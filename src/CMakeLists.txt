@@ -6,6 +6,8 @@ set(SUB0LLM_SOURCES
     backends/cuda/backend.cpp
     backends/openvino/backend.cpp
     tokenizer/bpe.cpp
+    data/dataset.cpp
+    data/dataloader.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.

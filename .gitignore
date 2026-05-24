@@ -36,9 +36,9 @@ compile_commands.json
 *.swo
 .DS_Store
 
-# Data and models (large files)
-data/
-models/
+# Data and models (large files) — top-level only, not src/data or include/.../data
+/data/
+/models/
 *.gguf
 *.bin
 *.safetensors
