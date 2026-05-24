@@ -43,6 +43,12 @@ void require_same(const Tensor& a, const Tensor& b, std::string_view op) {
             std::format("{}: device mismatch {} vs {}", op, a.device().str(), b.device().str()));
 }
 
+void require_cpu(const Tensor& t, std::string_view op) {
+    if (!t.device().is_cpu())
+        throw std::runtime_error(
+            std::format("{}: not yet implemented for device {}", op, t.device().str()));
+}
+
 // Dispatch a unary CPU kernel.
 template<typename KernelFn>
 Tensor unary_cpu(const Tensor& t, std::string_view op, KernelFn fn) {
@@ -54,10 +60,9 @@ Tensor unary_cpu(const Tensor& t, std::string_view op, KernelFn fn) {
     return out;
 }
 
-// Dispatch a binary CPU kernel.
+// Dispatch a binary CPU kernel. Callers must call require_same and require_cpu first.
 template<typename KernelFn>
 Tensor binary_cpu(const Tensor& a, const Tensor& b, std::string_view op, KernelFn fn) {
-    require_same(a, b, op);
     require_f32(a, op);
     Tensor out(a.shape(), a.dtype(), a.device());
     fn(reinterpret_cast<const float*>(a.raw_ptr()),
@@ -72,29 +77,33 @@ Tensor binary_cpu(const Tensor& a, const Tensor& b, std::string_view op, KernelF
 // ── Element-wise binary ───────────────────────────────────────────────────────
 
 Tensor add(const Tensor& a, const Tensor& b) {
+    require_same(a, b, "add");
     if (a.device().is_cuda())     return backend::cuda::add(a, b);
     if (a.device().is_openvino()) return backend::openvino::add(a, b);
     return binary_cpu(a, b, "add", backend::cpu::add_f32);
 }
 
 Tensor sub(const Tensor& a, const Tensor& b) {
-    if (a.device().is_cuda()) {
-        throw std::runtime_error("sub: CUDA dispatch not yet implemented");
-    }
+    require_same(a, b, "sub");
+    require_cpu(a, "sub");
     return binary_cpu(a, b, "sub", backend::cpu::sub_f32);
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
+    require_same(a, b, "mul");
     if (a.device().is_cuda())     return backend::cuda::mul(a, b);
     return binary_cpu(a, b, "mul", backend::cpu::mul_f32);
 }
 
 Tensor div(const Tensor& a, const Tensor& b) {
+    require_same(a, b, "div");
+    require_cpu(a, "div");
     return binary_cpu(a, b, "div", backend::cpu::div_f32);
 }
 
 Tensor add(const Tensor& a, float scalar) {
     require_f32(a, "add_scalar");
+    require_cpu(a, "add_scalar");
     Tensor out(a.shape(), a.dtype(), a.device());
     backend::cpu::add_scalar_f32(
         reinterpret_cast<const float*>(a.raw_ptr()),
@@ -106,6 +115,7 @@ Tensor add(const Tensor& a, float scalar) {
 
 Tensor mul(const Tensor& a, float scalar) {
     require_f32(a, "mul_scalar");
+    require_cpu(a, "mul_scalar");
     Tensor out(a.shape(), a.dtype(), a.device());
     backend::cpu::mul_scalar_f32(
         reinterpret_cast<const float*>(a.raw_ptr()),
@@ -117,11 +127,11 @@ Tensor mul(const Tensor& a, float scalar) {
 
 // ── Reductions ────────────────────────────────────────────────────────────────
 
-float sum (const Tensor& t) { require_f32(t,"sum");  return backend::cpu::sum_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
-float mean(const Tensor& t) { return t.numel() ? sum(t)/static_cast<float>(t.numel()) : 0.0f; }
-float max (const Tensor& t) { require_f32(t,"max");  return backend::cpu::max_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
-float min (const Tensor& t) { require_f32(t,"min");  return backend::cpu::min_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
-float norm(const Tensor& t) { require_f32(t,"norm"); return backend::cpu::norm_f32(reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float sum (const Tensor& t) { require_f32(t,"sum");  require_cpu(t,"sum");  return backend::cpu::sum_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float mean(const Tensor& t) { require_cpu(t,"mean"); return t.numel() ? sum(t)/static_cast<float>(t.numel()) : 0.0f; }
+float max (const Tensor& t) { require_f32(t,"max");  require_cpu(t,"max");  return backend::cpu::max_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float min (const Tensor& t) { require_f32(t,"min");  require_cpu(t,"min");  return backend::cpu::min_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float norm(const Tensor& t) { require_f32(t,"norm"); require_cpu(t,"norm"); return backend::cpu::norm_f32(reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
 
 // ── Activations ───────────────────────────────────────────────────────────────
 

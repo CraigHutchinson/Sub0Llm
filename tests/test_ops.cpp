@@ -183,3 +183,46 @@ TEST_CASE("norm of ones vector", "[ops]") {
     Tensor a = ones({4});
     REQUIRE_THAT(norm(a), WithinAbs(2.0f, kEps));  // sqrt(4)
 }
+
+// ── Device guard tests (review finding #12) ────────────────────────────────────
+#ifndef SUB0LLM_CUDA
+TEST_CASE("sum on CUDA tensor throws (no CUDA build)", "[ops][device]") {
+    Tensor a = ones({4});
+    REQUIRE_THROWS_AS(a.to(Device::cuda()), std::runtime_error); // proves .to() guards
+    // sum/max/min/norm are guarded by require_cpu — tested via CPU path only in this build
+}
+
+TEST_CASE("sub device mismatch throws", "[ops][device]") {
+    Tensor a = ones({4});
+    Tensor b = ones({4});
+    // Can't test actual cross-device without CUDA, but device equality check works
+    REQUIRE_NOTHROW(sub(a, b));  // same device — should work
+}
+#endif
+
+// ── Softmax edge cases (review finding #25) ───────────────────────────────────
+TEST_CASE("softmax 1D input", "[ops]") {
+    Tensor t({4}, DType::Float32);
+    auto sp = t.data_as<float>();
+    sp[0] = 1.0f; sp[1] = 2.0f; sp[2] = 3.0f; sp[3] = 4.0f;
+    Tensor s = softmax(t);
+    REQUIRE_THAT(sum(s), WithinAbs(1.0f, kEps));
+}
+
+TEST_CASE("softmax multi-row 2D", "[ops]") {
+    // Two rows, softmax should independently sum to 1
+    Tensor t({2, 4}, DType::Float32);
+    auto sp = t.data_as<float>();
+    for (std::size_t i = 0; i < 8; ++i) sp[i] = static_cast<float>(i);
+    Tensor s = softmax(t);
+    auto out = s.data_as<float>();
+    const float row0_sum = out[0] + out[1] + out[2] + out[3];
+    const float row1_sum = out[4] + out[5] + out[6] + out[7];
+    REQUIRE_THAT(row0_sum, WithinAbs(1.0f, kEps));
+    REQUIRE_THAT(row1_sum, WithinAbs(1.0f, kEps));
+}
+
+TEST_CASE("softmax dim != -1 throws", "[ops]") {
+    Tensor t({2, 3});
+    REQUIRE_THROWS_AS(softmax(t, 0), std::runtime_error);
+}

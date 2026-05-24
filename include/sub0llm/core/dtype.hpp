@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
+#include <utility>   // std::unreachable (C++23)
 
 namespace sub0llm {
 
@@ -46,7 +47,7 @@ template<> struct dtype_traits<DType::Bool>     { using type = bool;          st
         case DType::Int64:    return 8;
         case DType::Bool:     return 1;
     }
-    return 0;
+    std::unreachable();
 }
 
 [[nodiscard]] constexpr std::string_view dtype_name(DType dtype) noexcept {
@@ -61,7 +62,7 @@ template<> struct dtype_traits<DType::Bool>     { using type = bool;          st
         case DType::Int64:    return "int64";
         case DType::Bool:     return "bool";
     }
-    return "unknown";
+    std::unreachable();
 }
 
 [[nodiscard]] constexpr bool dtype_is_float(DType dtype) noexcept {

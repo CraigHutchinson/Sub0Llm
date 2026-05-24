@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <format>
 #include <string>
+#include <utility>   // std::unreachable
 
 namespace sub0llm {
 
@@ -38,7 +39,7 @@ struct Device {
             case DeviceType::CUDA:     return std::format("cuda:{}", index);
             case DeviceType::OpenVINO: return std::format("openvino:{}", index);
         }
-        return "unknown";
+        std::unreachable();
     }
 
     // ── Comparison ────────────────────────────────────────────────────────────

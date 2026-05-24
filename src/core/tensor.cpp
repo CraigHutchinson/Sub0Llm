@@ -189,12 +189,22 @@ std::ostream& operator<<(std::ostream& os, const Tensor& t) {
 
 Tensor zeros(Tensor::Shape shape, DType dtype, Device device) {
     Tensor t(std::move(shape), dtype, device);
-    if (t.numel() > 0)
-        std::memset(t.raw_ptr(), 0, static_cast<std::size_t>(t.numel()) * dtype_size(dtype));
+    if (t.numel() > 0) {
+        const std::size_t bytes = static_cast<std::size_t>(t.numel()) * dtype_size(dtype);
+        if (t.device().is_cuda()) {
+            backend::cuda::memset_zero(t.raw_ptr(), bytes, t.device().index);
+        } else {
+            std::memset(t.raw_ptr(), 0, bytes);
+        }
+    }
     return t;
 }
 
 Tensor ones(Tensor::Shape shape, DType dtype, Device device) {
+    if (dtype == DType::Float16 || dtype == DType::BFloat16 || dtype == DType::Bool) {
+        throw std::runtime_error(
+            std::format("ones: dtype {} not yet supported", dtype_name(dtype)));
+    }
     Tensor t = zeros(shape, dtype, device);
     if (dtype == DType::Float32) {
         auto sp = t.data_as<float>();
@@ -202,9 +212,15 @@ Tensor ones(Tensor::Shape shape, DType dtype, Device device) {
     } else if (dtype == DType::Float64) {
         auto sp = t.data_as<double>();
         std::fill(sp.begin(), sp.end(), 1.0);
+    } else if (dtype == DType::Int8) {
+        auto sp = t.data_as<std::int8_t>();
+        std::fill(sp.begin(), sp.end(), std::int8_t{1});
+    } else if (dtype == DType::Int16) {
+        auto sp = t.data_as<std::int16_t>();
+        std::fill(sp.begin(), sp.end(), std::int16_t{1});
     } else if (dtype == DType::Int32) {
         auto sp = t.data_as<std::int32_t>();
-        std::fill(sp.begin(), sp.end(), 1);
+        std::fill(sp.begin(), sp.end(), std::int32_t{1});
     } else if (dtype == DType::Int64) {
         auto sp = t.data_as<std::int64_t>();
         std::fill(sp.begin(), sp.end(), std::int64_t{1});
@@ -248,20 +264,43 @@ Tensor arange(std::int64_t n, DType dtype, Device device) {
 
 Tensor copy(const Tensor& src) {
     Tensor dst(src.shape(), src.dtype(), src.device());
-    if (src.numel() > 0) {
-        const std::size_t bytes = static_cast<std::size_t>(src.numel()) * dtype_size(src.dtype());
-        if (src.is_contiguous()) {
-            std::memcpy(dst.raw_ptr(), src.raw_ptr(), bytes);
-        } else {
-            // Slow element-wise copy for non-contiguous tensors.
-            // Ch02 will add proper stride-aware copy kernels.
-            if (src.dtype() == DType::Float32) {
-                auto src_sp = src.data_as<float>();
-                auto dst_sp = dst.data_as<float>();
-                std::copy(src_sp.begin(), src_sp.end(), dst_sp.begin());
-            }
+    if (src.numel() <= 0) return dst;
+
+    const std::size_t bytes = static_cast<std::size_t>(src.numel()) * dtype_size(src.dtype());
+
+    if (src.is_contiguous()) {
+        std::memcpy(dst.raw_ptr(), src.raw_ptr(), bytes);
+        return dst;
+    }
+
+    // Stride-aware copy: walk every element using its strided byte offset and write
+    // it into the contiguous destination in row-major order.
+    if (src.dtype() != DType::Float32) {
+        throw std::runtime_error(std::format(
+            "copy: non-contiguous copy of {} not yet implemented", dtype_name(src.dtype())));
+    }
+
+    const auto& shape   = src.shape();
+    const auto& strides = src.strides();
+    const std::size_t rank = src.ndim();
+    const auto n = static_cast<std::size_t>(src.numel());
+
+    auto dst_sp = dst.data_as<float>();
+    std::vector<std::size_t> idx(rank, 0);
+
+    for (std::size_t flat = 0; flat < n; ++flat) {
+        std::size_t byte_off = 0;
+        for (std::size_t d = 0; d < rank; ++d)
+            byte_off += idx[d] * static_cast<std::size_t>(strides[d]);
+        dst_sp[flat] = *reinterpret_cast<const float*>(src.raw_ptr() + byte_off);
+
+        // Increment multi-index, rightmost dim first.
+        for (std::size_t d = rank; d-- > 0;) {
+            if (++idx[d] < static_cast<std::size_t>(shape[d])) break;
+            idx[d] = 0;
         }
     }
+
     return dst;
 }
 

@@ -138,3 +138,75 @@ TEST_CASE("to() GPU device throws placeholder error", "[tensor]") {
     Tensor a = ones({4});
     REQUIRE_THROWS_AS(a.to(Device::cuda()), std::runtime_error);
 }
+
+// ── Edge cases identified in code review ─────────────────────────────────────
+
+TEST_CASE("default-constructed tensor is undefined", "[tensor][edge]") {
+    Tensor t;
+    REQUIRE_FALSE(t.defined());
+    REQUIRE(t.numel() == 0);
+    REQUIRE_THROWS_AS(t.raw_ptr(), std::runtime_error);
+}
+
+TEST_CASE("zero-element tensor (shape containing 0)", "[tensor][edge]") {
+    Tensor t({2, 0, 4});
+    REQUIRE(t.numel() == 0);
+    REQUIRE(t.shape(1) == 0);
+    REQUIRE(t.is_contiguous());
+    // data_as on zero-element tensor returns an empty span — no allocation
+    auto sp = t.data_as<float>();
+    REQUIRE(sp.empty());
+}
+
+TEST_CASE("non-contiguous copy — stride-aware float32", "[tensor][edge]") {
+    // Build (2,3) and transpose to get a non-contiguous (3,2)
+    Tensor t = arange(6).reshape({2, 3});
+    Tensor tT = t.transpose(0, 1);
+    REQUIRE_FALSE(tT.is_contiguous());
+
+    Tensor c = tT.contiguous();
+    REQUIRE(c.is_contiguous());
+
+    // Verify: tT[0,0]=0, tT[0,1]=3, tT[1,0]=1, tT[1,1]=4, tT[2,0]=2, tT[2,1]=5
+    auto sp = c.data_as<float>();
+    REQUIRE(sp[0] == 0.0f);
+    REQUIRE(sp[1] == 3.0f);
+    REQUIRE(sp[2] == 1.0f);
+    REQUIRE(sp[3] == 4.0f);
+    REQUIRE(sp[4] == 2.0f);
+    REQUIRE(sp[5] == 5.0f);
+}
+
+TEST_CASE("non-contiguous copy — non-float32 throws", "[tensor][edge]") {
+    Tensor t = arange(6, DType::Int64).reshape({2, 3});
+    Tensor tT = t.transpose(0, 1);
+    REQUIRE_FALSE(tT.is_contiguous());
+    REQUIRE_THROWS_AS(tT.contiguous(), std::runtime_error);
+}
+
+TEST_CASE("ones — unsupported dtype throws", "[tensor][edge]") {
+    REQUIRE_THROWS_AS(ones({4}, DType::Float16), std::runtime_error);
+    REQUIRE_THROWS_AS(ones({4}, DType::BFloat16), std::runtime_error);
+    REQUIRE_THROWS_AS(ones({4}, DType::Bool), std::runtime_error);
+}
+
+TEST_CASE("ones — Int8 and Int16 supported", "[tensor][edge]") {
+    Tensor a = ones({4}, DType::Int8);
+    for (auto v : a.data_as<std::int8_t>()) REQUIRE(v == 1);
+
+    Tensor b = ones({4}, DType::Int16);
+    for (auto v : b.data_as<std::int16_t>()) REQUIRE(v == 1);
+}
+
+TEST_CASE("dtype_name covers all enum values", "[dtype]") {
+    // Exhaustive check — catches missing cases in the switch.
+    REQUIRE(dtype_name(DType::Float32)  == "float32");
+    REQUIRE(dtype_name(DType::Float16)  == "float16");
+    REQUIRE(dtype_name(DType::BFloat16) == "bfloat16");
+    REQUIRE(dtype_name(DType::Float64)  == "float64");
+    REQUIRE(dtype_name(DType::Int8)     == "int8");
+    REQUIRE(dtype_name(DType::Int16)    == "int16");
+    REQUIRE(dtype_name(DType::Int32)    == "int32");
+    REQUIRE(dtype_name(DType::Int64)    == "int64");
+    REQUIRE(dtype_name(DType::Bool)     == "bool");
+}

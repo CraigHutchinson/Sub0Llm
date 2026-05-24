@@ -10,10 +10,11 @@ namespace sub0llm::backend::cuda {
 // Throws if CUDA is not compiled in.
 [[nodiscard]] std::shared_ptr<Storage> alloc(std::size_t byte_size, int device_index);
 
-// Copy between host and device (or device to device).
+// Copy between host and device (or device to device). All throw on CUDA error.
 void memcpy_h2d(void* dst, const void* src, std::size_t bytes, int device_index);
 void memcpy_d2h(void* dst, const void* src, std::size_t bytes, int device_index);
 void memcpy_d2d(void* dst, const void* src, std::size_t bytes, int device_index);
+void memset_zero(void* dst, std::size_t bytes, int device_index);
 
 // ── Ops (each throws if not compiled in) ─────────────────────────────────────
 [[nodiscard]] Tensor add(const Tensor& a, const Tensor& b);

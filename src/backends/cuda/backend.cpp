@@ -35,7 +35,8 @@ std::shared_ptr<Storage> alloc(std::size_t byte_size, int device_index) {
 void memcpy_h2d(void* dst, const void* src, std::size_t bytes, int device_index) {
 #ifdef SUB0LLM_CUDA
     cudaSetDevice(device_index);
-    cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    if (const cudaError_t e = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice); e != cudaSuccess)
+        throw std::runtime_error(std::format("cudaMemcpy H→D failed: {}", cudaGetErrorString(e)));
 #else
     (void)dst; (void)src; (void)bytes; (void)device_index;
     throw std::runtime_error("CUDA backend not compiled in");
@@ -45,7 +46,8 @@ void memcpy_h2d(void* dst, const void* src, std::size_t bytes, int device_index)
 void memcpy_d2h(void* dst, const void* src, std::size_t bytes, int device_index) {
 #ifdef SUB0LLM_CUDA
     cudaSetDevice(device_index);
-    cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+    if (const cudaError_t e = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost); e != cudaSuccess)
+        throw std::runtime_error(std::format("cudaMemcpy D→H failed: {}", cudaGetErrorString(e)));
 #else
     (void)dst; (void)src; (void)bytes; (void)device_index;
     throw std::runtime_error("CUDA backend not compiled in");
@@ -55,9 +57,21 @@ void memcpy_d2h(void* dst, const void* src, std::size_t bytes, int device_index)
 void memcpy_d2d(void* dst, const void* src, std::size_t bytes, int device_index) {
 #ifdef SUB0LLM_CUDA
     cudaSetDevice(device_index);
-    cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+    if (const cudaError_t e = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice); e != cudaSuccess)
+        throw std::runtime_error(std::format("cudaMemcpy D→D failed: {}", cudaGetErrorString(e)));
 #else
     (void)dst; (void)src; (void)bytes; (void)device_index;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+void memset_zero(void* dst, std::size_t bytes, int device_index) {
+#ifdef SUB0LLM_CUDA
+    cudaSetDevice(device_index);
+    if (const cudaError_t e = cudaMemset(dst, 0, bytes); e != cudaSuccess)
+        throw std::runtime_error(std::format("cudaMemset failed: {}", cudaGetErrorString(e)));
+#else
+    (void)dst; (void)bytes; (void)device_index;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }
