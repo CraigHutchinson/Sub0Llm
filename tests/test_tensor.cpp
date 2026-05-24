@@ -1,0 +1,140 @@
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+
+#include "sub0llm/core/tensor.hpp"
+
+using namespace sub0llm;
+using Catch::Matchers::WithinAbs;
+
+TEST_CASE("Tensor construction and metadata", "[tensor]") {
+    Tensor t({2, 3, 4}, DType::Float32, Device::cpu());
+
+    REQUIRE(t.ndim()  == 3);
+    REQUIRE(t.numel() == 24);
+    REQUIRE(t.shape() == Tensor::Shape{2, 3, 4});
+    REQUIRE(t.dtype() == DType::Float32);
+    REQUIRE(t.device().is_cpu());
+    REQUIRE(t.defined());
+    REQUIRE(t.is_contiguous());
+}
+
+TEST_CASE("zeros factory", "[tensor]") {
+    Tensor t = zeros({3, 3});
+    auto sp = t.data_as<float>();
+    for (float v : sp) REQUIRE(v == 0.0f);
+}
+
+TEST_CASE("ones factory", "[tensor]") {
+    Tensor t = ones({4});
+    auto sp = t.data_as<float>();
+    for (float v : sp) REQUIRE(v == 1.0f);
+}
+
+TEST_CASE("arange factory", "[tensor]") {
+    Tensor t = arange(5);
+    auto sp = t.data_as<float>();
+    for (std::size_t i = 0; i < 5; ++i)
+        REQUIRE(sp[i] == static_cast<float>(i));
+}
+
+TEST_CASE("arange int64", "[tensor]") {
+    Tensor t = arange(6, DType::Int64);
+    auto sp = t.data_as<std::int64_t>();
+    for (std::size_t i = 0; i < 6; ++i)
+        REQUIRE(sp[i] == static_cast<std::int64_t>(i));
+}
+
+TEST_CASE("randn shape and dtype", "[tensor]") {
+    Tensor t = randn({10, 10});
+    REQUIRE(t.shape() == Tensor::Shape{10, 10});
+    REQUIRE(t.numel() == 100);
+    REQUIRE(t.dtype() == DType::Float32);
+}
+
+TEST_CASE("dtype mismatch throws", "[tensor]") {
+    Tensor t = zeros({4}, DType::Int32);
+    REQUIRE_THROWS_AS(t.data_as<float>(), std::runtime_error);
+}
+
+TEST_CASE("reshape — same numel", "[tensor]") {
+    Tensor t = arange(12);
+    Tensor r = t.reshape({3, 4});
+
+    REQUIRE(r.ndim()  == 2);
+    REQUIRE(r.shape(0) == 3);
+    REQUIRE(r.shape(1) == 4);
+    REQUIRE(r.numel()  == 12);
+    REQUIRE(r.is_contiguous());
+
+    // Data shared with original.
+    auto orig = t.data_as<float>();
+    auto view = r.data_as<float>();
+    for (std::size_t i = 0; i < 12; ++i)
+        REQUIRE(view[i] == orig[i]);
+}
+
+TEST_CASE("reshape — wrong numel throws", "[tensor]") {
+    Tensor t = arange(12);
+    REQUIRE_THROWS_AS(t.reshape({3, 5}), std::runtime_error);
+}
+
+TEST_CASE("transpose — shape swap", "[tensor]") {
+    Tensor t = arange(6).reshape({2, 3});
+    Tensor tT = t.transpose(0, 1);
+
+    REQUIRE(tT.shape(0) == 3);
+    REQUIRE(tT.shape(1) == 2);
+    REQUIRE_FALSE(tT.is_contiguous());
+}
+
+TEST_CASE("contiguous copy", "[tensor]") {
+    Tensor t  = arange(6).reshape({2, 3});
+    Tensor tT = t.transpose(0, 1);
+    Tensor c  = tT.contiguous();
+
+    REQUIRE(c.is_contiguous());
+    REQUIRE(c.shape() == tT.shape());
+    REQUIRE(c.numel() == tT.numel());
+}
+
+TEST_CASE("item() on scalar tensor", "[tensor]") {
+    Tensor t = zeros({1});
+    t.data_as<float>()[0] = 3.14f;
+    REQUIRE_THAT(t.item<float>(), WithinAbs(3.14f, 1e-6f));
+}
+
+TEST_CASE("item() on non-scalar throws", "[tensor]") {
+    Tensor t = zeros({2});
+    REQUIRE_THROWS_AS(t.item<float>(), std::runtime_error);
+}
+
+TEST_CASE("shape_str formatting", "[tensor]") {
+    Tensor t({2, 3, 4});
+    REQUIRE(t.shape_str() == "(2, 3, 4)");
+}
+
+TEST_CASE("copy function", "[tensor]") {
+    Tensor a = ones({3, 3});
+    Tensor b = copy(a);
+
+    // Modifying a should not affect b.
+    a.data_as<float>()[0] = 99.0f;
+    REQUIRE(b.data_as<float>()[0] == 1.0f);
+}
+
+TEST_CASE("device assignment", "[tensor]") {
+    Tensor t = zeros({2, 2}, DType::Float32, Device::cpu());
+    REQUIRE(t.device().is_cpu());
+}
+
+TEST_CASE("to() same device is a no-op copy", "[tensor]") {
+    Tensor a = ones({4});
+    Tensor b = a.to(Device::cpu());
+    REQUIRE(b.numel() == 4);
+    REQUIRE(b.data_as<float>()[0] == 1.0f);
+}
+
+TEST_CASE("to() GPU device throws placeholder error", "[tensor]") {
+    Tensor a = ones({4});
+    REQUIRE_THROWS_AS(a.to(Device::cuda()), std::runtime_error);
+}

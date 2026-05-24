@@ -1,0 +1,57 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/CPM.cmake
+!cmake/options.cmake
+!cmake/deps.cmake
+!cmake/compiler_flags.cmake
+compile_commands.json
+
+# Compiled output
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# CUDA
+*.ptx
+*.cubin
+*.fatbin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data and models (large files)
+data/
+models/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Python tooling
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Test artifacts
+*.log
+test_output/
