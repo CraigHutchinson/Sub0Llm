@@ -8,6 +8,8 @@ set(SUB0LLM_SOURCES
     tokenizer/bpe.cpp
     data/dataset.cpp
     data/dataloader.cpp
+    autograd/variable.cpp
+    autograd/ops.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
