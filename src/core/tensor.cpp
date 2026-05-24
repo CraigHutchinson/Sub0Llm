@@ -1,4 +1,5 @@
 #include "sub0llm/core/tensor.hpp"
+#include "../backends/cuda/backend.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -49,7 +50,12 @@ Tensor::Tensor(Shape shape, DType dtype, Device device)
     storage_->byte_capacity = static_cast<std::size_t>(numel_) * dtype_size(dtype);
 
     if (storage_->byte_capacity > 0) {
-        // CPU-only for now; Ch02 adds CUDA/OpenVINO allocators.
+        if (device.is_cuda()) {
+            // Delegate to the CUDA backend allocator so we get the right deleter.
+            auto cuda_storage = backend::cuda::alloc(storage_->byte_capacity, device.index);
+            storage_ = cuda_storage;
+            return; // storage_ already fully initialised
+        }
         storage_->data = std::shared_ptr<std::byte[]>(
             new std::byte[storage_->byte_capacity]);
     }
@@ -114,12 +120,27 @@ Tensor Tensor::transpose(std::size_t dim0, std::size_t dim1) const {
 
 Tensor Tensor::to(Device target) const {
     if (device() == target) return *this;
-    if (!target.is_cpu()) {
-        // Ch02 will implement CUDA/OpenVINO transfer; placeholder error for now.
-        throw std::runtime_error(
-            std::format("Tensor::to({}): non-CPU backends added in Ch02", target.str()));
+    const std::size_t bytes = static_cast<std::size_t>(numel_) * dtype_size(dtype_);
+
+    if (device().is_cpu() && target.is_cuda()) {
+        Tensor dst(shape_, dtype_, target);
+        backend::cuda::memcpy_h2d(dst.raw_ptr(), raw_ptr(), bytes, target.index);
+        return dst;
     }
-    return copy(*this);
+    if (device().is_cuda() && target.is_cpu()) {
+        Tensor dst(shape_, dtype_, target);
+        backend::cuda::memcpy_d2h(dst.raw_ptr(), raw_ptr(), bytes, device().index);
+        return dst;
+    }
+    if (device().is_cuda() && target.is_cuda()) {
+        Tensor dst(shape_, dtype_, target);
+        backend::cuda::memcpy_d2d(dst.raw_ptr(), raw_ptr(), bytes, device().index);
+        return dst;
+    }
+    if (target.is_cpu()) return copy(*this);
+
+    throw std::runtime_error(
+        std::format("Tensor::to({}→{}): unsupported transfer", device().str(), target.str()));
 }
 
 // ── Printing ──────────────────────────────────────────────────────────────────

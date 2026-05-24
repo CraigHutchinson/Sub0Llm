@@ -1,6 +1,7 @@
 add_executable(tests
     test_tensor.cpp
     test_ops.cpp
+    test_backends.cpp
 )
 
 target_link_libraries(tests

@@ -1,12 +1,27 @@
-add_library(sub0llm STATIC
+set(SUB0LLM_SOURCES
     core/tensor.cpp
     core/ops.cpp
+    backends/cpu/kernels.cpp
+    backends/cpu/matmul.cpp
+    backends/cuda/backend.cpp
+    backends/openvino/backend.cpp
 )
+
+# CUDA .cu files must be listed separately so CMake uses nvcc for them.
+if(SUB0LLM_ENABLE_CUDA)
+    list(APPEND SUB0LLM_SOURCES backends/cuda/kernels.cu)
+    set_source_files_properties(backends/cuda/kernels.cu
+        PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+add_library(sub0llm STATIC ${SUB0LLM_SOURCES})
 
 target_include_directories(sub0llm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}   # so backends/… can include each other
 )
 
 target_link_libraries(sub0llm
@@ -15,7 +30,7 @@ target_link_libraries(sub0llm
         nlohmann_json::nlohmann_json
     PRIVATE
         $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
-        $<$<BOOL:${SUB0LLM_ENABLE_CUDA}>:CUDA::cublas CUDA::curand>
+        $<$<BOOL:${SUB0LLM_ENABLE_CUDA}>:CUDA::cublas CUDA::curand CUDA::cudart>
         $<$<BOOL:${SUB0LLM_ENABLE_OPENVINO}>:openvino::runtime>
 )
 

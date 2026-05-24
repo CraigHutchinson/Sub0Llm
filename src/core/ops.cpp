@@ -5,118 +5,142 @@
 #include <numeric>
 #include <stdexcept>
 
-// Naive CPU implementations — readable baseline for Chapter 1.
-// Chapter 2 will dispatch to SIMD/CUDA/OpenVINO equivalents.
+#include "../backends/cpu/kernels.hpp"
+#include "../backends/cuda/backend.hpp"
+#include "../backends/openvino/backend.hpp"
+
+// ── Ch02: Dispatch layer ──────────────────────────────────────────────────────
+// ops.cpp is now a routing table:
+//   CUDA device   → backend::cuda::*
+//   OpenVINO dev  → backend::openvino::*   (stub; full in Ch14)
+//   CPU           → backend::cpu::*        (AVX-512 / AVX2 / scalar)
+//
+// The per-backend kernel selection (AVX2 vs scalar) is resolved at compile
+// time in backends/cpu/kernels.cpp — ops.cpp sees only the same function
+// signatures regardless of the SIMD level.
 
 namespace sub0llm::ops {
 
+// ── Internal guards ────────────────────────────────────────────────────────────
+
 namespace {
 
-// Validate that two tensors have the same shape for element-wise ops.
-void check_same_shape(const Tensor& a, const Tensor& b, std::string_view op) {
-    if (a.shape() != b.shape()) {
+void require_f32(const Tensor& t, std::string_view op) {
+    if (t.dtype() != DType::Float32)
         throw std::runtime_error(
-            std::format("{}: shape mismatch {} vs {}", op,
-                a.shape_str(), b.shape_str()));
-    }
-    if (a.dtype() != b.dtype()) {
-        throw std::runtime_error(
-            std::format("{}: dtype mismatch {} vs {}", op,
-                dtype_name(a.dtype()), dtype_name(b.dtype())));
-    }
+            std::format("{}: only float32 supported, got {}", op, dtype_name(t.dtype())));
 }
 
-// Helper: apply a binary op element-wise for float32.
-template<typename F>
-Tensor binary_op_f32(const Tensor& a, const Tensor& b, std::string_view op, F fn) {
-    check_same_shape(a, b, op);
-    if (a.dtype() != DType::Float32)
-        throw std::runtime_error(std::format("{}: only float32 supported in Ch01", op));
+void require_same(const Tensor& a, const Tensor& b, std::string_view op) {
+    if (a.shape() != b.shape())
+        throw std::runtime_error(
+            std::format("{}: shape mismatch {} vs {}", op, a.shape_str(), b.shape_str()));
+    if (a.dtype() != b.dtype())
+        throw std::runtime_error(
+            std::format("{}: dtype mismatch {} vs {}", op, dtype_name(a.dtype()), dtype_name(b.dtype())));
+    if (a.device() != b.device())
+        throw std::runtime_error(
+            std::format("{}: device mismatch {} vs {}", op, a.device().str(), b.device().str()));
+}
 
-    Tensor out(a.shape(), DType::Float32, a.device());
-    auto sa  = a.data_as<float>();
-    auto sb  = b.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i)
-        dst[i] = fn(sa[i], sb[i]);
+// Dispatch a unary CPU kernel.
+template<typename KernelFn>
+Tensor unary_cpu(const Tensor& t, std::string_view op, KernelFn fn) {
+    require_f32(t, op);
+    Tensor out(t.shape(), t.dtype(), t.device());
+    fn(reinterpret_cast<const float*>(t.raw_ptr()),
+       reinterpret_cast<float*>(out.raw_ptr()),
+       static_cast<std::size_t>(t.numel()));
+    return out;
+}
+
+// Dispatch a binary CPU kernel.
+template<typename KernelFn>
+Tensor binary_cpu(const Tensor& a, const Tensor& b, std::string_view op, KernelFn fn) {
+    require_same(a, b, op);
+    require_f32(a, op);
+    Tensor out(a.shape(), a.dtype(), a.device());
+    fn(reinterpret_cast<const float*>(a.raw_ptr()),
+       reinterpret_cast<const float*>(b.raw_ptr()),
+       reinterpret_cast<float*>(out.raw_ptr()),
+       static_cast<std::size_t>(a.numel()));
     return out;
 }
 
 } // anonymous namespace
 
-// ── Element-wise ─────────────────────────────────────────────────────────────
+// ── Element-wise binary ───────────────────────────────────────────────────────
 
 Tensor add(const Tensor& a, const Tensor& b) {
-    return binary_op_f32(a, b, "add", [](float x, float y) { return x + y; });
+    if (a.device().is_cuda())     return backend::cuda::add(a, b);
+    if (a.device().is_openvino()) return backend::openvino::add(a, b);
+    return binary_cpu(a, b, "add", backend::cpu::add_f32);
 }
 
 Tensor sub(const Tensor& a, const Tensor& b) {
-    return binary_op_f32(a, b, "sub", [](float x, float y) { return x - y; });
+    if (a.device().is_cuda()) {
+        throw std::runtime_error("sub: CUDA dispatch not yet implemented");
+    }
+    return binary_cpu(a, b, "sub", backend::cpu::sub_f32);
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
-    return binary_op_f32(a, b, "mul", [](float x, float y) { return x * y; });
+    if (a.device().is_cuda())     return backend::cuda::mul(a, b);
+    return binary_cpu(a, b, "mul", backend::cpu::mul_f32);
 }
 
 Tensor div(const Tensor& a, const Tensor& b) {
-    return binary_op_f32(a, b, "div", [](float x, float y) { return x / y; });
+    return binary_cpu(a, b, "div", backend::cpu::div_f32);
 }
 
 Tensor add(const Tensor& a, float scalar) {
+    require_f32(a, "add_scalar");
     Tensor out(a.shape(), a.dtype(), a.device());
-    auto sa  = a.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i)
-        dst[i] = sa[i] + scalar;
+    backend::cpu::add_scalar_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()),
+        scalar,
+        reinterpret_cast<float*>(out.raw_ptr()),
+        static_cast<std::size_t>(a.numel()));
     return out;
 }
 
 Tensor mul(const Tensor& a, float scalar) {
+    require_f32(a, "mul_scalar");
     Tensor out(a.shape(), a.dtype(), a.device());
-    auto sa  = a.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i)
-        dst[i] = sa[i] * scalar;
+    backend::cpu::mul_scalar_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()),
+        scalar,
+        reinterpret_cast<float*>(out.raw_ptr()),
+        static_cast<std::size_t>(a.numel()));
     return out;
 }
 
 // ── Reductions ────────────────────────────────────────────────────────────────
 
-float sum(const Tensor& t) {
-    auto sp = t.data_as<float>();
-    return std::accumulate(sp.begin(), sp.end(), 0.0f);
-}
-
-float mean(const Tensor& t) {
-    if (t.numel() == 0) return 0.0f;
-    return sum(t) / static_cast<float>(t.numel());
-}
-
-float max(const Tensor& t) {
-    auto sp = t.data_as<float>();
-    return *std::max_element(sp.begin(), sp.end());
-}
-
-float min(const Tensor& t) {
-    auto sp = t.data_as<float>();
-    return *std::min_element(sp.begin(), sp.end());
-}
+float sum (const Tensor& t) { require_f32(t,"sum");  return backend::cpu::sum_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float mean(const Tensor& t) { return t.numel() ? sum(t)/static_cast<float>(t.numel()) : 0.0f; }
+float max (const Tensor& t) { require_f32(t,"max");  return backend::cpu::max_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float min (const Tensor& t) { require_f32(t,"min");  return backend::cpu::min_f32 (reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
+float norm(const Tensor& t) { require_f32(t,"norm"); return backend::cpu::norm_f32(reinterpret_cast<const float*>(t.raw_ptr()), static_cast<std::size_t>(t.numel())); }
 
 // ── Activations ───────────────────────────────────────────────────────────────
 
-Tensor relu(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i)
-        dst[i] = std::max(0.0f, si[i]);
-    return out;
+Tensor relu   (const Tensor& t) {
+    if (t.device().is_cuda()) return backend::cuda::relu(t);
+    return unary_cpu(t, "relu",    backend::cpu::relu_f32);
 }
+Tensor sigmoid(const Tensor& t) { return unary_cpu(t, "sigmoid", backend::cpu::sigmoid_f32); }
+Tensor neg    (const Tensor& t) { return unary_cpu(t, "neg",     backend::cpu::neg_f32);     }
+Tensor exp    (const Tensor& t) { return unary_cpu(t, "exp",     backend::cpu::exp_f32);     }
+Tensor log    (const Tensor& t) { return unary_cpu(t, "log",     backend::cpu::log_f32);     }
+Tensor sqrt   (const Tensor& t) { return unary_cpu(t, "sqrt",    backend::cpu::sqrt_f32);    }
+Tensor abs    (const Tensor& t) { return unary_cpu(t, "abs",     backend::cpu::abs_f32);     }
 
 Tensor gelu(const Tensor& t) {
-    // GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    // GELU(x) ≈ 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
     constexpr float kSqrt2OverPi = 0.7978845608f;
     constexpr float kCoef        = 0.044715f;
+    require_f32(t, "gelu");
     Tensor out(t.shape(), t.dtype(), t.device());
     auto si  = t.data_as<float>();
     auto dst = out.data_as<float>();
@@ -128,11 +152,9 @@ Tensor gelu(const Tensor& t) {
 }
 
 Tensor softmax(const Tensor& t, int dim) {
-    // Numerically-stable softmax along the last dimension for 1D/2D tensors.
-    // Full n-dim dispatch comes in Ch07 (attention).
-    if (t.ndim() > 2 || dim != -1) {
-        throw std::runtime_error("softmax: Ch01 only supports 1D/2D with dim=-1");
-    }
+    if (t.ndim() > 2 || dim != -1)
+        throw std::runtime_error("softmax: Ch02 only supports 1D/2D with dim=-1; full n-dim in Ch07");
+    require_f32(t, "softmax");
     Tensor out(t.shape(), t.dtype(), t.device());
 
     const std::int64_t cols = t.shape(static_cast<std::size_t>(t.ndim() - 1));
@@ -142,117 +164,48 @@ Tensor softmax(const Tensor& t, int dim) {
     auto dst = out.data_as<float>();
 
     for (std::int64_t r = 0; r < rows; ++r) {
-        const std::size_t offset = static_cast<std::size_t>(r * cols);
-        // Shift by max for stability.
-        float mx = *std::max_element(si.begin() + static_cast<std::ptrdiff_t>(offset),
-                                     si.begin() + static_cast<std::ptrdiff_t>(offset) + cols);
+        const std::size_t off = static_cast<std::size_t>(r * cols);
+        const float mx = backend::cpu::max_f32(si.data() + off, static_cast<std::size_t>(cols));
         float s = 0.0f;
         for (std::int64_t c = 0; c < cols; ++c) {
-            dst[offset + static_cast<std::size_t>(c)] = std::exp(si[offset + static_cast<std::size_t>(c)] - mx);
-            s += dst[offset + static_cast<std::size_t>(c)];
+            dst[off + static_cast<std::size_t>(c)] = std::exp(si[off + static_cast<std::size_t>(c)] - mx);
+            s += dst[off + static_cast<std::size_t>(c)];
         }
-        for (std::int64_t c = 0; c < cols; ++c)
-            dst[offset + static_cast<std::size_t>(c)] /= s;
+        backend::cpu::mul_scalar_f32(dst.data() + off, 1.0f / s, dst.data() + off,
+                                     static_cast<std::size_t>(cols));
     }
-    return out;
-}
-
-Tensor sigmoid(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i)
-        dst[i] = 1.0f / (1.0f + std::exp(-si[i]));
     return out;
 }
 
 // ── Matrix multiply ───────────────────────────────────────────────────────────
-// Naive O(M*N*K) — Ch02 replaces with BLAS/cuBLAS/oneDNN.
 
 Tensor matmul(const Tensor& a, const Tensor& b) {
-    if (a.ndim() < 2 || b.ndim() < 2) {
+    if (a.ndim() < 2 || b.ndim() < 2)
         throw std::runtime_error("matmul: inputs must be at least 2D");
-    }
-    const std::int64_t M = a.shape(a.ndim() - 2);
-    const std::int64_t K = a.shape(a.ndim() - 1);
-    const std::int64_t K2 = b.shape(b.ndim() - 2);
-    const std::int64_t N  = b.shape(b.ndim() - 1);
-    if (K != K2) {
-        throw std::runtime_error(
-            std::format("matmul: inner dims must match, got {} vs {}", K, K2));
-    }
-    if (a.dtype() != DType::Float32)
-        throw std::runtime_error("matmul: only float32 supported in Ch01");
-
-    // For simplicity, only 2D matmul in Ch01; batched added in Ch07.
-    if (a.ndim() != 2 || b.ndim() != 2) {
+    if (a.ndim() != 2 || b.ndim() != 2)
         throw std::runtime_error("matmul: batched matmul added in Ch07 (attention)");
-    }
 
-    Tensor out = zeros({M, N}, DType::Float32, a.device());
-    auto sa  = a.data_as<float>();
-    auto sb  = b.data_as<float>();
-    auto dst = out.data_as<float>();
+    const auto M  = static_cast<std::size_t>(a.shape(0));
+    const auto K  = static_cast<std::size_t>(a.shape(1));
+    const auto K2 = static_cast<std::size_t>(b.shape(0));
+    const auto N  = static_cast<std::size_t>(b.shape(1));
 
-    for (std::int64_t m = 0; m < M; ++m) {
-        for (std::int64_t k = 0; k < K; ++k) {
-            const float a_mk = sa[static_cast<std::size_t>(m * K + k)];
-            for (std::int64_t n = 0; n < N; ++n) {
-                dst[static_cast<std::size_t>(m * N + n)] +=
-                    a_mk * sb[static_cast<std::size_t>(k * N + n)];
-            }
-        }
-    }
+    if (K != K2) throw std::runtime_error(
+        std::format("matmul: inner dims must match, got {} vs {}", K, K2));
+    require_f32(a, "matmul");
+
+    if (a.device().is_cuda()) return backend::cuda::matmul(a, b);
+    if (a.device().is_openvino()) return backend::openvino::matmul(a, b);
+
+    Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
+               DType::Float32, a.device());
+
+    backend::cpu::matmul_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()),
+        reinterpret_cast<const float*>(b.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()),
+        M, N, K);
     return out;
-}
-
-// ── Unary ─────────────────────────────────────────────────────────────────────
-
-Tensor exp(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = std::exp(si[i]);
-    return out;
-}
-
-Tensor log(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = std::log(si[i]);
-    return out;
-}
-
-Tensor sqrt(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = std::sqrt(si[i]);
-    return out;
-}
-
-Tensor abs(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = std::abs(si[i]);
-    return out;
-}
-
-Tensor neg(const Tensor& t) {
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = -si[i];
-    return out;
-}
-
-float norm(const Tensor& t) {
-    auto sp = t.data_as<float>();
-    float s = 0.0f;
-    for (float v : sp) s += v * v;
-    return std::sqrt(s);
 }
 
 } // namespace sub0llm::ops
