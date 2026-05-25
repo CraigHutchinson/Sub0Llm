@@ -5,6 +5,7 @@ add_executable(tests
     test_tokenizer.cpp
     test_dataset.cpp
     test_autograd.cpp
+    test_embeddings.cpp
 )
 
 target_link_libraries(tests
