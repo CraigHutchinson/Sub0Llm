@@ -80,9 +80,10 @@ std::vector<autograd::Variable*> FeedForward::parameters() {
 
 TransformerBlock::TransformerBlock(int64_t D, int64_t num_heads,
                                    std::uint64_t seed)
-    : norm1_(D), norm2_(D),
+    : norm1_(D),
       attn_(static_cast<std::size_t>(D), static_cast<std::size_t>(num_heads),
             seed),
+      norm2_(D),
       ffn_(D, seed + 1000) {}
 
 autograd::Variable TransformerBlock::forward(const autograd::Variable& x) const {
@@ -107,6 +108,9 @@ GPT::GPT(int64_t vocab_size, int64_t embed_dim, int64_t num_heads,
     : tok_emb_(vocab_size, embed_dim, seed),
       pos_emb_(max_seq_len, embed_dim, seed + 1),
       ln_f_(embed_dim) {
+    if (num_heads <= 0)
+        throw std::runtime_error(std::format(
+            "GPT: num_heads={} must be positive", num_heads));
     if (num_layers <= 0)
         throw std::runtime_error(std::format(
             "GPT: num_layers={} must be positive", num_layers));

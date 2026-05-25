@@ -323,8 +323,10 @@ TEST_CASE("GPT — backward populates gradients on all parameters", "[gpt][model
     REQUIRE(params_with_grad == model.parameters().size());
 }
 
-TEST_CASE("GPT — invalid num_layers throws", "[gpt][model]") {
-    REQUIRE_THROWS_AS(GPT(32, 8, 2, 0, 16), std::runtime_error);
+TEST_CASE("GPT — invalid arguments throw", "[gpt][model]") {
+    REQUIRE_THROWS_AS(GPT(32, 8, 2,  0, 16), std::runtime_error);  // num_layers=0
+    REQUIRE_THROWS_AS(GPT(32, 8, 0,  1, 16), std::runtime_error);  // num_heads=0
+    REQUIRE_THROWS_AS(GPT(32, 8, -1, 1, 16), std::runtime_error);  // num_heads<0
 }
 
 TEST_CASE("GPT — weight tying: tok_emb appears once in parameters()", "[gpt][model]") {

@@ -174,8 +174,9 @@ Variable bias_add(const Variable& x, const Variable& b) {
         throw std::runtime_error(std::format(
             "autograd::bias_add: bias size {} != columns {}", blen, C));
 
+    const Tensor xc = xd.contiguous();
     Tensor out_data = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)});
-    const auto xs = xd.data_as<float>();
+    const auto xs = xc.data_as<float>();
     const auto bs = bd.data_as<float>();
     auto       os = out_data.data_as<float>();
     for (std::size_t i = 0; i < N; ++i)
@@ -377,6 +378,8 @@ Variable layer_norm(const Variable& x, const Variable& weight,
         throw std::runtime_error("autograd::layer_norm: x must be 2D (T, D)");
     const std::size_t T = static_cast<std::size_t>(xd.shape()[0]);
     const std::size_t D = static_cast<std::size_t>(xd.shape()[1]);
+    if (T == 0)
+        throw std::runtime_error("autograd::layer_norm: sequence length T must be > 0");
     if (D == 0)
         throw std::runtime_error("autograd::layer_norm: feature dimension D must be > 0");
     if (weight.data().numel() != static_cast<int64_t>(D) ||
