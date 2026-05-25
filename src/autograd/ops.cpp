@@ -218,7 +218,8 @@ Variable log_softmax(const Variable& x) {
         throw std::runtime_error(
             "autograd::log_softmax: only 1D or 2D input supported");
 
-    Tensor probs     = ops::softmax(xd, -1);
+    const Tensor xc  = xd.contiguous();
+    Tensor probs     = ops::softmax(xc, -1);
     Tensor log_probs = ops::log(probs);
 
     auto out = make_node(std::move(log_probs), x.requires_grad());
@@ -326,7 +327,8 @@ Variable cross_entropy(const Variable& logits, const Tensor& targets) {
 // dL/dx = alpha * upstream
 
 Variable scale(const Variable& x, float alpha) {
-    auto out = make_node(ops::mul(x.data(), alpha), x.requires_grad());
+    const Tensor xc = x.data().contiguous();
+    auto out = make_node(ops::mul(xc, alpha), x.requires_grad());
     if (out->requires_grad)
         out->edges.push_back(make_edge(x.impl(),
             [alpha](const Tensor& g) { return ops::mul(g, alpha); }));
@@ -372,6 +374,12 @@ Variable softmax(const Variable& x) {
         out->edges.push_back(make_edge(x.impl(),
             [y_copy, N, C](const Tensor& g) {
                 const Tensor gc = g.contiguous();
+                if (gc.ndim() != 2 ||
+                    static_cast<std::size_t>(gc.shape()[0]) != N ||
+                    static_cast<std::size_t>(gc.shape()[1]) != C)
+                    throw std::runtime_error(std::format(
+                        "softmax backward: gradient shape ({},{}) != expected ({},{})",
+                        gc.shape()[0], gc.shape()[1], N, C));
                 const auto   gs = gc.data_as<float>();
                 const auto   ys = y_copy.data_as<float>();
                 Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)},

@@ -165,9 +165,11 @@ Tensor softmax(const Tensor& t, int dim) {
     if (t.ndim() > 2 || dim != -1)
         throw std::runtime_error("softmax: Ch02 only supports 1D/2D with dim=-1; full n-dim in Ch07");
     require_f32(t, "softmax");
+    const std::int64_t cols = t.shape(static_cast<std::size_t>(t.ndim() - 1));
+    if (cols == 0)
+        throw std::runtime_error("softmax: last dimension must be > 0");
     Tensor out(t.shape(), t.dtype(), t.device());
 
-    const std::int64_t cols = t.shape(static_cast<std::size_t>(t.ndim() - 1));
     const std::int64_t rows = t.numel() / cols;
 
     auto si  = t.data_as<float>();

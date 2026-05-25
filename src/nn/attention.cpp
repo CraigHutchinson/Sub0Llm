@@ -83,8 +83,11 @@ autograd::Variable MultiHeadSelfAttention::forward(const autograd::Variable& x,
             "MultiHeadSelfAttention::forward: input dim {} != embed_dim {}",
             D_in, embed_dim_));
 
-    const int64_t T           = x.data().shape()[0];
-    const float   scale_fac   = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    const int64_t T = x.data().shape()[0];
+    if (T < 1)
+        throw std::runtime_error(std::format(
+            "MultiHeadSelfAttention::forward: sequence length T={} must be >= 1", T));
+    const float scale_fac = 1.0f / std::sqrt(static_cast<float>(head_dim_));
 
     // One head → Variable (T, embed_dim).
     auto compute_head = [&](std::size_t h) -> Variable {
