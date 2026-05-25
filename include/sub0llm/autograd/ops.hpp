@@ -40,6 +40,22 @@ namespace sub0llm::autograd {
 // Backward: grad_x = upstream, grad_b = sum(upstream over rows).
 [[nodiscard]] Variable bias_add(const Variable& x, const Variable& b);
 
+// ── Activations (Ch08) ────────────────────────────────────────────────────────
+
+// Gaussian Error Linear Unit (tanh approximation, same as GPT-2).
+[[nodiscard]] Variable gelu(const Variable& x);
+
+// Layer normalisation with affine transform.
+//   x      : (T, D)   — input to normalise
+//   weight : (D,)     — learnable scale (gamma)
+//   bias   : (D,)     — learnable shift (beta)
+//   eps    : stability constant (default 1e-5)
+// Returns Variable (T, D).
+[[nodiscard]] Variable layer_norm(const Variable& x,
+                                  const Variable& weight,
+                                  const Variable& bias,
+                                  float eps = 1e-5f);
+
 // ── Attention ops ─────────────────────────────────────────────────────────────
 
 // Row-wise softmax over the last dimension.  Input must be 2D (N, C).

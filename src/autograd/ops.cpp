@@ -2,6 +2,7 @@
 
 #include "sub0llm/core/ops.hpp"
 
+#include <cmath>
 #include <format>
 #include <stdexcept>
 
@@ -317,6 +318,165 @@ Variable cross_entropy(const Variable& logits, const Tensor& targets) {
                 }
                 return grad;
             }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
+// ── gelu ─────────────────────────────────────────────────────────────────────
+//
+// y = gelu(x)  (tanh approximation: 0.5*x*(1+tanh(sqrt(2/π)*(x+0.044715*x³))))
+// dL/dx = g * gelu'(x)
+// gelu'(x) = 0.5*(1+t) + 0.5*x*(1-t²)*sqrt(2/π)*(1+3*0.044715*x²)
+//            where k = sqrt(2/π)*(x+0.044715*x³), t = tanh(k)
+
+Variable gelu(const Variable& x) {
+    const Tensor xc       = x.data().contiguous();
+    Tensor       out_data = ops::gelu(xc);
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad) {
+        Tensor x_snap = copy(xc);
+        out->edges.push_back(make_edge(x.impl(),
+            [x_snap](const Tensor& g) {
+                constexpr float kSqrt2OverPi = 0.7978845608f;
+                constexpr float kCoef        = 0.044715f;
+                const Tensor gc = g.contiguous();
+                const auto   gs = gc.data_as<float>();
+                const auto   xs = x_snap.data_as<float>();
+                Tensor gx = zeros(x_snap.shape(), DType::Float32, x_snap.device());
+                auto   gxs = gx.data_as<float>();
+                for (std::size_t i = 0; i < gxs.size(); ++i) {
+                    const float xi = xs[i];
+                    const float k  = kSqrt2OverPi * (xi + kCoef * xi * xi * xi);
+                    const float t  = std::tanh(k);
+                    const float dp = 0.5f * (1.0f + t) +
+                                     0.5f * xi * (1.0f - t * t) *
+                                     kSqrt2OverPi * (1.0f + 3.0f * kCoef * xi * xi);
+                    gxs[i] = gs[i] * dp;
+                }
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
+// ── layer_norm ────────────────────────────────────────────────────────────────
+//
+// y[t,d] = weight[d] * x_hat[t,d] + bias[d]
+// x_hat[t,d] = (x[t,d] - mean[t]) * rstd[t]
+//
+// Backward (standard LayerNorm JVP per row t):
+//   dhat[j]   = g[t,j] * weight[j]
+//   dx[t,j]   = (rstd[t]/D) * (D*dhat[j] - Σ_k dhat[k] - x_hat[t,j]*Σ_k dhat[k]*x_hat[t,k])
+//   dweight[j] = Σ_t g[t,j] * x_hat[t,j]
+//   dbias[j]   = Σ_t g[t,j]
+
+Variable layer_norm(const Variable& x, const Variable& weight,
+                    const Variable& bias, float eps) {
+    const auto& xd = x.data();
+    if (xd.ndim() != 2)
+        throw std::runtime_error("autograd::layer_norm: x must be 2D (T, D)");
+    const std::size_t T = static_cast<std::size_t>(xd.shape()[0]);
+    const std::size_t D = static_cast<std::size_t>(xd.shape()[1]);
+    if (D == 0)
+        throw std::runtime_error("autograd::layer_norm: feature dimension D must be > 0");
+    if (weight.data().numel() != static_cast<int64_t>(D) ||
+        bias.data().numel()   != static_cast<int64_t>(D))
+        throw std::runtime_error(std::format(
+            "autograd::layer_norm: weight/bias numel ({},{}) must equal D={}",
+            weight.data().numel(), bias.data().numel(), D));
+
+    const Tensor xc = xd.contiguous();
+    const Tensor wc = weight.data().contiguous();
+    const Tensor bc = bias.data().contiguous();
+    const auto   xcs = xc.data_as<float>();
+    const auto   ws  = wc.data_as<float>();
+    const auto   bs  = bc.data_as<float>();
+
+    Tensor x_hat  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+    Tensor rstd_t = zeros({static_cast<int64_t>(T)});
+    Tensor out_d  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+    {
+        auto xhs = x_hat.data_as<float>();
+        auto rs  = rstd_t.data_as<float>();
+        auto od  = out_d.data_as<float>();
+        const float Df = static_cast<float>(D);
+        for (std::size_t i = 0; i < T; ++i) {
+            float mu = 0.0f;
+            for (std::size_t j = 0; j < D; ++j) mu += xcs[i * D + j];
+            mu /= Df;
+            float var = 0.0f;
+            for (std::size_t j = 0; j < D; ++j) {
+                const float d = xcs[i * D + j] - mu;
+                var += d * d;
+            }
+            var /= Df;
+            const float rs_i = 1.0f / std::sqrt(var + eps);
+            rs[i] = rs_i;
+            for (std::size_t j = 0; j < D; ++j) {
+                xhs[i * D + j] = (xcs[i * D + j] - mu) * rs_i;
+                od[i * D + j]  = ws[j] * xhs[i * D + j] + bs[j];
+            }
+        }
+    }
+
+    const bool rg = x.requires_grad() || weight.requires_grad() || bias.requires_grad();
+    auto out = make_node(std::move(out_d), rg);
+    if (rg) {
+        Tensor xh_snap = copy(x_hat);
+        Tensor rs_snap = rstd_t;
+        Tensor w_snap  = copy(wc);
+
+        if (x.requires_grad())
+            out->edges.push_back(make_edge(x.impl(),
+                [xh_snap, rs_snap, w_snap, T, D](const Tensor& g) {
+                    const Tensor gc = g.contiguous();
+                    const auto   gs  = gc.data_as<float>();
+                    const auto   xhs = xh_snap.data_as<float>();
+                    const auto   rs  = rs_snap.data_as<float>();
+                    const auto   wgs = w_snap.data_as<float>();
+                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+                    auto   gxs = gx.data_as<float>();
+                    const float Df = static_cast<float>(D);
+                    for (std::size_t i = 0; i < T; ++i) {
+                        float s1 = 0.0f, s2 = 0.0f;
+                        for (std::size_t j = 0; j < D; ++j) {
+                            const float dh = gs[i * D + j] * wgs[j];
+                            s1 += dh;
+                            s2 += dh * xhs[i * D + j];
+                        }
+                        for (std::size_t j = 0; j < D; ++j) {
+                            const float dh = gs[i * D + j] * wgs[j];
+                            gxs[i * D + j] = rs[i] / Df *
+                                (Df * dh - s1 - xhs[i * D + j] * s2);
+                        }
+                    }
+                    return gx;
+                }));
+        if (weight.requires_grad())
+            out->edges.push_back(make_edge(weight.impl(),
+                [xh_snap, T, D](const Tensor& g) {
+                    const Tensor gc = g.contiguous();
+                    const auto   gs = gc.data_as<float>();
+                    const auto   xhs= xh_snap.data_as<float>();
+                    Tensor gw = zeros({static_cast<int64_t>(D)});
+                    auto   gws = gw.data_as<float>();
+                    for (std::size_t i = 0; i < T; ++i)
+                        for (std::size_t j = 0; j < D; ++j)
+                            gws[j] += gs[i * D + j] * xhs[i * D + j];
+                    return gw;
+                }));
+        if (bias.requires_grad())
+            out->edges.push_back(make_edge(bias.impl(),
+                [T, D](const Tensor& g) {
+                    const Tensor gc = g.contiguous();
+                    const auto   gs = gc.data_as<float>();
+                    Tensor gb = zeros({static_cast<int64_t>(D)});
+                    auto   gbs = gb.data_as<float>();
+                    for (std::size_t i = 0; i < T; ++i)
+                        for (std::size_t j = 0; j < D; ++j)
+                            gbs[j] += gs[i * D + j];
+                    return gb;
+                }));
     }
     return Variable::wrap(std::move(out));
 }

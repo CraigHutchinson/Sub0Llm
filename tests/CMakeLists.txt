@@ -7,6 +7,7 @@ add_executable(tests
     test_autograd.cpp
     test_embeddings.cpp
     test_attention.cpp
+    test_gpt.cpp
 )
 
 target_link_libraries(tests
