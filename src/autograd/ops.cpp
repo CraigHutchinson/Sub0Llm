@@ -320,4 +320,74 @@ Variable cross_entropy(const Variable& logits, const Tensor& targets) {
     return Variable::wrap(std::move(out));
 }
 
+// ── scale ─────────────────────────────────────────────────────────────────────
+//
+// y = alpha * x    (scalar broadcast, no learnable parameter)
+// dL/dx = alpha * upstream
+
+Variable scale(const Variable& x, float alpha) {
+    auto out = make_node(ops::mul(x.data(), alpha), x.requires_grad());
+    if (out->requires_grad)
+        out->edges.push_back(make_edge(x.impl(),
+            [alpha](const Tensor& g) { return ops::mul(g, alpha); }));
+    return Variable::wrap(std::move(out));
+}
+
+// ── transpose2d ───────────────────────────────────────────────────────────────
+//
+// y = x^T   (M, N) → (N, M)
+// dL/dx = (dL/dy)^T
+
+Variable transpose2d(const Variable& x) {
+    if (x.data().ndim() != 2)
+        throw std::runtime_error("autograd::transpose2d: input must be 2D (M, N)");
+    Tensor out_data = x.data().transpose(0, 1).contiguous();
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad)
+        out->edges.push_back(make_edge(x.impl(),
+            [](const Tensor& g) { return g.transpose(0, 1).contiguous(); }));
+    return Variable::wrap(std::move(out));
+}
+
+// ── softmax ───────────────────────────────────────────────────────────────────
+//
+// y = softmax(x, dim=-1)   row-wise for 2D input (N, C)
+//
+// Backward (Jacobian-vector product):
+//   dL/dx[i] = y[i] * (g[i] - dot(g[i], y[i]))  per row i
+
+Variable softmax(const Variable& x) {
+    const auto& xd = x.data();
+    if (xd.ndim() != 2)
+        throw std::runtime_error("autograd::softmax: only 2D input (N, C) supported");
+
+    const Tensor xc       = xd.contiguous();
+    Tensor       out_data = ops::softmax(xc, -1);
+
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad) {
+        Tensor y_copy = copy(out->data);
+        const std::size_t N = static_cast<std::size_t>(xd.shape()[0]);
+        const std::size_t C = static_cast<std::size_t>(xd.shape()[1]);
+        out->edges.push_back(make_edge(x.impl(),
+            [y_copy, N, C](const Tensor& g) {
+                const Tensor gc = g.contiguous();
+                const auto   gs = gc.data_as<float>();
+                const auto   ys = y_copy.data_as<float>();
+                Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)},
+                                  DType::Float32, y_copy.device());
+                auto gxs = gx.data_as<float>();
+                for (std::size_t i = 0; i < N; ++i) {
+                    float dot = 0.0f;
+                    for (std::size_t j = 0; j < C; ++j)
+                        dot += gs[i * C + j] * ys[i * C + j];
+                    for (std::size_t j = 0; j < C; ++j)
+                        gxs[i * C + j] = ys[i * C + j] * (gs[i * C + j] - dot);
+                }
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
 } // namespace sub0llm::autograd

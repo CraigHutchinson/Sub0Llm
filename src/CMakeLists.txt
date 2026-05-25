@@ -13,6 +13,7 @@ set(SUB0LLM_SOURCES
     autograd/embedding_ops.cpp
     nn/embedding.cpp
     nn/positional_encoding.cpp
+    nn/attention.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.

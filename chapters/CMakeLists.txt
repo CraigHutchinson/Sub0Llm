@@ -4,5 +4,6 @@ add_subdirectory(ch03_tokenization)
 add_subdirectory(ch04_dataset)
 add_subdirectory(ch05_autograd)
 add_subdirectory(ch06_embeddings)
+add_subdirectory(ch07_attention)
 # Chapters are added here as they are written.
 # ... and so on through ch14_inference

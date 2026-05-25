@@ -40,6 +40,18 @@ namespace sub0llm::autograd {
 // Backward: grad_x = upstream, grad_b = sum(upstream over rows).
 [[nodiscard]] Variable bias_add(const Variable& x, const Variable& b);
 
+// ── Attention ops ─────────────────────────────────────────────────────────────
+
+// Row-wise softmax over the last dimension.  Input must be 2D (N, C).
+// Backward: grad_x[i] = y[i] * (g[i] - dot(g[i], y[i])) per row.
+[[nodiscard]] Variable softmax(const Variable& x);
+
+// Swap dimensions 0 and 1 of a 2D matrix: (M, N) → (N, M).
+[[nodiscard]] Variable transpose2d(const Variable& x);
+
+// Multiply all elements by a scalar constant (no learnable parameter).
+[[nodiscard]] Variable scale(const Variable& x, float alpha);
+
 // ── Operator overloads (thin wrappers) ────────────────────────────────────────
 
 inline Variable operator+(const Variable& a, const Variable& b) { return add(a, b); }
