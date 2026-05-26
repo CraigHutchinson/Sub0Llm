@@ -13,6 +13,7 @@ add_executable(tests
     test_pretraining.cpp
     test_lora.cpp
     test_dpo.cpp
+    test_sampler.cpp
 )
 
 target_link_libraries(tests

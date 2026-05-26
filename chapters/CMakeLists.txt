@@ -11,5 +11,6 @@ add_subdirectory(ch10_modern_arch)
 add_subdirectory(ch11_pretraining)
 add_subdirectory(ch12_finetuning)
 add_subdirectory(ch13_alignment)
+add_subdirectory(ch14_inference)
 # Chapters are added here as they are written.
 # ... and so on through ch14_inference

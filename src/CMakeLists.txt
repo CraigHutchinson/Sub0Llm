@@ -21,6 +21,7 @@ set(SUB0LLM_SOURCES
     nn/trainer.cpp
     nn/lora.cpp
     nn/dpo.cpp
+    nn/sampler.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
