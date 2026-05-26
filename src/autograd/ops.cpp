@@ -752,4 +752,39 @@ Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freq
     return Variable::wrap(std::move(out));
 }
 
+// ── narrow ────────────────────────────────────────────────────────────────────
+//
+// Extract rows [start, start+length) along dim 0.  Backward: scatter upstream
+// gradient into a zeros tensor of the original shape.
+
+Variable narrow(const Variable& x, int64_t start, int64_t length) {
+    const auto& xd = x.data();
+    if (xd.ndim() < 1)
+        throw std::runtime_error("autograd::narrow: input must be at least 1D");
+    const int64_t T = xd.shape(0);
+    if (start < 0 || length <= 0 || start + length > T)
+        throw std::runtime_error(std::format(
+            "autograd::narrow: [{},{}) out of range [0,{})", start, start + length, T));
+
+    Tensor out_data = ops::narrow(xd, start, length);
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad) {
+        Shape orig_shape = xd.shape();
+        out->edges.push_back(make_edge(x.impl(),
+            [start, length, orig_shape](const Tensor& g) {
+                const Tensor gc = g.contiguous();
+                const auto   gs = gc.data_as<float>();
+                Tensor gx  = zeros(orig_shape);
+                auto   gxs = gx.data_as<float>();
+                const int64_t row_elems = gc.numel() / length;
+                for (int64_t i = 0; i < length; ++i)
+                    for (int64_t j = 0; j < row_elems; ++j)
+                        gxs[static_cast<std::size_t>((start + i) * row_elems + j)] =
+                            gs[static_cast<std::size_t>(i * row_elems + j)];
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
 } // namespace sub0llm::autograd

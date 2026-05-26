@@ -48,4 +48,12 @@ namespace sub0llm::ops {
 // ── Norms ─────────────────────────────────────────────────────────────────────
 [[nodiscard]] float  norm(const Tensor& t);        // L2 norm
 
+// ── Indexing / slicing (Ch11) ─────────────────────────────────────────────────
+// Extract a contiguous slice along dim 0.
+//   t:      (T, ...) input
+//   start:  first row index (0-indexed)
+//   length: number of rows to extract
+// Returns tensor of shape (length, ...).
+[[nodiscard]] Tensor narrow(const Tensor& t, int64_t start, int64_t length);
+
 } // namespace sub0llm::ops

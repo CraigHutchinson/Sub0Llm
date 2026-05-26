@@ -233,4 +233,28 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor narrow(const Tensor& t, int64_t start, int64_t length) {
+    require_f32(t, "narrow");
+    require_cpu(t, "narrow");
+    if (t.ndim() < 1)
+        throw std::runtime_error("narrow: input must be at least 1D");
+    const int64_t T = t.shape(0);
+    if (start < 0 || length <= 0 || start + length > T)
+        throw std::runtime_error(
+            std::format("narrow: [{},{}) out of range [0,{})", start, start + length, T));
+
+    const int64_t row_elems = t.numel() / T;
+    Tensor::Shape out_shape = t.shape();
+    out_shape[0] = length;
+    Tensor out(out_shape, t.dtype(), t.device());
+
+    const auto src = t.data_as<float>();
+    auto       dst = out.data_as<float>();
+    for (int64_t i = 0; i < length; ++i)
+        for (int64_t j = 0; j < row_elems; ++j)
+            dst[static_cast<std::size_t>(i * row_elems + j)] =
+                src[static_cast<std::size_t>((start + i) * row_elems + j)];
+    return out;
+}
+
 } // namespace sub0llm::ops

@@ -17,6 +17,8 @@ set(SUB0LLM_SOURCES
     nn/gpt.cpp
     nn/optimizer.cpp
     nn/modern_gpt.cpp
+    nn/scheduler.cpp
+    nn/trainer.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.

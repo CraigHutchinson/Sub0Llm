@@ -10,6 +10,7 @@ add_executable(tests
     test_gpt.cpp
     test_optimizer.cpp
     test_modern_gpt.cpp
+    test_pretraining.cpp
 )
 
 target_link_libraries(tests

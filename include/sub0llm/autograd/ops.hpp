@@ -91,6 +91,12 @@ namespace sub0llm::autograd {
 // Multiply all elements by a scalar constant (no learnable parameter).
 [[nodiscard]] Variable scale(const Variable& x, float alpha);
 
+// ── Indexing / slicing (Ch11) ─────────────────────────────────────────────────
+
+// Extract rows [start, start+length) along dim 0 of a 2-D or 1-D Variable.
+// Backward scatters upstream gradient back into the original row range.
+[[nodiscard]] Variable narrow(const Variable& x, int64_t start, int64_t length);
+
 // ── Operator overloads (thin wrappers) ────────────────────────────────────────
 
 inline Variable operator+(const Variable& a, const Variable& b) { return add(a, b); }
