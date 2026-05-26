@@ -15,6 +15,7 @@ set(SUB0LLM_SOURCES
     nn/positional_encoding.cpp
     nn/attention.cpp
     nn/gpt.cpp
+    nn/optimizer.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.

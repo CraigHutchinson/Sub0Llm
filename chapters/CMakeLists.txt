@@ -6,5 +6,6 @@ add_subdirectory(ch05_autograd)
 add_subdirectory(ch06_embeddings)
 add_subdirectory(ch07_attention)
 add_subdirectory(ch08_gpt)
+add_subdirectory(ch09_optimizer)
 # Chapters are added here as they are written.
 # ... and so on through ch14_inference
