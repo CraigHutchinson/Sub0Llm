@@ -202,6 +202,28 @@ TEST_CASE("Adam: skips params with no grad", "[optimizer]") {
     REQUIRE_THAT(p.data().data_as<float>()[0], WithinAbs(3.0f, 1e-6f));
 }
 
+TEST_CASE("SGD: constructor throws on null or duplicate params", "[optimizer]") {
+    Variable p = leaf1d({1.0f});
+    Variable q = leaf1d({2.0f});
+    // null pointer
+    std::vector<Variable*> null_params = {nullptr};
+    REQUIRE_THROWS_AS(nn::SGD(null_params, 0.1f), std::runtime_error);
+    // duplicate pointer
+    std::vector<Variable*> dup_params = {&p, &p};
+    REQUIRE_THROWS_AS(nn::SGD(dup_params, 0.1f), std::runtime_error);
+    // valid
+    REQUIRE_NOTHROW(nn::SGD({&p, &q}, 0.1f));
+}
+
+TEST_CASE("Adam: constructor throws on null or duplicate params", "[optimizer]") {
+    Variable p = leaf1d({1.0f});
+    Variable q = leaf1d({2.0f});
+    std::vector<Variable*> null_params = {nullptr};
+    REQUIRE_THROWS_AS(nn::Adam(null_params, 0.001f), std::runtime_error);
+    std::vector<Variable*> dup_params = {&p, &p};
+    REQUIRE_THROWS_AS(nn::Adam(dup_params, 0.001f), std::runtime_error);
+}
+
 TEST_CASE("Adam: constructor throws on invalid b1", "[optimizer]") {
     Variable p = leaf1d({1.0f});
     REQUIRE_THROWS_AS((nn::Adam({&p}, 1e-3f, 1.0f, 0.999f, 1e-8f)), std::runtime_error);

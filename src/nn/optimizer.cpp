@@ -6,8 +6,27 @@
 #include <cmath>
 #include <format>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace sub0llm::nn {
+
+namespace {
+
+void validate_params(const std::vector<autograd::Variable*>& params,
+                     std::string_view who) {
+    std::unordered_set<const autograd::Variable*> seen;
+    for (const auto* p : params) {
+        if (!p || !p->defined())
+            throw std::runtime_error(std::format(
+                "{}: null or uninitialised Variable* in params", who));
+        if (!seen.insert(p).second)
+            throw std::runtime_error(std::format(
+                "{}: duplicate Variable* in params (same pointer appears twice)",
+                who));
+    }
+}
+
+} // anonymous namespace
 
 float clip_grad_norm(const std::vector<autograd::Variable*>& params,
                      float max_norm) {
@@ -36,6 +55,7 @@ float clip_grad_norm(const std::vector<autograd::Variable*>& params,
 
 SGD::SGD(std::vector<autograd::Variable*> params, float lr, float momentum)
     : params_(std::move(params)), lr_(lr), momentum_(momentum) {
+    validate_params(params_, "SGD");
     velocity_.reserve(params_.size());
     for (const auto* p : params_)
         velocity_.push_back(zeros(p->data().shape(), p->data().dtype(),
@@ -66,6 +86,7 @@ void SGD::zero_grad() {
 Adam::Adam(std::vector<autograd::Variable*> params,
            float lr, float b1, float b2, float eps)
     : params_(std::move(params)), lr_(lr), b1_(b1), b2_(b2), eps_(eps) {
+    validate_params(params_, "Adam");
     if (b1 < 0.0f || b1 >= 1.0f)
         throw std::runtime_error(std::format(
             "Adam: b1={} must be in [0, 1)", b1));
