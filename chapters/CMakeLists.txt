@@ -14,4 +14,5 @@ add_subdirectory(ch13_alignment)
 add_subdirectory(ch14_inference)
 add_subdirectory(ch15_distillation)
 add_subdirectory(ch16_thinking)
+add_subdirectory(ch17_looped_gpt)
 # Chapters are added here as they are written.

@@ -37,7 +37,7 @@ cmake --build build-rel --parallel
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch16, complete)
+## Current state (Ch01–Ch17, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -60,7 +60,7 @@ cmake --build build-rel --parallel
 - `include/sub0llm/autograd/variable.hpp`, `ops.hpp` — Reverse-mode autograd, full op set including `log_sigmoid`
 - `src/autograd/variable.cpp`, `ops.cpp`, `embedding_ops.cpp`
 
-### Neural network modules (Ch06–Ch15)
+### Neural network modules (Ch06–Ch17)
 - `include/sub0llm/nn/embedding.hpp` — Token and positional embeddings
 - `include/sub0llm/nn/attention.hpp` — Multi-head attention (Ch07)
 - `include/sub0llm/nn/gpt.hpp` — Vanilla GPT (Ch08)
@@ -72,9 +72,10 @@ cmake --build build-rel --parallel
 - `include/sub0llm/nn/sampler.hpp` — Greedy/temperature/top-k/top-p sampling, `generate` loop (Ch14)
 - `include/sub0llm/nn/distillation.hpp` — Soft cross-entropy, knowledge distillation loss (Ch15)
 - `include/sub0llm/nn/thinking.hpp` — `ThinkingConfig`, `ThinkingResult`, `generate_with_thinking`, `think_self_consistency` (Ch16)
+- `include/sub0llm/nn/looped_gpt.hpp` — `LoopedGPT`: single block looped K times, `forward_k()` runtime budget (Ch17)
 
 ### Tests
-317 Catch2 tests across 18 test files — all passing.
+329 Catch2 tests across 19 test files — all passing.
 
 ## Git branch
 
