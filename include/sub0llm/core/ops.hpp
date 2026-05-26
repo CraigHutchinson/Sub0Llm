@@ -29,6 +29,7 @@ namespace sub0llm::ops {
 // ── Activations ───────────────────────────────────────────────────────────────
 [[nodiscard]] Tensor relu(const Tensor& t);
 [[nodiscard]] Tensor gelu(const Tensor& t);   // added in Ch08 (GPT uses GELU)
+[[nodiscard]] Tensor silu(const Tensor& t);   // added in Ch10 (SwiGLU uses SiLU)
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim = -1);
 [[nodiscard]] Tensor sigmoid(const Tensor& t);
 

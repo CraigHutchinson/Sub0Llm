@@ -161,6 +161,19 @@ Tensor gelu(const Tensor& t) {
     return out;
 }
 
+Tensor silu(const Tensor& t) {
+    require_f32(t, "silu");
+    Tensor out(t.shape(), t.dtype(), t.device());
+    auto si  = t.data_as<float>();
+    auto dst = out.data_as<float>();
+    for (std::size_t i = 0; i < dst.size(); ++i) {
+        const float x  = si[i];
+        const float sg = 1.0f / (1.0f + std::exp(-x));
+        dst[i] = x * sg;
+    }
+    return out;
+}
+
 Tensor softmax(const Tensor& t, int dim) {
     if (t.ndim() > 2 || dim != -1)
         throw std::runtime_error("softmax: Ch02 only supports 1D/2D with dim=-1; full n-dim in Ch07");

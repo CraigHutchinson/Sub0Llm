@@ -45,6 +45,29 @@ namespace sub0llm::autograd {
 // Gaussian Error Linear Unit (tanh approximation, same as GPT-2).
 [[nodiscard]] Variable gelu(const Variable& x);
 
+// ── Activations / norms (Ch10) ────────────────────────────────────────────────
+
+// SiLU activation: y = x * sigmoid(x).  Used as the gate in SwiGLU FFNs.
+[[nodiscard]] Variable silu(const Variable& x);
+
+// RMS Normalisation — no mean subtraction, no bias (LLaMA/Gemma/Qwen style).
+//   y[t,d] = weight[d] * x[t,d] / RMS(x[t,:])
+//   RMS(v) = sqrt((1/D) * Σ v_i² + eps)
+//   x: (T, D),  weight: (D,).
+[[nodiscard]] Variable rms_norm(const Variable& x, const Variable& weight,
+                                float eps = 1e-6f);
+
+// Rotary Position Embedding (RoPE) — applied to one head's Q or K.
+//   x:         (T, Dh)      input head tensor
+//   cos_freqs: (T, Dh/2)   cos(pos * θ_i),  θ_i = base^(-2i/Dh)
+//   sin_freqs: (T, Dh/2)   sin(pos * θ_i)
+// For each position t and pair i:
+//   out[t, 2i]   = x[t,2i]*cos[t,i] − x[t,2i+1]*sin[t,i]
+//   out[t, 2i+1] = x[t,2i]*sin[t,i] + x[t,2i+1]*cos[t,i]
+[[nodiscard]] Variable rope(const Variable& x,
+                             const Tensor& cos_freqs,
+                             const Tensor& sin_freqs);
+
 // Layer normalisation with affine transform.
 //   x      : (T, D)   — input to normalise
 //   weight : (D,)     — learnable scale (gamma)

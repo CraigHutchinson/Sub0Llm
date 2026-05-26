@@ -16,6 +16,7 @@ set(SUB0LLM_SOURCES
     nn/attention.cpp
     nn/gpt.cpp
     nn/optimizer.cpp
+    nn/modern_gpt.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.

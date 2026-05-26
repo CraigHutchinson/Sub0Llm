@@ -561,4 +561,195 @@ Variable softmax(const Variable& x) {
     return Variable::wrap(std::move(out));
 }
 
+// ── silu ──────────────────────────────────────────────────────────────────────
+//
+// y = x * sigmoid(x) = x / (1 + exp(-x))
+// dy/dx = sigmoid(x) * (1 + x * (1 − sigmoid(x)))
+
+Variable silu(const Variable& x) {
+    const Tensor xc = x.data().contiguous();
+    Tensor out_data = ops::silu(xc);
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad) {
+        Tensor x_snap = copy(xc);
+        out->edges.push_back(make_edge(x.impl(),
+            [x_snap](const Tensor& g) {
+                const Tensor gc = g.contiguous();
+                const auto   gs = gc.data_as<float>();
+                const auto   xs = x_snap.data_as<float>();
+                Tensor gx  = zeros(x_snap.shape(), DType::Float32, x_snap.device());
+                auto   gxs = gx.data_as<float>();
+                for (std::size_t i = 0; i < gxs.size(); ++i) {
+                    const float xi  = xs[i];
+                    const float sig = 1.0f / (1.0f + std::exp(-xi));
+                    gxs[i] = gs[i] * sig * (1.0f + xi * (1.0f - sig));
+                }
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
+// ── rms_norm ──────────────────────────────────────────────────────────────────
+//
+// y[t,d] = weight[d] * x_norm[t,d],  x_norm[t,d] = x[t,d] / rms[t]
+// rms[t] = sqrt((1/D) * Σ_j x[t,j]² + eps)
+//
+// Backward:
+//   h[j]     = weight[j] * g[t,j]                   (per row t)
+//   σ[t]     = dot(h[t,:], x_norm[t,:])
+//   dx[t,j]  = inv_rms[t]/D * (D*h[j] − x_norm[t,j] * σ[t])
+//   dweight[j] = Σ_t g[t,j] * x_norm[t,j]
+
+Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
+    const auto& xd = x.data();
+    if (xd.ndim() != 2)
+        throw std::runtime_error("autograd::rms_norm: x must be 2D (T, D)");
+    const std::size_t T = static_cast<std::size_t>(xd.shape()[0]);
+    const std::size_t D = static_cast<std::size_t>(xd.shape()[1]);
+    if (T == 0 || D == 0)
+        throw std::runtime_error("autograd::rms_norm: T and D must be > 0");
+    if (weight.data().numel() != static_cast<int64_t>(D))
+        throw std::runtime_error(std::format(
+            "autograd::rms_norm: weight numel {} must equal D={}", weight.data().numel(), D));
+
+    const Tensor xc = xd.contiguous();
+    const Tensor wc = weight.data().contiguous();
+    const auto   xs = xc.data_as<float>();
+    const auto   ws = wc.data_as<float>();
+    const float  Df = static_cast<float>(D);
+
+    Tensor x_norm  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+    Tensor inv_rms = zeros({static_cast<int64_t>(T)});
+    Tensor out_d   = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+    {
+        auto xns  = x_norm.data_as<float>();
+        auto irs  = inv_rms.data_as<float>();
+        auto od   = out_d.data_as<float>();
+        for (std::size_t t = 0; t < T; ++t) {
+            float ss = 0.0f;
+            for (std::size_t j = 0; j < D; ++j) ss += xs[t * D + j] * xs[t * D + j];
+            const float ir = 1.0f / std::sqrt(ss / Df + eps);
+            irs[t] = ir;
+            for (std::size_t j = 0; j < D; ++j) {
+                xns[t * D + j] = xs[t * D + j] * ir;
+                od[t * D + j]  = ws[j] * xns[t * D + j];
+            }
+        }
+    }
+
+    const bool rg = x.requires_grad() || weight.requires_grad();
+    auto out = make_node(std::move(out_d), rg);
+    if (rg) {
+        Tensor xn_snap  = copy(x_norm);
+        Tensor ir_snap  = copy(inv_rms);
+        Tensor w_snap   = copy(wc);
+
+        if (x.requires_grad())
+            out->edges.push_back(make_edge(x.impl(),
+                [xn_snap, ir_snap, w_snap, T, D, Df](const Tensor& g) {
+                    const Tensor gc  = g.contiguous();
+                    const auto   gs  = gc.data_as<float>();
+                    const auto   xns = xn_snap.data_as<float>();
+                    const auto   irs = ir_snap.data_as<float>();
+                    const auto   wb  = w_snap.data_as<float>();
+                    Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+                    auto   gxs = gx.data_as<float>();
+                    for (std::size_t t = 0; t < T; ++t) {
+                        float sigma = 0.0f;
+                        for (std::size_t j = 0; j < D; ++j)
+                            sigma += wb[j] * gs[t * D + j] * xns[t * D + j];
+                        for (std::size_t j = 0; j < D; ++j) {
+                            const float h = wb[j] * gs[t * D + j];
+                            gxs[t * D + j] = irs[t] / Df * (Df * h - xns[t * D + j] * sigma);
+                        }
+                    }
+                    return gx;
+                }));
+        if (weight.requires_grad())
+            out->edges.push_back(make_edge(weight.impl(),
+                [xn_snap, T, D](const Tensor& g) {
+                    const Tensor gc  = g.contiguous();
+                    const auto   gs  = gc.data_as<float>();
+                    const auto   xns = xn_snap.data_as<float>();
+                    Tensor gw  = zeros({static_cast<int64_t>(D)});
+                    auto   gws = gw.data_as<float>();
+                    for (std::size_t t = 0; t < T; ++t)
+                        for (std::size_t j = 0; j < D; ++j)
+                            gws[j] += gs[t * D + j] * xns[t * D + j];
+                    return gw;
+                }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
+// ── rope ──────────────────────────────────────────────────────────────────────
+//
+// Rotary Position Embedding applied to one head's Q or K.
+//   x:         (T, Dh)      input
+//   cos_freqs: (T, Dh/2)   precomputed
+//   sin_freqs: (T, Dh/2)   precomputed (no grad — constants)
+//
+// Forward (pair i at position t):
+//   out[t, 2i]   = x[t,2i]*c − x[t,2i+1]*s
+//   out[t, 2i+1] = x[t,2i]*s + x[t,2i+1]*c
+//
+// Backward (rotate upstream by −θ, i.e. swap sin sign):
+//   dx[t, 2i]   =  g[t,2i]*c + g[t,2i+1]*s
+//   dx[t, 2i+1] = −g[t,2i]*s + g[t,2i+1]*c
+
+Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freqs) {
+    const auto& xd = x.data();
+    if (xd.ndim() != 2)
+        throw std::runtime_error("autograd::rope: x must be 2D (T, Dh)");
+    const std::size_t T  = static_cast<std::size_t>(xd.shape()[0]);
+    const std::size_t Dh = static_cast<std::size_t>(xd.shape()[1]);
+    if (Dh % 2 != 0)
+        throw std::runtime_error("autograd::rope: head_dim Dh must be even");
+    const std::size_t D2 = Dh / 2;
+
+    const Tensor xc = xd.contiguous();
+    const auto   xs = xc.data_as<float>();
+    const auto   cs = cos_freqs.data_as<float>();
+    const auto   ss = sin_freqs.data_as<float>();
+
+    Tensor out_d = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)});
+    auto   od    = out_d.data_as<float>();
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t i = 0; i < D2; ++i) {
+            const float c  = cs[t * D2 + i];
+            const float s  = ss[t * D2 + i];
+            const float x0 = xs[t * Dh + 2 * i];
+            const float x1 = xs[t * Dh + 2 * i + 1];
+            od[t * Dh + 2 * i]     = x0 * c - x1 * s;
+            od[t * Dh + 2 * i + 1] = x0 * s + x1 * c;
+        }
+
+    auto out = make_node(std::move(out_d), x.requires_grad());
+    if (out->requires_grad) {
+        Tensor cf_snap = copy(cos_freqs);
+        Tensor sf_snap = copy(sin_freqs);
+        out->edges.push_back(make_edge(x.impl(),
+            [cf_snap, sf_snap, T, Dh, D2](const Tensor& g) {
+                const Tensor gc = g.contiguous();
+                const auto   gs = gc.data_as<float>();
+                const auto   cf = cf_snap.data_as<float>();
+                const auto   sf = sf_snap.data_as<float>();
+                Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)});
+                auto   gxs = gx.data_as<float>();
+                for (std::size_t t = 0; t < T; ++t)
+                    for (std::size_t i = 0; i < D2; ++i) {
+                        const float c  = cf[t * D2 + i];
+                        const float s  = sf[t * D2 + i];
+                        const float g0 = gs[t * Dh + 2 * i];
+                        const float g1 = gs[t * Dh + 2 * i + 1];
+                        gxs[t * Dh + 2 * i]     =  g0 * c + g1 * s;
+                        gxs[t * Dh + 2 * i + 1] = -g0 * s + g1 * c;
+                    }
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
 } // namespace sub0llm::autograd

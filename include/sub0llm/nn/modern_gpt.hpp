@@ -1,0 +1,166 @@
+#pragma once
+
+#include "sub0llm/autograd/ops.hpp"
+#include "sub0llm/autograd/variable.hpp"
+#include "sub0llm/core/tensor.hpp"
+#include "sub0llm/nn/embedding.hpp"
+#include "sub0llm/nn/gpt.hpp"       // reuses Linear from Ch08
+
+#include <cstdint>
+#include <vector>
+
+namespace sub0llm::nn {
+
+// ── RMSNorm ───────────────────────────────────────────────────────────────────
+//
+// Replaces LayerNorm: no mean subtraction, no bias, cheaper to compute.
+//   y[t,d] = weight[d] * x[t,d] / RMS(x[t,:])
+//   weight (gamma): (D,), initialised to 1.
+class RMSNorm {
+public:
+    explicit RMSNorm(int64_t D, float eps = 1e-6f);
+
+    [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+    [[nodiscard]] std::vector<autograd::Variable*> parameters();
+
+    [[nodiscard]] int64_t dim() const noexcept;
+
+private:
+    autograd::Variable weight_;
+    float              eps_;
+};
+
+// ── SwiGLUFeedForward ─────────────────────────────────────────────────────────
+//
+// Replaces GELU FFN.  Three projections:
+//   gate(x) = SiLU(W_gate · x)    (D → d_ff)
+//   up(x)   = W_up   · x          (D → d_ff)
+//   down(x) = W_down · (gate ⊙ up) (d_ff → D)
+//
+// d_ff defaults to 8*D/3 (rounded to nearest multiple of 64) to match the
+// parameter count of the 2-layer GELU FFN.
+class SwiGLUFeedForward {
+public:
+    // d_ff = 0 → auto-compute 8*D/3 rounded up to next 64.
+    SwiGLUFeedForward(int64_t D, int64_t d_ff = 0, std::uint64_t seed = 42);
+
+    [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+    [[nodiscard]] std::vector<autograd::Variable*> parameters();
+
+private:
+    Linear gate_;
+    Linear up_;
+    Linear down_;
+};
+
+// ── GroupedQueryAttention ─────────────────────────────────────────────────────
+//
+// Generalises MHA with n_kv_heads ≤ n_heads shared KV heads (GQA).
+// Special cases: n_kv_heads == n_heads → standard MHA;
+//                n_kv_heads == 1       → MQA (Multi-Query Attention).
+//
+// RoPE positional embeddings are applied to Q and K inside forward().
+// Frequencies are recomputed each call (O(T·head_dim) trig ops — acceptable
+// for education; a real implementation would cache them).
+//
+// Weight layout:
+//   W_Q[h]:  (embed_dim, head_dim)   — n_heads  matrices
+//   W_K[g]:  (embed_dim, head_dim)   — n_kv_heads matrices
+//   W_V[g]:  (embed_dim, head_dim)   — n_kv_heads matrices
+//   W_O[h]:  (head_dim,  embed_dim)  — n_heads  matrices
+class GroupedQueryAttention {
+public:
+    // embed_dim must be divisible by n_heads; n_heads must be divisible by n_kv_heads.
+    GroupedQueryAttention(std::size_t embed_dim,
+                          std::size_t n_heads,
+                          std::size_t n_kv_heads,
+                          float       rope_base = 10000.0f,
+                          std::uint64_t seed    = 42);
+
+    // x: (T, embed_dim); causal = apply lower-triangular mask.
+    [[nodiscard]] autograd::Variable forward(const autograd::Variable& x,
+                                              bool causal = true) const;
+
+    [[nodiscard]] std::vector<autograd::Variable*> parameters();
+
+    [[nodiscard]] std::size_t n_heads()    const noexcept { return n_heads_; }
+    [[nodiscard]] std::size_t n_kv_heads() const noexcept { return n_kv_heads_; }
+    [[nodiscard]] std::size_t head_dim()   const noexcept { return head_dim_; }
+
+private:
+    std::size_t embed_dim_, n_heads_, n_kv_heads_, head_dim_;
+    float       rope_base_;
+    std::vector<autograd::Variable> W_Q_, W_O_;  // n_heads each
+    std::vector<autograd::Variable> W_K_, W_V_;  // n_kv_heads each
+};
+
+// ── ModernTransformerBlock ────────────────────────────────────────────────────
+//
+// Pre-norm GPT block using modern components:
+//   h = x + GQA_RoPE(RMSNorm(x))     (residual #1)
+//   y = h + SwiGLU(RMSNorm(h))        (residual #2)
+class ModernTransformerBlock {
+public:
+    ModernTransformerBlock(int64_t     D,
+                           std::size_t n_heads,
+                           std::size_t n_kv_heads,
+                           int64_t     d_ff   = 0,
+                           std::uint64_t seed = 42);
+
+    [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+    [[nodiscard]] std::vector<autograd::Variable*> parameters();
+
+private:
+    RMSNorm              norm1_;
+    GroupedQueryAttention attn_;
+    RMSNorm              norm2_;
+    SwiGLUFeedForward    ffn_;
+};
+
+// ── ModernGPT ─────────────────────────────────────────────────────────────────
+//
+// LLaMA / Gemma-style GPT:
+//   • Token embedding (weight-tied with LM head)
+//   • No learned positional embedding (RoPE applied inside each attention block)
+//   • N × ModernTransformerBlock
+//   • Final RMSNorm
+//   • LM head = transpose(tok_emb weight)  (weight tying)
+//
+// Optional MTP (Multi-Token Prediction) heads (n_mtp_heads > 0):
+//   Extra linear projections from final hidden state, each predicting
+//   the token at offset +k (k = 1 … n_mtp_heads).  Only used at
+//   training time via forward_mtp(); forward() uses the tied head only.
+class ModernGPT {
+public:
+    ModernGPT(int64_t     vocab_size,
+              int64_t     embed_dim,
+              std::size_t n_heads,
+              std::size_t n_kv_heads,
+              int64_t     n_layers,
+              int64_t     d_ff          = 0,
+              int64_t     n_mtp_heads   = 0,
+              std::uint64_t seed        = 42);
+
+    // Returns logits (T, vocab_size) — main LM head only.
+    [[nodiscard]] autograd::Variable forward(const Tensor& token_ids) const;
+
+    // Returns [head_0_logits, head_1_logits, …] for MTP training.
+    // head_0 is the weight-tied main head; heads 1..n_mtp_heads are additional.
+    [[nodiscard]] std::vector<autograd::Variable> forward_mtp(
+        const Tensor& token_ids) const;
+
+    [[nodiscard]] std::vector<autograd::Variable*> parameters();
+
+    [[nodiscard]] int64_t     vocab_size()   const noexcept;
+    [[nodiscard]] int64_t     embed_dim()    const noexcept;
+    [[nodiscard]] std::size_t num_layers()   const noexcept;
+    [[nodiscard]] int64_t     n_mtp_heads()  const noexcept;
+
+private:
+    Embedding                          tok_emb_;
+    std::vector<ModernTransformerBlock> blocks_;
+    RMSNorm                            ln_f_;
+    std::vector<Linear>                mtp_heads_;  // empty if n_mtp_heads == 0
+};
+
+} // namespace sub0llm::nn
