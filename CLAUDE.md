@@ -60,7 +60,7 @@ cmake --build build-rel --parallel
 - `include/sub0llm/autograd/variable.hpp`, `ops.hpp` — Reverse-mode autograd, full op set including `log_sigmoid`
 - `src/autograd/variable.cpp`, `ops.cpp`, `embedding_ops.cpp`
 
-### Neural network modules (Ch06–Ch14)
+### Neural network modules (Ch06–Ch15)
 - `include/sub0llm/nn/embedding.hpp` — Token and positional embeddings
 - `include/sub0llm/nn/attention.hpp` — Multi-head attention (Ch07)
 - `include/sub0llm/nn/gpt.hpp` — Vanilla GPT (Ch08)
@@ -70,9 +70,10 @@ cmake --build build-rel --parallel
 - `include/sub0llm/nn/lora.hpp` — LoRA low-rank adaptation (Ch12)
 - `include/sub0llm/nn/dpo.hpp` — Direct Preference Optimization loss (Ch13)
 - `include/sub0llm/nn/sampler.hpp` — Greedy/temperature/top-k/top-p sampling, `generate` loop (Ch14)
+- `include/sub0llm/nn/distillation.hpp` — Soft cross-entropy, knowledge distillation loss (Ch15)
 
 ### Tests
-296 Catch2 tests across 16 test files — all passing.
+303 Catch2 tests across 17 test files — all passing.
 
 ## Git branch
 

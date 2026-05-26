@@ -22,6 +22,7 @@ set(SUB0LLM_SOURCES
     nn/lora.cpp
     nn/dpo.cpp
     nn/sampler.cpp
+    nn/distillation.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
