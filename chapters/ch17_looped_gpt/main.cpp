@@ -156,6 +156,9 @@ static void section_loop_training_comparison(const BPETokenizer& tokenizer,
     const int     steps   = 300;
 
     const int64_t n_tokens = static_cast<int64_t>(token_ids.size());
+    if (n_tokens < seq_len + 2)
+        throw std::runtime_error(
+            std::format("corpus too short ({} tokens), need >= {}", n_tokens, seq_len + 2));
 
     for (int64_t K : {1LL, 2LL, 4LL, 8LL}) {
         LoopedGPT model(V, 48, 2, 1, K, 0, /*seed=*/7);
