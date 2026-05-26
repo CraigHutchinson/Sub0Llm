@@ -823,4 +823,71 @@ Variable log_sigmoid(const Variable& x) {
     return Variable::wrap(std::move(out));
 }
 
+// ── row_scale ─────────────────────────────────────────────────────────────────
+//
+// y[i, j] = x[i, j] * v[i, 0]   — scale each row of x by the corresponding
+// scalar in v.
+//
+// Backward:
+//   grad_x[i, j] = upstream[i, j] * v[i, 0]
+//   grad_v[i, 0] = dot(upstream[i, :], x[i, :])
+
+Variable row_scale(const Variable& x, const Variable& v) {
+    const auto& xd = x.data();
+    const auto& vd = v.data();
+    if (xd.ndim() != 2)
+        throw std::runtime_error("autograd::row_scale: x must be 2D (N, D)");
+    if (vd.ndim() != 2 || vd.shape(1) != 1)
+        throw std::runtime_error("autograd::row_scale: v must be 2D (N, 1)");
+    const auto N = static_cast<std::size_t>(xd.shape(0));
+    const auto D = static_cast<std::size_t>(xd.shape(1));
+    if (static_cast<std::size_t>(vd.shape(0)) != N)
+        throw std::runtime_error(std::format(
+            "autograd::row_scale: x has {} rows but v has {} rows", N, vd.shape(0)));
+
+    const Tensor xc = xd.contiguous();
+    const Tensor vc = vd.contiguous();
+    Tensor out_data = zeros({static_cast<int64_t>(N), static_cast<int64_t>(D)});
+    const auto xs = xc.data_as<float>();
+    const auto vs = vc.data_as<float>();
+    auto       os = out_data.data_as<float>();
+    for (std::size_t i = 0; i < N; ++i)
+        for (std::size_t j = 0; j < D; ++j)
+            os[i * D + j] = xs[i * D + j] * vs[i];
+
+    auto out = make_node(std::move(out_data), any_grad(x, v));
+    if (out->requires_grad) {
+        if (x.requires_grad()) {
+            out->edges.push_back(make_edge(x.impl(),
+                [N, D, vc](const Tensor& g) {
+                    const auto g_sp  = g.data_as<float>();
+                    const auto vc_sp = vc.data_as<float>();
+                    Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(D)});
+                    auto gxs = gx.data_as<float>();
+                    for (std::size_t i = 0; i < N; ++i)
+                        for (std::size_t j = 0; j < D; ++j)
+                            gxs[i * D + j] = g_sp[i * D + j] * vc_sp[i];
+                    return gx;
+                }));
+        }
+        if (v.requires_grad()) {
+            out->edges.push_back(make_edge(v.impl(),
+                [N, D, xc](const Tensor& g) {
+                    const auto g_sp  = g.data_as<float>();
+                    const auto xc_sp = xc.data_as<float>();
+                    Tensor gv = zeros({static_cast<int64_t>(N), 1});
+                    auto gvs = gv.data_as<float>();
+                    for (std::size_t i = 0; i < N; ++i) {
+                        float s = 0.f;
+                        for (std::size_t j = 0; j < D; ++j)
+                            s += g_sp[i * D + j] * xc_sp[i * D + j];
+                        gvs[i] = s;
+                    }
+                    return gv;
+                }));
+        }
+    }
+    return Variable::wrap(std::move(out));
+}
+
 } // namespace sub0llm::autograd

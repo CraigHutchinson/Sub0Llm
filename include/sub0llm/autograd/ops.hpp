@@ -97,6 +97,12 @@ namespace sub0llm::autograd {
 // Backward scatters upstream gradient back into the original row range.
 [[nodiscard]] Variable narrow(const Variable& x, int64_t start, int64_t length);
 
+// Scale each row i of a 2D matrix by a per-row scalar.
+//   x: (N, D),  v: (N, 1)  →  y[i,j] = x[i,j] * v[i,0]
+// Backward: grad_x[i,j] = upstream[i,j] * v[i,0]
+//           grad_v[i,0] = dot(upstream[i,:], x[i,:])
+[[nodiscard]] Variable row_scale(const Variable& x, const Variable& v);
+
 // ── Activation / loss helpers (Ch13) ─────────────────────────────────────────
 
 // Log of sigmoid: log(σ(x)) = -log(1+exp(-x)), numerically stable.

@@ -17,6 +17,7 @@ add_executable(tests
     test_distillation.cpp
     test_thinking.cpp
     test_looped_gpt.cpp
+    test_moe.cpp
 )
 
 target_link_libraries(tests

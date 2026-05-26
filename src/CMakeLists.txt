@@ -25,6 +25,7 @@ set(SUB0LLM_SOURCES
     nn/distillation.cpp
     nn/thinking.cpp
     nn/looped_gpt.cpp
+    nn/moe.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
