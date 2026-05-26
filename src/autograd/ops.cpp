@@ -787,4 +787,40 @@ Variable narrow(const Variable& x, int64_t start, int64_t length) {
     return Variable::wrap(std::move(out));
 }
 
+// ── log_sigmoid ──────────────────────────────────────────────────────────────
+Variable log_sigmoid(const Variable& x) {
+    const auto& xd = x.data();
+    // forward: y = log(sigmoid(x)) = -log(1 + exp(-x))
+    // Numerically stable: min(x,0) - log(1 + exp(-|x|))
+    Tensor out_data(xd.shape(), DType::Float32, xd.device());
+    {
+        const auto xs = xd.data_as<float>();
+        auto       ys = out_data.data_as<float>();
+        for (std::size_t i = 0; i < xs.size(); ++i) {
+            const float xi = xs[i];
+            ys[i] = (xi >= 0.0f)
+                    ? -std::log1p(std::exp(-xi))
+                    : xi - std::log1p(std::exp(xi));
+        }
+    }
+    auto out = make_node(std::move(out_data), x.requires_grad());
+    if (out->requires_grad) {
+        Tensor xsnap = copy(xd);
+        out->edges.push_back(make_edge(x.impl(),
+            [xsnap = std::move(xsnap)](const Tensor& g) {
+                Tensor gx(xsnap.shape(), DType::Float32);
+                const auto xs  = xsnap.data_as<float>();
+                const auto gs  = g.data_as<float>();
+                auto       gxs = gx.data_as<float>();
+                for (std::size_t i = 0; i < xs.size(); ++i) {
+                    // d/dx log_sigmoid(x) = sigmoid(-x) = 1/(1+exp(x))
+                    const float sig_neg = 1.0f / (1.0f + std::exp(xs[i]));
+                    gxs[i] = gs[i] * sig_neg;
+                }
+                return gx;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
 } // namespace sub0llm::autograd

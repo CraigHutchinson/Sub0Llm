@@ -97,6 +97,12 @@ namespace sub0llm::autograd {
 // Backward scatters upstream gradient back into the original row range.
 [[nodiscard]] Variable narrow(const Variable& x, int64_t start, int64_t length);
 
+// ── Activation / loss helpers (Ch13) ─────────────────────────────────────────
+
+// Log of sigmoid: log(σ(x)) = -log(1+exp(-x)), numerically stable.
+// Backward: d/dx = σ(-x) = 1 / (1 + exp(x))
+[[nodiscard]] Variable log_sigmoid(const Variable& x);
+
 // ── Operator overloads (thin wrappers) ────────────────────────────────────────
 
 inline Variable operator+(const Variable& a, const Variable& b) { return add(a, b); }
