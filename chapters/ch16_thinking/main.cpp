@@ -216,12 +216,11 @@ static void section_self_consistency(ModernGPT& model,
     cfg.inner_cfg.temperature = 0.8f;
     cfg.answer_cfg.mode       = SamplingMode::Greedy;
 
-    // Show individual runs
+    // Show individual runs using the same advancing rng that think_self_consistency will use.
     std::cout << "  Individual first-answer tokens (7 runs):\n";
     std::mt19937 rng_show(99);
     for (int i = 0; i < 7; ++i) {
-        std::mt19937 rng_i(static_cast<uint32_t>(99 + i));
-        auto result = generate_with_thinking(model, prompt, cfg, rng_i);
+        auto result = generate_with_thinking(model, prompt, cfg, rng_show);
         int32_t first_tok = result.answer_tokens.empty() ? -1 : result.answer_tokens[0];
         std::string decoded = result.answer_tokens.empty() ? "(empty)" :
             tokenizer.decode(std::vector<int32_t>{first_tok});
@@ -229,7 +228,7 @@ static void section_self_consistency(ModernGPT& model,
                                   i, first_tok, decoded);
     }
 
-    // Voted result
+    // Voted result — identical seed so runs match what was displayed above.
     std::mt19937 rng_vote(99);
     int32_t voted = think_self_consistency(model, prompt, cfg, 7, rng_vote);
     std::cout << std::format("  Voted result: token {} \"{}\"\n",
