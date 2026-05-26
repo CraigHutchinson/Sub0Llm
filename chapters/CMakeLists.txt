@@ -13,4 +13,5 @@ add_subdirectory(ch12_finetuning)
 add_subdirectory(ch13_alignment)
 add_subdirectory(ch14_inference)
 add_subdirectory(ch15_distillation)
+add_subdirectory(ch16_thinking)
 # Chapters are added here as they are written.

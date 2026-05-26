@@ -15,6 +15,7 @@ add_executable(tests
     test_dpo.cpp
     test_sampler.cpp
     test_distillation.cpp
+    test_thinking.cpp
 )
 
 target_link_libraries(tests
