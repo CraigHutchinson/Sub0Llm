@@ -57,6 +57,18 @@ ThinkingResult generate_with_thinking(
     if (cfg.think_eos_id < 0)
         throw std::runtime_error(
             std::format("generate_with_thinking: think_eos_id must be >= 0, got {}", cfg.think_eos_id));
+    if (cfg.think_bos_id == cfg.think_eos_id)
+        throw std::runtime_error(
+            std::format("generate_with_thinking: think_bos_id and think_eos_id must differ, got both={}", cfg.think_bos_id));
+    {
+        const int64_t vocab_sz = model.vocab_size();
+        if (cfg.think_bos_id >= vocab_sz)
+            throw std::runtime_error(
+                std::format("generate_with_thinking: think_bos_id={} >= vocab_size={}", cfg.think_bos_id, vocab_sz));
+        if (cfg.think_eos_id >= vocab_sz)
+            throw std::runtime_error(
+                std::format("generate_with_thinking: think_eos_id={} >= vocab_size={}", cfg.think_eos_id, vocab_sz));
+    }
     if (prompt.empty())
         throw std::runtime_error("generate_with_thinking: prompt must not be empty");
     if (cfg.max_think_tokens < 1)
@@ -65,6 +77,12 @@ ThinkingResult generate_with_thinking(
     if (cfg.max_answer_tokens < 1)
         throw std::runtime_error(
             std::format("generate_with_thinking: max_answer_tokens must be >= 1, got {}", cfg.max_answer_tokens));
+    if (cfg.inner_cfg.mode == SamplingMode::TopK && cfg.inner_cfg.top_k < 1)
+        throw std::runtime_error(
+            std::format("generate_with_thinking: inner_cfg.top_k must be >= 1 when mode is TopK, got {}", cfg.inner_cfg.top_k));
+    if (cfg.answer_cfg.mode == SamplingMode::TopK && cfg.answer_cfg.top_k < 1)
+        throw std::runtime_error(
+            std::format("generate_with_thinking: answer_cfg.top_k must be >= 1 when mode is TopK, got {}", cfg.answer_cfg.top_k));
 
     ThinkingResult result;
     result.full_sequence.reserve(
