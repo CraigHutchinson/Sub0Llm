@@ -37,7 +37,7 @@ cmake --build build-rel --parallel
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch19, complete)
+## Current state (Ch01–Ch20, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -75,12 +75,13 @@ cmake --build build-rel --parallel
 - `include/sub0llm/nn/looped_gpt.hpp` — `LoopedGPT`: single block looped K times, `forward_k()` runtime budget (Ch17)
 - `include/sub0llm/nn/moe.hpp` — `MoEFeedForward`, `MoETransformerBlock`, `MoEGPT`: sparse top-k expert routing + load-balancing loss (Ch18)
 - `include/sub0llm/nn/mtp.hpp` — `mtp_train_loss`, `mtp_generate`, `mtp_generate_stats`, `MtpGenStats`: Multi-Token Prediction — K+1 tokens per forward pass (Ch19)
+- `include/sub0llm/nn/rlhf.hpp` — `RewardModel`, `reward_preference_loss`, `reinforce_loss`, `kl_penalty`: RLHF with Bradley-Terry preference training and KL-penalised REINFORCE (Ch20)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
 
 ### Tests
-361 Catch2 tests across 21 test files — all passing.
+384 Catch2 tests across 22 test files — all passing.
 
 ## Git branch
 
