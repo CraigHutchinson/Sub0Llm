@@ -37,23 +37,42 @@ cmake --build build-rel --parallel
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01)
+## Current state (Ch01–Ch14, complete)
 
+### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
 - `include/sub0llm/core/device.hpp` — Device value type (CPU / CUDA / OpenVINO)
 - `include/sub0llm/core/tensor.hpp` — Tensor: dynamic shape, strides, shared storage
 - `include/sub0llm/core/ops.hpp` — Basic ops: add/sub/mul/div, reductions, matmul, activations
-- `src/core/tensor.cpp`, `src/core/ops.cpp` — Naive CPU implementations
-- `tests/test_tensor.cpp`, `tests/test_ops.cpp` — Catch2 unit tests
-- `chapters/ch01_foundations/main.cpp` — Chapter narrative / demo
 
-## What changes in Ch02
+### Backends (Ch02)
+- `src/backends/cpu/kernels.cpp`, `matmul.cpp` — SIMD-dispatched CPU kernels (AVX2/AVX-512)
+- `src/backends/cuda/` — CUDA matmul and element-wise kernels
+- `src/backends/openvino/` — OpenVINO dispatch
 
-- Replace naive loops in `ops.cpp` with SIMD-dispatched kernels
-- Add `src/backends/cpu_simd.cpp` (AVX2/AVX-512 kernels)
-- Add `src/backends/cuda/` (CUDA kernels for matmul, element-wise)
-- Add `src/backends/openvino.cpp` (OpenVINO dispatch)
-- `Tensor::to(Device)` becomes fully implemented
+### Tokenizer (Ch03)
+- `include/sub0llm/tokenizer/bpe.hpp`, `src/tokenizer/bpe.cpp` — Byte-Pair Encoding
+
+### Data (Ch04)
+- `include/sub0llm/data/dataset.hpp`, `dataloader.hpp` — Dataset and DataLoader
+
+### Autograd (Ch05)
+- `include/sub0llm/autograd/variable.hpp`, `ops.hpp` — Reverse-mode autograd, full op set including `log_sigmoid`
+- `src/autograd/variable.cpp`, `ops.cpp`, `embedding_ops.cpp`
+
+### Neural network modules (Ch06–Ch14)
+- `include/sub0llm/nn/embedding.hpp` — Token and positional embeddings
+- `include/sub0llm/nn/attention.hpp` — Multi-head attention (Ch07)
+- `include/sub0llm/nn/gpt.hpp` — Vanilla GPT (Ch08)
+- `include/sub0llm/nn/optimizer.hpp` — SGD, Adam, gradient clipping (Ch09)
+- `include/sub0llm/nn/modern_gpt.hpp` — RMSNorm, SwiGLU, RoPE, GQA, ModernGPT+MTP (Ch10)
+- `include/sub0llm/nn/scheduler.hpp`, `trainer.hpp` — LR schedulers, Trainer (Ch11)
+- `include/sub0llm/nn/lora.hpp` — LoRA low-rank adaptation (Ch12)
+- `include/sub0llm/nn/dpo.hpp` — Direct Preference Optimization loss (Ch13)
+- `include/sub0llm/nn/sampler.hpp` — Greedy/temperature/top-k/top-p sampling, `generate` loop (Ch14)
+
+### Tests
+296 Catch2 tests across 16 test files — all passing.
 
 ## Git branch
 
