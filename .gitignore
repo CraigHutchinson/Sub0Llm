@@ -55,3 +55,6 @@ venv/
 # Test artifacts
 *.log
 test_output/
+
+# Claude Code session data
+.claude/
