@@ -1460,11 +1460,11 @@ static void print_train_row(int step, float loss, float acc, float spec, float e
 // Saves checkpoints every kCkptInterval steps to ckpt_dir.
 // On startup, resumes from the latest ch21_1cs_step*.ckpt if present.
 
-static void run_improved_phase_1cs(std::string_view ckpt_dir) {
+static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) {
     std::cout << "\n  Phase 1Cs — D=32, masked vocab + router supervision (α=0.5)\n";
+    std::cout << std::format("  target: {} steps\n", total);
 
     ImprovedData d    = build_improved_data();
-    const int total   = 1000;
     const int ckpt_iv = 100;
 
     MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
@@ -1553,12 +1553,12 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir) {
 // Returns {accuracy, router_spec, entropy} after the final evaluation.
 
 static std::tuple<float, float, float>
-run_improved_phase_2cs(std::string_view ckpt_dir)
+run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
 {
     std::cout << "\n  Phase 2Cs — full-vocab, Phase-1Cs math_block (D=32, no supervision)\n";
+    std::cout << std::format("  target: {} steps\n", total);
 
-    ImprovedData d  = build_improved_data();
-    const int total = 2000;
+    ImprovedData d    = build_improved_data();
     const int ckpt_iv = 200;
 
     MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
@@ -1673,7 +1673,8 @@ static void run_improved_eval(std::string_view ckpt_dir) {
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
 static void section_improved_training(std::string_view phase,
-                                       std::string_view ckpt_dir)
+                                       std::string_view ckpt_dir,
+                                       int steps = 0)  // 0 = use phase default
 {
     std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
@@ -1686,12 +1687,14 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
-    // build_improved_data() is called inside each phase function (deterministic)
-    if (phase == "all" || phase == "1cs")
-        run_improved_phase_1cs(ckpt_dir);
+    if (phase == "all" || phase == "1cs") {
+        const int total1 = (steps > 0) ? steps : 1000;
+        run_improved_phase_1cs(ckpt_dir, total1);
+    }
 
     if (phase == "all" || phase == "2cs") {
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir);
+        const int total2 = (steps > 0) ? steps : 2000;
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2);
 
         std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
@@ -1702,7 +1705,7 @@ static void section_improved_training(std::string_view phase,
                                   "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                                   22.0f, 50.0f, 0.04f);
         std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  "§21.9 Phase 2Cs (D=32, supervised, 2000 steps)",
+                                  std::format("§21.9 Phase 2Cs (D=32, supervised, {} steps)", total2),
                                   acc * 100.f, spec * 100.f, ent);
 
         std::cout << "\n  Key improvements:\n";
@@ -1720,20 +1723,23 @@ static void section_improved_training(std::string_view phase,
 // ── main ──────────────────────────────────────────────────────────────────────
 //
 // Usage:
-//   ./ch21_math_neurons                    # run all sections (default)
-//   ./ch21_math_neurons 1cs                # Phase 1Cs only
-//   ./ch21_math_neurons 2cs                # Phase 2Cs only (requires 1cs ckpt)
-//   ./ch21_math_neurons eval               # load 2cs ckpt, print summary
-//   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts
+//   ./ch21_math_neurons                              # run all sections (default)
+//   ./ch21_math_neurons 1cs                          # Phase 1Cs only
+//   ./ch21_math_neurons 2cs                          # Phase 2Cs only (requires 1cs ckpt)
+//   ./ch21_math_neurons 2cs --steps 5000             # extend Phase 2Cs to 5000 steps
+//   ./ch21_math_neurons eval                         # load 2cs ckpt, print summary
+//   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
 
 int main(int argc, char* argv[]) {
     std::string phase    = "all";
     std::string ckpt_dir = ".";
+    int         steps    = 0;  // 0 = use phase default (1000 / 2000)
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
         if      (arg == "--phase"    && i + 1 < argc) { phase    = argv[++i]; }
         else if (arg == "--ckpt-dir" && i + 1 < argc) { ckpt_dir = argv[++i]; }
+        else if (arg == "--steps"    && i + 1 < argc) { steps    = std::stoi(argv[++i]); }
         else if (!arg.starts_with("--"))               { phase    = std::string(arg); }
     }
 
@@ -1753,7 +1759,7 @@ int main(int argc, char* argv[]) {
         section_large_numbers();
     }
 
-    section_improved_training(phase, ckpt_dir);
+    section_improved_training(phase, ckpt_dir, steps);
 
     std::cout << "\nDone.\n";
     return 0;
