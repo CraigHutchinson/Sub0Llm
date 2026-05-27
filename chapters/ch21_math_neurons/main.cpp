@@ -428,6 +428,108 @@ static void section_layer_ablation() {
     }
 }
 
+// ── §21.6  Large Number Arithmetic — Exact vs Statistical ────────────────────
+//
+// A tiny statistical LM trained only on [0..9] single-digit arithmetic will
+// fail on large numbers it has never seen.  The math execution nodes compute
+// exact IEEE-754 int16 arithmetic for ANY input in [-32768, 32767] — no
+// training on those numbers is required.
+
+static void section_large_numbers() {
+    std::cout << "\n=== §21.6  Large Number Arithmetic — Exact vs Statistical ===\n";
+    std::cout << "  Math nodes use exact int16 arithmetic; statistical LMs must\n";
+    std::cout << "  memorise every pair and fail badly on unseen large numbers.\n\n";
+
+    // Build a tiny tokenizer (BPE on digit symbols only, never sees 4-digit numbers)
+    std::vector<std::string> small_corpus = {
+        "1 + 2 = 3", "5 - 3 = 2", "4 * 2 = 8", "9 / 3 = 3"
+    };
+    auto bpe  = BPETokenizer::train(small_corpus, 40);
+    NumericTokenizer ntok(std::move(bpe));
+
+    struct LargeCase {
+        RouteType   op;
+        int32_t     a, b;
+        std::string description;
+    };
+
+    const std::vector<LargeCase> cases = {
+        {RouteType::Add,     9876,  5432, "9876 + 5432"},
+        {RouteType::Sub,    32767,     1, "32767 - 1  "},
+        {RouteType::Mul,      181,     9, "181 × 9    "},
+        {RouteType::Div,    32760,     8, "32760 ÷ 8  "},
+        {RouteType::Compare, 9999,  9998, "9999 < 9998"},   // false → 0
+        {RouteType::Compare, 1000, 10000, "1000 < 10000"},  // true  → 1
+        {RouteType::Mul,      300,   200, "300 × 200  "},  // overflows int16
+        {RouteType::Div,       42,     0, "42 ÷ 0     "},  // NaN / div-by-zero
+    };
+
+    std::cout << std::format("  {:<16}  {:>8}  {:>9}  {:>9}  {}\n",
+                              "expression", "result", "is_nan", "overflow", "exact?");
+    std::cout << "  " << std::string(62, '-') << "\n";
+
+    for (const auto& c : cases) {
+        auto r = apply_math_op(c.op, static_cast<float>(c.a), static_cast<float>(c.b));
+
+        // Compute "true" reference (unclamped)
+        int64_t ref = 0;
+        bool ref_overflow = false;
+        switch (c.op) {
+            case RouteType::Add:     ref = static_cast<int64_t>(c.a) + c.b; break;
+            case RouteType::Sub:     ref = static_cast<int64_t>(c.a) - c.b; break;
+            case RouteType::Mul:     ref = static_cast<int64_t>(c.a) * c.b; break;
+            case RouteType::Div:     ref = (c.b == 0) ? 0 : c.a / c.b;     break;
+            case RouteType::Compare: ref = (c.a < c.b) ? 1 : 0;            break;
+            default: break;
+        }
+        if (ref < NumericTokenizer::kIntMin || ref > NumericTokenizer::kIntMax)
+            ref_overflow = true;
+
+        std::string exact_str;
+        if (r.is_nan) {
+            exact_str = "NaN (div/0)";
+        } else if (r.is_overflow || ref_overflow) {
+            exact_str = std::format("OVERFLOW (true={}, int16 range exceeded)", ref);
+        } else {
+            exact_str = (static_cast<int64_t>(r.value) == ref) ? "YES" : "NO";
+        }
+
+        std::cout << std::format("  {:<16}  {:>8.0f}  {:>9}  {:>9}  {}\n",
+                                  c.description,
+                                  r.value,
+                                  r.is_nan      ? "true" : "false",
+                                  r.is_overflow ? "true" : "false",
+                                  exact_str);
+    }
+
+    // Now show how the token encoding handles large numbers in context
+    std::cout << "\n  Token encoding for large operands:\n";
+    const std::vector<int32_t> large_vals = {9876, 5432, 15308, 32767, -32768};
+    for (int32_t v : large_vals) {
+        auto id = ntok.encode_int(v);
+        bool ok = ntok.is_numeric(id) && !ntok.is_nan_token(id) && !ntok.is_overflow_token(id);
+        if (ok) {
+            float decoded = ntok.numeric_value(id);
+            std::cout << std::format("    encode_int({:6d}) = {:6d}  decode = {:6.0f}  round-trip: {}\n",
+                                      v, static_cast<int>(id), decoded,
+                                      static_cast<int32_t>(decoded) == v ? "OK" : "FAIL");
+        } else {
+            std::cout << std::format("    encode_int({:6d}) = {:6d}  [overflow/nan token]\n",
+                                      v, static_cast<int>(id));
+        }
+    }
+
+    // Show statistical model failure mode
+    std::cout << "\n  Why statistical models fail on large numbers:\n";
+    std::cout << "    A model trained on [0..9] arithmetic has seen at most 100\n";
+    std::cout << "    unique A+B=C triples.  For 9876 + 5432 it has zero training\n";
+    std::cout << "    signal.  The math node computes it exactly in O(1) regardless\n";
+    std::cout << "    of training data — the result is always 9876+5432=15308.\n";
+    std::cout << "    For overflow (300*200=60000), the node correctly raises the\n";
+    std::cout << "    overflow sentinel, while a statistical model would produce\n";
+    std::cout << "    a random high-frequency token.\n";
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -439,6 +541,7 @@ int main() {
     section_numeric_router();
     section_arithmetic_training();
     section_layer_ablation();
+    section_large_numbers();
 
     std::cout << "\nDone.\n";
     return 0;
