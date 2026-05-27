@@ -5,6 +5,7 @@
 #include "sub0llm/core/tensor.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <stdexcept>
 
@@ -356,6 +357,26 @@ int64_t     MathGPT::l_math()     const noexcept { return l_math_; }
 int64_t     MathGPT::vocab_size() const noexcept { return tok_emb_.vocab_size(); }
 int64_t     MathGPT::embed_dim()  const noexcept { return tok_emb_.embed_dim(); }
 std::size_t MathGPT::num_layers() const noexcept { return blocks_.size(); }
+
+void MathGPT::import_math_block(MathGPT& source) {
+    auto src_p = source.math_block_.parameters();
+    auto dst_p = math_block_.parameters();
+    if (src_p.size() != dst_p.size())
+        throw std::runtime_error(std::format(
+            "import_math_block: param count mismatch: {} vs {}",
+            src_p.size(), dst_p.size()));
+    for (std::size_t i = 0; i < src_p.size(); ++i) {
+        const Tensor& src_t = src_p[i]->data();
+        Tensor& dst_t = dst_p[i]->data();
+        if (src_t.numel() != dst_t.numel())
+            throw std::runtime_error(std::format(
+                "import_math_block: tensor {} numel mismatch: {} vs {}",
+                i, src_t.numel(), dst_t.numel()));
+        std::memcpy(dst_t.data_as<float>().data(),
+                    src_t.data_as<float>().data(),
+                    src_t.numel() * sizeof(float));
+    }
+}
 
 std::vector<float> MathGPT::build_register(
     const Tensor& token_ids, const NumericTokenizer& ntok)

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <iostream>
 #include <random>
@@ -661,6 +662,310 @@ static void section_training_dynamics() {
     std::cout << "       without waiting for end-to-end gradient to propagate through STE.\n";
 }
 
+// ── §21.8  Curriculum Learning: Specialise then Scale ────────────────────────
+//
+// Phase 1: logit-masked training restricts cross-entropy to ~35 active tokens.
+// This concentrates gradient ~1800× vs full 65k vocab, forcing the router to
+// specialise quickly.  The trained math_block is then transferred via
+// import_math_block() and fine-tuned against the full vocabulary (Phase 2).
+
+static void section_curriculum_learning() {
+    std::cout << "\n=== §21.8  Curriculum Learning: Specialise then Scale ===\n";
+    std::cout << "  Phase 1: logit-masked (active ~35 tokens) — forces router specialisation\n";
+    std::cout << "  Phase 2A: full-vocab fresh start (cold baseline)\n";
+    std::cout << "  Phase 2B: full-vocab with Phase-1 math_block transferred\n\n";
+
+    // ── shared dataset (same seed as §21.7 for comparability) ────────────────
+    std::mt19937 rng_data(42);
+    std::uniform_int_distribution<int> d09(0, 9);
+
+    std::vector<std::string> corpus;
+    corpus.reserve(200);
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " + " + std::to_string(B) +
+                          " = " + std::to_string(A + B));
+    }
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " - " + std::to_string(B) +
+                          " = " + std::to_string(A - B));
+    }
+
+    auto bpe = BPETokenizer::train(corpus, 50);
+    NumericTokenizer ntok(std::move(bpe));
+    const int64_t V = ntok.total_vocab_size();
+
+    std::vector<std::vector<int32_t>> train_ids;
+    for (const auto& expr : corpus) {
+        auto ids = ntok.encode(expr);
+        if (ids.size() >= 2)
+            train_ids.push_back(std::vector<int32_t>(ids.begin(), ids.end()));
+    }
+
+    // Test set with explicit expected_op
+    struct TestItem {
+        std::vector<int32_t> prompt_ids;
+        int32_t              expected_val;
+        RouteType            expected_op;
+    };
+    std::vector<TestItem> test_items;
+    {
+        std::mt19937 rng_t(99);
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_t), B = d09(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " + " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A + B, RouteType::Add});
+        }
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_t), B = d09(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " - " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A - B, RouteType::Sub});
+        }
+    }
+
+    // ── Build Phase 1 logit bias (active token mask) ─────────────────────────
+    // Collect every token ID that appears in training/test sequences
+    std::vector<bool> is_active(static_cast<std::size_t>(V), false);
+    for (const auto& ids : train_ids)
+        for (auto id : ids)
+            is_active[static_cast<std::size_t>(id)] = true;
+    for (const auto& item : test_items)
+        for (auto id : item.prompt_ids)
+            is_active[static_cast<std::size_t>(id)] = true;
+    // Include all possible single-digit result tokens [-9..18]
+    for (int v = -9; v <= 18; ++v)
+        is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
+
+    int n_active = 0;
+    std::vector<float> bias_vec(static_cast<std::size_t>(V), -1e9f);
+    for (int64_t i = 0; i < V; ++i) {
+        if (is_active[static_cast<std::size_t>(i)]) {
+            bias_vec[static_cast<std::size_t>(i)] = 0.0f;
+            ++n_active;
+        }
+    }
+
+    std::cout << std::format("  total_vocab={} active_tokens={}\n\n", V, n_active);
+
+    // ── Shared evaluation lambdas ─────────────────────────────────────────────
+    const int64_t D = 16;
+    const std::size_t n_heads = 2, n_kv = 1;
+    const int64_t n_layers = 4;
+
+    // Evaluate accuracy and router metrics for a given model.
+    // If masked=true, add the logit bias before argmax (Phase 1 eval).
+    auto evaluate = [&](MathGPT& model, bool masked)
+        -> std::tuple<float, float, float>  // (accuracy, router_spec, avg_entropy)
+    {
+        int correct = 0;
+        float spec_sum = 0.f, entropy_sum = 0.f;
+        for (const auto& item : test_items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor id_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(id_t, ntok);
+
+            const int64_t last = logits.data().shape(0) - 1;
+            const int64_t Vl   = logits.data().shape(1);
+            auto lsp = logits.data().data_as<float>();
+
+            // Argmax (with optional bias)
+            int64_t best = 0;
+            float best_v = lsp[static_cast<std::size_t>(last * Vl)] +
+                           (masked ? bias_vec[0] : 0.f);
+            for (int64_t v = 1; v < Vl; ++v) {
+                float val = lsp[static_cast<std::size_t>(last * Vl + v)] +
+                            (masked ? bias_vec[static_cast<std::size_t>(v)] : 0.f);
+                if (val > best_v) { best_v = val; best = v; }
+            }
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            if (ntok.is_numeric(pred_id) && !ntok.is_nan_token(pred_id) &&
+                !ntok.is_overflow_token(pred_id))
+            {
+                if (static_cast<int32_t>(ntok.numeric_value(pred_id)) == item.expected_val)
+                    ++correct;
+            }
+
+            // Router info
+            RouteInfo ri = model.route_info(id_t, ntok);
+            const std::size_t last_t = ri.routes.size() - 1;
+            if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
+            entropy_sum += ri.entropy[last_t];
+        }
+        float n = static_cast<float>(test_items.size());
+        return {static_cast<float>(correct) / n, spec_sum / n, entropy_sum / n};
+    };
+
+    auto print_header = [&]() {
+        std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}\n",
+                                  "step", "loss", "accuracy", "router_spec", "entropy");
+        std::cout << "  " << std::string(51, '-') << "\n";
+    };
+
+    auto print_row = [&](int step, float loss, float acc, float spec, float ent) {
+        std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
+        std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  step, loss_s, acc * 100.f, spec * 100.f, ent);
+    };
+
+    // ── Phase 1: logit-masked training ────────────────────────────────────────
+    std::cout << "  Phase 1 — masked vocabulary (logit bias, active tokens only)\n";
+    print_header();
+
+    MathGPT model_p1(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    Adam    adam_p1(model_p1.parameters(), 3e-3f);
+    std::mt19937 rng_p1(11);
+
+    float last_loss_p1 = 0.f;
+    int step_spec30_p1 = -1;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p1, /*masked=*/true);
+            print_row(step, last_loss_p1, acc, spec, ent);
+            if (step_spec30_p1 < 0 && spec >= 0.30f) step_spec30_p1 = step;
+        }
+        if (step == 1000) break;
+
+        const std::size_t idx = rng_p1() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+        const int64_t T_loss  = seq_len - 1;
+
+        // Build (T_loss, V) additive bias for logit masking
+        Tensor bias_t({T_loss, V}, DType::Float32);
+        {
+            float* bsp = bias_t.data_as<float>().data();
+            for (int64_t t = 0; t < T_loss; ++t)
+                std::memcpy(bsp + t * V, bias_vec.data(),
+                            static_cast<std::size_t>(V) * sizeof(float));
+        }
+
+        adam_p1.zero_grad();
+        auto logits  = model_p1.forward_math(id_tensor, ntok);
+        auto ltrunc  = narrow(logits, 0, T_loss);
+        auto lmasked = add(ltrunc, Variable(bias_t, false));
+        auto loss    = cross_entropy(lmasked, targets);
+        loss.backward();
+        (void)clip_grad_norm(model_p1.parameters(), 1.0f);
+        adam_p1.step();
+        last_loss_p1 = loss.data().data_as<float>()[0];
+    }
+
+    if (step_spec30_p1 > 0)
+        std::cout << std::format("  → router_spec first crossed 30% at step {}\n", step_spec30_p1);
+    else
+        std::cout << "  → router_spec did not cross 30% within 1000 steps\n";
+
+    // ── Phase 2A: fresh full-vocab training (cold baseline) ───────────────────
+    std::cout << "\n  Phase 2A — full-vocab training from scratch (cold baseline)\n";
+    print_header();
+
+    MathGPT model_p2a(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    Adam    adam_p2a(model_p2a.parameters(), 3e-3f);
+    std::mt19937 rng_p2a(11);
+
+    float last_loss_p2a = 0.f;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p2a, /*masked=*/false);
+            print_row(step, last_loss_p2a, acc, spec, ent);
+        }
+        if (step == 1000) break;
+
+        const std::size_t idx = rng_p2a() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+
+        adam_p2a.zero_grad();
+        auto logits = model_p2a.forward_math(id_tensor, ntok);
+        auto ltrunc = narrow(logits, 0, seq_len - 1);
+        auto loss   = cross_entropy(ltrunc, targets);
+        loss.backward();
+        (void)clip_grad_norm(model_p2a.parameters(), 1.0f);
+        adam_p2a.step();
+        last_loss_p2a = loss.data().data_as<float>()[0];
+    }
+
+    // ── Phase 2B: full-vocab with Phase-1 math_block transferred ─────────────
+    std::cout << "\n  Phase 2B — full-vocab with Phase-1 math_block transferred\n";
+    print_header();
+
+    MathGPT model_p2b(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    model_p2b.import_math_block(model_p1);  // ← curriculum transfer
+    Adam    adam_p2b(model_p2b.parameters(), 3e-3f);
+    std::mt19937 rng_p2b(11);
+
+    float last_loss_p2b = 0.f;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p2b, /*masked=*/false);
+            print_row(step, last_loss_p2b, acc, spec, ent);
+        }
+        if (step == 1000) break;
+
+        const std::size_t idx = rng_p2b() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+
+        adam_p2b.zero_grad();
+        auto logits = model_p2b.forward_math(id_tensor, ntok);
+        auto ltrunc = narrow(logits, 0, seq_len - 1);
+        auto loss   = cross_entropy(ltrunc, targets);
+        loss.backward();
+        (void)clip_grad_norm(model_p2b.parameters(), 1.0f);
+        adam_p2b.step();
+        last_loss_p2b = loss.data().data_as<float>()[0];
+    }
+
+    // ── Summary comparison ────────────────────────────────────────────────────
+    std::cout << "\n  Summary at step 1000:\n";
+    std::cout << std::format("  {:>40}  {:>9}  {:>12}  {:>11}\n",
+                              "model", "accuracy", "router_spec", "entropy");
+    std::cout << "  " << std::string(76, '-') << "\n";
+    {
+        auto [acc_a, spec_a, ent_a] = evaluate(model_p2a, false);
+        auto [acc_b, spec_b, ent_b] = evaluate(model_p2b, false);
+        auto [acc_p1, spec_p1, ent_p1] = evaluate(model_p1, true);
+        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 2A (cold, full-vocab)",
+                                  acc_a * 100.f, spec_a * 100.f, ent_a);
+        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 2B (transferred math_block)",
+                                  acc_b * 100.f, spec_b * 100.f, ent_b);
+        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 1 (masked, for reference)",
+                                  acc_p1 * 100.f, spec_p1 * 100.f, ent_p1);
+    }
+
+    std::cout << "\n  Interpretation:\n";
+    std::cout << "    Phase 1 masking concentrates gradient onto ~" << n_active
+              << " tokens instead of " << V << ".\n";
+    std::cout << std::format("    Effective vocab ratio = {:.0f}× — this is the gradient\n",
+                              static_cast<float>(V) / static_cast<float>(n_active));
+    std::cout << "    amplification factor for the router in Phase 1.\n";
+    std::cout << "    A router_spec > 30% in Phase 1 means the math nodes have\n";
+    std::cout << "    learned operator classification from scratch; transferring\n";
+    std::cout << "    those weights to Phase 2B gives the full-vocab model a head\n";
+    std::cout << "    start that cold Phase 2A cannot match at equal step count.\n";
+}
+
 // ── §21.6  Large Number Arithmetic — Exact vs Statistical ────────────────────
 //
 // A tiny statistical LM trained only on [0..9] single-digit arithmetic will
@@ -775,6 +1080,7 @@ int main() {
     section_arithmetic_training();
     section_layer_ablation();
     section_training_dynamics();
+    section_curriculum_learning();
     section_large_numbers();
 
     std::cout << "\nDone.\n";

@@ -113,6 +113,10 @@ public:
     // Router + math_block parameters only; includes tok_emb weight.
     [[nodiscard]] std::vector<autograd::Variable*> math_parameters();
 
+    // Copy math_block_ weights from source into this model (curriculum learning).
+    // source and *this must have the same embed_dim, n_heads, n_kv_heads, d_ff.
+    void import_math_block(MathGPT& source);
+
     [[nodiscard]] int64_t     l_math()     const noexcept;
     [[nodiscard]] int64_t     vocab_size() const noexcept;
     [[nodiscard]] int64_t     embed_dim()  const noexcept;
