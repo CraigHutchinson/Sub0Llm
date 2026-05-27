@@ -24,6 +24,12 @@ ctest --test-dir build --output-on-failure -V
 # Release build with AVX2
 cmake -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_AVX2=ON
 cmake --build build-rel --parallel
+
+# Native release build — targets this machine's exact CPU (AVX-512, FMA, BMI, etc.)
+# Enables: -march=native, -mtune=native, -ffp-contract=fast, -funroll-loops, LTO
+# DO NOT distribute binaries from this build — they will SIGILL on other CPUs.
+cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_NATIVE=ON
+cmake --build build-native --parallel
 ```
 
 ## Code conventions
