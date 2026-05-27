@@ -353,6 +353,10 @@ std::vector<autograd::Variable*> MathGPT::math_parameters() {
     return p;
 }
 
+std::vector<autograd::Variable*> MathGPT::math_block_only_parameters() {
+    return math_block_.parameters();
+}
+
 int64_t     MathGPT::l_math()     const noexcept { return l_math_; }
 int64_t     MathGPT::vocab_size() const noexcept { return tok_emb_.vocab_size(); }
 int64_t     MathGPT::embed_dim()  const noexcept { return tok_emb_.embed_dim(); }

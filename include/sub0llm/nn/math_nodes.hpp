@@ -112,6 +112,10 @@ public:
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
     // Router + math_block parameters only; includes tok_emb weight.
     [[nodiscard]] std::vector<autograd::Variable*> math_parameters();
+    // math_block_ parameters only — excludes tok_emb, blocks_, ln_f.
+    // Use as the optimizer target in Phase 1 curriculum so tok_emb stays
+    // consistent with Phase 2 initialisation, enabling clean weight transfer.
+    [[nodiscard]] std::vector<autograd::Variable*> math_block_only_parameters();
 
     // Copy math_block_ weights from source into this model (curriculum learning).
     // source and *this must have the same embed_dim, n_heads, n_kv_heads, d_ff.

