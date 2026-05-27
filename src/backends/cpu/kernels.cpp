@@ -27,7 +27,7 @@ inline constexpr std::size_t simd_prefix(std::size_t n) noexcept {
 
 // ── Element-wise binary ───────────────────────────────────────────────────────
 
-void add_f32(const float* a, const float* b, float* out, std::size_t n) noexcept {
+void add_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -43,7 +43,7 @@ void add_f32(const float* a, const float* b, float* out, std::size_t n) noexcept
     for (; i < n; ++i) out[i] = a[i] + b[i];
 }
 
-void sub_f32(const float* a, const float* b, float* out, std::size_t n) noexcept {
+void sub_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -59,7 +59,7 @@ void sub_f32(const float* a, const float* b, float* out, std::size_t n) noexcept
     for (; i < n; ++i) out[i] = a[i] - b[i];
 }
 
-void mul_f32(const float* a, const float* b, float* out, std::size_t n) noexcept {
+void mul_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -75,7 +75,7 @@ void mul_f32(const float* a, const float* b, float* out, std::size_t n) noexcept
     for (; i < n; ++i) out[i] = a[i] * b[i];
 }
 
-void div_f32(const float* a, const float* b, float* out, std::size_t n) noexcept {
+void div_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -93,7 +93,7 @@ void div_f32(const float* a, const float* b, float* out, std::size_t n) noexcept
 
 // ── Scalar broadcast ─────────────────────────────────────────────────────────
 
-void add_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept {
+void add_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vs = _mm512_set1_ps(s);
@@ -107,7 +107,7 @@ void add_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept
     for (; i < n; ++i) out[i] = a[i] + s;
 }
 
-void mul_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept {
+void mul_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vs = _mm512_set1_ps(s);
@@ -123,7 +123,7 @@ void mul_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept
 
 // ── Activations ──────────────────────────────────────────────────────────────
 
-void relu_f32(const float* in, float* out, std::size_t n) noexcept {
+void relu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vz = _mm512_setzero_ps();
@@ -137,7 +137,7 @@ void relu_f32(const float* in, float* out, std::size_t n) noexcept {
     for (; i < n; ++i) out[i] = in[i] > 0.0f ? in[i] : 0.0f;
 }
 
-void neg_f32(const float* in, float* out, std::size_t n) noexcept {
+void neg_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vz = _mm512_setzero_ps();
@@ -152,15 +152,15 @@ void neg_f32(const float* in, float* out, std::size_t n) noexcept {
 }
 
 // Scalar math ops — no SIMD benefit due to transcendental cost.
-void exp_f32    (const float* in, float* out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::exp(in[i]);   }
-void log_f32    (const float* in, float* out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::log(in[i]);   }
-void sqrt_f32   (const float* in, float* out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::sqrt(in[i]);  }
-void abs_f32    (const float* in, float* out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::abs(in[i]);   }
-void sigmoid_f32(const float* in, float* out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=1.0f/(1.0f+std::exp(-in[i])); }
+void exp_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::exp(in[i]);   }
+void log_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::log(in[i]);   }
+void sqrt_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::sqrt(in[i]);  }
+void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::abs(in[i]);   }
+void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=1.0f/(1.0f+std::exp(-in[i])); }
 
 // ── Reductions ────────────────────────────────────────────────────────────────
 
-float sum_f32(const float* in, std::size_t n) noexcept {
+float sum_f32(const float* __restrict__ in, std::size_t n) noexcept {
     float acc = 0.0f;
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
@@ -184,17 +184,17 @@ float sum_f32(const float* in, std::size_t n) noexcept {
     return acc;
 }
 
-float max_f32(const float* in, std::size_t n) noexcept {
+float max_f32(const float* __restrict__ in, std::size_t n) noexcept {
     if (n == 0) return 0.0f;
     return *std::max_element(in, in + n);
 }
 
-float min_f32(const float* in, std::size_t n) noexcept {
+float min_f32(const float* __restrict__ in, std::size_t n) noexcept {
     if (n == 0) return 0.0f;
     return *std::min_element(in, in + n);
 }
 
-float norm_f32(const float* in, std::size_t n) noexcept {
+float norm_f32(const float* __restrict__ in, std::size_t n) noexcept {
     float s = 0.0f;
     for (std::size_t i = 0; i < n; ++i) s += in[i] * in[i];
     return std::sqrt(s);

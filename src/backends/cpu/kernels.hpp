@@ -10,29 +10,29 @@
 namespace sub0llm::backend::cpu {
 
 // ── Element-wise binary ───────────────────────────────────────────────────────
-void add_f32 (const float* a, const float* b, float* out, std::size_t n) noexcept;
-void sub_f32 (const float* a, const float* b, float* out, std::size_t n) noexcept;
-void mul_f32 (const float* a, const float* b, float* out, std::size_t n) noexcept;
-void div_f32 (const float* a, const float* b, float* out, std::size_t n) noexcept;
+void add_f32 (const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept;
+void sub_f32 (const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept;
+void mul_f32 (const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept;
+void div_f32 (const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept;
 
 // ── Scalar broadcast ─────────────────────────────────────────────────────────
-void add_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept;
-void mul_scalar_f32(const float* a, float s, float* out, std::size_t n) noexcept;
+void add_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept;
+void mul_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept;
 
 // ── Activations ──────────────────────────────────────────────────────────────
-void relu_f32   (const float* in, float* out, std::size_t n) noexcept;
-void neg_f32    (const float* in, float* out, std::size_t n) noexcept;
-void exp_f32    (const float* in, float* out, std::size_t n) noexcept;
-void log_f32    (const float* in, float* out, std::size_t n) noexcept;
-void sqrt_f32   (const float* in, float* out, std::size_t n) noexcept;
-void abs_f32    (const float* in, float* out, std::size_t n) noexcept;
-void sigmoid_f32(const float* in, float* out, std::size_t n) noexcept;
+void relu_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void neg_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void exp_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void log_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void sqrt_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
 
 // ── Reduction ─────────────────────────────────────────────────────────────────
-float sum_f32 (const float* in, std::size_t n) noexcept;
-float max_f32 (const float* in, std::size_t n) noexcept;
-float min_f32 (const float* in, std::size_t n) noexcept;
-float norm_f32(const float* in, std::size_t n) noexcept;
+float sum_f32 (const float* __restrict__ in, std::size_t n) noexcept;
+float max_f32 (const float* __restrict__ in, std::size_t n) noexcept;
+float min_f32 (const float* __restrict__ in, std::size_t n) noexcept;
+float norm_f32(const float* __restrict__ in, std::size_t n) noexcept;
 
 // ── Matrix multiply ───────────────────────────────────────────────────────────
 // C = A × B   where A(M,K), B(K,N), C(M,N) — row-major, C is zeroed inside.

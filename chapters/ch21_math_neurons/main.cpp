@@ -8,6 +8,7 @@
 #include "sub0llm/core/tensor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -1444,15 +1445,18 @@ static std::tuple<float, float, float> eval_improved(
 }
 
 static void print_train_header() {
-    std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}\n",
-                              "step", "loss", "accuracy", "router_spec", "entropy");
-    std::cout << "  " << std::string(51, '-') << "\n";
+    std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}  {:>9}\n",
+                              "step", "loss", "accuracy", "router_spec", "entropy", "ms/step");
+    std::cout << "  " << std::string(62, '-') << "\n";
 }
 
-static void print_train_row(int step, float loss, float acc, float spec, float ent) {
+static void print_train_row(int step, float loss, float acc, float spec, float ent,
+                             float ms_per_step = 0.f) {
     std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
-    std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
-                              step, loss_s, acc * 100.f, spec * 100.f, ent);
+    std::string ms_s   = (ms_per_step == 0.f) ? "    ---"
+                                               : std::format("{:6.1f}ms", ms_per_step);
+    std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}  {:>9}\n",
+                              step, loss_s, acc * 100.f, spec * 100.f, ent, ms_s);
 }
 
 // ── Phase 1Cs ─────────────────────────────────────────────────────────────────
@@ -1494,10 +1498,21 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
     float last_loss    = 0.f;
     int   step_spec30  = -1;
 
+    auto t_phase = std::chrono::steady_clock::now();
+    int  steps_since_eval = 0;
+
     for (int step = start_step; step <= total; ++step) {
         if (step % (total / 5) == 0 || step == start_step) {
+            float ms_per_step = 0.f;
+            if (steps_since_eval > 0) {
+                auto now = std::chrono::steady_clock::now();
+                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                              / static_cast<float>(steps_since_eval);
+                t_phase = now;
+                steps_since_eval = 0;
+            }
             auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true);
-            print_train_row(step, last_loss, acc, spec, ent);
+            print_train_row(step, last_loss, acc, spec, ent, ms_per_step);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
@@ -1538,6 +1553,7 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
         (void)clip_grad_norm(block_params, 1.0f);
         adam.step();
         last_loss = L_total.data().data_as<float>()[0];
+        ++steps_since_eval;
     }
 
     if (step_spec30 >= 0)
@@ -1594,10 +1610,21 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
     float last_loss  = 0.f;
     int   step_spec30 = -1;
 
+    auto t_phase = std::chrono::steady_clock::now();
+    int  steps_since_eval = 0;
+
     for (int step = start_step; step <= total; ++step) {
         if (step % (total / 5) == 0 || step == start_step) {
+            float ms_per_step = 0.f;
+            if (steps_since_eval > 0) {
+                auto now = std::chrono::steady_clock::now();
+                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                              / static_cast<float>(steps_since_eval);
+                t_phase = now;
+                steps_since_eval = 0;
+            }
             auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false);
-            print_train_row(step, last_loss, acc, spec, ent);
+            print_train_row(step, last_loss, acc, spec, ent, ms_per_step);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
@@ -1626,6 +1653,7 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
         (void)clip_grad_norm(all_params, 1.0f);
         adam.step();
         last_loss = loss.data().data_as<float>()[0];
+        ++steps_since_eval;
     }
 
     if (step_spec30 >= 0)
