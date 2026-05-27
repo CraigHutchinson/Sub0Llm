@@ -20,6 +20,8 @@ add_executable(tests
     test_moe.cpp
     test_mtp.cpp
     test_rlhf.cpp
+    test_math_nodes.cpp
+    test_numeric_router.cpp
 )
 
 target_link_libraries(tests
