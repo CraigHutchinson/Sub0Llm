@@ -116,8 +116,7 @@ public:
     // Both forward_math() and router_logits() are called per training step when
     // using router supervision; the slight extra cost is worthwhile for the
     // direct gradient signal it gives the routing linear layer.
-    [[nodiscard]] autograd::Variable router_logits(
-        const Tensor& token_ids, const NumericTokenizer& ntok) const;
+    [[nodiscard]] autograd::Variable router_logits(const Tensor& token_ids) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
     // Router + math_block parameters only; includes tok_emb weight.

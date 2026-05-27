@@ -228,7 +228,8 @@ autograd::Variable MathLayer::router_logits(const autograd::Variable& h) const {
 
 autograd::Variable MathTransformerBlock::router_logits(const autograd::Variable& x) const {
     auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
-    return math_ffn_.router_logits(h);
+    // Detach so supervision CE loss does not back-prop through attention weights.
+    return math_ffn_.router_logits(detach(h));
 }
 
 std::vector<autograd::Variable*> MathTransformerBlock::parameters() {
@@ -350,8 +351,7 @@ RouteInfo MathGPT::route_info(
     return math_block_.route_info(x);
 }
 
-autograd::Variable MathGPT::router_logits(
-    const Tensor& token_ids, const NumericTokenizer& /*ntok*/) const
+autograd::Variable MathGPT::router_logits(const Tensor& token_ids) const
 {
     if (token_ids.ndim() != 1)
         throw std::runtime_error("MathGPT::router_logits: token_ids must be 1D (T,)");

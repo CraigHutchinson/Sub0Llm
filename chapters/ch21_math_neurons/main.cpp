@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <string_view>
 #include <vector>
 
 using namespace sub0llm;
@@ -779,8 +782,8 @@ static void section_curriculum_learning() {
         float spec_sum = 0.f, entropy_sum = 0.f;
         for (const auto& item : test_items) {
             if (item.prompt_ids.empty()) continue;
-            Tensor id_t = make_ids_tensor(item.prompt_ids);
-            Variable logits = model.forward_math(id_t, ntok);
+            Tensor ids_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(ids_t, ntok);
 
             const int64_t last = logits.data().shape(0) - 1;
             const int64_t Vl   = logits.data().shape(1);
@@ -804,7 +807,7 @@ static void section_curriculum_learning() {
             }
 
             // Router info
-            RouteInfo ri = model.route_info(id_t, ntok);
+            RouteInfo ri = model.route_info(ids_t, ntok);
             if (!ri.routes.empty()) {
                 const std::size_t last_t = ri.routes.size() - 1;
                 if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
@@ -1181,16 +1184,139 @@ static void section_large_numbers() {
 // Both changes require no architecture modifications: router_logits() exposes
 // the pre-softmax router output for direct supervision.
 
-static void section_improved_training() {
-    std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
-    std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
-    std::cout << "  Phase 1Cs: masked vocab + direct router supervision loss (α=0.5)\n";
-    std::cout << "  Phase 2Cs: full-vocab fine-tuning with transferred Phase-1Cs weights\n\n";
+// ── Checkpoint utilities ──────────────────────────────────────────────────────
+// Binary format: magic(u32) | version(u32) | step(i32) | n_params(u32) |
+//   for each param: ndim(u32) | dims(i64 × ndim) | data(f32 × numel)
 
+static void save_checkpoint(const std::vector<autograd::Variable*>& params,
+                             const std::filesystem::path& path, int step)
+{
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f)
+        throw std::runtime_error(
+            std::format("save_checkpoint: cannot open {}", path.string()));
+
+    constexpr uint32_t kMagic   = 0x43483231u;
+    constexpr uint32_t kVersion = 1u;
+    const auto nparams = static_cast<uint32_t>(params.size());
+    const auto step32  = static_cast<int32_t>(step);
+    f.write(reinterpret_cast<const char*>(&kMagic),   4);
+    f.write(reinterpret_cast<const char*>(&kVersion), 4);
+    f.write(reinterpret_cast<const char*>(&step32),   4);
+    f.write(reinterpret_cast<const char*>(&nparams),  4);
+
+    for (const Variable* p : params) {
+        const Tensor& t  = p->data();
+        const auto    nd = static_cast<uint32_t>(t.ndim());
+        f.write(reinterpret_cast<const char*>(&nd), 4);
+        for (std::size_t i = 0, nd2 = static_cast<std::size_t>(t.ndim()); i < nd2; ++i) {
+            int64_t d = t.shape(i);
+            f.write(reinterpret_cast<const char*>(&d), 8);
+        }
+        auto sp = t.data_as<float>();  // const overload returns span<const float>
+        f.write(reinterpret_cast<const char*>(sp.data()),
+                static_cast<std::streamsize>(sp.size() * sizeof(float)));
+    }
+    std::cout << std::format("  [ckpt] step {:4d} → {}\n", step, path.string());
+}
+
+// Returns step stored in the latest checkpoint for this phase, or -1 if none found.
+static int load_latest_checkpoint(const std::vector<autograd::Variable*>& params,
+                                   std::string_view phase, std::string_view ckpt_dir)
+{
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(ckpt_dir)) return -1;
+
+    const std::string prefix = std::format("ch21_{}_step", phase);
+    int      best_step = -1;
+    fs::path best_path;
+
+    for (const auto& entry : fs::directory_iterator(ckpt_dir)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string fn = entry.path().filename().string();
+        if (!fn.starts_with(prefix) || !fn.ends_with(".ckpt")) continue;
+        try {
+            const std::size_t start = prefix.size();
+            const std::size_t len   = fn.size() - start - 5;
+            int s = std::stoi(fn.substr(start, len));
+            if (s > best_step) { best_step = s; best_path = entry.path(); }
+        } catch (...) {}
+    }
+    if (best_step < 0) return -1;
+
+    std::ifstream f(best_path, std::ios::binary);
+    if (!f) return -1;
+
+    constexpr uint32_t kMagic = 0x43483231u;
+    uint32_t magic, version, nparams;
+    int32_t  ckpt_step;
+    f.read(reinterpret_cast<char*>(&magic),     4);
+    f.read(reinterpret_cast<char*>(&version),   4);
+    f.read(reinterpret_cast<char*>(&ckpt_step), 4);
+    f.read(reinterpret_cast<char*>(&nparams),   4);
+
+    if (magic != kMagic)
+        throw std::runtime_error(
+            std::format("load_checkpoint: bad magic in {}", best_path.string()));
+    if (nparams != static_cast<uint32_t>(params.size()))
+        throw std::runtime_error(std::format(
+            "load_checkpoint: {} params in checkpoint, {} in model",
+            nparams, params.size()));
+
+    for (Variable* p : params) {
+        Tensor&  t = p->data();
+        uint32_t nd;
+        f.read(reinterpret_cast<char*>(&nd), 4);
+        if (nd != static_cast<uint32_t>(t.ndim()))
+            throw std::runtime_error("load_checkpoint: ndim mismatch");
+        for (uint32_t i = 0; i < nd; ++i) {
+            int64_t d;
+            f.read(reinterpret_cast<char*>(&d), 8);
+            if (d != t.shape(i))
+                throw std::runtime_error(std::format(
+                    "load_checkpoint: shape[{}] mismatch: ckpt={} model={}",
+                    i, d, t.shape(i)));
+        }
+        auto sp = t.data_as<float>();
+        f.read(reinterpret_cast<char*>(sp.data()),
+               static_cast<std::streamsize>(sp.size() * sizeof(float)));
+    }
+    std::cout << std::format("  [ckpt] resumed {} (step={})\n",
+                              best_path.string(), ckpt_step);
+    return ckpt_step;
+}
+
+// ── §21.9  Improved Specialisation: D=32 + Router Supervision ────────────────
+
+struct TestItemImproved {
+    std::vector<int32_t> prompt_ids;
+    int32_t              expected_val;
+    RouteType            expected_op;
+};
+
+static constexpr int64_t kD       = 32;
+static constexpr int64_t kNHeads  = 4;
+static constexpr int64_t kNKv     = 2;
+static constexpr int64_t kNLayers = 4;
+static constexpr float   kAlpha   = 0.5f;
+
+// Build the deterministic §21.9 corpus, tokenizer, test set, and logit bias.
+// All seeds are fixed so any phase can call this independently.
+struct ImprovedData {
+    NumericTokenizer                         ntok;
+    int64_t                                  V;
+    std::vector<std::vector<int32_t>>        train_ids;
+    std::vector<RouteType>                   train_ops;
+    std::vector<TestItemImproved>            test_items;
+    std::vector<float>                       bias_vec;
+    Tensor                                   bias_t_full;
+};
+
+static ImprovedData build_improved_data() {
     std::mt19937 rng_data(42);
     std::uniform_int_distribution<int> d09(0, 9);
 
-    // 100 add + 100 sub (same corpus as §21.8 for fair comparison)
     std::vector<std::string> corpus;
     corpus.reserve(200);
     for (int i = 0; i < 100; ++i) {
@@ -1208,7 +1334,6 @@ static void section_improved_training() {
     NumericTokenizer ntok(std::move(bpe));
     const int64_t V = ntok.total_vocab_size();
 
-    // Build train_ids AND train_ops (operator label per sequence)
     std::vector<std::vector<int32_t>> train_ids;
     std::vector<RouteType>            train_ops;
     for (std::size_t i = 0; i < corpus.size(); ++i) {
@@ -1219,30 +1344,24 @@ static void section_improved_training() {
         }
     }
 
-    // Test set (same structure as §21.8)
-    struct TestItem {
-        std::vector<int32_t> prompt_ids;
-        int32_t              expected_val;
-        RouteType            expected_op;
-    };
-    std::vector<TestItem> test_items;
+    std::vector<TestItemImproved> test_items;
     {
         std::mt19937 rng_t(99);
+        std::uniform_int_distribution<int> d(0, 9);
         for (int i = 0; i < 25; ++i) {
-            int A = d09(rng_t), B = d09(rng_t);
+            int A = d(rng_t), B = d(rng_t);
             auto ids = ntok.encode(std::to_string(A) + " + " + std::to_string(B) + " =");
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
                                    A + B, RouteType::Add});
         }
         for (int i = 0; i < 25; ++i) {
-            int A = d09(rng_t), B = d09(rng_t);
+            int A = d(rng_t), B = d(rng_t);
             auto ids = ntok.encode(std::to_string(A) + " - " + std::to_string(B) + " =");
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
                                    A - B, RouteType::Sub});
         }
     }
 
-    // ── Logit bias (same active-token masking as §21.8) ───────────────────────
     std::vector<bool> is_active(static_cast<std::size_t>(V), false);
     for (const auto& ids : train_ids)
         for (auto id : ids)
@@ -1258,248 +1377,383 @@ static void section_improved_training() {
         if (is_active[static_cast<std::size_t>(i)])
             bias_vec[static_cast<std::size_t>(i)] = 0.0f;
 
-    // Pre-build maximum-size bias tensor (same optimisation as §21.8)
     int64_t max_T_loss = 0;
     for (const auto& ids : train_ids)
         if (static_cast<int64_t>(ids.size()) >= 2)
             max_T_loss = std::max(max_T_loss, static_cast<int64_t>(ids.size()) - 1);
+
     Tensor bias_t_full({max_T_loss, V}, DType::Float32);
     {
         float* bsp = bias_t_full.data_as<float>().data();
         for (int64_t t = 0; t < max_T_loss; ++t)
-            std::memcpy(bsp + t * V, bias_vec.data(), static_cast<std::size_t>(V) * sizeof(float));
+            std::memcpy(bsp + t * V, bias_vec.data(),
+                        static_cast<std::size_t>(V) * sizeof(float));
     }
 
-    std::cout << std::format("  total_vocab={} active_tokens={} train_exprs={}\n\n",
-                              V,
-                              static_cast<int>(std::count(is_active.begin(), is_active.end(), true)),
-                              train_ids.size());
-
-    const int64_t D      = 32;
-    const int64_t n_heads = 4;
-    const int64_t n_kv   = 2;
-    const int64_t n_layers = 4;
-    const float   alpha_router = 0.5f;
-
-    // ── Shared helpers ────────────────────────────────────────────────────────
-    auto make_ids_tensor = [](const std::vector<int32_t>& ids) {
-        Tensor t({static_cast<int64_t>(ids.size())}, DType::Int32);
-        auto sp = t.data_as<int32_t>();
-        for (std::size_t i = 0; i < ids.size(); ++i) sp[i] = ids[i];
-        return t;
+    return ImprovedData{
+        std::move(ntok), V,
+        std::move(train_ids), std::move(train_ops),
+        std::move(test_items),
+        std::move(bias_vec), std::move(bias_t_full)
     };
-    auto make_targets = [](const std::vector<int32_t>& ids) {
-        Tensor t({static_cast<int64_t>(ids.size()) - 1}, DType::Int32);
-        auto sp = t.data_as<int32_t>();
-        for (std::size_t i = 1; i < ids.size(); ++i) sp[i - 1] = ids[i];
-        return t;
-    };
+}
 
-    auto evaluate = [&](MathGPT& model, bool masked)
-        -> std::tuple<float, float, float>
-    {
-        int correct = 0, spec_count = 0;
-        float spec_sum = 0.f, entropy_sum = 0.f;
-        for (const auto& item : test_items) {
-            if (item.prompt_ids.empty()) continue;
-            Tensor id_t = make_ids_tensor(item.prompt_ids);
-            Variable logits = model.forward_math(id_t, ntok);
+static std::tuple<float, float, float> eval_improved(
+    MathGPT& model,
+    const ImprovedData& d,
+    bool masked)
+{
+    int correct = 0, spec_count = 0;
+    float spec_sum = 0.f, entropy_sum = 0.f;
+    const int64_t Vl = d.V;
 
-            const int64_t last = logits.data().shape(0) - 1;
-            const int64_t Vl   = logits.data().shape(1);
-            auto lsp = logits.data().data_as<float>();
+    for (const auto& item : d.test_items) {
+        if (item.prompt_ids.empty()) continue;
+        Tensor ids_t = make_ids_tensor(item.prompt_ids);
+        Variable logits = model.forward_math(ids_t, d.ntok);
 
-            int64_t best = 0;
-            float best_v = lsp[static_cast<std::size_t>(last * Vl)] +
-                           (masked ? bias_vec[0] : 0.f);
-            for (int64_t v = 1; v < Vl; ++v) {
-                float val = lsp[static_cast<std::size_t>(last * Vl + v)] +
-                            (masked ? bias_vec[static_cast<std::size_t>(v)] : 0.f);
-                if (val > best_v) { best_v = val; best = v; }
-            }
-            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
-            if (ntok.is_numeric(pred_id) && !ntok.is_nan_token(pred_id) &&
-                !ntok.is_overflow_token(pred_id)) {
-                if (static_cast<int32_t>(ntok.numeric_value(pred_id)) == item.expected_val)
-                    ++correct;
-            }
+        const int64_t last = logits.data().shape(0) - 1;
+        auto lsp = logits.data().data_as<float>();  // const overload → span<const float>
 
-            RouteInfo ri = model.route_info(id_t, ntok);
-            if (!ri.routes.empty()) {
-                const std::size_t last_t = ri.routes.size() - 1;
-                if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
-                entropy_sum += ri.entropy[last_t];
-                ++spec_count;
-            }
+        int64_t best   = 0;
+        float   best_v = lsp[static_cast<std::size_t>(last * Vl)] +
+                          (masked ? d.bias_vec[0] : 0.f);
+        for (int64_t v = 1; v < Vl; ++v) {
+            float val = lsp[static_cast<std::size_t>(last * Vl + v)] +
+                        (masked ? d.bias_vec[static_cast<std::size_t>(v)] : 0.f);
+            if (val > best_v) { best_v = val; best = v; }
         }
-        float n  = static_cast<float>(test_items.size());
-        float sn = spec_count > 0 ? static_cast<float>(spec_count) : 1.f;
-        return {static_cast<float>(correct) / n, spec_sum / sn, entropy_sum / sn};
-    };
+        auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+        if (d.ntok.is_numeric(pred_id) && !d.ntok.is_nan_token(pred_id) &&
+            !d.ntok.is_overflow_token(pred_id)) {
+            if (static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val)
+                ++correct;
+        }
 
-    auto print_header = [&]() {
-        std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}\n",
-                                  "step", "loss", "accuracy", "router_spec", "entropy");
-        std::cout << "  " << std::string(51, '-') << "\n";
-    };
-    auto print_row = [&](int step, float loss, float acc, float spec, float ent) {
-        std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
-        std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
-                                  step, loss_s, acc * 100.f, spec * 100.f, ent);
-    };
+        RouteInfo ri = model.route_info(ids_t, d.ntok);
+        if (!ri.routes.empty()) {
+            const std::size_t last_t = ri.routes.size() - 1;
+            if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
+            entropy_sum += ri.entropy[last_t];
+            ++spec_count;
+        }
+    }
+    const float n  = static_cast<float>(d.test_items.size());
+    const float sn = spec_count > 0 ? static_cast<float>(spec_count) : 1.f;
+    return {static_cast<float>(correct) / n, spec_sum / sn, entropy_sum / sn};
+}
 
-    // Alpha tensor for loss combination (pre-built, reused every step)
+static void print_train_header() {
+    std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}\n",
+                              "step", "loss", "accuracy", "router_spec", "entropy");
+    std::cout << "  " << std::string(51, '-') << "\n";
+}
+
+static void print_train_row(int step, float loss, float acc, float spec, float ent) {
+    std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
+    std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                              step, loss_s, acc * 100.f, spec * 100.f, ent);
+}
+
+// ── Phase 1Cs ─────────────────────────────────────────────────────────────────
+// Trains math_block_only_parameters() with masked vocab + router supervision.
+// Saves checkpoints every kCkptInterval steps to ckpt_dir.
+// On startup, resumes from the latest ch21_1cs_step*.ckpt if present.
+
+static void run_improved_phase_1cs(std::string_view ckpt_dir) {
+    std::cout << "\n  Phase 1Cs — D=32, masked vocab + router supervision (α=0.5)\n";
+
+    ImprovedData d    = build_improved_data();
+    const int total   = 1000;
+    const int ckpt_iv = 100;
+
+    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+
+    auto block_params = model.math_block_only_parameters();
+    auto all_params   = model.parameters();
+    Adam adam(block_params, 3e-3f);
+
+    // Resume from latest checkpoint if available
+    int start_step = load_latest_checkpoint(block_params, "1cs", ckpt_dir);
+    if (start_step >= total) {
+        std::cout << std::format("  Phase 1Cs already complete (step {} ≥ {}).\n",
+                                  start_step, total);
+        return;
+    }
+    start_step = std::max(start_step, -1) + 1;  // first step to run
+
+    std::mt19937 rng(11);
+    // Advance RNG to match the step we're resuming from
+    for (int i = 0; i < start_step; ++i) rng();
+
     Tensor alpha_t({1}, DType::Float32);
-    alpha_t.data_as<float>()[0] = alpha_router;
+    alpha_t.data_as<float>()[0] = kAlpha;
 
-    // ── Phase 1Cs: masked + router supervision (D=32, tok_emb frozen) ─────────
-    std::cout << "  Phase 1Cs — D=32, masked vocab + router supervision (α=0.5)\n";
-    print_header();
+    print_train_header();
+    float last_loss    = 0.f;
+    int   step_spec30  = -1;
 
-    MathGPT model_p1cs(V, D, static_cast<std::size_t>(n_heads),
-                        static_cast<std::size_t>(n_kv), n_layers, -1, 0, /*seed=*/42);
-    auto p1cs_block_params = model_p1cs.math_block_only_parameters();
-    auto p1cs_all_params   = model_p1cs.parameters();
-    Adam adam_p1cs(p1cs_block_params, 3e-3f);
-    std::mt19937 rng_p1cs(11);
-
-    float last_loss_p1cs = 0.f;
-    int step_spec30_p1cs = -1;
-
-    for (int step = 0; step <= 1000; ++step) {
-        if (step % 200 == 0) {
-            auto [acc, spec, ent] = evaluate(model_p1cs, /*masked=*/true);
-            print_row(step, last_loss_p1cs, acc, spec, ent);
-            if (step_spec30_p1cs < 0 && spec >= 0.30f) step_spec30_p1cs = step;
+    for (int step = start_step; step <= total; ++step) {
+        if (step % (total / 5) == 0 || step == start_step) {
+            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true);
+            print_train_row(step, last_loss, acc, spec, ent);
+            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
-        if (step == 1000) break;
+        if (step == total) {
+            save_checkpoint(block_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_1cs_step{:04d}.ckpt", step), step);
+            break;
+        }
+        if (step > start_step && step % ckpt_iv == 0)
+            save_checkpoint(block_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_1cs_step{:04d}.ckpt", step), step);
 
-        const std::size_t idx = rng_p1cs() % train_ids.size();
-        const auto& ids = train_ids[idx];
-        const RouteType gt_op = train_ops[idx];
-        if (ids.size() < 2) { --step; continue; }
+        const std::size_t idx   = rng() % d.train_ids.size();
+        const auto&       ids   = d.train_ids[idx];
+        const RouteType   gt_op = d.train_ops[idx];
+        if (ids.size() < 2) { --step; rng(); continue; }
 
         Tensor id_tensor = make_ids_tensor(ids);
-        Tensor targets   = make_targets(ids);
-        const int64_t seq_len = static_cast<int64_t>(ids.size());
-        const int64_t T_loss  = seq_len - 1;
+        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
 
-        for (auto* p : p1cs_all_params) p->zero_grad();
+        for (auto* p : all_params) p->zero_grad();
 
-        // Main CE loss with masked vocabulary
-        auto logits  = model_p1cs.forward_math(id_tensor, ntok);
+        auto logits  = model.forward_math(id_tensor, d.ntok);
         auto ltrunc  = narrow(logits, 0, T_loss);
-        auto lmasked = add(ltrunc, narrow(Variable(bias_t_full, false), 0, T_loss));
-        auto L_ce    = cross_entropy(lmasked, targets);
+        auto lmasked = add(ltrunc, narrow(Variable(d.bias_t_full, false), 0, T_loss));
+        auto L_ce    = cross_entropy(lmasked, make_targets(ids));
 
-        // Router supervision at the "=" prediction position
-        auto rlogits   = model_p1cs.router_logits(id_tensor, ntok);  // (T, 6)
-        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);              // (1, 6)
+        // Supervision at the "=" token position (T_loss-1 for this 5-token corpus)
+        auto rlogits   = model.router_logits(id_tensor);
+        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
         Tensor gt_t({1}, DType::Int32);
         gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
         auto L_sup = cross_entropy(rlogit_eq, gt_t);
 
         auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
         L_total.backward();
-        (void)clip_grad_norm(p1cs_block_params, 1.0f);
-        adam_p1cs.step();
-        last_loss_p1cs = L_total.data().data_as<float>()[0];
+        (void)clip_grad_norm(block_params, 1.0f);
+        adam.step();
+        last_loss = L_total.data().data_as<float>()[0];
     }
 
-    if (step_spec30_p1cs >= 0)
+    if (step_spec30 >= 0)
         std::cout << std::format("  → router_spec first crossed 30% at step {}\n",
-                                  step_spec30_p1cs);
+                                  step_spec30);
     else
-        std::cout << "  → router_spec did not cross 30% within 1000 steps\n";
+        std::cout << "  → router_spec did not cross 30% within Phase 1Cs\n";
+}
 
-    // ── Phase 2Cs: full-vocab with Phase-1Cs math_block transferred ───────────
+// ── Phase 2Cs ─────────────────────────────────────────────────────────────────
+// Full-vocab fine-tuning.  Initialises math_block from the Phase 1Cs checkpoint;
+// saves whole-model checkpoints for crash recovery.
+// Returns {accuracy, router_spec, entropy} after the final evaluation.
+
+static std::tuple<float, float, float>
+run_improved_phase_2cs(std::string_view ckpt_dir)
+{
     std::cout << "\n  Phase 2Cs — full-vocab, Phase-1Cs math_block (D=32, no supervision)\n";
-    print_header();
 
-    MathGPT model_p2cs(V, D, static_cast<std::size_t>(n_heads),
-                        static_cast<std::size_t>(n_kv), n_layers, -1, 0, /*seed=*/42);
-    model_p2cs.import_math_block(model_p1cs);
-    Adam adam_p2cs(model_p2cs.parameters(), 3e-3f);
-    std::mt19937 rng_p2cs(11);
+    ImprovedData d  = build_improved_data();
+    const int total = 2000;
+    const int ckpt_iv = 200;
 
-    float last_loss_p2cs = 0.f;
-    int step_spec30_p2cs = -1;
+    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
 
-    for (int step = 0; step <= 2000; ++step) {
-        if (step % 400 == 0) {
-            auto [acc, spec, ent] = evaluate(model_p2cs, /*masked=*/false);
-            print_row(step, last_loss_p2cs, acc, spec, ent);
-            if (step_spec30_p2cs < 0 && spec >= 0.30f) step_spec30_p2cs = step;
+    auto all_params  = model.parameters();
+    auto math_params = model.math_block_only_parameters();
+    Adam adam(all_params, 3e-3f);
+
+    // Prefer a Phase 2Cs checkpoint (allows mid-phase resume)
+    int start_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
+    if (start_step < 0) {
+        // No Phase 2Cs checkpoint: import math_block from Phase 1Cs
+        int p1cs_step = load_latest_checkpoint(math_params, "1cs", ckpt_dir);
+        if (p1cs_step < 0)
+            throw std::runtime_error(
+                "Phase 2Cs requires a Phase 1Cs checkpoint.\n"
+                "  Run first: ./ch21_math_neurons 1cs [--ckpt-dir <dir>]");
+        std::cout << std::format("  math_block imported from Phase 1Cs checkpoint "
+                                  "(step {})\n", p1cs_step);
+        start_step = 0;
+    } else if (start_step >= total) {
+        std::cout << std::format("  Phase 2Cs already complete (step {} ≥ {}).\n",
+                                  start_step, total);
+        return eval_improved(model, d, false);
+    }
+    start_step = std::max(start_step, -1) + 1;
+
+    std::mt19937 rng(11);
+    for (int i = 0; i < start_step; ++i) rng();
+
+    print_train_header();
+    float last_loss  = 0.f;
+    int   step_spec30 = -1;
+
+    for (int step = start_step; step <= total; ++step) {
+        if (step % (total / 5) == 0 || step == start_step) {
+            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false);
+            print_train_row(step, last_loss, acc, spec, ent);
+            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
-        if (step == 2000) break;
+        if (step == total) {
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_2cs_step{:04d}.ckpt", step), step);
+            break;
+        }
+        if (step > start_step && step % ckpt_iv == 0)
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_2cs_step{:04d}.ckpt", step), step);
 
-        const std::size_t idx = rng_p2cs() % train_ids.size();
-        const auto& ids = train_ids[idx];
-        if (ids.size() < 2) { --step; continue; }
+        const std::size_t idx = rng() % d.train_ids.size();
+        const auto& ids = d.train_ids[idx];
+        if (ids.size() < 2) { --step; rng(); continue; }
 
         Tensor id_tensor = make_ids_tensor(ids);
-        Tensor targets   = make_targets(ids);
-        const int64_t seq_len = static_cast<int64_t>(ids.size());
-        const int64_t T_loss  = seq_len - 1;
+        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
 
-        adam_p2cs.zero_grad();
-        auto logits = model_p2cs.forward_math(id_tensor, ntok);
+        adam.zero_grad();
+        auto logits = model.forward_math(id_tensor, d.ntok);
         auto ltrunc = narrow(logits, 0, T_loss);
-        auto loss   = cross_entropy(ltrunc, targets);
+        auto loss   = cross_entropy(ltrunc, make_targets(ids));
         loss.backward();
-        (void)clip_grad_norm(model_p2cs.parameters(), 1.0f);
-        adam_p2cs.step();
-        last_loss_p2cs = loss.data().data_as<float>()[0];
+        (void)clip_grad_norm(all_params, 1.0f);
+        adam.step();
+        last_loss = loss.data().data_as<float>()[0];
     }
 
-    // ── Summary comparison ─────────────────────────────────────────────────────
-    // Final evaluation for the summary line
-    auto [acc_p2cs, spec_p2cs, ent_p2cs] = evaluate(model_p2cs, false);
+    if (step_spec30 >= 0)
+        std::cout << std::format("  → router_spec first crossed 30% at step {}\n",
+                                  step_spec30);
+    else
+        std::cout << "  → router_spec did not cross 30% within Phase 2Cs\n";
 
-    std::cout << "\n  Summary at step 2000 (Phase 2Cs) vs §21.8 Phase 2C (D=16, step 1000):\n";
+    return eval_improved(model, d, false);
+}
+
+// ── Standalone evaluation ─────────────────────────────────────────────────────
+// Load the Phase 2Cs checkpoint and print the summary table.
+
+static void run_improved_eval(std::string_view ckpt_dir) {
+    std::cout << "\n  Eval — loading Phase 2Cs checkpoint\n";
+
+    ImprovedData d = build_improved_data();
+    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+
+    auto all_params = model.parameters();
+    int loaded_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
+    if (loaded_step < 0)
+        throw std::runtime_error(
+            "Phase 2Cs checkpoint not found.\n"
+            "  Run first: ./ch21_math_neurons 2cs [--ckpt-dir <dir>]");
+
+    auto [acc, spec, ent] = eval_improved(model, d, false);
+    std::cout << std::format("  accuracy={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+                              acc * 100.f, spec * 100.f, ent);
+    std::cout << "\n  Summary (§21.9 Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
     std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
                               "model", "accuracy", "router_spec", "entropy");
     std::cout << "  " << std::string(83, '-') << "\n";
+    // §21.8 values are documented baselines from the prior run; see docs/ch21_math_neurons.md
     std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
                               "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                               22.0f, 50.0f, 0.04f);
     std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
                               "§21.9 Phase 2Cs (D=32, supervised, 2000 steps)",
-                              acc_p2cs * 100.f, spec_p2cs * 100.f, ent_p2cs);
+                              acc * 100.f, spec * 100.f, ent);
+}
 
-    std::cout << "\n  Key improvements:\n";
-    std::cout << "    D=32: router Linear(32,6) = 198 params (vs 102 at D=16)\n";
-    std::cout << "    Router supervision adds direct CE signal at the '=' position\n";
-    std::cout << "      — the router no longer waits for gradient to propagate\n";
-    std::cout << "        through the STE path and the full LM head.\n";
-    if (step_spec30_p1cs >= 0)
-        std::cout << std::format("    Phase 1Cs achieved >30% router_spec at step {} "
-                                  "(vs 200 steps in §21.8)\n", step_spec30_p1cs);
+// ── Orchestrator ──────────────────────────────────────────────────────────────
 
-    if (spec_p2cs > 0.50f)
-        std::cout << std::format("    Phase 2Cs router_spec {:.0f}% > 50% §21.8 baseline: "
-                                  "supervision transfer held\n", spec_p2cs * 100.f);
-    if (acc_p2cs > 0.22f)
-        std::cout << std::format("    Phase 2Cs accuracy {:.0f}% > 22% §21.8 baseline: "
-                                  "specialisation translates to predictions\n",
-                                  acc_p2cs * 100.f);
+static void section_improved_training(std::string_view phase,
+                                       std::string_view ckpt_dir)
+{
+    std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
+    std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
+    std::cout << "  Phase 1Cs: masked vocab + direct router supervision loss (α=0.5)\n";
+    std::cout << "  Phase 2Cs: full-vocab fine-tuning with transferred Phase-1Cs weights\n";
+    std::cout << std::format("  checkpoint directory: {}\n", ckpt_dir);
+
+    if (phase == "eval") {
+        run_improved_eval(ckpt_dir);
+        return;
+    }
+
+    // build_improved_data() is called inside each phase function (deterministic)
+    if (phase == "all" || phase == "1cs")
+        run_improved_phase_1cs(ckpt_dir);
+
+    if (phase == "all" || phase == "2cs") {
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir);
+
+        std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
+        std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
+                                  "model", "accuracy", "router_spec", "entropy");
+        std::cout << "  " << std::string(83, '-') << "\n";
+        // §21.8 values are documented baselines; see docs/ch21_math_neurons.md
+        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                                  "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
+                                  22.0f, 50.0f, 0.04f);
+        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                                  "§21.9 Phase 2Cs (D=32, supervised, 2000 steps)",
+                                  acc * 100.f, spec * 100.f, ent);
+
+        std::cout << "\n  Key improvements:\n";
+        std::cout << "    D=32: router Linear(32,6) = 198 params (vs 102 at D=16)\n";
+        std::cout << "    Router supervision adds direct CE signal at the '=' position\n";
+        if (spec > 0.50f)
+            std::cout << std::format("    Phase 2Cs router_spec {:.0f}% > 50% §21.8 baseline\n",
+                                      spec * 100.f);
+        if (acc > 0.22f)
+            std::cout << std::format("    Phase 2Cs accuracy {:.0f}% > 22% §21.8 baseline\n",
+                                      acc * 100.f);
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
+//
+// Usage:
+//   ./ch21_math_neurons                    # run all sections (default)
+//   ./ch21_math_neurons 1cs                # Phase 1Cs only
+//   ./ch21_math_neurons 2cs                # Phase 2Cs only (requires 1cs ckpt)
+//   ./ch21_math_neurons eval               # load 2cs ckpt, print summary
+//   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts
 
-int main() {
+int main(int argc, char* argv[]) {
+    std::string phase    = "all";
+    std::string ckpt_dir = ".";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        if      (arg == "--phase"    && i + 1 < argc) { phase    = argv[++i]; }
+        else if (arg == "--ckpt-dir" && i + 1 < argc) { ckpt_dir = argv[++i]; }
+        else if (!arg.starts_with("--"))               { phase    = std::string(arg); }
+    }
+
     std::cout << "Chapter 21 — Math Neurons: Arithmetic-Aware Transformers\n";
     std::cout << std::string(60, '=') << '\n';
 
-    section_numeric_tokenizer();
-    section_math_ops();
-    section_numeric_router();
-    section_arithmetic_training();
-    section_layer_ablation();
-    section_training_dynamics();
-    section_curriculum_learning();
-    section_large_numbers();
-    section_improved_training();
+    // When targeting a specific §21.9 phase, skip the earlier demo sections.
+    const bool improved_only = (phase == "1cs" || phase == "2cs" || phase == "eval");
+    if (!improved_only) {
+        section_numeric_tokenizer();
+        section_math_ops();
+        section_numeric_router();
+        section_arithmetic_training();
+        section_layer_ablation();
+        section_training_dynamics();
+        section_curriculum_learning();
+        section_large_numbers();
+    }
+
+    section_improved_training(phase, ckpt_dir);
 
     std::cout << "\nDone.\n";
     return 0;
