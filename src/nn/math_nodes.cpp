@@ -148,6 +148,42 @@ autograd::Variable MathLayer::forward(
     return output;
 }
 
+RouteInfo MathLayer::route_info(const autograd::Variable& h) const {
+    const int64_t T = h.data().shape(0);
+    const int64_t K = static_cast<int64_t>(kNumRouteTypes);
+
+    Variable xn = norm_.forward(h);
+    auto [soft_probs, hard_mask] = router_.forward(xn);
+
+    auto soft_sp = soft_probs.data().data_as<float>();
+    auto mask_sp = hard_mask.data_as<float>();
+
+    RouteInfo info;
+    info.routes.reserve(static_cast<std::size_t>(T));
+    info.entropy.reserve(static_cast<std::size_t>(T));
+
+    for (int64_t t = 0; t < T; ++t) {
+        // Find hard route from one-hot mask
+        RouteType route = RouteType::FFN;
+        for (int64_t k = 0; k < K; ++k) {
+            if (mask_sp[static_cast<std::size_t>(t * K + k)] > 0.5f) {
+                route = static_cast<RouteType>(k);
+                break;
+            }
+        }
+        info.routes.push_back(route);
+
+        // Compute entropy H = -sum(p * log(p)) from softmax probs
+        float H = 0.f;
+        for (int64_t k = 0; k < K; ++k) {
+            float p = soft_sp[static_cast<std::size_t>(t * K + k)];
+            if (p > 1e-9f) H -= p * std::log(p);
+        }
+        info.entropy.push_back(H);
+    }
+    return info;
+}
+
 std::vector<autograd::Variable*> MathLayer::parameters() {
     std::vector<Variable*> p;
     for (auto* v : norm_.parameters())   p.push_back(v);
@@ -173,6 +209,11 @@ autograd::Variable MathTransformerBlock::forward_math(
 {
     auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
     return add(h, math_ffn_.forward(h, reg, emb_weight, ntok));
+}
+
+RouteInfo MathTransformerBlock::route_info(const autograd::Variable& x) const {
+    auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
+    return math_ffn_.route_info(h);
 }
 
 std::vector<autograd::Variable*> MathTransformerBlock::parameters() {
@@ -276,6 +317,22 @@ autograd::Variable MathGPT::forward_math(
 
     x = ln_f_.forward(x);
     return matmul(x, transpose2d(tok_emb_.weight()));
+}
+
+RouteInfo MathGPT::route_info(
+    const Tensor& token_ids, const NumericTokenizer& ntok) const
+{
+    if (token_ids.ndim() != 1)
+        throw std::runtime_error("MathGPT::route_info: token_ids must be 1D (T,)");
+    if (token_ids.shape()[0] < 1)
+        throw std::runtime_error("MathGPT::route_info: token_ids must be non-empty");
+
+    Variable x = tok_emb_.forward(token_ids);
+
+    for (int64_t li = 0; li < l_math_; ++li)
+        x = blocks_[static_cast<std::size_t>(li)].forward(x);
+
+    return math_block_.route_info(x);
 }
 
 std::vector<autograd::Variable*> MathGPT::parameters() {

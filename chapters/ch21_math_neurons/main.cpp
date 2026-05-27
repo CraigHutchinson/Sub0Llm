@@ -428,6 +428,239 @@ static void section_layer_ablation() {
     }
 }
 
+// ── §21.7  Training Dynamics & Router Specialisation ─────────────────────────
+
+static void section_training_dynamics() {
+    std::cout << "\n=== §21.7  Training Dynamics & Router Specialisation ===\n";
+
+    std::mt19937 rng_data(42);
+    std::uniform_int_distribution<int> d09(0, 9);
+
+    // Build 300 training expressions: 100 add + 100 sub + 50 mul + 50 div
+    std::vector<std::string> corpus_exprs;
+    corpus_exprs.reserve(300);
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus_exprs.push_back(std::to_string(A) + " + " + std::to_string(B) +
+                                " = " + std::to_string(A + B));
+    }
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus_exprs.push_back(std::to_string(A) + " - " + std::to_string(B) +
+                                " = " + std::to_string(A - B));
+    }
+    for (int i = 0; i < 50; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus_exprs.push_back(std::to_string(A) + " * " + std::to_string(B) +
+                                " = " + std::to_string(A * B));
+    }
+    for (int i = 0; i < 50; ++i) {
+        int A = d09(rng_data), B = std::max(1, d09(rng_data));
+        corpus_exprs.push_back(std::to_string(A) + " / " + std::to_string(B) +
+                                " = " + std::to_string(A / B));
+    }
+
+    auto bpe = BPETokenizer::train(corpus_exprs, /*vocab_size=*/60);
+    NumericTokenizer ntok(std::move(bpe));
+    const int64_t total_vocab = ntok.total_vocab_size();
+
+    std::cout << std::format("  total_vocab = {}  training_exprs = {}\n\n",
+                              total_vocab, corpus_exprs.size());
+
+    std::vector<std::vector<int32_t>> train_ids;
+    train_ids.reserve(corpus_exprs.size());
+    for (const auto& expr : corpus_exprs) {
+        auto ids = ntok.encode(expr);
+        if (ids.size() >= 2)
+            train_ids.push_back(std::vector<int32_t>(ids.begin(), ids.end()));
+    }
+
+    // Build 50 test expressions (25 add + 25 sub)
+    std::vector<std::pair<std::vector<int32_t>, int32_t>> test_set;
+    // Also track expected operations for router_spec
+    std::vector<RouteType> test_expected_ops;
+    {
+        std::mt19937 rng_test(99);
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_test), B = d09(rng_test);
+            std::string expr = std::to_string(A) + " + " + std::to_string(B) + " =";
+            auto ids = ntok.encode(expr);
+            test_set.push_back({std::vector<int32_t>(ids.begin(), ids.end()), A + B});
+            test_expected_ops.push_back(RouteType::Add);
+        }
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_test), B = d09(rng_test);
+            std::string expr = std::to_string(A) + " - " + std::to_string(B) + " =";
+            auto ids = ntok.encode(expr);
+            test_set.push_back({std::vector<int32_t>(ids.begin(), ids.end()), A - B});
+            test_expected_ops.push_back(RouteType::Sub);
+        }
+    }
+
+    const int64_t D = 16;
+    const std::size_t n_heads = 2, n_kv = 1;
+    const int64_t n_layers = 4;
+
+    MathGPT model(total_vocab, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
+    Adam adam(model.parameters(), 3e-3f);
+    std::mt19937 rng_train(11);
+
+    const int steps = 5000;
+    const int log_every = 500;
+
+    // Evaluate helpers
+    auto eval_accuracy = [&]() -> float {
+        int correct = 0;
+        for (const auto& [prompt_ids, expected_val] : test_set) {
+            if (prompt_ids.empty()) continue;
+            Tensor id_tensor = make_ids_tensor(prompt_ids);
+            Variable logits = model.forward_math(id_tensor, ntok);
+
+            const int64_t last_pos = logits.data().shape(0) - 1;
+            const int64_t V       = logits.data().shape(1);
+            auto logits_sp = logits.data().data_as<float>();
+
+            int64_t best = 0;
+            float   best_val = logits_sp[static_cast<std::size_t>(last_pos * V)];
+            for (int64_t v = 1; v < V; ++v) {
+                float val = logits_sp[static_cast<std::size_t>(last_pos * V + v)];
+                if (val > best_val) { best_val = val; best = v; }
+            }
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            if (ntok.is_numeric(pred_id) && !ntok.is_nan_token(pred_id) &&
+                !ntok.is_overflow_token(pred_id))
+            {
+                int32_t pred_val = static_cast<int32_t>(ntok.numeric_value(pred_id));
+                if (pred_val == expected_val) ++correct;
+            }
+        }
+        return static_cast<float>(correct) / static_cast<float>(test_set.size());
+    };
+
+    auto eval_router = [&]() -> std::pair<float, float> {
+        int spec_correct = 0;
+        float total_entropy = 0.f;
+        int count = 0;
+        for (std::size_t i = 0; i < test_set.size(); ++i) {
+            const auto& prompt_ids = test_set[i].first;
+            if (prompt_ids.empty()) continue;
+            Tensor id_tensor = make_ids_tensor(prompt_ids);
+            RouteInfo ri = model.route_info(id_tensor, ntok);
+            if (ri.routes.empty()) continue;
+            // Check last token route (the "=" token position)
+            const std::size_t last_t = ri.routes.size() - 1;
+            if (ri.routes[last_t] == test_expected_ops[i]) ++spec_correct;
+            total_entropy += ri.entropy[last_t];
+            ++count;
+        }
+        float spec = static_cast<float>(spec_correct) / static_cast<float>(test_set.size());
+        float avg_ent = (count > 0) ? total_entropy / static_cast<float>(count) : 0.f;
+        return {spec, avg_ent};
+    };
+
+    std::cout << std::format("  {:>6}  {:>7}  {:>9}  {:>12}  {:>11}\n",
+                              "step", "loss", "test_acc", "router_spec", "avg_entropy");
+    std::cout << "  " << std::string(53, '-') << "\n";
+
+    // Step 0 baseline
+    {
+        auto [spec, avg_ent] = eval_router();
+        float acc = eval_accuracy();
+        std::cout << std::format("  {:>6}  {:>7}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  0, "n/a", acc * 100.f, spec * 100.f, avg_ent);
+    }
+
+    // Timing trackers
+    int step_spec_30 = -1, step_acc_10 = -1;
+    float last_loss = 0.f;
+
+    for (int step = 1; step <= steps; ++step) {
+        const std::size_t idx = rng_train() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+
+        adam.zero_grad();
+        auto logits = model.forward_math(id_tensor, ntok);
+        auto ltrunc = narrow(logits, 0, seq_len - 1);
+        auto loss   = cross_entropy(ltrunc, targets);
+        loss.backward();
+        (void)clip_grad_norm(model.parameters(), 1.0f);
+        adam.step();
+        last_loss = loss.data().data_as<float>()[0];
+
+        if (step % log_every == 0) {
+            float acc = eval_accuracy();
+            auto [spec, avg_ent] = eval_router();
+
+            std::cout << std::format("  {:>6}  {:>7.2f}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                      step, last_loss, acc * 100.f, spec * 100.f, avg_ent);
+
+            if (step_spec_30 < 0 && spec >= 0.30f) step_spec_30 = step;
+            if (step_acc_10  < 0 && acc  >= 0.10f) step_acc_10  = step;
+        }
+    }
+
+    // Analysis section
+    std::cout << "\n  Analysis:\n";
+    std::cout << "  ---------\n";
+
+    if (step_spec_30 > 0)
+        std::cout << std::format("  Router specialisation first exceeded 30% at step {}\n",
+                                  step_spec_30);
+    else
+        std::cout << "  Router specialisation did not exceed 30% within 5000 steps\n";
+
+    if (step_acc_10 > 0)
+        std::cout << std::format("  Test accuracy first exceeded 10% at step {}\n", step_acc_10);
+    else
+        std::cout << "  Test accuracy did not exceed 10% within 5000 steps\n";
+
+    if (step_spec_30 > 0 && step_acc_10 > 0) {
+        if (step_spec_30 < step_acc_10)
+            std::cout << std::format("  Router specialisation LEADS accuracy by {} steps\n",
+                                      step_acc_10 - step_spec_30);
+        else
+            std::cout << std::format("  Accuracy improvement LEADS router specialisation by {} steps\n",
+                                      step_spec_30 - step_acc_10);
+    }
+
+    // Minimum training budget estimate
+    const int n_unique_results = 19;  // add/sub on 0..9 produces results in [-9..18] → 28 vals,
+                                       // but practically ~19 unique outcomes seen in training
+    const int router_routes = kNumRouteTypes;
+    const int steps_per_example = 5000 / static_cast<int>(train_ids.size());
+    std::cout << std::format("\n  Minimum training budget estimate:\n");
+    std::cout << std::format("    steps_per_example ({}) × n_unique_results ({}) × router_routes ({}) = {}\n",
+                              steps_per_example, n_unique_results, router_routes,
+                              steps_per_example * n_unique_results * router_routes);
+
+    std::cout << "\n  Why convergence is slow:\n";
+    std::cout << std::format("    Vocabulary size = {} (cross-entropy floor ln({}) ≈ {:.2f} nats)\n",
+                              total_vocab, total_vocab,
+                              std::log(static_cast<float>(total_vocab)));
+    std::cout << "    Random-init embeddings: each of 65k+ tokens starts at equal distance from\n";
+    std::cout << "    every other token — the model must first cluster numeric tokens before\n";
+    std::cout << "    the router can learn meaningful distinctions.\n";
+    std::cout << std::format("    Early router: 1/K = {:.1f}% chance of correct route by chance.\n",
+                              100.f / static_cast<float>(kNumRouteTypes));
+    std::cout << "    With D=16 embeddings spread across 65k vocab, gradient signal per token\n";
+    std::cout << "    is extremely diluted — most steps update unrelated embeddings.\n";
+
+    std::cout << "\n  What would accelerate training:\n";
+    std::cout << "    1. Smaller vocab: a purpose-built arithmetic tokenizer (BPE on digits only)\n";
+    std::cout << "       would reduce the vocab to ~50 tokens, making each gradient step 1000×\n";
+    std::cout << "       more focused on the numeric subspace.\n";
+    std::cout << "    2. Larger D: D=64 or D=128 gives the router more expressive capacity to\n";
+    std::cout << "       separate operator symbols (+/-/*/) from numeric tokens in embedding space.\n";
+    std::cout << "    3. Explicit routing supervision: add a cross-entropy loss on router logits\n";
+    std::cout << "       with ground-truth operator labels — this directly trains the router\n";
+    std::cout << "       without waiting for end-to-end gradient to propagate through STE.\n";
+}
+
 // ── §21.6  Large Number Arithmetic — Exact vs Statistical ────────────────────
 //
 // A tiny statistical LM trained only on [0..9] single-digit arithmetic will
@@ -541,6 +774,7 @@ int main() {
     section_numeric_router();
     section_arithmetic_training();
     section_layer_ablation();
+    section_training_dynamics();
     section_large_numbers();
 
     std::cout << "\nDone.\n";

@@ -16,6 +16,11 @@ struct MathResult {
     bool  is_overflow;
 };
 
+struct RouteInfo {
+    std::vector<RouteType> routes;   // per-token hard route decision
+    std::vector<float>     entropy;  // per-token softmax entropy (nats, max=ln(6)≈1.79)
+};
+
 // Apply exact arithmetic for the given RouteType.
 // FFN / default returns {0, true, false} (NaN placeholder).
 [[nodiscard]] MathResult apply_math_op(RouteType op, float a, float b);
@@ -41,6 +46,8 @@ public:
         const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok) const;
 
+    [[nodiscard]] RouteInfo route_info(const autograd::Variable& h) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
 private:
@@ -63,6 +70,8 @@ public:
         const std::vector<float>& reg,
         const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok) const;
+
+    [[nodiscard]] RouteInfo route_info(const autograd::Variable& x) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
@@ -95,6 +104,9 @@ public:
 
     // Returns logits (T, total_vocab) using MathTransformerBlock at l_math_.
     [[nodiscard]] autograd::Variable forward_math(
+        const Tensor& token_ids, const NumericTokenizer& ntok) const;
+
+    [[nodiscard]] RouteInfo route_info(
         const Tensor& token_ids, const NumericTokenizer& ntok) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
