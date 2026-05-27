@@ -150,6 +150,8 @@ autograd::Variable MathLayer::forward(
 }
 
 RouteInfo MathLayer::route_info(const autograd::Variable& h) const {
+    if (h.data().ndim() != 2)
+        throw std::runtime_error("MathLayer::route_info: h must be 2D (T, D)");
     const int64_t T = h.data().shape(0);
     const int64_t K = static_cast<int64_t>(kNumRouteTypes);
 
@@ -372,9 +374,9 @@ void MathGPT::import_math_block(MathGPT& source) {
     for (std::size_t i = 0; i < src_p.size(); ++i) {
         const Tensor& src_t = src_p[i]->data();
         Tensor& dst_t = dst_p[i]->data();
-        if (src_t.numel() != dst_t.numel())
+        if (src_t.shape() != dst_t.shape())
             throw std::runtime_error(std::format(
-                "import_math_block: tensor {} numel mismatch: {} vs {}",
+                "import_math_block: tensor {} shape mismatch (numel {} vs {})",
                 i, src_t.numel(), dst_t.numel()));
         std::memcpy(dst_t.data_as<float>().data(),
                     src_t.data_as<float>().data(),

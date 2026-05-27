@@ -554,7 +554,7 @@ static void section_training_dynamics() {
             total_entropy += ri.entropy[last_t];
             ++count;
         }
-        float spec = static_cast<float>(spec_correct) / static_cast<float>(test_set.size());
+        float spec = (count > 0) ? static_cast<float>(spec_correct) / static_cast<float>(count) : 0.f;
         float avg_ent = (count > 0) ? total_entropy / static_cast<float>(count) : 0.f;
         return {spec, avg_ent};
     };
@@ -609,18 +609,18 @@ static void section_training_dynamics() {
     std::cout << "\n  Analysis:\n";
     std::cout << "  ---------\n";
 
-    if (step_spec_30 > 0)
+    if (step_spec_30 >= 0)
         std::cout << std::format("  Router specialisation first exceeded 30% at step {}\n",
                                   step_spec_30);
     else
         std::cout << "  Router specialisation did not exceed 30% within 5000 steps\n";
 
-    if (step_acc_10 > 0)
+    if (step_acc_10 >= 0)
         std::cout << std::format("  Test accuracy first exceeded 10% at step {}\n", step_acc_10);
     else
         std::cout << "  Test accuracy did not exceed 10% within 5000 steps\n";
 
-    if (step_spec_30 > 0 && step_acc_10 > 0) {
+    if (step_spec_30 >= 0 && step_acc_10 >= 0) {
         if (step_spec_30 < step_acc_10)
             std::cout << std::format("  Router specialisation LEADS accuracy by {} steps\n",
                                       step_acc_10 - step_spec_30);
@@ -750,6 +750,21 @@ static void section_curriculum_learning() {
 
     std::cout << std::format("  total_vocab={} active_tokens={}\n\n", V, n_active);
 
+    // Pre-build the maximum-size bias tensor once; each training step slices to
+    // T_loss rows via narrow instead of allocating and filling a fresh tensor.
+    int64_t max_T_loss_bias = 0;
+    for (const auto& ids : train_ids)
+        if (static_cast<int64_t>(ids.size()) >= 2)
+            max_T_loss_bias = std::max(max_T_loss_bias,
+                                       static_cast<int64_t>(ids.size()) - 1);
+    Tensor bias_t_full({max_T_loss_bias, V}, DType::Float32);
+    {
+        float* bsp = bias_t_full.data_as<float>().data();
+        for (int64_t t = 0; t < max_T_loss_bias; ++t)
+            std::memcpy(bsp + t * V, bias_vec.data(),
+                        static_cast<std::size_t>(V) * sizeof(float));
+    }
+
     // ── Shared evaluation lambdas ─────────────────────────────────────────────
     const int64_t D = 16;
     const std::size_t n_heads = 2, n_kv = 1;
@@ -760,7 +775,7 @@ static void section_curriculum_learning() {
     auto evaluate = [&](MathGPT& model, bool masked)
         -> std::tuple<float, float, float>  // (accuracy, router_spec, avg_entropy)
     {
-        int correct = 0;
+        int correct = 0, spec_count = 0;
         float spec_sum = 0.f, entropy_sum = 0.f;
         for (const auto& item : test_items) {
             if (item.prompt_ids.empty()) continue;
@@ -790,12 +805,16 @@ static void section_curriculum_learning() {
 
             // Router info
             RouteInfo ri = model.route_info(id_t, ntok);
-            const std::size_t last_t = ri.routes.size() - 1;
-            if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
-            entropy_sum += ri.entropy[last_t];
+            if (!ri.routes.empty()) {
+                const std::size_t last_t = ri.routes.size() - 1;
+                if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
+                entropy_sum += ri.entropy[last_t];
+                ++spec_count;
+            }
         }
-        float n = static_cast<float>(test_items.size());
-        return {static_cast<float>(correct) / n, spec_sum / n, entropy_sum / n};
+        float n  = static_cast<float>(test_items.size());
+        float sn = spec_count > 0 ? static_cast<float>(spec_count) : 1.f;
+        return {static_cast<float>(correct) / n, spec_sum / sn, entropy_sum / sn};
     };
 
     auto print_header = [&]() {
@@ -838,19 +857,10 @@ static void section_curriculum_learning() {
         const int64_t seq_len = static_cast<int64_t>(ids.size());
         const int64_t T_loss  = seq_len - 1;
 
-        // Build (T_loss, V) additive bias for logit masking
-        Tensor bias_t({T_loss, V}, DType::Float32);
-        {
-            float* bsp = bias_t.data_as<float>().data();
-            for (int64_t t = 0; t < T_loss; ++t)
-                std::memcpy(bsp + t * V, bias_vec.data(),
-                            static_cast<std::size_t>(V) * sizeof(float));
-        }
-
         adam_p1.zero_grad();
         auto logits  = model_p1.forward_math(id_tensor, ntok);
         auto ltrunc  = narrow(logits, 0, T_loss);
-        auto lmasked = add(ltrunc, Variable(bias_t, false));
+        auto lmasked = add(ltrunc, narrow(Variable(bias_t_full, false), 0, T_loss));
         auto loss    = cross_entropy(lmasked, targets);
         loss.backward();
         (void)clip_grad_norm(model_p1.parameters(), 1.0f);
@@ -932,19 +942,11 @@ static void section_curriculum_learning() {
         const int64_t seq_len = static_cast<int64_t>(ids.size());
         const int64_t T_loss  = seq_len - 1;
 
-        Tensor bias_t({T_loss, V}, DType::Float32);
-        {
-            float* bsp = bias_t.data_as<float>().data();
-            for (int64_t t = 0; t < T_loss; ++t)
-                std::memcpy(bsp + t * V, bias_vec.data(),
-                            static_cast<std::size_t>(V) * sizeof(float));
-        }
-
         // Zero ALL parameter grads (including frozen tok_emb) then step only block
         for (auto* p : p1c_all_params) p->zero_grad();
         auto logits  = model_p1c.forward_math(id_tensor, ntok);
         auto ltrunc  = narrow(logits, 0, T_loss);
-        auto lmasked = add(ltrunc, Variable(bias_t, false));
+        auto lmasked = add(ltrunc, narrow(Variable(bias_t_full, false), 0, T_loss));
         auto loss    = cross_entropy(lmasked, targets);
         loss.backward();
         (void)clip_grad_norm(p1c_block_params, 1.0f);
