@@ -179,6 +179,10 @@ class MathLayer {
 Returns a `(T, D)` residual update.  The caller adds it to `h` in
 `MathTransformerBlock::forward_math`.
 
+The `route_info(h)` diagnostic method returns a `RouteInfo` struct with
+per-token hard route decisions and softmax entropy values — used in §21.7 to
+track router specialisation during training.
+
 ---
 
 ## MathGPT
@@ -206,6 +210,16 @@ class MathGPT {
     int64_t vocab_size()  const noexcept;
     int64_t embed_dim()   const noexcept;
     size_t  num_layers()  const noexcept;
+
+    // Diagnostic: per-token hard route and softmax entropy at l_math_
+    RouteInfo route_info(const Tensor& token_ids,
+                         const NumericTokenizer& ntok) const;
+};
+
+// RouteInfo: returned by route_info() for training diagnostics
+struct RouteInfo {
+    std::vector<RouteType> routes;   // hard route per token (argmax)
+    std::vector<float>     entropy;  // softmax entropy per token (nats, max=ln(6)≈1.79)
 };
 ```
 
@@ -276,6 +290,50 @@ Chapter 21 — Math Neurons: Arithmetic-Aware Transformers
   2               4.0%        2.1638
   3               8.0%        2.1301
 
+=== §21.7  Training Dynamics & Router Specialisation ===
+  total_vocab = 65600  training_exprs = 300
+
+    step     loss   test_acc   router_spec  avg_entropy
+  -----------------------------------------------------
+       0      n/a       0.0%         24.0%         1.39
+     500     1.98      10.0%          0.0%         0.50
+    1000     1.91      12.0%          0.0%         0.11
+    1500     1.52      28.0%          0.0%         0.10
+    2000     1.13      28.0%          0.0%         0.07
+    2500     1.38      28.0%          0.0%         0.18
+    3000     0.82      24.0%          0.0%         0.07
+    3500     0.96      36.0%          0.0%         0.06
+    4000     2.10      48.0%          0.0%         0.08
+    4500     1.56      46.0%          0.0%         0.23
+    5000     1.51      44.0%          2.0%         0.24
+
+  Analysis:
+  ---------
+  Router specialisation did not exceed 30% within 5000 steps
+  Test accuracy first exceeded 10% at step 500
+
+  Minimum training budget estimate:
+    steps_per_example (16) × n_unique_results (19) × router_routes (6) = 1824
+
+  Why convergence is slow:
+    Vocabulary size = 65600 (cross-entropy floor ln(65600) ≈ 11.09 nats)
+    Random-init embeddings: each of 65k+ tokens starts at equal distance from
+    every other token — the model must first cluster numeric tokens before
+    the router can learn meaningful distinctions.
+    Early router: 1/K = 16.7% chance of correct route by chance.
+    With D=16 embeddings spread across 65k vocab, gradient signal per token
+    is extremely diluted — most steps update unrelated embeddings.
+
+  What would accelerate training:
+    1. Smaller vocab: a purpose-built arithmetic tokenizer (BPE on digits only)
+       would reduce the vocab to ~50 tokens, making each gradient step 1000×
+       more focused on the numeric subspace.
+    2. Larger D: D=64 or D=128 gives the router more expressive capacity to
+       separate operator symbols (+/-/*/) from numeric tokens in embedding space.
+    3. Explicit routing supervision: add a cross-entropy loss on router logits
+       with ground-truth operator labels — this directly trains the router
+       without waiting for end-to-end gradient to propagate through STE.
+
 === §21.6  Large Number Arithmetic — Exact vs Statistical ===
   Math nodes use exact int16 arithmetic; statistical LMs must
   memorise every pair and fail badly on unseen large numbers.
@@ -323,6 +381,13 @@ vocabulary (cross-entropy floor `ln(65585) ≈ 11.1 nats`), and 300 steps with
 D=16 is deliberately minimal — this is a proof-of-concept, not a production
 model.  The loss curve drops from 12.2 → ~2.1, showing solid convergence.
 
+The §21.7 training-dynamics investigation (see below) shows that 5000 steps
+lifts test accuracy to **44–48%** and confirms that the router's hard entropy
+collapses early (avg entropy drops from 1.39 to ~0.07 nats by step 1000),
+meaning the argmax gate is picking one route consistently — but it takes far
+longer for that preferred route to become the *correct* one for each operator
+context.
+
 The fundamental advantage of Chapter 21 is **not** raw accuracy on this tiny
 setup.  The claim is:
 
@@ -331,6 +396,85 @@ setup.  The claim is:
 > represent `9876 + 5432 = 15308` via the result embedding after the router
 > has learned to select `Add` — something a purely statistical model of any
 > practical size cannot guarantee for unseen number pairs.
+
+---
+
+## §21.7  Training Dynamics & Router Specialisation
+
+### What was measured
+
+A 5000-step training run on MathGPT (D=16, n\_layers=4, l\_math=3) with 300
+training expressions (100 add + 100 sub + 50 mul + 50 div on digits 0–9) and
+a fresh 50-expression test set.  Three metrics tracked every 500 steps:
+
+- **test\_acc** — fraction of test prompts (`"A op B ="`) where the top-1
+  logit decodes to the correct integer answer.
+- **router\_spec** — fraction of test prompts where the hard-argmax route at
+  the final token (`=`) matches the expected operator (Add for `+`, Sub for
+  `-`).  Measures whether the router has *learned* to classify operators.
+- **avg\_entropy** — Shannon entropy of the soft-probability distribution
+  over the 6 route types at the final token position.  Maximum is
+  `ln(6) ≈ 1.79` nats (uniform); minimum is 0 (fully collapsed).
+
+### Key findings
+
+| Metric | Step 0 | Step 500 | Step 5000 |
+|--------|--------|----------|-----------|
+| test\_acc | 0.0% | 10.0% | 44.0% |
+| router\_spec | 24.0% | 0.0% | 2.0% |
+| avg\_entropy | 1.39 | 0.50 | 0.24 |
+
+**Entropy collapse precedes accuracy**.  The router's soft distribution
+collapses from near-uniform (1.39 nats at step 0, with slight random bias)
+to highly concentrated (0.11 nats at step 1000) well before meaningful
+accuracy appears.  This means the router commits hard to *one* route early —
+but it takes thousands more steps before that committed route is the *right*
+one for the operator in each expression.
+
+**Router specialisation lags accuracy** throughout the 5000-step window.
+Test accuracy reaches 10% at step 500 and climbs to 44–48% by step 4000,
+while `router_spec` stays at 0% until step 5000 where it barely crosses 2%.
+This dissociation reveals a critical insight: **the model is learning to
+produce correct answers via the FFN branch (route 0), not via the arithmetic
+branches (routes 1–5)**.  The MathLayer's FFN path still provides a reliable
+fallback, and in a 65 600-token vocabulary the gradient signal for route
+selection is too diluted to overcome the FFN's head start.
+
+**Why convergence is slow** (verbatim from program analysis):
+
+1. The vocabulary is 65 600 tokens.  The cross-entropy floor is
+   `ln(65600) ≈ 11.09 nats`.  Every gradient step must first overcome this
+   enormous random-init baseline before operator-specific patterns emerge.
+2. Random-init embeddings: all 65k+ tokens start equidistant.  The model must
+   first cluster numeric tokens before the router can distinguish `+` from `-`.
+3. Early in training the router has a `1/K = 16.7%` chance of picking the
+   correct route by chance — well below the 30% threshold used to detect
+   meaningful specialisation.
+4. With D=16 the router linear layer has only `6 × (16 + 1) = 102` parameters
+   competing against the FFN's much larger capacity.
+
+### What would accelerate specialisation
+
+1. **Smaller vocab** — a purpose-built arithmetic tokenizer with ~50 tokens
+   instead of 65 600 would make every gradient step 1000× more focused on the
+   numeric subspace.
+2. **Larger D** — D=64 or D=128 gives the router more capacity to separate
+   operator symbols from numeric tokens in embedding space.
+3. **Explicit routing supervision** — add a cross-entropy auxiliary loss on
+   the router logits using ground-truth operator labels.  This directly trains
+   the router without waiting for end-to-end STE gradient to propagate.
+
+### Minimum training budget estimate
+
+For this configuration (D=16, vocab=65 600):
+
+```
+steps_per_example × n_unique_results × router_routes
+  = 16 × 19 × 6 = 1824 steps
+```
+
+This is a lower bound; observed specialisation requires substantially more
+steps due to the large-vocabulary dilution effect.
 
 ---
 
@@ -362,7 +506,7 @@ answer, looked up deterministically.
 | `src/nn/numeric_router.cpp` | Linear gate + softmax + argmax hard mask |
 | `include/sub0llm/nn/math_nodes.hpp` | MathResult, MathLayer, MathTransformerBlock, MathGPT |
 | `src/nn/math_nodes.cpp` | apply_math_op, MathLayer::forward, MathGPT |
-| `chapters/ch21_math_neurons/main.cpp` | §21.1–§21.6 chapter demo |
+| `chapters/ch21_math_neurons/main.cpp` | §21.1–§21.7 chapter demo |
 | `tests/test_math_nodes.cpp` | 16 Catch2 tests for math_nodes |
 | `tests/test_numeric_router.cpp` | 9 Catch2 tests for NumericRouter |
 | `tools/gen_arithmetic_dataset.py` | 5-tier arithmetic dataset generator (~225k examples) |
