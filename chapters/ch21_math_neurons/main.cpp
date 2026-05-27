@@ -220,10 +220,10 @@ static void section_arithmetic_training() {
         test_set.push_back({std::vector<int32_t>(ids.begin(), ids.end()), A - B});
     }
 
-    // Build both models — use small D/n_layers so training is fast on CPU
+    // Build both models
     const int64_t D = 16;
     const std::size_t n_heads = 2, n_kv = 1;
-    const int64_t n_layers = 2;
+    const int64_t n_layers = 4;
 
     ModernGPT baseline(total_vocab, D, n_heads, n_kv, n_layers, 0, 0, /*seed=*/42);
     MathGPT   math_model(total_vocab, D, n_heads, n_kv, n_layers, -1, 0, /*seed=*/42);
@@ -231,7 +231,7 @@ static void section_arithmetic_training() {
     Adam adam_base(baseline.parameters(), 3e-3f);
     Adam adam_math(math_model.parameters(), 3e-3f);
 
-    const int steps = 500;
+    const int steps = 300;
     std::mt19937 rng_train(11);
 
     std::cout << std::format("  Training both models for {} steps...\n", steps);
@@ -322,7 +322,7 @@ static void section_arithmetic_training() {
 
 static void section_layer_ablation() {
     std::cout << "\n=== §21.5  Layer Depth Ablation ===\n";
-    std::cout << "  Training MathGPT with l_math = 0..1, n_layers=2\n\n";
+    std::cout << "  Training MathGPT with l_math = 0..3, n_layers=4\n\n";
 
     // Build a shared dataset (same seed as §21.4 for comparability)
     std::mt19937 rng_data(42);
@@ -371,14 +371,14 @@ static void section_layer_ablation() {
     std::cout << std::format("  {:<8}  {:>10}  {:>12}\n", "l_math", "accuracy", "final_loss");
     std::cout << "  " << std::string(36, '-') << "\n";
 
-    // n_layers=2 so l_math ∈ {0, 1}
-    for (int64_t lm = 0; lm < 2; ++lm) {
-        MathGPT model(total_vocab, 16, 2, 1, 2, lm, 0, /*seed=*/42);
+    // n_layers=4 so l_math ∈ {0, 1, 2, 3}
+    for (int64_t lm = 0; lm < 4; ++lm) {
+        MathGPT model(total_vocab, 16, 2, 1, 4, lm, 0, /*seed=*/42);
         Adam adam(model.parameters(), 3e-3f);
         std::mt19937 rng_train(11);
 
         float last_loss = 0.f;
-        for (int step = 0; step < 500; ++step) {
+        for (int step = 0; step < 300; ++step) {
             const std::size_t idx = rng_train() % train_ids.size();
             const auto& ids = train_ids[idx];
             if (ids.size() < 2) continue;
