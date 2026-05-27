@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <numbers>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -1302,6 +1303,61 @@ static constexpr int64_t kNKv     = 2;
 static constexpr int64_t kNLayers = 4;
 static constexpr float   kAlpha   = 0.5f;
 
+// ── Supervision schedule ──────────────────────────────────────────────────────
+// Controls how the router-supervision weight α varies over training.
+// Flat      : constant α = alpha_start throughout.
+// LinearDecay  : α interpolates linearly from alpha_start to alpha_end.
+// CosineDecay  : cosine annealing from alpha_start down to alpha_end.
+// ExpDecay     : exponential decay; reaches alpha_end at the final step.
+//
+// alpha_end > 0 keeps a residual signal so the router never goes unsupervised.
+
+enum class SupProfile { Flat, LinearDecay, CosineDecay, ExpDecay };
+
+struct SupervisionSchedule {
+    SupProfile profile     = SupProfile::Flat;
+    float      alpha_start = 0.5f;
+    float      alpha_end   = 0.0f;
+
+    [[nodiscard]] float alpha_at(int step, int total) const noexcept {
+        if (total <= 0) return alpha_start;
+        const float t = std::clamp(
+            static_cast<float>(step) / static_cast<float>(total), 0.f, 1.f);
+        switch (profile) {
+            case SupProfile::Flat:
+                return alpha_start;
+            case SupProfile::LinearDecay:
+                return alpha_start + (alpha_end - alpha_start) * t;
+            case SupProfile::CosineDecay: {
+                const float w = 0.5f * (1.f + std::cos(std::numbers::pi_v<float> * t));
+                return alpha_end + (alpha_start - alpha_end) * w;
+            }
+            case SupProfile::ExpDecay: {
+                if (alpha_start <= 0.f) return alpha_end;
+                if (alpha_end   <= 0.f) return alpha_start * std::exp(-5.f * t);
+                const float k = std::log(alpha_start / alpha_end);
+                return alpha_start * std::exp(-k * t);
+            }
+        }
+        return alpha_start;
+    }
+
+    [[nodiscard]] std::string label() const {
+        const char* name = [&]() noexcept -> const char* {
+            switch (profile) {
+                case SupProfile::Flat:        return "flat";
+                case SupProfile::LinearDecay: return "linear";
+                case SupProfile::CosineDecay: return "cosine";
+                case SupProfile::ExpDecay:    return "exp";
+            }
+            return "?";
+        }();
+        if (profile == SupProfile::Flat)
+            return std::format("{} α={:.2f}", name, alpha_start);
+        return std::format("{} α={:.2f}→{:.2f}", name, alpha_start, alpha_end);
+    }
+};
+
 // Build the deterministic §21.9 corpus, tokenizer, test set, and logit bias.
 // All seeds are fixed so any phase can call this independently.
 struct ImprovedData {
@@ -1444,19 +1500,31 @@ static std::tuple<float, float, float> eval_improved(
     return {static_cast<float>(correct) / n, spec_sum / sn, entropy_sum / sn};
 }
 
-static void print_train_header() {
-    std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}  {:>9}\n",
-                              "step", "loss", "accuracy", "router_spec", "entropy", "ms/step");
-    std::cout << "  " << std::string(62, '-') << "\n";
+static void print_train_header(bool show_alpha = false) {
+    if (show_alpha)
+        std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}  {:>9}  {:>6}\n",
+                                  "step", "loss", "accuracy", "router_spec", "entropy",
+                                  "ms/step", "α");
+    else
+        std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}  {:>9}\n",
+                                  "step", "loss", "accuracy", "router_spec", "entropy",
+                                  "ms/step");
+    std::cout << "  " << std::string(show_alpha ? 70 : 62, '-') << "\n";
 }
 
+// alpha < 0 → omit the α column; ms_per_step == 0 → show "---"
 static void print_train_row(int step, float loss, float acc, float spec, float ent,
-                             float ms_per_step = 0.f) {
+                             float ms_per_step = 0.f, float alpha = -1.f) {
     std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
     std::string ms_s   = (ms_per_step == 0.f) ? "    ---"
                                                : std::format("{:6.1f}ms", ms_per_step);
-    std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}  {:>9}\n",
-                              step, loss_s, acc * 100.f, spec * 100.f, ent, ms_s);
+    if (alpha >= 0.f) {
+        std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}  {:>9}  {:>6.3f}\n",
+                                  step, loss_s, acc * 100.f, spec * 100.f, ent, ms_s, alpha);
+    } else {
+        std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}  {:>9}\n",
+                                  step, loss_s, acc * 100.f, spec * 100.f, ent, ms_s);
+    }
 }
 
 // ── Phase 1Cs ─────────────────────────────────────────────────────────────────
@@ -1464,8 +1532,12 @@ static void print_train_row(int step, float loss, float acc, float spec, float e
 // Saves checkpoints every kCkptInterval steps to ckpt_dir.
 // On startup, resumes from the latest ch21_1cs_step*.ckpt if present.
 
-static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) {
-    std::cout << "\n  Phase 1Cs — D=32, masked vocab + router supervision (α=0.5)\n";
+static void run_improved_phase_1cs(
+    std::string_view ckpt_dir, int total = 1000,
+    SupervisionSchedule sched = {SupProfile::Flat, kAlpha, kAlpha})
+{
+    std::cout << std::format("\n  Phase 1Cs — D=32, masked vocab + router supervision ({})\n",
+                              sched.label());
     std::cout << std::format("  target: {} steps\n", total);
 
     ImprovedData d    = build_improved_data();
@@ -1491,10 +1563,7 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
     // Advance RNG to match the step we're resuming from
     for (int i = 0; i < start_step; ++i) rng();
 
-    Tensor alpha_t({1}, DType::Float32);
-    alpha_t.data_as<float>()[0] = kAlpha;
-
-    print_train_header();
+    print_train_header(/*show_alpha=*/true);
     float last_loss    = 0.f;
     int   step_spec30  = -1;
 
@@ -1502,6 +1571,7 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
     int  steps_since_eval = 0;
 
     for (int step = start_step; step <= total; ++step) {
+        const float cur_alpha = sched.alpha_at(step, total);
         if (step % (total / 5) == 0 || step == start_step) {
             float ms_per_step = 0.f;
             if (steps_since_eval > 0) {
@@ -1512,7 +1582,7 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
                 steps_since_eval = 0;
             }
             auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true);
-            print_train_row(step, last_loss, acc, spec, ent, ms_per_step);
+            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
@@ -1541,7 +1611,9 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
         auto lmasked = add(ltrunc, narrow(Variable(d.bias_t_full, false), 0, T_loss));
         auto L_ce    = cross_entropy(lmasked, make_targets(ids));
 
-        // Supervision at the "=" token position (T_loss-1 for this 5-token corpus)
+        // Supervision at the "=" position; weight by scheduled α
+        Tensor alpha_t({1}, DType::Float32);
+        alpha_t.data_as<float>()[0] = cur_alpha;
         auto rlogits   = model.router_logits(id_tensor);
         auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
         Tensor gt_t({1}, DType::Int32);
@@ -1565,13 +1637,18 @@ static void run_improved_phase_1cs(std::string_view ckpt_dir, int total = 1000) 
 
 // ── Phase 2Cs ─────────────────────────────────────────────────────────────────
 // Full-vocab fine-tuning.  Initialises math_block from the Phase 1Cs checkpoint;
-// saves whole-model checkpoints for crash recovery.
+// saves whole-model checkpoints under ch21_2cs_sup_step*.ckpt for crash recovery.
+// Supervision weight follows `sched` so the router signal is never fully cut off.
 // Returns {accuracy, router_spec, entropy} after the final evaluation.
 
 static std::tuple<float, float, float>
-run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
+run_improved_phase_2cs(
+    std::string_view ckpt_dir, int total = 5000,
+    SupervisionSchedule sched = {SupProfile::CosineDecay, 0.3f, 0.05f})
 {
-    std::cout << "\n  Phase 2Cs — full-vocab, Phase-1Cs math_block (D=32, no supervision)\n";
+    std::cout << std::format(
+        "\n  Phase 2Cs — full-vocab fine-tuning, supervision schedule: {}\n",
+        sched.label());
     std::cout << std::format("  target: {} steps\n", total);
 
     ImprovedData d    = build_improved_data();
@@ -1584,10 +1661,10 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
     auto math_params = model.math_block_only_parameters();
     Adam adam(all_params, 3e-3f);
 
-    // Prefer a Phase 2Cs checkpoint (allows mid-phase resume)
-    int start_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
+    // Resume from a supervised Phase 2Cs checkpoint if available
+    int start_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir);
     if (start_step < 0) {
-        // No Phase 2Cs checkpoint: import math_block from Phase 1Cs
+        // No supervised checkpoint: initialise math_block from Phase 1Cs
         int p1cs_step = load_latest_checkpoint(math_params, "1cs", ckpt_dir);
         if (p1cs_step < 0)
             throw std::runtime_error(
@@ -1606,7 +1683,7 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
     std::mt19937 rng(11);
     for (int i = 0; i < start_step; ++i) rng();
 
-    print_train_header();
+    print_train_header(/*show_alpha=*/true);
     float last_loss  = 0.f;
     int   step_spec30 = -1;
 
@@ -1614,6 +1691,7 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
     int  steps_since_eval = 0;
 
     for (int step = start_step; step <= total; ++step) {
+        const float cur_alpha = sched.alpha_at(step, total);
         if (step % (total / 5) == 0 || step == start_step) {
             float ms_per_step = 0.f;
             if (steps_since_eval > 0) {
@@ -1624,22 +1702,23 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
                 steps_since_eval = 0;
             }
             auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false);
-            print_train_row(step, last_loss, acc, spec, ent, ms_per_step);
+            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
             save_checkpoint(all_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_2cs_step{:04d}.ckpt", step), step);
+                    std::format("ch21_2cs_sup_step{:04d}.ckpt", step), step);
             break;
         }
         if (step > start_step && step % ckpt_iv == 0)
             save_checkpoint(all_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_2cs_step{:04d}.ckpt", step), step);
+                    std::format("ch21_2cs_sup_step{:04d}.ckpt", step), step);
 
-        const std::size_t idx = rng() % d.train_ids.size();
-        const auto& ids = d.train_ids[idx];
+        const std::size_t idx   = rng() % d.train_ids.size();
+        const auto&       ids   = d.train_ids[idx];
+        const RouteType   gt_op = d.train_ops[idx];
         if (ids.size() < 2) { --step; rng(); continue; }
 
         Tensor id_tensor = make_ids_tensor(ids);
@@ -1648,11 +1727,22 @@ run_improved_phase_2cs(std::string_view ckpt_dir, int total = 2000)
         adam.zero_grad();
         auto logits = model.forward_math(id_tensor, d.ntok);
         auto ltrunc = narrow(logits, 0, T_loss);
-        auto loss   = cross_entropy(ltrunc, make_targets(ids));
-        loss.backward();
+        auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
+
+        // Scheduled supervision at the "=" position
+        Tensor alpha_t({1}, DType::Float32);
+        alpha_t.data_as<float>()[0] = cur_alpha;
+        auto rlogits   = model.router_logits(id_tensor);
+        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
+        Tensor gt_t({1}, DType::Int32);
+        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+        auto L_sup   = cross_entropy(rlogit_eq, gt_t);
+        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+
+        L_total.backward();
         (void)clip_grad_norm(all_params, 1.0f);
         adam.step();
-        last_loss = loss.data().data_as<float>()[0];
+        last_loss = L_total.data().data_as<float>()[0];
         ++steps_since_eval;
     }
 
@@ -1676,7 +1766,10 @@ static void run_improved_eval(std::string_view ckpt_dir) {
                    static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
 
     auto all_params = model.parameters();
-    int loaded_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
+    // Prefer supervised checkpoint; fall back to unsupervised for older runs
+    int loaded_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir);
+    if (loaded_step < 0)
+        loaded_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
     if (loaded_step < 0)
         throw std::runtime_error(
             "Phase 2Cs checkpoint not found.\n"
@@ -1704,10 +1797,16 @@ static void section_improved_training(std::string_view phase,
                                        std::string_view ckpt_dir,
                                        int steps = 0)  // 0 = use phase default
 {
+    // Phase supervision schedules
+    const SupervisionSchedule sched_1cs{SupProfile::Flat,        kAlpha, kAlpha};
+    const SupervisionSchedule sched_2cs{SupProfile::CosineDecay, 0.3f,   0.05f};
+
     std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
-    std::cout << "  Phase 1Cs: masked vocab + direct router supervision loss (α=0.5)\n";
-    std::cout << "  Phase 2Cs: full-vocab fine-tuning with transferred Phase-1Cs weights\n";
+    std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
+                              sched_1cs.label());
+    std::cout << std::format("  Phase 2Cs: full-vocab fine-tuning, supervision ({})\n",
+                              sched_2cs.label());
     std::cout << std::format("  checkpoint directory: {}\n", ckpt_dir);
 
     if (phase == "eval") {
@@ -1717,12 +1816,12 @@ static void section_improved_training(std::string_view phase,
 
     if (phase == "all" || phase == "1cs") {
         const int total1 = (steps > 0) ? steps : 1000;
-        run_improved_phase_1cs(ckpt_dir, total1);
+        run_improved_phase_1cs(ckpt_dir, total1, sched_1cs);
     }
 
     if (phase == "all" || phase == "2cs") {
-        const int total2 = (steps > 0) ? steps : 2000;
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2);
+        const int total2 = (steps > 0) ? steps : 5000;
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs);
 
         std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
