@@ -231,7 +231,7 @@ static void section_arithmetic_training() {
     Adam adam_base(baseline.parameters(), 3e-3f);
     Adam adam_math(math_model.parameters(), 3e-3f);
 
-    const int steps = 50;
+    const int steps = 500;
     std::mt19937 rng_train(11);
 
     std::cout << std::format("  Training both models for {} steps...\n", steps);
@@ -274,7 +274,7 @@ static void section_arithmetic_training() {
             math_loss_last = loss.data().data_as<float>()[0];
         }
 
-        if (step == 0 || (step + 1) % 25 == 0) {
+        if (step == 0 || (step + 1) % 100 == 0) {
             std::cout << std::format("  step {:3d}  baseline_loss={:.4f}  math_loss={:.4f}\n",
                                       step + 1, base_loss_last, math_loss_last);
         }
@@ -378,7 +378,7 @@ static void section_layer_ablation() {
         std::mt19937 rng_train(11);
 
         float last_loss = 0.f;
-        for (int step = 0; step < 50; ++step) {
+        for (int step = 0; step < 500; ++step) {
             const std::size_t idx = rng_train() % train_ids.size();
             const auto& ids = train_ids[idx];
             if (ids.size() < 2) continue;
