@@ -121,11 +121,14 @@ autograd::Variable MathLayer::forward(
             if (op1_pos[t] < 0) {
                 ids_sp[t] = ntok.nan_token();
             } else {
-                const float a = reg[static_cast<std::size_t>(op1_pos[t])];
-                const float b = (op2_pos[t] >= 0)
+                // op1 = most recent token = RIGHT operand in "A op B"
+                // op2 = second most recent = LEFT operand
+                // apply_math_op contract: (op, a=LEFT, b=RIGHT)
+                const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
+                const float lhs = (op2_pos[t] >= 0)
                     ? reg[static_cast<std::size_t>(op2_pos[t])]
-                    : a;
-                const MathResult mr = apply_math_op(route_k, a, b);
+                    : rhs;
+                const MathResult mr = apply_math_op(route_k, lhs, rhs);
                 if (mr.is_nan)
                     ids_sp[t] = ntok.nan_token();
                 else if (mr.is_overflow)

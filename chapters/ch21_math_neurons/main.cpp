@@ -1373,18 +1373,47 @@ struct ImprovedData {
 static ImprovedData build_improved_data() {
     std::mt19937 rng_data(42);
     std::uniform_int_distribution<int> d09(0, 9);
+    std::uniform_int_distribution<int> d19(1, 9);
 
     std::vector<std::string> corpus;
-    corpus.reserve(200);
+    std::vector<RouteType>   corpus_ops;
+    corpus.reserve(500);
+
+    // Add: A + B, A,B ∈ [0,9], result ∈ [0,18]
     for (int i = 0; i < 100; ++i) {
         int A = d09(rng_data), B = d09(rng_data);
         corpus.push_back(std::to_string(A) + " + " + std::to_string(B) +
                           " = " + std::to_string(A + B));
+        corpus_ops.push_back(RouteType::Add);
     }
+    // Sub: A - B, A,B ∈ [0,9], result ∈ [-9,9]
     for (int i = 0; i < 100; ++i) {
         int A = d09(rng_data), B = d09(rng_data);
         corpus.push_back(std::to_string(A) + " - " + std::to_string(B) +
                           " = " + std::to_string(A - B));
+        corpus_ops.push_back(RouteType::Sub);
+    }
+    // Mul: A * B, A,B ∈ [0,9], result ∈ [0,81]
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " * " + std::to_string(B) +
+                          " = " + std::to_string(A * B));
+        corpus_ops.push_back(RouteType::Mul);
+    }
+    // Div: A / B = k (exact integer), A = k*B, k,B ∈ [1,9]
+    for (int i = 0; i < 100; ++i) {
+        int B = d19(rng_data), k = d19(rng_data);
+        int A = k * B;
+        corpus.push_back(std::to_string(A) + " / " + std::to_string(B) +
+                          " = " + std::to_string(k));
+        corpus_ops.push_back(RouteType::Div);
+    }
+    // Compare: A < B = 1 or 0, A,B ∈ [0,9]
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " < " + std::to_string(B) +
+                          " = " + std::to_string(A < B ? 1 : 0));
+        corpus_ops.push_back(RouteType::Compare);
     }
 
     auto bpe = BPETokenizer::train(corpus, 50);
@@ -1397,7 +1426,7 @@ static ImprovedData build_improved_data() {
         auto ids = ntok.encode(corpus[i]);
         if (ids.size() >= 2) {
             train_ids.push_back(std::vector<int32_t>(ids.begin(), ids.end()));
-            train_ops.push_back(i < 100 ? RouteType::Add : RouteType::Sub);
+            train_ops.push_back(corpus_ops[i]);
         }
     }
 
@@ -1405,17 +1434,37 @@ static ImprovedData build_improved_data() {
     {
         std::mt19937 rng_t(99);
         std::uniform_int_distribution<int> d(0, 9);
-        for (int i = 0; i < 25; ++i) {
+        std::uniform_int_distribution<int> d1(1, 9);
+        for (int i = 0; i < 20; ++i) {
             int A = d(rng_t), B = d(rng_t);
             auto ids = ntok.encode(std::to_string(A) + " + " + std::to_string(B) + " =");
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
                                    A + B, RouteType::Add});
         }
-        for (int i = 0; i < 25; ++i) {
+        for (int i = 0; i < 20; ++i) {
             int A = d(rng_t), B = d(rng_t);
             auto ids = ntok.encode(std::to_string(A) + " - " + std::to_string(B) + " =");
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
                                    A - B, RouteType::Sub});
+        }
+        for (int i = 0; i < 20; ++i) {
+            int A = d(rng_t), B = d(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " * " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A * B, RouteType::Mul});
+        }
+        for (int i = 0; i < 20; ++i) {
+            int B = d1(rng_t), k = d1(rng_t);
+            int A = k * B;
+            auto ids = ntok.encode(std::to_string(A) + " / " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   k, RouteType::Div});
+        }
+        for (int i = 0; i < 20; ++i) {
+            int A = d(rng_t), B = d(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " < " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A < B ? 1 : 0, RouteType::Compare});
         }
     }
 
@@ -1426,7 +1475,9 @@ static ImprovedData build_improved_data() {
     for (const auto& item : test_items)
         for (auto id : item.prompt_ids)
             is_active[static_cast<std::size_t>(id)] = true;
-    for (int v = -9; v <= 18; ++v)
+    // Cover all possible result values: Sub [-9,9], Add [0,18], Compare [0,1],
+    // Div [1,9], Mul [0,81]
+    for (int v = -9; v <= 81; ++v)
         is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
 
     std::vector<float> bias_vec(static_cast<std::size_t>(V), -1e9f);
@@ -1801,8 +1852,9 @@ static void section_improved_training(std::string_view phase,
     const SupervisionSchedule sched_1cs{SupProfile::Flat,        kAlpha, kAlpha};
     const SupervisionSchedule sched_2cs{SupProfile::CosineDecay, 0.3f,   0.05f};
 
-    std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
+    std::cout << "\n=== §21.9  Improved Specialisation: D=32, 5 ops, Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
+    std::cout << "  Operations: Add, Sub, Mul, Div, Compare (500 training examples)\n";
     std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
                               sched_1cs.label());
     std::cout << std::format("  Phase 2Cs: full-vocab fine-tuning, supervision ({})\n",
@@ -1832,7 +1884,7 @@ static void section_improved_training(std::string_view phase,
                                   "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                                   22.0f, 50.0f, 0.04f);
         std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  std::format("§21.9 Phase 2Cs (D=32, supervised, {} steps)", total2),
+                                  std::format("§21.9 Phase 2Cs (D=32, 5-op, sup, {} steps)", total2),
                                   acc * 100.f, spec * 100.f, ent);
 
         std::cout << "\n  Key improvements:\n";
