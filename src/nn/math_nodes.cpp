@@ -219,6 +219,18 @@ RouteInfo MathTransformerBlock::route_info(const autograd::Variable& x) const {
     return math_ffn_.route_info(h);
 }
 
+autograd::Variable MathLayer::router_logits(const autograd::Variable& h) const {
+    if (h.data().ndim() != 2)
+        throw std::runtime_error("MathLayer::router_logits: h must be 2D (T, D)");
+    Variable xn = norm_.forward(h);
+    return router_.router_logits(xn);
+}
+
+autograd::Variable MathTransformerBlock::router_logits(const autograd::Variable& x) const {
+    auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
+    return math_ffn_.router_logits(h);
+}
+
 std::vector<autograd::Variable*> MathTransformerBlock::parameters() {
     std::vector<Variable*> p;
     for (auto* v : norm1_.parameters())     p.push_back(v);
@@ -336,6 +348,20 @@ RouteInfo MathGPT::route_info(
         x = blocks_[static_cast<std::size_t>(li)].forward(x);
 
     return math_block_.route_info(x);
+}
+
+autograd::Variable MathGPT::router_logits(
+    const Tensor& token_ids, const NumericTokenizer& /*ntok*/) const
+{
+    if (token_ids.ndim() != 1)
+        throw std::runtime_error("MathGPT::router_logits: token_ids must be 1D (T,)");
+    if (token_ids.shape()[0] < 1)
+        throw std::runtime_error("MathGPT::router_logits: token_ids must be non-empty");
+
+    Variable x = tok_emb_.forward(token_ids);
+    for (int64_t li = 0; li < l_math_; ++li)
+        x = blocks_[static_cast<std::size_t>(li)].forward(x);
+    return math_block_.router_logits(x);
 }
 
 std::vector<autograd::Variable*> MathGPT::parameters() {

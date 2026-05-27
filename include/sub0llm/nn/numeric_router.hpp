@@ -34,6 +34,8 @@ public:
 
     [[nodiscard]] ForwardResult forward(const autograd::Variable& x) const;
     [[nodiscard]] std::vector<RouteType> route_hard(const autograd::Variable& x) const;
+    // Returns pre-softmax logits (T, n_types) — use for supervision cross-entropy loss.
+    [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& x) const;
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
 private:

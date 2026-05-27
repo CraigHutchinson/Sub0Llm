@@ -47,6 +47,8 @@ public:
         const NumericTokenizer&   ntok) const;
 
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& h) const;
+    // Pre-softmax router logits (T, n_types) — feed into cross_entropy for supervision.
+    [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& h) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
@@ -72,6 +74,7 @@ public:
         const NumericTokenizer&   ntok) const;
 
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& x) const;
+    [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& x) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
@@ -107,6 +110,13 @@ public:
         const Tensor& token_ids, const NumericTokenizer& ntok) const;
 
     [[nodiscard]] RouteInfo route_info(
+        const Tensor& token_ids, const NumericTokenizer& ntok) const;
+
+    // Pre-softmax router logits (T, n_types) at l_math_ — for supervision loss.
+    // Both forward_math() and router_logits() are called per training step when
+    // using router supervision; the slight extra cost is worthwhile for the
+    // direct gradient signal it gives the routing linear layer.
+    [[nodiscard]] autograd::Variable router_logits(
         const Tensor& token_ids, const NumericTokenizer& ntok) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();

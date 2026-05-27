@@ -55,6 +55,10 @@ NumericRouter::ForwardResult NumericRouter::forward(const autograd::Variable& x)
     return {std::move(probs), std::move(mask)};
 }
 
+Variable NumericRouter::router_logits(const autograd::Variable& x) const {
+    return gate_.forward(x);   // (T, K) pre-softmax
+}
+
 std::vector<RouteType> NumericRouter::route_hard(const autograd::Variable& x) const {
     auto [probs, mask] = forward(x);
 

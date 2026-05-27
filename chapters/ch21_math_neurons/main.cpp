@@ -1163,6 +1163,328 @@ static void section_large_numbers() {
     std::cout << "    a random high-frequency token.\n";
 }
 
+// ── §21.9  Improved Specialisation: D=32 + Router Supervision ────────────────
+//
+// §21.7 showed end-to-end training locks the router onto FFN (0% router_spec
+// within 5000 steps). §21.8 showed curriculum (logit masking) achieves 50%
+// router_spec in Phase 1C but D=16 limits the router to 102 parameters and
+// head_dim=8 limits operator disambiguation.
+//
+// Two targeted fixes:
+//   1. D=32: router Linear(32,6) has 198 params, head_dim=16, embeddings
+//      more separable across 65k vocab.
+//   2. Router supervision loss: at each Phase 1Cs step, add
+//        L_sup = CE(router_logits["=" position], ground_truth_op)
+//      with weight α=0.5. This is a DIRECT gradient signal — instead of
+//      relying solely on the STE path through the LM objective.
+//
+// Both changes require no architecture modifications: router_logits() exposes
+// the pre-softmax router output for direct supervision.
+
+static void section_improved_training() {
+    std::cout << "\n=== §21.9  Improved Specialisation: D=32 + Router Supervision ===\n";
+    std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
+    std::cout << "  Phase 1Cs: masked vocab + direct router supervision loss (α=0.5)\n";
+    std::cout << "  Phase 2Cs: full-vocab fine-tuning with transferred Phase-1Cs weights\n\n";
+
+    std::mt19937 rng_data(42);
+    std::uniform_int_distribution<int> d09(0, 9);
+
+    // 100 add + 100 sub (same corpus as §21.8 for fair comparison)
+    std::vector<std::string> corpus;
+    corpus.reserve(200);
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " + " + std::to_string(B) +
+                          " = " + std::to_string(A + B));
+    }
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " - " + std::to_string(B) +
+                          " = " + std::to_string(A - B));
+    }
+
+    auto bpe = BPETokenizer::train(corpus, 50);
+    NumericTokenizer ntok(std::move(bpe));
+    const int64_t V = ntok.total_vocab_size();
+
+    // Build train_ids AND train_ops (operator label per sequence)
+    std::vector<std::vector<int32_t>> train_ids;
+    std::vector<RouteType>            train_ops;
+    for (std::size_t i = 0; i < corpus.size(); ++i) {
+        auto ids = ntok.encode(corpus[i]);
+        if (ids.size() >= 2) {
+            train_ids.push_back(std::vector<int32_t>(ids.begin(), ids.end()));
+            train_ops.push_back(i < 100 ? RouteType::Add : RouteType::Sub);
+        }
+    }
+
+    // Test set (same structure as §21.8)
+    struct TestItem {
+        std::vector<int32_t> prompt_ids;
+        int32_t              expected_val;
+        RouteType            expected_op;
+    };
+    std::vector<TestItem> test_items;
+    {
+        std::mt19937 rng_t(99);
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_t), B = d09(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " + " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A + B, RouteType::Add});
+        }
+        for (int i = 0; i < 25; ++i) {
+            int A = d09(rng_t), B = d09(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " - " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A - B, RouteType::Sub});
+        }
+    }
+
+    // ── Logit bias (same active-token masking as §21.8) ───────────────────────
+    std::vector<bool> is_active(static_cast<std::size_t>(V), false);
+    for (const auto& ids : train_ids)
+        for (auto id : ids)
+            is_active[static_cast<std::size_t>(id)] = true;
+    for (const auto& item : test_items)
+        for (auto id : item.prompt_ids)
+            is_active[static_cast<std::size_t>(id)] = true;
+    for (int v = -9; v <= 18; ++v)
+        is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
+
+    std::vector<float> bias_vec(static_cast<std::size_t>(V), -1e9f);
+    for (int64_t i = 0; i < V; ++i)
+        if (is_active[static_cast<std::size_t>(i)])
+            bias_vec[static_cast<std::size_t>(i)] = 0.0f;
+
+    // Pre-build maximum-size bias tensor (same optimisation as §21.8)
+    int64_t max_T_loss = 0;
+    for (const auto& ids : train_ids)
+        if (static_cast<int64_t>(ids.size()) >= 2)
+            max_T_loss = std::max(max_T_loss, static_cast<int64_t>(ids.size()) - 1);
+    Tensor bias_t_full({max_T_loss, V}, DType::Float32);
+    {
+        float* bsp = bias_t_full.data_as<float>().data();
+        for (int64_t t = 0; t < max_T_loss; ++t)
+            std::memcpy(bsp + t * V, bias_vec.data(), static_cast<std::size_t>(V) * sizeof(float));
+    }
+
+    std::cout << std::format("  total_vocab={} active_tokens={} train_exprs={}\n\n",
+                              V,
+                              static_cast<int>(std::count(is_active.begin(), is_active.end(), true)),
+                              train_ids.size());
+
+    const int64_t D      = 32;
+    const int64_t n_heads = 4;
+    const int64_t n_kv   = 2;
+    const int64_t n_layers = 4;
+    const float   alpha_router = 0.5f;
+
+    // ── Shared helpers ────────────────────────────────────────────────────────
+    auto make_ids_tensor = [](const std::vector<int32_t>& ids) {
+        Tensor t({static_cast<int64_t>(ids.size())}, DType::Int32);
+        auto sp = t.data_as<int32_t>();
+        for (std::size_t i = 0; i < ids.size(); ++i) sp[i] = ids[i];
+        return t;
+    };
+    auto make_targets = [](const std::vector<int32_t>& ids) {
+        Tensor t({static_cast<int64_t>(ids.size()) - 1}, DType::Int32);
+        auto sp = t.data_as<int32_t>();
+        for (std::size_t i = 1; i < ids.size(); ++i) sp[i - 1] = ids[i];
+        return t;
+    };
+
+    auto evaluate = [&](MathGPT& model, bool masked)
+        -> std::tuple<float, float, float>
+    {
+        int correct = 0, spec_count = 0;
+        float spec_sum = 0.f, entropy_sum = 0.f;
+        for (const auto& item : test_items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor id_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(id_t, ntok);
+
+            const int64_t last = logits.data().shape(0) - 1;
+            const int64_t Vl   = logits.data().shape(1);
+            auto lsp = logits.data().data_as<float>();
+
+            int64_t best = 0;
+            float best_v = lsp[static_cast<std::size_t>(last * Vl)] +
+                           (masked ? bias_vec[0] : 0.f);
+            for (int64_t v = 1; v < Vl; ++v) {
+                float val = lsp[static_cast<std::size_t>(last * Vl + v)] +
+                            (masked ? bias_vec[static_cast<std::size_t>(v)] : 0.f);
+                if (val > best_v) { best_v = val; best = v; }
+            }
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            if (ntok.is_numeric(pred_id) && !ntok.is_nan_token(pred_id) &&
+                !ntok.is_overflow_token(pred_id)) {
+                if (static_cast<int32_t>(ntok.numeric_value(pred_id)) == item.expected_val)
+                    ++correct;
+            }
+
+            RouteInfo ri = model.route_info(id_t, ntok);
+            if (!ri.routes.empty()) {
+                const std::size_t last_t = ri.routes.size() - 1;
+                if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
+                entropy_sum += ri.entropy[last_t];
+                ++spec_count;
+            }
+        }
+        float n  = static_cast<float>(test_items.size());
+        float sn = spec_count > 0 ? static_cast<float>(spec_count) : 1.f;
+        return {static_cast<float>(correct) / n, spec_sum / sn, entropy_sum / sn};
+    };
+
+    auto print_header = [&]() {
+        std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}\n",
+                                  "step", "loss", "accuracy", "router_spec", "entropy");
+        std::cout << "  " << std::string(51, '-') << "\n";
+    };
+    auto print_row = [&](int step, float loss, float acc, float spec, float ent) {
+        std::string loss_s = (step == 0) ? "  n/a" : std::format("{:6.2f}", loss);
+        std::cout << std::format("  {:>6}  {}  {:>8.1f}%  {:>11.1f}%  {:>11.2f}\n",
+                                  step, loss_s, acc * 100.f, spec * 100.f, ent);
+    };
+
+    // Alpha tensor for loss combination (pre-built, reused every step)
+    Tensor alpha_t({1}, DType::Float32);
+    alpha_t.data_as<float>()[0] = alpha_router;
+
+    // ── Phase 1Cs: masked + router supervision (D=32, tok_emb frozen) ─────────
+    std::cout << "  Phase 1Cs — D=32, masked vocab + router supervision (α=0.5)\n";
+    print_header();
+
+    MathGPT model_p1cs(V, D, static_cast<std::size_t>(n_heads),
+                        static_cast<std::size_t>(n_kv), n_layers, -1, 0, /*seed=*/42);
+    auto p1cs_block_params = model_p1cs.math_block_only_parameters();
+    auto p1cs_all_params   = model_p1cs.parameters();
+    Adam adam_p1cs(p1cs_block_params, 3e-3f);
+    std::mt19937 rng_p1cs(11);
+
+    float last_loss_p1cs = 0.f;
+    int step_spec30_p1cs = -1;
+
+    for (int step = 0; step <= 1000; ++step) {
+        if (step % 200 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p1cs, /*masked=*/true);
+            print_row(step, last_loss_p1cs, acc, spec, ent);
+            if (step_spec30_p1cs < 0 && spec >= 0.30f) step_spec30_p1cs = step;
+        }
+        if (step == 1000) break;
+
+        const std::size_t idx = rng_p1cs() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        const RouteType gt_op = train_ops[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+        const int64_t T_loss  = seq_len - 1;
+
+        for (auto* p : p1cs_all_params) p->zero_grad();
+
+        // Main CE loss with masked vocabulary
+        auto logits  = model_p1cs.forward_math(id_tensor, ntok);
+        auto ltrunc  = narrow(logits, 0, T_loss);
+        auto lmasked = add(ltrunc, narrow(Variable(bias_t_full, false), 0, T_loss));
+        auto L_ce    = cross_entropy(lmasked, targets);
+
+        // Router supervision at the "=" prediction position
+        auto rlogits   = model_p1cs.router_logits(id_tensor, ntok);  // (T, 6)
+        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);              // (1, 6)
+        Tensor gt_t({1}, DType::Int32);
+        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+        auto L_sup = cross_entropy(rlogit_eq, gt_t);
+
+        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+        L_total.backward();
+        (void)clip_grad_norm(p1cs_block_params, 1.0f);
+        adam_p1cs.step();
+        last_loss_p1cs = L_total.data().data_as<float>()[0];
+    }
+
+    if (step_spec30_p1cs >= 0)
+        std::cout << std::format("  → router_spec first crossed 30% at step {}\n",
+                                  step_spec30_p1cs);
+    else
+        std::cout << "  → router_spec did not cross 30% within 1000 steps\n";
+
+    // ── Phase 2Cs: full-vocab with Phase-1Cs math_block transferred ───────────
+    std::cout << "\n  Phase 2Cs — full-vocab, Phase-1Cs math_block (D=32, no supervision)\n";
+    print_header();
+
+    MathGPT model_p2cs(V, D, static_cast<std::size_t>(n_heads),
+                        static_cast<std::size_t>(n_kv), n_layers, -1, 0, /*seed=*/42);
+    model_p2cs.import_math_block(model_p1cs);
+    Adam adam_p2cs(model_p2cs.parameters(), 3e-3f);
+    std::mt19937 rng_p2cs(11);
+
+    float last_loss_p2cs = 0.f;
+    int step_spec30_p2cs = -1;
+
+    for (int step = 0; step <= 2000; ++step) {
+        if (step % 400 == 0) {
+            auto [acc, spec, ent] = evaluate(model_p2cs, /*masked=*/false);
+            print_row(step, last_loss_p2cs, acc, spec, ent);
+            if (step_spec30_p2cs < 0 && spec >= 0.30f) step_spec30_p2cs = step;
+        }
+        if (step == 2000) break;
+
+        const std::size_t idx = rng_p2cs() % train_ids.size();
+        const auto& ids = train_ids[idx];
+        if (ids.size() < 2) { --step; continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        Tensor targets   = make_targets(ids);
+        const int64_t seq_len = static_cast<int64_t>(ids.size());
+        const int64_t T_loss  = seq_len - 1;
+
+        adam_p2cs.zero_grad();
+        auto logits = model_p2cs.forward_math(id_tensor, ntok);
+        auto ltrunc = narrow(logits, 0, T_loss);
+        auto loss   = cross_entropy(ltrunc, targets);
+        loss.backward();
+        (void)clip_grad_norm(model_p2cs.parameters(), 1.0f);
+        adam_p2cs.step();
+        last_loss_p2cs = loss.data().data_as<float>()[0];
+    }
+
+    // ── Summary comparison ─────────────────────────────────────────────────────
+    // Final evaluation for the summary line
+    auto [acc_p2cs, spec_p2cs, ent_p2cs] = evaluate(model_p2cs, false);
+
+    std::cout << "\n  Summary at step 2000 (Phase 2Cs) vs §21.8 Phase 2C (D=16, step 1000):\n";
+    std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
+                              "model", "accuracy", "router_spec", "entropy");
+    std::cout << "  " << std::string(83, '-') << "\n";
+    std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                              "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
+                              22.0f, 50.0f, 0.04f);
+    std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                              "§21.9 Phase 2Cs (D=32, supervised, 2000 steps)",
+                              acc_p2cs * 100.f, spec_p2cs * 100.f, ent_p2cs);
+
+    std::cout << "\n  Key improvements:\n";
+    std::cout << "    D=32: router Linear(32,6) = 198 params (vs 102 at D=16)\n";
+    std::cout << "    Router supervision adds direct CE signal at the '=' position\n";
+    std::cout << "      — the router no longer waits for gradient to propagate\n";
+    std::cout << "        through the STE path and the full LM head.\n";
+    if (step_spec30_p1cs >= 0)
+        std::cout << std::format("    Phase 1Cs achieved >30% router_spec at step {} "
+                                  "(vs 200 steps in §21.8)\n", step_spec30_p1cs);
+
+    if (spec_p2cs > 0.50f)
+        std::cout << std::format("    Phase 2Cs router_spec {:.0f}% > 50% §21.8 baseline: "
+                                  "supervision transfer held\n", spec_p2cs * 100.f);
+    if (acc_p2cs > 0.22f)
+        std::cout << std::format("    Phase 2Cs accuracy {:.0f}% > 22% §21.8 baseline: "
+                                  "specialisation translates to predictions\n",
+                                  acc_p2cs * 100.f);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -1177,6 +1499,7 @@ int main() {
     section_training_dynamics();
     section_curriculum_learning();
     section_large_numbers();
+    section_improved_training();
 
     std::cout << "\nDone.\n";
     return 0;
