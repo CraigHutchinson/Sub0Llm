@@ -117,10 +117,22 @@ TEST_CASE("apply_math_op: addition") {
 }
 
 // ── apply_math_op: subtraction ────────────────────────────────────────────────
+// Convention: a = LEFT operand, b = RIGHT operand  ("a op b" in expression order).
+// MathLayer::forward must pass (lhs=earlier_token, rhs=most_recent_token).
+// Regression: "5 - 3" must yield 2, not -2 (was broken before the call-site fix).
 
 TEST_CASE("apply_math_op: subtraction") {
     auto r = apply_math_op(RouteType::Sub, 100.f, 65.f);
     REQUIRE(r.value == Catch::Approx(35.f));
+    REQUIRE_FALSE(r.is_nan);
+    REQUIRE_FALSE(r.is_overflow);
+}
+
+TEST_CASE("apply_math_op: subtraction left-right order") {
+    // 5 - 3 = 2  (a=5=LEFT, b=3=RIGHT)
+    auto r = apply_math_op(RouteType::Sub, 5.f, 3.f);
+    REQUIRE(r.value == Catch::Approx(2.f));
+    // Regression guard: b - a = 3 - 5 = -2 is the wrong result
     REQUIRE_FALSE(r.is_nan);
     REQUIRE_FALSE(r.is_overflow);
 }
@@ -135,12 +147,19 @@ TEST_CASE("apply_math_op: multiplication") {
 }
 
 // ── apply_math_op: division exact ────────────────────────────────────────────
+// Convention: a = dividend (LEFT), b = divisor (RIGHT). "a / b" in expression order.
 
 TEST_CASE("apply_math_op: division exact") {
     auto r = apply_math_op(RouteType::Div, 100.f, 4.f);
     REQUIRE(r.value == Catch::Approx(25.0f));
     REQUIRE_FALSE(r.is_nan);
     REQUIRE_FALSE(r.is_overflow);
+}
+
+TEST_CASE("apply_math_op: division left-right order") {
+    // 6 / 3 = 2  (a=6=LEFT/dividend, b=3=RIGHT/divisor)
+    auto r = apply_math_op(RouteType::Div, 6.f, 3.f);
+    REQUIRE(r.value == Catch::Approx(2.f));
 }
 
 // ── apply_math_op: division by zero ──────────────────────────────────────────
@@ -151,7 +170,8 @@ TEST_CASE("apply_math_op: division by zero") {
     REQUIRE_FALSE(r.is_overflow);
 }
 
-// ── apply_math_op: compare less ───────────────────────────────────────────────
+// ── apply_math_op: compare ────────────────────────────────────────────────────
+// Convention: a = LEFT operand, b = RIGHT operand. Returns 1 if a < b, else 0.
 
 TEST_CASE("apply_math_op: compare less") {
     auto r = apply_math_op(RouteType::Compare, 3.f, 7.f);
@@ -159,8 +179,6 @@ TEST_CASE("apply_math_op: compare less") {
     REQUIRE_FALSE(r.is_nan);
     REQUIRE_FALSE(r.is_overflow);
 }
-
-// ── apply_math_op: compare greater ───────────────────────────────────────────
 
 TEST_CASE("apply_math_op: compare greater") {
     auto r = apply_math_op(RouteType::Compare, 7.f, 3.f);
