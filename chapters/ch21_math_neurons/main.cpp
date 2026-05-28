@@ -1921,7 +1921,7 @@ static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0) {
                               "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                               22.0f, 50.0f, 0.04f);
     std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                              "§21.9 Phase 2Cs (D=32, supervised, 2000 steps)",
+                              std::format("§21.9 Phase 2Cs (D=32, sup, step {})", loaded_step),
                               acc * 100.f, spec * 100.f, ent);
 }
 
