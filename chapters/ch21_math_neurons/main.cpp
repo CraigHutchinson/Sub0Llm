@@ -1806,6 +1806,11 @@ run_improved_phase_2cs(
     int  steps_since_eval = 0;
 
     const int eff_sched_total = (sched_total > 0) ? sched_total : total;
+    if (sched_total > 0 && sched_total > total)
+        std::cerr << std::format(
+            "  [warn] --sched-total {} > --steps {}; schedules will not reach their "
+            "endpoints (max t={:.2f} instead of 1.0)\n",
+            sched_total, total, static_cast<float>(total) / sched_total);
 
     // Pre-allocate a reusable workspace for the scaled vocab bias; avoids a
     // ~(T×V×4)-byte heap allocation on every training step.

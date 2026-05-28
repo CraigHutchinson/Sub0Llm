@@ -1,7 +1,9 @@
 #include "kernels.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
+#include <limits>
 
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
 #  include <immintrin.h>
@@ -121,6 +123,11 @@ void matmul_f32(const float* A, const float* B, float* C,
                 std::size_t M, std::size_t N, std::size_t K) noexcept {
 #if defined(SUB0LLM_BLAS)
     if (K >= 64) {
+        // BLAS dimensions are int; assert before narrowing cast (educational sizes are
+        // always far below INT_MAX, but the contract must hold for future larger models).
+        assert(M <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(N <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(K <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                     1.0f, A, static_cast<int>(K),
