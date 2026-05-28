@@ -75,7 +75,7 @@ std::vector<RouteType> NumericRouter::route_hard(const autograd::Variable& x) co
     for (std::size_t t = 0; t < T_sz; ++t) {
         int best = 0;
         for (std::size_t k = 1; k < K_sz; ++k) {
-            if (mask_sp[t * K_sz + k] > mask_sp[t * K_sz + best])
+            if (mask_sp[t * K_sz + k] > mask_sp[t * K_sz + static_cast<std::size_t>(best)])
                 best = static_cast<int>(k);
         }
         routes.push_back(static_cast<RouteType>(best));

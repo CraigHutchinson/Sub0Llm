@@ -42,6 +42,11 @@ MathResult apply_math_op(RouteType op, float a, float b) {
             return {a > b ? 1.0f : 0.0f, false, false};
         case RouteType::IsEqual:
             return {a == b ? 1.0f : 0.0f, false, false};
+        // Unary: b = the operand (most-recent numeric); a is unused
+        case RouteType::Increment:
+            return overflow_check(b + 1.0f);
+        case RouteType::Decrement:
+            return overflow_check(b - 1.0f);
         case RouteType::FFN:
         default:
             return {0.0f, true, false};
@@ -117,24 +122,27 @@ autograd::Variable MathLayer::forward(
         }
     }
 
-    // Math operation branches (k = 1..5)
+    // Math operation branches (k = 1..N-1)
     for (int k = 1; k < kNumRouteTypes; ++k) {
         const RouteType route_k = static_cast<RouteType>(k);
+        const bool is_unary = (route_k == RouteType::Increment ||
+                               route_k == RouteType::Decrement);
 
         // Build result token IDs for this operation
         Tensor result_ids({T}, DType::Int32);
         auto   ids_sp = result_ids.data_as<int32_t>();
 
         for (std::size_t t = 0; t < T_sz; ++t) {
-            if (op1_pos[t] < 0 || op2_pos[t] < 0) {
-                // Binary op needs two operands; emit NaN when context is incomplete
+            if (op1_pos[t] < 0 || (!is_unary && op2_pos[t] < 0)) {
+                // Binary needs two operands; unary only needs one. Emit NaN if missing.
                 ids_sp[t] = ntok.nan_token();
             } else {
-                // op1 = most recent token = RIGHT operand in "A op B"
-                // op2 = second most recent = LEFT operand
+                // Binary: op1=RIGHT (most recent), op2=LEFT (second most recent)
+                // Unary:  op1=the operand; a=0 (ignored by apply_math_op for Inc/Dec)
                 // apply_math_op contract: (op, a=LEFT, b=RIGHT)
                 const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
-                const float lhs = reg[static_cast<std::size_t>(op2_pos[t])];
+                const float lhs = (!is_unary && op2_pos[t] >= 0)
+                                  ? reg[static_cast<std::size_t>(op2_pos[t])] : 0.0f;
                 const MathResult mr = apply_math_op(route_k, lhs, rhs);
                 if (mr.is_nan)
                     ids_sp[t] = ntok.nan_token();
@@ -440,8 +448,16 @@ Tensor MathGPT::remap_tokens(
                 ntok.is_numeric(id) ? placeholder : src[static_cast<std::size_t>(t)];
         }
     } else {
-        // Algebraic: assign X0, X1, … to each distinct numeric value in order
-        // of first appearance. Same value → same slot. Slot overflow → placeholder.
+        // Algebraic / AlgebraicSpecial: assign X0, X1, … to each distinct numeric
+        // value in order of first appearance. Same value → same slot.
+        // AlgebraicSpecial keeps {-1, 0, 1} as their real token IDs so the
+        // transformer can reason structurally about identity elements and boolean
+        // outputs without those values being collapsed into opaque slots.
+        const bool preserve_special = (mode == TokenMode::AlgebraicSpecial);
+        auto is_special = [](float v) {
+            return v == -1.0f || v == 0.0f || v == 1.0f;
+        };
+
         std::array<float, NumericTokenizer::kAlgSlots> seen{};
         seen.fill(std::numeric_limits<float>::quiet_NaN());
         int next_slot = 0;
@@ -453,6 +469,10 @@ Tensor MathGPT::remap_tokens(
             if (ntok.is_numeric(id) && !ntok.is_nan_token(id) &&
                 !ntok.is_overflow_token(id)) {
                 const float val = ntok.numeric_value(id);
+                if (preserve_special && is_special(val)) {
+                    dst[static_cast<std::size_t>(t)] = src[static_cast<std::size_t>(t)];
+                    continue;
+                }
                 int slot = -1;
                 for (int s = 0; s < next_slot; ++s) {
                     if (seen[static_cast<std::size_t>(s)] == val) { slot = s; break; }

@@ -10,15 +10,19 @@
 namespace sub0llm::nn {
 
 enum class RouteType : int {
-    FFN          = 0,
-    Add          = 1,
-    Sub          = 2,
-    Mul          = 3,
-    Div          = 4,
-    IsLessThan   = 5,
+    FFN           = 0,
+    Add           = 1,
+    Sub           = 2,
+    Mul           = 3,
+    Div           = 4,
+    IsLessThan    = 5,
     IsGreaterThan = 6,
-    IsEqual      = 7,
-    N_TYPES      = 8
+    IsEqual       = 7,
+    // Unary ops: single operand (most-recent numeric token); second operand ignored.
+    // ++ / -- prefix notation — model must route based on the operator token alone.
+    Increment     = 8,   // ++x  →  x + 1
+    Decrement     = 9,   // --x  →  x - 1
+    N_TYPES       = 10
 };
 
 inline constexpr int kNumRouteTypes = static_cast<int>(RouteType::N_TYPES);

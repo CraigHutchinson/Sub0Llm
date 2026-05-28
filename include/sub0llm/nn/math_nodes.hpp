@@ -19,9 +19,11 @@ struct MathResult {
 // How numeric token IDs are presented to the transformer embedding layer.
 // The reg side-channel always uses original token IDs; only the embedding input changes.
 enum class TokenMode {
-    Real,       // unchanged — transformer sees actual numeric token IDs
-    Anon,       // all numeric → single NUM placeholder; cannot distinguish any values
-    Algebraic,  // distinct values per expression → X0, X1, … (same value = same Xn)
+    Real,              // unchanged — transformer sees actual numeric token IDs
+    Anon,              // all numeric → single NUM placeholder; cannot distinguish any values
+    Algebraic,         // distinct values per expression → X0, X1, … (same value = same Xn)
+    AlgebraicSpecial,  // like Algebraic but {-1, 0, 1} stay visible — structural constants
+                       // (loop terminators, boolean outputs, identity elements) remain distinct
 };
 
 struct RouteInfo {

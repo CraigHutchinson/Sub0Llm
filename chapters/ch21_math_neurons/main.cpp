@@ -1562,6 +1562,8 @@ static const char* route_op_name(RouteType op) noexcept {
         case RouteType::IsLessThan:    return "IsLT ";
         case RouteType::IsGreaterThan: return "IsGT ";
         case RouteType::IsEqual:       return "IsEq ";
+        case RouteType::Increment:     return "Inc  ";
+        case RouteType::Decrement:     return "Dec  ";
         default:                       return "?????";
     }
 }
@@ -1770,8 +1772,9 @@ static void run_improved_phase_1cs(
     SupervisionSchedule sched = {SupProfile::Flat, kAlpha, kAlpha},
     TokenMode token_mode = TokenMode::Real)
 {
-    const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
-                               : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
+    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
     std::cout << std::format("\n  Phase 1Cs — D=32, masked vocab + router supervision ({}){}",
                               sched.label(), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
     std::cout << '\n';
@@ -1893,8 +1896,9 @@ run_improved_phase_2cs(
     int sched_total = 0,  // 0 = use total; >0 = normalise schedules against this value
     TokenMode token_mode = TokenMode::Real)
 {
-    const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
-                               : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
+    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
     std::cout << std::format(
         "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}{}\n",
         sched.label(), bias_sched.label("β"), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
@@ -2194,10 +2198,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--sched-total" && i + 1 < argc) { sched_total = std::stoi(argv[++i]); }
         else if (arg == "--token-mode"  && i + 1 < argc) {
             std::string_view m(argv[++i]);
-            if      (m == "anon")      token_mode = TokenMode::Anon;
-            else if (m == "algebraic") token_mode = TokenMode::Algebraic;
-            else if (m == "real")      token_mode = TokenMode::Real;
-            else { std::cerr << "Unknown --token-mode: " << m << " (use real/anon/algebraic)\n"; return 1; }
+            if      (m == "anon")               token_mode = TokenMode::Anon;
+            else if (m == "algebraic")          token_mode = TokenMode::Algebraic;
+            else if (m == "algebraic-special")  token_mode = TokenMode::AlgebraicSpecial;
+            else if (m == "real")               token_mode = TokenMode::Real;
+            else { std::cerr << "Unknown --token-mode: " << m
+                             << " (use real/anon/algebraic/algebraic-special)\n"; return 1; }
         }
         else if (!arg.starts_with("--"))                  { phase       = std::string(arg); }
     }
