@@ -1856,7 +1856,7 @@ static void run_improved_phase_1cs(
         // Supervision at the "=" position; weight by scheduled α
         Tensor alpha_t({1}, DType::Float32);
         alpha_t.data_as<float>()[0] = cur_alpha;
-        auto rlogits   = model.router_logits(id_tensor);
+        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
         auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
         Tensor gt_t({1}, DType::Int32);
         gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
@@ -2015,7 +2015,7 @@ run_improved_phase_2cs(
         // Scheduled supervision at the "=" position
         Tensor alpha_t({1}, DType::Float32);
         alpha_t.data_as<float>()[0] = cur_alpha;
-        auto rlogits   = model.router_logits(id_tensor);
+        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
         auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
         Tensor gt_t({1}, DType::Int32);
         gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);

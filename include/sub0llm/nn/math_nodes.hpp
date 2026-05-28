@@ -127,9 +127,13 @@ public:
         TokenMode mode = TokenMode::Real) const;
 
     // Pre-softmax router logits (T, n_types) at l_math_ — for supervision loss.
-    // Both forward_math() and router_logits() are called per training step when
-    // using router supervision; the slight extra cost is worthwhile for the
-    // direct gradient signal it gives the routing linear layer.
+    // Must use the same TokenMode and ntok as the paired forward_math() call so
+    // the embedding representations seen by the router are consistent.
+    [[nodiscard]] autograd::Variable router_logits(
+        const Tensor& token_ids,
+        const NumericTokenizer& ntok,
+        TokenMode mode = TokenMode::Real) const;
+    // Convenience overload for Real mode (no remapping needed).
     [[nodiscard]] autograd::Variable router_logits(const Tensor& token_ids) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();

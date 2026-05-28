@@ -370,8 +370,24 @@ RouteInfo MathGPT::route_info(
     return math_block_.route_info(x);
 }
 
+autograd::Variable MathGPT::router_logits(
+    const Tensor& token_ids, const NumericTokenizer& ntok, TokenMode mode) const
+{
+    if (token_ids.ndim() != 1)
+        throw std::runtime_error("MathGPT::router_logits: token_ids must be 1D (T,)");
+    if (token_ids.shape()[0] < 1)
+        throw std::runtime_error("MathGPT::router_logits: token_ids must be non-empty");
+
+    const Tensor emb_ids = remap_tokens(token_ids, ntok, mode);
+    Variable x = tok_emb_.forward(emb_ids);
+    for (int64_t li = 0; li < l_math_; ++li)
+        x = blocks_[static_cast<std::size_t>(li)].forward(x);
+    return math_block_.router_logits(x);
+}
+
 autograd::Variable MathGPT::router_logits(const Tensor& token_ids) const
 {
+    // Real-mode convenience overload — no remapping.
     if (token_ids.ndim() != 1)
         throw std::runtime_error("MathGPT::router_logits: token_ids must be 1D (T,)");
     if (token_ids.shape()[0] < 1)
