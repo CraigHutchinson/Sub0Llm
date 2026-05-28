@@ -23,10 +23,16 @@ class NumericTokenizer {
 public:
     using TokenId = BPETokenizer::TokenId;
 
-    static constexpr int32_t  kIntMin     = -32768;
-    static constexpr int32_t  kIntMax     =  32767;
-    static constexpr int64_t  kIntRange   = 65536;
-    static constexpr int64_t  kExtraTokens = 2;
+    static constexpr int32_t  kIntMin          = -32768;
+    static constexpr int32_t  kIntMax          =  32767;
+    static constexpr int64_t  kIntRange        = 65536;
+    // NaN + Overflow — the two tokens that sit inside the "numeric" predicate
+    static constexpr int64_t  kIntExtraTokens  = 2;
+    // Opaque algebraic symbol slots X0..X(kAlgSlots-1)
+    static constexpr int64_t  kAlgSlots        = 4;
+    // Total extra tokens beyond the integer range:
+    //   kIntExtraTokens (NaN, Overflow) + 1 (NUM placeholder) + kAlgSlots (X0..X3)
+    static constexpr int64_t  kExtraTokens     = kIntExtraTokens + 1 + kAlgSlots;
 
     explicit NumericTokenizer(BPETokenizer bpe);
 
@@ -46,8 +52,15 @@ public:
     // Encode a signed integer value. Out-of-range → overflow_token().
     [[nodiscard]] TokenId encode_int(int32_t value) const noexcept;
 
-    [[nodiscard]] TokenId nan_token()      const noexcept;
-    [[nodiscard]] TokenId overflow_token() const noexcept;
+    [[nodiscard]] TokenId nan_token()             const noexcept;
+    [[nodiscard]] TokenId overflow_token()        const noexcept;
+    // Full-anonymisation placeholder — all numeric tokens map to this single ID.
+    [[nodiscard]] TokenId num_placeholder_token() const noexcept;
+    // Algebraic symbol tokens X0..X(kAlgSlots-1) — slot must be in [0, kAlgSlots).
+    [[nodiscard]] TokenId algebraic_token(int slot) const noexcept;
+
+    [[nodiscard]] bool is_placeholder_token(TokenId id) const noexcept;
+    [[nodiscard]] bool is_algebraic_token(TokenId id)   const noexcept;
 
     // Encode text: pure int16 words → numeric token; other words → BPE tokens.
     [[nodiscard]] std::vector<TokenId> encode(std::string_view text) const;

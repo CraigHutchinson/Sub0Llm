@@ -35,7 +35,8 @@ static Variable make_rand_var(int64_t T, int64_t D) {
 
 TEST_CASE("NumericTokenizer: vocab sizes") {
     auto ntok = make_small_ntok();
-    REQUIRE(ntok.total_vocab_size() == ntok.bpe_vocab_size() + 65538);
+    REQUIRE(ntok.total_vocab_size() ==
+            ntok.bpe_vocab_size() + NumericTokenizer::kIntRange + NumericTokenizer::kExtraTokens);
     REQUIRE(ntok.numeric_range_start() == static_cast<NumericTokenizer::TokenId>(ntok.bpe_vocab_size()));
 
     // Boundaries: just below numeric range is not numeric

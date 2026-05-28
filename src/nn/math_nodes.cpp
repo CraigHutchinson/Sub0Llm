@@ -4,9 +4,11 @@
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/core/tensor.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <stdexcept>
 
 namespace sub0llm::nn {
@@ -319,16 +321,17 @@ autograd::Variable MathGPT::forward(const Tensor& token_ids) const {
 }
 
 autograd::Variable MathGPT::forward_math(
-    const Tensor& token_ids, const NumericTokenizer& ntok) const
+    const Tensor& token_ids, const NumericTokenizer& ntok, TokenMode mode) const
 {
     if (token_ids.ndim() != 1)
         throw std::runtime_error("MathGPT::forward_math: token_ids must be 1D (T,)");
     if (token_ids.shape()[0] < 1)
         throw std::runtime_error("MathGPT::forward_math: token_ids must be non-empty");
 
-    const std::vector<float> reg = build_register(token_ids, ntok);
+    const std::vector<float> reg      = build_register(token_ids, ntok);
+    const Tensor             emb_ids  = remap_tokens(token_ids, ntok, mode);
 
-    Variable x = tok_emb_.forward(token_ids);
+    Variable x = tok_emb_.forward(emb_ids);
     const auto n_layers = static_cast<int64_t>(blocks_.size());
 
     for (int64_t li = 0; li < n_layers; ++li) {
@@ -343,14 +346,15 @@ autograd::Variable MathGPT::forward_math(
 }
 
 RouteInfo MathGPT::route_info(
-    const Tensor& token_ids, const NumericTokenizer& ntok) const
+    const Tensor& token_ids, const NumericTokenizer& ntok, TokenMode mode) const
 {
     if (token_ids.ndim() != 1)
         throw std::runtime_error("MathGPT::route_info: token_ids must be 1D (T,)");
     if (token_ids.shape()[0] < 1)
         throw std::runtime_error("MathGPT::route_info: token_ids must be non-empty");
 
-    Variable x = tok_emb_.forward(token_ids);
+    const Tensor emb_ids = remap_tokens(token_ids, ntok, mode);
+    Variable x = tok_emb_.forward(emb_ids);
 
     for (int64_t li = 0; li < l_math_; ++li)
         x = blocks_[static_cast<std::size_t>(li)].forward(x);
@@ -413,8 +417,59 @@ void MathGPT::import_math_block(MathGPT& source) {
                 i, src_t.numel(), dst_t.numel()));
         std::memcpy(dst_t.data_as<float>().data(),
                     src_t.data_as<float>().data(),
-                    src_t.numel() * sizeof(float));
+                    static_cast<std::size_t>(src_t.numel()) * sizeof(float));
     }
+}
+
+Tensor MathGPT::remap_tokens(
+    const Tensor& token_ids, const NumericTokenizer& ntok, TokenMode mode)
+{
+    if (mode == TokenMode::Real) return token_ids;
+
+    const int64_t T   = token_ids.shape()[0];
+    const auto    src = token_ids.data_as<int32_t>();
+    Tensor        out({T}, DType::Int32);
+    auto          dst = out.data_as<int32_t>();
+
+    if (mode == TokenMode::Anon) {
+        const auto placeholder = static_cast<int32_t>(ntok.num_placeholder_token());
+        for (int64_t t = 0; t < T; ++t) {
+            const auto id = static_cast<NumericTokenizer::TokenId>(
+                src[static_cast<std::size_t>(t)]);
+            dst[static_cast<std::size_t>(t)] =
+                ntok.is_numeric(id) ? placeholder : src[static_cast<std::size_t>(t)];
+        }
+    } else {
+        // Algebraic: assign X0, X1, … to each distinct numeric value in order
+        // of first appearance. Same value → same slot. Slot overflow → placeholder.
+        std::array<float, NumericTokenizer::kAlgSlots> seen{};
+        seen.fill(std::numeric_limits<float>::quiet_NaN());
+        int next_slot = 0;
+        const auto placeholder = static_cast<int32_t>(ntok.num_placeholder_token());
+
+        for (int64_t t = 0; t < T; ++t) {
+            const auto id = static_cast<NumericTokenizer::TokenId>(
+                src[static_cast<std::size_t>(t)]);
+            if (ntok.is_numeric(id) && !ntok.is_nan_token(id) &&
+                !ntok.is_overflow_token(id)) {
+                const float val = ntok.numeric_value(id);
+                int slot = -1;
+                for (int s = 0; s < next_slot; ++s) {
+                    if (seen[static_cast<std::size_t>(s)] == val) { slot = s; break; }
+                }
+                if (slot < 0 && next_slot < static_cast<int>(NumericTokenizer::kAlgSlots)) {
+                    seen[static_cast<std::size_t>(next_slot)] = val;
+                    slot = next_slot++;
+                }
+                dst[static_cast<std::size_t>(t)] = (slot >= 0)
+                    ? static_cast<int32_t>(ntok.algebraic_token(slot))
+                    : placeholder;
+            } else {
+                dst[static_cast<std::size_t>(t)] = src[static_cast<std::size_t>(t)];
+            }
+        }
+    }
+    return out;
 }
 
 std::vector<float> MathGPT::build_register(

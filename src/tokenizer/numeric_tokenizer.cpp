@@ -28,7 +28,7 @@ NumericTokenizer::TokenId NumericTokenizer::numeric_range_start() const noexcept
 
 bool NumericTokenizer::is_numeric(TokenId id) const noexcept {
     return id >= numeric_start_ &&
-           id < static_cast<TokenId>(numeric_start_ + kIntRange + kExtraTokens);
+           id < static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens);
 }
 
 bool NumericTokenizer::is_nan_token(TokenId id) const noexcept {
@@ -63,6 +63,23 @@ NumericTokenizer::TokenId NumericTokenizer::nan_token() const noexcept {
 
 NumericTokenizer::TokenId NumericTokenizer::overflow_token() const noexcept {
     return static_cast<TokenId>(numeric_start_ + kIntRange + 1);
+}
+
+NumericTokenizer::TokenId NumericTokenizer::num_placeholder_token() const noexcept {
+    return static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens);
+}
+
+NumericTokenizer::TokenId NumericTokenizer::algebraic_token(int slot) const noexcept {
+    return static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens + 1 + slot);
+}
+
+bool NumericTokenizer::is_placeholder_token(TokenId id) const noexcept {
+    return id == num_placeholder_token();
+}
+
+bool NumericTokenizer::is_algebraic_token(TokenId id) const noexcept {
+    const auto base = static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens + 1);
+    return id >= base && id < static_cast<TokenId>(base + kAlgSlots);
 }
 
 std::optional<int32_t> NumericTokenizer::try_parse_int16(std::string_view s) {

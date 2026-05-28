@@ -1569,7 +1569,8 @@ static const char* route_op_name(RouteType op) noexcept {
 // ── Spot-check: per-example predictions with per-op accuracy summary ──────────
 // Load via phase "spot". Iterates the full test set and prints every prediction
 // (correct or wrong), then a per-op accuracy table so failure patterns are clear.
-static void spot_check_improved(MathGPT& model, const ImprovedData& d) {
+static void spot_check_improved(MathGPT& model, const ImprovedData& d,
+                                TokenMode token_mode = TokenMode::Real) {
     using RT = RouteType;
 
     // Per-op counters indexed by static_cast<int>(RouteType)
@@ -1594,7 +1595,7 @@ static void spot_check_improved(MathGPT& model, const ImprovedData& d) {
 
         // Greedy prediction
         Tensor ids_t = make_ids_tensor(item.prompt_ids);
-        Variable logits = model.forward_math(ids_t, d.ntok);
+        Variable logits = model.forward_math(ids_t, d.ntok, token_mode);
         const int64_t last = logits.data().shape(0) - 1;
         auto lsp = logits.data().data_as<float>();
         int64_t best = 0;
@@ -1610,7 +1611,7 @@ static void spot_check_improved(MathGPT& model, const ImprovedData& d) {
             pred_val = static_cast<int32_t>(d.ntok.numeric_value(pred_id));
 
         // Routing at the last (=) position
-        RouteInfo ri = model.route_info(ids_t, d.ntok);
+        RouteInfo ri = model.route_info(ids_t, d.ntok, token_mode);
         RT routed_op = ri.routes.empty() ? RT::FFN : ri.routes.back();
 
         bool correct = (pred_val == item.expected_val);
@@ -1682,7 +1683,8 @@ static void spot_check_improved(MathGPT& model, const ImprovedData& d) {
 static std::tuple<float, float, float> eval_improved(
     MathGPT& model,
     const ImprovedData& d,
-    bool masked)
+    bool masked,
+    TokenMode token_mode = TokenMode::Real)
 {
     int correct = 0, spec_count = 0;
     float spec_sum = 0.f, entropy_sum = 0.f;
@@ -1691,7 +1693,7 @@ static std::tuple<float, float, float> eval_improved(
     for (const auto& item : d.test_items) {
         if (item.prompt_ids.empty()) continue;
         Tensor ids_t = make_ids_tensor(item.prompt_ids);
-        Variable logits = model.forward_math(ids_t, d.ntok);
+        Variable logits = model.forward_math(ids_t, d.ntok, token_mode);
 
         const int64_t last = logits.data().shape(0) - 1;
         auto lsp = logits.data().data_as<float>();  // const overload → span<const float>
@@ -1711,7 +1713,7 @@ static std::tuple<float, float, float> eval_improved(
                 ++correct;
         }
 
-        RouteInfo ri = model.route_info(ids_t, d.ntok);
+        RouteInfo ri = model.route_info(ids_t, d.ntok, token_mode);
         if (!ri.routes.empty()) {
             const std::size_t last_t = ri.routes.size() - 1;
             if (ri.routes[last_t] == item.expected_op) spec_sum += 1.f;
@@ -1765,10 +1767,14 @@ static void print_train_row(int step, float loss, float acc, float spec, float e
 
 static void run_improved_phase_1cs(
     std::string_view ckpt_dir, int total = 1000,
-    SupervisionSchedule sched = {SupProfile::Flat, kAlpha, kAlpha})
+    SupervisionSchedule sched = {SupProfile::Flat, kAlpha, kAlpha},
+    TokenMode token_mode = TokenMode::Real)
 {
-    std::cout << std::format("\n  Phase 1Cs — D=32, masked vocab + router supervision ({})\n",
-                              sched.label());
+    const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
+                               : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
+    std::cout << std::format("\n  Phase 1Cs — D=32, masked vocab + router supervision ({}){}",
+                              sched.label(), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
+    std::cout << '\n';
     std::cout << std::format("  target: {} steps\n", total);
 
     ImprovedData d    = build_improved_data();
@@ -1781,8 +1787,10 @@ static void run_improved_phase_1cs(
     auto all_params   = model.parameters();
     Adam adam(block_params, 3e-3f);
 
+    const std::string p1_prefix = "1cs" + mode_tag;
+
     // Resume from latest checkpoint if available
-    int start_step = load_latest_checkpoint(block_params, "1cs", ckpt_dir);
+    int start_step = load_latest_checkpoint(block_params, p1_prefix, ckpt_dir);
     if (start_step >= total) {
         std::cout << std::format("  Phase 1Cs already complete (step {} ≥ {}).\n",
                                   start_step, total);
@@ -1812,20 +1820,20 @@ static void run_improved_phase_1cs(
                 t_phase = now;
                 steps_since_eval = 0;
             }
-            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true);
+            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true, token_mode);
             print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
             save_checkpoint(block_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_1cs_step{:04d}.ckpt", step), step);
+                    std::format("ch21_{}_step{:04d}.ckpt", p1_prefix, step), step);
             break;
         }
         if (step > start_step && step % ckpt_iv == 0)
             save_checkpoint(block_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_1cs_step{:04d}.ckpt", step), step);
+                    std::format("ch21_{}_step{:04d}.ckpt", p1_prefix, step), step);
 
         const std::size_t idx   = rng() % d.train_ids.size();
         const auto&       ids   = d.train_ids[idx];
@@ -1837,7 +1845,7 @@ static void run_improved_phase_1cs(
 
         for (auto* p : all_params) p->zero_grad();
 
-        auto logits  = model.forward_math(id_tensor, d.ntok);
+        auto logits  = model.forward_math(id_tensor, d.ntok, token_mode);
         auto ltrunc  = narrow(logits, 0, T_loss);
         auto lmasked = add(ltrunc, narrow(Variable(d.bias_t_full, false), 0, T_loss));
         auto L_ce    = cross_entropy(lmasked, make_targets(ids));
@@ -1882,13 +1890,14 @@ run_improved_phase_2cs(
     SupervisionSchedule sched      = {SupProfile::CosineDecay, 0.3f, 0.05f},
     SupervisionSchedule bias_sched = {SupProfile::LinearDecay, 0.8f, 0.0f},
     int ckpt_step = 0,
-    int sched_total = 0)  // 0 = use total; >0 = normalise schedules against this value
-                          // (set equal to the original run's total when continuing so the
-                          // schedule doesn't restart mid-range; steps > sched_total clamp to 1)
+    int sched_total = 0,  // 0 = use total; >0 = normalise schedules against this value
+    TokenMode token_mode = TokenMode::Real)
 {
+    const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
+                               : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
     std::cout << std::format(
-        "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}\n",
-        sched.label(), bias_sched.label("β"));
+        "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}{}\n",
+        sched.label(), bias_sched.label("β"), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
     std::cout << std::format("  target: {} steps\n", total);
 
     ImprovedData d    = build_improved_data();
@@ -1901,13 +1910,17 @@ run_improved_phase_2cs(
     auto math_params = model.math_block_only_parameters();
     Adam adam(all_params, 3e-3f);
 
+    const std::string p2_bsup_prefix = "2cs_bsup" + mode_tag;
+    const std::string p2_sup_prefix  = "2cs_sup"  + mode_tag;
+    const std::string p1_prefix      = "1cs"      + mode_tag;
+
     // Resume from the newest available Phase 2Cs checkpoint: bsup > sup > 1cs init
-    int start_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir, ckpt_step);
+    int start_step = load_latest_checkpoint(all_params, p2_bsup_prefix, ckpt_dir, ckpt_step);
     if (start_step < 0)
-        start_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir, ckpt_step);
+        start_step = load_latest_checkpoint(all_params, p2_sup_prefix, ckpt_dir, ckpt_step);
     if (start_step < 0) {
         // No Phase 2Cs checkpoint at all: initialise math_block from Phase 1Cs
-        int p1cs_step = load_latest_checkpoint(math_params, "1cs", ckpt_dir);
+        int p1cs_step = load_latest_checkpoint(math_params, p1_prefix, ckpt_dir);
         if (p1cs_step < 0)
             throw std::runtime_error(
                 "Phase 2Cs requires a Phase 1Cs checkpoint.\n"
@@ -1918,7 +1931,7 @@ run_improved_phase_2cs(
     } else if (start_step >= total) {
         std::cout << std::format("  Phase 2Cs already complete (step {} ≥ {}).\n",
                                   start_step, total);
-        return eval_improved(model, d, false);
+        return eval_improved(model, d, false, token_mode);
     }
     start_step = std::max(start_step, -1) + 1;
 
@@ -1956,20 +1969,20 @@ run_improved_phase_2cs(
                 t_phase = now;
                 steps_since_eval = 0;
             }
-            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false);
+            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false, token_mode);
             print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha, cur_beta);
             if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
         }
         if (step == total) {
             save_checkpoint(all_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_2cs_bsup_step{:04d}.ckpt", step), step);
+                    std::format("ch21_{}_step{:04d}.ckpt", p2_bsup_prefix, step), step);
             break;
         }
         if (step > start_step && step % ckpt_iv == 0)
             save_checkpoint(all_params,
                 std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_2cs_bsup_step{:04d}.ckpt", step), step);
+                    std::format("ch21_{}_step{:04d}.ckpt", p2_bsup_prefix, step), step);
 
         const std::size_t idx   = rng() % d.train_ids.size();
         const auto&       ids   = d.train_ids[idx];
@@ -1980,7 +1993,7 @@ run_improved_phase_2cs(
         const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
 
         adam.zero_grad();
-        auto logits = model.forward_math(id_tensor, d.ntok);
+        auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
         auto ltrunc = narrow(logits, 0, T_loss);
 
         // Decaying vocab bias: β×bias keeps gradient focused on active tokens early in
@@ -2018,7 +2031,7 @@ run_improved_phase_2cs(
     else
         std::cout << "  → router_spec did not cross 30% within Phase 2Cs\n";
 
-    return eval_improved(model, d, false);
+    return eval_improved(model, d, false, token_mode);
 }
 
 // ── Standalone evaluation ─────────────────────────────────────────────────────
@@ -2066,9 +2079,10 @@ static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0) {
 
 static void section_improved_training(std::string_view phase,
                                        std::string_view ckpt_dir,
-                                       int steps = 0,       // 0 = use phase default
-                                       int ckpt_step = 0,   // 0 = load latest checkpoint
-                                       int sched_total = 0) // 0 = use steps; >0 = schedule denominator
+                                       int steps = 0,
+                                       int ckpt_step = 0,
+                                       int sched_total = 0,
+                                       TokenMode token_mode = TokenMode::Real)
 {
     // Phase supervision schedules
     const SupervisionSchedule sched_1cs     {SupProfile::Flat,        kAlpha, kAlpha};
@@ -2092,31 +2106,32 @@ static void section_improved_training(std::string_view phase,
     }
 
     if (phase == "spot") {
-        // Load the best available checkpoint and run the per-example spot check.
+        const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
+                                   : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
         ImprovedData d = build_improved_data();
         MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
                        static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
         auto all_params = model.parameters();
-        int loaded_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir, ckpt_step);
+        int loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs_sup",  ckpt_dir, ckpt_step);
+            loaded_step = load_latest_checkpoint(all_params, "2cs_sup" + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs",      ckpt_dir, ckpt_step);
+            loaded_step = load_latest_checkpoint(all_params, "2cs" + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
             throw std::runtime_error("No Phase 2Cs checkpoint found for spot check.");
         std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
-        spot_check_improved(model, d);
+        spot_check_improved(model, d, token_mode);
         return;
     }
 
     if (phase == "all" || phase == "1cs") {
         const int total1 = (steps > 0) ? steps : 1000;
-        run_improved_phase_1cs(ckpt_dir, total1, sched_1cs);
+        run_improved_phase_1cs(ckpt_dir, total1, sched_1cs, token_mode);
     }
 
     if (phase == "all" || phase == "2cs") {
         const int total2 = (steps > 0) ? steps : 5000;
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step, sched_total);
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step, sched_total, token_mode);
 
         std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
@@ -2168,8 +2183,7 @@ int main(int argc, char* argv[]) {
     int         steps       = 0;  // 0 = use phase default (1000 / 5000)
     int         ckpt_step   = 0;  // 0 = load latest checkpoint; >0 = load <= this step
     int         sched_total = 0;  // 0 = use steps; >0 = schedule denominator
-                                  // (set to original run's total when continuing a run so
-                                  //  the schedules don't restart mid-range)
+    TokenMode   token_mode  = TokenMode::Real;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -2178,6 +2192,13 @@ int main(int argc, char* argv[]) {
         else if (arg == "--steps"       && i + 1 < argc) { steps       = std::stoi(argv[++i]); }
         else if (arg == "--ckpt-step"   && i + 1 < argc) { ckpt_step   = std::stoi(argv[++i]); }
         else if (arg == "--sched-total" && i + 1 < argc) { sched_total = std::stoi(argv[++i]); }
+        else if (arg == "--token-mode"  && i + 1 < argc) {
+            std::string_view m(argv[++i]);
+            if      (m == "anon")      token_mode = TokenMode::Anon;
+            else if (m == "algebraic") token_mode = TokenMode::Algebraic;
+            else if (m == "real")      token_mode = TokenMode::Real;
+            else { std::cerr << "Unknown --token-mode: " << m << " (use real/anon/algebraic)\n"; return 1; }
+        }
         else if (!arg.starts_with("--"))                  { phase       = std::string(arg); }
     }
 
@@ -2197,7 +2218,7 @@ int main(int argc, char* argv[]) {
         section_large_numbers();
     }
 
-    section_improved_training(phase, ckpt_dir, steps, ckpt_step, sched_total);
+    section_improved_training(phase, ckpt_dir, steps, ckpt_step, sched_total, token_mode);
 
     std::cout << "\nDone.\n";
     return 0;

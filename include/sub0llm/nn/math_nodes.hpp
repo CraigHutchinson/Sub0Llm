@@ -16,6 +16,14 @@ struct MathResult {
     bool  is_overflow;
 };
 
+// How numeric token IDs are presented to the transformer embedding layer.
+// The reg side-channel always uses original token IDs; only the embedding input changes.
+enum class TokenMode {
+    Real,       // unchanged — transformer sees actual numeric token IDs
+    Anon,       // all numeric → single NUM placeholder; cannot distinguish any values
+    Algebraic,  // distinct values per expression → X0, X1, … (same value = same Xn)
+};
+
 struct RouteInfo {
     std::vector<RouteType> routes;   // per-token hard route decision
     std::vector<float>     entropy;  // per-token softmax entropy (nats, max=ln(8)≈2.08)
@@ -106,11 +114,15 @@ public:
     [[nodiscard]] autograd::Variable forward(const Tensor& token_ids) const;
 
     // Returns logits (T, total_vocab) using MathTransformerBlock at l_math_.
+    // The transformer embedding sees remap_tokens(token_ids, mode); reg is built
+    // from the original token_ids so math neurons always read exact float values.
     [[nodiscard]] autograd::Variable forward_math(
-        const Tensor& token_ids, const NumericTokenizer& ntok) const;
+        const Tensor& token_ids, const NumericTokenizer& ntok,
+        TokenMode mode = TokenMode::Real) const;
 
     [[nodiscard]] RouteInfo route_info(
-        const Tensor& token_ids, const NumericTokenizer& ntok) const;
+        const Tensor& token_ids, const NumericTokenizer& ntok,
+        TokenMode mode = TokenMode::Real) const;
 
     // Pre-softmax router logits (T, n_types) at l_math_ — for supervision loss.
     // Both forward_math() and router_logits() are called per training step when
@@ -141,6 +153,12 @@ private:
     MathTransformerBlock                 math_block_;  // replaces blocks_[l_math_] in forward_math
     RMSNorm                              ln_f_;
     int64_t                              l_math_;
+
+    // Remap numeric token IDs for the embedding lookup (leaves non-numeric unchanged).
+    // Real → identity; Anon → all numeric to num_placeholder_token();
+    // Algebraic → first distinct value → X0, second → X1, etc. (per expression).
+    [[nodiscard]] static Tensor remap_tokens(
+        const Tensor& token_ids, const NumericTokenizer& ntok, TokenMode mode);
 
     [[nodiscard]] static std::vector<float> build_register(
         const Tensor& token_ids, const NumericTokenizer& ntok);
