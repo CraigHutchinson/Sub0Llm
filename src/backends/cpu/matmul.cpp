@@ -9,6 +9,10 @@
 
 #if defined(SUB0LLM_BLAS)
 // System BLAS (OpenBLAS, MKL, Apple Accelerate, …) via find_package(BLAS)
+// Use the system header so parameter types (e.g. MKL_INT vs int) are correct.
+#  if __has_include(<cblas.h>)
+#    include <cblas.h>
+#  else
 extern "C" {
 void cblas_sgemm(int Order, int TransA, int TransB,
                  int M, int N, int K,
@@ -17,6 +21,7 @@ void cblas_sgemm(int Order, int TransA, int TransB,
                  float beta, float* C, int ldc);
 }
 constexpr int CblasRowMajor = 101, CblasNoTrans = 111;
+#  endif
 #elif defined(SUB0LLM_EIGEN)
 // Eigen3 — header-only, fetched via CPM; no CBLAS/Fortran dependency
 #  include <Eigen/Core>
@@ -129,8 +134,12 @@ void matmul_f32(const float* A, const float* B, float* C,
         Eigen::Map<const RowMat> Am(A, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(K));
         Eigen::Map<const RowMat> Bm(B, static_cast<Eigen::Index>(K), static_cast<Eigen::Index>(N));
         Eigen::Map<RowMat>       Cm(C, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(N));
-        Cm.noalias() = Am * Bm;
-        return;
+        // operator* may allocate a heap temporary; catch any exception (bad_alloc) so
+        // the noexcept contract is honoured — fall through to the blocked path on OOM.
+        try {
+            Cm.noalias() = Am * Bm;
+            return;
+        } catch (...) {}
     }
 #endif
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)

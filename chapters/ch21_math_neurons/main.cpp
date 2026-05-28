@@ -1250,6 +1250,7 @@ static int load_latest_checkpoint(const std::vector<autograd::Variable*>& params
         if (!fn.starts_with(prefix) || !fn.ends_with(".ckpt")) continue;
         try {
             const std::size_t start = prefix.size();
+            if (fn.size() <= start + 5) continue;  // no step digits between prefix and .ckpt
             const std::size_t len   = fn.size() - start - 5;
             int s = std::stoi(fn.substr(start, len));
             if (target_step > 0 && s > target_step) continue;
@@ -1319,7 +1320,7 @@ static constexpr float   kAlpha   = 0.5f;
 // Flat      : constant α = alpha_start throughout.
 // LinearDecay  : α interpolates linearly from alpha_start to alpha_end.
 // CosineDecay  : cosine annealing from alpha_start down to alpha_end.
-// ExpDecay     : exponential decay toward alpha_end (exact at t=1 for alpha_end>0).
+// ExpDecay     : alpha_start*(alpha_end/alpha_start)^t — exact at both endpoints.
 //
 // alpha_end > 0 keeps a residual signal so the router never goes unsupervised.
 
@@ -1345,13 +1346,14 @@ struct SupervisionSchedule {
             }
             case SupProfile::ExpDecay: {
                 if (alpha_start <= 0.f) return alpha_end;
-                const float range = alpha_start - alpha_end;
-                if (range <= 0.f) return alpha_end;
-                // k=log(range/eps) gives near-zero residual at t=1 for alpha_end=0
-                const float k = (alpha_end > 0.f)
-                    ? std::log(alpha_start / alpha_end)
-                    : 10.f;
-                return alpha_end + range * std::exp(-k * t);
+                if (alpha_start <= alpha_end) return alpha_end;  // not a decay
+                if (alpha_end <= 0.f) {
+                    // Toward zero; k=10 gives ~0.005% residual at t=1
+                    return alpha_start * std::exp(-10.f * t);
+                }
+                // alpha_start * (alpha_end/alpha_start)^t — exact at t=0 and t=1
+                const float k = std::log(alpha_start / alpha_end);
+                return alpha_start * std::exp(-k * t);
             }
         }
         return alpha_start;
@@ -1607,7 +1609,7 @@ static void print_train_header(bool show_alpha = false, bool show_beta = false) 
         std::cout << std::format("  {:>6}  {:>6}  {:>9}  {:>12}  {:>11}  {:>9}\n",
                                   "step", "loss", "accuracy", "router_spec", "entropy",
                                   "ms/step");
-    std::cout << "  " << std::string(show_beta ? 77 : (show_alpha ? 70 : 62), '-') << "\n";
+    std::cout << "  " << std::string(show_beta ? 79 : (show_alpha ? 71 : 63), '-') << "\n";
 }
 
 // alpha < 0 → omit the α column; ms_per_step == 0 → show "---"; beta < 0 → omit β column
@@ -1750,7 +1752,8 @@ static std::tuple<float, float, float>
 run_improved_phase_2cs(
     std::string_view ckpt_dir, int total = 5000,
     SupervisionSchedule sched      = {SupProfile::CosineDecay, 0.3f, 0.05f},
-    SupervisionSchedule bias_sched = {SupProfile::LinearDecay, 0.8f, 0.0f})
+    SupervisionSchedule bias_sched = {SupProfile::LinearDecay, 0.8f, 0.0f},
+    int ckpt_step = 0)
 {
     std::cout << std::format(
         "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}\n",
@@ -1767,10 +1770,12 @@ run_improved_phase_2cs(
     auto math_params = model.math_block_only_parameters();
     Adam adam(all_params, 3e-3f);
 
-    // Resume from a bias-supervised Phase 2Cs checkpoint if available
-    int start_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir);
+    // Resume from the newest available Phase 2Cs checkpoint: bsup > sup > 1cs init
+    int start_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir, ckpt_step);
+    if (start_step < 0)
+        start_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir, ckpt_step);
     if (start_step < 0) {
-        // No bias-supervised checkpoint: initialise math_block from Phase 1Cs
+        // No Phase 2Cs checkpoint at all: initialise math_block from Phase 1Cs
         int p1cs_step = load_latest_checkpoint(math_params, "1cs", ckpt_dir);
         if (p1cs_step < 0)
             throw std::runtime_error(
@@ -1951,7 +1956,7 @@ static void section_improved_training(std::string_view phase,
 
     if (phase == "all" || phase == "2cs") {
         const int total2 = (steps > 0) ? steps : 5000;
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs);
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step);
 
         std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
