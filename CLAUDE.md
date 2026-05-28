@@ -43,7 +43,7 @@ cmake --build build-native --parallel
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch20, complete)
+## Current state (Ch01–Ch21, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -82,12 +82,13 @@ cmake --build build-native --parallel
 - `include/sub0llm/nn/moe.hpp` — `MoEFeedForward`, `MoETransformerBlock`, `MoEGPT`: sparse top-k expert routing + load-balancing loss (Ch18)
 - `include/sub0llm/nn/mtp.hpp` — `mtp_train_loss`, `mtp_generate`, `mtp_generate_stats`, `MtpGenStats`: Multi-Token Prediction — K+1 tokens per forward pass (Ch19)
 - `include/sub0llm/nn/rlhf.hpp` — `RewardModel`, `reward_preference_loss`, `reinforce_loss`, `kl_penalty`: RLHF with Bradley-Terry preference training and KL-penalised REINFORCE (Ch20)
+- `include/sub0llm/nn/math_nodes.hpp`, `src/nn/math_nodes.cpp` — `MathLayer`, `MathGPT`, `NumericRouter`: arithmetic-aware transformer with STE routing over 8 ops (FFN, Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual); `apply_math_op`, `RouteType`, `RouteInfo`, `SupervisionSchedule` (Ch21)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
 
 ### Tests
-384 Catch2 tests across 22 test files — all passing.
+415 Catch2 tests across 22 test files — all passing.
 
 ## Git branch
 
@@ -100,6 +101,7 @@ All work goes to `claude/llm-cpp23-repo-init-1f1Il`.
 | spdlog | Logging throughout the library |
 | nlohmann/json | Tokenizer vocab, model configs (Ch03+) |
 | Catch2 v3 | Unit tests |
-| OpenBLAS (system) | Optional BLAS-accelerated matmul (Ch02) |
+| OpenBLAS (system) | Optional BLAS-accelerated matmul (Ch02); dispatched for K≥64 |
+| Eigen3 3.4.0 (CPM) | Header-only matmul fallback when system BLAS absent; dispatched for K≥64 |
 | CUDAToolkit (system) | CUDA backend (Ch02) |
 | OpenVINO (system) | Intel backend (Ch02) |
