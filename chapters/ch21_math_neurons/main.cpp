@@ -1753,7 +1753,10 @@ run_improved_phase_2cs(
     std::string_view ckpt_dir, int total = 5000,
     SupervisionSchedule sched      = {SupProfile::CosineDecay, 0.3f, 0.05f},
     SupervisionSchedule bias_sched = {SupProfile::LinearDecay, 0.8f, 0.0f},
-    int ckpt_step = 0)
+    int ckpt_step = 0,
+    int sched_total = 0)  // 0 = use total; >0 = normalise schedules against this value
+                          // (set equal to the original run's total when continuing so the
+                          // schedule doesn't restart mid-range; steps > sched_total clamp to 1)
 {
     std::cout << std::format(
         "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}\n",
@@ -1801,9 +1804,10 @@ run_improved_phase_2cs(
     auto t_phase = std::chrono::steady_clock::now();
     int  steps_since_eval = 0;
 
+    const int eff_sched_total = (sched_total > 0) ? sched_total : total;
     for (int step = start_step; step <= total; ++step) {
-        const float cur_alpha = sched.alpha_at(step, total);
-        const float cur_beta  = bias_sched.alpha_at(step, total);
+        const float cur_alpha = sched.alpha_at(step, eff_sched_total);
+        const float cur_beta  = bias_sched.alpha_at(step, eff_sched_total);
         if (step % std::max(1, total / 5) == 0 || step == start_step) {
             float ms_per_step = 0.f;
             if (steps_since_eval > 0) {
@@ -1925,8 +1929,9 @@ static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0) {
 
 static void section_improved_training(std::string_view phase,
                                        std::string_view ckpt_dir,
-                                       int steps = 0,      // 0 = use phase default
-                                       int ckpt_step = 0)  // 0 = load latest checkpoint
+                                       int steps = 0,       // 0 = use phase default
+                                       int ckpt_step = 0,   // 0 = load latest checkpoint
+                                       int sched_total = 0) // 0 = use steps; >0 = schedule denominator
 {
     // Phase supervision schedules
     const SupervisionSchedule sched_1cs     {SupProfile::Flat,        kAlpha, kAlpha};
@@ -1956,7 +1961,7 @@ static void section_improved_training(std::string_view phase,
 
     if (phase == "all" || phase == "2cs") {
         const int total2 = (steps > 0) ? steps : 5000;
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step);
+        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step, sched_total);
 
         std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
@@ -1985,12 +1990,15 @@ static void section_improved_training(std::string_view phase,
 // ── main ──────────────────────────────────────────────────────────────────────
 //
 // Usage:
-//   ./ch21_math_neurons                              # run all sections (default)
-//   ./ch21_math_neurons 1cs                          # Phase 1Cs only
-//   ./ch21_math_neurons 2cs                          # Phase 2Cs only (requires 1cs ckpt)
-//   ./ch21_math_neurons 2cs --steps 5000             # extend Phase 2Cs to 5000 steps
-//   ./ch21_math_neurons eval                         # load latest 2cs ckpt, print summary
-//   ./ch21_math_neurons eval --ckpt-step 3000        # eval at the 3000-step baseline
+//   ./ch21_math_neurons                                         # run all sections (default)
+//   ./ch21_math_neurons 1cs                                     # Phase 1Cs only
+//   ./ch21_math_neurons 2cs                                     # Phase 2Cs only (requires 1cs ckpt)
+//   ./ch21_math_neurons 2cs --steps 5000                        # Phase 2Cs for 5000 steps
+//   ./ch21_math_neurons 2cs --steps 10000 --sched-total 5000    # continue from step 5000
+//                                                               #   (schedules stay at final
+//                                                               #    values, no β restart)
+//   ./ch21_math_neurons eval                                    # load latest 2cs ckpt
+//   ./ch21_math_neurons eval --ckpt-step 3000                   # eval at the 3000-step milestone
 //   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
 
 int main(int argc, char* argv[]) {
@@ -1998,18 +2006,22 @@ int main(int argc, char* argv[]) {
     // in real-time rather than flushing only on process exit.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    std::string phase     = "all";
-    std::string ckpt_dir  = ".";
-    int         steps     = 0;  // 0 = use phase default (1000 / 5000)
-    int         ckpt_step = 0;  // 0 = load latest checkpoint; >0 = load <= this step
+    std::string phase       = "all";
+    std::string ckpt_dir    = ".";
+    int         steps       = 0;  // 0 = use phase default (1000 / 5000)
+    int         ckpt_step   = 0;  // 0 = load latest checkpoint; >0 = load <= this step
+    int         sched_total = 0;  // 0 = use steps; >0 = schedule denominator
+                                  // (set to original run's total when continuing a run so
+                                  //  the schedules don't restart mid-range)
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
-        if      (arg == "--phase"     && i + 1 < argc) { phase     = argv[++i]; }
-        else if (arg == "--ckpt-dir"  && i + 1 < argc) { ckpt_dir  = argv[++i]; }
-        else if (arg == "--steps"     && i + 1 < argc) { steps     = std::stoi(argv[++i]); }
-        else if (arg == "--ckpt-step" && i + 1 < argc) { ckpt_step = std::stoi(argv[++i]); }
-        else if (!arg.starts_with("--"))                { phase     = std::string(arg); }
+        if      (arg == "--phase"       && i + 1 < argc) { phase       = argv[++i]; }
+        else if (arg == "--ckpt-dir"    && i + 1 < argc) { ckpt_dir    = argv[++i]; }
+        else if (arg == "--steps"       && i + 1 < argc) { steps       = std::stoi(argv[++i]); }
+        else if (arg == "--ckpt-step"   && i + 1 < argc) { ckpt_step   = std::stoi(argv[++i]); }
+        else if (arg == "--sched-total" && i + 1 < argc) { sched_total = std::stoi(argv[++i]); }
+        else if (!arg.starts_with("--"))                  { phase       = std::string(arg); }
     }
 
     std::cout << "Chapter 21 — Math Neurons: Arithmetic-Aware Transformers\n";
@@ -2028,7 +2040,7 @@ int main(int argc, char* argv[]) {
         section_large_numbers();
     }
 
-    section_improved_training(phase, ckpt_dir, steps, ckpt_step);
+    section_improved_training(phase, ckpt_dir, steps, ckpt_step, sched_total);
 
     std::cout << "\nDone.\n";
     return 0;
