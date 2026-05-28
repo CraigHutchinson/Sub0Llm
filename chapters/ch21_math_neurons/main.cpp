@@ -1552,6 +1552,133 @@ static ImprovedData build_improved_data() {
     };
 }
 
+static const char* route_op_name(RouteType op) noexcept {
+    switch (op) {
+        case RouteType::FFN:           return "FFN  ";
+        case RouteType::Add:           return "Add  ";
+        case RouteType::Sub:           return "Sub  ";
+        case RouteType::Mul:           return "Mul  ";
+        case RouteType::Div:           return "Div  ";
+        case RouteType::IsLessThan:    return "IsLT ";
+        case RouteType::IsGreaterThan: return "IsGT ";
+        case RouteType::IsEqual:       return "IsEq ";
+        default:                       return "?????";
+    }
+}
+
+// ── Spot-check: per-example predictions with per-op accuracy summary ──────────
+// Load via phase "spot". Iterates the full test set and prints every prediction
+// (correct or wrong), then a per-op accuracy table so failure patterns are clear.
+static void spot_check_improved(MathGPT& model, const ImprovedData& d) {
+    using RT = RouteType;
+
+    // Per-op counters indexed by static_cast<int>(RouteType)
+    constexpr int kN = static_cast<int>(RT::N_TYPES);
+    std::array<int, kN> op_ok{}, op_tot{};
+
+    struct Row {
+        std::string expr;
+        int32_t     expected;
+        int32_t     predicted;   // INT32_MIN if non-numeric token
+        RT          expected_op;
+        RT          routed_op;
+    };
+    std::vector<Row> rows;
+    rows.reserve(d.test_items.size());
+
+    for (const auto& item : d.test_items) {
+        if (item.prompt_ids.empty()) continue;
+
+        // Decode the prompt expression for display
+        std::string expr = d.ntok.decode(item.prompt_ids) + " ?";
+
+        // Greedy prediction
+        Tensor ids_t = make_ids_tensor(item.prompt_ids);
+        Variable logits = model.forward_math(ids_t, d.ntok);
+        const int64_t last = logits.data().shape(0) - 1;
+        auto lsp = logits.data().data_as<float>();
+        int64_t best = 0;
+        float   best_v = lsp[static_cast<std::size_t>(last * d.V)];
+        for (int64_t v = 1; v < d.V; ++v) {
+            float val = lsp[static_cast<std::size_t>(last * d.V + v)];
+            if (val > best_v) { best_v = val; best = v; }
+        }
+        auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+        int32_t pred_val = INT32_MIN;
+        if (d.ntok.is_numeric(pred_id) && !d.ntok.is_nan_token(pred_id) &&
+            !d.ntok.is_overflow_token(pred_id))
+            pred_val = static_cast<int32_t>(d.ntok.numeric_value(pred_id));
+
+        // Routing at the last (=) position
+        RouteInfo ri = model.route_info(ids_t, d.ntok);
+        RT routed_op = ri.routes.empty() ? RT::FFN : ri.routes.back();
+
+        bool correct = (pred_val == item.expected_val);
+        auto oi = static_cast<std::size_t>(item.expected_op);
+        op_ok[oi]  += correct ? 1 : 0;
+        op_tot[oi] += 1;
+
+        rows.push_back({std::move(expr), item.expected_val, pred_val,
+                        item.expected_op, routed_op});
+    }
+
+    // ── Per-op summary ────────────────────────────────────────────────────────
+    std::cout << "\n  Per-op accuracy:\n";
+    std::cout << std::format("  {:>6}  {:>7}  {:>8}  {}\n",
+                              "op", "correct", "total", "accuracy");
+    std::cout << "  " << std::string(33, '-') << "\n";
+    int total_ok = 0, total_all = 0;
+    for (std::size_t oi = 1; oi < static_cast<std::size_t>(kN); ++oi) {  // skip FFN (0)
+        if (op_tot[oi] == 0) continue;
+        RT rt = static_cast<RT>(oi);
+        float pct = 100.f * static_cast<float>(op_ok[oi]) / static_cast<float>(op_tot[oi]);
+        std::cout << std::format("  {:>6}  {:>7}  {:>8}  {:>6.1f}%\n",
+                                  route_op_name(rt), op_ok[oi], op_tot[oi], pct);
+        total_ok  += op_ok[oi];
+        total_all += op_tot[oi];
+    }
+    std::cout << "  " << std::string(33, '-') << "\n";
+    std::cout << std::format("  {:>6}  {:>7}  {:>8}  {:>6.1f}%\n",
+                              "TOTAL", total_ok, total_all,
+                              100.f * static_cast<float>(total_ok) /
+                              static_cast<float>(std::max(1, total_all)));
+
+    // ── Wrong predictions ─────────────────────────────────────────────────────
+    std::cout << "\n  Wrong predictions (expression | expected | got | op | routed):\n";
+    std::cout << std::format("  {:>22}  {:>8}  {:>8}  {:>5}  {:>5}  {}\n",
+                              "expression", "expected", "predicted", "op", "route", "mismatch");
+    std::cout << "  " << std::string(68, '-') << "\n";
+    int n_wrong = 0;
+    for (const auto& r : rows) {
+        if (r.predicted == r.expected) continue;
+        ++n_wrong;
+        std::string pred_s = (r.predicted == INT32_MIN) ? "???" : std::to_string(r.predicted);
+        bool route_wrong   = (r.routed_op != r.expected_op);
+        std::cout << std::format("  {:>22}  {:>8}  {:>8}  {:>5}  {:>5}  {}\n",
+                                  r.expr, r.expected, pred_s,
+                                  route_op_name(r.expected_op),
+                                  route_op_name(r.routed_op),
+                                  route_wrong ? "MISROUTED" : "");
+    }
+    if (n_wrong == 0)
+        std::cout << "  (all correct!)\n";
+
+    // ── Correct-but-misrouted ─────────────────────────────────────────────────
+    std::cout << "\n  Correct answer but wrong route (router error masked by coincidence):\n";
+    int n_ghost = 0;
+    for (const auto& r : rows) {
+        if (r.predicted != r.expected) continue;       // skip real failures
+        if (r.routed_op == r.expected_op) continue;    // routing was right
+        ++n_ghost;
+        std::cout << std::format("    {:>22}  ans={:<4}  op={} → routed={}\n",
+                                  r.expr, r.expected,
+                                  route_op_name(r.expected_op),
+                                  route_op_name(r.routed_op));
+    }
+    if (n_ghost == 0)
+        std::cout << "  (none)\n";
+}
+
 static std::tuple<float, float, float> eval_improved(
     MathGPT& model,
     const ImprovedData& d,
@@ -1810,7 +1937,7 @@ run_improved_phase_2cs(
         std::cerr << std::format(
             "  [warn] --sched-total {} > --steps {}; schedules will not reach their "
             "endpoints (max t={:.2f} instead of 1.0)\n",
-            sched_total, total, static_cast<float>(total) / sched_total);
+            sched_total, total, static_cast<float>(total) / static_cast<float>(sched_total));
 
     // Pre-allocate a reusable workspace for the scaled vocab bias; avoids a
     // ~(T×V×4)-byte heap allocation on every training step.
@@ -1964,6 +2091,24 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
+    if (phase == "spot") {
+        // Load the best available checkpoint and run the per-example spot check.
+        ImprovedData d = build_improved_data();
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                       static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        auto all_params = model.parameters();
+        int loaded_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir, ckpt_step);
+        if (loaded_step < 0)
+            loaded_step = load_latest_checkpoint(all_params, "2cs_sup",  ckpt_dir, ckpt_step);
+        if (loaded_step < 0)
+            loaded_step = load_latest_checkpoint(all_params, "2cs",      ckpt_dir, ckpt_step);
+        if (loaded_step < 0)
+            throw std::runtime_error("No Phase 2Cs checkpoint found for spot check.");
+        std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
+        spot_check_improved(model, d);
+        return;
+    }
+
     if (phase == "all" || phase == "1cs") {
         const int total1 = (steps > 0) ? steps : 1000;
         run_improved_phase_1cs(ckpt_dir, total1, sched_1cs);
@@ -2009,6 +2154,8 @@ static void section_improved_training(std::string_view phase,
 //                                                               #    values, no β restart)
 //   ./ch21_math_neurons eval                                    # load latest 2cs ckpt
 //   ./ch21_math_neurons eval --ckpt-step 3000                   # eval at the 3000-step milestone
+//   ./ch21_math_neurons spot                                    # per-example spot check + per-op accuracy
+//   ./ch21_math_neurons spot --ckpt-step 5000                   # spot check at step 5000
 //   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
 
 int main(int argc, char* argv[]) {
@@ -2038,7 +2185,7 @@ int main(int argc, char* argv[]) {
     std::cout << std::string(60, '=') << '\n';
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "1cs" || phase == "2cs" || phase == "eval");
+    const bool improved_only = (phase == "1cs" || phase == "2cs" || phase == "eval" || phase == "spot");
     if (!improved_only) {
         section_numeric_tokenizer();
         section_math_ops();
