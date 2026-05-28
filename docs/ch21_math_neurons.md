@@ -735,6 +735,123 @@ answer, looked up deterministically.
 
 ---
 
+## Known Limitations & Open Design Questions
+
+### 1. Counting-for-generation: "list 5 animals"
+
+**The problem.** When a numeric value controls generation *length* rather than
+appearing as an operand in an arithmetic expression, the architecture faces a
+qualitatively different challenge.
+
+| Layer | Native FFN (statistical LM) | MathGPT |
+|-------|----------------------------|---------|
+| How it reads `5` | As an embedding; magnitude is implicit in co-occurrence statistics | `reg[t] = 5.0f` — exact float in the register |
+| How it counts outputs | Statistical: learned from "list N X → N items" patterns; miscounts on unseen N | Arithmetic nodes can compute `N - 1` exactly each step |
+| When does it stop? | Heuristic: learns EOS distribution from training | Exact: `IsEqual(counter, 0) == 1` → stop |
+| Failure mode | Off-by-one or off-by-many, especially for large N | No failure in arithmetic — but counter must be *visible in context* at every generation step |
+
+**Why the math neuron doesn't automatically fix this.** A single-pass forward
+computes one token at a time. For "list 5 animals", the counter needs to
+decrement across *autoregressive generation steps*. That requires the current
+counter value to appear explicitly in the context window at each step (e.g. as
+a running `[REMAINING: 4]` token), so the `--` (Decrement) node can fire and
+the `IsEqual(counter, 0)` check can gate the EOS.
+
+Without such explicit state in the context, the model must rely on the
+transformer's positional/attention machinery to "feel" how many tokens have
+been generated — the same statistical approximation as a native FFN.
+
+**Why `AlgebraicSpecial` matters here.** With full anonymisation (`Anon` or
+`Algebraic`), the value `0` is opaque — the model cannot learn "stop when
+counter reaches zero" as a structural pattern. `AlgebraicSpecial` keeps
+`{-1, 0, 1}` visible precisely so that `X0 == 0` (reach-zero check) and
+`X0 - 1` (decrement) remain structurally legible to the transformer's
+attention layers.
+
+**TBD / future work.**
+- Add an explicit running-counter token to the generation protocol and train
+  on "list N X" examples with a visible `[REMAINING: K]` marker that
+  decrements each step.
+- Evaluate whether the `--` / `IsEqual(·, 0)` chain makes counting exact vs
+  the native FFN baseline for N ∈ {2, 3, 5, 10, 20}.
+- Determine the minimum training examples needed for the router to reliably
+  pick `Decrement` on `--` operator tokens.
+
+---
+
+### 2. Opaque special constants: the 0 / 1 edge case
+
+**The problem.** Full anonymisation (`Anon`/`Algebraic`) maps every numeric
+token to an opaque placeholder, including `0` and `1`. These values are
+structurally special:
+
+| Value | Algebraic role | Example structural pattern |
+|-------|---------------|---------------------------|
+| `0` | Additive identity; loop terminator | `a - 1 == 0` → stop |
+| `1` | Multiplicative identity | `a * 1 == a`; `a / 1 == a` |
+| `-1` | Negation factor | `-1 * a == -a` |
+
+When these are opaque, the transformer cannot learn that `X0 * X1 = X0`
+whenever `X1` happens to be `1` — because it never sees `X1 = 1` as a
+structural fact.
+
+**Current solution.** `--token-mode algebraic-special` keeps `{-1, 0, 1}` as
+their real token IDs; all other integers become `X0`, `X1`, etc. This is the
+recommended default for tasks that involve loop control or identity-element
+short-circuiting.
+
+**TBD.** Whether the model should be allowed to short-circuit `a * 1 = a` in
+the transformer layer (without firing the Mul neuron) is an open design
+question. Allowing it increases efficiency; requiring it to go through the
+math node preserves the "all arithmetic is exact" invariant.
+
+---
+
+### 3. Prefix increment/decrement: `++x` and `--x`
+
+**Current state.** `RouteType::Increment` (slot 8) and `RouteType::Decrement`
+(slot 9) are defined and wired in `apply_math_op` and `MathLayer::forward`
+(unary — only one operand required). Training data is **not yet added**;
+the router will default to FFN for these tokens until training examples of
+the form `++ A = A+1` are included in `build_improved_data`.
+
+**Design question.** Two approaches:
+1. **Dedicated unary nodes** (current scaffold): router learns `++ token →
+   Increment slot`; exact `b + 1` computed deterministically. Cleaner, no
+   implicit operand fabrication.
+2. **Learned decomposition**: model learns `++ X0 = X0 + 1` by routing to
+   `Add` with an implicit RHS of `1`. Requires `1` to be a visible constant
+   (`AlgebraicSpecial`) and the transformer to construct the phantom `+1`
+   operand — less clean but zero architectural cost.
+
+**TBD.** Add `++` / `--` training examples (100 each) once the current
+`Real` / `Anon` / `Algebraic` comparison runs finish. BPE vocab size will
+need to increase from 50 to ~70 to absorb `++` and `--` as single tokens.
+Run a head-to-head between approach 1 (dedicated nodes) and approach 2
+(learned decomposition via `Add`) to determine which converges faster.
+
+---
+
+### 4. Multi-step / chained expressions
+
+**Current state.** All experiments use single binary expressions
+`A op B = ?`. The `reg` side-channel only stores values from input tokens;
+intermediate results of the math layer are not fed back into `reg`.
+
+A chained expression such as `(A + B) * C = ?` would require either:
+- Two forward passes (first compute `A + B`, write result back to context,
+  then `result * C`), or
+- A `reg`-writeback mechanism so that a math-layer output at position `t`
+  becomes available in `reg[t]` for subsequent positions.
+
+**TBD.** Implement `reg` writeback: after `MathLayer::forward` computes
+result token IDs for each position, decode those IDs back to float and
+store in a mutable register. This requires the register to be built
+incrementally (left-to-right, one position at a time) rather than as a
+pre-pass over all token IDs.
+
+---
+
 ## Files
 
 | File | Description |
