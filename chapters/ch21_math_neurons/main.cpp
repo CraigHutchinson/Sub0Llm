@@ -2038,44 +2038,163 @@ run_improved_phase_2cs(
     return eval_improved(model, d, false, token_mode);
 }
 
-// ── Standalone evaluation ─────────────────────────────────────────────────────
-// Load the Phase 2Cs checkpoint and print the summary table.
+// ── Single-phase training ──────────────────────────────────────────────────────
+// Trains all parameters from step 0 with full vocab and router supervision only.
+// No masked-vocab warmup — with Anon/Algebraic token modes the transformer
+// cannot approximate numeric results through the FFN (it never sees real values),
+// so the Phase 1Cs curriculum is structurally unnecessary.
 
-static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0) {
-    if (ckpt_step > 0)
-        std::cout << std::format("\n  Eval — loading Phase 2Cs checkpoint at step {}\n", ckpt_step);
+static std::tuple<float, float, float>
+run_train_single_phase(
+    std::string_view ckpt_dir, int total = 3000,
+    SupervisionSchedule sched = {SupProfile::CosineDecay, 0.5f, 0.05f},
+    TokenMode token_mode = TokenMode::Anon)
+{
+    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
+    std::cout << std::format(
+        "\n  Single-phase training — full-vocab, all params, supervision α: {}{}\n",
+        sched.label(),
+        mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
+    std::cout << std::format("  target: {} steps\n", total);
+
+    ImprovedData d    = build_improved_data();
+    const int ckpt_iv = 200;
+
+    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+
+    auto all_params = model.parameters();
+    Adam adam(all_params, 3e-3f);
+
+    const std::string prefix = "train" + mode_tag;
+
+    int start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
+    if (start_step >= total) {
+        std::cout << std::format("  Already complete (step {} ≥ {}).\n", start_step, total);
+        return eval_improved(model, d, false, token_mode);
+    }
+    start_step = std::max(start_step, -1) + 1;
+
+    std::mt19937 rng(11);
+    for (int i = 0; i < start_step; ++i) rng();
+
+    print_train_header(/*show_alpha=*/true);
+    float last_loss   = 0.f;
+    int   step_spec30 = -1;
+    auto  t_phase     = std::chrono::steady_clock::now();
+    int   steps_since_eval = 0;
+
+    for (int step = start_step; step <= total; ++step) {
+        const float cur_alpha = sched.alpha_at(step, total);
+        if (step % std::max(1, total / 5) == 0 || step == start_step) {
+            float ms_per_step = 0.f;
+            if (steps_since_eval > 0) {
+                auto now = std::chrono::steady_clock::now();
+                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                              / static_cast<float>(steps_since_eval);
+                t_phase = now;
+                steps_since_eval = 0;
+            }
+            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false, token_mode);
+            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
+            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
+        }
+        if (step == total) {
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+            break;
+        }
+        if (step > start_step && step % ckpt_iv == 0)
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+
+        const std::size_t idx   = rng() % d.train_ids.size();
+        const auto&       ids   = d.train_ids[idx];
+        const RouteType   gt_op = d.train_ops[idx];
+        if (ids.size() < 2) { --step; rng(); continue; }
+
+        Tensor id_tensor = make_ids_tensor(ids);
+        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
+
+        adam.zero_grad();
+        auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
+        auto ltrunc = narrow(logits, 0, T_loss);
+        auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
+
+        Tensor alpha_t({1}, DType::Float32);
+        alpha_t.data_as<float>()[0] = cur_alpha;
+        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
+        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
+        Tensor gt_t({1}, DType::Int32);
+        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+        auto L_sup   = cross_entropy(rlogit_eq, gt_t);
+        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+
+        L_total.backward();
+        (void)clip_grad_norm(all_params, 1.0f);
+        adam.step();
+        last_loss = L_total.data().data_as<float>()[0];
+        ++steps_since_eval;
+    }
+
+    if (step_spec30 >= 0)
+        std::cout << std::format("  → router_spec first crossed 30% at step {}\n", step_spec30);
     else
-        std::cout << "\n  Eval — loading Phase 2Cs checkpoint (latest)\n";
+        std::cout << "  → router_spec did not cross 30% within training\n";
+
+    return eval_improved(model, d, false, token_mode);
+}
+
+// ── Standalone evaluation ─────────────────────────────────────────────────────
+// Load the latest checkpoint (train > 2cs_bsup > 2cs_sup > 2cs) and print the
+// summary table.
+
+static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0,
+                               TokenMode token_mode = TokenMode::Real) {
+    if (ckpt_step > 0)
+        std::cout << std::format("\n  Eval — loading checkpoint at step {}\n", ckpt_step);
+    else
+        std::cout << "\n  Eval — loading latest checkpoint\n";
+
+    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
 
     ImprovedData d = build_improved_data();
     MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
                    static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
 
     auto all_params = model.parameters();
-    // Prefer newest run first: bsup (bias+sup) > sup (supervision only) > unsupervised
-    int loaded_step = load_latest_checkpoint(all_params, "2cs_bsup", ckpt_dir, ckpt_step);
+    // Search order: single-phase train > two-phase bsup > sup > unsupervised
+    int loaded_step = load_latest_checkpoint(all_params, "train"    + mode_tag, ckpt_dir, ckpt_step);
     if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs_sup",  ckpt_dir, ckpt_step);
+        loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
     if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs",      ckpt_dir, ckpt_step);
+        loaded_step = load_latest_checkpoint(all_params, "2cs_sup"  + mode_tag, ckpt_dir, ckpt_step);
+    if (loaded_step < 0)
+        loaded_step = load_latest_checkpoint(all_params, "2cs"      + mode_tag, ckpt_dir, ckpt_step);
     if (loaded_step < 0)
         throw std::runtime_error(
-            "Phase 2Cs checkpoint not found.\n"
-            "  Run first: ./ch21_math_neurons 2cs [--ckpt-dir <dir>]");
+            "No checkpoint found.\n"
+            "  Run first: ./ch21_math_neurons train [--ckpt-dir <dir>] [--token-mode anon]");
 
-    auto [acc, spec, ent] = eval_improved(model, d, false);
+    auto [acc, spec, ent] = eval_improved(model, d, false, token_mode);
     std::cout << std::format("  accuracy={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
                               acc * 100.f, spec * 100.f, ent);
-    std::cout << "\n  Summary (§21.9 Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
+    std::cout << "\n  Summary (§21.9 vs §21.8 Phase 2C documented baseline):\n";
     std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
                               "model", "accuracy", "router_spec", "entropy");
     std::cout << "  " << std::string(83, '-') << "\n";
-    // §21.8 values are documented baselines from the prior run; see docs/ch21_math_neurons.md
     std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
                               "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                               22.0f, 50.0f, 0.04f);
     std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                              std::format("§21.9 Phase 2Cs (D=32, sup, step {})", loaded_step),
+                              std::format("§21.9 (D=32, sup, step {}{})", loaded_step,
+                                          mode_tag.empty() ? "" : ", " + mode_tag.substr(1)),
                               acc * 100.f, spec * 100.f, ent);
 }
 
@@ -2088,12 +2207,12 @@ static void section_improved_training(std::string_view phase,
                                        int sched_total = 0,
                                        TokenMode token_mode = TokenMode::Real)
 {
-    // Phase supervision schedules
+    // Phase supervision schedules (used by legacy 1cs/2cs path)
     const SupervisionSchedule sched_1cs     {SupProfile::Flat,        kAlpha, kAlpha};
     const SupervisionSchedule sched_2cs     {SupProfile::CosineDecay, 0.3f,   0.05f};
-    // Vocab bias schedule: decays from 0.8→0 so Phase 2Cs starts with 80% of the
-    // Phase-1Cs masking strength and fully opens to all 65k tokens by the final step.
     const SupervisionSchedule bias_sched_2cs{SupProfile::LinearDecay, 0.8f,   0.0f};
+    // Single-phase schedule: higher start α since no warmup phase
+    const SupervisionSchedule sched_train   {SupProfile::CosineDecay, 0.5f,   0.05f};
 
     std::cout << "\n=== §21.9  Improved Specialisation: D=32, 7 ops, Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
@@ -2105,26 +2224,52 @@ static void section_improved_training(std::string_view phase,
     std::cout << std::format("  checkpoint directory: {}\n", ckpt_dir);
 
     if (phase == "eval") {
-        run_improved_eval(ckpt_dir, ckpt_step);
+        run_improved_eval(ckpt_dir, ckpt_step, token_mode);
         return;
     }
 
     if (phase == "spot") {
-        const std::string mode_tag = (token_mode == TokenMode::Anon) ? "_anon"
-                                   : (token_mode == TokenMode::Algebraic) ? "_alg" : "";
+        const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                                   : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                                   : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
         ImprovedData d = build_improved_data();
         MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
                        static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
         auto all_params = model.parameters();
-        int loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
+        // Search order: single-phase train > two-phase bsup > sup
+        int loaded_step = load_latest_checkpoint(all_params, "train"    + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs_sup" + mode_tag, ckpt_dir, ckpt_step);
+            loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs" + mode_tag, ckpt_dir, ckpt_step);
+            loaded_step = load_latest_checkpoint(all_params, "2cs_sup"  + mode_tag, ckpt_dir, ckpt_step);
         if (loaded_step < 0)
-            throw std::runtime_error("No Phase 2Cs checkpoint found for spot check.");
+            loaded_step = load_latest_checkpoint(all_params, "2cs"      + mode_tag, ckpt_dir, ckpt_step);
+        if (loaded_step < 0)
+            throw std::runtime_error("No checkpoint found for spot check.");
         std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
         spot_check_improved(model, d, token_mode);
+        return;
+    }
+
+    if (phase == "train") {
+        const int total_t = (steps > 0) ? steps : 3000;
+        auto [acc, spec, ent] = run_train_single_phase(ckpt_dir, total_t, sched_train, token_mode);
+
+        std::cout << "\n  Summary (single-phase vs §21.8 Phase 2C documented baseline):\n";
+        std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
+                                  "model", "accuracy", "router_spec", "entropy");
+        std::cout << "  " << std::string(83, '-') << "\n";
+        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                                  "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
+                                  22.0f, 50.0f, 0.04f);
+        const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
+                                   : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                                   : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
+        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
+                                  std::format("§21.9 single-phase (D=32{}, {} steps)",
+                                              mode_tag.empty() ? "" : ", " + mode_tag.substr(1),
+                                              total_t),
+                                  acc * 100.f, spec * 100.f, ent);
         return;
     }
 
@@ -2141,7 +2286,6 @@ static void section_improved_training(std::string_view phase,
         std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
                                   "model", "accuracy", "router_spec", "entropy");
         std::cout << "  " << std::string(83, '-') << "\n";
-        // §21.8 values are documented baselines; see docs/ch21_math_neurons.md
         std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
                                   "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                                   22.0f, 50.0f, 0.04f);
@@ -2164,18 +2308,18 @@ static void section_improved_training(std::string_view phase,
 // ── main ──────────────────────────────────────────────────────────────────────
 //
 // Usage:
-//   ./ch21_math_neurons                                         # run all sections (default)
-//   ./ch21_math_neurons 1cs                                     # Phase 1Cs only
-//   ./ch21_math_neurons 2cs                                     # Phase 2Cs only (requires 1cs ckpt)
-//   ./ch21_math_neurons 2cs --steps 5000                        # Phase 2Cs for 5000 steps
-//   ./ch21_math_neurons 2cs --steps 10000 --sched-total 5000    # continue from step 5000
-//                                                               #   (schedules stay at final
-//                                                               #    values, no β restart)
-//   ./ch21_math_neurons eval                                    # load latest 2cs ckpt
-//   ./ch21_math_neurons eval --ckpt-step 3000                   # eval at the 3000-step milestone
-//   ./ch21_math_neurons spot                                    # per-example spot check + per-op accuracy
-//   ./ch21_math_neurons spot --ckpt-step 5000                   # spot check at step 5000
-//   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
+//   ./ch21_math_neurons                                              # run all sections (default)
+//   ./ch21_math_neurons train --token-mode anon                      # single-phase, 3000 steps (recommended)
+//   ./ch21_math_neurons train --steps 5000 --token-mode algebraic    # single-phase, 5000 steps
+//   ./ch21_math_neurons 1cs                                          # legacy Phase 1Cs only
+//   ./ch21_math_neurons 2cs                                          # legacy Phase 2Cs (requires 1cs ckpt)
+//   ./ch21_math_neurons 2cs --steps 5000                             # Phase 2Cs for 5000 steps
+//   ./ch21_math_neurons 2cs --steps 10000 --sched-total 5000         # continue from step 5000
+//   ./ch21_math_neurons eval --token-mode anon                       # load latest checkpoint
+//   ./ch21_math_neurons eval --ckpt-step 3000 --token-mode anon      # eval at step milestone
+//   ./ch21_math_neurons spot --token-mode anon                       # per-example spot check
+//   ./ch21_math_neurons spot --ckpt-step 3000 --token-mode algebraic # spot check at step 3000
+//   ./ch21_math_neurons --phase train --ckpt-dir /tmp/ckpts --token-mode anon
 
 int main(int argc, char* argv[]) {
     // Force line-buffered stdout so log files written via redirection are readable
@@ -2212,7 +2356,8 @@ int main(int argc, char* argv[]) {
     std::cout << std::string(60, '=') << '\n';
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "1cs" || phase == "2cs" || phase == "eval" || phase == "spot");
+    const bool improved_only = (phase == "train" || phase == "1cs" || phase == "2cs" ||
+                                 phase == "eval"  || phase == "spot");
     if (!improved_only) {
         section_numeric_tokenizer();
         section_math_ops();
