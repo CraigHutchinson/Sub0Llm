@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numbers>
 #include <filesystem>
@@ -1988,6 +1989,10 @@ static void section_improved_training(std::string_view phase,
 //   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
 
 int main(int argc, char* argv[]) {
+    // Force line-buffered stdout so log files written via redirection are readable
+    // in real-time rather than flushing only on process exit.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     std::string phase     = "all";
     std::string ckpt_dir  = ".";
     int         steps     = 0;  // 0 = use phase default (1000 / 5000)
