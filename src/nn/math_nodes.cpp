@@ -89,11 +89,13 @@ autograd::Variable MathLayer::forward(
     // Accumulate output
     Variable output(zeros({T, D_}, DType::Float32), false);
 
+    // Hoist transpose once — shared by FFN (k=0) and all math branches (k=1..K-1)
+    Variable gates_T = transpose2d(gates);  // (K, T)
+
     // Extract gate column for FFN (k=0) and scale ffn_out
     {
-        Variable gates_T     = transpose2d(gates);               // (K, T)
-        Variable gate_row0   = narrow(gates_T, 0, 1);            // (1, T)
-        Variable gate_col0   = transpose2d(gate_row0);           // (T, 1)
+        Variable gate_row0 = narrow(gates_T, 0, 1);   // (1, T)
+        Variable gate_col0 = transpose2d(gate_row0);  // (T, 1)
         output = add(output, row_scale(ffn_out, gate_col0));
     }
 
@@ -122,16 +124,15 @@ autograd::Variable MathLayer::forward(
         auto   ids_sp = result_ids.data_as<int32_t>();
 
         for (std::size_t t = 0; t < T_sz; ++t) {
-            if (op1_pos[t] < 0) {
+            if (op1_pos[t] < 0 || op2_pos[t] < 0) {
+                // Binary op needs two operands; emit NaN when context is incomplete
                 ids_sp[t] = ntok.nan_token();
             } else {
                 // op1 = most recent token = RIGHT operand in "A op B"
                 // op2 = second most recent = LEFT operand
                 // apply_math_op contract: (op, a=LEFT, b=RIGHT)
                 const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
-                const float lhs = (op2_pos[t] >= 0)
-                    ? reg[static_cast<std::size_t>(op2_pos[t])]
-                    : rhs;
+                const float lhs = reg[static_cast<std::size_t>(op2_pos[t])];
                 const MathResult mr = apply_math_op(route_k, lhs, rhs);
                 if (mr.is_nan)
                     ids_sp[t] = ntok.nan_token();
@@ -145,10 +146,9 @@ autograd::Variable MathLayer::forward(
         // Look up embeddings for the result tokens
         Variable math_emb = embedding_lookup(emb_weight, result_ids);  // (T, D)
 
-        // Extract gate column for this branch
-        Variable gates_T   = transpose2d(gates);                     // (K, T)
-        Variable gate_row  = narrow(gates_T, static_cast<int64_t>(k), 1);  // (1, T)
-        Variable gate_col  = transpose2d(gate_row);                  // (T, 1)
+        // Extract gate column for this branch (gates_T hoisted above loop)
+        Variable gate_row = narrow(gates_T, static_cast<int64_t>(k), 1);  // (1, T)
+        Variable gate_col = transpose2d(gate_row);                         // (T, 1)
 
         output = add(output, row_scale(math_emb, gate_col));
     }

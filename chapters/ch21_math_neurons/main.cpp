@@ -1314,7 +1314,7 @@ static constexpr float   kAlpha   = 0.5f;
 // Flat      : constant α = alpha_start throughout.
 // LinearDecay  : α interpolates linearly from alpha_start to alpha_end.
 // CosineDecay  : cosine annealing from alpha_start down to alpha_end.
-// ExpDecay     : exponential decay; reaches alpha_end at the final step.
+// ExpDecay     : exponential decay toward alpha_end (exact at t=1 for alpha_end>0).
 //
 // alpha_end > 0 keeps a residual signal so the router never goes unsupervised.
 
@@ -1340,9 +1340,13 @@ struct SupervisionSchedule {
             }
             case SupProfile::ExpDecay: {
                 if (alpha_start <= 0.f) return alpha_end;
-                if (alpha_end   <= 0.f) return alpha_start * std::exp(-5.f * t);
-                const float k = std::log(alpha_start / alpha_end);
-                return alpha_start * std::exp(-k * t);
+                const float range = alpha_start - alpha_end;
+                if (range <= 0.f) return alpha_end;
+                // k=log(range/eps) gives near-zero residual at t=1 for alpha_end=0
+                const float k = (alpha_end > 0.f)
+                    ? std::log(alpha_start / alpha_end)
+                    : 10.f;
+                return alpha_end + range * std::exp(-k * t);
             }
         }
         return alpha_start;
@@ -1383,7 +1387,7 @@ static ImprovedData build_improved_data() {
 
     std::vector<std::string> corpus;
     std::vector<RouteType>   corpus_ops;
-    corpus.reserve(500);
+    corpus.reserve(700);
 
     // Add: A + B, A,B ∈ [0,9], result ∈ [0,18]
     for (int i = 0; i < 100; ++i) {
@@ -1657,7 +1661,7 @@ static void run_improved_phase_1cs(
 
     for (int step = start_step; step <= total; ++step) {
         const float cur_alpha = sched.alpha_at(step, total);
-        if (step % (total / 5) == 0 || step == start_step) {
+        if (step % std::max(1, total / 5) == 0 || step == start_step) {
             float ms_per_step = 0.f;
             if (steps_since_eval > 0) {
                 auto now = std::chrono::steady_clock::now();
@@ -1777,7 +1781,7 @@ run_improved_phase_2cs(
 
     for (int step = start_step; step <= total; ++step) {
         const float cur_alpha = sched.alpha_at(step, total);
-        if (step % (total / 5) == 0 || step == start_step) {
+        if (step % std::max(1, total / 5) == 0 || step == start_step) {
             float ms_per_step = 0.f;
             if (steps_since_eval > 0) {
                 auto now = std::chrono::steady_clock::now();
@@ -1886,7 +1890,7 @@ static void section_improved_training(std::string_view phase,
     const SupervisionSchedule sched_1cs{SupProfile::Flat,        kAlpha, kAlpha};
     const SupervisionSchedule sched_2cs{SupProfile::CosineDecay, 0.3f,   0.05f};
 
-    std::cout << "\n=== §21.9  Improved Specialisation: D=32, 5 ops, Router Supervision ===\n";
+    std::cout << "\n=== §21.9  Improved Specialisation: D=32, 7 ops, Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
     std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual (700 training examples)\n";
     std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
@@ -1918,7 +1922,7 @@ static void section_improved_training(std::string_view phase,
                                   "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
                                   22.0f, 50.0f, 0.04f);
         std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  std::format("§21.9 Phase 2Cs (D=32, 5-op, sup, {} steps)", total2),
+                                  std::format("§21.9 Phase 2Cs (D=32, 7-op, sup, {} steps)", total2),
                                   acc * 100.f, spec * 100.f, ent);
 
         std::cout << "\n  Key improvements:\n";

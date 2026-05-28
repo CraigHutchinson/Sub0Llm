@@ -18,7 +18,7 @@ struct MathResult {
 
 struct RouteInfo {
     std::vector<RouteType> routes;   // per-token hard route decision
-    std::vector<float>     entropy;  // per-token softmax entropy (nats, max=ln(6)≈1.79)
+    std::vector<float>     entropy;  // per-token softmax entropy (nats, max=ln(8)≈2.08)
 };
 
 // Apply exact arithmetic for the given RouteType.
