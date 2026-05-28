@@ -187,6 +187,38 @@ TEST_CASE("apply_math_op: IsLessThan false") {
     REQUIRE_FALSE(r.is_overflow);
 }
 
+// ── apply_math_op: IsGreaterThan ──────────────────────────────────────────────
+
+TEST_CASE("apply_math_op: IsGreaterThan true") {
+    auto r = apply_math_op(RouteType::IsGreaterThan, 7.f, 3.f);
+    REQUIRE(r.value == Catch::Approx(1.0f));
+    REQUIRE_FALSE(r.is_nan);
+    REQUIRE_FALSE(r.is_overflow);
+}
+
+TEST_CASE("apply_math_op: IsGreaterThan false") {
+    auto r = apply_math_op(RouteType::IsGreaterThan, 3.f, 7.f);
+    REQUIRE(r.value == Catch::Approx(0.0f));
+    REQUIRE_FALSE(r.is_nan);
+    REQUIRE_FALSE(r.is_overflow);
+}
+
+// ── apply_math_op: IsEqual ────────────────────────────────────────────────────
+
+TEST_CASE("apply_math_op: IsEqual true") {
+    auto r = apply_math_op(RouteType::IsEqual, 5.f, 5.f);
+    REQUIRE(r.value == Catch::Approx(1.0f));
+    REQUIRE_FALSE(r.is_nan);
+    REQUIRE_FALSE(r.is_overflow);
+}
+
+TEST_CASE("apply_math_op: IsEqual false") {
+    auto r = apply_math_op(RouteType::IsEqual, 5.f, 6.f);
+    REQUIRE(r.value == Catch::Approx(0.0f));
+    REQUIRE_FALSE(r.is_nan);
+    REQUIRE_FALSE(r.is_overflow);
+}
+
 // ── apply_math_op: overflow ───────────────────────────────────────────────────
 
 TEST_CASE("apply_math_op: overflow") {

@@ -10,13 +10,15 @@
 namespace sub0llm::nn {
 
 enum class RouteType : int {
-    FFN     = 0,
-    Add     = 1,
-    Sub     = 2,
-    Mul     = 3,
-    Div     = 4,
-    IsLessThan = 5,
-    N_TYPES = 6
+    FFN          = 0,
+    Add          = 1,
+    Sub          = 2,
+    Mul          = 3,
+    Div          = 4,
+    IsLessThan   = 5,
+    IsGreaterThan = 6,
+    IsEqual      = 7,
+    N_TYPES      = 8
 };
 
 inline constexpr int kNumRouteTypes = static_cast<int>(RouteType::N_TYPES);

@@ -29,8 +29,10 @@ TEST_CASE("RouteType values") {
     REQUIRE(static_cast<int>(RouteType::Sub)     == 2);
     REQUIRE(static_cast<int>(RouteType::Mul)     == 3);
     REQUIRE(static_cast<int>(RouteType::Div)     == 4);
-    REQUIRE(static_cast<int>(RouteType::IsLessThan) == 5);
-    REQUIRE(kNumRouteTypes == 6);
+    REQUIRE(static_cast<int>(RouteType::IsLessThan)    == 5);
+    REQUIRE(static_cast<int>(RouteType::IsGreaterThan) == 6);
+    REQUIRE(static_cast<int>(RouteType::IsEqual)       == 7);
+    REQUIRE(kNumRouteTypes == 8);
 }
 
 // ── NumericRouter: output shapes ─────────────────────────────────────────────
@@ -143,8 +145,11 @@ TEST_CASE("NumericRouter: gradient flows through soft_probs") {
     auto x = make_input(T, D);
     auto [soft_probs, hard_mask] = router.forward(x);
 
-    // Backpropagate through soft_probs
-    auto loss = sum(soft_probs);
+    // Penalise the class-0 probability for each token — sum(p_0 over T).
+    // Unlike sum(all soft_probs) which equals T (constant, zero gradient),
+    // a single class probability has a well-defined non-zero gradient through softmax.
+    auto prob_class0 = narrow(transpose2d(soft_probs), 0, 1);  // (1, T)
+    auto loss = sum(prob_class0);
     loss.backward();
 
     bool any_grad = false;

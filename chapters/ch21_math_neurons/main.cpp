@@ -103,9 +103,13 @@ static void section_math_ops() {
         {RouteType::Mul,     12.f,  5.f,  "Mul(12, 5)   "},
         {RouteType::Div,    100.f,  4.f,  "Div(100, 4)  "},
         {RouteType::Div,      7.f,  0.f,  "Div(7, 0)    "},
-        {RouteType::IsLessThan,  3.f,  7.f,  "IsLT(3, 7)   "},
-        {RouteType::IsLessThan,  7.f,  3.f,  "IsLT(7, 3)   "},
-        {RouteType::Mul,    300.f,300.f,  "Mul(300,300) "},
+        {RouteType::IsLessThan,    3.f,  7.f,  "IsLT(3, 7)   "},
+        {RouteType::IsLessThan,    7.f,  3.f,  "IsLT(7, 3)   "},
+        {RouteType::IsGreaterThan, 7.f,  3.f,  "IsGT(7, 3)   "},
+        {RouteType::IsGreaterThan, 3.f,  7.f,  "IsGT(3, 7)   "},
+        {RouteType::IsEqual,       5.f,  5.f,  "IsEq(5, 5)   "},
+        {RouteType::IsEqual,       5.f,  6.f,  "IsEq(5, 6)   "},
+        {RouteType::Mul,         300.f,300.f,  "Mul(300,300) "},
     };
 
     std::cout << std::format("  {:<16}  {:>8}  {:>8}  {:>8}\n",
@@ -1117,7 +1121,9 @@ static void section_large_numbers() {
             case RouteType::Sub:     ref = static_cast<int64_t>(c.a) - c.b; break;
             case RouteType::Mul:     ref = static_cast<int64_t>(c.a) * c.b; break;
             case RouteType::Div:     ref = (c.b == 0) ? 0 : c.a / c.b;     break;
-            case RouteType::IsLessThan: ref = (c.a < c.b) ? 1 : 0;            break;
+            case RouteType::IsLessThan:    ref = (c.a < c.b)  ? 1 : 0; break;
+            case RouteType::IsGreaterThan: ref = (c.a > c.b)  ? 1 : 0; break;
+            case RouteType::IsEqual:       ref = (c.a == c.b) ? 1 : 0; break;
             default: break;
         }
         if (ref < NumericTokenizer::kIntMin || ref > NumericTokenizer::kIntMax)
@@ -1415,6 +1421,21 @@ static ImprovedData build_improved_data() {
                           " = " + std::to_string(A < B ? 1 : 0));
         corpus_ops.push_back(RouteType::IsLessThan);
     }
+    // IsGreaterThan: A > B = 1 or 0, A,B ∈ [0,9]
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data), B = d09(rng_data);
+        corpus.push_back(std::to_string(A) + " > " + std::to_string(B) +
+                          " = " + std::to_string(A > B ? 1 : 0));
+        corpus_ops.push_back(RouteType::IsGreaterThan);
+    }
+    // IsEqual: A == B = 1 or 0; sample equal pairs for half to balance true/false
+    for (int i = 0; i < 100; ++i) {
+        int A = d09(rng_data);
+        int B = (i % 2 == 0) ? A : d09(rng_data);  // alternate equal/random
+        corpus.push_back(std::to_string(A) + " == " + std::to_string(B) +
+                          " = " + std::to_string(A == B ? 1 : 0));
+        corpus_ops.push_back(RouteType::IsEqual);
+    }
 
     auto bpe = BPETokenizer::train(corpus, 50);
     NumericTokenizer ntok(std::move(bpe));
@@ -1466,6 +1487,19 @@ static ImprovedData build_improved_data() {
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
                                    A < B ? 1 : 0, RouteType::IsLessThan});
         }
+        for (int i = 0; i < 20; ++i) {
+            int A = d(rng_t), B = d(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " > " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A > B ? 1 : 0, RouteType::IsGreaterThan});
+        }
+        for (int i = 0; i < 20; ++i) {
+            int A = d(rng_t);
+            int B = (i % 2 == 0) ? A : d(rng_t);
+            auto ids = ntok.encode(std::to_string(A) + " == " + std::to_string(B) + " =");
+            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                   A == B ? 1 : 0, RouteType::IsEqual});
+        }
     }
 
     std::vector<bool> is_active(static_cast<std::size_t>(V), false);
@@ -1475,7 +1509,7 @@ static ImprovedData build_improved_data() {
     for (const auto& item : test_items)
         for (auto id : item.prompt_ids)
             is_active[static_cast<std::size_t>(id)] = true;
-    // Cover all possible result values: Sub [-9,9], Add [0,18], IsLessThan [0,1],
+    // Cover all possible result values: Sub [-9,9], Add [0,18], comparisons [0,1],
     // Div [1,9], Mul [0,81]
     for (int v = -9; v <= 81; ++v)
         is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
@@ -1854,7 +1888,7 @@ static void section_improved_training(std::string_view phase,
 
     std::cout << "\n=== §21.9  Improved Specialisation: D=32, 5 ops, Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
-    std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan (500 training examples)\n";
+    std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual (700 training examples)\n";
     std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
                               sched_1cs.label());
     std::cout << std::format("  Phase 2Cs: full-vocab fine-tuning, supervision ({})\n",
