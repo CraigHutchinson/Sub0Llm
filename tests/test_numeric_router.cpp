@@ -29,7 +29,7 @@ TEST_CASE("RouteType values") {
     REQUIRE(static_cast<int>(RouteType::Sub)     == 2);
     REQUIRE(static_cast<int>(RouteType::Mul)     == 3);
     REQUIRE(static_cast<int>(RouteType::Div)     == 4);
-    REQUIRE(static_cast<int>(RouteType::Compare) == 5);
+    REQUIRE(static_cast<int>(RouteType::IsLessThan) == 5);
     REQUIRE(kNumRouteTypes == 6);
 }
 

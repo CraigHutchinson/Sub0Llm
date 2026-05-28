@@ -15,7 +15,7 @@ enum class RouteType : int {
     Sub     = 2,
     Mul     = 3,
     Div     = 4,
-    Compare = 5,
+    IsLessThan = 5,
     N_TYPES = 6
 };
 

@@ -170,18 +170,18 @@ TEST_CASE("apply_math_op: division by zero") {
     REQUIRE_FALSE(r.is_overflow);
 }
 
-// ── apply_math_op: compare ────────────────────────────────────────────────────
+// ── apply_math_op: IsLessThan ─────────────────────────────────────────────────
 // Convention: a = LEFT operand, b = RIGHT operand. Returns 1 if a < b, else 0.
 
-TEST_CASE("apply_math_op: compare less") {
-    auto r = apply_math_op(RouteType::Compare, 3.f, 7.f);
+TEST_CASE("apply_math_op: IsLessThan true") {
+    auto r = apply_math_op(RouteType::IsLessThan, 3.f, 7.f);
     REQUIRE(r.value == Catch::Approx(1.0f));
     REQUIRE_FALSE(r.is_nan);
     REQUIRE_FALSE(r.is_overflow);
 }
 
-TEST_CASE("apply_math_op: compare greater") {
-    auto r = apply_math_op(RouteType::Compare, 7.f, 3.f);
+TEST_CASE("apply_math_op: IsLessThan false") {
+    auto r = apply_math_op(RouteType::IsLessThan, 7.f, 3.f);
     REQUIRE(r.value == Catch::Approx(0.0f));
     REQUIRE_FALSE(r.is_nan);
     REQUIRE_FALSE(r.is_overflow);

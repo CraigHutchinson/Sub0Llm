@@ -34,7 +34,7 @@ MathResult apply_math_op(RouteType op, float a, float b) {
             if (std::abs(b) < 1e-9f)
                 return {0.0f, true, false};
             return overflow_check(std::round(a / b));
-        case RouteType::Compare:
+        case RouteType::IsLessThan:
             return {a < b ? 1.0f : 0.0f, false, false};
         case RouteType::FFN:
         default:
