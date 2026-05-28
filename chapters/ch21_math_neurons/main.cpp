@@ -1249,9 +1249,10 @@ static int load_latest_checkpoint(const std::vector<autograd::Variable*>& params
         const std::string fn = entry.path().filename().string();
         if (!fn.starts_with(prefix) || !fn.ends_with(".ckpt")) continue;
         try {
+            constexpr std::size_t kExtLen = std::string_view{".ckpt"}.size();
             const std::size_t start = prefix.size();
-            if (fn.size() <= start + 5) continue;  // no step digits between prefix and .ckpt
-            const std::size_t len   = fn.size() - start - 5;
+            if (fn.size() <= start + kExtLen) continue;  // no step digits between prefix and .ckpt
+            const std::size_t len   = fn.size() - start - kExtLen;
             int s = std::stoi(fn.substr(start, len));
             if (target_step > 0 && s > target_step) continue;
             if (s > best_step) { best_step = s; best_path = entry.path(); }
@@ -1805,6 +1806,12 @@ run_improved_phase_2cs(
     int  steps_since_eval = 0;
 
     const int eff_sched_total = (sched_total > 0) ? sched_total : total;
+
+    // Pre-allocate a reusable workspace for the scaled vocab bias; avoids a
+    // ~(T×V×4)-byte heap allocation on every training step.
+    Tensor sbias_workspace({d.bias_t_full.shape(0), d.V}, DType::Float32);
+    const float* bsrc = d.bias_t_full.data_as<float>().data();
+
     for (int step = start_step; step <= total; ++step) {
         const float cur_alpha = sched.alpha_at(step, eff_sched_total);
         const float cur_beta  = bias_sched.alpha_at(step, eff_sched_total);
@@ -1849,12 +1856,10 @@ run_improved_phase_2cs(
         Variable lfor_ce = ltrunc;
         if (cur_beta > 1e-4f) {
             const int64_t T_bias = std::min(T_loss, d.bias_t_full.shape(0));
-            Tensor sbias({T_bias, d.V}, DType::Float32);
-            const float* bsrc = d.bias_t_full.data_as<float>().data();
-            float*       bdst = sbias.data_as<float>().data();
+            float* bdst = sbias_workspace.data_as<float>().data();
             const std::size_t bn = static_cast<std::size_t>(T_bias * d.V);
             for (std::size_t j = 0; j < bn; ++j) bdst[j] = bsrc[j] * cur_beta;
-            lfor_ce = add(ltrunc, Variable(sbias, false));
+            lfor_ce = add(ltrunc, narrow(Variable(sbias_workspace, false), 0, T_bias));
         }
         auto L_ce = cross_entropy(lfor_ce, make_targets(ids));
 
