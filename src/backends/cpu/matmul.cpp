@@ -7,6 +7,21 @@
 #  include <immintrin.h>
 #endif
 
+#if defined(SUB0LLM_BLAS)
+// System BLAS (OpenBLAS, MKL, Apple Accelerate, …) via find_package(BLAS)
+extern "C" {
+void cblas_sgemm(int Order, int TransA, int TransB,
+                 int M, int N, int K,
+                 float alpha, const float* A, int lda,
+                 const float* B, int ldb,
+                 float beta, float* C, int ldc);
+}
+constexpr int CblasRowMajor = 101, CblasNoTrans = 111;
+#elif defined(SUB0LLM_EIGEN)
+// Eigen3 — header-only, fetched via CPM; no CBLAS/Fortran dependency
+#  include <Eigen/Core>
+#endif
+
 // ── Cache-blocked matmul ──────────────────────────────────────────────────────
 // The naive O(M·N·K) triple loop has terrible cache behaviour for large matrices
 // because the inner loop strides across B with step N (cache-unfriendly).
@@ -94,8 +109,30 @@ void matmul_scalar_blocked(const float* A, const float* B, float* C,
 
 } // anonymous namespace
 
+// Dispatch strategy (priority: BLAS > Eigen > AVX2 > scalar):
+//   K < 64  → AVX2/scalar  (matrix fits in L1/L2; BLAS call overhead dominates)
+//   K >= 64 → BLAS or Eigen (optimal for larger D values used in future chapters)
 void matmul_f32(const float* A, const float* B, float* C,
                 std::size_t M, std::size_t N, std::size_t K) noexcept {
+#if defined(SUB0LLM_BLAS)
+    if (K >= 64) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    1.0f, A, static_cast<int>(K),
+                          B, static_cast<int>(N),
+                    0.0f, C, static_cast<int>(N));
+        return;
+    }
+#elif defined(SUB0LLM_EIGEN)
+    if (K >= 64) {
+        using RowMat = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<const RowMat> Am(A, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(K));
+        Eigen::Map<const RowMat> Bm(B, static_cast<Eigen::Index>(K), static_cast<Eigen::Index>(N));
+        Eigen::Map<RowMat>       Cm(C, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(N));
+        Cm.noalias() = Am * Bm;
+        return;
+    }
+#endif
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
     matmul_tile_avx2(A, B, C, M, N, K);
 #else

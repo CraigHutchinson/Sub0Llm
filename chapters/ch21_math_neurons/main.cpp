@@ -1230,8 +1230,11 @@ static void save_checkpoint(const std::vector<autograd::Variable*>& params,
 }
 
 // Returns step stored in the latest checkpoint for this phase, or -1 if none found.
+// If target_step > 0, only checkpoints with step <= target_step are considered
+// (useful for replaying an earlier milestone without running to the end).
 static int load_latest_checkpoint(const std::vector<autograd::Variable*>& params,
-                                   std::string_view phase, std::string_view ckpt_dir)
+                                   std::string_view phase, std::string_view ckpt_dir,
+                                   int target_step = 0)
 {
     namespace fs = std::filesystem;
     if (!fs::is_directory(ckpt_dir)) return -1;
@@ -1248,6 +1251,7 @@ static int load_latest_checkpoint(const std::vector<autograd::Variable*>& params
             const std::size_t start = prefix.size();
             const std::size_t len   = fn.size() - start - 5;
             int s = std::stoi(fn.substr(start, len));
+            if (target_step > 0 && s > target_step) continue;
             if (s > best_step) { best_step = s; best_path = entry.path(); }
         } catch (...) {}
     }
@@ -1847,8 +1851,11 @@ run_improved_phase_2cs(
 // ── Standalone evaluation ─────────────────────────────────────────────────────
 // Load the Phase 2Cs checkpoint and print the summary table.
 
-static void run_improved_eval(std::string_view ckpt_dir) {
-    std::cout << "\n  Eval — loading Phase 2Cs checkpoint\n";
+static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0) {
+    if (ckpt_step > 0)
+        std::cout << std::format("\n  Eval — loading Phase 2Cs checkpoint at step {}\n", ckpt_step);
+    else
+        std::cout << "\n  Eval — loading Phase 2Cs checkpoint (latest)\n";
 
     ImprovedData d = build_improved_data();
     MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
@@ -1856,9 +1863,9 @@ static void run_improved_eval(std::string_view ckpt_dir) {
 
     auto all_params = model.parameters();
     // Prefer supervised checkpoint; fall back to unsupervised for older runs
-    int loaded_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir);
+    int loaded_step = load_latest_checkpoint(all_params, "2cs_sup", ckpt_dir, ckpt_step);
     if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir);
+        loaded_step = load_latest_checkpoint(all_params, "2cs", ckpt_dir, ckpt_step);
     if (loaded_step < 0)
         throw std::runtime_error(
             "Phase 2Cs checkpoint not found.\n"
@@ -1884,7 +1891,8 @@ static void run_improved_eval(std::string_view ckpt_dir) {
 
 static void section_improved_training(std::string_view phase,
                                        std::string_view ckpt_dir,
-                                       int steps = 0)  // 0 = use phase default
+                                       int steps = 0,      // 0 = use phase default
+                                       int ckpt_step = 0)  // 0 = load latest checkpoint
 {
     // Phase supervision schedules
     const SupervisionSchedule sched_1cs{SupProfile::Flat,        kAlpha, kAlpha};
@@ -1900,7 +1908,7 @@ static void section_improved_training(std::string_view phase,
     std::cout << std::format("  checkpoint directory: {}\n", ckpt_dir);
 
     if (phase == "eval") {
-        run_improved_eval(ckpt_dir);
+        run_improved_eval(ckpt_dir, ckpt_step);
         return;
     }
 
@@ -1948,16 +1956,18 @@ static void section_improved_training(std::string_view phase,
 //   ./ch21_math_neurons --phase 2cs --ckpt-dir /tmp/ckpts --steps 4000
 
 int main(int argc, char* argv[]) {
-    std::string phase    = "all";
-    std::string ckpt_dir = ".";
-    int         steps    = 0;  // 0 = use phase default (1000 / 2000)
+    std::string phase     = "all";
+    std::string ckpt_dir  = ".";
+    int         steps     = 0;  // 0 = use phase default (1000 / 5000)
+    int         ckpt_step = 0;  // 0 = load latest checkpoint; >0 = load <= this step
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
-        if      (arg == "--phase"    && i + 1 < argc) { phase    = argv[++i]; }
-        else if (arg == "--ckpt-dir" && i + 1 < argc) { ckpt_dir = argv[++i]; }
-        else if (arg == "--steps"    && i + 1 < argc) { steps    = std::stoi(argv[++i]); }
-        else if (!arg.starts_with("--"))               { phase    = std::string(arg); }
+        if      (arg == "--phase"     && i + 1 < argc) { phase     = argv[++i]; }
+        else if (arg == "--ckpt-dir"  && i + 1 < argc) { ckpt_dir  = argv[++i]; }
+        else if (arg == "--steps"     && i + 1 < argc) { steps     = std::stoi(argv[++i]); }
+        else if (arg == "--ckpt-step" && i + 1 < argc) { ckpt_step = std::stoi(argv[++i]); }
+        else if (!arg.starts_with("--"))                { phase     = std::string(arg); }
     }
 
     std::cout << "Chapter 21 — Math Neurons: Arithmetic-Aware Transformers\n";
@@ -1976,7 +1986,7 @@ int main(int argc, char* argv[]) {
         section_large_numbers();
     }
 
-    section_improved_training(phase, ckpt_dir, steps);
+    section_improved_training(phase, ckpt_dir, steps, ckpt_step);
 
     std::cout << "\nDone.\n";
     return 0;

@@ -8,6 +8,13 @@ option(SUB0LLM_BUILD_TESTS    "Build test suite"               ON)
 option(SUB0LLM_ENABLE_CUDA      "Enable CUDA backend (requires NVIDIA GPU + toolkit)" OFF)
 option(SUB0LLM_ENABLE_OPENVINO  "Enable OpenVINO backend (requires Intel OpenVINO)"   OFF)
 
+# ── Accelerator / matmul back-ends ───────────────────────────────────────────
+# Priority: BLAS (system) > Eigen (CPM) > AVX2 intrinsics > scalar blocked.
+# BLAS is tried first via find_package; Eigen is fetched via CPM as a portable
+# C++-only alternative with no Fortran dependency.  Both are gated on minimum
+# matrix size (K >= 64) so small-D experiments still use the fast AVX2 path.
+option(SUB0LLM_ENABLE_EIGEN     "Fetch Eigen3 via CPM for large-matrix matmul" ON)
+
 # ── SIMD / architecture options ──────────────────────────────────────────────
 # SUB0LLM_ENABLE_NATIVE: use -march=native -mtune=native; subsumes AVX2/AVX-512
 # options and auto-detects all ISA extensions for compile-time dispatch macros.

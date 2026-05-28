@@ -56,8 +56,15 @@ target_link_libraries(sub0llm
         nlohmann_json::nlohmann_json
     PRIVATE
         $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
+        $<$<BOOL:${SUB0LLM_EIGEN_AVAILABLE}>:Eigen3::Eigen>
         $<$<BOOL:${SUB0LLM_ENABLE_CUDA}>:CUDA::cublas CUDA::curand CUDA::cudart>
         $<$<BOOL:${SUB0LLM_ENABLE_OPENVINO}>:openvino::runtime>
+)
+
+# Propagate BLAS/Eigen availability as compile definitions for dispatch in matmul.cpp
+target_compile_definitions(sub0llm PRIVATE
+    $<$<BOOL:${BLAS_FOUND}>:SUB0LLM_BLAS>
+    $<$<BOOL:${SUB0LLM_EIGEN_AVAILABLE}>:SUB0LLM_EIGEN>
 )
 
 target_compile_features(sub0llm PUBLIC cxx_std_23)
