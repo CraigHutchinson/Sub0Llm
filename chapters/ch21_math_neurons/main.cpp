@@ -3029,6 +3029,59 @@ static ImprovedData build_advanced_algebraic_data() {
                         std::move(test_items), {}, std::move(bias_t_full)};
 }
 
+// ── §21.13: Advanced algebraic data v3 — more Sqrt, stable boost ─────────────
+// Differences vs v2:
+//  • Sqrt single-step: r=0..20, 12 copies each (240 items vs 64 in v2)
+//    → ~300 Sqrt-supervised gradient updates in 2000 steps (6× v2)
+//  • OOD Sqrt test: r=21..26 (441..676) — larger than all training squares
+//  • Training uses boost=15 (stable); eval uses boost=50 (fixes chain OOD)
+static ImprovedData build_advanced_algebraic_data_v3() {
+    // Start from v2 data, then override/extend Sqrt items.
+    ImprovedData base = build_advanced_algebraic_data();
+
+    // Re-encode the extended Sqrt items on the same tokenizer.
+    // Remove old Sqrt test entries (r=14..20, all single-step Sqrt).
+    // v2 OOD Sqrt was: 14,15,16,17,18,20  → 6 items
+    {
+        std::vector<TestItemImproved> kept;
+        kept.reserve(base.test_items.size());
+        for (auto& item : base.test_items)
+            if (item.expected_op != RouteType::Sqrt)
+                kept.push_back(std::move(item));
+        base.test_items = std::move(kept);
+    }
+
+    // Add OOD Sqrt test: r=21..26 (values 441, 484, 529, 576, 625, 676)
+    for (int r = 21; r <= 26; ++r) {
+        auto ids = base.ntok.encode("sqrt ( " + std::to_string(r * r) + " ) =");
+        if (!ids.empty())
+            base.test_items.push_back(
+                {{ids.begin(), ids.end()}, r, RouteType::Sqrt});
+    }
+
+    // Add Sqrt training items for r=0..20 (252 total after v2's 64).
+    // r=0..15 already exist in v2 (64 items): add 8 more each (→ 12 per r).
+    // r=16..20 are new: add 12 each.
+    for (int r = 0; r <= 20; ++r) {
+        int sq = r * r;
+        int extra = (r <= 15) ? 8 : 12;   // 4 existing + 8 extra = 12; or 12 fresh
+        for (int rep = 0; rep < extra; ++rep) {
+            auto ids = base.ntok.encode(
+                "sqrt ( " + std::to_string(sq) + " ) = " + std::to_string(r));
+            if (ids.size() < 2) continue;
+            base.train_ids.push_back({ids.begin(), ids.end()});
+            base.train_ops.push_back(RouteType::Sqrt);
+        }
+    }
+
+    return base;
+}
+
+// ── Shared op-name table (must stay in sync with RouteType enum) ─────────────
+
+static constexpr std::array<std::string_view, kNumRouteTypes> kOpNames{
+    "FFN","Add","Sub","Mul","Div","IsLT","IsGT","IsEq","Inc","Dec","Sqrt"};
+
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
 static void section_improved_training(std::string_view phase,
@@ -3173,6 +3226,267 @@ static void section_improved_training(std::string_view phase,
         auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
         std::cout << std::format("\n  §21.12 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
                                   acc * 100.f, spec * 100.f, ent);
+        return;
+    }
+
+    if (phase == "eval_alg2") {
+        std::cout << "\n  §21.12 Eval: per-op accuracy breakdown on alg2 OOD test set\n";
+        ImprovedData d = build_advanced_algebraic_data();
+        std::cout << std::format("  test set: {} items\n", d.test_items.size());
+
+        // Use a larger math_boost at eval time to test if chain Add failures are due to
+        // LM logit domination over the injected result signal.
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42, 50.0f);
+        auto params = model.parameters();
+        int step = load_latest_checkpoint(params, "train_alg2", ckpt_dir, ckpt_step);
+        if (step < 0)
+            throw std::runtime_error(std::format("No train_alg2 checkpoint in {}", ckpt_dir));
+        std::cout << std::format("  loaded checkpoint step {} (eval boost=50.0)\n\n", step);
+
+        // Per-op tallies + up to 3 failure samples per op
+        std::array<int, kNumRouteTypes> op_ok{};
+        std::array<int, kNumRouteTypes> op_tot{};
+        std::array<int, kNumRouteTypes> fail_shown{};
+
+        for (const auto& item : d.test_items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor ids_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(ids_t, d.ntok, TokenMode::Algebraic);
+
+            const int64_t last = logits.data().shape(0) - 1;
+            auto lsp = logits.data().data_as<float>();
+            int64_t best = 0;
+            float best_v = lsp[static_cast<std::size_t>(last * d.V)];
+            for (int64_t v = 1; v < d.V; ++v) {
+                float val = lsp[static_cast<std::size_t>(last * d.V + v)];
+                if (val > best_v) { best_v = val; best = v; }
+            }
+
+            const auto op_idx = static_cast<std::size_t>(item.expected_op);
+            ++op_tot[op_idx];
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            const bool correct = d.ntok.is_numeric(pred_id) &&
+                !d.ntok.is_nan_token(pred_id) && !d.ntok.is_overflow_token(pred_id) &&
+                static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val;
+            if (correct) { ++op_ok[op_idx]; continue; }
+
+            // Print up to 3 failure samples per op with route info
+            if (fail_shown[op_idx] < 3) {
+                RouteInfo ri = model.route_info(ids_t, d.ntok, TokenMode::Algebraic);
+                std::string_view chosen_op = (ri.routes.empty())
+                    ? "?" : kOpNames[static_cast<std::size_t>(ri.routes.back())];
+                std::string pred_str = d.ntok.is_numeric(pred_id)
+                    ? std::to_string(static_cast<int32_t>(d.ntok.numeric_value(pred_id)))
+                    : "non-numeric";
+                std::cout << std::format("  [{}] routed={} pred={} expected={}\n",
+                    kOpNames[op_idx], chosen_op, pred_str, item.expected_val);
+                ++fail_shown[op_idx];
+            }
+        }
+
+        // Print breakdown
+        std::cout << "\n";
+        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>8}\n", "op", "ok", "total", "acc%");
+        std::cout << "  " << std::string(35, '-') << "\n";
+        int grand_ok = 0, grand_tot = 0;
+        for (std::size_t k = 0; k < kNumRouteTypes; ++k) {
+            if (op_tot[k] == 0) continue;
+            float acc_k = static_cast<float>(op_ok[k]) / static_cast<float>(op_tot[k]) * 100.f;
+            std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n",
+                                      kOpNames[k], op_ok[k], op_tot[k], acc_k);
+            grand_ok += op_ok[k]; grand_tot += op_tot[k];
+        }
+        std::cout << "  " << std::string(35, '-') << "\n";
+        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n\n",
+                                  "TOTAL", grand_ok, grand_tot,
+                                  static_cast<float>(grand_ok)/static_cast<float>(grand_tot)*100.f);
+        return;
+    }
+
+    if (phase == "train_alg3") {
+        const int total_t = (steps > 0) ? steps : 2000;
+        const SupervisionSchedule sched_alg3{SupProfile::CosineDecay, 0.5f, 0.05f};
+        std::cout << "\n  §21.13 Advanced algebraic training v3 — more Sqrt + boost=50\n";
+        std::cout << std::format("  supervision α: {}  target: {} steps\n",
+                                  sched_alg3.label(), total_t);
+
+        ImprovedData d = build_advanced_algebraic_data_v3();
+        std::cout << std::format("  training corpus: {} items  test set: {} items\n",
+                                  d.train_ids.size(), d.test_items.size());
+
+        // Training with stable boost=15 (same as alg2); eval_alg3 uses boost=50 for OOD chain.
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        auto all_params = model.parameters();
+        Adam adam(all_params, 2e-3f);  // slightly lower LR: more Sqrt data shifts gradient balance
+
+        const std::string prefix     = "train_alg3";
+        int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
+        if (start_step >= total_t) {
+            auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+            std::cout << std::format("  Already complete — acc={:.1f}%  spec={:.1f}%  ent={:.2f}\n",
+                                      acc*100.f, spec*100.f, ent);
+            return;
+        }
+        start_step = std::max(start_step, -1) + 1;
+
+        const int ckpt_iv = 200;
+        std::mt19937 rng(55);
+        for (int i = 0; i < start_step; ++i) rng();
+
+        print_train_header(/*show_alpha=*/true);
+        float last_loss = 0.f;
+        auto  t_phase   = std::chrono::steady_clock::now();
+        int   steps_since_eval = 0;
+        float best_acc  = -1.f;
+        int   best_step = -1;
+
+        for (int step = start_step; step <= total_t; ++step) {
+            const float cur_alpha = sched_alg3.alpha_at(step, total_t);
+            if (step % std::max(1, total_t / 5) == 0 || step == start_step) {
+                float ms = 0.f;
+                if (steps_since_eval > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                         / static_cast<float>(steps_since_eval);
+                    t_phase = now; steps_since_eval = 0;
+                }
+                auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+                print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
+                if (acc > best_acc && step > 0) {
+                    best_acc = acc; best_step = step;
+                    save_checkpoint(all_params,
+                        std::filesystem::path(ckpt_dir) /
+                            std::format("ch21_{}_best_step{:04d}.ckpt", prefix, step), step);
+                }
+            }
+            if (step == total_t) {
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+                break;
+            }
+            if (step > start_step && step % ckpt_iv == 0)
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+
+            const std::size_t idx   = rng() % d.train_ids.size();
+            const auto&       ids   = d.train_ids[idx];
+            const RouteType   gt_op = d.train_ops[idx];
+            if (ids.size() < 2) { --step; continue; }
+
+            Tensor id_tensor = make_ids_tensor(ids);
+            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
+
+            Tensor alpha_t({1}, DType::Float32);
+            alpha_t.data_as<float>()[0] = cur_alpha;
+
+            adam.zero_grad();
+            auto logits  = model.forward_math(id_tensor, d.ntok, TokenMode::Algebraic);
+            auto ltrunc  = narrow(logits, 0, T_loss);
+            auto L_ce    = cross_entropy(ltrunc, make_targets(ids));
+
+            Tensor gt_t({1}, DType::Int32);
+            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+            auto rlogits  = model.router_logits(id_tensor, d.ntok, TokenMode::Algebraic);
+            auto L_sup    = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
+
+            // 2× supervision weight for Sqrt to compensate for its relative rarity.
+            const float sup_scale = (gt_op == RouteType::Sqrt) ? 2.0f : 1.0f;
+            Tensor sup_scale_t({1}, DType::Float32);
+            sup_scale_t.data_as<float>()[0] = cur_alpha * sup_scale;
+
+            auto L_total  = add(L_ce, mul(Variable(sup_scale_t, false), L_sup));
+
+            L_total.backward();
+            (void)clip_grad_norm(all_params, 1.0f);
+            adam.step();
+            last_loss = L_total.data().data_as<float>()[0];
+            ++steps_since_eval;
+        }
+
+        auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+        std::cout << std::format("\n  §21.13 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+                                  acc * 100.f, spec * 100.f, ent);
+        std::cout << std::format("  best checkpoint: step {} ({:.1f}%) — ch21_{}_best_step{:04d}.ckpt\n",
+                                  best_step, best_acc * 100.f, prefix, best_step);
+        return;
+    }
+
+    if (phase == "eval_alg3") {
+        std::cout << "\n  §21.13 Eval: per-op accuracy breakdown on alg3 OOD test set\n";
+        ImprovedData d = build_advanced_algebraic_data_v3();
+        std::cout << std::format("  test set: {} items\n", d.test_items.size());
+
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42, 50.0f);
+        auto params = model.parameters();
+        // Prefer the best-accuracy checkpoint; fall back to latest if not found.
+        int step = load_latest_checkpoint(params, "train_alg3_best", ckpt_dir, ckpt_step);
+        const bool used_best = (step >= 0);
+        if (step < 0)
+            step = load_latest_checkpoint(params, "train_alg3", ckpt_dir, ckpt_step);
+        if (step < 0)
+            throw std::runtime_error(std::format("No train_alg3 checkpoint in {}", ckpt_dir));
+        std::cout << std::format("  loaded {} checkpoint step {} (boost=50.0)\n\n",
+                                  used_best ? "best" : "latest", step);
+
+        std::array<int, kNumRouteTypes> op_ok{};
+        std::array<int, kNumRouteTypes> op_tot{};
+        std::array<int, kNumRouteTypes> fail_shown{};
+
+        for (const auto& item : d.test_items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor ids_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(ids_t, d.ntok, TokenMode::Algebraic);
+
+            const int64_t last = logits.data().shape(0) - 1;
+            auto lsp = logits.data().data_as<float>();
+            int64_t best = 0;
+            float best_v = lsp[static_cast<std::size_t>(last * d.V)];
+            for (int64_t v = 1; v < d.V; ++v) {
+                float val = lsp[static_cast<std::size_t>(last * d.V + v)];
+                if (val > best_v) { best_v = val; best = v; }
+            }
+
+            const auto op_idx = static_cast<std::size_t>(item.expected_op);
+            ++op_tot[op_idx];
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            const bool correct = d.ntok.is_numeric(pred_id) &&
+                !d.ntok.is_nan_token(pred_id) && !d.ntok.is_overflow_token(pred_id) &&
+                static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val;
+            if (correct) { ++op_ok[op_idx]; continue; }
+
+            if (fail_shown[op_idx] < 3) {
+                RouteInfo ri = model.route_info(ids_t, d.ntok, TokenMode::Algebraic);
+                std::string_view chosen_op = ri.routes.empty()
+                    ? "?" : kOpNames[static_cast<std::size_t>(ri.routes.back())];
+                std::string pred_str = d.ntok.is_numeric(pred_id)
+                    ? std::to_string(static_cast<int32_t>(d.ntok.numeric_value(pred_id)))
+                    : "non-numeric";
+                std::cout << std::format("  [{}] routed={} pred={} expected={}\n",
+                    kOpNames[op_idx], chosen_op, pred_str, item.expected_val);
+                ++fail_shown[op_idx];
+            }
+        }
+
+        std::cout << "\n";
+        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>8}\n", "op", "ok", "total", "acc%");
+        std::cout << "  " << std::string(35, '-') << "\n";
+        int grand_ok = 0, grand_tot = 0;
+        for (std::size_t k = 0; k < kNumRouteTypes; ++k) {
+            if (op_tot[k] == 0) continue;
+            float acc_k = static_cast<float>(op_ok[k]) / static_cast<float>(op_tot[k]) * 100.f;
+            std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n",
+                                      kOpNames[k], op_ok[k], op_tot[k], acc_k);
+            grand_ok += op_ok[k]; grand_tot += op_tot[k];
+        }
+        std::cout << "  " << std::string(35, '-') << "\n";
+        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n\n",
+                                  "TOTAL", grand_ok, grand_tot,
+                                  static_cast<float>(grand_ok)/static_cast<float>(grand_tot)*100.f);
         return;
     }
 
@@ -3519,6 +3833,15 @@ static void section_generalization_test(
         auto p    = alg_model.parameters();
         int  step = load_latest_checkpoint(p, "train_chain_alg", alg_ckpt_dir);
         const bool chained = (step >= 0);
+        if (step < 0) {
+            // train_alg3 may have a different embedding V (vocab_size=70 BPE); try, skip on mismatch.
+            try { step = load_latest_checkpoint(p, "train_alg3_best", alg_ckpt_dir); }
+            catch (...) { step = -1; }
+        }
+        if (step < 0) {
+            try { step = load_latest_checkpoint(p, "train_alg3", alg_ckpt_dir); }
+            catch (...) { step = -1; }
+        }
         if (step < 0)
             step = load_latest_checkpoint(p, "train_alg", alg_ckpt_dir);
         if (step < 0)
@@ -3562,9 +3885,9 @@ static void section_generalization_test(
                               total);
 
     // Per-op breakdown for the Chained tier (last tier)
-    static constexpr std::array<std::string_view, kNumRouteTypes> kOpNames = {
+    static constexpr std::array<std::string_view, kNumRouteTypes> kOpNamesLong = {
         "FFN", "Add", "Sub", "Mul", "Div",
-        "IsLessThan", "IsGreaterThan", "IsEqual", "Increment", "Decrement"
+        "IsLessThan", "IsGreaterThan", "IsEqual", "Increment", "Decrement", "Sqrt"
     };
     const auto& chain_real = real_r.back();
     const auto& chain_alg  = alg_r.back();
@@ -3579,7 +3902,7 @@ static void section_generalization_test(
         const float a_acc = static_cast<float>(chain_alg.op_ok[k]) /
                             static_cast<float>(chain_alg.op_tot[k]);
         std::cout << std::format("  {:>14}  {:>13.1f}%  {:>13.1f}%  {:>11}\n",
-                                  kOpNames[k], r_acc * 100.f, a_acc * 100.f,
+                                  kOpNamesLong[k], r_acc * 100.f, a_acc * 100.f,
                                   chain_real.op_tot[k]);
     }
 }
@@ -3648,6 +3971,8 @@ int main(int argc, char* argv[]) {
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
     const bool improved_only = (phase == "train" || phase == "train_alg2" ||
+                                 phase == "train_alg3" ||
+                                 phase == "eval_alg2" || phase == "eval_alg3" ||
                                  phase == "train_chain" ||
                                  phase == "1cs"   || phase == "2cs" ||
                                  phase == "eval"  || phase == "spot");
