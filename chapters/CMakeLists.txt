@@ -19,4 +19,5 @@ add_subdirectory(ch18_moe)
 add_subdirectory(ch19_mtp)
 add_subdirectory(ch20_rlhf)
 add_subdirectory(ch21_math_neurons)
+add_subdirectory(ch22_math_lm)
 # Chapters are added here as they are written.

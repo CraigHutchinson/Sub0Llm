@@ -59,7 +59,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch21, complete)
+## Current state (Ch01–Ch22, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -98,13 +98,14 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - `include/sub0llm/nn/moe.hpp` — `MoEFeedForward`, `MoETransformerBlock`, `MoEGPT`: sparse top-k expert routing + load-balancing loss (Ch18)
 - `include/sub0llm/nn/mtp.hpp` — `mtp_train_loss`, `mtp_generate`, `mtp_generate_stats`, `MtpGenStats`: Multi-Token Prediction — K+1 tokens per forward pass (Ch19)
 - `include/sub0llm/nn/rlhf.hpp` — `RewardModel`, `reward_preference_loss`, `reinforce_loss`, `kl_penalty`: RLHF with Bradley-Terry preference training and KL-penalised REINFORCE (Ch20)
-- `include/sub0llm/nn/math_nodes.hpp`, `src/nn/math_nodes.cpp` — `MathLayer`, `MathGPT`, `NumericRouter`: arithmetic-aware transformer with STE routing over 8 ops (FFN, Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual); `apply_math_op`, `RouteType`, `RouteInfo`, `SupervisionSchedule` (Ch21)
+- `include/sub0llm/nn/math_nodes.hpp`, `src/nn/math_nodes.cpp` — `MathLayer`, `MathGPT`, `NumericRouter`: arithmetic-aware transformer with STE routing over 11 ops (FFN, Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual, Increment, Decrement, Sqrt); `apply_math_op`, `RouteType`, `RouteInfo`; configurable integer range via `NumericTokenizer(bpe, int_min, int_max)` (Ch21)
+- `chapters/ch22_math_lm/` — General-purpose MathLM: parameter efficiency analysis, configurable int range (beyond int16), OOD generalization proof (exact compute vs memorization), mixed language+arithmetic training (Ch22)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
 
 ### Tests
-415 Catch2 tests across 22 test files — all passing.
+417 Catch2 tests across 22 test files — all passing.
 
 ## Git branch
 
