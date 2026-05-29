@@ -228,6 +228,23 @@ TEST_CASE("apply_math_op: overflow") {
     REQUIRE_FALSE(r.is_nan);
 }
 
+// ── apply_math_op: Sqrt ───────────────────────────────────────────────────────
+
+TEST_CASE("apply_math_op: Sqrt perfect squares") {
+    // Sqrt is unary: b = operand, a is unused (convention: a=0)
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f,  0.f).value == Catch::Approx(0.f));
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f,  1.f).value == Catch::Approx(1.f));
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f,  4.f).value == Catch::Approx(2.f));
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f,  9.f).value == Catch::Approx(3.f));
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f, 25.f).value == Catch::Approx(5.f));
+    REQUIRE(apply_math_op(RouteType::Sqrt, 0.f, 100.f).value == Catch::Approx(10.f));
+}
+
+TEST_CASE("apply_math_op: Sqrt negative is NaN") {
+    auto r = apply_math_op(RouteType::Sqrt, 0.f, -1.f);
+    REQUIRE(r.is_nan);
+}
+
 // ── MathLayer: forward shape ──────────────────────────────────────────────────
 
 TEST_CASE("MathLayer: forward shape") {

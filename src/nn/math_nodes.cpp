@@ -47,6 +47,9 @@ MathResult apply_math_op(RouteType op, float a, float b) {
             return overflow_check(b + 1.0f);
         case RouteType::Decrement:
             return overflow_check(b - 1.0f);
+        case RouteType::Sqrt:
+            if (b < -1e-6f) return {0.0f, true, false};  // negative → NaN
+            return overflow_check(std::round(std::sqrt(std::max(0.0f, b))));
         case RouteType::FFN:
         default:
             return {0.0f, true, false};
@@ -155,7 +158,8 @@ MathLayer::forward_with_boost(
     for (int k = 1; k < kNumRouteTypes; ++k) {
         const RouteType route_k = static_cast<RouteType>(k);
         const bool is_unary = (route_k == RouteType::Increment ||
-                               route_k == RouteType::Decrement);
+                               route_k == RouteType::Decrement ||
+                               route_k == RouteType::Sqrt);
 
         // One-hot (T, V): row t has 1.0 at result token position when result is valid.
         // Invalid positions (NaN/overflow/missing operand) leave the row all-zero so

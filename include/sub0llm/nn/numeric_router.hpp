@@ -22,7 +22,8 @@ enum class RouteType : int {
     // ++ / -- prefix notation — model must route based on the operator token alone.
     Increment     = 8,   // ++x  →  x + 1
     Decrement     = 9,   // --x  →  x - 1
-    N_TYPES       = 10
+    Sqrt          = 10,  // sqrt ( x )  →  round(√x)  exact for perfect squares
+    N_TYPES       = 11
 };
 
 inline constexpr int kNumRouteTypes = static_cast<int>(RouteType::N_TYPES);

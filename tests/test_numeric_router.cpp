@@ -34,7 +34,8 @@ TEST_CASE("RouteType values") {
     REQUIRE(static_cast<int>(RouteType::IsEqual)       == 7);
     REQUIRE(static_cast<int>(RouteType::Increment)     == 8);
     REQUIRE(static_cast<int>(RouteType::Decrement)     == 9);
-    REQUIRE(kNumRouteTypes == 10);
+    REQUIRE(static_cast<int>(RouteType::Sqrt)          == 10);
+    REQUIRE(kNumRouteTypes == 11);
 }
 
 // ── NumericRouter: output shapes ─────────────────────────────────────────────

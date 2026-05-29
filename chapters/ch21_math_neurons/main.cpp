@@ -2565,6 +2565,470 @@ static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0,
                               acc * 100.f, spec * 100.f, ent);
 }
 
+// ── §21.12  Advanced Algebraic Training Dataset ───────────────────────────────
+//
+// Inspired by the structure of the DeepMind Mathematics Dataset (Saxton et al.,
+// 2019) — arithmetic, algebra, mixed expressions — but purpose-built for the
+// Algebraic token mode.  Key design principles:
+//
+//   • Expression diversity over value diversity — Algebraic mode renders all
+//     values as abstract slots (X0, X1, …), so only the structural pattern
+//     matters.  We maximise template variety, not numeric range.
+//
+//   • Chains from the start — no separate fine-tuning step needed.  Two-step
+//     and three-step chains (like the §21.11 fix) are first-class training items.
+//
+//   • Standard formulae as compositional anchors — Celsius→Fahrenheit,
+//     triangle area, Pythagorean triples, etc. provide naturally chained
+//     real-world patterns that bind operation sequences to semantic meaning.
+//
+//   • Sqrt as a new unary op — perfect-square inputs; the router must learn
+//     to detect "sqrt ( ... )" context distinctly from binary ops.
+//
+//   • Mixed-operator order-of-operations chains — A*B+C, A+B*C expressed
+//     as sub-expression chains, teaching the router that the last operator
+//     before '=' is always the one being requested.
+
+static ImprovedData build_advanced_algebraic_data() {
+    std::mt19937 rng(42), rng_test(99);
+
+    std::vector<std::string> corpus;
+    std::vector<RouteType>   corpus_ops;
+
+    struct RawTest { std::string prompt; int32_t expected; RouteType op; };
+    std::vector<RawTest> raw_test;
+
+    constexpr int kMax = 32767;
+
+    auto safe = [](int v) { return v >= -kMax && v <= kMax; };
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    auto pick = [&](int lo, int hi) -> int {
+        return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1));
+    };
+    auto pick_t = [&](int lo, int hi) -> int {
+        return lo + static_cast<int>(rng_test() % static_cast<unsigned>(hi - lo + 1));
+    };
+
+    // Add one full expression (including answer) to the training corpus.
+    auto add1 = [&](RouteType op, const std::string& s) {
+        corpus.push_back(s);
+        corpus_ops.push_back(op);
+    };
+
+    // Add a two-step chain.
+    //   "A sym1 B = R1 , R1 sym2 C = R2"  finalOp=op2
+    auto add2 = [&](RouteType op1, RouteType op2,
+                    const std::string& sym1, const std::string& sym2,
+                    int A, int B, int C, int R1, int R2) {
+        (void)op1;  // op1 carried for documentation; only op2 supervised at final '='
+        add1(op2, std::to_string(A) + " " + sym1 + " " + std::to_string(B) + " = " +
+                  std::to_string(R1) + " , " + std::to_string(R1) + " " + sym2 + " " +
+                  std::to_string(C) + " = " + std::to_string(R2));
+    };
+
+    // Add a three-step chain.
+    //   "A s1 B = R1 , R1 s2 C = R2 , R2 s3 D = R3"  finalOp=op3
+    auto add3 = [&](RouteType op3,
+                    const std::string& s1, const std::string& s2, const std::string& s3,
+                    int A, int B, int C, int D, int R1, int R2, int R3) {
+        add1(op3, std::to_string(A)  + " " + s1 + " " + std::to_string(B)  + " = " +
+                  std::to_string(R1) + " , " + std::to_string(R1) + " " + s2 + " " +
+                  std::to_string(C)  + " = " + std::to_string(R2) + " , " +
+                  std::to_string(R2) + " " + s3 + " " + std::to_string(D)  + " = " +
+                  std::to_string(R3));
+    };
+
+    // ── 1. Single-step ops ────────────────────────────────────────────────────
+    // Add: A,B ∈ [0,40]; stratify by result, 3 examples per result.
+    {
+        std::map<int, std::vector<std::pair<int,int>>> by_r;
+        for (int A = 0; A <= 40; ++A)
+            for (int B = 0; B <= 40; ++B)
+                by_r[A + B].emplace_back(A, B);
+        for (auto& [r, pairs] : by_r) {
+            std::shuffle(pairs.begin(), pairs.end(), rng);
+            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+                add1(RouteType::Add, std::to_string(pairs[i].first) + " + " +
+                     std::to_string(pairs[i].second) + " = " + std::to_string(r));
+        }
+    }
+
+    // Sub: A,B ∈ [0,40]; include negative results.
+    {
+        std::map<int, std::vector<std::pair<int,int>>> by_r;
+        for (int A = 0; A <= 40; ++A)
+            for (int B = 0; B <= 40; ++B)
+                by_r[A - B].emplace_back(A, B);
+        for (auto& [r, pairs] : by_r) {
+            std::shuffle(pairs.begin(), pairs.end(), rng);
+            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+                add1(RouteType::Sub, std::to_string(pairs[i].first) + " - " +
+                     std::to_string(pairs[i].second) + " = " + std::to_string(r));
+        }
+    }
+
+    // Mul: A,B ∈ [1,20].
+    {
+        std::map<int, std::vector<std::pair<int,int>>> by_r;
+        for (int A = 1; A <= 20; ++A)
+            for (int B = 1; B <= 20; ++B)
+                by_r[A * B].emplace_back(A, B);
+        for (auto& [r, pairs] : by_r) {
+            std::shuffle(pairs.begin(), pairs.end(), rng);
+            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+                add1(RouteType::Mul, std::to_string(pairs[i].first) + " * " +
+                     std::to_string(pairs[i].second) + " = " + std::to_string(r));
+        }
+    }
+
+    // Div: exact division only; k ∈ [1,20], B ∈ [1,20].
+    {
+        std::map<int, std::vector<std::pair<int,int>>> by_k;
+        for (int k = 1; k <= 20; ++k)
+            for (int B = 1; B <= 20; ++B)
+                by_k[k].emplace_back(k * B, B);
+        for (auto& [k, pairs] : by_k) {
+            std::shuffle(pairs.begin(), pairs.end(), rng);
+            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+                add1(RouteType::Div, std::to_string(pairs[i].first) + " / " +
+                     std::to_string(pairs[i].second) + " = " + std::to_string(k));
+        }
+    }
+
+    // Comparisons: 80 true + 80 false each.
+    for (auto [op, sym, fn] : std::initializer_list<std::tuple<
+             RouteType, const char*,
+             std::function<bool(int,int)>>>{
+         {RouteType::IsLessThan,    "<",  [](int A,int B){return A< B;}},
+         {RouteType::IsGreaterThan, ">",  [](int A,int B){return A> B;}},
+         {RouteType::IsEqual,       "==", [](int A,int B){return A==B;}}})
+    {
+        std::vector<std::pair<int,int>> tp, fp;
+        for (int A = 0; A <= 40; ++A)
+            for (int B = 0; B <= 40; ++B)
+                (fn(A,B) ? tp : fp).emplace_back(A, B);
+        std::shuffle(tp.begin(), tp.end(), rng);
+        std::shuffle(fp.begin(), fp.end(), rng);
+        int n = std::min({(int)tp.size(), (int)fp.size(), 80});
+        for (int i = 0; i < n; ++i) {
+            add1(op, std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" = 1");
+            add1(op, std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" = 0");
+        }
+    }
+
+    // Sqrt: perfect squares {0,1,4,9,16,25,36,49,64,81,100,121,144,169,196,225}.
+    // Notation: "sqrt ( A ) = R"
+    {
+        std::vector<int> perfects;
+        for (int r = 0; r <= 15; ++r) perfects.push_back(r * r);
+        for (int r : perfects)
+            for (int rep = 0; rep < 4; ++rep)  // 4 copies to balance vs binary ops
+                add1(RouteType::Sqrt,
+                     "sqrt ( " + std::to_string(r) + " ) = " + std::to_string(static_cast<int>(std::round(std::sqrt(r)))));
+    }
+
+    // Increment / Decrement.
+    for (int A = 0; A <= 30; ++A) {
+        add1(RouteType::Increment, "++ " + std::to_string(A) + " = " + std::to_string(A + 1));
+        add1(RouteType::Decrement, "-- " + std::to_string(A) + " = " + std::to_string(A - 1));
+    }
+
+    // ── 2. Two-step chains — systematic cross-product ─────────────────────────
+    // Add→Mul  A+B=R1 , R1*C=R2
+    for (int i = 0; i < 60; ) {
+        int A=pick(2,15), B=pick(2,15), C=pick(2,8);
+        int R1=A+B, R2=R1*C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Add, RouteType::Mul, "+", "*", A, B, C, R1, R2);
+        ++i;
+    }
+    // Mul→Add  A*B=R1 , R1+C=R2
+    for (int i = 0; i < 60; ) {
+        int A=pick(2,12), B=pick(2,12), C=pick(1,20);
+        int R1=A*B, R2=R1+C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Mul, RouteType::Add, "*", "+", A, B, C, R1, R2);
+        ++i;
+    }
+    // Sub→Mul  A-B=R1 , R1*C=R2
+    for (int i = 0; i < 60; ) {
+        int A=pick(5,20), B=pick(1,A-1), C=pick(2,6);
+        int R1=A-B, R2=R1*C;
+        if (R1<=0 || !safe(R2)) continue;
+        add2(RouteType::Sub, RouteType::Mul, "-", "*", A, B, C, R1, R2);
+        ++i;
+    }
+    // Mul→Div  A*B=R1 , R1/C=R2  (exact: C divides R1)
+    for (int i = 0; i < 40; ) {
+        int C=pick(2,6), B=pick(1,10);
+        int A=pick(2,10)*C;  // ensure A is multiple of C so R1/C is exact
+        int R1=A*B;
+        if (!safe(R1) || R1 % C != 0) continue;
+        int R2=R1/C;
+        add2(RouteType::Mul, RouteType::Div, "*", "/", A, B, C, R1, R2);
+        ++i;
+    }
+    // Add→Div  (A+B)/C=R2  (exact)
+    for (int i = 0; i < 40; ) {
+        int C=pick(2,5);
+        int A=pick(1,10)*C, B=pick(1,10)*C;
+        int R1=A+B, R2=R1/C;
+        if (R1%C!=0 || !safe(R2)) continue;
+        add2(RouteType::Add, RouteType::Div, "+", "/", A, B, C, R1, R2);
+        ++i;
+    }
+    // Add→Add  A+B=R1 , R1+C=R2
+    for (int i = 0; i < 40; ) {
+        int A=pick(1,10), B=pick(1,10), C=pick(1,10);
+        int R1=A+B, R2=R1+C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Add, RouteType::Add, "+", "+", A, B, C, R1, R2);
+        ++i;
+    }
+    // Mul→Sub  A*B=R1 , R1-C=R2
+    for (int i = 0; i < 40; ) {
+        int A=pick(2,10), B=pick(2,10), C=pick(1,15);
+        int R1=A*B, R2=R1-C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Mul, RouteType::Sub, "*", "-", A, B, C, R1, R2);
+        ++i;
+    }
+    // Sub→Add  A-B=R1 , R1+C=R2
+    for (int i = 0; i < 40; ) {
+        int A=pick(5,20), B=pick(1,A), C=pick(1,15);
+        int R1=A-B, R2=R1+C;
+        if (!safe(R1)||!safe(R2)) continue;
+        add2(RouteType::Sub, RouteType::Add, "-", "+", A, B, C, R1, R2);
+        ++i;
+    }
+    // Sqrt→Add  sqrt(A)=R1 , R1+B=R2
+    {
+        std::vector<int> perf;
+        for (int r = 1; r <= 12; ++r) perf.push_back(r*r);
+        for (int sq : perf)
+            for (int B = 1; B <= 10; ++B) {
+                int R1=static_cast<int>(std::round(std::sqrt(sq))), R2=R1+B;
+                if (!safe(R2)) continue;
+                add2(RouteType::Sqrt, RouteType::Add, "sqrt (", ")+", sq, 0, B, R1, R2);
+                // NOTE: the chain format "sqrt ( A ) = R1 , R1 + B = R2"
+                // is generated differently; use manual add1 below.
+                corpus.pop_back(); corpus_ops.pop_back();  // undo add2; redo with correct format
+                add1(RouteType::Add,
+                     "sqrt ( " + std::to_string(sq) + " ) = " + std::to_string(R1) +
+                     " , " + std::to_string(R1) + " + " + std::to_string(B) +
+                     " = " + std::to_string(R2));
+            }
+    }
+    // Sqrt→Mul  sqrt(A)=R1 , R1*B=R2
+    {
+        std::vector<int> perf;
+        for (int r = 1; r <= 12; ++r) perf.push_back(r*r);
+        for (int sq : perf)
+            for (int B = 2; B <= 6; ++B) {
+                int R1=static_cast<int>(std::round(std::sqrt(sq))), R2=R1*B;
+                if (!safe(R2)) continue;
+                add1(RouteType::Mul,
+                     "sqrt ( " + std::to_string(sq) + " ) = " + std::to_string(R1) +
+                     " , " + std::to_string(R1) + " * " + std::to_string(B) +
+                     " = " + std::to_string(R2));
+            }
+    }
+    // Compare after Add: A+B=R1 , R1 < C = 0/1
+    for (int i = 0; i < 40; ) {
+        int A=pick(1,10), B=pick(1,10), C=pick(1,25);
+        int R1=A+B;
+        int R2=(R1<C)?1:0;
+        if (!safe(R2)) continue;
+        add2(RouteType::Add, RouteType::IsLessThan, "+", "<", A, B, C, R1, R2);
+        ++i;
+    }
+    // Compare after Mul: A*B=R1 , R1 > C = 0/1
+    for (int i = 0; i < 40; ) {
+        int A=pick(1,8), B=pick(1,8), C=pick(1,60);
+        int R1=A*B;
+        int R2=(R1>C)?1:0;
+        if (!safe(R2)) continue;
+        add2(RouteType::Mul, RouteType::IsGreaterThan, "*", ">", A, B, C, R1, R2);
+        ++i;
+    }
+
+    // ── 3. Three-step chains — standard formulae + accumulation ──────────────
+    // Accumulative sum: A+B+C+D
+    for (int i = 0; i < 50; ) {
+        int A=pick(1,8),B=pick(1,8),C=pick(1,8),D=pick(1,8);
+        int R1=A+B, R2=R1+C, R3=R2+D;
+        if (!safe(R3)) continue;
+        add3(RouteType::Add, "+", "+", "+", A, B, C, D, R1, R2, R3);
+        ++i;
+    }
+    // Accumulative product: A*B*C
+    for (int i = 0; i < 40; ) {
+        int A=pick(2,6), B=pick(2,6), C=pick(2,4);
+        int R1=A*B, R2=R1*C;
+        if (!safe(R2)) continue;
+        // Encode as 3-step by using a dummy D (we need 4 operands for add3).
+        // Instead use direct add1 for 2-step product.
+        add1(RouteType::Mul,
+             std::to_string(A)+" * "+std::to_string(B)+" = "+std::to_string(R1)+
+             " , "+std::to_string(R1)+" * "+std::to_string(C)+" = "+std::to_string(R2));
+        ++i;
+    }
+    // Triangle area: B*H=R1 , R1/2=R2   (B and H even so result is exact)
+    for (int H = 2; H <= 16; H += 2)
+        for (int B = 2; B <= 16; B += 2) {
+            int R1=B*H, R2=R1/2;
+            if (!safe(R2)) continue;
+            add1(RouteType::Div,
+                 std::to_string(B)+" * "+std::to_string(H)+" = "+std::to_string(R1)+
+                 " , "+std::to_string(R1)+" / 2 = "+std::to_string(R2));
+        }
+    // Perimeter of rectangle: W+H=R1 , R1*2=R2
+    for (int W = 1; W <= 15; ++W)
+        for (int H = 1; H <= 15; ++H) {
+            int R1=W+H, R2=R1*2;
+            if (!safe(R2)) continue;
+            add1(RouteType::Mul,
+                 std::to_string(W)+" + "+std::to_string(H)+" = "+std::to_string(R1)+
+                 " , "+std::to_string(R1)+" * 2 = "+std::to_string(R2));
+        }
+    // Celsius to Fahrenheit:  C*9=R1 , R1/5=R2 , R2+32=T  (C multiples of 5)
+    for (int C = 0; C <= 40; C += 5) {
+        int R1=C*9, R2=R1/5, T=R2+32;
+        if (R1%5!=0||!safe(T)) continue;
+        add3(RouteType::Add, "*", "/", "+", C, 9, 5, 32, R1, R2, T);
+    }
+    // Simple interest: P*R=R1 , R1*T=R2
+    for (int i = 0; i < 30; ) {
+        int P=pick(10,50), R=pick(1,5), T=pick(1,4);
+        int R1=P*R, R2=R1*T;
+        if (!safe(R2)) continue;
+        add1(RouteType::Mul,
+             std::to_string(P)+" * "+std::to_string(R)+" = "+std::to_string(R1)+
+             " , "+std::to_string(R1)+" * "+std::to_string(T)+" = "+std::to_string(R2));
+        ++i;
+    }
+    // Pythagorean triples: A*A=R1 , B*B=R2 , R1+R2=R3  (3,4,5 family)
+    for (auto [a,b] : std::initializer_list<std::pair<int,int>>{
+         {3,4},{5,12},{8,15},{7,24},{6,8},{9,12},{5,12},{8,6},{20,21},{9,40}}) {
+        int R1=a*a, R2=b*b, R3=R1+R2;
+        if (!safe(R3)) continue;
+        add3(RouteType::Add, "*", "*", "+", a, a, b, b, R1, R2, R3);
+    }
+    // Mixed: A*B+C (multiply then add — order of operations pattern)
+    for (int i = 0; i < 50; ) {
+        int A=pick(2,10),B=pick(2,10),C=pick(1,20);
+        int R1=A*B, R2=R1+C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Mul, RouteType::Add, "*", "+", A, B, C, R1, R2);
+        ++i;
+    }
+    // Mixed: A+B*C (add then multiply — teaches "last op wins" in chain form)
+    for (int i = 0; i < 50; ) {
+        int A=pick(1,15),B=pick(2,10),C=pick(2,8);
+        int R1=A+B, R2=R1*C;
+        if (!safe(R2)) continue;
+        add2(RouteType::Add, RouteType::Mul, "+", "*", A, B, C, R1, R2);
+        ++i;
+    }
+
+    // ── 4. OOD test set ───────────────────────────────────────────────────────
+    // Single-step OOD: operands outside all training ranges.
+    constexpr int kOodLo = 41, kOodHi = 60;
+
+    // Add OOD
+    for (int i = 0; i < 20; ) {
+        int A=pick_t(kOodLo,kOodHi), B=pick_t(kOodLo,kOodHi);
+        int R=A+B;
+        if (!safe(R)) continue;
+        raw_test.push_back({""+std::to_string(A)+" + "+std::to_string(B)+" =", R, RouteType::Add});
+        ++i;
+    }
+    // Sub OOD
+    for (int i = 0; i < 20; ) {
+        int A=pick_t(kOodLo,kOodHi), B=pick_t(kOodLo,kOodHi);
+        int R=A-B;
+        if (!safe(R)) continue;
+        raw_test.push_back({std::to_string(A)+" - "+std::to_string(B)+" =", R, RouteType::Sub});
+        ++i;
+    }
+    // Mul OOD
+    for (int i = 0; i < 20; ) {
+        int A=pick_t(21,30), B=pick_t(21,30);
+        int R=A*B;
+        if (!safe(R)) continue;
+        raw_test.push_back({std::to_string(A)+" * "+std::to_string(B)+" =", R, RouteType::Mul});
+        ++i;
+    }
+    // Div OOD (exact)
+    for (int k = 1; k <= 15; ++k) {
+        int B=pick_t(21,30), A=k*B;
+        if (!safe(A)) continue;
+        raw_test.push_back({std::to_string(A)+" / "+std::to_string(B)+" =", k, RouteType::Div});
+    }
+    // Sqrt OOD: larger perfect squares (196, 225, 256, 289, 324, 400)
+    for (int r : {14,15,16,17,18,20})
+        raw_test.push_back({"sqrt ( "+std::to_string(r*r)+" ) =", r, RouteType::Sqrt});
+
+    // Two-step OOD: Add→Mul with OOD operands
+    for (int i = 0; i < 15; ) {
+        int A=pick_t(kOodLo,kOodHi), B=pick_t(kOodLo,kOodHi), C=pick_t(2,5);
+        int R1=A+B, R2=R1*C;
+        if (!safe(R2)) continue;
+        raw_test.push_back({
+            std::to_string(A)+" + "+std::to_string(B)+" = "+std::to_string(R1)+
+            " , "+std::to_string(R1)+" * "+std::to_string(C)+" =",
+            R2, RouteType::Mul});
+        ++i;
+    }
+    // Two-step OOD: Mul→Add with OOD operands
+    for (int i = 0; i < 15; ) {
+        int A=pick_t(21,30), B=pick_t(21,30), C=pick_t(kOodLo,kOodHi);
+        int R1=A*B, R2=R1+C;
+        if (!safe(R2)) continue;
+        raw_test.push_back({
+            std::to_string(A)+" * "+std::to_string(B)+" = "+std::to_string(R1)+
+            " , "+std::to_string(R1)+" + "+std::to_string(C)+" =",
+            R2, RouteType::Add});
+        ++i;
+    }
+
+    // ── 5. BPE training + encoding ────────────────────────────────────────────
+    // vocab_size=70: handles existing op symbols + "sqrt", "(", ")", "++"/"--"
+    auto bpe  = BPETokenizer::train(corpus, 70);
+    NumericTokenizer ntok(std::move(bpe));
+    const int64_t V = ntok.total_vocab_size();
+
+    std::vector<std::vector<int32_t>> train_ids;
+    std::vector<RouteType>            train_ops;
+    train_ids.reserve(corpus.size());
+    train_ops.reserve(corpus.size());
+    for (std::size_t i = 0; i < corpus.size(); ++i) {
+        auto ids = ntok.encode(corpus[i]);
+        if (ids.size() < 2) continue;
+        train_ids.push_back({ids.begin(), ids.end()});
+        train_ops.push_back(corpus_ops[i]);
+    }
+
+    // Build test items.
+    std::vector<TestItemImproved> test_items;
+    test_items.reserve(raw_test.size());
+    for (auto& rt : raw_test) {
+        auto ids = ntok.encode(rt.prompt);
+        if (ids.empty()) continue;
+        test_items.push_back({{ids.begin(), ids.end()}, rt.expected, rt.op});
+    }
+
+    // No vocab bias for the advanced algebraic training (full-vocab from the start).
+    Tensor bias_t_full({V}, DType::Float32);
+    auto bp = bias_t_full.data_as<float>();
+    for (int64_t i = 0; i < V; ++i) bp[static_cast<std::size_t>(i)] = 0.0f;
+
+    return ImprovedData{std::move(ntok), V,
+                        std::move(train_ids), std::move(train_ops),
+                        std::move(test_items), {}, std::move(bias_t_full)};
+}
+
 // ── Orchestrator ──────────────────────────────────────────────────────────────
 
 static void section_improved_training(std::string_view phase,
@@ -2615,6 +3079,100 @@ static void section_improved_training(std::string_view phase,
             throw std::runtime_error("No checkpoint found for spot check.");
         std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
         spot_check_improved(model, d, token_mode);
+        return;
+    }
+
+    if (phase == "train_alg2") {
+        const int total_t = (steps > 0) ? steps : 2000;
+        const SupervisionSchedule sched_alg2{SupProfile::CosineDecay, 0.5f, 0.05f};
+        std::cout << "\n  §21.12 Advanced algebraic training — fresh 2000 steps\n";
+        std::cout << std::format("  supervision α: {}  target: {} steps\n",
+                                  sched_alg2.label(), total_t);
+
+        ImprovedData d = build_advanced_algebraic_data();
+        std::cout << std::format("  training corpus: {} items  test set: {} items\n",
+                                  d.train_ids.size(), d.test_items.size());
+
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        auto all_params = model.parameters();
+        Adam adam(all_params, 3e-3f);
+
+        const std::string prefix    = "train_alg2";
+        int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
+        if (start_step >= total_t) {
+            auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+            std::cout << std::format("  Already complete — acc={:.1f}%  spec={:.1f}%  ent={:.2f}\n",
+                                      acc*100.f, spec*100.f, ent);
+            return;
+        }
+        start_step = std::max(start_step, -1) + 1;
+
+        const int ckpt_iv = 200;
+        std::mt19937 rng(55);
+        for (int i = 0; i < start_step; ++i) rng();
+
+        print_train_header(/*show_alpha=*/true);
+        float last_loss = 0.f;
+        auto  t_phase   = std::chrono::steady_clock::now();
+        int   steps_since_eval = 0;
+
+        for (int step = start_step; step <= total_t; ++step) {
+            const float cur_alpha = sched_alg2.alpha_at(step, total_t);
+            if (step % std::max(1, total_t / 5) == 0 || step == start_step) {
+                float ms = 0.f;
+                if (steps_since_eval > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                         / static_cast<float>(steps_since_eval);
+                    t_phase = now; steps_since_eval = 0;
+                }
+                auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+                print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
+            }
+            if (step == total_t) {
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+                break;
+            }
+            if (step > start_step && step % ckpt_iv == 0)
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+
+            const std::size_t idx   = rng() % d.train_ids.size();
+            const auto&       ids   = d.train_ids[idx];
+            const RouteType   gt_op = d.train_ops[idx];
+            if (ids.size() < 2) { --step; continue; }
+
+            Tensor id_tensor = make_ids_tensor(ids);
+            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
+
+            Tensor alpha_t({1}, DType::Float32);
+            alpha_t.data_as<float>()[0] = cur_alpha;
+
+            adam.zero_grad();
+            auto logits = model.forward_math(id_tensor, d.ntok, TokenMode::Algebraic);
+            auto ltrunc = narrow(logits, 0, T_loss);
+            auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
+
+            Tensor gt_t({1}, DType::Int32);
+            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+            auto rlogits   = model.router_logits(id_tensor, d.ntok, TokenMode::Algebraic);
+            auto L_sup     = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
+            auto L_total   = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+
+            L_total.backward();
+            (void)clip_grad_norm(all_params, 1.0f);
+            adam.step();
+            last_loss = L_total.data().data_as<float>()[0];
+            ++steps_since_eval;
+        }
+
+        auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
+        std::cout << std::format("\n  §21.12 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+                                  acc * 100.f, spec * 100.f, ent);
         return;
     }
 
@@ -3089,7 +3647,8 @@ int main(int argc, char* argv[]) {
     }
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "train" || phase == "train_chain" ||
+    const bool improved_only = (phase == "train" || phase == "train_alg2" ||
+                                 phase == "train_chain" ||
                                  phase == "1cs"   || phase == "2cs" ||
                                  phase == "eval"  || phase == "spot");
     if (!improved_only) {
