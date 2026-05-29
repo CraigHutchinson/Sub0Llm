@@ -123,12 +123,22 @@ MathLayer::forward_with_boost(
     // Pre-norm + routing
     Variable xn = norm_.forward(h);
     auto [soft_probs, hard_mask] = router_.forward(xn);
-    Variable gates   = mul(soft_probs, Variable(hard_mask, false));  // (T, K) STE
-    Variable gates_T = transpose2d(gates);                            // (K, T)
 
-    // ── FFN branch ────────────────────────────────────────────────────────────
+    // Two gate tensors with different gradient semantics:
+    //  gates_hard: STE (soft × hard_mask) — used only for the FFN residual so that
+    //              exactly one FFN weight set is active in the forward pass.
+    //  soft_probs: used directly for the math injection so that gradient always
+    //              flows to the correct op regardless of what the hard argmax selected.
+    //              Without this, a hard-argmax of FFN blocks ALL injection gradients
+    //              (STE gives zero gradient for every k≠argmax), trapping Sub/Sqrt in
+    //              the FFN local minimum and requiring explicit supervision to escape.
+    Variable gates_hard   = mul(soft_probs, Variable(hard_mask, false));  // (T, K) STE
+    Variable gates_hard_T = transpose2d(gates_hard);                       // (K, T)
+    Variable soft_T       = transpose2d(soft_probs);                       // (K, T)
+
+    // ── FFN branch (hard-gated) ───────────────────────────────────────────────
     Variable ffn_out      = ffn_.forward(xn);
-    Variable gate_row0    = narrow(gates_T, 0, 1);
+    Variable gate_row0    = narrow(gates_hard_T, 0, 1);
     Variable gate_col0    = transpose2d(gate_row0);
     Variable ffn_residual = row_scale(ffn_out, gate_col0);
 
@@ -146,13 +156,13 @@ MathLayer::forward_with_boost(
         }
     }
 
-    // ── Direct logit-space boost ──────────────────────────────────────────────
-    // For each math op k and each token t, place gate_k[t] at logit position
-    // encode_int(result_k_t) via a (T, V) one-hot matrix.  Injecting into logit
-    // space after the final matmul makes the result prediction independent of the
-    // result token's embedding norm — no attractor bias from heavily-trained tokens.
-    // Gradient flows through gate_col (router STE) via row_scale backward:
-    //   d_loss/d_gate_k[t] = kMathBoost * d_loss/d_logit[t, encode_int(result_k_t)]
+    // ── Direct logit-space boost (soft-weighted) ──────────────────────────────
+    // For each math op k and each token t, place soft_prob_k[t] at logit position
+    // encode_int(result_k_t) via a (T, V) one-hot matrix.
+    // Using soft_probs (not hard-gated) ensures gradient reaches every op's router
+    // weight even when the hard argmax selected a different op.  After training
+    // converges, soft_probs peak near 1 for the correct op and the soft injection
+    // is equivalent to the hard injection used at inference (route_hard / route_info).
     Variable math_logit_boost(zeros({T, vocab_size}, DType::Float32), false);
 
     for (int k = 1; k < kNumRouteTypes; ++k) {
@@ -183,8 +193,8 @@ MathLayer::forward_with_boost(
             oh[t * V_sz + rid] = 1.0f;
         }
 
-        Variable gate_row = narrow(gates_T, static_cast<int64_t>(k), 1); // (1, T)
-        Variable gate_col = transpose2d(gate_row);                         // (T, 1)
+        Variable gate_row = narrow(soft_T, static_cast<int64_t>(k), 1); // (1, T)
+        Variable gate_col = transpose2d(gate_row);                        // (T, 1)
         math_logit_boost  = add(math_logit_boost,
                                 row_scale(Variable(logit_oh, false), gate_col));
     }
@@ -389,9 +399,29 @@ autograd::Variable MathGPT::forward_math(
     }
 
     x = ln_f_.forward(x);
-    // Inject directly into logit space AFTER the final matmul so the result
-    // prediction is independent of result-token embedding norm (no attractor bias).
-    return add(matmul(x, transpose2d(tok_emb_.weight())), math_logit_boost);
+
+    auto lm_logits = matmul(x, transpose2d(tok_emb_.weight()));
+
+    // Zero the LM head's contribution to numeric token positions so only the
+    // math injection can predict numeric outputs.  This forces the router to
+    // select the correct operation: CE loss alone trains it end-to-end, with
+    // no explicit supervision schedule and no large eval-time boost required.
+    // Gradient is zero for numeric logit positions → LM weights never learn
+    // to predict arithmetic results, preventing memorisation from bypassing
+    // the router on in-distribution examples.
+    const int64_t vocab_size = tok_emb_.vocab_size();
+    const int64_t num_start  = static_cast<int64_t>(ntok.numeric_range_start());
+    Tensor mask_t({vocab_size, 1}, DType::Float32);
+    {
+        auto* md = mask_t.data_as<float>().data();
+        for (int64_t v = 0; v < vocab_size; ++v)
+            md[static_cast<std::size_t>(v)] = (v < num_start) ? 1.0f : 0.0f;
+    }
+    // row_scale(transpose2d(lm_logits), mask) scales column v of lm_logits by mask[v]:
+    // 1 for text tokens (v < num_start), 0 for numeric tokens (v >= num_start).
+    auto lm_text = transpose2d(
+        row_scale(transpose2d(lm_logits), Variable(mask_t, false)));
+    return add(lm_text, math_logit_boost);
 }
 
 RouteInfo MathGPT::route_info(
