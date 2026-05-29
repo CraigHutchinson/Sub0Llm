@@ -2938,28 +2938,36 @@ static void section_generalization_test(
     for (const auto& tier : tiers)
         std::cout << std::format("    {:>22} — {} items\n", tier.label, tier.items.size());
 
-    // Load Real model
+    // Load Real model — prefer chain-fine-tuned checkpoint over base
     MathGPT real_model(base.V, kD, static_cast<std::size_t>(kNHeads),
                         static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
     {
-        auto p   = real_model.parameters();
-        int step = load_latest_checkpoint(p, "train", real_ckpt_dir);
+        auto p    = real_model.parameters();
+        int  step = load_latest_checkpoint(p, "train_chain", real_ckpt_dir);
+        const bool chained = (step >= 0);
+        if (step < 0)
+            step = load_latest_checkpoint(p, "train", real_ckpt_dir);
         if (step < 0)
             throw std::runtime_error(
                 std::format("No Real checkpoint in {}", real_ckpt_dir));
-        std::cout << std::format("\n  Real model      (step {:>4}): {}\n", step, real_ckpt_dir);
+        std::cout << std::format("\n  Real model      (step {:>4}, {}): {}\n",
+                                  step, chained ? "chain-ft" : "base", real_ckpt_dir);
     }
 
-    // Load Algebraic model
+    // Load Algebraic model — prefer chain-fine-tuned checkpoint over base
     MathGPT alg_model(base.V, kD, static_cast<std::size_t>(kNHeads),
                        static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
     {
-        auto p   = alg_model.parameters();
-        int step = load_latest_checkpoint(p, "train_alg", alg_ckpt_dir);
+        auto p    = alg_model.parameters();
+        int  step = load_latest_checkpoint(p, "train_chain_alg", alg_ckpt_dir);
+        const bool chained = (step >= 0);
+        if (step < 0)
+            step = load_latest_checkpoint(p, "train_alg", alg_ckpt_dir);
         if (step < 0)
             throw std::runtime_error(
                 std::format("No Algebraic checkpoint in {}", alg_ckpt_dir));
-        std::cout << std::format("  Algebraic model (step {:>4}): {}\n", step, alg_ckpt_dir);
+        std::cout << std::format("  Algebraic model (step {:>4}, {}): {}\n",
+                                  step, chained ? "chain-ft" : "base", alg_ckpt_dir);
     }
 
     // Evaluate both models on every tier
