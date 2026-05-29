@@ -3658,6 +3658,187 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
+    if (phase == "train_real4") {
+        // Real-mode counterpart of train_alg4 for side-by-side OOD comparison.
+        // Same vocabulary, data, architecture, and CE-only objective; only the
+        // TokenMode differs — numeric tokens keep their actual values instead of
+        // being remapped to abstract slots.
+        const int total_t = (steps > 0) ? steps : 2000;
+        std::cout << "\n  §21.14 Real-mode training — CE-only, no supervision\n";
+        std::cout << "  Same data/vocab as train_alg4; TokenMode::Real (actual numeric tokens)\n";
+        std::cout << std::format("  target: {} steps\n", total_t);
+
+        ImprovedData d = build_advanced_algebraic_data_v3();
+        std::cout << std::format("  training corpus: {} items  test set: {} items\n",
+                                  d.train_ids.size(), d.test_items.size());
+
+        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        auto all_params = model.parameters();
+        Adam adam(all_params, 1e-3f);
+
+        const std::string prefix     = "train_real4";
+        int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
+        if (start_step >= total_t) {
+            auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Real);
+            std::cout << std::format("  Already complete — acc={:.1f}%  spec={:.1f}%  ent={:.2f}\n",
+                                      acc*100.f, spec*100.f, ent);
+            return;
+        }
+        start_step = std::max(start_step, -1) + 1;
+
+        const int ckpt_iv = 200;
+        std::mt19937 rng(77);
+        for (int i = 0; i < start_step; ++i) rng();
+
+        print_train_header();
+        float last_loss = 0.f;
+        auto  t_phase   = std::chrono::steady_clock::now();
+        int   steps_since_eval = 0;
+        float best_acc  = 0.f;
+        int   best_step = -1;
+
+        for (int step = start_step; step <= total_t; ++step) {
+            if (step % std::max(1, total_t / 5) == 0 || step == start_step) {
+                float ms = 0.f;
+                if (steps_since_eval > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                         / static_cast<float>(steps_since_eval);
+                    t_phase = now; steps_since_eval = 0;
+                }
+                auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Real);
+                print_train_row(step, last_loss, acc, spec, ent, ms);
+                if (acc > best_acc && step > 0) {
+                    best_acc = acc; best_step = step;
+                    save_checkpoint(all_params,
+                        std::filesystem::path(ckpt_dir) /
+                            std::format("ch21_{}_best_step{:04d}.ckpt", prefix, step), step);
+                }
+            }
+            if (step == total_t) {
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+                break;
+            }
+            if (step > start_step && step % ckpt_iv == 0)
+                save_checkpoint(all_params,
+                    std::filesystem::path(ckpt_dir) /
+                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
+
+            const std::size_t idx = rng() % d.train_ids.size();
+            const auto&       ids = d.train_ids[idx];
+            if (ids.size() < 2) { --step; continue; }
+
+            Tensor id_tensor = make_ids_tensor(ids);
+            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
+
+            adam.zero_grad();
+            auto logits = model.forward_math(id_tensor, d.ntok, TokenMode::Real);
+            auto ltrunc = narrow(logits, 0, T_loss);
+            auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
+            L_ce.backward();
+            (void)clip_grad_norm(all_params, 1.0f);
+            adam.step();
+            last_loss = L_ce.data().data_as<float>()[0];
+            ++steps_since_eval;
+        }
+
+        auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Real);
+        std::cout << std::format("\n  train_real4 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+                                  acc * 100.f, spec * 100.f, ent);
+        if (best_step >= 0)
+            std::cout << std::format("  best checkpoint: step {} ({:.1f}%) — ch21_{}_best_step{:04d}.ckpt\n",
+                                      best_step, best_acc * 100.f, prefix, best_step);
+        return;
+    }
+
+    if (phase == "compare4") {
+        // §21.14: Real vs Algebraic on the same extended OOD test set.
+        // Both models share vocabulary (build_advanced_algebraic_data_v3).
+        // Real mode processes actual numeric token embeddings; algebraic mode
+        // remaps them to abstract sequential slots before embedding lookup.
+        std::cout << "\n  §21.14 Real vs Algebraic — OOD generalisation comparison\n";
+        ImprovedData d = build_advanced_algebraic_data_v3();
+        std::cout << std::format("  test set: {} items  vocab_size: {}\n\n",
+                                  d.test_items.size(), d.V);
+
+        // Load algebraic model
+        MathGPT alg_model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                          static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        {
+            auto p = alg_model.parameters();
+            int  s = load_latest_checkpoint(p, "train_alg4_best", ckpt_dir, ckpt_step);
+            if (s < 0) s = load_latest_checkpoint(p, "train_alg4", ckpt_dir, ckpt_step);
+            if (s < 0) throw std::runtime_error(std::format("No train_alg4 checkpoint in {}", ckpt_dir));
+            std::cout << std::format("  Algebraic model: step {} (train_alg4)\n", s);
+        }
+
+        // Load real model
+        MathGPT real_model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                           static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+        {
+            auto p = real_model.parameters();
+            int  s = load_latest_checkpoint(p, "train_real4_best", ckpt_dir, ckpt_step);
+            if (s < 0) s = load_latest_checkpoint(p, "train_real4", ckpt_dir, ckpt_step);
+            if (s < 0) throw std::runtime_error(std::format("No train_real4 checkpoint in {}", ckpt_dir));
+            std::cout << std::format("  Real model:       step {} (train_real4)\n\n", s);
+        }
+
+        // Per-op tallies for both modes
+        std::array<int, kNumRouteTypes> alg_ok{}, alg_tot{};
+        std::array<int, kNumRouteTypes> real_ok{}, real_tot{};
+
+        for (const auto& item : d.test_items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor ids_t = make_ids_tensor(item.prompt_ids);
+            const auto op_idx = static_cast<std::size_t>(item.expected_op);
+
+            auto eval_one = [&](MathGPT& m, TokenMode mode) -> bool {
+                Variable logits = m.forward_math(ids_t, d.ntok, mode);
+                const int64_t last = logits.data().shape(0) - 1;
+                auto lsp = logits.data().data_as<float>();
+                int64_t best = 0;
+                float best_v = lsp[static_cast<std::size_t>(last * d.V)];
+                for (int64_t v = 1; v < d.V; ++v) {
+                    float val = lsp[static_cast<std::size_t>(last * d.V + v)];
+                    if (val > best_v) { best_v = val; best = v; }
+                }
+                auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+                return d.ntok.is_numeric(pred_id) &&
+                       !d.ntok.is_nan_token(pred_id) &&
+                       !d.ntok.is_overflow_token(pred_id) &&
+                       static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val;
+            };
+
+            ++alg_tot[op_idx];
+            ++real_tot[op_idx];
+            if (eval_one(alg_model,  TokenMode::Algebraic)) ++alg_ok[op_idx];
+            if (eval_one(real_model, TokenMode::Real))      ++real_ok[op_idx];
+        }
+
+        // Print comparison table
+        std::cout << std::format("  {:>8}  {:>12}  {:>12}  {:>10}  {:>5}\n",
+                                  "op", "algebraic", "real", "Δ(alg-real)", "n");
+        std::cout << "  " << std::string(55, '-') << "\n";
+        int grand_alg_ok = 0, grand_real_ok = 0, grand_tot = 0;
+        for (std::size_t k = 0; k < kNumRouteTypes; ++k) {
+            if (alg_tot[k] == 0) continue;
+            const float alg_a  = static_cast<float>(alg_ok[k])  / static_cast<float>(alg_tot[k]) * 100.f;
+            const float real_a = static_cast<float>(real_ok[k]) / static_cast<float>(real_tot[k]) * 100.f;
+            std::cout << std::format("  {:>8}  {:>11.1f}%  {:>11.1f}%  {:>+9.1f}%  {:>5}\n",
+                                      kOpNames[k], alg_a, real_a, alg_a - real_a, alg_tot[k]);
+            grand_alg_ok += alg_ok[k]; grand_real_ok += real_ok[k]; grand_tot += alg_tot[k];
+        }
+        std::cout << "  " << std::string(55, '-') << "\n";
+        const float tot_alg  = static_cast<float>(grand_alg_ok)  / static_cast<float>(grand_tot) * 100.f;
+        const float tot_real = static_cast<float>(grand_real_ok) / static_cast<float>(grand_tot) * 100.f;
+        std::cout << std::format("  {:>8}  {:>11.1f}%  {:>11.1f}%  {:>+9.1f}%  {:>5}\n\n",
+                                  "TOTAL", tot_alg, tot_real, tot_alg - tot_real, grand_tot);
+        return;
+    }
+
     if (phase == "train_chain") {
         const int total_t = (steps > 0) ? steps : 1000;
         const SupervisionSchedule sched_chain{SupProfile::CosineDecay, 0.5f, 0.05f};
@@ -4147,10 +4328,11 @@ int main(int argc, char* argv[]) {
     }
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "train" || phase == "train_alg2" ||
-                                 phase == "train_alg3" || phase == "train_alg4" ||
-                                 phase == "eval_alg2"  || phase == "eval_alg3" ||
-                                 phase == "eval_alg4"  ||
+    const bool improved_only = (phase == "train"      || phase == "train_alg2" ||
+                                 phase == "train_alg3"  || phase == "train_alg4" ||
+                                 phase == "train_real4" || phase == "compare4"   ||
+                                 phase == "eval_alg2"   || phase == "eval_alg3"  ||
+                                 phase == "eval_alg4"   ||
                                  phase == "train_chain" ||
                                  phase == "1cs"   || phase == "2cs" ||
                                  phase == "eval"  || phase == "spot");
