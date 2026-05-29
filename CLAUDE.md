@@ -32,6 +32,22 @@ cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_NATIV
 cmake --build build-native --parallel
 ```
 
+## Training policy
+
+**Always use the native build for training runs** (`build-native/bin/`). It enables
+`-march=native`, LTO, and fast-math, giving 3–4× throughput vs the debug build.
+After any code change that affects a chapter binary, rebuild native before launching:
+
+```bash
+cmake --build build-native --parallel
+# Then launch training, e.g.:
+nohup ./build-native/bin/ch21_math_neurons \
+  --phase train --ckpt-dir /tmp/ckpts --steps 3000 --token-mode real \
+  > /tmp/train.log 2>&1 &
+```
+
+Tests use the debug build (`ctest --test-dir build`) — never run tests on native.
+
 ## Code conventions
 
 - **Namespace**: `sub0llm` for the library; `sub0llm::ops` for ops
