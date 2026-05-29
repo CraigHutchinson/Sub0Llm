@@ -132,7 +132,8 @@ public:
             int64_t       n_layers,
             int64_t       l_math    = -1,
             int64_t       d_ff      = 0,
-            std::uint64_t seed      = 42);
+            std::uint64_t seed      = 42,
+            float         math_boost = 15.0f);
 
     // Returns logits (T, total_vocab) using all ModernTransformerBlocks.
     [[nodiscard]] autograd::Variable forward(const Tensor& token_ids) const;
@@ -181,6 +182,7 @@ private:
     MathTransformerBlock                 math_block_;  // replaces blocks_[l_math_] in forward_math
     RMSNorm                              ln_f_;
     int64_t                              l_math_;
+    float                                math_boost_;  // post-ln_f injection scale
 
     // Remap numeric token IDs for the embedding lookup (leaves non-numeric unchanged).
     // Real → identity; Anon → all numeric to num_placeholder_token();

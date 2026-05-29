@@ -1418,8 +1418,6 @@ static ImprovedData build_improved_data() {
             for (int B = B_lo; B <= B_hi; ++B)
                 by_r[compute(A,B)].emplace_back(A,B);
 
-        auto by_r_test = by_r;
-
         for (auto& [r, pairs] : by_r) {
             std::shuffle(pairs.begin(), pairs.end(), rng_train);
             int n = std::min((int)pairs.size(), kPerTrain);
@@ -1428,11 +1426,15 @@ static ImprovedData build_improved_data() {
                                   std::to_string(pairs[i].second)+" = "+std::to_string(r));
                 corpus_ops.push_back(op);
             }
-        }
-        for (auto& [r, pairs] : by_r_test) {
-            std::shuffle(pairs.begin(), pairs.end(), rng_test);
-            auto [A,B] = pairs[0];
-            raw_test.push_back(RawTest{std::to_string(A)+" "+sym+" "+std::to_string(B)+" =", r, op});
+            // Test from held-out tail (pairs[n..]) to avoid train/test overlap.
+            // Buckets with only kPerTrain or fewer pairs are skipped — all their
+            // pairs are in training, so there is no clean held-out example.
+            if (n < (int)pairs.size()) {
+                std::shuffle(pairs.begin() + n, pairs.end(), rng_test);
+                auto [A, B] = pairs[static_cast<std::size_t>(n)];
+                raw_test.push_back(RawTest{
+                    std::to_string(A)+" "+sym+" "+std::to_string(B)+" =", r, op});
+            }
         }
     };
 
