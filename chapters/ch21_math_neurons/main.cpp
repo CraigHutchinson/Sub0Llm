@@ -2240,6 +2240,282 @@ run_train_single_phase(
     return eval_improved(model, d, false, token_mode);
 }
 
+// ── §21.11  Chain-Augmented Fine-Tuning ──────────────────────────────────────
+//
+// Chained expressions ("A op1 B = R1 , R1 op2 C =") exercise a structural
+// pattern the base model never sees during single-step training.  The fix is
+// targeted fine-tuning on mixed data (25 % chains, 75 % single-step).
+//
+// Novel: dual router supervision (inspired by CTC / structured-prediction).
+// At every chain example, the router is supervised at BOTH '=' positions — the
+// intermediate one (op1) and the final one (op2).  Single-step examples keep
+// supervision only at the terminal '='.  This teaches the router that
+// "operation context resets at each sub-expression boundary."
+//
+// Add→Add chains (same op both steps) are included to teach compositional
+// structure independently of operation switching — the simplest recursive case,
+// analogous to function self-composition in category theory.
+//
+// Fine-tuning uses a reduced LR (1e-3 vs 3e-3 for cold-start) to avoid
+// disrupting the already-converged single-step routing knowledge.
+
+struct ChainItem {
+    std::vector<int32_t> full_ids;  // full sequence including R2 at end
+    int32_t              final_val;
+    RouteType            final_op;  // operation at the final '='
+    int64_t              mid_eq_pos; // token index of the intermediate '='
+    RouteType            mid_op;    // operation at the intermediate '='
+};
+
+static std::vector<ChainItem> generate_chain_items(
+    const NumericTokenizer& ntok, std::mt19937& rng)
+{
+    std::vector<ChainItem> items;
+    items.reserve(120);
+
+    auto to_ids = [&](const std::string& s) {
+        auto toks = ntok.encode(s);
+        return std::vector<int32_t>(toks.begin(), toks.end());
+    };
+
+    // Position of '=' in the full token sequence equals the number of tokens
+    // in the prefix (up to and including '=') minus one.  Because numeric
+    // values are atomic tokens and operators are single-char BPE tokens, the
+    // prefix tokenisation is identical to the corresponding prefix of the full
+    // sequence encoding.
+    auto mid_eq = [&](const std::string& prefix) -> int64_t {
+        return static_cast<int64_t>(ntok.encode(prefix).size()) - 1;
+    };
+
+    auto pick = [&](int lo, int hi) -> int {
+        return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1));
+    };
+
+    // Add→Mul:  "A + B = R1 , R1 * C = R2"
+    for (int i = 0; i < 30; ) {
+        int A = pick(2, 10), B = pick(2, 10), C = pick(2, 5);
+        int R1 = A + B, R2 = R1 * C;
+        if (R2 > 32767) continue;
+        std::string pre  = std::to_string(A) + " + " + std::to_string(B) + " =";
+        std::string full = pre + " " + std::to_string(R1) + " , " +
+                           std::to_string(R1) + " * " + std::to_string(C) +
+                           " = " + std::to_string(R2);
+        auto ids = to_ids(full);
+        if (ids.size() < 4) continue;
+        items.push_back({ids, R2, RouteType::Mul, mid_eq(pre), RouteType::Add});
+        ++i;
+    }
+
+    // Mul→Add:  "A * B = R1 , R1 + C = R2"  — the case where Algebraic scored 0 %
+    for (int i = 0; i < 30; ) {
+        int A = pick(2, 8), B = pick(2, 8), C = pick(2, 12);
+        int R1 = A * B, R2 = R1 + C;
+        if (R2 > 32767) continue;
+        std::string pre  = std::to_string(A) + " * " + std::to_string(B) + " =";
+        std::string full = pre + " " + std::to_string(R1) + " , " +
+                           std::to_string(R1) + " + " + std::to_string(C) +
+                           " = " + std::to_string(R2);
+        auto ids = to_ids(full);
+        if (ids.size() < 4) continue;
+        items.push_back({ids, R2, RouteType::Add, mid_eq(pre), RouteType::Mul});
+        ++i;
+    }
+
+    // Sub→Mul:  "A - B = R1 , R1 * C = R2"
+    for (int i = 0; i < 30; ) {
+        int A = pick(5, 15), B = pick(1, A - 1), C = pick(2, 5);
+        int R1 = A - B, R2 = R1 * C;
+        if (R1 <= 0 || R2 > 32767) continue;
+        std::string pre  = std::to_string(A) + " - " + std::to_string(B) + " =";
+        std::string full = pre + " " + std::to_string(R1) + " , " +
+                           std::to_string(R1) + " * " + std::to_string(C) +
+                           " = " + std::to_string(R2);
+        auto ids = to_ids(full);
+        if (ids.size() < 4) continue;
+        items.push_back({ids, R2, RouteType::Mul, mid_eq(pre), RouteType::Sub});
+        ++i;
+    }
+
+    // Add→Add:  "A + B = R1 , R1 + C = R2"
+    // Teaches compositional structure without operation switching — the simplest
+    // recursive case (analogous to self-composition in category theory).
+    for (int i = 0; i < 30; ) {
+        int A = pick(1, 8), B = pick(1, 8), C = pick(1, 8);
+        int R1 = A + B, R2 = R1 + C;
+        if (R2 > 32767) continue;
+        std::string pre  = std::to_string(A) + " + " + std::to_string(B) + " =";
+        std::string full = pre + " " + std::to_string(R1) + " , " +
+                           std::to_string(R1) + " + " + std::to_string(C) +
+                           " = " + std::to_string(R2);
+        auto ids = to_ids(full);
+        if (ids.size() < 4) continue;
+        items.push_back({ids, R2, RouteType::Add, mid_eq(pre), RouteType::Add});
+        ++i;
+    }
+
+    return items;
+}
+
+// Fine-tunes from the existing single-phase checkpoint with chain-augmented data.
+// 25 % of steps use chain items with dual-position router supervision.
+static std::tuple<float,float,float> run_train_chain_augmented(
+    std::string_view ckpt_dir, int total = 1000,
+    SupervisionSchedule sched = {SupProfile::CosineDecay, 0.5f, 0.05f},
+    TokenMode token_mode = TokenMode::Real)
+{
+    const std::string mode_tag    = (token_mode == TokenMode::Anon)             ? "_anon"
+                                  : (token_mode == TokenMode::Algebraic)        ? "_alg"
+                                  : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
+    const std::string base_prefix  = "train"       + mode_tag;
+    const std::string chain_prefix = "train_chain" + mode_tag;
+
+    std::cout << std::format(
+        "\n  §21.11 Chain-augmented fine-tuning — 25%% chains, dual supervision{}\n",
+        mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
+    std::cout << std::format("  supervision α: {}  target: {} steps\n",
+                              sched.label(), total);
+
+    ImprovedData d = build_improved_data();
+
+    std::mt19937 chain_rng(77);
+    auto chain_items = generate_chain_items(d.ntok, chain_rng);
+    std::cout << std::format("  chain items: {}\n", chain_items.size());
+
+    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
+                  static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+    auto all_params = model.parameters();
+    Adam adam(all_params, 1e-3f);  // smaller LR — transfer learning heuristic
+
+    // Resume from chain checkpoint if present; otherwise start from base.
+    int start_step = load_latest_checkpoint(all_params, chain_prefix, ckpt_dir);
+    if (start_step < 0) {
+        start_step = load_latest_checkpoint(all_params, base_prefix, ckpt_dir);
+        if (start_step < 0)
+            throw std::runtime_error(std::format(
+                "No checkpoint found for '{}' or '{}' in {}",
+                chain_prefix, base_prefix, ckpt_dir));
+        std::cout << std::format("  starting from base checkpoint (step {})\n",
+                                  start_step);
+        start_step = 0;  // reset step counter for fine-tuning phase
+    }
+    if (start_step >= total) {
+        std::cout << std::format("  Already complete (step {} ≥ {}).\n",
+                                  start_step, total);
+        return eval_improved(model, d, false, token_mode);
+    }
+    start_step = std::max(start_step, -1) + 1;
+
+    const int ckpt_iv = 200;
+    std::mt19937 rng(33);
+    for (int i = 0; i < start_step; ++i) rng();
+
+    print_train_header(/*show_alpha=*/true);
+    float last_loss      = 0.f;
+    int   step_spec30    = -1;
+    int   steps_since_eval = 0;
+    auto  t_phase        = std::chrono::steady_clock::now();
+
+    for (int step = start_step; step <= total; ++step) {
+        const float cur_alpha = sched.alpha_at(step, total);
+
+        if (step % std::max(1, total / 5) == 0 || step == start_step) {
+            float ms = 0.f;
+            if (steps_since_eval > 0) {
+                auto now = std::chrono::steady_clock::now();
+                ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
+                     / static_cast<float>(steps_since_eval);
+                t_phase = now; steps_since_eval = 0;
+            }
+            auto [acc, spec, ent] = eval_improved(model, d, false, token_mode);
+            print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
+            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
+        }
+        if (step == total) {
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_{}_step{:04d}.ckpt", chain_prefix, step), step);
+            break;
+        }
+        if (step > start_step && step % ckpt_iv == 0)
+            save_checkpoint(all_params,
+                std::filesystem::path(ckpt_dir) /
+                    std::format("ch21_{}_step{:04d}.ckpt", chain_prefix, step), step);
+
+        Tensor alpha_t({1}, DType::Float32);
+        alpha_t.data_as<float>()[0] = cur_alpha;
+
+        adam.zero_grad();
+
+        // 25 % chain items — dual-position router supervision.
+        // 75 % single-step items — standard supervision at terminal '='.
+        const bool use_chain = !chain_items.empty() && (rng() % 4 == 0);
+        if (use_chain) {
+            const auto& ci = chain_items[rng() % chain_items.size()];
+            if (ci.full_ids.size() < 4) { --step; continue; }
+
+            Tensor id_tensor = make_ids_tensor(ci.full_ids);
+            const int64_t T_loss = static_cast<int64_t>(ci.full_ids.size()) - 1;
+
+            auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
+            auto ltrunc = narrow(logits, 0, T_loss);
+            auto L_ce   = cross_entropy(ltrunc, make_targets(ci.full_ids));
+
+            auto rlogits = model.router_logits(id_tensor, d.ntok, token_mode);
+
+            // Supervision at final '='
+            Tensor gt_fin({1}, DType::Int32);
+            gt_fin.data_as<int32_t>()[0] = static_cast<int32_t>(ci.final_op);
+            auto L_sup_fin = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_fin);
+
+            // Dual supervision at intermediate '=' — half weight.
+            // Inspired by CTC and structured-prediction: every decision point
+            // in a chain gets explicit gradient, not just the final output.
+            Tensor gt_mid({1}, DType::Int32);
+            gt_mid.data_as<int32_t>()[0] = static_cast<int32_t>(ci.mid_op);
+            auto L_sup_mid = cross_entropy(narrow(rlogits, ci.mid_eq_pos, 1), gt_mid);
+
+            auto L_sup   = add(L_sup_fin, scale(L_sup_mid, 0.5f));
+            auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+
+            L_total.backward();
+            (void)clip_grad_norm(all_params, 1.0f);
+            adam.step();
+            last_loss = L_total.data().data_as<float>()[0];
+        } else {
+            // Standard single-step training item.
+            const std::size_t idx   = rng() % d.train_ids.size();
+            const auto&       ids   = d.train_ids[idx];
+            const RouteType   gt_op = d.train_ops[idx];
+            if (ids.size() < 2) { --step; continue; }
+
+            Tensor id_tensor = make_ids_tensor(ids);
+            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
+
+            auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
+            auto ltrunc = narrow(logits, 0, T_loss);
+            auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
+
+            Tensor gt_t({1}, DType::Int32);
+            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
+            auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
+            auto L_sup     = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
+            auto L_total   = add(L_ce, mul(Variable(alpha_t, false), L_sup));
+
+            L_total.backward();
+            (void)clip_grad_norm(all_params, 1.0f);
+            adam.step();
+            last_loss = L_total.data().data_as<float>()[0];
+        }
+        ++steps_since_eval;
+    }
+
+    if (step_spec30 >= 0)
+        std::cout << std::format("  → router_spec first crossed 30%% at step {}\n",
+                                  step_spec30);
+
+    return eval_improved(model, d, false, token_mode);
+}
+
 // ── Standalone evaluation ─────────────────────────────────────────────────────
 // Load the latest checkpoint (train > 2cs_bsup > 2cs_sup > 2cs) and print the
 // summary table.
@@ -2339,6 +2615,15 @@ static void section_improved_training(std::string_view phase,
             throw std::runtime_error("No checkpoint found for spot check.");
         std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
         spot_check_improved(model, d, token_mode);
+        return;
+    }
+
+    if (phase == "train_chain") {
+        const int total_t = (steps > 0) ? steps : 1000;
+        const SupervisionSchedule sched_chain{SupProfile::CosineDecay, 0.5f, 0.05f};
+        auto [acc, spec, ent] = run_train_chain_augmented(ckpt_dir, total_t, sched_chain, token_mode);
+        std::cout << std::format("\n  §21.11 chain fine-tune result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+                                  acc * 100.f, spec * 100.f, ent);
         return;
     }
 
@@ -2796,7 +3081,8 @@ int main(int argc, char* argv[]) {
     }
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "train" || phase == "1cs" || phase == "2cs" ||
+    const bool improved_only = (phase == "train" || phase == "train_chain" ||
+                                 phase == "1cs"   || phase == "2cs" ||
                                  phase == "eval"  || phase == "spot");
     if (!improved_only) {
         section_numeric_tokenizer();
