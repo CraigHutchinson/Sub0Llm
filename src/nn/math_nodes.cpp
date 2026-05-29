@@ -17,12 +17,12 @@ using namespace autograd;
 
 // ── apply_math_op ─────────────────────────────────────────────────────────────
 
-MathResult apply_math_op(RouteType op, float a, float b) {
-    auto overflow_check = [](float result) -> MathResult {
-        const auto iv = static_cast<int32_t>(std::round(result));
-        if (iv < NumericTokenizer::kIntMin || iv > NumericTokenizer::kIntMax)
+MathResult apply_math_op(RouteType op, float a, float b, int32_t int_min, int32_t int_max) {
+    auto overflow_check = [int_min, int_max](float result) -> MathResult {
+        const float r = std::round(result);
+        if (r < static_cast<float>(int_min) || r > static_cast<float>(int_max))
             return {0.0f, false, true};
-        return {static_cast<float>(iv), false, false};
+        return {r, false, false};
     };
 
     switch (op) {
@@ -185,7 +185,7 @@ MathLayer::forward_with_boost(
             const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
             const float lhs = (!is_unary && op2_pos[t] >= 0)
                               ? reg[static_cast<std::size_t>(op2_pos[t])] : 0.0f;
-            const MathResult mr = apply_math_op(route_k, lhs, rhs);
+            const MathResult mr = apply_math_op(route_k, lhs, rhs, ntok.int_min(), ntok.int_max());
             if (mr.is_nan || mr.is_overflow) continue;
 
             const auto rid = static_cast<std::size_t>(

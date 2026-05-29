@@ -10,13 +10,20 @@
 
 namespace sub0llm {
 
-NumericTokenizer::NumericTokenizer(BPETokenizer bpe)
+NumericTokenizer::NumericTokenizer(BPETokenizer bpe, int32_t int_min, int32_t int_max)
     : bpe_(std::move(bpe)),
-      numeric_start_(static_cast<TokenId>(bpe_.vocab_size())) {}
+      numeric_start_(static_cast<TokenId>(bpe_.vocab_size())),
+      int_min_(int_min),
+      int_max_(int_max),
+      int_range_(static_cast<int64_t>(int_max) - static_cast<int64_t>(int_min) + 1) {}
 
 int64_t NumericTokenizer::total_vocab_size() const noexcept {
-    return static_cast<int64_t>(bpe_.vocab_size()) + kIntRange + kExtraTokens;
+    return static_cast<int64_t>(bpe_.vocab_size()) + int_range_ + kExtraTokens;
 }
+
+int32_t NumericTokenizer::int_min()   const noexcept { return int_min_; }
+int32_t NumericTokenizer::int_max()   const noexcept { return int_max_; }
+int64_t NumericTokenizer::int_range() const noexcept { return int_range_; }
 
 int64_t NumericTokenizer::bpe_vocab_size() const noexcept {
     return static_cast<int64_t>(bpe_.vocab_size());
@@ -28,7 +35,7 @@ NumericTokenizer::TokenId NumericTokenizer::numeric_range_start() const noexcept
 
 bool NumericTokenizer::is_numeric(TokenId id) const noexcept {
     return id >= numeric_start_ &&
-           id < static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens);
+           id < static_cast<TokenId>(numeric_start_ + int_range_ + kIntExtraTokens);
 }
 
 bool NumericTokenizer::is_nan_token(TokenId id) const noexcept {
@@ -47,30 +54,31 @@ float NumericTokenizer::numeric_value(TokenId id) const {
         return std::numeric_limits<float>::quiet_NaN();
     if (is_overflow_token(id))
         return std::numeric_limits<float>::infinity();
-    const int32_t val = static_cast<int32_t>(id - numeric_start_) + kIntMin;
+    const int32_t val = static_cast<int32_t>(id - numeric_start_) + int_min_;
     return static_cast<float>(val);
 }
 
 NumericTokenizer::TokenId NumericTokenizer::encode_int(int32_t value) const noexcept {
-    if (value < kIntMin || value > kIntMax)
+    if (value < int_min_ || value > int_max_)
         return overflow_token();
-    return static_cast<TokenId>(numeric_start_ + static_cast<int64_t>(value - kIntMin));
+    return static_cast<TokenId>(numeric_start_ +
+                                (static_cast<int64_t>(value) - static_cast<int64_t>(int_min_)));
 }
 
 NumericTokenizer::TokenId NumericTokenizer::nan_token() const noexcept {
-    return static_cast<TokenId>(numeric_start_ + kIntRange);
+    return static_cast<TokenId>(numeric_start_ + int_range_);
 }
 
 NumericTokenizer::TokenId NumericTokenizer::overflow_token() const noexcept {
-    return static_cast<TokenId>(numeric_start_ + kIntRange + 1);
+    return static_cast<TokenId>(numeric_start_ + int_range_ + 1);
 }
 
 NumericTokenizer::TokenId NumericTokenizer::num_placeholder_token() const noexcept {
-    return static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens);
+    return static_cast<TokenId>(numeric_start_ + int_range_ + kIntExtraTokens);
 }
 
 NumericTokenizer::TokenId NumericTokenizer::algebraic_token(int slot) const noexcept {
-    return static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens + 1 + slot);
+    return static_cast<TokenId>(numeric_start_ + int_range_ + kIntExtraTokens + 1 + slot);
 }
 
 bool NumericTokenizer::is_placeholder_token(TokenId id) const noexcept {
@@ -78,11 +86,11 @@ bool NumericTokenizer::is_placeholder_token(TokenId id) const noexcept {
 }
 
 bool NumericTokenizer::is_algebraic_token(TokenId id) const noexcept {
-    const auto base = static_cast<TokenId>(numeric_start_ + kIntRange + kIntExtraTokens + 1);
+    const auto base = static_cast<TokenId>(numeric_start_ + int_range_ + kIntExtraTokens + 1);
     return id >= base && id < static_cast<TokenId>(base + kAlgSlots);
 }
 
-std::optional<int32_t> NumericTokenizer::try_parse_int16(std::string_view s) {
+std::optional<int32_t> NumericTokenizer::try_parse_int(std::string_view s) const {
     if (s.empty()) return std::nullopt;
 
     // Only allow optional leading '-' followed by digits
@@ -96,7 +104,7 @@ std::optional<int32_t> NumericTokenizer::try_parse_int16(std::string_view s) {
     int32_t val{};
     const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), val);
     if (ec != std::errc{} || ptr != s.data() + s.size()) return std::nullopt;
-    if (val < kIntMin || val > kIntMax) return std::nullopt;
+    if (val < int_min_ || val > int_max_) return std::nullopt;
     return val;
 }
 
@@ -119,7 +127,7 @@ std::vector<NumericTokenizer::TokenId> NumericTokenizer::encode(std::string_view
 
         std::string_view word = text.substr(i, j - i);
 
-        auto parsed = try_parse_int16(word);
+        auto parsed = try_parse_int(word);
         if (parsed.has_value()) {
             result.push_back(encode_int(*parsed));
         } else {
@@ -153,7 +161,7 @@ std::string NumericTokenizer::decode(std::span<const TokenId> ids) const {
             } else if (is_overflow_token(id)) {
                 result += "Overflow";
             } else {
-                const int32_t val = static_cast<int32_t>(id - numeric_start_) + kIntMin;
+                const int32_t val = static_cast<int32_t>(id - numeric_start_) + int_min_;
                 result += std::to_string(val);
             }
         } else {

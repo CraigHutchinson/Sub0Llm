@@ -1078,12 +1078,12 @@ static void section_curriculum_learning() {
 //
 // A tiny statistical LM trained only on [0..9] single-digit arithmetic will
 // fail on large numbers it has never seen.  The math execution nodes compute
-// exact IEEE-754 int16 arithmetic for ANY input in [-32768, 32767] — no
-// training on those numbers is required.
+// exact integer arithmetic for ANY input in the tokenizer's configured range —
+// no training on those numbers is required.
 
 static void section_large_numbers() {
     std::cout << "\n=== §21.6  Large Number Arithmetic — Exact vs Statistical ===\n";
-    std::cout << "  Math nodes use exact int16 arithmetic; statistical LMs must\n";
+    std::cout << "  Math nodes use exact integer arithmetic; statistical LMs must\n";
     std::cout << "  memorise every pair and fail badly on unseen large numbers.\n\n";
 
     // Build a tiny tokenizer (BPE on digit symbols only, never sees 4-digit numbers)
@@ -1130,7 +1130,7 @@ static void section_large_numbers() {
             case RouteType::IsEqual:       ref = (c.a == c.b) ? 1 : 0; break;
             default: break;
         }
-        if (ref < NumericTokenizer::kIntMin || ref > NumericTokenizer::kIntMax)
+        if (ref < ntok.int_min() || ref > ntok.int_max())
             ref_overflow = true;
 
         std::string exact_str;
@@ -1317,70 +1317,6 @@ static constexpr int64_t kD       = 32;
 static constexpr int64_t kNHeads  = 4;
 static constexpr int64_t kNKv     = 2;
 static constexpr int64_t kNLayers = 4;
-static constexpr float   kAlpha   = 0.5f;
-
-// ── Supervision schedule ──────────────────────────────────────────────────────
-// Controls how the router-supervision weight α varies over training.
-// Flat      : constant α = alpha_start throughout.
-// LinearDecay  : α interpolates linearly from alpha_start to alpha_end.
-// CosineDecay  : cosine annealing from alpha_start down to alpha_end.
-// ExpDecay     : alpha_start*(alpha_end/alpha_start)^t — exact at both endpoints.
-//
-// alpha_end > 0 keeps a residual signal so the router never goes unsupervised.
-
-enum class SupProfile { Flat, LinearDecay, CosineDecay, ExpDecay };
-
-struct SupervisionSchedule {
-    SupProfile profile     = SupProfile::Flat;
-    float      alpha_start = 0.5f;
-    float      alpha_end   = 0.0f;
-
-    [[nodiscard]] float alpha_at(int step, int total) const noexcept {
-        if (total <= 0) return alpha_start;
-        const float t = std::clamp(
-            static_cast<float>(step) / static_cast<float>(total), 0.f, 1.f);
-        switch (profile) {
-            case SupProfile::Flat:
-                return alpha_start;
-            case SupProfile::LinearDecay:
-                return alpha_start + (alpha_end - alpha_start) * t;
-            case SupProfile::CosineDecay: {
-                const float w = 0.5f * (1.f + std::cos(std::numbers::pi_v<float> * t));
-                return alpha_end + (alpha_start - alpha_end) * w;
-            }
-            case SupProfile::ExpDecay: {
-                if (alpha_start <= 0.f) return alpha_end;
-                if (alpha_start <= alpha_end) return alpha_end;  // not a decay
-                if (alpha_end <= 0.f) {
-                    // Toward zero; k=10 gives ~0.005% residual at t=1
-                    return alpha_start * std::exp(-10.f * t);
-                }
-                // alpha_start * (alpha_end/alpha_start)^t — exact at t=0 and t=1
-                const float k = std::log(alpha_start / alpha_end);
-                return alpha_start * std::exp(-k * t);
-            }
-        }
-        return alpha_start;
-    }
-
-    [[nodiscard]] std::string label(const char* sym = "α") const {
-        const char* name = [&]() noexcept -> const char* {
-            switch (profile) {
-                case SupProfile::Flat:        return "flat";
-                case SupProfile::LinearDecay: return "linear";
-                case SupProfile::CosineDecay: return "cosine";
-                case SupProfile::ExpDecay:    return "exp";
-            }
-            return "?";
-        }();
-        if (profile == SupProfile::Flat)
-            return std::format("{} {}={:.2f}", name, sym, alpha_start);
-        return std::format("{} {}={:.2f}→{:.2f}", name, sym, alpha_start, alpha_end);
-    }
-};
-
-// Build the deterministic §21.9 corpus, tokenizer, test set, and logit bias.
-// All seeds are fixed so any phase can call this independently.
 struct ImprovedData {
     NumericTokenizer                         ntok;
     int64_t                                  V;
@@ -1391,387 +1327,6 @@ struct ImprovedData {
     Tensor                                   bias_t_full;
 };
 
-static ImprovedData build_improved_data() {
-    // Training operand ranges and OOD test ranges are fully disjoint.
-    // NumericTokenizer maps every int16 to a dedicated token, so OOD operands
-    // tokenize correctly; their embeddings are trained (they appear as results
-    // in the training corpus, receiving gradient signal via the weight-tied
-    // projection and the CE loss on active tokens).
-    static constexpr int kMaxOp      = 25;   // train: add/sub/cmp operands [0,25]
-    static constexpr int kMaxMul     = 15;   // train: mul/div operands [1,15]
-    static constexpr int kPerTrain   = 4;    // training examples per distinct result
-    static constexpr int kCmpN       = 100;  // comparison true/false examples each
-
-    // OOD test ranges — strictly disjoint from training operand ranges
-    static constexpr int kOodOpLo    = 26;   // add/sub/cmp test operands [26,35]
-    static constexpr int kOodOpHi    = 35;
-    static constexpr int kOodMulLo   = 16;   // mul test: A∈[16,19], 19×11=209 ≤ 225
-    static constexpr int kOodMulHi   = 19;
-    static constexpr int kOodMulMaxB = 11;
-    static constexpr int kOodDivBLo  = 16;   // div test: denominator [16,20], 10×20=200 ≤ 225
-    static constexpr int kOodDivBHi  = 20;
-    static constexpr int kOodDivKMax = 10;   // div test: quotients [1,10]
-
-    std::mt19937 rng_train(42), rng_test(99);
-
-    std::vector<std::string> corpus;
-    std::vector<RouteType>   corpus_ops;
-
-    struct RawTest { std::string prompt; int32_t expected; RouteType op; };
-    std::vector<RawTest> raw_test;
-
-    // ── Training: stratified by result, kPerTrain examples per distinct result ───
-    auto train_arith = [&](RouteType op,
-                           std::function<int(int,int)> compute,
-                           const std::string& sym,
-                           int A_lo, int A_hi, int B_lo, int B_hi)
-    {
-        std::map<int, std::vector<std::pair<int,int>>> by_r;
-        for (int A = A_lo; A <= A_hi; ++A)
-            for (int B = B_lo; B <= B_hi; ++B)
-                by_r[compute(A,B)].emplace_back(A,B);
-
-        for (auto& [r, pairs] : by_r) {
-            std::shuffle(pairs.begin(), pairs.end(), rng_train);
-            int n = std::min((int)pairs.size(), kPerTrain);
-            for (int i = 0; i < n; ++i) {
-                corpus.push_back(std::to_string(pairs[i].first)+" "+sym+" "+
-                                  std::to_string(pairs[i].second)+" = "+std::to_string(r));
-                corpus_ops.push_back(op);
-            }
-        }
-    };
-
-    // ── OOD test: one example per distinct result from the OOD operand range ─────
-    auto test_arith = [&](RouteType op,
-                          std::function<int(int,int)> compute,
-                          const std::string& sym,
-                          int A_lo, int A_hi, int B_lo, int B_hi)
-    {
-        std::map<int, std::vector<std::pair<int,int>>> by_r;
-        for (int A = A_lo; A <= A_hi; ++A)
-            for (int B = B_lo; B <= B_hi; ++B)
-                by_r[compute(A,B)].emplace_back(A,B);
-
-        for (auto& [r, pairs] : by_r) {
-            std::shuffle(pairs.begin(), pairs.end(), rng_test);
-            raw_test.push_back(RawTest{
-                std::to_string(pairs[0].first)+" "+sym+" "+
-                std::to_string(pairs[0].second)+" =",
-                r, op});
-        }
-    };
-
-    train_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", 0,kMaxOp, 0,kMaxOp);
-    train_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", 0,kMaxOp, 0,kMaxOp);
-    train_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", 1,kMaxMul, 1,kMaxMul);
-
-    // OOD test — operands strictly outside training range:
-    //   Add: A∈[26,35], B∈[0,25]   → results ∈ [26,60]  (26–50 seen as Add results,
-    //                                  51–60 unseen as results but embeddings trained
-    //                                  via bias_vec active-token CE signal)
-    //   Sub: A,B∈[26,35]            → results ∈ [-9,9]   (in Sub training range [-25,25])
-    //   Mul: A∈[16,19], B∈[1,11]   → results ∈ [16,209] (subset of Mul range [1,225])
-    test_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", kOodOpLo,kOodOpHi, 0,kMaxOp);
-    test_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", kOodOpLo,kOodOpHi, kOodOpLo,kOodOpHi);
-    test_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", kOodMulLo,kOodMulHi, 1,kOodMulMaxB);
-
-    // ── Div training: group by quotient, kPerTrain examples per quotient ─────────
-    {
-        for (int k = 1; k <= kMaxMul; ++k) {
-            std::vector<std::pair<int,int>> pairs;
-            for (int B = 1; B <= kMaxMul; ++B)
-                pairs.emplace_back(k*B, B);
-            std::shuffle(pairs.begin(), pairs.end(), rng_train);
-            int n = std::min((int)pairs.size(), kPerTrain);
-            for (int i = 0; i < n; ++i) {
-                corpus.push_back(std::to_string(pairs[i].first)+" / "+
-                                  std::to_string(pairs[i].second)+" = "+std::to_string(k));
-                corpus_ops.push_back(RouteType::Div);
-            }
-        }
-    }
-
-    // ── Div OOD test: OOD denominators [16,20], quotients [1,10] ─────────────────
-    // dividend = k*B ∈ [16,200] ≤ 225; quotient result ∈ [1,10] (in training range)
-    {
-        for (int k = 1; k <= kOodDivKMax; ++k) {
-            std::vector<std::pair<int,int>> pairs;
-            for (int B = kOodDivBLo; B <= kOodDivBHi; ++B)
-                pairs.emplace_back(k*B, B);
-            std::shuffle(pairs.begin(), pairs.end(), rng_test);
-            raw_test.push_back(RawTest{
-                std::to_string(pairs[0].first)+" / "+
-                std::to_string(pairs[0].second)+" =",
-                k, RouteType::Div});
-        }
-    }
-
-    // ── Comparison training: [0,25]×[0,25], 50/50 true/false balance ─────────────
-    auto train_cmp = [&](RouteType op,
-                         std::function<bool(int,int)> cmp,
-                         const std::string& sym)
-    {
-        std::vector<std::pair<int,int>> tp, fp;
-        for (int A = 0; A <= kMaxOp; ++A)
-            for (int B = 0; B <= kMaxOp; ++B)
-                (cmp(A,B) ? tp : fp).emplace_back(A,B);
-        std::shuffle(tp.begin(), tp.end(), rng_train);
-        std::shuffle(fp.begin(), fp.end(), rng_train);
-        int n = std::min({(int)tp.size(), (int)fp.size(), kCmpN});
-        for (int i = 0; i < n; ++i) {
-            corpus.push_back(std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" = 1");
-            corpus_ops.push_back(op);
-            corpus.push_back(std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" = 0");
-            corpus_ops.push_back(op);
-        }
-    };
-
-    // ── Comparison OOD test: A,B∈[26,35]; results always 0 or 1 ─────────────────
-    auto test_cmp = [&](RouteType op,
-                        std::function<bool(int,int)> cmp,
-                        const std::string& sym)
-    {
-        std::vector<std::pair<int,int>> tp, fp;
-        for (int A = kOodOpLo; A <= kOodOpHi; ++A)
-            for (int B = kOodOpLo; B <= kOodOpHi; ++B)
-                (cmp(A,B) ? tp : fp).emplace_back(A,B);
-        std::shuffle(tp.begin(), tp.end(), rng_test);
-        std::shuffle(fp.begin(), fp.end(), rng_test);
-        for (int i = 0; i < 10 && i < (int)tp.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" =", 1, op});
-        for (int i = 0; i < 10 && i < (int)fp.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" =", 0, op});
-    };
-
-    train_cmp(RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
-    train_cmp(RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
-    test_cmp (RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
-    test_cmp (RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
-
-    // ── IsEqual training: diagonal true pairs + off-diagonal false ────────────────
-    {
-        std::vector<std::pair<int,int>> tp, fp;
-        for (int A = 0; A <= kMaxOp; ++A) {
-            tp.emplace_back(A,A);
-            for (int B = 0; B <= kMaxOp; ++B)
-                if (B != A) fp.emplace_back(A,B);
-        }
-        std::shuffle(tp.begin(), tp.end(), rng_train);
-        std::shuffle(fp.begin(), fp.end(), rng_train);
-        int n = std::min({(int)tp.size(), (int)fp.size(), kCmpN});
-        for (int i = 0; i < n; ++i) {
-            corpus.push_back(std::to_string(tp[i].first)+" == "+std::to_string(tp[i].second)+" = 1");
-            corpus_ops.push_back(RouteType::IsEqual);
-            corpus.push_back(std::to_string(fp[i].first)+" == "+std::to_string(fp[i].second)+" = 0");
-            corpus_ops.push_back(RouteType::IsEqual);
-        }
-    }
-
-    // ── IsEqual OOD test: A,B∈[26,35] ────────────────────────────────────────────
-    {
-        std::vector<std::pair<int,int>> tp, fp;
-        for (int A = kOodOpLo; A <= kOodOpHi; ++A) {
-            tp.emplace_back(A, A);
-            for (int B = kOodOpLo; B <= kOodOpHi; ++B)
-                if (B != A) fp.emplace_back(A, B);
-        }
-        std::shuffle(tp.begin(), tp.end(), rng_test);
-        std::shuffle(fp.begin(), fp.end(), rng_test);
-        for (int i = 0; i < 10 && i < (int)tp.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(tp[i].first)+" == "+std::to_string(tp[i].second)+" =", 1, RouteType::IsEqual});
-        for (int i = 0; i < 10 && i < (int)fp.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(fp[i].first)+" == "+std::to_string(fp[i].second)+" =", 0, RouteType::IsEqual});
-    }
-
-    // ── Tokenizer and encoding ────────────────────────────────────────────────────
-    auto bpe = BPETokenizer::train(corpus, 50);
-    NumericTokenizer ntok(std::move(bpe));
-    const int64_t V = ntok.total_vocab_size();
-
-    std::vector<std::vector<int32_t>> train_ids;
-    std::vector<RouteType>            train_ops;
-    for (std::size_t i = 0; i < corpus.size(); ++i) {
-        auto ids = ntok.encode(corpus[i]);
-        if (ids.size() >= 2) {
-            train_ids.push_back(std::vector<int32_t>(ids.begin(), ids.end()));
-            train_ops.push_back(corpus_ops[i]);
-        }
-    }
-
-    std::vector<TestItemImproved> test_items;
-    for (const auto& r : raw_test) {
-        auto ids = ntok.encode(r.prompt);
-        if (!ids.empty())
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   r.expected, r.op});
-    }
-
-    // ── Logit bias for legacy Phase 1Cs masking ───────────────────────────────────
-    std::vector<bool> is_active(static_cast<std::size_t>(V), false);
-    for (const auto& ids : train_ids)
-        for (auto id : ids) is_active[static_cast<std::size_t>(id)] = true;
-    for (const auto& item : test_items)
-        for (auto id : item.prompt_ids) is_active[static_cast<std::size_t>(id)] = true;
-    // Cover all result ranges including OOD test results:
-    // Sub[-25,25], Add[0,60] (OOD Add reaches 35+25=60), Mul[1,225], Div[1,15], cmp[0,1]
-    for (int v = -25; v <= 225; ++v)
-        is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
-
-    std::vector<float> bias_vec(static_cast<std::size_t>(V), -1e9f);
-    for (int64_t i = 0; i < V; ++i)
-        if (is_active[static_cast<std::size_t>(i)])
-            bias_vec[static_cast<std::size_t>(i)] = 0.0f;
-
-    int64_t max_T_loss = 0;
-    for (const auto& ids : train_ids)
-        max_T_loss = std::max(max_T_loss, static_cast<int64_t>(ids.size()) - 1);
-
-    Tensor bias_t_full({max_T_loss, V}, DType::Float32);
-    {
-        float* bsp = bias_t_full.data_as<float>().data();
-        for (int64_t t = 0; t < max_T_loss; ++t)
-            std::memcpy(bsp + t * V, bias_vec.data(),
-                        static_cast<std::size_t>(V) * sizeof(float));
-    }
-
-    return ImprovedData{
-        std::move(ntok), V,
-        std::move(train_ids), std::move(train_ops),
-        std::move(test_items),
-        std::move(bias_vec), std::move(bias_t_full)
-    };
-}
-
-static const char* route_op_name(RouteType op) noexcept {
-    switch (op) {
-        case RouteType::FFN:           return "FFN  ";
-        case RouteType::Add:           return "Add  ";
-        case RouteType::Sub:           return "Sub  ";
-        case RouteType::Mul:           return "Mul  ";
-        case RouteType::Div:           return "Div  ";
-        case RouteType::IsLessThan:    return "IsLT ";
-        case RouteType::IsGreaterThan: return "IsGT ";
-        case RouteType::IsEqual:       return "IsEq ";
-        case RouteType::Increment:     return "Inc  ";
-        case RouteType::Decrement:     return "Dec  ";
-        default:                       return "?????";
-    }
-}
-
-// ── Spot-check: per-example predictions with per-op accuracy summary ──────────
-// Load via phase "spot". Iterates the full test set and prints every prediction
-// (correct or wrong), then a per-op accuracy table so failure patterns are clear.
-static void spot_check_improved(MathGPT& model, const ImprovedData& d,
-                                TokenMode token_mode = TokenMode::Real) {
-    using RT = RouteType;
-
-    // Per-op counters indexed by static_cast<int>(RouteType)
-    constexpr int kN = static_cast<int>(RT::N_TYPES);
-    std::array<int, kN> op_ok{}, op_tot{};
-
-    struct Row {
-        std::string expr;
-        int32_t     expected;
-        int32_t     predicted;   // INT32_MIN if non-numeric token
-        RT          expected_op;
-        RT          routed_op;
-    };
-    std::vector<Row> rows;
-    rows.reserve(d.test_items.size());
-
-    for (const auto& item : d.test_items) {
-        if (item.prompt_ids.empty()) continue;
-
-        // Decode the prompt expression for display
-        std::string expr = d.ntok.decode(item.prompt_ids) + " ?";
-
-        // Greedy prediction
-        Tensor ids_t = make_ids_tensor(item.prompt_ids);
-        Variable logits = model.forward_math(ids_t, d.ntok, token_mode);
-        const int64_t last = logits.data().shape(0) - 1;
-        auto lsp = logits.data().data_as<float>();
-        int64_t best = 0;
-        float   best_v = lsp[static_cast<std::size_t>(last * d.V)];
-        for (int64_t v = 1; v < d.V; ++v) {
-            float val = lsp[static_cast<std::size_t>(last * d.V + v)];
-            if (val > best_v) { best_v = val; best = v; }
-        }
-        auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
-        int32_t pred_val = INT32_MIN;
-        if (d.ntok.is_numeric(pred_id) && !d.ntok.is_nan_token(pred_id) &&
-            !d.ntok.is_overflow_token(pred_id))
-            pred_val = static_cast<int32_t>(d.ntok.numeric_value(pred_id));
-
-        // Routing at the last (=) position
-        RouteInfo ri = model.route_info(ids_t, d.ntok, token_mode);
-        RT routed_op = ri.routes.empty() ? RT::FFN : ri.routes.back();
-
-        bool correct = (pred_val == item.expected_val);
-        auto oi = static_cast<std::size_t>(item.expected_op);
-        op_ok[oi]  += correct ? 1 : 0;
-        op_tot[oi] += 1;
-
-        rows.push_back({std::move(expr), item.expected_val, pred_val,
-                        item.expected_op, routed_op});
-    }
-
-    // ── Per-op summary ────────────────────────────────────────────────────────
-    std::cout << "\n  Per-op accuracy:\n";
-    std::cout << std::format("  {:>6}  {:>7}  {:>8}  {}\n",
-                              "op", "correct", "total", "accuracy");
-    std::cout << "  " << std::string(33, '-') << "\n";
-    int total_ok = 0, total_all = 0;
-    for (std::size_t oi = 1; oi < static_cast<std::size_t>(kN); ++oi) {  // skip FFN (0)
-        if (op_tot[oi] == 0) continue;
-        RT rt = static_cast<RT>(oi);
-        float pct = 100.f * static_cast<float>(op_ok[oi]) / static_cast<float>(op_tot[oi]);
-        std::cout << std::format("  {:>6}  {:>7}  {:>8}  {:>6.1f}%\n",
-                                  route_op_name(rt), op_ok[oi], op_tot[oi], pct);
-        total_ok  += op_ok[oi];
-        total_all += op_tot[oi];
-    }
-    std::cout << "  " << std::string(33, '-') << "\n";
-    std::cout << std::format("  {:>6}  {:>7}  {:>8}  {:>6.1f}%\n",
-                              "TOTAL", total_ok, total_all,
-                              100.f * static_cast<float>(total_ok) /
-                              static_cast<float>(std::max(1, total_all)));
-
-    // ── Wrong predictions ─────────────────────────────────────────────────────
-    std::cout << "\n  Wrong predictions (expression | expected | got | op | routed):\n";
-    std::cout << std::format("  {:>22}  {:>8}  {:>8}  {:>5}  {:>5}  {}\n",
-                              "expression", "expected", "predicted", "op", "route", "mismatch");
-    std::cout << "  " << std::string(68, '-') << "\n";
-    int n_wrong = 0;
-    for (const auto& r : rows) {
-        if (r.predicted == r.expected) continue;
-        ++n_wrong;
-        std::string pred_s = (r.predicted == INT32_MIN) ? "???" : std::to_string(r.predicted);
-        bool route_wrong   = (r.routed_op != r.expected_op);
-        std::cout << std::format("  {:>22}  {:>8}  {:>8}  {:>5}  {:>5}  {}\n",
-                                  r.expr, r.expected, pred_s,
-                                  route_op_name(r.expected_op),
-                                  route_op_name(r.routed_op),
-                                  route_wrong ? "MISROUTED" : "");
-    }
-    if (n_wrong == 0)
-        std::cout << "  (all correct!)\n";
-
-    // ── Correct-but-misrouted ─────────────────────────────────────────────────
-    std::cout << "\n  Correct answer but wrong route (router error masked by coincidence):\n";
-    int n_ghost = 0;
-    for (const auto& r : rows) {
-        if (r.predicted != r.expected) continue;       // skip real failures
-        if (r.routed_op == r.expected_op) continue;    // routing was right
-        ++n_ghost;
-        std::cout << std::format("    {:>22}  ans={:<4}  op={} → routed={}\n",
-                                  r.expr, r.expected,
-                                  route_op_name(r.expected_op),
-                                  route_op_name(r.routed_op));
-    }
-    if (n_ghost == 0)
-        std::cout << "  (none)\n";
-}
 
 static std::tuple<float, float, float> eval_improved(
     MathGPT& model,
@@ -1853,743 +1408,8 @@ static void print_train_row(int step, float loss, float acc, float spec, float e
     }
 }
 
-// ── Phase 1Cs ─────────────────────────────────────────────────────────────────
-// Trains math_block_only_parameters() with masked vocab + router supervision.
-// Saves checkpoints every kCkptInterval steps to ckpt_dir.
-// On startup, resumes from the latest ch21_1cs_step*.ckpt if present.
 
-static void run_improved_phase_1cs(
-    std::string_view ckpt_dir, int total = 1000,
-    SupervisionSchedule sched = {SupProfile::Flat, kAlpha, kAlpha},
-    TokenMode token_mode = TokenMode::Real)
-{
-    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-    std::cout << std::format("\n  Phase 1Cs — D=32, masked vocab + router supervision ({}){}",
-                              sched.label(), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
-    std::cout << '\n';
-    std::cout << std::format("  target: {} steps\n", total);
-
-    ImprovedData d    = build_improved_data();
-    const int ckpt_iv = 100;
-
-    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-
-    auto block_params = model.math_block_only_parameters();
-    auto all_params   = model.parameters();
-    Adam adam(block_params, 3e-3f);
-
-    const std::string p1_prefix = "1cs" + mode_tag;
-
-    // Resume from latest checkpoint if available
-    int start_step = load_latest_checkpoint(block_params, p1_prefix, ckpt_dir);
-    if (start_step >= total) {
-        std::cout << std::format("  Phase 1Cs already complete (step {} ≥ {}).\n",
-                                  start_step, total);
-        return;
-    }
-    start_step = std::max(start_step, -1) + 1;  // first step to run
-
-    std::mt19937 rng(11);
-    // Advance RNG to match the step we're resuming from
-    for (int i = 0; i < start_step; ++i) rng();
-
-    print_train_header(/*show_alpha=*/true);
-    float last_loss    = 0.f;
-    int   step_spec30  = -1;
-
-    auto t_phase = std::chrono::steady_clock::now();
-    int  steps_since_eval = 0;
-
-    for (int step = start_step; step <= total; ++step) {
-        const float cur_alpha = sched.alpha_at(step, total);
-        if (step % std::max(1, total / 5) == 0 || step == start_step) {
-            float ms_per_step = 0.f;
-            if (steps_since_eval > 0) {
-                auto now = std::chrono::steady_clock::now();
-                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                              / static_cast<float>(steps_since_eval);
-                t_phase = now;
-                steps_since_eval = 0;
-            }
-            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/true, token_mode);
-            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
-            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
-        }
-        if (step == total) {
-            save_checkpoint(block_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", p1_prefix, step), step);
-            break;
-        }
-        if (step > start_step && step % ckpt_iv == 0)
-            save_checkpoint(block_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", p1_prefix, step), step);
-
-        const std::size_t idx   = rng() % d.train_ids.size();
-        const auto&       ids   = d.train_ids[idx];
-        const RouteType   gt_op = d.train_ops[idx];
-        if (ids.size() < 2) { --step; rng(); continue; }
-
-        Tensor id_tensor = make_ids_tensor(ids);
-        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-        for (auto* p : all_params) p->zero_grad();
-
-        auto logits  = model.forward_math(id_tensor, d.ntok, token_mode);
-        auto ltrunc  = narrow(logits, 0, T_loss);
-        auto lmasked = add(ltrunc, narrow(Variable(d.bias_t_full, false), 0, T_loss));
-        auto L_ce    = cross_entropy(lmasked, make_targets(ids));
-
-        // Supervision at the "=" position; weight by scheduled α
-        Tensor alpha_t({1}, DType::Float32);
-        alpha_t.data_as<float>()[0] = cur_alpha;
-        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
-        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
-        Tensor gt_t({1}, DType::Int32);
-        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-        auto L_sup = cross_entropy(rlogit_eq, gt_t);
-
-        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-        L_total.backward();
-        (void)clip_grad_norm(block_params, 1.0f);
-        adam.step();
-        last_loss = L_total.data().data_as<float>()[0];
-        ++steps_since_eval;
-    }
-
-    if (step_spec30 >= 0)
-        std::cout << std::format("  → router_spec first crossed 30% at step {}\n",
-                                  step_spec30);
-    else
-        std::cout << "  → router_spec did not cross 30% within Phase 1Cs\n";
-}
-
-// ── Phase 2Cs ─────────────────────────────────────────────────────────────────
-// Full-vocab fine-tuning.  Initialises math_block from the Phase 1Cs checkpoint;
-// saves whole-model checkpoints under ch21_2cs_bsup_step*.ckpt for crash recovery.
-// Two schedules:
-//   sched      — router supervision α: direct CE signal to the routing layer
-//   bias_sched — vocab bias β: decaying mask that keeps gradient focused on active
-//                tokens early in Phase 2 (prevents 65k-token dilution), then opens
-//                to full-vocab by end so the model generalises beyond the active set
-// Returns {accuracy, router_spec, entropy} after the final evaluation.
-
-static std::tuple<float, float, float>
-run_improved_phase_2cs(
-    std::string_view ckpt_dir, int total = 5000,
-    SupervisionSchedule sched      = {SupProfile::CosineDecay, 0.3f, 0.05f},
-    SupervisionSchedule bias_sched = {SupProfile::LinearDecay, 0.8f, 0.0f},
-    int ckpt_step = 0,
-    int sched_total = 0,  // 0 = use total; >0 = normalise schedules against this value
-    TokenMode token_mode = TokenMode::Real)
-{
-    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-    std::cout << std::format(
-        "\n  Phase 2Cs — full-vocab fine-tuning, supervision α: {}, vocab bias β: {}{}\n",
-        sched.label(), bias_sched.label("β"), mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
-    std::cout << std::format("  target: {} steps\n", total);
-
-    ImprovedData d    = build_improved_data();
-    const int ckpt_iv = 200;
-
-    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-
-    auto all_params  = model.parameters();
-    auto math_params = model.math_block_only_parameters();
-    Adam adam(all_params, 3e-3f);
-
-    const std::string p2_bsup_prefix = "2cs_bsup" + mode_tag;
-    const std::string p2_sup_prefix  = "2cs_sup"  + mode_tag;
-    const std::string p1_prefix      = "1cs"      + mode_tag;
-
-    // Resume from the newest available Phase 2Cs checkpoint: bsup > sup > 1cs init
-    int start_step = load_latest_checkpoint(all_params, p2_bsup_prefix, ckpt_dir, ckpt_step);
-    if (start_step < 0)
-        start_step = load_latest_checkpoint(all_params, p2_sup_prefix, ckpt_dir, ckpt_step);
-    if (start_step < 0) {
-        // No Phase 2Cs checkpoint at all: initialise math_block from Phase 1Cs
-        int p1cs_step = load_latest_checkpoint(math_params, p1_prefix, ckpt_dir);
-        if (p1cs_step < 0)
-            throw std::runtime_error(
-                "Phase 2Cs requires a Phase 1Cs checkpoint.\n"
-                "  Run first: ./ch21_math_neurons 1cs [--ckpt-dir <dir>]");
-        std::cout << std::format("  math_block imported from Phase 1Cs checkpoint "
-                                  "(step {})\n", p1cs_step);
-        start_step = 0;
-    } else if (start_step >= total) {
-        std::cout << std::format("  Phase 2Cs already complete (step {} ≥ {}).\n",
-                                  start_step, total);
-        return eval_improved(model, d, false, token_mode);
-    }
-    start_step = std::max(start_step, -1) + 1;
-
-    std::mt19937 rng(11);
-    for (int i = 0; i < start_step; ++i) rng();
-
-    print_train_header(/*show_alpha=*/true, /*show_beta=*/true);
-    float last_loss   = 0.f;
-    int   step_spec30 = -1;
-
-    auto t_phase = std::chrono::steady_clock::now();
-    int  steps_since_eval = 0;
-
-    const int eff_sched_total = (sched_total > 0) ? sched_total : total;
-    if (sched_total > 0 && sched_total > total)
-        std::cerr << std::format(
-            "  [warn] --sched-total {} > --steps {}; schedules will not reach their "
-            "endpoints (max t={:.2f} instead of 1.0)\n",
-            sched_total, total, static_cast<float>(total) / static_cast<float>(sched_total));
-
-    // Pre-allocate a reusable workspace for the scaled vocab bias; avoids a
-    // ~(T×V×4)-byte heap allocation on every training step.
-    Tensor sbias_workspace({d.bias_t_full.shape(0), d.V}, DType::Float32);
-    const float* bsrc = d.bias_t_full.data_as<float>().data();
-
-    for (int step = start_step; step <= total; ++step) {
-        const float cur_alpha = sched.alpha_at(step, eff_sched_total);
-        const float cur_beta  = bias_sched.alpha_at(step, eff_sched_total);
-        if (step % std::max(1, total / 5) == 0 || step == start_step) {
-            float ms_per_step = 0.f;
-            if (steps_since_eval > 0) {
-                auto now = std::chrono::steady_clock::now();
-                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                              / static_cast<float>(steps_since_eval);
-                t_phase = now;
-                steps_since_eval = 0;
-            }
-            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false, token_mode);
-            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha, cur_beta);
-            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
-        }
-        if (step == total) {
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", p2_bsup_prefix, step), step);
-            break;
-        }
-        if (step > start_step && step % ckpt_iv == 0)
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", p2_bsup_prefix, step), step);
-
-        const std::size_t idx   = rng() % d.train_ids.size();
-        const auto&       ids   = d.train_ids[idx];
-        const RouteType   gt_op = d.train_ops[idx];
-        if (ids.size() < 2) { --step; rng(); continue; }
-
-        Tensor id_tensor = make_ids_tensor(ids);
-        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-        adam.zero_grad();
-        auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
-        auto ltrunc = narrow(logits, 0, T_loss);
-
-        // Decaying vocab bias: β×bias keeps gradient focused on active tokens early in
-        // Phase 2Cs (prevents 65k-token dilution); anneals to 0 so the model generalises
-        Variable lfor_ce = ltrunc;
-        if (cur_beta > 1e-4f) {
-            const int64_t T_bias = std::min(T_loss, d.bias_t_full.shape(0));
-            float* bdst = sbias_workspace.data_as<float>().data();
-            const std::size_t bn = static_cast<std::size_t>(T_bias * d.V);
-            for (std::size_t j = 0; j < bn; ++j) bdst[j] = bsrc[j] * cur_beta;
-            lfor_ce = add(ltrunc, narrow(Variable(sbias_workspace, false), 0, T_bias));
-        }
-        auto L_ce = cross_entropy(lfor_ce, make_targets(ids));
-
-        // Scheduled supervision at the "=" position
-        Tensor alpha_t({1}, DType::Float32);
-        alpha_t.data_as<float>()[0] = cur_alpha;
-        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
-        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
-        Tensor gt_t({1}, DType::Int32);
-        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-        auto L_sup   = cross_entropy(rlogit_eq, gt_t);
-        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-
-        L_total.backward();
-        (void)clip_grad_norm(all_params, 1.0f);
-        adam.step();
-        last_loss = L_total.data().data_as<float>()[0];
-        ++steps_since_eval;
-    }
-
-    if (step_spec30 >= 0)
-        std::cout << std::format("  → router_spec first crossed 30% at step {}\n",
-                                  step_spec30);
-    else
-        std::cout << "  → router_spec did not cross 30% within Phase 2Cs\n";
-
-    return eval_improved(model, d, false, token_mode);
-}
-
-// ── Single-phase training ──────────────────────────────────────────────────────
-// Trains all parameters from step 0 with full vocab and router supervision only.
-// No masked-vocab warmup — with Anon/Algebraic token modes the transformer
-// cannot approximate numeric results through the FFN (it never sees real values),
-// so the Phase 1Cs curriculum is structurally unnecessary.
-
-static std::tuple<float, float, float>
-run_train_single_phase(
-    std::string_view ckpt_dir, int total = 3000,
-    SupervisionSchedule sched = {SupProfile::CosineDecay, 0.5f, 0.05f},
-    TokenMode token_mode = TokenMode::Anon)
-{
-    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-    std::cout << std::format(
-        "\n  Single-phase training — full-vocab, all params, supervision α: {}{}\n",
-        sched.label(),
-        mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
-    std::cout << std::format("  target: {} steps\n", total);
-
-    ImprovedData d    = build_improved_data();
-    const int ckpt_iv = 200;
-
-    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-
-    auto all_params = model.parameters();
-    Adam adam(all_params, 3e-3f);
-
-    const std::string prefix = "train" + mode_tag;
-
-    int start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
-    if (start_step >= total) {
-        std::cout << std::format("  Already complete (step {} ≥ {}).\n", start_step, total);
-        return eval_improved(model, d, false, token_mode);
-    }
-    start_step = std::max(start_step, -1) + 1;
-
-    std::mt19937 rng(11);
-    for (int i = 0; i < start_step; ++i) rng();
-
-    print_train_header(/*show_alpha=*/true);
-    float last_loss   = 0.f;
-    int   step_spec30 = -1;
-    auto  t_phase     = std::chrono::steady_clock::now();
-    int   steps_since_eval = 0;
-
-    for (int step = start_step; step <= total; ++step) {
-        const float cur_alpha = sched.alpha_at(step, total);
-        if (step % std::max(1, total / 5) == 0 || step == start_step) {
-            float ms_per_step = 0.f;
-            if (steps_since_eval > 0) {
-                auto now = std::chrono::steady_clock::now();
-                ms_per_step = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                              / static_cast<float>(steps_since_eval);
-                t_phase = now;
-                steps_since_eval = 0;
-            }
-            auto [acc, spec, ent] = eval_improved(model, d, /*masked=*/false, token_mode);
-            print_train_row(step, last_loss, acc, spec, ent, ms_per_step, cur_alpha);
-            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
-        }
-        if (step == total) {
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-            break;
-        }
-        if (step > start_step && step % ckpt_iv == 0)
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-
-        const std::size_t idx   = rng() % d.train_ids.size();
-        const auto&       ids   = d.train_ids[idx];
-        const RouteType   gt_op = d.train_ops[idx];
-        if (ids.size() < 2) { --step; rng(); continue; }
-
-        Tensor id_tensor = make_ids_tensor(ids);
-        const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-        adam.zero_grad();
-        auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
-        auto ltrunc = narrow(logits, 0, T_loss);
-        auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
-
-        Tensor alpha_t({1}, DType::Float32);
-        alpha_t.data_as<float>()[0] = cur_alpha;
-        auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
-        auto rlogit_eq = narrow(rlogits, T_loss - 1, 1);
-        Tensor gt_t({1}, DType::Int32);
-        gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-        auto L_sup   = cross_entropy(rlogit_eq, gt_t);
-        auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-
-        L_total.backward();
-        (void)clip_grad_norm(all_params, 1.0f);
-        adam.step();
-        last_loss = L_total.data().data_as<float>()[0];
-        ++steps_since_eval;
-    }
-
-    if (step_spec30 >= 0)
-        std::cout << std::format("  → router_spec first crossed 30% at step {}\n", step_spec30);
-    else
-        std::cout << "  → router_spec did not cross 30% within training\n";
-
-    return eval_improved(model, d, false, token_mode);
-}
-
-// ── §21.11  Chain-Augmented Fine-Tuning ──────────────────────────────────────
-//
-// Chained expressions ("A op1 B = R1 , R1 op2 C =") exercise a structural
-// pattern the base model never sees during single-step training.  The fix is
-// targeted fine-tuning on mixed data (25 % chains, 75 % single-step).
-//
-// Novel: dual router supervision (inspired by CTC / structured-prediction).
-// At every chain example, the router is supervised at BOTH '=' positions — the
-// intermediate one (op1) and the final one (op2).  Single-step examples keep
-// supervision only at the terminal '='.  This teaches the router that
-// "operation context resets at each sub-expression boundary."
-//
-// Add→Add chains (same op both steps) are included to teach compositional
-// structure independently of operation switching — the simplest recursive case,
-// analogous to function self-composition in category theory.
-//
-// Fine-tuning uses a reduced LR (1e-3 vs 3e-3 for cold-start) to avoid
-// disrupting the already-converged single-step routing knowledge.
-
-struct ChainItem {
-    std::vector<int32_t> full_ids;  // full sequence including R2 at end
-    int32_t              final_val;
-    RouteType            final_op;  // operation at the final '='
-    int64_t              mid_eq_pos; // token index of the intermediate '='
-    RouteType            mid_op;    // operation at the intermediate '='
-};
-
-static std::vector<ChainItem> generate_chain_items(
-    const NumericTokenizer& ntok, std::mt19937& rng)
-{
-    std::vector<ChainItem> items;
-    items.reserve(120);
-
-    auto to_ids = [&](const std::string& s) {
-        auto toks = ntok.encode(s);
-        return std::vector<int32_t>(toks.begin(), toks.end());
-    };
-
-    // Position of '=' in the full token sequence equals the number of tokens
-    // in the prefix (up to and including '=') minus one.  Because numeric
-    // values are atomic tokens and operators are single-char BPE tokens, the
-    // prefix tokenisation is identical to the corresponding prefix of the full
-    // sequence encoding.
-    auto mid_eq = [&](const std::string& prefix) -> int64_t {
-        return static_cast<int64_t>(ntok.encode(prefix).size()) - 1;
-    };
-
-    auto pick = [&](int lo, int hi) -> int {
-        return lo + static_cast<int>(rng() % static_cast<unsigned>(hi - lo + 1));
-    };
-
-    // Add→Mul:  "A + B = R1 , R1 * C = R2"
-    for (int i = 0; i < 30; ) {
-        int A = pick(2, 10), B = pick(2, 10), C = pick(2, 5);
-        int R1 = A + B, R2 = R1 * C;
-        if (R2 > 32767) continue;
-        std::string pre  = std::to_string(A) + " + " + std::to_string(B) + " =";
-        std::string full = pre + " " + std::to_string(R1) + " , " +
-                           std::to_string(R1) + " * " + std::to_string(C) +
-                           " = " + std::to_string(R2);
-        auto ids = to_ids(full);
-        if (ids.size() < 4) continue;
-        items.push_back({ids, R2, RouteType::Mul, mid_eq(pre), RouteType::Add});
-        ++i;
-    }
-
-    // Mul→Add:  "A * B = R1 , R1 + C = R2"  — the case where Algebraic scored 0 %
-    for (int i = 0; i < 30; ) {
-        int A = pick(2, 8), B = pick(2, 8), C = pick(2, 12);
-        int R1 = A * B, R2 = R1 + C;
-        if (R2 > 32767) continue;
-        std::string pre  = std::to_string(A) + " * " + std::to_string(B) + " =";
-        std::string full = pre + " " + std::to_string(R1) + " , " +
-                           std::to_string(R1) + " + " + std::to_string(C) +
-                           " = " + std::to_string(R2);
-        auto ids = to_ids(full);
-        if (ids.size() < 4) continue;
-        items.push_back({ids, R2, RouteType::Add, mid_eq(pre), RouteType::Mul});
-        ++i;
-    }
-
-    // Sub→Mul:  "A - B = R1 , R1 * C = R2"
-    for (int i = 0; i < 30; ) {
-        int A = pick(5, 15), B = pick(1, A - 1), C = pick(2, 5);
-        int R1 = A - B, R2 = R1 * C;
-        if (R1 <= 0 || R2 > 32767) continue;
-        std::string pre  = std::to_string(A) + " - " + std::to_string(B) + " =";
-        std::string full = pre + " " + std::to_string(R1) + " , " +
-                           std::to_string(R1) + " * " + std::to_string(C) +
-                           " = " + std::to_string(R2);
-        auto ids = to_ids(full);
-        if (ids.size() < 4) continue;
-        items.push_back({ids, R2, RouteType::Mul, mid_eq(pre), RouteType::Sub});
-        ++i;
-    }
-
-    // Add→Add:  "A + B = R1 , R1 + C = R2"
-    // Teaches compositional structure without operation switching — the simplest
-    // recursive case (analogous to self-composition in category theory).
-    for (int i = 0; i < 30; ) {
-        int A = pick(1, 8), B = pick(1, 8), C = pick(1, 8);
-        int R1 = A + B, R2 = R1 + C;
-        if (R2 > 32767) continue;
-        std::string pre  = std::to_string(A) + " + " + std::to_string(B) + " =";
-        std::string full = pre + " " + std::to_string(R1) + " , " +
-                           std::to_string(R1) + " + " + std::to_string(C) +
-                           " = " + std::to_string(R2);
-        auto ids = to_ids(full);
-        if (ids.size() < 4) continue;
-        items.push_back({ids, R2, RouteType::Add, mid_eq(pre), RouteType::Add});
-        ++i;
-    }
-
-    return items;
-}
-
-// Fine-tunes from the existing single-phase checkpoint with chain-augmented data.
-// 25 % of steps use chain items with dual-position router supervision.
-static std::tuple<float,float,float> run_train_chain_augmented(
-    std::string_view ckpt_dir, int total = 1000,
-    SupervisionSchedule sched = {SupProfile::CosineDecay, 0.5f, 0.05f},
-    TokenMode token_mode = TokenMode::Real)
-{
-    const std::string mode_tag    = (token_mode == TokenMode::Anon)             ? "_anon"
-                                  : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                                  : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-    const std::string base_prefix  = "train"       + mode_tag;
-    const std::string chain_prefix = "train_chain" + mode_tag;
-
-    std::cout << std::format(
-        "\n  §21.11 Chain-augmented fine-tuning — 25%% chains, dual supervision{}\n",
-        mode_tag.empty() ? "" : " [token-mode" + mode_tag + "]");
-    std::cout << std::format("  supervision α: {}  target: {} steps\n",
-                              sched.label(), total);
-
-    ImprovedData d = build_improved_data();
-
-    std::mt19937 chain_rng(77);
-    auto chain_items = generate_chain_items(d.ntok, chain_rng);
-    std::cout << std::format("  chain items: {}\n", chain_items.size());
-
-    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                  static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-    auto all_params = model.parameters();
-    Adam adam(all_params, 1e-3f);  // smaller LR — transfer learning heuristic
-
-    // Resume from chain checkpoint if present; otherwise start from base.
-    int start_step = load_latest_checkpoint(all_params, chain_prefix, ckpt_dir);
-    if (start_step < 0) {
-        start_step = load_latest_checkpoint(all_params, base_prefix, ckpt_dir);
-        if (start_step < 0)
-            throw std::runtime_error(std::format(
-                "No checkpoint found for '{}' or '{}' in {}",
-                chain_prefix, base_prefix, ckpt_dir));
-        std::cout << std::format("  starting from base checkpoint (step {})\n",
-                                  start_step);
-        start_step = 0;  // reset step counter for fine-tuning phase
-    }
-    if (start_step >= total) {
-        std::cout << std::format("  Already complete (step {} ≥ {}).\n",
-                                  start_step, total);
-        return eval_improved(model, d, false, token_mode);
-    }
-    start_step = std::max(start_step, -1) + 1;
-
-    const int ckpt_iv = 200;
-    std::mt19937 rng(33);
-    for (int i = 0; i < start_step; ++i) rng();
-
-    print_train_header(/*show_alpha=*/true);
-    float last_loss      = 0.f;
-    int   step_spec30    = -1;
-    int   steps_since_eval = 0;
-    auto  t_phase        = std::chrono::steady_clock::now();
-
-    for (int step = start_step; step <= total; ++step) {
-        const float cur_alpha = sched.alpha_at(step, total);
-
-        if (step % std::max(1, total / 5) == 0 || step == start_step) {
-            float ms = 0.f;
-            if (steps_since_eval > 0) {
-                auto now = std::chrono::steady_clock::now();
-                ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                     / static_cast<float>(steps_since_eval);
-                t_phase = now; steps_since_eval = 0;
-            }
-            auto [acc, spec, ent] = eval_improved(model, d, false, token_mode);
-            print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
-            if (step_spec30 < 0 && spec >= 0.30f) step_spec30 = step;
-        }
-        if (step == total) {
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", chain_prefix, step), step);
-            break;
-        }
-        if (step > start_step && step % ckpt_iv == 0)
-            save_checkpoint(all_params,
-                std::filesystem::path(ckpt_dir) /
-                    std::format("ch21_{}_step{:04d}.ckpt", chain_prefix, step), step);
-
-        Tensor alpha_t({1}, DType::Float32);
-        alpha_t.data_as<float>()[0] = cur_alpha;
-
-        adam.zero_grad();
-
-        // 25 % chain items — dual-position router supervision.
-        // 75 % single-step items — standard supervision at terminal '='.
-        const bool use_chain = !chain_items.empty() && (rng() % 4 == 0);
-        if (use_chain) {
-            const auto& ci = chain_items[rng() % chain_items.size()];
-            if (ci.full_ids.size() < 4) { --step; continue; }
-
-            Tensor id_tensor = make_ids_tensor(ci.full_ids);
-            const int64_t T_loss = static_cast<int64_t>(ci.full_ids.size()) - 1;
-
-            auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
-            auto ltrunc = narrow(logits, 0, T_loss);
-            auto L_ce   = cross_entropy(ltrunc, make_targets(ci.full_ids));
-
-            auto rlogits = model.router_logits(id_tensor, d.ntok, token_mode);
-
-            // Supervision at final '='
-            Tensor gt_fin({1}, DType::Int32);
-            gt_fin.data_as<int32_t>()[0] = static_cast<int32_t>(ci.final_op);
-            auto L_sup_fin = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_fin);
-
-            // Dual supervision at intermediate '=' — half weight.
-            // Inspired by CTC and structured-prediction: every decision point
-            // in a chain gets explicit gradient, not just the final output.
-            Tensor gt_mid({1}, DType::Int32);
-            gt_mid.data_as<int32_t>()[0] = static_cast<int32_t>(ci.mid_op);
-            auto L_sup_mid = cross_entropy(narrow(rlogits, ci.mid_eq_pos, 1), gt_mid);
-
-            auto L_sup   = add(L_sup_fin, scale(L_sup_mid, 0.5f));
-            auto L_total = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-
-            L_total.backward();
-            (void)clip_grad_norm(all_params, 1.0f);
-            adam.step();
-            last_loss = L_total.data().data_as<float>()[0];
-        } else {
-            // Standard single-step training item.
-            const std::size_t idx   = rng() % d.train_ids.size();
-            const auto&       ids   = d.train_ids[idx];
-            const RouteType   gt_op = d.train_ops[idx];
-            if (ids.size() < 2) { --step; continue; }
-
-            Tensor id_tensor = make_ids_tensor(ids);
-            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-            auto logits = model.forward_math(id_tensor, d.ntok, token_mode);
-            auto ltrunc = narrow(logits, 0, T_loss);
-            auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
-
-            Tensor gt_t({1}, DType::Int32);
-            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-            auto rlogits   = model.router_logits(id_tensor, d.ntok, token_mode);
-            auto L_sup     = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
-            auto L_total   = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-
-            L_total.backward();
-            (void)clip_grad_norm(all_params, 1.0f);
-            adam.step();
-            last_loss = L_total.data().data_as<float>()[0];
-        }
-        ++steps_since_eval;
-    }
-
-    if (step_spec30 >= 0)
-        std::cout << std::format("  → router_spec first crossed 30%% at step {}\n",
-                                  step_spec30);
-
-    return eval_improved(model, d, false, token_mode);
-}
-
-// ── Standalone evaluation ─────────────────────────────────────────────────────
-// Load the latest checkpoint (train > 2cs_bsup > 2cs_sup > 2cs) and print the
-// summary table.
-
-static void run_improved_eval(std::string_view ckpt_dir, int ckpt_step = 0,
-                               TokenMode token_mode = TokenMode::Real) {
-    if (ckpt_step > 0)
-        std::cout << std::format("\n  Eval — loading checkpoint at step {}\n", ckpt_step);
-    else
-        std::cout << "\n  Eval — loading latest checkpoint\n";
-
-    const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                               : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                               : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-
-    ImprovedData d = build_improved_data();
-    MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                   static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-
-    auto all_params = model.parameters();
-    // Search order: single-phase train > two-phase bsup > sup > unsupervised
-    int loaded_step = load_latest_checkpoint(all_params, "train"    + mode_tag, ckpt_dir, ckpt_step);
-    if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
-    if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs_sup"  + mode_tag, ckpt_dir, ckpt_step);
-    if (loaded_step < 0)
-        loaded_step = load_latest_checkpoint(all_params, "2cs"      + mode_tag, ckpt_dir, ckpt_step);
-    if (loaded_step < 0)
-        throw std::runtime_error(
-            "No checkpoint found.\n"
-            "  Run first: ./ch21_math_neurons train [--ckpt-dir <dir>] [--token-mode anon]");
-
-    auto [acc, spec, ent] = eval_improved(model, d, false, token_mode);
-    std::cout << std::format("  accuracy={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
-                              acc * 100.f, spec * 100.f, ent);
-    std::cout << "\n  Summary (§21.9 vs §21.8 Phase 2C documented baseline):\n";
-    std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
-                              "model", "accuracy", "router_spec", "entropy");
-    std::cout << "  " << std::string(83, '-') << "\n";
-    std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                              "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
-                              22.0f, 50.0f, 0.04f);
-    std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                              std::format("§21.9 (D=32, sup, step {}{})", loaded_step,
-                                          mode_tag.empty() ? "" : ", " + mode_tag.substr(1)),
-                              acc * 100.f, spec * 100.f, ent);
-}
-
-// ── §21.12  Advanced Algebraic Training Dataset ───────────────────────────────
-//
-// Inspired by the structure of the DeepMind Mathematics Dataset (Saxton et al.,
-// 2019) — arithmetic, algebra, mixed expressions — but purpose-built for the
-// Algebraic token mode.  Key design principles:
-//
-//   • Expression diversity over value diversity — Algebraic mode renders all
-//     values as abstract slots (X0, X1, …), so only the structural pattern
-//     matters.  We maximise template variety, not numeric range.
-//
-//   • Chains from the start — no separate fine-tuning step needed.  Two-step
-//     and three-step chains (like the §21.11 fix) are first-class training items.
-//
-//   • Standard formulae as compositional anchors — Celsius→Fahrenheit,
-//     triangle area, Pythagorean triples, etc. provide naturally chained
-//     real-world patterns that bind operation sequences to semantic meaning.
-//
-//   • Sqrt as a new unary op — perfect-square inputs; the router must learn
-//     to detect "sqrt ( ... )" context distinctly from binary ops.
-//
-//   • Mixed-operator order-of-operations chains — A*B+C, A+B*C expressed
-//     as sub-expression chains, teaching the router that the last operator
-//     before '=' is always the one being requested.
-
-static ImprovedData build_advanced_algebraic_data() {
+static ImprovedData build_math_dataset_base() {
     std::mt19937 rng(42), rng_test(99);
 
     std::vector<std::string> corpus;
@@ -2997,6 +1817,9 @@ static ImprovedData build_advanced_algebraic_data() {
     // vocab_size=70: handles existing op symbols + "sqrt", "(", ")", "++"/"--"
     auto bpe  = BPETokenizer::train(corpus, 70);
     NumericTokenizer ntok(std::move(bpe));
+    // The corpus safe() guard above uses kMax=32767; verify it matches the tokenizer range.
+    if (ntok.int_max() != kMax || ntok.int_min() != -kMax - 1)
+        throw std::logic_error("build_math_dataset_base: tokenizer range != corpus safe range");
     const int64_t V = ntok.total_vocab_size();
 
     std::vector<std::vector<int32_t>> train_ids;
@@ -3029,19 +1852,15 @@ static ImprovedData build_advanced_algebraic_data() {
                         std::move(test_items), {}, std::move(bias_t_full)};
 }
 
-// ── §21.13: Advanced algebraic data v3 — more Sqrt, stable boost ─────────────
-// Differences vs v2:
-//  • Sqrt single-step: r=0..20, 12 copies each (240 items vs 64 in v2)
-//    → ~300 Sqrt-supervised gradient updates in 2000 steps (6× v2)
-//  • OOD Sqrt test: r=21..26 (441..676) — larger than all training squares
-//  • Training uses boost=15 (stable); eval uses boost=50 (fixes chain OOD)
-static ImprovedData build_advanced_algebraic_data_v3() {
-    // Start from v2 data, then override/extend Sqrt items.
-    ImprovedData base = build_advanced_algebraic_data();
 
-    // Re-encode the extended Sqrt items on the same tokenizer.
-    // Remove old Sqrt test entries (r=14..20, all single-step Sqrt).
-    // v2 OOD Sqrt was: 14,15,16,17,18,20  → 6 items
+// ── §21.14  Math training dataset ────────────────────────────────────────────
+// Builds on the base corpus: adds 240 Sqrt training items (r=0..20, 12 each),
+// extends OOD Sqrt test to r=21..26 (441..676), and uses boost=15 at train time.
+static ImprovedData build_math_dataset() {
+    // Extend the base corpus with additional Sqrt items.
+    ImprovedData base = build_math_dataset_base();
+
+    // Replace base Sqrt test items with the extended OOD set.
     {
         std::vector<TestItemImproved> kept;
         kept.reserve(base.test_items.size());
@@ -3059,12 +1878,10 @@ static ImprovedData build_advanced_algebraic_data_v3() {
                 {{ids.begin(), ids.end()}, r, RouteType::Sqrt});
     }
 
-    // Add Sqrt training items for r=0..20 (252 total after v2's 64).
-    // r=0..15 already exist in v2 (64 items): add 8 more each (→ 12 per r).
-    // r=16..20 are new: add 12 each.
+    // Add Sqrt training items: 12 copies per r for r=0..20 (extra on top of base's 4).
     for (int r = 0; r <= 20; ++r) {
         int sq = r * r;
-        int extra = (r <= 15) ? 8 : 12;   // 4 existing + 8 extra = 12; or 12 fresh
+        int extra = (r <= 15) ? 8 : 12;   // base already has 4; add 8 more → 12 total per r
         for (int rep = 0; rep < extra; ++rep) {
             auto ids = base.ntok.encode(
                 "sqrt ( " + std::to_string(sq) + " ) = " + std::to_string(r));
@@ -3088,417 +1905,17 @@ static void section_improved_training(std::string_view phase,
                                        std::string_view ckpt_dir,
                                        int steps = 0,
                                        int ckpt_step = 0,
-                                       int sched_total = 0,
                                        TokenMode token_mode = TokenMode::Real)
 {
-    // Phase supervision schedules (used by legacy 1cs/2cs path)
-    const SupervisionSchedule sched_1cs     {SupProfile::Flat,        kAlpha, kAlpha};
-    const SupervisionSchedule sched_2cs     {SupProfile::CosineDecay, 0.3f,   0.05f};
-    const SupervisionSchedule bias_sched_2cs{SupProfile::LinearDecay, 0.8f,   0.0f};
-    // Single-phase schedule: higher start α since no warmup phase
-    const SupervisionSchedule sched_train   {SupProfile::CosineDecay, 0.5f,   0.05f};
-
-    std::cout << "\n=== §21.9  Improved Specialisation: D=32, 7 ops, Router Supervision ===\n";
-    std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
-    std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual (stratified, operands [0,25]/[1,15])\n";
-    std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
-                              sched_1cs.label());
-    std::cout << std::format("  Phase 2Cs: full-vocab fine-tuning, supervision α: {}, vocab bias β: {}\n",
-                              sched_2cs.label(), bias_sched_2cs.label("β"));
     std::cout << std::format("  checkpoint directory: {}\n", ckpt_dir);
 
-    if (phase == "eval") {
-        run_improved_eval(ckpt_dir, ckpt_step, token_mode);
-        return;
-    }
-
-    if (phase == "spot") {
-        const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                                   : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                                   : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-        ImprovedData d = build_improved_data();
-        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                       static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-        auto all_params = model.parameters();
-        // Search order: single-phase train > two-phase bsup > sup
-        int loaded_step = load_latest_checkpoint(all_params, "train"    + mode_tag, ckpt_dir, ckpt_step);
-        if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs_bsup" + mode_tag, ckpt_dir, ckpt_step);
-        if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs_sup"  + mode_tag, ckpt_dir, ckpt_step);
-        if (loaded_step < 0)
-            loaded_step = load_latest_checkpoint(all_params, "2cs"      + mode_tag, ckpt_dir, ckpt_step);
-        if (loaded_step < 0)
-            throw std::runtime_error("No checkpoint found for spot check.");
-        std::cout << std::format("\n  Spot check — checkpoint step {}\n", loaded_step);
-        spot_check_improved(model, d, token_mode);
-        return;
-    }
-
-    if (phase == "train_alg2") {
-        const int total_t = (steps > 0) ? steps : 2000;
-        const SupervisionSchedule sched_alg2{SupProfile::CosineDecay, 0.5f, 0.05f};
-        std::cout << "\n  §21.12 Advanced algebraic training — fresh 2000 steps\n";
-        std::cout << std::format("  supervision α: {}  target: {} steps\n",
-                                  sched_alg2.label(), total_t);
-
-        ImprovedData d = build_advanced_algebraic_data();
-        std::cout << std::format("  training corpus: {} items  test set: {} items\n",
-                                  d.train_ids.size(), d.test_items.size());
-
-        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-        auto all_params = model.parameters();
-        Adam adam(all_params, 3e-3f);
-
-        const std::string prefix    = "train_alg2";
-        int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
-        if (start_step >= total_t) {
-            auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-            std::cout << std::format("  Already complete — acc={:.1f}%  spec={:.1f}%  ent={:.2f}\n",
-                                      acc*100.f, spec*100.f, ent);
-            return;
-        }
-        start_step = std::max(start_step, -1) + 1;
-
-        const int ckpt_iv = 200;
-        std::mt19937 rng(55);
-        for (int i = 0; i < start_step; ++i) rng();
-
-        print_train_header(/*show_alpha=*/true);
-        float last_loss = 0.f;
-        auto  t_phase   = std::chrono::steady_clock::now();
-        int   steps_since_eval = 0;
-
-        for (int step = start_step; step <= total_t; ++step) {
-            const float cur_alpha = sched_alg2.alpha_at(step, total_t);
-            if (step % std::max(1, total_t / 5) == 0 || step == start_step) {
-                float ms = 0.f;
-                if (steps_since_eval > 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                         / static_cast<float>(steps_since_eval);
-                    t_phase = now; steps_since_eval = 0;
-                }
-                auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-                print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
-            }
-            if (step == total_t) {
-                save_checkpoint(all_params,
-                    std::filesystem::path(ckpt_dir) /
-                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-                break;
-            }
-            if (step > start_step && step % ckpt_iv == 0)
-                save_checkpoint(all_params,
-                    std::filesystem::path(ckpt_dir) /
-                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-
-            const std::size_t idx   = rng() % d.train_ids.size();
-            const auto&       ids   = d.train_ids[idx];
-            const RouteType   gt_op = d.train_ops[idx];
-            if (ids.size() < 2) { --step; continue; }
-
-            Tensor id_tensor = make_ids_tensor(ids);
-            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-            Tensor alpha_t({1}, DType::Float32);
-            alpha_t.data_as<float>()[0] = cur_alpha;
-
-            adam.zero_grad();
-            auto logits = model.forward_math(id_tensor, d.ntok, TokenMode::Algebraic);
-            auto ltrunc = narrow(logits, 0, T_loss);
-            auto L_ce   = cross_entropy(ltrunc, make_targets(ids));
-
-            Tensor gt_t({1}, DType::Int32);
-            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-            auto rlogits   = model.router_logits(id_tensor, d.ntok, TokenMode::Algebraic);
-            auto L_sup     = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
-            auto L_total   = add(L_ce, mul(Variable(alpha_t, false), L_sup));
-
-            L_total.backward();
-            (void)clip_grad_norm(all_params, 1.0f);
-            adam.step();
-            last_loss = L_total.data().data_as<float>()[0];
-            ++steps_since_eval;
-        }
-
-        auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-        std::cout << std::format("\n  §21.12 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
-                                  acc * 100.f, spec * 100.f, ent);
-        return;
-    }
-
-    if (phase == "eval_alg2") {
-        std::cout << "\n  §21.12 Eval: per-op accuracy breakdown on alg2 OOD test set\n";
-        ImprovedData d = build_advanced_algebraic_data();
-        std::cout << std::format("  test set: {} items\n", d.test_items.size());
-
-        // Use a larger math_boost at eval time to test if chain Add failures are due to
-        // LM logit domination over the injected result signal.
-        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42, 50.0f);
-        auto params = model.parameters();
-        int step = load_latest_checkpoint(params, "train_alg2", ckpt_dir, ckpt_step);
-        if (step < 0)
-            throw std::runtime_error(std::format("No train_alg2 checkpoint in {}", ckpt_dir));
-        std::cout << std::format("  loaded checkpoint step {} (eval boost=50.0)\n\n", step);
-
-        // Per-op tallies + up to 3 failure samples per op
-        std::array<int, kNumRouteTypes> op_ok{};
-        std::array<int, kNumRouteTypes> op_tot{};
-        std::array<int, kNumRouteTypes> fail_shown{};
-
-        for (const auto& item : d.test_items) {
-            if (item.prompt_ids.empty()) continue;
-            Tensor ids_t = make_ids_tensor(item.prompt_ids);
-            Variable logits = model.forward_math(ids_t, d.ntok, TokenMode::Algebraic);
-
-            const int64_t last = logits.data().shape(0) - 1;
-            auto lsp = logits.data().data_as<float>();
-            int64_t best = 0;
-            float best_v = lsp[static_cast<std::size_t>(last * d.V)];
-            for (int64_t v = 1; v < d.V; ++v) {
-                float val = lsp[static_cast<std::size_t>(last * d.V + v)];
-                if (val > best_v) { best_v = val; best = v; }
-            }
-
-            const auto op_idx = static_cast<std::size_t>(item.expected_op);
-            ++op_tot[op_idx];
-            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
-            const bool correct = d.ntok.is_numeric(pred_id) &&
-                !d.ntok.is_nan_token(pred_id) && !d.ntok.is_overflow_token(pred_id) &&
-                static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val;
-            if (correct) { ++op_ok[op_idx]; continue; }
-
-            // Print up to 3 failure samples per op with route info
-            if (fail_shown[op_idx] < 3) {
-                RouteInfo ri = model.route_info(ids_t, d.ntok, TokenMode::Algebraic);
-                std::string_view chosen_op = (ri.routes.empty())
-                    ? "?" : kOpNames[static_cast<std::size_t>(ri.routes.back())];
-                std::string pred_str = d.ntok.is_numeric(pred_id)
-                    ? std::to_string(static_cast<int32_t>(d.ntok.numeric_value(pred_id)))
-                    : "non-numeric";
-                std::cout << std::format("  [{}] routed={} pred={} expected={}\n",
-                    kOpNames[op_idx], chosen_op, pred_str, item.expected_val);
-                ++fail_shown[op_idx];
-            }
-        }
-
-        // Print breakdown
-        std::cout << "\n";
-        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>8}\n", "op", "ok", "total", "acc%");
-        std::cout << "  " << std::string(35, '-') << "\n";
-        int grand_ok = 0, grand_tot = 0;
-        for (std::size_t k = 0; k < kNumRouteTypes; ++k) {
-            if (op_tot[k] == 0) continue;
-            float acc_k = static_cast<float>(op_ok[k]) / static_cast<float>(op_tot[k]) * 100.f;
-            std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n",
-                                      kOpNames[k], op_ok[k], op_tot[k], acc_k);
-            grand_ok += op_ok[k]; grand_tot += op_tot[k];
-        }
-        std::cout << "  " << std::string(35, '-') << "\n";
-        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n\n",
-                                  "TOTAL", grand_ok, grand_tot,
-                                  static_cast<float>(grand_ok)/static_cast<float>(grand_tot)*100.f);
-        return;
-    }
-
-    if (phase == "train_alg3") {
-        const int total_t = (steps > 0) ? steps : 2000;
-        const SupervisionSchedule sched_alg3{SupProfile::CosineDecay, 0.5f, 0.05f};
-        std::cout << "\n  §21.13 Advanced algebraic training v3 — more Sqrt + boost=50\n";
-        std::cout << std::format("  supervision α: {}  target: {} steps\n",
-                                  sched_alg3.label(), total_t);
-
-        ImprovedData d = build_advanced_algebraic_data_v3();
-        std::cout << std::format("  training corpus: {} items  test set: {} items\n",
-                                  d.train_ids.size(), d.test_items.size());
-
-        // Training with stable boost=15 (same as alg2); eval_alg3 uses boost=50 for OOD chain.
-        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
-        auto all_params = model.parameters();
-        Adam adam(all_params, 2e-3f);  // slightly lower LR: more Sqrt data shifts gradient balance
-
-        const std::string prefix     = "train_alg3";
-        int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
-        if (start_step >= total_t) {
-            auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-            std::cout << std::format("  Already complete — acc={:.1f}%  spec={:.1f}%  ent={:.2f}\n",
-                                      acc*100.f, spec*100.f, ent);
-            return;
-        }
-        start_step = std::max(start_step, -1) + 1;
-
-        const int ckpt_iv = 200;
-        std::mt19937 rng(55);
-        for (int i = 0; i < start_step; ++i) rng();
-
-        print_train_header(/*show_alpha=*/true);
-        float last_loss = 0.f;
-        auto  t_phase   = std::chrono::steady_clock::now();
-        int   steps_since_eval = 0;
-        float best_acc  = -1.f;
-        int   best_step = -1;
-
-        for (int step = start_step; step <= total_t; ++step) {
-            const float cur_alpha = sched_alg3.alpha_at(step, total_t);
-            if (step % std::max(1, total_t / 5) == 0 || step == start_step) {
-                float ms = 0.f;
-                if (steps_since_eval > 0) {
-                    auto now = std::chrono::steady_clock::now();
-                    ms = std::chrono::duration<float, std::milli>(now - t_phase).count()
-                         / static_cast<float>(steps_since_eval);
-                    t_phase = now; steps_since_eval = 0;
-                }
-                auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-                print_train_row(step, last_loss, acc, spec, ent, ms, cur_alpha);
-                if (acc > best_acc && step > 0) {
-                    best_acc = acc; best_step = step;
-                    save_checkpoint(all_params,
-                        std::filesystem::path(ckpt_dir) /
-                            std::format("ch21_{}_best_step{:04d}.ckpt", prefix, step), step);
-                }
-            }
-            if (step == total_t) {
-                save_checkpoint(all_params,
-                    std::filesystem::path(ckpt_dir) /
-                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-                break;
-            }
-            if (step > start_step && step % ckpt_iv == 0)
-                save_checkpoint(all_params,
-                    std::filesystem::path(ckpt_dir) /
-                        std::format("ch21_{}_step{:04d}.ckpt", prefix, step), step);
-
-            const std::size_t idx   = rng() % d.train_ids.size();
-            const auto&       ids   = d.train_ids[idx];
-            const RouteType   gt_op = d.train_ops[idx];
-            if (ids.size() < 2) { --step; continue; }
-
-            Tensor id_tensor = make_ids_tensor(ids);
-            const int64_t T_loss = static_cast<int64_t>(ids.size()) - 1;
-
-            Tensor alpha_t({1}, DType::Float32);
-            alpha_t.data_as<float>()[0] = cur_alpha;
-
-            adam.zero_grad();
-            auto logits  = model.forward_math(id_tensor, d.ntok, TokenMode::Algebraic);
-            auto ltrunc  = narrow(logits, 0, T_loss);
-            auto L_ce    = cross_entropy(ltrunc, make_targets(ids));
-
-            Tensor gt_t({1}, DType::Int32);
-            gt_t.data_as<int32_t>()[0] = static_cast<int32_t>(gt_op);
-            auto rlogits  = model.router_logits(id_tensor, d.ntok, TokenMode::Algebraic);
-            auto L_sup    = cross_entropy(narrow(rlogits, T_loss - 1, 1), gt_t);
-
-            // 2× supervision weight for Sqrt to compensate for its relative rarity.
-            const float sup_scale = (gt_op == RouteType::Sqrt) ? 2.0f : 1.0f;
-            Tensor sup_scale_t({1}, DType::Float32);
-            sup_scale_t.data_as<float>()[0] = cur_alpha * sup_scale;
-
-            auto L_total  = add(L_ce, mul(Variable(sup_scale_t, false), L_sup));
-
-            L_total.backward();
-            (void)clip_grad_norm(all_params, 1.0f);
-            adam.step();
-            last_loss = L_total.data().data_as<float>()[0];
-            ++steps_since_eval;
-        }
-
-        auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
-        std::cout << std::format("\n  §21.13 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
-                                  acc * 100.f, spec * 100.f, ent);
-        std::cout << std::format("  best checkpoint: step {} ({:.1f}%) — ch21_{}_best_step{:04d}.ckpt\n",
-                                  best_step, best_acc * 100.f, prefix, best_step);
-        return;
-    }
-
-    if (phase == "eval_alg3") {
-        std::cout << "\n  §21.13 Eval: per-op accuracy breakdown on alg3 OOD test set\n";
-        ImprovedData d = build_advanced_algebraic_data_v3();
-        std::cout << std::format("  test set: {} items\n", d.test_items.size());
-
-        MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
-                      static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42, 50.0f);
-        auto params = model.parameters();
-        // Prefer the best-accuracy checkpoint; fall back to latest if not found.
-        int step = load_latest_checkpoint(params, "train_alg3_best", ckpt_dir, ckpt_step);
-        const bool used_best = (step >= 0);
-        if (step < 0)
-            step = load_latest_checkpoint(params, "train_alg3", ckpt_dir, ckpt_step);
-        if (step < 0)
-            throw std::runtime_error(std::format("No train_alg3 checkpoint in {}", ckpt_dir));
-        std::cout << std::format("  loaded {} checkpoint step {} (boost=50.0)\n\n",
-                                  used_best ? "best" : "latest", step);
-
-        std::array<int, kNumRouteTypes> op_ok{};
-        std::array<int, kNumRouteTypes> op_tot{};
-        std::array<int, kNumRouteTypes> fail_shown{};
-
-        for (const auto& item : d.test_items) {
-            if (item.prompt_ids.empty()) continue;
-            Tensor ids_t = make_ids_tensor(item.prompt_ids);
-            Variable logits = model.forward_math(ids_t, d.ntok, TokenMode::Algebraic);
-
-            const int64_t last = logits.data().shape(0) - 1;
-            auto lsp = logits.data().data_as<float>();
-            int64_t best = 0;
-            float best_v = lsp[static_cast<std::size_t>(last * d.V)];
-            for (int64_t v = 1; v < d.V; ++v) {
-                float val = lsp[static_cast<std::size_t>(last * d.V + v)];
-                if (val > best_v) { best_v = val; best = v; }
-            }
-
-            const auto op_idx = static_cast<std::size_t>(item.expected_op);
-            ++op_tot[op_idx];
-            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
-            const bool correct = d.ntok.is_numeric(pred_id) &&
-                !d.ntok.is_nan_token(pred_id) && !d.ntok.is_overflow_token(pred_id) &&
-                static_cast<int32_t>(d.ntok.numeric_value(pred_id)) == item.expected_val;
-            if (correct) { ++op_ok[op_idx]; continue; }
-
-            if (fail_shown[op_idx] < 3) {
-                RouteInfo ri = model.route_info(ids_t, d.ntok, TokenMode::Algebraic);
-                std::string_view chosen_op = ri.routes.empty()
-                    ? "?" : kOpNames[static_cast<std::size_t>(ri.routes.back())];
-                std::string pred_str = d.ntok.is_numeric(pred_id)
-                    ? std::to_string(static_cast<int32_t>(d.ntok.numeric_value(pred_id)))
-                    : "non-numeric";
-                std::cout << std::format("  [{}] routed={} pred={} expected={}\n",
-                    kOpNames[op_idx], chosen_op, pred_str, item.expected_val);
-                ++fail_shown[op_idx];
-            }
-        }
-
-        std::cout << "\n";
-        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>8}\n", "op", "ok", "total", "acc%");
-        std::cout << "  " << std::string(35, '-') << "\n";
-        int grand_ok = 0, grand_tot = 0;
-        for (std::size_t k = 0; k < kNumRouteTypes; ++k) {
-            if (op_tot[k] == 0) continue;
-            float acc_k = static_cast<float>(op_ok[k]) / static_cast<float>(op_tot[k]) * 100.f;
-            std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n",
-                                      kOpNames[k], op_ok[k], op_tot[k], acc_k);
-            grand_ok += op_ok[k]; grand_tot += op_tot[k];
-        }
-        std::cout << "  " << std::string(35, '-') << "\n";
-        std::cout << std::format("  {:>12}  {:>5}  {:>5}  {:>7.1f}%\n\n",
-                                  "TOTAL", grand_ok, grand_tot,
-                                  static_cast<float>(grand_ok)/static_cast<float>(grand_tot)*100.f);
-        return;
-    }
-
-    // ── §21.14  Exclusive Math Routing — CE-only training ────────────────────────
-
-    if (phase == "train_alg4") {
+    if (phase == "train") {
         const int total_t = (steps > 0) ? steps : 2000;
         std::cout << "\n  §21.14 Exclusive math routing — CE-only, no supervision\n";
         std::cout << "  LM head masked for numeric range: router trains from CE loss alone\n";
         std::cout << std::format("  target: {} steps\n", total_t);
 
-        ImprovedData d = build_advanced_algebraic_data_v3();
+        ImprovedData d = build_math_dataset();
         std::cout << std::format("  training corpus: {} items  test set: {} items\n",
                                   d.train_ids.size(), d.test_items.size());
 
@@ -3507,7 +1924,7 @@ static void section_improved_training(std::string_view phase,
         auto all_params = model.parameters();
         Adam adam(all_params, 1e-3f);
 
-        const std::string prefix     = "train_alg4";
+        const std::string prefix     = "train";
         int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
         if (start_step >= total_t) {
             auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Algebraic);
@@ -3584,20 +2001,20 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
-    if (phase == "eval_alg4") {
+    if (phase == "eval") {
         std::cout << "\n  §21.14 Eval: per-op accuracy breakdown on alg4 OOD test set\n";
-        ImprovedData d = build_advanced_algebraic_data_v3();
+        ImprovedData d = build_math_dataset();
         std::cout << std::format("  test set: {} items\n", d.test_items.size());
 
         MathGPT model(d.V, kD, static_cast<std::size_t>(kNHeads),
                       static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
         auto params = model.parameters();
-        int step = load_latest_checkpoint(params, "train_alg4_best", ckpt_dir, ckpt_step);
+        int step = load_latest_checkpoint(params, "train_best", ckpt_dir, ckpt_step);
         const bool used_best = (step >= 0);
         if (step < 0)
-            step = load_latest_checkpoint(params, "train_alg4", ckpt_dir, ckpt_step);
+            step = load_latest_checkpoint(params, "train", ckpt_dir, ckpt_step);
         if (step < 0)
-            throw std::runtime_error(std::format("No train_alg4 checkpoint in {}", ckpt_dir));
+            throw std::runtime_error(std::format("No train checkpoint in {}", ckpt_dir));
         std::cout << std::format("  loaded {} checkpoint step {}\n\n",
                                   used_best ? "best" : "latest", step);
 
@@ -3658,17 +2075,17 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
-    if (phase == "train_real4") {
-        // Real-mode counterpart of train_alg4 for side-by-side OOD comparison.
+    if (phase == "train_real") {
+        // Real-mode counterpart of train for side-by-side OOD comparison.
         // Same vocabulary, data, architecture, and CE-only objective; only the
         // TokenMode differs — numeric tokens keep their actual values instead of
         // being remapped to abstract slots.
         const int total_t = (steps > 0) ? steps : 2000;
         std::cout << "\n  §21.14 Real-mode training — CE-only, no supervision\n";
-        std::cout << "  Same data/vocab as train_alg4; TokenMode::Real (actual numeric tokens)\n";
+        std::cout << "  Same data/vocab as train; TokenMode::Real (actual numeric tokens)\n";
         std::cout << std::format("  target: {} steps\n", total_t);
 
-        ImprovedData d = build_advanced_algebraic_data_v3();
+        ImprovedData d = build_math_dataset();
         std::cout << std::format("  training corpus: {} items  test set: {} items\n",
                                   d.train_ids.size(), d.test_items.size());
 
@@ -3677,7 +2094,7 @@ static void section_improved_training(std::string_view phase,
         auto all_params = model.parameters();
         Adam adam(all_params, 1e-3f);
 
-        const std::string prefix     = "train_real4";
+        const std::string prefix     = "train_real";
         int               start_step = load_latest_checkpoint(all_params, prefix, ckpt_dir);
         if (start_step >= total_t) {
             auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Real);
@@ -3746,7 +2163,7 @@ static void section_improved_training(std::string_view phase,
         }
 
         auto [acc, spec, ent] = eval_improved(model, d, false, TokenMode::Real);
-        std::cout << std::format("\n  train_real4 result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
+        std::cout << std::format("\n  train_real result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
                                   acc * 100.f, spec * 100.f, ent);
         if (best_step >= 0)
             std::cout << std::format("  best checkpoint: step {} ({:.1f}%) — ch21_{}_best_step{:04d}.ckpt\n",
@@ -3754,13 +2171,13 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
-    if (phase == "compare4") {
+    if (phase == "compare") {
         // §21.14: Real vs Algebraic on the same extended OOD test set.
         // Both models share vocabulary (build_advanced_algebraic_data_v3).
         // Real mode processes actual numeric token embeddings; algebraic mode
         // remaps them to abstract sequential slots before embedding lookup.
         std::cout << "\n  §21.14 Real vs Algebraic — OOD generalisation comparison\n";
-        ImprovedData d = build_advanced_algebraic_data_v3();
+        ImprovedData d = build_math_dataset();
         std::cout << std::format("  test set: {} items  vocab_size: {}\n\n",
                                   d.test_items.size(), d.V);
 
@@ -3769,10 +2186,10 @@ static void section_improved_training(std::string_view phase,
                           static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
         {
             auto p = alg_model.parameters();
-            int  s = load_latest_checkpoint(p, "train_alg4_best", ckpt_dir, ckpt_step);
-            if (s < 0) s = load_latest_checkpoint(p, "train_alg4", ckpt_dir, ckpt_step);
-            if (s < 0) throw std::runtime_error(std::format("No train_alg4 checkpoint in {}", ckpt_dir));
-            std::cout << std::format("  Algebraic model: step {} (train_alg4)\n", s);
+            int  s = load_latest_checkpoint(p, "train_best", ckpt_dir, ckpt_step);
+            if (s < 0) s = load_latest_checkpoint(p, "train", ckpt_dir, ckpt_step);
+            if (s < 0) throw std::runtime_error(std::format("No train checkpoint in {}", ckpt_dir));
+            std::cout << std::format("  Algebraic model: step {} (train)\n", s);
         }
 
         // Load real model
@@ -3780,10 +2197,10 @@ static void section_improved_training(std::string_view phase,
                            static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
         {
             auto p = real_model.parameters();
-            int  s = load_latest_checkpoint(p, "train_real4_best", ckpt_dir, ckpt_step);
-            if (s < 0) s = load_latest_checkpoint(p, "train_real4", ckpt_dir, ckpt_step);
-            if (s < 0) throw std::runtime_error(std::format("No train_real4 checkpoint in {}", ckpt_dir));
-            std::cout << std::format("  Real model:       step {} (train_real4)\n\n", s);
+            int  s = load_latest_checkpoint(p, "train_real_best", ckpt_dir, ckpt_step);
+            if (s < 0) s = load_latest_checkpoint(p, "train_real", ckpt_dir, ckpt_step);
+            if (s < 0) throw std::runtime_error(std::format("No train_real checkpoint in {}", ckpt_dir));
+            std::cout << std::format("  Real model:       step {} (train_real)\n\n", s);
         }
 
         // Per-op tallies for both modes
@@ -3839,67 +2256,8 @@ static void section_improved_training(std::string_view phase,
         return;
     }
 
-    if (phase == "train_chain") {
-        const int total_t = (steps > 0) ? steps : 1000;
-        const SupervisionSchedule sched_chain{SupProfile::CosineDecay, 0.5f, 0.05f};
-        auto [acc, spec, ent] = run_train_chain_augmented(ckpt_dir, total_t, sched_chain, token_mode);
-        std::cout << std::format("\n  §21.11 chain fine-tune result: acc={:.1f}%  router_spec={:.1f}%  entropy={:.2f}\n",
-                                  acc * 100.f, spec * 100.f, ent);
-        return;
-    }
-
-    if (phase == "train") {
-        const int total_t = (steps > 0) ? steps : 3000;
-        auto [acc, spec, ent] = run_train_single_phase(ckpt_dir, total_t, sched_train, token_mode);
-
-        std::cout << "\n  Summary (single-phase vs §21.8 Phase 2C documented baseline):\n";
-        std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
-                                  "model", "accuracy", "router_spec", "entropy");
-        std::cout << "  " << std::string(83, '-') << "\n";
-        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
-                                  22.0f, 50.0f, 0.04f);
-        const std::string mode_tag = (token_mode == TokenMode::Anon)             ? "_anon"
-                                   : (token_mode == TokenMode::Algebraic)        ? "_alg"
-                                   : (token_mode == TokenMode::AlgebraicSpecial) ? "_algsp" : "";
-        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  std::format("§21.9 single-phase (D=32{}, {} steps)",
-                                              mode_tag.empty() ? "" : ", " + mode_tag.substr(1),
-                                              total_t),
-                                  acc * 100.f, spec * 100.f, ent);
-        return;
-    }
-
-    if (phase == "all" || phase == "1cs") {
-        const int total1 = (steps > 0) ? steps : 1000;
-        run_improved_phase_1cs(ckpt_dir, total1, sched_1cs, token_mode);
-    }
-
-    if (phase == "all" || phase == "2cs") {
-        const int total2 = (steps > 0) ? steps : 5000;
-        auto [acc, spec, ent] = run_improved_phase_2cs(ckpt_dir, total2, sched_2cs, bias_sched_2cs, ckpt_step, sched_total, token_mode);
-
-        std::cout << "\n  Summary (Phase 2Cs vs §21.8 Phase 2C documented baseline):\n";
-        std::cout << std::format("  {:>50}  {:>9}  {:>12}  {:>9}\n",
-                                  "model", "accuracy", "router_spec", "entropy");
-        std::cout << "  " << std::string(83, '-') << "\n";
-        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  "§21.8 Phase 2C (D=16, no supervision, 1000 steps)",
-                                  22.0f, 50.0f, 0.04f);
-        std::cout << std::format("  {:>50}  {:>8.1f}%  {:>11.1f}%  {:>9.2f}\n",
-                                  std::format("§21.9 Phase 2Cs (D=32, 7-op, sup, {} steps)", total2),
-                                  acc * 100.f, spec * 100.f, ent);
-
-        std::cout << "\n  Key improvements:\n";
-        std::cout << "    D=32: router Linear(32,6) = 198 params (vs 102 at D=16)\n";
-        std::cout << "    Router supervision adds direct CE signal at the '=' position\n";
-        if (spec > 0.50f)
-            std::cout << std::format("    Phase 2Cs router_spec {:.0f}% > 50% §21.8 baseline\n",
-                                      spec * 100.f);
-        if (acc > 0.22f)
-            std::cout << std::format("    Phase 2Cs accuracy {:.0f}% > 22% §21.8 baseline\n",
-                                      acc * 100.f);
-    }
+    if (phase != "all")
+        throw std::runtime_error(std::format("unknown phase '{}' — valid: train eval train_real compare", phase));
 }
 
 // ── §21.10  Generalization Across Scale: Real vs Algebraic ────────────────────
@@ -3939,7 +2297,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
         for (int A = A_lo; A <= A_hi; ++A)
             for (int B = B_lo; B <= B_hi; ++B) {
                 int r = compute(A, B);
-                if (r >= NumericTokenizer::kIntMin && r <= NumericTokenizer::kIntMax)
+                if (r >= ntok.int_min() && r <= ntok.int_max())
                     valid.emplace_back(A, B);
             }
         std::shuffle(valid.begin(), valid.end(), rng);
@@ -3962,7 +2320,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
         for (int B = B_lo; B <= B_hi; ++B)
             for (int k = 1; k <= k_max; ++k) {
                 int A = k * B;
-                if (A <= NumericTokenizer::kIntMax) valid.emplace_back(A, B);
+                if (A <= ntok.int_max()) valid.emplace_back(A, B);
             }
         std::shuffle(valid.begin(), valid.end(), rng);
         std::vector<TestItemImproved> out;
@@ -4036,7 +2394,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
         for (int i = 0; i < kN; ) {
             int A = pick_med(rng), B = pick_med(rng), C = pick_sm(rng);
             int R1 = A + B, R2 = R1 * C;
-            if (R2 < -32768 || R2 > 32767) continue;
+            if (R2 < ntok.int_min() || R2 > ntok.int_max()) continue;
             std::string p = std::to_string(A) + " + " + std::to_string(B) + " = " +
                              std::to_string(R1) + " , " + std::to_string(R1) +
                              " * " + std::to_string(C) + " =";
@@ -4052,7 +2410,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
             std::uniform_int_distribution<int> pick_a2(20, 99);
             int A = pick_a2(rng), B = pick_sm(rng), C = pick_med(rng);
             int R1 = A * B, R2 = R1 + C;
-            if (R2 > 32767) continue;
+            if (R2 < ntok.int_min() || R2 > ntok.int_max()) continue;
             std::string p = std::to_string(A) + " * " + std::to_string(B) + " = " +
                              std::to_string(R1) + " , " + std::to_string(R1) +
                              " + " + std::to_string(C) + " =";
@@ -4069,7 +2427,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
             if (A == B) continue;
             if (A < B) std::swap(A, B);
             int R1 = A - B, R2 = R1 * C;
-            if (R2 > 32767) continue;
+            if (R2 < ntok.int_min() || R2 > ntok.int_max()) continue;
             std::string p = std::to_string(A) + " - " + std::to_string(B) + " = " +
                              std::to_string(R1) + " , " + std::to_string(R1) +
                              " * " + std::to_string(C) + " =";
@@ -4151,7 +2509,7 @@ static void section_generalization_test(
     std::cout << "  token IDs — routing depends on learned embedding geometry which\n";
     std::cout << "  only covers the training operand range [0,25].\n";
 
-    ImprovedData base = build_improved_data();
+    ImprovedData base = build_math_dataset();
     auto tiers = build_gentest_tiers(base.ntok);
 
     // Print test-set composition
@@ -4159,54 +2517,32 @@ static void section_generalization_test(
     for (const auto& tier : tiers)
         std::cout << std::format("    {:>22} — {} items\n", tier.label, tier.items.size());
 
-    // Load Real model — prefer chain-fine-tuned checkpoint over base
+    // Load Real model
     MathGPT real_model(base.V, kD, static_cast<std::size_t>(kNHeads),
                         static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
     {
         auto p    = real_model.parameters();
-        int  step = load_latest_checkpoint(p, "train_chain", real_ckpt_dir);
-        const bool chained = (step >= 0);
+        int  step = load_latest_checkpoint(p, "train_real_best", real_ckpt_dir);
         if (step < 0)
-            step = load_latest_checkpoint(p, "train", real_ckpt_dir);
+            step = load_latest_checkpoint(p, "train_real", real_ckpt_dir);
         if (step < 0)
             throw std::runtime_error(
-                std::format("No Real checkpoint in {}", real_ckpt_dir));
-        std::cout << std::format("\n  Real model      (step {:>4}, {}): {}\n",
-                                  step, chained ? "chain-ft" : "base", real_ckpt_dir);
+                std::format("No train_real checkpoint in {}", real_ckpt_dir));
+        std::cout << std::format("\n  Real model      (step {:>4}): {}\n", step, real_ckpt_dir);
     }
 
-    // Load Algebraic model — prefer chain-fine-tuned checkpoint over base
+    // Load Algebraic model
     MathGPT alg_model(base.V, kD, static_cast<std::size_t>(kNHeads),
                        static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
     {
         auto p    = alg_model.parameters();
-        int  step = load_latest_checkpoint(p, "train_chain_alg", alg_ckpt_dir);
-        const bool chained = (step >= 0);
-        // alg4/alg3 use vocab_size=70 BPE (V differs from build_improved_data's vocab_size=50);
-        // wrap each in try/catch to skip gracefully on V mismatch.
-        if (step < 0) {
-            try { step = load_latest_checkpoint(p, "train_alg4_best", alg_ckpt_dir); }
-            catch (...) { step = -1; }
-        }
-        if (step < 0) {
-            try { step = load_latest_checkpoint(p, "train_alg4", alg_ckpt_dir); }
-            catch (...) { step = -1; }
-        }
-        if (step < 0) {
-            try { step = load_latest_checkpoint(p, "train_alg3_best", alg_ckpt_dir); }
-            catch (...) { step = -1; }
-        }
-        if (step < 0) {
-            try { step = load_latest_checkpoint(p, "train_alg3", alg_ckpt_dir); }
-            catch (...) { step = -1; }
-        }
+        int  step = load_latest_checkpoint(p, "train_best", alg_ckpt_dir);
         if (step < 0)
-            step = load_latest_checkpoint(p, "train_alg", alg_ckpt_dir);
+            step = load_latest_checkpoint(p, "train", alg_ckpt_dir);
         if (step < 0)
             throw std::runtime_error(
-                std::format("No Algebraic checkpoint in {}", alg_ckpt_dir));
-        std::cout << std::format("  Algebraic model (step {:>4}, {}): {}\n",
-                                  step, chained ? "chain-ft" : "base", alg_ckpt_dir);
+                std::format("No train checkpoint in {}", alg_ckpt_dir));
+        std::cout << std::format("  Algebraic model (step {:>4}): {}\n", step, alg_ckpt_dir);
     }
 
     // Evaluate both models on every tier
@@ -4290,9 +2626,8 @@ int main(int argc, char* argv[]) {
     std::string phase       = "all";
     std::string ckpt_dir    = ".";
     std::string ckpt_dir_alg = "";   // algebraic checkpoint dir for --phase gentest
-    int         steps       = 0;  // 0 = use phase default (1000 / 5000)
+    int         steps       = 0;  // 0 = use phase default
     int         ckpt_step   = 0;  // 0 = load latest checkpoint; >0 = load <= this step
-    int         sched_total = 0;  // 0 = use steps; >0 = schedule denominator
     TokenMode   token_mode  = TokenMode::Real;
 
     for (int i = 1; i < argc; ++i) {
@@ -4302,7 +2637,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--ckpt-dir-alg" && i + 1 < argc) { ckpt_dir_alg = argv[++i]; }
         else if (arg == "--steps"       && i + 1 < argc) { steps       = std::stoi(argv[++i]); }
         else if (arg == "--ckpt-step"   && i + 1 < argc) { ckpt_step   = std::stoi(argv[++i]); }
-        else if (arg == "--sched-total" && i + 1 < argc) { sched_total = std::stoi(argv[++i]); }
         else if (arg == "--token-mode"  && i + 1 < argc) {
             std::string_view m(argv[++i]);
             if      (m == "anon")               token_mode = TokenMode::Anon;
@@ -4327,15 +2661,9 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // When targeting a specific §21.9 phase, skip the earlier demo sections.
-    const bool improved_only = (phase == "train"      || phase == "train_alg2" ||
-                                 phase == "train_alg3"  || phase == "train_alg4" ||
-                                 phase == "train_real4" || phase == "compare4"   ||
-                                 phase == "eval_alg2"   || phase == "eval_alg3"  ||
-                                 phase == "eval_alg4"   ||
-                                 phase == "train_chain" ||
-                                 phase == "1cs"   || phase == "2cs" ||
-                                 phase == "eval"  || phase == "spot");
+    // When targeting a training/eval phase, skip the earlier demo sections.
+    const bool improved_only = (phase == "train"      || phase == "train_real" ||
+                                 phase == "eval"       || phase == "compare");
     if (!improved_only) {
         section_numeric_tokenizer();
         section_math_ops();
@@ -4347,7 +2675,7 @@ int main(int argc, char* argv[]) {
         section_large_numbers();
     }
 
-    section_improved_training(phase, ckpt_dir, steps, ckpt_step, sched_total, token_mode);
+    section_improved_training(phase, ckpt_dir, steps, ckpt_step, token_mode);
 
     std::cout << "\nDone.\n";
     return 0;

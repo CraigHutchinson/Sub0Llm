@@ -36,7 +36,7 @@ static Variable make_rand_var(int64_t T, int64_t D) {
 TEST_CASE("NumericTokenizer: vocab sizes") {
     auto ntok = make_small_ntok();
     REQUIRE(ntok.total_vocab_size() ==
-            ntok.bpe_vocab_size() + NumericTokenizer::kIntRange + NumericTokenizer::kExtraTokens);
+            ntok.bpe_vocab_size() + ntok.int_range() + NumericTokenizer::kExtraTokens);
     REQUIRE(ntok.numeric_range_start() == static_cast<NumericTokenizer::TokenId>(ntok.bpe_vocab_size()));
 
     // Boundaries: just below numeric range is not numeric
@@ -48,7 +48,7 @@ TEST_CASE("NumericTokenizer: vocab sizes") {
 
     // Last valid numeric (before nan/overflow sentinels)
     auto last_int = static_cast<NumericTokenizer::TokenId>(
-        ntok.numeric_range_start() + 65535);
+        ntok.numeric_range_start() + ntok.int_range() - 1);
     REQUIRE(ntok.is_numeric(last_int));
 
     // nan and overflow tokens are also in the numeric range
@@ -70,11 +70,11 @@ TEST_CASE("NumericTokenizer: encode_int round-trip") {
     auto id_neg = ntok.encode_int(-100);
     REQUIRE(ntok.numeric_value(id_neg) == Catch::Approx(-100.0f));
 
-    auto id_max = ntok.encode_int(32767);
-    REQUIRE(ntok.numeric_value(id_max) == Catch::Approx(32767.0f));
+    auto id_max = ntok.encode_int(ntok.int_max());
+    REQUIRE(ntok.numeric_value(id_max) == Catch::Approx(static_cast<float>(ntok.int_max())));
 
     // Out of range → overflow_token
-    auto id_ovf = ntok.encode_int(32768);
+    auto id_ovf = ntok.encode_int(ntok.int_max() + 1);
     REQUIRE(id_ovf == ntok.overflow_token());
 }
 

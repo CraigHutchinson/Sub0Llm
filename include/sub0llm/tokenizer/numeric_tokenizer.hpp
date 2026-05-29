@@ -13,19 +13,16 @@ namespace sub0llm {
 // ── NumericTokenizer ──────────────────────────────────────────────────────────
 //
 // Wraps a BPETokenizer and extends its vocabulary with a contiguous range of
-// numeric token IDs representing signed int16 values plus two sentinel tokens.
+// numeric token IDs for integers in [int_min, int_max] plus sentinel tokens.
 //
 // ID layout (above the BPE vocab):
-//   [numeric_start, numeric_start + 65536)  ↔  signed int16 [-32768, 32767]
-//   numeric_start + 65536                   = NaN token
-//   numeric_start + 65537                   = Overflow token
+//   [numeric_start, numeric_start + int_range())  ↔  [int_min, int_max]
+//   numeric_start + int_range()                   = NaN token
+//   numeric_start + int_range() + 1               = Overflow token
 class NumericTokenizer {
 public:
     using TokenId = BPETokenizer::TokenId;
 
-    static constexpr int32_t  kIntMin          = -32768;
-    static constexpr int32_t  kIntMax          =  32767;
-    static constexpr int64_t  kIntRange        = 65536;
     // NaN + Overflow — the two tokens that sit inside the "numeric" predicate
     static constexpr int64_t  kIntExtraTokens  = 2;
     // Opaque algebraic symbol slots X0..X(kAlgSlots-1)
@@ -34,11 +31,19 @@ public:
     //   kIntExtraTokens (NaN, Overflow) + 1 (NUM placeholder) + kAlgSlots (X0..X3)
     static constexpr int64_t  kExtraTokens     = kIntExtraTokens + 1 + kAlgSlots;
 
-    explicit NumericTokenizer(BPETokenizer bpe);
+    // int_min/int_max define the representable integer range.
+    // Defaults match the original signed int16 range for backward compatibility.
+    explicit NumericTokenizer(BPETokenizer bpe,
+                              int32_t int_min = -32768,
+                              int32_t int_max =  32767);
 
     [[nodiscard]] int64_t total_vocab_size() const noexcept;
     [[nodiscard]] int64_t bpe_vocab_size()   const noexcept;
     [[nodiscard]] TokenId numeric_range_start() const noexcept;
+
+    [[nodiscard]] int32_t int_min()   const noexcept;
+    [[nodiscard]] int32_t int_max()   const noexcept;
+    [[nodiscard]] int64_t int_range() const noexcept;
 
     [[nodiscard]] bool is_numeric(TokenId id)        const noexcept;
     [[nodiscard]] bool is_nan_token(TokenId id)      const noexcept;
@@ -73,8 +78,11 @@ public:
 private:
     BPETokenizer bpe_;
     TokenId      numeric_start_;
+    int32_t      int_min_;
+    int32_t      int_max_;
+    int64_t      int_range_;
 
-    [[nodiscard]] static std::optional<int32_t> try_parse_int16(std::string_view s);
+    [[nodiscard]] std::optional<int32_t> try_parse_int(std::string_view s) const;
 };
 
 } // namespace sub0llm

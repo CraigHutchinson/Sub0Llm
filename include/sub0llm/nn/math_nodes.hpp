@@ -33,7 +33,9 @@ struct RouteInfo {
 
 // Apply exact arithmetic for the given RouteType.
 // FFN / default returns {0, true, false} (NaN placeholder).
-[[nodiscard]] MathResult apply_math_op(RouteType op, float a, float b);
+// int_min / int_max define the overflow window and should match the tokenizer's range.
+[[nodiscard]] MathResult apply_math_op(RouteType op, float a, float b,
+                                        int32_t int_min = -32768, int32_t int_max = 32767);
 
 // ── MathLayer ─────────────────────────────────────────────────────────────────
 //
