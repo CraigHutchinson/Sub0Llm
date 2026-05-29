@@ -232,26 +232,11 @@ TEST_CASE("apply_math_op: overflow") {
 
 TEST_CASE("MathLayer: forward shape") {
     const int64_t D = 16, T = 4;
-    auto ntok = make_small_ntok();
-    const int64_t total_V = ntok.total_vocab_size();
-
     MathLayer layer(D, /*d_ff=*/0, /*seed=*/7);
-
     Variable x = make_rand_var(T, D);
-
-    // Build all-NaN register (no numeric tokens)
     std::vector<float> reg(static_cast<std::size_t>(T),
                             std::numeric_limits<float>::quiet_NaN());
-
-    // Embedding weight: (total_V, D)
-    Tensor emb_t({total_V, D}, DType::Float32);
-    auto sp = emb_t.data_as<float>();
-    for (std::size_t i = 0; i < static_cast<std::size_t>(total_V * D); ++i)
-        sp[i] = static_cast<float>(i % 5) * 0.05f;
-    Variable emb_weight(emb_t, /*requires_grad=*/true);
-
-    auto out = layer.forward(x, reg, emb_weight, ntok);
-
+    auto out = layer.forward(x, reg);
     REQUIRE(out.data().shape(0) == T);
     REQUIRE(out.data().shape(1) == D);
 }

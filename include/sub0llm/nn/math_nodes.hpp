@@ -45,29 +45,28 @@ public:
     // D: embed dim; d_ff: FFN hidden dim (0 = auto-compute).
     MathLayer(int64_t D, int64_t d_ff = 0, std::uint64_t seed = 42);
 
-    // h:          (T, D) post-attention residual stream
-    // reg[t]:     float value if t is a numeric token, NaN otherwise
-    // emb_weight: (total_V, D) embedding weight Variable (for result token lookup)
-    // ntok:       tokenizer (for encode_int / nan_token / overflow_token)
-    // Returns (T, D) — the residual update (replaces norm2(h) + FFN role).
+    // h:      (T, D) post-attention residual stream
+    // reg[t]: float value if t is a numeric token, NaN otherwise
+    // Returns (T, D) — FFN-gated residual (no math injection; use forward_with_boost
+    //                  for the full logit-space math path).
     [[nodiscard]] autograd::Variable forward(
         const autograd::Variable& h,
-        const std::vector<float>& reg,
-        const autograd::Variable& emb_weight,
-        const NumericTokenizer&   ntok) const;
+        const std::vector<float>& reg) const;
 
-    // Like forward(), but separates the FFN residual from the math-result injection.
-    // Returns {ffn_residual (T,D), math_inject (T,D)}.
-    //   ffn_residual  — add to h for the block residual connection (FFN branch only)
-    //   math_inject   — scaled result embeddings; caller adds this to x AFTER ln_f
-    //                   so layer-norm magnitude suppression is bypassed.
+    // Like forward(), but separates the FFN residual from the math-result boost.
+    // Returns {ffn_residual (T,D), math_logit_boost (T,V)}.
+    //   ffn_residual      — add to h for the block residual connection (FFN branch only)
+    //   math_logit_boost  — sparse (T, vocab_size) direct logit boost; caller adds this
+    //                       to logits AFTER the final matmul.  Prediction is thereby
+    //                       independent of result-token embedding norm — a one-hot at
+    //                       position encode_int(result) is used instead of emb[result].
     [[nodiscard]] std::pair<autograd::Variable, autograd::Variable>
     forward_with_boost(
         const autograd::Variable& h,
         const std::vector<float>& reg,
-        const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok,
-        float                     kMathBoost) const;
+        float                     kMathBoost,
+        int64_t                   vocab_size) const;
 
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& h) const;
     // Pre-softmax router logits (T, n_types) — feed into cross_entropy for supervision.
@@ -90,20 +89,14 @@ public:
     MathTransformerBlock(int64_t D, std::size_t n_heads, std::size_t n_kv_heads,
                          int64_t d_ff = 0, std::uint64_t seed = 42);
 
-    [[nodiscard]] autograd::Variable forward_math(
-        const autograd::Variable& x,
-        const std::vector<float>& reg,
-        const autograd::Variable& emb_weight,
-        const NumericTokenizer&   ntok) const;
-
-    // Returns {hidden_out (T,D), math_inject (T,D)} — see MathLayer::forward_with_boost.
+    // Returns {hidden_out (T,D), math_logit_boost (T,V)} — see MathLayer::forward_with_boost.
     [[nodiscard]] std::pair<autograd::Variable, autograd::Variable>
     forward_math_with_boost(
         const autograd::Variable& x,
         const std::vector<float>& reg,
-        const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok,
-        float                     kMathBoost) const;
+        float                     kMathBoost,
+        int64_t                   vocab_size) const;
 
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& x) const;
     [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& x) const;

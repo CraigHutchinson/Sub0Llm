@@ -67,14 +67,26 @@ MathLayer::MathLayer(int64_t D, int64_t d_ff, std::uint64_t seed)
 
 autograd::Variable MathLayer::forward(
     const autograd::Variable& h,
-    const std::vector<float>& reg,
-    const autograd::Variable& emb_weight,
-    const NumericTokenizer&   ntok) const
+    const std::vector<float>& reg) const
 {
-    // Delegate to forward_with_boost with unit scale so the two paths stay in sync.
-    auto [ffn_residual, math_inject] =
-        forward_with_boost(h, reg, emb_weight, ntok, 1.0f);
-    return add(ffn_residual, math_inject);
+    const auto& hd = h.data();
+    if (hd.ndim() != 2)
+        throw std::runtime_error("MathLayer::forward: h must be 2D (T, D)");
+    const int64_t T = hd.shape(0);
+    if (T < 1)
+        throw std::runtime_error("MathLayer::forward: T must be >= 1");
+    if (static_cast<int64_t>(reg.size()) != T)
+        throw std::runtime_error(std::format(
+            "MathLayer::forward: reg.size()={} != T={}", reg.size(), T));
+
+    Variable xn = norm_.forward(h);
+    auto [soft_probs, hard_mask] = router_.forward(xn);
+    Variable gates   = mul(soft_probs, Variable(hard_mask, false));
+    Variable gates_T = transpose2d(gates);
+
+    Variable ffn_out   = ffn_.forward(xn);
+    Variable gate_col0 = transpose2d(narrow(gates_T, 0, 1));
+    return row_scale(ffn_out, gate_col0);
 }
 
 // ── MathLayer::forward_with_boost ────────────────────────────────────────────
@@ -88,9 +100,9 @@ std::pair<autograd::Variable, autograd::Variable>
 MathLayer::forward_with_boost(
     const autograd::Variable& h,
     const std::vector<float>& reg,
-    const autograd::Variable& emb_weight,
     const NumericTokenizer&   ntok,
-    float                     kMathBoost) const
+    float                     kMathBoost,
+    int64_t                   vocab_size) const
 {
     const auto& hd = h.data();
     if (hd.ndim() != 2)
@@ -102,16 +114,17 @@ MathLayer::forward_with_boost(
         throw std::runtime_error(std::format(
             "MathLayer::forward_with_boost: reg.size()={} != T={}", reg.size(), T));
 
-    const auto T_sz = static_cast<std::size_t>(T);
+    const auto T_sz    = static_cast<std::size_t>(T);
+    const auto V_sz    = static_cast<std::size_t>(vocab_size);
 
-    // Pre-norm + routing (identical to forward)
+    // Pre-norm + routing
     Variable xn = norm_.forward(h);
     auto [soft_probs, hard_mask] = router_.forward(xn);
     Variable gates   = mul(soft_probs, Variable(hard_mask, false));  // (T, K) STE
     Variable gates_T = transpose2d(gates);                            // (K, T)
 
-    // ── FFN branch (goes into the block residual stream, as before) ───────────
-    Variable ffn_out  = ffn_.forward(xn);
+    // ── FFN branch ────────────────────────────────────────────────────────────
+    Variable ffn_out      = ffn_.forward(xn);
     Variable gate_row0    = narrow(gates_T, 0, 1);
     Variable gate_col0    = transpose2d(gate_row0);
     Variable ffn_residual = row_scale(ffn_out, gate_col0);
@@ -130,61 +143,49 @@ MathLayer::forward_with_boost(
         }
     }
 
-    // ── Math-result injection: (T, D) scaled result embeddings ───────────────
-    // Accumulate gate_k * emb[result_k] for each math op k (NaN/overflow zeroed
-    // out via valid_mask).  After the loop, scale by kMathBoost so that validity
-    // (0/1) and the boost magnitude are kept separate — kMathBoost=0 explicitly
-    // disables injection without corrupting the validity logic.
-    // Caller adds math_inject to x AFTER ln_f, bypassing layer-norm suppression.
-    Variable math_inject(zeros({T, D_}, DType::Float32), false);
-
-    const int32_t nan_id = ntok.nan_token();
-    const int32_t ovf_id = ntok.overflow_token();
-
-    // result_ids is an Int32 index tensor (not autograd-tracked); reuse across ops.
-    Tensor result_ids({T}, DType::Int32);
-    auto   ids_sp = result_ids.data_as<int32_t>();
+    // ── Direct logit-space boost ──────────────────────────────────────────────
+    // For each math op k and each token t, place gate_k[t] at logit position
+    // encode_int(result_k_t) via a (T, V) one-hot matrix.  Injecting into logit
+    // space after the final matmul makes the result prediction independent of the
+    // result token's embedding norm — no attractor bias from heavily-trained tokens.
+    // Gradient flows through gate_col (router STE) via row_scale backward:
+    //   d_loss/d_gate_k[t] = kMathBoost * d_loss/d_logit[t, encode_int(result_k_t)]
+    Variable math_logit_boost(zeros({T, vocab_size}, DType::Float32), false);
 
     for (int k = 1; k < kNumRouteTypes; ++k) {
         const RouteType route_k = static_cast<RouteType>(k);
         const bool is_unary = (route_k == RouteType::Increment ||
                                route_k == RouteType::Decrement);
 
-        // valid_mask[t, 0] = 1.0f when a real numeric result exists, 0 otherwise.
-        // A fresh tensor is required each iteration: Variable holds a reference to
-        // the underlying storage, so the previous iteration's autograd node would
-        // be corrupted if we reset and reuse the same buffer.
-        Tensor valid_data = zeros({T, 1}, DType::Float32);
-        float* vp = valid_data.data_as<float>().data();
+        // One-hot (T, V): row t has 1.0 at result token position when result is valid.
+        // Invalid positions (NaN/overflow/missing operand) leave the row all-zero so
+        // row_scale contributes nothing — no explicit validity mask tensor needed.
+        // A fresh Tensor is required each iteration: the Variable wraps a reference to
+        // the underlying buffer; reusing would corrupt earlier autograd nodes.
+        Tensor logit_oh = zeros({T, vocab_size}, DType::Float32);
+        float* oh = logit_oh.data_as<float>().data();
 
         for (std::size_t t = 0; t < T_sz; ++t) {
-            if (op1_pos[t] < 0 || (!is_unary && op2_pos[t] < 0)) {
-                ids_sp[t] = nan_id;
-            } else {
-                const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
-                const float lhs = (!is_unary && op2_pos[t] >= 0)
-                                  ? reg[static_cast<std::size_t>(op2_pos[t])] : 0.0f;
-                const MathResult mr = apply_math_op(route_k, lhs, rhs);
-                if (mr.is_nan || mr.is_overflow) {
-                    ids_sp[t] = (mr.is_overflow) ? ovf_id : nan_id;
-                } else {
-                    ids_sp[t] = ntok.encode_int(static_cast<int32_t>(mr.value));
-                    vp[t] = 1.0f;  // validity flag only — boost applied after loop
-                }
-            }
+            if (op1_pos[t] < 0 || (!is_unary && op2_pos[t] < 0)) continue;
+
+            const float rhs = reg[static_cast<std::size_t>(op1_pos[t])];
+            const float lhs = (!is_unary && op2_pos[t] >= 0)
+                              ? reg[static_cast<std::size_t>(op2_pos[t])] : 0.0f;
+            const MathResult mr = apply_math_op(route_k, lhs, rhs);
+            if (mr.is_nan || mr.is_overflow) continue;
+
+            const auto rid = static_cast<std::size_t>(
+                ntok.encode_int(static_cast<int32_t>(mr.value)));
+            oh[t * V_sz + rid] = 1.0f;
         }
 
-        Variable result_embs = embedding_lookup(emb_weight, result_ids);    // (T, D)
-        Variable gate_row    = narrow(gates_T, static_cast<int64_t>(k), 1); // (1, T)
-        Variable gate_col    = transpose2d(gate_row);                        // (T, 1)
-        Variable valid_scale(valid_data, false);
-        Variable masked_gate = mul(gate_col, valid_scale);                   // (T, 1)
-
-        math_inject = add(math_inject, row_scale(result_embs, masked_gate));
+        Variable gate_row = narrow(gates_T, static_cast<int64_t>(k), 1); // (1, T)
+        Variable gate_col = transpose2d(gate_row);                         // (T, 1)
+        math_logit_boost  = add(math_logit_boost,
+                                row_scale(Variable(logit_oh, false), gate_col));
     }
 
-    // Apply boost as a single scalar multiply: keeps validity (0/1) and scale separate.
-    return {ffn_residual, scale(math_inject, kMathBoost)};
+    return {ffn_residual, scale(math_logit_boost, kMathBoost)};
 }
 
 RouteInfo MathLayer::route_info(const autograd::Variable& h) const {
@@ -242,28 +243,18 @@ MathTransformerBlock::MathTransformerBlock(int64_t D, std::size_t n_heads,
       attn_(static_cast<std::size_t>(D), n_heads, n_kv_heads, 10000.0f, seed),
       math_ffn_(D, d_ff, seed + 500) {}
 
-autograd::Variable MathTransformerBlock::forward_math(
-    const autograd::Variable& x,
-    const std::vector<float>& reg,
-    const autograd::Variable& emb_weight,
-    const NumericTokenizer&   ntok) const
-{
-    auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
-    return add(h, math_ffn_.forward(h, reg, emb_weight, ntok));
-}
-
 std::pair<autograd::Variable, autograd::Variable>
 MathTransformerBlock::forward_math_with_boost(
     const autograd::Variable& x,
     const std::vector<float>& reg,
-    const autograd::Variable& emb_weight,
     const NumericTokenizer&   ntok,
-    float                     kMathBoost) const
+    float                     kMathBoost,
+    int64_t                   vocab_size) const
 {
     auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
-    auto [ffn_residual, math_inject] =
-        math_ffn_.forward_with_boost(h, reg, emb_weight, ntok, kMathBoost);
-    return {add(h, ffn_residual), math_inject};
+    auto [ffn_residual, math_logit_boost] =
+        math_ffn_.forward_with_boost(h, reg, ntok, kMathBoost, vocab_size);
+    return {add(h, ffn_residual), math_logit_boost};
 }
 
 RouteInfo MathTransformerBlock::route_info(const autograd::Variable& x) const {
@@ -379,26 +370,24 @@ autograd::Variable MathGPT::forward_math(
     Variable x = tok_emb_.forward(emb_ids);
     const auto n_layers = static_cast<int64_t>(blocks_.size());
 
-    // math_inject is guaranteed to be assigned: l_math_ is in [0, n_layers).
-    Variable math_inject;
+    // math_logit_boost is guaranteed to be assigned: l_math_ is in [0, n_layers).
+    Variable math_logit_boost;
 
     for (int64_t li = 0; li < n_layers; ++li) {
         if (li == l_math_) {
-            auto [x_new, inject] = math_block_.forward_math_with_boost(
-                x, reg, tok_emb_.weight(), ntok, math_boost_);
-            x           = x_new;
-            math_inject = inject;
+            auto [x_new, boost] = math_block_.forward_math_with_boost(
+                x, reg, ntok, math_boost_, tok_emb_.vocab_size());
+            x               = x_new;
+            math_logit_boost = boost;
         } else {
             x = blocks_[static_cast<std::size_t>(li)].forward(x);
         }
     }
 
     x = ln_f_.forward(x);
-    // Add the result-embedding injection AFTER ln_f so it is not normalised
-    // away before the final weight-tied projection to logits.
-    x = add(x, math_inject);
-
-    return matmul(x, transpose2d(tok_emb_.weight()));
+    // Inject directly into logit space AFTER the final matmul so the result
+    // prediction is independent of result-token embedding norm (no attractor bias).
+    return add(matmul(x, transpose2d(tok_emb_.weight())), math_logit_boost);
 }
 
 RouteInfo MathGPT::route_info(
