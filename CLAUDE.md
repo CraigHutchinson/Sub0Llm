@@ -59,7 +59,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch22, complete)
+## Current state (Ch01–Ch23, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -100,12 +100,13 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - `include/sub0llm/nn/rlhf.hpp` — `RewardModel`, `reward_preference_loss`, `reinforce_loss`, `kl_penalty`: RLHF with Bradley-Terry preference training and KL-penalised REINFORCE (Ch20)
 - `include/sub0llm/nn/math_nodes.hpp`, `src/nn/math_nodes.cpp` — `MathLayer`, `MathGPT`, `NumericRouter`: arithmetic-aware transformer with STE routing over 11 ops (FFN, Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual, Increment, Decrement, Sqrt); `apply_math_op`, `RouteType`, `RouteInfo`; configurable integer range via `NumericTokenizer(bpe, int_min, int_max)` (Ch21)
 - `chapters/ch22_math_lm/` — General-purpose MathLM: parameter efficiency analysis, configurable int range (beyond int16), OOD generalization proof (exact compute vs memorization), mixed language+arithmetic training (Ch22)
+- `chapters/ch23_reasoned_math/` — Reasoned Arithmetic: multi-step chain-of-thought with exact math head; register walkthrough, two-step and three-step chain training, natural language word problems, OOD multi-step generalization (Ch23)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
 
 ### Tests
-417 Catch2 tests across 22 test files — all passing.
+430 Catch2 tests across 23 test files — all passing.
 
 ## Git branch
 
