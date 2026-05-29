@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <numbers>
+#include <numeric>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -2395,6 +2396,343 @@ static void section_improved_training(std::string_view phase,
     }
 }
 
+// ── §21.10  Generalization Across Scale: Real vs Algebraic ────────────────────
+//
+// Tests whether the math-neuron architecture generalises beyond training operand
+// ranges, and whether Algebraic mode closes the gap that Real mode leaves open.
+//
+// Real mode:      transformer embedding sees actual numeric token IDs.
+//                 OOD operands (e.g. 5000) were never in the *input* position during
+//                 training — only as *results*. The router may see unfamiliar
+//                 embedding patterns and misroute.
+//
+// Algebraic mode: numeric tokens are replaced with abstract slots X0, X1, ...
+//                 The embedding always sees the same abstract OP(Xi, Xj) = ?
+//                 pattern regardless of the actual values; the reg[] side-channel
+//                 carries the exact floats for arithmetic computation.
+//                 Generalisation should be perfect at any scale.
+//
+// Chained tier:   2-step expressions "A op1 B = R , R op2 C =".  Tests that
+//                 the router correctly identifies the SECOND operation even when
+//                 R is an OOD value produced at runtime, not from training data.
+
+struct GenTestTier {
+    std::string                   label;
+    std::vector<TestItemImproved> items;
+};
+
+static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok) {
+    std::mt19937 rng(2025);
+
+    // Collect valid (A, B) pairs from a range, shuffle, return up to n_sample items.
+    auto sample_arith = [&](RouteType op, const std::string& sym,
+                             std::function<int(int,int)> compute,
+                             int A_lo, int A_hi, int B_lo, int B_hi,
+                             int n_sample) -> std::vector<TestItemImproved> {
+        std::vector<std::pair<int,int>> valid;
+        for (int A = A_lo; A <= A_hi; ++A)
+            for (int B = B_lo; B <= B_hi; ++B) {
+                int r = compute(A, B);
+                if (r >= NumericTokenizer::kIntMin && r <= NumericTokenizer::kIntMax)
+                    valid.emplace_back(A, B);
+            }
+        std::shuffle(valid.begin(), valid.end(), rng);
+        std::vector<TestItemImproved> out;
+        for (int i = 0; i < std::min(n_sample, (int)valid.size()); ++i) {
+            auto [A, B] = valid[i];
+            auto ids = ntok.encode(std::to_string(A) + " " + sym + " " +
+                                    std::to_string(B) + " =");
+            if (!ids.empty())
+                out.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                compute(A, B), op});
+        }
+        return out;
+    };
+
+    // Exact-division cases: A = k * B.
+    auto sample_div = [&](int B_lo, int B_hi, int k_max, int n_sample)
+        -> std::vector<TestItemImproved> {
+        std::vector<std::pair<int,int>> valid;
+        for (int B = B_lo; B <= B_hi; ++B)
+            for (int k = 1; k <= k_max; ++k) {
+                int A = k * B;
+                if (A <= NumericTokenizer::kIntMax) valid.emplace_back(A, B);
+            }
+        std::shuffle(valid.begin(), valid.end(), rng);
+        std::vector<TestItemImproved> out;
+        for (int i = 0; i < std::min(n_sample, (int)valid.size()); ++i) {
+            auto [A, B] = valid[i];
+            auto ids = ntok.encode(std::to_string(A) + " / " + std::to_string(B) + " =");
+            if (!ids.empty())
+                out.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                A / B, RouteType::Div});
+        }
+        return out;
+    };
+
+    static constexpr int kN = 30;  // samples per op per tier
+
+    auto add_tier = [&](std::string label,
+                         int op_lo, int op_hi,        // add/sub/cmp operand range
+                         int mul_a_lo, int mul_a_hi,  // mul left operand range
+                         int mul_b_max,               // mul right operand max
+                         int div_b_lo, int div_b_hi,  // div denominator range
+                         int div_k_max)               // div quotient max
+        -> GenTestTier
+    {
+        GenTestTier t;
+        t.label = std::move(label);
+        auto push = [&](std::vector<TestItemImproved>&& v) {
+            for (auto& item : v) t.items.push_back(std::move(item));
+        };
+        push(sample_arith(RouteType::Add, "+", [](int A,int B){return A+B;},
+                           op_lo,op_hi, op_lo,op_hi, kN));
+        push(sample_arith(RouteType::Sub, "-", [](int A,int B){return A-B;},
+                           op_lo,op_hi, op_lo,op_hi, kN));
+        push(sample_arith(RouteType::Mul, "*", [](int A,int B){return A*B;},
+                           mul_a_lo,mul_a_hi, 1,mul_b_max, kN));
+        push(sample_div(div_b_lo, div_b_hi, div_k_max, kN));
+        push(sample_arith(RouteType::IsLessThan, "<",
+                           [](int A,int B){return A<B?1:0;}, op_lo,op_hi, op_lo,op_hi, kN));
+        push(sample_arith(RouteType::IsGreaterThan, ">",
+                           [](int A,int B){return A>B?1:0;}, op_lo,op_hi, op_lo,op_hi, kN));
+        push(sample_arith(RouteType::IsEqual, "==",
+                           [](int A,int B){return A==B?1:0;}, op_lo,op_hi, op_lo,op_hi, kN/3));
+        return t;
+    };
+
+    std::vector<GenTestTier> tiers;
+
+    // Near-OOD: [36, 100] — just past the existing OOD test range [26, 35]
+    tiers.push_back(add_tier("Near-OOD   [36-100]",
+                              36,100,  36,100,9,  36,100,9));
+
+    // Mid-OOD: [200, 999] — hundreds scale, far beyond training/test
+    tiers.push_back(add_tier("Mid-OOD  [200-999]",
+                              200,999,  200,999,9,  200,999,9));
+
+    // Large-OOD: [1000, 9000] — thousands scale
+    // Mul: A∈[1000,3000], B∈[1,9] → max 27000 ≤ 32767
+    // Div: B∈[1000,3000], k∈[1,9] → A=k*B ≤ 27000
+    tiers.push_back(add_tier("Large-OOD [1K-9K]",
+                              1000,9000,  1000,3000,9,  1000,3000,9));
+
+    // ── Chained tier: "A op1 B = R1 , R1 op2 C =" ────────────────────────────
+    // The model must route at the SECOND = position using an OOD intermediate.
+    // Three sub-types: Add→Mul, Mul→Add, Sub→Mul.
+    {
+        GenTestTier t;
+        t.label = "Chained    [2-step]";
+        std::uniform_int_distribution<int> pick_med(100, 499);
+        std::uniform_int_distribution<int> pick_sm(2, 9);
+
+        // Add→Mul: "A + B = R1 , R1 * C ="  (A,B ∈ [100,499], C small)
+        for (int i = 0; i < kN; ) {
+            int A = pick_med(rng), B = pick_med(rng), C = pick_sm(rng);
+            int R1 = A + B, R2 = R1 * C;
+            if (R2 < -32768 || R2 > 32767) continue;
+            std::string p = std::to_string(A) + " + " + std::to_string(B) + " = " +
+                             std::to_string(R1) + " , " + std::to_string(R1) +
+                             " * " + std::to_string(C) + " =";
+            auto ids = ntok.encode(p);
+            if (!ids.empty())
+                t.items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                    R2, RouteType::Mul});
+            ++i;
+        }
+
+        // Mul→Add: "A * B = R1 , R1 + C ="  (A∈[20,99], B small, C ∈ [100,499])
+        for (int i = 0; i < kN; ) {
+            std::uniform_int_distribution<int> pick_a2(20, 99);
+            int A = pick_a2(rng), B = pick_sm(rng), C = pick_med(rng);
+            int R1 = A * B, R2 = R1 + C;
+            if (R2 > 32767) continue;
+            std::string p = std::to_string(A) + " * " + std::to_string(B) + " = " +
+                             std::to_string(R1) + " , " + std::to_string(R1) +
+                             " + " + std::to_string(C) + " =";
+            auto ids = ntok.encode(p);
+            if (!ids.empty())
+                t.items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                    R2, RouteType::Add});
+            ++i;
+        }
+
+        // Sub→Mul: "A - B = R1 , R1 * C ="  (A > B, both ∈ [100,499], C small)
+        for (int i = 0; i < kN; ) {
+            int A = pick_med(rng), B = pick_med(rng), C = pick_sm(rng);
+            if (A == B) continue;
+            if (A < B) std::swap(A, B);
+            int R1 = A - B, R2 = R1 * C;
+            if (R2 > 32767) continue;
+            std::string p = std::to_string(A) + " - " + std::to_string(B) + " = " +
+                             std::to_string(R1) + " , " + std::to_string(R1) +
+                             " * " + std::to_string(C) + " =";
+            auto ids = ntok.encode(p);
+            if (!ids.empty())
+                t.items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
+                                    R2, RouteType::Mul});
+            ++i;
+        }
+
+        tiers.push_back(std::move(t));
+    }
+
+    return tiers;
+}
+
+struct GenTierResult {
+    float acc   = 0.f;
+    int   total = 0;
+    std::array<int, kNumRouteTypes> op_ok{};
+    std::array<int, kNumRouteTypes> op_tot{};
+};
+
+// Evaluate a model on all tiers; returns per-tier result with per-op stats.
+static std::vector<GenTierResult> eval_gentest(
+    MathGPT&                           model,
+    const NumericTokenizer&            ntok,
+    int64_t                            V,
+    const std::vector<GenTestTier>&    tiers,
+    TokenMode                          mode)
+{
+    std::vector<GenTierResult> results;
+    results.reserve(tiers.size());
+
+    for (const auto& tier : tiers) {
+        GenTierResult tr{};
+        for (const auto& item : tier.items) {
+            if (item.prompt_ids.empty()) continue;
+            Tensor ids_t = make_ids_tensor(item.prompt_ids);
+            Variable logits = model.forward_math(ids_t, ntok, mode);
+            const int64_t last = logits.data().shape(0) - 1;
+            auto lsp  = logits.data().data_as<float>();
+            int64_t best = 0;
+            float   best_v = lsp[static_cast<std::size_t>(last * V)];
+            for (int64_t v = 1; v < V; ++v) {
+                float val = lsp[static_cast<std::size_t>(last * V + v)];
+                if (val > best_v) { best_v = val; best = v; }
+            }
+            auto pred_id = static_cast<NumericTokenizer::TokenId>(best);
+            int32_t pred_val = INT32_MIN;
+            if (ntok.is_numeric(pred_id) && !ntok.is_nan_token(pred_id) &&
+                !ntok.is_overflow_token(pred_id))
+                pred_val = static_cast<int32_t>(ntok.numeric_value(pred_id));
+            ++tr.total;
+            const int op_idx = static_cast<int>(item.expected_op);
+            ++tr.op_tot[op_idx];
+            if (pred_val == item.expected_val) {
+                ++tr.op_ok[op_idx];
+            }
+        }
+        tr.acc = tr.total > 0
+            ? static_cast<float>(
+                  std::accumulate(tr.op_ok.begin(), tr.op_ok.end(), 0)) /
+              static_cast<float>(tr.total)
+            : 0.f;
+        results.push_back(tr);
+    }
+    return results;
+}
+
+static void section_generalization_test(
+    std::string_view real_ckpt_dir,
+    std::string_view alg_ckpt_dir)
+{
+    std::cout << "\n=== §21.10  Generalization Across Scale: Real vs Algebraic ===\n";
+    std::cout << "  Algebraic mode replaces every numeric token with an abstract slot\n";
+    std::cout << "  (X0, X1, …) so the transformer always sees the same OP(Xi,Xj)=?\n";
+    std::cout << "  pattern regardless of value magnitude.  Real mode sees the actual\n";
+    std::cout << "  token IDs — routing depends on learned embedding geometry which\n";
+    std::cout << "  only covers the training operand range [0,25].\n";
+
+    ImprovedData base = build_improved_data();
+    auto tiers = build_gentest_tiers(base.ntok);
+
+    // Print test-set composition
+    std::cout << "\n  Test tiers:\n";
+    for (const auto& tier : tiers)
+        std::cout << std::format("    {:>22} — {} items\n", tier.label, tier.items.size());
+
+    // Load Real model
+    MathGPT real_model(base.V, kD, static_cast<std::size_t>(kNHeads),
+                        static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+    {
+        auto p   = real_model.parameters();
+        int step = load_latest_checkpoint(p, "train", real_ckpt_dir);
+        if (step < 0)
+            throw std::runtime_error(
+                std::format("No Real checkpoint in {}", real_ckpt_dir));
+        std::cout << std::format("\n  Real model      (step {:>4}): {}\n", step, real_ckpt_dir);
+    }
+
+    // Load Algebraic model
+    MathGPT alg_model(base.V, kD, static_cast<std::size_t>(kNHeads),
+                       static_cast<std::size_t>(kNKv), kNLayers, -1, 0, /*seed=*/42);
+    {
+        auto p   = alg_model.parameters();
+        int step = load_latest_checkpoint(p, "train_alg", alg_ckpt_dir);
+        if (step < 0)
+            throw std::runtime_error(
+                std::format("No Algebraic checkpoint in {}", alg_ckpt_dir));
+        std::cout << std::format("  Algebraic model (step {:>4}): {}\n", step, alg_ckpt_dir);
+    }
+
+    // Evaluate both models on every tier
+    auto real_r = eval_gentest(real_model, base.ntok, base.V, tiers, TokenMode::Real);
+    auto alg_r  = eval_gentest(alg_model,  base.ntok, base.V, tiers, TokenMode::Algebraic);
+
+    // Print comparison table
+    std::cout << "\n";
+    std::cout << std::format("  {:>22}  {:>9}  {:>9}  {:>11}  {}\n",
+                              "tier", "real", "algebraic", "Δ(alg-real)", "n");
+    std::cout << "  " << std::string(62, '-') << "\n";
+    for (std::size_t i = 0; i < tiers.size(); ++i) {
+        float r = real_r[i].acc, a = alg_r[i].acc;
+        int   n = real_r[i].total;
+        std::cout << std::format("  {:>22}  {:>8.1f}%  {:>8.1f}%  {:>+10.1f}%  {}\n",
+                                  tiers[i].label, r * 100.f, a * 100.f,
+                                  (a - r) * 100.f, n);
+    }
+    std::cout << "  " << std::string(62, '-') << "\n";
+
+    // Overall summary
+    int real_ok = 0, alg_ok = 0, total = 0;
+    for (std::size_t i = 0; i < tiers.size(); ++i) {
+        real_ok += std::accumulate(real_r[i].op_ok.begin(), real_r[i].op_ok.end(), 0);
+        alg_ok  += std::accumulate(alg_r[i].op_ok.begin(),  alg_r[i].op_ok.end(),  0);
+        total   += real_r[i].total;
+    }
+    std::cout << std::format("  {:>22}  {:>8.1f}%  {:>8.1f}%  {:>+10.1f}%  {}\n",
+                              "OVERALL",
+                              100.f * static_cast<float>(real_ok) / static_cast<float>(total),
+                              100.f * static_cast<float>(alg_ok)  / static_cast<float>(total),
+                              100.f * static_cast<float>(alg_ok - real_ok) /
+                                      static_cast<float>(total),
+                              total);
+
+    // Per-op breakdown for the Chained tier (last tier)
+    static constexpr std::array<std::string_view, kNumRouteTypes> kOpNames = {
+        "FFN", "Add", "Sub", "Mul", "Div",
+        "IsLessThan", "IsGreaterThan", "IsEqual", "Increment", "Decrement"
+    };
+    const auto& chain_real = real_r.back();
+    const auto& chain_alg  = alg_r.back();
+    std::cout << "\n  Per-op breakdown — Chained tier:\n";
+    std::cout << std::format("  {:>14}  {:>14}  {:>14}  {:>11}\n",
+                              "op", "real", "algebraic", "n");
+    std::cout << "  " << std::string(58, '-') << "\n";
+    for (std::size_t k = 0; k < static_cast<std::size_t>(kNumRouteTypes); ++k) {
+        if (chain_real.op_tot[k] == 0) continue;
+        const float r_acc = static_cast<float>(chain_real.op_ok[k]) /
+                            static_cast<float>(chain_real.op_tot[k]);
+        const float a_acc = static_cast<float>(chain_alg.op_ok[k]) /
+                            static_cast<float>(chain_alg.op_tot[k]);
+        std::cout << std::format("  {:>14}  {:>13.1f}%  {:>13.1f}%  {:>11}\n",
+                                  kOpNames[k], r_acc * 100.f, a_acc * 100.f,
+                                  chain_real.op_tot[k]);
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 //
 // Usage:
@@ -2410,6 +2748,7 @@ static void section_improved_training(std::string_view phase,
 //   ./ch21_math_neurons spot --token-mode anon                       # per-example spot check
 //   ./ch21_math_neurons spot --ckpt-step 3000 --token-mode algebraic # spot check at step 3000
 //   ./ch21_math_neurons --phase train --ckpt-dir /tmp/ckpts --token-mode anon
+//   ./ch21_math_neurons --phase gentest --ckpt-dir /tmp/real --ckpt-dir-alg /tmp/alg
 
 int main(int argc, char* argv[]) {
     // Force line-buffered stdout so log files written via redirection are readable
@@ -2418,6 +2757,7 @@ int main(int argc, char* argv[]) {
 
     std::string phase       = "all";
     std::string ckpt_dir    = ".";
+    std::string ckpt_dir_alg = "";   // algebraic checkpoint dir for --phase gentest
     int         steps       = 0;  // 0 = use phase default (1000 / 5000)
     int         ckpt_step   = 0;  // 0 = load latest checkpoint; >0 = load <= this step
     int         sched_total = 0;  // 0 = use steps; >0 = schedule denominator
@@ -2425,8 +2765,9 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
-        if      (arg == "--phase"       && i + 1 < argc) { phase       = argv[++i]; }
-        else if (arg == "--ckpt-dir"    && i + 1 < argc) { ckpt_dir    = argv[++i]; }
+        if      (arg == "--phase"        && i + 1 < argc) { phase        = argv[++i]; }
+        else if (arg == "--ckpt-dir"     && i + 1 < argc) { ckpt_dir     = argv[++i]; }
+        else if (arg == "--ckpt-dir-alg" && i + 1 < argc) { ckpt_dir_alg = argv[++i]; }
         else if (arg == "--steps"       && i + 1 < argc) { steps       = std::stoi(argv[++i]); }
         else if (arg == "--ckpt-step"   && i + 1 < argc) { ckpt_step   = std::stoi(argv[++i]); }
         else if (arg == "--sched-total" && i + 1 < argc) { sched_total = std::stoi(argv[++i]); }
@@ -2444,6 +2785,15 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Chapter 21 — Math Neurons: Arithmetic-Aware Transformers\n";
     std::cout << std::string(60, '=') << '\n';
+
+    // §21.10 generalization test: needs both real and algebraic checkpoint dirs.
+    if (phase == "gentest") {
+        if (ckpt_dir_alg.empty())
+            ckpt_dir_alg = ckpt_dir + "_alg";  // default: same base + "_alg"
+        section_generalization_test(ckpt_dir, ckpt_dir_alg);
+        std::cout << "\nDone.\n";
+        return 0;
+    }
 
     // When targeting a specific §21.9 phase, skip the earlier demo sections.
     const bool improved_only = (phase == "train" || phase == "1cs" || phase == "2cs" ||
