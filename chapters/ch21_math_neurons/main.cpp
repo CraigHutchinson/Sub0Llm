@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <numbers>
 #include <filesystem>
 #include <format>
@@ -1389,66 +1391,137 @@ struct ImprovedData {
 };
 
 static ImprovedData build_improved_data() {
-    std::mt19937 rng_data(42);
-    std::uniform_int_distribution<int> d09(0, 9);
-    std::uniform_int_distribution<int> d19(1, 9);
+    // Stratified result sampling: each distinct result value gets kPerTrain training
+    // examples, equalising output embedding norm pressure across all result tokens.
+    // Wider operand ranges exercise more of the numeric token space.
+    static constexpr int kMaxOp    = 25;   // add/sub/cmp operands [0,25]
+    static constexpr int kMaxMul   = 15;   // mul/div operands [1,15]
+    static constexpr int kPerTrain = 4;    // training examples per distinct result
+    static constexpr int kCmpN     = 100;  // comparison true/false examples each
+
+    std::mt19937 rng_train(42), rng_test(99);
 
     std::vector<std::string> corpus;
     std::vector<RouteType>   corpus_ops;
-    corpus.reserve(700);
 
-    // Add: A + B, A,B ∈ [0,9], result ∈ [0,18]
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data), B = d09(rng_data);
-        corpus.push_back(std::to_string(A) + " + " + std::to_string(B) +
-                          " = " + std::to_string(A + B));
-        corpus_ops.push_back(RouteType::Add);
-    }
-    // Sub: A - B, A,B ∈ [0,9], result ∈ [-9,9]
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data), B = d09(rng_data);
-        corpus.push_back(std::to_string(A) + " - " + std::to_string(B) +
-                          " = " + std::to_string(A - B));
-        corpus_ops.push_back(RouteType::Sub);
-    }
-    // Mul: A * B, A,B ∈ [0,9], result ∈ [0,81]
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data), B = d09(rng_data);
-        corpus.push_back(std::to_string(A) + " * " + std::to_string(B) +
-                          " = " + std::to_string(A * B));
-        corpus_ops.push_back(RouteType::Mul);
-    }
-    // Div: A / B = k (exact integer), A = k*B, k,B ∈ [1,9]
-    for (int i = 0; i < 100; ++i) {
-        int B = d19(rng_data), k = d19(rng_data);
-        int A = k * B;
-        corpus.push_back(std::to_string(A) + " / " + std::to_string(B) +
-                          " = " + std::to_string(k));
-        corpus_ops.push_back(RouteType::Div);
-    }
-    // IsLessThan: A < B = 1 or 0, A,B ∈ [0,9]
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data), B = d09(rng_data);
-        corpus.push_back(std::to_string(A) + " < " + std::to_string(B) +
-                          " = " + std::to_string(A < B ? 1 : 0));
-        corpus_ops.push_back(RouteType::IsLessThan);
-    }
-    // IsGreaterThan: A > B = 1 or 0, A,B ∈ [0,9]
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data), B = d09(rng_data);
-        corpus.push_back(std::to_string(A) + " > " + std::to_string(B) +
-                          " = " + std::to_string(A > B ? 1 : 0));
-        corpus_ops.push_back(RouteType::IsGreaterThan);
-    }
-    // IsEqual: A == B = 1 or 0; sample equal pairs for half to balance true/false
-    for (int i = 0; i < 100; ++i) {
-        int A = d09(rng_data);
-        int B = (i % 2 == 0) ? A : d09(rng_data);  // alternate equal/random
-        corpus.push_back(std::to_string(A) + " == " + std::to_string(B) +
-                          " = " + std::to_string(A == B ? 1 : 0));
-        corpus_ops.push_back(RouteType::IsEqual);
+    struct RawTest { std::string prompt; int32_t expected; RouteType op; };
+    std::vector<RawTest> raw_test;
+
+    // ── Arithmetic ops: group all (A,B) pairs by result, take kPerTrain each ────
+    auto do_arith = [&](RouteType op,
+                        std::function<int(int,int)> compute,
+                        const std::string& sym,
+                        int A_lo, int A_hi, int B_lo, int B_hi)
+    {
+        std::map<int, std::vector<std::pair<int,int>>> by_r;
+        for (int A = A_lo; A <= A_hi; ++A)
+            for (int B = B_lo; B <= B_hi; ++B)
+                by_r[compute(A,B)].emplace_back(A,B);
+
+        auto by_r_test = by_r;
+
+        for (auto& [r, pairs] : by_r) {
+            std::shuffle(pairs.begin(), pairs.end(), rng_train);
+            int n = std::min((int)pairs.size(), kPerTrain);
+            for (int i = 0; i < n; ++i) {
+                corpus.push_back(std::to_string(pairs[i].first)+" "+sym+" "+
+                                  std::to_string(pairs[i].second)+" = "+std::to_string(r));
+                corpus_ops.push_back(op);
+            }
+        }
+        for (auto& [r, pairs] : by_r_test) {
+            std::shuffle(pairs.begin(), pairs.end(), rng_test);
+            auto [A,B] = pairs[0];
+            raw_test.push_back(RawTest{std::to_string(A)+" "+sym+" "+std::to_string(B)+" =", r, op});
+        }
+    };
+
+    do_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", 0,kMaxOp,0,kMaxOp);
+    do_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", 0,kMaxOp,0,kMaxOp);
+    do_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", 1,kMaxMul,1,kMaxMul);
+
+    // Div: group by quotient k so each quotient value trains equally often
+    {
+        auto do_div_group = [&](std::mt19937& rng, bool for_test) {
+            for (int k = 1; k <= kMaxMul; ++k) {
+                std::vector<std::pair<int,int>> pairs;
+                for (int B = 1; B <= kMaxMul; ++B)
+                    pairs.emplace_back(k*B, B);
+                std::shuffle(pairs.begin(), pairs.end(), rng);
+                if (!for_test) {
+                    int n = std::min((int)pairs.size(), kPerTrain);
+                    for (int i = 0; i < n; ++i) {
+                        corpus.push_back(std::to_string(pairs[i].first)+" / "+
+                                          std::to_string(pairs[i].second)+" = "+std::to_string(k));
+                        corpus_ops.push_back(RouteType::Div);
+                    }
+                } else {
+                    raw_test.push_back(RawTest{std::to_string(pairs[0].first)+" / "+
+                                         std::to_string(pairs[0].second)+" =", k, RouteType::Div});
+                }
+            }
+        };
+        do_div_group(rng_train, false);
+        do_div_group(rng_test,  true);
     }
 
+    // ── Comparison ops: explicit 50/50 true/false balance ────────────────────────
+    auto do_cmp = [&](RouteType op,
+                      std::function<bool(int,int)> cmp,
+                      const std::string& sym)
+    {
+        std::vector<std::pair<int,int>> tp, fp;
+        for (int A = 0; A <= kMaxOp; ++A)
+            for (int B = 0; B <= kMaxOp; ++B)
+                (cmp(A,B) ? tp : fp).emplace_back(A,B);
+        std::shuffle(tp.begin(), tp.end(), rng_train);
+        std::shuffle(fp.begin(), fp.end(), rng_train);
+        int n = std::min({(int)tp.size(), (int)fp.size(), kCmpN});
+        for (int i = 0; i < n; ++i) {
+            corpus.push_back(std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" = 1");
+            corpus_ops.push_back(op);
+            corpus.push_back(std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" = 0");
+            corpus_ops.push_back(op);
+        }
+        auto tp2 = tp, fp2 = fp;
+        std::shuffle(tp2.begin(), tp2.end(), rng_test);
+        std::shuffle(fp2.begin(), fp2.end(), rng_test);
+        for (int i = 0; i < 10 && i < (int)tp2.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(tp2[i].first)+" "+sym+" "+std::to_string(tp2[i].second)+" =", 1, op});
+        for (int i = 0; i < 10 && i < (int)fp2.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(fp2[i].first)+" "+sym+" "+std::to_string(fp2[i].second)+" =", 0, op});
+    };
+
+    do_cmp(RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
+    do_cmp(RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
+
+    // IsEqual: A==B true pairs are on the diagonal (A==B), false elsewhere
+    {
+        std::vector<std::pair<int,int>> tp, fp;
+        for (int A = 0; A <= kMaxOp; ++A) {
+            tp.emplace_back(A,A);
+            for (int B = 0; B <= kMaxOp; ++B)
+                if (B != A) fp.emplace_back(A,B);
+        }
+        std::shuffle(tp.begin(), tp.end(), rng_train);
+        std::shuffle(fp.begin(), fp.end(), rng_train);
+        int n = std::min({(int)tp.size(), (int)fp.size(), kCmpN});
+        for (int i = 0; i < n; ++i) {
+            corpus.push_back(std::to_string(tp[i].first)+" == "+std::to_string(tp[i].second)+" = 1");
+            corpus_ops.push_back(RouteType::IsEqual);
+            corpus.push_back(std::to_string(fp[i].first)+" == "+std::to_string(fp[i].second)+" = 0");
+            corpus_ops.push_back(RouteType::IsEqual);
+        }
+        auto tp2 = tp, fp2 = fp;
+        std::shuffle(tp2.begin(), tp2.end(), rng_test);
+        std::shuffle(fp2.begin(), fp2.end(), rng_test);
+        for (int i = 0; i < 10 && i < (int)tp2.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(tp2[i].first)+" == "+std::to_string(tp2[i].second)+" =", 1, RouteType::IsEqual});
+        for (int i = 0; i < 10 && i < (int)fp2.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(fp2[i].first)+" == "+std::to_string(fp2[i].second)+" =", 0, RouteType::IsEqual});
+    }
+
+    // ── Tokenizer and encoding ────────────────────────────────────────────────────
     auto bpe = BPETokenizer::train(corpus, 50);
     NumericTokenizer ntok(std::move(bpe));
     const int64_t V = ntok.total_vocab_size();
@@ -1464,66 +1537,21 @@ static ImprovedData build_improved_data() {
     }
 
     std::vector<TestItemImproved> test_items;
-    {
-        std::mt19937 rng_t(99);
-        std::uniform_int_distribution<int> d(0, 9);
-        std::uniform_int_distribution<int> d1(1, 9);
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t), B = d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " + " + std::to_string(B) + " =");
+    for (const auto& r : raw_test) {
+        auto ids = ntok.encode(r.prompt);
+        if (!ids.empty())
             test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A + B, RouteType::Add});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t), B = d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " - " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A - B, RouteType::Sub});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t), B = d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " * " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A * B, RouteType::Mul});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int B = d1(rng_t), k = d1(rng_t);
-            int A = k * B;
-            auto ids = ntok.encode(std::to_string(A) + " / " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   k, RouteType::Div});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t), B = d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " < " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A < B ? 1 : 0, RouteType::IsLessThan});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t), B = d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " > " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A > B ? 1 : 0, RouteType::IsGreaterThan});
-        }
-        for (int i = 0; i < 20; ++i) {
-            int A = d(rng_t);
-            int B = (i % 2 == 0) ? A : d(rng_t);
-            auto ids = ntok.encode(std::to_string(A) + " == " + std::to_string(B) + " =");
-            test_items.push_back({std::vector<int32_t>(ids.begin(), ids.end()),
-                                   A == B ? 1 : 0, RouteType::IsEqual});
-        }
+                                   r.expected, r.op});
     }
 
+    // ── Logit bias for legacy Phase 1Cs masking ───────────────────────────────────
     std::vector<bool> is_active(static_cast<std::size_t>(V), false);
     for (const auto& ids : train_ids)
-        for (auto id : ids)
-            is_active[static_cast<std::size_t>(id)] = true;
+        for (auto id : ids) is_active[static_cast<std::size_t>(id)] = true;
     for (const auto& item : test_items)
-        for (auto id : item.prompt_ids)
-            is_active[static_cast<std::size_t>(id)] = true;
-    // Cover all possible result values: Sub [-9,9], Add [0,18], comparisons [0,1],
-    // Div [1,9], Mul [0,81]
-    for (int v = -9; v <= 81; ++v)
+        for (auto id : item.prompt_ids) is_active[static_cast<std::size_t>(id)] = true;
+    // Cover all result ranges: Sub[-25,25], Add[0,50], Mul[1,225], Div[1,15], cmp[0,1]
+    for (int v = -25; v <= 225; ++v)
         is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
 
     std::vector<float> bias_vec(static_cast<std::size_t>(V), -1e9f);
@@ -1533,8 +1561,7 @@ static ImprovedData build_improved_data() {
 
     int64_t max_T_loss = 0;
     for (const auto& ids : train_ids)
-        if (static_cast<int64_t>(ids.size()) >= 2)
-            max_T_loss = std::max(max_T_loss, static_cast<int64_t>(ids.size()) - 1);
+        max_T_loss = std::max(max_T_loss, static_cast<int64_t>(ids.size()) - 1);
 
     Tensor bias_t_full({max_T_loss, V}, DType::Float32);
     {
@@ -2216,7 +2243,7 @@ static void section_improved_training(std::string_view phase,
 
     std::cout << "\n=== §21.9  Improved Specialisation: D=32, 7 ops, Router Supervision ===\n";
     std::cout << "  D=32 (vs D=16 in §21.8): router 198 params, head_dim=16\n";
-    std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual (700 training examples)\n";
+    std::cout << "  Operations: Add, Sub, Mul, Div, IsLessThan, IsGreaterThan, IsEqual (stratified, operands [0,25]/[1,15])\n";
     std::cout << std::format("  Phase 1Cs: masked vocab + router supervision ({})\n",
                               sched_1cs.label());
     std::cout << std::format("  Phase 2Cs: full-vocab fine-tuning, supervision α: {}, vocab bias β: {}\n",
