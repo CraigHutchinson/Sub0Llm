@@ -56,6 +56,19 @@ public:
         const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok) const;
 
+    // Like forward(), but separates the FFN residual from the math-result injection.
+    // Returns {ffn_residual (T,D), math_inject (T,D)}.
+    //   ffn_residual  — add to h for the block residual connection (FFN branch only)
+    //   math_inject   — scaled result embeddings; caller adds this to x AFTER ln_f
+    //                   so layer-norm magnitude suppression is bypassed.
+    [[nodiscard]] std::pair<autograd::Variable, autograd::Variable>
+    forward_with_boost(
+        const autograd::Variable& h,
+        const std::vector<float>& reg,
+        const autograd::Variable& emb_weight,
+        const NumericTokenizer&   ntok,
+        float                     kMathBoost) const;
+
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& h) const;
     // Pre-softmax router logits (T, n_types) — feed into cross_entropy for supervision.
     [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& h) const;
@@ -82,6 +95,15 @@ public:
         const std::vector<float>& reg,
         const autograd::Variable& emb_weight,
         const NumericTokenizer&   ntok) const;
+
+    // Returns {hidden_out (T,D), math_inject (T,D)} — see MathLayer::forward_with_boost.
+    [[nodiscard]] std::pair<autograd::Variable, autograd::Variable>
+    forward_math_with_boost(
+        const autograd::Variable& x,
+        const std::vector<float>& reg,
+        const autograd::Variable& emb_weight,
+        const NumericTokenizer&   ntok,
+        float                     kMathBoost) const;
 
     [[nodiscard]] RouteInfo route_info(const autograd::Variable& x) const;
     [[nodiscard]] autograd::Variable router_logits(const autograd::Variable& x) const;
