@@ -1391,13 +1391,25 @@ struct ImprovedData {
 };
 
 static ImprovedData build_improved_data() {
-    // Stratified result sampling: each distinct result value gets kPerTrain training
-    // examples, equalising output embedding norm pressure across all result tokens.
-    // Wider operand ranges exercise more of the numeric token space.
-    static constexpr int kMaxOp    = 25;   // add/sub/cmp operands [0,25]
-    static constexpr int kMaxMul   = 15;   // mul/div operands [1,15]
-    static constexpr int kPerTrain = 4;    // training examples per distinct result
-    static constexpr int kCmpN     = 100;  // comparison true/false examples each
+    // Training operand ranges and OOD test ranges are fully disjoint.
+    // NumericTokenizer maps every int16 to a dedicated token, so OOD operands
+    // tokenize correctly; their embeddings are trained (they appear as results
+    // in the training corpus, receiving gradient signal via the weight-tied
+    // projection and the CE loss on active tokens).
+    static constexpr int kMaxOp      = 25;   // train: add/sub/cmp operands [0,25]
+    static constexpr int kMaxMul     = 15;   // train: mul/div operands [1,15]
+    static constexpr int kPerTrain   = 4;    // training examples per distinct result
+    static constexpr int kCmpN       = 100;  // comparison true/false examples each
+
+    // OOD test ranges — strictly disjoint from training operand ranges
+    static constexpr int kOodOpLo    = 26;   // add/sub/cmp test operands [26,35]
+    static constexpr int kOodOpHi    = 35;
+    static constexpr int kOodMulLo   = 16;   // mul test: A∈[16,19], 19×11=209 ≤ 225
+    static constexpr int kOodMulHi   = 19;
+    static constexpr int kOodMulMaxB = 11;
+    static constexpr int kOodDivBLo  = 16;   // div test: denominator [16,20], 10×20=200 ≤ 225
+    static constexpr int kOodDivBHi  = 20;
+    static constexpr int kOodDivKMax = 10;   // div test: quotients [1,10]
 
     std::mt19937 rng_train(42), rng_test(99);
 
@@ -1407,11 +1419,11 @@ static ImprovedData build_improved_data() {
     struct RawTest { std::string prompt; int32_t expected; RouteType op; };
     std::vector<RawTest> raw_test;
 
-    // ── Arithmetic ops: group all (A,B) pairs by result, take kPerTrain each ────
-    auto do_arith = [&](RouteType op,
-                        std::function<int(int,int)> compute,
-                        const std::string& sym,
-                        int A_lo, int A_hi, int B_lo, int B_hi)
+    // ── Training: stratified by result, kPerTrain examples per distinct result ───
+    auto train_arith = [&](RouteType op,
+                           std::function<int(int,int)> compute,
+                           const std::string& sym,
+                           int A_lo, int A_hi, int B_lo, int B_hi)
     {
         std::map<int, std::vector<std::pair<int,int>>> by_r;
         for (int A = A_lo; A <= A_hi; ++A)
@@ -1426,51 +1438,78 @@ static ImprovedData build_improved_data() {
                                   std::to_string(pairs[i].second)+" = "+std::to_string(r));
                 corpus_ops.push_back(op);
             }
-            // Test from held-out tail (pairs[n..]) to avoid train/test overlap.
-            // Buckets with only kPerTrain or fewer pairs are skipped — all their
-            // pairs are in training, so there is no clean held-out example.
-            if (n < (int)pairs.size()) {
-                std::shuffle(pairs.begin() + n, pairs.end(), rng_test);
-                auto [A, B] = pairs[static_cast<std::size_t>(n)];
-                raw_test.push_back(RawTest{
-                    std::to_string(A)+" "+sym+" "+std::to_string(B)+" =", r, op});
-            }
         }
     };
 
-    do_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", 0,kMaxOp,0,kMaxOp);
-    do_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", 0,kMaxOp,0,kMaxOp);
-    do_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", 1,kMaxMul,1,kMaxMul);
-
-    // Div: group by quotient k so each quotient value trains equally often
+    // ── OOD test: one example per distinct result from the OOD operand range ─────
+    auto test_arith = [&](RouteType op,
+                          std::function<int(int,int)> compute,
+                          const std::string& sym,
+                          int A_lo, int A_hi, int B_lo, int B_hi)
     {
-        auto do_div_group = [&](std::mt19937& rng, bool for_test) {
-            for (int k = 1; k <= kMaxMul; ++k) {
-                std::vector<std::pair<int,int>> pairs;
-                for (int B = 1; B <= kMaxMul; ++B)
-                    pairs.emplace_back(k*B, B);
-                std::shuffle(pairs.begin(), pairs.end(), rng);
-                if (!for_test) {
-                    int n = std::min((int)pairs.size(), kPerTrain);
-                    for (int i = 0; i < n; ++i) {
-                        corpus.push_back(std::to_string(pairs[i].first)+" / "+
-                                          std::to_string(pairs[i].second)+" = "+std::to_string(k));
-                        corpus_ops.push_back(RouteType::Div);
-                    }
-                } else {
-                    raw_test.push_back(RawTest{std::to_string(pairs[0].first)+" / "+
-                                         std::to_string(pairs[0].second)+" =", k, RouteType::Div});
-                }
+        std::map<int, std::vector<std::pair<int,int>>> by_r;
+        for (int A = A_lo; A <= A_hi; ++A)
+            for (int B = B_lo; B <= B_hi; ++B)
+                by_r[compute(A,B)].emplace_back(A,B);
+
+        for (auto& [r, pairs] : by_r) {
+            std::shuffle(pairs.begin(), pairs.end(), rng_test);
+            raw_test.push_back(RawTest{
+                std::to_string(pairs[0].first)+" "+sym+" "+
+                std::to_string(pairs[0].second)+" =",
+                r, op});
+        }
+    };
+
+    train_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", 0,kMaxOp, 0,kMaxOp);
+    train_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", 0,kMaxOp, 0,kMaxOp);
+    train_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", 1,kMaxMul, 1,kMaxMul);
+
+    // OOD test — operands strictly outside training range:
+    //   Add: A∈[26,35], B∈[0,25]   → results ∈ [26,60]  (26–50 seen as Add results,
+    //                                  51–60 unseen as results but embeddings trained
+    //                                  via bias_vec active-token CE signal)
+    //   Sub: A,B∈[26,35]            → results ∈ [-9,9]   (in Sub training range [-25,25])
+    //   Mul: A∈[16,19], B∈[1,11]   → results ∈ [16,209] (subset of Mul range [1,225])
+    test_arith(RouteType::Add, [](int A,int B){return A+B;}, "+", kOodOpLo,kOodOpHi, 0,kMaxOp);
+    test_arith(RouteType::Sub, [](int A,int B){return A-B;}, "-", kOodOpLo,kOodOpHi, kOodOpLo,kOodOpHi);
+    test_arith(RouteType::Mul, [](int A,int B){return A*B;}, "*", kOodMulLo,kOodMulHi, 1,kOodMulMaxB);
+
+    // ── Div training: group by quotient, kPerTrain examples per quotient ─────────
+    {
+        for (int k = 1; k <= kMaxMul; ++k) {
+            std::vector<std::pair<int,int>> pairs;
+            for (int B = 1; B <= kMaxMul; ++B)
+                pairs.emplace_back(k*B, B);
+            std::shuffle(pairs.begin(), pairs.end(), rng_train);
+            int n = std::min((int)pairs.size(), kPerTrain);
+            for (int i = 0; i < n; ++i) {
+                corpus.push_back(std::to_string(pairs[i].first)+" / "+
+                                  std::to_string(pairs[i].second)+" = "+std::to_string(k));
+                corpus_ops.push_back(RouteType::Div);
             }
-        };
-        do_div_group(rng_train, false);
-        do_div_group(rng_test,  true);
+        }
     }
 
-    // ── Comparison ops: explicit 50/50 true/false balance ────────────────────────
-    auto do_cmp = [&](RouteType op,
-                      std::function<bool(int,int)> cmp,
-                      const std::string& sym)
+    // ── Div OOD test: OOD denominators [16,20], quotients [1,10] ─────────────────
+    // dividend = k*B ∈ [16,200] ≤ 225; quotient result ∈ [1,10] (in training range)
+    {
+        for (int k = 1; k <= kOodDivKMax; ++k) {
+            std::vector<std::pair<int,int>> pairs;
+            for (int B = kOodDivBLo; B <= kOodDivBHi; ++B)
+                pairs.emplace_back(k*B, B);
+            std::shuffle(pairs.begin(), pairs.end(), rng_test);
+            raw_test.push_back(RawTest{
+                std::to_string(pairs[0].first)+" / "+
+                std::to_string(pairs[0].second)+" =",
+                k, RouteType::Div});
+        }
+    }
+
+    // ── Comparison training: [0,25]×[0,25], 50/50 true/false balance ─────────────
+    auto train_cmp = [&](RouteType op,
+                         std::function<bool(int,int)> cmp,
+                         const std::string& sym)
     {
         std::vector<std::pair<int,int>> tp, fp;
         for (int A = 0; A <= kMaxOp; ++A)
@@ -1485,19 +1524,31 @@ static ImprovedData build_improved_data() {
             corpus.push_back(std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" = 0");
             corpus_ops.push_back(op);
         }
-        auto tp2 = tp, fp2 = fp;
-        std::shuffle(tp2.begin(), tp2.end(), rng_test);
-        std::shuffle(fp2.begin(), fp2.end(), rng_test);
-        for (int i = 0; i < 10 && i < (int)tp2.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(tp2[i].first)+" "+sym+" "+std::to_string(tp2[i].second)+" =", 1, op});
-        for (int i = 0; i < 10 && i < (int)fp2.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(fp2[i].first)+" "+sym+" "+std::to_string(fp2[i].second)+" =", 0, op});
     };
 
-    do_cmp(RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
-    do_cmp(RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
+    // ── Comparison OOD test: A,B∈[26,35]; results always 0 or 1 ─────────────────
+    auto test_cmp = [&](RouteType op,
+                        std::function<bool(int,int)> cmp,
+                        const std::string& sym)
+    {
+        std::vector<std::pair<int,int>> tp, fp;
+        for (int A = kOodOpLo; A <= kOodOpHi; ++A)
+            for (int B = kOodOpLo; B <= kOodOpHi; ++B)
+                (cmp(A,B) ? tp : fp).emplace_back(A,B);
+        std::shuffle(tp.begin(), tp.end(), rng_test);
+        std::shuffle(fp.begin(), fp.end(), rng_test);
+        for (int i = 0; i < 10 && i < (int)tp.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" =", 1, op});
+        for (int i = 0; i < 10 && i < (int)fp.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" =", 0, op});
+    };
 
-    // IsEqual: A==B true pairs are on the diagonal (A==B), false elsewhere
+    train_cmp(RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
+    train_cmp(RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
+    test_cmp (RouteType::IsLessThan,    [](int A,int B){return A<B;},  "<");
+    test_cmp (RouteType::IsGreaterThan, [](int A,int B){return A>B;},  ">");
+
+    // ── IsEqual training: diagonal true pairs + off-diagonal false ────────────────
     {
         std::vector<std::pair<int,int>> tp, fp;
         for (int A = 0; A <= kMaxOp; ++A) {
@@ -1514,13 +1565,22 @@ static ImprovedData build_improved_data() {
             corpus.push_back(std::to_string(fp[i].first)+" == "+std::to_string(fp[i].second)+" = 0");
             corpus_ops.push_back(RouteType::IsEqual);
         }
-        auto tp2 = tp, fp2 = fp;
-        std::shuffle(tp2.begin(), tp2.end(), rng_test);
-        std::shuffle(fp2.begin(), fp2.end(), rng_test);
-        for (int i = 0; i < 10 && i < (int)tp2.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(tp2[i].first)+" == "+std::to_string(tp2[i].second)+" =", 1, RouteType::IsEqual});
-        for (int i = 0; i < 10 && i < (int)fp2.size(); ++i)
-            raw_test.push_back(RawTest{std::to_string(fp2[i].first)+" == "+std::to_string(fp2[i].second)+" =", 0, RouteType::IsEqual});
+    }
+
+    // ── IsEqual OOD test: A,B∈[26,35] ────────────────────────────────────────────
+    {
+        std::vector<std::pair<int,int>> tp, fp;
+        for (int A = kOodOpLo; A <= kOodOpHi; ++A) {
+            tp.emplace_back(A, A);
+            for (int B = kOodOpLo; B <= kOodOpHi; ++B)
+                if (B != A) fp.emplace_back(A, B);
+        }
+        std::shuffle(tp.begin(), tp.end(), rng_test);
+        std::shuffle(fp.begin(), fp.end(), rng_test);
+        for (int i = 0; i < 10 && i < (int)tp.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(tp[i].first)+" == "+std::to_string(tp[i].second)+" =", 1, RouteType::IsEqual});
+        for (int i = 0; i < 10 && i < (int)fp.size(); ++i)
+            raw_test.push_back(RawTest{std::to_string(fp[i].first)+" == "+std::to_string(fp[i].second)+" =", 0, RouteType::IsEqual});
     }
 
     // ── Tokenizer and encoding ────────────────────────────────────────────────────
@@ -1552,7 +1612,8 @@ static ImprovedData build_improved_data() {
         for (auto id : ids) is_active[static_cast<std::size_t>(id)] = true;
     for (const auto& item : test_items)
         for (auto id : item.prompt_ids) is_active[static_cast<std::size_t>(id)] = true;
-    // Cover all result ranges: Sub[-25,25], Add[0,50], Mul[1,225], Div[1,15], cmp[0,1]
+    // Cover all result ranges including OOD test results:
+    // Sub[-25,25], Add[0,60] (OOD Add reaches 35+25=60), Mul[1,225], Div[1,15], cmp[0,1]
     for (int v = -25; v <= 225; ++v)
         is_active[static_cast<std::size_t>(ntok.encode_int(v))] = true;
 
