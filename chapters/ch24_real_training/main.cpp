@@ -407,7 +407,8 @@ static void section_training_approaches()
 // ── §24.6  Full Iterative Training ────────────────────────────────────────────
 
 static void section_full_training(int steps, const std::string& ckpt_dir, bool demo_mode,
-                                    const std::string& corpus_file = "")
+                                    const std::string& corpus_file = "",
+                                    std::size_t vocab_size_override = 0)
 {
     std::cout << "\n=== §24.6  Full Iterative Training ===\n\n";
 
@@ -430,7 +431,8 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
     }
 
     // 2. Train BPE tokenizer
-    const std::size_t vocab_size = corpus_file.empty() ? 512 : 2048;
+    const std::size_t vocab_size = vocab_size_override > 0 ? vocab_size_override
+                                 : corpus_file.empty()     ? 512 : 2048;
     auto tok = BPETokenizer::train(texts, vocab_size);
     std::cout << std::format("  Tokenizer: vocab_size={}\n", tok.vocab_size());
 
@@ -639,6 +641,7 @@ int main(int argc, char** argv)
     std::string ckpt_dir    = "/tmp/ch24_ckpts";
     std::string corpus_file = "";
     int         steps       = 200;
+    std::size_t vocab_size  = 0;  // 0 = auto
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -650,6 +653,8 @@ int main(int argc, char** argv)
             steps = std::stoi(argv[++i]);
         else if (arg == "--corpus" && i + 1 < argc)
             corpus_file = argv[++i];
+        else if (arg == "--vocab-size" && i + 1 < argc)
+            vocab_size = static_cast<std::size_t>(std::stoi(argv[++i]));
     }
 
     const bool run_all = (phase == "all");
@@ -663,7 +668,7 @@ int main(int argc, char** argv)
         // 'train' phase: use provided steps (default 2000 when called explicitly)
         // 'all' phase: use shorter demo (200 steps or whatever --steps says)
         const int actual_steps = (phase == "train" && steps == 200) ? 2000 : steps;
-        section_full_training(actual_steps, ckpt_dir, phase != "train", corpus_file);
+        section_full_training(actual_steps, ckpt_dir, phase != "train", corpus_file, vocab_size);
     }
 
     if (!run_all &&
