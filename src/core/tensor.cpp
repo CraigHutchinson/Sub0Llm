@@ -1,5 +1,6 @@
 #include "sub0llm/core/tensor.hpp"
 #include "../backends/cuda/backend.hpp"
+#include "pool.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -56,8 +57,7 @@ Tensor::Tensor(Shape shape, DType dtype, Device device)
             storage_ = cuda_storage;
             return; // storage_ already fully initialised
         }
-        storage_->data = std::shared_ptr<std::byte[]>(
-            new std::byte[storage_->byte_capacity]);
+        storage_->data = TensorPool::get().allocate(storage_->byte_capacity);
     }
 }
 
