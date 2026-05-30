@@ -59,7 +59,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch24, complete)
+## Current state (Ch01–Ch25, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -87,7 +87,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - `include/sub0llm/nn/attention.hpp` — Multi-head attention (Ch07)
 - `include/sub0llm/nn/gpt.hpp` — Vanilla GPT (Ch08)
 - `include/sub0llm/nn/optimizer.hpp` — SGD, Adam, gradient clipping (Ch09)
-- `include/sub0llm/nn/modern_gpt.hpp` — RMSNorm, SwiGLU, RoPE, GQA, ModernGPT+MTP (Ch10)
+- `include/sub0llm/nn/modern_gpt.hpp` — RMSNorm, SwiGLU, RoPE, GQA, ModernGPT+MTP (Ch10); sliding-window attention, KV-cached `forward_one()`, RoPE NTK scaling, `make_kv_cache()` (Ch25)
 - `include/sub0llm/nn/scheduler.hpp`, `trainer.hpp` — LR schedulers, Trainer (Ch11)
 - `include/sub0llm/nn/lora.hpp` — LoRA low-rank adaptation (Ch12)
 - `include/sub0llm/nn/dpo.hpp` — Direct Preference Optimization loss (Ch13)
@@ -104,6 +104,9 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - `include/sub0llm/data/text_corpus.hpp`, `src/data/text_corpus.cpp` — `TextCorpus`: streaming BPE-tokenised corpus from in-memory texts or JSONL/text files, shuffled non-overlapping windows (Ch24)
 - `include/sub0llm/nn/checkpoint.hpp`, `src/nn/checkpoint.cpp` — `save_checkpoint`, `load_checkpoint`, `latest_checkpoint_path`, `latest_checkpoint_step`: binary checkpoint save/resume with JSON header (Ch24)
 - `chapters/ch24_real_training/` — Real-World Pretraining: data landscape, Chinchilla scaling, TextCorpus pipeline demo, Ollama synthetic data API, training approach decision tree, full iterative training loop with checkpoint save/resume (Ch24)
+- `include/sub0llm/nn/kv_cache.hpp` — `KVCache`: pre-allocated K/V buffers per layer/kv_head for O(n) autoregressive inference (Ch25)
+- `include/sub0llm/nn/long_context.hpp`, `src/nn/long_context.cpp` — `LongContextConfig`, `generate_cached()`: KV-cached generation loop with temperature/top-k sampling and on_token callback (Ch25)
+- `chapters/ch25_long_context/` — Long-Context Inference: KV cache (~9× speedup demo), sliding-window attention (banded causal mask, O(n·W) memory), RoPE NTK-aware scaling (extend beyond training length without fine-tuning), memory budget table for production models (Ch25)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
@@ -198,6 +201,22 @@ curl http://localhost:8080/v1/models
 - BPE training scales as O(corpus_lines × vocab_merges): 1000 lines + vocab 1024 ≈ 14 s
 - Use `--vocab-size 512` for fast tokenizer, `--vocab-size 2048` for richer subwords
 - The model dir is gitignored (`/data/*.ckpt` etc.); use Git LFS for checkpoints
+
+#### Training dynamics observed (1000 Shakespeare paragraphs, 5M-param model)
+
+| Step | Train loss | Eval loss | State |
+|------|-----------|-----------|-------|
+| 200 | 6.29 | **6.28** ← best generalisation | learning vocabulary |
+| 1000 | 5.86 | 6.03 | structuring |
+| 2000 | 3.82 | 6.33 | overfitting begins |
+| 5000 | 0.37 | 7.88 | memorising |
+| 10000 | 0.17 | 9.20 | fully memorised |
+
+Key findings:
+- **Chinchilla gap**: 5M-param model needs ~100M tokens to generalise; 577 samples × 64 tokens ≈ 37K tokens is 2700× under-resourced
+- **Early stopping**: best eval checkpoint is around step 200–500 (minimum eval loss)
+- **Memorisation is visible**: greedy decoding at step 9999 reproduces verbatim training passages at low temperature (e.g., "My nobler friends, I crave their pardons: For the mutable, rank-scented many" — Coriolanus Act III)
+- **More data needed**: fix the BPE O(n²) bottleneck or use the GPT-2 tokenizer to use the full 7222-paragraph corpus
 
 ### Tests
 442 Catch2 tests across 25 test files — all passing.

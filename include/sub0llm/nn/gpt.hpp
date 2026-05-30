@@ -21,6 +21,11 @@ public:
     Linear(int64_t in_features, int64_t out_features, std::uint64_t seed = 42);
 
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+
+    // Inference-only: x @ W^T + b using pure Tensor ops (no autograd graph).
+    // x: (*, in_features) → (*, out_features).
+    [[nodiscard]] Tensor apply_one(const Tensor& x) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
 private:

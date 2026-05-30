@@ -25,6 +25,7 @@ add_executable(tests
     test_reasoning.cpp
     test_checkpoint.cpp
     test_text_corpus.cpp
+    test_ch25_long_context.cpp
 )
 
 target_link_libraries(tests

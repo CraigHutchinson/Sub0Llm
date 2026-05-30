@@ -1,5 +1,7 @@
 #include "sub0llm/nn/gpt.hpp"
 
+#include "sub0llm/core/ops.hpp"
+
 #include <cmath>
 #include <format>
 #include <random>
@@ -35,6 +37,22 @@ Linear::Linear(int64_t in_features, int64_t out_features, std::uint64_t seed) {
 autograd::Variable Linear::forward(const autograd::Variable& x) const {
     using namespace autograd;
     return bias_add(matmul(x, transpose2d(W_)), b_);
+}
+
+Tensor Linear::apply_one(const Tensor& x) const {
+    // W_: (out, in) — transpose to (in, out) for matmul
+    Tensor wt  = W_.data().transpose(0, 1).contiguous();
+    Tensor out = ops::matmul(x, wt);             // (*, out)
+    // Add bias row-wise
+    auto od = out.data_as<float>();
+    auto bd = b_.data().data_as<float>();
+    const int64_t N    = static_cast<int64_t>(b_.data().numel());
+    const int64_t rows = static_cast<int64_t>(out.numel()) / N;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < N; ++c)
+            od[static_cast<std::size_t>(r * N + c)] +=
+                bd[static_cast<std::size_t>(c)];
+    return out;
 }
 
 std::vector<autograd::Variable*> Linear::parameters() {

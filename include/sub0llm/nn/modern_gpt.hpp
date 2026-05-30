@@ -5,11 +5,27 @@
 #include "sub0llm/core/tensor.hpp"
 #include "sub0llm/nn/embedding.hpp"
 #include "sub0llm/nn/gpt.hpp"       // reuses Linear from Ch08
+#include "sub0llm/nn/kv_cache.hpp"
 
 #include <cstdint>
 #include <vector>
 
 namespace sub0llm::nn {
+
+// ── RoPE scaling (Ch25) ───────────────────────────────────────────────────────
+//
+// NTK-aware scaling extends the effective RoPE context beyond the training
+// length without fine-tuning.  The base frequency is scaled so that high-
+// frequency dimensions (which encode fine-grained position) are distorted less
+// than low-frequency ones.  Formula (Chen et al. 2023):
+//
+//   base_scaled = base × alpha^(head_dim / (head_dim − 2))
+//   alpha       = target_len / train_len
+//
+// Set scale_factor = 1.0 (default) to disable scaling.
+struct RopeScalingConfig {
+    float scale_factor = 1.0f; // > 1 extends context; 1 = no scaling (default)
+};
 
 // ── RMSNorm ───────────────────────────────────────────────────────────────────
 //
@@ -21,6 +37,10 @@ public:
     explicit RMSNorm(int64_t D, float eps = 1e-6f);
 
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+
+    // Inference-only: pure Tensor path, no autograd. x: (1, D) → (1, D).
+    [[nodiscard]] Tensor apply_one(const Tensor& x) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
     [[nodiscard]] int64_t dim() const noexcept;
@@ -45,6 +65,10 @@ public:
     SwiGLUFeedForward(int64_t D, int64_t d_ff = 0, std::uint64_t seed = 42);
 
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+
+    // Inference-only: pure Tensor path. x: (1, D) → (1, D).
+    [[nodiscard]] Tensor apply_one(const Tensor& x) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
 private:
@@ -71,32 +95,46 @@ private:
 class GroupedQueryAttention {
 public:
     // embed_dim must be divisible by n_heads; n_heads must be divisible by n_kv_heads.
-    GroupedQueryAttention(std::size_t embed_dim,
-                          std::size_t n_heads,
-                          std::size_t n_kv_heads,
-                          float       rope_base = 10000.0f,
-                          std::uint64_t seed    = 42);
+    // window_size: sliding-window context (tokens attend only to the last W tokens).
+    //              -1 = full causal attention (default).
+    GroupedQueryAttention(std::size_t   embed_dim,
+                          std::size_t   n_heads,
+                          std::size_t   n_kv_heads,
+                          float         rope_base   = 10000.0f,
+                          std::uint64_t seed        = 42,
+                          int64_t       window_size = -1);
 
-    // x: (T, embed_dim); causal = apply lower-triangular mask.
+    // x: (T, embed_dim); causal = apply lower-triangular (or sliding-window) mask.
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x,
                                               bool causal = true) const;
 
+    // Inference-only single-token forward with KV cache.
+    // x_new: (1, embed_dim). pos: absolute position of this token.
+    // Appends K,V to cache[layer_idx] and returns output (1, embed_dim).
+    [[nodiscard]] Tensor forward_one(const Tensor& x_new,
+                                      int64_t       pos,
+                                      KVCache&      cache,
+                                      std::size_t   layer_idx,
+                                      float         rope_base_override = 0.0f) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
-    [[nodiscard]] std::size_t n_heads()    const noexcept { return n_heads_; }
-    [[nodiscard]] std::size_t n_kv_heads() const noexcept { return n_kv_heads_; }
-    [[nodiscard]] std::size_t head_dim()   const noexcept { return head_dim_; }
+    [[nodiscard]] std::size_t n_heads()     const noexcept { return n_heads_; }
+    [[nodiscard]] std::size_t n_kv_heads()  const noexcept { return n_kv_heads_; }
+    [[nodiscard]] std::size_t head_dim()    const noexcept { return head_dim_; }
+    [[nodiscard]] int64_t     window_size() const noexcept { return window_size_; }
 
 private:
     std::size_t embed_dim_, n_heads_, n_kv_heads_, head_dim_;
     float       rope_base_;
+    int64_t     window_size_;  // -1 = full attention
     std::vector<autograd::Variable> W_Q_, W_O_;  // n_heads each
     std::vector<autograd::Variable> W_K_, W_V_;  // n_kv_heads each
     // Cached RoPE frequencies — recomputed only when T changes.
     mutable int64_t        rope_cache_T_  = -1;
     mutable Tensor         rope_cache_cos_;
     mutable Tensor         rope_cache_sin_;
-    // Cached causal mask — recomputed only when T changes.
+    // Cached causal/sliding-window mask — recomputed only when T or window_size changes.
     mutable int64_t        mask_cache_T_  = -1;
     mutable Tensor         mask_cache_;
 };
@@ -108,20 +146,29 @@ private:
 //   y = h + SwiGLU(RMSNorm(h))        (residual #2)
 class ModernTransformerBlock {
 public:
-    ModernTransformerBlock(int64_t     D,
-                           std::size_t n_heads,
-                           std::size_t n_kv_heads,
-                           int64_t     d_ff   = 0,
-                           std::uint64_t seed = 42);
+    ModernTransformerBlock(int64_t       D,
+                           std::size_t   n_heads,
+                           std::size_t   n_kv_heads,
+                           int64_t       d_ff        = 0,
+                           std::uint64_t seed        = 42,
+                           int64_t       window_size = -1);
 
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
+
+    // Inference-only: single token, KV-cached. Returns (1, D).
+    [[nodiscard]] Tensor forward_one(const Tensor& x,
+                                      int64_t       pos,
+                                      KVCache&      cache,
+                                      std::size_t   layer_idx,
+                                      float         rope_base_override = 0.0f) const;
+
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
 private:
-    RMSNorm              norm1_;
-    GroupedQueryAttention attn_;
-    RMSNorm              norm2_;
-    SwiGLUFeedForward    ffn_;
+    RMSNorm               norm1_;
+    GroupedQueryAttention  attn_;
+    RMSNorm               norm2_;
+    SwiGLUFeedForward     ffn_;
 };
 
 // ── ModernGPT ─────────────────────────────────────────────────────────────────
@@ -139,22 +186,34 @@ private:
 //   training time via forward_mtp(); forward() uses the tied head only.
 class ModernGPT {
 public:
-    ModernGPT(int64_t     vocab_size,
-              int64_t     embed_dim,
-              std::size_t n_heads,
-              std::size_t n_kv_heads,
-              int64_t     n_layers,
-              int64_t     d_ff          = 0,
-              int64_t     n_mtp_heads   = 0,
-              std::uint64_t seed        = 42);
+    ModernGPT(int64_t       vocab_size,
+              int64_t       embed_dim,
+              std::size_t   n_heads,
+              std::size_t   n_kv_heads,
+              int64_t       n_layers,
+              int64_t       d_ff          = 0,
+              int64_t       n_mtp_heads   = 0,
+              std::uint64_t seed          = 42,
+              int64_t       window_size   = -1);
 
-    // Returns logits (T, vocab_size) — main LM head only.
+    // Returns logits (T, vocab_size) — training path via autograd.
     [[nodiscard]] autograd::Variable forward(const Tensor& token_ids) const;
 
-    // Returns [head_0_logits, head_1_logits, …] for MTP training.
-    // head_0 is the weight-tied main head; heads 1..n_mtp_heads are additional.
+    // MTP training: returns per-head logits including the weight-tied head.
     [[nodiscard]] std::vector<autograd::Variable> forward_mtp(
         const Tensor& token_ids) const;
+
+    // ── KV-cached inference (Ch25) ─────────────────────────────────────────────
+
+    // Allocate a KV cache for up to max_seq tokens.
+    [[nodiscard]] KVCache make_kv_cache(int64_t max_seq) const;
+
+    // Single-token forward with KV cache. Returns logits (1, vocab_size).
+    // Appends this token's K,V to cache and increments cache.filled.
+    // rope_scaling: NTK scale factor (>1 extends context; 1.0 = disabled).
+    [[nodiscard]] Tensor forward_one(int32_t  token_id,
+                                      KVCache& cache,
+                                      float    rope_scaling = 1.0f) const;
 
     [[nodiscard]] std::vector<autograd::Variable*> parameters();
 
@@ -162,12 +221,16 @@ public:
     [[nodiscard]] int64_t     embed_dim()    const noexcept;
     [[nodiscard]] std::size_t num_layers()   const noexcept;
     [[nodiscard]] int64_t     n_mtp_heads()  const noexcept;
+    [[nodiscard]] std::size_t n_kv_heads()   const noexcept;
+    [[nodiscard]] std::size_t head_dim()     const noexcept;
 
 private:
-    Embedding                          tok_emb_;
-    std::vector<ModernTransformerBlock> blocks_;
-    RMSNorm                            ln_f_;
-    std::vector<Linear>                mtp_heads_;  // empty if n_mtp_heads == 0
+    Embedding                           tok_emb_;
+    std::vector<ModernTransformerBlock>  blocks_;
+    RMSNorm                             ln_f_;
+    std::vector<Linear>                 mtp_heads_;  // empty if n_mtp_heads == 0
+    std::size_t                         n_kv_heads_ = 0;
+    std::size_t                         head_dim_   = 0;
 };
 
 } // namespace sub0llm::nn

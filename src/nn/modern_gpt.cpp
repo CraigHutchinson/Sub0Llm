@@ -70,15 +70,20 @@ void compute_rope_freqs(int64_t T, int64_t Dh, float base,
         }
 }
 
-// Lower-triangular causal mask: 0 on/below diagonal, −∞ above.
-Tensor causal_mask(int64_t T) {
+// Causal mask with optional sliding window.
+// W = -1 → full causal attention; W >= 0 → also block j < i − W.
+Tensor sliding_window_mask(int64_t T, int64_t W) {
     Tensor m = zeros({T, T});
     auto   md = m.data_as<float>();
     const float neg_inf = -std::numeric_limits<float>::infinity();
     const auto  Ts = static_cast<std::size_t>(T);
     for (std::size_t i = 0; i < Ts; ++i)
-        for (std::size_t j = i + 1; j < Ts; ++j)
-            md[i * Ts + j] = neg_inf;
+        for (std::size_t j = 0; j < Ts; ++j) {
+            const auto ii = static_cast<int64_t>(i);
+            const auto jj = static_cast<int64_t>(j);
+            if (jj > ii || (W >= 0 && ii - jj > W))
+                md[i * Ts + j] = neg_inf;
+        }
     return m;
 }
 
@@ -106,6 +111,25 @@ int64_t RMSNorm::dim() const noexcept {
     return weight_.data().numel();
 }
 
+Tensor RMSNorm::apply_one(const Tensor& x) const {
+    const int64_t D = weight_.data().numel();
+    auto xd = x.data_as<float>();
+    auto wd = weight_.data().data_as<float>();
+    float ss = 0.0f;
+    for (int64_t i = 0; i < D; ++i) {
+        const float v = xd[static_cast<std::size_t>(i)];
+        ss += v * v;
+    }
+    const float rms_inv = 1.0f / std::sqrt(ss / static_cast<float>(D) + eps_);
+    Tensor out = zeros({1, D});
+    auto od = out.data_as<float>();
+    for (int64_t i = 0; i < D; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        od[idx] = wd[idx] * xd[idx] * rms_inv;
+    }
+    return out;
+}
+
 // ── SwiGLUFeedForward ─────────────────────────────────────────────────────────
 
 SwiGLUFeedForward::SwiGLUFeedForward(int64_t D, int64_t d_ff, std::uint64_t seed)
@@ -118,6 +142,13 @@ autograd::Variable SwiGLUFeedForward::forward(const autograd::Variable& x) const
     auto gate_out = silu(gate_.forward(x));  // (T, d_ff)
     auto up_out   = up_.forward(x);          // (T, d_ff)
     return down_.forward(mul(gate_out, up_out));
+}
+
+Tensor SwiGLUFeedForward::apply_one(const Tensor& x) const {
+    Tensor g = gate_.apply_one(x);             // (1, d_ff)
+    Tensor u = up_.apply_one(x);               // (1, d_ff)
+    Tensor gs = ops::mul(g, ops::sigmoid(g));  // SiLU: g * σ(g)
+    return down_.apply_one(ops::mul(gs, u));   // (1, D)
 }
 
 std::vector<autograd::Variable*> SwiGLUFeedForward::parameters() {
@@ -134,9 +165,11 @@ GroupedQueryAttention::GroupedQueryAttention(std::size_t embed_dim,
                                              std::size_t n_heads,
                                              std::size_t n_kv_heads,
                                              float       rope_base,
-                                             std::uint64_t seed)
+                                             std::uint64_t seed,
+                                             int64_t     window_size)
     : embed_dim_(embed_dim), n_heads_(n_heads),
-      n_kv_heads_(n_kv_heads), rope_base_(rope_base) {
+      n_kv_heads_(n_kv_heads), rope_base_(rope_base),
+      window_size_(window_size) {
     if (embed_dim == 0 || n_heads == 0 || n_kv_heads == 0)
         throw std::runtime_error(std::format(
             "GroupedQueryAttention: embed_dim={}, n_heads={}, n_kv_heads={} "
@@ -205,11 +238,11 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
         V_heads[g] = v_raw;
     }
 
-    // Build causal mask once per T — cached to avoid repeated allocation.
+    // Build causal/sliding-window mask once per T — cached.
     Variable mask_var;
     if (causal) {
         if (T != mask_cache_T_) {
-            mask_cache_   = causal_mask(T);
+            mask_cache_   = sliding_window_mask(T, window_size_);
             mask_cache_T_ = T;
         }
         mask_var = Variable(mask_cache_, false);
@@ -233,6 +266,102 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     return out;
 }
 
+Tensor GroupedQueryAttention::forward_one(const Tensor& x_new,
+                                           int64_t       pos,
+                                           KVCache&      cache,
+                                           std::size_t   layer_idx,
+                                           float         rope_base_override) const {
+    const float base    = (rope_base_override > 0.0f) ? rope_base_override : rope_base_;
+    const int64_t Dh    = static_cast<int64_t>(head_dim_);
+    const int64_t D2    = Dh / 2;
+    const int64_t D     = static_cast<int64_t>(embed_dim_);
+    const float scale   = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    const std::size_t r = n_heads_ / n_kv_heads_;
+
+    // RoPE cos/sin for single position `pos`
+    std::vector<float> cos_p(static_cast<std::size_t>(D2));
+    std::vector<float> sin_p(static_cast<std::size_t>(D2));
+    for (int64_t i = 0; i < D2; ++i) {
+        const float theta = std::pow(base,
+            -2.0f * static_cast<float>(i) / static_cast<float>(Dh));
+        const float angle = static_cast<float>(pos) * theta;
+        cos_p[static_cast<std::size_t>(i)] = std::cos(angle);
+        sin_p[static_cast<std::size_t>(i)] = std::sin(angle);
+    }
+
+    // Project and write K, V into cache for each KV head
+    for (std::size_t g = 0; g < n_kv_heads_; ++g) {
+        // W_K_[g]: (D, Dh) — x_new @ W_K_[g] = (1,D)@(D,Dh) → (1,Dh)
+        Tensor k_new = ops::matmul(x_new, W_K_[g].data());
+        Tensor v_new = ops::matmul(x_new, W_V_[g].data());
+        // Apply RoPE to k in-place
+        auto kd = k_new.data_as<float>();
+        for (int64_t i = 0; i < D2; ++i) {
+            const auto si = static_cast<std::size_t>(i);
+            const auto si2 = static_cast<std::size_t>(i + D2);
+            const float k0 = kd[si], k1 = kd[si2];
+            kd[si]  = k0 * cos_p[si] - k1 * sin_p[si];
+            kd[si2] = k1 * cos_p[si] + k0 * sin_p[si];
+        }
+        // Write row `pos` of the cache buffers
+        auto kb = cache.K[layer_idx][g].data_as<float>();
+        auto vb = cache.V[layer_idx][g].data_as<float>();
+        auto knd = k_new.data_as<float>();
+        auto vnd = v_new.data_as<float>();
+        const std::size_t off = static_cast<std::size_t>(pos * Dh);
+        for (std::size_t i = 0; i < static_cast<std::size_t>(Dh); ++i) {
+            kb[off + i] = knd[i];
+            vb[off + i] = vnd[i];
+        }
+    }
+
+    // Attend over [0, pos] — the filled rows of the KV cache
+    const int64_t ctx_len = pos + 1;
+    Tensor out = zeros({1, D});
+    auto od = out.data_as<float>();
+
+    for (std::size_t h = 0; h < n_heads_; ++h) {
+        const std::size_t g = h / r;
+
+        // Q for this head
+        Tensor q = ops::matmul(x_new, W_Q_[h].data());  // (1, Dh)
+        auto qd = q.data_as<float>();
+        for (int64_t i = 0; i < D2; ++i) {
+            const auto si = static_cast<std::size_t>(i);
+            const auto si2 = static_cast<std::size_t>(i + D2);
+            const float q0 = qd[si], q1 = qd[si2];
+            qd[si]  = q0 * cos_p[si] - q1 * sin_p[si];
+            qd[si2] = q1 * cos_p[si] + q0 * sin_p[si];
+        }
+
+        // Scores: q @ K_cache[:ctx_len]^T  → (1, ctx_len)
+        Tensor K_slice = ops::narrow(cache.K[layer_idx][g], 0, ctx_len);
+        Tensor K_T     = K_slice.transpose(0, 1).contiguous();  // (Dh, ctx_len)
+        Tensor scores  = ops::mul(ops::matmul(q, K_T), scale);
+
+        // Apply sliding-window mask to scores
+        if (window_size_ >= 0) {
+            auto sd = scores.data_as<float>();
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+            for (int64_t j = 0; j < ctx_len; ++j)
+                if (pos - j > window_size_)
+                    sd[static_cast<std::size_t>(j)] = neg_inf;
+        }
+
+        Tensor attn = ops::softmax(scores, -1);               // (1, ctx_len)
+        Tensor V_slice = ops::narrow(cache.V[layer_idx][g], 0, ctx_len);
+        Tensor ctx   = ops::matmul(attn, V_slice);            // (1, Dh)
+        // W_O_[h]: (Dh, D) — ctx @ W_O_[h] = (1,Dh)@(Dh,D) → (1,D)
+        Tensor head_out = ops::matmul(ctx, W_O_[h].data());
+
+        auto hod = head_out.data_as<float>();
+        for (std::size_t i = 0; i < static_cast<std::size_t>(D); ++i)
+            od[i] += hod[i];
+    }
+
+    return out;
+}
+
 std::vector<autograd::Variable*> GroupedQueryAttention::parameters() {
     std::vector<autograd::Variable*> params;
     params.reserve(n_heads_ * 2 + n_kv_heads_ * 2);
@@ -253,9 +382,11 @@ ModernTransformerBlock::ModernTransformerBlock(int64_t     D,
                                                std::size_t n_heads,
                                                std::size_t n_kv_heads,
                                                int64_t     d_ff,
-                                               std::uint64_t seed)
+                                               std::uint64_t seed,
+                                               int64_t     window_size)
     : norm1_(D),
-      attn_(static_cast<std::size_t>(D), n_heads, n_kv_heads, 10000.0f, seed),
+      attn_(static_cast<std::size_t>(D), n_heads, n_kv_heads, 10000.0f, seed,
+            window_size),
       norm2_(D),
       ffn_(D, d_ff, seed + 1000) {}
 
@@ -263,6 +394,18 @@ autograd::Variable ModernTransformerBlock::forward(const autograd::Variable& x) 
     using namespace autograd;
     auto h = add(x, attn_.forward(norm1_.forward(x), /*causal=*/true));
     return add(h, ffn_.forward(norm2_.forward(h)));
+}
+
+Tensor ModernTransformerBlock::forward_one(const Tensor& x,
+                                            int64_t       pos,
+                                            KVCache&      cache,
+                                            std::size_t   layer_idx,
+                                            float         rope_base_override) const {
+    Tensor h_norm = norm1_.apply_one(x);
+    Tensor h_attn = attn_.forward_one(h_norm, pos, cache, layer_idx, rope_base_override);
+    Tensor h      = ops::add(x, h_attn);
+    Tensor h_norm2 = norm2_.apply_one(h);
+    return ops::add(h, ffn_.apply_one(h_norm2));
 }
 
 std::vector<autograd::Variable*> ModernTransformerBlock::parameters() {
@@ -283,7 +426,8 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
                      int64_t     n_layers,
                      int64_t     d_ff,
                      int64_t     n_mtp,
-                     std::uint64_t seed)
+                     std::uint64_t seed,
+                     int64_t     window_size)
     : tok_emb_(vocab_size, mgpt_validate(vocab_size, embed_dim), seed),
       ln_f_(embed_dim) {
     if (n_heads == 0)
@@ -300,10 +444,14 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
         throw std::runtime_error(std::format(
             "ModernGPT: n_mtp_heads={} must be >= 0", n_mtp));
 
+    n_kv_heads_ = n_kv_heads;
+    head_dim_   = static_cast<std::size_t>(embed_dim) / n_heads;
+
     blocks_.reserve(static_cast<std::size_t>(n_layers));
     for (int64_t l = 0; l < n_layers; ++l)
         blocks_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff,
-                             seed + 2 + static_cast<std::uint64_t>(l) * 2000);
+                             seed + 2 + static_cast<std::uint64_t>(l) * 2000,
+                             window_size);
 
     mtp_heads_.reserve(static_cast<std::size_t>(n_mtp));
     for (int64_t k = 0; k < n_mtp; ++k)
@@ -355,11 +503,82 @@ std::vector<autograd::Variable*> ModernGPT::parameters() {
     return p;
 }
 
+KVCache ModernGPT::make_kv_cache(int64_t max_seq) const {
+    KVCache cache;
+    cache.max_seq = max_seq;
+    cache.filled  = 0;
+    const std::size_t nl = blocks_.size();
+    const int64_t     Dh = static_cast<int64_t>(head_dim_);
+    cache.K.resize(nl);
+    cache.V.resize(nl);
+    for (std::size_t l = 0; l < nl; ++l) {
+        cache.K[l].resize(n_kv_heads_);
+        cache.V[l].resize(n_kv_heads_);
+        for (std::size_t g = 0; g < n_kv_heads_; ++g) {
+            cache.K[l][g] = zeros({max_seq, Dh});
+            cache.V[l][g] = zeros({max_seq, Dh});
+        }
+    }
+    return cache;
+}
+
+Tensor ModernGPT::forward_one(int32_t token_id, KVCache& cache,
+                               float rope_scaling) const {
+    if (cache.full())
+        throw std::runtime_error("ModernGPT::forward_one: KV cache is full");
+
+    const int64_t D  = tok_emb_.embed_dim();
+    const int64_t V  = tok_emb_.vocab_size();
+    const int64_t pos = cache.filled;
+
+    // Embedding lookup — copy one row of the weight matrix
+    Tensor x = zeros({1, D});
+    auto xd  = x.data_as<float>();
+    auto wd  = tok_emb_.weight().data().data_as<float>();
+    const std::size_t tok = static_cast<std::size_t>(token_id);
+    const std::size_t Dsz = static_cast<std::size_t>(D);
+    for (std::size_t i = 0; i < Dsz; ++i)
+        xd[i] = wd[tok * Dsz + i];
+
+    // NTK-aware RoPE base override for context extension
+    float rope_base_override = 0.0f;
+    if (rope_scaling > 1.0f) {
+        const float Dh = static_cast<float>(head_dim_);
+        rope_base_override = 10000.0f * std::pow(rope_scaling, Dh / (Dh - 2.0f));
+    }
+
+    // Forward through transformer blocks with KV cache
+    for (std::size_t l = 0; l < blocks_.size(); ++l)
+        x = blocks_[l].forward_one(x, pos, cache, l, rope_base_override);
+
+    // Final RMSNorm
+    x = ln_f_.apply_one(x);
+
+    // LM head: weight-tied dot product against embedding table
+    // W_emb: (V, D) — compute logits[v] = dot(x[0,:], W_emb[v,:])
+    Tensor logits = zeros({1, V});
+    auto ld  = logits.data_as<float>();
+    auto xd2 = x.data_as<float>();
+    auto emb = tok_emb_.weight().data().data_as<float>();
+    for (int64_t v = 0; v < V; ++v) {
+        float dot = 0.0f;
+        const std::size_t row_off = static_cast<std::size_t>(v) * Dsz;
+        for (std::size_t d = 0; d < Dsz; ++d)
+            dot += xd2[d] * emb[row_off + d];
+        ld[static_cast<std::size_t>(v)] = dot;
+    }
+
+    ++cache.filled;
+    return logits;
+}
+
 int64_t     ModernGPT::vocab_size()  const noexcept { return tok_emb_.vocab_size(); }
 int64_t     ModernGPT::embed_dim()   const noexcept { return tok_emb_.embed_dim(); }
 std::size_t ModernGPT::num_layers()  const noexcept { return blocks_.size(); }
 int64_t     ModernGPT::n_mtp_heads() const noexcept {
     return static_cast<int64_t>(mtp_heads_.size());
 }
+std::size_t ModernGPT::n_kv_heads()  const noexcept { return n_kv_heads_; }
+std::size_t ModernGPT::head_dim()    const noexcept { return head_dim_; }
 
 } // namespace sub0llm::nn
