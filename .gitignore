@@ -37,7 +37,13 @@ compile_commands.json
 .DS_Store
 
 # Data and models (large files) — top-level only, not src/data or include/.../data
-/data/
+# Text corpora (*.txt, *.jsonl) up to ~10 MB are committed directly.
+# Binary model weights use Git LFS (.gitattributes) and are excluded here.
+/data/*.ckpt
+/data/*.bin
+/data/*.pt
+/data/*.safetensors
+/data/*.gguf
 /models/
 *.gguf
 *.bin

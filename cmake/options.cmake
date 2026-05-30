@@ -3,6 +3,7 @@ include(CMakeDependentOption)
 # ── Feature toggles ──────────────────────────────────────────────────────────
 option(SUB0LLM_BUILD_CHAPTERS "Build chapter example programs" ON)
 option(SUB0LLM_BUILD_TESTS    "Build test suite"               ON)
+option(SUB0LLM_BUILD_TOOLS    "Build CLI and server tools"     ON)
 
 # ── Backend options ──────────────────────────────────────────────────────────
 option(SUB0LLM_ENABLE_CUDA      "Enable CUDA backend (requires NVIDIA GPU + toolkit)" OFF)

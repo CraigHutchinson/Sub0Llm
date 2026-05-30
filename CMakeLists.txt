@@ -43,6 +43,11 @@ if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
 
+# ── Tools (CLI + server) ──────────────────────────────────────────────────────
+if(SUB0LLM_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
+
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 add_subdirectory(benchmarks)
 

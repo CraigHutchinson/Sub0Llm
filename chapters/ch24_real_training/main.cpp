@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -436,6 +437,10 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
     auto tok = BPETokenizer::train(texts, vocab_size);
     std::cout << std::format("  Tokenizer: vocab_size={}\n", tok.vocab_size());
 
+    // Persist tokenizer so CLI / server can reload it without re-training
+    std::filesystem::create_directories(ckpt_dir);
+    tok.save(std::filesystem::path(ckpt_dir) / "tokenizer");
+
     // 3. Build TextCorpus (hold out last 10% for eval)
     const int64_t seq_len = corpus_file.empty() ? 32 : 64;
     const std::size_t eval_split = std::max(std::size_t{1},
@@ -474,6 +479,20 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
     }();
     std::cout << std::format("  ModernGPT: V={} D={} layers={} heads={}  ({:.2f}M params)\n",
         V, D, nlayers, nheads, static_cast<double>(n_params) / 1e6);
+
+    // Write architecture config so CLI / server can reconstruct the model
+    {
+        nlohmann::json cfg;
+        cfg["vocab_size"]  = V;
+        cfg["embed_dim"]   = D;
+        cfg["n_heads"]     = nheads;
+        cfg["n_kv_heads"]  = nheads;
+        cfg["n_layers"]    = nlayers;
+        cfg["d_ff"]        = 0;
+        cfg["n_mtp_heads"] = 0;
+        std::ofstream f(std::filesystem::path(ckpt_dir) / "config.json");
+        f << cfg.dump(2) << '\n';
+    }
 
     // 5. Adam optimizer
     constexpr float lr = 3e-4f;
