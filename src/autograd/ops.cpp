@@ -1,6 +1,7 @@
 #include "sub0llm/autograd/ops.hpp"
 
 #include "sub0llm/core/ops.hpp"
+#include "../backends/cpu/kernels.hpp"
 
 #include <cmath>
 #include <format>
@@ -338,22 +339,13 @@ Variable gelu(const Variable& x) {
         Tensor x_snap = copy(xc);
         out->edges.push_back(make_edge(x.impl(),
             [x_snap](const Tensor& g) {
-                constexpr float kSqrt2OverPi = 0.7978845608f;
-                constexpr float kCoef        = 0.044715f;
                 const Tensor gc = g.contiguous();
-                const auto   gs = gc.data_as<float>();
-                const auto   xs = x_snap.data_as<float>();
                 Tensor gx = zeros(x_snap.shape(), DType::Float32, x_snap.device());
-                auto   gxs = gx.data_as<float>();
-                for (std::size_t i = 0; i < gxs.size(); ++i) {
-                    const float xi = xs[i];
-                    const float k  = kSqrt2OverPi * (xi + kCoef * xi * xi * xi);
-                    const float t  = std::tanh(k);
-                    const float dp = 0.5f * (1.0f + t) +
-                                     0.5f * xi * (1.0f - t * t) *
-                                     kSqrt2OverPi * (1.0f + 3.0f * kCoef * xi * xi);
-                    gxs[i] = gs[i] * dp;
-                }
+                backend::cpu::gelu_backward_f32(
+                    reinterpret_cast<const float*>(gc.raw_ptr()),
+                    reinterpret_cast<const float*>(x_snap.raw_ptr()),
+                    reinterpret_cast<float*>(gx.raw_ptr()),
+                    static_cast<std::size_t>(gx.numel()));
                 return gx;
             }));
     }
@@ -575,15 +567,12 @@ Variable silu(const Variable& x) {
         out->edges.push_back(make_edge(x.impl(),
             [x_snap](const Tensor& g) {
                 const Tensor gc = g.contiguous();
-                const auto   gs = gc.data_as<float>();
-                const auto   xs = x_snap.data_as<float>();
-                Tensor gx  = zeros(x_snap.shape(), DType::Float32, x_snap.device());
-                auto   gxs = gx.data_as<float>();
-                for (std::size_t i = 0; i < gxs.size(); ++i) {
-                    const float xi  = xs[i];
-                    const float sig = 1.0f / (1.0f + std::exp(-xi));
-                    gxs[i] = gs[i] * sig * (1.0f + xi * (1.0f - sig));
-                }
+                Tensor gx = zeros(x_snap.shape(), DType::Float32, x_snap.device());
+                backend::cpu::silu_backward_f32(
+                    reinterpret_cast<const float*>(gc.raw_ptr()),
+                    reinterpret_cast<const float*>(x_snap.raw_ptr()),
+                    reinterpret_cast<float*>(gx.raw_ptr()),
+                    static_cast<std::size_t>(gx.numel()));
                 return gx;
             }));
     }

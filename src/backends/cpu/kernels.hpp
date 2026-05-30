@@ -27,6 +27,23 @@ void log_f32    (const float* __restrict__ in, float* __restrict__ out, std::siz
 void sqrt_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
 void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
 void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+// SiLU: out = in * sigmoid(in).  Uses fast polynomial exp — same accuracy as sigmoid_f32.
+void silu_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+// GELU: out = in * sigmoid(2k), k = sqrt(2/π)*(in + 0.044715*in³). Tanh-approx via sigmoid identity.
+void gelu_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept;
+
+// ── Activation backward kernels ──────────────────────────────────────────────
+// grad_in[i] = grad_out[i] * local_derivative(x[i])
+void silu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
+                       float* __restrict__ grad_in, std::size_t n) noexcept;
+void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
+                       float* __restrict__ grad_in, std::size_t n) noexcept;
+
+// ── Softmax ───────────────────────────────────────────────────────────────────
+// Numerically-stable row-wise softmax: exp(in[r,c] - max_r) / sum.
+// Uses fast polynomial exp for throughput; accurate enough for attention and logits.
+void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
+                      std::size_t rows, std::size_t cols) noexcept;
 
 // ── Reduction ─────────────────────────────────────────────────────────────────
 float sum_f32 (const float* __restrict__ in, std::size_t n) noexcept;

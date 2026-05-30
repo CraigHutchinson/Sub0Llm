@@ -24,6 +24,10 @@
 
 using namespace sub0llm;
 
+// Prevents the compiler from eliminating pure reduction calls whose return values
+// would otherwise be discarded and optimised away under Release+LTO.
+static volatile float g_sink = 0.0f;
+
 // ── Timing utility ────────────────────────────────────────────────────────────
 
 struct BenchResult {
@@ -87,10 +91,10 @@ static void bench_reductions(std::size_t N, int iters)
     auto ap = a.data_as<float>();
     for (std::size_t i = 0; i < N; ++i) ap[i] = static_cast<float>(i) * 0.001f - 50.0f;
 
-    time_it("sum_f32",  N, -1, iters, [&]{ ops::sum(a);  });
-    time_it("max_f32",  N, -1, iters, [&]{ ops::max(a);  });
-    time_it("min_f32",  N, -1, iters, [&]{ ops::min(a);  });
-    time_it("norm_f32", N, -1, iters, [&]{ ops::norm(a); });
+    time_it("sum_f32",  N, -1, iters, [&]{ g_sink += ops::sum(a);  });
+    time_it("max_f32",  N, -1, iters, [&]{ g_sink += ops::max(a);  });
+    time_it("min_f32",  N, -1, iters, [&]{ g_sink += ops::min(a);  });
+    time_it("norm_f32", N, -1, iters, [&]{ g_sink += ops::norm(a); });
 }
 
 static void bench_matmul(int iters)

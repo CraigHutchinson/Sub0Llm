@@ -146,33 +146,8 @@ Tensor log    (const Tensor& t) { return unary_cpu(t, "log",     backend::cpu::l
 Tensor sqrt   (const Tensor& t) { return unary_cpu(t, "sqrt",    backend::cpu::sqrt_f32);    }
 Tensor abs    (const Tensor& t) { return unary_cpu(t, "abs",     backend::cpu::abs_f32);     }
 
-Tensor gelu(const Tensor& t) {
-    // GELU(x) ≈ 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
-    constexpr float kSqrt2OverPi = 0.7978845608f;
-    constexpr float kCoef        = 0.044715f;
-    require_f32(t, "gelu");
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) {
-        const float x = si[i];
-        dst[i] = 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + kCoef * x * x * x)));
-    }
-    return out;
-}
-
-Tensor silu(const Tensor& t) {
-    require_f32(t, "silu");
-    Tensor out(t.shape(), t.dtype(), t.device());
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-    for (std::size_t i = 0; i < dst.size(); ++i) {
-        const float x  = si[i];
-        const float sg = 1.0f / (1.0f + std::exp(-x));
-        dst[i] = x * sg;
-    }
-    return out;
-}
+Tensor gelu(const Tensor& t) { return unary_cpu(t, "gelu", backend::cpu::gelu_f32); }
+Tensor silu(const Tensor& t) { return unary_cpu(t, "silu", backend::cpu::silu_f32); }
 
 Tensor softmax(const Tensor& t, int dim) {
     if (t.ndim() > 2 || dim != -1)
@@ -182,23 +157,12 @@ Tensor softmax(const Tensor& t, int dim) {
     if (cols == 0)
         throw std::runtime_error("softmax: last dimension must be > 0");
     Tensor out(t.shape(), t.dtype(), t.device());
-
     const std::int64_t rows = t.numel() / cols;
-
-    auto si  = t.data_as<float>();
-    auto dst = out.data_as<float>();
-
-    for (std::int64_t r = 0; r < rows; ++r) {
-        const std::size_t off = static_cast<std::size_t>(r * cols);
-        const float mx = backend::cpu::max_f32(si.data() + off, static_cast<std::size_t>(cols));
-        float s = 0.0f;
-        for (std::int64_t c = 0; c < cols; ++c) {
-            dst[off + static_cast<std::size_t>(c)] = std::exp(si[off + static_cast<std::size_t>(c)] - mx);
-            s += dst[off + static_cast<std::size_t>(c)];
-        }
-        backend::cpu::mul_scalar_f32(dst.data() + off, 1.0f / s, dst.data() + off,
-                                     static_cast<std::size_t>(cols));
-    }
+    backend::cpu::softmax_rows_f32(
+        reinterpret_cast<const float*>(t.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()),
+        static_cast<std::size_t>(rows),
+        static_cast<std::size_t>(cols));
     return out;
 }
 

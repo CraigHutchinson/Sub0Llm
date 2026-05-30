@@ -239,6 +239,215 @@ void log_f32    (const float* __restrict__ in, float* __restrict__ out, std::siz
 void sqrt_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::sqrt(in[i]);  }
 void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::abs(in[i]);   }
 
+// SiLU: out[i] = in[i] * sigmoid(in[i]).
+void silu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 vz  = _mm512_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
+        __m512 x   = _mm512_loadu_ps(in + i);
+        __m512 e   = fast_exp_avx512(_mm512_sub_ps(vz, x));
+        __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, sig));
+    }
+#elif defined(SUB0LLM_AVX2)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 vz  = _mm256_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
+        __m256 x   = _mm256_loadu_ps(in + i);
+        __m256 e   = fast_exp_avx2(_mm256_sub_ps(vz, x));
+        __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, sig));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float x = in[i];
+        out[i] = x / (1.0f + std::exp(-x));
+    }
+}
+
+// GELU: out[i] = in[i] * sigmoid(z), where z = kK*(in[i] + kC*in[i]^3).
+// Tanh identity: 0.5*(1+tanh(k)) = sigmoid(2k), so gelu(x) = x*sigmoid(kK*(x+kC*x³)).
+void gelu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    // kK = 2*sqrt(2/pi) so that sigmoid(kK*k_arg) = 0.5*(1+tanh(sqrt(2/pi)*k_arg))
+    constexpr float kK = 1.5957691216f;
+    constexpr float kC = 0.044715f;
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    const __m512 vkK = _mm512_set1_ps(kK);
+    const __m512 vkC = _mm512_set1_ps(kC);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 vz  = _mm512_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
+        __m512 x     = _mm512_loadu_ps(in + i);
+        __m512 x2    = _mm512_mul_ps(x, x);
+        // inner = x + kC*x^3  =  fmadd(kC*x^2, x, x)
+        __m512 inner = _mm512_fmadd_ps(_mm512_mul_ps(vkC, x2), x, x);
+        __m512 z     = _mm512_mul_ps(vkK, inner);
+        __m512 e     = fast_exp_avx512(_mm512_sub_ps(vz, z));
+        __m512 sig   = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, sig));
+    }
+#elif defined(SUB0LLM_AVX2)
+    const __m256 vkK = _mm256_set1_ps(kK);
+    const __m256 vkC = _mm256_set1_ps(kC);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 vz  = _mm256_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
+        __m256 x     = _mm256_loadu_ps(in + i);
+        __m256 x2    = _mm256_mul_ps(x, x);
+        __m256 inner = _mm256_fmadd_ps(_mm256_mul_ps(vkC, x2), x, x);
+        __m256 z     = _mm256_mul_ps(vkK, inner);
+        __m256 e     = fast_exp_avx2(_mm256_sub_ps(vz, z));
+        __m256 sig   = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, sig));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float x = in[i];
+        const float z = kK * (x + kC * x * x * x);
+        out[i] = x / (1.0f + std::exp(-z));
+    }
+}
+
+// SiLU backward: grad_in[i] = grad_out[i] * sig*(1 + x*(1-sig)), sig = sigmoid(x).
+void silu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
+                       float* __restrict__ grad_in, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 vz  = _mm512_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
+        __m512 xi  = _mm512_loadu_ps(x + i);
+        __m512 gi  = _mm512_loadu_ps(grad_out + i);
+        __m512 e   = fast_exp_avx512(_mm512_sub_ps(vz, xi));
+        __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        // dp = sig * (1 + x*(1-sig)) = sig + x*sig*(1-sig)
+        __m512 dp  = _mm512_fmadd_ps(_mm512_mul_ps(xi, sig),
+                                      _mm512_sub_ps(one, sig), sig);
+        _mm512_storeu_ps(grad_in + i, _mm512_mul_ps(gi, dp));
+    }
+#elif defined(SUB0LLM_AVX2)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 vz  = _mm256_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
+        __m256 xi  = _mm256_loadu_ps(x + i);
+        __m256 gi  = _mm256_loadu_ps(grad_out + i);
+        __m256 e   = fast_exp_avx2(_mm256_sub_ps(vz, xi));
+        __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        __m256 dp  = _mm256_fmadd_ps(_mm256_mul_ps(xi, sig),
+                                      _mm256_sub_ps(one, sig), sig);
+        _mm256_storeu_ps(grad_in + i, _mm256_mul_ps(gi, dp));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-x[i]));
+        grad_in[i] = grad_out[i] * sig * (1.0f + x[i] * (1.0f - sig));
+    }
+}
+
+// GELU backward: grad_in[i] = grad_out[i] * gelu'(x[i]).
+// gelu'(x) = sig(z) + x * sig(z)*(1-sig(z)) * z', where z = kK*(x+kC*x³), z' = kK*(1+3*kC*x²).
+void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
+                       float* __restrict__ grad_in, std::size_t n) noexcept {
+    constexpr float kK  = 1.5957691216f;
+    constexpr float kC  = 0.044715f;
+    constexpr float k3C = 3.0f * kC * kK;   // kK*3*kC — coefficient for z' constant term
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    const __m512 vkK  = _mm512_set1_ps(kK);
+    const __m512 vkC  = _mm512_set1_ps(kC);
+    const __m512 vk3C = _mm512_set1_ps(k3C);
+    const __m512 one  = _mm512_set1_ps(1.0f);
+    const __m512 vz   = _mm512_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
+        __m512 xi   = _mm512_loadu_ps(x + i);
+        __m512 gi   = _mm512_loadu_ps(grad_out + i);
+        __m512 x2   = _mm512_mul_ps(xi, xi);
+        __m512 z    = _mm512_mul_ps(vkK, _mm512_fmadd_ps(_mm512_mul_ps(vkC, x2), xi, xi));
+        __m512 e    = fast_exp_avx512(_mm512_sub_ps(vz, z));
+        __m512 sig  = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        // z' = kK*(1 + 3*kC*x²) = kK + k3C*x²
+        __m512 zp   = _mm512_fmadd_ps(vk3C, x2, vkK);
+        // gelu'(x) = sig + x*sig*(1-sig)*z'
+        __m512 dp   = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_mul_ps(xi, sig),
+                                                      _mm512_sub_ps(one, sig)),
+                                       zp, sig);
+        _mm512_storeu_ps(grad_in + i, _mm512_mul_ps(gi, dp));
+    }
+#elif defined(SUB0LLM_AVX2)
+    const __m256 vkK  = _mm256_set1_ps(kK);
+    const __m256 vkC  = _mm256_set1_ps(kC);
+    const __m256 vk3C = _mm256_set1_ps(k3C);
+    const __m256 one  = _mm256_set1_ps(1.0f);
+    const __m256 vz   = _mm256_setzero_ps();
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
+        __m256 xi   = _mm256_loadu_ps(x + i);
+        __m256 gi   = _mm256_loadu_ps(grad_out + i);
+        __m256 x2   = _mm256_mul_ps(xi, xi);
+        __m256 z    = _mm256_mul_ps(vkK, _mm256_fmadd_ps(_mm256_mul_ps(vkC, x2), xi, xi));
+        __m256 e    = fast_exp_avx2(_mm256_sub_ps(vz, z));
+        __m256 sig  = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        __m256 zp   = _mm256_fmadd_ps(vk3C, x2, vkK);
+        __m256 dp   = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(xi, sig),
+                                                      _mm256_sub_ps(one, sig)),
+                                       zp, sig);
+        _mm256_storeu_ps(grad_in + i, _mm256_mul_ps(gi, dp));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float xi = x[i];
+        const float z  = kK * (xi + kC * xi * xi * xi);
+        const float sig = 1.0f / (1.0f + std::exp(-z));
+        const float zp  = kK + k3C * xi * xi;
+        grad_in[i] = grad_out[i] * (sig + xi * sig * (1.0f - sig) * zp);
+    }
+}
+
+// ── Softmax ───────────────────────────────────────────────────────────────────
+
+// Numerically-stable row-wise softmax using fast polynomial exp.
+void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
+                      std::size_t rows, std::size_t cols) noexcept {
+    for (std::size_t r = 0; r < rows; ++r) {
+        const float* rin  = in  + r * cols;
+        float*       rout = out + r * cols;
+        const float  mx   = max_f32(rin, cols);
+        std::size_t  i    = 0;
+        float        s    = 0.0f;
+#if defined(SUB0LLM_AVX512)
+        const __m512 vmx = _mm512_set1_ps(mx);
+        __m512 vacc = _mm512_setzero_ps();
+        for (const std::size_t end = simd_prefix(cols); i < end; i += 16) {
+            __m512 e = fast_exp_avx512(_mm512_sub_ps(_mm512_loadu_ps(rin + i), vmx));
+            _mm512_storeu_ps(rout + i, e);
+            vacc = _mm512_add_ps(vacc, e);
+        }
+        s = _mm512_reduce_add_ps(vacc);
+#elif defined(SUB0LLM_AVX2)
+        const __m256 vmx = _mm256_set1_ps(mx);
+        __m256 vacc = _mm256_setzero_ps();
+        for (const std::size_t end = simd_prefix(cols); i < end; i += 8) {
+            __m256 e = fast_exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(rin + i), vmx));
+            _mm256_storeu_ps(rout + i, e);
+            vacc = _mm256_add_ps(vacc, e);
+        }
+        __m128 hi  = _mm256_extractf128_ps(vacc, 1);
+        __m128 lo  = _mm256_castps256_ps128(vacc);
+        __m128 sum = _mm_add_ps(hi, lo);
+        sum = _mm_hadd_ps(sum, sum);
+        sum = _mm_hadd_ps(sum, sum);
+        s = _mm_cvtss_f32(sum);
+#endif
+        for (; i < cols; ++i) {
+            rout[i] = std::exp(rin[i] - mx);
+            s += rout[i];
+        }
+        mul_scalar_f32(rout, 1.0f / s, rout, cols);
+    }
+}
+
 // ── Reductions ────────────────────────────────────────────────────────────────
 
 float sum_f32(const float* __restrict__ in, std::size_t n) noexcept {
