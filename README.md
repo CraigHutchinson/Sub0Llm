@@ -122,6 +122,10 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ```
 
+For the full step-by-step guide including CUDA, native builds, Ollama synthetic
+data, training commands, and troubleshooting, see
+**[docs/local_machine_setup.md](docs/local_machine_setup.md)**.
+
 ### Run a chapter
 
 ```bash
