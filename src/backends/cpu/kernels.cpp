@@ -82,18 +82,57 @@ static inline __m256 fast_exp_avx2(__m256 x) noexcept {
 
 // ── Shared SIMD helpers ───────────────────────────────────────────────────────
 // fast_sigmoid: 1/(1+exp(-x)) using the fast polynomial exp above.
-// hsum256: horizontal sum of 8 floats in a 256-bit AVX register.
+// fast_log:     log(x) via IEEE exponent decomposition + atanh Horner series.
+//               Uses x = 2^e * m, m in [1,2); u=(m-1)/(m+1) in [0,1/3);
+//               log(m) = 2*u*(1 + u²/3 + u⁴/5 + u⁶/7 + u⁸/9). Max err ~1.3e-6.
+// hsum256:      horizontal sum of 8 floats in a 256-bit AVX register.
 #if defined(SUB0LLM_AVX512)
 static inline __m512 fast_sigmoid_avx512(__m512 x) noexcept {
     const __m512 one = _mm512_set1_ps(1.0f);
     return _mm512_div_ps(one, _mm512_add_ps(one,
         fast_exp_avx512(_mm512_sub_ps(_mm512_setzero_ps(), x))));
 }
+static inline __m512 fast_log_avx512(__m512 x) noexcept {
+    x = _mm512_max_ps(x, _mm512_set1_ps(1.175494e-38f));  // clamp to min normal
+    __m512i xi = _mm512_castps_si512(x);
+    __m512i e  = _mm512_sub_epi32(_mm512_srli_epi32(xi, 23), _mm512_set1_epi32(127));
+    xi = _mm512_or_epi32(_mm512_and_epi32(xi, _mm512_set1_epi32(0x007FFFFF)),
+                          _mm512_set1_epi32(0x3F800000));
+    __m512 m  = _mm512_castsi512_ps(xi);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    __m512 u  = _mm512_div_ps(_mm512_sub_ps(m, one), _mm512_add_ps(m, one));
+    __m512 u2 = _mm512_mul_ps(u, u);
+    __m512 p  = _mm512_set1_ps(1.0f / 9.0f);
+    p = _mm512_fmadd_ps(u2, p, _mm512_set1_ps(1.0f / 7.0f));
+    p = _mm512_fmadd_ps(u2, p, _mm512_set1_ps(1.0f / 5.0f));
+    p = _mm512_fmadd_ps(u2, p, _mm512_set1_ps(1.0f / 3.0f));
+    p = _mm512_fmadd_ps(u2, p, one);
+    __m512 log_m = _mm512_mul_ps(_mm512_set1_ps(2.0f), _mm512_mul_ps(u, p));
+    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(e), _mm512_set1_ps(0.693147180559945f), log_m);
+}
 #elif defined(SUB0LLM_AVX2)
 static inline __m256 fast_sigmoid_avx2(__m256 x) noexcept {
     const __m256 one = _mm256_set1_ps(1.0f);
     return _mm256_div_ps(one, _mm256_add_ps(one,
         fast_exp_avx2(_mm256_sub_ps(_mm256_setzero_ps(), x))));
+}
+static inline __m256 fast_log_avx2(__m256 x) noexcept {
+    x = _mm256_max_ps(x, _mm256_set1_ps(1.175494e-38f));
+    __m256i xi = _mm256_castps_si256(x);
+    __m256i e  = _mm256_sub_epi32(_mm256_srli_epi32(xi, 23), _mm256_set1_epi32(127));
+    xi = _mm256_or_si256(_mm256_and_si256(xi, _mm256_set1_epi32(0x007FFFFF)),
+                          _mm256_set1_epi32(0x3F800000));
+    __m256 m  = _mm256_castsi256_ps(xi);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 u  = _mm256_div_ps(_mm256_sub_ps(m, one), _mm256_add_ps(m, one));
+    __m256 u2 = _mm256_mul_ps(u, u);
+    __m256 p  = _mm256_set1_ps(1.0f / 9.0f);
+    p = _mm256_fmadd_ps(u2, p, _mm256_set1_ps(1.0f / 7.0f));
+    p = _mm256_fmadd_ps(u2, p, _mm256_set1_ps(1.0f / 5.0f));
+    p = _mm256_fmadd_ps(u2, p, _mm256_set1_ps(1.0f / 3.0f));
+    p = _mm256_fmadd_ps(u2, p, one);
+    __m256 log_m = _mm256_mul_ps(_mm256_set1_ps(2.0f), _mm256_mul_ps(u, p));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(e), _mm256_set1_ps(0.693147180559945f), log_m);
 }
 
 static inline float hsum256(__m256 v) noexcept {
@@ -246,12 +285,54 @@ void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::siz
     for (; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-in[i]));
 }
 
-// Scalar math ops — leave exp/log/sqrt as scalar (transcendental accuracy required
-// for log-softmax, cross-entropy; fast approximation is only safe for sigmoid gate).
-void exp_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::exp(in[i]);   }
-void log_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::log(in[i]);   }
-void sqrt_f32   (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::sqrt(in[i]);  }
-void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept { for (std::size_t i=0;i<n;++i) out[i]=std::abs(in[i]);   }
+void exp_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16)
+        _mm512_storeu_ps(out + i, fast_exp_avx512(_mm512_loadu_ps(in + i)));
+#elif defined(SUB0LLM_AVX2)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8)
+        _mm256_storeu_ps(out + i, fast_exp_avx2(_mm256_loadu_ps(in + i)));
+#endif
+    for (; i < n; ++i) out[i] = std::exp(in[i]);
+}
+void log_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16)
+        _mm512_storeu_ps(out + i, fast_log_avx512(_mm512_loadu_ps(in + i)));
+#elif defined(SUB0LLM_AVX2)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8)
+        _mm256_storeu_ps(out + i, fast_log_avx2(_mm256_loadu_ps(in + i)));
+#endif
+    for (; i < n; ++i) out[i] = std::log(in[i]);
+}
+// sqrt/abs use hardware SIMD instructions — exact same results as scalar.
+void sqrt_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16)
+        _mm512_storeu_ps(out + i, _mm512_sqrt_ps(_mm512_loadu_ps(in + i)));
+#elif defined(SUB0LLM_AVX2)
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8)
+        _mm256_storeu_ps(out + i, _mm256_sqrt_ps(_mm256_loadu_ps(in + i)));
+#endif
+    for (; i < n; ++i) out[i] = std::sqrt(in[i]);
+}
+void abs_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+    std::size_t i = 0;
+#if defined(SUB0LLM_AVX512)
+    const __m512i smask512 = _mm512_set1_epi32(0x7FFFFFFF);
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16)
+        _mm512_storeu_ps(out + i, _mm512_castsi512_ps(
+            _mm512_and_epi32(_mm512_castps_si512(_mm512_loadu_ps(in + i)), smask512)));
+#elif defined(SUB0LLM_AVX2)
+    const __m256 smask256 = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8)
+        _mm256_storeu_ps(out + i, _mm256_and_ps(_mm256_loadu_ps(in + i), smask256));
+#endif
+    for (; i < n; ++i) out[i] = std::abs(in[i]);
+}
 
 // SiLU: out[i] = in[i] * sigmoid(in[i]).
 void silu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {

@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#if defined(SUB0LLM_AVX512) || defined(SUB0LLM_AVX2)
+#  include <immintrin.h>
+#endif
+
 namespace sub0llm::nn {
 
 namespace {
@@ -66,11 +70,33 @@ void SGD::step() {
     for (std::size_t i = 0; i < params_.size(); ++i) {
         auto* p = params_[i];
         if (p->grad().numel() == 0) continue;
-        auto       ps = p->data().data_as<float>();
-        const auto gs = p->grad().data_as<float>();
-        auto       vs = velocity_[i].data_as<float>();
-        assert(gs.size() == ps.size() && "grad shape must match param shape");
-        for (std::size_t j = 0; j < ps.size(); ++j) {
+        float*       ps = p->data().data_as<float>().data();
+        const float* gs = p->grad().data_as<float>().data();
+        float*       vs = velocity_[i].data_as<float>().data();
+        const std::size_t n = static_cast<std::size_t>(p->data().numel());
+        assert(p->grad().numel() == p->data().numel() && "grad shape must match param shape");
+
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        const __m512 vm  = _mm512_set1_ps(momentum_);
+        const __m512 vlr = _mm512_set1_ps(-lr_);
+        for (const std::size_t end = n & ~15u; j < end; j += 16) {
+            __m512 vel = _mm512_fmadd_ps(vm, _mm512_loadu_ps(vs + j),
+                                          _mm512_mul_ps(vlr, _mm512_loadu_ps(gs + j)));
+            _mm512_storeu_ps(vs + j, vel);
+            _mm512_storeu_ps(ps + j, _mm512_add_ps(_mm512_loadu_ps(ps + j), vel));
+        }
+#elif defined(SUB0LLM_AVX2)
+        const __m256 vm  = _mm256_set1_ps(momentum_);
+        const __m256 vlr = _mm256_set1_ps(-lr_);
+        for (const std::size_t end = n & ~7u; j < end; j += 8) {
+            __m256 vel = _mm256_fmadd_ps(vm, _mm256_loadu_ps(vs + j),
+                                          _mm256_mul_ps(vlr, _mm256_loadu_ps(gs + j)));
+            _mm256_storeu_ps(vs + j, vel);
+            _mm256_storeu_ps(ps + j, _mm256_add_ps(_mm256_loadu_ps(ps + j), vel));
+        }
+#endif
+        for (; j < n; ++j) {
             vs[j] = momentum_ * vs[j] - lr_ * gs[j];
             ps[j] += vs[j];
         }
@@ -106,23 +132,65 @@ Adam::Adam(std::vector<autograd::Variable*> params,
 
 void Adam::step() {
     ++t_;
-    const float bc1 = 1.0f - std::pow(b1_, static_cast<float>(t_));
-    const float bc2 = 1.0f - std::pow(b2_, static_cast<float>(t_));
+    const float bc1    = 1.0f - std::pow(b1_, static_cast<float>(t_));
+    const float bc2    = 1.0f - std::pow(b2_, static_cast<float>(t_));
+    const float omB1   = 1.0f - b1_;
+    const float omB2   = 1.0f - b2_;
+    const float lrBc1  = lr_ / bc1;
+    const float invBc2 = 1.0f / bc2;
 
     for (std::size_t i = 0; i < params_.size(); ++i) {
         auto* p = params_[i];
         if (p->grad().numel() == 0) continue;
-        auto       ps = p->data().data_as<float>();
-        const auto gs = p->grad().data_as<float>();
-        auto       ms = m_[i].data_as<float>();
-        auto       vs = v_[i].data_as<float>();
-        assert(gs.size() == ps.size() && "grad shape must match param shape");
-        for (std::size_t j = 0; j < ps.size(); ++j) {
-            ms[j] = b1_ * ms[j] + (1.0f - b1_) * gs[j];
-            vs[j] = b2_ * vs[j] + (1.0f - b2_) * gs[j] * gs[j];
-            const float m_hat = ms[j] / bc1;
-            const float v_hat = vs[j] / bc2;
-            ps[j] -= lr_ * m_hat / (std::sqrt(v_hat) + eps_);
+        float*       ps = p->data().data_as<float>().data();
+        const float* gs = p->grad().data_as<float>().data();
+        float*       mi = m_[i].data_as<float>().data();
+        float*       vi = v_[i].data_as<float>().data();
+        const std::size_t n = static_cast<std::size_t>(p->data().numel());
+        assert(p->grad().numel() == p->data().numel() && "grad shape must match param shape");
+
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        const __m512 vb1     = _mm512_set1_ps(b1_);
+        const __m512 vomB1   = _mm512_set1_ps(omB1);
+        const __m512 vb2     = _mm512_set1_ps(b2_);
+        const __m512 vomB2   = _mm512_set1_ps(omB2);
+        const __m512 vlrBc1  = _mm512_set1_ps(lrBc1);
+        const __m512 vinvBc2 = _mm512_set1_ps(invBc2);
+        const __m512 veps    = _mm512_set1_ps(eps_);
+        for (const std::size_t end = n & ~15u; j < end; j += 16) {
+            __m512 g  = _mm512_loadu_ps(gs + j);
+            __m512 mv = _mm512_fmadd_ps(vb1, _mm512_loadu_ps(mi + j), _mm512_mul_ps(vomB1, g));
+            __m512 vv = _mm512_fmadd_ps(vb2, _mm512_loadu_ps(vi + j), _mm512_mul_ps(vomB2, _mm512_mul_ps(g, g)));
+            _mm512_storeu_ps(mi + j, mv);
+            _mm512_storeu_ps(vi + j, vv);
+            __m512 denom = _mm512_add_ps(_mm512_sqrt_ps(_mm512_mul_ps(vinvBc2, vv)), veps);
+            _mm512_storeu_ps(ps + j, _mm512_sub_ps(_mm512_loadu_ps(ps + j),
+                                                     _mm512_div_ps(_mm512_mul_ps(vlrBc1, mv), denom)));
+        }
+#elif defined(SUB0LLM_AVX2)
+        const __m256 vb1     = _mm256_set1_ps(b1_);
+        const __m256 vomB1   = _mm256_set1_ps(omB1);
+        const __m256 vb2     = _mm256_set1_ps(b2_);
+        const __m256 vomB2   = _mm256_set1_ps(omB2);
+        const __m256 vlrBc1  = _mm256_set1_ps(lrBc1);
+        const __m256 vinvBc2 = _mm256_set1_ps(invBc2);
+        const __m256 veps    = _mm256_set1_ps(eps_);
+        for (const std::size_t end = n & ~7u; j < end; j += 8) {
+            __m256 g  = _mm256_loadu_ps(gs + j);
+            __m256 mv = _mm256_fmadd_ps(vb1, _mm256_loadu_ps(mi + j), _mm256_mul_ps(vomB1, g));
+            __m256 vv = _mm256_fmadd_ps(vb2, _mm256_loadu_ps(vi + j), _mm256_mul_ps(vomB2, _mm256_mul_ps(g, g)));
+            _mm256_storeu_ps(mi + j, mv);
+            _mm256_storeu_ps(vi + j, vv);
+            __m256 denom = _mm256_add_ps(_mm256_sqrt_ps(_mm256_mul_ps(vinvBc2, vv)), veps);
+            _mm256_storeu_ps(ps + j, _mm256_sub_ps(_mm256_loadu_ps(ps + j),
+                                                     _mm256_div_ps(_mm256_mul_ps(vlrBc1, mv), denom)));
+        }
+#endif
+        for (; j < n; ++j) {
+            mi[j] = b1_ * mi[j] + omB1 * gs[j];
+            vi[j] = b2_ * vi[j] + omB2 * gs[j] * gs[j];
+            ps[j] -= lrBc1 * mi[j] / (std::sqrt(invBc2 * vi[j]) + eps_);
         }
     }
 }
