@@ -683,4 +683,58 @@ float norm_f32(const float* __restrict__ in, std::size_t n) noexcept {
     return std::sqrt(acc);
 }
 
+// ── 2-D strided copy ─────────────────────────────────────────────────────────
+
+void copy_strided_2d_f32(const float* __restrict__ src,
+                          std::size_t rs, std::size_t cs,
+                          float* __restrict__ dst,
+                          std::size_t rows, std::size_t cols) noexcept {
+    constexpr std::size_t B = 16;
+
+    // Case 1: cs==1 — inner dimension is contiguous → plain memcpy per row.
+    if (cs == 1) {
+        for (std::size_t i = 0; i < rows; ++i)
+            std::memcpy(dst + i * cols, src + i * rs, cols * sizeof(float));
+        return;
+    }
+
+    // Case 2: rs==1 — the transpose case (A.T.contiguous()).
+    // Source inner dimension is the fast axis (stride=1), so we loop j-outer
+    // and i-inner: reads from src are sequential (stride=1), writes to dst are
+    // strided but cache-blocked.
+    if (rs == 1) {
+        for (std::size_t bj = 0; bj < cols; bj += B) {
+            const std::size_t jend = bj + B < cols ? bj + B : cols;
+            for (std::size_t bi = 0; bi < rows; bi += B) {
+                const std::size_t iend = bi + B < rows ? bi + B : rows;
+                for (std::size_t j = bj; j < jend; ++j) {
+                    // src[i*1 + j*cs] = src[bi+k + j*cs] for k in [0, ilen).
+                    // Pointer arithmetic makes this a sequential scan of src.
+                    const float* sr = src + j * cs + bi;
+                    float*       dr = dst + bi * cols + j;
+                    const std::size_t ilen = iend - bi;
+                    for (std::size_t k = 0; k < ilen; ++k)
+                        dr[k * cols] = sr[k];
+                }
+            }
+        }
+        return;
+    }
+
+    // Case 3: general 2D strided — blocked 16×16 loop.
+    for (std::size_t bi = 0; bi < rows; bi += B) {
+        const std::size_t iend = bi + B < rows ? bi + B : rows;
+        for (std::size_t bj = 0; bj < cols; bj += B) {
+            const std::size_t jend = bj + B < cols ? bj + B : cols;
+            for (std::size_t i = bi; i < iend; ++i) {
+                const float* sr = src + i * rs + bj * cs;
+                float*       dr = dst + i * cols + bj;
+                const std::size_t jlen = jend - bj;
+                for (std::size_t j = 0; j < jlen; ++j)
+                    dr[j] = sr[j * cs];
+            }
+        }
+    }
+}
+
 } // namespace sub0llm::backend::cpu

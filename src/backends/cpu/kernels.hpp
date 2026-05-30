@@ -76,6 +76,16 @@ void rms_norm_bwd_w_f32(const float* __restrict__ g,
 void embed_bwd_f32(const float* __restrict__ g_out, const int32_t* __restrict__ idx,
                    float* __restrict__ g_w, std::size_t N, std::size_t D) noexcept;
 
+// ── 2-D strided copy ─────────────────────────────────────────────────────────
+// dst[i,j] = src[i*rs + j*cs]  for all (i,j) in [0,rows) × [0,cols).
+// dst is always written contiguously (row-major, stride = cols).
+// rs and cs are in float elements (not bytes).
+// Covers general non-contiguous slices and the common A.T.contiguous() transpose.
+void copy_strided_2d_f32(const float* __restrict__ src,
+                          std::size_t rs, std::size_t cs,
+                          float* __restrict__ dst,
+                          std::size_t rows, std::size_t cols) noexcept;
+
 // ── Reduction ─────────────────────────────────────────────────────────────────
 float sum_f32 (const float* __restrict__ in, std::size_t n) noexcept;
 float max_f32 (const float* __restrict__ in, std::size_t n) noexcept;

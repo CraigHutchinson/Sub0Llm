@@ -96,15 +96,22 @@ Variable mul(const Variable& a, const Variable& b) {
 Variable matmul(const Variable& a, const Variable& b) {
     auto out = make_node(ops::matmul(a.data(), b.data()), any_grad(a, b));
     if (out->requires_grad) {
+        // Lazy transpose: capture shallow Tensor snapshots (no data copy at forward time).
+        // .transpose(0,1).contiguous() is deferred to backward, where it is actually needed.
+        // Safe for standard training (optimizer runs after all backward passes complete).
         if (a.requires_grad()) {
-            Tensor b_t = b.data().transpose(0, 1).contiguous();
+            Tensor b_snap = b.data();
             out->edges.push_back(make_edge(a.impl(),
-                [b_t](const Tensor& g) { return ops::matmul(g, b_t); }));
+                [b_snap](const Tensor& g) {
+                    return ops::matmul(g, b_snap.transpose(0, 1).contiguous());
+                }));
         }
         if (b.requires_grad()) {
-            Tensor a_t = a.data().transpose(0, 1).contiguous();
+            Tensor a_snap = a.data();
             out->edges.push_back(make_edge(b.impl(),
-                [a_t](const Tensor& g) { return ops::matmul(a_t, g); }));
+                [a_snap](const Tensor& g) {
+                    return ops::matmul(a_snap.transpose(0, 1).contiguous(), g);
+                }));
         }
     }
     return Variable::wrap(std::move(out));

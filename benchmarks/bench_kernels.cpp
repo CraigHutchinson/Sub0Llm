@@ -119,6 +119,26 @@ static void bench_matmul(int iters)
     }
 }
 
+static void bench_copy_strided(int iters)
+{
+    std::cout << "\n--- copy_strided_2d (transpose) ---\n";
+
+    // Typical weight shapes seen during training.
+    struct Spec { int64_t M, N; std::string label; };
+    const Spec specs[] = {
+        {128,  128,  "128×128  (D=128 proj weight)"},
+        {341,  128,  "341×128  (SwiGLU gate weight)"},
+        {512,  512,  "512×512  (D=512 proj weight)"},
+        {1024, 1024, "1024×1024 (D=1024 proj weight)"},
+    };
+    for (const auto& s : specs) {
+        Tensor A = zeros({s.M, s.N});
+        const std::size_t n_floats = static_cast<std::size_t>(s.M * s.N) * 2;
+        time_it(s.label, n_floats, -1, iters,
+            [&]{ A.transpose(0, 1).contiguous(); });
+    }
+}
+
 static void bench_autograd_forward(int iters)
 {
     std::cout << "\n--- Autograd forward (T=32, D=128) ---\n";
@@ -128,7 +148,6 @@ static void bench_autograd_forward(int iters)
     const int64_t T = 32, D = 128;
     Tensor x_t = zeros({T, D});
     Tensor w_t = zeros({D});
-    Tensor b_t = zeros({D});
     auto xs = x_t.data_as<float>();
     auto ws = w_t.data_as<float>();
     for (std::size_t i = 0; i < static_cast<std::size_t>(T * D); ++i) xs[i] = static_cast<float>(i) * 0.001f;
@@ -136,7 +155,10 @@ static void bench_autograd_forward(int iters)
 
     Variable x(x_t, true);
     Variable w(w_t, true);
-    Variable b(b_t, true);
+    // Pre-create weight matrix so the benchmark measures only the matmul wrapper,
+    // not the zeros({D,D}) allocation (which is a benchmark artefact).
+    Tensor wmat = zeros({D, D});
+    Variable wv(wmat, true);
     const std::size_t n = static_cast<std::size_t>(T * D);
 
     time_it("rms_norm fwd",    n * 2, -1, iters, [&]{ rms_norm(x, w); });
@@ -144,7 +166,7 @@ static void bench_autograd_forward(int iters)
     time_it("silu fwd",        n * 2, -1, iters, [&]{ silu(x); });
     time_it("gelu fwd",        n * 2, -1, iters, [&]{ gelu(x); });
     time_it("matmul (32x128x128)", static_cast<std::size_t>(T*(D+D)+D*D), 2*T*D*D, iters,
-        [&]{ Tensor wmat = zeros({D, D}); Variable wv(wmat, true); matmul(x, wv); });
+        [&]{ matmul(x, wv); });
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -165,6 +187,7 @@ int main(int argc, char** argv)
     bench_element_wise(N, iters);
     bench_reductions(N, iters);
     bench_matmul(iters);
+    bench_copy_strided(iters);
     bench_autograd_forward(iters);
 
     std::cout << "\nDone.\n";
