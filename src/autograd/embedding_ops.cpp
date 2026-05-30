@@ -1,5 +1,7 @@
 #include "sub0llm/autograd/embedding_ops.hpp"
+#include "../backends/cpu/kernels.hpp"
 
+#include <cstring>
 #include <format>
 #include <stdexcept>
 
@@ -57,8 +59,7 @@ Variable embedding_lookup(const Variable& weight, const Tensor& indices) {
         if (tok >= V)
             throw std::runtime_error(std::format(
                 "autograd::embedding_lookup: index {} out of vocab [0,{})", tok, V));
-        for (std::size_t j = 0; j < D; ++j)
-            os[i * D + j] = ws[tok * D + j];
+        std::memcpy(os.data() + i * D, ws.data() + tok * D, D * sizeof(float));
     }
 
     // Reshape to match indices shape + D.
@@ -85,11 +86,10 @@ Variable embedding_lookup(const Variable& weight, const Tensor& indices) {
                     DType::Float32, w_device);
                 auto gwd = grad_w.data_as<float>();
 
-                for (std::size_t i = 0; i < N; ++i) {
-                    const auto tok = static_cast<std::size_t>(tc[i]);
-                    for (std::size_t j = 0; j < D; ++j)
-                        gwd[tok * D + j] += gs[i * D + j];
-                }
+                backend::cpu::embed_bwd_f32(
+                    gs.data(),
+                    reinterpret_cast<const int32_t*>(idx_copy.raw_ptr()),
+                    gwd.data(), N, D);
                 return grad_w;
             }));
     }

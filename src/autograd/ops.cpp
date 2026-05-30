@@ -603,69 +603,52 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
             "autograd::rms_norm: weight numel {} must equal D={}", weight.data().numel(), D));
 
     const Tensor xc = xd.contiguous();
-    const Tensor wc = weight.data().contiguous();
-    const auto   xs = xc.data_as<float>();
-    const auto   ws = wc.data_as<float>();
-    const float  Df = static_cast<float>(D);
+    Tensor       wc = weight.data().contiguous();
 
     Tensor x_norm  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
     Tensor inv_rms = zeros({static_cast<int64_t>(T)});
     Tensor out_d   = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
-    {
-        auto xns  = x_norm.data_as<float>();
-        auto irs  = inv_rms.data_as<float>();
-        auto od   = out_d.data_as<float>();
-        for (std::size_t t = 0; t < T; ++t) {
-            float ss = 0.0f;
-            for (std::size_t j = 0; j < D; ++j) ss += xs[t * D + j] * xs[t * D + j];
-            const float ir = 1.0f / std::sqrt(ss / Df + eps);
-            irs[t] = ir;
-            for (std::size_t j = 0; j < D; ++j) {
-                xns[t * D + j] = xs[t * D + j] * ir;
-                od[t * D + j]  = ws[j] * xns[t * D + j];
-            }
-        }
-    }
+
+    backend::cpu::rms_norm_fwd_f32(
+        reinterpret_cast<const float*>(xc.raw_ptr()),
+        reinterpret_cast<const float*>(wc.raw_ptr()),
+        reinterpret_cast<float*>(x_norm.raw_ptr()),
+        reinterpret_cast<float*>(inv_rms.raw_ptr()),
+        reinterpret_cast<float*>(out_d.raw_ptr()),
+        T, D, eps);
 
     const bool rg = x.requires_grad() || weight.requires_grad();
     auto out = make_node(std::move(out_d), rg);
     if (rg) {
-        Tensor xn_snap  = copy(x_norm);
-        Tensor ir_snap  = copy(inv_rms);
-        Tensor w_snap   = copy(wc);
+        // Move intermediates into snapshots (no deep copy).
+        // Closures share the same storage via Tensor's internal shared_ptr.
+        Tensor xn_snap = std::move(x_norm);
+        Tensor ir_snap = std::move(inv_rms);
 
         if (x.requires_grad())
             out->edges.push_back(make_edge(x.impl(),
-                [xn_snap, ir_snap, w_snap, T, D, Df](const Tensor& g) {
-                    const Tensor gc  = g.contiguous();
-                    const auto   gs  = gc.data_as<float>();
-                    const auto   xns = xn_snap.data_as<float>();
-                    const auto   irs = ir_snap.data_as<float>();
-                    const auto   wb  = w_snap.data_as<float>();
-                    Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
-                    auto   gxs = gx.data_as<float>();
-                    for (std::size_t t = 0; t < T; ++t) {
-                        float sigma = 0.0f;
-                        for (std::size_t j = 0; j < D; ++j)
-                            sigma += wb[j] * gs[t * D + j] * xns[t * D + j];
-                        for (std::size_t j = 0; j < D; ++j) {
-                            const float h = wb[j] * gs[t * D + j];
-                            gxs[t * D + j] = irs[t] / Df * (Df * h - xns[t * D + j] * sigma);
-                        }
-                    }
+                [xn_snap, ir_snap, w_snap = std::move(wc), T, D](const Tensor& g) {
+                    const Tensor gc = g.contiguous();
+                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+                    backend::cpu::rms_norm_bwd_x_f32(
+                        reinterpret_cast<const float*>(gc.raw_ptr()),
+                        reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                        reinterpret_cast<const float*>(ir_snap.raw_ptr()),
+                        reinterpret_cast<const float*>(w_snap.raw_ptr()),
+                        reinterpret_cast<float*>(gx.raw_ptr()),
+                        T, D);
                     return gx;
                 }));
         if (weight.requires_grad())
             out->edges.push_back(make_edge(weight.impl(),
                 [xn_snap, T, D](const Tensor& g) {
-                    const Tensor gc  = g.contiguous();
-                    const auto   gs  = gc.data_as<float>();
-                    const auto   xns = xn_snap.data_as<float>();
-                    Tensor gw  = zeros({static_cast<int64_t>(D)});
-                    auto   gws = gw.data_as<float>();
-                    for (std::size_t t = 0; t < T; ++t)
-                        for (std::size_t j = 0; j < D; ++j)
-                            gws[j] += gs[t * D + j] * xns[t * D + j];
+                    const Tensor gc = g.contiguous();
+                    Tensor gw = zeros({static_cast<int64_t>(D)});
+                    backend::cpu::rms_norm_bwd_w_f32(
+                        reinterpret_cast<const float*>(gc.raw_ptr()),
+                        reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                        reinterpret_cast<float*>(gw.raw_ptr()),
+                        T, D);
                     return gw;
                 }));
     }

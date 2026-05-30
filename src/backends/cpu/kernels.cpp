@@ -444,7 +444,173 @@ void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
             rout[i] = std::exp(rin[i] - mx);
             s += rout[i];
         }
-        mul_scalar_f32(rout, 1.0f / s, rout, cols);
+        // Inline normalization: calling mul_scalar_f32(rout, s, rout, cols) would
+        // pass the same pointer for two __restrict__ params — undefined behaviour.
+        const float inv_s = 1.0f / s;
+        for (std::size_t k = 0; k < cols; ++k) rout[k] *= inv_s;
+    }
+}
+
+// ── RMSNorm ───────────────────────────────────────────────────────────────────
+
+void rms_norm_fwd_f32(const float* __restrict__ x, const float* __restrict__ w,
+                      float* __restrict__ x_norm, float* __restrict__ inv_rms,
+                      float* __restrict__ out,
+                      std::size_t T, std::size_t D, float eps) noexcept {
+    const float invD = 1.0f / static_cast<float>(D);
+    const std::size_t Ds = simd_prefix(D);
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* xt  = x     + t * D;
+        float*       xnt = x_norm + t * D;
+        float*       ot  = out   + t * D;
+        float ss = 0.0f;
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        __m512 vacc = _mm512_setzero_ps();
+        for (; j < Ds; j += 16) {
+            __m512 v = _mm512_loadu_ps(xt + j);
+            vacc = _mm512_fmadd_ps(v, v, vacc);
+        }
+        ss = _mm512_reduce_add_ps(vacc);
+#elif defined(SUB0LLM_AVX2)
+        __m256 vacc = _mm256_setzero_ps();
+        for (; j < Ds; j += 8) {
+            __m256 v = _mm256_loadu_ps(xt + j);
+            vacc = _mm256_fmadd_ps(v, v, vacc);
+        }
+        __m128 hi = _mm256_extractf128_ps(vacc, 1);
+        __m128 lo = _mm256_castps256_ps128(vacc);
+        __m128 s  = _mm_add_ps(hi, lo);
+        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
+        ss = _mm_cvtss_f32(s);
+#endif
+        for (; j < D; ++j) ss += xt[j] * xt[j];
+        const float ir = 1.0f / std::sqrt(ss * invD + eps);
+        inv_rms[t] = ir;
+        j = 0;
+#if defined(SUB0LLM_AVX512)
+        const __m512 vir = _mm512_set1_ps(ir);
+        for (; j < Ds; j += 16) {
+            __m512 xn = _mm512_mul_ps(_mm512_loadu_ps(xt + j), vir);
+            _mm512_storeu_ps(xnt + j, xn);
+            _mm512_storeu_ps(ot  + j, _mm512_mul_ps(_mm512_loadu_ps(w + j), xn));
+        }
+#elif defined(SUB0LLM_AVX2)
+        const __m256 vir = _mm256_set1_ps(ir);
+        for (; j < Ds; j += 8) {
+            __m256 xn = _mm256_mul_ps(_mm256_loadu_ps(xt + j), vir);
+            _mm256_storeu_ps(xnt + j, xn);
+            _mm256_storeu_ps(ot  + j, _mm256_mul_ps(_mm256_loadu_ps(w + j), xn));
+        }
+#endif
+        for (; j < D; ++j) { xnt[j] = xt[j]*ir; ot[j] = w[j]*xnt[j]; }
+    }
+}
+
+void rms_norm_bwd_x_f32(const float* __restrict__ g,
+                          const float* __restrict__ x_norm,
+                          const float* __restrict__ inv_rms,
+                          const float* __restrict__ w,
+                          float* __restrict__ gx,
+                          std::size_t T, std::size_t D) noexcept {
+    const float invD = 1.0f / static_cast<float>(D);
+    const std::size_t Ds = simd_prefix(D);
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* gt  = g     + t * D;
+        const float* xnt = x_norm + t * D;
+        float*       gxt = gx   + t * D;
+        const float  ir  = inv_rms[t];
+        // sigma = dot(w * g[t,:], x_norm[t,:])
+        float sigma = 0.0f;
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        __m512 vacc = _mm512_setzero_ps();
+        for (; j < Ds; j += 16)
+            vacc = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_loadu_ps(w+j), _mm512_loadu_ps(gt+j)),
+                                    _mm512_loadu_ps(xnt+j), vacc);
+        sigma = _mm512_reduce_add_ps(vacc);
+#elif defined(SUB0LLM_AVX2)
+        __m256 vacc = _mm256_setzero_ps();
+        for (; j < Ds; j += 8)
+            vacc = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_loadu_ps(w+j), _mm256_loadu_ps(gt+j)),
+                                    _mm256_loadu_ps(xnt+j), vacc);
+        __m128 hi = _mm256_extractf128_ps(vacc, 1);
+        __m128 lo = _mm256_castps256_ps128(vacc);
+        __m128 s  = _mm_add_ps(hi, lo);
+        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
+        sigma = _mm_cvtss_f32(s);
+#endif
+        for (; j < D; ++j) sigma += w[j] * gt[j] * xnt[j];
+        // gx[t,j] = ir*w[j]*g[t,j] − ir*sigma*invD*x_norm[t,j]
+        const float c2 = ir * sigma * invD;
+        j = 0;
+#if defined(SUB0LLM_AVX512)
+        const __m512 vir = _mm512_set1_ps(ir);
+        const __m512 vc2 = _mm512_set1_ps(c2);
+        for (; j < Ds; j += 16) {
+            __m512 h = _mm512_mul_ps(_mm512_loadu_ps(w+j), _mm512_loadu_ps(gt+j));
+            _mm512_storeu_ps(gxt+j, _mm512_fnmadd_ps(vc2, _mm512_loadu_ps(xnt+j),
+                                                       _mm512_mul_ps(vir, h)));
+        }
+#elif defined(SUB0LLM_AVX2)
+        const __m256 vir = _mm256_set1_ps(ir);
+        const __m256 vc2 = _mm256_set1_ps(c2);
+        for (; j < Ds; j += 8) {
+            __m256 h = _mm256_mul_ps(_mm256_loadu_ps(w+j), _mm256_loadu_ps(gt+j));
+            _mm256_storeu_ps(gxt+j, _mm256_fnmadd_ps(vc2, _mm256_loadu_ps(xnt+j),
+                                                       _mm256_mul_ps(vir, h)));
+        }
+#endif
+        for (; j < D; ++j) gxt[j] = ir * w[j] * gt[j] - c2 * xnt[j];
+    }
+}
+
+void rms_norm_bwd_w_f32(const float* __restrict__ g,
+                          const float* __restrict__ x_norm,
+                          float* gw,   // read-modified-write: no __restrict__
+                          std::size_t T, std::size_t D) noexcept {
+    std::memset(gw, 0, D * sizeof(float));
+    const std::size_t Ds = simd_prefix(D);
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* gt  = g      + t * D;
+        const float* xnt = x_norm + t * D;
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        for (; j < Ds; j += 16) {
+            __m512 acc = _mm512_loadu_ps(gw + j);
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(gt+j), _mm512_loadu_ps(xnt+j), acc);
+            _mm512_storeu_ps(gw + j, acc);
+        }
+#elif defined(SUB0LLM_AVX2)
+        for (; j < Ds; j += 8) {
+            __m256 acc = _mm256_loadu_ps(gw + j);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(gt+j), _mm256_loadu_ps(xnt+j), acc);
+            _mm256_storeu_ps(gw + j, acc);
+        }
+#endif
+        for (; j < D; ++j) gw[j] += gt[j] * xnt[j];
+    }
+}
+
+// ── Embedding backward ────────────────────────────────────────────────────────
+
+void embed_bwd_f32(const float* __restrict__ g_out, const int32_t* __restrict__ idx,
+                   float* __restrict__ g_w, std::size_t N, std::size_t D) noexcept {
+    const std::size_t Ds = simd_prefix(D);
+    for (std::size_t i = 0; i < N; ++i) {
+        const float* src = g_out + i * D;
+        float*       dst = g_w + static_cast<std::size_t>(idx[i]) * D;
+        std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+        for (; j < Ds; j += 16)
+            _mm512_storeu_ps(dst+j,
+                _mm512_add_ps(_mm512_loadu_ps(dst+j), _mm512_loadu_ps(src+j)));
+#elif defined(SUB0LLM_AVX2)
+        for (; j < Ds; j += 8)
+            _mm256_storeu_ps(dst+j,
+                _mm256_add_ps(_mm256_loadu_ps(dst+j), _mm256_loadu_ps(src+j)));
+#endif
+        for (; j < D; ++j) dst[j] += src[j];
     }
 }
 
