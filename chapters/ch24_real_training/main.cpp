@@ -11,7 +11,7 @@
 //   §24.6  Full Iterative Training — end-to-end loop with checkpoint save/resume
 //
 // Usage:
-//   ./ch24_real_training [--phase <landscape|estimate|pipeline|synth|train|all>]
+//   ./ch24_real_training [--phase <landscape|estimate|pipeline|synth|approaches|train|all>]
 //                        [--ckpt-dir <dir>]
 //                        [--steps <N>]
 
@@ -23,11 +23,32 @@
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/core/tensor.hpp"
 
-// POSIX headers for minimal HTTP client
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+// Cross-platform socket support for the minimal Ollama HTTP client
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+   using SocketFd = SOCKET;
+   static constexpr SocketFd kBadSocket = INVALID_SOCKET;
+   static inline void close_socket(SocketFd s) { ::closesocket(s); }
+   static inline bool socket_valid(SocketFd s) { return s != INVALID_SOCKET; }
+   // Initialise Winsock once at process start
+   namespace { struct WsaGuard {
+       WsaGuard()  { WSADATA d{}; ::WSAStartup(MAKEWORD(2,2), &d); }
+       ~WsaGuard() { ::WSACleanup(); }
+   } s_wsa; }
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+   using SocketFd = int;
+   static constexpr SocketFd kBadSocket = -1;
+   static inline void close_socket(SocketFd s) { ::close(s); }
+   static inline bool socket_valid(SocketFd s) { return s >= 0; }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -245,19 +266,27 @@ static void section_pipeline()
 
 // ── §24.4  Synthetic Data via LLM API ─────────────────────────────────────────
 
-// Minimal HTTP POST to localhost:port/path using POSIX sockets.
+// Minimal HTTP POST to localhost:port/path. Cross-platform (Windows + POSIX).
 // Returns response body on success, empty string on error/timeout.
 static std::string http_post_local(uint16_t port, std::string_view path,
                                     std::string_view json_body)
 {
-    const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
+    const SocketFd sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!socket_valid(sock)) return "";
 
-    // 3-second send/recv timeout
+    // 3-second send/recv timeout (platform-specific option type)
+#ifdef _WIN32
+    const DWORD timeout_ms = 3000;
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+    ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                 reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
     struct timeval tv{};
     tv.tv_sec = 3;
     ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -265,7 +294,7 @@ static std::string http_post_local(uint16_t port, std::string_view path,
     addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
 
     if (::connect(sock, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock);
+        close_socket(sock);
         return "";
     }
 
@@ -279,18 +308,18 @@ static std::string http_post_local(uint16_t port, std::string_view path,
         "{}",
         path, json_body.size(), json_body);
 
-    if (::send(sock, req.data(), req.size(), 0) < 0) {
-        ::close(sock);
+    if (::send(sock, req.data(), static_cast<int>(req.size()), 0) < 0) {
+        close_socket(sock);
         return "";
     }
 
     // Receive full response
     std::string response;
     char buf[4096];
-    ssize_t n;
-    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0)
+    int n;
+    while ((n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), 0)) > 0)
         response.append(buf, static_cast<std::size_t>(n));
-    ::close(sock);
+    close_socket(sock);
 
     if (response.empty()) return "";
 
@@ -687,10 +716,11 @@ int main(int argc, char** argv)
 
     const bool run_all = (phase == "all");
 
-    if (run_all || phase == "landscape") section_landscape();
-    if (run_all || phase == "estimate")  section_estimate();
-    if (run_all || phase == "pipeline")  section_pipeline();
-    if (run_all || phase == "synth")     section_synthetic();
+    if (run_all || phase == "landscape")  section_landscape();
+    if (run_all || phase == "estimate")   section_estimate();
+    if (run_all || phase == "pipeline")   section_pipeline();
+    if (run_all || phase == "synth")      section_synthetic();
+    if (run_all || phase == "approaches") section_training_approaches();
     if (run_all || phase == "train") {
         // 'train' phase: use provided steps (default 2000 when called explicitly)
         // 'all' phase: use shorter demo (200 steps or whatever --steps says)
@@ -700,11 +730,11 @@ int main(int argc, char** argv)
 
     if (!run_all &&
         phase != "landscape" && phase != "estimate" && phase != "pipeline" &&
-        phase != "synth"     && phase != "train")
+        phase != "synth"     && phase != "approaches" && phase != "train")
     {
         throw std::runtime_error(
             std::format("unknown phase '{}' — valid: landscape, estimate, pipeline, "
-                        "synth, train, all", phase));
+                        "synth, approaches, train, all", phase));
     }
 
     return 0;
