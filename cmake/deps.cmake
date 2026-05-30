@@ -50,6 +50,17 @@ elseif(SUB0LLM_ENABLE_EIGEN AND BLAS_FOUND)
     message(STATUS "sub0llm: BLAS takes priority over Eigen; Eigen will not be fetched")
 endif()
 
+# ── HTTP client (cpp-httplib) — used by ch24 for Ollama synthetic data ────────
+# Single-header, MIT-licensed, cross-platform (Windows/Linux/macOS).
+# Handles Winsock2 initialisation internally on Windows.
+CPMAddPackage(
+    NAME httplib
+    GITHUB_REPOSITORY yhirose/cpp-httplib
+    VERSION 0.18.1
+    OPTIONS "HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF"
+           "HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF"
+)
+
 # ── Optional: CUDA ────────────────────────────────────────────────────────────
 if(SUB0LLM_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)

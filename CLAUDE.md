@@ -122,6 +122,7 @@ All work goes to `claude/llm-cpp23-repo-init-1f1Il`.
 | spdlog | Logging throughout the library |
 | nlohmann/json | Tokenizer vocab, model configs (Ch03+) |
 | Catch2 v3 | Unit tests |
+| cpp-httplib 0.18.1 (CPM) | Cross-platform HTTP client for Ollama synthetic data (Ch24) |
 | OpenBLAS (system) | Optional BLAS-accelerated matmul (Ch02); dispatched for K≥64 |
 | Eigen3 3.4.0 (CPM) | Header-only matmul fallback when system BLAS absent; dispatched for K≥64 |
 | CUDAToolkit (system) | CUDA backend (Ch02) |

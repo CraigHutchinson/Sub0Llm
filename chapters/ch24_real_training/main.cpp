@@ -23,32 +23,7 @@
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/core/tensor.hpp"
 
-// Cross-platform socket support for the minimal Ollama HTTP client
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-   using SocketFd = SOCKET;
-   static constexpr SocketFd kBadSocket = INVALID_SOCKET;
-   static inline void close_socket(SocketFd s) { ::closesocket(s); }
-   static inline bool socket_valid(SocketFd s) { return s != INVALID_SOCKET; }
-   // Initialise Winsock once at process start
-   namespace { struct WsaGuard {
-       WsaGuard()  { WSADATA d{}; ::WSAStartup(MAKEWORD(2,2), &d); }
-       ~WsaGuard() { ::WSACleanup(); }
-   } s_wsa; }
-#else
-#  include <arpa/inet.h>
-#  include <netinet/in.h>
-#  include <sys/socket.h>
-#  include <unistd.h>
-   using SocketFd = int;
-   static constexpr SocketFd kBadSocket = -1;
-   static inline void close_socket(SocketFd s) { ::close(s); }
-   static inline bool socket_valid(SocketFd s) { return s >= 0; }
-#endif
+#include <httplib.h>
 
 #include <algorithm>
 #include <chrono>
@@ -266,67 +241,17 @@ static void section_pipeline()
 
 // ── §24.4  Synthetic Data via LLM API ─────────────────────────────────────────
 
-// Minimal HTTP POST to localhost:port/path. Cross-platform (Windows + POSIX).
+// HTTP POST to localhost:port/path via cpp-httplib (cross-platform, no POSIX guards).
 // Returns response body on success, empty string on error/timeout.
 static std::string http_post_local(uint16_t port, std::string_view path,
                                     std::string_view json_body)
 {
-    const SocketFd sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (!socket_valid(sock)) return "";
-
-    // 3-second send/recv timeout (platform-specific option type)
-#ifdef _WIN32
-    const DWORD timeout_ms = 3000;
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                 reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-    ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
-                 reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-#else
-    struct timeval tv{};
-    tv.tv_sec = 3;
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
-
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-
-    if (::connect(sock, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close_socket(sock);
-        return "";
-    }
-
-    // Build HTTP request
-    std::string req = std::format(
-        "POST {} HTTP/1.0\r\n"
-        "Host: localhost\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: {}\r\n"
-        "\r\n"
-        "{}",
-        path, json_body.size(), json_body);
-
-    if (::send(sock, req.data(), static_cast<int>(req.size()), 0) < 0) {
-        close_socket(sock);
-        return "";
-    }
-
-    // Receive full response
-    std::string response;
-    char buf[4096];
-    int n;
-    while ((n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), 0)) > 0)
-        response.append(buf, static_cast<std::size_t>(n));
-    close_socket(sock);
-
-    if (response.empty()) return "";
-
-    // Strip HTTP headers: find blank line separating headers from body
-    const auto pos = response.find("\r\n\r\n");
-    if (pos == std::string::npos) return "";
-    return response.substr(pos + 4);
+    httplib::Client cli("127.0.0.1", static_cast<int>(port));
+    cli.set_connection_timeout(3);
+    cli.set_read_timeout(3);
+    auto res = cli.Post(std::string(path), std::string(json_body), "application/json");
+    if (!res || res->status != 200) return "";
+    return res->body;
 }
 
 static std::vector<std::string> generate_synthetic_corpus(int n_samples)
@@ -533,8 +458,11 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
                     nlayers, /*d_ff=*/0, /*n_mtp=*/0, /*seed=*/1337);
 
     auto params = model.parameters();
-    const int64_t n_params = [&]{ int64_t n = 0;
-        for (const auto* p : params) n += p->data().numel(); return n; }();
+    const int64_t n_params = [&]{
+        int64_t n = 0;
+        for (const auto* p : params) n += p->data().numel();
+        return n;
+    }();
     std::cout << std::format("  ModernGPT: V={} D={} layers={} heads={}  ({:.2f}M params)\n",
         V, D, nlayers, nheads, static_cast<double>(n_params) / 1e6);
 
@@ -616,7 +544,7 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
         loss.backward();
 
         // Clip grads and step
-        clip_grad_norm(params, 1.0f);
+        std::ignore = clip_grad_norm(params, 1.0f);
         opt.step();
 
         tokens_trained += seq_len;

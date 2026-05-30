@@ -792,13 +792,14 @@ Binary built with `-march=native` on one machine and run on another. Always
 use the `build/` (debug) or `build-rel/` (AVX2-safe release) binaries for
 distribution. Only use `build-native/` on the machine it was compiled on.
 
-### Windows: `LINK : fatal error LNK1181: cannot open input file 'ws2_32.lib'`
+### Windows: Winsock or networking errors building ch24
 
-This should never happen because CMake links `ws2_32` automatically when
-building for Windows. If it does occur, check that your Visual Studio
-installation includes the **Windows SDK**. Reinstall the
+Chapter 24 uses **cpp-httplib** (fetched automatically via CPM) which
+initialises Winsock2 internally. No manual `ws2_32` link is needed.
+If you see any socket-related linker error, ensure the
+**Windows SDK** is installed by reinstalling the
 "Desktop development with C++" workload in Visual Studio Installer and
-tick "Windows 10/11 SDK".
+ticking "Windows 10/11 SDK".
 
 ### Windows: `'std::format' is not a member of 'std'`
 

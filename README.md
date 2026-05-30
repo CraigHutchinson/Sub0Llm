@@ -205,6 +205,7 @@ Sub0Llm/
 | spdlog | Logging throughout the library |
 | nlohmann/json | Tokenizer vocab, model configs |
 | Catch2 v3 | Unit tests |
+| cpp-httplib (CPM) | Cross-platform HTTP client for Ollama synthetic data (Ch24) |
 | OpenBLAS (system) | Optional BLAS-accelerated matmul (dispatched for K≥64) |
 | Eigen3 3.4.0 (CPM) | Header-only matmul fallback when system BLAS absent |
 | CUDAToolkit (system) | CUDA backend |
