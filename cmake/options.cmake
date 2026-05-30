@@ -40,6 +40,12 @@ else()
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 endif()
 
+# ── Vectorisation report ─────────────────────────────────────────────────────
+# Emits GCC/Clang vectorisation diagnostics during compilation.
+# Useful for verifying that SIMD kernels and hot loops are auto-vectorised.
+# Do NOT enable in CI — the diagnostic output is noisy.
+option(SUB0LLM_ENABLE_VEC_REPORT "Emit GCC/Clang vectorisation report (-fopt-info-vec)" OFF)
+
 # Validate CUDA + SIMD aren't both off in a way that breaks things
 if(SUB0LLM_ENABLE_CUDA)
     enable_language(CUDA)

@@ -70,6 +70,16 @@ void matmul_tile_avx2(const float* __restrict__ A,
 #if defined(SUB0LLM_AVX512)
             const __m512 va = _mm512_set1_ps(a_ik);
             std::size_t j = jj;
+            for (; j + 64 <= jmax; j += 64) {
+                __m512 vc0 = _mm512_loadu_ps(C + i*N + j);
+                __m512 vc1 = _mm512_loadu_ps(C + i*N + j + 16);
+                __m512 vc2 = _mm512_loadu_ps(C + i*N + j + 32);
+                __m512 vc3 = _mm512_loadu_ps(C + i*N + j + 48);
+                _mm512_storeu_ps(C + i*N + j,      _mm512_fmadd_ps(va, _mm512_loadu_ps(B + k*N + j),      vc0));
+                _mm512_storeu_ps(C + i*N + j + 16, _mm512_fmadd_ps(va, _mm512_loadu_ps(B + k*N + j + 16), vc1));
+                _mm512_storeu_ps(C + i*N + j + 32, _mm512_fmadd_ps(va, _mm512_loadu_ps(B + k*N + j + 32), vc2));
+                _mm512_storeu_ps(C + i*N + j + 48, _mm512_fmadd_ps(va, _mm512_loadu_ps(B + k*N + j + 48), vc3));
+            }
             for (; j + 16 <= jmax; j += 16) {
                 __m512 vc = _mm512_loadu_ps(C + i*N + j);
                 __m512 vb = _mm512_loadu_ps(B + k*N + j);
@@ -80,6 +90,16 @@ void matmul_tile_avx2(const float* __restrict__ A,
 #else
             const __m256 va = _mm256_set1_ps(a_ik);
             std::size_t j = jj;
+            for (; j + 32 <= jmax; j += 32) {
+                __m256 vc0 = _mm256_loadu_ps(C + i*N + j);
+                __m256 vc1 = _mm256_loadu_ps(C + i*N + j + 8);
+                __m256 vc2 = _mm256_loadu_ps(C + i*N + j + 16);
+                __m256 vc3 = _mm256_loadu_ps(C + i*N + j + 24);
+                _mm256_storeu_ps(C + i*N + j,      _mm256_fmadd_ps(va, _mm256_loadu_ps(B + k*N + j),      vc0));
+                _mm256_storeu_ps(C + i*N + j + 8,  _mm256_fmadd_ps(va, _mm256_loadu_ps(B + k*N + j + 8),  vc1));
+                _mm256_storeu_ps(C + i*N + j + 16, _mm256_fmadd_ps(va, _mm256_loadu_ps(B + k*N + j + 16), vc2));
+                _mm256_storeu_ps(C + i*N + j + 24, _mm256_fmadd_ps(va, _mm256_loadu_ps(B + k*N + j + 24), vc3));
+            }
             for (; j + 8 <= jmax; j += 8) {
                 __m256 vc = _mm256_loadu_ps(C + i*N + j);
                 __m256 vb = _mm256_loadu_ps(B + k*N + j);

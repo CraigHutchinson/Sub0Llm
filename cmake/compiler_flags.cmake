@@ -134,4 +134,8 @@ function(sub0llm_apply_compile_options target)
         $<$<BOOL:${SUB0LLM_ENABLE_CUDA}>:SUB0LLM_CUDA>
         $<$<BOOL:${SUB0LLM_ENABLE_OPENVINO}>:SUB0LLM_OPENVINO>
     )
+    # Vectorisation report: -fopt-info-vec prints which loops were vectorised.
+    if(SUB0LLM_ENABLE_VEC_REPORT AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(${target} PRIVATE -fopt-info-vec)
+    endif()
 endfunction()

@@ -187,9 +187,14 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     const float    scale_fac = 1.0f / std::sqrt(static_cast<float>(head_dim_));
     const std::size_t r    = n_heads_ / n_kv_heads_;  // heads per KV group
 
-    // Precompute RoPE frequencies for this sequence length.
-    Tensor cos_f, sin_f;
-    compute_rope_freqs(T, static_cast<int64_t>(head_dim_), rope_base_, cos_f, sin_f);
+    // Precompute RoPE frequencies — cached by T to avoid per-step trig ops.
+    if (T != rope_cache_T_) {
+        compute_rope_freqs(T, static_cast<int64_t>(head_dim_), rope_base_,
+                           rope_cache_cos_, rope_cache_sin_);
+        rope_cache_T_ = T;
+    }
+    const Tensor& cos_f = rope_cache_cos_;
+    const Tensor& sin_f = rope_cache_sin_;
 
     // Precompute K and V for each KV head (shared across query groups).
     std::vector<Variable> K_heads(n_kv_heads_), V_heads(n_kv_heads_);
@@ -200,9 +205,15 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
         V_heads[g] = v_raw;
     }
 
-    // Optional causal mask (same for all heads).
+    // Build causal mask once per T — cached to avoid repeated allocation.
     Variable mask_var;
-    if (causal) mask_var = Variable(causal_mask(T), false);
+    if (causal) {
+        if (T != mask_cache_T_) {
+            mask_cache_   = causal_mask(T);
+            mask_cache_T_ = T;
+        }
+        mask_var = Variable(mask_cache_, false);
+    }
 
     // Accumulate output across all query heads.
     auto compute_head = [&](std::size_t h) -> Variable {

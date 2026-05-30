@@ -43,6 +43,9 @@ if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
 
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+add_subdirectory(benchmarks)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 include(GNUInstallDirs)
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

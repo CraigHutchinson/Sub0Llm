@@ -92,6 +92,13 @@ private:
     float       rope_base_;
     std::vector<autograd::Variable> W_Q_, W_O_;  // n_heads each
     std::vector<autograd::Variable> W_K_, W_V_;  // n_kv_heads each
+    // Cached RoPE frequencies — recomputed only when T changes.
+    mutable int64_t        rope_cache_T_  = -1;
+    mutable Tensor         rope_cache_cos_;
+    mutable Tensor         rope_cache_sin_;
+    // Cached causal mask — recomputed only when T changes.
+    mutable int64_t        mask_cache_T_  = -1;
+    mutable Tensor         mask_cache_;
 };
 
 // ── ModernTransformerBlock ────────────────────────────────────────────────────
