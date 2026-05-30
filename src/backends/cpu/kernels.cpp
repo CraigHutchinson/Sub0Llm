@@ -80,6 +80,32 @@ static inline __m256 fast_exp_avx2(__m256 x) noexcept {
 }
 #endif
 
+// ── Shared SIMD helpers ───────────────────────────────────────────────────────
+// fast_sigmoid: 1/(1+exp(-x)) using the fast polynomial exp above.
+// hsum256: horizontal sum of 8 floats in a 256-bit AVX register.
+#if defined(SUB0LLM_AVX512)
+static inline __m512 fast_sigmoid_avx512(__m512 x) noexcept {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    return _mm512_div_ps(one, _mm512_add_ps(one,
+        fast_exp_avx512(_mm512_sub_ps(_mm512_setzero_ps(), x))));
+}
+#elif defined(SUB0LLM_AVX2)
+static inline __m256 fast_sigmoid_avx2(__m256 x) noexcept {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    return _mm256_div_ps(one, _mm256_add_ps(one,
+        fast_exp_avx2(_mm256_sub_ps(_mm256_setzero_ps(), x))));
+}
+
+static inline float hsum256(__m256 v) noexcept {
+    __m128 hi  = _mm256_extractf128_ps(v, 1);
+    __m128 lo  = _mm256_castps256_ps128(v);
+    __m128 sum = _mm_add_ps(hi, lo);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+#endif
+
 // ── Element-wise binary ───────────────────────────────────────────────────────
 
 void add_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
@@ -211,23 +237,11 @@ void neg_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t 
 void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
-    const __m512 one = _mm512_set1_ps(1.0f);
-    const __m512 vz  = _mm512_setzero_ps();
-    for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
-        __m512 x   = _mm512_loadu_ps(in + i);
-        __m512 neg = _mm512_sub_ps(vz, x);
-        __m512 e   = fast_exp_avx512(neg);
-        _mm512_storeu_ps(out + i, _mm512_div_ps(one, _mm512_add_ps(one, e)));
-    }
+    for (const std::size_t end = simd_prefix(n); i < end; i += 16)
+        _mm512_storeu_ps(out + i, fast_sigmoid_avx512(_mm512_loadu_ps(in + i)));
 #elif defined(SUB0LLM_AVX2)
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 vz  = _mm256_setzero_ps();
-    for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
-        __m256 x   = _mm256_loadu_ps(in + i);
-        __m256 neg = _mm256_sub_ps(vz, x);
-        __m256 e   = fast_exp_avx2(neg);
-        _mm256_storeu_ps(out + i, _mm256_div_ps(one, _mm256_add_ps(one, e)));
-    }
+    for (const std::size_t end = simd_prefix(n); i < end; i += 8)
+        _mm256_storeu_ps(out + i, fast_sigmoid_avx2(_mm256_loadu_ps(in + i)));
 #endif
     for (; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-in[i]));
 }
@@ -243,22 +257,14 @@ void abs_f32    (const float* __restrict__ in, float* __restrict__ out, std::siz
 void silu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
-    const __m512 one = _mm512_set1_ps(1.0f);
-    const __m512 vz  = _mm512_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
-        __m512 x   = _mm512_loadu_ps(in + i);
-        __m512 e   = fast_exp_avx512(_mm512_sub_ps(vz, x));
-        __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
-        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, sig));
+        __m512 x = _mm512_loadu_ps(in + i);
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, fast_sigmoid_avx512(x)));
     }
 #elif defined(SUB0LLM_AVX2)
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 vz  = _mm256_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
-        __m256 x   = _mm256_loadu_ps(in + i);
-        __m256 e   = fast_exp_avx2(_mm256_sub_ps(vz, x));
-        __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
-        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, sig));
+        __m256 x = _mm256_loadu_ps(in + i);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, fast_sigmoid_avx2(x)));
     }
 #endif
     for (; i < n; ++i) {
@@ -277,31 +283,20 @@ void gelu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t
 #if defined(SUB0LLM_AVX512)
     const __m512 vkK = _mm512_set1_ps(kK);
     const __m512 vkC = _mm512_set1_ps(kC);
-    const __m512 one = _mm512_set1_ps(1.0f);
-    const __m512 vz  = _mm512_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
         __m512 x     = _mm512_loadu_ps(in + i);
         __m512 x2    = _mm512_mul_ps(x, x);
-        // inner = x + kC*x^3  =  fmadd(kC*x^2, x, x)
         __m512 inner = _mm512_fmadd_ps(_mm512_mul_ps(vkC, x2), x, x);
-        __m512 z     = _mm512_mul_ps(vkK, inner);
-        __m512 e     = fast_exp_avx512(_mm512_sub_ps(vz, z));
-        __m512 sig   = _mm512_div_ps(one, _mm512_add_ps(one, e));
-        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, sig));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(x, fast_sigmoid_avx512(_mm512_mul_ps(vkK, inner))));
     }
 #elif defined(SUB0LLM_AVX2)
     const __m256 vkK = _mm256_set1_ps(kK);
     const __m256 vkC = _mm256_set1_ps(kC);
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 vz  = _mm256_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
         __m256 x     = _mm256_loadu_ps(in + i);
         __m256 x2    = _mm256_mul_ps(x, x);
         __m256 inner = _mm256_fmadd_ps(_mm256_mul_ps(vkC, x2), x, x);
-        __m256 z     = _mm256_mul_ps(vkK, inner);
-        __m256 e     = fast_exp_avx2(_mm256_sub_ps(vz, z));
-        __m256 sig   = _mm256_div_ps(one, _mm256_add_ps(one, e));
-        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, sig));
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(x, fast_sigmoid_avx2(_mm256_mul_ps(vkK, inner))));
     }
 #endif
     for (; i < n; ++i) {
@@ -317,12 +312,10 @@ void silu_backward_f32(const float* __restrict__ grad_out, const float* __restri
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 one = _mm512_set1_ps(1.0f);
-    const __m512 vz  = _mm512_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
         __m512 xi  = _mm512_loadu_ps(x + i);
         __m512 gi  = _mm512_loadu_ps(grad_out + i);
-        __m512 e   = fast_exp_avx512(_mm512_sub_ps(vz, xi));
-        __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        __m512 sig = fast_sigmoid_avx512(xi);
         // dp = sig * (1 + x*(1-sig)) = sig + x*sig*(1-sig)
         __m512 dp  = _mm512_fmadd_ps(_mm512_mul_ps(xi, sig),
                                       _mm512_sub_ps(one, sig), sig);
@@ -330,12 +323,10 @@ void silu_backward_f32(const float* __restrict__ grad_out, const float* __restri
     }
 #elif defined(SUB0LLM_AVX2)
     const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 vz  = _mm256_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
         __m256 xi  = _mm256_loadu_ps(x + i);
         __m256 gi  = _mm256_loadu_ps(grad_out + i);
-        __m256 e   = fast_exp_avx2(_mm256_sub_ps(vz, xi));
-        __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        __m256 sig = fast_sigmoid_avx2(xi);
         __m256 dp  = _mm256_fmadd_ps(_mm256_mul_ps(xi, sig),
                                       _mm256_sub_ps(one, sig), sig);
         _mm256_storeu_ps(grad_in + i, _mm256_mul_ps(gi, dp));
@@ -360,14 +351,12 @@ void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restri
     const __m512 vkC  = _mm512_set1_ps(kC);
     const __m512 vk3C = _mm512_set1_ps(k3C);
     const __m512 one  = _mm512_set1_ps(1.0f);
-    const __m512 vz   = _mm512_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
         __m512 xi   = _mm512_loadu_ps(x + i);
         __m512 gi   = _mm512_loadu_ps(grad_out + i);
         __m512 x2   = _mm512_mul_ps(xi, xi);
         __m512 z    = _mm512_mul_ps(vkK, _mm512_fmadd_ps(_mm512_mul_ps(vkC, x2), xi, xi));
-        __m512 e    = fast_exp_avx512(_mm512_sub_ps(vz, z));
-        __m512 sig  = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        __m512 sig  = fast_sigmoid_avx512(z);
         // z' = kK*(1 + 3*kC*x²) = kK + k3C*x²
         __m512 zp   = _mm512_fmadd_ps(vk3C, x2, vkK);
         // gelu'(x) = sig + x*sig*(1-sig)*z'
@@ -381,14 +370,12 @@ void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restri
     const __m256 vkC  = _mm256_set1_ps(kC);
     const __m256 vk3C = _mm256_set1_ps(k3C);
     const __m256 one  = _mm256_set1_ps(1.0f);
-    const __m256 vz   = _mm256_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 8) {
         __m256 xi   = _mm256_loadu_ps(x + i);
         __m256 gi   = _mm256_loadu_ps(grad_out + i);
         __m256 x2   = _mm256_mul_ps(xi, xi);
         __m256 z    = _mm256_mul_ps(vkK, _mm256_fmadd_ps(_mm256_mul_ps(vkC, x2), xi, xi));
-        __m256 e    = fast_exp_avx2(_mm256_sub_ps(vz, z));
-        __m256 sig  = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        __m256 sig  = fast_sigmoid_avx2(z);
         __m256 zp   = _mm256_fmadd_ps(vk3C, x2, vkK);
         __m256 dp   = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_mul_ps(xi, sig),
                                                       _mm256_sub_ps(one, sig)),
@@ -433,12 +420,7 @@ void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
             _mm256_storeu_ps(rout + i, e);
             vacc = _mm256_add_ps(vacc, e);
         }
-        __m128 hi  = _mm256_extractf128_ps(vacc, 1);
-        __m128 lo  = _mm256_castps256_ps128(vacc);
-        __m128 sum = _mm_add_ps(hi, lo);
-        sum = _mm_hadd_ps(sum, sum);
-        sum = _mm_hadd_ps(sum, sum);
-        s = _mm_cvtss_f32(sum);
+        s = hsum256(vacc);
 #endif
         for (; i < cols; ++i) {
             rout[i] = std::exp(rin[i] - mx);
@@ -478,11 +460,7 @@ void rms_norm_fwd_f32(const float* __restrict__ x, const float* __restrict__ w,
             __m256 v = _mm256_loadu_ps(xt + j);
             vacc = _mm256_fmadd_ps(v, v, vacc);
         }
-        __m128 hi = _mm256_extractf128_ps(vacc, 1);
-        __m128 lo = _mm256_castps256_ps128(vacc);
-        __m128 s  = _mm_add_ps(hi, lo);
-        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
-        ss = _mm_cvtss_f32(s);
+        ss = hsum256(vacc);
 #endif
         for (; j < D; ++j) ss += xt[j] * xt[j];
         const float ir = 1.0f / std::sqrt(ss * invD + eps);
@@ -534,11 +512,7 @@ void rms_norm_bwd_x_f32(const float* __restrict__ g,
         for (; j < Ds; j += 8)
             vacc = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_loadu_ps(w+j), _mm256_loadu_ps(gt+j)),
                                     _mm256_loadu_ps(xnt+j), vacc);
-        __m128 hi = _mm256_extractf128_ps(vacc, 1);
-        __m128 lo = _mm256_castps256_ps128(vacc);
-        __m128 s  = _mm_add_ps(hi, lo);
-        s = _mm_hadd_ps(s, s); s = _mm_hadd_ps(s, s);
-        sigma = _mm_cvtss_f32(s);
+        sigma = hsum256(vacc);
 #endif
         for (; j < D; ++j) sigma += w[j] * gt[j] * xnt[j];
         // gx[t,j] = ir*w[j]*g[t,j] − ir*sigma*invD*x_norm[t,j]
@@ -569,7 +543,6 @@ void rms_norm_bwd_w_f32(const float* __restrict__ g,
                           const float* __restrict__ x_norm,
                           float* gw,   // read-modified-write: no __restrict__
                           std::size_t T, std::size_t D) noexcept {
-    std::memset(gw, 0, D * sizeof(float));
     const std::size_t Ds = simd_prefix(D);
     for (std::size_t t = 0; t < T; ++t) {
         const float* gt  = g      + t * D;
@@ -628,12 +601,7 @@ float sum_f32(const float* __restrict__ in, std::size_t n) noexcept {
     __m256 vacc = _mm256_setzero_ps();
     for (const std::size_t end = simd_prefix(n); i < end; i += 8)
         vacc = _mm256_add_ps(vacc, _mm256_loadu_ps(in + i));
-    __m128 hi  = _mm256_extractf128_ps(vacc, 1);
-    __m128 lo  = _mm256_castps256_ps128(vacc);
-    __m128 sum = _mm_add_ps(hi, lo);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    acc = _mm_cvtss_f32(sum);
+    acc = hsum256(vacc);
 #endif
     for (; i < n; ++i) acc += in[i];
     return acc;
@@ -709,12 +677,7 @@ float norm_f32(const float* __restrict__ in, std::size_t n) noexcept {
         const __m256 v = _mm256_loadu_ps(in + i);
         vacc = _mm256_fmadd_ps(v, v, vacc);
     }
-    __m128 hi  = _mm256_extractf128_ps(vacc, 1);
-    __m128 lo  = _mm256_castps256_ps128(vacc);
-    __m128 sum = _mm_add_ps(hi, lo);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    acc = _mm_cvtss_f32(sum);
+    acc = hsum256(vacc);
 #endif
     for (; i < n; ++i) acc += in[i] * in[i];
     return std::sqrt(acc);

@@ -620,8 +620,9 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
     const bool rg = x.requires_grad() || weight.requires_grad();
     auto out = make_node(std::move(out_d), rg);
     if (rg) {
-        // Move intermediates into snapshots (no deep copy).
-        // Closures share the same storage via Tensor's internal shared_ptr.
+        // Move intermediates into snapshots — no deep copy; closures share the
+        // same storage via shared_ptr<Storage>.  Invariant: backward kernels
+        // must be read-only on xn_snap / ir_snap (no scratch reuse into those buffers).
         Tensor xn_snap = std::move(x_norm);
         Tensor ir_snap = std::move(inv_rms);
 

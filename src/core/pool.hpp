@@ -65,8 +65,11 @@ public:
                 throw;
             }
         }
-        // Bypass: size outside pooled range — plain new[]/delete[].
-        return std::shared_ptr<std::byte[]>(new std::byte[bytes]);
+        // Bypass: size outside pooled range — still 64-byte aligned for SIMD correctness.
+        const std::size_t aligned = (bytes + kAlign - 1u) & ~(kAlign - 1u);
+        std::byte* ptr = static_cast<std::byte*>(std::aligned_alloc(kAlign, aligned));
+        if (!ptr) throw std::bad_alloc{};
+        return std::shared_ptr<std::byte[]>(ptr, [](std::byte* p) noexcept { std::free(p); });
     }
 
 private:

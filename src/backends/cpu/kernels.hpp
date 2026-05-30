@@ -63,7 +63,8 @@ void rms_norm_bwd_x_f32(const float* __restrict__ g,
                          float* __restrict__ gx,
                          std::size_t T, std::size_t D) noexcept;
 
-// Backward for weight: gw[d] = Σ_t g[t,d]*x_norm[t,d].  Zeroes gw before filling.
+// Backward for weight: gw[d] += Σ_t g[t,d]*x_norm[t,d].  Pure accumulator — caller
+// must provide a zeroed gw (e.g. zeros({D})) before the first call.
 // gw is read-modified-write so __restrict__ is omitted on that parameter.
 void rms_norm_bwd_w_f32(const float* __restrict__ g,
                          const float* __restrict__ x_norm,

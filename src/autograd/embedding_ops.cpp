@@ -87,9 +87,7 @@ Variable embedding_lookup(const Variable& weight, const Tensor& indices) {
                 auto gwd = grad_w.data_as<float>();
 
                 backend::cpu::embed_bwd_f32(
-                    gs.data(),
-                    reinterpret_cast<const int32_t*>(idx_copy.raw_ptr()),
-                    gwd.data(), N, D);
+                    gs.data(), tc.data(), gwd.data(), N, D);
                 return grad_w;
             }));
     }
