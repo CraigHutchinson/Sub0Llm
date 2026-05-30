@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -405,30 +406,36 @@ static void section_training_approaches()
 
 // ── §24.6  Full Iterative Training ────────────────────────────────────────────
 
-static void section_full_training(int steps, const std::string& ckpt_dir, bool demo_mode)
+static void section_full_training(int steps, const std::string& ckpt_dir, bool demo_mode,
+                                    const std::string& corpus_file = "")
 {
     std::cout << "\n=== §24.6  Full Iterative Training ===\n\n";
 
     // 1. Get corpus
     std::vector<std::string> texts;
-    if (demo_mode) {
+    if (!corpus_file.empty()) {
+        std::ifstream f(corpus_file);
+        if (!f) throw std::runtime_error("Cannot open corpus file: " + corpus_file);
+        std::string line;
+        while (std::getline(f, line))
+            if (!line.empty()) texts.push_back(std::move(line));
+        std::cout << std::format("  Corpus: {} documents from '{}'\n", texts.size(), corpus_file);
+    } else if (demo_mode) {
         texts = generate_synthetic_corpus(50);
+        std::cout << std::format("  Corpus: {} synthetic documents\n", texts.size());
     } else {
-        // In a real run, load from file:
-        //   texts = load_texts_from_file(data_path);
-        // For this demo, fall back to the same synthetic corpus
-        std::cout << "  [real mode] would load from data file — using synthetic fallback\n";
         texts = generate_synthetic_corpus(50);
+        std::cout << std::format("  Corpus: {} synthetic documents (real mode — no --corpus given)\n",
+            texts.size());
     }
-    std::cout << std::format("  Corpus: {} documents\n", texts.size());
 
     // 2. Train BPE tokenizer
-    const std::size_t vocab_size = 512;
+    const std::size_t vocab_size = corpus_file.empty() ? 512 : 2048;
     auto tok = BPETokenizer::train(texts, vocab_size);
     std::cout << std::format("  Tokenizer: vocab_size={}\n", tok.vocab_size());
 
     // 3. Build TextCorpus (hold out last 10% for eval)
-    constexpr int64_t seq_len = 32;
+    const int64_t seq_len = corpus_file.empty() ? 32 : 64;
     const std::size_t eval_split = std::max(std::size_t{1},
         texts.size() * 9 / 10);
     std::vector<std::string> train_texts(texts.begin(),
@@ -628,9 +635,10 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
 
 int main(int argc, char** argv)
 {
-    std::string phase    = "all";
-    std::string ckpt_dir = "/tmp/ch24_ckpts";
-    int         steps    = 200;
+    std::string phase       = "all";
+    std::string ckpt_dir    = "/tmp/ch24_ckpts";
+    std::string corpus_file = "";
+    int         steps       = 200;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -640,6 +648,8 @@ int main(int argc, char** argv)
             ckpt_dir = argv[++i];
         else if (arg == "--steps" && i + 1 < argc)
             steps = std::stoi(argv[++i]);
+        else if (arg == "--corpus" && i + 1 < argc)
+            corpus_file = argv[++i];
     }
 
     const bool run_all = (phase == "all");
@@ -653,7 +663,7 @@ int main(int argc, char** argv)
         // 'train' phase: use provided steps (default 2000 when called explicitly)
         // 'all' phase: use shorter demo (200 steps or whatever --steps says)
         const int actual_steps = (phase == "train" && steps == 200) ? 2000 : steps;
-        section_full_training(actual_steps, ckpt_dir, phase != "train");
+        section_full_training(actual_steps, ckpt_dir, phase != "train", corpus_file);
     }
 
     if (!run_all &&
