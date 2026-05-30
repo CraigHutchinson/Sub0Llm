@@ -21,4 +21,5 @@ add_subdirectory(ch20_rlhf)
 add_subdirectory(ch21_math_neurons)
 add_subdirectory(ch22_math_lm)
 add_subdirectory(ch23_reasoned_math)
+add_subdirectory(ch24_real_training)
 # Chapters are added here as they are written.

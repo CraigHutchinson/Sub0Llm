@@ -23,6 +23,8 @@ add_executable(tests
     test_math_nodes.cpp
     test_numeric_router.cpp
     test_reasoning.cpp
+    test_checkpoint.cpp
+    test_text_corpus.cpp
 )
 
 target_link_libraries(tests

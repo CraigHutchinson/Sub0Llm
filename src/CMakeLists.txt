@@ -31,6 +31,8 @@ set(SUB0LLM_SOURCES
     tokenizer/numeric_tokenizer.cpp
     nn/numeric_router.cpp
     nn/math_nodes.cpp
+    data/text_corpus.cpp
+    nn/checkpoint.cpp
 )
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
