@@ -108,6 +108,97 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
 
+### Tools (CLI + server)
+- `tools/cli/main.cpp` → `build/bin/sub0llm-cli` — Interactive inference CLI
+- `tools/server/main.cpp` → `build/bin/sub0llm-server` — OpenAI-compatible HTTP server
+
+Both tools require a **model directory** produced by `ch24_real_training --phase train`.
+The model directory contains:
+- `config.json` — architecture params (vocab_size, embed_dim, n_heads, n_kv_heads, n_layers)
+- `tokenizer/` — `vocab.json` + `merges.txt` (GPT-2 format, loadable with `BPETokenizer::load()`)
+- `step_XXXXXXXXX.ckpt` — latest model weights
+
+#### End-to-end workflow
+
+```bash
+# 1. Train (native build — required for speed)
+cmake --build build-native --parallel
+
+nohup ./build-native/bin/ch24_real_training \
+  --phase train \
+  --ckpt-dir /tmp/my_model \
+  --steps 10000 \
+  --corpus data/shakespeare.txt \
+  --vocab-size 1024 \
+  > /tmp/train.log 2>&1 &
+
+tail -f /tmp/train.log   # watch progress
+
+# 2. Inference with the CLI
+./build-native/bin/sub0llm-cli \
+  --model-dir /tmp/my_model \
+  --prompt "To be or not to be" \
+  --max-tokens 100 \
+  --temperature 0.8 \
+  --top-k 20
+
+# Interactive mode (read prompts from stdin):
+./build-native/bin/sub0llm-cli --model-dir /tmp/my_model --interactive
+
+# 3. Start the HTTP server
+./build-native/bin/sub0llm-server --model-dir /tmp/my_model --port 8080
+
+# OpenAI-compatible completion:
+curl -s http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"HAMLET:","max_tokens":80,"temperature":0.9,"top_k":30}'
+
+# Chat completion:
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"What is love?"}],"max_tokens":80}'
+
+# Health check:
+curl http://localhost:8080/health
+curl http://localhost:8080/v1/models
+```
+
+#### CLI flags
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-dir DIR` | required | directory with config.json, tokenizer/, *.ckpt |
+| `--prompt TEXT` | (empty) | initial prompt text |
+| `--max-tokens N` | 200 | max new tokens to generate |
+| `--temperature F` | 1.0 | sampling temperature >0 |
+| `--top-k N` | 0 (off) | top-k filtering |
+| `--top-p F` | 1.0 (off) | nucleus sampling threshold |
+| `--greedy` | off | force deterministic argmax |
+| `--interactive` | off | read prompts from stdin |
+| `--seed N` | 42 | RNG seed |
+
+#### Server flags
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-dir DIR` | required | same layout as CLI |
+| `--host HOST` | 0.0.0.0 | bind address |
+| `--port PORT` | 8080 | listen port |
+| `--threads N` | 4 | concurrent request handlers |
+| `--seed N` | 42 | base RNG seed (incremented per request) |
+
+#### Server endpoints
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | status, step, n_params |
+| GET | `/v1/models` | model listing |
+| POST | `/v1/completions` | text completion (OpenAI schema) |
+| POST | `/v1/chat/completions` | chat completion (messages → prompt) |
+
+#### Corpus notes
+- `data/shakespeare.txt` (1.1 MB, 7222 paragraphs) is committed to the repo
+- BPE training scales as O(corpus_lines × vocab_merges): 1000 lines + vocab 1024 ≈ 14 s
+- Use `--vocab-size 512` for fast tokenizer, `--vocab-size 2048` for richer subwords
+- The model dir is gitignored (`/data/*.ckpt` etc.); use Git LFS for checkpoints
+
 ### Tests
 442 Catch2 tests across 25 test files — all passing.
 
