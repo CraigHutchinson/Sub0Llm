@@ -22,10 +22,14 @@ Supported presets (--preset flag):
 
 After download, run:
   ./build/bin/sub0llm-episodic info --model /tmp/models/<filename>
-  ./build/bin/sub0llm-episodic write --model /tmp/models/<filename> \\
-      --fact "The capital of France is Paris" --delta /tmp/test.epis
-  ./build/bin/sub0llm-episodic recall --model /tmp/models/<filename> \\
-      --query "capital of France" --delta /tmp/test.epis
+
+  # Use a NOVEL fact the model cannot already know.
+  # Bad: "capital of France" — already in training data, NLL drop is meaningless.
+  # Good: project-specific names, invented terms, clearly fictional specifics.
+
+  ./build/bin/sub0llm-episodic probe --model /tmp/models/<filename> \\
+      --fact "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \\
+      --query "what is sub0llm used for"
 """
 
 import argparse
