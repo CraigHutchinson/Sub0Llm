@@ -46,9 +46,9 @@ static void section_temperature() {
 
         std::cout << std::format("  {:>8.1f}  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%\n",
                                   temp,
-                                  100.0f * counts[0] / N, 100.0f * counts[1] / N,
-                                  100.0f * counts[2] / N, 100.0f * counts[3] / N,
-                                  100.0f * counts[4] / N);
+                                  100.0f * static_cast<float>(counts[0]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[1]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[2]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[3]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[4]) / static_cast<float>(N));
     }
 
     std::cout << "  Low temperature concentrates mass on the peak; high flattens it.\n";
@@ -77,9 +77,9 @@ static void section_top_k() {
         std::cout << std::format("  {:>4}  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%"
                                   "  [top-{}]\n",
                                   k,
-                                  100.0f * counts[0] / N, 100.0f * counts[1] / N,
-                                  100.0f * counts[2] / N, 100.0f * counts[3] / N,
-                                  100.0f * counts[4] / N, k);
+                                  100.0f * static_cast<float>(counts[0]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[1]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[2]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[3]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[4]) / static_cast<float>(N), k);
     }
 
     std::cout << "  Top-k prevents probability mass leaking to very low-probability tokens.\n";
@@ -106,9 +106,9 @@ static void section_top_p() {
 
         std::cout << std::format("  {:>6.2f}  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%\n",
                                   p,
-                                  100.0f * counts[0] / N, 100.0f * counts[1] / N,
-                                  100.0f * counts[2] / N, 100.0f * counts[3] / N,
-                                  100.0f * counts[4] / N);
+                                  100.0f * static_cast<float>(counts[0]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[1]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[2]) / static_cast<float>(N), 100.0f * static_cast<float>(counts[3]) / static_cast<float>(N),
+                                  100.0f * static_cast<float>(counts[4]) / static_cast<float>(N));
     }
 
     std::cout << "  Nucleus sampling adapts the candidate set to the distribution shape.\n";
@@ -197,7 +197,7 @@ static void section_comparison() {
         std::cout << std::format("  {:>20}: ", label);
         for (int tok = 0; tok < 5; ++tok)
             std::cout << std::format("  tok{}={:.1f}%", tok,
-                                      100.0f * counts[tok] / N);
+                                      100.0f * static_cast<float>(counts[tok]) / static_cast<float>(N));
         std::cout << '\n';
     };
 

@@ -80,15 +80,15 @@ TEST_CASE("forward_one fills cache for multiple tokens", "[ch25][kv_cache]") {
     auto cache = model.make_kv_cache(16);
 
     for (int32_t tok = 0; tok < 5; ++tok)
-        model.forward_one(tok, cache);
+        (void)model.forward_one(tok, cache);
     CHECK(cache.filled == 5);
 }
 
 TEST_CASE("forward_one throws when cache is full", "[ch25][kv_cache]") {
     ModernGPT model(32, 32, 4, 2, 2, 64);
     auto cache = model.make_kv_cache(2);
-    model.forward_one(0, cache);
-    model.forward_one(1, cache);
+    (void)model.forward_one(0, cache);
+    (void)model.forward_one(1, cache);
     CHECK(cache.full());
     CHECK_THROWS_AS(model.forward_one(2, cache), std::runtime_error);
 }

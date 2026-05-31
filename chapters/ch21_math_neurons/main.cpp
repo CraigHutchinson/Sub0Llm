@@ -1468,7 +1468,7 @@ static ImprovedData build_math_dataset_base() {
                 by_r[A + B].emplace_back(A, B);
         for (auto& [r, pairs] : by_r) {
             std::shuffle(pairs.begin(), pairs.end(), rng);
-            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, pairs.size()); ++i)
                 add1(RouteType::Add, std::to_string(pairs[i].first) + " + " +
                      std::to_string(pairs[i].second) + " = " + std::to_string(r));
         }
@@ -1482,7 +1482,7 @@ static ImprovedData build_math_dataset_base() {
                 by_r[A - B].emplace_back(A, B);
         for (auto& [r, pairs] : by_r) {
             std::shuffle(pairs.begin(), pairs.end(), rng);
-            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, pairs.size()); ++i)
                 add1(RouteType::Sub, std::to_string(pairs[i].first) + " - " +
                      std::to_string(pairs[i].second) + " = " + std::to_string(r));
         }
@@ -1496,7 +1496,7 @@ static ImprovedData build_math_dataset_base() {
                 by_r[A * B].emplace_back(A, B);
         for (auto& [r, pairs] : by_r) {
             std::shuffle(pairs.begin(), pairs.end(), rng);
-            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, pairs.size()); ++i)
                 add1(RouteType::Mul, std::to_string(pairs[i].first) + " * " +
                      std::to_string(pairs[i].second) + " = " + std::to_string(r));
         }
@@ -1510,7 +1510,7 @@ static ImprovedData build_math_dataset_base() {
                 by_k[k].emplace_back(k * B, B);
         for (auto& [k, pairs] : by_k) {
             std::shuffle(pairs.begin(), pairs.end(), rng);
-            for (int i = 0; i < std::min(3, (int)pairs.size()); ++i)
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, pairs.size()); ++i)
                 add1(RouteType::Div, std::to_string(pairs[i].first) + " / " +
                      std::to_string(pairs[i].second) + " = " + std::to_string(k));
         }
@@ -1530,8 +1530,8 @@ static ImprovedData build_math_dataset_base() {
                 (fn(A,B) ? tp : fp).emplace_back(A, B);
         std::shuffle(tp.begin(), tp.end(), rng);
         std::shuffle(fp.begin(), fp.end(), rng);
-        int n = std::min({(int)tp.size(), (int)fp.size(), 80});
-        for (int i = 0; i < n; ++i) {
+        const std::size_t n = std::min({tp.size(), fp.size(), std::size_t{80}});
+        for (std::size_t i = 0; i < n; ++i) {
             add1(op, std::to_string(tp[i].first)+" "+sym+" "+std::to_string(tp[i].second)+" = 1");
             add1(op, std::to_string(fp[i].first)+" "+sym+" "+std::to_string(fp[i].second)+" = 0");
         }
@@ -2302,7 +2302,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
             }
         std::shuffle(valid.begin(), valid.end(), rng);
         std::vector<TestItemImproved> out;
-        for (int i = 0; i < std::min(n_sample, (int)valid.size()); ++i) {
+        for (std::size_t i = 0; i < std::min<std::size_t>(static_cast<std::size_t>(n_sample), valid.size()); ++i) {
             auto [A, B] = valid[i];
             auto ids = ntok.encode(std::to_string(A) + " " + sym + " " +
                                     std::to_string(B) + " =");
@@ -2324,7 +2324,7 @@ static std::vector<GenTestTier> build_gentest_tiers(const NumericTokenizer& ntok
             }
         std::shuffle(valid.begin(), valid.end(), rng);
         std::vector<TestItemImproved> out;
-        for (int i = 0; i < std::min(n_sample, (int)valid.size()); ++i) {
+        for (std::size_t i = 0; i < std::min<std::size_t>(static_cast<std::size_t>(n_sample), valid.size()); ++i) {
             auto [A, B] = valid[i];
             auto ids = ntok.encode(std::to_string(A) + " / " + std::to_string(B) + " =");
             if (!ids.empty())
@@ -2482,7 +2482,7 @@ static std::vector<GenTierResult> eval_gentest(
                 !ntok.is_overflow_token(pred_id))
                 pred_val = static_cast<int32_t>(ntok.numeric_value(pred_id));
             ++tr.total;
-            const int op_idx = static_cast<int>(item.expected_op);
+            const std::size_t op_idx = static_cast<std::size_t>(item.expected_op);
             ++tr.op_tot[op_idx];
             if (pred_val == item.expected_val) {
                 ++tr.op_ok[op_idx];

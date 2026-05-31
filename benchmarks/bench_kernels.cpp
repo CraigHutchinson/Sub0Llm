@@ -74,13 +74,13 @@ static void bench_element_wise(std::size_t N, int iters)
     auto bp = b.data_as<float>();
     for (std::size_t i = 0; i < N; ++i) { ap[i] = 1.0f + static_cast<float>(i) * 0.001f; bp[i] = 2.0f; }
 
-    time_it("add_f32",     N * 2, -1, iters, [&]{ ops::add(a, b); });
-    time_it("mul_f32",     N * 2, -1, iters, [&]{ ops::mul(a, b); });
-    time_it("relu_f32",    N * 2, -1, iters, [&]{ ops::relu(a);   });
-    time_it("sigmoid_f32", N * 2, -1, iters, [&]{ ops::sigmoid(a); });
-    time_it("silu_f32",    N * 2, -1, iters, [&]{ ops::silu(a);   });
-    time_it("exp_f32",     N * 2, -1, iters, [&]{ ops::exp(a);    });
-    time_it("log_f32",     N * 2, -1, iters, [&]{ ops::log(a);    });
+    time_it("add_f32",     N * 2, -1, iters, [&]{ (void)ops::add(a, b); });
+    time_it("mul_f32",     N * 2, -1, iters, [&]{ (void)ops::mul(a, b); });
+    time_it("relu_f32",    N * 2, -1, iters, [&]{ (void)ops::relu(a);   });
+    time_it("sigmoid_f32", N * 2, -1, iters, [&]{ (void)ops::sigmoid(a); });
+    time_it("silu_f32",    N * 2, -1, iters, [&]{ (void)ops::silu(a);   });
+    time_it("exp_f32",     N * 2, -1, iters, [&]{ (void)ops::exp(a);    });
+    time_it("log_f32",     N * 2, -1, iters, [&]{ (void)ops::log(a);    });
 }
 
 static void bench_reductions(std::size_t N, int iters)
@@ -115,7 +115,7 @@ static void bench_matmul(int iters)
         Tensor B = zeros({s.K, s.N});
         const int64_t flops = 2 * s.M * s.K * s.N;
         const std::size_t n_floats = static_cast<std::size_t>(s.M * s.K + s.K * s.N + s.M * s.N);
-        time_it(s.label, n_floats, flops, iters, [&]{ ops::matmul(A, B); });
+        time_it(s.label, n_floats, flops, iters, [&]{ (void)ops::matmul(A, B); });
     }
 }
 
@@ -135,7 +135,7 @@ static void bench_copy_strided(int iters)
         Tensor A = zeros({s.M, s.N});
         const std::size_t n_floats = static_cast<std::size_t>(s.M * s.N) * 2;
         time_it(s.label, n_floats, -1, iters,
-            [&]{ A.transpose(0, 1).contiguous(); });
+            [&]{ (void)A.transpose(0, 1).contiguous(); });
     }
 }
 
@@ -161,12 +161,12 @@ static void bench_autograd_forward(int iters)
     Variable wv(wmat, true);
     const std::size_t n = static_cast<std::size_t>(T * D);
 
-    time_it("rms_norm fwd",    n * 2, -1, iters, [&]{ rms_norm(x, w); });
-    time_it("softmax fwd",     n * 2, -1, iters, [&]{ softmax(x); });
-    time_it("silu fwd",        n * 2, -1, iters, [&]{ silu(x); });
-    time_it("gelu fwd",        n * 2, -1, iters, [&]{ gelu(x); });
+    time_it("rms_norm fwd",    n * 2, -1, iters, [&]{ (void)rms_norm(x, w); });
+    time_it("softmax fwd",     n * 2, -1, iters, [&]{ (void)softmax(x); });
+    time_it("silu fwd",        n * 2, -1, iters, [&]{ (void)silu(x); });
+    time_it("gelu fwd",        n * 2, -1, iters, [&]{ (void)gelu(x); });
     time_it("matmul (32x128x128)", static_cast<std::size_t>(T*(D+D)+D*D), 2*T*D*D, iters,
-        [&]{ matmul(x, wv); });
+        [&]{ (void)matmul(x, wv); });
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
