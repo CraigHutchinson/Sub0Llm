@@ -10,7 +10,7 @@ in C++ with explicit hardware backends (CPU SIMD, CUDA, OpenVINO).
 
 ## Synopsis
 
-sub0llm is a complete, self-contained LLM implementation split across 23
+sub0llm is a complete, self-contained LLM implementation split across 26
 chapters.  Each chapter is a standalone executable that demonstrates a
 coherent concept, builds on the previous chapters' infrastructure, and ships
 with full unit-test coverage.
@@ -57,6 +57,26 @@ Bob gives B, she now has A + B = C") work correctly because the last-two-
 numerics rule picks the explicitly-written operands regardless of stray numbers
 in prose.
 
+### Phase V — Real-World Deployment (Ch24–Ch26)
+Ch24 assembles every library component into a full pretraining loop with
+BPE tokenization, streaming TextCorpus, Chinchilla-scaled batch sizing,
+checkpoint save/resume, and a demonstration on Shakespeare.  A CLI tool and
+OpenAI-compatible HTTP server (sub0llm-cli / sub0llm-server) expose any
+trained or GGUF-loaded model for interactive use.
+
+Ch25 adds production inference: a KV cache (~9× latency speedup),
+sliding-window attention for O(n·W) memory, and RoPE NTK-aware scaling
+for extending beyond training context length without fine-tuning.
+
+Ch26 introduces **episodic memory**: a three-tier framework (working →
+episodic → semantic) where fast-weight delta LoRA updates let the model
+acquire novel facts (ones absent from pretraining) in seconds via a
+targeted comprehension-pass → thinking-loop → gradient-write cycle.
+A GGUF loader enables running the episodic pipeline on Qwen2/Qwen3
+community weights.  The `sub0llm-episodic probe` command validates episodic
+encoding on novel facts using a 4-condition test (high baseline NLL, NLL
+reduction, query transfer, specificity).
+
 ---
 
 ## Why C++23?
@@ -96,8 +116,11 @@ expressive code without sacrificing performance.
 | 21 | **Specialised Math Neurons** | `NumericTokenizer` (configurable int range), `MathLayer`, STE router over 11 ops, exact arithmetic execution, OOD generalisation proof |
 | 22 | **General-Purpose MathLM** | Parameter efficiency analysis (~8% overhead), int range scaling, mixed language + arithmetic training, OOD accuracy 100% vs 0% baseline |
 | 23 | **Reasoned Arithmetic** | Multi-step chain-of-thought with exact math head, register walkthrough, natural language word problems, 3-step chains, OOD multi-step generalisation |
+| 24 | **Real-World Pretraining** | `TextCorpus` streaming BPE pipeline, Chinchilla scaling, checkpoint save/resume, Ollama synthetic data, Shakespeare demo |
+| 25 | **Long-Context Inference** | KV cache (~9× speedup), sliding-window attention (O(n·W) memory), RoPE NTK-aware scaling, `generate_cached()` loop |
+| 26 | **Episodic Memory** | Three-tier memory framework, fast-weight delta LoRA, comprehension pass → thinking loop → targeted write, GGUF loader (Qwen2/Qwen3), `sub0llm-episodic` CLI |
 
-> **Test coverage**: 430 Catch2 tests across 23 test files — all passing.
+> **Test coverage**: 474 Catch2 tests across 26 test files — all passing.
 
 ---
 
@@ -125,6 +148,34 @@ cmake --build build --parallel
 For the full step-by-step guide including CUDA, native builds, Ollama synthetic
 data, training commands, and troubleshooting, see
 **[docs/local_machine_setup.md](docs/local_machine_setup.md)**.
+
+### Chapter docs
+
+Each chapter has a companion design document in `docs/`:
+
+| Doc | Contents |
+|-----|----------|
+| [ch01_foundations.md](docs/ch01_foundations.md) | Tensor internals, DType, Device |
+| [ch02_backends.md](docs/ch02_backends.md) | SIMD dispatch, CUDA, OpenVINO |
+| [ch03_tokenization.md](docs/ch03_tokenization.md) | BPE algorithm, GPT-2 encoding |
+| [ch04_dataset.md](docs/ch04_dataset.md) | DataLoader, sliding-window chunks |
+| [ch05_autograd.md](docs/ch05_autograd.md) | Reverse-mode AD, gradient check |
+| [ch06_embeddings.md](docs/ch06_embeddings.md) | Token/positional embeddings, RoPE |
+| [ch07_attention.md](docs/ch07_attention.md) | Scaled dot-product, causal masking |
+| [ch08_gpt.md](docs/ch08_gpt.md) | GELU, LayerNorm, GPT-2 architecture |
+| [ch09_optimizer.md](docs/ch09_optimizer.md) | SGD, Adam, gradient clipping |
+| [ch10_modern_arch.md](docs/ch10_modern_arch.md) | RMSNorm, SwiGLU, GQA, ModernGPT |
+| [ch11_pretraining.md](docs/ch11_pretraining.md) | Cosine LR, MTP loss, pretraining loop |
+| [ch12_finetuning.md](docs/ch12_finetuning.md) | LoRA, frozen base, rank ablation |
+| [ch13_alignment.md](docs/ch13_alignment.md) | DPO, Bradley-Terry, implicit reward |
+| [ch14_inference.md](docs/ch14_inference.md) | Sampling strategies, generation loop |
+| [ch15_distillation.md](docs/ch15_distillation.md) | Soft targets, temperature scaling |
+| [ch16_thinking.md](docs/ch16_thinking.md) | Chain-of-thought, budget control |
+| [ch17_looped_gpt.md](docs/ch17_looped_gpt.md) | Universal Transformer, runtime budget |
+| [ch18_moe.md](docs/ch18_moe.md) | Sparse top-k routing, load-balancing loss |
+| [ch19_mtp.md](docs/ch19_mtp.md) | Multi-Token Prediction, K+1 heads |
+| [ch20_rlhf.md](docs/ch20_rlhf.md) | RewardModel, REINFORCE, KL penalty |
+| [ch21_math_neurons.md](docs/ch21_math_neurons.md) | MathLayer, STE router, exact arithmetic |
 
 ### Run a chapter
 
@@ -168,12 +219,18 @@ Sub0Llm/
 │   ├── core/               # Tensor, DType, Device, ops
 │   ├── autograd/           # Variable, differentiable ops
 │   ├── tokenizer/          # BPE + NumericTokenizer
-│   ├── data/               # Dataset, DataLoader
+│   ├── data/               # Dataset, DataLoader, TextCorpus
 │   └── nn/                 # All neural network modules
 ├── src/                    # Library implementation
-├── chapters/               # One executable per chapter (ch01–ch23)
-├── tests/                  # Catch2 unit tests (430 tests, 23 files)
-└── tools/                  # Python scripts for data prep, plotting
+├── chapters/               # One executable per chapter (ch01–ch26)
+├── tests/                  # Catch2 unit tests (474 tests, 26 files)
+├── docs/                   # Per-chapter design documents
+└── tools/
+    ├── cli/                # sub0llm-cli — interactive inference CLI
+    ├── server/             # sub0llm-server — OpenAI-compatible HTTP server
+    ├── episodic/           # sub0llm-episodic — episodic memory CLI
+    ├── gen_test_gguf.py    # Synthetic GGUF generator (llama/qwen2/qwen3 modes)
+    └── download_model.py   # Download Qwen2/Qwen3 GGUF from HuggingFace Hub
 ```
 
 ---
@@ -187,14 +244,77 @@ Sub0Llm/
 | `autograd/variable.hpp` | `Variable` — autograd node wrapping a `Tensor` |
 | `autograd/ops.hpp` | Full differentiable op set; `cross_entropy`, `narrow`, `row_scale` |
 | `tokenizer/bpe.hpp` | BPE tokenizer with save/load |
-| `tokenizer/numeric_tokenizer.hpp` | Extends BPE with a configurable integer vocabulary (`int_min`…`int_max`), NaN and overflow tokens |
-| `nn/modern_gpt.hpp` | `ModernGPT`: RMSNorm, SwiGLU, RoPE, GQA — production-style LLM |
-| `nn/math_nodes.hpp` | `MathGPT`, `MathLayer`, `apply_math_op`, `RouteType` (11 ops), `RouteInfo` — exact arithmetic transformer |
+| `tokenizer/numeric_tokenizer.hpp` | Extends BPE with configurable integer vocabulary (`int_min`…`int_max`), NaN and overflow tokens |
+| `data/text_corpus.hpp` | `TextCorpus`: streaming BPE-tokenised corpus from files or JSONL, shuffled windows |
+| `nn/modern_gpt.hpp` | `ModernGPT`: RMSNorm, SwiGLU, RoPE, GQA, explicit `head_dim` (Qwen3 support) |
+| `nn/math_nodes.hpp` | `MathGPT`, `MathLayer`, `apply_math_op`, `RouteType` (11 ops) — exact arithmetic transformer |
 | `nn/optimizer.hpp` | SGD, Adam, gradient clipping |
 | `nn/lora.hpp` | LoRA low-rank adaptation |
 | `nn/sampler.hpp` | Greedy / temperature / top-k / top-p + `generate` loop |
 | `nn/moe.hpp` | Sparse MoE: `MoEFeedForward`, `MoEGPT`, load-balancing loss |
 | `nn/rlhf.hpp` | `RewardModel`, preference loss, REINFORCE, KL penalty |
+| `nn/checkpoint.hpp` | `save_checkpoint` / `load_checkpoint` with JSON header + binary weights |
+| `nn/kv_cache.hpp` | `KVCache`: pre-allocated K/V buffers per layer for O(n) autoregressive inference |
+| `nn/long_context.hpp` | `generate_cached()`: KV-cached generation with on-token callback and NTK RoPE scaling |
+| `nn/gguf_loader.hpp` | `GGUFReader` + `load_gguf_model`: parse GGUF v2/v3, dequantise F32/F16/Q8_0, load Qwen2/Qwen3 weights |
+| `nn/episodic_memory.hpp` | `EpisodicState`, `episodic_encode`, `merge`/`unmerge`, `save`/`load` — fast-weight episodic LoRA |
+
+---
+
+## CLI tools
+
+Three binaries built alongside the chapters:
+
+### sub0llm-cli — interactive inference
+```bash
+# Single-shot generation from a trained checkpoint
+./build/bin/sub0llm-cli --model-dir /tmp/my_model --prompt "To be or not" --max-tokens 100
+
+# Interactive REPL
+./build/bin/sub0llm-cli --model-dir /tmp/my_model --interactive
+```
+
+### sub0llm-server — OpenAI-compatible HTTP server
+```bash
+./build/bin/sub0llm-server --model-dir /tmp/my_model --port 8080
+
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"HAMLET:","max_tokens":80,"temperature":0.9}'
+```
+
+Both tools require a model directory produced by `ch24_real_training --phase train`
+(contains `config.json`, `tokenizer/`, and a `*.ckpt` checkpoint file).
+
+### sub0llm-episodic — episodic memory CLI
+```bash
+# Download a model (requires HuggingFace access)
+python3 tools/download_model.py --preset qwen2-0.5b
+
+# Show model config
+./build/bin/sub0llm-episodic info --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf
+
+# Validity probe — tests 4 conditions with a novel fact
+./build/bin/sub0llm-episodic probe \
+    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
+    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \
+    --query "what is sub0llm used for"
+
+# Write a fact to a persistent delta file
+./build/bin/sub0llm-episodic write \
+    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
+    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \
+    --delta /tmp/sub0llm.epis
+
+# Recall — measure NLL with and without the delta
+./build/bin/sub0llm-episodic recall \
+    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
+    --query "what is sub0llm" \
+    --delta /tmp/sub0llm.epis
+```
+
+**GGUF compatibility**: Qwen2 (0.5B–72B), Qwen3 (0.6B–235B, including models
+with explicit `head_dim` != `embed_dim/n_heads`).  Quantisation: F32, F16, Q8_0.
 
 ---
 
@@ -215,12 +335,17 @@ Sub0Llm/
 
 ## References
 
-- [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) — the Python counterpart
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) — reference for SIMD kernels, quantisation
-- [DeepSeek-V3 technical report](https://arxiv.org/abs/2412.19437) — MTP modules
-- [LoRA paper](https://arxiv.org/abs/2106.09685) — Hu et al., 2021
-- [DPO paper](https://arxiv.org/abs/2305.18290) — Rafailov et al., 2023
-- [Switch Transformer](https://arxiv.org/abs/2101.03961) — MoE load balancing
+- [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) — the Python counterpart that inspired this project
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) — reference for SIMD kernels, GGUF format, quantisation
+- [DeepSeek-V3 technical report](https://arxiv.org/abs/2412.19437) — MTP modules (Ch19)
+- [LoRA paper](https://arxiv.org/abs/2106.09685) — Hu et al., 2021 (Ch12)
+- [DPO paper](https://arxiv.org/abs/2305.18290) — Rafailov et al., 2023 (Ch13)
+- [Switch Transformer](https://arxiv.org/abs/2101.03961) — MoE load balancing (Ch18)
+- [Chinchilla scaling laws](https://arxiv.org/abs/2203.15556) — Hoffmann et al., 2022 (Ch24)
+- [NTK-aware RoPE scaling](https://arxiv.org/abs/2309.00071) — Chen et al., 2023 (Ch25)
+- [Titans: Learning to Memorize at Test Time](https://arxiv.org/abs/2501.00663) — Behrouz et al., 2024 (Ch26 prior art)
+- [ROME: Locating and Editing Factual Associations](https://arxiv.org/abs/2202.05262) — Meng et al., 2022 (Ch26 prior art)
+- [Test-Time Training on Language Models](https://arxiv.org/abs/2407.04620) — Sun et al., 2024 (Ch26 prior art)
 - [C++23 standard](https://en.cppreference.com/w/cpp/23) — `std::format`, concepts, ranges
 
 ---
