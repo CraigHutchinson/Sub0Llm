@@ -34,7 +34,9 @@ set(SUB0LLM_SOURCES
     data/text_corpus.cpp
     nn/checkpoint.cpp
     nn/long_context.cpp
+    nn/episodic_memory.cpp
 )
+
 
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
 if(SUB0LLM_ENABLE_CUDA)

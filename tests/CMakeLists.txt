@@ -26,6 +26,7 @@ add_executable(tests
     test_checkpoint.cpp
     test_text_corpus.cpp
     test_ch25_long_context.cpp
+    test_ch26_episodic_memory.cpp
 )
 
 target_link_libraries(tests
