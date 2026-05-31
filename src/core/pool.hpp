@@ -6,6 +6,24 @@
 #include <new>
 #include <vector>
 
+// Windows (MSVC CRT + clang-cl) does not provide std::aligned_alloc.
+// Use _aligned_malloc/_aligned_free instead, noting the reversed argument order.
+#ifdef _WIN32
+namespace sub0llm { namespace detail {
+    inline void* aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
+        return ::_aligned_malloc(size, alignment);
+    }
+    inline void aligned_free(void* ptr) noexcept { ::_aligned_free(ptr); }
+} }
+#else
+namespace sub0llm { namespace detail {
+    inline void* aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
+        return std::aligned_alloc(alignment, size);
+    }
+    inline void aligned_free(void* ptr) noexcept { std::free(ptr); }
+} }
+#endif
+
 namespace sub0llm {
 
 // Thread-local tensor buffer pool.
@@ -37,7 +55,7 @@ public:
 
     ~TensorPool() {
         for (auto& bkt : buckets_)
-            for (auto* p : bkt) std::free(p);
+            for (auto* p : bkt) detail::aligned_free(p);
     }
 
     // Allocate a buffer of at least `bytes` bytes, 64-byte aligned.
@@ -52,7 +70,7 @@ public:
                 ptr = bkt.back();
                 bkt.pop_back();
             } else {
-                ptr = static_cast<std::byte*>(std::aligned_alloc(kAlign, alloc_sz));
+                ptr = static_cast<std::byte*>(detail::aligned_alloc(kAlign, alloc_sz));
                 if (!ptr) throw std::bad_alloc{};
             }
             try {
@@ -61,15 +79,15 @@ public:
                         TensorPool::get().reclaim(p, idx);
                     });
             } catch (...) {
-                std::free(ptr);
+                detail::aligned_free(ptr);
                 throw;
             }
         }
         // Bypass: size outside pooled range — still 64-byte aligned for SIMD correctness.
         const std::size_t aligned = (bytes + kAlign - 1u) & ~(kAlign - 1u);
-        std::byte* ptr = static_cast<std::byte*>(std::aligned_alloc(kAlign, aligned));
+        std::byte* ptr = static_cast<std::byte*>(detail::aligned_alloc(kAlign, aligned));
         if (!ptr) throw std::bad_alloc{};
-        return std::shared_ptr<std::byte[]>(ptr, [](std::byte* p) noexcept { std::free(p); });
+        return std::shared_ptr<std::byte[]>(ptr, [](std::byte* p) noexcept { detail::aligned_free(p); });
     }
 
 private:
@@ -83,7 +101,7 @@ private:
     void reclaim(std::byte* ptr, int idx) noexcept {
         auto& bkt = buckets_[static_cast<std::size_t>(idx)];
         if (bkt.size() < kMaxCached) bkt.push_back(ptr);
-        else                          std::free(ptr);
+        else                          detail::aligned_free(ptr);
     }
 
     // Bucket index whose size covers `bytes` bytes, or -1 if out of range.

@@ -10,6 +10,8 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-${presetName}",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "SUB0LLM_BUILD_CHAPTERS": "ON",
         "SUB0LLM_BUILD_TESTS":    "ON",
