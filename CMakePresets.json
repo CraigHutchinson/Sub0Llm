@@ -1,0 +1,209 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+
+  "configurePresets": [
+
+    {
+      "name": "_base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SUB0LLM_BUILD_CHAPTERS": "ON",
+        "SUB0LLM_BUILD_TESTS":    "ON",
+        "SUB0LLM_BUILD_TOOLS":    "ON",
+        "SUB0LLM_ENABLE_EIGEN":   "ON",
+        "SUB0LLM_ENABLE_CUDA":      "OFF",
+        "SUB0LLM_ENABLE_OPENVINO":  "OFF",
+        "SUB0LLM_ENABLE_NATIVE":    "OFF",
+        "SUB0LLM_ENABLE_AVX512":    "OFF",
+        "SUB0LLM_ENABLE_SANITIZERS":           "OFF",
+        "SUB0LLM_ENABLE_WARNINGS_AS_ERRORS":   "OFF",
+        "SUB0LLM_ENABLE_VEC_REPORT":           "OFF"
+      }
+    },
+
+    {
+      "name": "debug",
+      "displayName": "Debug (AVX2)",
+      "description": "Debug build with AVX2 — used for development and unit tests",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SUB0LLM_ENABLE_AVX2": "ON",
+        "SUB0LLM_ENABLE_LTO":  "OFF"
+      }
+    },
+
+    {
+      "name": "release",
+      "displayName": "Release (AVX2)",
+      "description": "Optimised release build with AVX2 — distributable binaries",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SUB0LLM_ENABLE_AVX2": "ON",
+        "SUB0LLM_ENABLE_LTO":  "ON"
+      }
+    },
+
+    {
+      "name": "avx512",
+      "displayName": "Release (AVX-512)",
+      "description": "Release with AVX-512 — Skylake-X / Ice Lake and newer server CPUs",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SUB0LLM_ENABLE_AVX2":   "OFF",
+        "SUB0LLM_ENABLE_AVX512": "ON",
+        "SUB0LLM_ENABLE_LTO":    "ON"
+      }
+    },
+
+    {
+      "name": "native",
+      "displayName": "Release (native — training)",
+      "description": "Host-native release build: -march=native, LTO, fast-math FMA. Use for training runs. Do NOT distribute these binaries — they will SIGILL on other CPUs.",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":      "Release",
+        "SUB0LLM_ENABLE_NATIVE": "ON",
+        "SUB0LLM_ENABLE_LTO":    "ON"
+      }
+    },
+
+    {
+      "name": "reldbg",
+      "displayName": "RelWithDebInfo (AVX2)",
+      "description": "Optimised build with debug info — profiling and crash investigation",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SUB0LLM_ENABLE_AVX2": "ON",
+        "SUB0LLM_ENABLE_LTO":  "OFF"
+      }
+    },
+
+    {
+      "name": "asan",
+      "displayName": "Debug + ASan/UBSan",
+      "description": "Debug with AddressSanitizer + UBSanitizer — for finding memory bugs",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":              "Debug",
+        "SUB0LLM_ENABLE_AVX2":          "ON",
+        "SUB0LLM_ENABLE_LTO":           "OFF",
+        "SUB0LLM_ENABLE_SANITIZERS":    "ON"
+      }
+    },
+
+    {
+      "name": "cuda",
+      "displayName": "Release (AVX2 + CUDA)",
+      "description": "Release with CUDA backend — requires NVIDIA GPU and CUDA Toolkit ≥ 12",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":    "Release",
+        "SUB0LLM_ENABLE_AVX2": "ON",
+        "SUB0LLM_ENABLE_CUDA": "ON",
+        "SUB0LLM_ENABLE_LTO":  "ON"
+      }
+    },
+
+    {
+      "name": "cuda-native",
+      "displayName": "Release (native + CUDA — training)",
+      "description": "Host-native release with CUDA — maximum throughput for training on GPU. Do NOT distribute binaries.",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":      "Release",
+        "SUB0LLM_ENABLE_NATIVE": "ON",
+        "SUB0LLM_ENABLE_CUDA":   "ON",
+        "SUB0LLM_ENABLE_LTO":    "ON"
+      }
+    },
+
+    {
+      "name": "openvino",
+      "displayName": "Release (AVX2 + OpenVINO)",
+      "description": "Release with Intel OpenVINO backend — requires OpenVINO ≥ 2024",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":        "Release",
+        "SUB0LLM_ENABLE_AVX2":     "ON",
+        "SUB0LLM_ENABLE_OPENVINO": "ON",
+        "SUB0LLM_ENABLE_LTO":      "ON"
+      }
+    },
+
+    {
+      "name": "lib-only",
+      "displayName": "Library only (Release)",
+      "description": "Builds only the sub0llm library — no chapter executables, tests, or tools. Useful when embedding sub0llm as a dependency.",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":       "Release",
+        "SUB0LLM_ENABLE_AVX2":   "ON",
+        "SUB0LLM_ENABLE_LTO":    "ON",
+        "SUB0LLM_BUILD_CHAPTERS": "OFF",
+        "SUB0LLM_BUILD_TESTS":    "OFF",
+        "SUB0LLM_BUILD_TOOLS":    "OFF"
+      }
+    },
+
+    {
+      "name": "ci",
+      "displayName": "CI (Debug, strict)",
+      "description": "Configuration used in CI: debug build, warnings-as-errors, all targets. Tests are run separately via ctest.",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":                    "Debug",
+        "SUB0LLM_ENABLE_AVX2":                "ON",
+        "SUB0LLM_ENABLE_LTO":                 "OFF",
+        "SUB0LLM_ENABLE_WARNINGS_AS_ERRORS":  "OFF"
+      }
+    }
+
+  ],
+
+  "buildPresets": [
+
+    { "name": "debug",       "configurePreset": "debug",       "jobs": 0 },
+    { "name": "release",     "configurePreset": "release",     "jobs": 0 },
+    { "name": "avx512",      "configurePreset": "avx512",      "jobs": 0 },
+    { "name": "native",      "configurePreset": "native",      "jobs": 0 },
+    { "name": "reldbg",      "configurePreset": "reldbg",      "jobs": 0 },
+    { "name": "asan",        "configurePreset": "asan",        "jobs": 0 },
+    { "name": "cuda",        "configurePreset": "cuda",        "jobs": 0 },
+    { "name": "cuda-native", "configurePreset": "cuda-native", "jobs": 0 },
+    { "name": "openvino",    "configurePreset": "openvino",    "jobs": 0 },
+    { "name": "lib-only",    "configurePreset": "lib-only",    "jobs": 0 },
+    { "name": "ci",          "configurePreset": "ci",          "jobs": 0 }
+
+  ],
+
+  "testPresets": [
+
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": { "outputOnFailure": true, "verbosity": "extra" },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    }
+
+  ]
+}

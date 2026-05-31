@@ -8,45 +8,50 @@ plotting scripts.
 
 ## Build commands
 
+CMakePresets.json defines all standard configurations. Use `--preset <name>`:
+
 ```bash
-# Configure (first time — downloads CPM deps, requires internet)
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+# List all presets
+cmake --list-presets=all
 
-# Build everything
-cmake --build build --parallel
-
-# Run tests
-ctest --test-dir build --output-on-failure -V
+# Debug build (development + tests) — build tree: build-debug/
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 
 # Run a chapter
-./build/bin/ch01_foundations
-
-# Release build with AVX2
-cmake -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_AVX2=ON
-cmake --build build-rel --parallel
+./build-debug/bin/ch01_foundations
 
 # Native release build — targets this machine's exact CPU (AVX-512, FMA, BMI, etc.)
 # Enables: -march=native, -mtune=native, -ffp-contract=fast, -funroll-loops, LTO
 # DO NOT distribute binaries from this build — they will SIGILL on other CPUs.
-cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_NATIVE=ON
-cmake --build build-native --parallel
+# Build tree: build-native/
+cmake --preset native
+cmake --build --preset native
+```
+
+Manual configure (without presets):
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # equivalent to --preset debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure -V
 ```
 
 ## Training policy
 
-**Always use the native build for training runs** (`build-native/bin/`). It enables
+**Always use the native preset for training runs** (`build-native/bin/`). It enables
 `-march=native`, LTO, and fast-math, giving 3–4× throughput vs the debug build.
 After any code change that affects a chapter binary, rebuild native before launching:
 
 ```bash
-cmake --build build-native --parallel
+cmake --build --preset native
 # Then launch training, e.g.:
 nohup ./build-native/bin/ch21_math_neurons \
   --phase train --ckpt-dir /tmp/ckpts --steps 3000 --token-mode real \
   > /tmp/train.log 2>&1 &
 ```
 
-Tests use the debug build (`ctest --test-dir build`) — never run tests on native.
+Tests use the debug preset (`ctest --preset debug`) — never run tests on native.
 
 ## Code conventions
 

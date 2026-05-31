@@ -135,18 +135,58 @@ expressive code without sacrificing performance.
 | Ninja (optional) | any |
 
 Optional backends:
-- CUDA Toolkit ≥ 12 — pass `-DSUB0LLM_ENABLE_CUDA=ON`
-- Intel OpenVINO ≥ 2024 — pass `-DSUB0LLM_ENABLE_OPENVINO=ON`
+- CUDA Toolkit ≥ 12 — use the `cuda` or `cuda-native` preset
+- Intel OpenVINO ≥ 2024 — use the `openvino` preset
 
-### Quick start (CPU only)
+### Quick start with presets
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
+# List all available presets
+cmake --list-presets=all
+
+# Configure + build + test in one go (debug build, AVX2)
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 ```
 
-For the full step-by-step guide including CUDA, native builds, Ollama synthetic
-data, training commands, and troubleshooting, see
+### Preset reference
+
+| Preset | Build type | SIMD | Extras | Use for |
+|--------|-----------|------|--------|---------|
+| `debug` | Debug | AVX2 | — | Development, unit tests |
+| `release` | Release | AVX2 | LTO | Distributable binaries |
+| `avx512` | Release | AVX-512 | LTO | Skylake-X / Ice Lake+ servers |
+| `native` | Release | host-native | LTO | **Training runs** (do not distribute) |
+| `reldbg` | RelWithDebInfo | AVX2 | — | Profiling, crash investigation |
+| `asan` | Debug | AVX2 | ASan + UBSan | Memory and undefined-behaviour checks |
+| `cuda` | Release | AVX2 | CUDA, LTO | NVIDIA GPU inference |
+| `cuda-native` | Release | host-native | CUDA, LTO | **GPU training** (do not distribute) |
+| `openvino` | Release | AVX2 | OpenVINO, LTO | Intel hardware |
+| `lib-only` | Release | AVX2 | LTO | Embedding sub0llm as a library |
+| `ci` | Debug | AVX2 | — | CI pipelines |
+
+Each preset writes its build tree to `build-<preset>` so multiple presets
+can coexist without interfering.
+
+> **Training policy**: always use `native` (CPU) or `cuda-native` (GPU). They
+> enable `-march=native`, LTO, and FMA fusion for 3–4× throughput over `debug`.
+> Never use these presets for binaries you intend to distribute.
+
+### Manual configure (without presets)
+
+```bash
+# Debug (equivalent to --preset debug)
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+
+# Native release (equivalent to --preset native)
+cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_NATIVE=ON
+cmake --build build-native --parallel
+```
+
+For the full step-by-step guide including CUDA, Ollama synthetic data,
+training commands, and troubleshooting, see
 **[docs/local_machine_setup.md](docs/local_machine_setup.md)**.
 
 ### Chapter docs
@@ -180,27 +220,18 @@ Each chapter has a companion design document in `docs/`:
 ### Run a chapter
 
 ```bash
-./build/bin/ch01_foundations
-./build/bin/ch10_modern_arch
-./build/bin/ch20_rlhf
-./build/bin/ch23_reasoned_math            # all sections
-./build/bin/ch23_reasoned_math --phase register   # just the register walkthrough
+./build-debug/bin/ch01_foundations
+./build-debug/bin/ch10_modern_arch
+./build-debug/bin/ch20_rlhf
+./build-debug/bin/ch23_reasoned_math            # all sections
+./build-debug/bin/ch23_reasoned_math --phase register   # just the register walkthrough
 ```
 
 ### Run tests
 
 ```bash
-ctest --test-dir build --output-on-failure
-```
-
-### Native release build (for training runs)
-
-Enables `-march=native`, LTO, and fast-math — 3–4× throughput vs debug.
-**Do not distribute binaries from this build.**
-
-```bash
-cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUB0LLM_ENABLE_NATIVE=ON
-cmake --build build-native --parallel
+ctest --preset debug          # via preset (recommended)
+ctest --test-dir build-debug --output-on-failure   # manual equivalent
 ```
 
 ---
