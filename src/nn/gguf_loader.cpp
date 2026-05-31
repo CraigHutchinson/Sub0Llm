@@ -148,6 +148,7 @@ void read_kv_pair(std::ifstream& f, GGUFModelConfig& cfg, GGUFVocab& vocab) {
                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
 
+    if (ends_with(".vocab_size"))                { cfg.vocab_size  = read_int_val(); return; }
     if (ends_with(".embedding_length"))          { cfg.embed_dim   = read_int_val(); return; }
     if (ends_with(".block_count"))               { cfg.n_layers    = read_int_val(); return; }
     if (ends_with(".attention.head_count"))      { cfg.n_heads     = static_cast<std::size_t>(read_int_val()); return; }
