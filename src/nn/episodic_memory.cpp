@@ -1,6 +1,7 @@
 #include "sub0llm/nn/episodic_memory.hpp"
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/core/tensor.hpp"
+#include "sub0llm/nn/optimizer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,17 +13,23 @@ namespace sub0llm::nn {
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-// Apply (+1) or remove (-1) deltas from model weights. sign = +1.0 or -1.0.
-static void apply_delta(ModernGPT& model,
-                         std::vector<Tensor>& deltas,
-                         float sign)
+static void check_size_match(const std::vector<Tensor>& deltas,
+                              const std::vector<autograd::Variable*>& params)
 {
-    auto params = model.parameters();
     if (params.size() != deltas.size())
         throw std::runtime_error(std::format(
             "EpisodicState: parameter count mismatch — state has {} deltas, "
             "model has {} parameters",
             deltas.size(), params.size()));
+}
+
+// Apply (+1) or remove (-1) deltas from model weights.
+static void apply_delta(ModernGPT& model,
+                         std::vector<Tensor>& deltas,
+                         float sign)
+{
+    auto params = model.parameters();
+    check_size_match(deltas, params);
 
     for (std::size_t i = 0; i < deltas.size(); ++i) {
         if (deltas[i].numel() == 0) continue;
@@ -36,9 +43,6 @@ static void apply_delta(ModernGPT& model,
 // ── EpisodicState ─────────────────────────────────────────────────────────────
 
 void EpisodicState::reset() {
-    // Caller must unmerge before resetting; resetting while merged would leave
-    // the old deltas permanently baked into the model weights with no way to
-    // remove them (merged=false would make subsequent unmerge() a no-op).
     if (merged)
         throw std::runtime_error(
             "EpisodicState::reset() called while state is merged into model — "
@@ -116,7 +120,6 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
                      const EpisodicConfig& cfg)
 {
     if (!cfg.accumulate) {
-        // Safe reset: unmerge first if the state is currently baked into the model.
         if (state.merged) state.unmerge(model);
         state.reset();
     }
@@ -124,18 +127,18 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
 
     auto losses = comprehension_pass(model, tokens);
     auto params  = model.parameters();
-
-    if (params.size() != state.deltas.size())
-        throw std::runtime_error(std::format(
-            "episodic_encode: state has {} deltas but model has {} parameters",
-            state.deltas.size(), params.size()));
+    check_size_match(state.deltas, params);
 
     const int64_t T = static_cast<int64_t>(tokens.size()) - 1;  // # of predictions
 
-    // Pre-compute which parameters require gradients — invariant across spans/steps.
+    // Pre-compute which parameters require gradients — invariant across spans.
     std::vector<bool> needs_grad(params.size());
     for (std::size_t pi = 0; pi < params.size(); ++pi)
         needs_grad[pi] = params[pi]->requires_grad();
+
+    // One Adam optimizer per episodic_encode call; momentum accumulates across
+    // spans within the same document, which helps convergence.
+    SGD span_opt(params, cfg.learning_rate);
 
     // Walk the surprisal signal; greedily extend spans above the threshold.
     int64_t i = 0;
@@ -145,14 +148,13 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
             continue;
         }
 
-        // Extend span while still surprising and within the length cap.
         int64_t j = i + 1;
         while (j < T
                && losses[static_cast<std::size_t>(j)] > cfg.surprise_threshold
                && j - i < static_cast<int64_t>(cfg.max_span_len))
             ++j;
 
-        // span uses input tokens [i .. j-1] to predict [i+1 .. j].
+        // span uses input tokens [i..j-1] to predict [i+1..j].
         const int64_t Ts = j - i;
         if (Ts < static_cast<int64_t>(cfg.min_span_len)) {
             i = j;
@@ -168,61 +170,43 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
             sdt[static_cast<std::size_t>(k)] = tokens[static_cast<std::size_t>(i + k + 1)];
         }
 
-        // Elaborative rehearsal: cfg.think_steps true gradient-descent steps.
+        // ── Elaborative rehearsal ─────────────────────────────────────────
         //
-        // Each step applies the current step's gradient to the model weights
-        // before computing the next gradient, so each step builds on the
-        // previous. After the loop the temporary weight changes are undone and
-        // the net delta is accumulated into state.deltas.
+        // Save parameter values, run think_steps SGD steps (each step sees
+        // the updated weights from the previous one — true gradient descent),
+        // then fold the net delta into state.deltas and restore the model.
         //
-        // Per-span accumulator (tracks only this span's contribution so that
-        // we can undo the temporary model changes after the loop).
-        std::vector<float> span_acc;  // flat, indexed per param via offsets
-
-        // Build a flat buffer and per-param offset table for efficient undo.
-        std::vector<std::size_t> offsets(params.size() + 1, 0);
-        for (std::size_t pi = 0; pi < params.size(); ++pi)
-            offsets[pi + 1] = offsets[pi] + (needs_grad[pi]
-                ? static_cast<std::size_t>(params[pi]->data().numel()) : 0);
-        span_acc.assign(offsets.back(), 0.0f);
+        // SGD is used rather than Adam because Adam normalises updates to
+        // approximately ±lr per step regardless of gradient magnitude.  For
+        // short write sessions (think_steps ≤ 20) this makes the effective
+        // update sensitive to the lr choice and can overshoot badly.  SGD's
+        // update scales with gradient magnitude, keeping smaller-gradient
+        // parameters small and larger-gradient parameters larger.
+        std::vector<std::vector<float>> orig_vals;
+        orig_vals.reserve(params.size());
+        for (auto* p : params) {
+            auto pd = p->data().data_as<float>();
+            orig_vals.emplace_back(pd.begin(), pd.end());
+        }
 
         for (int t = 0; t < cfg.think_steps; ++t) {
-            for (auto* p : params) p->zero_grad();
-
+            span_opt.zero_grad();
             auto logits = model.forward(span_ids);
             auto loss   = autograd::cross_entropy(logits, span_tgt);
             loss.backward();
-
-            // Apply this step's gradient to BOTH the model (so next step sees
-            // updated weights) and the per-span accumulator (for final undo).
-            for (std::size_t pi = 0; pi < params.size(); ++pi) {
-                if (!needs_grad[pi]) continue;
-                const Tensor& g = params[pi]->grad();
-                if (g.numel() == 0) continue;
-                auto gd = g.data_as<float>();
-                auto wd = params[pi]->data().data_as<float>();
-                const std::size_t n = static_cast<std::size_t>(g.numel());
-                const float lr = cfg.learning_rate;
-                float* acc = span_acc.data() + offsets[pi];
-                for (std::size_t k = 0; k < n; ++k) {
-                    const float delta = -lr * gd[k];
-                    acc[k]  += delta;   // track for undo
-                    wd[k]   += delta;   // apply to model → next step sees updated weights
-                }
-            }
+            span_opt.step();
         }
 
-        // Restore model weights and fold per-span delta into state.deltas.
+        // delta += (params_after - orig); restore model to original weights.
         for (std::size_t pi = 0; pi < params.size(); ++pi) {
             if (!needs_grad[pi]) continue;
-            const std::size_t n = offsets[pi + 1] - offsets[pi];
+            const std::size_t n = orig_vals[pi].size();
             if (n == 0) continue;
             auto wd = params[pi]->data().data_as<float>();
             auto dd = state.deltas[pi].data_as<float>();
-            const float* acc = span_acc.data() + offsets[pi];
             for (std::size_t k = 0; k < n; ++k) {
-                wd[k] -= acc[k];   // undo temporary model change
-                dd[k] += acc[k];   // accumulate into persistent episodic delta
+                dd[k] += wd[k] - orig_vals[pi][k];  // accumulate net span delta
+                wd[k]  = orig_vals[pi][k];           // restore model weights
             }
         }
 
