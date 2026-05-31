@@ -4,6 +4,7 @@
 #include "sub0llm/nn/optimizer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <format>
 #include <fstream>

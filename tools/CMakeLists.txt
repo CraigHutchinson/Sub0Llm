@@ -20,4 +20,4 @@ set_target_properties(sub0llm-server PROPERTIES
 
 # ── sub0llm-episodic ──────────────────────────────────────────────────────────
 # Episodic memory CLI: write/recall/info subcommands for GGUF models.
-add_subdirectory(episodic_tool)
+add_subdirectory(episodic)

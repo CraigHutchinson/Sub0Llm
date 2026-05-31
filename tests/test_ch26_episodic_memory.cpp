@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -362,4 +365,92 @@ TEST_CASE("episodic delta does not catastrophically degrade unrelated tokens", "
                          static_cast<float>(ls.size());
     }
     CHECK_THAT(nll_b_restored, WithinAbs(nll_b_base, 1e-3f));
+}
+
+// ── Tier 5: Session persistence ───────────────────────────────────────────────
+
+TEST_CASE("save/load roundtrip preserves delta values exactly", "[ch26][tier5]") {
+    ModernGPT model(32, 32, 2, 1, 2, 64, 0, 7);
+    auto state = make_episodic_state(model);
+
+    // Write a known pattern into the deltas
+    EpisodicConfig cfg;
+    cfg.surprise_threshold = 0.0f;
+    cfg.think_steps        = 2;
+    cfg.learning_rate      = 1e-2f;
+    episodic_encode(model, state, {5, 12, 3, 7, 20}, cfg);
+
+    // Snapshot pre-save delta values
+    std::vector<float> before;
+    for (auto& d : state.deltas) {
+        auto dd = d.data_as<float>();
+        before.insert(before.end(), dd.begin(), dd.end());
+    }
+
+    const std::string tmp_path = "/tmp/test_epis_roundtrip.epis";
+    save_episodic_state(state, tmp_path);
+
+    auto loaded = load_episodic_state(tmp_path);
+    std::remove(tmp_path.c_str());
+
+    REQUIRE(loaded.deltas.size() == state.deltas.size());
+    CHECK(loaded.merged == state.merged);
+
+    std::vector<float> after;
+    for (auto& d : loaded.deltas) {
+        auto dd = d.data_as<float>();
+        after.insert(after.end(), dd.begin(), dd.end());
+    }
+
+    REQUIRE(before.size() == after.size());
+    for (std::size_t i = 0; i < before.size(); ++i)
+        CHECK_THAT(after[i], WithinAbs(before[i], 1e-6f));
+}
+
+TEST_CASE("loaded delta merges into model and reduces loss", "[ch26][tier5]") {
+    ModernGPT model(32, 32, 2, 1, 2, 64, 0, 7);
+    std::vector<int32_t> tokens = {5, 12, 3, 7, 20};
+
+    float loss_before = 0.0f;
+    {
+        auto ls = comprehension_pass(model, tokens);
+        for (float v : ls) loss_before += v;
+        loss_before /= static_cast<float>(ls.size());
+    }
+
+    // Write delta and save
+    auto state = make_episodic_state(model);
+    EpisodicConfig cfg;
+    cfg.surprise_threshold = 0.0f;
+    cfg.think_steps        = 3;
+    cfg.learning_rate      = 5e-3f;
+    episodic_encode(model, state, tokens, cfg);
+
+    const std::string tmp_path = "/tmp/test_epis_merge.epis";
+    save_episodic_state(state, tmp_path);
+
+    // Load into a fresh state and merge
+    auto loaded = load_episodic_state(tmp_path);
+    std::remove(tmp_path.c_str());
+
+    loaded.merge(model);
+    float loss_after = 0.0f;
+    {
+        auto ls = comprehension_pass(model, tokens);
+        for (float v : ls) loss_after += v;
+        loss_after /= static_cast<float>(ls.size());
+    }
+    loaded.unmerge(model);
+
+    CHECK(loss_after < loss_before);
+}
+
+TEST_CASE("load_episodic_state throws on bad magic", "[ch26][tier5]") {
+    const std::string tmp_path = "/tmp/test_epis_bad.epis";
+    {
+        std::ofstream f(tmp_path, std::ios::binary);
+        f.write("BADMAGIC", 8);
+    }
+    CHECK_THROWS_AS(load_episodic_state(tmp_path), std::runtime_error);
+    std::remove(tmp_path.c_str());
 }
