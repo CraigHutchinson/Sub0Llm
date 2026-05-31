@@ -97,10 +97,12 @@ static int cmd_info(const Args& args) {
     std::cout << std::format(
         "arch:       {}\nvocab_size: {}\nembed_dim:  {}\n"
         "n_heads:    {}\nn_kv_heads: {}\nn_layers:   {}\n"
-        "d_ff:       {}\ncontext:    {}\n",
+        "d_ff:       {}\ncontext:    {}\nrope_base:  {}\n"
+        "lm_head:    {}\n",
         cfg.arch, cfg.vocab_size, cfg.embed_dim,
         cfg.n_heads, cfg.n_kv_heads, cfg.n_layers,
-        cfg.d_ff, cfg.context_len);
+        cfg.d_ff, cfg.context_len, cfg.rope_base,
+        cfg.has_separate_lm_head ? "separate (output.weight)" : "tied (token_embd.weight)");
     auto model = load_gguf_model(reader);
     std::cout << std::format("n_params:   {}\n", model.parameters().size());
     return 0;

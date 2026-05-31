@@ -27,6 +27,10 @@ struct GGUFModelConfig {
     int64_t     d_ff          = 0;
     int64_t     context_len   = 0;
     float       rope_base     = 10000.0f;
+    // True when the GGUF has a separate output.weight (e.g. Qwen2).
+    // load_gguf_model loads it in place of token_embd.weight so that
+    // ModernGPT's tied-embedding forward() uses the correct output projection.
+    bool        has_separate_lm_head = false;
 };
 
 struct GGUFVocab {

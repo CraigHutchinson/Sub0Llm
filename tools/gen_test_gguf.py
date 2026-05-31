@@ -120,17 +120,29 @@ for l in range(L):
 # final norm — ones
 tensors.append(("output_norm.weight", [D], ones(D)))
 
+# Qwen2-style: separate output.weight (untied lm_head) — different from token_embd
+# Use small random values (non-zero) so has_separate_lm_head branch is exercised.
+qwen2_mode = "--qwen2" in sys.argv
+if qwen2_mode:
+    tensors.append(("output.weight", [D, V], rand_f32(V * D)))
+    # Q/K biases (Qwen2-specific) — loader should skip these cleanly
+    for lq in range(L):
+        tensors.append((f"blk.{lq}.attn_q.bias", [H*Dh], zeros(H*Dh)))
+        tensors.append((f"blk.{lq}.attn_k.bias", [Hkv*Dh], zeros(Hkv*Dh)))
+
 # ── Metadata ──────────────────────────────────────────────────────────────────
-metadata  = pack_kv_string("general.architecture", "llama")
-metadata += pack_kv_string("tokenizer.ggml.model", "llama")
-metadata += pack_kv_u32("llama.embedding_length", D)
-metadata += pack_kv_u32("llama.block_count", L)
-metadata += pack_kv_u32("llama.attention.head_count", H)
-metadata += pack_kv_u32("llama.attention.head_count_kv", Hkv)
-metadata += pack_kv_u32("llama.feed_forward_length", dff)
-metadata += pack_kv_u32("llama.context_length", 512)
-metadata += pack_kv_u32("llama.vocab_size", V)
-metadata += pack_kv_f32("llama.rope.freq_base", 10000.0)
+arch = "qwen2" if qwen2_mode else "llama"
+rope_base = 1000000.0 if qwen2_mode else 10000.0
+metadata  = pack_kv_string("general.architecture", arch)
+metadata += pack_kv_string("tokenizer.ggml.model", arch)
+metadata += pack_kv_u32(f"{arch}.embedding_length", D)
+metadata += pack_kv_u32(f"{arch}.block_count", L)
+metadata += pack_kv_u32(f"{arch}.attention.head_count", H)
+metadata += pack_kv_u32(f"{arch}.attention.head_count_kv", Hkv)
+metadata += pack_kv_u32(f"{arch}.feed_forward_length", dff)
+metadata += pack_kv_u32(f"{arch}.context_length", 512)
+metadata += pack_kv_u32(f"{arch}.vocab_size", V)
+metadata += pack_kv_f32(f"{arch}.rope.freq_base", rope_base)
 metadata_kv_count = 10
 
 # ── Tensor data offsets ───────────────────────────────────────────────────────
