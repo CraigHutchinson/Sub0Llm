@@ -32,13 +32,16 @@ struct EpisodicState {
     std::vector<Tensor> deltas;  // zero-initialised; same shapes as model.parameters()
     bool merged = false;
 
-    // Zero all deltas (call between unrelated sessions).
+    // Zero all deltas. Throws if the state is currently merged; call unmerge()
+    // first so the in-flight delta is properly removed from the model weights.
     void reset();
 
     // Add deltas to model weight data (idempotent: no-op if already merged).
+    // Throws if the model's parameter count differs from deltas.size().
     void merge(ModernGPT& model);
 
     // Subtract deltas from model weight data.
+    // Throws if the model's parameter count differs from deltas.size().
     void unmerge(ModernGPT& model);
 };
 

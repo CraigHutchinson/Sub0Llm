@@ -139,37 +139,55 @@ static ModernGPT train_fact_recall_model() {
     std::printf("Sequence: [BOS, FACT, 8×FILLER, RECALL, FACT] (12 tokens)\n");
     std::printf("Task: predict FACT after RECALL (long-range recall over 9 tokens)\n\n");
 
-    // Full-attention model (window_size=-1 = no sliding window during training).
-    ModernGPT model(V, 64, 4, 2, 3, 128, 0, 42, -1);
+    // D=128 gives head_dim=32 (vs 16), meaningfully improving the model's
+    // ability to distinguish 20 distinct fact embeddings over the 9-token span.
+    // Full-attention (window_size=-1) during training; no sliding window.
+    ModernGPT model(V, 128, 4, 2, 4, 256, 0, 42, -1);
 
     const int64_t n_params = [&] {
         int64_t n = 0;
         for (auto* p : model.parameters()) n += p->data().numel();
         return n;
     }();
-    std::printf("Model: V=%lld D=64 heads=4 kv=2 layers=3  (%lld parameters)\n\n",
+    std::printf("Model: V=%lld D=128 heads=4 kv=2 layers=4  (%lld parameters)\n\n",
                 static_cast<long long>(V), static_cast<long long>(n_params));
 
     Adam opt(model.parameters(), 2e-3f);
     std::mt19937 rng(123);
 
-    const int N_STEPS = 600;
+    const int N_STEPS = 800;
     std::printf("%-8s  %-12s\n", "step", "train_loss");
     std::printf("%-8s  %-12s\n", "--------", "----------");
 
     for (int step = 0; step < N_STEPS; ++step) {
         int32_t fact = 1 + static_cast<int32_t>(rng() % static_cast<uint32_t>(N_FACTS));
-        auto seq = make_seq(fact);
 
-        // Input: tokens 0..10; targets: tokens 1..11.
-        const int64_t T = SEQ_LEN - 1;
+        // 70% long-form: [BOS, FACT, FILL×8, RECALL, FACT] (full 12-token sequence)
+        // 30% short-form: [FILL×3, RECALL, FACT] (limited-context form)
+        //
+        // The short-form examples ensure that (a) FILL at position 0 is seen
+        // during training → in-distribution for the episodic write sequence, and
+        // (b) the RECALL→FACT association at position 3 is directly trained, so the
+        // episodic write [FILL×3, RECALL, FACT] fires on an in-distribution pattern.
+        std::vector<int32_t> input_ids_v, target_ids_v;
+        if (rng() % 10 < 3) {
+            // Short-form: input = [FILL×3, RECALL], target = [FILL×2, RECALL, FACT]
+            input_ids_v  = {FILLER, FILLER, FILLER, RECALL};
+            target_ids_v = {FILLER, FILLER, RECALL, fact};
+        } else {
+            auto seq = make_seq(fact);
+            input_ids_v.assign(seq.begin(), seq.begin() + SEQ_LEN - 1);
+            target_ids_v.assign(seq.begin() + 1, seq.end());
+        }
+
+        const int64_t T = static_cast<int64_t>(input_ids_v.size());
         Tensor ids({T}, DType::Int32);
         Tensor tgt({T}, DType::Int32);
         auto id_data = ids.data_as<int32_t>();
         auto tg_data = tgt.data_as<int32_t>();
         for (int64_t k = 0; k < T; ++k) {
-            id_data[static_cast<std::size_t>(k)] = seq[static_cast<std::size_t>(k)];
-            tg_data[static_cast<std::size_t>(k)] = seq[static_cast<std::size_t>(k + 1)];
+            id_data[static_cast<std::size_t>(k)] = input_ids_v[static_cast<std::size_t>(k)];
+            tg_data[static_cast<std::size_t>(k)] = target_ids_v[static_cast<std::size_t>(k)];
         }
 
         opt.zero_grad();
@@ -241,26 +259,20 @@ static CondResult evaluate(ModernGPT& model,
         // Build the test prompt: seq[0..10] (excludes the answer at position 11)
         std::vector<int32_t> prompt(seq.begin(), seq.begin() + 11);
 
-        // Targeted episodic write: encode [FILL×3, RECALL, FACT] — the SAME
-        // token positions as the test context plus the answer.  This ensures
-        // RoPE encodings match exactly: the gradient at position 3
-        // (predicting FACT given [FILL×3, RECALL]) is computed for the
-        // identical positional context we use at inference time.
+        // Targeted episodic write: [FILL×3, RECALL, FACT]
         //
-        // NLL at position 3 ≈ log(20) ≈ 3.0 (uniform prior without full ctx)
-        // → triggers write cleanly.  Positions 0–2 (FILL→FILL) have NLL ≈ 0
-        // → do not trigger write.
-        // Targeted write: [FILL×3, RECALL, FACT].
-        // threshold=0.0 fires on all positions; lr=1e-2 keeps delta small
-        // enough that OOD positions (FILL at pos 0 → NLL≈5) don't over-shoot.
-        // The position-3 gradient (predict FACT after [FILL×3, RECALL]) is
-        // exactly the limited-context inference scenario.
+        // Mixed-context training (30% short-form) ensures FILL at position 0 is
+        // in-distribution, so this write sequence triggers clean gradients at all
+        // positions.  The key gradient is at position 3: "given [FILL×3, RECALL],
+        // predict FACT" — exactly the limited-context inference scenario.
+        // threshold=0.0 fires on all positions; true multi-step gradient descent
+        // (think_steps=10) with lr=3e-2 gives a strong, clean write.
         if (state_ptr) {
             state_ptr->reset();
             EpisodicConfig cfg;
             cfg.surprise_threshold = 0.0f;
-            cfg.think_steps        = 5;
-            cfg.learning_rate      = 1e-2f;
+            cfg.think_steps        = 10;
+            cfg.learning_rate      = 3e-2f;
             cfg.min_span_len       = 1;
             std::vector<int32_t> write_seq =
                 {FILLER, FILLER, FILLER, RECALL, fact};
@@ -355,9 +367,9 @@ int main() {
 
         auto ds = make_episodic_state(model);
         EpisodicConfig dc;
-        dc.surprise_threshold = 0.0f;   // force write on every position
-        dc.think_steps        = 5;
-        dc.learning_rate      = 1e-2f;
+        dc.surprise_threshold = 0.0f;
+        dc.think_steps        = 10;
+        dc.learning_rate      = 3e-2f;
         episodic_encode(model, ds, write_seq, dc);
         ds.merge(model);
 
@@ -414,8 +426,8 @@ int main() {
     }();
 
     EpisodicConfig write_cfg;
-    write_cfg.surprise_threshold = 0.0f;   // write on ALL positions
-    write_cfg.think_steps        = 5;
+    write_cfg.surprise_threshold = 0.0f;   // write on ALL positions of the full sequence
+    write_cfg.think_steps        = 10;
     write_cfg.learning_rate      = 3e-2f;
 
     auto proof_state = make_episodic_state(model);

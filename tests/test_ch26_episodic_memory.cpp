@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 using namespace sub0llm;
@@ -84,6 +85,21 @@ TEST_CASE("reset zeros out accumulated deltas", "[ch26][tier2]") {
             CHECK(v == 0.0f);
     }
     CHECK(!state.merged);
+}
+
+TEST_CASE("reset throws when merged to prevent silent corruption", "[ch26][tier2]") {
+    ModernGPT model(32, 32, 2, 1, 2, 64);
+    auto state = make_episodic_state(model);
+
+    auto dd = state.deltas[0].data_as<float>();
+    for (auto& v : dd) v = 0.1f;
+    state.merge(model);
+
+    // reset() while merged must throw — caller must unmerge first
+    CHECK_THROWS_AS(state.reset(), std::runtime_error);
+
+    state.unmerge(model);
+    CHECK_NOTHROW(state.reset());  // safe after unmerge
 }
 
 // ── Tier 3: episodic_encode changes the deltas ────────────────────────────────
