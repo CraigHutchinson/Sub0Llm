@@ -323,23 +323,23 @@ Both tools require a model directory produced by `ch24_real_training --phase tra
 python3 tools/download_model.py --preset qwen2-0.5b
 
 # Show model config
-./build/bin/sub0llm-episodic info --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf
+./build/bin/sub0llm-episodic info --model models\Qwen3-0.6B-Q8_0.gguf
 
 # Validity probe — tests 4 conditions with a novel fact
-./build/bin/sub0llm-episodic probe \
-    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
-    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \
+./build/bin/sub0llm-episodic probe `
+    --model models\Qwen3-0.6B-Q8_0.gguf `
+    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" `
     --query "what is sub0llm used for"
 
 # Write a fact to a persistent delta file
 ./build/bin/sub0llm-episodic write \
-    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
+    --model models\Qwen3-0.6B-Q8_0.gguf \
     --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \
     --delta /tmp/sub0llm.epis
 
 # Recall — measure NLL with and without the delta
 ./build/bin/sub0llm-episodic recall \
-    --model /tmp/models/qwen2-0_5b-instruct-q4_k_m.gguf \
+    --model models\Qwen3-0.6B-Q8_0.gguf \
     --query "what is sub0llm" \
     --delta /tmp/sub0llm.epis
 ```

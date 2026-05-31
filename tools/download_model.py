@@ -39,21 +39,20 @@ import sys
 PRESETS = {
     "qwen2-0.5b": ("Qwen/Qwen2-0.5B-Instruct-GGUF",  "qwen2-0_5b-instruct-q4_k_m.gguf"),
     "qwen2-1.5b": ("Qwen/Qwen2-1.5B-Instruct-GGUF",  "qwen2-1_5b-instruct-q4_k_m.gguf"),
-    "qwen3-0.6b": ("Qwen/Qwen3-0.6B-GGUF",            "qwen3-0.6b-q4_k_m.gguf"),
+    "qwen3-0.6b": ("Qwen/Qwen3-0.6B-GGUF",            "Qwen3-0.6B-Q8_0.gguf"),
     "qwen3-1.7b": ("Qwen/Qwen3-1.7B-GGUF",            "qwen3-1.7b-q4_k_m.gguf"),
     "qwen3-4b":   ("Qwen/Qwen3-4B-GGUF",              "qwen3-4b-q4_k_m.gguf"),
 }
 
-
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--preset", choices=list(PRESETS), default="qwen2-0.5b",
+    p.add_argument("--preset", choices=list(PRESETS), default="qwen3-0.6b",
                    help="Model preset (default: qwen2-0.5b)")
     p.add_argument("--model", help="Override HuggingFace repo ID")
     p.add_argument("--quant", help="Override filename within the repo")
-    p.add_argument("--out",   default="/tmp/models",
-                   help="Output directory (default: /tmp/models)")
+    p.add_argument("--out",   default="models",
+                   help="Output directory (default: models)")
     p.add_argument("--token", default=os.environ.get("HF_TOKEN"),
                    help="HuggingFace token (or set HF_TOKEN env var)")
     return p.parse_args()
