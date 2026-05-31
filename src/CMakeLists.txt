@@ -35,6 +35,7 @@ set(SUB0LLM_SOURCES
     nn/checkpoint.cpp
     nn/long_context.cpp
     nn/episodic_memory.cpp
+    nn/gguf_loader.cpp
 )
 
 

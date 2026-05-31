@@ -17,3 +17,7 @@ sub0llm_apply_compile_options(sub0llm-server)
 set_target_properties(sub0llm-server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# ── sub0llm-episodic ──────────────────────────────────────────────────────────
+# Episodic memory CLI: write/recall/info subcommands for GGUF models.
+add_subdirectory(episodic_tool)

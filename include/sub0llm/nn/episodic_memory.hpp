@@ -69,4 +69,14 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
                      const std::vector<int32_t>& tokens,
                      const EpisodicConfig& cfg = {});
 
+// ── Session persistence ───────────────────────────────────────────────────────
+//
+// Binary format: 8-byte magic "SUB0EPIS" + 4-byte version (1) + 8-byte n_deltas
+//   per delta: 4-byte n_dims + n_dims×8-byte shape + n_elements×4-byte data
+// + 1-byte merged flag.
+//
+// Throws std::runtime_error on I/O error or format mismatch.
+void save_episodic_state(const EpisodicState& state, const std::string& path);
+[[nodiscard]] EpisodicState load_episodic_state(const std::string& path);
+
 } // namespace sub0llm::nn

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 
@@ -239,6 +240,122 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
 
         i = j;
     }
+}
+
+// ── Session persistence ───────────────────────────────────────────────────────
+
+static constexpr std::array<char, 8> k_epis_magic = {'S','U','B','0','E','P','I','S'};
+static constexpr uint32_t            k_epis_version = 1;
+
+void save_episodic_state(const EpisodicState& state, const std::string& path)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open())
+        throw std::runtime_error(
+            std::format("save_episodic_state: cannot open '{}' for writing", path));
+
+    // Magic + version
+    f.write(k_epis_magic.data(), 8);
+    f.write(reinterpret_cast<const char*>(&k_epis_version), sizeof(k_epis_version));
+
+    // n_deltas
+    const uint64_t n_deltas = static_cast<uint64_t>(state.deltas.size());
+    f.write(reinterpret_cast<const char*>(&n_deltas), sizeof(n_deltas));
+
+    for (const Tensor& d : state.deltas) {
+        // n_dims + shape (each dim as int64 = 8 bytes)
+        const uint32_t n_dims = static_cast<uint32_t>(d.ndim());
+        f.write(reinterpret_cast<const char*>(&n_dims), sizeof(n_dims));
+        for (std::size_t i = 0; i < n_dims; ++i) {
+            const int64_t dim = d.shape(i);
+            f.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+        }
+
+        // float32 data
+        const auto sp = d.data_as<float>();
+        f.write(reinterpret_cast<const char*>(sp.data()),
+                static_cast<std::streamsize>(sp.size() * sizeof(float)));
+    }
+
+    // merged flag
+    const uint8_t merged_byte = state.merged ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&merged_byte), sizeof(merged_byte));
+
+    if (!f)
+        throw std::runtime_error(
+            std::format("save_episodic_state: I/O error writing '{}'", path));
+}
+
+[[nodiscard]] EpisodicState load_episodic_state(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open())
+        throw std::runtime_error(
+            std::format("load_episodic_state: cannot open '{}'", path));
+
+    // Validate magic
+    std::array<char, 8> magic{};
+    f.read(magic.data(), 8);
+    if (!f || magic != k_epis_magic)
+        throw std::runtime_error(
+            std::format("load_episodic_state: bad magic in '{}'", path));
+
+    // Validate version
+    uint32_t version = 0;
+    f.read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (!f || version != k_epis_version)
+        throw std::runtime_error(
+            std::format("load_episodic_state: unsupported version {} in '{}'",
+                        version, path));
+
+    // n_deltas
+    uint64_t n_deltas = 0;
+    f.read(reinterpret_cast<char*>(&n_deltas), sizeof(n_deltas));
+    if (!f)
+        throw std::runtime_error(
+            std::format("load_episodic_state: truncated header in '{}'", path));
+
+    EpisodicState state;
+    state.deltas.reserve(n_deltas);
+
+    for (uint64_t di = 0; di < n_deltas; ++di) {
+        uint32_t n_dims = 0;
+        f.read(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
+        if (!f)
+            throw std::runtime_error(
+                std::format("load_episodic_state: truncated dims for delta {} in '{}'",
+                            di, path));
+
+        std::vector<int64_t> shape(n_dims);
+        for (uint32_t i = 0; i < n_dims; ++i) {
+            f.read(reinterpret_cast<char*>(&shape[i]), sizeof(int64_t));
+            if (!f)
+                throw std::runtime_error(
+                    std::format("load_episodic_state: truncated shape[{}] for delta {} in '{}'",
+                                i, di, path));
+        }
+
+        Tensor t(shape, DType::Float32);
+        auto sp = t.data_as<float>();
+        f.read(reinterpret_cast<char*>(sp.data()),
+               static_cast<std::streamsize>(sp.size() * sizeof(float)));
+        if (!f)
+            throw std::runtime_error(
+                std::format("load_episodic_state: truncated data for delta {} in '{}'",
+                            di, path));
+
+        state.deltas.emplace_back(std::move(t));
+    }
+
+    // merged flag
+    uint8_t merged_byte = 0;
+    f.read(reinterpret_cast<char*>(&merged_byte), sizeof(merged_byte));
+    if (!f)
+        throw std::runtime_error(
+            std::format("load_episodic_state: truncated merged flag in '{}'", path));
+    state.merged = (merged_byte != 0);
+
+    return state;
 }
 
 } // namespace sub0llm::nn
