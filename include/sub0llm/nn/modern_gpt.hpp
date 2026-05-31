@@ -102,7 +102,8 @@ public:
                           std::size_t   n_kv_heads,
                           float         rope_base   = 10000.0f,
                           std::uint64_t seed        = 42,
-                          int64_t       window_size = -1);
+                          int64_t       window_size = -1,
+                          std::size_t   head_dim    = 0);
 
     // x: (T, embed_dim); causal = apply lower-triangular (or sliding-window) mask.
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x,
@@ -151,7 +152,8 @@ public:
                            std::size_t   n_kv_heads,
                            int64_t       d_ff        = 0,
                            std::uint64_t seed        = 42,
-                           int64_t       window_size = -1);
+                           int64_t       window_size = -1,
+                           std::size_t   head_dim    = 0);
 
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x) const;
 
@@ -194,7 +196,8 @@ public:
               int64_t       d_ff          = 0,
               int64_t       n_mtp_heads   = 0,
               std::uint64_t seed          = 42,
-              int64_t       window_size   = -1);
+              int64_t       window_size   = -1,
+              std::size_t   head_dim      = 0);
 
     // Returns logits (T, vocab_size) — training path via autograd.
     [[nodiscard]] autograd::Variable forward(const Tensor& token_ids) const;

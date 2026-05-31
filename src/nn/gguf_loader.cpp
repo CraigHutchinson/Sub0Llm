@@ -153,6 +153,11 @@ void read_kv_pair(std::ifstream& f, GGUFModelConfig& cfg, GGUFVocab& vocab) {
     if (ends_with(".block_count"))               { cfg.n_layers    = read_int_val(); return; }
     if (ends_with(".attention.head_count"))      { cfg.n_heads     = static_cast<std::size_t>(read_int_val()); return; }
     if (ends_with(".attention.head_count_kv"))   { cfg.n_kv_heads  = static_cast<std::size_t>(read_int_val()); return; }
+    // key_length / value_length encode explicit head_dim (Qwen3-4B+: 128 != embed/n_heads).
+    if (ends_with(".attention.key_length"))      { cfg.head_dim = read_int_val(); return; }
+    if (ends_with(".attention.value_length"))    { const auto vl = read_int_val();
+                                                   if (cfg.head_dim == 0) cfg.head_dim = vl;
+                                                   return; }
     if (ends_with(".feed_forward_length"))       { cfg.d_ff        = read_int_val(); return; }
     if (ends_with(".context_length"))            { cfg.context_len = read_int_val(); return; }
     if (ends_with(".rope.freq_base")) {
@@ -360,10 +365,13 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
     const std::size_t Hkv = cfg.n_kv_heads > 0 ? cfg.n_kv_heads : H;
     const int64_t     L   = cfg.n_layers;
     const int64_t     dff = cfg.d_ff;
+    // head_dim: explicit from GGUF (Qwen3-4B+) or derived from D/H.
+    const std::size_t Dh  = cfg.head_dim > 0
+                                ? static_cast<std::size_t>(cfg.head_dim)
+                                : static_cast<std::size_t>(D) / H;
 
-    ModernGPT model(V, D, H, Hkv, L, dff, /*n_mtp=*/0, /*seed=*/42);
-
-    const std::size_t Dh = static_cast<std::size_t>(D) / H;
+    ModernGPT model(V, D, H, Hkv, L, dff, /*n_mtp=*/0, /*seed=*/42,
+                    /*window_size=*/-1, Dh);
 
     // params per block: norm1(1) + attn(H*2 + Hkv*2) + norm2(1) + ffn(6) = H*2+Hkv*2+8
     const std::size_t per_block = 1 + H * 2 + Hkv * 2 + 1 + 6;

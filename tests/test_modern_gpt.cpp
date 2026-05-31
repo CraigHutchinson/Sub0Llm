@@ -435,6 +435,24 @@ TEST_CASE("GroupedQueryAttention — forward throws on non-2D input", "[modern_g
     REQUIRE_THROWS(gqa.forward(x));
 }
 
+TEST_CASE("GroupedQueryAttention — explicit head_dim != D/H (Qwen3 style)", "[modern_gpt][gqa]") {
+    // D=32, H=2 → derived Dh=16; but we force Dh=8 explicitly.
+    // This models Qwen3-4B+: head_dim fixed, embed_dim/n_heads differs.
+    constexpr int64_t D  = 32;
+    constexpr int64_t T  = 4;
+    GroupedQueryAttention gqa(D, 2, 1, 10000.0f, 7, -1, /*head_dim=*/8);
+    REQUIRE(gqa.head_dim() == 8);
+
+    Tensor xd({T, D}, DType::Float32);
+    for (auto& v : xd.data_as<float>()) v = 0.1f;
+    Variable x(xd, false);
+    auto y = gqa.forward(x);
+
+    // Output must still be (T, D) — W_O projects head_dim→embed_dim.
+    REQUIRE(y.data().shape()[0] == T);
+    REQUIRE(y.data().shape()[1] == D);
+}
+
 // ── ModernTransformerBlock ────────────────────────────────────────────────────
 
 TEST_CASE("ModernTransformerBlock — forward output shape", "[modern_gpt][block]") {

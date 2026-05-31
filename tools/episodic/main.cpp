@@ -94,13 +94,18 @@ static int cmd_info(const Args& args) {
     if (args.model_path.empty()) throw std::runtime_error("--model is required");
     GGUFReader reader(args.model_path);
     const GGUFModelConfig cfg = reader.config();
+    const int64_t head_dim = cfg.head_dim > 0
+                                ? cfg.head_dim
+                                : cfg.embed_dim / static_cast<int64_t>(cfg.n_heads);
     std::cout << std::format(
         "arch:       {}\nvocab_size: {}\nembed_dim:  {}\n"
-        "n_heads:    {}\nn_kv_heads: {}\nn_layers:   {}\n"
+        "n_heads:    {}\nn_kv_heads: {}\nhead_dim:   {}{}\nn_layers:   {}\n"
         "d_ff:       {}\ncontext:    {}\nrope_base:  {}\n"
         "lm_head:    {}\n",
         cfg.arch, cfg.vocab_size, cfg.embed_dim,
-        cfg.n_heads, cfg.n_kv_heads, cfg.n_layers,
+        cfg.n_heads, cfg.n_kv_heads,
+        head_dim, cfg.head_dim > 0 ? " (explicit)" : " (derived)",
+        cfg.n_layers,
         cfg.d_ff, cfg.context_len, cfg.rope_base,
         cfg.has_separate_lm_head ? "separate (output.weight)" : "tied (token_embd.weight)");
     auto model = load_gguf_model(reader);

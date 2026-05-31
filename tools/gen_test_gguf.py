@@ -123,6 +123,12 @@ tensors.append(("output_norm.weight", [D], ones(D)))
 # Qwen2-style: separate output.weight (untied lm_head) — different from token_embd
 # Use small random values (non-zero) so has_separate_lm_head branch is exercised.
 qwen2_mode = "--qwen2" in sys.argv
+# Qwen3-style: explicit head_dim (key/value_length) that differs from D/H.
+# We keep D=32, H=2, but set head_dim=8 (normally D/H=16).
+# This exercises the cfg.head_dim path in the loader.
+qwen3_mode = "--qwen3" in sys.argv
+if qwen3_mode:
+    Dh = 8   # override: explicit head_dim != D/H
 if qwen2_mode:
     tensors.append(("output.weight", [D, V], rand_f32(V * D)))
     # Q/K biases (Qwen2-specific) — loader should skip these cleanly
@@ -131,8 +137,8 @@ if qwen2_mode:
         tensors.append((f"blk.{lq}.attn_k.bias", [Hkv*Dh], zeros(Hkv*Dh)))
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
-arch = "qwen2" if qwen2_mode else "llama"
-rope_base = 1000000.0 if qwen2_mode else 10000.0
+arch = "qwen3" if qwen3_mode else ("qwen2" if qwen2_mode else "llama")
+rope_base = 1000000.0 if (qwen2_mode or qwen3_mode) else 10000.0
 metadata  = pack_kv_string("general.architecture", arch)
 metadata += pack_kv_string("tokenizer.ggml.model", arch)
 metadata += pack_kv_u32(f"{arch}.embedding_length", D)
@@ -144,6 +150,11 @@ metadata += pack_kv_u32(f"{arch}.context_length", 512)
 metadata += pack_kv_u32(f"{arch}.vocab_size", V)
 metadata += pack_kv_f32(f"{arch}.rope.freq_base", rope_base)
 metadata_kv_count = 10
+if qwen3_mode:
+    # key_length / value_length declare explicit head_dim to the loader
+    metadata += pack_kv_u32(f"{arch}.attention.key_length", Dh)
+    metadata += pack_kv_u32(f"{arch}.attention.value_length", Dh)
+    metadata_kv_count += 2
 
 # ── Tensor data offsets ───────────────────────────────────────────────────────
 # We need to know the offset of each tensor in the data section.
@@ -182,7 +193,9 @@ for name, gguf_dims, data in tensors:
     output += pack_f32_data(data)
 
 # ── Write ─────────────────────────────────────────────────────────────────────
-out_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/test_model.gguf"
+# Last positional arg (not a flag) is the output path.
+positional_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+out_path = positional_args[0] if positional_args else "/tmp/test_model.gguf"
 with open(out_path, "wb") as f:
     f.write(output)
 

@@ -27,6 +27,9 @@ struct GGUFModelConfig {
     int64_t     d_ff          = 0;
     int64_t     context_len   = 0;
     float       rope_base     = 10000.0f;
+    // Explicit per-head dimension (Qwen3-4B+: head_dim=128, D/H=80).
+    // 0 = derive from embed_dim / n_heads (standard LLaMA/Qwen2 behaviour).
+    int64_t     head_dim      = 0;
     // True when the GGUF has a separate output.weight (e.g. Qwen2).
     // load_gguf_model loads it in place of token_embd.weight so that
     // ModernGPT's tied-embedding forward() uses the correct output projection.

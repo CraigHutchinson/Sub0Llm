@@ -166,7 +166,8 @@ GroupedQueryAttention::GroupedQueryAttention(std::size_t embed_dim,
                                              std::size_t n_kv_heads,
                                              float       rope_base,
                                              std::uint64_t seed,
-                                             int64_t     window_size)
+                                             int64_t     window_size,
+                                             std::size_t head_dim)
     : embed_dim_(embed_dim), n_heads_(n_heads),
       n_kv_heads_(n_kv_heads), rope_base_(rope_base),
       window_size_(window_size) {
@@ -174,16 +175,21 @@ GroupedQueryAttention::GroupedQueryAttention(std::size_t embed_dim,
         throw std::runtime_error(std::format(
             "GroupedQueryAttention: embed_dim={}, n_heads={}, n_kv_heads={} "
             "must all be positive", embed_dim, n_heads, n_kv_heads));
-    if (embed_dim % n_heads != 0)
-        throw std::runtime_error(std::format(
-            "GroupedQueryAttention: embed_dim={} must be divisible by n_heads={}",
-            embed_dim, n_heads));
+    if (head_dim == 0) {
+        // Derive head_dim from embed_dim / n_heads — standard LLaMA/Qwen2 path.
+        if (embed_dim % n_heads != 0)
+            throw std::runtime_error(std::format(
+                "GroupedQueryAttention: embed_dim={} must be divisible by n_heads={}",
+                embed_dim, n_heads));
+        head_dim_ = embed_dim / n_heads;
+    } else {
+        // Explicit head_dim (Qwen3-4B+): head_dim != embed_dim / n_heads is allowed.
+        head_dim_ = head_dim;
+    }
     if (n_heads % n_kv_heads != 0)
         throw std::runtime_error(std::format(
             "GroupedQueryAttention: n_heads={} must be divisible by n_kv_heads={}",
             n_heads, n_kv_heads));
-
-    head_dim_ = embed_dim / n_heads;
     if (head_dim_ % 2 != 0)
         throw std::runtime_error(std::format(
             "GroupedQueryAttention: head_dim={} must be even for RoPE", head_dim_));
@@ -383,10 +389,11 @@ ModernTransformerBlock::ModernTransformerBlock(int64_t     D,
                                                std::size_t n_kv_heads,
                                                int64_t     d_ff,
                                                std::uint64_t seed,
-                                               int64_t     window_size)
+                                               int64_t     window_size,
+                                               std::size_t head_dim)
     : norm1_(D),
       attn_(static_cast<std::size_t>(D), n_heads, n_kv_heads, 10000.0f, seed,
-            window_size),
+            window_size, head_dim),
       norm2_(D),
       ffn_(D, d_ff, seed + 1000) {}
 
@@ -427,7 +434,8 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
                      int64_t     d_ff,
                      int64_t     n_mtp,
                      std::uint64_t seed,
-                     int64_t     window_size)
+                     int64_t     window_size,
+                     std::size_t head_dim)
     : tok_emb_(vocab_size, mgpt_validate(vocab_size, embed_dim), seed),
       ln_f_(embed_dim) {
     if (n_heads == 0)
@@ -445,13 +453,14 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
             "ModernGPT: n_mtp_heads={} must be >= 0", n_mtp));
 
     n_kv_heads_ = n_kv_heads;
-    head_dim_   = static_cast<std::size_t>(embed_dim) / n_heads;
+    head_dim_   = head_dim > 0 ? head_dim
+                               : static_cast<std::size_t>(embed_dim) / n_heads;
 
     blocks_.reserve(static_cast<std::size_t>(n_layers));
     for (int64_t l = 0; l < n_layers; ++l)
         blocks_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff,
                              seed + 2 + static_cast<std::uint64_t>(l) * 2000,
-                             window_size);
+                             window_size, head_dim);
 
     mtp_heads_.reserve(static_cast<std::size_t>(n_mtp));
     for (int64_t k = 0; k < n_mtp; ++k)
