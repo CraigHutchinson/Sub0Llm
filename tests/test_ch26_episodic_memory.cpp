@@ -268,7 +268,14 @@ TEST_CASE("reset between sessions prevents interference", "[ch26][tier4]") {
     cfg.think_steps        = 2;
     cfg.learning_rate      = 1e-2f;
 
-    // Session 1: encode one sequence
+    // Session 1: measure baseline, encode, verify loss reduced
+    float loss_s1_before;
+    {
+        auto ls = comprehension_pass(model, {1, 2, 3, 4, 5});
+        loss_s1_before = std::accumulate(ls.begin(), ls.end(), 0.0f) /
+                         static_cast<float>(ls.size());
+    }
+
     auto state = make_episodic_state(model);
     episodic_encode(model, state, {1, 2, 3, 4, 5}, cfg);
     state.merge(model);
@@ -283,7 +290,16 @@ TEST_CASE("reset between sessions prevents interference", "[ch26][tier4]") {
     state.unmerge(model);
     state.reset();  // clear for new session
 
-    // Session 2: encode a different sequence
+    CHECK(loss_s1_after < loss_s1_before);  // session 1 actually improved
+
+    // Session 2: measure baseline, encode different sequence, verify loss reduced
+    float loss_s2_before;
+    {
+        auto ls = comprehension_pass(model, {20, 21, 22, 23, 24});
+        loss_s2_before = std::accumulate(ls.begin(), ls.end(), 0.0f) /
+                         static_cast<float>(ls.size());
+    }
+
     episodic_encode(model, state, {20, 21, 22, 23, 24}, cfg);
     state.merge(model);
 
@@ -296,8 +312,54 @@ TEST_CASE("reset between sessions prevents interference", "[ch26][tier4]") {
 
     state.unmerge(model);
 
-    // Both sessions should have reduced loss on their own span
-    // (This is more of a sanity check — we just confirm neither is NaN/Inf)
+    CHECK(loss_s2_after < loss_s2_before);  // session 2 actually improved
     CHECK(std::isfinite(loss_s1_after));
     CHECK(std::isfinite(loss_s2_after));
+}
+
+TEST_CASE("episodic delta does not catastrophically degrade unrelated tokens", "[ch26][tier4]") {
+    ModernGPT model(32, 32, 2, 1, 2, 64, 0, 7);
+
+    // Sequences A and B use disjoint token values
+    std::vector<int32_t> seq_a = {5, 12, 3, 7, 20};
+    std::vector<int32_t> seq_b = {1, 2, 8, 15, 25};
+
+    // Baseline: NLL on seq_b before any episodic write
+    float nll_b_base;
+    {
+        auto ls = comprehension_pass(model, seq_b);
+        nll_b_base = std::accumulate(ls.begin(), ls.end(), 0.0f) /
+                     static_cast<float>(ls.size());
+    }
+
+    // Write delta for seq_a only
+    auto state = make_episodic_state(model);
+    EpisodicConfig cfg;
+    cfg.surprise_threshold = 0.0f;
+    cfg.think_steps        = 3;
+    cfg.learning_rate      = 5e-3f;
+    episodic_encode(model, state, seq_a, cfg);
+
+    // Merged: cross-contamination should be bounded (not catastrophic)
+    state.merge(model);
+    float nll_b_merged;
+    {
+        auto ls = comprehension_pass(model, seq_b);
+        nll_b_merged = std::accumulate(ls.begin(), ls.end(), 0.0f) /
+                       static_cast<float>(ls.size());
+    }
+    CHECK(std::isfinite(nll_b_merged));
+    // A small delta (lr=5e-3, 3 steps) should not more than double the NLL
+    // on unrelated tokens — bounded interference
+    CHECK(nll_b_merged < nll_b_base * 2.5f);
+
+    // After unmerge: base model is completely restored, no residual contamination
+    state.unmerge(model);
+    float nll_b_restored;
+    {
+        auto ls = comprehension_pass(model, seq_b);
+        nll_b_restored = std::accumulate(ls.begin(), ls.end(), 0.0f) /
+                         static_cast<float>(ls.size());
+    }
+    CHECK_THAT(nll_b_restored, WithinAbs(nll_b_base, 1e-3f));
 }

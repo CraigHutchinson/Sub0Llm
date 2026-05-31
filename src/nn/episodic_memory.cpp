@@ -136,9 +136,35 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
     for (std::size_t pi = 0; pi < params.size(); ++pi)
         needs_grad[pi] = params[pi]->requires_grad();
 
-    // One Adam optimizer per episodic_encode call; momentum accumulates across
-    // spans within the same document, which helps convergence.
+    // One SGD optimizer per episodic_encode call; optimizer state persists
+    // across spans within the same document.
     SGD span_opt(params, cfg.learning_rate);
+
+    // Save base weights ONCE before the span loop.
+    // Every span restores to these same base weights, so a single copy suffices.
+    // Only grad-enabled parameters are saved; non-grad params are never modified.
+    std::vector<std::vector<float>> orig_vals;
+    orig_vals.reserve(params.size());
+    for (std::size_t pi = 0; pi < params.size(); ++pi) {
+        if (needs_grad[pi]) {
+            auto pd = params[pi]->data().data_as<float>();
+            orig_vals.emplace_back(pd.begin(), pd.end());
+        } else {
+            orig_vals.emplace_back();  // empty placeholder — never read
+        }
+    }
+
+    // Restore all grad-enabled params to orig_vals.
+    // Called after each span (normal completion) and on exception (safety).
+    auto restore_weights = [&] {
+        for (std::size_t pi = 0; pi < params.size(); ++pi) {
+            if (!needs_grad[pi]) continue;
+            auto wd = params[pi]->data().data_as<float>();
+            const auto& ov = orig_vals[pi];
+            for (std::size_t k = 0; k < ov.size(); ++k)
+                wd[k] = ov[k];
+        }
+    };
 
     // Walk the surprisal signal; greedily extend spans above the threshold.
     int64_t i = 0;
@@ -172,9 +198,9 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
 
         // ── Elaborative rehearsal ─────────────────────────────────────────
         //
-        // Save parameter values, run think_steps SGD steps (each step sees
-        // the updated weights from the previous one — true gradient descent),
-        // then fold the net delta into state.deltas and restore the model.
+        // Run think_steps SGD steps on the span — each step sees the model
+        // updated by the previous one (true gradient descent).  Then fold the
+        // net delta into state.deltas and restore the model to base weights.
         //
         // SGD is used rather than Adam because Adam normalises updates to
         // approximately ±lr per step regardless of gradient magnitude.  For
@@ -182,19 +208,20 @@ void episodic_encode(ModernGPT& model, EpisodicState& state,
         // update sensitive to the lr choice and can overshoot badly.  SGD's
         // update scales with gradient magnitude, keeping smaller-gradient
         // parameters small and larger-gradient parameters larger.
-        std::vector<std::vector<float>> orig_vals;
-        orig_vals.reserve(params.size());
-        for (auto* p : params) {
-            auto pd = p->data().data_as<float>();
-            orig_vals.emplace_back(pd.begin(), pd.end());
-        }
-
-        for (int t = 0; t < cfg.think_steps; ++t) {
-            span_opt.zero_grad();
-            auto logits = model.forward(span_ids);
-            auto loss   = autograd::cross_entropy(logits, span_tgt);
-            loss.backward();
-            span_opt.step();
+        //
+        // If forward/backward throws, restore_weights() ensures base model
+        // weights are never left in a partially-updated state.
+        try {
+            for (int t = 0; t < cfg.think_steps; ++t) {
+                span_opt.zero_grad();
+                auto logits = model.forward(span_ids);
+                auto loss   = autograd::cross_entropy(logits, span_tgt);
+                loss.backward();
+                span_opt.step();
+            }
+        } catch (...) {
+            restore_weights();
+            throw;
         }
 
         // delta += (params_after - orig); restore model to original weights.
