@@ -59,7 +59,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
 
-## Current state (Ch01–Ch25, complete)
+## Current state (Ch01–Ch26, complete)
 
 ### Core
 - `include/sub0llm/core/dtype.hpp` — DType enum, traits, `dtype_of<T>` concept mapping
@@ -107,6 +107,7 @@ Tests use the debug build (`ctest --test-dir build`) — never run tests on nati
 - `include/sub0llm/nn/kv_cache.hpp` — `KVCache`: pre-allocated K/V buffers per layer/kv_head for O(n) autoregressive inference (Ch25)
 - `include/sub0llm/nn/long_context.hpp`, `src/nn/long_context.cpp` — `LongContextConfig`, `generate_cached()`: KV-cached generation loop with temperature/top-k sampling and on_token callback (Ch25)
 - `chapters/ch25_long_context/` — Long-Context Inference: KV cache (~9× speedup demo), sliding-window attention (banded causal mask, O(n·W) memory), RoPE NTK-aware scaling (extend beyond training length without fine-tuning), memory budget table for production models (Ch25)
+- `chapters/ch26_episodic_memory/` — Episodic Memory design chapter: three-tier memory framework (working/episodic/semantic), CLS theory, prior art survey (fast weights, TTT layers, Titans Dec 2024, ROME/MEMIT, SHINE/Text-to-LoRA), schema acceleration model, proposed architecture (comprehension pass → thinking loop → targeted write), Online LoRA Path A plan, Titans NLM Path B roadmap (Ch26)
 
 ### Autograd extensions
 - `row_scale(x, v)` — scale each row i of (N,D) Variable x by scalar v[i,0]; used by MoE routing
