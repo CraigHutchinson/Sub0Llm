@@ -44,6 +44,14 @@ public:
         const std::filesystem::path& vocab_json,
         const std::filesystem::path& merges_txt);
 
+    // Construct from pre-built vocab and merge list — used when loading from
+    // GGUF files whose vocab is embedded in the file header.
+    // id_to_token: token string at each id position.
+    // merge_pairs: each entry is "A B" (a space-separated pair).
+    [[nodiscard]] static BPETokenizer from_vocab(
+        const std::vector<std::string>& id_to_token,
+        const std::vector<std::string>& merge_pairs);
+
     // ── Encode / decode ───────────────────────────────────────────────────────
 
     // Convert a string to a sequence of token IDs.

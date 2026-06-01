@@ -586,7 +586,7 @@ static void section_full_training(int steps, const std::string& ckpt_dir, bool d
             const double tok_s  = elapsed > 0 ? static_cast<double>(tokens_trained) / elapsed : 0.0;
             const int64_t remaining = static_cast<int64_t>(steps) - step - 1;
             const double eta_sec = (tok_s > 0 && remaining > 0)
-                ? static_cast<double>(remaining) * seq_len / tok_s : 0.0;
+                ? static_cast<double>(remaining) * static_cast<double>(seq_len) / tok_s : 0.0;
             std::string eta_str = eta_sec > 3600 ? std::format("{:.1f}h", eta_sec / 3600)
                                 : eta_sec > 60   ? std::format("{:.1f}m", eta_sec / 60)
                                 :                  std::format("{:.0f}s", eta_sec);

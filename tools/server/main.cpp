@@ -1,7 +1,7 @@
 // sub0llm-server — OpenAI-compatible HTTP inference server.
 //
-// Loads a trained ModernGPT checkpoint at startup and serves inference over
-// HTTP using the same JSON schema as the OpenAI Completions API.
+// Loads a trained ModernGPT checkpoint or a GGUF model file at startup and
+// serves inference over HTTP using the same JSON schema as the OpenAI API.
 //
 // Endpoints:
 //   GET  /health                  → {"status":"ok","model":"sub0llm"}
@@ -10,16 +10,19 @@
 //   POST /v1/chat/completions     → chat completion (messages → concatenated prompt)
 //
 // Usage:
-//   sub0llm-server --model-dir DIR [--host HOST] [--port PORT]
+//   sub0llm-server --model-dir DIR      [options]  (checkpoint directory)
+//   sub0llm-server --model-dir F.gguf   [options]  (GGUF model file)
 //
 // Options:
-//   --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt (required)
+//   --model-dir PATH  directory with config.json/tokenizer/step_*.ckpt,
+//                     or a .gguf file (detected by extension) (required)
 //   --host HOST       bind address (default: 0.0.0.0)
 //   --port PORT       listen port  (default: 8080)
 //   --threads N       worker threads for concurrent requests (default: 4)
 //   --seed N          base RNG seed; each request uses seed+request_count (default: 42)
 
 #include "sub0llm/nn/checkpoint.hpp"
+#include "sub0llm/nn/gguf_loader.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"
 #include "sub0llm/nn/sampler.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
@@ -64,10 +67,12 @@ void print_usage() {
     std::cerr << R"(sub0llm-server — OpenAI-compatible inference server
 
 Usage:
-  sub0llm-server --model-dir DIR [options]
+  sub0llm-server --model-dir DIR     [options]  (checkpoint directory)
+  sub0llm-server --model-dir F.gguf  [options]  (GGUF model file)
 
 Required:
-  --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt
+  --model-dir PATH  directory with config.json/tokenizer/step_*.ckpt,
+                    or a .gguf file (detected by .gguf extension)
 
 Options:
   --host HOST       bind address (default: 0.0.0.0)
@@ -129,6 +134,11 @@ ModelArch load_arch(const std::filesystem::path& dir) {
     return a;
 }
 
+// Returns true when path points to a GGUF file (detected by .gguf extension).
+static bool is_gguf_path(const std::filesystem::path& p) {
+    return p.extension() == ".gguf";
+}
+
 // ── InferenceEngine ───────────────────────────────────────────────────────────
 // Thread-safe wrapper: ModernGPT::forward() uses mutable caches (RoPE, mask)
 // so all inference must be serialised through the mutex.
@@ -137,48 +147,67 @@ class InferenceEngine {
 public:
     InferenceEngine(const std::filesystem::path& dir, uint64_t seed)
         : seed_(seed) {
-        const auto arch = load_arch(dir);
+        if (is_gguf_path(dir)) {
+            // ── GGUF model file ───────────────────────────────────────────────
+            sub0llm::nn::GGUFReader reader(dir.string());
+            const auto& gv  = reader.vocab();
+            const auto& cfg = reader.config();
 
-        model_ = std::make_unique<sub0llm::nn::ModernGPT>(
-            arch.vocab_size, arch.embed_dim,
-            arch.n_heads,   arch.n_kv_heads,
-            arch.n_layers,  arch.d_ff,
-            arch.n_mtp_heads, /*seed=*/42);
+            tok_ = std::make_unique<sub0llm::BPETokenizer>(
+                sub0llm::BPETokenizer::from_vocab(gv.tokens, gv.merges));
 
-        const auto tok_dir = dir / "tokenizer";
-        if (!std::filesystem::exists(tok_dir))
-            throw std::runtime_error(std::format(
-                "tokenizer/ not found in '{}'", dir.string()));
-        tok_ = std::make_unique<sub0llm::BPETokenizer>(
-            sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
-                                         tok_dir / "merges.txt"));
+            sub0llm::nn::ModernGPT tmp = sub0llm::nn::load_gguf_model(reader);
+            model_ = std::make_unique<sub0llm::nn::ModernGPT>(std::move(tmp));
 
-        const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
-        if (ckpt.empty())
-            throw std::runtime_error(
-                std::format("No checkpoint found in '{}'", dir.string()));
+            vocab_size_ = cfg.vocab_size;
+            embed_dim_  = cfg.embed_dim;
+            n_layers_   = cfg.n_layers;
+            step_       = 0;
+        } else {
+            // ── Checkpoint directory ──────────────────────────────────────────
+            const auto arch = load_arch(dir);
 
-        // Load weights: copy-then-reassign to flush into model params
-        std::vector<sub0llm::autograd::Variable> copies;
-        for (auto* p : model_->parameters()) copies.push_back(*p);
-        step_ = sub0llm::load_checkpoint(copies, ckpt);
-        auto raw = model_->parameters();
-        for (std::size_t i = 0; i < raw.size(); ++i)
-            raw[i]->data() = copies[i].data();
+            model_ = std::make_unique<sub0llm::nn::ModernGPT>(
+                arch.vocab_size, arch.embed_dim,
+                arch.n_heads,   arch.n_kv_heads,
+                arch.n_layers,  arch.d_ff,
+                arch.n_mtp_heads, /*seed=*/42);
 
-        vocab_size_ = arch.vocab_size;
-        embed_dim_  = arch.embed_dim;
-        n_layers_   = arch.n_layers;
-        n_params_   = [&] {
+            const auto tok_dir = dir / "tokenizer";
+            if (!std::filesystem::exists(tok_dir))
+                throw std::runtime_error(std::format(
+                    "tokenizer/ not found in '{}'", dir.string()));
+            tok_ = std::make_unique<sub0llm::BPETokenizer>(
+                sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
+                                             tok_dir / "merges.txt"));
+
+            const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
+            if (ckpt.empty())
+                throw std::runtime_error(
+                    std::format("No checkpoint found in '{}'", dir.string()));
+
+            std::vector<sub0llm::autograd::Variable> copies;
+            for (auto* p : model_->parameters()) copies.push_back(*p);
+            step_ = sub0llm::load_checkpoint(copies, ckpt);
+            auto raw = model_->parameters();
+            for (std::size_t i = 0; i < raw.size(); ++i)
+                raw[i]->data() = copies[i].data();
+
+            vocab_size_ = arch.vocab_size;
+            embed_dim_  = arch.embed_dim;
+            n_layers_   = arch.n_layers;
+        }
+
+        n_params_ = [&] {
             int64_t n = 0;
             for (const auto* p : model_->parameters()) n += p->data().numel();
             return n;
         }();
 
         std::cerr << std::format(
-            "Loaded step {} | V={} D={} layers={} | {:.2f}M params | ckpt: {}\n",
+            "Loaded step {} | V={} D={} layers={} | {:.2f}M params | {}\n",
             step_, vocab_size_, embed_dim_, n_layers_,
-            static_cast<double>(n_params_) / 1e6, ckpt);
+            static_cast<double>(n_params_) / 1e6, dir.string());
     }
 
     struct CompletionRequest {

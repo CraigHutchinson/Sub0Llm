@@ -81,12 +81,12 @@ int main() {
     const auto wg = emb.weight().grad().data_as<float>();
     const int64_t D = DIM;
     std::print("grad[token 1] = [");
-    for (int64_t j = 0; j < D; ++j) std::print(" {:.2f}", wg[1 * D + j]);
+    for (int64_t j = 0; j < D; ++j) std::print(" {:.2f}", wg[static_cast<std::size_t>(D + j)]);
     std::println(" ]  (2× upstream since token 1 appears twice)");
 
     // Token 0 (not in sequence) should have zero gradient.
     float tok0_grad_norm = 0.0f;
-    for (int64_t j = 0; j < D; ++j) tok0_grad_norm += wg[0 * D + j] * wg[0 * D + j];
+    for (int64_t j = 0; j < D; ++j) tok0_grad_norm += wg[static_cast<std::size_t>(j)] * wg[static_cast<std::size_t>(j)];
     std::println("grad[token 0] norm = {:.4f}  (expected 0 — unused token)", tok0_grad_norm);
 
     // ── 3. Sinusoidal positional encoding ─────────────────────────────────────
@@ -98,11 +98,11 @@ int main() {
     std::println("PE shape: (seq={}, dim={})", SEQ, D6);
     std::print("PE[0] = [");
     for (int64_t j = 0; j < D6; ++j)
-        std::print(" {:.3f}", pe.data_as<float>()[j]);
+        std::print(" {:.3f}", pe.data_as<float>()[static_cast<std::size_t>(j)]);
     std::println(" ]  (sin at pos 0 → all zeros for even dims)");
     std::print("PE[1] = [");
     for (int64_t j = 0; j < D6; ++j)
-        std::print(" {:.3f}", pe.data_as<float>()[D6 + j]);
+        std::print(" {:.3f}", pe.data_as<float>()[static_cast<std::size_t>(D6 + j)]);
     std::println(" ]");
 
     // Verify: row norms should all equal sqrt(D6/2) for sinusoidal.
@@ -110,7 +110,7 @@ int main() {
     const auto ped = pe.data_as<float>();
     for (int64_t pos = 0; pos < SEQ; ++pos) {
         float sq = 0.0f;
-        for (int64_t j = 0; j < D6; ++j) sq += ped[pos * D6 + j] * ped[pos * D6 + j];
+        for (int64_t j = 0; j < D6; ++j) sq += ped[static_cast<std::size_t>(pos * D6 + j)] * ped[static_cast<std::size_t>(pos * D6 + j)];
         min_norm = std::min(min_norm, std::sqrt(sq));
         max_norm = std::max(max_norm, std::sqrt(sq));
     }
@@ -147,7 +147,7 @@ int main() {
         const auto bs = b.data_as<float>();
         float d = 0.0f;
         for (int64_t j = 0; j < ROPE_D; ++j)
-            d += as[row_a * ROPE_D + j] * bs[row_b * ROPE_D + j];
+            d += as[static_cast<std::size_t>(row_a * ROPE_D + j)] * bs[static_cast<std::size_t>(row_b * ROPE_D + j)];
         return d;
     };
 

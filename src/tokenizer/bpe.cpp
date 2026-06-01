@@ -24,7 +24,8 @@ std::vector<std::string> pre_tokenize(std::string_view text) {
     bool at_start = true;
     std::string cur;
 
-    for (unsigned char c : text) {
+    for (auto raw_c : text) {
+        const auto c = static_cast<unsigned char>(raw_c);
         const bool is_ws = (c == ' ' || c == '\n' || c == '\t' || c == '\r');
         if (is_ws) {
             if (!cur.empty()) { words.push_back(std::move(cur)); cur.clear(); }
@@ -197,7 +198,7 @@ BPETokenizer BPETokenizer::load(
             entries.emplace_back(v.get<TokenId>(), k);
         std::sort(entries.begin(), entries.end());
 
-        tok.id_to_token_.resize(entries.back().first + 1);
+        tok.id_to_token_.resize(static_cast<std::size_t>(entries.back().first) + 1);
         for (auto& [id, str] : entries) {
             tok.vocab_[str]                              = id;
             tok.id_to_token_[static_cast<std::size_t>(id)] = str;
@@ -226,6 +227,48 @@ BPETokenizer BPETokenizer::load(
         tok.eos_id_ = tok.bos_id_ = it->second;
     if (auto it = tok.vocab_.find("<|unk|>"); it != tok.vocab_.end())
         tok.unk_id_ = it->second;
+
+    return tok;
+}
+
+// ── from_vocab ────────────────────────────────────────────────────────────────
+
+BPETokenizer BPETokenizer::from_vocab(
+    const std::vector<std::string>& id_to_token,
+    const std::vector<std::string>& merge_pairs)
+{
+    BPETokenizer tok;
+    tok.id_to_token_ = id_to_token;
+    tok.vocab_.reserve(id_to_token.size());
+    for (std::size_t i = 0; i < id_to_token.size(); ++i)
+        tok.vocab_[id_to_token[i]] = static_cast<TokenId>(i);
+
+    tok.merges_.reserve(merge_pairs.size());
+    for (const auto& p : merge_pairs) {
+        const auto sp = p.find(' ');
+        if (sp == std::string::npos) continue;
+        tok.merges_.emplace_back(p.substr(0, sp), p.substr(sp + 1));
+    }
+
+    // Locate special token ids; different model families use different names.
+    for (const char* name : {"<|endoftext|>", "<eos>", "</s>", "<EOS>"}) {
+        if (auto it = tok.vocab_.find(name); it != tok.vocab_.end()) {
+            tok.eos_id_ = tok.bos_id_ = it->second;
+            break;
+        }
+    }
+    for (const char* name : {"<|unk|>", "<unk>", "<UNK>"}) {
+        if (auto it = tok.vocab_.find(name); it != tok.vocab_.end()) {
+            tok.unk_id_ = it->second;
+            break;
+        }
+    }
+    for (const char* name : {"<pad>", "<PAD>"}) {
+        if (auto it = tok.vocab_.find(name); it != tok.vocab_.end()) {
+            tok.pad_id_ = it->second;
+            break;
+        }
+    }
 
     return tok;
 }
