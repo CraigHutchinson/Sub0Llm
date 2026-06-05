@@ -82,15 +82,23 @@ layers 8** — a deliberate KV-cache optimization (global layers attend over the
 256K context, so fewer KV heads slash their cache; windowed local layers keep 8).
 The 5-local : 1-global pattern is uniform across all 48 layers (global = index%6==5).
 
-### Gemma 4 tokenizer gate — FAILS (new prerequisite)
+### Gemma 4 tokenizer gate — PASSES (SentencePiece tokenizer built)
 
 `tokenizer.ggml.model = gemma4` is a **SentencePiece** tokenizer; our `BPETokenizer`
-is **GPT-2 byte-level BPE**. Verified mismatch on "The capital of France is":
-llama → `<bos> The(818) ' capital'(5279) ' of'(529) ' France'(7001) ' is'(563)`;
-ours → `818 245237 41626 245237 …` (the `▁` space marker leaks as token 245237, no
-`<bos>`, wrong merges). So **a SentencePiece-compatible tokenizer is a hard
-prerequisite** for Gemma — the architecture work is moot until tokenization matches.
-This is the same gate that confirmed Qwen3 (whose `gpt2` tokenizer *did* match exactly).
+is GPT-2 byte-level BPE and produced garbage (`▁` leaked as token 245237). Built
+`SPTokenizer` (`tokenizer/sentencepiece.{hpp,cpp}`): score-based priority-queue merge
+of adjacent symbols, `▁` (U+2581) word marker, byte fallback (`<0xNN>`), BOS prepend —
+matching llama.cpp's `llm_tokenizer_spm`. The GGUF loader now also captures
+`tokenizer.ggml.scores` / `token_type` / `bos`/`eos`/`add_bos`.
+
+**Parity vs `llama-tokenize` — exact match**, ASCII and non-ASCII:
+- "The capital of France is" → `2 818 5279 529 7001 563` ✓
+- "the café costs $5" (UTF-8) → `2 1437 33443 5384 609 236810` ✓ (incl. " café"=33443)
+
+(The earlier "café" divergence was the Windows console mangling UTF-8 in argv — clean
+via `--file`.) `sub0llm-verify` auto-selects SPM for `gemma*`/`llama` vocabs, BPE
+otherwise. Unit-tested (`test_sentencepiece.cpp`, 493 tests total). The tokenizer
+prerequisite is cleared; the per-layer forward is next.
 
 **Tokenizer performance note (staged win, off the generation hot path).** Tokenization
 is a one-time prompt-ingestion cost — negligible vs per-token generation — so it does

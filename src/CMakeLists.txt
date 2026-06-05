@@ -7,6 +7,7 @@ set(SUB0LLM_SOURCES
     backends/cuda/backend.cpp
     backends/openvino/backend.cpp
     tokenizer/bpe.cpp
+    tokenizer/sentencepiece.cpp
     data/dataset.cpp
     data/dataloader.cpp
     autograd/variable.cpp

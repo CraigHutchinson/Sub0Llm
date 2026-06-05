@@ -15,6 +15,9 @@
 #include "sub0llm/nn/gguf_loader.hpp"
 #include "sub0llm/nn/sampler.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
+#include "sub0llm/tokenizer/sentencepiece.hpp"
+
+#include <optional>
 
 #include <algorithm>
 #include <cmath>
@@ -110,8 +113,13 @@ int main(int argc, char** argv) {
         const Args args = parse(argc, argv);
 
         sub0llm::nn::GGUFReader reader(args.model);
-        auto tok   = sub0llm::BPETokenizer::from_vocab(reader.vocab().tokens,
-                                                       reader.vocab().merges);
+        const auto& voc = reader.vocab();
+        // SentencePiece (Gemma) vs GPT-2 byte-level BPE (Qwen/GPT-2).
+        const bool is_spm = voc.model.rfind("gemma", 0) == 0 || voc.model == "llama";
+        auto tok = sub0llm::BPETokenizer::from_vocab(voc.tokens, voc.merges);
+        std::optional<sub0llm::SPTokenizer> sp;
+        if (is_spm)
+            sp = sub0llm::SPTokenizer::from_vocab(voc.tokens, voc.scores, voc.bos_id, voc.eos_id, voc.add_bos);
 
         std::string text = args.text;
         if (!args.file.empty()) {
@@ -119,7 +127,13 @@ int main(int argc, char** argv) {
             if (!in) throw std::runtime_error(std::format("cannot open --file {}", args.file));
             text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
         }
-        auto ids = tok.encode(text);
+        auto encode = [&](const std::string& s) {
+            return is_spm ? sp->encode(s) : tok.encode(s);
+        };
+        auto decode1 = [&](int32_t id) {
+            return is_spm ? sp->decode({id}) : tok.decode({id});
+        };
+        auto ids = encode(text);
         if (args.cap > 0 && static_cast<int64_t>(ids.size()) > args.cap)
             ids.resize(static_cast<std::size_t>(args.cap));
 
@@ -129,7 +143,7 @@ int main(int argc, char** argv) {
             std::cout << "\n";
             if (args.pieces)
                 for (int32_t id : ids)
-                    std::cout << "  " << id << " -> '" << tok.decode({id}) << "'\n";
+                    std::cout << "  " << id << " -> '" << decode1(id) << "'\n";
             return 0;
         }
 

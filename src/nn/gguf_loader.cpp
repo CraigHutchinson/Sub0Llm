@@ -133,6 +133,12 @@ void read_kv_pair(std::ifstream& f, GGUFVocab& vocab,
                        for (uint64_t k = 0; k < n; ++k)
                            if (et == 8) vocab.merges.push_back(read_gguf_string(f));
                            else { skip_gguf_value(f, et); vocab.merges.emplace_back(); }
+                   } else if (key == "tokenizer.ggml.scores" && et == 6) {
+                       vocab.scores.reserve(n);
+                       for (uint64_t k = 0; k < n; ++k) vocab.scores.push_back(read_pod<float>(f, key));
+                   } else if (key == "tokenizer.ggml.token_type" && et == 5) {
+                       vocab.token_types.reserve(n);
+                       for (uint64_t k = 0; k < n; ++k) vocab.token_types.push_back(read_pod<int32_t>(f, key));
                    } else {
                        for (uint64_t k = 0; k < n; ++k) skip_gguf_value(f, et);
                    }
@@ -145,6 +151,11 @@ void read_kv_pair(std::ifstream& f, GGUFVocab& vocab,
             throw std::runtime_error(
                 std::format("gguf_loader: unknown metadata type {} for key '{}'", type, key));
     }
+
+    // Tokenizer special-token scalars (just captured into `ints` above).
+    if (key == "tokenizer.ggml.bos_token_id")  vocab.bos_id = static_cast<int32_t>(ints[key]);
+    else if (key == "tokenizer.ggml.eos_token_id") vocab.eos_id = static_cast<int32_t>(ints[key]);
+    else if (key == "tokenizer.ggml.add_bos_token") vocab.add_bos = ints[key] != 0;
 }
 
 // Interpret captured metadata into GGUFModelConfig. Architecture-specific keys are

@@ -3,6 +3,7 @@ add_executable(tests
     test_ops.cpp
     test_backends.cpp
     test_quant.cpp
+    test_sentencepiece.cpp
     test_tokenizer.cpp
     test_dataset.cpp
     test_autograd.cpp

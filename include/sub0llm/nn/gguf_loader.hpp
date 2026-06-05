@@ -44,8 +44,15 @@ struct GGUFModelConfig {
 
 struct GGUFVocab {
     std::vector<std::string> tokens;  // token_id → token_string
-    std::vector<std::string> merges;  // "A B" format, in priority order
-    std::string              model;   // "llama", "gpt2", etc.
+    std::vector<std::string> merges;  // "A B" format, in priority order (BPE only)
+    std::string              model;   // "llama"/"gpt2"/"gemma4"/…
+    // SentencePiece (SPM) extras — present for "gemma*"/"llama" tokenizers; the SPM
+    // tokenizer merges adjacent symbols by score, not by a merge list.
+    std::vector<float>       scores;       // per-token score (log-prob); SPM merge key
+    std::vector<int32_t>     token_types;  // 1=normal 2=unknown 3=control 4=user 6=byte
+    int32_t                  bos_id = -1;
+    int32_t                  eos_id = -1;
+    bool                     add_bos = false;
 };
 
 // Loads a GGUF file: parses header, metadata (architecture config + vocab),
