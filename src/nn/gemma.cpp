@@ -5,14 +5,26 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <format>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#if defined(_M_X64) || defined(__x86_64__) || defined(__i386__)
+#  include <immintrin.h>
+#  define GEMMA_CPU_RELAX() _mm_pause()
+#else
+#  define GEMMA_CPU_RELAX() std::this_thread::yield()
+#endif
+
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
 namespace sub0llm::nn {
 
@@ -26,85 +38,103 @@ namespace cpu = backend::cpu;
 
 constexpr int64_t QK = cpu::QK8_0;   // 32
 
-// Persistent thread pool for the Q8 GEMVs. A single-token decode is bandwidth-bound:
-// one core can't saturate DRAM, so the win comes from many cores streaming weights
-// concurrently. A FRESH std::thread pool per GEMV (the naive approach) is dominated by
-// spawn/join — ~340 GEMVs/token — so we keep workers alive and hand them a row range
-// via a generation-counter barrier. Workers grab CHUNK-row tiles from an atomic cursor
-// (dynamic load balance); the calling thread participates too, then waits for the pool.
+void pin_thread_to_cpu(int cpu) {
+#ifdef _WIN32
+    SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << (cpu & 63));
+#else
+    (void)cpu;
+#endif
+}
+
+// Persistent thread pool for the Q8 GEMVs, tuned for a single-token decode (which is
+// DRAM-bandwidth-bound: one core can't saturate memory, so the win is many cores
+// streaming weights concurrently). Three things make this scale where the naive
+// per-GEMV fork-join didn't, matching ggml's threadpool design:
+//   1. Persistent workers — spawned once, not per GEMV (~340 / token).
+//   2. SPIN-WAIT barrier (not a condition variable) — at ~340 sync points per token,
+//      a CV's ~10 us kernel wake dominates; workers instead busy-poll an atomic
+//      generation counter with _mm_pause, so dispatch latency is tens of ns.
+//   3. Thread AFFINITY — each worker (and the caller) is pinned to a distinct logical
+//      CPU (SetThreadAffinityMask). This stops the OS migrating threads (which thrashes
+//      the per-core L2 holding the hot quantized activation) and, on this hybrid
+//      8 P-core + 16 E-core part, places the first/few threads on the P-cores.
+// The caller participates as one of the N threads (so N total = nworkers + 1), and rows
+// are handed out as CHUNK-row tiles from an atomic cursor — dynamic load-balancing that
+// naturally compensates for the slower E-cores.
 class GemmaPool {
 public:
-    explicit GemmaPool(int n) : n_(n) {
-        for (int i = 0; i < n_; ++i) workers_.emplace_back([this] { worker(); });
+    explicit GemmaPool(int total_threads) : nworkers_(std::max(0, total_threads - 1)) {
+        pin_thread_to_cpu(0);                       // caller runs on CPU 0
+        for (int i = 0; i < nworkers_; ++i)
+            workers_.emplace_back([this, i] { worker(i + 1); });
     }
     ~GemmaPool() {
-        { std::unique_lock lk(m_); stop_ = true; ++gen_; }
-        cv_start_.notify_all();
+        stop_.store(true, std::memory_order_relaxed);
+        gen_.fetch_add(1, std::memory_order_release);   // release the spinning workers
         for (auto& t : workers_) t.join();
     }
-    [[nodiscard]] int size() const noexcept { return n_; }
+    [[nodiscard]] int total() const noexcept { return nworkers_ + 1; }
 
     // y[m] = dot(W + m*nb, xq, nb) for m in [0, M), across the pool + caller.
     void run(const cpu::BlockQ8_0* W, const cpu::BlockQ8_0* xq, float* y,
              int64_t M, int64_t nb) {
-        {
-            std::unique_lock lk(m_);
-            W_ = W; xq_ = xq; y_ = y; M_ = M; nb_ = nb;
-            next_.store(0, std::memory_order_relaxed);
-            remaining_ = n_;
-            ++gen_;
-        }
-        cv_start_.notify_all();
-        work();                                   // caller participates
-        std::unique_lock lk(m_);
-        cv_done_.wait(lk, [this] { return remaining_ == 0; });
+        W_ = W; xq_ = xq; y_ = y; M_ = M; nb_ = nb;
+        next_.store(0, std::memory_order_relaxed);
+        remaining_.store(nworkers_, std::memory_order_relaxed);
+        gen_.fetch_add(1, std::memory_order_release);   // publishes W_..nb_ to workers
+        work();                                         // caller participates
+        while (remaining_.load(std::memory_order_acquire) != 0) GEMMA_CPU_RELAX();
     }
 
 private:
     static constexpr int64_t CHUNK = 32;
 
     void work() {
+        const cpu::BlockQ8_0* W = W_;
+        const cpu::BlockQ8_0* xq = xq_;
+        float* y = y_; const int64_t M = M_, nb = nb_;
         for (;;) {
             const int64_t i = next_.fetch_add(CHUNK, std::memory_order_relaxed);
-            if (i >= M_) break;
-            const int64_t hi = std::min(M_, i + CHUNK);
+            if (i >= M) break;
+            const int64_t hi = std::min(M, i + CHUNK);
             for (int64_t m = i; m < hi; ++m)
-                y_[m] = cpu::dot_q8_0_q8_0(W_ + m * nb_, xq_, nb_);
+                y[m] = cpu::dot_q8_0_q8_0(W + m * nb, xq, nb);
         }
     }
-    void worker() {
-        int local_gen = 0;
+    void worker(int cpu) {
+        pin_thread_to_cpu(cpu);
+        int local = 0;
         for (;;) {
-            {
-                std::unique_lock lk(m_);
-                cv_start_.wait(lk, [&] { return gen_ != local_gen; });
-                local_gen = gen_;
-                if (stop_) return;
-            }
+            while (gen_.load(std::memory_order_acquire) == local) GEMMA_CPU_RELAX();
+            local = gen_.load(std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_relaxed)) return;
             work();
-            std::unique_lock lk(m_);
-            if (--remaining_ == 0) cv_done_.notify_one();
+            remaining_.fetch_sub(1, std::memory_order_release);  // publishes y writes
         }
     }
 
-    int n_;
-    std::vector<std::thread>    workers_;
-    std::mutex                  m_;
-    std::condition_variable     cv_start_, cv_done_;
-    int                         gen_ = 0;
-    bool                        stop_ = false;
-    int                         remaining_ = 0;
-    std::atomic<int64_t>        next_{0};
-    const cpu::BlockQ8_0*       W_  = nullptr;
-    const cpu::BlockQ8_0*       xq_ = nullptr;
-    float*                      y_  = nullptr;
-    int64_t                     M_ = 0, nb_ = 0;
+    int                          nworkers_;
+    std::vector<std::thread>     workers_;
+    std::atomic<int>             gen_{0};
+    std::atomic<bool>            stop_{false};
+    std::atomic<int>             remaining_{0};
+    std::atomic<int64_t>         next_{0};
+    const cpu::BlockQ8_0*        W_  = nullptr;
+    const cpu::BlockQ8_0*        xq_ = nullptr;
+    float*                       y_  = nullptr;
+    int64_t                      M_ = 0, nb_ = 0;
 };
 
 int desired_threads() {
     if (g_gemma_threads > 0) return g_gemma_threads;
     unsigned hw = std::thread::hardware_concurrency();
-    return static_cast<int>(std::clamp<unsigned>(hw ? hw : 1u, 1u, 32u));
+    if (hw == 0) return 1;
+    // Single-token decode is DRAM-bandwidth-bound and saturates well before all cores;
+    // meanwhile spin-wait workers starve the OS if they occupy every core. Leaving a few
+    // cores free is measurably faster (on a 24-core part, 20 threads beat 24). Default to
+    // hw-4 for large core counts; use everything on small machines.
+    const unsigned n = hw > 8 ? hw - 4 : hw;
+    return static_cast<int>(std::clamp<unsigned>(n, 1u, 32u));
 }
 
 // Get (lazily build / rebuild on thread-count change) the process-wide pool. Called
@@ -113,7 +143,7 @@ GemmaPool* get_pool() {
     static std::unique_ptr<GemmaPool> pool;
     const int want = desired_threads();
     if (want <= 1) { pool.reset(); return nullptr; }
-    if (!pool || pool->size() != want) pool = std::make_unique<GemmaPool>(want);
+    if (!pool || pool->total() != want) pool = std::make_unique<GemmaPool>(want);
     return pool.get();
 }
 

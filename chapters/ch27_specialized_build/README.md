@@ -161,31 +161,63 @@ tokens are emitted identically by both, so the per-token work is the same).
 | engine | 1 thread | best multi-thread | RSS | scaling |
 |--------|---------:|------------------:|----:|--------:|
 | llama.cpp (eval time) | 1.37 | 6.00 (24t) | 11.78 GiB | 4.4× |
-| our `GemmaModel` (naive fork-join) | **1.60** | 1.96 | 12.1 GiB | 1.2× |
-| **our `GemmaModel` (persistent pool)** | **1.60** | **5.32 (16t)** | 12.1 GiB | **3.3×** |
+| our `GemmaModel` (naive fork-join) | 1.60 | 1.96 | 12.1 GiB | 1.2× |
+| our `GemmaModel` (CV pool) | 1.60 | 5.32 (16t) | 12.1 GiB | 3.3× |
+| **our `GemmaModel` (spin + affinity)** | **1.60** | **5.59 (20t)** | 12.1 GiB | **3.5×** |
 
-Two honest findings:
+**Per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s (117%).** The
+single-thread baseline is the cleanest kernel comparison; our Q8 quantize-on-load +
+`dot_q8_0_q8_0` holds up against heavily-tuned ggml (which here has AVX-VNNI + weight
+repack) on one core. The multi-thread gap was *scaling*, not kernels, and closing it took
+three things — each matching ggml's threadpool design and each **zero logit change**
+(every `y[m]` is the same row dot, just on a different worker — bitwise-deterministic,
+greedy stays byte-identical to llama.cpp):
 
-1. **Per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s (117%).**
-   The single-thread baseline is the cleanest kernel comparison; our Q8 quantize-on-load
-   + `dot_q8_0_q8_0` holds up against heavily-tuned ggml (which here even has AVX-VNNI +
-   weight repack) on one core.
+1. **Persistent pool** (workers spawned once, not ~340×/token): 1.96 → 5.32.
+2. **Spin-wait barrier** instead of a condition variable — at ~340 sync points/token a
+   CV's ~10 µs kernel wake dominates; workers busy-poll an atomic generation counter with
+   `_mm_pause`, dropping dispatch latency to tens of ns.
+3. **Thread affinity** (`SetThreadAffinityMask`, one thread per logical CPU) + an
+   off-by-one fix (the caller counts as a thread): stops OS migration thrashing each
+   core's L2, and on this hybrid part places the first 8 threads on the P-cores. → 5.59.
 
-2. **The multi-thread gap was thread *scaling*, not kernel efficiency.** The first cut
-   spawned a fresh `std::thread` pool for *every* GEMV (~340 / token) and ran the small
-   K/V projections single-threaded — it barely scaled (1.2×). Replacing it with a
-   **persistent thread pool** (workers parked on a generation-counter barrier, grabbing
-   32-row tiles from an atomic cursor; the caller participates) took us from 1.96 → **5.32
-   tok/s (3.3× scaling, 89% of llama)** with **zero logit change** (each `y[m]` is the
-   same row dot, just assigned to a different worker — bitwise-deterministic, greedy
-   stays byte-identical). 16 threads beats 24 here (memory-bandwidth contention /
-   hyperthreading). Single-token decode is bandwidth-bound — one core can't saturate
-   DRAM, so the win is many cores streaming weights concurrently.
+### Why it scales the way it does (the physics)
 
-The remaining ~11% is the next lever: explicit **thread affinity / pipelining** tuned for
-this Intel-on-Windows machine (pin workers to cores, keep them off the OS scheduler's
-migration, possibly split weight-streaming across cores to maximize aggregate DRAM
-bandwidth). Use `sub0llm-gemma -t N` to pick the thread count (`-t 1` for the baseline).
+This CPU is an **Intel Core Ultra 9 275HX — Arrow Lake-HX: 8 P-cores + 16 E-cores, 24
+threads, no SMT**. Single-token decode reads **every weight exactly once** (zero
+arithmetic reuse), so throughput is **hard-capped by DRAM bandwidth ÷ model bytes**, not
+compute. Measured (tok/s × 12.65 GB/token):
+
+| threads | tok/s | speedup | eff. BW | note |
+|--------:|------:|--------:|--------:|------|
+| 1 | 1.60 | 1.0× | 20 GB/s | one core ≈ ¼ of DRAM BW |
+| 2 | 2.25 | 1.41× | 28 GB/s | |
+| 4 | 3.64 | 2.27× | 46 GB/s | |
+| 8 | 4.42 | 2.76× | 56 GB/s | **P-cores only** (logical CPUs 0–7) |
+| 16 | 5.52 | 3.45× | 70 GB/s | + E-cores; near the BW wall |
+| 20 | **5.59** | 3.49× | **71 GB/s** | best — leaves 4 cores for the OS |
+| 24 | 4.70 | — | 59 GB/s | **regresses**: spin workers on every core starve the OS + main thread |
+| llama (24) | 6.00 | — | 76 GB/s | extracts ~7% more BW (VNNI/prefetch) |
+
+Two regimes explain why *2 cores ≠ 3.2 tok/s*:
+- **Low core count → Amdahl.** Only the GEMVs parallelize; the per-token serial work
+  (RMSNorms, RoPE, per-head QK-norm, the attention softmax, GeGLU, residuals, activation
+  quantization) runs on the caller. That serial fraction (~25–30%) caps low-end scaling,
+  so 1→2 cores gives 1.41×, not 2×.
+- **High core count → bandwidth wall.** By ~8–16 cores the memory controller saturates
+  at **~70 GB/s**, so extra cores add almost nothing (8→20 cores: +1.17 tok/s total).
+  The **P-cores are ~4× more bandwidth-efficient per core** than the E-cores (P: ~7.0
+  GB/s/core to 56 GB/s at 8 cores; each added E-core: ~0.1 tok/s), so `-t 8` (P-cores
+  only) is the efficiency sweet spot and `-t 20` the throughput sweet spot. The hard
+  ceiling is ~5.5–6 tok/s on this machine — exactly where both engines land — because
+  no amount of compute beats *bandwidth ÷ 12.65 GB*. (The dynamic 32-row tile cursor is
+  what lets the fast P-cores and slow E-cores share work without the barrier waiting on a
+  straggler.)
+
+`sub0llm-gemma -t N` picks the thread count (`-t 1` = single-core baseline, `-t 8` =
+P-cores only); the default leaves 4 cores free. The last ~7% vs llama is its extra
+bandwidth extraction (AVX-VNNI lets each core issue more outstanding loads, plus weight
+repacking for friendlier access) — a kernel/prefetch refinement, not a threading one.
 Multimodal (vision/audio) and the 26B-A4B MoE variant are out of scope (text-only, dense).
 
 ## The stack
