@@ -26,7 +26,7 @@ static Variable make_input(int64_t rows, int64_t cols, float fill = 1.0f) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("LoRALinear — throws on bad args") {
+TEST_CASE("LoRALinear - throws on bad args") {
     CHECK_THROWS_AS(LoRALinear(0, 4, 0),  std::runtime_error);  // in <= 0
     CHECK_THROWS_AS(LoRALinear(-1, 4, 0), std::runtime_error);  // in < 0
     CHECK_THROWS_AS(LoRALinear(4, 0, 0),  std::runtime_error);  // out <= 0
@@ -37,7 +37,7 @@ TEST_CASE("LoRALinear — throws on bad args") {
     CHECK_THROWS_AS(LoRALinear(4, 4, 2, -1.0f), std::runtime_error); // alpha < 0
 }
 
-TEST_CASE("LoRALinear — rank=0 is frozen linear") {
+TEST_CASE("LoRALinear - rank=0 is frozen linear") {
     LoRALinear layer(8, 4, /*rank=*/0);
 
     CHECK(layer.lora_parameters().empty());
@@ -50,7 +50,7 @@ TEST_CASE("LoRALinear — rank=0 is frozen linear") {
     CHECK(out.data().shape()[1] == 4);
 }
 
-TEST_CASE("LoRALinear — delta is zero at init") {
+TEST_CASE("LoRALinear - delta is zero at init") {
     // B is initialised to zeros, so ΔW = (alpha/r)*A@B = 0 regardless of A.
     // Therefore forward(x) == x @ W^T at initialisation.
     LoRALinear layer(8, 4, /*rank=*/2, /*alpha=*/1.0f, /*seed=*/42);
@@ -68,7 +68,7 @@ TEST_CASE("LoRALinear — delta is zero at init") {
     for (float v : b_data) CHECK(v == 0.0f);
 }
 
-TEST_CASE("LoRALinear — base has no gradient after backward") {
+TEST_CASE("LoRALinear - base has no gradient after backward") {
     LoRALinear layer(8, 4, /*rank=*/2);
     auto x   = make_input(3, 8);
     auto out = layer.forward(x);
@@ -78,7 +78,7 @@ TEST_CASE("LoRALinear — base has no gradient after backward") {
     CHECK(layer.all_parameters()[0]->grad().numel() == 0);
 }
 
-TEST_CASE("LoRALinear — lora params have gradients after backward") {
+TEST_CASE("LoRALinear - lora params have gradients after backward") {
     LoRALinear layer(8, 4, /*rank=*/2);
     auto x   = make_input(3, 8);
     auto out = layer.forward(x);
@@ -91,7 +91,7 @@ TEST_CASE("LoRALinear — lora params have gradients after backward") {
     CHECK(params[2]->grad().numel() > 0);  // B
 }
 
-TEST_CASE("LoRALinear — lora_parameters count") {
+TEST_CASE("LoRALinear - lora_parameters count") {
     {
         LoRALinear layer(8, 4, /*rank=*/4);
         CHECK(layer.lora_parameters().size() == 2);
@@ -102,10 +102,10 @@ TEST_CASE("LoRALinear — lora_parameters count") {
     }
 }
 
-TEST_CASE("LoRALinear — grad norm is non-zero for A and B after backward") {
+TEST_CASE("LoRALinear - grad norm is non-zero for A and B after backward") {
     // Sanity: after a real backward pass with non-trivial input, A and B
     // accumulate non-zero gradients (B gets grad through the A path since
-    // upstream != 0; A gets grad once B is updated — but here B starts at 0
+    // upstream != 0; A gets grad once B is updated - but here B starts at 0
     // so dL/dA = upstream @ B^T which is 0.  That is expected at init.)
     //
     // To get a non-trivial A gradient, perturb B before the forward pass.
@@ -131,7 +131,7 @@ TEST_CASE("LoRALinear — grad norm is non-zero for A and B after backward") {
     CHECK(norm_B > 0.0f);
 }
 
-TEST_CASE("LoRALinear — fine-tuning decreases loss") {
+TEST_CASE("LoRALinear - fine-tuning decreases loss") {
     // Simple regression-style task via cross_entropy:
     // embed integers → LoRALinear → logits → cross_entropy.
     // Train only lora_parameters() and verify loss decreases.

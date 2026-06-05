@@ -6,7 +6,7 @@ using namespace sub0llm;
 
 // ── Vocabulary and token registration ────────────────────────────────────────
 
-TEST_CASE("add_special_token — deduplication", "[tokenizer]") {
+TEST_CASE("add_special_token - deduplication", "[tokenizer]") {
     auto tok = BPETokenizer::train({"hello"}, 20);
     const auto id1 = tok.add_special_token("<pad>");
     const auto id2 = tok.add_special_token("<pad>");
@@ -26,7 +26,7 @@ TEST_CASE("token_id for unknown returns -1", "[tokenizer]") {
 
 // ── Training ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("train — vocab grows with merges", "[tokenizer][train]") {
+TEST_CASE("train - vocab grows with merges", "[tokenizer][train]") {
     // Use a repetitive corpus so many merges are possible.
     auto tok = BPETokenizer::train(
         {"the cat sat on the mat the cat ate the rat"}, 50);
@@ -35,7 +35,7 @@ TEST_CASE("train — vocab grows with merges", "[tokenizer][train]") {
     REQUIRE(tok.num_merges() > 0);
 }
 
-TEST_CASE("train — all input bytes are in vocabulary", "[tokenizer][train]") {
+TEST_CASE("train - all input bytes are in vocabulary", "[tokenizer][train]") {
     auto tok = BPETokenizer::train({"abc def"}, 20);
     // Every unique character in the corpus must be in the vocabulary
     for (char c : std::string{"abcdef"}) {
@@ -43,7 +43,7 @@ TEST_CASE("train — all input bytes are in vocabulary", "[tokenizer][train]") {
     }
 }
 
-TEST_CASE("train — merge rules are non-empty for non-trivial corpus", "[tokenizer][train]") {
+TEST_CASE("train - merge rules are non-empty for non-trivial corpus", "[tokenizer][train]") {
     auto tok = BPETokenizer::train(
         {"aaabdaaabac", "aaabdaaabac", "aaabdaaabac"}, 15);
     REQUIRE(tok.num_merges() > 0);
@@ -51,13 +51,13 @@ TEST_CASE("train — merge rules are non-empty for non-trivial corpus", "[tokeni
 
 // ── Encode ────────────────────────────────────────────────────────────────────
 
-TEST_CASE("encode — non-empty output", "[tokenizer][encode]") {
+TEST_CASE("encode - non-empty output", "[tokenizer][encode]") {
     auto tok = BPETokenizer::train({"hello world"}, 20);
     const auto ids = tok.encode("hello");
     REQUIRE_FALSE(ids.empty());
 }
 
-TEST_CASE("encode — all ids are in vocabulary", "[tokenizer][encode]") {
+TEST_CASE("encode - all ids are in vocabulary", "[tokenizer][encode]") {
     auto tok = BPETokenizer::train({"hello world"}, 30);
     const auto ids = tok.encode("hello world");
     for (auto id : ids) {
@@ -66,14 +66,14 @@ TEST_CASE("encode — all ids are in vocabulary", "[tokenizer][encode]") {
     }
 }
 
-TEST_CASE("encode — empty string returns empty", "[tokenizer][encode]") {
+TEST_CASE("encode - empty string returns empty", "[tokenizer][encode]") {
     auto tok = BPETokenizer::train({"hello"}, 15);
     REQUIRE(tok.encode("").empty());
 }
 
 // ── Decode ────────────────────────────────────────────────────────────────────
 
-TEST_CASE("decode — roundtrip for in-vocabulary text", "[tokenizer][roundtrip]") {
+TEST_CASE("decode - roundtrip for in-vocabulary text", "[tokenizer][roundtrip]") {
     const std::string corpus_word = "hello";
     auto tok = BPETokenizer::train({corpus_word}, 20);
 
@@ -83,7 +83,7 @@ TEST_CASE("decode — roundtrip for in-vocabulary text", "[tokenizer][roundtrip]
     REQUIRE(decoded == corpus_word);
 }
 
-TEST_CASE("decode — space marker is restored", "[tokenizer][roundtrip]") {
+TEST_CASE("decode - space marker is restored", "[tokenizer][roundtrip]") {
     auto tok = BPETokenizer::train({"hello world foo bar"}, 40);
     const std::string text = "hello world";
     const auto ids = tok.encode(text);
@@ -91,7 +91,7 @@ TEST_CASE("decode — space marker is restored", "[tokenizer][roundtrip]") {
     REQUIRE(decoded == text);
 }
 
-TEST_CASE("decode — out-of-range id throws", "[tokenizer][decode]") {
+TEST_CASE("decode - out-of-range id throws", "[tokenizer][decode]") {
     auto tok = BPETokenizer::train({"a"}, 5);
     const std::vector<BPETokenizer::TokenId> bad{9999};
     REQUIRE_THROWS_AS(tok.decode(bad), std::runtime_error);
@@ -99,7 +99,7 @@ TEST_CASE("decode — out-of-range id throws", "[tokenizer][decode]") {
 
 // ── Save / load ───────────────────────────────────────────────────────────────
 
-TEST_CASE("save and reload — vocab identical", "[tokenizer][io]") {
+TEST_CASE("save and reload - vocab identical", "[tokenizer][io]") {
     auto tok = BPETokenizer::train({"hello world goodbye"}, 30);
     const std::filesystem::path dir = "/tmp/sub0llm_tok_test";
     tok.save(dir);
@@ -116,7 +116,7 @@ TEST_CASE("save and reload — vocab identical", "[tokenizer][io]") {
     }
 }
 
-TEST_CASE("save and reload — encode roundtrip preserved", "[tokenizer][io]") {
+TEST_CASE("save and reload - encode roundtrip preserved", "[tokenizer][io]") {
     auto tok = BPETokenizer::train({"hello world"}, 25);
     const std::filesystem::path dir = "/tmp/sub0llm_tok_test2";
     tok.save(dir);

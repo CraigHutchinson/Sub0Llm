@@ -30,7 +30,7 @@ static Tensor make_logits(int64_t T, int64_t V, float fill = 0.0f) {
 
 // ── RewardModel ───────────────────────────────────────────────────────────────
 
-TEST_CASE("RewardModel — forward output shape (T, 1)") {
+TEST_CASE("RewardModel - forward output shape (T, 1)") {
     RewardModel rm(20, 16, 2, 1, 2);
     auto ids = make_ids({0, 1, 2, 3});
     auto out = rm.forward(ids);
@@ -38,7 +38,7 @@ TEST_CASE("RewardModel — forward output shape (T, 1)") {
     REQUIRE(out.data().shape(1) == 1);
 }
 
-TEST_CASE("RewardModel — score returns scalar") {
+TEST_CASE("RewardModel - score returns scalar") {
     RewardModel rm(20, 16, 2, 1, 2);
     auto ids = make_ids({0, 1, 2, 3});
     auto s = rm.score(ids);
@@ -46,14 +46,14 @@ TEST_CASE("RewardModel — score returns scalar") {
     REQUIRE(std::isfinite(s.data().data_as<float>()[0]));
 }
 
-TEST_CASE("RewardModel — accessors") {
+TEST_CASE("RewardModel - accessors") {
     RewardModel rm(30, 24, 2, 1, 3);
     REQUIRE(rm.vocab_size() == 30);
     REQUIRE(rm.embed_dim()  == 24);
     REQUIRE(rm.num_layers() == 3);
 }
 
-TEST_CASE("RewardModel — invalid construction throws") {
+TEST_CASE("RewardModel - invalid construction throws") {
     REQUIRE_THROWS_AS(RewardModel(0,  16, 2, 1, 2), std::runtime_error);  // vocab=0
     REQUIRE_THROWS_AS(RewardModel(20,  0, 2, 1, 2), std::runtime_error);  // embed=0
     REQUIRE_THROWS_AS(RewardModel(20, 16, 0, 1, 2), std::runtime_error);  // heads=0
@@ -62,13 +62,13 @@ TEST_CASE("RewardModel — invalid construction throws") {
     REQUIRE_THROWS_AS(RewardModel(20, 16, 4, 3, 2), std::runtime_error);  // 4 % 3 != 0
 }
 
-TEST_CASE("RewardModel — forward rejects non-1D ids") {
+TEST_CASE("RewardModel - forward rejects non-1D ids") {
     RewardModel rm(20, 16, 2, 1, 2);
     Tensor ids2d({3, 4}, DType::Int32);
     REQUIRE_THROWS_AS(rm.forward(ids2d), std::runtime_error);
 }
 
-TEST_CASE("RewardModel — gradient flows to parameters") {
+TEST_CASE("RewardModel - gradient flows to parameters") {
     RewardModel rm(20, 16, 2, 1, 1, 0, 42);
     auto ids = make_ids({0, 1, 2, 3});
     auto score = rm.score(ids);
@@ -86,7 +86,7 @@ TEST_CASE("RewardModel — gradient flows to parameters") {
 
 // ── reward_preference_loss ────────────────────────────────────────────────────
 
-TEST_CASE("reward_preference_loss — scalar Variable returned") {
+TEST_CASE("reward_preference_loss - scalar Variable returned") {
     Tensor rc({1}, DType::Float32); rc.data_as<float>()[0] =  1.0f;
     Tensor rr({1}, DType::Float32); rr.data_as<float>()[0] = -1.0f;
     Variable vc(rc, true), vr(rr, true);
@@ -95,7 +95,7 @@ TEST_CASE("reward_preference_loss — scalar Variable returned") {
     REQUIRE(loss.data().data_as<float>()[0] > 0.f);
 }
 
-TEST_CASE("reward_preference_loss — margin=0 gives log(2) loss") {
+TEST_CASE("reward_preference_loss - margin=0 gives log(2) loss") {
     // r_chosen == r_rejected → L = -log σ(0) = log(2)
     Tensor rc({1}, DType::Float32); rc.data_as<float>()[0] = 0.f;
     Tensor rr({1}, DType::Float32); rr.data_as<float>()[0] = 0.f;
@@ -105,7 +105,7 @@ TEST_CASE("reward_preference_loss — margin=0 gives log(2) loss") {
             Catch::Approx(std::log(2.0f)).epsilon(1e-4));
 }
 
-TEST_CASE("reward_preference_loss — large positive margin gives low loss") {
+TEST_CASE("reward_preference_loss - large positive margin gives low loss") {
     Tensor rc({1}, DType::Float32); rc.data_as<float>()[0] =  10.f;
     Tensor rr({1}, DType::Float32); rr.data_as<float>()[0] = -10.f;
     Variable vc(rc, false), vr(rr, false);
@@ -113,7 +113,7 @@ TEST_CASE("reward_preference_loss — large positive margin gives low loss") {
     REQUIRE(loss.data().data_as<float>()[0] < 0.001f);
 }
 
-TEST_CASE("reward_preference_loss — gradient flows to r_chosen and r_rejected") {
+TEST_CASE("reward_preference_loss - gradient flows to r_chosen and r_rejected") {
     Tensor rc({1}, DType::Float32); rc.data_as<float>()[0] = 0.5f;
     Tensor rr({1}, DType::Float32); rr.data_as<float>()[0] = -0.5f;
     Variable vc(rc, true), vr(rr, true);
@@ -125,14 +125,14 @@ TEST_CASE("reward_preference_loss — gradient flows to r_chosen and r_rejected"
     REQUIRE(vr.grad().data_as<float>()[0] > 0.f);
 }
 
-TEST_CASE("reward_preference_loss — rejects non-scalar inputs") {
+TEST_CASE("reward_preference_loss - rejects non-scalar inputs") {
     Tensor t2({2}, DType::Float32);
     Variable v2(t2, true), v1(Tensor({1}, DType::Float32), true);
     REQUIRE_THROWS_AS(reward_preference_loss(v2, v1), std::runtime_error);
     REQUIRE_THROWS_AS(reward_preference_loss(v1, v2), std::runtime_error);
 }
 
-TEST_CASE("reward_preference_loss — training reduces loss") {
+TEST_CASE("reward_preference_loss - training reduces loss") {
     RewardModel rm(20, 16, 2, 1, 1, 0, 42);
     Adam adam(rm.parameters(), 1e-2f);
 
@@ -156,7 +156,7 @@ TEST_CASE("reward_preference_loss — training reduces loss") {
 
 // ── reinforce_loss ────────────────────────────────────────────────────────────
 
-TEST_CASE("reinforce_loss — returns scalar Variable") {
+TEST_CASE("reinforce_loss - returns scalar Variable") {
     Tensor logits = make_logits(4, 20);
     Variable lv(logits, true);
     auto ids = make_ids({0, 1, 2, 3});
@@ -164,7 +164,7 @@ TEST_CASE("reinforce_loss — returns scalar Variable") {
     REQUIRE(loss.data().numel() == 1);
 }
 
-TEST_CASE("reinforce_loss — positive reward scales CE positively") {
+TEST_CASE("reinforce_loss - positive reward scales CE positively") {
     Tensor logits = make_logits(4, 20);
     Variable lv(logits, false);
     auto ids = make_ids({0, 1, 2, 3});
@@ -173,7 +173,7 @@ TEST_CASE("reinforce_loss — positive reward scales CE positively") {
     REQUIRE(rl_val == Catch::Approx(2.0f * ce_val).epsilon(1e-5));
 }
 
-TEST_CASE("reinforce_loss — reward=0 gives zero loss") {
+TEST_CASE("reinforce_loss - reward=0 gives zero loss") {
     Tensor logits = make_logits(4, 20);
     Variable lv(logits, false);
     auto ids = make_ids({0, 1, 2, 3});
@@ -181,7 +181,7 @@ TEST_CASE("reinforce_loss — reward=0 gives zero loss") {
     REQUIRE(loss.data().data_as<float>()[0] == Catch::Approx(0.0f).margin(1e-6));
 }
 
-TEST_CASE("reinforce_loss — gradient flows to logits") {
+TEST_CASE("reinforce_loss - gradient flows to logits") {
     Tensor logits = make_logits(4, 20);
     Variable lv(logits, true);
     auto ids = make_ids({0, 1, 2, 3});
@@ -192,13 +192,13 @@ TEST_CASE("reinforce_loss — gradient flows to logits") {
     REQUIRE(any_grad);
 }
 
-TEST_CASE("reinforce_loss — rejects mismatched shapes") {
+TEST_CASE("reinforce_loss - rejects mismatched shapes") {
     Variable lv(make_logits(4, 20), true);
     auto ids = make_ids({0, 1, 2});  // T=3, logits T=4
     REQUIRE_THROWS_AS(reinforce_loss(lv, ids, 1.0f), std::runtime_error);
 }
 
-TEST_CASE("reinforce_loss — rejects non-finite reward") {
+TEST_CASE("reinforce_loss - rejects non-finite reward") {
     Variable lv(make_logits(4, 20), true);
     auto ids = make_ids({0, 1, 2, 3});
     REQUIRE_THROWS_AS(
@@ -211,14 +211,14 @@ TEST_CASE("reinforce_loss — rejects non-finite reward") {
 
 // ── kl_penalty ────────────────────────────────────────────────────────────────
 
-TEST_CASE("kl_penalty — same logits gives zero KL") {
+TEST_CASE("kl_penalty - same logits gives zero KL") {
     Tensor logits = make_logits(4, 20, 0.0f);
     Variable lv(logits, true);
     auto kl = kl_penalty(lv, logits);
     REQUIRE(kl.data().data_as<float>()[0] == Catch::Approx(0.0f).margin(1e-5));
 }
 
-TEST_CASE("kl_penalty — different logits gives positive KL") {
+TEST_CASE("kl_penalty - different logits gives positive KL") {
     Tensor logits_new = make_logits(4, 20, 0.0f);
     Tensor logits_ref = make_logits(4, 20, 0.0f);
     // Shift new logits so distributions differ
@@ -228,7 +228,7 @@ TEST_CASE("kl_penalty — different logits gives positive KL") {
     REQUIRE(kl.data().data_as<float>()[0] > 0.f);
 }
 
-TEST_CASE("kl_penalty — gradient flows through logits_new") {
+TEST_CASE("kl_penalty - gradient flows through logits_new") {
     // Non-uniform logits so that KL gradient is non-zero.
     Tensor logits_new({3, 10}, DType::Float32);
     Tensor logits_ref({3, 10}, DType::Float32);
@@ -246,13 +246,13 @@ TEST_CASE("kl_penalty — gradient flows through logits_new") {
     REQUIRE(any_grad);
 }
 
-TEST_CASE("kl_penalty — rejects shape mismatch") {
+TEST_CASE("kl_penalty - rejects shape mismatch") {
     Variable lv(make_logits(4, 20), true);
     Tensor ref_wrong = make_logits(3, 20);  // T mismatch
     REQUIRE_THROWS_AS(kl_penalty(lv, ref_wrong), std::runtime_error);
 }
 
-TEST_CASE("kl_penalty — rejects T=0 input") {
+TEST_CASE("kl_penalty - rejects T=0 input") {
     Tensor empty({0, 20}, DType::Float32);
     Variable lv(empty, true);
     REQUIRE_THROWS_AS(kl_penalty(lv, empty), std::runtime_error);

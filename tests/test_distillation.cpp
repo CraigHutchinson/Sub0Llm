@@ -14,7 +14,7 @@ using namespace sub0llm::nn;
 
 // ── soft_cross_entropy tests ──────────────────────────────────────────────────
 
-TEST_CASE("soft_cross_entropy — uniform teacher probs give approx log(V)") {
+TEST_CASE("soft_cross_entropy - uniform teacher probs give approx log(V)") {
     // With uniform teacher distribution (1/V each), soft CE = log(V)
     // because: -sum_v (1/V) * log_softmax(logits)[v] = -avg log_softmax = log(V) when logits uniform
     constexpr int64_t N = 4, V = 8;
@@ -39,7 +39,7 @@ TEST_CASE("soft_cross_entropy — uniform teacher probs give approx log(V)") {
     REQUIRE_THAT(val, WithinAbs(std::log(static_cast<float>(V)), 1e-4f));
 }
 
-TEST_CASE("soft_cross_entropy — identical distributions gives lower loss") {
+TEST_CASE("soft_cross_entropy - identical distributions gives lower loss") {
     // When teacher_probs = softmax(same logits as student), soft CE < log(V)
     constexpr int64_t N = 4, V = 8;
 
@@ -66,7 +66,7 @@ TEST_CASE("soft_cross_entropy — identical distributions gives lower loss") {
     REQUIRE(val < std::log(static_cast<float>(V)));
 }
 
-TEST_CASE("soft_cross_entropy — gradient flows to student") {
+TEST_CASE("soft_cross_entropy - gradient flows to student") {
     constexpr int64_t N = 4, V = 8;
 
     Tensor student_data({N, V}, DType::Float32);
@@ -94,7 +94,7 @@ TEST_CASE("soft_cross_entropy — gradient flows to student") {
     REQUIRE(any_nonzero);
 }
 
-TEST_CASE("soft_cross_entropy — shape mismatch throws") {
+TEST_CASE("soft_cross_entropy - shape mismatch throws") {
     constexpr int64_t N = 4, M = 3, V = 8;
 
     Tensor student_data({N, V}, DType::Float32);
@@ -107,7 +107,7 @@ TEST_CASE("soft_cross_entropy — shape mismatch throws") {
 
 // ── distillation_loss tests ───────────────────────────────────────────────────
 
-TEST_CASE("distillation_loss — alpha=1 equals hard CE") {
+TEST_CASE("distillation_loss - alpha=1 equals hard CE") {
     constexpr int64_t N = 4, V = 8;
 
     Tensor logit_data({N, V}, DType::Float32);
@@ -141,7 +141,7 @@ TEST_CASE("distillation_loss — alpha=1 equals hard CE") {
     REQUIRE_THAT(dist_val, WithinAbs(hard_val, 1e-5f));
 }
 
-TEST_CASE("distillation_loss — alpha=0 uses only soft term") {
+TEST_CASE("distillation_loss - alpha=0 uses only soft term") {
     constexpr int64_t N = 4, V = 8;
 
     Tensor logit_data({N, V}, DType::Float32);
@@ -178,7 +178,7 @@ TEST_CASE("distillation_loss — alpha=0 uses only soft term") {
     REQUIRE(std::abs(soft_val - hard_val) > 1e-6f);
 }
 
-TEST_CASE("distillation_loss — invalid alpha throws") {
+TEST_CASE("distillation_loss - invalid alpha throws") {
     constexpr int64_t N = 2, V = 4;
 
     Tensor logit_data({N, V}, DType::Float32);
@@ -194,7 +194,7 @@ TEST_CASE("distillation_loss — invalid alpha throws") {
                       std::runtime_error);
 }
 
-TEST_CASE("distillation_loss — invalid temp throws") {
+TEST_CASE("distillation_loss - invalid temp throws") {
     constexpr int64_t N = 2, V = 4;
 
     Tensor logit_data({N, V}, DType::Float32);
@@ -210,7 +210,7 @@ TEST_CASE("distillation_loss — invalid temp throws") {
                       std::runtime_error);
 }
 
-TEST_CASE("distillation_loss — gradient flows to student") {
+TEST_CASE("distillation_loss - gradient flows to student") {
     constexpr int64_t N = 4, V = 8;
 
     Tensor logit_data({N, V}, DType::Float32);

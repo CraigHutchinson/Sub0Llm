@@ -21,3 +21,34 @@ set_target_properties(sub0llm-server PROPERTIES
 # ── sub0llm-episodic ──────────────────────────────────────────────────────────
 # Episodic memory CLI: write/recall/info subcommands for GGUF models.
 add_subdirectory(episodic)
+
+# ── sub0llm-specialize (Ch27) ─────────────────────────────────────────────────
+# Compile-time specialization front-end: read a GGUF's metadata and emit a
+# constexpr <model>_spec.hpp + <model>_arch.json so a dedicated binary can be
+# monomorphized to one model's exact shapes.
+add_executable(sub0llm-specialize specialize/main.cpp)
+target_link_libraries(sub0llm-specialize PRIVATE sub0llm)
+sub0llm_apply_compile_options(sub0llm-specialize)
+set_target_properties(sub0llm-specialize PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ── sub0llm-verify (Ch27) ─────────────────────────────────────────────────────
+# Correctness harness: tokenize / greedy / logits / nll for a GGUF model, to diff
+# against llama.cpp (the correctness oracle) before trusting any optimization.
+add_executable(sub0llm-verify verify/main.cpp)
+target_link_libraries(sub0llm-verify PRIVATE sub0llm)
+sub0llm_apply_compile_options(sub0llm-verify)
+set_target_properties(sub0llm-verify PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ── sub0llm-qbench (Ch27) ─────────────────────────────────────────────────────
+# Profile Q8 weight-consumption strategies (dequant-on-the-fly vs quantized int8
+# matmul vs f32) across real model GEMV shapes — measure, don't assume.
+add_executable(sub0llm-qbench qbench/main.cpp)
+target_link_libraries(sub0llm-qbench PRIVATE sub0llm)
+sub0llm_apply_compile_options(sub0llm-qbench)
+set_target_properties(sub0llm-qbench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

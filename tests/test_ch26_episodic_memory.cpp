@@ -18,7 +18,7 @@ using namespace sub0llm;
 using namespace sub0llm::nn;
 using Catch::Matchers::WithinAbs;
 
-// ── Tier 1: Write gate — comprehension_pass gives sensible surprisal ──────────
+// ── Tier 1: Write gate - comprehension_pass gives sensible surprisal ──────────
 
 TEST_CASE("comprehension_pass returns T-1 losses for T tokens", "[ch26][tier1]") {
     ModernGPT model(32, 32, 2, 1, 2, 64);
@@ -98,7 +98,7 @@ TEST_CASE("reset throws when merged to prevent silent corruption", "[ch26][tier2
     for (auto& v : dd) v = 0.1f;
     state.merge(model);
 
-    // reset() while merged must throw — caller must unmerge first
+    // reset() while merged must throw - caller must unmerge first
     CHECK_THROWS_AS(state.reset(), std::runtime_error);
 
     state.unmerge(model);
@@ -353,7 +353,7 @@ TEST_CASE("episodic delta does not catastrophically degrade unrelated tokens", "
     }
     CHECK(std::isfinite(nll_b_merged));
     // A small delta (lr=5e-3, 3 steps) should not more than double the NLL
-    // on unrelated tokens — bounded interference
+    // on unrelated tokens - bounded interference
     CHECK(nll_b_merged < nll_b_base * 2.5f);
 
     // After unmerge: base model is completely restored, no residual contamination

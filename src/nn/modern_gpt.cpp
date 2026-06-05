@@ -132,10 +132,11 @@ Tensor RMSNorm::apply_one(const Tensor& x) const {
 
 // ── SwiGLUFeedForward ─────────────────────────────────────────────────────────
 
-SwiGLUFeedForward::SwiGLUFeedForward(int64_t D, int64_t d_ff, std::uint64_t seed)
-    : gate_(swiglu_check_D(D), swiglu_d_ff(D, d_ff), seed),
-      up_  (D, swiglu_d_ff(D, d_ff), seed + 1),
-      down_(swiglu_d_ff(D, d_ff), D, seed + 2) {}
+SwiGLUFeedForward::SwiGLUFeedForward(int64_t D, int64_t d_ff, std::uint64_t seed,
+                                     bool alloc_weights)
+    : gate_(swiglu_check_D(D), swiglu_d_ff(D, d_ff), seed,     alloc_weights),
+      up_  (D, swiglu_d_ff(D, d_ff), seed + 1,                 alloc_weights),
+      down_(swiglu_d_ff(D, d_ff), D, seed + 2,                 alloc_weights) {}
 
 autograd::Variable SwiGLUFeedForward::forward(const autograd::Variable& x) const {
     using namespace autograd;
@@ -151,12 +152,30 @@ Tensor SwiGLUFeedForward::apply_one(const Tensor& x) const {
     return down_.apply_one(ops::mul(gs, u));   // (1, D)
 }
 
+void SwiGLUFeedForward::quantize_weights() {
+    gate_.quantize_weights();
+    up_.quantize_weights();
+    down_.quantize_weights();
+}
+
+void SwiGLUFeedForward::free_f32_weights() {
+    gate_.free_f32_weights();
+    up_.free_f32_weights();
+    down_.free_f32_weights();
+}
+
 std::vector<autograd::Variable*> SwiGLUFeedForward::parameters() {
     std::vector<autograd::Variable*> p;
     for (auto* v : gate_.parameters()) p.push_back(v);
     for (auto* v : up_.parameters())   p.push_back(v);
     for (auto* v : down_.parameters()) p.push_back(v);
     return p;
+}
+
+void SwiGLUFeedForward::enable_lora(int64_t rank, float alpha, std::uint64_t seed) {
+    gate_.enable_lora(rank, alpha, seed);
+    up_.enable_lora  (rank, alpha, seed + 1);
+    down_.enable_lora(rank, alpha, seed + 2);
 }
 
 // ── GroupedQueryAttention ─────────────────────────────────────────────────────
@@ -167,10 +186,12 @@ GroupedQueryAttention::GroupedQueryAttention(std::size_t embed_dim,
                                              float       rope_base,
                                              std::uint64_t seed,
                                              int64_t     window_size,
-                                             std::size_t head_dim)
+                                             std::size_t head_dim,
+                                             bool        use_qk_norm,
+                                             bool        alloc_weights)
     : embed_dim_(embed_dim), n_heads_(n_heads),
       n_kv_heads_(n_kv_heads), rope_base_(rope_base),
-      window_size_(window_size) {
+      window_size_(window_size), use_qk_norm_(use_qk_norm) {
     if (embed_dim == 0 || n_heads == 0 || n_kv_heads == 0)
         throw std::runtime_error(std::format(
             "GroupedQueryAttention: embed_dim={}, n_heads={}, n_kv_heads={} "
@@ -198,17 +219,28 @@ GroupedQueryAttention::GroupedQueryAttention(std::size_t embed_dim,
     const int64_t Dh = static_cast<int64_t>(head_dim_);
     std::mt19937_64 rng(seed);
 
+    // alloc_weights=false: placeholders only — the Q8 loader fills wq_q8_ directly.
+    auto make = [&](int64_t r, int64_t c, const std::string& nm) {
+        return alloc_weights ? xavier_var(r, c, rng, nm)
+                             : autograd::Variable(zeros({1, 1}), false, nm + ".elided");
+    };
     W_Q_.reserve(n_heads_);
     W_O_.reserve(n_heads_);
     for (std::size_t h = 0; h < n_heads_; ++h) {
-        W_Q_.push_back(xavier_var(D, Dh, rng, std::format("gqa.W_Q.{}", h)));
-        W_O_.push_back(xavier_var(Dh, D, rng, std::format("gqa.W_O.{}", h)));
+        W_Q_.push_back(make(D, Dh, std::format("gqa.W_Q.{}", h)));
+        W_O_.push_back(make(Dh, D, std::format("gqa.W_O.{}", h)));
     }
     W_K_.reserve(n_kv_heads_);
     W_V_.reserve(n_kv_heads_);
     for (std::size_t g = 0; g < n_kv_heads_; ++g) {
-        W_K_.push_back(xavier_var(D, Dh, rng, std::format("gqa.W_K.{}", g)));
-        W_V_.push_back(xavier_var(D, Dh, rng, std::format("gqa.W_V.{}", g)));
+        W_K_.push_back(make(D, Dh, std::format("gqa.W_K.{}", g)));
+        W_V_.push_back(make(D, Dh, std::format("gqa.W_V.{}", g)));
+    }
+
+    // Qwen3 QK-norm: one RMSNorm(head_dim) each for Q and K, shared across heads.
+    if (use_qk_norm_) {
+        q_norm_.emplace(Dh);
+        k_norm_.emplace(Dh);
     }
 }
 
@@ -240,6 +272,7 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     for (std::size_t g = 0; g < n_kv_heads_; ++g) {
         auto k_raw = matmul(x, W_K_[g]);          // (T, head_dim)
         auto v_raw = matmul(x, W_V_[g]);          // (T, head_dim)
+        if (use_qk_norm_) k_raw = k_norm_->forward(k_raw);  // RMSNorm over head_dim
         K_heads[g] = rope(k_raw, cos_f, sin_f);
         V_heads[g] = v_raw;
     }
@@ -258,6 +291,7 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     auto compute_head = [&](std::size_t h) -> Variable {
         const std::size_t g = h / r;
         auto q_raw = matmul(x, W_Q_[h]);                        // (T, head_dim)
+        if (use_qk_norm_) q_raw = q_norm_->forward(q_raw);      // RMSNorm over head_dim
         auto q     = rope(q_raw, cos_f, sin_f);
         auto scores = scale(matmul(q, transpose2d(K_heads[g])), scale_fac); // (T,T)
         if (causal) scores = add(scores, mask_var);
@@ -270,6 +304,59 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     for (std::size_t h = 1; h < n_heads_; ++h)
         out = add(out, compute_head(h));
     return out;
+}
+
+void GroupedQueryAttention::quantize_weights() {
+    const int64_t D  = static_cast<int64_t>(embed_dim_);
+    const int64_t Dh = static_cast<int64_t>(head_dim_);
+    if (D % backend::cpu::QK8_0 != 0 || Dh % backend::cpu::QK8_0 != 0) return;
+
+    // W is (in, out) row-major; emit Q8 of its transpose (out, in) row-major so each
+    // output row is `in` contiguous values — what matvec_q8_0_q8_0 expects.
+    auto quant_T = [](const Tensor& W, int64_t in, int64_t out,
+                      std::vector<backend::cpu::BlockQ8_0>& dst) {
+        const int64_t nb = in / backend::cpu::QK8_0;
+        dst.resize(static_cast<std::size_t>(out * nb));
+        auto wd = W.data_as<float>();
+        std::vector<float> row(static_cast<std::size_t>(in));
+        for (int64_t o = 0; o < out; ++o) {
+            for (int64_t i = 0; i < in; ++i)
+                row[static_cast<std::size_t>(i)] = wd[static_cast<std::size_t>(i * out + o)];
+            backend::cpu::quantize_row_q8_0(row.data(), dst.data() + o * nb, in);
+        }
+    };
+
+    wq_q8_.resize(n_heads_);    wo_q8_.resize(n_heads_);
+    wk_q8_.resize(n_kv_heads_); wv_q8_.resize(n_kv_heads_);
+    for (std::size_t h = 0; h < n_heads_; ++h) {
+        quant_T(W_Q_[h].data(), D, Dh, wq_q8_[h]);   // (D,Dh) → (Dh,D)
+        quant_T(W_O_[h].data(), Dh, D, wo_q8_[h]);   // (Dh,D) → (D,Dh)
+    }
+    for (std::size_t g = 0; g < n_kv_heads_; ++g) {
+        quant_T(W_K_[g].data(), D, Dh, wk_q8_[g]);
+        quant_T(W_V_[g].data(), D, Dh, wv_q8_[g]);
+    }
+    q8_ = true;
+}
+
+void GroupedQueryAttention::free_f32_weights() {
+    if (!q8_) return;
+    for (auto& w : W_Q_) w = autograd::Variable(zeros({1, 1}), false);
+    for (auto& w : W_K_) w = autograd::Variable(zeros({1, 1}), false);
+    for (auto& w : W_V_) w = autograd::Variable(zeros({1, 1}), false);
+    for (auto& w : W_O_) w = autograd::Variable(zeros({1, 1}), false);
+}
+
+// int8 matvec helper: y(1,M) = Wq(M,K row-major Q8) · x(1,K).
+static Tensor q8_matvec(const std::vector<backend::cpu::BlockQ8_0>& Wq,
+                        const Tensor& x, int64_t M, int64_t K) {
+    Tensor xc = x.reshape({1, K}).contiguous();
+    thread_local std::vector<backend::cpu::BlockQ8_0> xq;
+    xq.resize(static_cast<std::size_t>(K / backend::cpu::QK8_0));
+    Tensor y = zeros({1, M});
+    backend::cpu::matvec_q8_0_q8_0(Wq.data(), xc.data_as<float>().data(),
+                                   y.data_as<float>().data(), M, K, xq.data());
+    return y;
 }
 
 Tensor GroupedQueryAttention::forward_one(const Tensor& x_new,
@@ -298,8 +385,12 @@ Tensor GroupedQueryAttention::forward_one(const Tensor& x_new,
     // Project and write K, V into cache for each KV head
     for (std::size_t g = 0; g < n_kv_heads_; ++g) {
         // W_K_[g]: (D, Dh) — x_new @ W_K_[g] = (1,D)@(D,Dh) → (1,Dh)
-        Tensor k_new = ops::matmul(x_new, W_K_[g].data());
-        Tensor v_new = ops::matmul(x_new, W_V_[g].data());
+        Tensor k_new = q8_ ? q8_matvec(wk_q8_[g], x_new, Dh, D)
+                           : ops::matmul(x_new, W_K_[g].data());
+        Tensor v_new = q8_ ? q8_matvec(wv_q8_[g], x_new, Dh, D)
+                           : ops::matmul(x_new, W_V_[g].data());
+        // Qwen3 QK-norm: RMSNorm over head_dim before RoPE.
+        if (use_qk_norm_) k_new = k_norm_->apply_one(k_new);
         // Apply RoPE to k in-place
         auto kd = k_new.data_as<float>();
         for (int64_t i = 0; i < D2; ++i) {
@@ -330,7 +421,9 @@ Tensor GroupedQueryAttention::forward_one(const Tensor& x_new,
         const std::size_t g = h / r;
 
         // Q for this head
-        Tensor q = ops::matmul(x_new, W_Q_[h].data());  // (1, Dh)
+        Tensor q = q8_ ? q8_matvec(wq_q8_[h], x_new, Dh, D)
+                       : ops::matmul(x_new, W_Q_[h].data());  // (1, Dh)
+        if (use_qk_norm_) q = q_norm_->apply_one(q);     // QK-norm before RoPE
         auto qd = q.data_as<float>();
         for (int64_t i = 0; i < D2; ++i) {
             const auto si = static_cast<std::size_t>(i);
@@ -358,7 +451,8 @@ Tensor GroupedQueryAttention::forward_one(const Tensor& x_new,
         Tensor V_slice = ops::narrow(cache.V[layer_idx][g], 0, ctx_len);
         Tensor ctx   = ops::matmul(attn, V_slice);            // (1, Dh)
         // W_O_[h]: (Dh, D) — ctx @ W_O_[h] = (1,Dh)@(Dh,D) → (1,D)
-        Tensor head_out = ops::matmul(ctx, W_O_[h].data());
+        Tensor head_out = q8_ ? q8_matvec(wo_q8_[h], ctx, D, Dh)
+                              : ops::matmul(ctx, W_O_[h].data());
 
         auto hod = head_out.data_as<float>();
         for (std::size_t i = 0; i < static_cast<std::size_t>(D); ++i)
@@ -379,6 +473,11 @@ std::vector<autograd::Variable*> GroupedQueryAttention::parameters() {
         params.push_back(&W_K_[g]);
         params.push_back(&W_V_[g]);
     }
+    // QK-norm weights last, so non-QK-norm models keep their original layout.
+    if (use_qk_norm_) {
+        for (auto* p : q_norm_->parameters()) params.push_back(p);
+        for (auto* p : k_norm_->parameters()) params.push_back(p);
+    }
     return params;
 }
 
@@ -390,12 +489,14 @@ ModernTransformerBlock::ModernTransformerBlock(int64_t     D,
                                                int64_t     d_ff,
                                                std::uint64_t seed,
                                                int64_t     window_size,
-                                               std::size_t head_dim)
+                                               std::size_t head_dim,
+                                               bool        use_qk_norm,
+                                               bool        alloc_weights)
     : norm1_(D),
       attn_(static_cast<std::size_t>(D), n_heads, n_kv_heads, 10000.0f, seed,
-            window_size, head_dim),
+            window_size, head_dim, use_qk_norm, alloc_weights),
       norm2_(D),
-      ffn_(D, d_ff, seed + 1000) {}
+      ffn_(D, d_ff, seed + 1000, alloc_weights) {}
 
 autograd::Variable ModernTransformerBlock::forward(const autograd::Variable& x) const {
     using namespace autograd;
@@ -424,6 +525,20 @@ std::vector<autograd::Variable*> ModernTransformerBlock::parameters() {
     return p;
 }
 
+void ModernTransformerBlock::enable_lora(int64_t rank, float alpha, std::uint64_t seed) {
+    ffn_.enable_lora(rank, alpha, seed);
+}
+
+void ModernTransformerBlock::quantize_weights() {
+    attn_.quantize_weights();
+    ffn_.quantize_weights();
+}
+
+void ModernTransformerBlock::free_f32_weights() {
+    attn_.free_f32_weights();
+    ffn_.free_f32_weights();
+}
+
 // ── ModernGPT ─────────────────────────────────────────────────────────────────
 
 ModernGPT::ModernGPT(int64_t     vocab_size,
@@ -435,8 +550,10 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
                      int64_t     n_mtp,
                      std::uint64_t seed,
                      int64_t     window_size,
-                     std::size_t head_dim)
-    : tok_emb_(vocab_size, mgpt_validate(vocab_size, embed_dim), seed),
+                     std::size_t head_dim,
+                     bool        use_qk_norm,
+                     bool        alloc_weights)
+    : tok_emb_(vocab_size, mgpt_validate(vocab_size, embed_dim), seed, alloc_weights),
       ln_f_(embed_dim) {
     if (n_heads == 0)
         throw std::runtime_error(std::format(
@@ -455,18 +572,30 @@ ModernGPT::ModernGPT(int64_t     vocab_size,
     n_kv_heads_ = n_kv_heads;
     head_dim_   = head_dim > 0 ? head_dim
                                : static_cast<std::size_t>(embed_dim) / n_heads;
+    cached_vocab_ = vocab_size;   // survive a tok_emb f32 free in pure-inference mode
+    cached_embed_ = embed_dim;
 
     blocks_.reserve(static_cast<std::size_t>(n_layers));
     for (int64_t l = 0; l < n_layers; ++l)
         blocks_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff,
                              seed + 2 + static_cast<std::uint64_t>(l) * 2000,
-                             window_size, head_dim);
+                             window_size, head_dim, use_qk_norm, alloc_weights);
 
     mtp_heads_.reserve(static_cast<std::size_t>(n_mtp));
     for (int64_t k = 0; k < n_mtp; ++k)
         mtp_heads_.emplace_back(embed_dim, vocab_size,
                                 seed + 2 + static_cast<std::uint64_t>(n_layers) * 2000
                                          + static_cast<std::uint64_t>(k));
+}
+
+// Tied LM head: logits (T,V) = x (T,D) · Wᵀ, where W = token embedding (V,D).
+// Computed as (W · xᵀ)ᵀ so the V×D (≈152k×1024) weight is never transposed —
+// transpose2d(W) would copy ~155M floats every forward AND again in backward.
+// Here only the small activation xᵀ and the (T,V) result are transposed; autograd
+// flows gradients to both W and x through the standard matmul/transpose2d backward.
+static autograd::Variable tied_lm_head(const autograd::Variable& weight,
+                                       const autograd::Variable& x) {
+    return autograd::transpose2d(autograd::matmul(weight, autograd::transpose2d(x)));
 }
 
 autograd::Variable ModernGPT::forward(const Tensor& token_ids) const {
@@ -478,7 +607,7 @@ autograd::Variable ModernGPT::forward(const Tensor& token_ids) const {
     auto x = tok_emb_.forward(token_ids);
     for (const auto& block : blocks_) x = block.forward(x);
     x = ln_f_.forward(x);
-    return matmul(x, transpose2d(tok_emb_.weight()));
+    return tied_lm_head(tok_emb_.weight(), x);
 }
 
 std::vector<autograd::Variable> ModernGPT::forward_mtp(const Tensor& token_ids) const {
@@ -494,7 +623,7 @@ std::vector<autograd::Variable> ModernGPT::forward_mtp(const Tensor& token_ids) 
     std::vector<Variable> logits;
     logits.reserve(1 + mtp_heads_.size());
     // Head 0: weight-tied main LM head
-    logits.push_back(matmul(x, transpose2d(tok_emb_.weight())));
+    logits.push_back(tied_lm_head(tok_emb_.weight(), x));
     // Heads 1…k: additional MTP heads
     for (const auto& head : mtp_heads_)
         logits.push_back(head.forward(x));
@@ -510,6 +639,46 @@ std::vector<autograd::Variable*> ModernGPT::parameters() {
     for (auto& head : mtp_heads_)
         for (auto* v : head.parameters()) p.push_back(v);
     return p;
+}
+
+void ModernGPT::set_trainable_last_layers(int n) {
+    const int L = static_cast<int>(blocks_.size());
+    if (n < 0)  n = (L + 1) / 2;   // default: last half (ceil)
+    if (n == 0) n = L;             // 0 = full model
+    n = std::clamp(n, 1, L);
+    const bool partial = (n < L);
+
+    // Embedding (and the tied LM head it backs) is frozen only for partial
+    // updates; full-model mode keeps everything trainable.
+    tok_emb_.weight().set_requires_grad(!partial);
+    for (int b = 0; b < L; ++b) {
+        const bool train = (b >= L - n);
+        for (auto* v : blocks_[static_cast<std::size_t>(b)].parameters())
+            v->set_requires_grad(train);
+    }
+    // The final norm and any MTP heads are always trainable (they sit at the top).
+    for (auto* v : ln_f_.parameters()) v->set_requires_grad(true);
+    for (auto& head : mtp_heads_)
+        for (auto* v : head.parameters()) v->set_requires_grad(true);
+}
+
+void ModernGPT::enable_episodic_lora(int last_layers, int64_t rank, float alpha) {
+    // Freeze every existing base parameter; adapters added below are trainable.
+    for (auto* p : parameters()) p->set_requires_grad(false);
+
+    // Default scaling = alpha/rank = 2 (alpha = 2·rank): alpha=1 would damp the
+    // adapter to 1/rank and it barely learns. Caller may override alpha (>0).
+    const float eff_alpha = (alpha > 0.0f) ? alpha : 2.0f * static_cast<float>(rank);
+
+    const int L = static_cast<int>(blocks_.size());
+    int n = last_layers;
+    if (n < 0)  n = (L + 1) / 2;   // default: last half
+    if (n == 0) n = L;             // 0 = all blocks
+    n = std::clamp(n, 1, L);
+
+    for (int b = L - n; b < L; ++b)
+        blocks_[static_cast<std::size_t>(b)].enable_lora(
+            rank, eff_alpha, 9000u + static_cast<std::uint64_t>(b) * 10u);
 }
 
 KVCache ModernGPT::make_kv_cache(int64_t max_seq) const {
@@ -531,23 +700,53 @@ KVCache ModernGPT::make_kv_cache(int64_t max_seq) const {
     return cache;
 }
 
+void ModernGPT::quantize_for_inference(bool drop_f32) {
+    for (auto& b : blocks_) b.quantize_weights();        // attention + FFN projections
+    const int64_t V = tok_emb_.vocab_size();
+    const int64_t D = tok_emb_.embed_dim();
+    if (D % backend::cpu::QK8_0 == 0) {                   // LM head
+        const int64_t nb = D / backend::cpu::QK8_0;
+        lm_head_q8_.resize(static_cast<std::size_t>(V * nb));
+        auto wd = tok_emb_.weight().data().data_as<float>();
+        for (int64_t r = 0; r < V; ++r)
+            backend::cpu::quantize_row_q8_0(wd.data() + r * D,
+                                            lm_head_q8_.data() + r * nb, D);
+    }
+    if (drop_f32) {
+        for (auto& b : blocks_) b.free_f32_weights();    // reclaim attn+FFN f32 RAM
+        if (!lm_head_q8_.empty()) {
+            // Free the f32 (tied) embedding table too — the embedding lookup now
+            // dequantizes its row from lm_head_q8_. Reclaims V·D·4 bytes (the single
+            // biggest f32 tensor), completing the ~3.76× weight-RAM reduction.
+            emb_from_q8_ = true;
+            tok_emb_.weight() = autograd::Variable(zeros({1, 1}), false);
+        }
+    }
+}
+
 Tensor ModernGPT::forward_one(int32_t token_id, KVCache& cache,
                                float rope_scaling) const {
     if (cache.full())
         throw std::runtime_error("ModernGPT::forward_one: KV cache is full");
 
-    const int64_t D  = tok_emb_.embed_dim();
-    const int64_t V  = tok_emb_.vocab_size();
+    const int64_t D  = cached_embed_;
+    const int64_t V  = cached_vocab_;
     const int64_t pos = cache.filled;
 
-    // Embedding lookup — copy one row of the weight matrix
+    // Embedding lookup — one row of the (tied) embedding table.
     Tensor x = zeros({1, D});
     auto xd  = x.data_as<float>();
-    auto wd  = tok_emb_.weight().data().data_as<float>();
     const std::size_t tok = static_cast<std::size_t>(token_id);
-    const std::size_t Dsz = static_cast<std::size_t>(D);
-    for (std::size_t i = 0; i < Dsz; ++i)
-        xd[i] = wd[tok * Dsz + i];
+    if (emb_from_q8_) {
+        // f32 table was freed: dequantize the row from the Q8 LM head (same tensor).
+        const std::size_t nb = static_cast<std::size_t>(D / backend::cpu::QK8_0);
+        backend::cpu::dequantize_row_q8_0(lm_head_q8_.data() + tok * nb, xd.data(), D);
+    } else {
+        auto wd  = tok_emb_.weight().data().data_as<float>();
+        const std::size_t Dsz = static_cast<std::size_t>(D);
+        for (std::size_t i = 0; i < Dsz; ++i)
+            xd[i] = wd[tok * Dsz + i];
+    }
 
     // NTK-aware RoPE base override for context extension
     float rope_base_override = 0.0f;
@@ -563,26 +762,30 @@ Tensor ModernGPT::forward_one(int32_t token_id, KVCache& cache,
     // Final RMSNorm
     x = ln_f_.apply_one(x);
 
-    // LM head: weight-tied dot product against embedding table
-    // W_emb: (V, D) — compute logits[v] = dot(x[0,:], W_emb[v,:])
-    Tensor logits = zeros({1, V});
-    auto ld  = logits.data_as<float>();
-    auto xd2 = x.data_as<float>();
-    auto emb = tok_emb_.weight().data().data_as<float>();
-    for (int64_t v = 0; v < V; ++v) {
-        float dot = 0.0f;
-        const std::size_t row_off = static_cast<std::size_t>(v) * Dsz;
-        for (std::size_t d = 0; d < Dsz; ++d)
-            dot += xd2[d] * emb[row_off + d];
-        ld[static_cast<std::size_t>(v)] = dot;
+    // LM head: weight-tied projection against the embedding table.
+    // W_emb is (V, D) row-major, so logits = W_emb @ xᵀ.
+    Tensor logits;
+    if (!lm_head_q8_.empty()) {
+        // Q8 int8 fast path (Ch27): the biggest single GEMV in generation.
+        const int64_t nb = D / backend::cpu::QK8_0;
+        Tensor xc = x.reshape({1, D}).contiguous();
+        thread_local std::vector<backend::cpu::BlockQ8_0> xq;
+        xq.resize(static_cast<std::size_t>(nb));
+        logits = zeros({V, 1});
+        backend::cpu::matvec_q8_0_q8_0(lm_head_q8_.data(), xc.data_as<float>().data(),
+                                       logits.data_as<float>().data(), V, D, xq.data());
+    } else {
+        // matmul((V,D),(D,1)) → (V,1) needs no transpose and routes through the
+        // vectorised Eigen/BLAS GEMV path (K=D≥64), unlike a scalar dot-product loop.
+        logits = ops::matmul(tok_emb_.weight().data(), x.reshape({D, 1}));
     }
 
     ++cache.filled;
-    return logits;
+    return logits.reshape({1, V});
 }
 
-int64_t     ModernGPT::vocab_size()  const noexcept { return tok_emb_.vocab_size(); }
-int64_t     ModernGPT::embed_dim()   const noexcept { return tok_emb_.embed_dim(); }
+int64_t     ModernGPT::vocab_size()  const noexcept { return cached_vocab_; }
+int64_t     ModernGPT::embed_dim()   const noexcept { return cached_embed_; }
 std::size_t ModernGPT::num_layers()  const noexcept { return blocks_.size(); }
 int64_t     ModernGPT::n_mtp_heads() const noexcept {
     return static_cast<int64_t>(mtp_heads_.size());

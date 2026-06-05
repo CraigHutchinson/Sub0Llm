@@ -27,7 +27,7 @@ static ThinkingConfig make_cfg(int32_t bos, int32_t eos,
 
 // ── generate_with_thinking tests ──────────────────────────────────────────────
 
-TEST_CASE("generate_with_thinking — full_sequence length correct") {
+TEST_CASE("generate_with_thinking - full_sequence length correct") {
     ModernGPT model(/*vocab_size=*/16, /*embed_dim=*/16,
                     /*n_heads=*/2, /*n_kv_heads=*/1, /*n_layers=*/1,
                     /*d_ff=*/0, /*n_mtp_heads=*/0, /*seed=*/42);
@@ -45,7 +45,7 @@ TEST_CASE("generate_with_thinking — full_sequence length correct") {
     REQUIRE(result.full_sequence.size() == expected);
 }
 
-TEST_CASE("generate_with_thinking — answer tokens within budget") {
+TEST_CASE("generate_with_thinking - answer tokens within budget") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
 
     std::vector<int32_t> prompt = {0, 1};
@@ -57,7 +57,7 @@ TEST_CASE("generate_with_thinking — answer tokens within budget") {
     REQUIRE(result.answer_tokens.size() <= static_cast<std::size_t>(cfg.max_answer_tokens));
 }
 
-TEST_CASE("generate_with_thinking — thinking tokens within budget") {
+TEST_CASE("generate_with_thinking - thinking tokens within budget") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
 
     std::vector<int32_t> prompt = {0, 1};
@@ -69,7 +69,7 @@ TEST_CASE("generate_with_thinking — thinking tokens within budget") {
     REQUIRE(result.thinking_tokens.size() <= static_cast<std::size_t>(cfg.max_think_tokens));
 }
 
-TEST_CASE("generate_with_thinking — think_bos in full_sequence") {
+TEST_CASE("generate_with_thinking - think_bos in full_sequence") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
 
     std::vector<int32_t> prompt = {1, 2, 3};
@@ -82,7 +82,7 @@ TEST_CASE("generate_with_thinking — think_bos in full_sequence") {
     REQUIRE(result.full_sequence[prompt.size()] == bos_id);
 }
 
-TEST_CASE("generate_with_thinking — think_eos in full_sequence") {
+TEST_CASE("generate_with_thinking - think_eos in full_sequence") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
 
     std::vector<int32_t> prompt = {1, 2, 3};
@@ -97,7 +97,7 @@ TEST_CASE("generate_with_thinking — think_eos in full_sequence") {
     REQUIRE(result.full_sequence[eos_pos] == eos_id);
 }
 
-TEST_CASE("generate_with_thinking — budget invariant holds") {
+TEST_CASE("generate_with_thinking - budget invariant holds") {
     // Verify that either:
     //   (a) thinking_complete=true and thinking_tokens.size() < max_think, or
     //   (b) thinking_complete=false and thinking_tokens.size() == max_think
@@ -118,7 +118,7 @@ TEST_CASE("generate_with_thinking — budget invariant holds") {
     }
 }
 
-TEST_CASE("generate_with_thinking — empty prompt throws") {
+TEST_CASE("generate_with_thinking - empty prompt throws") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
     auto cfg = make_cfg(14, 15);
     std::mt19937 rng(0);
@@ -126,7 +126,7 @@ TEST_CASE("generate_with_thinking — empty prompt throws") {
     REQUIRE_THROWS_AS(generate_with_thinking(model, {}, cfg, rng), std::runtime_error);
 }
 
-TEST_CASE("generate_with_thinking — negative bos_id throws") {
+TEST_CASE("generate_with_thinking - negative bos_id throws") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
     auto cfg = make_cfg(/*bos=*/-1, /*eos=*/15);
     std::mt19937 rng(0);
@@ -134,7 +134,7 @@ TEST_CASE("generate_with_thinking — negative bos_id throws") {
     REQUIRE_THROWS_AS(generate_with_thinking(model, {1}, cfg, rng), std::runtime_error);
 }
 
-TEST_CASE("generate_with_thinking — zero budget throws") {
+TEST_CASE("generate_with_thinking - zero budget throws") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
     auto cfg = make_cfg(14, 15);
     cfg.max_think_tokens = 0;
@@ -145,7 +145,7 @@ TEST_CASE("generate_with_thinking — zero budget throws") {
 
 // ── think_self_consistency tests ──────────────────────────────────────────────
 
-TEST_CASE("think_self_consistency — returns valid vocab token") {
+TEST_CASE("think_self_consistency - returns valid vocab token") {
     constexpr int64_t V = 16;
     ModernGPT model(V, 16, 2, 1, 1, 0, 0, 42);
 
@@ -159,7 +159,7 @@ TEST_CASE("think_self_consistency — returns valid vocab token") {
     REQUIRE(tok < static_cast<int32_t>(V));
 }
 
-TEST_CASE("think_self_consistency — zero samples throws") {
+TEST_CASE("think_self_consistency - zero samples throws") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
     auto cfg = make_cfg(14, 15);
     std::mt19937 rng(0);
@@ -167,11 +167,11 @@ TEST_CASE("think_self_consistency — zero samples throws") {
     REQUIRE_THROWS_AS(think_self_consistency(model, {1}, cfg, 0, rng), std::runtime_error);
 }
 
-TEST_CASE("think_self_consistency — deterministic on greedy") {
+TEST_CASE("think_self_consistency - deterministic on greedy") {
     ModernGPT model(16, 16, 2, 1, 1, 0, 0, 42);
 
     std::vector<int32_t> prompt = {0, 1};
-    // Greedy cfg — deterministic, so all 3 calls must return the same token
+    // Greedy cfg - deterministic, so all 3 calls must return the same token
     auto cfg = make_cfg(14, 15, 4, 3);
     // inner and answer are already greedy from make_cfg
 

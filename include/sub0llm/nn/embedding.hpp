@@ -14,8 +14,10 @@ namespace sub0llm::nn {
 // dL/dW[tok, :] += upstream[i, j, :] for each occurrence of tok.
 class Embedding {
 public:
+    // alloc_weights=false elides the (V×D) f32 table (placeholder only) for a
+    // pure-Q8 inference load that never materializes f32 (Ch27 quantize-on-load).
     Embedding(std::int64_t vocab_size, std::int64_t embed_dim,
-              std::uint64_t seed = 42);
+              std::uint64_t seed = 42, bool alloc_weights = true);
 
     // Forward pass.
     // indices: (T,) or (B, T) int32 → output: (T, D) or (B, T, D)
@@ -29,6 +31,8 @@ public:
 
 private:
     autograd::Variable weight_;
+    std::int64_t       vocab_size_ = 0;   // cached so dims survive an elided table
+    std::int64_t       embed_dim_  = 0;
 };
 
 } // namespace sub0llm::nn

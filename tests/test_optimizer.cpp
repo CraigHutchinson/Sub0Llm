@@ -97,7 +97,7 @@ TEST_CASE("clip_grad_norm: multi-param global norm", "[optimizer]") {
     std::vector<Variable*> params = {&p1, &p2};
     const float norm = nn::clip_grad_norm(params, 5.0f);
     REQUIRE_THAT(norm, WithinAbs(5.0f, 1e-5f));
-    // No clip — gradients unchanged
+    // No clip - gradients unchanged
     REQUIRE_THAT(p1.grad().data_as<float>()[0], WithinAbs(3.0f, 1e-5f));
     REQUIRE_THAT(p2.grad().data_as<float>()[0], WithinAbs(4.0f, 1e-5f));
 }
@@ -242,7 +242,7 @@ TEST_CASE("Adam: constructor throws on non-positive eps", "[optimizer]") {
 }
 
 TEST_CASE("Adam: multiple params updated independently", "[optimizer]") {
-    // p1=2, g1=1; p2=4, g2=2 — both should decrease
+    // p1=2, g1=1; p2=4, g2=2 - both should decrease
     Variable p1 = leaf1d({2.0f});
     Variable p2 = leaf1d({4.0f});
     p1.grad() = make_grad({1.0f});

@@ -25,7 +25,7 @@ static Variable leaf2d(std::vector<float> vals, int64_t rows, int64_t cols,
 
 // ── autograd::gelu ────────────────────────────────────────────────────────────
 
-TEST_CASE("gelu — forward matches ops::gelu", "[gpt][gelu]") {
+TEST_CASE("gelu - forward matches ops::gelu", "[gpt][gelu]") {
     auto x = leaf2d({-1.f, 0.f, 1.f, 2.f}, 2, 2);
     auto y = gelu(x);
     const auto yd = y.data().data_as<float>();
@@ -35,7 +35,7 @@ TEST_CASE("gelu — forward matches ops::gelu", "[gpt][gelu]") {
     REQUIRE_THAT(yd[2], WithinAbs(0.8413f, 1e-3f));         // gelu(1)≈0.841
 }
 
-TEST_CASE("gelu — backward numerical gradient check", "[gpt][gelu]") {
+TEST_CASE("gelu - backward numerical gradient check", "[gpt][gelu]") {
     const float eps = 1e-3f;
     Tensor xt = zeros({1, 4});
     { auto s = xt.data_as<float>(); s[0]=-1.f; s[1]=0.f; s[2]=0.5f; s[3]=2.f; }
@@ -64,7 +64,7 @@ TEST_CASE("gelu — backward numerical gradient check", "[gpt][gelu]") {
 
 // ── autograd::layer_norm ──────────────────────────────────────────────────────
 
-TEST_CASE("layer_norm — output is zero-mean unit-variance with identity affine",
+TEST_CASE("layer_norm - output is zero-mean unit-variance with identity affine",
           "[gpt][ln]") {
     // weight=1, bias=0 → y = x_hat
     Tensor xt = zeros({2, 4});
@@ -90,7 +90,7 @@ TEST_CASE("layer_norm — output is zero-mean unit-variance with identity affine
     }
 }
 
-TEST_CASE("layer_norm — bias shifts output by exact amount", "[gpt][ln]") {
+TEST_CASE("layer_norm - bias shifts output by exact amount", "[gpt][ln]") {
     // With weight=1, adding bias=k to feature j shifts y[j] by exactly k.
     Tensor xt = zeros({1, 3});
     { auto s = xt.data_as<float>(); s[0]=1.f; s[1]=2.f; s[2]=3.f; }
@@ -110,7 +110,7 @@ TEST_CASE("layer_norm — bias shifts output by exact amount", "[gpt][ln]") {
     REQUIRE_THAT(y1[2] - y0[2], WithinAbs(-3.0f, 1e-5f));
 }
 
-TEST_CASE("layer_norm — weight scales x_hat proportionally", "[gpt][ln]") {
+TEST_CASE("layer_norm - weight scales x_hat proportionally", "[gpt][ln]") {
     // weight=2 doubles each normalised feature.
     Tensor xt = zeros({1, 3});
     { auto s = xt.data_as<float>(); s[0]=1.f; s[1]=2.f; s[2]=3.f; }
@@ -126,7 +126,7 @@ TEST_CASE("layer_norm — weight scales x_hat proportionally", "[gpt][ln]") {
         REQUIRE_THAT(y2[j], WithinAbs(2.0f * y1[j], 1e-5f));
 }
 
-TEST_CASE("layer_norm — backward gradient check for x", "[gpt][ln]") {
+TEST_CASE("layer_norm - backward gradient check for x", "[gpt][ln]") {
     const float eps = 1e-3f;
     Tensor xt = zeros({2, 3});
     { auto s = xt.data_as<float>();
@@ -159,7 +159,7 @@ TEST_CASE("layer_norm — backward gradient check for x", "[gpt][ln]") {
     }
 }
 
-TEST_CASE("layer_norm — backward gradient check for weight", "[gpt][ln]") {
+TEST_CASE("layer_norm - backward gradient check for weight", "[gpt][ln]") {
     const float eps = 1e-3f;
     Tensor xt = zeros({2, 3});
     { auto s = xt.data_as<float>();
@@ -190,14 +190,14 @@ TEST_CASE("layer_norm — backward gradient check for weight", "[gpt][ln]") {
     }
 }
 
-TEST_CASE("layer_norm — non-2D input throws", "[gpt][ln]") {
+TEST_CASE("layer_norm - non-2D input throws", "[gpt][ln]") {
     Variable x(zeros({4}), false), w(zeros({4}), false), b(zeros({4}), false);
     REQUIRE_THROWS_AS(layer_norm(x, w, b), std::runtime_error);
 }
 
 // ── Linear ────────────────────────────────────────────────────────────────────
 
-TEST_CASE("Linear — output shape (T, out)", "[gpt][linear]") {
+TEST_CASE("Linear - output shape (T, out)", "[gpt][linear]") {
     Linear lin(8, 4);
     auto x = leaf2d(std::vector<float>(3 * 8, 0.1f), 3, 8);
     auto y = lin.forward(x);
@@ -205,7 +205,7 @@ TEST_CASE("Linear — output shape (T, out)", "[gpt][linear]") {
     REQUIRE(y.data().shape()[1] == 4);
 }
 
-TEST_CASE("Linear — gradient flows to W and b", "[gpt][linear]") {
+TEST_CASE("Linear - gradient flows to W and b", "[gpt][linear]") {
     Linear lin(4, 3, /*seed=*/1);
     auto x = leaf2d(std::vector<float>(2 * 4, 0.5f), 2, 4);
     sum(lin.forward(x)).backward();
@@ -218,19 +218,19 @@ TEST_CASE("Linear — gradient flows to W and b", "[gpt][linear]") {
     }
 }
 
-TEST_CASE("Linear — invalid dimensions throw", "[gpt][linear]") {
+TEST_CASE("Linear - invalid dimensions throw", "[gpt][linear]") {
     REQUIRE_THROWS_AS(Linear(0, 4), std::runtime_error);
     REQUIRE_THROWS_AS(Linear(4, 0), std::runtime_error);
 }
 
-TEST_CASE("Linear — parameters() returns 2 pointers", "[gpt][linear]") {
+TEST_CASE("Linear - parameters() returns 2 pointers", "[gpt][linear]") {
     Linear lin(4, 8);
     REQUIRE(lin.parameters().size() == 2u);
 }
 
 // ── LayerNorm ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("LayerNorm — default weight=1 bias=0", "[gpt][layernorm]") {
+TEST_CASE("LayerNorm - default weight=1 bias=0", "[gpt][layernorm]") {
     LayerNorm ln(4);
     const auto wp = ln.parameters();
     REQUIRE(wp.size() == 2u);
@@ -240,7 +240,7 @@ TEST_CASE("LayerNorm — default weight=1 bias=0", "[gpt][layernorm]") {
         REQUIRE_THAT(v, WithinAbs(0.0f, 1e-7f));
 }
 
-TEST_CASE("LayerNorm — gradient flows to weight and bias", "[gpt][layernorm]") {
+TEST_CASE("LayerNorm - gradient flows to weight and bias", "[gpt][layernorm]") {
     LayerNorm ln(6);
     auto x = leaf2d(std::vector<float>(3 * 6, 0.3f), 3, 6, false);
     sum(ln.forward(x)).backward();
@@ -251,7 +251,7 @@ TEST_CASE("LayerNorm — gradient flows to weight and bias", "[gpt][layernorm]")
 
 // ── FeedForward ───────────────────────────────────────────────────────────────
 
-TEST_CASE("FeedForward — output shape (T, D)", "[gpt][ffn]") {
+TEST_CASE("FeedForward - output shape (T, D)", "[gpt][ffn]") {
     FeedForward ffn(8, /*seed=*/0);
     auto x = leaf2d(std::vector<float>(3 * 8, 0.1f), 3, 8);
     auto y = ffn.forward(x);
@@ -259,7 +259,7 @@ TEST_CASE("FeedForward — output shape (T, D)", "[gpt][ffn]") {
     REQUIRE(y.data().shape()[1] == 8);
 }
 
-TEST_CASE("FeedForward — gradient flows to all 4 parameters", "[gpt][ffn]") {
+TEST_CASE("FeedForward - gradient flows to all 4 parameters", "[gpt][ffn]") {
     FeedForward ffn(4, /*seed=*/1);
     auto x = leaf2d(std::vector<float>(2 * 4, 0.1f), 2, 4);
     sum(ffn.forward(x)).backward();
@@ -275,7 +275,7 @@ TEST_CASE("FeedForward — gradient flows to all 4 parameters", "[gpt][ffn]") {
 
 // ── TransformerBlock ──────────────────────────────────────────────────────────
 
-TEST_CASE("TransformerBlock — output shape (T, D)", "[gpt][block]") {
+TEST_CASE("TransformerBlock - output shape (T, D)", "[gpt][block]") {
     TransformerBlock block(8, 2, /*seed=*/0);
     auto x = leaf2d(std::vector<float>(4 * 8, 0.1f), 4, 8);
     auto y = block.forward(x);
@@ -283,7 +283,7 @@ TEST_CASE("TransformerBlock — output shape (T, D)", "[gpt][block]") {
     REQUIRE(y.data().shape()[1] == 8);
 }
 
-TEST_CASE("TransformerBlock — gradient flows to all parameters", "[gpt][block]") {
+TEST_CASE("TransformerBlock - gradient flows to all parameters", "[gpt][block]") {
     TransformerBlock block(4, 2, /*seed=*/3);
     Variable x(randn({3, 4}), true);
     sum(block.forward(x)).backward();
@@ -298,7 +298,7 @@ TEST_CASE("TransformerBlock — gradient flows to all parameters", "[gpt][block]
 
 // ── GPT ───────────────────────────────────────────────────────────────────────
 
-TEST_CASE("GPT — forward output shape (T, vocab_size)", "[gpt][model]") {
+TEST_CASE("GPT - forward output shape (T, vocab_size)", "[gpt][model]") {
     GPT model(/*vocab=*/32, /*embed=*/8, /*heads=*/2, /*layers=*/2,
               /*max_seq=*/16, /*seed=*/0);
     Tensor ids = zeros({5}, DType::Int32);
@@ -308,7 +308,7 @@ TEST_CASE("GPT — forward output shape (T, vocab_size)", "[gpt][model]") {
     REQUIRE(logits.data().shape()[1] == 32);
 }
 
-TEST_CASE("GPT — backward populates gradients on all parameters", "[gpt][model]") {
+TEST_CASE("GPT - backward populates gradients on all parameters", "[gpt][model]") {
     GPT model(/*vocab=*/16, /*embed=*/4, /*heads=*/2, /*layers=*/1,
               /*max_seq=*/8, /*seed=*/1);
     Tensor ids = zeros({3}, DType::Int32);
@@ -323,13 +323,13 @@ TEST_CASE("GPT — backward populates gradients on all parameters", "[gpt][model
     REQUIRE(params_with_grad == model.parameters().size());
 }
 
-TEST_CASE("GPT — invalid arguments throw", "[gpt][model]") {
+TEST_CASE("GPT - invalid arguments throw", "[gpt][model]") {
     REQUIRE_THROWS_AS(GPT(32, 8, 2,  0, 16), std::runtime_error);  // num_layers=0
     REQUIRE_THROWS_AS(GPT(32, 8, 0,  1, 16), std::runtime_error);  // num_heads=0
     REQUIRE_THROWS_AS(GPT(32, 8, -1, 1, 16), std::runtime_error);  // num_heads<0
 }
 
-TEST_CASE("GPT — weight tying: tok_emb appears once in parameters()", "[gpt][model]") {
+TEST_CASE("GPT - weight tying: tok_emb appears once in parameters()", "[gpt][model]") {
     GPT model(32, 8, 2, 1, 16, /*seed=*/0);
     const auto params = model.parameters();
     // Count occurrences of the tok_emb weight pointer
@@ -337,4 +337,33 @@ TEST_CASE("GPT — weight tying: tok_emb appears once in parameters()", "[gpt][m
     for (const auto* p : params)
         if (p == params[0]) ++count;
     REQUIRE(count == 1u);
+}
+
+// ── Ch27: Linear Q8 inference fast path ─────────────────────────────────────────
+TEST_CASE("Linear Q8 apply_one matches f32 within quant tolerance", "[gpt][quant]") {
+    const int64_t in = 256, out = 64;
+    Linear lin(in, out, /*seed=*/7);
+
+    Tensor x = zeros({1, in});
+    auto xd = x.data_as<float>();
+    uint32_t s = 12345u;
+    for (int64_t i = 0; i < in; ++i) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        xd[static_cast<std::size_t>(i)] = (static_cast<float>(s >> 8) / 16777216.0f - 0.5f);
+    }
+
+    const Tensor y_f32 = lin.apply_one(x);
+    lin.quantize_weights();
+    REQUIRE(lin.q8_enabled());
+    const Tensor y_q8 = lin.apply_one(x);
+
+    REQUIRE(y_q8.shape() == y_f32.shape());
+    auto a = y_f32.data_as<float>();
+    auto b = y_q8.data_as<float>();
+    double se = 0.0, sr = 0.0;
+    for (int64_t i = 0; i < out; ++i) {
+        const double d = static_cast<double>(b[static_cast<std::size_t>(i)]) - a[static_cast<std::size_t>(i)];
+        se += d * d; sr += static_cast<double>(a[static_cast<std::size_t>(i)]) * a[static_cast<std::size_t>(i)];
+    }
+    REQUIRE(std::sqrt(se / (sr + 1e-12)) < 0.05);   // < 5% relRMS
 }

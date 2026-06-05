@@ -35,6 +35,12 @@ namespace sub0llm::autograd {
 // Returns a scalar Variable (mean NLL over the batch).
 [[nodiscard]] Variable cross_entropy(const Variable& logits, const Tensor& targets);
 
+// Per-position weighted cross-entropy: loss = Σ wᵢ·CEᵢ / Σ wᵢ (weights is (N,)).
+// Used by episodic memory to weight each token by its novelty.
+[[nodiscard]] Variable weighted_cross_entropy(const Variable& logits,
+                                              const Tensor& targets,
+                                              const Tensor& weights);
+
 // Add a bias vector to every row of a 2D matrix.
 //   x: (N, C),  b: (C,) or (1, C)  →  output: (N, C)
 // Backward: grad_x = upstream, grad_b = sum(upstream over rows).

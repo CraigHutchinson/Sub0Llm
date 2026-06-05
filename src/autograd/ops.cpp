@@ -331,6 +331,64 @@ Variable cross_entropy(const Variable& logits, const Tensor& targets) {
     return Variable::wrap(std::move(out));
 }
 
+// Per-position weighted cross-entropy: loss = Σ wᵢ·CEᵢ / Σ wᵢ.  Used by episodic
+// memory to weight each token by its novelty, so the gradient concentrates on the
+// surprising tokens and barely touches ones the model already predicts.
+Variable weighted_cross_entropy(const Variable& logits, const Tensor& targets,
+                                const Tensor& weights) {
+    const auto& ld = logits.data();
+    if (ld.ndim() != 2)
+        throw std::runtime_error("autograd::weighted_cross_entropy: logits must be 2D (N, C)");
+    if (targets.ndim() != 1)
+        throw std::runtime_error("autograd::weighted_cross_entropy: targets must be 1D (N,)");
+
+    const auto N = static_cast<std::size_t>(ld.shape()[0]);
+    const auto C = static_cast<std::size_t>(ld.shape()[1]);
+    if (targets.numel() != static_cast<std::int64_t>(N) ||
+        weights.numel() != static_cast<std::int64_t>(N))
+        throw std::runtime_error("autograd::weighted_cross_entropy: targets/weights size != N");
+
+    Tensor probs     = ops::softmax(ld, -1);
+    Tensor log_probs = ops::log(probs);
+    const auto lps = log_probs.data_as<float>();
+    const auto tgs = targets.data_as<int32_t>();
+    const auto wts = weights.data_as<float>();
+
+    float wsum = 0.0f;
+    for (std::size_t i = 0; i < N; ++i) wsum += wts[i];
+    if (wsum <= 0.0f) wsum = static_cast<float>(N);   // fallback to uniform
+
+    float loss_val = 0.0f;
+    for (std::size_t i = 0; i < N; ++i)
+        loss_val += wts[i] * (-lps[i * C + static_cast<std::size_t>(tgs[i])]);
+    loss_val /= wsum;
+
+    Tensor scalar = ones({1}, DType::Float32, ld.device());
+    scalar.data_as<float>()[0] = loss_val;
+
+    auto out = make_node(std::move(scalar), logits.requires_grad());
+    if (out->requires_grad) {
+        Tensor probs_copy = copy(probs);
+        Tensor tgt_copy   = copy(targets);
+        Tensor w_copy     = copy(weights);
+        out->edges.push_back(make_edge(logits.impl(),
+            [probs_copy, tgt_copy, w_copy, N, C, wsum](const Tensor& g) {
+                const float upstream = g.data_as<float>()[0];
+                Tensor grad = copy(probs_copy);
+                auto   gd   = grad.data_as<float>();
+                const auto tc = tgt_copy.data_as<int32_t>();
+                const auto wc = w_copy.data_as<float>();
+                for (std::size_t i = 0; i < N; ++i) {
+                    const float wi = wc[i] * upstream / wsum;
+                    for (std::size_t j = 0; j < C; ++j) gd[i * C + j] *= wi;
+                    gd[i * C + static_cast<std::size_t>(tc[i])] -= wi;
+                }
+                return grad;
+            }));
+    }
+    return Variable::wrap(std::move(out));
+}
+
 // ── gelu ─────────────────────────────────────────────────────────────────────
 //
 // y = gelu(x)  (tanh approximation: 0.5*x*(1+tanh(sqrt(2/π)*(x+0.044715*x³))))
@@ -693,16 +751,19 @@ Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freq
     const auto   cs = cos_freqs.data_as<float>();
     const auto   ss = sin_freqs.data_as<float>();
 
+    // Half-split (NeoX/HF "rotate_half") convention: dimension i pairs with
+    // i+D2, matching ModernGPT::forward_one() and GGUF/Qwen3 weights so the
+    // training and KV-cached inference paths produce identical results.
     Tensor out_d = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)});
     auto   od    = out_d.data_as<float>();
     for (std::size_t t = 0; t < T; ++t)
         for (std::size_t i = 0; i < D2; ++i) {
             const float c  = cs[t * D2 + i];
             const float s  = ss[t * D2 + i];
-            const float x0 = xs[t * Dh + 2 * i];
-            const float x1 = xs[t * Dh + 2 * i + 1];
-            od[t * Dh + 2 * i]     = x0 * c - x1 * s;
-            od[t * Dh + 2 * i + 1] = x0 * s + x1 * c;
+            const float x0 = xs[t * Dh + i];
+            const float x1 = xs[t * Dh + i + D2];
+            od[t * Dh + i]      = x0 * c - x1 * s;
+            od[t * Dh + i + D2] = x0 * s + x1 * c;
         }
 
     auto out = make_node(std::move(out_d), x.requires_grad());
@@ -721,10 +782,10 @@ Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freq
                     for (std::size_t i = 0; i < D2; ++i) {
                         const float c  = cf[t * D2 + i];
                         const float s  = sf[t * D2 + i];
-                        const float g0 = gs[t * Dh + 2 * i];
-                        const float g1 = gs[t * Dh + 2 * i + 1];
-                        gxs[t * Dh + 2 * i]     =  g0 * c + g1 * s;
-                        gxs[t * Dh + 2 * i + 1] = -g0 * s + g1 * c;
+                        const float g0 = gs[t * Dh + i];
+                        const float g1 = gs[t * Dh + i + D2];
+                        gxs[t * Dh + i]      =  g0 * c + g1 * s;
+                        gxs[t * Dh + i + D2] = -g0 * s + g1 * c;
                     }
                 return gx;
             }));

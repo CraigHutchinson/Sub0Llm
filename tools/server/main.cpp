@@ -1,7 +1,8 @@
 // sub0llm-server — OpenAI-compatible HTTP inference server.
 //
-// Loads a trained ModernGPT checkpoint at startup and serves inference over
-// HTTP using the same JSON schema as the OpenAI Completions API.
+// Two model sources are supported:
+//   --model-dir DIR     checkpoint directory (config.json, tokenizer/, step_*.ckpt)
+//   --model FILE.gguf   GGUF file (tokenizer embedded, weights dequantised on load)
 //
 // Endpoints:
 //   GET  /health                  → {"status":"ok","model":"sub0llm"}
@@ -10,16 +11,19 @@
 //   POST /v1/chat/completions     → chat completion (messages → concatenated prompt)
 //
 // Usage:
-//   sub0llm-server --model-dir DIR [--host HOST] [--port PORT]
+//   sub0llm-server --model-dir DIR   [--host HOST] [--port PORT]
+//   sub0llm-server --model FILE.gguf [--host HOST] [--port PORT]
 //
 // Options:
-//   --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt (required)
+//   --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt
+//   --model FILE.gguf GGUF file (mutually exclusive with --model-dir)
 //   --host HOST       bind address (default: 0.0.0.0)
 //   --port PORT       listen port  (default: 8080)
 //   --threads N       worker threads for concurrent requests (default: 4)
 //   --seed N          base RNG seed; each request uses seed+request_count (default: 42)
 
 #include "sub0llm/nn/checkpoint.hpp"
+#include "sub0llm/nn/gguf_loader.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"
 #include "sub0llm/nn/sampler.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
@@ -43,7 +47,8 @@
 namespace {
 
 struct ServerConfig {
-    std::string model_dir;
+    std::string model_dir;   // --model-dir: checkpoint directory
+    std::string model_file;  // --model:     GGUF file path
     std::string host     = "0.0.0.0";
     int         port     = 8080;
     int         threads  = 4;
@@ -64,10 +69,12 @@ void print_usage() {
     std::cerr << R"(sub0llm-server — OpenAI-compatible inference server
 
 Usage:
-  sub0llm-server --model-dir DIR [options]
+  sub0llm-server --model-dir DIR   [options]   (checkpoint directory)
+  sub0llm-server --model FILE.gguf [options]   (GGUF file)
 
-Required:
+Model source (provide exactly one):
   --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt
+  --model FILE.gguf GGUF model file (tokenizer embedded)
 
 Options:
   --host HOST       bind address (default: 0.0.0.0)
@@ -93,15 +100,21 @@ ServerConfig parse_args(int argc, char** argv) {
             return argv[++i];
         };
         if      (a == "--help" || a == "-h") { print_usage(); std::exit(0); }
-        else if (a == "--model-dir") cfg.model_dir = next();
-        else if (a == "--host")      cfg.host      = next();
-        else if (a == "--port")      cfg.port      = std::stoi(next());
-        else if (a == "--threads")   cfg.threads   = std::stoi(next());
-        else if (a == "--seed")      cfg.seed      = std::stoull(next());
+        else if (a == "--model-dir") cfg.model_dir  = next();
+        else if (a == "--model")     cfg.model_file = next();
+        else if (a == "--host")      cfg.host       = next();
+        else if (a == "--port")      cfg.port       = std::stoi(next());
+        else if (a == "--threads")   cfg.threads    = std::stoi(next());
+        else if (a == "--seed")      cfg.seed       = std::stoull(next());
         else { std::cerr << "Unknown argument: " << a << "\n"; print_usage(); std::exit(1); }
     }
-    if (cfg.model_dir.empty()) {
-        std::cerr << "Error: --model-dir is required\n\n";
+    if (cfg.model_dir.empty() && cfg.model_file.empty()) {
+        std::cerr << "Error: --model-dir or --model is required\n\n";
+        print_usage();
+        std::exit(1);
+    }
+    if (!cfg.model_dir.empty() && !cfg.model_file.empty()) {
+        std::cerr << "Error: --model-dir and --model are mutually exclusive\n\n";
         print_usage();
         std::exit(1);
     }
@@ -135,50 +148,75 @@ ModelArch load_arch(const std::filesystem::path& dir) {
 
 class InferenceEngine {
 public:
-    InferenceEngine(const std::filesystem::path& dir, uint64_t seed)
+    // model_dir: checkpoint directory (config.json + tokenizer/ + *.ckpt)
+    // gguf_file: GGUF file path — provide exactly one; leave the other empty
+    InferenceEngine(const std::string& model_dir,
+                    const std::string& gguf_file,
+                    uint64_t seed)
         : seed_(seed) {
-        const auto arch = load_arch(dir);
+        if (!gguf_file.empty()) {
+            // ── GGUF path ──────────────────────────────────────────────────
+            std::cerr << "[info] loading GGUF: " << gguf_file << "  (Q8 quantize-on-load)\n";
+            sub0llm::nn::GGUFReader reader(gguf_file);
+            tok_   = std::make_unique<sub0llm::BPETokenizer>(
+                sub0llm::BPETokenizer::from_vocab(reader.vocab().tokens,
+                                                   reader.vocab().merges));
+            // Q8 quantize-on-load by default: faster + ~3.6× less RAM, no f32 peak.
+            model_ = std::make_unique<sub0llm::nn::ModernGPT>(
+                sub0llm::nn::load_gguf_model_q8(reader));
 
-        model_ = std::make_unique<sub0llm::nn::ModernGPT>(
-            arch.vocab_size, arch.embed_dim,
-            arch.n_heads,   arch.n_kv_heads,
-            arch.n_layers,  arch.d_ff,
-            arch.n_mtp_heads, /*seed=*/42);
+            const auto& c = reader.config();
+            vocab_size_ = c.vocab_size;
+            embed_dim_  = c.embed_dim;
+            n_layers_   = c.n_layers;
+            // From the GGUF tensor table — parameters() is elided under Q8 load.
+            for (const auto& [nm, ti] : reader.tensors()) n_params_ += ti.numel;
+        } else {
+            // ── Checkpoint directory path ──────────────────────────────────
+            const std::filesystem::path dir = model_dir;
+            const auto arch = load_arch(dir);
 
-        const auto tok_dir = dir / "tokenizer";
-        if (!std::filesystem::exists(tok_dir))
-            throw std::runtime_error(std::format(
-                "tokenizer/ not found in '{}'", dir.string()));
-        tok_ = std::make_unique<sub0llm::BPETokenizer>(
-            sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
-                                         tok_dir / "merges.txt"));
+            model_ = std::make_unique<sub0llm::nn::ModernGPT>(
+                arch.vocab_size, arch.embed_dim,
+                arch.n_heads,   arch.n_kv_heads,
+                arch.n_layers,  arch.d_ff,
+                arch.n_mtp_heads, /*seed=*/42);
 
-        const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
-        if (ckpt.empty())
-            throw std::runtime_error(
-                std::format("No checkpoint found in '{}'", dir.string()));
+            const auto tok_dir = dir / "tokenizer";
+            if (!std::filesystem::exists(tok_dir))
+                throw std::runtime_error(std::format(
+                    "tokenizer/ not found in '{}'", dir.string()));
+            tok_ = std::make_unique<sub0llm::BPETokenizer>(
+                sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
+                                             tok_dir / "merges.txt"));
 
-        // Load weights: copy-then-reassign to flush into model params
-        std::vector<sub0llm::autograd::Variable> copies;
-        for (auto* p : model_->parameters()) copies.push_back(*p);
-        step_ = sub0llm::load_checkpoint(copies, ckpt);
-        auto raw = model_->parameters();
-        for (std::size_t i = 0; i < raw.size(); ++i)
-            raw[i]->data() = copies[i].data();
+            const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
+            if (ckpt.empty())
+                throw std::runtime_error(
+                    std::format("No checkpoint found in '{}'", dir.string()));
 
-        vocab_size_ = arch.vocab_size;
-        embed_dim_  = arch.embed_dim;
-        n_layers_   = arch.n_layers;
-        n_params_   = [&] {
-            int64_t n = 0;
-            for (const auto* p : model_->parameters()) n += p->data().numel();
-            return n;
-        }();
+            std::vector<sub0llm::autograd::Variable> copies;
+            for (auto* p : model_->parameters()) copies.push_back(*p);
+            step_ = sub0llm::load_checkpoint(copies, ckpt);
+            auto raw = model_->parameters();
+            for (std::size_t i = 0; i < raw.size(); ++i)
+                raw[i]->data() = copies[i].data();
 
+            vocab_size_ = arch.vocab_size;
+            embed_dim_  = arch.embed_dim;
+            n_layers_   = arch.n_layers;
+
+            std::cerr << std::format(
+                "Loaded step {} | V={} D={} layers={} | ckpt: {}\n",
+                step_, vocab_size_, embed_dim_, n_layers_, ckpt);
+        }
+
+        if (n_params_ == 0)   // checkpoint path: count live parameters
+            for (const auto* p : model_->parameters()) n_params_ += p->data().numel();
         std::cerr << std::format(
-            "Loaded step {} | V={} D={} layers={} | {:.2f}M params | ckpt: {}\n",
-            step_, vocab_size_, embed_dim_, n_layers_,
-            static_cast<double>(n_params_) / 1e6, ckpt);
+            "V={} D={} layers={} | {:.2f}M params\n",
+            vocab_size_, embed_dim_, n_layers_,
+            static_cast<double>(n_params_) / 1e6);
     }
 
     struct CompletionRequest {
@@ -413,7 +451,7 @@ int main(int argc, char** argv) {
     const auto cfg = parse_args(argc, argv);
 
     // Load model
-    InferenceEngine engine(std::filesystem::path(cfg.model_dir), cfg.seed);
+    InferenceEngine engine(cfg.model_dir, cfg.model_file, cfg.seed);
 
     // Build server
     httplib::Server svr;

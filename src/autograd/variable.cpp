@@ -55,6 +55,9 @@ const Tensor& Variable::grad() const {
 bool Variable::requires_grad() const noexcept {
     return impl_ && impl_->requires_grad;
 }
+void Variable::set_requires_grad(bool rg) noexcept {
+    if (impl_) impl_->requires_grad = rg;
+}
 bool Variable::is_leaf() const noexcept {
     return impl_ && impl_->is_leaf;
 }

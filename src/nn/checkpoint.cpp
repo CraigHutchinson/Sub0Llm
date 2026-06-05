@@ -18,9 +18,10 @@ void save_checkpoint(const std::vector<autograd::Variable>& params,
     const std::string filename = std::format("step_{:09d}.ckpt", step);
     const std::string path     = (std::filesystem::path(dir) / filename).string();
 
-    // Build JSON header: step + list of shapes
+    // Build JSON header: format_version + step + list of shapes
     nlohmann::json header;
-    header["step"] = step;
+    header["format_version"] = kCheckpointFormatVersion;
+    header["step"]           = step;
     nlohmann::json shapes = nlohmann::json::array();
     for (const auto& p : params) {
         nlohmann::json shape_arr = nlohmann::json::array();
@@ -72,6 +73,18 @@ int64_t load_checkpoint(const std::vector<autograd::Variable>& params,
             std::format("load_checkpoint: truncated JSON header in '{}'", path));
 
     auto header = nlohmann::json::parse(header_str);
+
+    // Reject incompatible checkpoints. Pre-versioned files (no "format_version")
+    // are legacy v1 and used the interleaved RoPE convention, which would silently
+    // produce wrong outputs under the current half-split convention.
+    const int version = header.value("format_version", 1);
+    if (version != kCheckpointFormatVersion)
+        throw std::runtime_error(std::format(
+            "load_checkpoint: incompatible checkpoint '{}' — format_version {} but this "
+            "build expects {}. Checkpoints from before the RoPE convention change "
+            "(half-split/NeoX) cannot be restored; retrain or convert the weights.",
+            path, version, kCheckpointFormatVersion));
+
     const int64_t step = header["step"].get<int64_t>();
     const auto& shapes = header["shapes"];
 

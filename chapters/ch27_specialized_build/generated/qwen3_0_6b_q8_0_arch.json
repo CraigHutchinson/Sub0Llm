@@ -1,0 +1,23 @@
+{
+  "source": "Qwen3-0.6B-Q8_0.gguf",
+  "arch": "qwen3",
+  "family": "qwen",
+  "vocab_size": 151936,
+  "embed_dim": 1024,
+  "n_heads": 16,
+  "n_kv_heads": 8,
+  "head_dim": 128,
+  "n_layers": 28,
+  "d_ff": 3072,
+  "context_len": 40960,
+  "rope_base": 1e+06,
+  "norm_eps": 1e-06,
+  "embed_scale": 1,
+  "use_qk_norm": true,
+  "tied_embeddings": true,
+  "norm_plus_one": false,
+  "attn_qkv_bias": false,
+  "activation": 0,
+  "sliding_window": 0,
+  "local_global_stride": 0
+}

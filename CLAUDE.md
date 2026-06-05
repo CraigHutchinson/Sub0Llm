@@ -63,6 +63,11 @@ Tests use the debug preset (`ctest --preset debug`) — never run tests on nativ
 - **Concepts over SFINAE**: use `template<ComputeScalar T>` style
 - **`[[nodiscard]]` everywhere** on pure functions that return a new value
 - **`noexcept`** only when truly impossible to throw (metadata accessors, etc.)
+- **Keep hard-won SIMD/kernel primitives**: a correct, reusable vectorized helper
+  (horizontal-sum, fast dtype conversion, etc.) that isn't currently on a hot path
+  is marked `[[maybe_unused]]` with a comment on its intended use — NOT deleted.
+  These building blocks cost real effort to get right; preserve them for the next
+  kernel. (Applies to `backends/cpu/`.)
 
 ## Current state (Ch01–Ch26, complete)
 

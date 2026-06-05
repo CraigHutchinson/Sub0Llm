@@ -1,17 +1,19 @@
-// sub0llm-cli — interactive inference using a trained ModernGPT checkpoint.
+// sub0llm-cli — interactive inference using a trained ModernGPT checkpoint or GGUF model.
 //
-// Expected model-dir layout (written by ch24 training):
-//   config.json          — architecture params
-//   tokenizer/           — vocab.json + merges.txt
-//   step_XXXXXXXXX.ckpt  — model weights
+// Two model sources are supported:
+//   --model-dir DIR     directory written by ch24_real_training:
+//                         config.json, tokenizer/, step_XXXXXXXXX.ckpt
+//   --model FILE.gguf   GGUF file (tokenizer embedded, weights dequantised on load)
 //
 // Usage:
 //   sub0llm-cli --model-dir DIR [options]
-//   sub0llm-cli --model-dir DIR --prompt "Once upon" --max-tokens 200
-//   sub0llm-cli --model-dir DIR --interactive
+//   sub0llm-cli --model FILE.gguf [options]
+//   sub0llm-cli --model FILE.gguf --prompt "Once upon" --max-tokens 200
+//   sub0llm-cli --model FILE.gguf --interactive
 //
 // Options:
-//   --model-dir DIR     path to model directory (required)
+//   --model-dir DIR     path to model directory (mutually exclusive with --model)
+//   --model FILE.gguf   path to GGUF file        (mutually exclusive with --model-dir)
 //   --prompt TEXT       initial prompt (default: empty → unconditional)
 //   --max-tokens N      max new tokens to generate (default: 200)
 //   --temperature F     sampling temperature >0 (default: 1.0)
@@ -22,6 +24,7 @@
 //   --interactive       read prompts from stdin, one per line
 
 #include "sub0llm/nn/checkpoint.hpp"
+#include "sub0llm/nn/gguf_loader.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"
 #include "sub0llm/nn/sampler.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
@@ -33,6 +36,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -41,7 +45,8 @@
 namespace {
 
 struct CliConfig {
-    std::string model_dir;
+    std::string model_dir;   // --model-dir: checkpoint directory
+    std::string model_file;  // --model:     GGUF file path
     std::string prompt;
     int64_t     max_tokens  = 200;
     float       temperature = 1.0f;
@@ -49,6 +54,7 @@ struct CliConfig {
     float       top_p       = 1.0f;
     bool        greedy      = false;
     bool        interactive = false;
+    bool        f32         = false;  // --f32: load full f32 weights (default: Q8 int8)
     uint64_t    seed        = 42;
 };
 
@@ -66,10 +72,12 @@ void print_usage() {
     std::cerr << R"(sub0llm-cli — inference CLI for a trained ModernGPT model
 
 Usage:
-  sub0llm-cli --model-dir DIR [options]
+  sub0llm-cli --model-dir DIR   [options]   (checkpoint directory)
+  sub0llm-cli --model FILE.gguf [options]   (GGUF file)
 
-Required:
+Model source (provide exactly one):
   --model-dir DIR     directory containing config.json, tokenizer/, step_*.ckpt
+  --model FILE.gguf   GGUF model file (tokenizer embedded)
 
 Sampling:
   --prompt TEXT       initial prompt (default: empty)
@@ -99,6 +107,7 @@ CliConfig parse_args(int argc, char** argv) {
         };
         if      (a == "--help" || a == "-h") { print_usage(); std::exit(0); }
         else if (a == "--model-dir")   cfg.model_dir   = next();
+        else if (a == "--model")       cfg.model_file  = next();
         else if (a == "--prompt")      cfg.prompt      = next();
         else if (a == "--max-tokens")  cfg.max_tokens  = std::stoll(next());
         else if (a == "--temperature") cfg.temperature = std::stof(next());
@@ -107,10 +116,16 @@ CliConfig parse_args(int argc, char** argv) {
         else if (a == "--seed")        cfg.seed        = std::stoull(next());
         else if (a == "--greedy")      cfg.greedy      = true;
         else if (a == "--interactive") cfg.interactive = true;
+        else if (a == "--f32")         cfg.f32         = true;
         else { std::cerr << "Unknown argument: " << a << "\n"; print_usage(); std::exit(1); }
     }
-    if (cfg.model_dir.empty()) {
-        std::cerr << "Error: --model-dir is required\n\n";
+    if (cfg.model_dir.empty() && cfg.model_file.empty()) {
+        std::cerr << "Error: --model-dir or --model is required\n\n";
+        print_usage();
+        std::exit(1);
+    }
+    if (!cfg.model_dir.empty() && !cfg.model_file.empty()) {
+        std::cerr << "Error: --model-dir and --model are mutually exclusive\n\n";
         print_usage();
         std::exit(1);
     }
@@ -179,65 +194,80 @@ std::string run_generation(sub0llm::nn::ModernGPT&  model,
 
 int main(int argc, char** argv) {
     const auto cfg = parse_args(argc, argv);
-    const std::filesystem::path dir = cfg.model_dir;
 
-    // Load architecture
-    ModelArch arch;
+    std::optional<sub0llm::nn::ModernGPT> model_opt;
+    std::optional<sub0llm::BPETokenizer>  tok_opt;
+
     try {
-        arch = load_arch(dir);
+        if (!cfg.model_file.empty()) {
+            // ── GGUF path ──────────────────────────────────────────────────────
+            std::cerr << std::format("[info] loading GGUF: {}  ({})\n", cfg.model_file,
+                                     cfg.f32 ? "f32 weights" : "Q8 quantize-on-load");
+            sub0llm::nn::GGUFReader reader(cfg.model_file);
+            tok_opt   = sub0llm::BPETokenizer::from_vocab(reader.vocab().tokens,
+                                                           reader.vocab().merges);
+            // Default to Q8 quantize-on-load: faster generation and ~3.6× less RAM,
+            // never materializing f32. Use --f32 for the full-precision path.
+            model_opt = cfg.f32 ? sub0llm::nn::load_gguf_model(reader)
+                                : sub0llm::nn::load_gguf_model_q8(reader);
+
+            // n_params from the GGUF tensor table (robust whether or not f32 is elided).
+            const int64_t n_params = [&] {
+                int64_t n = 0;
+                for (const auto& [name, ti] : reader.tensors()) n += ti.numel;
+                return n;
+            }();
+            const auto& c = reader.config();
+            std::cerr << std::format(
+                "GGUF | arch={} V={} D={} heads={}/{} layers={} | {:.2f}M params\n",
+                c.arch, c.vocab_size, c.embed_dim, c.n_heads, c.n_kv_heads,
+                c.n_layers, static_cast<double>(n_params) / 1e6);
+        } else {
+            // ── Checkpoint directory path ──────────────────────────────────────
+            const std::filesystem::path dir = cfg.model_dir;
+            const auto arch = load_arch(dir);
+
+            const auto tok_dir = dir / "tokenizer";
+            if (!std::filesystem::exists(tok_dir))
+                throw std::runtime_error(std::format(
+                    "tokenizer/ not found in '{}'", dir.string()));
+            tok_opt = sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
+                                                   tok_dir / "merges.txt");
+
+            model_opt.emplace(arch.vocab_size, arch.embed_dim,
+                              arch.n_heads,   arch.n_kv_heads,
+                              arch.n_layers,  arch.d_ff,
+                              arch.n_mtp_heads, /*seed=*/42);
+
+            const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
+            if (ckpt.empty())
+                throw std::runtime_error(std::format(
+                    "no checkpoint found in '{}'", dir.string()));
+
+            std::vector<sub0llm::autograd::Variable> param_copies;
+            for (auto* p : model_opt->parameters()) param_copies.push_back(*p);
+            const int64_t step = sub0llm::load_checkpoint(param_copies, ckpt);
+            auto raw = model_opt->parameters();
+            for (std::size_t i = 0; i < raw.size(); ++i)
+                raw[i]->data() = param_copies[i].data();
+
+            const int64_t n_params = [&] {
+                int64_t n = 0;
+                for (const auto* p : model_opt->parameters()) n += p->data().numel();
+                return n;
+            }();
+            std::cerr << std::format(
+                "Loaded step {} | V={} D={} heads={}/{} layers={} | {:.2f}M params\n",
+                step, arch.vocab_size, arch.embed_dim, arch.n_heads, arch.n_kv_heads,
+                arch.n_layers, static_cast<double>(n_params) / 1e6);
+        }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
 
-    // Load tokenizer
-    sub0llm::BPETokenizer tok = [&] {
-        const auto tok_dir = dir / "tokenizer";
-        if (!std::filesystem::exists(tok_dir))
-            throw std::runtime_error(std::format(
-                "tokenizer/ not found in '{}'", dir.string()));
-        return sub0llm::BPETokenizer::load(tok_dir / "vocab.json",
-                                            tok_dir / "merges.txt");
-    }();
-
-    // Build model with same architecture as training
-    sub0llm::nn::ModernGPT model(arch.vocab_size, arch.embed_dim,
-                                  arch.n_heads,   arch.n_kv_heads,
-                                  arch.n_layers,  arch.d_ff,
-                                  arch.n_mtp_heads, /*seed=*/42);
-
-    // Load latest checkpoint — Variable copies share tensor storage, so loading
-    // into copies updates the model's weights in place.
-    const auto ckpt = sub0llm::latest_checkpoint_path(dir.string());
-    if (ckpt.empty()) {
-        std::cerr << "Error: no checkpoint found in '" << dir.string() << "'\n";
-        return 1;
-    }
-
-    std::vector<sub0llm::autograd::Variable> param_copies;
-    for (auto* p : model.parameters()) param_copies.push_back(*p);
-
-    int64_t step = 0;
-    try {
-        step = sub0llm::load_checkpoint(param_copies, ckpt);
-        // Make weights visible to the model (reassign tensor data)
-        auto raw = model.parameters();
-        for (std::size_t i = 0; i < raw.size(); ++i)
-            raw[i]->data() = param_copies[i].data();
-    } catch (const std::exception& e) {
-        std::cerr << "Error loading checkpoint: " << e.what() << "\n";
-        return 1;
-    }
-
-    const int64_t n_params = [&] {
-        int64_t n = 0;
-        for (const auto* p : model.parameters()) n += p->data().numel();
-        return n;
-    }();
-    std::cerr << std::format("Loaded step {} | V={} D={} heads={}/{} layers={} | {:.2f}M params\n",
-        step, arch.vocab_size, arch.embed_dim, arch.n_heads, arch.n_kv_heads,
-        arch.n_layers, static_cast<double>(n_params) / 1e6);
-
+    auto& model = *model_opt;
+    auto& tok   = *tok_opt;
     std::mt19937 rng(cfg.seed);
 
     if (cfg.interactive) {

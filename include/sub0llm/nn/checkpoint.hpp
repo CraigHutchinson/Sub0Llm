@@ -6,8 +6,16 @@
 
 namespace sub0llm {
 
+// Checkpoint format version. Bumped whenever a change makes previously-saved
+// weights numerically incompatible with the current code.
+//   1 (implicit/legacy): pre-versioned checkpoints; interleaved RoPE convention.
+//   2: half-split (NeoX/HF) RoPE convention — matches GGUF and forward_one().
+// load_checkpoint rejects any checkpoint whose version != kCheckpointFormatVersion.
+inline constexpr int kCheckpointFormatVersion = 2;
+
 // Save all param tensors to dir/step_XXXXXXXXX.ckpt
-// Format: 4-byte header-length + JSON header (step + shapes) + packed float32 data
+// Format: 4-byte header-length + JSON header (format_version + step + shapes)
+//         + packed float32 data
 void save_checkpoint(const std::vector<autograd::Variable>& params,
                      const std::string& dir, int64_t step);
 

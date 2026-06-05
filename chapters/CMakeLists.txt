@@ -24,4 +24,5 @@ add_subdirectory(ch23_reasoned_math)
 add_subdirectory(ch24_real_training)
 add_subdirectory(ch25_long_context)
 add_subdirectory(ch26_episodic_memory)
+add_subdirectory(ch27_specialized_build)
 # Chapters are added here as they are written.

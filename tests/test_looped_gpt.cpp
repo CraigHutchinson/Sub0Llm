@@ -29,14 +29,14 @@ static int64_t count_params(LoopedGPT& m) {
 
 // ── construction & accessors ──────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — accessors") {
+TEST_CASE("LoopedGPT - accessors") {
     LoopedGPT m(20, 16, 2, 1, 3);
     REQUIRE(m.vocab_size() == 20);
     REQUIRE(m.embed_dim()  == 16);
     REQUIRE(m.n_loops()    == 3);
 }
 
-TEST_CASE("LoopedGPT — invalid construction throws") {
+TEST_CASE("LoopedGPT - invalid construction throws") {
     REQUIRE_THROWS_AS(LoopedGPT(0,  16, 2, 1, 2), std::runtime_error);
     REQUIRE_THROWS_AS(LoopedGPT(20,  0, 2, 1, 2), std::runtime_error);
     REQUIRE_THROWS_AS(LoopedGPT(20, 16, 2, 1, 0), std::runtime_error);
@@ -44,7 +44,7 @@ TEST_CASE("LoopedGPT — invalid construction throws") {
 
 // ── forward shape ─────────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — forward output shape (T,V)") {
+TEST_CASE("LoopedGPT - forward output shape (T,V)") {
     LoopedGPT m(20, 16, 2, 1, 2, 0, 1);
     auto ids    = make_ids({0, 1, 2, 3});
     auto logits = m.forward(ids);
@@ -53,7 +53,7 @@ TEST_CASE("LoopedGPT — forward output shape (T,V)") {
     REQUIRE(logits.data().shape(1) == 20);
 }
 
-TEST_CASE("LoopedGPT — forward single token") {
+TEST_CASE("LoopedGPT - forward single token") {
     LoopedGPT m(10, 8, 2, 1, 1, 0, 2);
     auto ids    = make_ids({3});
     auto logits = m.forward(ids);
@@ -63,7 +63,7 @@ TEST_CASE("LoopedGPT — forward single token") {
 
 // ── forward_k ────────────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — forward_k output shape matches forward") {
+TEST_CASE("LoopedGPT - forward_k output shape matches forward") {
     LoopedGPT m(20, 16, 2, 1, 3, 0, 5);
     auto ids = make_ids({0, 1, 2});
     auto l3  = m.forward(ids);            // uses n_loops=3
@@ -75,13 +75,13 @@ TEST_CASE("LoopedGPT — forward_k output shape matches forward") {
         REQUIRE(sp3[i] == Catch::Approx(spk3[i]));
 }
 
-TEST_CASE("LoopedGPT — forward_k k=0 throws") {
+TEST_CASE("LoopedGPT - forward_k k=0 throws") {
     LoopedGPT m(10, 8, 2, 1, 2);
     auto ids = make_ids({0});
     REQUIRE_THROWS_AS(m.forward_k(ids, 0), std::runtime_error);
 }
 
-TEST_CASE("LoopedGPT — forward_k different k produces different logits") {
+TEST_CASE("LoopedGPT - forward_k different k produces different logits") {
     // With different loop counts the hidden state refines differently.
     LoopedGPT m(10, 8, 2, 1, 2, 0, 7);
     auto ids = make_ids({0, 1});
@@ -97,7 +97,7 @@ TEST_CASE("LoopedGPT — forward_k different k produces different logits") {
 
 // ── parameter count ──────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — fewer parameters than equivalent multi-layer ModernGPT") {
+TEST_CASE("LoopedGPT - fewer parameters than equivalent multi-layer ModernGPT") {
     // K-loop LoopedGPT has 1 block; K-layer ModernGPT has K blocks.
     const int64_t V = 20, D = 16, K = 4;
     LoopedGPT looped(V, D, 2, 1, K);
@@ -113,7 +113,7 @@ TEST_CASE("LoopedGPT — fewer parameters than equivalent multi-layer ModernGPT"
 
 // ── gradient flow ─────────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — backward populates gradients") {
+TEST_CASE("LoopedGPT - backward populates gradients") {
     LoopedGPT m(10, 8, 2, 1, 2, 0, 3);
     Tensor targets({3}, DType::Int32);
     auto tgt = targets.data_as<int32_t>();
@@ -138,7 +138,7 @@ TEST_CASE("LoopedGPT — backward populates gradients") {
 
 // ── training step ─────────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — loss decreases over 50 training steps") {
+TEST_CASE("LoopedGPT - loss decreases over 50 training steps") {
     const int64_t V = 20, T = 8;
     LoopedGPT m(V, 16, 2, 1, 2, 0, 99);
     Adam adam(m.parameters(), 5e-3f);
@@ -167,13 +167,13 @@ TEST_CASE("LoopedGPT — loss decreases over 50 training steps") {
 
 // ── input validation ──────────────────────────────────────────────────────────
 
-TEST_CASE("LoopedGPT — forward rejects 2D token tensor") {
+TEST_CASE("LoopedGPT - forward rejects 2D token tensor") {
     LoopedGPT m(10, 8, 2, 1, 1);
     Tensor bad({2, 3}, DType::Int32);
     REQUIRE_THROWS_AS(m.forward(bad), std::runtime_error);
 }
 
-TEST_CASE("LoopedGPT — forward rejects empty token tensor") {
+TEST_CASE("LoopedGPT - forward rejects empty token tensor") {
     LoopedGPT m(10, 8, 2, 1, 1);
     Tensor empty({0}, DType::Int32);
     REQUIRE_THROWS_AS(m.forward(empty), std::runtime_error);

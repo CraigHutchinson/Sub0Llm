@@ -7,6 +7,8 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace sub0llm::nn {
@@ -88,85 +90,105 @@ void skip_gguf_value(std::ifstream& f, uint32_t type) {
     }
 }
 
-void read_kv_pair(std::ifstream& f, GGUFModelConfig& cfg, GGUFVocab& vocab) {
+// Read one metadata kv pair generically: capture the value into typed maps (and a
+// stringified dump), populating the vocab for the big token/merge arrays. Config
+// interpretation happens later in resolve_config — so it can scope keys to the
+// architecture prefix regardless of metadata ordering, and ignore the vision/audio
+// sub-model keys that a multimodal GGUF (Gemma 4) interleaves.
+void read_kv_pair(std::ifstream& f, GGUFVocab& vocab,
+                  std::map<std::string, int64_t>&     ints,
+                  std::map<std::string, double>&      floats,
+                  std::map<std::string, std::string>& strings,
+                  std::vector<std::pair<std::string, std::string>>& meta) {
     const std::string key  = read_gguf_string(f);
     const uint32_t    type = read_pod<uint32_t>(f, "kv type");
 
-    auto read_int_val = [&]() -> int64_t {
-        switch (type) {
-            case 0:  return static_cast<int64_t>(read_pod<uint8_t>(f,  key));
-            case 1:  return static_cast<int64_t>(read_pod<int8_t>(f,   key));
-            case 2:  return static_cast<int64_t>(read_pod<uint16_t>(f, key));
-            case 3:  return static_cast<int64_t>(read_pod<int16_t>(f,  key));
-            case 4:  return static_cast<int64_t>(read_pod<uint32_t>(f, key));
-            case 5:  return static_cast<int64_t>(read_pod<int32_t>(f,  key));
-            case 10: return static_cast<int64_t>(read_pod<uint64_t>(f, key));
-            case 11: return read_pod<int64_t>(f, key);
-            default:
-                skip_gguf_value(f, type);
-                return 0;
+    auto put_i = [&](int64_t v) { ints[key] = v;    meta.emplace_back(key, std::to_string(v)); };
+    auto put_f = [&](double  v) { floats[key] = v;  meta.emplace_back(key, std::format("{}", v)); };
+
+    switch (type) {
+        case 0:  put_i(read_pod<uint8_t>(f,  key)); break;
+        case 1:  put_i(read_pod<int8_t>(f,   key)); break;
+        case 2:  put_i(read_pod<uint16_t>(f, key)); break;
+        case 3:  put_i(read_pod<int16_t>(f,  key)); break;
+        case 4:  put_i(read_pod<uint32_t>(f, key)); break;
+        case 5:  put_i(read_pod<int32_t>(f,  key)); break;
+        case 6:  put_f(read_pod<float>(f,    key)); break;
+        case 7:  { const auto v = read_pod<uint8_t>(f, key);
+                   ints[key] = v; meta.emplace_back(key, v ? "true" : "false"); break; }
+        case 8:  { auto s = read_gguf_string(f); strings[key] = s;
+                   if (key == "tokenizer.ggml.model")  vocab.model = s;
+                   meta.emplace_back(key, s.size() <= 96 ? s
+                                          : std::format("[string len={}]", s.size()));
+                   break; }
+        case 9:  { const uint32_t et = read_pod<uint32_t>(f, "array elem_type");
+                   const uint64_t n  = read_pod<uint64_t>(f, "array count");
+                   if (key == "tokenizer.ggml.tokens") {
+                       vocab.tokens.reserve(n);
+                       for (uint64_t k = 0; k < n; ++k)
+                           if (et == 8) vocab.tokens.push_back(read_gguf_string(f));
+                           else { skip_gguf_value(f, et); vocab.tokens.emplace_back(); }
+                   } else if (key == "tokenizer.ggml.merges") {
+                       vocab.merges.reserve(n);
+                       for (uint64_t k = 0; k < n; ++k)
+                           if (et == 8) vocab.merges.push_back(read_gguf_string(f));
+                           else { skip_gguf_value(f, et); vocab.merges.emplace_back(); }
+                   } else {
+                       for (uint64_t k = 0; k < n; ++k) skip_gguf_value(f, et);
+                   }
+                   meta.emplace_back(key, std::format("[array elem_type={} count={}]", et, n));
+                   break; }
+        case 10: put_i(static_cast<int64_t>(read_pod<uint64_t>(f, key))); break;
+        case 11: put_i(read_pod<int64_t>(f, key)); break;
+        case 12: put_f(read_pod<double>(f, key)); break;
+        default:
+            throw std::runtime_error(
+                std::format("gguf_loader: unknown metadata type {} for key '{}'", type, key));
+    }
+}
+
+// Interpret captured metadata into GGUFModelConfig. Architecture-specific keys are
+// matched as EXACTLY "<arch><suffix>" (e.g. "gemma4.attention.head_count_kv"), so the
+// text-tower config is read and the vision/audio sub-model keys are ignored.
+void resolve_config(GGUFModelConfig& cfg,
+                    const std::map<std::string, int64_t>&     ints,
+                    const std::map<std::string, double>&      floats,
+                    const std::map<std::string, std::string>& strings) {
+    if (auto it = strings.find("general.architecture"); it != strings.end())
+        cfg.arch = it->second;
+    const std::string& a = cfg.arch;
+
+    auto geti = [&](const std::string& suffix) -> std::optional<int64_t> {
+        if (!a.empty()) { if (auto it = ints.find(a + suffix); it != ints.end()) return it->second; }
+        else { // architecture unknown — fall back to legacy suffix match
+            for (const auto& [k, v] : ints)
+                if (k.size() >= suffix.size() &&
+                    k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) return v;
         }
+        return std::nullopt;
+    };
+    auto getf = [&](const std::string& suffix) -> std::optional<double> {
+        if (!a.empty()) { if (auto it = floats.find(a + suffix); it != floats.end()) return it->second; }
+        else {
+            for (const auto& [k, v] : floats)
+                if (k.size() >= suffix.size() &&
+                    k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) return v;
+        }
+        return std::nullopt;
     };
 
-    if (key == "general.architecture") {
-        if (type == 8) cfg.arch = read_gguf_string(f);
-        else skip_gguf_value(f, type);
-        return;
-    }
-    if (key == "tokenizer.ggml.model") {
-        if (type == 8) vocab.model = read_gguf_string(f);
-        else skip_gguf_value(f, type);
-        return;
-    }
-    if (key == "tokenizer.ggml.tokens") {
-        if (type == 9) {
-            const uint32_t elem_type = read_pod<uint32_t>(f, "tokens elem_type");
-            const uint64_t count     = read_pod<uint64_t>(f, "tokens count");
-            vocab.tokens.reserve(count);
-            for (uint64_t k = 0; k < count; ++k) {
-                if (elem_type == 8) vocab.tokens.push_back(read_gguf_string(f));
-                else { skip_gguf_value(f, elem_type); vocab.tokens.emplace_back(); }
-            }
-        } else { skip_gguf_value(f, type); }
-        return;
-    }
-    if (key == "tokenizer.ggml.merges") {
-        if (type == 9) {
-            const uint32_t elem_type = read_pod<uint32_t>(f, "merges elem_type");
-            const uint64_t count     = read_pod<uint64_t>(f, "merges count");
-            vocab.merges.reserve(count);
-            for (uint64_t k = 0; k < count; ++k) {
-                if (elem_type == 8) vocab.merges.push_back(read_gguf_string(f));
-                else { skip_gguf_value(f, elem_type); vocab.merges.emplace_back(); }
-            }
-        } else { skip_gguf_value(f, type); }
-        return;
-    }
-
-    auto ends_with = [&](const std::string& suffix) {
-        return key.size() >= suffix.size() &&
-               key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0;
-    };
-
-    if (ends_with(".vocab_size"))                { cfg.vocab_size  = read_int_val(); return; }
-    if (ends_with(".embedding_length"))          { cfg.embed_dim   = read_int_val(); return; }
-    if (ends_with(".block_count"))               { cfg.n_layers    = read_int_val(); return; }
-    if (ends_with(".attention.head_count"))      { cfg.n_heads     = static_cast<std::size_t>(read_int_val()); return; }
-    if (ends_with(".attention.head_count_kv"))   { cfg.n_kv_heads  = static_cast<std::size_t>(read_int_val()); return; }
-    // key_length / value_length encode explicit head_dim (Qwen3-4B+: 128 != embed/n_heads).
-    if (ends_with(".attention.key_length"))      { cfg.head_dim = read_int_val(); return; }
-    if (ends_with(".attention.value_length"))    { const auto vl = read_int_val();
-                                                   if (cfg.head_dim == 0) cfg.head_dim = vl;
-                                                   return; }
-    if (ends_with(".feed_forward_length"))       { cfg.d_ff        = read_int_val(); return; }
-    if (ends_with(".context_length"))            { cfg.context_len = read_int_val(); return; }
-    if (ends_with(".rope.freq_base")) {
-        if (type == 6) cfg.rope_base = read_pod<float>(f, key);
-        else skip_gguf_value(f, type);
-        return;
-    }
-
-    skip_gguf_value(f, type);
+    if (auto v = geti(".vocab_size"))                       cfg.vocab_size  = *v;
+    if (auto v = geti(".embedding_length"))                 cfg.embed_dim   = *v;
+    if (auto v = geti(".block_count"))                      cfg.n_layers    = *v;
+    if (auto v = geti(".attention.head_count"))             cfg.n_heads     = static_cast<std::size_t>(*v);
+    if (auto v = geti(".attention.head_count_kv"))          cfg.n_kv_heads  = static_cast<std::size_t>(*v);
+    if (auto v = geti(".attention.key_length"))             cfg.head_dim    = *v;
+    if (cfg.head_dim == 0) if (auto v = geti(".attention.value_length")) cfg.head_dim = *v;
+    if (auto v = geti(".feed_forward_length"))              cfg.d_ff        = *v;
+    if (auto v = geti(".context_length"))                   cfg.context_len = *v;
+    if (auto v = geti(".attention.sliding_window"))         cfg.sliding_window = *v;
+    if (auto v = getf(".attention.layer_norm_rms_epsilon")) cfg.norm_eps    = static_cast<float>(*v);
+    if (auto v = getf(".rope.freq_base"))                   cfg.rope_base   = static_cast<float>(*v);
 }
 
 } // anonymous namespace
@@ -197,8 +219,13 @@ void GGUFReader::parse_header() {
     const uint64_t tensor_count      = read_pod<uint64_t>(f, "tensor_count");
     const uint64_t metadata_kv_count = read_pod<uint64_t>(f, "metadata_kv_count");
 
+    std::map<std::string, int64_t>     ints;
+    std::map<std::string, double>      floats;
+    std::map<std::string, std::string> strings;
+    metadata_.reserve(metadata_kv_count);
     for (uint64_t i = 0; i < metadata_kv_count; ++i)
-        read_kv_pair(f, config_, vocab_);
+        read_kv_pair(f, vocab_, ints, floats, strings, metadata_);
+    resolve_config(config_, ints, floats, strings);
 
     if (config_.vocab_size == 0 && !vocab_.tokens.empty())
         config_.vocab_size = static_cast<int64_t>(vocab_.tokens.size());
@@ -270,6 +297,42 @@ std::vector<float> GGUFReader::dequant_q8_0(const uint8_t* src, int64_t n) {
     return out;
 }
 
+int32_t GGUFReader::tensor_type(const std::string& name) const {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end())
+        throw std::runtime_error(std::format(
+            "GGUFReader: tensor '{}' not found in '{}'", name, path_));
+    return it->second.ggml_type;
+}
+
+std::vector<backend::cpu::BlockQ8_0> GGUFReader::load_tensor_q8(const std::string& name) const {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end())
+        throw std::runtime_error(std::format(
+            "GGUFReader: tensor '{}' not found in '{}'", name, path_));
+    const GGUFTensorInfo& ti = it->second;
+    if (ti.ggml_type != 8)
+        throw std::runtime_error(std::format(
+            "GGUFReader: tensor '{}' is ggml_type {}, not Q8_0 (8)", name, ti.ggml_type));
+    if (ti.numel % 32 != 0)
+        throw std::runtime_error(std::format(
+            "GGUFReader: Q8_0 tensor '{}' numel {} not a multiple of 32", name, ti.numel));
+
+    const int64_t n_blocks = ti.numel / 32;
+    std::vector<backend::cpu::BlockQ8_0> out(static_cast<std::size_t>(n_blocks));
+    static_assert(sizeof(backend::cpu::BlockQ8_0) == 34);
+
+    std::ifstream f(path_, std::ios::binary);
+    if (!f.is_open())
+        throw std::runtime_error(std::format("GGUFReader: cannot reopen '{}'", path_));
+    f.seekg(static_cast<std::streamoff>(data_section_offset_ + ti.offset), std::ios::beg);
+    f.read(reinterpret_cast<char*>(out.data()),
+           static_cast<std::streamsize>(n_blocks) * 34);
+    if (!f)
+        throw std::runtime_error(std::format("GGUFReader: truncated Q8_0 data for '{}'", name));
+    return out;
+}
+
 std::vector<float> GGUFReader::load_tensor(const std::string& name) const {
     auto it = tensors_.find(name);
     if (it == tensors_.end())
@@ -293,7 +356,7 @@ std::vector<float> GGUFReader::load_tensor(const std::string& name) const {
         case 0: {
             std::vector<float> buf(static_cast<std::size_t>(ti.numel));
             f.read(reinterpret_cast<char*>(buf.data()),
-                   static_cast<std::streamsize>(ti.numel * sizeof(float)));
+                   static_cast<std::streamsize>(ti.numel) * static_cast<std::streamsize>(sizeof(float)));
             if (!f) throw std::runtime_error(
                 std::format("GGUFReader: truncated F32 data for '{}'", name));
             return dequant_f32(buf.data(), ti.numel);
@@ -370,11 +433,19 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
                                 ? static_cast<std::size_t>(cfg.head_dim)
                                 : static_cast<std::size_t>(D) / H;
 
-    ModernGPT model(V, D, H, Hkv, L, dff, /*n_mtp=*/0, /*seed=*/42,
-                    /*window_size=*/-1, Dh);
+    // Qwen3 applies RMSNorm to Q and K per head (before RoPE).  Detect it from the
+    // presence of the per-layer norm tensors and build the model with QK-norm so
+    // the weights have a home and attention matches the reference implementation.
+    const bool use_qk_norm = reader.has_tensor("blk.0.attn_q_norm.weight");
 
-    // params per block: norm1(1) + attn(H*2 + Hkv*2) + norm2(1) + ffn(6) = H*2+Hkv*2+8
-    const std::size_t per_block = 1 + H * 2 + Hkv * 2 + 1 + 6;
+    ModernGPT model(V, D, H, Hkv, L, dff, /*n_mtp=*/0, /*seed=*/42,
+                    /*window_size=*/-1, Dh, use_qk_norm);
+
+    // params per block: norm1(1) + attn(H*2 + Hkv*2 + qkn) + norm2(1) + ffn(6).
+    // qkn = 2 (q_norm, k_norm) when QK-norm is enabled — appended after W_K/W_V
+    // in GroupedQueryAttention::parameters().
+    const std::size_t qkn       = use_qk_norm ? 2u : 0u;
+    const std::size_t per_block = 1 + H * 2 + Hkv * 2 + qkn + 1 + 6;
 
     auto block_base = [&](int64_t l) -> std::size_t {
         return 1 + static_cast<std::size_t>(l) * per_block;
@@ -468,18 +539,31 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
             }
         }
 
+        // QK-norm weights (Qwen3): q_norm then k_norm, each (head_dim,).
+        // Slotted right after W_K/W_V, matching GroupedQueryAttention::parameters().
+        if (use_qk_norm) {
+            const std::size_t qkb = base + 1 + H * 2 + Hkv * 2;
+            auto qn = std::format("blk.{}.attn_q_norm.weight", l);
+            auto kn = std::format("blk.{}.attn_k_norm.weight", l);
+            if (reader.has_tensor(qn)) copy_data(lp[qkb + 0], reader.load_tensor(qn));
+            if (reader.has_tensor(kn)) copy_data(lp[qkb + 1], reader.load_tensor(kn));
+        }
+
+        // FFN/norm2 indices shift by qkn to clear the QK-norm params.
+        const std::size_t ffn_base = base + 1 + H * 2 + Hkv * 2 + qkn;
+
         // norm2.weight
         {
             auto tname = std::format("blk.{}.ffn_norm.weight", l);
             if (reader.has_tensor(tname))
-                copy_data(lp[base + 1 + H * 2 + Hkv * 2], reader.load_tensor(tname));
+                copy_data(lp[ffn_base], reader.load_tensor(tname));
         }
 
         // gate.W (d_ff, D)  — Linear stores W as (out_features, in_features) = (d_ff, D) ✓
         {
             auto tname = std::format("blk.{}.ffn_gate.weight", l);
             if (reader.has_tensor(tname))
-                copy_data(lp[base + 1 + H * 2 + Hkv * 2 + 1], reader.load_tensor(tname));
+                copy_data(lp[ffn_base + 1], reader.load_tensor(tname));
         }
         // gate.b — skip (GGUF has no bias for RMSNorm-style FFN, leave zero-init)
 
@@ -487,7 +571,7 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
         {
             auto tname = std::format("blk.{}.ffn_up.weight", l);
             if (reader.has_tensor(tname))
-                copy_data(lp[base + 1 + H * 2 + Hkv * 2 + 3], reader.load_tensor(tname));
+                copy_data(lp[ffn_base + 3], reader.load_tensor(tname));
         }
         // up.b — skip
 
@@ -495,7 +579,7 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
         {
             auto tname = std::format("blk.{}.ffn_down.weight", l);
             if (reader.has_tensor(tname))
-                copy_data(lp[base + 1 + H * 2 + Hkv * 2 + 5], reader.load_tensor(tname));
+                copy_data(lp[ffn_base + 5], reader.load_tensor(tname));
         }
         // down.b — skip
     }
@@ -526,6 +610,108 @@ ModernGPT load_gguf_model(const GGUFReader& reader) {
 ModernGPT load_gguf_model(const std::string& path) {
     GGUFReader reader(path);
     return load_gguf_model(reader);
+}
+
+// ── load_gguf_model_q8 — quantize-on-load (Ch27) ─────────────────────────────────
+// Builds an inference model with f32 elided (alloc_weights=false) and copies the
+// raw Q8_0 blocks straight into the int8 buffers — no f32 is ever materialized, so
+// peak RSS stays at the Q8 footprint. GGUF weight layouts are already (out,in)
+// row-major, matching our int8 buffers (attention is sliced per head).
+ModernGPT load_gguf_model_q8(const GGUFReader& reader) {
+    namespace cpu = backend::cpu;
+    const GGUFModelConfig& cfg = reader.config();
+    if (cfg.embed_dim == 0 || cfg.n_layers == 0 || cfg.n_heads == 0)
+        throw std::runtime_error("load_gguf_model_q8: incomplete config");
+
+    const int64_t     V   = cfg.vocab_size;
+    const int64_t     D   = cfg.embed_dim;
+    const std::size_t H   = cfg.n_heads;
+    const std::size_t Hkv = cfg.n_kv_heads > 0 ? cfg.n_kv_heads : H;
+    const int64_t     L   = cfg.n_layers;
+    const int64_t     dff = cfg.d_ff;
+    const std::size_t Dh  = cfg.head_dim > 0 ? static_cast<std::size_t>(cfg.head_dim)
+                                             : static_cast<std::size_t>(D) / H;
+    if (D % cpu::QK8_0 != 0 || (Dh % cpu::QK8_0) != 0)
+        throw std::runtime_error(std::format(
+            "load_gguf_model_q8: embed_dim={} and head_dim={} must be multiples of 32",
+            D, Dh));
+    const bool use_qk_norm = reader.has_tensor("blk.0.attn_q_norm.weight");
+
+    ModernGPT model(V, D, H, Hkv, L, dff, /*n_mtp=*/0, /*seed=*/42,
+                    /*window=*/-1, Dh, use_qk_norm, /*alloc_weights=*/false);
+
+    auto set_norm = [&](RMSNorm& nrm, const std::string& name) {
+        if (!reader.has_tensor(name)) return;
+        const auto f = reader.load_tensor(name);
+        auto d = nrm.weight_.data().data_as<float>();
+        if (d.size() != f.size())
+            throw std::runtime_error(std::format("load_gguf_model_q8: norm size mismatch {}", name));
+        std::copy(f.begin(), f.end(), d.begin());
+    };
+
+    const int64_t nbD   = D / cpu::QK8_0;                              // blocks per D-row
+    const int64_t nbDh  = static_cast<int64_t>(Dh) / cpu::QK8_0;      // blocks per head slice
+    const int64_t nbHDh = static_cast<int64_t>(H * Dh) / cpu::QK8_0;  // attn_output row length
+
+    for (int64_t l = 0; l < L; ++l) {
+        auto& blk = model.blocks_[static_cast<std::size_t>(l)];
+        auto& att = blk.attn_;
+
+        set_norm(blk.norm1_, std::format("blk.{}.attn_norm.weight", l));
+        set_norm(blk.norm2_, std::format("blk.{}.ffn_norm.weight", l));
+        if (use_qk_norm) {
+            if (att.q_norm_) set_norm(*att.q_norm_, std::format("blk.{}.attn_q_norm.weight", l));
+            if (att.k_norm_) set_norm(*att.k_norm_, std::format("blk.{}.attn_k_norm.weight", l));
+        }
+
+        // Q/K/V: GGUF (heads·Dh, D) row-major → per-head contiguous (Dh, D) slices.
+        const auto qraw = reader.load_tensor_q8(std::format("blk.{}.attn_q.weight", l));
+        const auto kraw = reader.load_tensor_q8(std::format("blk.{}.attn_k.weight", l));
+        const auto vraw = reader.load_tensor_q8(std::format("blk.{}.attn_v.weight", l));
+        const std::size_t head_blocks = static_cast<std::size_t>(Dh) * static_cast<std::size_t>(nbD);
+        const auto hb = static_cast<std::ptrdiff_t>(head_blocks);
+        att.wq_q8_.resize(H);
+        for (std::size_t h = 0; h < H; ++h) {
+            const auto off = static_cast<std::ptrdiff_t>(h) * hb;
+            att.wq_q8_[h].assign(qraw.begin() + off, qraw.begin() + off + hb);
+        }
+        att.wk_q8_.resize(Hkv);
+        att.wv_q8_.resize(Hkv);
+        for (std::size_t g = 0; g < Hkv; ++g) {
+            const auto off = static_cast<std::ptrdiff_t>(g) * hb;
+            att.wk_q8_[g].assign(kraw.begin() + off, kraw.begin() + off + hb);
+            att.wv_q8_[g].assign(vraw.begin() + off, vraw.begin() + off + hb);
+        }
+
+        // O: GGUF (D, H·Dh) row-major → per-head (D, Dh): row d, blocks [h·nbDh : (h+1)·nbDh].
+        const auto oraw = reader.load_tensor_q8(std::format("blk.{}.attn_output.weight", l));
+        att.wo_q8_.resize(H);
+        for (std::size_t h = 0; h < H; ++h) {
+            att.wo_q8_[h].resize(static_cast<std::size_t>(D) * static_cast<std::size_t>(nbDh));
+            for (int64_t d = 0; d < D; ++d) {
+                const std::size_t src = static_cast<std::size_t>(d) * static_cast<std::size_t>(nbHDh)
+                                      + h * static_cast<std::size_t>(nbDh);
+                const std::size_t dst = static_cast<std::size_t>(d) * static_cast<std::size_t>(nbDh);
+                for (int64_t b = 0; b < nbDh; ++b)
+                    att.wo_q8_[h][dst + static_cast<std::size_t>(b)] = oraw[src + static_cast<std::size_t>(b)];
+            }
+        }
+        att.q8_ = true;
+
+        // FFN: GGUF (out, in) row-major → directly our int8 layout.
+        blk.ffn_.gate_.wq8_ = reader.load_tensor_q8(std::format("blk.{}.ffn_gate.weight", l));
+        blk.ffn_.up_.wq8_   = reader.load_tensor_q8(std::format("blk.{}.ffn_up.weight", l));
+        blk.ffn_.down_.wq8_ = reader.load_tensor_q8(std::format("blk.{}.ffn_down.weight", l));
+    }
+
+    set_norm(model.ln_f_, "output_norm.weight");
+
+    // LM head / tied embedding: raw Q8; the embedding lookup dequantizes a row from it.
+    const std::string emb = reader.has_tensor("output.weight") ? "output.weight"
+                                                               : "token_embd.weight";
+    model.lm_head_q8_  = reader.load_tensor_q8(emb);
+    model.emb_from_q8_ = true;
+    return model;
 }
 
 } // namespace sub0llm::nn

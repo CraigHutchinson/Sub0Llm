@@ -90,14 +90,14 @@ TEST_CASE("reasoning chain: overflow in middle stops chain cleanly") {
     REQUIRE_FALSE(r1.is_nan);
 
     // Continuing a chain after overflow: the is_overflow flag propagates to caller.
-    // The downstream apply_math_op uses the clamped value (0.f) — verify no UB.
+    // The downstream apply_math_op uses the clamped value (0.f) - verify no UB.
     auto r2 = apply_math_op(RouteType::Add, r1.value, 5.f);
     REQUIRE_FALSE(r2.is_overflow);   // 0 + 5 = 5 is fine
     REQUIRE(r2.value == Catch::Approx(5.f));
 }
 
 TEST_CASE("reasoning chain: lhs/rhs ordering across custom range") {
-    // Division is non-commutative — verify lhs (2nd most recent) / rhs (most recent).
+    // Division is non-commutative - verify lhs (2nd most recent) / rhs (most recent).
     // 100 / 4 = 25  (lhs=100, rhs=4)
     auto r = apply_math_op(RouteType::Div, 100.f, 4.f, -1000, 1000);
     REQUIRE(r.value == Catch::Approx(25.f));
@@ -129,7 +129,7 @@ TEST_CASE("reasoning chain: encode multi-step sequence numeric positions") {
 
 TEST_CASE("reasoning chain: three-step sequence numeric positions") {
     auto ntok = make_arith_ntok();
-    // "2 + 3 = 5 * 4 = 20 / 5 = 4" — 7 numeric tokens
+    // "2 + 3 = 5 * 4 = 20 / 5 = 4" - 7 numeric tokens
     auto ids = ntok.encode("2 + 3 = 5 * 4 = 20 / 5 = 4");
 
     std::vector<int32_t> numerics;
@@ -158,7 +158,7 @@ TEST_CASE("reasoning chain: text-interleaved numerics") {
         if (ntok.is_numeric(id) && !ntok.is_nan_token(id) && !ntok.is_overflow_token(id))
             numerics.push_back(static_cast<int32_t>(ntok.numeric_value(id)));
     }
-    // There must be at least 3 numeric tokens (5, 3, 8) — the explicit expression
+    // There must be at least 3 numeric tokens (5, 3, 8) - the explicit expression
     REQUIRE(numerics.size() >= 3);
     CHECK(numerics.back() == 8);  // last numeric is the result
 }
@@ -166,7 +166,7 @@ TEST_CASE("reasoning chain: text-interleaved numerics") {
 TEST_CASE("reasoning chain: large range encode/decode round-trip") {
     auto ntok = make_arith_ntok(-10000, 10000);
 
-    // Chain: 1000 + 5000 = 6000 — all within range
+    // Chain: 1000 + 5000 = 6000 - all within range
     auto id1 = ntok.encode_int(1000);
     auto id2 = ntok.encode_int(5000);
     auto id3 = ntok.encode_int(6000);

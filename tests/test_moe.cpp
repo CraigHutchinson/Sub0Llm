@@ -28,7 +28,7 @@ static Variable make_input(int64_t T, int64_t D, float fill = 0.5f) {
 
 // ── row_scale (autograd op) ───────────────────────────────────────────────────
 
-TEST_CASE("row_scale — forward correctness") {
+TEST_CASE("row_scale - forward correctness") {
     // x[i,j] = i+1,  v[i,0] = 2.0f  → y[i,j] = 2*(i+1)
     Tensor xt({3, 4}, DType::Float32);
     Tensor vt({3, 1}, DType::Float32);
@@ -49,7 +49,7 @@ TEST_CASE("row_scale — forward correctness") {
                     == Catch::Approx(static_cast<float>(i + 1)));
 }
 
-TEST_CASE("row_scale — backward x-gradient") {
+TEST_CASE("row_scale - backward x-gradient") {
     // y[i,j] = x[i,j]*v[i,0]; grad_x[i,j] = upstream[i,j]*v[i,0]
     Tensor xt({2, 3}, DType::Float32);
     Tensor vt({2, 1}, DType::Float32);
@@ -69,7 +69,7 @@ TEST_CASE("row_scale — backward x-gradient") {
     REQUIRE(xv.grad().data_as<float>()[3] == Catch::Approx(3.0f));
 }
 
-TEST_CASE("row_scale — backward v-gradient") {
+TEST_CASE("row_scale - backward v-gradient") {
     // grad_v[i,0] = sum_j(upstream[i,j] * x[i,j])
     Tensor xt({2, 3}, DType::Float32);
     Tensor vt({2, 1}, DType::Float32);
@@ -86,7 +86,7 @@ TEST_CASE("row_scale — backward v-gradient") {
     REQUIRE(vv.grad().data_as<float>()[1] == Catch::Approx(3.0f));
 }
 
-TEST_CASE("row_scale — rejects wrong v shape") {
+TEST_CASE("row_scale - rejects wrong v shape") {
     auto x = make_input(3, 4);
     Variable vbad(zeros({3, 2}), false);
     REQUIRE_THROWS_AS(row_scale(x, vbad), std::runtime_error);
@@ -94,7 +94,7 @@ TEST_CASE("row_scale — rejects wrong v shape") {
 
 // ── MoEFeedForward ────────────────────────────────────────────────────────────
 
-TEST_CASE("MoEFeedForward — output shape (T, D)") {
+TEST_CASE("MoEFeedForward - output shape (T, D)") {
     MoEFeedForward moe(16, 4, 2);
     auto x = make_input(5, 16);
     auto [out, aux] = moe.forward(x);
@@ -103,21 +103,21 @@ TEST_CASE("MoEFeedForward — output shape (T, D)") {
     REQUIRE(aux.data().numel() == 1);
 }
 
-TEST_CASE("MoEFeedForward — aux loss is non-negative") {
+TEST_CASE("MoEFeedForward - aux loss is non-negative") {
     MoEFeedForward moe(16, 4, 1, 0, 99);
     auto x = make_input(4, 16);
     auto [out, aux] = moe.forward(x);
     REQUIRE(aux.data().data_as<float>()[0] >= 0.0f);
 }
 
-TEST_CASE("MoEFeedForward — invalid construction throws") {
+TEST_CASE("MoEFeedForward - invalid construction throws") {
     REQUIRE_THROWS_AS(MoEFeedForward(16, 1, 1),   std::runtime_error);  // n_experts < 2
     REQUIRE_THROWS_AS(MoEFeedForward(16, 4, 0),   std::runtime_error);  // top_k < 1
     REQUIRE_THROWS_AS(MoEFeedForward(16, 4, 5),   std::runtime_error);  // top_k > n_experts
     REQUIRE_THROWS_AS(MoEFeedForward(0,  4, 1),   std::runtime_error);  // D <= 0
 }
 
-TEST_CASE("MoEFeedForward — gradient flows through router and experts") {
+TEST_CASE("MoEFeedForward - gradient flows through router and experts") {
     MoEFeedForward moe(8, 2, 1, 0, 7);
     auto x = make_input(3, 8);
     auto [out, aux] = moe.forward(x);
@@ -136,7 +136,7 @@ TEST_CASE("MoEFeedForward — gradient flows through router and experts") {
 
 // ── MoEGPT ────────────────────────────────────────────────────────────────────
 
-TEST_CASE("MoEGPT — forward output shape (T, V)") {
+TEST_CASE("MoEGPT - forward output shape (T, V)") {
     MoEGPT m(20, 16, 2, 1, 2, 4, 2);
     auto ids    = make_ids({0, 1, 2, 3});
     auto logits = m.forward(ids);
@@ -144,7 +144,7 @@ TEST_CASE("MoEGPT — forward output shape (T, V)") {
     REQUIRE(logits.data().shape(1) == 20);
 }
 
-TEST_CASE("MoEGPT — forward_moe returns aux loss") {
+TEST_CASE("MoEGPT - forward_moe returns aux loss") {
     MoEGPT m(20, 16, 2, 1, 2, 4, 2);
     auto ids = make_ids({0, 1, 2});
     auto [logits, aux] = m.forward_moe(ids);
@@ -153,7 +153,7 @@ TEST_CASE("MoEGPT — forward_moe returns aux loss") {
     REQUIRE(aux.data().data_as<float>()[0] >= 0.f);
 }
 
-TEST_CASE("MoEGPT — accessors") {
+TEST_CASE("MoEGPT - accessors") {
     MoEGPT m(30, 16, 2, 1, 3, 4, 2);
     REQUIRE(m.vocab_size() == 30);
     REQUIRE(m.embed_dim()  == 16);
@@ -162,13 +162,13 @@ TEST_CASE("MoEGPT — accessors") {
     REQUIRE(m.top_k()      == 2);
 }
 
-TEST_CASE("MoEGPT — invalid construction throws") {
+TEST_CASE("MoEGPT - invalid construction throws") {
     REQUIRE_THROWS_AS(MoEGPT(0,  16, 2, 1, 2, 4, 2), std::runtime_error);
     REQUIRE_THROWS_AS(MoEGPT(20,  0, 2, 1, 2, 4, 2), std::runtime_error);
     REQUIRE_THROWS_AS(MoEGPT(20, 16, 2, 1, 0, 4, 2), std::runtime_error);
 }
 
-TEST_CASE("MoEGPT — more parameters than dense ModernGPT (E experts vs 1)") {
+TEST_CASE("MoEGPT - more parameters than dense ModernGPT (E experts vs 1)") {
     // MoEGPT has E SwiGLU experts per block; ModernGPT has 1.
     // With E=4, MoE should have more params.
     MoEGPT moe(20, 16, 2, 1, 2, 4, 2);
@@ -182,7 +182,7 @@ TEST_CASE("MoEGPT — more parameters than dense ModernGPT (E experts vs 1)") {
     REQUIRE(count(moe) > count(dense));
 }
 
-TEST_CASE("MoEGPT — training step reduces loss") {
+TEST_CASE("MoEGPT - training step reduces loss") {
     const int64_t V = 20, T = 6;
     MoEGPT m(V, 16, 2, 1, 1, 2, 1, 0, 42);
     Adam adam(m.parameters(), 5e-3f);

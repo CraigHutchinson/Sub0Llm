@@ -332,17 +332,63 @@ python3 tools/download_model.py --preset qwen2-0.5b
     --query "what is sub0llm used for"
 
 # Write a fact to a persistent delta file
-./build/bin/sub0llm-episodic write \
-    --model models\Qwen3-0.6B-Q8_0.gguf \
-    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" \
+./build/bin/sub0llm-episodic write `
+    --model models\Qwen3-0.6B-Q8_0.gguf `
+    --fact  "sub0llm is a C++23 educational LLM framework by CraigHutchinson" `
     --delta /tmp/sub0llm.epis
 
-# Recall — measure NLL with and without the delta
-./build/bin/sub0llm-episodic recall \
-    --model models\Qwen3-0.6B-Q8_0.gguf \
-    --query "what is sub0llm" \
+# Recall — compare surprisal AND generated response, delta off vs on
+./build/bin/sub0llm-episodic recall `
+    --model models\Qwen3-0.6B-Q8_0.gguf `
+    --query "what is sub0llm" `
     --delta /tmp/sub0llm.epis
 ```
+
+The tool tokenises with the model's own GGUF BPE vocabulary (not raw bytes), so
+the surprisal (NLL) signal is meaningful and generated text is readable.
+`probe` and `recall` print the model's continuation of the query **with the
+delta off vs on**, so the encoded fact's effect is directly visible — e.g. a
+fact about "crystal lattices at 9 kelvin" steers the response toward
+"superconducting material / magnetic storage". Each rehearsal step's loss and
+gradient norm are streamed so a long write visibly converges.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lr F` | 5e-3 | rehearsal learning rate (gradients are clipped to ‖g‖≤1) |
+| `--steps N` | 10 | elaborative-rehearsal gradient steps per surprising span |
+| `--gen-tokens N` | 40 | length of the demonstrative query continuation (0 = skip) |
+| `--train-layers N` | -1 | trailing transformer blocks to update: -1 = last half (freezes embedding + early blocks → faster + more specific), 0 = full model, N = last N blocks |
+| `--angles N` | 0 | rehearse self-generated *question→fact* framings for retrieval linkage. The base model poses N questions about the fact; off-topic ones are auto-skipped, the rest are rehearsed so a *reworded* query transfers (fixes the single-phrasing failure). Cost ~×(1+kept). Improves transfer but increases specificity drift. |
+| `--lora-rank R` | 0 | write into low-rank, base-frozen adapters on the late-layer FFNs instead of full weights (0=off). The base is provably untouched, so the memory is a tiny, cleanly-detachable delta. NB: composability/storage wins, but **not** better specificity (the adapter is a global FFN change). Higher `--lr` needed (2e-2–5e-2). |
+| `--locality W` | 0 | penalise drift on a generic anchor (`W·MSE` of its logits vs the base). Keeps the write "light on existing memory" → specificity. The real PASS4 fix; `~1.0` works. |
+| `--adaptive-steps` | off | scale rehearsal steps by novelty: fewer steps when the fact's baseline NLL is low (the model already half-knows it). |
+| `--adaptive-lr` | off | likewise scale the learning rate by novelty (gentler step for familiar facts). Pairs with `--adaptive-steps`. |
+| `--iterative` | off | grow the `--angles` mid-training — each new question is generated from the *partially-trained* model, so it links to what's already embedded rather than guessing from the base. |
+
+Angles + locality must be trained **jointly** (one rehearsal session) — the tool
+does this automatically. The default freezes the embedding and first half of the
+blocks (~38% faster, more localised); `--train-layers 0` restores full-model updates.
+
+### sub0llm-episodic suite
+
+`sub0llm-episodic suite --model M [opts]` runs the probe over several built-in
+facts with one model load and prints a comparison table — variance across facts is
+real (some transfer, some don't), and the `baseNLL` column is the novelty signal
+that drives `--adaptive-steps`. Example (bare, no angles/locality):
+
+```
+  baseNLL  fact-drop  queryNLL  P1 P2 P3 P4  core
+    6.11      -44%      6.81    Y Y - -  fail   sub0llm ...
+    5.28      -58%      4.19    Y Y Y -  PASS   Project Zephyr ...
+    2.98      -58%      3.63    Y Y - -  fail   Mount Everest ...   (familiar → low baseNLL)
+```
+
+A config that passes **all four** checks on Qwen3-0.6B (PASS2 −55%, PASS3 transfers,
+PASS4 −0.8% within the strict 2% bar) by writing into a frozen-base low-rank
+partition and keeping it off existing knowledge:
+`--lora-rank 8 --angles 3 --locality 1.0 --lr 5e-2 --steps 20`. The three guards —
+frozen base, low rank, locality — together give learning + transfer + specificity
+that none achieves alone.
 
 **GGUF compatibility**: Qwen2 (0.5B–72B), Qwen3 (0.6B–235B, including models
 with explicit `head_dim` != `embed_dim/n_heads`).  Quantisation: F32, F16, Q8_0.

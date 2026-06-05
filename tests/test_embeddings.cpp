@@ -34,7 +34,7 @@ static Tensor int_tensor(std::vector<int32_t> vals) {
 
 // ── embedding_lookup forward ──────────────────────────────────────────────────
 
-TEST_CASE("embedding_lookup — forward gathers correct rows", "[embed]") {
+TEST_CASE("embedding_lookup - forward gathers correct rows", "[embed]") {
     // Weight: [[1,2],[3,4],[5,6]]  indices: [2, 0, 1]
     auto W = leaf2d({1.f,2.f, 3.f,4.f, 5.f,6.f}, 3, 2);
     auto idx = int_tensor({2, 0, 1});
@@ -46,7 +46,7 @@ TEST_CASE("embedding_lookup — forward gathers correct rows", "[embed]") {
     REQUIRE_THAT(od[4], WithinAbs(3.0f, 1e-5f));  // row 1
 }
 
-TEST_CASE("embedding_lookup — output shape 1D indices", "[embed]") {
+TEST_CASE("embedding_lookup - output shape 1D indices", "[embed]") {
     auto W   = leaf2d(std::vector<float>(10 * 4, 0.f), 10, 4);
     auto idx = int_tensor({0, 3, 7});
     auto out = embedding_lookup(W, idx);
@@ -55,18 +55,18 @@ TEST_CASE("embedding_lookup — output shape 1D indices", "[embed]") {
     REQUIRE(out.data().shape()[1] == 4);
 }
 
-TEST_CASE("embedding_lookup — out-of-range index throws", "[embed]") {
+TEST_CASE("embedding_lookup - out-of-range index throws", "[embed]") {
     auto W   = leaf2d(std::vector<float>(4 * 2, 0.f), 4, 2);
     auto idx = int_tensor({5});   // vocab_size=4, 5 out of range
     REQUIRE_THROWS_AS(embedding_lookup(W, idx), std::runtime_error);
 }
 
-TEST_CASE("sinusoidal_encoding — non-positive seq_len throws", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - non-positive seq_len throws", "[embed][pe]") {
     REQUIRE_THROWS_AS(sinusoidal_encoding(0,  8), std::runtime_error);
     REQUIRE_THROWS_AS(sinusoidal_encoding(-1, 8), std::runtime_error);
 }
 
-TEST_CASE("LearnedPE — non-positive seq_len throws", "[embed][pe]") {
+TEST_CASE("LearnedPE - non-positive seq_len throws", "[embed][pe]") {
     LearnedPositionalEncoding lpe(16, 4);
     REQUIRE_THROWS_AS(lpe.forward(0),  std::runtime_error);
     REQUIRE_THROWS_AS(lpe.forward(-1), std::runtime_error);
@@ -74,7 +74,7 @@ TEST_CASE("LearnedPE — non-positive seq_len throws", "[embed][pe]") {
 
 // ── embedding_lookup backward ─────────────────────────────────────────────────
 
-TEST_CASE("embedding_lookup — backward gathers correct grad rows", "[embed]") {
+TEST_CASE("embedding_lookup - backward gathers correct grad rows", "[embed]") {
     // Weight (3,2), indices [0,2]: upstream = all-ones → each row gets (1,1)
     auto W   = leaf2d({0.f,0.f, 0.f,0.f, 0.f,0.f}, 3, 2);
     auto idx = int_tensor({0, 2});
@@ -87,7 +87,7 @@ TEST_CASE("embedding_lookup — backward gathers correct grad rows", "[embed]") 
     REQUIRE_THAT(gd[4], WithinAbs(1.0f, 1e-5f));  // row 2, dim 0
 }
 
-TEST_CASE("embedding_lookup — repeated token accumulates gradient", "[embed]") {
+TEST_CASE("embedding_lookup - repeated token accumulates gradient", "[embed]") {
     // indices [1, 1]: token 1 appears twice, so grad[1] should be 2× upstream.
     auto W   = leaf2d({0.f,0.f, 0.f,0.f, 0.f,0.f}, 3, 2);
     auto idx = int_tensor({1, 1});
@@ -99,7 +99,7 @@ TEST_CASE("embedding_lookup — repeated token accumulates gradient", "[embed]")
     REQUIRE_THAT(gd[0], WithinAbs(0.0f, 1e-5f));  // row 0 unused
 }
 
-TEST_CASE("embedding_lookup — unused tokens have zero gradient", "[embed]") {
+TEST_CASE("embedding_lookup - unused tokens have zero gradient", "[embed]") {
     auto W   = leaf2d(std::vector<float>(5 * 3, 1.f), 5, 3);
     auto idx = int_tensor({0, 2});
     auto out = embedding_lookup(W, idx);
@@ -113,7 +113,7 @@ TEST_CASE("embedding_lookup — unused tokens have zero gradient", "[embed]") {
 
 // ── Embedding class ───────────────────────────────────────────────────────────
 
-TEST_CASE("Embedding — weight shape is (vocab, dim)", "[embed]") {
+TEST_CASE("Embedding - weight shape is (vocab, dim)", "[embed]") {
     Embedding e(20, 8);
     REQUIRE(e.vocab_size() == 20);
     REQUIRE(e.embed_dim()  == 8);
@@ -121,12 +121,12 @@ TEST_CASE("Embedding — weight shape is (vocab, dim)", "[embed]") {
     REQUIRE(e.weight().data().shape()[1] == 8);
 }
 
-TEST_CASE("Embedding — requires_grad=true on weight", "[embed]") {
+TEST_CASE("Embedding - requires_grad=true on weight", "[embed]") {
     Embedding e(10, 4);
     REQUIRE(e.weight().requires_grad());
 }
 
-TEST_CASE("Embedding — forward matches manual lookup", "[embed]") {
+TEST_CASE("Embedding - forward matches manual lookup", "[embed]") {
     Embedding e(5, 3, 0);
     auto idx = int_tensor({2, 4});
     auto out = e.forward(idx);
@@ -139,20 +139,20 @@ TEST_CASE("Embedding — forward matches manual lookup", "[embed]") {
         REQUIRE_THAT(od[3u + j], WithinAbs(wd[4u * 3u + j], 1e-5f));  // row 4
 }
 
-TEST_CASE("Embedding — invalid vocab/dim throws", "[embed]") {
+TEST_CASE("Embedding - invalid vocab/dim throws", "[embed]") {
     REQUIRE_THROWS_AS(Embedding(0, 4),  std::runtime_error);
     REQUIRE_THROWS_AS(Embedding(10, 0), std::runtime_error);
 }
 
 // ── sinusoidal_encoding ───────────────────────────────────────────────────────
 
-TEST_CASE("sinusoidal_encoding — shape is (T, D)", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - shape is (T, D)", "[embed][pe]") {
     auto pe = sinusoidal_encoding(8, 16);
     REQUIRE(pe.shape()[0] == 8);
     REQUIRE(pe.shape()[1] == 16);
 }
 
-TEST_CASE("sinusoidal_encoding — pos 0, even dims are 0", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - pos 0, even dims are 0", "[embed][pe]") {
     auto pe = sinusoidal_encoding(4, 8);
     const auto pd = pe.data_as<float>();
     // sin(0) = 0 for all even dims
@@ -160,7 +160,7 @@ TEST_CASE("sinusoidal_encoding — pos 0, even dims are 0", "[embed][pe]") {
         REQUIRE_THAT(pd[i * 2u], WithinAbs(0.0f, 1e-5f));
 }
 
-TEST_CASE("sinusoidal_encoding — pos 0, odd dims are 1", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - pos 0, odd dims are 1", "[embed][pe]") {
     auto pe = sinusoidal_encoding(4, 8);
     const auto pd = pe.data_as<float>();
     // cos(0) = 1 for all odd dims
@@ -168,11 +168,11 @@ TEST_CASE("sinusoidal_encoding — pos 0, odd dims are 1", "[embed][pe]") {
         REQUIRE_THAT(pd[i * 2u + 1u], WithinAbs(1.0f, 1e-5f));
 }
 
-TEST_CASE("sinusoidal_encoding — odd embed_dim throws", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - odd embed_dim throws", "[embed][pe]") {
     REQUIRE_THROWS_AS(sinusoidal_encoding(4, 7), std::runtime_error);
 }
 
-TEST_CASE("sinusoidal_encoding — rows have equal L2 norm", "[embed][pe]") {
+TEST_CASE("sinusoidal_encoding - rows have equal L2 norm", "[embed][pe]") {
     // All row norms should equal sqrt(D/2) (each sin²+cos² pair = 1).
     const int64_t T = 6, D = 12;
     auto pe = sinusoidal_encoding(T, D);
@@ -188,35 +188,35 @@ TEST_CASE("sinusoidal_encoding — rows have equal L2 norm", "[embed][pe]") {
 
 // ── LearnedPositionalEncoding ─────────────────────────────────────────────────
 
-TEST_CASE("LearnedPE — weight shape is (max_seq_len, dim)", "[embed][pe]") {
+TEST_CASE("LearnedPE - weight shape is (max_seq_len, dim)", "[embed][pe]") {
     LearnedPositionalEncoding lpe(64, 8);
     REQUIRE(lpe.max_seq_len() == 64);
     REQUIRE(lpe.embed_dim()   == 8);
     REQUIRE(lpe.weight().data().shape()[0] == 64);
 }
 
-TEST_CASE("LearnedPE — forward shape is (seq_len, dim)", "[embed][pe]") {
+TEST_CASE("LearnedPE - forward shape is (seq_len, dim)", "[embed][pe]") {
     LearnedPositionalEncoding lpe(64, 8);
     auto out = lpe.forward(10);
     REQUIRE(out.data().shape()[0] == 10);
     REQUIRE(out.data().shape()[1] == 8);
 }
 
-TEST_CASE("LearnedPE — seq_len > max throws", "[embed][pe]") {
+TEST_CASE("LearnedPE - seq_len > max throws", "[embed][pe]") {
     LearnedPositionalEncoding lpe(8, 4);
     REQUIRE_THROWS_AS(lpe.forward(9), std::runtime_error);
 }
 
 // ── apply_rope ────────────────────────────────────────────────────────────────
 
-TEST_CASE("apply_rope — output shape matches input", "[embed][rope]") {
+TEST_CASE("apply_rope - output shape matches input", "[embed][rope]") {
     Tensor x = randn({6, 8});
     auto out = apply_rope(x);
     REQUIRE(out.shape()[0] == 6);
     REQUIRE(out.shape()[1] == 8);
 }
 
-TEST_CASE("apply_rope — position 0 is unchanged (theta=0 → rotation is identity)", "[embed][rope]") {
+TEST_CASE("apply_rope - position 0 is unchanged (theta=0 -> rotation is identity)", "[embed][rope]") {
     Tensor x = randn({4, 8});
     auto out = apply_rope(x);
     const auto xs  = x.data_as<float>();
@@ -226,7 +226,7 @@ TEST_CASE("apply_rope — position 0 is unchanged (theta=0 → rotation is ident
         REQUIRE_THAT(os[j], WithinAbs(xs[j], 1e-5f));
 }
 
-TEST_CASE("apply_rope — rotation preserves vector norms", "[embed][rope]") {
+TEST_CASE("apply_rope - rotation preserves vector norms", "[embed][rope]") {
     Tensor x = randn({4, 8});
     auto out = apply_rope(x);
     const auto xs  = x.data_as<float>();
@@ -241,7 +241,7 @@ TEST_CASE("apply_rope — rotation preserves vector norms", "[embed][rope]") {
     }
 }
 
-TEST_CASE("apply_rope — odd embed_dim throws", "[embed][rope]") {
+TEST_CASE("apply_rope - odd embed_dim throws", "[embed][rope]") {
     Tensor x = zeros({4, 7});
     REQUIRE_THROWS_AS(apply_rope(x), std::runtime_error);
 }

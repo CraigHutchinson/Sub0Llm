@@ -88,6 +88,8 @@
 #include <format>
 #include <iomanip>
 #include <iostream>
+#include <string>
+#include <string_view>
 #include <vector>
 
 using namespace sub0llm;
@@ -110,17 +112,22 @@ static double ms_now() {
         1000.0;
 }
 
-static void rule(char c = '─', int n = 60) {
-    std::cout << std::string(static_cast<std::size_t>(n), c) << "\n";
+static void rule(std::string_view c = "─", int n = 60) {
+    // c may be a multi-byte UTF-8 glyph (e.g. box-drawing ─/═), so it cannot be
+    // a narrow char; repeat the whole sequence n times.
+    std::string line;
+    line.reserve(c.size() * static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) line += c;
+    std::cout << line << "\n";
 }
 
 // ── §0  The four jobs of context ─────────────────────────────────────────────
 
 static void explain_context_jobs() {
-    rule('═');
+    rule("═");
     std::cout <<
         "§0  What is context, and what does attention actually do?\n";
-    rule('═');
+    rule("═");
     std::cout << R"(
 Every time the model generates the next token it looks back at all previous
 tokens and decides which ones are relevant.  That look-back is attention.
@@ -167,9 +174,9 @@ Attention made full causal attention memory-tractable.
 // ── §1  The quadratic wall ────────────────────────────────────────────────────
 
 static void demo_quadratic_wall() {
-    rule('─');
+    rule("-");
     std::cout << "§1  The quadratic wall\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "With naive forward(), each new token requires re-running the full\n"
         "sequence through every layer.  Step t costs O(t) work; summed over\n"
@@ -191,9 +198,9 @@ static void demo_quadratic_wall() {
 // ── §2  KV-cache speedup ──────────────────────────────────────────────────────
 
 static void demo_kv_cache_speedup() {
-    rule('─');
+    rule("-");
     std::cout << "§2  KV-cache: measured speedup\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "We time two generation strategies on the same model:\n"
         "  Naive   — re-run the full sequence (prompt + generated so far)\n"
@@ -277,9 +284,9 @@ static void demo_kv_cache_speedup() {
 // ── §3  Sliding-window attention — trade-offs ─────────────────────────────────
 
 static void demo_sliding_window() {
-    rule('─');
+    rule("-");
     std::cout << "§3  Sliding-window attention — job-3 trade-off\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "With window size W each token attends only to the last W tokens.\n"
         "The causal mask becomes a banded diagonal rather than lower-triangular.\n\n"
@@ -313,9 +320,9 @@ static void demo_sliding_window() {
 // ── §4  RoPE NTK / YaRN scaling — extrapolating beyond training length ────────
 
 static void demo_rope_scaling() {
-    rule('─');
+    rule("-");
     std::cout << "§4  RoPE context extension — NTK scaling and YaRN\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "RoPE encodes position by rotating Q and K vectors.  Each dimension\n"
         "pair (i, i+D/2) rotates at a different frequency:\n\n"
@@ -369,9 +376,9 @@ static void demo_rope_scaling() {
 // ── §5  KV memory budget — what long context actually costs ───────────────────
 
 static void demo_memory_budget() {
-    rule('─');
+    rule("-");
     std::cout << "§5  KV cache memory budget — production perspective\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "KV cache formula:  2 × n_layers × n_kv_heads × head_dim × ctx_len × dtype_bytes\n"
         "The factor of 2 is for K and V separately.\n\n"
@@ -406,9 +413,9 @@ static void demo_memory_budget() {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
-    rule('═');
+    rule("═");
     std::cout << "Chapter 25 — Long-Context Inference\n";
-    rule('═');
+    rule("═");
 
     explain_context_jobs();
     demo_quadratic_wall();
@@ -417,10 +424,10 @@ int main() {
     demo_rope_scaling();
     demo_memory_budget();
 
-    rule('═');
+    rule("═");
     std::cout <<
         "Summary\n";
-    rule('─');
+    rule("-");
     std::cout <<
         "Context serves four jobs: grammar glue, topic memory, key-fact\n"
         "retrieval, and rule framing.  Every long-context technique is a\n"
@@ -436,7 +443,7 @@ int main() {
         "Next: Chapter 26 will implement Multi-head Latent Attention (MLA),\n"
         "the DeepSeek technique that compresses KV to a low-rank latent\n"
         "vector — 9× less memory than MHA, better quality than GQA.\n";
-    rule('═');
+    rule("═");
 
     std::cout << "\n[ch25] Done.\n";
     return 0;

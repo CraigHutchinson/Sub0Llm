@@ -99,6 +99,48 @@ void merge_pair(WordList& words,
     }
 }
 
+// GPT-2 byte-level decoder: maps each remapped Unicode code point back to the
+// original byte.  GPT-2/Qwen vocabularies encode every byte as a printable code
+// point (printable ASCII maps to itself; other bytes map to U+0100+n), so to
+// recover text we reverse that mapping.  See Radford et al. bytes_to_unicode().
+const std::unordered_map<uint32_t, unsigned char>& gpt2_byte_decoder() {
+    static const std::unordered_map<uint32_t, unsigned char> dec = [] {
+        std::vector<int> bs;
+        for (int b = '!';   b <= '~';   ++b) bs.push_back(b);   // 0x21..0x7E
+        for (int b = 0xA1;  b <= 0xAC;  ++b) bs.push_back(b);
+        for (int b = 0xAE;  b <= 0xFF;  ++b) bs.push_back(b);
+        std::vector<int> cs = bs;
+        int n = 0;
+        for (int b = 0; b < 256; ++b)
+            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+                bs.push_back(b);
+                cs.push_back(256 + n);
+                ++n;
+            }
+        std::unordered_map<uint32_t, unsigned char> d;
+        for (std::size_t i = 0; i < bs.size(); ++i)
+            d[static_cast<uint32_t>(cs[i])] = static_cast<unsigned char>(bs[i]);
+        return d;
+    }();
+    return dec;
+}
+
+// Decode the next UTF-8 code point from [p, end); advances p. Returns the code
+// point, or 0xFFFD on a malformed sequence (consuming one byte).
+uint32_t next_codepoint(const unsigned char*& p, const unsigned char* end) {
+    const unsigned char c = *p;
+    int len; uint32_t cp;
+    if      (c < 0x80) { len = 1; cp = c; }
+    else if (c < 0xE0) { len = 2; cp = c & 0x1Fu; }
+    else if (c < 0xF0) { len = 3; cp = c & 0x0Fu; }
+    else               { len = 4; cp = c & 0x07u; }
+    if (p + len > end) { ++p; return 0xFFFDu; }
+    for (int i = 1; i < len; ++i)
+        cp = (cp << 6) | (static_cast<uint32_t>(p[i]) & 0x3Fu);
+    p += len;
+    return cp;
+}
+
 } // anonymous namespace
 
 // ── add_token / add_special_token ──────────────────────────────────────────────
@@ -230,6 +272,48 @@ BPETokenizer BPETokenizer::load(
     return tok;
 }
 
+// ── from_vocab ────────────────────────────────────────────────────────────────
+
+BPETokenizer BPETokenizer::from_vocab(
+    const std::vector<std::string>& id_to_token,
+    const std::vector<std::string>& merges_list)
+{
+    BPETokenizer tok;
+    tok.byte_level_  = true;   // GGUF vocabs use GPT-2 byte-level encoding
+    tok.id_to_token_ = id_to_token;
+    for (TokenId i = 0; i < static_cast<TokenId>(id_to_token.size()); ++i)
+        tok.vocab_[id_to_token[static_cast<std::size_t>(i)]] = i;
+
+    for (const auto& entry : merges_list) {
+        const auto sp = entry.find(' ');
+        if (sp == std::string::npos) continue;
+        tok.merges_.emplace_back(entry.substr(0, sp), entry.substr(sp + 1));
+    }
+
+    // Detect common special tokens.
+    for (const std::string& eos_str : {"<|endoftext|>", "<eos>", "</s>", "<|im_end|>"}) {
+        if (auto it = tok.vocab_.find(eos_str); it != tok.vocab_.end()) {
+            tok.eos_id_ = it->second;
+            if (tok.bos_id_ < 0) tok.bos_id_ = it->second;
+            break;
+        }
+    }
+    for (const std::string& bos_str : {"<|startoftext|>", "<bos>", "<s>", "<|im_start|>"}) {
+        if (auto it = tok.vocab_.find(bos_str); it != tok.vocab_.end()) {
+            tok.bos_id_ = it->second;
+            break;
+        }
+    }
+    for (const std::string& unk_str : {"<unk>", "<|unk|>", "[UNK]"}) {
+        if (auto it = tok.vocab_.find(unk_str); it != tok.vocab_.end()) {
+            tok.unk_id_ = it->second;
+            break;
+        }
+    }
+
+    return tok;
+}
+
 // ── encode_word ────────────────────────────────────────────────────────────────
 
 std::vector<BPETokenizer::TokenId>
@@ -298,6 +382,29 @@ BPETokenizer::encode(std::string_view text) const {
 
 std::string BPETokenizer::decode(std::span<const TokenId> ids) const {
     std::string out;
+
+    // Byte-level (GPT-2/Qwen) vocab: every token char is a remapped byte, so map
+    // each code point back to its byte; the assembled bytes form the UTF-8 text.
+    if (byte_level_) {
+        const auto& dec = gpt2_byte_decoder();
+        for (const TokenId id : ids) {
+            if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size())
+                throw std::runtime_error(
+                    std::format("BPETokenizer::decode: id {} out of range [0,{})",
+                        id, id_to_token_.size()));
+            const std::string& tok = id_to_token_[static_cast<std::size_t>(id)];
+            const auto* p   = reinterpret_cast<const unsigned char*>(tok.data());
+            const auto* end = p + tok.size();
+            while (p < end) {
+                const uint32_t cp = next_codepoint(p, end);
+                if (const auto it = dec.find(cp); it != dec.end())
+                    out += static_cast<char>(it->second);   // recovered byte
+                // Special tokens (e.g. <|endoftext|>) aren't byte-mapped — skip.
+            }
+        }
+        return out;
+    }
+
     for (const TokenId id : ids) {
         if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size())
             throw std::runtime_error(

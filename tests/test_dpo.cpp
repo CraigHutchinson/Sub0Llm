@@ -12,7 +12,7 @@ using namespace sub0llm;
 using namespace sub0llm::autograd;
 using namespace sub0llm::nn;
 
-TEST_CASE("log_sigmoid — forward values") {
+TEST_CASE("log_sigmoid - forward values") {
     auto eval_log_sig = [](float x_val) -> float {
         Tensor xd({1}, DType::Float32);
         xd.data_as<float>()[0] = x_val;
@@ -30,7 +30,7 @@ TEST_CASE("log_sigmoid — forward values") {
     REQUIRE_THAT(eval_log_sig(-10.0f), WithinAbs(-10.0f, 1e-2f));
 }
 
-TEST_CASE("log_sigmoid — backward") {
+TEST_CASE("log_sigmoid - backward") {
     Tensor xd({1}, DType::Float32);
     xd.data_as<float>()[0] = 0.5f;
     const float eps = 1e-3f;
@@ -48,8 +48,8 @@ TEST_CASE("log_sigmoid — backward") {
     REQUIRE_THAT(xv.grad().data_as<float>()[0], WithinAbs(ng, 1e-3f));
 }
 
-TEST_CASE("log_prob_sequence — throws on T<2") {
-    // Build trivial logits (1, V) — T=1 should throw
+TEST_CASE("log_prob_sequence - throws on T<2") {
+    // Build trivial logits (1, V) - T=1 should throw
     Tensor ld({1, 4}, DType::Float32);
     auto ls = ld.data_as<float>();
     for (std::size_t i = 0; i < ls.size(); ++i) ls[i] = 0.25f;
@@ -61,7 +61,7 @@ TEST_CASE("log_prob_sequence — throws on T<2") {
     REQUIRE_THROWS_AS(log_prob_sequence(logits, ids), std::runtime_error);
 }
 
-TEST_CASE("log_prob_sequence — returns scalar") {
+TEST_CASE("log_prob_sequence - returns scalar") {
     const int64_t T = 4;
     const int64_t V = 8;
     Tensor ld({T, V}, DType::Float32);
@@ -84,7 +84,7 @@ TEST_CASE("log_prob_sequence — returns scalar") {
     REQUIRE(std::isfinite(lp.data().data_as<float>()[0]));
 }
 
-TEST_CASE("log_prob_sequence — backward works") {
+TEST_CASE("log_prob_sequence - backward works") {
     const int64_t T = 4;
     const int64_t V = 8;
     Tensor ld({T, V}, DType::Float32);
@@ -105,11 +105,11 @@ TEST_CASE("log_prob_sequence — backward works") {
     Variable lp = log_prob_sequence(logits, ids);
     REQUIRE(std::isfinite(lp.data().data_as<float>()[0]));
     lp.backward();
-    // Gradient should have been computed — logits grad should exist
+    // Gradient should have been computed - logits grad should exist
     REQUIRE(logits.grad().numel() == T * V);
 }
 
-TEST_CASE("dpo_loss — returns scalar") {
+TEST_CASE("dpo_loss - returns scalar") {
     const int64_t T = 4;
     const int64_t V = 8;
 
@@ -144,7 +144,7 @@ TEST_CASE("dpo_loss — returns scalar") {
     REQUIRE(logits_l.grad().numel() == T * V);
 }
 
-TEST_CASE("dpo_loss — equal sequences give zero margin") {
+TEST_CASE("dpo_loss - equal sequences give zero margin") {
     const int64_t T = 4;
     const int64_t V = 8;
 
@@ -171,7 +171,7 @@ TEST_CASE("dpo_loss — equal sequences give zero margin") {
                  WithinAbs(std::log(2.0f), 1e-4f));
 }
 
-TEST_CASE("dpo_loss — backward flows to model params") {
+TEST_CASE("dpo_loss - backward flows to model params") {
     const int64_t V = 16;
     const int64_t D = 16;
 

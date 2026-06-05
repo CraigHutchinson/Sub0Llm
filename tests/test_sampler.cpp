@@ -37,26 +37,26 @@ static Tensor make_logits_2d(int64_t T, int64_t V, std::initializer_list<float> 
 
 // ── greedy_sample ─────────────────────────────────────────────────────────────
 
-TEST_CASE("greedy_sample — argmax on 1-D logits", "[sampler]") {
+TEST_CASE("greedy_sample - argmax on 1-D logits", "[sampler]") {
     // Highest logit is index 2.
     Tensor logits = make_logits_1d({0.1f, 0.5f, 3.0f, 1.2f});
     REQUIRE(greedy_sample(logits) == 2);
 }
 
-TEST_CASE("greedy_sample — uses last row of 2-D logits", "[sampler]") {
+TEST_CASE("greedy_sample - uses last row of 2-D logits", "[sampler]") {
     // First row has max at index 0; last row has max at index 3.
     Tensor logits = make_logits_2d(3, 4, {-1.0f, -2.0f, 0.0f, 5.0f});
     REQUIRE(greedy_sample(logits) == 3);
 }
 
-TEST_CASE("greedy_sample — wrong dtype throws", "[sampler]") {
+TEST_CASE("greedy_sample - wrong dtype throws", "[sampler]") {
     Tensor t({4}, DType::Int32);
     REQUIRE_THROWS_AS(greedy_sample(t), std::runtime_error);
 }
 
 // ── temperature_sample ────────────────────────────────────────────────────────
 
-TEST_CASE("temperature_sample — very low temperature approaches greedy", "[sampler]") {
+TEST_CASE("temperature_sample - very low temperature approaches greedy", "[sampler]") {
     // With temp=0.01 the distribution is extremely peaked; the argmax token
     // should be selected for the overwhelming majority of draws.
     Tensor logits = make_logits_1d({0.0f, 0.0f, 10.0f, 0.0f});
@@ -69,14 +69,14 @@ TEST_CASE("temperature_sample — very low temperature approaches greedy", "[sam
     REQUIRE(wins == 100);
 }
 
-TEST_CASE("temperature_sample — non-positive temperature throws", "[sampler]") {
+TEST_CASE("temperature_sample - non-positive temperature throws", "[sampler]") {
     Tensor logits = make_logits_1d({1.0f, 2.0f, 3.0f});
     std::mt19937 rng(1);
     REQUIRE_THROWS_AS(temperature_sample(logits, 0.0f, rng), std::runtime_error);
     REQUIRE_THROWS_AS(temperature_sample(logits, -1.0f, rng), std::runtime_error);
 }
 
-TEST_CASE("temperature_sample — output always within vocab range", "[sampler]") {
+TEST_CASE("temperature_sample - output always within vocab range", "[sampler]") {
     Tensor logits = make_logits_1d({1.0f, 2.0f, 3.0f, 4.0f});
     std::mt19937 rng(99);
     for (int i = 0; i < 200; ++i) {
@@ -88,7 +88,7 @@ TEST_CASE("temperature_sample — output always within vocab range", "[sampler]"
 
 // ── top_k_sample ──────────────────────────────────────────────────────────────
 
-TEST_CASE("top_k_sample — k=1 always picks the max", "[sampler]") {
+TEST_CASE("top_k_sample - k=1 always picks the max", "[sampler]") {
     // k=1 collapses to greedy.
     Tensor logits = make_logits_1d({1.0f, 9.0f, 2.0f, 3.0f});
     std::mt19937 rng(7);
@@ -96,7 +96,7 @@ TEST_CASE("top_k_sample — k=1 always picks the max", "[sampler]") {
         REQUIRE(top_k_sample(logits, 1, 1.0f, rng) == 1);
 }
 
-TEST_CASE("top_k_sample — never samples below the top-k threshold", "[sampler]") {
+TEST_CASE("top_k_sample - never samples below the top-k threshold", "[sampler]") {
     // Logits: indices 0,1 are clearly highest; 2,3 are suppressed.
     // With k=2, tokens 2 and 3 should never appear.
     Tensor logits = make_logits_1d({5.0f, 4.0f, -10.0f, -10.0f});
@@ -107,7 +107,7 @@ TEST_CASE("top_k_sample — never samples below the top-k threshold", "[sampler]
     }
 }
 
-TEST_CASE("top_k_sample — k < 1 throws", "[sampler]") {
+TEST_CASE("top_k_sample - k < 1 throws", "[sampler]") {
     Tensor logits = make_logits_1d({1.0f, 2.0f});
     std::mt19937 rng(0);
     REQUIRE_THROWS_AS(top_k_sample(logits, 0, 1.0f, rng), std::runtime_error);
@@ -115,7 +115,7 @@ TEST_CASE("top_k_sample — k < 1 throws", "[sampler]") {
 
 // ── top_p_sample ──────────────────────────────────────────────────────────────
 
-TEST_CASE("top_p_sample — p=1.0 uses the full distribution", "[sampler]") {
+TEST_CASE("top_p_sample - p=1.0 uses the full distribution", "[sampler]") {
     // With p=1.0 all tokens are eligible; just verify no crash and valid range.
     Tensor logits = make_logits_1d({1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
     std::mt19937 rng(21);
@@ -126,7 +126,7 @@ TEST_CASE("top_p_sample — p=1.0 uses the full distribution", "[sampler]") {
     }
 }
 
-TEST_CASE("top_p_sample — very small p selects only the top token", "[sampler]") {
+TEST_CASE("top_p_sample - very small p selects only the top token", "[sampler]") {
     // The highest-prob token alone exceeds p=0.01, so it must always be picked.
     Tensor logits = make_logits_1d({0.0f, 0.0f, 0.0f, 50.0f});
     std::mt19937 rng(55);
@@ -134,7 +134,7 @@ TEST_CASE("top_p_sample — very small p selects only the top token", "[sampler]
         REQUIRE(top_p_sample(logits, 0.01f, 1.0f, rng) == 3);
 }
 
-TEST_CASE("top_p_sample — out-of-range p throws", "[sampler]") {
+TEST_CASE("top_p_sample - out-of-range p throws", "[sampler]") {
     Tensor logits = make_logits_1d({1.0f, 2.0f});
     std::mt19937 rng(0);
     REQUIRE_THROWS_AS(top_p_sample(logits, 0.0f, 1.0f, rng), std::runtime_error);
@@ -143,8 +143,8 @@ TEST_CASE("top_p_sample — out-of-range p throws", "[sampler]") {
 
 // ── generate ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("generate — output length is prompt + max_new", "[sampler]") {
-    // Tiny model: V=8, D=8, 1 head, 1 layer — just needs to run without crashing.
+TEST_CASE("generate - output length is prompt + max_new", "[sampler]") {
+    // Tiny model: V=8, D=8, 1 head, 1 layer - just needs to run without crashing.
     ModernGPT model(/*vocab_size=*/8, /*embed_dim=*/8,
                     /*n_heads=*/1, /*n_kv_heads=*/1, /*n_layers=*/1,
                     /*d_ff=*/0, /*n_mtp_heads=*/0, /*seed=*/7);
@@ -163,7 +163,7 @@ TEST_CASE("generate — output length is prompt + max_new", "[sampler]") {
     REQUIRE(out[2] == 2);
 }
 
-TEST_CASE("generate — all generated tokens are within vocab range", "[sampler]") {
+TEST_CASE("generate - all generated tokens are within vocab range", "[sampler]") {
     constexpr int64_t V = 16;
     ModernGPT model(V, 16, 2, 1, 1, 0, 0, /*seed=*/3);
 
@@ -183,14 +183,14 @@ TEST_CASE("generate — all generated tokens are within vocab range", "[sampler]
     }
 }
 
-TEST_CASE("generate — empty prompt throws", "[sampler]") {
+TEST_CASE("generate - empty prompt throws", "[sampler]") {
     ModernGPT model(8, 8, 1, 1, 1, 0, 0, 1);
     std::mt19937 rng(0);
     SamplingConfig cfg;
     REQUIRE_THROWS_AS(generate(model, {}, 1, cfg, rng), std::runtime_error);
 }
 
-TEST_CASE("generate — max_new < 1 throws", "[sampler]") {
+TEST_CASE("generate - max_new < 1 throws", "[sampler]") {
     ModernGPT model(8, 8, 1, 1, 1, 0, 0, 1);
     std::mt19937 rng(0);
     SamplingConfig cfg;

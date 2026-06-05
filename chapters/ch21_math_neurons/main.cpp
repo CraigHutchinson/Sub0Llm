@@ -8,6 +8,7 @@
 #include "sub0llm/core/tensor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>

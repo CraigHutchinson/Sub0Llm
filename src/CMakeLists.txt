@@ -3,6 +3,7 @@ set(SUB0LLM_SOURCES
     core/ops.cpp
     backends/cpu/kernels.cpp
     backends/cpu/matmul.cpp
+    backends/cpu/quant.cpp
     backends/cuda/backend.cpp
     backends/openvino/backend.cpp
     tokenizer/bpe.cpp
@@ -81,3 +82,14 @@ set_target_properties(sub0llm PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     ARCHIVE_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}/lib"
 )
+
+# nvcc has no "CUDA23" dialect; the C++23 requirement on this mixed-language
+# target would otherwise propagate to the .cu sources and fail configuration.
+# Device code only needs C++20, so pin the CUDA dialect explicitly.
+if(SUB0LLM_ENABLE_CUDA)
+    set_target_properties(sub0llm PROPERTIES
+        CUDA_STANDARD          20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES     native
+    )
+endif()

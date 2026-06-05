@@ -148,7 +148,7 @@ TEST_CASE("NumericRouter: gradient flows through soft_probs") {
     auto x = make_input(T, D);
     auto [soft_probs, hard_mask] = router.forward(x);
 
-    // Penalise the class-0 probability for each token — sum(p_0 over T).
+    // Penalise the class-0 probability for each token - sum(p_0 over T).
     // Unlike sum(all soft_probs) which equals T (constant, zero gradient),
     // a single class probability has a well-defined non-zero gradient through softmax.
     auto prob_class0 = narrow(transpose2d(soft_probs), 0, 1);  // (1, T)

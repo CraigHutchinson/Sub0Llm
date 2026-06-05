@@ -192,41 +192,41 @@ std::vector<int32_t> generate(ModernGPT&                  model,
     std::vector<int32_t> tokens(prompt);
     tokens.reserve(prompt.size() + static_cast<std::size_t>(max_new));
 
-    for (int64_t step = 0; step < max_new; ++step) {
-        // Build a (T,) Int32 token-id tensor from the current sequence.
-        const int64_t T = static_cast<int64_t>(tokens.size());
-        Tensor ids({T}, DType::Int32);
-        {
-            auto sp = ids.data_as<int32_t>();
-            for (std::size_t i = 0; i < tokens.size(); ++i)
-                sp[i] = tokens[i];
-        }
-
-        // Forward pass — returns Variable wrapping logits (T, V).
-        // Copy the Tensor (shared storage) so it survives the temporary Variable.
-        Tensor logits = model.forward(ids).data();
-
-        int32_t next_token{};
+    auto sample_next = [&](const Tensor& logits) -> int32_t {
         switch (cfg.mode) {
             case SamplingMode::Greedy:
-                next_token = greedy_sample(logits);
-                break;
+                return greedy_sample(logits);
             case SamplingMode::Temperature:
-                next_token = temperature_sample(logits, cfg.temperature, rng);
-                break;
+                return temperature_sample(logits, cfg.temperature, rng);
             case SamplingMode::TopK:
-                next_token = top_k_sample(logits, cfg.top_k, cfg.temperature, rng);
-                break;
+                return top_k_sample(logits, cfg.top_k, cfg.temperature, rng);
             case SamplingMode::TopP:
-                next_token = top_p_sample(logits, cfg.top_p, cfg.temperature, rng);
-                break;
+                return top_p_sample(logits, cfg.top_p, cfg.temperature, rng);
             default:
                 throw std::runtime_error(
                     std::format("generate: unhandled SamplingMode {}",
                                 static_cast<int>(cfg.mode)));
         }
+    };
 
+    // KV-cached autoregressive decoding: O(n) total instead of O(n²).
+    // forward_one() appends each token's K,V to the cache and returns the
+    // (1, V) logits for the next-token distribution, so the prompt is encoded
+    // once and each generated token costs a single-token forward pass.
+    KVCache cache = model.make_kv_cache(
+        static_cast<int64_t>(prompt.size()) + max_new);
+
+    // Encode the prompt, filling the cache; keep the final-position logits.
+    Tensor logits;
+    for (const int32_t tok : tokens)
+        logits = model.forward_one(tok, cache);
+
+    // Generate new tokens one at a time from the running logits.
+    for (int64_t step = 0; step < max_new; ++step) {
+        const int32_t next_token = sample_next(logits);
         tokens.push_back(next_token);
+        if (step + 1 < max_new)
+            logits = model.forward_one(next_token, cache);
     }
 
     return tokens;

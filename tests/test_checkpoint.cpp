@@ -5,8 +5,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -98,6 +100,32 @@ TEST_CASE("load throws on param count mismatch", "[checkpoint]")
     wrong.push_back(make_param({3, 3}, 0.f));
 
     REQUIRE_THROWS_AS(load_checkpoint(wrong, path), std::runtime_error);
+
+    remove_dir(dir);
+}
+
+TEST_CASE("load rejects legacy checkpoint without format_version", "[checkpoint]")
+{
+    const std::string dir = unique_tmp_dir("legacy");
+    remove_dir(dir);
+    std::filesystem::create_directories(dir);
+    const std::string path = (std::filesystem::path(dir) / "step_000000000.ckpt").string();
+
+    // Hand-craft a v1-style checkpoint: JSON header with NO "format_version"
+    // (one param of shape [2]) followed by two float32 values.
+    const std::string header = R"({"step":0,"shapes":[[2]]})";
+    {
+        std::ofstream f(path, std::ios::binary);
+        const uint32_t hlen = static_cast<uint32_t>(header.size());
+        f.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+        f.write(header.data(), static_cast<std::streamsize>(header.size()));
+        const float vals[2] = {1.0f, 2.0f};
+        f.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    std::vector<Variable> params;
+    params.push_back(make_param({2}, 0.f));
+    REQUIRE_THROWS_AS(load_checkpoint(params, path), std::runtime_error);
 
     remove_dir(dir);
 }

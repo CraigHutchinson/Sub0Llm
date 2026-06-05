@@ -1,0 +1,23 @@
+{
+  "source": "gemma-4-12b-it-Q8_0.gguf",
+  "arch": "gemma4",
+  "family": "gemma",
+  "vocab_size": 262144,
+  "embed_dim": 3840,
+  "n_heads": 16,
+  "n_kv_heads": 16,
+  "head_dim": 512,
+  "n_layers": 48,
+  "d_ff": 15360,
+  "context_len": 131072,
+  "rope_base": 1e+06,
+  "norm_eps": 1e-06,
+  "embed_scale": 61.967735,
+  "use_qk_norm": true,
+  "tied_embeddings": true,
+  "norm_plus_one": true,
+  "attn_qkv_bias": false,
+  "activation": 1,
+  "sliding_window": 1024,
+  "local_global_stride": 6
+}

@@ -29,7 +29,7 @@ static Tensor make_ids(int64_t T, int32_t V) {
 
 // ── ops::narrow ───────────────────────────────────────────────────────────────
 
-TEST_CASE("ops::narrow — 2D slice values", "[pretraining][narrow]") {
+TEST_CASE("ops::narrow - 2D slice values", "[pretraining][narrow]") {
     Tensor t({4, 3}, DType::Float32);
     auto d = t.data_as<float>();
     for (std::size_t i = 0; i < 12u; ++i) d[i] = static_cast<float>(i);
@@ -44,7 +44,7 @@ TEST_CASE("ops::narrow — 2D slice values", "[pretraining][narrow]") {
     REQUIRE_THAT(sd[3], WithinAbs(6.f, 1e-6f));  // row 2 col 0
 }
 
-TEST_CASE("ops::narrow — 1D slice", "[pretraining][narrow]") {
+TEST_CASE("ops::narrow - 1D slice", "[pretraining][narrow]") {
     Tensor t({6}, DType::Float32);
     auto d = t.data_as<float>();
     for (std::size_t i = 0; i < 6u; ++i) d[i] = static_cast<float>(i) * 2.f;
@@ -57,7 +57,7 @@ TEST_CASE("ops::narrow — 1D slice", "[pretraining][narrow]") {
     REQUIRE_THAT(sd[2], WithinAbs(8.f, 1e-6f));
 }
 
-TEST_CASE("ops::narrow — throws on bad bounds", "[pretraining][narrow]") {
+TEST_CASE("ops::narrow - throws on bad bounds", "[pretraining][narrow]") {
     Tensor t({5, 2}, DType::Float32);
     REQUIRE_THROWS(ops::narrow(t, -1, 2));    // negative start
     REQUIRE_THROWS(ops::narrow(t, 3, 3));     // start+length > T
@@ -67,7 +67,7 @@ TEST_CASE("ops::narrow — throws on bad bounds", "[pretraining][narrow]") {
 
 // ── autograd::narrow ──────────────────────────────────────────────────────────
 
-TEST_CASE("autograd::narrow — forward matches ops::narrow", "[pretraining][narrow]") {
+TEST_CASE("autograd::narrow - forward matches ops::narrow", "[pretraining][narrow]") {
     Tensor xd({5, 3}, DType::Float32);
     auto d = xd.data_as<float>();
     for (std::size_t i = 0; i < 15u; ++i) d[i] = static_cast<float>(i);
@@ -82,7 +82,7 @@ TEST_CASE("autograd::narrow — forward matches ops::narrow", "[pretraining][nar
     REQUIRE_THAT(yd[8], WithinAbs(11.f, 1e-6f));  // row 2 (=index 3), col 2
 }
 
-TEST_CASE("autograd::narrow — backward scatters to correct rows", "[pretraining][narrow]") {
+TEST_CASE("autograd::narrow - backward scatters to correct rows", "[pretraining][narrow]") {
     Tensor xd({5, 3}, DType::Float32);
     for (auto& v : xd.data_as<float>()) v = 1.f;
 
@@ -100,7 +100,7 @@ TEST_CASE("autograd::narrow — backward scatters to correct rows", "[pretrainin
     }
 }
 
-TEST_CASE("autograd::narrow — backward numerical gradient check", "[pretraining][narrow]") {
+TEST_CASE("autograd::narrow - backward numerical gradient check", "[pretraining][narrow]") {
     const float eps = 1e-3f;
     Tensor xd({4, 3}, DType::Float32);
     {
@@ -128,7 +128,7 @@ TEST_CASE("autograd::narrow — backward numerical gradient check", "[pretrainin
     }
 }
 
-TEST_CASE("autograd::narrow — throws on bad range", "[pretraining][narrow]") {
+TEST_CASE("autograd::narrow - throws on bad range", "[pretraining][narrow]") {
     Tensor xd({4, 2}, DType::Float32);
     Variable x(xd, false);
     REQUIRE_THROWS(narrow(x, -1, 2));
@@ -138,7 +138,7 @@ TEST_CASE("autograd::narrow — throws on bad range", "[pretraining][narrow]") {
 
 // ── ConstantLR ────────────────────────────────────────────────────────────────
 
-TEST_CASE("ConstantLR — always returns lr", "[pretraining][scheduler]") {
+TEST_CASE("ConstantLR - always returns lr", "[pretraining][scheduler]") {
     ConstantLR s(1e-3f);
     REQUIRE_THAT(s(0),   WithinAbs(1e-3f, 1e-7f));
     REQUIRE_THAT(s(100), WithinAbs(1e-3f, 1e-7f));
@@ -146,14 +146,14 @@ TEST_CASE("ConstantLR — always returns lr", "[pretraining][scheduler]") {
     REQUIRE_THAT(s.peak_lr(), WithinAbs(1e-3f, 1e-7f));
 }
 
-TEST_CASE("ConstantLR — throws on non-positive lr", "[pretraining][scheduler]") {
+TEST_CASE("ConstantLR - throws on non-positive lr", "[pretraining][scheduler]") {
     REQUIRE_THROWS([] { ConstantLR bad(0.f); }());
     REQUIRE_THROWS([] { ConstantLR bad(-1.f); }());
 }
 
 // ── CosineWithWarmup ──────────────────────────────────────────────────────────
 
-TEST_CASE("CosineWithWarmup — warmup ramps linearly", "[pretraining][scheduler]") {
+TEST_CASE("CosineWithWarmup - warmup ramps linearly", "[pretraining][scheduler]") {
     CosineWithWarmup s(1e-3f, 1e-4f, 10, 100);
     // step 0: lr should be ~0 (0/10 * max_lr = 0)
     REQUIRE_THAT(s(0),  WithinAbs(0.f, 1e-7f));
@@ -163,7 +163,7 @@ TEST_CASE("CosineWithWarmup — warmup ramps linearly", "[pretraining][scheduler
     REQUIRE_THAT(s(10), WithinAbs(1e-3f, 2e-6f));
 }
 
-TEST_CASE("CosineWithWarmup — cosine decay at midpoint", "[pretraining][scheduler]") {
+TEST_CASE("CosineWithWarmup - cosine decay at midpoint", "[pretraining][scheduler]") {
     CosineWithWarmup s(1e-3f, 1e-4f, 0, 100);
     // step 0: warmup=0 so immediately at max_lr
     REQUIRE_THAT(s(0),  WithinAbs(1e-3f, 1e-7f));
@@ -175,7 +175,7 @@ TEST_CASE("CosineWithWarmup — cosine decay at midpoint", "[pretraining][schedu
     REQUIRE_THAT(s(200), WithinAbs(1e-4f, 1e-6f));
 }
 
-TEST_CASE("CosineWithWarmup — lr is monotone in cosine phase", "[pretraining][scheduler]") {
+TEST_CASE("CosineWithWarmup - lr is monotone in cosine phase", "[pretraining][scheduler]") {
     CosineWithWarmup s(1e-3f, 0.f, 5, 50);
     float prev = s(5);
     for (int64_t step = 6; step <= 50; ++step) {
@@ -185,7 +185,7 @@ TEST_CASE("CosineWithWarmup — lr is monotone in cosine phase", "[pretraining][
     }
 }
 
-TEST_CASE("CosineWithWarmup — throws on invalid args", "[pretraining][scheduler]") {
+TEST_CASE("CosineWithWarmup - throws on invalid args", "[pretraining][scheduler]") {
     REQUIRE_THROWS([] { CosineWithWarmup bad(0.f,  0.f, 5, 100); }()); // max_lr=0
     REQUIRE_THROWS([] { CosineWithWarmup bad(1e-3f, -1.f, 5, 100); }()); // min_lr<0
     REQUIRE_THROWS([] { CosineWithWarmup bad(1e-3f, 2e-3f, 5, 100); }()); // min>max
@@ -195,7 +195,7 @@ TEST_CASE("CosineWithWarmup — throws on invalid args", "[pretraining][schedule
     REQUIRE_THROWS([] { CosineWithWarmup bad(1e-3f, 0.f, 50, 1); }()); // warmup>total, total==1
 }
 
-TEST_CASE("CosineWithWarmup — valid boundary: warmup=0, total=1", "[pretraining][scheduler]") {
+TEST_CASE("CosineWithWarmup - valid boundary: warmup=0, total=1", "[pretraining][scheduler]") {
     // warmup_steps=0 < total_steps=1 is valid (no cosine phase, goes straight to min_lr)
     CosineWithWarmup s(1e-3f, 1e-4f, 0, 1);
     REQUIRE_THAT(s(0), WithinAbs(1e-3f, 1e-6f)); // step 0 at or past total → cosine(0) = max_lr
@@ -204,7 +204,7 @@ TEST_CASE("CosineWithWarmup — valid boundary: warmup=0, total=1", "[pretrainin
 
 // ── mtp_cross_entropy ─────────────────────────────────────────────────────────
 
-TEST_CASE("mtp_cross_entropy — single head (n_mtp=0) matches plain CE", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - single head (n_mtp=0) matches plain CE", "[pretraining][mtp]") {
     constexpr int64_t V = 16, T = 6;
     ModernGPT m(V, 16, 2, 1, 1, 0, 0, 1);
     Tensor ids = make_ids(T, V);
@@ -232,7 +232,7 @@ TEST_CASE("mtp_cross_entropy — single head (n_mtp=0) matches plain CE", "[pret
                  WithinAbs(plain_l.data().data_as<float>()[0], 1e-4f));
 }
 
-TEST_CASE("mtp_cross_entropy — multiple heads produce scalar loss", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - multiple heads produce scalar loss", "[pretraining][mtp]") {
     constexpr int64_t V = 16, T = 8, Nmtp = 2;
     ModernGPT m(V, 16, 2, 1, 1, 0, Nmtp, 2);
     Tensor ids = make_ids(T, V);
@@ -245,7 +245,7 @@ TEST_CASE("mtp_cross_entropy — multiple heads produce scalar loss", "[pretrain
     REQUIRE(std::isfinite(loss.data().data_as<float>()[0]));
 }
 
-TEST_CASE("mtp_cross_entropy — custom weights scale loss", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - custom weights scale loss", "[pretraining][mtp]") {
     constexpr int64_t V = 16, T = 6, Nmtp = 1;
     ModernGPT m(V, 16, 2, 1, 1, 0, Nmtp, 3);
     Tensor ids = make_ids(T, V);
@@ -276,7 +276,7 @@ TEST_CASE("mtp_cross_entropy — custom weights scale loss", "[pretraining][mtp]
                      plain.data().data_as<float>()[0]) > 1e-5f);
 }
 
-TEST_CASE("mtp_cross_entropy — backward flows through all heads", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - backward flows through all heads", "[pretraining][mtp]") {
     constexpr int64_t V = 16, T = 6, Nmtp = 2;
     ModernGPT m(V, 16, 2, 1, 1, 0, Nmtp, 4);
     Tensor ids = make_ids(T, V);
@@ -291,12 +291,12 @@ TEST_CASE("mtp_cross_entropy — backward flows through all heads", "[pretrainin
     REQUIRE(n_grad == static_cast<int64_t>(params.size()));
 }
 
-TEST_CASE("mtp_cross_entropy — throws on empty heads", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - throws on empty heads", "[pretraining][mtp]") {
     Tensor ids = make_ids(5, 8);
     REQUIRE_THROWS(mtp_cross_entropy({}, ids));
 }
 
-TEST_CASE("mtp_cross_entropy — throws on T < 2", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - throws on T < 2", "[pretraining][mtp]") {
     constexpr int64_t V = 8;
     ModernGPT m(V, 8, 2, 1, 1, 0, 0, 5);
     Tensor ids = make_ids(1, V);
@@ -304,7 +304,7 @@ TEST_CASE("mtp_cross_entropy — throws on T < 2", "[pretraining][mtp]") {
     REQUIRE_THROWS(mtp_cross_entropy(heads, ids));
 }
 
-TEST_CASE("mtp_cross_entropy — wrong weights size throws", "[pretraining][mtp]") {
+TEST_CASE("mtp_cross_entropy - wrong weights size throws", "[pretraining][mtp]") {
     constexpr int64_t V = 8, T = 4;
     ModernGPT m(V, 8, 2, 1, 1, 0, 1, 6);
     Tensor ids = make_ids(T, V);
@@ -315,7 +315,7 @@ TEST_CASE("mtp_cross_entropy — wrong weights size throws", "[pretraining][mtp]
 
 // ── Integration: training loop converges ─────────────────────────────────────
 
-TEST_CASE("Pretraining loop — loss decreases with MTP", "[pretraining][integration]") {
+TEST_CASE("Pretraining loop - loss decreases with MTP", "[pretraining][integration]") {
     constexpr int64_t V = 32, T = 10, Nmtp = 1;
     ModernGPT model(V, 32, 2, 1, 2, 0, Nmtp, 99);
     CosineWithWarmup sched(3e-3f, 3e-4f, 3, 30);

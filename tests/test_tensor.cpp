@@ -56,7 +56,7 @@ TEST_CASE("dtype mismatch throws", "[tensor]") {
     REQUIRE_THROWS_AS(t.data_as<float>(), std::runtime_error);
 }
 
-TEST_CASE("reshape — same numel", "[tensor]") {
+TEST_CASE("reshape - same numel", "[tensor]") {
     Tensor t = arange(12);
     Tensor r = t.reshape({3, 4});
 
@@ -73,12 +73,12 @@ TEST_CASE("reshape — same numel", "[tensor]") {
         REQUIRE(view[i] == orig[i]);
 }
 
-TEST_CASE("reshape — wrong numel throws", "[tensor]") {
+TEST_CASE("reshape - wrong numel throws", "[tensor]") {
     Tensor t = arange(12);
     REQUIRE_THROWS_AS(t.reshape({3, 5}), std::runtime_error);
 }
 
-TEST_CASE("transpose — shape swap", "[tensor]") {
+TEST_CASE("transpose - shape swap", "[tensor]") {
     Tensor t = arange(6).reshape({2, 3});
     Tensor tT = t.transpose(0, 1);
 
@@ -153,12 +153,12 @@ TEST_CASE("zero-element tensor (shape containing 0)", "[tensor][edge]") {
     REQUIRE(t.numel() == 0);
     REQUIRE(t.shape(1) == 0);
     REQUIRE(t.is_contiguous());
-    // data_as on zero-element tensor returns an empty span — no allocation
+    // data_as on zero-element tensor returns an empty span - no allocation
     auto sp = t.data_as<float>();
     REQUIRE(sp.empty());
 }
 
-TEST_CASE("non-contiguous copy — stride-aware float32", "[tensor][edge]") {
+TEST_CASE("non-contiguous copy - stride-aware float32", "[tensor][edge]") {
     // Build (2,3) and transpose to get a non-contiguous (3,2)
     Tensor t = arange(6).reshape({2, 3});
     Tensor tT = t.transpose(0, 1);
@@ -177,20 +177,20 @@ TEST_CASE("non-contiguous copy — stride-aware float32", "[tensor][edge]") {
     REQUIRE(sp[5] == 5.0f);
 }
 
-TEST_CASE("non-contiguous copy — non-float32 throws", "[tensor][edge]") {
+TEST_CASE("non-contiguous copy - non-float32 throws", "[tensor][edge]") {
     Tensor t = arange(6, DType::Int64).reshape({2, 3});
     Tensor tT = t.transpose(0, 1);
     REQUIRE_FALSE(tT.is_contiguous());
     REQUIRE_THROWS_AS(tT.contiguous(), std::runtime_error);
 }
 
-TEST_CASE("ones — unsupported dtype throws", "[tensor][edge]") {
+TEST_CASE("ones - unsupported dtype throws", "[tensor][edge]") {
     REQUIRE_THROWS_AS(ones({4}, DType::Float16), std::runtime_error);
     REQUIRE_THROWS_AS(ones({4}, DType::BFloat16), std::runtime_error);
     REQUIRE_THROWS_AS(ones({4}, DType::Bool), std::runtime_error);
 }
 
-TEST_CASE("ones — Int8 and Int16 supported", "[tensor][edge]") {
+TEST_CASE("ones - Int8 and Int16 supported", "[tensor][edge]") {
     Tensor a = ones({4}, DType::Int8);
     for (auto v : a.data_as<std::int8_t>()) REQUIRE(v == 1);
 
@@ -199,7 +199,7 @@ TEST_CASE("ones — Int8 and Int16 supported", "[tensor][edge]") {
 }
 
 TEST_CASE("dtype_name covers all enum values", "[dtype]") {
-    // Exhaustive check — catches missing cases in the switch.
+    // Exhaustive check - catches missing cases in the switch.
     REQUIRE(dtype_name(DType::Float32)  == "float32");
     REQUIRE(dtype_name(DType::Float16)  == "float16");
     REQUIRE(dtype_name(DType::BFloat16) == "bfloat16");

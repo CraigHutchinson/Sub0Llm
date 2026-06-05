@@ -147,7 +147,7 @@ static inline float hsum256(__m256 v) noexcept {
 
 // ── Element-wise binary ───────────────────────────────────────────────────────
 
-void add_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
+void add_f32(const float* RESTRICT a, const float* RESTRICT b, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -163,7 +163,7 @@ void add_f32(const float* __restrict__ a, const float* __restrict__ b, float* __
     for (; i < n; ++i) out[i] = a[i] + b[i];
 }
 
-void sub_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
+void sub_f32(const float* RESTRICT a, const float* RESTRICT b, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -179,7 +179,7 @@ void sub_f32(const float* __restrict__ a, const float* __restrict__ b, float* __
     for (; i < n; ++i) out[i] = a[i] - b[i];
 }
 
-void mul_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
+void mul_f32(const float* RESTRICT a, const float* RESTRICT b, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -195,7 +195,7 @@ void mul_f32(const float* __restrict__ a, const float* __restrict__ b, float* __
     for (; i < n; ++i) out[i] = a[i] * b[i];
 }
 
-void div_f32(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::size_t n) noexcept {
+void div_f32(const float* RESTRICT a, const float* RESTRICT b, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -213,7 +213,7 @@ void div_f32(const float* __restrict__ a, const float* __restrict__ b, float* __
 
 // ── Scalar broadcast ─────────────────────────────────────────────────────────
 
-void add_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept {
+void add_scalar_f32(const float* RESTRICT a, float s, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vs = _mm512_set1_ps(s);
@@ -227,7 +227,7 @@ void add_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ ou
     for (; i < n; ++i) out[i] = a[i] + s;
 }
 
-void mul_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ out, std::size_t n) noexcept {
+void mul_scalar_f32(const float* RESTRICT a, float s, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vs = _mm512_set1_ps(s);
@@ -243,7 +243,7 @@ void mul_scalar_f32(const float* __restrict__ a, float s, float* __restrict__ ou
 
 // ── Activations ──────────────────────────────────────────────────────────────
 
-void relu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void relu_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vz = _mm512_setzero_ps();
@@ -257,7 +257,7 @@ void relu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t
     for (; i < n; ++i) out[i] = in[i] > 0.0f ? in[i] : 0.0f;
 }
 
-void neg_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void neg_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 vz = _mm512_setzero_ps();
@@ -273,7 +273,7 @@ void neg_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t 
 
 // Sigmoid: 1/(1+exp(-x)).  Uses fast polynomial exp for SIMD throughput;
 // scalar tail falls back to std::exp (accurate) so boundary elements are exact.
-void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void sigmoid_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16)
@@ -285,7 +285,7 @@ void sigmoid_f32(const float* __restrict__ in, float* __restrict__ out, std::siz
     for (; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-in[i]));
 }
 
-void exp_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void exp_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16)
@@ -296,7 +296,7 @@ void exp_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t 
 #endif
     for (; i < n; ++i) out[i] = std::exp(in[i]);
 }
-void log_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void log_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16)
@@ -308,7 +308,7 @@ void log_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t 
     for (; i < n; ++i) out[i] = std::log(in[i]);
 }
 // sqrt/abs use hardware SIMD instructions — exact same results as scalar.
-void sqrt_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void sqrt_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16)
@@ -319,7 +319,7 @@ void sqrt_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t
 #endif
     for (; i < n; ++i) out[i] = std::sqrt(in[i]);
 }
-void abs_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void abs_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512i smask512 = _mm512_set1_epi32(0x7FFFFFFF);
@@ -335,7 +335,7 @@ void abs_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t 
 }
 
 // SiLU: out[i] = in[i] * sigmoid(in[i]).
-void silu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void silu_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     for (const std::size_t end = simd_prefix(n); i < end; i += 16) {
@@ -356,7 +356,7 @@ void silu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t
 
 // GELU: out[i] = in[i] * sigmoid(z), where z = kK*(in[i] + kC*in[i]^3).
 // Tanh identity: 0.5*(1+tanh(k)) = sigmoid(2k), so gelu(x) = x*sigmoid(kK*(x+kC*x³)).
-void gelu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t n) noexcept {
+void gelu_f32(const float* RESTRICT in, float* RESTRICT out, std::size_t n) noexcept {
     // kK = 2*sqrt(2/pi) so that sigmoid(kK*k_arg) = 0.5*(1+tanh(sqrt(2/pi)*k_arg))
     constexpr float kK = 1.5957691216f;
     constexpr float kC = 0.044715f;
@@ -388,8 +388,8 @@ void gelu_f32(const float* __restrict__ in, float* __restrict__ out, std::size_t
 }
 
 // SiLU backward: grad_in[i] = grad_out[i] * sig*(1 + x*(1-sig)), sig = sigmoid(x).
-void silu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
-                       float* __restrict__ grad_in, std::size_t n) noexcept {
+void silu_backward_f32(const float* RESTRICT grad_out, const float* RESTRICT x,
+                       float* RESTRICT grad_in, std::size_t n) noexcept {
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
     const __m512 one = _mm512_set1_ps(1.0f);
@@ -421,8 +421,8 @@ void silu_backward_f32(const float* __restrict__ grad_out, const float* __restri
 
 // GELU backward: grad_in[i] = grad_out[i] * gelu'(x[i]).
 // gelu'(x) = sig(z) + x * sig(z)*(1-sig(z)) * z', where z = kK*(x+kC*x³), z' = kK*(1+3*kC*x²).
-void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restrict__ x,
-                       float* __restrict__ grad_in, std::size_t n) noexcept {
+void gelu_backward_f32(const float* RESTRICT grad_out, const float* RESTRICT x,
+                       float* RESTRICT grad_in, std::size_t n) noexcept {
     constexpr float kK  = 1.5957691216f;
     constexpr float kC  = 0.044715f;
     constexpr float k3C = 3.0f * kC * kK;   // kK*3*kC — coefficient for z' constant term
@@ -476,7 +476,7 @@ void gelu_backward_f32(const float* __restrict__ grad_out, const float* __restri
 // ── Softmax ───────────────────────────────────────────────────────────────────
 
 // Numerically-stable row-wise softmax using fast polynomial exp.
-void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
+void softmax_rows_f32(const float* RESTRICT in, float* RESTRICT out,
                       std::size_t rows, std::size_t cols) noexcept {
     for (std::size_t r = 0; r < rows; ++r) {
         const float* rin  = in  + r * cols;
@@ -508,7 +508,7 @@ void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
             s += rout[i];
         }
         // Inline normalization: calling mul_scalar_f32(rout, s, rout, cols) would
-        // pass the same pointer for two __restrict__ params — undefined behaviour.
+        // pass the same pointer for two RESTRICT params — undefined behaviour.
         const float inv_s = 1.0f / s;
         for (std::size_t k = 0; k < cols; ++k) rout[k] *= inv_s;
     }
@@ -516,9 +516,9 @@ void softmax_rows_f32(const float* __restrict__ in, float* __restrict__ out,
 
 // ── RMSNorm ───────────────────────────────────────────────────────────────────
 
-void rms_norm_fwd_f32(const float* __restrict__ x, const float* __restrict__ w,
-                      float* __restrict__ x_norm, float* __restrict__ inv_rms,
-                      float* __restrict__ out,
+void rms_norm_fwd_f32(const float* RESTRICT x, const float* RESTRICT w,
+                      float* RESTRICT x_norm, float* RESTRICT inv_rms,
+                      float* RESTRICT out,
                       std::size_t T, std::size_t D, float eps) noexcept {
     const float invD = 1.0f / static_cast<float>(D);
     const std::size_t Ds = simd_prefix(D);
@@ -566,11 +566,11 @@ void rms_norm_fwd_f32(const float* __restrict__ x, const float* __restrict__ w,
     }
 }
 
-void rms_norm_bwd_x_f32(const float* __restrict__ g,
-                          const float* __restrict__ x_norm,
-                          const float* __restrict__ inv_rms,
-                          const float* __restrict__ w,
-                          float* __restrict__ gx,
+void rms_norm_bwd_x_f32(const float* RESTRICT g,
+                          const float* RESTRICT x_norm,
+                          const float* RESTRICT inv_rms,
+                          const float* RESTRICT w,
+                          float* RESTRICT gx,
                           std::size_t T, std::size_t D) noexcept {
     const float invD = 1.0f / static_cast<float>(D);
     const std::size_t Ds = simd_prefix(D);
@@ -620,9 +620,9 @@ void rms_norm_bwd_x_f32(const float* __restrict__ g,
     }
 }
 
-void rms_norm_bwd_w_f32(const float* __restrict__ g,
-                          const float* __restrict__ x_norm,
-                          float* gw,   // read-modified-write: no __restrict__
+void rms_norm_bwd_w_f32(const float* RESTRICT g,
+                          const float* RESTRICT x_norm,
+                          float* gw,   // read-modified-write: no RESTRICT
                           std::size_t T, std::size_t D) noexcept {
     const std::size_t Ds = simd_prefix(D);
     for (std::size_t t = 0; t < T; ++t) {
@@ -648,8 +648,8 @@ void rms_norm_bwd_w_f32(const float* __restrict__ g,
 
 // ── Embedding backward ────────────────────────────────────────────────────────
 
-void embed_bwd_f32(const float* __restrict__ g_out, const int32_t* __restrict__ idx,
-                   float* __restrict__ g_w, std::size_t N, std::size_t D) noexcept {
+void embed_bwd_f32(const float* RESTRICT g_out, const int32_t* RESTRICT idx,
+                   float* RESTRICT g_w, std::size_t N, std::size_t D) noexcept {
     const std::size_t Ds = simd_prefix(D);
     for (std::size_t i = 0; i < N; ++i) {
         const float* src = g_out + i * D;
@@ -670,7 +670,7 @@ void embed_bwd_f32(const float* __restrict__ g_out, const int32_t* __restrict__ 
 
 // ── Reductions ────────────────────────────────────────────────────────────────
 
-float sum_f32(const float* __restrict__ in, std::size_t n) noexcept {
+float sum_f32(const float* RESTRICT in, std::size_t n) noexcept {
     float acc = 0.0f;
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
@@ -688,7 +688,7 @@ float sum_f32(const float* __restrict__ in, std::size_t n) noexcept {
     return acc;
 }
 
-float max_f32(const float* __restrict__ in, std::size_t n) noexcept {
+float max_f32(const float* RESTRICT in, std::size_t n) noexcept {
     if (n == 0) return 0.0f;
     std::size_t i = 0;
     float result;
@@ -715,7 +715,7 @@ float max_f32(const float* __restrict__ in, std::size_t n) noexcept {
     return result;
 }
 
-float min_f32(const float* __restrict__ in, std::size_t n) noexcept {
+float min_f32(const float* RESTRICT in, std::size_t n) noexcept {
     if (n == 0) return 0.0f;
     std::size_t i = 0;
     float result;
@@ -742,7 +742,7 @@ float min_f32(const float* __restrict__ in, std::size_t n) noexcept {
 }
 
 // L2 norm using FMA dot-product accumulation.
-float norm_f32(const float* __restrict__ in, std::size_t n) noexcept {
+float norm_f32(const float* RESTRICT in, std::size_t n) noexcept {
     float acc = 0.0f;
     std::size_t i = 0;
 #if defined(SUB0LLM_AVX512)
@@ -766,9 +766,9 @@ float norm_f32(const float* __restrict__ in, std::size_t n) noexcept {
 
 // ── 2-D strided copy ─────────────────────────────────────────────────────────
 
-void copy_strided_2d_f32(const float* __restrict__ src,
+void copy_strided_2d_f32(const float* RESTRICT src,
                           std::size_t rs, std::size_t cs,
-                          float* __restrict__ dst,
+                          float* RESTRICT dst,
                           std::size_t rows, std::size_t cols) noexcept {
     constexpr std::size_t B = 16;
 

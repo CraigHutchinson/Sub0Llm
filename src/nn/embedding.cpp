@@ -9,11 +9,18 @@
 namespace sub0llm::nn {
 
 Embedding::Embedding(std::int64_t vocab_size, std::int64_t embed_dim,
-                     std::uint64_t seed) {
+                     std::uint64_t seed, bool alloc_weights) {
     if (vocab_size <= 0 || embed_dim <= 0)
         throw std::runtime_error(std::format(
             "Embedding: vocab_size={} and embed_dim={} must both be positive",
             vocab_size, embed_dim));
+    vocab_size_ = vocab_size;
+    embed_dim_  = embed_dim;
+
+    if (!alloc_weights) {   // Q8 inference: table elided, served from Q8 elsewhere
+        weight_ = autograd::Variable(zeros({1, 1}), /*requires_grad=*/false, "emb.weight.elided");
+        return;
+    }
 
     // Initialise with N(0, 1/sqrt(embed_dim)) — same as PyTorch default.
     const float std_dev = 1.0f / std::sqrt(static_cast<float>(embed_dim));
@@ -31,11 +38,7 @@ autograd::Variable Embedding::forward(const Tensor& indices) const {
     return autograd::embedding_lookup(weight_, indices);
 }
 
-std::int64_t Embedding::vocab_size() const noexcept {
-    return weight_.data().shape()[0];
-}
-std::int64_t Embedding::embed_dim() const noexcept {
-    return weight_.data().shape()[1];
-}
+std::int64_t Embedding::vocab_size() const noexcept { return vocab_size_; }
+std::int64_t Embedding::embed_dim()  const noexcept { return embed_dim_; }
 
 } // namespace sub0llm::nn

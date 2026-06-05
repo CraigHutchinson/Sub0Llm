@@ -82,7 +82,7 @@ TEST_CASE("min", "[ops]") {
 
 // ── Activations ───────────────────────────────────────────────────────────────
 
-TEST_CASE("relu — positive stays, negative zeros", "[ops]") {
+TEST_CASE("relu - positive stays, negative zeros", "[ops]") {
     Tensor t({4}, DType::Float32);
     {
         auto sp = t.data_as<float>();
@@ -168,7 +168,7 @@ TEST_CASE("matmul dimension mismatch throws", "[ops]") {
 
 TEST_CASE("exp and log are inverses", "[ops]") {
     Tensor a = arange(4);
-    a = add(a, 1.0f);              // [1,2,3,4] — avoid log(0)
+    a = add(a, 1.0f);              // [1,2,3,4] - avoid log(0)
     Tensor b = log(exp(a));
     require_near(a, b, 1e-5f);
 }
@@ -189,14 +189,14 @@ TEST_CASE("norm of ones vector", "[ops]") {
 TEST_CASE("sum on CUDA tensor throws (no CUDA build)", "[ops][device]") {
     Tensor a = ones({4});
     REQUIRE_THROWS_AS(a.to(Device::cuda()), std::runtime_error); // proves .to() guards
-    // sum/max/min/norm are guarded by require_cpu — tested via CPU path only in this build
+    // sum/max/min/norm are guarded by require_cpu - tested via CPU path only in this build
 }
 
 TEST_CASE("sub device mismatch throws", "[ops][device]") {
     Tensor a = ones({4});
     Tensor b = ones({4});
     // Can't test actual cross-device without CUDA, but device equality check works
-    REQUIRE_NOTHROW(sub(a, b));  // same device — should work
+    REQUIRE_NOTHROW(sub(a, b));  // same device - should work
 }
 #endif
 

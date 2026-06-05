@@ -34,7 +34,7 @@ static Tensor make_ids(int64_t T, int32_t vocab) {
 
 // ── autograd::silu ────────────────────────────────────────────────────────────
 
-TEST_CASE("silu — forward values", "[modern_gpt][silu]") {
+TEST_CASE("silu - forward values", "[modern_gpt][silu]") {
     // silu(0) = 0, silu(x) > 0 for x > 0, negative for small x < 0
     auto x = leaf({-3.f, -1.f, 0.f, 1.f, 3.f}, 1, 5);
     auto y = silu(x);
@@ -47,7 +47,7 @@ TEST_CASE("silu — forward values", "[modern_gpt][silu]") {
     REQUIRE_THAT(yd[3], WithinAbs(0.7311f, 2e-4f));
 }
 
-TEST_CASE("silu — backward numerical gradient check", "[modern_gpt][silu]") {
+TEST_CASE("silu - backward numerical gradient check", "[modern_gpt][silu]") {
     auto x = leaf({-2.f, -0.5f, 0.f, 1.f, 2.5f}, 1, 5);
     sum(silu(x)).backward();
     const auto ag = x.grad().data_as<float>();
@@ -63,7 +63,7 @@ TEST_CASE("silu — backward numerical gradient check", "[modern_gpt][silu]") {
 
 // ── autograd::rms_norm ────────────────────────────────────────────────────────
 
-TEST_CASE("rms_norm — output is unit-RMS when weight=1", "[modern_gpt][rms_norm]") {
+TEST_CASE("rms_norm - output is unit-RMS when weight=1", "[modern_gpt][rms_norm]") {
     constexpr int64_t T = 3, D = 6;
     Tensor xd({T, D}, DType::Float32);
     {
@@ -85,7 +85,7 @@ TEST_CASE("rms_norm — output is unit-RMS when weight=1", "[modern_gpt][rms_nor
     }
 }
 
-TEST_CASE("rms_norm — weight scales output proportionally", "[modern_gpt][rms_norm]") {
+TEST_CASE("rms_norm - weight scales output proportionally", "[modern_gpt][rms_norm]") {
     constexpr int64_t T = 1, D = 4;
     auto x = leaf({1.f, 2.f, 3.f, 4.f}, T, D, /*rg=*/false);
 
@@ -105,7 +105,7 @@ TEST_CASE("rms_norm — weight scales output proportionally", "[modern_gpt][rms_
         REQUIRE_THAT(y2d[i], WithinAbs(2.0f * y1d[i], 1e-5f));
 }
 
-TEST_CASE("rms_norm — backward: x-grad numerical check", "[modern_gpt][rms_norm]") {
+TEST_CASE("rms_norm - backward: x-grad numerical check", "[modern_gpt][rms_norm]") {
     constexpr int64_t T = 2, D = 4;
     const float eps = 5e-4f;
 
@@ -139,7 +139,7 @@ TEST_CASE("rms_norm — backward: x-grad numerical check", "[modern_gpt][rms_nor
     }
 }
 
-TEST_CASE("rms_norm — backward: weight-grad numerical check", "[modern_gpt][rms_norm]") {
+TEST_CASE("rms_norm - backward: weight-grad numerical check", "[modern_gpt][rms_norm]") {
     constexpr int64_t T = 2, D = 4;
     const float eps = 1e-3f;
 
@@ -175,7 +175,7 @@ TEST_CASE("rms_norm — backward: weight-grad numerical check", "[modern_gpt][rm
 
 // ── autograd::rope ────────────────────────────────────────────────────────────
 
-TEST_CASE("rope — forward: rotation pairs", "[modern_gpt][rope]") {
+TEST_CASE("rope - forward: rotation pairs", "[modern_gpt][rope]") {
     // For a single position with known cos/sin, verify the rotation formula.
     // out[0] = x[0]*cos - x[1]*sin, out[1] = x[0]*sin + x[1]*cos
     const float angle = 0.5f;
@@ -192,7 +192,7 @@ TEST_CASE("rope — forward: rotation pairs", "[modern_gpt][rope]") {
     REQUIRE_THAT(yd[1], WithinAbs(3.f * sv + 4.f * cv, 1e-5f));
 }
 
-TEST_CASE("rope — forward preserves vector norm", "[modern_gpt][rope]") {
+TEST_CASE("rope - forward preserves vector norm", "[modern_gpt][rope]") {
     // Rotation is norm-preserving.
     constexpr int64_t T = 4, Dh = 8;
     const int64_t D2 = Dh / 2;
@@ -229,7 +229,7 @@ TEST_CASE("rope — forward preserves vector norm", "[modern_gpt][rope]") {
     }
 }
 
-TEST_CASE("rope — backward: inverse rotation (negate sin)", "[modern_gpt][rope]") {
+TEST_CASE("rope - backward: inverse rotation (negate sin)", "[modern_gpt][rope]") {
     // Apply rope, upstream gradient = all-ones, backward should equal inverse rotation.
     const float angle = 0.7f;
     const float cv = std::cos(angle), sv = std::sin(angle);
@@ -247,7 +247,7 @@ TEST_CASE("rope — backward: inverse rotation (negate sin)", "[modern_gpt][rope
     REQUIRE_THAT(gd[1], WithinAbs(-sv + cv, 1e-5f));
 }
 
-TEST_CASE("rope — backward numerical gradient check", "[modern_gpt][rope]") {
+TEST_CASE("rope - backward numerical gradient check", "[modern_gpt][rope]") {
     constexpr int64_t T = 3, Dh = 4;
     const int64_t D2 = Dh / 2;
     const float eps = 1e-3f;
@@ -291,7 +291,7 @@ TEST_CASE("rope — backward numerical gradient check", "[modern_gpt][rope]") {
 
 // ── RMSNorm class ─────────────────────────────────────────────────────────────
 
-TEST_CASE("RMSNorm — construction and dim()", "[modern_gpt][rmsnorm]") {
+TEST_CASE("RMSNorm - construction and dim()", "[modern_gpt][rmsnorm]") {
     RMSNorm n(16);
     REQUIRE(n.dim() == 16);
     REQUIRE(n.parameters().size() == 1);
@@ -299,7 +299,7 @@ TEST_CASE("RMSNorm — construction and dim()", "[modern_gpt][rmsnorm]") {
     REQUIRE_THROWS([] { RMSNorm bad(0); }());
 }
 
-TEST_CASE("RMSNorm — forward output is unit-RMS", "[modern_gpt][rmsnorm]") {
+TEST_CASE("RMSNorm - forward output is unit-RMS", "[modern_gpt][rmsnorm]") {
     constexpr int64_t T = 4, D = 8;
     RMSNorm n(D);
 
@@ -323,21 +323,21 @@ TEST_CASE("RMSNorm — forward output is unit-RMS", "[modern_gpt][rmsnorm]") {
 
 // ── SwiGLUFeedForward ─────────────────────────────────────────────────────────
 
-TEST_CASE("SwiGLUFeedForward — construction auto d_ff", "[modern_gpt][swiglu]") {
+TEST_CASE("SwiGLUFeedForward - construction auto d_ff", "[modern_gpt][swiglu]") {
     constexpr int64_t D = 64;
     SwiGLUFeedForward ffn(D, /*d_ff=*/0, /*seed=*/1);
     const auto params = ffn.parameters();
     REQUIRE(!params.empty());
     // d_ff = ceil(8*64/3 / 64) * 64 = 192
     const int64_t expected_dff = (((8 * D + 2) / 3 + 63) / 64) * 64;
-    // gate + up: D→d_ff (no bias here since Linear may have bias — check total numel)
+    // gate + up: D→d_ff (no bias here since Linear may have bias - check total numel)
     int64_t total = 0;
     for (auto* p : params) total += p->data().numel();
     REQUIRE(total > 0);
     (void)expected_dff;
 }
 
-TEST_CASE("SwiGLUFeedForward — output shape preserved", "[modern_gpt][swiglu]") {
+TEST_CASE("SwiGLUFeedForward - output shape preserved", "[modern_gpt][swiglu]") {
     constexpr int64_t T = 5, D = 32;
     SwiGLUFeedForward ffn(D, /*d_ff=*/64, /*seed=*/2);
 
@@ -350,7 +350,7 @@ TEST_CASE("SwiGLUFeedForward — output shape preserved", "[modern_gpt][swiglu]"
     REQUIRE(y.data().shape()[1] == D);
 }
 
-TEST_CASE("SwiGLUFeedForward — backward propagates gradients", "[modern_gpt][swiglu]") {
+TEST_CASE("SwiGLUFeedForward - backward propagates gradients", "[modern_gpt][swiglu]") {
     constexpr int64_t T = 3, D = 16;
     SwiGLUFeedForward ffn(D, /*d_ff=*/32, /*seed=*/3);
 
@@ -366,13 +366,13 @@ TEST_CASE("SwiGLUFeedForward — backward propagates gradients", "[modern_gpt][s
     REQUIRE(x.grad().numel() == T * D);
 }
 
-TEST_CASE("SwiGLUFeedForward — throws on D<=0", "[modern_gpt][swiglu]") {
+TEST_CASE("SwiGLUFeedForward - throws on D<=0", "[modern_gpt][swiglu]") {
     REQUIRE_THROWS([] { SwiGLUFeedForward bad(0, 64, 1); }());
 }
 
 // ── GroupedQueryAttention ─────────────────────────────────────────────────────
 
-TEST_CASE("GroupedQueryAttention — MHA (n_kv_heads==n_heads)", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - MHA (n_kv_heads==n_heads)", "[modern_gpt][gqa]") {
     constexpr std::size_t D = 16, Nh = 2, Nkv = 2;
     GroupedQueryAttention gqa(D, Nh, Nkv, 10000.0f, 1);
 
@@ -385,7 +385,7 @@ TEST_CASE("GroupedQueryAttention — MHA (n_kv_heads==n_heads)", "[modern_gpt][g
     REQUIRE(y.data().shape()[1] == static_cast<int64_t>(D));
 }
 
-TEST_CASE("GroupedQueryAttention — GQA (n_kv_heads < n_heads)", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - GQA (n_kv_heads < n_heads)", "[modern_gpt][gqa]") {
     constexpr std::size_t D = 16, Nh = 4, Nkv = 2;
     GroupedQueryAttention gqa(D, Nh, Nkv, 10000.0f, 2);
 
@@ -401,7 +401,7 @@ TEST_CASE("GroupedQueryAttention — GQA (n_kv_heads < n_heads)", "[modern_gpt][
     REQUIRE(y.data().shape()[1] == static_cast<int64_t>(D));
 }
 
-TEST_CASE("GroupedQueryAttention — MQA (n_kv_heads==1)", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - MQA (n_kv_heads==1)", "[modern_gpt][gqa]") {
     constexpr std::size_t D = 16, Nh = 4, Nkv = 1;
     GroupedQueryAttention gqa(D, Nh, Nkv, 10000.0f, 3);
 
@@ -410,7 +410,7 @@ TEST_CASE("GroupedQueryAttention — MQA (n_kv_heads==1)", "[modern_gpt][gqa]") 
     REQUIRE(params.size() == Nh * 2 + 2u);
 }
 
-TEST_CASE("GroupedQueryAttention — backward propagates gradients", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - backward propagates gradients", "[modern_gpt][gqa]") {
     constexpr std::size_t D = 16, Nh = 2, Nkv = 1;
     GroupedQueryAttention gqa(D, Nh, Nkv, 10000.0f, 4);
 
@@ -421,21 +421,21 @@ TEST_CASE("GroupedQueryAttention — backward propagates gradients", "[modern_gp
     REQUIRE(x.grad().numel() == 3 * static_cast<int64_t>(D));
 }
 
-TEST_CASE("GroupedQueryAttention — throws on bad dimensions", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - throws on bad dimensions", "[modern_gpt][gqa]") {
     REQUIRE_THROWS([] { GroupedQueryAttention bad(0, 2, 1); }());
     REQUIRE_THROWS([] { GroupedQueryAttention bad(16, 0, 1); }());
     REQUIRE_THROWS([] { GroupedQueryAttention bad(16, 3, 1); }());  // 16 % 3 != 0
     REQUIRE_THROWS([] { GroupedQueryAttention bad(16, 4, 3); }());  // 4 % 3 != 0
 }
 
-TEST_CASE("GroupedQueryAttention — forward throws on non-2D input", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - forward throws on non-2D input", "[modern_gpt][gqa]") {
     GroupedQueryAttention gqa(16, 2, 1, 10000.0f, 5);
     Tensor xd({16}, DType::Float32);
     Variable x(xd, false);
     REQUIRE_THROWS(gqa.forward(x));
 }
 
-TEST_CASE("GroupedQueryAttention — explicit head_dim != D/H (Qwen3 style)", "[modern_gpt][gqa]") {
+TEST_CASE("GroupedQueryAttention - explicit head_dim != D/H (Qwen3 style)", "[modern_gpt][gqa]") {
     // D=32, H=2 → derived Dh=16; but we force Dh=8 explicitly.
     // This models Qwen3-4B+: head_dim fixed, embed_dim/n_heads differs.
     constexpr int64_t D  = 32;
@@ -448,14 +448,14 @@ TEST_CASE("GroupedQueryAttention — explicit head_dim != D/H (Qwen3 style)", "[
     Variable x(xd, false);
     auto y = gqa.forward(x);
 
-    // Output must still be (T, D) — W_O projects head_dim→embed_dim.
+    // Output must still be (T, D) - W_O projects head_dim→embed_dim.
     REQUIRE(y.data().shape()[0] == T);
     REQUIRE(y.data().shape()[1] == D);
 }
 
 // ── ModernTransformerBlock ────────────────────────────────────────────────────
 
-TEST_CASE("ModernTransformerBlock — forward output shape", "[modern_gpt][block]") {
+TEST_CASE("ModernTransformerBlock - forward output shape", "[modern_gpt][block]") {
     constexpr int64_t D = 16;
     ModernTransformerBlock block(D, 2, 1, 32, 10);
 
@@ -468,7 +468,7 @@ TEST_CASE("ModernTransformerBlock — forward output shape", "[modern_gpt][block
     REQUIRE(y.data().shape()[1] == D);
 }
 
-TEST_CASE("ModernTransformerBlock — backward flow", "[modern_gpt][block]") {
+TEST_CASE("ModernTransformerBlock - backward flow", "[modern_gpt][block]") {
     constexpr int64_t D = 16;
     ModernTransformerBlock block(D, 2, 1, 32, 11);
 
@@ -481,7 +481,7 @@ TEST_CASE("ModernTransformerBlock — backward flow", "[modern_gpt][block]") {
 
 // ── ModernGPT ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("ModernGPT — construction and accessors", "[modern_gpt]") {
+TEST_CASE("ModernGPT - construction and accessors", "[modern_gpt]") {
     ModernGPT m(32, 16, 2, 1, 2, 0, 0, 1);
     REQUIRE(m.vocab_size() == 32);
     REQUIRE(m.embed_dim()  == 16);
@@ -489,7 +489,66 @@ TEST_CASE("ModernGPT — construction and accessors", "[modern_gpt]") {
     REQUIRE(m.n_mtp_heads() == 0);
 }
 
-TEST_CASE("ModernGPT — forward output shape", "[modern_gpt]") {
+TEST_CASE("ModernGPT - QK-norm adds 2 params per layer", "[modern_gpt][qk_norm]") {
+    // Qwen3-style QK-norm adds one q_norm + one k_norm (RMSNorm) per layer.
+    constexpr int64_t V = 32, D = 16, L = 3;
+    ModernGPT base(V, D, 2, 1, L, 0, 0, 1, -1, 0, /*use_qk_norm=*/false);
+    ModernGPT qkn (V, D, 2, 1, L, 0, 0, 1, -1, 0, /*use_qk_norm=*/true);
+    CHECK(qkn.parameters().size() == base.parameters().size() + 2u * L);
+}
+
+TEST_CASE("ModernGPT - QK-norm forward and forward_one run and stay finite",
+          "[modern_gpt][qk_norm]") {
+    constexpr int64_t V = 48, D = 32, T = 6;
+    ModernGPT m(V, D, 4, 2, 2, 64, 0, 5, -1, 0, /*use_qk_norm=*/true);
+
+    Tensor ids = make_ids(T, static_cast<int32_t>(V));
+
+    // Training path: full forward.
+    auto logits = m.forward(ids);
+    REQUIRE(logits.data().shape()[0] == T);
+    REQUIRE(logits.data().shape()[1] == V);
+    for (float v : logits.data().data_as<float>()) CHECK(std::isfinite(v));
+
+    // Inference path: the KV-cached forward_one must agree with the last row of
+    // the full forward — both apply QK-norm and (after RoPE unification) the same
+    // half-split RoPE convention.
+    auto cache = m.make_kv_cache(T);
+    Tensor last;
+    for (int64_t t = 0; t < T; ++t)
+        last = m.forward_one(ids.data_as<int32_t>()[static_cast<std::size_t>(t)], cache);
+    REQUIRE(last.shape()[1] == V);
+
+    auto full = logits.data().data_as<float>();
+    auto one  = last.data_as<float>();
+    const std::size_t off = static_cast<std::size_t>((T - 1) * V);
+    for (std::size_t v = 0; v < static_cast<std::size_t>(V); ++v)
+        CHECK_THAT(one[v], WithinAbs(full[off + v], 1e-4));
+    CHECK(cache.filled == T);
+}
+
+TEST_CASE("ModernGPT - forward and forward_one agree (RoPE convention unified)",
+          "[modern_gpt][rope]") {
+    // Regression guard: the training forward() and KV-cached forward_one() must
+    // use the same RoPE convention, so the last-position logits match.
+    constexpr int64_t V = 40, D = 32, T = 5;
+    ModernGPT m(V, D, 4, 2, 2, 64, 0, 9);
+    Tensor ids = make_ids(T, static_cast<int32_t>(V));
+
+    auto full_logits = m.forward(ids).data();
+    auto cache = m.make_kv_cache(T);
+    Tensor last;
+    for (int64_t t = 0; t < T; ++t)
+        last = m.forward_one(ids.data_as<int32_t>()[static_cast<std::size_t>(t)], cache);
+
+    auto full = full_logits.data_as<float>();
+    auto one  = last.data_as<float>();
+    const std::size_t off = static_cast<std::size_t>((T - 1) * V);
+    for (std::size_t v = 0; v < static_cast<std::size_t>(V); ++v)
+        CHECK_THAT(one[v], WithinAbs(full[off + v], 1e-4));
+}
+
+TEST_CASE("ModernGPT - forward output shape", "[modern_gpt]") {
     constexpr int64_t V = 64, D = 32, T = 8;
     ModernGPT m(V, D, 2, 1, 2, 0, 0, 2);
     Tensor ids = make_ids(T, static_cast<int32_t>(V));
@@ -498,7 +557,7 @@ TEST_CASE("ModernGPT — forward output shape", "[modern_gpt]") {
     REQUIRE(logits.data().shape()[1] == V);
 }
 
-TEST_CASE("ModernGPT — backward runs without error", "[modern_gpt]") {
+TEST_CASE("ModernGPT - backward runs without error", "[modern_gpt]") {
     constexpr int64_t V = 32, D = 16, T = 4;
     ModernGPT m(V, D, 2, 1, 2, 0, 0, 3);
     Tensor ids = make_ids(T, static_cast<int32_t>(V));
@@ -519,7 +578,7 @@ TEST_CASE("ModernGPT — backward runs without error", "[modern_gpt]") {
     REQUIRE(with_grad > 0);
 }
 
-TEST_CASE("ModernGPT — forward_mtp returns 1 + n_mtp_heads heads", "[modern_gpt]") {
+TEST_CASE("ModernGPT - forward_mtp returns 1 + n_mtp_heads heads", "[modern_gpt]") {
     constexpr int64_t V = 32, D = 16, T = 6, Nmtp = 3;
     ModernGPT m(V, D, 2, 1, 2, 0, Nmtp, 4);
     Tensor ids = make_ids(T, static_cast<int32_t>(V));
@@ -532,7 +591,7 @@ TEST_CASE("ModernGPT — forward_mtp returns 1 + n_mtp_heads heads", "[modern_gp
     }
 }
 
-TEST_CASE("ModernGPT — forward with n_mtp==0 same as forward_mtp head_0", "[modern_gpt]") {
+TEST_CASE("ModernGPT - forward with n_mtp==0 same as forward_mtp head_0", "[modern_gpt]") {
     constexpr int64_t V = 32, D = 16, T = 5;
     ModernGPT m(V, D, 2, 1, 2, 0, 0, 5);
     Tensor ids = make_ids(T, static_cast<int32_t>(V));
@@ -546,7 +605,7 @@ TEST_CASE("ModernGPT — forward with n_mtp==0 same as forward_mtp head_0", "[mo
         REQUIRE_THAT(la[i], WithinAbs(lb[i], 1e-5f));
 }
 
-TEST_CASE("ModernGPT — throws on invalid arguments", "[modern_gpt]") {
+TEST_CASE("ModernGPT - throws on invalid arguments", "[modern_gpt]") {
     REQUIRE_THROWS([] { ModernGPT bad(32, 16, 0, 1, 2); }());   // n_heads=0
     REQUIRE_THROWS([] { ModernGPT bad(32, 16, 2, 0, 2); }());   // n_kv_heads=0
     REQUIRE_THROWS([] { ModernGPT bad(32, 16, 2, 3, 2); }());   // n_kv_heads>n_heads
@@ -554,13 +613,13 @@ TEST_CASE("ModernGPT — throws on invalid arguments", "[modern_gpt]") {
     REQUIRE_THROWS([] { ModernGPT bad(32, 16, 2, 1, 2, 0, -1); }()); // n_mtp<0
 }
 
-TEST_CASE("ModernGPT — forward throws on non-1D token_ids", "[modern_gpt]") {
+TEST_CASE("ModernGPT - forward throws on non-1D token_ids", "[modern_gpt]") {
     ModernGPT m(32, 16, 2, 1, 2, 0, 0, 6);
     Tensor bad({4, 4}, DType::Int32);
     REQUIRE_THROWS(m.forward(bad));
 }
 
-TEST_CASE("ModernGPT — loss decreases over 30 SGD steps", "[modern_gpt]") {
+TEST_CASE("ModernGPT - loss decreases over 30 SGD steps", "[modern_gpt]") {
     constexpr int64_t V = 64, D = 32, T = 8;
     ModernGPT m(V, D, 2, 1, 2, 0, 0, 7);
     auto params = m.parameters();

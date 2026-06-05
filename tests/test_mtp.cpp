@@ -32,39 +32,39 @@ static Tensor make_ids_seq(int64_t len, int64_t vocab_size) {
 
 // ModernGPT(vocab_size, embed_dim, n_heads, n_kv_heads, n_layers, d_ff=0, n_mtp_heads=0, seed=42)
 
-TEST_CASE("mtp_train_loss — rejects model with no MTP heads") {
+TEST_CASE("mtp_train_loss - rejects model with no MTP heads") {
     ModernGPT m(20, 16, 2, 1, 2);  // n_mtp_heads defaults to 0
     auto ids = make_ids({0, 1, 2, 3, 4});
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids, 5), std::runtime_error);
 }
 
-TEST_CASE("mtp_train_loss — rejects 2D token_ids") {
+TEST_CASE("mtp_train_loss - rejects 2D token_ids") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     Tensor ids2d({3, 4}, DType::Int32);
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids2d, 12), std::runtime_error);
 }
 
-TEST_CASE("mtp_train_loss — rejects mismatched seq_len") {
+TEST_CASE("mtp_train_loss - rejects mismatched seq_len") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     auto ids = make_ids({0, 1, 2, 3, 4});  // T=5
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids, 4), std::runtime_error);  // seq_len=4 != T
 }
 
-TEST_CASE("mtp_train_loss — rejects seq too short (T < 2+K)") {
+TEST_CASE("mtp_train_loss - rejects seq too short (T < 2+K)") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 2 /*n_mtp_heads=2*/);
     // Need T >= 4, provide T=3
     auto ids = make_ids({0, 1, 2});
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids, 3), std::runtime_error);
 }
 
-TEST_CASE("mtp_train_loss — rejects invalid aux_weight") {
+TEST_CASE("mtp_train_loss - rejects invalid aux_weight") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     auto ids = make_ids({0, 1, 2, 3, 4});
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids, 5, -0.1f), std::runtime_error);
     REQUIRE_THROWS_AS(mtp_train_loss(m, ids, 5,  1.1f), std::runtime_error);
 }
 
-TEST_CASE("mtp_train_loss — returns scalar Variable") {
+TEST_CASE("mtp_train_loss - returns scalar Variable") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     auto ids = make_ids_seq(6, 20);
     auto loss = mtp_train_loss(m, ids, 6, 0.1f);
@@ -72,7 +72,7 @@ TEST_CASE("mtp_train_loss — returns scalar Variable") {
     REQUIRE(loss.data().data_as<float>()[0] > 0.f);
 }
 
-TEST_CASE("mtp_train_loss — loss is finite and positive") {
+TEST_CASE("mtp_train_loss - loss is finite and positive") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 2 /*n_mtp_heads=2*/);
     auto ids = make_ids_seq(8, 20);
     auto loss = mtp_train_loss(m, ids, 8, 0.1f);
@@ -81,7 +81,7 @@ TEST_CASE("mtp_train_loss — loss is finite and positive") {
     REQUIRE(lv > 0.f);
 }
 
-TEST_CASE("mtp_train_loss — gradient flows to model parameters") {
+TEST_CASE("mtp_train_loss - gradient flows to model parameters") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     auto ids = make_ids_seq(6, 20);
     auto loss = mtp_train_loss(m, ids, 6, 0.1f);
@@ -97,7 +97,7 @@ TEST_CASE("mtp_train_loss — gradient flows to model parameters") {
     REQUIRE(any_grad);
 }
 
-TEST_CASE("mtp_train_loss — aux_weight=0 gives same loss as aux_weight with all zeros auxiliary heads") {
+TEST_CASE("mtp_train_loss - aux_weight=0 gives same loss as aux_weight with all zeros auxiliary heads") {
     // aux_weight=0 means only the main head (k=0) contributes.
     ModernGPT m1(20, 16, 2, 1, 2, 0, 1, 42 /*n_mtp_heads=1*/);
     ModernGPT m2(20, 16, 2, 1, 2, 0, 1, 42 /*n_mtp_heads=1*/);
@@ -109,7 +109,7 @@ TEST_CASE("mtp_train_loss — aux_weight=0 gives same loss as aux_weight with al
     REQUIRE(loss0.data().data_as<float>()[0] <= loss1.data().data_as<float>()[0] + 1e-4f);
 }
 
-TEST_CASE("mtp_train_loss — training step reduces loss (K=1)") {
+TEST_CASE("mtp_train_loss - training step reduces loss (K=1)") {
     const int64_t V = 20, T = 8;
     ModernGPT m(V, 16, 2, 1, 1, 0, 1 /*n_mtp_heads=1*/, 42);
     Adam adam(m.parameters(), 5e-3f);
@@ -131,21 +131,21 @@ TEST_CASE("mtp_train_loss — training step reduces loss (K=1)") {
 
 // ── mtp_generate ─────────────────────────────────────────────────────────────
 
-TEST_CASE("mtp_generate — rejects empty prompt") {
+TEST_CASE("mtp_generate - rejects empty prompt") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     std::mt19937 rng(42);
     SamplingConfig cfg;
     REQUIRE_THROWS_AS(mtp_generate(m, {}, 5, cfg, rng), std::runtime_error);
 }
 
-TEST_CASE("mtp_generate — rejects max_new_tokens < 1") {
+TEST_CASE("mtp_generate - rejects max_new_tokens < 1") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     std::mt19937 rng(42);
     SamplingConfig cfg;
     REQUIRE_THROWS_AS(mtp_generate(m, {0, 1, 2}, 0, cfg, rng), std::runtime_error);
 }
 
-TEST_CASE("mtp_generate — produces correct number of tokens (K=0 fallback)") {
+TEST_CASE("mtp_generate - produces correct number of tokens (K=0 fallback)") {
     ModernGPT m(20, 16, 2, 1, 2);  // n_mtp_heads=0
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};
@@ -153,7 +153,7 @@ TEST_CASE("mtp_generate — produces correct number of tokens (K=0 fallback)") {
     REQUIRE(static_cast<int64_t>(result.size()) == 3 + 5);
 }
 
-TEST_CASE("mtp_generate — produces correct number of tokens (K=2)") {
+TEST_CASE("mtp_generate - produces correct number of tokens (K=2)") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 2 /*n_mtp_heads=2*/);
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};
@@ -161,7 +161,7 @@ TEST_CASE("mtp_generate — produces correct number of tokens (K=2)") {
     REQUIRE(static_cast<int64_t>(result.size()) == 3 + 7);
 }
 
-TEST_CASE("mtp_generate — prompt tokens preserved at front") {
+TEST_CASE("mtp_generate - prompt tokens preserved at front") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1*/);
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};
@@ -174,7 +174,7 @@ TEST_CASE("mtp_generate — prompt tokens preserved at front") {
 
 // ── mtp_generate_stats ────────────────────────────────────────────────────────
 
-TEST_CASE("mtp_generate_stats — K=0 uses 1 pass per token") {
+TEST_CASE("mtp_generate_stats - K=0 uses 1 pass per token") {
     ModernGPT m(20, 16, 2, 1, 2);  // n_mtp_heads=0
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};
@@ -183,7 +183,7 @@ TEST_CASE("mtp_generate_stats — K=0 uses 1 pass per token") {
     REQUIRE(stats.tokens_per_pass == Catch::Approx(1.0));
 }
 
-TEST_CASE("mtp_generate_stats — K=2 uses fewer passes than tokens") {
+TEST_CASE("mtp_generate_stats - K=2 uses fewer passes than tokens") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 2 /*n_mtp_heads=2, 3 tokens/pass*/);
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};
@@ -194,7 +194,7 @@ TEST_CASE("mtp_generate_stats — K=2 uses fewer passes than tokens") {
     REQUIRE(static_cast<int64_t>(stats.tokens.size()) == 2 + 9);
 }
 
-TEST_CASE("mtp_generate_stats — tokens_per_pass > 1 for K > 0") {
+TEST_CASE("mtp_generate_stats - tokens_per_pass > 1 for K > 0") {
     ModernGPT m(20, 16, 2, 1, 2, 0, 1 /*n_mtp_heads=1, 2 tokens/pass*/);
     std::mt19937 rng(42);
     SamplingConfig cfg{SamplingMode::Greedy};

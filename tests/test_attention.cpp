@@ -26,7 +26,7 @@ static Variable leaf2d(std::vector<float> vals, int64_t rows, int64_t cols,
 
 // ── scale ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("scale — forward multiplies all elements by alpha", "[attn]") {
+TEST_CASE("scale - forward multiplies all elements by alpha", "[attn]") {
     auto x   = leaf2d({1.f, 2.f, 3.f, 4.f}, 2, 2);
     auto y   = scale(x, 2.0f);
     const auto od = y.data().data_as<float>();
@@ -34,7 +34,7 @@ TEST_CASE("scale — forward multiplies all elements by alpha", "[attn]") {
     REQUIRE_THAT(od[3], WithinAbs(8.0f, 1e-5f));
 }
 
-TEST_CASE("scale — backward propagates alpha * upstream", "[attn]") {
+TEST_CASE("scale - backward propagates alpha * upstream", "[attn]") {
     auto x = leaf2d({1.f, -1.f, 2.f, -2.f}, 2, 2);
     sum(scale(x, 3.0f)).backward();
     const auto gd = x.grad().data_as<float>();
@@ -42,7 +42,7 @@ TEST_CASE("scale — backward propagates alpha * upstream", "[attn]") {
         REQUIRE_THAT(gd[i], WithinAbs(3.0f, 1e-5f));
 }
 
-TEST_CASE("scale — alpha=0 gives zero output and zero grad", "[attn]") {
+TEST_CASE("scale - alpha=0 gives zero output and zero grad", "[attn]") {
     auto x = leaf2d({5.f, -3.f}, 1, 2);
     sum(scale(x, 0.0f)).backward();
     for (std::size_t i = 0; i < 2u; ++i) {
@@ -52,14 +52,14 @@ TEST_CASE("scale — alpha=0 gives zero output and zero grad", "[attn]") {
 
 // ── transpose2d ───────────────────────────────────────────────────────────────
 
-TEST_CASE("transpose2d — output shape is (N, M) for (M, N) input", "[attn]") {
+TEST_CASE("transpose2d - output shape is (N, M) for (M, N) input", "[attn]") {
     auto x   = leaf2d(std::vector<float>(3 * 4, 0.f), 3, 4);
     auto xt  = transpose2d(x);
     REQUIRE(xt.data().shape()[0] == 4);
     REQUIRE(xt.data().shape()[1] == 3);
 }
 
-TEST_CASE("transpose2d — values are correctly transposed", "[attn]") {
+TEST_CASE("transpose2d - values are correctly transposed", "[attn]") {
     // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
     auto x  = leaf2d({1.f,2.f,3.f, 4.f,5.f,6.f}, 2, 3);
     auto xt = transpose2d(x);
@@ -70,7 +70,7 @@ TEST_CASE("transpose2d — values are correctly transposed", "[attn]") {
     REQUIRE_THAT(td[5], WithinAbs(6.0f, 1e-5f));  // [2,1]
 }
 
-TEST_CASE("transpose2d — backward gives transposed upstream", "[attn]") {
+TEST_CASE("transpose2d - backward gives transposed upstream", "[attn]") {
     // sum(x^T) = sum(x), so grad_x = ones
     auto x  = leaf2d({1.f,2.f, 3.f,4.f}, 2, 2);
     sum(transpose2d(x)).backward();
@@ -79,7 +79,7 @@ TEST_CASE("transpose2d — backward gives transposed upstream", "[attn]") {
         REQUIRE_THAT(gd[i], WithinAbs(1.0f, 1e-5f));
 }
 
-TEST_CASE("transpose2d — non-2D input throws", "[attn]") {
+TEST_CASE("transpose2d - non-2D input throws", "[attn]") {
     Tensor t3 = zeros({2, 3, 4});
     Variable v3(std::move(t3), true);
     REQUIRE_THROWS_AS(transpose2d(v3), std::runtime_error);
@@ -87,7 +87,7 @@ TEST_CASE("transpose2d — non-2D input throws", "[attn]") {
 
 // ── softmax ───────────────────────────────────────────────────────────────────
 
-TEST_CASE("softmax — each row sums to 1", "[attn]") {
+TEST_CASE("softmax - each row sums to 1", "[attn]") {
     auto x = leaf2d({1.f,2.f,3.f, 0.f,-1.f,2.f}, 2, 3);
     auto y = softmax(x);
     const auto yd = y.data().data_as<float>();
@@ -97,7 +97,7 @@ TEST_CASE("softmax — each row sums to 1", "[attn]") {
     REQUIRE_THAT(row1, WithinAbs(1.0f, 1e-5f));
 }
 
-TEST_CASE("softmax — masked position (-inf) gets zero weight", "[attn]") {
+TEST_CASE("softmax - masked position (-inf) gets zero weight", "[attn]") {
     const float neg_inf = -std::numeric_limits<float>::infinity();
     auto x = leaf2d({0.5f, neg_inf, neg_inf,
                      0.5f, 0.3f,    neg_inf}, 2, 3, false);
@@ -109,8 +109,8 @@ TEST_CASE("softmax — masked position (-inf) gets zero weight", "[attn]") {
     REQUIRE_THAT(yd[5], WithinAbs(0.0f, 1e-5f));  // row 1: pos 2 masked
 }
 
-TEST_CASE("softmax — backward grad check", "[attn]") {
-    // f = sum(softmax(x) * w) with non-uniform w — non-constant, non-trivial grad.
+TEST_CASE("softmax - backward grad check", "[attn]") {
+    // f = sum(softmax(x) * w) with non-uniform w - non-constant, non-trivial grad.
     const float eps = 1e-3f;
 
     // Fixed input and weight tensors.
@@ -151,14 +151,14 @@ TEST_CASE("softmax — backward grad check", "[attn]") {
     }
 }
 
-TEST_CASE("softmax — non-2D input throws", "[attn]") {
+TEST_CASE("softmax - non-2D input throws", "[attn]") {
     Variable v(zeros({4}), true);
     REQUIRE_THROWS_AS(softmax(v), std::runtime_error);
 }
 
 // ── MultiHeadSelfAttention ────────────────────────────────────────────────────
 
-TEST_CASE("MHA — output shape is (T, D)", "[attn][mha]") {
+TEST_CASE("MHA - output shape is (T, D)", "[attn][mha]") {
     MultiHeadSelfAttention mha(8, 2);
     auto x   = leaf2d(std::vector<float>(4 * 8, 0.1f), 4, 8);
     auto out = mha.forward(x);
@@ -166,7 +166,7 @@ TEST_CASE("MHA — output shape is (T, D)", "[attn][mha]") {
     REQUIRE(out.data().shape()[1] == 8);
 }
 
-TEST_CASE("MHA — single head, output shape is (T, D)", "[attn][mha]") {
+TEST_CASE("MHA - single head, output shape is (T, D)", "[attn][mha]") {
     MultiHeadSelfAttention mha(6, 1);
     auto x   = leaf2d(std::vector<float>(3 * 6, 0.2f), 3, 6);
     auto out = mha.forward(x);
@@ -174,13 +174,13 @@ TEST_CASE("MHA — single head, output shape is (T, D)", "[attn][mha]") {
     REQUIRE(out.data().shape()[1] == 6);
 }
 
-TEST_CASE("MHA — invalid embed_dim/num_heads throws", "[attn][mha]") {
+TEST_CASE("MHA - invalid embed_dim/num_heads throws", "[attn][mha]") {
     REQUIRE_THROWS_AS(MultiHeadSelfAttention(0, 2),  std::runtime_error);
     REQUIRE_THROWS_AS(MultiHeadSelfAttention(6, 0),  std::runtime_error);
     REQUIRE_THROWS_AS(MultiHeadSelfAttention(6, 4),  std::runtime_error);  // not divisible
 }
 
-TEST_CASE("MHA — gradient flows to all weight matrices", "[attn][mha]") {
+TEST_CASE("MHA - gradient flows to all weight matrices", "[attn][mha]") {
     MultiHeadSelfAttention mha(4, 2, /*seed=*/0);
     Tensor xt = randn({3, 4});
     Variable x(std::move(xt), true);
@@ -197,7 +197,7 @@ TEST_CASE("MHA — gradient flows to all weight matrices", "[attn][mha]") {
     }
 }
 
-TEST_CASE("MHA — causal: position 0 output depends only on token 0", "[attn][mha]") {
+TEST_CASE("MHA - causal: position 0 output depends only on token 0", "[attn][mha]") {
     // With causal masking, output[0] must not change when tokens 1+ change.
     MultiHeadSelfAttention mha(4, 1, /*seed=*/7);
 
@@ -218,7 +218,7 @@ TEST_CASE("MHA — causal: position 0 output depends only on token 0", "[attn][m
         REQUIRE_THAT(o1[j], WithinAbs(o2[j], 1e-5f));
 }
 
-TEST_CASE("MHA — non-causal differs from causal for T>1", "[attn][mha]") {
+TEST_CASE("MHA - non-causal differs from causal for T>1", "[attn][mha]") {
     MultiHeadSelfAttention mha(4, 1, /*seed=*/3);
     Tensor xt = randn({3, 4});
     Variable x1(xt, false), x2(xt, false);
@@ -234,7 +234,7 @@ TEST_CASE("MHA — non-causal differs from causal for T>1", "[attn][mha]") {
     REQUIRE(any_diff);
 }
 
-TEST_CASE("MHA — parameters() returns 4 * num_heads pointers", "[attn][mha]") {
+TEST_CASE("MHA - parameters() returns 4 * num_heads pointers", "[attn][mha]") {
     MultiHeadSelfAttention mha(8, 4);
     REQUIRE(mha.parameters().size() == 16u);
 }

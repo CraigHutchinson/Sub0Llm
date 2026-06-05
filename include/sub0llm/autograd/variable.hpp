@@ -48,6 +48,10 @@ public:
     [[nodiscard]] Tensor&       grad();
     [[nodiscard]] const Tensor& grad()          const;
     [[nodiscard]] bool          requires_grad() const noexcept;
+    // Toggle gradient tracking on a leaf (e.g. to freeze parameters). Ops read
+    // this when building the backward graph, so a frozen leaf gets no edges and
+    // its subgraph is pruned from backward.
+    void                        set_requires_grad(bool rg) noexcept;
     [[nodiscard]] bool          is_leaf()       const noexcept;
     [[nodiscard]] bool          defined()       const noexcept { return impl_ != nullptr; }
     [[nodiscard]] const std::string& name()     const noexcept;

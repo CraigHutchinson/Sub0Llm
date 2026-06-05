@@ -44,6 +44,13 @@ public:
         const std::filesystem::path& vocab_json,
         const std::filesystem::path& merges_txt);
 
+    // Build from in-memory data (e.g. extracted from a GGUF file).
+    //   id_to_token: index is token id, value is token string
+    //   merges:      each entry is "A B" (space-separated pair), in priority order
+    [[nodiscard]] static BPETokenizer from_vocab(
+        const std::vector<std::string>& id_to_token,
+        const std::vector<std::string>& merges);
+
     // ── Encode / decode ───────────────────────────────────────────────────────
 
     // Convert a string to a sequence of token IDs.
@@ -88,6 +95,12 @@ private:
     TokenId bos_id_{-1};
     TokenId pad_id_{-1};
     TokenId unk_id_{-1};
+
+    // True for GPT-2/Qwen-style byte-level vocabularies (set by from_vocab):
+    // every token char is a remapped byte (e.g. newline→'Ċ', space→'Ġ'), so
+    // decode must reverse the byte↔unicode mapping rather than emit the raw
+    // token text. Trained/loaded vocabularies leave this false.
+    bool    byte_level_{false};
 
     // Apply one round of BPE to a sequence of tokens.
     // Returns true if any merge was performed.
