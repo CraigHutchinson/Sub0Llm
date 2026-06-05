@@ -68,9 +68,11 @@ shapes (authoritative for the file we load) and HF `config.json`, which agree:
 | context / window | 256K / 1024 | model card = HF = GGUF |
 | vocab | 262144 | model card (262K) = GGUF |
 | d_model | 3840 | GGUF = HF |
-| n_heads / head_dim | 16 / 256 | GGUF (`attn_q`=4096=16·256, `attn_q_norm`=256) = HF |
-| **n_kv_heads** | **8 local / 2 global** | **GGUF tensors per-layer** (refines HF's "8") |
-| global-attn layers | every 6th: 5,11,…,47 (8 of 48) | GGUF (the 2-kv layers) |
+| n_heads | 16 (all layers) | GGUF tensors |
+| **head_dim** | **256 local / 512 global** | **GGUF `attn_q_norm` dim per layer** (varies!) |
+| **n_kv_heads** | **8 local / 1 global (MQA)** | **GGUF tensors per-layer** (q_out/head_dim) |
+| global-attn layers | every 6th: 5,11,…,47 (8 of 48) | GGUF (the head_dim-512 / 1-kv layers) |
+| per-layer extras | 4 norms (in/post-attn/pre-ffn/post-ffn) + `layer_output_scale` scalar | GGUF tensors |
 | d_ff | 15360 | GGUF = HF |
 | RoPE θ | 1e4 local / 1e6 global | HF |
 | activation / norm | gelu_pytorch_tanh / (1+w) RMSNorm | HF + Gemma lineage |
