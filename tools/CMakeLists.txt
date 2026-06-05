@@ -43,6 +43,17 @@ set_target_properties(sub0llm-verify PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# ── sub0llm-gemma (Ch27) ──────────────────────────────────────────────────────
+# Faithful Gemma 4 text inference: the dedicated per-layer-heterogeneous GemmaModel
+# (local/global attention, dual RoPE, GeGLU, logit soft-cap) loaded Q8-on-load,
+# with tokenize / logits / greedy modes to gate parity against llama.cpp.
+add_executable(sub0llm-gemma gemma/main.cpp)
+target_link_libraries(sub0llm-gemma PRIVATE sub0llm)
+sub0llm_apply_compile_options(sub0llm-gemma)
+set_target_properties(sub0llm-gemma PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # ── sub0llm-qbench (Ch27) ─────────────────────────────────────────────────────
 # Profile Q8 weight-consumption strategies (dequant-on-the-fly vs quantized int8
 # matmul vs f32) across real model GEMV shapes — measure, don't assume.

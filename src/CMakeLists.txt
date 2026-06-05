@@ -38,6 +38,7 @@ set(SUB0LLM_SOURCES
     nn/long_context.cpp
     nn/episodic_memory.cpp
     nn/gguf_loader.cpp
+    nn/gemma.cpp
 )
 
 

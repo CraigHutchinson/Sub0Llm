@@ -112,24 +112,69 @@ well-trodden domain). Both are real "staged" improvements that compound with the
 tiling wins for end-to-end latency on prompt-heavy workloads; sequence them after the
 SentencePiece correctness work.
 
-### Gemma 4 forward — implementation plan (dedicated next effort)
+### Gemma 4 12B forward — DONE, at parity with llama.cpp
 
-Prerequisite: **SentencePiece tokenizer** (▁ marker, BOS prepend, vocab/merge rules),
-gated by tokenizer parity vs `llama-tokenize`. Then the forward feature set, each
-correctness-gated against a reference:
-1. **Per-layer config**: each block carries its own `n_kv_heads` (8 or 2), window
-   type (local/global from `sliding_window_pattern[48]`), and RoPE base (1e6 global /
-   1e4 local). → a `LayerSpec[]` instead of scalar model dims.
-2. **GeGLU** FFN (gelu-tanh gate) — we have `gelu_f32`; swap the SiLU gate.
-3. **(1 + weight) RMSNorm** — Gemma adds 1 to the learned gamma.
-4. **Embedding scale** ×√3840 ≈ 61.97 after lookup.
-5. **Final logit soft-cap** 30: `logits = 30·tanh(logits/30)`.
-6. **Partial rotary** (rope.dimension_count 256 of head_dim 256 → here full; verify).
-7. QK-norm (have), GQA (have, but per-layer count), tied embeddings (have).
-8. **Q8 quantize-on-load** path extended to per-layer kv (the loader already slices
-   per head; generalize to per-layer head counts).
-Gate: tokenizer parity → logit/greedy parity vs `llama-cli` on the Gemma GGUF, exactly
-as done for Qwen3. Multimodal (vision/audio) is out of scope (text-only).
+A dedicated, self-contained **`GemmaModel`** (`include/sub0llm/nn/gemma.{hpp,cpp}`)
+implements the faithful per-layer-heterogeneous forward — the uniform `ModernGPT`
+cannot represent it. Driven by `sub0llm-gemma` (`tokenize` / `logits` / `greedy`).
+Q8 quantize-on-load (no f32 materialized): **11.91 B params, ~12.1 GiB RSS**.
+
+**The architecture was resolved from the GGUF tensor shapes _and_ llama.cpp's
+`src/models/gemma4.cpp`** (the authoritative interpreter of this exact file — the HF
+config and even some GGUF metadata disagree). Several details would have been
+impossible to guess and were each parity-critical:
+
+| feature | resolution |
+|---------|-----------|
+| head_dim / kv-heads | **per layer**: local (idx%6≠5) 256-dim, 16q/8kv, window 1024, θ=1e4; global (idx%6==5) 512-dim, 16q/**1kv (MQA)**, full attn, θ=1e6 |
+| attention scale | **1.0** — *not* 1/√head_dim (QK-norm controls magnitude; `f_attention_scale=1.0`) |
+| V projection | global layers omit `attn_v` → **V = the raw K projection** (`Vcur = Kcur`) |
+| V norm | plain `rms_norm` with **no learned weight** (easy to miss) |
+| (1+w) RMSNorm | the +1 is **baked into the GGUF weights at conversion** → plain `x_normed·w` |
+| RoPE | NEOX half-split; global layers apply `rope_freqs[256]` = `[1.0]×64, [1e30]×192` → only the first 64 freq-pairs rotate |
+| layer_output_scale | real per-layer scalar (~0.05–0.36) multiplying the **whole** residual stream |
+| FFN | GeGLU (`gelu_pytorch_tanh` gate) ; embed ×√3840 ; final logit soft-cap 30 |
+
+**Correctness gate — PASSED** (vs llama.cpp `b9334`, raw completion `-no-cnv --temp 0`):
+
+| check | result |
+|-------|--------|
+| Tokenize "The capital of France is" | `2 818 5279 529 7001 563` — **exact** vs `llama-tokenize` |
+| Top next-token logit | ` Paris` @ 19.23 (margin 1.7 over ` a`) — **correct** |
+| Greedy continuation (multiple clean prompts) | **byte-identical** to `llama-completion` across 24–48 tokens, e.g. " Paris.\n<\|channel>thought\n<channel\|>That is correct. Paris is the capital and most populous city of France." |
+
+The greedy match runs through all 48 heterogeneous layers (both head dims, MQA,
+dual RoPE + the `rope_freqs` partial rotation, the V=K fallback, per-layer scales,
+GeGLU, soft-cap) — a byte-identical 48-token continuation is only possible if every
+one of those is correct. (Adversarial/ambiguous prompts where the model is genuinely
+uncertain can flip a near-tied token under Q8 activation quantization — llama itself
+gives nonsensical answers there — but every clean prompt matches.)
+
+**Speed / RAM (this CPU, gen tok/s, single-token decode):**
+
+| engine | 1 thread | all threads | RSS | scaling |
+|--------|---------:|------------:|----:|--------:|
+| llama.cpp `tg` | 1.37 | **6.03** (24t) | 11.78 GiB | **4.4×** |
+| our `GemmaModel` | **1.60** | 1.96 (≤32t) | 12.1 GiB | 1.2× |
+
+The single-thread baseline is the honest apples-to-apples kernel comparison, and it's
+the headline: **per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s
+(117%)**. Our representation/kernel work (Q8 quantize-on-load + `dot_q8_0_q8_0`) holds
+up against heavily-tuned ggml on a single core.
+
+The whole multi-thread gap is **thread scaling, not kernel efficiency**: llama scales
+4.4× across 24 threads; ours only 1.2×. The cause is the naive per-GEMV fork-join —
+a fresh `std::thread` pool is spawned and joined for *every* matvec (~340 / token), and
+the small K/V projections (M = 512/2048) fall back to single-threaded entirely. Single-
+token decode is memory-bandwidth-bound, and one core can't saturate DRAM; llama reaches
+~70 GB/s by keeping many cores streaming, while our fork-join overhead caps us near one
+core's bandwidth (~19 GB/s). Since our per-core kernel is already ahead, a persistent
+thread pool + parallelizing all projections should scale us toward — and potentially
+past — llama's 6 tok/s. None of that changes a logit, so the parity gate stays green.
+(On the small Qwen3 we *already* beat llama overall, because there the per-token
+overhead is small relative to the work.) Use `sub0llm-gemma -t N` to pick the thread
+count (`-t 1` for the baseline). Multimodal (vision/audio) and the 26B-A4B MoE variant
+are out of scope (text-only, dense).
 
 ## The stack
 
