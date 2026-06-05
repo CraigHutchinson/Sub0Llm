@@ -150,31 +150,43 @@ one of those is correct. (Adversarial/ambiguous prompts where the model is genui
 uncertain can flip a near-tied token under Q8 activation quantization — llama itself
 gives nonsensical answers there — but every clean prompt matches.)
 
-**Speed / RAM (this CPU, gen tok/s, single-token decode):**
+**Speed / RAM (this CPU, gen tok/s, single-token decode).** Measured apples-to-apples:
+each engine's *own* decode-loop timer (ours; llama's `common_perf_print` **eval time**,
+which excludes load, prompt-eval, and sampling — "unaccounted time = 0.0%"), both
+running greedy temp-0 on the same prompt and generating byte-identical tokens. No
+`llama-bench` is used for the headline — it's two engines self-timing the identical
+workload (one forward / token, batch 1, growing KV; the model's `<|channel>thought`
+tokens are emitted identically by both, so the per-token work is the same).
 
-| engine | 1 thread | all threads | RSS | scaling |
-|--------|---------:|------------:|----:|--------:|
-| llama.cpp `tg` | 1.37 | **6.03** (24t) | 11.78 GiB | **4.4×** |
-| our `GemmaModel` | **1.60** | 1.96 (≤32t) | 12.1 GiB | 1.2× |
+| engine | 1 thread | best multi-thread | RSS | scaling |
+|--------|---------:|------------------:|----:|--------:|
+| llama.cpp (eval time) | 1.37 | 6.00 (24t) | 11.78 GiB | 4.4× |
+| our `GemmaModel` (naive fork-join) | **1.60** | 1.96 | 12.1 GiB | 1.2× |
+| **our `GemmaModel` (persistent pool)** | **1.60** | **5.32 (16t)** | 12.1 GiB | **3.3×** |
 
-The single-thread baseline is the honest apples-to-apples kernel comparison, and it's
-the headline: **per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s
-(117%)**. Our representation/kernel work (Q8 quantize-on-load + `dot_q8_0_q8_0`) holds
-up against heavily-tuned ggml on a single core.
+Two honest findings:
 
-The whole multi-thread gap is **thread scaling, not kernel efficiency**: llama scales
-4.4× across 24 threads; ours only 1.2×. The cause is the naive per-GEMV fork-join —
-a fresh `std::thread` pool is spawned and joined for *every* matvec (~340 / token), and
-the small K/V projections (M = 512/2048) fall back to single-threaded entirely. Single-
-token decode is memory-bandwidth-bound, and one core can't saturate DRAM; llama reaches
-~70 GB/s by keeping many cores streaming, while our fork-join overhead caps us near one
-core's bandwidth (~19 GB/s). Since our per-core kernel is already ahead, a persistent
-thread pool + parallelizing all projections should scale us toward — and potentially
-past — llama's 6 tok/s. None of that changes a logit, so the parity gate stays green.
-(On the small Qwen3 we *already* beat llama overall, because there the per-token
-overhead is small relative to the work.) Use `sub0llm-gemma -t N` to pick the thread
-count (`-t 1` for the baseline). Multimodal (vision/audio) and the 26B-A4B MoE variant
-are out of scope (text-only, dense).
+1. **Per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s (117%).**
+   The single-thread baseline is the cleanest kernel comparison; our Q8 quantize-on-load
+   + `dot_q8_0_q8_0` holds up against heavily-tuned ggml (which here even has AVX-VNNI +
+   weight repack) on one core.
+
+2. **The multi-thread gap was thread *scaling*, not kernel efficiency.** The first cut
+   spawned a fresh `std::thread` pool for *every* GEMV (~340 / token) and ran the small
+   K/V projections single-threaded — it barely scaled (1.2×). Replacing it with a
+   **persistent thread pool** (workers parked on a generation-counter barrier, grabbing
+   32-row tiles from an atomic cursor; the caller participates) took us from 1.96 → **5.32
+   tok/s (3.3× scaling, 89% of llama)** with **zero logit change** (each `y[m]` is the
+   same row dot, just assigned to a different worker — bitwise-deterministic, greedy
+   stays byte-identical). 16 threads beats 24 here (memory-bandwidth contention /
+   hyperthreading). Single-token decode is bandwidth-bound — one core can't saturate
+   DRAM, so the win is many cores streaming weights concurrently.
+
+The remaining ~11% is the next lever: explicit **thread affinity / pipelining** tuned for
+this Intel-on-Windows machine (pin workers to cores, keep them off the OS scheduler's
+migration, possibly split weight-streaming across cores to maximize aggregate DRAM
+bandwidth). Use `sub0llm-gemma -t N` to pick the thread count (`-t 1` for the baseline).
+Multimodal (vision/audio) and the 26B-A4B MoE variant are out of scope (text-only, dense).
 
 ## The stack
 
