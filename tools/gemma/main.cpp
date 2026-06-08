@@ -147,10 +147,8 @@ int main(int argc, char** argv) {
 
         if (args.mode == "logits") {
             auto kv = model.make_cache(prompt_len + 1);
-            std::vector<float> logits;
             const auto t0 = std::chrono::steady_clock::now();
-            for (int64_t p = 0; p < prompt_len; ++p)
-                logits = model.forward_one(ids[static_cast<std::size_t>(p)], p, kv);
+            std::vector<float> logits = model.forward_prefill(ids.data(), prompt_len, 0, kv);
             const double s = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
 
@@ -178,10 +176,10 @@ int main(int argc, char** argv) {
             auto kv = model.make_cache(prompt_len + args.max_tokens + 1);
             std::vector<float> logits;
             int64_t pos = 0;
-            {
+            {   // batched prefill (greedy: argmax only → skip softcap)
                 const auto pp0 = std::chrono::steady_clock::now();
-                for (; pos < prompt_len; ++pos)   // greedy: argmax only → skip softcap
-                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, false);
+                logits = model.forward_prefill(ids.data(), prompt_len, 0, kv, false);
+                pos = prompt_len;
                 const double pp_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - pp0).count();
                 std::cerr << std::format("[gemma] prompt forward {} tok in {:.2f}s ({:.2f} tok/s)\n",

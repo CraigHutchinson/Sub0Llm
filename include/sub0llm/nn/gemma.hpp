@@ -97,9 +97,23 @@ public:
     // `apply_softcap` controls the final logit soft-cap (30·tanh(z/30)). It is
     // order-preserving, so GREEDY decoding can pass false (identical argmax) and skip
     // 262 K tanh/token; pass true when the magnitudes matter (sampling, logit/nll parity).
+    // `compute_logits=false` runs the layers (filling the KV cache) but SKIPS the final
+    // norm + V-wide LM head and returns {} — for prompt prefill of every token except the
+    // last, whose logits no one reads (saves the biggest single GEMV per prompt token).
     [[nodiscard]] std::vector<float> forward_one(int32_t token, int64_t pos,
                                                  GemmaKVCache& kv,
-                                                 bool apply_softcap = true) const;
+                                                 bool apply_softcap = true,
+                                                 bool compute_logits = true) const;
+
+    // Batched prompt prefill: process tokens[start_pos .. start_pos+T) in ONE pass per
+    // layer using the row-reuse Q8 GEMM (weights streamed once, reused across all T
+    // tokens — compute-bound, not the per-token bandwidth wall), filling the KV cache.
+    // Returns the LAST token's logits (the only ones prefill needs). Equivalent to T
+    // sequential forward_one calls but far faster for T>1; falls back to forward_one for
+    // T==1. `apply_softcap` as above.
+    [[nodiscard]] std::vector<float> forward_prefill(const int32_t* tokens, int64_t T,
+                                                     int64_t start_pos, GemmaKVCache& kv,
+                                                     bool apply_softcap = true) const;
 
     [[nodiscard]] int64_t vocab_size()  const noexcept { return V_; }
     [[nodiscard]] int64_t embed_dim()   const noexcept { return D_; }
