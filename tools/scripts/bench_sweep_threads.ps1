@@ -64,6 +64,31 @@ if ($DryRun) {
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+# Returns the generated text from our binary for a short fixed-n run.
+# stdout line format: "gen_text: <text>"
+function Get-OursGenText([int]$t, [int]$n) {
+    try {
+        $out = & $OursBin --model $Model --mode greedy --text $Prompt -n $n -t $t 2>$null
+        foreach ($line in $out) {
+            if ($line -match '^gen_text:\s*(.*)') { return $Matches[1].Trim() }
+        }
+    } catch { }
+    return $null
+}
+
+# Returns the generated text from llama-cli for a short fixed-n run.
+# With --no-display-prompt the stdout is the generated tokens only.
+function Get-LlamaGenText([int]$t, [int]$n) {
+    try {
+        $out = & $LlamaCli -m $Model --prompt $Prompt -n $n -t $t `
+                           --no-display-prompt -s 42 --log-disable 2>$null
+        # stdout lines that are not timing/log lines joined = generated text
+        $text = ($out | Where-Object { $_ -notmatch 'llama_' -and $_ -notmatch '^\s*$' }) -join ' '
+        return $text.Trim()
+    } catch { }
+    return $null
+}
+
 # Returns {tg, pp} from a single run of our binary (both from one model load).
 # main.cpp greedy mode emits on stderr:
 #   [gemma] prompt forward N tok in Xs (PP tok/s)
@@ -160,7 +185,9 @@ Write-Host ""
 
 if (-not $DryRun) {
     $smokeT = [math]::Max(1, [int]([math]::Round($TMax * 0.75)))
-    Write-Host "Smoke-check at t=$smokeT (~75% of TMax=$TMax) ..."
+    $smokeN = 8   # small fixed count — enough to catch divergence, fast to run
+    Write-Host "Smoke-check at t=$smokeT (~75% of TMax=$TMax), n=$smokeN tokens ..."
+
     $smokeOurs  = Get-OursMetrics  $smokeT
     $smokeLlama = Get-LlamaMetrics $smokeT
     $ok = $true
@@ -172,6 +199,23 @@ if (-not $DryRun) {
         Write-Warning "SMOKE FAIL: llama-cli returned no TG tok/s at t=$smokeT — check binary / model path"
         $ok = $false
     }
+
+    if ($ok) {
+        # Verify generated text is binary-identical (greedy decode must agree token-for-token)
+        $oursText  = Get-OursGenText  $smokeT $smokeN
+        $llamaText = Get-LlamaGenText $smokeT $smokeN
+        if ($null -eq $oursText -or $null -eq $llamaText) {
+            Write-Warning "SMOKE WARN: could not capture generated text for equality check"
+        } elseif ($oursText -ne $llamaText) {
+            Write-Warning "SMOKE FAIL: generated text differs — engines are NOT producing identical output"
+            Write-Warning "  sub0llm : '$oursText'"
+            Write-Warning "  llama   : '$llamaText'"
+            $ok = $false
+        } else {
+            Write-Host   "  Output match: '$oursText'"
+        }
+    }
+
     if (-not $ok) {
         Write-Error "Smoke-check failed — aborting before the full sweep."
         exit 1
