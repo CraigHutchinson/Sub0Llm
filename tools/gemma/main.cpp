@@ -56,8 +56,10 @@ struct Args {
     int64_t     max_tokens = 32;
     int64_t     topk = 10;
     int         threads = 0;      // 0 = auto; set to 1 for a single-core baseline
+    int         repeat = 5;       // --mode bench: interleaved A/B rounds
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
+    bool        no_fuse = false;  // disable Q/K/V + gate/up GEMV fusion
 };
 
 Args parse(int argc, char** argv) {
@@ -75,11 +77,14 @@ Args parse(int argc, char** argv) {
         else if (s == "-n" || s == "--max-tokens") a.max_tokens = std::stoll(next());
         else if (s == "--topk")         a.topk = std::stoll(next());
         else if (s == "-t" || s == "--threads") a.threads = std::stoi(next());
+        else if (s == "--repeat")       a.repeat = std::stoi(next());
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
+        else if (s == "--no-fuse")      a.no_fuse = true;
         else if (s == "-h" || s == "--help") {
             std::cout << "usage: sub0llm-gemma --model G.gguf --text \"...\" "
-                         "--mode tokenize|logits|greedy [-n N] [--topk K] [--pieces]\n";
+                         "--mode tokenize|logits|greedy|bench [-n N] [-t N] [--no-fuse] "
+                         "[--repeat N]\n";
             std::exit(0);
         } else throw std::runtime_error(std::format("unknown argument: {}", s));
     }
@@ -98,6 +103,7 @@ int main(int argc, char** argv) {
         const Args args = parse(argc, argv);
 
         sub0llm::nn::set_gemma_threads(args.threads);
+        sub0llm::nn::set_gemma_fuse(!args.no_fuse);
 
         sub0llm::nn::GGUFReader reader(args.model);
         const auto& voc = reader.vocab();
@@ -191,6 +197,51 @@ int main(int argc, char** argv) {
             std::cout << "\ngen_text: " << sp.decode(gen) << "\n";
             std::cerr << std::format("[gemma] generated {} tok in {:.2f}s ({:.2f} tok/s)\n",
                                      gen.size(), s, static_cast<double>(gen.size()) / s);
+            return 0;
+        }
+
+        if (args.mode == "bench") {
+            // Drift-free A/B: alternate fuse-ON / fuse-OFF within ONE process (model
+            // loaded once, shared thermal state), interleaved over `repeat` rounds.
+            // Single-token decode of `max_tokens` per measurement; report best+median.
+            const int64_t G = args.max_tokens;
+            auto decode_toks = [&](bool fuse) {
+                sub0llm::nn::set_gemma_fuse(fuse);
+                auto kv = model.make_cache(prompt_len + G + 1);
+                std::vector<float> logits;
+                int64_t pos = 0;
+                for (; pos < prompt_len; ++pos)
+                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int64_t t = 0; t < G; ++t) {
+                    logits = model.forward_one(argmax(logits), pos, kv);
+                    ++pos;
+                }
+                return static_cast<double>(G) / std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+            };
+            decode_toks(true);   // warmup (page-in, settle clocks)
+
+            std::vector<double> on, off;
+            for (int r = 0; r < args.repeat; ++r) {
+                const double a = decode_toks(true);
+                const double b = decode_toks(false);
+                on.push_back(a); off.push_back(b);
+                std::cerr << std::format("[bench] round {}: fuse {:.2f} | no-fuse {:.2f} tok/s\n",
+                                         r + 1, a, b);
+            }
+            auto stats = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return std::pair{v.back(), v[v.size() / 2]};  // best, median
+            };
+            const auto [on_best, on_med]   = stats(on);
+            const auto [off_best, off_med] = stats(off);
+            std::cout << std::format(
+                "FUSE    best {:.2f}  median {:.2f} tok/s\n"
+                "NO-FUSE best {:.2f}  median {:.2f} tok/s\n"
+                "fusion delta (median): {:+.1f}%\n",
+                on_best, on_med, off_best, off_med,
+                100.0 * (on_med - off_med) / off_med);
             return 0;
         }
 

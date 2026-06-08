@@ -32,6 +32,11 @@ namespace sub0llm::nn {
 namespace { int g_gemma_threads = 0; }
 void set_gemma_threads(int n) { g_gemma_threads = n < 0 ? 0 : n; }
 
+// GEMV fusion toggle (Q/K/V and gate/up under one barrier). On by default; the off path
+// dispatches each output separately — for drift-free A/B of the fusion optimization.
+namespace { bool g_gemma_fuse = true; }
+void set_gemma_fuse(bool on) { g_gemma_fuse = on; }
+
 namespace {
 
 namespace cpu = backend::cpu;
@@ -45,6 +50,12 @@ void pin_thread_to_cpu(int cpu) {
     (void)cpu;
 #endif
 }
+
+// One output of a fused GEMV group: y[m] = dot(W + m*kblk, xq, kblk), m in [0, M).
+// Several jobs that share the SAME activation (same K) are dispatched under ONE barrier
+// (e.g. Q/K/V from attn_norm, or gate/up from ffn_norm) — fewer sync points per token and
+// a larger, better-balanced row space than three small separate dispatches.
+struct GemvJob { const cpu::BlockQ8_0* W; float* y; int64_t M; };
 
 // Persistent thread pool for the Q8 GEMVs, tuned for a single-token decode (which is
 // DRAM-bandwidth-bound: one core can't saturate memory, so the win is many cores
@@ -75,13 +86,16 @@ public:
     }
     [[nodiscard]] int total() const noexcept { return nworkers_ + 1; }
 
-    // y[m] = dot(W + m*nb, xq, nb) for m in [0, M), across the pool + caller.
-    void run(const cpu::BlockQ8_0* W, const cpu::BlockQ8_0* xq, float* y,
-             int64_t M, int64_t nb) {
-        W_ = W; xq_ = xq; y_ = y; M_ = M; nb_ = nb;
+    // Run `njobs` GEMV outputs (sharing the activation `xq`, kblk blocks each) under one
+    // barrier. `offsets` is the prefix sum of job row counts (length njobs+1); rows are
+    // the concatenated space [0, offsets[njobs]). Caller participates, then waits.
+    void run(const GemvJob* jobs, int njobs, const int64_t* offsets,
+             const cpu::BlockQ8_0* xq, int64_t kblk) {
+        jobs_ = jobs; njobs_ = njobs; offsets_ = offsets;
+        xq_ = xq; kblk_ = kblk; total_ = offsets[njobs];
         next_.store(0, std::memory_order_relaxed);
         remaining_.store(nworkers_, std::memory_order_relaxed);
-        gen_.fetch_add(1, std::memory_order_release);   // publishes W_..nb_ to workers
+        gen_.fetch_add(1, std::memory_order_release);   // publishes the job state
         work();                                         // caller participates
         while (remaining_.load(std::memory_order_acquire) != 0) GEMMA_CPU_RELAX();
     }
@@ -90,15 +104,19 @@ private:
     static constexpr int64_t CHUNK = 32;
 
     void work() {
-        const cpu::BlockQ8_0* W = W_;
-        const cpu::BlockQ8_0* xq = xq_;
-        float* y = y_; const int64_t M = M_, nb = nb_;
+        const GemvJob* jobs = jobs_; const int64_t* off = offsets_;
+        const cpu::BlockQ8_0* xq = xq_; const int64_t kblk = kblk_, total = total_;
+        const int nj = njobs_;
         for (;;) {
             const int64_t i = next_.fetch_add(CHUNK, std::memory_order_relaxed);
-            if (i >= M) break;
-            const int64_t hi = std::min(M, i + CHUNK);
-            for (int64_t m = i; m < hi; ++m)
-                y[m] = cpu::dot_q8_0_q8_0(W + m * nb, xq, nb);
+            if (i >= total) break;
+            const int64_t hi = std::min(total, i + CHUNK);
+            int j = 0; while (j + 1 < nj && i >= off[j + 1]) ++j;    // job owning row i
+            for (int64_t g = i; g < hi; ++g) {
+                while (j + 1 < nj && g >= off[j + 1]) ++j;           // advance across boundary
+                const int64_t lr = g - off[j];
+                jobs[j].y[lr] = cpu::dot_q8_0_q8_0(jobs[j].W + lr * kblk, xq, kblk);
+            }
         }
     }
     void worker(int cpu) {
@@ -119,10 +137,11 @@ private:
     std::atomic<bool>            stop_{false};
     std::atomic<int>             remaining_{0};
     std::atomic<int64_t>         next_{0};
-    const cpu::BlockQ8_0*        W_  = nullptr;
-    const cpu::BlockQ8_0*        xq_ = nullptr;
-    float*                       y_  = nullptr;
-    int64_t                      M_ = 0, nb_ = 0;
+    const GemvJob*               jobs_    = nullptr;
+    const int64_t*               offsets_ = nullptr;
+    const cpu::BlockQ8_0*        xq_      = nullptr;
+    int                          njobs_   = 0;
+    int64_t                      total_   = 0, kblk_ = 0;
 };
 
 int desired_threads() {
@@ -147,21 +166,41 @@ GemmaPool* get_pool() {
     return pool.get();
 }
 
-// Parallel Q8 GEMV: y[M] = W[M,K]·x[K], W row-major (out,in) Q8_0, x f32.
-// Quantizes the activation once, then dots each output row (across the pool).
-void pmatvec(const std::vector<cpu::BlockQ8_0>& W, const float* x, float* y,
-             int64_t M, int64_t K) {
+// Fused parallel Q8 GEMV: dispatch up to `njobs` outputs (each y[m] = W·x, W row-major
+// (out,in) Q8_0) that share the same f32 activation `x` (K wide) under ONE barrier.
+// Quantizes x once. Used to fuse Q/K/V (from attn_norm) and gate/up (from ffn_norm).
+void pmatvec_multi(const GemvJob* jobs, int njobs, const float* x, int64_t K) {
     const int64_t nb = K / QK;
     std::vector<cpu::BlockQ8_0> xq(static_cast<std::size_t>(nb));
     cpu::quantize_row_q8_0(x, xq.data(), K);
 
+    int64_t offsets[8];
+    offsets[0] = 0;
+    for (int j = 0; j < njobs; ++j) offsets[j + 1] = offsets[j] + jobs[j].M;
+    const int64_t total = offsets[njobs];
+
     GemmaPool* pool = get_pool();
-    if (!pool || M < 128) {                       // tiny GEMV: not worth dispatching
-        for (int64_t m = 0; m < M; ++m)
-            y[m] = cpu::dot_q8_0_q8_0(W.data() + m * nb, xq.data(), nb);
+    if (!pool || total < 128) {                   // tiny: not worth dispatching
+        for (int j = 0; j < njobs; ++j)
+            for (int64_t m = 0; m < jobs[j].M; ++m)
+                jobs[j].y[m] = cpu::dot_q8_0_q8_0(jobs[j].W + m * nb, xq.data(), nb);
         return;
     }
-    pool->run(W.data(), xq.data(), y, M, nb);
+    if (g_gemma_fuse) {
+        pool->run(jobs, njobs, offsets, xq.data(), nb);
+    } else {                                       // A/B: one barrier per output
+        for (int j = 0; j < njobs; ++j) {
+            const int64_t off[2] = {0, jobs[j].M};
+            pool->run(&jobs[j], 1, off, xq.data(), nb);
+        }
+    }
+}
+
+// Single Q8 GEMV: y[M] = W[M,K]·x[K]. Thin wrapper over the fused path (one job).
+void pmatvec(const std::vector<cpu::BlockQ8_0>& W, const float* x, float* y,
+             int64_t M, int64_t K) {
+    const GemvJob job{W.data(), y, M};
+    pmatvec_multi(&job, 1, x, K);
 }
 
 // Plain RMSNorm matching ggml: y = x/sqrt(mean(x^2)+eps) * w. The Gemma (1+weight)
@@ -336,12 +375,17 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
         std::vector<float> q(static_cast<std::size_t>(nH * dh));
         std::vector<float> kcur(static_cast<std::size_t>(nKV * dh));
         std::vector<float> vcur(static_cast<std::size_t>(nKV * dh));
-        pmatvec(L.wq, h.data(), q.data(),    nH * dh,  D);
-        pmatvec(L.wk, h.data(), kcur.data(), nKV * dh, D);   // raw K projection
-        // V source: a dedicated wv projection, or — on global layers that omit attn_v —
-        // the raw K projection itself (matching llama.cpp's "Vcur = Kcur" fallback).
-        if (L.has_wv) pmatvec(L.wv, h.data(), vcur.data(), nKV * dh, D);
-        else          vcur = kcur;
+        // Fuse Q, K, (V) into one dispatch — all project the same attn_norm output `h`,
+        // so quantize h once and run the concatenated rows under a single barrier.
+        // Global layers omit attn_v → V is the raw K projection (Vcur = Kcur), so only
+        // Q,K are projected and vcur is copied from kcur afterward.
+        GemvJob qkv[3];
+        int njobs = 0;
+        qkv[njobs++] = {L.wq.data(), q.data(),    nH * dh};
+        qkv[njobs++] = {L.wk.data(), kcur.data(), nKV * dh};
+        if (L.has_wv) qkv[njobs++] = {L.wv.data(), vcur.data(), nKV * dh};
+        pmatvec_multi(qkv, njobs, h.data(), D);
+        if (!L.has_wv) vcur = kcur;
 
         // Q: per-head rmsnorm(q_norm) + RoPE.
         for (int64_t hd = 0; hd < nH; ++hd) {
@@ -405,8 +449,10 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
         rmsnorm(attn_out.data(), L.ffn_norm.data(), h.data(), D, eps_);
         std::vector<float> g(static_cast<std::size_t>(d_ff_));
         std::vector<float> u(static_cast<std::size_t>(d_ff_));
-        pmatvec(L.gate, h.data(), g.data(), d_ff_, D);
-        pmatvec(L.up,   h.data(), u.data(), d_ff_, D);
+        // Fuse gate + up — both project the same ffn_norm output `h` — into one barrier.
+        const GemvJob gu[2] = {{L.gate.data(), g.data(), d_ff_},
+                               {L.up.data(),   u.data(), d_ff_}};
+        pmatvec_multi(gu, 2, h.data(), D);
         cpu::gelu_f32(g.data(), g.data(), static_cast<std::size_t>(d_ff_));
         for (std::size_t i = 0; i < g.size(); ++i) g[i] *= u[i];
 

@@ -37,6 +37,10 @@ namespace sub0llm::nn {
 // capped at 32). Set to 1 for a single-core baseline. Applies to subsequent forwards.
 void set_gemma_threads(int n);
 
+// Toggle Q/K/V and gate/up GEMV fusion (one barrier per fused group). On by default;
+// off dispatches each output separately — for drift-free A/B of the optimization.
+void set_gemma_fuse(bool on);
+
 // Per-layer weights + shape. Q8 weights are stored as the GGUF gives them: row-major
 // (out_features, in_features), so backend::cpu::matvec_q8_0_q8_0 consumes them with
 // M=out, K=in directly (q/k/v are sliced per head AFTER projection, in f32).
