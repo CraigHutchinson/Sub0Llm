@@ -314,4 +314,94 @@ void matmul_q8_0_q8_0(const BlockQ8_0* W, const BlockQ8_0* Xq, float* Y,
     }
 }
 
+// ── f32 reduction / BLAS-ish primitives ────────────────────────────────────────
+// Explicit 8-wide SIMD + scalar remainder for the float reductions clang leaves scalar
+// without -ffast-math (it won't reassociate float adds). Reuses hsum_ps_avx above.
+
+float sum_squares_f32(const float* x, int64_t n) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    __m256 acc = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    float s = hsum_ps_avx(acc);
+    for (; i < n; ++i) s += x[i] * x[i];
+    return s;
+#else
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; ++i) s += x[i] * x[i];
+    return s;
+#endif
+}
+
+float dot_f32(const float* a, const float* b, int64_t n) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    __m256 acc = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+    float s = hsum_ps_avx(acc);
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+#else
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+#endif
+}
+
+void axpy_f32(float alpha, const float* x, float* y, int64_t n) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    const __m256 va = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i,
+            _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+    for (; i < n; ++i) y[i] += alpha * x[i];
+#else
+    for (int64_t i = 0; i < n; ++i) y[i] += alpha * x[i];
+#endif
+}
+
+int64_t argmax_f32(const float* x, int64_t n) noexcept {
+    if (n <= 0) return 0;
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    // 8 independent column-accumulators: lane l tracks the max (and first index) of the
+    // strided column {l, l+8, …}. The cmp is strict-greater so each column keeps its
+    // earliest max; the horizontal reduce breaks ties toward the lower index → first overall.
+    __m256  maxv = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+    __m256i maxi = _mm256_setzero_si256();
+    __m256i idx  = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i eight = _mm256_set1_epi32(8);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v  = _mm256_loadu_ps(x + i);
+        const __m256 gt = _mm256_cmp_ps(v, maxv, _CMP_GT_OQ);
+        maxv = _mm256_max_ps(maxv, v);
+        maxi = _mm256_blendv_epi8(maxi, idx, _mm256_castps_si256(gt));
+        idx  = _mm256_add_epi32(idx, eight);
+    }
+    alignas(32) float mv[8];
+    alignas(32) int32_t mi[8];
+    _mm256_store_ps(mv, maxv);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(mi), maxi);
+    float   best = mv[0];
+    int64_t bi   = mi[0];
+    for (int l = 1; l < 8; ++l) {
+        const int64_t li = mi[l];
+        if (mv[l] > best || (mv[l] == best && li < bi)) { best = mv[l]; bi = li; }
+    }
+    for (; i < n; ++i)
+        if (x[i] > best) { best = x[i]; bi = i; }
+    return bi;
+#else
+    float best = x[0];
+    int64_t bi = 0;
+    for (int64_t i = 1; i < n; ++i) if (x[i] > best) { best = x[i]; bi = i; }
+    return bi;
+#endif
+}
+
 } // namespace sub0llm::backend::cpu

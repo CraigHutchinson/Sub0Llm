@@ -245,18 +245,19 @@ void parallel_for(int64_t n, F body) {
 
 // Plain RMSNorm matching ggml: y = x/sqrt(mean(x^2)+eps) * w. The Gemma (1+weight)
 // is already baked into `w` at GGUF conversion, so this is a straight multiply.
+// The sum-of-squares uses the SIMD reduction (the compiler can't auto-vectorize a float
+// reduction without -ffast-math); the scale pass is a countable elementwise loop the
+// compiler does vectorize. (float accumulation here is far below the Q8 weight error.)
 void rmsnorm(const float* x, const float* w, float* y, int64_t n, float eps) {
-    double ss = 0.0;
-    for (int64_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
-    const float inv = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(n)) + eps);
+    const float ss  = cpu::sum_squares_f32(x, n);
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(n) + eps);
     for (int64_t i = 0; i < n; ++i) y[i] = x[i] * inv * w[i];
 }
 
 // RMSNorm with no learned weight (Gemma V projection): y = x/sqrt(mean(x^2)+eps).
 void rmsnorm_noweight(const float* x, float* y, int64_t n, float eps) {
-    double ss = 0.0;
-    for (int64_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
-    const float inv = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(n)) + eps);
+    const float ss  = cpu::sum_squares_f32(x, n);
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(n) + eps);
     for (int64_t i = 0; i < n; ++i) y[i] = x[i] * inv;
 }
 
@@ -464,10 +465,8 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
             float* scores = scores_all.data() + hd * kvlen;
 
             float mx = -std::numeric_limits<float>::infinity();
-            for (int64_t t = kv_lo; t <= kv_hi; ++t) {
-                const float* kt = Kbase + static_cast<std::size_t>(t * dh);
-                float dot = 0.0f;
-                for (int64_t d = 0; d < dh; ++d) dot += qh[d] * kt[d];
+            for (int64_t t = kv_lo; t <= kv_hi; ++t) {           // QKᵀ score (SIMD dot)
+                const float dot = cpu::dot_f32(qh, Kbase + static_cast<std::size_t>(t * dh), dh);
                 scores[t - kv_lo] = dot;   // scale = 1.0
                 mx = std::max(mx, dot);
             }
@@ -477,10 +476,9 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
 
             float* oh = attn_concat.data() + hd * dh;
             for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
-            for (int64_t t = kv_lo; t <= kv_hi; ++t) {
-                const float w  = scores[t - kv_lo] * invsum;
+            for (int64_t t = kv_lo; t <= kv_hi; ++t) {           // weighted V sum (SIMD axpy)
                 const float* vt = Vbase + static_cast<std::size_t>(t * dh);
-                for (int64_t d = 0; d < dh; ++d) oh[d] += w * vt[d];
+                cpu::axpy_f32(scores[t - kv_lo] * invsum, vt, oh, dh);
             }
         });
 

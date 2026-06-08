@@ -32,6 +32,18 @@ static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block must be 34 bytes (matches GGU
 [[nodiscard]] float    f16_to_f32(uint16_t h) noexcept;
 [[nodiscard]] uint16_t f32_to_f16(float f) noexcept;
 
+// ── f32 reduction / BLAS-ish primitives ────────────────────────────────────────
+// SIMD helpers for the per-token "glue" between GEMVs (RMSNorm, attention, argmax) that
+// the compiler can't auto-vectorize: a float-add reduction needs reassociation, which is
+// forbidden without -ffast-math. These do an explicit 8-wide reduction + scalar remainder
+// (sizes are runtime — head_dim 256/512, D 3840, V 262144 — so the bulk is SIMD, the tail
+// scalar). AVX2 instructions run on AVX-512 hosts too, so one path covers both.
+[[nodiscard]] float sum_squares_f32(const float* x, int64_t n) noexcept;                  // Σ x²
+[[nodiscard]] float dot_f32(const float* a, const float* b, int64_t n) noexcept;          // Σ aᵢbᵢ
+void axpy_f32(float alpha, const float* x, float* y, int64_t n) noexcept;                  // y += α·x
+// Index of the first maximum (matches std::max_element's first-occurrence semantics).
+[[nodiscard]] int64_t argmax_f32(const float* x, int64_t n) noexcept;
+
 // Quantize / dequantize a row of `k` floats (k must be a multiple of QK8_0).
 void quantize_row_q8_0  (const float* x, BlockQ8_0* y, int64_t k) noexcept;
 void dequantize_row_q8_0(const BlockQ8_0* x, float* y, int64_t k) noexcept;

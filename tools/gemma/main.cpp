@@ -92,8 +92,10 @@ Args parse(int argc, char** argv) {
     return a;
 }
 
+// SIMD argmax over the V=262144 logits (std::max_element is scalar). First-max semantics.
 int argmax(const std::vector<float>& v) {
-    return static_cast<int>(std::distance(v.begin(), std::max_element(v.begin(), v.end())));
+    return static_cast<int>(
+        sub0llm::backend::cpu::argmax_f32(v.data(), static_cast<int64_t>(v.size())));
 }
 
 } // namespace
