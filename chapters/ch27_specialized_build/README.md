@@ -160,18 +160,31 @@ tokens are emitted identically by both, so the per-token work is the same).
 
 | engine | 1 thread | best multi-thread | RSS | scaling |
 |--------|---------:|------------------:|----:|--------:|
-| llama.cpp (eval time) | 1.37 | 6.00 (24t) | 11.78 GiB | 4.4× |
+| llama.cpp (eval time) | 1.37 | 6.0–6.4 (20–24t) | 11.78 GiB | 4.4× |
 | our `GemmaModel` (naive fork-join) | 1.60 | 1.96 | 12.1 GiB | 1.2× |
 | our `GemmaModel` (CV pool) | 1.60 | 5.32 (16t) | 12.1 GiB | 3.3× |
-| **our `GemmaModel` (spin + affinity)** | **1.60** | **5.59 (20t)** | 12.1 GiB | **3.5×** |
+| our `GemmaModel` (spin + affinity) | 1.60 | 5.59 (20t) | 12.1 GiB | 3.5× |
+| **+ GEMV fusion + attention-parallel + SIMD glue** | **1.60** | **~6.0–6.2 (20t)** | 12.1 GiB | **~3.8×** |
 
 **Per core, our int8 GEMV is _faster_ than llama.cpp — 1.60 vs 1.37 tok/s (117%).** The
 single-thread baseline is the cleanest kernel comparison; our Q8 quantize-on-load +
 `dot_q8_0_q8_0` holds up against heavily-tuned ggml (which here has AVX-VNNI + weight
-repack) on one core. The multi-thread gap was *scaling*, not kernels, and closing it took
-three things — each matching ggml's threadpool design and each **zero logit change**
-(every `y[m]` is the same row dot, just on a different worker — bitwise-deterministic,
-greedy stays byte-identical to llama.cpp):
+repack) on one core.
+
+**Multi-thread, interleaved head-to-head (the thermal-drift-free number): ~95% of
+llama.** `bench_vs_llama.sh` alternates the two engines round-by-round (swapping order
+each round) so Arrow Lake-HX throttling averages out — the cross-process analogue of the
+in-process rotation. Each reports its own decode-loop timer (load/prompt excluded). At
+t=20, n=64, 6 rounds: **ours median 6.02 / best 6.18 vs llama 6.36 → 94.7%.** (Both read
+higher than sustained back-to-back runs because interleaving gives each cooldowns; the
+*ratio* is the fair figure.) So we win per-core, match on RAM, and sit ~5% behind
+multi-thread — that residual is llama's VNNI weight-repack bandwidth edge, exactly as the
+`bench_membw` ladder predicted (the kernel already saturates the bus; the gap is access
+pattern, not compute).
+
+The multi-thread gap *was* scaling, not kernels; closing it took (each **zero logit
+change** — every `y[m]` is the same row dot on a different worker, greedy stays
+byte-identical to llama.cpp):
 
 1. **Persistent pool** (workers spawned once, not ~340×/token): 1.96 → 5.32.
 2. **Spin-wait barrier** instead of a condition variable — at ~340 sync points/token a
@@ -180,6 +193,11 @@ greedy stays byte-identical to llama.cpp):
 3. **Thread affinity** (`SetThreadAffinityMask`, one thread per logical CPU) + an
    off-by-one fix (the caller counts as a thread): stops OS migration thrashing each
    core's L2, and on this hybrid part places the first 8 threads on the P-cores. → 5.59.
+4. **GEMV fusion** (Q/K/V and gate/up share one activation → one barrier, ~337→193
+   barriers/token; +4.6%), **per-head attention parallelized** across the pool (a generic
+   `parallel_for`; ~neutral short-context, essential for long), and **SIMD f32 glue**
+   (`sum_squares`/`dot`/`axpy`/`argmax` — clang leaves float reductions scalar without
+   `-ffast-math`; +~5% on the serial fraction). → ~6.0–6.2, crossing into llama's range.
 
 ### Why we win at 1 core but llama wins at 20 (the bottleneck moves)
 
