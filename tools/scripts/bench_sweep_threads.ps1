@@ -30,7 +30,8 @@ param(
     [int]   $Samples = 6,
     [int]   $TMin    = 1,
     [int]   $TMax    = -1,  # -1 = auto-detect logical core count
-    [string]$Prompt  = "The transformer architecture, introduced in the paper Attention Is All You Need, revolutionised natural language processing by replacing recurrent networks with self-attention mechanisms. Each token attends to every other token in the sequence, allowing the model to capture long-range dependencies in a single forward pass."
+    [string]$Prompt  = "The transformer architecture, introduced in the paper Attention Is All You Need, revolutionised natural language processing by replacing recurrent networks with self-attention mechanisms. Each token attends to every other token in the sequence, allowing the model to capture long-range dependencies in a single forward pass.",
+    [switch]$DryRun          # Skip real binaries; use synthetic data to exercise the full script
 )
 
 Set-StrictMode -Version Latest
@@ -48,13 +49,17 @@ $TotalRounds  = $Samples * $K
 
 # ── get prompt token length (no model load) ───────────────────────────────────
 
-$PromptLen = try {
-    $toks = & $OursBin --model $Model --mode tokenize --text $Prompt 2>$null
-    @($toks -split '\s+' | Where-Object { $_ -match '^\d+$' }).Count
-} catch { 0 }
-if ($PromptLen -lt 1) {
-    Write-Warning "Could not tokenize prompt; prompt length will show as 0 in header"
-    $PromptLen = 0
+if ($DryRun) {
+    $PromptLen = 42   # synthetic stand-in; no binary invoked
+} else {
+    $PromptLen = try {
+        $toks = & $OursBin --model $Model --mode tokenize --text $Prompt 2>$null
+        @($toks -split '\s+' | Where-Object { $_ -match '^\d+$' }).Count
+    } catch { 0 }
+    if ($PromptLen -lt 1) {
+        Write-Warning "Could not tokenize prompt; prompt length will show as 0 in header"
+        $PromptLen = 0
+    }
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -64,6 +69,12 @@ if ($PromptLen -lt 1) {
 #   [gemma] prompt forward N tok in Xs (PP tok/s)
 #   [gemma] generated N tok in Xs (TG tok/s)
 function Get-OursMetrics([int]$t) {
+    if ($DryRun) {
+        # Synthetic: TG peaks around 16-20 threads then falls; PP grows with threads
+        $tg = [math]::Round(1.0 + $t * 0.42 - $t * $t * 0.008 + (Get-Random -Minimum -15 -Maximum 15) / 100.0, 2)
+        $pp = [math]::Round($t * 2.1 + (Get-Random -Minimum -20 -Maximum 20) / 100.0, 2)
+        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp) }
+    }
     $tg = $null; $pp = $null
     try {
         $out = & $OursBin --model $Model --mode greedy --text $Prompt -n $N -t $t 2>&1
@@ -80,6 +91,12 @@ function Get-OursMetrics([int]$t) {
 #   llama_print_timings: prompt eval time = ... (X.XX tokens per second)
 #   llama_print_timings:        eval time = ... (X.XX tokens per second)
 function Get-LlamaMetrics([int]$t) {
+    if ($DryRun) {
+        # Synthetic: llama TG similar shape but slightly higher; PP much higher (batched)
+        $tg = [math]::Round(1.1 + $t * 0.44 - $t * $t * 0.0085 + (Get-Random -Minimum -15 -Maximum 15) / 100.0, 2)
+        $pp = [math]::Round($t * 8.5 + (Get-Random -Minimum -50 -Maximum 50) / 100.0, 2)
+        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp) }
+    }
     $tg = $null; $pp = $null
     try {
         $out = & $LlamaCli -m $Model --prompt $Prompt -n $N -t $t `
@@ -127,6 +144,7 @@ Write-Host ""
 Write-Host "Thread sweep  model=$modelName  n=$N  t=${TMin}..${TMax}  samples=$Samples"
 Write-Host "Schedule: cyclic-rotation Latin square (K=$K threads x $Samples passes = $TotalRounds rounds)"
 Write-Host "Engines: sub0llm @ $gitHash  vs  llama.cpp @ $LlamaVersion"
+if ($DryRun) { Write-Host "*** DRY-RUN MODE — synthetic data only, no binaries invoked ***" }
 Write-Host "Prompt ($PromptLen tokens): '$Prompt'"
 Write-Host "NOTE: llama-cli used (not llama-bench) so both engines receive identical prompt text"
 Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched prefill"
