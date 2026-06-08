@@ -77,12 +77,11 @@ function Get-OursGenText([int]$t, [int]$n) {
 }
 
 # Returns the generated text from llama-cli for a short fixed-n run.
-# With --no-display-prompt the stdout is the generated tokens only.
+# --no-cnv --single-turn ensures it exits after one generation (no interactive hang).
 function Get-LlamaGenText([int]$t, [int]$n) {
     try {
         $out = & $LlamaCli -m $Model --prompt $Prompt -n $n -t $t `
-                           --no-display-prompt -s 42 --log-disable 2>$null
-        # stdout lines that are not timing/log lines joined = generated text
+                           --no-display-prompt --no-cnv --single-turn -s 42 --log-disable 2>$null
         $text = ($out | Where-Object { $_ -notmatch 'llama_' -and $_ -notmatch '^\s*$' }) -join ' '
         return $text.Trim()
     } catch { }
@@ -125,7 +124,7 @@ function Get-LlamaMetrics([int]$t) {
     $tg = $null; $pp = $null
     try {
         $out = & $LlamaCli -m $Model --prompt $Prompt -n $N -t $t `
-                           --no-display-prompt -s 42 --log-disable 2>&1
+                           --no-display-prompt --no-cnv --single-turn -s 42 --log-disable 2>&1
         foreach ($line in $out) {
             if ($line -match 'prompt eval time' -and
                 $line -match '([0-9]+\.[0-9]+) tokens per second') { $pp = [double]$Matches[1] }
@@ -176,7 +175,7 @@ Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched
 Write-Host ""
 Write-Host "Commands (t = thread count for each round):"
 Write-Host "  ours : $OursBin --model $Model --mode greedy --text '<prompt>' -n $N -t <t>"
-Write-Host "  llama: $LlamaCli -m $Model --prompt '<prompt>' -n $N -t <t> --no-display-prompt -s 42 --log-disable"
+Write-Host "  llama: $LlamaCli -m $Model --prompt '<prompt>' -n $N -t <t> --no-display-prompt --no-cnv --single-turn -s 42 --log-disable"
 Write-Host ""
 
 # ── smoke-check ───────────────────────────────────────────────────────────────
