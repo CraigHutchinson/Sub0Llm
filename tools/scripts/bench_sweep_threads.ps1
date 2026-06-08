@@ -140,16 +140,21 @@ $startTime = Get-Date
 $round = 0
 
 # ── main loop ─────────────────────────────────────────────────────────────────
+# One continuous table; two rows (one per engine) per round.
+# Columns: round | pass | threads | elapsed | engine | PP tok/s | TG tok/s
+#
+$tblSep = "+-------+------+------+-------+----------+----------+----------+"
+$tblHdr = "| round | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+Write-Host $tblSep
+Write-Host $tblHdr
+Write-Host $tblSep
 
 for ($p = 0; $p -lt $Samples; $p++) {
-    Write-Host "=== Pass $($p + 1) / $Samples ==="
 
     for ($i = 0; $i -lt $K; $i++) {
         $t = $Threads[($p + $i) % $K]
         $round++
         $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-
-        Write-Host -NoNewline ("  [r{0,3}/{1} t={2,2}] {3,5}m  " -f $round, $TotalRounds, $t, $elapsed)
 
         # Alternate ours/llama order each pass to cancel within-slot bias
         if ($p % 2 -eq 0) {
@@ -165,16 +170,16 @@ for ($p = 0; $p -lt $Samples; $p++) {
         if ($null -ne $lm.tg) { $llamaTG[$t].Add($lm.tg) }
         if ($null -ne $lm.pp) { $llamaPP[$t].Add($lm.pp) }
 
-        # Per-round result table
-        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
-        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' engine', 'PP tok/s', 'TG tok/s')
-        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
-        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' sub0llm', (Fmt $om.pp), (Fmt $om.tg))
-        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' llama', (Fmt $lm.pp), (Fmt $lm.tg))
-        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
+        $prefix = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f $round, ($p+1), $t, $elapsed
+        Write-Host ("$prefix {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $om.pp), (Fmt $om.tg))
+        Write-Host ("$prefix {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lm.pp), (Fmt $lm.tg))
+        # Separator between rounds; thicker (===) between passes
+        if ($i -eq $K - 1) {
+            Write-Host $tblSep
+        } else {
+            Write-Host "+-------+------+------+-------+----------+----------+----------+"
+        }
     }
-
-    Write-Host ""
 }
 
 # ── summary table ─────────────────────────────────────────────────────────────
