@@ -175,8 +175,8 @@ int main(int argc, char** argv) {
             auto kv = model.make_cache(prompt_len + args.max_tokens + 1);
             std::vector<float> logits;
             int64_t pos = 0;
-            for (; pos < prompt_len; ++pos)
-                logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv);
+            for (; pos < prompt_len; ++pos)   // greedy: argmax only → skip softcap
+                logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, false);
 
             std::vector<int32_t> gen;
             const auto t0 = std::chrono::steady_clock::now();
@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
                 const int32_t next = argmax(logits);
                 if (next == voc.eos_id) break;
                 gen.push_back(next);
-                logits = model.forward_one(next, pos, kv);
+                logits = model.forward_one(next, pos, kv, false);
                 ++pos;
             }
             const double s = std::chrono::duration<double>(
@@ -201,47 +201,52 @@ int main(int argc, char** argv) {
         }
 
         if (args.mode == "bench") {
-            // Drift-free A/B: alternate fuse-ON / fuse-OFF within ONE process (model
-            // loaded once, shared thermal state), interleaved over `repeat` rounds.
-            // Single-token decode of `max_tokens` per measurement; report best+median.
+            // Drift-free A/B/C: cycle the cumulative orchestration levers within ONE
+            // process (model loaded once, shared thermal state), interleaved over
+            // `repeat` rounds. Single-token decode of `max_tokens` per measurement.
             const int64_t G = args.max_tokens;
-            auto decode_toks = [&](bool fuse) {
+            auto decode_toks = [&](bool fuse, bool softcap) {
                 sub0llm::nn::set_gemma_fuse(fuse);
                 auto kv = model.make_cache(prompt_len + G + 1);
                 std::vector<float> logits;
                 int64_t pos = 0;
                 for (; pos < prompt_len; ++pos)
-                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv);
+                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, softcap);
                 const auto t0 = std::chrono::steady_clock::now();
                 for (int64_t t = 0; t < G; ++t) {
-                    logits = model.forward_one(argmax(logits), pos, kv);
+                    logits = model.forward_one(argmax(logits), pos, kv, softcap);
                     ++pos;
                 }
                 return static_cast<double>(G) / std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count();
             };
-            decode_toks(true);   // warmup (page-in, settle clocks)
-
-            std::vector<double> on, off;
-            for (int r = 0; r < args.repeat; ++r) {
-                const double a = decode_toks(true);
-                const double b = decode_toks(false);
-                on.push_back(a); off.push_back(b);
-                std::cerr << std::format("[bench] round {}: fuse {:.2f} | no-fuse {:.2f} tok/s\n",
-                                         r + 1, a, b);
-            }
-            auto stats = [](std::vector<double> v) {
-                std::sort(v.begin(), v.end());
-                return std::pair{v.back(), v[v.size() / 2]};  // best, median
+            struct Cfg { const char* name; bool fuse; bool softcap; std::vector<double> t; };
+            Cfg cfgs[] = {
+                {"baseline (no-fuse, softcap)", false, true,  {}},
+                {"+fuse",                       true,  true,  {}},
+                {"+fuse +no-softcap (best)",    true,  false, {}},
             };
-            const auto [on_best, on_med]   = stats(on);
-            const auto [off_best, off_med] = stats(off);
-            std::cout << std::format(
-                "FUSE    best {:.2f}  median {:.2f} tok/s\n"
-                "NO-FUSE best {:.2f}  median {:.2f} tok/s\n"
-                "fusion delta (median): {:+.1f}%\n",
-                on_best, on_med, off_best, off_med,
-                100.0 * (on_med - off_med) / off_med);
+            const int ncfg = static_cast<int>(std::size(cfgs));
+            decode_toks(true, false);   // warmup
+            // Rotate the evaluation order each round so every config samples each thermal
+            // position equally — otherwise a fixed order biases later configs downward as
+            // the chip heats within a round (the in-harness analogue of interleaving).
+            for (int r = 0; r < args.repeat; ++r)
+                for (int s = 0; s < ncfg; ++s) {
+                    auto& c = cfgs[(r + s) % ncfg];
+                    c.t.push_back(decode_toks(c.fuse, c.softcap));
+                }
+
+            auto median = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end()); return v[v.size() / 2];
+            };
+            const double base = median(cfgs[0].t);
+            for (auto& c : cfgs) {
+                std::sort(c.t.begin(), c.t.end());
+                const double med = c.t[c.t.size() / 2];
+                std::cout << std::format("{:<32s} median {:.2f} tok/s  best {:.2f}  ({:+.1f}% vs baseline)\n",
+                                         c.name, med, c.t.back(), 100.0 * (med - base) / base);
+            }
             return 0;
         }
 

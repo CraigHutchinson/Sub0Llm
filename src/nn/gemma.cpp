@@ -349,7 +349,7 @@ GemmaKVCache GemmaModel::make_cache(int64_t max_pos) const {
 }
 
 std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
-                                           GemmaKVCache& kv) const {
+                                           GemmaKVCache& kv, bool apply_softcap) const {
     const int64_t D = D_;
     const int64_t nbD = D / QK;
 
@@ -471,7 +471,8 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
     rmsnorm(x.data(), output_norm_.data(), x.data(), D, eps_);
     std::vector<float> logits(static_cast<std::size_t>(V_));
     pmatvec(token_embd_, x.data(), logits.data(), V_, D);
-    if (final_softcap_ > 0.0f) {
+    // Soft-cap is monotonic → order-preserving; skip it when only the argmax matters.
+    if (apply_softcap && final_softcap_ > 0.0f) {
         const float cap = final_softcap_;
         for (auto& z : logits) z = cap * std::tanh(z / cap);
     }

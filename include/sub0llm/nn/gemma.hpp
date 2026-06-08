@@ -94,8 +94,12 @@ public:
     [[nodiscard]] GemmaKVCache make_cache(int64_t max_pos) const;
 
     // One decode step: append token at position `pos` to the cache, return logits (V).
+    // `apply_softcap` controls the final logit soft-cap (30·tanh(z/30)). It is
+    // order-preserving, so GREEDY decoding can pass false (identical argmax) and skip
+    // 262 K tanh/token; pass true when the magnitudes matter (sampling, logit/nll parity).
     [[nodiscard]] std::vector<float> forward_one(int32_t token, int64_t pos,
-                                                 GemmaKVCache& kv) const;
+                                                 GemmaKVCache& kv,
+                                                 bool apply_softcap = true) const;
 
     [[nodiscard]] int64_t vocab_size()  const noexcept { return V_; }
     [[nodiscard]] int64_t embed_dim()   const noexcept { return D_; }
