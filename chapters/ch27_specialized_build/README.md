@@ -352,6 +352,39 @@ session, `llama-bench tg32 -t 20` = **5.15 tok/s** vs our best **4.82** → **~9
 Closing the last ~6% is a memory-access-pattern problem (repack + deeper prefetch), the
 one lever the read probe shows still has headroom.
 
+#### The Q8 decode ladder — the gap is *orchestration*, not the kernel
+
+The read-vs-decode framing above leaves a question the STREAM kernels can't answer: is our
+*int8 GEMV kernel* itself leaving bandwidth on the table, or is it the *per-token plumbing
+around it*? `bench_membw` now walks a **ladder** from pure memory to the real kernel — pure
+f32 **read** → **q8_stream** (read the Q8 weight bytes, ~no math) → **q8_gemv** (the actual
+`dot_q8_0_q8_0` over a 512 MiB weight buffer, activation reused across rows = the decode hot
+path) — all thread-swept and core-pinned, best-of-2 per cell with cooldowns, and a
+thermal-drift recheck. Representative run (this machine, exercised GB/s):
+
+| threads | read | q8_stream | q8_gemv | gemv / read |
+|--------:|-----:|----------:|--------:|------------:|
+| 1  | 28.6 | 17.1 | 18.4 | 64% |
+| 4  | 59.6 | 43.7 | 47.4 | 80% |
+| 16 | 91.9 | 79.2 | 84.6 | 92% |
+| 24 | 108.5 | 84.1 | 94.2 | 87% |
+
+The diagnosis is decisive: **`q8_gemv` ≈ `q8_stream` ≈ `read`** at scale (94 vs 84 vs 108
+GB/s) — adding the int8 dot to a raw byte stream costs almost nothing, so the **kernel is
+memory-bound, not compute-bound**, and it reaches **~94 GB/s in isolation (87% of the pure-
+read ceiling)**. But real Gemma decode only sustains **~71 GB/s** (5.59 tok/s × 12.65 GB) =
+**75% of what the same kernel does over one big buffer.** So the missing ~25% is **not** in
+the kernel — it is the **per-token orchestration**: ~25–30% serial main-thread work (the
+RMSNorms, RoPE, QK-norm, attention softmax, GeGLU, residuals that don't parallelize), **340
+barriers/token**, and **small per-GEMV M** (real projections are M = 2048…262144, far below
+the ladder's single 131 586-row dispatch, so sync overhead and load-imbalance eat a larger
+slice). That refines the earlier "repack/prefetch" reading: vs *llama* the residual ~6% is
+indeed its VNNI-friendly repack, but vs the *silicon* our bigger recoverable win is the
+orchestration layer — **fuse/batch GEMVs to cut barrier count, and overlap the serial
+fraction** — which the ladder shows is worth ~20 GB/s, more than the kernel has left to give.
+(The recheck also makes the **thermal drift** concrete: −18% between a cool and a hot `read`,
+so every cross-engine number must be **interleaved A/B/A/B**, never two long back-to-back runs.)
+
 ## The stack
 
 ```
