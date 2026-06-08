@@ -82,7 +82,8 @@ function Get-OursGenText([int]$t, [int]$n) {
 function Get-LlamaGenText([int]$t, [int]$n) {
     try {
         # Capture stdout only (2>$null silences timing/log stderr)
-        $raw = (& $LlamaCompletion -m $Model --prompt $Prompt -n $n -t $t -no-cnv -s 42 2>$null)
+        # --temp 0 forces greedy argmax to match our engine's greedy mode
+        $raw = (& $LlamaCompletion -m $Model --prompt $Prompt -n $n -t $t -no-cnv -s 42 --temp 0 2>$null)
         $joined = ($raw -join ' ').Trim()
         # llama-completion echoes the prompt before the generated tokens — strip it
         if ($joined.StartsWith($Prompt)) { $joined = $joined.Substring($Prompt.Length).Trim() }
@@ -132,7 +133,7 @@ function Get-LlamaMetrics([int]$t) {
     $tg = $null; $pp = $null
     $t0 = Get-Date
     try {
-        $out = & $LlamaCompletion -m $Model --prompt $Prompt -n $N -t $t -no-cnv -s 42 2>&1
+        $out = & $LlamaCompletion -m $Model --prompt $Prompt -n $N -t $t -no-cnv -s 42 --temp 0 2>&1
         foreach ($line in $out) {
             if ($line -match 'prompt eval time' -and
                 $line -match '([0-9]+\.[0-9]+) tokens per second') { $pp = [double]$Matches[1] }
@@ -186,7 +187,7 @@ Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched
 Write-Host ""
 Write-Host "Commands (t = thread count for each round):"
 Write-Host "  ours : $OursBin --model $Model --mode greedy --text '<prompt>' -n $N -t <t>"
-Write-Host "  llama: $LlamaCompletion -m $Model --prompt '<prompt>' -n $N -t <t> -no-cnv -s 42"
+Write-Host "  llama: $LlamaCompletion -m $Model --prompt '<prompt>' -n $N -t <t> -no-cnv --temp 0 -s 42"
 Write-Host ""
 
 # ── smoke-check ───────────────────────────────────────────────────────────────
@@ -211,19 +212,16 @@ if (-not $DryRun) {
     }
 
     if ($ok) {
-        # Verify generated text is identical (greedy decode should agree token-for-token
-        # given the same model weights, tokeniser and seed).
-        # Mismatch is a WARNING not an abort — timing metrics are still valid, but the
-        # mismatch should be investigated (BOS handling, tokeniser version, etc.).
+        # Verify generated text is identical (greedy decode with --temp 0 must agree token-for-token).
         $oursText  = Get-OursGenText  $smokeT $smokeN
         $llamaText = Get-LlamaGenText $smokeT $smokeN
         if ($null -eq $oursText -or $null -eq $llamaText) {
             Write-Warning "SMOKE WARN: could not capture generated text for equality check"
         } elseif ($oursText -ne $llamaText) {
-            Write-Warning "SMOKE WARN: generated text differs — investigate tokeniser/BOS differences"
+            Write-Warning "SMOKE FAIL: generated text differs — engines are NOT producing identical greedy output"
             Write-Warning "  sub0llm : '$oursText'"
             Write-Warning "  llama   : '$llamaText'"
-            Write-Warning "  Continuing sweep — timing metrics are unaffected."
+            $ok = $false
         } else {
             Write-Host   "  Output match: '$oursText'"
         }
