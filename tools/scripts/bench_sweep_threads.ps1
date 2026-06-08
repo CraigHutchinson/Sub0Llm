@@ -184,26 +184,22 @@ for ($p = 0; $p -lt $Samples; $p++) {
 
 # ── summary table ─────────────────────────────────────────────────────────────
 
-$hdr = "{0,7}  {1,8} {2,8}  {3,8} {4,8}  {5,8} {6,8}  {7,8} {8,8}  {9,7}" -f `
-    "threads",
-    "o_tg_med", "o_tg_max",
-    "l_tg_med", "l_tg_max",
-    "o_pp_med", "o_pp_max",
-    "l_pp_med", "l_pp_max",
-    "tg_ratio"
-$sep = "-" * ($hdr.Length)
-
-Write-Host "=== Summary (TG = token generation, PP = prompt processing, tok/s) ==="
-Write-Host $hdr
-Write-Host $sep
-
 $csvLines = [System.Collections.Generic.List[string]]::new()
-$csvLines.Add("threads,ours_tg_med,ours_tg_max,llama_tg_med,llama_tg_max,ours_pp_med,ours_pp_max,llama_pp_med,llama_pp_max,tg_ratio_pct")
+$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,tg_ratio_pct")
 
 $bestOursTGt  = $null; $bestOursTGMed  = 0.0
 $bestLlamaTGt = $null; $bestLlamaTGMed = 0.0
 $bestOursPPt  = $null; $bestOursPPMed  = 0.0
 $bestLlamaPPt = $null; $bestLlamaPPMed = 0.0
+
+# ── summary: append to the same table ────────────────────────────────────────
+# Reuse the identical column layout; 'round' col = stat (med/max), 'pass' col = '-'
+
+Write-Host ""
+Write-Host "=== Summary — median and max across all $Samples samples per thread count ==="
+Write-Host $tblSep
+Write-Host "| stat  | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+Write-Host $tblSep
 
 foreach ($t in $Threads) {
     $otg = $oursTG[$t].ToArray();  $opp = $oursPP[$t].ToArray()
@@ -215,15 +211,18 @@ foreach ($t in $Threads) {
     $lppMed = Get-Median $lpp; $lppMax = if ($lpp.Count) { ($lpp | Measure-Object -Maximum).Maximum } else { $null }
     $tgRatio = if ($null -ne $otgMed -and $null -ne $ltgMed -and $ltgMed -gt 0) { 100.0 * $otgMed / $ltgMed } else { $null }
 
-    Write-Host ("{0,7}  {1,8} {2,8}  {3,8} {4,8}  {5,8} {6,8}  {7,8} {8,8}  {9,7}" -f `
-        $t,
-        (Fmt $otgMed), (Fmt $otgMax),
-        (Fmt $ltgMed), (Fmt $ltgMax),
-        (Fmt $oppMed), (Fmt $oppMax),
-        (Fmt $lppMed), (Fmt $lppMax),
-        (Fmt $tgRatio "F1"))
+    $pfx = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f 'med', '-', $t, '-'
+    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $oppMed), (Fmt $otgMed))
+    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lppMed), (Fmt $ltgMed))
 
-    $csvLines.Add("$t,$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $ltgMed),$(Fmt $ltgMax),$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $tgRatio 'F1')")
+    $pfx = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f 'max', '-', $t, '-'
+    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $oppMax), (Fmt $otgMax))
+    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lppMax), (Fmt $ltgMax))
+
+    Write-Host $tblSep
+
+    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $tgRatio 'F1')")
+    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-")
 
     if ($null -ne $otgMed -and $otgMed -gt $bestOursTGMed)  { $bestOursTGMed  = $otgMed; $bestOursTGt  = $t }
     if ($null -ne $ltgMed -and $ltgMed -gt $bestLlamaTGMed) { $bestLlamaTGMed = $ltgMed; $bestLlamaTGt = $t }
@@ -231,11 +230,13 @@ foreach ($t in $Threads) {
     if ($null -ne $lppMed -and $lppMed -gt $bestLlamaPPMed) { $bestLlamaPPMed = $lppMed; $bestLlamaPPt = $t }
 }
 
-Write-Host $sep
-Write-Host ("Best ours  TG: t={0,2}  {1} tok/s (median)" -f $bestOursTGt,  (Fmt $bestOursTGMed))
-Write-Host ("Best llama TG: t={0,2}  {1} tok/s (median)" -f $bestLlamaTGt, (Fmt $bestLlamaTGMed))
-Write-Host ("Best ours  PP: t={0,2}  {1} tok/s (median)" -f $bestOursPPt,  (Fmt $bestOursPPMed))
-Write-Host ("Best llama PP: t={0,2}  {1} tok/s (median)" -f $bestLlamaPPt, (Fmt $bestLlamaPPMed))
+# Best-thread highlight rows
+Write-Host "| stat  | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+Write-Host $tblSep
+$bpfx = "| {0,5} | {1,4} | {2,4} | {3,5} |"
+Write-Host (($bpfx -f 'BEST','-',$bestOursTGt,'-')  + (" {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $bestOursPPMed), (Fmt $bestOursTGMed)))
+Write-Host (($bpfx -f 'BEST','-',$bestLlamaTGt,'-') + (" {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $bestLlamaPPMed),(Fmt $bestLlamaTGMed)))
+Write-Host $tblSep
 Write-Host ""
 
 # ── save CSV ──────────────────────────────────────────────────────────────────
