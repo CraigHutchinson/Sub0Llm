@@ -11,11 +11,12 @@
 # Within each slot, ours/llama order alternates per pass to cancel within-slot bias.
 #
 # Apples-to-apples design:
-#   TG: both engines process the same prompt first (llama-bench -p $PromptLen),
-#       then time generation of $N tokens — identical KV-cache state at decode start.
-#   PP: both engines time sequential prompt processing of $N tokens.
-#       NOTE: our PP is token-by-token (forward_one loop, i.e. TTFT-representative);
-#             llama's PP is batched prefill — a valid architectural difference to observe.
+#   Both engines receive the identical prompt text via --text / --prompt.
+#   llama-cli is used (not llama-bench which feeds random synthetic tokens regardless
+#   of -p), so KV-cache content and decoding context are truly equivalent.
+#   TG: timed after full prompt prefill — identical starting state for both engines.
+#   PP: our PP is token-by-token forward_one (TTFT-representative); llama's is batched
+#       prefill — a valid architectural difference captured in the PP column.
 #
 # Usage:
 #   .\tools\scripts\bench_sweep_threads.ps1
@@ -38,7 +39,7 @@ $ErrorActionPreference = "Stop"
 if ($TMax -le 0) { $TMax = [Environment]::ProcessorCount }
 
 $LlamaDir     = "D:/tools/llamacpp/vendor/llama.cpp-prebuilt/b9334/cpu"
-$LlamaBench   = Join-Path $LlamaDir "llama-bench.exe"
+$LlamaCli     = Join-Path $LlamaDir "llama-cli.exe"
 $LlamaVersion = Split-Path (Split-Path $LlamaDir -Parent) -Leaf
 $OursBin      = "./build-native/bin/sub0llm-gemma.exe"
 $Threads      = [int[]]($TMin..$TMax)
@@ -52,20 +53,11 @@ $PromptLen = try {
     @($toks -split '\s+' | Where-Object { $_ -match '^\d+$' }).Count
 } catch { 0 }
 if ($PromptLen -lt 1) {
-    Write-Warning "Could not tokenize prompt; defaulting prompt length to 5 for llama-bench -p"
-    $PromptLen = 5
+    Write-Warning "Could not tokenize prompt; prompt length will show as 0 in header"
+    $PromptLen = 0
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-# Extract the last float before ± (or its UTF-8-misread form ┬▒) on a llama-bench row,
-# falling back to the last float in the t/s column (always rightmost numeric field).
-function Parse-LlamaTps([string]$line) {
-    if (-not $line) { return $null }
-    if ($line -match '([0-9]+\.[0-9]+)\s*(?:[┬]?[▒±])') { return [double]$Matches[1] }
-    if ($line -match '.*\|\s*([0-9]+\.[0-9]+)') { return [double]$Matches[1] }
-    return $null
-}
 
 # Returns {tg, pp} from a single run of our binary (both from one model load).
 # main.cpp greedy mode emits on stderr:
@@ -83,15 +75,20 @@ function Get-OursMetrics([int]$t) {
     return @{ tg = $tg; pp = $pp }
 }
 
-# Returns {tg, pp} from a single llama-bench run (-p $PromptLen -n $N).
-# llama-bench emits one pp<N> row and one tg<N> row per run.
+# Returns {tg, pp} from a single llama-cli run with the real prompt text.
+# llama-cli prints llama_print_timings to stderr, e.g.:
+#   llama_print_timings: prompt eval time = ... (X.XX tokens per second)
+#   llama_print_timings:        eval time = ... (X.XX tokens per second)
 function Get-LlamaMetrics([int]$t) {
     $tg = $null; $pp = $null
     try {
-        $out = & $LlamaBench -m $Model -p $PromptLen -n $N -t $t -r 1 2>&1
+        $out = & $LlamaCli -m $Model --prompt $Prompt -n $N -t $t `
+                           --no-display-prompt -s 42 --log-disable 2>&1
         foreach ($line in $out) {
-            if ($line -match 'tg[0-9]') { $tg = Parse-LlamaTps $line }
-            if ($line -match 'pp[0-9]') { $pp = Parse-LlamaTps $line }
+            if ($line -match 'prompt eval time' -and
+                $line -match '([0-9]+\.[0-9]+) tokens per second') { $pp = [double]$Matches[1] }
+            if ($line -match 'llama_print_timings:\s+eval time' -and
+                $line -match '([0-9]+\.[0-9]+) tokens per second') { $tg = [double]$Matches[1] }
         }
     } catch { }
     return @{ tg = $tg; pp = $pp }
@@ -131,11 +128,12 @@ Write-Host "Thread sweep  model=$modelName  n=$N  t=${TMin}..${TMax}  samples=$S
 Write-Host "Schedule: cyclic-rotation Latin square (K=$K threads x $Samples passes = $TotalRounds rounds)"
 Write-Host "Engines: sub0llm @ $gitHash  vs  llama.cpp @ $LlamaVersion"
 Write-Host "Prompt ($PromptLen tokens): '$Prompt'"
+Write-Host "NOTE: llama-cli used (not llama-bench) so both engines receive identical prompt text"
 Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched prefill"
 Write-Host ""
 Write-Host "Commands (t = thread count for each round):"
 Write-Host "  ours : $OursBin --model $Model --mode greedy --text '<prompt>' -n $N -t <t>"
-Write-Host "  llama: $LlamaBench -m $Model -p $PromptLen -n $N -t <t> -r 1"
+Write-Host "  llama: $LlamaCli -m $Model --prompt '<prompt>' -n $N -t <t> --no-display-prompt -s 42 --log-disable"
 Write-Host ""
 
 $startTime = Get-Date
@@ -167,8 +165,13 @@ for ($p = 0; $p -lt $Samples; $p++) {
         if ($null -ne $lm.tg) { $llamaTG[$t].Add($lm.tg) }
         if ($null -ne $lm.pp) { $llamaPP[$t].Add($lm.pp) }
 
-        Write-Host ("ours tg={0,6} pp={1,7}  llama tg={2,6} pp={3,7} tok/s" -f `
-            (Fmt $om.tg), (Fmt $om.pp), (Fmt $lm.tg), (Fmt $lm.pp))
+        # Per-round result table
+        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
+        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' engine', 'PP tok/s', 'TG tok/s')
+        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
+        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' sub0llm', (Fmt $om.pp), (Fmt $om.tg))
+        Write-Host ("|{0,-10}| {1,8} | {2,8} |" -f ' llama', (Fmt $lm.pp), (Fmt $lm.tg))
+        Write-Host ("+{0}+{1}+{2}+" -f ('-'*10), ('-'*10), ('-'*10))
     }
 
     Write-Host ""
