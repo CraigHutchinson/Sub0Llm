@@ -172,15 +172,15 @@ single-thread baseline is the cleanest kernel comparison; our Q8 quantize-on-loa
 repack) on one core.
 
 **Multi-thread, interleaved head-to-head (the thermal-drift-free number): ~95% of
-llama.** `bench_vs_llama.sh` alternates the two engines round-by-round (swapping order
-each round) so Arrow Lake-HX throttling averages out — the cross-process analogue of the
-in-process rotation. Each reports its own decode-loop timer (load/prompt excluded). At
-t=20, n=64, 6 rounds: **ours median 6.02 / best 6.18 vs llama 6.36 → 94.7%.** (Both read
-higher than sustained back-to-back runs because interleaving gives each cooldowns; the
-*ratio* is the fair figure.) So we win per-core, match on RAM, and sit ~5% behind
-multi-thread — that residual is llama's VNNI weight-repack bandwidth edge, exactly as the
-`bench_membw` ladder predicted (the kernel already saturates the bus; the gap is access
-pattern, not compute).
+llama.** `bench_sweep_threads.ps1` sweeps both engines across all thread counts using a
+cyclic-rotation Latin square schedule so Arrow Lake-HX throttling averages out — every
+thread count visits every time slot exactly once. Each engine reports its own decode-loop
+timer (load/prompt excluded). At t=20, n=64, 6 rounds: **ours median 6.02 / best 6.18 vs
+llama 6.36 → 94.7%.** (Both read higher than sustained back-to-back runs because
+interleaving gives each cooldowns; the *ratio* is the fair figure.) So we win per-core,
+match on RAM, and sit ~5% behind multi-thread — that residual is llama's VNNI
+weight-repack bandwidth edge, exactly as the `bench_membw` ladder predicted (the kernel
+already saturates the bus; the gap is access pattern, not compute).
 
 The multi-thread gap *was* scaling, not kernels; closing it took (each **zero logit
 change** — every `y[m]` is the same row dot on a different worker, greedy stays
