@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cmath>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -93,6 +94,7 @@ public:
              const cpu::BlockQ8_0* xq, int64_t kblk) {
         jobs_ = jobs; njobs_ = njobs; offsets_ = offsets;
         xq_ = xq; kblk_ = kblk; total_ = offsets[njobs];
+        gtask_ = nullptr;                               // GEMV mode
         next_.store(0, std::memory_order_relaxed);
         remaining_.store(nworkers_, std::memory_order_relaxed);
         gen_.fetch_add(1, std::memory_order_release);   // publishes the job state
@@ -100,10 +102,22 @@ public:
         while (remaining_.load(std::memory_order_acquire) != 0) GEMMA_CPU_RELAX();
     }
 
+    // Generic parallel-for: call (*task)(lo, hi) over tiles covering [0, n). Used to move
+    // the per-head attention work (independent across heads) off the single caller thread.
+    void run_generic(int64_t n, const std::function<void(int64_t, int64_t)>* task) {
+        gtask_ = task; total_ = n;
+        next_.store(0, std::memory_order_relaxed);
+        remaining_.store(nworkers_, std::memory_order_relaxed);
+        gen_.fetch_add(1, std::memory_order_release);
+        work();
+        while (remaining_.load(std::memory_order_acquire) != 0) GEMMA_CPU_RELAX();
+    }
+
 private:
     static constexpr int64_t CHUNK = 32;
 
     void work() {
+        if (gtask_) { work_generic(); return; }
         const GemvJob* jobs = jobs_; const int64_t* off = offsets_;
         const cpu::BlockQ8_0* xq = xq_; const int64_t kblk = kblk_, total = total_;
         const int nj = njobs_;
@@ -117,6 +131,15 @@ private:
                 const int64_t lr = g - off[j];
                 jobs[j].y[lr] = cpu::dot_q8_0_q8_0(jobs[j].W + lr * kblk, xq, kblk);
             }
+        }
+    }
+    // Small index spaces (head counts) — grab one index at a time for even distribution.
+    void work_generic() {
+        const auto& task = *gtask_; const int64_t total = total_;
+        for (;;) {
+            const int64_t i = next_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) break;
+            task(i, i + 1);
         }
     }
     void worker(int cpu) {
@@ -140,6 +163,7 @@ private:
     const GemvJob*               jobs_    = nullptr;
     const int64_t*               offsets_ = nullptr;
     const cpu::BlockQ8_0*        xq_      = nullptr;
+    const std::function<void(int64_t, int64_t)>* gtask_ = nullptr;  // non-null = generic
     int                          njobs_   = 0;
     int64_t                      total_   = 0, kblk_ = 0;
 };
@@ -201,6 +225,22 @@ void pmatvec(const std::vector<cpu::BlockQ8_0>& W, const float* x, float* y,
              int64_t M, int64_t K) {
     const GemvJob job{W.data(), y, M};
     pmatvec_multi(&job, 1, x, K);
+}
+
+// Parallelize an independent per-index loop (e.g. attention heads) across the pool —
+// moves serial main-thread work onto the idle cores. `body(i)` for i in [0, n).
+// `g_gemma_fuse` also gates this (the attention parallelization is part of the same
+// orchestration optimization), so --no-fuse measures the fully-serial baseline.
+template <typename F>
+void parallel_for(int64_t n, F body) {
+    GemmaPool* pool = get_pool();
+    if (!pool || !g_gemma_fuse || n <= 1) {
+        for (int64_t i = 0; i < n; ++i) body(i);
+        return;
+    }
+    const std::function<void(int64_t, int64_t)> task =
+        [&](int64_t lo, int64_t hi) { for (int64_t i = lo; i < hi; ++i) body(i); };
+    pool->run_generic(n, &task);
 }
 
 // Plain RMSNorm matching ggml: y = x/sqrt(mean(x^2)+eps) * w. The Gemma (1+weight)
@@ -387,57 +427,62 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
         pmatvec_multi(qkv, njobs, h.data(), D);
         if (!L.has_wv) vcur = kcur;
 
-        // Q: per-head rmsnorm(q_norm) + RoPE.
-        for (int64_t hd = 0; hd < nH; ++hd) {
-            float* qh = q.data() + hd * dh;
-            rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
-            rope_neox(qh, dh, pos, L.rope_base, ff);
-        }
-        // K: per-head rmsnorm(k_norm) + RoPE; V: per-head plain rmsnorm (no weight).
-        // Store K/V for this position into the cache.
-        for (int64_t g = 0; g < nKV; ++g) {
-            float* kh = kcur.data() + g * dh;
-            float* vh = vcur.data() + g * dh;
-            rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
-            rope_neox(kh, dh, pos, L.rope_base, ff);
-            rmsnorm_noweight(vh, vh, dh, eps_);
-            const std::size_t base = static_cast<std::size_t>(g * kv.max_pos * dh + pos * dh);
-            std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(base));
-            std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(base));
-        }
+        // Q-norm+RoPE (per q-head) and K-norm+RoPE / V-norm + cache-store (per kv-head)
+        // are all independent — dispatch them together across the pool. Indices [0,nH)
+        // are q-heads; [nH, nH+nKV) are kv-heads. (For !has_wv, vcur is the raw-K copy.)
+        parallel_for(nH + nKV, [&](int64_t idx) {
+            if (idx < nH) {
+                float* qh = q.data() + idx * dh;
+                rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
+                rope_neox(qh, dh, pos, L.rope_base, ff);
+            } else {
+                const int64_t g = idx - nH;
+                float* kh = kcur.data() + g * dh;
+                float* vh = vcur.data() + g * dh;
+                rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
+                rope_neox(kh, dh, pos, L.rope_base, ff);
+                rmsnorm_noweight(vh, vh, dh, eps_);
+                const std::size_t base = static_cast<std::size_t>(g * kv.max_pos * dh + pos * dh);
+                std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(base));
+                std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(base));
+            }
+        });
 
         // Per query head, attend over the cache (scale = 1.0; sliding window for local).
+        // Independent across heads → parallelize; each head uses its own scores slice.
         const int64_t kv_lo = L.window > 0 ? std::max<int64_t>(0, pos - L.window + 1) : 0;
         const int64_t kv_hi = pos;                    // inclusive
+        const int64_t kvlen = kv_hi - kv_lo + 1;
         const int64_t group = nH / nKV;               // q heads per kv head
         std::vector<float> attn_concat(static_cast<std::size_t>(nH * dh));
-        std::vector<float> scores(static_cast<std::size_t>(kv_hi - kv_lo + 1));
-        for (int64_t hd = 0; hd < nH; ++hd) {
+        std::vector<float> scores_all(static_cast<std::size_t>(nH * kvlen));
+        parallel_for(nH, [&](int64_t hd) {
             const float* qh = q.data() + hd * dh;
             const int64_t g = hd / group;
             const float* Kbase = C.k.data() + static_cast<std::size_t>(g * kv.max_pos * dh);
             const float* Vbase = C.v.data() + static_cast<std::size_t>(g * kv.max_pos * dh);
+            float* scores = scores_all.data() + hd * kvlen;
 
             float mx = -std::numeric_limits<float>::infinity();
             for (int64_t t = kv_lo; t <= kv_hi; ++t) {
                 const float* kt = Kbase + static_cast<std::size_t>(t * dh);
                 float dot = 0.0f;
                 for (int64_t d = 0; d < dh; ++d) dot += qh[d] * kt[d];
-                scores[static_cast<std::size_t>(t - kv_lo)] = dot;   // scale = 1.0
+                scores[t - kv_lo] = dot;   // scale = 1.0
                 mx = std::max(mx, dot);
             }
             float sum = 0.0f;
-            for (auto& s : scores) { s = std::exp(s - mx); sum += s; }
+            for (int64_t t = 0; t < kvlen; ++t) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
             const float invsum = 1.0f / sum;
 
             float* oh = attn_concat.data() + hd * dh;
             for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
             for (int64_t t = kv_lo; t <= kv_hi; ++t) {
-                const float w  = scores[static_cast<std::size_t>(t - kv_lo)] * invsum;
+                const float w  = scores[t - kv_lo] * invsum;
                 const float* vt = Vbase + static_cast<std::size_t>(t * dh);
                 for (int64_t d = 0; d < dh; ++d) oh[d] += w * vt[d];
             }
-        }
+        });
 
         // Output projection (D, nH*dh) → D, post-attn norm, residual.
         std::vector<float> ao(static_cast<std::size_t>(D));
