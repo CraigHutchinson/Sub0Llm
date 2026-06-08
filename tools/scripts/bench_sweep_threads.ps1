@@ -203,7 +203,7 @@ for ($p = 0; $p -lt $Samples; $p++) {
 # ── summary table ─────────────────────────────────────────────────────────────
 
 $csvLines = [System.Collections.Generic.List[string]]::new()
-$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,tg_ratio_pct,pp_samples,tg_samples")
+$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,pp_ratio_pct,tg_ratio_pct,pp_samples,tg_samples")
 
 $bestOursTGt  = $null; $bestOursTGMed  = 0.0
 $bestLlamaTGt = $null; $bestLlamaTGMed = 0.0
@@ -228,6 +228,7 @@ foreach ($t in $Threads) {
     $oppMed = Get-Median $opp; $oppMax = if ($opp.Count) { ($opp | Measure-Object -Maximum).Maximum } else { $null }
     $lppMed = Get-Median $lpp; $lppMax = if ($lpp.Count) { ($lpp | Measure-Object -Maximum).Maximum } else { $null }
     $tgRatio = if ($null -ne $otgMed -and $null -ne $ltgMed -and $ltgMed -gt 0) { 100.0 * $otgMed / $ltgMed } else { $null }
+    $ppRatio = if ($null -ne $oppMed -and $null -ne $lppMed -and $lppMed -gt 0) { 100.0 * $oppMed / $lppMed } else { $null }
 
     $pfx = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f 'med', '-', $t, '-'
     Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $oppMed), (Fmt $otgMed))
@@ -243,8 +244,8 @@ foreach ($t in $Threads) {
     $otgRaw = ($otg | ForEach-Object { $_.ToString('F2') }) -join ';'
     $lppRaw = ($lpp | ForEach-Object { $_.ToString('F2') }) -join ';'
     $ltgRaw = ($ltg | ForEach-Object { $_.ToString('F2') }) -join ';'
-    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $tgRatio 'F1'),$oppRaw,$otgRaw")
-    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-,$lppRaw,$ltgRaw")
+    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $ppRatio 'F1'),$(Fmt $tgRatio 'F1'),$oppRaw,$otgRaw")
+    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-,-,$lppRaw,$ltgRaw")
 
     if ($null -ne $otgMed -and $otgMed -gt $bestOursTGMed)  { $bestOursTGMed  = $otgMed; $bestOursTGt  = $t }
     if ($null -ne $ltgMed -and $ltgMed -gt $bestLlamaTGMed) { $bestLlamaTGMed = $ltgMed; $bestLlamaTGt = $t }
