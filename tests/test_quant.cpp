@@ -150,3 +150,52 @@ TEST_CASE("Q8 GEMV strategies agree with f32 matmul", "[quant]") {
         REQUIRE_THAT(y_qq[static_cast<std::size_t>(m)], Catch::Matchers::WithinAbs(ref, 0.08f * std::fabs(ref) + 0.5f));
     }
 }
+
+// ── f32 SIMD reduction primitives (Ch27) ───────────────────────────────────────
+// The SIMD bulk + scalar-remainder helpers must match a scalar reference across sizes
+// that exercise the remainder tail (not just multiples of 8).
+
+TEST_CASE("sum_squares_f32 matches scalar reference", "[quant][simd]") {
+    for (int64_t n : {1, 7, 8, 9, 31, 256, 257, 3840}) {
+        const auto x = make_vec(n, 11);
+        float ref = 0.0f;
+        for (int64_t i = 0; i < n; ++i) ref += x[static_cast<std::size_t>(i)] * x[static_cast<std::size_t>(i)];
+        REQUIRE_THAT(sum_squares_f32(x.data(), n),
+                     Catch::Matchers::WithinRel(ref, 1e-4f));
+    }
+}
+
+TEST_CASE("dot_f32 matches scalar reference", "[quant][simd]") {
+    for (int64_t n : {1, 7, 8, 9, 31, 256, 257, 3840}) {
+        const auto a = make_vec(n, 3), b = make_vec(n, 7);
+        REQUIRE_THAT(dot_f32(a.data(), b.data(), n),
+                     Catch::Matchers::WithinRel(ref_dot(a.data(), b.data(), n), 1e-4f));
+    }
+}
+
+TEST_CASE("axpy_f32 matches scalar reference", "[quant][simd]") {
+    for (int64_t n : {1, 7, 8, 31, 256, 257}) {
+        const auto x = make_vec(n, 5);
+        auto y0 = make_vec(n, 9);
+        auto y1 = y0;
+        const float a = 1.75f;
+        axpy_f32(a, x.data(), y1.data(), n);
+        for (int64_t i = 0; i < n; ++i) {
+            const float ref = y0[static_cast<std::size_t>(i)] + a * x[static_cast<std::size_t>(i)];
+            REQUIRE_THAT(y1[static_cast<std::size_t>(i)], Catch::Matchers::WithinAbs(ref, 1e-5f));
+        }
+    }
+}
+
+TEST_CASE("argmax_f32 matches std max element first-occurrence", "[quant][simd]") {
+    for (int64_t n : {1, 5, 8, 9, 33, 1000}) {
+        auto x = make_vec(n, 17);
+        int64_t ref = 0;
+        for (int64_t i = 1; i < n; ++i)
+            if (x[static_cast<std::size_t>(i)] > x[static_cast<std::size_t>(ref)]) ref = i;
+        REQUIRE(argmax_f32(x.data(), n) == ref);
+    }
+    // ties resolve to the first index
+    std::vector<float> t{1.0f, 3.0f, 3.0f, 2.0f, 3.0f};
+    REQUIRE(argmax_f32(t.data(), 5) == 1);
+}
