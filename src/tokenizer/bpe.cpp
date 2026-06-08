@@ -24,7 +24,8 @@ std::vector<std::string> pre_tokenize(std::string_view text) {
     bool at_start = true;
     std::string cur;
 
-    for (unsigned char c : text) {
+    for (auto raw_c : text) {
+        const auto c = static_cast<unsigned char>(raw_c);
         const bool is_ws = (c == ' ' || c == '\n' || c == '\t' || c == '\r');
         if (is_ws) {
             if (!cur.empty()) { words.push_back(std::move(cur)); cur.clear(); }
@@ -239,7 +240,7 @@ BPETokenizer BPETokenizer::load(
             entries.emplace_back(v.get<TokenId>(), k);
         std::sort(entries.begin(), entries.end());
 
-        tok.id_to_token_.resize(entries.back().first + 1);
+        tok.id_to_token_.resize(static_cast<std::size_t>(entries.back().first) + 1);
         for (auto& [id, str] : entries) {
             tok.vocab_[str]                              = id;
             tok.id_to_token_[static_cast<std::size_t>(id)] = str;
@@ -281,17 +282,19 @@ BPETokenizer BPETokenizer::from_vocab(
     BPETokenizer tok;
     tok.byte_level_  = true;   // GGUF vocabs use GPT-2 byte-level encoding
     tok.id_to_token_ = id_to_token;
+    tok.vocab_.reserve(id_to_token.size());
     for (TokenId i = 0; i < static_cast<TokenId>(id_to_token.size()); ++i)
         tok.vocab_[id_to_token[static_cast<std::size_t>(i)]] = i;
 
+    tok.merges_.reserve(merges_list.size());
     for (const auto& entry : merges_list) {
         const auto sp = entry.find(' ');
         if (sp == std::string::npos) continue;
         tok.merges_.emplace_back(entry.substr(0, sp), entry.substr(sp + 1));
     }
 
-    // Detect common special tokens.
-    for (const std::string& eos_str : {"<|endoftext|>", "<eos>", "</s>", "<|im_end|>"}) {
+    // Detect common special tokens (names vary by model family).
+    for (const std::string& eos_str : {"<|endoftext|>", "<eos>", "</s>", "<|im_end|>", "<EOS>"}) {
         if (auto it = tok.vocab_.find(eos_str); it != tok.vocab_.end()) {
             tok.eos_id_ = it->second;
             if (tok.bos_id_ < 0) tok.bos_id_ = it->second;
@@ -304,9 +307,15 @@ BPETokenizer BPETokenizer::from_vocab(
             break;
         }
     }
-    for (const std::string& unk_str : {"<unk>", "<|unk|>", "[UNK]"}) {
+    for (const std::string& unk_str : {"<unk>", "<|unk|>", "[UNK]", "<UNK>"}) {
         if (auto it = tok.vocab_.find(unk_str); it != tok.vocab_.end()) {
             tok.unk_id_ = it->second;
+            break;
+        }
+    }
+    for (const char* name : {"<pad>", "<PAD>"}) {
+        if (auto it = tok.vocab_.find(name); it != tok.vocab_.end()) {
+            tok.pad_id_ = it->second;
             break;
         }
     }

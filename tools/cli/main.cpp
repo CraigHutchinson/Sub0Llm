@@ -1,19 +1,23 @@
 // sub0llm-cli — interactive inference using a trained ModernGPT checkpoint or GGUF model.
 //
 // Two model sources are supported:
-//   --model-dir DIR     directory written by ch24_real_training:
-//                         config.json, tokenizer/, step_XXXXXXXXX.ckpt
-//   --model FILE.gguf   GGUF file (tokenizer embedded, weights dequantised on load)
+//   --model-dir DIR     checkpoint directory written by ch24_real_training
+//                         (config.json, tokenizer/, step_XXXXXXXXX.ckpt), OR a .gguf
+//                         file (detected by extension)
+//   --model FILE.gguf   GGUF file (tokenizer embedded; Q8 quantize-on-load by default)
+//
+// GGUF: pass the .gguf file path directly as --model-dir (detected by extension).
 //
 // Usage:
-//   sub0llm-cli --model-dir DIR [options]
-//   sub0llm-cli --model FILE.gguf [options]
+//   sub0llm-cli --model-dir DIR     [options]   (checkpoint dir or .gguf file)
+//   sub0llm-cli --model FILE.gguf   [options]   (GGUF file)
 //   sub0llm-cli --model FILE.gguf --prompt "Once upon" --max-tokens 200
 //   sub0llm-cli --model FILE.gguf --interactive
 //
 // Options:
-//   --model-dir DIR     path to model directory (mutually exclusive with --model)
-//   --model FILE.gguf   path to GGUF file        (mutually exclusive with --model-dir)
+//   --model-dir PATH    model directory, or a .gguf file (detected by extension)
+//   --model FILE.gguf   GGUF file (alias; mutually exclusive with --model-dir)
+//   --f32               load full f32 weights (default: Q8 quantize-on-load)
 //   --prompt TEXT       initial prompt (default: empty → unconditional)
 //   --max-tokens N      max new tokens to generate (default: 200)
 //   --temperature F     sampling temperature >0 (default: 1.0)
@@ -72,12 +76,14 @@ void print_usage() {
     std::cerr << R"(sub0llm-cli — inference CLI for a trained ModernGPT model
 
 Usage:
-  sub0llm-cli --model-dir DIR   [options]   (checkpoint directory)
-  sub0llm-cli --model FILE.gguf [options]   (GGUF file)
+  sub0llm-cli --model-dir DIR     [options]   (checkpoint dir or .gguf file)
+  sub0llm-cli --model FILE.gguf   [options]   (GGUF file)
 
 Model source (provide exactly one):
-  --model-dir DIR     directory containing config.json, tokenizer/, step_*.ckpt
+  --model-dir PATH    directory with config.json/tokenizer/step_*.ckpt,
+                      or a .gguf file (detected by .gguf extension)
   --model FILE.gguf   GGUF model file (tokenizer embedded)
+  --f32               load full f32 weights (default: Q8 quantize-on-load)
 
 Sampling:
   --prompt TEXT       initial prompt (default: empty)
@@ -190,6 +196,11 @@ std::string run_generation(sub0llm::nn::ModernGPT&  model,
     return tok.decode(generated);
 }
 
+// Returns true when path points to a GGUF file (detected by .gguf extension).
+static bool is_gguf_path(const std::filesystem::path& p) {
+    return p.extension() == ".gguf";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -198,12 +209,18 @@ int main(int argc, char** argv) {
     std::optional<sub0llm::nn::ModernGPT> model_opt;
     std::optional<sub0llm::BPETokenizer>  tok_opt;
 
+    // Resolve the model source: an explicit --model GGUF, or a --model-dir that is
+    // either a .gguf file (detected by extension) or a checkpoint directory.
+    const std::filesystem::path dir = cfg.model_dir;
+    const bool        is_gguf   = !cfg.model_file.empty() || is_gguf_path(dir);
+    const std::string gguf_path = !cfg.model_file.empty() ? cfg.model_file : cfg.model_dir;
+
     try {
-        if (!cfg.model_file.empty()) {
+        if (is_gguf) {
             // ── GGUF path ──────────────────────────────────────────────────────
-            std::cerr << std::format("[info] loading GGUF: {}  ({})\n", cfg.model_file,
+            std::cerr << std::format("[info] loading GGUF: {}  ({})\n", gguf_path,
                                      cfg.f32 ? "f32 weights" : "Q8 quantize-on-load");
-            sub0llm::nn::GGUFReader reader(cfg.model_file);
+            sub0llm::nn::GGUFReader reader(gguf_path);
             tok_opt   = sub0llm::BPETokenizer::from_vocab(reader.vocab().tokens,
                                                            reader.vocab().merges);
             // Default to Q8 quantize-on-load: faster generation and ~3.6× less RAM,
@@ -224,7 +241,6 @@ int main(int argc, char** argv) {
                 c.n_layers, static_cast<double>(n_params) / 1e6);
         } else {
             // ── Checkpoint directory path ──────────────────────────────────────
-            const std::filesystem::path dir = cfg.model_dir;
             const auto arch = load_arch(dir);
 
             const auto tok_dir = dir / "tokenizer";
@@ -268,6 +284,7 @@ int main(int argc, char** argv) {
 
     auto& model = *model_opt;
     auto& tok   = *tok_opt;
+
     std::mt19937 rng(cfg.seed);
 
     if (cfg.interactive) {

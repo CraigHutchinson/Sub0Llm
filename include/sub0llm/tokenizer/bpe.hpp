@@ -44,7 +44,8 @@ public:
         const std::filesystem::path& vocab_json,
         const std::filesystem::path& merges_txt);
 
-    // Build from in-memory data (e.g. extracted from a GGUF file).
+    // Build from in-memory data (e.g. extracted from a GGUF file whose vocab is
+    // embedded in the file header).
     //   id_to_token: index is token id, value is token string
     //   merges:      each entry is "A B" (space-separated pair), in priority order
     [[nodiscard]] static BPETokenizer from_vocab(

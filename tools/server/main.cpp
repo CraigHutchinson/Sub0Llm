@@ -1,8 +1,10 @@
 // sub0llm-server — OpenAI-compatible HTTP inference server.
 //
-// Two model sources are supported:
-//   --model-dir DIR     checkpoint directory (config.json, tokenizer/, step_*.ckpt)
-//   --model FILE.gguf   GGUF file (tokenizer embedded, weights dequantised on load)
+// Loads a trained ModernGPT checkpoint or a GGUF model file at startup and serves
+// inference over HTTP using the same JSON schema as the OpenAI API. Two model sources:
+//   --model-dir DIR     checkpoint directory (config.json, tokenizer/, step_*.ckpt),
+//                         OR a .gguf file (detected by extension)
+//   --model FILE.gguf   GGUF file (tokenizer embedded; Q8 quantize-on-load)
 //
 // Endpoints:
 //   GET  /health                  → {"status":"ok","model":"sub0llm"}
@@ -11,12 +13,13 @@
 //   POST /v1/chat/completions     → chat completion (messages → concatenated prompt)
 //
 // Usage:
-//   sub0llm-server --model-dir DIR   [--host HOST] [--port PORT]
-//   sub0llm-server --model FILE.gguf [--host HOST] [--port PORT]
+//   sub0llm-server --model-dir DIR    [--host HOST] [--port PORT]   (checkpoint or .gguf)
+//   sub0llm-server --model FILE.gguf  [--host HOST] [--port PORT]
 //
 // Options:
-//   --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt
-//   --model FILE.gguf GGUF file (mutually exclusive with --model-dir)
+//   --model-dir PATH  directory with config.json/tokenizer/step_*.ckpt,
+//                     or a .gguf file (detected by extension)
+//   --model FILE.gguf GGUF file (alias; mutually exclusive with --model-dir)
 //   --host HOST       bind address (default: 0.0.0.0)
 //   --port PORT       listen port  (default: 8080)
 //   --threads N       worker threads for concurrent requests (default: 4)
@@ -69,11 +72,12 @@ void print_usage() {
     std::cerr << R"(sub0llm-server — OpenAI-compatible inference server
 
 Usage:
-  sub0llm-server --model-dir DIR   [options]   (checkpoint directory)
-  sub0llm-server --model FILE.gguf [options]   (GGUF file)
+  sub0llm-server --model-dir DIR     [options]   (checkpoint dir or .gguf file)
+  sub0llm-server --model FILE.gguf   [options]   (GGUF file)
 
 Model source (provide exactly one):
-  --model-dir DIR   directory with config.json, tokenizer/, step_*.ckpt
+  --model-dir PATH  directory with config.json/tokenizer/step_*.ckpt,
+                    or a .gguf file (detected by .gguf extension)
   --model FILE.gguf GGUF model file (tokenizer embedded)
 
 Options:
@@ -142,6 +146,11 @@ ModelArch load_arch(const std::filesystem::path& dir) {
     return a;
 }
 
+// Returns true when path points to a GGUF file (detected by .gguf extension).
+static bool is_gguf_path(const std::filesystem::path& p) {
+    return p.extension() == ".gguf";
+}
+
 // ── InferenceEngine ───────────────────────────────────────────────────────────
 // Thread-safe wrapper: ModernGPT::forward() uses mutable caches (RoPE, mask)
 // so all inference must be serialised through the mutex.
@@ -154,10 +163,16 @@ public:
                     const std::string& gguf_file,
                     uint64_t seed)
         : seed_(seed) {
-        if (!gguf_file.empty()) {
+        // Resolve the model source: an explicit --model GGUF, or a --model-dir that is
+        // either a .gguf file (detected by extension) or a checkpoint directory.
+        const bool                  is_gguf   = !gguf_file.empty() || is_gguf_path(model_dir);
+        const std::string           gguf_path = !gguf_file.empty() ? gguf_file : model_dir;
+        const std::filesystem::path dir       = model_dir;
+
+        if (is_gguf) {
             // ── GGUF path ──────────────────────────────────────────────────
-            std::cerr << "[info] loading GGUF: " << gguf_file << "  (Q8 quantize-on-load)\n";
-            sub0llm::nn::GGUFReader reader(gguf_file);
+            std::cerr << "[info] loading GGUF: " << gguf_path << "  (Q8 quantize-on-load)\n";
+            sub0llm::nn::GGUFReader reader(gguf_path);
             tok_   = std::make_unique<sub0llm::BPETokenizer>(
                 sub0llm::BPETokenizer::from_vocab(reader.vocab().tokens,
                                                    reader.vocab().merges));
@@ -169,11 +184,11 @@ public:
             vocab_size_ = c.vocab_size;
             embed_dim_  = c.embed_dim;
             n_layers_   = c.n_layers;
+            step_       = 0;
             // From the GGUF tensor table — parameters() is elided under Q8 load.
             for (const auto& [nm, ti] : reader.tensors()) n_params_ += ti.numel;
         } else {
             // ── Checkpoint directory path ──────────────────────────────────
-            const std::filesystem::path dir = model_dir;
             const auto arch = load_arch(dir);
 
             model_ = std::make_unique<sub0llm::nn::ModernGPT>(
@@ -205,14 +220,13 @@ public:
             vocab_size_ = arch.vocab_size;
             embed_dim_  = arch.embed_dim;
             n_layers_   = arch.n_layers;
+            for (const auto* p : model_->parameters()) n_params_ += p->data().numel();
 
             std::cerr << std::format(
                 "Loaded step {} | V={} D={} layers={} | ckpt: {}\n",
                 step_, vocab_size_, embed_dim_, n_layers_, ckpt);
         }
 
-        if (n_params_ == 0)   // checkpoint path: count live parameters
-            for (const auto* p : model_->parameters()) n_params_ += p->data().numel();
         std::cerr << std::format(
             "V={} D={} layers={} | {:.2f}M params\n",
             vocab_size_, embed_dim_, n_layers_,
