@@ -154,6 +154,33 @@ Write-Host "  ours : $OursBin --model $Model --mode greedy --text '<prompt>' -n 
 Write-Host "  llama: $LlamaCli -m $Model --prompt '<prompt>' -n $N -t <t> --no-display-prompt -s 42 --log-disable"
 Write-Host ""
 
+# ── smoke-check ───────────────────────────────────────────────────────────────
+# Run one warm-up round at ~75% of TMax before the sweep to confirm both engines
+# produce parseable TG output. Aborts with a clear message if either fails.
+
+if (-not $DryRun) {
+    $smokeT = [math]::Max(1, [int]([math]::Round($TMax * 0.75)))
+    Write-Host "Smoke-check at t=$smokeT (~75% of TMax=$TMax) ..."
+    $smokeOurs  = Get-OursMetrics  $smokeT
+    $smokeLlama = Get-LlamaMetrics $smokeT
+    $ok = $true
+    if ($null -eq $smokeOurs.tg) {
+        Write-Warning "SMOKE FAIL: sub0llm returned no TG tok/s at t=$smokeT — check binary / model path"
+        $ok = $false
+    }
+    if ($null -eq $smokeLlama.tg) {
+        Write-Warning "SMOKE FAIL: llama-cli returned no TG tok/s at t=$smokeT — check binary / model path"
+        $ok = $false
+    }
+    if (-not $ok) {
+        Write-Error "Smoke-check failed — aborting before the full sweep."
+        exit 1
+    }
+    Write-Host ("  sub0llm  PP={0,7} TG={1,7} tok/s  OK" -f (Fmt $smokeOurs.pp),  (Fmt $smokeOurs.tg))
+    Write-Host ("  llama    PP={0,7} TG={1,7} tok/s  OK" -f (Fmt $smokeLlama.pp), (Fmt $smokeLlama.tg))
+    Write-Host ""
+}
+
 $startTime = Get-Date
 $round = 0
 
