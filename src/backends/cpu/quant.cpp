@@ -9,6 +9,28 @@
 #  include <immintrin.h>
 #endif
 
+// ── int8 dot-product: VNNI dispatch ─────────────────────────────────────────────
+// `vpdpbusd` does an unsigned×signed 4-byte dot accumulated into int32 in ONE
+// instruction, replacing the maddubs(int16) + madd(int16→int32) two-op chain. The
+// win on a memory-bound GEMV is not the saved ALU op — it's INSTRUCTION DENSITY:
+// fewer uops per consumed weight byte lets each core keep more loads in flight, so
+// the per-core load-issue throttle (not the DRAM bus, which a pure-read probe shows
+// has headroom) eases. This is the lever behind llama.cpp's ~7% multi-thread edge.
+//   - Arrow Lake / Alder Lake (hybrid, no AVX-512): AVX-VNNI via __AVXVNNI__,
+//     intrinsic _mm256_dpbusd_avx_epi32 (VEX encoding).
+//   - Ice Lake-SP / Sapphire Rapids (AVX-512): AVX512-VNNI+VL, _mm256_dpbusd_epi32.
+// Define SUB0LLM_DISABLE_VNNI (e.g. -DSUB0LLM_DISABLE_VNNI) to force the maddubs
+// fallback — used for the controlled A/B that isolates the VNNI+prefetch speedup.
+#if (defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)) && !defined(SUB0LLM_DISABLE_VNNI)
+#  if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#    define SUB0LLM_DPBUSD(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
+#    define SUB0LLM_HAVE_VNNI 1
+#  elif defined(__AVXVNNI__)
+#    define SUB0LLM_DPBUSD(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
+#    define SUB0LLM_HAVE_VNNI 1
+#  endif
+#endif
+
 namespace sub0llm::backend::cpu {
 
 // ── f16 <-> f32 ────────────────────────────────────────────────────────────────
@@ -187,18 +209,33 @@ void matvec_q8_0_f16(const BlockQ8_0* W, const float* x, float* y,
 
 float dot_q8_0_q8_0(const BlockQ8_0* a, const BlockQ8_0* b, int64_t nblocks) noexcept {
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    // Software-prefetch the weight stream `a` a few blocks ahead. `a` is the big
+    // sequential read (one full weight row, and rows are contiguous in W, so this
+    // also warms the start of the next row across the boundary); `b` (activation)
+    // is tiny and already hot in L1. 8 blocks ≈ 272 B ≈ 4–5 cache lines ahead keeps
+    // the load stream from stalling at row edges, especially on the weaker-prefetch
+    // E-cores. An out-of-range hint on the final row is harmless (prefetch never faults).
+    constexpr int64_t kPrefetchAhead = 8;
+#  if !SUB0LLM_HAVE_VNNI
     const __m256i ones = _mm256_set1_epi16(1);
+#  endif
     // Accumulate (int32 partial dots × per-block scale) as floats in a vector and
     // hsum ONCE per row — avoids a horizontal integer reduction every block.
     __m256 facc = _mm256_setzero_ps();
     for (int64_t i = 0; i < nblocks; ++i) {
+        _mm_prefetch(reinterpret_cast<const char*>(a + i + kPrefetchAhead), _MM_HINT_T0);
         const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a[i].qs));
         const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b[i].qs));
-        // signed×signed via maddubs: |a| (unsigned) × (b·sign(a)) (signed).
+        // signed×signed via |a| (unsigned) × (b·sign(a)) (signed): vpdpbusd wants an
+        // unsigned first operand, so fold a's sign into b and take |a|.
         const __m256i ax  = _mm256_sign_epi8(va, va);
         const __m256i sy  = _mm256_sign_epi8(vb, va);
+#  if SUB0LLM_HAVE_VNNI
+        const __m256i d32 = SUB0LLM_DPBUSD(_mm256_setzero_si256(), ax, sy);  // 8 int32
+#  else
         const __m256i d16 = _mm256_maddubs_epi16(ax, sy);
         const __m256i d32 = _mm256_madd_epi16(d16, ones);   // 8 int32 partials
+#  endif
         const __m256  sc  = _mm256_set1_ps(f16_fast(a[i].d) * f16_fast(b[i].d));
         facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), sc, facc);
     }
