@@ -458,6 +458,54 @@ a Gemma 4 GGUF is dropped in `models/`.
 Dedicated binaries built against the Gemma spec, plus a harness that runs the same
 prompts through llama.cpp and tabulates load time / tokens-per-second / RSS.
 
+## Bench harness: `bench_sweep_threads.ps1`
+
+`tools/scripts/bench_sweep_threads.ps1` performs a full thread-count sweep (1..N_cores)
+comparing sub0llm-gemma vs llama-completion on the same model + prompt, measuring
+both PP (prompt processing) and TG (token generation) tok/s across all thread counts.
+
+### Confirmed apples-to-apples properties (as of b9334 / gemma-4-12b-it-Q8_0)
+
+| Property | Our engine | llama-completion | Status |
+|----------|-----------|-----------------|--------|
+| Tokenizer | SentencePiece (from GGUF vocab) | SentencePiece (from GGUF vocab) | **identical IDs** |
+| Greedy decode | argmax (`--mode greedy`) | `--temp 0` (collapses top-k/top-p to argmax) | **identical tokens** |
+| Prompt text | `--text` flag | `--prompt` flag | **same string** |
+| BOS token | prepended automatically | prepended automatically | **matches** |
+| Conversation mode | N/A | `-no-cnv` required (Gemma GGUF has embedded chat template that auto-enables it) | **disabled** |
+| Token IDs verified | `2 818 5279 529 7001 563` for "The capital of France is" | identical | **exact** |
+| Greedy output verified | `9079 236761 107 100 45518 107 101 6372` (` Paris.\n<\|channel>thought\n<channel\|>That`) | identical | **exact** |
+
+**Smoke-check** in the script runs a binary-identical output test at ~75% of TMax
+before the sweep starts, aborting if tokens diverge.
+
+### Known architectural difference: PP measurement
+
+- **Our PP** — sequential `forward_one()` calls per prompt token (measures our
+  real TTFT / time-to-first-token; reflects our current prefill implementation)
+- **llama PP** — batched prefill over all prompt tokens in one kernel call
+  (exploits full parallelism; `llama-completion --temp 0 -no-cnv`)
+
+This is not a measurement error — it is a real capability gap. The PP column in
+bench output will show llama's PP ~4–8× higher than ours for the same thread count.
+
+### Future work (bench-driven)
+
+- **P1 — Batched prefill for sub0llm-gemma**: implement a `forward_batch()` path
+  that processes the prompt as a full matrix (seq_len × d_model) rather than token
+  by token. This closes the PP gap and makes TTFT competitive with llama.cpp.
+  Requires: KV-cache fill over a batch, attention mask for causal prefill, and
+  Q8-fused matmul accepting 2-D input. Once done, PP ratio should approach 1.0.
+
+- **P2 — Model load time**: `wall_s` column in bench CSV captures total invocation
+  time including load. Our load is currently ~9–10 s (dequant on load); llama's is
+  ~6 s (stays Q8). Investigate lazy dequantization or memory-mapped Q8 weights to
+  reduce cold-start overhead.
+
+- **P3 — Thread scaling ceiling**: sweep data will show TG plateauing or declining
+  above a certain thread count (memory-bandwidth bound). Profile with `bench_membw`
+  to confirm the crossover and document the optimal thread count per system.
+
 ## Correctness is a gate on performance
 
 **A faster forward that produces different logits is a regression, not a win.**

@@ -229,6 +229,13 @@ Key findings:
 - **Memorisation is visible**: greedy decoding at step 9999 reproduces verbatim training passages at low temperature (e.g., "My nobler friends, I crave their pardons: For the mutable, rank-scented many" — Coriolanus Act III)
 - **More data needed**: fix the BPE O(n²) bottleneck or use the GPT-2 tokenizer to use the full 7222-paragraph corpus
 
+- `tools/scripts/bench_sweep_threads.ps1` — thread-count sweep (1..N_cores), both PP + TG tok/s,
+  cyclic-rotation Latin square schedule (thermal-drift-balanced), sub0llm vs llama-completion;
+  smoke-checks binary-identical greedy output before sweep; saves timestamped CSV with raw samples.
+  **Known gap**: our PP is sequential `forward_one()` (TTFT-accurate); llama PP is batched prefill
+  (~4–8× faster). See `chapters/ch27_specialized_build/README.md` → "Bench harness" for full
+  apples-to-apples confirmation and future-work items (batched prefill P1, load-time P2).
+
 ### Tests
 442 Catch2 tests across 25 test files — all passing.
 
