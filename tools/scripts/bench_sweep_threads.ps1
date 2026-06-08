@@ -97,9 +97,11 @@ function Get-OursMetrics([int]$t) {
         # Synthetic: TG peaks around 16-20 threads then falls; PP grows with threads
         $tg = [math]::Round(1.0 + $t * 0.42 - $t * $t * 0.008 + (Get-Random -Minimum -15 -Maximum 15) / 100.0, 2)
         $pp = [math]::Round($t * 2.1 + (Get-Random -Minimum -20 -Maximum 20) / 100.0, 2)
-        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp) }
+        $ws = [math]::Round(12.0 + (Get-Random -Minimum -100 -Maximum 100) / 100.0, 1)
+        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp); wallS = $ws }
     }
     $tg = $null; $pp = $null
+    $t0 = Get-Date
     try {
         $out = & $OursBin --model $Model --mode greedy --text $Prompt -n $N -t $t 2>&1
         foreach ($line in $out) {
@@ -107,7 +109,8 @@ function Get-OursMetrics([int]$t) {
             if ($line -match 'prompt forward.*\(([0-9.]+) tok/s\)')  { $pp = [double]$Matches[1] }
         }
     } catch { }
-    return @{ tg = $tg; pp = $pp }
+    $ws = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+    return @{ tg = $tg; pp = $pp; wallS = $ws }
 }
 
 # Returns {tg, pp} from a single llama-completion run with the real prompt text.
@@ -120,9 +123,11 @@ function Get-LlamaMetrics([int]$t) {
         # Synthetic: llama TG similar shape but slightly higher; PP much higher (batched)
         $tg = [math]::Round(1.1 + $t * 0.44 - $t * $t * 0.0085 + (Get-Random -Minimum -15 -Maximum 15) / 100.0, 2)
         $pp = [math]::Round($t * 8.5 + (Get-Random -Minimum -50 -Maximum 50) / 100.0, 2)
-        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp) }
+        $ws = [math]::Round(14.0 + (Get-Random -Minimum -100 -Maximum 100) / 100.0, 1)
+        return @{ tg = [math]::Max(0.1, $tg); pp = [math]::Max(0.1, $pp); wallS = $ws }
     }
     $tg = $null; $pp = $null
+    $t0 = Get-Date
     try {
         $out = & $LlamaCompletion -m $Model --prompt $Prompt -n $N -t $t -no-cnv -s 42 2>&1
         foreach ($line in $out) {
@@ -132,7 +137,8 @@ function Get-LlamaMetrics([int]$t) {
                 $line -match '([0-9]+\.[0-9]+) tokens per second') { $tg = [double]$Matches[1] }
         }
     } catch { }
-    return @{ tg = $tg; pp = $pp }
+    $ws = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+    return @{ tg = $tg; pp = $pp; wallS = $ws }
 }
 
 function Get-Median([double[]]$vals) {
@@ -150,13 +156,15 @@ function Fmt([object]$v, [string]$fmt = "F2") {
 
 # ── per-thread accumulators ───────────────────────────────────────────────────
 
-$oursTG  = @{}; $oursPP  = @{}
-$llamaTG = @{}; $llamaPP = @{}
+$oursTG  = @{}; $oursPP  = @{}; $oursWall  = @{}
+$llamaTG = @{}; $llamaPP = @{}; $llamaWall = @{}
 foreach ($t in $Threads) {
-    $oursTG[$t]  = [System.Collections.Generic.List[double]]::new()
-    $oursPP[$t]  = [System.Collections.Generic.List[double]]::new()
-    $llamaTG[$t] = [System.Collections.Generic.List[double]]::new()
-    $llamaPP[$t] = [System.Collections.Generic.List[double]]::new()
+    $oursTG[$t]   = [System.Collections.Generic.List[double]]::new()
+    $oursPP[$t]   = [System.Collections.Generic.List[double]]::new()
+    $oursWall[$t] = [System.Collections.Generic.List[double]]::new()
+    $llamaTG[$t]   = [System.Collections.Generic.List[double]]::new()
+    $llamaPP[$t]   = [System.Collections.Generic.List[double]]::new()
+    $llamaWall[$t] = [System.Collections.Generic.List[double]]::new()
 }
 
 # ── header ────────────────────────────────────────────────────────────────────
@@ -170,7 +178,7 @@ Write-Host "Schedule: cyclic-rotation Latin square (K=$K threads x $Samples pass
 Write-Host "Engines: sub0llm @ $gitHash  vs  llama.cpp @ $LlamaVersion"
 if ($DryRun) { Write-Host "*** DRY-RUN MODE — synthetic data only, no binaries invoked ***" }
 Write-Host "Prompt ($PromptLen tokens): '$Prompt'"
-Write-Host "NOTE: llama-cli used (not llama-bench) so both engines receive identical prompt text"
+Write-Host "NOTE: llama-completion used (not llama-bench) so both engines receive identical prompt text"
 Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched prefill"
 Write-Host ""
 Write-Host "Commands (t = thread count for each round):"
@@ -229,10 +237,10 @@ $round = 0
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 # One continuous table; two rows (one per engine) per round.
-# Columns: round | pass | threads | elapsed | engine | PP tok/s | TG tok/s
+# Columns: round | pass | t | min | engine | wall_s | PP tok/s | TG tok/s
 #
-$tblSep = "+-------+------+------+-------+----------+----------+----------+"
-$tblHdr = "| round | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+$tblSep = "+-------+------+------+-------+----------+--------+----------+----------+"
+$tblHdr = "| round | pass |    t |   min | engine   | wall_s |  PP tok/s|  TG tok/s|"
 Write-Host $tblSep
 Write-Host $tblHdr
 Write-Host $tblSep
@@ -253,19 +261,21 @@ for ($p = 0; $p -lt $Samples; $p++) {
             $om = Get-OursMetrics  $t
         }
 
-        if ($null -ne $om.tg) { $oursTG[$t].Add($om.tg) }
-        if ($null -ne $om.pp) { $oursPP[$t].Add($om.pp) }
-        if ($null -ne $lm.tg) { $llamaTG[$t].Add($lm.tg) }
-        if ($null -ne $lm.pp) { $llamaPP[$t].Add($lm.pp) }
+        if ($null -ne $om.tg)    { $oursTG[$t].Add($om.tg) }
+        if ($null -ne $om.pp)    { $oursPP[$t].Add($om.pp) }
+        if ($null -ne $om.wallS) { $oursWall[$t].Add($om.wallS) }
+        if ($null -ne $lm.tg)    { $llamaTG[$t].Add($lm.tg) }
+        if ($null -ne $lm.pp)    { $llamaPP[$t].Add($lm.pp) }
+        if ($null -ne $lm.wallS) { $llamaWall[$t].Add($lm.wallS) }
 
         $prefix = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f $round, ($p+1), $t, $elapsed
-        Write-Host ("$prefix {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $om.pp), (Fmt $om.tg))
-        Write-Host ("$prefix {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lm.pp), (Fmt $lm.tg))
+        Write-Host ("$prefix {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'sub0llm', (Fmt $om.wallS 'F1'), (Fmt $om.pp), (Fmt $om.tg))
+        Write-Host ("$prefix {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'llama',   (Fmt $lm.wallS 'F1'), (Fmt $lm.pp), (Fmt $lm.tg))
         # Separator between rounds; thicker (===) between passes
         if ($i -eq $K - 1) {
             Write-Host $tblSep
         } else {
-            Write-Host "+-------+------+------+-------+----------+----------+----------+"
+            Write-Host $tblSep
         }
     }
 }
@@ -273,10 +283,10 @@ for ($p = 0; $p -lt $Samples; $p++) {
 # ── summary table ─────────────────────────────────────────────────────────────
 
 $csvLines = [System.Collections.Generic.List[string]]::new()
-$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,pp_ratio_pct,tg_ratio_pct,pp_samples,tg_samples")
+$csvLines.Add("threads,engine,wall_med,wall_max,pp_med,pp_max,tg_med,tg_max,pp_ratio_pct,tg_ratio_pct,pp_samples,tg_samples,wall_samples")
 
-$bestOursTGt  = $null; $bestOursTGMed  = 0.0
-$bestLlamaTGt = $null; $bestLlamaTGMed = 0.0
+$bestOursTGt  = $null; $bestOursTGMed  = 0.0; $bestOursWallMed  = $null
+$bestLlamaTGt = $null; $bestLlamaTGMed = 0.0; $bestLlamaWallMed = $null
 $bestOursPPt  = $null; $bestOursPPMed  = 0.0
 $bestLlamaPPt = $null; $bestLlamaPPMed = 0.0
 
@@ -286,27 +296,29 @@ $bestLlamaPPt = $null; $bestLlamaPPMed = 0.0
 Write-Host ""
 Write-Host "=== Summary — median and max across all $Samples samples per thread count ==="
 Write-Host $tblSep
-Write-Host "| stat  | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+Write-Host "| stat  | pass |    t |   min | engine   | wall_s |  PP tok/s|  TG tok/s|"
 Write-Host $tblSep
 
 foreach ($t in $Threads) {
-    $otg = $oursTG[$t].ToArray();  $opp = $oursPP[$t].ToArray()
-    $ltg = $llamaTG[$t].ToArray(); $lpp = $llamaPP[$t].ToArray()
+    $otg = $oursTG[$t].ToArray();   $opp = $oursPP[$t].ToArray();   $ows = $oursWall[$t].ToArray()
+    $ltg = $llamaTG[$t].ToArray();  $lpp = $llamaPP[$t].ToArray();  $lws = $llamaWall[$t].ToArray()
 
     $otgMed = Get-Median $otg; $otgMax = if ($otg.Count) { ($otg | Measure-Object -Maximum).Maximum } else { $null }
     $ltgMed = Get-Median $ltg; $ltgMax = if ($ltg.Count) { ($ltg | Measure-Object -Maximum).Maximum } else { $null }
     $oppMed = Get-Median $opp; $oppMax = if ($opp.Count) { ($opp | Measure-Object -Maximum).Maximum } else { $null }
     $lppMed = Get-Median $lpp; $lppMax = if ($lpp.Count) { ($lpp | Measure-Object -Maximum).Maximum } else { $null }
+    $owsMed = Get-Median $ows; $owsMax = if ($ows.Count) { ($ows | Measure-Object -Maximum).Maximum } else { $null }
+    $lwsMed = Get-Median $lws; $lwsMax = if ($lws.Count) { ($lws | Measure-Object -Maximum).Maximum } else { $null }
     $tgRatio = if ($null -ne $otgMed -and $null -ne $ltgMed -and $ltgMed -gt 0) { 100.0 * $otgMed / $ltgMed } else { $null }
     $ppRatio = if ($null -ne $oppMed -and $null -ne $lppMed -and $lppMed -gt 0) { 100.0 * $oppMed / $lppMed } else { $null }
 
     $pfx = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f 'med', '-', $t, '-'
-    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $oppMed), (Fmt $otgMed))
-    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lppMed), (Fmt $ltgMed))
+    Write-Host ("$pfx {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'sub0llm', (Fmt $owsMed 'F1'), (Fmt $oppMed), (Fmt $otgMed))
+    Write-Host ("$pfx {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'llama',   (Fmt $lwsMed 'F1'), (Fmt $lppMed), (Fmt $ltgMed))
 
     $pfx = "| {0,5} | {1,4} | {2,4} | {3,5} |" -f 'max', '-', $t, '-'
-    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $oppMax), (Fmt $otgMax))
-    Write-Host ("$pfx {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $lppMax), (Fmt $ltgMax))
+    Write-Host ("$pfx {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'sub0llm', (Fmt $owsMax 'F1'), (Fmt $oppMax), (Fmt $otgMax))
+    Write-Host ("$pfx {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'llama',   (Fmt $lwsMax 'F1'), (Fmt $lppMax), (Fmt $ltgMax))
 
     Write-Host $tblSep
 
@@ -314,21 +326,24 @@ foreach ($t in $Threads) {
     $otgRaw = ($otg | ForEach-Object { $_.ToString('F2') }) -join ';'
     $lppRaw = ($lpp | ForEach-Object { $_.ToString('F2') }) -join ';'
     $ltgRaw = ($ltg | ForEach-Object { $_.ToString('F2') }) -join ';'
-    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $ppRatio 'F1'),$(Fmt $tgRatio 'F1'),$oppRaw,$otgRaw")
-    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-,-,$lppRaw,$ltgRaw")
+    $owsRaw = ($ows | ForEach-Object { $_.ToString('F1') }) -join ';'
+    $lwsRaw = ($lws | ForEach-Object { $_.ToString('F1') }) -join ';'
+    $csvLines.Add("$t,sub0llm,$(Fmt $owsMed 'F1'),$(Fmt $owsMax 'F1'),$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $ppRatio 'F1'),$(Fmt $tgRatio 'F1'),$oppRaw,$otgRaw,$owsRaw")
+    $csvLines.Add("$t,llama,$(Fmt $lwsMed 'F1'),$(Fmt $lwsMax 'F1'),$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-,-,$lppRaw,$ltgRaw,$lwsRaw")
 
-    if ($null -ne $otgMed -and $otgMed -gt $bestOursTGMed)  { $bestOursTGMed  = $otgMed; $bestOursTGt  = $t }
-    if ($null -ne $ltgMed -and $ltgMed -gt $bestLlamaTGMed) { $bestLlamaTGMed = $ltgMed; $bestLlamaTGt = $t }
+    if ($null -ne $otgMed -and $otgMed -gt $bestOursTGMed)  { $bestOursTGMed  = $otgMed; $bestOursTGt  = $t; $bestOursWallMed  = $owsMed }
+    if ($null -ne $ltgMed -and $ltgMed -gt $bestLlamaTGMed) { $bestLlamaTGMed = $ltgMed; $bestLlamaTGt = $t; $bestLlamaWallMed = $lwsMed }
     if ($null -ne $oppMed -and $oppMed -gt $bestOursPPMed)  { $bestOursPPMed  = $oppMed; $bestOursPPt  = $t }
     if ($null -ne $lppMed -and $lppMed -gt $bestLlamaPPMed) { $bestLlamaPPMed = $lppMed; $bestLlamaPPt = $t }
 }
 
 # Best-thread highlight rows
-Write-Host "| stat  | pass |    t |   min | engine   |  PP tok/s|  TG tok/s|"
+Write-Host $tblSep
+Write-Host "| stat  | pass |    t |   min | engine   | wall_s |  PP tok/s|  TG tok/s|"
 Write-Host $tblSep
 $bpfx = "| {0,5} | {1,4} | {2,4} | {3,5} |"
-Write-Host (($bpfx -f 'BEST','-',$bestOursTGt,'-')  + (" {0,-8} | {1,9}| {2,9}|" -f 'sub0llm', (Fmt $bestOursPPMed), (Fmt $bestOursTGMed)))
-Write-Host (($bpfx -f 'BEST','-',$bestLlamaTGt,'-') + (" {0,-8} | {1,9}| {2,9}|" -f 'llama',   (Fmt $bestLlamaPPMed),(Fmt $bestLlamaTGMed)))
+Write-Host (($bpfx -f 'BEST','-',$bestOursTGt,'-')  + (" {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'sub0llm', (Fmt $bestOursWallMed 'F1'), (Fmt $bestOursPPMed),  (Fmt $bestOursTGMed)))
+Write-Host (($bpfx -f 'BEST','-',$bestLlamaTGt,'-') + (" {0,-8} | {1,6}s| {2,9}| {3,9}|" -f 'llama',   (Fmt $bestLlamaWallMed 'F1'), (Fmt $bestLlamaPPMed), (Fmt $bestLlamaTGMed)))
 Write-Host $tblSep
 Write-Host ""
 
