@@ -203,7 +203,7 @@ for ($p = 0; $p -lt $Samples; $p++) {
 # ── summary table ─────────────────────────────────────────────────────────────
 
 $csvLines = [System.Collections.Generic.List[string]]::new()
-$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,tg_ratio_pct")
+$csvLines.Add("threads,engine,pp_med,pp_max,tg_med,tg_max,tg_ratio_pct,pp_samples,tg_samples")
 
 $bestOursTGt  = $null; $bestOursTGMed  = 0.0
 $bestLlamaTGt = $null; $bestLlamaTGMed = 0.0
@@ -239,8 +239,12 @@ foreach ($t in $Threads) {
 
     Write-Host $tblSep
 
-    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $tgRatio 'F1')")
-    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-")
+    $oppRaw = ($opp | ForEach-Object { $_.ToString('F2') }) -join ';'
+    $otgRaw = ($otg | ForEach-Object { $_.ToString('F2') }) -join ';'
+    $lppRaw = ($lpp | ForEach-Object { $_.ToString('F2') }) -join ';'
+    $ltgRaw = ($ltg | ForEach-Object { $_.ToString('F2') }) -join ';'
+    $csvLines.Add("$t,sub0llm,$(Fmt $oppMed),$(Fmt $oppMax),$(Fmt $otgMed),$(Fmt $otgMax),$(Fmt $tgRatio 'F1'),$oppRaw,$otgRaw")
+    $csvLines.Add("$t,llama,$(Fmt $lppMed),$(Fmt $lppMax),$(Fmt $ltgMed),$(Fmt $ltgMax),-,$lppRaw,$ltgRaw")
 
     if ($null -ne $otgMed -and $otgMed -gt $bestOursTGMed)  { $bestOursTGMed  = $otgMed; $bestOursTGt  = $t }
     if ($null -ne $ltgMed -and $ltgMed -gt $bestLlamaTGMed) { $bestLlamaTGMed = $ltgMed; $bestLlamaTGt = $t }
