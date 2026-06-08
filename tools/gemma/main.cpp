@@ -178,8 +178,15 @@ int main(int argc, char** argv) {
             auto kv = model.make_cache(prompt_len + args.max_tokens + 1);
             std::vector<float> logits;
             int64_t pos = 0;
-            for (; pos < prompt_len; ++pos)   // greedy: argmax only → skip softcap
-                logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, false);
+            {
+                const auto pp0 = std::chrono::steady_clock::now();
+                for (; pos < prompt_len; ++pos)   // greedy: argmax only → skip softcap
+                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, false);
+                const double pp_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pp0).count();
+                std::cerr << std::format("[gemma] prompt forward {} tok in {:.2f}s ({:.2f} tok/s)\n",
+                                         prompt_len, pp_s, static_cast<double>(prompt_len) / pp_s);
+            }
 
             std::vector<int32_t> gen;
             const auto t0 = std::chrono::steady_clock::now();
