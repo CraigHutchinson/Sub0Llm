@@ -40,8 +40,8 @@ $ErrorActionPreference = "Stop"
 if ($TMax -le 0) { $TMax = [Environment]::ProcessorCount }
 
 $LlamaDir     = "D:/tools/llamacpp/vendor/llama.cpp-prebuilt/b9334/cpu"
-$LlamaCli     = Join-Path $LlamaDir "llama-cli.exe"
-$LlamaVersion = Split-Path (Split-Path $LlamaDir -Parent) -Leaf
+$LlamaCompletion = Join-Path $LlamaDir "llama-completion.exe"
+$LlamaVersion    = Split-Path (Split-Path $LlamaDir -Parent) -Leaf
 $OursBin      = "./build-native/bin/sub0llm-gemma.exe"
 $Threads      = [int[]]($TMin..$TMax)
 $K            = $Threads.Count
@@ -76,14 +76,14 @@ function Get-OursGenText([int]$t, [int]$n) {
     return $null
 }
 
-# Returns the generated text from llama-cli for a short fixed-n run.
-# --no-cnv --single-turn ensures it exits after one generation (no interactive hang).
+# Returns the generated text from llama-completion for a short fixed-n run.
+# llama-completion stdout = generated tokens only; stderr = log/timing lines.
+# -no-cnv (single dash) disables auto-enabled conversation mode from the embedded chat template.
 function Get-LlamaGenText([int]$t, [int]$n) {
     try {
-        $out = & $LlamaCli -m $Model --prompt $Prompt -n $n -t $t `
-                           --no-display-prompt --no-cnv --single-turn -s 42 --log-disable 2>$null
-        $text = ($out | Where-Object { $_ -notmatch 'llama_' -and $_ -notmatch '^\s*$' }) -join ' '
-        return $text.Trim()
+        # Capture stdout only (2>$null silences timing/log stderr)
+        $text = (& $LlamaCompletion -m $Model --prompt $Prompt -n $n -t $t -no-cnv -s 42 2>$null)
+        return ($text -join ' ').Trim()
     } catch { }
     return $null
 }
@@ -110,10 +110,11 @@ function Get-OursMetrics([int]$t) {
     return @{ tg = $tg; pp = $pp }
 }
 
-# Returns {tg, pp} from a single llama-cli run with the real prompt text.
-# llama-cli prints llama_print_timings to stderr, e.g.:
-#   llama_print_timings: prompt eval time = ... (X.XX tokens per second)
-#   llama_print_timings:        eval time = ... (X.XX tokens per second)
+# Returns {tg, pp} from a single llama-completion run with the real prompt text.
+# llama-completion logs timings to stderr under 'common_perf_print':
+#   common_perf_print:    prompt eval time = ... X.XX tokens per second
+#   common_perf_print:        eval time    = ... X.XX tokens per second
+# -no-cnv disables the auto-enabled conversation mode from the embedded Gemma chat template.
 function Get-LlamaMetrics([int]$t) {
     if ($DryRun) {
         # Synthetic: llama TG similar shape but slightly higher; PP much higher (batched)
@@ -123,12 +124,11 @@ function Get-LlamaMetrics([int]$t) {
     }
     $tg = $null; $pp = $null
     try {
-        $out = & $LlamaCli -m $Model --prompt $Prompt -n $N -t $t `
-                           --no-display-prompt --no-cnv --single-turn -s 42 --log-disable 2>&1
+        $out = & $LlamaCompletion -m $Model --prompt $Prompt -n $N -t $t -no-cnv -s 42 2>&1
         foreach ($line in $out) {
             if ($line -match 'prompt eval time' -and
                 $line -match '([0-9]+\.[0-9]+) tokens per second') { $pp = [double]$Matches[1] }
-            if ($line -match 'llama_print_timings:\s+eval time' -and
+            if ($line -match 'common_perf_print:\s+eval time' -and
                 $line -match '([0-9]+\.[0-9]+) tokens per second') { $tg = [double]$Matches[1] }
         }
     } catch { }
@@ -175,7 +175,7 @@ Write-Host "NOTE: our PP = sequential token-by-token prefill; llama PP = batched
 Write-Host ""
 Write-Host "Commands (t = thread count for each round):"
 Write-Host "  ours : $OursBin --model $Model --mode greedy --text '<prompt>' -n $N -t <t>"
-Write-Host "  llama: $LlamaCli -m $Model --prompt '<prompt>' -n $N -t <t> --no-display-prompt --no-cnv --single-turn -s 42 --log-disable"
+Write-Host "  llama: $LlamaCompletion -m $Model --prompt '<prompt>' -n $N -t <t> -no-cnv -s 42"
 Write-Host ""
 
 # ── smoke-check ───────────────────────────────────────────────────────────────
