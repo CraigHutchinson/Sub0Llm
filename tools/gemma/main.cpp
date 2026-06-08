@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -249,6 +250,54 @@ int main(int argc, char** argv) {
                 std::cout << std::format("{:<32s} median {:.2f} tok/s  best {:.2f}  ({:+.1f}% vs baseline)\n",
                                          c.name, med, c.t.back(), 100.0 * (med - base) / base);
             }
+            return 0;
+        }
+
+        if (args.mode == "sweep") {
+            // Thread-count sweep within ONE process (model loaded once): find OUR sweet
+            // spot. Single-token decode at the best config (fused, no-softcap). Rotates
+            // the thread-count order each round so thermal drift doesn't bias later T's.
+            const int64_t G = args.max_tokens;
+            sub0llm::nn::set_gemma_fuse(true);
+            auto decode_at = [&](int threads) {
+                sub0llm::nn::set_gemma_threads(threads);
+                auto kv = model.make_cache(prompt_len + G + 1);
+                std::vector<float> logits;
+                int64_t pos = 0;
+                for (; pos < prompt_len; ++pos)
+                    logits = model.forward_one(ids[static_cast<std::size_t>(pos)], pos, kv, false);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int64_t t = 0; t < G; ++t) {
+                    logits = model.forward_one(argmax(logits), pos, kv, false);
+                    ++pos;
+                }
+                return static_cast<double>(G) / std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+            };
+
+            const unsigned hw = std::thread::hardware_concurrency();
+            std::vector<int> Ts;
+            for (int t : {1, 2, 4, 6, 8, 12, 16, 20, 24, 32})
+                if (t <= static_cast<int>(hw)) Ts.push_back(t);
+            std::vector<std::vector<double>> s(Ts.size());
+
+            decode_at(static_cast<int>(hw > 4 ? hw - 4 : hw));   // warmup
+            const int nt = static_cast<int>(Ts.size());
+            for (int r = 0; r < args.repeat; ++r)
+                for (int k = 0; k < nt; ++k) {
+                    const int idx = (r + k) % nt;
+                    s[static_cast<std::size_t>(idx)].push_back(decode_at(Ts[static_cast<std::size_t>(idx)]));
+                }
+
+            int best_t = Ts[0]; double best = 0.0;
+            std::cout << "threads   median   best   tok/s\n";
+            for (std::size_t k = 0; k < Ts.size(); ++k) {
+                std::sort(s[k].begin(), s[k].end());
+                const double med = s[k][s[k].size() / 2];
+                if (med > best) { best = med; best_t = Ts[k]; }
+                std::cout << std::format("  {:>4}   {:6.2f}  {:6.2f}\n", Ts[k], med, s[k].back());
+            }
+            std::cout << std::format("OUR SWEET SPOT: {} threads ({:.2f} tok/s median)\n", best_t, best);
             return 0;
         }
 

@@ -172,11 +172,12 @@ int desired_threads() {
     if (g_gemma_threads > 0) return g_gemma_threads;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) return 1;
-    // Single-token decode is DRAM-bandwidth-bound and saturates well before all cores;
-    // meanwhile spin-wait workers starve the OS if they occupy every core. Leaving a few
-    // cores free is measurably faster (on a 24-core part, 20 threads beat 24). Default to
-    // hw-4 for large core counts; use everything on small machines.
-    const unsigned n = hw > 8 ? hw - 4 : hw;
+    // Single-token decode is DRAM-bandwidth-bound and saturates at the memory knee, well
+    // before all cores; past it the extra (E-)cores add contention not bandwidth, and
+    // spin-wait workers on every core starve the OS. MEASURED on this 8 P + 16 E (24-thread)
+    // part: 16 threads is the peak for BOTH us (6.47 tok/s) and llama (5.94) — 16 beats 20
+    // (6.02) and 24 (5.15). Default to ~2/3 of cores (= 16 here); -t overrides per machine.
+    const unsigned n = hw > 6 ? (hw * 2u) / 3u : hw;
     return static_cast<int>(std::clamp<unsigned>(n, 1u, 32u));
 }
 
