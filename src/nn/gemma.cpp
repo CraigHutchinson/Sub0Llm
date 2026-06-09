@@ -8,6 +8,7 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -38,11 +39,46 @@ void set_gemma_threads(int n) { g_gemma_threads = n < 0 ? 0 : n; }
 namespace { bool g_gemma_fuse = true; }
 void set_gemma_fuse(bool on) { g_gemma_fuse = on; }
 
-// Base logical CPU for pool pinning (default 0). Set to 8 on Arrow Lake to run the pool
-// on the E-cores (8..23) — TG is bandwidth-bound, so E-cores may match P-cores while
-// freeing them. Read when the pool is (re)built.
-namespace { int g_affinity_base = 0; }
-void set_gemma_affinity_base(int base) { g_affinity_base = base < 0 ? 0 : base; }
+// Explicit logical-CPU set for pool pinning (empty = OS default, no pinning). Worker k
+// pins to g_cpu_set[k]. Read when the pool is (re)built.
+namespace { std::vector<int> g_cpu_set; }
+void set_gemma_cpus(const std::vector<int>& cpus) { g_cpu_set = cpus; }
+
+GemmaCoreTopology gemma_detect_cores() {
+    GemmaCoreTopology topo;
+    topo.n_logical = static_cast<int>(std::thread::hardware_concurrency());
+#ifdef _WIN32
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) return topo;
+    std::vector<char> buf(len);
+    auto* first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first, &len)) return topo;
+
+    // Group logical CPUs by EfficiencyClass (higher = higher performance). One record per
+    // physical core; GroupMask names its logical CPUs (SMT siblings share the core's class).
+    std::map<int, std::vector<int>> by_class;
+    for (char* p = buf.data(); p < buf.data() + len; ) {
+        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+        if (info->Relationship == RelationProcessorCore) {
+            const int ec = info->Processor.EfficiencyClass;
+            const auto& gm = info->Processor.GroupMask[0];
+            const int gbase = gm.Group * 64;
+            for (int b = 0; b < 64; ++b)
+                if (gm.Mask & (static_cast<KAFFINITY>(1) << b)) by_class[ec].push_back(gbase + b);
+        }
+        p += info->Size;
+    }
+    if (by_class.size() >= 2) {                       // hybrid: top class = perf, rest = eff
+        const int top = by_class.rbegin()->first;
+        for (auto& [cls, cpus] : by_class)
+            for (int c : cpus) (cls == top ? topo.perf : topo.efficiency).push_back(c);
+        std::sort(topo.perf.begin(), topo.perf.end());
+        std::sort(topo.efficiency.begin(), topo.efficiency.end());
+    }
+#endif
+    return topo;
+}
 
 namespace {
 
@@ -51,6 +87,7 @@ namespace cpu = backend::cpu;
 constexpr int64_t QK = cpu::QK8_0;   // 32
 
 void pin_thread_to_cpu(int cpu) {
+    if (cpu < 0) return;                              // no pinning
 #ifdef _WIN32
     SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << (cpu & 63));
 #else
@@ -81,11 +118,14 @@ struct GemvJob { const cpu::BlockQ8_0* W; float* y; int64_t M; };
 // naturally compensates for the slower E-cores.
 class GemmaPool {
 public:
-    explicit GemmaPool(int total_threads) : nworkers_(std::max(0, total_threads - 1)) {
-        const int base = g_affinity_base;
-        pin_thread_to_cpu(base);                    // caller runs on `base`
+    // cpus[k] is the logical CPU for thread k (cpus[0] = caller, cpus[1..] = workers); an
+    // empty list means no pinning. Total threads = cpus.size() (or `count` when unpinned).
+    GemmaPool(const std::vector<int>& cpus, int count)
+        : nworkers_(std::max(0, (cpus.empty() ? count : static_cast<int>(cpus.size())) - 1)) {
+        if (!cpus.empty()) pin_thread_to_cpu(cpus[0]);            // caller
         for (int i = 0; i < nworkers_; ++i)
-            workers_.emplace_back([this, cpu = base + i + 1] { worker(cpu); });
+            workers_.emplace_back(
+                [this, cpu = cpus.empty() ? -1 : cpus[static_cast<std::size_t>(i + 1)]] { worker(cpu); });
     }
     ~GemmaPool() {
         stop_.store(true, std::memory_order_relaxed);
@@ -192,12 +232,22 @@ int desired_threads() {
 // only from the single generation thread, so no locking on the pool pointer is needed.
 GemmaPool* get_pool() {
     static std::unique_ptr<GemmaPool> pool;
-    static int pool_base = -1;
-    const int want = desired_threads();
-    if (want <= 1) { pool.reset(); pool_base = -1; return nullptr; }
-    if (!pool || pool->total() != want || pool_base != g_affinity_base) {
-        pool = std::make_unique<GemmaPool>(want);
-        pool_base = g_affinity_base;
+    static std::vector<int> pool_cpus;
+    int want = desired_threads();
+
+    // Resolve the logical-CPU pin list: an explicit set (capped to the thread count), or a
+    // contiguous 0..want-1 default (the OS-default behaviour, preserved).
+    std::vector<int> cpus;
+    if (g_cpu_set.empty()) {
+        for (int i = 0; i < want; ++i) cpus.push_back(i);
+    } else {
+        want = std::min<int>(want, static_cast<int>(g_cpu_set.size()));
+        cpus.assign(g_cpu_set.begin(), g_cpu_set.begin() + want);
+    }
+    if (want <= 1) { pool.reset(); pool_cpus.clear(); return nullptr; }
+    if (!pool || cpus != pool_cpus) {
+        pool = std::make_unique<GemmaPool>(cpus, want);
+        pool_cpus = cpus;
     }
     return pool.get();
 }

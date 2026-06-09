@@ -41,11 +41,25 @@ void set_gemma_threads(int n);
 // off dispatches each output separately — for drift-free A/B of the optimization.
 void set_gemma_fuse(bool on);
 
-// Base logical CPU for thread pinning (default 0). The caller pins to `base`, worker i to
-// `base+i+1`. On a hybrid part where the E-cores are the high logical IDs (Arrow Lake:
-// P=0..7, E=8..23), set base=8 to run the (bandwidth-bound) pool entirely on E-cores and
-// leave the P-cores free. Applied when the pool is next (re)built.
-void set_gemma_affinity_base(int base);
+// CPU topology: logical-CPU ids grouped by performance class, auto-detected so we never
+// hardcode a core index. perf = the highest-performance class (Intel P-cores); efficiency
+// = the rest (E-cores / LP-E). Both empty on a homogeneous CPU or if detection is
+// unavailable (caller then uses all cores). On Windows, from
+// GetLogicalProcessorInformationEx's EfficiencyClass (works on every Intel hybrid from
+// 12th-gen Alder Lake through Core Ultra, and ARM big.LITTLE).
+struct GemmaCoreTopology {
+    std::vector<int> perf;        // performance-core logical CPU ids
+    std::vector<int> efficiency;  // efficiency-core logical CPU ids
+    int              n_logical = 0;
+    [[nodiscard]] bool hybrid() const noexcept { return !perf.empty() && !efficiency.empty(); }
+};
+[[nodiscard]] GemmaCoreTopology gemma_detect_cores();
+
+// Pin the GEMV pool to these logical CPUs (worker k → cpus[k]); the thread count becomes
+// min(requested, cpus.size()). Empty = let the OS schedule (no pinning). Bandwidth-bound
+// decode prefers the efficiency cores (measured equal/faster, frees the P-cores); set this
+// to gemma_detect_cores().efficiency for that. Applied when the pool is next (re)built.
+void set_gemma_cpus(const std::vector<int>& cpus);
 
 // Per-layer weights + shape. Q8 weights are stored as the GGUF gives them: row-major
 // (out_features, in_features), so backend::cpu::matvec_q8_0_q8_0 consumes them with

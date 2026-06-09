@@ -57,7 +57,7 @@ struct Args {
     int64_t     max_tokens = 32;
     int64_t     topk = 10;
     int         threads = 0;      // 0 = auto; set to 1 for a single-core baseline
-    int         cpu_base = 0;     // base logical CPU for pinning (8 = E-cores on Arrow Lake)
+    std::string cores = "auto";   // auto | all | P | E | "lo-hi" | "a,b,c" (pin policy)
     int         repeat = 5;       // --mode bench: interleaved A/B rounds
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
@@ -79,7 +79,7 @@ Args parse(int argc, char** argv) {
         else if (s == "-n" || s == "--max-tokens") a.max_tokens = std::stoll(next());
         else if (s == "--topk")         a.topk = std::stoll(next());
         else if (s == "-t" || s == "--threads") a.threads = std::stoi(next());
-        else if (s == "--cpu-base")     a.cpu_base = std::stoi(next());
+        else if (s == "--cores")        a.cores = next();
         else if (s == "--repeat")       a.repeat = std::stoi(next());
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
@@ -101,6 +101,40 @@ int argmax(const std::vector<float>& v) {
         sub0llm::backend::cpu::argmax_f32(v.data(), static_cast<int64_t>(v.size())));
 }
 
+// Parse an explicit CPU list: "lo-hi" range or "a,b,c" comma list.
+std::vector<int> parse_cpu_list(const std::string& s) {
+    std::vector<int> out;
+    if (auto dash = s.find('-'); dash != std::string::npos && s.find(',') == std::string::npos) {
+        const int lo = std::stoi(s.substr(0, dash)), hi = std::stoi(s.substr(dash + 1));
+        for (int c = lo; c <= hi; ++c) out.push_back(c);
+    } else {
+        std::size_t i = 0;
+        while (i < s.size()) {
+            std::size_t j = s.find(',', i);
+            if (j == std::string::npos) j = s.size();
+            if (j > i) out.push_back(std::stoi(s.substr(i, j - i)));
+            i = j + 1;
+        }
+    }
+    return out;
+}
+
+// Resolve a --cores policy to a logical-CPU pin set for a phase.
+//   compute=true  → prompt-processing (compute-bound): prefers all cores / P-cores.
+//   compute=false → token-generation (bandwidth-bound): prefers E-cores (frees P-cores).
+// Returns empty = "no explicit set" (OS-default contiguous, i.e. all cores up to -t).
+std::vector<int> resolve_cores(const std::string& policy,
+                               const sub0llm::nn::GemmaCoreTopology& topo, bool compute) {
+    if (policy == "all") return {};
+    if (policy == "P")   return topo.perf;          // empty on non-hybrid → falls back to all
+    if (policy == "E")   return topo.efficiency;
+    if (policy == "auto") {
+        if (!topo.hybrid()) return {};
+        return compute ? std::vector<int>{} : topo.efficiency;   // PP: all cores; TG: E-cores
+    }
+    return parse_cpu_list(policy);                   // explicit "lo-hi" / "a,b,c"
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -109,7 +143,6 @@ int main(int argc, char** argv) {
 
         sub0llm::nn::set_gemma_threads(args.threads);
         sub0llm::nn::set_gemma_fuse(!args.no_fuse);
-        sub0llm::nn::set_gemma_affinity_base(args.cpu_base);
 
         sub0llm::nn::GGUFReader reader(args.model);
         const auto& voc = reader.vocab();
@@ -146,9 +179,19 @@ int main(int argc, char** argv) {
                                  static_cast<double>(model.n_params()) / 1e9,
                                  load_s, rss_mb());
 
+        // Auto-detect P/E topology and resolve the --cores pin policy (no hardcoded index).
+        const auto topo = sub0llm::nn::gemma_detect_cores();
+        const auto pp_cpus = resolve_cores(args.cores, topo, /*compute=*/true);   // PP set
+        const auto tg_cpus = resolve_cores(args.cores, topo, /*compute=*/false);  // TG set
+        if (topo.hybrid())
+            std::cerr << std::format("[gemma] cores: {} P-core + {} E-core (logical); "
+                                     "policy '{}'\n", topo.perf.size(), topo.efficiency.size(),
+                                     args.cores);
+
         const int64_t prompt_len = static_cast<int64_t>(ids.size());
 
         if (args.mode == "logits") {
+            sub0llm::nn::set_gemma_cpus(pp_cpus);             // prefill = compute-bound
             auto kv = model.make_cache(prompt_len + 1);
             const auto t0 = std::chrono::steady_clock::now();
             std::vector<float> logits = model.forward_prefill(ids.data(), prompt_len, 0, kv);
@@ -179,7 +222,8 @@ int main(int argc, char** argv) {
             auto kv = model.make_cache(prompt_len + args.max_tokens + 1);
             std::vector<float> logits;
             int64_t pos = 0;
-            {   // batched prefill (greedy: argmax only → skip softcap)
+            {   // batched prefill (greedy: argmax only → skip softcap) — compute-bound → PP cores
+                sub0llm::nn::set_gemma_cpus(pp_cpus);
                 const auto pp0 = std::chrono::steady_clock::now();
                 logits = model.forward_prefill(ids.data(), prompt_len, 0, kv, false);
                 pos = prompt_len;
@@ -189,6 +233,7 @@ int main(int argc, char** argv) {
                                          prompt_len, pp_s, static_cast<double>(prompt_len) / pp_s);
             }
 
+            sub0llm::nn::set_gemma_cpus(tg_cpus);             // decode = bandwidth-bound → E-cores
             std::vector<int32_t> gen;
             const auto t0 = std::chrono::steady_clock::now();
             for (int64_t t = 0; t < args.max_tokens; ++t) {
@@ -215,6 +260,7 @@ int main(int argc, char** argv) {
             // Drift-free A/B/C: cycle the cumulative orchestration levers within ONE
             // process (model loaded once, shared thermal state), interleaved over
             // `repeat` rounds. Single-token decode of `max_tokens` per measurement.
+            sub0llm::nn::set_gemma_cpus(tg_cpus);            // decode benchmark = bandwidth set
             const int64_t G = args.max_tokens;
             auto decode_toks = [&](bool fuse, bool softcap) {
                 sub0llm::nn::set_gemma_fuse(fuse);
@@ -267,6 +313,7 @@ int main(int argc, char** argv) {
             // the thread-count order each round so thermal drift doesn't bias later T's.
             const int64_t G = args.max_tokens;
             sub0llm::nn::set_gemma_fuse(true);
+            sub0llm::nn::set_gemma_cpus(pp_cpus);            // sweep across all cores (auto→{})
             auto decode_at = [&](int threads) {
                 sub0llm::nn::set_gemma_threads(threads);
                 auto kv = model.make_cache(prompt_len + G + 1);
