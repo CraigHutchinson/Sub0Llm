@@ -41,6 +41,12 @@ void set_gemma_threads(int n);
 // off dispatches each output separately — for drift-free A/B of the optimization.
 void set_gemma_fuse(bool on);
 
+// Base logical CPU for thread pinning (default 0). The caller pins to `base`, worker i to
+// `base+i+1`. On a hybrid part where the E-cores are the high logical IDs (Arrow Lake:
+// P=0..7, E=8..23), set base=8 to run the (bandwidth-bound) pool entirely on E-cores and
+// leave the P-cores free. Applied when the pool is next (re)built.
+void set_gemma_affinity_base(int base);
+
 // Per-layer weights + shape. Q8 weights are stored as the GGUF gives them: row-major
 // (out_features, in_features), so backend::cpu::matvec_q8_0_q8_0 consumes them with
 // M=out, K=in directly (q/k/v are sliced per head AFTER projection, in f32).

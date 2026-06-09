@@ -38,6 +38,12 @@ void set_gemma_threads(int n) { g_gemma_threads = n < 0 ? 0 : n; }
 namespace { bool g_gemma_fuse = true; }
 void set_gemma_fuse(bool on) { g_gemma_fuse = on; }
 
+// Base logical CPU for pool pinning (default 0). Set to 8 on Arrow Lake to run the pool
+// on the E-cores (8..23) — TG is bandwidth-bound, so E-cores may match P-cores while
+// freeing them. Read when the pool is (re)built.
+namespace { int g_affinity_base = 0; }
+void set_gemma_affinity_base(int base) { g_affinity_base = base < 0 ? 0 : base; }
+
 namespace {
 
 namespace cpu = backend::cpu;
@@ -76,9 +82,10 @@ struct GemvJob { const cpu::BlockQ8_0* W; float* y; int64_t M; };
 class GemmaPool {
 public:
     explicit GemmaPool(int total_threads) : nworkers_(std::max(0, total_threads - 1)) {
-        pin_thread_to_cpu(0);                       // caller runs on CPU 0
+        const int base = g_affinity_base;
+        pin_thread_to_cpu(base);                    // caller runs on `base`
         for (int i = 0; i < nworkers_; ++i)
-            workers_.emplace_back([this, i] { worker(i + 1); });
+            workers_.emplace_back([this, cpu = base + i + 1] { worker(cpu); });
     }
     ~GemmaPool() {
         stop_.store(true, std::memory_order_relaxed);
@@ -185,9 +192,13 @@ int desired_threads() {
 // only from the single generation thread, so no locking on the pool pointer is needed.
 GemmaPool* get_pool() {
     static std::unique_ptr<GemmaPool> pool;
+    static int pool_base = -1;
     const int want = desired_threads();
-    if (want <= 1) { pool.reset(); return nullptr; }
-    if (!pool || pool->total() != want) pool = std::make_unique<GemmaPool>(want);
+    if (want <= 1) { pool.reset(); pool_base = -1; return nullptr; }
+    if (!pool || pool->total() != want || pool_base != g_affinity_base) {
+        pool = std::make_unique<GemmaPool>(want);
+        pool_base = g_affinity_base;
+    }
     return pool.get();
 }
 

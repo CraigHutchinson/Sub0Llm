@@ -57,6 +57,7 @@ struct Args {
     int64_t     max_tokens = 32;
     int64_t     topk = 10;
     int         threads = 0;      // 0 = auto; set to 1 for a single-core baseline
+    int         cpu_base = 0;     // base logical CPU for pinning (8 = E-cores on Arrow Lake)
     int         repeat = 5;       // --mode bench: interleaved A/B rounds
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
@@ -78,6 +79,7 @@ Args parse(int argc, char** argv) {
         else if (s == "-n" || s == "--max-tokens") a.max_tokens = std::stoll(next());
         else if (s == "--topk")         a.topk = std::stoll(next());
         else if (s == "-t" || s == "--threads") a.threads = std::stoi(next());
+        else if (s == "--cpu-base")     a.cpu_base = std::stoi(next());
         else if (s == "--repeat")       a.repeat = std::stoi(next());
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
@@ -107,6 +109,7 @@ int main(int argc, char** argv) {
 
         sub0llm::nn::set_gemma_threads(args.threads);
         sub0llm::nn::set_gemma_fuse(!args.no_fuse);
+        sub0llm::nn::set_gemma_affinity_base(args.cpu_base);
 
         sub0llm::nn::GGUFReader reader(args.model);
         const auto& voc = reader.vocab();
