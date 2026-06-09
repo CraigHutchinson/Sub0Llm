@@ -142,13 +142,27 @@ void bench_batch(const char* label, int64_t M, int64_t K, int64_t T, int reps) {
     };
     auto f_batch = [&] { matmul_q8_0_q8_0(Wq.data(), Xq.data(), Y.data(), M, K, T); };
 
+    // Hoisted: pre-decode the T·nb activation block scales ONCE (reused across all M rows),
+    // vs the inline f16-decode the plain matmul redoes per row. Scale decode is O(T·nb) —
+    // negligible beside the O(M·T·nb) GEMM — so it is realistically amortized; time only the
+    // row loop to isolate the inner-kernel win.
+    std::vector<float> xsd(static_cast<std::size_t>(T * nb));
+    decode_q8_block_scales(Xq.data(), xsd.data(), T * nb);
+    auto f_hoist = [&] {
+        for (int64_t m = 0; m < M; ++m)
+            gemm_row_q8_0(Wq.data() + m * nb, Xq.data(), xsd.data(), Y.data() + m * T, nb, T);
+    };
+
     const double tc = time_it(reps, f_cols);
     const double tb = time_it(reps, f_batch);
+    const double th = time_it(reps, f_hoist);
     const double gf = 2.0 * static_cast<double>(M) * static_cast<double>(K) * static_cast<double>(T) * reps / 1e9;
     std::printf("\n%s  (M=%lld K=%lld T=%lld, %d reps)\n", label,
                 static_cast<long long>(M), static_cast<long long>(K), static_cast<long long>(T), reps);
     std::printf("  per-column GEMVs (W re-streamed): %7.2f GFLOP/s\n", gf / tc);
     std::printf("  batched matmul   (W reused/tile): %7.2f GFLOP/s   %.2fx\n", gf / tb, tc / tb);
+    std::printf("  + hoisted act-scale decode:       %7.2f GFLOP/s   %.2fx vs batched\n",
+                gf / th, tb / th);
 }
 
 } // namespace

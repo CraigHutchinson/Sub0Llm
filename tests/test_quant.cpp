@@ -200,8 +200,8 @@ TEST_CASE("argmax_f32 matches std max element first-occurrence", "[quant][simd]"
     REQUIRE(argmax_f32(t.data(), 5) == 1);
 }
 
-// gemm_row_q8_0 (4-column register-blocked prefill kernel) must equal T independent
-// dot_q8_0_q8_0 calls — the tiling only reorders weight-side work, not the math.
+// gemm_row_q8_0 (8-column register-blocked prefill kernel, 4-col + scalar tail) must equal
+// T independent dot_q8_0_q8_0 calls — the tiling only reorders weight-side work, not the math.
 TEST_CASE("gemm_row_q8_0 matches per-column dot_q8_0_q8_0", "[quant][gemm]") {
     const int64_t K = 256, nb = K / QK8_0;
     for (int64_t T : {1, 3, 4, 5, 8, 13}) {
@@ -221,5 +221,14 @@ TEST_CASE("gemm_row_q8_0 matches per-column dot_q8_0_q8_0", "[quant][gemm]") {
             REQUIRE_THAT(tiled[static_cast<std::size_t>(t)],
                          Catch::Matchers::WithinAbs(ref, 1e-3f));
         }
+
+        // Hoisted-scale overload must be BITWISE-identical: it only moves the f16→f32 scale
+        // decode out of the inner loop, the float scale value is unchanged.
+        std::vector<float> xsd(static_cast<std::size_t>(T * nb));
+        decode_q8_block_scales(Xq.data(), xsd.data(), T * nb);
+        std::vector<float> tiled_h(static_cast<std::size_t>(T));
+        gemm_row_q8_0(w.data(), Xq.data(), xsd.data(), tiled_h.data(), nb, T);
+        for (int64_t t = 0; t < T; ++t)
+            REQUIRE(tiled_h[static_cast<std::size_t>(t)] == tiled[static_cast<std::size_t>(t)]);
     }
 }

@@ -310,23 +310,58 @@ static inline __m256i q8_block_dot(__m256i ax, __m256i sy) noexcept {
     return _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1));
 #  endif
 }
-// Accumulate one activation block `xb` into a column's float accumulator, given the
-// weight block already decoded once (va = raw weight, ax = |va|, wd = f16 weight scale).
-static inline __m256 q8_accum_col(const BlockQ8_0& xb, __m256i va, __m256i ax, float wd,
+// Accumulate one activation block `xb` into a column's float accumulator. `scale` is the
+// already-combined block scale (weight_d × activation_d); the caller decodes the weight
+// block once (va = raw weight, ax = |va|) and supplies the per-(column,block) scale.
+static inline __m256 q8_accum_col(const BlockQ8_0& xb, __m256i va, __m256i ax, float scale,
                                   __m256 facc) noexcept {
     const __m256i vb  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb.qs));
     const __m256i sy  = _mm256_sign_epi8(vb, va);
     const __m256i d32 = q8_block_dot(ax, sy);
-    const __m256  sc  = _mm256_set1_ps(wd * f16_fast(xb.d));
+    const __m256  sc  = _mm256_set1_ps(scale);
     return _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), sc, facc);
 }
-#endif
 
-void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
-                   int64_t nb, int64_t T) noexcept {
-#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+// Shared register-blocked body. `xscale(col, i)` returns the ACTIVATION scale for column
+// `col`, block `i`; the weight scale `wd` is decoded once per block and reused across the
+// 8/4 columns. Two callers differ only in `xscale`: the plain one decodes f16_fast(Xq.d)
+// inline; the prefill one reads a precomputed scale table (hoisting the f16 decode out of
+// the per-row inner loop). Both yield the identical float scale, so output is bitwise-equal.
+template <class XScale>
+static inline void gemm_row_blocked(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
+                                    int64_t nb, int64_t T, XScale xscale) noexcept {
     int64_t t = 0;
-    for (; t + 4 <= T; t += 4) {
+    // NC=8 column block: decode each weight block ONCE (va/|va|/scale) and reuse it across
+    // 8 activation columns — doubles the weight-decode amortization vs 4 and halves the
+    // passes over the (L1-resident) weight row. 8 accumulators + va + ax = 10 live ymm of 16.
+    for (; t + 8 <= T; t += 8) {
+        const BlockQ8_0* x0 = Xq + (t + 0) * nb; const BlockQ8_0* x1 = Xq + (t + 1) * nb;
+        const BlockQ8_0* x2 = Xq + (t + 2) * nb; const BlockQ8_0* x3 = Xq + (t + 3) * nb;
+        const BlockQ8_0* x4 = Xq + (t + 4) * nb; const BlockQ8_0* x5 = Xq + (t + 5) * nb;
+        const BlockQ8_0* x6 = Xq + (t + 6) * nb; const BlockQ8_0* x7 = Xq + (t + 7) * nb;
+        __m256 f0 = _mm256_setzero_ps(), f1 = _mm256_setzero_ps();
+        __m256 f2 = _mm256_setzero_ps(), f3 = _mm256_setzero_ps();
+        __m256 f4 = _mm256_setzero_ps(), f5 = _mm256_setzero_ps();
+        __m256 f6 = _mm256_setzero_ps(), f7 = _mm256_setzero_ps();
+        for (int64_t i = 0; i < nb; ++i) {
+            const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[i].qs));
+            const __m256i ax = _mm256_sign_epi8(va, va);   // |w|, computed ONCE per block
+            const float   wd = f16_fast(w[i].d);           // weight scale, decoded ONCE
+            f0 = q8_accum_col(x0[i], va, ax, wd * xscale(t + 0, i), f0);
+            f1 = q8_accum_col(x1[i], va, ax, wd * xscale(t + 1, i), f1);
+            f2 = q8_accum_col(x2[i], va, ax, wd * xscale(t + 2, i), f2);
+            f3 = q8_accum_col(x3[i], va, ax, wd * xscale(t + 3, i), f3);
+            f4 = q8_accum_col(x4[i], va, ax, wd * xscale(t + 4, i), f4);
+            f5 = q8_accum_col(x5[i], va, ax, wd * xscale(t + 5, i), f5);
+            f6 = q8_accum_col(x6[i], va, ax, wd * xscale(t + 6, i), f6);
+            f7 = q8_accum_col(x7[i], va, ax, wd * xscale(t + 7, i), f7);
+        }
+        out[t + 0] = hsum_ps_avx(f0); out[t + 1] = hsum_ps_avx(f1);
+        out[t + 2] = hsum_ps_avx(f2); out[t + 3] = hsum_ps_avx(f3);
+        out[t + 4] = hsum_ps_avx(f4); out[t + 5] = hsum_ps_avx(f5);
+        out[t + 6] = hsum_ps_avx(f6); out[t + 7] = hsum_ps_avx(f7);
+    }
+    for (; t + 4 <= T; t += 4) {                              // 4-column tail
         const BlockQ8_0* x0 = Xq + (t + 0) * nb;
         const BlockQ8_0* x1 = Xq + (t + 1) * nb;
         const BlockQ8_0* x2 = Xq + (t + 2) * nb;
@@ -335,20 +370,43 @@ void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
         __m256 f2 = _mm256_setzero_ps(), f3 = _mm256_setzero_ps();
         for (int64_t i = 0; i < nb; ++i) {
             const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[i].qs));
-            const __m256i ax = _mm256_sign_epi8(va, va);   // |w|, computed ONCE per block
-            const float   wd = f16_fast(w[i].d);           // weight scale, decoded ONCE
-            f0 = q8_accum_col(x0[i], va, ax, wd, f0);
-            f1 = q8_accum_col(x1[i], va, ax, wd, f1);
-            f2 = q8_accum_col(x2[i], va, ax, wd, f2);
-            f3 = q8_accum_col(x3[i], va, ax, wd, f3);
+            const __m256i ax = _mm256_sign_epi8(va, va);
+            const float   wd = f16_fast(w[i].d);
+            f0 = q8_accum_col(x0[i], va, ax, wd * xscale(t + 0, i), f0);
+            f1 = q8_accum_col(x1[i], va, ax, wd * xscale(t + 1, i), f1);
+            f2 = q8_accum_col(x2[i], va, ax, wd * xscale(t + 2, i), f2);
+            f3 = q8_accum_col(x3[i], va, ax, wd * xscale(t + 3, i), f3);
         }
         out[t + 0] = hsum_ps_avx(f0); out[t + 1] = hsum_ps_avx(f1);
         out[t + 2] = hsum_ps_avx(f2); out[t + 3] = hsum_ps_avx(f3);
     }
     for (; t < T; ++t) out[t] = dot_q8_0_q8_0(w, Xq + t * nb, nb);   // <4 column remainder
+}
+#endif
+
+void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
+                   int64_t nb, int64_t T) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    gemm_row_blocked(w, Xq, out, nb, T,
+                     [&](int64_t c, int64_t i) { return f16_fast(Xq[c * nb + i].d); });
 #else
     for (int64_t t = 0; t < T; ++t) out[t] = dot_q8_0_q8_0(w, Xq + t * nb, nb);
 #endif
+}
+
+void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, const float* xsd,
+                   float* out, int64_t nb, int64_t T) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    gemm_row_blocked(w, Xq, out, nb, T,
+                     [&](int64_t c, int64_t i) { return xsd[c * nb + i]; });
+#else
+    (void)xsd;
+    for (int64_t t = 0; t < T; ++t) out[t] = dot_q8_0_q8_0(w, Xq + t * nb, nb);
+#endif
+}
+
+void decode_q8_block_scales(const BlockQ8_0* X, float* scales, int64_t count) noexcept {
+    for (int64_t i = 0; i < count; ++i) scales[i] = f16_fast(X[i].d);
 }
 
 void matmul_q8_0_q8_0(const BlockQ8_0* W, const BlockQ8_0* Xq, float* Y,

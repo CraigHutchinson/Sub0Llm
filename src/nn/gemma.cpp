@@ -314,12 +314,17 @@ void pmatmul(const std::vector<cpu::BlockQ8_0>& W, const cpu::BlockQ8_0* Xq, flo
              int64_t M, int64_t K, int64_t T) {
     const int64_t nb = K / QK;
     const cpu::BlockQ8_0* Wp = W.data();
-    // Each weight row is 4-column register-blocked across the T tokens (gemm_row_q8_0):
-    // the per-block weight decode (|w| + f16 scale) is done once and reused across 4
-    // columns, turning the compute-bound prefill GEMM from per-column GEMVs into a tiled
-    // matmul. Parallel over the M output rows.
+    // Each weight row is 8-column register-blocked across the T tokens (gemm_row_q8_0): the
+    // per-block weight decode (|w| + f16 scale) is done once and reused across 8 columns,
+    // turning the compute-bound prefill GEMM from per-column GEMVs into a tiled matmul.
+    // The activation block scales are f16→f32 decoded ONCE here (not redone per weight row)
+    // and shared read-only across all M rows. Parallel over the M output rows.
+    thread_local std::vector<float> xsd;
+    xsd.resize(static_cast<std::size_t>(T * nb));
+    cpu::decode_q8_block_scales(Xq, xsd.data(), T * nb);
+    const float* xs = xsd.data();
     parallel_for(M, [&](int64_t m) {
-        cpu::gemm_row_q8_0(Wp + m * nb, Xq, Y + m * T, nb, T);
+        cpu::gemm_row_q8_0(Wp + m * nb, Xq, xs, Y + m * T, nb, T);
     });
 }
 

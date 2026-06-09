@@ -96,4 +96,16 @@ void matmul_q8_0_q8_0(const BlockQ8_0* W, const BlockQ8_0* Xq, float* Y,
 void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
                    int64_t nb, int64_t T) noexcept;
 
+// As above, but with the T·nb activation block scales pre-decoded (xsd[col*nb + i] =
+// f16_fast(Xq[col*nb + i].d), via decode_q8_block_scales). The per-(column,block) f16→f32
+// decode is otherwise redone for every one of the M weight rows; hoisting it out — decode
+// once per matmul, reuse across rows — removes that redundant work from the inner loop.
+// Bitwise-identical to the inline-decode overload (same scale values).
+void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, const float* xsd,
+                   float* out, int64_t nb, int64_t T) noexcept;
+
+// Decode `count` Q8 block scales (f16 → f32) into `scales`. Call once per prefill matmul to
+// feed the hoisted gemm_row_q8_0; `count` is T·(K/QK8_0) for a T-column activation tile.
+void decode_q8_block_scales(const BlockQ8_0* X, float* scales, int64_t count) noexcept;
+
 } // namespace sub0llm::backend::cpu
