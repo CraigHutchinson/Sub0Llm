@@ -253,11 +253,12 @@ void pmatmul(const std::vector<cpu::BlockQ8_0>& W, const cpu::BlockQ8_0* Xq, flo
              int64_t M, int64_t K, int64_t T) {
     const int64_t nb = K / QK;
     const cpu::BlockQ8_0* Wp = W.data();
+    // Each weight row is 4-column register-blocked across the T tokens (gemm_row_q8_0):
+    // the per-block weight decode (|w| + f16 scale) is done once and reused across 4
+    // columns, turning the compute-bound prefill GEMM from per-column GEMVs into a tiled
+    // matmul. Parallel over the M output rows.
     parallel_for(M, [&](int64_t m) {
-        const cpu::BlockQ8_0* wr = Wp + m * nb;
-        float* yr = Y + m * T;
-        for (int64_t t = 0; t < T; ++t)
-            yr[t] = cpu::dot_q8_0_q8_0(wr, Xq + t * nb, nb);
+        cpu::gemm_row_q8_0(Wp + m * nb, Xq, Y + m * T, nb, T);
     });
 }
 

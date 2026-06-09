@@ -300,18 +300,65 @@ void matvec_q8_0_q8_0(const BlockQ8_0* W, const float* x, float* y,
         y[m] = dot_q8_0_q8_0(W + m * nb, xq, nb);
 }
 
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+// int8 block dot → 8 int32 lane-partials (VNNI vpdpbusd, else maddubs+madd). `ax` is the
+// unsigned |weight| block; `sy` the activation block with the weight's sign folded in.
+static inline __m256i q8_block_dot(__m256i ax, __m256i sy) noexcept {
+#  if SUB0LLM_HAVE_VNNI
+    return SUB0LLM_DPBUSD(_mm256_setzero_si256(), ax, sy);
+#  else
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1));
+#  endif
+}
+// Accumulate one activation block `xb` into a column's float accumulator, given the
+// weight block already decoded once (va = raw weight, ax = |va|, wd = f16 weight scale).
+static inline __m256 q8_accum_col(const BlockQ8_0& xb, __m256i va, __m256i ax, float wd,
+                                  __m256 facc) noexcept {
+    const __m256i vb  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb.qs));
+    const __m256i sy  = _mm256_sign_epi8(vb, va);
+    const __m256i d32 = q8_block_dot(ax, sy);
+    const __m256  sc  = _mm256_set1_ps(wd * f16_fast(xb.d));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), sc, facc);
+}
+#endif
+
+void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
+                   int64_t nb, int64_t T) noexcept {
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    int64_t t = 0;
+    for (; t + 4 <= T; t += 4) {
+        const BlockQ8_0* x0 = Xq + (t + 0) * nb;
+        const BlockQ8_0* x1 = Xq + (t + 1) * nb;
+        const BlockQ8_0* x2 = Xq + (t + 2) * nb;
+        const BlockQ8_0* x3 = Xq + (t + 3) * nb;
+        __m256 f0 = _mm256_setzero_ps(), f1 = _mm256_setzero_ps();
+        __m256 f2 = _mm256_setzero_ps(), f3 = _mm256_setzero_ps();
+        for (int64_t i = 0; i < nb; ++i) {
+            const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[i].qs));
+            const __m256i ax = _mm256_sign_epi8(va, va);   // |w|, computed ONCE per block
+            const float   wd = f16_fast(w[i].d);           // weight scale, decoded ONCE
+            f0 = q8_accum_col(x0[i], va, ax, wd, f0);
+            f1 = q8_accum_col(x1[i], va, ax, wd, f1);
+            f2 = q8_accum_col(x2[i], va, ax, wd, f2);
+            f3 = q8_accum_col(x3[i], va, ax, wd, f3);
+        }
+        out[t + 0] = hsum_ps_avx(f0); out[t + 1] = hsum_ps_avx(f1);
+        out[t + 2] = hsum_ps_avx(f2); out[t + 3] = hsum_ps_avx(f3);
+    }
+    for (; t < T; ++t) out[t] = dot_q8_0_q8_0(w, Xq + t * nb, nb);   // <4 column remainder
+#else
+    for (int64_t t = 0; t < T; ++t) out[t] = dot_q8_0_q8_0(w, Xq + t * nb, nb);
+#endif
+}
+
 void matmul_q8_0_q8_0(const BlockQ8_0* W, const BlockQ8_0* Xq, float* Y,
                       int64_t M, int64_t K, int64_t T) noexcept {
     const int64_t nb = K / QK8_0;
-    // Rows outer, columns inner: W + m*nb is loaded once and reused for all T columns
-    // (it stays resident in L1/L2 across the inner loop), so W is streamed from RAM a
-    // single time instead of once per column.
-    for (int64_t m = 0; m < M; ++m) {
-        const BlockQ8_0* wr = W + m * nb;
-        float* yr = Y + m * T;
-        for (int64_t t = 0; t < T; ++t)
-            yr[t] = dot_q8_0_q8_0(wr, Xq + t * nb, nb);
-    }
+    // Rows outer: each weight row is streamed from RAM once and 4-column-blocked across
+    // the T activation columns (gemm_row_q8_0), so the per-block weight decode (|w| +
+    // f16 scale) is amortized 4× — the compute-bound prefill win over per-column GEMVs.
+    for (int64_t m = 0; m < M; ++m)
+        gemm_row_q8_0(W + m * nb, Xq, Y + m * T, nb, T);
 }
 
 // ── f32 reduction / BLAS-ish primitives ────────────────────────────────────────

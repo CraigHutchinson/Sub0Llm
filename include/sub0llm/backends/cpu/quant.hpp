@@ -88,4 +88,12 @@ void matvec_q8_0_q8_0(const BlockQ8_0* W, const float* x, float* y,
 void matmul_q8_0_q8_0(const BlockQ8_0* W, const BlockQ8_0* Xq, float* Y,
                       int64_t M, int64_t K, int64_t T) noexcept;
 
+// ONE weight row (nb = K/QK8_0 blocks) · T activation columns (Xq is T×nb row-major,
+// each column contiguous), writing out[0..T). Register-blocks 4 columns at a time so each
+// weight block is loaded, |w|-folded, and f16-scale-decoded ONCE and reused across the 4
+// columns (vs a per-column GEMV that redoes that weight-side work T times) — the
+// compute-bound prefill-GEMM win. Callers parallelize over the M weight rows.
+void gemm_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* Xq, float* out,
+                   int64_t nb, int64_t T) noexcept;
+
 } // namespace sub0llm::backend::cpu

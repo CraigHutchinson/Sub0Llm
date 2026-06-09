@@ -199,3 +199,27 @@ TEST_CASE("argmax_f32 matches std max element first-occurrence", "[quant][simd]"
     std::vector<float> t{1.0f, 3.0f, 3.0f, 2.0f, 3.0f};
     REQUIRE(argmax_f32(t.data(), 5) == 1);
 }
+
+// gemm_row_q8_0 (4-column register-blocked prefill kernel) must equal T independent
+// dot_q8_0_q8_0 calls — the tiling only reorders weight-side work, not the math.
+TEST_CASE("gemm_row_q8_0 matches per-column dot_q8_0_q8_0", "[quant][gemm]") {
+    const int64_t K = 256, nb = K / QK8_0;
+    for (int64_t T : {1, 3, 4, 5, 8, 13}) {
+        const auto wf = make_vec(K, 21, 2.0f);
+        std::vector<BlockQ8_0> w(static_cast<std::size_t>(nb));
+        quantize_row_q8_0(wf.data(), w.data(), K);
+
+        std::vector<BlockQ8_0> Xq(static_cast<std::size_t>(T * nb));
+        for (int64_t t = 0; t < T; ++t) {
+            const auto xf = make_vec(K, static_cast<uint32_t>(100 + t), 1.5f);
+            quantize_row_q8_0(xf.data(), Xq.data() + t * nb, K);
+        }
+        std::vector<float> tiled(static_cast<std::size_t>(T));
+        gemm_row_q8_0(w.data(), Xq.data(), tiled.data(), nb, T);
+        for (int64_t t = 0; t < T; ++t) {
+            const float ref = dot_q8_0_q8_0(w.data(), Xq.data() + t * nb, nb);
+            REQUIRE_THAT(tiled[static_cast<std::size_t>(t)],
+                         Catch::Matchers::WithinAbs(ref, 1e-3f));
+        }
+    }
+}
