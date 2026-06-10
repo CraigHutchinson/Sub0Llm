@@ -103,6 +103,32 @@ __global__ void matmul_q8_0_kernel(const BlockQ8_0* __restrict__ W,
     Y[static_cast<long long>(m) * T + t] = acc;
 }
 
+// T=1 Q8 GEMV (decode): one WARP per output row, lanes stream the row's nb blocks cooperatively
+// (coalesced — adjacent lanes read adjacent blocks), int8 dot via __dp4a, warp-reduce the partials.
+// Replaces the one-thread-per-output kernel for T=1, which read each weight row serially (poor
+// coalescing, GPU under-utilized) — this saturates VRAM bandwidth, the point of GPU-resident layers.
+__global__ void matmul_q8_0_gemv_kernel(const BlockQ8_0* __restrict__ W,
+                                        const BlockQ8_0* __restrict__ X,
+                                        float* __restrict__ Y, int M, int nb) {
+    const int m = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // global warp id = output row
+    const int lane = threadIdx.x & 31;
+    if (m >= M) return;
+    const BlockQ8_0* wrow = W + static_cast<long long>(m) * nb;
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const BlockQ8_0& wb = wrow[b];
+        const BlockQ8_0& xb = X[b];
+        int idot = 0;
+        #pragma unroll
+        for (int j = 0; j < QK; j += 4) idot = __dp4a(pack4_s8(wb.qs + j), pack4_s8(xb.qs + j), idot);
+        acc += __half2float(__ushort_as_half(wb.d)) * __half2float(__ushort_as_half(xb.d))
+             * static_cast<float>(idot);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) Y[m] = acc;
+}
+
 // IMMA (int8 tensor-core) Q8 matmul. One warp computes a 16×16 output tile. Q8_0's per-32
 // scale fights the tensor core (which wants uniform-scale K-accumulation), so we run ONE
 // 16×16×16 MMA pair per Q8 block (= 32 K-elems → two K=16 steps) into an int32 fragment,
@@ -401,6 +427,12 @@ void launch_matmul_f32(const float* A, const float* B, float* C,
 
 void launch_matmul_q8_0(const BlockQ8_0* dW, const BlockQ8_0* dXq, float* dY,
                         int M, int K, int T) {
+    if (T == 1) {                                  // decode GEMV: one warp per output row
+        constexpr int B = 128;                     // 4 warps/block → 4 rows per block
+        const int blocks = grid(static_cast<std::size_t>(M) * 32, B);
+        matmul_q8_0_gemv_kernel<<<blocks, B>>>(dW, dXq, dY, M, K / QK);
+        return;
+    }
     const dim3 block(16, 16);
     const dim3 grid2(grid(static_cast<std::size_t>(T), block.x),
                      grid(static_cast<std::size_t>(M), block.y));
