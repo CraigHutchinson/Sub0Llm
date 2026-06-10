@@ -85,5 +85,20 @@ void launch_store_kv(const float* kcur, const float* vcur, float* kcD, float* vc
 void launch_flash_attn_decode_heads(const float* q, const float* kcD, const float* vcD, float* out,
                                     int n_head, int dh, int kvlen, int kv_lo, int group, int max_pos);
 
+// ── q8 KV cache variants (long context: halve KV memory + bandwidth) ────────────────────────
+// Quantize n_kv K/V head-vectors to Q8_0 and scatter into the Q8 KV cache slot for `pos`
+// (cache layout [kv_head][max_pos][dh/32] blocks). One warp per Q8 block.
+void launch_store_kv_q8(const float* kcur, const float* vcur,
+                        ::sub0llm::backend::cpu::BlockQ8_0* kcD,
+                        ::sub0llm::backend::cpu::BlockQ8_0* vcD,
+                        int n_kv, int dh, int max_pos, int pos);
+
+// Flash decode reading a Q8 KV cache (dequantize K/V on the fly via each block's f16 scale).
+void launch_flash_attn_decode_heads_q8(const float* q,
+                                       const ::sub0llm::backend::cpu::BlockQ8_0* kcD,
+                                       const ::sub0llm::backend::cpu::BlockQ8_0* vcD,
+                                       float* out, int n_head, int dh, int kvlen, int kv_lo,
+                                       int group, int max_pos);
+
 } // namespace sub0llm::backend::cuda::kernels
 #endif // SUB0LLM_CUDA

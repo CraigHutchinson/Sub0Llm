@@ -403,6 +403,80 @@ __global__ void flash_attn_decode_heads_kernel(const float* __restrict__ q, cons
     for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
 }
 
+// ── q8 KV cache variants ────────────────────────────────────────────────────────────────────
+// Quantize K/V head-vectors and scatter into the Q8 KV cache slot for `pos`. One warp per block;
+// warp w covers a (head, block) of K (w < nKV·nbh) or V (w >= nKV·nbh). Mirrors quantize_row_q8_0.
+__global__ void store_kv_q8_kernel(const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                   BlockQ8_0* __restrict__ kcD, BlockQ8_0* __restrict__ vcD,
+                                   int nKV, int dh, int max_pos, int pos) {
+    const int nbh = dh / QK;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nKV * nbh * 2) return;
+    const bool isV = warp >= nKV * nbh;
+    const int w = isV ? warp - nKV * nbh : warp;
+    const int g = w / nbh, blk = w % nbh;
+    const float* src = (isV ? vcur : kcur) + static_cast<long long>(g) * dh + blk * QK;
+    BlockQ8_0* dst = (isV ? vcD : kcD) + (static_cast<long long>(g) * max_pos + pos) * nbh + blk;
+    const float v = src[lane];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const float d = a / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+    dst->qs[lane] = static_cast<signed char>(__float2int_rn(v * id));
+    if (lane == 0) dst->d = __half_as_ushort(__float2half(d));
+}
+
+// Flash decode reading a Q8 KV cache: dequantize K/V per element via the block's f16 scale.
+__global__ void flash_attn_decode_heads_q8_kernel(const float* __restrict__ q,
+                                                  const BlockQ8_0* __restrict__ kcD,
+                                                  const BlockQ8_0* __restrict__ vcD,
+                                                  float* __restrict__ out, int dh, int kvlen,
+                                                  int kv_lo, int group, int max_pos) {
+    const int hd = blockIdx.x, g = hd / group, nbh = dh / QK;
+    const float* qh = q + static_cast<long long>(hd) * dh;
+    const BlockQ8_0* K = kcD + (static_cast<long long>(g) * max_pos + kv_lo) * nbh;
+    const BlockQ8_0* V = vcD + (static_cast<long long>(g) * max_pos + kv_lo) * nbh;
+    float* oh = out + static_cast<long long>(hd) * dh;
+
+    extern __shared__ float sh[];
+    float* sq = sh;  float* sacc = sh + dh;  float* sred = sh + 2 * dh;
+    __shared__ float s_m, s_l, s_alpha, s_p;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) { sq[i] = qh[i]; sacc[i] = 0.0f; }
+    if (threadIdx.x == 0) { s_m = __int_as_float(0xff800000); s_l = 0.0f; }
+    __syncthreads();
+    for (int t = 0; t < kvlen; ++t) {
+        const BlockQ8_0* Kt = K + static_cast<long long>(t) * nbh;
+        float local = 0.0f;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) {
+            const BlockQ8_0& b = Kt[i >> 5];
+            local += sq[i] * __half2float(__ushort_as_half(b.d)) * static_cast<float>(b.qs[i & 31]);
+        }
+        sred[threadIdx.x] = local;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = sred[0];
+            const float m_new = fmaxf(s_m, score);
+            s_alpha = expf(s_m - m_new);  s_p = expf(score - m_new);
+            s_l = s_l * s_alpha + s_p;    s_m = m_new;
+        }
+        __syncthreads();
+        const BlockQ8_0* Vt = V + static_cast<long long>(t) * nbh;
+        const float alpha = s_alpha, p = s_p;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) {
+            const BlockQ8_0& b = Vt[i >> 5];
+            sacc[i] = sacc[i] * alpha + p * __half2float(__ushort_as_half(b.d)) * static_cast<float>(b.qs[i & 31]);
+        }
+        __syncthreads();
+    }
+    const float invl = 1.0f / s_l;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -502,6 +576,21 @@ void launch_flash_attn_decode_heads(const float* q, const float* kcD, const floa
     constexpr int B = 128;
     const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
     flash_attn_decode_heads_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
+}
+
+void launch_store_kv_q8(const float* kcur, const float* vcur, BlockQ8_0* kcD, BlockQ8_0* vcD,
+                        int n_kv, int dh, int max_pos, int pos) {
+    constexpr int B = 256;                                  // 8 warps/block
+    const std::size_t total = static_cast<std::size_t>(n_kv) * (dh / QK) * 2 * 32;
+    store_kv_q8_kernel<<<grid(total, B), B>>>(kcur, vcur, kcD, vcD, n_kv, dh, max_pos, pos);
+}
+
+void launch_flash_attn_decode_heads_q8(const float* q, const BlockQ8_0* kcD, const BlockQ8_0* vcD,
+                                       float* out, int n_head, int dh, int kvlen, int kv_lo,
+                                       int group, int max_pos) {
+    constexpr int B = 128;
+    const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
+    flash_attn_decode_heads_q8_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

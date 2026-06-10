@@ -782,7 +782,7 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
 }
 
 // ── Hybrid GPU/CPU decode (Ch27) ──────────────────────────────────────────────────────────
-void GemmaModel::enable_gpu_layers(int k_gpu, int64_t max_pos) {
+void GemmaModel::enable_gpu_layers(int k_gpu, int64_t max_pos, bool kv_q8) {
     n_gpu_layers_ = std::clamp(k_gpu, 0, static_cast<int>(layers_.size()));
     if (n_gpu_layers_ == 0) { gpu_.reset(); return; }
     std::vector<backend::cuda::GpuLayerDesc> descs;
@@ -802,7 +802,7 @@ void GemmaModel::enable_gpu_layers(int k_gpu, int64_t max_pos) {
         d.rope_freqs = (L.is_global && !rope_freqs_.empty()) ? rope_freqs_.data() : nullptr;
         descs.push_back(d);
     }
-    gpu_ = std::make_unique<backend::cuda::GemmaGpuLayers>(descs, static_cast<int>(max_pos));
+    gpu_ = std::make_unique<backend::cuda::GemmaGpuLayers>(descs, static_cast<int>(max_pos), kv_q8);
 }
 
 std::vector<float> GemmaModel::forward_one_hybrid(int32_t token, int64_t pos, GemmaKVCache& kv,

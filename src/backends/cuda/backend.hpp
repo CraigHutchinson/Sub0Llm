@@ -77,7 +77,10 @@ void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
 // kernels, same order. Construction throws if CUDA is not compiled in.
 class GemmaGpuLayers {
 public:
-    GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_pos);
+    // kv_q8: q8 KV cache (~3.8× less KV memory/bandwidth — long context) vs f32 (greedy-exact vs
+    // CPU). q8 is LOSSY (~1% per value) and shifts Gemma's scale=1.0 attention enough to change
+    // greedy tokens, so it is off by default (the parity-exact path).
+    GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_pos, bool kv_q8 = false);
     ~GemmaGpuLayers();
     GemmaGpuLayers(const GemmaGpuLayers&) = delete;
     GemmaGpuLayers& operator=(const GemmaGpuLayers&) = delete;

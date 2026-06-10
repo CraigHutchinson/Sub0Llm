@@ -60,6 +60,7 @@ struct Args {
     std::string cores = "auto";   // auto | all | P | E | "lo-hi" | "a,b,c" (pin policy)
     int         repeat = 5;       // --mode bench: interleaved A/B rounds
     int         gpu_layers = 0;   // --mode hybrid*: first N layers run on the GPU
+    bool        q8_kv = false;    // --q8-kv: q8 KV cache on the GPU layers (long context; lossy)
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
     bool        no_fuse = false;  // disable Q/K/V + gate/up GEMV fusion
@@ -83,6 +84,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--cores")        a.cores = next();
         else if (s == "--repeat")       a.repeat = std::stoi(next());
         else if (s == "--gpu-layers")   a.gpu_layers = std::stoi(next());
+        else if (s == "--q8-kv")        a.q8_kv = true;
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
         else if (s == "--no-fuse")      a.no_fuse = true;
@@ -367,7 +369,7 @@ int main(int argc, char** argv) {
             const int64_t total = prompt_len + args.max_tokens + 1;
 
             auto greedy = [&](bool hybrid) {
-                if (hybrid) model.enable_gpu_layers(k, total);
+                if (hybrid) model.enable_gpu_layers(k, total, args.q8_kv);
                 auto kv = model.make_cache(total);
                 std::vector<int32_t> gen;  std::vector<float> logits;  int64_t pos = 0;
                 const auto fwd = [&](int32_t tok, bool want_logits) {

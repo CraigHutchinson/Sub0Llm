@@ -214,7 +214,7 @@ struct DevScratch {
 // No host transfers, no sync — the caller owns those. Shared by the validation entry point and
 // the resident GemmaGpuLayers path so the kernel sequence is defined once.
 void run_gpu_layer(const DevLayer& L, const float* x_dev, float* out_dev,
-                   float* kcD, float* vcD, int max_pos, int pos, const DevScratch& s) {
+                   bool kv_q8, void* kcD, void* vcD, int max_pos, int pos, const DevScratch& s) {
     const int D = L.D, dff = L.d_ff, dh = L.dh, nH = L.n_head, nKV = L.n_kv_head;
     const int qM = nH * dh, kvM = nKV * dh, group = nH / nKV;
     const int nbD = D / 32, nbQM = qM / 32, nbFF = dff / 32;
@@ -236,11 +236,20 @@ void run_gpu_layer(const DevLayer& L, const float* x_dev, float* out_dev,
     kernels::launch_rmsnorm_heads(s.kcur, L.k_norm, s.kcur, nKV, dh, eps);
     kernels::launch_rope_heads(s.kcur, s.kcur, nKV, dh, pos, base, L.rope_freqs);
     kernels::launch_rmsnorm_heads(s.vcur, nullptr, s.vcur, nKV, dh, eps);
-    kernels::launch_store_kv(s.kcur, s.vcur, kcD, vcD, nKV, dh, max_pos, pos);
 
     const int kv_lo = L.window > 0 ? std::max(0, pos - L.window + 1) : 0;
     const int kvlen = pos - kv_lo + 1;
-    kernels::launch_flash_attn_decode_heads(s.q, kcD, vcD, s.ac, nH, dh, kvlen, kv_lo, group, max_pos);
+    if (kv_q8) {
+        auto* kc = static_cast<cpu::BlockQ8_0*>(kcD);
+        auto* vc = static_cast<cpu::BlockQ8_0*>(vcD);
+        kernels::launch_store_kv_q8(s.kcur, s.vcur, kc, vc, nKV, dh, max_pos, pos);
+        kernels::launch_flash_attn_decode_heads_q8(s.q, kc, vc, s.ac, nH, dh, kvlen, kv_lo, group, max_pos);
+    } else {
+        auto* kc = static_cast<float*>(kcD);
+        auto* vc = static_cast<float*>(vcD);
+        kernels::launch_store_kv(s.kcur, s.vcur, kc, vc, nKV, dh, max_pos, pos);
+        kernels::launch_flash_attn_decode_heads(s.q, kc, vc, s.ac, nH, dh, kvlen, kv_lo, group, max_pos);
+    }
     kernels::launch_quantize_q8(s.ac, s.acq, nbQM);
     kernels::launch_matmul_q8_0(L.wo, s.acq, s.ao, D, qM, 1);
     kernels::launch_rmsnorm(s.ao, L.post_attn_norm, s.ao, D, eps);
@@ -382,7 +391,7 @@ void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
     float* vcD  = up(vcache, kvElems);
     pool.emplace_back(FB(D));  float* dout = static_cast<float*>(pool.back().p);
 
-    run_gpu_layer(dl, dx, dout, kcD, vcD, max_pos, pos, s);
+    run_gpu_layer(dl, dx, dout, /*kv_q8=*/false, kcD, vcD, max_pos, pos, s);
 
     ck(cudaDeviceSynchronize(), "gemma layer sync");
     ck(cudaMemcpy(out, dout, FB(D), cudaMemcpyDeviceToHost), "D2H out");
@@ -392,18 +401,19 @@ void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
 
 // ── Persistent device-resident layers ───────────────────────────────────────────────────────
 struct GemmaGpuLayers::Impl {
-    std::vector<DevBuf> pool;            // owns all weight/KV/scratch allocations
-    std::vector<DevLayer> layers;        // device pointers per layer
-    std::vector<float*> kcD, vcD;        // device KV cache per layer
-    DevScratch scratch{};                // shared across layers (sized for the widest)
-    float* curAct = nullptr;             // ping-pong activation buffers
+    std::vector<DevBuf> pool;               // owns all weight/KV/scratch allocations
+    std::vector<DevLayer> layers;           // device pointers per layer
+    std::vector<void*> kcD, vcD;            // KV cache per layer (f32* or BlockQ8_0* per kv_q8)
+    DevScratch scratch{};                   // shared across layers (sized for the widest)
+    float* curAct = nullptr;                // ping-pong activation buffers
     float* nxtAct = nullptr;
-    int D = 0, max_pos = 0;
+    int D = 0, max_pos = 0;  bool kv_q8 = false;
 };
 
-GemmaGpuLayers::GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_pos)
+GemmaGpuLayers::GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_pos, bool kv_q8)
     : impl_(std::make_unique<Impl>()) {
     impl_->max_pos = max_pos;
+    impl_->kv_q8 = kv_q8;
     impl_->D = layers.empty() ? 0 : layers.front().D;
     int maxD = 0, maxFF = 0, maxQM = 0, maxKVM = 0, maxKV = 0;
     for (const auto& L : layers) {
@@ -414,12 +424,14 @@ GemmaGpuLayers::GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_
         maxKV  = std::max(maxKV,  L.n_kv_head * max_pos * L.dh);
     }
     const auto FB = [](int n) { return static_cast<std::size_t>(n) * sizeof(float); };
+    const auto KVB = [](int blocks) { return static_cast<std::size_t>(blocks) * sizeof(cpu::BlockQ8_0); };
     for (const auto& L : layers) {
         impl_->layers.push_back(upload_layer(L, impl_->pool));
-        impl_->pool.emplace_back(FB(L.n_kv_head * max_pos * L.dh));
-        impl_->kcD.push_back(static_cast<float*>(impl_->pool.back().p));
-        impl_->pool.emplace_back(FB(L.n_kv_head * max_pos * L.dh));
-        impl_->vcD.push_back(static_cast<float*>(impl_->pool.back().p));
+        const int kvf32 = L.n_kv_head * max_pos * L.dh;          // f32 KV elements per layer
+        const int kvblk = L.n_kv_head * max_pos * (L.dh / 32);   // q8 KV: dh/32 blocks per (head,pos)
+        const std::size_t kvbytes = kv_q8 ? KVB(kvblk) : FB(kvf32);
+        impl_->pool.emplace_back(kvbytes);  impl_->kcD.push_back(impl_->pool.back().p);
+        impl_->pool.emplace_back(kvbytes);  impl_->vcD.push_back(impl_->pool.back().p);
     }
     (void)maxKV;
     impl_->scratch = alloc_scratch(maxD, maxFF, maxQM, maxKVM, impl_->pool);
@@ -435,7 +447,7 @@ void GemmaGpuLayers::decode(const float* x, int pos, float* out) {
     ck(cudaMemcpy(m.curAct, x, Db, cudaMemcpyHostToDevice), "H2D x");
     float* cur = m.curAct; float* nxt = m.nxtAct;
     for (std::size_t l = 0; l < m.layers.size(); ++l) {
-        run_gpu_layer(m.layers[l], cur, nxt, m.kcD[l], m.vcD[l], m.max_pos, pos, m.scratch);
+        run_gpu_layer(m.layers[l], cur, nxt, m.kv_q8, m.kcD[l], m.vcD[l], m.max_pos, pos, m.scratch);
         std::swap(cur, nxt);                 // layer output becomes next layer's input (on device)
     }
     ck(cudaDeviceSynchronize(), "gpu layers sync");
@@ -461,7 +473,7 @@ void gemma_layer_decode_dev(const GpuLayerDesc&, const float*, int, float*, floa
     throw std::runtime_error("CUDA backend not compiled in");
 }
 struct GemmaGpuLayers::Impl {};
-GemmaGpuLayers::GemmaGpuLayers(const std::vector<GpuLayerDesc>&, int) {
+GemmaGpuLayers::GemmaGpuLayers(const std::vector<GpuLayerDesc>&, int, bool) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 GemmaGpuLayers::~GemmaGpuLayers() = default;

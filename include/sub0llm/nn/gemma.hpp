@@ -128,7 +128,7 @@ public:
     // subsequent forward_one_hybrid calls; the remaining layers + head stay on the CPU. `max_pos`
     // sizes the device KV cache. Throws (from the CUDA backend) if CUDA is not compiled in. Call
     // once before the decode loop; k_gpu in [0, n_layers].
-    void enable_gpu_layers(int k_gpu, int64_t max_pos);
+    void enable_gpu_layers(int k_gpu, int64_t max_pos, bool kv_q8 = false);
     [[nodiscard]] int n_gpu_layers() const noexcept { return n_gpu_layers_; }
 
     // Like forward_one, but the first n_gpu_layers() layers run on the GPU (device KV cache) and
