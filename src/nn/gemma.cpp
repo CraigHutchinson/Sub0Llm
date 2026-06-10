@@ -330,17 +330,19 @@ void pmatmul(const std::vector<cpu::BlockQ8_0>& W, const cpu::BlockQ8_0* Xq, flo
 
 // Transpose an (M, T) row-major matrix to (T, M) row-major — used to turn a GEMM's
 // (out_features, token) output into per-token-contiguous rows for the per-head norm/RoPE.
+// Parallel over T so each thread writes one contiguous dst row (no false sharing); the
+// prefill caller has the whole pool idle here otherwise (serial Amdahl tax at high T).
 void transpose_mt(const float* src, float* dst, int64_t M, int64_t T) {
-    for (int64_t m = 0; m < M; ++m)
-        for (int64_t t = 0; t < T; ++t)
-            dst[t * M + m] = src[m * T + t];
+    parallel_for(T, [&](int64_t t) {
+        for (int64_t m = 0; m < M; ++m) dst[t * M + m] = src[m * T + t];
+    });
 }
 
-// Quantize T contiguous activation rows of width K (T, K) → (T, K/QK) Q8 blocks.
+// Quantize T contiguous activation rows of width K (T, K) → (T, K/QK) Q8 blocks. Parallel
+// over the independent rows — each thread owns a disjoint Xq span (bitwise-identical).
 void quantize_rows(const float* X, cpu::BlockQ8_0* Xq, int64_t T, int64_t K) {
     const int64_t nb = K / QK;
-    for (int64_t t = 0; t < T; ++t)
-        cpu::quantize_row_q8_0(X + t * K, Xq + t * nb, K);
+    parallel_for(T, [&](int64_t t) { cpu::quantize_row_q8_0(X + t * K, Xq + t * nb, K); });
 }
 
 // Plain RMSNorm matching ggml: y = x/sqrt(mean(x^2)+eps) * w. The Gemma (1+weight)
@@ -643,13 +645,13 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
     const int64_t D = D_, nbD = D / QK, dff = d_ff_;
     const auto Z = [](int64_t n) { return static_cast<std::size_t>(n); };
 
-    // X (T, D): embed lookup + ×sqrt(D) scale.
+    // X (T, D): embed lookup + ×sqrt(D) scale. Parallel over tokens (independent rows).
     std::vector<float> X(Z(T * D));
-    for (int64_t t = 0; t < T; ++t) {
+    parallel_for(T, [&](int64_t t) {
         cpu::dequantize_row_q8_0(
             token_embd_.data() + Z(tokens[t]) * Z(nbD), X.data() + t * D, D);
         for (int64_t i = 0; i < D; ++i) X[Z(t * D + i)] *= embed_scale_;
-    }
+    });
 
     std::vector<float>           H(Z(T * D));            // norm output (reused attn/ffn)
     std::vector<cpu::BlockQ8_0>  Hq(Z(T * nbD));         // quantized H
@@ -663,8 +665,9 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
         const float* ff = L.is_global && !rope_freqs_.empty() ? rope_freqs_.data() : nullptr;
 
         // ── attention ───────────────────────────────────────────────────────────
-        for (int64_t t = 0; t < T; ++t)
+        parallel_for(T, [&](int64_t t) {
             rmsnorm(X.data() + t * D, L.attn_norm.data(), H.data() + t * D, D, eps_);
+        });
         quantize_rows(H.data(), Hq.data(), T, D);
 
         std::vector<float> Qmt(Z(qM * T)), Kmt(Z(kvM * T)), Vmt;
@@ -730,21 +733,26 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
         std::vector<float> AOmt(Z(D * T)), AO(Z(T * D));
         pmatmul(L.wo, ACq.data(), AOmt.data(), D, qM, T);
         transpose_mt(AOmt.data(), AO.data(), D, T);
-        for (int64_t t = 0; t < T; ++t) {
+        parallel_for(T, [&](int64_t t) {
             float* ao = AO.data() + t * D;
             rmsnorm(ao, L.post_attn_norm.data(), ao, D, eps_);
             for (int64_t i = 0; i < D; ++i) attn_out[Z(t * D + i)] = X[Z(t * D + i)] + ao[i];
-        }
+        });
 
         // ── FFN (GeGLU), batched ──────────────────────────────────────────────────
-        for (int64_t t = 0; t < T; ++t)
+        parallel_for(T, [&](int64_t t) {
             rmsnorm(attn_out.data() + t * D, L.ffn_norm.data(), H.data() + t * D, D, eps_);
+        });
         quantize_rows(H.data(), Hq.data(), T, D);
         std::vector<float> Gmt(Z(dff * T)), Umt(Z(dff * T));
         pmatmul(L.gate, Hq.data(), Gmt.data(), dff, D, T);
         pmatmul(L.up,   Hq.data(), Umt.data(), dff, D, T);
-        cpu::gelu_f32(Gmt.data(), Gmt.data(), Z(dff * T));
-        for (std::size_t i = 0; i < Gmt.size(); ++i) Gmt[i] *= Umt[i];   // GeGLU gate ⊙ up
+        // GeGLU: gelu(gate) ⊙ up, fused per token (each thread owns a disjoint dff slice).
+        parallel_for(T, [&](int64_t t) {
+            const std::size_t o = Z(t * dff);
+            cpu::gelu_f32(Gmt.data() + o, Gmt.data() + o, Z(dff));
+            for (int64_t i = 0; i < dff; ++i) Gmt[o + Z(i)] *= Umt[o + Z(i)];
+        });
         std::vector<float> Gtt(Z(T * dff));
         transpose_mt(Gmt.data(), Gtt.data(), dff, T);
         std::vector<cpu::BlockQ8_0> Gq(Z(T * (dff / QK)));
@@ -752,12 +760,12 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
         std::vector<float> FFmt(Z(D * T)), FF(Z(T * D));
         pmatmul(L.down, Gq.data(), FFmt.data(), D, dff, T);
         transpose_mt(FFmt.data(), FF.data(), D, T);
-        for (int64_t t = 0; t < T; ++t) {
+        parallel_for(T, [&](int64_t t) {
             float* fo = FF.data() + t * D;
             rmsnorm(fo, L.post_ffw_norm.data(), fo, D, eps_);
             for (int64_t i = 0; i < D; ++i)
                 X[Z(t * D + i)] = (attn_out[Z(t * D + i)] + fo[i]) * L.out_scale;
-        }
+        });
     }
     kv.len = start_pos + T;
 
