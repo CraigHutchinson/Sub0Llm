@@ -61,6 +61,7 @@ struct Args {
     int         repeat = 5;       // --mode bench: interleaved A/B rounds
     int         gpu_layers = 0;   // --mode hybrid*: first N layers run on the GPU
     bool        q8_kv = false;    // --q8-kv: q8 KV cache on the GPU layers (long context; lossy)
+    int64_t     ctx = 0;          // --ctx N: KV-cache capacity (positions); 0 = prompt+max_tokens+1
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
     bool        no_fuse = false;  // disable Q/K/V + gate/up GEMV fusion
@@ -85,6 +86,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--repeat")       a.repeat = std::stoi(next());
         else if (s == "--gpu-layers")   a.gpu_layers = std::stoi(next());
         else if (s == "--q8-kv")        a.q8_kv = true;
+        else if (s == "--ctx")          a.ctx = std::stoll(next());
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
         else if (s == "--no-fuse")      a.no_fuse = true;
@@ -366,7 +368,9 @@ int main(int argc, char** argv) {
             // the GPU, rest on CPU) — and report whether the GREEDY token sequences match. Both use
             // the token-by-token path so they are directly comparable (no batched-prefill skew).
             const int k = args.gpu_layers;
-            const int64_t total = prompt_len + args.max_tokens + 1;
+            // KV-cache capacity: --ctx sizes it independently of the token count, so we can measure
+            // the VRAM pressure (and q8-vs-f32 fit) of a realistic context without generating it.
+            const int64_t total = std::max<int64_t>(args.ctx, prompt_len + args.max_tokens + 1);
 
             auto greedy = [&](bool hybrid) {
                 if (hybrid) model.enable_gpu_layers(k, total, args.q8_kv);
