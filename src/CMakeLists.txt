@@ -45,8 +45,13 @@ set(SUB0LLM_SOURCES
 # CUDA .cu files must be listed separately so CMake uses nvcc for them.
 if(SUB0LLM_ENABLE_CUDA)
     list(APPEND SUB0LLM_SOURCES backends/cuda/kernels.cu)
+    # Whole-program (non-RDC) compilation: these kernels make no cross-translation-unit
+    # device calls, so relocatable device code is unnecessary — and the device-link step it
+    # triggers injects bare cudadevrt.lib/cudart.lib as positional args that the clang++ link
+    # driver can't resolve (it opens them as files). OFF keeps cudart linkage explicit via
+    # CUDA::cudart and avoids that.
     set_source_files_properties(backends/cuda/kernels.cu
-        PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 
 add_library(sub0llm STATIC ${SUB0LLM_SOURCES})

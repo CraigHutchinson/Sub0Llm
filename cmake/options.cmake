@@ -50,4 +50,12 @@ option(SUB0LLM_ENABLE_VEC_REPORT "Emit GCC/Clang vectorisation report (-fopt-inf
 # Validate CUDA + SIMD aren't both off in a way that breaks things
 if(SUB0LLM_ENABLE_CUDA)
     enable_language(CUDA)
+    # CMake auto-links the CUDA runtime into CXX targets that consume CUDA objects, emitting
+    # it as BARE names (cudart.lib, cudadevrt.lib). The clang++ link driver treats a bare .lib
+    # as an input file and fails ("no such file or directory") — it doesn't honour /LIBPATH for
+    # positional args the way link.exe/lld-link do. Set the runtime to None so CMake adds none
+    # of those; we link the runtime explicitly (full path) via CUDA::cudart, and use no RDC so
+    # cudadevrt is unneeded. Also clear the implicit list belt-and-braces.
+    set(CMAKE_CUDA_RUNTIME_LIBRARY "None")
+    set(CMAKE_CUDA_IMPLICIT_LINK_LIBRARIES "")
 endif()

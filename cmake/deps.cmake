@@ -4,6 +4,22 @@
 # ── Logging ───────────────────────────────────────────────────────────────────
 CPMAddPackage("gh:gabime/spdlog@1.15.1")
 
+# spdlog's CMakeLists adds MSVC-only options (e.g. /Zc:__cplusplus) under if(MSVC).
+# clang++ targeting the MSVC ABI makes CMake set MSVC=1, but its GNU-style command-line
+# frontend treats a /-prefixed token as an input filename and errors ("no such file").
+# This stays latent on cached trees but breaks a fresh configure (e.g. the CUDA preset).
+# Strip MSVC /-flags from spdlog whenever we drive clang through its GNU frontend.
+if(TARGET spdlog AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+        AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    foreach(_prop COMPILE_OPTIONS INTERFACE_COMPILE_OPTIONS)
+        get_target_property(_opts spdlog ${_prop})
+        if(_opts)
+            list(FILTER _opts EXCLUDE REGEX "^/")
+            set_target_properties(spdlog PROPERTIES ${_prop} "${_opts}")
+        endif()
+    endforeach()
+endif()
+
 # ── JSON (tokenizer configs, model configs) ───────────────────────────────────
 CPMAddPackage(
     NAME nlohmann_json

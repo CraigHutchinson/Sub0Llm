@@ -119,11 +119,15 @@ endif()
 
 # ── Helper to apply flags to a target ─────────────────────────────────────────
 function(sub0llm_apply_compile_options target)
+    # Warning/SIMD/release flags are GNU/clang command-line syntax (-Wall, -mavx2, …).
+    # Guard them to C++ sources: on a CUDA target, nvcc forwards unknown compile options
+    # to the host compiler (cl.exe on Windows), which rejects -W/-m flags (D8021). The .cu
+    # device code needs none of them anyway — its arch comes from CUDA_ARCHITECTURES.
     target_compile_options(${target} PRIVATE
-        ${SUB0LLM_WARNING_FLAGS}
-        ${SUB0LLM_SIMD_FLAGS}
-        ${SUB0LLM_RELEASE_FLAGS}
-        $<$<BOOL:${SUB0LLM_ENABLE_SANITIZERS}>:${SUB0LLM_SANITIZER_FLAGS}>
+        $<$<COMPILE_LANGUAGE:CXX>:${SUB0LLM_WARNING_FLAGS}>
+        $<$<COMPILE_LANGUAGE:CXX>:${SUB0LLM_SIMD_FLAGS}>
+        $<$<COMPILE_LANGUAGE:CXX>:${SUB0LLM_RELEASE_FLAGS}>
+        $<$<AND:$<BOOL:${SUB0LLM_ENABLE_SANITIZERS}>,$<COMPILE_LANGUAGE:CXX>>:${SUB0LLM_SANITIZER_FLAGS}>
     )
     target_link_options(${target} PRIVATE
         $<$<BOOL:${SUB0LLM_ENABLE_SANITIZERS}>:${SUB0LLM_SANITIZER_FLAGS}>

@@ -134,9 +134,20 @@ TEST_CASE("to() same device is a no-op copy", "[tensor]") {
     REQUIRE(b.data_as<float>()[0] == 1.0f);
 }
 
-TEST_CASE("to() GPU device throws placeholder error", "[tensor]") {
+TEST_CASE("to() GPU device", "[tensor]") {
     Tensor a = ones({4});
+#ifdef SUB0LLM_CUDA
+    // CUDA build: moving to the device must succeed (alloc + H2D), and a round-trip back
+    // to host must preserve the data — a real end-to-end exercise of the CUDA backend.
+    Tensor g    = a.to(Device::cuda());
+    Tensor back = g.to(Device::cpu());
+    REQUIRE(back.numel() == 4);
+    REQUIRE(back.data_as<float>()[0] == 1.0f);
+    REQUIRE(back.data_as<float>()[3] == 1.0f);
+#else
+    // No CUDA compiled in: the move throws the placeholder error.
     REQUIRE_THROWS_AS(a.to(Device::cuda()), std::runtime_error);
+#endif
 }
 
 // ── Edge cases identified in code review ─────────────────────────────────────
