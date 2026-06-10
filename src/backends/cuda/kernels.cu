@@ -170,6 +170,98 @@ __global__ void matmul_q8_0_mma_kernel(const BlockQ8_0* __restrict__ W,
     }
 }
 
+// ── Layer sub-kernels (f32) ─────────────────────────────────────────────────────────────
+// Mirror the CPU Gemma forward (gemma.cpp): rmsnorm, NEOX RoPE, GeGLU, flash-attn decode.
+
+// RMSNorm in one block: blockDim threads reduce Σx² in shared, then scale. Uses 1/sqrtf (not
+// the approximate rsqrtf) to stay close to the CPU's 1.0f/std::sqrt. w=nullptr → no weight.
+__global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                               float* __restrict__ y, int n, float eps) {
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) local += x[i] * x[i];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(red[0] / static_cast<float>(n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = x[i] * inv;
+        y[i] = w ? v * w[i] : v;
+    }
+}
+
+// NEOX half-split RoPE on one head vector, out-of-place. One thread per rotated pair.
+__global__ void rope_neox_kernel(const float* __restrict__ xin, float* __restrict__ xout,
+                                 int dh, int pos, float base, const float* __restrict__ ff) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = dh >> 1;
+    if (i >= half) return;
+    float theta = static_cast<float>(pos) * powf(base, -2.0f * static_cast<float>(i) / static_cast<float>(dh));
+    if (ff) theta /= ff[i];
+    const float c = cosf(theta), s = sinf(theta);
+    const float a = xin[i], b = xin[i + half];
+    xout[i]        = a * c - b * s;
+    xout[i + half] = a * s + b * c;
+}
+
+// GeGLU: out = gelu_tanh(gate) ⊙ up. Same constants as backend::cpu::gelu_f32.
+__global__ void geglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                             float* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    constexpr float kK = 1.5957691216f, kC = 0.044715f;
+    const float xv = gate[i];
+    const float z  = kK * (xv + kC * xv * xv * xv);
+    const float g  = xv / (1.0f + expf(-z));
+    out[i] = g * up[i];
+}
+
+// Flash-attention decode, single query head: online softmax over kvlen cached positions.
+// One block; q/acc live in shared; m,l,score scalars in shared. Attention scale = 1.0.
+__global__ void flash_attn_decode_kernel(const float* __restrict__ q, const float* __restrict__ K,
+                                         const float* __restrict__ V, float* __restrict__ o,
+                                         int dh, int kvlen) {
+    extern __shared__ float sh[];
+    float* sq   = sh;                 // [dh]   query
+    float* sacc = sh + dh;            // [dh]   running weighted-V accumulator
+    float* sred = sh + 2 * dh;        // [blockDim] dot reduction scratch
+    __shared__ float s_m, s_l, s_alpha, s_p;
+
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) { sq[i] = q[i]; sacc[i] = 0.0f; }
+    if (threadIdx.x == 0) { s_m = -INFINITY; s_l = 0.0f; }
+    __syncthreads();
+
+    for (int t = 0; t < kvlen; ++t) {
+        const float* Kt = K + static_cast<long long>(t) * dh;
+        float local = 0.0f;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) local += sq[i] * Kt[i];
+        sred[threadIdx.x] = local;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = sred[0];              // scale = 1.0
+            const float m_new = fmaxf(s_m, score);
+            s_alpha = expf(s_m - m_new);
+            s_p     = expf(score - m_new);
+            s_l     = s_l * s_alpha + s_p;
+            s_m     = m_new;
+        }
+        __syncthreads();
+        const float* Vt = V + static_cast<long long>(t) * dh;
+        const float alpha = s_alpha, p = s_p;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) sacc[i] = sacc[i] * alpha + p * Vt[i];
+        __syncthreads();
+    }
+    const float invl = 1.0f / s_l;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) o[i] = sacc[i] * invl;
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -206,6 +298,29 @@ void launch_matmul_q8_0_mma(const BlockQ8_0* dW, const BlockQ8_0* dXq, float* dY
     const dim3 grid2(grid(static_cast<std::size_t>(T), MMA),
                      grid(static_cast<std::size_t>(M), MMA));
     matmul_q8_0_mma_kernel<<<grid2, block>>>(dW, dXq, dY, M, K, T);
+}
+
+void launch_rmsnorm(const float* dx, const float* dw, float* dy, int n, float eps) {
+    constexpr int B = 256;                        // power of two for the tree reduction
+    rmsnorm_kernel<<<1, B, B * sizeof(float)>>>(dx, dw, dy, n, eps);
+}
+
+void launch_rope_neox(const float* dxin, float* dxout, int dh, int pos, float base,
+                      const float* dff) {
+    const int half = dh / 2;
+    rope_neox_kernel<<<grid(static_cast<std::size_t>(half), BLOCK), BLOCK>>>(
+        dxin, dxout, dh, pos, base, dff);
+}
+
+void launch_geglu(const float* dgate, const float* dup, float* dout, int n) {
+    geglu_kernel<<<grid(static_cast<std::size_t>(n), BLOCK), BLOCK>>>(dgate, dup, dout, n);
+}
+
+void launch_flash_attn_decode(const float* dq, const float* dK, const float* dV,
+                              float* dout, int dh, int kvlen) {
+    constexpr int B = 128;                        // power of two for the per-position reduction
+    const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
+    flash_attn_decode_kernel<<<1, B, shmem>>>(dq, dK, dV, dout, dh, kvlen);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

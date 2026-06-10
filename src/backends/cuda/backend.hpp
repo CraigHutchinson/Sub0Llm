@@ -32,4 +32,14 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 [[nodiscard]] double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq,
                                        float* Y, int M, int K, int T, int reps, int variant);
 
+// ── Layer sub-kernel validation (host in/out: H2D → launch → D2H) ────────────────────────
+// Thin wrappers over the kernels::launch_* layer ops. Each runs the GPU kernel on host data
+// and copies the result back, so qbench can compare it to the CPU reference (relRMS) before
+// the kernels are wired into the device-resident single-layer forward. Throw if CUDA absent.
+void rmsnorm_dev(const float* x, const float* w, float* y, int n, float eps);   // w=nullptr → no weight
+void rope_neox_dev(const float* x_in, float* x_out, int dh, int pos, float base, const float* ff); // ff=nullptr
+void geglu_dev(const float* gate, const float* up, float* out, int n);
+void flash_attn_decode_dev(const float* q, const float* K, const float* V, float* o,
+                           int dh, int kvlen);
+
 } // namespace sub0llm::backend::cuda

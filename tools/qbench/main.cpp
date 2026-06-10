@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #if defined(SUB0LLM_AVX512) || defined(SUB0LLM_AVX2)
@@ -191,10 +192,103 @@ void bench_batch(const char* label, int64_t M, int64_t K, int64_t T, int reps) {
 #endif
 }
 
+#ifdef SUB0LLM_CUDA
+// Validate the GPU layer sub-kernels (rmsnorm / rope / geglu / flash-attn decode) against an
+// inline CPU reference that mirrors gemma.cpp. Different backend + float-accumulation order, so
+// compare by relative RMS (not bitwise) — same gate as the Q8 matmul rows above.
+void bench_layer_kernels() {
+    namespace cuda = sub0llm::backend::cuda;
+    auto rel_rms = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double se = 0.0, sr = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            se += d * d;  sr += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        return std::sqrt(se / (sr + 1e-12));
+    };
+    std::printf("\n=== GPU layer sub-kernel validation (relRMS vs CPU reference) ===\n");
+
+    // ── RMSNorm (with weight, and Gemma V no-weight) ───────────────────────────────────────
+    {
+        const std::size_t D = 3840;  const float eps = 1e-6f;
+        std::vector<float> x(D), w(D), gw(D), gn(D), cw(D), cn(D);
+        fill(x, 11); fill(w, 12);
+        auto cpu_rms = [&](const float* wt, std::vector<float>& out) {
+            double ss = 0.0; for (std::size_t i = 0; i < D; ++i) ss += double(x[i]) * x[i];
+            const float inv = 1.0f / std::sqrt(float(ss / double(D)) + eps);
+            for (std::size_t i = 0; i < D; ++i) out[i] = x[i] * inv * (wt ? wt[i] : 1.0f);
+        };
+        cpu_rms(w.data(), cw);          cuda::rmsnorm_dev(x.data(), w.data(), gw.data(), int(D), eps);
+        cpu_rms(nullptr,  cn);          cuda::rmsnorm_dev(x.data(), nullptr,  gn.data(), int(D), eps);
+        std::printf("  rmsnorm (D=%zu, weighted)   relRMS %.2e\n", D, rel_rms(gw, cw));
+        std::printf("  rmsnorm (D=%zu, no-weight)  relRMS %.2e\n", D, rel_rms(gn, cn));
+    }
+
+    // ── NEOX RoPE (local dh=256 base 1e4 no-ff, and global dh=512 base 1e6 with freq_factors) ─
+    {
+        auto rope_cpu = [](std::vector<float> v, int dh, int pos, float base, const float* ff) {
+            const int half = dh / 2;
+            for (int i = 0; i < half; ++i) {
+                float theta = float(pos) * std::pow(base, -2.0f * float(i) / float(dh));
+                if (ff) theta /= ff[size_t(i)];
+                const float c = std::cos(theta), s = std::sin(theta);
+                const float a = v[size_t(i)], b = v[size_t(i + half)];
+                v[size_t(i)] = a * c - b * s;  v[size_t(i + half)] = a * s + b * c;
+            }
+            return v;
+        };
+        for (auto [dh, base, use_ff] : std::initializer_list<std::tuple<int,float,bool>>{
+                 {256, 1e4f, false}, {512, 1e6f, true}}) {
+            const std::size_t dz = static_cast<std::size_t>(dh), hz = dz / 2;
+            std::vector<float> x(dz), ff(hz), g(dz);
+            fill(x, 21); for (int i = 0; i < dh / 2; ++i) ff[size_t(i)] = 1.0f + 0.5f * float(i) / float(dh / 2);
+            const int pos = 137;
+            const std::vector<float> c = rope_cpu(x, dh, pos, base, use_ff ? ff.data() : nullptr);
+            cuda::rope_neox_dev(x.data(), g.data(), dh, pos, base, use_ff ? ff.data() : nullptr);
+            std::printf("  rope_neox (dh=%d base=%.0e %s)  relRMS %.2e\n",
+                        dh, base, use_ff ? "ff" : "no-ff", rel_rms(g, c));
+        }
+    }
+
+    // ── GeGLU (gelu_tanh(gate) ⊙ up) ───────────────────────────────────────────────────────
+    {
+        const std::size_t dff = 15360;
+        std::vector<float> gate(dff), up(dff), g(dff), c(dff);
+        fill(gate, 31); fill(up, 32);
+        auto gelu = [](float xv) { constexpr float kK = 1.5957691216f, kC = 0.044715f;
+            const float z = kK * (xv + kC * xv * xv * xv); return xv / (1.0f + std::exp(-z)); };
+        for (std::size_t i = 0; i < dff; ++i) c[i] = gelu(gate[i]) * up[i];
+        cuda::geglu_dev(gate.data(), up.data(), g.data(), int(dff));
+        std::printf("  geglu (dff=%zu)             relRMS %.2e\n", dff, rel_rms(g, c));
+    }
+
+    // ── Flash-attention decode (scale=1.0 online softmax over kvlen) ───────────────────────
+    {
+        for (auto [dhi, kvleni] : std::initializer_list<std::pair<int,int>>{{256, 300}, {512, 1024}}) {
+            const std::size_t dh = static_cast<std::size_t>(dhi), kvlen = static_cast<std::size_t>(kvleni);
+            std::vector<float> q(dh), Kc(kvlen * dh), Vc(kvlen * dh), g(dh), c(dh), sc(kvlen);
+            fill(q, 41); fill(Kc, 42); fill(Vc, 43);
+            float mx = -1e30f;
+            for (std::size_t t = 0; t < kvlen; ++t) {
+                float d = 0.0f; for (std::size_t i = 0; i < dh; ++i) d += q[i] * Kc[t * dh + i];
+                sc[t] = d; mx = std::max(mx, d);
+            }
+            float sum = 0.0f; for (std::size_t t = 0; t < kvlen; ++t) { sc[t] = std::exp(sc[t] - mx); sum += sc[t]; }
+            const float inv = 1.0f / sum;
+            for (std::size_t i = 0; i < dh; ++i) c[i] = 0.0f;
+            for (std::size_t t = 0; t < kvlen; ++t)
+                for (std::size_t i = 0; i < dh; ++i) c[i] += sc[t] * inv * Vc[t * dh + i];
+            cuda::flash_attn_decode_dev(q.data(), Kc.data(), Vc.data(), g.data(), dhi, kvleni);
+            std::printf("  flash_attn_decode (dh=%d kvlen=%d)  relRMS %.2e\n", dhi, kvleni, rel_rms(g, c));
+        }
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
-    int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3";
+    int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3"; bool layers = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
         auto next = [&] { return std::string(argv[++i]); };
@@ -203,8 +297,10 @@ int main(int argc, char** argv) {
         else if (a == "--batch")  T = std::stoll(next());
         else if (a == "--reps")   reps = std::stoi(next());
         else if (a == "--preset") preset = next();
+        else if (a == "--layers") layers = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("usage: sub0llm-qbench [--M N --K N] [--batch T] [--reps N] [--preset qwen3|gemma]\n");
+            std::printf("usage: sub0llm-qbench [--M N --K N] [--batch T] [--reps N] "
+                        "[--preset qwen3|gemma] [--layers]\n");
             return 0;
         }
     }
@@ -216,6 +312,15 @@ int main(int argc, char** argv) {
 #else
     std::printf("[qbench] SIMD: scalar\n");
 #endif
+
+    if (layers) {  // GPU layer sub-kernel validation vs CPU reference
+#ifdef SUB0LLM_CUDA
+        bench_layer_kernels();
+#else
+        std::printf("[qbench] --layers needs a CUDA build (configure with the cuda preset)\n");
+#endif
+        return 0;
+    }
 
     if (T > 0) {  // batched/tiling experiment: W-reuse across T columns
         std::printf("=== batched GEMM (prompt processing, T=%lld): tiling/locality ===\n",

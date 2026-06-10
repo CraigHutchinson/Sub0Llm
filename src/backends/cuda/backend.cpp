@@ -180,4 +180,84 @@ double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq, flo
 #endif
 }
 
+// ── Layer sub-kernel validation wrappers ────────────────────────────────────────────────
+#ifdef SUB0LLM_CUDA
+namespace {
+inline void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+}
+// Round-trip a host buffer to the device, run `fn(d...)`, copy the named output back.
+struct DevBuf {
+    void* p = nullptr;
+    explicit DevBuf(std::size_t bytes) { ck(cudaMalloc(&p, bytes), "cudaMalloc"); }
+    ~DevBuf() { if (p) cudaFree(p); }
+    DevBuf(const DevBuf&) = delete; DevBuf& operator=(const DevBuf&) = delete;
+};
+} // namespace
+
+void rmsnorm_dev(const float* x, const float* w, float* y, int n, float eps) {
+    const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(float);
+    DevBuf dx(bytes), dy(bytes);
+    DevBuf dw(w ? bytes : sizeof(float));
+    ck(cudaMemcpy(dx.p, x, bytes, cudaMemcpyHostToDevice), "H2D x");
+    if (w) ck(cudaMemcpy(dw.p, w, bytes, cudaMemcpyHostToDevice), "H2D w");
+    kernels::launch_rmsnorm(static_cast<float*>(dx.p), w ? static_cast<float*>(dw.p) : nullptr,
+                            static_cast<float*>(dy.p), n, eps);
+    ck(cudaDeviceSynchronize(), "rmsnorm sync");
+    ck(cudaMemcpy(y, dy.p, bytes, cudaMemcpyDeviceToHost), "D2H y");
+}
+
+void rope_neox_dev(const float* x_in, float* x_out, int dh, int pos, float base, const float* ff) {
+    const std::size_t bytes  = static_cast<std::size_t>(dh) * sizeof(float);
+    const std::size_t fbytes = static_cast<std::size_t>(dh / 2) * sizeof(float);
+    DevBuf din(bytes), dout(bytes);
+    DevBuf dff(ff ? fbytes : sizeof(float));
+    ck(cudaMemcpy(din.p, x_in, bytes, cudaMemcpyHostToDevice), "H2D x_in");
+    if (ff) ck(cudaMemcpy(dff.p, ff, fbytes, cudaMemcpyHostToDevice), "H2D ff");
+    kernels::launch_rope_neox(static_cast<float*>(din.p), static_cast<float*>(dout.p), dh, pos,
+                              base, ff ? static_cast<float*>(dff.p) : nullptr);
+    ck(cudaDeviceSynchronize(), "rope sync");
+    ck(cudaMemcpy(x_out, dout.p, bytes, cudaMemcpyDeviceToHost), "D2H x_out");
+}
+
+void geglu_dev(const float* gate, const float* up, float* out, int n) {
+    const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(float);
+    DevBuf dg(bytes), du(bytes), dout(bytes);
+    ck(cudaMemcpy(dg.p, gate, bytes, cudaMemcpyHostToDevice), "H2D gate");
+    ck(cudaMemcpy(du.p, up,   bytes, cudaMemcpyHostToDevice), "H2D up");
+    kernels::launch_geglu(static_cast<float*>(dg.p), static_cast<float*>(du.p),
+                          static_cast<float*>(dout.p), n);
+    ck(cudaDeviceSynchronize(), "geglu sync");
+    ck(cudaMemcpy(out, dout.p, bytes, cudaMemcpyDeviceToHost), "D2H out");
+}
+
+void flash_attn_decode_dev(const float* q, const float* K, const float* V, float* o,
+                           int dh, int kvlen) {
+    const std::size_t qb  = static_cast<std::size_t>(dh) * sizeof(float);
+    const std::size_t kvb = static_cast<std::size_t>(kvlen) * static_cast<std::size_t>(dh) * sizeof(float);
+    DevBuf dq(qb), dk(kvb), dv(kvb), dout(qb);
+    ck(cudaMemcpy(dq.p, q, qb,  cudaMemcpyHostToDevice), "H2D q");
+    ck(cudaMemcpy(dk.p, K, kvb, cudaMemcpyHostToDevice), "H2D K");
+    ck(cudaMemcpy(dv.p, V, kvb, cudaMemcpyHostToDevice), "H2D V");
+    kernels::launch_flash_attn_decode(static_cast<float*>(dq.p), static_cast<float*>(dk.p),
+                                      static_cast<float*>(dv.p), static_cast<float*>(dout.p),
+                                      dh, kvlen);
+    ck(cudaDeviceSynchronize(), "flash sync");
+    ck(cudaMemcpy(o, dout.p, qb, cudaMemcpyDeviceToHost), "D2H o");
+}
+#else
+void rmsnorm_dev(const float*, const float*, float*, int, float) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void rope_neox_dev(const float*, float*, int, int, float, const float*) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void geglu_dev(const float*, const float*, float*, int) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void flash_attn_decode_dev(const float*, const float*, const float*, float*, int, int) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+#endif
+
 } // namespace sub0llm::backend::cuda
