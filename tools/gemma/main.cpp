@@ -59,6 +59,7 @@ struct Args {
     int         threads = 0;      // 0 = auto; set to 1 for a single-core baseline
     std::string cores = "auto";   // auto | all | P | E | "lo-hi" | "a,b,c" (pin policy)
     int         repeat = 5;       // --mode bench: interleaved A/B rounds
+    int         gpu_layers = 0;   // --mode hybrid*: first N layers run on the GPU
     bool        pieces = false;
     bool        no_bos = false;   // for parity when the reference already added BOS
     bool        no_fuse = false;  // disable Q/K/V + gate/up GEMV fusion
@@ -81,13 +82,14 @@ Args parse(int argc, char** argv) {
         else if (s == "-t" || s == "--threads") a.threads = std::stoi(next());
         else if (s == "--cores")        a.cores = next();
         else if (s == "--repeat")       a.repeat = std::stoi(next());
+        else if (s == "--gpu-layers")   a.gpu_layers = std::stoi(next());
         else if (s == "--pieces")       a.pieces = true;
         else if (s == "--no-bos")       a.no_bos = true;
         else if (s == "--no-fuse")      a.no_fuse = true;
         else if (s == "-h" || s == "--help") {
             std::cout << "usage: sub0llm-gemma --model G.gguf --text \"...\" "
-                         "--mode tokenize|logits|greedy|bench [-n N] [-t N] [--no-fuse] "
-                         "[--repeat N]\n";
+                         "--mode tokenize|logits|greedy|bench|hybrid-check [-n N] [-t N] "
+                         "[--no-fuse] [--repeat N] [--gpu-layers K]\n";
             std::exit(0);
         } else throw std::runtime_error(std::format("unknown argument: {}", s));
     }
@@ -354,6 +356,56 @@ int main(int argc, char** argv) {
             }
             std::cout << std::format("OUR SWEET SPOT: {} threads ({:.2f} tok/s median)\n", best_t, best);
             return 0;
+        }
+
+        if (args.mode == "hybrid-check") {
+            // Full-model greedy PARITY gate: run the prompt+generation token-by-token two ways —
+            // pure CPU (forward_one, our llama-validated oracle) and hybrid (first --gpu-layers on
+            // the GPU, rest on CPU) — and report whether the GREEDY token sequences match. Both use
+            // the token-by-token path so they are directly comparable (no batched-prefill skew).
+            const int k = args.gpu_layers;
+            const int64_t total = prompt_len + args.max_tokens + 1;
+            sub0llm::nn::set_gemma_cpus(pp_cpus);
+
+            auto greedy = [&](bool hybrid) {
+                if (hybrid) model.enable_gpu_layers(k, total);
+                auto kv = model.make_cache(total);
+                std::vector<int32_t> gen;  std::vector<float> logits;  int64_t pos = 0;
+                const auto fwd = [&](int32_t tok, bool want_logits) {
+                    return hybrid ? model.forward_one_hybrid(tok, pos, kv, false, want_logits)
+                                  : model.forward_one(tok, pos, kv, false, want_logits);
+                };
+                const auto t0 = std::chrono::steady_clock::now();
+                for (; pos < prompt_len; ++pos) logits = fwd(ids[std::size_t(pos)], pos == prompt_len - 1);
+                for (int64_t t = 0; t < args.max_tokens; ++t) {
+                    const int32_t nx = argmax(logits);
+                    if (nx == voc.eos_id) break;
+                    gen.push_back(nx);
+                    logits = fwd(nx, true);
+                    ++pos;
+                }
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                std::cerr << std::format("[gemma] {} greedy: {} tok in {:.2f}s ({:.2f} tok/s)\n",
+                                         hybrid ? "hybrid" : "cpu   ", gen.size(), s,
+                                         static_cast<double>(gen.size()) / s);
+                return gen;
+            };
+
+            const auto cpu_ids = greedy(false);
+            std::cerr << std::format("[gemma] hybrid: first {} of {} layers on GPU\n", k, model.n_layers());
+            const auto hyb_ids = greedy(true);
+
+            std::size_t match = 0;
+            const std::size_t n = std::min(cpu_ids.size(), hyb_ids.size());
+            while (match < n && cpu_ids[match] == hyb_ids[match]) ++match;
+            const bool ok = (cpu_ids == hyb_ids);
+            std::cout << "cpu_ids   :"; for (int32_t id : cpu_ids) std::cout << ' ' << id; std::cout << "\n";
+            std::cout << "hybrid_ids:"; for (int32_t id : hyb_ids) std::cout << ' ' << id; std::cout << "\n";
+            std::cout << std::format("PARITY: {} — {}/{} greedy tokens match{}\n",
+                                     ok ? "PASS (identical greedy sequence)" : "FAIL",
+                                     match, std::max(cpu_ids.size(), hyb_ids.size()),
+                                     ok ? "" : std::format(" (first divergence at index {})", match));
+            return ok ? 0 : 2;
         }
 
         throw std::runtime_error(std::format("unknown mode: {}", args.mode));

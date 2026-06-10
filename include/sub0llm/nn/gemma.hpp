@@ -29,7 +29,10 @@
 #include "sub0llm/nn/gguf_loader.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
+
+namespace sub0llm::backend::cuda { class GemmaGpuLayers; }   // device-resident GPU layers (Ch27)
 
 namespace sub0llm::nn {
 
@@ -108,10 +111,33 @@ struct GemmaKVCache {
 
 class GemmaModel {
 public:
+    // Holds a unique_ptr to an incomplete GemmaGpuLayers (Ch27 hybrid), so the special members
+    // are out-of-line (defined where the type is complete). Move-only (owns device state).
+    GemmaModel();
+    ~GemmaModel();
+    GemmaModel(GemmaModel&&) noexcept;
+    GemmaModel& operator=(GemmaModel&&) noexcept;
+
     // Build from a Q8_0 Gemma 4 GGUF (quantize-on-load: no f32 weights materialized).
     [[nodiscard]] static GemmaModel load_q8(const GGUFReader& reader);
 
     [[nodiscard]] GemmaKVCache make_cache(int64_t max_pos) const;
+
+    // ── Hybrid GPU/CPU decode (Ch27) ─────────────────────────────────────────────────────────
+    // Upload the first `k_gpu` layers' weights to the GPU (resident) and run them on-device for
+    // subsequent forward_one_hybrid calls; the remaining layers + head stay on the CPU. `max_pos`
+    // sizes the device KV cache. Throws (from the CUDA backend) if CUDA is not compiled in. Call
+    // once before the decode loop; k_gpu in [0, n_layers].
+    void enable_gpu_layers(int k_gpu, int64_t max_pos);
+    [[nodiscard]] int n_gpu_layers() const noexcept { return n_gpu_layers_; }
+
+    // Like forward_one, but the first n_gpu_layers() layers run on the GPU (device KV cache) and
+    // the rest on the CPU (host `kv`), with ONE activation hand-off at the boundary. Numerically
+    // ~equal to forward_one (per-layer ~5e-7); the gate is identical GREEDY tokens. Non-const: it
+    // mutates the device KV held by the resident GPU layers. Requires enable_gpu_layers() first.
+    [[nodiscard]] std::vector<float> forward_one_hybrid(int32_t token, int64_t pos, GemmaKVCache& kv,
+                                                        bool apply_softcap = true,
+                                                        bool compute_logits = true);
 
     // One decode step: append token at position `pos` to the cache, return logits (V).
     // `apply_softcap` controls the final logit soft-cap (30·tanh(z/30)). It is
@@ -141,6 +167,12 @@ public:
     [[nodiscard]] int64_t n_params()    const noexcept { return n_params_; }
 
 private:
+    // Shared building blocks of the forward (used by forward_one and forward_one_hybrid).
+    [[nodiscard]] std::vector<float> embed_(int32_t token) const;     // dequant embedding · sqrt(D)
+    void cpu_layer_(const GemmaLayer& L, GemmaKVCache::Layer& C,
+                    std::vector<float>& x, int64_t pos, int64_t max_pos) const;  // one CPU layer
+    [[nodiscard]] std::vector<float> head_(std::vector<float> x, bool apply_softcap) const;
+
     int64_t V_ = 0, D_ = 0, d_ff_ = 0;
     float   eps_ = 1e-6f;
     float   embed_scale_ = 1.0f;
@@ -151,6 +183,9 @@ private:
     std::vector<float>      rope_freqs_;   // global freq_factors (head_dim_global/2)
     std::vector<float>      output_norm_;  // (D)
     std::vector<backend::cpu::BlockQ8_0> token_embd_;  // (V, D) — embedding + tied LM head
+
+    int n_gpu_layers_ = 0;
+    std::unique_ptr<backend::cuda::GemmaGpuLayers> gpu_;   // resident GPU layers [0, n_gpu_layers_)
 };
 
 } // namespace sub0llm::nn

@@ -1,6 +1,7 @@
 #include "sub0llm/nn/gemma.hpp"
 
 #include "../backends/cpu/kernels.hpp"
+#include "../backends/cuda/backend.hpp"   // GemmaGpuLayers + GpuLayerDesc (Ch27 hybrid)
 
 #include <algorithm>
 #include <atomic>
@@ -392,6 +393,12 @@ float meta_float(const GGUFReader& r, const std::string& key, float fallback) {
 
 } // namespace
 
+// Out-of-line because the GemmaGpuLayers member is an incomplete type in the header.
+GemmaModel::GemmaModel() = default;
+GemmaModel::~GemmaModel() = default;
+GemmaModel::GemmaModel(GemmaModel&&) noexcept = default;
+GemmaModel& GemmaModel::operator=(GemmaModel&&) noexcept = default;
+
 GemmaModel GemmaModel::load_q8(const GGUFReader& reader) {
     const GGUFModelConfig& cfg = reader.config();
     if (cfg.arch != "gemma4")
@@ -491,142 +498,135 @@ GemmaKVCache GemmaModel::make_cache(int64_t max_pos) const {
     return kv;
 }
 
-std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
-                                           GemmaKVCache& kv, bool apply_softcap,
-                                           bool compute_logits) const {
-    const int64_t D = D_;
-    const int64_t nbD = D / QK;
-
-    // ── embedding lookup + scale ────────────────────────────────────────────────
-    std::vector<float> x(static_cast<std::size_t>(D));
+// Embedding lookup + ×sqrt(D) scale.
+std::vector<float> GemmaModel::embed_(int32_t token) const {
+    const int64_t nbD = D_ / QK;
+    std::vector<float> x(static_cast<std::size_t>(D_));
     cpu::dequantize_row_q8_0(token_embd_.data()
                                  + static_cast<std::size_t>(token) * static_cast<std::size_t>(nbD),
-                             x.data(), D);
+                             x.data(), D_);
     for (std::size_t i = 0; i < x.size(); ++i) x[i] *= embed_scale_;
+    return x;
+}
 
-    std::vector<float> h(static_cast<std::size_t>(D));         // pre-attn / pre-ffn norm output
+// One decode layer on the CPU: in-place on `x`, updating cache `C` at `pos`. Exactly the body
+// the forward_one loop used (Q/K/V fusion, per-head norm+RoPE+store, windowed attention, GeGLU,
+// scaled residual) — shared by forward_one and the CPU tail of forward_one_hybrid.
+void GemmaModel::cpu_layer_(const GemmaLayer& L, GemmaKVCache::Layer& C,
+                            std::vector<float>& x, int64_t pos, int64_t max_pos) const {
+    const int64_t D = D_;
+    const int64_t dh = L.head_dim, nH = L.n_head, nKV = L.n_kv_head;
+    const float*  ff = L.is_global && !rope_freqs_.empty() ? rope_freqs_.data() : nullptr;
+
+    std::vector<float> h(static_cast<std::size_t>(D));
+    rmsnorm(x.data(), L.attn_norm.data(), h.data(), D, eps_);
+
+    std::vector<float> q(static_cast<std::size_t>(nH * dh));
+    std::vector<float> kcur(static_cast<std::size_t>(nKV * dh));
+    std::vector<float> vcur(static_cast<std::size_t>(nKV * dh));
+    // Fuse Q, K, (V) into one dispatch — all project the same attn_norm output `h`. Global layers
+    // omit attn_v → V is the raw K projection (copied from kcur afterward).
+    GemvJob qkv[3];
+    int njobs = 0;
+    qkv[njobs++] = {L.wq.data(), q.data(),    nH * dh};
+    qkv[njobs++] = {L.wk.data(), kcur.data(), nKV * dh};
+    if (L.has_wv) qkv[njobs++] = {L.wv.data(), vcur.data(), nKV * dh};
+    pmatvec_multi(qkv, njobs, h.data(), D);
+    if (!L.has_wv) vcur = kcur;
+
+    parallel_for(nH + nKV, [&](int64_t idx) {
+        if (idx < nH) {
+            float* qh = q.data() + idx * dh;
+            rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
+            rope_neox(qh, dh, pos, L.rope_base, ff);
+        } else {
+            const int64_t g = idx - nH;
+            float* kh = kcur.data() + g * dh;
+            float* vh = vcur.data() + g * dh;
+            rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
+            rope_neox(kh, dh, pos, L.rope_base, ff);
+            rmsnorm_noweight(vh, vh, dh, eps_);
+            const std::size_t base = static_cast<std::size_t>(g * max_pos * dh + pos * dh);
+            std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(base));
+            std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(base));
+        }
+    });
+
+    const int64_t kv_lo = L.window > 0 ? std::max<int64_t>(0, pos - L.window + 1) : 0;
+    const int64_t kv_hi = pos;
+    const int64_t kvlen = kv_hi - kv_lo + 1;
+    const int64_t group = nH / nKV;
+    std::vector<float> attn_concat(static_cast<std::size_t>(nH * dh));
+    std::vector<float> scores_all(static_cast<std::size_t>(nH * kvlen));
+    parallel_for(nH, [&](int64_t hd) {
+        const float* qh = q.data() + hd * dh;
+        const int64_t g = hd / group;
+        const float* Kbase = C.k.data() + static_cast<std::size_t>(g * max_pos * dh);
+        const float* Vbase = C.v.data() + static_cast<std::size_t>(g * max_pos * dh);
+        float* scores = scores_all.data() + hd * kvlen;
+
+        float mx = -std::numeric_limits<float>::infinity();
+        for (int64_t t = kv_lo; t <= kv_hi; ++t) {
+            const float dot = cpu::dot_f32(qh, Kbase + static_cast<std::size_t>(t * dh), dh);
+            scores[t - kv_lo] = dot;   // scale = 1.0
+            mx = std::max(mx, dot);
+        }
+        float sum = 0.0f;
+        for (int64_t t = 0; t < kvlen; ++t) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
+        const float invsum = 1.0f / sum;
+
+        float* oh = attn_concat.data() + hd * dh;
+        for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
+        for (int64_t t = kv_lo; t <= kv_hi; ++t) {
+            const float* vt = Vbase + static_cast<std::size_t>(t * dh);
+            cpu::axpy_f32(scores[t - kv_lo] * invsum, vt, oh, dh);
+        }
+    });
+
+    std::vector<float> ao(static_cast<std::size_t>(D));
+    pmatvec(L.wo, attn_concat.data(), ao.data(), D, nH * dh);
+    rmsnorm(ao.data(), L.post_attn_norm.data(), ao.data(), D, eps_);
     std::vector<float> attn_out(static_cast<std::size_t>(D));
+    for (std::size_t i = 0; i < attn_out.size(); ++i) attn_out[i] = x[i] + ao[i];
 
-    for (std::size_t li = 0; li < layers_.size(); ++li) {
-        const GemmaLayer& L = layers_[li];
-        GemmaKVCache::Layer& C = kv.layers[li];
-        const int64_t dh = L.head_dim, nH = L.n_head, nKV = L.n_kv_head;
-        const float*  ff = L.is_global && !rope_freqs_.empty() ? rope_freqs_.data() : nullptr;
+    rmsnorm(attn_out.data(), L.ffn_norm.data(), h.data(), D, eps_);
+    std::vector<float> g(static_cast<std::size_t>(d_ff_));
+    std::vector<float> u(static_cast<std::size_t>(d_ff_));
+    const GemvJob gu[2] = {{L.gate.data(), g.data(), d_ff_}, {L.up.data(), u.data(), d_ff_}};
+    pmatvec_multi(gu, 2, h.data(), D);
+    cpu::gelu_f32(g.data(), g.data(), static_cast<std::size_t>(d_ff_));
+    for (std::size_t i = 0; i < g.size(); ++i) g[i] *= u[i];
 
-        // ── attention ───────────────────────────────────────────────────────────
-        rmsnorm(x.data(), L.attn_norm.data(), h.data(), D, eps_);
+    std::vector<float> ff_out(static_cast<std::size_t>(D));
+    pmatvec(L.down, g.data(), ff_out.data(), D, d_ff_);
+    rmsnorm(ff_out.data(), L.post_ffw_norm.data(), ff_out.data(), D, eps_);
 
-        std::vector<float> q(static_cast<std::size_t>(nH * dh));
-        std::vector<float> kcur(static_cast<std::size_t>(nKV * dh));
-        std::vector<float> vcur(static_cast<std::size_t>(nKV * dh));
-        // Fuse Q, K, (V) into one dispatch — all project the same attn_norm output `h`,
-        // so quantize h once and run the concatenated rows under a single barrier.
-        // Global layers omit attn_v → V is the raw K projection (Vcur = Kcur), so only
-        // Q,K are projected and vcur is copied from kcur afterward.
-        GemvJob qkv[3];
-        int njobs = 0;
-        qkv[njobs++] = {L.wq.data(), q.data(),    nH * dh};
-        qkv[njobs++] = {L.wk.data(), kcur.data(), nKV * dh};
-        if (L.has_wv) qkv[njobs++] = {L.wv.data(), vcur.data(), nKV * dh};
-        pmatvec_multi(qkv, njobs, h.data(), D);
-        if (!L.has_wv) vcur = kcur;
+    for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] = (attn_out[i] + ff_out[i]) * L.out_scale;
+}
 
-        // Q-norm+RoPE (per q-head) and K-norm+RoPE / V-norm + cache-store (per kv-head)
-        // are all independent — dispatch them together across the pool. Indices [0,nH)
-        // are q-heads; [nH, nH+nKV) are kv-heads. (For !has_wv, vcur is the raw-K copy.)
-        parallel_for(nH + nKV, [&](int64_t idx) {
-            if (idx < nH) {
-                float* qh = q.data() + idx * dh;
-                rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
-                rope_neox(qh, dh, pos, L.rope_base, ff);
-            } else {
-                const int64_t g = idx - nH;
-                float* kh = kcur.data() + g * dh;
-                float* vh = vcur.data() + g * dh;
-                rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
-                rope_neox(kh, dh, pos, L.rope_base, ff);
-                rmsnorm_noweight(vh, vh, dh, eps_);
-                const std::size_t base = static_cast<std::size_t>(g * kv.max_pos * dh + pos * dh);
-                std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(base));
-                std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(base));
-            }
-        });
-
-        // Per query head, attend over the cache (scale = 1.0; sliding window for local).
-        // Independent across heads → parallelize; each head uses its own scores slice.
-        const int64_t kv_lo = L.window > 0 ? std::max<int64_t>(0, pos - L.window + 1) : 0;
-        const int64_t kv_hi = pos;                    // inclusive
-        const int64_t kvlen = kv_hi - kv_lo + 1;
-        const int64_t group = nH / nKV;               // q heads per kv head
-        std::vector<float> attn_concat(static_cast<std::size_t>(nH * dh));
-        std::vector<float> scores_all(static_cast<std::size_t>(nH * kvlen));
-        parallel_for(nH, [&](int64_t hd) {
-            const float* qh = q.data() + hd * dh;
-            const int64_t g = hd / group;
-            const float* Kbase = C.k.data() + static_cast<std::size_t>(g * kv.max_pos * dh);
-            const float* Vbase = C.v.data() + static_cast<std::size_t>(g * kv.max_pos * dh);
-            float* scores = scores_all.data() + hd * kvlen;
-
-            float mx = -std::numeric_limits<float>::infinity();
-            for (int64_t t = kv_lo; t <= kv_hi; ++t) {           // QKᵀ score (SIMD dot)
-                const float dot = cpu::dot_f32(qh, Kbase + static_cast<std::size_t>(t * dh), dh);
-                scores[t - kv_lo] = dot;   // scale = 1.0
-                mx = std::max(mx, dot);
-            }
-            float sum = 0.0f;
-            for (int64_t t = 0; t < kvlen; ++t) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
-            const float invsum = 1.0f / sum;
-
-            float* oh = attn_concat.data() + hd * dh;
-            for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
-            for (int64_t t = kv_lo; t <= kv_hi; ++t) {           // weighted V sum (SIMD axpy)
-                const float* vt = Vbase + static_cast<std::size_t>(t * dh);
-                cpu::axpy_f32(scores[t - kv_lo] * invsum, vt, oh, dh);
-            }
-        });
-
-        // Output projection (D, nH*dh) → D, post-attn norm, residual.
-        std::vector<float> ao(static_cast<std::size_t>(D));
-        pmatvec(L.wo, attn_concat.data(), ao.data(), D, nH * dh);
-        rmsnorm(ao.data(), L.post_attn_norm.data(), ao.data(), D, eps_);
-        for (std::size_t i = 0; i < attn_out.size(); ++i) attn_out[i] = x[i] + ao[i];
-
-        // ── FFN (GeGLU) ───────────────────────────────────────────────────────────
-        rmsnorm(attn_out.data(), L.ffn_norm.data(), h.data(), D, eps_);
-        std::vector<float> g(static_cast<std::size_t>(d_ff_));
-        std::vector<float> u(static_cast<std::size_t>(d_ff_));
-        // Fuse gate + up — both project the same ffn_norm output `h` — into one barrier.
-        const GemvJob gu[2] = {{L.gate.data(), g.data(), d_ff_},
-                               {L.up.data(),   u.data(), d_ff_}};
-        pmatvec_multi(gu, 2, h.data(), D);
-        cpu::gelu_f32(g.data(), g.data(), static_cast<std::size_t>(d_ff_));
-        for (std::size_t i = 0; i < g.size(); ++i) g[i] *= u[i];
-
-        std::vector<float> ff_out(static_cast<std::size_t>(D));
-        pmatvec(L.down, g.data(), ff_out.data(), D, d_ff_);
-        rmsnorm(ff_out.data(), L.post_ffw_norm.data(), ff_out.data(), D, eps_);
-
-        // Residual + per-layer output scale → next layer input.
-        for (std::size_t i = 0; i < x.size(); ++i)
-            x[i] = (attn_out[i] + ff_out[i]) * L.out_scale;
-    }
-
-    kv.len = pos + 1;
-
-    // Prompt prefill of non-final tokens: KV cache is filled, logits unused → stop here
-    // and skip the V-wide LM head (the single biggest GEMV per token).
-    if (!compute_logits) return {};
-
-    // ── final norm + tied LM head + logit soft-cap ──────────────────────────────
-    rmsnorm(x.data(), output_norm_.data(), x.data(), D, eps_);
+// Final norm + tied LM head + (optional) logit soft-cap.
+std::vector<float> GemmaModel::head_(std::vector<float> x, bool apply_softcap) const {
+    rmsnorm(x.data(), output_norm_.data(), x.data(), D_, eps_);
     std::vector<float> logits(static_cast<std::size_t>(V_));
-    pmatvec(token_embd_, x.data(), logits.data(), V_, D);
-    // Soft-cap is monotonic → order-preserving; skip it when only the argmax matters.
+    pmatvec(token_embd_, x.data(), logits.data(), V_, D_);
     if (apply_softcap && final_softcap_ > 0.0f) {
         const float cap = final_softcap_;
         for (auto& z : logits) z = cap * std::tanh(z / cap);
     }
     return logits;
+}
+
+std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
+                                           GemmaKVCache& kv, bool apply_softcap,
+                                           bool compute_logits) const {
+    std::vector<float> x = embed_(token);
+    for (std::size_t li = 0; li < layers_.size(); ++li)
+        cpu_layer_(layers_[li], kv.layers[li], x, pos, kv.max_pos);
+    kv.len = pos + 1;
+    // Prompt prefill of non-final tokens: KV cache filled, logits unused → skip the V-wide head.
+    if (!compute_logits) return {};
+    return head_(std::move(x), apply_softcap);
 }
 
 // ── batched prompt prefill ──────────────────────────────────────────────────────
@@ -779,6 +779,43 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
         for (auto& z : logits) z = cap * std::tanh(z / cap);
     }
     return logits;
+}
+
+// ── Hybrid GPU/CPU decode (Ch27) ──────────────────────────────────────────────────────────
+void GemmaModel::enable_gpu_layers(int k_gpu, int64_t max_pos) {
+    n_gpu_layers_ = std::clamp(k_gpu, 0, static_cast<int>(layers_.size()));
+    if (n_gpu_layers_ == 0) { gpu_.reset(); return; }
+    std::vector<backend::cuda::GpuLayerDesc> descs;
+    descs.reserve(static_cast<std::size_t>(n_gpu_layers_));
+    for (int li = 0; li < n_gpu_layers_; ++li) {
+        const GemmaLayer& L = layers_[static_cast<std::size_t>(li)];
+        backend::cuda::GpuLayerDesc d{};
+        d.D = static_cast<int>(D_); d.d_ff = static_cast<int>(d_ff_); d.dh = static_cast<int>(L.head_dim);
+        d.n_head = static_cast<int>(L.n_head); d.n_kv_head = static_cast<int>(L.n_kv_head);
+        d.window = static_cast<int>(L.window);
+        d.eps = eps_; d.rope_base = L.rope_base; d.out_scale = L.out_scale; d.has_wv = L.has_wv;
+        d.wq = L.wq.data(); d.wk = L.wk.data(); d.wv = L.has_wv ? L.wv.data() : nullptr;
+        d.wo = L.wo.data(); d.gate = L.gate.data(); d.up = L.up.data(); d.down = L.down.data();
+        d.attn_norm = L.attn_norm.data(); d.post_attn_norm = L.post_attn_norm.data();
+        d.ffn_norm = L.ffn_norm.data(); d.post_ffw_norm = L.post_ffw_norm.data();
+        d.q_norm = L.q_norm.data(); d.k_norm = L.k_norm.data();
+        d.rope_freqs = (L.is_global && !rope_freqs_.empty()) ? rope_freqs_.data() : nullptr;
+        descs.push_back(d);
+    }
+    gpu_ = std::make_unique<backend::cuda::GemmaGpuLayers>(descs, static_cast<int>(max_pos));
+}
+
+std::vector<float> GemmaModel::forward_one_hybrid(int32_t token, int64_t pos, GemmaKVCache& kv,
+                                                  bool apply_softcap, bool compute_logits) {
+    if (!gpu_ || n_gpu_layers_ <= 0)
+        return forward_one(token, pos, kv, apply_softcap, compute_logits);
+    std::vector<float> x = embed_(token);
+    gpu_->decode(x.data(), static_cast<int>(pos), x.data());   // GPU layers [0, n_gpu_layers_)
+    for (std::size_t li = static_cast<std::size_t>(n_gpu_layers_); li < layers_.size(); ++li)
+        cpu_layer_(layers_[li], kv.layers[li], x, pos, kv.max_pos);
+    kv.len = pos + 1;
+    if (!compute_logits) return {};
+    return head_(std::move(x), apply_softcap);
 }
 
 } // namespace sub0llm::nn
