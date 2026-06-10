@@ -278,6 +278,13 @@ __global__ void quantize_q8_kernel(const float* __restrict__ x, BlockQ8_0* __res
     if (lane == 0) y[warp].d = __half_as_ushort(__float2half(d));
 }
 
+// Fused scaled residual: out = (a + b) * s.
+__global__ void add_scale_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                 float* __restrict__ out, float s, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (a[i] + b[i]) * s;
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -343,6 +350,10 @@ void launch_quantize_q8(const float* dx, BlockQ8_0* dy, int nb) {
     constexpr int B = 256;                        // 8 warps/block → 8 Q8 blocks per CUDA block
     const int blocks = grid(static_cast<std::size_t>(nb) * 32, B);
     quantize_q8_kernel<<<blocks, B>>>(dx, dy, nb);
+}
+
+void launch_add_scale(const float* da, const float* db, float* dout, float s, int n) {
+    add_scale_kernel<<<grid(static_cast<std::size_t>(n), BLOCK), BLOCK>>>(da, db, dout, s, n);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

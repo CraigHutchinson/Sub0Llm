@@ -303,12 +303,146 @@ void bench_layer_kernels() {
                     n, rel_rms(gd, cd), blk_exact, nb);
     }
 }
+
+// Validate ONE full Gemma layer's on-device decode (gemma_layer_decode_dev) against a faithful
+// scalar CPU reference that mirrors GemmaModel::forward_one's per-layer body. Same Q8 weights,
+// norms, KV prefill and input on both sides → differences are only float-accumulation order +
+// GPU cos/sin rounding. Exercises the whole pipeline (norm/quantize/Q8 matmul/rope/flash-attn/
+// geglu/residuals) wired together, for a local (dh256, 8 kv) and a global (dh512, MQA, V=rawK,
+// freq_factors) layer at a position with pre-filled KV (window attention + cache store).
+void bench_gpu_layer() {
+    namespace cuda = sub0llm::backend::cuda;
+    auto rel_rms = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double se = 0.0, sr = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = double(a[i]) - double(b[i]);  se += d * d;  sr += double(b[i]) * double(b[i]);
+        }
+        return std::sqrt(se / (sr + 1e-12));
+    };
+    auto rmsn = [](const float* x, const float* w, float* y, int n, float eps) {
+        double ss = 0.0; for (int i = 0; i < n; ++i) ss += double(x[i]) * x[i];
+        const float inv = 1.0f / std::sqrt(float(ss / n) + eps);
+        for (int i = 0; i < n; ++i) y[i] = x[i] * inv * (w ? w[i] : 1.0f);
+    };
+    auto rope = [](float* x, int dh, int pos, float base, const float* ff) {
+        const int half = dh / 2;
+        for (int i = 0; i < half; ++i) {
+            float th = float(pos) * std::pow(base, -2.0f * float(i) / float(dh));
+            if (ff) th /= ff[i];
+            const float c = std::cos(th), s = std::sin(th), a = x[i], b = x[i + half];
+            x[i] = a * c - b * s;  x[i + half] = a * s + b * c;
+        }
+    };
+    auto gelu = [](float xv) { constexpr float kK = 1.5957691216f, kC = 0.044715f;
+        const float z = kK * (xv + kC * xv * xv * xv); return xv / (1.0f + std::exp(-z)); };
+
+    const int D = 3840, dff = 15360;  const float eps = 1e-6f, out_scale = 0.95f;
+    const int max_pos = 64, pos = 40;
+    struct Cfg { const char* name; int dh, nH, nKV, window; float base; bool has_wv, ff; };
+    const Cfg cfgs[2] = {{"local ", 256, 16, 8, 1024, 1e4f, true, false},
+                         {"global", 512, 16, 1,    0, 1e6f, false, true}};
+    std::printf("\n=== GPU single Gemma layer vs CPU reference (relRMS) ===\n");
+
+    for (const Cfg& cfg : cfgs) {
+        const int dh = cfg.dh, nH = cfg.nH, nKV = cfg.nKV, qM = nH * dh, kvM = nKV * dh;
+        const int group = nH / nKV;
+        const auto Z = [](long long n) { return static_cast<std::size_t>(n); };
+
+        // shared Q8 weights (random f32 → quantize once), shared by CPU + GPU
+        auto mkQ = [&](int Mr, int Kr, uint32_t seed) {
+            std::vector<float> W(Z(1LL * Mr * Kr));  fill(W, seed);
+            std::vector<BlockQ8_0> Wq(Z(1LL * Mr * (Kr / QK8_0)));
+            for (int m = 0; m < Mr; ++m)
+                quantize_row_q8_0(W.data() + Z(1LL * m * Kr), Wq.data() + Z(1LL * m * (Kr / QK8_0)), Kr);
+            return Wq;
+        };
+        const auto wq = mkQ(qM, D, 1), wk = mkQ(kvM, D, 2), wv = mkQ(kvM, D, 3), wo = mkQ(D, qM, 4),
+                   gate = mkQ(dff, D, 5), up = mkQ(dff, D, 6), down = mkQ(D, dff, 7);
+        // norms (f32) — Gemma bakes (1+w), so ~1.0
+        auto mkN = [&](int n, uint32_t s) { std::vector<float> v(Z(n)); fill(v, s); for (auto& z : v) z += 1.0f; return v; };
+        const auto an = mkN(D, 11), pan = mkN(D, 12), fn = mkN(D, 13), pfn = mkN(D, 14),
+                   kn = mkN(dh, 16);
+        // Gemma folds the query pre-attention scaling (~1/sqrt(head_dim)) into q_norm at GGUF
+        // conversion, so real queries are small and attn scores are O(1). Emulate that here —
+        // a ~1.0 q_norm would leave scores huge (esp. dh=512), peaking softmax and amplifying
+        // the CPU/GPU score-dot summation-order difference into the output (not a kernel bug).
+        auto qn = mkN(dh, 15);  { const float qs = 1.0f / std::sqrt(float(dh)); for (auto& z : qn) z *= qs; }
+        std::vector<float> ffv(Z(dh / 2));  for (int i = 0; i < dh / 2; ++i) ffv[Z(i)] = 1.0f + 0.5f * float(i) / float(dh / 2);
+        const float* ffp = cfg.ff ? ffv.data() : nullptr;
+
+        std::vector<float> kc(Z(1LL * nKV * max_pos * dh)), vc(Z(1LL * nKV * max_pos * dh)), x(Z(D));
+        fill(kc, 71); fill(vc, 72); fill(x, 73);
+
+        // ── CPU reference: one layer (mirrors forward_one) ─────────────────────────────────
+        std::vector<float> kcC = kc, vcC = vc, outC(Z(D)), h(Z(D));
+        rmsn(x.data(), an.data(), h.data(), D, eps);
+        std::vector<float> qv(Z(qM)), kcur(Z(kvM)), vcur(Z(kvM));
+        { std::vector<BlockQ8_0> xq(Z(D / QK8_0));
+          matvec_q8_0_q8_0(wq.data(), h.data(), qv.data(),   qM,  D, xq.data());
+          matvec_q8_0_q8_0(wk.data(), h.data(), kcur.data(), kvM, D, xq.data());
+          if (cfg.has_wv) matvec_q8_0_q8_0(wv.data(), h.data(), vcur.data(), kvM, D, xq.data());
+          else vcur = kcur; }
+        for (int hd = 0; hd < nH; ++hd) { float* p = qv.data() + hd * dh; rmsn(p, qn.data(), p, dh, eps); rope(p, dh, pos, cfg.base, ffp); }
+        for (int g = 0; g < nKV; ++g) {
+            float* kh = kcur.data() + g * dh; float* vh = vcur.data() + g * dh;
+            rmsn(kh, kn.data(), kh, dh, eps); rope(kh, dh, pos, cfg.base, ffp); rmsn(vh, nullptr, vh, dh, eps);
+            const std::size_t bo = Z((1LL * g * max_pos + pos) * dh);
+            std::copy(kh, kh + dh, kcC.begin() + std::ptrdiff_t(bo));
+            std::copy(vh, vh + dh, vcC.begin() + std::ptrdiff_t(bo));
+        }
+        const int kv_lo = cfg.window > 0 ? std::max(0, pos - cfg.window + 1) : 0, kvlen = pos - kv_lo + 1;
+        std::vector<float> ac(Z(qM));
+        for (int hd = 0; hd < nH; ++hd) {
+            const float* qh = qv.data() + hd * dh; const int g = hd / group;
+            const float* Kb = kcC.data() + Z(1LL * g * max_pos * dh);
+            const float* Vb = vcC.data() + Z(1LL * g * max_pos * dh);
+            std::vector<float> sc(Z(kvlen));  float mx = -1e30f;
+            for (int t = kv_lo; t <= pos; ++t) { float d = dot_f32(qh, Kb + Z(1LL * t * dh), dh); sc[Z(t - kv_lo)] = d; mx = std::max(mx, d); }
+            float sum = 0.0f; for (auto& s : sc) { s = std::exp(s - mx); sum += s; }  const float inv = 1.0f / sum;
+            float* oh = ac.data() + hd * dh; for (int d = 0; d < dh; ++d) oh[d] = 0.0f;
+            for (int t = kv_lo; t <= pos; ++t) { const float w = sc[Z(t - kv_lo)] * inv; const float* vt = Vb + Z(1LL * t * dh); for (int d = 0; d < dh; ++d) oh[d] += w * vt[d]; }
+        }
+        std::vector<float> ao(Z(D));
+        { std::vector<BlockQ8_0> acq(Z(qM / QK8_0)); matvec_q8_0_q8_0(wo.data(), ac.data(), ao.data(), D, qM, acq.data()); }
+        rmsn(ao.data(), pan.data(), ao.data(), D, eps);
+        std::vector<float> aout(Z(D)); for (int i = 0; i < D; ++i) aout[Z(i)] = x[Z(i)] + ao[Z(i)];
+        rmsn(aout.data(), fn.data(), h.data(), D, eps);
+        std::vector<float> gb(Z(dff)), ub(Z(dff));
+        { std::vector<BlockQ8_0> xq(Z(D / QK8_0));
+          matvec_q8_0_q8_0(gate.data(), h.data(), gb.data(), dff, D, xq.data());
+          matvec_q8_0_q8_0(up.data(),   h.data(), ub.data(), dff, D, xq.data()); }
+        for (int i = 0; i < dff; ++i) gb[Z(i)] = gelu(gb[Z(i)]) * ub[Z(i)];
+        std::vector<float> ffo(Z(D));
+        { std::vector<BlockQ8_0> gq(Z(dff / QK8_0)); matvec_q8_0_q8_0(down.data(), gb.data(), ffo.data(), D, dff, gq.data()); }
+        rmsn(ffo.data(), pfn.data(), ffo.data(), D, eps);
+        for (int i = 0; i < D; ++i) outC[Z(i)] = (aout[Z(i)] + ffo[Z(i)]) * out_scale;
+
+        // ── GPU: same inputs through gemma_layer_decode_dev ────────────────────────────────
+        std::vector<float> kcG = kc, vcG = vc, outG(Z(D));
+        cuda::GpuLayerDesc L{};
+        L.D = D; L.d_ff = dff; L.dh = dh; L.n_head = nH; L.n_kv_head = nKV; L.window = cfg.window;
+        L.eps = eps; L.rope_base = cfg.base; L.out_scale = out_scale; L.has_wv = cfg.has_wv;
+        L.wq = wq.data(); L.wk = wk.data(); L.wv = cfg.has_wv ? wv.data() : nullptr; L.wo = wo.data();
+        L.gate = gate.data(); L.up = up.data(); L.down = down.data();
+        L.attn_norm = an.data(); L.post_attn_norm = pan.data(); L.ffn_norm = fn.data();
+        L.post_ffw_norm = pfn.data(); L.q_norm = qn.data(); L.k_norm = kn.data(); L.rope_freqs = ffp;
+        cuda::gemma_layer_decode_dev(L, x.data(), pos, kcG.data(), vcG.data(), max_pos, outG.data());
+
+        // compare layer output + the K/V slot written at `pos`
+        const std::size_t slot = Z((1LL * 0 * max_pos + pos) * dh);
+        std::vector<float> kSlotC(kcC.begin() + std::ptrdiff_t(slot), kcC.begin() + std::ptrdiff_t(slot) + dh);
+        std::vector<float> kSlotG(kcG.begin() + std::ptrdiff_t(slot), kcG.begin() + std::ptrdiff_t(slot) + dh);
+        std::printf("  %s layer (dh=%d nKV=%d %s)  out relRMS %.2e   K@pos relRMS %.2e\n",
+                    cfg.name, dh, nKV, cfg.has_wv ? "wv" : "V=K", rel_rms(outG, outC), rel_rms(kSlotG, kSlotC));
+    }
+}
 #endif
 
 } // namespace
 
 int main(int argc, char** argv) {
-    int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3"; bool layers = false;
+    int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3";
+    bool layers = false, gpu_layer = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
         auto next = [&] { return std::string(argv[++i]); };
@@ -318,9 +452,10 @@ int main(int argc, char** argv) {
         else if (a == "--reps")   reps = std::stoi(next());
         else if (a == "--preset") preset = next();
         else if (a == "--layers") layers = true;
+        else if (a == "--gpu-layer") gpu_layer = true;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: sub0llm-qbench [--M N --K N] [--batch T] [--reps N] "
-                        "[--preset qwen3|gemma] [--layers]\n");
+                        "[--preset qwen3|gemma] [--layers] [--gpu-layer]\n");
             return 0;
         }
     }
@@ -333,11 +468,12 @@ int main(int argc, char** argv) {
     std::printf("[qbench] SIMD: scalar\n");
 #endif
 
-    if (layers) {  // GPU layer sub-kernel validation vs CPU reference
+    if (layers || gpu_layer) {  // GPU validation vs CPU reference
 #ifdef SUB0LLM_CUDA
-        bench_layer_kernels();
+        if (layers)    bench_layer_kernels();
+        if (gpu_layer) bench_gpu_layer();
 #else
-        std::printf("[qbench] --layers needs a CUDA build (configure with the cuda preset)\n");
+        std::printf("[qbench] --layers/--gpu-layer need a CUDA build (configure with the cuda preset)\n");
 #endif
         return 0;
     }

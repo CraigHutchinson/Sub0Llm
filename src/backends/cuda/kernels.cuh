@@ -59,5 +59,9 @@ void launch_flash_attn_decode(const float* dq, const float* dK, const float* dV,
 // One warp per block. Feeds the device Q8 matmul (which consumes Q8 activations).
 void launch_quantize_q8(const float* dx, ::sub0llm::backend::cpu::BlockQ8_0* dy, int nb);
 
+// Fused scaled residual: out[i] = (a[i] + b[i]) * s. One thread per element. Used for Gemma's
+// per-layer (cur + attn_out)·layer_output_scale.
+void launch_add_scale(const float* da, const float* db, float* dout, float s, int n);
+
 } // namespace sub0llm::backend::cuda::kernels
 #endif // SUB0LLM_CUDA

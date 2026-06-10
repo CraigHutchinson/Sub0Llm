@@ -43,4 +43,28 @@ void flash_attn_decode_dev(const float* q, const float* K, const float* V, float
                            int dh, int kvlen);
 void quantize_q8_dev(const float* x, cpu::BlockQ8_0* y, int n);   // n = row width (n/32 blocks)
 
+// ── On-device single Gemma layer (Stage 2) ──────────────────────────────────────────────
+// One transformer layer's weights + shape as HOST pointers (the GPU forward uploads them).
+// Q8 weights are row-major (out,in) exactly as GemmaLayer stores them; norms are f32. This is
+// the validation form (in-call upload); the Stage-3 perf form keeps everything device-resident.
+struct GpuLayerDesc {
+    int   D = 0, d_ff = 0, dh = 0, n_head = 0, n_kv_head = 0, window = 0;
+    float eps = 1e-6f, rope_base = 1e4f, out_scale = 1.0f;
+    bool  has_wv = true;
+    const cpu::BlockQ8_0 *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
+    const cpu::BlockQ8_0 *gate = nullptr, *up = nullptr, *down = nullptr;
+    const float *attn_norm = nullptr, *post_attn_norm = nullptr, *ffn_norm = nullptr;
+    const float *post_ffw_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+    const float *rope_freqs = nullptr;   // global freq_factors (dh/2) or nullptr
+};
+
+// Run ONE decode step of a single Gemma layer on the GPU, matching GemmaModel::forward_one's
+// per-layer body exactly. `x` is the f32 layer input (D). `kcache`/`vcache` are the host-side
+// KV caches laid out [kv_head][max_pos][dh]; positions [0,pos) must already hold the (RoPE'd K /
+// normed V) for this layer, and this call writes position `pos` into both before attending over
+// the window. Writes the layer output (D) to `out`. Uploads weights+caches, runs the device
+// kernel pipeline, downloads the result. Throws if CUDA is not compiled in.
+void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
+                            float* kcache, float* vcache, int max_pos, float* out);
+
 } // namespace sub0llm::backend::cuda

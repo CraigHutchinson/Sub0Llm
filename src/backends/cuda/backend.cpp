@@ -192,6 +192,8 @@ struct DevBuf {
     explicit DevBuf(std::size_t bytes) { ck(cudaMalloc(&p, bytes), "cudaMalloc"); }
     ~DevBuf() { if (p) cudaFree(p); }
     DevBuf(const DevBuf&) = delete; DevBuf& operator=(const DevBuf&) = delete;
+    DevBuf(DevBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
+    DevBuf& operator=(DevBuf&&) = delete;
 };
 } // namespace
 
@@ -257,6 +259,117 @@ void quantize_q8_dev(const float* x, cpu::BlockQ8_0* y, int n) {
     ck(cudaDeviceSynchronize(), "quantize sync");
     ck(cudaMemcpy(y, dy.p, ybytes, cudaMemcpyDeviceToHost), "D2H y");
 }
+
+void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
+                            float* kcache, float* vcache, int max_pos, float* out) {
+    const int D = L.D, dff = L.d_ff, dh = L.dh, nH = L.n_head, nKV = L.n_kv_head;
+    const int qM = nH * dh, kvM = nKV * dh, group = nH / nKV;
+    const int nbD = D / 32, nbQM = qM / 32, nbFF = dff / 32;
+    const float eps = L.eps, base = L.rope_base;
+    const auto FB = [](int n) { return static_cast<std::size_t>(n) * sizeof(float); };
+    const auto QB = [](int blocks) { return static_cast<std::size_t>(blocks) * sizeof(cpu::BlockQ8_0); };
+
+    // One pool owns every allocation (freed on scope exit, exceptions included).
+    std::vector<DevBuf> pool;
+    auto dev = [&](std::size_t bytes) -> void* { pool.emplace_back(bytes); return pool.back().p; };
+    auto upF = [&](const float* h, int n) -> float* {
+        float* d = static_cast<float*>(dev(FB(n)));
+        ck(cudaMemcpy(d, h, FB(n), cudaMemcpyHostToDevice), "H2D f32");  return d; };
+    auto upQ = [&](const cpu::BlockQ8_0* h, int blocks) -> cpu::BlockQ8_0* {
+        auto* d = static_cast<cpu::BlockQ8_0*>(dev(QB(blocks)));
+        ck(cudaMemcpy(d, h, QB(blocks), cudaMemcpyHostToDevice), "H2D q8");  return d; };
+    auto sF = [&](int n) -> float* { return static_cast<float*>(dev(FB(n))); };
+    auto sQ = [&](int blocks) -> cpu::BlockQ8_0* { return static_cast<cpu::BlockQ8_0*>(dev(QB(blocks))); };
+
+    // ── upload weights (Q8, out×in) + norms (f32) ──────────────────────────────────────────
+    auto* wqD   = upQ(L.wq,   qM  * nbD);
+    auto* wkD   = upQ(L.wk,   kvM * nbD);
+    auto* wvD   = L.has_wv ? upQ(L.wv, kvM * nbD) : nullptr;
+    auto* woD   = upQ(L.wo,   D   * nbQM);
+    auto* gateD = upQ(L.gate, dff * nbD);
+    auto* upD   = upQ(L.up,   dff * nbD);
+    auto* downD = upQ(L.down, D   * nbFF);
+    auto* anD   = upF(L.attn_norm,      D);
+    auto* panD  = upF(L.post_attn_norm, D);
+    auto* fnD   = upF(L.ffn_norm,       D);
+    auto* pfnD  = upF(L.post_ffw_norm,  D);
+    auto* qnD   = upF(L.q_norm,  dh);
+    auto* knD   = upF(L.k_norm,  dh);
+    float* ffD  = L.rope_freqs ? upF(L.rope_freqs, dh / 2) : nullptr;
+
+    // KV cache (host → device); positions [0,pos) already hold this layer's RoPE'd K / normed V.
+    const int kvElems = nKV * max_pos * dh;
+    float* kcD = upF(kcache, kvElems);
+    float* vcD = upF(vcache, kvElems);
+
+    // ── scratch ────────────────────────────────────────────────────────────────────────────
+    float* dx   = upF(x, D);                 // layer input
+    float* h    = sF(D);
+    auto*  hq   = sQ(nbD);
+    float* q    = sF(qM);
+    float* kcur = sF(kvM);
+    float* vcur = sF(kvM);
+    float* ac   = sF(qM);                    // attn_concat
+    auto*  acq  = sQ(nbQM);
+    float* ao   = sF(D);
+    float* aout = sF(D);                     // attn_out (x + ao)
+    float* gbuf = sF(dff);
+    float* ubuf = sF(dff);
+    auto*  gq   = sQ(nbFF);
+    float* ffo  = sF(D);
+    float* dout = sF(D);
+
+    auto d2d = [&](float* dst, const float* src, int n) {
+        ck(cudaMemcpy(dst, src, FB(n), cudaMemcpyDeviceToDevice), "D2D"); };
+
+    // ── attention ──────────────────────────────────────────────────────────────────────────
+    kernels::launch_rmsnorm(dx, anD, h, D, eps);
+    kernels::launch_quantize_q8(h, hq, nbD);
+    kernels::launch_matmul_q8_0(wqD, hq, q,    qM,  D, 1);
+    kernels::launch_matmul_q8_0(wkD, hq, kcur, kvM, D, 1);
+    if (L.has_wv) kernels::launch_matmul_q8_0(wvD, hq, vcur, kvM, D, 1);
+    else          d2d(vcur, kcur, kvM);               // V = raw K projection (pre-norm)
+
+    for (int hd = 0; hd < nH; ++hd) {                 // q-head rmsnorm + RoPE (in place)
+        kernels::launch_rmsnorm(q + hd * dh, qnD, q + hd * dh, dh, eps);
+        kernels::launch_rope_neox(q + hd * dh, q + hd * dh, dh, pos, base, ffD);
+    }
+    for (int g = 0; g < nKV; ++g) {                   // kv-head: K rmsnorm+RoPE, V rmsnorm, store
+        kernels::launch_rmsnorm(kcur + g * dh, knD, kcur + g * dh, dh, eps);
+        kernels::launch_rope_neox(kcur + g * dh, kcur + g * dh, dh, pos, base, ffD);
+        kernels::launch_rmsnorm(vcur + g * dh, nullptr, vcur + g * dh, dh, eps);
+        d2d(kcD + (static_cast<long long>(g) * max_pos + pos) * dh, kcur + g * dh, dh);
+        d2d(vcD + (static_cast<long long>(g) * max_pos + pos) * dh, vcur + g * dh, dh);
+    }
+
+    const int kv_lo = L.window > 0 ? std::max(0, pos - L.window + 1) : 0;
+    const int kvlen = pos - kv_lo + 1;
+    for (int hd = 0; hd < nH; ++hd) {                 // per-q-head windowed attention
+        const long long base_off = (static_cast<long long>(hd / group) * max_pos + kv_lo) * dh;
+        kernels::launch_flash_attn_decode(q + hd * dh, kcD + base_off, vcD + base_off,
+                                          ac + hd * dh, dh, kvlen);
+    }
+    kernels::launch_quantize_q8(ac, acq, nbQM);
+    kernels::launch_matmul_q8_0(woD, acq, ao, D, qM, 1);
+    kernels::launch_rmsnorm(ao, panD, ao, D, eps);
+    kernels::launch_add_f32(dx, ao, aout, static_cast<std::size_t>(D));   // attn_out = x + ao
+
+    // ── FFN (GeGLU) ─────────────────────────────────────────────────────────────────────────
+    kernels::launch_rmsnorm(aout, fnD, h, D, eps);
+    kernels::launch_quantize_q8(h, hq, nbD);
+    kernels::launch_matmul_q8_0(gateD, hq, gbuf, dff, D, 1);
+    kernels::launch_matmul_q8_0(upD,   hq, ubuf, dff, D, 1);
+    kernels::launch_geglu(gbuf, ubuf, gbuf, dff);
+    kernels::launch_quantize_q8(gbuf, gq, nbFF);
+    kernels::launch_matmul_q8_0(downD, gq, ffo, D, dff, 1);
+    kernels::launch_rmsnorm(ffo, pfnD, ffo, D, eps);
+    kernels::launch_add_scale(aout, ffo, dout, L.out_scale, D);           // (attn_out + ff)·out_scale
+
+    ck(cudaDeviceSynchronize(), "gemma layer sync");
+    ck(cudaMemcpy(out, dout, FB(D), cudaMemcpyDeviceToHost), "D2H out");
+    ck(cudaMemcpy(kcache, kcD, FB(kvElems), cudaMemcpyDeviceToHost), "D2H kcache");
+    ck(cudaMemcpy(vcache, vcD, FB(kvElems), cudaMemcpyDeviceToHost), "D2H vcache");
+}
 #else
 void rmsnorm_dev(const float*, const float*, float*, int, float) {
     throw std::runtime_error("CUDA backend not compiled in");
@@ -271,6 +384,9 @@ void flash_attn_decode_dev(const float*, const float*, const float*, float*, int
     throw std::runtime_error("CUDA backend not compiled in");
 }
 void quantize_q8_dev(const float*, cpu::BlockQ8_0*, int) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void gemma_layer_decode_dev(const GpuLayerDesc&, const float*, int, float*, float*, int, float*) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 #endif
