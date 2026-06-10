@@ -285,6 +285,98 @@ __global__ void add_scale_kernel(const float* __restrict__ a, const float* __res
     if (i < n) out[i] = (a[i] + b[i]) * s;
 }
 
+// ── Batched per-head decode kernels (one launch over all heads) ─────────────────────────────
+// RMSNorm of head blockIdx.x (dh-slice). Identical math to rmsnorm_kernel, offset per head.
+__global__ void rmsnorm_heads_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                     float* __restrict__ y, int dh, float eps) {
+    const long long off = static_cast<long long>(blockIdx.x) * dh;
+    const float* xh = x + off;  float* yh = y + off;
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) local += xh[i] * xh[i];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(red[0] / static_cast<float>(dh) + eps);
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) {
+        const float v = xh[i] * inv;
+        yh[i] = w ? v * w[i] : v;
+    }
+}
+
+// NEOX RoPE for n_heads contiguous dh-vectors; one thread per (head, pair).
+__global__ void rope_heads_kernel(const float* __restrict__ xin, float* __restrict__ xout,
+                                  int n_heads, int dh, int pos, float base, const float* __restrict__ ff) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = dh >> 1;
+    if (idx >= n_heads * half) return;
+    const int h = idx / half, i = idx % half;
+    const long long off = static_cast<long long>(h) * dh;
+    float theta = static_cast<float>(pos) * powf(base, -2.0f * static_cast<float>(i) / static_cast<float>(dh));
+    if (ff) theta /= ff[i];
+    const float c = cosf(theta), s = sinf(theta);
+    const float a = xin[off + i], b = xin[off + i + half];
+    xout[off + i]        = a * c - b * s;
+    xout[off + i + half] = a * s + b * c;
+}
+
+// Scatter n_kv contiguous K/V head-vectors into the cache slot for `pos` ([kv_head][max_pos][dh]).
+__global__ void store_kv_kernel(const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                float* __restrict__ kcD, float* __restrict__ vcD,
+                                int n_kv, int dh, int max_pos, int pos) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv * dh) return;
+    const int g = idx / dh, d = idx % dh;
+    const long long dst = (static_cast<long long>(g) * max_pos + pos) * dh + d;
+    kcD[dst] = kcur[static_cast<long long>(g) * dh + d];
+    vcD[dst] = vcur[static_cast<long long>(g) * dh + d];
+}
+
+// Flash decode for query head blockIdx.x. Same online softmax as flash_attn_decode_kernel.
+__global__ void flash_attn_decode_heads_kernel(const float* __restrict__ q, const float* __restrict__ kcD,
+                                               const float* __restrict__ vcD, float* __restrict__ out,
+                                               int dh, int kvlen, int kv_lo, int group, int max_pos) {
+    const int hd = blockIdx.x, g = hd / group;
+    const float* qh = q + static_cast<long long>(hd) * dh;
+    const float* K  = kcD + (static_cast<long long>(g) * max_pos + kv_lo) * dh;
+    const float* V  = vcD + (static_cast<long long>(g) * max_pos + kv_lo) * dh;
+    float* oh = out + static_cast<long long>(hd) * dh;
+
+    extern __shared__ float sh[];
+    float* sq = sh;  float* sacc = sh + dh;  float* sred = sh + 2 * dh;
+    __shared__ float s_m, s_l, s_alpha, s_p;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) { sq[i] = qh[i]; sacc[i] = 0.0f; }
+    if (threadIdx.x == 0) { s_m = __int_as_float(0xff800000); s_l = 0.0f; }
+    __syncthreads();
+    for (int t = 0; t < kvlen; ++t) {
+        const float* Kt = K + static_cast<long long>(t) * dh;
+        float local = 0.0f;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) local += sq[i] * Kt[i];
+        sred[threadIdx.x] = local;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sred[threadIdx.x] += sred[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = sred[0];
+            const float m_new = fmaxf(s_m, score);
+            s_alpha = expf(s_m - m_new);  s_p = expf(score - m_new);
+            s_l = s_l * s_alpha + s_p;    s_m = m_new;
+        }
+        __syncthreads();
+        const float* Vt = V + static_cast<long long>(t) * dh;
+        const float alpha = s_alpha, p = s_p;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) sacc[i] = sacc[i] * alpha + p * Vt[i];
+        __syncthreads();
+    }
+    const float invl = 1.0f / s_l;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -354,6 +446,30 @@ void launch_quantize_q8(const float* dx, BlockQ8_0* dy, int nb) {
 
 void launch_add_scale(const float* da, const float* db, float* dout, float s, int n) {
     add_scale_kernel<<<grid(static_cast<std::size_t>(n), BLOCK), BLOCK>>>(da, db, dout, s, n);
+}
+
+void launch_rmsnorm_heads(const float* x, const float* w, float* y, int n_heads, int dh, float eps) {
+    constexpr int B = 256;
+    rmsnorm_heads_kernel<<<n_heads, B, B * sizeof(float)>>>(x, w, y, dh, eps);
+}
+
+void launch_rope_heads(const float* xin, float* xout, int n_heads, int dh, int pos, float base,
+                       const float* ff) {
+    const std::size_t total = static_cast<std::size_t>(n_heads) * (dh / 2);
+    rope_heads_kernel<<<grid(total, BLOCK), BLOCK>>>(xin, xout, n_heads, dh, pos, base, ff);
+}
+
+void launch_store_kv(const float* kcur, const float* vcur, float* kcD, float* vcD,
+                     int n_kv, int dh, int max_pos, int pos) {
+    const std::size_t total = static_cast<std::size_t>(n_kv) * dh;
+    store_kv_kernel<<<grid(total, BLOCK), BLOCK>>>(kcur, vcur, kcD, vcD, n_kv, dh, max_pos, pos);
+}
+
+void launch_flash_attn_decode_heads(const float* q, const float* kcD, const float* vcD, float* out,
+                                    int n_head, int dh, int kvlen, int kv_lo, int group, int max_pos) {
+    constexpr int B = 128;
+    const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
+    flash_attn_decode_heads_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

@@ -63,5 +63,27 @@ void launch_quantize_q8(const float* dx, ::sub0llm::backend::cpu::BlockQ8_0* dy,
 // per-layer (cur + attn_out)·layer_output_scale.
 void launch_add_scale(const float* da, const float* db, float* dout, float s, int n);
 
+// ── Batched per-head ops (decode) — one launch over all heads, not one launch per head ──────
+// The decode forward was launch-overhead-bound (~16 q-heads × rmsnorm+rope etc. = dozens of tiny
+// launches/layer). These do the SAME math for `n_heads` contiguous dh-vectors in ONE launch.
+
+// RMSNorm of each of `n_heads` contiguous dh-slices (shared per-head weight w, or nullptr).
+// One block per head. In-place safe (y may equal x).
+void launch_rmsnorm_heads(const float* x, const float* w, float* y, int n_heads, int dh, float eps);
+
+// NEOX RoPE of each of `n_heads` contiguous dh-vectors at the same `pos`. In-place safe.
+void launch_rope_heads(const float* xin, float* xout, int n_heads, int dh, int pos, float base,
+                       const float* ff);
+
+// Scatter `n_kv` contiguous dh-vectors of K and V into the KV cache slot for `pos`
+// (cache layout [kv_head][max_pos][dh]) in one launch (replaces 2·n_kv D2D copies).
+void launch_store_kv(const float* kcur, const float* vcur, float* kcD, float* vcD,
+                     int n_kv, int dh, int max_pos, int pos);
+
+// Flash-attention decode for ALL `n_head` query heads in one launch (one block per head).
+// Head hd reads kv-head g=hd/group from the cache windowed at [kv_lo, kv_lo+kvlen). scale=1.0.
+void launch_flash_attn_decode_heads(const float* q, const float* kcD, const float* vcD, float* out,
+                                    int n_head, int dh, int kvlen, int kv_lo, int group, int max_pos);
+
 } // namespace sub0llm::backend::cuda::kernels
 #endif // SUB0LLM_CUDA

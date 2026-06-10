@@ -230,25 +230,17 @@ void run_gpu_layer(const DevLayer& L, const float* x_dev, float* out_dev,
     if (L.has_wv) kernels::launch_matmul_q8_0(L.wv, s.hq, s.vcur, kvM, D, 1);
     else          d2d(s.vcur, s.kcur, kvM);                 // V = raw K projection (pre-norm)
 
-    for (int hd = 0; hd < nH; ++hd) {
-        kernels::launch_rmsnorm(s.q + hd * dh, L.q_norm, s.q + hd * dh, dh, eps);
-        kernels::launch_rope_neox(s.q + hd * dh, s.q + hd * dh, dh, pos, base, L.rope_freqs);
-    }
-    for (int g = 0; g < nKV; ++g) {
-        kernels::launch_rmsnorm(s.kcur + g * dh, L.k_norm, s.kcur + g * dh, dh, eps);
-        kernels::launch_rope_neox(s.kcur + g * dh, s.kcur + g * dh, dh, pos, base, L.rope_freqs);
-        kernels::launch_rmsnorm(s.vcur + g * dh, nullptr, s.vcur + g * dh, dh, eps);
-        d2d(kcD + (static_cast<long long>(g) * max_pos + pos) * dh, s.kcur + g * dh, dh);
-        d2d(vcD + (static_cast<long long>(g) * max_pos + pos) * dh, s.vcur + g * dh, dh);
-    }
+    // Per-head q/k norm+RoPE, v norm, KV store — batched (one launch each over all heads).
+    kernels::launch_rmsnorm_heads(s.q, L.q_norm, s.q, nH, dh, eps);
+    kernels::launch_rope_heads(s.q, s.q, nH, dh, pos, base, L.rope_freqs);
+    kernels::launch_rmsnorm_heads(s.kcur, L.k_norm, s.kcur, nKV, dh, eps);
+    kernels::launch_rope_heads(s.kcur, s.kcur, nKV, dh, pos, base, L.rope_freqs);
+    kernels::launch_rmsnorm_heads(s.vcur, nullptr, s.vcur, nKV, dh, eps);
+    kernels::launch_store_kv(s.kcur, s.vcur, kcD, vcD, nKV, dh, max_pos, pos);
 
     const int kv_lo = L.window > 0 ? std::max(0, pos - L.window + 1) : 0;
     const int kvlen = pos - kv_lo + 1;
-    for (int hd = 0; hd < nH; ++hd) {
-        const long long off = (static_cast<long long>(hd / group) * max_pos + kv_lo) * dh;
-        kernels::launch_flash_attn_decode(s.q + hd * dh, kcD + off, vcD + off,
-                                          s.ac + hd * dh, dh, kvlen);
-    }
+    kernels::launch_flash_attn_decode_heads(s.q, kcD, vcD, s.ac, nH, dh, kvlen, kv_lo, group, max_pos);
     kernels::launch_quantize_q8(s.ac, s.acq, nbQM);
     kernels::launch_matmul_q8_0(L.wo, s.acq, s.ao, D, qM, 1);
     kernels::launch_rmsnorm(s.ao, L.post_attn_norm, s.ao, D, eps);
