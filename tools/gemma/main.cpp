@@ -365,7 +365,6 @@ int main(int argc, char** argv) {
             // the token-by-token path so they are directly comparable (no batched-prefill skew).
             const int k = args.gpu_layers;
             const int64_t total = prompt_len + args.max_tokens + 1;
-            sub0llm::nn::set_gemma_cpus(pp_cpus);
 
             auto greedy = [&](bool hybrid) {
                 if (hybrid) model.enable_gpu_layers(k, total);
@@ -375,8 +374,12 @@ int main(int argc, char** argv) {
                     return hybrid ? model.forward_one_hybrid(tok, pos, kv, false, want_logits)
                                   : model.forward_one(tok, pos, kv, false, want_logits);
                 };
-                const auto t0 = std::chrono::steady_clock::now();
+                // Per-phase core policy (matches greedy mode): prompt prefill = compute cores;
+                // decode = E-cores (bandwidth-bound). Time ONLY the decode loop → clean TG tok/s.
+                sub0llm::nn::set_gemma_cpus(pp_cpus);
                 for (; pos < prompt_len; ++pos) logits = fwd(ids[std::size_t(pos)], pos == prompt_len - 1);
+                sub0llm::nn::set_gemma_cpus(tg_cpus);
+                const auto t0 = std::chrono::steady_clock::now();
                 for (int64_t t = 0; t < args.max_tokens; ++t) {
                     const int32_t nx = argmax(logits);
                     if (nx == voc.eos_id) break;
@@ -385,7 +388,7 @@ int main(int argc, char** argv) {
                     ++pos;
                 }
                 const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                std::cerr << std::format("[gemma] {} greedy: {} tok in {:.2f}s ({:.2f} tok/s)\n",
+                std::cerr << std::format("[gemma] {} decode: {} tok in {:.2f}s ({:.2f} tok/s)\n",
                                          hybrid ? "hybrid" : "cpu   ", gen.size(), s,
                                          static_cast<double>(gen.size()) / s);
                 return gen;
