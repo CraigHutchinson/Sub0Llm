@@ -262,6 +262,43 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (args.mode == "hybrid") {
+            // Like greedy, but the first --gpu-layers run on the GPU (forward_one_hybrid). Emits the
+            // SAME PP/TG stderr lines as greedy so the interleaved bench parses both engines uniformly.
+            // Token-by-token prefill (no batched GPU prefill yet) so PP is comparable to greedy's TTFT.
+            const int64_t total = std::max<int64_t>(args.ctx, prompt_len + args.max_tokens + 1);
+            model.enable_gpu_layers(args.gpu_layers, total, args.q8_kv);
+            auto kv = model.make_cache(total);
+            std::vector<float> logits;  int64_t pos = 0;
+            {
+                sub0llm::nn::set_gemma_cpus(pp_cpus);
+                const auto pp0 = std::chrono::steady_clock::now();
+                for (; pos < prompt_len; ++pos)
+                    logits = model.forward_one_hybrid(ids[std::size_t(pos)], pos, kv, false, pos == prompt_len - 1);
+                const double pp_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pp0).count();
+                std::cerr << std::format("[gemma] prompt forward {} tok in {:.2f}s ({:.2f} tok/s)\n",
+                                         prompt_len, pp_s, static_cast<double>(prompt_len) / pp_s);
+            }
+            sub0llm::nn::set_gemma_cpus(tg_cpus);
+            std::vector<int32_t> gen;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int64_t t = 0; t < args.max_tokens; ++t) {
+                const int32_t next = argmax(logits);
+                if (next == voc.eos_id) break;
+                gen.push_back(next);
+                logits = model.forward_one_hybrid(next, pos, kv, false);
+                ++pos;
+            }
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::cout << "gen_ids:";
+            for (int32_t id : gen) std::cout << ' ' << id;
+            std::cout << "\ngen_text: " << sp.decode(gen) << "\n";
+            std::cerr << std::format("[gemma] hybrid {} of {} layers on GPU\n", model.n_gpu_layers(), model.n_layers());
+            std::cerr << std::format("[gemma] generated {} tok in {:.2f}s ({:.2f} tok/s)\n",
+                                     gen.size(), s, static_cast<double>(gen.size()) / s);
+            return 0;
+        }
+
         if (args.mode == "bench") {
             // Drift-free A/B/C: cycle the cumulative orchestration levers within ONE
             // process (model loaded once, shared thermal state), interleaved over
