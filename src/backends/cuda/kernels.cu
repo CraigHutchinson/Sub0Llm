@@ -129,6 +129,37 @@ __global__ void matmul_q8_0_gemv_kernel(const BlockQ8_0* __restrict__ W,
     if (lane == 0) Y[m] = acc;
 }
 
+// Aligned T=1 Q8 GEMV (decode): weights repacked to an ALIGNED layout — qs[M*K] contiguous int8
+// (16-byte aligned per block) + scales[M*nb] f16 — so the warp reads weights as coalesced int4
+// (vs the 34-byte BlockQ8_0 whose qs at +2 forces scattered byte loads ~27-45% of VRAM bw). One
+// warp per row; lane streams blocks. Activation X stays BlockQ8_0 (1 row, small). The bandwidth fix.
+__global__ void matmul_q8_0_gemv_aligned_kernel(const int8_t* __restrict__ Wqs,
+                                                const uint16_t* __restrict__ Wsc,
+                                                const BlockQ8_0* __restrict__ X,
+                                                float* __restrict__ Y, int M, int K, int nb) {
+    const int m = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (m >= M) return;
+    const int8_t*  wqs = Wqs + static_cast<long long>(m) * K;
+    const uint16_t* wsc = Wsc + static_cast<long long>(m) * nb;
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int4 a = *reinterpret_cast<const int4*>(wqs + b * QK);          // 16 int8 (aligned)
+        const int4 c = *reinterpret_cast<const int4*>(wqs + b * QK + 16);     // next 16 int8
+        const int8_t* xq = X[b].qs;
+        int idot = 0;
+        idot = __dp4a(a.x, pack4_s8(xq + 0),  idot);  idot = __dp4a(a.y, pack4_s8(xq + 4),  idot);
+        idot = __dp4a(a.z, pack4_s8(xq + 8),  idot);  idot = __dp4a(a.w, pack4_s8(xq + 12), idot);
+        idot = __dp4a(c.x, pack4_s8(xq + 16), idot);  idot = __dp4a(c.y, pack4_s8(xq + 20), idot);
+        idot = __dp4a(c.z, pack4_s8(xq + 24), idot);  idot = __dp4a(c.w, pack4_s8(xq + 28), idot);
+        acc += __half2float(__ushort_as_half(wsc[b])) * __half2float(__ushort_as_half(X[b].d))
+             * static_cast<float>(idot);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) Y[m] = acc;
+}
+
 // IMMA (int8 tensor-core) Q8 matmul. One warp computes a 16×16 output tile. Q8_0's per-32
 // scale fights the tensor core (which wants uniform-scale K-accumulation), so we run ONE
 // 16×16×16 MMA pair per Q8 block (= 32 K-elems → two K=16 steps) into an int32 fragment,
@@ -591,6 +622,13 @@ void launch_flash_attn_decode_heads_q8(const float* q, const BlockQ8_0* kcD, con
     constexpr int B = 128;
     const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
     flash_attn_decode_heads_q8_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
+}
+
+void launch_matmul_q8_0_gemv_aligned(const int8_t* Wqs, const uint16_t* Wsc, const BlockQ8_0* X,
+                                     float* Y, int M, int K) {
+    constexpr int B = 128;                          // 4 warps/block → 4 rows
+    const int blocks = grid(static_cast<std::size_t>(M) * 32, B);
+    matmul_q8_0_gemv_aligned_kernel<<<blocks, B>>>(Wqs, Wsc, X, Y, M, K, K / QK);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

@@ -143,6 +143,40 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq, float* Y,
                          int M, int K, int T, int reps, int variant) {
 #ifdef SUB0LLM_CUDA
+    auto ckb = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+    };
+    if (variant == 2) {   // aligned-repacked decode GEMV (T==1): coalesced int4 weight reads
+        const std::size_t nb = static_cast<std::size_t>(K) / cpu::QK8_0;
+        std::vector<signed char>    qs(static_cast<std::size_t>(M) * static_cast<std::size_t>(K));
+        std::vector<unsigned short> sc(static_cast<std::size_t>(M) * nb);
+        for (std::size_t m = 0; m < static_cast<std::size_t>(M); ++m)
+            for (std::size_t b = 0; b < nb; ++b) {
+                const cpu::BlockQ8_0& blk = Wq[m * nb + b];
+                sc[m * nb + b] = blk.d;
+                for (std::size_t j = 0; j < 32; ++j) qs[m * static_cast<std::size_t>(K) + b * 32 + j] = blk.qs[j];
+            }
+        signed char* dWqs = nullptr;  unsigned short* dWsc = nullptr;
+        cpu::BlockQ8_0* dX = nullptr;  float* dY = nullptr;
+        const std::size_t xbytes = static_cast<std::size_t>(T) * nb * sizeof(cpu::BlockQ8_0);
+        const std::size_t ybytes = static_cast<std::size_t>(M) * static_cast<std::size_t>(T) * sizeof(float);
+        ckb(cudaMalloc(&dWqs, qs.size()), "malloc qs");
+        ckb(cudaMalloc(&dWsc, sc.size() * sizeof(unsigned short)), "malloc sc");
+        ckb(cudaMalloc(&dX, xbytes), "malloc X");  ckb(cudaMalloc(&dY, ybytes), "malloc Y");
+        ckb(cudaMemcpy(dWqs, qs.data(), qs.size(), cudaMemcpyHostToDevice), "H2D qs");
+        ckb(cudaMemcpy(dWsc, sc.data(), sc.size() * sizeof(unsigned short), cudaMemcpyHostToDevice), "H2D sc");
+        ckb(cudaMemcpy(dX, Xq, xbytes, cudaMemcpyHostToDevice), "H2D X");
+        for (int w = 0; w < 3; ++w) kernels::launch_matmul_q8_0_gemv_aligned(dWqs, dWsc, dX, dY, M, K);
+        ckb(cudaDeviceSynchronize(), "warmup");
+        cudaEvent_t t0, t1;  cudaEventCreate(&t0);  cudaEventCreate(&t1);  cudaEventRecord(t0);
+        for (int r = 0; r < reps; ++r) kernels::launch_matmul_q8_0_gemv_aligned(dWqs, dWsc, dX, dY, M, K);
+        cudaEventRecord(t1);  ckb(cudaEventSynchronize(t1), "sync");
+        float ms = 0.0f;  cudaEventElapsedTime(&ms, t0, t1);
+        ckb(cudaMemcpy(Y, dY, ybytes, cudaMemcpyDeviceToHost), "D2H");
+        cudaEventDestroy(t0);  cudaEventDestroy(t1);
+        cudaFree(dWqs);  cudaFree(dWsc);  cudaFree(dX);  cudaFree(dY);
+        return static_cast<double>(ms) / 1000.0;
+    }
     const auto launch = (variant == 1) ? kernels::launch_matmul_q8_0_mma
                                        : kernels::launch_matmul_q8_0;
     const std::size_t nb = static_cast<std::size_t>(K) / cpu::QK8_0;

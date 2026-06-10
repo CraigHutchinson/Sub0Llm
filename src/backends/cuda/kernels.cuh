@@ -29,6 +29,12 @@ void launch_matmul_q8_0_mma(const ::sub0llm::backend::cpu::BlockQ8_0* dW,
                             const ::sub0llm::backend::cpu::BlockQ8_0* dXq,
                             float* dY, int M, int K, int T);
 
+// T=1 decode GEMV reading ALIGNED repacked weights (qs[M*K] int8 + scales[M*nb] f16) so the
+// weight reads are coalesced int4 (vs BlockQ8_0's misaligned byte loads). X stays BlockQ8_0.
+void launch_matmul_q8_0_gemv_aligned(const signed char* Wqs, const unsigned short* Wsc,
+                                     const ::sub0llm::backend::cpu::BlockQ8_0* X,
+                                     float* Y, int M, int K);
+
 // ── Layer sub-kernels (f32) — mirror the CPU Gemma forward (gemma.cpp) exactly ──────────
 // All operate on DEVICE pointers; one launch per call. These are the building blocks of the
 // on-device single-layer forward (the "go wide" GPU engine). Each is validated against its
