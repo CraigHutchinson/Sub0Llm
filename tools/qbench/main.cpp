@@ -305,6 +305,30 @@ void bench_layer_kernels() {
         std::printf("  quantize_q8 (n=%d)         relRMS %.2e   blocks bit-exact %zu/%zu\n",
                     n, rel_rms(gd, cd), blk_exact, nb);
     }
+
+    // ── Batched causal PREFILL attention (first batched-prefill kernel) ────────────────────
+    {
+        const int dh = 256, nH = 16, nKV = 8, T = 64, maxp = T, group = nH / nKV;
+        const auto Z = [](long long x) { return static_cast<std::size_t>(x); };
+        for (int window : {0, 24}) {   // 0 = full causal (global); 24 = sliding window (local)
+            std::vector<float> Q(Z(1LL*T*nH*dh)), kc(Z(1LL*nKV*maxp*dh)), vc(Z(1LL*nKV*maxp*dh)),
+                               g(Z(1LL*T*nH*dh)), c(Z(1LL*T*nH*dh));
+            fill(Q, 61); fill(kc, 62); fill(vc, 63);
+            for (int t = 0; t < T; ++t) for (int h = 0; h < nH; ++h) {
+                const int gi = h / group, kv_lo = window > 0 ? std::max(0, t - window + 1) : 0;
+                const float* qh = Q.data() + Z(1LL*(t*nH+h)*dh);
+                const float* Kb = kc.data() + Z(1LL*gi*maxp*dh);
+                const float* Vb = vc.data() + Z(1LL*gi*maxp*dh);
+                std::vector<float> sc(Z(t - kv_lo + 1));  float mx = -1e30f;
+                for (int s = kv_lo; s <= t; ++s) { float d = 0; for (int i = 0; i < dh; ++i) d += qh[i]*Kb[Z(1LL*s*dh)+i]; sc[Z(s-kv_lo)] = d; mx = std::max(mx, d); }
+                float sum = 0; for (auto& v : sc) { v = std::exp(v - mx); sum += v; }  const float inv = 1.0f / sum;
+                float* oh = c.data() + Z(1LL*(t*nH+h)*dh); for (int i = 0; i < dh; ++i) oh[i] = 0;
+                for (int s = kv_lo; s <= t; ++s) { const float w = sc[Z(s-kv_lo)]*inv; for (int i = 0; i < dh; ++i) oh[i] += w*Vb[Z(1LL*s*dh)+i]; }
+            }
+            cuda::flash_attn_prefill_dev(Q.data(), kc.data(), vc.data(), g.data(), T, nH, nKV, dh, window, maxp);
+            std::printf("  flash_attn_prefill (T=%d dh=%d window=%d)  relRMS %.2e\n", T, dh, window, rel_rms(g, c));
+        }
+    }
 }
 
 // Validate ONE full Gemma layer's on-device decode (gemma_layer_decode_dev) against a faithful

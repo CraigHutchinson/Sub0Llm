@@ -46,6 +46,11 @@ void flash_attn_decode_dev(const float* q, const float* K, const float* V, float
                            int dh, int kvlen);
 void quantize_q8_dev(const float* x, cpu::BlockQ8_0* y, int n);   // n = row width (n/32 blocks)
 
+// Validate batched causal PREFILL attention (H2D→launch→D2H). Q[T·nH·dh], f32 KV cache
+// kcache/vcache[nKV·max_pos·dh] (filled for the T positions), out[T·nH·dh]. group=nH/nKV.
+void flash_attn_prefill_dev(const float* Q, const float* kcache, const float* vcache, float* out,
+                            int T, int nH, int nKV, int dh, int window, int max_pos);
+
 // ── On-device single Gemma layer (Stage 2) ──────────────────────────────────────────────
 // One transformer layer's weights + shape as HOST pointers (the GPU forward uploads them).
 // Q8 weights are row-major (out,in) exactly as GemmaLayer stores them; norms are f32. This is

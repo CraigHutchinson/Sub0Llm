@@ -408,6 +408,21 @@ DevScratch alloc_scratch(int D, int dff, int qM, int kvM, std::vector<DevBuf>& p
 }
 } // namespace
 
+void flash_attn_prefill_dev(const float* Q, const float* kcache, const float* vcache, float* out,
+                            int T, int nH, int nKV, int dh, int window, int max_pos) {
+    const auto SZ = [](int v) { return static_cast<std::size_t>(v); };
+    const std::size_t qb  = SZ(T) * SZ(nH) * SZ(dh) * sizeof(float);
+    const std::size_t kvb = SZ(nKV) * SZ(max_pos) * SZ(dh) * sizeof(float);
+    DevBuf dQ(qb), dK(kvb), dV(kvb), dO(qb);
+    ck(cudaMemcpy(dQ.p, Q, qb, cudaMemcpyHostToDevice), "H2D Q");
+    ck(cudaMemcpy(dK.p, kcache, kvb, cudaMemcpyHostToDevice), "H2D K");
+    ck(cudaMemcpy(dV.p, vcache, kvb, cudaMemcpyHostToDevice), "H2D V");
+    kernels::launch_flash_attn_prefill_heads(static_cast<float*>(dQ.p), static_cast<float*>(dK.p),
+        static_cast<float*>(dV.p), static_cast<float*>(dO.p), T, nH, dh, window, nH / nKV, max_pos, 0);
+    ck(cudaDeviceSynchronize(), "prefill attn sync");
+    ck(cudaMemcpy(out, dO.p, qb, cudaMemcpyDeviceToHost), "D2H out");
+}
+
 void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
                             float* kcache, float* vcache, int max_pos, float* out) {
     const int D = L.D, dh = L.dh, qM = L.n_head * dh, kvM = L.n_kv_head * dh;
@@ -504,6 +519,9 @@ void quantize_q8_dev(const float*, cpu::BlockQ8_0*, int) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 void gemma_layer_decode_dev(const GpuLayerDesc&, const float*, int, float*, float*, int, float*) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void flash_attn_prefill_dev(const float*, const float*, const float*, float*, int, int, int, int, int, int) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 struct GemmaGpuLayers::Impl {};

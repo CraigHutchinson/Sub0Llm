@@ -434,6 +434,57 @@ __global__ void flash_attn_decode_heads_kernel(const float* __restrict__ q, cons
     for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
 }
 
+// Batched CAUSAL attention for PREFILL: one block per (token t, head h) = grid T·nH. Query (t,h)
+// attends cache positions [kv_lo(p), p], p=start_pos+t (causal + sliding window). Same online
+// softmax as the decode kernel; the only change is the grid carries the token index and kvlen=p-kv_lo+1.
+// Q is [T, nH, dh] (per-token-contiguous, row (t·nH+h)); K/V cache [kv_head][max_pos][dh] filled for the
+// T prefill positions before this launch. Matches forward_prefill's per-(token,head) attention.
+__global__ void flash_attn_prefill_heads_kernel(const float* __restrict__ Q, const float* __restrict__ kcD,
+                                                const float* __restrict__ vcD, float* __restrict__ out,
+                                                int nH, int dh, int window, int group, int max_pos,
+                                                int start_pos) {
+    const int idx = blockIdx.x;                 // t*nH + h
+    const int t = idx / nH, h = idx % nH, g = h / group;
+    const int p = start_pos + t;
+    const int kv_lo = window > 0 ? max(0, p - window + 1) : 0;
+    const int kvlen = p - kv_lo + 1;
+    const float* qh = Q + static_cast<long long>(idx) * dh;
+    const float* K  = kcD + (static_cast<long long>(g) * max_pos + kv_lo) * dh;
+    const float* V  = vcD + (static_cast<long long>(g) * max_pos + kv_lo) * dh;
+    float* oh = out + static_cast<long long>(idx) * dh;
+
+    extern __shared__ float sh[];
+    float* sq = sh;  float* sacc = sh + dh;  float* sred = sh + 2 * dh;
+    __shared__ float s_m, s_l, s_alpha, s_p;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) { sq[i] = qh[i]; sacc[i] = 0.0f; }
+    if (threadIdx.x == 0) { s_m = __int_as_float(0xff800000); s_l = 0.0f; }
+    __syncthreads();
+    for (int s = 0; s < kvlen; ++s) {
+        const float* Ks = K + static_cast<long long>(s) * dh;
+        float local = 0.0f;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) local += sq[i] * Ks[i];
+        sred[threadIdx.x] = local;
+        __syncthreads();
+        for (int r = blockDim.x >> 1; r > 0; r >>= 1) {
+            if (threadIdx.x < r) sred[threadIdx.x] += sred[threadIdx.x + r];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = sred[0];
+            const float m_new = fmaxf(s_m, score);
+            s_alpha = expf(s_m - m_new);  s_p = expf(score - m_new);
+            s_l = s_l * s_alpha + s_p;    s_m = m_new;
+        }
+        __syncthreads();
+        const float* Vs = V + static_cast<long long>(s) * dh;
+        const float alpha = s_alpha, pp = s_p;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) sacc[i] = sacc[i] * alpha + pp * Vs[i];
+        __syncthreads();
+    }
+    const float invl = 1.0f / s_l;
+    for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
+}
+
 // ── q8 KV cache variants ────────────────────────────────────────────────────────────────────
 // Quantize K/V head-vectors and scatter into the Q8 KV cache slot for `pos`. One warp per block;
 // warp w covers a (head, block) of K (w < nKV·nbh) or V (w >= nKV·nbh). Mirrors quantize_row_q8_0.
@@ -622,6 +673,15 @@ void launch_flash_attn_decode_heads_q8(const float* q, const BlockQ8_0* kcD, con
     constexpr int B = 128;
     const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
     flash_attn_decode_heads_q8_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
+}
+
+void launch_flash_attn_prefill_heads(const float* Q, const float* kcD, const float* vcD, float* out,
+                                     int T, int nH, int dh, int window, int group, int max_pos,
+                                     int start_pos) {
+    constexpr int B = 128;
+    const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
+    flash_attn_prefill_heads_kernel<<<T * nH, B, shmem>>>(Q, kcD, vcD, out, nH, dh, window, group,
+                                                          max_pos, start_pos);
 }
 
 void launch_matmul_q8_0_gemv_aligned(const int8_t* Wqs, const uint16_t* Wsc, const BlockQ8_0* X,

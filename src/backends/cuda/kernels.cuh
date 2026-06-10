@@ -35,6 +35,13 @@ void launch_matmul_q8_0_gemv_aligned(const signed char* Wqs, const unsigned shor
                                      const ::sub0llm::backend::cpu::BlockQ8_0* X,
                                      float* Y, int M, int K);
 
+// Batched causal PREFILL attention: grid T·nH, block (t,h) attends cache [kv_lo(p),p], p=start_pos+t.
+// Q is [T,nH,dh] (per-token-contiguous); f32 KV cache [kv_head][max_pos][dh]. The first batched-prefill
+// kernel (the genuinely new piece vs decode). scale=1.0.
+void launch_flash_attn_prefill_heads(const float* Q, const float* kcD, const float* vcD, float* out,
+                                     int T, int nH, int dh, int window, int group, int max_pos,
+                                     int start_pos);
+
 // ── Layer sub-kernels (f32) — mirror the CPU Gemma forward (gemma.cpp) exactly ──────────
 // All operate on DEVICE pointers; one launch per call. These are the building blocks of the
 // on-device single-layer forward (the "go wide" GPU engine). Each is validated against its
