@@ -5,6 +5,9 @@
 #include "sub0llm/core/tensor.hpp"
 #include "sub0llm/backends/cpu/quant.hpp"   // BlockQ8_0
 
+#include <memory>
+#include <vector>
+
 namespace sub0llm::backend::cuda {
 
 // Allocate device memory and return a Storage with a cuda-free deleter.
@@ -66,5 +69,24 @@ struct GpuLayerDesc {
 // kernel pipeline, downloads the result. Throws if CUDA is not compiled in.
 void gemma_layer_decode_dev(const GpuLayerDesc& L, const float* x, int pos,
                             float* kcache, float* vcache, int max_pos, float* out);
+
+// Persistent device-resident run of a contiguous block of Gemma layers (Stage 3 perf form):
+// uploads every layer's weights ONCE at construction, holds a device KV cache + reused scratch,
+// and on each decode keeps activations device-resident across all layers (no per-token weight
+// re-upload). Numerically identical to chaining gemma_layer_decode_dev layer-by-layer — same
+// kernels, same order. Construction throws if CUDA is not compiled in.
+class GemmaGpuLayers {
+public:
+    GemmaGpuLayers(const std::vector<GpuLayerDesc>& layers, int max_pos);
+    ~GemmaGpuLayers();
+    GemmaGpuLayers(const GemmaGpuLayers&) = delete;
+    GemmaGpuLayers& operator=(const GemmaGpuLayers&) = delete;
+    // Decode one token at `pos`: x (D, host f32) → out (D, host f32), updating the device KV
+    // cache. `out` is the activation after the LAST uploaded layer (feeds the CPU layers / head).
+    void decode(const float* x, int pos, float* out);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace sub0llm::backend::cuda

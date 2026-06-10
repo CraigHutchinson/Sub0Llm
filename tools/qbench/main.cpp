@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -436,13 +437,87 @@ void bench_gpu_layer() {
                     cfg.name, dh, nKV, cfg.has_wv ? "wv" : "V=K", rel_rms(outG, outC), rel_rms(kSlotG, kSlotC));
     }
 }
+
+// One synthetic layer that OWNS its weights/norms; desc points into them (heap buffers, stable).
+struct SynthLayer {
+    std::vector<BlockQ8_0> wq, wk, wv, wo, gate, up, down;
+    std::vector<float> an, pan, fn, pfn, qn, kn, ff;
+    sub0llm::backend::cuda::GpuLayerDesc desc{};
+};
+std::unique_ptr<SynthLayer> make_synth_layer(int D, int dff, int dh, int nH, int nKV, int window,
+                                             float base, bool has_wv, bool use_ff, uint32_t seed) {
+    auto S = std::make_unique<SynthLayer>();
+    const auto Z = [](long long n) { return static_cast<std::size_t>(n); };
+    auto mkQ = [&](std::vector<BlockQ8_0>& dst, int Mr, int Kr, uint32_t s) {
+        std::vector<float> W(Z(1LL * Mr * Kr));  fill(W, s);
+        dst.resize(Z(1LL * Mr * (Kr / QK8_0)));
+        for (int m = 0; m < Mr; ++m) quantize_row_q8_0(W.data() + Z(1LL * m * Kr), dst.data() + Z(1LL * m * (Kr / QK8_0)), Kr);
+    };
+    const int qM = nH * dh, kvM = nKV * dh;
+    mkQ(S->wq, qM, D, seed + 1); mkQ(S->wk, kvM, D, seed + 2); if (has_wv) mkQ(S->wv, kvM, D, seed + 3);
+    mkQ(S->wo, D, qM, seed + 4); mkQ(S->gate, dff, D, seed + 5); mkQ(S->up, dff, D, seed + 6); mkQ(S->down, D, dff, seed + 7);
+    auto mkN = [&](std::vector<float>& dst, int n, uint32_t s) { dst.resize(Z(n)); fill(dst, s); for (auto& z : dst) z += 1.0f; };
+    mkN(S->an, D, seed + 11); mkN(S->pan, D, seed + 12); mkN(S->fn, D, seed + 13); mkN(S->pfn, D, seed + 14);
+    mkN(S->qn, dh, seed + 15); { const float qs = 1.0f / std::sqrt(float(dh)); for (auto& z : S->qn) z *= qs; }
+    mkN(S->kn, dh, seed + 16);
+    S->ff.resize(Z(dh / 2)); for (int i = 0; i < dh / 2; ++i) S->ff[Z(i)] = 1.0f + 0.5f * float(i) / float(dh / 2);
+    auto& d = S->desc;
+    d.D = D; d.d_ff = dff; d.dh = dh; d.n_head = nH; d.n_kv_head = nKV; d.window = window;
+    d.eps = 1e-6f; d.rope_base = base; d.out_scale = 0.95f; d.has_wv = has_wv;
+    d.wq = S->wq.data(); d.wk = S->wk.data(); d.wv = has_wv ? S->wv.data() : nullptr; d.wo = S->wo.data();
+    d.gate = S->gate.data(); d.up = S->up.data(); d.down = S->down.data();
+    d.attn_norm = S->an.data(); d.post_attn_norm = S->pan.data(); d.ffn_norm = S->fn.data();
+    d.post_ffw_norm = S->pfn.data(); d.q_norm = S->qn.data(); d.k_norm = S->kn.data();
+    d.rope_freqs = use_ff ? S->ff.data() : nullptr;
+    return S;
+}
+
+// Equivalence check: the resident GemmaGpuLayers (weights uploaded once, KV + activations device-
+// resident across layers) must reproduce the per-call gemma_layer_decode_dev form (host KV, layer
+// chained on the host) BIT-for-bit — same kernels, same order, only data-movement timing differs.
+// Runs a 3-layer (local/global/local) stack for several decode steps and compares final outputs.
+void bench_gpu_resident() {
+    namespace cuda = sub0llm::backend::cuda;
+    auto rel_rms = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double se = 0.0, sr = 0.0; for (std::size_t i = 0; i < a.size(); ++i) { const double d = double(a[i]) - double(b[i]); se += d * d; sr += double(b[i]) * double(b[i]); }
+        return std::sqrt(se / (sr + 1e-12));
+    };
+    const int D = 3840, dff = 15360, max_pos = 64, ntok = 5;
+    const auto Z = [](long long n) { return static_cast<std::size_t>(n); };
+    std::vector<std::unique_ptr<SynthLayer>> S;
+    S.push_back(make_synth_layer(D, dff, 256, 16, 8, 1024, 1e4f, true,  false, 100));
+    S.push_back(make_synth_layer(D, dff, 512, 16, 1,    0, 1e6f, false, true,  200));
+    S.push_back(make_synth_layer(D, dff, 256, 16, 8, 1024, 1e4f, true,  false, 300));
+    std::vector<cuda::GpuLayerDesc> descs;  for (auto& s : S) descs.push_back(s->desc);
+    const int L = int(descs.size());
+
+    std::vector<std::vector<float>> kcA(Z(L)), vcA(Z(L));   // (A) host KV per layer
+    for (int l = 0; l < L; ++l) { const int kv = descs[Z(l)].n_kv_head * max_pos * descs[Z(l)].dh; kcA[Z(l)].assign(Z(kv), 0.0f); vcA[Z(l)].assign(Z(kv), 0.0f); }
+    cuda::GemmaGpuLayers gpu(descs, max_pos);               // (B) resident
+
+    std::printf("\n=== GPU resident layers vs per-call form (relRMS, expect ~0) ===\n");
+    double worst = 0.0;
+    for (int t = 0; t < ntok; ++t) {
+        std::vector<float> x(Z(D));  fill(x, 900u + uint32_t(t));
+        std::vector<float> xa = x, outa(Z(D));             // (A) chain per-call form on the host
+        for (int l = 0; l < L; ++l) {
+            cuda::gemma_layer_decode_dev(descs[Z(l)], xa.data(), t, kcA[Z(l)].data(), vcA[Z(l)].data(), max_pos, outa.data());
+            xa = outa;
+        }
+        std::vector<float> outb(Z(D));                     // (B) resident form
+        gpu.decode(x.data(), t, outb.data());
+        const double r = rel_rms(outb, outa);  worst = std::max(worst, r);
+        std::printf("  token %d (pos %d)  relRMS %.2e\n", t, t, r);
+    }
+    std::printf("  worst over %d tokens: %.2e %s\n", ntok, worst, worst < 1e-6 ? "(identical)" : "(MISMATCH)");
+}
 #endif
 
 } // namespace
 
 int main(int argc, char** argv) {
     int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3";
-    bool layers = false, gpu_layer = false;
+    bool layers = false, gpu_layer = false, gpu_resident = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
         auto next = [&] { return std::string(argv[++i]); };
@@ -453,9 +528,10 @@ int main(int argc, char** argv) {
         else if (a == "--preset") preset = next();
         else if (a == "--layers") layers = true;
         else if (a == "--gpu-layer") gpu_layer = true;
+        else if (a == "--gpu-resident") gpu_resident = true;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: sub0llm-qbench [--M N --K N] [--batch T] [--reps N] "
-                        "[--preset qwen3|gemma] [--layers] [--gpu-layer]\n");
+                        "[--preset qwen3|gemma] [--layers] [--gpu-layer] [--gpu-resident]\n");
             return 0;
         }
     }
@@ -468,12 +544,13 @@ int main(int argc, char** argv) {
     std::printf("[qbench] SIMD: scalar\n");
 #endif
 
-    if (layers || gpu_layer) {  // GPU validation vs CPU reference
+    if (layers || gpu_layer || gpu_resident) {  // GPU validation vs CPU reference
 #ifdef SUB0LLM_CUDA
-        if (layers)    bench_layer_kernels();
-        if (gpu_layer) bench_gpu_layer();
+        if (layers)       bench_layer_kernels();
+        if (gpu_layer)    bench_gpu_layer();
+        if (gpu_resident) bench_gpu_resident();
 #else
-        std::printf("[qbench] --layers/--gpu-layer need a CUDA build (configure with the cuda preset)\n");
+        std::printf("[qbench] --layers/--gpu-layer/--gpu-resident need a CUDA build (cuda preset)\n");
 #endif
         return 0;
     }
