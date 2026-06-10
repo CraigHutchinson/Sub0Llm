@@ -172,17 +172,22 @@ void bench_batch(const char* label, int64_t M, int64_t K, int64_t T, int reps) {
     // matmul within Q8 tolerance — different backend, different float-accumulation order, so
     // compare by relative RMS rather than bitwise. Y currently holds the CPU result.
     std::vector<float> Yg(static_cast<std::size_t>(M * T));
-    const double tgpu = sub0llm::backend::cuda::matmul_q8_0_bench(
-        Wq.data(), Xq.data(), Yg.data(),
-        static_cast<int>(M), static_cast<int>(K), static_cast<int>(T), reps);
-    double se = 0.0, sr = 0.0;
-    for (std::size_t i = 0; i < static_cast<std::size_t>(M * T); ++i) {
-        const double d = static_cast<double>(Yg[i]) - static_cast<double>(Y[i]);
-        se += d * d;  sr += static_cast<double>(Y[i]) * static_cast<double>(Y[i]);
+    auto rel_to_cpu = [&] {
+        double se = 0.0, sr = 0.0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(M * T); ++i) {
+            const double d = static_cast<double>(Yg[i]) - static_cast<double>(Y[i]);
+            se += d * d;  sr += static_cast<double>(Y[i]) * static_cast<double>(Y[i]);
+        }
+        return std::sqrt(se / (sr + 1e-12));
+    };
+    const char* names[2] = {"CUDA Q8 dp4a   (CUDA cores)", "CUDA Q8 IMMA   (tensor cores)"};
+    for (int variant = 0; variant < 2; ++variant) {
+        const double tgpu = sub0llm::backend::cuda::matmul_q8_0_bench(
+            Wq.data(), Xq.data(), Yg.data(),
+            static_cast<int>(M), static_cast<int>(K), static_cast<int>(T), reps, variant);
+        std::printf("  %-29s   %7.2f GFLOP/s   %.2fx vs CPU batched   relRMS %.2e\n",
+                    names[variant], gf / tgpu, tb / tgpu, rel_to_cpu());
     }
-    const double rel = std::sqrt(se / (sr + 1e-12));
-    std::printf("  CUDA Q8 dp4a (RTX 5070):          %7.2f GFLOP/s   %.2fx vs CPU batched   relRMS %.2e\n",
-                gf / tgpu, tb / tgpu, rel);
 #endif
 }
 

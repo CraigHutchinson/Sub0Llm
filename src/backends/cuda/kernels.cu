@@ -10,11 +10,13 @@
 #include "kernels.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cstdint>
 
 namespace sub0llm::backend::cuda::kernels {
 
 using ::sub0llm::backend::cpu::BlockQ8_0;
+namespace wmma = nvcuda::wmma;
 
 namespace {
 constexpr int BLOCK = 256;
@@ -101,6 +103,73 @@ __global__ void matmul_q8_0_kernel(const BlockQ8_0* __restrict__ W,
     Y[static_cast<long long>(m) * T + t] = acc;
 }
 
+// IMMA (int8 tensor-core) Q8 matmul. One warp computes a 16×16 output tile. Q8_0's per-32
+// scale fights the tensor core (which wants uniform-scale K-accumulation), so we run ONE
+// 16×16×16 MMA pair per Q8 block (= 32 K-elems → two K=16 steps) into an int32 fragment,
+// then apply that block's wd[m]·xd[n] scales and accumulate into a float tile in shared mem.
+// Weight/activation int8 + scales are gathered to shared each block (handles the scattered
+// BlockQ8_0 layout and lets WMMA load contiguous tiles). M/T tails are zero-padded.
+constexpr int MMA = 16;
+__global__ void matmul_q8_0_mma_kernel(const BlockQ8_0* __restrict__ W,
+                                       const BlockQ8_0* __restrict__ X,
+                                       float* __restrict__ Y, int M, int K, int T) {
+    const int m0 = blockIdx.y * MMA;   // tile's first weight row
+    const int n0 = blockIdx.x * MMA;   // tile's first token / column
+    const int lane = threadIdx.x;      // 0..31, single warp
+    const int nb = K / QK;
+
+    __shared__ signed char As[MMA][QK];   // weight tile  [row][k]   (matrix_a, row-major)
+    __shared__ signed char Bs[MMA][QK];   // act tile     [col][k]   (matrix_b, col-major)
+    __shared__ int         Cs[MMA][MMA];  // per-block int32 dot
+    __shared__ float       facc[MMA][MMA];// scaled float accumulator (persists across blocks)
+    __shared__ float       wd[MMA], xd[MMA];
+
+    for (int idx = lane; idx < MMA * MMA; idx += 32) facc[idx / MMA][idx % MMA] = 0.0f;
+    __syncwarp();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a0, a1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b0, b1;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c;
+
+    for (int b = 0; b < nb; ++b) {
+        for (int idx = lane; idx < MMA * QK; idx += 32) {       // gather weight int8 tile
+            const int r = idx / QK, k = idx % QK, gm = m0 + r;
+            As[r][k] = (gm < M) ? W[static_cast<long long>(gm) * nb + b].qs[k] : (signed char)0;
+        }
+        for (int idx = lane; idx < MMA * QK; idx += 32) {       // gather activation int8 tile
+            const int col = idx / QK, k = idx % QK, gn = n0 + col;
+            Bs[col][k] = (gn < T) ? X[static_cast<long long>(gn) * nb + b].qs[k] : (signed char)0;
+        }
+        if (lane < MMA) {                                       // gather per-block f16 scales
+            const int gm = m0 + lane, gn = n0 + lane;
+            wd[lane] = (gm < M) ? __half2float(__ushort_as_half(W[static_cast<long long>(gm) * nb + b].d)) : 0.0f;
+            xd[lane] = (gn < T) ? __half2float(__ushort_as_half(X[static_cast<long long>(gn) * nb + b].d)) : 0.0f;
+        }
+        __syncwarp();
+
+        wmma::fill_fragment(c, 0);
+        wmma::load_matrix_sync(a0, &As[0][0],  QK);
+        wmma::load_matrix_sync(a1, &As[0][16], QK);
+        wmma::load_matrix_sync(b0, &Bs[0][0],  QK);
+        wmma::load_matrix_sync(b1, &Bs[0][16], QK);
+        wmma::mma_sync(c, a0, b0, c);
+        wmma::mma_sync(c, a1, b1, c);
+        wmma::store_matrix_sync(&Cs[0][0], c, MMA, wmma::mem_row_major);
+        __syncwarp();
+
+        for (int idx = lane; idx < MMA * MMA; idx += 32) {      // apply block scales, accumulate
+            const int m = idx / MMA, n = idx % MMA;
+            facc[m][n] += wd[m] * xd[n] * static_cast<float>(Cs[m][n]);
+        }
+        __syncwarp();
+    }
+
+    for (int idx = lane; idx < MMA * MMA; idx += 32) {
+        const int m = idx / MMA, n = idx % MMA, gm = m0 + m, gn = n0 + n;
+        if (gm < M && gn < T) Y[static_cast<long long>(gm) * T + gn] = facc[m][n];
+    }
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -129,6 +198,14 @@ void launch_matmul_q8_0(const BlockQ8_0* dW, const BlockQ8_0* dXq, float* dY,
     const dim3 grid2(grid(static_cast<std::size_t>(T), block.x),
                      grid(static_cast<std::size_t>(M), block.y));
     matmul_q8_0_kernel<<<grid2, block>>>(dW, dXq, dY, M, K, T);
+}
+
+void launch_matmul_q8_0_mma(const BlockQ8_0* dW, const BlockQ8_0* dXq, float* dY,
+                            int M, int K, int T) {
+    const dim3 block(32, 1);                      // one warp per 16×16 output tile
+    const dim3 grid2(grid(static_cast<std::size_t>(T), MMA),
+                     grid(static_cast<std::size_t>(M), MMA));
+    matmul_q8_0_mma_kernel<<<grid2, block>>>(dW, dXq, dY, M, K, T);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

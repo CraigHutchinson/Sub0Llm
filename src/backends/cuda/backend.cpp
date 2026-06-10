@@ -141,8 +141,10 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 }
 
 double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq, float* Y,
-                         int M, int K, int T, int reps) {
+                         int M, int K, int T, int reps, int variant) {
 #ifdef SUB0LLM_CUDA
+    const auto launch = (variant == 1) ? kernels::launch_matmul_q8_0_mma
+                                       : kernels::launch_matmul_q8_0;
     const std::size_t nb = static_cast<std::size_t>(K) / cpu::QK8_0;
     const std::size_t wbytes = static_cast<std::size_t>(M) * nb * sizeof(cpu::BlockQ8_0);
     const std::size_t xbytes = static_cast<std::size_t>(T) * nb * sizeof(cpu::BlockQ8_0);
@@ -158,12 +160,12 @@ double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq, flo
     ck(cudaMemcpy(dW, Wq, wbytes, cudaMemcpyHostToDevice), "H2D W");
     ck(cudaMemcpy(dX, Xq, xbytes, cudaMemcpyHostToDevice), "H2D X");
 
-    for (int w = 0; w < 3; ++w) kernels::launch_matmul_q8_0(dW, dX, dY, M, K, T);  // warm-up
+    for (int w = 0; w < 3; ++w) launch(dW, dX, dY, M, K, T);  // warm-up
     ck(cudaDeviceSynchronize(), "warmup sync");
 
     cudaEvent_t t0, t1;  cudaEventCreate(&t0);  cudaEventCreate(&t1);
     cudaEventRecord(t0);
-    for (int r = 0; r < reps; ++r) kernels::launch_matmul_q8_0(dW, dX, dY, M, K, T);
+    for (int r = 0; r < reps; ++r) launch(dW, dX, dY, M, K, T);
     cudaEventRecord(t1);
     ck(cudaEventSynchronize(t1), "kernel sync");
     float ms = 0.0f;  cudaEventElapsedTime(&ms, t0, t1);
@@ -173,7 +175,7 @@ double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq, flo
     cudaFree(dW);  cudaFree(dX);  cudaFree(dY);
     return static_cast<double>(ms) / 1000.0;
 #else
-    (void)Wq; (void)Xq; (void)Y; (void)M; (void)K; (void)T; (void)reps;
+    (void)Wq; (void)Xq; (void)Y; (void)M; (void)K; (void)T; (void)reps; (void)variant;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }

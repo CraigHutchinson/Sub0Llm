@@ -23,5 +23,11 @@ void launch_matmul_q8_0(const ::sub0llm::backend::cpu::BlockQ8_0* dW,
                         const ::sub0llm::backend::cpu::BlockQ8_0* dXq,
                         float* dY, int M, int K, int T);
 
+// Same semantics, int8 tensor cores (WMMA IMMA): one warp per 16×16 tile, one MMA pair per
+// Q8 block, per-block f16 scales applied into a float accumulator. Targets the sm_120 ceiling.
+void launch_matmul_q8_0_mma(const ::sub0llm::backend::cpu::BlockQ8_0* dW,
+                            const ::sub0llm::backend::cpu::BlockQ8_0* dXq,
+                            float* dY, int M, int K, int T);
+
 } // namespace sub0llm::backend::cuda::kernels
 #endif // SUB0LLM_CUDA

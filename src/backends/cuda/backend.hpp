@@ -26,9 +26,10 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // Benchmark + validate the device Q8 matmul end-to-end: H2D-copy host Wq[M,K/32] and
 // Xq[T,K/32], run `reps` timed kernel launches (GPU events, after a warm-up), D2H-copy the
 // last result into Y[M,T]. Returns total GPU kernel time (seconds) for `reps` launches.
-// Throws if CUDA is not compiled in. Lets the CPU-side caller (qbench) compare Y to the CPU
-// reference and compute GFLOP/s without touching the CUDA API itself.
+// `variant`: 0 = dp4a (CUDA cores), 1 = IMMA (int8 tensor cores). Throws if CUDA is not
+// compiled in. Lets the CPU-side caller (qbench) compare Y to the CPU reference and compute
+// GFLOP/s without touching the CUDA API itself.
 [[nodiscard]] double matmul_q8_0_bench(const cpu::BlockQ8_0* Wq, const cpu::BlockQ8_0* Xq,
-                                       float* Y, int M, int K, int T, int reps);
+                                       float* Y, int M, int K, int T, int reps, int variant);
 
 } // namespace sub0llm::backend::cuda
