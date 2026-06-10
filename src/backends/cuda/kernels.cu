@@ -231,7 +231,7 @@ __global__ void flash_attn_decode_kernel(const float* __restrict__ q, const floa
     __shared__ float s_m, s_l, s_alpha, s_p;
 
     for (int i = threadIdx.x; i < dh; i += blockDim.x) { sq[i] = q[i]; sacc[i] = 0.0f; }
-    if (threadIdx.x == 0) { s_m = -INFINITY; s_l = 0.0f; }
+    if (threadIdx.x == 0) { s_m = __int_as_float(0xff800000); s_l = 0.0f; }  // -inf (no #221-D remark)
     __syncthreads();
 
     for (int t = 0; t < kvlen; ++t) {
@@ -260,6 +260,22 @@ __global__ void flash_attn_decode_kernel(const float* __restrict__ q, const floa
     }
     const float invl = 1.0f / s_l;
     for (int i = threadIdx.x; i < dh; i += blockDim.x) o[i] = sacc[i] * invl;
+}
+
+// Quantize f32 → Q8_0, one warp per 32-element block: lane j owns element j; warp-reduce the
+// abs-max, d = amax/127, qs[j] = round-to-nearest(x[j]/d), store d as f16. Mirrors quantize_row_q8_0.
+__global__ void quantize_q8_kernel(const float* __restrict__ x, BlockQ8_0* __restrict__ y, int nb) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nb) return;
+    const float v = x[static_cast<long long>(warp) * QK + lane];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const float d  = a / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    y[warp].qs[lane] = static_cast<signed char>(__float2int_rn(v * id));
+    if (lane == 0) y[warp].d = __half_as_ushort(__float2half(d));
 }
 
 } // anonymous namespace
@@ -321,6 +337,12 @@ void launch_flash_attn_decode(const float* dq, const float* dK, const float* dV,
     constexpr int B = 128;                        // power of two for the per-position reduction
     const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
     flash_attn_decode_kernel<<<1, B, shmem>>>(dq, dK, dV, dout, dh, kvlen);
+}
+
+void launch_quantize_q8(const float* dx, BlockQ8_0* dy, int nb) {
+    constexpr int B = 256;                        // 8 warps/block → 8 Q8 blocks per CUDA block
+    const int blocks = grid(static_cast<std::size_t>(nb) * 32, B);
+    quantize_q8_kernel<<<blocks, B>>>(dx, dy, nb);
 }
 
 } // namespace sub0llm::backend::cuda::kernels

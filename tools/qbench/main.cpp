@@ -282,6 +282,26 @@ void bench_layer_kernels() {
             std::printf("  flash_attn_decode (dh=%d kvlen=%d)  relRMS %.2e\n", dhi, kvleni, rel_rms(g, c));
         }
     }
+
+    // ── Device Q8 activation quantizer (mirrors quantize_row_q8_0) ─────────────────────────
+    {
+        const int n = 3840;  const std::size_t nb = static_cast<std::size_t>(n) / QK8_0;
+        std::vector<float> x(static_cast<std::size_t>(n));  fill(x, 51);
+        std::vector<BlockQ8_0> cq(nb), gq(nb);
+        quantize_row_q8_0(x.data(), cq.data(), n);
+        cuda::quantize_q8_dev(x.data(), gq.data(), n);
+        std::size_t blk_exact = 0;
+        for (std::size_t b = 0; b < nb; ++b) {
+            bool same = (cq[b].d == gq[b].d);
+            for (int j = 0; j < QK8_0 && same; ++j) same = (cq[b].qs[j] == gq[b].qs[j]);
+            blk_exact += same ? 1 : 0;
+        }
+        std::vector<float> cd(static_cast<std::size_t>(n)), gd(static_cast<std::size_t>(n));
+        dequantize_row_q8_0(cq.data(), cd.data(), n);
+        dequantize_row_q8_0(gq.data(), gd.data(), n);
+        std::printf("  quantize_q8 (n=%d)         relRMS %.2e   blocks bit-exact %zu/%zu\n",
+                    n, rel_rms(gd, cd), blk_exact, nb);
+    }
 }
 #endif
 

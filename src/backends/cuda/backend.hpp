@@ -41,5 +41,6 @@ void rope_neox_dev(const float* x_in, float* x_out, int dh, int pos, float base,
 void geglu_dev(const float* gate, const float* up, float* out, int n);
 void flash_attn_decode_dev(const float* q, const float* K, const float* V, float* o,
                            int dh, int kvlen);
+void quantize_q8_dev(const float* x, cpu::BlockQ8_0* y, int n);   // n = row width (n/32 blocks)
 
 } // namespace sub0llm::backend::cuda

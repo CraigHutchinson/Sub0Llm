@@ -54,5 +54,10 @@ void launch_geglu(const float* dgate, const float* dup, float* dout, int n);
 void launch_flash_attn_decode(const float* dq, const float* dK, const float* dV,
                               float* dout, int dh, int kvlen);
 
+// Quantize `nb` Q8_0 blocks (nb·32 f32 activations) → BlockQ8_0 on device, matching
+// backend::cpu::quantize_row_q8_0 (per-32 amax scale d=amax/127, round-to-nearest, f16 d).
+// One warp per block. Feeds the device Q8 matmul (which consumes Q8 activations).
+void launch_quantize_q8(const float* dx, ::sub0llm::backend::cpu::BlockQ8_0* dy, int nb);
+
 } // namespace sub0llm::backend::cuda::kernels
 #endif // SUB0LLM_CUDA

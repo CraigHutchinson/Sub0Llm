@@ -245,6 +245,18 @@ void flash_attn_decode_dev(const float* q, const float* K, const float* V, float
     ck(cudaDeviceSynchronize(), "flash sync");
     ck(cudaMemcpy(o, dout.p, qb, cudaMemcpyDeviceToHost), "D2H o");
 }
+
+void quantize_q8_dev(const float* x, cpu::BlockQ8_0* y, int n) {
+    const int nb = n / static_cast<int>(cpu::QK8_0);
+    const std::size_t xbytes = static_cast<std::size_t>(n) * sizeof(float);
+    const std::size_t ybytes = static_cast<std::size_t>(nb) * sizeof(cpu::BlockQ8_0);
+    DevBuf dx(xbytes), dy(ybytes);
+    ck(cudaMemcpy(dx.p, x, xbytes, cudaMemcpyHostToDevice), "H2D x");
+    kernels::launch_quantize_q8(static_cast<float*>(dx.p),
+                                static_cast<cpu::BlockQ8_0*>(dy.p), nb);
+    ck(cudaDeviceSynchronize(), "quantize sync");
+    ck(cudaMemcpy(y, dy.p, ybytes, cudaMemcpyDeviceToHost), "D2H y");
+}
 #else
 void rmsnorm_dev(const float*, const float*, float*, int, float) {
     throw std::runtime_error("CUDA backend not compiled in");
@@ -256,6 +268,9 @@ void geglu_dev(const float*, const float*, float*, int) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 void flash_attn_decode_dev(const float*, const float*, const float*, float*, int, int) {
+    throw std::runtime_error("CUDA backend not compiled in");
+}
+void quantize_q8_dev(const float*, cpu::BlockQ8_0*, int) {
     throw std::runtime_error("CUDA backend not compiled in");
 }
 #endif
