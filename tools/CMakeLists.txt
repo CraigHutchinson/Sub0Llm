@@ -59,6 +59,9 @@ set_target_properties(sub0llm-gemma PROPERTIES
 # matmul vs f32) across real model GEMV shapes — measure, don't assume.
 add_executable(sub0llm-qbench qbench/main.cpp)
 target_link_libraries(sub0llm-qbench PRIVATE sub0llm)
+# qbench reaches the private CUDA backend header (backends/cuda/backend.hpp) to bench the
+# device Q8 matmul against the CPU path; needs the library's src/ on its include path.
+target_include_directories(sub0llm-qbench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 sub0llm_apply_compile_options(sub0llm-qbench)
 set_target_properties(sub0llm-qbench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

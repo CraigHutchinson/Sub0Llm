@@ -9,6 +9,9 @@
 // preset to see how the winner shifts across the shapes a real forward issues.
 
 #include "sub0llm/backends/cpu/quant.hpp"
+#ifdef SUB0LLM_CUDA
+#  include "backends/cuda/backend.hpp"   // device Q8 matmul bench (validates vs CPU)
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -163,6 +166,24 @@ void bench_batch(const char* label, int64_t M, int64_t K, int64_t T, int reps) {
     std::printf("  batched matmul   (W reused/tile): %7.2f GFLOP/s   %.2fx\n", gf / tb, tc / tb);
     std::printf("  + hoisted act-scale decode:       %7.2f GFLOP/s   %.2fx vs batched\n",
                 gf / th, tb / th);
+
+#ifdef SUB0LLM_CUDA
+    // Same Q8 weights/activations on the GPU (dp4a int8 dot). The result must match the CPU
+    // matmul within Q8 tolerance — different backend, different float-accumulation order, so
+    // compare by relative RMS rather than bitwise. Y currently holds the CPU result.
+    std::vector<float> Yg(static_cast<std::size_t>(M * T));
+    const double tgpu = sub0llm::backend::cuda::matmul_q8_0_bench(
+        Wq.data(), Xq.data(), Yg.data(),
+        static_cast<int>(M), static_cast<int>(K), static_cast<int>(T), reps);
+    double se = 0.0, sr = 0.0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(M * T); ++i) {
+        const double d = static_cast<double>(Yg[i]) - static_cast<double>(Y[i]);
+        se += d * d;  sr += static_cast<double>(Y[i]) * static_cast<double>(Y[i]);
+    }
+    const double rel = std::sqrt(se / (sr + 1e-12));
+    std::printf("  CUDA Q8 dp4a (RTX 5070):          %7.2f GFLOP/s   %.2fx vs CPU batched   relRMS %.2e\n",
+                gf / tgpu, tb / tgpu, rel);
+#endif
 }
 
 } // namespace

@@ -9,8 +9,12 @@
 
 #include "kernels.cuh"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cstdint>
 
 namespace sub0llm::backend::cuda::kernels {
+
+using ::sub0llm::backend::cpu::BlockQ8_0;
 
 namespace {
 constexpr int BLOCK = 256;
@@ -60,6 +64,43 @@ inline int grid(std::size_t n, int block) {
     return static_cast<int>((n + static_cast<std::size_t>(block) - 1) / static_cast<std::size_t>(block));
 }
 
+// ── Q8_0 × Q8_0 matmul ────────────────────────────────────────────────────────
+constexpr int QK = 32;   // Q8_0 block size
+
+// Pack 4 signed int8 into the byte lanes of an int for __dp4a (reads them back as s8).
+__device__ __forceinline__ int pack4_s8(const int8_t* p) {
+    return  (static_cast<int>(static_cast<unsigned char>(p[0]))      )
+          | (static_cast<int>(static_cast<unsigned char>(p[1])) <<  8)
+          | (static_cast<int>(static_cast<unsigned char>(p[2])) << 16)
+          | (static_cast<int>(static_cast<unsigned char>(p[3])) << 24);
+}
+
+// One thread per output Y[m,t]: dot weight row m with activation column t over nb Q8 blocks.
+// int8 dot via __dp4a (DP4A, native sm_61+), scaled by the product of the two f16 block scales.
+__global__ void matmul_q8_0_kernel(const BlockQ8_0* __restrict__ W,
+                                   const BlockQ8_0* __restrict__ X,
+                                   float* __restrict__ Y, int M, int K, int T) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;   // token / column
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;   // output feature / row
+    if (m >= M || t >= T) return;
+    const int nb = K / QK;
+    const BlockQ8_0* wrow = W + static_cast<long long>(m) * nb;
+    const BlockQ8_0* xcol = X + static_cast<long long>(t) * nb;
+    float acc = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const BlockQ8_0& wb = wrow[i];
+        const BlockQ8_0& xb = xcol[i];
+        int idot = 0;
+        #pragma unroll
+        for (int j = 0; j < QK; j += 4)
+            idot = __dp4a(pack4_s8(wb.qs + j), pack4_s8(xb.qs + j), idot);
+        const float wd = __half2float(__ushort_as_half(wb.d));
+        const float xd = __half2float(__ushort_as_half(xb.d));
+        acc += wd * xd * static_cast<float>(idot);
+    }
+    Y[static_cast<long long>(m) * T + t] = acc;
+}
+
 } // anonymous namespace
 
 void launch_add_f32(const float* a, const float* b, float* out, std::size_t n) {
@@ -80,6 +121,14 @@ void launch_matmul_f32(const float* A, const float* B, float* C,
     const dim3 grid2(grid(N, TILE), grid(M, TILE));
     matmul_f32_kernel<<<grid2, block>>>(A, B, C,
         static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+}
+
+void launch_matmul_q8_0(const BlockQ8_0* dW, const BlockQ8_0* dXq, float* dY,
+                        int M, int K, int T) {
+    const dim3 block(16, 16);
+    const dim3 grid2(grid(static_cast<std::size_t>(T), block.x),
+                     grid(static_cast<std::size_t>(M), block.y));
+    matmul_q8_0_kernel<<<grid2, block>>>(dW, dXq, dY, M, K, T);
 }
 
 } // namespace sub0llm::backend::cuda::kernels
