@@ -92,6 +92,12 @@ public:
     // Decode one token at `pos`: x (D, host f32) → out (D, host f32), updating the device KV
     // cache. `out` is the activation after the LAST uploaded layer (feeds the CPU layers / head).
     void decode(const float* x, int pos, float* out);
+
+    // BATCHED prefill of T tokens through all uploaded layers (the compute-bound IMMA path): x
+    // (T·D, host f32) → out (T·D, host f32, the activation after the last GPU layer per token),
+    // filling the device KV cache at [start_pos, start_pos+T) so decode() can continue from it.
+    // Requires the default f32 KV (throws if kv_q8). Numerically ~equal to T sequential decode()s.
+    void prefill(const float* x, int T, int start_pos, float* out);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

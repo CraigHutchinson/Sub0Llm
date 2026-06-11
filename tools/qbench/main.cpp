@@ -537,13 +537,45 @@ void bench_gpu_resident() {
     }
     std::printf("  worst over %d tokens: %.2e %s\n", ntok, worst, worst < 1e-6 ? "(identical)" : "(MISMATCH)");
 }
+
+// Validate BATCHED prefill (GemmaGpuLayers::prefill, T tokens in IMMA GEMMs) against T sequential
+// decode()s (already CPU-validated). Same synthetic layers + same per-token inputs → prefill must
+// reproduce sequential decode (it's the same math, batched). Transitively validates the batched
+// prefill path (rmsnorm-rows, transpose, IMMA GEMMs, rope-prefill, KV store, causal attention).
+void bench_gpu_prefill() {
+    namespace cuda = sub0llm::backend::cuda;
+    auto rel_rms = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double se = 0.0, sr = 0.0; for (std::size_t i = 0; i < a.size(); ++i) { const double d = double(a[i]) - double(b[i]); se += d * d; sr += double(b[i]) * double(b[i]); }
+        return std::sqrt(se / (sr + 1e-12));
+    };
+    const int D = 3840, dff = 15360, T = 48, max_pos = 64;
+    const auto Z = [](long long n) { return static_cast<std::size_t>(n); };
+    std::vector<std::unique_ptr<SynthLayer>> S;
+    S.push_back(make_synth_layer(D, dff, 256, 16, 8, 1024, 1e4f, true,  false, 400));   // local only (isolate)
+    std::vector<cuda::GpuLayerDesc> descs;  for (auto& s : S) descs.push_back(s->desc);
+
+    std::vector<float> X(Z(1LL * T * D));  fill(X, 800);
+
+    std::vector<float> outP(Z(1LL * T * D));
+    { cuda::GemmaGpuLayers gp(descs, max_pos);  gp.prefill(X.data(), T, 0, outP.data()); }
+
+    // Reference = sequential prefill(1) (same IMMA matmul as batched → isolates the orchestration
+    // from the IMMA-vs-GEMV-decode K difference, which softmax amplifies on synthetic near-ties).
+    std::vector<float> outD(Z(1LL * T * D));
+    { cuda::GemmaGpuLayers gs(descs, max_pos);
+      for (int t = 0; t < T; ++t) gs.prefill(X.data() + Z(1LL * t * D), 1, t, outD.data() + Z(1LL * t * D)); }
+
+    const double r = rel_rms(outP, outD);
+    std::printf("\n=== Batched prefill(T=%d) vs sequential prefill(1) — isolates orchestration ===\n", T);
+    std::printf("  relRMS: %.2e %s\n", r, r < 1e-5 ? "(bit-exact orchestration)" : "(MISMATCH)");
+}
 #endif
 
 } // namespace
 
 int main(int argc, char** argv) {
     int64_t M = 0, K = 0, T = 0; int reps = 200; std::string preset = "qwen3";
-    bool layers = false, gpu_layer = false, gpu_resident = false;
+    bool layers = false, gpu_layer = false, gpu_resident = false, gpu_prefill = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
         auto next = [&] { return std::string(argv[++i]); };
@@ -555,6 +587,7 @@ int main(int argc, char** argv) {
         else if (a == "--layers") layers = true;
         else if (a == "--gpu-layer") gpu_layer = true;
         else if (a == "--gpu-resident") gpu_resident = true;
+        else if (a == "--gpu-prefill")  gpu_prefill = true;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: sub0llm-qbench [--M N --K N] [--batch T] [--reps N] "
                         "[--preset qwen3|gemma] [--layers] [--gpu-layer] [--gpu-resident]\n");
@@ -570,11 +603,12 @@ int main(int argc, char** argv) {
     std::printf("[qbench] SIMD: scalar\n");
 #endif
 
-    if (layers || gpu_layer || gpu_resident) {  // GPU validation vs CPU reference
+    if (layers || gpu_layer || gpu_resident || gpu_prefill) {  // GPU validation vs CPU reference
 #ifdef SUB0LLM_CUDA
         if (layers)       bench_layer_kernels();
         if (gpu_layer)    bench_gpu_layer();
         if (gpu_resident) bench_gpu_resident();
+        if (gpu_prefill)  bench_gpu_prefill();
 #else
         std::printf("[qbench] --layers/--gpu-layer/--gpu-resident need a CUDA build (cuda preset)\n");
 #endif

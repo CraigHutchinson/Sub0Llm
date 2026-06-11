@@ -485,6 +485,47 @@ __global__ void flash_attn_prefill_heads_kernel(const float* __restrict__ Q, con
     for (int i = threadIdx.x; i < dh; i += blockDim.x) oh[i] = sacc[i] * invl;
 }
 
+// ── batched-prefill primitives (T>1) ─────────────────────────────────────────────────────────
+// Coalesced tiled transpose: in (M,T) row-major → out (T,M) row-major. out[t*M+m]=in[m*T+t].
+// The IMMA GEMM emits (out_features, T); per-token rope/norm needs (T, out_features).
+__global__ void transpose_kernel(const float* __restrict__ in, float* __restrict__ out, int M, int T) {
+    __shared__ float tile[32][33];                  // +1 pad avoids shared bank conflicts
+    const int m = blockIdx.y * 32 + threadIdx.y, t = blockIdx.x * 32 + threadIdx.x;
+    if (m < M && t < T) tile[threadIdx.y][threadIdx.x] = in[static_cast<long long>(m) * T + t];
+    __syncthreads();
+    const int ot = blockIdx.x * 32 + threadIdx.y, om = blockIdx.y * 32 + threadIdx.x;
+    if (ot < T && om < M) out[static_cast<long long>(ot) * M + om] = tile[threadIdx.x][threadIdx.y];
+}
+
+// NEOX RoPE for prefill: per (token t, head h) — pos = start_pos + t (varies per token). One thread
+// per (t,h,pair). x is [T, nH, dh] (row t*nH+h). In-place.
+__global__ void rope_prefill_kernel(float* __restrict__ x, int T, int nH, int dh, int start_pos,
+                                    float base, const float* __restrict__ ff) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = dh >> 1;
+    if (idx >= T * nH * half) return;
+    const int pair = idx % half, hd = idx / half, t = hd / nH;
+    const int p = start_pos + t;
+    float* v = x + static_cast<long long>(hd) * dh;
+    float theta = static_cast<float>(p) * powf(base, -2.0f * static_cast<float>(pair) / static_cast<float>(dh));
+    if (ff) theta /= ff[pair];
+    const float c = cosf(theta), s = sinf(theta), a = v[pair], b = v[pair + half];
+    v[pair] = a * c - b * s;  v[pair + half] = a * s + b * c;
+}
+
+// Scatter T tokens' K/V (each [T, nKV, dh], row t*nKV+g) into the cache [kv_head][max_pos][dh] at
+// positions start_pos..start_pos+T-1. One thread per (t, g, d).
+__global__ void store_kv_prefill_kernel(const float* __restrict__ K, const float* __restrict__ V,
+                                        float* __restrict__ kcD, float* __restrict__ vcD,
+                                        int T, int nKV, int dh, int max_pos, int start_pos) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * nKV * dh) return;
+    const int d = idx % dh, tg = idx / dh, g = tg % nKV, t = tg / nKV;
+    const long long src = (static_cast<long long>(t) * nKV + g) * dh + d;
+    const long long dst = (static_cast<long long>(g) * max_pos + start_pos + t) * dh + d;
+    kcD[dst] = K[src];  vcD[dst] = V[src];
+}
+
 // ── q8 KV cache variants ────────────────────────────────────────────────────────────────────
 // Quantize K/V head-vectors and scatter into the Q8 KV cache slot for `pos`. One warp per block;
 // warp w covers a (head, block) of K (w < nKV·nbh) or V (w >= nKV·nbh). Mirrors quantize_row_q8_0.
@@ -673,6 +714,23 @@ void launch_flash_attn_decode_heads_q8(const float* q, const BlockQ8_0* kcD, con
     constexpr int B = 128;
     const std::size_t shmem = (static_cast<std::size_t>(2 * dh) + B) * sizeof(float);
     flash_attn_decode_heads_q8_kernel<<<n_head, B, shmem>>>(q, kcD, vcD, out, dh, kvlen, kv_lo, group, max_pos);
+}
+
+void launch_transpose(const float* in, float* out, int M, int T) {
+    const dim3 block(32, 32);
+    const dim3 g(grid(static_cast<std::size_t>(T), 32), grid(static_cast<std::size_t>(M), 32));
+    transpose_kernel<<<g, block>>>(in, out, M, T);
+}
+
+void launch_rope_prefill(float* x, int T, int nH, int dh, int start_pos, float base, const float* ff) {
+    const std::size_t total = static_cast<std::size_t>(T) * nH * (dh / 2);
+    rope_prefill_kernel<<<grid(total, BLOCK), BLOCK>>>(x, T, nH, dh, start_pos, base, ff);
+}
+
+void launch_store_kv_prefill(const float* K, const float* V, float* kcD, float* vcD,
+                             int T, int nKV, int dh, int max_pos, int start_pos) {
+    const std::size_t total = static_cast<std::size_t>(T) * nKV * dh;
+    store_kv_prefill_kernel<<<grid(total, BLOCK), BLOCK>>>(K, V, kcD, vcD, T, nKV, dh, max_pos, start_pos);
 }
 
 void launch_flash_attn_prefill_heads(const float* Q, const float* kcD, const float* vcD, float* out,

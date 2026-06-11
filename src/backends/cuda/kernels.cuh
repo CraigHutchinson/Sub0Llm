@@ -35,6 +35,15 @@ void launch_matmul_q8_0_gemv_aligned(const signed char* Wqs, const unsigned shor
                                      const ::sub0llm::backend::cpu::BlockQ8_0* X,
                                      float* Y, int M, int K);
 
+// Batched-prefill primitives (T>1).
+// Coalesced tiled transpose: in (M,T) row-major → out (T,M) row-major.
+void launch_transpose(const float* in, float* out, int M, int T);
+// NEOX RoPE for prefill: per (token,head), pos=start_pos+t. x is [T,nH,dh]. In-place. ff=nullptr → no scaling.
+void launch_rope_prefill(float* x, int T, int nH, int dh, int start_pos, float base, const float* ff);
+// Scatter T tokens' K/V ([T,nKV,dh]) into the cache [kv_head][max_pos][dh] at start_pos..start_pos+T-1.
+void launch_store_kv_prefill(const float* K, const float* V, float* kcD, float* vcD,
+                             int T, int nKV, int dh, int max_pos, int start_pos);
+
 // Batched causal PREFILL attention: grid T·nH, block (t,h) attends cache [kv_lo(p),p], p=start_pos+t.
 // Q is [T,nH,dh] (per-token-contiguous); f32 KV cache [kv_head][max_pos][dh]. The first batched-prefill
 // kernel (the genuinely new piece vs decode). scale=1.0.
