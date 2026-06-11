@@ -636,13 +636,120 @@ std::vector<float> GemmaModel::forward_one(int32_t token, int64_t pos,
 // sequential forward_one calls (same per-token norms/RoPE/causal attention). The big
 // (out,T) GEMM outputs are transposed to (T,out) so the per-head norm/RoPE work on
 // contiguous head vectors, exactly as forward_one does.
+// One BATCHED CPU layer (prefill): in-place on X (T,D), filling cache C at [start_pos,start_pos+T).
+// Exactly the body forward_prefill's loop used — shared by forward_prefill and the CPU tail of
+// forward_prefill_hybrid so the tail is batched (IMMA-class row-reuse GEMM), not token-by-token.
+void GemmaModel::cpu_prefill_layer_(const GemmaLayer& L, GemmaKVCache::Layer& C, std::vector<float>& X,
+                                    int64_t start_pos, int64_t T, int64_t max_pos) const {
+    const int64_t D = D_, nbD = D / QK, dff = d_ff_;
+    const auto Z = [](int64_t n) { return static_cast<std::size_t>(n); };
+    const int64_t dh = L.head_dim, nH = L.n_head, nKV = L.n_kv_head;
+    const int64_t qM = nH * dh, kvM = nKV * dh;
+    const float* ff = L.is_global && !rope_freqs_.empty() ? rope_freqs_.data() : nullptr;
+
+    std::vector<float> H(Z(T * D)), attn_out(Z(T * D));
+    std::vector<cpu::BlockQ8_0> Hq(Z(T * nbD));
+
+    parallel_for(T, [&](int64_t t) { rmsnorm(X.data() + t * D, L.attn_norm.data(), H.data() + t * D, D, eps_); });
+    quantize_rows(H.data(), Hq.data(), T, D);
+
+    std::vector<float> Qmt(Z(qM * T)), Kmt(Z(kvM * T)), Vmt;
+    pmatmul(L.wq, Hq.data(), Qmt.data(), qM, D, T);
+    pmatmul(L.wk, Hq.data(), Kmt.data(), kvM, D, T);
+    if (L.has_wv) { Vmt.resize(Z(kvM * T)); pmatmul(L.wv, Hq.data(), Vmt.data(), kvM, D, T); }
+
+    std::vector<float> Q(Z(T * qM)), Kt(Z(T * kvM)), Vt(Z(T * kvM));
+    transpose_mt(Qmt.data(), Q.data(),  qM,  T);
+    transpose_mt(Kmt.data(), Kt.data(), kvM, T);
+    if (L.has_wv) transpose_mt(Vmt.data(), Vt.data(), kvM, T);
+    else          Vt = Kt;                              // V = raw K projection (pre-norm)
+
+    parallel_for(T, [&](int64_t t) {
+        const int64_t p = start_pos + t;
+        for (int64_t h = 0; h < nH; ++h) {
+            float* qh = Q.data() + t * qM + h * dh;
+            rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
+            rope_neox(qh, dh, p, L.rope_base, ff);
+        }
+        for (int64_t g = 0; g < nKV; ++g) {
+            float* kh = Kt.data() + t * kvM + g * dh;
+            float* vh = Vt.data() + t * kvM + g * dh;
+            rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
+            rope_neox(kh, dh, p, L.rope_base, ff);
+            rmsnorm_noweight(vh, vh, dh, eps_);
+            const std::size_t b = Z(g * max_pos * dh + p * dh);
+            std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(b));
+            std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(b));
+        }
+    });
+
+    std::vector<float> attn_concat(Z(T * qM));
+    const int64_t group = nH / nKV;
+    parallel_for(T * nH, [&](int64_t th) {
+        const int64_t t = th / nH, h = th % nH, p = start_pos + t;
+        const int64_t kv_lo = L.window > 0 ? std::max<int64_t>(0, p - L.window + 1) : 0;
+        const int64_t g = h / group;
+        const float* qh    = Q.data() + t * qM + h * dh;
+        const float* Kbase = C.k.data() + Z(g * max_pos * dh);
+        const float* Vbase = C.v.data() + Z(g * max_pos * dh);
+        std::vector<float> scores(Z(p - kv_lo + 1));
+        float mx = -std::numeric_limits<float>::infinity();
+        for (int64_t s = kv_lo; s <= p; ++s) {
+            const float d = cpu::dot_f32(qh, Kbase + Z(s * dh), dh);   // scale = 1.0
+            scores[Z(s - kv_lo)] = d;  mx = std::max(mx, d);
+        }
+        float sum = 0.0f;
+        for (auto& sc : scores) { sc = std::exp(sc - mx); sum += sc; }
+        const float inv = 1.0f / sum;
+        float* oh = attn_concat.data() + t * qM + h * dh;
+        for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
+        for (int64_t s = kv_lo; s <= p; ++s)
+            cpu::axpy_f32(scores[Z(s - kv_lo)] * inv, Vbase + Z(s * dh), oh, dh);
+    });
+
+    std::vector<cpu::BlockQ8_0> ACq(Z(T * (qM / QK)));
+    quantize_rows(attn_concat.data(), ACq.data(), T, qM);
+    std::vector<float> AOmt(Z(D * T)), AO(Z(T * D));
+    pmatmul(L.wo, ACq.data(), AOmt.data(), D, qM, T);
+    transpose_mt(AOmt.data(), AO.data(), D, T);
+    parallel_for(T, [&](int64_t t) {
+        float* ao = AO.data() + t * D;
+        rmsnorm(ao, L.post_attn_norm.data(), ao, D, eps_);
+        for (int64_t i = 0; i < D; ++i) attn_out[Z(t * D + i)] = X[Z(t * D + i)] + ao[i];
+    });
+
+    parallel_for(T, [&](int64_t t) { rmsnorm(attn_out.data() + t * D, L.ffn_norm.data(), H.data() + t * D, D, eps_); });
+    quantize_rows(H.data(), Hq.data(), T, D);
+    std::vector<float> Gmt(Z(dff * T)), Umt(Z(dff * T));
+    pmatmul(L.gate, Hq.data(), Gmt.data(), dff, D, T);
+    pmatmul(L.up,   Hq.data(), Umt.data(), dff, D, T);
+    parallel_for(T, [&](int64_t t) {
+        const std::size_t o = Z(t * dff);
+        cpu::gelu_f32(Gmt.data() + o, Gmt.data() + o, Z(dff));
+        for (int64_t i = 0; i < dff; ++i) Gmt[o + Z(i)] *= Umt[o + Z(i)];
+    });
+    std::vector<float> Gtt(Z(T * dff));
+    transpose_mt(Gmt.data(), Gtt.data(), dff, T);
+    std::vector<cpu::BlockQ8_0> Gq(Z(T * (dff / QK)));
+    quantize_rows(Gtt.data(), Gq.data(), T, dff);
+    std::vector<float> FFmt(Z(D * T)), FF(Z(T * D));
+    pmatmul(L.down, Gq.data(), FFmt.data(), D, dff, T);
+    transpose_mt(FFmt.data(), FF.data(), D, T);
+    parallel_for(T, [&](int64_t t) {
+        float* fo = FF.data() + t * D;
+        rmsnorm(fo, L.post_ffw_norm.data(), fo, D, eps_);
+        for (int64_t i = 0; i < D; ++i)
+            X[Z(t * D + i)] = (attn_out[Z(t * D + i)] + fo[i]) * L.out_scale;
+    });
+}
+
 std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
                                                int64_t start_pos, GemmaKVCache& kv,
                                                bool apply_softcap) const {
     if (T <= 1)
         return forward_one(tokens[0], start_pos, kv, apply_softcap, /*compute_logits=*/true);
 
-    const int64_t D = D_, nbD = D / QK, dff = d_ff_;
+    const int64_t D = D_, nbD = D / QK;
     const auto Z = [](int64_t n) { return static_cast<std::size_t>(n); };
 
     // X (T, D): embed lookup + ×sqrt(D) scale. Parallel over tokens (independent rows).
@@ -653,120 +760,8 @@ std::vector<float> GemmaModel::forward_prefill(const int32_t* tokens, int64_t T,
         for (int64_t i = 0; i < D; ++i) X[Z(t * D + i)] *= embed_scale_;
     });
 
-    std::vector<float>           H(Z(T * D));            // norm output (reused attn/ffn)
-    std::vector<cpu::BlockQ8_0>  Hq(Z(T * nbD));         // quantized H
-    std::vector<float>           attn_out(Z(T * D));
-
-    for (std::size_t li = 0; li < layers_.size(); ++li) {
-        const GemmaLayer& L = layers_[li];
-        GemmaKVCache::Layer& C = kv.layers[li];
-        const int64_t dh = L.head_dim, nH = L.n_head, nKV = L.n_kv_head;
-        const int64_t qM = nH * dh, kvM = nKV * dh;
-        const float* ff = L.is_global && !rope_freqs_.empty() ? rope_freqs_.data() : nullptr;
-
-        // ── attention ───────────────────────────────────────────────────────────
-        parallel_for(T, [&](int64_t t) {
-            rmsnorm(X.data() + t * D, L.attn_norm.data(), H.data() + t * D, D, eps_);
-        });
-        quantize_rows(H.data(), Hq.data(), T, D);
-
-        std::vector<float> Qmt(Z(qM * T)), Kmt(Z(kvM * T)), Vmt;
-        pmatmul(L.wq, Hq.data(), Qmt.data(), qM, D, T);
-        pmatmul(L.wk, Hq.data(), Kmt.data(), kvM, D, T);
-        if (L.has_wv) { Vmt.resize(Z(kvM * T)); pmatmul(L.wv, Hq.data(), Vmt.data(), kvM, D, T); }
-
-        std::vector<float> Q(Z(T * qM)), Kt(Z(T * kvM)), Vt(Z(T * kvM));
-        transpose_mt(Qmt.data(), Q.data(),  qM,  T);
-        transpose_mt(Kmt.data(), Kt.data(), kvM, T);
-        if (L.has_wv) transpose_mt(Vmt.data(), Vt.data(), kvM, T);
-        else          Vt = Kt;                              // V = raw K projection (pre-norm)
-
-        // per token: Q/K rmsnorm+RoPE, V plain rmsnorm, store K/V to cache (all before attn)
-        parallel_for(T, [&](int64_t t) {
-            const int64_t p = start_pos + t;
-            for (int64_t h = 0; h < nH; ++h) {
-                float* qh = Q.data() + t * qM + h * dh;
-                rmsnorm(qh, L.q_norm.data(), qh, dh, eps_);
-                rope_neox(qh, dh, p, L.rope_base, ff);
-            }
-            for (int64_t g = 0; g < nKV; ++g) {
-                float* kh = Kt.data() + t * kvM + g * dh;
-                float* vh = Vt.data() + t * kvM + g * dh;
-                rmsnorm(kh, L.k_norm.data(), kh, dh, eps_);
-                rope_neox(kh, dh, p, L.rope_base, ff);
-                rmsnorm_noweight(vh, vh, dh, eps_);
-                const std::size_t b = Z(g * kv.max_pos * dh + p * dh);
-                std::copy(kh, kh + dh, C.k.begin() + static_cast<std::ptrdiff_t>(b));
-                std::copy(vh, vh + dh, C.v.begin() + static_cast<std::ptrdiff_t>(b));
-            }
-        });
-
-        // causal attention per (token, head): position p attends to cache [kv_lo, p].
-        std::vector<float> attn_concat(Z(T * qM));
-        const int64_t group = nH / nKV;
-        parallel_for(T * nH, [&](int64_t th) {
-            const int64_t t = th / nH, h = th % nH, p = start_pos + t;
-            const int64_t kv_lo = L.window > 0 ? std::max<int64_t>(0, p - L.window + 1) : 0;
-            const int64_t g = h / group;
-            const float* qh    = Q.data() + t * qM + h * dh;
-            const float* Kbase = C.k.data() + Z(g * kv.max_pos * dh);
-            const float* Vbase = C.v.data() + Z(g * kv.max_pos * dh);
-            std::vector<float> scores(Z(p - kv_lo + 1));
-            float mx = -std::numeric_limits<float>::infinity();
-            for (int64_t s = kv_lo; s <= p; ++s) {
-                const float d = cpu::dot_f32(qh, Kbase + Z(s * dh), dh);   // scale = 1.0
-                scores[Z(s - kv_lo)] = d;
-                mx = std::max(mx, d);
-            }
-            float sum = 0.0f;
-            for (auto& sc : scores) { sc = std::exp(sc - mx); sum += sc; }
-            const float inv = 1.0f / sum;
-            float* oh = attn_concat.data() + t * qM + h * dh;
-            for (int64_t d = 0; d < dh; ++d) oh[d] = 0.0f;
-            for (int64_t s = kv_lo; s <= p; ++s)
-                cpu::axpy_f32(scores[Z(s - kv_lo)] * inv, Vbase + Z(s * dh), oh, dh);
-        });
-
-        // output projection (D,T) → transpose → post-attn norm → residual
-        std::vector<cpu::BlockQ8_0> ACq(Z(T * (qM / QK)));
-        quantize_rows(attn_concat.data(), ACq.data(), T, qM);
-        std::vector<float> AOmt(Z(D * T)), AO(Z(T * D));
-        pmatmul(L.wo, ACq.data(), AOmt.data(), D, qM, T);
-        transpose_mt(AOmt.data(), AO.data(), D, T);
-        parallel_for(T, [&](int64_t t) {
-            float* ao = AO.data() + t * D;
-            rmsnorm(ao, L.post_attn_norm.data(), ao, D, eps_);
-            for (int64_t i = 0; i < D; ++i) attn_out[Z(t * D + i)] = X[Z(t * D + i)] + ao[i];
-        });
-
-        // ── FFN (GeGLU), batched ──────────────────────────────────────────────────
-        parallel_for(T, [&](int64_t t) {
-            rmsnorm(attn_out.data() + t * D, L.ffn_norm.data(), H.data() + t * D, D, eps_);
-        });
-        quantize_rows(H.data(), Hq.data(), T, D);
-        std::vector<float> Gmt(Z(dff * T)), Umt(Z(dff * T));
-        pmatmul(L.gate, Hq.data(), Gmt.data(), dff, D, T);
-        pmatmul(L.up,   Hq.data(), Umt.data(), dff, D, T);
-        // GeGLU: gelu(gate) ⊙ up, fused per token (each thread owns a disjoint dff slice).
-        parallel_for(T, [&](int64_t t) {
-            const std::size_t o = Z(t * dff);
-            cpu::gelu_f32(Gmt.data() + o, Gmt.data() + o, Z(dff));
-            for (int64_t i = 0; i < dff; ++i) Gmt[o + Z(i)] *= Umt[o + Z(i)];
-        });
-        std::vector<float> Gtt(Z(T * dff));
-        transpose_mt(Gmt.data(), Gtt.data(), dff, T);
-        std::vector<cpu::BlockQ8_0> Gq(Z(T * (dff / QK)));
-        quantize_rows(Gtt.data(), Gq.data(), T, dff);
-        std::vector<float> FFmt(Z(D * T)), FF(Z(T * D));
-        pmatmul(L.down, Gq.data(), FFmt.data(), D, dff, T);
-        transpose_mt(FFmt.data(), FF.data(), D, T);
-        parallel_for(T, [&](int64_t t) {
-            float* fo = FF.data() + t * D;
-            rmsnorm(fo, L.post_ffw_norm.data(), fo, D, eps_);
-            for (int64_t i = 0; i < D; ++i)
-                X[Z(t * D + i)] = (attn_out[Z(t * D + i)] + fo[i]) * L.out_scale;
-        });
-    }
+    for (std::size_t li = 0; li < layers_.size(); ++li)
+        cpu_prefill_layer_(layers_[li], kv.layers[li], X, start_pos, T, kv.max_pos);
     kv.len = start_pos + T;
 
     // ── final norm + tied LM head (last token only) + soft-cap ──────────────────
@@ -835,17 +830,14 @@ std::vector<float> GemmaModel::forward_prefill_hybrid(const int32_t* tokens, int
     std::vector<float> Xk(X.size());
     gpu_->prefill(X.data(), static_cast<int>(T), static_cast<int>(start_pos), Xk.data());
 
-    // CPU tail layers [n_gpu_layers_, n): per token, in order, filling host kv.layers[k..n).
-    std::vector<float> logits;
-    for (int64_t t = 0; t < T; ++t) {
-        std::vector<float> x(Xk.begin() + static_cast<std::ptrdiff_t>(t * D_),
-                             Xk.begin() + static_cast<std::ptrdiff_t>((t + 1) * D_));
-        for (std::size_t li = static_cast<std::size_t>(n_gpu_layers_); li < layers_.size(); ++li)
-            cpu_layer_(layers_[li], kv.layers[li], x, start_pos + t, kv.max_pos);
-        if (t == T - 1) logits = head_(std::move(x), apply_softcap);   // only the last token's logits
-    }
+    // CPU tail layers [n_gpu_layers_, n): BATCHED (cpu_prefill_layer_), filling host kv.layers[k..n).
+    for (std::size_t li = static_cast<std::size_t>(n_gpu_layers_); li < layers_.size(); ++li)
+        cpu_prefill_layer_(layers_[li], kv.layers[li], Xk, start_pos, T, kv.max_pos);
     kv.len = start_pos + T;
-    return logits;
+
+    // Last token's logits (the only ones prefill needs).
+    float* xl = Xk.data() + static_cast<std::ptrdiff_t>((T - 1) * D_);
+    return head_(std::vector<float>(xl, xl + D_), apply_softcap);
 }
 
 } // namespace sub0llm::nn

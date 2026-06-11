@@ -179,6 +179,8 @@ private:
     [[nodiscard]] std::vector<float> embed_(int32_t token) const;     // dequant embedding · sqrt(D)
     void cpu_layer_(const GemmaLayer& L, GemmaKVCache::Layer& C,
                     std::vector<float>& x, int64_t pos, int64_t max_pos) const;  // one CPU layer
+    void cpu_prefill_layer_(const GemmaLayer& L, GemmaKVCache::Layer& C, std::vector<float>& X,
+                            int64_t start_pos, int64_t T, int64_t max_pos) const;  // one BATCHED CPU layer
     [[nodiscard]] std::vector<float> head_(std::vector<float> x, bool apply_softcap) const;
 
     int64_t V_ = 0, D_ = 0, d_ff_ = 0;
