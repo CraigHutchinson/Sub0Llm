@@ -818,4 +818,34 @@ std::vector<float> GemmaModel::forward_one_hybrid(int32_t token, int64_t pos, Ge
     return head_(std::move(x), apply_softcap);
 }
 
+std::vector<float> GemmaModel::forward_prefill_hybrid(const int32_t* tokens, int64_t T,
+                                                      int64_t start_pos, GemmaKVCache& kv,
+                                                      bool apply_softcap) {
+    if (!gpu_ || n_gpu_layers_ <= 0)
+        return forward_prefill(tokens, T, start_pos, kv, apply_softcap);
+
+    // Embed all T tokens → X (T, D).
+    std::vector<float> X(static_cast<std::size_t>(T) * static_cast<std::size_t>(D_));
+    for (int64_t t = 0; t < T; ++t) {
+        std::vector<float> e = embed_(tokens[t]);
+        std::copy(e.begin(), e.end(), X.begin() + static_cast<std::ptrdiff_t>(t * D_));
+    }
+
+    // GPU layers [0, n_gpu_layers_): one batched pass (fills the device KV). Xk = activation after.
+    std::vector<float> Xk(X.size());
+    gpu_->prefill(X.data(), static_cast<int>(T), static_cast<int>(start_pos), Xk.data());
+
+    // CPU tail layers [n_gpu_layers_, n): per token, in order, filling host kv.layers[k..n).
+    std::vector<float> logits;
+    for (int64_t t = 0; t < T; ++t) {
+        std::vector<float> x(Xk.begin() + static_cast<std::ptrdiff_t>(t * D_),
+                             Xk.begin() + static_cast<std::ptrdiff_t>((t + 1) * D_));
+        for (std::size_t li = static_cast<std::size_t>(n_gpu_layers_); li < layers_.size(); ++li)
+            cpu_layer_(layers_[li], kv.layers[li], x, start_pos + t, kv.max_pos);
+        if (t == T - 1) logits = head_(std::move(x), apply_softcap);   // only the last token's logits
+    }
+    kv.len = start_pos + T;
+    return logits;
+}
+
 } // namespace sub0llm::nn

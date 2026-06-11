@@ -139,6 +139,14 @@ public:
                                                         bool apply_softcap = true,
                                                         bool compute_logits = true);
 
+    // Hybrid PREFILL: the first n_gpu_layers() layers run as ONE batched GPU pass (IMMA tensor
+    // cores — the compute-bound path), filling the device KV cache; the remaining layers run on the
+    // CPU (filling host `kv`). Returns the LAST token's logits. Far faster than token-by-token
+    // prefill for the GPU layers. Requires enable_gpu_layers() first; falls back to forward_prefill.
+    [[nodiscard]] std::vector<float> forward_prefill_hybrid(const int32_t* tokens, int64_t T,
+                                                            int64_t start_pos, GemmaKVCache& kv,
+                                                            bool apply_softcap = true);
+
     // One decode step: append token at position `pos` to the cache, return logits (V).
     // `apply_softcap` controls the final logit soft-cap (30·tanh(z/30)). It is
     // order-preserving, so GREEDY decoding can pass false (identical argmax) and skip

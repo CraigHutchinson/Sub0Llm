@@ -273,8 +273,8 @@ int main(int argc, char** argv) {
             {
                 sub0llm::nn::set_gemma_cpus(pp_cpus);
                 const auto pp0 = std::chrono::steady_clock::now();
-                for (; pos < prompt_len; ++pos)
-                    logits = model.forward_one_hybrid(ids[std::size_t(pos)], pos, kv, false, pos == prompt_len - 1);
+                logits = model.forward_prefill_hybrid(ids.data(), prompt_len, 0, kv, false);  // batched GPU prefill
+                pos = prompt_len;
                 const double pp_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pp0).count();
                 std::cerr << std::format("[gemma] prompt forward {} tok in {:.2f}s ({:.2f} tok/s)\n",
                                          prompt_len, pp_s, static_cast<double>(prompt_len) / pp_s);
