@@ -44,6 +44,10 @@ compile_commands.json
 /data/*.pt
 /data/*.safetensors
 /data/*.gguf
+# Interleaved bench run artifacts (reproducible via tools/scripts/bench_vs_llama.ps1;
+# headline numbers are recorded in commit messages + CLAUDE.md).
+/data/bench_*.csv
+/data/hybrid_vs_llama*.csv
 /models/
 *.gguf
 *.bin
