@@ -135,41 +135,101 @@ int main() {
     std::println("Model vocab = {} (real {} + 1 [MASK] row at id {}).",
                  model.model_vocab(), V, model.mask_id());
 
-    // ── 3. train: learn to undo masking (masked cross-entropy) ────────────────────
-    section("3. Training — predict the clean token at each masked position");
-    std::println("Ch28 keeps it simple: a FIXED 30% corruption rate (this is exactly a BERT-style");
-    std::println("masked language model). Ch29 varies the noise level across [0,1] — that is what");
-    std::println("turns a masked LM into a true diffusion model.\n");
-    const std::int64_t T = 24, steps = 5000;
-    const float        train_noise = 0.30f;          // fixed corruption rate
+    // ── 3. train: adaptive curriculum — noise level driven by performance ───────
+    section("3. Training — adaptive curriculum: performance-driven noise level");
+    std::println("The noise level moves up when the model masters the current difficulty");
+    std::println("and eases back when it struggles — keeping the model at the edge of its ability.\n");
+    const std::int64_t T = 24, steps = 15000;
+
+    // Adaptive curriculum parameters
+    const float curriculum_start = 0.05f;   // start easy — only 5% masked
+    const float curriculum_end   = 0.75f;   // cap at 75% masked
+    const int   adapt_interval   = 500;     // evaluate performance every N steps
+    const float noise_step       = 0.05f;   // how much to adjust noise per adaptation
+    const int   improvement_window = 3;     // look at last N probe losses for trend
+
     nn::Adam opt(params, /*lr=*/2e-3f);
     std::mt19937 rng(1234);
     std::uniform_int_distribution<std::size_t> off_dist(0, corpus_ids.size() - static_cast<std::size_t>(T) - 1);
     const std::int32_t mask_id = model.mask_id();
 
-    // A FIXED held-out probe (same window + same mask every time) so the loss TREND is
-    // visible instead of per-step noise: mask every 3rd position of the first window.
+    // Current curriculum noise level (starts low, adapts based on performance)
+    float current_noise = curriculum_start;
+
+    // A FIXED held-out probe (same window every time) — corrupted with current_noise
+    // so it's a realistic test of what the model will face at the current difficulty.
     std::vector<std::int32_t> probe(corpus_ids.begin(), corpus_ids.begin() + T);
-    std::vector<std::int32_t> probe_in = probe;
-    std::vector<float>        probe_w(static_cast<std::size_t>(T), 0.0f);
-    for (std::size_t i = 0; i < static_cast<std::size_t>(T); i += 3) { probe_in[i] = mask_id; probe_w[i] = 1.0f; }
-    auto probe_loss = [&] {
-        ag::Variable lg = model.forward(ids_tensor(probe_in), train_noise);
-        return ag::weighted_cross_entropy(lg, ids_tensor(probe), f32_tensor(probe_w)).data().item<float>();
+
+    // Separate RNG for probe (fixed seed for reproducibility)
+    std::mt19937 probe_rng(999);
+
+    // Track recent probe losses for trend detection
+    std::vector<float> probe_history;
+    constexpr int history_size = 6;
+
+    auto probe_loss = [&]() -> float {
+        // Corrupt probe with current_noise — realistic test of current difficulty
+        auto corr = dn::corrupt(std::span<const std::int32_t>(probe), current_noise,
+                                dn::NoiseSchedule::Absorbing, mask_id, V, probe_rng);
+        if (corr.n_corrupted == 0) { corr.tokens[0] = mask_id; corr.corrupted[0] = 1; }
+
+        std::vector<float> w(static_cast<std::size_t>(T));
+        for (std::size_t i = 0; i < static_cast<std::size_t>(T); ++i) w[i] = corr.corrupted[i];
+
+        ag::Variable logits = model.forward(ids_tensor(corr.tokens), current_noise);
+        return ag::weighted_cross_entropy(logits, ids_tensor(probe), f32_tensor(w)).data().item<float>();
     };
 
     for (std::int64_t step = 0; step < steps; ++step) {
+        // ── Adaptive curriculum: adjust noise based on probe loss TREND ───────
+        if (step > 0 && step % adapt_interval == 0) {
+            float pl = probe_loss();
+            probe_history.push_back(pl);
+            if (probe_history.size() > static_cast<std::size_t>(history_size))
+                probe_history.erase(probe_history.begin());
+
+            // Need enough history to detect a trend
+            if (probe_history.size() >= static_cast<std::size_t>(improvement_window)) {
+                // Compare average of recent window vs older window
+                std::size_t half = probe_history.size() / 2;
+                float recent_avg = 0.0f, older_avg = 0.0f;
+                for (std::size_t i = 0; i < half; ++i) {
+                    older_avg += probe_history[i];
+                    recent_avg += probe_history[half + i];
+                }
+                older_avg /= static_cast<float>(half);
+                recent_avg /= static_cast<float>(half);
+
+                float prev_noise = current_noise;
+                float improvement = older_avg - recent_avg;  // positive = getting better
+
+                if (improvement > 0.15f) {
+                    // Sustained improvement — increase difficulty
+                    current_noise = std::min(curriculum_end, current_noise + noise_step);
+                } else if (improvement < -0.1f) {
+                    // Getting worse — ease back
+                    current_noise = std::max(curriculum_start, current_noise - noise_step * 0.5f);
+                }
+                // else: plateau — hold steady
+
+                if (step % 500 == 0 || std::abs(current_noise - prev_noise) > 0.01f)
+                    std::println("  curriculum noise: {:.2f} → {:.2f}  (improvement={:+.4f}, history={:.2f}→{:.2f})",
+                                 prev_noise, current_noise, improvement, older_avg, recent_avg);
+            }
+        }
+
+        // ── Sample a training window and corrupt it with current noise level ──────
         const std::size_t off = off_dist(rng);
         std::vector<std::int32_t> clean(corpus_ids.begin() + static_cast<std::ptrdiff_t>(off),
                                         corpus_ids.begin() + static_cast<std::ptrdiff_t>(off) + T);
-        auto corr = dn::corrupt(std::span<const std::int32_t>(clean), train_noise,
+        auto corr = dn::corrupt(std::span<const std::int32_t>(clean), current_noise,
                                 dn::NoiseSchedule::Absorbing, mask_id, V, rng);
         if (corr.n_corrupted == 0) { corr.tokens[0] = mask_id; corr.corrupted[0] = 1; }  // need ≥1 target
 
         std::vector<float> w(static_cast<std::size_t>(T));
         for (std::size_t i = 0; i < static_cast<std::size_t>(T); ++i) w[i] = corr.corrupted[i];
 
-        ag::Variable logits = model.forward(ids_tensor(corr.tokens), train_noise);  // (T, V+1)
+        ag::Variable logits = model.forward(ids_tensor(corr.tokens), current_noise);  // (T, V+1)
         ag::Variable loss   = ag::weighted_cross_entropy(logits, ids_tensor(clean), f32_tensor(w));
 
         opt.zero_grad();
@@ -177,9 +237,10 @@ int main() {
         (void)nn::clip_grad_norm(params, 5.0f);
         opt.step();
 
-        if (step % 150 == 0 || step == steps - 1)
-            std::println("  step {:4}  train masked-CE = {:.4f}   held-probe = {:.4f}",
-                         step, loss.data().item<float>(), probe_loss());
+        if (step % 150 == 0 || step == steps - 1) {
+            std::println("  step {:4}  train masked-CE = {:.4f}   noise = {:.2f}",
+                         step, loss.data().item<float>(), current_noise);
+        }
     }
 
     // ── 4. one-step recovery ──────────────────────────────────────────────────────
