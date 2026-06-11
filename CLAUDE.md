@@ -229,17 +229,12 @@ Key findings:
 - **Memorisation is visible**: greedy decoding at step 9999 reproduces verbatim training passages at low temperature (e.g., "My nobler friends, I crave their pardons: For the mutable, rank-scented many" — Coriolanus Act III)
 - **More data needed**: fix the BPE O(n²) bottleneck or use the GPT-2 tokenizer to use the full 7222-paragraph corpus
 
-- `tools/scripts/bench_vs_llama.ps1` — **interleaved, same-session control baseline vs llama.cpp**
-  (run back-to-back so thermal/clock/driver state is shared — the ONLY valid way to cite a llama
-  reference; never compare against a llama number from a prior session). Two modes sharing all
-  logging/metric-parse/median/smoke-check/CSV and the cyclic-rotation Latin-square schedule
-  (thermal-drift-balanced): `-Mode threads` (CPU thread-count sweep, build-native vs llama cpu) and
-  `-Mode hybrid` (GPU/CPU: `build-cuda-native --mode hybrid --gpu-layers V` vs llama cuda
-  `-ngl Ngl [-fa on] [-ctk/-ctv q8_0]`). Smoke-checks greedy text equality (abort in threads mode,
-  warn in hybrid where GPU rounding may diverge); saves timestamped CSV with raw samples + ours/llama
-  ratio. **Known gap**: our PP is sequential `forward_one()` (TTFT-accurate); llama PP is batched
-  prefill (~4–8× faster) — shown in the PP column. CONTROL BASELINE (commit-time, gemma-4-12b, k24
-  vs ngl28+fa, greedy-identical): hybrid TG **8.36 vs llama 10.77 (78%)**; PP 10.2 vs 122 (8%).
+- `tools/scripts/bench_sweep_threads.ps1` — thread-count sweep (1..N_cores), both PP + TG tok/s,
+  cyclic-rotation Latin square schedule (thermal-drift-balanced), sub0llm vs llama-completion;
+  smoke-checks binary-identical greedy output before sweep; saves timestamped CSV with raw samples.
+  **Known gap**: our PP is sequential `forward_one()` (TTFT-accurate); llama PP is batched prefill
+  (~4–8× faster). See `chapters/ch27_specialized_build/README.md` → "Bench harness" for full
+  apples-to-apples confirmation and future-work items (batched prefill P1, load-time P2).
 
 ### Tests
 442 Catch2 tests across 25 test files — all passing.

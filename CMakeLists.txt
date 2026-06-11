@@ -37,6 +37,13 @@ if(SUB0LLM_BUILD_CHAPTERS)
     add_subdirectory(chapters)
 endif()
 
+# ── Diffusion-LM track (Ch28+) ────────────────────────────────────────────────
+# A separate specialized volume that links libsub0llm and builds the text-diffusion
+# (DiffusionGemma-style) model around compile-time monomorphization.
+if(SUB0LLM_BUILD_DIFFUSION)
+    add_subdirectory(diffusion)
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     enable_testing()
