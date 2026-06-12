@@ -60,11 +60,12 @@ static void section(std::string_view title) { std::println("\n── {} ──",
 struct Config {
     std::string corpus     = "data/shakespeare.txt";
     std::string ckpt_dir   = "/tmp/sub0diff_ch29";
-    std::size_t paragraphs = 7000;    // full shakespeare.txt (~7.2K paragraphs); BPE ~1 min
+    std::int64_t paragraphs = 0;      // 0 or -1 = read all paragraphs from corpus
     std::size_t vocab_size = 512;
     std::int64_t seq_len   = 64;
     std::uint64_t steps    = 200000;   // safety BOUND — training self-terminates (see below)
-    std::uint64_t eval_every = 2000;   // held-out NELBO cadence (the convergence signal)
+    std::uint64_t eval_every = 0;      // 0 = compute from corpus; override with --eval-every
+    double eval_factor = 0.5;           // fraction of train positions per eval cadence (0.5 = 50%)
     std::uint64_t patience   = 5;      // stop after this many evals without improvement
     float t_max            = 1.0f;    // <1.0 trains under a Ch28-style ceiling
     bool eval_only         = false;
@@ -84,12 +85,13 @@ static Config parse_args(int argc, char** argv) {
         };
         if      (a == "--corpus")     c.corpus     = next();
         else if (a == "--ckpt-dir")   c.ckpt_dir   = next();
-        else if (a == "--paragraphs") c.paragraphs = std::stoull(next());
+        else if (a == "--paragraphs") c.paragraphs = std::stoll(next());
         else if (a == "--vocab-size") c.vocab_size = std::stoull(next());
         else if (a == "--seq-len")    c.seq_len    = std::stoll(next());
         else if (a == "--steps")      c.steps      = std::stoull(next());
         else if (a == "--eval-every") c.eval_every = std::stoull(next());
         else if (a == "--patience")   c.patience   = std::stoull(next());
+        else if (a == "--eval-factor") c.eval_factor = std::stof(next());
         else if (a == "--t-max")      c.t_max      = std::stof(next());
         else if (a == "--eval-only")  c.eval_only  = true;
         else throw std::runtime_error(std::format("unknown argument: {}", a));
@@ -98,15 +100,45 @@ static Config parse_args(int argc, char** argv) {
 }
 
 // Paragraph reader: one paragraph per line (data/shakespeare.txt format, as Ch24).
-// Strips trailing '\r' so CRLF corpora behave identically everywhere.
-static std::vector<std::string> read_paragraphs(const std::string& path, std::size_t limit) {
+// Strips trailing '\r', leading/trailing whitespace, and collapses internal
+// runs of whitespace to a single space. Skips blank lines.
+// limit == 0 or -1 means read ALL paragraphs from the corpus.
+static std::vector<std::string> read_paragraphs(const std::string& path, std::int64_t limit) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error(std::format("cannot open corpus: {}", path));
     std::vector<std::string> out;
     std::string line;
-    while (out.size() < limit && std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) out.push_back(line);
+    const bool all = (limit <= 0);
+    while (std::getline(f, line)) {
+        // Strip trailing '\r' for CRLF files
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+               line.back() == '\v' || line.back() == '\f'))
+            line.pop_back();
+        // Strip leading whitespace
+        auto start = line.begin();
+        while (start != line.end() && std::isspace(static_cast<unsigned char>(*start)))
+            ++start;
+        // Strip trailing whitespace
+        auto end = line.rbegin();
+        while (end.base() != start && std::isspace(static_cast<unsigned char>(*end)))
+            ++end;
+        // Collapse internal whitespace to single space; skip blank lines
+        if (start >= end.base()) continue;
+        std::string cleaned;
+        cleaned.reserve(std::distance(start, end.base()));
+        bool prev_space = false;
+        for (auto it = start; it != end.base(); ++it) {
+            const char c = *it;
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                if (!prev_space) { cleaned += ' '; prev_space = true; }
+            } else {
+                cleaned += c; prev_space = false;
+            }
+        }
+        if (!cleaned.empty()) {
+            if (!all && out.size() >= static_cast<std::size_t>(limit)) break;
+            out.push_back(std::move(cleaned));
+        }
     }
     return out;
 }
@@ -140,11 +172,11 @@ static int run(int argc, char** argv) {
                  cfg.t_max);
 
     // ── 2. data: BPE + flat token streams with a held-out split ─────────────────
-    section("2. Data — BPE-tokenized corpus, 90/10 train/eval split");
+    section("2. Data — BPE-tokenized corpus, 95/5 train/eval split");
     auto paragraphs = read_paragraphs(cfg.corpus, cfg.paragraphs);
     if (paragraphs.size() < 20)
         throw std::runtime_error("corpus too small — need at least 20 paragraphs");
-    const std::size_t n_eval = paragraphs.size() / 10;
+    const std::size_t n_eval = paragraphs.size() / 5;
     std::vector<std::string> eval_texts(paragraphs.end() - static_cast<std::ptrdiff_t>(n_eval),
                                         paragraphs.end());
     paragraphs.resize(paragraphs.size() - n_eval);
@@ -179,6 +211,14 @@ static int run(int argc, char** argv) {
                  train_ids.size(), win_count(train_ids), cfg.seq_len);
     std::println("eval stream:  {} tokens ({} sliding positions for {}-token windows)",
                  eval_ids.size(), win_count(eval_ids), cfg.seq_len);
+
+    // ── 2b. eval cadence: scale with corpus size ────────────────────────────────
+    const std::uint64_t total_train_positions = win_count(train_ids);
+    if (cfg.eval_every == 0)
+        cfg.eval_every = std::max(std::uint64_t(500),
+                                  static_cast<std::uint64_t>(total_train_positions * cfg.eval_factor));
+    std::println("eval cadence: every {} steps ({} train positions)",
+                 cfg.eval_every, total_train_positions);
 
     // ── 3. model + checkpoint resume ────────────────────────────────────────────
     section("3. Model — bidirectional denoiser over the BPE vocabulary");
