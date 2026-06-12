@@ -44,20 +44,24 @@ struct Corruption {
     return std::clamp(r, 0.0f, 1.0f);
 }
 
-// Corrupt `clean` by independently damaging each position with probability `mask_prob`.
-// Guarantees at least one position is corrupted (Bernoulli can return 0 at low probabilities).
+// Corrupt `clean` into `c`, independently damaging each position with probability
+// `mask_prob`. Guarantees at least one position is corrupted (Bernoulli can return 0
+// at low probabilities).
 //   mask_id      — the [MASK] token (== real vocab size); used by Absorbing only.
 //   real_vocab   — number of real tokens; Uniform draws a replacement in [0, real_vocab).
+// Allocation-free when `c` is reused across calls with the same sequence length —
+// a training loop corrupts every step, so pass one Corruption hoisted out of the loop.
 template<class RNG>
-[[nodiscard]] Corruption corrupt(std::span<const std::int32_t> clean,
-                                 float            mask_prob,
-                                 NoiseSchedule    schedule,
-                                 std::int32_t     mask_id,
-                                 std::int64_t     real_vocab,
-                                 RNG&             rng) {
-    Corruption c;
+void corrupt_into(std::span<const std::int32_t> clean,
+                  float            mask_prob,
+                  NoiseSchedule    schedule,
+                  std::int32_t     mask_id,
+                  std::int64_t     real_vocab,
+                  RNG&             rng,
+                  Corruption&      c) {
     c.tokens.assign(clean.begin(), clean.end());
     c.corrupted.assign(clean.size(), 0);
+    c.n_corrupted = 0;
 
     std::bernoulli_distribution coin(std::clamp(mask_prob, 0.0f, 1.0f));
     std::uniform_int_distribution<std::int32_t> uni(0, static_cast<std::int32_t>(real_vocab) - 1);
@@ -87,6 +91,18 @@ template<class RNG>
         std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
         corrupt_pos( pos_dist(rng) );
     }
+}
+
+// Convenience form returning a fresh Corruption (allocates; fine outside hot loops).
+template<class RNG>
+[[nodiscard]] Corruption corrupt(std::span<const std::int32_t> clean,
+                                 float            mask_prob,
+                                 NoiseSchedule    schedule,
+                                 std::int32_t     mask_id,
+                                 std::int64_t     real_vocab,
+                                 RNG&             rng) {
+    Corruption c;
+    corrupt_into(clean, mask_prob, schedule, mask_id, real_vocab, rng, c);
     return c;
 }
 

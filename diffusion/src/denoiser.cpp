@@ -64,8 +64,7 @@ Variable Denoiser::forward(const sub0llm::Tensor& token_ids, float noise_level) 
 
     // 3. final norm + weight-tied LM head: logits = x · Wᵀ, W = tok_emb (Vm, D)
     x = ln_f_.forward(x);
-    Variable w_t = ag::transpose2d(tok_emb_.weight());  // (D, Vm)
-    return ag::matmul(x, w_t);                           // (T, Vm)
+    return ag::matmul_bt(x, tok_emb_.weight());  // (T, Vm) — fused x · Wᵀ, W row-major (Vm, D)
 }
 
 std::vector<Variable*> Denoiser::parameters() {
