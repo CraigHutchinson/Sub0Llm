@@ -180,6 +180,28 @@ TEST_CASE("matmul_bt equals matmul with transposed B (K>=64, BLAS/Eigen path)", 
     require_near(ref, out, 1e-4f);
 }
 
+TEST_CASE("matmul_tb equals matmul with transposed A (small M, SIMD path)", "[ops]") {
+    Tensor a = randn({7, 5});    // (M=7, K=5)
+    Tensor b = randn({7, 4});    // (M=7, N=4)
+    Tensor ref = matmul(a.transpose(0, 1).contiguous(), b);
+    Tensor out = matmul_tb(a, b);
+    require_near(ref, out, 1e-5f);
+}
+
+TEST_CASE("matmul_tb equals matmul with transposed A (M>=64, BLAS/Eigen path)", "[ops]") {
+    Tensor a = randn({96, 9});
+    Tensor b = randn({96, 33});
+    Tensor ref = matmul(a.transpose(0, 1).contiguous(), b);
+    Tensor out = matmul_tb(a, b);
+    require_near(ref, out, 1e-4f);
+}
+
+TEST_CASE("matmul_tb dimension mismatch throws", "[ops]") {
+    Tensor a = ones({2, 3});
+    Tensor b = ones({4, 2});   // leading dims 2 vs 4
+    REQUIRE_THROWS_AS(matmul_tb(a, b), std::runtime_error);
+}
+
 TEST_CASE("matmul_bt dimension mismatch throws", "[ops]") {
     Tensor a = ones({2, 3});
     Tensor b = ones({4, 2});   // inner dims 3 vs 2

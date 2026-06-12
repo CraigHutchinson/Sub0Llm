@@ -96,22 +96,19 @@ Variable mul(const Variable& a, const Variable& b) {
 Variable matmul(const Variable& a, const Variable& b) {
     auto out = make_node(ops::matmul(a.data(), b.data()), any_grad(a, b));
     if (out->requires_grad) {
-        // Lazy transpose: capture shallow Tensor snapshots (no data copy at forward time).
-        // .transpose(0,1).contiguous() is deferred to backward, where it is actually needed.
-        // Safe for standard training (optimizer runs after all backward passes complete).
+        // Both gradients use the fused transposed-operand kernels — no transposed
+        // copy is ever materialized in backward:
+        //   dL/dA = g · Bᵀ  → matmul_bt(g, B)      (B row-major as stored)
+        //   dL/dB = Aᵀ · g  → matmul_tb(A, g)      (A row-major as stored)
         if (a.requires_grad()) {
             Tensor b_snap = b.data();
             out->edges.push_back(make_edge(a.impl(),
-                [b_snap](const Tensor& g) {
-                    return ops::matmul(g, b_snap.transpose(0, 1).contiguous());
-                }));
+                [b_snap](const Tensor& g) { return ops::matmul_bt(g, b_snap); }));
         }
         if (b.requires_grad()) {
             Tensor a_snap = a.data();
             out->edges.push_back(make_edge(b.impl(),
-                [a_snap](const Tensor& g) {
-                    return ops::matmul(a_snap.transpose(0, 1).contiguous(), g);
-                }));
+                [a_snap](const Tensor& g) { return ops::matmul_tb(a_snap, g); }));
         }
     }
     return Variable::wrap(std::move(out));
@@ -121,7 +118,7 @@ Variable matmul(const Variable& a, const Variable& b) {
 //
 // out = A · Bᵀ   with A(M,K), B(N,K) — B stays row-major, no transpose materialized.
 // Backward:  dL/dA = g · B    (already the right orientation — no transpose at all)
-//            dL/dB = gᵀ · A
+//            dL/dB = gᵀ · A   → matmul_tb(g, A), also transpose-free
 
 Variable matmul_bt(const Variable& a, const Variable& b) {
     auto out = make_node(ops::matmul_bt(a.data(), b.data()), any_grad(a, b));
@@ -134,9 +131,7 @@ Variable matmul_bt(const Variable& a, const Variable& b) {
         if (b.requires_grad()) {
             Tensor a_snap = a.data();
             out->edges.push_back(make_edge(b.impl(),
-                [a_snap](const Tensor& g) {
-                    return ops::matmul(g.transpose(0, 1).contiguous(), a_snap);
-                }));
+                [a_snap](const Tensor& g) { return ops::matmul_tb(g, a_snap); }));
         }
     }
     return Variable::wrap(std::move(out));

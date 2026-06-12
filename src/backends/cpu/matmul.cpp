@@ -196,6 +196,53 @@ void matmul_bt_scalar(const float* A, const float* B, float* C,
 
 #endif
 
+// C = Aᵀ·B with A(M,K), B(M,N) stored row-major: C(K,N) accumulated as M rank-1
+// updates C[k,:] += A[m,k] * B[m,:]. The inner loop streams a contiguous row of B
+// and a contiguous row of C — no transposed copy of A is ever materialized.
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+
+void matmul_tb_tile_avx2(const float* __restrict__ A,
+                         const float* __restrict__ B,
+                         float*       __restrict__ C,
+                         std::size_t M, std::size_t N, std::size_t K) noexcept {
+    std::memset(C, 0, K * N * sizeof(float));
+    for (std::size_t m = 0; m < M; ++m) {
+        const float* b = B + m * N;
+        for (std::size_t k = 0; k < K; ++k) {
+            const float a_mk = A[m * K + k];
+            float* c = C + k * N;
+            std::size_t j = 0;
+#if defined(SUB0LLM_AVX512)
+            const __m512 va = _mm512_set1_ps(a_mk);
+            for (; j + 16 <= N; j += 16)
+                _mm512_storeu_ps(c + j, _mm512_fmadd_ps(va, _mm512_loadu_ps(b + j),
+                                                        _mm512_loadu_ps(c + j)));
+#else
+            const __m256 va = _mm256_set1_ps(a_mk);
+            for (; j + 8 <= N; j += 8)
+                _mm256_storeu_ps(c + j, _mm256_fmadd_ps(va, _mm256_loadu_ps(b + j),
+                                                        _mm256_loadu_ps(c + j)));
+#endif
+            for (; j < N; ++j) c[j] += a_mk * b[j];
+        }
+    }
+}
+
+#else
+
+void matmul_tb_scalar(const float* A, const float* B, float* C,
+                      std::size_t M, std::size_t N, std::size_t K) noexcept {
+    std::memset(C, 0, K * N * sizeof(float));
+    for (std::size_t m = 0; m < M; ++m)
+        for (std::size_t k = 0; k < K; ++k) {
+            const float a_mk = A[m * K + k];
+            for (std::size_t j = 0; j < N; ++j)
+                C[k * N + j] += a_mk * B[m * N + j];
+        }
+}
+
+#endif
+
 } // anonymous namespace
 
 // Dispatch strategy (priority: BLAS > Eigen > AVX2 > scalar):
@@ -271,6 +318,41 @@ void matmul_bt_f32(const float* A, const float* B, float* C,
     matmul_bt_tile_avx2(A, B, C, M, N, K);
 #else
     matmul_bt_scalar(A, B, C, M, N, K);
+#endif
+}
+
+// C = Aᵀ × B, A(M,K) and B(M,N) row-major, C(K,N). Same dispatch priority; the
+// fallback kernel uses rank-1 row updates so no transposed copy is materialized.
+void matmul_tb_f32(const float* A, const float* B, float* C,
+                   std::size_t M, std::size_t N, std::size_t K) noexcept {
+#if defined(SUB0LLM_BLAS)
+    if (M >= 64) {
+        assert(M <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(N <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(K <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    static_cast<int>(K), static_cast<int>(N), static_cast<int>(M),
+                    1.0f, A, static_cast<int>(K),
+                          B, static_cast<int>(N),
+                    0.0f, C, static_cast<int>(N));
+        return;
+    }
+#elif defined(SUB0LLM_EIGEN)
+    if (M >= 64) {
+        using RowMat = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<const RowMat> Am(A, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(K));
+        Eigen::Map<const RowMat> Bm(B, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(N));
+        Eigen::Map<RowMat>       Cm(C, static_cast<Eigen::Index>(K), static_cast<Eigen::Index>(N));
+        try {
+            Cm.noalias() = Am.transpose() * Bm;
+            return;
+        } catch (...) {}
+    }
+#endif
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    matmul_tb_tile_avx2(A, B, C, M, N, K);
+#else
+    matmul_tb_scalar(A, B, C, M, N, K);
 #endif
 }
 

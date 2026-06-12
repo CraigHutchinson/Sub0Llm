@@ -112,4 +112,9 @@ void matmul_f32(const float* A, const float* B, float* C,
 void matmul_bt_f32(const float* A, const float* B, float* C,
                    std::size_t M, std::size_t N, std::size_t K) noexcept;
 
+// C = Aᵀ × B  where A(M,K), B(M,N), C(K,N) — row-major, rank-1 row updates.
+// No transposed copy of A is materialized (the matmul-backward workhorse).
+void matmul_tb_f32(const float* A, const float* B, float* C,
+                   std::size_t M, std::size_t N, std::size_t K) noexcept;
+
 } // namespace sub0llm::backend::cpu

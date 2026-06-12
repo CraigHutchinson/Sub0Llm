@@ -69,6 +69,7 @@ struct Config {
     std::uint64_t patience   = 5;      // stop after this many evals without improvement
     float t_max            = 1.0f;    // <1.0 trains under a Ch28-style ceiling
     bool eval_only         = false;
+    bool profile           = false;   // report forward/backward/optimizer time split
 
     // Architecture — modest but real (≈1.6M params at V=512).
     std::int64_t embed_dim = 128, n_layers = 4, d_ff = 384;
@@ -94,6 +95,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--eval-factor") c.eval_factor = std::stof(next());
         else if (a == "--t-max")      c.t_max      = std::stof(next());
         else if (a == "--eval-only")  c.eval_only  = true;
+        else if (a == "--profile")    c.profile    = true;
         else throw std::runtime_error(std::format("unknown argument: {}", a));
     }
     return c;
@@ -289,15 +291,28 @@ static int run(int argc, char** argv) {
         std::uint64_t evals_since_best = 0, steps_taken = start_step;
         constexpr float min_improvement = 0.01f;
 
+        // --profile: accumulated wall time per phase, reported with each timing line.
+        double p_fwd = 0.0, p_bwd = 0.0, p_opt = 0.0;
+        const auto tick = [] { return std::chrono::steady_clock::now(); };
+
         for (std::uint64_t step = start_step; step < cfg.steps; ++step) {
             const auto window = train_span.subspan(off_dist(rng),
                                                    static_cast<std::size_t>(cfg.seq_len));
+            auto pt0 = tick();
             auto res = dt::diffusion_loss(model, window, rng, ctx, 0.02f, cfg.t_max);
 
+            auto pt1 = tick();
             opt.zero_grad();
             res.loss.backward();
+            auto pt2 = tick();
             (void)nn::clip_grad_norm(param_ptrs, 5.0f);
             opt.step();
+            if (cfg.profile) {
+                auto pt3 = tick();
+                p_fwd += std::chrono::duration<double>(pt1 - pt0).count();
+                p_bwd += std::chrono::duration<double>(pt2 - pt1).count();
+                p_opt += std::chrono::duration<double>(pt3 - pt2).count();
+            }
             ++interval_steps;
             interval_tokens += res.n_masked;
             steps_taken = step + 1;
@@ -311,6 +326,16 @@ static int run(int argc, char** argv) {
                              el, step, res.loss.data().item<float>(), res.t,
                              static_cast<double>(interval_steps) / since_report,
                              static_cast<double>(interval_tokens) / since_report);
+                if (cfg.profile) {
+                    const double tot = p_fwd + p_bwd + p_opt;
+                    std::println("        profile: fwd {:.0f}%  bwd {:.0f}%  opt {:.0f}%  "
+                                 "({:.2f}/{:.2f}/{:.2f} ms/step)",
+                                 100.0 * p_fwd / tot, 100.0 * p_bwd / tot, 100.0 * p_opt / tot,
+                                 1e3 * p_fwd / static_cast<double>(interval_steps),
+                                 1e3 * p_bwd / static_cast<double>(interval_steps),
+                                 1e3 * p_opt / static_cast<double>(interval_steps));
+                    p_fwd = p_bwd = p_opt = 0.0;
+                }
                 last_report = now;
                 interval_steps = 0;
                 interval_tokens = 0;
@@ -338,10 +363,12 @@ static int run(int argc, char** argv) {
         }
         const double total = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
-        std::println("Training done: {:.1f}s, {} steps ({}), best held-out NELBO {:.4f}",
+        std::println("Training done: {:.1f}s, {} steps ({}), best held-out NELBO {}",
                      total, steps_taken,
                      steps_taken == cfg.steps ? "hit safety bound" : "self-terminated",
-                     best_nelbo);
+                     best_nelbo == std::numeric_limits<float>::max()
+                         ? std::string("n/a (no eval ran)")
+                         : std::format("{:.4f}", best_nelbo));
         // Reload the BEST checkpoint (the loop may have overfit past it) so §5
         // evaluates — and Ch30 inherits — the early-stopping winner, not the tail.
         if (const auto best = latest_checkpoint_path(cfg.ckpt_dir); !best.empty())

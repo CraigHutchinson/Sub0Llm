@@ -227,6 +227,36 @@ Tensor matmul_bt(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor matmul_tb(const Tensor& a, const Tensor& b) {
+    if (a.ndim() != 2 || b.ndim() != 2)
+        throw std::runtime_error("matmul_tb: inputs must be 2D");
+
+    const auto M  = static_cast<std::size_t>(a.shape(0));
+    const auto K  = static_cast<std::size_t>(a.shape(1));
+    const auto M2 = static_cast<std::size_t>(b.shape(0));
+    const auto N  = static_cast<std::size_t>(b.shape(1));
+
+    if (M != M2) throw std::runtime_error(
+        std::format("matmul_tb: leading dims must match, got A({},.) vs B({},.)", M, M2));
+    require_f32(a, "matmul_tb");
+
+    // The fused row-major Aᵀ·B kernel is CPU-only; other devices take the generic path.
+    if (!a.device().is_cpu())
+        return matmul(a.transpose(0, 1).contiguous(), b);
+
+    const Tensor ac = a.contiguous();
+    const Tensor bc = b.contiguous();
+    Tensor out(Tensor::Shape{static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)},
+               DType::Float32, a.device());
+
+    backend::cpu::matmul_tb_f32(
+        reinterpret_cast<const float*>(ac.raw_ptr()),
+        reinterpret_cast<const float*>(bc.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()),
+        M, N, K);
+    return out;
+}
+
 Tensor narrow(const Tensor& t, int64_t start, int64_t length) {
     require_f32(t, "narrow");
     require_cpu(t, "narrow");
