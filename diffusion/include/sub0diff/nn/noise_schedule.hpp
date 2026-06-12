@@ -33,7 +33,7 @@ using sub0diff::spec::NoiseSchedule;
 struct Corruption {
     std::vector<std::int32_t> tokens;     // the corrupted sequence fed to the denoiser
     std::vector<std::uint8_t> corrupted;  // 1 where a position was damaged (a loss target)
-    int                       n_corrupted = 0;
+    std::uint32_t             n_corrupted = 0U;
 };
 
 // Linear noise level for a reverse-process step index: step 0 = clean, n_steps = fully masked.
@@ -65,6 +65,8 @@ template<class RNG>
     // Local helper: apply schedule-specific corruption to a single position.
     // Encapsulates the Absorbing/Uniform conditional so the fallback doesn't duplicate it.
     auto corrupt_pos = [&](std::size_t pos) {
+        c.corrupted[pos] = 1;
+        ++c.n_corrupted;
         if (schedule == NoiseSchedule::Absorbing) {
             c.tokens[pos] = mask_id;
         } else {  // Uniform: replace with a random real token (never the mask id)
@@ -76,8 +78,6 @@ template<class RNG>
 
     for (std::size_t i = 0; i < clean.size(); ++i) {
         if (!coin(rng)) continue;
-        c.corrupted[i] = 1;
-        ++c.n_corrupted;
         corrupt_pos(i);
     }
 
@@ -85,10 +85,7 @@ template<class RNG>
     // With mask_prob=0.04 and T=24: P(0) ≈ 37%, so this branch is hit frequently.
     if (c.n_corrupted == 0) {
         std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
-        std::size_t pos = pos_dist(rng);
-        c.corrupted[pos] = 1;
-        ++c.n_corrupted;
-        corrupt_pos(pos);
+        corrupt_pos( pos_dist(rng) );
     }
     return c;
 }

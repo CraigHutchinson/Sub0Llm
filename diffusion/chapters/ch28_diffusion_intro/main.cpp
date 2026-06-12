@@ -27,6 +27,7 @@
 #include "sub0llm/nn/optimizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <random>
@@ -225,7 +226,7 @@ int main() {
     section("3. Training — adaptive curriculum: performance-driven noise level");
     std::println("The noise level moves up when the model masters the current difficulty");
     std::println("and eases back when it struggles — keeping the model at the edge of its ability.\n");
-    const std::uint64_t steps = corpus_windows * 50LL;
+    const std::uint64_t steps = corpus_windows * 72LL;
 
     std::println("Training for {} steps ({} epochs, {} windows) with adaptive curriculum noise:",
                  steps, steps / corpus_windows, corpus_windows);
@@ -238,8 +239,6 @@ int main() {
     const float curriculum_start = min_corruption;   // start easy — only 5% masked
     const float curriculum_end   = 0.80f;   // cap at 80% masked — push higher for robust denoising
     const float noise_step       = min_corruption;   // smaller steps for smoother adaptation
-    const std::uint32_t status_interval = std::min(steps / 25, 10000ULL);  // print status ~25 times
-
 
     nn::Adam opt(params, /*lr=*/2e-3f);
     std::mt19937 rng(1234);
@@ -288,6 +287,12 @@ int main() {
         }
         return ema_probe_loss;
     };
+
+    // ── Timer for throughput measurement ───────────────────────────────────────
+    auto train_start = std::chrono::high_resolution_clock::now();
+    std::uint64_t reportinterval_steps = 0;
+    std::uint64_t reportinterval_tokens = 0;
+    auto last_timing_check = train_start;
 
     for (std::uint64_t step = 0; step < steps; ++step) {
         // ── Adaptive curriculum: adjust noise based on EMA probe loss vs baseline ───
@@ -342,11 +347,32 @@ int main() {
         (void)nn::clip_grad_norm(params, 5.0f);
         opt.step();
 
-        if (step % status_interval == 0 || step == steps - 1) {
-            std::println("  step {:4}  train masked-CE = {:.4f}   noise = {:.2f}",
-                         step, loss.data().item<float>(), current_noise);
+        ++reportinterval_steps;
+        reportinterval_tokens += corr.n_corrupted;
+
+        // Throughput reporting at timed interval
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed_since_check = std::chrono::duration<double>(now - last_timing_check).count();
+        if (elapsed_since_check >= 30.0 || step == steps - 1) {
+            double elapsed_total = std::chrono::duration<double>(now - train_start).count();
+            double steps_per_sec = static_cast<double>(reportinterval_steps) / elapsed_since_check;
+            double tokens_per_sec = static_cast<double>(reportinterval_tokens) / elapsed_since_check;
+            std::println("{}s  step {:6}  loss={:.4f}  noise={:.2f}  [{} steps/s, {} tok/s]",
+                         static_cast<int>(std::round(elapsed_total)),
+                         step, loss.data().item<float>(), current_noise,
+                         static_cast<int>(std::round(steps_per_sec)),
+                         static_cast<int>(std::round(tokens_per_sec)));
+            last_timing_check = now;
+            reportinterval_steps = 0;  // reset counter for next interval
+            reportinterval_tokens = 0; // reset token counter for next interval
         }
     }
+
+    auto train_end = std::chrono::high_resolution_clock::now();
+    double train_seconds = std::chrono::duration<double>(train_end - train_start).count();
+    double overall_steps_per_sec = static_cast<double>(steps) / train_seconds;
+    std::println("Training complete: {:.1f}s, {:.1f} steps/s, {} total steps", train_seconds,
+                 overall_steps_per_sec, steps);
 
     // ── 4. multi-fragment recovery evaluation ───────────────────────────────────
     section("4. Recovery evaluation — testing across corpus fragments");
