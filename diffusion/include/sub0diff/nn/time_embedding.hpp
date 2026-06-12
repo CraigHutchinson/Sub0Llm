@@ -23,18 +23,24 @@ namespace sub0diff::nn {
 inline constexpr float kTimeEmbedScale = 1000.0f;
 
 // Sinusoidal embedding of a single noise level into a (D,) vector.
+//
+// AMPLITUDE matters: token embeddings initialise at N(0, 1/sqrt(D)) (~0.09/dim at
+// D=128), so unit-amplitude sinusoids would be ~11x louder than the content signal —
+// token identity becomes <1% of the input energy and learning slows ~10x (measured:
+// Ch29 stuck near uniform NELBO until this was matched). Scale to the same 1/sqrt(D).
 [[nodiscard]] inline sub0llm::Tensor time_embedding_vector(float level, std::int64_t D) {
     sub0llm::Tensor v = sub0llm::zeros({D});
     auto s = v.data_as<float>();
+    const float amp = 1.0f / std::sqrt(static_cast<float>(D));
     const std::size_t half = static_cast<std::size_t>(D / 2);
     for (std::size_t i = 0; i < half; ++i) {
         const float omega = kTimeEmbedScale *
                             std::pow(10000.0f, -2.0f * static_cast<float>(i) / static_cast<float>(D));
         const float ang = level * omega;
-        s[2 * i]     = std::sin(ang);
-        s[2 * i + 1] = std::cos(ang);
+        s[2 * i]     = amp * std::sin(ang);
+        s[2 * i + 1] = amp * std::cos(ang);
     }
-    if (D & 1) s[static_cast<std::size_t>(D - 1)] = std::sin(level * kTimeEmbedScale);  // odd D
+    if (D & 1) s[static_cast<std::size_t>(D - 1)] = amp * std::sin(level * kTimeEmbedScale);  // odd D
     return v;
 }
 

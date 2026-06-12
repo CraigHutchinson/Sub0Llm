@@ -9,6 +9,7 @@
 add_library(sub0diff STATIC
     src/host_detect.cpp
     src/denoiser.cpp
+    src/recovery.cpp
 )
 target_include_directories(sub0diff PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -28,4 +29,9 @@ set_target_properties(sub0diff-specialize PROPERTIES
 # ── chapters ─────────────────────────────────────────────────────────────────────
 if(SUB0LLM_BUILD_CHAPTERS)
     add_subdirectory(chapters)
+endif()
+
+# ── tests ────────────────────────────────────────────────────────────────────────
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()

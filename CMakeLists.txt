@@ -35,6 +35,12 @@ include(deps)
 # ── Library & chapters ────────────────────────────────────────────────────────
 add_subdirectory(src)
 
+# enable_testing() must precede every add_subdirectory() that registers tests
+# (diffusion/tests would otherwise emit no CTest entries).
+if(BUILD_TESTING)
+    enable_testing()
+endif()
+
 if(SUB0LLM_BUILD_CHAPTERS)
     add_subdirectory(chapters)
 endif()
@@ -48,7 +54,6 @@ endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
-    enable_testing()
     add_subdirectory(tests)
 endif()
 
