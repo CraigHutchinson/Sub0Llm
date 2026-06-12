@@ -45,6 +45,7 @@ struct Corruption {
 }
 
 // Corrupt `clean` by independently damaging each position with probability `mask_prob`.
+// Guarantees at least one position is corrupted (Bernoulli can return 0 at low probabilities).
 //   mask_id      — the [MASK] token (== real vocab size); used by Absorbing only.
 //   real_vocab   — number of real tokens; Uniform draws a replacement in [0, real_vocab).
 template<class RNG>
@@ -61,17 +62,33 @@ template<class RNG>
     std::bernoulli_distribution coin(std::clamp(mask_prob, 0.0f, 1.0f));
     std::uniform_int_distribution<std::int32_t> uni(0, static_cast<std::int32_t>(real_vocab) - 1);
 
+    // Local helper: apply schedule-specific corruption to a single position.
+    // Encapsulates the Absorbing/Uniform conditional so the fallback doesn't duplicate it.
+    auto corrupt_pos = [&](std::size_t pos) {
+        if (schedule == NoiseSchedule::Absorbing) {
+            c.tokens[pos] = mask_id;
+        } else {  // Uniform: replace with a random real token (never the mask id)
+            std::int32_t r = uni(rng);
+            if (r == clean[pos] && real_vocab > 1) r = (r + 1) % static_cast<std::int32_t>(real_vocab);
+            c.tokens[pos] = r;
+        }
+    };
+
     for (std::size_t i = 0; i < clean.size(); ++i) {
         if (!coin(rng)) continue;
         c.corrupted[i] = 1;
         ++c.n_corrupted;
-        if (schedule == NoiseSchedule::Absorbing) {
-            c.tokens[i] = mask_id;
-        } else {  // Uniform: replace with a random real token (never the mask id)
-            std::int32_t r = uni(rng);
-            if (r == clean[i] && real_vocab > 1) r = (r + 1) % static_cast<std::int32_t>(real_vocab);
-            c.tokens[i] = r;
-        }
+        corrupt_pos(i);
+    }
+
+    // Guarantee at least one corrupted position — Bernoulli can return 0 at low mask_prob.
+    // With mask_prob=0.04 and T=24: P(0) ≈ 37%, so this branch is hit frequently.
+    if (c.n_corrupted == 0) {
+        std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
+        std::size_t pos = pos_dist(rng);
+        c.corrupted[pos] = 1;
+        ++c.n_corrupted;
+        corrupt_pos(pos);
     }
     return c;
 }

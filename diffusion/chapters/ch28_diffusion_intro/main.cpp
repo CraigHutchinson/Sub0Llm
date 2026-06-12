@@ -219,23 +219,27 @@ int main() {
     // We adapt every time we've seen ~5% of available corpus windows.
     // This scales with corpus size — small corpus adapts faster, large corpus adapts slower.
     const std::size_t corpus_windows = static_cast<std::size_t>(corpus_ids.size()) - static_cast<std::size_t>(T);
-    const std::uint32_t adapt_interval = std::max(250U, static_cast<std::uint32_t>(corpus_windows));
+    const std::uint32_t adapt_interval = std::max(250U, static_cast<std::uint32_t>(corpus_windows*2));
 
     // ── 3. train: adaptive curriculum — noise level driven by performance ───────
     section("3. Training — adaptive curriculum: performance-driven noise level");
     std::println("The noise level moves up when the model masters the current difficulty");
     std::println("and eases back when it struggles — keeping the model at the edge of its ability.\n");
-    const std::uint64_t steps = corpus_windows * 100ULL;
+    const std::uint64_t steps = corpus_windows * 50LL;
 
     std::println("Training for {} steps ({} epochs, {} windows) with adaptive curriculum noise:",
                  steps, steps / corpus_windows, corpus_windows);
 
+    // Minimum corruption floor — deterministic guarantee, not random fallback
+    // With T=24 tokens, 0.05 noise → ~1 token minimum (ceil(24*0.05) = 2)
+    const float min_corruption = 1.0f / static_cast<float>(T-1);  // one token minimum
+
     // Adaptive curriculum parameters
-    const float curriculum_start = 0.05f;   // start easy — only 5% masked
+    const float curriculum_start = min_corruption;   // start easy — only 5% masked
     const float curriculum_end   = 0.80f;   // cap at 80% masked — push higher for robust denoising
-    const float noise_step       = 0.02f;   // smaller steps for smoother adaptation
-    const int   improvement_window = 5;     // look at last N probe losses for trend
-    const std::uint32_t status_interval = std::max(steps / 100, 1000ULL);  // print status ~100 times
+    const float noise_step       = min_corruption;   // smaller steps for smoother adaptation
+    const std::uint32_t status_interval = std::min(steps / 25, 10000ULL);  // print status ~25 times
+
 
     nn::Adam opt(params, /*lr=*/2e-3f);
     std::mt19937 rng(1234);
@@ -252,75 +256,85 @@ int main() {
     // Separate RNG for probe (fixed seed for reproducibility)
     std::mt19937 probe_rng(999);
 
-    // Track recent probe losses for trend detection
-    std::vector<float> probe_history;
-    constexpr int history_size = 6;
+    // EMA-smoothed probe loss — prevents oscillation when noise level changes
+    // Raw probe loss rises when noise increases (harder task), causing false "getting worse"
+    // signals. EMA smooths this so we measure actual learning, not task difficulty.
+    // Baseline comparison: record EMA loss at last noise change, compare current EMA against it.
+    float ema_probe_loss = 0.0f;
+    constexpr float ema_alpha = 0.3f;  // aggressive smoothing — recent values weighted heavily
+    bool ema_initialized = false;
+    float ema_baseline = 0.0f;  // EMA loss recorded at last noise level change
+    bool baseline_set = false;
 
     auto probe_loss = [&]() -> float {
-        // Corrupt probe with current_noise — realistic test of current difficulty
-        auto corr = dn::corrupt(std::span<const std::int32_t>(probe), current_noise,
+        // Corrupt probe with actual_noise — realistic test of current difficulty
+        auto corr = dn::corrupt(std::span<const std::int32_t>(probe),
+                                current_noise,
                                 dn::NoiseSchedule::Absorbing, mask_id, V, probe_rng);
-        if (corr.n_corrupted == 0) { corr.tokens[0] = mask_id; corr.corrupted[0] = 1; }
 
+        const float actual_noise = static_cast<float>(corr.n_corrupted) / static_cast<float>(T);
         std::vector<float> w(static_cast<std::size_t>(T));
         for (std::size_t i = 0; i < static_cast<std::size_t>(T); ++i) w[i] = corr.corrupted[i];
 
-        ag::Variable logits = model.forward(ids_tensor(corr.tokens), current_noise);
-        return ag::weighted_cross_entropy(logits, ids_tensor(probe), f32_tensor(w)).data().item<float>();
+        ag::Variable logits = model.forward(ids_tensor(corr.tokens), actual_noise);
+        float raw_loss = ag::weighted_cross_entropy(logits, ids_tensor(probe), f32_tensor(w)).data().item<float>();
+
+        // EMA smoothing — prevents oscillation from noise-level-induced loss spikes
+        if (!ema_initialized) {
+            ema_probe_loss = raw_loss;
+            ema_initialized = true;
+        } else {
+            ema_probe_loss = ema_alpha * raw_loss + (1.0f - ema_alpha) * ema_probe_loss;
+        }
+        return ema_probe_loss;
     };
 
     for (std::uint64_t step = 0; step < steps; ++step) {
-        // ── Adaptive curriculum: adjust noise based on probe loss TREND ───────
+        // ── Adaptive curriculum: adjust noise based on EMA probe loss vs baseline ───
         if (step > 0 && step % adapt_interval == 0) {
             float pl = probe_loss();
-            probe_history.push_back(pl);
-            if (probe_history.size() > static_cast<std::size_t>(history_size))
-                probe_history.erase(probe_history.begin());
 
-            // Need enough history to detect a trend
-            if (probe_history.size() >= static_cast<std::size_t>(improvement_window)) {
-                // Compare average of recent window vs older window
-                std::size_t half = probe_history.size() / 2;
-                float recent_avg = 0.0f, older_avg = 0.0f;
-                for (std::size_t i = 0; i < half; ++i) {
-                    older_avg += probe_history[i];
-                    recent_avg += probe_history[half + i];
-                }
-                older_avg /= static_cast<float>(half);
-                recent_avg /= static_cast<float>(half);
-
-                float prev_noise = current_noise;
-                float improvement = older_avg - recent_avg;  // positive = getting better
-
-                if (improvement > 0.15f) {
-                    // Sustained improvement — increase difficulty
-                    current_noise = std::min(curriculum_end, current_noise + noise_step);
-                    probe_history.clear();  // reset history after a difficulty change
-                } else if (improvement < -0.1f) {
-                    // Getting worse — ease back
-                    current_noise = std::max(curriculum_start, current_noise - noise_step * 0.5f);
-                    probe_history.clear();  // reset history after a difficulty change
-                }
-                // else: plateau — hold steady
-
-                if ( std::abs(current_noise - prev_noise) >= 0.001f)
-                    std::println("  curriculum noise: {:.2f} → {:.2f}  (improvement={:+.4f}, history={:.2f}→{:.2f})",
-                                 prev_noise, current_noise, improvement, older_avg, recent_avg);
+            // Initialize baseline on first adapt step
+            if (!baseline_set) {
+                ema_baseline = pl;
+                baseline_set = true;
             }
+
+            float prev_noise = current_noise;
+            float improvement = ema_baseline - pl;  // positive = getting better (loss decreasing)
+
+            // Thresholds tuned for EMA-smoothed losses (less noisy than raw)
+            if (improvement > 0.08f) {
+                // Sustained improvement — increase difficulty
+                current_noise = std::min(curriculum_end, current_noise + noise_step);
+                baseline_set = false;  // reset baseline at new difficulty
+            } else if (improvement < -0.06f) {
+                // Getting worse — ease back
+                current_noise = std::max(curriculum_start, current_noise - noise_step * 0.5f);
+                baseline_set = false;  // reset baseline at new difficulty
+            }
+            // else: plateau — hold steady
+
+            if ( std::abs(current_noise - prev_noise) >= 0.001f)
+                std::println("  curriculum noise: {:.2f} → {:.2f}  (EMA baseline {:.4f} → {:.4f})",
+                             prev_noise, current_noise, ema_baseline, pl);
         }
 
         // ── Sample a training window and corrupt it with current noise level ──────
         const std::size_t off = off_dist(rng);
         std::vector<std::int32_t> clean(corpus_ids.begin() + static_cast<std::ptrdiff_t>(off),
                                         corpus_ids.begin() + static_cast<std::ptrdiff_t>(off) + T);
-        auto corr = dn::corrupt(std::span<const std::int32_t>(clean), current_noise,
+        // Quantize noise to min_corruption multiples — deterministic curriculum levels.
+        // corrupt() guarantees ≥1 corruption, so no fallback needed.
+        auto corr = dn::corrupt(std::span<const std::int32_t>(clean),
+                                current_noise,
                                 dn::NoiseSchedule::Absorbing, mask_id, V, rng);
-        if (corr.n_corrupted == 0) { corr.tokens[0] = mask_id; corr.corrupted[0] = 1; }  // need ≥1 target
 
+        const float actual_noise = static_cast<float>(corr.n_corrupted) / static_cast<float>(T);
         std::vector<float> w(static_cast<std::size_t>(T));
         for (std::size_t i = 0; i < static_cast<std::size_t>(T); ++i) w[i] = corr.corrupted[i];
 
-        ag::Variable logits = model.forward(ids_tensor(corr.tokens), current_noise);  // (T, V+1)
+        ag::Variable logits = model.forward(ids_tensor(corr.tokens), actual_noise);  // (T, V+1)
         ag::Variable loss   = ag::weighted_cross_entropy(logits, ids_tensor(clean), f32_tensor(w));
 
         opt.zero_grad();
