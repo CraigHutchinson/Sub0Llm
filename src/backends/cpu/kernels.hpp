@@ -107,4 +107,9 @@ float norm_f32(const float* RESTRICT in, std::size_t n) noexcept;
 void matmul_f32(const float* A, const float* B, float* C,
                 std::size_t M, std::size_t N, std::size_t K) noexcept;
 
+// C = A × Bᵀ  where A(M,K), B(N,K), C(M,N) — row-major. Both operands stream
+// contiguously (row·row dots), so no transposed copy of B is materialized.
+void matmul_bt_f32(const float* A, const float* B, float* C,
+                   std::size_t M, std::size_t N, std::size_t K) noexcept;
+
 } // namespace sub0llm::backend::cpu

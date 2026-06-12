@@ -22,7 +22,7 @@ void cblas_sgemm(int Order, int TransA, int TransB,
                  const float* B, int ldb,
                  float beta, float* C, int ldc);
 }
-constexpr int CblasRowMajor = 101, CblasNoTrans = 111;
+constexpr int CblasRowMajor = 101, CblasNoTrans = 111, CblasTrans = 112;
 #  endif
 #elif defined(SUB0LLM_EIGEN)
 // Eigen3 — header-only, fetched via CPM; no CBLAS/Fortran dependency
@@ -134,6 +134,68 @@ void matmul_scalar_blocked(const float* A, const float* B, float* C,
 
 #endif
 
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+
+// C = A·Bᵀ with B stored row-major (N, K): C[i,j] = dot(A row i, B row j).
+// Both operands stream contiguously, so no transpose materialization is needed —
+// this is the natural orientation for a weight-tied LM head (logits = x · Wᵀ).
+void matmul_bt_tile_avx2(const float* __restrict__ A,
+                         const float* __restrict__ B,
+                         float*       __restrict__ C,
+                         std::size_t M, std::size_t N, std::size_t K) noexcept {
+#if defined(SUB0LLM_AVX512)
+    constexpr std::size_t W = 16;
+    auto hsum = [](__m512 v) noexcept { return _mm512_reduce_add_ps(v); };
+    auto load = [](const float* p) noexcept { return _mm512_loadu_ps(p); };
+    auto fma  = [](__m512 a, __m512 b, __m512 c) noexcept { return _mm512_fmadd_ps(a, b, c); };
+    auto zero = []() noexcept { return _mm512_setzero_ps(); };
+#else
+    constexpr std::size_t W = 8;
+    auto hsum = [](__m256 v) noexcept {
+        __m128 lo  = _mm256_castps256_ps128(v);
+        __m128 hi  = _mm256_extractf128_ps(v, 1);
+        __m128 s   = _mm_add_ps(lo, hi);
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        return _mm_cvtss_f32(s);
+    };
+    auto load = [](const float* p) noexcept { return _mm256_loadu_ps(p); };
+    auto fma  = [](__m256 a, __m256 b, __m256 c) noexcept { return _mm256_fmadd_ps(a, b, c); };
+    auto zero = []() noexcept { return _mm256_setzero_ps(); };
+#endif
+    for (std::size_t i = 0; i < M; ++i) {
+        const float* a = A + i * K;
+        for (std::size_t j = 0; j < N; ++j) {
+            const float* b = B + j * K;
+            auto acc0 = zero(), acc1 = zero();
+            std::size_t k = 0;
+            for (; k + 2 * W <= K; k += 2 * W) {
+                acc0 = fma(load(a + k),     load(b + k),     acc0);
+                acc1 = fma(load(a + k + W), load(b + k + W), acc1);
+            }
+            for (; k + W <= K; k += W)
+                acc0 = fma(load(a + k), load(b + k), acc0);
+            float s = hsum(acc0) + hsum(acc1);
+            for (; k < K; ++k) s += a[k] * b[k];
+            C[i * N + j] = s;
+        }
+    }
+}
+
+#else
+
+void matmul_bt_scalar(const float* A, const float* B, float* C,
+                      std::size_t M, std::size_t N, std::size_t K) noexcept {
+    for (std::size_t i = 0; i < M; ++i)
+        for (std::size_t j = 0; j < N; ++j) {
+            float s = 0.0f;
+            for (std::size_t k = 0; k < K; ++k) s += A[i * K + k] * B[j * K + k];
+            C[i * N + j] = s;
+        }
+}
+
+#endif
+
 } // anonymous namespace
 
 // Dispatch strategy (priority: BLAS > Eigen > AVX2 > scalar):
@@ -173,6 +235,42 @@ void matmul_f32(const float* A, const float* B, float* C,
     matmul_tile_avx2(A, B, C, M, N, K);
 #else
     matmul_scalar_blocked(A, B, C, M, N, K);
+#endif
+}
+
+// C = A·Bᵀ, A(M,K) and B(N,K) row-major. Same dispatch priority as matmul_f32;
+// the fallback kernels read both operands contiguously (row·row dot products),
+// so unlike matmul_f32 no transposed copy of B is ever materialized.
+void matmul_bt_f32(const float* A, const float* B, float* C,
+                   std::size_t M, std::size_t N, std::size_t K) noexcept {
+#if defined(SUB0LLM_BLAS)
+    if (K >= 64) {
+        assert(M <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(N <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        assert(K <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    1.0f, A, static_cast<int>(K),
+                          B, static_cast<int>(K),
+                    0.0f, C, static_cast<int>(N));
+        return;
+    }
+#elif defined(SUB0LLM_EIGEN)
+    if (K >= 64) {
+        using RowMat = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<const RowMat> Am(A, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(K));
+        Eigen::Map<const RowMat> Bm(B, static_cast<Eigen::Index>(N), static_cast<Eigen::Index>(K));
+        Eigen::Map<RowMat>       Cm(C, static_cast<Eigen::Index>(M), static_cast<Eigen::Index>(N));
+        try {
+            Cm.noalias() = Am * Bm.transpose();
+            return;
+        } catch (...) {}
+    }
+#endif
+#if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
+    matmul_bt_tile_avx2(A, B, C, M, N, K);
+#else
+    matmul_bt_scalar(A, B, C, M, N, K);
 #endif
 }
 

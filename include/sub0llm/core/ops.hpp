@@ -38,6 +38,10 @@ namespace sub0llm::ops {
 // Batched: (..., M, K) × (..., K, N) → (..., M, N).
 [[nodiscard]] Tensor matmul(const Tensor& a, const Tensor& b);
 
+// Fused A·Bᵀ: (M, K) × (N, K)ᵀ → (M, N), 2D only. B stays row-major — no transposed
+// copy is materialized. The natural orientation for a weight-tied LM head (x · Wᵀ).
+[[nodiscard]] Tensor matmul_bt(const Tensor& a, const Tensor& b);
+
 // ── Unary ─────────────────────────────────────────────────────────────────────
 [[nodiscard]] Tensor exp(const Tensor& t);
 [[nodiscard]] Tensor log(const Tensor& t);

@@ -170,6 +170,39 @@ TEST_CASE("matmul - gradient check (B input)", "[autograd][grad_check]") {
     REQUIRE(grad_check(f, B) < 1e-2f);
 }
 
+TEST_CASE("matmul_bt - gradient check (A input)", "[autograd][grad_check]") {
+    auto B = leaf2d({0.7f,0.9f,1.1f, 0.8f,1.0f,1.2f}, 2, 3, false);   // (N=2, K=3)
+    auto A = leaf2d({0.1f,0.2f,0.3f, 0.4f,0.5f,0.6f}, 2, 3);          // (M=2, K=3)
+    auto f = [&](const Variable& v) { return sum(matmul_bt(v, B)); };
+    REQUIRE(grad_check(f, A) < 1e-2f);
+}
+
+TEST_CASE("matmul_bt - gradient check (B input)", "[autograd][grad_check]") {
+    auto A = leaf2d({0.1f,0.2f,0.3f, 0.4f,0.5f,0.6f}, 2, 3, false);
+    auto B = leaf2d({0.7f,0.9f,1.1f, 0.8f,1.0f,1.2f}, 2, 3);
+    auto f = [&](const Variable& v) { return sum(matmul_bt(A, v)); };
+    REQUIRE(grad_check(f, B) < 1e-2f);
+}
+
+TEST_CASE("matmul_bt - matches matmul(transpose2d) forward and backward", "[autograd]") {
+    auto A1 = leaf2d({0.1f,0.2f,0.3f, 0.4f,0.5f,0.6f}, 2, 3);
+    auto B1 = leaf2d({0.7f,0.9f,1.1f, 0.8f,1.0f,1.2f}, 2, 3);
+    auto A2 = leaf2d({0.1f,0.2f,0.3f, 0.4f,0.5f,0.6f}, 2, 3);
+    auto B2 = leaf2d({0.7f,0.9f,1.1f, 0.8f,1.0f,1.2f}, 2, 3);
+
+    auto fused = sum(matmul_bt(A1, B1));
+    auto ref   = sum(matmul(A2, transpose2d(B2)));
+    fused.backward();
+    ref.backward();
+
+    REQUIRE_THAT(fused.data().data_as<float>()[0],
+                 WithinAbs(ref.data().data_as<float>()[0], 1e-5f));
+    auto ga1 = A1.grad().data_as<float>(); auto ga2 = A2.grad().data_as<float>();
+    auto gb1 = B1.grad().data_as<float>(); auto gb2 = B2.grad().data_as<float>();
+    for (std::size_t i = 0; i < ga1.size(); ++i) REQUIRE_THAT(ga1[i], WithinAbs(ga2[i], 1e-5f));
+    for (std::size_t i = 0; i < gb1.size(); ++i) REQUIRE_THAT(gb1[i], WithinAbs(gb2[i], 1e-5f));
+}
+
 // ── sum ───────────────────────────────────────────────────────────────────────
 
 TEST_CASE("sum - gradient is broadcast ones", "[autograd]") {

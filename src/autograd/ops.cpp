@@ -117,6 +117,31 @@ Variable matmul(const Variable& a, const Variable& b) {
     return Variable::wrap(std::move(out));
 }
 
+// ── matmul_bt ─────────────────────────────────────────────────────────────────
+//
+// out = A · Bᵀ   with A(M,K), B(N,K) — B stays row-major, no transpose materialized.
+// Backward:  dL/dA = g · B    (already the right orientation — no transpose at all)
+//            dL/dB = gᵀ · A
+
+Variable matmul_bt(const Variable& a, const Variable& b) {
+    auto out = make_node(ops::matmul_bt(a.data(), b.data()), any_grad(a, b));
+    if (out->requires_grad) {
+        if (a.requires_grad()) {
+            Tensor b_snap = b.data();
+            out->edges.push_back(make_edge(a.impl(),
+                [b_snap](const Tensor& g) { return ops::matmul(g, b_snap); }));
+        }
+        if (b.requires_grad()) {
+            Tensor a_snap = a.data();
+            out->edges.push_back(make_edge(b.impl(),
+                [a_snap](const Tensor& g) {
+                    return ops::matmul(g.transpose(0, 1).contiguous(), a_snap);
+                }));
+        }
+    }
+    return Variable::wrap(std::move(out));
+}
+
 // ── sum ───────────────────────────────────────────────────────────────────────
 //
 // s = sum(x)   (scalar, numel=1)

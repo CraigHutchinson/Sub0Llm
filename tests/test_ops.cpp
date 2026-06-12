@@ -164,6 +164,28 @@ TEST_CASE("matmul dimension mismatch throws", "[ops]") {
     REQUIRE_THROWS_AS(matmul(a, b), std::runtime_error);
 }
 
+TEST_CASE("matmul_bt equals matmul with transposed B (small K, SIMD path)", "[ops]") {
+    Tensor a = randn({5, 7});
+    Tensor b = randn({4, 7});
+    Tensor ref = matmul(a, b.transpose(0, 1).contiguous());
+    Tensor out = matmul_bt(a, b);
+    require_near(ref, out, 1e-5f);
+}
+
+TEST_CASE("matmul_bt equals matmul with transposed B (K>=64, BLAS/Eigen path)", "[ops]") {
+    Tensor a = randn({9, 96});
+    Tensor b = randn({33, 96});
+    Tensor ref = matmul(a, b.transpose(0, 1).contiguous());
+    Tensor out = matmul_bt(a, b);
+    require_near(ref, out, 1e-4f);
+}
+
+TEST_CASE("matmul_bt dimension mismatch throws", "[ops]") {
+    Tensor a = ones({2, 3});
+    Tensor b = ones({4, 2});   // inner dims 3 vs 2
+    REQUIRE_THROWS_AS(matmul_bt(a, b), std::runtime_error);
+}
+
 // ── Unary ─────────────────────────────────────────────────────────────────────
 
 TEST_CASE("exp and log are inverses", "[ops]") {

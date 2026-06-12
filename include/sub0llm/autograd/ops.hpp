@@ -14,6 +14,10 @@ namespace sub0llm::autograd {
 
 [[nodiscard]] Variable matmul(const Variable& a, const Variable& b);
 
+// Fused A·Bᵀ: (M, K) × (N, K)ᵀ → (M, N). B stays row-major (no transpose
+// materialized in forward OR in dL/dA) — use for weight-tied LM heads (x · Wᵀ).
+[[nodiscard]] Variable matmul_bt(const Variable& a, const Variable& b);
+
 // ── Reductions ────────────────────────────────────────────────────────────────
 
 // Sum all elements; result has shape {1} and numel()==1.
