@@ -8,8 +8,8 @@
 //      mask with probability t, weight the masked CE by n_masked/(t·T). Ch28's
 //      curriculum experiments were variants of choosing the distribution of t; the
 //      formal objective integrates over ALL noise levels every epoch.
-//   2. REAL data: BPE-tokenized Shakespeare via the Ch24 TextCorpus pipeline, with a
-//      held-out split for honest evaluation.
+//   2. REAL data: BPE-tokenized Shakespeare as a flat token stream with random-offset
+//      sliding windows (train and eval share one window distribution) + held-out split.
 //   3. CHECKPOINTS: save/resume via the Ch24 binary checkpoint format. The model dir
 //      (config.json + tokenizer/ + step_*.ckpt) is what Ch30's iterative sampler loads.
 //
@@ -31,7 +31,7 @@
 
 #include "sub0llm/compat/print.hpp"
 #include "sub0llm/core/runtime.hpp"
-#include "sub0llm/data/text_corpus.hpp"
+
 #include "sub0llm/nn/checkpoint.hpp"
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
@@ -139,7 +139,7 @@ static int run(int argc, char** argv) {
     std::println("is the special case of reshaping the distribution of t (here: U(0.02, {:.2f}]).",
                  cfg.t_max);
 
-    // ── 2. data: BPE + TextCorpus with a held-out split ─────────────────────────
+    // ── 2. data: BPE + flat token streams with a held-out split ─────────────────
     section("2. Data — BPE-tokenized corpus, 90/10 train/eval split");
     auto paragraphs = read_paragraphs(cfg.corpus, cfg.paragraphs);
     if (paragraphs.size() < 20)
@@ -156,17 +156,29 @@ static int run(int argc, char** argv) {
     std::println("done in {:.1f}s",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - bpe_start).count());
 
-    TextCorpus train_corpus(paragraphs, tok, cfg.seq_len, /*seed=*/42);
-    std::println("train corpus: {} tokens, {} windows of {}",
-                 train_corpus.total_tokens(), train_corpus.n_samples(), cfg.seq_len);
-
-    // Flat eval token stream for the recall sweep + held-out NELBO.
-    std::vector<std::int32_t> eval_ids;
-    for (const auto& p : eval_texts) {
-        auto ids = tok.encode(p);
-        eval_ids.insert(eval_ids.end(), ids.begin(), ids.end());
-    }
-    std::println("eval stream: {} tokens", eval_ids.size());
+    // Both splits are FLAT token streams sampled with sliding windows, so train and
+    // eval see the same window distribution. Training draws windows at RANDOM offsets
+    // (not disjoint blocks): every token gets trained at every window position, which
+    // matters for the edge-recall deficit — a token at a window edge in one draw is
+    // interior in the next. (TextCorpus's stride-(T+1) AR layout would pin each token
+    // to one fixed position forever, and its +1 shift target is unused by diffusion.)
+    auto flatten = [&](const std::vector<std::string>& texts) {
+        std::vector<std::int32_t> ids;
+        for (const auto& p : texts) {
+            auto v = tok.encode(p);
+            ids.insert(ids.end(), v.begin(), v.end());
+        }
+        return ids;
+    };
+    const std::vector<std::int32_t> train_ids = flatten(paragraphs);
+    const std::vector<std::int32_t> eval_ids  = flatten(eval_texts);
+    const auto win_count = [&](const std::vector<std::int32_t>& s) {
+        return s.size() - static_cast<std::size_t>(cfg.seq_len) + 1;
+    };
+    std::println("train stream: {} tokens ({} sliding window positions of {})",
+                 train_ids.size(), win_count(train_ids), cfg.seq_len);
+    std::println("eval stream:  {} tokens ({} sliding window positions of {})",
+                 eval_ids.size(), win_count(eval_ids), cfg.seq_len);
 
     // ── 3. model + checkpoint resume ────────────────────────────────────────────
     section("3. Model — bidirectional denoiser over the BPE vocabulary");
@@ -222,9 +234,10 @@ static int run(int argc, char** argv) {
         std::mt19937 rng(1234 + static_cast<std::uint32_t>(start_step));
         dt::DiffusionLossContext ctx(cfg.seq_len);
 
-        // NOTE: TextCorpus::next_sample REASSIGNS these tensors (fresh storage each
-        // call) — the data span must be re-taken after every call, never cached.
-        Tensor ids({cfg.seq_len}, DType::Int32), tgt({cfg.seq_len}, DType::Int32);
+        // Random window offset per step — uniform over all sliding positions, the
+        // same distribution the eval sweep measures.
+        const std::span<const std::int32_t> train_span(train_ids);
+        std::uniform_int_distribution<std::size_t> off_dist(0, win_count(train_ids) - 1);
 
         auto t0 = std::chrono::steady_clock::now();
         auto last_report = t0;
@@ -235,14 +248,9 @@ static int run(int argc, char** argv) {
         constexpr float min_improvement = 0.01f;
 
         for (std::uint64_t step = start_step; step < cfg.steps; ++step) {
-            if (!train_corpus.next_sample(ids, tgt)) {
-                train_corpus.reset(static_cast<std::uint32_t>(step));
-                (void)train_corpus.next_sample(ids, tgt);
-            }
-            const auto ids_s = ids.data_as<std::int32_t>();
-            auto res = dt::diffusion_loss(
-                model, std::span<const std::int32_t>(ids_s.data(), ids_s.size()),
-                rng, ctx, 0.02f, cfg.t_max);
+            const auto window = train_span.subspan(off_dist(rng),
+                                                   static_cast<std::size_t>(cfg.seq_len));
+            auto res = dt::diffusion_loss(model, window, rng, ctx, 0.02f, cfg.t_max);
 
             opt.zero_grad();
             res.loss.backward();
@@ -306,8 +314,8 @@ static int run(int argc, char** argv) {
     section("5. Held-out evaluation");
     std::println("held-out NELBO (256 windows): {:.4f}\n", eval_nelbo(256));
 
-    std::println("Recall sweep over the held-out stream ({} windows of {}):",
-                 eval_ids.size() - static_cast<std::size_t>(cfg.seq_len), cfg.seq_len);
+    std::println("Recall sweep over the held-out stream ({} sliding window positions of {}):",
+                 win_count(eval_ids), cfg.seq_len);
     std::println("  {:>6}  {:>8}  {:>10}  {:>7}", "noise", "masked", "recovered", "recall");
     std::mt19937 eval_rng(4242);
     de::PositionStats pos(static_cast<std::size_t>(cfg.seq_len));

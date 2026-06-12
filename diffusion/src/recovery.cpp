@@ -51,7 +51,8 @@ RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
                                       PositionStats* pos) {
     RecoveryResult total;
     nn::Corruption corr;
-    const std::size_t n_windows = corpus_ids.size() - static_cast<std::size_t>(T);
+    // Every sliding offset: a stream of N tokens has N-T+1 windows of length T.
+    const std::size_t n_windows = corpus_ids.size() - static_cast<std::size_t>(T) + 1;
     for (std::size_t off = 0; off < n_windows; ++off) {
         auto window = corpus_ids.subspan(off, static_cast<std::size_t>(T));
         nn::corrupt_into(window, noise, spec::NoiseSchedule::Absorbing,
