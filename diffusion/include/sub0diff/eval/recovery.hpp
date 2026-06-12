@@ -43,11 +43,16 @@ struct PositionStats {
                                                std::span<const std::uint8_t> masked,
                                                PositionStats* pos = nullptr);
 
-// Corrupt EVERY window of `corpus_ids` at `noise` and accumulate recall.
+// Corrupt windows of `corpus_ids` at `noise` and accumulate recall.
+// max_windows caps the cost: when the stream has more sliding positions than the
+// budget, windows are sampled on a uniform stride across the whole stream (full
+// coverage of the corpus span, bounded forward count). 0 = exhaustive (every
+// position — on large corpora this can cost ORDERS more time than training did).
 [[nodiscard]] RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
                                                     std::span<const std::int32_t> corpus_ids,
                                                     std::int64_t T, float noise,
                                                     std::mt19937& rng,
-                                                    PositionStats* pos = nullptr);
+                                                    PositionStats* pos = nullptr,
+                                                    std::size_t max_windows = 0);
 
 } // namespace sub0diff::eval

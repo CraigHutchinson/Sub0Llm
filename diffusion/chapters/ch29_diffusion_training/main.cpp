@@ -63,13 +63,15 @@ struct Config {
     std::int64_t paragraphs = 0;      // 0 or -1 = read all paragraphs from corpus
     std::size_t vocab_size = 512;
     std::int64_t seq_len   = 64;
-    std::uint64_t steps    = 1000000;   // safety BOUND — training self-terminates (see below)
+    std::uint64_t steps    = 0;        // 0 = corpus-scaled safety bound (see §2c)
     std::uint64_t eval_every = 0;      // 0 = compute from corpus; override with --eval-every
     double eval_factor = 0.5;           // fraction of train positions per eval cadence (0.5 = 50%)
     std::uint64_t patience   = 5;      // stop after this many evals without improvement
     float t_max            = 1.0f;    // <1.0 trains under a Ch28-style ceiling
     bool eval_only         = false;
     bool profile           = false;   // report forward/backward/optimizer time split
+    // SIZE_MAX = corpus-scaled (§2c); explicit N = fixed budget; 0 = exhaustive sweep.
+    std::size_t recall_windows = std::numeric_limits<std::size_t>::max();
 
     // Architecture — modest but real (≈1.6M params at V=512).
     std::int64_t embed_dim = 128, n_layers = 4, d_ff = 384;
@@ -96,6 +98,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--t-max")      c.t_max      = std::stof(next());
         else if (a == "--eval-only")  c.eval_only  = true;
         else if (a == "--profile")    c.profile    = true;
+        else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
         else throw std::runtime_error(std::format("unknown argument: {}", a));
     }
     return c;
@@ -224,6 +227,32 @@ static int run(int argc, char** argv) {
     std::println("eval cadence: every {} steps ({} non-overlapping windows, {} sliding)",
                  cfg.eval_every, total_train_windows, win_count(train_ids));
 
+    // ── 2c. corpus-scaled defaults — every unset knob derives from corpus size ──
+    // steps bound: enough steps for `coverage_epochs` passes over the train tokens
+    // in MASKED-token terms (a step teaches ~E[t]·T masked tokens), so the safety
+    // bound grows with the corpus instead of truncating large runs / padding small.
+    const double mean_t = 0.5 * (0.02 + cfg.t_max);
+    const double masked_per_step = mean_t * static_cast<double>(cfg.seq_len);
+    if (cfg.steps == 0) {
+        constexpr double coverage_epochs = 50.0;   // upper bound, not a target —
+                                                   // early stopping decides the real end
+        cfg.steps = static_cast<std::uint64_t>(
+            coverage_epochs * static_cast<double>(train_ids.size()) / masked_per_step);
+    }
+    // Convergence-eval sample: enough windows that the NELBO signal noise stays
+    // below the min_improvement threshold, scaled to (and capped by) the eval stream.
+    const std::size_t eval_nelbo_windows =
+        std::clamp(win_count(eval_ids) / 500, std::size_t{64}, std::size_t{512});
+    // Recall-sweep budget: ~5% of eval positions, clamped to a sane cost band.
+    if (cfg.recall_windows == std::numeric_limits<std::size_t>::max())
+        cfg.recall_windows = std::clamp(win_count(eval_ids) / 20,
+                                        std::size_t{2000}, std::size_t{16000});
+    std::println("corpus-scaled: steps bound {} (~50 masked-token epochs), "
+                 "nelbo eval {} windows, recall budget {}/level",
+                 cfg.steps, eval_nelbo_windows,
+                 cfg.recall_windows == 0 ? std::string("exhaustive")
+                                         : std::format("{}", cfg.recall_windows));
+
     // ── 3. model + checkpoint resume ────────────────────────────────────────────
     section("3. Model — bidirectional denoiser over the BPE vocabulary");
     const auto V = static_cast<std::int64_t>(tok.vocab_size());
@@ -343,7 +372,7 @@ static int run(int argc, char** argv) {
 
             // ── Convergence check: held-out NELBO every eval_every steps ───────────
             if ((step + 1) % cfg.eval_every == 0) {
-                const float nelbo = static_cast<float>(eval_nelbo(64));
+                const float nelbo = static_cast<float>(eval_nelbo(eval_nelbo_windows));
                 if (nelbo < best_nelbo - min_improvement) {
                     best_nelbo = nelbo;
                     evals_since_best = 0;
@@ -381,21 +410,35 @@ static int run(int argc, char** argv) {
 
     // ── 5. held-out evaluation: NELBO + recall sweep + edge profile ─────────────
     section("5. Held-out evaluation");
-    std::println("held-out NELBO (256 windows): {:.4f}\n", eval_nelbo(256));
+    std::println("held-out NELBO ({} windows): {:.4f}\n",
+                 4 * eval_nelbo_windows, eval_nelbo(4 * eval_nelbo_windows));
 
-    std::println("Recall sweep over the held-out stream ({} sliding positions for {}-token windows):",
-                 win_count(eval_ids), cfg.seq_len);
+    // Budgeted sweep: a few thousand uniformly-strided windows per noise level
+    // estimate recall to ~±1%; an exhaustive sweep of a large eval stream can cost
+    // ORDERS more wall time than training did (467K positions × 4 levels ≈ 75 min
+    // on complete_shakespeare). --recall-windows 0 restores the exhaustive sweep.
+    const std::size_t sweep_budget =
+        cfg.recall_windows == 0 ? win_count(eval_ids)
+                                : std::min<std::size_t>(cfg.recall_windows, win_count(eval_ids));
+    std::println("Recall sweep over the held-out stream: {} of {} sliding positions per noise "
+                 "level ({}-token windows, uniform stride):",
+                 sweep_budget, win_count(eval_ids), cfg.seq_len);
     std::println("  {:>6}  {:>8}  {:>10}  {:>7}", "noise", "masked", "recovered", "recall");
     std::mt19937 eval_rng(4242);
     de::PositionStats pos(static_cast<std::size_t>(cfg.seq_len));
     de::RecoveryResult sweep;
+    const auto sweep_t0 = std::chrono::steady_clock::now();
     for (float noise : {0.10f, 0.25f, 0.50f, 0.75f}) {
-        auto r = de::evaluate_corpus_recall(model, eval_ids, cfg.seq_len, noise, eval_rng, &pos);
+        auto r = de::evaluate_corpus_recall(model, eval_ids, cfg.seq_len, noise, eval_rng,
+                                            &pos, cfg.recall_windows);
         sweep.hits += r.hits; sweep.masked += r.masked;
         std::println("  {:>5.0f}%  {:>8}  {:>10}  {:>6.1f}%",
                      noise * 100.0f, r.masked, r.hits, r.recall() * 100.0f);
     }
-    std::println("  overall: {}/{} ({:.1f}%)", sweep.hits, sweep.masked, sweep.recall() * 100.0f);
+    const double sweep_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - sweep_t0).count();
+    std::println("  overall: {}/{} ({:.1f}%)  [sweep took {:.1f}s]",
+                 sweep.hits, sweep.masked, sweep.recall() * 100.0f, sweep_s);
 
     float interior = 0.0f; int n_int = 0;
     for (std::int64_t t = 1; t + 1 < cfg.seq_len; ++t) {

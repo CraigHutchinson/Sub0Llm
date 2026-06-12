@@ -48,12 +48,18 @@ RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
                                       std::span<const std::int32_t> corpus_ids,
                                       std::int64_t T, float noise,
                                       std::mt19937& rng,
-                                      PositionStats* pos) {
+                                      PositionStats* pos,
+                                      std::size_t max_windows) {
     RecoveryResult total;
     nn::Corruption corr;
-    // Every sliding offset: a stream of N tokens has N-T+1 windows of length T.
-    const std::size_t n_windows = corpus_ids.size() - static_cast<std::size_t>(T) + 1;
-    for (std::size_t off = 0; off < n_windows; ++off) {
+    // A stream of N tokens has N-T+1 sliding positions; sample them on a uniform
+    // stride when a budget is set so coverage spans the whole stream.
+    const std::size_t n_positions = corpus_ids.size() - static_cast<std::size_t>(T) + 1;
+    const std::size_t n_eval = (max_windows == 0) ? n_positions
+                                                  : std::min(max_windows, n_positions);
+    const double stride = static_cast<double>(n_positions) / static_cast<double>(n_eval);
+    for (std::size_t i = 0; i < n_eval; ++i) {
+        const auto off = static_cast<std::size_t>(static_cast<double>(i) * stride);
         auto window = corpus_ids.subspan(off, static_cast<std::size_t>(T));
         nn::corrupt_into(window, noise, spec::NoiseSchedule::Absorbing,
                          model.mask_id(), model.real_vocab(), rng, corr);
