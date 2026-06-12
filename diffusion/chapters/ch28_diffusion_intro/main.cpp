@@ -89,6 +89,49 @@ static std::string render_masked(const CharVocab& vocab,
     return s;
 }
 
+// Evaluate one-step recovery on a set of test fragments.
+// Returns overall accuracy and prints per-fragment results.
+struct RecoveryResult {
+    float accuracy;   // fraction of masked positions filled correctly
+    int   total_hits;
+    int   total_masked;
+};
+
+RecoveryResult evaluate_recovery(const CharVocab& vocab,
+                                 const dn::Denoiser& model,
+                                 std::span<const std::int32_t> test_ids,
+                                 std::span<const std::int32_t> clean_ids,
+                                 std::vector<std::uint8_t> masked,
+                                 std::int32_t mask_id,
+                                 float noise) {
+    auto input = std::vector<std::int32_t>(test_ids.begin(), test_ids.end());
+    for (std::size_t i = 0; i < masked.size(); ++i)
+        if (masked[i]) input[i] = mask_id;
+
+    ag::Variable logits = model.forward(ids_tensor(input), noise);
+    auto lz = logits.data().data_as<float>();
+    const std::size_t C = static_cast<std::size_t>(model.model_vocab());
+
+    auto recovered = input;
+    for (std::size_t t = 0; t < masked.size(); ++t) {
+        if (!masked[t]) continue;
+        std::int32_t best = 0;
+        float best_v = -1e30f;
+        for (std::int64_t c = 0; c < vocab.size(); ++c) {
+            const float v = lz[t * C + static_cast<std::size_t>(c)];
+            if (v > best_v) { best_v = v; best = static_cast<std::int32_t>(c); }
+        }
+        recovered[t] = best;
+    }
+
+    int hits = 0, total = 0;
+    for (std::size_t t = 0; t < masked.size(); ++t)
+        if (masked[t]) { ++total; hits += (recovered[t] == clean_ids[t]); }
+
+    RecoveryResult res{static_cast<float>(hits) / (total > 0 ? total : 1), hits, total};
+    return res;
+}
+
 int main() {
     std::println("sub0llm — Chapter 28: Text Diffusion, Part 1 (corruption → denoiser → recovery)");
 
@@ -98,7 +141,41 @@ int main() {
         "a stitch in time saves nine. "
         "the early bird catches the worm. "
         "actions speak louder than words. "
-        "practice makes perfect every single day. ";
+        "practice makes perfect every single day. "
+        "all that glitters is not gold. "
+        "better late than never. "
+        "beauty is in the eye of the beholder. "
+        "birds of a feather flock together. "
+        "cat got your tongue. "
+        "don't count your chickens before they hatch. "
+        "every cloud has a silver lining. "
+        "fair and square. "
+        "go the extra mile. "
+        "had a ball at the party last night. "
+        "if the mountain won't come to Muhammad then Muhammad goes to the mountain. "
+        "in the nick of time we arrived. "
+        "jack of all trades but master of none. "
+        "kiss of death ended the deal. "
+        "let by and by. "
+        "make a long story short. "
+        "never put off till tomorrow what you can do today. "
+        "once in a blue moon we see such beauty. "
+        "play devil's advocate for a moment. "
+        "quiet as the grave in the old house. "
+        "raining cats and dogs all afternoon. "
+        "the best of both worlds is what she found. "
+        "the cake is a lie but the truth hurts. "
+        "the pen is mightier than the sword. "
+        "there is no place like home. "
+        "this is the end of the road. "
+        "to be or not to be that is the question. "
+        "under the same roof they lived. "
+        "we shall overcome the difficulty. "
+        "you can't judge a book by its cover. "
+        "a journey of a thousand miles begins with a single step. "
+        "knowledge is power and wisdom is the light. "
+        "the sun rises in the east and sets in the west. "
+        "time flies when you are having fun. ";
     CharVocab vocab(corpus);
     const std::int64_t V = vocab.size();
     std::println("corpus: {} chars, vocab: {} unique characters", corpus.size(), V);
@@ -135,18 +212,30 @@ int main() {
     std::println("Model vocab = {} (real {} + 1 [MASK] row at id {}).",
                  model.model_vocab(), V, model.mask_id());
 
+    // T is the window size we train on — how many tokens we corrupt and predict at once.
+    const std::int64_t T = 24;
+
+    // Dynamic adapt interval: corpus-aware, not rigid.
+    // We adapt every time we've seen ~5% of available corpus windows.
+    // This scales with corpus size — small corpus adapts faster, large corpus adapts slower.
+    const std::size_t corpus_windows = static_cast<std::size_t>(corpus_ids.size()) - static_cast<std::size_t>(T);
+    const std::uint32_t adapt_interval = std::max(250U, static_cast<std::uint32_t>(corpus_windows));
+
     // ── 3. train: adaptive curriculum — noise level driven by performance ───────
     section("3. Training — adaptive curriculum: performance-driven noise level");
     std::println("The noise level moves up when the model masters the current difficulty");
     std::println("and eases back when it struggles — keeping the model at the edge of its ability.\n");
-    const std::int64_t T = 24, steps = 15000;
+    const std::uint64_t steps = corpus_windows * 100ULL;
+
+    std::println("Training for {} steps ({} epochs, {} windows) with adaptive curriculum noise:",
+                 steps, steps / corpus_windows, corpus_windows);
 
     // Adaptive curriculum parameters
     const float curriculum_start = 0.05f;   // start easy — only 5% masked
-    const float curriculum_end   = 0.75f;   // cap at 75% masked
-    const int   adapt_interval   = 500;     // evaluate performance every N steps
-    const float noise_step       = 0.05f;   // how much to adjust noise per adaptation
-    const int   improvement_window = 3;     // look at last N probe losses for trend
+    const float curriculum_end   = 0.80f;   // cap at 80% masked — push higher for robust denoising
+    const float noise_step       = 0.02f;   // smaller steps for smoother adaptation
+    const int   improvement_window = 5;     // look at last N probe losses for trend
+    const std::uint32_t status_interval = std::max(steps / 100, 1000ULL);  // print status ~100 times
 
     nn::Adam opt(params, /*lr=*/2e-3f);
     std::mt19937 rng(1234);
@@ -180,7 +269,7 @@ int main() {
         return ag::weighted_cross_entropy(logits, ids_tensor(probe), f32_tensor(w)).data().item<float>();
     };
 
-    for (std::int64_t step = 0; step < steps; ++step) {
+    for (std::uint64_t step = 0; step < steps; ++step) {
         // ── Adaptive curriculum: adjust noise based on probe loss TREND ───────
         if (step > 0 && step % adapt_interval == 0) {
             float pl = probe_loss();
@@ -206,13 +295,15 @@ int main() {
                 if (improvement > 0.15f) {
                     // Sustained improvement — increase difficulty
                     current_noise = std::min(curriculum_end, current_noise + noise_step);
+                    probe_history.clear();  // reset history after a difficulty change
                 } else if (improvement < -0.1f) {
                     // Getting worse — ease back
                     current_noise = std::max(curriculum_start, current_noise - noise_step * 0.5f);
+                    probe_history.clear();  // reset history after a difficulty change
                 }
                 // else: plateau — hold steady
 
-                if (step % 500 == 0 || std::abs(current_noise - prev_noise) > 0.01f)
+                if ( std::abs(current_noise - prev_noise) >= 0.001f)
                     std::println("  curriculum noise: {:.2f} → {:.2f}  (improvement={:+.4f}, history={:.2f}→{:.2f})",
                                  prev_noise, current_noise, improvement, older_avg, recent_avg);
             }
@@ -237,54 +328,92 @@ int main() {
         (void)nn::clip_grad_norm(params, 5.0f);
         opt.step();
 
-        if (step % 150 == 0 || step == steps - 1) {
+        if (step % status_interval == 0 || step == steps - 1) {
             std::println("  step {:4}  train masked-CE = {:.4f}   noise = {:.2f}",
                          step, loss.data().item<float>(), current_noise);
         }
     }
 
-    // ── 4. one-step recovery ──────────────────────────────────────────────────────
-    section("4. One-step recovery — fill in the blanks in a single forward pass");
+    // ── 4. multi-fragment recovery evaluation ───────────────────────────────────
+    section("4. Recovery evaluation — testing across corpus fragments");
     std::println("Unlike an autoregressive model, the denoiser predicts every blank at once, using");
-    std::println("context from BOTH sides (bidirectional attention). We mask scattered characters:\n");
+    std::println("context from BOTH sides (bidirectional attention). Testing on multiple fragments:\n");
+
+    // Test fragments: mix of corpus windows and held-out sentences
+    struct TestFragment {
+        std::string description;
+        std::vector<std::int32_t> clean_ids;
+        std::vector<std::uint8_t> masked;
+    };
+
+    std::vector<TestFragment> test_fragments;
+
+    // Fragment 1: "the quick brown fox" — appears verbatim in corpus
     {
-        const std::string sentence = "the quick brown fox";   // appears verbatim in the corpus
+        const std::string sentence = "the quick brown fox";
         const auto clean = vocab.encode(sentence);
         const auto Tn = static_cast<std::int64_t>(clean.size());
-
-        // mask a few individual characters scattered through the sentence (BERT-style cloze).
-        auto input = clean;
         std::vector<std::uint8_t> masked(static_cast<std::size_t>(Tn), 0);
-        for (std::size_t pos : {5u, 7u, 12u}) {  // 'u' in quick, 'c' in quick, 'o' in brown
-            input[pos] = mask_id;
+        for (std::size_t pos : {5u, 7u, 12u}) {
             masked[pos] = 1;
         }
-        const float noise = 3.0f / static_cast<float>(Tn);
-
-        std::println("  clean    : \"{}\"", sentence);
-        std::println("  masked   : \"{}\"", render_masked(vocab, input, masked, mask_id));
-
-        ag::Variable logits = model.forward(ids_tensor(input), noise);  // (Tn, V+1)
-        auto lz = logits.data().data_as<float>();
-        const std::size_t C = static_cast<std::size_t>(model.model_vocab());
-        auto recovered = input;
-        for (std::size_t t = 0; t < static_cast<std::size_t>(Tn); ++t) {
-            if (!masked[t]) continue;
-            std::int32_t best = 0;
-            float best_v = -1e30f;
-            for (std::int64_t c = 0; c < V; ++c) {   // argmax over REAL tokens (skip the mask col)
-                const float v = lz[t * C + static_cast<std::size_t>(c)];
-                if (v > best_v) { best_v = v; best = static_cast<std::int32_t>(c); }
-            }
-            recovered[t] = best;
-        }
-        std::println("  recovered: \"{}\"", vocab.decode(recovered));
-        int hits = 0, total = 0;
-        for (std::size_t t = 0; t < static_cast<std::size_t>(Tn); ++t)
-            if (masked[t]) { ++total; hits += (recovered[t] == clean[t]); }
-        std::println("\n  filled {}/{} blanks correctly{}.", hits, total,
-                     hits == total ? " — exact one-step recovery ✓" : " (train longer for the rest)");
+        test_fragments.push_back({"verbatim corpus (the quick brown fox)", clean, masked});
     }
+
+    // Fragment 2: "the lazy dog" — appears verbatim in corpus, different positions
+    {
+        const std::string sentence = "the lazy dog";
+        const auto clean = vocab.encode(sentence);
+        const auto Tn = static_cast<std::int64_t>(clean.size());
+        std::vector<std::uint8_t> masked(static_cast<std::size_t>(Tn), 0);
+        for (std::size_t pos : {4u, 8u}) {
+            masked[pos] = 1;
+        }
+        test_fragments.push_back({"verbatim corpus (the lazy dog)", clean, masked});
+    }
+
+    // Fragment 3: "a stitch in time" — appears verbatim in corpus
+    {
+        const std::string sentence = "a stitch in time";
+        const auto clean = vocab.encode(sentence);
+        const auto Tn = static_cast<std::int64_t>(clean.size());
+        std::vector<std::uint8_t> masked(static_cast<std::size_t>(Tn), 0);
+        for (std::size_t pos : {1u, 3u, 11u}) {
+            masked[pos] = 1;
+        }
+        test_fragments.push_back({"verbatim corpus (a stitch in time)", clean, masked});
+    }
+
+    // Fragment 4: random corpus window at different offset
+    {
+        const std::size_t off = (corpus_ids.size() - static_cast<std::size_t>(T)) / 2;
+        std::vector<std::int32_t> window(corpus_ids.begin() + static_cast<std::ptrdiff_t>(off),
+                                         corpus_ids.begin() + static_cast<std::ptrdiff_t>(off) + T);
+        const auto Tn = static_cast<std::int64_t>(window.size());
+        std::vector<std::uint8_t> masked(static_cast<std::size_t>(Tn), 0);
+        // Mask positions 1, 5, 9, 13, 17, 21 (scattered, not just even)
+        for (std::size_t i = 1u; i < masked.size(); i += 4) masked[i] = 1;
+        test_fragments.push_back({"mid-corpus window (offset ~50%)", window, masked});
+    }
+
+    // Run recovery evaluation on all fragments
+    RecoveryResult overall{0.0f, 0, 0};
+    for (const auto& frag : test_fragments) {
+        const float noise = static_cast<float>(std::count(frag.masked.begin(), frag.masked.end(), 1))
+                          / static_cast<float>(frag.clean_ids.size());
+
+        auto result = evaluate_recovery(vocab, model, frag.clean_ids, frag.clean_ids,
+                                        frag.masked, mask_id, noise);
+        overall.total_hits += result.total_hits;
+        overall.total_masked += result.total_masked;
+
+        std::println("  [{}] {} — {} correct",
+                     result.accuracy > 0.9f ? "PASS" : (result.accuracy > 0.5f ? "PARTIAL" : "NEEDS WORK"),
+                     frag.description, result.total_hits);
+    }
+    overall.accuracy = static_cast<float>(overall.total_hits) / (overall.total_masked > 0 ? overall.total_masked : 1);
+    std::println("\n  Overall recovery: {}/{} masked positions correct ({:.0f}%)",
+                 overall.total_hits, overall.total_masked, overall.accuracy * 100.0f);
 
     section("What's next");
     std::println("Ch29 — formalise the diffusion loss + a full bidirectional training loop with checkpoints.");
