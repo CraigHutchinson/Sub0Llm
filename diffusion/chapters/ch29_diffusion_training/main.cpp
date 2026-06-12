@@ -175,9 +175,9 @@ static int run(int argc, char** argv) {
     const auto win_count = [&](const std::vector<std::int32_t>& s) {
         return s.size() - static_cast<std::size_t>(cfg.seq_len) + 1;
     };
-    std::println("train stream: {} tokens ({} sliding window positions of {})",
+    std::println("train stream: {} tokens ({} sliding positions for {}-token windows)",
                  train_ids.size(), win_count(train_ids), cfg.seq_len);
-    std::println("eval stream:  {} tokens ({} sliding window positions of {})",
+    std::println("eval stream:  {} tokens ({} sliding positions for {}-token windows)",
                  eval_ids.size(), win_count(eval_ids), cfg.seq_len);
 
     // ── 3. model + checkpoint resume ────────────────────────────────────────────
@@ -314,7 +314,7 @@ static int run(int argc, char** argv) {
     section("5. Held-out evaluation");
     std::println("held-out NELBO (256 windows): {:.4f}\n", eval_nelbo(256));
 
-    std::println("Recall sweep over the held-out stream ({} sliding window positions of {}):",
+    std::println("Recall sweep over the held-out stream ({} sliding positions for {}-token windows):",
                  win_count(eval_ids), cfg.seq_len);
     std::println("  {:>6}  {:>8}  {:>10}  {:>7}", "noise", "masked", "recovered", "recall");
     std::mt19937 eval_rng(4242);
