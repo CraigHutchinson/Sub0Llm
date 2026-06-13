@@ -1,5 +1,6 @@
 #include "sub0llm/nn/gemma.hpp"
 
+#include "sub0llm/core/cpu_topology.hpp"   // shared P/E detection + thread pinning
 #include "../backends/cpu/kernels.hpp"
 #include "../backends/cuda/backend.hpp"   // GemmaGpuLayers + GpuLayerDesc (Ch27 hybrid)
 
@@ -46,38 +47,17 @@ namespace { std::vector<int> g_cpu_set; }
 void set_gemma_cpus(const std::vector<int>& cpus) { g_cpu_set = cpus; }
 
 GemmaCoreTopology gemma_detect_cores() {
+    // Delegate to the project-wide detector (sub0llm/core/cpu_topology.hpp) so every
+    // threaded component shares ONE P/E detection. GemmaCoreTopology remains a thin
+    // adapter for this engine's call sites; its hybrid() needs both lists non-empty, so
+    // a homogeneous CPU leaves them empty here (caller then uses all cores) — unchanged.
+    const CpuTopology shared = detect_cpu_topology();
     GemmaCoreTopology topo;
-    topo.n_logical = static_cast<int>(std::thread::hardware_concurrency());
-#ifdef _WIN32
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) return topo;
-    std::vector<char> buf(len);
-    auto* first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first, &len)) return topo;
-
-    // Group logical CPUs by EfficiencyClass (higher = higher performance). One record per
-    // physical core; GroupMask names its logical CPUs (SMT siblings share the core's class).
-    std::map<int, std::vector<int>> by_class;
-    for (char* p = buf.data(); p < buf.data() + len; ) {
-        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
-        if (info->Relationship == RelationProcessorCore) {
-            const int ec = info->Processor.EfficiencyClass;
-            const auto& gm = info->Processor.GroupMask[0];
-            const int gbase = gm.Group * 64;
-            for (int b = 0; b < 64; ++b)
-                if (gm.Mask & (static_cast<KAFFINITY>(1) << b)) by_class[ec].push_back(gbase + b);
-        }
-        p += info->Size;
+    topo.n_logical = shared.n_logical;
+    if (shared.hybrid()) {
+        topo.perf       = shared.perf;
+        topo.efficiency = shared.efficiency;
     }
-    if (by_class.size() >= 2) {                       // hybrid: top class = perf, rest = eff
-        const int top = by_class.rbegin()->first;
-        for (auto& [cls, cpus] : by_class)
-            for (int c : cpus) (cls == top ? topo.perf : topo.efficiency).push_back(c);
-        std::sort(topo.perf.begin(), topo.perf.end());
-        std::sort(topo.efficiency.begin(), topo.efficiency.end());
-    }
-#endif
     return topo;
 }
 

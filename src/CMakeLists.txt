@@ -1,6 +1,7 @@
 set(SUB0LLM_SOURCES
     core/tensor.cpp
     core/ops.cpp
+    core/cpu_topology.cpp
     backends/cpu/kernels.cpp
     backends/cpu/matmul.cpp
     backends/cpu/quant.cpp

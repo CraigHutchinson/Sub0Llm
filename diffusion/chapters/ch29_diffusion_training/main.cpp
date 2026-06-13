@@ -28,6 +28,7 @@
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
+#include "sub0diff/train/parallel.hpp"
 
 #include "sub0llm/compat/print.hpp"
 #include "sub0llm/core/runtime.hpp"
@@ -43,6 +44,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -70,6 +72,7 @@ struct Config {
     float t_max            = 1.0f;    // <1.0 trains under a Ch28-style ceiling
     bool eval_only         = false;
     bool profile           = false;   // report forward/backward/optimizer time split
+    std::size_t threads    = 0;       // data-parallel workers; 0 = auto (cores/2), 1 = serial
     // SIZE_MAX = corpus-scaled (§2c); explicit N = fixed budget; 0 = exhaustive sweep.
     std::size_t recall_windows = std::numeric_limits<std::size_t>::max();
 
@@ -98,6 +101,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--t-max")      c.t_max      = std::stof(next());
         else if (a == "--eval-only")  c.eval_only  = true;
         else if (a == "--profile")    c.profile    = true;
+        else if (a == "--threads")    c.threads    = std::stoull(next());
         else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
         else throw std::runtime_error(std::format("unknown argument: {}", a));
     }
@@ -221,7 +225,8 @@ static int run(int argc, char** argv) {
     // Sliding windows overlap heavily (T-1 per window), so use non-overlapping
     // windows for meaningful corpus coverage: total_train_positions / seq_len.
     const std::uint64_t total_train_windows = train_ids.size() / static_cast<std::size_t>(cfg.seq_len);
-    if (cfg.eval_every == 0)
+    const bool eval_every_auto = (cfg.eval_every == 0);
+    if (eval_every_auto)
         cfg.eval_every = std::max(std::uint64_t(500),
                                   static_cast<std::uint64_t>(total_train_windows * cfg.eval_factor));
     std::println("eval cadence: every {} steps ({} non-overlapping windows, {} sliding)",
@@ -231,8 +236,20 @@ static int run(int argc, char** argv) {
     // steps bound: enough steps for `coverage_epochs` passes over the train tokens
     // in MASKED-token terms (a step teaches ~E[t]·T masked tokens), so the safety
     // bound grows with the corpus instead of truncating large runs / padding small.
+    if (cfg.threads == 0) {
+        // Default to the P-core count: compute-bound workers on E-cores or SMT
+        // siblings contend more than they contribute (shared threading model —
+        // sub0llm/core/cpu_topology.hpp; constexpr HostSpec folds this in Ch32).
+        const auto topo = sub0llm::detect_cpu_topology();
+        cfg.threads = std::max<std::size_t>(1, static_cast<std::size_t>(topo.n_perf()) / 2);
+    }
+    if (eval_every_auto && cfg.threads > 1)
+        cfg.eval_every = std::max<std::uint64_t>(100, cfg.eval_every / cfg.threads);
     const double mean_t = 0.5 * (0.02 + cfg.t_max);
-    const double masked_per_step = mean_t * static_cast<double>(cfg.seq_len);
+    // A step trains `threads` windows (data-parallel grad accumulation), so the
+    // step-denominated bounds and cadences shrink proportionally.
+    const double masked_per_step =
+        mean_t * static_cast<double>(cfg.seq_len) * static_cast<double>(cfg.threads);
     if (cfg.steps == 0) {
         constexpr double coverage_epochs = 50.0;   // upper bound, not a target —
                                                    // early stopping decides the real end
@@ -248,10 +265,11 @@ static int run(int argc, char** argv) {
         cfg.recall_windows = std::clamp(win_count(eval_ids) / 20,
                                         std::size_t{2000}, std::size_t{16000});
     std::println("corpus-scaled: steps bound {} (~50 masked-token epochs), "
-                 "nelbo eval {} windows, recall budget {}/level",
+                 "nelbo eval {} windows, recall budget {}/level, {} worker thread{}",
                  cfg.steps, eval_nelbo_windows,
                  cfg.recall_windows == 0 ? std::string("exhaustive")
-                                         : std::format("{}", cfg.recall_windows));
+                                         : std::format("{}", cfg.recall_windows),
+                 cfg.threads, cfg.threads == 1 ? "" : "s");
 
     // ── 3. model + checkpoint resume ────────────────────────────────────────────
     section("3. Model — bidirectional denoiser over the BPE vocabulary");
@@ -324,16 +342,41 @@ static int run(int argc, char** argv) {
         double p_fwd = 0.0, p_bwd = 0.0, p_opt = 0.0;
         const auto tick = [] { return std::chrono::steady_clock::now(); };
 
-        for (std::uint64_t step = start_step; step < cfg.steps; ++step) {
-            const auto window = train_span.subspan(off_dist(rng),
-                                                   static_cast<std::size_t>(cfg.seq_len));
-            auto pt0 = tick();
-            auto res = dt::diffusion_loss(model, window, rng, ctx, 0.02f, cfg.t_max);
+        // Data-parallel workers (threads > 1): each step trains `threads` windows,
+        // one per replica, and the master sees the MEAN gradient (see parallel.hpp).
+        std::unique_ptr<dt::ParallelTrainer> pool;
+        if (cfg.threads > 1)
+            pool = std::make_unique<dt::ParallelTrainer>(
+                cfg.threads,
+                dt::ParallelTrainer::Arch{V, cfg.embed_dim, cfg.n_layers, cfg.d_ff,
+                                          cfg.seq_len, cfg.n_heads, cfg.n_kv_heads},
+                param_ptrs, 0.02f, cfg.t_max, 1234 + start_step);
+        std::vector<std::size_t> offsets(cfg.threads);
 
-            auto pt1 = tick();
-            opt.zero_grad();
-            res.loss.backward();
-            auto pt2 = tick();
+        float last_loss = 0.0f, last_t = 0.0f;
+        for (std::uint64_t step = start_step; step < cfg.steps; ++step) {
+            auto pt0 = tick();
+            std::uint64_t step_masked = 0;
+            auto pt1 = pt0, pt2 = pt0;
+            if (pool) {
+                for (auto& o : offsets) o = off_dist(rng);
+                auto res = pool->step(train_span, offsets);
+                last_loss = res.mean_loss;
+                last_t    = res.last_t;
+                step_masked = res.masked_tokens;
+                pt2 = pt1 = tick();   // fwd+bwd fused inside the pool
+            } else {
+                const auto window = train_span.subspan(off_dist(rng),
+                                                       static_cast<std::size_t>(cfg.seq_len));
+                auto res = dt::diffusion_loss(model, window, rng, ctx, 0.02f, cfg.t_max);
+                pt1 = tick();
+                opt.zero_grad();
+                res.loss.backward();
+                pt2 = tick();
+                last_loss = res.loss.data().item<float>();
+                last_t    = res.t;
+                step_masked = res.n_masked;
+            }
             (void)nn::clip_grad_norm(param_ptrs, 5.0f);
             opt.step();
             if (cfg.profile) {
@@ -343,7 +386,7 @@ static int run(int argc, char** argv) {
                 p_opt += std::chrono::duration<double>(pt3 - pt2).count();
             }
             ++interval_steps;
-            interval_tokens += res.n_masked;
+            interval_tokens += step_masked;
             steps_taken = step + 1;
 
             auto now = std::chrono::steady_clock::now();
@@ -352,7 +395,7 @@ static int run(int argc, char** argv) {
                 const double el = std::chrono::duration<double>(now - t0).count();
                 std::println("{:>5.0f}s  step {:>6}  nelbo={:.4f} (t={:.2f})  "
                              "[{:.0f} steps/s, {:.0f} masked-tok/s]",
-                             el, step, res.loss.data().item<float>(), res.t,
+                             el, step, last_loss, last_t,
                              static_cast<double>(interval_steps) / since_report,
                              static_cast<double>(interval_tokens) / since_report);
                 if (cfg.profile) {

@@ -96,6 +96,11 @@ HostFacts detect_host() noexcept {
 
 #if defined(_WIN32)
     // Physical cores + P/E split via the processor-core relation (EfficiencyClass).
+    // The P/E classification rule here (max EfficiencyClass == perf) MUST match the
+    // runtime threading path in sub0llm/core/cpu_topology.hpp, so that a specialized
+    // binary's `-verify` agrees with the pin sets its pools actually use. This pass
+    // also gathers physical-core and cache-line data (a superset of the runtime
+    // topology), which is why it stays a separate enumeration.
     {
         DWORD len = 0;
         GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
