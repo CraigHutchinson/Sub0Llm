@@ -4,6 +4,7 @@
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
+#include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/nn/optimizer.hpp"
@@ -106,6 +107,46 @@ TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diff
     REQUIRE(pos.masked[23] == 1);
     REQUIRE(pos.masked[1] == 0);
     REQUIRE(r.hits == pos.hits[0] + pos.hits[5] + pos.hits[23]);
+}
+
+TEST_CASE("refine_canvas - completes, respects fixed positions, self-terminates", "[diffusion]") {
+    dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/21);
+    std::mt19937 rng(3);
+
+    // Canvas with a 3-token fixed prompt; the rest must be filled.
+    const std::vector<std::int32_t> prompt{1, 2, 3};
+    auto canvas = dn::make_canvas(model, 16, prompt);
+    REQUIRE(canvas[0] == 1);
+    REQUIRE(canvas[3] == model.mask_id());
+
+    dn::SamplerConfig cfg;
+    cfg.temperature = 0.0f;
+    auto stats = dn::refine_canvas(model, canvas, cfg, rng);
+
+    REQUIRE(canvas[0] == 1);                      // fixed prompt untouched
+    REQUIRE(canvas[1] == 2);
+    REQUIRE(canvas[2] == 3);
+    for (auto t : canvas) {
+        REQUIRE(t != model.mask_id());            // canvas complete
+        REQUIRE(t >= 0);
+        REQUIRE(t < 16);                          // only real tokens predicted
+    }
+    REQUIRE(stats.committed == 13);
+    REQUIRE(stats.iterations >= 1);
+    REQUIRE(stats.iterations <= 13);              // guaranteed progress each iter
+}
+
+TEST_CASE("refine_canvas - entropy_bound forces single-iteration commit", "[diffusion]") {
+    dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/23);
+    std::mt19937 rng(5);
+    auto canvas = dn::make_canvas(model, 12);
+    dn::SamplerConfig cfg;
+    cfg.temperature   = 0.0f;
+    cfg.entropy_bound = 1e9f;                     // everything counts as low-entropy
+    auto stats = dn::refine_canvas(model, canvas, cfg, rng);
+    REQUIRE(stats.iterations == 1);
+    REQUIRE(stats.entropy_stopped);
+    REQUIRE(stats.committed == 12);
 }
 
 TEST_CASE("evaluate_corpus_recall - sweeps every window", "[diffusion]") {

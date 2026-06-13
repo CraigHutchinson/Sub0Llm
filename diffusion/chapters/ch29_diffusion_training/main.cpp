@@ -181,7 +181,7 @@ static int run(int argc, char** argv) {
     auto paragraphs = read_paragraphs(cfg.corpus, cfg.paragraphs);
     if (paragraphs.size() < 20)
         throw std::runtime_error("corpus too small — need at least 20 paragraphs");
-    const std::size_t n_eval = paragraphs.size() / 5;
+    const std::size_t n_eval = paragraphs.size() * 0.05;   // 5% held out for eval (early stopping, final metrics)
     std::vector<std::string> eval_texts(paragraphs.end() - static_cast<std::ptrdiff_t>(n_eval),
                                         paragraphs.end());
     paragraphs.resize(paragraphs.size() - n_eval);

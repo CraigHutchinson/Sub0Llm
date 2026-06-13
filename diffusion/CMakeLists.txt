@@ -10,6 +10,8 @@ add_library(sub0diff STATIC
     src/host_detect.cpp
     src/denoiser.cpp
     src/recovery.cpp
+    src/sampler.cpp
+    src/model_io.cpp
 )
 target_include_directories(sub0diff PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
