@@ -380,3 +380,43 @@ TEST_CASE("detach - result does not require grad", "[autograd]") {
     auto d = detach(x);
     REQUIRE_FALSE(d.requires_grad());
 }
+
+// ── Batched matmul gradients (Ch29 re-architecture) ────────────────────────────
+// The batched core ops reuse the 2D VJPs (matmul_bt/matmul_tb), so batched
+// gradients must equal stacking the per-slice 2D gradients. This guards that the
+// batch dimension threads correctly through backward.
+namespace {
+Variable leaf3d(const Tensor& t, bool rg = true) { return Variable(t, rg); }
+Tensor   slice2d_ag(const Tensor& t, int64_t bi) {
+    const int64_t R = t.shape(1), C = t.shape(2);
+    Tensor out({R, C});
+    auto s = t.data_as<float>(); auto d = out.data_as<float>();
+    for (int64_t i = 0; i < R * C; ++i) d[static_cast<std::size_t>(i)] =
+        s[static_cast<std::size_t>(bi * R * C + i)];
+    return out;
+}
+} // namespace
+
+TEST_CASE("batched matmul gradients equal stacked per-slice 2D gradients", "[autograd][batched]") {
+    const int64_t B = 3, M = 4, K = 5, N = 2;
+    Tensor at = randn({B, M, K}), bt = randn({B, K, N});
+
+    auto a = leaf3d(at), b = leaf3d(bt);
+    sum(autograd::matmul(a, b)).backward();   // sum reduces the (B,M,N) output to a scalar
+    auto ga = a.grad().data_as<float>();
+    auto gb = b.grad().data_as<float>();
+
+    for (int64_t bi = 0; bi < B; ++bi) {
+        auto a2 = Variable(slice2d_ag(at, bi), true);
+        auto b2 = Variable(slice2d_ag(bt, bi), true);
+        sum(autograd::matmul(a2, b2)).backward();
+        auto ga2 = a2.grad().data_as<float>();
+        auto gb2 = b2.grad().data_as<float>();
+        for (int64_t i = 0; i < M * K; ++i)
+            REQUIRE_THAT(ga[static_cast<std::size_t>(bi * M * K + i)],
+                         WithinAbs(ga2[static_cast<std::size_t>(i)], 1e-4f));
+        for (int64_t i = 0; i < K * N; ++i)
+            REQUIRE_THAT(gb[static_cast<std::size_t>(bi * K * N + i)],
+                         WithinAbs(gb2[static_cast<std::size_t>(i)], 1e-4f));
+    }
+}

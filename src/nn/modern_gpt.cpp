@@ -306,6 +306,77 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     return out;
 }
 
+// Batched bidirectional forward: x is (B·T, D), B windows stacked on the leading
+// dim. Projections / RoPE / QK-norm / softmax run once over all B·T rows; only the
+// score and context matmuls reshape to (B,T,·) so attention is block-diagonal.
+autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
+                                                  int64_t B, int64_t T, bool causal) const {
+    using namespace autograd;
+    if (causal)
+        throw std::runtime_error(
+            "GroupedQueryAttention batched forward: causal masking is future work (bidirectional only)");
+    if (x.data().ndim() != 2 || x.data().shape()[0] != B * T ||
+        x.data().shape()[1] != static_cast<int64_t>(embed_dim_))
+        throw std::runtime_error(std::format(
+            "GroupedQueryAttention batched forward: x must be (B*T, D) = ({}, {})",
+            B * T, embed_dim_));
+    if (B < 1 || T < 1)
+        throw std::runtime_error("GroupedQueryAttention batched forward: B,T must be >= 1");
+
+    const float       scale_fac = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    const std::size_t r  = n_heads_ / n_kv_heads_;
+    const int64_t     Dh = static_cast<int64_t>(head_dim_);
+    const int64_t     D2 = Dh / 2;
+
+    // Base (T) RoPE table (cached by T), then tile to (B·T) rows (cached by B,T).
+    if (T != rope_cache_T_) {
+        compute_rope_freqs(T, Dh, rope_base_, rope_cache_cos_, rope_cache_sin_);
+        rope_cache_T_ = T;
+        rope_btile_B_ = -1;                      // invalidate the tiled table
+    }
+    if (B != rope_btile_B_ || T != rope_btile_T_) {
+        auto tile = [&](const Tensor& base) {
+            Tensor out = zeros({B * T, D2});
+            auto bd = base.data_as<float>();
+            auto od = out.data_as<float>();
+            for (int64_t b = 0; b < B; ++b)
+                std::copy_n(bd.begin(), T * D2, od.begin() + b * T * D2);
+            return out;
+        };
+        rope_btile_cos_ = tile(rope_cache_cos_);
+        rope_btile_sin_ = tile(rope_cache_sin_);
+        rope_btile_B_   = B;
+        rope_btile_T_   = T;
+    }
+    const Tensor& cos_f = rope_btile_cos_;
+    const Tensor& sin_f = rope_btile_sin_;
+
+    // K, V per KV head: (B·T,D)→(B·T,hd), QK-norm+RoPE on K, then fold to (B,T,hd).
+    std::vector<Variable> K_heads(n_kv_heads_), V_heads(n_kv_heads_);
+    for (std::size_t g = 0; g < n_kv_heads_; ++g) {
+        auto k_raw = matmul(x, W_K_[g]);                       // (B·T, hd)
+        if (use_qk_norm_) k_raw = k_norm_->forward(k_raw);
+        K_heads[g] = reshape(rope(k_raw, cos_f, sin_f), {B, T, Dh});
+        V_heads[g] = reshape(matmul(x, W_V_[g]), {B, T, Dh});
+    }
+
+    auto compute_head = [&](std::size_t h) -> Variable {
+        const std::size_t g = h / r;
+        auto q_raw = matmul(x, W_Q_[h]);                       // (B·T, hd)
+        if (use_qk_norm_) q_raw = q_norm_->forward(q_raw);
+        auto q3     = reshape(rope(q_raw, cos_f, sin_f), {B, T, Dh});  // (B,T,hd)
+        auto scores = scale(matmul_bt(q3, K_heads[g]), scale_fac);    // (B,T,T) batched q·Kᵀ
+        auto attn2  = softmax(reshape(scores, {B * T, T}));          // row-softmax over T
+        auto ctx    = matmul(reshape(attn2, {B, T, T}), V_heads[g]); // (B,T,hd) batched
+        return matmul(reshape(ctx, {B * T, Dh}), W_O_[h]);           // (B·T, D)
+    };
+
+    Variable out = compute_head(0);
+    for (std::size_t h = 1; h < n_heads_; ++h)
+        out = add(out, compute_head(h));
+    return out;
+}
+
 void GroupedQueryAttention::quantize_weights() {
     const int64_t D  = static_cast<int64_t>(embed_dim_);
     const int64_t Dh = static_cast<int64_t>(head_dim_);

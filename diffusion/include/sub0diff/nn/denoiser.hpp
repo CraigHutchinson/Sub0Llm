@@ -16,6 +16,7 @@
 #include "sub0llm/nn/modern_gpt.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace sub0diff::nn {
@@ -29,6 +30,9 @@ public:
                        std::int64_t d_ff = 0, std::uint64_t seed = 42, float rope_base = 10000.0f);
 
     [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::autograd::Variable& x) const;
+    // Batched: x is (B·T, D), B windows stacked; attention is block-diagonal per window.
+    [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::autograd::Variable& x,
+                                                      std::int64_t B, std::int64_t T) const;
     [[nodiscard]] std::vector<sub0llm::autograd::Variable*> parameters();
 
 private:
@@ -50,6 +54,13 @@ public:
     // Returns logits (T, vocab_size+1) over the clean token at every position.
     [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::Tensor& token_ids,
                                                       float noise_level) const;
+
+    // Batched training forward. token_ids: (B·T,) int32 — B windows of T tokens
+    // stacked on the leading dim. noise_levels: one level per window (size B).
+    // Returns logits (B·T, vocab_size+1). Attention stays block-diagonal per window.
+    [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::Tensor& token_ids,
+                                                      std::span<const float> noise_levels,
+                                                      std::int64_t B, std::int64_t T) const;
 
     [[nodiscard]] std::vector<sub0llm::autograd::Variable*> parameters();
 

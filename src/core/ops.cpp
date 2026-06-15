@@ -1,7 +1,9 @@
 #include "sub0llm/core/ops.hpp"
+#include "sub0llm/core/thread_pool.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
 
@@ -29,6 +31,73 @@ void require_f32(const Tensor& t, std::string_view op) {
     if (t.dtype() != DType::Float32)
         throw std::runtime_error(
             std::format("{}: only float32 supported, got {}", op, dtype_name(t.dtype())));
+}
+
+// Intra-op threading (Ch29 Route B): a large GEMM's M output rows are independent,
+// so partition them across the shared P-core pool — each block runs the same 2D
+// kernel on its rows. Row-disjoint ⇒ bitwise-identical to serial (no reduction), so
+// it is parity-safe and needs no test changes. Small ops stay serial (work threshold).
+using RowKernel = void (*)(const float*, const float*, float*,
+                           std::size_t, std::size_t, std::size_t);
+constexpr std::size_t kMatmulThreadWork = std::size_t{1} << 21;   // ~2M MACs
+
+void run_matmul_rows(const float* A, const float* B, float* C,
+                     std::size_t M, std::size_t N, std::size_t K, RowKernel kern) {
+    if (intra_op_threading_enabled() && M >= 8 && M * N * K >= kMatmulThreadWork) {
+        ThreadPool::global().parallel_for(
+            static_cast<std::int64_t>(M),
+            [=](std::int64_t r0, std::int64_t r1) {
+                kern(A + static_cast<std::size_t>(r0) * K, B,
+                     C + static_cast<std::size_t>(r0) * N,
+                     static_cast<std::size_t>(r1 - r0), N, K);
+            },
+            /*grain=*/8);
+    } else {
+        kern(A, B, C, M, N, K);
+    }
+}
+
+// Threaded Aᵀ·B (the weight-gradient GEMM dL/dB) — the backward bottleneck. Its
+// output C(K,N) reduces over the contracted M dim, so M-row blocks can't write
+// disjoint output; instead each P-core computes a PARTIAL C(K,N) from its M-block
+// (contiguous A/B row slices → still Eigen-fast) and we sum the partials. The sum
+// reorders float adds vs the serial path (≈1e-6 rel), so this is gated to large M
+// (training shapes) — the small 2D unit tests stay on the exact serial kernel.
+void run_matmul_tb(const float* A, const float* B, float* C,
+                   std::size_t M, std::size_t N, std::size_t K) {
+    auto& pool = ThreadPool::global();
+    const int Tn = pool.size();
+    if (!intra_op_threading_enabled() || Tn <= 1 || M < 256 || M * N * K < kMatmulThreadWork) {
+        backend::cpu::matmul_tb_f32(A, B, C, M, N, K);
+        return;
+    }
+    const std::size_t KN = K * N;
+    // Reused scratch (one allocation, grows monotonically): run_matmul_tb is only
+    // ever called from the single graph-building thread (backward is sequential), so
+    // a plain function-static buffer is safe — the pool workers only WRITE disjoint
+    // [p·KN, (p+1)·KN) slices of it, they never call run_matmul_tb. NOT thread_local
+    // (that bound the workers to a different instance → the earlier crash).
+    static std::vector<float> partials;
+    const std::size_t need = static_cast<std::size_t>(Tn) * KN;
+    if (partials.size() < need) partials.resize(need);
+    const std::int64_t mchunk = (static_cast<std::int64_t>(M) + Tn - 1) / Tn;
+    pool.parallel_for(Tn, [&](std::int64_t p0, std::int64_t p1) {
+        for (std::int64_t p = p0; p < p1; ++p) {
+            float* dst = partials.data() + static_cast<std::size_t>(p) * KN;
+            const std::int64_t m0 = p * mchunk;
+            const std::int64_t m1 = std::min<std::int64_t>(static_cast<std::int64_t>(M), m0 + mchunk);
+            if (m1 <= m0) { std::fill_n(dst, KN, 0.0f); continue; }
+            backend::cpu::matmul_tb_f32(A + static_cast<std::size_t>(m0) * K,
+                                        B + static_cast<std::size_t>(m0) * N,
+                                        dst, static_cast<std::size_t>(m1 - m0), N, K);
+        }
+    }, /*grain=*/1);
+    // Serial reduce partials → C.
+    std::memcpy(C, partials.data(), KN * sizeof(float));
+    for (int p = 1; p < Tn; ++p) {
+        const float* bp = partials.data() + static_cast<std::size_t>(p) * KN;
+        for (std::size_t i = 0; i < KN; ++i) C[i] += bp[i];
+    }
 }
 
 void require_same(const Tensor& a, const Tensor& b, std::string_view op) {
@@ -168,11 +237,53 @@ Tensor softmax(const Tensor& t, int dim) {
 
 // ── Matrix multiply ───────────────────────────────────────────────────────────
 
+// Batched 3D matmul: (B,M,K)·(B,K,N) → (B,M,N), both operands batched with the same
+// leading B. CPU/f32 only (the fused kernels are CPU-only). The 2D path is unchanged;
+// the autograd VJPs (matmul_bt / matmul_tb) inherit batching by calling back here.
+// 2D weight layers fold batch into M via reshape in the model, not through here.
+namespace {
+template<class Kernel>
+Tensor matmul_batched_impl(const Tensor& a, const Tensor& b, const char* name,
+                           std::int64_t out_rows, std::int64_t out_cols,
+                           std::size_t M, std::size_t N, std::size_t K,
+                           std::size_t a_slice, std::size_t b_slice, Kernel kern) {
+    require_f32(a, name);
+    require_cpu(a, name);
+    require_cpu(b, name);
+    const Tensor ac = a.contiguous();
+    const Tensor bc = b.contiguous();
+    const auto B = static_cast<std::size_t>(a.shape(0));
+    Tensor out(Tensor::Shape{a.shape(0), out_rows, out_cols}, DType::Float32, a.device());
+    const float* pa = reinterpret_cast<const float*>(ac.raw_ptr());
+    const float* pb = reinterpret_cast<const float*>(bc.raw_ptr());
+    float*       pc = reinterpret_cast<float*>(out.raw_ptr());
+    // Output slice is rows×cols (M·N for matmul/bt, K·N for tb) — derive it, don't
+    // assume M·N, so the transposed-A kernel's (K,N) output strides correctly.
+    const std::size_t c_slice = static_cast<std::size_t>(out_rows) * static_cast<std::size_t>(out_cols);
+    for (std::size_t bi = 0; bi < B; ++bi)
+        kern(pa + bi * a_slice, pb + bi * b_slice, pc + bi * c_slice, M, N, K);
+    return out;
+}
+} // namespace
+
 Tensor matmul(const Tensor& a, const Tensor& b) {
     if (a.ndim() < 2 || b.ndim() < 2)
         throw std::runtime_error("matmul: inputs must be at least 2D");
+    if (a.ndim() == 3 || b.ndim() == 3) {
+        if (a.ndim() != 3 || b.ndim() != 3)
+            throw std::runtime_error("matmul: batched matmul needs both operands 3D (B,M,K)·(B,K,N)");
+        if (a.shape(0) != b.shape(0))
+            throw std::runtime_error(std::format(
+                "matmul: batch dims must match, got {} vs {}", a.shape(0), b.shape(0)));
+        const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+        const auto K2 = static_cast<std::size_t>(b.shape(1)), N = static_cast<std::size_t>(b.shape(2));
+        if (K != K2) throw std::runtime_error(std::format(
+            "matmul: inner dims must match, got {} vs {}", K, K2));
+        return matmul_batched_impl(a, b, "matmul", a.shape(1), b.shape(2),
+                                   M, N, K, M * K, K * N, backend::cpu::matmul_f32);
+    }
     if (a.ndim() != 2 || b.ndim() != 2)
-        throw std::runtime_error("matmul: batched matmul added in Ch07 (attention)");
+        throw std::runtime_error("matmul: only 2D and 3D-batched are supported");
 
     const auto M  = static_cast<std::size_t>(a.shape(0));
     const auto K  = static_cast<std::size_t>(a.shape(1));
@@ -189,15 +300,28 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
 
-    backend::cpu::matmul_f32(
+    run_matmul_rows(
         reinterpret_cast<const float*>(a.raw_ptr()),
         reinterpret_cast<const float*>(b.raw_ptr()),
         reinterpret_cast<float*>(out.raw_ptr()),
-        M, N, K);
+        M, N, K, backend::cpu::matmul_f32);
     return out;
 }
 
 Tensor matmul_bt(const Tensor& a, const Tensor& b) {
+    if (a.ndim() == 3 || b.ndim() == 3) {
+        if (a.ndim() != 3 || b.ndim() != 3)
+            throw std::runtime_error("matmul_bt: batched needs both operands 3D (B,M,K)·(B,N,K)ᵀ");
+        if (a.shape(0) != b.shape(0))
+            throw std::runtime_error(std::format(
+                "matmul_bt: batch dims must match, got {} vs {}", a.shape(0), b.shape(0)));
+        const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+        const auto N = static_cast<std::size_t>(b.shape(1)), K2 = static_cast<std::size_t>(b.shape(2));
+        if (K != K2) throw std::runtime_error(std::format(
+            "matmul_bt: inner dims must match, got A(.,{}) vs B(.,{})", K, K2));
+        return matmul_batched_impl(a, b, "matmul_bt", a.shape(1), b.shape(1),
+                                   M, N, K, M * K, N * K, backend::cpu::matmul_bt_f32);
+    }
     if (a.ndim() != 2 || b.ndim() != 2)
         throw std::runtime_error("matmul_bt: inputs must be 2D");
 
@@ -219,15 +343,28 @@ Tensor matmul_bt(const Tensor& a, const Tensor& b) {
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
 
-    backend::cpu::matmul_bt_f32(
+    run_matmul_rows(
         reinterpret_cast<const float*>(ac.raw_ptr()),
         reinterpret_cast<const float*>(bc.raw_ptr()),
         reinterpret_cast<float*>(out.raw_ptr()),
-        M, N, K);
+        M, N, K, backend::cpu::matmul_bt_f32);
     return out;
 }
 
 Tensor matmul_tb(const Tensor& a, const Tensor& b) {
+    if (a.ndim() == 3 || b.ndim() == 3) {
+        if (a.ndim() != 3 || b.ndim() != 3)
+            throw std::runtime_error("matmul_tb: batched needs both operands 3D (B,M,K)ᵀ·(B,M,N)");
+        if (a.shape(0) != b.shape(0))
+            throw std::runtime_error(std::format(
+                "matmul_tb: batch dims must match, got {} vs {}", a.shape(0), b.shape(0)));
+        const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+        const auto M2 = static_cast<std::size_t>(b.shape(1)), N = static_cast<std::size_t>(b.shape(2));
+        if (M != M2) throw std::runtime_error(std::format(
+            "matmul_tb: leading dims must match, got A({},.) vs B({},.)", M, M2));
+        return matmul_batched_impl(a, b, "matmul_tb", a.shape(2), b.shape(2),
+                                   M, N, K, M * K, M * N, backend::cpu::matmul_tb_f32);
+    }
     if (a.ndim() != 2 || b.ndim() != 2)
         throw std::runtime_error("matmul_tb: inputs must be 2D");
 
@@ -249,12 +386,51 @@ Tensor matmul_tb(const Tensor& a, const Tensor& b) {
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
 
-    backend::cpu::matmul_tb_f32(
+    run_matmul_tb(
         reinterpret_cast<const float*>(ac.raw_ptr()),
         reinterpret_cast<const float*>(bc.raw_ptr()),
         reinterpret_cast<float*>(out.raw_ptr()),
         M, N, K);
     return out;
+}
+
+void matmul_into(const Tensor& a, const Tensor& b, Tensor& c) {
+    if (a.ndim() != 2 || b.ndim() != 2 || c.ndim() != 2)
+        throw std::runtime_error("matmul_into: a, b, c must be 2D");
+    const auto M = static_cast<std::size_t>(a.shape(0)), K = static_cast<std::size_t>(a.shape(1));
+    const auto K2 = static_cast<std::size_t>(b.shape(0)), N = static_cast<std::size_t>(b.shape(1));
+    if (K != K2 || c.shape(0) != a.shape(0) || c.shape(1) != b.shape(1))
+        throw std::runtime_error("matmul_into: shape mismatch (need A(M,K)·B(K,N)→C(M,N))");
+    require_f32(a, "matmul_into"); require_cpu(a, "matmul_into");
+    backend::cpu::matmul_f32(reinterpret_cast<const float*>(a.raw_ptr()),
+                             reinterpret_cast<const float*>(b.raw_ptr()),
+                             reinterpret_cast<float*>(c.raw_ptr()), M, N, K);
+}
+
+void matmul_bt_into(const Tensor& a, const Tensor& b, Tensor& c) {
+    if (a.ndim() != 2 || b.ndim() != 2 || c.ndim() != 2)
+        throw std::runtime_error("matmul_bt_into: a, b, c must be 2D");
+    const auto M = static_cast<std::size_t>(a.shape(0)), K = static_cast<std::size_t>(a.shape(1));
+    const auto N = static_cast<std::size_t>(b.shape(0)), K2 = static_cast<std::size_t>(b.shape(1));
+    if (K != K2 || c.shape(0) != a.shape(0) || c.shape(1) != b.shape(0))
+        throw std::runtime_error("matmul_bt_into: shape mismatch (need A(M,K)·B(N,K)ᵀ→C(M,N))");
+    require_f32(a, "matmul_bt_into"); require_cpu(a, "matmul_bt_into");
+    backend::cpu::matmul_bt_f32(reinterpret_cast<const float*>(a.raw_ptr()),
+                                reinterpret_cast<const float*>(b.raw_ptr()),
+                                reinterpret_cast<float*>(c.raw_ptr()), M, N, K);
+}
+
+void matmul_tb_into(const Tensor& a, const Tensor& b, Tensor& c) {
+    if (a.ndim() != 2 || b.ndim() != 2 || c.ndim() != 2)
+        throw std::runtime_error("matmul_tb_into: a, b, c must be 2D");
+    const auto M = static_cast<std::size_t>(a.shape(0)), K = static_cast<std::size_t>(a.shape(1));
+    const auto M2 = static_cast<std::size_t>(b.shape(0)), N = static_cast<std::size_t>(b.shape(1));
+    if (M != M2 || c.shape(0) != a.shape(1) || c.shape(1) != b.shape(1))
+        throw std::runtime_error("matmul_tb_into: shape mismatch (need A(M,K)ᵀ·B(M,N)→C(K,N))");
+    require_f32(a, "matmul_tb_into"); require_cpu(a, "matmul_tb_into");
+    backend::cpu::matmul_tb_f32(reinterpret_cast<const float*>(a.raw_ptr()),
+                                reinterpret_cast<const float*>(b.raw_ptr()),
+                                reinterpret_cast<float*>(c.raw_ptr()), M, N, K);
 }
 
 Tensor narrow(const Tensor& t, int64_t start, int64_t length) {

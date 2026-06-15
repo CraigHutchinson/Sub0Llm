@@ -591,6 +591,18 @@ Variable transpose2d(const Variable& x) {
     return Variable::wrap(std::move(out));
 }
 
+// ── reshape ───────────────────────────────────────────────────────────────────
+// Zero-copy on contiguous data (Tensor::reshape shares storage). Backward reshapes
+// the upstream gradient back to the input's original shape.
+Variable reshape(const Variable& x, Tensor::Shape new_shape) {
+    Tensor::Shape in_shape = x.data().shape();
+    auto out = make_node(x.data().reshape(std::move(new_shape)), x.requires_grad());
+    if (out->requires_grad)
+        out->edges.push_back(make_edge(x.impl(),
+            [in_shape](const Tensor& g) { return g.reshape(in_shape); }));
+    return Variable::wrap(std::move(out));
+}
+
 // ── softmax ───────────────────────────────────────────────────────────────────
 //
 // y = softmax(x, dim=-1)   row-wise for 2D input (N, C)

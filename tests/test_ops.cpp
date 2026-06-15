@@ -208,6 +208,85 @@ TEST_CASE("matmul_bt dimension mismatch throws", "[ops]") {
     REQUIRE_THROWS_AS(matmul_bt(a, b), std::runtime_error);
 }
 
+// ── Batched 3D matmul (Ch29 re-architecture: batch folds into the M dimension) ──
+
+// Copy slice `bi` of a 3D (B,R,C) tensor into a fresh 2D (R,C) tensor.
+static Tensor slice2d(const Tensor& t, std::int64_t bi) {
+    const std::int64_t R = t.shape(1), C = t.shape(2);
+    Tensor out({R, C});
+    auto src = t.data_as<float>();
+    auto dst = out.data_as<float>();
+    std::copy_n(src.begin() + bi * R * C, R * C, dst.begin());
+    return out;
+}
+
+TEST_CASE("batched matmul equals per-slice 2D matmul", "[ops][batched]") {
+    const std::int64_t B = 3, M = 5, K = 7, N = 4;
+    Tensor a = randn({B, M, K});
+    Tensor b = randn({B, K, N});
+    Tensor out = matmul(a, b);                       // (B,M,N)
+    REQUIRE(out.shape() == Tensor::Shape{B, M, N});
+    for (std::int64_t bi = 0; bi < B; ++bi)
+        require_near(slice2d(out, bi), matmul(slice2d(a, bi), slice2d(b, bi)), 1e-4f);
+}
+
+TEST_CASE("batched matmul_bt equals per-slice 2D matmul_bt (K>=64 path too)", "[ops][batched]") {
+    const std::int64_t B = 2, M = 6, N = 5, K = 96;   // K>=64 exercises Eigen/BLAS slice path
+    Tensor a = randn({B, M, K});
+    Tensor b = randn({B, N, K});
+    Tensor out = matmul_bt(a, b);                    // (B,M,N)
+    REQUIRE(out.shape() == Tensor::Shape{B, M, N});
+    for (std::int64_t bi = 0; bi < B; ++bi)
+        require_near(slice2d(out, bi), matmul_bt(slice2d(a, bi), slice2d(b, bi)), 1e-3f);
+}
+
+TEST_CASE("batched matmul_tb equals per-slice 2D matmul_tb", "[ops][batched]") {
+    const std::int64_t B = 3, M = 8, K = 5, N = 4;
+    Tensor a = randn({B, M, K});
+    Tensor b = randn({B, M, N});
+    Tensor out = matmul_tb(a, b);                    // (B,K,N)
+    REQUIRE(out.shape() == Tensor::Shape{B, K, N});
+    for (std::int64_t bi = 0; bi < B; ++bi)
+        require_near(slice2d(out, bi), matmul_tb(slice2d(a, bi), slice2d(b, bi)), 1e-4f);
+}
+
+TEST_CASE("matmul_tb threaded large-M path matches serial reference", "[ops][threaded]") {
+    // M>=256 and work>=2M engages the threaded M-partition+reduce path; verify it
+    // matches the trusted 2D reference (transpose then matmul). Reduction reorders
+    // float adds, so allow a loose tolerance.
+    const std::int64_t M = 2048, K = 128, N = 96;
+    Tensor a = randn({M, K});
+    Tensor b = randn({M, N});
+    Tensor ref = matmul(a.transpose(0, 1).contiguous(), b);   // (K, N)
+    Tensor out = matmul_tb(a, b);
+    REQUIRE(out.shape() == Tensor::Shape{K, N});
+    require_near(out, ref, 5e-2f);
+}
+
+TEST_CASE("matmul threaded large-M path matches serial reference", "[ops][threaded]") {
+    const std::int64_t M = 2048, K = 128, N = 384;
+    Tensor a = randn({M, K});
+    Tensor b = randn({K, N});
+    Tensor ref(Tensor::Shape{M, N});
+    // serial reference via per-row dot using the public 2D matmul on row blocks of 1.
+    Tensor out = matmul(a, b);
+    REQUIRE(out.shape() == Tensor::Shape{M, N});
+    // spot-check a few rows against an explicit small matmul of that row.
+    for (std::int64_t r : {0, 1, 1023, 2047}) {
+        Tensor arow = narrow(a, r, 1);                // (1,K)
+        Tensor orow = matmul(arow, b);                // (1,N)
+        auto od = out.data_as<float>(); auto rd = orow.data_as<float>();
+        for (std::int64_t j = 0; j < N; ++j)
+            REQUIRE_THAT(od[static_cast<std::size_t>(r * N + j)],
+                         WithinAbs(rd[static_cast<std::size_t>(j)], 1e-3f));
+    }
+}
+
+TEST_CASE("batched matmul rejects mismatched batch / rank", "[ops][batched]") {
+    REQUIRE_THROWS_AS(matmul(randn({2, 3, 4}), randn({3, 4, 5})), std::runtime_error); // B 2 vs 3
+    REQUIRE_THROWS_AS(matmul(randn({2, 3, 4}), randn({4, 5})),    std::runtime_error); // 3D vs 2D
+}
+
 // ── Unary ─────────────────────────────────────────────────────────────────────
 
 TEST_CASE("exp and log are inverses", "[ops]") {

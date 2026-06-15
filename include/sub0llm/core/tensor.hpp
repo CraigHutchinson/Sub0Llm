@@ -13,6 +13,7 @@
 
 #include "dtype.hpp"
 #include "device.hpp"
+#include "small_vector.hpp"
 
 namespace sub0llm {
 
@@ -39,8 +40,10 @@ struct Storage {
 // Ch05 will wrap this in a Node for autograd
 class Tensor {
 public:
-    using Shape   = std::vector<std::int64_t>;
-    using Strides = std::vector<std::int64_t>;
+    // Inline storage for rank ≤4 (the practical maximum) → zero heap allocation for
+    // tensor metadata, which was ~half the per-step allocation firehose (Ch29).
+    using Shape   = SmallVector<std::int64_t, 4>;
+    using Strides = SmallVector<std::int64_t, 4>;
 
     // ── Constructors ─────────────────────────────────────────────────────────
     Tensor() = default;

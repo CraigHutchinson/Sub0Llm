@@ -34,7 +34,7 @@ static void remove_dir(const std::string& dir)
 
 static Variable make_param(std::vector<int64_t> shape, float fill_value)
 {
-    Tensor t(shape, DType::Float32);
+    Tensor t(Tensor::Shape(shape.begin(), shape.end()), DType::Float32);
     for (float& v : t.data_as<float>()) v = fill_value;
     return Variable(std::move(t), /*requires_grad=*/true);
 }

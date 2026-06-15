@@ -4,10 +4,9 @@
 //
 // One training "step" becomes W windows, one per worker thread:
 //
-//   1. SYNC     each worker memcpys the master weights into its own replica
-//               (~3.4 MB at Ch29 scale — ~0.2 ms done in parallel)
-//   2. COMPUTE  each worker corrupts its window and runs forward+backward on its
-//               OWN replica — no shared mutable state, no locks in the hot path
+//   1. ZERO     each worker clears its own (private) gradient accumulators
+//   2. COMPUTE  each worker corrupts its window and runs forward+backward reading
+//               the SHARED master weights — no per-step weight copy, no locks
 //   3. REDUCE   workers partition the parameter list (i % W == wid) and write the
 //               mean of all replicas' gradients straight into the master's grad
 //               tensors (assignment, so no zeroing pass is needed)
@@ -16,9 +15,18 @@
 // gradient-accumulation convergence lever: the effective batch is W windows, so
 // each Adam update sees a W× less noisy gradient.
 //
-// Thread safety rests on replica isolation: autograd graphs, loss contexts and
-// RNGs are all per-worker. The master's tensors are only read during SYNC/COMPUTE
-// and only written during REDUCE, with std::barrier separating the phases.
+// SHARED WEIGHTS (not replicated): at construction each worker's leaf parameter
+// *data* storage is aliased onto the master's buffer, so all W workers + master read
+// ONE 6.4 MB weight copy. This was the key throughput fix — W private replicas total
+// W×6.4 MB, which blows past L3 (~30 MB) at W≳5 and forces every forward to stream
+// weights from DRAM; the workers then contend for memory bandwidth and compute stops
+// scaling. One shared copy stays L3-resident. The master mutates the weights in place
+// in opt.step() AFTER pool.step() returns (all barriers passed), so the read-only
+// COMPUTE phase never races the write. Only the gradient accumulators stay private.
+//
+// Thread safety: gradients/autograd graphs/loss contexts/RNGs are all per-worker;
+// weight DATA is shared but read-only within COMPUTE. The std::barrier phases
+// separate every worker read of the weights from the single master write.
 //
 // FTZ note: workers inherit MXCSR from the thread that constructs the pool, so
 // call sub0llm::init_cpu_compute() before constructing (main() already does).
@@ -27,9 +35,11 @@
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/core/cpu_topology.hpp"
+#include "sub0llm/core/thread_pool.hpp"
 
 #include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <span>
@@ -48,13 +58,24 @@ public:
         float         mean_loss = 0.0f;   // mean per-window NELBO this step
         std::uint64_t masked_tokens = 0;  // summed over all workers
         float         last_t = 0.0f;      // a representative sampled noise level
+        // Master-side phase timing (≈free: 2 clock reads/step) — lets a caller see
+        // the parallel-overhead split. compute_s = SYNC+forward+backward (the useful,
+        // perfectly-parallel part); reduce_s = the barrier-bounded gradient reduction.
+        double        compute_s = 0.0;
+        double        reduce_s  = 0.0;
     };
 
     ParallelTrainer(std::size_t n_workers, const Arch& arch,
                     std::vector<sub0llm::autograd::Variable*> master_params,
-                    float t_min, float t_max, std::uint64_t seed)
+                    float t_min, float t_max, std::uint64_t seed,
+                    bool share_weights = true,
+                    std::span<const std::uint8_t> is_word_start = {},
+                    bool whole_word = false,
+                    std::vector<int> pin_override = {},
+                    bool exact_count = false)
         : master_(std::move(master_params)),
-          t_min_(t_min), t_max_(t_max),
+          t_min_(t_min), t_max_(t_max), share_weights_(share_weights),
+          is_word_start_(is_word_start), whole_word_(whole_word), exact_count_(exact_count),
           barrier_(static_cast<std::ptrdiff_t>(n_workers + 1)) {
         // Master grads must exist before workers assign into them.
         for (auto* p : master_)
@@ -63,14 +84,28 @@ public:
 
         // Compute-bound pool: pin workers P-cores-first via the shared topology
         // (sub0llm/core/cpu_topology.hpp) — the project-wide thread-placement model.
-        const auto pins = sub0llm::compute_pin_set(sub0llm::detect_cpu_topology(), n_workers);
+        // An explicit pin_override (from --pin) lets concurrent trainers take DISJOINT
+        // cores so they don't oversubscribe the same P-cores.
+        const auto pins = pin_override.empty()
+            ? sub0llm::compute_pin_set(sub0llm::detect_cpu_topology(), n_workers)
+            : pin_override;
 
         workers_.reserve(n_workers);
         for (std::size_t w = 0; w < n_workers; ++w) {
             auto& wk = *workers_.emplace_back(std::make_unique<Worker>(arch, seed + 1000 * (w + 1)));
+            // Alias each replica's weight DATA onto the master's storage (shallow
+            // Tensor copy shares the underlying buffer): one L3-resident weight copy,
+            // no per-step SYNC, and the worker's own randomly-initialised weight
+            // buffers are released here. Grads stay private (not aliased).
+            if (share_weights_)
+                for (std::size_t i = 0; i < master_.size(); ++i)
+                    wk.params[i]->data() = master_[i]->data();
             const int pin = pins[w];
             wk.thread = std::thread([this, &wk, w, n_workers, pin] {
                 sub0llm::pin_current_thread(pin);
+                // This replica IS the parallel unit — keep its matmuls serial so we
+                // don't oversubscribe (W workers × an 8-way GEMM each).
+                sub0llm::intra_op_threading_enabled() = false;
                 worker_loop(wk, w, n_workers);
             });
         }
@@ -87,6 +122,13 @@ public:
 
     [[nodiscard]] std::size_t n_workers() const noexcept { return workers_.size(); }
 
+    // Update the noise band workers sample t from (the curriculum's dynamic ceiling).
+    // Read by each worker at the top of its next step — set it before step().
+    void set_t_range(float t_min, float t_max) noexcept {
+        t_min_.store(t_min, std::memory_order_relaxed);
+        t_max_.store(t_max, std::memory_order_relaxed);
+    }
+
     // Run one accumulated step: window w = stream[offsets[w] .. +seq_len).
     // offsets.size() must equal n_workers(). Master grads hold the MEAN gradient
     // on return; caller clips and steps its optimizer.
@@ -94,11 +136,16 @@ public:
                     std::span<const std::size_t> offsets) {
         stream_  = stream;
         offsets_ = offsets;
+        const auto t0 = std::chrono::steady_clock::now();
         barrier_.arrive_and_wait();          // → SYNC + COMPUTE
         barrier_.arrive_and_wait();          // compute done → REDUCE
+        const auto t1 = std::chrono::steady_clock::now();
         barrier_.arrive_and_wait();          // reduce done
+        const auto t2 = std::chrono::steady_clock::now();
 
         StepResult r;
+        r.compute_s = std::chrono::duration<double>(t1 - t0).count();
+        r.reduce_s  = std::chrono::duration<double>(t2 - t1).count();
         for (const auto& w : workers_) {
             r.mean_loss     += w->loss;
             r.masked_tokens += w->masked;
@@ -136,21 +183,27 @@ private:
                 return;
             }
 
-            // SYNC: master weights → replica (grad cleared by fresh accumulate).
+            // ZERO (+ optional SYNC): weights are SHARED read-only with the master
+            // (aliased once at construction) so there is normally no per-step weight
+            // copy — workers observe the master's in-place opt.step() directly. With
+            // share_weights=false (A/B fallback) we instead memcpy master→replica.
+            // Either way the private gradient accumulators are cleared before backward.
             for (std::size_t i = 0; i < master_.size(); ++i) {
-                auto&       dst = wk.params[i]->data();
-                const auto& src = master_[i]->data();
-                std::memcpy(dst.raw_ptr(), src.raw_ptr(),
-                            static_cast<std::size_t>(src.numel()) * sizeof(float));
+                if (!share_weights_)
+                    std::memcpy(wk.params[i]->data().raw_ptr(), master_[i]->data().raw_ptr(),
+                                static_cast<std::size_t>(master_[i]->data().numel()) * sizeof(float));
                 auto& g = wk.params[i]->grad();
                 if (g.numel() > 0)
                     std::memset(g.raw_ptr(), 0,
                                 static_cast<std::size_t>(g.numel()) * sizeof(float));
             }
 
-            // COMPUTE: this worker's window, forward + backward on the replica.
+            // COMPUTE: this worker's window, forward + backward (reads shared weights).
             const auto window = stream_.subspan(offsets_[wid], static_cast<std::size_t>(T));
-            auto res = diffusion_loss(wk.model, window, wk.rng, wk.ctx, t_min_, t_max_);
+            auto res = diffusion_loss(wk.model, window, wk.rng, wk.ctx,
+                                      t_min_.load(std::memory_order_relaxed),
+                                      t_max_.load(std::memory_order_relaxed),
+                                      is_word_start_, whole_word_, exact_count_);
             res.loss.backward();
             wk.loss   = res.loss.data().item<float>();
             wk.t      = res.t;
@@ -181,7 +234,11 @@ private:
     std::vector<std::unique_ptr<Worker>>       workers_;
     std::span<const std::int32_t>              stream_;
     std::span<const std::size_t>               offsets_;
-    float                                      t_min_, t_max_;
+    std::atomic<float>                         t_min_, t_max_;
+    bool                                       share_weights_ = true;
+    std::span<const std::uint8_t>              is_word_start_;   // read-only, owned by caller
+    bool                                       whole_word_ = false;
+    bool                                       exact_count_ = false;
     std::atomic<bool>                          stop_{false};
     std::barrier<>                             barrier_;
 };

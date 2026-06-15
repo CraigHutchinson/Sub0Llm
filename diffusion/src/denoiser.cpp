@@ -3,6 +3,8 @@
 
 #include "sub0llm/autograd/ops.hpp"
 
+#include <algorithm>
+
 namespace sub0diff::nn {
 
 using sub0llm::autograd::Variable;
@@ -22,6 +24,14 @@ BidirectionalBlock::BidirectionalBlock(std::int64_t D, std::size_t n_heads,
 Variable BidirectionalBlock::forward(const Variable& x) const {
     // Bidirectional: causal=false lets every canvas position attend to every other.
     Variable h = ag::add(x, attn_.forward(norm1_.forward(x), /*causal=*/false));
+    Variable y = ag::add(h, ffn_.forward(norm2_.forward(h)));
+    return y;
+}
+
+Variable BidirectionalBlock::forward(const Variable& x, std::int64_t B, std::int64_t T) const {
+    // Same residual structure as the 2D path; attention runs block-diagonal over the
+    // B windows while the row-wise norm/FFN see all B·T rows at once.
+    Variable h = ag::add(x, attn_.forward(norm1_.forward(x), B, T, /*causal=*/false));
     Variable y = ag::add(h, ffn_.forward(norm2_.forward(h)));
     return y;
 }
@@ -65,6 +75,36 @@ Variable Denoiser::forward(const sub0llm::Tensor& token_ids, float noise_level) 
     // 3. final norm + weight-tied LM head: logits = x · Wᵀ, W = tok_emb (Vm, D)
     x = ln_f_.forward(x);
     return ag::matmul_bt(x, tok_emb_.weight());  // (T, Vm) — fused x · Wᵀ, W row-major (Vm, D)
+}
+
+Variable Denoiser::forward(const sub0llm::Tensor& token_ids,
+                           std::span<const float> noise_levels,
+                           std::int64_t B, std::int64_t T) const {
+    if (token_ids.numel() != B * T)
+        throw std::runtime_error("Denoiser batched forward: token_ids must have B*T elements");
+    if (static_cast<std::int64_t>(noise_levels.size()) != B)
+        throw std::runtime_error("Denoiser batched forward: need one noise level per window (B)");
+
+    // 1. token embedding (B·T, D)
+    Variable x = tok_emb_.forward(token_ids);
+
+    // 2. per-window noise conditioning: row b·T+t uses window b's level (broadcast over t).
+    sub0llm::Tensor cond({B * T, embed_dim_}, sub0llm::DType::Float32);
+    auto cs = cond.data_as<float>();
+    for (std::int64_t b = 0; b < B; ++b) {
+        sub0llm::Tensor rows = time_embedding_rows(noise_levels[static_cast<std::size_t>(b)],
+                                                   T, embed_dim_);  // (T, D)
+        auto rs = rows.data_as<float>();
+        std::copy_n(rs.begin(), T * embed_dim_, cs.begin() + b * T * embed_dim_);
+    }
+    x = ag::add(x, Variable{cond});   // constant (no grad)
+
+    // 3. bidirectional transformer stack (batched, block-diagonal attention)
+    for (const auto& blk : blocks_) x = blk.forward(x, B, T);
+
+    // 4. final norm + weight-tied LM head → (B·T, Vm)
+    x = ln_f_.forward(x);
+    return ag::matmul_bt(x, tok_emb_.weight());
 }
 
 std::vector<Variable*> Denoiser::parameters() {

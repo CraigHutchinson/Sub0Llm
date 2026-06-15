@@ -46,6 +46,14 @@ namespace sub0llm::ops {
 // updates) — the matmul-backward workhorse (dL/dB = Aᵀ·g without a transpose copy).
 [[nodiscard]] Tensor matmul_tb(const Tensor& a, const Tensor& b);
 
+// Zero-allocation matmul into a PREALLOCATED contiguous output (CPU/f32, 2D). The
+// caller owns c, sized (M,N) for matmul_into / (M,N) for matmul_bt_into. The building
+// block for the zero-alloc training hot path and for threaded GEMM (each worker writes
+// a disjoint M-row block of the same c). No graph, no autograd — raw kernel dispatch.
+void matmul_into(const Tensor& a, const Tensor& b, Tensor& c);      // C = A·B,  B (K,N)  → C(M,N)
+void matmul_bt_into(const Tensor& a, const Tensor& b, Tensor& c);   // C = A·Bᵀ, B (N,K)  → C(M,N)
+void matmul_tb_into(const Tensor& a, const Tensor& b, Tensor& c);   // C = Aᵀ·B, A(M,K),B(M,N) → C(K,N)
+
 // ── Unary ─────────────────────────────────────────────────────────────────────
 [[nodiscard]] Tensor exp(const Tensor& t);
 [[nodiscard]] Tensor log(const Tensor& t);

@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <cmath>
 #include <stdexcept>
 
 #include "sub0llm/nn/optimizer.hpp"
@@ -31,6 +32,94 @@ static Tensor make_grad(std::initializer_list<float> vals) {
     std::size_t i = 0;
     for (float v : vals) d[i++] = v;
     return t;
+}
+
+// ─── Newton-Schulz orthogonalisation (Muon's core kernel) ──────────────────────
+
+TEST_CASE("newton_schulz_orthogonalize: drives singular values to ~1", "[optimizer][muon]") {
+    // A FULL-RANK, well-conditioned matrix with a spread of singular values → after NS the
+    // singular values collapse toward 1, so ‖O‖_F ≈ sqrt(min(rows,cols)) and OᵀO ≈ I.
+    // (NS can only equalise NONZERO singular values — a rank-deficient input stays so.)
+    const int64_t R = 6, C = 3;
+    // Independent column directions (the first 3 rows are I₃ ⇒ full column rank), then more
+    // rows with mixed directions and per-row scaling to spread the singular values.
+    const float base[6][3] = {{1,0,0},{0,1,0},{0,0,1},{1,1,0},{0,1,1},{1,0,1}};
+    Tensor G = zeros({R, C});
+    auto g = G.data_as<float>();
+    for (int64_t i = 0; i < R; ++i)
+        for (int64_t j = 0; j < C; ++j)
+            g[i * C + j] = base[i][j] * (1.0f + 0.5f * static_cast<float>(i));
+
+    const Tensor O = nn::newton_schulz_orthogonalize(G, 5);
+    REQUIRE(O.shape()[0] == R);
+    REQUIRE(O.shape()[1] == C);
+    // ‖O‖_F ≈ sqrt(min(R,C)) = sqrt(3) ≈ 1.732 (all 3 singular values ≈ 1). NS5 is
+    // approximate, so allow a generous band.
+    REQUIRE_THAT(ops::norm(O), WithinAbs(std::sqrt(3.0f), 0.5f));
+
+    // OᵀO ≈ I_C: diagonals near 1, off-diagonals near 0.
+    const Tensor gram = ops::matmul_tb(O, O);     // (C×C) = Oᵀ·O
+    const auto gd = gram.data_as<float>();
+    for (int64_t i = 0; i < C; ++i) {
+        REQUIRE_THAT(gd[i * C + i], WithinAbs(1.0f, 0.45f));         // diagonal ~1
+        for (int64_t j = 0; j < C; ++j)
+            if (i != j) REQUIRE(std::abs(gd[i * C + j]) < 0.45f);    // off-diag ~0
+    }
+}
+
+// ─── optimizer factory ─────────────────────────────────────────────────────────
+
+TEST_CASE("make_optimizer: names resolve, unknown throws", "[optimizer]") {
+    Variable p = leaf1d({1.0f});
+    auto mk = [&](std::string_view n) {
+        std::vector<Variable*> ps = {&p};
+        return nn::make_optimizer(n, ps, 1e-3f);
+    };
+    REQUIRE(mk("adam")  != nullptr);
+    REQUIRE(mk("adamw") != nullptr);
+    REQUIRE(mk("muon")  != nullptr);
+    std::vector<Variable*> ps = {&p};
+    REQUIRE_THROWS_AS(nn::make_optimizer("nope", ps, 1e-3f), std::runtime_error);
+}
+
+TEST_CASE("AdamW: decoupled weight decay shrinks a zero-gradient weight", "[optimizer]") {
+    // grad = 0 → plain Adam leaves the weight unchanged; AdamW shrinks it by (1 - lr*wd).
+    Variable p = leaf1d({1.0f});
+    p.grad() = make_grad({0.0f});
+    nn::Adam adamw({&p}, /*lr=*/0.1f, 0.9f, 0.999f, 1e-8f, /*weight_decay=*/0.5f);
+    adamw.step();
+    // Expected: 1 * (1 - 0.1*0.5) = 0.95 (the Adam term is 0 since grad=0).
+    REQUIRE_THAT(p.data().data_as<float>()[0], WithinAbs(0.95f, 1e-4f));
+}
+
+TEST_CASE("Muon: reduces loss on a 2D linear-regression problem", "[optimizer][muon]") {
+    // Learn W (4×3) so that mean((W·x - y)²) → 0 for a fixed (x, y). W is 2D ⇒ Muon path.
+    Tensor x = zeros({3, 1});
+    for (int i = 0; i < 3; ++i) x.data_as<float>()[i] = static_cast<float>(i + 1);
+    Tensor ytgt = zeros({4, 1});
+    for (int i = 0; i < 4; ++i) ytgt.data_as<float>()[i] = static_cast<float>(4 - i);
+
+    Variable W(zeros({4, 3}), true);
+    for (float& w : W.data().data_as<float>()) w = 0.05f;
+    Variable xv(x, false), yv(ytgt, false);
+
+    nn::Muon opt({&W}, /*lr=*/0.05f);
+    auto loss_of = [&] {
+        Variable pred = matmul(W, xv);             // (4×1)
+        Variable diff = sub(pred, yv);
+        return sum(mul(diff, diff)).data().data_as<float>()[0];
+    };
+    const float l0 = loss_of();
+    for (int it = 0; it < 50; ++it) {
+        opt.zero_grad();
+        Variable pred = matmul(W, xv);
+        Variable diff = sub(pred, yv);
+        Variable loss = sum(mul(diff, diff));
+        loss.backward();
+        opt.step();
+    }
+    const float l1 = loss_of();
+    REQUIRE(l1 < l0 * 0.5f);   // Muon makes clear progress on a convex problem
 }
 
 // ─── clip_grad_norm ───────────────────────────────────────────────────────────

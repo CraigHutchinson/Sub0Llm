@@ -1,11 +1,15 @@
 #include "sub0llm/nn/optimizer.hpp"
 
 #include "sub0llm/core/ops.hpp"
+#include "sub0llm/core/thread_pool.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <format>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 #if defined(SUB0LLM_AVX512) || defined(SUB0LLM_AVX2)
@@ -110,8 +114,8 @@ void SGD::zero_grad() {
 // ── Adam ──────────────────────────────────────────────────────────────────────
 
 Adam::Adam(std::vector<autograd::Variable*> params,
-           float lr, float b1, float b2, float eps)
-    : params_(std::move(params)), lr_(lr), b1_(b1), b2_(b2), eps_(eps) {
+           float lr, float b1, float b2, float eps, float weight_decay)
+    : params_(std::move(params)), lr_(lr), b1_(b1), b2_(b2), eps_(eps), wd_(weight_decay) {
     validate_params(params_, "Adam");
     if (b1 < 0.0f || b1 >= 1.0f)
         throw std::runtime_error(std::format(
@@ -148,6 +152,14 @@ void Adam::step() {
         float*       vi = v_[i].data_as<float>().data();
         const std::size_t n = static_cast<std::size_t>(p->data().numel());
         assert(p->grad().numel() == p->data().numel() && "grad shape must match param shape");
+
+        // Decoupled weight decay (AdamW): shrink the weight before the Adam step. wd_==0
+        // (plain Adam) skips this entirely. Kept as a simple scalar pre-pass so the SIMD
+        // Adam update below is unchanged.
+        if (wd_ != 0.0f) {
+            const float keep = 1.0f - lr_ * wd_;
+            for (std::size_t k = 0; k < n; ++k) ps[k] *= keep;
+        }
 
         std::size_t j = 0;
 #if defined(SUB0LLM_AVX512)
@@ -197,6 +209,131 @@ void Adam::step() {
 
 void Adam::zero_grad() {
     for (auto* p : params_) p->zero_grad();
+}
+
+// ── Muon ────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Transpose a 2D float tensor (rows×cols) → (cols×rows).
+Tensor transpose2d(const Tensor& X) {
+    const std::int64_t r = X.shape()[0], c = X.shape()[1];
+    Tensor Y = zeros({c, r}, DType::Float32, X.device());
+    const float* x = X.data_as<float>().data();
+    float*       y = Y.data_as<float>().data();
+    for (std::int64_t i = 0; i < r; ++i)
+        for (std::int64_t j = 0; j < c; ++j)
+            y[j * r + i] = x[i * c + j];
+    return Y;
+}
+
+} // anonymous namespace
+
+// Quintic Newton-Schulz orthogonalisation (Jordan 2024): drives the singular values of G
+// to ≈1, returning O ≈ U·Vᵀ of G's SVD. Frobenius-normalised first so the fixed quintic
+// (a,b,c) coefficients are in their convergence basin; iterated on the SMALLER dimension so
+// the inner products A = X·Xᵀ are min(r,c)² (cheap for tall/wide weight matrices).
+Tensor newton_schulz_orthogonalize(const Tensor& G, int steps) {
+    constexpr float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    const std::int64_t rows = G.shape()[0], cols = G.shape()[1];
+    Tensor X = ops::mul(G, 1.0f / (ops::norm(G) + 1e-7f));
+    const bool transpose = rows > cols;             // work on the smaller dim
+    if (transpose) X = transpose2d(X);
+    for (int s = 0; s < steps; ++s) {
+        Tensor A  = ops::matmul_bt(X, X);           // X·Xᵀ  (m×m, m=min(r,c))
+        Tensor B  = ops::add(ops::mul(A, b), ops::mul(ops::matmul(A, A), c));  // bA + cA²
+        X = ops::add(ops::mul(X, a), ops::matmul(B, X));                       // aX + B·X
+    }
+    if (transpose) X = transpose2d(X);
+    return X;
+}
+
+Muon::Muon(std::vector<autograd::Variable*> params, float lr, float momentum, int ns_steps,
+           bool nesterov, float adamw_lr, float b1, float b2, float eps, float weight_decay,
+           std::vector<char> force_adamw)
+    : params_(std::move(params)), lr_(lr), momentum_(momentum), ns_steps_(ns_steps),
+      nesterov_(nesterov), adamw_lr_(adamw_lr), b1_(b1), b2_(b2), eps_(eps), wd_(weight_decay) {
+    validate_params(params_, "Muon");
+    if (ns_steps < 1) throw std::runtime_error("Muon: ns_steps must be >= 1");
+    for (std::size_t pi = 0; pi < params_.size(); ++pi) {
+        const auto* p = params_[pi];
+        const bool forced = pi < force_adamw.size() && force_adamw[pi] != 0;
+        const bool mat = p->data().shape().size() == 2 && !forced;   // 2D & not forced ⇒ Muon
+        is_matrix_.push_back(mat ? 1 : 0);
+        // Allocate only the state the routing needs; a tiny placeholder for the unused side.
+        mom_.push_back(mat ? zeros(p->data().shape(), p->data().dtype(), p->data().device())
+                           : zeros({1}, DType::Float32, p->data().device()));
+        m_.push_back(mat ? zeros({1}, DType::Float32, p->data().device())
+                         : zeros(p->data().shape(), p->data().dtype(), p->data().device()));
+        v_.push_back(mat ? zeros({1}, DType::Float32, p->data().device())
+                         : zeros(p->data().shape(), p->data().dtype(), p->data().device()));
+    }
+}
+
+void Muon::step() {
+    ++t_;
+    const float bc1 = 1.0f - std::pow(b1_, static_cast<float>(t_));
+    const float bc2 = 1.0f - std::pow(b2_, static_cast<float>(t_));
+    // The Newton-Schulz orthogonalisation does many TINY matmuls (per 2D param, per NS
+    // iteration). Intra-op GEMM threading's fork/join overhead dwarfs that compute (~2 ms
+    // wasted per tiny matmul, ×hundreds/step → ~30× slowdown), so run them serial.
+    const bool prev_intra = intra_op_threading_enabled();
+    intra_op_threading_enabled() = false;
+    struct RestoreIntra {
+        bool v; ~RestoreIntra() { intra_op_threading_enabled() = v; }
+    } restore{prev_intra};
+    for (std::size_t i = 0; i < params_.size(); ++i) {
+        auto* p = params_[i];
+        if (p->grad().numel() == 0) continue;
+        const std::int64_t n = p->data().numel();
+        float*       ps = p->data().data_as<float>().data();
+        const float* gs = p->grad().data_as<float>().data();
+
+        if (is_matrix_[i]) {
+            // Heavy-ball momentum, then orthogonalise (optionally Nesterov-corrected).
+            float* buf = mom_[i].data_as<float>().data();
+            for (std::int64_t j = 0; j < n; ++j) buf[j] = momentum_ * buf[j] + gs[j];
+            Tensor geff = zeros(p->data().shape(), DType::Float32, p->data().device());
+            float* ge = geff.data_as<float>().data();
+            if (nesterov_) for (std::int64_t j = 0; j < n; ++j) ge[j] = gs[j] + momentum_ * buf[j];
+            else           for (std::int64_t j = 0; j < n; ++j) ge[j] = buf[j];
+
+            const Tensor O = newton_schulz_orthogonalize(geff, ns_steps_);
+            const float* o = O.data_as<float>().data();
+            const std::int64_t rows = p->data().shape()[0], cols = p->data().shape()[1];
+            // Aspect-ratio scaling keeps the per-element update magnitude ~Adam-like across
+            // tall/wide matrices (O has unit singular values → RMS ≈ 1/sqrt(max(r,c))).
+            const float scale = lr_ * std::sqrt(std::max(1.0f,
+                                    static_cast<float>(rows) / static_cast<float>(cols)));
+            for (std::int64_t j = 0; j < n; ++j) ps[j] -= scale * o[j];
+        } else {
+            // AdamW fallback for 1D params (norm scales, biases).
+            float* mi = m_[i].data_as<float>().data();
+            float* vi = v_[i].data_as<float>().data();
+            for (std::int64_t j = 0; j < n; ++j) {
+                mi[j] = b1_ * mi[j] + (1.0f - b1_) * gs[j];
+                vi[j] = b2_ * vi[j] + (1.0f - b2_) * gs[j] * gs[j];
+                const float mh = mi[j] / bc1, vh = vi[j] / bc2;
+                ps[j] -= adamw_lr_ * (mh / (std::sqrt(vh) + eps_) + wd_ * ps[j]);
+            }
+        }
+    }
+}
+
+void Muon::zero_grad() {
+    for (auto* p : params_) p->zero_grad();
+}
+
+// ── Factory ─────────────────────────────────────────────────────────────────────
+
+std::unique_ptr<Optimizer> make_optimizer(std::string_view name,
+                                          std::vector<autograd::Variable*> params, float lr) {
+    if (name == "adam")  return std::make_unique<Adam>(std::move(params), lr);
+    if (name == "adamw") return std::make_unique<Adam>(std::move(params), lr, 0.9f, 0.999f,
+                                                       1e-8f, /*weight_decay=*/0.01f);
+    if (name == "muon")  return std::make_unique<Muon>(std::move(params), lr);
+    throw std::runtime_error(std::format(
+        "make_optimizer: unknown optimizer '{}' (expected adam|adamw|muon)", name));
 }
 
 } // namespace sub0llm::nn

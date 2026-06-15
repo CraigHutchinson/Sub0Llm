@@ -98,6 +98,12 @@ namespace sub0llm::autograd {
 // Swap dimensions 0 and 1 of a 2D matrix: (M, N) → (N, M).
 [[nodiscard]] Variable transpose2d(const Variable& x);
 
+// Zero-copy reshape (must preserve numel). The keystone for batched (B,T) work:
+// fold/unfold the batch into the leading dim so row-wise 2D ops run over (B·T, D)
+// while attention reshapes to (B, T, ·) for the batched matmuls. Backward reshapes
+// the upstream gradient back to the input shape (also zero-copy on contiguous data).
+[[nodiscard]] Variable reshape(const Variable& x, Tensor::Shape new_shape);
+
 // Multiply all elements by a scalar constant (no learnable parameter).
 [[nodiscard]] Variable scale(const Variable& x, float alpha);
 

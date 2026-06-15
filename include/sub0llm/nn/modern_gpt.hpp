@@ -124,6 +124,16 @@ public:
     [[nodiscard]] autograd::Variable forward(const autograd::Variable& x,
                                               bool causal = true) const;
 
+    // Batched training forward (Ch29 re-architecture). x: (B·T, embed_dim) — B
+    // independent windows stacked on the leading dim. The linear projections, RoPE,
+    // RMSNorm and softmax run as one (B·T)-row op each; only the score/context
+    // matmuls reshape to (B,T,·) so windows never attend across each other (block-
+    // diagonal by construction). Returns (B·T, embed_dim). causal=false only for now
+    // (the diffusion denoiser is bidirectional); causal batched masking is future work.
+    [[nodiscard]] autograd::Variable forward(const autograd::Variable& x,
+                                              int64_t B, int64_t T,
+                                              bool causal = false) const;
+
     // Inference-only single-token forward with KV cache.
     // x_new: (1, embed_dim). pos: absolute position of this token.
     // Appends K,V to cache[layer_idx] and returns output (1, embed_dim).
@@ -165,6 +175,13 @@ private:
     mutable int64_t        rope_cache_T_  = -1;
     mutable Tensor         rope_cache_cos_;
     mutable Tensor         rope_cache_sin_;
+    // Cached B-tiled RoPE frequencies for the batched path: the (T, Dh/2) table
+    // repeated B times to (B·T, Dh/2) so RoPE applies per-window positions in one
+    // row-wise pass. Recomputed only when (B,T) changes.
+    mutable int64_t        rope_btile_B_  = -1;
+    mutable int64_t        rope_btile_T_  = -1;
+    mutable Tensor         rope_btile_cos_;
+    mutable Tensor         rope_btile_sin_;
     // Cached causal/sliding-window mask — recomputed only when T or window_size changes.
     mutable int64_t        mask_cache_T_  = -1;
     mutable Tensor         mask_cache_;

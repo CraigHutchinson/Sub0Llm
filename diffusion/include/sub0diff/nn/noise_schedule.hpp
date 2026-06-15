@@ -20,6 +20,7 @@
 #include "sub0diff/spec/diffusion_spec.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <span>
@@ -31,8 +32,8 @@ using sub0diff::spec::NoiseSchedule;
 
 // Result of corrupting a clean sequence.
 struct Corruption {
-    std::vector<std::int32_t> tokens;     // the corrupted sequence fed to the denoiser
-    std::vector<std::uint8_t> corrupted;  // 1 where a position was damaged (a loss target)
+    std::vector<std::int32_t> tokens;       // the corrupted sequence fed to the denoiser
+    std::vector<std::uint8_t> corrupted;    // 1 where a position was damaged (a loss target)
     std::uint32_t             n_corrupted = 0U;
 };
 
@@ -51,6 +52,13 @@ struct Corruption {
 //   real_vocab   — number of real tokens; Uniform draws a replacement in [0, real_vocab).
 // Allocation-free when `c` is reused across calls with the same sequence length —
 // a training loop corrupts every step, so pass one Corruption hoisted out of the loop.
+//   exact_count — when true, mask EXACTLY k = round(mask_prob·T) positions (≥1), chosen
+//   uniformly via Knuth's Algorithm S (selection sampling — no buffer, no heap), instead of an
+//   independent Bernoulli per position. This makes the realised noise equal the nominal EXACTLY
+//   (so the model's
+//   noise conditioning is exact, not a random Binomial), removes the Bernoulli COUNT variance
+//   from the gradient, and makes the min-1 floor a clean k≥1 clamp rather than a low-t hack.
+//   The remaining randomness is only WHICH positions — a deterministic, even, unbiased count.
 template<class RNG>
 void corrupt_into(std::span<const std::int32_t> clean,
                   float            mask_prob,
@@ -58,17 +66,21 @@ void corrupt_into(std::span<const std::int32_t> clean,
                   std::int32_t     mask_id,
                   std::int64_t     real_vocab,
                   RNG&             rng,
-                  Corruption&      c) {
+                  Corruption&      c,
+                  bool             exact_count = false) {
     c.tokens.assign(clean.begin(), clean.end());
     c.corrupted.assign(clean.size(), 0);
     c.n_corrupted = 0;
 
-    std::bernoulli_distribution coin(std::clamp(mask_prob, 0.0f, 1.0f));
     std::uniform_int_distribution<std::int32_t> uni(0, static_cast<std::int32_t>(real_vocab) - 1);
 
     // Local helper: apply schedule-specific corruption to a single position.
     // Encapsulates the Absorbing/Uniform conditional so the fallback doesn't duplicate it.
+    // IDEMPOTENT: corrupting an already-corrupted position is a no-op, so n_corrupted always
+    // equals the true number of damaged positions (no double-count can skew the NELBO weight),
+    // robust to any caller that might revisit a position.
     auto corrupt_pos = [&](std::size_t pos) {
+        if (c.corrupted[pos]) return;
         c.corrupted[pos] = 1;
         ++c.n_corrupted;
         if (schedule == NoiseSchedule::Absorbing) {
@@ -80,6 +92,23 @@ void corrupt_into(std::span<const std::int32_t> clean,
         }
     };
 
+    if (exact_count) {
+        const std::int64_t T = static_cast<std::int64_t>(clean.size());
+        std::int64_t k = std::llround(std::clamp(mask_prob, 0.0f, 1.0f) * static_cast<float>(T));
+        k = std::clamp<std::int64_t>(k, 1, T);
+        // Knuth Algorithm S — select EXACTLY k of T positions uniformly with NO buffer/heap:
+        // visit each position once, take it with probability (remaining_k / remaining_n).
+        std::int64_t rem_k = k, rem_n = T;
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        for (std::size_t i = 0; i < clean.size() && rem_k > 0; ++i, --rem_n)
+            if (u(rng) * static_cast<float>(rem_n) < static_cast<float>(rem_k)) {
+                corrupt_pos(i);
+                --rem_k;
+            }
+        return;
+    }
+
+    std::bernoulli_distribution coin(std::clamp(mask_prob, 0.0f, 1.0f));
     for (std::size_t i = 0; i < clean.size(); ++i) {
         if (!coin(rng)) continue;
         corrupt_pos(i);
@@ -90,6 +119,69 @@ void corrupt_into(std::span<const std::int32_t> clean,
     if (c.n_corrupted == 0) {
         std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
         corrupt_pos( pos_dist(rng) );
+    }
+}
+
+// WHOLE-WORD corruption: instead of damaging independent BPE tokens, damage whole words
+// (all subwords of a chosen word together). A word boundary is `pos == 0` or a token that
+// carries the Ġ leading-space marker (is_word_start[token_id] != 0). Masking per-word makes
+// the task honest — the model can no longer "complete" a partially-visible word (`Ham`→`let`)
+// and must predict whole words from context. `mask_prob` is the per-WORD probability; the
+// realised token-level noise is similar in expectation (words are short). Guarantees ≥1
+// masked word. Falls back to per-token corruption if `is_word_start` is empty.
+template<class RNG>
+void corrupt_whole_word_into(std::span<const std::int32_t> clean,
+                             std::span<const std::uint8_t>  is_word_start,
+                             float            mask_prob,
+                             NoiseSchedule    schedule,
+                             std::int32_t     mask_id,
+                             std::int64_t     real_vocab,
+                             RNG&             rng,
+                             Corruption&      c) {
+    if (is_word_start.empty()) {
+        corrupt_into(clean, mask_prob, schedule, mask_id, real_vocab, rng, c);
+        return;
+    }
+    c.tokens.assign(clean.begin(), clean.end());
+    c.corrupted.assign(clean.size(), 0);
+    c.n_corrupted = 0;
+
+    std::bernoulli_distribution coin(std::clamp(mask_prob, 0.0f, 1.0f));
+    std::uniform_int_distribution<std::int32_t> uni(0, static_cast<std::int32_t>(real_vocab) - 1);
+
+    auto damage = [&](std::size_t pos) {
+        if (c.corrupted[pos]) return;   // idempotent — never double-count a position
+        c.corrupted[pos] = 1;
+        ++c.n_corrupted;
+        if (schedule == NoiseSchedule::Absorbing) {
+            c.tokens[pos] = mask_id;
+        } else {
+            std::int32_t r = uni(rng);
+            if (r == clean[pos] && real_vocab > 1) r = (r + 1) % static_cast<std::int32_t>(real_vocab);
+            c.tokens[pos] = r;
+        }
+    };
+    auto starts_word = [&](std::size_t t) {
+        return t == 0 || is_word_start[static_cast<std::size_t>(clean[t])] != 0;
+    };
+
+    // Walk words; decide once per word, apply to all its subwords.
+    for (std::size_t i = 0; i < clean.size();) {
+        const bool mask_this = coin(rng);
+        std::size_t j = i + 1;
+        while (j < clean.size() && !starts_word(j)) ++j;   // [i, j) is one word
+        if (mask_this) for (std::size_t k = i; k < j; ++k) damage(k);
+        i = j;
+    }
+
+    // Guarantee ≥1 masked word (mask the word containing a random position).
+    if (c.n_corrupted == 0 && !clean.empty()) {
+        std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
+        std::size_t p = pos_dist(rng);
+        while (p > 0 && !starts_word(p)) --p;                 // back up to the word start
+        std::size_t q = p + 1;
+        while (q < clean.size() && !starts_word(q)) ++q;      // forward to next start
+        for (std::size_t k = p; k < q; ++k) damage(k);
     }
 }
 

@@ -416,7 +416,7 @@ void save_episodic_state(const EpisodicState& state, const std::string& path)
                 std::format("load_episodic_state: truncated dims for delta {} in '{}'",
                             di, path));
 
-        std::vector<int64_t> shape(n_dims);
+        Tensor::Shape shape(static_cast<std::size_t>(n_dims));
         for (uint32_t i = 0; i < n_dims; ++i) {
             f.read(reinterpret_cast<char*>(&shape[i]), sizeof(int64_t));
             if (!f)

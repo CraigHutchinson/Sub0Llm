@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <vector>
 
 namespace sub0diff::train {
 
@@ -66,15 +67,22 @@ template<class RNG>
                                                  RNG& rng,
                                                  DiffusionLossContext& ctx,
                                                  float t_min = 0.02f,
-                                                 float t_max = 1.0f) {
+                                                 float t_max = 1.0f,
+                                                 std::span<const std::uint8_t> is_word_start = {},
+                                                 bool whole_word = false,
+                                                 bool exact_count = false) {
     namespace ag = sub0llm::autograd;
     const auto T = static_cast<float>(clean.size());
 
     std::uniform_real_distribution<float> t_dist(t_min, t_max);
     const float t = t_dist(rng);
 
-    nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
-                     model.mask_id(), model.real_vocab(), rng, ctx.corruption);
+    if (whole_word)
+        nn::corrupt_whole_word_into(clean, is_word_start, t, spec::NoiseSchedule::Absorbing,
+                                    model.mask_id(), model.real_vocab(), rng, ctx.corruption);
+    else
+        nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
+                         model.mask_id(), model.real_vocab(), rng, ctx.corruption, exact_count);
     const auto& corr = ctx.corruption;
 
     std::ranges::copy(corr.tokens, ctx.ids_input.data_as<std::int32_t>().begin());
@@ -89,6 +97,94 @@ template<class RNG>
     // mean-over-masked → NELBO term: scale by n_masked / (t·T).
     const float nelbo_w = static_cast<float>(corr.n_corrupted) / (t * T);
     return {ag::scale(mean_ce, nelbo_w), t, corr.n_corrupted};
+}
+
+// ── Batched objective (Ch29 re-architecture) ──────────────────────────────────
+// One forward+backward over B windows stacked as (B·T) rows — the keystone that
+// turns tiny per-window passes into big GEMMs and amortizes the autograd/allocation
+// overhead by ~B×. The loss is the MEAN per-window NELBO (same estimator the data-
+// parallel trainer averaged across W replicas), so convergence semantics match.
+struct BatchedDiffusionLossContext {
+    std::int64_t                 B, T;
+    sub0llm::Tensor              ids_input;    // (B·T,) int32 — the corrupted batch
+    std::vector<nn::Corruption>  corr;         // per-window corruption (reused buffers)
+    std::vector<float>           noise;        // per-window actual noise fraction (size B)
+
+    BatchedDiffusionLossContext(std::int64_t B_, std::int64_t T_)
+        : B(B_), T(T_),
+          ids_input({B_ * T_}, sub0llm::DType::Int32),
+          corr(static_cast<std::size_t>(B_)),
+          noise(static_cast<std::size_t>(B_)) {}
+};
+
+struct BatchedDiffusionLossResult {
+    sub0llm::autograd::Variable loss;            // scalar — mean per-window NELBO
+    std::uint64_t               n_masked = 0;    // summed over the batch
+    float                       mean_t   = 0.0f; // mean sampled noise level
+};
+
+// Corrupt B windows (one per offset), run a single batched forward, and reduce to
+// the mean per-window NELBO. offsets.size() must equal ctx.B.
+template<class RNG>
+[[nodiscard]] BatchedDiffusionLossResult
+batched_diffusion_loss(const nn::Denoiser& model,
+                       std::span<const std::int32_t> stream,
+                       std::span<const std::size_t> offsets,
+                       RNG& rng, BatchedDiffusionLossContext& ctx,
+                       float t_min = 0.02f, float t_max = 1.0f) {
+    namespace ag = sub0llm::autograd;
+    const std::int64_t B = ctx.B, T = ctx.T;
+    auto idd = ctx.ids_input.data_as<std::int32_t>();
+    std::uniform_real_distribution<float> t_dist(t_min, t_max);
+
+    std::vector<float>         ts(static_cast<std::size_t>(B));
+    std::vector<std::uint32_t> nm(static_cast<std::size_t>(B));
+    std::uint64_t total_masked = 0;
+    double        t_accum = 0.0;
+
+    for (std::int64_t b = 0; b < B; ++b) {
+        auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)],
+                                    static_cast<std::size_t>(T));
+        const float t = t_dist(rng);
+        nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
+                         model.mask_id(), model.real_vocab(), rng,
+                         ctx.corr[static_cast<std::size_t>(b)]);
+        const auto& c = ctx.corr[static_cast<std::size_t>(b)];
+        std::copy_n(c.tokens.begin(), T, idd.begin() + b * T);
+        ts[static_cast<std::size_t>(b)] = t;
+        nm[static_cast<std::size_t>(b)] = c.n_corrupted;
+        ctx.noise[static_cast<std::size_t>(b)] = static_cast<float>(c.n_corrupted) / static_cast<float>(T);
+        total_masked += c.n_corrupted;
+        t_accum      += t;
+    }
+
+    ag::Variable logits = model.forward(ctx.ids_input,
+                                        std::span<const float>(ctx.noise), B, T);  // (B·T, Vm)
+
+    // Per-window weighted CE on the shared logits graph (cheap: B small ops, one
+    // big forward/backward). loss = (1/B) Σ_b NELBO_b, NELBO_b = mean_ce_b·n_b/(t_b·T).
+    ag::Variable loss;
+    for (std::int64_t b = 0; b < B; ++b) {
+        const auto& c = ctx.corr[static_cast<std::size_t>(b)];
+        auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)],
+                                    static_cast<std::size_t>(T));
+        sub0llm::Tensor tb({T}, sub0llm::DType::Int32);
+        sub0llm::Tensor wb({T}, sub0llm::DType::Float32);
+        auto tbd = tb.data_as<std::int32_t>();
+        auto wbd = wb.data_as<float>();
+        for (std::int64_t i = 0; i < T; ++i) {
+            tbd[static_cast<std::size_t>(i)] = clean[static_cast<std::size_t>(i)];
+            wbd[static_cast<std::size_t>(i)] = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+        }
+        ag::Variable logits_b = ag::narrow(logits, b * T, T);                   // (T, Vm)
+        ag::Variable mean_ce  = ag::weighted_cross_entropy(logits_b, tb, wb);
+        const float  w        = static_cast<float>(nm[static_cast<std::size_t>(b)]) /
+                                (ts[static_cast<std::size_t>(b)] * static_cast<float>(T));
+        ag::Variable nelbo_b  = ag::scale(mean_ce, w);
+        loss = (b == 0) ? nelbo_b : ag::add(loss, nelbo_b);
+    }
+    loss = ag::scale(loss, 1.0f / static_cast<float>(B));
+    return {loss, total_masked, static_cast<float>(t_accum / static_cast<double>(B))};
 }
 
 } // namespace sub0diff::train
