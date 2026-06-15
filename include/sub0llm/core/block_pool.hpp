@@ -41,14 +41,20 @@ public:
         const int idx = bucket_for(bytes);
         if (idx < 0) { ::operator delete(p); return; }
         auto& bkt = buckets_[static_cast<std::size_t>(idx)];
-        if (bkt.size() < kMaxCached) bkt.push_back(p);
-        else                         ::operator delete(p);
+        if (bkt.size() < max_cached(idx)) bkt.push_back(p);
+        else                              ::operator delete(p);
     }
 
 private:
     static constexpr std::size_t kMin       = 16;     // smallest size class
     static constexpr int         kNumBuckets = 12;    // 16 B … 32 KB
-    static constexpr std::size_t kMaxCached = 256;    // per class (graph has many nodes/step)
+    // Size-aware cap (~8 MB cached bytes/class) so the small classes hold a whole step's live
+    // graph (hundreds–thousands of Nodes/Storages) while bounding total cached memory.
+    static constexpr std::size_t kCacheBytes = 8u << 20;
+    static std::size_t max_cached(int idx) noexcept {
+        const std::size_t cap = kCacheBytes / bucket_size(idx);
+        return cap < 8 ? 8 : (cap > 16384 ? 16384 : cap);
+    }
 
     std::array<std::vector<void*>, kNumBuckets> buckets_;
 

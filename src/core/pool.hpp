@@ -123,14 +123,21 @@ private:
     static constexpr std::size_t kAlign      = 64;    // cache line = SIMD granule
     static constexpr std::size_t kMinBytes   = 128;   // below this → bypass
     static constexpr int         kNumBuckets = 20;    // 128 B … 64 MB
-    static constexpr std::size_t kMaxCached  = 16;    // per bucket
+    // Per-bucket cache cap is SIZE-AWARE: cap the cached BYTES per class (~16 MB) so small
+    // classes cache the many live activation buffers a step holds at once, while big classes
+    // (up to 64 MB) cache only a few — bounding total cached memory (~512 MB worst case).
+    static constexpr std::size_t kCacheBytes = 16u << 20;
+    static std::size_t max_cached(int idx) noexcept {
+        const std::size_t cap = kCacheBytes / bucket_size(idx);
+        return cap < 4 ? 4 : (cap > 16384 ? 16384 : cap);
+    }
 
     std::array<std::vector<std::byte*>, kNumBuckets> buckets_;
 
     void reclaim(std::byte* ptr, int idx) noexcept {
         auto& bkt = buckets_[static_cast<std::size_t>(idx)];
-        if (bkt.size() < kMaxCached) bkt.push_back(ptr);
-        else                          detail::aligned_free(ptr);
+        if (bkt.size() < max_cached(idx)) bkt.push_back(ptr);
+        else                              detail::aligned_free(ptr);
     }
 
     // Bucket index whose size covers `bytes` bytes, or -1 if out of range.
