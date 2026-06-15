@@ -302,3 +302,40 @@ TEST_CASE("Denoiser batched backward equals summed per-window gradients", "[diff
             REQUIRE_THAT(gb[i], WithinAbs(gs[i], 2e-4f));
     }
 }
+
+// (B,W) invariance: with deterministic per-window seeding (seed_base), a window's corruption is a
+// pure function of its GLOBAL index, NOT how the batch was split across workers. This is what lets
+// the unified trainer produce the same gradient at any worker count W for a fixed effective batch B
+// — √B consistency decoupled from cores. Tested at the data level (no FP/threading nondeterminism).
+TEST_CASE("batched_diffusion_loss - window corruption invariant to batch split (B,W invariance)",
+          "[diffusion][batched]") {
+    const std::int64_t V = 16, D = 32, T = 8;
+    dn::Denoiser model(V, D, /*n_heads=*/2, /*n_kv_heads=*/2, /*n_layers=*/2, /*d_ff=*/64, 7);
+    const auto stream = ramp_tokens(64, V);
+    std::span<const std::int32_t> s(stream);
+    const std::uint64_t S = 0xDEADBEEF12345ull;
+    std::mt19937 rng(1);   // only the (deterministic, band-collapsed) shared-t draw touches this
+
+    // Call A: one worker owns all 4 windows (W=1), global indices 0..3.
+    std::vector<std::size_t> off4{0, 9, 18, 27};
+    dt::BatchedDiffusionLossContext ctxA(4, T);
+    (void)dt::batched_diffusion_loss(model, s, std::span<const std::size_t>(off4), rng, ctxA,
+                                     0.5f, 0.5f, /*shared_t=*/true, /*exact_count=*/true,
+                                     {}, /*whole_word=*/false, S, /*index0=*/0);
+
+    // Call B: a second worker owns the tail 2 windows (global indices 2,3) — index0=2.
+    std::vector<std::size_t> off2{18, 27};
+    dt::BatchedDiffusionLossContext ctxB(2, T);
+    (void)dt::batched_diffusion_loss(model, s, std::span<const std::size_t>(off2), rng, ctxB,
+                                     0.5f, 0.5f, true, true, {}, false, S, /*index0=*/2);
+
+    // Global window 2 == ctxA.corr[2] == ctxB.corr[0]; window 3 == ctxA.corr[3] == ctxB.corr[1].
+    for (int j = 0; j < 2; ++j) {
+        REQUIRE(ctxA.corr[static_cast<std::size_t>(2 + j)].n_corrupted
+                    == ctxB.corr[static_cast<std::size_t>(j)].n_corrupted);
+        REQUIRE(ctxA.corr[static_cast<std::size_t>(2 + j)].corrupted
+                    == ctxB.corr[static_cast<std::size_t>(j)].corrupted);
+        REQUIRE(ctxA.corr[static_cast<std::size_t>(2 + j)].tokens
+                    == ctxB.corr[static_cast<std::size_t>(j)].tokens);
+    }
+}

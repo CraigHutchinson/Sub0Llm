@@ -127,6 +127,14 @@ struct BatchedDiffusionLossResult {
     float                       mean_t   = 0.0f; // mean sampled noise level
 };
 
+// Fast integer hash for per-window deterministic seeding (Steele/Vigna splitmix64).
+[[nodiscard]] inline std::uint64_t splitmix64(std::uint64_t x) noexcept {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
 // Corrupt B windows (one per offset), run a single batched forward, and reduce to
 // the mean per-window NELBO. offsets.size() must equal ctx.B.
 //
@@ -143,11 +151,17 @@ batched_diffusion_loss(const nn::Denoiser& model,
                        std::span<const std::size_t> offsets,
                        RNG& rng, BatchedDiffusionLossContext& ctx,
                        float t_min = 0.02f, float t_max = 1.0f,
-                       bool shared_t = false, bool exact_count = false) {
+                       bool shared_t = false, bool exact_count = false,
+                       std::span<const std::uint8_t> is_word_start = {},
+                       bool whole_word = false,
+                       std::uint64_t seed_base = 0, std::int64_t index0 = 0) {
     namespace ag = sub0llm::autograd;
     const std::int64_t B = ctx.B, T = ctx.T;
     auto idd = ctx.ids_input.data_as<std::int32_t>();
     std::uniform_real_distribution<float> t_dist(t_min, t_max);
+    // Per-window DETERMINISTIC seeding (seed_base != 0): window's corruption + (independent) t are a
+    // pure function of its GLOBAL index, not which worker ran it — so the master gradient is bitwise
+    // identical for any worker count W at fixed B. seed_base == 0 ⇒ legacy: draw from the shared rng.
     const float shared = shared_t ? t_dist(rng) : 0.0f;   // one level for the whole batch
 
     std::vector<float>         ts(static_cast<std::size_t>(B));
@@ -158,10 +172,21 @@ batched_diffusion_loss(const nn::Denoiser& model,
     for (std::int64_t b = 0; b < B; ++b) {
         auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)],
                                     static_cast<std::size_t>(T));
-        const float t = shared_t ? shared : t_dist(rng);
-        nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
-                         model.mask_id(), model.real_vocab(), rng,
-                         ctx.corr[static_cast<std::size_t>(b)], exact_count);
+        // Window-local generator: deterministic from the global index when seed_base is set,
+        // else freshly drawn from the shared rng (legacy callers). shared-t makes t identical
+        // across workers (band collapsed to ts by the caller), so only mask POSITIONS vary here.
+        std::mt19937 wrng(static_cast<std::uint32_t>(
+            seed_base ? splitmix64(seed_base + static_cast<std::uint64_t>(index0 + b))
+                      : static_cast<std::uint64_t>(rng())));
+        const float t = shared_t ? shared : t_dist(wrng);
+        if (whole_word)
+            nn::corrupt_whole_word_into(clean, is_word_start, t, spec::NoiseSchedule::Absorbing,
+                                        model.mask_id(), model.real_vocab(), wrng,
+                                        ctx.corr[static_cast<std::size_t>(b)]);
+        else
+            nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
+                             model.mask_id(), model.real_vocab(), wrng,
+                             ctx.corr[static_cast<std::size_t>(b)], exact_count);
         const auto& c = ctx.corr[static_cast<std::size_t>(b)];
         std::copy_n(c.tokens.begin(), T, idd.begin() + b * T);
         ts[static_cast<std::size_t>(b)] = t;
@@ -179,7 +204,7 @@ batched_diffusion_loss(const nn::Denoiser& model,
     // identical, and (1/B)Σ_b mean_ce_b = mean over ALL masked positions. The whole reduction
     // collapses to ONE weighted_cross_entropy over the (B·T) batch × a single scalar — no B
     // serial CE ops, no per-window narrow/alloc. Exact, not an approximation.
-    if (shared_t && exact_count) {
+    if (shared_t && exact_count && !whole_word) {
         auto cl = ctx.ids_clean.data_as<std::int32_t>();
         auto wt = ctx.weights.data_as<float>();
         for (std::int64_t b = 0; b < B; ++b) {

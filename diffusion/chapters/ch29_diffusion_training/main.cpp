@@ -558,6 +558,11 @@ static int run(int argc, char** argv) {
         const int base = pc > 0 ? pc : topo.n_logical / 2;
         cfg.threads = std::max<std::size_t>(1, static_cast<std::size_t>((base + 1) / 2));
     }
+    // Effective batch B (windows averaged per step → gradient consistency ∝ √B) is INDEPENDENT of
+    // the worker count W (--threads, parallelism). Default B = W (the historical per-worker pool).
+    // --batch B>1 raises consistency on any W; round up to a multiple of W (workers split B/W each).
+    if (cfg.batch <= 1) cfg.batch = std::max<std::size_t>(1, cfg.threads);
+    else cfg.batch = ((cfg.batch + cfg.threads - 1) / cfg.threads) * cfg.threads;
     const double mean_t = 0.5 * (0.02 + cfg.t_max);
     const dt::ScheduleConfig sc{.eval_factor = cfg.eval_factor};
     const auto sched = dt::make_schedule(
@@ -570,11 +575,9 @@ static int run(int argc, char** argv) {
     cfg.recall_windows                   = sched.recall_windows;
     const std::size_t eval_nelbo_windows = sched.eval_nelbo_windows;
     // Early-stopping floor: min_epochs full passes (in STEPS) before a stop may fire. A step trains
-    // windows_per_step windows (batched→batch, else data-parallel→threads), so divide to get steps.
-    const std::size_t eff_windows_per_step =
-        cfg.batch > 1 ? cfg.batch : std::max<std::size_t>(1, cfg.threads);
+    // B = cfg.batch windows (over W workers), so divide epoch windows by B to get steps.
     const std::uint64_t min_stop_steps =
-        cfg.min_epochs * sched.epoch_windows / eff_windows_per_step;
+        cfg.min_epochs * sched.epoch_windows / std::max<std::size_t>(1, cfg.batch);
 
     if (cfg.eval_factor < sc.min_coverage)
         std::println("note: --eval-factor {:.2f} clamped up to the {:.0f}% epoch-coverage floor "
@@ -797,21 +800,10 @@ static int run(int argc, char** argv) {
             std::println("lr: constant {:.1e} (no warmup; --warmup-steps N to enable)", cfg.lr);
         }
         std::mt19937 rng(1234 + static_cast<std::uint32_t>(start_step));
-        dt::DiffusionLossContext ctx(cfg.seq_len);
-        // Single-thread batched path (--batch B>1): B windows in one (B·T)-row forward/backward.
-        std::optional<dt::BatchedDiffusionLossContext> bctx;
-        if (cfg.batch > 1) {
-            if (cfg.whole_word)
-                throw std::runtime_error("--batch is incompatible with --whole-word "
-                                         "(batched path masks per-token only)");
-            bctx.emplace(static_cast<std::int64_t>(cfg.batch), cfg.seq_len);
-            std::println("batched single-thread path: B={} windows/step, shared-t {}, exact-noise {}"
-                         " (within-level consistency ∝ √B)",
-                         cfg.batch, cfg.shared_t ? "on" : "off", cfg.exact_noise ? "on" : "off");
-        }
-        std::vector<std::size_t> batch_offsets(cfg.batch);
-        // windows trained per step: pool→threads, batched→batch, serial→1 (threads==1 there).
-        const std::size_t windows_per_step = bctx ? cfg.batch : cfg.threads;
+        // Effective batch B windows/step (gradient consistency ∝ √B), split across W=threads
+        // workers (B/W each). The master gradient is the mean over all B windows, identical for
+        // any W — so single-thread (W=1) trains the SAME approach, just slower.
+        const std::size_t windows_per_step = cfg.batch;
 
         // Random window offset per step — uniform over all sliding positions, the
         // same distribution the eval sweep measures.
@@ -830,17 +822,21 @@ static int run(int argc, char** argv) {
         double p_fwd = 0.0, p_bwd = 0.0, p_opt = 0.0;
         const auto tick = [] { return std::chrono::steady_clock::now(); };
 
-        // Data-parallel workers (threads > 1): each step trains `threads` windows,
-        // one per replica, and the master sees the MEAN gradient (see parallel.hpp).
-        std::unique_ptr<dt::ParallelTrainer> pool;
-        if (cfg.threads > 1 && cfg.batch <= 1)
-            pool = std::make_unique<dt::ParallelTrainer>(
-                cfg.threads,
-                dt::ParallelTrainer::Arch{V, cfg.embed_dim, cfg.n_layers, cfg.d_ff,
-                                          cfg.seq_len, cfg.n_heads, cfg.n_kv_heads},
-                param_ptrs, 0.02f, cfg.t_max, 1234 + start_step,
-                /*share_weights=*/true, ws_span, cfg.whole_word, worker_pins, cfg.exact_noise);
-        std::vector<std::size_t> offsets(cfg.threads);
+        // Unified trainer: W=cfg.threads workers cooperatively process B=cfg.batch windows/step
+        // (B/W each), master sees the MEAN gradient over all B. ALWAYS used (W=1 is a pool of one),
+        // so single- and multi-threaded training run the identical fundamental step.
+        auto pool = std::make_unique<dt::ParallelTrainer>(
+            cfg.threads,
+            dt::ParallelTrainer::Arch{V, cfg.embed_dim, cfg.n_layers, cfg.d_ff,
+                                      cfg.seq_len, cfg.n_heads, cfg.n_kv_heads},
+            param_ptrs, 0.02f, cfg.t_max, 1234 + start_step,
+            /*share_weights=*/true, ws_span, cfg.whole_word, worker_pins, cfg.exact_noise,
+            static_cast<std::int64_t>(cfg.batch), cfg.shared_t);
+        std::println("trainer: B={} windows/step over W={} worker{} (consistency ∝ √B), "
+                     "shared-t {}, exact-noise {}",
+                     cfg.batch, cfg.threads, cfg.threads == 1 ? "" : "s",
+                     cfg.shared_t ? "on" : "off", cfg.exact_noise ? "on" : "off");
+        std::vector<std::size_t> offsets(cfg.batch);
 
         // Frontier-point curriculum (opt-in): train AT a noise ceiling that rises only
         // once mastered. The floor stays at 0.02; frontier-point trains exactly at the
@@ -867,48 +863,15 @@ static int run(int argc, char** argv) {
             // regime, which made the uniform-noise eval climb and early-stop prematurely.
             const float t_lo = (curr && !curr->converged()) ? curr->frontier() : 0.02f;
             const float t_hi = curr ? curr->frontier() : cfg.t_max;
-            if (pool) {
-                if (cfg.shared_t) {
-                    // Variance reduction: one t for ALL workers this step → the W-window
-                    // average sharpens the per-t gradient instead of diluting across levels.
-                    std::uniform_real_distribution<float> td(0.02f, cfg.t_max);
-                    const float ts = td(rng);
-                    pool->set_t_range(ts, ts);
-                } else if (curr) {
-                    pool->set_t_range(t_lo, t_hi);
-                }
-                for (auto& o : offsets) o = off_dist(rng);
-                auto res = pool->step(train_span, offsets);
-                last_loss = res.mean_loss;
-                last_t    = res.last_t;
-                step_masked = res.masked_tokens;
-                pt2 = pt1 = tick();   // fwd+bwd fused inside the pool
-            } else if (bctx) {
-                // Single-thread batched: B windows, shared-t (default) → consistency ∝ √B.
-                for (auto& o : batch_offsets) o = off_dist(rng);
-                auto res = dt::batched_diffusion_loss(model, train_span, batch_offsets, rng,
-                                                      *bctx, t_lo, t_hi, cfg.shared_t,
-                                                      cfg.exact_noise);
-                pt1 = tick();
-                opt->zero_grad();
-                res.loss.backward();
-                pt2 = tick();
-                last_loss   = res.loss.data().item<float>();
-                last_t      = res.mean_t;
-                step_masked = res.n_masked;
-            } else {
-                const auto window = train_span.subspan(off_dist(rng),
-                                                       static_cast<std::size_t>(cfg.seq_len));
-                auto res = dt::diffusion_loss(model, window, rng, ctx, t_lo, t_hi,
-                                              ws_span, cfg.whole_word, cfg.exact_noise);
-                pt1 = tick();
-                opt->zero_grad();
-                res.loss.backward();
-                pt2 = tick();
-                last_loss = res.loss.data().item<float>();
-                last_t    = res.t;
-                step_masked = res.n_masked;
-            }
+            // Set the noise band the trainer samples from (curriculum ceiling, or the formal band).
+            // shared-t sampling (one t for all B windows) happens inside pool->step() from this band.
+            pool->set_t_range(t_lo, t_hi);
+            for (auto& o : offsets) o = off_dist(rng);
+            auto res = pool->step(train_span, offsets);
+            last_loss   = res.mean_loss;
+            last_t      = res.last_t;
+            step_masked = res.masked_tokens;
+            pt2 = pt1 = tick();   // fwd+bwd fused inside the pool
             // Token-gated mastery feedback: actual mask fraction ≈ the frontier.
             if (curr) curr->observe(last_t, last_loss, step_masked);
             (void)nn::clip_grad_norm(param_ptrs, 5.0f);

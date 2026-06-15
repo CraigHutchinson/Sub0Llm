@@ -72,11 +72,22 @@ public:
                     std::span<const std::uint8_t> is_word_start = {},
                     bool whole_word = false,
                     std::vector<int> pin_override = {},
-                    bool exact_count = false)
+                    bool exact_count = false,
+                    std::int64_t batch = 0,      // total windows/step B (0 ⇒ = n_workers)
+                    bool shared_t = false)
         : master_(std::move(master_params)),
           t_min_(t_min), t_max_(t_max), share_weights_(share_weights),
           is_word_start_(is_word_start), whole_word_(whole_word), exact_count_(exact_count),
+          shared_t_(shared_t),
+          per_worker_(batch <= 0 ? 1 : batch / static_cast<std::int64_t>(n_workers)),
+          batch_(per_worker_ * static_cast<std::int64_t>(n_workers)),
+          master_rng_(static_cast<std::uint32_t>(seed ^ 0x9E3779B9u)),
+          seed_(seed),
           barrier_(static_cast<std::ptrdiff_t>(n_workers + 1)) {
+        // Decouple consistency (B = batch windows/step → gradient quality ∝ √B) from parallelism
+        // (W = n_workers → throughput). Each worker computes a B/W-window batched mini-gradient;
+        // the reduce averages over workers, so the master gradient is the mean over all B windows
+        // and is IDENTICAL for any W (only wall-time changes). W=1 is just a pool of one.
         // Master grads must exist before workers assign into them.
         for (auto* p : master_)
             if (p->grad().numel() == 0)
@@ -92,7 +103,8 @@ public:
 
         workers_.reserve(n_workers);
         for (std::size_t w = 0; w < n_workers; ++w) {
-            auto& wk = *workers_.emplace_back(std::make_unique<Worker>(arch, seed + 1000 * (w + 1)));
+            auto& wk = *workers_.emplace_back(
+                std::make_unique<Worker>(arch, seed + 1000 * (w + 1), per_worker_));
             // Alias each replica's weight DATA onto the master's storage (shallow
             // Tensor copy shares the underlying buffer): one L3-resident weight copy,
             // no per-step SYNC, and the worker's own randomly-initialised weight
@@ -103,9 +115,10 @@ public:
             const int pin = pins[w];
             wk.thread = std::thread([this, &wk, w, n_workers, pin] {
                 sub0llm::pin_current_thread(pin);
-                // This replica IS the parallel unit — keep its matmuls serial so we
-                // don't oversubscribe (W workers × an 8-way GEMM each).
-                sub0llm::intra_op_threading_enabled() = false;
+                // W>1: each replica IS the parallel unit — keep its matmuls serial so we don't
+                // oversubscribe (W workers × an 8-way GEMM each). W==1: the lone worker fans its
+                // (B·T)-row GEMMs across all cores (no other worker to contend with).
+                sub0llm::intra_op_threading_enabled() = (n_workers == 1);
                 worker_loop(wk, w, n_workers);
             });
         }
@@ -129,13 +142,28 @@ public:
         t_max_.store(t_max, std::memory_order_relaxed);
     }
 
-    // Run one accumulated step: window w = stream[offsets[w] .. +seq_len).
-    // offsets.size() must equal n_workers(). Master grads hold the MEAN gradient
-    // on return; caller clips and steps its optimizer.
+    [[nodiscard]] std::int64_t batch() const noexcept { return batch_; }
+
+    // Run one accumulated step over B = batch() windows: offsets.size() must equal batch().
+    // Worker w processes offsets[w·B/W .. (w+1)·B/W). Master grads hold the MEAN gradient over
+    // all B windows on return (IDENTICAL for any W); caller clips and steps its optimizer.
     StepResult step(std::span<const std::int32_t> stream,
                     std::span<const std::size_t> offsets) {
         stream_  = stream;
         offsets_ = offsets;
+        // shared-t: ONE noise level for the whole step (all B windows) → within-level consistency
+        // ∝ √B. Sampled once on the master from the current band; workers read it. Independent-t
+        // (shared_t_=false) lets each window draw its own t (the diluted baseline).
+        if (shared_t_) {
+            std::uniform_real_distribution<float> td(t_min_.load(std::memory_order_relaxed),
+                                                     t_max_.load(std::memory_order_relaxed));
+            shared_ts_.store(td(master_rng_), std::memory_order_relaxed);
+        }
+        // Per-window seed base for THIS step — workers hash (this | global window index) so the
+        // masking is a pure function of (step, window), identical for any worker count W.
+        step_seed_.store(splitmix64(seed_ + 0xA5A5A5A5ull + step_count_) | 1ull,
+                         std::memory_order_relaxed);
+        ++step_count_;
         const auto t0 = std::chrono::steady_clock::now();
         barrier_.arrive_and_wait();          // → SYNC + COMPUTE
         barrier_.arrive_and_wait();          // compute done → REDUCE
@@ -159,23 +187,23 @@ private:
     struct Worker {
         nn::Denoiser                              model;
         std::vector<sub0llm::autograd::Variable*> params;
-        DiffusionLossContext                      ctx;
+        BatchedDiffusionLossContext               bctx;   // this worker's B/W-window mini-batch
         std::mt19937                              rng;
         std::thread                               thread;
         float         loss = 0.0f, t = 0.0f;
         std::uint32_t masked = 0;
 
-        Worker(const Arch& a, std::uint64_t seed)
+        Worker(const Arch& a, std::uint64_t seed, std::int64_t per_worker)
             : model(a.vocab_size, a.embed_dim, a.n_heads, a.n_kv_heads,
                     a.n_layers, a.d_ff, /*seed=*/42),   // arch identical to master
-              ctx(a.seq_len),
+              bctx(per_worker, a.seq_len),
               rng(static_cast<std::uint32_t>(seed)) {
             params = model.parameters();
         }
     };
 
     void worker_loop(Worker& wk, std::size_t wid, std::size_t n_workers) {
-        const std::int64_t T = wk.ctx.ids_input.numel();
+        const std::int64_t per = per_worker_;          // windows this worker owns
         for (;;) {
             barrier_.arrive_and_wait();      // wait for step() (or shutdown)
             if (stop_.load(std::memory_order_acquire)) {
@@ -198,16 +226,24 @@ private:
                                 static_cast<std::size_t>(g.numel()) * sizeof(float));
             }
 
-            // COMPUTE: this worker's window, forward + backward (reads shared weights).
-            const auto window = stream_.subspan(offsets_[wid], static_cast<std::size_t>(T));
-            auto res = diffusion_loss(wk.model, window, wk.rng, wk.ctx,
-                                      t_min_.load(std::memory_order_relaxed),
-                                      t_max_.load(std::memory_order_relaxed),
-                                      is_word_start_, whole_word_, exact_count_);
+            // COMPUTE: this worker's B/W-window mini-batch, one batched forward + backward
+            // (reads shared weights). For shared-t the band collapses to the master's single ts so
+            // all windows (across all workers) mask at the same level → global √B consistency.
+            auto my_offsets = offsets_.subspan(static_cast<std::size_t>(wid) * static_cast<std::size_t>(per),
+                                               static_cast<std::size_t>(per));
+            const float lo = shared_t_ ? shared_ts_.load(std::memory_order_relaxed)
+                                       : t_min_.load(std::memory_order_relaxed);
+            const float hi = shared_t_ ? shared_ts_.load(std::memory_order_relaxed)
+                                       : t_max_.load(std::memory_order_relaxed);
+            auto res = batched_diffusion_loss(wk.model, stream_, my_offsets, wk.rng, wk.bctx,
+                                              lo, hi, shared_t_, exact_count_,
+                                              is_word_start_, whole_word_,
+                                              step_seed_.load(std::memory_order_relaxed),
+                                              static_cast<std::int64_t>(wid) * per);
             res.loss.backward();
             wk.loss   = res.loss.data().item<float>();
-            wk.t      = res.t;
-            wk.masked = res.n_masked;
+            wk.t      = res.mean_t;
+            wk.masked = static_cast<std::uint32_t>(res.n_masked);
 
             barrier_.arrive_and_wait();      // all replicas done → REDUCE
 
@@ -239,6 +275,14 @@ private:
     std::span<const std::uint8_t>              is_word_start_;   // read-only, owned by caller
     bool                                       whole_word_ = false;
     bool                                       exact_count_ = false;
+    bool                                       shared_t_ = false;
+    std::int64_t                               per_worker_ = 1;  // windows/worker = B/W
+    std::int64_t                               batch_ = 0;       // total windows/step B = per·W
+    std::atomic<float>                         shared_ts_{0.0f}; // the step's shared noise level
+    std::mt19937                               master_rng_;      // shared-t sampling (master only)
+    std::uint64_t                              seed_ = 0;        // base seed for per-window hashing
+    std::uint64_t                              step_count_ = 0;  // master-only step counter
+    std::atomic<std::uint64_t>                 step_seed_{1};    // this step's per-window seed base
     std::atomic<bool>                          stop_{false};
     std::barrier<>                             barrier_;
 };
