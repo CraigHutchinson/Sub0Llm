@@ -107,12 +107,16 @@ template<class RNG>
 struct BatchedDiffusionLossContext {
     std::int64_t                 B, T;
     sub0llm::Tensor              ids_input;    // (B·T,) int32 — the corrupted batch
+    sub0llm::Tensor              ids_clean;    // (B·T,) int32 — clean targets (fast path)
+    sub0llm::Tensor              weights;      // (B·T,) f32  — masked-position flags (fast path)
     std::vector<nn::Corruption>  corr;         // per-window corruption (reused buffers)
     std::vector<float>           noise;        // per-window actual noise fraction (size B)
 
     BatchedDiffusionLossContext(std::int64_t B_, std::int64_t T_)
         : B(B_), T(T_),
           ids_input({B_ * T_}, sub0llm::DType::Int32),
+          ids_clean({B_ * T_}, sub0llm::DType::Int32),
+          weights({B_ * T_}, sub0llm::DType::Float32),
           corr(static_cast<std::size_t>(B_)),
           noise(static_cast<std::size_t>(B_)) {}
 };
@@ -170,8 +174,29 @@ batched_diffusion_loss(const nn::Denoiser& model,
     ag::Variable logits = model.forward(ctx.ids_input,
                                         std::span<const float>(ctx.noise), B, T);  // (B·T, Vm)
 
-    // Per-window weighted CE on the shared logits graph (cheap: B small ops, one
-    // big forward/backward). loss = (1/B) Σ_b NELBO_b, NELBO_b = mean_ce_b·n_b/(t_b·T).
+    // FAST PATH (shared_t + exact_count, the --batch default): every window masks EXACTLY the
+    // same count n=round(t·T) at the SAME t, so the per-window NELBO weight n_b/(t_b·T) is
+    // identical, and (1/B)Σ_b mean_ce_b = mean over ALL masked positions. The whole reduction
+    // collapses to ONE weighted_cross_entropy over the (B·T) batch × a single scalar — no B
+    // serial CE ops, no per-window narrow/alloc. Exact, not an approximation.
+    if (shared_t && exact_count) {
+        auto cl = ctx.ids_clean.data_as<std::int32_t>();
+        auto wt = ctx.weights.data_as<float>();
+        for (std::int64_t b = 0; b < B; ++b) {
+            auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)], static_cast<std::size_t>(T));
+            const auto& c = ctx.corr[static_cast<std::size_t>(b)];
+            for (std::int64_t i = 0; i < T; ++i) {
+                cl[static_cast<std::size_t>(b * T + i)] = clean[static_cast<std::size_t>(i)];
+                wt[static_cast<std::size_t>(b * T + i)] = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+            }
+        }
+        ag::Variable mean_ce = ag::weighted_cross_entropy(logits, ctx.ids_clean, ctx.weights);
+        const float w = static_cast<float>(nm[0]) / (ts[0] * static_cast<float>(T));
+        return {ag::scale(mean_ce, w), total_masked, static_cast<float>(t_accum / static_cast<double>(B))};
+    }
+
+    // General path (independent t and/or Bernoulli count): per-window weighted CE on the shared
+    // logits graph. loss = (1/B) Σ_b NELBO_b, NELBO_b = mean_ce_b·n_b/(t_b·T).
     ag::Variable loss;
     for (std::int64_t b = 0; b < B; ++b) {
         const auto& c = ctx.corr[static_cast<std::size_t>(b)];
