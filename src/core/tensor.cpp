@@ -1,4 +1,5 @@
 #include "sub0llm/core/tensor.hpp"
+#include "sub0llm/core/block_pool.hpp"
 #include "../backends/cpu/kernels.hpp"
 #include "../backends/cuda/backend.hpp"
 #include "pool.hpp"
@@ -14,6 +15,14 @@
 #include <stdexcept>
 
 namespace sub0llm {
+
+// Returns `data` to the pool (or frees it). Buffer lifetime is the Storage refcount.
+Storage::~Storage() noexcept {
+    if (!data) return;
+    if (pool_idx >= -1) TensorPool::get().reclaim_raw(data, pool_idx);
+    else if (free_fn)   free_fn(data);
+    // pool_idx == kExternal with null free_fn ⇒ externally owned: leave it alone.
+}
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -45,7 +54,7 @@ Tensor::Tensor(Shape shape, DType dtype, Device device)
     , strides_(make_contiguous_strides(shape_, dtype))
     , numel_(compute_numel(shape_))
     , dtype_(dtype)
-    , storage_(std::make_shared<Storage>())
+    , storage_(std::allocate_shared<Storage>(PoolAllocator<Storage>{}))
     , byte_offset_(0)
 {
     storage_->device        = device;
@@ -58,7 +67,9 @@ Tensor::Tensor(Shape shape, DType dtype, Device device)
             storage_ = cuda_storage;
             return; // storage_ already fully initialised
         }
-        storage_->data = TensorPool::get().allocate(storage_->byte_capacity);
+        const auto buf = TensorPool::get().allocate_raw(storage_->byte_capacity);
+        storage_->data     = buf.ptr;
+        storage_->pool_idx = buf.idx;
     }
 }
 

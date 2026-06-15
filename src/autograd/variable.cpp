@@ -1,5 +1,6 @@
 #include "sub0llm/autograd/variable.hpp"
 
+#include "sub0llm/core/block_pool.hpp"
 #include "sub0llm/core/ops.hpp"
 
 #include <algorithm>
@@ -27,7 +28,7 @@ void Node::zero_grad() {
 // ── Variable ──────────────────────────────────────────────────────────────────
 
 Variable::Variable(Tensor data, bool requires_grad, std::string name) {
-    impl_                 = std::make_shared<Node>();
+    impl_                 = std::allocate_shared<Node>(PoolAllocator<Node>{});
     impl_->data           = std::move(data);
     impl_->requires_grad  = requires_grad;
     impl_->is_leaf        = true;

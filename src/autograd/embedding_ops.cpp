@@ -1,4 +1,5 @@
 #include "sub0llm/autograd/embedding_ops.hpp"
+#include "sub0llm/core/block_pool.hpp"
 #include "../backends/cpu/kernels.hpp"
 
 #include <cstring>
@@ -12,7 +13,7 @@ using Shape = Tensor::Shape;
 namespace {
 
 std::shared_ptr<Node> make_node(Tensor data, bool rg) {
-    auto n           = std::make_shared<Node>();
+    auto n           = std::allocate_shared<Node>(PoolAllocator<Node>{});
     n->data          = std::move(data);
     n->requires_grad = rg;
     n->is_leaf       = false;

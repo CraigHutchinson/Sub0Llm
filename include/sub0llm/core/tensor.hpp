@@ -22,9 +22,24 @@ namespace sub0llm {
 // Device-specific allocation is handled by the backend (Ch02).  For now,
 // CPU storage is a plain heap allocation.
 struct Storage {
-    std::shared_ptr<std::byte[]> data;
-    std::size_t                  byte_capacity{0};
-    Device                       device;
+    // RAW buffer (not shared_ptr<byte[]>): the buffer's lifetime is governed by this
+    // Storage's own shared_ptr<Storage> refcount, so a second per-buffer control block was
+    // pure overhead — one heap alloc PER TENSOR even when the buffer itself is pooled. The
+    // dtor returns `data` to the pool / frees it. Views share one Storage, so the buffer
+    // lives until the last view drops (unchanged semantics).
+    std::byte*  data = nullptr;
+    std::size_t byte_capacity = 0;
+    Device      device;
+    // Free strategy: pool_idx >= -1 ⇒ TensorPool-owned (idx -1 = oversized bypass);
+    // pool_idx == kExternal ⇒ free via free_fn (CUDA / external), or leave alone if null.
+    static constexpr int kExternal = -2;
+    int         pool_idx = kExternal;
+    void      (*free_fn)(std::byte*) noexcept = nullptr;
+
+    Storage() = default;
+    Storage(const Storage&)            = delete;   // owns a raw buffer — not value-copyable
+    Storage& operator=(const Storage&) = delete;
+    ~Storage() noexcept;                           // returns `data` to the pool (tensor.cpp)
 };
 
 // ── Tensor ────────────────────────────────────────────────────────────────────
@@ -91,11 +106,11 @@ public:
     // Raw byte pointer (use sparingly). Throws if tensor is not defined.
     [[nodiscard]] std::byte* raw_ptr() {
         if (!storage_) throw std::runtime_error("raw_ptr() called on undefined tensor");
-        return storage_->data.get() + byte_offset_;
+        return storage_->data + byte_offset_;
     }
     [[nodiscard]] const std::byte* raw_ptr() const {
         if (!storage_) throw std::runtime_error("raw_ptr() called on undefined tensor");
-        return storage_->data.get() + byte_offset_;
+        return storage_->data + byte_offset_;
     }
 
     // ── Shape manipulation ────────────────────────────────────────────────────

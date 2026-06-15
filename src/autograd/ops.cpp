@@ -1,5 +1,6 @@
 #include "sub0llm/autograd/ops.hpp"
 
+#include "sub0llm/core/block_pool.hpp"
 #include "sub0llm/core/ops.hpp"
 #include "../backends/cpu/kernels.hpp"
 
@@ -20,7 +21,7 @@ bool any_grad(const Variable& a, const Variable& b) {
 }
 
 std::shared_ptr<Node> make_node(Tensor data, bool rg) {
-    auto n           = std::make_shared<Node>();
+    auto n           = std::allocate_shared<Node>(PoolAllocator<Node>{});
     n->data          = std::move(data);
     n->requires_grad = rg;
     n->is_leaf       = false;

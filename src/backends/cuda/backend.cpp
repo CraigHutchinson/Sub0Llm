@@ -20,11 +20,11 @@ std::shared_ptr<Storage> alloc(std::size_t byte_size, int device_index) {
             std::format("cudaMalloc({} bytes) failed: {}", byte_size, cudaGetErrorString(err)));
     }
     auto storage = std::make_shared<Storage>();
-    storage->data = std::shared_ptr<std::byte[]>(
-        static_cast<std::byte*>(raw),
-        [](std::byte* p) { cudaFree(p); });
+    storage->data          = static_cast<std::byte*>(raw);
     storage->byte_capacity = byte_size;
     storage->device        = Device::cuda(device_index);
+    storage->pool_idx      = Storage::kExternal;                 // not pool-owned
+    storage->free_fn       = [](std::byte* p) noexcept { cudaFree(p); };  // captureless → fn ptr
     return storage;
 #else
     (void)byte_size; (void)device_index;

@@ -58,6 +58,35 @@ public:
             for (auto* p : bkt) detail::aligned_free(p);
     }
 
+    // A pooled buffer + the bucket index needed to return it. idx >= 0 ⇒ a power-of-2
+    // pool bucket; idx == -1 ⇒ the oversized/undersized bypass path (plain aligned_free).
+    struct RawBuf { std::byte* ptr = nullptr; int idx = -1; };
+
+    // Allocate a 64-byte-aligned buffer WITHOUT a shared_ptr control block (which the
+    // shared_ptr `allocate()` below heap-allocates on every call even for a pooled buffer).
+    // The caller (Storage) owns the buffer and MUST return it via reclaim_raw(ptr, idx).
+    [[nodiscard]] RawBuf allocate_raw(std::size_t bytes) {
+        const int idx = bucket_for(bytes);
+        if (idx >= 0) {
+            auto& bkt = buckets_[static_cast<std::size_t>(idx)];
+            if (!bkt.empty()) { std::byte* p = bkt.back(); bkt.pop_back(); return {p, idx}; }
+            auto* p = static_cast<std::byte*>(detail::aligned_alloc(kAlign, bucket_size(idx)));
+            if (!p) throw std::bad_alloc{};
+            return {p, idx};
+        }
+        const std::size_t aligned = (bytes + kAlign - 1u) & ~(kAlign - 1u);
+        auto* p = static_cast<std::byte*>(detail::aligned_alloc(kAlign, aligned));
+        if (!p) throw std::bad_alloc{};
+        return {p, -1};
+    }
+
+    // Return a buffer from allocate_raw to the pool (or free it on the bypass path).
+    void reclaim_raw(std::byte* ptr, int idx) noexcept {
+        if (!ptr) return;
+        if (idx >= 0) reclaim(ptr, idx);
+        else          detail::aligned_free(ptr);
+    }
+
     // Allocate a buffer of at least `bytes` bytes, 64-byte aligned.
     // Returns a shared_ptr whose custom deleter returns the buffer to the pool.
     [[nodiscard]] std::shared_ptr<std::byte[]> allocate(std::size_t bytes) {
