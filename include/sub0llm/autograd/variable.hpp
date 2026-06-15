@@ -1,6 +1,8 @@
 #pragma once
 
 #include "sub0llm/core/tensor.hpp"
+#include "sub0llm/core/small_function.hpp"
+#include "sub0llm/core/inline_vector.hpp"
 
 #include <functional>
 #include <memory>
@@ -14,8 +16,10 @@ struct Node;
 // One backward edge: a reference to an input node plus the VJP that maps the
 // output gradient to the gradient contribution for that input.
 struct Edge {
-    std::shared_ptr<Node>               node;
-    std::function<Tensor(const Tensor&)> backward_fn;
+    std::shared_ptr<Node>                node;
+    // Inline VJP closure (no heap for closures that fit ~256 B = one captured Tensor): the
+    // dominant heap source in the per-step autograd graph. Larger closures spill to the heap.
+    SmallFunction<Tensor(const Tensor&)> backward_fn;
 };
 
 // A node in the dynamic computation graph.
@@ -28,7 +32,10 @@ struct Node {
     bool        is_leaf       = true;
     std::string name;           // optional debug label
 
-    std::vector<Edge> edges;    // backward edges (empty for leaves)
+    // Up to 2 edges inline (unary/binary ops — the vast majority); with the inline VJP
+    // closures above, a node's entire backward graph then lives in the (pooled) Node — zero
+    // heap. Ops with >2 inputs spill to the heap as a vector would.
+    InlineVector<Edge, 2> edges;
 
     // Accumulate upstream into grad (initialises grad on first call).
     void accumulate_grad(const Tensor& upstream);

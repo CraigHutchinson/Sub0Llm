@@ -31,6 +31,8 @@ add_executable(tests
     test_ch26_episodic_memory.cpp
     test_workspace.cpp
     test_cpu_topology.cpp
+    test_small_function.cpp
+    test_inline_vector.cpp
 )
 
 target_link_libraries(tests

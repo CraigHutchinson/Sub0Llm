@@ -21,7 +21,7 @@ std::shared_ptr<Node> make_node(Tensor data, bool rg) {
 }
 
 Edge make_edge(std::shared_ptr<Node> node,
-               std::function<Tensor(const Tensor&)> fn) {
+               SmallFunction<Tensor(const Tensor&)> fn) {
     Edge e;
     e.node        = std::move(node);
     e.backward_fn = std::move(fn);
