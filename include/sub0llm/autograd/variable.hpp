@@ -4,6 +4,7 @@
 #include "sub0llm/core/small_function.hpp"
 #include "sub0llm/core/inline_vector.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -31,6 +32,10 @@ struct Node {
     bool        requires_grad = false;
     bool        is_leaf       = true;
     std::string name;           // optional debug label
+    // Generation stamp for backward()'s topo DFS — lets "visited?" be an O(1) field check
+    // instead of an allocating std::unordered_set (one hash node per graph node — the last
+    // big per-step alloc source). A fresh generation per backward needs no clearing.
+    std::uint64_t visit_gen = 0;
 
     // Up to 2 edges inline (unary/binary ops — the vast majority); with the inline VJP
     // closures above, a node's entire backward graph then lives in the (pooled) Node — zero

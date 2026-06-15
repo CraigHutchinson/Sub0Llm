@@ -7,7 +7,6 @@
 #include <format>
 #include <functional>
 #include <stdexcept>
-#include <unordered_set>
 
 namespace sub0llm::autograd {
 
@@ -89,14 +88,20 @@ void Variable::backward(Tensor upstream_grad) {
         upstream_grad = ones({1}, DType::Float32, impl_->data.device());
     }
 
-    // Build reverse topological order via iterative DFS.
-    std::vector<std::shared_ptr<Node>> topo;
-    std::unordered_set<Node*>          visited;
+    // Build reverse topological order via DFS. "Visited?" is a per-node generation stamp
+    // (a fresh generation each backward) rather than an allocating std::unordered_set — that
+    // set allocated one hash node per graph node, the last big per-step alloc source.
+    static thread_local std::uint64_t s_visit_gen = 0;
+    const std::uint64_t gen = ++s_visit_gen;
+    // Reuse the topo buffer across backwards (capacity persists, no per-step realloc); it is
+    // cleared at the end so the graph's shared_ptrs are released promptly (pools reclaim).
+    static thread_local std::vector<std::shared_ptr<Node>> topo;
+    topo.clear();
 
     std::function<void(const std::shared_ptr<Node>&)> dfs =
         [&](const std::shared_ptr<Node>& n) {
-            if (!n || !n->requires_grad || visited.count(n.get())) return;
-            visited.insert(n.get());
+            if (!n || !n->requires_grad || n->visit_gen == gen) return;
+            n->visit_gen = gen;
             for (const auto& e : n->edges) dfs(e.node);
             topo.push_back(n);
         };
@@ -116,6 +121,7 @@ void Variable::backward(Tensor upstream_grad) {
             edge.node->accumulate_grad(input_grad);
         }
     }
+    topo.clear();   // release the graph (keep the buffer capacity for the next backward)
 }
 
 // ── detach ────────────────────────────────────────────────────────────────────
