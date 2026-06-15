@@ -220,3 +220,32 @@ cmake --build --preset native --target ch29_diffusion_training
 ./build-native/bin/ch29_diffusion_training --ckpt-dir /tmp/ab --paragraphs 10000 \
   --corpus data/complete_shakespeare.txt --threads 4 --seq-len 128 --eval-train
 ```
+
+## Latest result :
+FROM: `./build-native/bin/ch29_diffusion_training.exe --ckpt-dir D:/tmp/sub0diff_ch29_newb --corpus .\data\complete_shakespeare.txt --patience 15`
+
+The final recall appears to correlate/bounded by the optimizer fixes from 0.31 to 0.51 has moved our bar from ~0.3 to 0.4 @10% an increase across the board - there is soemthing here that seems relevant as potentially setting the upper-bar of our training is focused on here...
+```
+ 2140s  step 239347  nelbo=5.6229 (t=0.99)  [157 windows/s, 5186 masked-tok/s, 39.3 opt-steps/s]
+  eval @ 239680: held-out NELBO 3.7830  (best 3.7117, 15/15 patience)
+  early stop: no improvement for 15 evals (after 20 min epochs)
+Training done: 2152.5s, 239680 steps (self-terminated), best held-out NELBO 3.7117
+
+── 5. Held-out evaluation ──
+held-out NELBO (1052 windows): 3.8353
+
+Recall sweep over the held-out stream: 6581 of 131639 sliding positions per noise level (64-token windows, uniform stride):
+   noise    masked   recovered   recall
+     10%     42246       17817    42.2%
+     25%    105265       35447    33.7%
+     50%    210735       43681    20.7%
+     75%    316334       31004     9.8%
+  overall: 127949/674580 (19.0%)  [sweep took 376.5s]
+  breakdown: word-level 18.0% (64906/360668) | word-START 14.6% (36438/249715) | continuation 21.5% (91511/424865)
+
+Edge effect: first 9.3%, last 8.4% vs interior mean 19.3%
+
+── What's next ──
+Ch30 — the reverse process: iterative canvas refinement with confidence remasking,
+       loading this chapter's model dir (D:/tmp/sub0diff_ch29_newb).
+```

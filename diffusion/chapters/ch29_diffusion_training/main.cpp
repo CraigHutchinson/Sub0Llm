@@ -122,14 +122,16 @@ struct Config {
     // noise levels (grad-probe: easy↔hard cosine ≈0.1, within-level consistency only ≈0.3).
     // --shared-t samples ONE t per step so all workers mask at the SAME level → the 4-window
     // average sharpens the per-t gradient. Still unbiased (t ~ U over steps). Pool path only.
-    bool shared_t          = false;
+    // DEFAULT ON: exact+shared was the variance-reduction 2×2 winner (+1.0pt word-level).
+    // Pass --no-shared-t to restore the independent-per-worker baseline.
+    bool shared_t          = true;
     // --exact-noise: mask EXACTLY round(t·T) positions per window (shuffle-select) instead of
     // an independent Bernoulli per position. Realised noise = nominal exactly (exact model
     // conditioning), removes the Bernoulli COUNT variance from the gradient, and drops the
     // min-1 floor hack. A deterministic, even, unbiased corruption count (only WHICH stays
     // random). Affects training + the held-out NELBO; the recall sweep stays Bernoulli for a
     // stable cross-experiment metric.
-    bool exact_noise       = false;
+    bool exact_noise       = true;
     // --track-recall: at every held-out NELBO eval, ALSO measure a quick held-out recall and
     // print it. Decouples the early-stop signal (NELBO) from the metric we care about (recall)
     // — the test for "are we stopping too early / is NELBO-plateau actually recall-plateau".
@@ -212,7 +214,9 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--track-recall") c.track_recall = true;
         else if (a == "--grad-probe")   c.grad_probe   = true;
         else if (a == "--shared-t")     c.shared_t     = true;
+        else if (a == "--no-shared-t")  c.shared_t     = false;   // restore independent-per-worker t
         else if (a == "--exact-noise")  c.exact_noise  = true;
+        else if (a == "--no-exact-noise") c.exact_noise = false;  // restore Bernoulli-per-position
         else if (a == "--eval-train") c.eval_train = true;
         else if (a == "--profile")    c.profile    = true;
         else if (a == "--threads")    c.threads    = std::stoull(next());
@@ -888,21 +892,17 @@ static int run(int argc, char** argv) {
             if (since_report >= 30.0) {
                 const double el = std::chrono::duration<double>(now - t0).count();
                 // THROUGHPUT METRIC COHERENCE: a data-parallel "step" trains `threads`
-                // windows (grad accumulation), so opt-steps/s is NOT comparable across
-                // thread counts — it falls ~1/threads even when real throughput rises.
-                // The apples-to-apples unit is the WINDOW: windows/s == opt-steps/s only
-                // at threads==1, and is what the single-thread baseline (≈115/s) measures.
-                const double opt_steps_s = static_cast<double>(interval_steps) / since_report;
-                const double windows_s   = opt_steps_s * static_cast<double>(cfg.threads);
+                // windows (grad accumulation)
+                const double onethread_steps_s = static_cast<double>(interval_steps) / since_report;
+                const double windows_s   = onethread_steps_s * static_cast<double>(cfg.threads);
                 std::println("{:>5.0f}s  step {:>6}  nelbo={:.4f} (t={:.2f}){}  "
-                             "[{:.0f} windows/s, {:.0f} masked-tok/s, {:.1f} opt-steps/s]",
+                             "[{:.0f} windows/s, {:.0f} masked-tok/s]",
                              el, step, last_loss, last_t,
                              curr ? std::format("  ceiling={:.2f}{}", curr->frontier(),
                                                 curr->converged() ? " (converged)" : "")
                                   : std::string(),
                              windows_s,
-                             static_cast<double>(interval_tokens) / since_report,
-                             opt_steps_s);
+                             static_cast<double>(interval_tokens) / since_report);
                 if (cfg.profile) {
                     const double tot = p_fwd + p_bwd + p_opt;
                     std::println("        profile: fwd {:.0f}%  bwd {:.0f}%  opt {:.0f}%  "
