@@ -56,6 +56,8 @@ struct DiffusionLossResult {
     sub0llm::autograd::Variable loss;       // scalar — NELBO estimate for this sample
     float                       t = 0.0f;   // sampled noise level
     std::uint32_t               n_masked = 0;
+    float                       mean_ce = 0.0f;  // RAW mean masked CE (nats), before 1/t scaling —
+                                                 // the per-token NLL, for the per-t diagnostic curve
 };
 
 // One NELBO Monte-Carlo sample on a clean window.
@@ -93,10 +95,11 @@ template<class RNG>
     const float actual_noise = static_cast<float>(corr.n_corrupted) / T;
     ag::Variable logits = model.forward(ctx.ids_input, actual_noise);
     ag::Variable mean_ce = ag::weighted_cross_entropy(logits, ctx.ids_clean, ctx.weights);
+    const float mean_ce_val = mean_ce.data().item<float>();
 
     // mean-over-masked → NELBO term: scale by n_masked / (t·T).
     const float nelbo_w = static_cast<float>(corr.n_corrupted) / (t * T);
-    return {ag::scale(mean_ce, nelbo_w), t, corr.n_corrupted};
+    return {ag::scale(mean_ce, nelbo_w), t, corr.n_corrupted, mean_ce_val};
 }
 
 // ── Batched objective (Ch29 re-architecture) ──────────────────────────────────

@@ -145,6 +145,11 @@ struct Config {
     // print it. Decouples the early-stop signal (NELBO) from the metric we care about (recall)
     // — the test for "are we stopping too early / is NELBO-plateau actually recall-plateau".
     bool track_recall      = false;
+    // --per-t: after eval, print the per-noise-level masked-CE (raw per-token NLL, nats) + recall
+    // curve over a fine t grid, plus the unigram-entropy floor. The #1 diagnostic for "is the model
+    // t-AWARE?": a flat curve ≈ the t-averaged NELBO ⇒ t-agnostic (conditioning broken); a curve
+    // rising from <1 nat at low t up to the entropy floor ⇒ healthy / near objective floor.
+    bool per_t             = false;
     // Also sweep recall on the TRAIN stream — measures MEMORIZATION (fit) vs the held-out
     // GENERALIZATION. A large train≫held-out gap means the ceiling is generalization, not
     // coverage/undertraining (and is the apples-to-apples comparison with Ch28, which only
@@ -231,6 +236,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--whole-word") c.whole_word = true;
         else if (a == "--inspect")    c.inspect    = std::stoll(next());
         else if (a == "--track-recall") c.track_recall = true;
+        else if (a == "--per-t")        c.per_t        = true;
         else if (a == "--grad-probe")   c.grad_probe   = true;
         else if (a == "--shared-t")     c.shared_t     = true;
         else if (a == "--no-shared-t")  c.shared_t     = false;   // restore independent-per-worker t
@@ -985,6 +991,43 @@ static int run(int argc, char** argv) {
     section("5. Held-out evaluation");
     std::println("held-out NELBO ({} windows): {:.4f}\n",
                  4 * eval_nelbo_windows, eval_nelbo(4 * eval_nelbo_windows));
+
+    // 5a. Per-t diagnostic (--per-t): raw per-token NLL + recall vs noise level. The headline
+    // NELBO is this curve AVERAGED over t — a single scalar hides whether the model is t-aware.
+    if (cfg.per_t) {
+        section("5a. Per-t diagnostic — is the model t-aware?");
+        // Unigram-entropy floor H0 = the irreducible t→1 loss (predict from an empty canvas).
+        // A t-AGNOSTIC model's masked-CE sits near H0 at EVERY t (flat curve); a healthy model
+        // rises from well below 1 nat at low t up toward H0 — that's "t-awareness".
+        std::vector<std::uint64_t> freq(static_cast<std::size_t>(model.model_vocab()), 0);
+        for (auto id : eval_ids)
+            if (id >= 0 && id < model.model_vocab()) ++freq[static_cast<std::size_t>(id)];
+        double H0 = 0.0; const double Ntok = static_cast<double>(eval_ids.size());
+        for (auto f : freq) if (f) { const double p = static_cast<double>(f) / Ntok; H0 -= p * std::log(p); }
+        std::println("  unigram-entropy floor H0 = {:.3f} nats (flat curve ≈ H0 ⇒ t-agnostic; "
+                     "rising from <1 nat ⇒ t-aware / near floor)", H0);
+        std::println("  {:>5}  {:>16}  {:>8}", "t", "masked-CE (nats)", "recall");
+        std::mt19937 prng(2025);
+        std::uniform_int_distribution<std::size_t> poff(
+            0, eval_ids.size() - static_cast<std::size_t>(cfg.seq_len) - 1);
+        constexpr std::size_t ce_windows = 512;
+        const std::size_t rbudget = std::min<std::size_t>(2000, win_count(eval_ids));
+        for (float t : {0.05f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f,
+                        0.50f, 0.60f, 0.70f, 0.80f, 0.90f, 0.95f}) {
+            double ce = 0.0;
+            for (std::size_t i = 0; i < ce_windows; ++i) {
+                auto w = std::span<const std::int32_t>(eval_ids)
+                             .subspan(poff(prng), static_cast<std::size_t>(cfg.seq_len));
+                ce += dt::diffusion_loss(model, w, prng, eval_ctx, t, t,
+                                         ws_span, /*whole_word=*/false, /*exact_count=*/true).mean_ce;
+            }
+            auto r = de::evaluate_corpus_recall(model, eval_ids, cfg.seq_len, t, prng,
+                                                nullptr, rbudget, ws_span, /*whole_word=*/false);
+            std::println("  {:>5.2f}  {:>16.3f}  {:>7.1f}%",
+                         t, ce / static_cast<double>(ce_windows), r.recall() * 100.0f);
+        }
+        std::println("");
+    }
 
     // Budgeted sweep: a few thousand uniformly-strided windows per noise level
     // estimate recall to ~±1%; an exhaustive sweep of a large eval stream can cost
