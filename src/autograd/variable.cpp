@@ -93,20 +93,34 @@ void Variable::backward(Tensor upstream_grad) {
     // set allocated one hash node per graph node, the last big per-step alloc source.
     static thread_local std::uint64_t s_visit_gen = 0;
     const std::uint64_t gen = ++s_visit_gen;
-    // Reuse the topo buffer across backwards (capacity persists, no per-step realloc); it is
-    // cleared at the end so the graph's shared_ptrs are released promptly (pools reclaim).
+    // Reuse the topo + work-stack buffers across backwards (capacity persists, no per-step
+    // realloc); both are cleared so the graph's shared_ptrs are released promptly (pools
+    // reclaim). ITERATIVE post-order DFS — no recursive std::function (a per-backward heap
+    // alloc) and no stack-overflow risk on deep graphs. Each frame tracks its next child;
+    // we re-index by `i` every iteration so a push_back reallocating `stk` can't dangle.
     static thread_local std::vector<std::shared_ptr<Node>> topo;
+    static thread_local std::vector<std::pair<std::shared_ptr<Node>, std::size_t>> stk;
     topo.clear();
-
-    std::function<void(const std::shared_ptr<Node>&)> dfs =
-        [&](const std::shared_ptr<Node>& n) {
-            if (!n || !n->requires_grad || n->visit_gen == gen) return;
-            n->visit_gen = gen;
-            for (const auto& e : n->edges) dfs(e.node);
-            topo.push_back(n);
-        };
-
-    dfs(impl_);
+    stk.clear();
+    if (impl_ && impl_->requires_grad && impl_->visit_gen != gen) {
+        impl_->visit_gen = gen;
+        stk.emplace_back(impl_, 0);
+    }
+    while (!stk.empty()) {
+        const std::size_t i = stk.size() - 1;
+        Node* n = stk[i].first.get();
+        if (stk[i].second < n->edges.size()) {
+            auto child = n->edges[stk[i].second].node;   // copy the shared_ptr before realloc
+            ++stk[i].second;
+            if (child && child->requires_grad && child->visit_gen != gen) {
+                child->visit_gen = gen;
+                stk.emplace_back(std::move(child), 0);
+            }
+        } else {
+            topo.push_back(std::move(stk[i].first));      // post-order: children already emitted
+            stk.pop_back();
+        }
+    }
     std::reverse(topo.begin(), topo.end()); // output first
 
     // Seed the output gradient.

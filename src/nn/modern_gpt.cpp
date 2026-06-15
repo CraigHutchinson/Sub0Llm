@@ -268,13 +268,13 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     const Tensor& sin_f = rope_cache_sin_;
 
     // Precompute K and V for each KV head (shared across query groups).
-    std::vector<Variable> K_heads(n_kv_heads_), V_heads(n_kv_heads_);
+    InlineVector<Variable, 8> K_heads, V_heads;   // inline for the typical ≤8 KV heads
     for (std::size_t g = 0; g < n_kv_heads_; ++g) {
         auto k_raw = matmul(x, W_K_[g]);          // (T, head_dim)
         auto v_raw = matmul(x, W_V_[g]);          // (T, head_dim)
         if (use_qk_norm_) k_raw = k_norm_->forward(k_raw);  // RMSNorm over head_dim
-        K_heads[g] = rope(k_raw, cos_f, sin_f);
-        V_heads[g] = v_raw;
+        K_heads.push_back(rope(k_raw, cos_f, sin_f));
+        V_heads.push_back(v_raw);
     }
 
     // Build causal/sliding-window mask once per T — cached.
@@ -352,12 +352,12 @@ autograd::Variable GroupedQueryAttention::forward(const autograd::Variable& x,
     const Tensor& sin_f = rope_btile_sin_;
 
     // K, V per KV head: (B·T,D)→(B·T,hd), QK-norm+RoPE on K, then fold to (B,T,hd).
-    std::vector<Variable> K_heads(n_kv_heads_), V_heads(n_kv_heads_);
+    InlineVector<Variable, 8> K_heads, V_heads;   // inline for the typical ≤8 KV heads
     for (std::size_t g = 0; g < n_kv_heads_; ++g) {
         auto k_raw = matmul(x, W_K_[g]);                       // (B·T, hd)
         if (use_qk_norm_) k_raw = k_norm_->forward(k_raw);
-        K_heads[g] = reshape(rope(k_raw, cos_f, sin_f), {B, T, Dh});
-        V_heads[g] = reshape(matmul(x, W_V_[g]), {B, T, Dh});
+        K_heads.push_back(reshape(rope(k_raw, cos_f, sin_f), {B, T, Dh}));
+        V_heads.push_back(reshape(matmul(x, W_V_[g]), {B, T, Dh}));
     }
 
     auto compute_head = [&](std::size_t h) -> Variable {
