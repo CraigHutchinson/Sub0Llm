@@ -2,3 +2,4 @@
 add_subdirectory(ch28_diffusion_intro)
 add_subdirectory(ch29_diffusion_training)
 add_subdirectory(ch30_iterative_sampling)
+add_subdirectory(ch31_optimizer_sandbox)
