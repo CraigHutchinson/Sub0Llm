@@ -73,14 +73,14 @@ public:
                     bool whole_word = false,
                     std::vector<int> pin_override = {},
                     bool exact_count = false,
-                    std::int64_t batch = 0,      // total windows/step B (0 ⇒ = n_workers)
+                    std::int64_t batch_size = 0, // total windows/step B (0 ⇒ = n_workers)
                     bool shared_t = false)
         : master_(std::move(master_params)),
           t_min_(t_min), t_max_(t_max), share_weights_(share_weights),
           is_word_start_(is_word_start), whole_word_(whole_word), exact_count_(exact_count),
           shared_t_(shared_t),
-          per_worker_(batch <= 0 ? 1 : batch / static_cast<std::int64_t>(n_workers)),
-          batch_(per_worker_ * static_cast<std::int64_t>(n_workers)),
+          windows_per_worker_(batch_size <= 0 ? 1 : batch_size / static_cast<std::int64_t>(n_workers)),
+          batch_size_(windows_per_worker_ * static_cast<std::int64_t>(n_workers)),
           master_rng_(static_cast<std::uint32_t>(seed ^ 0x9E3779B9u)),
           seed_(seed),
           barrier_(static_cast<std::ptrdiff_t>(n_workers + 1)) {
@@ -104,7 +104,7 @@ public:
         workers_.reserve(n_workers);
         for (std::size_t w = 0; w < n_workers; ++w) {
             auto& wk = *workers_.emplace_back(
-                std::make_unique<Worker>(arch, seed + 1000 * (w + 1), per_worker_));
+                std::make_unique<Worker>(arch, seed + 1000 * (w + 1), windows_per_worker_));
             // Alias each replica's weight DATA onto the master's storage (shallow
             // Tensor copy shares the underlying buffer): one L3-resident weight copy,
             // no per-step SYNC, and the worker's own randomly-initialised weight
@@ -142,9 +142,9 @@ public:
         t_max_.store(t_max, std::memory_order_relaxed);
     }
 
-    [[nodiscard]] std::int64_t batch() const noexcept { return batch_; }
+    [[nodiscard]] std::int64_t batch_size() const noexcept { return batch_size_; }
 
-    // Run one accumulated step over B = batch() windows: offsets.size() must equal batch().
+    // Run one accumulated step over B = batch_size() windows: offsets.size() must equal batch_size().
     // Worker w processes offsets[w·B/W .. (w+1)·B/W). Master grads hold the MEAN gradient over
     // all B windows on return (IDENTICAL for any W); caller clips and steps its optimizer.
     StepResult step(std::span<const std::int32_t> stream,
@@ -203,7 +203,7 @@ private:
     };
 
     void worker_loop(Worker& wk, std::size_t wid, std::size_t n_workers) {
-        const std::int64_t per = per_worker_;          // windows this worker owns
+        const std::int64_t per = windows_per_worker_;          // windows this worker owns
         for (;;) {
             barrier_.arrive_and_wait();      // wait for step() (or shutdown)
             if (stop_.load(std::memory_order_acquire)) {
@@ -276,8 +276,8 @@ private:
     bool                                       whole_word_ = false;
     bool                                       exact_count_ = false;
     bool                                       shared_t_ = false;
-    std::int64_t                               per_worker_ = 1;  // windows/worker = B/W
-    std::int64_t                               batch_ = 0;       // total windows/step B = per·W
+    std::int64_t                               windows_per_worker_ = 1;  // windows/worker = B/W
+    std::int64_t                               batch_size_ = 0;       // total windows/step B = per·W
     std::atomic<float>                         shared_ts_{0.0f}; // the step's shared noise level
     std::mt19937                               master_rng_;      // shared-t sampling (master only)
     std::uint64_t                              seed_ = 0;        // base seed for per-window hashing

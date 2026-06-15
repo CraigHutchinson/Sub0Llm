@@ -18,6 +18,15 @@
 //                           [--vocab-size 512] [--seq-len 64] [--steps 200000]
 //                           [--ckpt-dir /tmp/sub0diff_ch29] [--eval-every 2000]
 //                           [--patience 5] [--t-max 1.0] [--eval-only]
+//                           [--batch-size B] [--threads W]
+//
+// Two ORTHOGONAL training knobs (see the unified trainer in train/parallel.hpp):
+//   --batch-size B  effective batch = windows averaged per optimizer step. The QUALITY knob:
+//                   gradient within-level consistency ∝ √B (Ch31 sandbox). Default B = W.
+//   --threads W     parallel workers that split each step. The SPEED knob ONLY: the gradient
+//                   (and the trained model) is IDENTICAL for any W — B windows split B/W per
+//                   worker. So a given B (e.g. 16) trains the same on 1, 4, or 16 cores.
+//   Mnemonic: pick B for how good the gradient is, W for how fast you get it.
 //
 // Training is SELF-TERMINATING (a Ch28 lesson): --steps is only a safety bound.
 // Every --eval-every steps the held-out NELBO is measured; a checkpoint is saved on
@@ -142,12 +151,16 @@ struct Config {
     // ever scored on its training corpus).
     bool eval_train        = false;
     bool profile           = false;   // report forward/backward/optimizer time split
-    std::size_t threads    = 0;       // data-parallel workers; 0 = auto (cores/2), 1 = serial
-    // --batch B: SINGLE-THREAD batched path. One forward/backward over B windows stacked as
-    // (B·T) rows, averaged. With --shared-t (default on) all B mask at ONE noise level, so the
-    // gradient's within-level consistency rises ∝ √B (the Ch31-sandbox lever) on ONE core — B is
-    // decoupled from core count, so concurrent disjoint-core jobs can each run a high-B clean
-    // gradient. Takes precedence over the data-parallel pool. B=1 ⇒ the serial single-window path.
+    // --threads W = WORKERS: how many parallel threads split each step's work. The SPEED knob
+    // ONLY — the gradient (and thus the trained model) is identical for any W. 0 = auto (P/2),
+    // 1 = serial. Each worker is a model replica sharing the master weights (see parallel.hpp).
+    std::size_t threads    = 0;
+    // --batch-size B = effective BATCH: windows averaged per optimizer step. The QUALITY knob —
+    // with --shared-t (default) all B mask at one noise level, so the gradient's within-level
+    // consistency rises ∝ √B (the Ch31-sandbox lever). INDEPENDENT of --threads: the B windows
+    // are split B/W across the W workers, so the SAME √B gradient runs on 1, 4, or 16 cores —
+    // only wall-time changes. Default B = W (the historical per-worker pool); rounded up to a
+    // multiple of W. Rule of thumb: pick B for quality, W for the speed you want.
     std::size_t batch      = 1;
     // Worker pin policy (shared cpu_topology::resolve_pin_set): auto | all | P | E | "lo-hi"
     // | "a,b,c". Lets concurrent training jobs take DISJOINT cores (e.g. one run --pin
@@ -225,8 +238,8 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--no-exact-noise") c.exact_noise = false;  // restore Bernoulli-per-position
         else if (a == "--eval-train") c.eval_train = true;
         else if (a == "--profile")    c.profile    = true;
-        else if (a == "--threads")    c.threads    = std::stoull(next());
-        else if (a == "--batch")      c.batch      = std::stoull(next());
+        else if (a == "--threads" || a == "--workers") c.threads = std::stoull(next());
+        else if (a == "--batch-size" || a == "--batch") c.batch  = std::stoull(next());
         else if (a == "--pin")        c.pin        = next();
         else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
         else throw std::runtime_error(std::format("unknown argument: {}", a));
@@ -558,9 +571,9 @@ static int run(int argc, char** argv) {
         const int base = pc > 0 ? pc : topo.n_logical / 2;
         cfg.threads = std::max<std::size_t>(1, static_cast<std::size_t>((base + 1) / 2));
     }
-    // Effective batch B (windows averaged per step → gradient consistency ∝ √B) is INDEPENDENT of
-    // the worker count W (--threads, parallelism). Default B = W (the historical per-worker pool).
-    // --batch B>1 raises consistency on any W; round up to a multiple of W (workers split B/W each).
+    // batch-size B (windows averaged per step → gradient consistency ∝ √B) is INDEPENDENT of the
+    // worker count W (--threads, parallelism). Default B = W (the historical per-worker pool).
+    // --batch-size B>1 raises consistency on any W; round up to a multiple of W (workers split B/W).
     if (cfg.batch <= 1) cfg.batch = std::max<std::size_t>(1, cfg.threads);
     else cfg.batch = ((cfg.batch + cfg.threads - 1) / cfg.threads) * cfg.threads;
     const double mean_t = 0.5 * (0.02 + cfg.t_max);
@@ -832,9 +845,9 @@ static int run(int argc, char** argv) {
             param_ptrs, 0.02f, cfg.t_max, 1234 + start_step,
             /*share_weights=*/true, ws_span, cfg.whole_word, worker_pins, cfg.exact_noise,
             static_cast<std::int64_t>(cfg.batch), cfg.shared_t);
-        std::println("trainer: B={} windows/step over W={} worker{} (consistency ∝ √B), "
-                     "shared-t {}, exact-noise {}",
-                     cfg.batch, cfg.threads, cfg.threads == 1 ? "" : "s",
+        std::println("trainer: batch-size {} windows/step (consistency ∝ √{}) split across {} "
+                     "worker{} (speed only — same gradient at any W); shared-t {}, exact-noise {}",
+                     cfg.batch, cfg.batch, cfg.threads, cfg.threads == 1 ? "" : "s",
                      cfg.shared_t ? "on" : "off", cfg.exact_noise ? "on" : "off");
         std::vector<std::size_t> offsets(cfg.batch);
 
