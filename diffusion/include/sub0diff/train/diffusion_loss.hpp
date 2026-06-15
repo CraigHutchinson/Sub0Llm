@@ -125,17 +125,26 @@ struct BatchedDiffusionLossResult {
 
 // Corrupt B windows (one per offset), run a single batched forward, and reduce to
 // the mean per-window NELBO. offsets.size() must equal ctx.B.
+//
+// shared_t (variance reduction, the Ch31-sandbox lever): draw ONE t for all B windows so the
+// B-window average sharpens the per-noise-level gradient (within-level consistency ∝ √B) instead
+// of diluting across the near-orthogonal noise levels. Still unbiased (t ~ U over steps). This is
+// the single-thread analog of the pool's --shared-t, but B is decoupled from the core count, so a
+// single core can buy arbitrarily high consistency. exact_count: mask EXACTLY round(t·T) positions
+// (removes the Bernoulli count variance) — the other half of the consistency win.
 template<class RNG>
 [[nodiscard]] BatchedDiffusionLossResult
 batched_diffusion_loss(const nn::Denoiser& model,
                        std::span<const std::int32_t> stream,
                        std::span<const std::size_t> offsets,
                        RNG& rng, BatchedDiffusionLossContext& ctx,
-                       float t_min = 0.02f, float t_max = 1.0f) {
+                       float t_min = 0.02f, float t_max = 1.0f,
+                       bool shared_t = false, bool exact_count = false) {
     namespace ag = sub0llm::autograd;
     const std::int64_t B = ctx.B, T = ctx.T;
     auto idd = ctx.ids_input.data_as<std::int32_t>();
     std::uniform_real_distribution<float> t_dist(t_min, t_max);
+    const float shared = shared_t ? t_dist(rng) : 0.0f;   // one level for the whole batch
 
     std::vector<float>         ts(static_cast<std::size_t>(B));
     std::vector<std::uint32_t> nm(static_cast<std::size_t>(B));
@@ -145,10 +154,10 @@ batched_diffusion_loss(const nn::Denoiser& model,
     for (std::int64_t b = 0; b < B; ++b) {
         auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)],
                                     static_cast<std::size_t>(T));
-        const float t = t_dist(rng);
+        const float t = shared_t ? shared : t_dist(rng);
         nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
                          model.mask_id(), model.real_vocab(), rng,
-                         ctx.corr[static_cast<std::size_t>(b)]);
+                         ctx.corr[static_cast<std::size_t>(b)], exact_count);
         const auto& c = ctx.corr[static_cast<std::size_t>(b)];
         std::copy_n(c.tokens.begin(), T, idd.begin() + b * T);
         ts[static_cast<std::size_t>(b)] = t;

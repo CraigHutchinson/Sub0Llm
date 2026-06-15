@@ -143,6 +143,12 @@ struct Config {
     bool eval_train        = false;
     bool profile           = false;   // report forward/backward/optimizer time split
     std::size_t threads    = 0;       // data-parallel workers; 0 = auto (cores/2), 1 = serial
+    // --batch B: SINGLE-THREAD batched path. One forward/backward over B windows stacked as
+    // (B·T) rows, averaged. With --shared-t (default on) all B mask at ONE noise level, so the
+    // gradient's within-level consistency rises ∝ √B (the Ch31-sandbox lever) on ONE core — B is
+    // decoupled from core count, so concurrent disjoint-core jobs can each run a high-B clean
+    // gradient. Takes precedence over the data-parallel pool. B=1 ⇒ the serial single-window path.
+    std::size_t batch      = 1;
     // Worker pin policy (shared cpu_topology::resolve_pin_set): auto | all | P | E | "lo-hi"
     // | "a,b,c". Lets concurrent training jobs take DISJOINT cores (e.g. one run --pin
     // 0,1,10,11 and another --pin 12,13,22,23) instead of all oversubscribing the same
@@ -220,6 +226,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--eval-train") c.eval_train = true;
         else if (a == "--profile")    c.profile    = true;
         else if (a == "--threads")    c.threads    = std::stoull(next());
+        else if (a == "--batch")      c.batch      = std::stoull(next());
         else if (a == "--pin")        c.pin        = next();
         else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
         else throw std::runtime_error(std::format("unknown argument: {}", a));
@@ -562,9 +569,12 @@ static int run(int argc, char** argv) {
     cfg.steps                            = sched.steps_bound;
     cfg.recall_windows                   = sched.recall_windows;
     const std::size_t eval_nelbo_windows = sched.eval_nelbo_windows;
-    // Early-stopping floor: min_epochs full passes (in STEPS) before a stop may fire.
+    // Early-stopping floor: min_epochs full passes (in STEPS) before a stop may fire. A step trains
+    // windows_per_step windows (batched→batch, else data-parallel→threads), so divide to get steps.
+    const std::size_t eff_windows_per_step =
+        cfg.batch > 1 ? cfg.batch : std::max<std::size_t>(1, cfg.threads);
     const std::uint64_t min_stop_steps =
-        cfg.min_epochs * sched.epoch_windows / std::max<std::size_t>(1, cfg.threads);
+        cfg.min_epochs * sched.epoch_windows / eff_windows_per_step;
 
     if (cfg.eval_factor < sc.min_coverage)
         std::println("note: --eval-factor {:.2f} clamped up to the {:.0f}% epoch-coverage floor "
@@ -788,6 +798,20 @@ static int run(int argc, char** argv) {
         }
         std::mt19937 rng(1234 + static_cast<std::uint32_t>(start_step));
         dt::DiffusionLossContext ctx(cfg.seq_len);
+        // Single-thread batched path (--batch B>1): B windows in one (B·T)-row forward/backward.
+        std::optional<dt::BatchedDiffusionLossContext> bctx;
+        if (cfg.batch > 1) {
+            if (cfg.whole_word)
+                throw std::runtime_error("--batch is incompatible with --whole-word "
+                                         "(batched path masks per-token only)");
+            bctx.emplace(static_cast<std::int64_t>(cfg.batch), cfg.seq_len);
+            std::println("batched single-thread path: B={} windows/step, shared-t {}, exact-noise {}"
+                         " (within-level consistency ∝ √B)",
+                         cfg.batch, cfg.shared_t ? "on" : "off", cfg.exact_noise ? "on" : "off");
+        }
+        std::vector<std::size_t> batch_offsets(cfg.batch);
+        // windows trained per step: pool→threads, batched→batch, serial→1 (threads==1 there).
+        const std::size_t windows_per_step = bctx ? cfg.batch : cfg.threads;
 
         // Random window offset per step — uniform over all sliding positions, the
         // same distribution the eval sweep measures.
@@ -809,7 +833,7 @@ static int run(int argc, char** argv) {
         // Data-parallel workers (threads > 1): each step trains `threads` windows,
         // one per replica, and the master sees the MEAN gradient (see parallel.hpp).
         std::unique_ptr<dt::ParallelTrainer> pool;
-        if (cfg.threads > 1)
+        if (cfg.threads > 1 && cfg.batch <= 1)
             pool = std::make_unique<dt::ParallelTrainer>(
                 cfg.threads,
                 dt::ParallelTrainer::Arch{V, cfg.embed_dim, cfg.n_layers, cfg.d_ff,
@@ -859,6 +883,19 @@ static int run(int argc, char** argv) {
                 last_t    = res.last_t;
                 step_masked = res.masked_tokens;
                 pt2 = pt1 = tick();   // fwd+bwd fused inside the pool
+            } else if (bctx) {
+                // Single-thread batched: B windows, shared-t (default) → consistency ∝ √B.
+                for (auto& o : batch_offsets) o = off_dist(rng);
+                auto res = dt::batched_diffusion_loss(model, train_span, batch_offsets, rng,
+                                                      *bctx, t_lo, t_hi, cfg.shared_t,
+                                                      cfg.exact_noise);
+                pt1 = tick();
+                opt->zero_grad();
+                res.loss.backward();
+                pt2 = tick();
+                last_loss   = res.loss.data().item<float>();
+                last_t      = res.mean_t;
+                step_masked = res.n_masked;
             } else {
                 const auto window = train_span.subspan(off_dist(rng),
                                                        static_cast<std::size_t>(cfg.seq_len));
@@ -894,7 +931,7 @@ static int run(int argc, char** argv) {
                 // THROUGHPUT METRIC COHERENCE: a data-parallel "step" trains `threads`
                 // windows (grad accumulation)
                 const double onethread_steps_s = static_cast<double>(interval_steps) / since_report;
-                const double windows_s   = onethread_steps_s * static_cast<double>(cfg.threads);
+                const double windows_s   = onethread_steps_s * static_cast<double>(windows_per_step);
                 std::println("{:>5.0f}s  step {:>6}  nelbo={:.4f} (t={:.2f}){}  "
                              "[{:.0f} windows/s, {:.0f} masked-tok/s]",
                              el, step, last_loss, last_t,
