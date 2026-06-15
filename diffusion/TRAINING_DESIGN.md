@@ -1,0 +1,272 @@
+# sub0llm Text-Diffusion — Training Design Specification
+
+> A distilled, accurate specification of how we train the text-diffusion model (Ch28–Ch31),
+> written both as a durable chapter resource and as the document an independent diffusion-LLM
+> expert is asked to review. **Central open question:** held-out NELBO plateaus around **3.5**;
+> intuition says a well-fit text model should reach **< 2**. Did we solve the underlying issue or
+> just move it? What is the shape/value of *good* convergence for this objective on this data?
+
+Status as of 2026-06-15. Code: `diffusion/` (project `sub0diff`), chapter binary
+`ch29_diffusion_training`.
+
+---
+
+## 1. Objective — absorbing-state masked-diffusion NELBO (MDLM / LLaDA)
+
+We train the **negative evidence lower bound** of an absorbing-state discrete diffusion model,
+which Rao-Blackwellizes (Sahoo et al. MDLM; Nie et al. LLaDA) to a weighted masked cross-entropy:
+
+```
+L = E_{t ~ U(t_min, 1]}  E_{x_t ~ q(·|x_0, t)}  [ (1/t) · Σ_{i : masked} −log p_θ(x_0[i] | x_t) ]
+```
+
+- Sample a noise level `t`, corrupt each position to `[MASK]` with probability `t`, predict the
+  clean token at the masked positions, weight the summed CE by `1/t`.
+- `t ~ U(0.02, 1.0]` (the formal objective; `t_min = 0.02` floor). Every noise level is trained
+  every epoch — Ch28's curriculum is a *variant* of reshaping the distribution of `t`.
+- **Implementation** (`diffusion/include/sub0diff/train/diffusion_loss.hpp`): `weighted_cross_entropy`
+  returns the MEAN over masked positions; the per-sample NELBO term is recovered by scaling with
+  `w = n_masked / (t · T)` (≈1 in expectation since `E[n_masked] = t·T`). T = seq_len = 64.
+
+### Variance-reduction levers (default ON, Ch29/Ch31)
+- **exact-count masking** (`--exact-noise`): mask EXACTLY `round(t·T)` positions (partial
+  Fisher-Yates) instead of an independent Bernoulli per position. Removes the count variance, so
+  realised noise = nominal exactly. Measured: raised gradient within-level consistency 0.31 → 0.51.
+- **shared-t** (`--shared-t`): one `t` for all B windows in a step, so the B-window average sharpens
+  the per-noise-level gradient (consistency ∝ √B) instead of diluting across near-orthogonal levels.
+
+---
+
+## 2. Model — bidirectional denoiser (`diffusion/include/sub0diff/nn/denoiser.hpp`)
+
+A pre-norm transformer that, given a corrupted sequence and its scalar noise level, predicts the
+clean token at **every** position with **full (non-causal) attention** (no left-to-right order to
+protect). Reuses sub0llm's modern blocks unchanged.
+
+```
+x = TokEmb(ids) + NoiseCond(t)                  # (T, D)
+repeat L times:  h = x + GQA_noncausal(RMSNorm(x))      # RoPE inside attention
+                 x = h + SwiGLU(RMSNorm(h))
+logits = RMSNorm(x) · TokEmbᵀ                    # WEIGHT-TIED head → (T, Vm)
+```
+
+- **Tokenizer**: BPE, `vocab_size ≈ 512` (+1 absorbing `[MASK]` row ⇒ model vocab `Vm = V+1`).
+- **Noise conditioning** (`time_embedding.hpp`): a **parameter-free sinusoidal** embedding of `t`,
+  amplitude-matched to the token embedding scale `1/√D` (a unit-amplitude version was ~11× louder
+  than content and stalled learning ~10×), **added** to every token row. A *learned* projection of
+  this is noted as an unimplemented upgrade.
+- **Blocks**: RMSNorm, GQA (RoPE, configurable query/kv heads), SwiGLU FFN. No absolute pos-emb.
+- **Head is weight-tied** to the token embedding.
+- **Architectures used**:
+  - *old default* (most historical results): D=128, L=8, heads=8/4 (GQA), d_ff=384 → head_dim **16**,
+    d_ff = 3·D. ~1.6 M params. Flagged mis-proportioned (head_dim < 32, d_ff < 4·D).
+  - *founded* (`--founded`): D=256, L=6, heads=8/4, d_ff=1024 → head_dim **32**, d_ff = 4·D. ~6 M params.
+
+---
+
+## 3. Data
+
+- Corpus: `data/complete_shakespeare.txt` (and smaller `shakespeare.txt`). Paragraph-per-line.
+- Flat BPE token stream; **random-offset sliding windows** of `seq_len = 64` (train and eval share
+  one window distribution); **95/5 train/eval split**.
+- Scales used: `--paragraphs 10000` (proxy A/B) up to the full ~146k-paragraph corpus.
+- Note: 10k Shakespeare paragraphs × 64 tokens ≈ a *very small* token budget for a 1.6–6 M model.
+
+---
+
+## 4. Training recipe
+
+- **Optimizer**: AdamW (lr 1e-3, decoupled wd 0.01) — the A/B winner (+1.4pt word-level over plain
+  Adam). Muon supported but routes embedding/output→AdamW; see §6.
+- **Unified (B, W) data-parallel step** (`train/parallel.hpp`): effective **batch-size B** windows
+  averaged per optimizer step (gradient consistency ∝ √B, the QUALITY knob) split across **W workers**
+  (`--threads`, SPEED only — gradient identical for any W via per-window deterministic seeding).
+  Default B = W. Weights shared (one L3-resident copy); grads private then mean-reduced.
+- **Gradient clipping**: global L2 norm ≤ 5.0.
+- **LR schedule**: constant by default; warmup+cosine is opt-in and *measured to hurt* the known-good
+  baseline (decays it into an earlier early-stop).
+- **Curriculum** (opt-in): frontier-point noise ceiling that rises only once mastered (Ch28). Default
+  off (uniform `t`).
+- **Self-termination**: every `eval_every` steps measure held-out NELBO; checkpoint on improvement;
+  stop after `patience` evals without one, with a `min_epochs` floor. (`--steps` is a safety bound.)
+
+---
+
+## 5. Evaluation
+
+- **Held-out NELBO** (averaged diffusion loss over fixed-seed eval windows) — the early-stop signal.
+- **Recall sweep**: over the held-out stream at noise levels {10, 25, 50, 75}%, fraction of masked
+  positions recovered exactly (greedy argmax). Broken down into **word-level / word-START /
+  continuation** (a BPE word-piece's first vs later subword). The headline metric.
+
+---
+
+## 6. Current results & what we've learned
+
+| run (full corpus, old arch D128/L8) | best held-out NELBO | overall recall | word-START | @10% noise |
+|---|---|---|---|---|
+| √4 baseline (W=4, shared-t, exact-noise) | 3.712 | 19.0% | 14.6% | 42.2% |
+| **√16 (W=16)** | **3.519** | **21.5%** | **16.9%** | **48.4%** |
+
+Progression of the headline recall over the project: ~15% → 19% (exact-noise + shared-t) → **21.5%**
+(√16 consistency). Key findings:
+
+- **Ch31 optimizer sandbox**: on the isolated gradient pathology (orthogonal per-level blocks +
+  within-level noise, depth-2 coupling, LR sweeps), **Adam ≈ Muon** at every consistency level — the
+  optimizer is *interchangeable*; **gradient within-level consistency is the crux**, and it bounds
+  both optimizers identically. The consistency-collapse near convergence (0.50 → 0.07) is reproduced
+  and is optimizer-independent.
+- **Consistency lever confirmed at scale**: √4 → √16 (more windows averaged at one noise level)
+  buys +2.5pt recall and a lower NELBO; it also trains productively far longer. This is the only
+  lever that has moved the ceiling recently.
+- **Muon canary**: Muon trained on the *old* arch (head_dim 16) FAILS catastrophically (basin-stuck,
+  NELBO 5.69, 3.2% recall) while AdamW reaches ~19%. On small/serial configs Muon ≈ AdamW. A
+  founded-arch (head_dim 32) Muon vs AdamW 2×2 is in progress to localize whether the failure is the
+  narrow head. (Muon amplifies any mis-scaled update direction Adam's per-coordinate norm hides — so
+  a Muon failure can be a *canary* for a latent gradient issue that also caps Adam.)
+
+---
+
+## 7. THE OPEN PUZZLE — did we solve it or move it?
+
+The consistency lever raised recall but **held-out NELBO is stuck around 3.5** and recall around 21%.
+A well-fit text model "should" reach NELBO well under 2. We have **not** closed that gap — we
+mitigated it. The reviewer's central task is to diagnose *why* and propose the highest-leverage fix.
+
+Candidate explanations (to be confirmed/refuted):
+
+1. **Objective-bound, not model-bound.** The NELBO is an *average over all `t ∈ (0.02,1]`*, including
+   the near-impossible `t ≈ 1` regime (predict ~all tokens from an almost-empty canvas), whose loss
+   is irreducibly high (≈ the data entropy). Is **3.5 actually near-optimal** for this `1/t`-weighted
+   objective on this data, such that the "< 2" intuition (an AR per-token cross-entropy number) is a
+   category error? What is the **theoretical NELBO floor** for absorbing diffusion on Shakespeare-BPE,
+   and how should we *normalize/report* it to make "good" legible (e.g. per-`t` loss curves, or a
+   masked-only CE at fixed low `t`)?
+2. **Under-data (Chinchilla).** ~10k–146k paragraphs is tiny. Masked diffusion sees each token under
+   many maskings (data-augmentation-like), so its *effective* token budget per parameter differs from
+   AR. **Do Chinchilla-style compute-optimal scaling laws transfer to masked diffusion LMs?** Is a
+   **smaller** model in fact compute-optimal here, and what is the right model-size / token-budget
+   ratio for dLLM? (This is the explicit research ask.)
+3. **Underfit / mis-proportioned.** Old arch had head_dim 16, d_ff 3·D. Founded fixes both but is
+   bigger. Is capacity or training-length the binding constraint at this data scale?
+4. **Recipe gaps.** Parameter-free (not learned) noise conditioning; weight-tied head; no LR schedule;
+   `t ~ U` vs importance/antithetic `t` sampling; constant LR; AdamW vs better. Which matter?
+5. **Metric mismatch.** Greedy exact-match recall at high noise is a harsh metric; is NELBO-vs-recall
+   decoupling hiding real progress (or real failure)?
+
+### Specific questions for the reviewer
+- Is held-out NELBO ≈ 3.5 consistent with a *correctly-implemented* MDLM/LLaDA objective that is
+  **near its achievable floor** on this data — or a clear symptom of under-fitting / a bug? How would
+  you tell them apart cheaply?
+- What does a healthy NELBO-vs-`t` curve look like, and what should we plot to know "good convergence"?
+- For masked diffusion LMs, how do compute-optimal scaling / Chinchilla findings apply? Is smaller
+  better here, and what model/data ratio would you recommend for Shakespeare-scale corpora?
+- What is the single highest-leverage change to break the ~3.5 NELBO / ~21% recall ceiling?
+- Any correctness red flags in §1–§4 (the objective weighting, exact-count masking, tied head,
+  noise conditioning, bidirectional attention, the (B,W) gradient estimator)?
+
+---
+
+## 8. Reproduce
+
+```bash
+cmake --build --preset native --target ch29_diffusion_training
+# best-defaults run (AdamW, shared-t, exact-noise; B=W); pick W for speed, B for gradient quality
+./build-native/bin/ch29_diffusion_training --ckpt-dir /tmp/ch29 \
+  --corpus data/complete_shakespeare.txt --threads 16        # √16 ≈ 21.5% recall
+# raise consistency independent of cores:
+./build-native/bin/ch29_diffusion_training ... --batch-size 32 --threads 8   # √32 on 8 cores
+```
+
+---
+
+## 9. Independent expert review — synthesis (2026-06-15)
+
+Three independent reviewers (diffusion-LM objective expert, scaling-laws/Chinchilla-for-dLLM
+researcher, adversarial recipe critic), each grounded in the literature. They **converge** on the
+answer to "did we solve it or move it": **we MOVED it.** The consistency lever is a real *variance*
+fix, not a floor-breaker — and the "NELBO < 2" target is the wrong yardstick.
+
+### 9.1 The "< 2" intuition is a category error (high confidence, all three agree)
+- The reported **3.5 is in NATS** (= 5.05 bits) and is **`t`-averaged over `t∼U(0.02,1]`**, so it is
+  structurally dominated by the **high-`t`, near-empty-canvas regime whose loss is irreducibly ≈ the
+  corpus unigram entropy** (~4–5.5 nats). The `1/t` weight *cancels* the mask count in our per-token-
+  mean formulation (this is the correct MDLM Rao-Blackwellized form), so the average is NOT upweighted
+  toward easy low-`t`.
+- **Literature anchor:** MDLM reports **perplexity ≈ 23–31 on LM1B** ⇒ per-token NELBO **≈ 3.1–3.4 nats**
+  *on a large clean corpus*. WikiText MDM NELBO ≈ 4.50. **Our 3.5 on tiny Shakespeare-512BPE is within
+  ~0.2–0.4 nats of MDLM's large-scale number** — i.e. plausibly **near the objective floor for this
+  data**, not catastrophically underfit. The diffusion irreducible-loss floor is structurally higher
+  than AR (fitted E≈2.41 vs Chinchilla 1.69).
+- **Therefore the real bug is MEASUREMENT**: we report one conflated scalar instead of the **per-`t`
+  loss curve**. That single missing artifact is why "solved vs moved" is currently unanswerable.
+
+### 9.2 We are strongly DATA-bound, and diffusion is the right objective for it (scaling reviewer)
+- tokens/param ≈ **0.1–6** here (10k-proxy ↔ full corpus, 1.6–6M params) vs AR-Chinchilla optimum ~20
+  and **diffusion-optimal ~40–100** — we are **1–2 orders of magnitude below optimal**. Textbook
+  data-bound; no model size reaches low loss on one pass.
+- **Chinchilla does NOT transfer**: masked diffusion is 2–5× more data-hungry per param, BUT tolerates
+  **~100–500 epochs of data reuse** (vs AR's ~4–15) because random masking is built-in MC augmentation
+  ("Diffusion Beats AR in Data-Constrained Settings", 2507.15857; "Super Data Learners", 2511.03276).
+- **Our self-termination / early-stop likely truncates training before the reuse regime where
+  diffusion's advantage lives.** The compute-optimal response to a fixed tiny corpus is **smaller,
+  properly-proportioned model + many more epochs**, not a bigger model.
+
+### 9.3 Concrete recipe flaws found in the code (adversarial critic — these are the model-side levers)
+- **P0 — noise conditioning is informationally weak (top suspected cause).** Parameter-free sinusoid,
+  **added** at `1/√D` amplitude (partly washed by the pre-norm RMSNorm), with a **mis-banded frequency**
+  (`kTimeEmbedScale=1000`, base 10000 → no low-frequency channel monotonic across `t∈[0,1]`; aliasing).
+  If the model can't cleanly read `t` it collapses toward a `t`-agnostic denoiser → marginal/unigram
+  floor (≈3.5). **Fix:** learned **AdaLN/FiLM** time conditioning (MLP over correctly-banded Fourier
+  features, per-block scale/shift) — the standard MDLM/LLaDA recipe we omitted.
+- **P2 — exact-count + `t_min=0.02` biases the `1/t` estimator at low `t`.** `round(t·T)` clamps to 1
+  for a range of `t` while the weight `1/(t·T)` keeps varying → breaks unbiasedness exactly in the
+  low-`t` regime where the model should shine. **Fix:** raise `t_min` so `t_min·T ≥ ~3` (≈0.05 at T=64),
+  weight by realized `k`. Also: exact-count removes the Binomial mask-count spread the model faces at
+  inference (a train/inference mismatch worth an A/B).
+- **P3 — weight-tied head may be under-capacity for a denoiser.** Untie (≈130K params at D=256) and
+  retest; cheap, decisive.
+- **P4 (cleared):** RoPE under bidirectional attention is correct — not a bug, don't spend effort.
+
+### 9.4 The challenge to our own conclusion (take seriously)
+The Ch31 sandbox proved optimizer-independence *conditional on a fixed gradient pathology*; it did
+**not** prove the pathology is irreducible. Weak `t`-conditioning (P0), the low-`t` estimator bias
+(P2), the tied-head cap (P3), and data starvation (§9.2) **each independently produce an optimizer-
+independent NELBO floor near the data entropy** — exactly what we see. "Consistency is the crux" is
+true as a *variance* statement but may be **masking** these floor-setting causes. The √16 win is real
+but is "variance reduction lets us train longer before overfitting a tiny dataset," not a floor break.
+
+### 9.5 Prioritized cheap experiments (do these BEFORE any more optimizer/consistency work)
+1. **Per-`t` loss curve** — bin eval windows into ~10–20 `t` buckets, plot mean masked-CE vs `t`.
+   *Flat ≈3.5 ⇒ `t`-agnostic (P0 confirmed); monotone rising from <1 nat at low `t` ⇒ near-floor.*
+   The single most informative missing artifact (~20 lines). Also switch eval to a fixed `t`-grid
+   (kills per-window `t`-sampling noise in checkpoint comparisons).
+2. **Single-batch overfit test** — drive train NELBO on ~64 windows toward 0. *Can reach <2 but held-out
+   stays 3.5 ⇒ data/generalization-bound; cannot even overfit <2 ⇒ capacity/conditioning bug.* The most
+   decisive falsifier of "consistency is the crux." (Note: an earlier tiny-model overfit reached only
+   5% train recall / NELBO ~4.6 — a hint it could NOT overfit, pointing at P0/P3 — but redo it properly
+   with the founded arch + the per-`t` plot.)
+3. **AR baseline on the identical token stream** (reuse `modern_gpt`). *AR ≈ 3.5 too ⇒ it's the data;
+   AR ≈ 2–2.5 ⇒ objective/conditioning gap.* The honest reference number.
+4. **Measure the unigram-entropy floor** `H₀` over the train stream (10-line pass) — pins the `t→1`
+   ceiling and tells you how close the `t`-average already is to the floor.
+5. **Report NELBO as perplexity** (`exp(NELBO)` ≈ 33 PPL) for cross-paper legibility, and report the
+   **per-`t` recall** (the @10% number, 48.4%, is the meaningful one) rather than the noise-averaged 21%.
+
+### 9.6 Highest-leverage changes (after the diagnostics)
+1. **Learned AdaLN time conditioning** (P0) — top model-side fix; the clearest deviation from MDLM/LLaDA.
+2. **Train many more epochs** (50–200) on the full corpus with `patience`/`min_epochs` raised far up —
+   diffusion monetizes data reuse where AR overfits; directly tests floored-vs-underfit.
+3. **Smaller, properly-proportioned model** (~1.5–3M, head_dim 32, d_ff 4·D) rather than the 6M founded —
+   bigger overfits earlier at this data scale.
+4. **Untie the head** (P3); **raise `t_min`** to ≥3/T (P2).
+5. **More / real data** if NELBO substantially below ~3 is the goal — the corpus is a genuine ceiling.
+
+> **Reframe of the project's narrative:** the optimizer/consistency line of work (Ch29–Ch31) correctly
+> characterized and fixed the *gradient-variance* axis. The *floor* is set elsewhere — measurement
+> (report per-`t`), conditioning (learned AdaLN), and data (epochs/size). The next chapter's work
+> should pivot from "make the gradient cleaner" to "is the model `t`-aware and is it data-bound."
+
+**Key sources:** MDLM (2406.07524), LLaDA (2502.09992), Diffusion-Beats-AR-in-Data-Constrained
+(2507.15857), Quokka optimal-DLM-scaling (2510.03280), Super-Data-Learners (2511.03276),
+MDM-scaling (2410.18514).
