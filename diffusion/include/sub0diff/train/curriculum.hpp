@@ -35,6 +35,17 @@ namespace sub0diff::train {
 // and moves a fractional ceiling; this gates on a per-EPOCH held-out NELBO plateau and moves an
 // integer k. This matches the rule "model parameters and the curriculum level only change on a
 // full-epoch boundary," so a difficulty step never contaminates the convergence signal.
+//
+// OPEN CONSIDERATION — forgetting the easy levels. Frontier-POINT trains at EXACTLY k, so while
+// climbing, the model stops seeing the easy k=1 regime (recover from 63 visible). In THEORY it
+// shouldn't forget — and the post-convergence phase trains the full objective, revisiting every
+// level — but the easy levels could degrade DURING the climb (a window at k=20 conditions each
+// prediction on far less context than at k=1, so it is not a strict superset). ch29 prints a live
+// "base(k=1)-NELBO" forgetting watch each epoch; per-`t` recall at any saved checkpoint is the
+// retrospective check. IF forgetting is observed, the fix is to make the curriculum a CAP/BIAS
+// rather than a point: train the RANGE t∈[t_min, k/T] up to the frontier (so every easier level
+// stays in the mix and is continually reinforced) instead of exactly k — a one-line change to the
+// trainer's t-range. Kept open pending evidence; the point variant is the lowest-variance default.
 class FrontierCurriculum {
 public:
     struct Config {

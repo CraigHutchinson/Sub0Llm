@@ -402,3 +402,12 @@ convergence signal.
   [--curriculum-k-step K]`. **Open:** a matched-comparison vs the uniform baseline (curricula are
   schedules, so compare *to-convergence/final* recall, not fixed-step) and a sensible `k_step` for
   the low-signal mid-range (step-1 is fine-grained; difficulty barely moves from `k=30` to `31`).
+- **Forgetting the easy levels (open).** Frontier-POINT trains at exactly `k`, so during the climb
+  the model stops seeing the easy `k=1` regime. In theory it shouldn't forget (the post-convergence
+  phase trains the full objective, revisiting all levels), and `k=1` is *not* a strict subset of
+  `k=20` (the latter conditions on far less context). ch29 now prints a live **`base(k=1)-NELBO`
+  forgetting watch** each curriculum epoch; per-`t` recall at any saved checkpoint is the
+  retrospective check. **If forgetting is observed,** rework the curriculum as a **cap/bias**: train
+  the *range* `t∈[t_min, k/T]` up to the frontier (every easier level stays in the mix, continually
+  reinforced) instead of exactly `k` — a one-line trainer change. Point is the lowest-variance
+  default; kept open pending the A/B evidence.

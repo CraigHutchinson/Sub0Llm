@@ -1106,10 +1106,20 @@ static int run(int argc, char** argv) {
                 const bool advanced  = fcurr->observe_epoch(fnelbo);
                 if (improved || advanced || fcurr->converged())
                     save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
-                std::println("  curriculum @ {:>6}: k={}/{} (t={:.3f}) level-NELBO {:.4f}  {}",
+                // FORGETTING WATCH: frontier-point trains EXACTLY at k, so while climbing the model
+                // no longer sees the easy k=1 regime. In theory it shouldn't forget (the post-
+                // convergence full-objective phase revisits every level), but watch the base-level
+                // (k=1) NELBO: if it CLIMBS as k rises, the easy levels are degrading and the
+                // curriculum should be reworked as a cap/bias over [1,k] (see curriculum.hpp).
+                const std::string base_tag = (k_before > 1)
+                    ? std::format("  base(k=1)-NELBO {:.4f}",
+                                  eval_nelbo_at(1.0f / static_cast<float>(cfg.seq_len),
+                                                eval_nelbo_windows))
+                    : std::string();
+                std::println("  curriculum @ {:>6}: k={}/{} (t={:.3f}) level-NELBO {:.4f}{}  {}",
                              step + 1, k_before, fcurr->max_level(),
                              static_cast<double>(k_before) / static_cast<double>(cfg.seq_len),
-                             fnelbo,
+                             fnelbo, base_tag,
                              advanced ? std::format("mastered → advance to k={}", fcurr->level())
                            : fcurr->converged() ? "mastered TOP → CONVERGED (→ full objective)"
                            : improved ? "learning"
