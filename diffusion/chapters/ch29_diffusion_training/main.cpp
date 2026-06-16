@@ -122,6 +122,17 @@ struct Config {
     // Masked-token evidence required per ceiling decision — the ramp-rate knob. Higher
     // = each level is mastered more thoroughly before the ceiling rises (slower, safer).
     std::uint64_t curriculum_min_tokens = 1500;
+    // CONVERGENCE-GATED frontier curriculum (--curriculum-converge): the integer-k variant
+    // motivated by §12 — train at EXACTLY k masked tokens (lowest-variance gradient), start at
+    // k=1 (recover 1 token from T-1 visible), and raise k → k+k_step only when the held-out
+    // NELBO at the current level PLATEAUS, judged at the per-epoch eval (the clean signal). Like
+    // a child mastering easy problems before hard ones. While the curriculum is progressing,
+    // global early-stop is SUSPENDED (the easy-level global NELBO is dominated by the untrained
+    // high-k tail); after it converges, training continues on the full objective with normal
+    // early-stop. Mutually exclusive with --curriculum (the token-gated EMA ceiling).
+    bool          curriculum_converge   = false;
+    std::uint64_t curriculum_patience   = 2;   // epochs of no level-NELBO improvement ⇒ advance k
+    std::int64_t  curriculum_k_step      = 1;  // masked tokens added per advancement (1/64→2/64)
     bool eval_only         = false;
     // WHOLE-WORD masking (axis H): corrupt whole words (all BPE subwords of a chosen word
     // together) instead of independent tokens. The honest, harder task — the model can no
@@ -247,6 +258,9 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--curriculum") c.curriculum = true;
         else if (a == "--curriculum-end") c.curriculum_end = std::stof(next());
         else if (a == "--curriculum-min-tokens") c.curriculum_min_tokens = std::stoull(next());
+        else if (a == "--curriculum-converge") c.curriculum_converge = true;
+        else if (a == "--curriculum-patience") c.curriculum_patience = std::stoull(next());
+        else if (a == "--curriculum-k-step") c.curriculum_k_step = std::stoll(next());
         else if (a == "--founded")  { c.founded = true; apply_founded(c); }  // later flags still override
         // Architecture overrides (so capacity experiments need no recompile).
         else if (a == "--embed-dim")  c.embed_dim  = std::stoll(next());
@@ -795,6 +809,24 @@ static int run(int argc, char** argv) {
         return sum / static_cast<double>(n_windows);
     };
 
+    // Held-out NELBO at a FIXED noise level (mask exactly round(t·T)) — the per-level mastery
+    // signal the convergence-gated curriculum gates on. Fixed seed so it's comparable epoch to
+    // epoch; exact-count so the masked count is exactly the frontier k.
+    auto eval_nelbo_at = [&](float t_level, std::size_t n_windows) {
+        std::mt19937 erng(778);
+        std::uniform_int_distribution<std::size_t> eoff(
+            0, eval_ids.size() - static_cast<std::size_t>(cfg.seq_len) - 1);
+        double sum = 0.0;
+        for (std::size_t i = 0; i < n_windows; ++i) {
+            auto w = std::span<const std::int32_t>(eval_ids)
+                         .subspan(eoff(erng), static_cast<std::size_t>(cfg.seq_len));
+            sum += dt::diffusion_loss(model, w, erng, eval_ctx, t_level, t_level,
+                                      ws_span, cfg.whole_word, /*exact_count=*/true)
+                       .loss.data().item<float>();
+        }
+        return sum / static_cast<double>(n_windows);
+    };
+
     // Quick held-out recall (small fixed budget) — for --track-recall, to watch recall
     // alongside NELBO during training. Fixed seed so the number is comparable across steps.
     auto quick_recall = [&](std::size_t budget) {
@@ -934,6 +966,11 @@ static int run(int argc, char** argv) {
         // once mastered. The floor stays at 0.02; frontier-point trains exactly at the
         // ceiling. Disabled → uniform t ∈ (0.02, t_max] (the formal objective).
         std::unique_ptr<dt::NoiseCurriculum> curr;
+        // Convergence-gated frontier curriculum (--curriculum-converge): integer-k, advanced
+        // per-epoch on held-out NELBO plateau. Mutually exclusive with the token-gated one.
+        std::unique_ptr<dt::FrontierCurriculum> fcurr;
+        if (cfg.curriculum && cfg.curriculum_converge)
+            throw std::runtime_error("--curriculum and --curriculum-converge are mutually exclusive");
         if (cfg.curriculum) {
             curr = std::make_unique<dt::NoiseCurriculum>(
                 dt::NoiseCurriculum::Config{.end = cfg.curriculum_end,
@@ -941,6 +978,16 @@ static int run(int argc, char** argv) {
             std::println("curriculum: frontier-point, ceiling {:.2f}→{:.2f}, token-gated "
                          "(min_tokens={})",
                          0.05f, cfg.curriculum_end, cfg.curriculum_min_tokens);
+        } else if (cfg.curriculum_converge) {
+            fcurr = std::make_unique<dt::FrontierCurriculum>(dt::FrontierCurriculum::Config{
+                .seq_len = cfg.seq_len, .k_start = 1, .k_max = 0,
+                .k_step = cfg.curriculum_k_step,
+                .patience = static_cast<int>(cfg.curriculum_patience)});
+            std::println("curriculum: CONVERGENCE-gated, k=1→{} masked tokens (t={:.3f}→1.0), "
+                         "+{}/level on per-epoch NELBO plateau (patience {} epochs); global "
+                         "early-stop suspended until converged",
+                         fcurr->max_level(), fcurr->frontier(), cfg.curriculum_k_step,
+                         cfg.curriculum_patience);
         }
 
         float last_loss = 0.0f, last_t = 0.0f;
@@ -953,8 +1000,16 @@ static int run(int argc, char** argv) {
             // switch to the full band [0.02, ceiling] = the formal objective: training a
             // single t=1.0 (fully masked, no context) is degenerate and degrades the easy
             // regime, which made the uniform-noise eval climb and early-stop prematurely.
-            const float t_lo = (curr && !curr->converged()) ? curr->frontier() : 0.02f;
-            const float t_hi = curr ? curr->frontier() : cfg.t_max;
+            float t_lo, t_hi;
+            if (fcurr) {
+                // Convergence-gated: train AT exactly k masked (t=k/T) until the curriculum
+                // converges, then the full formal band. Advancement is decided per-EPOCH below.
+                if (fcurr->converged()) { t_lo = 0.02f; t_hi = cfg.t_max; }
+                else                    { t_lo = t_hi = fcurr->frontier(); }
+            } else {
+                t_lo = (curr && !curr->converged()) ? curr->frontier() : 0.02f;
+                t_hi = curr ? curr->frontier() : cfg.t_max;
+            }
             // Set the noise band the trainer samples from (curriculum ceiling, or the formal band).
             // shared-t sampling (one t for all B windows) happens inside pool->step() from this band.
             pool->set_t_range(t_lo, t_hi);
@@ -992,12 +1047,15 @@ static int run(int argc, char** argv) {
                 // windows (grad accumulation)
                 const double onethread_steps_s = static_cast<double>(interval_steps) / since_report;
                 const double windows_s   = onethread_steps_s * static_cast<double>(windows_per_step);
+                const std::string curr_tag =
+                    curr  ? std::format("  ceiling={:.2f}{}", curr->frontier(),
+                                        curr->converged() ? " (converged)" : "")
+                  : fcurr ? std::format("  k={}/{}{}", fcurr->level(), fcurr->max_level(),
+                                        fcurr->converged() ? " (converged)" : "")
+                          : std::string();
                 std::println("{:>5.0f}s  step {:>6}  nelbo={:.4f} (t={:.2f}){}  "
                              "[{:.0f} windows/s, {:.0f} masked-tok/s]",
-                             el, step, last_loss, last_t,
-                             curr ? std::format("  ceiling={:.2f}{}", curr->frontier(),
-                                                curr->converged() ? " (converged)" : "")
-                                  : std::string(),
+                             el, step, last_loss, last_t, curr_tag,
                              windows_s,
                              static_cast<double>(interval_tokens) / since_report);
                 if (cfg.profile) {
@@ -1033,6 +1091,34 @@ static int run(int argc, char** argv) {
                     break;
                 }
                 continue;   // overfit never runs the held-out/patience path below
+            }
+
+            // ── Convergence-gated curriculum: advance the frontier per EPOCH ───────
+            // While the curriculum is progressing, the level-NELBO (held-out, exactly k masked)
+            // is the mastery signal; global early-stop is SUSPENDED (the easy-level global NELBO
+            // is dominated by the untrained high-k tail and would trip patience spuriously).
+            if (fcurr && !fcurr->converged() && (step + 1) % cfg.eval_every == 0) {
+                const float fnelbo   = static_cast<float>(eval_nelbo_at(fcurr->frontier(),
+                                                                        eval_nelbo_windows));
+                const float prev_best = fcurr->best();
+                const std::int64_t k_before = fcurr->level();
+                const bool improved  = fnelbo < prev_best - 0.01f;
+                const bool advanced  = fcurr->observe_epoch(fnelbo);
+                if (improved || advanced || fcurr->converged())
+                    save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
+                std::println("  curriculum @ {:>6}: k={}/{} (t={:.3f}) level-NELBO {:.4f}  {}",
+                             step + 1, k_before, fcurr->max_level(),
+                             static_cast<double>(k_before) / static_cast<double>(cfg.seq_len),
+                             fnelbo,
+                             advanced ? std::format("mastered → advance to k={}", fcurr->level())
+                           : fcurr->converged() ? "mastered TOP → CONVERGED (→ full objective)"
+                           : improved ? "learning"
+                           : std::format("stall {}/{}", fcurr->stalls(), cfg.curriculum_patience));
+                if (fcurr->converged()) {   // hand off to global early-stop, fresh
+                    best_nelbo = std::numeric_limits<float>::max();
+                    evals_since_best = 0;
+                }
+                continue;
             }
 
             // ── Convergence check: held-out NELBO every eval_every steps ───────────

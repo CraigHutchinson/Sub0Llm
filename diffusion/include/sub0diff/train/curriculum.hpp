@@ -14,9 +14,78 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace sub0diff::train {
+
+// ── Convergence-gated frontier curriculum (integer-k, decided per EPOCH) ─────────────
+// A second, simpler curriculum motivated by the Ch29 minimal-case findings (TRAINING_DESIGN
+// §12): a single EXACT masked count k is the lowest-variance gradient there is (every window
+// masks the same k → the consistency lever that flipped N=64 from 3% to 99%). So train at
+// EXACTLY k masked tokens, starting at the easiest (k=1: recover one token from T-1 visible),
+// and raise k only once the model has MASTERED the current level — judged by the held-out
+// NELBO at that level plateauing, measured at the per-epoch eval cadence (the one place the
+// model's standing is read cleanly; the within-step training loss is far too noisy to gate on).
+// Like a child mastering 1-token infilling, then 2-token, … before facing the full noise range.
+// When k reaches k_max (= T-1, the min-1-visible cap), the curriculum is converged and the
+// trainer switches to the full formal objective (all noise levels, t∈(0.02,t_max]).
+//
+// Contrast with NoiseCurriculum: that one gates on a within-step loss EMA in masked-TOKEN time
+// and moves a fractional ceiling; this gates on a per-EPOCH held-out NELBO plateau and moves an
+// integer k. This matches the rule "model parameters and the curriculum level only change on a
+// full-epoch boundary," so a difficulty step never contaminates the convergence signal.
+class FrontierCurriculum {
+public:
+    struct Config {
+        std::int64_t seq_len     = 64;    // window length T (frontier t = k/T)
+        std::int64_t k_start     = 1;     // easiest level: exactly 1 masked token
+        std::int64_t k_max       = 0;     // 0 = derive T-1 (the min-1-visible cap)
+        std::int64_t k_step      = 1;     // masked tokens added per advancement (user's 1/64→2/64)
+        int          patience    = 2;     // epochs of no NELBO improvement ⇒ level mastered
+        float        min_improve = 0.01f; // held-out NELBO drop that still counts as learning
+    };
+
+    explicit FrontierCurriculum(Config c)
+        : cfg_(c), k_(std::max<std::int64_t>(1, c.k_start)),
+          k_max_(c.k_max > 0 ? c.k_max : std::max<std::int64_t>(1, c.seq_len - 1)) {
+        k_ = std::min(k_, k_max_);
+    }
+
+    // Noise level the trainer masks at this step: t = k/T (with exact-count ⇒ exactly k masked).
+    [[nodiscard]] float        frontier() const noexcept {
+        return static_cast<float>(k_) / static_cast<float>(cfg_.seq_len);
+    }
+    [[nodiscard]] std::int64_t level()   const noexcept { return k_; }
+    [[nodiscard]] std::int64_t max_level() const noexcept { return k_max_; }
+    [[nodiscard]] bool         converged() const noexcept { return converged_; }
+    [[nodiscard]] float        best()    const noexcept { return best_; }
+    [[nodiscard]] int          stalls()  const noexcept { return stalls_; }
+
+    // Call ONCE per epoch (at the held-out eval) with the held-out NELBO measured at the CURRENT
+    // frontier level (mask exactly k). Returns true iff the level advanced on this call.
+    bool observe_epoch(float nelbo_at_frontier) {
+        if (converged_) return false;
+        if (nelbo_at_frontier < best_ - cfg_.min_improve) {   // still descending at this level
+            best_ = nelbo_at_frontier;
+            stalls_ = 0;
+            return false;
+        }
+        if (++stalls_ < cfg_.patience) return false;          // plateau not yet confirmed
+        if (k_ >= k_max_) { converged_ = true; return false; }  // mastered the hardest level
+        k_ = std::min(k_max_, k_ + cfg_.k_step);              // advance to the next difficulty
+        best_ = std::numeric_limits<float>::max();
+        stalls_ = 0;
+        return true;
+    }
+
+private:
+    Config       cfg_;
+    std::int64_t k_, k_max_;
+    float        best_ = std::numeric_limits<float>::max();
+    int          stalls_ = 0;
+    bool         converged_ = false;
+};
 
 class NoiseCurriculum {
 public:

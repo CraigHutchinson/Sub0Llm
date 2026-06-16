@@ -5,6 +5,7 @@
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
 #include "sub0diff/nn/sampler.hpp"
+#include "sub0diff/train/curriculum.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/nn/optimizer.hpp"
@@ -338,4 +339,33 @@ TEST_CASE("batched_diffusion_loss - window corruption invariant to batch split (
         REQUIRE(ctxA.corr[static_cast<std::size_t>(2 + j)].tokens
                     == ctxB.corr[static_cast<std::size_t>(j)].tokens);
     }
+}
+
+TEST_CASE("FrontierCurriculum - per-epoch NELBO plateau advances integer k", "[diffusion]") {
+    dt::FrontierCurriculum c(dt::FrontierCurriculum::Config{
+        .seq_len = 8, .k_start = 1, .k_max = 0, .k_step = 1, .patience = 2, .min_improve = 0.01f});
+    REQUIRE(c.level() == 1);
+    REQUIRE(c.max_level() == 7);                 // T-1 (min-1-visible cap)
+    REQUIRE_THAT(c.frontier(), WithinAbs(1.0f / 8.0f, 1e-6));   // t = k/T
+
+    // Descending NELBO at the level ⇒ "still learning", k stays put, stalls reset each time.
+    REQUIRE_FALSE(c.observe_epoch(5.0f));
+    REQUIRE_FALSE(c.observe_epoch(4.0f));
+    REQUIRE_FALSE(c.observe_epoch(3.0f));
+    REQUIRE(c.level() == 1);
+
+    // Plateau: no improvement for `patience` epochs ⇒ advance exactly once, k→2, best resets.
+    REQUIRE_FALSE(c.observe_epoch(3.0f));        // stall 1/2
+    REQUIRE(c.observe_epoch(3.0f));              // stall 2/2 ⇒ advance
+    REQUIRE(c.level() == 2);
+    REQUIRE_THAT(c.frontier(), WithinAbs(2.0f / 8.0f, 1e-6));
+
+    // Drive to the top and confirm it converges at k_max (and stops advancing).
+    for (int guard = 0; guard < 100 && !c.converged(); ++guard) {
+        c.observe_epoch(9.0f);                   // flat/high ⇒ keep plateauing/advancing
+    }
+    REQUIRE(c.converged());
+    REQUIRE(c.level() == 7);
+    REQUIRE_FALSE(c.observe_epoch(0.0f));        // converged: no further advancement
+    REQUIRE(c.level() == 7);
 }

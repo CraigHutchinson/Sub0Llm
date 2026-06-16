@@ -375,3 +375,30 @@ highest-variance), so it's safe with `t_max=1.0` default and Ch30 generation.
 **gradient quality** (batch/consistency, mid-`t` sampling, lower high-`t` mass) and **data**
 (the ~3.3/40% floor, §10). Next: confirm `t_max`/importance-sampling on founded + a 2nd seed,
 then more/real data.
+
+## 13. Convergence-gated frontier curriculum (2026-06-16) — integer-`k`, decided per-epoch
+
+The §12 finding (a single exact `k` is the lowest-variance gradient) motivates a second
+curriculum, distinct from the Ch28 token-gated EMA ceiling (`NoiseCurriculum`). `FrontierCurriculum`
+(`--curriculum-converge`): train at **exactly `k` masked tokens** starting at `k=1` (recover one
+token from `T-1` visible — the easiest possible task, maximal context), and raise `k → k+k_step`
+**only when the held-out NELBO at the current level plateaus**, judged at the **per-epoch eval**
+(the one clean read of the model's standing — within-step training loss is far too noisy to gate
+on). Like a child mastering 1-token infilling, then 2-token, … before the full noise range. At
+`k_max = T-1` (the §12.3 min-1-visible cap) it converges and the trainer switches to the full
+formal objective. The rule the user identified — *parameters and the curriculum level only change
+on a full-epoch boundary* — falls out naturally: a difficulty step never contaminates the
+convergence signal.
+
+- Why this and not the EMA ceiling: gates on a **clean per-epoch held-out** signal (not a noisy
+  within-step EMA), moves an **integer `k`** (not a fractional ceiling), and the per-level NELBO is
+  measured at *exactly that level* so "mastered?" means mastered-this-difficulty, not global drift.
+- Global early-stop is **suspended while the curriculum progresses** (the easy-level global NELBO is
+  dominated by the untrained high-`k` tail and would trip patience spuriously); normal early-stop
+  resumes, fresh, once it converges to the full objective.
+- Validated end-to-end (smoke: D64/L2, patience 1): clean `k=1→2→…` progression, level-NELBO
+  descends then plateaus then advances. New unit test (`FrontierCurriculum - per-epoch NELBO
+  plateau advances integer k`). Flags: `--curriculum-converge [--curriculum-patience N]
+  [--curriculum-k-step K]`. **Open:** a matched-comparison vs the uniform baseline (curricula are
+  schedules, so compare *to-convergence/final* recall, not fixed-step) and a sensible `k_step` for
+  the low-signal mid-range (step-1 is fine-grained; difficulty barely moves from `k=30` to `31`).
