@@ -287,6 +287,11 @@ arch directly attacks that. Result (power-law fit over 162 eval points, `fit_tre
 - **Extrapolation:** +24h ≈ +2.5pt (→35.4%), +48h ≈ 36.3%; **90% of the remaining gain to the 40%
   asymptote needs ~176× current compute.** ⇒ **more-of-the-same training is NOT the lever** — a day
   buys ~2.5pt. The next gains must come from efficiency/data/recipe, not steps.
+- **Ch30 sufficiency (iterative refinement):** the prior net-negative (iterative LOSES to one-step
+  via error-compounding on the 857K model) has **flipped to break-even** — iterative ≈ one-step
+  (25% noise +0.3..+1.0pp, 50% −0.1pp). So the reverse-process mechanism no longer compounds errors,
+  but it's not yet a clear win, and **generation is still incoherent** (mask-artifact fragments). Ch30
+  *runs* now but won't impress until the model strengthens (data/proportions, not the sampler).
 
 ## 11. dLLM training-EFFICIENCY axis — how each window is consumed (next work)
 
