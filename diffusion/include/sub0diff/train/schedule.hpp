@@ -57,8 +57,12 @@ inline constexpr std::size_t   kDeriveSz = std::numeric_limits<std::size_t>::max
 // Derive the whole schedule. `masked_per_window` = E[t]·seq_len (the diffusion masked-
 // token rate). Overrides: eval_every/steps == kDerive → derive; recall == kDeriveSz →
 // derive (any other value, including 0 for "exhaustive", is passed through unchanged).
+// NOTE on `windows_per_step`: a data-parallel optimizer step trains the EFFECTIVE BATCH B windows
+// (= --batch, split B/W across W workers), so the step-denominated cadences fold B in here — NOT
+// the worker count W. (Before the B⊥W decoupling, B always equalled W=threads; passing threads here
+// was correct then and silently wrong once B>W — it made evals/curriculum decisions B/W× too rare.)
 [[nodiscard]] inline Schedule make_schedule(std::uint64_t train_tokens, std::uint64_t eval_tokens,
-                                            std::int64_t seq_len, std::size_t threads,
+                                            std::int64_t seq_len, std::size_t windows_per_step,
                                             double masked_per_window,
                                             const ScheduleConfig& cfg = {},
                                             std::uint64_t eval_every_override = kDerive,
@@ -66,13 +70,13 @@ inline constexpr std::size_t   kDeriveSz = std::numeric_limits<std::size_t>::max
                                             std::size_t recall_override = kDeriveSz) {
     Schedule s;
     const auto T = static_cast<std::uint64_t>(seq_len);
-    const std::size_t W = std::max<std::size_t>(1, threads);
+    const std::size_t B = std::max<std::size_t>(1, windows_per_step);
     s.epoch_windows = (seq_len > 0) ? train_tokens / T : 0;
     s.sliding_train = sliding_positions(train_tokens, seq_len);
     s.sliding_eval  = sliding_positions(eval_tokens, seq_len);
 
     // Eval cadence: ≥ min_coverage of an epoch (in windows) between evals, converted to
-    // STEPS (each step trains W windows), floored at min_eval_steps.
+    // STEPS (each step trains B windows), floored at min_eval_steps.
     if (eval_every_override != kDerive) {
         s.eval_every = eval_every_override;
     } else {
@@ -80,17 +84,17 @@ inline constexpr std::size_t   kDeriveSz = std::numeric_limits<std::size_t>::max
         const double windows_per_eval = cov * static_cast<double>(s.epoch_windows);
         // Round UP so the realised coverage is GUARANTEED ≥ cov (never just under 50%).
         s.eval_every = std::max(cfg.min_eval_steps,
-                                static_cast<std::uint64_t>(std::ceil(windows_per_eval / static_cast<double>(W))));
+                                static_cast<std::uint64_t>(std::ceil(windows_per_eval / static_cast<double>(B))));
     }
     s.coverage_per_eval = s.epoch_windows
-        ? static_cast<double>(s.eval_every) * static_cast<double>(W) / static_cast<double>(s.epoch_windows)
+        ? static_cast<double>(s.eval_every) * static_cast<double>(B) / static_cast<double>(s.epoch_windows)
         : 0.0;
 
     // Safety bound: coverage_epochs over the train tokens, in masked-token terms.
     if (steps_override != kDerive) {
         s.steps_bound = steps_override;
     } else {
-        const double masked_per_step = masked_per_window * static_cast<double>(W);
+        const double masked_per_step = masked_per_window * static_cast<double>(B);
         s.steps_bound = (masked_per_step > 0.0)
             ? static_cast<std::uint64_t>(cfg.coverage_epochs * static_cast<double>(train_tokens) / masked_per_step)
             : 0;

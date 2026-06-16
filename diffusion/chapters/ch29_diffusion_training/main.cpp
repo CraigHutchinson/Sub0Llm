@@ -208,28 +208,27 @@ struct Config {
     // SIZE_MAX = corpus-scaled (§2c); explicit N = fixed budget; 0 = exhaustive sweep.
     std::size_t recall_windows = std::numeric_limits<std::size_t>::max();
 
-    // ── Architecture — proportions FOUNDED on working tiny-Shakespeare references ──
-    // Two reference points bracket this regime (head_dim ≈ n_embd/n_heads):
+    // ── Architecture — the FOUNDED proportions are now the DEFAULT ──────────────────
+    // Two tiny-Shakespeare references bracket this regime (head_dim ≈ n_embd/n_heads):
     //   paulseet/tiny_llm  : D=96,  L=3, H=3 → head_dim 32, d_ff=4·D=384, block 64, 354K params
     //   nanoGPT char (Karpathy): D=384, L=6, H=6 → head_dim 64, d_ff=4·D=1536, block 256, 10.6M
-    // Both keep head_dim ≥ 32 (64 is "typical") and d_ff = 4·D. The 8-layer completeb
-    // run (D=128, L=8, H=8 → head_dim=16, d_ff=3·D) was MIS-PROPORTIONED: too deep+narrow,
-    // heads too small, FFN too thin — and it underfit (33%/27%/17%/8% recall, plateaued).
-    // Founded fix = wider, fewer layers, head_dim≥32, d_ff=4·D (see --founded preset and
-    // the sanity warnings in run()). All overridable via CLI so experiments need no rebuild.
-    std::int64_t embed_dim = 128, n_layers = 8, d_ff = 384;
-    std::size_t  n_heads = 8, n_kv_heads = 4;   // GQA: 2 query heads per KV head
-    bool         founded   = false;   // --founded: apply the founded reference proportions
+    // Both keep head_dim ≥ 32 and d_ff = 4·D. The earlier D=128/L=8/H=8 (head_dim 16, d_ff 3·D)
+    // default was MIS-PROPORTIONED and underfit; the founded A/B won +11pt recall (TRAINING_DESIGN
+    // §10) so these proportions are now the DEFAULT: D=256, L=6, H=8 (head_dim 32), d_ff=4·D=1024,
+    // ~6M params. All overridable via CLI so capacity experiments need no rebuild.
+    std::int64_t embed_dim = 256, n_layers = 6, d_ff = 1024;
+    std::size_t  n_heads = 8, n_kv_heads = 4;   // head_dim = 256/8 = 32; GQA 2:1
+    bool         founded   = false;   // legacy --founded flag (a no-op now; defaults are founded)
 };
 
-// Founded reference config (nanoGPT-proportioned, CPU-feasible): wider D, head_dim 32,
-// d_ff = 4·D, balanced depth. Applied by --founded unless the user set arch flags.
+// Founded reference config — now identical to the Config defaults; retained so the legacy
+// --founded flag is a harmless no-op (and re-asserts the proportions if earlier flags changed them).
 static void apply_founded(Config& c) {
-    c.embed_dim  = 256;   // between paulseet(96) and nanoGPT(384); 2× the underfit run
-    c.n_layers   = 6;     // nanoGPT's depth — 8 was too deep for D=128
-    c.n_heads    = 8;     // head_dim = 256/8 = 32 (founded floor; was 16)
-    c.n_kv_heads = 4;     // keep the 2:1 GQA ratio
-    c.d_ff       = 1024;  // 4·D (was 3·D)
+    c.embed_dim  = 256;
+    c.n_layers   = 6;
+    c.n_heads    = 8;     // head_dim = 256/8 = 32
+    c.n_kv_heads = 4;     // 2:1 GQA
+    c.d_ff       = 1024;  // 4·D
 }
 
 static Config parse_args(int argc, char** argv) {
@@ -600,8 +599,8 @@ static int run(int argc, char** argv) {
     // Derives eval cadence, the safety step bound, and eval sample sizes. THE COVERAGE
     // RULE (Ch28): an eval is only a meaningful decision once the model has trained over
     // ≥50% of an epoch (non-overlapping windows) since the last one — below that, evals
-    // are noise on partial data and patience trips on noise. The thread count is folded
-    // in ONCE here (each step trains `threads` windows) — the prior split mis-reported it.
+    // are noise on partial data and patience trips on noise. The EFFECTIVE BATCH B (--batch,
+    // windows/step) is folded in ONCE here — each step trains B windows, NOT W (B⊥W decoupled).
     const auto topo = sub0llm::detect_cpu_topology();
     if (cfg.threads == 0) {
         // Default = HALF the physical P-cores. Per-window data-parallel training is
@@ -624,7 +623,7 @@ static int run(int argc, char** argv) {
     const double mean_t = 0.5 * (0.02 + cfg.t_max);
     const dt::ScheduleConfig sc{.eval_factor = cfg.eval_factor};
     const auto sched = dt::make_schedule(
-        train_ids.size(), eval_ids.size(), cfg.seq_len, cfg.threads,
+        train_ids.size(), eval_ids.size(), cfg.seq_len, /*windows_per_step=*/cfg.batch,
         /*masked_per_window=*/mean_t * static_cast<double>(cfg.seq_len), sc,
         /*eval_every_override=*/cfg.eval_every, /*steps_override=*/cfg.steps,
         /*recall_override=*/cfg.recall_windows);
@@ -686,18 +685,18 @@ static int run(int argc, char** argv) {
     for (const auto& p : params) n_params += p.data().numel();
     std::println("Denoiser: V={} (+1 mask), D={}, layers={}, heads={}/{} (GQA), params={}",
                  V, cfg.embed_dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, n_params);
-    // Proportion notes vs the tiny-Shakespeare references (head_dim≈32-64, d_ff=4·D).
-    // ADVISORY ONLY: those are char-level AUTOREGRESSIVE refs, and a Ch29 A/B REFUTED
-    // them for this BPE bidirectional-diffusion model — D=128 with 8 heads/8 layers
-    // (head_dim 16) beat 4 heads/6 layers (head_dim 32) by 14.8% vs 3.9% recall. So
-    // more heads + depth win here; the warnings are informational, not prescriptive.
+    // Proportion sanity notes vs the founded references (head_dim ≥ 32, d_ff = 4·D). The founded
+    // A/B (+11pt, §10) settled this: head_dim 32 + d_ff 4·D is the proportioned regime; the defaults
+    // already satisfy it, so these only fire when a CLI override drops below the floor. The §12
+    // capacity ladder also showed capacity/depth is NOT the binding constraint (data + gradient
+    // quality are), so treat low-proportion warnings as advisory, not fatal.
     {
         const std::int64_t head_dim = cfg.embed_dim / static_cast<std::int64_t>(cfg.n_heads);
         if (head_dim < 32)
-            std::println("  note: head_dim={} (< the char-AR ref's 32) — but A/B shows MORE heads "
-                         "win here, so this is likely fine.", head_dim);
+            std::println("  note: head_dim={} (< founded floor 32) — proportioning A/B favoured ≥32 "
+                         "(advisory; capacity is not the bottleneck per §12).", head_dim);
         if (cfg.d_ff < 4 * cfg.embed_dim)
-            std::println("  note: d_ff={} is below the references' 4·D={} (advisory).",
+            std::println("  note: d_ff={} is below the founded 4·D={} (advisory).",
                          cfg.d_ff, 4 * cfg.embed_dim);
     }
 
