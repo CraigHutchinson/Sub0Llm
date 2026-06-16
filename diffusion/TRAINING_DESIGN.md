@@ -402,12 +402,31 @@ convergence signal.
   [--curriculum-k-step K]`. **Open:** a matched-comparison vs the uniform baseline (curricula are
   schedules, so compare *to-convergence/final* recall, not fixed-step) and a sensible `k_step` for
   the low-signal mid-range (step-1 is fine-grained; difficulty barely moves from `k=30` to `31`).
-- **Forgetting the easy levels (open).** Frontier-POINT trains at exactly `k`, so during the climb
-  the model stops seeing the easy `k=1` regime. In theory it shouldn't forget (the post-convergence
-  phase trains the full objective, revisiting all levels), and `k=1` is *not* a strict subset of
-  `k=20` (the latter conditions on far less context). ch29 now prints a live **`base(k=1)-NELBO`
-  forgetting watch** each curriculum epoch; per-`t` recall at any saved checkpoint is the
-  retrospective check. **If forgetting is observed,** rework the curriculum as a **cap/bias**: train
-  the *range* `t∈[t_min, k/T]` up to the frontier (every easier level stays in the mix, continually
-  reinforced) instead of exactly `k` — a one-line trainer change. Point is the lowest-variance
-  default; kept open pending the A/B evidence.
+- **Forgetting the easy levels — CHECKED, refuted (the easy levels are the MOST improved).**
+  Frontier-POINT trains at exactly `k`, so during the climb the model stops seeing the easy `k=1`
+  regime, and `k=1` is *not* a strict subset of `k=20` (the latter conditions on far less context).
+  ch29 prints a live **`base(k=1)-NELBO` forgetting watch** each curriculum epoch; per-`t` recall at
+  any checkpoint is the retrospective check. **If forgetting were observed,** the fix is a **cap/bias**:
+  train the *range* `t∈[t_min, k/T]` up to the frontier (every easier level stays in the mix) instead
+  of exactly `k` — a one-line trainer change. Kept available but NOT needed (see §13.1).
+
+### 13.1 Curriculum A/B result (2026-06-16) — WINS by +3.8pt; no forgetting
+Final self-terminated recall, matched arch (D128/L4) / corpus (3000 paras) / seed:
+| run | overall | word-level | word-START | best NELBO | steps |
+|-----|--------:|-----------:|-----------:|-----------:|------:|
+| uniform baseline | 15.9% | 14.0% | 11.7% | 4.006 | 33.3k |
+| **convergence curriculum** (k_step=2) | **19.7%** | **17.9%** | **14.7%** | **3.819** | 65.9k |
+
+- **+3.8pt overall / +3.0pt word-START / NELBO 4.01→3.82** — the session's biggest controlled win.
+  The curriculum converged cleanly (k=63 at step 54.9k, well under the 80k bound), then the full-
+  objective phase ran to self-termination. Not "just more steps": the uniform baseline **plateaued
+  and early-stopped at 33k** (its eval NELBO had bottomed); the curriculum reaches a genuinely lower
+  optimum because the staged difficulty avoids that premature plateau. (Caveat: single seed, D128.)
+- **Per-`t` recall, baseline → curriculum:** 0.05: 34.0→42.4 (+8.4), 0.10: 31.8→39.9 (+8.1),
+  0.30: 24.7→31.2 (+6.5), 0.50: 17.3→22.1 (+4.8), 0.70: 10.4→12.7 (+2.3), 0.90: 4.8→5.2 (+0.4).
+  **The gain is LARGEST at low `t` and decays monotonically to the high-`t` entropy floor** (H0=5.575)
+  — the easy regime was *strengthened*, not forgotten, and the foundation transfers upward. Low-`t`
+  masked-CE dropped 2.94→2.61, closing the §10 underfit marker further. **Forgetting refuted** for the
+  deliverable model; the cap/bias variant is unnecessary here.
+- **Next:** confirm on the founded arch (D256/L6) as the new candidate long run; sweep `k_step`
+  (2 was fine; the mid-range barely changes difficulty so larger may save epochs); 2nd seed.
