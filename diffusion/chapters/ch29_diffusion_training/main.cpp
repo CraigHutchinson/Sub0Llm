@@ -17,8 +17,14 @@
 //   ch29_diffusion_training [--corpus data/shakespeare.txt] [--paragraphs 600]
 //                           [--vocab-size 512] [--seq-len 64] [--steps 200000]
 //                           [--ckpt-dir /tmp/sub0diff_ch29] [--eval-every 2000]
-//                           [--patience 5] [--t-max 1.0] [--eval-only]
-//                           [--batch-size B] [--threads W]
+//                           [--patience 3] [--t-max 1.0] [--eval-only]
+//                           [--batch-size B] [--threads W] [--overfit N]
+//
+// MINIMAL-CASE diagnostic (--overfit N): train ONLY the first N non-overlapping windows
+// and stop on TRAIN recall over them. A model with enough capacity MUST hit ~100% — N=1
+// is degenerate (memorize one constant output), N=4/16/64 force more real modeling. If
+// even N=1 can't fit, the bug is structural (capacity/optimizer/loss), not data. Bisect
+// "do we need 8 layers / 3 heads?" by finding the smallest arch that still fits each N.
 //
 // Two ORTHOGONAL training knobs (see the unified trainer in train/parallel.hpp):
 //   --batch-size B  effective batch = windows averaged per optimizer step. The QUALITY knob:
@@ -82,8 +88,12 @@ struct Config {
     std::int64_t seq_len   = 64;
     std::uint64_t steps    = 0;        // 0 = corpus-scaled safety bound (see §2c)
     std::uint64_t eval_every = 0;      // 0 = compute from corpus; override with --eval-every
-    double eval_factor = 0.5;           // fraction of train positions per eval cadence (0.5 = 50%)
-    std::uint64_t patience   = 5;      // stop after this many evals without improvement
+    // Epochs of train coverage per eval. 1.0 = eval once per FULL epoch (was 0.5): a full-epoch-
+    // separated held-out NELBO is a much cleaner decision signal than a half-epoch one, and it
+    // halves the eval churn (each eval costs a recall+NELBO sweep). The hard floor stays 0.5.
+    double eval_factor = 1.0;
+    // Stop after this many evals without improvement - larger patience makes trainign less noise sensitive.
+    std::uint64_t patience   = 10;
     // Minimum full passes (epochs) before early-stopping may fire. Guards against the
     // failure seen on small corpora: the held-out NELBO plateaus within the patience
     // window after only a few passes (the model has barely left the unigram collapse),
@@ -155,6 +165,18 @@ struct Config {
     // coverage/undertraining (and is the apples-to-apples comparison with Ch28, which only
     // ever scored on its training corpus).
     bool eval_train        = false;
+    // --overfit N: the MINIMAL-CASE capacity diagnostic. Restrict TRAINING to the first N
+    // NON-OVERLAPPING windows (the first N·seq_len tokens of the train stream) and stop on
+    // TRAIN recall over those EXACT windows, not held-out NELBO. A model with adequate
+    // capacity MUST drive train recall to ~100%: N=1 is degenerate (memorize one constant
+    // output → 100% at every noise level), N=4/16/64 force progressively more real modeling.
+    // If even N=1 won't reach ~100%, the bug is STRUCTURAL (capacity / optimizer / loss /
+    // conditioning), not data/coverage — investigate before any more corpus-scale runs. It
+    // also answers "do we need 8 layers / 3 heads?" empirically: find the SMALLEST arch
+    // (--n-layers/--embed-dim/--n-heads) that still fits each N. Uses the IDENTICAL training
+    // path (ParallelTrainer + diffusion_loss) — that's the point: stress the real loop on a
+    // case whose right answer we know. Default eval-every 200 / steps 20000 unless overridden.
+    std::int64_t overfit   = 0;
     bool profile           = false;   // report forward/backward/optimizer time split
     // --threads W = WORKERS: how many parallel threads split each step's work. The SPEED knob
     // ONLY — the gradient (and thus the trained model) is identical for any W. 0 = auto (P/2),
@@ -243,6 +265,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--exact-noise")  c.exact_noise  = true;
         else if (a == "--no-exact-noise") c.exact_noise = false;  // restore Bernoulli-per-position
         else if (a == "--eval-train") c.eval_train = true;
+        else if (a == "--overfit")    c.overfit    = std::stoll(next());
         else if (a == "--profile")    c.profile    = true;
         else if (a == "--threads" || a == "--workers") c.threads = std::stoull(next());
         else if (a == "--batch-size" || a == "--batch") c.batch  = std::stoull(next());
@@ -582,6 +605,8 @@ static int run(int argc, char** argv) {
     // --batch-size B>1 raises consistency on any W; round up to a multiple of W (workers split B/W).
     if (cfg.batch <= 1) cfg.batch = std::max<std::size_t>(1, cfg.threads);
     else cfg.batch = ((cfg.batch + cfg.threads - 1) / cfg.threads) * cfg.threads;
+    const bool eval_every_user = cfg.eval_every != 0;   // did the user fix the cadence/bound?
+    const bool steps_user      = cfg.steps != 0;
     const double mean_t = 0.5 * (0.02 + cfg.t_max);
     const dt::ScheduleConfig sc{.eval_factor = cfg.eval_factor};
     const auto sched = dt::make_schedule(
@@ -595,8 +620,17 @@ static int run(int argc, char** argv) {
     const std::size_t eval_nelbo_windows = sched.eval_nelbo_windows;
     // Early-stopping floor: min_epochs full passes (in STEPS) before a stop may fire. A step trains
     // B = cfg.batch windows (over W workers), so divide epoch windows by B to get steps.
-    const std::uint64_t min_stop_steps =
+    std::uint64_t min_stop_steps =
         cfg.min_epochs * sched.epoch_windows / std::max<std::size_t>(1, cfg.batch);
+    // --overfit overrides the corpus-scaled schedule: the train stream is unchanged but we only
+    // visit N fixed windows, so the epoch/coverage logic doesn't apply. Watch train recall climb
+    // (eval often), cap the run (a model that can't fit N in 20k steps has a structural bug), and
+    // drop the min-epochs floor (stop the instant the N windows are fit).
+    if (cfg.overfit > 0) {
+        if (!eval_every_user) cfg.eval_every = 200;
+        if (!steps_user)      cfg.steps      = 20000;
+        min_stop_steps = 0;
+    }
 
     if (cfg.eval_factor < sc.min_coverage)
         std::println("note: --eval-factor {:.2f} clamped up to the {:.0f}% epoch-coverage floor "
@@ -774,6 +808,40 @@ static int run(int argc, char** argv) {
         return agg;
     };
 
+    // ── --overfit: the N fixed training windows + their exact train-recall ──────────
+    // The minimal-case diagnostic (see Config::overfit). The N non-overlapping windows we
+    // train on are the first N·seq_len tokens; recall is measured over EXACTLY those windows
+    // (not held-out, not straddling slides) so "did the model fit what it was shown?" is a
+    // clean yes/no. Same Bernoulli corruption as the held-out sweep for comparability.
+    std::vector<std::size_t> overfit_offsets;
+    if (cfg.overfit > 0) {
+        const auto N = static_cast<std::size_t>(cfg.overfit);
+        const auto T = static_cast<std::size_t>(cfg.seq_len);
+        if (train_ids.size() < N * T)
+            throw std::runtime_error(std::format(
+                "--overfit {} needs ≥ {} train tokens ({} windows × {}), have {}",
+                N, N * T, N, T, train_ids.size()));
+        overfit_offsets.reserve(N);
+        for (std::size_t i = 0; i < N; ++i) overfit_offsets.push_back(i * T);
+    }
+    auto overfit_recall_at = [&](float noise, std::mt19937& rr) {
+        de::RecoveryResult agg;
+        dn::Corruption corr;
+        for (auto off : overfit_offsets) {
+            auto w = std::span<const std::int32_t>(train_ids).subspan(off, static_cast<std::size_t>(cfg.seq_len));
+            dn::corrupt_into(w, noise, sub0diff::spec::NoiseSchedule::Absorbing,
+                             model.mask_id(), model.real_vocab(), rr, corr);
+            agg.accumulate(de::evaluate_recovery(model, w, corr.corrupted, nullptr, ws_span));
+        }
+        return agg;
+    };
+    auto overfit_recall = [&] {
+        std::mt19937 rr(99);
+        de::RecoveryResult agg;
+        for (float n : {0.10f, 0.25f, 0.50f, 0.75f}) agg.accumulate(overfit_recall_at(n, rr));
+        return agg;
+    };
+
     // ── 4. training ─────────────────────────────────────────────────────────────
     if (!cfg.eval_only && start_step < cfg.steps) {
         section("4. Training — self-terminating on held-out NELBO (early stopping)");
@@ -856,6 +924,11 @@ static int run(int argc, char** argv) {
                      cfg.batch, cfg.batch, cfg.threads, cfg.threads == 1 ? "" : "s",
                      cfg.shared_t ? "on" : "off", cfg.exact_noise ? "on" : "off");
         std::vector<std::size_t> offsets(cfg.batch);
+        std::size_t overfit_cursor = 0;   // cycles the N fixed windows across the B step slots
+        if (cfg.overfit > 0)
+            std::println("OVERFIT mode: training only the first {} non-overlapping window{} "
+                         "(stop on TRAIN recall ≥ 99%; cap {} steps)",
+                         cfg.overfit, cfg.overfit == 1 ? "" : "s", cfg.steps);
 
         // Frontier-point curriculum (opt-in): train AT a noise ceiling that rises only
         // once mastered. The floor stays at 0.02; frontier-point trains exactly at the
@@ -885,7 +958,12 @@ static int run(int argc, char** argv) {
             // Set the noise band the trainer samples from (curriculum ceiling, or the formal band).
             // shared-t sampling (one t for all B windows) happens inside pool->step() from this band.
             pool->set_t_range(t_lo, t_hi);
-            for (auto& o : offsets) o = off_dist(rng);
+            // OVERFIT: cycle the N fixed windows across the B slots (full-batch GD over them).
+            // Else: a fresh random sliding offset per slot (the held-out eval distribution).
+            if (cfg.overfit > 0)
+                for (auto& o : offsets) o = overfit_offsets[overfit_cursor++ % overfit_offsets.size()];
+            else
+                for (auto& o : offsets) o = off_dist(rng);
             auto res = pool->step(train_span, offsets);
             last_loss   = res.mean_loss;
             last_t      = res.last_t;
@@ -937,6 +1015,26 @@ static int run(int argc, char** argv) {
                 interval_tokens = 0;
             }
 
+            // ── OVERFIT: stop on TRAIN recall over the N fixed windows (not held-out) ──
+            if (cfg.overfit > 0 && (step + 1) % cfg.eval_every == 0) {
+                const auto r = overfit_recall();
+                std::println("  overfit @ {:>6}: TRAIN recall {:.1f}% (word {:.1f}%, START {:.1f}%) "
+                             "over {} window{} | train-nelbo {:.4f}",
+                             step + 1, r.recall() * 100.0f, r.word_recall() * 100.0f,
+                             r.ws_recall() * 100.0f, cfg.overfit, cfg.overfit == 1 ? "" : "s",
+                             last_loss);
+                if (r.recall() >= 0.99f) {
+                    save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
+                    std::println("  overfit FIT ✓ — train recall {:.1f}% ≥ 99% at step {}: capacity "
+                                 "SUFFICIENT for N={} (D={}, L={}, H={})",
+                                 r.recall() * 100.0f, step + 1, cfg.overfit,
+                                 cfg.embed_dim, cfg.n_layers, cfg.n_heads);
+                    steps_taken = step + 1;
+                    break;
+                }
+                continue;   // overfit never runs the held-out/patience path below
+            }
+
             // ── Convergence check: held-out NELBO every eval_every steps ───────────
             if ((step + 1) % cfg.eval_every == 0) {
                 const float nelbo = static_cast<float>(eval_nelbo(eval_nelbo_windows));
@@ -979,12 +1077,55 @@ static int run(int argc, char** argv) {
                          : std::format("{:.4f}", best_nelbo));
         // Reload the BEST checkpoint (the loop may have overfit past it) so §5
         // evaluates — and Ch30 inherits — the early-stopping winner, not the tail.
-        if (const auto best = latest_checkpoint_path(cfg.ckpt_dir); !best.empty())
-            (void)load_checkpoint(params, best);
+        // SKIP in --overfit: we want the LIVE trained weights (a stale checkpoint from a
+        // prior run in this dir must not clobber them), and the verdict is the train recall.
+        if (cfg.overfit == 0)
+            if (const auto best = latest_checkpoint_path(cfg.ckpt_dir); !best.empty())
+                (void)load_checkpoint(params, best);
     } else if (cfg.eval_only) {
         section("4. Training — skipped (--eval-only)");
     } else {
         section("4. Training — skipped (checkpoint already at target steps)");
+    }
+
+    // ── 5'. OVERFIT verdict: per-noise TRAIN recall over the N fixed windows ────────
+    // Held-out eval is meaningless here (we deliberately trained on N windows only), so
+    // report the diagnostic — can the model reproduce exactly what it was shown? — and exit.
+    if (cfg.overfit > 0) {
+        section("5. Overfit verdict — TRAIN recall over the fixed windows");
+        std::println("Model: D={}, layers={}, heads={}/{} (GQA), d_ff={}, params={} | N={} window{}",
+                     cfg.embed_dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff,
+                     n_params, cfg.overfit, cfg.overfit == 1 ? "" : "s");
+        std::println("  {:>6}  {:>8}  {:>10}  {:>7}", "noise", "masked", "recovered", "recall");
+        std::mt19937 orng(4242);
+        de::RecoveryResult agg;
+        for (float noise : {0.10f, 0.25f, 0.50f, 0.75f}) {
+            auto r = overfit_recall_at(noise, orng);
+            agg.accumulate(r);
+            std::println("  {:>5.0f}%  {:>8}  {:>10}  {:>6.1f}%",
+                         noise * 100.0f, r.masked, r.hits, r.recall() * 100.0f);
+        }
+        const float rec = agg.recall();
+        std::println("  overall TRAIN recall: {}/{} ({:.1f}%) | word-level {:.1f}% | word-START {:.1f}%",
+                     agg.hits, agg.masked, rec * 100.0f,
+                     agg.word_recall() * 100.0f, agg.ws_recall() * 100.0f);
+        // FIT bar (0.98) sits just below the loop's stop bar (0.99): the final table re-rolls
+        // corruption at a fresh seed, and single-window recall at high noise has real boundary
+        // variance — 98%+ is unambiguously "fit", so don't flip a stopped run to PARTIAL on noise.
+        std::println("\nVerdict: {}",
+                     rec >= 0.98f
+                         ? std::format("FIT ✓ — this arch can reproduce {} window{}; capacity is "
+                                       "NOT the bottleneck at N={}.", cfg.overfit,
+                                       cfg.overfit == 1 ? "" : "s", cfg.overfit)
+                     : rec >= 0.80f
+                         ? std::format("PARTIAL ({:.0f}%) — close; try more steps (--steps), a wider "
+                                       "model, or a higher LR (--lr).", rec * 100.0f)
+                         : std::format("FAIL ({:.0f}%) — this arch could not even MEMORIZE {} "
+                                       "window{} in {} steps. Structural issue (capacity / optimizer "
+                                       "/ loss / conditioning), not data — investigate here, cheaply, "
+                                       "before any corpus-scale run.", rec * 100.0f, cfg.overfit,
+                                       cfg.overfit == 1 ? "" : "s", cfg.steps));
+        return 0;
     }
 
     // ── 5. held-out evaluation: NELBO + recall sweep + edge profile ─────────────

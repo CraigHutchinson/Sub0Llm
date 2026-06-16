@@ -23,7 +23,7 @@
 namespace sub0diff::train {
 
 struct ScheduleConfig {
-    double        eval_factor     = 0.5;   // epochs of train coverage per eval
+    double        eval_factor     = 1.0;   // epochs of train coverage per eval (1.0 = once per full epoch)
     double        min_coverage    = 0.5;   // HARD floor — never eval on < 50% epoch coverage
     double        coverage_epochs = 50.0;  // safety bound (early stopping ends the run sooner)
     std::uint64_t min_eval_steps  = 100;   // never eval more often than this (tiny corpora)
