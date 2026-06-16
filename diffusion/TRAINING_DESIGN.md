@@ -270,3 +270,49 @@ but is "variance reduction lets us train longer before overfitting a tiny datase
 **Key sources:** MDLM (2406.07524), LLaDA (2502.09992), Diffusion-Beats-AR-in-Data-Constrained
 (2507.15857), Quokka optimal-DLM-scaling (2510.03280), Super-Data-Learners (2511.03276),
 MDM-scaling (2410.18514).
+
+---
+
+## 10. Founded long-run baseline + trend extrapolation (2026-06-16)
+
+Best-candidate long run (founded D256/L6, √16, patience 40, full corpus). Per-t diagnostic on an
+earlier old-arch checkpoint had shown the model is **t-aware but underfit at low t**; the founded
+arch directly attacks that. Result (power-law fit over 162 eval points, `fit_trend.py`):
+
+- **Headline: recall 21.5% → ~33% (+11pt), word-START 16.9% → ~25%, best NELBO 3.519 → ~3.34.**
+  Low-t train NELBO fell ~1.94 → ~1.4 — the underfit marker closing (founded arch fits the easy
+  regime much better). This confirms the ceiling was **fit/proportions**, not optimizer/conditioning.
+- **Trend:** `NELBO = 3.06 + 202·s^-0.55`, `recall = 40.0 − 1710·s^-0.45`. Asymptotes **≈40% recall /
+  ≈3.06 NELBO**. Diminishing hard: recall rate +1.62 → +0.62 pt/10k steps.
+- **Extrapolation:** +24h ≈ +2.5pt (→35.4%), +48h ≈ 36.3%; **90% of the remaining gain to the 40%
+  asymptote needs ~176× current compute.** ⇒ **more-of-the-same training is NOT the lever** — a day
+  buys ~2.5pt. The next gains must come from efficiency/data/recipe, not steps.
+
+## 11. dLLM training-EFFICIENCY axis — how each window is consumed (next work)
+
+Independent dLLM-efficiency review (grounded in MD4 / MDLM / RADD / Prime / DiffuCoder). The suspected
+inefficiency is real: masked-only loss supervises ~t·T positions per forward, and `t∼U` spends ~30% of
+forwards at `t>0.7` (near-empty canvas, irreducible loss ≈ unigram entropy, ~no learnable gradient).
+These are **efficiency/variance levers** (reach the floor faster/cheaper) — same family as the √16 win;
+they shave NELBO and cut compute but the ~3.3 *floor* is still set by data/proportions. Ranked by
+gain/effort:
+
+1. **Mid-`t` importance sampling + realized-`k` weighting** (~30 lines, top ratio). Replace `t∼U(0.02,1]`
+   with a proposal concentrated on `t∈[~0.05,0.7]`, correct the loss by `p_U(t)/p_prop(t)` (stays
+   unbiased), and weight by the **realized** mask count `1/(k/T)` not `1/t`, with `t_min·T≥3` (fixes
+   the §9.3-P2 low-`t` bias). Validated to beat loss-reweighting at equal FLOPs (Hang et al. 2407.03297);
+   removes the ~30% near-useless high-`t` forwards.
+2. **Complementary (antithetic) masking pairs** (low effort). Per window, run the mask AND its complement;
+   average the two masked-only NELBO terms → **100% token coverage per pair, ½ masking variance**. Same
+   family as √16 but on the masking axis (additive). Used by DiffuCoder coupled-GRPO; antithetic pairs
+   are an MD4 default.
+3. **Low-discrepancy / stratified-`t` across the batch** (~5 lines). `t^(i)=(u+i)/B` instead of iid or
+   `--shared-t` (which collapses all B to one `t`). Cheapest validated change; part of MDLM's +17%
+   perplexity-bound gain. **NB:** this is in tension with our `--shared-t` (collapse vs spread) — A/B them.
+
+**De-prioritized:** all-position/copy loss (breaks the valid masked-only bound — MD4); token-frequency
+weighting (no validated bound gain); RADD time-removal (conflicts — our per-`t` shows we WANT
+`t`-conditioning); Prime partial-masking (large gain, high architectural cost — backlog).
+
+**Sources:** MD4 (2406.04329), MDLM (2406.07524), RADD (2406.03736), Improved-Noise-Schedule
+(2407.03297), DiffuCoder coupled-GRPO (2506.20639), Prime partial-masking (2505.18495).
