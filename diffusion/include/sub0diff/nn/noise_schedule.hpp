@@ -59,6 +59,10 @@ struct Corruption {
 //   noise conditioning is exact, not a random Binomial), removes the Bernoulli COUNT variance
 //   from the gradient, and makes the min-1 floor a clean k≥1 clamp rather than a low-t hack.
 //   The remaining randomness is only WHICH positions — a deterministic, even, unbiased count.
+//   The count is clamped to [1, T-1] (T≥2): ≥1 masked gives a loss TARGET, and ≥1 VISIBLE gives
+//   a context SIGNAL — a fully-masked window (t→1) teaches only the marginal and is the highest-
+//   variance, lowest-information case (a measured t_max A/B: dropping the high-t tail trains a
+//   better model per unit compute). This min-1-visible floor is the symmetric twin of min-1-masked.
 template<class RNG>
 void corrupt_into(std::span<const std::int32_t> clean,
                   float            mask_prob,
@@ -95,7 +99,9 @@ void corrupt_into(std::span<const std::int32_t> clean,
     if (exact_count) {
         const std::int64_t T = static_cast<std::int64_t>(clean.size());
         std::int64_t k = std::llround(std::clamp(mask_prob, 0.0f, 1.0f) * static_cast<float>(T));
-        k = std::clamp<std::int64_t>(k, 1, T);
+        // [1, T-1]: always ≥1 masked (a target) AND ≥1 visible (context). T=1 is degenerate
+        // (can't have both) → fall back to k=1 (=T, fully masked, unavoidable at length 1).
+        k = std::clamp<std::int64_t>(k, 1, std::max<std::int64_t>(1, T - 1));
         // Knuth Algorithm S — select EXACTLY k of T positions uniformly with NO buffer/heap:
         // visit each position once, take it with probability (remaining_k / remaining_n).
         std::int64_t rem_k = k, rem_n = T;
@@ -119,6 +125,15 @@ void corrupt_into(std::span<const std::int32_t> clean,
     if (c.n_corrupted == 0) {
         std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
         corrupt_pos( pos_dist(rng) );
+    }
+    // Symmetric min-1-VISIBLE floor: if every position got masked (mask_prob→1), restore one
+    // so the window keeps a context signal (mirrors the exact-count [1, T-1] clamp). T≥2 only.
+    if (clean.size() >= 2 && c.n_corrupted == static_cast<std::uint32_t>(clean.size())) {
+        std::uniform_int_distribution<std::size_t> pos_dist(0, clean.size() - 1);
+        const std::size_t pos = pos_dist(rng);
+        c.tokens[pos] = clean[pos];
+        c.corrupted[pos] = 0;
+        --c.n_corrupted;
     }
 }
 

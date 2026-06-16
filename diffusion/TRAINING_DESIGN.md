@@ -321,3 +321,57 @@ weighting (no validated bound gain); RADD time-removal (conflicts — our per-`t
 
 **Sources:** MD4 (2406.04329), MDLM (2406.07524), RADD (2406.03736), Improved-Noise-Schedule
 (2407.03297), DiffuCoder coupled-GRPO (2506.20639), Prime partial-masking (2505.18495).
+
+## 12. Minimal-case experiments (2026-06-16) — capacity is cleared; the constraint is GRADIENT QUALITY
+
+Three controlled experiments via the new `--overfit N` harness (train only the first N
+non-overlapping windows; stop on TRAIN recall over exactly those windows; identical
+ParallelTrainer + diffusion_loss path). The point: stress the real loop on cases whose right
+answer we know. Tooling: `ch29 --overfit N`, `overfit_ladder.ps1`, `tmax_ab.ps1`.
+
+### 12.1 Capacity ladder (N=1/4/16/64 × D64-L2 / D128-L4 / D256-L6, all founded-proportioned)
+| arch | params | N=1 | N=4 | N=16 | N=64 (batch=1) |
+|------|-------:|-----|-----|------|------|
+| D64-L2 | 157K | FIT 100% @1800 | FIT 98% @4600 | FAIL 79% | FAIL 3% |
+| D128-L4 | 1.05M | FIT 100% @800 | ~FIT 98% @3200 | ~FIT 91% | FAIL 2% |
+| D256-L6 | 6.05M | FIT 98% @400 | ~FIT 93% | FIT 98% | FAIL 3% |
+
+- **Capacity is NOT the corpus-scale bottleneck.** Even 157K params memorize N=1/4; 1M fits N≤16.
+  ⇒ "do we need 8 layers / 3 heads?" — **no.** The founded +11pt (§10) was **proportions**
+  (head_dim 16→32, d_ff 3D→4D), not depth/size. Depth and head-count are not the lever.
+- **N=64 collapses to ~3% (the marginal/unigram floor) for ALL archs, including 6M** — impossible
+  as a capacity limit (6M params trivially hold 64×64=4096 tokens). A *discrete* cliff, not a
+  gradual rolloff ⇒ a training-dynamics failure, not capacity. (At batch=1, 64 windows cycled over
+  8000 steps = only ~125 visits/window AND a single-window/single-`t` gradient per step.)
+
+### 12.2 The N=64 collapse is GRADIENT VARIANCE, not capacity (decisive)
+Re-ran D128-L4 N=64 with **full-batch (B=64, all 64 windows per step)**: **FIT to 99% by step 1800**
+— the *same arch* that failed at 3.4% with batch=1. So the collapse was the high-variance batch=1
+gradient sinking into the marginal basin; the consistent √B gradient drives full memorization fast.
+**This is the session's through-line:** the binding constraint at this scale is **gradient quality
+(variance/consistency)**, not capacity, optimizer, or conditioning — the same mechanism behind the
+√16 win (§10) and the `t_max` win below. (Full-batch also raised visits/window; both are
+training-dynamics levers, neither is capacity — the representational sufficiency is proven.)
+
+### 12.3 `t_max` 1.0 vs 0.8 A/B — dropping the high-`t` tail wins (matched 30k-step budget, seed-matched)
+| `t_max` | overall recall | word-level | word-START | best held-out NELBO |
+|--------:|---------------:|-----------:|-----------:|--------------------:|
+| 1.0 | 14.1% | 12.4% | 10.4% | 4.129 |
+| **0.8** | **15.0%** | **13.0%** | **11.0%** | **4.070** |
+
+`t_max=0.8` wins every metric (+0.9pt overall, +0.6 word-START, lower NELBO) at equal compute —
+recall scored on identical fixed noises ≤0.75, so the eval is `t_max`-independent. Confirms §11:
+the `t>0.8` tail (near the entropy floor, ~no learnable context) is net-negative per unit compute.
+Same variance-reduction family as §12.2. *Caveat:* single seed / D128 scale; the bigger principled
+version is **mid-`t` importance sampling** (§11.1, keeps the full range unbiased). Ch30 blank-canvas
+generation uses the `t≈1` regime, so don't drop the default to 0.8 blindly — confirm on founded + a
+2nd seed first. **Shipped now:** the conservative, always-correct slice — a structural **min-1-VISIBLE
+floor** (`k∈[1,T-1]` in `corrupt_into`, both exact-count and Bernoulli paths): every training window
+keeps ≥1 visible token (a learnable context) *and* ≥1 masked token (a target). It is the symmetric
+twin of the existing min-1-masked floor and removes only the ~0.8% fully-blank windows (zero-signal,
+highest-variance), so it's safe with `t_max=1.0` default and Ch30 generation.
+
+**Net for the session:** capacity/depth/heads are NOT the lever (cleared); the levers are
+**gradient quality** (batch/consistency, mid-`t` sampling, lower high-`t` mass) and **data**
+(the ~3.3/40% floor, §10). Next: confirm `t_max`/importance-sampling on founded + a 2nd seed,
+then more/real data.

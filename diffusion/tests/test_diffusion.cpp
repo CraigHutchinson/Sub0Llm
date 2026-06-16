@@ -47,7 +47,7 @@ TEST_CASE("corrupt_into - reuses buffers, guarantees >=1 corruption", "[diffusio
         REQUIRE(c.tokens[i] == (c.corrupted[i] ? 16 : clean[i]));
 }
 
-TEST_CASE("corrupt_into - exact_count masks exactly round(t*T), floor 1", "[diffusion]") {
+TEST_CASE("corrupt_into - exact_count masks round(t*T), clamped to [1, T-1]", "[diffusion]") {
     const auto clean = ramp_tokens(40, 16);
     std::mt19937 rng(1);
     dn::Corruption c;
@@ -57,9 +57,9 @@ TEST_CASE("corrupt_into - exact_count masks exactly round(t*T), floor 1", "[diff
     REQUIRE(c.n_corrupted == 10);            // round(0.25 * 40)
     REQUIRE(count() == 10);
     dn::corrupt_into(clean, 0.001f, dn::NoiseSchedule::Absorbing, 16, 16, rng, c, true);
-    REQUIRE(c.n_corrupted == 1);             // floor: round→0, clamped to 1
+    REQUIRE(c.n_corrupted == 1);             // floor: round→0, clamped to 1 (≥1 masked target)
     dn::corrupt_into(clean, 1.0f, dn::NoiseSchedule::Absorbing, 16, 16, rng, c, true);
-    REQUIRE(c.n_corrupted == 40);            // all masked
+    REQUIRE(c.n_corrupted == 39);            // min-1-VISIBLE floor: T-1, never fully blank
     // The COUNT is deterministic across seeds (only WHICH positions differ) — the whole point.
     std::mt19937 r2(99);
     dn::corrupt_into(clean, 0.5f, dn::NoiseSchedule::Absorbing, 16, 16, r2, c, true);

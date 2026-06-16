@@ -221,7 +221,7 @@ cmake --build --preset native --target ch29_diffusion_training
   --corpus data/complete_shakespeare.txt --threads 4 --seq-len 128 --eval-train
 ```
 
-## Latest result :
+## Latest result @ 6bc78ee:
 FROM: `./build-native/bin/ch29_diffusion_training.exe --ckpt-dir D:/tmp/sub0diff_ch29_newb --corpus .\data\complete_shakespeare.txt --patience 15`
 
 The final recall appears to correlate/bounded by the optimizer fixes from 0.31 to 0.51 has moved our bar from ~0.3 to 0.4 @10% an increase across the board - there is soemthing here that seems relevant as potentially setting the upper-bar of our training is focused on here...
@@ -248,4 +248,34 @@ Edge effect: first 9.3%, last 8.4% vs interior mean 19.3%
 ── What's next ──
 Ch30 — the reverse process: iterative canvas refinement with confidence remasking,
        loading this chapter's model dir (D:/tmp/sub0diff_ch29_newb).
+```
+
+## Minimal-case findings (2026-06-16) — `--overfit`, the capacity ladder, and the `t_max` win
+
+Full write-up in [`../../TRAINING_DESIGN.md`](../../TRAINING_DESIGN.md) §12. Three controlled
+experiments on the real training path, via the new `--overfit N` harness:
+
+- **`--overfit N`** trains only the first N non-overlapping windows and stops on TRAIN recall over
+  exactly those windows. A model with adequate capacity MUST reach ~100% — it isolates capacity from
+  generalization. `overfit_ladder.ps1` sweeps N × arch; `tmax_ab.ps1` runs the `t_max` A/B.
+- **Capacity is NOT the bottleneck.** A 157K model (D64/L2) memorizes N=1/4; 1M fits N≤16. So
+  **depth/heads are not the lever** — the founded +11pt (TRAINING_DESIGN §10) was *proportions*
+  (head_dim 16→32, d_ff 3D→4D), not size. 4 layers would suffice for capacity.
+- **The constraint is GRADIENT QUALITY, not capacity.** N=64 collapsed to ~3% (marginal floor) for
+  every arch incl. 6M with `batch=1` — but the *same* D128 model fit N=64 to **99% by step 1800 with
+  full-batch (B=64)**. The high-variance single-window gradient sinks into the marginal basin;
+  consistency (√B) flips it. Same mechanism as the √16 win and the `t_max` win below.
+- **`t_max`=0.8 beats 1.0** at matched 30k-step budget (overall recall 14.1→15.0%, word-START
+  10.4→11.0%, NELBO 4.13→4.07): the `t>0.8` tail is near-zero-signal and net-negative per compute.
+  **Shipped:** a structural **min-1-visible floor** (`k∈[1,T-1]` in `corrupt_into`) so every training
+  window keeps ≥1 visible context token — the symmetric twin of the min-1-masked floor.
+
+```bash
+# capacity ladder (answers "do we need 8 layers / 3 heads?")
+pwsh diffusion/chapters/ch29_diffusion_training/overfit_ladder.ps1
+# does dropping the high-t tail help? (matched budget, seed-matched)
+pwsh diffusion/chapters/ch29_diffusion_training/tmax_ab.ps1
+# single check: can THIS arch memorize N windows?
+./build-native/bin/ch29_diffusion_training --overfit 64 --batch 64 --threads 8 \
+  --ckpt-dir /tmp/of --paragraphs 400 --embed-dim 128 --n-layers 4 --n-heads 4 --n-kv-heads 2 --d-ff 512
 ```
