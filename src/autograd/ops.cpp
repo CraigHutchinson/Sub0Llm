@@ -262,7 +262,7 @@ Variable log_softmax(const Variable& x) {
                 const auto pd    = probs_copy.data_as<float>();
                 const std::size_t total = gd.size();
 
-                Tensor result = zeros(probs_copy.shape());
+                Tensor result = zeros(probs_copy.shape(), DType::Float32, probs_copy.device());
                 auto   rd     = result.data_as<float>();
 
                 if (probs_copy.ndim() <= 1) {
@@ -506,16 +506,20 @@ Variable layer_norm(const Variable& x, const Variable& weight,
         Tensor xh_snap = copy(x_hat);
         Tensor rs_snap = rstd_t;
         Tensor w_snap  = copy(wc);
+        const Device x_dev = x.data().device();
+        const Device w_dev = weight.data().device();
+        const Device b_dev = bias.data().device();
 
         if (x.requires_grad())
             out->edges.push_back(make_edge(x.impl(),
-                [xh_snap, rs_snap, w_snap, T, D](const Tensor& g) {
+                [xh_snap, rs_snap, w_snap, x_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
                     const auto   gs  = gc.data_as<float>();
                     const auto   xhs = xh_snap.data_as<float>();
                     const auto   rs  = rs_snap.data_as<float>();
                     const auto   wgs = w_snap.data_as<float>();
-                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)},
+                                      DType::Float32, x_dev);
                     auto   gxs = gx.data_as<float>();
                     const float Df = static_cast<float>(D);
                     for (std::size_t i = 0; i < T; ++i) {
@@ -535,11 +539,11 @@ Variable layer_norm(const Variable& x, const Variable& weight,
                 }));
         if (weight.requires_grad())
             out->edges.push_back(make_edge(weight.impl(),
-                [xh_snap, T, D](const Tensor& g) {
+                [xh_snap, w_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
                     const auto   gs = gc.data_as<float>();
                     const auto   xhs= xh_snap.data_as<float>();
-                    Tensor gw = zeros({static_cast<int64_t>(D)});
+                    Tensor gw = zeros({static_cast<int64_t>(D)}, DType::Float32, w_dev);
                     auto   gws = gw.data_as<float>();
                     for (std::size_t i = 0; i < T; ++i)
                         for (std::size_t j = 0; j < D; ++j)
@@ -548,10 +552,10 @@ Variable layer_norm(const Variable& x, const Variable& weight,
                 }));
         if (bias.requires_grad())
             out->edges.push_back(make_edge(bias.impl(),
-                [T, D](const Tensor& g) {
+                [b_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
                     const auto   gs = gc.data_as<float>();
-                    Tensor gb = zeros({static_cast<int64_t>(D)});
+                    Tensor gb = zeros({static_cast<int64_t>(D)}, DType::Float32, b_dev);
                     auto   gbs = gb.data_as<float>();
                     for (std::size_t i = 0; i < T; ++i)
                         for (std::size_t j = 0; j < D; ++j)
@@ -723,12 +727,15 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
         // must be read-only on xn_snap / ir_snap (no scratch reuse into those buffers).
         Tensor xn_snap = std::move(x_norm);
         Tensor ir_snap = std::move(inv_rms);
+        const Device x_dev = x.data().device();
+        const Device w_dev = weight.data().device();
 
         if (x.requires_grad())
             out->edges.push_back(make_edge(x.impl(),
-                [xn_snap, ir_snap, w_snap = std::move(wc), T, D](const Tensor& g) {
+                [xn_snap, ir_snap, w_snap = std::move(wc), x_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
-                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+                    Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)},
+                                      DType::Float32, x_dev);
                     backend::cpu::rms_norm_bwd_x_f32(
                         reinterpret_cast<const float*>(gc.raw_ptr()),
                         reinterpret_cast<const float*>(xn_snap.raw_ptr()),
@@ -740,9 +747,9 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
                 }));
         if (weight.requires_grad())
             out->edges.push_back(make_edge(weight.impl(),
-                [xn_snap, T, D](const Tensor& g) {
+                [xn_snap, w_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
-                    Tensor gw = zeros({static_cast<int64_t>(D)});
+                    Tensor gw = zeros({static_cast<int64_t>(D)}, DType::Float32, w_dev);
                     backend::cpu::rms_norm_bwd_w_f32(
                         reinterpret_cast<const float*>(gc.raw_ptr()),
                         reinterpret_cast<const float*>(xn_snap.raw_ptr()),
@@ -803,13 +810,15 @@ Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freq
     if (out->requires_grad) {
         Tensor cf_snap = copy(cos_freqs);
         Tensor sf_snap = copy(sin_freqs);
+        const Device x_dev = x.data().device();
         out->edges.push_back(make_edge(x.impl(),
-            [cf_snap, sf_snap, T, Dh, D2](const Tensor& g) {
+            [cf_snap, sf_snap, x_dev, T, Dh, D2](const Tensor& g) {
                 const Tensor gc = g.contiguous();
                 const auto   gs = gc.data_as<float>();
                 const auto   cf = cf_snap.data_as<float>();
                 const auto   sf = sf_snap.data_as<float>();
-                Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)});
+                Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)},
+                                   DType::Float32, x_dev);
                 auto   gxs = gx.data_as<float>();
                 for (std::size_t t = 0; t < T; ++t)
                     for (std::size_t i = 0; i < D2; ++i) {
@@ -844,11 +853,12 @@ Variable narrow(const Variable& x, int64_t start, int64_t length) {
     auto out = make_node(std::move(out_data), x.requires_grad());
     if (out->requires_grad) {
         Shape orig_shape = xd.shape();
+        const Device x_dev = xd.device();
         out->edges.push_back(make_edge(x.impl(),
-            [start, length, orig_shape](const Tensor& g) {
+            [start, length, orig_shape, x_dev](const Tensor& g) {
                 const Tensor gc = g.contiguous();
                 const auto   gs = gc.data_as<float>();
-                Tensor gx  = zeros(orig_shape);
+                Tensor gx  = zeros(orig_shape, DType::Float32, x_dev);
                 auto   gxs = gx.data_as<float>();
                 const int64_t row_elems = gc.numel() / length;
                 for (int64_t i = 0; i < length; ++i)
@@ -882,7 +892,7 @@ Variable log_sigmoid(const Variable& x) {
         Tensor xsnap = copy(xd);
         out->edges.push_back(make_edge(x.impl(),
             [xsnap = std::move(xsnap)](const Tensor& g) {
-                Tensor gx(xsnap.shape(), DType::Float32);
+                Tensor gx(xsnap.shape(), DType::Float32, xsnap.device());
                 const auto xs  = xsnap.data_as<float>();
                 const auto gs  = g.data_as<float>();
                 auto       gxs = gx.data_as<float>();
@@ -929,14 +939,17 @@ Variable row_scale(const Variable& x, const Variable& v) {
         for (std::size_t j = 0; j < D; ++j)
             os[i * D + j] = xs[i * D + j] * vs[i];
 
+    const Device x_dev = xd.device();
+    const Device v_dev = vd.device();
     auto out = make_node(std::move(out_data), any_grad(x, v));
     if (out->requires_grad) {
         if (x.requires_grad()) {
             out->edges.push_back(make_edge(x.impl(),
-                [N, D, vc](const Tensor& g) {
+                [N, D, vc, x_dev](const Tensor& g) {
                     const auto g_sp  = g.data_as<float>();
                     const auto vc_sp = vc.data_as<float>();
-                    Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(D)});
+                    Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(D)},
+                                      DType::Float32, x_dev);
                     auto gxs = gx.data_as<float>();
                     for (std::size_t i = 0; i < N; ++i)
                         for (std::size_t j = 0; j < D; ++j)
@@ -946,10 +959,10 @@ Variable row_scale(const Variable& x, const Variable& v) {
         }
         if (v.requires_grad()) {
             out->edges.push_back(make_edge(v.impl(),
-                [N, D, xc](const Tensor& g) {
+                [N, D, xc, v_dev](const Tensor& g) {
                     const auto g_sp  = g.data_as<float>();
                     const auto xc_sp = xc.data_as<float>();
-                    Tensor gv = zeros({static_cast<int64_t>(N), 1});
+                    Tensor gv = zeros({static_cast<int64_t>(N), 1}, DType::Float32, v_dev);
                     auto gvs = gv.data_as<float>();
                     for (std::size_t i = 0; i < N; ++i) {
                         float s = 0.f;

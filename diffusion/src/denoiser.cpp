@@ -119,4 +119,10 @@ std::vector<Variable*> Denoiser::parameters() {
     return p;
 }
 
+Denoiser& Denoiser::to(sub0llm::Device device) {
+    for (auto* p : parameters())
+        p->to(device);
+    return *this;
+}
+
 } // namespace sub0diff::nn

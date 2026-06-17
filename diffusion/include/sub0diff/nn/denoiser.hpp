@@ -64,6 +64,12 @@ public:
 
     [[nodiscard]] std::vector<sub0llm::autograd::Variable*> parameters();
 
+    // Move every parameter (and any accumulated grad) to `device` in place. The
+    // parameter Variables keep their identity, so a Trainer/optimizer already
+    // holding parameters() pointers stays valid across the move. Same-device is a
+    // no-op. (Phase 0 device plumbing for the CUDA training backend.)
+    Denoiser& to(sub0llm::Device device);
+
     [[nodiscard]] std::int32_t mask_id()       const noexcept { return static_cast<std::int32_t>(real_vocab_); }
     [[nodiscard]] std::int64_t real_vocab()    const noexcept { return real_vocab_; }
     [[nodiscard]] std::int64_t model_vocab()   const noexcept { return real_vocab_ + 1; }

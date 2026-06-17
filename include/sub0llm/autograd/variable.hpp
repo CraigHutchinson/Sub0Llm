@@ -68,6 +68,13 @@ public:
     [[nodiscard]] bool          defined()       const noexcept { return impl_ != nullptr; }
     [[nodiscard]] const std::string& name()     const noexcept;
 
+    // Move this variable's storage to `target` in place. Mutates the underlying
+    // Node (data and, if already accumulated, grad), so every Variable* the
+    // optimizer holds into this Node stays valid — a model moved with this keeps
+    // its parameter identity. Same-device is a cheap no-op. Returns *this so
+    // callers can chain. (Phase 0 device plumbing for the CUDA backend.)
+    Variable& to(Device target);
+
     // Run reverse-mode AD from this node.  Call only on scalar (numel=1) outputs;
     // for tensor outputs supply an explicit upstream_grad of matching shape.
     void backward(Tensor upstream_grad = {});

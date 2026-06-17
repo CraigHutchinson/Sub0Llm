@@ -70,6 +70,18 @@ void Variable::zero_grad() {
     if (impl_) impl_->zero_grad();
 }
 
+Variable& Variable::to(Device target) {
+    if (!impl_) return *this;
+    if (impl_->data.device() != target)
+        impl_->data = impl_->data.to(target);
+    // Move an already-accumulated grad too, so a mid-training move keeps the
+    // optimizer state device-consistent; an empty grad (numel 0) is left as-is
+    // and lands on the right device the next time accumulate_grad runs.
+    if (impl_->grad.numel() != 0 && impl_->grad.device() != target)
+        impl_->grad = impl_->grad.to(target);
+    return *this;
+}
+
 // ── backward ──────────────────────────────────────────────────────────────────
 
 void Variable::backward(Tensor upstream_grad) {

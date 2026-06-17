@@ -13,6 +13,7 @@
 #include <numeric>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 using Catch::Matchers::WithinAbs;
@@ -368,4 +369,48 @@ TEST_CASE("FrontierCurriculum - per-epoch NELBO plateau advances integer k", "[d
     REQUIRE(c.level() == 7);
     REQUIRE_FALSE(c.observe_epoch(0.0f));        // converged: no further advancement
     REQUIRE(c.level() == 7);
+}
+
+// ── Device placement (Stage 4 Phase 0) ────────────────────────────────────────
+//
+// Denoiser::to moves every parameter in place. On CPU it must be a value-exact
+// no-op (forward parity); the CUDA case (gated) proves the params actually land
+// on the device. parameters() pointers stay valid across the move, so a Trainer
+// holding them keeps working.
+
+TEST_CASE("Denoiser::to - CPU move is a value-exact no-op", "[diffusion][device]") {
+    dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/7);
+    const auto ids_vec = ramp_tokens(12, 16);
+    sub0llm::Tensor ids({12}, sub0llm::DType::Int32);
+    auto idd = ids.data_as<std::int32_t>();
+    for (std::size_t i = 0; i < ids_vec.size(); ++i) idd[i] = ids_vec[i];
+
+    auto before = model.forward(ids, 0.4f);
+    const auto bd = before.data().data_as<float>();
+
+    dn::Denoiser& ret = model.to(sub0llm::Device::cpu());
+    REQUIRE(&ret == &model);                          // chainable
+    for (auto* p : model.parameters())
+        REQUIRE(p->data().device().is_cpu());
+
+    auto after = model.forward(ids, 0.4f);
+    const auto ad = after.data().data_as<float>();
+    REQUIRE(after.data().shape() == before.data().shape());
+    for (std::int64_t i = 0; i < before.data().numel(); ++i)
+        REQUIRE_THAT(bd[static_cast<std::size_t>(i)],
+                     WithinAbs(ad[static_cast<std::size_t>(i)], 0.0f));
+}
+
+TEST_CASE("Denoiser::to - moves parameters to the GPU", "[diffusion][device]") {
+    dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/7);
+#ifdef SUB0LLM_CUDA
+    model.to(sub0llm::Device::cuda());
+    for (auto* p : model.parameters())
+        REQUIRE(p->data().device().is_cuda());
+    model.to(sub0llm::Device::cpu());                 // round-trip back
+    for (auto* p : model.parameters())
+        REQUIRE(p->data().device().is_cpu());
+#else
+    REQUIRE_THROWS_AS(model.to(sub0llm::Device::cuda()), std::runtime_error);
+#endif
 }

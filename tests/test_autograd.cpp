@@ -6,6 +6,7 @@
 #include "sub0llm/core/ops.hpp"
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 using Catch::Matchers::WithinAbs;
@@ -418,5 +419,138 @@ TEST_CASE("batched matmul gradients equal stacked per-slice 2D gradients", "[aut
         for (int64_t i = 0; i < K * N; ++i)
             REQUIRE_THAT(gb[static_cast<std::size_t>(bi * K * N + i)],
                          WithinAbs(gb2[static_cast<std::size_t>(i)], 1e-4f));
+    }
+}
+
+// ── Device plumbing (Stage 4 Phase 0) ─────────────────────────────────────────
+//
+// Variable::to moves a parameter's storage in place, keeping Node identity. The
+// CPU cases run on every build; the CUDA cases (gated) exercise the real H2D/D2H
+// path and the grad-moving branch. The backward closures' device-correctness
+// (grads land on the input's device) is validated by these round-trips plus the
+// full CPU suite staying green — an on-device gradcheck arrives with the Phase 1
+// kernels, since forward is still CPU-pointer math here.
+
+TEST_CASE("Variable::to - same device is an identity no-op", "[autograd][device]") {
+    auto x = leaf2d({1, 2, 3, 4, 5, 6}, 2, 3, /*rg=*/true);
+    Variable& ret = x.to(Device::cpu());
+    REQUIRE(&ret == &x);                 // returns *this for chaining
+    REQUIRE(x.data().device().is_cpu());
+    REQUIRE(x.requires_grad());
+    REQUIRE(x.is_leaf());
+    auto d = x.data().data_as<float>();
+    REQUIRE(d[0] == 1.0f);
+    REQUIRE(d[5] == 6.0f);
+}
+
+TEST_CASE("Variable::to - preserves an accumulated grad", "[autograd][device]") {
+    auto x = leaf2d({1, -2, 3, -4}, 2, 2, /*rg=*/true);
+    sum(relu(x)).backward();             // populates x.grad() on CPU
+    REQUIRE(x.grad().numel() == 4);
+    const float g0 = x.grad().data_as<float>()[0];
+
+    x.to(Device::cpu());                 // no-op must not disturb the grad
+    REQUIRE(x.grad().numel() == 4);
+    REQUIRE(x.grad().device().is_cpu());
+    REQUIRE(x.grad().data_as<float>()[0] == g0);
+}
+
+TEST_CASE("Variable::to - undefined variable is a safe no-op", "[autograd][device]") {
+    Variable v;                          // default-constructed, no Node
+    REQUIRE_NOTHROW(v.to(Device::cpu()));
+    REQUIRE_FALSE(v.defined());
+}
+
+TEST_CASE("Variable::to - GPU round-trip moves data and grad", "[autograd][device]") {
+    auto x = leaf2d({1, 2, 3, 4}, 2, 2, /*rg=*/true);
+    sum(relu(x)).backward();
+    const float g0 = x.grad().data_as<float>()[0];
+#ifdef SUB0LLM_CUDA
+    x.to(Device::cuda());
+    REQUIRE(x.data().device().is_cuda());
+    REQUIRE(x.grad().device().is_cuda());   // grad-moving branch exercised
+    x.to(Device::cpu());
+    REQUIRE(x.data().device().is_cpu());
+    REQUIRE(x.data().data_as<float>()[3] == 4.0f);
+    REQUIRE(x.grad().device().is_cpu());
+    REQUIRE(x.grad().data_as<float>()[0] == g0);
+#else
+    REQUIRE_THROWS_AS(x.to(Device::cuda()), std::runtime_error);
+#endif
+}
+
+// The component test for the backward-closure device plumbing — runs WITHOUT a GPU.
+//
+// A {CPU, index=1} device is host-backed (the Tensor allocator dispatches on
+// is_cpu(), ignoring index) yet compares unequal to Device::cpu(). The forward
+// ops (unary_cpu / softmax / narrow) preserve the input's device value, so a real
+// CPU forward+backward on a {CPU,1} input must yield grads tagged {CPU,1}. Before
+// the fix the closures allocated grads with the default {CPU,0}, so each REQUIRE
+// below would fail — i.e. this genuinely exercises the change, not a tautology.
+TEST_CASE("backward closures allocate grads on the input's device value",
+          "[autograd][device]") {
+    const Device alt{DeviceType::CPU, 1};
+    REQUIRE_FALSE(alt == Device::cpu());
+
+    auto mk2d = [&](std::vector<float> v, int64_t r, int64_t c) {
+        Tensor t({r, c}, DType::Float32, alt);
+        auto s = t.data_as<float>();
+        for (std::size_t i = 0; i < v.size(); ++i) s[i] = v[i];
+        return Variable(std::move(t), true);
+    };
+    auto mk1d = [&](std::vector<float> v) {
+        Tensor t({static_cast<int64_t>(v.size())}, DType::Float32, alt);
+        auto s = t.data_as<float>();
+        for (std::size_t i = 0; i < v.size(); ++i) s[i] = v[i];
+        return Variable(std::move(t), true);
+    };
+
+    SECTION("rms_norm — x and weight grads") {
+        auto x = mk2d({1, 2, 3, 4, 5, 6}, 2, 3);
+        auto w = mk1d({1, 1, 1});
+        sum(rms_norm(x, w, 1e-5f)).backward();
+        REQUIRE(x.grad().device() == alt);
+        REQUIRE(w.grad().device() == alt);
+    }
+    SECTION("layer_norm — x, weight and bias grads") {
+        auto x = mk2d({1, 2, 3, 4, 5, 6}, 2, 3);
+        auto w = mk1d({1, 1, 1});
+        auto b = mk1d({0, 0, 0});
+        sum(layer_norm(x, w, b, 1e-5f)).backward();
+        REQUIRE(x.grad().device() == alt);
+        REQUIRE(w.grad().device() == alt);
+        REQUIRE(b.grad().device() == alt);
+    }
+    SECTION("rope — x grad") {
+        auto x = mk2d({1, 2, 3, 4, 5, 6, 7, 8}, 2, 4);   // T=2, Dh=4
+        Tensor cosf({2, 2}, DType::Float32, alt);
+        Tensor sinf({2, 2}, DType::Float32, alt);
+        auto cs = cosf.data_as<float>();
+        auto ss = sinf.data_as<float>();
+        for (std::size_t i = 0; i < 4; ++i) { cs[i] = 0.5f; ss[i] = 0.5f; }
+        sum(rope(x, cosf, sinf)).backward();
+        REQUIRE(x.grad().device() == alt);
+    }
+    SECTION("narrow — x grad") {
+        auto x = mk2d({1, 2, 3, 4, 5, 6, 7, 8}, 4, 2);
+        sum(narrow(x, 1, 2)).backward();
+        REQUIRE(x.grad().device() == alt);
+    }
+    SECTION("row_scale — x and v grads") {
+        auto x = mk2d({1, 2, 3, 4}, 2, 2);
+        auto v = mk2d({2, 3}, 2, 1);
+        sum(row_scale(x, v)).backward();
+        REQUIRE(x.grad().device() == alt);
+        REQUIRE(v.grad().device() == alt);
+    }
+    SECTION("log_softmax — x grad") {
+        auto x = mk2d({1, 2, 3, 4, 5, 6}, 2, 3);
+        sum(log_softmax(x)).backward();
+        REQUIRE(x.grad().device() == alt);
+    }
+    SECTION("log_sigmoid — x grad") {
+        auto x = mk2d({0.5f, -0.5f, 1.0f, -1.0f}, 2, 2);
+        sum(log_sigmoid(x)).backward();
+        REQUIRE(x.grad().device() == alt);
     }
 }
