@@ -81,8 +81,11 @@ int main(int argc, char** argv) {
     std::uint64_t iters  = 600;
     int max_threads = 0;   // 0 = up to physical P-cores
     std::int64_t alloc_batch = 16;   // --alloc-count effective batch (per-worker = B/W)
-    const std::int64_t V = 512, D = 128, n_layers = 4, d_ff = 384;
-    const std::size_t n_heads = 8, n_kv_heads = 4;
+    // Arch defaults match the OLD reference (D=128/L4); override with the flags below to sweep
+    // the FOUNDED default (D=256/L6) — the arch the scaling wall must be re-measured against now
+    // the heap/malloc-lock thrash is fixed. --founded sets the founded proportions in one flag.
+    std::int64_t V = 512, D = 128, n_layers = 4, d_ff = 384;
+    std::size_t n_heads = 8, n_kv_heads = 4;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -91,6 +94,13 @@ int main(int argc, char** argv) {
         else if (a == "--iters")       iters   = std::stoull(next());
         else if (a == "--max-threads") max_threads = std::stoi(next());
         else if (a == "--alloc-batch") alloc_batch = std::stoll(next());
+        else if (a == "--embed-dim")   D = std::stoll(next());
+        else if (a == "--n-layers")    n_layers = std::stoll(next());
+        else if (a == "--d-ff")        d_ff = std::stoll(next());
+        else if (a == "--n-heads")     n_heads = std::stoull(next());
+        else if (a == "--n-kv-heads")  n_kv_heads = std::stoull(next());
+        else if (a == "--vocab-size")  V = std::stoll(next());
+        else if (a == "--founded")   { D = 256; n_layers = 6; d_ff = 1024; n_heads = 8; n_kv_heads = 4; }
     }
 
     bool alloc_probe = false, affinity_test = false, batch_bench = false, gemm_probe = false,
