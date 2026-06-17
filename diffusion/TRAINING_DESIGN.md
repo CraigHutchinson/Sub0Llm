@@ -462,3 +462,42 @@ proves *useful*, not just lower-NELBO):
   per-level curve already exists via `--per-t`. **Gate:** decide after the founded run finishes AND we
   judge whether the end model is actually useful (coherent generation / recall worth the schedule),
   not merely lower-NELBO.
+
+### 13.3 Level-NELBO rises with `k`, and the loss-weighting / per-level-cadence question (2026-06-17)
+Observed live (W=16 founded run): the per-level NELBO **rises** as the frontier climbs —
+k17 2.36, k18 2.39, k19 2.48, k20 2.57, k22 2.70 — while `base(k=1)` stays ~1.28–1.38.
+
+**First, what is NOT a bug.** `weighted_cross_entropy` returns the **mean over masked positions**,
+then the per-window NELBO scales it by `w = n_masked/(t·T)`. With **exact-count** masking (default) at
+the frontier, `t·T = k = n_masked` exactly ⇒ **`w = 1.0`**, so the reported level-NELBO **is the mean
+per-masked-token CE** (per-token NLL). As `k` rises, each masked token is predicted from less context,
+so per-token CE climbs toward the unigram **entropy floor** `H0`≈5.6 — i.e. **level-NELBO rising with `k`
+is the per-`t` difficulty curve, expected, not a defect.** Do not chase it as one.
+
+**This sharpens §13.2's early-termination story.** Because `w≈1`, the global NELBO `E_t[CE]` is the
+`t`-averaged *per-token* CE; every level contributes its per-token mean **equally per window**, so the
+high-`t` near-floor region (most of the `t` range) dominates the average and the learnable low-`t`
+progress is a thin slice — exactly "the higher levels are slow to move and the signal is lost in the
+noise." Precise restatement of why uniform training trips patience early.
+
+**Two genuinely-new investigables (backlog — see memory `diffusion-loss-weighting-and-level-cadence`):**
+1. **Loss-weighting balance (the user's "not weighted evenly for the larger token count").** The NELBO's
+   `(1/t)` weight makes each **window** contribute equally to the `t`-integral — which is the unbiased
+   estimator, but it means an individual **high-noise token** prediction is weighted *less* per-token than
+   a low-noise one (a `k=40` window's 40 predictions share the same window-weight as a `k=4` window's 4).
+   That may train high-noise levels too slowly **and** be a fundamental reason mixed-noise gradients
+   "conflict" (different effective per-token weights → competing directions; cf. the grad-conflict probe
+   and [[ch31-diffusion-optimization-sandbox-plan]] variance findings). A/B to run: NELBO `(1/t)` weighting
+   vs **per-token-equal** (drop `1/t`, weight by token count) vs an SNR-style weight — does per-token
+   weighting move the high-`t` curve faster and reduce conflict, at what cost to the low-`t` win?
+2. **Advance-while-still-learning / per-level cadence.** The curriculum advances on the current level's
+   per-epoch plateau (relative-2% bar), but at high `k` the learnable gain is smaller and slower, so the
+   plateau test can fire while the level is still inching down ("learning", not converged). This is the
+   case **for** the noise-**spread** / organic curriculum (§13.2): train a *band* up to the frontier so
+   each level keeps being reinforced as the front advances, rather than a point that leaves it behind.
+   Cheap levers to consider: scale patience (or the bar) with `k`; gate advancement on
+   learnable-progress-relative-to-floor `(CE−H0)` rather than absolute ΔNELBO.
+
+**Gate / non-disruption:** do NOT perturb the live founded run to test these — they are A/Bs for a fresh
+run (ideally the [[ch31-diffusion-optimization-sandbox-plan]] sandbox, where noise/weighting are isolated).
+Mechanistically these underpin the organic curriculum (§13.2) and the polluted-global-NELBO story.

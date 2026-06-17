@@ -101,6 +101,13 @@ nothing needs it. simdjson is parse-only → pair each migrated reader with a sm
 Gated on the founded run proving USEFUL. Generalize `FrontierCurriculum` to per-level plateau
 tracking + adaptive importance sampling. Add a cheap mid-k forward-transfer probe at next restart.
 
+### G. Diffusion loss-weighting & per-level cadence  (training-science track, not architecture)
+`TRAINING_DESIGN.md` §13.3 / memory `diffusion-loss-weighting-and-level-cadence`. A/B the per-window
+`(1/t)` NELBO weight vs per-token-equal vs SNR-style (may underlie noise-level gradient conflict +
+early global-NELBO stop), and whether the curriculum advances levels while still learning. Run in the
+[[ch31]] sandbox / a fresh run — NOT on the live founded run. Listed here so it isn't lost; it's
+distinct from the specialize/backend line above.
+
 ---
 
 ## 3. Stage 4 CUDA — phased plan (from the gap audit)
