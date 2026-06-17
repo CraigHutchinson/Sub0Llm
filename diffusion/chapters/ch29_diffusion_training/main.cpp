@@ -41,12 +41,15 @@
 // Ch24 failure mode: train loss falls while eval loss climbs).
 
 #include "sub0diff/config/run_config.hpp"
+#include "sub0diff/data/token_cache.hpp"
+#include "sub0diff/eval/inspect.hpp"
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/curriculum.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 #include "sub0diff/train/parallel.hpp"
 #include "sub0diff/train/schedule.hpp"
+#include "sub0diff/train/train_state.hpp"
 
 #include "sub0llm/compat/print.hpp"
 #include "sub0llm/core/runtime.hpp"
@@ -139,202 +142,12 @@ static std::vector<std::string> read_paragraphs(const std::string& path, std::in
     return out;
 }
 
-// ── Per-sample recovery inspection (--inspect N) ───────────────────────────────
-// Dumps the N best- and N worst-recovered held-out windows at a fixed noise level with
-// per-masked-position truth→prediction detail, so "15% recall" becomes legible: which
-// words the model nails, which it misses, and whether misses are word-STARTS (real
-// prediction) or continuations (partial-word completion).
-static void inspect_recovery(const dn::Denoiser& model, const BPETokenizer& tok,
-                             std::span<const std::int32_t> stream, std::int64_t T,
-                             std::span<const std::uint8_t> ws, bool whole_word,
-                             int n_show, float noise) {
-    // Render a single token id legibly: the Ġ word-start marker (UTF-8 C4 A0) → '·'.
-    auto disp = [&](std::int32_t id) {
-        std::string s(tok.token_str(id));
-        if (s.size() >= 2 && static_cast<unsigned char>(s[0]) == 0xC4 &&
-            static_cast<unsigned char>(s[1]) == 0xA0)
-            return "·" + s.substr(2);
-        return s;
-    };
-    struct Miss { std::int32_t pos, truth, pred; bool hit, word_start; };
-    struct Sample { std::size_t off; float recall; std::vector<Miss> masked; };
-
-    const std::size_t n_positions = stream.size() - static_cast<std::size_t>(T) + 1;
-    const std::size_t budget = std::min<std::size_t>(400, n_positions);
-    const double step = static_cast<double>(n_positions) / static_cast<double>(budget);
-    std::mt19937 rng(20240614);
-    dn::Corruption corr;
-    std::vector<Sample> samples;
-    samples.reserve(budget);
-
-    for (std::size_t i = 0; i < budget; ++i) {
-        const auto off = static_cast<std::size_t>(static_cast<double>(i) * step);
-        auto window = stream.subspan(off, static_cast<std::size_t>(T));
-        if (whole_word)
-            dn::corrupt_whole_word_into(window, ws, noise, sub0diff::spec::NoiseSchedule::Absorbing,
-                                        model.mask_id(), model.real_vocab(), rng, corr);
-        else
-            dn::corrupt_into(window, noise, sub0diff::spec::NoiseSchedule::Absorbing,
-                             model.mask_id(), model.real_vocab(), rng, corr);
-        // Forward on the corrupted window, argmax over real tokens at each masked position.
-        Tensor input({T}, DType::Int32);
-        std::ranges::copy(corr.tokens, input.data_as<std::int32_t>().begin());
-        const float actual = static_cast<float>(corr.n_corrupted) / static_cast<float>(T);
-        auto logits = model.forward(input, actual);
-        const auto lz = logits.data().data_as<float>();
-        const auto C  = static_cast<std::size_t>(model.model_vocab());
-        const auto V  = model.real_vocab();
-        Sample s{off, 0.0f, {}};
-        int hits = 0;
-        for (std::int64_t t = 0; t < T; ++t) {
-            if (!corr.corrupted[static_cast<std::size_t>(t)]) continue;
-            std::int32_t best = 0; float bv = -1e30f;
-            for (std::int64_t c = 0; c < V; ++c) {
-                const float v = lz[static_cast<std::size_t>(t) * C + static_cast<std::size_t>(c)];
-                if (v > bv) { bv = v; best = static_cast<std::int32_t>(c); }
-            }
-            const auto truth = window[static_cast<std::size_t>(t)];
-            const bool hit = (best == truth);
-            hits += hit;
-            const bool wstart = (t == 0) || ws[static_cast<std::size_t>(truth)] != 0;
-            s.masked.push_back({static_cast<std::int32_t>(t), truth, best, hit, wstart});
-        }
-        s.recall = s.masked.empty() ? 0.0f
-                                    : static_cast<float>(hits) / static_cast<float>(s.masked.size());
-        samples.push_back(std::move(s));
-    }
-
-    std::ranges::sort(samples, [](const Sample& a, const Sample& b) { return a.recall > b.recall; });
-
-    auto dump = [&](const Sample& s) {
-        auto window = stream.subspan(s.off, static_cast<std::size_t>(T));
-        std::vector<BPETokenizer::TokenId> ids(window.begin(), window.end());
-        std::string text = tok.decode(ids);
-        if (text.size() > 200) text = text.substr(0, 200) + "…";
-        std::println("  ── window @ {}  recall {:.0f}% ({} masked) ──",
-                     s.off, s.recall * 100.0f, s.masked.size());
-        std::println("    text: {}", text);
-        for (const auto& m : s.masked) {
-            std::println("      [{:>2}] {:<4} {:>10} → {:<10} {}",
-                         m.pos, m.word_start ? "WORD" : "cont",
-                         "'" + disp(m.truth) + "'", "'" + disp(m.pred) + "'",
-                         m.hit ? "✓" : "✗");
-        }
-    };
-
-    std::println("\n── --inspect: per-sample recovery at noise {:.0f}%{} ──",
-                 noise * 100.0f, whole_word ? " (whole-word)" : "");
-    const int n = std::min(n_show, static_cast<int>(samples.size()));
-    std::println("Best {} recovered windows:", n);
-    for (int i = 0; i < n; ++i) dump(samples[static_cast<std::size_t>(i)]);
-    std::println("\nWorst {} recovered windows:", n);
-    for (int i = 0; i < n; ++i)
-        dump(samples[samples.size() - 1 - static_cast<std::size_t>(i)]);
-}
-
-// ── Token-stream cache ─────────────────────────────────────────────────────────
-// BPE-encoding the full corpus (146K paragraphs) is the dominant STARTUP cost and is
-// DETERMINISTIC given a fixed (corpus, paragraph-limit, tokenizer). Cache the post-split
-// flat token streams to `ckpt_dir/tokens.bin` so resumes and --eval-only start near-
-// instantly. The header fingerprints (corpus byte-size, paragraph limit, vocab size); any
-// mismatch re-encodes and rewrites. (The vocab sweep is safe: each V has its own ckpt_dir.)
-namespace tokcache {
-constexpr std::uint32_t kMagic = 0x53304454u;  // "S0DT"
-constexpr std::uint32_t kVersion = 1u;
-struct Header {
-    std::uint32_t magic = kMagic, version = kVersion;
-    std::uint64_t corpus_size = 0;
-    std::int64_t  paragraphs = 0;
-    std::uint64_t vocab_size = 0;
-    std::uint64_t n_train = 0, n_eval = 0;
-};
-
-[[nodiscard]] static bool load(const fs::path& path, std::uint64_t corpus_size,
-                               std::int64_t paragraphs, std::uint64_t vocab_size,
-                               std::vector<std::int32_t>& train_ids,
-                               std::vector<std::int32_t>& eval_ids) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    Header h;
-    f.read(reinterpret_cast<char*>(&h), sizeof(h));
-    if (!f || h.magic != kMagic || h.version != kVersion || h.corpus_size != corpus_size ||
-        h.paragraphs != paragraphs || h.vocab_size != vocab_size)
-        return false;
-    train_ids.resize(h.n_train);
-    eval_ids.resize(h.n_eval);
-    if (h.n_train) f.read(reinterpret_cast<char*>(train_ids.data()),
-                          static_cast<std::streamsize>(h.n_train * sizeof(std::int32_t)));
-    if (h.n_eval)  f.read(reinterpret_cast<char*>(eval_ids.data()),
-                          static_cast<std::streamsize>(h.n_eval * sizeof(std::int32_t)));
-    return static_cast<bool>(f);
-}
-
-static void save(const fs::path& path, std::uint64_t corpus_size, std::int64_t paragraphs,
-                 std::uint64_t vocab_size, const std::vector<std::int32_t>& train_ids,
-                 const std::vector<std::int32_t>& eval_ids) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return;
-    Header h{kMagic, kVersion, corpus_size, paragraphs, vocab_size,
-             train_ids.size(), eval_ids.size()};
-    f.write(reinterpret_cast<const char*>(&h), sizeof(h));
-    if (!train_ids.empty()) f.write(reinterpret_cast<const char*>(train_ids.data()),
-                                    static_cast<std::streamsize>(train_ids.size() * sizeof(std::int32_t)));
-    if (!eval_ids.empty())  f.write(reinterpret_cast<const char*>(eval_ids.data()),
-                                    static_cast<std::streamsize>(eval_ids.size() * sizeof(std::int32_t)));
-}
-} // namespace tokcache
-
-// ── Training-state sidecar (train_state.txt) ───────────────────────────────────
-// Weights live in step_*.ckpt and Adam's moments in step_*.opt; this tiny text file holds
-// the remaining run state so a resume is HONEST — the curriculum continues mid-climb and
-// early-stopping keeps its history, instead of both restarting. One `key=value` per line
-// (human-readable, dependency-free). `step` is matched against the resumed checkpoint so a
-// stale sidecar is ignored.
-namespace trainstate {
-struct State {
-    bool          have = false;
-    std::uint64_t step = 0;
-    std::int64_t  curr_k = 1;
-    float         curr_best = std::numeric_limits<float>::max();
-    int           curr_stalls = 0;
-    bool          curr_converged = false;
-    float         best_nelbo = std::numeric_limits<float>::max();
-    std::uint64_t evals_since_best = 0;
-};
-
-static void save(const fs::path& path, const State& s) {
-    std::ofstream f(path);
-    if (!f) return;
-    f << std::format("step={}\ncurriculum_k={}\ncurriculum_best={:.9g}\ncurriculum_stalls={}\n"
-                     "curriculum_converged={}\nbest_nelbo={:.9g}\nevals_since_best={}\n",
-                     s.step, s.curr_k, s.curr_best, s.curr_stalls,
-                     s.curr_converged ? 1 : 0, s.best_nelbo, s.evals_since_best);
-}
-
-// Load and validate against the resumed step; returns have=false on any mismatch/absence.
-[[nodiscard]] static State load(const fs::path& path, std::uint64_t expect_step) {
-    State s;
-    std::ifstream f(path);
-    if (!f) return s;
-    std::string line;
-    while (std::getline(f, line)) {
-        const auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-        try {
-            if      (k == "step")                  s.step = std::stoull(v);
-            else if (k == "curriculum_k")          s.curr_k = std::stoll(v);
-            else if (k == "curriculum_best")       s.curr_best = std::stof(v);
-            else if (k == "curriculum_stalls")     s.curr_stalls = std::stoi(v);
-            else if (k == "curriculum_converged")  s.curr_converged = (v != "0");
-            else if (k == "best_nelbo")            s.best_nelbo = std::stof(v);
-            else if (k == "evals_since_best")      s.evals_since_best = std::stoull(v);
-        } catch (...) { return State{}; }   // malformed → treat as absent
-    }
-    s.have = (s.step == expect_step);       // only trust a sidecar matching the resumed ckpt
-    return s;
-}
-}  // namespace trainstate
+// ── Reusable support units — extracted to sub0diff for reuse across chapters ──────
+//   inspect_recovery → sub0diff/eval/inspect.hpp        (call via de::inspect_recovery)
+//   tokcache         → sub0diff/data/token_cache.hpp
+//   trainstate       → sub0diff/train/train_state.hpp  (pairs with the run_config module)
+namespace tokcache   = sub0diff::data::tokcache;
+namespace trainstate = sub0diff::train::trainstate;
 
 static int run(int argc, char** argv);
 
@@ -1246,8 +1059,8 @@ static int run(int argc, char** argv) {
     if (cfg.diag.inspect > 0) {
         section("5c. Per-sample recovery inspection (--inspect)");
         const int n = static_cast<int>(cfg.diag.inspect);
-        inspect_recovery(model, tok, eval_ids, cfg.model.seq_len, ws_span, cfg.optim.whole_word, n, 0.25f);
-        inspect_recovery(model, tok, eval_ids, cfg.model.seq_len, ws_span, cfg.optim.whole_word, n, 0.50f);
+        de::inspect_recovery(model, tok, eval_ids, cfg.model.seq_len, ws_span, cfg.optim.whole_word, n, 0.25f);
+        de::inspect_recovery(model, tok, eval_ids, cfg.model.seq_len, ws_span, cfg.optim.whole_word, n, 0.50f);
     }
 
     section("What's next");
