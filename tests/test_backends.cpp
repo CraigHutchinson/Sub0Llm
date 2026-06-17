@@ -142,3 +142,43 @@ TEST_CASE("to() CUDA throws without CUDA build", "[backends][dispatch]") {
     SUCCEED("CUDA build - skipping no-CUDA guard test");
 #endif
 }
+
+// Stage 4 Phase 1: the CUDA softmax kernel must match the CPU reference. Gated on the CUDA
+// build (runs on the GPU); on a CPU build the dispatch never reaches the device branch.
+TEST_CASE("softmax - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t rows = 8, cols = 1000;   // vocab-ish row width
+    Tensor x = randn({rows, cols});
+    {   // widen the dynamic range so the max-subtract path matters
+        auto xs = x.data_as<float>();
+        for (int64_t i = 0; i < rows * cols; ++i) xs[static_cast<std::size_t>(i)] *= 6.0f;
+    }
+    const Tensor cpu_y = ops::softmax(x, -1);
+
+    const Tensor x_dev = x.to(Device::cuda());
+    const Tensor y_dev = ops::softmax(x_dev, -1);
+    REQUIRE(y_dev.device().is_cuda());
+    const Tensor gpu_y = y_dev.to(Device::cpu());
+
+    const auto cy = cpu_y.data_as<float>();
+    const auto gy = gpu_y.data_as<float>();
+    double se = 0.0, sref = 0.0;
+    for (int64_t i = 0; i < rows * cols; ++i) {
+        const double d = static_cast<double>(gy[static_cast<std::size_t>(i)]) -
+                         static_cast<double>(cy[static_cast<std::size_t>(i)]);
+        se   += d * d;
+        sref += static_cast<double>(cy[static_cast<std::size_t>(i)]) *
+                static_cast<double>(cy[static_cast<std::size_t>(i)]);
+    }
+    const double rel_rms = std::sqrt(se / sref);
+    REQUIRE(rel_rms < 1e-4);
+
+    for (int64_t r = 0; r < rows; ++r) {   // each GPU row is a valid distribution
+        double s = 0.0;
+        for (int64_t c = 0; c < cols; ++c) s += gy[static_cast<std::size_t>(r * cols + c)];
+        REQUIRE_THAT(s, WithinAbs(1.0, 1e-4));
+    }
+#else
+    SUCCEED("CPU build - CUDA softmax parity is exercised on the cuda preset");
+#endif
+}

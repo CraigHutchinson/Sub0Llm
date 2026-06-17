@@ -36,6 +36,44 @@ __global__ void relu_f32_kernel(const float* in, float* out, int n) {
     if (i < n) out[i] = in[i] > 0.0f ? in[i] : 0.0f;
 }
 
+// Row-wise softmax: one block per row, blockDim threads reduce max then Σexp in shared mem,
+// matching backend::cpu::softmax_rows_f32 (max-subtract → expf → normalise). blockDim must be
+// a power of two for the tree reduction. expf (not __expf) to stay close to the CPU reference.
+__global__ void softmax_rows_f32_kernel(const float* __restrict__ in, float* __restrict__ out,
+                                        int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* rin  = in  + static_cast<std::size_t>(row) * cols;
+    float*       rout = out + static_cast<std::size_t>(row) * cols;
+
+    extern __shared__ float red[];
+    float local = -INFINITY;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) local = fmaxf(local, rin[i]);
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    const float mx = red[0];
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float e = expf(rin[i] - mx);
+        rout[i] = e;
+        lsum += e;
+    }
+    red[threadIdx.x] = lsum;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) rout[i] *= inv;
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -612,6 +650,11 @@ void launch_mul_f32(const float* a, const float* b, float* out, std::size_t n) {
 
 void launch_relu_f32(const float* in, float* out, std::size_t n) {
     relu_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(in, out, static_cast<int>(n));
+}
+
+void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols) {
+    constexpr int B = 256;                        // power of two for the tree reduction
+    softmax_rows_f32_kernel<<<rows, B, B * sizeof(float)>>>(in, out, rows, cols);
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,

@@ -63,10 +63,12 @@ the planned next axis (informally "Ch32"). This roadmap is that work, now fed by
 ## 2. Pending work (prioritized)
 
 ### A. Stage 4 — CUDA backend for diffusion training  (~22h, phased; see §3)
-The larger throughput lever. Gap audit done: device transfer exists, but autograd VJP closures
-allocate grads device-agnostically, 7 CUDA kernels are missing, and `GemmaGpuLayers` is
-inference-only. Phase 0 is CPU-testable; the rest need the CUDA build (`cuda`/`cuda-native`
-preset — see memory `cuda-build-setup`).
+The larger throughput lever. Gap audit done: device transfer exists; **Phase 0 (device plumbing)
+is now DONE** — backward grads land on the input's device and `Variable::to`/`Denoiser::to` exist.
+**Phase 1 (softmax fwd) also DONE** — CUDA kernel + dispatch + parity test + CPU-vs-GPU bench
+(586 CPU / 543 core + 41 diffusion CUDA cases green). Remaining: ~6 CUDA kernels (rms_norm bwd,
+matmul_tb, rope, silu/embedding bwd, …) and `GemmaGpuLayers` is inference-only. Phases 2+ need the
+CUDA build (`cuda`/`cuda-native` preset — see memory `cuda-build-setup`).
 
 ### B. Constexpr (specialized) engine — the "model axis"
 Turn BuildTime config into a `constexpr` model spec and monomorphize the Denoiser on it; then
@@ -117,8 +119,8 @@ exists; the gaps are VJP device-args + kernels + autograd integration.
 
 | Phase | Work | Kernels | CUDA build? |
 |------|------|---------|-------------|
-| **0** | **Device plumbing** — make autograd VJP closures allocate grads on the input's device (audit: `src/autograd/ops.cpp` `zeros/ones`/`copy` in backward closures lack a device arg → grads land on CPU); add `Denoiser::to(Device)` (per-param via `Tensor::to`, but params are `Variable`s — may need `Variable::to`). **CPU-testable** (device round-trips; `to(cpu)` identity). | 0 | No |
-| **1** | softmax fwd (+ wire `ops::softmax` CUDA branch; currently throws on CUDA) | 1 | Yes |
+| **0 ✅ DONE** | **Device plumbing** — backward VJP closures now allocate grads on the input's device (`src/autograd/ops.cpp`: log_softmax, layer_norm ×3, rms_norm ×2, rope, narrow, row_scale ×2, log_sigmoid); added `Variable::to(Device)` (in-place, keeps Node identity → optimizer `Variable*`s stay valid) and `Denoiser::to(Device)` (loops `parameters()`). Tests: `Variable::to`/`Denoiser::to` identity+parity, **a `{CPU,index=1}` host-backed sentinel** that exercises the closure device-threading end-to-end on CPU (the allocator dispatches on `is_cpu()`, ignoring index, so a real fwd+bwd lands grads on the input's device value — would fail against the old `{CPU,0}` default), plus CUDA round-trips. **Validated on both builds:** debug 585/585 green; cuda build run on the RTX 5070 — 542 core + 41 diffusion Catch cases green, device round-trips exercise live H2D/D2H. **Deferred to Phase 1:** forward-output `zeros()` allocs in those same ops still default to CPU — the constexpr/CUDA forward phases thread that once the kernels make CUDA forward runnable. | 0 | No |
+| **1 ✅ DONE** | softmax fwd — `softmax_rows_f32_kernel` (block-per-row, shared-mem max+Σexp reduction) in `kernels.cu`; `backend::cuda::softmax` + `ops::softmax` routes to it when `device().is_cuda()`. Parity test (`[backends][cuda]`) relRMS <1e-4 + rows sum to 1 on the RTX 5070 (actual ~1.6e-7). **Benchmarked** (`bench_kernels --iters` → "Device softmax" rows): kernel-only GPU time vs CPU, 3.6×/12×/53× as rows×cols grows (parity printed per row). GPU ~289 GB/s at the largest shape = well under the 5070 ceiling → headroom (block-per-row underfills at small row counts). | 1 | Yes |
 | **2** | rms_norm fwd+bwd | 2 | Yes |
 | **3** | matmul_tb (A^T·B — weight grads; currently `require_cpu`) | 1 | Yes |
 | **4** | rope fwd+bwd | 1 | Yes |
@@ -132,9 +134,19 @@ inference engine; training needs the autograd path above, not that class.
 Correctness oracle: CPU parity / finite-difference gradcheck (memory `verify-correctness-against-reference-before-perf`).
 Build: `cuda-native` with explicit clang (memory `cuda-build-setup`, `ch27-gpu-forward-build-arc`).
 
-**Recommended start:** Phase 0 alone in the first clean session (no GPU needed, but touches the
-shared autograd core — every model depends on it, so gate on the full 578-test suite). Then the
-kernel phases in a CUDA-build session.
+**Bench harness (standing tool for every kernel phase):** `benchmarks/bench_kernels.cpp` →
+`bench_device_ops()` is the per-op CPU-vs-GPU harness. Each kernel adds a `backend::cuda::*_bench`
+(preallocated device buffers + GPU events, kernel-only timing — mirrors `matmul_q8_0_bench`,
+NOT the per-iter `Tensor` alloc path) and a row that prints CPU ms, GPU ms, speedup, and parity
+relRMS. Build+run: `cmake --build --preset cuda --target bench_kernels` then
+`./build-cuda/bin/bench_kernels.exe --iters N`. A perf number is only trustworthy once relRMS is
+at f32-epsilon — gate on the `[backends][cuda]` parity test first.
+
+**Recommended start:** ~~Phase 0~~ ~~Phase 1~~ DONE. Next: **Phase 2 (rms_norm fwd+bwd)** — fwd
+kernel already exists (`launch_rmsnorm` / `rmsnorm_kernel`, used by the Gemma path), so wire
+`ops`/autograd `rms_norm` dispatch + add the bwd kernels (`rms_norm_bwd_x` / `rms_norm_bwd_w`),
+parity-test each, and add a bench row. Add a finite-difference gradcheck-on-CUDA per backward
+phase — that is where the Phase-0 backward closures' device arg finally gets exercised end-to-end.
 
 ---
 

@@ -13,6 +13,9 @@ namespace sub0llm::backend::cuda::kernels {
 void launch_add_f32 (const float* a, const float* b, float* out, std::size_t n);
 void launch_mul_f32 (const float* a, const float* b, float* out, std::size_t n);
 void launch_relu_f32(const float* in, float* out, std::size_t n);
+// Row-wise softmax over a (rows, cols) row-major f32 tensor (dim=-1), one block per row.
+// Matches backend::cpu::softmax_rows_f32 numerics. rows = numel/cols.
+void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
 

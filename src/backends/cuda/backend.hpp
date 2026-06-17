@@ -25,6 +25,17 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 [[nodiscard]] Tensor mul(const Tensor& a, const Tensor& b);
 [[nodiscard]] Tensor relu(const Tensor& a);
 [[nodiscard]] Tensor matmul(const Tensor& a, const Tensor& b);
+// Row-wise softmax (dim=-1) on a device-resident 1D/2D f32 tensor. The caller (ops::softmax)
+// validates shape/dtype; this allocates the device output and launches the kernel.
+[[nodiscard]] Tensor softmax(const Tensor& t, int dim);
+
+// Benchmark the row-wise softmax KERNEL in isolation (no per-iter device alloc): H2D the
+// (rows×cols) host input once, run `reps` timed launches (GPU events, after warm-up), D2H the
+// last result into `host_out`. Returns total GPU kernel time (seconds) for `reps` launches, so
+// the caller can compute throughput and compare host_out to the CPU reference. Mirrors
+// matmul_q8_0_bench. Throws if CUDA is not compiled in.
+[[nodiscard]] double softmax_rows_bench(const float* host_in, float* host_out,
+                                        int rows, int cols, int reps);
 
 // Benchmark + validate the device Q8 matmul end-to-end: H2D-copy host Wq[M,K/32] and
 // Xq[T,K/32], run `reps` timed kernel launches (GPU events, after a warm-up), D2H-copy the

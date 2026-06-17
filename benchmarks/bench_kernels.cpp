@@ -13,6 +13,9 @@
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/autograd/variable.hpp"
+#ifdef SUB0LLM_CUDA
+#  include "backends/cuda/backend.hpp"   // device softmax bench (kernel-only timing + parity)
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -169,6 +172,58 @@ static void bench_autograd_forward(int iters)
         [&]{ (void)matmul(x, wv); });
 }
 
+// ── Device (CPU vs CUDA) op benchmarks ──────────────────────────────────────────
+//
+// The per-op CPU-vs-GPU harness for the Stage-4 CUDA kernel work: for each shape it times the
+// CPU reference and the device KERNEL (preallocated buffers + GPU events, no per-iter cudaMalloc),
+// prints both + the speedup + the parity relRMS (a perf number is only trustworthy once the
+// kernel matches CPU). Each new kernel (rms_norm, matmul_tb, rope, …) adds a row here.
+static void bench_device_ops(int iters)
+{
+#ifdef SUB0LLM_CUDA
+    std::cout << "\n--- Device softmax: CPU vs CUDA (rows × cols) ---\n";
+    struct Spec { int64_t rows, cols; std::string label; };
+    const Spec specs[] = {
+        {64,   1025,  "64×1025    (T=64, vocab≈1024)"},
+        {256,  1025,  "256×1025   (T=256 prefill)"},
+        {1024, 4097,  "1024×4097  (long ctx, vocab≈4096)"},
+    };
+    for (const auto& s : specs) {
+        const std::size_t n = static_cast<std::size_t>(s.rows * s.cols);
+        Tensor x = zeros({s.rows, s.cols});
+        auto xp = x.data_as<float>();
+        for (std::size_t i = 0; i < n; ++i)
+            xp[i] = 6.0f * (static_cast<float>((i * 2654435761u) & 0xFFFF) / 32768.0f - 1.0f);
+
+        // CPU reference (timed + kept for parity).
+        Tensor cpu_y = ops::softmax(x, -1);
+        const auto cpu_t = time_it(s.label + "  [CPU]", n * 2, -1, iters,
+                                   [&]{ (void)ops::softmax(x, -1); });
+
+        // CUDA kernel-only time (seconds for `iters` launches) + parity vs CPU.
+        std::vector<float> gpu_y(n);
+        const double gpu_secs = sub0llm::backend::cuda::softmax_rows_bench(
+            xp.data(), gpu_y.data(), static_cast<int>(s.rows), static_cast<int>(s.cols), iters);
+        const double gpu_ms = gpu_secs * 1e3 / iters;
+        const double gpu_gbps = (static_cast<double>(n) * 4.0 / 1e9) / (gpu_ms * 1e-3);
+
+        double se = 0.0, sref = 0.0;
+        const auto cy = cpu_y.data_as<float>();
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(gpu_y[i]) - static_cast<double>(cy[i]);
+            se += d * d;  sref += static_cast<double>(cy[i]) * static_cast<double>(cy[i]);
+        }
+        const double rel_rms = std::sqrt(se / sref);
+        std::cout << std::format(
+            "  {:32s}  {:8.3f} ms  {:6.1f} GB/s  [CUDA]   {:5.2f}x vs CPU   relRMS {:.2e}\n",
+            s.label + "  [CUDA]", gpu_ms, gpu_gbps, cpu_t.ms_per_iter / gpu_ms, rel_rms);
+    }
+#else
+    (void)iters;
+    std::cout << "\n--- Device ops: CPU-only build (configure --preset cuda for GPU rows) ---\n";
+#endif
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv)
@@ -189,6 +244,7 @@ int main(int argc, char** argv)
     bench_matmul(iters);
     bench_copy_strided(iters);
     bench_autograd_forward(iters);
+    bench_device_ops(iters);
 
     std::cout << "\nDone.\n";
     return 0;

@@ -225,6 +225,7 @@ Tensor softmax(const Tensor& t, int dim) {
     const std::int64_t cols = t.shape(static_cast<std::size_t>(t.ndim() - 1));
     if (cols == 0)
         throw std::runtime_error("softmax: last dimension must be > 0");
+    if (t.device().is_cuda()) return backend::cuda::softmax(t, dim);
     Tensor out(t.shape(), t.dtype(), t.device());
     const std::int64_t rows = t.numel() / cols;
     backend::cpu::softmax_rows_f32(
