@@ -173,6 +173,34 @@ __global__ void matmul_f32_kernel(const float* A, const float* B, float* C,
     if (row < M && col < N) C[row * N + col] = acc;
 }
 
+// Transposed-first-operand matmul: C = Aᵀ·B. A(M,K) and B(M,N) row-major, C(K,N). Contraction is
+// over M (the shared leading dim). out[k,n] = Σ_m A[m,k]·B[m,n] — the weight-gradient kernel,
+// matching backend::cpu::matmul_tb_f32. Same 16×16 tiling as matmul_f32_kernel; the only change is
+// the left tile reads A transposed (A[m·K + k]).
+__global__ void matmul_tb_f32_kernel(const float* A, const float* B, float* C,
+                                     int M, int N, int K) {
+    __shared__ float sA[TILE][TILE];   // sA[ty][tx] = Aᵀ[k][m] = A[m·K + k]
+    __shared__ float sB[TILE][TILE];   // sB[ty][tx] = B[m][n]
+
+    const int k = blockIdx.y * TILE + threadIdx.y;   // output row (0..K)
+    const int n = blockIdx.x * TILE + threadIdx.x;   // output col (0..N)
+
+    float acc = 0.0f;
+    for (int t = 0; t < (M + TILE - 1) / TILE; ++t) {
+        const int mA = t * TILE + threadIdx.x;       // contraction index for the Aᵀ tile
+        sA[threadIdx.y][threadIdx.x] = (k < K && mA < M)
+            ? A[static_cast<std::size_t>(mA) * K + k] : 0.0f;
+        const int mB = t * TILE + threadIdx.y;       // contraction index for the B tile
+        sB[threadIdx.y][threadIdx.x] = (n < N && mB < M)
+            ? B[static_cast<std::size_t>(mB) * N + n] : 0.0f;
+        __syncthreads();
+
+        for (int i = 0; i < TILE; ++i) acc += sA[threadIdx.y][i] * sB[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (k < K && n < N) C[static_cast<std::size_t>(k) * N + n] = acc;
+}
+
 inline int grid(std::size_t n, int block) {
     return static_cast<int>((n + static_cast<std::size_t>(block) - 1) / static_cast<std::size_t>(block));
 }
@@ -752,6 +780,14 @@ void launch_matmul_f32(const float* A, const float* B, float* C,
     const dim3 block(TILE, TILE);
     const dim3 grid2(grid(N, TILE), grid(M, TILE));
     matmul_f32_kernel<<<grid2, block>>>(A, B, C,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+}
+
+void launch_matmul_tb_f32(const float* A, const float* B, float* C,
+                          std::size_t M, std::size_t N, std::size_t K) {
+    const dim3 block(TILE, TILE);
+    const dim3 grid2(grid(N, TILE), grid(K, TILE));   // output is (K, N)
+    matmul_tb_f32_kernel<<<grid2, block>>>(A, B, C,
         static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
 }
 

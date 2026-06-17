@@ -185,6 +185,24 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 #endif
 }
 
+Tensor matmul_tb(const Tensor& a, const Tensor& b) {
+#ifdef SUB0LLM_CUDA
+    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(M,N) → C(K,N)
+    const auto K = static_cast<std::size_t>(a.shape(1));
+    const auto N = static_cast<std::size_t>(b.shape(1));
+    Tensor out(Tensor::Shape{static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)},
+               DType::Float32, a.device());
+    kernels::launch_matmul_tb_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()),
+        reinterpret_cast<const float*>(b.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()), M, N, K);
+    return out;
+#else
+    (void)a; (void)b;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 double softmax_rows_bench(const float* host_in, float* host_out, int rows, int cols, int reps) {
 #ifdef SUB0LLM_CUDA
     auto ck = [](cudaError_t e, const char* what) {
@@ -250,6 +268,44 @@ double rms_norm_fwd_bench(const float* host_x, const float* host_w, float* host_
     return static_cast<double>(ms) / 1000.0;
 #else
     (void)host_x; (void)host_w; (void)host_out; (void)T; (void)D; (void)eps; (void)reps;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+double matmul_tb_bench(const float* host_a, const float* host_b, float* host_c,
+                       int M, int N, int K, int reps) {
+#ifdef SUB0LLM_CUDA
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+    };
+    const std::size_t abytes = static_cast<std::size_t>(M) * K * sizeof(float);
+    const std::size_t bbytes = static_cast<std::size_t>(M) * N * sizeof(float);
+    const std::size_t cbytes = static_cast<std::size_t>(K) * N * sizeof(float);
+    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+    ck(cudaMalloc(&dA, abytes), "malloc a");
+    ck(cudaMalloc(&dB, bbytes), "malloc b");
+    ck(cudaMalloc(&dC, cbytes), "malloc c");
+    ck(cudaMemcpy(dA, host_a, abytes, cudaMemcpyHostToDevice), "H2D a");
+    ck(cudaMemcpy(dB, host_b, bbytes, cudaMemcpyHostToDevice), "H2D b");
+
+    for (int w = 0; w < 3; ++w)
+        kernels::launch_matmul_tb_f32(dA, dB, dC, M, N, K);
+    ck(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t t0, t1;
+    ck(cudaEventCreate(&t0), "event t0");  ck(cudaEventCreate(&t1), "event t1");
+    ck(cudaEventRecord(t0), "record t0");
+    for (int r = 0; r < reps; ++r) kernels::launch_matmul_tb_f32(dA, dB, dC, M, N, K);
+    ck(cudaEventRecord(t1), "record t1");
+    ck(cudaEventSynchronize(t1), "kernel sync");
+    float ms = 0.0f;  ck(cudaEventElapsedTime(&ms, t0, t1), "elapsed");
+
+    ck(cudaMemcpy(host_c, dC, cbytes, cudaMemcpyDeviceToHost), "D2H c");
+    cudaEventDestroy(t0);  cudaEventDestroy(t1);
+    cudaFree(dA);  cudaFree(dB);  cudaFree(dC);
+    return static_cast<double>(ms) / 1000.0;
+#else
+    (void)host_a; (void)host_b; (void)host_c; (void)M; (void)N; (void)K; (void)reps;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }

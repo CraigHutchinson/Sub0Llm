@@ -262,6 +262,44 @@ static void bench_device_ops(int iters)
             "  {:32s}  {:8.3f} ms  {:6.1f} GB/s  [CUDA]   {:5.2f}x vs CPU   relRMS {:.2e}\n",
             s.label + "  [CUDA]", gpu_ms, gpu_gbps, cpu_t.ms_per_iter / gpu_ms, rel_rms);
     }
+
+    std::cout << "\n--- Device matmul_tb (Aᵀ·B weight grad): CPU vs CUDA (M·K·N) ---\n";
+    struct MSpec { int64_t M, K, N; std::string label; };
+    const MSpec mspecs[] = {
+        {256,  256, 256,  "256·256·256   (T=256, D=256)"},
+        {256,  256, 1024, "256·256·1024  (D_in=256, d_ff=1024)"},
+        {1024, 512, 512,  "1024·512·512  (T=1024, D=512)"},
+    };
+    for (const auto& s : mspecs) {
+        Tensor A = zeros({s.M, s.K});
+        Tensor B = zeros({s.M, s.N});
+        auto ap = A.data_as<float>();  auto bp = B.data_as<float>();
+        for (std::size_t i = 0; i < ap.size(); ++i) ap[i] = static_cast<float>((i * 2654435761u) & 0xFFFF) / 32768.0f - 1.0f;
+        for (std::size_t i = 0; i < bp.size(); ++i) bp[i] = static_cast<float>((i * 40503u) & 0xFFFF) / 32768.0f - 1.0f;
+        const int64_t flops = 2 * s.K * s.N * s.M;
+        const std::size_t nf = static_cast<std::size_t>(s.M * s.K + s.M * s.N + s.K * s.N);
+
+        Tensor C_cpu = ops::matmul_tb(A, B);
+        const auto cpu_t = time_it(s.label + "  [CPU]", nf, flops, iters, [&]{ (void)ops::matmul_tb(A, B); });
+
+        std::vector<float> gpu_c(static_cast<std::size_t>(s.K * s.N));
+        const double gpu_secs = sub0llm::backend::cuda::matmul_tb_bench(
+            ap.data(), bp.data(), gpu_c.data(),
+            static_cast<int>(s.M), static_cast<int>(s.N), static_cast<int>(s.K), iters);
+        const double gpu_ms = gpu_secs * 1e3 / iters;
+        const double gpu_gflops = static_cast<double>(flops) / 1e9 / (gpu_ms * 1e-3);
+
+        double se = 0.0, sref = 0.0;
+        const auto cc = C_cpu.data_as<float>();
+        for (std::size_t i = 0; i < gpu_c.size(); ++i) {
+            const double d = static_cast<double>(gpu_c[i]) - static_cast<double>(cc[i]);
+            se += d * d;  sref += static_cast<double>(cc[i]) * static_cast<double>(cc[i]);
+        }
+        const double rel_rms = std::sqrt(se / (sref + 1e-30));
+        std::cout << std::format(
+            "  {:32s}  {:8.3f} ms  {:7.2f} GFLOPs/s  [CUDA]  {:5.2f}x vs CPU  relRMS {:.2e}\n",
+            s.label + "  [CUDA]", gpu_ms, gpu_gflops, cpu_t.ms_per_iter / gpu_ms, rel_rms);
+    }
 #else
     (void)iters;
     std::cout << "\n--- Device ops: CPU-only build (configure --preset cuda for GPU rows) ---\n";

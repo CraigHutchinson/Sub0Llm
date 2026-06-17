@@ -25,6 +25,9 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 [[nodiscard]] Tensor mul(const Tensor& a, const Tensor& b);
 [[nodiscard]] Tensor relu(const Tensor& a);
 [[nodiscard]] Tensor matmul(const Tensor& a, const Tensor& b);
+// C = Aᵀ·B for 2D A(M,K), B(M,N) → C(K,N). The weight-gradient op; caller (ops::matmul_tb)
+// validates shapes. Device-resident in/out.
+[[nodiscard]] Tensor matmul_tb(const Tensor& a, const Tensor& b);
 // Row-wise softmax (dim=-1) on a device-resident 1D/2D f32 tensor. The caller (ops::softmax)
 // validates shape/dtype; this allocates the device output and launches the kernel.
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim);
@@ -50,6 +53,11 @@ void rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D
 // Returns total GPU kernel seconds. Throws if CUDA is not compiled in.
 [[nodiscard]] double rms_norm_fwd_bench(const float* host_x, const float* host_w,
                                         float* host_out, int T, int D, float eps, int reps);
+
+// Benchmark the matmul_tb kernel (C = Aᵀ·B) in isolation: H2D A(M,K)/B(M,N) once, run `reps`
+// timed launches, D2H C(K,N). Returns total GPU kernel seconds. Throws if CUDA not compiled in.
+[[nodiscard]] double matmul_tb_bench(const float* host_a, const float* host_b, float* host_c,
+                                     int M, int N, int K, int reps);
 
 // Benchmark + validate the device Q8 matmul end-to-end: H2D-copy host Wq[M,K/32] and
 // Xq[T,K/32], run `reps` timed kernel launches (GPU events, after a warm-up), D2H-copy the

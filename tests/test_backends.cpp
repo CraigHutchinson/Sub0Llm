@@ -16,6 +16,19 @@ using Catch::Matchers::WithinRel;
 
 static constexpr float kEps = 1e-4f;
 
+// Relative RMS error between two same-numel f32 tensors — the parity metric the CUDA kernel
+// tests share. eps guards the all-zeros reference (sref==0).
+[[maybe_unused]] static double rel_rms(const Tensor& a, const Tensor& b) {
+    const auto ap = a.data_as<float>();
+    const auto bp = b.data_as<float>();
+    double se = 0.0, sref = 0.0;
+    for (std::size_t i = 0; i < ap.size(); ++i) {
+        const double d = static_cast<double>(ap[i]) - static_cast<double>(bp[i]);
+        se += d * d;  sref += static_cast<double>(bp[i]) * static_cast<double>(bp[i]);
+    }
+    return std::sqrt(se / (sref + 1e-30));
+}
+
 // ── CPU SIMD path: results must match scalar reference ─────────────────────────
 // These tests run regardless of SIMD level - they verify the kernel output,
 // not the implementation path.  The SIMD path is selected transparently by
@@ -198,17 +211,6 @@ TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cu
     Tensor w = randn({D});
     Tensor g = randn({T, D});         // upstream gradient for the backward kernels
 
-    auto rel_rms = [](const Tensor& a, const Tensor& b) {
-        const auto ap = a.data_as<float>();
-        const auto bp = b.data_as<float>();
-        double se = 0.0, sref = 0.0;
-        for (std::size_t i = 0; i < ap.size(); ++i) {
-            const double d = static_cast<double>(ap[i]) - static_cast<double>(bp[i]);
-            se += d * d;  sref += static_cast<double>(bp[i]) * static_cast<double>(bp[i]);
-        }
-        return std::sqrt(se / (sref + 1e-30));
-    };
-
     // ── CPU reference ──
     Tensor xn_c = zeros({T, D}), ir_c = zeros({T}), out_c = zeros({T, D});
     backend::cpu::rms_norm_fwd_f32(
@@ -253,5 +255,24 @@ TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cu
     REQUIRE(rel_rms(gw_d.to(Device::cpu()),  gw_c)  < 1e-4);
 #else
     SUCCEED("CPU build - CUDA rms_norm parity is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 3: ops::matmul_tb (C = Aᵀ·B, the weight-gradient op) must dispatch to CUDA and
+// match the CPU reference. Dims are deliberately non-multiples of the 16×16 tile (tail coverage).
+TEST_CASE("matmul_tb - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t M = 70, K = 34, N = 50;   // A(M,K), B(M,N) → C(K,N); none a multiple of TILE=16
+    Tensor a = randn({M, K});
+    Tensor b = randn({M, N});
+
+    const Tensor c_cpu = matmul_tb(a, b);
+    const Tensor c_gpu = matmul_tb(a.to(Device::cuda()), b.to(Device::cuda())).to(Device::cpu());
+
+    REQUIRE(c_cpu.shape() == Tensor::Shape{K, N});
+    REQUIRE(c_gpu.shape() == c_cpu.shape());
+    REQUIRE(rel_rms(c_gpu, c_cpu) < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA matmul_tb parity is exercised on the cuda preset");
 #endif
 }

@@ -27,6 +27,10 @@ void launch_rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv
 void launch_rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
+// Transposed-first-operand matmul C = Aᵀ·B: A(M,K), B(M,N) row-major → C(K,N), contraction over M.
+// The weight-gradient kernel, matching backend::cpu::matmul_tb_f32.
+void launch_matmul_tb_f32(const float* A, const float* B, float* C,
+                          std::size_t M, std::size_t N, std::size_t K);
 
 // Q8_0 × Q8_0 batched matmul on DEVICE pointers: Y[M,T] = Wq[M,K] · Xqᵀ, matching the CPU
 // backend::cpu::matmul_q8_0_q8_0 semantics (Wq row-major (M, K/32), Xq (T, K/32), Y (M, T)
