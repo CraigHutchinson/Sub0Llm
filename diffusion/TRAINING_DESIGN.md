@@ -430,3 +430,35 @@ Final self-terminated recall, matched arch (D128/L4) / corpus (3000 paras) / see
   deliverable model; the cap/bias variant is unnecessary here.
 - **Next:** confirm on the founded arch (D256/L6) as the new candidate long run; sweep `k_step`
   (2 was fine; the mid-range barely changes difficulty so larger may save epochs); 2nd seed.
+
+### 13.2 WHY the curriculum works — the "polluted global NELBO" hypothesis + an organic follow-up
+Leading explanation (to confirm against the founded run, and only worth pursuing if that model
+proves *useful*, not just lower-NELBO):
+
+- **The curriculum's real win is the SIGNAL it terminates on, not the easy-first ordering.** Uniform
+  training early-stops on the **global** NELBO `E_t[CE]`, which is dominated by the **irreducible
+  high-`t` tail** (per-`t` curve rises monotonically to `H0`≈5.6 and barely moves there). The genuinely
+  learnable progress lives at low–mid `t` but is a small fraction of that average, so the global signal
+  **plateaus early and trips patience prematurely** — the high-noise levels *pollute* the stop metric.
+  The curriculum instead gates on **per-level** plateaus, tracking each difficulty's own learnable
+  progress, so it never terminates on the drowned-out average. Evidence: uniform baseline stopped at
+  33k while the curriculum kept finding real gains to 66k (§13.1); per-`t` gain is largest at low `t`.
+- **Transfer DOWN is proven, transfer UP is the open question.** Training higher `k` improved
+  `base(k=1)` (3.69→1.54) — denser supervision feeds the easy regime (down). Whether mastering low `k`
+  gives high `k` enough prior structure to resolve (up) is read directly from the **climb velocity as
+  `k` rises**: steady ~epochs/level ⇒ the foundation feeds up; ballooning epochs/level ⇒ a **wall**
+  (high `k` intrinsically under-resourced — the same starvation that hindered uniform training).
+  *Metric, free from existing logs:* the advance cadence in the founded run. *Richer, retrospective:*
+  `--per-t` per-level curve on any saved checkpoint (no restart) — compare an early vs late checkpoint
+  to see whether high-`k` NELBO falls *before* the frontier reaches it.
+- **Follow-up idea — the ORGANIC (self-scaling) curriculum.** Don't hand-set a `k` schedule: train the
+  **full** noise spread but **per-level-plateau-aware** — sample `t` preferentially from levels still
+  learning, and define the *global* stop as "**all** levels plateaued." This unifies three threads —
+  it is adaptive **importance sampling** (§11), driven by **per-level mastery** (§13), and it
+  structurally fixes the global-NELBO pollution (no single averaged metric to drown the signal). It
+  needs only a per-level plateau tracker (generalize `FrontierCurriculum` to all levels) + a sampling
+  weight. *Cheap metrics to add when we next restart* (more knowledge is cheap): a fixed mid-`k`
+  NELBO probe in the curriculum log alongside `base(k=1)` (forward-transfer-up signal); the full
+  per-level curve already exists via `--per-t`. **Gate:** decide after the founded run finishes AND we
+  judge whether the end model is actually useful (coherent generation / recall worth the schedule),
+  not merely lower-NELBO.
