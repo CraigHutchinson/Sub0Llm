@@ -133,6 +133,7 @@ struct Config {
     bool          curriculum_converge   = false;
     std::uint64_t curriculum_patience   = 2;   // epochs of no level-NELBO improvement ⇒ advance k
     std::int64_t  curriculum_k_step      = 1;  // masked tokens added per advancement (1/64→2/64)
+    std::int64_t  curriculum_k_start     = 1;  // starting level (set on RESUME to skip the re-climb)
     bool eval_only         = false;
     // WHOLE-WORD masking (axis H): corrupt whole words (all BPE subwords of a chosen word
     // together) instead of independent tokens. The honest, harder task — the model can no
@@ -260,6 +261,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--curriculum-converge") c.curriculum_converge = true;
         else if (a == "--curriculum-patience") c.curriculum_patience = std::stoull(next());
         else if (a == "--curriculum-k-step") c.curriculum_k_step = std::stoll(next());
+        else if (a == "--curriculum-k-start") c.curriculum_k_start = std::stoll(next());
         else if (a == "--founded")  { c.founded = true; apply_founded(c); }  // later flags still override
         // Architecture overrides (so capacity experiments need no recompile).
         else if (a == "--embed-dim")  c.embed_dim  = std::stoll(next());
@@ -979,7 +981,7 @@ static int run(int argc, char** argv) {
                          0.05f, cfg.curriculum_end, cfg.curriculum_min_tokens);
         } else if (cfg.curriculum_converge) {
             fcurr = std::make_unique<dt::FrontierCurriculum>(dt::FrontierCurriculum::Config{
-                .seq_len = cfg.seq_len, .k_start = 1, .k_max = 0,
+                .seq_len = cfg.seq_len, .k_start = cfg.curriculum_k_start, .k_max = 0,
                 .k_step = cfg.curriculum_k_step,
                 .patience = static_cast<int>(cfg.curriculum_patience)});
             std::println("curriculum: CONVERGENCE-gated, k=1→{} masked tokens (t={:.3f}→1.0), "

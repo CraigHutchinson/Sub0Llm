@@ -20,9 +20,12 @@
 
 namespace sub0llm {
 
-// Set flush-to-zero (FTZ) + denormals-are-zero (DAZ) in MXCSR for the calling
-// thread. Threads created afterwards inherit the creating thread's MXCSR on
-// Windows/Linux, so calling this first thing in main() covers worker threads too.
+// Set flush-to-zero (FTZ) + denormals-are-zero (DAZ) in MXCSR for the CALLING THREAD ONLY.
+// MXCSR is per-thread: on Linux a new thread inherits the creator's MXCSR (clone copies FP
+// state), but on WINDOWS a new std::thread starts with the default MXCSR (no FTZ/DAZ) — it does
+// NOT inherit. So calling this once in main() is NOT enough for worker threads on Windows; every
+// compute thread must call it itself (see sub0diff/train/parallel.hpp worker setup). Skipping it
+// in the workers reintroduces the exact denormal stall this guards against, once the loss falls.
 inline void init_cpu_compute() noexcept {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     _mm_setcsr(_mm_getcsr() | 0x8040);  // 0x8000 = FTZ, 0x0040 = DAZ

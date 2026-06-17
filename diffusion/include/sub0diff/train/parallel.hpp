@@ -28,13 +28,15 @@
 // weight DATA is shared but read-only within COMPUTE. The std::barrier phases
 // separate every worker read of the weights from the single master write.
 //
-// FTZ note: workers inherit MXCSR from the thread that constructs the pool, so
-// call sub0llm::init_cpu_compute() before constructing (main() already does).
+// FTZ note: each worker thread sets FTZ+DAZ ITSELF (init_cpu_compute in the thread body) —
+// MXCSR is per-thread and a new std::thread does NOT inherit it on Windows. main() also calls
+// it, but that only covers the main/reduce thread, not these workers where the compute runs.
 
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/core/cpu_topology.hpp"
+#include "sub0llm/core/runtime.hpp"      // init_cpu_compute (FTZ+DAZ) — set per worker thread
 #include "sub0llm/core/thread_pool.hpp"
 
 #include <atomic>
@@ -115,6 +117,12 @@ public:
             const int pin = pins[w];
             wk.thread = std::thread([this, &wk, w, n_workers, pin] {
                 sub0llm::pin_current_thread(pin);
+                // FTZ+DAZ must be set PER THREAD: a freshly created std::thread starts with the
+                // DEFAULT MXCSR on Windows (it does NOT inherit the constructing thread's), so the
+                // main()-level init_cpu_compute() never reached these workers — and since ALL the
+                // training compute runs here, the model slid into denormal-stall territory as the
+                // loss fell (the exact 50-100×/op penalty runtime.hpp documents). Set it in-thread.
+                sub0llm::init_cpu_compute();
                 // W>1: each replica IS the parallel unit — keep its matmuls serial so we don't
                 // oversubscribe (W workers × an 8-way GEMM each). W==1: the lone worker fans its
                 // (B·T)-row GEMMs across all cores (no other worker to contend with).
