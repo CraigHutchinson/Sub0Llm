@@ -45,7 +45,7 @@ TEST_CASE("schedule: eval_factor below floor is clamped to 50%", "[schedule]") {
     REQUIRE(s.coverage_per_eval >= 0.5 - 1e-6);              // clamped up, not 10%
 }
 
-TEST_CASE("schedule: larger eval_factor ⇒ less frequent evals, more coverage", "[schedule]") {
+TEST_CASE("schedule: larger eval_factor means less frequent evals, more coverage", "[schedule]") {
     ScheduleConfig half;  half.eval_factor = 0.5;
     ScheduleConfig full;  full.eval_factor = 1.0;
     auto sh = make_schedule(kTrain, kEval, kT, 4, kMaskPerWin, half);

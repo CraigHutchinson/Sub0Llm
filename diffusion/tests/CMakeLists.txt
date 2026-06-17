@@ -1,6 +1,7 @@
 add_executable(tests_diffusion
     test_diffusion.cpp
     test_schedule.cpp
+    test_config.cpp
 )
 
 target_link_libraries(tests_diffusion

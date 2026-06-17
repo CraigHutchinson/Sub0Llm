@@ -28,6 +28,20 @@ CPMAddPackage(
     OPTIONS "JSON_BuildTests OFF" "JSON_Install OFF"
 )
 
+# ── JSON parsing, fast path (config module) ───────────────────────────────────
+# simdjson is the optimal *parser* (SIMD, on-demand, minimal allocation) — used by the
+# config module to read run_config.json / model config.json. nlohmann stays for the
+# checkpoint/tokenizer DOM writing it already does; simdjson does not emit JSON, so the
+# config module's writer is a tiny dependency-free streamer (see config/schema.hpp).
+# SIMDJSON_DEVELOPER_MODE OFF (consumer mode) builds only the static lib — no CLI tools,
+# fuzzers, or benchmarks. (The older SIMDJSON_JUST_LIBRARY knob is deprecated in 3.10.)
+CPMAddPackage(
+    NAME simdjson
+    GITHUB_REPOSITORY simdjson/simdjson
+    VERSION 3.10.1
+    OPTIONS "SIMDJSON_DEVELOPER_MODE OFF"
+)
+
 # ── Testing ───────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     CPMAddPackage("gh:catchorg/Catch2@3.7.1")

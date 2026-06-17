@@ -40,6 +40,7 @@ set(SUB0LLM_SOURCES
     nn/episodic_memory.cpp
     nn/gguf_loader.cpp
     nn/gemma.cpp
+    config/json.cpp
 )
 
 
@@ -69,6 +70,7 @@ target_link_libraries(sub0llm
     PUBLIC
         spdlog::spdlog
         nlohmann_json::nlohmann_json
+        simdjson::simdjson
     PRIVATE
         $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
         $<$<BOOL:${SUB0LLM_EIGEN_AVAILABLE}>:Eigen3::Eigen>
