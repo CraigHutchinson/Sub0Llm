@@ -13,6 +13,7 @@
 // brings the curriculum back as a reusable, shared component.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -54,7 +55,15 @@ public:
         std::int64_t k_max       = 0;     // 0 = derive T-1 (the min-1-visible cap)
         std::int64_t k_step      = 1;     // masked tokens added per advancement (user's 1/64→2/64)
         int          patience    = 2;     // epochs of no NELBO improvement ⇒ level mastered
-        float        min_improve = 0.01f; // held-out NELBO drop that still counts as learning
+        // A "new best" must beat the prior best by at least max(min_improve, rel_improve·best).
+        // The RELATIVE term is the key: a level's per-epoch NELBO wobbles (stochastic training
+        // perturbs the model around its floor) by ~1-2% — and that wobble EXCEEDS a fixed 0.01,
+        // so a noise dip clears `best-0.01`, registers a false "new best", and resets the stall
+        // counter, stranding the curriculum at a plateaued level forever. A relative bar sits
+        // above the noise at every scale (early levels at NELBO~5, late ones ~2), so a genuine
+        // plateau accumulates stalls and advances. (Observed live: k=7 stuck bouncing 1.99-2.04.)
+        float        min_improve = 0.01f; // absolute floor on the improvement bar
+        float        rel_improve = 0.02f; // + relative bar (2% of best) — above the ~1-2% wobble
     };
 
     explicit FrontierCurriculum(Config c)
@@ -86,7 +95,14 @@ public:
     // frontier level (mask exactly k). Returns true iff the level advanced on this call.
     bool observe_epoch(float nelbo_at_frontier) {
         if (converged_) return false;
-        if (nelbo_at_frontier < best_ - cfg_.min_improve) {   // still descending at this level
+        if (best_ == std::numeric_limits<float>::max()) {     // first epoch at this level: seed best
+            best_ = nelbo_at_frontier;
+            return false;
+        }
+        // Improvement bar above the per-epoch noise (see Config): absolute floor OR a fraction of
+        // the current best, whichever is larger — so a noisy dip can't fake progress and strand us.
+        const float bar = std::max(cfg_.min_improve, cfg_.rel_improve * std::abs(best_));
+        if (nelbo_at_frontier < best_ - bar) {                // a GENUINE new best at this level
             best_ = nelbo_at_frontier;
             stalls_ = 0;
             return false;

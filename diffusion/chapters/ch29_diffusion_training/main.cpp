@@ -657,15 +657,14 @@ static int run(int argc, char** argv) {
     // windows/step) is folded in ONCE here — each step trains B windows, NOT W (B⊥W decoupled).
     const auto topo = sub0llm::detect_cpu_topology();
     if (cfg.threads == 0) {
-        // Default = HALF the physical P-cores. Per-window data-parallel training is
-        // MEMORY-BANDWIDTH bound for this small model (one P-core already pulls ~⅓ of
-        // the DRAM bus; bench_membw: read scales only 1t→4t ≈2.0×, 1t→8t ≈2.4×). So
-        // ~4 workers hit the bus wall — 8 is no faster and just burns cores. Measured
-        // throughput plateaus flat across W=3..8 at ~2.5× serial. Override with
-        // --threads. Shared topology model: sub0llm/core/cpu_topology.hpp.
+        // Default = ALL physical P-cores. The old P/2 default was tuned on the 1.6M model, which
+        // was memory-bandwidth-bound (~flat W=3..8); the founded 6M default arch has ~3.7× the
+        // compute per window, so it's COMPUTE-bound and scales: measured W=4→W=8 = ~63→~100+
+        // windows/s (~1.6×) on this 6M model. Cap at P-cores, NOT logical: the step is barrier-
+        // synced and the slower E-cores would straggle and gate every step (pin policy fills
+        // P-cores first). Override with --threads. Shared topology: sub0llm/core/cpu_topology.hpp.
         const int pc = topo.n_perf_cores();
-        const int base = pc > 0 ? pc : topo.n_logical / 2;
-        cfg.threads = std::max<std::size_t>(1, static_cast<std::size_t>((base + 1) / 2));
+        cfg.threads = std::max<std::size_t>(1, static_cast<std::size_t>(pc > 0 ? pc : topo.n_logical / 2));
     }
     // batch-size B (windows averaged per step → gradient consistency ∝ √B) is INDEPENDENT of the
     // worker count W (--threads, parallelism). Default B = W (the historical per-worker pool).
