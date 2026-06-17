@@ -2,9 +2,12 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <cmath>
+#include <vector>
 
 #include "sub0llm/core/tensor.hpp"
 #include "sub0llm/core/ops.hpp"
+#include "backends/cpu/kernels.hpp"        // CPU reference kernels (rms_norm parity)
+#include "backends/cuda/backend.hpp"       // CUDA kernels under test
 
 using namespace sub0llm;
 using namespace sub0llm::ops;
@@ -180,5 +183,75 @@ TEST_CASE("softmax - CUDA matches CPU reference", "[backends][cuda][device]") {
     }
 #else
     SUCCEED("CPU build - CUDA softmax parity is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 2: the CUDA rms_norm training kernels (fwd, bwd_x, bwd_w) must match the CPU
+// reference. Kernel-level parity (H2D via Tensor::to → launch → D2H), gated on the CUDA build.
+TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t T = 5, D = 130;     // D not a multiple of the warp/block width (tail coverage)
+    const float   eps = 1e-5f;
+    const std::size_t Tn = static_cast<std::size_t>(T), Dn = static_cast<std::size_t>(D);
+
+    Tensor x = randn({T, D});
+    Tensor w = randn({D});
+    Tensor g = randn({T, D});         // upstream gradient for the backward kernels
+
+    auto rel_rms = [](const Tensor& a, const Tensor& b) {
+        const auto ap = a.data_as<float>();
+        const auto bp = b.data_as<float>();
+        double se = 0.0, sref = 0.0;
+        for (std::size_t i = 0; i < ap.size(); ++i) {
+            const double d = static_cast<double>(ap[i]) - static_cast<double>(bp[i]);
+            se += d * d;  sref += static_cast<double>(bp[i]) * static_cast<double>(bp[i]);
+        }
+        return std::sqrt(se / (sref + 1e-30));
+    };
+
+    // ── CPU reference ──
+    Tensor xn_c = zeros({T, D}), ir_c = zeros({T}), out_c = zeros({T, D});
+    backend::cpu::rms_norm_fwd_f32(
+        x.data_as<float>().data(), w.data_as<float>().data(),
+        xn_c.data_as<float>().data(), ir_c.data_as<float>().data(),
+        out_c.data_as<float>().data(), Tn, Dn, eps);
+    Tensor gx_c = zeros({T, D});
+    backend::cpu::rms_norm_bwd_x_f32(
+        g.data_as<float>().data(), xn_c.data_as<float>().data(),
+        ir_c.data_as<float>().data(), w.data_as<float>().data(),
+        gx_c.data_as<float>().data(), Tn, Dn);
+    Tensor gw_c = zeros({D});
+    backend::cpu::rms_norm_bwd_w_f32(
+        g.data_as<float>().data(), xn_c.data_as<float>().data(),
+        gw_c.data_as<float>().data(), Tn, Dn);
+
+    // ── CUDA (device-resident; results copied back to host for comparison) ──
+    const Tensor xd = x.to(Device::cuda()), wd = w.to(Device::cuda()), gd = g.to(Device::cuda());
+    Tensor xn_d = zeros({T, D}, DType::Float32, Device::cuda());
+    Tensor ir_d = zeros({T},    DType::Float32, Device::cuda());
+    Tensor out_d = zeros({T, D}, DType::Float32, Device::cuda());
+    backend::cuda::rms_norm_fwd(
+        reinterpret_cast<const float*>(xd.raw_ptr()), reinterpret_cast<const float*>(wd.raw_ptr()),
+        reinterpret_cast<float*>(xn_d.raw_ptr()), reinterpret_cast<float*>(ir_d.raw_ptr()),
+        reinterpret_cast<float*>(out_d.raw_ptr()), static_cast<int>(T), static_cast<int>(D), eps);
+
+    Tensor gx_d = zeros({T, D}, DType::Float32, Device::cuda());
+    backend::cuda::rms_norm_bwd_x(
+        reinterpret_cast<const float*>(gd.raw_ptr()), reinterpret_cast<const float*>(xn_d.raw_ptr()),
+        reinterpret_cast<const float*>(ir_d.raw_ptr()), reinterpret_cast<const float*>(wd.raw_ptr()),
+        reinterpret_cast<float*>(gx_d.raw_ptr()), static_cast<int>(T), static_cast<int>(D));
+
+    Tensor gw_d = zeros({D}, DType::Float32, Device::cuda());
+    backend::cuda::rms_norm_bwd_w(
+        reinterpret_cast<const float*>(gd.raw_ptr()), reinterpret_cast<const float*>(xn_d.raw_ptr()),
+        reinterpret_cast<float*>(gw_d.raw_ptr()), static_cast<int>(T), static_cast<int>(D));
+
+    REQUIRE(rel_rms(out_d.to(Device::cpu()), out_c) < 1e-4);
+    REQUIRE(rel_rms(xn_d.to(Device::cpu()),  xn_c)  < 1e-4);
+    REQUIRE(rel_rms(ir_d.to(Device::cpu()),  ir_c)  < 1e-4);
+    REQUIRE(rel_rms(gx_d.to(Device::cpu()),  gx_c)  < 1e-4);
+    REQUIRE(rel_rms(gw_d.to(Device::cpu()),  gw_c)  < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA rms_norm parity is exercised on the cuda preset");
 #endif
 }

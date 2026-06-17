@@ -29,6 +29,14 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // validates shape/dtype; this allocates the device output and launches the kernel.
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim);
 
+// rms_norm training fwd+bwd on DEVICE pointers (T rows × D), signatures mirroring
+// backend::cpu::rms_norm_*_f32 so autograd::rms_norm can dispatch by device. Throw if not built.
+void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
+                  float* out, int T, int D, float eps);
+void rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv_rms,
+                    const float* w, float* gx, int T, int D);
+void rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D);
+
 // Benchmark the row-wise softmax KERNEL in isolation (no per-iter device alloc): H2D the
 // (rows×cols) host input once, run `reps` timed launches (GPU events, after warm-up), D2H the
 // last result into `host_out`. Returns total GPU kernel time (seconds) for `reps` launches, so
@@ -36,6 +44,12 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // matmul_q8_0_bench. Throws if CUDA is not compiled in.
 [[nodiscard]] double softmax_rows_bench(const float* host_in, float* host_out,
                                         int rows, int cols, int reps);
+
+// Benchmark the rms_norm FORWARD kernel in isolation (T×D), same idiom as softmax_rows_bench:
+// H2D x/w once, preallocate the x_norm/inv_rms scratch, run `reps` timed launches, D2H `out`.
+// Returns total GPU kernel seconds. Throws if CUDA is not compiled in.
+[[nodiscard]] double rms_norm_fwd_bench(const float* host_x, const float* host_w,
+                                        float* host_out, int T, int D, float eps, int reps);
 
 // Benchmark + validate the device Q8 matmul end-to-end: H2D-copy host Wq[M,K/32] and
 // Xq[T,K/32], run `reps` timed kernel launches (GPU events, after a warm-up), D2H-copy the

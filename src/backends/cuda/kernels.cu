@@ -74,6 +74,79 @@ __global__ void softmax_rows_f32_kernel(const float* __restrict__ in, float* __r
     for (int i = threadIdx.x; i < cols; i += blockDim.x) rout[i] *= inv;
 }
 
+// ── rms_norm training kernels (autograd path) ───────────────────────────────────────────
+// Distinct from the inference rmsnorm_kernel (single dh-vector, Gemma decode): these process
+// T rows of width D and expose the x_norm / inv_rms intermediates the backward pass needs.
+// Match backend::cpu::rms_norm_{fwd,bwd_x,bwd_w}_f32 exactly (1/sqrtf, not rsqrtf).
+
+// Forward: one block per row. y = x·inv_rms·w; also writes x_norm = x·inv_rms and inv_rms[t].
+__global__ void rms_norm_fwd_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                    float* __restrict__ x_norm, float* __restrict__ inv_rms,
+                                    float* __restrict__ out, int T, int D, float eps) {
+    const int t = blockIdx.x;
+    if (t >= T) return;
+    const float* xt  = x      + static_cast<std::size_t>(t) * D;
+    float*       xnt = x_norm + static_cast<std::size_t>(t) * D;
+    float*       ot  = out    + static_cast<std::size_t>(t) * D;
+
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < D; j += blockDim.x) local += xt[j] * xt[j];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float ir = 1.0f / sqrtf(red[0] / static_cast<float>(D) + eps);
+    if (threadIdx.x == 0) inv_rms[t] = ir;
+    for (int j = threadIdx.x; j < D; j += blockDim.x) {
+        const float xn = xt[j] * ir;
+        xnt[j] = xn;
+        ot[j]  = w[j] * xn;
+    }
+}
+
+// Backward wrt x: one block per row. sigma = Σ_j w·g·x_norm; gx = ir·w·g − (ir·sigma/D)·x_norm.
+__global__ void rms_norm_bwd_x_kernel(const float* __restrict__ g, const float* __restrict__ x_norm,
+                                      const float* __restrict__ inv_rms, const float* __restrict__ w,
+                                      float* __restrict__ gx, int T, int D) {
+    const int t = blockIdx.x;
+    if (t >= T) return;
+    const float* gt  = g      + static_cast<std::size_t>(t) * D;
+    const float* xnt = x_norm + static_cast<std::size_t>(t) * D;
+    float*       gxt = gx     + static_cast<std::size_t>(t) * D;
+    const float  ir  = inv_rms[t];
+
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < D; j += blockDim.x) local += w[j] * gt[j] * xnt[j];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float c2 = ir * red[0] / static_cast<float>(D);
+    for (int j = threadIdx.x; j < D; j += blockDim.x)
+        gxt[j] = ir * w[j] * gt[j] - c2 * xnt[j];
+}
+
+// Backward wrt w: one thread per column j, reduces over the T rows. gw[j] = Σ_t g[t,j]·x_norm[t,j].
+// Writes (not +=) — the autograd caller passes a freshly zeroed gw, so this matches the CPU
+// accumulate-into-zero result without needing cross-block atomics.
+__global__ void rms_norm_bwd_w_kernel(const float* __restrict__ g, const float* __restrict__ x_norm,
+                                      float* __restrict__ gw, int T, int D) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= D) return;
+    float acc = 0.0f;
+    for (int t = 0; t < T; ++t) {
+        const std::size_t off = static_cast<std::size_t>(t) * D + j;
+        acc += g[off] * x_norm[off];
+    }
+    gw[j] = acc;
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -655,6 +728,23 @@ void launch_relu_f32(const float* in, float* out, std::size_t n) {
 void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols) {
     constexpr int B = 256;                        // power of two for the tree reduction
     softmax_rows_f32_kernel<<<rows, B, B * sizeof(float)>>>(in, out, rows, cols);
+}
+
+void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
+                         float* out, int T, int D, float eps) {
+    constexpr int B = 256;                        // power of two for the tree reduction
+    rms_norm_fwd_kernel<<<T, B, B * sizeof(float)>>>(x, w, x_norm, inv_rms, out, T, D, eps);
+}
+
+void launch_rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv_rms,
+                           const float* w, float* gx, int T, int D) {
+    constexpr int B = 256;
+    rms_norm_bwd_x_kernel<<<T, B, B * sizeof(float)>>>(g, x_norm, inv_rms, w, gx, T, D);
+}
+
+void launch_rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D) {
+    constexpr int B = 256;
+    rms_norm_bwd_w_kernel<<<grid(static_cast<std::size_t>(D), B), B>>>(g, x_norm, gw, T, D);
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,

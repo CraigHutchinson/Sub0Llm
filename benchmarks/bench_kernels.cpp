@@ -14,7 +14,8 @@
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/autograd/variable.hpp"
 #ifdef SUB0LLM_CUDA
-#  include "backends/cuda/backend.hpp"   // device softmax bench (kernel-only timing + parity)
+#  include "backends/cuda/backend.hpp"   // device op benches (kernel-only timing + parity)
+#  include "backends/cpu/kernels.hpp"    // CPU reference (rms_norm fwd) for the parity column
 #endif
 
 #include <chrono>
@@ -214,6 +215,49 @@ static void bench_device_ops(int iters)
             se += d * d;  sref += static_cast<double>(cy[i]) * static_cast<double>(cy[i]);
         }
         const double rel_rms = std::sqrt(se / sref);
+        std::cout << std::format(
+            "  {:32s}  {:8.3f} ms  {:6.1f} GB/s  [CUDA]   {:5.2f}x vs CPU   relRMS {:.2e}\n",
+            s.label + "  [CUDA]", gpu_ms, gpu_gbps, cpu_t.ms_per_iter / gpu_ms, rel_rms);
+    }
+
+    std::cout << "\n--- Device rms_norm fwd: CPU vs CUDA (T × D) ---\n";
+    struct RSpec { int64_t T, D; std::string label; };
+    const RSpec rspecs[] = {
+        {64,   256,  "64×256     (T=64, D=256 founded)"},
+        {256,  1024, "256×1024   (T=256, D=1024)"},
+        {1024, 4096, "1024×4096  (long ctx, wide D)"},
+    };
+    for (const auto& s : rspecs) {
+        const std::size_t n = static_cast<std::size_t>(s.T * s.D);
+        Tensor x = zeros({s.T, s.D});
+        Tensor w = zeros({s.D});
+        auto xp = x.data_as<float>();  auto wp = w.data_as<float>();
+        for (std::size_t i = 0; i < n; ++i)
+            xp[i] = static_cast<float>((i * 2654435761u) & 0xFFFF) / 32768.0f - 1.0f;
+        for (int64_t j = 0; j < s.D; ++j) wp[static_cast<std::size_t>(j)] = 1.0f + 0.01f * static_cast<float>(j % 7);
+
+        Tensor xn_c = zeros({s.T, s.D}), ir_c = zeros({s.T}), out_c = zeros({s.T, s.D});
+        const auto cpu_t = time_it(s.label + "  [CPU]", n * 2, -1, iters, [&]{
+            sub0llm::backend::cpu::rms_norm_fwd_f32(
+                xp.data(), wp.data(), xn_c.data_as<float>().data(),
+                ir_c.data_as<float>().data(), out_c.data_as<float>().data(),
+                static_cast<std::size_t>(s.T), static_cast<std::size_t>(s.D), 1e-5f);
+        });
+
+        std::vector<float> gpu_out(n);
+        const double gpu_secs = sub0llm::backend::cuda::rms_norm_fwd_bench(
+            xp.data(), wp.data(), gpu_out.data(),
+            static_cast<int>(s.T), static_cast<int>(s.D), 1e-5f, iters);
+        const double gpu_ms = gpu_secs * 1e3 / iters;
+        const double gpu_gbps = (static_cast<double>(n) * 4.0 / 1e9) / (gpu_ms * 1e-3);
+
+        double se = 0.0, sref = 0.0;
+        const auto oc = out_c.data_as<float>();
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(gpu_out[i]) - static_cast<double>(oc[i]);
+            se += d * d;  sref += static_cast<double>(oc[i]) * static_cast<double>(oc[i]);
+        }
+        const double rel_rms = std::sqrt(se / (sref + 1e-30));
         std::cout << std::format(
             "  {:32s}  {:8.3f} ms  {:6.1f} GB/s  [CUDA]   {:5.2f}x vs CPU   relRMS {:.2e}\n",
             s.label + "  [CUDA]", gpu_ms, gpu_gbps, cpu_t.ms_per_iter / gpu_ms, rel_rms);

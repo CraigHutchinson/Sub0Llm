@@ -3,6 +3,7 @@
 #include "sub0llm/core/block_pool.hpp"
 #include "sub0llm/core/ops.hpp"
 #include "../backends/cpu/kernels.hpp"
+#include "../backends/cuda/backend.hpp"   // device dispatch for rms_norm (Stage 4 Phase 2)
 
 #include <cmath>
 #include <format>
@@ -704,20 +705,30 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
         throw std::runtime_error(std::format(
             "autograd::rms_norm: weight numel {} must equal D={}", weight.data().numel(), D));
 
+    const Device dev = xd.device();
     const Tensor xc = xd.contiguous();
     Tensor       wc = weight.data().contiguous();
 
-    Tensor x_norm  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
-    Tensor inv_rms = zeros({static_cast<int64_t>(T)});
-    Tensor out_d   = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)});
+    Tensor x_norm  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)}, DType::Float32, dev);
+    Tensor inv_rms = zeros({static_cast<int64_t>(T)}, DType::Float32, dev);
+    Tensor out_d   = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)}, DType::Float32, dev);
 
-    backend::cpu::rms_norm_fwd_f32(
-        reinterpret_cast<const float*>(xc.raw_ptr()),
-        reinterpret_cast<const float*>(wc.raw_ptr()),
-        reinterpret_cast<float*>(x_norm.raw_ptr()),
-        reinterpret_cast<float*>(inv_rms.raw_ptr()),
-        reinterpret_cast<float*>(out_d.raw_ptr()),
-        T, D, eps);
+    if (dev.is_cuda())
+        backend::cuda::rms_norm_fwd(
+            reinterpret_cast<const float*>(xc.raw_ptr()),
+            reinterpret_cast<const float*>(wc.raw_ptr()),
+            reinterpret_cast<float*>(x_norm.raw_ptr()),
+            reinterpret_cast<float*>(inv_rms.raw_ptr()),
+            reinterpret_cast<float*>(out_d.raw_ptr()),
+            static_cast<int>(T), static_cast<int>(D), eps);
+    else
+        backend::cpu::rms_norm_fwd_f32(
+            reinterpret_cast<const float*>(xc.raw_ptr()),
+            reinterpret_cast<const float*>(wc.raw_ptr()),
+            reinterpret_cast<float*>(x_norm.raw_ptr()),
+            reinterpret_cast<float*>(inv_rms.raw_ptr()),
+            reinterpret_cast<float*>(out_d.raw_ptr()),
+            T, D, eps);
 
     const bool rg = x.requires_grad() || weight.requires_grad();
     auto out = make_node(std::move(out_d), rg);
@@ -736,13 +747,22 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
                     const Tensor gc = g.contiguous();
                     Tensor gx = zeros({static_cast<int64_t>(T), static_cast<int64_t>(D)},
                                       DType::Float32, x_dev);
-                    backend::cpu::rms_norm_bwd_x_f32(
-                        reinterpret_cast<const float*>(gc.raw_ptr()),
-                        reinterpret_cast<const float*>(xn_snap.raw_ptr()),
-                        reinterpret_cast<const float*>(ir_snap.raw_ptr()),
-                        reinterpret_cast<const float*>(w_snap.raw_ptr()),
-                        reinterpret_cast<float*>(gx.raw_ptr()),
-                        T, D);
+                    if (x_dev.is_cuda())
+                        backend::cuda::rms_norm_bwd_x(
+                            reinterpret_cast<const float*>(gc.raw_ptr()),
+                            reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                            reinterpret_cast<const float*>(ir_snap.raw_ptr()),
+                            reinterpret_cast<const float*>(w_snap.raw_ptr()),
+                            reinterpret_cast<float*>(gx.raw_ptr()),
+                            static_cast<int>(T), static_cast<int>(D));
+                    else
+                        backend::cpu::rms_norm_bwd_x_f32(
+                            reinterpret_cast<const float*>(gc.raw_ptr()),
+                            reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                            reinterpret_cast<const float*>(ir_snap.raw_ptr()),
+                            reinterpret_cast<const float*>(w_snap.raw_ptr()),
+                            reinterpret_cast<float*>(gx.raw_ptr()),
+                            T, D);
                     return gx;
                 }));
         if (weight.requires_grad())
@@ -750,11 +770,18 @@ Variable rms_norm(const Variable& x, const Variable& weight, float eps) {
                 [xn_snap, w_dev, T, D](const Tensor& g) {
                     const Tensor gc = g.contiguous();
                     Tensor gw = zeros({static_cast<int64_t>(D)}, DType::Float32, w_dev);
-                    backend::cpu::rms_norm_bwd_w_f32(
-                        reinterpret_cast<const float*>(gc.raw_ptr()),
-                        reinterpret_cast<const float*>(xn_snap.raw_ptr()),
-                        reinterpret_cast<float*>(gw.raw_ptr()),
-                        T, D);
+                    if (w_dev.is_cuda())
+                        backend::cuda::rms_norm_bwd_w(
+                            reinterpret_cast<const float*>(gc.raw_ptr()),
+                            reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                            reinterpret_cast<float*>(gw.raw_ptr()),
+                            static_cast<int>(T), static_cast<int>(D));
+                    else
+                        backend::cpu::rms_norm_bwd_w_f32(
+                            reinterpret_cast<const float*>(gc.raw_ptr()),
+                            reinterpret_cast<const float*>(xn_snap.raw_ptr()),
+                            reinterpret_cast<float*>(gw.raw_ptr()),
+                            T, D);
                     return gw;
                 }));
     }

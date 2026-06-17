@@ -554,3 +554,32 @@ TEST_CASE("backward closures allocate grads on the input's device value",
         REQUIRE(x.grad().device() == alt);
     }
 }
+
+// Stage 4 Phase 2: autograd::rms_norm forward must dispatch to the CUDA kernel and produce the
+// same output as the CPU path (end-to-end through the public autograd API, like the softmax
+// forward). Gated on the CUDA build; backward-on-CUDA end-to-end waits on Phase 7 (device copy()).
+TEST_CASE("rms_norm forward dispatches to CUDA and matches CPU", "[autograd][device]") {
+    const int64_t T = 4, D = 6;
+    std::vector<float> xv(static_cast<std::size_t>(T * D));
+    for (std::size_t i = 0; i < xv.size(); ++i) xv[i] = 0.3f * static_cast<float>(i) - 1.1f;
+    std::vector<float> wv = {1.0f, 0.5f, -0.7f, 2.0f, 0.1f, -1.3f};
+
+    auto x_cpu = leaf2d(xv, T, D, /*rg=*/false);
+    auto w_cpu = leaf(wv, /*rg=*/false);
+    const Tensor y_cpu = rms_norm(x_cpu, w_cpu, 1e-5f).data();
+#ifdef SUB0LLM_CUDA
+    auto x_gpu = leaf2d(xv, T, D, /*rg=*/false);  x_gpu.to(Device::cuda());
+    auto w_gpu = leaf(wv, /*rg=*/false);          w_gpu.to(Device::cuda());
+    const Variable y_gpu = rms_norm(x_gpu, w_gpu, 1e-5f);
+    REQUIRE(y_gpu.data().device().is_cuda());
+    const Tensor y_back = y_gpu.data().to(Device::cpu());
+
+    const auto yc = y_cpu.data_as<float>();
+    const auto yb = y_back.data_as<float>();
+    for (int64_t i = 0; i < T * D; ++i)
+        REQUIRE_THAT(yb[static_cast<std::size_t>(i)],
+                     WithinAbs(yc[static_cast<std::size_t>(i)], 1e-4f));
+#else
+    REQUIRE(y_cpu.numel() == T * D);   // CPU path still exercised; CUDA dispatch on the cuda preset
+#endif
+}

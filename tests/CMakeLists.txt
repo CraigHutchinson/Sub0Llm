@@ -42,6 +42,10 @@ target_link_libraries(tests
         Catch2::Catch2WithMain
 )
 
+# Reach the private backend headers (backends/cpu/kernels.hpp, backends/cuda/backend.hpp) so
+# kernel-level parity tests can call the CPU reference and CUDA kernels directly — same as qbench.
+target_include_directories(tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 sub0llm_apply_compile_options(tests)
 
 set_target_properties(tests PROPERTIES

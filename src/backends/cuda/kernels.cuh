@@ -16,6 +16,15 @@ void launch_relu_f32(const float* in, float* out, std::size_t n);
 // Row-wise softmax over a (rows, cols) row-major f32 tensor (dim=-1), one block per row.
 // Matches backend::cpu::softmax_rows_f32 numerics. rows = numel/cols.
 void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols);
+
+// rms_norm training fwd+bwd over T rows of width D — match backend::cpu::rms_norm_*_f32.
+// fwd writes x_norm (=x·inv_rms), inv_rms[T] and out (=x_norm·w). bwd_x needs x_norm/inv_rms/w
+// snapshots; bwd_w reduces over rows into gw[D] (caller passes a zeroed gw).
+void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
+                         float* out, int T, int D, float eps);
+void launch_rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv_rms,
+                           const float* w, float* gx, int T, int D);
+void launch_rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
 

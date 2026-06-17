@@ -138,6 +138,35 @@ Tensor softmax(const Tensor& t, int dim) {
 #endif
 }
 
+void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
+                  float* out, int T, int D, float eps) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_rms_norm_fwd(x, w, x_norm, inv_rms, out, T, D, eps);
+#else
+    (void)x; (void)w; (void)x_norm; (void)inv_rms; (void)out; (void)T; (void)D; (void)eps;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+void rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv_rms,
+                    const float* w, float* gx, int T, int D) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_rms_norm_bwd_x(g, x_norm, inv_rms, w, gx, T, D);
+#else
+    (void)g; (void)x_norm; (void)inv_rms; (void)w; (void)gx; (void)T; (void)D;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+void rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_rms_norm_bwd_w(g, x_norm, gw, T, D);
+#else
+    (void)g; (void)x_norm; (void)gw; (void)T; (void)D;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 Tensor matmul(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
     const auto M = static_cast<std::size_t>(a.shape(0));
@@ -184,6 +213,43 @@ double softmax_rows_bench(const float* host_in, float* host_out, int rows, int c
     return static_cast<double>(ms) / 1000.0;
 #else
     (void)host_in; (void)host_out; (void)rows; (void)cols; (void)reps;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+double rms_norm_fwd_bench(const float* host_x, const float* host_w, float* host_out,
+                          int T, int D, float eps, int reps) {
+#ifdef SUB0LLM_CUDA
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+    };
+    const std::size_t td = static_cast<std::size_t>(T) * D;
+    float *dX = nullptr, *dW = nullptr, *dXn = nullptr, *dIr = nullptr, *dOut = nullptr;
+    ck(cudaMalloc(&dX,  td * sizeof(float)),                       "malloc x");
+    ck(cudaMalloc(&dW,  static_cast<std::size_t>(D) * sizeof(float)), "malloc w");
+    ck(cudaMalloc(&dXn, td * sizeof(float)),                       "malloc x_norm");
+    ck(cudaMalloc(&dIr, static_cast<std::size_t>(T) * sizeof(float)), "malloc inv_rms");
+    ck(cudaMalloc(&dOut, td * sizeof(float)),                      "malloc out");
+    ck(cudaMemcpy(dX, host_x, td * sizeof(float), cudaMemcpyHostToDevice), "H2D x");
+    ck(cudaMemcpy(dW, host_w, static_cast<std::size_t>(D) * sizeof(float), cudaMemcpyHostToDevice), "H2D w");
+
+    for (int w = 0; w < 3; ++w) kernels::launch_rms_norm_fwd(dX, dW, dXn, dIr, dOut, T, D, eps);
+    ck(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t t0, t1;
+    ck(cudaEventCreate(&t0), "event t0");  ck(cudaEventCreate(&t1), "event t1");
+    ck(cudaEventRecord(t0), "record t0");
+    for (int r = 0; r < reps; ++r) kernels::launch_rms_norm_fwd(dX, dW, dXn, dIr, dOut, T, D, eps);
+    ck(cudaEventRecord(t1), "record t1");
+    ck(cudaEventSynchronize(t1), "kernel sync");
+    float ms = 0.0f;  ck(cudaEventElapsedTime(&ms, t0, t1), "elapsed");
+
+    ck(cudaMemcpy(host_out, dOut, td * sizeof(float), cudaMemcpyDeviceToHost), "D2H out");
+    cudaEventDestroy(t0);  cudaEventDestroy(t1);
+    cudaFree(dX);  cudaFree(dW);  cudaFree(dXn);  cudaFree(dIr);  cudaFree(dOut);
+    return static_cast<double>(ms) / 1000.0;
+#else
+    (void)host_x; (void)host_w; (void)host_out; (void)T; (void)D; (void)eps; (void)reps;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }
