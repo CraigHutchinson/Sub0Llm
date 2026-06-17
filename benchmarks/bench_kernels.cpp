@@ -300,6 +300,52 @@ static void bench_device_ops(int iters)
             "  {:32s}  {:8.3f} ms  {:7.2f} GFLOPs/s  [CUDA]  {:5.2f}x vs CPU  relRMS {:.2e}\n",
             s.label + "  [CUDA]", gpu_ms, gpu_gflops, cpu_t.ms_per_iter / gpu_ms, rel_rms);
     }
+
+    std::cout << "\n--- Device rope fwd: CPU vs CUDA (T × Dh) ---\n";
+    struct PSpec { int64_t T, Dh; std::string label; };
+    const PSpec pspecs[] = {
+        {256,  64,  "256×64     (T=256, head_dim=64)"},
+        {1024, 128, "1024×128   (long ctx, Dh=128)"},
+    };
+    for (const auto& s : pspecs) {
+        const int64_t D2 = s.Dh / 2;
+        const std::size_t n = static_cast<std::size_t>(s.T * s.Dh);
+        Tensor x = zeros({s.T, s.Dh}), cosT = zeros({s.T, D2}), sinT = zeros({s.T, D2});
+        auto xp = x.data_as<float>(), cp = cosT.data_as<float>(), sp = sinT.data_as<float>();
+        for (std::size_t i = 0; i < n; ++i) xp[i] = static_cast<float>((i * 2654435761u) & 0xFFFF) / 32768.0f - 1.0f;
+        for (int64_t k = 0; k < s.T * D2; ++k) {
+            const float th = 0.01f * static_cast<float>(k % 257);
+            cp[static_cast<std::size_t>(k)] = std::cos(th);  sp[static_cast<std::size_t>(k)] = std::sin(th);
+        }
+        Tensor out_c = zeros({s.T, s.Dh});
+        auto op = out_c.data_as<float>();
+        const auto cpu_t = time_it(s.label + "  [CPU]", n * 2, -1, iters, [&]{
+            for (int64_t t = 0; t < s.T; ++t)
+                for (int64_t i = 0; i < D2; ++i) {
+                    const float c = cp[t * D2 + i], sn = sp[t * D2 + i];
+                    const float x0 = xp[t * s.Dh + i], x1 = xp[t * s.Dh + i + D2];
+                    op[t * s.Dh + i]      = x0 * c - x1 * sn;
+                    op[t * s.Dh + i + D2] = x0 * sn + x1 * c;
+                }
+        });
+
+        std::vector<float> gpu_out(n);
+        const double gpu_secs = sub0llm::backend::cuda::rope_fwd_bench(
+            xp.data(), cp.data(), sp.data(), gpu_out.data(),
+            static_cast<int>(s.T), static_cast<int>(s.Dh), iters);
+        const double gpu_ms = gpu_secs * 1e3 / iters;
+        const double gpu_gbps = (static_cast<double>(n) * 4.0 / 1e9) / (gpu_ms * 1e-3);
+
+        double se = 0.0, sref = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(gpu_out[i]) - static_cast<double>(op[i]);
+            se += d * d;  sref += static_cast<double>(op[i]) * static_cast<double>(op[i]);
+        }
+        const double rel_rms = std::sqrt(se / (sref + 1e-30));
+        std::cout << std::format(
+            "  {:32s}  {:8.3f} ms  {:6.1f} GB/s  [CUDA]   {:5.2f}x vs CPU   relRMS {:.2e}\n",
+            s.label + "  [CUDA]", gpu_ms, gpu_gbps, cpu_t.ms_per_iter / gpu_ms, rel_rms);
+    }
 #else
     (void)iters;
     std::cout << "\n--- Device ops: CPU-only build (configure --preset cuda for GPU rows) ---\n";

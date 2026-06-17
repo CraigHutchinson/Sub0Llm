@@ -25,6 +25,11 @@ void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* i
 void launch_rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv_rms,
                            const float* w, float* gx, int T, int D);
 void launch_rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D);
+
+// rope (half-split / NeoX) fwd+bwd over x(T,Dh) with precomputed cos/sin (T,Dh/2). Matches the
+// autograd::rope CPU math. One thread per rotated pair.
+void launch_rope_fwd(const float* x, const float* cosf, const float* sinf, float* out, int T, int Dh);
+void launch_rope_bwd(const float* g, const float* cosf, const float* sinf, float* gx, int T, int Dh);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
 // Transposed-first-operand matmul C = Aᵀ·B: A(M,K), B(M,N) row-major → C(K,N), contraction over M.

@@ -167,6 +167,24 @@ void rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D
 #endif
 }
 
+void rope_fwd(const float* x, const float* cos, const float* sin, float* out, int T, int Dh) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_rope_fwd(x, cos, sin, out, T, Dh);
+#else
+    (void)x; (void)cos; (void)sin; (void)out; (void)T; (void)Dh;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+void rope_bwd(const float* g, const float* cos, const float* sin, float* gx, int T, int Dh) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_rope_bwd(g, cos, sin, gx, T, Dh);
+#else
+    (void)g; (void)cos; (void)sin; (void)gx; (void)T; (void)Dh;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 Tensor matmul(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
     const auto M = static_cast<std::size_t>(a.shape(0));
@@ -268,6 +286,42 @@ double rms_norm_fwd_bench(const float* host_x, const float* host_w, float* host_
     return static_cast<double>(ms) / 1000.0;
 #else
     (void)host_x; (void)host_w; (void)host_out; (void)T; (void)D; (void)eps; (void)reps;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+double rope_fwd_bench(const float* host_x, const float* host_cos, const float* host_sin,
+                      float* host_out, int T, int Dh, int reps) {
+#ifdef SUB0LLM_CUDA
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+    };
+    const std::size_t xb = static_cast<std::size_t>(T) * Dh * sizeof(float);
+    const std::size_t cb = static_cast<std::size_t>(T) * (Dh / 2) * sizeof(float);
+    float *dX = nullptr, *dC = nullptr, *dS = nullptr, *dOut = nullptr;
+    ck(cudaMalloc(&dX, xb), "malloc x");   ck(cudaMalloc(&dC, cb), "malloc cos");
+    ck(cudaMalloc(&dS, cb), "malloc sin"); ck(cudaMalloc(&dOut, xb), "malloc out");
+    ck(cudaMemcpy(dX, host_x, xb, cudaMemcpyHostToDevice),   "H2D x");
+    ck(cudaMemcpy(dC, host_cos, cb, cudaMemcpyHostToDevice), "H2D cos");
+    ck(cudaMemcpy(dS, host_sin, cb, cudaMemcpyHostToDevice), "H2D sin");
+
+    for (int w = 0; w < 3; ++w) kernels::launch_rope_fwd(dX, dC, dS, dOut, T, Dh);
+    ck(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t t0, t1;
+    ck(cudaEventCreate(&t0), "event t0");  ck(cudaEventCreate(&t1), "event t1");
+    ck(cudaEventRecord(t0), "record t0");
+    for (int r = 0; r < reps; ++r) kernels::launch_rope_fwd(dX, dC, dS, dOut, T, Dh);
+    ck(cudaEventRecord(t1), "record t1");
+    ck(cudaEventSynchronize(t1), "kernel sync");
+    float ms = 0.0f;  ck(cudaEventElapsedTime(&ms, t0, t1), "elapsed");
+
+    ck(cudaMemcpy(host_out, dOut, xb, cudaMemcpyDeviceToHost), "D2H out");
+    cudaEventDestroy(t0);  cudaEventDestroy(t1);
+    cudaFree(dX);  cudaFree(dC);  cudaFree(dS);  cudaFree(dOut);
+    return static_cast<double>(ms) / 1000.0;
+#else
+    (void)host_x; (void)host_cos; (void)host_sin; (void)host_out; (void)T; (void)Dh; (void)reps;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }

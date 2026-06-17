@@ -813,40 +813,65 @@ Variable rope(const Variable& x, const Tensor& cos_freqs, const Tensor& sin_freq
         throw std::runtime_error("autograd::rope: head_dim Dh must be even");
     const std::size_t D2 = Dh / 2;
 
-    const Tensor xc = xd.contiguous();
-    const auto   xs = xc.data_as<float>();
-    const auto   cs = cos_freqs.data_as<float>();
-    const auto   ss = sin_freqs.data_as<float>();
+    const Device dev = xd.device();
+    const Tensor xc  = xd.contiguous();
 
     // Half-split (NeoX/HF "rotate_half") convention: dimension i pairs with
     // i+D2, matching ModernGPT::forward_one() and GGUF/Qwen3 weights so the
     // training and KV-cached inference paths produce identical results.
-    Tensor out_d = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)});
-    auto   od    = out_d.data_as<float>();
-    for (std::size_t t = 0; t < T; ++t)
-        for (std::size_t i = 0; i < D2; ++i) {
-            const float c  = cs[t * D2 + i];
-            const float s  = ss[t * D2 + i];
-            const float x0 = xs[t * Dh + i];
-            const float x1 = xs[t * Dh + i + D2];
-            od[t * Dh + i]      = x0 * c - x1 * s;
-            od[t * Dh + i + D2] = x0 * s + x1 * c;
-        }
+    Tensor out_d = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)}, DType::Float32, dev);
+    if (dev.is_cuda()) {
+        // cos/sin must be device-resident for the kernel; move them if the caller passed host
+        // tensors (cheap, constant). The temporaries' cudaFree synchronises the launch.
+        const Tensor cf = cos_freqs.device() == dev ? cos_freqs : cos_freqs.to(dev);
+        const Tensor sf = sin_freqs.device() == dev ? sin_freqs : sin_freqs.to(dev);
+        backend::cuda::rope_fwd(
+            reinterpret_cast<const float*>(xc.raw_ptr()),
+            reinterpret_cast<const float*>(cf.raw_ptr()),
+            reinterpret_cast<const float*>(sf.raw_ptr()),
+            reinterpret_cast<float*>(out_d.raw_ptr()),
+            static_cast<int>(T), static_cast<int>(Dh));
+    } else {
+        const auto xs = xc.data_as<float>();
+        const auto cs = cos_freqs.data_as<float>();
+        const auto ss = sin_freqs.data_as<float>();
+        auto       od = out_d.data_as<float>();
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t i = 0; i < D2; ++i) {
+                const float c  = cs[t * D2 + i];
+                const float s  = ss[t * D2 + i];
+                const float x0 = xs[t * Dh + i];
+                const float x1 = xs[t * Dh + i + D2];
+                od[t * Dh + i]      = x0 * c - x1 * s;
+                od[t * Dh + i + D2] = x0 * s + x1 * c;
+            }
+    }
 
     auto out = make_node(std::move(out_d), x.requires_grad());
     if (out->requires_grad) {
-        Tensor cf_snap = copy(cos_freqs);
-        Tensor sf_snap = copy(sin_freqs);
         const Device x_dev = x.data().device();
+        // Snapshot cos/sin on the input's device so the backward kernel can read them. .to(dev)
+        // is a deep H2D copy for host inputs; a same-device call shares storage (kept alive here).
+        Tensor cf_snap = x_dev.is_cuda() ? cos_freqs.to(x_dev) : copy(cos_freqs);
+        Tensor sf_snap = x_dev.is_cuda() ? sin_freqs.to(x_dev) : copy(sin_freqs);
         out->edges.push_back(make_edge(x.impl(),
             [cf_snap, sf_snap, x_dev, T, Dh, D2](const Tensor& g) {
                 const Tensor gc = g.contiguous();
-                const auto   gs = gc.data_as<float>();
-                const auto   cf = cf_snap.data_as<float>();
-                const auto   sf = sf_snap.data_as<float>();
                 Tensor gx  = zeros({static_cast<int64_t>(T), static_cast<int64_t>(Dh)},
                                    DType::Float32, x_dev);
-                auto   gxs = gx.data_as<float>();
+                if (x_dev.is_cuda()) {
+                    backend::cuda::rope_bwd(
+                        reinterpret_cast<const float*>(gc.raw_ptr()),
+                        reinterpret_cast<const float*>(cf_snap.raw_ptr()),
+                        reinterpret_cast<const float*>(sf_snap.raw_ptr()),
+                        reinterpret_cast<float*>(gx.raw_ptr()),
+                        static_cast<int>(T), static_cast<int>(Dh));
+                    return gx;
+                }
+                const auto gs  = gc.data_as<float>();
+                const auto cf  = cf_snap.data_as<float>();
+                const auto sf  = sf_snap.data_as<float>();
+                auto       gxs = gx.data_as<float>();
                 for (std::size_t t = 0; t < T; ++t)
                     for (std::size_t i = 0; i < D2; ++i) {
                         const float c  = cf[t * D2 + i];

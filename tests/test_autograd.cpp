@@ -4,6 +4,7 @@
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/autograd/variable.hpp"
 #include "sub0llm/core/ops.hpp"
+#include "backends/cuda/backend.hpp"   // rope_bwd kernel parity (Stage 4 Phase 4)
 
 #include <cmath>
 #include <stdexcept>
@@ -581,5 +582,63 @@ TEST_CASE("rms_norm forward dispatches to CUDA and matches CPU", "[autograd][dev
                      WithinAbs(yc[static_cast<std::size_t>(i)], 1e-4f));
 #else
     REQUIRE(y_cpu.numel() == T * D);   // CPU path still exercised; CUDA dispatch on the cuda preset
+#endif
+}
+
+// Stage 4 Phase 4: rope (half-split). Forward dispatches to CUDA end-to-end; the backward kernel
+// is validated against the autograd CPU gradient (the trusted reference — no math duplication).
+TEST_CASE("rope forward + backward match CPU on CUDA", "[autograd][device]") {
+    const int64_t T = 5, Dh = 8, D2 = Dh / 2;
+    std::vector<float> xv(static_cast<std::size_t>(T * Dh)), gv(static_cast<std::size_t>(T * Dh));
+    for (std::size_t i = 0; i < xv.size(); ++i) {
+        xv[i] = 0.2f * static_cast<float>(i) - 0.9f;
+        gv[i] = 0.13f * static_cast<float>(i) - 0.5f;
+    }
+    Tensor cosT({T, D2}, DType::Float32), sinT({T, D2}, DType::Float32);
+    {   // arbitrary but valid rotation angles
+        auto cp = cosT.data_as<float>();  auto sp = sinT.data_as<float>();
+        for (int64_t k = 0; k < T * D2; ++k) {
+            const float th = 0.05f * static_cast<float>(k);
+            cp[static_cast<std::size_t>(k)] = std::cos(th);
+            sp[static_cast<std::size_t>(k)] = std::sin(th);
+        }
+    }
+    Tensor up({T, Dh}, DType::Float32);
+    { auto u = up.data_as<float>(); for (std::size_t i = 0; i < gv.size(); ++i) u[i] = gv[i]; }
+
+    // CPU reference: forward output and the autograd backward gradient.
+    const Variable y_cpu = rope(leaf2d(xv, T, Dh, /*rg=*/false), cosT, sinT);
+    Variable x_for_grad = leaf2d(xv, T, Dh, /*rg=*/true);
+    rope(x_for_grad, cosT, sinT).backward(copy(up));
+    const Tensor gx_cpu = x_for_grad.grad();
+#ifdef SUB0LLM_CUDA
+    // Forward parity (end-to-end through autograd::rope dispatch).
+    auto x_gpu = leaf2d(xv, T, Dh, /*rg=*/false);  x_gpu.to(Device::cuda());
+    const Tensor cosD = cosT.to(Device::cuda()), sinD = sinT.to(Device::cuda());
+    const Variable y_gpu = rope(x_gpu, cosD, sinD);
+    REQUIRE(y_gpu.data().device().is_cuda());
+    const Tensor y_back = y_gpu.data().to(Device::cpu());
+    const auto yc = y_cpu.data().data_as<float>();
+    const auto yb = y_back.data_as<float>();
+    for (int64_t i = 0; i < T * Dh; ++i)
+        REQUIRE_THAT(yb[static_cast<std::size_t>(i)], WithinAbs(yc[static_cast<std::size_t>(i)], 1e-4f));
+
+    // Backward kernel parity vs the autograd CPU gradient.
+    const Tensor gD = up.to(Device::cuda());
+    Tensor gx_d = zeros({T, Dh}, DType::Float32, Device::cuda());
+    backend::cuda::rope_bwd(
+        reinterpret_cast<const float*>(gD.raw_ptr()),
+        reinterpret_cast<const float*>(cosD.raw_ptr()),
+        reinterpret_cast<const float*>(sinD.raw_ptr()),
+        reinterpret_cast<float*>(gx_d.raw_ptr()),
+        static_cast<int>(T), static_cast<int>(Dh));
+    const Tensor gx_gpu = gx_d.to(Device::cpu());
+    const auto gc = gx_cpu.data_as<float>();
+    const auto gg = gx_gpu.data_as<float>();
+    for (int64_t i = 0; i < T * Dh; ++i)
+        REQUIRE_THAT(gg[static_cast<std::size_t>(i)], WithinAbs(gc[static_cast<std::size_t>(i)], 1e-4f));
+#else
+    REQUIRE(y_cpu.data().numel() == T * Dh);
+    REQUIRE(gx_cpu.numel() == T * Dh);
 #endif
 }

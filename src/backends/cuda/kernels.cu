@@ -147,6 +147,36 @@ __global__ void rms_norm_bwd_w_kernel(const float* __restrict__ g, const float* 
     gw[j] = acc;
 }
 
+// rope (half-split / NeoX) fwd+bwd over x(T,Dh) with precomputed cos/sin (T,Dh/2). One thread per
+// rotated pair (t,i), i∈[0,Dh/2). Matches the autograd::rope CPU loops exactly.
+//   fwd: out[t,i]=x0·c−x1·s,  out[t,i+D2]=x0·s+x1·c   (x0=x[t,i], x1=x[t,i+D2])
+//   bwd: gx[t,i]=g0·c+g1·s,   gx[t,i+D2]=−g0·s+g1·c
+__global__ void rope_fwd_kernel(const float* __restrict__ x, const float* __restrict__ cosf,
+                                const float* __restrict__ sinf, float* __restrict__ out,
+                                int T, int Dh, int D2) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D2) return;
+    const int t = idx / D2, i = idx % D2;
+    const float c  = cosf[idx], s = sinf[idx];     // cos/sin are (T,D2) row-major → idx == t·D2+i
+    const float x0 = x[static_cast<std::size_t>(t) * Dh + i];
+    const float x1 = x[static_cast<std::size_t>(t) * Dh + i + D2];
+    out[static_cast<std::size_t>(t) * Dh + i]      = x0 * c - x1 * s;
+    out[static_cast<std::size_t>(t) * Dh + i + D2] = x0 * s + x1 * c;
+}
+
+__global__ void rope_bwd_kernel(const float* __restrict__ g, const float* __restrict__ cosf,
+                                const float* __restrict__ sinf, float* __restrict__ gx,
+                                int T, int Dh, int D2) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D2) return;
+    const int t = idx / D2, i = idx % D2;
+    const float c  = cosf[idx], s = sinf[idx];
+    const float g0 = g[static_cast<std::size_t>(t) * Dh + i];
+    const float g1 = g[static_cast<std::size_t>(t) * Dh + i + D2];
+    gx[static_cast<std::size_t>(t) * Dh + i]      =  g0 * c + g1 * s;
+    gx[static_cast<std::size_t>(t) * Dh + i + D2] = -g0 * s + g1 * c;
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -773,6 +803,20 @@ void launch_rms_norm_bwd_x(const float* g, const float* x_norm, const float* inv
 void launch_rms_norm_bwd_w(const float* g, const float* x_norm, float* gw, int T, int D) {
     constexpr int B = 256;
     rms_norm_bwd_w_kernel<<<grid(static_cast<std::size_t>(D), B), B>>>(g, x_norm, gw, T, D);
+}
+
+void launch_rope_fwd(const float* x, const float* cosf, const float* sinf, float* out,
+                     int T, int Dh) {
+    const int D2 = Dh / 2;
+    rope_fwd_kernel<<<grid(static_cast<std::size_t>(T) * D2, BLOCK), BLOCK>>>(
+        x, cosf, sinf, out, T, Dh, D2);
+}
+
+void launch_rope_bwd(const float* g, const float* cosf, const float* sinf, float* gx,
+                     int T, int Dh) {
+    const int D2 = Dh / 2;
+    rope_bwd_kernel<<<grid(static_cast<std::size_t>(T) * D2, BLOCK), BLOCK>>>(
+        g, cosf, sinf, gx, T, Dh, D2);
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,
