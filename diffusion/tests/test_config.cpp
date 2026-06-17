@@ -151,3 +151,65 @@ TEST_CASE("config_sha tracks the model shape only", "[config]") {
     b.model.n_layers = 12;          // a BuildTime field …
     CHECK(cfg::config_sha(a) != cfg::config_sha(b));   // … does
 }
+
+TEST_CASE("config_sha is stable across a JSON round-trip", "[config]") {
+    cfg::RunConfig a;
+    a.model.embed_dim = 384;
+    a.model.n_heads = 6;
+    a.optim.lr = 1.23e-4f;          // Runtime change must not perturb the (BuildTime) sha
+    const auto doc = scfg::JsonDoc::parse(scfg::to_json(a));
+    REQUIRE(doc.has_value());
+    cfg::RunConfig b;
+    scfg::load_json(b, *doc);
+    CHECK(cfg::config_sha(a) == cfg::config_sha(b));
+}
+
+TEST_CASE("to_json scope filter emits only the requested scope", "[config]") {
+    cfg::Model m;
+    const std::string build = scfg::to_json(m, /*all=*/false, scfg::Scope::BuildTime);
+    const std::string runtime = scfg::to_json(m, /*all=*/false, scfg::Scope::Runtime);
+    // Model fields are all BuildTime: present under BuildTime, absent under Runtime.
+    CHECK(build.find("embed_dim") != std::string::npos);
+    CHECK(build.find("n_layers") != std::string::npos);
+    CHECK(runtime.find("embed_dim") == std::string::npos);
+}
+
+TEST_CASE("write_run_config stamps meta and stays loadable", "[config]") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "ch29_cfg_meta_test";
+    fs::create_directories(dir);
+    cfg::RunConfig c;
+    c.model.embed_dim = 200;
+    cfg::write_run_config(dir, c, "abc1234");
+
+    auto doc = scfg::JsonDoc::parse_file(dir / "run_config.json");
+    REQUIRE(doc.has_value());
+    CHECK(doc->str("_code_sha").value_or("") == "abc1234");   // meta present
+    CHECK(doc->has("_config_sha"));
+    // The schema loader ignores the meta keys and still restores the fields.
+    cfg::RunConfig back;
+    scfg::load_json(back, *doc);
+    CHECK(back.model.embed_dim == 200);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("JsonDoc scalar coercion, missing keys, and bad input", "[config][json]") {
+    auto d = scfg::JsonDoc::parse(R"({"i":42,"f":1.5,"neg":-3,"b":true,"s":"hi","fi":64.0})");
+    REQUIRE(d.has_value());
+    CHECK(d->i64("i").value() == 42);
+    CHECK(d->i64("fi").value() == 64);            // float with no fraction → int
+    CHECK(d->u64("i").value() == 42u);
+    CHECK_FALSE(d->u64("neg").has_value());       // negative rejected as unsigned
+    CHECK(d->f64("i").value() == 42.0);           // int widened to double
+    CHECK(d->boolean("b").value() == true);
+    CHECK(d->str("s").value() == "hi");
+    CHECK_FALSE(d->i64("missing").has_value());   // absent key
+    CHECK_FALSE(d->boolean("i").has_value());     // type mismatch
+    CHECK(d->has("f"));
+    CHECK_FALSE(d->has("nope"));
+
+    CHECK_FALSE(scfg::JsonDoc::parse("{ not json").has_value());   // malformed → nullopt
+    auto arr = scfg::JsonDoc::parse("[1,2,3]");                    // non-object root
+    REQUIRE(arr.has_value());
+    CHECK_FALSE(arr->i64("x").has_value());                       // no keys on an array
+}

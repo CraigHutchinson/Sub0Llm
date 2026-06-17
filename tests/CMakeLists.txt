@@ -33,6 +33,7 @@ add_executable(tests
     test_cpu_topology.cpp
     test_small_function.cpp
     test_inline_vector.cpp
+    test_pool.cpp
 )
 
 target_link_libraries(tests
