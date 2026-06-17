@@ -501,3 +501,22 @@ noise." Precise restatement of why uniform training trips patience early.
 **Gate / non-disruption:** do NOT perturb the live founded run to test these — they are A/Bs for a fresh
 run (ideally the [[ch31-diffusion-optimization-sandbox-plan]] sandbox, where noise/weighting are isolated).
 Mechanistically these underpin the organic curriculum (§13.2) and the polluted-global-NELBO story.
+
+**Live evidence — a WITHIN-level NELBO sign-flip at k≈26 / t≈0.41 (2026-06-17).** Parsing the W=16
+run's per-epoch level-NELBO triples (≈3 evals/level before advance): below ~k=25 the within-level
+Δ (last−first) is mixed/noisy and leans DOWN (the level is still net-improving while trained); at and
+above **k=26 it is consistently POSITIVE — 10 consecutive levels (k26–k35) all up, none down.** Ten
+same-sign in a row is not 3-sample noise (random would be ~50/50; p≈0.001), so there is a real
+**phase transition: frontier-POINT training makes a level's held-out NELBO WORSE once t≳0.41.** Past
+~40% masking there is no net-learnable signal for the point objective, so the optimizer drifts in a
+direction that worsens held-out high-noise prediction — most plausibly **overfitting** (with little
+context the model can only memorize the seen high-noise windows, which don't generalise) and/or
+gradient-noise/conflict near the floor. The curriculum's "mastered→advance" there detects
+NON-improvement, but it is mild REGRESSION; the best per-level checkpoint is the arrival epoch.
+Implications: (a) the net-negative tail starts at **t≈0.4, not t>0.8** as §11/§13.2 assumed — the real
+learnable frontier for this model is ~0.4; (b) strong support for the noise-SPREAD/organic curriculum
+(don't dwell at high k; keep low-k in the mix to anchor) and an LR-decay-at-high-k lever; (c) the
+within-level slope sign-flip is itself a FREE diagnostic for "where training stops helping" — usable to
+cap the curriculum frontier or switch to spread. Δdelta-per-level is small (~+0.01–0.02) and the post-
+convergence full-objective phase re-anchors the learnable levels, so this is an efficiency/design signal,
+not run-ruining — but it sharpens both the loss-weighting and per-level-cadence A/Bs above.
