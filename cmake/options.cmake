@@ -35,6 +35,15 @@ endif()
 option(SUB0LLM_ENABLE_SANITIZERS         "Enable address/UB sanitizers (Debug)"    OFF)
 option(SUB0LLM_ENABLE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"        OFF)
 
+# Allocator instrumentation: tally TensorPool/BlockPool hit/miss/cache/evict (pool_stats.hpp).
+# Profiling only — adds relaxed-atomic counters on every pooled alloc/free. Default OFF
+# (zero overhead; the count sites compile to no-ops). Enable for a measurement build.
+option(SUB0LLM_POOL_STATS "Instrument TensorPool/BlockPool with hit/miss/evict counters" OFF)
+if(SUB0LLM_POOL_STATS)
+    add_compile_definitions(SUB0LLM_POOL_STATS)
+    message(STATUS "sub0llm: pool-stats instrumentation ENABLED (profiling build)")
+endif()
+
 # Wire up BUILD_TESTING
 if(SUB0LLM_BUILD_TESTS)
     set(BUILD_TESTING ON CACHE BOOL "" FORCE)

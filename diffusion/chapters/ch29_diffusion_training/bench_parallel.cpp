@@ -11,6 +11,7 @@
 #include "sub0llm/compat/print.hpp"
 #include "sub0llm/core/cpu_topology.hpp"
 #include "sub0llm/core/ops.hpp"
+#include "sub0llm/core/pool_stats.hpp"
 #include "sub0llm/core/runtime.hpp"
 #include "sub0llm/core/tensor.hpp"
 #include "sub0llm/core/thread_pool.hpp"
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     std::int64_t seq_len = 64;
     std::uint64_t iters  = 600;
     int max_threads = 0;   // 0 = up to physical P-cores
+    std::int64_t alloc_batch = 16;   // --alloc-count effective batch (per-worker = B/W)
     const std::int64_t V = 512, D = 128, n_layers = 4, d_ff = 384;
     const std::size_t n_heads = 8, n_kv_heads = 4;
 
@@ -88,6 +90,7 @@ int main(int argc, char** argv) {
         if      (a == "--seq-len")     seq_len = std::stoll(next());
         else if (a == "--iters")       iters   = std::stoull(next());
         else if (a == "--max-threads") max_threads = std::stoi(next());
+        else if (a == "--alloc-batch") alloc_batch = std::stoll(next());
     }
 
     bool alloc_probe = false, affinity_test = false, batch_bench = false, gemm_probe = false,
@@ -103,27 +106,37 @@ int main(int argc, char** argv) {
     }
 
     // ── Allocation profile: how many heap allocations does ONE step do? ──────────
-    // Targets the zero-alloc substrate work at the real offenders. Measures the
-    // per-window path (what each data-parallel worker runs) — the convoy source.
+    // Targets the zero-alloc substrate work at the real offenders. Uses the FOUNDED arch
+    // (the real default: D=256/L6/d_ff=1024) and the BATCHED path with a real effective
+    // batch B — i.e. one whole training step — so the count reflects what production runs.
+    // NOTE: operator-new counts BlockPool (::operator new) + std/misc, but NOT TensorPool
+    // buffers (those use _aligned_malloc). The pool-stats block below (SUB0LLM_POOL_STATS)
+    // is the authoritative source for TensorPool MISS/EVICT — the heap-thrash signature.
     if (alloc_count) {
-        const auto topo0 = sub0llm::detect_cpu_topology();
-        (void)topo0;
-        dn::Denoiser model(V, D, n_heads, n_kv_heads, n_layers, d_ff, /*seed=*/42);
+        const std::int64_t fV = 512, fD = 256, fL = 6, fdff = 1024;
+        const std::size_t  fH = 8, fKV = 4;
+        const std::int64_t Bb = alloc_batch;   // per-worker batch (real run: B/W); sweep with --alloc-batch
+        dn::Denoiser model(fV, fD, fH, fKV, fL, fdff, /*seed=*/42);
         auto params = model.parameters();
         nn::Adam opt(params, 1e-3f);
-        dt::DiffusionLossContext ctx(seq_len);
+        dt::BatchedDiffusionLossContext bctx(Bb, seq_len);
         std::mt19937 rng(1234);
         std::vector<std::int32_t> stream(1u << 16);
-        std::uniform_int_distribution<std::int32_t> tk(0, static_cast<std::int32_t>(V) - 1);
+        std::uniform_int_distribution<std::int32_t> tk(0, static_cast<std::int32_t>(fV) - 1);
         for (auto& t : stream) t = tk(rng);
         std::span<const std::int32_t> ss(stream);
         std::uniform_int_distribution<std::size_t> od(0, stream.size() - static_cast<std::size_t>(seq_len) - 1);
+        std::vector<std::size_t> offs(static_cast<std::size_t>(Bb));
         auto one = [&] {
-            auto w = ss.subspan(od(rng), static_cast<std::size_t>(seq_len));
-            auto r = dt::diffusion_loss(model, w, rng, ctx, 0.02f, 1.0f);
-            opt.zero_grad(); r.loss.backward(); opt.step();
+            for (auto& o : offs) o = od(rng);
+            auto r = dt::batched_diffusion_loss(model, ss, offs, rng, bctx, 0.02f, 1.0f);
+            opt.zero_grad(); r.loss.backward();
+            (void)nn::clip_grad_norm(params, 5.0f); opt.step();
         };
-        for (int i = 0; i < 20; ++i) one();             // warmup (pools settle)
+        for (int i = 0; i < 30; ++i) one();             // warmup (pools settle)
+#ifdef SUB0LLM_POOL_STATS
+        const auto ps0 = sub0llm::poolstats::snapshot();
+#endif
         auto& gc = allocprof::c();                        // reset counters
         gc.count = 0; gc.bytes = 0;
         for (auto& bkt : gc.buckets) bkt = 0;
@@ -132,16 +145,30 @@ int main(int argc, char** argv) {
         for (int i = 0; i < N; ++i) one();
         allocprof::c().armed = false;
         auto& g = allocprof::c();
-        std::println("alloc-count: per-window step (V={} D={} layers={} d_ff={} T={})\n",
-                     V, D, n_layers, d_ff, seq_len);
-        std::println("  {:.0f} heap allocs/step   {:.1f} KB/step",
+        std::println("alloc-count: FOUNDED batched step (V={} D={} layers={} d_ff={} T={} B={})\n",
+                     fV, fD, fL, fdff, seq_len, Bb);
+        std::println("  {:.1f} operator-new/step   {:.1f} KB/step   ({:.2f} new/window)",
                      static_cast<double>(g.count.load()) / N,
-                     static_cast<double>(g.bytes.load()) / N / 1024.0);
+                     static_cast<double>(g.bytes.load()) / N / 1024.0,
+                     static_cast<double>(g.count.load()) / N / static_cast<double>(Bb));
         const char* names[] = {"<=32", "<=64", "<=128", "<=256", "<=512", "<=1K", "<=4K", ">4K"};
-        std::println("  size histogram (allocs/step):");
+        std::println("  operator-new size histogram (allocs/step):");
         for (std::size_t b = 0; b < 8; ++b)
             std::println("    {:>5}  {:8.1f}", names[b],
                          static_cast<double>(g.buckets[b].load()) / N);
+#ifdef SUB0LLM_POOL_STATS
+        const auto ps1 = sub0llm::poolstats::snapshot();
+        auto per = [&](std::uint64_t a, std::uint64_t b) { return static_cast<double>(b - a) / N; };
+        std::println("\n  pool stats/step (SUB0LLM_POOL_STATS) — MISS+EVICT = real heap thrash:");
+        std::println("    TensorPool  hit {:8.1f}  miss {:8.1f}  cache {:8.1f}  EVICT {:8.1f}",
+                     per(ps0.tp_hit, ps1.tp_hit), per(ps0.tp_miss, ps1.tp_miss),
+                     per(ps0.tp_cache, ps1.tp_cache), per(ps0.tp_evict, ps1.tp_evict));
+        std::println("    BlockPool   hit {:8.1f}  miss {:8.1f}  cache {:8.1f}  EVICT {:8.1f}",
+                     per(ps0.bp_hit, ps1.bp_hit), per(ps0.bp_miss, ps1.bp_miss),
+                     per(ps0.bp_cache, ps1.bp_cache), per(ps0.bp_evict, ps1.bp_evict));
+#else
+        std::println("\n  (build with -DSUB0LLM_POOL_STATS for TensorPool/BlockPool miss/evict attribution)");
+#endif
         return 0;
     }
 

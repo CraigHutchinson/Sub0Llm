@@ -13,8 +13,11 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <new>
 #include <vector>
+
+#include "sub0llm/core/pool_stats.hpp"
 
 namespace sub0llm {
 
@@ -31,32 +34,45 @@ public:
 
     [[nodiscard]] void* take(std::size_t bytes) {
         const int idx = bucket_for(bytes);
-        if (idx < 0) return ::operator new(bytes);          // outsized → bypass
+        if (idx < 0) { SUB0LLM_POOL_COUNT(bp_miss); return ::operator new(bytes); }  // outsized → bypass
+        note_take(idx);
         auto& bkt = buckets_[static_cast<std::size_t>(idx)];
-        if (!bkt.empty()) { void* p = bkt.back(); bkt.pop_back(); return p; }
+        if (!bkt.empty()) { SUB0LLM_POOL_COUNT(bp_hit); void* p = bkt.back(); bkt.pop_back(); return p; }
+        SUB0LLM_POOL_COUNT(bp_miss);
         return ::operator new(bucket_size(idx));            // cold: size-class block
     }
     void give(void* p, std::size_t bytes) noexcept {
         if (!p) return;
         const int idx = bucket_for(bytes);
-        if (idx < 0) { ::operator delete(p); return; }
-        auto& bkt = buckets_[static_cast<std::size_t>(idx)];
-        if (bkt.size() < max_cached(idx)) bkt.push_back(p);
-        else                              ::operator delete(p);
+        if (idx < 0) { SUB0LLM_POOL_COUNT(bp_evict); ::operator delete(p); return; }
+        const std::size_t i = static_cast<std::size_t>(idx);
+        if (live_[i]) --live_[i];
+        auto& bkt = buckets_[i];
+        if (bkt.size() < cap(idx)) { SUB0LLM_POOL_COUNT(bp_cache); bkt.push_back(p); }
+        else                       { SUB0LLM_POOL_COUNT(bp_evict); ::operator delete(p); }
     }
 
 private:
     static constexpr std::size_t kMin       = 16;     // smallest size class
     static constexpr int         kNumBuckets = 12;    // 16 B … 32 KB
-    // Size-aware cap (~8 MB cached bytes/class) so the small classes hold a whole step's live
-    // graph (hundreds–thousands of Nodes/Storages) while bounding total cached memory.
-    static constexpr std::size_t kCacheBytes = 8u << 20;
-    static std::size_t max_cached(int idx) noexcept {
-        const std::size_t cap = kCacheBytes / bucket_size(idx);
-        return cap < 8 ? 8 : (cap > 16384 ? 16384 : cap);
-    }
+    // SELF-SCALING cap, same rationale as TensorPool (src/core/pool.hpp): a step's live Node/
+    // Storage count is set by the graph size (∝ L·B), so learn it via a per-class high-water mark
+    // rather than a fixed byte budget that would regress as layers grow. Memory-free (cached =
+    // min(peak-live, cap)); kSafetyMax guards a leak only.
+    static constexpr std::size_t kSafetyMax = 1u << 20;
 
     std::array<std::vector<void*>, kNumBuckets> buckets_;
+    std::array<std::uint32_t, kNumBuckets>      live_{};
+    std::array<std::uint32_t, kNumBuckets>      peak_{};
+
+    void note_take(int idx) noexcept {
+        const std::size_t i = static_cast<std::size_t>(idx);
+        if (++live_[i] > peak_[i]) peak_[i] = live_[i];
+    }
+    [[nodiscard]] std::size_t cap(int idx) const noexcept {
+        const std::size_t want = static_cast<std::size_t>(peak_[static_cast<std::size_t>(idx)]) + 2;
+        return want < kSafetyMax ? want : kSafetyMax;
+    }
 
     static int bucket_for(std::size_t bytes) noexcept {
         std::size_t s = kMin;
