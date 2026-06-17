@@ -2,7 +2,9 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <cmath>
+#include <filesystem>
 #include <stdexcept>
+#include <vector>
 
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/autograd/variable.hpp"
@@ -342,4 +344,44 @@ TEST_CASE("Adam: multiple params updated independently", "[optimizer]") {
 
     REQUIRE(p1.data().data_as<float>()[0] < 2.0f);
     REQUIRE(p2.data().data_as<float>()[0] < 4.0f);
+}
+
+TEST_CASE("Adam save_state/load_state restores (m,v,t) for an honest resume", "[optimizer][adam]") {
+    namespace fs = std::filesystem;
+    const std::string path = (fs::temp_directory_path() / "sub0_adam_state_roundtrip.opt").string();
+    const std::initializer_list<float> g = {0.1f, 0.4f, -0.3f};
+
+    // Populate m/v/t with a few steps, snapshot the weights, then take ONE reference step.
+    Variable a = leaf1d({1.0f, -2.0f, 0.5f});
+    nn::Adam optA({&a}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.0f);
+    for (int s = 0; s < 5; ++s) { a.grad() = make_grad({0.3f, -0.7f, 0.2f}); optA.step(); }
+    const std::vector<float> w_saved(a.data().data_as<float>().begin(), a.data().data_as<float>().end());
+    optA.save_state(path);
+    a.grad() = make_grad(g); optA.step();
+    const std::vector<float> w_ref(a.data().data_as<float>().begin(), a.data().data_as<float>().end());
+
+    auto reset = [&] { auto d = a.data().data_as<float>();
+                       for (std::size_t i = 0; i < w_saved.size(); ++i) d[i] = w_saved[i]; };
+
+    // Load state into a FRESH Adam, take the SAME step → must match the reference exactly.
+    reset();
+    nn::Adam optB({&a}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.0f);
+    REQUIRE(optB.load_state(path));
+    a.grad() = make_grad(g); optB.step();
+    {   auto d = a.data().data_as<float>();
+        for (std::size_t i = 0; i < w_ref.size(); ++i) REQUIRE_THAT(d[i], WithinAbs(w_ref[i], 1e-6f)); }
+
+    // A fresh Adam WITHOUT loading (t=0, zero moments) must DIFFER — proves the state mattered.
+    reset();
+    nn::Adam optC({&a}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.0f);
+    a.grad() = make_grad(g); optC.step();
+    {   auto d = a.data().data_as<float>(); bool differs = false;
+        for (std::size_t i = 0; i < w_ref.size(); ++i) differs |= std::abs(d[i] - w_ref[i]) > 1e-4f;
+        REQUIRE(differs); }
+
+    // A shape-mismatched optimizer rejects the file (returns false, keeps fresh state).
+    Variable b = leaf1d({0.0f, 0.0f});
+    nn::Adam optD({&b}, 0.1f);
+    REQUIRE_FALSE(optD.load_state(path));
+    fs::remove(path);
 }

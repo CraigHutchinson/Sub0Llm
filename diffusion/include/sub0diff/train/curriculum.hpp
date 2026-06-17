@@ -73,6 +73,15 @@ public:
     [[nodiscard]] float        best()    const noexcept { return best_; }
     [[nodiscard]] int          stalls()  const noexcept { return stalls_; }
 
+    // Rehydrate the exact state from a resumed checkpoint's training-state sidecar, so the
+    // curriculum continues mid-climb instead of restarting at k_start.
+    void restore(std::int64_t k, float best, int stalls, bool converged) noexcept {
+        k_         = std::clamp<std::int64_t>(k, 1, k_max_);
+        best_      = best;
+        stalls_    = stalls;
+        converged_ = converged;
+    }
+
     // Call ONCE per epoch (at the held-out eval) with the held-out NELBO measured at the CURRENT
     // frontier level (mask exactly k). Returns true iff the level advanced on this call.
     bool observe_epoch(float nelbo_at_frontier) {

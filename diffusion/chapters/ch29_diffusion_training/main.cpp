@@ -480,6 +480,58 @@ static void save(const fs::path& path, std::uint64_t corpus_size, std::int64_t p
 }
 } // namespace tokcache
 
+// ── Training-state sidecar (train_state.txt) ───────────────────────────────────
+// Weights live in step_*.ckpt and Adam's moments in step_*.opt; this tiny text file holds
+// the remaining run state so a resume is HONEST — the curriculum continues mid-climb and
+// early-stopping keeps its history, instead of both restarting. One `key=value` per line
+// (human-readable, dependency-free). `step` is matched against the resumed checkpoint so a
+// stale sidecar is ignored.
+namespace trainstate {
+struct State {
+    bool          have = false;
+    std::uint64_t step = 0;
+    std::int64_t  curr_k = 1;
+    float         curr_best = std::numeric_limits<float>::max();
+    int           curr_stalls = 0;
+    bool          curr_converged = false;
+    float         best_nelbo = std::numeric_limits<float>::max();
+    std::uint64_t evals_since_best = 0;
+};
+
+static void save(const fs::path& path, const State& s) {
+    std::ofstream f(path);
+    if (!f) return;
+    f << std::format("step={}\ncurriculum_k={}\ncurriculum_best={:.9g}\ncurriculum_stalls={}\n"
+                     "curriculum_converged={}\nbest_nelbo={:.9g}\nevals_since_best={}\n",
+                     s.step, s.curr_k, s.curr_best, s.curr_stalls,
+                     s.curr_converged ? 1 : 0, s.best_nelbo, s.evals_since_best);
+}
+
+// Load and validate against the resumed step; returns have=false on any mismatch/absence.
+[[nodiscard]] static State load(const fs::path& path, std::uint64_t expect_step) {
+    State s;
+    std::ifstream f(path);
+    if (!f) return s;
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        try {
+            if      (k == "step")                  s.step = std::stoull(v);
+            else if (k == "curriculum_k")          s.curr_k = std::stoll(v);
+            else if (k == "curriculum_best")       s.curr_best = std::stof(v);
+            else if (k == "curriculum_stalls")     s.curr_stalls = std::stoi(v);
+            else if (k == "curriculum_converged")  s.curr_converged = (v != "0");
+            else if (k == "best_nelbo")            s.best_nelbo = std::stof(v);
+            else if (k == "evals_since_best")      s.evals_since_best = std::stoull(v);
+        } catch (...) { return State{}; }   // malformed → treat as absent
+    }
+    s.have = (s.step == expect_step);       // only trust a sidecar matching the resumed ckpt
+    return s;
+}
+}  // namespace trainstate
+
 static int run(int argc, char** argv);
 
 int main(int argc, char** argv) {
@@ -704,9 +756,14 @@ static int run(int argc, char** argv) {
 
     fs::create_directories(cfg.ckpt_dir);
     std::uint64_t start_step = 0;
+    std::string resume_ckpt_path;            // the .ckpt we resumed from (→ matching .opt)
+    trainstate::State resume_state;          // curriculum + early-stop state to rehydrate
     if (const auto path = latest_checkpoint_path(cfg.ckpt_dir); !path.empty()) {
         start_step = static_cast<std::uint64_t>(load_checkpoint(params, path));
-        std::println("resumed from {} (step {})", path, start_step);
+        resume_ckpt_path = path;
+        resume_state = trainstate::load(fs::path(cfg.ckpt_dir) / "train_state.txt", start_step);
+        std::println("resumed from {} (step {}){}", path, start_step,
+                     resume_state.have ? " + train_state.txt" : "");
     } else {
         // Fresh run: persist tokenizer + config so Ch30's sampler can reload the model dir.
         tok.save(fs::path(cfg.ckpt_dir) / "tokenizer");
@@ -905,6 +962,18 @@ static int run(int argc, char** argv) {
             opt = nn::make_optimizer(cfg.optimizer, param_ptrs, cfg.lr);
             std::println("optimizer: {} (lr {:.1e})", cfg.optimizer, cfg.lr);
         }
+        // HONEST RESUME: restore Adam's (m, v, t) from the .opt next to the resumed .ckpt, so the
+        // optimizer keeps its adaptive per-parameter rates instead of re-warming from zero. The
+        // .opt path mirrors the weight checkpoint (step_*.ckpt → step_*.opt).
+        if (!resume_ckpt_path.empty()) {
+            fs::path opt_path = resume_ckpt_path;
+            opt_path.replace_extension(".opt");
+            if (fs::exists(opt_path) && opt->load_state(opt_path.string()))
+                std::println("restored optimizer state from {}", opt_path.string());
+            else
+                std::println("note: no matching optimizer state ({}) — Adam moments start fresh "
+                             "(a brief re-warm)", opt_path.string());
+        }
         // LR schedule is OPT-IN (--warmup-steps N): a measured A/B showed warmup+cosine
         // HURT the known-good baseline (12.0% vs 14.8%) by decaying it into an earlier
         // early-stop, and did NOT rescue wider configs that get stuck in the unigram
@@ -934,8 +1003,11 @@ static int run(int argc, char** argv) {
         auto last_report = t0;
         std::uint64_t interval_steps = 0, interval_tokens = 0;
 
-        float best_nelbo = std::numeric_limits<float>::max();
-        std::uint64_t evals_since_best = 0, steps_taken = start_step;
+        // Early-stop history rehydrated on an honest resume (else fresh).
+        float best_nelbo = resume_state.have ? resume_state.best_nelbo
+                                             : std::numeric_limits<float>::max();
+        std::uint64_t evals_since_best = resume_state.have ? resume_state.evals_since_best : 0;
+        std::uint64_t steps_taken = start_step;
         constexpr float min_improvement = 0.01f;
 
         // --profile: accumulated wall time per phase, reported with each timing line.
@@ -984,12 +1056,37 @@ static int run(int argc, char** argv) {
                 .seq_len = cfg.seq_len, .k_start = cfg.curriculum_k_start, .k_max = 0,
                 .k_step = cfg.curriculum_k_step,
                 .patience = static_cast<int>(cfg.curriculum_patience)});
-            std::println("curriculum: CONVERGENCE-gated, k=1→{} masked tokens (t={:.3f}→1.0), "
+            // Honest resume: rehydrate the exact curriculum state from the sidecar (continue
+            // mid-climb) — overrides --curriculum-k-start, which is the manual fallback.
+            if (resume_state.have)
+                fcurr->restore(resume_state.curr_k, resume_state.curr_best,
+                               resume_state.curr_stalls, resume_state.curr_converged);
+            std::println("curriculum: CONVERGENCE-gated, k={}→{} masked tokens (t={:.3f}→1.0), "
                          "+{}/level on per-epoch NELBO plateau (patience {} epochs); global "
-                         "early-stop suspended until converged",
-                         fcurr->max_level(), fcurr->frontier(), cfg.curriculum_k_step,
-                         cfg.curriculum_patience);
+                         "early-stop suspended until converged{}",
+                         fcurr->level(), fcurr->max_level(), fcurr->frontier(),
+                         cfg.curriculum_k_step, cfg.curriculum_patience,
+                         fcurr->converged() ? " [resumed: CONVERGED]"
+                       : resume_state.have ? std::format(" [resumed at k={}]", fcurr->level())
+                                           : "");
         }
+
+        // Honest checkpoint: weights (step_*.ckpt) + Adam state (step_*.opt) + the curriculum/
+        // early-stop sidecar (train_state.txt), all stamped with the same step so a resume
+        // restores the FULL training state. Replaces bare save_checkpoint at every save site.
+        auto save_full = [&](std::uint64_t step) {
+            save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step));
+            opt->save_state((fs::path(cfg.ckpt_dir) / std::format("step_{:09d}.opt", step)).string());
+            trainstate::State s;
+            s.step = step;
+            if (fcurr) {
+                s.curr_k = fcurr->level();       s.curr_best = fcurr->best();
+                s.curr_stalls = fcurr->stalls(); s.curr_converged = fcurr->converged();
+            }
+            s.best_nelbo = best_nelbo;
+            s.evals_since_best = evals_since_best;
+            trainstate::save(fs::path(cfg.ckpt_dir) / "train_state.txt", s);
+        };
 
         float last_loss = 0.0f, last_t = 0.0f;
         for (std::uint64_t step = start_step; step < cfg.steps; ++step) {
@@ -1083,7 +1180,7 @@ static int run(int argc, char** argv) {
                              r.ws_recall() * 100.0f, cfg.overfit, cfg.overfit == 1 ? "" : "s",
                              last_loss);
                 if (r.recall() >= 0.99f) {
-                    save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
+                    save_full(step + 1);
                     std::println("  overfit FIT ✓ — train recall {:.1f}% ≥ 99% at step {}: capacity "
                                  "SUFFICIENT for N={} (D={}, L={}, H={})",
                                  r.recall() * 100.0f, step + 1, cfg.overfit,
@@ -1106,7 +1203,7 @@ static int run(int argc, char** argv) {
                 const bool improved  = fnelbo < prev_best - 0.01f;
                 const bool advanced  = fcurr->observe_epoch(fnelbo);
                 if (improved || advanced || fcurr->converged())
-                    save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
+                    save_full(step + 1);
                 // FORGETTING WATCH: frontier-point trains EXACTLY at k, so while climbing the model
                 // no longer sees the easy k=1 regime. In theory it shouldn't forget (the post-
                 // convergence full-objective phase revisits every level), but watch the base-level
@@ -1145,7 +1242,7 @@ static int run(int argc, char** argv) {
                 if (nelbo < best_nelbo - min_improvement) {
                     best_nelbo = nelbo;
                     evals_since_best = 0;
-                    save_checkpoint(params, cfg.ckpt_dir, static_cast<std::int64_t>(step + 1));
+                    save_full(step + 1);
                     std::println("  eval @ {:>6}: held-out NELBO {:.4f}  ← best, checkpointed",
                                  step + 1, nelbo);
                 } else {

@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -209,6 +210,54 @@ void Adam::step() {
 
 void Adam::zero_grad() {
     for (auto* p : params_) p->zero_grad();
+}
+
+// Adam state file: [magic "S0OA"][ver][t_][n_params] then per-param [numel][m floats][v floats].
+// Float32 only (m_/v_ mirror the param dtype, always f32 here). load validates layout exactly.
+namespace {
+constexpr std::uint32_t kAdamMagic = 0x53304F41u, kAdamVer = 1u;
+template <class T> const char* as_bytes(const T* p) { return reinterpret_cast<const char*>(p); }
+template <class T> char*       as_wbytes(T* p)       { return reinterpret_cast<char*>(p); }
+}  // namespace
+
+void Adam::save_state(const std::string& path) const {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+    const std::int64_t n = static_cast<std::int64_t>(m_.size());
+    f.write(as_bytes(&kAdamMagic), 4);
+    f.write(as_bytes(&kAdamVer), 4);
+    f.write(as_bytes(&t_), 8);
+    f.write(as_bytes(&n), 8);
+    for (std::size_t i = 0; i < m_.size(); ++i) {
+        const std::int64_t numel = m_[i].numel();
+        f.write(as_bytes(&numel), 8);
+        f.write(as_bytes(m_[i].data_as<float>().data()), numel * 4);
+        f.write(as_bytes(v_[i].data_as<float>().data()), numel * 4);
+    }
+}
+
+bool Adam::load_state(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::uint32_t magic = 0, ver = 0;
+    std::int64_t  t = 0, n = 0;
+    f.read(as_wbytes(&magic), 4);
+    f.read(as_wbytes(&ver), 4);
+    f.read(as_wbytes(&t), 8);
+    f.read(as_wbytes(&n), 8);
+    if (!f || magic != kAdamMagic || ver != kAdamVer ||
+        n != static_cast<std::int64_t>(m_.size()))
+        return false;
+    for (std::size_t i = 0; i < m_.size(); ++i) {
+        std::int64_t numel = 0;
+        f.read(as_wbytes(&numel), 8);
+        if (!f || numel != m_[i].numel()) return false;
+        f.read(as_wbytes(m_[i].data_as<float>().data()), numel * 4);
+        f.read(as_wbytes(v_[i].data_as<float>().data()), numel * 4);
+    }
+    if (!f) return false;
+    t_ = t;
+    return true;
 }
 
 // ── Muon ────────────────────────────────────────────────────────────────────────

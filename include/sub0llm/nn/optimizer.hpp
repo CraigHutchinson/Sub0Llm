@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -24,6 +25,14 @@ public:
     virtual void                zero_grad()        = 0;
     virtual void                set_lr(float lr) noexcept = 0;
     [[nodiscard]] virtual float lr() const noexcept       = 0;
+
+    // Persist/restore internal state (momentum buffers + step count) so a resumed run
+    // continues with the SAME adaptive rates instead of re-warming from zero — an honest
+    // resume. Default no-op (a stateless optimizer); stateful ones override. `path` is a
+    // binary file written alongside the weight checkpoint. load_state returns false (leaving
+    // the fresh zero state) if the file is absent or its shape doesn't match this optimizer.
+    virtual void save_state(const std::string& /*path*/) const {}
+    virtual bool load_state(const std::string& /*path*/) { return false; }
 };
 
 // Stochastic gradient descent with optional momentum.
@@ -65,6 +74,10 @@ public:
     // Set the learning rate (for an LR schedule, e.g. CosineWithWarmup applied per step).
     void                set_lr(float lr) noexcept override { lr_ = lr; }
     [[nodiscard]] float lr() const noexcept override { return lr_; }
+
+    // Persist/restore (m, v, t) — the full Adam state for an honest resume.
+    void save_state(const std::string& path) const override;
+    bool load_state(const std::string& path) override;
 
 private:
     std::vector<autograd::Variable*> params_;
