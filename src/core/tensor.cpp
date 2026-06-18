@@ -217,6 +217,11 @@ Tensor ones(Tensor::Shape shape, DType dtype, Device device) {
         throw std::runtime_error(
             std::format("ones: dtype {} not yet supported", dtype_name(dtype)));
     }
+    // The value fill below writes via host pointers, so build on the host and transfer for CUDA.
+    // (Used by Variable::backward to seed a scalar loss's gradient on the loss's device.)
+    if (device.is_cuda())
+        return ones(std::move(shape), dtype, Device::cpu()).to(device);
+
     Tensor t = zeros(shape, dtype, device);
     if (dtype == DType::Float32) {
         auto sp = t.data_as<float>();
@@ -279,6 +284,17 @@ Tensor copy(const Tensor& src) {
     if (src.numel() <= 0) return dst;
 
     const std::size_t bytes = static_cast<std::size_t>(src.numel()) * dtype_size(src.dtype());
+
+    // CUDA: a deep copy is a device-to-device memcpy. This is what lets the autograd backward
+    // graph run on-device — Node::accumulate_grad seeds each grad with copy(upstream). Only the
+    // contiguous case is needed (grads/snapshots are contiguous); a strided device copy would
+    // need its own kernel (Phase 7+ if ever required).
+    if (src.device().is_cuda()) {
+        if (!src.is_contiguous())
+            throw std::runtime_error("copy: non-contiguous CUDA copy not yet implemented");
+        backend::cuda::memcpy_d2d(dst.raw_ptr(), src.raw_ptr(), bytes, src.device().index);
+        return dst;
+    }
 
     if (src.is_contiguous()) {
         std::memcpy(dst.raw_ptr(), src.raw_ptr(), bytes);

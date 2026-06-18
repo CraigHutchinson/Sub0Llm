@@ -673,3 +673,45 @@ TEST_CASE("narrow backward scatter matches CPU on CUDA", "[autograd][device]") {
     REQUIRE(gx_cpu.numel() == T * C);
 #endif
 }
+
+// Stage 4 Phase 7 (step 1): with device-d2d copy() + accumulate_grad, a FULL autograd backward
+// graph runs on-device. This gradchecks a composed graph y = silu(rms_norm(x*0.5, w)) end-to-end —
+// every grad accumulation, the backward seed copy, and the rms_norm/silu/scale bwd dispatches —
+// against the identical CPU graph. This is the end-to-end proof that the Phase 2-6 bwd dispatches
+// compose correctly on the GPU.
+TEST_CASE("end-to-end autograd backward on CUDA matches CPU", "[autograd][device]") {
+    const int64_t T = 4, D = 6;
+    std::vector<float> xv(static_cast<std::size_t>(T * D)), wv(static_cast<std::size_t>(D));
+    for (std::size_t i = 0; i < xv.size(); ++i) xv[i] = 0.25f * static_cast<float>(i) - 1.3f;
+    for (std::size_t i = 0; i < wv.size(); ++i) wv[i] = 0.5f + 0.2f * static_cast<float>(i);
+    Tensor up({T, D}, DType::Float32);
+    { auto u = up.data_as<float>(); for (std::size_t i = 0; i < u.size(); ++i) u[i] = 0.1f * static_cast<float>(i) + 0.3f; }
+
+    // CPU reference graph + grads.
+    auto x_cpu = leaf2d(xv, T, D, /*rg=*/true);
+    auto w_cpu = leaf(wv, /*rg=*/true);
+    silu(rms_norm(scale(x_cpu, 0.5f), w_cpu, 1e-5f)).backward(copy(up));
+    const Tensor xg_cpu = x_cpu.grad();
+    const Tensor wg_cpu = w_cpu.grad();
+#ifdef SUB0LLM_CUDA
+    auto x_gpu = leaf2d(xv, T, D, /*rg=*/true);  x_gpu.to(Device::cuda());
+    auto w_gpu = leaf(wv, /*rg=*/true);          w_gpu.to(Device::cuda());
+    Variable y_gpu = silu(rms_norm(scale(x_gpu, 0.5f), w_gpu, 1e-5f));
+    REQUIRE(y_gpu.data().device().is_cuda());
+    y_gpu.backward(up.to(Device::cuda()));
+    REQUIRE(x_gpu.grad().device().is_cuda());   // grad accumulated on-device
+    REQUIRE(w_gpu.grad().device().is_cuda());
+
+    const Tensor xg = x_gpu.grad().to(Device::cpu());
+    const Tensor wg = w_gpu.grad().to(Device::cpu());
+    const auto xc = xg_cpu.data_as<float>();  const auto xgs = xg.data_as<float>();
+    const auto wc = wg_cpu.data_as<float>();  const auto wgs = wg.data_as<float>();
+    for (int64_t i = 0; i < T * D; ++i)
+        REQUIRE_THAT(xgs[static_cast<std::size_t>(i)], WithinAbs(xc[static_cast<std::size_t>(i)], 1e-3f));
+    for (int64_t i = 0; i < D; ++i)
+        REQUIRE_THAT(wgs[static_cast<std::size_t>(i)], WithinAbs(wc[static_cast<std::size_t>(i)], 1e-3f));
+#else
+    REQUIRE(xg_cpu.numel() == T * D);
+    REQUIRE(wg_cpu.numel() == D);
+#endif
+}
