@@ -531,7 +531,18 @@ the data-matched 157K resists until t≈0.58 and only gently). [Correction: an e
 157K was "immune / NO sign-flip" — that was from k≤29 data; it is far more RESISTANT, not immune.] The
 mechanism stands and is cleaner for being capacity-monotone: the over-capacity 6M has room to MEMORIZE
 high-noise training windows → held-out NELBO rises as it trains them; the data-matched 157K has little
-spare capacity, so the effect is delayed to extreme noise and small. Corollary
+spare capacity, so the effect is delayed to extreme noise and small.
+
+**GENERATION coherence — DATA is the ceiling, not capacity (2026-06-18).** Ch30 iterative sampling at the
+SAME curriculum step (k=36) on both models: the 6M and the 157K BOTH produce word-salad ("ROMEO: Fort S
+Inightthe one alter…" vs "ROMEO: so a fav) death emacre's a… shall nature, drebans"), comparably
+incoherent (the 157K arguably has more word-like fragments). A 38× capacity gap ⇒ the SAME incoherence,
+so coherent generation is bottlenecked by DATA quantity/diversity, not model size. Final ledger for "just
+train smaller?": the data-matched 157K wins honesty (no/late overfitting), memorization-resistance, and
+~25× speed/cost, TIES on generation (both word-salad), and loses only raw held-out NELBO (which was partly
+the 6M overfitting) — so for this data regime it is the better practical/educational choice; coherence
+needs more data (full corpus via GPT-2 BPE / external text), not param count. (To re-test at the small
+model's CONVERGENCE too — pending.) Corollary
 results from the same A/B: the 157K is **on par at k=1** but **uniformly weaker on held-out NELBO** as the
 task hardens (base(k=1) plateaus ~2.6 vs the 6M's ~1.3; per-level gap ~0.8) — capacity buys real held-out
 modeling, not just memorization. **Net:** training a data-matched smaller model FIXES the overfitting/
