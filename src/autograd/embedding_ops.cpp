@@ -1,6 +1,7 @@
 #include "sub0llm/autograd/embedding_ops.hpp"
 #include "sub0llm/core/block_pool.hpp"
 #include "../backends/cpu/kernels.hpp"
+#include "../backends/cuda/backend.hpp"   // device dispatch for embed-scatter bwd (Stage 4 Phase 5)
 
 #include <cstring>
 #include <format>
@@ -72,23 +73,29 @@ Variable embedding_lookup(const Variable& weight, const Tensor& indices) {
 
     auto out = make_node(std::move(out_data), weight.requires_grad());
     if (out->requires_grad) {
-        Tensor idx_copy = copy(indices);
         const Device w_device = wd.device();
+        // Snapshot indices on the weight's device so the scatter kernel can read them.
+        Tensor idx_copy = w_device.is_cuda() ? indices.to(w_device) : copy(indices);
         out->edges.push_back(make_edge(weight.impl(),
             [idx_copy, N, V, D, w_device](const Tensor& g) {
                 // Flatten upstream gradient to (N, D) for uniform indexing.
                 const Tensor g_flat = g.reshape(
                     {static_cast<int64_t>(N), static_cast<int64_t>(D)}).contiguous();
-                const auto gs  = g_flat.data_as<float>();
-                const auto tc  = idx_copy.data_as<int32_t>();
 
-                Tensor grad_w = zeros(
+                Tensor grad_w = zeros(   // pre-zeroed: both kernels accumulate into it
                     {static_cast<int64_t>(V), static_cast<int64_t>(D)},
                     DType::Float32, w_device);
-                auto gwd = grad_w.data_as<float>();
 
-                backend::cpu::embed_bwd_f32(
-                    gs.data(), tc.data(), gwd.data(), N, D);
+                if (w_device.is_cuda())
+                    backend::cuda::embed_bwd(
+                        reinterpret_cast<const float*>(g_flat.raw_ptr()),
+                        reinterpret_cast<const int*>(idx_copy.raw_ptr()),
+                        reinterpret_cast<float*>(grad_w.raw_ptr()),
+                        static_cast<int>(N), static_cast<int>(D));
+                else
+                    backend::cpu::embed_bwd_f32(
+                        g_flat.data_as<float>().data(), idx_copy.data_as<int32_t>().data(),
+                        grad_w.data_as<float>().data(), N, D);
                 return grad_w;
             }));
     }

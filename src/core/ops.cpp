@@ -216,7 +216,10 @@ Tensor sqrt   (const Tensor& t) { return unary_cpu(t, "sqrt",    backend::cpu::s
 Tensor abs    (const Tensor& t) { return unary_cpu(t, "abs",     backend::cpu::abs_f32);     }
 
 Tensor gelu(const Tensor& t) { return unary_cpu(t, "gelu", backend::cpu::gelu_f32); }
-Tensor silu(const Tensor& t) { return unary_cpu(t, "silu", backend::cpu::silu_f32); }
+Tensor silu(const Tensor& t) {
+    if (t.device().is_cuda()) return backend::cuda::silu(t);
+    return unary_cpu(t, "silu", backend::cpu::silu_f32);
+}
 
 Tensor softmax(const Tensor& t, int dim) {
     if (t.ndim() > 2 || dim != -1)

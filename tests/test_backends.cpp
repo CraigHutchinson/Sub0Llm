@@ -276,3 +276,57 @@ TEST_CASE("matmul_tb - CUDA matches CPU reference", "[backends][cuda][device]") 
     SUCCEED("CPU build - CUDA matmul_tb parity is exercised on the cuda preset");
 #endif
 }
+
+// Stage 4 Phase 5: silu forward (ops::silu dispatch) and backward kernel must match CPU. The CPU
+// SIMD path uses a fast-sigmoid approximation vs the GPU's expf, so the tolerance is looser than
+// the exact ops.
+TEST_CASE("silu - CUDA fwd+bwd match CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t n = 1000;
+    Tensor x = randn({n});
+    Tensor g = randn({n});      // upstream gradient
+
+    const Tensor y_cpu = ops::silu(x);
+    const Tensor y_gpu = ops::silu(x.to(Device::cuda())).to(Device::cpu());
+    REQUIRE(rel_rms(y_gpu, y_cpu) < 2e-3);
+
+    Tensor gi_cpu = zeros({n});
+    backend::cpu::silu_backward_f32(g.data_as<float>().data(), x.data_as<float>().data(),
+                                    gi_cpu.data_as<float>().data(), static_cast<std::size_t>(n));
+    const Tensor xd = x.to(Device::cuda()), gd = g.to(Device::cuda());
+    Tensor gi_d = zeros({n}, DType::Float32, Device::cuda());
+    backend::cuda::silu_bwd(reinterpret_cast<const float*>(gd.raw_ptr()),
+                            reinterpret_cast<const float*>(xd.raw_ptr()),
+                            reinterpret_cast<float*>(gi_d.raw_ptr()), static_cast<int>(n));
+    REQUIRE(rel_rms(gi_d.to(Device::cpu()), gi_cpu) < 2e-3);
+#else
+    SUCCEED("CPU build - CUDA silu parity is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 5: embedding-scatter backward — repeated indices (N>V) exercise the atomicAdd
+// accumulation that multiple tokens sharing a row require.
+TEST_CASE("embed_bwd - CUDA scatter matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t V = 20, D = 16, N = 50;
+    Tensor g = randn({N, D});
+    Tensor idx({N}, DType::Int32);
+    { auto ip = idx.data_as<int32_t>();
+      for (int64_t i = 0; i < N; ++i) ip[static_cast<std::size_t>(i)] = static_cast<int32_t>(i % V); }
+
+    Tensor gw_cpu = zeros({V, D});
+    backend::cpu::embed_bwd_f32(g.data_as<float>().data(), idx.data_as<int32_t>().data(),
+                                gw_cpu.data_as<float>().data(),
+                                static_cast<std::size_t>(N), static_cast<std::size_t>(D));
+
+    const Tensor gd = g.to(Device::cuda()), idd = idx.to(Device::cuda());
+    Tensor gw_d = zeros({V, D}, DType::Float32, Device::cuda());
+    backend::cuda::embed_bwd(reinterpret_cast<const float*>(gd.raw_ptr()),
+                             reinterpret_cast<const int*>(idd.raw_ptr()),
+                             reinterpret_cast<float*>(gw_d.raw_ptr()),
+                             static_cast<int>(N), static_cast<int>(D));
+    REQUIRE(rel_rms(gw_d.to(Device::cpu()), gw_cpu) < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA embed_bwd parity is exercised on the cuda preset");
+#endif
+}

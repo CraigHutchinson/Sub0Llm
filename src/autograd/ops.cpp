@@ -671,11 +671,18 @@ Variable silu(const Variable& x) {
             [x_snap](const Tensor& g) {
                 const Tensor gc = g.contiguous();
                 Tensor gx = zeros(x_snap.shape(), DType::Float32, x_snap.device());
-                backend::cpu::silu_backward_f32(
-                    reinterpret_cast<const float*>(gc.raw_ptr()),
-                    reinterpret_cast<const float*>(x_snap.raw_ptr()),
-                    reinterpret_cast<float*>(gx.raw_ptr()),
-                    static_cast<std::size_t>(gx.numel()));
+                if (x_snap.device().is_cuda())
+                    backend::cuda::silu_bwd(
+                        reinterpret_cast<const float*>(gc.raw_ptr()),
+                        reinterpret_cast<const float*>(x_snap.raw_ptr()),
+                        reinterpret_cast<float*>(gx.raw_ptr()),
+                        static_cast<int>(gx.numel()));
+                else
+                    backend::cpu::silu_backward_f32(
+                        reinterpret_cast<const float*>(gc.raw_ptr()),
+                        reinterpret_cast<const float*>(x_snap.raw_ptr()),
+                        reinterpret_cast<float*>(gx.raw_ptr()),
+                        static_cast<std::size_t>(gx.numel()));
                 return gx;
             }));
     }

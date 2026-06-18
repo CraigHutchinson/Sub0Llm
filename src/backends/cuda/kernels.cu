@@ -177,6 +177,34 @@ __global__ void rope_bwd_kernel(const float* __restrict__ g, const float* __rest
     gx[static_cast<std::size_t>(t) * Dh + i + D2] = -g0 * s + g1 * c;
 }
 
+// silu fwd/bwd (elementwise). silu(x)=x·σ(x); silu'(x)=σ·(1+x·(1−σ)). expf for σ, matching the
+// scalar tail of backend::cpu::silu_{f32,backward_f32} (the SIMD path uses a fast σ approximation).
+__global__ void silu_f32_kernel(const float* __restrict__ in, float* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = in[i];
+    out[i] = x / (1.0f + expf(-x));
+}
+
+__global__ void silu_bwd_f32_kernel(const float* __restrict__ grad_out, const float* __restrict__ x,
+                                    float* __restrict__ grad_in, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float sig = 1.0f / (1.0f + expf(-x[i]));
+    grad_in[i] = grad_out[i] * sig * (1.0f + x[i] * (1.0f - sig));
+}
+
+// Embedding-scatter backward: grad_w[idx[i]] += g_out[i] over N rows of width D. One thread per
+// (i,j) element; atomicAdd resolves the rows multiple tokens share. grad_w must be pre-zeroed,
+// matching backend::cpu::embed_bwd_f32 (which accumulates into a zeroed buffer).
+__global__ void embed_bwd_f32_kernel(const float* __restrict__ g_out, const int* __restrict__ idx,
+                                     float* __restrict__ g_w, int N, int D) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N * D) return;
+    const int i = t / D, j = t % D;
+    atomicAdd(&g_w[static_cast<std::size_t>(idx[i]) * D + j], g_out[static_cast<std::size_t>(i) * D + j]);
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -817,6 +845,18 @@ void launch_rope_bwd(const float* g, const float* cosf, const float* sinf, float
     const int D2 = Dh / 2;
     rope_bwd_kernel<<<grid(static_cast<std::size_t>(T) * D2, BLOCK), BLOCK>>>(
         g, cosf, sinf, gx, T, Dh, D2);
+}
+
+void launch_silu_f32(const float* in, float* out, std::size_t n) {
+    silu_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(in, out, static_cast<int>(n));
+}
+
+void launch_silu_bwd_f32(const float* grad_out, const float* x, float* grad_in, std::size_t n) {
+    silu_bwd_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(grad_out, x, grad_in, static_cast<int>(n));
+}
+
+void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N, int D) {
+    embed_bwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * D, BLOCK), BLOCK>>>(g_out, idx, g_w, N, D);
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,

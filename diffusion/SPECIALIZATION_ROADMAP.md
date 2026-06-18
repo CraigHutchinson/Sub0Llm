@@ -65,11 +65,11 @@ the planned next axis (informally "Ch32"). This roadmap is that work, now fed by
 ### A. Stage 4 — CUDA backend for diffusion training  (~22h, phased; see §3)
 The larger throughput lever. Gap audit done: device transfer exists; **Phase 0 (device plumbing)
 is now DONE** — backward grads land on the input's device and `Variable::to`/`Denoiser::to` exist.
-**Phases 1 (softmax) + 2 (rms_norm) + 3 (matmul_tb) + 4 (rope) also DONE** — CUDA kernels +
-dispatch + parity tests + CPU-vs-GPU bench rows (590 CPU / 547 core CUDA cases green). Remaining:
-~2 CUDA kernels (silu bwd, embedding-scatter bwd — Phase 5) plus Phase 6 (narrow/scale/weighted-CE
-dispatch). The autograd BACKWARD-on-CUDA end-to-end path also needs device d2d
-`copy()`/`accumulate_grad` (Phase 7). Phases 5+ need the CUDA build (`cuda`/`cuda-native` preset).
+**Phases 1 (softmax) + 2 (rms_norm) + 3 (matmul_tb) + 4 (rope) + 5 (silu fwd+bwd, embed-scatter
+bwd) also DONE** — CUDA kernels + dispatch + parity tests + CPU-vs-GPU bench rows (592 CPU / 549
+core CUDA cases green). Remaining: Phase 6 (narrow/scale dispatch + weighted_cross_entropy on CUDA
+— mostly dispatch/small kernels) then Phase 7 (end-to-end Denoiser fwd+bwd, which needs device d2d
+`copy()`/`accumulate_grad` for autograd BACKWARD-on-CUDA). Phases 6+ need the CUDA build.
 
 ### B. Constexpr (specialized) engine — the "model axis"
 Turn BuildTime config into a `constexpr` model spec and monomorphize the Denoiser on it; then
@@ -125,7 +125,7 @@ exists; the gaps are VJP device-args + kernels + autograd integration.
 | **2 ✅ DONE** | rms_norm fwd+bwd — 3 kernels (`rms_norm_fwd_kernel` exposing x_norm/inv_rms/out that the inference `rmsnorm_kernel` doesn't; `rms_norm_bwd_x_kernel`; `rms_norm_bwd_w_kernel` column-parallel over rows) + `backend::cuda::rms_norm_{fwd,bwd_x,bwd_w}` device-ptr wrappers; `autograd::rms_norm` dispatches fwd + both bwd closures by device. Parity: kernel-level fwd/bwd_x/bwd_w vs CPU (relRMS <1e-4, actual ~5–9e-8) + autograd fwd end-to-end on the RTX 5070. Benched (`rms_norm fwd` row): 0.63×→17× as T×D grows (launch-bound at small sizes, ~86 GB/s plateau = block-per-row underfill, a later lever). **NOTE:** autograd BACKWARD end-to-end on CUDA waits on Phase 7 — `Node::accumulate_grad`/`copy()` use host `memcpy` (no device d2d); the bwd kernels are validated directly here. | 3 | Yes |
 | **3 ✅ DONE** | matmul_tb (Aᵀ·B — weight grads) — `matmul_tb_f32_kernel` (16×16 tiled, contraction over M, left tile reads A transposed) + `backend::cuda::matmul_tb`; `ops::matmul_tb` now dispatches to it when `device().is_cuda()` (replaced the broken transpose-then-matmul fallback that did a host memcpy on device ptrs). Parity test via the public `ops::matmul_tb` (non-tile-multiple dims, relRMS <1e-4, actual ~2–6e-6 from f32 reduction-order). Benched (`matmul_tb` row, GFLOP/s): 8–48× vs CPU at ~1.25–1.6 TFLOP/s f32 — large headroom vs the 5070 f32 peak (naive tile; cuBLAS/wmma later). | 1 | Yes |
 | **4 ✅ DONE** | rope fwd+bwd — `rope_fwd_kernel`/`rope_bwd_kernel` (half-split, one thread per (t,i) pair over x(T,Dh) with precomputed cos/sin (T,Dh/2); distinct from the single-vector inference `rope_neox_kernel`) + `backend::cuda::rope_{fwd,bwd}`; `autograd::rope` dispatches fwd (moves host cos/sin to device) + bwd closure. Parity: fwd end-to-end + bwd kernel vs the autograd CPU grad (relRMS 0 — pure mul/add, no reduction). Benched (`rope fwd` row): 0.22×→2.28× (launch/bandwidth-bound; only wins at larger T·Dh). | 2 | Yes |
-| **5** | silu backward; embedding-scatter backward | 2 | Yes |
+| **5 ✅ DONE** | silu fwd+bwd + embedding-scatter bwd — `silu_f32_kernel`/`silu_bwd_f32_kernel` (elementwise, expf) + `embed_bwd_f32_kernel` (scatter-add via `atomicAdd` into a zeroed grad_w). `ops::silu` now dispatches fwd to CUDA; `autograd::silu` bwd closure + `autograd::embedding_lookup` bwd closure dispatch by device (indices snapshotted on the weight's device). Parity: silu fwd+bwd vs CPU (relRMS ~7.6e-8 — fast-sigmoid is accurate, 2e-3 tol is slack), embed-scatter vs CPU with repeated indices N>V (relRMS <1e-4, atomics exercised). Benched: silu fwd 5.75×→61× (395 GB/s at 1M). | 3 | Yes |
 | **6** | narrow/scale dispatch + weighted_cross_entropy on CUDA | 0 | Yes |
 | **7** | end-to-end: Denoiser fwd+bwd on CUDA, gradient-checked vs CPU; mini training loop | 0 | Yes |
 
@@ -143,13 +143,13 @@ relRMS. Build+run: `cmake --build --preset cuda --target bench_kernels` then
 `./build-cuda/bin/bench_kernels.exe --iters N`. A perf number is only trustworthy once relRMS is
 at f32-epsilon — gate on the `[backends][cuda]` parity test first.
 
-**Recommended start:** ~~Phase 0~~ ~~Phase 1~~ ~~Phase 2~~ ~~Phase 3~~ ~~Phase 4~~ DONE. Next:
-**Phase 5 (silu backward + embedding-scatter backward)** — `autograd::silu` bwd currently calls
-`backend::cpu::silu_backward_f32`; add a CUDA silu-bwd kernel + dispatch (fwd `ops::silu` is
-elementwise — wire its CUDA branch too) and an embedding-scatter bwd kernel. Then Phase 6
-(narrow/scale dispatch + weighted_cross_entropy on CUDA). The device d2d `copy()`/`accumulate_grad`
-gap (autograd BACKWARD end-to-end on CUDA) is best done as part of Phase 7 — until then validate
-bwd kernels directly (H2D→launch→D2H vs CPU).
+**Recommended start:** ~~Phase 0–5~~ DONE. Next: **Phase 6 (narrow/scale dispatch +
+weighted_cross_entropy on CUDA)** — `autograd::narrow` bwd scatters into a zeros tensor, `scale` is
+elementwise, `weighted_cross_entropy` is the diffusion loss; wire their CUDA branches (small kernels
+/ dispatch). Then **Phase 7 (end-to-end Denoiser fwd+bwd on CUDA)** — the big one: needs device d2d
+`copy()` + `Node::accumulate_grad` so the full autograd backward graph runs on-device (today both
+are host memcpy), then a gradient-checked mini training loop. Until Phase 7, bwd kernels are
+validated directly (H2D→launch→D2H vs CPU) / against the autograd CPU grad.
 
 ---
 
