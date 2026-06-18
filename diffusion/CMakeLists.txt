@@ -29,6 +29,14 @@ set_target_properties(sub0diff-specialize PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# ── recall_probe — structured single-forward recall capability probe ─────────────
+add_executable(sub0diff-recall-probe tools/recall_probe/main.cpp)
+target_link_libraries(sub0diff-recall-probe PRIVATE sub0diff)
+sub0llm_apply_compile_options(sub0diff-recall-probe)
+set_target_properties(sub0diff-recall-probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # ── chapters ─────────────────────────────────────────────────────────────────────
 if(SUB0LLM_BUILD_CHAPTERS)
     add_subdirectory(chapters)

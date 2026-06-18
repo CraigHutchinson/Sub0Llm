@@ -549,3 +549,37 @@ modeling, not just memorization. **Net:** training a data-matched smaller model 
 memorization pathology (no high-k regression, cleaner honesty) at the cost of higher raw NELBO — a trade,
 not a free win. The last open axis is GENERATION coherence (Ch30): if both are word-salad, DATA is the
 coherence ceiling and the cheaper honest model is the better educational choice. (Run: `ch29_small_100k`.)
+
+### 13.4 The model is a LOCAL INTERPOLATOR, not a sequence model — train/use mismatch (2026-06-18)
+A structured single-forward recall probe (`sub0diff-recall-probe`, builds `diffusion/tools/recall_probe`)
+"breaks" real corpus windows in STRUCTURED ways (vs the random/scattered masking of training) and measures
+exact-match recovery. Result across 3 checkpoints (6M @k36, 157K @k36, 157K converged) — at the SAME 25%
+mask fraction:
+
+| scenario (25% masked) | 6M @k36 | 157K @k36 | 157K converged |
+|---|---|---|---|
+| single token (1 masked, 1.6%) | 78.7% | 44.3% | 50.0% |
+| scatter 25% (training distribution) | 60.0% | 29.8% | 36.6% |
+| continuation (give 75%, mask the tail) | 6.6% | 3.2% | 4.3% |
+| middle-infill (centred 25% gap) | 10.1% | 3.6% | 5.4% |
+| 2 anchors only (97% masked) | 2.0% | 2.2% | 2.7% |
+
+Three robust conclusions (hold across capacity AND training duration):
+1. **Every model is a LOCAL INTERPOLATOR.** Same mask fraction, SCATTERED ≈ 60%/37% but CONTIGUOUS ≈ 4–10%
+   — an **~8–9× collapse**, universal. It recovers a masked token from its immediate VISIBLE neighbours;
+   it cannot fill a contiguous span (where masked tokens lack local context).
+2. **Capacity scales INTERPOLATION, not GENERATION.** The 6M crushes the 157K on scattered (60% vs 37%) but
+   on continuation/infill BOTH are floored ~3–10%; more training (converged vs k36) only nudges contiguous
+   (3.2→4.3%). Extra capacity/training buys local interpolation, NOT span continuation.
+3. **This is WHY generation is word-salad — a fixable OBJECTIVE mismatch, not (only) data.** Generation IS
+   contiguous infilling = the ~5% regime. Training masks RANDOM/SCATTERED positions, so a masked token almost
+   always has visible neighbours → the objective rewards local interpolation and never forces LONG-RANGE
+   modeling. The headline "recall" (scattered = training dist) OVERSTATES real capability ~9×.
+
+**Actionable lever (backlog — `diffusion-contiguous-masking-lever`):** add CONTIGUOUS/BLOCK masking to the
+training objective — suffix-masking (give a prefix, mask the tail = "finish it"), span masking, or a
+semi-autoregressive schedule — so the model must model spans without local crutches. Largely ORTHOGONAL to
+the data ceiling (§13.3): it forces long-range modeling at fixed data, and is plausibly the DOMINANT cause
+of word-salad (even the high-interpolation 6M can't do contiguous). Validate with this probe (continuation/
+middle recall) + Ch30 coherence. Connects to the loss-weighting/cadence backlog (the masking PATTERN, not
+just the weighting). Run a fresh A/B in the Ch31 sandbox — do not retrofit the founded/small runs.
