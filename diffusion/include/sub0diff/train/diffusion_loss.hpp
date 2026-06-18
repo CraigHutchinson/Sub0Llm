@@ -72,7 +72,8 @@ template<class RNG>
                                                  float t_max = 1.0f,
                                                  std::span<const std::uint8_t> is_word_start = {},
                                                  bool whole_word = false,
-                                                 bool exact_count = false) {
+                                                 bool exact_count = false,
+                                                 bool contiguous = false) {
     namespace ag = sub0llm::autograd;
     const auto T = static_cast<float>(clean.size());
 
@@ -84,7 +85,7 @@ template<class RNG>
                                     model.mask_id(), model.real_vocab(), rng, ctx.corruption);
     else
         nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
-                         model.mask_id(), model.real_vocab(), rng, ctx.corruption, exact_count);
+                         model.mask_id(), model.real_vocab(), rng, ctx.corruption, exact_count, contiguous);
     const auto& corr = ctx.corruption;
 
     std::ranges::copy(corr.tokens, ctx.ids_input.data_as<std::int32_t>().begin());
@@ -157,7 +158,8 @@ batched_diffusion_loss(const nn::Denoiser& model,
                        bool shared_t = false, bool exact_count = false,
                        std::span<const std::uint8_t> is_word_start = {},
                        bool whole_word = false,
-                       std::uint64_t seed_base = 0, std::int64_t index0 = 0) {
+                       std::uint64_t seed_base = 0, std::int64_t index0 = 0,
+                       bool contiguous = false) {
     namespace ag = sub0llm::autograd;
     const std::int64_t B = ctx.B, T = ctx.T;
     auto idd = ctx.ids_input.data_as<std::int32_t>();
@@ -189,7 +191,7 @@ batched_diffusion_loss(const nn::Denoiser& model,
         else
             nn::corrupt_into(clean, t, spec::NoiseSchedule::Absorbing,
                              model.mask_id(), model.real_vocab(), wrng,
-                             ctx.corr[static_cast<std::size_t>(b)], exact_count);
+                             ctx.corr[static_cast<std::size_t>(b)], exact_count, contiguous);
         const auto& c = ctx.corr[static_cast<std::size_t>(b)];
         std::copy_n(c.tokens.begin(), T, idd.begin() + b * T);
         ts[static_cast<std::size_t>(b)] = t;

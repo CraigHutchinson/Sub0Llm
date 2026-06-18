@@ -482,7 +482,8 @@ static int run(int argc, char** argv) {
             auto w = std::span<const std::int32_t>(eval_ids)
                          .subspan(eoff(erng), static_cast<std::size_t>(cfg.model.seq_len));
             sum += dt::diffusion_loss(model, w, erng, eval_ctx, 0.02f, 1.0f,
-                                      ws_span, cfg.optim.whole_word, cfg.optim.exact_noise)
+                                      ws_span, cfg.optim.whole_word, cfg.optim.exact_noise,
+                                      cfg.optim.contiguous)
                        .loss.data().item<float>();
         }
         return sum / static_cast<double>(n_windows);
@@ -500,7 +501,8 @@ static int run(int argc, char** argv) {
             auto w = std::span<const std::int32_t>(eval_ids)
                          .subspan(eoff(erng), static_cast<std::size_t>(cfg.model.seq_len));
             sum += dt::diffusion_loss(model, w, erng, eval_ctx, t_level, t_level,
-                                      ws_span, cfg.optim.whole_word, /*exact_count=*/true)
+                                      ws_span, cfg.optim.whole_word, /*exact_count=*/true,
+                                      cfg.optim.contiguous)
                        .loss.data().item<float>();
         }
         return sum / static_cast<double>(n_windows);
@@ -646,11 +648,12 @@ static int run(int argc, char** argv) {
                                       static_cast<std::size_t>(cfg.model.n_kv_heads)},
             param_ptrs, 0.02f, cfg.optim.t_max, 1234 + start_step,
             /*share_weights=*/true, ws_span, cfg.optim.whole_word, worker_pins, cfg.optim.exact_noise,
-            static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t);
+            static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t, cfg.optim.contiguous);
         std::println("trainer: batch-size {} windows/step (consistency ∝ √{}) split across {} "
-                     "worker{} (speed only — same gradient at any W); shared-t {}, exact-noise {}",
+                     "worker{} (speed only — same gradient at any W); shared-t {}, exact-noise {}, masking {}",
                      cfg.optim.batch, cfg.optim.batch, cfg.optim.threads, cfg.optim.threads == 1 ? "" : "s",
-                     cfg.optim.shared_t ? "on" : "off", cfg.optim.exact_noise ? "on" : "off");
+                     cfg.optim.shared_t ? "on" : "off", cfg.optim.exact_noise ? "on" : "off",
+                     cfg.optim.contiguous ? "CONTIGUOUS-span" : "scattered");
         std::vector<std::size_t> offsets(cfg.optim.batch);
         std::size_t overfit_cursor = 0;   // cycles the N fixed windows across the B step slots
         if (cfg.diag.overfit > 0)

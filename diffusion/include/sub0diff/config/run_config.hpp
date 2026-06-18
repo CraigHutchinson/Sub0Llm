@@ -81,6 +81,7 @@ struct Optim {
     bool          shared_t     = true;       // one t per step across workers (variance reduction)
     bool          exact_noise  = true;       // mask exactly round(t·T) positions
     bool          whole_word   = false;      // corrupt whole words, not independent subwords
+    bool          contiguous   = false;      // mask a CONTIGUOUS span (§13.4 — trains long-range infill, not local interpolation)
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -95,6 +96,7 @@ struct Optim {
         v("pin",          Scope::Runtime, self.pin,          "worker pin policy");
         v("shared_t",     Scope::Runtime, self.shared_t,     "shared t per step");
         v("exact_noise",  Scope::Runtime, self.exact_noise,  "exact masked count");
+        v("contiguous",   Scope::Runtime, self.contiguous,   "mask a contiguous span (long-range infill)");
         v("whole_word",   Scope::Runtime, self.whole_word,   "whole-word masking");
     }
 };

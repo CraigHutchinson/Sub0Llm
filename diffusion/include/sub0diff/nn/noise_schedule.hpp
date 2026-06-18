@@ -71,7 +71,8 @@ void corrupt_into(std::span<const std::int32_t> clean,
                   std::int64_t     real_vocab,
                   RNG&             rng,
                   Corruption&      c,
-                  bool             exact_count = false) {
+                  bool             exact_count = false,
+                  bool             contiguous  = false) {
     c.tokens.assign(clean.begin(), clean.end());
     c.corrupted.assign(clean.size(), 0);
     c.n_corrupted = 0;
@@ -102,6 +103,16 @@ void corrupt_into(std::span<const std::int32_t> clean,
         // [1, T-1]: always ≥1 masked (a target) AND ≥1 visible (context). T=1 is degenerate
         // (can't have both) → fall back to k=1 (=T, fully masked, unavoidable at length 1).
         k = std::clamp<std::int64_t>(k, 1, std::max<std::int64_t>(1, T - 1));
+        if (contiguous) {
+            // CONTIGUOUS span of length k at a random start in [0, T-k]: the masked tokens lack
+            // LOCAL context (only the span edges abut visible tokens), so the model must use
+            // LONG-RANGE context to fill it — the continuation/infill capability the scattered
+            // objective never trains (TRAINING_DESIGN §13.4, the local-interpolator finding).
+            std::uniform_int_distribution<std::int64_t> sd(0, T - k);
+            const std::int64_t s = sd(rng);
+            for (std::int64_t i = s; i < s + k; ++i) corrupt_pos(static_cast<std::size_t>(i));
+            return;
+        }
         // Knuth Algorithm S — select EXACTLY k of T positions uniformly with NO buffer/heap:
         // visit each position once, take it with probability (remaining_k / remaining_n).
         std::int64_t rem_k = k, rem_n = T;

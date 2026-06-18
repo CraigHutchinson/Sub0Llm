@@ -76,11 +76,12 @@ public:
                     std::vector<int> pin_override = {},
                     bool exact_count = false,
                     std::int64_t batch_size = 0, // total windows/step B (0 ⇒ = n_workers)
-                    bool shared_t = false)
+                    bool shared_t = false,
+                    bool contiguous = false)
         : master_(std::move(master_params)),
           t_min_(t_min), t_max_(t_max), share_weights_(share_weights),
           is_word_start_(is_word_start), whole_word_(whole_word), exact_count_(exact_count),
-          shared_t_(shared_t),
+          shared_t_(shared_t), contiguous_(contiguous),
           windows_per_worker_(batch_size <= 0 ? 1 : batch_size / static_cast<std::int64_t>(n_workers)),
           batch_size_(windows_per_worker_ * static_cast<std::int64_t>(n_workers)),
           master_rng_(static_cast<std::uint32_t>(seed ^ 0x9E3779B9u)),
@@ -247,7 +248,7 @@ private:
                                               lo, hi, shared_t_, exact_count_,
                                               is_word_start_, whole_word_,
                                               step_seed_.load(std::memory_order_relaxed),
-                                              static_cast<std::int64_t>(wid) * per);
+                                              static_cast<std::int64_t>(wid) * per, contiguous_);
             res.loss.backward();
             wk.loss   = res.loss.data().item<float>();
             wk.t      = res.mean_t;
@@ -284,6 +285,7 @@ private:
     bool                                       whole_word_ = false;
     bool                                       exact_count_ = false;
     bool                                       shared_t_ = false;
+    bool                                       contiguous_ = false;  // mask a contiguous span (§13.4)
     std::int64_t                               windows_per_worker_ = 1;  // windows/worker = B/W
     std::int64_t                               batch_size_ = 0;       // total windows/step B = per·W
     std::atomic<float>                         shared_ts_{0.0f}; // the step's shared noise level
