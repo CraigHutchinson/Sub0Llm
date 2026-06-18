@@ -523,11 +523,15 @@ not run-ruining — but it sharpens both the loss-weighting and per-level-cadenc
 
 **CONFIRMED — the sign-flip is OVERFITTING (capacity-driven), via a data-matched A/B (2026-06-18).** A
 **157K-param** model (D=64/L2, founded proportions; 38× smaller than the 6M, ≈ Chinchilla-matched to the
-~2M-token corpus) was trained with the IDENTICAL curriculum/tokenizer/streams/B=16. Within-level slope,
-high-k region (k≥20, past the 6M's k=26 flip): **2 up / 4 down / rest flat — NO sign-flip** (even at k=26
-it goes +0.026 then flat/down), vs the 6M's **10/10 all-up** from k=26. So the over-capacity 6M had room to
-MEMORIZE the high-noise training windows → held-out NELBO rose as it trained them; the data-matched 157K
-has no spare capacity to overfit, so high-noise levels sit at their floor — stable, honest. Corollary
+~2M-token corpus) was trained with the IDENTICAL curriculum/tokenizer/streams/B=16. Within-level slope: the 157K is
+flat/scattered through k≈36 (k20–29: 2 up / 4 down) where the 6M was already **10/10 all-up from k=26**;
+a **mild** within-level UP only **emerges at k≥37 (t≥0.58)** (+0.008→0.012, last 3 levels). So the onset
+**SCALES WITH CAPACITY**: more capacity ⇒ *earlier + stronger* overfitting (6M flips hard at t≈0.41;
+the data-matched 157K resists until t≈0.58 and only gently). [Correction: an earlier note here said the
+157K was "immune / NO sign-flip" — that was from k≤29 data; it is far more RESISTANT, not immune.] The
+mechanism stands and is cleaner for being capacity-monotone: the over-capacity 6M has room to MEMORIZE
+high-noise training windows → held-out NELBO rises as it trains them; the data-matched 157K has little
+spare capacity, so the effect is delayed to extreme noise and small. Corollary
 results from the same A/B: the 157K is **on par at k=1** but **uniformly weaker on held-out NELBO** as the
 task hardens (base(k=1) plateaus ~2.6 vs the 6M's ~1.3; per-level gap ~0.8) — capacity buys real held-out
 modeling, not just memorization. **Net:** training a data-matched smaller model FIXES the overfitting/
