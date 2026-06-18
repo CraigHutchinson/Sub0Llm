@@ -184,6 +184,7 @@ Tensor add(const Tensor& a, float scalar) {
 
 Tensor mul(const Tensor& a, float scalar) {
     require_f32(a, "mul_scalar");
+    if (a.device().is_cuda()) return backend::cuda::mul_scalar(a, scalar);
     require_cpu(a, "mul_scalar");
     Tensor out(a.shape(), a.dtype(), a.device());
     backend::cpu::mul_scalar_f32(
@@ -438,7 +439,6 @@ void matmul_tb_into(const Tensor& a, const Tensor& b, Tensor& c) {
 
 Tensor narrow(const Tensor& t, int64_t start, int64_t length) {
     require_f32(t, "narrow");
-    require_cpu(t, "narrow");
     if (t.ndim() < 1)
         throw std::runtime_error("narrow: input must be at least 1D");
     const int64_t T = t.shape(0);
@@ -450,6 +450,18 @@ Tensor narrow(const Tensor& t, int64_t start, int64_t length) {
     Tensor::Shape out_shape = t.shape();
     out_shape[0] = length;
     Tensor out(out_shape, t.dtype(), t.device());
+
+    // Narrow along dim 0 of a row-major tensor is a contiguous block — a single copy of
+    // [start·row_elems, (start+length)·row_elems). On CUDA that's a device-to-device memcpy.
+    if (t.device().is_cuda()) {
+        const std::size_t off   = static_cast<std::size_t>(start) * row_elems * sizeof(float);
+        const std::size_t bytes = static_cast<std::size_t>(length) * row_elems * sizeof(float);
+        backend::cuda::memcpy_d2d(out.raw_ptr(),
+                                  static_cast<const std::byte*>(t.raw_ptr()) + off,
+                                  bytes, t.device().index);
+        return out;
+    }
+    require_cpu(t, "narrow");
 
     const auto src = t.data_as<float>();
     auto       dst = out.data_as<float>();

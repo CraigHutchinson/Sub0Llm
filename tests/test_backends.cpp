@@ -330,3 +330,25 @@ TEST_CASE("embed_bwd - CUDA scatter matches CPU reference", "[backends][cuda][de
     SUCCEED("CPU build - CUDA embed_bwd parity is exercised on the cuda preset");
 #endif
 }
+
+// Stage 4 Phase 6: scalar-multiply (autograd::scale primitive, both directions) and dim-0 narrow
+// forward must match CPU on CUDA. narrow is a contiguous d2d copy; scale is the mul_scalar kernel.
+TEST_CASE("scale + narrow - CUDA forward matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    {   // scale: out = x * alpha  (ops::mul scalar overload)
+        Tensor x = randn({257});
+        const float alpha = 0.37f;
+        REQUIRE(rel_rms(ops::mul(x.to(Device::cuda()), alpha).to(Device::cpu()),
+                        ops::mul(x, alpha)) < 1e-6);
+    }
+    {   // narrow along dim 0: rows [3, 7)
+        Tensor x = randn({10, 8});
+        const Tensor n_cpu = ops::narrow(x, 3, 4);
+        const Tensor n_gpu = ops::narrow(x.to(Device::cuda()), 3, 4).to(Device::cpu());
+        REQUIRE(n_gpu.shape() == n_cpu.shape());
+        REQUIRE(rel_rms(n_gpu, n_cpu) < 1e-6);
+    }
+#else
+    SUCCEED("CPU build - CUDA scale/narrow parity is exercised on the cuda preset");
+#endif
+}

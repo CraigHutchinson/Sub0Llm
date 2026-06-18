@@ -50,6 +50,8 @@ void rope_bwd(const float* g, const float* cos, const float* sin, float* gx, int
 [[nodiscard]] Tensor silu(const Tensor& a);
 void silu_bwd(const float* grad_out, const float* x, float* grad_in, int n);
 void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D);
+// Scalar multiply out = a*alpha on a device tensor (autograd::scale fwd+bwd primitive).
+[[nodiscard]] Tensor mul_scalar(const Tensor& a, float alpha);
 
 // Benchmark the row-wise softmax KERNEL in isolation (no per-iter device alloc): H2D the
 // (rows×cols) host input once, run `reps` timed launches (GPU events, after warm-up), D2H the
@@ -78,6 +80,10 @@ void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D);
 
 // Benchmark the silu FORWARD kernel (n elements) in isolation. Returns total GPU kernel seconds.
 [[nodiscard]] double silu_fwd_bench(const float* host_in, float* host_out, int n, int reps);
+
+// Benchmark the scalar-multiply kernel (n elements). Returns total GPU kernel seconds.
+[[nodiscard]] double mul_scalar_bench(const float* host_in, float alpha, float* host_out,
+                                      int n, int reps);
 
 // Benchmark + validate the device Q8 matmul end-to-end: H2D-copy host Wq[M,K/32] and
 // Xq[T,K/32], run `reps` timed kernel launches (GPU events, after a warm-up), D2H-copy the

@@ -36,6 +36,8 @@ void launch_rope_bwd(const float* g, const float* cosf, const float* sinf, float
 void launch_silu_f32(const float* in, float* out, std::size_t n);
 void launch_silu_bwd_f32(const float* grad_out, const float* x, float* grad_in, std::size_t n);
 void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N, int D);
+// Scalar multiply out=in*alpha (autograd::scale primitive); matches backend::cpu::mul_scalar_f32.
+void launch_mul_scalar_f32(const float* in, float alpha, float* out, std::size_t n);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
 // Transposed-first-operand matmul C = Aᵀ·B: A(M,K), B(M,N) row-major → C(K,N), contraction over M.

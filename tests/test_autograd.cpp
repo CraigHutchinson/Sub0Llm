@@ -642,3 +642,34 @@ TEST_CASE("rope forward + backward match CPU on CUDA", "[autograd][device]") {
     REQUIRE(gx_cpu.numel() == T * Dh);
 #endif
 }
+
+// Stage 4 Phase 6: autograd::narrow backward on CUDA scatters the upstream into a contiguous slice
+// of a zeroed buffer (zeros() cudaMemsets, memcpy_d2d fills [start·C, (start+len)·C)). The autograd
+// CPU gradient is the reference; we reproduce the closure's device path (running the full backward
+// graph on-device awaits Phase 7's device accumulate_grad).
+TEST_CASE("narrow backward scatter matches CPU on CUDA", "[autograd][device]") {
+    const int64_t T = 10, C = 8, start = 3, len = 4;
+    std::vector<float> xv(static_cast<std::size_t>(T * C));
+    for (std::size_t i = 0; i < xv.size(); ++i) xv[i] = 0.1f * static_cast<float>(i) - 1.0f;
+    Tensor up({len, C}, DType::Float32);
+    { auto u = up.data_as<float>(); for (std::size_t i = 0; i < u.size(); ++i) u[i] = 0.07f * static_cast<float>(i) + 0.2f; }
+
+    Variable x = leaf2d(xv, T, C, /*rg=*/true);
+    narrow(x, start, len).backward(copy(up));
+    const Tensor gx_cpu = x.grad();   // rows [start, start+len) == up, the rest zero
+#ifdef SUB0LLM_CUDA
+    Tensor gx_d = zeros({T, C}, DType::Float32, Device::cuda());
+    const Tensor up_d = up.to(Device::cuda());
+    const std::size_t off = static_cast<std::size_t>(start) * C * sizeof(float);
+    backend::cuda::memcpy_d2d(
+        reinterpret_cast<char*>(gx_d.raw_ptr()) + off, up_d.raw_ptr(),
+        static_cast<std::size_t>(len) * C * sizeof(float), 0);
+    const Tensor gx_gpu = gx_d.to(Device::cpu());
+    const auto gc = gx_cpu.data_as<float>();
+    const auto gg = gx_gpu.data_as<float>();
+    for (int64_t i = 0; i < T * C; ++i)
+        REQUIRE_THAT(gg[static_cast<std::size_t>(i)], WithinAbs(gc[static_cast<std::size_t>(i)], 0.0f));
+#else
+    REQUIRE(gx_cpu.numel() == T * C);
+#endif
+}

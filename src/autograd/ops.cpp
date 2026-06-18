@@ -916,10 +916,19 @@ Variable narrow(const Variable& x, int64_t start, int64_t length) {
         out->edges.push_back(make_edge(x.impl(),
             [start, length, orig_shape, x_dev](const Tensor& g) {
                 const Tensor gc = g.contiguous();
-                const auto   gs = gc.data_as<float>();
-                Tensor gx  = zeros(orig_shape, DType::Float32, x_dev);
-                auto   gxs = gx.data_as<float>();
+                Tensor gx  = zeros(orig_shape, DType::Float32, x_dev);   // zeros() cudaMemsets on GPU
                 const int64_t row_elems = gc.numel() / length;
+                // Backward of a dim-0 narrow scatters the upstream into a contiguous slice of a
+                // zeroed buffer — a single copy at offset start·row_elems.
+                if (x_dev.is_cuda()) {
+                    const std::size_t off = static_cast<std::size_t>(start) * row_elems * sizeof(float);
+                    backend::cuda::memcpy_d2d(
+                        static_cast<std::byte*>(gx.raw_ptr()) + off, gc.raw_ptr(),
+                        static_cast<std::size_t>(gc.numel()) * sizeof(float), x_dev.index);
+                    return gx;
+                }
+                const auto gs  = gc.data_as<float>();
+                auto       gxs = gx.data_as<float>();
                 for (int64_t i = 0; i < length; ++i)
                     for (int64_t j = 0; j < row_elems; ++j)
                         gxs[static_cast<std::size_t>((start + i) * row_elems + j)] =

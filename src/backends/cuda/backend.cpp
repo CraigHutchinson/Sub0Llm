@@ -216,6 +216,19 @@ void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D) {
 #endif
 }
 
+Tensor mul_scalar(const Tensor& a, float alpha) {
+#ifdef SUB0LLM_CUDA
+    Tensor out(a.shape(), a.dtype(), a.device());
+    kernels::launch_mul_scalar_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()), alpha,
+        reinterpret_cast<float*>(out.raw_ptr()), static_cast<std::size_t>(a.numel()));
+    return out;
+#else
+    (void)a; (void)alpha;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 Tensor matmul(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
     const auto M = static_cast<std::size_t>(a.shape(0));
@@ -317,6 +330,38 @@ double rms_norm_fwd_bench(const float* host_x, const float* host_w, float* host_
     return static_cast<double>(ms) / 1000.0;
 #else
     (void)host_x; (void)host_w; (void)host_out; (void)T; (void)D; (void)eps; (void)reps;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+double mul_scalar_bench(const float* host_in, float alpha, float* host_out, int n, int reps) {
+#ifdef SUB0LLM_CUDA
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::format("{}: {}", what, cudaGetErrorString(e)));
+    };
+    const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(float);
+    float *dIn = nullptr, *dOut = nullptr;
+    ck(cudaMalloc(&dIn, bytes),  "malloc in");
+    ck(cudaMalloc(&dOut, bytes), "malloc out");
+    ck(cudaMemcpy(dIn, host_in, bytes, cudaMemcpyHostToDevice), "H2D in");
+
+    for (int w = 0; w < 3; ++w) kernels::launch_mul_scalar_f32(dIn, alpha, dOut, static_cast<std::size_t>(n));
+    ck(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t t0, t1;
+    ck(cudaEventCreate(&t0), "event t0");  ck(cudaEventCreate(&t1), "event t1");
+    ck(cudaEventRecord(t0), "record t0");
+    for (int r = 0; r < reps; ++r) kernels::launch_mul_scalar_f32(dIn, alpha, dOut, static_cast<std::size_t>(n));
+    ck(cudaEventRecord(t1), "record t1");
+    ck(cudaEventSynchronize(t1), "kernel sync");
+    float ms = 0.0f;  ck(cudaEventElapsedTime(&ms, t0, t1), "elapsed");
+
+    ck(cudaMemcpy(host_out, dOut, bytes, cudaMemcpyDeviceToHost), "D2H out");
+    cudaEventDestroy(t0);  cudaEventDestroy(t1);
+    cudaFree(dIn);  cudaFree(dOut);
+    return static_cast<double>(ms) / 1000.0;
+#else
+    (void)host_in; (void)alpha; (void)host_out; (void)n; (void)reps;
     throw std::runtime_error("CUDA backend not compiled in");
 #endif
 }

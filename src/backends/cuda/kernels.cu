@@ -205,6 +205,14 @@ __global__ void embed_bwd_f32_kernel(const float* __restrict__ g_out, const int*
     atomicAdd(&g_w[static_cast<std::size_t>(idx[i]) * D + j], g_out[static_cast<std::size_t>(i) * D + j]);
 }
 
+// Scalar multiply (elementwise): out[i] = in[i] * alpha. Matches backend::cpu::mul_scalar_f32 —
+// the primitive behind autograd::scale (forward y=α·x and backward g↦α·g).
+__global__ void mul_scalar_f32_kernel(const float* __restrict__ in, float alpha,
+                                      float* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i] * alpha;
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -857,6 +865,10 @@ void launch_silu_bwd_f32(const float* grad_out, const float* x, float* grad_in, 
 
 void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N, int D) {
     embed_bwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * D, BLOCK), BLOCK>>>(g_out, idx, g_w, N, D);
+}
+
+void launch_mul_scalar_f32(const float* in, float alpha, float* out, std::size_t n) {
+    mul_scalar_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(in, alpha, out, static_cast<int>(n));
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,
