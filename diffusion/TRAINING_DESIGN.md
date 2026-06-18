@@ -520,3 +520,17 @@ within-level slope sign-flip is itself a FREE diagnostic for "where training sto
 cap the curriculum frontier or switch to spread. Δdelta-per-level is small (~+0.01–0.02) and the post-
 convergence full-objective phase re-anchors the learnable levels, so this is an efficiency/design signal,
 not run-ruining — but it sharpens both the loss-weighting and per-level-cadence A/Bs above.
+
+**CONFIRMED — the sign-flip is OVERFITTING (capacity-driven), via a data-matched A/B (2026-06-18).** A
+**157K-param** model (D=64/L2, founded proportions; 38× smaller than the 6M, ≈ Chinchilla-matched to the
+~2M-token corpus) was trained with the IDENTICAL curriculum/tokenizer/streams/B=16. Within-level slope,
+high-k region (k≥20, past the 6M's k=26 flip): **2 up / 4 down / rest flat — NO sign-flip** (even at k=26
+it goes +0.026 then flat/down), vs the 6M's **10/10 all-up** from k=26. So the over-capacity 6M had room to
+MEMORIZE the high-noise training windows → held-out NELBO rose as it trained them; the data-matched 157K
+has no spare capacity to overfit, so high-noise levels sit at their floor — stable, honest. Corollary
+results from the same A/B: the 157K is **on par at k=1** but **uniformly weaker on held-out NELBO** as the
+task hardens (base(k=1) plateaus ~2.6 vs the 6M's ~1.3; per-level gap ~0.8) — capacity buys real held-out
+modeling, not just memorization. **Net:** training a data-matched smaller model FIXES the overfitting/
+memorization pathology (no high-k regression, cleaner honesty) at the cost of higher raw NELBO — a trade,
+not a free win. The last open axis is GENERATION coherence (Ch30): if both are word-salad, DATA is the
+coherence ceiling and the cheaper honest model is the better educational choice. (Run: `ch29_small_100k`.)
