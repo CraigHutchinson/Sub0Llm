@@ -583,3 +583,26 @@ the data ceiling (§13.3): it forces long-range modeling at fixed data, and is p
 of word-salad (even the high-interpolation 6M can't do contiguous). Validate with this probe (continuation/
 middle recall) + Ch30 coherence. Connects to the loss-weighting/cadence backlog (the masking PATTERN, not
 just the weighting). Run a fresh A/B in the Ch31 sandbox — do not retrofit the founded/small runs.
+
+### 13.5 The contiguous-masking lever was TESTED and FAILS at this scale — generation is data/capacity-bound (2026-06-18)
+§13.4 proposed contiguous/block masking as "plausibly the dominant FIXABLE cause of word-salad,
+orthogonal to the data ceiling." **A/B run (`--contiguous`, 157K, identical arch/data/curriculum/B=16
+to the scattered small run) REFUTES that.** Trained directly on contiguous spans, the model:
+- **did NOT improve continuation/infill recall** — continuation give-75% **4.1% vs scattered 4.3%**,
+  middle-gap-25% 5.3% vs 5.4% (both still the ~4–5% floor);
+- got **much WORSE at everything else** — single 50→**22%**, scatter-25% 37→**18%**, overall scatter
+  recall 16.7→**9.8%**, global held-out NELBO 3.90→**5.47 (≈ the H0≈5.6 floor)**;
+- generation still word-salad (a little more play-FORMAT skeleton — "Enter X and Y", caps names — but
+  no coherent content).
+
+**Conclusion — the objective-mismatch hypothesis is FALSIFIED at this scale.** The model could not learn
+span-filling even when trained EXCLUSIVELY on it (NELBO pinned at the floor from k≈9 on). So the
+continuation/generation failure is **not** the masking pattern — it is a fundamental **DATA/CAPACITY limit
+on long-range modeling**: from ~2M tokens / 157K params, the only learnable signal is LOCAL interpolation;
+the long-range structure needed to fill a contiguous span simply isn't there to learn. Contiguous training
+threw away the one learnable thing (interpolation) for a task that is unlearnable here. A mix wouldn't
+rescue it (the contiguous component stays unlearnable). **This CONFIRMS the data ceiling from a second,
+independent angle** (§13.3 said data limits coherence; this shows even a *direct* objective change can't
+buy generation at this scale). Path to real generation = more DATA + CAPACITY (learnable long-range
+structure), not a masking-pattern change. [Supersedes §13.4's "fixable objective" framing.] The
+`--contiguous` flag + the recall probe remain as validated tools to re-test once data/capacity grow.
