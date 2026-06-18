@@ -38,6 +38,13 @@ void launch_silu_bwd_f32(const float* grad_out, const float* x, float* grad_in, 
 void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N, int D);
 // Scalar multiply out=in*alpha (autograd::scale primitive); matches backend::cpu::mul_scalar_f32.
 void launch_mul_scalar_f32(const float* in, float alpha, float* out, std::size_t n);
+
+// weighted_cross_entropy (the diffusion loss) fwd+bwd. fwd: single-block reduction → scalar loss +
+// Σwᵢ. bwd: grad[i,j]=wᵢ·(g[0]/wsum)·(probs[i,j]−[j==tgt[i]]). probs are softmax outputs (N,C).
+void launch_wce_fwd(const float* probs, const int* targets, const float* weights,
+                    float* out_loss, float* out_wsum, int N, int C);
+void launch_wce_bwd(const float* probs, const int* targets, const float* weights, const float* g,
+                    float* grad, int N, int C, float wsum);
 void launch_matmul_f32(const float* A, const float* B, float* C,
                        std::size_t M, std::size_t N, std::size_t K);
 // Transposed-first-operand matmul C = Aᵀ·B: A(M,K), B(M,N) row-major → C(K,N), contraction over M.

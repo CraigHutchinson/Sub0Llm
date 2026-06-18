@@ -229,6 +229,26 @@ Tensor mul_scalar(const Tensor& a, float alpha) {
 #endif
 }
 
+void wce_fwd(const float* probs, const int* targets, const float* weights,
+             float* out_loss, float* out_wsum, int N, int C) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_wce_fwd(probs, targets, weights, out_loss, out_wsum, N, C);
+#else
+    (void)probs; (void)targets; (void)weights; (void)out_loss; (void)out_wsum; (void)N; (void)C;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+void wce_bwd(const float* probs, const int* targets, const float* weights, const float* g,
+             float* grad, int N, int C, float wsum) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_wce_bwd(probs, targets, weights, g, grad, N, C, wsum);
+#else
+    (void)probs; (void)targets; (void)weights; (void)g; (void)grad; (void)N; (void)C; (void)wsum;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 Tensor matmul(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
     const auto M = static_cast<std::size_t>(a.shape(0));

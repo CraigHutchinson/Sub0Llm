@@ -370,7 +370,44 @@ Variable weighted_cross_entropy(const Variable& logits, const Tensor& targets,
         weights.numel() != static_cast<std::int64_t>(N))
         throw std::runtime_error("autograd::weighted_cross_entropy: targets/weights size != N");
 
-    Tensor probs     = ops::softmax(ld, -1);
+    Tensor probs = ops::softmax(ld, -1);
+
+    // ── CUDA path: reduce the loss on-device and dispatch the backward kernel ──
+    if (ld.device().is_cuda()) {
+        const Device dev = ld.device();
+        const Tensor tgt_dev = targets.device() == dev ? targets : targets.to(dev);
+        const Tensor w_dev   = weights.device() == dev ? weights : weights.to(dev);
+        Tensor loss_dev = zeros({1}, DType::Float32, dev);
+        Tensor wsum_dev = zeros({1}, DType::Float32, dev);
+        backend::cuda::wce_fwd(
+            reinterpret_cast<const float*>(probs.raw_ptr()),
+            reinterpret_cast<const int*>(tgt_dev.raw_ptr()),
+            reinterpret_cast<const float*>(w_dev.raw_ptr()),
+            reinterpret_cast<float*>(loss_dev.raw_ptr()),
+            reinterpret_cast<float*>(wsum_dev.raw_ptr()),
+            static_cast<int>(N), static_cast<int>(C));
+        const float wsum = wsum_dev.to(Device::cpu()).data_as<float>()[0];   // D2H one float
+
+        auto out = make_node(std::move(loss_dev), logits.requires_grad());
+        if (out->requires_grad) {
+            Tensor probs_copy = copy(probs);
+            out->edges.push_back(make_edge(logits.impl(),
+                [probs_copy, tgt_dev, w_dev, N, C, wsum](const Tensor& g) {
+                    Tensor grad = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)},
+                                        DType::Float32, probs_copy.device());
+                    backend::cuda::wce_bwd(
+                        reinterpret_cast<const float*>(probs_copy.raw_ptr()),
+                        reinterpret_cast<const int*>(tgt_dev.raw_ptr()),
+                        reinterpret_cast<const float*>(w_dev.raw_ptr()),
+                        reinterpret_cast<const float*>(g.raw_ptr()),
+                        reinterpret_cast<float*>(grad.raw_ptr()),
+                        static_cast<int>(N), static_cast<int>(C), wsum);
+                    return grad;
+                }));
+        }
+        return Variable::wrap(std::move(out));
+    }
+
     Tensor log_probs = ops::log(probs);
     const auto lps = log_probs.data_as<float>();
     const auto tgs = targets.data_as<int32_t>();

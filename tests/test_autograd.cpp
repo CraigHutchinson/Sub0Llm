@@ -715,3 +715,42 @@ TEST_CASE("end-to-end autograd backward on CUDA matches CPU", "[autograd][device
     REQUIRE(wg_cpu.numel() == D);
 #endif
 }
+
+// Stage 4 Phase 7 (step 2): weighted_cross_entropy (the diffusion loss) on CUDA — forward loss
+// value + the scalar backward() seed (ones on-device) + the backward grad kernel, all vs CPU.
+// targets/weights are passed on the host to exercise the dispatch's device-move.
+TEST_CASE("weighted_cross_entropy fwd+bwd match CPU on CUDA", "[autograd][device]") {
+    const int64_t N = 6, C = 5;
+    std::vector<float> lv(static_cast<std::size_t>(N * C));
+    for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = 0.3f * static_cast<float>(i % 7) - 1.0f;
+    Tensor targets({N}, DType::Int32);
+    { auto tp = targets.data_as<int32_t>();
+      for (int64_t i = 0; i < N; ++i) tp[static_cast<std::size_t>(i)] = static_cast<int32_t>(i % C); }
+    Tensor weights({N}, DType::Float32);
+    { auto wp = weights.data_as<float>();
+      for (int64_t i = 0; i < N; ++i) wp[static_cast<std::size_t>(i)] = 0.5f + 0.25f * static_cast<float>(i % 4); }
+
+    Variable logits_cpu = leaf2d(lv, N, C, /*rg=*/true);
+    Variable loss_cpu = weighted_cross_entropy(logits_cpu, targets, weights);
+    const float lval_cpu = loss_cpu.data().data_as<float>()[0];
+    loss_cpu.backward();
+    const Tensor grad_cpu = logits_cpu.grad();
+#ifdef SUB0LLM_CUDA
+    Variable logits_gpu = leaf2d(lv, N, C, /*rg=*/true);  logits_gpu.to(Device::cuda());
+    Variable loss_gpu = weighted_cross_entropy(logits_gpu, targets, weights);   // host targets/weights
+    REQUIRE(loss_gpu.data().device().is_cuda());
+    const float lval_gpu = loss_gpu.data().to(Device::cpu()).data_as<float>()[0];
+    REQUIRE_THAT(lval_gpu, WithinAbs(lval_cpu, 1e-3f));
+
+    loss_gpu.backward();   // scalar seed ones({1}, cuda) + the wce backward kernel
+    REQUIRE(logits_gpu.grad().device().is_cuda());
+    const Tensor grad_gpu = logits_gpu.grad().to(Device::cpu());
+    const auto gc = grad_cpu.data_as<float>();
+    const auto gg = grad_gpu.data_as<float>();
+    for (int64_t i = 0; i < N * C; ++i)
+        REQUIRE_THAT(gg[static_cast<std::size_t>(i)], WithinAbs(gc[static_cast<std::size_t>(i)], 1e-4f));
+#else
+    REQUIRE(loss_cpu.data().numel() == 1);
+    REQUIRE(grad_cpu.numel() == N * C);
+#endif
+}

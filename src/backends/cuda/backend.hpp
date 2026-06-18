@@ -53,6 +53,13 @@ void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D);
 // Scalar multiply out = a*alpha on a device tensor (autograd::scale fwd+bwd primitive).
 [[nodiscard]] Tensor mul_scalar(const Tensor& a, float alpha);
 
+// weighted_cross_entropy (the diffusion loss) on DEVICE pointers. fwd writes the scalar loss and
+// Σwᵢ; bwd writes grad (N,C) from probs/targets/weights, the upstream scalar g, and wsum.
+void wce_fwd(const float* probs, const int* targets, const float* weights,
+             float* out_loss, float* out_wsum, int N, int C);
+void wce_bwd(const float* probs, const int* targets, const float* weights, const float* g,
+             float* grad, int N, int C, float wsum);
+
 // Benchmark the row-wise softmax KERNEL in isolation (no per-iter device alloc): H2D the
 // (rows×cols) host input once, run `reps` timed launches (GPU events, after warm-up), D2H the
 // last result into `host_out`. Returns total GPU kernel time (seconds) for `reps` launches, so

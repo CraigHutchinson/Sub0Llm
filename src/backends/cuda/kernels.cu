@@ -213,6 +213,53 @@ __global__ void mul_scalar_f32_kernel(const float* __restrict__ in, float alpha,
     if (i < n) out[i] = in[i] * alpha;
 }
 
+// weighted_cross_entropy forward: single-block reduction over N rows. loss = Σ wᵢ·(−log probs[i,tgt[i]])
+// / Σwᵢ (wsum≤0 → fallback N). Matches autograd::weighted_cross_entropy (which logs softmax outputs).
+// Writes the scalar loss and Σwᵢ (the backward needs the latter). Shared mem = 2·blockDim floats.
+__global__ void wce_fwd_kernel(const float* __restrict__ probs, const int* __restrict__ targets,
+                               const float* __restrict__ weights, float* __restrict__ out_loss,
+                               float* __restrict__ out_wsum, int N, int C) {
+    extern __shared__ float sh[];
+    float* sloss = sh;
+    float* swsum = sh + blockDim.x;
+    float lloss = 0.0f, lwsum = 0.0f;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const float wi = weights[i];
+        const float p  = probs[static_cast<std::size_t>(i) * C + targets[i]];
+        lloss += wi * (-logf(p));
+        lwsum += wi;
+    }
+    sloss[threadIdx.x] = lloss;
+    swsum[threadIdx.x] = lwsum;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sloss[threadIdx.x] += sloss[threadIdx.x + s];
+            swsum[threadIdx.x] += swsum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float ws = swsum[0];
+        if (ws <= 0.0f) ws = static_cast<float>(N);
+        *out_loss = sloss[0] / ws;
+        *out_wsum = ws;
+    }
+}
+
+// weighted_cross_entropy backward: grad[i,j] = wᵢ·(g[0]/wsum)·(probs[i,j] − [j==tgt[i]]). One
+// thread per element — the target subtraction lands in the same thread, so no atomics.
+__global__ void wce_bwd_kernel(const float* __restrict__ probs, const int* __restrict__ targets,
+                               const float* __restrict__ weights, const float* __restrict__ g,
+                               float* __restrict__ grad, int N, int C, float wsum) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C) return;
+    const int i = idx / C, j = idx % C;
+    const float s = g[0] / wsum;
+    const float onehot = (j == targets[i]) ? 1.0f : 0.0f;
+    grad[idx] = weights[i] * s * (probs[idx] - onehot);
+}
+
 // Tiled matmul — 16×16 shared-memory tile.
 // For production use cuBLAS; this is for pedagogical clarity.
 constexpr int TILE = 16;
@@ -869,6 +916,18 @@ void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N,
 
 void launch_mul_scalar_f32(const float* in, float alpha, float* out, std::size_t n) {
     mul_scalar_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(in, alpha, out, static_cast<int>(n));
+}
+
+void launch_wce_fwd(const float* probs, const int* targets, const float* weights,
+                    float* out_loss, float* out_wsum, int N, int C) {
+    constexpr int B = 256;
+    wce_fwd_kernel<<<1, B, 2 * B * sizeof(float)>>>(probs, targets, weights, out_loss, out_wsum, N, C);
+}
+
+void launch_wce_bwd(const float* probs, const int* targets, const float* weights, const float* g,
+                    float* grad, int N, int C, float wsum) {
+    constexpr int B = 256;
+    wce_bwd_kernel<<<grid(static_cast<std::size_t>(N) * C, B), B>>>(probs, targets, weights, g, grad, N, C, wsum);
 }
 
 void launch_matmul_f32(const float* A, const float* B, float* C,
