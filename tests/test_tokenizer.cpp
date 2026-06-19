@@ -58,6 +58,45 @@ TEST_CASE("char_level - survives save/load via empty-merges detection", "[tokeni
     std::filesystem::remove_all(dir);
 }
 
+// ── Word-level tokenizer (granularity spectrum, TRAINING_DESIGN §13.6) ─────────
+
+TEST_CASE("word_level - round-trips, one token per word + punctuation + whitespace", "[tokenizer][word]") {
+    const std::string text = "To be, or not\n  to be.\n";
+    auto tok = BPETokenizer::word_level({text});
+
+    REQUIRE(tok.num_merges() == 0);
+    const auto ids = tok.encode(text);
+    REQUIRE(tok.decode(ids) == text);                 // exact round-trip, structure preserved
+    // "be" appears twice but is ONE vocab entry; "be," is split into "be" + ",".
+    REQUIRE(tok.token_id("be") >= 0);
+    REQUIRE(tok.token_id("not") >= 0);
+    REQUIRE(tok.token_id(",")  >= 0);
+    REQUIRE(tok.token_id("\n") >= 0);
+}
+
+TEST_CASE("word_level - contractions stay whole, repeats collapse to one token", "[tokenizer][word]") {
+    auto tok = BPETokenizer::word_level({"I'll go and go and go"});
+    REQUIRE(tok.token_id("I'll") >= 0);               // apostrophe kept inside the word
+    const auto ids = tok.encode("go go");
+    REQUIRE(ids.size() == 3);                         // go, <space>, go — "go" is one shared id
+    REQUIRE(ids[0] == ids[2]);
+}
+
+TEST_CASE("word_level - survives save/load and is distinguished from char-level", "[tokenizer][word]") {
+    const std::string text = "hark, who goes there?\n";
+    auto tok = BPETokenizer::word_level({text});
+
+    const auto dir = std::filesystem::temp_directory_path() / "sub0llm_wordtok_test";
+    std::filesystem::remove_all(dir);
+    tok.save(dir);
+    auto loaded = BPETokenizer::load(dir / "vocab.json", dir / "merges.txt");
+    // load() must re-detect word-level (multi-char word token present) — NOT char-level —
+    // so encode splits by word, giving the same ids and an exact round-trip.
+    REQUIRE(loaded.encode(text) == tok.encode(text));
+    REQUIRE(loaded.decode(loaded.encode(text)) == text);
+    std::filesystem::remove_all(dir);
+}
+
 // ── Training ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("train - vocab grows with merges", "[tokenizer][train]") {

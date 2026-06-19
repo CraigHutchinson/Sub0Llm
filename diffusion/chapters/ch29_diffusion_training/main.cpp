@@ -219,12 +219,15 @@ static int run(int argc, char** argv) {
                  cfg.optim.t_max);
 
     // ── 2. data: BPE + flat token streams with a held-out split ─────────────────
-    section(cfg.data.char_level
-                ? "2. Data — char-tokenized corpus (whitespace preserved), 95/5 train/eval split"
-                : "2. Data — BPE-tokenized corpus, 95/5 train/eval split");
-    // Char-level mode reads the corpus RAW (newlines/indentation kept) so the model can
+    if (cfg.data.char_level && cfg.data.word_level)
+        throw std::runtime_error("--char-level and --word-level are mutually exclusive");
+    const bool raw_mode = cfg.data.char_level || cfg.data.word_level;
+    section(cfg.data.char_level ? "2. Data — char-tokenized corpus (whitespace preserved), 95/5 train/eval split"
+            : cfg.data.word_level ? "2. Data — word-tokenized corpus (whitespace preserved), 95/5 train/eval split"
+                                  : "2. Data — BPE-tokenized corpus, 95/5 train/eval split");
+    // Char/word-level modes read the corpus RAW (newlines/indentation kept) so the model can
     // reproduce verse/line structure; BPE mode uses the paragraph-per-line reader.
-    auto paragraphs = cfg.data.char_level
+    auto paragraphs = raw_mode
                           ? read_raw_chunks(cfg.data.corpus, cfg.data.paragraphs)
                           : read_paragraphs(cfg.data.corpus, cfg.data.paragraphs);
     if (paragraphs.size() < 20)
@@ -253,6 +256,15 @@ static int run(int argc, char** argv) {
             std::print("building char-level tokenizer (whitespace preserved)... ");
             auto t = BPETokenizer::char_level(paragraphs);
             std::println("done — {} char vocab", t.vocab_size());
+            return t;
+        }
+        if (cfg.data.word_level) {
+            // Word-level: one token per whole word (the far end of the granularity spectrum).
+            // Every token is a real word, so the model cannot emit a non-word — isolates the
+            // §13.6 fragment-coordination mechanism. Large vocab (~unique words in corpus).
+            std::print("building word-level tokenizer (one token per word)... ");
+            auto t = BPETokenizer::word_level(paragraphs);
+            std::println("done — {} word vocab", t.vocab_size());
             return t;
         }
         std::print("training BPE (vocab {})... ", cfg.model.vocab_size);

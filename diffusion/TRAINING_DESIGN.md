@@ -628,3 +628,63 @@ not data quantity or the diffusion objective.
 to ch29 (the primary lever) + longer context, then RE-RUN the recall probe / contiguous A/B on a
 char-level model before trusting the §13.4–13.5 findings. Also still-owed: the plain AR-GPT baseline on
 complete_shakespeare (never run). [Supersedes the §13.3–13.5 "data ceiling" framing.]
+
+### 13.7 Tokenization granularity, mechanistically — char vs BPE-512 vs word-level (2026-06-19)
+§13.6 said "char-level is the lever"; this section says **why**, after implementing char-level
+(`--char-level`) and word-level (`--word-level`) tokenizers in ch29 and controlling two confounds.
+
+**Confound 1 — sampling. CLOSED.** We had only ever judged BPE-512 at GREEDY (Ch30's temp-0 default),
+and char-level greedy turns out to **collapse to a blank canvas** (with the `conf≥0.90` commit rule the
+model commits the single safest high-frequency token — space, ~18% of chars — everywhere). So a naive
+"char coheres, BPE doesn't" risked being a greedy-vs-greedy artifact. Re-ran the converged **BPE-512**
+founded ckpt at temperature 0 / 0.6 / 0.9 (same prompt): **subword salad at EVERY temperature**
+(`itome`, `WIACHER`, `conickeders`, `ging`, `oldd`) — temperature changes *which* garbage fragments
+appear, not *whether*. BPE-512 greedy does **not** blank-collapse (rich vocab commits real content), so
+the old salad verdict was genuine, not a sampling artifact. Char-level needs temperature 0.6–0.7 (see
+the Ch30 weak-model precondition); at that setting it gives real words + verse form. Net: across temp
+0/0.6/0.9, BPE-512 = salad, char-level = real words ⇒ **tokenization, not sampling.**
+
+**Confound 2 — "did BPE just pick bad/rare tokens?" NO.** Inspected the actual 514-token vocab: it
+**contains the high-frequency whole words** as single tokens (the/and/thou/thee/thy/you/that/with/king/
+lord/love/heart/sir all present). Composition: 138×1-char, 181×2-char, 127×3-char, 53×4-char, 11×5-char;
+**235 mid-word continuation fragments** (`AL EN ER ON ST con ick ed ers …`). So the failure is not vocab
+coverage. The real mechanism is **diffusion-specific**:
+1. **~60% of the vocab is multi-char fragments** — only the top words earn whole tokens; the rest must be
+   ASSEMBLED from pieces (`con`+`ick`+`ed`+`ers`).
+2. **Parallel denoising can't coordinate fragments.** Masked diffusion fills positions from their
+   *marginals* with no left→right constraint, so it commits `con` then `ick` then `ers` — each locally
+   probable, the concatenation a NON-word. (An autoregressive model leans on committed left-context to
+   keep the next fragment word-consistent — so this is *not* a universal tokenizer fact.)
+3. **Error granularity.** A wrong *char* = a 1-char blemish in an otherwise-real word (`nighthe`); a
+   wrong *fragment* = a whole visible non-word chunk (`WIACHER`). Char atoms degrade gracefully; subword
+   fragments do not.
+
+**The granularity spectrum (this is the chapter-level lesson):**
+`char (V~101)`  →  `BPE-512`  →  `word-level (V~33k)`  →  `large subword (Gemma 262k)`.
+Char and word-level sit at the two ends where **a token error stays a real unit** (a real letter / a real
+word); BPE-N in the awkward middle emits *fragments* that the parallel denoiser mis-assembles. Subword
+works again only **at scale** (DiffusionGemma's 262k tokens are mostly whole words/frequent units, trained
+on trillions of tokens). So tokenizer granularity should track data/model scale: char/byte at tiny scale,
+large subword at large scale — BPE-512 on 5M chars was the wrong point on the curve.
+
+**Empirical (this session, ch29 founded D=256/L6, complete_shakespeare, seq128 char / seq64 word):**
+- **char-level** (`--char-level`, V=101, 5.94M params): held-out NELBO 3.4→1.87 by step 6300; Ch30 temp-0.6
+  generation = real English + Shakespeare form (speaker labels, `[_Exeunt._]`, verse lines), graceful
+  degradation. PROVES §13.6 on our own engine.
+- **word-level** (`--word-level`, V≈32.8k, 14.3M params): one token per whole word ⇒ the model **cannot emit
+  a non-word** by construction. CONFIRMED at step 1000 (Ch30 temp 0.6 / 0.9): every emitted token is a real
+  word, **zero spelling salad** — e.g. *"KING HENRY: thou my well. … With make too I to matter / To me with
+  his me as to him, and is told a"* and (temp 0.9) a second speaker label *"ROSALIND."*. The errors are now
+  purely wrong *word choice / order* (grammatical word-salad), never broken spelling — exactly as predicted.
+  This closes the mechanism loop: removing fragments entirely makes the non-words vanish, so BPE-512's salad
+  was fragment mis-coordination, not a data or objective limit.
+
+**Error-mode by granularity (the one-line takeaway):** char error = 1-char blemish → near-word
+(`nighthe`); BPE-512 error = mis-assembled fragment → **non-word** (`conickeders`); word error = wrong word
+→ **still a real word** ("make too I to matter"). Both ends of the spectrum keep a token error a *real
+unit*; the small-BPE middle does not.
+
+**TESTABLE PREDICTION (motivates the owed AR baseline):** an autoregressive GPT on BPE-512 should produce
+**far less** salad than diffusion on BPE-512, because left-context constrains each next fragment. If true,
+it confirms the salad is the *interaction* of subword tokenization × parallel denoising, not tokenization
+alone. (See `chapters/ch03_tokenization` for the granularity walkthrough.)

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <format>
 #include <fstream>
 #include <limits>
@@ -65,6 +66,42 @@ std::vector<std::string> word_to_chars(std::string_view word) {
         p += len;
     }
     return chars;
+}
+
+// Split raw text into word-level tokens for word_level(): a "word" is a maximal run of
+// ASCII letters and apostrophes (ASCII ' or the curly U+2019, so "I'll"/"th'" stay whole);
+// a "number" is a run of ASCII digits; every whitespace char and every other code point
+// (punctuation, non-ASCII) is its own token. Lossless — concatenating the tokens reproduces
+// the text exactly — so it round-trips and preserves verse/line structure.
+std::vector<std::string> split_words(std::string_view text) {
+    static const std::string apostrophe = "\xE2\x80\x99";  // U+2019 RIGHT SINGLE QUOTATION
+    auto is_letter = [](const std::string& c) {
+        return c.size() == 1 && (std::isalpha(static_cast<unsigned char>(c[0])) != 0);
+    };
+    auto is_apos = [&](const std::string& c) { return c == "'" || c == apostrophe; };
+    auto is_digit = [](const std::string& c) {
+        return c.size() == 1 && (std::isdigit(static_cast<unsigned char>(c[0])) != 0);
+    };
+
+    std::vector<std::string> out;
+    std::string buf;
+    int kind = 0;  // 0 none, 1 word, 2 number
+    auto flush = [&] { if (!buf.empty()) { out.push_back(std::move(buf)); buf.clear(); } kind = 0; };
+
+    for (auto& cp : word_to_chars(text)) {
+        if (is_letter(cp) || is_apos(cp)) {
+            if (kind == 2) flush();
+            buf += cp; kind = 1;
+        } else if (is_digit(cp)) {
+            if (kind == 1) flush();
+            buf += cp; kind = 2;
+        } else {
+            flush();
+            out.push_back(cp);  // whitespace / punctuation / non-ASCII — its own token
+        }
+    }
+    flush();
+    return out;
 }
 
 // Count frequency of adjacent pairs in a list of tokenised words.
@@ -240,6 +277,27 @@ BPETokenizer BPETokenizer::char_level(const std::vector<std::string>& corpus) {
     return tok;
 }
 
+// ── word_level ────────────────────────────────────────────────────────────────
+//
+// One token per whole word (+ each punctuation/whitespace char), no merges — the far
+// end of the granularity spectrum from char_level(). Every token IS a real word, so the
+// model literally cannot emit a non-word; it isolates whether BPE-512's salad came from
+// mis-assembled subword fragments under diffusion's parallel denoising (§13.6). Vocab is
+// every unique word/punct/whitespace token in the corpus (no frequency cap → large vocab).
+BPETokenizer BPETokenizer::word_level(const std::vector<std::string>& corpus) {
+    BPETokenizer tok;
+    tok.word_level_ = true;
+
+    for (const auto& text : corpus)
+        for (auto& w : split_words(text))
+            tok.add_token(w);
+
+    tok.eos_id_ = tok.add_special_token("<|endoftext|>");
+    tok.bos_id_ = tok.eos_id_;
+    tok.unk_id_ = tok.add_special_token("<|unk|>");
+    return tok;
+}
+
 // ── load ───────────────────────────────────────────────────────────────────────
 
 BPETokenizer BPETokenizer::load(
@@ -294,13 +352,21 @@ BPETokenizer BPETokenizer::load(
     if (auto it = tok.vocab_.find("<|unk|>"); it != tok.vocab_.end())
         tok.unk_id_ = it->second;
 
-    // A char_level() tokenizer round-trips as an EMPTY merges.txt plus a vocab holding a
-    // literal space/newline token — neither of which a trained BPE vocab ever has (its
-    // spaces are the Ġ marker and it always has merges). Detect that and restore the flag
-    // so encode bypasses the whitespace-collapsing pre-tokenizer on a resumed/eval run.
-    if (tok.merges_.empty() &&
-        (tok.vocab_.find(" ") != tok.vocab_.end() || tok.vocab_.find("\n") != tok.vocab_.end()))
-        tok.char_level_ = true;
+    // A char_level()/word_level() tokenizer round-trips as an EMPTY merges.txt plus a vocab
+    // holding a literal space/newline token — neither of which a trained BPE vocab ever has
+    // (its spaces are the Ġ marker and it always has merges). Restore the right flag so
+    // encode uses the matching splitter on a resumed/eval run. char_level has ONLY single
+    // code-point tokens; word_level additionally has multi-character word tokens — so the
+    // presence of any multi-byte non-special token distinguishes the two.
+    const bool literal = tok.merges_.empty() &&
+        (tok.vocab_.find(" ") != tok.vocab_.end() || tok.vocab_.find("\n") != tok.vocab_.end());
+    if (literal) {
+        bool has_word = false;
+        for (const auto& t : tok.id_to_token_)
+            if (!t.empty() && t.front() != '<' && word_to_chars(t).size() >= 2) { has_word = true; break; }
+        tok.word_level_ = has_word;
+        tok.char_level_ = !has_word;
+    }
 
     return tok;
 }
@@ -412,16 +478,18 @@ BPETokenizer::encode_word(std::string_view word) const {
 std::vector<BPETokenizer::TokenId>
 BPETokenizer::encode(std::string_view text) const {
     std::vector<TokenId> result;
-    // Char-level: one token per raw code point, whitespace and newlines preserved —
-    // skip the GPT-2 pre-tokenizer that would collapse whitespace and remap spaces.
-    if (char_level_) {
-        for (const auto& ch : word_to_chars(text)) {
-            if (const auto it = vocab_.find(ch); it != vocab_.end())
+    // Char-level / word-level: one token per raw code point (char) or per whole word
+    // (word), whitespace and newlines preserved — skip the GPT-2 pre-tokenizer that would
+    // collapse whitespace and remap spaces.
+    if (char_level_ || word_level_) {
+        const auto units = word_level_ ? split_words(text) : word_to_chars(text);
+        for (const auto& u : units) {
+            if (const auto it = vocab_.find(u); it != vocab_.end())
                 result.push_back(it->second);
             else if (unk_id_ >= 0)
                 result.push_back(unk_id_);
             else
-                throw std::runtime_error("BPETokenizer::encode: unknown char: " + ch);
+                throw std::runtime_error("BPETokenizer::encode: unknown token: " + u);
         }
         return result;
     }
@@ -437,9 +505,9 @@ BPETokenizer::encode(std::string_view text) const {
 std::string BPETokenizer::decode(std::span<const TokenId> ids) const {
     std::string out;
 
-    // Char-level: tokens are literal code points (whitespace/newlines included) —
-    // concatenate them as-is, no Ġ→space rewrite and no byte remapping.
-    if (char_level_) {
+    // Char-level / word-level: tokens are literal text (code points or whole words, with
+    // whitespace/newlines included) — concatenate as-is, no Ġ→space rewrite or byte remap.
+    if (char_level_ || word_level_) {
         for (const TokenId id : ids) {
             if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size())
                 throw std::runtime_error(std::format(

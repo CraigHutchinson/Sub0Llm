@@ -62,6 +62,16 @@ public:
     [[nodiscard]] static BPETokenizer char_level(
         const std::vector<std::string>& corpus);
 
+    // Word-level tokenizer: one token per whole word (maximal run of letters/apostrophes),
+    // with each digit-run, punctuation mark, and whitespace char its own token — structure
+    // PRESERVED, no merges. The opposite extreme from char_level on the granularity
+    // spectrum: because every emitted token IS a real word, the model can never produce a
+    // non-word (no subword fragments to mis-assemble) — it isolates whether BPE-512's salad
+    // was fragment mis-coordination under diffusion's parallel denoising (TRAINING_DESIGN
+    // §13.6). Vocab = every unique such token in `corpus` (no frequency cap).
+    [[nodiscard]] static BPETokenizer word_level(
+        const std::vector<std::string>& corpus);
+
     // ── Encode / decode ───────────────────────────────────────────────────────
 
     // Convert a string to a sequence of token IDs.
@@ -118,6 +128,11 @@ private:
     // concatenates them literally. Detected on load() by an empty merge list plus a
     // literal whitespace token in the vocabulary.
     bool    char_level_{false};
+
+    // True for the word_level() tokenizer: encode splits the raw text into whole-word /
+    // punctuation / whitespace tokens (not code points), decode concatenates literally.
+    // Detected on load() by an empty merge list plus a multi-character word token.
+    bool    word_level_{false};
 
     // Apply one round of BPE to a sequence of tokens.
     // Returns true if any merge was performed.
