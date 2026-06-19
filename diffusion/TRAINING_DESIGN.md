@@ -684,7 +684,27 @@ large subword at large scale — BPE-512 on 5M chars was the wrong point on the 
 → **still a real word** ("make too I to matter"). Both ends of the spectrum keep a token error a *real
 unit*; the small-BPE middle does not.
 
-**TESTABLE PREDICTION (motivates the owed AR baseline):** an autoregressive GPT on BPE-512 should produce
-**far less** salad than diffusion on BPE-512, because left-context constrains each next fragment. If true,
-it confirms the salad is the *interaction* of subword tokenization × parallel denoising, not tokenization
-alone. (See `chapters/ch03_tokenization` for the granularity walkthrough.)
+**PREDICTION → CONFIRMED (AR baseline, 2026-06-19).** Predicted: an autoregressive GPT on BPE-512 should
+produce **far less** salad than diffusion on BPE-512, because left-context constrains each next fragment.
+Ran it — `ch24_real_training --phase train --corpus complete_shakespeare --vocab-size 512`, which trains a
+**ModernGPT at the SAME D=256/L6/H8** as the diffusion founded model (4.96M params), so tokenizer + dims +
+corpus all match and **only the objective differs** (AR next-token vs diffusion masked-parallel). Generation
+(`sub0llm-cli`, greedy + temp 0.8):
+> *"SECOND GENTLEMAN. … Come, my lord, I will not, I have being."* / *"It is her very … Save I hold me to be
+> run the … son. Ay, thou he is I said"*
+
+AR is **predominantly real words + grammar**, where diffusion on the identical BPE-512 was pervasive
+non-word salad (`itome`,`WIACHER`,`conickeders`). AR's residual non-words are mostly **invented proper
+names** (`DEDILE`,`GRUCE`,`ASITUS` — plausible name shapes) plus rare genuine slips (`powoper`,`ribation`) —
+i.e. left-context coordination *dramatically reduces* fragment misassembly without 100% eliminating it.
+⇒ The salad is the **interaction of subword tokenization × parallel denoising**, not tokenization alone:
+same tokenizer/dims/corpus, swap the objective, and word-validity returns. (Caveat: the AR output is choppy
+/ `<|endoftext|>`-heavy because ch24 treats each corpus *line* as a document — a pipeline artifact that hits
+*structure*, not the word-validity question.) See `chapters/ch03_tokenization` for the granularity walkthrough.
+
+**Net picture across the spectrum (one corpus, ~5M params each):**
+| | char (diffusion) | BPE-512 (diffusion) | word (diffusion) | BPE-512 (AR) |
+|---|---|---|---|---|
+| emits non-words? | rare (1-char blemish) | **pervasive** | **never** | rare (mostly invented names) |
+| grammar | emerging | n/a (salad) | emerging | emerging |
+| why | atoms are chars | fragments mis-coordinate under parallel denoise | atoms are words | left-context coordinates fragments |
