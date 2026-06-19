@@ -65,7 +65,12 @@ struct Config {
 
 static Config parse_args(int argc, char** argv) {
     Config c;
-    c.sampler.temperature = 0.0f;       // deterministic by default (educational)
+    // GENERATION temperature. Default >0 on purpose: temperature 0 (greedy) under the
+    // confidence-commit sampler COLLAPSES a weak model to its single safest token — for a
+    // char model that is the space token (~18% of all tokens), so the canvas fills with
+    // blanks. A small temperature breaks that degeneracy and yields real text. (The recall
+    // comparison in section 3 measures recovery GREEDILY via a temperature-0 copy — see below.)
+    c.sampler.temperature = 0.9f;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         auto next = [&]() -> std::string {
@@ -128,6 +133,10 @@ static int run(int argc, char** argv) {
     std::println("sampler: conf≥{:.2f} commits, entropy_bound {:.2f}, temperature {:.1f}",
                  cfg.sampler.conf_threshold, cfg.sampler.entropy_bound,
                  cfg.sampler.temperature);
+    if (cfg.sampler.temperature <= 0.0f)
+        std::println("  warning: temperature 0 (greedy) + confidence-commit can COLLAPSE a weak model to its\n"
+                     "           single safest token (e.g. all spaces for a char model). Use --temperature 0.7+\n"
+                     "           for real generation; this is the iterative-refinement weak-model precondition.");
 
     // ── 2. watch a canvas snap into focus ───────────────────────────────────────
     section("2. Generation — iterative refinement from a prompt");
@@ -190,6 +199,11 @@ static int run(int argc, char** argv) {
     std::println("  {:>6}  {:>10}  {:>10}  {:>12}  {:>10}", "noise", "one-step",
                  "iterative", "iters (avg)", "Δ recall");
     std::mt19937 rng_a(4242), rng_b(4242);   // identical corruption streams
+    // Recovery is a DETERMINISTIC measurement (does iterative refinement recover the exact
+    // masked token?), so force greedy here regardless of the generation temperature above —
+    // one-step (evaluate_recovery) is argmax, and iterative must match it for a fair compare.
+    dn::SamplerConfig recall_cfg = cfg.sampler;
+    recall_cfg.temperature = 0.0f;
     const double stride = static_cast<double>(n_positions) / static_cast<double>(budget);
     for (float noise : {0.25f, 0.50f, 0.75f, 0.90f}) {
         de::RecoveryResult one, iter;
@@ -207,7 +221,7 @@ static int run(int argc, char** argv) {
 
             dn::SamplerStats st;
             auto r2 = iterative_recovery(model, window, corr.corrupted,
-                                         cfg.sampler, rng_b, &st);
+                                         recall_cfg, rng_b, &st);
             iter.hits += r2.hits; iter.masked += r2.masked;
             iter_sum += st.iterations;
         }
