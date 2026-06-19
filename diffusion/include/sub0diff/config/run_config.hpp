@@ -57,13 +57,15 @@ struct Model {
 struct Data {
     std::string  corpus     = "data/shakespeare.txt";
     std::string  ckpt_dir   = "/tmp/sub0diff_ch29";
-    std::int64_t paragraphs = 0;   // 0/-1 = all paragraphs
+    std::int64_t paragraphs = 0;       // 0/-1 = all paragraphs
+    bool         char_level = false;   // char tokenizer (whitespace preserved) + raw reader
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
         v("corpus",     Scope::Runtime, self.corpus,     "training corpus path");
         v("ckpt_dir",   Scope::Runtime, self.ckpt_dir,   "checkpoint directory");
         v("paragraphs", Scope::Runtime, self.paragraphs, "paragraph cap (0=all)");
+        v("char_level", Scope::Runtime, self.char_level, "char-level tokenizer + raw reader");
     }
 };
 

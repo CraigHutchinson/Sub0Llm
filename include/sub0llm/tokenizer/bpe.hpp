@@ -52,6 +52,16 @@ public:
         const std::vector<std::string>& id_to_token,
         const std::vector<std::string>& merges);
 
+    // Char-level tokenizer: one token per Unicode code point, with whitespace and
+    // newlines PRESERVED literally — no GPT-2 Ġ space remapping, no whitespace
+    // collapse, and no merges. Degrades gracefully (a wrong prediction is still a real
+    // letter, not a broken subword) and keeps the verse/line structure that BPE's
+    // pre-tokenizer discards. Mirrors nathan-barry/tiny-diffusion's char model, the
+    // control that isolated tokenization as the ch29 word-salad cause (TRAINING_DESIGN
+    // §13.6). The starting (and only) vocabulary is the unique code points in `corpus`.
+    [[nodiscard]] static BPETokenizer char_level(
+        const std::vector<std::string>& corpus);
+
     // ── Encode / decode ───────────────────────────────────────────────────────
 
     // Convert a string to a sequence of token IDs.
@@ -102,6 +112,12 @@ private:
     // decode must reverse the byte↔unicode mapping rather than emit the raw
     // token text. Trained/loaded vocabularies leave this false.
     bool    byte_level_{false};
+
+    // True for the char_level() tokenizer: encode splits the raw text into code points
+    // directly (bypassing the whitespace-collapsing GPT-2 pre-tokenizer) and decode
+    // concatenates them literally. Detected on load() by an empty merge list plus a
+    // literal whitespace token in the vocabulary.
+    bool    char_level_{false};
 
     // Apply one round of BPE to a sequence of tokens.
     // Returns true if any merge was performed.

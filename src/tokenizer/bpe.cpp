@@ -216,6 +216,30 @@ BPETokenizer BPETokenizer::train(
     return tok;
 }
 
+// ── char_level ────────────────────────────────────────────────────────────────
+//
+// One token per Unicode code point over the RAW text — spaces, tabs, and newlines
+// included, byte-for-byte, with no GPT-2 space remapping and no merges. This is the
+// graceful-degradation tokenizer: at small scale a diffusion model that emits whole
+// characters produces real words and keeps line/verse structure, where a BPE-512 vocab
+// forced subword emission and degraded to non-words (TRAINING_DESIGN §13.6).
+BPETokenizer BPETokenizer::char_level(const std::vector<std::string>& corpus) {
+    BPETokenizer tok;
+    tok.char_level_ = true;
+
+    // Seed the vocabulary with every code point appearing anywhere in the corpus,
+    // INCLUDING whitespace. No pre_tokenize: walk the raw text so ' ', '\n', '\t'
+    // become first-class tokens (BPE's pre_tokenize would drop or remap them).
+    for (const auto& text : corpus)
+        for (auto& ch : word_to_chars(text))
+            tok.add_token(ch);
+
+    tok.eos_id_ = tok.add_special_token("<|endoftext|>");
+    tok.bos_id_ = tok.eos_id_;  // GPT-2 convention: shared BOS/EOS
+    tok.unk_id_ = tok.add_special_token("<|unk|>");
+    return tok;
+}
+
 // ── load ───────────────────────────────────────────────────────────────────────
 
 BPETokenizer BPETokenizer::load(
@@ -269,6 +293,14 @@ BPETokenizer BPETokenizer::load(
         tok.eos_id_ = tok.bos_id_ = it->second;
     if (auto it = tok.vocab_.find("<|unk|>"); it != tok.vocab_.end())
         tok.unk_id_ = it->second;
+
+    // A char_level() tokenizer round-trips as an EMPTY merges.txt plus a vocab holding a
+    // literal space/newline token — neither of which a trained BPE vocab ever has (its
+    // spaces are the Ġ marker and it always has merges). Detect that and restore the flag
+    // so encode bypasses the whitespace-collapsing pre-tokenizer on a resumed/eval run.
+    if (tok.merges_.empty() &&
+        (tok.vocab_.find(" ") != tok.vocab_.end() || tok.vocab_.find("\n") != tok.vocab_.end()))
+        tok.char_level_ = true;
 
     return tok;
 }
@@ -380,6 +412,19 @@ BPETokenizer::encode_word(std::string_view word) const {
 std::vector<BPETokenizer::TokenId>
 BPETokenizer::encode(std::string_view text) const {
     std::vector<TokenId> result;
+    // Char-level: one token per raw code point, whitespace and newlines preserved —
+    // skip the GPT-2 pre-tokenizer that would collapse whitespace and remap spaces.
+    if (char_level_) {
+        for (const auto& ch : word_to_chars(text)) {
+            if (const auto it = vocab_.find(ch); it != vocab_.end())
+                result.push_back(it->second);
+            else if (unk_id_ >= 0)
+                result.push_back(unk_id_);
+            else
+                throw std::runtime_error("BPETokenizer::encode: unknown char: " + ch);
+        }
+        return result;
+    }
     for (const auto& word : pre_tokenize(text)) {
         auto word_ids = encode_word(word);
         result.insert(result.end(), word_ids.begin(), word_ids.end());
@@ -391,6 +436,18 @@ BPETokenizer::encode(std::string_view text) const {
 
 std::string BPETokenizer::decode(std::span<const TokenId> ids) const {
     std::string out;
+
+    // Char-level: tokens are literal code points (whitespace/newlines included) —
+    // concatenate them as-is, no Ġ→space rewrite and no byte remapping.
+    if (char_level_) {
+        for (const TokenId id : ids) {
+            if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size())
+                throw std::runtime_error(std::format(
+                    "BPETokenizer::decode: id {} out of range [0,{})", id, id_to_token_.size()));
+            out += id_to_token_[static_cast<std::size_t>(id)];
+        }
+        return out;
+    }
 
     // Byte-level (GPT-2/Qwen) vocab: every token char is a remapped byte, so map
     // each code point back to its byte; the assembled bytes form the UTF-8 text.

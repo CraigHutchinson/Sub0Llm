@@ -67,6 +67,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -142,6 +143,41 @@ static std::vector<std::string> read_paragraphs(const std::string& path, std::in
     return out;
 }
 
+// Raw reader for char-level mode: returns the corpus as contiguous chunks with EVERY
+// character preserved — spaces, indentation, and newlines included (only '\r' from CRLF
+// is dropped). Unlike read_paragraphs (one line per paragraph, internal whitespace
+// collapsed, blank lines skipped) this keeps the verse/line structure that the char
+// tokenizer needs. Chunks break only at '\n', so no code point or line is split and
+// concatenating them (the flatten step) reproduces the file's char stream exactly. We
+// still chunk rather than return one big string so the 95/5 train/eval split and the
+// sliding windows have many units to draw from. `limit` caps the chunk count (0 = all).
+static std::vector<std::string> read_raw_chunks(const std::string& path, std::int64_t limit) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error(std::format("cannot open corpus: {}", path));
+    const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    std::string text;
+    text.reserve(raw.size());
+    for (const char c : raw)
+        if (c != '\r') text += c;   // normalise CRLF → LF; keep every other byte
+
+    // ~400 chunks gives a ≥20-unit 5% eval tail; break at the next newline so lines and
+    // multi-byte code points stay intact.
+    constexpr std::size_t target_chunks = 400;
+    const std::size_t chunk_len = std::max<std::size_t>(1, text.size() / target_chunks);
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        std::size_t end = std::min(text.size(), i + chunk_len);
+        while (end < text.size() && text[end] != '\n') ++end;
+        if (end < text.size()) ++end;   // include the terminating newline
+        out.emplace_back(text.substr(i, end - i));
+        i = end;
+        if (limit > 0 && out.size() >= static_cast<std::size_t>(limit)) break;
+    }
+    return out;
+}
+
 // ── Reusable support units — extracted to sub0diff for reuse across chapters ──────
 //   inspect_recovery → sub0diff/eval/inspect.hpp        (call via de::inspect_recovery)
 //   tokcache         → sub0diff/data/token_cache.hpp
@@ -183,8 +219,14 @@ static int run(int argc, char** argv) {
                  cfg.optim.t_max);
 
     // ── 2. data: BPE + flat token streams with a held-out split ─────────────────
-    section("2. Data — BPE-tokenized corpus, 95/5 train/eval split");
-    auto paragraphs = read_paragraphs(cfg.data.corpus, cfg.data.paragraphs);
+    section(cfg.data.char_level
+                ? "2. Data — char-tokenized corpus (whitespace preserved), 95/5 train/eval split"
+                : "2. Data — BPE-tokenized corpus, 95/5 train/eval split");
+    // Char-level mode reads the corpus RAW (newlines/indentation kept) so the model can
+    // reproduce verse/line structure; BPE mode uses the paragraph-per-line reader.
+    auto paragraphs = cfg.data.char_level
+                          ? read_raw_chunks(cfg.data.corpus, cfg.data.paragraphs)
+                          : read_paragraphs(cfg.data.corpus, cfg.data.paragraphs);
     if (paragraphs.size() < 20)
         throw std::runtime_error("corpus too small — need at least 20 paragraphs");
     const std::size_t n_eval = paragraphs.size() * 0.05;   // 5% held out for eval (early stopping, final metrics)
@@ -201,8 +243,17 @@ static int run(int argc, char** argv) {
     const fs::path merges_txt = tok_dir / "merges.txt";
     auto tok = [&] {
         if (fs::exists(vocab_json) && fs::exists(merges_txt)) {
-            std::println("loaded cached tokenizer from {} (skipped BPE training)", tok_dir.string());
+            std::println("loaded cached tokenizer from {} (skipped tokenizer build)", tok_dir.string());
             return BPETokenizer::load(vocab_json, merges_txt);
+        }
+        if (cfg.data.char_level) {
+            // Char-level: one token per code point, whitespace/newlines preserved, zero
+            // merges — the graceful-degradation control (TRAINING_DESIGN §13.6). vocab is
+            // tiny (~the unique chars in the corpus) and pinned into config.json below.
+            std::print("building char-level tokenizer (whitespace preserved)... ");
+            auto t = BPETokenizer::char_level(paragraphs);
+            std::println("done — {} char vocab", t.vocab_size());
+            return t;
         }
         std::print("training BPE (vocab {})... ", cfg.model.vocab_size);
         auto bpe_start = std::chrono::steady_clock::now();

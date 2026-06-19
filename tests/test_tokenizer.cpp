@@ -24,6 +24,40 @@ TEST_CASE("token_id for unknown returns -1", "[tokenizer]") {
     REQUIRE(tok.token_id("XXXXXXXX") == -1);
 }
 
+// ── Char-level tokenizer (TRAINING_DESIGN §13.6) ──────────────────────────────
+
+TEST_CASE("char_level - round-trips text preserving whitespace and newlines", "[tokenizer][char]") {
+    const std::string text = "To be,\n  or not to be.\n";
+    auto tok = BPETokenizer::char_level({text});
+
+    REQUIRE(tok.num_merges() == 0);                      // zero merges — pure char-level
+    const auto ids = tok.encode(text);
+    // One token per Unicode code point (here all single-byte): exact length, exact round-trip.
+    REQUIRE(ids.size() == text.size());
+    REQUIRE(tok.decode(ids) == text);                    // spaces, indent and '\n' survive
+}
+
+TEST_CASE("char_level - space and newline are first-class tokens", "[tokenizer][char]") {
+    auto tok = BPETokenizer::char_level({"a b\nc"});
+    REQUIRE(tok.token_id(" ")  >= 0);
+    REQUIRE(tok.token_id("\n") >= 0);
+}
+
+TEST_CASE("char_level - survives save/load via empty-merges detection", "[tokenizer][char]") {
+    const std::string text = "hark!\nwho goes there?\n";
+    auto tok = BPETokenizer::char_level({text});
+
+    const auto dir = std::filesystem::temp_directory_path() / "sub0llm_chartok_test";
+    std::filesystem::remove_all(dir);
+    tok.save(dir);
+    auto loaded = BPETokenizer::load(dir / "vocab.json", dir / "merges.txt");
+
+    // load() must re-detect char-level (no merges + literal whitespace) so encode does
+    // NOT fall back to the whitespace-collapsing pre-tokenizer.
+    REQUIRE(loaded.decode(loaded.encode(text)) == text);
+    std::filesystem::remove_all(dir);
+}
+
 // ── Training ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("train - vocab grows with merges", "[tokenizer][train]") {
