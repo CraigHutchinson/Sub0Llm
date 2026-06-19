@@ -1,10 +1,29 @@
 # Chapter 32 — Tree Predictor: Hierarchical / Structural Generation (DESIGN)
 
-> **Status: design skeleton, not yet implemented.** This chapter proposes a *third*
-> text-generation paradigm alongside autoregression (Ch08) and masked diffusion
-> (Ch28–31), motivated directly by the failure analysis in
-> [`../../TRAINING_DESIGN.md` §13.7](../../TRAINING_DESIGN.md). Sections marked **[OPEN]**
-> are unresolved design questions; **[PHASE n]** tags sequence the build.
+> **Status: PARKED (design skeleton, not implemented).** Proposes a *third* generation
+> paradigm alongside autoregression (Ch08) and masked diffusion (Ch28–31), motivated by the
+> local-interpolator finding in [`../../TRAINING_DESIGN.md` §13.8](../../TRAINING_DESIGN.md)
+> (flat parallel denoising provides no cross-span coordination scaffold). Sections marked
+> **[OPEN]** are unresolved; **[PHASE n]** tags sequence an eventual build.
+>
+> **Why parked (2026-06-19):**
+> 1. **Not necessary — flat diffusion demonstrably works at scale.** DiffusionGemma-26B
+>    (`[[diffusiongemma-reference-run]]`) is a coherent flat masked-diffusion LM. So our §13.8
+>    local-interpolator limit is a property of *our small-scale setup/recipe*, not of flat
+>    diffusion per se. The tree is a *possible novel improvement*, not a required fix.
+> 2. **Research prerequisite.** Before building a novel architecture, find public info on **how
+>    DiffusionGemma (and LLaDA / MDLM / block-diffusion) are actually trained** — their recipe
+>    (scale, noise schedule, block/semi-AR masking, objective weighting) may already supply the
+>    long-range coordination we're missing, far cheaper than a new paradigm. **[RESEARCH TASK]**
+> 3. **The balanced-binary-pyramid prior (§5-A) is theoretically weak for language.** Syntax is
+>    *unbalanced* and *n-ary* (a sentence is not a balanced binary tree); a fixed balanced
+>    pyramid imposes structure that doesn't match real constituency. This pushes weight toward
+>    the §4-B/§4-C (real / induced trees) or §5-C (soft-structure) variants and is itself an
+>    argument to validate the *idea* against the literature before committing. **[OPEN — see §4]**
+>
+> **Unpark when:** the DiffusionGemma/LLaDA training research is done AND (a) their recipe
+> doesn't already close the §13.8 gap on our setup, and (b) we still judge a structural prior a
+> promising novel lever. Until then this stands as a recorded idea, not active work.
 
 ---
 
