@@ -748,11 +748,32 @@ prior; there is no way to propagate distant information across a fully-masked sp
 parallel pass. (This reproduces the §13.5 BPE result at char level — the objective-mismatch
 "fix" is now **falsified at both BPE and char level**.)
 
-**Conclusion → motivates Ch32.** The local-interpolator limit is **not** a data, capacity, or
-masking-pattern problem — it is the **flat parallel architecture**: one parallel denoising pass
-provides no scaffold to coordinate positions across a masked span. The fix has to be
-*structural*. This is the direct motivation for the **tree predictor**
-([`chapters/ch32_tree_predictor`](chapters/ch32_tree_predictor/README.md)): a parent node
-conditions its children, supplying exactly the cross-span coordination the flat denoiser lacks,
-while keeping breadth-parallel decode. Next data lever (orthogonal): re-baseline on **TinyStories**
-(small-model-coherent) to separate "long-range modelling" from "Shakespeare is hard, low data."
+**Conclusion (as first written — corrected below).** The *one-step* local-interpolator limit is
+**not** a masking-pattern problem (the objective fix is falsified): in a single parallel pass the
+model cannot propagate information across a fully-masked span. As first written this read as "the
+fix has to be *structural* → the tree predictor." **§13.8c corrects that overreach.**
+
+### 13.8c CORRECTION — one-step ≠ generation; iterative decoding bootstraps the local interpolator (2026-06-19)
+The §13.8a/b probes measure **one-step** recovery (fill a masked span in a single forward pass).
+**Generation does not work that way.** Both our Ch30 sampler and tiny-diffusion use **confidence-based
+iterative decoding**: commit the few high-confidence tokens, which then become *visible neighbours*,
+and refine again — progressively turning a contiguous gap into a scattered one the local interpolator
+*can* fill. So coherent generation does **not** require one-step long-range modelling; it can emerge
+from **progressive local filling**.
+
+The decisive evidence is **tiny-diffusion's masking** (`D:/Craig/tiny-diffusion/diffusion.py`):
+`mask_probs = rand(B,1); mask = rand(B,T) < mask_probs` — i.e. **independent per-token Bernoulli,
+SCATTERED**, the *same family as ours* (we use exact `round(t·T)` scattered + 1/t weighting; tiny uses
+Bernoulli + plain masked-CE). So tiny-diffusion is **also** a scattered-trained "local interpolator" by
+the §13.8a definition — yet it produces coherent Shakespeare via iterative confidence decoding. ⇒ the
+differentiator between our loose output and tiny's coherence is **not** the masking or the "flat
+architecture"; it is **recipe**: char-level + capacity (10.7M) + context (block 256) + training (10k
+steps). Flat scattered diffusion *does* generate coherently with the right recipe — corroborated at
+scale by DiffusionGemma-26B.
+
+**Revised conclusion.** The flat parallel denoiser is one-step short-range, but iterative decoding
+makes it a working generator; coherence is **recipe-bound, not architecture-bound**. So the tree
+predictor is a *possible novel improvement, not a required fix* — **PARKED** pending (i) the TinyStories
+recipe re-baseline (does coherence appear on simple data at our scale?) and (ii) research into how
+DiffusionGemma / LLaDA / MDLM / block-diffusion actually train for long range. See
+[`chapters/ch32_tree_predictor`](chapters/ch32_tree_predictor/README.md) (parked-status header).
