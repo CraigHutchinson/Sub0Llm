@@ -708,3 +708,51 @@ same tokenizer/dims/corpus, swap the objective, and word-validity returns. (Cave
 | emits non-words? | rare (1-char blemish) | **pervasive** | **never** | rare (mostly invented names) |
 | grammar | emerging | n/a (salad) | emerging | emerging |
 | why | atoms are chars | fragments mis-coordinate under parallel denoise | atoms are words | left-context coordinates fragments |
+
+### 13.8 Is the parallel denoiser actually working? — it's a short-range LOCAL INTERPOLATOR, and the objective can't fix it (2026-06-19)
+With tokenization settled (§13.6–§13.7), we asked the deeper question: is our bidirectional /
+parallel masked-diffusion denoiser learning long-range structure at all? Two char-level
+experiments (un-confounded by BPE) answer it decisively.
+
+**(a) Recall probe on the scattered-trained char model** (`/d/tmp/ch29_char` step 6300, V=101,
+T=128, 200 windows; `sub0diff-recall-probe`). At equal mask fractions, recall depends entirely
+on whether masked positions have *visible immediate neighbours*:
+
+| scenario | masked | recall |
+|---|---|---|
+| single token | 0.8% | 68.0% |
+| scatter 25% (train-dist) | 25% | 61.7% |
+| scatter 50% | 50% | **44.5%** |
+| continuation give-75% | 25% | 16.5% |
+| continuation give-25% | 75% | 16.1% |
+| middle gap 50% | 50% | **17.1%** |
+| 2 anchors (ends only) | 98% | 16.0% |
+
+Two smoking guns: (i) identical 50% mask → scattered **44.5%** vs contiguous-middle **17.1%**
+(2.6×; only difference = visible neighbours); (ii) contiguous recall is **flat ~16% regardless
+of how much context is given** (give-75% 16.5% ≈ give-25% 16.1% ≈ 98%-masked 16.0%) ⇒ distant
+context is **ignored**. So the denoiser *is* genuinely bidirectional but **only short-range** —
+it interpolates a masked token from immediate neighbours and does **not** model long-range
+structure. This is exactly why free generation is loose: generating a fresh canvas = the
+98%-masked regime = the ~16% local-statistics floor.
+
+**(b) Can the training OBJECTIVE fix it? — NO (un-confounds §13.5).** Trained an otherwise
+identical char model with `--contiguous` (mask a span, not scattered points), so it is *forced*
+to learn span-filling. NELBO plateaued almost immediately (~3.18 by step 2100; the scattered
+model was already at 2.10 and still falling). Its recall probe **collapsed to the unigram floor
+everywhere** — single 18%, scatter-50% 15.5%, every contiguous scenario ~15.7%, 2-anchors 15.7%
+— i.e. it did **not** raise contiguous recall *and* destroyed scattered recall (44–68% → ~15.5%).
+Mechanism: a contiguous span's **interior** positions have *no* visible neighbours, so the
+single-pass parallel prediction has nothing to interpolate from and falls back to the unigram
+prior; there is no way to propagate distant information across a fully-masked span in one
+parallel pass. (This reproduces the §13.5 BPE result at char level — the objective-mismatch
+"fix" is now **falsified at both BPE and char level**.)
+
+**Conclusion → motivates Ch32.** The local-interpolator limit is **not** a data, capacity, or
+masking-pattern problem — it is the **flat parallel architecture**: one parallel denoising pass
+provides no scaffold to coordinate positions across a masked span. The fix has to be
+*structural*. This is the direct motivation for the **tree predictor**
+([`chapters/ch32_tree_predictor`](chapters/ch32_tree_predictor/README.md)): a parent node
+conditions its children, supplying exactly the cross-span coordination the flat denoiser lacks,
+while keeping breadth-parallel decode. Next data lever (orthogonal): re-baseline on **TinyStories**
+(small-model-coherent) to separate "long-range modelling" from "Shakespeare is hard, low data."
