@@ -205,6 +205,16 @@ __global__ void embed_bwd_f32_kernel(const float* __restrict__ g_out, const int*
     atomicAdd(&g_w[static_cast<std::size_t>(idx[i]) * D + j], g_out[static_cast<std::size_t>(i) * D + j]);
 }
 
+// Embedding forward (gather): out[i,:] = weight[idx[i],:]. One thread per output element. The
+// caller validates idx ∈ [0,V) on the host before launching (matches the CPU gather).
+__global__ void embed_fwd_f32_kernel(const float* __restrict__ weight, const int* __restrict__ idx,
+                                     float* __restrict__ out, int N, int D) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N * D) return;
+    const int i = t / D, j = t % D;
+    out[t] = weight[static_cast<std::size_t>(idx[i]) * D + j];
+}
+
 // Scalar multiply (elementwise): out[i] = in[i] * alpha. Matches backend::cpu::mul_scalar_f32 —
 // the primitive behind autograd::scale (forward y=α·x and backward g↦α·g).
 __global__ void mul_scalar_f32_kernel(const float* __restrict__ in, float alpha,
@@ -312,6 +322,34 @@ __global__ void matmul_tb_f32_kernel(const float* A, const float* B, float* C,
         __syncthreads();
     }
     if (k < K && n < N) C[static_cast<std::size_t>(k) * N + n] = acc;
+}
+
+// Transposed-second-operand matmul: C = A·Bᵀ. A(M,K) and B(N,K) row-major, C(M,N). Contraction
+// over K (the trailing dim of both). out[m,n] = Σ_k A[m,k]·B[n,k] — matmul's input-gradient
+// (dL/dA = g·B) and attention scores (q·kᵀ). Matches backend::cpu::matmul_bt_f32. The right tile
+// reads B transposed (B[n·K + k]).
+__global__ void matmul_bt_f32_kernel(const float* A, const float* B, float* C,
+                                     int M, int N, int K) {
+    __shared__ float sA[TILE][TILE];   // sA[ty][tx] = A[m][k]
+    __shared__ float sB[TILE][TILE];   // sB[ty][tx] = Bᵀ[k][n] = B[n][k]
+
+    const int m = blockIdx.y * TILE + threadIdx.y;   // output row
+    const int n = blockIdx.x * TILE + threadIdx.x;   // output col
+
+    float acc = 0.0f;
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        const int kA = t * TILE + threadIdx.x;
+        sA[threadIdx.y][threadIdx.x] = (m < M && kA < K)
+            ? A[static_cast<std::size_t>(m) * K + kA] : 0.0f;
+        const int kB = t * TILE + threadIdx.y;       // contraction index for the Bᵀ tile
+        sB[threadIdx.y][threadIdx.x] = (n < N && kB < K)
+            ? B[static_cast<std::size_t>(n) * K + kB] : 0.0f;
+        __syncthreads();
+
+        for (int i = 0; i < TILE; ++i) acc += sA[threadIdx.y][i] * sB[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (m < M && n < N) C[static_cast<std::size_t>(m) * N + n] = acc;
 }
 
 inline int grid(std::size_t n, int block) {
@@ -914,6 +952,10 @@ void launch_embed_bwd_f32(const float* g_out, const int* idx, float* g_w, int N,
     embed_bwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * D, BLOCK), BLOCK>>>(g_out, idx, g_w, N, D);
 }
 
+void launch_embed_fwd_f32(const float* weight, const int* idx, float* out, int N, int D) {
+    embed_fwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * D, BLOCK), BLOCK>>>(weight, idx, out, N, D);
+}
+
 void launch_mul_scalar_f32(const float* in, float alpha, float* out, std::size_t n) {
     mul_scalar_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(in, alpha, out, static_cast<int>(n));
 }
@@ -943,6 +985,14 @@ void launch_matmul_tb_f32(const float* A, const float* B, float* C,
     const dim3 block(TILE, TILE);
     const dim3 grid2(grid(N, TILE), grid(K, TILE));   // output is (K, N)
     matmul_tb_f32_kernel<<<grid2, block>>>(A, B, C,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+}
+
+void launch_matmul_bt_f32(const float* A, const float* B, float* C,
+                          std::size_t M, std::size_t N, std::size_t K) {
+    const dim3 block(TILE, TILE);
+    const dim3 grid2(grid(N, TILE), grid(M, TILE));   // output is (M, N)
+    matmul_bt_f32_kernel<<<grid2, block>>>(A, B, C,
         static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
 }
 

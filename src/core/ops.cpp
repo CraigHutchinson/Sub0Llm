@@ -339,9 +339,8 @@ Tensor matmul_bt(const Tensor& a, const Tensor& b) {
         std::format("matmul_bt: inner dims must match, got A(.,{}) vs B(.,{})", K, K2));
     require_f32(a, "matmul_bt");
 
-    // The fused row-major A·Bᵀ kernel is CPU-only; other devices take the generic path.
-    if (!a.device().is_cpu())
-        return matmul(a, b.transpose(0, 1).contiguous());
+    if (a.device().is_cuda())
+        return backend::cuda::matmul_bt(a.contiguous(), b.contiguous());
 
     const Tensor ac = a.contiguous();
     const Tensor bc = b.contiguous();

@@ -277,6 +277,25 @@ TEST_CASE("matmul_tb - CUDA matches CPU reference", "[backends][cuda][device]") 
 #endif
 }
 
+// Stage 4 Phase 7 (step 3): ops::matmul_bt (C = A·Bᵀ, matmul's input-gradient + attention scores)
+// must dispatch to CUDA and match the CPU reference. Non-tile-multiple dims for tail coverage.
+TEST_CASE("matmul_bt - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t M = 70, K = 34, N = 50;   // A(M,K), B(N,K) → C(M,N)
+    Tensor a = randn({M, K});
+    Tensor b = randn({N, K});
+
+    const Tensor c_cpu = matmul_bt(a, b);
+    const Tensor c_gpu = matmul_bt(a.to(Device::cuda()), b.to(Device::cuda())).to(Device::cpu());
+
+    REQUIRE(c_cpu.shape() == Tensor::Shape{M, N});
+    REQUIRE(c_gpu.shape() == c_cpu.shape());
+    REQUIRE(rel_rms(c_gpu, c_cpu) < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA matmul_bt parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 5: silu forward (ops::silu dispatch) and backward kernel must match CPU. The CPU
 // SIMD path uses a fast-sigmoid approximation vs the GPU's expf, so the tolerance is looser than
 // the exact ops.

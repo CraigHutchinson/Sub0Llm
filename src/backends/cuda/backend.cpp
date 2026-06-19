@@ -216,6 +216,15 @@ void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D) {
 #endif
 }
 
+void embed_fwd(const float* weight, const int* idx, float* out, int N, int D) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_embed_fwd_f32(weight, idx, out, N, D);
+#else
+    (void)weight; (void)idx; (void)out; (void)N; (void)D;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 Tensor mul_scalar(const Tensor& a, float alpha) {
 #ifdef SUB0LLM_CUDA
     Tensor out(a.shape(), a.dtype(), a.device());
@@ -275,6 +284,24 @@ Tensor matmul_tb(const Tensor& a, const Tensor& b) {
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
     kernels::launch_matmul_tb_f32(
+        reinterpret_cast<const float*>(a.raw_ptr()),
+        reinterpret_cast<const float*>(b.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()), M, N, K);
+    return out;
+#else
+    (void)a; (void)b;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+Tensor matmul_bt(const Tensor& a, const Tensor& b) {
+#ifdef SUB0LLM_CUDA
+    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(N,K) → C(M,N)
+    const auto K = static_cast<std::size_t>(a.shape(1));
+    const auto N = static_cast<std::size_t>(b.shape(0));
+    Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
+               DType::Float32, a.device());
+    kernels::launch_matmul_bt_f32(
         reinterpret_cast<const float*>(a.raw_ptr()),
         reinterpret_cast<const float*>(b.raw_ptr()),
         reinterpret_cast<float*>(out.raw_ptr()), M, N, K);

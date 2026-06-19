@@ -28,6 +28,8 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // C = Aᵀ·B for 2D A(M,K), B(M,N) → C(K,N). The weight-gradient op; caller (ops::matmul_tb)
 // validates shapes. Device-resident in/out.
 [[nodiscard]] Tensor matmul_tb(const Tensor& a, const Tensor& b);
+// C = A·Bᵀ for 2D A(M,K), B(N,K) → C(M,N). matmul's input-gradient + attention scores.
+[[nodiscard]] Tensor matmul_bt(const Tensor& a, const Tensor& b);
 // Row-wise softmax (dim=-1) on a device-resident 1D/2D f32 tensor. The caller (ops::softmax)
 // validates shape/dtype; this allocates the device output and launches the kernel.
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim);
@@ -50,6 +52,8 @@ void rope_bwd(const float* g, const float* cos, const float* sin, float* gx, int
 [[nodiscard]] Tensor silu(const Tensor& a);
 void silu_bwd(const float* grad_out, const float* x, float* grad_in, int n);
 void embed_bwd(const float* g_out, const int* idx, float* g_w, int N, int D);
+// Embedding forward gather: out[i,:] = weight[idx[i],:] (device pointers). Caller checks bounds.
+void embed_fwd(const float* weight, const int* idx, float* out, int N, int D);
 // Scalar multiply out = a*alpha on a device tensor (autograd::scale fwd+bwd primitive).
 [[nodiscard]] Tensor mul_scalar(const Tensor& a, float alpha);
 

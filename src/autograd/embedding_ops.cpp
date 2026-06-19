@@ -49,19 +49,29 @@ Variable embedding_lookup(const Variable& weight, const Tensor& indices) {
     const auto D = static_cast<std::size_t>(wd.shape()[1]);
     const auto N = static_cast<std::size_t>(indices.numel());
 
-    // Forward: gather rows.
+    // Forward: gather rows. Indices are host-resident (token ids); validate bounds on the host,
+    // then gather on the weight's device.
     Tensor out_flat = zeros({static_cast<int64_t>(N), static_cast<int64_t>(D)},
                             DType::Float32, wd.device());
-    const auto ws  = wd.data_as<float>();
-    auto       os  = out_flat.data_as<float>();
     const auto idx = indices.data_as<int32_t>();
-
-    for (std::size_t i = 0; i < N; ++i) {
-        const auto tok = static_cast<std::size_t>(idx[i]);
-        if (tok >= V)
+    for (std::size_t i = 0; i < N; ++i)
+        if (static_cast<std::size_t>(idx[i]) >= V)
             throw std::runtime_error(std::format(
-                "autograd::embedding_lookup: index {} out of vocab [0,{})", tok, V));
-        std::memcpy(os.data() + i * D, ws.data() + tok * D, D * sizeof(float));
+                "autograd::embedding_lookup: index {} out of vocab [0,{})", idx[i], V));
+
+    if (wd.device().is_cuda()) {
+        const Tensor idx_dev = indices.to(wd.device());
+        backend::cuda::embed_fwd(
+            reinterpret_cast<const float*>(wd.raw_ptr()),
+            reinterpret_cast<const int*>(idx_dev.raw_ptr()),
+            reinterpret_cast<float*>(out_flat.raw_ptr()),
+            static_cast<int>(N), static_cast<int>(D));
+    } else {
+        const auto ws = wd.data_as<float>();
+        auto       os = out_flat.data_as<float>();
+        for (std::size_t i = 0; i < N; ++i)
+            std::memcpy(os.data() + i * D,
+                        ws.data() + static_cast<std::size_t>(idx[i]) * D, D * sizeof(float));
     }
 
     // Reshape to match indices shape + D.

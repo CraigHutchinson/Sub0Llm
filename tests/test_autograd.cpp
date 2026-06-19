@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "sub0llm/autograd/ops.hpp"
+#include "sub0llm/autograd/embedding_ops.hpp"   // embedding fwd+bwd on CUDA (Stage 4 Phase 7)
 #include "sub0llm/autograd/variable.hpp"
 #include "sub0llm/core/ops.hpp"
 #include "backends/cuda/backend.hpp"   // rope_bwd kernel parity (Stage 4 Phase 4)
@@ -752,5 +753,75 @@ TEST_CASE("weighted_cross_entropy fwd+bwd match CPU on CUDA", "[autograd][device
 #else
     REQUIRE(loss_cpu.data().numel() == 1);
     REQUIRE(grad_cpu.numel() == N * C);
+#endif
+}
+
+// Stage 4 Phase 7 (step 3): matmul fwd+bwd on CUDA. Backward exercises matmul_bt (dL/dA) AND
+// matmul_tb (dL/dB) plus on-device grad accumulation — the full matmul autograd path.
+TEST_CASE("matmul forward+backward on CUDA matches CPU", "[autograd][device]") {
+    const int64_t M = 5, K = 7, N = 4;
+    std::vector<float> av(static_cast<std::size_t>(M * K)), bv(static_cast<std::size_t>(K * N));
+    for (std::size_t i = 0; i < av.size(); ++i) av[i] = 0.2f * static_cast<float>(i) - 0.7f;
+    for (std::size_t i = 0; i < bv.size(); ++i) bv[i] = 0.15f * static_cast<float>(i) - 0.5f;
+    Tensor up({M, N}, DType::Float32);
+    { auto u = up.data_as<float>(); for (std::size_t i = 0; i < u.size(); ++i) u[i] = 0.1f * static_cast<float>(i) + 0.2f; }
+
+    auto a_cpu = leaf2d(av, M, K, /*rg=*/true);
+    auto b_cpu = leaf2d(bv, K, N, /*rg=*/true);
+    Variable y_cpu = matmul(a_cpu, b_cpu);
+    y_cpu.backward(copy(up));
+    const Tensor ga_cpu = a_cpu.grad(), gb_cpu = b_cpu.grad();
+#ifdef SUB0LLM_CUDA
+    auto a_g = leaf2d(av, M, K, /*rg=*/true);  a_g.to(Device::cuda());
+    auto b_g = leaf2d(bv, K, N, /*rg=*/true);  b_g.to(Device::cuda());
+    Variable y_g = matmul(a_g, b_g);
+    REQUIRE(y_g.data().device().is_cuda());
+    y_g.backward(up.to(Device::cuda()));
+
+    const Tensor yb = y_g.data().to(Device::cpu());
+    const auto yc = y_cpu.data().data_as<float>();  const auto ybs = yb.data_as<float>();
+    for (int64_t i = 0; i < M * N; ++i) REQUIRE_THAT(ybs[static_cast<std::size_t>(i)], WithinAbs(yc[static_cast<std::size_t>(i)], 1e-3f));
+    const Tensor ga = a_g.grad().to(Device::cpu()), gb = b_g.grad().to(Device::cpu());
+    const auto gac = ga_cpu.data_as<float>(); const auto gas = ga.data_as<float>();
+    for (int64_t i = 0; i < M * K; ++i) REQUIRE_THAT(gas[static_cast<std::size_t>(i)], WithinAbs(gac[static_cast<std::size_t>(i)], 1e-3f));
+    const auto gbc = gb_cpu.data_as<float>(); const auto gbs = gb.data_as<float>();
+    for (int64_t i = 0; i < K * N; ++i) REQUIRE_THAT(gbs[static_cast<std::size_t>(i)], WithinAbs(gbc[static_cast<std::size_t>(i)], 1e-3f));
+#else
+    REQUIRE(ga_cpu.numel() == M * K);
+    REQUIRE(gb_cpu.numel() == K * N);
+#endif
+}
+
+// Stage 4 Phase 7 (step 3): embedding fwd (gather kernel) + bwd (scatter) on CUDA, end-to-end.
+// Repeated indices (N>... ) exercise the backward scatter accumulation.
+TEST_CASE("embedding forward+backward on CUDA matches CPU", "[autograd][device]") {
+    const int64_t V = 12, D = 8, N = 6;
+    std::vector<float> wv(static_cast<std::size_t>(V * D));
+    for (std::size_t i = 0; i < wv.size(); ++i) wv[i] = 0.1f * static_cast<float>(i) - 0.6f;
+    Tensor idx({N}, DType::Int32);
+    { auto ip = idx.data_as<int32_t>();
+      const int32_t toks[N] = {0, 5, 5, 11, 2, 5};   // repeats on row 5
+      for (int64_t i = 0; i < N; ++i) ip[static_cast<std::size_t>(i)] = toks[i]; }
+    Tensor up({N, D}, DType::Float32);
+    { auto u = up.data_as<float>(); for (std::size_t i = 0; i < u.size(); ++i) u[i] = 0.07f * static_cast<float>(i) + 0.1f; }
+
+    auto w_cpu = leaf2d(wv, V, D, /*rg=*/true);
+    Variable e_cpu = embedding_lookup(w_cpu, idx);
+    e_cpu.backward(copy(up));
+    const Tensor gw_cpu = w_cpu.grad();
+#ifdef SUB0LLM_CUDA
+    auto w_g = leaf2d(wv, V, D, /*rg=*/true);  w_g.to(Device::cuda());
+    Variable e_g = embedding_lookup(w_g, idx);   // host indices; dispatch moves them
+    REQUIRE(e_g.data().device().is_cuda());
+    const Tensor eb = e_g.data().to(Device::cpu());
+    const auto ec = e_cpu.data().data_as<float>();  const auto ebs = eb.data_as<float>();
+    for (int64_t i = 0; i < N * D; ++i) REQUIRE_THAT(ebs[static_cast<std::size_t>(i)], WithinAbs(ec[static_cast<std::size_t>(i)], 1e-5f));
+
+    e_g.backward(up.to(Device::cuda()));
+    const Tensor gw = w_g.grad().to(Device::cpu());
+    const auto gc = gw_cpu.data_as<float>();  const auto gg = gw.data_as<float>();
+    for (int64_t i = 0; i < V * D; ++i) REQUIRE_THAT(gg[static_cast<std::size_t>(i)], WithinAbs(gc[static_cast<std::size_t>(i)], 1e-4f));
+#else
+    REQUIRE(gw_cpu.numel() == V * D);
 #endif
 }
