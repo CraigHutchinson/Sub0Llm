@@ -606,3 +606,25 @@ independent angle** (§13.3 said data limits coherence; this shows even a *direc
 buy generation at this scale). Path to real generation = more DATA + CAPACITY (learnable long-range
 structure), not a masking-pattern change. [Supersedes §13.4's "fixable objective" framing.] The
 `--contiguous` flag + the recall probe remain as validated tools to re-test once data/capacity grow.
+
+### 13.6 CORRECTION — the missed lever is TOKENIZATION (char-level), not the data ceiling (2026-06-19)
+A trusted control overturns §13.3–13.5's "data/capacity ceiling" conclusion. Ran **tiny-diffusion**
+(nathan-barry/tiny-diffusion: char-level, 10.7M, block 256, the SAME 5 diffusion changes we have, a
+SIMPLER objective — plain masked-CE, no 1/t, no curriculum, no exact-count) on our EXACT
+`data/complete_shakespeare.txt`. By **step 2000 (~11 min)** it produces locally-coherent **real
+English with Shakespeare cadence + verse structure** ("To poor man so for parted, and your say,") —
+where our BPE-512 model produced subword salad on the same corpus.
+
+**Conclusion:** the corpus is learnable; **BPE-512 was the crippling choice.** BPE forces subword
+emission — a wrong subword is a non-word (`hTee`,`Cirj`) so it degrades to garbage; char-level (vocab
+~66) degrades GRACEFULLY to plausible letter sequences → real words, and gives ~5.6M chars of signal
+vs ~2M BPE tokens. So §13.3 (data limits coherence), §13.4 (local interpolator), and §13.5 (contiguous
+A/B "data-bound") were all run on BPE-512 and are **confounded by the tokenizer** — they describe what
+BPE-512 can/can't learn here, NOT a fundamental data/mechanism limit. The word-salad was representation,
+not data quantity or the diffusion objective.
+
+**Other contributing diffs (secondary to char-level):** block_size 256 (4× our 64 → more context),
+10.7M params (~2× our founded 6M), head_dim 64 + d_ff 4·D. **Actionable:** add CHAR-LEVEL tokenization
+to ch29 (the primary lever) + longer context, then RE-RUN the recall probe / contiguous A/B on a
+char-level model before trusting the §13.4–13.5 findings. Also still-owed: the plain AR-GPT baseline on
+complete_shakespeare (never run). [Supersedes the §13.3–13.5 "data ceiling" framing.]
