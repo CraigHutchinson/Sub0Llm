@@ -36,7 +36,14 @@ namespace sub0diff::nn {
 struct SamplerConfig {
     float conf_threshold = 0.9f;   // commit positions with max-prob ≥ this
     float entropy_bound  = 0.1f;   // mean masked entropy below this → commit all & stop
-    float min_commit_frac = 0.10f; // progress guarantee: ≥ this fraction of masked/iter
+    // Progress guarantee: commit ≥ this fraction of the still-masked positions each iter,
+    // even if none clear conf_threshold. KEEP THIS SMALL. At 0.10 the EARLY all-masked steps
+    // force-commit ~10% of the canvas from near-unigram statistics (the model has no context
+    // yet), seeding garbage the bootstrap can't recover (measured: coherent prose → char-salad
+    // on the SAME model). 0.03 ≈ a handful of the most-confident positions per iter — matches
+    // tiny-diffusion's conservative "commit the confident few, or at least 1" and recovers the
+    // model's real quality. Lower (0.01) = cleaner but ~3× the iterations; --min-commit overrides.
+    float min_commit_frac = 0.03f;
     float temperature    = 1.0f;   // 0 = greedy argmax; >0 = sample from softmax
     std::size_t max_iters = 0;     // 0 = canvas length (one-per-iter worst case)
 

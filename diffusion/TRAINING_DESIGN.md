@@ -777,3 +777,27 @@ predictor is a *possible novel improvement, not a required fix* — **PARKED** p
 recipe re-baseline (does coherence appear on simple data at our scale?) and (ii) research into how
 DiffusionGemma / LLaDA / MDLM / block-diffusion actually train for long range. See
 [`chapters/ch32_tree_predictor`](chapters/ch32_tree_predictor/README.md) (parked-status header).
+
+### 13.8d The "loose generation" was largely a DECODE-DEFAULT BUG — `min_commit_frac` (2026-06-20)
+The TinyStories recipe re-baseline (§13.8c plan) delivered the sharpest result yet. The char model
+trained well (held-out NELBO 1.28 by step 10k, well below Shakespeare's 1.87) but **generated
+char-salad** at the default sampler — *"Once upon a time, there whe a birty it you have i in"*. Raising
+`conf_threshold` (0.90→0.95→0.98) changed **nothing** (byte-identical, same 29 iterations), which ruled
+out over-eager confidence and pointed at the **progress floor**: `min_commit_frac = 0.10` commits ≥10%
+of the still-masked canvas *every iteration regardless of confidence*. In the **early all-masked steps**
+the model has almost no context, so that floor force-commits ~12 chars from near-unigram statistics —
+garbage that anchors more garbage, and the iterative bootstrap never recovers.
+
+Dropping the floor (`--min-commit 0.01`, conservative like tiny-diffusion's "commit the confident few,
+or at least 1") on the **same checkpoint** flips it to coherent prose:
+> *"Once upon a time, there was a big hole. She had a little girl named Sue… Anna said,"*
+> *"Tom and the dog saw a big tree… named Spot loved to play with his mom and d[ad]"*
+
+The Shakespeare char model jumps the same way (*"come … you to your mother with her … not the leave"*).
+A sweep set the default: 0.10→29 iters (garbage), 0.05→46, **0.03→58 (coherent, new default)**, 0.01→87
+(cleanest, ~3×). **The model was always this capable; the sampler default was destroying it** — exactly
+the temperature-default bug (§Ch30) in a second guise. ⇒ Across the whole investigation: *salad* =
+tokenization (§13.6–7); *loose grammar / char-garbage* = **decode defaults** (temperature + min_commit),
+**not** data, capacity, objective, or the flat architecture. This is the strongest confirmation of
+§13.8c (coherence is **recipe/decode-bound**) and further vindicates parking the tree predictor. Fix:
+`SamplerConfig::min_commit_frac` default 0.10 → 0.03; `--min-commit` overrides.
