@@ -379,6 +379,61 @@ Tensor matmul_bt(const Tensor& a, const Tensor& b) {
 #endif
 }
 
+#ifdef SUB0LLM_CUDA
+// Batched GEMM helper: loop a 2D launch over the leading-dim slices of contiguous 3D tensors.
+namespace {
+template <class Launch>
+Tensor batched_gemm(const Tensor& a, const Tensor& b, std::int64_t out_rows, std::int64_t out_cols,
+                    std::size_t M, std::size_t N, std::size_t K,
+                    std::size_t a_slice, std::size_t b_slice, Launch launch) {
+    const Tensor ac = a.contiguous();
+    const Tensor bc = b.contiguous();
+    const auto Bn = static_cast<std::size_t>(ac.shape(0));
+    Tensor out(Tensor::Shape{ac.shape(0), out_rows, out_cols}, DType::Float32, ac.device());
+    const std::size_t c_slice = static_cast<std::size_t>(out_rows) * static_cast<std::size_t>(out_cols);
+    const float* pa = reinterpret_cast<const float*>(ac.raw_ptr());
+    const float* pb = reinterpret_cast<const float*>(bc.raw_ptr());
+    float*       pc = reinterpret_cast<float*>(out.raw_ptr());
+    for (std::size_t i = 0; i < Bn; ++i)
+        launch(pa + i * a_slice, pb + i * b_slice, pc + i * c_slice, M, N, K);
+    return out;
+}
+}  // namespace
+#endif
+
+Tensor matmul_batched(const Tensor& a, const Tensor& b) {        // (B,M,K)·(B,K,N)→(B,M,N)
+#ifdef SUB0LLM_CUDA
+    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+    const auto N = static_cast<std::size_t>(b.shape(2));
+    return batched_gemm(a, b, a.shape(1), b.shape(2), M, N, K, M * K, K * N,
+                        kernels::launch_matmul_f32);
+#else
+    (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+Tensor matmul_bt_batched(const Tensor& a, const Tensor& b) {     // (B,M,K)·(B,N,K)→(B,M,N)
+#ifdef SUB0LLM_CUDA
+    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+    const auto N = static_cast<std::size_t>(b.shape(1));
+    return batched_gemm(a, b, a.shape(1), b.shape(1), M, N, K, M * K, N * K,
+                        kernels::launch_matmul_bt_f32);
+#else
+    (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+Tensor matmul_tb_batched(const Tensor& a, const Tensor& b) {     // (B,M,K)·(B,M,N)→(B,K,N)
+#ifdef SUB0LLM_CUDA
+    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
+    const auto N = static_cast<std::size_t>(b.shape(2));
+    return batched_gemm(a, b, a.shape(2), b.shape(2), M, N, K, M * K, M * N,
+                        kernels::launch_matmul_tb_f32);
+#else
+    (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 double softmax_rows_bench(const float* host_in, float* host_out, int rows, int cols, int reps) {
 #ifdef SUB0LLM_CUDA
     auto ck = [](cudaError_t e, const char* what) {

@@ -197,6 +197,42 @@ TEST_CASE("Denoiser end-to-end training step on CUDA reduces loss", "[diffusion]
 #endif
 }
 
+// Stage 4 Phase 7: the BATCHED training step (the ch29 path — block-diagonal attention over B
+// windows via 3D batched matmul) also runs end-to-end on CUDA and reduces the loss.
+TEST_CASE("Denoiser BATCHED training step on CUDA reduces loss", "[diffusion][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const std::int64_t V = 16, D = 32, T = 8, B = 4;
+    dn::Denoiser model(V, D, /*n_heads=*/2, /*n_kv_heads=*/2, /*n_layers=*/1, /*d_ff=*/64, /*seed=*/5);
+    model.to(sub0llm::Device::cuda());
+    auto params = model.parameters();
+    REQUIRE(params[0]->data().device().is_cuda());
+    sub0llm::nn::Adam opt(params, 5e-2f);
+
+    const auto stream = ramp_tokens(static_cast<std::size_t>(B * T), V);
+    std::vector<std::size_t> offsets(static_cast<std::size_t>(B));
+    for (std::int64_t b = 0; b < B; ++b) offsets[static_cast<std::size_t>(b)] = static_cast<std::size_t>(b * T);
+    dt::BatchedDiffusionLossContext ctx(B, T);
+
+    auto loss_now = [&]() {
+        std::mt19937 rng(11);
+        return dt::batched_diffusion_loss(model, stream, offsets, rng, ctx, 0.3f, 0.7f)
+                   .loss.data().to(sub0llm::Device::cpu()).item<float>();
+    };
+    const float before = loss_now();
+    for (int i = 0; i < 8; ++i) {
+        std::mt19937 rng(11);
+        auto res = dt::batched_diffusion_loss(model, stream, offsets, rng, ctx, 0.3f, 0.7f);
+        opt.zero_grad();
+        res.loss.backward();
+        opt.step();
+    }
+    const float after = loss_now();
+    REQUIRE(after < before);                           // batched fwd+bwd+update on GPU reduces the loss
+#else
+    SUCCEED("CPU build - CUDA batched training step is exercised on the cuda preset");
+#endif
+}
+
 TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diffusion]") {
     dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/9);
     const auto clean = ramp_tokens(24, 16);

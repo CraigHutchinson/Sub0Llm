@@ -30,6 +30,12 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 [[nodiscard]] Tensor matmul_tb(const Tensor& a, const Tensor& b);
 // C = A·Bᵀ for 2D A(M,K), B(N,K) → C(M,N). matmul's input-gradient + attention scores.
 [[nodiscard]] Tensor matmul_bt(const Tensor& a, const Tensor& b);
+
+// Batched (3D) variants for multi-head attention: one 2D GEMM per leading-dim slice (loops the
+// validated 2D kernels — small B, launch overhead amortised by the per-head work).
+[[nodiscard]] Tensor matmul_batched(const Tensor& a, const Tensor& b);     // (B,M,K)·(B,K,N)→(B,M,N)
+[[nodiscard]] Tensor matmul_bt_batched(const Tensor& a, const Tensor& b);  // (B,M,K)·(B,N,K)→(B,M,N)
+[[nodiscard]] Tensor matmul_tb_batched(const Tensor& a, const Tensor& b);  // (B,M,K)·(B,M,N)→(B,K,N)
 // Row-wise softmax (dim=-1) on a device-resident 1D/2D f32 tensor. The caller (ops::softmax)
 // validates shape/dtype; this allocates the device output and launches the kernel.
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim);

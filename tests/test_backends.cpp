@@ -303,6 +303,27 @@ TEST_CASE("adam step - CUDA matches CPU reference", "[backends][cuda][device]") 
 #endif
 }
 
+// Stage 4 Phase 7: batched (3D) matmul / matmul_bt / matmul_tb on CUDA (multi-head attention)
+// must match the CPU reference — dispatched per-slice to the validated 2D kernels.
+TEST_CASE("batched matmul - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t Bn = 3, M = 5, K = 7, N = 4;   // non-tile-multiple dims, B>1
+    Tensor a  = randn({Bn, M, K});
+    Tensor bk = randn({Bn, K, N});               // for matmul:    (B,M,K)·(B,K,N)→(B,M,N)
+    Tensor bn = randn({Bn, N, K});               // for matmul_bt: (B,M,K)·(B,N,K)→(B,M,N)
+    Tensor bm = randn({Bn, M, N});               // for matmul_tb: (B,M,K)·(B,M,N)→(B,K,N)
+
+    REQUIRE(rel_rms(matmul(a.to(Device::cuda()), bk.to(Device::cuda())).to(Device::cpu()),
+                    matmul(a, bk)) < 1e-4);
+    REQUIRE(rel_rms(matmul_bt(a.to(Device::cuda()), bn.to(Device::cuda())).to(Device::cpu()),
+                    matmul_bt(a, bn)) < 1e-4);
+    REQUIRE(rel_rms(matmul_tb(a.to(Device::cuda()), bm.to(Device::cuda())).to(Device::cpu()),
+                    matmul_tb(a, bm)) < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA batched matmul parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 2: the CUDA rms_norm training kernels (fwd, bwd_x, bwd_w) must match the CPU
 // reference. Kernel-level parity (H2D via Tensor::to → launch → D2H), gated on the CUDA build.
 TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cuda][device]") {

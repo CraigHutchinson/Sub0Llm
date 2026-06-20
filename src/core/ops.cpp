@@ -253,6 +253,14 @@ Tensor matmul_batched_impl(const Tensor& a, const Tensor& b, const char* name,
                            std::size_t M, std::size_t N, std::size_t K,
                            std::size_t a_slice, std::size_t b_slice, Kernel kern) {
     require_f32(a, name);
+    // Stage 4 Phase 7: batched (3D) GEMM on CUDA dispatches per-slice to the validated 2D kernels.
+    if (a.device().is_cuda()) {
+        const std::string_view nm(name);
+        if (nm == "matmul")    return backend::cuda::matmul_batched(a, b);
+        if (nm == "matmul_bt") return backend::cuda::matmul_bt_batched(a, b);
+        if (nm == "matmul_tb") return backend::cuda::matmul_tb_batched(a, b);
+        throw std::runtime_error(std::format("{}: batched CUDA matmul not implemented", name));
+    }
     require_cpu(a, name);
     require_cpu(b, name);
     const Tensor ac = a.contiguous();
