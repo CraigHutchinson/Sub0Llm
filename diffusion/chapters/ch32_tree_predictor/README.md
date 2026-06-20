@@ -1,237 +1,108 @@
-# Chapter 32 — Tree Predictor: Hierarchical / Structural Generation (DESIGN)
+# Chapter 32 — Unified Multi-Resolution Language (DESIGN)
 
-> **Status: PARKED (design skeleton, not implemented).** Proposes a *third* generation
-> paradigm alongside autoregression (Ch08) and masked diffusion (Ch28–31), motivated by the
-> local-interpolator finding in [`../../TRAINING_DESIGN.md` §13.8](../../TRAINING_DESIGN.md)
-> (flat parallel denoising provides no cross-span coordination scaffold). Sections marked
-> **[OPEN]** are unresolved; **[PHASE n]** tags sequence an eventual build.
+> **Status: PARKED design vision (not implemented).** This supersedes the earlier
+> "tree predictor / balanced-binary-pyramid" sketch — that was one (weak, syntax-flavoured)
+> expression of a deeper idea. The real idea, distilled from this volume's empirical findings
+> (§13.6–§13.9) and the char-vs-word experiments: **language exists at several coexisting levels
+> of abstraction at once, and a good model should represent all of them in one coherent system.**
+> Sections marked **[OPEN]** are unresolved; **[PHASE n]** sequence an eventual build.
 >
-> **Why parked (2026-06-19):**
-> 1. **Not necessary — flat diffusion demonstrably works at scale.** DiffusionGemma-26B
->    (`[[diffusiongemma-reference-run]]`) is a coherent flat masked-diffusion LM. So our §13.8
->    local-interpolator limit is a property of *our small-scale setup/recipe*, not of flat
->    diffusion per se. The tree is a *possible novel improvement*, not a required fix.
-> 2. **Research prerequisite.** Before building a novel architecture, find public info on **how
->    DiffusionGemma (and LLaDA / MDLM / block-diffusion) are actually trained** — their recipe
->    (scale, noise schedule, block/semi-AR masking, objective weighting) may already supply the
->    long-range coordination we're missing, far cheaper than a new paradigm. **[RESEARCH TASK]**
-> 3. **The balanced-binary-pyramid prior (§5-A) is theoretically weak for language.** Syntax is
->    *unbalanced* and *n-ary* (a sentence is not a balanced binary tree); a fixed balanced
->    pyramid imposes structure that doesn't match real constituency. This pushes weight toward
->    the §4-B/§4-C (real / induced trees) or §5-C (soft-structure) variants and is itself an
->    argument to validate the *idea* against the literature before committing. **[OPEN — see §4]**
->
-> **Unpark when:** the DiffusionGemma/LLaDA training research is done AND (a) their recipe
-> doesn't already close the §13.8 gap on our setup, and (b) we still judge a structural prior a
-> promising novel lever. Until then this stands as a recorded idea, not active work.
+> **Parked pending** (unchanged): research into how flat text-diffusion (DiffusionGemma, LLaDA,
+> MDLM, block-diffusion) is actually trained — a known recipe may close the long-range gap on our
+> setup far cheaper than new architecture. Don't build before that research. See
+> [[tree-predictor-parked-research-diffusion-training]].
 
 ---
 
-## 1. Motivation — generation *order* is a design axis
+## 1. The observation — three levels coexist, and we've seen all three
 
-Every generator commits tokens in some order. That order is the real design choice:
+We kept finding the "same" model behaving at different granularities. Step back and they are
+**three coexisting levels of linguistic abstraction**, each one we have *empirically produced* in
+this project:
 
-| paradigm | commit order | coordination mechanism | chapter |
+| level | unit | what it carries | what we observed |
 |---|---|---|---|
-| **Autoregressive** | left → right (position) | left context conditions each next token | Ch08 |
-| **Masked diffusion** | high → low confidence | none — positions predicted from independent marginals | Ch28–31 |
-| **Tree predictor** *(this)* | root → leaves (structure) | the **parent node** conditions its children | — |
+| **A — gist / keyword** | content words | *what happens* — the semantic skeleton | the word model's content spine: *"girl. Want walk. Saw ball. Wanted…"* — coherent above the sentence |
+| **B — prose / word** | whole words | grammar, function words, syntax | word-level: grammatical sentences fast (~step 2k on TinyStories), **but** closed vocab / OOV-blind |
+| **C — surface / sub-token** | chars (→ bytes) | spelling, morphology, **no OOV** | char-level: spells anything, graceful degradation, **but** must *also* learn to spell → slower to grammar |
 
-§13.7 found *why* flat diffusion produces salad: it fills masked positions from their
-**marginals with no left→right (or any) constraint**, so locally-probable pieces fail to
-coordinate into globally-valid units (`con`+`ick`+`ers` → `conickers`). AR avoids this
-because left-context coordinates each next token — but pays a strict sequential bottleneck.
+These are not competing tokenizer choices — they are **layers that are all true at the same time**.
+"Once upon a time, there was a wise girl who wanted to walk" *is* simultaneously a gist (girl,
+walk), a grammatical word sequence, and a character string. The granularity experiments
+(§13.6–§13.9) were really probing **one layer at a time**; the design goal is to hold **all three at
+once**.
 
-**The thesis of this chapter:** language is *hierarchical* (a sentence is a tree of
-phrases, not a flat list), so the natural coordination scaffold is the **tree itself**.
-Generate a sentence by expanding its structure top-down: each parent node supplies the
-shared context its children need, so siblings can be produced **in parallel** (no AR
-bottleneck) **without** the uncoordinated-marginals problem (the parent *is* the
-coordination). Tree generation is "outside-in / coarse-structure-first," a third point
-distinct from AR's "front-to-back" and diffusion's "confident-first."
+## 2. Meaning resolution — the in-vocab / OOV split (the crux)
 
----
+The layers differ in *how a unit acquires meaning*:
 
-## 2. Core idea — generation as recursive expansion
+- **In-vocabulary word → meaning is KNOWN.** It has a learned representation (the word-level
+  efficiency we measured: grammar+semantics learned per-word, no spelling overhead).
+- **Out-of-vocabulary word → meaning is FOUND**, two ways that reinforce each other:
+  1. **Composition (level C ↑):** build the word's representation from its *characters* — morphology
+     generalises ("happily" lands near "happy" it has never seen; cf. CharCNN word embeddings,
+     fastText). This is the answer to "train the character-level relation to a known word meaning."
+  2. **Context / proximity (level B):** the surrounding known words constrain the unknown one — exactly
+     how a human reads a word they've never met.
 
-```
-            [ROOT]                         level 0: one node summarising the whole utterance
-           /      \
-       [Aːsummary] [Bːsummary]            level 1: ROOT expands to 2 child summaries
-        /   \        /    \
-      ...   ...    ...    ...             level k: each node expands to its children
-      |      |      |      |
-     the   king   said   "..."           leaves: the actual tokens (chars or words)
-```
+So **level C is the OOV safety net for level B**, and **level A is the semantic plan that keeps level B
+on topic.** A unified model gets word-level efficiency *without* the closed vocabulary, *and* a coarse
+plan that fights the topic-drift we still see (the wise-girl→"He saw" slips).
 
-- **Top-down.** Start from one root embedding; predict its expansion; recurse until leaves
-  are concrete tokens.
-- **Parallel within a level, conditioned across levels.** All nodes at level *k* are
-  predicted together (bidirectional attention over the level), each conditioned on its
-  parent at level *k−1*. This is the key: **breadth-parallel, depth-sequential.**
-- **The parent is the scaffold.** A child is never predicted from a bare marginal — it is
-  predicted from its parent's summary plus its siblings, which is exactly the coordination
-  flat diffusion lacks.
+## 3. The hard part — ONE coherent expression, not three models
 
----
+The user's framing is the whole challenge: *the layers technically coexist and need a simple coherent
+means to express.* It is easy to bolt three models together; the goal is a **single representation /
+single objective** in which a token simultaneously carries its surface (chars), its lexical identity
+(word), and its semantic role (gist) — and generation can move between resolutions cleanly. The "tree"
+was a clumsy attempt at this; the levels above are the real structure, and they happen to align with
+**tokenization granularity**, which is concrete and buildable (no parser, no syntax labels).
 
-## 3. Prior art (survey — to be expanded)
+## 4. Candidate unifying mechanisms **[OPEN — this is the research]**
 
-- **Recurrent Neural Network Grammars** (Dyer et al. 2016) — joint model of words + phrase
-  structure via shift/reduce actions; explicitly tree-structured but strictly sequential.
-- **Insertion Transformer** (Stern et al. 2019) & **Levenshtein Transformer** (Gu et al.
-  2019) — non-monotonic / edit-based decoding (insert between existing tokens); "outside-in"
-  cousins without an explicit tree.
-- **Tree Transformers / constituency-attention** (Wang et al. 2019; Nguyen et al. 2020) —
-  bias attention toward induced constituents.
-- **Syntactic / latent-tree VAEs** (Yin et al.; Kim et al.) — induce trees as latent
-  variables.
-- **Hourglass / U-Net Transformers & hierarchical diffusion** (Nawrot et al.; multi-scale
-  diffusion) — the *multi-resolution* mechanics we borrow for the pyramid in §5-A.
-- **SUNDAE / step-unrolled denoising, Diffusion-LM** — flat-diffusion baselines to beat.
-- **[OPEN]** position this chapter precisely against insertion-based decoding — our claim is
-  that an explicit **level/parent scaffold** gives stronger coordination than flat insertion.
+- **4-A. Multi-resolution residual stream (hourglass / U-Net).** One network, one residual stream, three
+  resolutions: **chars → pool to words → pool to gist → process → unpool to words → unpool to chars.**
+  Pooling boundaries are induced by whitespace (words) and by content-word/saliency (gist). This is the
+  "simple coherent means": the *same* stack is all three levels at different depths. (Cf. CANINE, ByT5,
+  Charformer, Megabyte/MambaByte, hourglass transformers — char/byte I/O, word-ish processing.)
+- **4-B. Multi-scale per-position embedding.** Each char position's vector = char-emb ⊕ word-emb
+  (lookup if in-vocab, CharCNN-composed if OOV) ⊕ gist-emb (pooled). The model *reads* all three levels
+  at every position; one stream, three views.
+- **4-C. Diffusion across resolutions (fits our engine best).** Keep the masked-diffusion canvas at the
+  **word** level (we measured this is where grammar is learned cheaply), give each word its embedding via
+  **char-composition** (no OOV), and condition the denoiser on a **gist vector** (a pooled content-word
+  plan, itself optionally diffused first). Generation = plan gist → denoise word canvas → spell any OOV
+  words from chars. Reuses our `Denoiser`, char/word tokenizers, and the iterative sampler.
 
----
+## 5. What this volume already proved that grounds each level
 
-## 4. Where does the tree come from? (the central design fork) **[OPEN]**
+- Level C works and is OOV-proof but slow to grammar (char-level, §13.6/§13.8).
+- Level B learns grammar fast but is OOV-blind (word-level TinyStories: grammatical by step ~2k).
+- Subword (B↔C bridge) is *coherent once decoded right* (§13.9) — so the surface/word coupling is not
+  inherently broken; our earlier "salad" was the decode bug, not the representation.
+- Coherence is **recipe/decode-bound**, and the remaining gap everywhere is **semantics / topic drift** —
+  precisely what **level A (gist plan)** is meant to supply.
 
-Three sources, in increasing ambition:
+So the empirical case for this design is: the pieces each work in isolation; the open question is the
+**unifying mechanism** of §4, and whether it beats a well-trained flat subword diffusion model (which we
+must understand first — see parked criteria).
 
-- **A — Induced by construction (no parser).** Impose a *fixed* structural prior: a balanced
-  binary pyramid over the token sequence (§5-A). The "tree" is just multi-resolution; the
-  model learns what each coarse node should mean. **Cheapest, codebase-aligned, recommended
-  for [PHASE 1].**
-- **B — Supervised parses.** Use a constituency/dependency parser to produce gold trees;
-  train the expander to reproduce them. Linguistically grounded, but adds a parser
-  dependency and a Python tool step (against the no-Python-core rule — parser runs in
-  `tools/`, emits trees to disk). **[PHASE 2].**
-- **C — Latent / induced trees.** Learn the tree as a latent variable (grammar induction).
-  Most powerful, hardest to train (discrete latent structure). **[PHASE 3 / research].**
+## 6. Minimal first build (when unparked) **[PHASE 1]**
 
-The pyramid (A) is the pragmatic start: it tests the *mechanism* (does parent-conditioned
-breadth-parallel expansion beat flat diffusion?) without the parser/latent machinery.
+§4-C on our stack: char→word pooling encoder (CNN over a word's chars → word embedding; lookup blended
+in for frequent words), word-level masked-diffusion denoiser (existing block), char upsampling head for
+the loss + OOV output, and a single pooled **gist conditioning vector**. TinyStories first (small vocab,
+known-coherent), compared against the char- and word-level baselines we now have. Go/no-go: does
+char-composition remove the OOV cliff *and* keep word-level's fast grammar, and does the gist vector cut
+topic drift?
 
----
+## 7. Open questions & unpark criteria
 
-## 5. Proposed architectures
-
-### 5-A. Recursive pyramid expansion — **recommended first build [PHASE 1]**
-
-A balanced binary pyramid over a length-`T` canvas (`T` a power of two). Level `k` has
-`2^k` nodes; the leaf level `K = log2(T)` is the token sequence.
-
-**Representations.** Each node holds a `D`-dim embedding. Leaves embed real tokens; internal
-nodes are *summaries*. Build training targets by **pooling**: a parent's target summary is a
-(learned or mean) pool of its two children — so the pyramid is a learned encoder downward
-and a generator upward.
-
-**Training (teacher-forced, all levels at once).**
-1. Encode a real token window → leaf embeddings.
-2. Pool up the pyramid to get every node's "true" summary (the encoder pass).
-3. For each level `k`, run a **transformer over that level's nodes** (bidirectional, with
-   *tree-positional* encodings: depth + index-within-level + parent pointer) conditioned on
-   the parent summaries from level `k−1`, and train it to predict the level-`k` summaries
-   (and, at the leaf level, the actual token logits).
-4. Loss = Σ_levels (summary regression / distillation) + leaf cross-entropy. **[OPEN]**:
-   regress summaries vs. quantize them to a codebook (VQ) so each level is a classification —
-   VQ likely trains more stably and gives a clean "expansion vocabulary."
-
-**Generation (top-down).** Predict ROOT summary from a learned BOS → expand to level 1 →
-… → leaf logits → sample tokens. `K = log2(T)` sequential steps (e.g. **7 for T=128**),
-each fully parallel across its level — far fewer sequential steps than AR's `T`, with a
-real coordination scaffold unlike flat diffusion.
-
-**Why this is the right first cut:** it reuses our `Denoiser` transformer block almost
-verbatim (it's "a transformer over a set of nodes with positional encodings"), needs no
-parser, and isolates the core hypothesis.
-
-### 5-B. Head-first insertion decoder — **linguistic variant [PHASE 2]**
-
-Generate the dependency *heads* (content skeleton) first, then recursively **insert**
-dependents (modifiers, function words) between them, each insertion conditioned on its head.
-Closer to real syntax and to Insertion/Levenshtein Transformers; needs a head ordering
-(source B/C). Stronger linguistic prior, more moving parts.
-
-### 5-C. Soft-structure prior — **fallback if explicit trees underperform [OPEN]**
-
-Keep a flat canvas but add a learned **span/constituent bias** to attention + a coarse-to-fine
-*schedule* (commit head words before modifiers) — captures some hierarchy benefit with
-minimal departure from Ch29. A cheap ablation to attribute gains to "structure" vs "the tree
-machinery."
-
----
-
-## 6. Fit with the existing codebase
-
-**Reuse as-is:** the transformer block & RMSNorm/RoPE/attention (`sub0diff/nn/denoiser.hpp`),
-the char/word tokenizers (Ch03 — leaves are tokens), the raw corpus reader and token cache
-(Ch29), checkpointing (Ch24), and the autograd engine.
-
-**New components (small surface):**
-- `TreePositionalEncoding` — (depth, index-in-level, parent-index) instead of linear position.
-- a **pool-up encoder** (mean or learned/VQ) to build per-level targets.
-- a per-level **expansion head** (parent summary + level transformer → child summaries / leaf
-  logits).
-- a top-down **generation loop** (the analogue of `refine_canvas`).
-
-**Minimal first experiment [PHASE 1]:** `T=128`, char-level, balanced pyramid (`K=7`),
-mean-pool summaries, summary-regression + leaf-CE, on **TinyStories** (see §8). Compare leaf
-perplexity + free-generation coherence head-to-head with the Ch29 char-diffusion baseline at
-matched params.
-
----
-
-## 7. Why it could beat AR and diffusion (hypotheses to test)
-
-- **vs diffusion:** the parent scaffold supplies cross-position coordination, so children
-  shouldn't mis-assemble the way flat marginals do (§13.7). *Prediction:* fewer incoherent
-  local transitions at equal token granularity.
-- **vs AR:** `log2(T)` sequential steps instead of `T`, with structural lookahead (the root
-  "plans" before leaves commit). *Prediction:* faster decode, more globally-consistent long
-  outputs.
-- **Predicted failure modes [OPEN]:** (a) summary regression collapses (all nodes alike) →
-  needs VQ / contrastive targets; (b) a *fixed* balanced pyramid mismatches real linguistic
-  structure → motivates B/C; (c) error compounding down levels (a wrong root dooms the
-  subtree) → the diffusion-style weak-model precondition reappears, mitigated by per-level
-  refinement passes.
-
----
-
-## 8. Evaluation plan
-
-- **Corpus:** **TinyStories** (small-model-coherent; see the corpus discussion in the session
-  notes / `[[ch29-char-level-run-results]]`) as the primary; Shakespeare retained as the
-  hard, low-data stress test.
-- **Baselines (matched params/corpus):** Ch29 char-diffusion, Ch08/Ch24 AR-GPT.
-- **Metrics:** leaf perplexity; free-generation coherence (human-read + a coherence proxy);
-  **non-word rate** (the §13.7 lens — does structure further reduce it?); decode
-  sequential-step count; long-range consistency.
-- **Ablations:** pyramid vs soft-structure (5-C) vs flat diffusion; mean-pool vs VQ summaries;
-  per-level refinement on/off.
-
----
-
-## 9. Roadmap
-
-- **[PHASE 0]** this design doc + a tiny numpy/host sketch of the pyramid pool/expand on one
-  sentence to sanity-check shapes and the training signal.
-- **[PHASE 1]** pyramid expander (5-A), char-level, TinyStories; beat-or-match char-diffusion
-  on coherence at matched params. **Go/no-go gate.**
-- **[PHASE 2]** VQ summaries + per-level refinement; word-level; head-first variant (5-B).
-- **[PHASE 3]** induced/latent trees (4-C); scale corpus (WikiText).
-
----
-
-## 10. Open questions
-
-1. Summary targets: **regression vs VQ codebook vs contrastive** — which gives a stable,
-   informative per-level signal? *(leading: VQ.)*
-2. Is a **fixed balanced pyramid** enough, or does the win require *real* linguistic trees
-   (B/C)? The 5-A vs 5-C ablation answers this.
-3. **Decoding:** single top-down pass vs. iterative per-level refinement (diffusion-style)
-   vs. beam over expansions — and where the weak-model error-compounding precondition bites.
-4. **Length handling:** powers-of-two padding vs. n-ary / unbalanced trees for natural
-   sentence lengths.
-5. Does the structural scaffold measurably **lower the §13.7 non-word rate** at subword
-   granularity — i.e. can it rehabilitate BPE for parallel generation?
+1. **The unifying mechanism (§4)** — residual-stream pooling vs multi-scale embedding vs
+   diffusion-across-resolutions. Which gives "one coherent system" rather than three bolted models?
+2. **Where do the pooling boundaries come from?** Whitespace gives words for free; the **gist** level is
+   the hard one — saliency/content-word selection, learned, or a second diffusion over a content-word
+   subset. **[OPEN]**
+3. **Does char-composition actually rescue OOV meaning** at our scale, or only at large scale?
+4. **Unpark only when:** the DiffusionGemma/LLaDA training research is done AND a well-trained flat
+   subword diffusion model still shows the semantic/topic-drift gap this design targets.
