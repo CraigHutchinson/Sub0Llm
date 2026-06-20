@@ -35,10 +35,17 @@ def entropy_bits(p):
     return float(-(p * np.log2(p)).sum())
 
 
-def mi_at(ids, K, d):
-    """Empirical I(X_i; X_{i+d}) in bits, Miller-Madow corrected."""
+def mi_at(ids, K, d, seg=None):
+    """Empirical I(X_i; X_{i+d}) in bits, Miller-Madow corrected.
+    If seg is given (per-position segment id), only count pairs WITHIN one segment —
+    used for model output that is many independent canvases joined by newlines."""
     a, b = ids[:-d], ids[d:]
+    if seg is not None:
+        m = seg[:-d] == seg[d:]
+        a, b = a[m], b[m]
     N = a.size
+    if N == 0:
+        return 0.0
     J = np.bincount(a * K + b, minlength=K * K).astype(np.float64).reshape(K, K)
     J /= N
     pa, pb = J.sum(1), J.sum(0)
@@ -98,14 +105,25 @@ def main():
     ap.add_argument("--max-d", type=int, default=100)
     ap.add_argument("--limit-mb", type=float, default=8.0)
     ap.add_argument("--label", default=None)
+    ap.add_argument("--reset-on-newline", action="store_true",
+                    help="only count pairs within one line/canvas (for model output = many independent samples)")
     a = ap.parse_args()
 
     ids, K = load_ids(a.corpus, int(a.limit_mb * 1024 * 1024))
     label = a.label or a.corpus
+    seg = None
+    if a.reset_on_newline:
+        nl = [i for i in range(K) if False]  # placeholder; resolve newline id below
+        # newline byte 0x0A -> its compact id (if present)
+        with open(a.corpus, "rb") as f:
+            raw = f.read(int(a.limit_mb * 1024 * 1024))
+        b = np.frombuffer(raw, dtype=np.uint8)
+        seg = np.cumsum(b == 0x0A)        # segment id increments at each newline
+        print(f"# (intra-segment mode: {int(seg[-1])+1} segments, avg {ids.size/(int(seg[-1])+1):.0f} chars)")
     print(f"# {label}: {ids.size:,} chars, alphabet K={K}, H1={entropy_bits(np.bincount(ids).astype(float)/ids.size):.3f} bits")
 
     dists = np.unique(np.round(np.geomspace(1, a.max_d, 24)).astype(int))
-    real = np.array([mi_at(ids, K, int(d)) for d in dists])
+    real = np.array([mi_at(ids, K, int(d), seg) for d in dists])
     rng = np.random.default_rng(0)
     sh = ids.copy(); rng.shuffle(sh)
     floor = mi_at(sh, K, 1)               # finite-sample MI bias floor

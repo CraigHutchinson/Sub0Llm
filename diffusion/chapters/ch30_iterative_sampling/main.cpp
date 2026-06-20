@@ -61,6 +61,7 @@ struct Config {
     std::string prompt = "and the king said ";
     dn::SamplerConfig sampler{};        // conf 0.9, entropy_bound 0.1, greedy
     std::size_t recall_windows = 1500;  // per noise level, strided over eval stream
+    std::size_t n_samples = 0;          // >0: bulk-generate N canvases (seeds 1..N), raw stream, exit
 };
 
 static Config parse_args(int argc, char** argv) {
@@ -86,6 +87,7 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--entropy-bound")  c.sampler.entropy_bound = std::stof(next());
         else if (a == "--temperature")    c.sampler.temperature = std::stof(next());
         else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
+        else if (a == "--samples")        c.n_samples = std::stoull(next());
         else throw std::runtime_error(std::format("unknown argument: {}", a));
     }
     if (c.model_dir.empty())
@@ -137,6 +139,24 @@ static int run(int argc, char** argv) {
         std::println("  warning: temperature 0 (greedy) + confidence-commit can COLLAPSE a weak model to its\n"
                      "           single safest token (e.g. all spaces for a char model). Use --temperature 0.7+\n"
                      "           for real generation; this is the iterative-refinement weak-model precondition.");
+
+    // ── Bulk generation (M3b / corr-decay): emit N raw decoded canvases, one per line,
+    //    each from a distinct seed, then exit. Used to measure the model's generated-text
+    //    correlation structure (tools/corr_decay) without the verbose demo or recall sweep.
+    if (cfg.n_samples > 0) {
+        const auto prompt_ids = tok.encode(cfg.prompt);
+        for (std::size_t s = 1; s <= cfg.n_samples; ++s) {
+            std::mt19937 rng(static_cast<std::uint32_t>(s));
+            auto canvas = dn::make_canvas(model, T, prompt_ids);
+            dn::refine_canvas(model, canvas, cfg.sampler, rng);
+            std::string text;
+            for (auto t : canvas)
+                if (t != model.mask_id()) text += std::string(tok.decode({t}));
+            std::fputs(text.c_str(), stdout);
+            std::fputc('\n', stdout);
+        }
+        return 0;
+    }
 
     // ── 2. watch a canvas snap into focus ───────────────────────────────────────
     section("2. Generation — iterative refinement from a prompt");

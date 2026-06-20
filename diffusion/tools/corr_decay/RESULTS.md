@@ -30,10 +30,22 @@ a distance-`d` correlation in `~log d` coarse-graining steps, which is the **kno
 power-law correlations efficiently (DESIGN_REVIEW_2 §1). So M3 says: **build the hierarchy — the premise
 holds on our data.**
 
-## Next increment (M3b, confirmatory)
-Measure the **model's** generated-text MI(d): does our flat char model reproduce the corpus power-law, or
-does it fall toward the Markov-1/exponential reference? Prediction (from the local-interpolator finding):
-the model **undershoots** at large `d`. That closes the loop — corpus is critical, flat model is not.
+## M3b (model generated-text MI) — CONFOUNDED, do not over-interpret
+Generated 549 canvases (~37k chars) from the char TinyStories model (`ch30 --samples`, intra-canvas MI via
+`--reset-on-newline`) and compared to the corpus:
+- **Short range (d=1–7): model MATCHES the corpus** — it learned local structure well.
+- **Long range (d≈18–24): the model's MI stops falling and RISES** (corpus keeps decaying ~power-law).
+  This is **not** genuine long-range modeling — it is the **repetition artifact**: the model loops
+  ("play in the sun and play in the sun"), and a repeated phrase at distance `d` manufactures spurious
+  correlation at `d`. The elevated tail is the *signature of the topic-drift/looping failure*, not structure.
+- **Caveat:** only 37k chars → large finite-sample bias (shuffle floor 0.077 vs corpus 0.0008); generated-
+  text MI is the **wrong instrument** when the model repeats (looping inflates exactly the probed tail).
+  More generation would not fix the repetition confound.
+
+⇒ **M3b is consistent with "the flat model lacks genuine long-range structure" but is not clean evidence.**
+The model-side claim rests more cleanly on **§13.8** (recall probe: the model ignores distant context —
+contiguous recall flat ~16%, no lift from far context). **The hierarchy-premise verdict stands on M3
+(corpus = power-law/critical) + §13.8 (model = short-range local interpolator), not on M3b.**
 
 Reproduce:
 ```
