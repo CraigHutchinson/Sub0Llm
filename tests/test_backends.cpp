@@ -257,6 +257,52 @@ TEST_CASE("transpose-contiguous - CUDA matches CPU", "[backends][cuda][device]")
 #endif
 }
 
+// Stage 4 Phase 7 (step 3b): the fused Adam(W) step on CUDA must match the CPU reference
+// (in-place p, m, v update). Exercises the precomputed bias-corrected scalars + decoupled WD.
+TEST_CASE("adam step - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t n = 257;                         // non-block-multiple tail
+    Tensor p = randn({n}), g = randn({n}), m = randn({n}), v = randn({n});
+    { auto vs = v.data_as<float>();                // v must be ≥ 0 (second-moment accumulator)
+      for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i) vs[i] = vs[i] * vs[i] + 0.01f; }
+
+    const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, lr = 1e-3f, wd = 0.01f;
+    const int   t  = 3;
+    const float bc1 = 1.0f - std::pow(b1, static_cast<float>(t));
+    const float bc2 = 1.0f - std::pow(b2, static_cast<float>(t));
+    const float omB1 = 1.0f - b1, omB2 = 1.0f - b2;
+    const float lrBc1 = lr / bc1, invBc2 = 1.0f / bc2, wd_keep = 1.0f - lr * wd;
+
+    // CPU reference.
+    Tensor pc = copy(p), mc = copy(m), vc = copy(v);
+    {
+        auto ps = pc.data_as<float>(); const auto gs = g.data_as<float>();
+        auto mi = mc.data_as<float>(); auto vi = vc.data_as<float>();
+        for (std::size_t k = 0; k < static_cast<std::size_t>(n); ++k) {
+            const float gk = gs[k];
+            const float mk = b1 * mi[k] + omB1 * gk;
+            const float vk = b2 * vi[k] + omB2 * gk * gk;
+            mi[k] = mk; vi[k] = vk;
+            ps[k] = ps[k] * wd_keep - lrBc1 * mk / (std::sqrt(invBc2 * vk) + eps);
+        }
+    }
+
+    // CUDA.
+    Tensor pd = p.to(Device::cuda()), gd = g.to(Device::cuda());
+    Tensor md = m.to(Device::cuda()), vd = v.to(Device::cuda());
+    backend::cuda::adam_step_f32(
+        reinterpret_cast<float*>(pd.raw_ptr()), reinterpret_cast<const float*>(gd.raw_ptr()),
+        reinterpret_cast<float*>(md.raw_ptr()), reinterpret_cast<float*>(vd.raw_ptr()),
+        static_cast<std::size_t>(n), b1, omB1, b2, omB2, lrBc1, invBc2, eps, wd_keep);
+
+    REQUIRE(rel_rms(pd.to(Device::cpu()), pc) < 1e-5);
+    REQUIRE(rel_rms(md.to(Device::cpu()), mc) < 1e-5);
+    REQUIRE(rel_rms(vd.to(Device::cpu()), vc) < 1e-5);
+#else
+    SUCCEED("CPU build - CUDA adam step parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 2: the CUDA rms_norm training kernels (fwd, bwd_x, bwd_w) must match the CPU
 // reference. Kernel-level parity (H2D via Tensor::to → launch → D2H), gated on the CUDA build.
 TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cuda][device]") {

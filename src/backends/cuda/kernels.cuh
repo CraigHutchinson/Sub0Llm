@@ -22,6 +22,10 @@ void launch_softmax_bwd_f32(const float* g, const float* y, float* gx, int rows,
 // estr[rank] = SOURCE strides in ELEMENTS; n = numel. ≤8 dims.
 void launch_copy_strided_f32(const float* src, float* dst,
                              const int* shape, const long long* estr, int rank, long long n);
+// Fused Adam/AdamW step (in-place p, m, v). wd_keep = 1−lr·wd (1 → plain Adam).
+void launch_adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
+                          float b1, float omB1, float b2, float omB2,
+                          float lrBc1, float invBc2, float eps, float wd_keep);
 
 // rms_norm training fwd+bwd over T rows of width D — match backend::cpu::rms_norm_*_f32.
 // fwd writes x_norm (=x·inv_rms), inv_rms[T] and out (=x_norm·w). bwd_x needs x_norm/inv_rms/w

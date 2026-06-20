@@ -2,6 +2,7 @@
 
 #include "sub0llm/core/ops.hpp"
 #include "sub0llm/core/thread_pool.hpp"
+#include "../backends/cuda/backend.hpp"   // fused Adam step on CUDA (Stage 4 Phase 7)
 
 #include <algorithm>
 #include <cassert>
@@ -147,12 +148,26 @@ void Adam::step() {
     for (std::size_t i = 0; i < params_.size(); ++i) {
         auto* p = params_[i];
         if (p->grad().numel() == 0) continue;
+        const std::size_t n = static_cast<std::size_t>(p->data().numel());
+        assert(p->grad().numel() == p->data().numel() && "grad shape must match param shape");
+
+        // Stage 4 Phase 7: fused Adam(W) step on CUDA when the parameter lives on the device.
+        // m_/v_ were allocated on the param's device, so all four buffers are device-resident.
+        if (p->data().device().is_cuda()) {
+            const float wd_keep = (wd_ != 0.0f) ? (1.0f - lr_ * wd_) : 1.0f;
+            backend::cuda::adam_step_f32(
+                reinterpret_cast<float*>(p->data().raw_ptr()),
+                reinterpret_cast<const float*>(p->grad().raw_ptr()),
+                reinterpret_cast<float*>(m_[i].raw_ptr()),
+                reinterpret_cast<float*>(v_[i].raw_ptr()),
+                n, b1_, omB1, b2_, omB2, lrBc1, invBc2, eps_, wd_keep);
+            continue;
+        }
+
         float*       ps = p->data().data_as<float>().data();
         const float* gs = p->grad().data_as<float>().data();
         float*       mi = m_[i].data_as<float>().data();
         float*       vi = v_[i].data_as<float>().data();
-        const std::size_t n = static_cast<std::size_t>(p->data().numel());
-        assert(p->grad().numel() == p->data().numel() && "grad shape must match param shape");
 
         // Decoupled weight decay (AdamW): shrink the weight before the Adam step. wd_==0
         // (plain Adam) skips this entirely. Kept as a simple scalar pre-pass so the SIMD

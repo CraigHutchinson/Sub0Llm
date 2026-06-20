@@ -164,6 +164,18 @@ void copy_strided_f32(const float* src, float* dst,
 #endif
 }
 
+void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
+                   float b1, float omB1, float b2, float omB2,
+                   float lrBc1, float invBc2, float eps, float wd_keep) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_adam_step_f32(p, g, m, v, n, b1, omB1, b2, omB2, lrBc1, invBc2, eps, wd_keep);
+#else
+    (void)p; (void)g; (void)m; (void)v; (void)n; (void)b1; (void)omB1; (void)b2; (void)omB2;
+    (void)lrBc1; (void)invBc2; (void)eps; (void)wd_keep;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
                   float* out, int T, int D, float eps) {
 #ifdef SUB0LLM_CUDA

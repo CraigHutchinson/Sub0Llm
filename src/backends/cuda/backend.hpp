@@ -43,6 +43,12 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 void copy_strided_f32(const float* src, float* dst,
                       const int* shape, const long long* estride_elems, int rank, long long n);
 
+// Fused Adam/AdamW step on a device-resident f32 parameter (in-place p, m, v). Scalars are
+// precomputed by the caller (bias-corrected lr etc.); wd_keep = 1−lr·wd (1 → plain Adam).
+void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
+                   float b1, float omB1, float b2, float omB2,
+                   float lrBc1, float invBc2, float eps, float wd_keep);
+
 // rms_norm training fwd+bwd on DEVICE pointers (T rows × D), signatures mirroring
 // backend::cpu::rms_norm_*_f32 so autograd::rms_norm can dispatch by device. Throw if not built.
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

@@ -117,6 +117,23 @@ __global__ void copy_strided_f32_kernel(const float* __restrict__ src, float* __
     dst[flat] = src[off];
 }
 
+// Fused Adam / AdamW step: in-place element-wise update of one parameter + its m,v moments.
+//   m = b1·m + (1−b1)·g;  v = b2·v + (1−b2)·g²;  p = p·wd_keep − (lr/bc1)·m / (√(v/bc2) + eps)
+// wd_keep = 1 − lr·wd (AdamW decoupled decay; 1 → plain Adam). Matches the CPU SIMD path.
+__global__ void adam_step_f32_kernel(float* __restrict__ p, const float* __restrict__ g,
+                                     float* __restrict__ m, float* __restrict__ v, std::size_t n,
+                                     float b1, float omB1, float b2, float omB2,
+                                     float lrBc1, float invBc2, float eps, float wd_keep) {
+    const std::size_t k = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    const float gk = g[k];
+    const float mk = b1 * m[k] + omB1 * gk;
+    const float vk = b2 * v[k] + omB2 * gk * gk;
+    m[k] = mk;
+    v[k] = vk;
+    p[k] = p[k] * wd_keep - lrBc1 * mk / (sqrtf(invBc2 * vk) + eps);
+}
+
 // ── rms_norm training kernels (autograd path) ───────────────────────────────────────────
 // Distinct from the inference rmsnorm_kernel (single dh-vector, Gemma decode): these process
 // T rows of width D and expose the x_norm / inv_rms intermediates the backward pass needs.
@@ -964,6 +981,13 @@ void launch_copy_strided_f32(const float* src, float* dst,
     constexpr int B = 256;
     const unsigned blocks = static_cast<unsigned>((n + B - 1) / B);
     copy_strided_f32_kernel<<<blocks, B>>>(src, dst, d, rank, n);
+}
+
+void launch_adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
+                          float b1, float omB1, float b2, float omB2,
+                          float lrBc1, float invBc2, float eps, float wd_keep) {
+    adam_step_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(p, g, m, v, n, b1, omB1, b2, omB2,
+                                                    lrBc1, invBc2, eps, wd_keep);
 }
 
 void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
