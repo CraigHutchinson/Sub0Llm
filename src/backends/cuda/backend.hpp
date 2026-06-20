@@ -34,6 +34,10 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // validates shape/dtype; this allocates the device output and launches the kernel.
 [[nodiscard]] Tensor softmax(const Tensor& t, int dim);
 
+// Softmax backward (autograd): gx = y·(g − rowsum(g·y)), given the softmax output y and upstream
+// grad g (both device-resident 2D f32, same shape). Allocates the device output gx.
+[[nodiscard]] Tensor softmax_bwd(const Tensor& g, const Tensor& y);
+
 // rms_norm training fwd+bwd on DEVICE pointers (T rows × D), signatures mirroring
 // backend::cpu::rms_norm_*_f32 so autograd::rms_norm can dispatch by device. Throw if not built.
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

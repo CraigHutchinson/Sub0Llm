@@ -74,6 +74,31 @@ __global__ void softmax_rows_f32_kernel(const float* __restrict__ in, float* __r
     for (int i = threadIdx.x; i < cols; i += blockDim.x) rout[i] *= inv;
 }
 
+// Row-wise softmax BACKWARD: given y = softmax(x) and upstream g = dL/dy,
+//   dL/dx_i = y_i · (g_i − Σ_j g_j·y_j).
+// One block per row, shared-mem tree reduction for the dot. Matches the CPU loop in
+// autograd::softmax. blockDim must be a power of two.
+__global__ void softmax_bwd_f32_kernel(const float* __restrict__ g, const float* __restrict__ y,
+                                       float* __restrict__ gx, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* rg = g  + static_cast<std::size_t>(row) * cols;
+    const float* ry = y  + static_cast<std::size_t>(row) * cols;
+    float*       ro = gx + static_cast<std::size_t>(row) * cols;
+
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) local += rg[i] * ry[i];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float dot = red[0];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) ro[i] = ry[i] * (rg[i] - dot);
+}
+
 // ── rms_norm training kernels (autograd path) ───────────────────────────────────────────
 // Distinct from the inference rmsnorm_kernel (single dh-vector, Gemma decode): these process
 // T rows of width D and expose the x_norm / inv_rms intermediates the backward pass needs.
@@ -907,6 +932,11 @@ void launch_relu_f32(const float* in, float* out, std::size_t n) {
 void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols) {
     constexpr int B = 256;                        // power of two for the tree reduction
     softmax_rows_f32_kernel<<<rows, B, B * sizeof(float)>>>(in, out, rows, cols);
+}
+
+void launch_softmax_bwd_f32(const float* g, const float* y, float* gx, int rows, int cols) {
+    constexpr int B = 256;                        // power of two for the tree reduction
+    softmax_bwd_f32_kernel<<<rows, B, B * sizeof(float)>>>(g, y, gx, rows, cols);
 }
 
 void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

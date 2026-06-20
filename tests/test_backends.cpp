@@ -199,6 +199,40 @@ TEST_CASE("softmax - CUDA matches CPU reference", "[backends][cuda][device]") {
 #endif
 }
 
+// Stage 4 Phase 7 (step 3b): the CUDA softmax BACKWARD must match the CPU reference.
+// gx_i = y_i·(g_i − Σ_j g_j·y_j) per row, given y=softmax(x) and upstream g.
+TEST_CASE("softmax backward - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t rows = 6, cols = 130;     // cols not a block multiple (tail coverage)
+    Tensor x = randn({rows, cols});
+    Tensor g = randn({rows, cols});          // upstream gradient dL/dy
+    const Tensor y = ops::softmax(x, -1);
+
+    // CPU reference (matches the autograd::softmax backward loop).
+    Tensor gx_c = zeros({rows, cols});
+    {
+        const auto ys = y.data_as<float>();
+        const auto gs = g.data_as<float>();
+        auto       gxs = gx_c.data_as<float>();
+        const auto C = static_cast<std::size_t>(cols);
+        for (std::size_t r = 0; r < static_cast<std::size_t>(rows); ++r) {
+            double dot = 0.0;
+            for (std::size_t c = 0; c < C; ++c)
+                dot += static_cast<double>(gs[r * C + c]) * static_cast<double>(ys[r * C + c]);
+            for (std::size_t c = 0; c < C; ++c)
+                gxs[r * C + c] = ys[r * C + c] * (gs[r * C + c] - static_cast<float>(dot));
+        }
+    }
+
+    const Tensor gx_d = backend::cuda::softmax_bwd(g.to(Device::cuda()), y.to(Device::cuda()));
+    REQUIRE(gx_d.device().is_cuda());
+    REQUIRE(gx_d.shape() == gx_c.shape());
+    REQUIRE(rel_rms(gx_d.to(Device::cpu()), gx_c) < 1e-4);
+#else
+    SUCCEED("CPU build - CUDA softmax backward parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 2: the CUDA rms_norm training kernels (fwd, bwd_x, bwd_w) must match the CPU
 // reference. Kernel-level parity (H2D via Tensor::to → launch → D2H), gated on the CUDA build.
 TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cuda][device]") {

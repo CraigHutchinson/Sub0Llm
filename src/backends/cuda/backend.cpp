@@ -138,6 +138,22 @@ Tensor softmax(const Tensor& t, int dim) {
 #endif
 }
 
+Tensor softmax_bwd(const Tensor& g, const Tensor& y) {
+#ifdef SUB0LLM_CUDA
+    Tensor gx(y.shape(), y.dtype(), y.device());
+    const int cols = static_cast<int>(y.shape(static_cast<std::size_t>(y.ndim() - 1)));
+    const int rows = static_cast<int>(y.numel() / cols);
+    kernels::launch_softmax_bwd_f32(
+        reinterpret_cast<const float*>(g.raw_ptr()),
+        reinterpret_cast<const float*>(y.raw_ptr()),
+        reinterpret_cast<float*>(gx.raw_ptr()), rows, cols);
+    return gx;
+#else
+    (void)g; (void)y;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
                   float* out, int T, int D, float eps) {
 #ifdef SUB0LLM_CUDA

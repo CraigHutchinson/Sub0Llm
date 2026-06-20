@@ -675,6 +675,8 @@ Variable softmax(const Variable& x) {
                     throw std::runtime_error(std::format(
                         "softmax backward: gradient shape ({},{}) != expected ({},{})",
                         gc.shape()[0], gc.shape()[1], N, C));
+                if (y_copy.device().is_cuda())     // Stage 4 Phase 7: gx = y·(g − rowsum(g·y))
+                    return backend::cuda::softmax_bwd(gc, y_copy);
                 const auto   gs = gc.data_as<float>();
                 const auto   ys = y_copy.data_as<float>();
                 Tensor gx = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)},
