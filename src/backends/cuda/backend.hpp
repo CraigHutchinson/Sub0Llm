@@ -49,6 +49,11 @@ void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
                    float b1, float omB1, float b2, float omB2,
                    float lrBc1, float invBc2, float eps, float wd_keep);
 
+// bias_add forward: (N,C) x + (C,) bias broadcast over rows → (N,C) on x's device.
+[[nodiscard]] Tensor bias_add(const Tensor& x, const Tensor& b);
+// bias_add backward (bias grad): (N,C) upstream → (C,) column-sum on g's device.
+[[nodiscard]] Tensor bias_add_bwd_b(const Tensor& g);
+
 // rms_norm training fwd+bwd on DEVICE pointers (T rows × D), signatures mirroring
 // backend::cpu::rms_norm_*_f32 so autograd::rms_norm can dispatch by device. Throw if not built.
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

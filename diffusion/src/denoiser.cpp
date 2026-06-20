@@ -66,7 +66,9 @@ Variable Denoiser::forward(const sub0llm::Tensor& token_ids, float noise_level) 
 
     // 1. token embedding (T, D) + noise-level conditioning (broadcast over positions)
     Variable x = tok_emb_.forward(token_ids);
-    Variable t_emb{time_embedding_rows(noise_level, T, embed_dim_)};  // constant (no grad)
+    // Conditioning is a host-built constant (no grad); move it to x's device so the add stays
+    // on-device when the model lives on CUDA (.to is a no-op on CPU). Stage 4 Phase 7.
+    Variable t_emb{time_embedding_rows(noise_level, T, embed_dim_).to(x.data().device())};
     x = ag::add(x, t_emb);
 
     // 2. bidirectional transformer stack
@@ -97,7 +99,8 @@ Variable Denoiser::forward(const sub0llm::Tensor& token_ids,
         auto rs = rows.data_as<float>();
         std::copy_n(rs.begin(), T * embed_dim_, cs.begin() + b * T * embed_dim_);
     }
-    x = ag::add(x, Variable{cond});   // constant (no grad)
+    // Host-built constant (no grad) → move to x's device for an on-device add (Stage 4 Phase 7).
+    x = ag::add(x, Variable{cond.to(x.data().device())});
 
     // 3. bidirectional transformer stack (batched, block-diagonal attention)
     for (const auto& blk : blocks_) x = blk.forward(x, B, T);

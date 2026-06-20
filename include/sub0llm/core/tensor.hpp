@@ -131,6 +131,13 @@ public:
     [[nodiscard]] T item() const {
         if (numel_ != 1) throw std::runtime_error("item() requires a scalar tensor");
         check_dtype<T>();
+        // A device-resident scalar (e.g. a CUDA loss value) must be brought to host before the
+        // host memcpy — raw_ptr() would otherwise be a device pointer (Stage 4 Phase 7).
+        if (!device().is_cpu()) {
+            const Tensor host = to(Device::cpu());
+            T val; std::memcpy(&val, host.raw_ptr(), sizeof(T));
+            return val;
+        }
         T val;
         std::memcpy(&val, raw_ptr(), sizeof(T));
         return val;

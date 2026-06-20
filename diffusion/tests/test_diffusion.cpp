@@ -163,6 +163,40 @@ TEST_CASE("diffusion_loss - one optimizer step reduces loss on a fixed sample", 
     REQUIRE(after < before);   // gradient flows end-to-end and reduces the objective
 }
 
+// Stage 4 Phase 7 capstone: the FULL Denoiser training step — embed → transformer (rms_norm,
+// RoPE, GQA-attention softmax, SwiGLU) → LM head → diffusion loss → backward → Adam — composes
+// end-to-end on CUDA and reduces the loss. Every op dispatched to the device kernels (Phases 1–7).
+TEST_CASE("Denoiser end-to-end training step on CUDA reduces loss", "[diffusion][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/5);
+    model.to(sub0llm::Device::cuda());
+    auto params = model.parameters();
+    REQUIRE(params[0]->data().device().is_cuda());     // confirm we really run on the GPU
+    sub0llm::nn::Adam opt(params, 5e-2f);              // m_/v_ allocated on-device (after to(cuda))
+    const auto clean = ramp_tokens(16, 16);
+    dt::DiffusionLossContext ctx(16);
+
+    auto loss_now = [&]() {
+        std::mt19937 rng(11);                          // identical (t, corruption) each call
+        return dt::diffusion_loss(model, clean, rng, ctx, 0.3f, 0.7f)
+                   .loss.data().to(sub0llm::Device::cpu()).item<float>();
+    };
+
+    const float before = loss_now();
+    for (int i = 0; i < 10; ++i) {
+        std::mt19937 rng(11);
+        auto res = dt::diffusion_loss(model, clean, rng, ctx, 0.3f, 0.7f);
+        opt.zero_grad();
+        res.loss.backward();
+        opt.step();
+    }
+    const float after = loss_now();
+    REQUIRE(after < before);                           // full fwd+bwd+update on GPU reduces the loss
+#else
+    SUCCEED("CPU build - CUDA end-to-end training step is exercised on the cuda preset");
+#endif
+}
+
 TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diffusion]") {
     dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/9);
     const auto clean = ramp_tokens(24, 16);

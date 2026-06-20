@@ -205,13 +205,18 @@ Variable bias_add(const Variable& x, const Variable& b) {
             "autograd::bias_add: bias size {} != columns {}", blen, C));
 
     const Tensor xc = xd.contiguous();
-    Tensor out_data = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)});
-    const auto xs = xc.data_as<float>();
-    const auto bs = bd.data_as<float>();
-    auto       os = out_data.data_as<float>();
-    for (std::size_t i = 0; i < N; ++i)
-        for (std::size_t j = 0; j < C; ++j)
-            os[i * C + j] = xs[i * C + j] + bs[j];
+    Tensor out_data;
+    if (xd.device().is_cuda()) {                 // Stage 4 Phase 7: on-device bias broadcast-add
+        out_data = backend::cuda::bias_add(xc, bd);
+    } else {
+        out_data = zeros({static_cast<int64_t>(N), static_cast<int64_t>(C)});
+        const auto xs = xc.data_as<float>();
+        const auto bs = bd.data_as<float>();
+        auto       os = out_data.data_as<float>();
+        for (std::size_t i = 0; i < N; ++i)
+            for (std::size_t j = 0; j < C; ++j)
+                os[i * C + j] = xs[i * C + j] + bs[j];
+    }
 
     auto out = make_node(std::move(out_data), any_grad(x, b));
     if (out->requires_grad) {
@@ -224,6 +229,8 @@ Variable bias_add(const Variable& x, const Variable& b) {
             out->edges.push_back(make_edge(b.impl(),
                 [N, C, b_dtype, b_device](const Tensor& g) {
                     // Sum upstream over rows → (C,) gradient for bias.
+                    if (b_device.is_cuda())      // Stage 4 Phase 7: on-device column sum
+                        return backend::cuda::bias_add_bwd_b(g.contiguous());
                     Tensor gb  = zeros({static_cast<int64_t>(C)}, b_dtype, b_device);
                     const auto gs  = g.data_as<float>();
                     auto       gbs = gb.data_as<float>();

@@ -134,6 +134,24 @@ __global__ void adam_step_f32_kernel(float* __restrict__ p, const float* __restr
     p[k] = p[k] * wd_keep - lrBc1 * mk / (sqrtf(invBc2 * vk) + eps);
 }
 
+// bias_add forward: out[i,j] = x[i,j] + b[j] (bias broadcast over the N rows). Flat over N·C.
+__global__ void bias_add_fwd_f32_kernel(const float* __restrict__ x, const float* __restrict__ b,
+                                        float* __restrict__ out, int N, int C) {
+    const std::size_t k = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= static_cast<std::size_t>(N) * static_cast<std::size_t>(C)) return;
+    out[k] = x[k] + b[k % static_cast<std::size_t>(C)];
+}
+
+// bias_add backward (bias grad): gb[j] = Σ_i g[i,j] (column sum over N rows). One thread per column.
+__global__ void bias_add_bwd_b_f32_kernel(const float* __restrict__ g, float* __restrict__ gb,
+                                          int N, int C) {
+    const int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (j >= C) return;
+    float s = 0.0f;
+    for (int i = 0; i < N; ++i) s += g[static_cast<std::size_t>(i) * C + j];
+    gb[j] = s;
+}
+
 // ── rms_norm training kernels (autograd path) ───────────────────────────────────────────
 // Distinct from the inference rmsnorm_kernel (single dh-vector, Gemma decode): these process
 // T rows of width D and expose the x_norm / inv_rms intermediates the backward pass needs.
@@ -988,6 +1006,15 @@ void launch_adam_step_f32(float* p, const float* g, float* m, float* v, std::siz
                           float lrBc1, float invBc2, float eps, float wd_keep) {
     adam_step_f32_kernel<<<grid(n, BLOCK), BLOCK>>>(p, g, m, v, n, b1, omB1, b2, omB2,
                                                     lrBc1, invBc2, eps, wd_keep);
+}
+
+void launch_bias_add_fwd_f32(const float* x, const float* b, float* out, int N, int C) {
+    bias_add_fwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * static_cast<std::size_t>(C), BLOCK),
+                              BLOCK>>>(x, b, out, N, C);
+}
+
+void launch_bias_add_bwd_b_f32(const float* g, float* gb, int N, int C) {
+    bias_add_bwd_b_f32_kernel<<<grid(static_cast<std::size_t>(C), BLOCK), BLOCK>>>(g, gb, N, C);
 }
 
 void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

@@ -26,6 +26,9 @@ void launch_copy_strided_f32(const float* src, float* dst,
 void launch_adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
                           float b1, float omB1, float b2, float omB2,
                           float lrBc1, float invBc2, float eps, float wd_keep);
+// bias_add forward (out[i,j]=x[i,j]+b[j]) and bias grad (gb[j]=Σ_i g[i,j]). (N,C) rows × C bias.
+void launch_bias_add_fwd_f32(const float* x, const float* b, float* out, int N, int C);
+void launch_bias_add_bwd_b_f32(const float* g, float* gb, int N, int C);
 
 // rms_norm training fwd+bwd over T rows of width D — match backend::cpu::rms_norm_*_f32.
 // fwd writes x_norm (=x·inv_rms), inv_rms[T] and out (=x_norm·w). bwd_x needs x_norm/inv_rms/w

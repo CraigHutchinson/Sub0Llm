@@ -176,6 +176,35 @@ void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
 #endif
 }
 
+Tensor bias_add(const Tensor& x, const Tensor& b) {
+#ifdef SUB0LLM_CUDA
+    const int N = static_cast<int>(x.shape(0));
+    const int C = static_cast<int>(x.shape(1));
+    Tensor out(x.shape(), x.dtype(), x.device());
+    kernels::launch_bias_add_fwd_f32(
+        reinterpret_cast<const float*>(x.raw_ptr()), reinterpret_cast<const float*>(b.raw_ptr()),
+        reinterpret_cast<float*>(out.raw_ptr()), N, C);
+    return out;
+#else
+    (void)x; (void)b;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
+Tensor bias_add_bwd_b(const Tensor& g) {
+#ifdef SUB0LLM_CUDA
+    const int N = static_cast<int>(g.shape(0));
+    const int C = static_cast<int>(g.shape(1));
+    Tensor gb(Tensor::Shape{static_cast<std::int64_t>(C)}, g.dtype(), g.device());
+    kernels::launch_bias_add_bwd_b_f32(
+        reinterpret_cast<const float*>(g.raw_ptr()), reinterpret_cast<float*>(gb.raw_ptr()), N, C);
+    return gb;
+#else
+    (void)g;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
                   float* out, int T, int D, float eps) {
 #ifdef SUB0LLM_CUDA

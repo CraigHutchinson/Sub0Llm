@@ -299,7 +299,10 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
         std::format("matmul: inner dims must match, got {} vs {}", K, K2));
     require_f32(a, "matmul");
 
-    if (a.device().is_cuda()) return backend::cuda::matmul(a, b);
+    // contiguous(): the device matmul kernel assumes row-major contiguous, but operands can be
+    // transposed views (e.g. attention's matmul(Q, transpose2d(K))). No-op when already contiguous;
+    // otherwise materialised on-device via the strided-copy kernel (Stage 4 Phase 7).
+    if (a.device().is_cuda()) return backend::cuda::matmul(a.contiguous(), b.contiguous());
     if (a.device().is_openvino()) return backend::openvino::matmul(a, b);
 
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
