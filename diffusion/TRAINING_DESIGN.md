@@ -801,3 +801,36 @@ tokenization (§13.6–7); *loose grammar / char-garbage* = **decode defaults** 
 **not** data, capacity, objective, or the flat architecture. This is the strongest confirmation of
 §13.8c (coherence is **recipe/decode-bound**) and further vindicates parking the tree predictor. Fix:
 `SamplerConfig::min_commit_frac` default 0.10 → 0.03; `--min-commit` overrides.
+
+### 13.9 CORRECTION — the BPE-512 "salad" was ALSO largely the decode bug; tokenization was a MODULATOR, not the ceiling (2026-06-20)
+The §13.8d decode fix forced an honest re-test of §13.6–§13.7: **every BPE-512 salad sample in those
+sections was generated at the broken `min_commit=0.10`.** Re-ran the *converged* BPE-512 model
+(`/d/tmp/ch29_curric_founded`) with the corrected decode (`--min-commit 0.01`), 5 prompts:
+
+| decode | output (BPE-512, same model) |
+|---|---|
+| **old (0.10), temp 0.9** | *"...your **conickeders**. I would have g my hands e much a **ging** man does, Back thre **oldd**"* (salad) |
+| **0.01, temp 0.6** | *"...to bear me. Will you hear? Fair, Or else will I bear to think that love, Wherein I wert"* |
+| **0.01, temp 0.3** | *"...to bear me. BRUTUS. Stay, then, part, and we'll follow him. SICIUS. Stand up, and let's"* |
+| **0.01, temp 0.4** | *"God save you, God be your Grace! Will you be revenged? Where is the King? NORTHUMBERLAN[D]"* |
+
+With the corrected decode BPE-512 produces **coherent real-word Shakespeare with speaker labels** — the
+catastrophic salad is gone. Residual failures are *fragment-glued invented names* ("RICHARDIAL", "SICIUS",
+like the AR model's invented names) and *low-temp repetition loops* ("three or four or three…") — not salad.
+
+**Why §13.7's "salad at every temperature" looked tokenization-bound but wasn't:** at `min_commit=0.10`
+the progress floor was the *binding constraint* — it force-commits ~10% of the masked canvas from
+near-unigram statistics early, so temperature couldn't matter (it had nothing to act on). That is exactly
+the §13.8d mechanism, and it hits BPE *harder* than char because a force-committed BPE fragment is a
+non-word while a force-committed char is a 1-char blemish. So the **decode bug was the dominant cause of
+the salad**, amplified by — not caused by — subword tokenization.
+
+**Revised conclusion (supersedes the §13.6 headline).** The single unifying lever across *all* the
+loose/salad output — char, BPE-512, and TinyStories — was the **decode default (`min_commit`/temperature)**,
+not tokenization. What survives of §13.6–7: (i) the *mechanism* is real (parallel denoising can mis-
+coordinate subword fragments; char/word atoms degrade more gracefully), and (ii) tokenization **modulates
+robustness to decode quality** — char tolerates a bad decode, BPE-512 collapses under it. But the practical
+claim "BPE-512 is unusable / char-level is required" is **wrong**: with a conservative decode BPE-512 is
+coherent. Tokenization is a second-order modulator; the decode was first-order. (tiny-diffusion's coherence
+likewise conflated char-level *and* its conservative "commit the confident few, or ≥1" decode — we now know
+the decode did most of the work.)
