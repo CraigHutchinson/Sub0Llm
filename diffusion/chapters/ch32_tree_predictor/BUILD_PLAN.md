@@ -5,6 +5,31 @@
 > independently buildable and **falsifiable** — every increment has a test that can *kill* the design
 > cheaply, and is measured against baselines we already have (char/word, Shakespeare/TinyStories).
 
+## ⏯ STATUS / RESUME HERE (updated 2026-06-20) — hierarchy track is PAUSED mid-build
+The premise and mechanism are validated; the actual P-phase build hasn't started. Pick up at **P1**.
+
+**Done:**
+- **Premise (M3): VALIDATED** — language is power-law/critical on our corpora (TinyStories α=1.88,
+  Shakespeare α=1.79; Markov-1 control decays exponentially). See [`M3_RESULTS.md`](M3_RESULTS.md). The
+  flat denoiser (exponential decay) structurally can't match it ⇒ the hierarchy is justified.
+- **4b (gist-field sampler probe): DONE** — `--commit-order spread` (training-free) cuts within-canvas
+  looping ~22–30% and raises distinct-n ~10% on word-TinyStories. See [`4B_RESULTS.md`](4B_RESULTS.md). A
+  *crude untrained* coarse-anchor already helps ⇒ strong signal that a *trained* gist (P2) helps more.
+- All design docs committed (README, DESIGN_REVIEW, DESIGN_REVIEW_2, BUILD_PLAN, M3/4B results).
+
+**Not started (resume order):** Phase **P1** (char-composition codec → OOV) → **P2** (gist conditioning:
+content-word `is_content` table + IB-pooling + feudal training) → **P3** (MERA log-depth, gated on the M3
+gap). Plus the ungated side probes 4a (holographic capacity numerics).
+
+**Key change since pause — GPU training is now available** (Stage 4 Phase 7, [[cuda-first-class-iteration-time]]):
+the Denoiser trains end-to-end on CUDA, so the **training-heavy P-phases can iterate fast** once `ch29
+--device cuda` is wired. That was the reason to pause P1 on CPU; the blocker is being removed.
+
+**Baselines banked for the A/Bs:** char-TinyStories (`/d/tmp/ch29_tinystories`, NELBO 1.12), word-TinyStories
+(`/d/tmp/ch29_word_tiny`, NELBO 1.77), char/word/BPE-512 Shakespeare. Decode default fixed (temp 0.9,
+min_commit 0.03) so samples reflect real model quality. Analysis corpus = TinyStories
+([[tinystories-default-analysis-corpus]]).
+
 ## Principles
 1. **Each increment ships a measurable result**, not just code.
 2. **Falsification-first:** every block states *"kills the design if…"*. Cheapest killers first.
