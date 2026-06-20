@@ -88,6 +88,12 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--temperature")    c.sampler.temperature = std::stof(next());
         else if (a == "--recall-windows") c.recall_windows = std::stoull(next());
         else if (a == "--samples")        c.n_samples = std::stoull(next());
+        else if (a == "--commit-order") {
+            const std::string v = next();
+            if      (v == "spread")     c.sampler.commit_order = dn::CommitOrder::Spread;
+            else if (v == "confidence") c.sampler.commit_order = dn::CommitOrder::Confidence;
+            else throw std::runtime_error("--commit-order must be confidence|spread");
+        }
         else throw std::runtime_error(std::format("unknown argument: {}", a));
     }
     if (c.model_dir.empty())

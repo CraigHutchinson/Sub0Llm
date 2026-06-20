@@ -117,11 +117,40 @@ SamplerStats refine_canvas(const Denoiser& model,
         const std::size_t min_commit = std::max<std::size_t>(
             1, static_cast<std::size_t>(std::ceil(cfg.min_commit_frac
                                                   * static_cast<float>(n_masked))));
-        std::size_t committed = 0;
+        // How many the confidence rule commits this iter (all ≥ threshold, but ≥ min_commit).
+        std::size_t target = 0;
         for (const auto& p : preds) {
-            if (committed >= min_commit && p.conf < cfg.conf_threshold) break;
-            canvas[p.pos] = p.token;
-            ++committed;
+            if (target >= min_commit && p.conf < cfg.conf_threshold) break;
+            ++target;
+        }
+        std::size_t committed = 0;
+        if (cfg.commit_order == CommitOrder::Spread) {
+            // Spread the `target` commits across the canvas (gist-field analog): greedy
+            // farthest-point in confidence order, then fill any shortfall ignoring the gap.
+            const std::size_t gap = std::max<std::size_t>(1, T / std::max<std::size_t>(1, target));
+            std::vector<std::size_t> chosen;
+            chosen.reserve(target);
+            auto far_enough = [&](std::size_t pos) {
+                for (auto q : chosen)
+                    if ((pos > q ? pos - q : q - pos) < gap) return false;
+                return true;
+            };
+            for (const auto& p : preds) {           // pass 1: spread, most-confident first
+                if (committed >= target) break;
+                if (far_enough(p.pos)) {
+                    canvas[p.pos] = p.token; chosen.push_back(p.pos); ++committed;
+                }
+            }
+            for (const auto& p : preds) {           // pass 2: fill to target, gap relaxed
+                if (committed >= target) break;
+                if (canvas[p.pos] == mask_id) { canvas[p.pos] = p.token; ++committed; }
+            }
+        } else {
+            for (const auto& p : preds) {
+                if (committed >= min_commit && p.conf < cfg.conf_threshold) break;
+                canvas[p.pos] = p.token;
+                ++committed;
+            }
         }
         stats.committed += committed;
 

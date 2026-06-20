@@ -33,6 +33,14 @@
 
 namespace sub0diff::nn {
 
+// Commit ORDER within an iteration (which confident positions to commit first).
+//   Confidence — pure most-confident-first (MaskGIT/LLaDA default).
+//   Spread     — 4b experiment (ch32): commit a spatially SPREAD coarse skeleton first (a
+//                training-free "gist field" — confident anchors distributed across the canvas),
+//                then fill, so the model can't greedily extend one region into a repetition loop.
+//                Tests whether topic-drift/looping is fixable at DECODE time or needs training.
+enum class CommitOrder : std::uint8_t { Confidence, Spread };
+
 struct SamplerConfig {
     float conf_threshold = 0.9f;   // commit positions with max-prob ≥ this
     float entropy_bound  = 0.1f;   // mean masked entropy below this → commit all & stop
@@ -54,6 +62,8 @@ struct SamplerConfig {
     // commit-only refinement, measured in Ch30). 0 = off. Net progress is enforced
     // (never remask more than was committed this iteration, minus one).
     float remask_threshold = 0.0f;
+
+    CommitOrder commit_order = CommitOrder::Confidence;
 };
 
 struct SamplerStats {
