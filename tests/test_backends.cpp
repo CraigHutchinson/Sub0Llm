@@ -233,6 +233,30 @@ TEST_CASE("softmax backward - CUDA matches CPU reference", "[backends][cuda][dev
 #endif
 }
 
+// Stage 4 Phase 7 (step 3b): non-contiguous CUDA copy() materialises a transpose/permute via the
+// strided-gather kernel — the multi-head attention reshape. Must match the CPU stride-aware copy.
+TEST_CASE("transpose-contiguous - CUDA matches CPU", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    // 3D permute (the (T,H,Dh) → (H,T,Dh) multi-head pattern): transpose makes it non-contiguous,
+    // .contiguous() must materialise it identically on GPU and CPU.
+    Tensor x = randn({5, 3, 7});
+    const Tensor cpu = x.transpose(0, 1).contiguous();
+    const Tensor gpu = x.to(Device::cuda()).transpose(0, 1).contiguous().to(Device::cpu());
+    REQUIRE(gpu.shape() == cpu.shape());
+    REQUIRE(gpu.is_contiguous());
+    REQUIRE(rel_rms(gpu, cpu) < 1e-6);     // exact gather, not a compute → ~0
+
+    // 2D transpose (the A.T.contiguous() pattern), dims non-multiples of any block.
+    Tensor m = randn({40, 13});
+    const Tensor m_cpu = m.transpose(0, 1).contiguous();
+    const Tensor m_gpu = m.to(Device::cuda()).transpose(0, 1).contiguous().to(Device::cpu());
+    REQUIRE(m_gpu.shape() == m_cpu.shape());
+    REQUIRE(rel_rms(m_gpu, m_cpu) < 1e-6);
+#else
+    SUCCEED("CPU build - CUDA transpose-contiguous parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 2: the CUDA rms_norm training kernels (fwd, bwd_x, bwd_w) must match the CPU
 // reference. Kernel-level parity (H2D via Tensor::to → launch → D2H), gated on the CUDA build.
 TEST_CASE("rms_norm - CUDA training kernels match CPU reference", "[backends][cuda][device]") {

@@ -99,6 +99,24 @@ __global__ void softmax_bwd_f32_kernel(const float* __restrict__ g, const float*
     for (int i = threadIdx.x; i < cols; i += blockDim.x) ro[i] = ry[i] * (rg[i] - dot);
 }
 
+// Strided → contiguous copy of an f32 view (materialises transpose/permute on device — the
+// multi-head attention reshape). For each contiguous output index, decompose into the row-major
+// multi-index over `shape` and gather from the source via element strides `estr`. Mirrors the
+// CPU stride-aware copy in tensor.cpp. ≤8 dims (caller guards).
+struct StridedDesc { int shape[8]; long long estr[8]; };
+__global__ void copy_strided_f32_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                        StridedDesc d, int rank, long long n) {
+    const long long flat = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (flat >= n) return;
+    long long rem = flat, off = 0;
+    for (int k = rank - 1; k >= 0; --k) {
+        const long long s = d.shape[k];
+        off += (rem % s) * d.estr[k];
+        rem /= s;
+    }
+    dst[flat] = src[off];
+}
+
 // ── rms_norm training kernels (autograd path) ───────────────────────────────────────────
 // Distinct from the inference rmsnorm_kernel (single dh-vector, Gemma decode): these process
 // T rows of width D and expose the x_norm / inv_rms intermediates the backward pass needs.
@@ -937,6 +955,15 @@ void launch_softmax_rows_f32(const float* in, float* out, int rows, int cols) {
 void launch_softmax_bwd_f32(const float* g, const float* y, float* gx, int rows, int cols) {
     constexpr int B = 256;                        // power of two for the tree reduction
     softmax_bwd_f32_kernel<<<rows, B, B * sizeof(float)>>>(g, y, gx, rows, cols);
+}
+
+void launch_copy_strided_f32(const float* src, float* dst,
+                             const int* shape, const long long* estr, int rank, long long n) {
+    StridedDesc d{};
+    for (int k = 0; k < rank; ++k) { d.shape[k] = shape[k]; d.estr[k] = estr[k]; }
+    constexpr int B = 256;
+    const unsigned blocks = static_cast<unsigned>((n + B - 1) / B);
+    copy_strided_f32_kernel<<<blocks, B>>>(src, dst, d, rank, n);
 }
 
 void launch_rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,

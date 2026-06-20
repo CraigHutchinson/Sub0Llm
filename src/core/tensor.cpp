@@ -285,14 +285,31 @@ Tensor copy(const Tensor& src) {
 
     const std::size_t bytes = static_cast<std::size_t>(src.numel()) * dtype_size(src.dtype());
 
-    // CUDA: a deep copy is a device-to-device memcpy. This is what lets the autograd backward
-    // graph run on-device — Node::accumulate_grad seeds each grad with copy(upstream). Only the
-    // contiguous case is needed (grads/snapshots are contiguous); a strided device copy would
-    // need its own kernel (Phase 7+ if ever required).
+    // CUDA: a contiguous deep copy is a device-to-device memcpy (the common grad/snapshot case);
+    // a non-contiguous view (transpose/permute in multi-head attention) materialises via the
+    // strided-gather kernel (Stage 4 Phase 7), mirroring the CPU stride-aware path below.
     if (src.device().is_cuda()) {
-        if (!src.is_contiguous())
-            throw std::runtime_error("copy: non-contiguous CUDA copy not yet implemented");
-        backend::cuda::memcpy_d2d(dst.raw_ptr(), src.raw_ptr(), bytes, src.device().index);
+        if (src.is_contiguous()) {
+            backend::cuda::memcpy_d2d(dst.raw_ptr(), src.raw_ptr(), bytes, src.device().index);
+            return dst;
+        }
+        if (src.dtype() != DType::Float32)
+            throw std::runtime_error(std::format(
+                "copy: non-contiguous CUDA copy of {} not yet implemented", dtype_name(src.dtype())));
+        const std::size_t rank = src.ndim();
+        if (rank > 8)
+            throw std::runtime_error("copy: non-contiguous CUDA copy supports ≤8 dims");
+        int       shape_i[8];
+        long long estr_e[8];
+        for (std::size_t d = 0; d < rank; ++d) {
+            shape_i[d] = static_cast<int>(src.shape()[d]);
+            estr_e[d]  = static_cast<long long>(src.strides()[d]) /
+                         static_cast<long long>(sizeof(float));   // byte stride → element stride
+        }
+        backend::cuda::copy_strided_f32(
+            reinterpret_cast<const float*>(src.raw_ptr()),
+            reinterpret_cast<float*>(dst.raw_ptr()),
+            shape_i, estr_e, static_cast<int>(rank), static_cast<long long>(src.numel()));
         return dst;
     }
 

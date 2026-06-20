@@ -154,6 +154,16 @@ Tensor softmax_bwd(const Tensor& g, const Tensor& y) {
 #endif
 }
 
+void copy_strided_f32(const float* src, float* dst,
+                      const int* shape, const long long* estride_elems, int rank, long long n) {
+#ifdef SUB0LLM_CUDA
+    kernels::launch_copy_strided_f32(src, dst, shape, estride_elems, rank, n);
+#else
+    (void)src; (void)dst; (void)shape; (void)estride_elems; (void)rank; (void)n;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
                   float* out, int T, int D, float eps) {
 #ifdef SUB0LLM_CUDA

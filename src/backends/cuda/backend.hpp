@@ -38,6 +38,11 @@ void memset_zero(void* dst, std::size_t bytes, int device_index);
 // grad g (both device-resident 2D f32, same shape). Allocates the device output gx.
 [[nodiscard]] Tensor softmax_bwd(const Tensor& g, const Tensor& y);
 
+// Strided→contiguous device copy of an f32 view (materialise a transpose/permute). `shape[rank]`
+// are the output dims, `estride_elems[rank]` the SOURCE strides in ELEMENTS, `n` = numel. ≤8 dims.
+void copy_strided_f32(const float* src, float* dst,
+                      const int* shape, const long long* estride_elems, int rank, long long n);
+
 // rms_norm training fwd+bwd on DEVICE pointers (T rows × D), signatures mirroring
 // backend::cpu::rms_norm_*_f32 so autograd::rms_norm can dispatch by device. Throw if not built.
 void rms_norm_fwd(const float* x, const float* w, float* x_norm, float* inv_rms,
