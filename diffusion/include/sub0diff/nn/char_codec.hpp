@@ -45,7 +45,7 @@ class CharComposer {
 public:
     CharComposer(std::int64_t n_chars, std::int64_t D, std::size_t n_heads, std::size_t n_kv_heads,
                  std::int64_t n_layers, std::int64_t d_ff = 0, std::uint64_t seed = 42)
-        : char_emb_(n_chars, D, seed) {
+        : char_emb_(n_chars, D, seed), D_(D) {
         blocks_.reserve(static_cast<std::size_t>(n_layers));
         for (std::int64_t i = 0; i < n_layers; ++i)
             blocks_.emplace_back(D, n_heads, n_kv_heads, d_ff,
@@ -62,6 +62,25 @@ public:
         return ag::scale(ag::matmul(sel, e), 1.0f / static_cast<float>(L));  // (1, D) mean-pool
     }
 
+    // Compose a WHOLE vocabulary at once: char_ids is (V·L,) — V words of L chars each (fixed L,
+    // padded), row-major. Returns the (V, D) composed embedding table. This is the P1-1c primitive:
+    // the table feeds BOTH the input embedding and the weight-tied LM head, so every word (in-vocab
+    // or OOV) has a content-addressed representation. Per-word mean-pool is a batched matmul against
+    // a (V,1,L) selector — no V×(V·L) matrix — so it scales to a 12k+ vocab.
+    [[nodiscard]] sub0llm::autograd::Variable compose_vocab(const sub0llm::Tensor& char_ids,
+                                                            std::int64_t V, std::int64_t L) const {
+        namespace ag = sub0llm::autograd;
+        ag::Variable e = char_emb_.forward(char_ids);          // (V·L, D)
+        for (const auto& b : blocks_) e = b.forward(e, V, L);  // batched, block-diagonal per word
+        ag::Variable e3 = ag::reshape(e, {V, L, D_});          // (V, L, D)
+        const sub0llm::Device dev = e.data().device();
+        ag::Variable sel(sub0llm::ops::mul(sub0llm::ones({V, 1, L}, sub0llm::DType::Float32, dev),
+                                           1.0f / static_cast<float>(L)),
+                         /*requires_grad=*/false);             // (V, 1, L) per-word mean selector
+        ag::Variable pooled = ag::matmul(sel, e3);             // (V, 1, D) batched
+        return ag::reshape(pooled, {V, D_});                   // (V, D)
+    }
+
     [[nodiscard]] std::vector<sub0llm::autograd::Variable*> parameters() {
         std::vector<sub0llm::autograd::Variable*> p{&char_emb_.weight()};
         for (auto& b : blocks_) {
@@ -75,6 +94,7 @@ public:
 private:
     sub0llm::nn::Embedding          char_emb_;
     std::vector<BidirectionalBlock> blocks_;
+    std::int64_t                    D_;
 };
 
 // Word vector (1, D) → char logits (L, n_chars), non-autoregressive (the diffusion idiom). Each

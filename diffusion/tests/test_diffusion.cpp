@@ -444,6 +444,40 @@ TEST_CASE("CharComposer/CharDecoder round-trip spellings (P1 1a/1b)", "[diffusio
     REQUIRE(cosine < 0.999);   // not collapsed to a bag-of-letters
 }
 
+// P1 1c primitive: composing a whole vocab in one batched (block-diagonal) call must equal composing
+// each word on its own. Fixed-length words → exact parity (no padding in the mean-pool).
+TEST_CASE("CharComposer::compose_vocab matches per-word forward (P1 1c)", "[diffusion][char_codec]") {
+    using sub0diff::nn::CharComposer;
+    const std::int64_t n_chars = 27, D = 32, V = 5, L = 4;
+    CharComposer comp(n_chars, D, /*n_heads=*/4, /*n_kv_heads=*/2, /*n_layers=*/2, /*d_ff=*/0, 7);
+
+    std::vector<std::int32_t> chars(static_cast<std::size_t>(V * L));
+    for (std::int64_t v = 0; v < V; ++v)
+        for (std::int64_t j = 0; j < L; ++j)
+            chars[static_cast<std::size_t>(v * L + j)] = static_cast<std::int32_t>((v * 7 + j * 3 + 1) % 26);
+
+    sub0llm::Tensor all({V * L}, sub0llm::DType::Int32);
+    std::copy(chars.begin(), chars.end(), all.data_as<std::int32_t>().begin());
+    auto table = comp.compose_vocab(all, V, L);      // (V, D)
+    REQUIRE(table.data().shape(0) == V);
+    REQUIRE(table.data().shape(1) == D);
+
+    const auto tz = table.data().data_as<float>();
+    for (std::int64_t v = 0; v < V; ++v) {
+        sub0llm::Tensor w({L}, sub0llm::DType::Int32);
+        std::copy_n(chars.begin() + static_cast<std::ptrdiff_t>(v * L), L, w.data_as<std::int32_t>().begin());
+        const auto single = comp.forward(w).data();  // (1, D)
+        const auto sz = single.data_as<float>();
+        double se = 0.0, sref = 0.0;
+        for (std::int64_t d = 0; d < D; ++d) {
+            const double diff = static_cast<double>(tz[static_cast<std::size_t>(v * D + d)]) - sz[static_cast<std::size_t>(d)];
+            se += diff * diff;
+            sref += static_cast<double>(sz[static_cast<std::size_t>(d)]) * sz[static_cast<std::size_t>(d)];
+        }
+        REQUIRE(std::sqrt(se / std::max(sref, 1e-12)) < 1e-4);   // batched row == single forward
+    }
+}
+
 TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diffusion]") {
     dn::Denoiser model(16, 32, 2, 2, 1, 64, /*seed=*/9);
     const auto clean = ramp_tokens(24, 16);
