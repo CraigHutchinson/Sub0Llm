@@ -10,6 +10,8 @@
 
 #include "sub0llm/nn/optimizer.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <numeric>
 #include <random>
 #include <span>
@@ -293,6 +295,50 @@ TEST_CASE("unwired autograd ops throw cleanly on CUDA", "[diffusion][cuda][devic
     REQUIRE_THROWS(ag::log_sigmoid(x));
 #else
     SUCCEED("CPU build - CUDA guard behaviour is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 7 (perf, review #2): timed full batched training step (fwd + diffusion loss +
+// backward + Adam) CPU vs CUDA. Hidden ([.]) — run explicitly: tests_diffusion "[bench]".
+// Per-step time includes the loss D2H read (a sync point), so the loop wall-time is honest.
+TEST_CASE("BENCH Denoiser full step CPU vs CUDA", "[.][bench][cuda]") {
+#ifdef SUB0LLM_CUDA
+    const std::int64_t V = 512, D = 256, T = 64, B = 16;
+    const int warmup = 2, steps = 8;
+
+    auto bench = [&](sub0llm::Device dev) -> double {
+        dn::Denoiser model(V, D, /*n_heads=*/8, /*n_kv_heads=*/4, /*n_layers=*/2, /*d_ff=*/1024, 7);
+        if (dev.is_cuda()) model.to(dev);
+        auto params = model.parameters();
+        sub0llm::nn::Adam opt(params, 1e-3f);
+        const auto stream = ramp_tokens(static_cast<std::size_t>(B * T), V);
+        std::vector<std::size_t> offsets(static_cast<std::size_t>(B));
+        for (std::int64_t b = 0; b < B; ++b) offsets[static_cast<std::size_t>(b)] = static_cast<std::size_t>(b * T);
+        dt::BatchedDiffusionLossContext ctx(B, T);
+        auto one = [&](int s) {
+            std::mt19937 r(static_cast<std::uint32_t>(s) + 1u);
+            auto res = dt::batched_diffusion_loss(model, stream, offsets, r, ctx, 0.3f, 0.7f);
+            opt.zero_grad();
+            res.loss.backward();
+            opt.step();
+            (void)res.loss.data().to(sub0llm::Device::cpu()).item<float>();  // D2H sync each step
+        };
+        for (int s = 0; s < warmup; ++s) one(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < steps; ++s) one(s);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / steps;
+    };
+
+    const double cpu_s = bench(sub0llm::Device::cpu());
+    const double gpu_s = bench(sub0llm::Device::cuda());
+    std::fprintf(stderr,
+        "\n[BENCH] Denoiser step (V=%lld D=%lld T=%lld B=%lld, 2 layers): "
+        "CPU %.4f s/step | GPU %.4f s/step | speedup %.2fx\n",
+        static_cast<long long>(V), static_cast<long long>(D), static_cast<long long>(T),
+        static_cast<long long>(B), cpu_s, gpu_s, cpu_s / gpu_s);
+    SUCCEED();
+#else
+    SUCCEED("CPU build - the GPU step bench runs on the cuda preset");
 #endif
 }
 
