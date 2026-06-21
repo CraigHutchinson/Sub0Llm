@@ -28,40 +28,75 @@ cublasHandle_t cublas() {
 
 // Caching device allocator. cudaMalloc/cudaFree each SYNCHRONISE the device; a single training step
 // allocates hundreds of short-lived intermediates, so raw malloc/free per tensor made GPU training
-// allocation-bound (~5 s/step at word-level vocab — far above the kernel ceiling). Here freed blocks
-// go to a size-keyed free list and are reused instead of released. Training shapes repeat every step,
-// so exact-size reuse drives the steady-state cudaMalloc count to ~zero. (Blocks are written before
-// read — zeros() memsets, every op overwrites its output — so a recycled block is always safe.)
+// allocation-BOUND (small-vocab step 4× over the kernel ceiling). Freed blocks go to a size-keyed
+// free list and are reused instead of released; training shapes repeat → steady-state cudaMalloc→0.
+// (Recycled blocks are always written before read — zeros() memsets, every op overwrites its output.)
+//
+// VRAM-AWARE + bounded. The win (skip the synchronising cudaMalloc/cudaFree on the MANY small
+// intermediates) only pays off when there is VRAM headroom to spare. When the model's working set
+// already nearly fills VRAM (e.g. word-level 12k-vocab on 8 GB — the ~100 MB (B·T,vocab) tensors),
+// caching ANYTHING tips it over and Windows WDDM pages GPU memory to host → 10× slowdown (46 s/step).
+// So: cache a freed block only if (a) it is small (≤ kPoolMax — the huge tensors are few, and bypass)
+// AND (b) there is comfortable free VRAM (≥ kReserve). Under pressure the pool transparently degrades
+// to immediate free — i.e. exactly the pre-pool behaviour. With headroom (char-level / small models)
+// it gives the full ~4× step speedup. Recycled blocks are written before read, so always safe.
 class CudaPool {
 public:
     static CudaPool& instance() { static CudaPool p; return p; }
 
     void* get(std::size_t bytes, int dev) {
         std::lock_guard<std::mutex> lk(mu_);
-        auto& fl = free_[dev][bytes];
-        if (!fl.empty()) { void* p = fl.back(); fl.pop_back(); return p; }
+        if (bytes <= kPoolMax) {
+            auto& fl = free_[dev][bytes];
+            if (!fl.empty()) { void* p = fl.back(); fl.pop_back(); cached_ -= bytes; return p; }
+        }
         cudaSetDevice(dev);
         void* raw = nullptr;
         if (const cudaError_t e = cudaMalloc(&raw, bytes); e != cudaSuccess)
             throw std::runtime_error(
                 std::format("cudaMalloc({} bytes) failed: {}", bytes, cudaGetErrorString(e)));
-        info_[raw] = Info{bytes, dev};
+        if (bytes <= kPoolMax) info_[raw] = Info{bytes, dev};   // only poolable blocks are tracked
         return raw;
     }
 
-    // noexcept (called from Storage::free_fn). On any failure, fall back to a real cudaFree.
+    // noexcept (called from Storage::free_fn). Cache only small blocks, only with VRAM headroom and
+    // under the cache budget; otherwise release immediately. On any failure fall back to cudaFree.
     void put(void* p) noexcept {
         try {
             std::lock_guard<std::mutex> lk(mu_);
             const auto it = info_.find(p);
-            if (it == info_.end()) { cudaFree(p); return; }
+            if (it == info_.end()) { cudaFree(p); return; }              // bypassed (huge) block
+            if (cached_ + it->second.bytes > kCapBytes || !headroom(it->second.dev)) {
+                cudaFree(p);                                             // budget/VRAM pressure → free
+                info_.erase(it);
+                return;
+            }
             free_[it->second.dev][it->second.bytes].push_back(p);
+            cached_ += it->second.bytes;
         } catch (...) { cudaFree(p); }
     }
 
 private:
     struct Info { std::size_t bytes; int dev; };
-    std::mutex mu_;
+    static constexpr std::size_t kPoolMax  = 16ull << 20;   // cache blocks ≤16 MB; larger bypass
+    static constexpr std::size_t kCapBytes = 1ull << 30;    // ≤1 GB cached total
+    static constexpr std::size_t kReserve  = 2ull << 30;    // keep ≥2 GB device-free; else don't cache
+
+    // Is there comfortable free VRAM? cudaMemGetInfo is a driver call, so refresh only every 32 puts
+    // (free VRAM moves slowly relative to the alloc rate). free_vram_ starts "ample" so warm-up caches.
+    bool headroom(int dev) {
+        if (poll_++ % 32 == 0) {
+            std::size_t freeb = 0, totb = 0;
+            cudaSetDevice(dev);
+            if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) free_vram_ = freeb;
+        }
+        return free_vram_ >= kReserve;
+    }
+
+    std::mutex   mu_;
+    std::size_t  cached_   = 0;                         // bytes currently held in the free list
+    std::size_t  free_vram_ = std::size_t(-1);          // last cudaMemGetInfo free bytes (∞ until polled)
+    std::uint64_t poll_     = 0;
     std::unordered_map<int, std::unordered_map<std::size_t, std::vector<void*>>> free_;
     std::unordered_map<void*, Info>                                              info_;
 };
