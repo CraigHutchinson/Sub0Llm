@@ -137,3 +137,60 @@ objective and §5 boundary fixes are the levers to *shrink the gap*; this benchm
 memory headroom and extended context, at a *controllable* accuracy cost — and the within-window
 redundancy we measured is exactly why it must be evaluated at scale, across windows, on runtime +
 context + gap, not on single-window NLL.
+
+---
+
+## 8. Verbosity / time as a first-class slider (future extension)
+
+The coarse-to-fine split also exposes a **user-facing quality/time/length control** that a flat model
+cannot offer cleanly, because it separates *what to say* (the gist `G` — invariant meaning) from *how
+much surface to spend saying it* (the fine realization). Two **orthogonal** axes fall out:
+
+1. **Refinement depth — iterations `K`.** Time↑, local quality↑, *length fixed*. This already exists as
+   sampler knobs (`max_iters`, `conf_threshold`, `entropy_bound`, `min_commit_frac` in
+   [`sampler.hpp`](../../include/sub0diff/nn/sampler.hpp)). Diffusion refines in place, so more passes =
+   more polish — but with a ceiling: on weak models iterative refinement can *lose* to one-step
+   (error compounding, [[ch30-iterative-refinement-precondition]]), so depth must be gated on model
+   strength.
+2. **Realization length — verbosity `N` per gist.** Words↑, filler↑, clarity↑ (to a point), time↑ (but
+   *parallel* across windows). **This is what the gist newly enables:** fix `G`, then infill it into a
+   *terse* short canvas or a *verbose* long one — same meaning, different elaboration. Without a plan,
+   "generate longer" just drifts; with `G` held fixed, length controls only the verbosity of realizing
+   a fixed meaning (the classic plan→surface-realization NLG split, now native to the diffusion
+   hierarchy, and natural because diffusion picks its canvas length up front).
+
+**Why orthogonal:** you can ask for terse-but-polished (low `N`, high `K`) or verbose-but-rough (high
+`N`, low `K`). A flat AR model conflates the two (more tokens = more compute = the only knob).
+
+### Two forms
+- **Global slider (v1).** One control `0..1` → `(K, N/Nc)`: low = terse/fast/rough, high =
+  verbose/slow/clear. A user dial, or an API param like `max_tokens` but *meaning-preserving* (it
+  changes elaboration, not content).
+- **Per-window dynamic (the extension you flagged).** `G` already scores each coarse slot's content; so
+  **allocate length and iterations per fine window by content density** — content-rich slots (many
+  content words, high masked entropy) get more tokens + more passes; filler/function regions get fewer.
+  This is per-window *adaptive computation time* (Graves ACT), a natural fit because the windows are
+  already independent and the sampler already has per-window entropy/confidence stopping. Connects to
+  the LoopedGPT `forward_k` runtime budget (Ch17) and the thinking-budget idea (Ch16). Implementation
+  note: variable per-window length means ragged windows → pad to the batch max with masked padding (the
+  block-diagonal forward assumes equal `T`), or bucket windows by length.
+
+### Risks / where it breaks
+- **Verbosity ≠ quality monotonically.** Too much length → filler hallucination, dilution, and the M2
+  *looping/repetition* failure (we already have the metric). There is an information-density sweet spot;
+  past it, clarity falls. **M2 content-recurrence + distinct-n are exactly the guardrails** to find the
+  knee.
+- **Depth ceiling** (above): the `K` axis has negative returns on weak checkpoints; re-measure as models
+  strengthen.
+
+### How to test it (once HierDenoiser has a generator)
+Sweep `(K, N)` for a *fixed* gist and plot the **verbosity–clarity–time surface**: tokens, wall-time,
+M2 content-recurrence + distinct-n (clarity/looping), and info density (content tokens / total). The
+deliverable is the knee of that surface and a default slider mapping. This needs HierDenoiser
+generation first (the sampler is currently `Denoiser`-only) — a near-term build once the 2c/2d accuracy
+gap is acceptable. Until then this is a recorded design axis, not a claim.
+
+**Why it matters:** it turns the hierarchy's compute decomposition into a *product* knob — a
+meaning-preserving terseness/verbosity/latency dial — that is only coherent *because* the gist holds the
+content fixed while length and depth vary. It is the user-facing payoff of separating plan from
+realization.

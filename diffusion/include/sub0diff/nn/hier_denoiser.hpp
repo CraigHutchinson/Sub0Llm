@@ -40,11 +40,16 @@ public:
     // coarsen: c (tokens per coarse slot); window: w (fine window width). N must be a multiple of
     // both w and c (and w a multiple of c is not required). n_coarse_layers + n_fine_layers ≈ a flat
     // model's depth for a parameter-matched A/B.
+    // mask_aware_pool (2c): pool each coarse slot over its VISIBLE (non-[MASK]) tokens only, instead
+    // of a uniform mean over all c — at 50% noise the uniform mean averages in ~50% [MASK] garbage,
+    // the single largest cause of the flat−hier gap (2E_RESULTS). Falls back to uniform if a slot is
+    // fully masked.
     HierDenoiser(std::int64_t vocab_size, std::int64_t embed_dim, std::size_t n_heads,
                  std::size_t n_kv_heads, std::int64_t n_coarse_layers, std::int64_t n_fine_layers,
                  std::int64_t coarsen, std::int64_t window, std::int64_t d_ff = 0,
-                 std::uint64_t seed = 42)
+                 std::uint64_t seed = 42, bool mask_aware_pool = false)
         : real_vocab_(vocab_size), embed_dim_(embed_dim), coarsen_(coarsen), window_(window),
+          mask_aware_pool_(mask_aware_pool),
           tok_emb_(vocab_size + 1, embed_dim, seed),
           ln_f_(embed_dim) {
         coarse_.reserve(static_cast<std::size_t>(n_coarse_layers));
@@ -88,11 +93,10 @@ public:
         }
         ag::Variable x0 = ag::add(emb, ag::Variable{cond.to(dev)});
 
-        // ── coarse pass: mean-pool every `coarsen_` rows → (B·Nc, D), attend within each sequence ──
+        // ── coarse pass: pool every `coarsen_` rows → (B·Nc, D), attend within each sequence ──
+        // psel (B·Nc,1,c): uniform 1/c, or (mask-aware) 1/(visible count) over non-[MASK] tokens.
         ag::Variable g3 = ag::reshape(x0, {B * Nc, coarsen_, embed_dim_});         // group c rows
-        ag::Variable psel(sub0llm::ops::mul(
-            sub0llm::ones({B * Nc, 1, coarsen_}, sub0llm::DType::Float32, dev),
-            1.0f / static_cast<float>(coarsen_)), /*requires_grad=*/false);
+        ag::Variable psel(build_pool_selector(token_ids, B * Nc).to(dev), /*requires_grad=*/false);
         ag::Variable coarse = ag::reshape(ag::matmul(psel, g3), {B * Nc, embed_dim_});  // (B·Nc, D)
         for (const auto& blk : coarse_) coarse = blk.forward(coarse, B, Nc);     // attn over Nc slots
 
@@ -126,7 +130,36 @@ public:
     [[nodiscard]] std::int64_t embed_dim()   const noexcept { return embed_dim_; }
 
 private:
+    // (n_slots, 1, c) pooling weights per coarse slot. Uniform 1/c, or — when mask_aware_pool_ — a
+    // mean over the slot's non-[MASK] tokens (uniform fallback if the whole slot is masked). Built on
+    // host from token_ids so the coarse plan summarises the VISIBLE canvas, not the [MASK] noise.
+    [[nodiscard]] sub0llm::Tensor build_pool_selector(const sub0llm::Tensor& token_ids,
+                                                      std::int64_t n_slots) const {
+        sub0llm::Tensor sel({n_slots, 1, coarsen_}, sub0llm::DType::Float32);
+        auto s = sel.data_as<float>();
+        if (!mask_aware_pool_) {
+            std::fill(s.begin(), s.end(), 1.0f / static_cast<float>(coarsen_));
+            return sel;
+        }
+        const sub0llm::Tensor ids_h =
+            token_ids.device().is_cpu() ? token_ids : token_ids.to(sub0llm::Device::cpu());
+        const auto ids = ids_h.data_as<std::int32_t>();
+        const std::int32_t mask = mask_id();
+        for (std::int64_t g = 0; g < n_slots; ++g) {
+            std::int64_t vis = 0;
+            for (std::int64_t j = 0; j < coarsen_; ++j)
+                if (ids[static_cast<std::size_t>(g * coarsen_ + j)] != mask) ++vis;
+            const float wv = vis > 0 ? 1.0f / static_cast<float>(vis) : 1.0f / static_cast<float>(coarsen_);
+            for (std::int64_t j = 0; j < coarsen_; ++j) {
+                const bool visible = ids[static_cast<std::size_t>(g * coarsen_ + j)] != mask;
+                s[static_cast<std::size_t>(g * coarsen_ + j)] = (vis == 0 || visible) ? wv : 0.0f;
+            }
+        }
+        return sel;
+    }
+
     std::int64_t                    real_vocab_, embed_dim_, coarsen_, window_;
+    bool                            mask_aware_pool_ = false;
     sub0llm::nn::Embedding          tok_emb_;
     std::vector<BidirectionalBlock> coarse_, fine_;
     sub0llm::nn::RMSNorm            ln_f_;

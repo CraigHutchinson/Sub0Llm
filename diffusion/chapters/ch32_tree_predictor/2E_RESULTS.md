@@ -54,6 +54,31 @@ follow-up lever:
    (Ch28: edges recover ~40% vs ~62% interior, [[ch28-curriculum-findings]]). → **2d**: halo overlap /
    edge conditioning / a global refine sweep.
 
+## 2c — mask-aware coarse pooling (RAN): closes the CONTENT gap, isolates seams as the rest
+
+The first 2c lever — pool each coarse slot over its VISIBLE (non-`[MASK]`) tokens only, instead of a
+uniform mean that averages in ~50% `[MASK]` garbage at noise 0.5 (`HierDenoiser(..., mask_aware=true)`,
+free — pooling weights cost nothing). Same data/budget A/B, flat vs hier-uniform vs hier-mask-aware:
+
+| N | flat | hier-unif | **hier-mask** | overall gap unif→mask | **content gap unif→mask** | function NLL (mask vs flat) |
+|---|-----:|----------:|--------------:|----------------------:|--------------------------:|----------------------------:|
+| 256 | 2.549 | 3.495 (+37.1%) | **3.295 (+29.3%)** | closes 21% | **+13.4% → +6.6%** | 2.008 vs 1.216 |
+| 512 | 2.703 | 3.336 (+23.4%) | **3.262 (+20.7%)** | closes 12% | **+2.9% → +0.5%** | 1.944 vs 1.267 |
+
+- **Content-word gap halves at N=256 and nearly vanishes at N=512 (+0.5%).** Once the coarse plan stops
+  summarising `[MASK]` noise, it carries topic/content almost as well as full `O(N²)` attention — the
+  coarsening hypothesis (long-range info compresses into a cheap plan) is confirmed for content.
+- **The remaining gap is now almost ENTIRELY function words** (at N=512: content +0.5% but function
+  +53%). Function words are *local grammar/glue*; what the `w=64` fine windows lack is cross-window flow
+  at the **boundaries**. So 2c cleanly splits the gap: **content/long-range → solved by the coarse plan;
+  function/local-grammar-across-seams → the remaining cost → 2d's job.**
+- Compute win unchanged (6.4×/10.7× fewer ops, ~2× wall-clock) — mask-aware pooling is a free accuracy
+  gain.
+
+Next 2c+ levers (if needed beyond seams): a *learned* attention-pool / IB objective on the coarse plan;
+this run shows even the trivial mask-aware mean nearly closes content, so the headroom there is small —
+**2d (seams) is the higher-value next lever.**
+
 ## Frontier verdict & next
 
 The gist-as-coarsening design is a **real efficiency/context primitive**: an order-of-magnitude compute

@@ -83,6 +83,13 @@ P1 codec. **Do not build P2 on char-composition.**
   real but shrinking** — hier +41→**29%** NLL (content +13→**7%**) as N grows. The naive mean-pool
   coarse plan + no cross-window attention + 50%-masked coarse input explain the gap → the explicit
   targets for 2c/2d. See [`2E_RESULTS.md`](2E_RESULTS.md). **2e is now the scoreboard for 2c/2d.**
+- **P2 2c (mask-aware coarse pooling) RAN** — pool each coarse slot over its VISIBLE (non-`[MASK]`)
+  tokens only (`HierDenoiser(mask_aware=true)`, free). **Closes the CONTENT-word gap: +13.4%→+6.6% at
+  N=256, +2.9%→+0.5% at N=512** (coarse plan now carries topic ≈ as well as flat attention); overall gap
+  closes 12–21%. The **remaining gap is now almost entirely FUNCTION words** (N=512: content +0.5% but
+  function +53%) = local grammar across window **seams** → squarely **2d's** job. Compute win unchanged.
+  See [`2E_RESULTS.md`](2E_RESULTS.md) §2c. Also recorded: DESIGN_REVIEW_3 §8 **verbosity/time slider**
+  (gist separates meaning from surface → terseness/latency dial; future, needs HierDenoiser generation).
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
