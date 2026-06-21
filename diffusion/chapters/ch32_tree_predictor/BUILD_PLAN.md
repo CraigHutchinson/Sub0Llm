@@ -41,15 +41,22 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
 - **P1 1c follow-up (1) rare-weighted 2×2 RAN — rare-weighting helps but does NOT rescue the codec**
   (runner `ch32_oov_ab`, now full 2×2; `tok_weight` wired into `batched_diffusion_loss`). Rare-aware
   loss lowers the cliff on *both* models (baseline 6.36→**4.85×**, codec 8.10→5.66×), but under the
-  identical objective the plain baseline still beats the codec (4.85× vs 5.66×, and worse rare NLL in
-  absolute nats). Culprit isolated: the **additive gate** retains the noisy rare lookup. The simple
-  rare-weighted objective is the robust cliff lever in hand. See [`1C_RESULTS.md`](1C_RESULTS.md) §Follow-up (1).
+  identical objective the plain baseline still beats the codec. Culprit isolated: the **additive
+  gate** retains the noisy rare lookup. See [`1C_RESULTS.md`](1C_RESULTS.md) §Follow-up (1).
+- **P1 1c follow-up (2)+(3) convex+pretrain RAN — char-composition FALSIFIED at the PREMISE level.**
+  With a near-perfect spelling autoencoder (composer pretrained to recon-CE **0.026**), *replacing*
+  the rare lookup with the composed vector makes rare words **much worse** (NLL_rare 23.1 vs baseline
+  12.1; cliff **7.68× vs 4.72×**). Mechanism isolated: the composed vector is a faithful *spelling*
+  encoding, the embedding is *weight-tied to the LM head*, so spelling-similar words ("cat"/"cap")
+  collide at the output. **Spelling geometry ≠ prediction geometry.** Three integrations all lose to
+  a plain rare-weighted baseline. See [`1C_RESULTS.md`](1C_RESULTS.md) §Follow-up (2)+(3).
 
-**Next:** follow-up (2) — convex blend that *replaces* lookup for rare words
-(`E = g·lookup + (1−g)·composed`, `g→0` for low-freq types) **+** (3) composer *pretraining* (so
-`composed_rare` is a real spelling vector before the LM objective biases it toward common). (2) is
-now the best-motivated test; the 2×2 shows *additive* blending of an LM-trained composer does not work.
-**Do not build P2 assuming 1c closed the cliff — it did not.** (Phase-0 **M2** topic-drift also remains, for P2.)
+**P1 verdict (closed):** the OOV cliff is real (M1) and **reducible by the rare-weighted objective
+alone** (best arm of all, ~4.7×) — adopt that. **Char-composition as an OOV *embedding* mechanism is
+the wrong tool and does NOT enter P2/P3** (spelling≠prediction geometry under a tied head). Any future
+sub-word/OOV info must enter as an *input-side feature the model re-embeds* (concatenated, not tied,
+not substituted into the output projection) — a different design with its own kill-test, outside the
+P1 codec. **Do not build P2 on char-composition.** (Phase-0 **M2** topic-drift remains, for P2.)
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

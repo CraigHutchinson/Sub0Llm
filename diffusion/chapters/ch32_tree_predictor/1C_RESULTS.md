@@ -111,3 +111,56 @@ exactly what (3) guarantees; this 2×2 shows additive blending of an LM-trained 
 it), but the char-composition layer as designed (additive gate) does not deliver OOV robustness over
 a matched baseline. Do not build P2 on it. The cheap, robust lever in hand is the rare-weighted
 objective itself.
+
+---
+
+# Follow-up (2)+(3): convex blend (drop lookup for rare) + composer pretraining — the DECISIVE test
+
+**Status: char-composition for the OOV cliff is FALSIFIED at the PREMISE level. With a near-perfect
+spelling autoencoder (composer pretrained to recon-CE 0.026), REPLACING the rare-word lookup with
+its composed spelling vector makes rare words *much worse* (NLL_rare 23.1 vs baseline 12.1; cliff
+7.68× vs 4.72×). The composed vector is a faithful SPELLING encoding — and that is exactly why it
+hurts: the weight-tied LM head needs DISTRIBUTIONAL geometry, not orthographic geometry.**
+
+This addressed both isolated culprits from the 2×2 at once: the *additive gate* (→ convex-fixed
+blend that **replaces** lookup for rare words, `E = g·lookup + (1−g)·composed`, `g=0` rare / `g=1`
+common, [`codec_denoiser.hpp`](../../include/sub0diff/nn/codec_denoiser.hpp) `Blend::ConvexFixed`)
+and *composed_rare quality* (→ pretrain the composer as a char autoencoder first,
+`pretrain_composer` in [`oov_ab.cpp`](oov_ab.cpp), follow-up 3). All arms rare-weighted.
+
+Word-TinyStories, 570 train paragraphs → 1749-word vocab, D=256 L=4 T=64, 2000 steps each,
+`rare_weight 38.4`; pretrain 1000 steps mb 64 (**recon-CE 0.553→0.200→0.182→0.085→0.026** — the
+composer learned to spell almost perfectly):
+
+| arm | NLL_common | NLL_rare | cliff |
+|-----|-----------:|---------:|------:|
+| baseline / rare-weighted | 2.564 | 12.096 | **4.72×** ← best |
+| codec / additive / rw | 2.516 | 13.809 | 5.49× |
+| codec / convex+pretrain / rw | 3.009 | **23.116** | 7.68× ← much WORSE |
+
+**The mechanism (now isolated, not speculative).** Pretraining succeeded (recon-CE 0.026), so
+`composed_rare` is a *good, distinct* spelling vector — this is no longer an undertraining excuse.
+Yet substituting it for the lookup nearly **doubles** rare NLL. Why: a spelling encoder maps
+orthographically-similar words ("cat"/"cap"/"car", "running"/"runner") to *nearby* vectors. The
+embedding table is **weight-tied to the LM head**, so those near-identical rows produce near-identical
+logits — spelling neighbours become mutually confusable at the output. The plain lookup row is free
+to sit wherever the *prediction* task wants (distributional/semantic neighbourhood), which is what a
+masked-token objective rewards. **Content-addressing by spelling trades "OOV word = missing row" for
+"OOV word = collides with every spelling neighbour" — and the collision is worse than the hole.**
+
+**This falsifies P1's premise**, not just an integration choice. P1 assumed (DESIGN_REVIEW §6) that a
+spelling→vector map makes an unseen word "no longer a hole". It does fill the hole — with a vector in
+the *wrong metric space* for the LM head. Three independent integrations (additive/unweighted,
+additive/rare-weighted, convex+pretrain/rare-weighted) all lose to a plain rare-weighted baseline,
+and the convex+pretrain arm — the one engineered to give composed every advantage — loses by the most.
+
+## Verdict for the hierarchy
+
+- **The OOV cliff is real (M1) and reducible — by the rare-weighted objective alone** (baseline/rw
+  4.72–4.85×, the best of every arm tried). That is the cheap, robust lever; adopt it.
+- **Char-composition as an OOV *embedding* mechanism is the wrong tool** and should not be carried
+  into P2/P3. Spelling geometry ≠ prediction geometry under a weight-tied head.
+- If sub-word/OOV info is still wanted later, it must enter as an *input-side feature that the model
+  is free to re-embed* (so the LM head stays in distributional space) — e.g. concatenated, not tied,
+  and not substituted into the output projection — NOT as the tied embedding row. That is a different
+  design, outside P1's char-composition codec, and is not assumed to work without its own kill-test.

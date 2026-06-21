@@ -8,6 +8,7 @@
 // Build: cmake --build build-cuda --target ch32_oov_ab ; run with --device cuda.
 
 #include "sub0diff/eval/oov_cliff.hpp"
+#include "sub0diff/nn/char_codec.hpp"
 #include "sub0diff/nn/codec_denoiser.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
@@ -76,6 +77,50 @@ sub0llm::Tensor build_word_chars(const BPETokenizer& tok, std::int64_t Vm, std::
                     : pad;
     }
     return wc;
+}
+
+// Pretrain a CharComposer as a char autoencoder (compose→decode→reconstruct each word's spelling)
+// so its composed vectors are meaningful BEFORE the LM objective biases them toward common words
+// (1C_RESULTS.md follow-up 3). Trains composer + a throwaway decoder on the GPU; the composer is a
+// reference into the CodecDenoiser, so its weights are updated in place.
+void pretrain_composer(dn::CharComposer& comp, std::int64_t n_chars, std::int64_t D,
+                       const sub0llm::Tensor& word_chars, std::int64_t Vm, std::int64_t max_len,
+                       int steps, std::int64_t mb, std::uint64_t seed) {
+    dn::CharDecoder dec(n_chars, D, 8, 4, /*depth=*/2, 0, seed, max_len);
+    comp.to(sub0llm::Device::cuda());
+    dec.to(sub0llm::Device::cuda());
+    std::vector<sub0llm::autograd::Variable*> params = comp.parameters();
+    auto dp = dec.parameters();
+    params.insert(params.end(), dp.begin(), dp.end());
+    sub0llm::nn::Adam opt(params, 1e-3f);
+    const auto wc = word_chars.data_as<std::int32_t>();
+    std::mt19937 rng(static_cast<std::uint32_t>(seed));
+    std::uniform_int_distribution<std::int64_t> wid(0, Vm - 1);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int s = 0; s < steps; ++s) {
+        for (auto* p : params)
+            if (p->grad().numel() > 0)
+                p->grad() = sub0llm::zeros(p->data().shape(), p->data().dtype(), p->data().device());
+        sub0llm::autograd::Variable loss;
+        for (std::int64_t j = 0; j < mb; ++j) {
+            const std::int64_t id = wid(rng);
+            sub0llm::Tensor ci({max_len}, sub0llm::DType::Int32);
+            auto cid = ci.data_as<std::int32_t>();
+            for (std::int64_t k = 0; k < max_len; ++k)
+                cid[static_cast<std::size_t>(k)] = wc[static_cast<std::size_t>(id * max_len + k)];
+            auto l = dn::char_recon_loss(comp, dec, ci);
+            loss = (j == 0) ? l : sub0llm::autograd::add(loss, l);
+        }
+        loss = sub0llm::autograd::scale(loss, 1.0f / static_cast<float>(mb));
+        loss.backward();
+        (void)sub0llm::nn::clip_grad_norm(params, 5.0f);
+        opt.step();
+        if ((s + 1) % 200 == 0)
+            std::println("  [pretrain] step {:>4}  recon_ce={:.4f}  ({:.1f}s)", s + 1,
+                         static_cast<double>(loss.data().to(sub0llm::Device::cpu()).item<float>()),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
 }
 
 template <class Model>
@@ -179,6 +224,57 @@ int main(int argc, char** argv) {
     std::println("rare-aware objective: common {} / rare {} masked-eligible tokens (ratio {:.1f}); "
                  "rare_weight = {:.1f} {}", n_common_tok, n_rare_tok, auto_rw, rw,
                  rw_arg > 0 ? "(fixed)" : "(auto = balance mass)");
+
+    // ── Follow-up (2)+(3): convex-blend (drop lookup for rare) + composer pretraining ──────────────
+    // The 2×2 isolated the additive gate as the culprit. This branch tests the fix: a fixed convex
+    // blend that REPLACES lookup with the char-composed vector for rare words, with the composer
+    // PRETRAINED as a spelling autoencoder first. All arms rare-weighted (the better objective). The
+    // question: does codec/convex+pretrain finally beat baseline/rw on the cliff?
+    if (arg_i(argc, argv, "--convex", 0) > 0) {
+        const int pre_steps = static_cast<int>(arg_i(argc, argv, "--pretrain", 600));
+        const std::int64_t pre_mb = arg_i(argc, argv, "--pretrain_mb", 64);
+
+        std::println("\n-- [convex experiment] BASELINE Denoiser, RARE-WEIGHTED (control) --");
+        dn::Denoiser base_rw(Vr, D, 8, 4, L, 0, /*seed=*/7);
+        train(base_rw, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "base/rw", tok_w);
+        const auto c_base_rw = cliff(base_rw, eval_ids, is_rare, T, windows);
+
+        std::println("\n-- [convex experiment] CodecDenoiser ADDITIVE, RARE-WEIGHTED (control) --");
+        dn::CodecDenoiser codec_add(Vr, D, 8, 4, L, 0, 257, maxlen, word_chars, /*seed=*/7);
+        train(codec_add, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec/add", tok_w);
+        const auto c_codec_add = cliff(codec_add, eval_ids, is_rare, T, windows);
+
+        std::println("\n-- [convex experiment] CodecDenoiser CONVEX+PRETRAIN, RARE-WEIGHTED (the test) --");
+        dn::CodecDenoiser codec_cv(Vr, D, 8, 4, L, 0, 257, maxlen, word_chars, /*seed=*/7,
+                                   dn::CodecDenoiser::Blend::ConvexFixed, is_rare);
+        std::println("  pretraining composer ({} steps, mb {})...", pre_steps, pre_mb);
+        pretrain_composer(codec_cv.composer(), 257, D, word_chars, Vr + 1, maxlen,
+                          pre_steps, pre_mb, /*seed=*/9000);
+        train(codec_cv, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec/cv", tok_w);
+        const auto c_codec_cv = cliff(codec_cv, eval_ids, is_rare, T, windows);
+
+        auto row = [](const char* tag, const de::OovCliffResult& r) {
+            std::println("  {:<22} NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x", tag,
+                         r.nll_common(), r.nll_rare(), r.ratio());
+        };
+        std::println("\n===== OOV convex-blend + pretrain (rarest 50%; rare_weight {:.1f}) =====", rw);
+        row("baseline/rw",            c_base_rw);
+        row("codec/additive/rw",      c_codec_add);
+        row("codec/convex+pre/rw",    c_codec_cv);
+        const double cv_vs_base = c_base_rw.ratio() > 0
+            ? (c_base_rw.ratio() - c_codec_cv.ratio()) / c_base_rw.ratio() * 100.0 : 0.0;
+        const double cv_vs_add = c_codec_add.ratio() > 0
+            ? (c_codec_add.ratio() - c_codec_cv.ratio()) / c_codec_add.ratio() * 100.0 : 0.0;
+        std::println("\n  convex+pretrain vs additive codec: cliff {:.2f}x -> {:.2f}x ({:+.0f}%)",
+                     c_codec_add.ratio(), c_codec_cv.ratio(), -cv_vs_add);
+        std::println("  convex+pretrain vs baseline (both rare-weighted): {:.2f}x vs {:.2f}x ({:+.0f}% for codec)",
+                     c_codec_cv.ratio(), c_base_rw.ratio(), cv_vs_base);
+        std::println("  VERDICT: {}",
+                     (c_codec_cv.ratio() < c_base_rw.ratio())
+                         ? "codec convex+pretrain BEATS baseline on the cliff — char-composition salvageable"
+                         : "codec still does not beat baseline — see numbers");
+        return 0;
+    }
 
     // 2×2: {baseline, codec} × {unweighted, rare-weighted}, identical data split + seeds.
     std::println("\n-- BASELINE Denoiser, UNWEIGHTED --");
