@@ -13,3 +13,7 @@ target_link_libraries(ch32_gist_ab PRIVATE sub0diff)
 # P2 2e coarse-to-fine vs flat (efficiency/context benchmark).
 add_executable(ch32_hier_ab hier_ab.cpp)
 target_link_libraries(ch32_hier_ab PRIVATE sub0diff)
+
+# P2 HierDenoiser generation + M2-on-generations (flat vs coarse-to-fine).
+add_executable(ch32_hier_gen hier_gen.cpp)
+target_link_libraries(ch32_hier_gen PRIVATE sub0diff)
