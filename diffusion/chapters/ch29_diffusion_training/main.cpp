@@ -1002,12 +1002,11 @@ static int run(int argc, char** argv) {
         section("4. Training — skipped (checkpoint already at target steps)");
     }
 
-#ifdef SUB0LLM_CUDA
-    // The post-training diagnostics (§5 held-out eval, recall sweep, per-t) are run-once probes that
-    // read logits/argmax via host pointers (recall, recovery). Move the model back to CPU so they
-    // work unchanged — these aren't on the iteration hot path, so the H2D/D2H cost is irrelevant.
-    if (use_cuda) model.to(sub0llm::Device::cpu());
-#endif
+    // Post-training diagnostics (§5 held-out eval, recall sweep, per-t) now run on the model's
+    // device: held-out NELBO is diffusion_loss (CUDA), and evaluate_recovery runs the forward on
+    // the GPU and D2H's only the (T,vocab) logits for its host-side argmax. So a GPU-trained model
+    // keeps its diagnostics on the GPU — the recall sweep was the dominant wall-time cost of a full
+    // run, and the forward is the expensive part. (--inspect is opt-in and not exercised here.)
 
     // ── 5'. OVERFIT verdict: per-noise TRAIN recall over the N fixed windows ────────
     // Held-out eval is meaningless here (we deliberately trained on N windows only), so

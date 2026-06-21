@@ -25,7 +25,12 @@ RecoveryResult evaluate_recovery(const nn::Denoiser& model,
 
     const float noise = static_cast<float>(n_masked) / static_cast<float>(T);
     auto logits = model.forward(input, noise);
-    const auto lz = logits.data().data_as<float>();
+    // The forward runs on the model's device (GPU when training on cuda — the expensive part stays
+    // on the GPU); bring only the (T, vocab) logits to host for the argmax below.
+    const Tensor lh = logits.data().device().is_cpu()
+                          ? logits.data()
+                          : logits.data().to(sub0llm::Device::cpu());
+    const auto lz = lh.data_as<float>();
     const auto C = static_cast<std::size_t>(model.model_vocab());
     const auto V = model.real_vocab();   // argmax over real tokens only
 
