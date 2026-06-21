@@ -4,6 +4,7 @@
 #include "sub0diff/eval/oov_cliff.hpp"
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/char_codec.hpp"
+#include "sub0diff/nn/codec_denoiser.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
 #include "sub0diff/nn/sampler.hpp"
@@ -476,6 +477,60 @@ TEST_CASE("CharComposer::compose_vocab matches per-word forward (P1 1c)", "[diff
         }
         REQUIRE(std::sqrt(se / std::max(sref, 1e-12)) < 1e-4);   // batched row == single forward
     }
+}
+
+// P1 1c: the CodecDenoiser (lookup + alpha·composed embedding, weight-tied LM head) trains, and the
+// composed path activates (alpha moves off its 0 init). Full OOV-cliff A/B needs the loss/eval
+// generalised to the model type; this validates the model end-to-end in isolation.
+TEST_CASE("CodecDenoiser trains; composed path activates (P1 1c)", "[diffusion][char_codec]") {
+    using sub0diff::nn::CodecDenoiser;
+    namespace ag = sub0llm::autograd;
+    const std::int64_t V = 16, D = 32, n_chars = 27, L = 4, T = 16;
+
+    sub0llm::Tensor word_chars({(V + 1) * L}, sub0llm::DType::Int32);
+    {
+        auto wc = word_chars.data_as<std::int32_t>();
+        for (std::int64_t id = 0; id <= V; ++id)
+            for (std::int64_t j = 0; j < L; ++j)
+                wc[static_cast<std::size_t>(id * L + j)] =
+                    (id < V) ? static_cast<std::int32_t>((id * 3 + j) % 26) : 26;   // mask id → pad
+    }
+    CodecDenoiser model(V, D, /*n_heads=*/4, /*n_kv_heads=*/2, /*n_layers=*/1, /*d_ff=*/0,
+                        n_chars, L, word_chars, /*seed=*/5);
+    auto params = model.parameters();
+    sub0llm::nn::Adam opt(params, 3e-2f);
+
+    const auto clean = ramp_tokens(static_cast<std::size_t>(T), static_cast<std::int32_t>(V));
+    sub0llm::Tensor targets({T}, sub0llm::DType::Int32), weights({T}, sub0llm::DType::Float32);
+    std::copy(clean.begin(), clean.end(), targets.data_as<std::int32_t>().begin());
+    {
+        auto w = weights.data_as<float>();
+        for (std::int64_t t = 0; t < T; ++t) w[static_cast<std::size_t>(t)] = (t % 3 == 0) ? 1.0f : 0.0f;
+    }
+    sub0llm::Tensor input({T}, sub0llm::DType::Int32);
+    {
+        auto is = input.data_as<std::int32_t>();
+        for (std::int64_t t = 0; t < T; ++t)
+            is[static_cast<std::size_t>(t)] = (t % 3 == 0) ? model.mask_id() : clean[static_cast<std::size_t>(t)];
+    }
+
+    float first = 0.0f, last = 0.0f;
+    for (int step = 0; step < 120; ++step) {
+        opt.zero_grad();
+        auto logits = model.forward(input, 0.5f);                       // (T, Vm)
+        auto loss   = ag::weighted_cross_entropy(logits, targets, weights);
+        loss.backward();
+        opt.step();
+        last = loss.data().item<float>();
+        if (step == 0) first = last;
+    }
+    REQUIRE(last < first);                                              // CodecDenoiser learns
+
+    const auto az = model.alpha().data().data_as<float>();
+    double mabs = 0.0;
+    for (auto a : az) mabs += std::abs(static_cast<double>(a));
+    mabs /= static_cast<double>(az.size());
+    REQUIRE(mabs > 1e-4);                                               // composed path activated
 }
 
 TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diffusion]") {
