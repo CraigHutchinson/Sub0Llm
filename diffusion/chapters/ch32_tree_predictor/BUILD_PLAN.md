@@ -33,11 +33,16 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
   on the model type. All tested in isolation (compose parity, trains + alpha activates). See
   [`P1_RESULTS.md`](P1_RESULTS.md).
 
-**Next:** run the P1 1c **OOV A/B** — train a `CodecDenoiser` on word-TinyStories and re-run M1. Needs a
-runner: generalise `evaluate_oov_cliff`/`evaluate_corpus_recall` on the model type + a `--codec` ch29
-mode, OR a small standalone experiment (load banked tokenizer + tokens.bin, build the `word_chars`
-table, train, measure). Bar: the **8.08× cliff → ~1** while in-vocab NLL (1.91) holds. (Phase-0 **M2**
-topic-drift remains, for P2.)
+- **P1 1c OOV A/B RAN — the naive codec FAILS the kill-test** (commit pending, runner `ch32_oov_ab`).
+  Step-budget-matched baseline vs CodecDenoiser on word-TinyStories: cliff **6.50× → 8.08× (WORSE)**;
+  in-vocab NLL −1.9% (slightly better). The shared composer is optimised by a common-word-dominated
+  loss (~14:1), so it helps common words and the additive gate leaves rare words *more* confusable.
+  This is a falsification, not a pass. See [`1C_RESULTS.md`](1C_RESULTS.md).
+
+**Next:** the OOV layer needs a **rare-aware objective** before it can work — most directly a
+frequency-balanced / rare-weighted masked loss so the composer is forced to learn rare spellings
+(1C_RESULTS.md §follow-ups). Re-run `ch32_oov_ab` after that. **Do not build P2 assuming 1c closed the
+cliff — it did not.** (Phase-0 **M2** topic-drift also remains, for P2.)
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
