@@ -66,6 +66,17 @@ P1 codec. **Do not build P2 on char-composition.**
   homogeneous TinyStories; the valid control is a *distribution-matched* unigram null. See
   [`M2_RESULTS.md`](M2_RESULTS.md). **P2 gate: lift model recurrence 0.021 → 0.121 without looping.**
 
+- **P2 2b (gist conditioning) RAN + REFRAMED** — `GistDenoiser` (visible-content-word gist, learned
+  proj init 0), runner `ch32_gist_ab` with a capacity+init-matched **shuffled-gist control**. 3 seeds:
+  real gist beats shuffled in 3/3 (~2% NLL) ⇒ real signal, NOT capacity — but does NOT net-beat a flat
+  baseline. Cause: **in a bidirectional denoiser a gist of VISIBLE tokens is redundant with
+  self-attention over them** ([`2B_RESULTS.md`](2B_RESULTS.md)). **RETROSPECTIVE
+  ([`DESIGN_REVIEW_3.md`](DESIGN_REVIEW_3.md)):** the single-window NLL kill-test tested the WRONG thing
+  — the gist is a **coarsening / compute-decomposition primitive** (coarse plan → parallel fine
+  sub-windows): ~15× less work, ~256× less attention memory, extended context, at a controllable
+  cross-window accuracy cost. The within-window redundancy is the FLOOR (consistent with the reframe),
+  not a verdict. **P2/P3 are the same coarsen operator at different depths.**
+
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
 capacity numerics).
@@ -130,17 +141,21 @@ before integration (1c).
 
 ---
 
-## Phase 2 — Gist conditioning (the topic-drift fix). **Builds on P1**
-Adds level A as conditioning; the two Review-II objectives give it teeth.
+## Phase 2 — Gist as a COMPUTE/CONTEXT primitive (re-scoped). **Builds on P1**
+The gist is a **coarsening operator** for coarse-to-fine, parallel sub-window generation — NOT a
+within-window accuracy fix (DESIGN_REVIEW_3, after the 2b retrospective). Judge it by runtime +
+context + a bounded cross-window accuracy gap, not single-window NLL.
 
 | step | building block | test | kills design if… |
 |---|---|---|---|
-| 2a | `is_content` table (frequency split, mirrors `is_word_start`) | content-word subsequence reads as a sensible gist on held-out stories | the freq split doesn't separate gist from grammar |
-| 2b | `GistPlanner` pools content words → `g`; condition `Denoiser` via AdaLN | conditioning on `g` **lowers masked-token NLL** (the feudal signal, Review II §5) | `g` gives no NLL improvement (it's ignored) |
-| 2c | **IB-pooling** objective (Review II §3): train `g` to keep info predictive of the rest of the passage | `g` predicts future content words > mean-pool baseline | IB `g` no better than mean-pool |
-| 2d | **Feudal** training: train `g` by the worker-loss *improvement* it causes | ablation 2d vs 2b: lower **M2** drift | feudal `g` doesn't beat reconstruction `g` on M2 |
+| 2a | `is_content` table (frequency split) | **DONE** — `content_type_mask`; M2 uses it | — |
+| 2b | `GistDenoiser` (content gist, learned proj) + shuffled-gist control | **DONE/REFRAMED** — real signal vs control but within-window-redundant; see DESIGN_REVIEW_3 | (re-scoped: single-window NLL was the wrong gate) |
+| **2e** | **coarse-to-fine generator**: coarse plan `G` over full N → `M=N/w` parallel fine windows conditioned on `G` (reuse batched block-diagonal forward + shared broadcast gist) | **the real gate** — tok/s & memory vs flat at N≫w (expect ~15× work / ~256× attn-mem), and small flat−hierarchical NLL / M2-recurrence gap | the accuracy gap at large N is large AND not closable by 2c / boundary fixes |
+| 2c | **IB-pooling**: train `G` to retain long-range predictive info | shrinks the flat−hierarchical gap (2e) vs mean-pool `G` | IB `G` no better than mean-pool on the 2e gap |
+| 2d | boundary/seam handling (halo overlap, edge conditioning, global refine sweep) | window-edge recovery ≈ interior (cf. Ch28 40% vs 62%); seam rate ↓ | seams can't be closed without erasing the compute win |
 
-*Exit:* M2 drift drops vs P1, attributable (via 2c/2d ablations) to a gist that carries predictive info.
+*Exit:* the coarse-to-fine generator hits an order-of-magnitude compute/memory/context win at N≫w with
+a small, 2c/2d-shrinkable accuracy gap vs flat — i.e. the gist earns its place as a scaling primitive.
 
 ---
 
