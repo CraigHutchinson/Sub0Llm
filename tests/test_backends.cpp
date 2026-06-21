@@ -303,6 +303,23 @@ TEST_CASE("adam step - CUDA matches CPU reference", "[backends][cuda][device]") 
 #endif
 }
 
+// Stage 4 Phase 7: Σx² reduction on CUDA (used by clip_grad_norm on GPU grads) must match
+// the CPU sum-of-squares, including a non-block-multiple, multi-grid-stride size.
+TEST_CASE("sum_squares - CUDA matches CPU reference", "[backends][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    const int64_t n = 300003;                          // > one 256-block grid → exercises grid-stride
+    Tensor x = randn({n});
+    double ref = 0.0;
+    { const auto xs = x.data_as<float>();
+      for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i)
+          ref += static_cast<double>(xs[i]) * static_cast<double>(xs[i]); }
+    const float gpu = backend::cuda::sum_squares(x.to(Device::cuda()));
+    REQUIRE(std::abs(gpu - static_cast<float>(ref)) / static_cast<float>(ref) < 1e-4f);
+#else
+    SUCCEED("CPU build - CUDA sum_squares parity is exercised on the cuda preset");
+#endif
+}
+
 // Stage 4 Phase 7: batched (3D) matmul / matmul_bt / matmul_tb on CUDA (multi-head attention)
 // must match the CPU reference — dispatched per-slice to the validated 2D kernels.
 TEST_CASE("batched matmul - CUDA matches CPU reference", "[backends][cuda][device]") {

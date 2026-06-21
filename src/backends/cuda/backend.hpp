@@ -55,6 +55,9 @@ void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
                    float b1, float omB1, float b2, float omB2,
                    float lrBc1, float invBc2, float eps, float wd_keep);
 
+// Σ xᵢ² over all elements, returned to host. For clip_grad_norm on CUDA grads.
+[[nodiscard]] float sum_squares(const Tensor& t);
+
 // bias_add forward: (N,C) x + (C,) bias broadcast over rows → (N,C) on x's device.
 [[nodiscard]] Tensor bias_add(const Tensor& x, const Tensor& b);
 // bias_add backward (bias grad): (N,C) upstream → (C,) column-sum on g's device.

@@ -180,6 +180,24 @@ void copy_strided_f32(const float* src, float* dst,
 #endif
 }
 
+float sum_squares(const Tensor& t) {
+#ifdef SUB0LLM_CUDA
+    float* dscalar = nullptr;
+    if (cudaMalloc(&dscalar, sizeof(float)) != cudaSuccess)
+        throw std::runtime_error("sum_squares: cudaMalloc failed");
+    cudaMemset(dscalar, 0, sizeof(float));
+    kernels::launch_sum_sq_f32(reinterpret_cast<const float*>(t.raw_ptr()), dscalar,
+                               static_cast<std::size_t>(t.numel()));
+    float host = 0.0f;
+    memcpy_d2h(&host, dscalar, sizeof(float), t.device().index);
+    cudaFree(dscalar);
+    return host;
+#else
+    (void)t;
+    throw std::runtime_error("CUDA backend not compiled in");
+#endif
+}
+
 void adam_step_f32(float* p, const float* g, float* m, float* v, std::size_t n,
                    float b1, float omB1, float b2, float omB2,
                    float lrBc1, float invBc2, float eps, float wd_keep) {

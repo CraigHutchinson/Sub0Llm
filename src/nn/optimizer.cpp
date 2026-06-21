@@ -46,8 +46,12 @@ float clip_grad_norm(const std::vector<autograd::Variable*>& params,
     float norm_sq = 0.0f;
     for (const auto* p : params) {
         if (p->grad().numel() == 0) continue;
-        const float n = ops::norm(p->grad());
-        norm_sq += n * n;
+        if (p->grad().device().is_cuda()) {
+            norm_sq += backend::cuda::sum_squares(p->grad());   // GPU reduction → host scalar
+        } else {
+            const float n = ops::norm(p->grad());
+            norm_sq += n * n;
+        }
     }
     const float grad_norm = std::sqrt(norm_sq);
     // Guard divisor separately so tiny max_norm values still trigger clipping.
@@ -55,7 +59,10 @@ float clip_grad_norm(const std::vector<autograd::Variable*>& params,
         const float scale = max_norm / std::max(grad_norm, 1e-12f);
         for (auto* p : params) {
             if (p->grad().numel() == 0) continue;
-            for (float& g : p->grad().data_as<float>()) g *= scale;
+            if (p->grad().device().is_cuda())
+                p->grad() = ops::mul(p->grad(), scale);          // mul_scalar kernel (on-device)
+            else
+                for (float& g : p->grad().data_as<float>()) g *= scale;
         }
     }
     return grad_norm;

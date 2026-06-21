@@ -1008,6 +1008,33 @@ void launch_adam_step_f32(float* p, const float* g, float* m, float* v, std::siz
                                                     lrBc1, invBc2, eps, wd_keep);
 }
 
+// Σ xᵢ² over all n elements → single device scalar (grid-stride, block-reduce, atomicAdd).
+// For clip_grad_norm on CUDA grads. Caller zeroes `out` before launch.
+__global__ void sum_sq_f32_kernel(const float* __restrict__ x, float* __restrict__ out, std::size_t n) {
+    extern __shared__ float sh[];
+    float local = 0.0f;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+        const float v = x[i];
+        local += v * v;
+    }
+    sh[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out, sh[0]);
+}
+
+void launch_sum_sq_f32(const float* x, float* out, std::size_t n) {
+    constexpr int B = 256;                                  // power of two for the tree reduction
+    unsigned blocks = static_cast<unsigned>((n + B - 1) / B);
+    if (blocks < 1u)    blocks = 1u;
+    if (blocks > 1024u) blocks = 1024u;                     // cap; grid-stride covers the remainder
+    sum_sq_f32_kernel<<<blocks, B, B * sizeof(float)>>>(x, out, n);
+}
+
 void launch_bias_add_fwd_f32(const float* x, const float* b, float* out, int N, int C) {
     bias_add_fwd_f32_kernel<<<grid(static_cast<std::size_t>(N) * static_cast<std::size_t>(C), BLOCK),
                               BLOCK>>>(x, b, out, N, C);

@@ -42,10 +42,12 @@ void save_checkpoint(const std::vector<autograd::Variable>& params,
     f.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
     f.write(header_str.data(), static_cast<std::streamsize>(header_str.size()));
 
-    // Raw float32 data for each parameter
+    // Raw float32 data for each parameter. CUDA params are brought to host first (the checkpoint
+    // is device-agnostic on disk; a GPU-trained model resumes on CPU or GPU identically).
     for (const auto& p : params) {
-        const auto sp    = p.data().data_as<float>();
-        const auto n     = static_cast<std::streamsize>(sp.size() * sizeof(float));
+        const Tensor host = p.data().device().is_cpu() ? p.data() : p.data().to(Device::cpu());
+        const auto sp     = host.data_as<float>();
+        const auto n      = static_cast<std::streamsize>(sp.size() * sizeof(float));
         f.write(reinterpret_cast<const char*>(sp.data()), n);
     }
 }
