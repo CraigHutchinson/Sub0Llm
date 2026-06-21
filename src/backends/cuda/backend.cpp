@@ -5,6 +5,10 @@
 #  include <cuda_runtime.h>
 #  include <cublas_v2.h>
 #  include "kernels.cuh"
+#  include <cstdint>
+#  include <mutex>
+#  include <unordered_map>
+#  include <vector>
 #endif
 
 namespace sub0llm::backend::cuda {
@@ -21,6 +25,46 @@ cublasHandle_t cublas() {
     }();
     return h;
 }
+
+// Caching device allocator. cudaMalloc/cudaFree each SYNCHRONISE the device; a single training step
+// allocates hundreds of short-lived intermediates, so raw malloc/free per tensor made GPU training
+// allocation-bound (~5 s/step at word-level vocab — far above the kernel ceiling). Here freed blocks
+// go to a size-keyed free list and are reused instead of released. Training shapes repeat every step,
+// so exact-size reuse drives the steady-state cudaMalloc count to ~zero. (Blocks are written before
+// read — zeros() memsets, every op overwrites its output — so a recycled block is always safe.)
+class CudaPool {
+public:
+    static CudaPool& instance() { static CudaPool p; return p; }
+
+    void* get(std::size_t bytes, int dev) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto& fl = free_[dev][bytes];
+        if (!fl.empty()) { void* p = fl.back(); fl.pop_back(); return p; }
+        cudaSetDevice(dev);
+        void* raw = nullptr;
+        if (const cudaError_t e = cudaMalloc(&raw, bytes); e != cudaSuccess)
+            throw std::runtime_error(
+                std::format("cudaMalloc({} bytes) failed: {}", bytes, cudaGetErrorString(e)));
+        info_[raw] = Info{bytes, dev};
+        return raw;
+    }
+
+    // noexcept (called from Storage::free_fn). On any failure, fall back to a real cudaFree.
+    void put(void* p) noexcept {
+        try {
+            std::lock_guard<std::mutex> lk(mu_);
+            const auto it = info_.find(p);
+            if (it == info_.end()) { cudaFree(p); return; }
+            free_[it->second.dev][it->second.bytes].push_back(p);
+        } catch (...) { cudaFree(p); }
+    }
+
+private:
+    struct Info { std::size_t bytes; int dev; };
+    std::mutex mu_;
+    std::unordered_map<int, std::unordered_map<std::size_t, std::vector<void*>>> free_;
+    std::unordered_map<void*, Info>                                              info_;
+};
 }  // namespace
 #endif
 
@@ -28,19 +72,14 @@ cublasHandle_t cublas() {
 
 std::shared_ptr<Storage> alloc(std::size_t byte_size, int device_index) {
 #ifdef SUB0LLM_CUDA
-    cudaSetDevice(device_index);
-    void* raw = nullptr;
-    const cudaError_t err = cudaMalloc(&raw, byte_size);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(
-            std::format("cudaMalloc({} bytes) failed: {}", byte_size, cudaGetErrorString(err)));
-    }
+    void* raw = CudaPool::instance().get(byte_size, device_index);   // pooled (was raw cudaMalloc)
     auto storage = std::make_shared<Storage>();
     storage->data          = static_cast<std::byte*>(raw);
     storage->byte_capacity = byte_size;
     storage->device        = Device::cuda(device_index);
-    storage->pool_idx      = Storage::kExternal;                 // not pool-owned
-    storage->free_fn       = [](std::byte* p) noexcept { cudaFree(p); };  // captureless → fn ptr
+    storage->pool_idx      = Storage::kExternal;                 // not TensorPool-owned
+    // Return the block to the caching pool instead of releasing it (captureless → fn ptr).
+    storage->free_fn       = [](std::byte* p) noexcept { CudaPool::instance().put(p); };
     return storage;
 #else
     (void)byte_size; (void)device_index;
