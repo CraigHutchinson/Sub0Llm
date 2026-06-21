@@ -38,11 +38,18 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
   in-vocab NLL −1.9% (slightly better). The shared composer is optimised by a common-word-dominated
   loss (~14:1), so it helps common words and the additive gate leaves rare words *more* confusable.
   This is a falsification, not a pass. See [`1C_RESULTS.md`](1C_RESULTS.md).
+- **P1 1c follow-up (1) rare-weighted 2×2 RAN — rare-weighting helps but does NOT rescue the codec**
+  (runner `ch32_oov_ab`, now full 2×2; `tok_weight` wired into `batched_diffusion_loss`). Rare-aware
+  loss lowers the cliff on *both* models (baseline 6.36→**4.85×**, codec 8.10→5.66×), but under the
+  identical objective the plain baseline still beats the codec (4.85× vs 5.66×, and worse rare NLL in
+  absolute nats). Culprit isolated: the **additive gate** retains the noisy rare lookup. The simple
+  rare-weighted objective is the robust cliff lever in hand. See [`1C_RESULTS.md`](1C_RESULTS.md) §Follow-up (1).
 
-**Next:** the OOV layer needs a **rare-aware objective** before it can work — most directly a
-frequency-balanced / rare-weighted masked loss so the composer is forced to learn rare spellings
-(1C_RESULTS.md §follow-ups). Re-run `ch32_oov_ab` after that. **Do not build P2 assuming 1c closed the
-cliff — it did not.** (Phase-0 **M2** topic-drift also remains, for P2.)
+**Next:** follow-up (2) — convex blend that *replaces* lookup for rare words
+(`E = g·lookup + (1−g)·composed`, `g→0` for low-freq types) **+** (3) composer *pretraining* (so
+`composed_rare` is a real spelling vector before the LM objective biases it toward common). (2) is
+now the best-motivated test; the 2×2 shows *additive* blending of an LM-trained composer does not work.
+**Do not build P2 assuming 1c closed the cliff — it did not.** (Phase-0 **M2** topic-drift also remains, for P2.)
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

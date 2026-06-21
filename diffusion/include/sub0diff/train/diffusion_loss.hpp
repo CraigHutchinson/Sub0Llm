@@ -148,6 +148,13 @@ struct BatchedDiffusionLossResult {
 // the single-thread analog of the pool's --shared-t, but B is decoupled from the core count, so a
 // single core can buy arbitrarily high consistency. exact_count: mask EXACTLY round(t·T) positions
 // (removes the Bernoulli count variance) — the other half of the consistency win.
+//
+// tok_weight (Ch32 P1 1c follow-up — the rare-aware objective): an optional per-token-id multiplier
+// (size >= model_vocab, indexed by the CLEAN target id). When given, each masked position's loss
+// weight is scaled by tok_weight[target]. Since weighted_cross_entropy normalises by the weight
+// sum, only the RATIOS matter (loss magnitude stays O(1) nats) — so upweighting rare-type targets
+// forces the shared CharComposer to allocate capacity to rare spellings instead of being swamped by
+// the ~14:1 common-token majority that made the naive 1c codec WORSEN the OOV cliff (1C_RESULTS.md).
 template<class Model, class RNG>
 [[nodiscard]] BatchedDiffusionLossResult
 batched_diffusion_loss(const Model& model,
@@ -159,7 +166,8 @@ batched_diffusion_loss(const Model& model,
                        std::span<const std::uint8_t> is_word_start = {},
                        bool whole_word = false,
                        std::uint64_t seed_base = 0, std::int64_t index0 = 0,
-                       bool contiguous = false) {
+                       bool contiguous = false,
+                       std::span<const float> tok_weight = {}) {
     namespace ag = sub0llm::autograd;
     const std::int64_t B = ctx.B, T = ctx.T;
     auto idd = ctx.ids_input.data_as<std::int32_t>();
@@ -216,8 +224,11 @@ batched_diffusion_loss(const Model& model,
             auto clean = stream.subspan(offsets[static_cast<std::size_t>(b)], static_cast<std::size_t>(T));
             const auto& c = ctx.corr[static_cast<std::size_t>(b)];
             for (std::int64_t i = 0; i < T; ++i) {
-                cl[static_cast<std::size_t>(b * T + i)] = clean[static_cast<std::size_t>(i)];
-                wt[static_cast<std::size_t>(b * T + i)] = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+                const std::int32_t cid = clean[static_cast<std::size_t>(i)];
+                cl[static_cast<std::size_t>(b * T + i)] = cid;
+                float w = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+                if (!tok_weight.empty()) w *= tok_weight[static_cast<std::size_t>(cid)];
+                wt[static_cast<std::size_t>(b * T + i)] = w;
             }
         }
         ag::Variable mean_ce = ag::weighted_cross_entropy(logits, ctx.ids_clean, ctx.weights);
@@ -237,8 +248,11 @@ batched_diffusion_loss(const Model& model,
         auto tbd = tb.data_as<std::int32_t>();
         auto wbd = wb.data_as<float>();
         for (std::int64_t i = 0; i < T; ++i) {
-            tbd[static_cast<std::size_t>(i)] = clean[static_cast<std::size_t>(i)];
-            wbd[static_cast<std::size_t>(i)] = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+            const std::int32_t cid = clean[static_cast<std::size_t>(i)];
+            tbd[static_cast<std::size_t>(i)] = cid;
+            float w = static_cast<float>(c.corrupted[static_cast<std::size_t>(i)]);
+            if (!tok_weight.empty()) w *= tok_weight[static_cast<std::size_t>(cid)];
+            wbd[static_cast<std::size_t>(i)] = w;
         }
         ag::Variable logits_b = ag::narrow(logits, b * T, T);                   // (T, Vm)
         ag::Variable mean_ce  = ag::weighted_cross_entropy(logits_b, tb, wb);

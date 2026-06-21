@@ -59,3 +59,55 @@ order-sensitivity, compose_vocab parity, CodecDenoiser trains). What's falsified
 integration* (additive gate, unweighted loss). Before P2/P3, the OOV layer needs follow-up (1) — a
 rare-aware objective — or P1 should be re-scoped. **Do not build P2 on the assumption that 1c, as
 run, closed the cliff: it did not.**
+
+---
+
+# Follow-up (1): rare-weighted objective — the 2×2 (tested)
+
+**Status: the rare-aware objective is a REAL cliff lever (−24…−30% on both models), but it does NOT
+rescue the codec. Under the *identical* rare-weighted objective a plain baseline still beats the
+codec on the cliff. Follow-up (1) thus deepens the falsification of the additive-gate codec and
+isolates the culprit: the additive gate retains the noisy rare lookup.**
+
+Wired a per-token-id loss multiplier into `batched_diffusion_loss` (`tok_weight`, indexed by the
+clean target id; `weighted_cross_entropy` normalises by the weight sum so only the ratios matter).
+`rare_weight` defaults to *auto* = the common:rare token-mass ratio, which equalises the two
+buckets' total gradient mass. `oov_ab.cpp` now runs the full 2×2 in one process (identical split +
+seeds).
+
+Word-TinyStories, 570 train paragraphs → 1749-word vocab, D=256 L=4 T=64, 2000 steps each,
+auto `rare_weight = 38.4` (common 43622 / rare 1137 masked-eligible tokens):
+
+| arm | NLL_common | NLL_rare | cliff |
+|-----|-----------:|---------:|------:|
+| baseline / unweighted | 2.049 | 13.042 | 6.36× |
+| **baseline / rare-weighted** | 2.538 | 12.306 | **4.85×** ← best cliff |
+| codec / unweighted | 1.953 | 15.817 | 8.10× |
+| codec / rare-weighted | 2.460 | 13.919 | 5.66× |
+
+**Findings:**
+1. **Rare-weighting works as a mechanism.** It lowers the cliff on *both* models (baseline
+   6.36→4.85, codec 8.10→5.66) by trading common NLL for rare NLL — exactly the intended effect.
+   The simple frequency-balanced objective *alone* (baseline/rw 4.85×) gives the lowest cliff of all
+   four arms. **If the goal were just "shrink the cliff", rare-weighting beats the codec outright.**
+2. **The codec still loses — even under its own prescribed fix.** Under the identical rare-aware
+   objective, codec/rw cliff 5.66× is **worse** than baseline/rw 4.85× (+17%). Not a ratio artifact:
+   codec's NLL_rare is worse in absolute nats (13.919 vs 12.306). In *both* objectives the
+   char-composed component, *added* on top of lookup, makes rare words **more** confusable
+   (uw 15.8 vs 13.0; rw 13.9 vs 12.3) while helping common (codec always has the lower NLL_common).
+
+**Sharpened diagnosis.** A shared composer preferentially helps common words (more distinct contexts
+to exploit the composed signal) under *any* loss weighting, and the **additive gate**
+`E = lookup + α⊙composed` *keeps the noisy `lookup_rare` row* — so adding a non-rare-specialised
+composed vector on top only blurs the rare logits. The gate form, not just the loss, is the problem.
+
+**Next test (now the best-motivated):** follow-up (2) — a convex blend that *replaces* lookup for
+rare words, `E = g·lookup + (1−g)·composed` with `g→0` for low-frequency types — paired with
+follow-up (3) composer *pretraining* (so `composed_rare` is a meaningful spelling vector before the
+LM objective biases it toward common). (2) only helps if `composed_rare` is actually good, which is
+exactly what (3) guarantees; this 2×2 shows additive blending of an LM-trained composer is not.
+
+**Bearing on the hierarchy unchanged:** the OOV cliff is real and *reducible* (rare-weighting proves
+it), but the char-composition layer as designed (additive gate) does not deliver OOV robustness over
+a matched baseline. Do not build P2 on it. The cheap, robust lever in hand is the rare-weighted
+objective itself.

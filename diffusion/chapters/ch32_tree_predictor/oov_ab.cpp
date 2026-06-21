@@ -80,7 +80,8 @@ sub0llm::Tensor build_word_chars(const BPETokenizer& tok, std::int64_t Vm, std::
 
 template <class Model>
 void train(Model& model, std::span<const std::int32_t> stream, int steps, std::int64_t B,
-           std::int64_t T, float lr, std::uint64_t seed, const char* name) {
+           std::int64_t T, float lr, std::uint64_t seed, const char* name,
+           std::span<const float> tok_weight = {}) {
     model.to(sub0llm::Device::cuda());
     auto params = model.parameters();
     sub0llm::nn::Adam opt(params, lr);
@@ -97,7 +98,11 @@ void train(Model& model, std::span<const std::int32_t> stream, int steps, std::i
         for (auto* p : params)
             if (p->grad().numel() > 0)
                 p->grad() = sub0llm::zeros(p->data().shape(), p->data().dtype(), p->data().device());
-        auto res = dt::batched_diffusion_loss(model, stream, offsets, rng, ctx, 0.02f, 1.0f);
+        auto res = dt::batched_diffusion_loss(model, stream, offsets, rng, ctx, 0.02f, 1.0f,
+                                              /*shared_t=*/false, /*exact_count=*/false,
+                                              /*is_word_start=*/{}, /*whole_word=*/false,
+                                              /*seed_base=*/0, /*index0=*/0, /*contiguous=*/false,
+                                              tok_weight);
         res.loss.backward();
         (void)sub0llm::nn::clip_grad_norm(params, 5.0f);
         opt.step();
@@ -160,26 +165,64 @@ int main(int argc, char** argv) {
     const sub0llm::Tensor word_chars = build_word_chars(tok, Vr + 1, maxlen, /*pad=*/256);
     const auto is_rare = de::rare_type_mask(train_ids, Vr + 1, 0.5);
 
-    std::println("\n-- training BASELINE Denoiser --");
-    dn::Denoiser base(Vr, D, 8, 4, L, 0, /*seed=*/7);
-    train(base, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "base");
-    const auto cb = cliff(base, eval_ids, is_rare, T, windows);
+    // Rare-aware objective (1C_RESULTS.md follow-up #1). Build a per-token-id weight: rare types get
+    // `rw`, common get 1. Default rw = "auto": the common:rare TOKEN-mass ratio, which equalises the
+    // two buckets' total gradient mass — the most direct counter to the ~14:1 common dominance that
+    // made the naive codec WORSEN the cliff. --rare_weight N overrides with a fixed multiplier.
+    std::uint64_t n_common_tok = 0, n_rare_tok = 0;
+    for (auto id : train_ids) (is_rare[static_cast<std::size_t>(id)] ? n_rare_tok : n_common_tok)++;
+    const double auto_rw = n_rare_tok ? static_cast<double>(n_common_tok) / static_cast<double>(n_rare_tok) : 1.0;
+    const std::int64_t rw_arg = arg_i(argc, argv, "--rare_weight", 0);   // 0 = auto
+    const float rw = rw_arg > 0 ? static_cast<float>(rw_arg) : static_cast<float>(auto_rw);
+    std::vector<float> tok_w(static_cast<std::size_t>(Vr + 1), 1.0f);
+    for (std::size_t id = 0; id < tok_w.size(); ++id) if (is_rare[id]) tok_w[id] = rw;
+    std::println("rare-aware objective: common {} / rare {} masked-eligible tokens (ratio {:.1f}); "
+                 "rare_weight = {:.1f} {}", n_common_tok, n_rare_tok, auto_rw, rw,
+                 rw_arg > 0 ? "(fixed)" : "(auto = balance mass)");
 
-    std::println("\n-- training CodecDenoiser --");
-    dn::CodecDenoiser codec(Vr, D, 8, 4, L, 0, /*n_chars=*/257, maxlen, word_chars, /*seed=*/7);
-    train(codec, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec");
-    const auto cc = cliff(codec, eval_ids, is_rare, T, windows);
+    // 2×2: {baseline, codec} × {unweighted, rare-weighted}, identical data split + seeds.
+    std::println("\n-- BASELINE Denoiser, UNWEIGHTED --");
+    dn::Denoiser base_uw(Vr, D, 8, 4, L, 0, /*seed=*/7);
+    train(base_uw, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "base/uw");
+    const auto c_base_uw = cliff(base_uw, eval_ids, is_rare, T, windows);
 
-    std::println("\n================= OOV A/B (rarest 50% of types) =================");
-    std::println("  BASELINE  NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x   (rare {} / common {} tok)",
-                 cb.nll_common(), cb.nll_rare(), cb.ratio(), cb.n_rare, cb.n_common);
-    std::println("  CODEC     NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x   (rare {} / common {} tok)",
-                 cc.nll_common(), cc.nll_rare(), cc.ratio(), cc.n_rare, cc.n_common);
-    const double cliff_drop = cb.ratio() > 0 ? (cb.ratio() - cc.ratio()) / cb.ratio() * 100.0 : 0.0;
-    const double invocab_reg = cb.nll_common() > 0 ? (cc.nll_common() - cb.nll_common()) / cb.nll_common() * 100.0 : 0.0;
-    std::println("  VERDICT: cliff {:.2f}x -> {:.2f}x ({:+.0f}%); in-vocab NLL {:+.1f}%  [{}]",
-                 cb.ratio(), cc.ratio(), -cliff_drop, invocab_reg,
-                 (cc.ratio() < cb.ratio() && invocab_reg < 5.0) ? "PASS (cliff down, in-vocab held)"
-                                                                : "see numbers");
+    std::println("\n-- BASELINE Denoiser, RARE-WEIGHTED --");
+    dn::Denoiser base_rw(Vr, D, 8, 4, L, 0, /*seed=*/7);
+    train(base_rw, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "base/rw", tok_w);
+    const auto c_base_rw = cliff(base_rw, eval_ids, is_rare, T, windows);
+
+    std::println("\n-- CodecDenoiser, UNWEIGHTED --");
+    dn::CodecDenoiser codec_uw(Vr, D, 8, 4, L, 0, /*n_chars=*/257, maxlen, word_chars, /*seed=*/7);
+    train(codec_uw, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec/uw");
+    const auto c_codec_uw = cliff(codec_uw, eval_ids, is_rare, T, windows);
+
+    std::println("\n-- CodecDenoiser, RARE-WEIGHTED --");
+    dn::CodecDenoiser codec_rw(Vr, D, 8, 4, L, 0, /*n_chars=*/257, maxlen, word_chars, /*seed=*/7);
+    train(codec_rw, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec/rw", tok_w);
+    const auto c_codec_rw = cliff(codec_rw, eval_ids, is_rare, T, windows);
+
+    auto row = [](const char* tag, const de::OovCliffResult& r) {
+        std::println("  {:<14} NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x", tag,
+                     r.nll_common(), r.nll_rare(), r.ratio());
+    };
+    std::println("\n========== OOV 2x2 (rarest 50% of types; rare_weight {:.1f}) ==========", rw);
+    row("baseline/uw",  c_base_uw);
+    row("baseline/rw",  c_base_rw);
+    row("codec/uw",     c_codec_uw);
+    row("codec/rw",     c_codec_rw);
+
+    // The key isolation: under the SAME rare-aware objective, does the codec beat the baseline?
+    const double codec_vs_base_rw = c_base_rw.ratio() > 0
+        ? (c_base_rw.ratio() - c_codec_rw.ratio()) / c_base_rw.ratio() * 100.0 : 0.0;
+    const double rw_helps_codec = c_codec_uw.ratio() > 0
+        ? (c_codec_uw.ratio() - c_codec_rw.ratio()) / c_codec_uw.ratio() * 100.0 : 0.0;
+    std::println("\n  rare-weighting effect on codec cliff: {:.2f}x -> {:.2f}x ({:+.0f}%)",
+                 c_codec_uw.ratio(), c_codec_rw.ratio(), -rw_helps_codec);
+    std::println("  codec vs baseline UNDER rare-aware objective: cliff {:.2f}x vs {:.2f}x ({:+.0f}% for codec)",
+                 c_codec_rw.ratio(), c_base_rw.ratio(), codec_vs_base_rw);
+    std::println("  VERDICT: {}",
+                 (c_codec_rw.ratio() < c_base_rw.ratio() && c_codec_rw.ratio() < c_codec_uw.ratio())
+                     ? "codec helps under rare-aware objective (cliff below both controls)"
+                     : "see numbers — codec still not winning");
     return 0;
 }
