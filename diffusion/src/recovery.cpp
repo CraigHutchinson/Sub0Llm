@@ -3,11 +3,59 @@
 #include "sub0llm/core/tensor.hpp"
 
 #include <algorithm>
+#include <span>
+#include <vector>
 
 namespace sub0diff::eval {
 
 using sub0llm::Tensor;
 using sub0llm::DType;
+
+namespace {
+// Score one window's masked positions from its (T, C) host logits: greedy argmax over the real
+// vocab, token recall + word-start/continuation/whole-word breakdown. Shared by the single-window
+// and batched paths so they stay bit-identical. `lz` points at this window's first logit row.
+RecoveryResult score_window(const float* lz, std::size_t C, std::int64_t V,
+                            std::span<const std::int32_t> clean_ids,
+                            std::span<const std::uint8_t> masked,
+                            PositionStats* pos,
+                            std::span<const std::uint8_t> is_word_start) {
+    const bool word_aware = !is_word_start.empty();
+    auto starts_word = [&](std::size_t t) {
+        return t == 0 || is_word_start[static_cast<std::size_t>(clean_ids[t])] != 0;
+    };
+    RecoveryResult res{};
+    for (auto m : masked) res.masked += (m != 0);
+    int cur_word_masked = 0, cur_word_hits = 0;
+    auto flush_word = [&] {
+        if (cur_word_masked > 0) {
+            res.word_total += 1;
+            res.word_hits  += (cur_word_hits == cur_word_masked);
+        }
+        cur_word_masked = cur_word_hits = 0;
+    };
+    for (std::size_t t = 0; t < masked.size(); ++t) {
+        if (word_aware && starts_word(t)) flush_word();
+        if (!masked[t]) continue;
+        std::int32_t best = 0;
+        float best_v = -1e30f;
+        for (std::int64_t c = 0; c < V; ++c) {
+            const float v = lz[t * C + static_cast<std::size_t>(c)];
+            if (v > best_v) { best_v = v; best = static_cast<std::int32_t>(c); }
+        }
+        const bool hit = (best == clean_ids[t]);
+        res.hits += hit;
+        if (pos) { pos->masked[t] += 1; pos->hits[t] += hit; }
+        if (word_aware) {
+            if (starts_word(t)) { res.ws_masked += 1; res.ws_hits += hit; }
+            else                { res.wc_masked += 1; res.wc_hits += hit; }
+            cur_word_masked += 1; cur_word_hits += hit;
+        }
+    }
+    if (word_aware) flush_word();
+    return res;
+}
+}  // namespace
 
 RecoveryResult evaluate_recovery(const nn::Denoiser& model,
                                  std::span<const std::int32_t> clean_ids,
@@ -30,49 +78,8 @@ RecoveryResult evaluate_recovery(const nn::Denoiser& model,
     const Tensor lh = logits.data().device().is_cpu()
                           ? logits.data()
                           : logits.data().to(sub0llm::Device::cpu());
-    const auto lz = lh.data_as<float>();
-    const auto C = static_cast<std::size_t>(model.model_vocab());
-    const auto V = model.real_vocab();   // argmax over real tokens only
-
-    const bool word_aware = !is_word_start.empty();
-    // Word boundaries within the window: position 0 always starts a word; thereafter a
-    // token starts a word iff it carries the Ġ marker. word_id[t] groups subwords.
-    auto starts_word = [&](std::size_t t) {
-        return t == 0 || is_word_start[static_cast<std::size_t>(clean_ids[t])] != 0;
-    };
-
-    RecoveryResult res{};
-    res.masked = n_masked;
-    // Per-word accumulation for word-level recall (only words touched by a mask count).
-    int cur_word_masked = 0, cur_word_hits = 0;
-    auto flush_word = [&] {
-        if (cur_word_masked > 0) {
-            res.word_total += 1;
-            res.word_hits  += (cur_word_hits == cur_word_masked);   // all masked subwords right
-        }
-        cur_word_masked = cur_word_hits = 0;
-    };
-
-    for (std::size_t t = 0; t < masked.size(); ++t) {
-        if (word_aware && starts_word(t)) flush_word();   // close previous word at each boundary
-        if (!masked[t]) continue;
-        std::int32_t best = 0;
-        float best_v = -1e30f;
-        for (std::int64_t c = 0; c < V; ++c) {
-            const float v = lz[t * C + static_cast<std::size_t>(c)];
-            if (v > best_v) { best_v = v; best = static_cast<std::int32_t>(c); }
-        }
-        const bool hit = (best == clean_ids[t]);
-        res.hits += hit;
-        if (pos) { pos->masked[t] += 1; pos->hits[t] += hit; }
-        if (word_aware) {
-            if (starts_word(t)) { res.ws_masked += 1; res.ws_hits += hit; }
-            else                { res.wc_masked += 1; res.wc_hits += hit; }
-            cur_word_masked += 1; cur_word_hits += hit;
-        }
-    }
-    if (word_aware) flush_word();   // close the final word
-    return res;
+    return score_window(lh.data_as<float>().data(), static_cast<std::size_t>(model.model_vocab()),
+                        model.real_vocab(), clean_ids, masked, pos, is_word_start);
 }
 
 RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
@@ -91,6 +98,38 @@ RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
     const std::size_t n_eval = (max_windows == 0) ? n_positions
                                                   : std::min(max_windows, n_positions);
     const double stride = static_cast<double>(n_positions) / static_cast<double>(n_eval);
+
+    // Batch B windows per Denoiser forward. The sweep is forward-bound, and a batched (block-
+    // diagonal) forward is mathematically identical to B single-window forwards but with far better
+    // GPU utilisation — fewer launches, one D2H per batch. Recall numbers are unchanged (same masks,
+    // same per-window scoring) — only the wall time drops.
+    constexpr std::int64_t B = 32;
+    std::vector<std::int32_t>                  batch_tokens;   // (bn·T) corrupted ids, row-major
+    std::vector<float>                         noises;         // per-window n_masked/T
+    std::vector<std::vector<std::uint8_t>>     masks;          // per-window masked flags (copied)
+    std::vector<std::span<const std::int32_t>> windows;        // per-window clean span
+    batch_tokens.reserve(static_cast<std::size_t>(B * T));
+    noises.reserve(static_cast<std::size_t>(B));
+
+    auto flush = [&] {
+        const std::int64_t bn = static_cast<std::int64_t>(noises.size());
+        if (bn == 0) return;
+        Tensor input({bn * T}, DType::Int32);
+        std::ranges::copy(batch_tokens, input.data_as<std::int32_t>().begin());
+        auto         logits = model.forward(input, noises, bn, T);   // (bn·T, model_vocab)
+        const Tensor lh     = logits.data().device().is_cpu()
+                                  ? logits.data()
+                                  : logits.data().to(sub0llm::Device::cpu());
+        const float*      lz = lh.data_as<float>().data();
+        const std::size_t C  = static_cast<std::size_t>(model.model_vocab());
+        for (std::int64_t b = 0; b < bn; ++b)
+            total.accumulate(score_window(
+                lz + static_cast<std::size_t>(b) * static_cast<std::size_t>(T) * C, C,
+                model.real_vocab(), windows[static_cast<std::size_t>(b)],
+                masks[static_cast<std::size_t>(b)], pos, is_word_start));
+        batch_tokens.clear(); noises.clear(); masks.clear(); windows.clear();
+    };
+
     for (std::size_t i = 0; i < n_eval; ++i) {
         const auto off = static_cast<std::size_t>(static_cast<double>(i) * stride);
         auto window = corpus_ids.subspan(off, static_cast<std::size_t>(T));
@@ -100,9 +139,13 @@ RecoveryResult evaluate_corpus_recall(const nn::Denoiser& model,
         else
             nn::corrupt_into(window, noise, spec::NoiseSchedule::Absorbing,
                              model.mask_id(), model.real_vocab(), rng, corr);
-        auto r = evaluate_recovery(model, window, corr.corrupted, pos, is_word_start);
-        total.accumulate(r);
+        batch_tokens.insert(batch_tokens.end(), corr.tokens.begin(), corr.tokens.end());
+        masks.emplace_back(corr.corrupted.begin(), corr.corrupted.end());
+        windows.push_back(window);
+        noises.push_back(static_cast<float>(corr.n_corrupted) / static_cast<float>(T));
+        if (static_cast<std::int64_t>(noises.size()) == B) flush();
     }
+    flush();   // trailing partial batch
     return total;
 }
 
