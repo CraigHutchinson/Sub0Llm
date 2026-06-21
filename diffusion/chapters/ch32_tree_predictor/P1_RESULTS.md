@@ -47,7 +47,25 @@ this milestone: the **CUDA caching allocator** removed the per-op `cudaMalloc`/`
 sync that made GPU training allocation-bound — controlled bench **0.0635 → 0.0158 s/step
 (4× faster, 23.9× vs CPU)**. See [`SPECIALIZATION_ROADMAP.md`](../../SPECIALIZATION_ROADMAP.md).
 
-## Next — 1c (the OOV A/B, the actual kill-test)
+## 1c — model stack BUILT + validated (the OOV A/B run is the remaining piece)
+
+The codec is now wired into a full model, with every piece tested in isolation:
+
+| piece | what | test | commit |
+|-------|------|------|--------|
+| `CharComposer::compose_vocab` | composes the WHOLE vocab → `(V,D)` table in one batched, block-diagonal forward; per-word mean-pool via a `(V,1,L)` selector matmul (scales to 12k+ vocab) | row == per-word `forward` (relRMS <1e-4) | (1c primitive) |
+| `CodecDenoiser` | `E = lookup + alpha·composed`, used for BOTH input embedding (`embedding_lookup(E,·)`) and the weight-tied LM head (`matmul_bt(x,E)`). `alpha` inits 0 ⇒ **identical to plain word-level at init** (no-regression baseline) and learns to mix in spelling. Composer gradient comes from every word ⇒ trains even for rare words. | trains (masked-CE overfit) + `mean\|alpha\|` moves off 0 (composed path activates) | (1c model) |
+| `diffusion_loss` / `batched_diffusion_loss` | generalised `template<class Model,…>` so the codec trains through the same loss (Denoiser deduces unchanged) | existing suites green | (codec-ready) |
+
+**Remaining for the A/B RESULT** (the kill-test): a *runner* — train a `CodecDenoiser` on
+word-TinyStories and re-run M1. Two paths: (a) generalise `evaluate_oov_cliff` /
+`evaluate_corpus_recall` on the model type + add a `--codec` mode to ch29 (reuses its data +
+trainer); or (b) a small standalone experiment that loads the banked tokenizer + `tokens.bin`,
+builds the `word_chars` spelling table from the vocab, trains, and measures M1 inline. Success bar
+(BUILD_PLAN §Phase 1): the **8.08× cliff falls toward ~1** while the common-bucket NLL (1.91) does
+**not** regress. Failure ⇒ the codec doesn't buy OOV robustness and the design is falsified.
+
+## (original) Next — 1c (the OOV A/B, the actual kill-test)
 
 Wire the codec around the word `Denoiser` (compose-in for the embedding, decode-out for OOV
 words), with a lookup/composed **gated blend**, and measure on TinyStories:

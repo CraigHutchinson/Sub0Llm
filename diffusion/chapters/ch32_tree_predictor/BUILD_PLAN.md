@@ -27,9 +27,17 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
   sensitive (anagrams diverge), `[char_codec]` test. See [`P1_RESULTS.md`](P1_RESULTS.md). Key finding:
   the non-AR decoder needs LEARNED POSITION QUERIES (RoPE alone → 35%, +queries → >90%).
 
-**Next:** P1 **1c** — wire the codec around the word Denoiser (compose-in / decode-out + lookup/composed
-gated blend), train, and re-run `--oov_cliff`: the 8.08× ratio must fall toward ~1 while in-vocab NLL
-(≈1.91) does not regress. (Phase-0 **M2** topic-drift is the remaining metric, needed for P2.)
+- **P1 1c model stack BUILT** (commits 2e6ea15 + compose_vocab + loss-generalise) — `CodecDenoiser`
+  (`E = lookup + alpha·compose_vocab(spellings)` for input AND the weight-tied LM head; alpha init 0 =
+  plain word-level baseline), `compose_vocab` whole-vocab primitive, and `diffusion_loss` generalised
+  on the model type. All tested in isolation (compose parity, trains + alpha activates). See
+  [`P1_RESULTS.md`](P1_RESULTS.md).
+
+**Next:** run the P1 1c **OOV A/B** — train a `CodecDenoiser` on word-TinyStories and re-run M1. Needs a
+runner: generalise `evaluate_oov_cliff`/`evaluate_corpus_recall` on the model type + a `--codec` ch29
+mode, OR a small standalone experiment (load banked tokenizer + tokens.bin, build the `word_chars`
+table, train, measure). Bar: the **8.08× cliff → ~1** while in-vocab NLL (1.91) holds. (Phase-0 **M2**
+topic-drift remains, for P2.)
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
