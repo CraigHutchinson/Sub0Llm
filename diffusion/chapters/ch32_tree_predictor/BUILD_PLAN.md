@@ -17,9 +17,16 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
   *crude untrained* coarse-anchor already helps ⇒ strong signal that a *trained* gist (P2) helps more.
 - All design docs committed (README, DESIGN_REVIEW, DESIGN_REVIEW_2, BUILD_PLAN, M3/4B results).
 
-**Not started (resume order):** Phase **P1** (char-composition codec → OOV) → **P2** (gist conditioning:
-content-word `is_content` table + IB-pooling + feudal training) → **P3** (MERA log-depth, gated on the M3
-gap). Plus the ungated side probes 4a (holographic capacity numerics).
+**Progress:** **P1 steps 1a+1b DONE** (commit d3e4302) — `CharComposer`+`CharDecoder` codec
+([`char_codec.hpp`](../../include/sub0diff/nn/char_codec.hpp)); round-trips spellings >90% + order-
+sensitive (anagrams diverge), validated by the `[char_codec]` test. See [`P1_RESULTS.md`](P1_RESULTS.md).
+Key finding: the non-AR decoder needs LEARNED POSITION QUERIES (RoPE alone → 35%, +queries → >90%).
+**Next:** P1 **1c** (wire codec around the word Denoiser + gated blend; the OOV A/B) — gated on the
+Phase-0 **M1 (OOV-cliff)** metric, which is the immediate build.
+
+**Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
+feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
+capacity numerics).
 
 **Key change since pause — GPU training is now WIRED** (Stage 4 Phase 7, [[cuda-first-class-iteration-time]],
 commit e1064ba): `ch29 --device cuda` trains the Denoiser end-to-end on ONE GPU stream (GpuTrainer;
