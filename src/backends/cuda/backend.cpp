@@ -3,10 +3,26 @@
 
 #ifdef SUB0LLM_CUDA
 #  include <cuda_runtime.h>
+#  include <cublas_v2.h>
 #  include "kernels.cuh"
 #endif
 
 namespace sub0llm::backend::cuda {
+
+#ifdef SUB0LLM_CUDA
+namespace {
+// Process-wide cuBLAS handle (default/null stream — serialises with our kernel launches).
+cublasHandle_t cublas() {
+    static cublasHandle_t h = [] {
+        cublasHandle_t hh = nullptr;
+        if (cublasCreate(&hh) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cublasCreate failed");
+        return hh;
+    }();
+    return h;
+}
+}  // namespace
+#endif
 
 // ── Memory helpers ────────────────────────────────────────────────────────────
 
@@ -332,10 +348,13 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     const auto N = static_cast<std::size_t>(b.shape(1));
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
-    kernels::launch_matmul_f32(
-        reinterpret_cast<const float*>(a.raw_ptr()),
-        reinterpret_cast<const float*>(b.raw_ptr()),
-        reinterpret_cast<float*>(out.raw_ptr()), M, N, K);
+    // Row-major C(M,N)=A·B ≡ col-major Cᵀ(N,M)=Bᵀ·Aᵀ : sgemm(N,N, N,M,K, B[ldN], A[ldK], C[ldN]).
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(cublas(), CUBLAS_OP_N, CUBLAS_OP_N,
+                static_cast<int>(N), static_cast<int>(M), static_cast<int>(K), &alpha,
+                reinterpret_cast<const float*>(b.raw_ptr()), static_cast<int>(N),
+                reinterpret_cast<const float*>(a.raw_ptr()), static_cast<int>(K), &beta,
+                reinterpret_cast<float*>(out.raw_ptr()), static_cast<int>(N));
     return out;
 #else
     (void)a; (void)b;
@@ -345,15 +364,18 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 
 Tensor matmul_tb(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
-    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(M,N) → C(K,N)
+    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(M,N) → C(K,N) (contract M)
     const auto K = static_cast<std::size_t>(a.shape(1));
     const auto N = static_cast<std::size_t>(b.shape(1));
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
-    kernels::launch_matmul_tb_f32(
-        reinterpret_cast<const float*>(a.raw_ptr()),
-        reinterpret_cast<const float*>(b.raw_ptr()),
-        reinterpret_cast<float*>(out.raw_ptr()), M, N, K);
+    // col-major C(N,K)=Bᵀ_cm·(Aᵀ_cm)ᵀ : sgemm(N,T, N,K,M, B[ldN], A[ldK], C[ldN]).
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(cublas(), CUBLAS_OP_N, CUBLAS_OP_T,
+                static_cast<int>(N), static_cast<int>(K), static_cast<int>(M), &alpha,
+                reinterpret_cast<const float*>(b.raw_ptr()), static_cast<int>(N),
+                reinterpret_cast<const float*>(a.raw_ptr()), static_cast<int>(K), &beta,
+                reinterpret_cast<float*>(out.raw_ptr()), static_cast<int>(N));
     return out;
 #else
     (void)a; (void)b;
@@ -363,15 +385,18 @@ Tensor matmul_tb(const Tensor& a, const Tensor& b) {
 
 Tensor matmul_bt(const Tensor& a, const Tensor& b) {
 #ifdef SUB0LLM_CUDA
-    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(N,K) → C(M,N)
+    const auto M = static_cast<std::size_t>(a.shape(0));   // A(M,K), B(N,K) → C(M,N) (contract K)
     const auto K = static_cast<std::size_t>(a.shape(1));
     const auto N = static_cast<std::size_t>(b.shape(0));
     Tensor out(Tensor::Shape{static_cast<std::int64_t>(M), static_cast<std::int64_t>(N)},
                DType::Float32, a.device());
-    kernels::launch_matmul_bt_f32(
-        reinterpret_cast<const float*>(a.raw_ptr()),
-        reinterpret_cast<const float*>(b.raw_ptr()),
-        reinterpret_cast<float*>(out.raw_ptr()), M, N, K);
+    // col-major C(N,M)=(Bᵀ_cm)ᵀ·Aᵀ_cm : sgemm(T,N, N,M,K, B[ldK], A[ldK], C[ldN]).
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(cublas(), CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(N), static_cast<int>(M), static_cast<int>(K), &alpha,
+                reinterpret_cast<const float*>(b.raw_ptr()), static_cast<int>(K),
+                reinterpret_cast<const float*>(a.raw_ptr()), static_cast<int>(K), &beta,
+                reinterpret_cast<float*>(out.raw_ptr()), static_cast<int>(N));
     return out;
 #else
     (void)a; (void)b;
@@ -380,22 +405,24 @@ Tensor matmul_bt(const Tensor& a, const Tensor& b) {
 }
 
 #ifdef SUB0LLM_CUDA
-// Batched GEMM helper: loop a 2D launch over the leading-dim slices of contiguous 3D tensors.
 namespace {
-template <class Launch>
-Tensor batched_gemm(const Tensor& a, const Tensor& b, std::int64_t out_rows, std::int64_t out_cols,
-                    std::size_t M, std::size_t N, std::size_t K,
-                    std::size_t a_slice, std::size_t b_slice, Launch launch) {
+// Batched GEMM via cublasSgemmStridedBatched — same column-major mapping as the 2D ops, with a
+// fixed per-slice stride over the contiguous leading dim. `out_rows×out_cols` is the slice shape.
+Tensor batched_sgemm(const Tensor& a, const Tensor& b,
+                     cublasOperation_t opA, cublasOperation_t opB,
+                     int m, int n, int k, int lda, long long sa, int ldb, long long sb,
+                     int ldc, std::int64_t out_rows, std::int64_t out_cols) {
     const Tensor ac = a.contiguous();
     const Tensor bc = b.contiguous();
-    const auto Bn = static_cast<std::size_t>(ac.shape(0));
+    const int Bn = static_cast<int>(ac.shape(0));
     Tensor out(Tensor::Shape{ac.shape(0), out_rows, out_cols}, DType::Float32, ac.device());
-    const std::size_t c_slice = static_cast<std::size_t>(out_rows) * static_cast<std::size_t>(out_cols);
-    const float* pa = reinterpret_cast<const float*>(ac.raw_ptr());
-    const float* pb = reinterpret_cast<const float*>(bc.raw_ptr());
-    float*       pc = reinterpret_cast<float*>(out.raw_ptr());
-    for (std::size_t i = 0; i < Bn; ++i)
-        launch(pa + i * a_slice, pb + i * b_slice, pc + i * c_slice, M, N, K);
+    const long long sc = out_rows * out_cols;
+    const float alpha = 1.0f, beta = 0.0f;
+    // sgemm's "A" is our b (first matrix in the col-major Cᵀ product), "B" is our a.
+    cublasSgemmStridedBatched(cublas(), opA, opB, m, n, k, &alpha,
+                              reinterpret_cast<const float*>(bc.raw_ptr()), lda, sa,
+                              reinterpret_cast<const float*>(ac.raw_ptr()), ldb, sb, &beta,
+                              reinterpret_cast<float*>(out.raw_ptr()), ldc, sc, Bn);
     return out;
 }
 }  // namespace
@@ -403,10 +430,10 @@ Tensor batched_gemm(const Tensor& a, const Tensor& b, std::int64_t out_rows, std
 
 Tensor matmul_batched(const Tensor& a, const Tensor& b) {        // (B,M,K)·(B,K,N)→(B,M,N)
 #ifdef SUB0LLM_CUDA
-    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
-    const auto N = static_cast<std::size_t>(b.shape(2));
-    return batched_gemm(a, b, a.shape(1), b.shape(2), M, N, K, M * K, K * N,
-                        kernels::launch_matmul_f32);
+    const int M = static_cast<int>(a.shape(1)), K = static_cast<int>(a.shape(2)), N = static_cast<int>(b.shape(2));
+    return batched_sgemm(a, b, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                         N, static_cast<long long>(K) * N, K, static_cast<long long>(M) * K,
+                         N, a.shape(1), b.shape(2));
 #else
     (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
 #endif
@@ -414,10 +441,10 @@ Tensor matmul_batched(const Tensor& a, const Tensor& b) {        // (B,M,K)·(B,
 
 Tensor matmul_bt_batched(const Tensor& a, const Tensor& b) {     // (B,M,K)·(B,N,K)→(B,M,N)
 #ifdef SUB0LLM_CUDA
-    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
-    const auto N = static_cast<std::size_t>(b.shape(1));
-    return batched_gemm(a, b, a.shape(1), b.shape(1), M, N, K, M * K, N * K,
-                        kernels::launch_matmul_bt_f32);
+    const int M = static_cast<int>(a.shape(1)), K = static_cast<int>(a.shape(2)), N = static_cast<int>(b.shape(1));
+    return batched_sgemm(a, b, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                         K, static_cast<long long>(N) * K, K, static_cast<long long>(M) * K,
+                         N, a.shape(1), b.shape(1));
 #else
     (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
 #endif
@@ -425,10 +452,10 @@ Tensor matmul_bt_batched(const Tensor& a, const Tensor& b) {     // (B,M,K)·(B,
 
 Tensor matmul_tb_batched(const Tensor& a, const Tensor& b) {     // (B,M,K)·(B,M,N)→(B,K,N)
 #ifdef SUB0LLM_CUDA
-    const auto M = static_cast<std::size_t>(a.shape(1)), K = static_cast<std::size_t>(a.shape(2));
-    const auto N = static_cast<std::size_t>(b.shape(2));
-    return batched_gemm(a, b, a.shape(2), b.shape(2), M, N, K, M * K, M * N,
-                        kernels::launch_matmul_tb_f32);
+    const int M = static_cast<int>(a.shape(1)), K = static_cast<int>(a.shape(2)), N = static_cast<int>(b.shape(2));
+    return batched_sgemm(a, b, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M,
+                         N, static_cast<long long>(M) * N, K, static_cast<long long>(M) * K,
+                         N, a.shape(2), b.shape(2));
 #else
     (void)a; (void)b; throw std::runtime_error("CUDA backend not compiled in");
 #endif
