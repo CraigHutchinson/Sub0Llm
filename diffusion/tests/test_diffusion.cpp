@@ -7,6 +7,7 @@
 #include "sub0diff/nn/char_codec.hpp"
 #include "sub0diff/nn/codec_denoiser.hpp"
 #include "sub0diff/nn/denoiser.hpp"
+#include "sub0diff/nn/hier_denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
 #include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/curriculum.hpp"
@@ -422,6 +423,55 @@ TEST_CASE("topic-drift metric: content_type_mask + evaluate_topic_drift (M2)", "
     REQUIRE(rd.persistence_far < 0.01);      // distant windows disjoint (topic gone)
     REQUIRE(rd.drift > 0.9);                 // ⇒ strong drift
     REQUIRE(rd.drift > rs.drift);
+}
+
+// Validates the P2 2e coarse-to-fine HierDenoiser plumbing: the pool→coarse→broadcast→fine forward
+// produces finite logits of the right shape for both the 2D and batched paths, and one optimizer
+// step lowers a diffusion-loss sample (the hierarchy is differentiable end-to-end). The compute/
+// accuracy frontier vs flat is a trained-model property measured in ch32_hier_ab (2E_RESULTS.md).
+TEST_CASE("HierDenoiser coarse-to-fine forward + trains (P2 2e)", "[diffusion][hier_denoiser]") {
+    using sub0diff::nn::HierDenoiser;
+    const std::int64_t V = 24, D = 32, N = 16, c = 4, w = 8;     // Nc=4 coarse slots, M=2 fine windows
+    HierDenoiser model(V, D, 2, 2, /*coarse=*/1, /*fine=*/1, c, w, 0, /*seed=*/3);
+
+    sub0llm::Tensor ids({N}, sub0llm::DType::Int32);
+    for (std::int64_t i = 0; i < N; ++i) ids.data_as<std::int32_t>()[i] = static_cast<std::int32_t>(i % V);
+    auto logits = model.forward(ids, 0.5f);
+    REQUIRE(logits.data().shape()[0] == N);
+    REQUIRE(logits.data().shape()[1] == V + 1);                  // model_vocab
+    for (float v : logits.data().data_as<float>()) REQUIRE(std::isfinite(v));
+
+    // batched path: B=2 sequences of N
+    sub0llm::Tensor bids({2 * N}, sub0llm::DType::Int32);
+    for (std::int64_t i = 0; i < 2 * N; ++i) bids.data_as<std::int32_t>()[i] = static_cast<std::int32_t>(i % V);
+    std::array<float, 2> noises{0.3f, 0.7f};
+    auto blogits = model.forward(bids, std::span<const float>(noises), 2, N);
+    REQUIRE(blogits.data().shape()[0] == 2 * N);
+
+    // one diffusion-loss step lowers the loss (end-to-end differentiable through the hierarchy)
+    std::vector<std::int32_t> stream(static_cast<std::size_t>(8 * N));
+    for (std::size_t i = 0; i < stream.size(); ++i) stream[i] = static_cast<std::int32_t>(i % V);
+    auto params = model.parameters();
+    sub0llm::nn::Adam opt(params, 1e-2f);
+    namespace dt = sub0diff::train;
+    dt::BatchedDiffusionLossContext ctx(2, N);
+    std::mt19937 rng(1);
+    std::uniform_int_distribution<std::size_t> off(0, stream.size() - static_cast<std::size_t>(N));
+    float first = 0.0f, last = 0.0f;
+    for (int s = 0; s < 25; ++s) {
+        std::vector<std::size_t> offs{off(rng), off(rng)};
+        for (auto* p : params)
+            if (p->grad().numel() > 0)
+                p->grad() = sub0llm::zeros(p->data().shape(), p->data().dtype(), p->data().device());
+        auto res = dt::batched_diffusion_loss(model, stream, offs, rng, ctx, 0.1f, 1.0f);
+        res.loss.backward();
+        opt.step();
+        const float lv = res.loss.data().item<float>();
+        if (s == 0) first = lv;
+        last = lv;
+    }
+    REQUIRE(std::isfinite(last));
+    REQUIRE(last < first);                                        // the hierarchy learns
 }
 
 // ── Ch32 P1: character-composition codec ───────────────────────────────────────────────────────

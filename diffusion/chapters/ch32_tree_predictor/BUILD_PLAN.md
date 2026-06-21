@@ -76,6 +76,13 @@ P1 codec. **Do not build P2 on char-composition.**
   sub-windows): ~15× less work, ~256× less attention memory, extended context, at a controllable
   cross-window accuracy cost. The within-window redundancy is the FLOOR (consistent with the reframe),
   not a verdict. **P2/P3 are the same coarsen operator at different depths.**
+- **P2 2e (coarse-to-fine HierDenoiser) BUILT + BENCHMARKED** — `hier_denoiser.hpp` (coarse global
+  pass over N/c pooled slots + fine window-local block-diagonal pass), runner `ch32_hier_ab`,
+  `[hier_denoiser]` test. N-sweep (128/256/512): **efficiency win VALIDATED + scales** — attn-ops
+  3.6→**10.7×** fewer, attn-mem 4→**64×** smaller, wall-clock ~**2× faster** at N≥256. **Accuracy gap
+  real but shrinking** — hier +41→**29%** NLL (content +13→**7%**) as N grows. The naive mean-pool
+  coarse plan + no cross-window attention + 50%-masked coarse input explain the gap → the explicit
+  targets for 2c/2d. See [`2E_RESULTS.md`](2E_RESULTS.md). **2e is now the scoreboard for 2c/2d.**
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

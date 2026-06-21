@@ -9,3 +9,7 @@ target_link_libraries(ch32_m2_drift PRIVATE sub0diff)
 # P2 2b gist-conditioning A/B (flat Denoiser vs GistDenoiser).
 add_executable(ch32_gist_ab gist_ab.cpp)
 target_link_libraries(ch32_gist_ab PRIVATE sub0diff)
+
+# P2 2e coarse-to-fine vs flat (efficiency/context benchmark).
+add_executable(ch32_hier_ab hier_ab.cpp)
+target_link_libraries(ch32_hier_ab PRIVATE sub0diff)
