@@ -3,6 +3,7 @@
 
 #include "sub0diff/eval/oov_cliff.hpp"
 #include "sub0diff/eval/recovery.hpp"
+#include "sub0diff/eval/topic_drift.hpp"
 #include "sub0diff/nn/char_codec.hpp"
 #include "sub0diff/nn/codec_denoiser.hpp"
 #include "sub0diff/nn/denoiser.hpp"
@@ -372,6 +373,55 @@ TEST_CASE("OOV-cliff metric: rare_type_mask + evaluate_oov_cliff (M1)", "[diffus
     REQUIRE(std::isfinite(r.nll_rare()));
     REQUIRE(std::isfinite(r.nll_common()));
     REQUIRE(r.nll_rare() > 0.0);                          // CE (nats) is a positive NLL
+}
+
+// Validates content_type_mask's frequency split and that evaluate_topic_drift computes distinct-n
+// and content persistence at the extremes (a repetitive vs varied passage; a topic-stable vs
+// topic-disjoint passage). The drift/distinct VALUES on real text are model properties measured on
+// generations; here we validate the mechanism on constructed sequences.
+TEST_CASE("topic-drift metric: content_type_mask + evaluate_topic_drift (M2)", "[diffusion][topic_drift]") {
+    using namespace sub0diff::eval;
+
+    // freq: 0->4 (function), 1->2, 2->1, 3->1; stop_k=1 ⇒ only id 0 is a function word.
+    const std::vector<std::int32_t> train{0, 0, 0, 0, 1, 1, 2, 3};
+    const auto is_content = content_type_mask(train, 4, /*stop_k=*/1);
+    REQUIRE(is_content.size() == 4);
+    REQUIRE(is_content[0] == 0);   // most frequent ⇒ function word
+    REQUIRE(is_content[1] == 1);
+    REQUIRE(is_content[2] == 1);
+    REQUIRE(is_content[3] == 1);
+
+    // distinct-2: a strictly increasing passage has all-unique bigrams (1.0); an alternating
+    // [5,6,5,6,...] passage repeats one bigram pair (≈ near 0 as it grows).
+    std::vector<std::int32_t> varied(64), looped(64);
+    for (std::size_t i = 0; i < varied.size(); ++i) varied[i] = static_cast<std::int32_t>(i);
+    for (std::size_t i = 0; i < looped.size(); ++i) looped[i] = (i % 2) ? 6 : 5;
+    std::vector<std::uint8_t> all_content(128, 1);
+    const auto rv = evaluate_topic_drift(std::span<const std::int32_t>(varied), all_content, 8, 1, 4);
+    const auto rl = evaluate_topic_drift(std::span<const std::int32_t>(looped), all_content, 8, 1, 4);
+    REQUIRE(rv.distinct2 > 0.99);
+    REQUIRE(rl.distinct2 < rv.distinct2);    // looping ⇒ fewer distinct bigrams
+    REQUIRE(rv.content_recurrence < 0.01);   // all-distinct ⇒ no content type recurs
+
+    // Persistence: a STABLE passage (every window shares the same content set) has Jaccard 1 at all
+    // distances ⇒ drift ≈ 0. A SLIDING-topic passage (window w uses types [10+4w .. 10+4w+7], so
+    // adjacent windows overlap by 4 but windows ≥2 apart are disjoint) has high near overlap and
+    // ~0 far overlap ⇒ drift ≈ 1 — the "coherent locally, lost the thread globally" shape M2 targets.
+    std::vector<std::int32_t> stable, sliding;
+    for (int w = 0; w < 6; ++w)
+        for (int i = 0; i < 8; ++i) {
+            stable.push_back(10 + i);                    // same 8 content types every window
+            sliding.push_back(10 + w * 4 + i);           // window topic slides by 4 types each step
+        }
+    const auto rs = evaluate_topic_drift(std::span<const std::int32_t>(stable),  all_content, 8, 1, 2);
+    const auto rd = evaluate_topic_drift(std::span<const std::int32_t>(sliding), all_content, 8, 1, 2);
+    REQUIRE(rs.persistence_far > 0.99);      // identical sets ⇒ Jaccard 1 at distance ⇒ no drift
+    REQUIRE(rs.drift < 0.01);
+    REQUIRE(rs.content_recurrence > 0.99);   // same 8 content types every window ⇒ all recur
+    REQUIRE(rd.persistence_near > 0.2);      // adjacent windows still overlap (locally coherent)
+    REQUIRE(rd.persistence_far < 0.01);      // distant windows disjoint (topic gone)
+    REQUIRE(rd.drift > 0.9);                 // ⇒ strong drift
+    REQUIRE(rd.drift > rs.drift);
 }
 
 // ── Ch32 P1: character-composition codec ───────────────────────────────────────────────────────

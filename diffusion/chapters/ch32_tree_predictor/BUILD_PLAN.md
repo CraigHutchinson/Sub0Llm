@@ -56,7 +56,15 @@ alone** (best arm of all, ~4.7×) — adopt that. **Char-composition as an OOV *
 the wrong tool and does NOT enter P2/P3** (spelling≠prediction geometry under a tied head). Any future
 sub-word/OOV info must enter as an *input-side feature the model re-embeds* (concatenated, not tied,
 not substituted into the output projection) — a different design with its own kill-test, outside the
-P1 codec. **Do not build P2 on char-composition.** (Phase-0 **M2** topic-drift remains, for P2.)
+P1 codec. **Do not build P2 on char-composition.**
+
+- **Phase-0 M2 (topic-drift) DONE + BASELINED** — `eval/topic_drift.hpp`, runner `ch32_m2_drift`,
+  `[topic_drift]` test. Validated coherence signal = **content recurrence** (entity reuse ≥2×). On
+  word-TinyStories: corpus 0.121 is **5.7× above** the unigram-chance floor 0.021 (real structure),
+  and the **flat model sits AT the floor (0.021)** — zero entity-persistence. distinct-n ≈ corpus
+  (not looping). Methodological catch: window-rearrangement controls are useless on lexically-
+  homogeneous TinyStories; the valid control is a *distribution-matched* unigram null. See
+  [`M2_RESULTS.md`](M2_RESULTS.md). **P2 gate: lift model recurrence 0.021 → 0.121 without looping.**
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

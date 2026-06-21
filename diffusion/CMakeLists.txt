@@ -11,6 +11,7 @@ add_library(sub0diff STATIC
     src/denoiser.cpp
     src/recovery.cpp
     src/oov_cliff.cpp
+    src/topic_drift.cpp
     src/sampler.cpp
     src/model_io.cpp
     src/run_config.cpp
