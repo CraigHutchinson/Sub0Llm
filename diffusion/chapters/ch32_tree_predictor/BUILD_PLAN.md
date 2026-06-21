@@ -21,9 +21,12 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
 content-word `is_content` table + IB-pooling + feudal training) → **P3** (MERA log-depth, gated on the M3
 gap). Plus the ungated side probes 4a (holographic capacity numerics).
 
-**Key change since pause — GPU training is now available** (Stage 4 Phase 7, [[cuda-first-class-iteration-time]]):
-the Denoiser trains end-to-end on CUDA, so the **training-heavy P-phases can iterate fast** once `ch29
---device cuda` is wired. That was the reason to pause P1 on CPU; the blocker is being removed.
+**Key change since pause — GPU training is now WIRED** (Stage 4 Phase 7, [[cuda-first-class-iteration-time]],
+commit e1064ba): `ch29 --device cuda` trains the Denoiser end-to-end on ONE GPU stream (GpuTrainer;
+batched_diffusion_loss + Adam + clip + checkpoint all on/around CUDA). Verified on TinyStories
+(NELBO 4.85→4.06, clean exit). **The reason to pause P1 on CPU is GONE — the P-phases can now iterate
+fast on GPU** (`--device cuda`). One CPU-only tail remains: the post-training recall sweep falls back
+to CPU (logits/argmax host-deref); fine for now (run-once), GPU recall probe is a LOW follow-up.
 
 **Baselines banked for the A/Bs:** char-TinyStories (`/d/tmp/ch29_tinystories`, NELBO 1.12), word-TinyStories
 (`/d/tmp/ch29_word_tiny`, NELBO 1.77), char/word/BPE-512 Shakespeare. Decode default fixed (temp 0.9,
