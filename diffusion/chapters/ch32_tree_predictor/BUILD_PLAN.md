@@ -17,12 +17,19 @@ The premise and mechanism are validated; the actual P-phase build hasn't started
   *crude untrained* coarse-anchor already helps ⇒ strong signal that a *trained* gist (P2) helps more.
 - All design docs committed (README, DESIGN_REVIEW, DESIGN_REVIEW_2, BUILD_PLAN, M3/4B results).
 
-**Progress:** **P1 steps 1a+1b DONE** (commit d3e4302) — `CharComposer`+`CharDecoder` codec
-([`char_codec.hpp`](../../include/sub0diff/nn/char_codec.hpp)); round-trips spellings >90% + order-
-sensitive (anagrams diverge), validated by the `[char_codec]` test. See [`P1_RESULTS.md`](P1_RESULTS.md).
-Key finding: the non-AR decoder needs LEARNED POSITION QUERIES (RoPE alone → 35%, +queries → >90%).
-**Next:** P1 **1c** (wire codec around the word Denoiser + gated blend; the OOV A/B) — gated on the
-Phase-0 **M1 (OOV-cliff)** metric, which is the immediate build.
+**Progress:**
+- **Phase 0 M1 (OOV-cliff) DONE** (commit 6928738) — `eval/oov_cliff.hpp`, `--oov_cliff`. Measured
+  on word-TinyStories: **NLL_common 1.91 vs NLL_rare 15.44 → 8.08× cliff** (rare types predicted
+  ~8× worse, *above* uniform — actively mispredicted). The word-level OOV weakness is real and large
+  → P1 is justified. See [`M1_RESULTS.md`](M1_RESULTS.md). This is the **gate for 1c** (ratio→~1).
+- **P1 steps 1a+1b DONE** (commit d3e4302) — `CharComposer`+`CharDecoder` codec
+  ([`char_codec.hpp`](../../include/sub0diff/nn/char_codec.hpp)); round-trips spellings >90% + order-
+  sensitive (anagrams diverge), `[char_codec]` test. See [`P1_RESULTS.md`](P1_RESULTS.md). Key finding:
+  the non-AR decoder needs LEARNED POSITION QUERIES (RoPE alone → 35%, +queries → >90%).
+
+**Next:** P1 **1c** — wire the codec around the word Denoiser (compose-in / decode-out + lookup/composed
+gated blend), train, and re-run `--oov_cliff`: the 8.08× ratio must fall toward ~1 while in-vocab NLL
+(≈1.91) does not regress. (Phase-0 **M2** topic-drift is the remaining metric, needed for P2.)
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
