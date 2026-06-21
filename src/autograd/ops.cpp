@@ -168,6 +168,10 @@ Variable sum(const Variable& x) {
 // dL/dx = dL/dy * (x > 0)
 
 Variable relu(const Variable& x) {
+    // CUDA: forward dispatches but the backward mask is host pointer math — guard to a clean
+    // error rather than a UB host-deref of device memory (Stage 4: not on the diffusion path).
+    if (x.data().device().is_cuda())
+        throw std::runtime_error("autograd::relu: not yet implemented on CUDA");
     auto out = make_node(ops::relu(x.data()), x.requires_grad());
     if (out->requires_grad) {
         Tensor x_data = copy(x.data());
@@ -253,6 +257,8 @@ Variable bias_add(const Variable& x, const Variable& b) {
 
 Variable log_softmax(const Variable& x) {
     const auto& xd = x.data();
+    if (xd.device().is_cuda())   // not yet on CUDA — clean error vs host-deref UB
+        throw std::runtime_error("autograd::log_softmax: not yet implemented on CUDA");
     if (xd.ndim() > 2)
         throw std::runtime_error(
             "autograd::log_softmax: only 1D or 2D input supported");
@@ -306,6 +312,8 @@ Variable log_softmax(const Variable& x) {
 
 Variable cross_entropy(const Variable& logits, const Tensor& targets) {
     const auto& ld = logits.data();
+    if (ld.device().is_cuda())   // diffusion uses weighted_cross_entropy (on CUDA); this one isn't
+        throw std::runtime_error("autograd::cross_entropy: not yet implemented on CUDA");
     if (ld.ndim() != 2)
         throw std::runtime_error(
             "autograd::cross_entropy: logits must be 2D (N, C)");
@@ -463,6 +471,8 @@ Variable weighted_cross_entropy(const Variable& logits, const Tensor& targets,
 //            where k = sqrt(2/π)*(x+0.044715*x³), t = tanh(k)
 
 Variable gelu(const Variable& x) {
+    if (x.data().device().is_cuda())   // backward is host pointer math — guard (diffusion uses silu)
+        throw std::runtime_error("autograd::gelu: not yet implemented on CUDA");
     const Tensor xc       = x.data().contiguous();
     Tensor       out_data = ops::gelu(xc);
     auto out = make_node(std::move(out_data), x.requires_grad());
@@ -497,6 +507,8 @@ Variable gelu(const Variable& x) {
 Variable layer_norm(const Variable& x, const Variable& weight,
                     const Variable& bias, float eps) {
     const auto& xd = x.data();
+    if (xd.device().is_cuda())   // diffusion uses rms_norm (on CUDA); layer_norm isn't ported
+        throw std::runtime_error("autograd::layer_norm: not yet implemented on CUDA");
     if (xd.ndim() != 2)
         throw std::runtime_error("autograd::layer_norm: x must be 2D (T, D)");
     const std::size_t T = static_cast<std::size_t>(xd.shape()[0]);
@@ -988,6 +1000,8 @@ Variable narrow(const Variable& x, int64_t start, int64_t length) {
 // ── log_sigmoid ──────────────────────────────────────────────────────────────
 Variable log_sigmoid(const Variable& x) {
     const auto& xd = x.data();
+    if (xd.device().is_cuda())   // host pointer math — guard (not on the diffusion path)
+        throw std::runtime_error("autograd::log_sigmoid: not yet implemented on CUDA");
     // forward: y = log(sigmoid(x)) = -log(1 + exp(-x))
     // Numerically stable: min(x,0) - log(1 + exp(-|x|))
     Tensor out_data(xd.shape(), DType::Float32, xd.device());
@@ -1033,6 +1047,8 @@ Variable log_sigmoid(const Variable& x) {
 Variable row_scale(const Variable& x, const Variable& v) {
     const auto& xd = x.data();
     const auto& vd = v.data();
+    if (xd.device().is_cuda())   // MoE routing op; host pointer math — guard (not on diffusion path)
+        throw std::runtime_error("autograd::row_scale: not yet implemented on CUDA");
     if (xd.ndim() != 2)
         throw std::runtime_error("autograd::row_scale: x must be 2D (N, D)");
     if (vd.ndim() != 2 || vd.shape(1) != 1)

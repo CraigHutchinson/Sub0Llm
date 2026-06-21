@@ -30,6 +30,19 @@ std::vector<std::int32_t> ramp_tokens(std::size_t n, std::int32_t vocab) {
     return v;
 }
 
+// Relative RMS error between two host f32 tensors (for CPU-vs-CUDA parity checks).
+[[maybe_unused]] static double rel_rms(const sub0llm::Tensor& a, const sub0llm::Tensor& b) {
+    const auto as = a.data_as<float>();
+    const auto bs = b.data_as<float>();
+    double se = 0.0, sref = 0.0;
+    for (std::size_t i = 0; i < as.size(); ++i) {
+        const double d = static_cast<double>(as[i]) - static_cast<double>(bs[i]);
+        se += d * d;
+        sref += static_cast<double>(bs[i]) * static_cast<double>(bs[i]);
+    }
+    return std::sqrt(se / std::max(sref, 1e-12));
+}
+
 } // namespace
 
 TEST_CASE("corrupt_into - reuses buffers, guarantees >=1 corruption", "[diffusion]") {
@@ -230,6 +243,56 @@ TEST_CASE("Denoiser BATCHED training step on CUDA reduces loss", "[diffusion][cu
     REQUIRE(after < before);                           // batched fwd+bwd+update on GPU reduces the loss
 #else
     SUCCEED("CPU build - CUDA batched training step is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 7: NUMERICAL parity of the whole Denoiser stack (not just "loss decreases").
+// Two same-seed models (identical init) — one CPU, one CUDA — must agree on forward logits and
+// parameter gradients for one step. f32 reduction-order differs across devices → loose bounds.
+TEST_CASE("Denoiser fwd + param-grads match CPU vs CUDA", "[diffusion][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    dn::Denoiser cpu_model(16, 32, 2, 2, 1, 64, /*seed=*/5);
+    dn::Denoiser gpu_model(16, 32, 2, 2, 1, 64, /*seed=*/5);   // same seed ⇒ identical weights
+    gpu_model.to(sub0llm::Device::cuda());
+
+    const auto clean = ramp_tokens(16, 16);
+    sub0llm::Tensor toks({static_cast<std::int64_t>(clean.size())}, sub0llm::DType::Int32);
+    std::copy(clean.begin(), clean.end(), toks.data_as<std::int32_t>().begin());
+
+    auto y_cpu = cpu_model.forward(toks, 0.5f);
+    auto y_gpu = gpu_model.forward(toks, 0.5f);
+    REQUIRE(rel_rms(y_gpu.data().to(sub0llm::Device::cpu()), y_cpu.data()) < 5e-3);   // forward parity
+
+    // Backward parity via the diffusion loss (same seed ⇒ identical corruption on both devices).
+    dt::DiffusionLossContext cc(16), cg(16);
+    std::mt19937 rc(11), rg(11);
+    dt::diffusion_loss(cpu_model, clean, rc, cc, 0.3f, 0.7f).loss.backward();
+    dt::diffusion_loss(gpu_model, clean, rg, cg, 0.3f, 0.7f).loss.backward();
+    auto pc = cpu_model.parameters();
+    auto pg = gpu_model.parameters();
+    REQUIRE(pc.size() == pg.size());
+    // Check a few params' grads (token embedding + a block weight) — full-stack backward parity.
+    for (std::size_t i = 0; i < pc.size(); i += std::max<std::size_t>(1, pc.size() / 4)) {
+        if (pc[i]->grad().numel() == 0) continue;
+        REQUIRE(rel_rms(pg[i]->grad().to(sub0llm::Device::cpu()), pc[i]->grad()) < 5e-2);
+    }
+#else
+    SUCCEED("CPU build - CUDA Denoiser parity is exercised on the cuda preset");
+#endif
+}
+
+// Stage 4 Phase 7 (robustness): autograd ops NOT yet on CUDA must throw a clean error, not
+// UB-crash by host-dereferencing device memory, if a (non-diffusion) model is moved to CUDA.
+TEST_CASE("unwired autograd ops throw cleanly on CUDA", "[diffusion][cuda][device]") {
+#ifdef SUB0LLM_CUDA
+    namespace ag = sub0llm::autograd;
+    ag::Variable x(sub0llm::randn({4, 8}).to(sub0llm::Device::cuda()), /*requires_grad=*/true);
+    REQUIRE_THROWS(ag::relu(x));
+    REQUIRE_THROWS(ag::gelu(x));
+    REQUIRE_THROWS(ag::log_softmax(x));
+    REQUIRE_THROWS(ag::log_sigmoid(x));
+#else
+    SUCCEED("CPU build - CUDA guard behaviour is exercised on the cuda preset");
 #endif
 }
 
