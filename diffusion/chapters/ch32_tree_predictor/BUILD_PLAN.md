@@ -90,6 +90,13 @@ P1 codec. **Do not build P2 on char-composition.**
   function +53%) = local grammar across window **seams** → squarely **2d's** job. Compute win unchanged.
   See [`2E_RESULTS.md`](2E_RESULTS.md) §2c. Also recorded: DESIGN_REVIEW_3 §8 **verbosity/time slider**
   (gist separates meaning from surface → terseness/latency dial; future, needs HierDenoiser generation).
+- **HierDenoiser GENERATION wired** (sampler templated on model type — `make_canvas`/`refine_canvas`
+  now header templates; flat + hier share the SAME tuned sampler). `ch32_hier_gen` measures M2 on
+  generations. **3-seed result: the hierarchy does NOT improve generation coherence** — flat ≥ hier on
+  content-recurrence in 3/3 seeds (a single earlier run favoring hier was gen-seed noise, caught by the
+  3-seed check). **Verdict: the coarse-to-fine hierarchy is a COMPUTE/CONTEXT primitive only** —
+  efficiency/context win at a small (2c/2d-shrinkable) quality cost, NOT a coherence win. See
+  [`2E_RESULTS.md`](2E_RESULTS.md) §Generation-M2.
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

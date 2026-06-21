@@ -79,6 +79,30 @@ Next 2c+ levers (if needed beyond seams): a *learned* attention-pool / IB object
 this run shows even the trivial mask-aware mean nearly closes content, so the headroom there is small —
 **2d (seams) is the higher-value next lever.**
 
+## Generation M2 (RAN, 3 seeds): the hierarchy does NOT improve coherence — compute win only
+
+The 2e/2c gates are NLL (prediction). The actual P2 goal is topic coherence in GENERATION (M2
+content-recurrence). `ch32_hier_gen` trains flat + mask-aware hier at N=256, GENERATES 64 passages from
+each via the templated sampler, and scores M2 vs corpus and the unigram-chance floor (recurrence gap
+corpus−chance = 0.101).
+
+| seed | flat-gen recurrence | hier-gen recurrence | distinct-2 flat / hier |
+|------|--------------------:|--------------------:|-----------------------:|
+| 7 | 0.045 (24% of gap) | 0.039 (18%) | 0.671 / 0.608 |
+| 8 | 0.068 (47%) | 0.053 (33%) | 0.618 / 0.625 |
+| 9 | 0.054 (33%) | 0.048 (27%) | 0.664 / 0.608 |
+
+**Flat ≥ hier on content-recurrence in 3/3 seeds**, and hier is slightly *more* bigram-repetitive
+(lower distinct-2) in 3/3. (A single earlier run showed hier 0.063 > flat 0.048 — a lucky generation
+seed; the 3-seed check overturned it, the same way the 2b 3-seed check corrected its single run.)
+
+**Verdict:** the coarse-to-fine hierarchy is a **compute/context primitive only**. It does NOT improve
+generation coherence as a side effect — the shared coarse plan carries topic for *prediction* (2c
+closed the content-NLL gap) but does not make *generation* reuse entities more than flat. Entity reuse
+requires actively copying content words across distance, which neither model does well (~30% of the
+gap) and the gist does not add. So the hierarchy's value is **efficiency/context at a small, 2c/2d-
+shrinkable quality cost** — not a quality win. Do not claim coherence gains for it.
+
 ## Frontier verdict & next
 
 The gist-as-coarsening design is a **real efficiency/context primitive**: an order-of-magnitude compute
