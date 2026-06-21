@@ -63,8 +63,8 @@ struct DiffusionLossResult {
 // One NELBO Monte-Carlo sample on a clean window.
 //   t is drawn from U(t_min, t_max]; pass t_max < 1 to train under a curriculum
 //   ceiling (Ch28-style), or the defaults for the formal objective.
-template<class RNG>
-[[nodiscard]] DiffusionLossResult diffusion_loss(const nn::Denoiser& model,
+template<class Model, class RNG>
+[[nodiscard]] DiffusionLossResult diffusion_loss(const Model& model,
                                                  std::span<const std::int32_t> clean,
                                                  RNG& rng,
                                                  DiffusionLossContext& ctx,
@@ -148,9 +148,9 @@ struct BatchedDiffusionLossResult {
 // the single-thread analog of the pool's --shared-t, but B is decoupled from the core count, so a
 // single core can buy arbitrarily high consistency. exact_count: mask EXACTLY round(t·T) positions
 // (removes the Bernoulli count variance) — the other half of the consistency win.
-template<class RNG>
+template<class Model, class RNG>
 [[nodiscard]] BatchedDiffusionLossResult
-batched_diffusion_loss(const nn::Denoiser& model,
+batched_diffusion_loss(const Model& model,
                        std::span<const std::int32_t> stream,
                        std::span<const std::size_t> offsets,
                        RNG& rng, BatchedDiffusionLossContext& ctx,
