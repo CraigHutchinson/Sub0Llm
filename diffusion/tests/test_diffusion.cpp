@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "sub0diff/eval/recovery.hpp"
+#include "sub0diff/nn/char_codec.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
 #include "sub0diff/nn/sampler.hpp"
@@ -340,6 +341,77 @@ TEST_CASE("BENCH Denoiser full step CPU vs CUDA", "[.][bench][cuda]") {
 #else
     SUCCEED("CPU build - the GPU step bench runs on the cuda preset");
 #endif
+}
+
+// ── Ch32 P1: character-composition codec ───────────────────────────────────────────────────────
+// Validates the headline P1 claim (1a compose + 1b decode): compose→decode ROUND-TRIPS a word's
+// spelling, and the composed vector is ORDER-SENSITIVE (anagrams diverge) — the property that makes
+// it a real word representation, not a bag of letters. Tiny overfit so the unit test stays fast.
+TEST_CASE("CharComposer/CharDecoder round-trip spellings (P1 1a/1b)", "[diffusion][char_codec]") {
+    using sub0diff::nn::CharComposer;
+    using sub0diff::nn::CharDecoder;
+    namespace ag = sub0llm::autograd;
+
+    const std::int64_t n_chars = 27;   // a-z + a spare slot (26)
+    auto enc = [](const std::string& w) {
+        sub0llm::Tensor t({static_cast<std::int64_t>(w.size())}, sub0llm::DType::Int32);
+        auto s = t.data_as<std::int32_t>();
+        for (std::size_t i = 0; i < w.size(); ++i) s[i] = static_cast<std::int32_t>(w[i] - 'a');
+        return t;
+    };
+    const std::vector<std::string> words{"cat", "dog", "god", "run", "sun",
+                                         "the", "star", "tree", "moon", "fish"};
+    std::vector<sub0llm::Tensor> data;
+    for (const auto& w : words) data.push_back(enc(w));
+
+    CharComposer comp(n_chars, /*D=*/32, /*n_heads=*/4, /*n_kv_heads=*/2, /*n_layers=*/2, /*d_ff=*/0, 7);
+    CharDecoder  dec(n_chars, /*D=*/32, /*n_heads=*/4, /*n_kv_heads=*/2, /*n_layers=*/2, /*d_ff=*/0, 99);
+    std::vector<ag::Variable*> params;
+    for (auto* p : comp.parameters()) params.push_back(p);
+    for (auto* p : dec.parameters()) params.push_back(p);
+    sub0llm::nn::Adam opt(params, 3e-3f);
+
+    float first = 0.0f, last = 0.0f;
+    for (int step = 0; step < 400; ++step) {
+        opt.zero_grad();
+        ag::Variable loss = sub0diff::nn::char_recon_loss(comp, dec, data[0]);
+        for (std::size_t i = 1; i < data.size(); ++i)
+            loss = ag::add(loss, sub0diff::nn::char_recon_loss(comp, dec, data[i]));
+        loss.backward();
+        opt.step();
+        last = loss.data().item<float>();
+        if (step == 0) first = last;
+    }
+    REQUIRE(last < first);   // the autoencoder learns
+
+    // Reconstruction accuracy: argmax of the decoded char logits matches the spelling.
+    int correct = 0, total = 0;
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        const std::int64_t L = data[i].shape(0);
+        ag::Variable logits = dec.forward(comp.forward(data[i]), L);   // (L, n_chars)
+        const auto ls = logits.data().data_as<float>();
+        const auto cs = data[i].data_as<std::int32_t>();
+        for (std::int64_t r = 0; r < L; ++r) {
+            std::int64_t best = 0;
+            float        bv   = ls[static_cast<std::size_t>(r) * n_chars];
+            for (std::int64_t c = 1; c < n_chars; ++c) {
+                const float v = ls[static_cast<std::size_t>(r) * n_chars + c];
+                if (v > bv) { bv = v; best = c; }
+            }
+            if (best == cs[r]) ++correct;
+            ++total;
+        }
+    }
+    REQUIRE(static_cast<double>(correct) / total > 0.9);   // round-trips the spellings
+
+    // Order-sensitivity: "dog" and "god" (same letters, different order) compose to DISTINCT vectors.
+    const sub0llm::Tensor vd = comp.forward(enc("dog")).data();
+    const sub0llm::Tensor vg = comp.forward(enc("god")).data();
+    const auto a = vd.data_as<float>(), b = vg.data_as<float>();
+    double dot = 0, na = 0, nb = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    const double cosine = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-9);
+    REQUIRE(cosine < 0.999);   // not collapsed to a bag-of-letters
 }
 
 TEST_CASE("evaluate_recovery - counts and position stats are consistent", "[diffusion]") {
