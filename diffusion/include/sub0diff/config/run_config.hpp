@@ -86,6 +86,7 @@ struct Optim {
     bool          exact_noise  = true;       // mask exactly round(t·T) positions
     bool          whole_word   = false;      // corrupt whole words, not independent subwords
     bool          contiguous   = false;      // mask a CONTIGUOUS span (§13.4 — trains long-range infill, not local interpolation)
+    std::string   device       = "cpu";      // cpu (worker pool) | cuda (single GPU stream)
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -102,6 +103,7 @@ struct Optim {
         v("exact_noise",  Scope::Runtime, self.exact_noise,  "exact masked count");
         v("contiguous",   Scope::Runtime, self.contiguous,   "mask a contiguous span (long-range infill)");
         v("whole_word",   Scope::Runtime, self.whole_word,   "whole-word masking");
+        v("device",       Scope::Runtime, self.device,       "cpu|cuda (train on GPU)");
     }
 };
 

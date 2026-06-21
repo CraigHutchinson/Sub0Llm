@@ -47,6 +47,7 @@
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/curriculum.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
+#include "sub0diff/train/gpu_trainer.hpp"
 #include "sub0diff/train/parallel.hpp"
 #include "sub0diff/train/schedule.hpp"
 #include "sub0diff/train/train_state.hpp"
@@ -460,6 +461,20 @@ static int run(int argc, char** argv) {
     // resumes this exact run. Stamped with code_sha + config_sha (the specialized-build tag).
     cfgm::write_run_config(cfg.data.ckpt_dir, cfg, SUB0DIFF_CODE_SHA);
 
+    // ── device: move the model to the GPU AFTER the CPU checkpoint load (Stage 4 Phase 7) ───────
+    // The optimizer + GpuTrainer are constructed below, so they see the GPU params (Variable::to is
+    // in-place → param_ptrs stay valid; Adam's m/v then allocate on-device). Checkpoint save D2H's.
+    const bool use_cuda = (cfg.optim.device == "cuda" || cfg.optim.device == "gpu");
+    if (use_cuda) {
+#ifdef SUB0LLM_CUDA
+        model.to(sub0llm::Device::cuda());
+        std::println("device: CUDA — single GPU stream (worker pool bypassed; --threads ignored)");
+#else
+        throw std::runtime_error("--device cuda requested but this binary was built without CUDA "
+                                 "(configure the cuda preset)");
+#endif
+    }
+
     // ── Gradient-conflict probe (--grad-probe) — a Ch31-sandbox diagnostic ───────
     // At the CURRENT weights, does the gradient from EASY (low-t) maskings point the same way
     // as from HARD (high-t) maskings? Diffusion averages all noise levels in one step (unlike
@@ -703,20 +718,36 @@ static int run(int argc, char** argv) {
         // Unified trainer: W=cfg.optim.threads workers cooperatively process B=cfg.optim.batch windows/step
         // (B/W each), master sees the MEAN gradient over all B. ALWAYS used (W=1 is a pool of one),
         // so single- and multi-threaded training run the identical fundamental step.
-        auto pool = std::make_unique<dt::ParallelTrainer>(
-            cfg.optim.threads,
-            dt::ParallelTrainer::Arch{V, cfg.model.embed_dim, cfg.model.n_layers, cfg.model.d_ff,
-                                      cfg.model.seq_len,
-                                      static_cast<std::size_t>(cfg.model.n_heads),
-                                      static_cast<std::size_t>(cfg.model.n_kv_heads)},
-            param_ptrs, 0.02f, cfg.optim.t_max, 1234 + start_step,
-            /*share_weights=*/true, ws_span, cfg.optim.whole_word, worker_pins, cfg.optim.exact_noise,
-            static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t, cfg.optim.contiguous);
-        std::println("trainer: batch-size {} windows/step (consistency ∝ √{}) split across {} "
-                     "worker{} (speed only — same gradient at any W); shared-t {}, exact-noise {}, masking {}",
-                     cfg.optim.batch, cfg.optim.batch, cfg.optim.threads, cfg.optim.threads == 1 ? "" : "s",
-                     cfg.optim.shared_t ? "on" : "off", cfg.optim.exact_noise ? "on" : "off",
-                     cfg.optim.contiguous ? "CONTIGUOUS-span" : "scattered");
+        // Back-end-agnostic trainer (ITrainer): the CPU worker pool, or — under --device cuda — a
+        // single GPU stream (no threads/reduce; the GPU is the parallelism). main()'s loop below is
+        // identical for both: set_t_range() + step().
+        std::unique_ptr<dt::ITrainer> pool;
+        if (use_cuda) {
+            pool = std::make_unique<dt::GpuTrainer>(
+                model, param_ptrs, cfg.model.seq_len, 0.02f, cfg.optim.t_max, 1234 + start_step,
+                static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t, cfg.optim.exact_noise,
+                ws_span, cfg.optim.whole_word, cfg.optim.contiguous);
+            std::println("trainer: batch-size {} windows/step on ONE GPU stream; shared-t {}, "
+                         "exact-noise {}, masking {}",
+                         cfg.optim.batch, cfg.optim.shared_t ? "on" : "off",
+                         cfg.optim.exact_noise ? "on" : "off",
+                         cfg.optim.contiguous ? "CONTIGUOUS-span" : "scattered");
+        } else {
+            pool = std::make_unique<dt::ParallelTrainer>(
+                cfg.optim.threads,
+                dt::ParallelTrainer::Arch{V, cfg.model.embed_dim, cfg.model.n_layers, cfg.model.d_ff,
+                                          cfg.model.seq_len,
+                                          static_cast<std::size_t>(cfg.model.n_heads),
+                                          static_cast<std::size_t>(cfg.model.n_kv_heads)},
+                param_ptrs, 0.02f, cfg.optim.t_max, 1234 + start_step,
+                /*share_weights=*/true, ws_span, cfg.optim.whole_word, worker_pins, cfg.optim.exact_noise,
+                static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t, cfg.optim.contiguous);
+            std::println("trainer: batch-size {} windows/step (consistency ∝ √{}) split across {} "
+                         "worker{} (speed only — same gradient at any W); shared-t {}, exact-noise {}, masking {}",
+                         cfg.optim.batch, cfg.optim.batch, cfg.optim.threads, cfg.optim.threads == 1 ? "" : "s",
+                         cfg.optim.shared_t ? "on" : "off", cfg.optim.exact_noise ? "on" : "off",
+                         cfg.optim.contiguous ? "CONTIGUOUS-span" : "scattered");
+        }
         std::vector<std::size_t> offsets(cfg.optim.batch);
         std::size_t overfit_cursor = 0;   // cycles the N fixed windows across the B step slots
         if (cfg.diag.overfit > 0)
@@ -970,6 +1001,13 @@ static int run(int argc, char** argv) {
     } else {
         section("4. Training — skipped (checkpoint already at target steps)");
     }
+
+#ifdef SUB0LLM_CUDA
+    // The post-training diagnostics (§5 held-out eval, recall sweep, per-t) are run-once probes that
+    // read logits/argmax via host pointers (recall, recovery). Move the model back to CPU so they
+    // work unchanged — these aren't on the iteration hot path, so the H2D/D2H cost is irrelevant.
+    if (use_cuda) model.to(sub0llm::Device::cpu());
+#endif
 
     // ── 5'. OVERFIT verdict: per-noise TRAIN recall over the N fixed windows ────────
     // Held-out eval is meaningless here (we deliberately trained on N windows only), so

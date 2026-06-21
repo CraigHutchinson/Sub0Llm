@@ -108,13 +108,19 @@ int64_t load_checkpoint(const std::vector<autograd::Variable>& params,
                 std::format("load_checkpoint: param {} numel mismatch: checkpoint={}, model={}",
                             i, expected_numel, actual_numel));
 
-        // Write directly into the mutable tensor data
-        auto sp = const_cast<autograd::Variable&>(params[i]).data().data_as<float>();
+        // Read into a host buffer, then move to the param's device (H2D for CUDA params).
+        auto&        var  = const_cast<autograd::Variable&>(params[i]);
+        const Device dev  = var.data().device();
+        Tensor       host = dev.is_cpu() ? var.data()
+                                         : Tensor(var.data().shape(), DType::Float32, Device::cpu());
+        auto sp = host.data_as<float>();
         f.read(reinterpret_cast<char*>(sp.data()),
                static_cast<std::streamsize>(sp.size() * sizeof(float)));
         if (!f)
             throw std::runtime_error(
                 std::format("load_checkpoint: truncated data for param {} in '{}'", i, path));
+        if (!dev.is_cpu())
+            var.data() = host.to(dev);
     }
 
     return step;

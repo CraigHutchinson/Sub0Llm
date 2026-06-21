@@ -50,21 +50,35 @@
 
 namespace sub0diff::train {
 
-class ParallelTrainer {
+// One step's outcome, shared across trainer back-ends (CPU pool / single GPU stream).
+struct TrainStepResult {
+    float         mean_loss = 0.0f;   // mean per-window NELBO this step
+    std::uint64_t masked_tokens = 0;  // summed over all windows
+    float         last_t = 0.0f;      // a representative sampled noise level
+    // Master-side phase timing (≈free: 2 clock reads/step) — lets a caller see
+    // the parallel-overhead split. compute_s = SYNC+forward+backward (the useful,
+    // perfectly-parallel part); reduce_s = the barrier-bounded gradient reduction.
+    double        compute_s = 0.0;
+    double        reduce_s  = 0.0;
+};
+
+// Trainer interface: main()'s loop drives a back-end through set_t_range()/step() and is
+// agnostic to whether it's the CPU worker pool or the single-GPU-stream trainer (gpu_trainer.hpp).
+class ITrainer {
 public:
+    virtual ~ITrainer() = default;
+    virtual void set_t_range(float t_min, float t_max) noexcept = 0;
+    virtual TrainStepResult step(std::span<const std::int32_t> stream,
+                                 std::span<const std::size_t> offsets) = 0;
+    [[nodiscard]] virtual std::int64_t batch_size() const noexcept = 0;
+};
+
+class ParallelTrainer : public ITrainer {
+public:
+    using StepResult = TrainStepResult;   // back-compat alias (internal use)
     struct Arch {
         std::int64_t vocab_size, embed_dim, n_layers, d_ff, seq_len;
         std::size_t  n_heads, n_kv_heads;
-    };
-    struct StepResult {
-        float         mean_loss = 0.0f;   // mean per-window NELBO this step
-        std::uint64_t masked_tokens = 0;  // summed over all workers
-        float         last_t = 0.0f;      // a representative sampled noise level
-        // Master-side phase timing (≈free: 2 clock reads/step) — lets a caller see
-        // the parallel-overhead split. compute_s = SYNC+forward+backward (the useful,
-        // perfectly-parallel part); reduce_s = the barrier-bounded gradient reduction.
-        double        compute_s = 0.0;
-        double        reduce_s  = 0.0;
     };
 
     ParallelTrainer(std::size_t n_workers, const Arch& arch,
@@ -146,18 +160,18 @@ public:
 
     // Update the noise band workers sample t from (the curriculum's dynamic ceiling).
     // Read by each worker at the top of its next step — set it before step().
-    void set_t_range(float t_min, float t_max) noexcept {
+    void set_t_range(float t_min, float t_max) noexcept override {
         t_min_.store(t_min, std::memory_order_relaxed);
         t_max_.store(t_max, std::memory_order_relaxed);
     }
 
-    [[nodiscard]] std::int64_t batch_size() const noexcept { return batch_size_; }
+    [[nodiscard]] std::int64_t batch_size() const noexcept override { return batch_size_; }
 
     // Run one accumulated step over B = batch_size() windows: offsets.size() must equal batch_size().
     // Worker w processes offsets[w·B/W .. (w+1)·B/W). Master grads hold the MEAN gradient over
     // all B windows on return (IDENTICAL for any W); caller clips and steps its optimizer.
     StepResult step(std::span<const std::int32_t> stream,
-                    std::span<const std::size_t> offsets) {
+                    std::span<const std::size_t> offsets) override {
         stream_  = stream;
         offsets_ = offsets;
         // shared-t: ONE noise level for the whole step (all B windows) → within-level consistency

@@ -253,8 +253,11 @@ void Adam::save_state(const std::string& path) const {
     for (std::size_t i = 0; i < m_.size(); ++i) {
         const std::int64_t numel = m_[i].numel();
         f.write(as_bytes(&numel), 8);
-        f.write(as_bytes(m_[i].data_as<float>().data()), numel * 4);
-        f.write(as_bytes(v_[i].data_as<float>().data()), numel * 4);
+        // CUDA moments are brought to host first (the .opt sidecar is device-agnostic on disk).
+        const Tensor mh = m_[i].device().is_cpu() ? m_[i] : m_[i].to(Device::cpu());
+        const Tensor vh = v_[i].device().is_cpu() ? v_[i] : v_[i].to(Device::cpu());
+        f.write(as_bytes(mh.data_as<float>().data()), numel * 4);
+        f.write(as_bytes(vh.data_as<float>().data()), numel * 4);
     }
 }
 
@@ -274,8 +277,14 @@ bool Adam::load_state(const std::string& path) {
         std::int64_t numel = 0;
         f.read(as_wbytes(&numel), 8);
         if (!f || numel != m_[i].numel()) return false;
-        f.read(as_wbytes(m_[i].data_as<float>().data()), numel * 4);
-        f.read(as_wbytes(v_[i].data_as<float>().data()), numel * 4);
+        // Read into host buffers, then move to the moment's device (H2D for CUDA).
+        Tensor mh(m_[i].shape(), DType::Float32, Device::cpu());
+        Tensor vh(v_[i].shape(), DType::Float32, Device::cpu());
+        f.read(as_wbytes(mh.data_as<float>().data()), numel * 4);
+        f.read(as_wbytes(vh.data_as<float>().data()), numel * 4);
+        if (!f) return false;
+        m_[i] = m_[i].device().is_cpu() ? std::move(mh) : mh.to(m_[i].device());
+        v_[i] = v_[i].device().is_cpu() ? std::move(vh) : vh.to(v_[i].device());
     }
     if (!f) return false;
     t_ = t;
