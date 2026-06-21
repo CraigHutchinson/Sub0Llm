@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "sub0diff/eval/oov_cliff.hpp"
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/char_codec.hpp"
 #include "sub0diff/nn/denoiser.hpp"
@@ -341,6 +342,35 @@ TEST_CASE("BENCH Denoiser full step CPU vs CUDA", "[.][bench][cuda]") {
 #else
     SUCCEED("CPU build - the GPU step bench runs on the cuda preset");
 #endif
+}
+
+// ── Ch32 Phase 0: OOV-cliff metric (M1) ────────────────────────────────────────────────────────
+// Validates rare_type_mask's frequency split and that evaluate_oov_cliff buckets the per-masked-
+// token NELBO correctly (counts add up, CE is a positive softmax NLL). The cliff RATIO itself is a
+// model property measured on trained checkpoints; here we validate the mechanism.
+TEST_CASE("OOV-cliff metric: rare_type_mask + evaluate_oov_cliff (M1)", "[diffusion][oov_cliff]") {
+    using namespace sub0diff::eval;
+    // freq: 0->3, 1->2, 2->1, 3->0; rarest 50% of 4 types (ties by id) = {3, 2}.
+    const std::vector<std::int32_t> train{0, 0, 0, 1, 1, 2};
+    const auto is_rare = rare_type_mask(train, 4, 0.5);
+    REQUIRE(is_rare.size() == 4);
+    REQUIRE(is_rare[3] == 1);   // freq 0 — the OOV-est, sorts first
+    REQUIRE(is_rare[2] == 1);   // freq 1
+    REQUIRE(is_rare[0] == 0);   // freq 3 — common
+    REQUIRE(is_rare[1] == 0);
+
+    // Mechanism on a tiny model + stream: every token equally frequent ⇒ ties by id ⇒ ids 0-3 rare.
+    dn::Denoiser model(8, 32, 2, 2, 1, 64, /*seed=*/5);   // real vocab 8
+    std::vector<std::int32_t> eval;
+    for (int i = 0; i < 64; ++i) eval.push_back(i % 8);
+    const auto rare8 = rare_type_mask(eval, 8, 0.5);
+    std::mt19937 rng(1);
+    const auto r = evaluate_oov_cliff(model, eval, rare8, /*T=*/16, /*noise=*/0.5f, rng,
+                                      /*max_windows=*/8);
+    REQUIRE(r.n_rare + r.n_common > 0);                   // masked tokens were scored
+    REQUIRE(std::isfinite(r.nll_rare()));
+    REQUIRE(std::isfinite(r.nll_common()));
+    REQUIRE(r.nll_rare() > 0.0);                          // CE (nats) is a positive NLL
 }
 
 // ── Ch32 P1: character-composition codec ───────────────────────────────────────────────────────

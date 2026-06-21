@@ -43,6 +43,7 @@
 #include "sub0diff/config/run_config.hpp"
 #include "sub0diff/data/token_cache.hpp"
 #include "sub0diff/eval/inspect.hpp"
+#include "sub0diff/eval/oov_cliff.hpp"
 #include "sub0diff/eval/recovery.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/train/curriculum.hpp"
@@ -1135,6 +1136,24 @@ static int run(int argc, char** argv) {
                  pos.recall_at(0) * 100.0f,
                  pos.recall_at(static_cast<std::size_t>(cfg.model.seq_len - 1)) * 100.0f,
                  interior / static_cast<float>(n_int) * 100.0f);
+
+    // ── 5a'. OOV-CLIFF (M1, --oov-cliff): per-masked-token NLL on RARE vs COMMON types ──
+    // The rarest types by TRAIN frequency proxy OOV-at-test. NLL_rare / NLL_common is the
+    // "cliff" the Ch32 P1 char-codec targets (BUILD_PLAN Phase 0): >>1 ⇒ much worse on rare
+    // words; ~1 ⇒ no cliff. Gate for P1 1c (the ratio should fall toward 1 after the codec).
+    if (cfg.diag.oov_cliff) {
+        section("5a'. OOV-cliff (M1): NLL on rare vs common word types");
+        const auto is_rare = de::rare_type_mask(train_ids, model.model_vocab(), cfg.diag.oov_rare_frac);
+        std::size_t n_rare_types = 0;
+        for (auto b : is_rare) n_rare_types += b;
+        std::mt19937 oov_rng(4242);
+        const auto oc = de::evaluate_oov_cliff(model, eval_ids, is_rare, cfg.model.seq_len,
+                                               /*noise=*/0.5f, oov_rng, cfg.diag.recall_windows);
+        std::println("rarest {:.0f}% of types ({} of {}) = OOV proxy; held-out masked at t=0.50:",
+                     cfg.diag.oov_rare_frac * 100.0, n_rare_types, model.model_vocab());
+        std::println("  NLL_common {:.3f} ({} tok) | NLL_rare {:.3f} ({} tok) | CLIFF ratio {:.2f}x",
+                     oc.nll_common(), oc.n_common, oc.nll_rare(), oc.n_rare, oc.ratio());
+    }
 
     // ── 5b. MEMORIZATION check: the SAME sweep on the TRAIN stream (--eval-train) ──
     // train≫held-out ⇒ the model fits/memorizes training fine and the limit is

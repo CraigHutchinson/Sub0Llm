@@ -10,6 +10,7 @@ add_library(sub0diff STATIC
     src/host_detect.cpp
     src/denoiser.cpp
     src/recovery.cpp
+    src/oov_cliff.cpp
     src/sampler.cpp
     src/model_io.cpp
     src/run_config.cpp

@@ -159,6 +159,8 @@ struct Diag {
     std::int64_t  overfit        = 0;     // minimal-case: train only first N windows, stop on train recall
     std::uint64_t recall_windows = std::numeric_limits<std::uint64_t>::max();  // SIZE_MAX=corpus-scaled
     bool          founded        = false; // legacy --founded (a no-op now; defaults are founded)
+    bool          oov_cliff      = false; // M1: NLL_rare/NLL_common cliff after the recall sweep
+    double        oov_rare_frac  = 0.5;   // fraction of rarest types treated as the OOV proxy
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -172,6 +174,8 @@ struct Diag {
         v("overfit",        Scope::Runtime, self.overfit,        "minimal-case: first N windows");
         v("recall_windows", Scope::Runtime, self.recall_windows, "recall sweep budget");
         v("founded",        Scope::Runtime, self.founded,        "legacy founded preset (no-op)");
+        v("oov_cliff",      Scope::Runtime, self.oov_cliff,      "M1: NLL rare vs common cliff");
+        v("oov_rare_frac",  Scope::Runtime, self.oov_rare_frac,  "rarest type fraction (OOV proxy)");
     }
 };
 
