@@ -1,0 +1,185 @@
+// oov_ab.cpp (Ch32 P1 1c) — the OOV A/B kill-test.
+//
+// Trains a BASELINE word Denoiser and a CodecDenoiser (char-composed embedding) on the SAME
+// word-level corpus and budget, then measures the M1 OOV-cliff (NLL_rare / NLL_common) on both.
+// The codec passes the kill-test iff its cliff falls toward ~1 while its in-vocab (common-bucket)
+// NLL does not regress vs the baseline. See ch32 M1_RESULTS.md / P1_RESULTS.md.
+//
+// Build: cmake --build build-cuda --target ch32_oov_ab ; run with --device cuda.
+
+#include "sub0diff/eval/oov_cliff.hpp"
+#include "sub0diff/nn/codec_denoiser.hpp"
+#include "sub0diff/nn/denoiser.hpp"
+#include "sub0diff/train/diffusion_loss.hpp"
+
+#include "sub0llm/core/ops.hpp"
+#include "sub0llm/nn/optimizer.hpp"
+#include "sub0llm/tokenizer/bpe.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <format>
+#include <print>
+#include <random>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using sub0llm::BPETokenizer;
+namespace dn = sub0diff::nn;
+namespace dt = sub0diff::train;
+namespace de = sub0diff::eval;
+
+namespace {
+
+std::vector<std::string> read_paragraphs(const std::string& path, std::int64_t limit) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error(std::format("cannot open corpus: {}", path));
+    std::vector<std::string> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+        std::size_t b = 0;
+        while (b < line.size() && std::isspace(static_cast<unsigned char>(line[b]))) ++b;
+        if (b >= line.size()) continue;
+        out.push_back(line.substr(b));
+        if (limit > 0 && static_cast<std::int64_t>(out.size()) >= limit) break;
+    }
+    return out;
+}
+
+std::vector<std::int32_t> encode_all(const BPETokenizer& tok, std::span<const std::string> texts) {
+    std::vector<std::int32_t> ids;
+    for (const auto& t : texts) {
+        auto v = tok.encode(t);
+        ids.insert(ids.end(), v.begin(), v.end());
+    }
+    return ids;
+}
+
+// (Vm·max_len,) int32 byte-level spellings: word id → its UTF-8 bytes (0-255), padded with `pad`.
+sub0llm::Tensor build_word_chars(const BPETokenizer& tok, std::int64_t Vm, std::int64_t max_len,
+                                 std::int32_t pad) {
+    sub0llm::Tensor wc({Vm * max_len}, sub0llm::DType::Int32);
+    auto d = wc.data_as<std::int32_t>();
+    for (std::int64_t id = 0; id < Vm; ++id) {
+        const std::string_view s = (id < static_cast<std::int64_t>(tok.vocab_size()))
+                                       ? tok.token_str(static_cast<BPETokenizer::TokenId>(id))
+                                       : std::string_view{};
+        for (std::int64_t j = 0; j < max_len; ++j)
+            d[static_cast<std::size_t>(id * max_len + j)] =
+                (j < static_cast<std::int64_t>(s.size()))
+                    ? static_cast<std::int32_t>(static_cast<unsigned char>(s[static_cast<std::size_t>(j)]))
+                    : pad;
+    }
+    return wc;
+}
+
+template <class Model>
+void train(Model& model, std::span<const std::int32_t> stream, int steps, std::int64_t B,
+           std::int64_t T, float lr, std::uint64_t seed, const char* name) {
+    model.to(sub0llm::Device::cuda());
+    auto params = model.parameters();
+    sub0llm::nn::Adam opt(params, lr);
+    dt::BatchedDiffusionLossContext ctx(B, T);
+    std::mt19937 rng(static_cast<std::uint32_t>(seed));
+    const std::size_t n_pos = stream.size() - static_cast<std::size_t>(T) + 1;
+    std::uniform_int_distribution<std::size_t> off_dist(0, n_pos - 1);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    float last = 0.0f;
+    for (int s = 0; s < steps; ++s) {
+        std::vector<std::size_t> offsets(static_cast<std::size_t>(B));
+        for (auto& o : offsets) o = off_dist(rng);
+        for (auto* p : params)
+            if (p->grad().numel() > 0)
+                p->grad() = sub0llm::zeros(p->data().shape(), p->data().dtype(), p->data().device());
+        auto res = dt::batched_diffusion_loss(model, stream, offsets, rng, ctx, 0.02f, 1.0f);
+        res.loss.backward();
+        (void)sub0llm::nn::clip_grad_norm(params, 5.0f);
+        opt.step();
+        last = res.loss.data().to(sub0llm::Device::cpu()).item<float>();
+        if ((s + 1) % 500 == 0)
+            std::println("  [{}] step {:>5}  nelbo={:.4f}  ({:.1f}s)", name, s + 1,
+                         static_cast<double>(last),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+}
+
+template <class Model>
+de::OovCliffResult cliff(const Model& model, std::span<const std::int32_t> eval_ids,
+                         std::span<const std::uint8_t> is_rare, std::int64_t T,
+                         std::size_t windows) {
+    std::mt19937 rng(123);
+    return de::evaluate_oov_cliff(model, eval_ids, is_rare, T, 0.5f, rng, windows);
+}
+
+std::int64_t arg_i(int argc, char** argv, const std::string& key, std::int64_t def) {
+    for (int i = 1; i + 1 < argc; ++i) if (key == argv[i]) return std::stoll(argv[i + 1]);
+    return def;
+}
+std::string arg_s(int argc, char** argv, const std::string& key, const std::string& def) {
+    for (int i = 1; i + 1 < argc; ++i) if (key == argv[i]) return argv[i + 1];
+    return def;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const std::string corpus = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
+    const std::int64_t plimit  = arg_i(argc, argv, "--paragraphs", 400);
+    const std::int64_t steps   = arg_i(argc, argv, "--steps", 2000);
+    const std::int64_t D       = arg_i(argc, argv, "--embed_dim", 256);
+    const std::int64_t L       = arg_i(argc, argv, "--n_layers", 4);
+    const std::int64_t T       = arg_i(argc, argv, "--seq_len", 64);
+    const std::int64_t maxlen  = arg_i(argc, argv, "--max_len", 12);
+    const std::int64_t B       = arg_i(argc, argv, "--batch", 16);
+    const std::size_t  windows = static_cast<std::size_t>(arg_i(argc, argv, "--recall_windows", 4000));
+
+    std::println("== Ch32 P1 1c — OOV A/B (baseline Denoiser vs CodecDenoiser) ==");
+    auto paras = read_paragraphs(corpus, plimit);
+    if (paras.size() < 20) throw std::runtime_error("need >=20 paragraphs");
+    const std::size_t n_eval = std::max<std::size_t>(1, paras.size() / 20);   // 5% held out
+    std::vector<std::string> train_p(paras.begin(), paras.end() - n_eval);
+    std::vector<std::string> eval_p(paras.end() - n_eval, paras.end());
+
+    std::print("building word tokenizer over {} paragraphs... ", train_p.size());
+    BPETokenizer tok = BPETokenizer::word_level(train_p);
+    const std::int64_t Vr = static_cast<std::int64_t>(tok.vocab_size());
+    std::println("done — {} word vocab", Vr);
+
+    const auto train_ids = encode_all(tok, train_p);
+    const auto eval_ids  = encode_all(tok, eval_p);
+    std::println("train {} tokens, eval {} tokens; D={} L={} T={} steps={} maxlen={}",
+                 train_ids.size(), eval_ids.size(), D, L, T, steps, maxlen);
+
+    // model_vocab = Vr + 1 (mask id); byte-level char vocab 0-255 + pad=256 → n_chars 257.
+    const sub0llm::Tensor word_chars = build_word_chars(tok, Vr + 1, maxlen, /*pad=*/256);
+    const auto is_rare = de::rare_type_mask(train_ids, Vr + 1, 0.5);
+
+    std::println("\n-- training BASELINE Denoiser --");
+    dn::Denoiser base(Vr, D, 8, 4, L, 0, /*seed=*/7);
+    train(base, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "base");
+    const auto cb = cliff(base, eval_ids, is_rare, T, windows);
+
+    std::println("\n-- training CodecDenoiser --");
+    dn::CodecDenoiser codec(Vr, D, 8, 4, L, 0, /*n_chars=*/257, maxlen, word_chars, /*seed=*/7);
+    train(codec, train_ids, static_cast<int>(steps), B, T, 1e-3f, 7, "codec");
+    const auto cc = cliff(codec, eval_ids, is_rare, T, windows);
+
+    std::println("\n================= OOV A/B (rarest 50% of types) =================");
+    std::println("  BASELINE  NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x   (rare {} / common {} tok)",
+                 cb.nll_common(), cb.nll_rare(), cb.ratio(), cb.n_rare, cb.n_common);
+    std::println("  CODEC     NLL_common {:.3f}  NLL_rare {:.3f}  CLIFF {:.2f}x   (rare {} / common {} tok)",
+                 cc.nll_common(), cc.nll_rare(), cc.ratio(), cc.n_rare, cc.n_common);
+    const double cliff_drop = cb.ratio() > 0 ? (cb.ratio() - cc.ratio()) / cb.ratio() * 100.0 : 0.0;
+    const double invocab_reg = cb.nll_common() > 0 ? (cc.nll_common() - cb.nll_common()) / cb.nll_common() * 100.0 : 0.0;
+    std::println("  VERDICT: cliff {:.2f}x -> {:.2f}x ({:+.0f}%); in-vocab NLL {:+.1f}%  [{}]",
+                 cb.ratio(), cc.ratio(), -cliff_drop, invocab_reg,
+                 (cc.ratio() < cb.ratio() && invocab_reg < 5.0) ? "PASS (cliff down, in-vocab held)"
+                                                                : "see numbers");
+    return 0;
+}

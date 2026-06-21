@@ -46,7 +46,7 @@ public:
           tok_emb_(vocab_size + 1, embed_dim, seed),
           composer_(n_chars, embed_dim, n_heads, n_kv_heads, /*codec depth=*/2, 0, seed + 7000),
           word_chars_(std::move(word_chars)),
-          alpha_(sub0llm::zeros(sub0llm::Tensor::Shape{vocab_size + 1, 1}), /*requires_grad=*/true),
+          alpha_(sub0llm::zeros(sub0llm::Tensor::Shape{vocab_size + 1, embed_dim}), /*requires_grad=*/true),
           ln_f_(embed_dim) {
         blocks_.reserve(static_cast<std::size_t>(n_layers));
         for (std::int64_t l = 0; l < n_layers; ++l)
@@ -116,14 +116,16 @@ private:
     [[nodiscard]] sub0llm::autograd::Variable effective_embedding() const {
         namespace ag = sub0llm::autograd;
         ag::Variable composed = composer_.compose_vocab(word_chars_, model_vocab(), max_len_);  // (Vm,D)
-        return ag::add(tok_emb_.weight(), ag::row_scale(composed, alpha_));
+        // E = lookup + alpha ⊙ composed (per-element gate; mul+add are both on CUDA — row_scale is
+        // not). alpha inits 0 ⇒ E = lookup at the start (plain word-level / no-regression baseline).
+        return ag::add(tok_emb_.weight(), ag::mul(composed, alpha_));
     }
 
     std::int64_t                    real_vocab_, embed_dim_, max_len_;
     sub0llm::nn::Embedding          tok_emb_;       // per-word lookup (Vm × D)
     CharComposer                    composer_;      // spelling → word vector
     sub0llm::Tensor                 word_chars_;    // (Vm·max_len,) int32 — fixed spellings
-    sub0llm::autograd::Variable     alpha_;         // (Vm, 1) per-word lookup↔composed gate
+    sub0llm::autograd::Variable     alpha_;         // (Vm, D) per-element lookup↔composed gate (init 0)
     std::vector<BidirectionalBlock> blocks_;
     sub0llm::nn::RMSNorm            ln_f_;
 };
