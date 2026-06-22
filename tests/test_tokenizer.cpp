@@ -97,6 +97,18 @@ TEST_CASE("word_level - LEADING quotes don't weld to the word (apostrophe is wor
     REQUIRE(a.back() == b.back());
 }
 
+TEST_CASE("word_level - accented Latin letters stay inside the word (no accent split)",
+          "[tokenizer][word]") {
+    // ñ/é/ï are multi-byte UTF-8; the old ASCII-only letter test split them out, fragmenting
+    // "piñata"->"pi"+"ñ"+"ata". Accented Latin letters must be word-internal.
+    auto tok = BPETokenizer::word_level({"the piñata at the café was naïve"});
+    REQUIRE(tok.decode(tok.encode("piñata")) == "piñata");   // lossless
+    REQUIRE(tok.token_id("piñata") >= 0);                    // ONE token, not split
+    REQUIRE(tok.token_id("café")   >= 0);
+    REQUIRE(tok.token_id("naïve")  >= 0);
+    REQUIRE(tok.token_id("ñ") < 0);                          // the accent is NOT its own token
+}
+
 TEST_CASE("word_level - survives save/load and is distinguished from char-level", "[tokenizer][word]") {
     const std::string text = "hark, who goes there?\n";
     auto tok = BPETokenizer::word_level({text});

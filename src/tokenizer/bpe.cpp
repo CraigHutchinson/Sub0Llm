@@ -85,8 +85,26 @@ std::vector<std::string> word_to_chars(std::string_view word) {
 // the text exactly — so it round-trips and preserves verse/line structure.
 std::vector<std::string> split_words(std::string_view text) {
     static const std::string apostrophe = "\xE2\x80\x99";  // U+2019 RIGHT SINGLE QUOTATION
-    auto is_letter = [](const std::string& c) {
-        return c.size() == 1 && (std::isalpha(static_cast<unsigned char>(c[0])) != 0);
+    // Decode the single UTF-8 code point in `c` (word_to_chars yields one code point per element).
+    auto cp_value = [](const std::string& c) -> std::uint32_t {
+        const auto b0 = static_cast<unsigned char>(c[0]);
+        if (b0 < 0x80) return b0;
+        std::uint32_t u; int n;
+        if (b0 < 0xE0) { u = b0 & 0x1Fu; n = 1; }
+        else if (b0 < 0xF0) { u = b0 & 0x0Fu; n = 2; }
+        else { u = b0 & 0x07u; n = 3; }
+        for (int i = 1; i <= n && i < static_cast<int>(c.size()); ++i)
+            u = (u << 6) | (static_cast<unsigned char>(c[i]) & 0x3Fu);
+        return u;
+    };
+    // A "letter" is ASCII alpha OR an accented Latin letter (Latin-1 Supplement + Latin Extended-A/B:
+    // é ñ ü ç ø … — excludes × U+00D7 and ÷ U+00F7), so piñata / café / naïve stay ONE token instead of
+    // splitting on the multi-byte accent. (Earlier the size==1 ASCII-only test dropped every accent.)
+    auto is_letter = [&](const std::string& c) {
+        if (c.empty()) return false;
+        if (c.size() == 1) return std::isalpha(static_cast<unsigned char>(c[0])) != 0;
+        const std::uint32_t u = cp_value(c);
+        return u >= 0x00C0u && u <= 0x024Fu && u != 0x00D7u && u != 0x00F7u;
     };
     auto is_apos = [&](const std::string& c) { return c == "'" || c == apostrophe; };
     auto is_digit = [](const std::string& c) {

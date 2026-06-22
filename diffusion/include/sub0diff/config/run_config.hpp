@@ -66,7 +66,7 @@ struct Model {
 
 // ── Data + checkpoint location — Runtime ────────────────────────────────────────────
 struct Data {
-    std::string  corpus     = "data/tinystories_clean.txt";
+    std::string  corpus     = "data/tinystories.txt";
     std::string  ckpt_dir   = "/tmp/sub0diff_ch29";      // checkpoint directory (train_state.json + step_*.ckpt + step_*.opt)};
     std::string  name       = {};      // model name → in-repo dir models/<name>_g<gitSHA>_c<configSHA>
     std::int64_t paragraphs = 0;       // 0/-1 = all paragraphs
