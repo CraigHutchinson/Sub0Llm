@@ -97,6 +97,13 @@ P1 codec. **Do not build P2 on char-composition.**
   3-seed check). **Verdict: the coarse-to-fine hierarchy is a COMPUTE/CONTEXT primitive only** —
   efficiency/context win at a small (2c/2d-shrinkable) quality cost, NOT a coherence win. See
   [`2E_RESULTS.md`](2E_RESULTS.md) §Generation-M2.
+- **P2 context-length ceiling (`ch32_hier_ceiling`) RAN** — flat practical ceiling ≈ N=1024 (collapses
+  to 66 tok/s / 125 s/step at N=2048 via WDDM VRAM thrashing; N=4096 crashed the box). **hier extends
+  usable context ~4× (to N≈4096 at full throughput), ~1300× faster than flat at the N=2048 crossover** —
+  the "runs vs doesn't" regime. **But hier walls too** because the coarse pass is `O((N/c)²)` (its own N²
+  scaled by c²) → single-level coarsening buys ~`c×`, not ∞. **This is the measured motivation for P3
+  MERA** (recursive log-depth coarsening removes the residual coarse-pass N²). See
+  [`2E_RESULTS.md`](2E_RESULTS.md) §Context-ceiling.
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

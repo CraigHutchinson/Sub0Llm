@@ -103,6 +103,33 @@ requires actively copying content words across distance, which neither model doe
 gap) and the gist does not add. So the hierarchy's value is **efficiency/context at a small, 2c/2d-
 shrinkable quality cost** — not a quality win. Do not claim coherence gains for it.
 
+## Context-length ceiling (RAN): where flat dies, hier survives — and why hier walls too (→ P3)
+
+`ch32_hier_ceiling` times one model at one seq-length per process (so an OOM can't corrupt the next
+measurement) and a shell loop sweeps N. Small model (D=128, L=4, B=4), tok/s = B·N / s-per-step:
+
+| N | flat | hier | hier ÷ flat |
+|------|------------------------:|------------------------:|------------:|
+| 512 | 29.6K tok/s | 59.6K tok/s | 2.0× |
+| 1024 | 18.1K tok/s | 88.5K tok/s | 4.9× |
+| 2048 | **66 tok/s (125 s/step)** | 86.6K tok/s | **~1300×** |
+| 4096 | *crashed the box* (WDDM TDR / reboot from VRAM exhaustion) | 74.5K tok/s | — |
+| 8192 | — | 1481 tok/s (22 s/step) | — |
+
+- **flat practical ceiling ≈ N=1024.** At N=2048 it collapses to 66 tok/s — Windows WDDM oversubscribes
+  VRAM (spills to system RAM) so the wall shows up as catastrophic *thrashing* (125 s/step), not a clean
+  catchable OOM; at N=4096 it exhausted VRAM hard enough to take the machine down (TDR/reboot). On 8 GB
+  this is the `O(N²)` attention-memory wall.
+- **hier extends usable context ~4×** (to N≈4096 at 74.5K tok/s — the *same* throughput band as small N).
+  At the N=2048 crossover hier is **~1300× higher throughput** than flat: the regime where the choice is
+  "runs vs doesn't," not "faster vs slower." This is the context/compute headline, demonstrated.
+- **But hier ALSO walls — and the reason is the P3 motivation.** The coarse pass is `O((N/c)²)`: it has
+  its OWN `N²` term, merely scaled by `c²`. So single-level coarsening pushes the ceiling out by ~`c×`
+  (c=8 → ~4× measured: flat dies ~2048, hier slows by ~8192) but does **not remove** it. **Removing it
+  needs RECURSIVE log-depth coarsening — stack coarse levels so the top level is always small (P3
+  MERA).** This sweep is the concrete, measured argument for building P3: a single gist level buys a
+  ~`c×` context extension; only a `log(N)`-deep stack makes the coarse term cheap enough to scale freely.
+
 ## Frontier verdict & next
 
 The gist-as-coarsening design is a **real efficiency/context primitive**: an order-of-magnitude compute
