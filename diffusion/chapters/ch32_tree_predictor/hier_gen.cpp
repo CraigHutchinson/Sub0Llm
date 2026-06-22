@@ -10,6 +10,7 @@
 #include "sub0diff/eval/topic_drift.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/hier_denoiser.hpp"
+#include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
@@ -165,9 +166,25 @@ int main(int argc, char** argv) {
     dn::HierDenoiser hier(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/seed, /*mask_aware=*/true);
     train(hier, train_ids, static_cast<int>(steps), Bsz, N, 1e-3f, seed, "hier");
 
+    dn::MeraDenoiser mera(Vr, D, 8, 4, c, w, N, 0, /*seed=*/seed);
+    std::println("\n-- training MERA Denoiser ({} levels) --", mera.n_levels());
+    train(mera, train_ids, static_cast<int>(steps), Bsz, N, 1e-3f, seed, "mera");
+
     std::println("\ngenerating {} passages from each (N={}, temp {:.2f}, spread)...", K, N, temp);
     auto flat_gen = generate(flat, N, K, temp, seed * 131 + 17);
     auto hier_gen = generate(hier, N, K, temp, seed * 131 + 17);
+    auto mera_gen = generate(mera, N, K, temp, seed * 131 + 17);
+
+    // eyeball coherence: decode the first generation from flat and MERA (first 60 tokens)
+    auto sample = [&](const std::vector<std::int32_t>& g) {
+        std::vector<sub0llm::BPETokenizer::TokenId> ids;
+        for (std::size_t i = 0; i < g.size() && i < 60; ++i)
+            if (g[i] >= 0 && g[i] < Vr) ids.push_back(static_cast<sub0llm::BPETokenizer::TokenId>(g[i]));
+        return tok.decode(ids);
+    };
+    std::println("\n-- sample (first 60 tokens) --");
+    std::println("  FLAT: {}", sample(flat_gen[0]));
+    std::println("  MERA: {}", sample(mera_gen[0]));
 
     // corpus passages (per held-out paragraph) + unigram-chance floor
     std::vector<std::vector<std::int32_t>> corpus_p;
@@ -183,21 +200,24 @@ int main(int argc, char** argv) {
     const auto ru = de::evaluate_topic_drift(spans(unigram),  is_content, win, 1, 2);
     const auto rf = de::evaluate_topic_drift(spans(flat_gen), is_content, win, 1, 2);
     const auto rh = de::evaluate_topic_drift(spans(hier_gen), is_content, win, 1, 2);
+    const auto rr = de::evaluate_topic_drift(spans(mera_gen), is_content, win, 1, 2);
 
     std::println("\n============= M2 on generations (window {}) =============", win);
     m2row("corpus",         rc);
     m2row("unigram-floor",  ru);
     m2row("flat-gen",       rf);
     m2row("hier-gen",       rh);
+    m2row("mera-gen",       rr);
     const double span = rc.content_recurrence - ru.content_recurrence;   // corpus - chance
     auto frac = [&](double v) { return span > 0 ? (v - ru.content_recurrence) / span * 100.0 : 0.0; };
     std::println("\n  content recurrence — corpus {:.3f}, chance floor {:.3f} (gap {:.3f})",
                  rc.content_recurrence, ru.content_recurrence, span);
-    std::println("  flat-gen {:.3f} ({:.0f}% of the gap closed);  hier-gen {:.3f} ({:.0f}% of the gap closed)",
-                 rf.content_recurrence, frac(rf.content_recurrence), rh.content_recurrence, frac(rh.content_recurrence));
-    std::println("  VERDICT: {}",
-                 rh.content_recurrence > rf.content_recurrence + 0.005
-                     ? "coarse-to-fine generations reuse entities MORE than flat (toward corpus)"
-                     : "no M2 recurrence gain from the hierarchy — see numbers");
+    std::println("  flat {:.3f} ({:.0f}% of gap);  hier {:.3f} ({:.0f}%);  mera {:.3f} ({:.0f}%)",
+                 rf.content_recurrence, frac(rf.content_recurrence), rh.content_recurrence, frac(rh.content_recurrence),
+                 rr.content_recurrence, frac(rr.content_recurrence));
+    std::println("  VERDICT (mera vs flat): {}",
+                 rr.content_recurrence > rf.content_recurrence + 0.005
+                     ? "MERA generations reuse entities MORE than flat (toward corpus)"
+                     : "no M2 recurrence gain for MERA vs flat — see numbers");
     return 0;
 }
