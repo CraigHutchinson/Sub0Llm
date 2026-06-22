@@ -21,3 +21,7 @@ target_link_libraries(ch32_hier_gen PRIVATE sub0diff)
 # P2 context-length ceiling: where flat OOMs, hier keeps running (one model/N per process).
 add_executable(ch32_hier_ceiling hier_ceiling.cpp)
 target_link_libraries(ch32_hier_ceiling PRIVATE sub0diff)
+
+# P3 mixed-N training: variable-N MERA robustness across lengths.
+add_executable(ch32_mera_mixedn mera_mixedn.cpp)
+target_link_libraries(ch32_mera_mixedn PRIVATE sub0diff)
