@@ -285,33 +285,35 @@ int run_main(int argc, char** argv) {
     std::vector<std::string> eval_paras(paras.end() - static_cast<std::ptrdiff_t>(n_eval), paras.end());
     paras.resize(paras.size() - n_eval);
 
-    // tokenizer — reload from the ckpt dir if present (so a resume is deterministic + instant), else build.
-    const fs::path tok_dir = fs::path(cfg.data.ckpt_dir) / "tokenizer";
-    const fs::path vocab_json = tok_dir / "vocab.json", merges_txt = tok_dir / "merges.txt";
-    BPETokenizer tok = [&] {
-        if (fs::exists(vocab_json) && fs::exists(merges_txt)) {
-            std::println("loaded tokenizer from {}", tok_dir.string());
-            return BPETokenizer::load(vocab_json, merges_txt);
+    // --name defers the real ckpt dir until the vocab is known (the dir name embeds config_sha, which
+    // depends on vocab) — so with --name we must NOT reload a tokenizer from the *default* dir (a stale
+    // one there would silently override --word-level/--char-level). Build fresh, then reload from the
+    // finalized name dir only.
+    const bool use_name = !cfg.data.name.empty() && !has_flag(argc, argv, "--ckpt-dir");
+
+    auto build_tokenizer = [&](bool allow_reload, const fs::path& dir) -> BPETokenizer {
+        const fs::path vj = dir / "tokenizer" / "vocab.json", mt = dir / "tokenizer" / "merges.txt";
+        if (allow_reload && fs::exists(vj) && fs::exists(mt)) {
+            std::println("loaded tokenizer from {}", (dir / "tokenizer").string());
+            return BPETokenizer::load(vj, mt);
         }
         if (cfg.data.char_level) { std::print("char tokenizer... "); auto t = BPETokenizer::char_level(paras); std::println("{} vocab", t.vocab_size()); return t; }
         if (cfg.data.word_level) { std::print("word tokenizer... "); auto t = BPETokenizer::word_level(paras); std::println("{} vocab", t.vocab_size()); return t; }
         std::print("BPE tokenizer (vocab {})... ", cfg.model.vocab_size);
         auto t = BPETokenizer::train(paras, cfg.model.vocab_size); std::println("done"); return t;
-    }();
+    };
+    BPETokenizer tok = build_tokenizer(/*allow_reload=*/!use_name, cfg.data.ckpt_dir);
     cfg.model.vocab_size = static_cast<std::int64_t>(tok.vocab_size());  // pin REAL vocab → exact-arch resume
 
-    // In-repo, provenance-tagged model dir: `--name foo` (and no explicit --ckpt-dir) → the checkpoint
-    // dir becomes models/foo_g<gitSHA>_c<configSHA>. config_sha needs the (now-pinned) vocab, so this is
-    // computed here. Tokenization is deterministic, so `--name foo` with the same config reproduces the
-    // SAME dir → resume-by-name finds the existing checkpoints. (If that dir already holds a tokenizer
-    // from a prior run, reload it for exactness.)
-    if (!cfg.data.name.empty() && !has_flag(argc, argv, "--ckpt-dir")) {
+    // In-repo, provenance-tagged model dir: models/<name>_g<gitSHA>_c<configSHA> (config_sha needs the
+    // now-pinned vocab). Deterministic tokenization ⇒ same name+config reproduces the SAME dir → resume.
+    if (use_name) {
         cfg.data.ckpt_dir = std::format("models/{}_g{}_c{:016x}", cfg.data.name,
                                         std::string(SUB0DIFF_CODE_SHA), cfgm::config_sha(cfg));
         std::println("model dir (from --name): {}", cfg.data.ckpt_dir);
         const fs::path vj = fs::path(cfg.data.ckpt_dir) / "tokenizer" / "vocab.json";
         const fs::path mt = fs::path(cfg.data.ckpt_dir) / "tokenizer" / "merges.txt";
-        if (fs::exists(vj) && fs::exists(mt)) {
+        if (fs::exists(vj) && fs::exists(mt)) {   // a prior run of this exact config → reload for exactness
             tok = BPETokenizer::load(vj, mt);
             cfg.model.vocab_size = static_cast<std::int64_t>(tok.vocab_size());
         }
