@@ -36,27 +36,23 @@ namespace sub0diff::nn {
 
 class MeraDenoiser {
 public:
-    // c: coarsen factor per level; w: local window width; N: the sequence length the level pyramid is
-    // built for. blocks_per_level kept at 1 (one disentangle + one refine per level + one top block)
-    // for a parameter-economical model; depth ≈ 2·levels + 1.
+    // c: coarsen factor per level; w: local window width; max_seq_len: the LONGEST sequence the model
+    // will see — it sizes the block pyramid (max levels). forward() then accepts ANY valid N ≤
+    // max_seq_len (the pyramid is rebuilt per call; blocks are indexed by depth-from-finest, so enc[k]
+    // always processes level k and the single top block handles whatever level falls ≤ w). blocks_per_
+    // level = 1 (one disentangle + one refine per level + one top); depth ≈ 2·levels + 1.
     MeraDenoiser(std::int64_t vocab_size, std::int64_t embed_dim, std::size_t n_heads,
-                 std::size_t n_kv_heads, std::int64_t coarsen, std::int64_t window, std::int64_t N,
-                 std::int64_t d_ff = 0, std::uint64_t seed = 42)
+                 std::size_t n_kv_heads, std::int64_t coarsen, std::int64_t window,
+                 std::int64_t max_seq_len, std::int64_t d_ff = 0, std::uint64_t seed = 42)
         : real_vocab_(vocab_size), embed_dim_(embed_dim), coarsen_(coarsen), window_(window),
           tok_emb_(vocab_size + 1, embed_dim, seed), ln_f_(embed_dim) {
-        lens_.push_back(N);
-        while (lens_.back() > window_) {
-            if (lens_.back() % coarsen_ != 0)
-                throw std::runtime_error("MeraDenoiser: level length not divisible by coarsen");
-            lens_.push_back(lens_.back() / coarsen_);
-        }
-        K_ = static_cast<std::int64_t>(lens_.size()) - 1;   // number of coarsen steps
+        max_levels_ = static_cast<std::int64_t>(compute_lens(max_seq_len).size()) - 1;  // coarsen steps at max N
         std::uint64_t s = seed + 1000;
-        enc_.reserve(static_cast<std::size_t>(K_));
-        dec_.reserve(static_cast<std::size_t>(K_));
-        for (std::int64_t k = 0; k < K_; ++k) enc_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff, s += 17);
+        enc_.reserve(static_cast<std::size_t>(max_levels_));
+        dec_.reserve(static_cast<std::size_t>(max_levels_));
+        for (std::int64_t k = 0; k < max_levels_; ++k) enc_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff, s += 17);
         top_blk_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff, s += 17);
-        for (std::int64_t k = 0; k < K_; ++k) dec_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff, s += 17);
+        for (std::int64_t k = 0; k < max_levels_; ++k) dec_.emplace_back(embed_dim, n_heads, n_kv_heads, d_ff, s += 17);
     }
 
     [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::Tensor& token_ids,
@@ -69,8 +65,10 @@ public:
                                                       std::span<const float> noise_levels,
                                                       std::int64_t B, std::int64_t N) const {
         namespace ag = sub0llm::autograd;
-        if (N != lens_.front())
-            throw std::runtime_error("MeraDenoiser: forward N must match the constructed level pyramid");
+        const auto lens = compute_lens(N);                        // pyramid for THIS N (any valid N)
+        const std::int64_t K = static_cast<std::int64_t>(lens.size()) - 1;
+        if (K > max_levels_)
+            throw std::runtime_error("MeraDenoiser: N exceeds the constructed max_seq_len pyramid depth");
         const sub0llm::Device dev = tok_emb_.weight().data().device();
 
         ag::Variable emb = tok_emb_.forward(token_ids);            // (B·N, D)
@@ -83,19 +81,19 @@ public:
         ag::Variable cur = ag::add(emb, ag::Variable{cond.to(dev)});
 
         // encode: disentangle (windowed) + coarsen, saving a skip per level
-        std::vector<ag::Variable> skips(static_cast<std::size_t>(K_));
-        for (std::int64_t k = 0; k < K_; ++k) {
-            cur = attn_level(enc_[static_cast<std::size_t>(k)], cur, B, lens_[static_cast<std::size_t>(k)]);
+        std::vector<ag::Variable> skips(static_cast<std::size_t>(K));
+        for (std::int64_t k = 0; k < K; ++k) {
+            cur = attn_level(enc_[static_cast<std::size_t>(k)], cur, B, lens[static_cast<std::size_t>(k)]);
             skips[static_cast<std::size_t>(k)] = cur;
-            cur = pool(cur, B, lens_[static_cast<std::size_t>(k)], dev);
+            cur = pool(cur, B, lens[static_cast<std::size_t>(k)], dev);
         }
         // top: one full-attention pass at the smallest level (len ≤ w)
-        cur = attn_level(top_blk_[0], cur, B, lens_[static_cast<std::size_t>(K_)]);
+        cur = attn_level(top_blk_[0], cur, B, lens[static_cast<std::size_t>(K)]);
         // decode: broadcast up, add skip, refine (windowed)
-        for (std::int64_t k = K_ - 1; k >= 0; --k) {
-            cur = broadcast(cur, B, lens_[static_cast<std::size_t>(k + 1)], dev);   // → len_k
+        for (std::int64_t k = K - 1; k >= 0; --k) {
+            cur = broadcast(cur, B, lens[static_cast<std::size_t>(k + 1)], dev);    // → len_k
             cur = ag::add(skips[static_cast<std::size_t>(k)], cur);
-            cur = attn_level(dec_[static_cast<std::size_t>(k)], cur, B, lens_[static_cast<std::size_t>(k)]);
+            cur = attn_level(dec_[static_cast<std::size_t>(k)], cur, B, lens[static_cast<std::size_t>(k)]);
         }
         cur = ln_f_.forward(cur);
         return ag::matmul_bt(cur, tok_emb_.weight());             // (B·N, Vm)
@@ -118,9 +116,23 @@ public:
     [[nodiscard]] std::int64_t real_vocab()  const noexcept { return real_vocab_; }
     [[nodiscard]] std::int64_t model_vocab() const noexcept { return real_vocab_ + 1; }
     [[nodiscard]] std::int64_t embed_dim()   const noexcept { return embed_dim_; }
-    [[nodiscard]] std::int64_t n_levels()    const noexcept { return K_ + 1; }
+    // levels at the constructed max_seq_len (the deepest pyramid this model supports).
+    [[nodiscard]] std::int64_t n_levels()    const noexcept { return max_levels_ + 1; }
+    // levels for a specific N (≤ max) — what forward(N) actually uses.
+    [[nodiscard]] std::int64_t n_levels_for(std::int64_t N) const { return static_cast<std::int64_t>(compute_lens(N).size()); }
 
 private:
+    // The level-length pyramid for a sequence of length N: [N, N/c, N/c², …] down to the first ≤ w.
+    [[nodiscard]] std::vector<std::int64_t> compute_lens(std::int64_t N) const {
+        std::vector<std::int64_t> lens{N};
+        while (lens.back() > window_) {
+            if (lens.back() % coarsen_ != 0)
+                throw std::runtime_error("MeraDenoiser: level length not divisible by coarsen");
+            lens.push_back(lens.back() / coarsen_);
+        }
+        return lens;
+    }
+
     // Run one block over a level: full attention if len ≤ w (one window per sequence), else windowed
     // block-diagonal attention (len/w windows of w per sequence).
     [[nodiscard]] sub0llm::autograd::Variable attn_level(const BidirectionalBlock& blk,
@@ -150,8 +162,7 @@ private:
         return ag::reshape(ag::matmul(sel, c3), {slots * coarsen_, embed_dim_});
     }
 
-    std::int64_t                    real_vocab_, embed_dim_, coarsen_, window_, K_ = 0;
-    std::vector<std::int64_t>       lens_;
+    std::int64_t                    real_vocab_, embed_dim_, coarsen_, window_, max_levels_ = 0;
     sub0llm::nn::Embedding          tok_emb_;
     std::vector<BidirectionalBlock> enc_, top_blk_, dec_;
     sub0llm::nn::RMSNorm            ln_f_;

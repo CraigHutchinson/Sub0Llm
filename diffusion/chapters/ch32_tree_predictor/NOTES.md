@@ -5,9 +5,11 @@
 
 ## Open items / things to make work
 
-- **MERA model is N-specific** — the level pyramid (lens, per-level blocks) is baked in at construction
-  from `N`. A real engine needs variable-N handling: either construct per length, pad to the next valid
-  pyramid size, or make the level structure dynamic. Fine for fixed-length training/benchmarks today.
+- ~~MERA model is N-specific~~ **DONE** — MERA now takes `max_seq_len` and `forward(N)` rebuilds the
+  pyramid per call, accepting ANY valid N ≤ max (blocks indexed by depth-from-finest; the top block
+  handles whatever level falls ≤ w). Test covers N=64 + N=32 on one model. **Caveat to watch:** if
+  TRAINED at a single fixed N, the top block sees one top-length; using a different N at inference shifts
+  the top-length (mild train/use mismatch). True variable-N robustness needs MIXED-N training (future).
 - **Generation device** — sampler runs on CPU (reads host logits). GPU generation would need the
   sampler's softmax/commit on-device or batched D2H. Fine for now (generation is run-once).
 - **Seam handling (2d)** — was diagnosed for single-level *hier* (function-word gap). MERA's multi-level

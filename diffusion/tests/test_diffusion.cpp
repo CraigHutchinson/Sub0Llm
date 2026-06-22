@@ -481,8 +481,8 @@ TEST_CASE("HierDenoiser coarse-to-fine forward + trains (P2 2e)", "[diffusion][h
 // through all levels). The compute ceiling vs flat/hier is measured in ch32_hier_ceiling.
 TEST_CASE("MeraDenoiser recursive coarsen forward + trains (P3)", "[diffusion][mera_denoiser]") {
     using sub0diff::nn::MeraDenoiser;
-    const std::int64_t V = 24, D = 32, N = 64, c = 4, w = 8;     // 64→16→4 ≤ w ⇒ 3 levels
-    MeraDenoiser model(V, D, 2, 2, c, w, N, 0, /*seed=*/5);
+    const std::int64_t V = 24, D = 32, N = 64, c = 4, w = 8;     // max_seq_len 64: 64→16→4 ≤ w ⇒ 3 levels
+    MeraDenoiser model(V, D, 2, 2, c, w, /*max_seq_len=*/N, 0, /*seed=*/5);
     REQUIRE(model.n_levels() == 3);                              // 64,16,4
 
     sub0llm::Tensor ids({N}, sub0llm::DType::Int32);
@@ -491,6 +491,16 @@ TEST_CASE("MeraDenoiser recursive coarsen forward + trains (P3)", "[diffusion][m
     REQUIRE(logits.data().shape()[0] == N);
     REQUIRE(logits.data().shape()[1] == V + 1);
     for (float v : logits.data().data_as<float>()) REQUIRE(std::isfinite(v));
+
+    // VARIABLE-N: the SAME model accepts a shorter sequence (32 → 8, a shallower pyramid that reuses
+    // enc[0]/dec[0]/top). Proves forward isn't locked to the construction length.
+    sub0llm::Tensor ids32({32}, sub0llm::DType::Int32);
+    for (std::int64_t i = 0; i < 32; ++i) ids32.data_as<std::int32_t>()[i] = static_cast<std::int32_t>(i % V);
+    auto l32 = model.forward(ids32, 0.5f);
+    REQUIRE(l32.data().shape()[0] == 32);
+    REQUIRE(l32.data().shape()[1] == V + 1);
+    REQUIRE(model.n_levels_for(32) == 2);                       // 32,8
+    for (float v : l32.data().data_as<float>()) REQUIRE(std::isfinite(v));
 
     std::vector<std::int32_t> stream(static_cast<std::size_t>(8 * N));
     for (std::size_t i = 0; i < stream.size(); ++i) stream[i] = static_cast<std::int32_t>(i % V);
