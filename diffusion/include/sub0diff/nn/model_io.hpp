@@ -6,6 +6,7 @@
 //   step_*.ckpt   weights (latest = the early-stopping winner Ch29 reloads at exit)
 
 #include "sub0diff/nn/denoiser.hpp"
+#include "sub0diff/nn/mera_denoiser.hpp"
 
 #include "sub0llm/tokenizer/bpe.hpp"
 
@@ -15,10 +16,17 @@
 
 namespace sub0diff::nn {
 
+// A loaded model directory. `model_type` selects which denoiser pointer is populated: "flat" → `model`
+// (the vanilla Denoiser), "mera" → `mera` (the Ch32 hierarchical MeraDenoiser). config.json with no
+// model_type loads as flat (back-compat with pre-Ch32 model dirs). Both denoisers satisfy the templated
+// sampler/loss, so a consumer dispatches on model_type and runs the populated one.
 struct LoadedModel {
-    std::unique_ptr<Denoiser>               model;
+    std::string                             model_type = "flat";
+    std::unique_ptr<Denoiser>               model;     // set iff model_type == "flat"
+    std::unique_ptr<MeraDenoiser>           mera;      // set iff model_type == "mera"
     std::unique_ptr<sub0llm::BPETokenizer>  tokenizer;
-    std::int64_t                            seq_len = 0;   // training window length
+    std::int64_t                            seq_len = 0;   // training window length T
+    std::int64_t                            mera_coarsen = 0, mera_window = 0;  // MERA geometry (if mera)
     std::int64_t                            step    = 0;   // checkpoint step loaded
 };
 

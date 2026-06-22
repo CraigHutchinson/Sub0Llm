@@ -1,0 +1,7 @@
+# Keep the scaffolding tracked; ignore generated model dirs by default so throwaway training runs
+# don't bloat the repo. Force-add a model you want to keep in-repo (it goes through Git LFS):
+#   git lfs install && git add -f models/<name>_g<sha>_c<sha>
+*
+!.gitignore
+!.gitattributes
+!README.md

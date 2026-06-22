@@ -1,0 +1,4 @@
+# Trained-checkpoint binaries are large → store via Git LFS (run `git lfs install` once).
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.opt  filter=lfs diff=lfs merge=lfs -text
+*.bin  filter=lfs diff=lfs merge=lfs -text

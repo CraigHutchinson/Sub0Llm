@@ -98,6 +98,24 @@
     whole-word/contiguous masking on MERA+GPU is an open follow-up.
 - `init_cpu_compute()` (FTZ+DAZ) added to all new ch32 mains (`mera_train`/`viz_gen`/`viz_train`/
   `viz_server`) + the server's per-request httplib worker thread (per-thread MXCSR).
+- **GPU-trainer ↔ lightweight-server separation + in-repo models + honest-resume state**:
+  - `model_io::load_model_dir` now dispatches on `config.json` `model_type` → builds the flat Denoiser
+    OR the MeraDenoiser (reads `mera_coarsen`/`mera_window`); `LoadedModel` holds whichever.
+  - `ch32_viz_server --model-dir DIR` LOADS a trained model and serves it (no retraining) — serving
+    factored into a `template<class Model> serve(...)` (MERA or flat); the inline-train path stays as a
+    no-arg fallback. So the GPU trainer is one unit, the CPU httplib server another (sidesteps the
+    clang/CUDA httplib link entirely). Validated: train on GPU → serve the dir on native CPU, /health +
+    generate correct.
+  - **`train_state.json`** sidecar for HONEST resume: `{step, best_nelbo, evals_since_best, code_sha,
+    config_sha, updated_unix}`, written each checkpoint, rehydrated on resume (validated: resume picked
+    up best_nelbo=5.12 / stalls=1 and continued the early-stop counter, not restarted). Read via
+    simdjson on-demand (forward), written as a hand-built JSON string. Early-stop on `patience`.
+  - **In-repo `models/`**: `--name foo` (a new `Data.name` consistent-layer field) → the dir becomes
+    `models/foo_g<gitSHA>_c<configSHA>` (computed after vocab pin; deterministic tokenization ⇒ same
+    name+config reproduces the same dir ⇒ resume-by-name). `models/README.md` documents the convention;
+    `.gitattributes` routes `*.ckpt`/`*.opt` through Git LFS; `.gitignore` keeps generated model dirs out
+    by default (force-add the keepers). Bug fixed: tokenizer was saved to a stale `tok_dir` captured
+    before the `--name` dir override (config.json was correct, tokenizer/ went to the old default).
 - `sum_squares` per-step cudaMalloc/cudaFree → persistent static scalar (commit 0f30f0e).
 - Corrected: the `*_bench` multi-malloc functions are microbenchmarks, not the training hot path.
 - MERA end-to-end generation works (templated sampler); generation-M2 vs flat measured (noisy, above).

@@ -23,19 +23,25 @@
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
+#include <simdjson.h>   // train_state.json read (forward on-demand)
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <print>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef SUB0DIFF_CODE_SHA
@@ -66,6 +72,11 @@ std::vector<std::string> read_paragraphs(const std::string& path, std::int64_t l
     return out;
 }
 
+bool has_flag(int argc, char** argv, const std::string& k) {
+    for (int i = 1; i < argc; ++i) if (k == argv[i]) return true;
+    return false;
+}
+
 // Average NELBO over `n_batches` random eval windows (no backward — a held-out quality read).
 template <class Model>
 double eval_nelbo(Model& model, std::span<const std::int32_t> stream, const cfgm::RunConfig& cfg,
@@ -94,6 +105,54 @@ std::vector<sub0llm::autograd::Variable> snapshot_params(
     v.reserve(ptrs.size());
     for (auto* p : ptrs) v.push_back(*p);
     return v;
+}
+
+// The dynamic-progress sidecar for an HONEST resume: weights live in step_*.ckpt and Adam moments in
+// step_*.opt; this train_state.json holds the REST — the early-stop history — so a resume continues
+// mid-climb instead of restarting the best-tracking. `step` is matched against the resumed checkpoint so
+// a stale sidecar is ignored. Written as JSON (per the project model-artifact convention); READ with
+// simdjson on-demand (forward, single pass — the project JSON-read direction).
+struct TrainState {
+    bool          have = false;
+    std::uint64_t step = 0;
+    double        best_nelbo = std::numeric_limits<double>::max();
+    std::uint64_t evals_since_best = 0;
+};
+
+void save_train_state(const fs::path& path, const TrainState& s, std::string_view code_sha,
+                      std::uint64_t config_sha) {
+    std::ofstream f(path);
+    if (!f) return;
+    f << std::format(
+        "{{\n  \"step\": {},\n  \"best_nelbo\": {:.9g},\n  \"evals_since_best\": {},\n"
+        "  \"code_sha\": \"{}\",\n  \"config_sha\": \"{:016x}\",\n  \"updated_unix\": {}\n}}\n",
+        s.step, s.best_nelbo, s.evals_since_best, code_sha, config_sha,
+        static_cast<std::int64_t>(std::time(nullptr)));
+}
+
+// Load + validate against the resumed step; have=false on absence/mismatch (a stale sidecar is ignored).
+[[nodiscard]] TrainState load_train_state(const fs::path& path, std::uint64_t expect_step) {
+    TrainState s;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return s;
+    std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (body.empty()) return s;
+    simdjson::ondemand::parser parser;
+    simdjson::padded_string padded(body.data(), body.size());
+    auto doc = parser.iterate(padded);
+    if (doc.error()) return s;
+    auto obj = doc.get_object();
+    if (obj.error()) return s;
+    for (auto field : obj) {
+        auto k = field.unescaped_key(); if (k.error()) continue;
+        auto v = field.value();         if (v.error()) continue;
+        const std::string_view key = k.value_unsafe();
+        if      (key == "step")             { std::uint64_t x; if (!v.get(x)) s.step = x; }
+        else if (key == "best_nelbo")       { double x;        if (!v.get(x)) s.best_nelbo = x; }
+        else if (key == "evals_since_best") { std::uint64_t x; if (!v.get(x)) s.evals_since_best = x; }
+    }
+    s.have = (s.step == expect_step);
+    return s;
 }
 
 // The model-agnostic training loop: resume weights+optimizer, train on GPU/CPU, checkpoint periodically.
@@ -135,6 +194,21 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
             std::println("note: no optimizer state at {} — Adam moments start fresh", opt_path.string());
     }
 
+    // 4) Dynamic training-state sidecar — the early-stop history, for an HONEST resume (continues the
+    //    best-tracking instead of restarting it). step is validated against the resumed checkpoint.
+    const std::string code_sha = SUB0DIFF_CODE_SHA;
+    const std::uint64_t cfg_sha = cfgm::config_sha(cfg);
+    const fs::path state_path = fs::path(cfg.data.ckpt_dir) / "train_state.json";
+    TrainState state;
+    if (!resume_ckpt.empty()) {
+        state = load_train_state(state_path, start_step);
+        if (state.have)
+            std::println("rehydrated train_state.json: best_nelbo={:.4f}, evals_since_best={}",
+                         state.best_nelbo, state.evals_since_best);
+        else
+            std::println("note: no matching train_state.json @ step {} — best-tracking starts fresh", start_step);
+    }
+
     const std::int64_t N = cfg.model.seq_len, B = std::max<std::int64_t>(1, cfg.optim.batch);
     const std::uint64_t steps = cfg.train.steps ? cfg.train.steps : 3000;
     const std::uint64_t ckpt_every = cfg.train.eval_every ? cfg.train.eval_every : 500;
@@ -157,30 +231,44 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
         return static_cast<double>(res.loss.data().to(sub0llm::Device::cpu()).template item<float>());
     };
 
-    auto save = [&](std::uint64_t step, double nelbo) {
+    // Checkpoint = eval + update best-tracking + write weights/.opt/train_state.json (the full honest
+    // resume set). Returns true if early-stop should fire (patience stalled evals with no improvement).
+    auto checkpoint = [&](std::uint64_t step, int eval_batches) {
+        const double nelbo = eval_nelbo(model, eval_ids, cfg, rng, eval_batches);
+        constexpr double kMinImprove = 0.01;
+        if (nelbo < state.best_nelbo - kMinImprove) { state.best_nelbo = nelbo; state.evals_since_best = 0; }
+        else ++state.evals_since_best;
+        state.step = step;
         auto view = snapshot_params(param_ptrs);   // current live params (on device) — save_checkpoint D2H's
         sub0llm::save_checkpoint(view, cfg.data.ckpt_dir, static_cast<std::int64_t>(step));
         const std::string ck = sub0llm::latest_checkpoint_path(cfg.data.ckpt_dir);
         if (!ck.empty()) { fs::path op = ck; op.replace_extension(".opt"); opt->save_state(op.string()); }
-        std::println("  ckpt @ step {:>6}  eval_nelbo={:.4f}  -> {}", step, nelbo, ck);
+        save_train_state(state_path, state, code_sha, cfg_sha);   // honest-resume sidecar
+        const bool stop = cfg.train.patience > 0 && state.evals_since_best >= cfg.train.patience;
+        std::println("  ckpt @ step {:>6}  eval_nelbo={:.4f}  best={:.4f}  stalls={}{}  -> {}",
+                     step, nelbo, state.best_nelbo, state.evals_since_best, stop ? "  EARLY-STOP" : "", ck);
+        return stop;
     };
 
     std::println("training {} → {} steps (N={}, B={}, model={})", start_step, steps, N, B, cfg.model.model_type);
     const auto t0 = std::chrono::steady_clock::now();
     double last_loss = 0.0;
+    bool stopped = false;
+    std::uint64_t last_step = start_step;
     for (std::uint64_t s = start_step; s < steps; ++s) {
         std::vector<std::size_t> offs(static_cast<std::size_t>(B));
         for (auto& o : offs) o = off(rng);
         last_loss = train_step(offs);
+        last_step = s + 1;
         if ((s + 1) % 200 == 0) {
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::println("  step {:>6}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss, (s + 1 - start_step) / std::max(1e-9, secs));
         }
-        if ((s + 1) % ckpt_every == 0) save(s + 1, eval_nelbo(model, eval_ids, cfg, rng, 4));
+        if ((s + 1) % ckpt_every == 0 && checkpoint(s + 1, 4)) { stopped = true; break; }
     }
-    // final checkpoint (so a resume always finds the last step)
-    save(steps, eval_nelbo(model, eval_ids, cfg, rng, 8));
-    std::println("done. checkpoints in {}", cfg.data.ckpt_dir);
+    // final checkpoint so a resume always finds the last step (skip if already saved this step)
+    if (!stopped && last_step > start_step && last_step % ckpt_every != 0) checkpoint(last_step, 8);
+    std::println("done. checkpoints + train_state.json in {}", cfg.data.ckpt_dir);
     return 0;
 }
 
@@ -210,8 +298,25 @@ int run_main(int argc, char** argv) {
         std::print("BPE tokenizer (vocab {})... ", cfg.model.vocab_size);
         auto t = BPETokenizer::train(paras, cfg.model.vocab_size); std::println("done"); return t;
     }();
-    const std::int64_t V = static_cast<std::int64_t>(tok.vocab_size());
-    cfg.model.vocab_size = V;   // pin REAL post-tokenizer vocab so a resume rebuilds the exact arch
+    cfg.model.vocab_size = static_cast<std::int64_t>(tok.vocab_size());  // pin REAL vocab → exact-arch resume
+
+    // In-repo, provenance-tagged model dir: `--name foo` (and no explicit --ckpt-dir) → the checkpoint
+    // dir becomes models/foo_g<gitSHA>_c<configSHA>. config_sha needs the (now-pinned) vocab, so this is
+    // computed here. Tokenization is deterministic, so `--name foo` with the same config reproduces the
+    // SAME dir → resume-by-name finds the existing checkpoints. (If that dir already holds a tokenizer
+    // from a prior run, reload it for exactness.)
+    if (!cfg.data.name.empty() && !has_flag(argc, argv, "--ckpt-dir")) {
+        cfg.data.ckpt_dir = std::format("models/{}_g{}_c{:016x}", cfg.data.name,
+                                        std::string(SUB0DIFF_CODE_SHA), cfgm::config_sha(cfg));
+        std::println("model dir (from --name): {}", cfg.data.ckpt_dir);
+        const fs::path vj = fs::path(cfg.data.ckpt_dir) / "tokenizer" / "vocab.json";
+        const fs::path mt = fs::path(cfg.data.ckpt_dir) / "tokenizer" / "merges.txt";
+        if (fs::exists(vj) && fs::exists(mt)) {
+            tok = BPETokenizer::load(vj, mt);
+            cfg.model.vocab_size = static_cast<std::int64_t>(tok.vocab_size());
+        }
+    }
+    const std::int64_t V = cfg.model.vocab_size;
 
     std::vector<std::uint8_t> is_word_start(tok.vocab_size(), 0);
     for (std::size_t id = 0; id < tok.vocab_size(); ++id) {
@@ -235,7 +340,7 @@ int run_main(int argc, char** argv) {
     fs::create_directories(cfg.data.ckpt_dir);
     const std::string resume_ckpt = sub0llm::latest_checkpoint_path(cfg.data.ckpt_dir);
     if (resume_ckpt.empty()) {
-        tok.save(tok_dir);
+        tok.save(fs::path(cfg.data.ckpt_dir) / "tokenizer");   // final dir (--name may have moved it)
         std::ofstream cj(fs::path(cfg.data.ckpt_dir) / "config.json");
         cj << std::format(
             "{{\n  \"model\": \"sub0diff-{}\",\n  \"model_type\": \"{}\",\n  \"vocab_size\": {},\n"

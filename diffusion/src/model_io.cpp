@@ -31,14 +31,28 @@ LoadedModel load_model_dir(const std::string& dir) {
     const auto d_ff       = j.at("d_ff").get<std::int64_t>();
 
     LoadedModel out;
-    out.seq_len = j.value("seq_len", std::int64_t{64});
-    out.model = std::make_unique<Denoiser>(vocab_size, embed_dim, n_heads, n_kv_heads,
-                                           n_layers, d_ff, /*seed=*/42);
+    out.seq_len    = j.value("seq_len", std::int64_t{64});
+    out.model_type = j.value("model_type", std::string("flat"));
+
+    // Build the architecture named in config.json. Both denoisers expose parameters()/forward() the
+    // sampler/loss templates accept; the checkpoint loads into whichever one we built.
+    std::vector<sub0llm::autograd::Variable*> param_ptrs;
+    if (out.model_type == "mera") {
+        out.mera_coarsen = j.value("mera_coarsen", std::int64_t{4});
+        out.mera_window  = j.value("mera_window",  std::int64_t{64});
+        out.mera = std::make_unique<MeraDenoiser>(vocab_size, embed_dim, n_heads, n_kv_heads,
+                                                  out.mera_coarsen, out.mera_window, out.seq_len,
+                                                  d_ff, /*seed=*/42);
+        param_ptrs = out.mera->parameters();
+    } else {
+        out.model = std::make_unique<Denoiser>(vocab_size, embed_dim, n_heads, n_kv_heads,
+                                               n_layers, d_ff, /*seed=*/42);
+        param_ptrs = out.model->parameters();
+    }
 
     const std::string ckpt = sub0llm::latest_checkpoint_path(dir);
     if (ckpt.empty())
         throw std::runtime_error(std::format("load_model_dir: no step_*.ckpt in {}", dir));
-    auto param_ptrs = out.model->parameters();
     std::vector<sub0llm::autograd::Variable> params;
     params.reserve(param_ptrs.size());
     for (auto* p : param_ptrs) params.push_back(*p);

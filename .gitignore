@@ -48,7 +48,9 @@ compile_commands.json
 # headline numbers are recorded in commit messages + CLAUDE.md).
 /data/bench_*.csv
 /data/hybrid_vs_llama*.csv
-/models/
+# /models/ is an in-repo home for provenance-tagged checkpoints — its OWN models/.gitignore keeps the
+# scaffolding (README/.gitattributes) tracked, ignores generated model dirs by default, and routes
+# committed weights through Git LFS. (Do not blanket-ignore /models/ here, or the child rules never run.)
 *.gguf
 *.bin
 *.safetensors

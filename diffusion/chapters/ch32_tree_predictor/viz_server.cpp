@@ -15,6 +15,7 @@
 
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/mera_denoiser.hpp"
+#include "sub0diff/nn/model_io.hpp"
 #include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 #include "sub0diff/viz/trace.hpp"
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <format>
 #include <functional>
@@ -163,57 +165,36 @@ std::string arg_s(int argc, char** argv, const std::string& k, const std::string
     return d;
 }
 
-}  // namespace
+// Level pyramid for a model: MERA exposes level_lens(); flat is a single level [N].
+template <class Model>
+std::vector<std::int64_t> levels_of(const Model& m, std::int64_t N) {
+    if constexpr (requires { m.level_lens(N); }) return m.level_lens(N);
+    else return {N};
+}
 
-int main(int argc, char** argv) {
-    const std::string corpus  = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
-    const std::string host    = arg_s(argc, argv, "--host", "127.0.0.1");
-    const std::string webroot = arg_s(argc, argv, "--webroot", ".");
-    const int port            = static_cast<int>(arg_i(argc, argv, "--port", 8080));
-    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", 600);
-    const std::int64_t steps  = arg_i(argc, argv, "--steps", 2000);
-    const std::int64_t D      = arg_i(argc, argv, "--embed_dim", 256);
-    const std::int64_t maxN   = arg_i(argc, argv, "--seq_len", 128);   // also the trained max length
-    const std::int64_t w      = arg_i(argc, argv, "--window", 64);
-    const std::int64_t c      = arg_i(argc, argv, "--coarsen", 4);
-    const std::int64_t L      = arg_i(argc, argv, "--n_layers", 4);
-    const std::int64_t Btr    = arg_i(argc, argv, "--batch", 8);
-    const std::uint64_t seed  = static_cast<std::uint64_t>(arg_i(argc, argv, "--seed", 7));
-    const std::string devs    = arg_s(argc, argv, "--device", "cuda");   // cuda (fast) | cpu (no GPU)
-    const sub0llm::Device train_dev = devs == "cpu" ? sub0llm::Device::cpu() : sub0llm::Device::cuda();
-
-    sub0llm::init_cpu_compute();   // FTZ+DAZ on the main thread
-    std::println("== Ch32 Viz server (Phase C) ==");
-    auto paras = read_paragraphs(corpus, plimit);
-    if (paras.size() < 20) throw std::runtime_error("need >=20 paragraphs");
-    std::print("building word tokenizer over {} paragraphs... ", paras.size());
-    BPETokenizer tok = BPETokenizer::word_level(paras);
-    const std::int64_t Vr = static_cast<std::int64_t>(tok.vocab_size());
-    std::println("done — {} word vocab", Vr);
-
-    std::vector<std::int32_t> ids;
-    for (const auto& p : paras) { auto v = tok.encode(p); ids.insert(ids.end(), v.begin(), v.end()); }
-    if (static_cast<std::int64_t>(ids.size()) < maxN + Btr + 8) throw std::runtime_error("corpus too short");
-
-    std::println("training MERA ({} steps, max N={}, D={}, c={}, w={}, device={})...", steps, maxN, D, c, w, devs);
-    dn::MeraDenoiser model(Vr, D, 8, 4, c, w, maxN, 0, seed);
-    train(model, ids, static_cast<int>(steps), Btr, maxN, seed, train_dev);
+// The HTTP server, templated on the model type so it serves a loaded/trained MERA or a flat Denoiser
+// identically (both satisfy the refine_canvas sampler). `model` must be on CPU. Blocks in listen().
+template <class Model>
+int serve(Model& model, BPETokenizer& tok, std::int64_t Vr, const std::string& model_type,
+          std::int64_t maxN, std::int64_t c, std::int64_t w,
+          const std::string& host, int port, const std::string& webroot) {
     const std::int32_t mask_id = model.mask_id();
     auto decode = [&tok, Vr](std::int32_t id) {
         return (id >= 0 && id < Vr) ? std::string(tok.token_str(static_cast<BPETokenizer::TokenId>(id)))
                                     : std::string("?");
     };
-    std::println("ready. levels at max N: {}", [&]{ std::string s; for (auto l : model.level_lens(maxN)) s += std::format("{} ", l); return s; }());
+    std::println("ready ({}). levels at max N={}: {}", model_type, maxN,
+                 [&]{ std::string s; for (auto l : levels_of(model, maxN)) s += std::format("{} ", l); return s; }());
 
     std::mutex gen_mtx;  // serialize generation (model + autograd graph are not re-entrant)
     httplib::Server srv;
 
     srv.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
         std::string lv;
-        for (auto l : model.level_lens(maxN)) { if (!lv.empty()) lv += ','; lv += std::format("{}", l); }
+        for (auto l : levels_of(model, maxN)) { if (!lv.empty()) lv += ','; lv += std::format("{}", l); }
         res.set_content(std::format(
-            R"({{"status":"ok","model":"mera","vocab":{},"max_seq_len":{},"coarsen":{},"window":{},"levels":[{}]}})",
-            Vr, maxN, c, w, lv), "application/json");
+            R"({{"status":"ok","model":"{}","vocab":{},"max_seq_len":{},"coarsen":{},"window":{},"levels":[{}]}})",
+            model_type, Vr, maxN, c, w, lv), "application/json");
     });
 
     // POST /v1/generate_trace {prompt, seq_len, temperature, conf_threshold, min_commit_frac,
@@ -241,10 +222,15 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("request body is not valid JSON");
             cfg.commit_order = (order == "spread") ? dn::CommitOrder::Spread : dn::CommitOrder::Confidence;
 
+            // Snap N down to the nearest length the model accepts (MERA needs a valid pyramid; flat any
+            // N), so a knob never 500s.
+            auto valid = [&](std::int64_t n) {
+                if (n <= 0) return false;
+                if constexpr (requires { model.level_lens(n); }) {
+                    try { (void)model.level_lens(n); return true; } catch (...) { return false; }
+                } else return true;
+            };
             std::int64_t N = std::min(maxN, seq_len);
-            // N must be valid for the pyramid (divisible by c down to <= w). Snap down to the nearest
-            // length the trained model accepts, so the knob never 500s.
-            auto valid = [&](std::int64_t n) { std::int64_t x = n; while (x > w) { if (x % c) return false; x /= c; } return n > 0; };
             while (N > 0 && !valid(N)) --N;
             if (N <= 0) throw std::runtime_error("no valid seq_len <= requested");
 
@@ -255,12 +241,12 @@ int main(int argc, char** argv) {
             }
 
             dv::GenerationTrace trace;
-            trace.T = N; trace.model = "mera"; trace.N = N; trace.c = c; trace.w = w;
+            trace.T = N; trace.model = model_type; trace.N = N; trace.c = c; trace.w = w;
             trace.commit_order = (cfg.commit_order == dn::CommitOrder::Spread) ? "spread" : "confidence";
             trace.temperature = cfg.temperature; trace.conf_threshold = cfg.conf_threshold;
             trace.min_commit_frac = cfg.min_commit_frac; trace.remask_threshold = cfg.remask_threshold;
             trace.prompt = prompt_text;
-            trace.levels = model.level_lens(N);
+            trace.levels = levels_of(model, N);
 
             std::string payload;
             {
@@ -280,9 +266,7 @@ int main(int argc, char** argv) {
     // static viewer + glossary (mount repo root so /tools/viz/ and /ACRONYMS.json resolve)
     if (!srv.set_mount_point("/", webroot))
         std::println("WARN: could not mount static webroot '{}' (API still works)", webroot);
-    srv.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        res.set_redirect("/tools/viz/");
-    });
+    srv.Get("/", [](const httplib::Request&, httplib::Response& res) { res.set_redirect("/tools/viz/"); });
 
     std::println("\nserving on http://{}:{}", host, port);
     std::println("  open:   http://{}:{}/tools/viz/", host, port);
@@ -290,4 +274,65 @@ int main(int argc, char** argv) {
     std::println("  health: GET  http://{}:{}/health", host, port);
     if (!srv.listen(host, port)) { std::println("ERROR: failed to bind {}:{}", host, port); return 1; }
     return 0;
+}
+
+}  // namespace
+
+int run_main(int argc, char** argv) {
+    sub0llm::init_cpu_compute();   // FTZ+DAZ on the main thread
+    const std::string model_dir = arg_s(argc, argv, "--model-dir", "");
+    const std::string host    = arg_s(argc, argv, "--host", "127.0.0.1");
+    const std::string webroot = arg_s(argc, argv, "--webroot", ".");
+    const int port            = static_cast<int>(arg_i(argc, argv, "--port", 8080));
+    std::println("== Ch32 Viz server ==");
+
+    // ── A) load a trained model dir (the GPU trainer's output) — no retraining ──────────────────────
+    if (!model_dir.empty()) {
+        std::println("loading model dir {} ...", model_dir);
+        dn::LoadedModel lm = dn::load_model_dir(model_dir);
+        const std::int64_t Vr = static_cast<std::int64_t>(lm.tokenizer->vocab_size());
+        std::println("loaded {} model (step {}, seq_len {}, vocab {})", lm.model_type, lm.step, lm.seq_len, Vr);
+        if (lm.model_type == "mera")
+            return serve(*lm.mera, *lm.tokenizer, Vr, "mera", lm.seq_len, lm.mera_coarsen, lm.mera_window, host, port, webroot);
+        return serve(*lm.model, *lm.tokenizer, Vr, "flat", lm.seq_len, 0, 0, host, port, webroot);
+    }
+
+    // ── B) no model dir: train a small MERA inline (the original Phase-C convenience path) ──────────
+    const std::string corpus  = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
+    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", 600);
+    const std::int64_t steps  = arg_i(argc, argv, "--steps", 2000);
+    const std::int64_t D      = arg_i(argc, argv, "--embed_dim", 256);
+    const std::int64_t maxN   = arg_i(argc, argv, "--seq_len", 128);   // also the trained max length
+    const std::int64_t w      = arg_i(argc, argv, "--window", 64);
+    const std::int64_t c      = arg_i(argc, argv, "--coarsen", 4);
+    const std::int64_t Btr    = arg_i(argc, argv, "--batch", 8);
+    const std::uint64_t seed  = static_cast<std::uint64_t>(arg_i(argc, argv, "--seed", 7));
+    const std::string devs    = arg_s(argc, argv, "--device", "cuda");
+    const sub0llm::Device train_dev = devs == "cpu" ? sub0llm::Device::cpu() : sub0llm::Device::cuda();
+
+    std::println("(no --model-dir) training a small MERA inline...");
+    auto paras = read_paragraphs(corpus, plimit);
+    if (paras.size() < 20) throw std::runtime_error("need >=20 paragraphs");
+    std::print("building word tokenizer over {} paragraphs... ", paras.size());
+    BPETokenizer tok = BPETokenizer::word_level(paras);
+    const std::int64_t Vr = static_cast<std::int64_t>(tok.vocab_size());
+    std::println("done — {} word vocab", Vr);
+    std::vector<std::int32_t> ids;
+    for (const auto& p : paras) { auto v = tok.encode(p); ids.insert(ids.end(), v.begin(), v.end()); }
+    if (static_cast<std::int64_t>(ids.size()) < maxN + Btr + 8) throw std::runtime_error("corpus too short");
+
+    std::println("training MERA ({} steps, N={}, D={}, c={}, w={}, device={})...", steps, maxN, D, c, w, devs);
+    dn::MeraDenoiser model(Vr, D, 8, 4, c, w, maxN, 0, seed);
+    train(model, ids, static_cast<int>(steps), Btr, maxN, seed, train_dev);
+    return serve(model, tok, Vr, "mera", maxN, c, w, host, port, webroot);
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::fflush(stdout);
+        std::println(stderr, "ERROR: {}", e.what());
+        return 1;
+    }
 }
