@@ -80,6 +80,17 @@
 
 ## Done
 
+- **Reusable training-loop CHECKS module** (`sub0diff::train::Checkpointer`, `train/checkpointer.hpp` +
+  `src/checkpointer.cpp`): bundles the discipline so every trainer inherits it instead of reimplementing
+  (and drifting) — the coverage-rule eval cadence + averaged sample (`due()`/`eval_windows()`/
+  `steps_bound()` from make_schedule), early-stop (best + patience + min-improve deadband), and the full
+  honest-resume I/O (`load_weights`→`restore`→`record` over weights `step_*.ckpt` + Adam `step_*.opt` +
+  progress `train_state.json`). The model device-order constraint stays the caller's (load on CPU →
+  to(device) → build optimizer → restore). simdjson read confined to the .cpp. `ch32_mera_train` now
+  delegates to it (deleted its inline TrainState/save/load/early-stop). Validated: train→resume rehydrated
+  best/stalls and continued honestly; 52/52 tests green. **Coverage rule proven on a real run**: word-level
+  TinyStories (vocab 2953) early-stopped at step 2700 (patience 10), best NELBO 2.31 @ step 1700, with the
+  derived cadence (eval every 100 steps ≈ 1.4 epoch coverage, not the old fixed 500).
 - **Robust resumable CUDA MERA trainer** (`ch32_mera_train`) — reuses the Ch29 consistent config layer
   (`sub0diff::config::RunConfig`) + binary checkpoint format. `--ckpt-dir X` ALONE reconstructs the exact
   arch from `run_config.json` (added BuildTime fields `model_type`/`mera_coarsen`/`mera_window`), reloads

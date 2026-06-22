@@ -15,8 +15,9 @@
 #include "sub0diff/config/run_config.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/mera_denoiser.hpp"
+#include "sub0diff/train/checkpointer.hpp"   // reusable checks: coverage cadence + early-stop + resume I/O
 #include "sub0diff/train/diffusion_loss.hpp"
-#include "sub0diff/train/schedule.hpp"   // make_schedule — coverage-rule eval cadence + eval sample size
+#include "sub0diff/train/schedule.hpp"        // make_schedule — coverage-rule eval cadence + sample size
 
 #include "sub0llm/core/ops.hpp"
 #include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ — training-throughput prerequisite)
@@ -24,25 +25,19 @@
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
-#include <simdjson.h>   // train_state.json read (forward on-demand)
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <iterator>
-#include <limits>
 #include <memory>
 #include <print>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #ifndef SUB0DIFF_CODE_SHA
@@ -99,80 +94,33 @@ double eval_nelbo(Model& model, std::span<const std::int32_t> stream, const cfgm
     return sum / n_batches;
 }
 
-// Snapshot the live param Variables (copies sharing storage with the model AT THE CALL TIME).
-// Must be re-taken whenever the model's device changes: Variable::to() swaps in a NEW storage tensor, so
-// a snapshot taken before to(cuda) goes stale. load BEFORE to(cuda) (CPU weights) and re-snapshot at each
-// save (current on-device weights — save_checkpoint D2H's them).
-std::vector<sub0llm::autograd::Variable> snapshot_params(
-    const std::vector<sub0llm::autograd::Variable*>& ptrs) {
-    std::vector<sub0llm::autograd::Variable> v;
-    v.reserve(ptrs.size());
-    for (auto* p : ptrs) v.push_back(*p);
-    return v;
-}
-
-// The dynamic-progress sidecar for an HONEST resume: weights live in step_*.ckpt and Adam moments in
-// step_*.opt; this train_state.json holds the REST — the early-stop history — so a resume continues
-// mid-climb instead of restarting the best-tracking. `step` is matched against the resumed checkpoint so
-// a stale sidecar is ignored. Written as JSON (per the project model-artifact convention); READ with
-// simdjson on-demand (forward, single pass — the project JSON-read direction).
-struct TrainState {
-    bool          have = false;
-    std::uint64_t step = 0;
-    double        best_nelbo = std::numeric_limits<double>::max();
-    std::uint64_t evals_since_best = 0;
-};
-
-void save_train_state(const fs::path& path, const TrainState& s, std::string_view code_sha,
-                      std::uint64_t config_sha) {
-    std::ofstream f(path);
-    if (!f) return;
-    f << std::format(
-        "{{\n  \"step\": {},\n  \"best_nelbo\": {:.9g},\n  \"evals_since_best\": {},\n"
-        "  \"code_sha\": \"{}\",\n  \"config_sha\": \"{:016x}\",\n  \"updated_unix\": {}\n}}\n",
-        s.step, s.best_nelbo, s.evals_since_best, code_sha, config_sha,
-        static_cast<std::int64_t>(std::time(nullptr)));
-}
-
-// Load + validate against the resumed step; have=false on absence/mismatch (a stale sidecar is ignored).
-[[nodiscard]] TrainState load_train_state(const fs::path& path, std::uint64_t expect_step) {
-    TrainState s;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return s;
-    std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (body.empty()) return s;
-    simdjson::ondemand::parser parser;
-    simdjson::padded_string padded(body.data(), body.size());
-    auto doc = parser.iterate(padded);
-    if (doc.error()) return s;
-    auto obj = doc.get_object();
-    if (obj.error()) return s;
-    for (auto field : obj) {
-        auto k = field.unescaped_key(); if (k.error()) continue;
-        auto v = field.value();         if (v.error()) continue;
-        const std::string_view key = k.value_unsafe();
-        if      (key == "step")             { std::uint64_t x; if (!v.get(x)) s.step = x; }
-        else if (key == "best_nelbo")       { double x;        if (!v.get(x)) s.best_nelbo = x; }
-        else if (key == "evals_since_best") { std::uint64_t x; if (!v.get(x)) s.evals_since_best = x; }
-    }
-    s.have = (s.step == expect_step);
-    return s;
-}
-
 // The model-agnostic training loop: resume weights+optimizer, train on GPU/CPU, checkpoint periodically.
+// All the reusable CHECKS (coverage-rule cadence, early-stop, honest-resume I/O) live in dt::Checkpointer.
 template <class Model>
 int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_ids,
-        std::span<const std::int32_t> eval_ids, std::span<const std::uint8_t> ws_span,
-        const std::string& resume_ckpt) {
+        std::span<const std::int32_t> eval_ids, std::span<const std::uint8_t> ws_span) {
     auto param_ptrs = model.parameters();
+    const std::int64_t N = cfg.model.seq_len, B = std::max<std::int64_t>(1, cfg.optim.batch);
+    (void)ws_span;  // whole-word / contiguous masking not wired in this lean trainer yet (defaults off)
+
+    // THE COVERAGE RULE (ch29 schedule.hpp): never eval more often than ~½ epoch of coverage, and average
+    // over a corpus-scaled sample — else consecutive evals differ only by noise and early-stop trips on it.
+    const double mean_t = 0.5 * (0.02 + static_cast<double>(cfg.optim.t_max));
+    const auto sched = dt::make_schedule(
+        static_cast<std::uint64_t>(train_ids.size()), static_cast<std::uint64_t>(eval_ids.size()),
+        N, static_cast<std::size_t>(B), mean_t * static_cast<double>(N), {},
+        cfg.train.eval_every, cfg.train.steps);
+    std::println("schedule: epoch={} windows ({} steps/epoch); eval every {} steps = {:.0f}% epoch "
+                 "coverage, averaged over {} eval windows; steps bound {}",
+                 sched.epoch_windows, B > 0 ? sched.epoch_windows / static_cast<std::uint64_t>(B) : 0,
+                 sched.eval_every, 100.0 * sched.coverage_per_eval, sched.eval_nelbo_windows, sched.steps_bound);
+
+    // The reusable training-loop checks: cadence + early-stop + honest-resume I/O in one tested place.
+    dt::Checkpointer ck(sched, cfg.data.ckpt_dir, SUB0DIFF_CODE_SHA, cfgm::config_sha(cfg), cfg.train.patience);
 
     // 1) Resume weights on CPU (the snapshot shares storage with the model, still on CPU here).
-    std::uint64_t start_step = 0;
-    if (!resume_ckpt.empty()) {
-        auto cpu_view = snapshot_params(param_ptrs);
-        start_step = static_cast<std::uint64_t>(sub0llm::load_checkpoint(cpu_view, resume_ckpt));
-        std::println("resumed weights from {} (step {})", resume_ckpt, start_step);
-    }
+    const std::uint64_t start_step = ck.load_weights(param_ptrs);
+    if (start_step) std::println("resumed weights from {} (step {})", ck.resumed_from(), start_step);
 
     // 2) Move to the device BEFORE building the optimizer, so Adam's (m,v) allocate on-device with the
     //    params (constructing the optimizer first leaves its state on the CPU → device-mismatch crash).
@@ -188,53 +136,16 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
         std::println("device: CPU");
     }
 
-    // 3) Optimizer over the now-on-device params; restore Adam moments from the matching .opt on resume.
+    // 3) Optimizer over the now-on-device params, then restore Adam moments + the early-stop history.
     auto opt = sub0llm::nn::make_optimizer(cfg.optim.optimizer, param_ptrs, cfg.optim.lr);
-    if (!resume_ckpt.empty()) {
-        fs::path opt_path = resume_ckpt; opt_path.replace_extension(".opt");
-        if (fs::exists(opt_path) && opt->load_state(opt_path.string()))
-            std::println("restored optimizer state from {}", opt_path.string());
-        else
-            std::println("note: no optimizer state at {} — Adam moments start fresh", opt_path.string());
-    }
+    ck.restore(*opt);
+    if (start_step && ck.progress().have)
+        std::println("rehydrated train_state.json: best_nelbo={:.4f}, evals_since_best={}",
+                     ck.progress().best, ck.progress().stalls);
 
-    // 4) Dynamic training-state sidecar — the early-stop history, for an HONEST resume (continues the
-    //    best-tracking instead of restarting it). step is validated against the resumed checkpoint.
-    const std::string code_sha = SUB0DIFF_CODE_SHA;
-    const std::uint64_t cfg_sha = cfgm::config_sha(cfg);
-    const fs::path state_path = fs::path(cfg.data.ckpt_dir) / "train_state.json";
-    TrainState state;
-    if (!resume_ckpt.empty()) {
-        state = load_train_state(state_path, start_step);
-        if (state.have)
-            std::println("rehydrated train_state.json: best_nelbo={:.4f}, evals_since_best={}",
-                         state.best_nelbo, state.evals_since_best);
-        else
-            std::println("note: no matching train_state.json @ step {} — best-tracking starts fresh", start_step);
-    }
-
-    const std::int64_t N = cfg.model.seq_len, B = std::max<std::int64_t>(1, cfg.optim.batch);
-
-    // THE COVERAGE RULE (ch29 schedule.hpp): a held-out eval is only a meaningful early-stop signal once
-    // the model has trained over a significant fraction of the corpus SINCE the last eval — eval more
-    // often and consecutive evals differ only by noise. make_schedule derives the eval cadence (≥0.5
-    // epoch between evals, batch folded in) AND the averaged eval sample size from the corpus; an explicit
-    // --eval-every / --steps overrides (0 = derive). masked_per_window = E[t]·seq_len.
-    const double mean_t = 0.5 * (0.02 + static_cast<double>(cfg.optim.t_max));
-    const auto sched = dt::make_schedule(
-        static_cast<std::uint64_t>(train_ids.size()), static_cast<std::uint64_t>(eval_ids.size()),
-        N, static_cast<std::size_t>(B), mean_t * static_cast<double>(N), {},
-        cfg.train.eval_every, cfg.train.steps);
-    const std::uint64_t steps = sched.steps_bound;
-    const std::uint64_t ckpt_every = sched.eval_every;
-    const std::size_t eval_windows = sched.eval_nelbo_windows;
-    std::println("schedule: epoch={} windows ({} steps/epoch); eval every {} steps = {:.0f}% epoch "
-                 "coverage, averaged over {} eval windows; steps bound {}",
-                 sched.epoch_windows, B > 0 ? sched.epoch_windows / static_cast<std::uint64_t>(B) : 0,
-                 ckpt_every, 100.0 * sched.coverage_per_eval, eval_windows, steps);
+    const std::uint64_t steps = ck.steps_bound();
     std::mt19937 rng(static_cast<std::uint32_t>(cfg.optim.seed) + static_cast<std::uint32_t>(start_step));
     std::uniform_int_distribution<std::size_t> off(0, train_ids.size() - static_cast<std::size_t>(N));
-    (void)ws_span;  // whole-word / contiguous masking not wired in this lean trainer yet (defaults off)
 
     // One forward+backward+step on `offs`. The SAME batched loss drives CPU and the GPU single stream
     // (the model already sits on the chosen device; batched_diffusion_loss dispatches). Validated on
@@ -251,22 +162,14 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
         return static_cast<double>(res.loss.data().to(sub0llm::Device::cpu()).template item<float>());
     };
 
-    // Checkpoint = eval + update best-tracking + write weights/.opt/train_state.json (the full honest
-    // resume set). Returns true if early-stop should fire (patience stalled evals with no improvement).
+    // Eval + checkpoint via the reusable guard: averaged held-out NELBO over the schedule's sample, then
+    // ck.record saves weights/.opt/train_state.json, updates best/stalls, and reports early-stop.
     auto checkpoint = [&](std::uint64_t step) {
-        const double nelbo = eval_nelbo(model, eval_ids, cfg, rng, eval_windows);
-        constexpr double kMinImprove = 0.01;
-        if (nelbo < state.best_nelbo - kMinImprove) { state.best_nelbo = nelbo; state.evals_since_best = 0; }
-        else ++state.evals_since_best;
-        state.step = step;
-        auto view = snapshot_params(param_ptrs);   // current live params (on device) — save_checkpoint D2H's
-        sub0llm::save_checkpoint(view, cfg.data.ckpt_dir, static_cast<std::int64_t>(step));
-        const std::string ck = sub0llm::latest_checkpoint_path(cfg.data.ckpt_dir);
-        if (!ck.empty()) { fs::path op = ck; op.replace_extension(".opt"); opt->save_state(op.string()); }
-        save_train_state(state_path, state, code_sha, cfg_sha);   // honest-resume sidecar
-        const bool stop = cfg.train.patience > 0 && state.evals_since_best >= cfg.train.patience;
+        const double nelbo = eval_nelbo(model, eval_ids, cfg, rng, ck.eval_windows());
+        const bool stop = ck.record(step, nelbo, param_ptrs, *opt);
         std::println("  ckpt @ step {:>6}  eval_nelbo={:.4f}  best={:.4f}  stalls={}{}  -> {}",
-                     step, nelbo, state.best_nelbo, state.evals_since_best, stop ? "  EARLY-STOP" : "", ck);
+                     step, nelbo, ck.progress().best, ck.progress().stalls,
+                     stop ? "  EARLY-STOP" : "", sub0llm::latest_checkpoint_path(cfg.data.ckpt_dir));
         return stop;
     };
 
@@ -284,10 +187,10 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::println("  step {:>6}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss, (s + 1 - start_step) / std::max(1e-9, secs));
         }
-        if ((s + 1) % ckpt_every == 0 && checkpoint(s + 1)) { stopped = true; break; }
+        if (ck.due(s + 1) && checkpoint(s + 1)) { stopped = true; break; }
     }
     // final checkpoint so a resume always finds the last step (skip if already saved this step)
-    if (!stopped && last_step > start_step && last_step % ckpt_every != 0) checkpoint(last_step);
+    if (!stopped && last_step > start_step && !ck.due(last_step)) checkpoint(last_step);
     std::println("done. checkpoints + train_state.json in {}", cfg.data.ckpt_dir);
     return 0;
 }
@@ -386,13 +289,13 @@ int run_main(int argc, char** argv) {
         std::println("MeraDenoiser: V={} D={} c={} w={} levels={}", V, cfg.model.embed_dim,
                      cfg.model.mera_coarsen, cfg.model.mera_window,
                      [&]{ std::string s; for (auto l : model.level_lens(cfg.model.seq_len)) s += std::format("{} ", l); return s; }());
-        return run(model, cfg, train_ids, eval_ids, ws_span, resume_ckpt);
+        return run(model, cfg, train_ids, eval_ids, ws_span);
     }
     dn::Denoiser model(V, cfg.model.embed_dim, static_cast<std::size_t>(cfg.model.n_heads),
                        static_cast<std::size_t>(cfg.model.n_kv_heads), cfg.model.n_layers,
                        cfg.model.d_ff, cfg.optim.seed);
     std::println("Denoiser (flat): V={} D={} layers={}", V, cfg.model.embed_dim, cfg.model.n_layers);
-    return run(model, cfg, train_ids, eval_ids, ws_span, resume_ckpt);
+    return run(model, cfg, train_ids, eval_ids, ws_span);
 }
 
 int main(int argc, char** argv) {
