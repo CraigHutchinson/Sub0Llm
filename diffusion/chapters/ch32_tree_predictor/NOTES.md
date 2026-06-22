@@ -22,7 +22,18 @@
   (would lift MERA's ~16384 training ceiling).
 - Per-step arena allocator = the principled end state (stable VRAM, predictable peak).
 
+## Findings
+
+- **MERA's NLL win does NOT robustly transfer to generation coherence (M2) at this scale.** 3-seed
+  `ch32_hier_gen` (N=256, 64 gens): mera-gen content-recurrence beats flat-gen in 2/3 seeds (0.072 vs
+  0.053; 0.059 vs 0.074; 0.076 vs 0.054) — mean 0.069 vs 0.060, but the per-seed variance swamps it
+  (seed 8 flips). So MERA's clear, robust advantages stay in PREDICTION (NLL 3/3), compute, and context;
+  generation coherence is comparable/noisy at 5M params on 540 paragraphs (the Chinchilla gap — samples
+  are word-salad-ish for all variants). To get a real generation-quality signal: more samples (cut M2
+  variance) and/or a bigger model + more data. Don't claim a MERA generation-quality win.
+
 ## Done
 
 - `sum_squares` per-step cudaMalloc/cudaFree → persistent static scalar (commit 0f30f0e).
 - Corrected: the `*_bench` multi-malloc functions are microbenchmarks, not the training hot path.
+- MERA end-to-end generation works (templated sampler); generation-M2 vs flat measured (noisy, above).
