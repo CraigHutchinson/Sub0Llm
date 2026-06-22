@@ -9,6 +9,7 @@
 
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/hier_denoiser.hpp"
+#include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/core/ops.hpp"
@@ -110,7 +111,10 @@ int main(int argc, char** argv) {
 
     try {
         double sps = 0.0;
-        if (which == "hier") {
+        if (which == "mera") {
+            dn::MeraDenoiser m(Vr, D, 8, 4, c, w, N, 0, /*seed=*/7);
+            sps = time_steps(m, ids, B, N, /*warmup=*/3, /*steps=*/15);
+        } else if (which == "hier") {
             dn::HierDenoiser m(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/7, /*mask_aware=*/true);
             sps = time_steps(m, ids, B, N, /*warmup=*/3, /*steps=*/15);
         } else {
