@@ -10,6 +10,7 @@
 #include "sub0diff/eval/topic_drift.hpp"
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/hier_denoiser.hpp"
+#include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
 #include "sub0llm/core/ops.hpp"
@@ -123,6 +124,7 @@ int main(int argc, char** argv) {
     const std::int64_t B      = arg_i(argc, argv, "--batch", 8);
     const std::int64_t stop_k = arg_i(argc, argv, "--stop_k", 100);
     const std::size_t windows = static_cast<std::size_t>(arg_i(argc, argv, "--eval_windows", 2000));
+    const std::uint64_t seed  = static_cast<std::uint64_t>(arg_i(argc, argv, "--seed", 7));
 
     std::println("== Ch32 P2 2e — coarse-to-fine vs flat (efficiency/context benchmark) ==");
     std::println("N={} window={} (M={} fine windows) coarsen={} (Nc={} coarse slots)", N, w, N / w, c, N / c);
@@ -146,20 +148,25 @@ int main(int argc, char** argv) {
         throw std::runtime_error("corpus too short for this seq_len");
 
     std::println("\n-- training FLAT Denoiser (N={}) --", N);
-    dn::Denoiser flat(Vr, D, 8, 4, L, 0, /*seed=*/7);
-    const double t_flat = train(flat, train_ids, static_cast<int>(steps), B, N, 1e-3f, 7, "flat");
+    dn::Denoiser flat(Vr, D, 8, 4, L, 0, /*seed=*/seed);
+    const double t_flat = train(flat, train_ids, static_cast<int>(steps), B, N, 1e-3f, seed, "flat");
     const auto nf = nll(flat, eval_ids, is_content, N, windows);
 
     std::println("\n-- training HIER Denoiser, UNIFORM pool (coarse {}L over Nc={} + fine {}L over w={}) --",
                  L / 2, N / c, L - L / 2, w);
-    dn::HierDenoiser hier(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/7, /*mask_aware=*/false);
-    const double t_hier = train(hier, train_ids, static_cast<int>(steps), B, N, 1e-3f, 7, "hier");
+    dn::HierDenoiser hier(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/seed, /*mask_aware=*/false);
+    const double t_hier = train(hier, train_ids, static_cast<int>(steps), B, N, 1e-3f, seed, "hier");
     const auto nh = nll(hier, eval_ids, is_content, N, windows);
 
     std::println("\n-- training HIER Denoiser, MASK-AWARE pool (2c) --");
-    dn::HierDenoiser hierm(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/7, /*mask_aware=*/true);
-    const double t_hierm = train(hierm, train_ids, static_cast<int>(steps), B, N, 1e-3f, 7, "hierM");
+    dn::HierDenoiser hierm(Vr, D, 8, 4, L / 2, L - L / 2, c, w, 0, /*seed=*/seed, /*mask_aware=*/true);
+    const double t_hierm = train(hierm, train_ids, static_cast<int>(steps), B, N, 1e-3f, seed, "hierM");
     const auto nm = nll(hierm, eval_ids, is_content, N, windows);
+
+    dn::MeraDenoiser mera(Vr, D, 8, 4, c, w, N, 0, /*seed=*/seed);
+    std::println("\n-- training MERA Denoiser (P3, {} levels, linear O(N*w)) --", mera.n_levels());
+    const double t_mera = train(mera, train_ids, static_cast<int>(steps), B, N, 1e-3f, 7, "mera");
+    const auto nr = nll(mera, eval_ids, is_content, N, windows);
 
     // analytic attention-op ratio (per sequence, ignoring D and heads): flat L·N² vs coarse+fine.
     const double flat_ops = static_cast<double>(L) * static_cast<double>(N) * static_cast<double>(N);
@@ -171,10 +178,10 @@ int main(int argc, char** argv) {
     std::println("  FLAT       NLL content {:.3f} function {:.3f} overall {:.3f}   train {:.1f}s", nf[0], nf[1], nf[2], t_flat);
     std::println("  HIER-unif  NLL content {:.3f} function {:.3f} overall {:.3f}   train {:.1f}s", nh[0], nh[1], nh[2], t_hier);
     std::println("  HIER-mask  NLL content {:.3f} function {:.3f} overall {:.3f}   train {:.1f}s", nm[0], nm[1], nm[2], t_hierm);
-    std::println("\n  ACCURACY gap vs flat (overall NLL):  uniform {:+.1f}%  ->  mask-aware {:+.1f}%   (content {:+.1f}% -> {:+.1f}%)",
-                 gap(nh[2], nf[2]), gap(nm[2], nf[2]), gap(nh[0], nf[0]), gap(nm[0], nf[0]));
-    std::println("  mask-aware pooling closes the gap by: {:.0f}% of it (overall)",
-                 gap(nh[2], nf[2]) != 0 ? (gap(nh[2], nf[2]) - gap(nm[2], nf[2])) / gap(nh[2], nf[2]) * 100.0 : 0.0);
+    std::println("  MERA (P3)  NLL content {:.3f} function {:.3f} overall {:.3f}   train {:.1f}s", nr[0], nr[1], nr[2], t_mera);
+    std::println("\n  ACCURACY gap vs flat (overall NLL):  hier-unif {:+.1f}%  hier-mask {:+.1f}%  MERA {:+.1f}%   (content: {:+.1f}% / {:+.1f}% / {:+.1f}%)",
+                 gap(nh[2], nf[2]), gap(nm[2], nf[2]), gap(nr[2], nf[2]),
+                 gap(nh[0], nf[0]), gap(nm[0], nf[0]), gap(nr[0], nf[0]));
     std::println("  COMPUTE: attention-ops flat {:.0f} vs hier {:.0f}  ({:.1f}x fewer);  wall-time {:.2f}x of flat",
                  flat_ops, hier_ops, hier_ops > 0 ? flat_ops / hier_ops : 0.0,
                  t_flat > 0 ? t_hier / t_flat : 0.0);

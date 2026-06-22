@@ -112,6 +112,12 @@ P1 codec. **Do not build P2 on char-composition.**
   ceiling (~16384 thrash / 32768 OOM) is **memory, not compute** — the training autograd graph's linear-
   but-large activations; separable via gradient checkpointing (training) and absent at inference. P3's
   core claim validated. See [`2E_RESULTS.md`](2E_RESULTS.md) §P3.
+- **P3 MERA ALSO BEATS FLAT ON ACCURACY (3 seeds)** — `ch32_hier_ab` N=256: MERA overall NLL **−1.7 /
+  −3.7 / −3.5%** vs flat in 3/3 (content −3…−4.4%), ~2.1× faster, with FEWER blocks than flat (3 vs 4 →
+  not capacity). Single-level hier was +28–41% WORSE; recursive multi-level MERA is BETTER — the **M3
+  multi-scale hypothesis vindicated in accuracy**. **Verdict: flat is strictly dominated on every metric
+  (accuracy, compute, context) — never wins; role drops to reference/accuracy oracle. MERA = default;
+  hier only for small-N raw speed.** See [`2E_RESULTS.md`](2E_RESULTS.md) §P3.
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic

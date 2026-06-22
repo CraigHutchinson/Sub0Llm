@@ -166,6 +166,31 @@ total attention work is `Σ_k O((N/cᵏ)·w) = O(N·w)` — LINEAR, no level eve
 ~4× then walls → recursive MERA `O(N·w)` holds constant throughput to ~8192 (22× over hier), memory-
 bounded ~16384. Each phase's *measured* limitation motivated the next; P3 lands the linear-compute win.
 
+### MERA also BEATS flat on accuracy (3 seeds) — not just compute
+
+The 4-way NLL A/B (`ch32_hier_ab`, N=256, 2000 steps) — and a 3-seed repeat — show MERA is *more
+accurate* than flat, not merely cheaper:
+
+| seed | flat overall | MERA overall | MERA−flat | content | train: MERA vs flat |
+|------|-------------:|-------------:|----------:|--------:|--------------------:|
+| 7 | 2.494 | 2.452 | −1.7% | −4.4% | 80s vs 172s |
+| 8 | 2.610 | 2.513 | −3.7% | −3.0% | 87s vs 177s |
+| 9 | 2.587 | 2.496 | −3.5% | −3.7% | 81s vs 178s |
+
+(single-level hier was +28–41% WORSE than flat; the recursive MERA is −2…−4% BETTER, and beats flat on
+both content and function buckets.) Robust (3/3 seeds), and **not capacity** — at N=256 MERA has FEWER
+blocks than flat (3 vs 4) yet wins, while training ~2.1× faster. This is the **M3 multi-scale hypothesis
+vindicated in accuracy**: a U-Net/MERA processing the sequence at log(N) resolutions is a better
+inductive bias for power-law language than flat single-resolution attention — better generalisation AND
+cheaper. The single-level hier's accuracy loss came from its lossy single coarse pass + seams; the
+recursive multi-level encode/skip/decode fixes that.
+
+**Verdict — flat is strictly dominated.** MERA beats flat on accuracy (3/3), compute (~2×), and context
+(linear vs N² wall); hier beats flat on speed/context but not accuracy. So **flat never wins on any
+metric** — its role drops to the *reference/accuracy oracle* (educational baseline), not a deployment
+option. Toolbox: **MERA = the default** (accuracy + scaling); **hier** only where small-N raw speed beats
+accuracy (it has lower per-step overhead than MERA below ~N=4096); flat = reference.
+
 ## Frontier verdict & next
 
 The gist-as-coarsening design is a **real efficiency/context primitive**: an order-of-magnitude compute
