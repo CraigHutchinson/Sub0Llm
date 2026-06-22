@@ -34,7 +34,7 @@ using sub0llm::config::Scope;
 // trainer after tokenizer build so a resume reconstructs the exact embedding/LM-head).
 struct Model {
     std::int64_t  vocab_size = 512;   // real vocab (mask token added internally by the denoiser)
-    std::int64_t  seq_len    = 64;    // canvas length T (frontier t = k/T)
+    std::int64_t  seq_len    = 128;   // canvas length T (frontier t = k/T) — ≫ mera_window so MERA is hierarchical
     std::int64_t  embed_dim  = 256;   // residual width D
     std::int64_t  n_layers   = 6;
     std::int64_t  d_ff       = 1024;  // 4·D
@@ -45,7 +45,7 @@ struct Model {
     // level ≤ `mera_window`; n_layers is unused by MERA (its depth ≈ 2·levels+1 derives from seq_len).
     std::string   model_type      = "flat";   // flat | mera
     std::int64_t  mera_coarsen    = 4;        // MERA coarsen factor c per level
-    std::int64_t  mera_window     = 64;       // MERA local window / top-level size w
+    std::int64_t  mera_window     = 16;       // MERA local window / top size w (seq 128 → levels 128·32·8)
     bool          mera_gated_pool = false;    // MERA: content-weighted (boundary-aware) coarsening vs mean-pool
 
     template <class Self, class V>
@@ -66,12 +66,12 @@ struct Model {
 
 // ── Data + checkpoint location — Runtime ────────────────────────────────────────────
 struct Data {
-    std::string  corpus     = "data/shakespeare.txt";
-    std::string  ckpt_dir   = "/tmp/sub0diff_ch29";
-    std::string  name       = "";      // model name → in-repo dir models/<name>_g<gitSHA>_c<configSHA>
+    std::string  corpus     = "data/tinystories_clean.txt";
+    std::string  ckpt_dir   = "/tmp/sub0diff_ch29";      // checkpoint directory (train_state.json + step_*.ckpt + step_*.opt)};
+    std::string  name       = {};      // model name → in-repo dir models/<name>_g<gitSHA>_c<configSHA>
     std::int64_t paragraphs = 0;       // 0/-1 = all paragraphs
     bool         char_level = false;   // char tokenizer (whitespace preserved) + raw reader
-    bool         word_level = false;   // word tokenizer (one token per whole word) + raw reader
+    bool         word_level = true;   // word tokenizer (one token per whole word) + raw reader
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -92,7 +92,7 @@ struct Optim {
     std::uint64_t warmup_steps = 0;          // 0 = derive
     std::uint64_t seed         = 42;
     float         t_max        = 1.0f;       // <1 trains under a Ch28-style noise ceiling
-    std::int64_t  batch        = 1;          // effective batch B (quality, consistency ∝ √B)
+    std::int64_t  batch        = 8;          // effective batch B (quality, consistency ∝ √B); GPU handles 8 easily
     std::int64_t  threads      = 0;          // workers (speed only; 0 = auto = all P-cores)
     std::string   pin          = "auto";     // worker pin policy: auto|all|P|E|"lo-hi"|"a,b,c"
     bool          shared_t     = true;       // one t per step across workers (variance reduction)

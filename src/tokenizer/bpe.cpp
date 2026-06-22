@@ -89,9 +89,15 @@ std::vector<std::string> split_words(std::string_view text) {
     auto flush = [&] { if (!buf.empty()) { out.push_back(std::move(buf)); buf.clear(); } kind = 0; };
 
     for (auto& cp : word_to_chars(text)) {
-        if (is_letter(cp) || is_apos(cp)) {
+        if (is_letter(cp)) {
             if (kind == 2) flush();
             buf += cp; kind = 1;
+        } else if (is_apos(cp) && kind == 1) {
+            // Apostrophe joins only when ALREADY inside a letter run — a contraction/possessive
+            // (What's, I'll, th'). A LEADING apostrophe (TinyStories dialogue: 'And, ''What's) is NOT a
+            // word char: it falls through to its own punctuation token, so quotes stop welding to words
+            // (which otherwise spawned 1000s of rare 'Word / ''Word variants and bloated the vocab).
+            buf += cp;
         } else if (is_digit(cp)) {
             if (kind == 1) flush();
             buf += cp; kind = 2;

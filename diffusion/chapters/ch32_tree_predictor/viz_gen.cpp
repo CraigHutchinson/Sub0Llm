@@ -98,7 +98,7 @@ int run_main(int argc, char** argv) {
     const std::string corpus = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
     const std::string which  = arg_s(argc, argv, "--model", "mera");      // mera | flat
     const std::string out    = arg_s(argc, argv, "--out", "tools/viz/trace.json");
-    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", 600);
+    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", std::numeric_limits<std::int64_t>::max());
     const std::int64_t steps  = arg_i(argc, argv, "--steps", 2000);
     const std::int64_t D      = arg_i(argc, argv, "--embed_dim", 256);
     const std::int64_t N      = arg_i(argc, argv, "--seq_len", 128);

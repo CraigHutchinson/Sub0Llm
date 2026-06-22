@@ -82,6 +82,21 @@ TEST_CASE("word_level - contractions stay whole, repeats collapse to one token",
     REQUIRE(ids[0] == ids[2]);
 }
 
+TEST_CASE("word_level - LEADING quotes don't weld to the word (apostrophe is word-internal only)",
+          "[tokenizer][word]") {
+    // TinyStories dialogue ('What's, ''Oh) used to spawn rare 'Word / ''Word tokens because a leading
+    // apostrophe started a word run. The leading quote must now be its own token; the contraction stays.
+    auto tok = BPETokenizer::word_level({"''What's that?' said the dog. What's up"});
+    REQUIRE(tok.decode(tok.encode("''What's")) == "''What's");   // still lossless
+    REQUIRE(tok.token_id("'")      >= 0);                         // the quote is its own token
+    REQUIRE(tok.token_id("What's") >= 0);                        // the word, unwelded
+    REQUIRE(tok.token_id("''What's") < 0);                       // the glued variant no longer exists
+    REQUIRE(tok.token_id("'What's") < 0);
+    // "What's" before a quote and after one are the SAME id now (statistics no longer fragmented).
+    const auto a = tok.encode("''What's"), b = tok.encode(" What's");
+    REQUIRE(a.back() == b.back());
+}
+
 TEST_CASE("word_level - survives save/load and is distinguished from char-level", "[tokenizer][word]") {
     const std::string text = "hark, who goes there?\n";
     auto tok = BPETokenizer::word_level({text});

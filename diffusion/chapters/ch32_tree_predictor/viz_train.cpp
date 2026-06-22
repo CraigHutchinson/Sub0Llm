@@ -78,9 +78,9 @@ int run_main(int argc, char** argv) {
     const std::string out     = arg_s(argc, argv, "--out", "tools/viz/trajectory.json");
     const std::string prompt_text = arg_s(argc, argv, "--prompt", "once there was a");
     const std::string devs    = arg_s(argc, argv, "--device", "cuda");
-    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", 600);
-    const std::int64_t steps  = arg_i(argc, argv, "--steps", 3000);
-    const std::int64_t snap   = arg_i(argc, argv, "--snap-every", 300);
+    const std::int64_t plimit = arg_i(argc, argv, "--paragraphs", std::numeric_limits<std::int64_t>::max());
+    const std::int64_t steps  = arg_i(argc, argv, "--steps", 60000);
+    const std::int64_t snap   = arg_i(argc, argv, "--snap-every", 1000);
     const std::int64_t D      = arg_i(argc, argv, "--embed_dim", 256);
     const std::int64_t N      = arg_i(argc, argv, "--seq_len", 128);
     const std::int64_t w      = arg_i(argc, argv, "--window", 64);

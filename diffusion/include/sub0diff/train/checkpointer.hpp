@@ -73,6 +73,14 @@ public:
     bool record(std::uint64_t step, double metric,
                 std::span<sub0llm::autograd::Variable* const> params, sub0llm::nn::Optimizer& opt);
 
+    // Time-based SAFETY checkpoint between evals: save weights + opt + train_state.json at `step`
+    // WITHOUT running eval or touching best/stalls — pure crash insurance, since the coverage-rule eval
+    // cadence is deliberately rare (≥½ epoch) and a crash mid-epoch would otherwise lose hours. Rolls a
+    // SINGLE safety file (deletes the previous safety checkpoint, never the best/eval ones) so disk
+    // doesn't bloat. Drive it from a wall-clock util::Heartbeat, independent of due().
+    void save_safety(std::uint64_t step,
+                     std::span<sub0llm::autograd::Variable* const> params, sub0llm::nn::Optimizer& opt);
+
     [[nodiscard]] const Progress&    progress() const noexcept { return prog_; }
     [[nodiscard]] const std::string& resumed_from() const noexcept { return resume_path_; }
 
@@ -82,6 +90,8 @@ private:
     std::uint64_t config_sha_, patience_;
     double        min_improve_;
     Progress      prog_;
+    std::string   safety_path_;        // last rolling safety .ckpt (deleted when the next one lands)
+    std::uint64_t safety_step_ = 0;
 };
 
 }  // namespace sub0diff::train

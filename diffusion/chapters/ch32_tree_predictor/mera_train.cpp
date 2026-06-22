@@ -18,6 +18,7 @@
 #include "sub0diff/train/checkpointer.hpp"   // reusable checks: coverage cadence + early-stop + resume I/O
 #include "sub0diff/train/diffusion_loss.hpp"
 #include "sub0diff/train/schedule.hpp"        // make_schedule — coverage-rule eval cadence + sample size
+#include "sub0diff/util/heartbeat.hpp"        // wall-clock progress log + safety-checkpoint cadence
 
 #include "sub0llm/core/ops.hpp"
 #include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ — training-throughput prerequisite)
@@ -174,19 +175,24 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
     };
 
     std::println("training {} → {} steps (N={}, B={}, model={})", start_step, steps, N, B, cfg.model.model_type);
-    const auto t0 = std::chrono::steady_clock::now();
     double last_loss = 0.0;
     bool stopped = false;
-    std::uint64_t last_step = start_step;
+    std::uint64_t last_step = start_step, log_step = start_step;
+    // Wall-clock cadence (decoupled from the deliberately-rare ½-epoch eval): a progress line every 30 s
+    // with the INSTANTANEOUS rate over the interval, and a rolling safety checkpoint every 3 min so a
+    // crash mid-epoch loses minutes, not hours. The eval-driven best checkpoint still rides ck.due().
+    sub0diff::util::Heartbeat log_hb(30.0), save_hb(180.0);
     for (std::uint64_t s = start_step; s < steps; ++s) {
         std::vector<std::size_t> offs(static_cast<std::size_t>(B));
         for (auto& o : offs) o = off(rng);
         last_loss = train_step(offs);
         last_step = s + 1;
-        if ((s + 1) % 200 == 0) {
-            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::println("  step {:>6}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss, (s + 1 - start_step) / std::max(1e-9, secs));
+        if (const double dt = log_hb.due(); dt > 0.0) {
+            std::println("  step {:>8}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss,
+                         static_cast<double>(s + 1 - log_step) / dt);
+            log_step = s + 1;
         }
+        if (save_hb.due() > 0.0) ck.save_safety(s + 1, param_ptrs, *opt);   // crash insurance between evals
         if (ck.due(s + 1) && checkpoint(s + 1)) { stopped = true; break; }
     }
     // final checkpoint so a resume always finds the last step (skip if already saved this step)
@@ -292,6 +298,14 @@ int run_main(int argc, char** argv) {
                      cfg.model.mera_coarsen, cfg.model.mera_window,
                      cfg.model.mera_gated_pool ? "gated" : "mean",
                      [&]{ std::string s; for (auto l : model.level_lens(cfg.model.seq_len)) s += std::format("{} ", l); return s; }());
+        // Footgun guard: MERA only coarsens while a level length exceeds the window. seq_len ≤ window
+        // ⇒ ONE level ⇒ no hierarchy at all (a single full-attention block mislabelled "mera"). The
+        // whole point of MERA is the recursive pyramid, so warn loudly — use seq_len ≫ window (e.g.
+        // seq_len 256, window 16, coarsen 4 → 256·64·16) to actually exercise it.
+        if (model.n_levels_for(cfg.model.seq_len) <= 1)
+            std::println("  [WARN] seq_len {} ≤ mera_window {} → a SINGLE level (no coarsening). This "
+                         "trains a flat block, not a hierarchy. Set seq_len ≫ window for real MERA.",
+                         cfg.model.seq_len, cfg.model.mera_window);
         return run(model, cfg, train_ids, eval_ids, ws_span);
     }
     dn::Denoiser model(V, cfg.model.embed_dim, static_cast<std::size_t>(cfg.model.n_heads),

@@ -116,4 +116,23 @@ bool Checkpointer::record(std::uint64_t step, double metric,
     return patience_ != 0 && prog_.stalls >= patience_;
 }
 
+void Checkpointer::save_safety(std::uint64_t step,
+                               std::span<Variable* const> params, sub0llm::nn::Optimizer& opt) {
+    auto view = snapshot(params);
+    sub0llm::save_checkpoint(view, dir_, static_cast<std::int64_t>(step));
+    const std::string ck = sub0llm::latest_checkpoint_path(dir_);   // the file we just wrote (highest step)
+    if (!ck.empty()) { fs::path op = ck; op.replace_extension(".opt"); opt.save_state(op.string()); }
+    prog_.step = step;   // best/best_step/stalls untouched — this is NOT an eval
+    write_progress(fs::path(dir_) / "train_state.json", prog_, code_sha_, config_sha_);
+    // Roll: delete the PREVIOUS safety checkpoint so only one extra file lingers — never the best (an
+    // eval winner) nor a record() eval checkpoint (those self-prune later, separately).
+    if (!safety_path_.empty() && safety_step_ != prog_.best_step) {
+        std::error_code ec;
+        fs::remove(safety_path_, ec);
+        fs::path op = safety_path_; op.replace_extension(".opt"); fs::remove(op, ec);
+    }
+    safety_path_ = ck;
+    safety_step_ = step;
+}
+
 }  // namespace sub0diff::train
