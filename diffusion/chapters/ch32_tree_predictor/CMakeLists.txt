@@ -17,3 +17,7 @@ target_link_libraries(ch32_hier_ab PRIVATE sub0diff)
 # P2 HierDenoiser generation + M2-on-generations (flat vs coarse-to-fine).
 add_executable(ch32_hier_gen hier_gen.cpp)
 target_link_libraries(ch32_hier_gen PRIVATE sub0diff)
+
+# P2 context-length ceiling: where flat OOMs, hier keeps running (one model/N per process).
+add_executable(ch32_hier_ceiling hier_ceiling.cpp)
+target_link_libraries(ch32_hier_ceiling PRIVATE sub0diff)
