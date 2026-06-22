@@ -130,6 +130,42 @@ measurement) and a shell loop sweeps N. Small model (D=128, L=4, B=4), tok/s = B
   MERA).** This sweep is the concrete, measured argument for building P3: a single gist level buys a
   ~`c×` context extension; only a `log(N)`-deep stack makes the coarse term cheap enough to scale freely.
 
+## P3 — recursive MERA removes the COMPUTE wall (RAN); residual ceiling is memory
+
+[`mera_denoiser.hpp`](../../include/sub0diff/nn/mera_denoiser.hpp) (`MeraDenoiser`) coarsens
+RECURSIVELY (encode: disentangle + pool, up to a tiny top; decode: broadcast + skip + refine), so
+total attention work is `Σ_k O((N/cᵏ)·w) = O(N·w)` — LINEAR, no level ever large. Same
+`ch32_hier_ceiling` runner, `--model mera`. Full three-way ceiling (D=128, L≈4, B=4, c=8, w=64):
+
+| N | flat | hier | **mera** |
+|------|----------------:|---------------:|---------------:|
+| 1024 | 18.1K tok/s | 88.5K | 51.5K |
+| 2048 | 66 (dead) | 86.6K | 52.8K |
+| 4096 | crashed box | 74.5K | 49.5K |
+| 8192 | — | 1481 | **33.6K** |
+| 16384 | — | — | 1822 (thrash) |
+| 32768 | — | — | OOM |
+
+- **The compute wall is GONE.** MERA holds ~50K tok/s *roughly constant* from N=1024→8192 — the
+  linear-`O(N·w)` signature — where flat is long dead and hier's `O((N/c)²)` coarse pass has collapsed
+  (1481 tok/s at 8192). **At N=8192 MERA is 22× faster than hier** and runs at lengths flat cannot
+  approach. P3's core claim — recursive coarsening keeps every level small and removes the residual N²
+  — is validated.
+- **Crossover is ~N=4096.** Below it, hier is as fast or faster (its single coarse pass has less
+  overhead than MERA's log-depth levels); above it, hier collapses and MERA stays flat. The recursive
+  structure pays off exactly where it should — long sequences.
+- **MERA's remaining wall is MEMORY, not compute.** N=16384 at 36 s/step is ~18× slower than the linear
+  extrapolation (~2 s) = WDDM VRAM thrashing; OOM at 32768. The training autograd graph retains every
+  level's activations (linear in N, but a large constant: ~7 blocks × intermediates), so on 8 GB it
+  caps ~16384 — about 2× hier's ceiling. This is **separable engineering, not an architectural wall**:
+  gradient checkpointing (recompute activations in backward instead of storing) buys unbounded *training*
+  context, and *inference* (no autograd graph) scales much further already. The O(N·w) compute is the
+  hard part and it is solved.
+
+**P2→P3 progression (all measured):** flat `O(N²)` dies ~N=1024 → single-level hier `O((N/c)²)` extends
+~4× then walls → recursive MERA `O(N·w)` holds constant throughput to ~8192 (22× over hier), memory-
+bounded ~16384. Each phase's *measured* limitation motivated the next; P3 lands the linear-compute win.
+
 ## Frontier verdict & next
 
 The gist-as-coarsening design is a **real efficiency/context primitive**: an order-of-magnitude compute

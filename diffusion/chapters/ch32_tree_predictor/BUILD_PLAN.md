@@ -104,6 +104,14 @@ P1 codec. **Do not build P2 on char-composition.**
   scaled by c²) → single-level coarsening buys ~`c×`, not ∞. **This is the measured motivation for P3
   MERA** (recursive log-depth coarsening removes the residual coarse-pass N²). See
   [`2E_RESULTS.md`](2E_RESULTS.md) §Context-ceiling.
+- **P3 (recursive MERA denoiser) BUILT + BENCHMARKED** — `mera_denoiser.hpp` (encode disentangle+coarsen
+  to a tiny top, decode broadcast+skip+refine; total attention `O(N·w)` linear), `[mera_denoiser]` test,
+  `ch32_hier_ceiling --model mera`. **The compute wall is GONE:** MERA holds ~50K tok/s roughly constant
+  N=1024→8192 (linear), **22× faster than hier at N=8192** where hier's `O((N/c)²)` coarse pass has
+  collapsed; crossover ~N=4096 (below it hier's single coarse pass has less overhead). MERA's residual
+  ceiling (~16384 thrash / 32768 OOM) is **memory, not compute** — the training autograd graph's linear-
+  but-large activations; separable via gradient checkpointing (training) and absent at inference. P3's
+  core claim validated. See [`2E_RESULTS.md`](2E_RESULTS.md) §P3.
 
 **Resume order after 1c:** **P2** (gist conditioning: content-word `is_content` table + IB-pooling +
 feudal training) → **P3** (MERA log-depth, gated on the M3 gap). Plus ungated side probe 4a (holographic
