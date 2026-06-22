@@ -39,14 +39,56 @@
          padding:6px 9px; font-size:12px; color:var(--fg); max-width:320px; display:none; z-index:10; }
   #tip .k { color:var(--mut); }
   #drop { padding:8px 16px; color:var(--mut); font-size:12px; }
+  .mut { color:var(--mut); }
+  details#gen { border-bottom:1px solid var(--line); background:#11151b; }
+  details#gen > summary { padding:9px 16px; cursor:pointer; font-size:13px; user-select:none; }
+  .genbody { padding:4px 16px 12px; display:flex; flex-direction:column; gap:7px; }
+  .genbody .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .genbody label { color:var(--mut); font-size:12px; }
+  .genbody input[type=text], .genbody input[type=number], .genbody select {
+    background:#0e1116; color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:4px 7px; font:12px system-ui; }
+  .genbody input[type=number] { width:78px; }
+  .slotbtn { font-variant-numeric:tabular-nums; }
+  .slotbtn.active { border-color:var(--acc); color:var(--acc); }
+  .cell.diverge { box-shadow:inset 0 0 0 1px #d2992288; }
 </style>
 </head>
 <body>
 <header>
-  <h1>sub0llm — diffusion "thought process" scrubber <span style="color:var(--mut);font-weight:400">(Viz Phase B — true per-level activations)</span></h1>
+  <h1>sub0llm — diffusion "thought process" scrubber <span style="color:var(--mut);font-weight:400">(Viz Phase C — live prompt + param A/B)</span></h1>
   <div class="meta" id="meta">load a trace to begin…</div>
 </header>
-<div id="drop">trace: <input type="file" id="file" accept="application/json"> &nbsp;(or serve the repo root and it auto-loads <code>./trace.json</code>)</div>
+<div id="drop">trace: <input type="file" id="file" accept="application/json"> &nbsp;(static file; or use the live server panel below)</div>
+
+<!-- Phase C: prompt box + sampler/model knobs + A/B generate (needs ch32_viz_server). -->
+<details id="gen" open>
+<summary>live generation &amp; A/B compare <span class="mut">(requires <code>ch32_viz_server</code>)</span></summary>
+<div class="genbody">
+  <div class="row"><label>server</label><input id="srv" type="text" value="" placeholder="(same origin)" style="flex:1">
+    <span id="srvStat" class="mut">?</span><button id="ping">health</button></div>
+  <div class="row"><label>prompt</label><input id="prompt" type="text" placeholder="(optional — seeds the canvas front)" style="flex:1"></div>
+  <div class="row">
+    <label>seq_len</label><input id="k_seq" type="number" value="128" min="8" step="1">
+    <label>temperature</label><input id="k_temp" type="number" value="0.9" min="0" step="0.05">
+    <label>conf_thr</label><input id="k_conf" type="number" value="0.9" min="0" max="1" step="0.05">
+    <label>min_commit</label><input id="k_mcf" type="number" value="0.03" min="0" max="1" step="0.01">
+  </div>
+  <div class="row">
+    <label>commit</label><select id="k_order"><option value="spread">spread</option><option value="confidence">confidence</option></select>
+    <label>remask</label><input id="k_remask" type="number" value="0" min="0" max="1" step="0.05">
+    <label>seed</label><input id="k_seed" type="number" value="3" step="1">
+    <button id="genA">▷ generate → A</button><button id="genB">▷ generate → B</button>
+    <span id="genStat" class="mut"></span>
+  </div>
+  <div class="row" id="slots">
+    <span>showing:</span>
+    <button id="focusA" class="slotbtn">A —</button>
+    <button id="focusB" class="slotbtn">B —</button>
+    <label style="margin-left:auto"><input type="checkbox" id="diffChk"> mark A↔B divergence</label>
+  </div>
+  <div id="cmp" class="mut"></div>
+</div>
+</details>
 <div class="controls">
   <button id="play">▶ play</button>
   <button id="prev">◀</button>
@@ -109,6 +151,7 @@ function renderFrame(){
     if(remasked)  d.className+=' remask';
     d.textContent = glyph(masked ? (f.predicted[i] && f.predicted[i]!=='·' ? f.predicted[i] : '·') : f.tokens[i]);
     if(masked && f.confidence[i]>0) d.style.background=confColor(f.confidence[i]);
+    if($('#diffChk').checked && DIVERGE && DIVERGE.has(i)) d.classList.add('diverge');
     d.dataset.tip = `<span class="k">pos</span> ${i}  <span class="k">conf</span> ${f.confidence[i]?.toFixed(3)}  <span class="k">entropy</span> ${f.entropy[i]?.toFixed(3)}<br>`+
                     `<span class="k">token</span> ${JSON.stringify(f.tokens[i])}  <span class="k">predicted</span> ${JSON.stringify(f.predicted[i])}<br>`+
                     `${masked?'masked':'settled'}${committed?' · committed-here':''}${remasked?' · remasked-here':''}`;
@@ -203,9 +246,59 @@ document.addEventListener('mousemove', e=>{
   tip.style.top=(e.clientY+14)+'px';
 });
 
+// ── Phase C: live generation + A/B compare (drives ch32_viz_server) ────────────
+const SLOTS={A:null,B:null}; let focus='A', DIVERGE=null;
+function srvBase(){ return ($('#srv').value.trim() || location.origin).replace(/\/$/,''); }
+function knobBody(){ return {
+  prompt:$('#prompt').value, seq_len:+$('#k_seq').value, temperature:+$('#k_temp').value,
+  conf_threshold:+$('#k_conf').value, min_commit_frac:+$('#k_mcf').value,
+  remask_threshold:+$('#k_remask').value, commit_order:$('#k_order').value, seed:+$('#k_seed').value }; }
+async function ping(){
+  try{ const r=await fetch(srvBase()+'/health'); const j=await r.json();
+       $('#srvStat').textContent=r.ok?`ok · vocab ${j.vocab} · levels [${j.levels}]`:'error'; }
+  catch(e){ $('#srvStat').textContent='unreachable'; } }
+function finalTokens(t){ return t? t.frames[t.frames.length-1].tokens : null; }
+function tps(t){ let ms=0,tok=0; for(const f of t.frames){ms+=f.ms||0;tok+=f.committed_count||0;} return ms>0?tok/(ms/1000):0; }
+function computeDiverge(){
+  const a=finalTokens(SLOTS.A), b=finalTokens(SLOTS.B);
+  if(!a||!b){ DIVERGE=null; return; }
+  const n=Math.min(a.length,b.length); DIVERGE=new Set();
+  for(let i=0;i<n;i++) if(a[i]!==b[i]) DIVERGE.add(i); }
+function renderCompare(){
+  const a=SLOTS.A,b=SLOTS.B;
+  if(!a||!b){ $('#cmp').textContent=(a||b)?'generate the other slot to A/B compare':''; return; }
+  computeDiverge();
+  const m=Math.min(finalTokens(a).length,finalTokens(b).length);
+  $('#cmp').innerHTML =
+    `<b>A</b> ${a.meta.n_frames} iters · ${tps(a).toFixed(0)} tok/s · T=${a.meta.T} (temp ${a.meta.temperature}, ${a.meta.commit_order}) `+
+    `&nbsp;|&nbsp; <b>B</b> ${b.meta.n_frames} iters · ${tps(b).toFixed(0)} tok/s · T=${b.meta.T} (temp ${b.meta.temperature}, ${b.meta.commit_order}) `+
+    `&nbsp;→&nbsp; <b>${DIVERGE?DIVERGE.size:0}/${m}</b> final tokens differ (tick the box to mark them on the canvas)`; }
+function refreshSlots(){
+  $('#focusA').textContent='A '+(SLOTS.A?`(${SLOTS.A.meta.n_frames}it)`:'—');
+  $('#focusB').textContent='B '+(SLOTS.B?`(${SLOTS.B.meta.n_frames}it)`:'—');
+  $('#focusA').classList.toggle('active',focus==='A'); $('#focusB').classList.toggle('active',focus==='B');
+  $('#focusA').disabled=!SLOTS.A; $('#focusB').disabled=!SLOTS.B; renderCompare(); }
+async function genTo(slot){
+  $('#genStat').textContent='generating '+slot+'…';
+  try{
+    const r=await fetch(srvBase()+'/v1/generate_trace',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(knobBody())});
+    const t=await r.json();
+    if(!r.ok) throw new Error(t.error||('HTTP '+r.status));
+    SLOTS[slot]=t; focus=slot; $('#genStat').textContent=`${slot}: ${t.meta.n_frames} iters`;
+    refreshSlots(); setTrace(t);
+  }catch(e){ $('#genStat').textContent='✗ '+e.message; } }
+$('#ping').onclick=ping;
+$('#genA').onclick=()=>genTo('A'); $('#genB').onclick=()=>genTo('B');
+$('#focusA').onclick=()=>{ if(SLOTS.A){focus='A';refreshSlots();setTrace(SLOTS.A);} };
+$('#focusB').onclick=()=>{ if(SLOTS.B){focus='B';refreshSlots();setTrace(SLOTS.B);} };
+$('#diffChk').onchange=()=>renderFrame();
+refreshSlots();
+
 (async()=>{ await loadGlossary();
   try { const r=await fetch('../../tools/viz/trace.json').catch(()=>null) || await fetch('./trace.json');
-        if(r && r.ok) setTrace(await r.json()); } catch(e){ /* use the file picker */ }
+        if(r && r.ok) setTrace(await r.json()); } catch(e){ /* use the file picker / live server */ }
+  ping();  // probe the server panel on load (same origin by default)
 })();
 </script>
 </body>

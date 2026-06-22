@@ -8,9 +8,9 @@
 
 namespace sub0diff::viz {
 
-std::size_t write_trace_json(const GenerationTrace& trace, const std::string& path,
-                             const std::function<std::string(std::int32_t)>& token_str,
-                             std::int32_t mask_id) {
+std::string serialize_trace_json(const GenerationTrace& trace,
+                                 const std::function<std::string(std::int32_t)>& token_str,
+                                 std::int32_t mask_id) {
     using nlohmann::json;
     auto tok = [&](std::int32_t id) { return id == mask_id ? std::string("·") : token_str(id); };
     auto r3  = [](float v) { return std::round(v * 1000.0f) / 1000.0f; };  // 3-dp for compactness
@@ -57,10 +57,15 @@ std::size_t write_trace_json(const GenerationTrace& trace, const std::string& pa
         }
         j["frames"].push_back(std::move(jf));
     }
+    return j.dump();
+}
 
+std::size_t write_trace_json(const GenerationTrace& trace, const std::string& path,
+                             const std::function<std::string(std::int32_t)>& token_str,
+                             std::int32_t mask_id) {
     std::ofstream os(path);
     if (!os) throw std::runtime_error("write_trace_json: cannot open " + path);
-    os << j.dump();
+    os << serialize_trace_json(trace, token_str, mask_id);
     return trace.frames.size();
 }
 

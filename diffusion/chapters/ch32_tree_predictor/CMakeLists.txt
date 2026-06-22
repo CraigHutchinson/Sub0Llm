@@ -29,3 +29,8 @@ target_link_libraries(ch32_mera_mixedn PRIVATE sub0diff)
 # Viz Phase A: generate a traced passage -> tools/viz/trace.json for the web scrubber.
 add_executable(ch32_viz_gen viz_gen.cpp)
 target_link_libraries(ch32_viz_gen PRIVATE sub0diff)
+
+# Viz Phase C: interactive server — trains a MERA once, serves POST /v1/generate_trace + the static
+# viewer so the web UI can drive generation live (prompt box + param knobs + A/B trace diff).
+add_executable(ch32_viz_server viz_server.cpp)
+target_link_libraries(ch32_viz_server PRIVATE sub0diff httplib)

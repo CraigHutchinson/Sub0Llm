@@ -11,8 +11,14 @@
 
 namespace sub0diff::viz {
 
-// Write `trace` to `path` as JSON. token_str(id) → the display string for a token id (decoded word);
-// positions equal to mask_id render as a mask placeholder. Returns the number of frames written.
+// Serialise `trace` to a JSON string. token_str(id) → the display string for a token id (decoded word);
+// positions equal to mask_id render as a mask placeholder. Used by both the file writer and the
+// Phase-C server endpoint (which returns it directly over HTTP).
+std::string serialize_trace_json(const GenerationTrace& trace,
+                                 const std::function<std::string(std::int32_t)>& token_str,
+                                 std::int32_t mask_id);
+
+// Write `trace` to `path` as JSON (calls serialize_trace_json). Returns the number of frames written.
 std::size_t write_trace_json(const GenerationTrace& trace, const std::string& path,
                              const std::function<std::string(std::int32_t)>& token_str,
                              std::int32_t mask_id);

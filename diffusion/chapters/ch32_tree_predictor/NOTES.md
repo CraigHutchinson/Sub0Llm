@@ -89,3 +89,14 @@
   returns {} → viewer falls back to derived). Each Frame carries `level_rms` (one array per level, order
   = `meta.levels`); the hierarchy panel renders real activation magnitude (violet) when present. Validated:
   trace `level_rms` shapes `[128,32]` match `levels`; 52/52 tests green.
+- **Viz Phase C** — interactive `ch32_viz_server`: trains a MERA once, serves `GET /health` +
+  `POST /v1/generate_trace` (prompt + sampler/model knobs → fresh GenerationTrace) + the static viewer
+  (mounts repo root, so one process, no Python). Viewer gained a live-generation panel + **A/B compare**
+  (generate two settings, mark canvas divergence, iters/tok-s/divergent-count summary). Request parsing
+  uses **simdjson on-demand directly** (forward, single-pass: `JsonFields` registers a typed handler per
+  key, then walks the object once — no DOM/random-access), per the project JSON-read direction; trace
+  serialization stays nlohmann (simdjson doesn't emit). `seq_len` snaps to a valid pyramid length so a
+  knob never 500s. Validated on native CPU: valid/defaults/error(400) paths + prompt seeding all correct.
+  Toolchain note: the clang/CUDA tree can't link httplib (clang++ GNU driver rejects bare `ws2_32.lib`
+  positionals); the **native (Release CPU)** build links fine and trains the small viz model in seconds,
+  so `--device cpu` is the supported path until that pre-existing toolchain issue is addressed.

@@ -1,12 +1,34 @@
-# sub0llm Viz — diffusion "thought process" scrubber (Phase B)
+# sub0llm Viz — diffusion "thought process" scrubber (Phase C)
 
 Replay a MERA/flat diffusion generation **iteration-by-iteration**: watch the canvas snap into focus,
-see per-position confidence/entropy, the MERA **level hierarchy**, **timing**, and a **settled tok/s**
-metric. Tooltips for terms/acronyms come from [`/ACRONYMS.json`](../../ACRONYMS.json).
+see per-position confidence/entropy, the MERA **level hierarchy** (true per-level activations), **timing**,
+and a **settled tok/s** metric. With the live server (Phase C) you can also **set a prompt + sampler/model
+knobs and generate on the fly**, and **A/B compare** two settings (same prompt+seed) to see how a parameter
+reshapes the trajectory. Tooltips for terms/acronyms come from [`/ACRONYMS.json`](../../ACRONYMS.json).
 
 See the design: [`diffusion/VISUALIZATION_DESIGN.md`](../../diffusion/VISUALIZATION_DESIGN.md).
 
-## How to run
+## Two ways to run
+
+### A) Live server — prompt box + param A/B (Phase C, recommended)
+
+One process trains a small MERA once, then serves both the API and the viewer. **No Python needed.**
+
+```bash
+# Release CPU build links cleanly everywhere and trains the small model in seconds:
+cmake --build build-native --target ch32_viz_server
+./build-native/diffusion/chapters/ch32_tree_predictor/ch32_viz_server.exe --device cpu --port 8080
+#   --device cuda  trains on GPU (needs a CUDA build; the clang/CUDA tree currently can't link
+#                  httplib — use --device cpu on the native build until that toolchain issue is fixed)
+#   --steps S  --seq_len N (also the trained MAX length)  --coarsen c  --window w  --embed_dim D
+```
+
+Then open **http://localhost:8080/tools/viz/** — the page auto-detects the server (same origin). Use the
+**live generation** panel: type a prompt, set the knobs, click **generate → A**, change a knob, click
+**generate → B**, then tick **mark A↔B divergence** to see exactly where the two trajectories differ on
+the canvas. The compare line reports iters / settled tok/s / divergent-token count for A vs B.
+
+### B) Static trace file — offline scrubber (Phase A/B)
 
 **1. Build the trace generator** (CUDA build; needs the MSVC env, see project CLAUDE.md):
 
