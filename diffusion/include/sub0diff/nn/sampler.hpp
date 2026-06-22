@@ -24,6 +24,7 @@
 // to Ch29's one-step recovery numbers.
 
 #include "sub0diff/nn/denoiser.hpp"
+#include "sub0diff/viz/trace.hpp"
 #include "sub0llm/core/tensor.hpp"
 
 #include <algorithm>
@@ -99,7 +100,8 @@ template <class Model>
 SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
                            const SamplerConfig& cfg, std::mt19937& rng,
                            const std::function<void(std::span<const std::int32_t>,
-                                                    std::size_t)>& on_iter = {}) {
+                                                    std::size_t)>& on_iter = {},
+                           viz::GenerationTrace* trace = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::size_t T = canvas.size();
     const std::int32_t mask_id = model.mask_id();
@@ -118,6 +120,7 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
     std::vector<std::uint8_t> fixed(T);
     for (std::size_t i = 0; i < T; ++i) fixed[i] = (canvas[i] != mask_id);
 
+    std::vector<std::int32_t> prev;   // canvas at the START of an iter (for the trace before/after diff)
     SamplerStats stats;
     for (std::size_t iter = 0; iter < max_iters; ++iter) {
         std::size_t n_masked = 0;
@@ -127,6 +130,8 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
         }
         if (n_masked == 0) break;
         ++stats.iterations;
+        const auto it0 = std::chrono::steady_clock::now();
+        if (trace) prev.assign(canvas.begin(), canvas.end());
 
         const float noise = static_cast<float>(n_masked) / static_cast<float>(T);
         auto logits = model.forward(input, noise);
@@ -169,11 +174,38 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
             entropy_sum += entropy;
         }
 
+        // Build a trace Frame from the before(prev)/after(canvas) diff + this iter's per-position
+        // confidence/entropy/prediction (the data the loop already has). committed = newly filled this
+        // iter; remasked = re-opened this iter.
+        auto record_frame = [&] {
+            if (!trace) return;
+            viz::Frame fr;
+            fr.iter = static_cast<int>(stats.iterations);
+            fr.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it0).count();
+            fr.tokens.assign(canvas.begin(), canvas.end());
+            fr.predicted.assign(canvas.begin(), canvas.end());
+            fr.masked.resize(T); fr.committed.resize(T); fr.remasked.resize(T);
+            fr.confidence.assign(T, 0.0f); fr.entropy.assign(T, 0.0f);
+            for (std::size_t i = 0; i < T; ++i) {
+                fr.masked[i]    = static_cast<std::uint8_t>(canvas[i] == mask_id);
+                fr.committed[i] = static_cast<std::uint8_t>(prev[i] == mask_id && canvas[i] != mask_id);
+                fr.remasked[i]  = static_cast<std::uint8_t>(prev[i] != mask_id && canvas[i] == mask_id);
+                fr.committed_count += fr.committed[i];
+            }
+            for (const auto& p : preds) {
+                fr.confidence[p.pos] = p.conf;
+                fr.entropy[p.pos]    = p.entropy;
+                fr.predicted[p.pos]  = p.token;
+            }
+            trace->frames.push_back(std::move(fr));
+        };
+
         const double mean_entropy = entropy_sum / static_cast<double>(preds.size());
         if (mean_entropy < cfg.entropy_bound) {
             for (const auto& p : preds) canvas[p.pos] = p.token;
             stats.committed += preds.size();
             stats.entropy_stopped = true;
+            record_frame();
             if (on_iter) on_iter(canvas, stats.iterations);
             break;
         }
@@ -231,6 +263,7 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
             for (std::size_t k = 0; k < std::min(cap, doubts.size()); ++k)
                 canvas[doubts[k].pos] = mask_id;
         }
+        record_frame();
         if (on_iter) on_iter(canvas, stats.iterations);
     }
 

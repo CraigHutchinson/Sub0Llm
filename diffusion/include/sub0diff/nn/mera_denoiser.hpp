@@ -120,6 +120,8 @@ public:
     [[nodiscard]] std::int64_t n_levels()    const noexcept { return max_levels_ + 1; }
     // levels for a specific N (≤ max) — what forward(N) actually uses.
     [[nodiscard]] std::int64_t n_levels_for(std::int64_t N) const { return static_cast<std::int64_t>(compute_lens(N).size()); }
+    // the level-length pyramid forward(N) uses: [N, N/c, …, top] (coarse-to-fine; for the Viz).
+    [[nodiscard]] std::vector<std::int64_t> level_lens(std::int64_t N) const { return compute_lens(N); }
 
 private:
     // The level-length pyramid for a sequence of length N: [N, N/c, N/c², …] down to the first ≤ w.

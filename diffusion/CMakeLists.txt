@@ -12,6 +12,7 @@ add_library(sub0diff STATIC
     src/recovery.cpp
     src/oov_cliff.cpp
     src/topic_drift.cpp
+    src/viz_trace.cpp
     src/sampler.cpp
     src/model_io.cpp
     src/run_config.cpp

@@ -1,0 +1,56 @@
+#include "sub0diff/viz/trace_json.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <fstream>
+#include <stdexcept>
+
+namespace sub0diff::viz {
+
+std::size_t write_trace_json(const GenerationTrace& trace, const std::string& path,
+                             const std::function<std::string(std::int32_t)>& token_str,
+                             std::int32_t mask_id) {
+    using nlohmann::json;
+    auto tok = [&](std::int32_t id) { return id == mask_id ? std::string("·") : token_str(id); };
+    auto r3  = [](float v) { return std::round(v * 1000.0f) / 1000.0f; };  // 3-dp for compactness
+
+    json j;
+    j["version"]   = 1;
+    j["meta"] = {
+        {"T", trace.T}, {"prompt", trace.prompt}, {"model", trace.model},
+        {"commit_order", trace.commit_order}, {"temperature", trace.temperature},
+        {"conf_threshold", trace.conf_threshold}, {"min_commit_frac", trace.min_commit_frac},
+        {"remask_threshold", trace.remask_threshold}, {"N", trace.N}, {"c", trace.c}, {"w", trace.w},
+        {"levels", trace.levels},
+        {"n_frames", static_cast<std::int64_t>(trace.frames.size())},
+    };
+    j["frames"] = json::array();
+    for (const auto& f : trace.frames) {
+        json jf;
+        jf["iter"] = f.iter;
+        jf["ms"] = std::round(f.ms * 100.0) / 100.0;
+        jf["committed_count"] = f.committed_count;
+        json toks = json::array(), pred = json::array();
+        for (auto id : f.tokens)    toks.push_back(tok(id));
+        for (auto id : f.predicted) pred.push_back(tok(id));
+        jf["tokens"]     = std::move(toks);
+        jf["predicted"]  = std::move(pred);
+        jf["masked"]     = f.masked;       // 0/1 arrays
+        jf["committed"]  = f.committed;
+        jf["remasked"]   = f.remasked;
+        json conf = json::array(), ent = json::array();
+        for (auto v : f.confidence) conf.push_back(r3(v));
+        for (auto v : f.entropy)    ent.push_back(r3(v));
+        jf["confidence"] = std::move(conf);
+        jf["entropy"]    = std::move(ent);
+        j["frames"].push_back(std::move(jf));
+    }
+
+    std::ofstream os(path);
+    if (!os) throw std::runtime_error("write_trace_json: cannot open " + path);
+    os << j.dump();
+    return trace.frames.size();
+}
+
+}  // namespace sub0diff::viz

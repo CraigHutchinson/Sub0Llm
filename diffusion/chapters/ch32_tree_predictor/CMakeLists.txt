@@ -25,3 +25,7 @@ target_link_libraries(ch32_hier_ceiling PRIVATE sub0diff)
 # P3 mixed-N training: variable-N MERA robustness across lengths.
 add_executable(ch32_mera_mixedn mera_mixedn.cpp)
 target_link_libraries(ch32_mera_mixedn PRIVATE sub0diff)
+
+# Viz Phase A: generate a traced passage -> tools/viz/trace.json for the web scrubber.
+add_executable(ch32_viz_gen viz_gen.cpp)
+target_link_libraries(ch32_viz_gen PRIVATE sub0diff)
