@@ -78,25 +78,27 @@ static void apply_cli(RunConfig& cfg, int argc, char** argv) {
     }
 }
 
-// Pre-scan only for --ckpt-dir, so we know where to look for run_config.json BEFORE the
-// full layered apply (the CLI location wins over any default/saved value for the lookup).
-[[nodiscard]] static std::string scan_ckpt_dir(int argc, char** argv, std::string fallback) {
+// Pre-scan for an EXPLICIT --ckpt-dir (returns "" if absent). We layer in a saved run_config.json ONLY
+// from an explicit dir — see resolve().
+[[nodiscard]] static std::string scan_explicit_ckpt_dir(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i)
         if (std::string_view(argv[i]) == "--ckpt-dir") return argv[i + 1];
-    return fallback;
+    return {};
 }
 
 RunConfig resolve(int argc, char** argv) {
     RunConfig cfg;   // 1. compiled-in defaults
 
-    // 2. load run_config.json from the resolved checkpoint dir, if present
-    const std::string ckpt_dir = scan_ckpt_dir(argc, argv, cfg.data.ckpt_dir);
-    if (auto doc = cfgns::JsonDoc::parse_file(fs::path(ckpt_dir) / "run_config.json")) {
-        cfgns::load_json(cfg, *doc);
-        cfg.data.ckpt_dir = ckpt_dir;   // the dir we loaded from is authoritative
-    }
+    // 2. Layer a saved run_config.json ONLY from an EXPLICIT --ckpt-dir (a deliberate resume). A bare
+    //    default/scratch dir must NOT inject its (possibly stale) config into a fresh run — that silently
+    //    overrode --name runs with leftover geometry from a prior experiment in /tmp. A --name resume
+    //    reloads config from its own provenance dir later (run_main), once config_sha pins the dir name.
+    const std::string explicit_ckpt = scan_explicit_ckpt_dir(argc, argv);
+    if (!explicit_ckpt.empty())
+        if (auto doc = cfgns::JsonDoc::parse_file(fs::path(explicit_ckpt) / "run_config.json"))
+            cfgns::load_json(cfg, *doc);
 
-    // 3. command-line overrides (each explicit flag wins over default and saved value)
+    // 3. command-line overrides (each explicit flag wins over default and saved value; --ckpt-dir too)
     apply_cli(cfg, argc, argv);
 
     // Validation — the one combination the trainer cannot honour.
