@@ -80,6 +80,24 @@
 
 ## Done
 
+- **Robust resumable CUDA MERA trainer** (`ch32_mera_train`) — reuses the Ch29 consistent config layer
+  (`sub0diff::config::RunConfig`) + binary checkpoint format. `--ckpt-dir X` ALONE reconstructs the exact
+  arch from `run_config.json` (added BuildTime fields `model_type`/`mera_coarsen`/`mera_window`), reloads
+  the latest `step_*.ckpt` + matching `step_*.opt` Adam moments, and continues. Validated on GPU: train
+  0→400 (ckpt@200,400), then resume with only `--ckpt-dir` → rebuilt `MeraDenoiser V=1285 D=256 c=4 w=64`,
+  loaded step 400, restored optimizer, continued 400→600 at ~37 steps/s. `GpuTrainer` templatized on Model
+  (was Denoiser-only) for reuse. Two real bugs fixed en route:
+  - **ch32 targets never called `sub0llm_apply_compile_options()`** (chapter-wide) → the executables
+    missed AVX2/SIMD flags AND `SUB0LLM_CUDA` was undefined in their own TUs (so `#ifdef SUB0LLM_CUDA`
+    device guards compiled the no-CUDA branch). Now applied to all ch32 targets.
+  - **optimizer-before-`to(cuda)` ordering**: building Adam while params are on CPU then moving the model
+    to GPU left Adam's (m,v) on the host → device-mismatch illegal access. Fixed: load-on-CPU →
+    `to(cuda)` → build optimizer; and re-snapshot the param Variable-list at each save (Variable::to swaps
+    storage, staling an up-front snapshot). NOTE: GpuTrainer's 13-arg masked-loss path illegal-accessed on
+    MERA (the plain 7-arg `batched_diffusion_loss` is fine on GPU) — the lean trainer uses the 7-arg loop;
+    whole-word/contiguous masking on MERA+GPU is an open follow-up.
+- `init_cpu_compute()` (FTZ+DAZ) added to all new ch32 mains (`mera_train`/`viz_gen`/`viz_train`/
+  `viz_server`) + the server's per-request httplib worker thread (per-thread MXCSR).
 - `sum_squares` per-step cudaMalloc/cudaFree → persistent static scalar (commit 0f30f0e).
 - Corrected: the `*_bench` multi-malloc functions are microbenchmarks, not the training hot path.
 - MERA end-to-end generation works (templated sampler); generation-M2 vs flat measured (noisy, above).

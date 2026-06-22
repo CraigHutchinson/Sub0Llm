@@ -21,12 +21,16 @@
 
 namespace sub0diff::train {
 
+// Templated on the model type so the SAME single-GPU-stream trainer drives the flat Denoiser AND the
+// hierarchical MeraDenoiser (Ch32) — it only touches `model` through batched_diffusion_loss, which is
+// itself templated on Model. Construct as GpuTrainer<dn::Denoiser>{...} or GpuTrainer<dn::MeraDenoiser>{...}.
+template <class Model>
 class GpuTrainer : public ITrainer {
 public:
     // `model` must already be on CUDA; `master_params` = model.parameters() (also on CUDA, the same
     // pointers the caller's optimizer steps). Knobs mirror ParallelTrainer's so behaviour matches a
     // W=1 CPU step (minus the multi-worker reduce, which is a no-op for a single stream).
-    GpuTrainer(nn::Denoiser& model, std::vector<sub0llm::autograd::Variable*> master_params,
+    GpuTrainer(Model& model, std::vector<sub0llm::autograd::Variable*> master_params,
                std::int64_t seq_len, float t_min, float t_max, std::uint64_t seed,
                std::int64_t batch_size, bool shared_t, bool exact_count,
                std::span<const std::uint8_t> is_word_start, bool whole_word, bool contiguous)
@@ -62,7 +66,7 @@ public:
         const auto t1 = std::chrono::steady_clock::now();
 
         TrainStepResult r;
-        r.mean_loss     = res.loss.data().item<float>();   // D2H scalar (item() brings to host)
+        r.mean_loss     = res.loss.data().template item<float>();   // D2H scalar (item() brings to host)
         r.masked_tokens = res.n_masked;
         r.last_t        = res.mean_t;
         r.compute_s     = std::chrono::duration<double>(t1 - t0).count();
@@ -70,7 +74,7 @@ public:
     }
 
 private:
-    nn::Denoiser&                              model_;
+    Model&                                     model_;
     std::vector<sub0llm::autograd::Variable*>  params_;
     BatchedDiffusionLossContext                bctx_;
     std::mt19937                               rng_;

@@ -40,16 +40,25 @@ struct Model {
     std::int64_t  d_ff       = 1024;  // 4·D
     std::int64_t  n_heads    = 8;     // head_dim = D/n_heads = 32
     std::int64_t  n_kv_heads = 4;     // 2:1 GQA
+    // Architecture family (BuildTime). "flat" = the vanilla Denoiser (n_layers blocks). "mera" = the
+    // recursive coarsen/refine MeraDenoiser (Ch32 P3): coarsen by `mera_coarsen` per level down to a top
+    // level ≤ `mera_window`; n_layers is unused by MERA (its depth ≈ 2·levels+1 derives from seq_len).
+    std::string   model_type   = "flat";   // flat | mera
+    std::int64_t  mera_coarsen = 4;        // MERA coarsen factor c per level
+    std::int64_t  mera_window  = 64;       // MERA local window / top-level size w
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
-        v("vocab_size", Scope::BuildTime, self.vocab_size, "real vocabulary size");
-        v("seq_len",    Scope::BuildTime, self.seq_len,    "canvas length T");
-        v("embed_dim",  Scope::BuildTime, self.embed_dim,  "residual width D");
-        v("n_layers",   Scope::BuildTime, self.n_layers,   "transformer blocks");
-        v("d_ff",       Scope::BuildTime, self.d_ff,       "FFN hidden width (4*D)");
-        v("n_heads",    Scope::BuildTime, self.n_heads,    "attention heads");
-        v("n_kv_heads", Scope::BuildTime, self.n_kv_heads, "KV heads (GQA)");
+        v("vocab_size",   Scope::BuildTime, self.vocab_size,   "real vocabulary size");
+        v("seq_len",      Scope::BuildTime, self.seq_len,      "canvas length T");
+        v("embed_dim",    Scope::BuildTime, self.embed_dim,    "residual width D");
+        v("n_layers",     Scope::BuildTime, self.n_layers,     "transformer blocks (flat)");
+        v("d_ff",         Scope::BuildTime, self.d_ff,         "FFN hidden width (4*D)");
+        v("n_heads",      Scope::BuildTime, self.n_heads,      "attention heads");
+        v("n_kv_heads",   Scope::BuildTime, self.n_kv_heads,   "KV heads (GQA)");
+        v("model_type",   Scope::BuildTime, self.model_type,   "flat|mera architecture family");
+        v("mera_coarsen", Scope::BuildTime, self.mera_coarsen, "MERA coarsen factor c per level");
+        v("mera_window",  Scope::BuildTime, self.mera_window,  "MERA local window / top size w");
     }
 };
 

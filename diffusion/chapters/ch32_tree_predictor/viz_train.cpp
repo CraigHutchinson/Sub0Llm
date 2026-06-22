@@ -18,6 +18,7 @@
 #include "sub0diff/viz/trace_json.hpp"
 
 #include "sub0llm/core/ops.hpp"
+#include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ)
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
@@ -67,6 +68,7 @@ std::string arg_s(int argc, char** argv, const std::string& k, const std::string
 }  // namespace
 
 int main(int argc, char** argv) {
+    sub0llm::init_cpu_compute();   // FTZ+DAZ (training-throughput prerequisite)
     const std::string corpus  = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
     const std::string out     = arg_s(argc, argv, "--out", "tools/viz/trajectory.json");
     const std::string prompt_text = arg_s(argc, argv, "--prompt", "once there was a");

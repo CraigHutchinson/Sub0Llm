@@ -21,6 +21,7 @@
 #include "sub0diff/viz/trace_json.hpp"
 
 #include "sub0llm/core/ops.hpp"
+#include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ) — main + each httplib worker thread
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
@@ -181,6 +182,7 @@ int main(int argc, char** argv) {
     const std::string devs    = arg_s(argc, argv, "--device", "cuda");   // cuda (fast) | cpu (no GPU)
     const sub0llm::Device train_dev = devs == "cpu" ? sub0llm::Device::cpu() : sub0llm::Device::cuda();
 
+    sub0llm::init_cpu_compute();   // FTZ+DAZ on the main thread
     std::println("== Ch32 Viz server (Phase C) ==");
     auto paras = read_paragraphs(corpus, plimit);
     if (paras.size() < 20) throw std::runtime_error("need >=20 paragraphs");
@@ -217,6 +219,7 @@ int main(int argc, char** argv) {
     // POST /v1/generate_trace {prompt, seq_len, temperature, conf_threshold, min_commit_frac,
     //   remask_threshold, entropy_bound, commit_order:"confidence"|"spread", seed} -> GenerationTrace JSON.
     srv.Post("/v1/generate_trace", [&](const httplib::Request& req, httplib::Response& res) {
+        sub0llm::init_cpu_compute();   // FTZ+DAZ on THIS httplib worker thread (per-thread MXCSR state)
         try {
             // Defaults, then a single forward pass fills whatever keys the request actually sent.
             dn::SamplerConfig cfg;

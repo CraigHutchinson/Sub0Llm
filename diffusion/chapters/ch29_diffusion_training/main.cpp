@@ -724,7 +724,7 @@ static int run(int argc, char** argv) {
         // identical for both: set_t_range() + step().
         std::unique_ptr<dt::ITrainer> pool;
         if (use_cuda) {
-            pool = std::make_unique<dt::GpuTrainer>(
+            pool = std::make_unique<dt::GpuTrainer<dn::Denoiser>>(
                 model, param_ptrs, cfg.model.seq_len, 0.02f, cfg.optim.t_max, 1234 + start_step,
                 static_cast<std::int64_t>(cfg.optim.batch), cfg.optim.shared_t, cfg.optim.exact_noise,
                 ws_span, cfg.optim.whole_word, cfg.optim.contiguous);
