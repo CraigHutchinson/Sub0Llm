@@ -68,6 +68,16 @@ std::vector<std::string> word_to_chars(std::string_view word) {
     return chars;
 }
 
+// TODO(tokenizer-normalization, later): two orthographic-noise sources still split a word's statistics
+// across tokens — (1) curly vs straight quotes (U+2019 ’ vs ' → "Billy’s" and "Billy's" are distinct
+// ids); (2) TRAILING apostrophes from closing quotes ("Monster'", "Nibbles'") that this splitter keeps
+// welded (the rule deliberately keeps th'/dogs'). A normalization pass (NFKC-style ’→', drop ambiguous
+// trailing quotes) is the quick win but it BREAKS the lossless decode∘encode invariant this file
+// guarantees — so it's a deliberate design change, not a free fix. The deeper lever is FACTORED tokens:
+// one id per lemma + separable attribute axes (case / number / possession / tense) collapsed during
+// learning — see the `tokenizer-normalization-and-factored-tokens` memory. Don't fold either into a
+// model mid-training (it changes the vocab → requires a retrain).
+//
 // Split raw text into word-level tokens for word_level(): a "word" is a maximal run of
 // ASCII letters and apostrophes (ASCII ' or the curly U+2019, so "I'll"/"th'" stay whole);
 // a "number" is a run of ASCII digits; every whitespace char and every other code point
