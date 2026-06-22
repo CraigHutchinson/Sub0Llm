@@ -96,6 +96,14 @@
   <input type="range" id="slider" min="0" max="0" value="0">
   <span id="frameLbl">frame – / –</span>
 </div>
+<div id="traj" style="display:none">
+  <div class="controls">
+    <span class="mut" style="min-width:96px">training step</span>
+    <button id="tprev">◀</button><button id="tnext">▶</button>
+    <input type="range" id="tslider" min="0" max="0" value="0">
+    <span id="tLbl" class="mut" style="min-width:200px"></span>
+  </div>
+</div>
 <div id="metrics"></div>
 <div id="layers"><h2 id="layersHdr">hierarchy</h2><div id="layerRows"></div></div>
 <div id="canvas"></div>
@@ -223,6 +231,22 @@ function setTrace(t){
   TRACE._rmsMax = mx;
   renderMeta(); renderFrame();
 }
+
+// Phase D: a training-trajectory artifact wraps many GenerationTraces tagged by training step.
+let TRAJ=null, ti=0;
+function loadAny(obj){
+  if(obj && obj.kind==='training_trajectory') setTrajectory(obj);
+  else { TRAJ=null; $('#traj').style.display='none'; setTrace(obj); }
+}
+function setTrajectory(t){
+  TRAJ=t; ti=0; $('#traj').style.display='block'; $('#tslider').max=t.snapshots.length-1; showSnap(0);
+}
+function showSnap(i){
+  ti=Math.max(0,Math.min(TRAJ.snapshots.length-1,i));
+  const s=TRAJ.snapshots[ti]; $('#tslider').value=ti;
+  $('#tLbl').textContent=`step ${s.step} · ${term('NELBO')} ${(+s.nelbo).toFixed(3)}  (${ti+1}/${TRAJ.snapshots.length})`;
+  setTrace(s.trace);
+}
 function step(d){ if(!TRACE) return; fi=Math.max(0,Math.min(TRACE.frames.length-1,fi+d)); renderFrame(); }
 
 $('#slider').oninput = e => { fi=+e.target.value; renderFrame(); };
@@ -234,7 +258,10 @@ $('#play').onclick = function(){
   timer=setInterval(()=>{ if(fi>=TRACE.frames.length-1){ clearInterval(timer); timer=null; $('#play').textContent='▶ play'; } else step(1); }, 450);
 };
 $('#file').onchange = e => { const f=e.target.files[0]; if(!f) return; const r=new FileReader();
-  r.onload=()=>{ try{ setTrace(JSON.parse(r.result)); }catch(err){ alert('bad trace JSON: '+err); } }; r.readAsText(f); };
+  r.onload=()=>{ try{ loadAny(JSON.parse(r.result)); }catch(err){ alert('bad JSON: '+err); } }; r.readAsText(f); };
+$('#tslider').oninput = e => showSnap(+e.target.value);
+$('#tprev').onclick = ()=>showSnap(ti-1);
+$('#tnext').onclick = ()=>showSnap(ti+1);
 
 // shared tooltip for both cells (data-tip) and glossary terms (data-tip)
 const tip=$('#tip');
@@ -286,6 +313,7 @@ async function genTo(slot){
     const t=await r.json();
     if(!r.ok) throw new Error(t.error||('HTTP '+r.status));
     SLOTS[slot]=t; focus=slot; $('#genStat').textContent=`${slot}: ${t.meta.n_frames} iters`;
+    TRAJ=null; $('#traj').style.display='none';   // live single-trace supersedes any loaded trajectory
     refreshSlots(); setTrace(t);
   }catch(e){ $('#genStat').textContent='✗ '+e.message; } }
 $('#ping').onclick=ping;
@@ -296,8 +324,10 @@ $('#diffChk').onchange=()=>renderFrame();
 refreshSlots();
 
 (async()=>{ await loadGlossary();
-  try { const r=await fetch('../../tools/viz/trace.json').catch(()=>null) || await fetch('./trace.json');
-        if(r && r.ok) setTrace(await r.json()); } catch(e){ /* use the file picker / live server */ }
+  // prefer a training trajectory if present, else a single trace; either way use the file picker / server otherwise
+  for(const url of ['./trajectory.json','../../tools/viz/trajectory.json','./trace.json','../../tools/viz/trace.json']){
+    try{ const r=await fetch(url); if(r && r.ok){ loadAny(await r.json()); break; } }catch(e){}
+  }
   ping();  // probe the server panel on load (same origin by default)
 })();
 </script>

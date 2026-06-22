@@ -100,3 +100,12 @@
   Toolchain note: the clang/CUDA tree can't link httplib (clang++ GNU driver rejects bare `ws2_32.lib`
   positionals); the **native (Release CPU)** build links fine and trains the small viz model in seconds,
   so `--device cpu` is the supported path until that pre-existing toolchain issue is addressed.
+- **Viz Phase D** — training-time trajectory (`ch32_viz_train`): snapshots a FIXED prompt+seed traced
+  generation every K steps during training → `trajectory.json` ({meta, snapshots:[{step,nelbo,trace}]}),
+  reusing `serialize_trace_json` per snapshot. Viewer detects `kind:"training_trajectory"` and shows a
+  **training-step slider** above the iteration scrubber (only the model changes between steps, so it's a
+  clean learning view). Validated on native CPU: 7 snapshots, NELBO 7.92→2.39 (learning ✓), step-1 text
+  is unigram mush vs later structured prose; each snapshot trace carries `level_rms [128,32]`. Size note:
+  per-frame `level_rms` dominates (3.4 MB for 7×65 frames) — if snapshot count grows, drop/subsample
+  `level_rms` in trajectory mode. Open item: NELBO curve wobbles mid-run (t-averaged diffusion variance,
+  cf. `diffusion-nelbo-ceiling-reframe`) — a per-t eval curve would read cleaner.

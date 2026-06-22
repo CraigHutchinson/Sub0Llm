@@ -97,7 +97,7 @@ The payoff the user asked for: **see how parameter changes reshape the thought p
 | **A** | iteration timeline JSON + web scrubber (canvas + confidence heatmap + commit order) | extend `refine_canvas` `on_iter` to emit a Frame | watch diffusion "snap into focus"; smallest, highest ratio | **done** (64bc494) |
 | **B** | MERA per-level internals (true per-slot activation RMS per level) | opt-in slot-RMS capture on `MeraDenoiser::forward` + ADL `capture_levels` | see the tiered hierarchy think | **done** (4b7d24e) |
 | **C** | prompt box + param knobs + A/B trace diff | `ch32_viz_server` `POST /v1/generate_trace` (simdjson on-demand reads) | parameter-adjustment comparison; verbosity slider | **done** |
-| **D** | training-time trajectory replay across checkpoints | checkpoint-tagged traces | watch it learn | pending |
+| **D** | training-time trajectory replay (step-tagged traces) | `ch32_viz_train` snapshots a fixed prompt+seed generation every K steps | watch it learn | **done** |
 
 ## 7. Data-volume notes (so it stays cheap)
 

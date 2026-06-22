@@ -34,3 +34,8 @@ target_link_libraries(ch32_viz_gen PRIVATE sub0diff)
 # viewer so the web UI can drive generation live (prompt box + param knobs + A/B trace diff).
 add_executable(ch32_viz_server viz_server.cpp)
 target_link_libraries(ch32_viz_server PRIVATE sub0diff httplib)
+
+# Viz Phase D: training-time trajectory — snapshot a fixed-prompt traced generation every K steps so the
+# viewer can scrub across training and watch the same prompt's denoising sharpen as the model learns.
+add_executable(ch32_viz_train viz_train.cpp)
+target_link_libraries(ch32_viz_train PRIVATE sub0diff)

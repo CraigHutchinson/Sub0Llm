@@ -60,6 +60,23 @@ python -m http.server 8000        # any static server works; this is just the si
 or **(b)** open `tools/viz/index.html` directly and click **“trace”** to load `tools/viz/trace.json`
 with the file picker (tooltips need the served route).
 
+### C) Training trajectory — watch it learn (Phase D)
+
+Snapshot a fixed-prompt+seed traced generation every K steps during training, so you can scrub a
+**training-step** axis and watch the same prompt's denoising sharpen as the model learns:
+
+```bash
+cmake --build build-native --target ch32_viz_train
+./build-native/diffusion/chapters/ch32_tree_predictor/ch32_viz_train.exe \
+  --device cpu --steps 3000 --snap-every 300 --seq_len 128 --prompt "once there was a"
+#   -> writes tools/viz/trajectory.json (self-check prints per-snapshot nelbo + text)
+```
+
+Serve the repo root and open the page; it auto-loads `trajectory.json` and shows a **training step**
+slider above the iteration scrubber. Because the prompt and seed are fixed, only the model changes
+between steps — early snapshots are noisy unigram mush, later ones structured prose, and the per-step
+**NELBO** is shown as the model improves.
+
 ## What you see
 
 - **Scrub bar / play** — drag across refine iterations; the canvas fills in commit order.
