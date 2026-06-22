@@ -25,13 +25,13 @@
 //   --threads N       worker threads for concurrent requests (default: 4)
 //   --seed N          base RNG seed; each request uses seed+request_count (default: 42)
 
+#include "sub0llm/http/server.hpp"
 #include "sub0llm/nn/checkpoint.hpp"
 #include "sub0llm/nn/gguf_loader.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"
 #include "sub0llm/nn/sampler.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -319,7 +319,7 @@ std::string unix_time_str() {
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
-void handle_health(const httplib::Request&, httplib::Response& res,
+void handle_health(const sub0llm::http::Request&, sub0llm::http::Response& res,
                    const InferenceEngine& eng) {
     const nlohmann::json body = {
         {"status",  "ok"},
@@ -330,7 +330,7 @@ void handle_health(const httplib::Request&, httplib::Response& res,
     res.set_content(body.dump(), "application/json");
 }
 
-void handle_models(const httplib::Request&, httplib::Response& res,
+void handle_models(const sub0llm::http::Request&, sub0llm::http::Response& res,
                    const InferenceEngine& eng) {
     const nlohmann::json body = {
         {"object", "list"},
@@ -345,7 +345,7 @@ void handle_models(const httplib::Request&, httplib::Response& res,
     res.set_content(body.dump(), "application/json");
 }
 
-void handle_completions(const httplib::Request& req, httplib::Response& res,
+void handle_completions(const sub0llm::http::Request& req, sub0llm::http::Response& res,
                          InferenceEngine& eng) {
     nlohmann::json j;
     try {
@@ -397,7 +397,7 @@ void handle_completions(const httplib::Request& req, httplib::Response& res,
     res.set_content(body.dump(), "application/json");
 }
 
-void handle_chat_completions(const httplib::Request& req, httplib::Response& res,
+void handle_chat_completions(const sub0llm::http::Request& req, sub0llm::http::Response& res,
                               InferenceEngine& eng) {
     nlohmann::json j;
     try {
@@ -468,33 +468,29 @@ int main(int argc, char** argv) {
     InferenceEngine engine(cfg.model_dir, cfg.model_file, cfg.seed);
 
     // Build server
-    httplib::Server svr;
-    svr.new_task_queue = [&cfg] {
-        return new httplib::ThreadPool(static_cast<std::size_t>(cfg.threads));
-    };
-
-    svr.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
-        handle_health(req, res, engine);
-    });
-
-    svr.Get("/v1/models", [&](const httplib::Request& req, httplib::Response& res) {
-        handle_models(req, res, engine);
-    });
-
-    svr.Post("/v1/completions", [&](const httplib::Request& req, httplib::Response& res) {
-        handle_completions(req, res, engine);
-    });
-
-    svr.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
-        handle_chat_completions(req, res, engine);
-    });
+    sub0llm::http::Server svr;
 
     // CORS for browser clients / curl --json
-    svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
+    svr.set_pre_routing_handler([](const sub0llm::http::Request&, sub0llm::http::Response& res) {
         res.set_header("Access-Control-Allow-Origin",  "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
-        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.Get("/health", [&](const sub0llm::http::Request& req, sub0llm::http::Response& res) {
+        handle_health(req, res, engine);
+    });
+
+    svr.Get("/v1/models", [&](const sub0llm::http::Request& req, sub0llm::http::Response& res) {
+        handle_models(req, res, engine);
+    });
+
+    svr.Post("/v1/completions", [&](const sub0llm::http::Request& req, sub0llm::http::Response& res) {
+        handle_completions(req, res, engine);
+    });
+
+    svr.Post("/v1/chat/completions", [&](const sub0llm::http::Request& req, sub0llm::http::Response& res) {
+        handle_chat_completions(req, res, engine);
     });
 
     std::cerr << std::format("sub0llm-server listening on {}:{}\n", cfg.host, cfg.port);
@@ -503,7 +499,7 @@ int main(int argc, char** argv) {
     std::cerr << "  GET  /health\n";
     std::cerr << "  GET  /v1/models\n";
 
-    if (!svr.listen(cfg.host, cfg.port)) {
+    if (!svr.listen(cfg.host, cfg.port, cfg.threads)) {
         std::cerr << std::format("Failed to bind {}:{}\n", cfg.host, cfg.port);
         return 1;
     }

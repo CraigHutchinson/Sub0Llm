@@ -270,10 +270,11 @@ int run_main(int argc, char** argv) {
         cj << std::format(
             "{{\n  \"model\": \"sub0diff-{}\",\n  \"model_type\": \"{}\",\n  \"vocab_size\": {},\n"
             "  \"embed_dim\": {},\n  \"n_layers\": {},\n  \"n_heads\": {},\n  \"n_kv_heads\": {},\n"
-            "  \"d_ff\": {},\n  \"seq_len\": {},\n  \"mera_coarsen\": {},\n  \"mera_window\": {}\n}}\n",
+            "  \"d_ff\": {},\n  \"seq_len\": {},\n  \"mera_coarsen\": {},\n  \"mera_window\": {},\n"
+            "  \"mera_gated_pool\": {}\n}}\n",
             cfg.model.model_type, cfg.model.model_type, V, cfg.model.embed_dim, cfg.model.n_layers,
             cfg.model.n_heads, cfg.model.n_kv_heads, cfg.model.d_ff, cfg.model.seq_len,
-            cfg.model.mera_coarsen, cfg.model.mera_window);
+            cfg.model.mera_coarsen, cfg.model.mera_window, cfg.model.mera_gated_pool);
         std::println("fresh run — wrote tokenizer/ + config.json to {}", cfg.data.ckpt_dir);
     } else {
         std::println("resuming from {}", resume_ckpt);
@@ -285,9 +286,11 @@ int run_main(int argc, char** argv) {
     if (cfg.model.model_type == "mera") {
         dn::MeraDenoiser model(V, cfg.model.embed_dim, static_cast<std::size_t>(cfg.model.n_heads),
                                static_cast<std::size_t>(cfg.model.n_kv_heads), cfg.model.mera_coarsen,
-                               cfg.model.mera_window, cfg.model.seq_len, cfg.model.d_ff, cfg.optim.seed);
-        std::println("MeraDenoiser: V={} D={} c={} w={} levels={}", V, cfg.model.embed_dim,
+                               cfg.model.mera_window, cfg.model.seq_len, cfg.model.d_ff, cfg.optim.seed,
+                               cfg.model.mera_gated_pool);
+        std::println("MeraDenoiser: V={} D={} c={} w={} pool={} levels={}", V, cfg.model.embed_dim,
                      cfg.model.mera_coarsen, cfg.model.mera_window,
+                     cfg.model.mera_gated_pool ? "gated" : "mean",
                      [&]{ std::string s; for (auto l : model.level_lens(cfg.model.seq_len)) s += std::format("{} ", l); return s; }());
         return run(model, cfg, train_ids, eval_ids, ws_span);
     }

@@ -9,6 +9,10 @@
 // work) and the API — no separate Python static server needed. Generation is serialized behind a mutex
 // (the model/autograd graph is not re-entrant); fine for an interactive single-user tool.
 //
+// Uses Boost.Beast (sync HTTP) + Boost.ASIO for the server — one thread per connection, serialized
+// generation. Static files are served directly from disk via beast::http::file_body. Path traversal
+// is rejected at the segment level before any filesystem access occurs.
+//
 // Build: cmake --build build-cuda --target ch32_viz_server   (CUDA build trains fast at startup)
 // Run:   ./build-cuda/diffusion/chapters/ch32_tree_predictor/ch32_viz_server.exe --port 8080
 // Open:  http://localhost:8080/tools/viz/
@@ -23,29 +27,40 @@
 #include "sub0diff/viz/trace_json.hpp"
 
 #include "sub0llm/core/ops.hpp"
-#include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ) — main + each httplib worker thread
+#include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ) — main + each Beast worker thread
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 
-#include <httplib.h>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <simdjson.h>   // direct on-demand (forward, single-pass) request-body parsing
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <format>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <print>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+
+namespace beast = boost::beast;
+namespace http  = beast::http;
+namespace net   = boost::asio;
+using tcp       = net::ip::tcp;
 
 using sub0llm::BPETokenizer;
 namespace dn = sub0diff::nn;
@@ -173,8 +188,96 @@ std::vector<std::int64_t> levels_of(const Model& m, std::int64_t N) {
     else return {N};
 }
 
+// ── Static-file helpers ──────────────────────────────────────────────────────
+
+// MIME type from file extension (covers all assets used by tools/viz/).
+std::string_view mime_type(const std::filesystem::path& p) {
+    const auto ext = p.extension().string();
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".js")                    return "application/javascript";
+    if (ext == ".css")                   return "text/css";
+    if (ext == ".json")                  return "application/json";
+    if (ext == ".png")                   return "image/png";
+    if (ext == ".svg")                   return "image/svg+xml";
+    if (ext == ".ico")                   return "image/x-icon";
+    if (ext == ".woff2")                 return "font/woff2";
+    if (ext == ".woff")                  return "font/woff";
+    return "application/octet-stream";
+}
+
+// Resolve a URL path to a real file under `webroot`.
+// Returns nullopt if the path contains a traversal attempt or the resolved file does not exist.
+// Security: each path segment is inspected; any ".." is rejected outright (not silently skipped)
+// to prevent directory traversal (OWASP A01). Drive-letter segments are also rejected on Windows.
+std::optional<std::filesystem::path>
+resolve_path(std::string_view target_view, const std::filesystem::path& webroot) {
+    namespace fs = std::filesystem;
+
+    // Strip query string and fragment
+    std::string tpath{target_view};
+    for (char delim : {'?', '#'}) {
+        if (auto pos = tpath.find(delim); pos != std::string::npos)
+            tpath.resize(pos);
+    }
+
+    // Walk URL segments and build a safe relative path.
+    fs::path rel;
+    for (const auto& part : fs::path(tpath)) {
+        const auto seg = part.string();
+        if (seg == "/" || seg == "\\") continue;   // root / separator
+        if (seg == ".")                continue;   // current dir — skip
+        if (seg == "..")               return std::nullopt;   // traversal — hard reject
+        if (seg.find(':') != std::string::npos) return std::nullopt;  // Windows drive letter
+        rel /= part;
+    }
+
+    const auto candidate   = webroot / rel;
+    const auto canon_root  = fs::weakly_canonical(webroot);
+    const auto canon_cand  = fs::weakly_canonical(candidate);
+
+    // Defense-in-depth: canonical path must stay within the webroot tree
+    if (canon_cand.string().rfind(canon_root.string(), 0) != 0) return std::nullopt;
+
+    // Directory index
+    const auto resolved = fs::is_directory(canon_cand) ? canon_cand / "index.html" : canon_cand;
+    if (!fs::exists(resolved)) return std::nullopt;
+    return resolved;
+}
+
+// ── Beast response helpers ───────────────────────────────────────────────────
+
+// Write a JSON string-body response to `sock`.
+void send_json(tcp::socket& sock, unsigned version, bool keep_alive,
+               http::status status, std::string body, beast::error_code& ec) {
+    http::response<http::string_body> res{status, version};
+    res.set(http::field::server, "sub0diff/1.0");
+    res.set(http::field::content_type, "application/json");
+    res.keep_alive(keep_alive);
+    res.body() = std::move(body);
+    res.prepare_payload();
+    http::write(sock, res, ec);
+}
+
+// Stream a file to `sock` using Beast's file_body (zero-copy on most platforms).
+// Returns false (and sets ec) if the file cannot be opened.
+bool send_file(tcp::socket& sock, unsigned version, bool keep_alive,
+               const std::filesystem::path& fspath, beast::error_code& ec) {
+    beast::error_code fec;
+    http::response<http::file_body> res{http::status::ok, version};
+    res.set(http::field::server, "sub0diff/1.0");
+    res.set(http::field::content_type, mime_type(fspath));
+    res.keep_alive(keep_alive);
+    res.body().open(fspath.string().c_str(), beast::file_mode::scan, fec);
+    if (fec) { ec = fec; return false; }
+    res.prepare_payload();
+    http::write(sock, res, ec);
+    return !ec;
+}
+
+// ── HTTP server (Beast sync, thread-per-connection) ──────────────────────────
+
 // The HTTP server, templated on the model type so it serves a loaded/trained MERA or a flat Denoiser
-// identically (both satisfy the refine_canvas sampler). `model` must be on CPU. Blocks in listen().
+// identically (both satisfy the refine_canvas sampler). `model` must be on CPU. Blocks in accept loop.
 template <class Model>
 int serve(Model& model, BPETokenizer& tok, std::int64_t Vr, const std::string& model_type,
           std::int64_t maxN, std::int64_t c, std::int64_t w,
@@ -188,93 +291,164 @@ int serve(Model& model, BPETokenizer& tok, std::int64_t Vr, const std::string& m
                  [&]{ std::string s; for (auto l : levels_of(model, maxN)) s += std::format("{} ", l); return s; }());
 
     std::mutex gen_mtx;  // serialize generation (model + autograd graph are not re-entrant)
-    httplib::Server srv;
 
-    srv.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
-        std::string lv;
-        for (auto l : levels_of(model, maxN)) { if (!lv.empty()) lv += ','; lv += std::format("{}", l); }
-        res.set_content(std::format(
-            R"({{"status":"ok","model":"{}","vocab":{},"max_seq_len":{},"coarsen":{},"window":{},"levels":[{}]}})",
-            model_type, Vr, maxN, c, w, lv), "application/json");
-    });
+    namespace fs = std::filesystem;
+    const fs::path webroot_path = fs::weakly_canonical(fs::path(webroot));
 
-    // POST /v1/generate_trace {prompt, seq_len, temperature, conf_threshold, min_commit_frac,
-    //   remask_threshold, entropy_bound, commit_order:"confidence"|"spread", seed} -> GenerationTrace JSON.
-    srv.Post("/v1/generate_trace", [&](const httplib::Request& req, httplib::Response& res) {
-        sub0llm::init_cpu_compute();   // FTZ+DAZ on THIS httplib worker thread (per-thread MXCSR state)
-        try {
-            // Defaults, then a single forward pass fills whatever keys the request actually sent.
-            dn::SamplerConfig cfg;
-            cfg.temperature = 0.9f;
-            std::int64_t seq_len = maxN;
-            std::uint64_t rseed = 7;
-            std::string prompt_text, order = "spread";
-            JsonFields fields;
-            fields.f64("temperature", cfg.temperature)
-                  .f64("conf_threshold", cfg.conf_threshold)
-                  .f64("min_commit_frac", cfg.min_commit_frac)
-                  .f64("remask_threshold", cfg.remask_threshold)
-                  .f64("entropy_bound", cfg.entropy_bound)
-                  .i64("seq_len", seq_len)
-                  .u64("seed", rseed)
-                  .str("prompt", prompt_text)
-                  .str("commit_order", order);
-            if (!fields.read(req.body.empty() ? "{}" : req.body))
-                throw std::runtime_error("request body is not valid JSON");
-            cfg.commit_order = (order == "spread") ? dn::CommitOrder::Spread : dn::CommitOrder::Confidence;
+    // Per-connection session. Runs on a detached thread; captures model context by reference which is
+    // safe because serve() never returns while any connection thread is alive.
+    auto session = [&](tcp::socket sock) {
+        sub0llm::init_cpu_compute();   // FTZ+DAZ on THIS Beast worker thread (per-thread MXCSR state)
+        beast::flat_buffer buf;
+        beast::error_code ec;
 
-            // Snap N down to the nearest length the model accepts (MERA needs a valid pyramid; flat any
-            // N), so a knob never 500s.
-            auto valid = [&](std::int64_t n) {
-                if (n <= 0) return false;
-                if constexpr (requires { model.level_lens(n); }) {
-                    try { (void)model.level_lens(n); return true; } catch (...) { return false; }
-                } else return true;
-            };
-            std::int64_t N = std::min(maxN, seq_len);
-            while (N > 0 && !valid(N)) --N;
-            if (N <= 0) throw std::runtime_error("no valid seq_len <= requested");
+        for (;;) {
+            http::request<http::string_body> req;
+            http::read(sock, buf, req, ec);
+            if (ec) break;
 
-            std::vector<std::int32_t> prompt;
-            if (!prompt_text.empty()) {
-                auto enc = tok.encode(prompt_text);
-                for (auto t : enc) if (t >= 0 && t < Vr && static_cast<std::int64_t>(prompt.size()) < N) prompt.push_back(t);
+            const auto     version    = req.version();
+            const bool     keep_alive = req.keep_alive();
+            const auto     target     = req.target();
+
+            // ── GET / → redirect to viewer ───────────────────────────────
+            if (req.method() == http::verb::get && target == "/") {
+                http::response<http::string_body> res{http::status::temporary_redirect, version};
+                res.set(http::field::server, "sub0diff/1.0");
+                res.set(http::field::location, "/tools/viz/");
+                res.keep_alive(keep_alive);
+                res.prepare_payload();
+                http::write(sock, res, ec);
+            }
+            // ── GET /health ───────────────────────────────────────────────
+            else if (req.method() == http::verb::get && target == "/health") {
+                std::string lv;
+                for (auto l : levels_of(model, maxN)) { if (!lv.empty()) lv += ','; lv += std::format("{}", l); }
+                send_json(sock, version, keep_alive, http::status::ok,
+                    std::format(R"({{"status":"ok","model":"{}","vocab":{},"max_seq_len":{},"coarsen":{},"window":{},"levels":[{}]}})",
+                        model_type, Vr, maxN, c, w, lv), ec);
+            }
+            // ── POST /v1/generate_trace ───────────────────────────────────
+            else if (req.method() == http::verb::post && target == "/v1/generate_trace") {
+                std::string    payload;
+                http::status   status = http::status::ok;
+                try {
+                    dn::SamplerConfig cfg;
+                    cfg.temperature = 0.9f;
+                    std::int64_t  seq_len = maxN;
+                    std::uint64_t rseed   = 7;
+                    std::string prompt_text, order = "spread";
+                    JsonFields fields;
+                    fields.f64("temperature",      cfg.temperature)
+                          .f64("conf_threshold",   cfg.conf_threshold)
+                          .f64("min_commit_frac",  cfg.min_commit_frac)
+                          .f64("remask_threshold", cfg.remask_threshold)
+                          .f64("entropy_bound",    cfg.entropy_bound)
+                          .i64("seq_len",          seq_len)
+                          .u64("seed",             rseed)
+                          .str("prompt",           prompt_text)
+                          .str("commit_order",     order);
+                    const auto& body_str = req.body();
+                    if (!fields.read(body_str.empty() ? "{}" : body_str))
+                        throw std::runtime_error("request body is not valid JSON");
+                    cfg.commit_order = (order == "spread") ? dn::CommitOrder::Spread : dn::CommitOrder::Confidence;
+
+                    // Snap N down to the nearest length the model accepts (MERA needs a valid pyramid;
+                    // flat accepts any N), so a knob never 500s.
+                    auto valid = [&](std::int64_t n) {
+                        if (n <= 0) return false;
+                        if constexpr (requires { model.level_lens(n); }) {
+                            try { (void)model.level_lens(n); return true; } catch (...) { return false; }
+                        } else return true;
+                    };
+                    std::int64_t N = std::min(maxN, seq_len);
+                    while (N > 0 && !valid(N)) --N;
+                    if (N <= 0) throw std::runtime_error("no valid seq_len <= requested");
+
+                    std::vector<std::int32_t> prompt;
+                    if (!prompt_text.empty()) {
+                        auto enc = tok.encode(prompt_text);
+                        for (auto t : enc)
+                            if (t >= 0 && t < Vr && static_cast<std::int64_t>(prompt.size()) < N)
+                                prompt.push_back(t);
+                    }
+
+                    dv::GenerationTrace trace;
+                    trace.T = N; trace.model = model_type; trace.N = N; trace.c = c; trace.w = w;
+                    trace.commit_order    = (cfg.commit_order == dn::CommitOrder::Spread) ? "spread" : "confidence";
+                    trace.temperature     = cfg.temperature;
+                    trace.conf_threshold  = cfg.conf_threshold;
+                    trace.min_commit_frac = cfg.min_commit_frac;
+                    trace.remask_threshold = cfg.remask_threshold;
+                    trace.prompt  = prompt_text;
+                    trace.levels  = levels_of(model, N);
+
+                    {
+                        std::scoped_lock lk(gen_mtx);
+                        std::mt19937 rng(static_cast<std::uint32_t>(rseed * 131 + 5));
+                        auto canvas = dn::make_canvas(model, N, prompt);
+                        dn::refine_canvas(model, canvas, cfg, rng, {}, &trace);
+                        payload = dv::serialize_trace_json(trace, decode, mask_id);
+                    }
+                } catch (const std::exception& e) {
+                    status  = http::status::bad_request;
+                    payload = std::format(R"({{"error":"{}"}})", jesc(e.what()));
+                }
+                send_json(sock, version, keep_alive, status, std::move(payload), ec);
+            }
+            // ── GET <anything else> → static file ────────────────────────
+            else if (req.method() == http::verb::get) {
+                if (auto fspath = resolve_path(target, webroot_path)) {
+                    if (!send_file(sock, version, keep_alive, *fspath, ec)) {
+                        send_json(sock, version, keep_alive, http::status::not_found,
+                            std::format(R"({{"error":"file not found: {}"}})", jesc(target)), ec);
+                    }
+                } else {
+                    send_json(sock, version, keep_alive, http::status::not_found,
+                        std::format(R"({{"error":"not found: {}"}})", jesc(target)), ec);
+                }
+            }
+            // ── Anything else ─────────────────────────────────────────────
+            else {
+                http::response<http::string_body> res{http::status::method_not_allowed, version};
+                res.set(http::field::server, "sub0diff/1.0");
+                res.set(http::field::allow, "GET, POST");
+                res.keep_alive(keep_alive);
+                res.prepare_payload();
+                http::write(sock, res, ec);
             }
 
-            dv::GenerationTrace trace;
-            trace.T = N; trace.model = model_type; trace.N = N; trace.c = c; trace.w = w;
-            trace.commit_order = (cfg.commit_order == dn::CommitOrder::Spread) ? "spread" : "confidence";
-            trace.temperature = cfg.temperature; trace.conf_threshold = cfg.conf_threshold;
-            trace.min_commit_frac = cfg.min_commit_frac; trace.remask_threshold = cfg.remask_threshold;
-            trace.prompt = prompt_text;
-            trace.levels = levels_of(model, N);
-
-            std::string payload;
-            {
-                std::scoped_lock lk(gen_mtx);
-                std::mt19937 rng(static_cast<std::uint32_t>(rseed * 131 + 5));
-                auto canvas = dn::make_canvas(model, N, prompt);
-                dn::refine_canvas(model, canvas, cfg, rng, {}, &trace);
-                payload = dv::serialize_trace_json(trace, decode, mask_id);
-            }
-            res.set_content(payload, "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(std::format(R"({{"error":"{}"}})", jesc(e.what())), "application/json");
+            if (ec || !keep_alive) break;
         }
-    });
 
-    // static viewer + glossary (mount repo root so /tools/viz/ and /ACRONYMS.json resolve)
-    if (!srv.set_mount_point("/", webroot))
-        std::println("WARN: could not mount static webroot '{}' (API still works)", webroot);
-    srv.Get("/", [](const httplib::Request&, httplib::Response& res) { res.set_redirect("/tools/viz/"); });
+        beast::error_code shut_ec;
+        sock.shutdown(tcp::socket::shutdown_send, shut_ec);
+    };
+
+    // ── Accept loop ──────────────────────────────────────────────────────────
+    net::io_context ioc{1};
+    tcp::acceptor   acceptor{ioc, {net::ip::make_address(host), static_cast<unsigned short>(port)}};
+    acceptor.set_option(net::socket_base::reuse_address(true));
 
     std::println("\nserving on http://{}:{}", host, port);
     std::println("  open:   http://{}:{}/tools/viz/", host, port);
     std::println("  api:    POST http://{}:{}/v1/generate_trace", host, port);
     std::println("  health: GET  http://{}:{}/health", host, port);
-    std::fflush(stdout);   // flush the startup banner before listen() blocks (logs visible while serving)
-    if (!srv.listen(host, port)) { std::println("ERROR: failed to bind {}:{}", host, port); return 1; }
+    std::fflush(stdout);   // flush the startup banner before accept() blocks
+
+    for (;;) {
+        beast::error_code ec;
+        tcp::socket sock{ioc};
+        acceptor.accept(sock, ec);
+        if (ec) break;   // acceptor closed / interrupted — stop serving
+        // Spawn a detached thread per connection.  The session lambda captures model context by
+        // reference; serve() never returns while a connection thread could be alive, so the
+        // references remain valid.
+        std::thread([session, sock = std::move(sock)]() mutable {
+            session(std::move(sock));
+        }).detach();
+    }
+
     return 0;
 }
 
@@ -341,3 +515,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+

@@ -49,6 +49,13 @@ template <class Model>
     return {};
 }
 
+// Viz Phase E hook: the GIST readout (top/coarsest level decoded to tokens). Generic fallback = none;
+// MeraDenoiser supplies a same-namespace overload (ADL), like capture_levels above.
+template <class Model>
+[[nodiscard]] inline viz::GistReadout capture_gist(const Model&, std::span<const std::int32_t>) {
+    return {};
+}
+
 // Commit ORDER within an iteration (which confident positions to commit first).
 //   Confidence — pure most-confident-first (MaskGIT/LLaDA default).
 //   Spread     — 4b experiment (ch32): commit a spatially SPREAD coarse skeleton first (a
@@ -211,6 +218,8 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
             // falls back to the derived settled-fraction view). One extra forward per frame; fine for
             // the single traced passage the Viz records.
             fr.level_rms = capture_levels(model, std::span<const std::int32_t>(canvas));
+            // Phase E: the GIST (coarsest level) decoded to tokens for THIS frame (empty for flat).
+            fr.gist = capture_gist(model, std::span<const std::int32_t>(canvas));
             trace->frames.push_back(std::move(fr));
         };
 

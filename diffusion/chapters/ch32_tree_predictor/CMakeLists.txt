@@ -32,8 +32,11 @@ target_link_libraries(ch32_viz_gen PRIVATE sub0diff)
 
 # Viz Phase C: interactive server — trains a MERA once, serves POST /v1/generate_trace + the static
 # viewer so the web UI can drive generation live (prompt box + param knobs + A/B trace diff).
+# Uses Boost.Beast + Boost.ASIO (sync) instead of httplib — compatible with the CUDA build toolchain.
+# Boost.ASIO headers emit #pragma comment(lib,"ws2_32.lib") for clang/MSVC so no explicit Winsock
+# target_link_libraries entry is needed; the pragma is honoured by lld-link automatically.
 add_executable(ch32_viz_server viz_server.cpp)
-target_link_libraries(ch32_viz_server PRIVATE sub0diff httplib)
+target_link_libraries(ch32_viz_server PRIVATE sub0diff Boost::beast Boost::system)
 
 # Viz Phase D: training-time trajectory — snapshot a fixed-prompt traced generation every K steps so the
 # viewer can scrub across training and watch the same prompt's denoising sharpen as the model learns.

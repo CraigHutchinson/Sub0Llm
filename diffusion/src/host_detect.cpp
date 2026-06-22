@@ -75,7 +75,7 @@ std::string detect_cpu_brand() {
     for (int i = 0; i < 3; ++i) {
         int regs[4] = {0, 0, 0, 0};
         sub0diff_cpuidex(regs, static_cast<int>(0x80000002u + static_cast<unsigned>(i)), 0);
-        __builtin_memcpy(brand + i * 16, regs, 16);
+        std::memcpy(brand + i * 16, regs, 16);
     }
     std::string s(brand);
     // trim leading spaces some vendors pad with

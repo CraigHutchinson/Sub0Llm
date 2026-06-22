@@ -14,6 +14,15 @@
 
 namespace sub0diff::viz {
 
+// The GIST readout: what the coarsest (top) MERA level compressed a canvas into, expressed in TOKEN
+// space. One entry per top-level slot, holding the top-k nearest token ids and their scores (the slot's
+// D-vector projected through the tied embedding head). A readable handle on the model's coarse "plan."
+struct GistReadout {
+    std::vector<std::vector<std::int32_t>> tokens;   // [slot][k] — top-k token ids
+    std::vector<std::vector<float>>        scores;   // [slot][k] — matching projection scores
+    [[nodiscard]] bool empty() const noexcept { return tokens.empty(); }
+};
+
 // One refine iteration. All per-position vectors are length T (the canvas length).
 struct Frame {
     int                       iter = 0;
@@ -32,6 +41,11 @@ struct Frame {
     // the per-slot RMS magnitude of that level's D-dim representation. Empty for models without a level
     // hierarchy (flat) — the viewer then falls back to the derived settled-fraction view.
     std::vector<std::vector<float>> level_rms;
+
+    // Phase E — the GIST readout for THIS frame's canvas: the top (coarsest) MERA level decoded into
+    // token space, so the scrubber can watch the coarse "plan" sharpen iteration-by-iteration. Empty
+    // for flat models. See GistReadout.
+    GistReadout gist;
 };
 
 // A whole generation. meta fields are set by the runner; frames by refine_canvas.

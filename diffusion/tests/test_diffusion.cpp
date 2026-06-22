@@ -527,6 +527,69 @@ TEST_CASE("MeraDenoiser recursive coarsen forward + trains (P3)", "[diffusion][m
     REQUIRE(last < first);                                        // the MERA stack learns
 }
 
+// Gated (boundary-aware / content-weighted) coarsening: with its score projection ZERO-INITIALISED, a
+// gated model's softmax-over-block weights are uniform ⇒ it must be BIT-IDENTICAL to the mean-pool model
+// at init (same seed). The A/B starts tied and only diverges as pool_proj_ learns. Also covers param
+// count (gated adds exactly one (1,D) tensor, appended last) and that it still trains.
+TEST_CASE("MeraDenoiser gated pool starts identical to mean-pool, then trains", "[diffusion][mera_denoiser]") {
+    using sub0diff::nn::MeraDenoiser;
+    const std::int64_t V = 24, D = 32, N = 64, c = 4, w = 8;
+    MeraDenoiser mean(V, D, 2, 2, c, w, N, 0, /*seed=*/5, /*gated_pool=*/false);
+    MeraDenoiser gate(V, D, 2, 2, c, w, N, 0, /*seed=*/5, /*gated_pool=*/true);
+    REQUIRE(gate.parameters().size() == mean.parameters().size() + 1);   // + pool_proj_ (appended last)
+
+    sub0llm::Tensor ids({N}, sub0llm::DType::Int32);
+    for (std::int64_t i = 0; i < N; ++i) ids.data_as<std::int32_t>()[i] = static_cast<std::int32_t>(i % V);
+    auto lm = mean.forward(ids, 0.5f), lg = gate.forward(ids, 0.5f);
+    const auto a = lm.data().data_as<float>(), b = lg.data().data_as<float>();
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) REQUIRE_THAT(a[i], WithinAbs(b[i], 1e-5f));
+
+    std::vector<std::int32_t> stream(static_cast<std::size_t>(8 * N));
+    for (std::size_t i = 0; i < stream.size(); ++i) stream[i] = static_cast<std::int32_t>(i % V);
+    auto params = gate.parameters();
+    sub0llm::nn::Adam opt(params, 1e-2f);
+    namespace dt = sub0diff::train;
+    dt::BatchedDiffusionLossContext ctx(2, N);
+    std::mt19937 rng(1);
+    std::uniform_int_distribution<std::size_t> off(0, stream.size() - static_cast<std::size_t>(N));
+    float first = 0.0f, last = 0.0f;
+    for (int s = 0; s < 25; ++s) {
+        std::vector<std::size_t> offs{off(rng), off(rng)};
+        for (auto* p : params)
+            if (p->grad().numel() > 0)
+                p->grad() = sub0llm::zeros(p->data().shape(), p->data().dtype(), p->data().device());
+        auto res = dt::batched_diffusion_loss(gate, stream, offs, rng, ctx, 0.1f, 1.0f);
+        res.loss.backward();
+        opt.step();
+        const float lv = res.loss.data().item<float>();
+        if (s == 0) first = lv; last = lv;
+    }
+    REQUIRE(std::isfinite(last));
+    REQUIRE(last < first);                                        // gated stack learns (pool_proj_ moves off 0)
+}
+
+// Gist readout (Viz Phase E): the coarsest level decoded to token space yields one entry per top slot,
+// each with `top_k` token ids (in valid range) and matching, descending scores.
+TEST_CASE("MeraDenoiser gist_readout decodes the top level to tokens", "[diffusion][mera_denoiser]") {
+    using sub0diff::nn::MeraDenoiser;
+    const std::int64_t V = 24, D = 32, N = 64, c = 4, w = 8;      // top level len = 4
+    MeraDenoiser model(V, D, 2, 2, c, w, N, 0, /*seed=*/5);
+    std::vector<std::int32_t> canvas(static_cast<std::size_t>(N), model.mask_id());
+    for (std::int64_t i = 0; i < N; i += 3) canvas[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(i % V);
+
+    const auto gist = model.gist_readout(canvas, /*top_k=*/3);
+    REQUIRE(gist.tokens.size() == 4);                            // top-level slot count (64→16→4)
+    REQUIRE(gist.scores.size() == gist.tokens.size());
+    for (std::size_t s = 0; s < gist.tokens.size(); ++s) {
+        REQUIRE(gist.tokens[s].size() == 3);
+        REQUIRE(gist.scores[s].size() == 3);
+        for (auto id : gist.tokens[s]) { REQUIRE(id >= 0); REQUIRE(id < V); }   // real tokens only, no [MASK]
+        REQUIRE(gist.scores[s][0] >= gist.scores[s][1]);        // descending (top-k order)
+        REQUIRE(gist.scores[s][1] >= gist.scores[s][2]);
+    }
+}
+
 // ── Ch32 P1: character-composition codec ───────────────────────────────────────────────────────
 // Validates the headline P1 claim (1a compose + 1b decode): compose→decode ROUND-TRIPS a word's
 // spelling, and the composed vector is ORDER-SENSITIVE (anagrams diverge) — the property that makes

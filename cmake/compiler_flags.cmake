@@ -1,6 +1,14 @@
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceCompiles)
 
+# ── Windows SDK target version ────────────────────────────────────────────────
+# Silence Boost.ASIO / WinSock "Assuming Windows 7" noise and unlock the full
+# Win10/11 API surface.  0x0A00 = Windows 10 and later (there is no distinct
+# value for Windows 11 in the SDK headers).
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 # ── Warning flags ─────────────────────────────────────────────────────────────
 set(SUB0LLM_WARNING_FLAGS)
 
@@ -31,7 +39,16 @@ if(SUB0LLM_ENABLE_NATIVE)
     # -march=native subsumes all individual SIMD flags.
     # We probe which ISA extensions the host CPU actually provides so the
     # SUB0LLM_AVX2 / SUB0LLM_AVX512 compile-time dispatch macros are correct.
+    # clang-cl (Clang with MSVC frontend) does not accept -march=native; detect
+    # via CMAKE_CXX_COMPILER_FRONTEND_VARIANT and fall through to the MSVC path.
+    set(_native_is_gnu_clang FALSE)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        if(NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            set(_native_is_gnu_clang TRUE)
+        endif()
+    endif()
+
+    if(_native_is_gnu_clang)
         set(CMAKE_REQUIRED_FLAGS "-march=native")
         check_cxx_source_compiles(
             "#ifndef __AVX2__\n#error no AVX2\n#endif\nint main(){}"
@@ -51,8 +68,20 @@ if(SUB0LLM_ENABLE_NATIVE)
         list(APPEND SUB0LLM_SIMD_FLAGS -march=native -mtune=native)
         message(STATUS
             "sub0llm: -march=native — avx2=${_native_has_avx2} avx512=${_native_has_avx512}")
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"
+           OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+               AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+        # MSVC and clang-cl do not support -march=native.  Apply /arch:AVX2 as
+        # the best available static equivalent; configure cuda-native from a VS
+        # Developer Prompt with clang++ in PATH for true -march=native tuning.
+        list(APPEND SUB0LLM_SIMD_FLAGS /arch:AVX2)
+        set(SUB0LLM_ENABLE_AVX2 ON CACHE BOOL "AVX2 fallback for MSVC native" FORCE)
+        message(STATUS
+            "sub0llm: SUB0LLM_ENABLE_NATIVE with MSVC/clang-cl — "
+            "-march=native unsupported; applying /arch:AVX2 instead.")
     else()
-        message(WARNING "sub0llm: SUB0LLM_ENABLE_NATIVE requires GCC/Clang; ignoring")
+        message(STATUS "sub0llm: SUB0LLM_ENABLE_NATIVE — compiler '${CMAKE_CXX_COMPILER_ID}' "
+            "does not support -march=native; no native SIMD flags applied.")
     endif()
 
 elseif(SUB0LLM_ENABLE_AVX512)

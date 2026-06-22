@@ -156,3 +156,22 @@
   per-frame `level_rms` dominates (3.4 MB for 7×65 frames) — if snapshot count grows, drop/subsample
   `level_rms` in trajectory mode. Open item: NELBO curve wobbles mid-run (t-averaged diffusion variance,
   cf. `diffusion-nelbo-ceiling-reframe`) — a per-t eval curve would read cleaner.
+- **Viz Phase E** — the GIST readout: the coarsest (top) MERA level decoded into token space. `forward`
+  optionally captures the top-level representation (the model’s compressed “plan”, `top_len` D-vectors);
+  `gist_readout()` projects each slot through the tied embedding head (x·Eᵀ over real tokens) and returns
+  the top-k tokens+scores per slot. An ADL `capture_gist()` hook feeds the templated sampler (flat → {});
+  each Frame carries `gist`, serialized as `gist_tokens`/`gist_scores`. The viewer overlays the top-1
+  token (amber) on the coarsest hierarchy row, full top-k on hover. **Finding (confirms the earlier scrub
+  observation):** on a lightly-trained model EVERY gist slot reads ' ' (whitespace) by a wide margin —
+  the coarse plan literally *is* whitespace, which is exactly why iteration 1 commits to spaces. The gist
+  view makes that failure mode legible, and is the natural success metric for boundary-aware coarsening.
+- **Boundary-aware coarsening (`--mera-gated-pool`, BuildTime A/B)** — the rigid mean-pool (every `c`
+  rows averaged equally; a block can straddle a sentence/word boundary and blur across it) gets a
+  content-weighted alternative: each `c`-block is combined by a softmax over a learned per-row score
+  (`pool_proj_`, a (1,D) projection), so a block spanning a boundary can down-weight the wrong side — a
+  soft, fixed-shape approximation of the “unbalanced tree”. `pool_proj_` is **zero-initialised**, so a
+  gated model starts **bit-identical** to mean-pool (unit-tested) and only learns to deviate — a clean
+  A/B. It’s a distinct architecture (own `config_sha` ⇒ own `models/` dir); `mera_gated_pool` rides the
+  consistent config layer (run_config + config.json), so resume/serve reconstruct it. Open: run the
+  matched A/B (gated vs mean) on TinyStories and read the gist — does the coarse plan stop collapsing to
+  whitespace / align to word boundaries? (The gist view above is the readout for that experiment.)

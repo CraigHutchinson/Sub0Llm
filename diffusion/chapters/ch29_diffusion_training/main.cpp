@@ -437,6 +437,15 @@ static int run(int argc, char** argv) {
     }
 
     fs::create_directories(cfg.data.ckpt_dir);
+    // TODO(checkpointer): this resume + the save_full lambda + the convergence check below predate
+    // sub0diff::train::Checkpointer (diffusion/include/sub0diff/train/checkpointer.hpp), which now owns
+    // the same three concerns — load_weights() → restore() (Adam .opt + best/stalls) and record()
+    // (save + early-stop) — and ch32_mera_train already uses it. Migrating here would DRY the cadence /
+    // early-stop / honest-resume rules. The one thing the shared module does NOT yet carry is the
+    // CURRICULUM state (curr_k/curr_best/curr_stalls/curr_converged), which lives in trainstate::State.
+    // So a migration must EITHER extend Progress with those fields (preferred) OR keep a small curriculum
+    // sidecar alongside Checkpointer's train_state.json. Also: ch29 writes train_state.txt (legacy);
+    // Checkpointer writes train_state.json — a migration switches format (resume-compat: read both).
     std::uint64_t start_step = 0;
     std::string resume_ckpt_path;            // the .ckpt we resumed from (→ matching .opt)
     trainstate::State resume_state;          // curriculum + early-stop state to rehydrate
@@ -795,6 +804,12 @@ static int run(int argc, char** argv) {
         // Honest checkpoint: weights (step_*.ckpt) + Adam state (step_*.opt) + the curriculum/
         // early-stop sidecar (train_state.txt), all stamped with the same step so a resume
         // restores the FULL training state. Replaces bare save_checkpoint at every save site.
+        // TODO(checkpointer): Checkpointer::record() does exactly this save trio (weights + .opt +
+        // train_state.json) AND folds in the best/stalls update + early-stop return — replacing both
+        // this lambda and the convergence block below. It also records best_step so a loader can serve
+        // the early-stop winner (ch29 currently reloads `latest` at §5, which IS the best only because
+        // it saves on improvement; best_step makes that explicit). Blocker to lift first: carry the
+        // curriculum fields (see the resume-site TODO above).
         auto save_full = [&](std::uint64_t step) {
             save_checkpoint(params, cfg.data.ckpt_dir, static_cast<std::int64_t>(step));
             opt->save_state((fs::path(cfg.data.ckpt_dir) / std::format("step_{:09d}.opt", step)).string());
@@ -951,6 +966,11 @@ static int run(int argc, char** argv) {
             }
 
             // ── Convergence check: held-out NELBO every eval_every steps ───────────
+            // TODO(checkpointer): this is Checkpointer::record()'s job — `if (ck.due(step+1) &&
+            // ck.record(step+1, nelbo, params, *opt)) break;` collapses the best/stalls/save/early-stop
+            // logic here into one call, with the cadence gate from make_schedule. Keep the track_recall
+            // print and the min_epochs floor (Checkpointer::record stops on patience alone — pass
+            // patience=0 until floor_reached, or add a min-step guard to the module).
             if ((step + 1) % cfg.train.eval_every == 0) {
                 const float nelbo = static_cast<float>(eval_nelbo(eval_nelbo_windows));
                 if (cfg.diag.track_recall) {

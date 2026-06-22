@@ -27,6 +27,7 @@ struct LoadedModel {
     std::unique_ptr<sub0llm::BPETokenizer>  tokenizer;
     std::int64_t                            seq_len = 0;   // training window length T
     std::int64_t                            mera_coarsen = 0, mera_window = 0;  // MERA geometry (if mera)
+    bool                                    mera_gated_pool = false;            // MERA content-weighted pool
     std::int64_t                            step    = 0;   // checkpoint step loaded
 };
 

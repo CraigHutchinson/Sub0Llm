@@ -16,14 +16,13 @@
 //                        [--steps <N>]
 
 #include "sub0llm/data/text_corpus.hpp"
+#include "sub0llm/http/client.hpp"
 #include "sub0llm/nn/checkpoint.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"
 #include "sub0llm/nn/optimizer.hpp"
 #include "sub0llm/tokenizer/bpe.hpp"
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/core/tensor.hpp"
-
-#include <httplib.h>
 
 #include <algorithm>
 #include <chrono>
@@ -243,17 +242,17 @@ static void section_pipeline()
 
 // ── §24.4  Synthetic Data via LLM API ─────────────────────────────────────────
 
-// HTTP POST to localhost:port/path via cpp-httplib (cross-platform, no POSIX guards).
+// HTTP POST to localhost:port/path via sub0llm::http::Client (Boost.Beast, no POSIX guards).
 // Returns response body on success, empty string on error/timeout.
 static std::string http_post_local(uint16_t port, std::string_view path,
                                     std::string_view json_body)
 {
-    httplib::Client cli("127.0.0.1", static_cast<int>(port));
+    sub0llm::http::Client cli("127.0.0.1", static_cast<int>(port));
     cli.set_connection_timeout(3);
     cli.set_read_timeout(3);
-    auto res = cli.Post(std::string(path), std::string(json_body), "application/json");
-    if (!res || res->status != 200) return "";
-    return res->body;
+    auto res = cli.Post(path, json_body, "application/json");
+    if (!res || res.status != 200) return "";
+    return res.body;
 }
 
 static std::vector<std::string> generate_synthetic_corpus(int n_samples)

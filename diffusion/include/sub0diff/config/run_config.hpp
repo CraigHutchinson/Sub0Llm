@@ -43,9 +43,10 @@ struct Model {
     // Architecture family (BuildTime). "flat" = the vanilla Denoiser (n_layers blocks). "mera" = the
     // recursive coarsen/refine MeraDenoiser (Ch32 P3): coarsen by `mera_coarsen` per level down to a top
     // level ≤ `mera_window`; n_layers is unused by MERA (its depth ≈ 2·levels+1 derives from seq_len).
-    std::string   model_type   = "flat";   // flat | mera
-    std::int64_t  mera_coarsen = 4;        // MERA coarsen factor c per level
-    std::int64_t  mera_window  = 64;       // MERA local window / top-level size w
+    std::string   model_type      = "flat";   // flat | mera
+    std::int64_t  mera_coarsen    = 4;        // MERA coarsen factor c per level
+    std::int64_t  mera_window     = 64;       // MERA local window / top-level size w
+    bool          mera_gated_pool = false;    // MERA: content-weighted (boundary-aware) coarsening vs mean-pool
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -57,8 +58,9 @@ struct Model {
         v("n_heads",      Scope::BuildTime, self.n_heads,      "attention heads");
         v("n_kv_heads",   Scope::BuildTime, self.n_kv_heads,   "KV heads (GQA)");
         v("model_type",   Scope::BuildTime, self.model_type,   "flat|mera architecture family");
-        v("mera_coarsen", Scope::BuildTime, self.mera_coarsen, "MERA coarsen factor c per level");
-        v("mera_window",  Scope::BuildTime, self.mera_window,  "MERA local window / top size w");
+        v("mera_coarsen",    Scope::BuildTime, self.mera_coarsen,    "MERA coarsen factor c per level");
+        v("mera_window",     Scope::BuildTime, self.mera_window,     "MERA local window / top size w");
+        v("mera_gated_pool", Scope::BuildTime, self.mera_gated_pool, "MERA content-weighted coarsening");
     }
 };
 

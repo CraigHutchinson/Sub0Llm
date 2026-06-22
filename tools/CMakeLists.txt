@@ -12,7 +12,7 @@ set_target_properties(sub0llm-cli PROPERTIES
 # OpenAI-compatible HTTP inference server (POST /v1/completions,
 # POST /v1/chat/completions) backed by a trained ModernGPT checkpoint.
 add_executable(sub0llm-server server/main.cpp)
-target_link_libraries(sub0llm-server PRIVATE sub0llm httplib)
+target_link_libraries(sub0llm-server PRIVATE sub0llm Boost::beast Boost::system)
 sub0llm_apply_compile_options(sub0llm-server)
 set_target_properties(sub0llm-server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

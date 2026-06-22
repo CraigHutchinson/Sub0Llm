@@ -80,16 +80,52 @@ elseif(SUB0LLM_ENABLE_EIGEN AND BLAS_FOUND)
     message(STATUS "sub0llm: BLAS takes priority over Eigen; Eigen will not be fetched")
 endif()
 
-# ── HTTP client (cpp-httplib) — used by ch24 for Ollama synthetic data ────────
-# Single-header, MIT-licensed, cross-platform (Windows/Linux/macOS).
-# Handles Winsock2 initialisation internally on Windows.
+# ── Boost (Beast + ASIO for the Ch32 viz server) ──────────────────────────────
+# Using the cmake-first tarball (fastest CPM download — no recursive git clone).
+# Boost.Beast and Boost.ASIO are header-only; Boost.System is effectively
+# header-only since 1.77.  BOOST_CONTEXT_IMPLEMENTATION winfib avoids the MASM
+# assembler (ml64.exe) which is not in PATH in the CUDA preset environment.
 CPMAddPackage(
-    NAME httplib
-    GITHUB_REPOSITORY yhirose/cpp-httplib
-    VERSION 0.18.1
-    OPTIONS "HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF"
-           "HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF"
+    NAME Boost
+    VERSION 1.91.0
+    URL https://github.com/boostorg/boost/releases/download/boost-1.91.0-1/boost-1.91.0-1-cmake.tar.xz
+    URL_HASH SHA256=cc5dc5006ecbdf0051f90979be31b4eee5987d9ae14ae9fb9c03cfa43fa3cdad
+    OPTIONS
+        "BOOST_ENABLE_CMAKE ON"
+        "BOOST_INCLUDE_LIBRARIES beast"
+        "BUILD_SHARED_LIBS OFF"
+        "BOOST_CONTEXT_IMPLEMENTATION winfib"
 )
+
+# ── Suppress warnings in all CPM / third-party headers ───────────────────────
+# Moving their include paths into INTERFACE_SYSTEM_INCLUDE_DIRECTORIES causes
+# the compiler to treat them like system headers — our -Wsign-conversion,
+# -Wconversion, etc. flags never fire on code we do not own.
+foreach(_3p_target
+        spdlog::spdlog
+        nlohmann_json::nlohmann_json
+        simdjson::simdjson
+        Boost::headers
+        Boost::beast
+        Boost::asio
+        Boost::system)
+    if(TARGET ${_3p_target})
+        # ALIAS targets do not support set_target_properties — resolve to the
+        # real target before setting INTERFACE_SYSTEM_INCLUDE_DIRECTORIES.
+        get_target_property(_real ${_3p_target} ALIASED_TARGET)
+        if(NOT _real)
+            set(_real ${_3p_target})
+        endif()
+        get_target_property(_incs ${_real} INTERFACE_INCLUDE_DIRECTORIES)
+        if(_incs)
+            set_target_properties(${_real} PROPERTIES
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_incs}")
+        endif()
+    endif()
+endforeach()
+unset(_3p_target)
+unset(_real)
+unset(_incs)
 
 # ── Optional: CUDA ────────────────────────────────────────────────────────────
 if(SUB0LLM_ENABLE_CUDA)

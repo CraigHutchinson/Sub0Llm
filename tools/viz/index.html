@@ -26,6 +26,8 @@
   .lvl .name { color:var(--mut); font-size:11px; width:120px; text-align:right; }
   .lvl .slots { display:flex; gap:2px; flex-wrap:nowrap; }
   .slot { height:14px; border-radius:2px; border:1px solid #00000033; }
+  .slot.gistcell { height:16px; min-width:14px; display:flex; align-items:center; justify-content:center;
+                   font:600 9px ui-monospace,monospace; color:#ffe9cf; overflow:hidden; }
   #canvas { padding:16px; display:flex; flex-wrap:wrap; gap:4px; align-content:flex-start; }
   .cell { padding:2px 5px; border-radius:4px; border:1px solid transparent; font-size:13px; white-space:pre; cursor:default; }
   .settled { color:var(--fg); background:#1b2230; }
@@ -198,17 +200,32 @@ function renderLayers(f){
     : 'hierarchy (MERA levels — fine → coarse; derived: fine settled-fraction pooled per level)';
   const settledArr = f.masked.map(m=>m?0:1);     // 1 = filled, 0 = masked (derived fallback)
   const W = Math.max(360, Math.min(900, N*7)), unit = W/N;
+  // Phase E: the GIST readout decorates the coarsest level — each top slot shows its top-1 token (the
+  // model's coarse "plan"), full top-k in the tooltip. Present only for MERA traces.
+  const hasGist = Array.isArray(f.gist_tokens) && f.gist_tokens.length>0;
   for(let li=0; li<lv.length; li++){
     const L = lv[li];
+    const isTop = (li===lv.length-1);
+    const gistHere = hasGist && isTop && f.gist_tokens.length===L;
     const row=document.createElement('div'); row.className='lvl';
     const name=document.createElement('div'); name.className='name';
-    name.textContent = (L===N?'fine (N)':`coarse /${Math.round(N/L)}`) + ` · ${L} slots`;
+    name.textContent = (L===N?'fine (N)':`coarse /${Math.round(N/L)}`) + ` · ${L} slots`
+                       + (gistHere?' · gist':'');
     const slots=document.createElement('div'); slots.className='slots';
     const per = N/L;
     for(let j=0;j<L;j++){
       const cell=document.createElement('div'); cell.className='slot';
       cell.style.width=Math.max(3,unit*per-2)+'px';
-      if(trueAct){
+      if(gistHere){
+        const toks=f.gist_tokens[j]||[], scs=(f.gist_scores&&f.gist_scores[j])||[];
+        cell.textContent = glyph(toks[0]!==undefined?toks[0]:'·');
+        cell.classList.add('gistcell');
+        const a = trueAct?f.level_rms[li][j]:0, v = TRACE._rmsMax>0 ? a/TRACE._rmsMax : 0;
+        cell.style.background = `hsl(28,70%,${12+Math.max(0,Math.min(1,v))*40}%)`;  // amber = gist
+        cell.dataset.tip = `gist slot ${j} — coarse plan (top-k by tied head):<br>`+
+          toks.map((t,ti)=>`&nbsp;${JSON.stringify(t)} <span class="k">${(scs[ti]??0).toFixed(1)}</span>`).join('<br>')
+          + (trueAct?`<br>activation RMS <b>${a.toFixed(3)}</b>`:'');
+      } else if(trueAct){
         const a = f.level_rms[li][j], v = TRACE._rmsMax>0 ? a/TRACE._rmsMax : 0;
         cell.style.background = `hsl(265,55%,${10+Math.max(0,Math.min(1,v))*42}%)`;  // violet = activation
         cell.dataset.tip = `level ${L} · slot ${j}: activation RMS <b>${a.toFixed(3)}</b> (${(100*v).toFixed(0)}% of max)`;

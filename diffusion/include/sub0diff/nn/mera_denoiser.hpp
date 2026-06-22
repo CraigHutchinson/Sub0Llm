@@ -18,6 +18,7 @@
 
 #include "sub0diff/nn/denoiser.hpp"        // BidirectionalBlock
 #include "sub0diff/nn/time_embedding.hpp"
+#include "sub0diff/viz/trace.hpp"          // viz::GistReadout (Phase E gist decode)
 
 #include "sub0llm/autograd/ops.hpp"
 #include "sub0llm/autograd/variable.hpp"
@@ -43,11 +44,19 @@ public:
     // max_seq_len (the pyramid is rebuilt per call; blocks are indexed by depth-from-finest, so enc[k]
     // always processes level k and the single top block handles whatever level falls ≤ w). blocks_per_
     // level = 1 (one disentangle + one refine per level + one top); depth ≈ 2·levels + 1.
+    // gated_pool (BuildTime A/B): when false, coarsening is the rigid uniform mean-pool (every c
+    // consecutive rows averaged equally — a block can straddle a sentence/word boundary and blur across
+    // it). When true, each c-block is pooled by a CONTENT-WEIGHTED softmax (a learned per-row score),
+    // so a block spanning a boundary can down-weight the wrong side instead of averaging it in — a soft,
+    // fixed-shape approximation of the "unbalanced tree" the scrubber motivated. The score projection is
+    // zero-initialised, so a gated model STARTS bit-identical to mean-pool and only learns to deviate.
     MeraDenoiser(std::int64_t vocab_size, std::int64_t embed_dim, std::size_t n_heads,
                  std::size_t n_kv_heads, std::int64_t coarsen, std::int64_t window,
-                 std::int64_t max_seq_len, std::int64_t d_ff = 0, std::uint64_t seed = 42)
+                 std::int64_t max_seq_len, std::int64_t d_ff = 0, std::uint64_t seed = 42,
+                 bool gated_pool = false)
         : real_vocab_(vocab_size), embed_dim_(embed_dim), coarsen_(coarsen), window_(window),
-          tok_emb_(vocab_size + 1, embed_dim, seed), ln_f_(embed_dim) {
+          gated_pool_(gated_pool), tok_emb_(vocab_size + 1, embed_dim, seed),
+          pool_proj_(zero_param(1, embed_dim)), ln_f_(embed_dim) {
         max_levels_ = static_cast<std::int64_t>(compute_lens(max_seq_len).size()) - 1;  // coarsen steps at max N
         std::uint64_t s = seed + 1000;
         enc_.reserve(static_cast<std::size_t>(max_levels_));
@@ -70,7 +79,8 @@ public:
     [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::Tensor& token_ids,
                                                       std::span<const float> noise_levels,
                                                       std::int64_t B, std::int64_t N,
-                                                      std::vector<std::vector<float>>* slot_rms = nullptr) const {
+                                                      std::vector<std::vector<float>>* slot_rms = nullptr,
+                                                      sub0llm::Tensor* gist_repr = nullptr) const {
         namespace ag = sub0llm::autograd;
         const auto lens = compute_lens(N);                        // pyramid for THIS N (any valid N)
         const std::int64_t K = static_cast<std::int64_t>(lens.size()) - 1;
@@ -95,9 +105,13 @@ public:
             skips[static_cast<std::size_t>(k)] = cur;
             cur = pool(cur, B, lens[static_cast<std::size_t>(k)], dev);
         }
-        // top: one full-attention pass at the smallest level (len ≤ w)
+        // top: one full-attention pass at the smallest level (len ≤ w) — this IS the gist.
         cur = attn_level(top_blk_[0], cur, B, lens[static_cast<std::size_t>(K)]);
         if (slot_rms) slot_rms->push_back(slot_rms_of(cur, embed_dim_));
+        if (gist_repr) {   // capture the coarsest representation (B·top_len, D) for the Phase-E readout
+            const sub0llm::Tensor& t = cur.data();
+            *gist_repr = t.device().is_cpu() ? t : t.to(sub0llm::Device::cpu());
+        }
         // decode: broadcast up, add skip, refine (windowed)
         for (std::int64_t k = K - 1; k >= 0; --k) {
             cur = broadcast(cur, B, lens[static_cast<std::size_t>(k + 1)], dev);    // → len_k
@@ -116,6 +130,9 @@ public:
         take(enc_); take(top_blk_); take(dec_);
         auto lp = ln_f_.parameters();
         p.insert(p.end(), lp.begin(), lp.end());
+        // Appended LAST and only when gated, so a non-gated model's parameter order (and thus its
+        // checkpoint layout) is unchanged — the two pool modes are distinct architectures (config_sha).
+        if (gated_pool_) p.push_back(&pool_proj_);
         return p;
     }
 
@@ -144,6 +161,50 @@ public:
         std::array<float, 1> nl{N > 0 ? static_cast<float>(nm) / static_cast<float>(N) : 0.0f};
         std::vector<std::vector<float>> out;
         (void)forward(input, std::span<const float>(nl), 1, N, &out);
+        return out;
+    }
+
+    // Viz Phase E: the GIST decoded to TOKEN space. Runs one forward over `canvas`, captures the top
+    // (coarsest) level — top_len D-vectors, the model's compressed "plan" for this window — and projects
+    // each through the tied embedding head (x·Eᵀ over real tokens), returning the top-k tokens per gist
+    // slot. It is a PROBE: the head is trained for the fine level, so read it as "which tokens this coarse
+    // vector points at," a human-readable handle on the gist, not a literal decode.
+    [[nodiscard]] viz::GistReadout gist_readout(std::span<const std::int32_t> canvas, int top_k = 3) const {
+        const std::int64_t N = static_cast<std::int64_t>(canvas.size());
+        sub0llm::Tensor input({N}, sub0llm::DType::Int32);
+        std::copy(canvas.begin(), canvas.end(), input.data_as<std::int32_t>().begin());
+        std::int64_t nm = 0;
+        for (auto t : canvas) nm += (t == mask_id());
+        std::array<float, 1> nl{N > 0 ? static_cast<float>(nm) / static_cast<float>(N) : 0.0f};
+        sub0llm::Tensor gist;
+        (void)forward(input, std::span<const float>(nl), 1, N, nullptr, &gist);  // (top_len, D), host
+
+        const sub0llm::Tensor& w = tok_emb_.weight().data();
+        sub0llm::Tensor Eh = w.device().is_cpu() ? w : w.to(sub0llm::Device::cpu());
+        const auto e = Eh.data_as<float>();          // (model_vocab, D), first real_vocab_ rows = tokens
+        const auto g = gist.data_as<float>();
+        const std::int64_t top_len = gist.numel() / embed_dim_;
+        const int k = std::max(1, std::min<int>(top_k, static_cast<int>(real_vocab_)));
+
+        viz::GistReadout out;
+        std::vector<std::pair<float, std::int32_t>> scored(static_cast<std::size_t>(real_vocab_));
+        for (std::int64_t s = 0; s < top_len; ++s) {
+            const float* gv = &g[s * embed_dim_];
+            for (std::int64_t v = 0; v < real_vocab_; ++v) {
+                const float* ev = &e[v * embed_dim_];
+                float dot = 0.0f;
+                for (std::int64_t d = 0; d < embed_dim_; ++d) dot += gv[d] * ev[d];
+                scored[static_cast<std::size_t>(v)] = {dot, static_cast<std::int32_t>(v)};
+            }
+            std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::int32_t> ids; std::vector<float> sc;
+            ids.reserve(static_cast<std::size_t>(k)); sc.reserve(static_cast<std::size_t>(k));
+            for (int j = 0; j < k; ++j) { ids.push_back(scored[static_cast<std::size_t>(j)].second);
+                                          sc.push_back(scored[static_cast<std::size_t>(j)].first); }
+            out.tokens.push_back(std::move(ids));
+            out.scores.push_back(std::move(sc));
+        }
         return out;
     }
 
@@ -183,15 +244,38 @@ private:
         return len <= window_ ? blk.forward(x, B, len) : blk.forward(x, B * (len / window_), window_);
     }
 
-    // mean-pool every `coarsen_` rows: (B·len, D) → (B·len/c, D), via reshape + batched matmul.
+    // Coarsen every `coarsen_` rows: (B·len, D) → (B·len/c, D), via reshape + batched matmul.
+    // Uniform mean-pool (rigid) unless gated_pool_, in which case each c-block is combined by a
+    // content-weighted softmax (boundary-aware) — see the constructor note.
     [[nodiscard]] sub0llm::autograd::Variable pool(const sub0llm::autograd::Variable& x, std::int64_t B,
                                                    std::int64_t len, sub0llm::Device dev) const {
         namespace ag = sub0llm::autograd;
         const std::int64_t slots = B * len / coarsen_;
         ag::Variable g3 = ag::reshape(x, {slots, coarsen_, embed_dim_});
-        ag::Variable sel(sub0llm::ops::mul(sub0llm::ones({slots, 1, coarsen_}, sub0llm::DType::Float32, dev),
-                                           1.0f / static_cast<float>(coarsen_)), false);
+        ag::Variable sel = gated_pool_ ? pool_weights(x, slots)   // (slots, 1, c), content-weighted
+                         : ag::Variable(sub0llm::ops::mul(
+                               sub0llm::ones({slots, 1, coarsen_}, sub0llm::DType::Float32, dev),
+                               1.0f / static_cast<float>(coarsen_)), false);
         return ag::reshape(ag::matmul(sel, g3), {slots, embed_dim_});
+    }
+
+    // Boundary-aware pool weights: score each row (x·pool_projᵀ → scalar), softmax over the c rows of
+    // each block, returned shaped (slots, 1, c) for the batched weighted-sum. With pool_proj_ = 0 the
+    // scores are all 0 ⇒ softmax is uniform ⇒ this reduces EXACTLY to mean-pool (the A/B starts tied).
+    [[nodiscard]] sub0llm::autograd::Variable pool_weights(const sub0llm::autograd::Variable& x,
+                                                           std::int64_t slots) const {
+        namespace ag = sub0llm::autograd;
+        ag::Variable scores = ag::matmul_bt(x, pool_proj_);              // (B·len, 1)
+        ag::Variable w = ag::softmax(ag::reshape(scores, {slots, coarsen_}));  // softmax over c per block
+        return ag::reshape(w, {slots, 1, coarsen_});
+    }
+
+    // A (rows, cols) zero-initialised trainable parameter (host; to() moves it with the rest).
+    [[nodiscard]] static sub0llm::autograd::Variable zero_param(std::int64_t rows, std::int64_t cols) {
+        sub0llm::Tensor t({rows, cols}, sub0llm::DType::Float32);
+        auto d = t.data_as<float>();
+        std::fill(d.begin(), d.end(), 0.0f);
+        return sub0llm::autograd::Variable(t, /*requires_grad=*/true);
     }
 
     // broadcast each coarse slot to its `coarsen_` finer positions: (B·lc, D) → (B·lc·c, D).
@@ -205,7 +289,9 @@ private:
     }
 
     std::int64_t                    real_vocab_, embed_dim_, coarsen_, window_, max_levels_ = 0;
+    bool                            gated_pool_ = false;
     sub0llm::nn::Embedding          tok_emb_;
+    sub0llm::autograd::Variable     pool_proj_;   // (1, D) score projection for gated pooling (unused if off)
     std::vector<BidirectionalBlock> enc_, top_blk_, dec_;
     sub0llm::nn::RMSNorm            ln_f_;
 };
@@ -216,6 +302,12 @@ private:
 [[nodiscard]] inline std::vector<std::vector<float>> capture_levels(const MeraDenoiser& m,
                                                                     std::span<const std::int32_t> canvas) {
     return m.level_activations(canvas);
+}
+
+// ADL hook (Viz Phase E): the gist (coarsest level) decoded to tokens. Selected at refine_canvas<Mera>.
+[[nodiscard]] inline viz::GistReadout capture_gist(const MeraDenoiser& m,
+                                                   std::span<const std::int32_t> canvas) {
+    return m.gist_readout(canvas);
 }
 
 }  // namespace sub0diff::nn

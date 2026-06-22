@@ -59,7 +59,7 @@ struct CliConfig {
     bool        greedy      = false;
     bool        interactive = false;
     bool        f32         = false;  // --f32: load full f32 weights (default: Q8 int8)
-    uint64_t    seed        = 42;
+    uint32_t    seed        = 42;
 };
 
 struct ModelArch {

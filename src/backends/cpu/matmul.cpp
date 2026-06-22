@@ -51,9 +51,9 @@ constexpr std::size_t BLOCK = 64;
 
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
 
-void matmul_tile_avx2(const float* __restrict__ A,
-                      const float* __restrict__ B,
-                      float*       __restrict__ C,
+void matmul_tile_avx2(const float* RESTRICT A,
+                      const float* RESTRICT B,
+                      float*       RESTRICT C,
                       std::size_t M, std::size_t N, std::size_t K) noexcept {
     std::memset(C, 0, M * N * sizeof(float));
 
@@ -139,9 +139,9 @@ void matmul_scalar_blocked(const float* A, const float* B, float* C,
 // C = A·Bᵀ with B stored row-major (N, K): C[i,j] = dot(A row i, B row j).
 // Both operands stream contiguously, so no transpose materialization is needed —
 // this is the natural orientation for a weight-tied LM head (logits = x · Wᵀ).
-void matmul_bt_tile_avx2(const float* __restrict__ A,
-                         const float* __restrict__ B,
-                         float*       __restrict__ C,
+void matmul_bt_tile_avx2(const float* RESTRICT A,
+                         const float* RESTRICT B,
+                         float*       RESTRICT C,
                          std::size_t M, std::size_t N, std::size_t K) noexcept {
 #if defined(SUB0LLM_AVX512)
     constexpr std::size_t W = 16;
@@ -201,9 +201,9 @@ void matmul_bt_scalar(const float* A, const float* B, float* C,
 // and a contiguous row of C — no transposed copy of A is ever materialized.
 #if defined(SUB0LLM_AVX2) || defined(SUB0LLM_AVX512)
 
-void matmul_tb_tile_avx2(const float* __restrict__ A,
-                         const float* __restrict__ B,
-                         float*       __restrict__ C,
+void matmul_tb_tile_avx2(const float* RESTRICT A,
+                         const float* RESTRICT B,
+                         float*       RESTRICT C,
                          std::size_t M, std::size_t N, std::size_t K) noexcept {
     std::memset(C, 0, K * N * sizeof(float));
     for (std::size_t m = 0; m < M; ++m) {

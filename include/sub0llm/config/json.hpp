@@ -1,5 +1,7 @@
 #pragma once
 
+//TODO: Important DEPRECATE in favour of refactoring the reader to be forward-pass (SAX style) and use simdjson's on-demand API directly, which is faster and more memory-efficient.
+
 // json.hpp — a tiny random-access JSON *reader* facade over simdjson.
 //
 // The config module needs to look scalar values up by key, in any order, possibly

@@ -26,7 +26,7 @@ Each model dir contains:
 
 | file | purpose |
 |------|---------|
-| `config.json` | model arch (model_type, vocab, D, layers, heads, d_ff, seq_len, mera_coarsen/window) |
+| `config.json` | model arch (model_type, vocab, D, layers, heads, d_ff, seq_len, mera_coarsen/window, mera_gated_pool) |
 | `run_config.json` | the FULL resolved run config (every knob) + `_code_sha` + `_config_sha` — the resume source |
 | `train_state.json` | dynamic progress (step, best_nelbo, **best_step**, evals_since_best) — **honest** resume of the early-stop history; `best_step` is the checkpoint the server serves |
 | `tokenizer/` | `vocab.json` + `merges.txt` |

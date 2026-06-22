@@ -86,8 +86,12 @@ between steps — early snapshots are noisy unigram mush, later ones structured 
 - **Hierarchy** — the MERA levels (fine→coarse). For a MERA trace each slot is colored by the level’s
   **true per-level activation RMS** (violet, Phase B) — the model’s actual internal representation at
   that resolution; for flat traces (no hierarchy) it falls back to the derived settled-fraction (green).
-  Note the coarse tiling is **rigid** (every `c` consecutive tokens pool to one slot), so a coarse block
-  can straddle a sentence boundary — see ch32 NOTES (boundary-aware coarsening is the open lever).
+  The coarsest level additionally shows the **gist** (Phase E): each top slot is decoded to its top-1
+  token (amber) — the model’s coarse “plan” for that span — with the full top-k + scores on hover. Watch
+  it sharpen across iterations (and, on weak models, collapse to whitespace — the root of the “commits to
+  spaces first” artifact). Coarse tiling is **rigid** by default (every `c` consecutive tokens pool to one
+  slot, so a block can straddle a sentence boundary); train with `--mera-gated-pool` for content-weighted
+  (boundary-aware) coarsening — see ch32 NOTES.
 - **Metrics** — % settled, committed-this-iter, iter time (ms), **settled tok/s** (running + overall),
   total settle time.
 
