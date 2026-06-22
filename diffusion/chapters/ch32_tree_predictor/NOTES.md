@@ -5,11 +5,16 @@
 
 ## Open items / things to make work
 
-- ~~MERA model is N-specific~~ **DONE** — MERA now takes `max_seq_len` and `forward(N)` rebuilds the
-  pyramid per call, accepting ANY valid N ≤ max (blocks indexed by depth-from-finest; the top block
-  handles whatever level falls ≤ w). Test covers N=64 + N=32 on one model. **Caveat to watch:** if
-  TRAINED at a single fixed N, the top block sees one top-length; using a different N at inference shifts
-  the top-length (mild train/use mismatch). True variable-N robustness needs MIXED-N training (future).
+- ~~MERA model is N-specific~~ **DONE** — MERA takes `max_seq_len`; `forward(N)` rebuilds the pyramid per
+  call, accepting ANY valid N ≤ max (blocks indexed by depth-from-finest; the top block handles whatever
+  level falls ≤ w). Test covers N=64 + N=32 on one model.
+- ~~fixed-N train/use mismatch~~ **RESOLVED by mixed-N training** (`ch32_mera_mixedn`, c8284d5). Train an
+  identical MERA fixed@512 vs mixed on {128,256,512}; eval at each (3000 steps):
+  `fixed 3.59/3.60/2.88 at N=128/256/512` (degrades ~25% off its training length) vs
+  `mixed 2.545/2.535/2.532` (consistent at EVERY length, −29/−30/−12% vs fixed). Mixed even beats fixed
+  at 512 — likely a multi-scale REGULARIZER: fixed@512 OVERFIT at 3000 steps (cf. the earlier MERA@512
+  2000-step run = 2.53, matching mixed) while mixed stayed low. **Recommendation: train MERA mixed-N by
+  default** — robust across lengths AND resists the documented early-overfit, with fewer total tokens.
 - **Generation device** — sampler runs on CPU (reads host logits). GPU generation would need the
   sampler's softmax/commit on-device or batched D2H. Fine for now (generation is run-once).
 - **Seam handling (2d)** — was diagnosed for single-level *hier* (function-word gap). MERA's multi-level
