@@ -256,15 +256,21 @@ void copy_strided_f32(const float* src, float* dst,
 
 float sum_squares(const Tensor& t) {
 #ifdef SUB0LLM_CUDA
-    float* dscalar = nullptr;
-    if (cudaMalloc(&dscalar, sizeof(float)) != cudaSuccess)
-        throw std::runtime_error("sum_squares: cudaMalloc failed");
+    // PERSISTENT reduction scalar — allocated ONCE and reused. sum_squares is called every training
+    // step (clip_grad_norm); a per-call cudaMalloc/cudaFree synchronises the device twice each step.
+    // A 4-byte static buffer (single-GPU; device 0) removes that churn — a small fixed-allocation step
+    // toward the preallocated-memory design (no per-step malloc/free on the hot path).
+    static float* dscalar = [] {
+        float* p = nullptr;
+        if (cudaMalloc(&p, sizeof(float)) != cudaSuccess)
+            throw std::runtime_error("sum_squares: cudaMalloc failed");
+        return p;
+    }();
     cudaMemset(dscalar, 0, sizeof(float));
     kernels::launch_sum_sq_f32(reinterpret_cast<const float*>(t.raw_ptr()), dscalar,
                                static_cast<std::size_t>(t.numel()));
     float host = 0.0f;
     memcpy_d2h(&host, dscalar, sizeof(float), t.device().index);
-    cudaFree(dscalar);
     return host;
 #else
     (void)t;
