@@ -171,6 +171,7 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
         std::println("  ckpt @ step {:>6}  eval_nelbo={:.4f}  best={:.4f}  stalls={}{}  -> {}",
                      step, nelbo, ck.progress().best, ck.progress().stalls,
                      stop ? "  EARLY-STOP" : "", sub0llm::latest_checkpoint_path(cfg.data.ckpt_dir));
+        std::fflush(stdout);
         return stop;
     };
 
@@ -190,6 +191,7 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
         if (const double dt = log_hb.due(); dt > 0.0) {
             std::println("  step {:>8}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss,
                          static_cast<double>(s + 1 - log_step) / dt);
+            std::fflush(stdout);   // redirected stdout is fully buffered — flush so a tailed log is live
             log_step = s + 1;
         }
         if (save_hb.due() > 0.0) ck.save_safety(s + 1, param_ptrs, *opt);   // crash insurance between evals
