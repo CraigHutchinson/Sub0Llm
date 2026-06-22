@@ -1,4 +1,4 @@
-# sub0llm Viz — diffusion "thought process" scrubber (Phase A)
+# sub0llm Viz — diffusion "thought process" scrubber (Phase B)
 
 Replay a MERA/flat diffusion generation **iteration-by-iteration**: watch the canvas snap into focus,
 see per-position confidence/entropy, the MERA **level hierarchy**, **timing**, and a **settled tok/s**
@@ -44,9 +44,11 @@ with the file picker (tooltips need the served route).
 - **Canvas** — each position: settled tokens solid; *tentative* (still-masked) guesses italic with a
   red→green **confidence** heatmap; green border = committed this iter; amber = remasked. Hover a cell
   for pos / confidence / entropy / token / predicted.
-- **Hierarchy** — the MERA levels (coarse→fine); each level’s slots colored by how settled that region
-  is this frame (derived: fine settled-fraction pooled per level — true per-level activations are
-  Phase B).
+- **Hierarchy** — the MERA levels (fine→coarse). For a MERA trace each slot is colored by the level’s
+  **true per-level activation RMS** (violet, Phase B) — the model’s actual internal representation at
+  that resolution; for flat traces (no hierarchy) it falls back to the derived settled-fraction (green).
+  Note the coarse tiling is **rigid** (every `c` consecutive tokens pool to one slot), so a coarse block
+  can straddle a sentence boundary — see ch32 NOTES (boundary-aware coarsening is the open lever).
 - **Metrics** — % settled, committed-this-iter, iter time (ms), **settled tok/s** (running + overall),
   total settle time.
 

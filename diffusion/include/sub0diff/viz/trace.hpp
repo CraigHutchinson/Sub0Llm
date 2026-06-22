@@ -26,6 +26,12 @@ struct Frame {
     std::vector<float>        confidence;   // this iter's max prob at masked positions (0 elsewhere)
     std::vector<float>        entropy;      // this iter's entropy at masked positions (0 elsewhere)
     std::vector<std::int32_t> predicted;    // this iter's best-token prediction (token id; current id elsewhere)
+
+    // Phase B — TRUE per-level internal activations from a forward pass over THIS frame's canvas.
+    // One inner vector per MERA level (order matches GenerationTrace.levels: [N, N/c, …, top]); each is
+    // the per-slot RMS magnitude of that level's D-dim representation. Empty for models without a level
+    // hierarchy (flat) — the viewer then falls back to the derived settled-fraction view.
+    std::vector<std::vector<float>> level_rms;
 };
 
 // A whole generation. meta fields are set by the runner; frames by refine_canvas.

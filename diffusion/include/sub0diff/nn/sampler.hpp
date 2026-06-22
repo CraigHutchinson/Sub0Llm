@@ -39,6 +39,16 @@
 
 namespace sub0diff::nn {
 
+// Viz Phase B hook: per-frame TRUE per-level internal activations. Generic fallback = none (flat and
+// other non-hierarchical models). A hierarchical model (MeraDenoiser) supplies a same-namespace overload
+// (declared with the model) selected by ADL at this template's instantiation — so the sampler stays
+// model-agnostic and flat builds don't depend on the MERA header.
+template <class Model>
+[[nodiscard]] inline std::vector<std::vector<float>> capture_levels(const Model&,
+                                                                    std::span<const std::int32_t>) {
+    return {};
+}
+
 // Commit ORDER within an iteration (which confident positions to commit first).
 //   Confidence — pure most-confident-first (MaskGIT/LLaDA default).
 //   Spread     — 4b experiment (ch32): commit a spatially SPREAD coarse skeleton first (a
@@ -197,6 +207,10 @@ SamplerStats refine_canvas(const Model& model, std::span<std::int32_t> canvas,
                 fr.entropy[p.pos]    = p.entropy;
                 fr.predicted[p.pos]  = p.token;
             }
+            // Phase B: TRUE per-level internals for THIS frame's canvas (empty for flat — viewer then
+            // falls back to the derived settled-fraction view). One extra forward per frame; fine for
+            // the single traced passage the Viz records.
+            fr.level_rms = capture_levels(model, std::span<const std::int32_t>(canvas));
             trace->frames.push_back(std::move(fr));
         };
 

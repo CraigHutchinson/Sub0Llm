@@ -26,7 +26,9 @@
 #include "sub0llm/nn/embedding.hpp"
 #include "sub0llm/nn/modern_gpt.hpp"       // RMSNorm
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -61,9 +63,14 @@ public:
         return forward(token_ids, std::span<const float>(nl), 1, token_ids.numel());
     }
 
+    // slot_rms (optional, Viz Phase B): if non-null, receives one row per level — the per-slot RMS
+    // magnitude of that level's disentangled representation (encoder skips finest→coarsest, then the
+    // top), so the order matches level_lens(N) = [N, N/c, …, top]. Used by level_activations() to expose
+    // the model's TRUE internal hierarchy to the scrubber. Only meaningful for B=1 (one sequence).
     [[nodiscard]] sub0llm::autograd::Variable forward(const sub0llm::Tensor& token_ids,
                                                       std::span<const float> noise_levels,
-                                                      std::int64_t B, std::int64_t N) const {
+                                                      std::int64_t B, std::int64_t N,
+                                                      std::vector<std::vector<float>>* slot_rms = nullptr) const {
         namespace ag = sub0llm::autograd;
         const auto lens = compute_lens(N);                        // pyramid for THIS N (any valid N)
         const std::int64_t K = static_cast<std::int64_t>(lens.size()) - 1;
@@ -84,11 +91,13 @@ public:
         std::vector<ag::Variable> skips(static_cast<std::size_t>(K));
         for (std::int64_t k = 0; k < K; ++k) {
             cur = attn_level(enc_[static_cast<std::size_t>(k)], cur, B, lens[static_cast<std::size_t>(k)]);
+            if (slot_rms) slot_rms->push_back(slot_rms_of(cur, embed_dim_));
             skips[static_cast<std::size_t>(k)] = cur;
             cur = pool(cur, B, lens[static_cast<std::size_t>(k)], dev);
         }
         // top: one full-attention pass at the smallest level (len ≤ w)
         cur = attn_level(top_blk_[0], cur, B, lens[static_cast<std::size_t>(K)]);
+        if (slot_rms) slot_rms->push_back(slot_rms_of(cur, embed_dim_));
         // decode: broadcast up, add skip, refine (windowed)
         for (std::int64_t k = K - 1; k >= 0; --k) {
             cur = broadcast(cur, B, lens[static_cast<std::size_t>(k + 1)], dev);    // → len_k
@@ -123,7 +132,38 @@ public:
     // the level-length pyramid forward(N) uses: [N, N/c, …, top] (coarse-to-fine; for the Viz).
     [[nodiscard]] std::vector<std::int64_t> level_lens(std::int64_t N) const { return compute_lens(N); }
 
+    // Viz Phase B: the model's TRUE per-level internal state for a single canvas. Runs one forward pass
+    // (noise = fraction of [MASK] positions, matching how generation conditions the model) and returns,
+    // per level (order = level_lens(N)), the per-slot RMS magnitude of that level's representation.
+    [[nodiscard]] std::vector<std::vector<float>> level_activations(std::span<const std::int32_t> canvas) const {
+        const std::int64_t N = static_cast<std::int64_t>(canvas.size());
+        sub0llm::Tensor input({N}, sub0llm::DType::Int32);
+        std::copy(canvas.begin(), canvas.end(), input.data_as<std::int32_t>().begin());
+        std::int64_t nm = 0;
+        for (auto t : canvas) nm += (t == mask_id());
+        std::array<float, 1> nl{N > 0 ? static_cast<float>(nm) / static_cast<float>(N) : 0.0f};
+        std::vector<std::vector<float>> out;
+        (void)forward(input, std::span<const float>(nl), 1, N, &out);
+        return out;
+    }
+
 private:
+    // per-row RMS over the D-dim of a (rows·D) activation Variable (read back to host if on device).
+    [[nodiscard]] static std::vector<float> slot_rms_of(const sub0llm::autograd::Variable& v,
+                                                        std::int64_t D) {
+        const sub0llm::Tensor& t = v.data();
+        sub0llm::Tensor host = t.device().is_cpu() ? t : t.to(sub0llm::Device::cpu());
+        auto d = host.data_as<float>();
+        const std::int64_t rows = host.numel() / D;
+        std::vector<float> rms(static_cast<std::size_t>(rows));
+        for (std::int64_t r = 0; r < rows; ++r) {
+            float s = 0.0f;
+            for (std::int64_t j = 0; j < D; ++j) { const float x = d[r * D + j]; s += x * x; }
+            rms[static_cast<std::size_t>(r)] = std::sqrt(s / static_cast<float>(D));
+        }
+        return rms;
+    }
+
     // The level-length pyramid for a sequence of length N: [N, N/c, N/c², …] down to the first ≤ w.
     [[nodiscard]] std::vector<std::int64_t> compute_lens(std::int64_t N) const {
         std::vector<std::int64_t> lens{N};
@@ -169,5 +209,13 @@ private:
     std::vector<BidirectionalBlock> enc_, top_blk_, dec_;
     sub0llm::nn::RMSNorm            ln_f_;
 };
+
+// ADL hook for the templated sampler (sampler.hpp): give the Viz the model's TRUE per-level internals.
+// The generic fallback in sampler.hpp returns {} (flat/non-hierarchical models); this MeraDenoiser
+// overload is selected by ADL at the refine_canvas<MeraDenoiser> instantiation point.
+[[nodiscard]] inline std::vector<std::vector<float>> capture_levels(const MeraDenoiser& m,
+                                                                    std::span<const std::int32_t> canvas) {
+    return m.level_activations(canvas);
+}
 
 }  // namespace sub0diff::nn

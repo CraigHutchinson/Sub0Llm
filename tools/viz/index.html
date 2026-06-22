@@ -43,7 +43,7 @@
 </head>
 <body>
 <header>
-  <h1>sub0llm — diffusion "thought process" scrubber <span style="color:var(--mut);font-weight:400">(Viz Phase A)</span></h1>
+  <h1>sub0llm — diffusion "thought process" scrubber <span style="color:var(--mut);font-weight:400">(Viz Phase B — true per-level activations)</span></h1>
   <div class="meta" id="meta">load a trace to begin…</div>
 </header>
 <div id="drop">trace: <input type="file" id="file" accept="application/json"> &nbsp;(or serve the repo root and it auto-loads <code>./trace.json</code>)</div>
@@ -55,7 +55,7 @@
   <span id="frameLbl">frame – / –</span>
 </div>
 <div id="metrics"></div>
-<div id="layers"><h2>hierarchy (MERA levels — coarse → fine; derived: fine settled-fraction pooled per level)</h2><div id="layerRows"></div></div>
+<div id="layers"><h2 id="layersHdr">hierarchy</h2><div id="layerRows"></div></div>
 <div id="canvas"></div>
 <div class="legend">
   <span><span class="sw" style="background:#1b2230"></span>settled token</span>
@@ -72,6 +72,9 @@ const $ = s => document.querySelector(s);
 
 // confidence (0..1) -> red→green heatmap
 function confColor(v){ const h = Math.max(0,Math.min(1,v))*120; return `hsl(${h},55%,28%)`; }
+// make otherwise-invisible tokens legible: [MASK]=·, empty=∅, whitespace=␣ (so a canvas full of
+// space tokens — e.g. the early all-masked unigram prior — reads as spaces, not ambiguous blanks).
+function glyph(s){ if(s==='·') return '·'; if(s==='') return '∅'; if(/^\s+$/.test(s)) return '␣'.repeat(Math.min(3,s.length)); return s; }
 
 async function loadGlossary(){
   try { const r = await fetch('../../ACRONYMS.json'); if(r.ok){ GLOSS=(await r.json()).terms||{}; } } catch(e){}
@@ -104,7 +107,7 @@ function renderFrame(){
     d.className='cell '+(masked?'mask tentative':'settled');
     if(committed) d.className+=' commit';
     if(remasked)  d.className+=' remask';
-    d.textContent = masked ? (f.predicted[i] && f.predicted[i]!=='·' ? f.predicted[i] : '·') : f.tokens[i];
+    d.textContent = glyph(masked ? (f.predicted[i] && f.predicted[i]!=='·' ? f.predicted[i] : '·') : f.tokens[i]);
     if(masked && f.confidence[i]>0) d.style.background=confColor(f.confidence[i]);
     d.dataset.tip = `<span class="k">pos</span> ${i}  <span class="k">conf</span> ${f.confidence[i]?.toFixed(3)}  <span class="k">entropy</span> ${f.entropy[i]?.toFixed(3)}<br>`+
                     `<span class="k">token</span> ${JSON.stringify(f.tokens[i])}  <span class="k">predicted</span> ${JSON.stringify(f.predicted[i])}<br>`+
@@ -135,30 +138,48 @@ function renderMetrics(f){
 function renderLayers(f){
   const lv = TRACE.meta.levels || [TRACE.meta.T], N = TRACE.meta.T, host=$('#layerRows');
   host.innerHTML='';
-  // settled fraction per fine position this frame (1 = filled, 0 = masked)
-  const settledArr = f.masked.map(m=>m?0:1);
-  // cell width so the finest level spans a fixed pixel width
+  // TRUE per-level activations (Phase B) when the model supplies them and they line up with the level
+  // lengths; otherwise fall back to the DERIVED settled-fraction (Phase A).
+  const trueAct = Array.isArray(f.level_rms) && f.level_rms.length===lv.length
+                  && f.level_rms.every((a,i)=>a.length===lv[i]);
+  $('#layersHdr').innerHTML = trueAct
+    ? `hierarchy (${term('MERA')} levels — fine → coarse; <b>true per-level activation RMS</b>, normalized)`
+    : 'hierarchy (MERA levels — fine → coarse; derived: fine settled-fraction pooled per level)';
+  const settledArr = f.masked.map(m=>m?0:1);     // 1 = filled, 0 = masked (derived fallback)
   const W = Math.max(360, Math.min(900, N*7)), unit = W/N;
-  for(const L of lv){
+  for(let li=0; li<lv.length; li++){
+    const L = lv[li];
     const row=document.createElement('div'); row.className='lvl';
     const name=document.createElement('div'); name.className='name';
     name.textContent = (L===N?'fine (N)':`coarse /${Math.round(N/L)}`) + ` · ${L} slots`;
     const slots=document.createElement('div'); slots.className='slots';
     const per = N/L;
     for(let j=0;j<L;j++){
-      let s=0; for(let i=Math.floor(j*per);i<Math.floor((j+1)*per);i++) s+=settledArr[i];
-      const frac = s/Math.max(1,Math.floor((j+1)*per)-Math.floor(j*per));
       const cell=document.createElement('div'); cell.className='slot';
       cell.style.width=Math.max(3,unit*per-2)+'px';
-      cell.style.background = frac>0 ? `hsl(140,45%,${12+frac*34}%)` : '#12161c';
-      cell.dataset.tip = `level ${L} · slot ${j}: ${(100*frac).toFixed(0)}% settled`;
+      if(trueAct){
+        const a = f.level_rms[li][j], v = TRACE._rmsMax>0 ? a/TRACE._rmsMax : 0;
+        cell.style.background = `hsl(265,55%,${10+Math.max(0,Math.min(1,v))*42}%)`;  // violet = activation
+        cell.dataset.tip = `level ${L} · slot ${j}: activation RMS <b>${a.toFixed(3)}</b> (${(100*v).toFixed(0)}% of max)`;
+      } else {
+        let s=0; for(let i=Math.floor(j*per);i<Math.floor((j+1)*per);i++) s+=settledArr[i];
+        const frac = s/Math.max(1,Math.floor((j+1)*per)-Math.floor(j*per));
+        cell.style.background = frac>0 ? `hsl(140,45%,${12+frac*34}%)` : '#12161c';
+        cell.dataset.tip = `level ${L} · slot ${j}: ${(100*frac).toFixed(0)}% settled`;
+      }
       slots.appendChild(cell);
     }
     row.appendChild(name); row.appendChild(slots); host.appendChild(row);
   }
 }
 
-function setTrace(t){ TRACE=t; fi=0; $('#slider').max=t.frames.length-1; renderMeta(); renderFrame(); }
+function setTrace(t){
+  TRACE=t; fi=0; $('#slider').max=t.frames.length-1;
+  // global activation max across all frames/levels → stable color scale for the hierarchy (Phase B)
+  let mx=0; for(const fr of t.frames) if(Array.isArray(fr.level_rms)) for(const lvl of fr.level_rms) for(const v of lvl) if(v>mx) mx=v;
+  TRACE._rmsMax = mx;
+  renderMeta(); renderFrame();
+}
 function step(d){ if(!TRACE) return; fi=Math.max(0,Math.min(TRACE.frames.length-1,fi+d)); renderFrame(); }
 
 $('#slider').oninput = e => { fi=+e.target.value; renderFrame(); };

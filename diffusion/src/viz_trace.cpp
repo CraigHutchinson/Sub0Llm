@@ -44,6 +44,17 @@ std::size_t write_trace_json(const GenerationTrace& trace, const std::string& pa
         for (auto v : f.entropy)    ent.push_back(r3(v));
         jf["confidence"] = std::move(conf);
         jf["entropy"]    = std::move(ent);
+        // Phase B: TRUE per-level activation magnitudes (one inner array per MERA level, order =
+        // meta.levels). Absent/empty for flat — the viewer falls back to the derived settled-fraction.
+        if (!f.level_rms.empty()) {
+            json lv = json::array();
+            for (const auto& level : f.level_rms) {
+                json slots = json::array();
+                for (auto v : level) slots.push_back(r3(v));
+                lv.push_back(std::move(slots));
+            }
+            jf["level_rms"] = std::move(lv);
+        }
         j["frames"].push_back(std::move(jf));
     }
 
