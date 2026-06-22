@@ -18,6 +18,7 @@
 #include "sub0diff/nn/model_io.hpp"
 #include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
+#include "sub0diff/util/cli.hpp"
 #include "sub0diff/viz/trace.hpp"
 #include "sub0diff/viz/trace_json.hpp"
 
@@ -280,6 +281,9 @@ int serve(Model& model, BPETokenizer& tok, std::int64_t Vr, const std::string& m
 
 int run_main(int argc, char** argv) {
     sub0llm::init_cpu_compute();   // FTZ+DAZ on the main thread
+    sub0diff::cli::require_known(argc, argv, {
+        "--model-dir", "--host", "--webroot", "--port", "--corpus", "--paragraphs", "--steps",
+        "--embed_dim", "--seq_len", "--window", "--coarsen", "--batch", "--seed", "--device"});
     const std::string model_dir = arg_s(argc, argv, "--model-dir", "");
     const std::string host    = arg_s(argc, argv, "--host", "127.0.0.1");
     const std::string webroot = arg_s(argc, argv, "--webroot", ".");

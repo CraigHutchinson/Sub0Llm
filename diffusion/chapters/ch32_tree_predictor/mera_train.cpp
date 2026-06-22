@@ -16,6 +16,7 @@
 #include "sub0diff/nn/denoiser.hpp"
 #include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
+#include "sub0diff/train/schedule.hpp"   // make_schedule — coverage-rule eval cadence + eval sample size
 
 #include "sub0llm/core/ops.hpp"
 #include "sub0llm/core/runtime.hpp"   // init_cpu_compute (FTZ+DAZ — training-throughput prerequisite)
@@ -77,14 +78,17 @@ bool has_flag(int argc, char** argv, const std::string& k) {
     return false;
 }
 
-// Average NELBO over `n_batches` random eval windows (no backward — a held-out quality read).
+// Held-out NELBO AVERAGED over ~`target_windows` random eval windows — the coverage rule's stable
+// signal (a too-small sample makes consecutive evals differ by noise, tripping early-stop on noise).
+// target_windows comes from make_schedule (clamp(sliding_eval/500, 64, 512)).
 template <class Model>
 double eval_nelbo(Model& model, std::span<const std::int32_t> stream, const cfgm::RunConfig& cfg,
-                  std::mt19937& rng, int n_batches) {
+                  std::mt19937& rng, std::size_t target_windows) {
     const std::int64_t N = cfg.model.seq_len, B = std::max<std::int64_t>(1, cfg.optim.batch);
     if (static_cast<std::int64_t>(stream.size()) <= N + B) return 0.0;
     dt::BatchedDiffusionLossContext ctx(B, N);
     std::uniform_int_distribution<std::size_t> off(0, stream.size() - static_cast<std::size_t>(N));
+    const int n_batches = std::max<int>(1, static_cast<int>((target_windows + static_cast<std::size_t>(B) - 1) / static_cast<std::size_t>(B)));
     double sum = 0.0;
     for (int i = 0; i < n_batches; ++i) {
         std::vector<std::size_t> offs(static_cast<std::size_t>(B));
@@ -92,7 +96,7 @@ double eval_nelbo(Model& model, std::span<const std::int32_t> stream, const cfgm
         auto res = dt::batched_diffusion_loss(model, stream, offs, rng, ctx, 0.02f, cfg.optim.t_max);
         sum += static_cast<double>(res.loss.data().to(sub0llm::Device::cpu()).template item<float>());
     }
-    return sum / std::max(1, n_batches);
+    return sum / n_batches;
 }
 
 // Snapshot the live param Variables (copies sharing storage with the model AT THE CALL TIME).
@@ -210,8 +214,24 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
     }
 
     const std::int64_t N = cfg.model.seq_len, B = std::max<std::int64_t>(1, cfg.optim.batch);
-    const std::uint64_t steps = cfg.train.steps ? cfg.train.steps : 3000;
-    const std::uint64_t ckpt_every = cfg.train.eval_every ? cfg.train.eval_every : 500;
+
+    // THE COVERAGE RULE (ch29 schedule.hpp): a held-out eval is only a meaningful early-stop signal once
+    // the model has trained over a significant fraction of the corpus SINCE the last eval — eval more
+    // often and consecutive evals differ only by noise. make_schedule derives the eval cadence (≥0.5
+    // epoch between evals, batch folded in) AND the averaged eval sample size from the corpus; an explicit
+    // --eval-every / --steps overrides (0 = derive). masked_per_window = E[t]·seq_len.
+    const double mean_t = 0.5 * (0.02 + static_cast<double>(cfg.optim.t_max));
+    const auto sched = dt::make_schedule(
+        static_cast<std::uint64_t>(train_ids.size()), static_cast<std::uint64_t>(eval_ids.size()),
+        N, static_cast<std::size_t>(B), mean_t * static_cast<double>(N), {},
+        cfg.train.eval_every, cfg.train.steps);
+    const std::uint64_t steps = sched.steps_bound;
+    const std::uint64_t ckpt_every = sched.eval_every;
+    const std::size_t eval_windows = sched.eval_nelbo_windows;
+    std::println("schedule: epoch={} windows ({} steps/epoch); eval every {} steps = {:.0f}% epoch "
+                 "coverage, averaged over {} eval windows; steps bound {}",
+                 sched.epoch_windows, B > 0 ? sched.epoch_windows / static_cast<std::uint64_t>(B) : 0,
+                 ckpt_every, 100.0 * sched.coverage_per_eval, eval_windows, steps);
     std::mt19937 rng(static_cast<std::uint32_t>(cfg.optim.seed) + static_cast<std::uint32_t>(start_step));
     std::uniform_int_distribution<std::size_t> off(0, train_ids.size() - static_cast<std::size_t>(N));
     (void)ws_span;  // whole-word / contiguous masking not wired in this lean trainer yet (defaults off)
@@ -233,8 +253,8 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
 
     // Checkpoint = eval + update best-tracking + write weights/.opt/train_state.json (the full honest
     // resume set). Returns true if early-stop should fire (patience stalled evals with no improvement).
-    auto checkpoint = [&](std::uint64_t step, int eval_batches) {
-        const double nelbo = eval_nelbo(model, eval_ids, cfg, rng, eval_batches);
+    auto checkpoint = [&](std::uint64_t step) {
+        const double nelbo = eval_nelbo(model, eval_ids, cfg, rng, eval_windows);
         constexpr double kMinImprove = 0.01;
         if (nelbo < state.best_nelbo - kMinImprove) { state.best_nelbo = nelbo; state.evals_since_best = 0; }
         else ++state.evals_since_best;
@@ -264,10 +284,10 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::println("  step {:>6}  train_nelbo={:.4f}  ({:.0f} steps/s)", s + 1, last_loss, (s + 1 - start_step) / std::max(1e-9, secs));
         }
-        if ((s + 1) % ckpt_every == 0 && checkpoint(s + 1, 4)) { stopped = true; break; }
+        if ((s + 1) % ckpt_every == 0 && checkpoint(s + 1)) { stopped = true; break; }
     }
     // final checkpoint so a resume always finds the last step (skip if already saved this step)
-    if (!stopped && last_step > start_step && last_step % ckpt_every != 0) checkpoint(last_step, 8);
+    if (!stopped && last_step > start_step && last_step % ckpt_every != 0) checkpoint(last_step);
     std::println("done. checkpoints + train_state.json in {}", cfg.data.ckpt_dir);
     return 0;
 }

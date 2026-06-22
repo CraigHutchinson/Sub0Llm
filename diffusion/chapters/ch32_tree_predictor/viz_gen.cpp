@@ -8,6 +8,7 @@
 #include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/nn/sampler.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
+#include "sub0diff/util/cli.hpp"
 #include "sub0diff/viz/trace.hpp"
 #include "sub0diff/viz/trace_json.hpp"
 
@@ -18,6 +19,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <format>
 #include <print>
@@ -88,8 +90,11 @@ std::string arg_s(int argc, char** argv, const std::string& k, const std::string
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_main(int argc, char** argv) {
     sub0llm::init_cpu_compute();   // FTZ+DAZ (training-throughput prerequisite)
+    sub0diff::cli::require_known(argc, argv, {
+        "--corpus", "--model", "--out", "--paragraphs", "--steps", "--embed_dim", "--seq_len",
+        "--window", "--coarsen", "--n_layers", "--batch", "--temp_x100", "--seed"});
     const std::string corpus = arg_s(argc, argv, "--corpus", "data/tinystories_clean.txt");
     const std::string which  = arg_s(argc, argv, "--model", "mera");      // mera | flat
     const std::string out    = arg_s(argc, argv, "--out", "tools/viz/trace.json");
@@ -182,4 +187,14 @@ int main(int argc, char** argv) {
     std::println("  2) open:                  http://localhost:8000/tools/viz/");
     std::println("     (or open tools/viz/index.html directly and use the 'Load trace' button)");
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::fflush(stdout);
+        std::println(stderr, "ERROR: {}", e.what());
+        return 1;
+    }
 }
