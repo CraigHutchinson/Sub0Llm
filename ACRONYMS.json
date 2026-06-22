@@ -26,19 +26,26 @@
     },
     "HIERDENOISER": {
       "expansion": "Hierarchical Denoiser (single-level coarse-to-fine)",
-      "def": "P2 single-level gist model: one coarse global pass over N/c pooled slots + a fine window-local pass conditioned on it. Extends context ~c x but its coarse pass is still O((N/c)^2), so it walls; MERA generalises it recursively.",
+      "def": "sub0llm single-level gist model (chapter-32 Phase 2): one coarse global pass over N/c pooled slots + a fine window-local pass conditioned on it. Extends usable context ~c x but its coarse pass is still O((N/c)^2), so it walls; the MERA denoiser generalises it recursively.",
       "category": "project",
-      "tags": ["architecture", "P2"],
+      "tags": ["architecture", "ch32"],
       "see_also": ["MERA", "GIST"],
       "ref": "diffusion/include/sub0diff/nn/hier_denoiser.hpp"
     },
     "GIST": {
-      "expansion": "Gist / coarse plan (G)",
-      "def": "A low-resolution summary of the sequence (pooled content words or coarsened slots) used to condition fine generation. A COMPUTE/CONTEXT primitive (coarse plan -> parallel fine windows), NOT a within-window accuracy fix — redundant with attention inside a single window.",
+      "expansion": "Gist / coarse plan (denoted G)",
+      "def": "In the sub0llm diffusion engine: a low-resolution summary of the sequence (pooled content words or coarsened slots), written G, used to condition fine generation. A COMPUTE/CONTEXT primitive (coarse plan -> parallel fine windows), NOT a within-window accuracy fix — redundant with attention inside a single window.",
       "category": "project",
-      "tags": ["concept", "P2"],
-      "see_also": ["MERA", "COARSEN", "IB"],
+      "tags": ["concept", "ch32"],
+      "see_also": ["G", "MERA", "COARSEN", "IB"],
       "ref": "diffusion/chapters/ch32_tree_predictor/DESIGN_REVIEW_3.md"
+    },
+    "G": {
+      "expansion": "G — the gist / coarse plan",
+      "def": "Single-letter shorthand used throughout the sub0llm diffusion engine for the GIST: the low-resolution summary vector(s) a coarse pass produces to condition fine generation. Not a standard ML symbol — it is this project's notation. See GIST.",
+      "category": "project",
+      "tags": ["notation", "ch32"],
+      "see_also": ["GIST", "MERA", "COARSEN"]
     },
     "COARSEN": {
       "expansion": "Coarsen (pool by c)",
@@ -65,7 +72,7 @@
     },
     "M1": {
       "expansion": "Metric 1 — OOV-cliff",
-      "def": "Phase-0 metric: per-masked-token NLL split by whether the target is a rare type. NLL_rare / NLL_common is the 'cliff'. Measured ~6-8x on word-TinyStories (rare words predicted far worse).",
+      "def": "sub0llm chapter-32 Phase-0 (instrumentation) metric — per-masked-token NLL split by whether the target is a rare type. NLL_rare / NLL_common is the 'cliff'. Measured ~6-8x on word-TinyStories (rare words predicted far worse).",
       "category": "project",
       "tags": ["metric", "phase0"],
       "see_also": ["OOV", "M2", "M3"],
@@ -73,7 +80,7 @@
     },
     "M2": {
       "expansion": "Metric 2 — topic-drift",
-      "def": "Phase-0 metric: content-word RECURRENCE (fraction of distinct content types reused >=2x) + distinct-n (looping). Validated vs a unigram-chance floor: corpus 5.7x above chance; flat model AT chance.",
+      "def": "sub0llm chapter-32 Phase-0 (instrumentation) metric — content-word RECURRENCE (fraction of distinct content types reused >=2x) + distinct-n (looping). Validated vs a unigram-chance floor: corpus 5.7x above chance; flat model AT chance.",
       "category": "project",
       "tags": ["metric", "phase0", "coherence"],
       "see_also": ["M1", "M3", "DISTINCT-N"],
@@ -81,15 +88,15 @@
     },
     "M3": {
       "expansion": "Metric 3 — correlation decay (criticality)",
-      "def": "Phase-0 metric: mutual-information / prediction-improvement vs distance; corpus is power-law (alpha~1.8) while a flat model decays exponentially. The multi-scale gap that justifies the hierarchy; vindicated by MERA beating flat on accuracy.",
+      "def": "sub0llm chapter-32 Phase-0 (instrumentation) metric — mutual-information / prediction-improvement vs distance; corpus is power-law (alpha~1.8) while a flat model decays exponentially. The multi-scale gap that justifies the hierarchy; vindicated by MERA beating flat on accuracy.",
       "category": "project",
       "tags": ["metric", "phase0", "criticality"],
       "see_also": ["M1", "M2", "MERA"],
       "ref": "diffusion/chapters/ch32_tree_predictor/M3_RESULTS.md"
     },
-    "P1": { "expansion": "Phase 1 — char-composition OOV fix", "def": "ch32 hierarchy phase: fold sub-word spelling into the word embedding to fix the OOV cliff. FALSIFIED (spelling geometry != prediction geometry under a tied head); robust OOV lever = rare-weighted loss.", "category": "project", "tags": ["phase"], "see_also": ["M1", "OOV"] },
-    "P2": { "expansion": "Phase 2 — gist conditioning / coarse-to-fine", "def": "ch32 phase: the gist as a compute/context primitive (coarse plan -> parallel fine windows). HierDenoiser + mask-aware pooling.", "category": "project", "tags": ["phase"], "see_also": ["GIST", "HIERDENOISER", "M2"] },
-    "P3": { "expansion": "Phase 3 — MERA log-depth hierarchy", "def": "ch32 phase: recursive coarsening (MeraDenoiser). Removes the O((N/c)^2) wall, linear O(N*w), and BEATS flat on accuracy (M3 vindicated).", "category": "project", "tags": ["phase"], "see_also": ["MERA", "M3"] },
+    "P1": { "expansion": "Phase 1 (sub0llm chapter-32 hierarchy build-out) — char-composition OOV fix", "def": "sub0llm chapter-32 (ch32) hierarchy build-out, Phase 1: fold sub-word spelling into the word embedding to fix the OOV cliff. FALSIFIED (spelling geometry != prediction geometry under a weight-tied head); the robust OOV lever turned out to be a rare-weighted loss.", "category": "project", "tags": ["phase", "ch32"], "see_also": ["M1", "OOV", "P2", "P3"] },
+    "P2": { "expansion": "Phase 2 (sub0llm chapter-32 hierarchy build-out) — gist conditioning / coarse-to-fine", "def": "sub0llm chapter-32 (ch32) hierarchy build-out, Phase 2: use the gist (G) as a compute/context primitive — a coarse plan conditioning parallel fine windows. Built the HierDenoiser + mask-aware pooling.", "category": "project", "tags": ["phase", "ch32"], "see_also": ["GIST", "G", "HIERDENOISER", "M2", "P1", "P3"] },
+    "P3": { "expansion": "Phase 3 (sub0llm chapter-32 hierarchy build-out) — MERA log-depth hierarchy", "def": "sub0llm chapter-32 (ch32) hierarchy build-out, Phase 3: recursive coarsening (the MeraDenoiser). Removes the O((N/c)^2) wall (linear O(N*w)) and BEATS the flat baseline on accuracy — the M3 multi-scale hypothesis vindicated.", "category": "project", "tags": ["phase", "ch32"], "see_also": ["MERA", "M3", "P1", "P2"] },
     "OOV": {
       "expansion": "Out-Of-Vocabulary",
       "def": "A word/token not (or barely) seen in training -> poorly-trained or missing embedding row. Word-level models fall off a 'cliff' on OOV words (M1).",
