@@ -24,6 +24,13 @@
   (would lift MERA's ~16384 training ceiling).
 - Per-step arena allocator = the principled end state (stable VRAM, predictable peak).
 
+## Planned
+
+- **Interactive visualization & prompting** — scrub the diffusion "thought process" (iteration timeline)
+  + drill into MERA tiered internals; param-adjustment comparison; verbosity slider. Design:
+  [`../VISUALIZATION_DESIGN.md`](../VISUALIZATION_DESIGN.md). Phase A (cheap, first) = GenerationTrace
+  JSON via the `refine_canvas` `on_iter` hook + a static `tools/viz/` web scrubber.
+
 ## Findings
 
 - **MERA's NLL win does NOT robustly transfer to generation coherence (M2) at this scale.** 3-seed
