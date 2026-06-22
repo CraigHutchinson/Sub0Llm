@@ -67,6 +67,10 @@ JS is fine — the no-Python rule is for the core library). It loads a trace and
 - **Hierarchy panel** — expand a frame into the MERA pyramid: each level as a row (coarse at top, fine at
   bottom), `proj2d` scatter of its slots, attention top-k, info flow up (coarsen) / down (refine).
 - **Prompt box + knobs** — set the prompt and the sampler/model params, (re)generate, get a new trace.
+- **Acronym tooltips** — any term/acronym shown in the UI (MERA, NELBO, gist, conf_threshold, …) gets a
+  hover tooltip with its expansion + definition, sourced from [`/ACRONYMS.json`](../ACRONYMS.json) (keyed
+  by UPPERCASE token; `glossary.terms[token.toUpperCase()]`). That index is the project glossary
+  (project terms + common LLM terminology + external refs) and is maintained alongside the code.
 
 Serving: reuse `tools/server` (the OpenAI-compatible HTTP server) — add a `POST /v1/generate_trace`
 endpoint returning the `GenerationTrace` JSON for a prompt+params; the web viewer is a static page that

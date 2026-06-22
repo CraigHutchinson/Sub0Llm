@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "description": "Acronym & terminology index for the sub0llm project. Project-specific definitions, common LLM/ML terminology, and external references. Keyed by UPPERCASE token for tooltip lookup (Viz: glossary.terms[token.toUpperCase()]).",
+  "categories": {
+    "project": "Defined within this project (sub0llm / the diffusion engine)",
+    "llm": "Common LLM / deep-learning terminology",
+    "external": "External paper, model, or system referenced by the project",
+    "hardware": "Hardware, systems, or performance terminology"
+  },
+  "terms": {
+    "MERA": {
+      "expansion": "Multi-scale Entanglement Renormalization Ansatz",
+      "def": "Originally a tensor-network from physics (Vidal); here the recursive log-depth coarsen/refine denoiser (MeraDenoiser) — disentangle (windowed local attention) + coarsen (pool) up to a tiny top, then refine back down with skips. Attention work is O(N*w), linear in N.",
+      "category": "project",
+      "tags": ["architecture", "hierarchy", "P3"],
+      "see_also": ["HIERDENOISER", "GIST", "COARSEN"],
+      "ref": "Vidal 2007 (tensor networks); sub0llm: diffusion/include/sub0diff/nn/mera_denoiser.hpp"
+    },
+    "DENOISER": {
+      "expansion": "(flat) Denoiser",
+      "def": "The baseline bidirectional diffusion model: embed + noise/time conditioning -> full O(N^2) self-attention -> weight-tied LM head. Predicts the clean token at every position. Strictly dominated by MERA on accuracy/compute/context; kept as the reference/accuracy oracle.",
+      "category": "project",
+      "tags": ["architecture", "baseline"],
+      "see_also": ["MERA", "HIERDENOISER"],
+      "ref": "diffusion/include/sub0diff/nn/denoiser.hpp"
+    },
+    "HIERDENOISER": {
+      "expansion": "Hierarchical Denoiser (single-level coarse-to-fine)",
+      "def": "P2 single-level gist model: one coarse global pass over N/c pooled slots + a fine window-local pass conditioned on it. Extends context ~c x but its coarse pass is still O((N/c)^2), so it walls; MERA generalises it recursively.",
+      "category": "project",
+      "tags": ["architecture", "P2"],
+      "see_also": ["MERA", "GIST"],
+      "ref": "diffusion/include/sub0diff/nn/hier_denoiser.hpp"
+    },
+    "GIST": {
+      "expansion": "Gist / coarse plan (G)",
+      "def": "A low-resolution summary of the sequence (pooled content words or coarsened slots) used to condition fine generation. A COMPUTE/CONTEXT primitive (coarse plan -> parallel fine windows), NOT a within-window accuracy fix — redundant with attention inside a single window.",
+      "category": "project",
+      "tags": ["concept", "P2"],
+      "see_also": ["MERA", "COARSEN", "IB"],
+      "ref": "diffusion/chapters/ch32_tree_predictor/DESIGN_REVIEW_3.md"
+    },
+    "COARSEN": {
+      "expansion": "Coarsen (pool by c)",
+      "def": "Mean-pool every c adjacent positions into one coarse slot (the encode/up step of MERA). Inverse = broadcast (decode/down). c = the coarsen factor per level.",
+      "category": "project",
+      "tags": ["operation", "hierarchy"],
+      "see_also": ["MERA", "GIST"],
+      "ref": "diffusion/include/sub0diff/nn/mera_denoiser.hpp"
+    },
+    "NELBO": {
+      "expansion": "Negative Evidence Lower BOund",
+      "def": "The masked-diffusion training loss (absorbing-state discrete diffusion, MDLM/LLaDA). Sample noise level t, mask each position with prob t, weight the summed cross-entropy of masked positions by 1/t. Our per-token NLL diagnostic averages over t.",
+      "category": "project",
+      "tags": ["loss", "training"],
+      "see_also": ["ELBO", "MDLM", "CE"],
+      "ref": "diffusion/include/sub0diff/train/diffusion_loss.hpp"
+    },
+    "ELBO": {
+      "expansion": "Evidence Lower BOund",
+      "def": "A variational lower bound on the log-likelihood of the data; maximised when training latent-variable/diffusion models. We minimise its negative (NELBO).",
+      "category": "llm",
+      "tags": ["loss", "theory"],
+      "see_also": ["NELBO"]
+    },
+    "M1": {
+      "expansion": "Metric 1 — OOV-cliff",
+      "def": "Phase-0 metric: per-masked-token NLL split by whether the target is a rare type. NLL_rare / NLL_common is the 'cliff'. Measured ~6-8x on word-TinyStories (rare words predicted far worse).",
+      "category": "project",
+      "tags": ["metric", "phase0"],
+      "see_also": ["OOV", "M2", "M3"],
+      "ref": "diffusion/include/sub0diff/eval/oov_cliff.hpp"
+    },
+    "M2": {
+      "expansion": "Metric 2 — topic-drift",
+      "def": "Phase-0 metric: content-word RECURRENCE (fraction of distinct content types reused >=2x) + distinct-n (looping). Validated vs a unigram-chance floor: corpus 5.7x above chance; flat model AT chance.",
+      "category": "project",
+      "tags": ["metric", "phase0", "coherence"],
+      "see_also": ["M1", "M3", "DISTINCT-N"],
+      "ref": "diffusion/include/sub0diff/eval/topic_drift.hpp"
+    },
+    "M3": {
+      "expansion": "Metric 3 — correlation decay (criticality)",
+      "def": "Phase-0 metric: mutual-information / prediction-improvement vs distance; corpus is power-law (alpha~1.8) while a flat model decays exponentially. The multi-scale gap that justifies the hierarchy; vindicated by MERA beating flat on accuracy.",
+      "category": "project",
+      "tags": ["metric", "phase0", "criticality"],
+      "see_also": ["M1", "M2", "MERA"],
+      "ref": "diffusion/chapters/ch32_tree_predictor/M3_RESULTS.md"
+    },
+    "P1": { "expansion": "Phase 1 — char-composition OOV fix", "def": "ch32 hierarchy phase: fold sub-word spelling into the word embedding to fix the OOV cliff. FALSIFIED (spelling geometry != prediction geometry under a tied head); robust OOV lever = rare-weighted loss.", "category": "project", "tags": ["phase"], "see_also": ["M1", "OOV"] },
+    "P2": { "expansion": "Phase 2 — gist conditioning / coarse-to-fine", "def": "ch32 phase: the gist as a compute/context primitive (coarse plan -> parallel fine windows). HierDenoiser + mask-aware pooling.", "category": "project", "tags": ["phase"], "see_also": ["GIST", "HIERDENOISER", "M2"] },
+    "P3": { "expansion": "Phase 3 — MERA log-depth hierarchy", "def": "ch32 phase: recursive coarsening (MeraDenoiser). Removes the O((N/c)^2) wall, linear O(N*w), and BEATS flat on accuracy (M3 vindicated).", "category": "project", "tags": ["phase"], "see_also": ["MERA", "M3"] },
+    "OOV": {
+      "expansion": "Out-Of-Vocabulary",
+      "def": "A word/token not (or barely) seen in training -> poorly-trained or missing embedding row. Word-level models fall off a 'cliff' on OOV words (M1).",
+      "category": "llm",
+      "tags": ["tokenization"],
+      "see_also": ["M1", "BPE"]
+    },
+    "IB": {
+      "expansion": "Information Bottleneck",
+      "def": "Train a compressed representation to retain only the information predictive of a target. P2 step 2c: make the gist keep long-range predictive info while discarding the rest.",
+      "category": "llm",
+      "tags": ["objective", "theory"],
+      "see_also": ["GIST"]
+    },
+    "ACT": {
+      "expansion": "Adaptive Computation Time",
+      "def": "Let the model spend a variable number of compute steps per input/position (Graves). Basis for the per-window verbosity/iteration slider (DESIGN_REVIEW_3 §8).",
+      "category": "llm",
+      "tags": ["inference"],
+      "see_also": ["VERBOSITY-SLIDER"]
+    },
+    "NLL": { "expansion": "Negative Log-Likelihood", "def": "-log p(target); the per-token loss/quality measure (nats). Lower is better.", "category": "llm", "tags": ["loss", "metric"], "see_also": ["CE", "NELBO"] },
+    "CE": { "expansion": "Cross-Entropy", "def": "-sum p*log q; the classification loss between predicted and target token distributions. Our weighted_cross_entropy normalises by the masked-weight sum.", "category": "llm", "tags": ["loss"], "see_also": ["NLL"] },
+    "DISTINCT-N": { "expansion": "distinct-n", "def": "Unique n-grams / total n-grams in a passage. Higher = less degenerate repetition/looping. Part of M2.", "category": "project", "tags": ["metric", "coherence"], "see_also": ["M2"] },
+    "LLM": { "expansion": "Large Language Model", "def": "A neural network trained on large text corpora to model token sequences.", "category": "llm", "tags": ["general"] },
+    "BPE": { "expansion": "Byte-Pair Encoding", "def": "Subword tokenizer that greedily merges frequent byte/char pairs. We also use a word-level tokenizer for analysis.", "category": "llm", "tags": ["tokenization"], "see_also": ["OOV"], "ref": "include/sub0llm/tokenizer/bpe.hpp" },
+    "ROPE": { "expansion": "Rotary Position Embedding", "def": "Encodes token position by rotating query/key vectors by a position-dependent angle; relative-position aware. NTK-scaling extends it beyond training length.", "category": "llm", "tags": ["attention", "position"], "ref": "Su et al. 2021 (RoFormer)" },
+    "RMSNORM": { "expansion": "Root Mean Square Normalization", "def": "Normalises activations by their RMS (no mean subtraction); cheaper than LayerNorm, used throughout the modern blocks.", "category": "llm", "tags": ["normalization"], "ref": "Zhang & Sennrich 2019" },
+    "SWIGLU": { "expansion": "Swish-Gated Linear Unit", "def": "FFN variant: (Swish(xW) * xV)W2 — a gated activation that outperforms plain GELU FFNs.", "category": "llm", "tags": ["ffn"], "ref": "Shazeer 2020" },
+    "GQA": { "expansion": "Grouped-Query Attention", "def": "Attention where several query heads share each key/value head — between MHA and MQA; cuts KV-cache memory with little quality loss.", "category": "llm", "tags": ["attention"], "see_also": ["MHA", "MQA", "KV-CACHE"], "ref": "Ainslie et al. 2023" },
+    "MHA": { "expansion": "Multi-Head Attention", "def": "Standard attention with H independent query/key/value heads.", "category": "llm", "tags": ["attention"], "see_also": ["GQA", "MQA"] },
+    "MQA": { "expansion": "Multi-Query Attention", "def": "All query heads share a single key/value head (extreme GQA); minimal KV cache.", "category": "llm", "tags": ["attention"], "see_also": ["GQA"] },
+    "KV-CACHE": { "expansion": "Key-Value cache", "def": "Cached attention keys/values from past tokens so autoregressive decode is O(n) not O(n^2). Less relevant to bidirectional diffusion.", "category": "llm", "tags": ["inference"], "ref": "include/sub0llm/nn/kv_cache.hpp" },
+    "FFN": { "expansion": "Feed-Forward Network", "def": "The per-position MLP in a transformer block (here SwiGLU).", "category": "llm", "tags": ["block"], "see_also": ["SWIGLU"] },
+    "MOE": { "expansion": "Mixture of Experts", "def": "Sparse FFN: route each token to top-k of many expert MLPs + a load-balancing loss. Ch18.", "category": "llm", "tags": ["architecture"], "ref": "include/sub0llm/nn/moe.hpp" },
+    "MTP": { "expansion": "Multi-Token Prediction", "def": "Predict K+1 tokens per forward pass (extra heads). Ch19.", "category": "llm", "tags": ["training"], "ref": "include/sub0llm/nn/mtp.hpp" },
+    "LORA": { "expansion": "Low-Rank Adaptation", "def": "Fine-tune by adding trainable low-rank matrices to frozen weights. Ch12.", "category": "llm", "tags": ["finetune"], "ref": "Hu et al. 2021; include/sub0llm/nn/lora.hpp" },
+    "DPO": { "expansion": "Direct Preference Optimization", "def": "Align a model to preference pairs directly (no separate reward model/RL). Ch13.", "category": "llm", "tags": ["alignment"], "ref": "Rafailov et al. 2023; include/sub0llm/nn/dpo.hpp" },
+    "RLHF": { "expansion": "Reinforcement Learning from Human Feedback", "def": "Train a reward model from preferences then optimise the policy against it (KL-penalised). Ch20.", "category": "llm", "tags": ["alignment"], "see_also": ["PPO", "DPO"], "ref": "include/sub0llm/nn/rlhf.hpp" },
+    "PPO": { "expansion": "Proximal Policy Optimization", "def": "A clipped policy-gradient RL algorithm commonly used for the RL step of RLHF.", "category": "llm", "tags": ["rl"], "see_also": ["RLHF"] },
+    "STE": { "expansion": "Straight-Through Estimator", "def": "Backprop through a non-differentiable (e.g. argmax/routing) op by passing the gradient through as if it were identity. Used by the MathGPT router (Ch21).", "category": "llm", "tags": ["training"] },
+    "ADALN": { "expansion": "Adaptive Layer Normalization", "def": "Condition a model by predicting per-channel scale/shift for its norm layers from a conditioning vector (FiLM-style). A way to inject the gist.", "category": "llm", "tags": ["conditioning"], "see_also": ["FILM", "GIST"] },
+    "FILM": { "expansion": "Feature-wise Linear Modulation", "def": "Condition features via a learned per-channel affine (gamma*x+beta) from a conditioning input.", "category": "llm", "tags": ["conditioning"], "see_also": ["ADALN"], "ref": "Perez et al. 2017" },
+    "GELU": { "expansion": "Gaussian Error Linear Unit", "def": "Smooth activation x*Phi(x); common transformer nonlinearity.", "category": "llm", "tags": ["activation"] },
+    "ADAM": { "expansion": "Adaptive Moment estimation", "def": "First-order optimizer using running estimates of gradient mean and variance. AdamW adds decoupled weight decay.", "category": "llm", "tags": ["optimizer"], "ref": "Kingma & Ba 2014" },
+    "MDLM": { "expansion": "Masked Diffusion Language Model", "def": "Absorbing-state discrete diffusion for text; its Rao-Blackwellised objective is our NELBO. The training recipe behind the engine.", "category": "external", "tags": ["diffusion"], "see_also": ["NELBO", "LLADA"], "ref": "Sahoo et al. 2024" },
+    "LLADA": { "expansion": "Large Language Diffusion with mAsking", "def": "A masked text-diffusion LLM; reference recipe (low-confidence remasking, etc.) for our sampler.", "category": "external", "tags": ["diffusion"], "see_also": ["MDLM", "MASKGIT"] },
+    "DIFFUSIONGEMMA": { "expansion": "DiffusionGemma", "def": "A real ~26B text-diffusion LLM run locally as a correctness/behaviour oracle; diffusion is GPU-favorable on 8GB (hybrid offload).", "category": "external", "tags": ["diffusion", "oracle"] },
+    "MASKGIT": { "expansion": "Masked Generative Image Transformer", "def": "Iterative confidence-based parallel decoding (commit the confident, re-predict the rest) — the sampler pattern our refine_canvas uses.", "category": "external", "tags": ["sampling"], "ref": "Chang et al. 2022" },
+    "TITANS": { "expansion": "Titans (neural long-term memory)", "def": "A test-time-learned long-term memory module (Dec 2024); prior art surveyed for the Ch26 episodic-memory design.", "category": "external", "tags": ["memory"], "see_also": ["TTT", "CLS"] },
+    "TTT": { "expansion": "Test-Time Training", "def": "Update (part of) the model on the test input itself at inference; a fast-weights / online-adaptation approach (Ch26 prior art).", "category": "llm", "tags": ["memory", "adaptation"], "see_also": ["TITANS"] },
+    "CLS": { "expansion": "Complementary Learning Systems", "def": "Neuroscience theory: a fast episodic store (hippocampus) + slow semantic store (cortex). Framing for the Ch26 three-tier memory design.", "category": "external", "tags": ["memory", "theory"] },
+    "CHINCHILLA": { "expansion": "Chinchilla scaling", "def": "Compute-optimal scaling: ~20 tokens per parameter. Our 5M-param models on ~37K tokens are ~2700x under-resourced -> word-salad generations (the data ceiling, not an engine fault).", "category": "external", "tags": ["scaling"], "ref": "Hoffmann et al. 2022" },
+    "FLOPS": { "expansion": "Floating-point Operations Per Second", "def": "Compute throughput measure; FLOPs (no s) = a count of operations.", "category": "hardware", "tags": ["perf"] },
+    "TG": { "expansion": "Token Generation", "def": "The decode phase throughput (tokens/s) — generating new tokens. Contrast PP.", "category": "hardware", "tags": ["perf"], "see_also": ["PP", "TTFT"] },
+    "PP": { "expansion": "Prompt Processing (prefill)", "def": "The prefill phase throughput — processing the input prompt before generation. Contrast TG.", "category": "hardware", "tags": ["perf"], "see_also": ["TG"] },
+    "TTFT": { "expansion": "Time To First Token", "def": "Latency from request to the first generated token (dominated by prefill).", "category": "hardware", "tags": ["perf"], "see_also": ["PP"] },
+    "VRAM": { "expansion": "Video RAM", "def": "GPU memory. The binding constraint at long context (8 GB here); flat O(N^2) attention exhausts it ~N=1024-2048.", "category": "hardware", "tags": ["memory"], "see_also": ["TDR", "WDDM"] },
+    "TDR": { "expansion": "Timeout Detection and Recovery", "def": "Windows GPU watchdog that resets the driver if a kernel hangs; VRAM exhaustion can trigger it (and a reboot). Why the ceiling shows as thrash-then-crash.", "category": "hardware", "tags": ["windows", "gpu"], "see_also": ["WDDM", "VRAM"] },
+    "WDDM": { "expansion": "Windows Display Driver Model", "def": "Windows GPU driver model; oversubscribes VRAM by spilling to system RAM -> catastrophic slowdown (thrash) rather than a clean OOM.", "category": "hardware", "tags": ["windows", "gpu"], "see_also": ["TDR", "VRAM"] },
+    "SIMD": { "expansion": "Single Instruction Multiple Data", "def": "CPU vector instructions (AVX2/AVX-512) that process multiple values per instruction; the CPU kernels are SIMD-dispatched.", "category": "hardware", "tags": ["cpu"], "see_also": ["AVX", "FMA"] },
+    "AVX": { "expansion": "Advanced Vector Extensions", "def": "x86 SIMD instruction sets (AVX2 256-bit, AVX-512 512-bit). The native build targets the host's exact set.", "category": "hardware", "tags": ["cpu"], "see_also": ["SIMD", "FMA"] },
+    "FMA": { "expansion": "Fused Multiply-Add", "def": "a*b+c in one rounded instruction; key for matmul throughput and -ffp-contract=fast.", "category": "hardware", "tags": ["cpu"] },
+    "FTZ": { "expansion": "Flush-To-Zero (+ DAZ, Denormals-Are-Zero)", "def": "CPU modes that treat denormal floats as zero; set at startup to avoid a ~4x slowdown when Adam state goes denormal late in training.", "category": "hardware", "tags": ["cpu", "training"] },
+    "LR": { "expansion": "Learning Rate", "def": "Optimizer step size; scheduled (warmup/decay) by the trainer.", "category": "llm", "tags": ["training"] },
+    "GENERATIONTRACE": { "expansion": "GenerationTrace", "def": "The engine-emitted JSON artifact for the Viz: per-iteration frames (tokens, masked, committed, confidence, entropy, commit order) + optional per-MERA-level digests. Lets you scrub the diffusion 'thought process'.", "category": "project", "tags": ["viz"], "see_also": ["MERA"], "ref": "diffusion/VISUALIZATION_DESIGN.md" },
+    "VERBOSITY-SLIDER": { "expansion": "Verbosity / time slider", "def": "Future feature enabled by the gist: separate meaning (G) from surface, exposing two knobs — refinement depth K and realization length N — as a meaning-preserving terseness/verbosity/latency dial.", "category": "project", "tags": ["feature"], "see_also": ["GIST", "ACT"], "ref": "diffusion/chapters/ch32_tree_predictor/DESIGN_REVIEW_3.md §8" }
+  }
+}

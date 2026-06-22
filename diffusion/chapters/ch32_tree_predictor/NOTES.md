@@ -29,6 +29,12 @@
   (would lift MERA's ~16384 training ceiling).
 - Per-step arena allocator = the principled end state (stable VRAM, predictable peak).
 
+## Resources
+
+- **Acronym / terminology index** — [`/ACRONYMS.json`](../../ACRONYMS.json): parsable glossary (project
+  terms + common LLM terminology + external refs), keyed by UPPERCASE token. Doubles as the Viz
+  tooltip source. Keep it updated as we coin/use terms.
+
 ## Planned
 
 - **Interactive visualization & prompting** — scrub the diffusion "thought process" (iteration timeline)
