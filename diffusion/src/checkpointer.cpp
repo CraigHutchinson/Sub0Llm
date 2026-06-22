@@ -35,9 +35,11 @@ void write_progress(const fs::path& path, const Progress& p, std::string_view co
     std::ofstream f(path);
     if (!f) return;
     f << std::format(
-        "{{\n  \"step\": {},\n  \"best_nelbo\": {:.9g},\n  \"evals_since_best\": {},\n"
-        "  \"code_sha\": \"{}\",\n  \"config_sha\": \"{:016x}\",\n  \"updated_unix\": {}\n}}\n",
-        p.step, p.best, p.stalls, code_sha, config_sha, static_cast<std::int64_t>(std::time(nullptr)));
+        "{{\n  \"step\": {},\n  \"best_nelbo\": {:.9g},\n  \"best_step\": {},\n"
+        "  \"evals_since_best\": {},\n  \"code_sha\": \"{}\",\n  \"config_sha\": \"{:016x}\",\n"
+        "  \"updated_unix\": {}\n}}\n",
+        p.step, p.best, p.best_step, p.stalls, code_sha, config_sha,
+        static_cast<std::int64_t>(std::time(nullptr)));
 }
 
 // Read + validate against the resumed step; have=false on absence/mismatch (a stale sidecar is ignored).
@@ -59,6 +61,7 @@ Progress read_progress(const fs::path& path, std::uint64_t expect_step) {
         const std::string_view key = k.value_unsafe();
         if      (key == "step")             { std::uint64_t x; if (!v.get(x)) p.step = x; }
         else if (key == "best_nelbo")       { double x;        if (!v.get(x)) p.best = x; }
+        else if (key == "best_step")        { std::uint64_t x; if (!v.get(x)) p.best_step = x; }
         else if (key == "evals_since_best") { std::uint64_t x; if (!v.get(x)) p.stalls = x; }
     }
     p.have = (p.step == expect_step);
@@ -66,6 +69,11 @@ Progress read_progress(const fs::path& path, std::uint64_t expect_step) {
 }
 
 }  // namespace
+
+std::int64_t best_checkpoint_step(const std::string& ckpt_dir) {
+    const Progress p = read_progress(fs::path(ckpt_dir) / "train_state.json", /*expect=*/0);
+    return p.best_step > 0 ? static_cast<std::int64_t>(p.best_step) : -1;
+}
 
 Checkpointer::Checkpointer(Schedule sched, std::string ckpt_dir, std::string code_sha,
                            std::uint64_t config_sha, std::uint64_t patience, double min_improve)
@@ -97,7 +105,7 @@ void Checkpointer::restore(sub0llm::nn::Optimizer& opt) {
 
 bool Checkpointer::record(std::uint64_t step, double metric,
                           std::span<Variable* const> params, sub0llm::nn::Optimizer& opt) {
-    if (metric < prog_.best - min_improve_) { prog_.best = metric; prog_.stalls = 0; }
+    if (metric < prog_.best - min_improve_) { prog_.best = metric; prog_.stalls = 0; prog_.best_step = step; }
     else ++prog_.stalls;
     prog_.step = step;
     auto view = snapshot(params);   // current live params (on device) — save_checkpoint D2H's them

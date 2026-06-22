@@ -1,5 +1,7 @@
 #include "sub0diff/nn/model_io.hpp"
 
+#include "sub0diff/train/checkpointer.hpp"   // best_checkpoint_step — serve the early-stop winner
+
 #include "sub0llm/nn/checkpoint.hpp"
 
 #include <nlohmann/json.hpp>
@@ -50,7 +52,14 @@ LoadedModel load_model_dir(const std::string& dir) {
         param_ptrs = out.model->parameters();
     }
 
-    const std::string ckpt = sub0llm::latest_checkpoint_path(dir);
+    // Prefer the BEST (early-stop-winning) checkpoint recorded in train_state.json — after early-stop the
+    // LATEST step is past the best. Fall back to the latest if there's no best marker or its file is gone.
+    std::string ckpt;
+    if (const std::int64_t bs = train::best_checkpoint_step(dir); bs >= 0) {
+        const fs::path bp = root / std::format("step_{:09d}.ckpt", bs);
+        if (fs::exists(bp)) ckpt = bp.string();
+    }
+    if (ckpt.empty()) ckpt = sub0llm::latest_checkpoint_path(dir);
     if (ckpt.empty())
         throw std::runtime_error(std::format("load_model_dir: no step_*.ckpt in {}", dir));
     std::vector<sub0llm::autograd::Variable> params;

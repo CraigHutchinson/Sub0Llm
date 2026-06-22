@@ -36,11 +36,16 @@ namespace sub0diff::train {
 
 // Dynamic training progress — the honest-resume state, persisted as train_state.json beside the weights.
 struct Progress {
-    bool          have   = false;   // a matching sidecar was loaded (step validated against the ckpt)
-    std::uint64_t step   = 0;
-    double        best   = std::numeric_limits<double>::max();   // best held-out metric (lower is better)
-    std::uint64_t stalls = 0;       // evals since `best` last improved
+    bool          have      = false;   // a matching sidecar was loaded (step validated against the ckpt)
+    std::uint64_t step      = 0;
+    double        best      = std::numeric_limits<double>::max();  // best held-out metric (lower is better)
+    std::uint64_t stalls    = 0;       // evals since `best` last improved
+    std::uint64_t best_step = 0;       // the step whose checkpoint achieved `best` (the early-stop winner)
 };
+
+// The best (early-stop-winning) step recorded in `ckpt_dir/train_state.json`, or -1 if absent — so a
+// loader can serve the BEST checkpoint, not merely the latest (which, after early-stop, is past the best).
+[[nodiscard]] std::int64_t best_checkpoint_step(const std::string& ckpt_dir);
 
 class Checkpointer {
 public:

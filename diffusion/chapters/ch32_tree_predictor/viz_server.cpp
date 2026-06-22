@@ -273,6 +273,7 @@ int serve(Model& model, BPETokenizer& tok, std::int64_t Vr, const std::string& m
     std::println("  open:   http://{}:{}/tools/viz/", host, port);
     std::println("  api:    POST http://{}:{}/v1/generate_trace", host, port);
     std::println("  health: GET  http://{}:{}/health", host, port);
+    std::fflush(stdout);   // flush the startup banner before listen() blocks (logs visible while serving)
     if (!srv.listen(host, port)) { std::println("ERROR: failed to bind {}:{}", host, port); return 1; }
     return 0;
 }
