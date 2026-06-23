@@ -109,6 +109,45 @@ TEST_CASE("word_level - accented Latin letters stay inside the word (no accent s
     REQUIRE(tok.token_id("ñ") < 0);                          // the accent is NOT its own token
 }
 
+TEST_CASE("word_level truecase - collapses case duplicates and round-trips", "[tokenizer][word][truecase]") {
+    auto tok = BPETokenizer::word_level({"The cat sat. THE END. the the Need need café Café"}, /*truecase=*/true);
+    REQUIRE(tok.is_truecased());
+
+    // Need/need, The/the/THE all share ONE lemma id; case lives in the markers.
+    REQUIRE(tok.token_id("need") >= 0);
+    REQUIRE(tok.token_id("Need") < 0);      // no capitalised duplicate in the vocab
+    REQUIRE(tok.token_id("the")  >= 0);
+    REQUIRE(tok.token_id("The")  < 0);
+    REQUIRE(tok.token_id("THE")  < 0);
+    REQUIRE(tok.token_id("café") >= 0);     // accent preserved in the lemma
+    REQUIRE(tok.token_id("Café") < 0);
+
+    // Lossless round-trip across lower / Capitalised / ALL-CAPS / accented-capital.
+    for (const std::string s : {"The cat sat.", "THE END.", "the the", "Need need", "café Café"})
+        REQUIRE(tok.decode(tok.encode(s)) == s);
+
+    // "Café" encodes as the cap marker followed by the shared lemma "café".
+    const auto ids = tok.encode("Café");
+    REQUIRE(ids.size() == 2);
+    REQUIRE(ids[0] == tok.token_id("<|cap|>"));
+    REQUIRE(ids[1] == tok.token_id("café"));
+}
+
+TEST_CASE("word_level truecase - vocab shrinks vs cased; survives save/load", "[tokenizer][word][truecase]") {
+    const std::vector<std::string> corpus{"The dog ran. A dog. THE DOG. the dog runs and the cat naps."};
+    auto cased = BPETokenizer::word_level(corpus, /*truecase=*/false);
+    auto tc    = BPETokenizer::word_level(corpus, /*truecase=*/true);
+    REQUIRE(tc.vocab_size() < cased.vocab_size());   // The/THE/the collapsed to one lemma + 2 markers
+
+    const auto dir = std::filesystem::temp_directory_path() / "sub0llm_truecase_test";
+    std::filesystem::remove_all(dir);
+    tc.save(dir);
+    auto loaded = BPETokenizer::load(dir / "vocab.json", dir / "merges.txt");
+    REQUIRE(loaded.is_truecased());                  // flag restored from the markers in vocab
+    REQUIRE(loaded.decode(loaded.encode("THE DOG.")) == "THE DOG.");
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("word_level - survives save/load and is distinguished from char-level", "[tokenizer][word]") {
     const std::string text = "hark, who goes there?\n";
     auto tok = BPETokenizer::word_level({text});

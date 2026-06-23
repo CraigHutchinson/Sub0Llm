@@ -138,6 +138,52 @@ std::vector<std::string> split_words(std::string_view text) {
     return out;
 }
 
+// ── Truecasing (case-marker tokens) ─────────────────────────────────────────────
+// A word_level(truecase=true) tokenizer lowercases each word's LEMMA and prepends a marker token for the
+// case it stripped, so "Need"/"need"/"NEED" share ONE lemma id `need` (and the most frequent words —
+// the/The, he/He — stop splitting their statistics across two ids). Round-trip is GUARANTEED by
+// construction: a marker is assigned ONLY when the ASCII-only inverse of the lowercased form reproduces
+// the original word EXACTLY; anything else (mixed case, leading accented capital) is emitted verbatim.
+constexpr const char* kCapMarker = "<|cap|>";   // first letter upper:  Need  → <|cap|> need
+constexpr const char* kUpMarker  = "<|up|>";    // all letters upper:   NEED  → <|up|>  need
+
+std::string ascii_lower(std::string s) {
+    for (char& c : s) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    return s;
+}
+std::string ascii_upper(std::string s) {
+    for (char& c : s) if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
+    return s;
+}
+std::string ascii_cap(std::string s) {   // uppercase only the FIRST byte (if ASCII lower)
+    if (!s.empty() && s[0] >= 'a' && s[0] <= 'z') s[0] = static_cast<char>(s[0] - 32);
+    return s;
+}
+[[nodiscard]] bool is_ascii_word_char(unsigned char b) {
+    return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z');
+}
+
+// Transform one split_words unit into its truecased form: returns {marker, lemma} for a capitalised /
+// all-caps word, or {unit} unchanged otherwise. The marker is assigned only if the ASCII-only inverse
+// round-trips (so accents and mixed case stay verbatim). Length-1 words are left alone (e.g. "I").
+void truecase_unit(const std::string& u, std::vector<std::string>& out) {
+    std::size_t letters = 0;
+    for (unsigned char b : u) letters += is_ascii_word_char(b);
+    if (letters < 2) { out.push_back(u); return; }          // single-letter words: keep ("I", "A")
+    const std::string lw = ascii_lower(u);
+    if (u == lw) { out.push_back(u); return; }               // already lowercase → unmarked
+    if (u == ascii_cap(lw))   { out.emplace_back(kCapMarker); out.push_back(lw); return; }
+    if (u == ascii_upper(lw)) { out.emplace_back(kUpMarker);  out.push_back(lw); return; }
+    out.push_back(u);                                         // mixed case (McDonald) → verbatim
+}
+
+std::vector<std::string> truecase_units(const std::vector<std::string>& words) {
+    std::vector<std::string> out;
+    out.reserve(words.size() + words.size() / 4);
+    for (const auto& u : words) truecase_unit(u, out);
+    return out;
+}
+
 // Count frequency of adjacent pairs in a list of tokenised words.
 using WordList = std::vector<std::vector<std::string>>;
 using PairFreq = std::map<std::pair<std::string, std::string>, std::size_t>;
@@ -318,13 +364,20 @@ BPETokenizer BPETokenizer::char_level(const std::vector<std::string>& corpus) {
 // model literally cannot emit a non-word; it isolates whether BPE-512's salad came from
 // mis-assembled subword fragments under diffusion's parallel denoising (§13.6). Vocab is
 // every unique word/punct/whitespace token in the corpus (no frequency cap → large vocab).
-BPETokenizer BPETokenizer::word_level(const std::vector<std::string>& corpus) {
+BPETokenizer BPETokenizer::word_level(const std::vector<std::string>& corpus, bool truecase) {
     BPETokenizer tok;
     tok.word_level_ = true;
+    tok.truecased_  = truecase;
 
-    for (const auto& text : corpus)
-        for (auto& w : split_words(text))
+    if (truecase) {                       // markers get low, stable ids; lemmas follow
+        tok.add_token(kCapMarker);
+        tok.add_token(kUpMarker);
+    }
+    for (const auto& text : corpus) {
+        const auto words = split_words(text);
+        for (const auto& w : (truecase ? truecase_units(words) : words))
             tok.add_token(w);
+    }
 
     tok.eos_id_ = tok.add_special_token("<|endoftext|>");
     tok.bos_id_ = tok.eos_id_;
@@ -400,6 +453,9 @@ BPETokenizer BPETokenizer::load(
             if (!t.empty() && t.front() != '<' && word_to_chars(t).size() >= 2) { has_word = true; break; }
         tok.word_level_ = has_word;
         tok.char_level_ = !has_word;
+        // Truecasing leaves its markers in the vocab — restore the flag so a resumed/eval run re-applies
+        // the lowercasing transform on encode and the case restoration on decode.
+        tok.truecased_  = has_word && tok.vocab_.find(kCapMarker) != tok.vocab_.end();
     }
 
     return tok;
@@ -516,7 +572,10 @@ BPETokenizer::encode(std::string_view text) const {
     // (word), whitespace and newlines preserved — skip the GPT-2 pre-tokenizer that would
     // collapse whitespace and remap spaces.
     if (char_level_ || word_level_) {
-        const auto units = word_level_ ? split_words(text) : word_to_chars(text);
+        std::vector<std::string> units;
+        if (!word_level_)        units = word_to_chars(text);
+        else if (truecased_)     units = truecase_units(split_words(text));
+        else                     units = split_words(text);
         for (const auto& u : units) {
             if (const auto it = vocab_.find(u); it != vocab_.end())
                 result.push_back(it->second);
@@ -542,11 +601,19 @@ std::string BPETokenizer::decode(std::span<const TokenId> ids) const {
     // Char-level / word-level: tokens are literal text (code points or whole words, with
     // whitespace/newlines included) — concatenate as-is, no Ġ→space rewrite or byte remap.
     if (char_level_ || word_level_) {
+        int pending = 0;   // truecasing: 1 = capitalise next word, 2 = uppercase next word
         for (const TokenId id : ids) {
             if (id < 0 || static_cast<std::size_t>(id) >= id_to_token_.size())
                 throw std::runtime_error(std::format(
                     "BPETokenizer::decode: id {} out of range [0,{})", id, id_to_token_.size()));
-            out += id_to_token_[static_cast<std::size_t>(id)];
+            const std::string& t = id_to_token_[static_cast<std::size_t>(id)];
+            if (truecased_) {
+                if (t == kCapMarker) { pending = 1; continue; }
+                if (t == kUpMarker)  { pending = 2; continue; }
+                if (pending == 1) { out += ascii_cap(t);  pending = 0; continue; }
+                if (pending == 2) { out += ascii_upper(t); pending = 0; continue; }
+            }
+            out += t;
         }
         return out;
     }

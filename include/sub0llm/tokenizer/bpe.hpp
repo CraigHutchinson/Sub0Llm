@@ -69,8 +69,16 @@ public:
     // non-word (no subword fragments to mis-assemble) — it isolates whether BPE-512's salad
     // was fragment mis-coordination under diffusion's parallel denoising (TRAINING_DESIGN
     // §13.6). Vocab = every unique such token in `corpus` (no frequency cap).
+    // truecase: collapse case-duplicate vocab by lowercasing each word's LEMMA and emitting a leading
+    // case-marker token instead — "Need" → <|cap|> need, "NEED" → <|up|> need (lowercase = unmarked,
+    // mixed-case left verbatim). The most frequent words (the/The, he/He) stop being two ids with split
+    // statistics; decode re-applies the marker. Pure tokenizer transform — the single-stream model, loss
+    // and sampler are untouched. Cost: a capitalized word is 2 tokens, so sequences get a little longer.
     [[nodiscard]] static BPETokenizer word_level(
-        const std::vector<std::string>& corpus);
+        const std::vector<std::string>& corpus, bool truecase = false);
+
+    // True if this word-level tokenizer emits truecasing markers (above).
+    [[nodiscard]] bool is_truecased() const noexcept { return truecased_; }
 
     // ── Encode / decode ───────────────────────────────────────────────────────
 
@@ -133,6 +141,11 @@ private:
     // punctuation / whitespace tokens (not code points), decode concatenates literally.
     // Detected on load() by an empty merge list plus a multi-character word token.
     bool    word_level_{false};
+
+    // True for a truecased word_level() tokenizer: encode lowercases each word's lemma and inserts a
+    // <|cap|>/<|up|> marker before it; decode re-applies the case. Detected on load() by the markers'
+    // presence in the vocabulary.
+    bool    truecased_{false};
 
     // Apply one round of BPE to a sequence of tokens.
     // Returns true if any merge was performed.

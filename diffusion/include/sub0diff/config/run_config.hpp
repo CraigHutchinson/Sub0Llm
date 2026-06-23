@@ -72,6 +72,7 @@ struct Data {
     std::int64_t paragraphs = 0;       // 0/-1 = all paragraphs
     bool         char_level = false;   // char tokenizer (whitespace preserved) + raw reader
     bool         word_level = true;   // word tokenizer (one token per whole word) + raw reader
+    bool         truecase   = false;   // word tokenizer: lowercase lemma + <|cap|>/<|up|> case markers
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
@@ -81,6 +82,7 @@ struct Data {
         v("paragraphs", Scope::Runtime, self.paragraphs, "paragraph cap (0=all)");
         v("char_level", Scope::Runtime, self.char_level, "char-level tokenizer + raw reader");
         v("word_level", Scope::Runtime, self.word_level, "word-level tokenizer + raw reader");
+        v("truecase",   Scope::Runtime, self.truecase,   "truecasing case-marker tokens");
     }
 };
 

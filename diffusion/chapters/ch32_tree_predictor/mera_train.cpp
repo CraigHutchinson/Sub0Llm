@@ -229,7 +229,7 @@ int run_main(int argc, char** argv) {
             return BPETokenizer::load(vj, mt);
         }
         if (cfg.data.char_level) { std::print("char tokenizer... "); auto t = BPETokenizer::char_level(paras); std::println("{} vocab", t.vocab_size()); return t; }
-        if (cfg.data.word_level) { std::print("word tokenizer... "); auto t = BPETokenizer::word_level(paras); std::println("{} vocab", t.vocab_size()); return t; }
+        if (cfg.data.word_level) { std::print("word tokenizer{}... ", cfg.data.truecase ? " (truecase)" : ""); auto t = BPETokenizer::word_level(paras, cfg.data.truecase); std::println("{} vocab", t.vocab_size()); return t; }
         std::print("BPE tokenizer (vocab {})... ", cfg.model.vocab_size);
         auto t = BPETokenizer::train(paras, cfg.model.vocab_size); std::println("done"); return t;
     };
