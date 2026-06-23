@@ -193,3 +193,16 @@
   VALIDATED end-to-end. Residual quality: small-model repetition ("the sun and the sun and…"), expected at
   this scale. Backlog (docs/factored_tokens_research.md): inflection as parallel factors, compositional
   stems as subwords, quote-glyph normalization, typo→nearest-id input retrieval.
+
+- **Gist resolution check + readout fix (pre-boundary-aware, 2026-06-23).** Checking the gist on the
+  TRAINED truecase model: the coarsest level (8 slots for N=128) read as ~99-100% SPACE at top-1 — but the
+  coarse level had the HIGHEST activation RMS (~10-11.6 vs 8.7 fine), i.e. active, and content (her/lily/
+  was/loved) sat right under space in the top-3. Diagnosis: the gist probe ranked by RAW DOT-product, which
+  favors the highest-NORM embedding — the word-level space, by far the most frequent token, has a
+  dominant-norm "default" vector that won every argmax and MASKED the content. Fix: **cosine** readout
+  (÷|gist||E[v]|). Result: gist top-1==space drops 100% → 25% and resolves to the story's actual content
+  (her/lily/loved/dog/play/ball). So the coarse plan was doing real semantic work; the "gist collapses to
+  whitespace" worry was a MEASUREMENT artifact, not a coarsening failure. Output spacing is also normal
+  (58/128 spaces, no multi-space runs). The cosine gist is now a clean instrument for the boundary-aware
+  (gated-pool) A/B: does content-weighted coarsening give SHARPER / more boundary-aligned coarse slots than
+  rigid mean-pool? (gated-pool flag --mera-gated-pool already built, zero-init so starts == mean-pool.)
