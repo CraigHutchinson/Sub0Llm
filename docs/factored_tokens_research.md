@@ -103,6 +103,31 @@ Your framing ("`quix` → `quick` because context says so") is exactly **input-s
   embedding/head row. Both input and the tied head stay on the real vocab; nothing novel pollutes the head.
   This also matches "typos should be mapped to the relevant token."
 
+## 5.5. Sequential subwords vs parallel factors (compound/morpheme decomposition)
+
+A separate way to exploit morphology is **subword decomposition** — split words into reusable chunks:
+inflectional (`zoom`+`ed`, `play`+`ers`), compositional (`zoo`+`keep`+`ers`, `mon`+`day` sharing `day`).
+This is exactly BPE/WordPiece (we already have `BPETokenizer::train`) and, linguistically-aware,
+**Morfessor**. Two mechanisms for the same morphology — and the choice matters for **diffusion**:
+
+| | Sequential subwords (BPE/Morfessor) | Parallel factors (§4) |
+|---|---|---|
+| `zoomed` → | `zoom` + `ed` (2 **positions**) | lemma `zoom` + tense factor (1 token) |
+| Vocab | ↓ (shared chunks) | ↓ (shared lemmas) |
+| **Token count / seq length** | **↑ (one word → 2–3 tokens)** | unchanged |
+| Composition | model composes across positions via attention | summed at the embedding |
+| Carries semantics? | **yes** — stems (`zoo`,`keep`,`day`) are meaning units | only grammatical features |
+| Needs | merge table (have) / Morfessor | morphological analyzer |
+
+**The diffusion catch:** subwords DON'T reduce the token count — they increase it (only the *vocab*
+shrinks). At a fixed `seq_len`, `zoo-keep-ers` consumes 3 of 128 slots, so **fewer words fit per window**
+(less context) and MERA's O(N·w) cost rises. Word-level packs the most *meaning per position*. So the
+elegant split is by morpheme TYPE:
+- **Inflectional** suffixes (`-ed/-s/-ing/-ers`) → better as **parallel factors** (keep seq length).
+- **Compositional** stems (`zoo`+`keep`, `mon`+`day`) → genuine semantic units → **sequential subwords**
+  earn their position (the model gets `day`'s shared meaning across all weekdays for free).
+A hybrid — Morfessor-style stem segmentation for content morphemes + factored inflection — is the target.
+
 ## 6. Diffusion-specific angle (a genuinely novel fit)
 
 - Our denoiser already predicts **all positions in parallel** with a full-vocab softmax each. Adding
