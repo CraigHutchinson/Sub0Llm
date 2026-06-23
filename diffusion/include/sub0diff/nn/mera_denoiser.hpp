@@ -165,10 +165,12 @@ public:
     }
 
     // Viz Phase E: the GIST decoded to TOKEN space. Runs one forward over `canvas`, captures the top
-    // (coarsest) level — top_len D-vectors, the model's compressed "plan" for this window — and projects
-    // each through the tied embedding head (x·Eᵀ over real tokens), returning the top-k tokens per gist
-    // slot. It is a PROBE: the head is trained for the fine level, so read it as "which tokens this coarse
-    // vector points at," a human-readable handle on the gist, not a literal decode.
+    // (coarsest) level — top_len D-vectors, the model's compressed "plan" for this window — and reads off
+    // the top-k tokens each coarse vector points at by COSINE similarity to the tied embedding (x·Eᵀ /
+    // |x||E|). Cosine (not raw dot) matters: the most-frequent token (the word-level space) trains a
+    // dominant-NORM embedding that wins every raw-dot argmax, masking the content — normalising by |E[v]|
+    // removes that frequency/norm bias and shows the DIRECTION the coarse vector encodes. Still a PROBE
+    // (the head is trained for the fine level), so read it as "which tokens this coarse vector points at."
     [[nodiscard]] viz::GistReadout gist_readout(std::span<const std::int32_t> canvas, int top_k = 3) const {
         const std::int64_t N = static_cast<std::int64_t>(canvas.size());
         sub0llm::Tensor input({N}, sub0llm::DType::Int32);
@@ -186,15 +188,28 @@ public:
         const std::int64_t top_len = gist.numel() / embed_dim_;
         const int k = std::max(1, std::min<int>(top_k, static_cast<int>(real_vocab_)));
 
+        // Precompute each token embedding's L2 norm once (the cosine denominator that de-biases space).
+        std::vector<float> enorm(static_cast<std::size_t>(real_vocab_));
+        for (std::int64_t v = 0; v < real_vocab_; ++v) {
+            const float* ev = &e[v * embed_dim_];
+            float s2 = 0.0f;
+            for (std::int64_t d = 0; d < embed_dim_; ++d) s2 += ev[d] * ev[d];
+            enorm[static_cast<std::size_t>(v)] = std::sqrt(s2) + 1e-8f;
+        }
+
         viz::GistReadout out;
         std::vector<std::pair<float, std::int32_t>> scored(static_cast<std::size_t>(real_vocab_));
         for (std::int64_t s = 0; s < top_len; ++s) {
             const float* gv = &g[s * embed_dim_];
+            float gn = 0.0f;
+            for (std::int64_t d = 0; d < embed_dim_; ++d) gn += gv[d] * gv[d];
+            gn = std::sqrt(gn) + 1e-8f;
             for (std::int64_t v = 0; v < real_vocab_; ++v) {
                 const float* ev = &e[v * embed_dim_];
                 float dot = 0.0f;
                 for (std::int64_t d = 0; d < embed_dim_; ++d) dot += gv[d] * ev[d];
-                scored[static_cast<std::size_t>(v)] = {dot, static_cast<std::int32_t>(v)};
+                scored[static_cast<std::size_t>(v)] = {dot / (gn * enorm[static_cast<std::size_t>(v)]),
+                                                       static_cast<std::int32_t>(v)};
             }
             std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
                               [](const auto& a, const auto& b) { return a.first > b.first; });
