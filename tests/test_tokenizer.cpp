@@ -133,6 +133,27 @@ TEST_CASE("word_level truecase - collapses case duplicates and round-trips", "[t
     REQUIRE(ids[1] == tok.token_id("café"));
 }
 
+TEST_CASE("word_level truecase - only collapses words that appear in BOTH cases", "[tokenizer][word][truecase]") {
+    // "the"/"The" both occur → collapse. "Lily"/"Tom" only ever capitalised (names) → keep verbatim:
+    // collapsing them would merge with nothing, just cost a marker and a thing for the model to learn.
+    auto tok = BPETokenizer::word_level({"the dog ran. The cat sat. Lily and Tom played with the dog."},
+                                        /*truecase=*/true);
+    // dual-case function word collapses:
+    REQUIRE(tok.token_id("the") >= 0);
+    REQUIRE(tok.token_id("The") < 0);
+    // always-capitalised names stay verbatim — NO lowercase lemma, NO marker:
+    REQUIRE(tok.token_id("Lily") >= 0);
+    REQUIRE(tok.token_id("lily") < 0);
+    REQUIRE(tok.token_id("Tom")  >= 0);
+    REQUIRE(tok.token_id("tom")  < 0);
+    const auto ids = tok.encode("Lily");
+    REQUIRE(ids.size() == 1);                       // one token, not <|cap|>+lily
+    REQUIRE(ids[0] == tok.token_id("Lily"));
+    // round-trip holds for both the collapsed and the verbatim path:
+    for (const std::string s : {"The cat sat.", "Lily and Tom played with the dog."})
+        REQUIRE(tok.decode(tok.encode(s)) == s);
+}
+
 TEST_CASE("word_level truecase - vocab shrinks vs cased; survives save/load", "[tokenizer][word][truecase]") {
     const std::vector<std::string> corpus{"The dog ran. A dog. THE DOG. the dog runs and the cat naps."};
     auto cased = BPETokenizer::word_level(corpus, /*truecase=*/false);

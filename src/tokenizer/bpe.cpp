@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace sub0llm {
 
@@ -164,23 +165,33 @@ std::string ascii_cap(std::string s) {   // uppercase only the FIRST byte (if AS
 }
 
 // Transform one split_words unit into its truecased form: returns {marker, lemma} for a capitalised /
-// all-caps word, or {unit} unchanged otherwise. The marker is assigned only if the ASCII-only inverse
-// round-trips (so accents and mixed case stay verbatim). Length-1 words are left alone (e.g. "I").
-void truecase_unit(const std::string& u, std::vector<std::string>& out) {
+// all-caps word whose lowercase lemma is COLLAPSIBLE (it actually occurs lowercase in the corpus, so
+// merging the two forms is a real statistic win), or {unit} unchanged otherwise. An always-capitalised
+// name (Lily, Tom) has nothing to merge with — collapsing it would only cost a marker token and force the
+// model to learn to emit it — so it stays verbatim. The marker is assigned only if the ASCII-only inverse
+// round-trips (accents / mixed case stay verbatim). Length-1 words are left alone ("I", "A").
+template <class Collapsible>
+void truecase_unit(const std::string& u, Collapsible&& collapsible, std::vector<std::string>& out) {
     std::size_t letters = 0;
     for (unsigned char b : u) letters += is_ascii_word_char(b);
-    if (letters < 2) { out.push_back(u); return; }          // single-letter words: keep ("I", "A")
+    if (letters < 2) { out.push_back(u); return; }
     const std::string lw = ascii_lower(u);
     if (u == lw) { out.push_back(u); return; }               // already lowercase → unmarked
-    if (u == ascii_cap(lw))   { out.emplace_back(kCapMarker); out.push_back(lw); return; }
-    if (u == ascii_upper(lw)) { out.emplace_back(kUpMarker);  out.push_back(lw); return; }
-    out.push_back(u);                                         // mixed case (McDonald) → verbatim
+    const bool cap = (u == ascii_cap(lw));
+    const bool up  = (u == ascii_upper(lw));
+    if ((cap || up) && collapsible(lw)) {                     // dual-case word → collapse to lemma + marker
+        out.emplace_back(cap ? kCapMarker : kUpMarker);
+        out.push_back(lw);
+    } else {
+        out.push_back(u);                                    // name / proper noun / mixed case → verbatim
+    }
 }
 
-std::vector<std::string> truecase_units(const std::vector<std::string>& words) {
+template <class Collapsible>
+std::vector<std::string> truecase_units(const std::vector<std::string>& words, Collapsible&& collapsible) {
     std::vector<std::string> out;
     out.reserve(words.size() + words.size() / 4);
-    for (const auto& u : words) truecase_unit(u, out);
+    for (const auto& u : words) truecase_unit(u, collapsible, out);
     return out;
 }
 
@@ -369,14 +380,24 @@ BPETokenizer BPETokenizer::word_level(const std::vector<std::string>& corpus, bo
     tok.word_level_ = true;
     tok.truecased_  = truecase;
 
-    if (truecase) {                       // markers get low, stable ids; lemmas follow
-        tok.add_token(kCapMarker);
+    if (truecase) {
+        tok.add_token(kCapMarker);        // markers get low, stable ids; lemmas follow
         tok.add_token(kUpMarker);
-    }
-    for (const auto& text : corpus) {
-        const auto words = split_words(text);
-        for (const auto& w : (truecase ? truecase_units(words) : words))
-            tok.add_token(w);
+        // Pass 1: which lemmas actually occur LOWERCASE? Only those are worth collapsing (a cap/upper
+        // form then merges with an existing lowercase form). Always-capitalised names never enter here,
+        // so they stay verbatim in pass 2.
+        std::unordered_set<std::string> lower;
+        for (const auto& text : corpus)
+            for (const auto& w : split_words(text))
+                if (w == ascii_lower(w)) lower.insert(w);
+        const auto collapsible = [&](const std::string& lw) { return lower.find(lw) != lower.end(); };
+        for (const auto& text : corpus)              // pass 2: build vocab over the conditionally-truecased units
+            for (const auto& w : truecase_units(split_words(text), collapsible))
+                tok.add_token(w);
+    } else {
+        for (const auto& text : corpus)
+            for (auto& w : split_words(text))
+                tok.add_token(w);
     }
 
     tok.eos_id_ = tok.add_special_token("<|endoftext|>");
@@ -574,7 +595,9 @@ BPETokenizer::encode(std::string_view text) const {
     if (char_level_ || word_level_) {
         std::vector<std::string> units;
         if (!word_level_)        units = word_to_chars(text);
-        else if (truecased_)     units = truecase_units(split_words(text));
+        else if (truecased_)     // collapse a cap/upper word only if its lowercase lemma is in the vocab
+            units = truecase_units(split_words(text),
+                                   [&](const std::string& lw) { return vocab_.find(lw) != vocab_.end(); });
         else                     units = split_words(text);
         for (const auto& u : units) {
             if (const auto it = vocab_.find(u); it != vocab_.end())
