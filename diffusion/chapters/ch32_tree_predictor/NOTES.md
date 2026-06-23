@@ -206,3 +206,18 @@
   (58/128 spaces, no multi-space runs). The cosine gist is now a clean instrument for the boundary-aware
   (gated-pool) A/B: does content-weighted coarsening give SHARPER / more boundary-aligned coarse slots than
   rigid mean-pool? (gated-pool flag --mera-gated-pool already built, zero-init so starts == mean-pool.)
+
+- **Boundary-aware coarsening A/B — FALSIFIED with a mechanism (2026-06-23).** Trained gated (content-
+  weighted) pool vs rigid mean-pool, identical config (MERA seq128/win16 → 128·32·8, truecase, cuda-native,
+  zero-init gate so it starts == mean-pool). Gated tracked **~0.15-0.30 NELBO WORSE the entire run** and
+  early-plateaued; **best NELBO gated 1.668 (step 229398) vs mean-pool 1.514** (+0.15). The gist (cosine)
+  comparison shows WHY: the gated pool DID its job — gist top-1==space dropped 25% → **1%** (it down-weights
+  the uninformative space token, leaving a content-only coarse plan: Tom/wanted/ball) — BUT this was
+  counterproductive: gist SHARPNESS fell (mean top-1 cosine 0.366 → 0.208, blurrier coarse vectors) and
+  NELBO rose. **Mechanism:** in word-level tokenization the space token is NOT noise to suppress — it is
+  word-BOUNDARY structure; the rigid mean-pool's space-aware coarse representation predicts better than the
+  gated pool's content-only one. So suppressing the boundary signal removes useful structure. Verdict: keep
+  rigid mean-pool; gated pool is a documented negative. NOTE the run was STOPPED early (plateaued in noise)
+  rather than run to its own early-stop — patience-on-best drags noisy plateaus because every sub-noise "new
+  best" resets stalls; a noise-scaled min-improve deadband is the fix (pure trend-over-5 would have killed
+  mean-pool's late 1.514 jump at stalls 9).
