@@ -175,3 +175,21 @@
   consistent config layer (run_config + config.json), so resume/serve reconstruct it. Open: run the
   matched A/B (gated vs mean) on TinyStories and read the gist — does the coarse plan stop collapsing to
   whitespace / align to word boundaries? (The gist view above is the readout for that experiment.)
+
+- **Tokenizer quality pass + truecasing (full verification run, 2026-06-23).** Fixed a chain of word_level
+  issues that fragmented the vocab: (1) LEADING quotes welded to words ('And, ''What's → 1000s of rare
+  variants) — apostrophe now joins only inside a letter run; (2) multi-byte accents split words (piñata →
+  pi+ñ+ata) — is_letter now accepts Latin-1/Extended letters; (3) the corpus typo concern measured at
+  ~0.02% (negligible; a blind corrector would corrupt real words/names — dropped, hand-cleaned instead).
+  Then **truecasing** (--truecase): lowercase each word's lemma + a <|cap|>/<|up|> marker, so Need/need/NEED
+  and the high-frequency the/The collapse to one lemma id with de-fragmented statistics; round-trip is
+  guaranteed by construction; PURE tokenizer transform (denoiser/loss/sampler untouched). Full corpus:
+  vocab 11929 → 10314 (−13.5%), tokens +6.7% (the capitalised-word +1-marker cost). **Verification run**
+  (MERA, seq128/win16/c4 → levels 128·32·8, B8, cuda-native): early-stopped at step 314090, **best NELBO
+  1.514 @ step 224350** (patience-10 deadband saved it TWICE — it made its biggest gains at stalls 9, the
+  classic diffusion sticky-basin/plateau-break dynamic). Served the best checkpoint and generated: output
+  is **coherent TinyStories prose AND case restores correctly** ("named Lily", "She had", "The sun was
+  shining", "One day", "They liked") — the model learned to place the case markers. Truecasing design
+  VALIDATED end-to-end. Residual quality: small-model repetition ("the sun and the sun and…"), expected at
+  this scale. Backlog (docs/factored_tokens_research.md): inflection as parallel factors, compositional
+  stems as subwords, quote-glyph normalization, typo→nearest-id input retrieval.
