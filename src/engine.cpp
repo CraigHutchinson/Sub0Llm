@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <print>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -76,7 +77,7 @@ static size_t g_act_used = 0;
 
 static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
     if (g_act_used + n > ACT_CAP) {
-        std::fprintf(stderr, "fatal: activation arena overflow (need %zu, cap %zu)\n",
+        std::println(stderr, "fatal: activation arena overflow (need {}, cap {})",
                      g_act_used + n, ACT_CAP);
         std::abort();
     }
@@ -117,7 +118,7 @@ static Node* mk_param(int r, int c, bool decay) {
 }
 
 static Node* mk_node(Op op, int r, int c) {
-    if (g_pool_used >= MAX_NODES) { std::fprintf(stderr, "fatal: node pool overflow\n"); std::abort(); }
+    if (g_pool_used >= MAX_NODES) { std::println(stderr, "fatal: node pool overflow"); std::abort(); }
     Node& nd = g_pool[g_pool_used++];
     nd = Node{};
     nd.op = op; nd.rows = r; nd.cols = c;
@@ -483,7 +484,7 @@ bool load_model(const char* path) {
         h.d_model != ref.d_model || h.n_layers != ref.n_layers || h.n_heads != ref.n_heads ||
         h.d_ff != ref.d_ff || h.seq_len != ref.seq_len || h.vocab != ref.vocab ||
         h.ternary != ref.ternary || h.param_floats != ref.param_floats) {
-        std::fprintf(stderr, "error: model was built with a different (constexpr) config\n");
+        std::println(stderr, "error: model was built with a different (constexpr) config");
         return false;
     }
     is.read((char*)g_param_data.data(), (std::streamsize)(PARAM_FLOATS * sizeof(float)));
@@ -491,11 +492,11 @@ bool load_model(const char* path) {
 }
 
 void print_config() {
-    std::printf("model: d=%d L=%d H=%d ff=%d seq=%d vocab=%d%s | params: %.2fM | "
-                "static mem: params %.1fMB acts %.1fMB\n",
-                D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
-                4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6);
+    std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
+                 "static mem: params {:.1f}MB acts {:.1f}MB",
+                 D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                 USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
+                 4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6);
 }
 
 const char* default_corpus()     { return DEFAULT_CORPUS; }
@@ -564,9 +565,9 @@ void bpe_encode_word(std::vector<int>& seq, std::vector<int>& out) {
 
 bool load_tokenizer(const char* path) {
     std::ifstream is(path, std::ios::binary);
-    if (!is) { std::fprintf(stderr, "tokenizer: cannot open '%s'\n", path); return false; }
+    if (!is) { std::println(stderr, "tokenizer: cannot open '{}'", path); return false; }
     if (read_pod<std::uint32_t>(is) != 0x5A543053u) {  // "S0TZ"
-        std::fprintf(stderr, "tokenizer: bad magic in '%s'\n", path);
+        std::println(stderr, "tokenizer: bad magic in '{}'", path);
         return false;
     }
     Tokenizer t;
@@ -599,9 +600,9 @@ bool load_tokenizer(const char* path) {
         is.read(w.data(), len);
         t.attested.insert(std::move(w));
     }
-    if (!is) { std::fprintf(stderr, "tokenizer: truncated '%s'\n", path); return false; }
+    if (!is) { std::println(stderr, "tokenizer: truncated '{}'", path); return false; }
     if (t.vocab != VOCAB)
-        std::fprintf(stderr, "tokenizer: vocab %d != built-in VOCAB %d (stale artifact?)\n", t.vocab, VOCAB);
+        std::println(stderr, "tokenizer: vocab {} != built-in VOCAB {} (stale artifact?)", t.vocab, VOCAB);
     t.loaded = true;
     g_tok = std::move(t);
     return true;

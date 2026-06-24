@@ -1,17 +1,59 @@
 {
     "version": 8,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
     "configurePresets": [
         {
-            "name": "Clang 22.1.6 x86_64-pc-windows-msvc",
-            "displayName": "Clang 22.1.6 x86_64-pc-windows-msvc",
-            "description": "Using compilers: C = C:\\Program Files\\LLVM\\bin\\clang.exe, CXX = C:\\Program Files\\LLVM\\bin\\clang++.exe",
+            "name": "base",
+            "hidden": true,
+            "description": "Shared settings: Clang + Ninja, per-preset build/install dirs. Compilers are looked up on PATH so the presets are portable across machines.",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "installDir": "${sourceDir}/out/install/${presetName}",
+            "generator": "Ninja",
             "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
-                "CMAKE_C_COMPILER": "C:/Program Files/LLVM/bin/clang.exe",
-                "CMAKE_CXX_COMPILER": "C:/Program Files/LLVM/bin/clang++.exe",
-                "CMAKE_BUILD_TYPE": "Debug"
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
             }
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug",
+            "description": "Unoptimized build with debug info; generic CPU.",
+            "inherits": "base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "release",
+            "displayName": "Release (portable)",
+            "description": "Optimized build that runs on any x86-64 CPU. Use when the build host differs from the run host.",
+            "inherits": "base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "native",
+            "displayName": "Release (native, this machine)",
+            "description": "Optimized for the building machine's exact CPU (-march=native). This project always builds where the model runs, so this is the default for real runs.",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "SUB0_NATIVE": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "debug",   "configurePreset": "debug" },
+        { "name": "release", "configurePreset": "release" },
+        { "name": "native",  "configurePreset": "native" }
+    ],
+    "testPresets": [
+        {
+            "name": "native",
+            "configurePreset": "native",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "debug",
+            "configurePreset": "debug",
+            "output": { "outputOnFailure": true }
         }
     ]
 }

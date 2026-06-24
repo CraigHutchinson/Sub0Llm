@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <print>
 #include <random>
 #include <string>
 #include <vector>
@@ -18,11 +19,11 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                         int n, float temp, int topk, unsigned seed) {
     sub0::build_model();                 // establish parameter-node layout
     if (!sub0::load_model(model_in)) {   // overwrite with trained weights
-        std::fprintf(stderr, "gen: cannot load model '%s'\n", model_in);
+        std::println(stderr, "gen: cannot load model '{}'", model_in);
         return 1;
     }
     if (!sub0::load_tokenizer(sub0::default_tokenizer())) {
-        std::fprintf(stderr, "gen: cannot load tokenizer '%s'\n", sub0::default_tokenizer());
+        std::println(stderr, "gen: cannot load tokenizer '{}'", sub0::default_tokenizer());
         return 1;
     }
 
@@ -63,6 +64,6 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         ctx.push_back(pick);
     }
     sub0::graph_reset();
-    std::printf("%s\n", sub0::detokenize(ctx).c_str());
+    std::println("{}", sub0::detokenize(ctx));
     return 0;
 }

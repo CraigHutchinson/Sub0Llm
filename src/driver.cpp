@@ -8,9 +8,9 @@
 
 #include "sub0/core.hpp"  // for DEFAULT_CORPUS (generated config)
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <print>
 #include <random>
 
 // Entry points provided by the stage libraries we link against.
@@ -29,13 +29,13 @@ static float arg_float(int c, char** v, const char* k, float d) {
 }
 
 static void usage() {
-    std::printf(
-        "sub0llm — staged CPU transformer LM (config baked in at build time)\n\n"
+    std::println(
+        "sub0llm \u2014 staged CPU transformer LM (config baked in at build time)\n\n"
         "  sub0llm train <model.bin> [corpus] [--steps N --batch N --lr F --seed N]\n"
         "      corpus defaults to the one this build was configured with:\n"
-        "      %s\n\n"
+        "      {}\n\n"
         "  sub0llm gen   <model.bin> \"<prompt>\" [--n N --temp F --topk N --seed N]\n\n"
-        "  Reconfigure dimensions/corpus/vocab by re-running cmake with -DSUB0_* and rebuilding.\n",
+        "  Reconfigure dimensions/corpus/vocab by re-running cmake with -DSUB0_* and rebuilding.",
         DEFAULT_CORPUS);
 }
 

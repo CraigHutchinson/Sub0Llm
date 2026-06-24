@@ -26,6 +26,24 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
+# Native tuning. This project is always built on the machine the model will run
+# on, so an exact-CPU build is the intended default for real runs (the `native`
+# preset). It is opt-in and probed for support so portable/cross builds and
+# non-GCC/Clang toolchains still configure cleanly.
+option(SUB0_NATIVE "Optimize for the building machine's exact CPU (-march=native)" OFF)
+if(SUB0_NATIVE)
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag("-march=native" SUB0_HAS_MARCH_NATIVE)
+  if(SUB0_HAS_MARCH_NATIVE)
+    # Release-only: a -march=native Debug build would also be CPU-specific but is
+    # not what anyone debugging wants, and the speed only matters for real runs.
+    add_compile_options($<$<CONFIG:Release>:-march=native>)
+    message(STATUS "SUB0_NATIVE: building for this machine's CPU (-march=native)")
+  else()
+    message(WARNING "SUB0_NATIVE requested but the compiler rejects -march=native; using a generic build")
+  endif()
+endif()
+
 find_package(OpenMP)
 
 # --- Dependency management via CPM -----------------------------------------
