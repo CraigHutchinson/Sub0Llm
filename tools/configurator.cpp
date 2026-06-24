@@ -157,11 +157,16 @@ int main(int argc, char** argv) {
         return s == TOK_CAP ? cap_id : s == TOK_UP ? up_id : byte_base[s];
     };
 
-    // 5. Pre-tokenize into word units (markers + alpha) and standalone symbols.
-    //    Each unit becomes one entry in the unique-word table; everything else is
-    //    a standalone base token that never participates in merges.
+    // 5. Pre-tokenize into word units (alpha runs) and standalone symbols. Each
+    //    unit becomes one entry in the unique-word table; everything else --
+    //    punctuation, spaces, AND the case markers -- is a standalone base token
+    //    that never participates in merges. Keeping the markers atomic is the whole
+    //    point of truecasing: BPE merges the lowercase letters only, so "They"
+    //    tokenizes as <|cap|> + the same `they` token as lowercase "they" rather
+    //    than a separate <|cap|>they merge. Letting markers merge would re-introduce
+    //    the per-case vocabulary split truecasing exists to remove.
     auto is_unit_sym = [&](int s) {
-        return s == TOK_CAP || s == TOK_UP || is_alpha(static_cast<unsigned char>(s));
+        return is_alpha(static_cast<unsigned char>(s));
     };
     std::vector<int> items;                   // >=0 standalone base id; <0 -> -(word index + 1)
     items.reserve(stream.size());

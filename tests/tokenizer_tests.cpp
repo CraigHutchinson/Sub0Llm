@@ -47,6 +47,19 @@ TEST_CASE("truecasing preserves capitalization through the round-trip", "[tokeni
     REQUIRE(sub0::detokenize(sub0::encode(text)) == text);
 }
 
+TEST_CASE("case markers stay atomic so the word token is case-shared", "[tokenizer]") {
+    REQUIRE(tokenizer_ready());
+    // The point of truecasing: "They" must encode as a standalone <|cap|> marker
+    // followed by the *same* token sequence as lowercase "they". If BPE were allowed
+    // to merge the marker into the word, "They" would get its own token and the tail
+    // would differ -- the per-case vocab split this design exists to prevent.
+    const std::vector<int> low = sub0::encode("they");
+    const std::vector<int> cap = sub0::encode("They");
+    REQUIRE_FALSE(low.empty());
+    REQUIRE(cap.size() == low.size() + 1);
+    REQUIRE(std::vector<int>(cap.begin() + 1, cap.end()) == low);
+}
+
 TEST_CASE("encode is deterministic", "[tokenizer]") {
     REQUIRE(tokenizer_ready());
     const std::string text = "the dog ran and the cat slept";

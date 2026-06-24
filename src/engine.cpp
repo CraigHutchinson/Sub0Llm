@@ -615,9 +615,11 @@ std::vector<int> encode(const std::string& text) {
     const std::string norm = casing::normalize_quotes(text, replaced);
     const std::vector<int> stream = casing::truecase_tokenize(norm, g_tok.attested, nullptr);
 
+    // Mirror the configurator's pre-tokenization: only alpha runs form BPE units;
+    // the case markers stay atomic (see configurator step 5), so a prompt's "They"
+    // encodes as <|cap|> + the shared `they` token, in-distribution with training.
     auto is_unit = [](int s) {
-        return s == casing::TOK_CAP || s == casing::TOK_UP ||
-               casing::is_alpha(static_cast<unsigned char>(s));
+        return casing::is_alpha(static_cast<unsigned char>(s));
     };
     out.reserve(stream.size());
     for (std::size_t i = 0, n = stream.size(); i < n;) {
