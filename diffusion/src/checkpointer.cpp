@@ -34,11 +34,15 @@ void write_progress(const fs::path& path, const Progress& p, std::string_view co
                     std::uint64_t config_sha) {
     std::ofstream f(path);
     if (!f) return;
+    std::string recent = "[";
+    for (std::size_t i = 0; i < p.recent.size(); ++i)
+        recent += std::format("{}{:.9g}", i ? ", " : "", p.recent[i]);
+    recent += "]";
     f << std::format(
         "{{\n  \"step\": {},\n  \"best_nelbo\": {:.9g},\n  \"best_step\": {},\n"
-        "  \"evals_since_best\": {},\n  \"code_sha\": \"{}\",\n  \"config_sha\": \"{:016x}\",\n"
-        "  \"updated_unix\": {}\n}}\n",
-        p.step, p.best, p.best_step, p.stalls, code_sha, config_sha,
+        "  \"evals_since_best\": {},\n  \"recent\": {},\n  \"code_sha\": \"{}\",\n"
+        "  \"config_sha\": \"{:016x}\",\n  \"updated_unix\": {}\n}}\n",
+        p.step, p.best, p.best_step, p.stalls, recent, code_sha, config_sha,
         static_cast<std::int64_t>(std::time(nullptr)));
 }
 
@@ -63,6 +67,10 @@ Progress read_progress(const fs::path& path, std::uint64_t expect_step) {
         else if (key == "best_nelbo")       { double x;        if (!v.get(x)) p.best = x; }
         else if (key == "best_step")        { std::uint64_t x; if (!v.get(x)) p.best_step = x; }
         else if (key == "evals_since_best") { std::uint64_t x; if (!v.get(x)) p.stalls = x; }
+        else if (key == "recent") {
+            if (auto arr = v.get_array(); !arr.error())
+                for (auto e : arr.value_unsafe()) { double x; if (!e.get(x)) p.recent.push_back(x); }
+        }
     }
     p.have = (p.step == expect_step);
     return p;
@@ -70,15 +78,29 @@ Progress read_progress(const fs::path& path, std::uint64_t expect_step) {
 
 }  // namespace
 
+double trend_slope(std::span<const double> ys) {
+    const std::size_t n = ys.size();
+    if (n < 2) return -1.0;   // <2 points → "still descending", never a plateau
+    const double xm = static_cast<double>(n - 1) / 2.0;
+    double ym = 0.0; for (double y : ys) ym += y; ym /= static_cast<double>(n);
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double dx = static_cast<double>(i) - xm;
+        num += dx * (ys[i] - ym);
+        den += dx * dx;
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
 std::int64_t best_checkpoint_step(const std::string& ckpt_dir) {
     const Progress p = read_progress(fs::path(ckpt_dir) / "train_state.json", /*expect=*/0);
     return p.best_step > 0 ? static_cast<std::int64_t>(p.best_step) : -1;
 }
 
 Checkpointer::Checkpointer(Schedule sched, std::string ckpt_dir, std::string code_sha,
-                           std::uint64_t config_sha, std::uint64_t patience, double min_improve)
+                           std::uint64_t config_sha, std::uint64_t plateau_window, double min_improve)
     : sched_(sched), dir_(std::move(ckpt_dir)), code_sha_(std::move(code_sha)),
-      config_sha_(config_sha), patience_(patience), min_improve_(min_improve) {}
+      config_sha_(config_sha), plateau_window_(plateau_window), min_improve_(min_improve) {}
 
 bool Checkpointer::due(std::uint64_t step) const noexcept {
     return sched_.eval_every != 0 && step % sched_.eval_every == 0;
@@ -105,15 +127,23 @@ void Checkpointer::restore(sub0llm::nn::Optimizer& opt) {
 
 bool Checkpointer::record(std::uint64_t step, double metric,
                           std::span<Variable* const> params, sub0llm::nn::Optimizer& opt) {
+    // best/best_step (with a min-improve debounce) drive WHICH checkpoint is served, not the stop.
     if (metric < prog_.best - min_improve_) { prog_.best = metric; prog_.stalls = 0; prog_.best_step = step; }
     else ++prog_.stalls;
     prog_.step = step;
+    // Trend-line plateau detector: keep the last `plateau_window` metrics; stop once their fitted slope
+    // is ≥ 0 (flat/rising held-out curve). The oscillating up/down deltas at a real plateau make the slope
+    // cross 0 with no magnitude threshold needed.
+    prog_.recent.push_back(metric);
+    while (plateau_window_ != 0 && prog_.recent.size() > plateau_window_) prog_.recent.erase(prog_.recent.begin());
+    const bool plateaued = plateau_window_ != 0 && prog_.recent.size() >= plateau_window_ &&
+                           trend_slope(prog_.recent) >= 0.0;
     auto view = snapshot(params);   // current live params (on device) — save_checkpoint D2H's them
     sub0llm::save_checkpoint(view, dir_, static_cast<std::int64_t>(step));
     const std::string ck = sub0llm::latest_checkpoint_path(dir_);
     if (!ck.empty()) { fs::path op = ck; op.replace_extension(".opt"); opt.save_state(op.string()); }
     write_progress(fs::path(dir_) / "train_state.json", prog_, code_sha_, config_sha_);
-    return patience_ != 0 && prog_.stalls >= patience_;
+    return plateaued;
 }
 
 void Checkpointer::save_safety(std::uint64_t step,

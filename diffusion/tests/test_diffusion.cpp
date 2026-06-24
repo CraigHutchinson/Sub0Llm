@@ -11,6 +11,7 @@
 #include "sub0diff/nn/mera_denoiser.hpp"
 #include "sub0diff/nn/noise_schedule.hpp"
 #include "sub0diff/nn/sampler.hpp"
+#include "sub0diff/train/checkpointer.hpp"
 #include "sub0diff/train/curriculum.hpp"
 #include "sub0diff/train/diffusion_loss.hpp"
 
@@ -567,6 +568,27 @@ TEST_CASE("MeraDenoiser gated pool starts identical to mean-pool, then trains", 
     }
     REQUIRE(std::isfinite(last));
     REQUIRE(last < first);                                        // gated stack learns (pool_proj_ moves off 0)
+}
+
+// Trend-line plateau detector (Checkpointer early-stop): slope ≥ 0 over the last N evals = plateau.
+// Locked against the REAL eval curves of the two runs that motivated it (mean-pool tinystories_mera_tc and
+// the gated boundary-aware A/B) so the N=7 behavior can't silently regress.
+TEST_CASE("trend_slope - plateau vs descent on real run data (N=7)", "[diffusion][checkpointer]") {
+    using sub0diff::train::trend_slope;
+    auto slope = [](std::initializer_list<double> v) {
+        std::vector<double> y(v); return trend_slope(std::span<const double>(y));
+    };
+    // <2 points → never a plateau (large negative sentinel).
+    REQUIRE(trend_slope(std::span<const double>{}) < 0.0);
+
+    // Clear descent → strongly negative slope (don't stop). First 7 mean-pool evals:
+    REQUIRE(slope({2.1088, 1.9354, 1.9086, 1.8385, 1.7661, 1.6944, 1.7312}) < 0.0);
+    // Mean-pool plateau window (evals 15-21) where the trend criterion fires → slope ≥ 0:
+    REQUIRE(slope({1.5768, 1.5872, 1.5882, 1.6278, 1.6035, 1.6289, 1.6046}) >= 0.0);
+    // Gated boundary-aware flatline (evals 18-24) → slope ≥ 0 (the run we manually stopped):
+    REQUIRE(slope({1.7050, 1.7050, 1.6976, 1.7017, 1.7651, 1.6869, 1.7655}) >= 0.0);
+    // A purely oscillating-flat window has ~0 slope regardless of magnitude (no threshold needed):
+    REQUIRE(std::abs(slope({1.70, 1.68, 1.70, 1.68, 1.70, 1.68, 1.70})) < 1e-3);
 }
 
 // Gist readout (Viz Phase E): the coarsest level decoded to token space yields one entry per top slot,

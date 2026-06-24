@@ -31,6 +31,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace sub0diff::train {
 
@@ -39,20 +40,30 @@ struct Progress {
     bool          have      = false;   // a matching sidecar was loaded (step validated against the ckpt)
     std::uint64_t step      = 0;
     double        best      = std::numeric_limits<double>::max();  // best held-out metric (lower is better)
-    std::uint64_t stalls    = 0;       // evals since `best` last improved
+    std::uint64_t stalls    = 0;       // evals since `best` last improved (display only; stop is trend-based)
     std::uint64_t best_step = 0;       // the step whose checkpoint achieved `best` (the early-stop winner)
+    std::vector<double> recent;        // last `window` eval metrics — the trend-line plateau detector
 };
 
 // The best (early-stop-winning) step recorded in `ckpt_dir/train_state.json`, or -1 if absent — so a
 // loader can serve the BEST checkpoint, not merely the latest (which, after early-stop, is past the best).
 [[nodiscard]] std::int64_t best_checkpoint_step(const std::string& ckpt_dir);
 
+// Least-squares slope (trend-line gradient) of evenly-spaced values — the plateau detector's core.
+// ≥ 0 = flat/rising (plateau, stop); < 0 = still descending. Fewer than 2 values → -1 (never a plateau).
+[[nodiscard]] double trend_slope(std::span<const double> ys);
+
 class Checkpointer {
 public:
     // `sched` from make_schedule supplies the eval cadence + averaged eval-sample size + steps bound.
-    // code_sha/config_sha tag the produced state (provenance). patience=0 disables early-stop.
+    // code_sha/config_sha tag the produced state (provenance). `plateau_window` is the TREND-LINE early-
+    // stop: stop once the least-squares slope of the last `plateau_window` eval metrics is ≥ 0 (a flat/
+    // rising held-out curve = plateau). No magnitude threshold — at a real plateau the per-eval deltas
+    // oscillate up/down so the fitted slope crosses 0, while genuine descent keeps it clearly negative.
+    // Empirically N=7 is robust (N≤6 false-fires on a momentary uptick mid-descent; N≥9 rarely fires).
+    // plateau_window=0 disables early-stop. `min_improve` only debounces best-checkpoint tracking (serving).
     Checkpointer(Schedule sched, std::string ckpt_dir, std::string code_sha,
-                 std::uint64_t config_sha, std::uint64_t patience, double min_improve = 0.01);
+                 std::uint64_t config_sha, std::uint64_t plateau_window, double min_improve = 0.01);
 
     // schedule-derived knobs the loop needs.
     [[nodiscard]] bool          due(std::uint64_t step) const noexcept;     // an eval/checkpoint is due
@@ -68,8 +79,8 @@ public:
     void restore(sub0llm::nn::Optimizer& opt);
 
     // Record a held-out metric (LOWER IS BETTER) at `step`: save weights + opt + train_state.json,
-    // update best/stalls, and return true iff early-stop should fire (stalls >= patience). The eval
-    // cadence gate is the caller's (call only when due()).
+    // update best + the trend window, and return true iff early-stop should fire (last-`plateau_window`
+    // slope ≥ 0). The eval cadence gate is the caller's (call only when due()).
     bool record(std::uint64_t step, double metric,
                 std::span<sub0llm::autograd::Variable* const> params, sub0llm::nn::Optimizer& opt);
 
@@ -87,7 +98,7 @@ public:
 private:
     Schedule      sched_;
     std::string   dir_, code_sha_, resume_path_;
-    std::uint64_t config_sha_, patience_;
+    std::uint64_t config_sha_, plateau_window_;
     double        min_improve_;
     Progress      prog_;
     std::string   safety_path_;        // last rolling safety .ckpt (deleted when the next one lands)

@@ -127,16 +127,18 @@ struct Train {
     std::uint64_t steps       = 0;    // 0 = corpus-scaled safety bound
     std::uint64_t eval_every  = 0;    // 0 = derive from corpus
     double        eval_factor = 1.0;  // epochs of coverage per eval (floor 0.5)
-    std::uint64_t patience    = 10;   // evals without improvement ⇒ stop
-    std::uint64_t min_epochs  = 20;   // minimum passes before early-stop may fire
+    std::uint64_t patience       = 10;   // ch29 inline early-stop: evals without improvement ⇒ stop
+    std::uint64_t min_epochs     = 20;   // minimum passes before early-stop may fire
+    std::uint64_t plateau_window = 7;    // ch32 Checkpointer: stop when last-N eval slope ≥ 0 (trend-line)
 
     template <class Self, class V>
     static constexpr void reflect(Self& self, V&& v) {
-        v("steps",       Scope::Runtime, self.steps,       "max steps (0=corpus-scaled)");
-        v("eval_every",  Scope::Runtime, self.eval_every,  "steps per eval (0=derive)");
-        v("eval_factor", Scope::Runtime, self.eval_factor, "epochs coverage per eval");
-        v("patience",    Scope::Runtime, self.patience,    "early-stop patience (evals)");
-        v("min_epochs",  Scope::Runtime, self.min_epochs,  "min epochs before stopping");
+        v("steps",          Scope::Runtime, self.steps,          "max steps (0=corpus-scaled)");
+        v("eval_every",     Scope::Runtime, self.eval_every,     "steps per eval (0=derive)");
+        v("eval_factor",    Scope::Runtime, self.eval_factor,    "epochs coverage per eval");
+        v("patience",       Scope::Runtime, self.patience,       "early-stop patience (evals)");
+        v("min_epochs",     Scope::Runtime, self.min_epochs,     "min epochs before stopping");
+        v("plateau_window", Scope::Runtime, self.plateau_window, "trend-line plateau window (evals)");
     }
 };
 

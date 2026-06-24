@@ -117,7 +117,7 @@ int run(Model& model, cfgm::RunConfig& cfg, std::span<const std::int32_t> train_
                  sched.eval_every, 100.0 * sched.coverage_per_eval, sched.eval_nelbo_windows, sched.steps_bound);
 
     // The reusable training-loop checks: cadence + early-stop + honest-resume I/O in one tested place.
-    dt::Checkpointer ck(sched, cfg.data.ckpt_dir, SUB0DIFF_CODE_SHA, cfgm::config_sha(cfg), cfg.train.patience);
+    dt::Checkpointer ck(sched, cfg.data.ckpt_dir, SUB0DIFF_CODE_SHA, cfgm::config_sha(cfg), cfg.train.plateau_window);
 
     // 1) Resume weights on CPU (the snapshot shares storage with the model, still on CPU here).
     const std::uint64_t start_step = ck.load_weights(param_ptrs);
