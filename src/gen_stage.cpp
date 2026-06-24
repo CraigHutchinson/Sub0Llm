@@ -21,10 +21,13 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         std::fprintf(stderr, "gen: cannot load model '%s'\n", model_in);
         return 1;
     }
+    if (!sub0::load_tokenizer(sub0::default_tokenizer())) {
+        std::fprintf(stderr, "gen: cannot load tokenizer '%s'\n", sub0::default_tokenizer());
+        return 1;
+    }
 
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
-    std::string out = prompt;
     std::mt19937 rng(seed);
 
     for (int s = 0; s < n; ++s) {
@@ -58,9 +61,8 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         int pick = VOCAB - 1;
         for (int j = 0; j < VOCAB; ++j) { acc += l[j]; if (r <= acc) { pick = j; break; } }
         ctx.push_back(pick);
-        out.push_back(sub0::decode(pick));
     }
     sub0::graph_reset();
-    std::printf("%s\n", out.c_str());
+    std::printf("%s\n", sub0::detokenize(ctx).c_str());
     return 0;
 }

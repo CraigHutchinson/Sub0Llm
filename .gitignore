@@ -1,7 +1,10 @@
 build/
+out/
 *.bin
 *.log
 *.o
 *.so
 *.dylib
 /sub0llm
+/build*
+/models

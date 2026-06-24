@@ -54,10 +54,16 @@ SUB0_API bool load_model(const char* path);        // overwrite params from disk
 SUB0_API void save_model(const char* path);        // write params to disk
 SUB0_API void print_config();                      // human-readable config + memory line
 SUB0_API const char* default_corpus();             // baked-in corpus path
+SUB0_API const char* default_corpus_tok();         // baked-in tokenized corpus (corpus.tok)
+SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer (tokenizer.bin)
 
-// --- Tokenizer (generated vocabulary) --------------------------------------
-SUB0_API std::vector<int> encode(const std::string& text);
-SUB0_API char decode(int id);
+// --- Tokenizer (BPE, learned at build time, loaded at runtime) -------------
+// The corpus is pre-tokenized by sub0-configure, so training reads token ids
+// directly. Only generation needs the tokenizer: encode() turns a prompt into
+// ids (corpus-aware truecasing + BPE), detokenize() turns ids back into text.
+SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.bin
+SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
+SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
 
 // --- Forward / loss / backward ---------------------------------------------
 SUB0_API void  graph_reset();                                   // reset arena + node pool

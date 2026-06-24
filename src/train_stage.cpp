@@ -7,26 +7,33 @@
 
 #include "sub0/core.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
-#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace {
 
-std::string read_file(const std::string& path) {
+// Read the pre-tokenized corpus (corpus.tok, "S0TK") into a flat id array.
+std::vector<int> load_tokens(const std::string& path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) return {};
-    return std::string((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+    auto rd = [&] { std::uint32_t v{}; is.read(reinterpret_cast<char*>(&v), 4); return v; };
+    if (rd() != 0x4B543053u) return {};  // "S0TK"
+    (void)rd();                          // vocab (checked by load_tokenizer)
+    const std::uint32_t ntok = rd();
+    std::vector<int> data(ntok);
+    is.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(ntok) * sizeof(int));
+    if (!is) return {};
+    return data;
 }
 
 // A short sample, used for mid-training previews.
 std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
-    std::string out = prompt;
     for (int s = 0; s < n; ++s) {
         int T = std::min((int)ctx.size(), SEQ_LEN);
         sub0::graph_reset();
@@ -41,26 +48,33 @@ std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
         std::uniform_real_distribution<float> ud(0.f, 1.f);
         if (ud(rng) < 0.3f) best = std::min(best + 1, VOCAB - 1);
         ctx.push_back(best);
-        out.push_back(sub0::decode(best));
     }
     sub0::graph_reset();
-    return out;
+    return sub0::detokenize(ctx);
 }
 
 }  // namespace
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed) {
-    std::string text = read_file(corpus_path);
-    if (text.empty()) { std::fprintf(stderr, "train: cannot read corpus '%s'\n", corpus_path); return 1; }
-    std::vector<int> data = sub0::encode(text);
+    // Training consumes the pre-tokenized corpus produced by the configurator.
+    // If the driver passed a plain .txt path, fall back to the baked-in .tok.
+    std::string tok_path = corpus_path ? corpus_path : "";
+    if (tok_path.size() < 4 || tok_path.compare(tok_path.size() - 4, 4, ".tok") != 0)
+        tok_path = sub0::default_corpus_tok();
+
+    std::vector<int> data = load_tokens(tok_path);
     if ((int)data.size() <= SEQ_LEN + 1) {
-        std::fprintf(stderr, "train: corpus too small (%zu) for seq_len %d\n", data.size(), SEQ_LEN);
+        std::fprintf(stderr, "train: cannot read tokens '%s' (or too small for seq_len %d)\n",
+                     tok_path.c_str(), SEQ_LEN);
         return 1;
     }
 
+    // The tokenizer is only needed so mid-training previews can render text.
+    sub0::load_tokenizer(sub0::default_tokenizer());
+
     sub0::build_model();
-    std::printf("corpus: %zu bytes (%zu tokens) | ", text.size(), data.size());
+    std::printf("corpus: %s (%zu tokens) | ", tok_path.c_str(), data.size());
     sub0::print_config();
     std::fflush(stdout);
 
