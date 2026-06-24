@@ -650,6 +650,48 @@ std::string detokenize(const std::vector<int>& ids) {
     return casing::detokenize(stream);
 }
 
+namespace {
+// Render a token's expansion (base-symbol codes) into a printable string: case
+// markers become <|cap|>/<|up|>, control and high bytes are escaped, so the table
+// stays one line per token regardless of the bytes a merge happens to contain.
+std::string render_expansion(const std::vector<int>& codes) {
+    std::string s;
+    for (int code : codes) {
+        if (code == casing::TOK_CAP)      { s += "<|cap|>"; continue; }
+        if (code == casing::TOK_UP)       { s += "<|up|>";  continue; }
+        const unsigned char c = static_cast<unsigned char>(code);
+        switch (c) {
+            case '\n': s += "\\n"; break;
+            case '\t': s += "\\t"; break;
+            case '\r': s += "\\r"; break;
+            default:
+                if (c >= 0x20 && c < 0x7F) s += static_cast<char>(c);
+                else { char b[5]; std::snprintf(b, sizeof b, "\\x%02X", c); s += b; }
+        }
+    }
+    return s;
+}
+}  // namespace
+
+std::vector<TokenEntry> vocab_entries() {
+    std::vector<TokenEntry> rows;
+    if (!g_tok.loaded) return rows;
+    rows.reserve(g_tok.expansion.size());
+    for (std::size_t id = 0; id < g_tok.expansion.size(); ++id) {
+        const std::vector<int>& exp = g_tok.expansion[id];
+        TokenEntry e;
+        e.id = static_cast<int>(id);
+        if (static_cast<int>(id) >= g_tok.n_base)        e.kind = TokenEntry::Kind::Merge;
+        else if (!exp.empty() && exp[0] == casing::TOK_CAP) e.kind = TokenEntry::Kind::CapMarker;
+        else if (!exp.empty() && exp[0] == casing::TOK_UP)  e.kind = TokenEntry::Kind::UpMarker;
+        else                                                e.kind = TokenEntry::Kind::Byte;
+        e.expansion_len = static_cast<int>(exp.size());
+        e.text = render_expansion(exp);
+        rows.push_back(std::move(e));
+    }
+    return rows;
+}
+
 void graph_reset() { g_pool_used = 0; g_act_used = 0; }
 
 Node* forward(const int* ids, int T) { return g_model.forward(ids, T); }

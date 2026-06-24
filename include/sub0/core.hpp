@@ -65,6 +65,18 @@ SUB0_API bool        load_tokenizer(const char* path);          // parse tokeniz
 SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
 SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
 
+// One row of the vocabulary, for inspection tooling. `text` is a printable
+// rendering of the token's expansion (control/high bytes escaped, case markers
+// shown as <|cap|>/<|up|>); `expansion_len` is how many base symbols it covers.
+struct TokenEntry {
+    enum class Kind : std::uint8_t { Byte, CapMarker, UpMarker, Merge };
+    int         id   = 0;
+    Kind        kind = Kind::Byte;
+    std::string text;
+    int         expansion_len = 0;
+};
+SUB0_API std::vector<TokenEntry> vocab_entries();  // requires load_tokenizer() first
+
 // --- Forward / loss / backward ---------------------------------------------
 SUB0_API void  graph_reset();                                   // reset arena + node pool
 SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB]

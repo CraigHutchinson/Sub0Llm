@@ -67,3 +67,36 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     std::println("{}", sub0::detokenize(ctx));
     return 0;
 }
+
+// Dump the build's BPE vocabulary as a readable table. Inspection only; no model
+// is loaded. `tokenizer_path` may be null to use the baked-in tokenizer.bin, and
+// `limit <= 0` prints every entry.
+extern "C" SUB0_API int sub0_vocab_stage(const char* tokenizer_path, int limit) {
+    const char* path = tokenizer_path ? tokenizer_path : sub0::default_tokenizer();
+    if (!sub0::load_tokenizer(path)) {
+        std::println(stderr, "vocab: cannot load tokenizer '{}'", path);
+        return 1;
+    }
+    const std::vector<sub0::TokenEntry> rows = sub0::vocab_entries();
+
+    int n_base = 0, n_merge = 0;
+    for (const auto& e : rows)
+        (e.kind == sub0::TokenEntry::Kind::Merge ? n_merge : n_base) += 1;
+    std::println("tokenizer: {} | {} tokens ({} base, {} merges)",
+                 path, rows.size(), n_base, n_merge);
+    std::println("{:>6}  {:<6}  {:>3}  text", "id", "kind", "len");
+
+    const std::size_t shown =
+        (limit > 0) ? std::min(rows.size(), static_cast<std::size_t>(limit)) : rows.size();
+    for (std::size_t i = 0; i < shown; ++i) {
+        const sub0::TokenEntry& e = rows[i];
+        const char* kind = e.kind == sub0::TokenEntry::Kind::Byte      ? "byte"
+                         : e.kind == sub0::TokenEntry::Kind::CapMarker ? "cap"
+                         : e.kind == sub0::TokenEntry::Kind::UpMarker  ? "up"
+                                                                       : "merge";
+        std::println("{:>6}  {:<6}  {:>3}  {}", e.id, kind, e.expansion_len, e.text);
+    }
+    if (shown < rows.size())
+        std::println("... {} more (raise --limit to see all)", rows.size() - shown);
+    return 0;
+}

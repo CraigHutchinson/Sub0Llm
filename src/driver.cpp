@@ -18,6 +18,7 @@ extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
+extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 
 static int arg_int(int c, char** v, const char* k, int d) {
     for (int i = 1; i < c - 1; ++i) if (!std::strcmp(v[i], k)) return std::atoi(v[i + 1]);
@@ -35,13 +36,24 @@ static void usage() {
         "      corpus defaults to the one this build was configured with:\n"
         "      {}\n\n"
         "  sub0llm gen   <model.bin> \"<prompt>\" [--n N --temp F --topk N --seed N]\n\n"
+        "  sub0llm vocab [tokenizer.bin] [--limit N]\n"
+        "      print the build's BPE vocabulary table (defaults to the baked-in tokenizer)\n\n"
         "  Reconfigure dimensions/corpus/vocab by re-running cmake with -DSUB0_* and rebuilding.",
         DEFAULT_CORPUS);
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { usage(); return 1; }
+    if (argc < 2) { usage(); return 1; }
     std::string mode = argv[1];
+
+    if (mode == "vocab") {
+        // Optional positional tokenizer path (second arg if it isn't a flag); else default.
+        const char* tok = (argc >= 3 && argv[2][0] != '-') ? argv[2] : nullptr;
+        int limit = arg_int(argc, argv, "--limit", 0);  // 0 = all
+        return sub0_vocab_stage(tok, limit);
+    }
+
+    if (argc < 3) { usage(); return 1; }
 
     if (mode == "train") {
         const char* model_out = argv[2];
