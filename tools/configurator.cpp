@@ -109,9 +109,10 @@ int main(int argc, char** argv) {
     }
     const std::string abspath = std::filesystem::absolute(corpus).string();
 
-    // 1. Normalize space-adjacent fancy quotes to a straight apostrophe.
+    // 1. Fold fancy typographic glyphs (curly quotes/apostrophes, dashes, ellipsis)
+    //    to ASCII so they neither fragment into multibyte tokens nor split words.
     long quote_repl = 0;
-    const std::string norm = normalize_quotes(text, quote_repl);
+    const std::string norm = normalize_text(text, quote_repl);
 
     // 2. Attested lowercase words license Capitalized/UPPER collapses; genuine
     //    names (whose lowercase never appears) stay verbatim.
@@ -157,27 +158,24 @@ int main(int argc, char** argv) {
         return s == TOK_CAP ? cap_id : s == TOK_UP ? up_id : byte_base[s];
     };
 
-    // 5. Pre-tokenize into word units (alpha runs) and standalone symbols. Each
-    //    unit becomes one entry in the unique-word table; everything else --
-    //    punctuation, spaces, AND the case markers -- is a standalone base token
-    //    that never participates in merges. Keeping the markers atomic is the whole
-    //    point of truecasing: BPE merges the lowercase letters only, so "They"
-    //    tokenizes as <|cap|> + the same `they` token as lowercase "they" rather
-    //    than a separate <|cap|>they merge. Letting markers merge would re-introduce
-    //    the per-case vocabulary split truecasing exists to remove.
-    auto is_unit_sym = [&](int s) {
-        return is_alpha(static_cast<unsigned char>(s));
-    };
+    // 5. Pre-tokenize into word units and standalone symbols. A unit is a run of
+    //    word bytes (letters, accented UTF-8 letters, interior apostrophes) per
+    //    casing::word_unit_end; each becomes one entry in the unique-word table.
+    //    Everything else -- punctuation, spaces, AND the case markers -- is a
+    //    standalone base token that never participates in merges. Keeping the
+    //    markers atomic is the whole point of truecasing: BPE merges the lowercase
+    //    letters only, so "They" tokenizes as <|cap|> + the same `they` token as
+    //    lowercase "they" rather than a separate <|cap|>they merge.
     std::vector<int> items;                   // >=0 standalone base id; <0 -> -(word index + 1)
     items.reserve(stream.size());
     std::vector<std::vector<int>> word_syms;  // unique word -> base-id sequence (mutated by BPE)
     std::vector<long> word_freq;
     std::unordered_map<std::string, int> word_index;
     for (std::size_t i = 0, n = stream.size(); i < n;) {
-        if (!is_unit_sym(stream[i])) { items.push_back(sym_to_base(stream[i])); ++i; continue; }
+        const std::size_t end = word_unit_end(stream, i);
+        if (end == i) { items.push_back(sym_to_base(stream[i])); ++i; continue; }
         std::vector<int> seq;
-        std::size_t j = i;
-        while (j < n && is_unit_sym(stream[j])) { seq.push_back(sym_to_base(stream[j])); ++j; }
+        for (std::size_t k = i; k < end; ++k) seq.push_back(sym_to_base(stream[k]));
         const std::string key = seq_key(seq);
         auto it = word_index.find(key);
         int idx;
@@ -191,7 +189,7 @@ int main(int argc, char** argv) {
         }
         word_freq[idx] += 1;
         items.push_back(-(idx + 1));
-        i = j;
+        i = end;
     }
 
     // 6. BPE: greedily merge the most frequent adjacent pair (weighted by word

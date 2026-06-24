@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/core.hpp"
+#include "sub0/casing.hpp"
 
 #include <string>
 #include <vector>
@@ -58,6 +59,34 @@ TEST_CASE("case markers stay atomic so the word token is case-shared", "[tokeniz
     REQUIRE_FALSE(low.empty());
     REQUIRE(cap.size() == low.size() + 1);
     REQUIRE(std::vector<int>(cap.begin() + 1, cap.end()) == low);
+}
+
+TEST_CASE("normalize_text folds typographic glyphs to ASCII", "[casing]") {
+    long r = 0;
+    // “ I don’t ” – wait…  (curly double/single quotes, en dash, ellipsis)
+    const std::string in = "\xE2\x80\x9C" "I don\xE2\x80\x99t\xE2\x80\x9D \xE2\x80\x93 wait\xE2\x80\xA6";
+    REQUIRE(sub0::casing::normalize_text(in, r) == "\"I don't\" - wait...");
+    REQUIRE(r == 5);
+}
+
+TEST_CASE("word_unit_end keeps contractions and accented words whole", "[casing]") {
+    using namespace sub0::casing;
+    // Interior apostrophe -> one unit covering all of "don't".
+    const std::vector<int> dont = truecase_tokenize("don't", {}, nullptr);
+    REQUIRE(word_unit_end(dont, 0) == dont.size());
+    // ñ (C3 B1) is word material -> "piñata" is one unit, not split at the accent.
+    const std::vector<int> pin = truecase_tokenize("pi\xC3\xB1" "ata", {}, nullptr);
+    REQUIRE(word_unit_end(pin, 0) == pin.size());
+    // A trailing apostrophe is not interior -> it splits off ("dogs" + "'").
+    const std::vector<int> dogs = truecase_tokenize("dogs'", {}, nullptr);
+    REQUIRE(word_unit_end(dogs, 0) == 4);
+}
+
+TEST_CASE("typographic input round-trips through the build tokenizer", "[tokenizer]") {
+    REQUIRE(tokenizer_ready());
+    long r = 0;
+    const std::string in = "\xE2\x80\x9C" "I don\xE2\x80\x99t\xE2\x80\x9D";  // “I don’t”
+    REQUIRE(sub0::detokenize(sub0::encode(in)) == sub0::casing::normalize_text(in, r));
 }
 
 TEST_CASE("encode is deterministic", "[tokenizer]") {

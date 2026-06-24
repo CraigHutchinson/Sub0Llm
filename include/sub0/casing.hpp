@@ -30,6 +30,18 @@ inline bool          is_space(unsigned char c) { return c == ' ' || c == '\n' ||
 inline unsigned char to_lower(unsigned char c) { return is_upper(c) ? static_cast<unsigned char>(c + 32) : c; }
 inline unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cast<unsigned char>(c - 32) : c; }
 
+// A "word byte" for pre-tokenization: ASCII letters plus any UTF-8 multibyte byte
+// (>= 0x80). Treating the continuation/lead bytes of accented letters as word
+// material keeps loanwords like "piñata" or "café" as one BPE unit instead of
+// shattering them at the accent. (Typographic punctuation -- curly quotes, dashes
+// -- is folded to ASCII by normalize_text first, so the only multibyte sequences
+// left in the stream are genuine letters and a few rare symbols.) Markers (>= 256)
+// are deliberately excluded so they stay atomic case operators.
+inline bool is_word_byte(int s) {
+    return s >= 0 && s <= 0xFF &&
+           (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
+}
+
 // Per-corpus truecasing statistics (configurator reporting only).
 struct TokStats {
     long words = 0;  // alpha runs seen
@@ -38,39 +50,56 @@ struct TokStats {
     long names = 0;  // capitalized/upper words left verbatim (corpus-aware)
 };
 
-// Collapse space-adjacent "fancy" quote glyphs to a straight apostrophe. This
-// shrinks the vocabulary: an opening quote (space before) and a closing quote
-// (space after) both normalize to '\''. Handles the ASCII backtick and the
-// UTF-8 curly single quotes U+2018/U+2019. Lossy by design — the specific glyph
-// identity is intentionally discarded so dialogue marks share one token.
-inline std::string normalize_quotes(const std::string& in, long& replaced) {
+// Fold "fancy" typographic glyphs to their ASCII equivalents. The corpus carries
+// curly quotes, curly apostrophes (inside contractions like "don't"), en/em dashes
+// and ellipses as UTF-8 multibyte sequences; left alone each one fragments into 2-3
+// standalone byte tokens and splits the word it touches. Mapping them to ASCII
+// removes those fragments and lets, e.g., "don't" stay a single unit. Lossy by
+// design — the specific glyph identity (curly vs straight, en vs em) is discarded;
+// the round-trip contract is decode(encode(x)) == normalize_text(x), not == x.
+//   U+2018/U+2019 ' '  -> '      U+201C/U+201D " "  -> "
+//   U+2013/U+2014 – —  -> -      U+2026 …            -> ...      ASCII ` -> '
+inline std::string normalize_text(const std::string& in, long& replaced) {
     std::string out;
     out.reserve(in.size());
     replaced = 0;
     const std::size_t n = in.size();
     for (std::size_t i = 0; i < n;) {
         const unsigned char c = static_cast<unsigned char>(in[i]);
-        const bool curly = (c == 0xE2 && i + 2 < n &&
-                            static_cast<unsigned char>(in[i + 1]) == 0x80 &&
-                            (static_cast<unsigned char>(in[i + 2]) == 0x98 ||
-                             static_cast<unsigned char>(in[i + 2]) == 0x99));
-        const bool backtick = (c == '`');
-        if (curly || backtick) {
-            const std::size_t glyph_len    = curly ? 3 : 1;
-            const bool        space_before = !out.empty() && is_space(static_cast<unsigned char>(out.back()));
-            const std::size_t after        = i + glyph_len;
-            const bool        space_after  = after < n && is_space(static_cast<unsigned char>(in[after]));
-            if (space_before || space_after) {
-                out.push_back('\'');
-                ++replaced;
-                i += glyph_len;
-                continue;
+        // General-punctuation block U+2013..U+2026 is encoded E2 80 xx.
+        if (c == 0xE2 && i + 2 < n && static_cast<unsigned char>(in[i + 1]) == 0x80) {
+            const unsigned char t = static_cast<unsigned char>(in[i + 2]);
+            const char* rep = nullptr;
+            switch (t) {
+                case 0x98: case 0x99: rep = "'";   break;  // ‘ ’ single quotes / apostrophe
+                case 0x9C: case 0x9D: rep = "\"";  break;  // “ ” double quotes
+                case 0x93: case 0x94: rep = "-";   break;  // – — dashes
+                case 0xA6:            rep = "...";  break;  // … ellipsis
+                default: break;
             }
+            if (rep) { out += rep; ++replaced; i += 3; continue; }
         }
+        if (c == '`') { out.push_back('\''); ++replaced; ++i; continue; }  // ASCII backtick
         out.push_back(static_cast<char>(c));
         ++i;
     }
     return out;
+}
+
+// End (exclusive) of the word unit beginning at `s[i]`, or `i` itself if `s[i]`
+// does not start one. A unit is a maximal run of word bytes (see is_word_byte)
+// with interior apostrophes kept — an apostrophe flanked by word bytes on both
+// sides, so "don't"/"Lily's" stay whole while a leading/trailing ' splits off.
+inline std::size_t word_unit_end(const std::vector<int>& s, std::size_t i) {
+    if (i >= s.size() || !is_word_byte(s[i])) return i;
+    std::size_t j = i + 1;
+    while (j < s.size()) {
+        if (is_word_byte(s[j])) { ++j; continue; }
+        if (s[j] == '\'' && j + 1 < s.size() &&
+            is_word_byte(s[j - 1]) && is_word_byte(s[j + 1])) { ++j; continue; }
+        break;
+    }
+    return j;
 }
 
 // Corpus-aware truecasing. Each alpha word is classified:

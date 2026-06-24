@@ -612,32 +612,29 @@ std::vector<int> encode(const std::string& text) {
     std::vector<int> out;
     if (!g_tok.loaded) return out;
     long replaced = 0;
-    const std::string norm = casing::normalize_quotes(text, replaced);
+    const std::string norm = casing::normalize_text(text, replaced);
     const std::vector<int> stream = casing::truecase_tokenize(norm, g_tok.attested, nullptr);
 
-    // Mirror the configurator's pre-tokenization: only alpha runs form BPE units;
-    // the case markers stay atomic (see configurator step 5), so a prompt's "They"
-    // encodes as <|cap|> + the shared `they` token, in-distribution with training.
-    auto is_unit = [](int s) {
-        return casing::is_alpha(static_cast<unsigned char>(s));
-    };
+    // Mirror the configurator's pre-tokenization exactly (casing::word_unit_end):
+    // word units are letter runs incl. accented UTF-8 and interior apostrophes, the
+    // case markers stay atomic. A prompt's "They" thus encodes as <|cap|> + the
+    // shared `they` token, in-distribution with training.
     out.reserve(stream.size());
     for (std::size_t i = 0, n = stream.size(); i < n;) {
-        if (!is_unit(stream[i])) {
+        const std::size_t end = casing::word_unit_end(stream, i);
+        if (end == i) {
             const int id = g_tok.sym_to_base(stream[i]);
             if (id >= 0) out.push_back(id);
             ++i;
             continue;
         }
         std::vector<int> seq;
-        std::size_t j = i;
-        while (j < n && is_unit(stream[j])) {
-            const int id = g_tok.sym_to_base(stream[j]);
+        for (std::size_t k = i; k < end; ++k) {
+            const int id = g_tok.sym_to_base(stream[k]);
             if (id >= 0) seq.push_back(id);
-            ++j;
         }
         bpe_encode_word(seq, out);
-        i = j;
+        i = end;
     }
     return out;
 }
