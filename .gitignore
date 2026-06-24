@@ -1,4 +1,7 @@
-sub0llm
+build/
 *.bin
 *.log
 *.o
+*.so
+*.dylib
+/sub0llm
