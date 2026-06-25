@@ -10,6 +10,7 @@ add_executable(sub0_tests
   tokenizer_tests.cpp
   engine_tests.cpp
   tune_tests.cpp
+  coherence_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.

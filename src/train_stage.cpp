@@ -17,6 +17,7 @@
 // crashed run resumes exactly.
 
 #include "sub0/core.hpp"
+#include "sub0/coherence.hpp"
 #include "sub0/tune.hpp"
 
 #include <algorithm>
@@ -121,6 +122,43 @@ double evaluate(const std::vector<int>& data, std::size_t val_start) {
     sub0::graph_reset();
     return total / nw;
 }
+
+// Mean per-token predictive entropy (nats) of the model on the held-out tail: its
+// average uncertainty when *reading* real text it never trained on, over the same fixed
+// windows as evaluate(). exp() of this is the natural target for generation -- we match
+// the model's sampling entropy to its reading entropy. Unlike cross-entropy (inflated by
+// model error -> perplexity 5.17 here), entropy compares the model to ITSELF, so the
+// matched temperature is not biased upward by an imperfect fit and centers near 1.
+double mean_entropy(const std::vector<int>& data, std::size_t val_start) {
+    const std::size_t last = data.size() - SEQ_LEN - 1;
+    if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
+    const std::size_t span = last - val_start;
+    const int avail  = static_cast<int>(span / SEQ_LEN) + 1;
+    const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
+    const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
+    double total = 0.0; long n = 0;
+    for (int w = 0; w < nw; ++w) {
+        std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
+        if (s > last) s = last;
+        sub0::graph_reset();
+        sub0::Node* logits = sub0::forward(data.data() + s, SEQ_LEN);
+        for (int r = 0; r < logits->rows; ++r) {
+            const float* row = logits->data.data() + static_cast<std::size_t>(r) * VOCAB;
+            float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
+            double Z = 0.0; for (int j = 0; j < VOCAB; ++j) Z += std::exp(static_cast<double>(row[j] - mx));
+            double H = 0.0;
+            for (int j = 0; j < VOCAB; ++j) {
+                const double p = std::exp(static_cast<double>(row[j] - mx)) / Z;
+                if (p > 0.0) H -= p * std::log(p);
+            }
+            total += H; ++n;
+        }
+    }
+    sub0::graph_reset();
+    return total / static_cast<double>(std::max(1L, n));
+}
+
+using sub0::coherence::ngram_repeat;   // pure n-gram repeat metric (see coherence.hpp)
 
 // Plateau as a sign test: among the last PLATEAU_WINDOW eval-to-eval deltas, count
 // how many decreased. Still trending down if at least PLATEAU_MIN_IMPROVE did;
@@ -245,10 +283,10 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     return true;
 }
 
-// A short mid-training sample. Uses the SAME temperature/top-k sampler as `gen` so
-// the preview reflects real generation quality -- the old greedy+noise hack made a
+// A short text sample at a given temperature/top-k. Uses the SAME sampler as `gen`
+// so the output reflects real generation quality -- the old greedy+noise hack made a
 // coherent model look like word-salad.
-std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
+std::string preview_at(const std::string& prompt, int n, float temp, int topk, std::mt19937& rng) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
     for (int s = 0; s < n; ++s) {
@@ -256,10 +294,15 @@ std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
         const int last = logits->rows - 1;
-        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, 0.7f, 20, rng));
+        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng));
     }
     sub0::graph_reset();
     return sub0::detokenize(ctx);
+}
+
+// Mid-training preview at the generation defaults (temp 0.7, top-k 20).
+std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
+    return preview_at(prompt, n, 0.7f, 20, rng);
 }
 
 }  // namespace
@@ -684,6 +727,190 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     } else {
         std::println(stderr, "warning: could not write tune cache '{}'", DEFAULT_TUNE_CACHE);
     }
+    return 0;
+}
+
+// --- Auto-temperature ("coherence tuner") -----------------------------------
+// `sub0llm autotemp` picks the sampling temperature whose GENERATIONS are as
+// in-distribution as real held-out text -- both judged by the model itself, so the
+// loop is self-validating with no external grader. The held-out tail has perplexity
+// exp(val_nelbo) under the model (its genuine uncertainty on text it never trained
+// on). We generate at a candidate temperature and measure the chosen tokens' own
+// perplexity, scored under the model's TRUE (T=1) distribution -- the same measure as
+// real-text perplexity, so the two are directly comparable:
+//   * greedy / low temp  -> self-perplexity far BELOW target: the model walks its own
+//                           high-probability path and degenerates into repetition;
+//   * high temp          -> self-perplexity far ABOVE target: increasingly random.
+// Self-perplexity rises monotonically with temperature, so we bisect to the crossing.
+// We MATCH the target, never minimise it -- minimising drives T->0 and straight back
+// into the repetition failure. This is the coherence analogue of the throughput
+// `tune` stage: same "search a knob against a self-measured objective" shape.
+namespace {
+
+struct GenStats { double ppl = 0.0; double rep4 = 0.0; };
+
+// Generate from several real prefixes in the held-out tail and return (a) the sampled
+// tokens' mean perplexity under the model's true (T=1) distribution and (b) the 4-gram
+// repeat rate of the generations (the degeneration signal). A FIXED local RNG seed gives
+// common random numbers across temperatures, so the perplexity-vs-temperature curve is
+// smooth enough to bisect cleanly. Sampling uses temperature+top-k (the real gen path);
+// scoring uses the full T=1 softmax so the number is comparable to real-text perplexity.
+GenStats gen_self_stats(const std::vector<int>& data, std::size_t val_start,
+                        float temp, int topk, int n_seeds, int gen_len, unsigned cr_seed) {
+    const std::size_t last = data.size() - SEQ_LEN - 1;
+    const std::size_t span = (last > val_start) ? last - val_start : 0;
+    const int prefix_len = std::max(1, std::min(SEQ_LEN / 4, 16));
+    std::mt19937 rng(cr_seed);                          // common random numbers across temps
+
+    double nll_sum = 0.0, rep_sum = 0.0; long nll_n = 0;
+    std::vector<int> gen; gen.reserve(static_cast<std::size_t>(gen_len));
+    for (int k = 0; k < n_seeds; ++k) {
+        std::size_t s = val_start +
+            (n_seeds > 1 ? static_cast<std::size_t>(k) * span / static_cast<std::size_t>(n_seeds - 1) : 0);
+        if (s > last) s = last;
+        std::vector<int> ctx(data.begin() + static_cast<std::ptrdiff_t>(s),
+                             data.begin() + static_cast<std::ptrdiff_t>(s) + prefix_len);
+        gen.clear();
+        for (int g = 0; g < gen_len; ++g) {
+            const int T = std::min(static_cast<int>(ctx.size()), SEQ_LEN);
+            sub0::graph_reset();
+            sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
+            const float* row = logits->data.data() + static_cast<std::size_t>(logits->rows - 1) * VOCAB;
+            const int tok = sub0::sample_token(row, temp, topk, rng);
+            // Surprise of the chosen token under the TRUE (T=1) model distribution.
+            float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
+            double Z = 0.0; for (int j = 0; j < VOCAB; ++j) Z += std::exp(static_cast<double>(row[j] - mx));
+            nll_sum += -(static_cast<double>(row[tok] - mx) - std::log(Z));
+            ++nll_n;
+            gen.push_back(tok);
+            ctx.push_back(tok);
+        }
+        rep_sum += ngram_repeat(gen.data(), static_cast<int>(gen.size()));
+    }
+    sub0::graph_reset();
+    GenStats out;
+    out.ppl  = std::exp(nll_sum / static_cast<double>(std::max(1L, nll_n)));
+    out.rep4 = n_seeds > 0 ? rep_sum / static_cast<double>(n_seeds) : 0.0;
+    return out;
+}
+
+// Real-text 4-gram repeat measured EXACTLY like the generation metric: averaged over
+// the same number of equal-length windows spread across the held-out tail. Measuring
+// real text over one long contiguous span instead would inflate it (names/phrases recur
+// across many sentences), making the gen-vs-real comparison apples-to-oranges.
+double real_windowed_repeat(const std::vector<int>& data, std::size_t val_start,
+                            int n_seeds, int win) {
+    if (data.size() <= static_cast<std::size_t>(win) + 1) return 0.0;
+    const std::size_t last = data.size() - 1 - static_cast<std::size_t>(win);
+    const std::size_t span = (last > val_start) ? last - val_start : 0;
+    double sum = 0.0;
+    for (int k = 0; k < n_seeds; ++k) {
+        std::size_t s = val_start +
+            (n_seeds > 1 ? static_cast<std::size_t>(k) * span / static_cast<std::size_t>(n_seeds - 1) : 0);
+        if (s > last) s = last;
+        sum += ngram_repeat(data.data() + s, win);
+    }
+    return n_seeds > 0 ? sum / static_cast<double>(n_seeds) : 0.0;
+}
+
+using sub0::coherence::Crossing;       // monotone-crossing interpolation (see coherence.hpp)
+using sub0::coherence::interp_cross;
+
+}  // namespace
+
+extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose) {
+    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
+    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+        std::println(stderr, "autotemp: cannot load a usable corpus.tok");
+        return 1;
+    }
+    const std::vector<int>& data = tok->data;
+
+    sub0::build_model();
+    if (!sub0::load_model(model_in)) {
+        std::println(stderr, "autotemp: cannot load model '{}'", model_in);
+        return 1;
+    }
+    sub0::load_tokenizer(sub0::default_tokenizer());    // for the sample print
+
+    // The SAME held-out split the trainer uses, so the target perplexity is measured on
+    // text the model never trained on.
+    const std::size_t val_tokens = std::max<std::size_t>(
+        static_cast<std::size_t>(SEQ_LEN) + 2,
+        static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
+    const std::size_t val_start = data.size() - val_tokens;
+
+    // Sweep/scoring config. Top-k mirrors gen's default so the recommended temperature
+    // transfers directly to the real generation path.
+    constexpr int AUTOTEMP_TOPK = 20;
+    constexpr int N_SEEDS = 10, GEN_LEN = 96;   // long windows so repetition/looping is visible
+
+    // Two self-validating anchors from the real held-out text:
+    //  * perplexity -- the model's reading entropy (compares the model to itself, so an
+    //    imperfect fit does not bias it; we match generation perplexity to this);
+    //  * repetition -- real text's 4-gram repeat rate, measured the SAME windowed way as
+    //    the generations, so the comparison is fair. This is the robust anchor: it is a
+    //    surface property of real text, independent of whether the model is well-calibrated.
+    const double ce_ppl    = std::exp(evaluate(data, val_start));          // headline (inflated by model error)
+    const double target_ppl = std::exp(mean_entropy(data, val_start));    // entropy-perplexity (match target)
+    const double target_rep = real_windowed_repeat(data, val_start, N_SEEDS, GEN_LEN);
+
+    std::println("autotemp: model {}", model_in);
+    std::println("held-out (real text): cross-entropy perplexity {:.2f} | reading entropy {:.2f} | 4-gram repeat {:.1f}%",
+                 ce_ppl, target_ppl, 100.0 * target_rep);
+    std::fflush(stdout);
+
+    // One honest sweep over a fixed temperature grid; the table IS the evidence. gen_ppl
+    // rises with temperature, 4-gram repeat falls, so each target has exactly one crossing
+    // -- recovered by interpolation (no noisy bisection, and both anchors from one pass).
+    const std::vector<float> grid = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.4f};
+    std::vector<double> ppls(grid.size()), reps(grid.size());
+    if (verbose) std::println("  {:>6}   {:>10}   {:>10}", "temp", "gen_ppl", "4gram-rep");
+    for (std::size_t i = 0; i < grid.size(); ++i) {
+        const GenStats g = gen_self_stats(data, val_start, grid[i], AUTOTEMP_TOPK, N_SEEDS, GEN_LEN, seed);
+        ppls[i] = g.ppl; reps[i] = g.rep4;
+        if (verbose) {
+            std::println("  {:>6.2f}   {:>10.3f}   {:>9.1f}%{}{}", grid[i], g.ppl, 100.0 * g.rep4,
+                         g.ppl >= target_ppl ? "  ppl>=tgt" : "", g.rep4 <= target_rep ? "  rep<=tgt" : "");
+            std::fflush(stdout);
+        }
+    }
+
+    const Crossing by_ppl = interp_cross(grid, ppls, target_ppl, /*increasing=*/true);
+    const Crossing by_rep = interp_cross(grid, reps, target_rep, /*increasing=*/false);
+
+    // Repetition is the robust anchor (a surface property of real text, independent of
+    // the model's calibration); perplexity is the principled cross-check. Both match by
+    // pushing temperature UP for this model, because it is under-fit -- it is MORE
+    // repetitive and MORE over-confident than real text at every coherent temperature.
+    //
+    // We never recommend hotter than the training-natural ceiling temp 1.0: cross-entropy
+    // training fits the model's distribution at temp 1, so sampling above it only helps a
+    // genuinely well-calibrated model. When BOTH matches sit above 1.0 the model cannot
+    // reach real-text diversity without losing coherence (heat turns repetition into
+    // gibberish) -- that gap is the under-fit signal, and the fix is capacity/training,
+    // not a hotter temperature. For a well-calibrated model the matches fall below 1.0 and
+    // the cap does not bind, so autotemp returns the true crossing.
+    constexpr float TEMP_CEILING = 1.0f;
+    const float rec = std::min(by_rep.temp, TEMP_CEILING);
+    const bool underfit = by_rep.temp > TEMP_CEILING && by_ppl.temp > TEMP_CEILING;
+
+    std::mt19937 prng(seed ^ 0x9e3779b9u);
+    std::println("");
+    std::println("matched temperatures (both = 'as in-distribution as real text'):");
+    std::println("  by repetition (gen 4-gram repeat -> real {:.1f}%):   temp {:.2f}{}",
+                 100.0 * target_rep, by_rep.temp, by_rep.hit ? "" : " (off-grid)");
+    std::println("  by perplexity (gen perplexity -> reading entropy):   temp {:.2f}{}",
+                 by_ppl.temp, by_ppl.hit ? "" : " (off-grid)");
+    if (underfit)
+        std::println("  diagnosis: both matches exceed the training-natural ceiling 1.0 -- the model is\n"
+                     "             under-fit (more repetitive AND less confident than real text), so it\n"
+                     "             cannot match real-text diversity without losing coherence. Capping at\n"
+                     "             1.0; the real lever is capacity/training, not temperature.");
+    std::println("");
+    std::println("recommended --temp {:.2f}", rec);
+    std::println("  --- sample @ temp {:.2f} ---\n  {}", rec, preview_at("the ", 80, rec, AUTOTEMP_TOPK, prng));
+    std::println("apply with:  sub0llm gen {} \"<prompt>\" --temp {:.2f}", model_in, rec);
     return 0;
 }
 

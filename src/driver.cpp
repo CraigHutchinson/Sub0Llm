@@ -23,6 +23,7 @@ extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose);
+extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
 
 int main(int argc, char** argv) {
     // CLI11 rejects unknown options and positionals by default (allow_extras is off),
@@ -94,6 +95,18 @@ int main(int argc, char** argv) {
                      "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
     tune->add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
 
+    // --- autotemp ------------------------------------------------------------
+    // The coherence analogue of `tune`: search the sampling temperature whose
+    // generations are as in-distribution (by self-perplexity) as real held-out text.
+    std::string at_model;
+    unsigned at_seed = 42;
+    bool at_quiet = false;
+    auto* autotemp = app.add_subcommand("autotemp",
+        "Auto-pick the sampling temperature whose generations match held-out text perplexity");
+    autotemp->add_option("model", at_model, "Trained model path")->required();
+    autotemp->add_option("--seed", at_seed, "RNG seed for the generation sweep")->capture_default_str();
+    autotemp->add_flag("--quiet", at_quiet, "Print only the recommendation, not the temperature sweep");
+
     CLI11_PARSE(app, argc, argv);
 
     if (*train) {
@@ -113,6 +126,8 @@ int main(int argc, char** argv) {
         return sub0_bench_stage(bench_iters, bench_threads, bench_wpt);
     if (*tune)
         return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1);
+    if (*autotemp)
+        return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
 
     return 1;  // unreachable: require_subcommand(1) guarantees one of the above
 }
