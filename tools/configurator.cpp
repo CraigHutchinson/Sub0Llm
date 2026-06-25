@@ -105,6 +105,7 @@ int main(int argc, char** argv) {
     int ternary      = 0;
     int vocab_target = 2048;
     int min_merge    = 2;
+    int emit_tok     = 1;
     std::string tune_cache;
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
@@ -120,6 +121,10 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
        ->capture_default_str();
+    app.add_option("--corpus-tok", emit_tok,
+                   "1 = pre-tokenize the whole corpus to corpus.tok; 0 = skip it and let training tokenize "
+                   "on demand (avoids the ~2x-on-disk token copy for a huge corpus)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
        ->capture_default_str();
@@ -308,61 +313,66 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- Pass 3: stream the corpus once more and emit the merged token stream to
-    //     corpus.tok incrementally (never materialised in memory). Each word unit looks up
-    //     its post-BPE id sequence in the table; standalone symbols map straight to base
-    //     ids. Losslessness is verified per chunk by reconstructing the base symbols from
-    //     the emitted ids. The id array's length is back-patched after the count is known.
     const std::filesystem::path gen_dir  = std::filesystem::path(out).parent_path();
     const std::filesystem::path tok_path = gen_dir / "corpus.tok";
     const std::filesystem::path tkz_path = gen_dir / "tokenizer.bin";
-    std::ofstream ts(tok_path, std::ios::binary);
-    if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_path.string()); return 1; }
-    {
-        const std::uint32_t magic = 0x4B543053u, vfield = static_cast<std::uint32_t>(vocab), nfield = 0u;
-        ts.write(reinterpret_cast<const char*>(&magic),  sizeof magic);
-        ts.write(reinterpret_cast<const char*>(&vfield), sizeof vfield);
-        ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);  // patched below
-    }
+
+    // --- Pass 3 (optional): stream the corpus once more and emit the merged token stream to
+    //     corpus.tok incrementally (never materialised in memory). Skipped when --corpus-tok
+    //     0: training then tokenizes windows on demand from the raw corpus + tokenizer.bin,
+    //     avoiding the ~2x-on-disk token copy for a huge corpus. Each word unit looks up its
+    //     post-BPE id sequence in the table; standalone symbols map straight to base ids.
+    //     Losslessness is verified per chunk by reconstructing the base symbols; the id
+    //     array's length is back-patched after the count is known.
     std::size_t token_count = 0;
     bool tok_rt = true;
-    std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
-    std::vector<int> recon;                   // per-chunk reconstruction (bounded)
-    for_each_chunk(corpus, [&](std::string_view chunk) {
-        long qr = 0;
-        const std::string norm = normalize_text(std::string(chunk), qr);
-        const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
-        if (detokenize(stream) != norm) tok_rt = false;     // round-trip 1: truecasing
-        out_tokens.clear();
-        for (std::size_t i = 0, n = stream.size(); i < n;) {
-            const std::size_t end = word_unit_end(stream, i);
-            if (end == i) { out_tokens.push_back(sym_to_base(stream[i])); ++i; continue; }
-            std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                 stream.begin() + static_cast<std::ptrdiff_t>(end));
-            auto it = word_index.find(seq_key(seq));
-            if (it == word_index.end()) {                   // unreachable if passes agree
-                for (int b : seq) out_tokens.push_back(byte_base[b]);
-                tok_rt = false;
-            } else {
-                for (int id : word_syms[static_cast<std::size_t>(it->second)]) out_tokens.push_back(id);
-            }
-            i = end;
+    if (emit_tok) {
+        std::ofstream ts(tok_path, std::ios::binary);
+        if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_path.string()); return 1; }
+        {
+            const std::uint32_t magic = 0x4B543053u, vfield = static_cast<std::uint32_t>(vocab), nfield = 0u;
+            ts.write(reinterpret_cast<const char*>(&magic),  sizeof magic);
+            ts.write(reinterpret_cast<const char*>(&vfield), sizeof vfield);
+            ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);  // patched below
         }
-        recon.clear();                                       // round-trip 2: tokenization
-        for (std::int32_t id : out_tokens)
-            recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
-                         expansion[static_cast<std::size_t>(id)].end());
-        if (recon != stream) tok_rt = false;
-        ts.write(reinterpret_cast<const char*>(out_tokens.data()),
-                 static_cast<std::streamsize>(out_tokens.size() * sizeof(std::int32_t)));
-        token_count += out_tokens.size();
-    });
-    {
-        const std::uint32_t nfield = static_cast<std::uint32_t>(token_count);  // back-patch ntok
-        ts.seekp(8, std::ios::beg);
-        ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);
+        std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
+        std::vector<int> recon;                   // per-chunk reconstruction (bounded)
+        for_each_chunk(corpus, [&](std::string_view chunk) {
+            long qr = 0;
+            const std::string norm = normalize_text(std::string(chunk), qr);
+            const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
+            if (detokenize(stream) != norm) tok_rt = false;     // round-trip 1: truecasing
+            out_tokens.clear();
+            for (std::size_t i = 0, n = stream.size(); i < n;) {
+                const std::size_t end = word_unit_end(stream, i);
+                if (end == i) { out_tokens.push_back(sym_to_base(stream[i])); ++i; continue; }
+                std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                     stream.begin() + static_cast<std::ptrdiff_t>(end));
+                auto it = word_index.find(seq_key(seq));
+                if (it == word_index.end()) {                   // unreachable if passes agree
+                    for (int b : seq) out_tokens.push_back(byte_base[b]);
+                    tok_rt = false;
+                } else {
+                    for (int id : word_syms[static_cast<std::size_t>(it->second)]) out_tokens.push_back(id);
+                }
+                i = end;
+            }
+            recon.clear();                                       // round-trip 2: tokenization
+            for (std::int32_t id : out_tokens)
+                recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
+                             expansion[static_cast<std::size_t>(id)].end());
+            if (recon != stream) tok_rt = false;
+            ts.write(reinterpret_cast<const char*>(out_tokens.data()),
+                     static_cast<std::streamsize>(out_tokens.size() * sizeof(std::int32_t)));
+            token_count += out_tokens.size();
+        });
+        {
+            const std::uint32_t nfield = static_cast<std::uint32_t>(token_count);  // back-patch ntok
+            ts.seekp(8, std::ios::beg);
+            ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);
+        }
+        ts.close();
     }
-    ts.close();
 
     // 9. Write the runtime tokenizer (base alphabet + merges + attested words).
     //    Generation uses this to encode prompts and detokenize output; training
@@ -451,12 +461,17 @@ int main(int argc, char** argv) {
     std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
     std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
     std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
-    std::println(stderr, "total tokens:                    {}", token_count);
-    std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
+    if (emit_tok) {
+        std::println(stderr, "total tokens:                    {}", token_count);
+        std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
+    } else {
+        std::println(stderr, "corpus.tok:                      skipped (--corpus-tok 0; on-demand)");
+    }
     std::println(stderr, "attested words / table size:     {} / {} bytes ({:.1f} KB)",
                  attested.size(), wordset_bytes, wordset_bytes / 1024.0);
     std::println(stderr, "round-trip truecase / tokenize:  OK / {}", tok_rt ? "OK" : "FAIL");
-    std::println(stderr, "corpus.tok / tokenizer.bin:      {} | {}", tok_path.string(), tkz_path.string());
+    std::println(stderr, "corpus.tok / tokenizer.bin:      {} | {}",
+                 emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
     std::println(stderr, "-----------------------------------------------");
     if (!tok_rt) { std::println(stderr, "configure error: tokenization round-trip failed"); return 1; }
 

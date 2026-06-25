@@ -88,6 +88,73 @@ const char* tokmap_error(sub0::TokMap::Err e) {
     }
 }
 
+// --- On-demand tokenization (out-of-core, no corpus.tok) --------------------
+// When the build skipped corpus.tok (--corpus-tok 0) the token copy is never written to
+// disk (~2x saved). Training instead tokenizes contiguous regions of the RAW text corpus
+// on the fly with the runtime tokenizer (sub0::encode, which reproduces the configurator's
+// truecasing + BPE) into bounded in-memory buffers: a rotating training buffer refilled
+// from new random regions each interval (so the run still traverses the whole corpus) and
+// a fixed validation buffer (so the eval metric stays comparable). RAM is capped by the
+// buffers; the corpus stays on disk. Region reads are contiguous, so encode() amortises.
+constexpr std::size_t OD_REGION_BYTES   = 64u << 10;   // contiguous bytes read per region
+constexpr std::size_t OD_TRAIN_BUF_TOK  = 8u  << 20;   // ~32 MB rotating shuffle buffer
+constexpr std::size_t OD_VAL_BUF_TOK    = 512u << 10;  // ~2 MB fixed validation window
+
+class TextCorpus {
+public:
+    bool open(const std::string& path) {
+        is_.open(path, std::ios::binary | std::ios::ate);
+        if (!is_) return false;
+        size_ = static_cast<std::size_t>(is_.tellg());
+        return size_ > 0;
+    }
+    std::size_t bytes() const { return size_; }
+
+    // Read up to OD_REGION_BYTES starting at the line after `off` (so we don't begin
+    // mid-word) and append its tokens to `out`. The trailing partial word is harmless --
+    // training windows are taken from inside the buffer, and a partial word at a region
+    // join is the same kind of boundary a packed corpus already has.
+    void encode_region(std::size_t off, std::vector<int>& out) {
+        if (off >= size_) return;
+        is_.clear();
+        is_.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+        std::string buf(std::min(OD_REGION_BYTES, size_ - off), '\0');
+        is_.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        buf.resize(static_cast<std::size_t>(is_.gcount()));
+        std::size_t b = 0;
+        if (off != 0) { const std::size_t nl = buf.find('\n'); if (nl != std::string::npos) b = nl + 1; }
+        if (b >= buf.size()) return;
+        const std::vector<int> toks = sub0::encode(buf.substr(b));
+        out.insert(out.end(), toks.begin(), toks.end());
+    }
+
+    // Fill `out` with ~target tokens from random regions in [lo, hi) bytes (training).
+    void fill_random(std::size_t lo, std::size_t hi, std::size_t target,
+                     std::mt19937& rng, std::vector<int>& out) {
+        out.clear();
+        if (hi <= lo) return;
+        std::uniform_int_distribution<std::size_t> pick(lo, hi - 1);
+        while (out.size() < target) {
+            const std::size_t before = out.size();
+            encode_region(pick(rng), out);
+            if (out.size() == before) break;   // no progress -> stop
+        }
+    }
+
+    // Fill `out` with ~target tokens read sequentially from `start` bytes (validation).
+    void fill_sequential(std::size_t start, std::size_t target, std::vector<int>& out) {
+        out.clear();
+        for (std::size_t off = start; out.size() < target && off < size_; off += OD_REGION_BYTES) {
+            const std::size_t before = out.size();
+            encode_region(off, out);
+            if (out.size() == before) break;
+        }
+    }
+private:
+    std::ifstream is_;
+    std::size_t size_ = 0;
+};
+
 // --- Validation NELBO -------------------------------------------------------
 // Mean cross-entropy per token over a fixed, evenly-spaced set of windows in the
 // held-out tail. Fixed windows make the metric comparable across evals (so the
@@ -308,53 +375,94 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (tok_path.size() < 4 || tok_path.compare(tok_path.size() - 4, 4, ".tok") != 0)
         tok_path = sub0::default_corpus_tok();
 
+    sub0::load_tokenizer(sub0::default_tokenizer());   // previews + on-demand encode
+    sub0::build_model();
+
+    // Where training windows come from. train_span is sampled for training windows; val_span
+    // is the fixed held-out eval region. Backed either by the corpus.tok memory map, or --
+    // when no corpus.tok was built (--corpus-tok 0) -- by bounded in-memory buffers tokenized
+    // on demand from the raw corpus (see TextCorpus): no token copy on disk, RAM capped by
+    // the buffers. The rotating training buffer is refilled each interval inside the loop.
     sub0::TokMap tok(tok_path);
-    if (!tok.ok()) {
-        std::println(stderr, "train: {} '{}'", tokmap_error(tok.error()), tok_path);
-        return 1;
-    }
+    const bool on_demand = !tok.ok();
 
-    // The .tok stream carries token ids in [0, VOCAB). The configurator bakes the
-    // matching VOCAB into the engine, so within a build they always agree -- but a
-    // stale, hand-built, or foreign .tok passed on the command line would index the
-    // embedding table out of bounds. Reject it up front rather than corrupt memory.
-    if (tok.vocab() != VOCAB) {
-        std::println(stderr,
-                     "train: '{}' was tokenized for vocab {} but this engine was built for VOCAB {}.\n"
-                     "       Reconfigure/rebuild against this corpus, or pass a matching .tok.",
-                     tok_path, tok.vocab(), VOCAB);
-        return 1;
-    }
+    std::span<const int> train_span, val_span;
+    std::vector<int> train_buf, val_buf;       // on-demand backing storage
+    TextCorpus text;                           // on-demand raw-corpus reader
+    std::mt19937 buf_rng;                      // separate stream: refilling never perturbs `rng`
+    std::size_t train_byte_lo = 0, train_byte_hi = 0;
+    long refresh_n = 0;
+    std::size_t est_train_tokens = 0;
+    std::string src_desc;
 
-    const std::span<const int> data = tok.tokens();
-    // Need a validation tail plus a training region each large enough for a window.
-    const std::size_t min_tokens = 2 * (static_cast<std::size_t>(SEQ_LEN) + 2);
-    if (data.size() < min_tokens) {
-        std::println(stderr, "train: '{}' has only {} tokens, too few for seq_len {} (need >= {})",
-                     tok_path, data.size(), SEQ_LEN, min_tokens);
-        return 1;
-    }
-
-    // Defense in depth: even with a matching vocab field, a corrupt file could hold
-    // an out-of-range id. One linear scan turns a silent OOB gather into a clear
-    // diagnostic; it also faults in the whole mapping once, but training's random
-    // windows would touch most of it across epochs anyway.
-    for (size_t i = 0; i < data.size(); ++i)
-        if (data[i] < 0 || data[i] >= VOCAB) {
-            std::println(stderr, "train: '{}' token {} = {} is out of range [0,{})",
-                         tok_path, i, data[i], VOCAB);
+    if (!on_demand) {
+        // The .tok stream carries token ids in [0, VOCAB). The configurator bakes the matching
+        // VOCAB into the engine, so within a build they always agree -- but a stale, hand-built,
+        // or foreign .tok would index the embedding table out of bounds. Reject it up front.
+        if (tok.vocab() != VOCAB) {
+            std::println(stderr,
+                         "train: '{}' was tokenized for vocab {} but this engine was built for VOCAB {}.\n"
+                         "       Reconfigure/rebuild against this corpus, or pass a matching .tok.",
+                         tok_path, tok.vocab(), VOCAB);
             return 1;
         }
+        const std::span<const int> data = tok.tokens();
+        const std::size_t min_tokens = 2 * (static_cast<std::size_t>(SEQ_LEN) + 2);
+        if (data.size() < min_tokens) {
+            std::println(stderr, "train: '{}' has only {} tokens, too few for seq_len {} (need >= {})",
+                         tok_path, data.size(), SEQ_LEN, min_tokens);
+            return 1;
+        }
+        // Defense in depth: a corrupt file could hold an out-of-range id. One linear scan
+        // turns a silent OOB gather into a clear diagnostic (and faults in the mapping once,
+        // but training's random windows touch most of it across epochs anyway).
+        for (std::size_t i = 0; i < data.size(); ++i)
+            if (data[i] < 0 || data[i] >= VOCAB) {
+                std::println(stderr, "train: '{}' token {} = {} is out of range [0,{})",
+                             tok_path, i, data[i], VOCAB);
+                return 1;
+            }
+        // Hold out the tail for validation; train only on the head so NELBO is honest.
+        const std::size_t val_tokens = std::max<std::size_t>(
+            static_cast<std::size_t>(SEQ_LEN) + 2,
+            static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
+        const std::size_t val_start = data.size() - val_tokens;
+        train_span = data.first(val_start);
+        val_span   = data.subspan(val_start);
+        est_train_tokens = val_start;
+        src_desc = std::format("{} ({} tokens; {} train / {} val)", tok_path, data.size(), val_start, val_tokens);
+    } else {
+        // No corpus.tok: tokenize on demand from the raw text corpus. Split the corpus by
+        // BYTES; tokenize a fixed validation buffer once and the first shuffle buffer now.
+        const char* raw = sub0::default_corpus();
+        if (!text.open(raw)) {
+            std::println(stderr, "train: no corpus.tok ('{}') and cannot open raw corpus '{}'", tok_path, raw);
+            return 1;
+        }
+        const std::size_t total = text.bytes();
+        const std::size_t val_bytes = std::max<std::size_t>(
+            1, static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(total)));
+        const std::size_t val_byte_start = total - val_bytes;
+        train_byte_lo = 0; train_byte_hi = val_byte_start;
 
-    // Hold out the tail for validation; train only on the head so NELBO is honest.
-    const std::size_t val_tokens = std::max<std::size_t>(
-        static_cast<std::size_t>(SEQ_LEN) + 2,
-        static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
-    const std::size_t val_start  = data.size() - val_tokens;
-    const std::size_t train_tokens = val_start;  // [0, val_start) is the training region
-
-    sub0::load_tokenizer(sub0::default_tokenizer());  // for previews
-    sub0::build_model();
+        text.fill_sequential(val_byte_start, OD_VAL_BUF_TOK, val_buf);
+        buf_rng.seed(static_cast<std::uint32_t>(seed) ^ 0x9E3779B9u);
+        text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
+        const std::size_t need = static_cast<std::size_t>(SEQ_LEN) + 2;
+        if (val_buf.size() < need || train_buf.size() < need) {
+            std::println(stderr, "train: on-demand corpus '{}' too small to tokenize a window (need >= {} tokens)",
+                         raw, need);
+            return 1;
+        }
+        train_span = train_buf;
+        val_span   = val_buf;
+        // Estimate tokens/byte from one region to size the epoch schedule (heuristic only).
+        std::vector<int> probe; text.encode_region(0, probe);
+        const double tpb = probe.empty() ? 0.5 : static_cast<double>(probe.size()) / static_cast<double>(OD_REGION_BYTES);
+        est_train_tokens = static_cast<std::size_t>(static_cast<double>(train_byte_hi) * tpb);
+        src_desc = std::format("{} (on-demand; ~{} train tok est / {}-tok shuffle buf / {}-tok val buf)",
+                               raw, est_train_tokens, train_buf.size(), val_buf.size());
+    }
 
     std::mt19937 rng(seed);
     RunState rs;
@@ -369,23 +477,27 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::AdamW opt(lr);
     if (resumed) opt.set_step_count(adam_t);
 
-    // Corpus-relative schedule (max_steps is a per-invocation budget, never restored).
+    // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
+    // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
+    // plateau-stopped, so an estimate is fine).
     const long tokens_per_step = static_cast<long>(batch) * SEQ_LEN;
-    const long epoch_steps  = std::max<long>(1, (static_cast<long>(train_tokens) + tokens_per_step - 1) / tokens_per_step);
+    const long epoch_steps  = std::max<long>(1, (static_cast<long>(est_train_tokens) + tokens_per_step - 1) / tokens_per_step);
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
 
-    std::print("corpus: {} ({} tokens; {} train / {} val) | ", tok_path, data.size(), train_tokens, val_tokens);
+    std::print("corpus: {} | ", src_desc);
     sub0::print_config();
-    std::println("schedule: {} steps/epoch | warmup {} | eval every {} | max {} steps ({} epochs){}",
+    std::println("schedule: {} steps/epoch | warmup {} | eval every {} | max {} steps ({} epochs){}{}",
                  epoch_steps, warmup_steps, eval_every, max_steps,
                  (max_steps + epoch_steps - 1) / epoch_steps,
+                 on_demand ? " | on-demand" : "",
                  resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
     std::fflush(stdout);
 
-    std::uniform_int_distribution<size_t> startd(0, val_start - SEQ_LEN - 2);
+    std::uniform_int_distribution<size_t> startd(0, train_span.size() - SEQ_LEN - 2);
     std::vector<size_t> starts(batch);
+    long steps_since_refresh = 0;
 
     using clock = std::chrono::steady_clock;
     auto win_t0 = clock::now();
@@ -394,10 +506,23 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     bool stop = false;
 
     for (long step = rs.step + 1; step <= max_steps && !stop; ++step) {
+        // On-demand: refill the rotating shuffle buffer once per eval interval from new
+        // random regions, so the run traverses the whole corpus over time. buf_rng is a
+        // separate stream, so this never perturbs the resume-critical `rng`. The refill may
+        // reallocate train_buf, so re-bind the span and the sampler to the new storage.
+        if (on_demand && steps_since_refresh >= eval_every) {
+            buf_rng.seed(static_cast<std::uint32_t>(seed) ^ (0x9E3779B9u * static_cast<std::uint32_t>(++refresh_n)));
+            text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
+            train_span = train_buf;
+            startd = std::uniform_int_distribution<size_t>(0, train_span.size() - SEQ_LEN - 2);
+            steps_since_refresh = 0;
+        }
+        ++steps_since_refresh;
+
         // Draw the window starts on the main thread (keeps the RNG stream, hence
         // resume, deterministic), then run the batch data-parallel across threads.
         for (int b = 0; b < batch; ++b) starts[b] = startd(rng);
-        const float step_loss = sub0::train_batch(data.data(), starts.data(), batch, SEQ_LEN);
+        const float step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, SEQ_LEN);
         opt.step();
         run_loss += step_loss; ++run_n;
         rs.step = step;
@@ -411,7 +536,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Validation NELBO only once enough of the corpus has been seen.
             std::string eval_str = "(warmup)";
             if (step >= warmup_steps) {
-                const double nelbo = evaluate(data, val_start);
+                const double nelbo = evaluate(val_span, 0);
                 rs.evals.push_back(nelbo);
                 rs.best_loss = std::min(rs.best_loss, nelbo);
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
