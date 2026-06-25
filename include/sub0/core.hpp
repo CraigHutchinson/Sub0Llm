@@ -89,9 +89,20 @@ public:
     explicit AdamW(float lr);
     void zero_grad();
     void step();
+    long step_count() const { return t_; }      // bias-correction counter (for checkpoints)
+    void set_step_count(long t) { t_ = t; }      // restore on resume
 private:
     float lr_, b1_ = 0.9f, b2_ = 0.95f, eps_ = 1e-8f, wd_ = 0.01f, clip_ = 1.0f;
     long t_ = 0;
 };
+
+// --- Trainable-state access (for crash-safe checkpointing) ------------------
+// The parameters and the Adam moments live in the engine's static arenas. These
+// expose them so the train stage can serialize the *complete* optimizer state and
+// resume a run exactly. All three buffers are trainable_floats() long.
+SUB0_API std::size_t trainable_floats();   // == PARAM_FLOATS
+SUB0_API float*      params_ptr();         // parameter values
+SUB0_API float*      adam_m_ptr();         // Adam first-moment estimates
+SUB0_API float*      adam_v_ptr();         // Adam second-moment estimates
 
 }  // namespace sub0

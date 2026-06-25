@@ -34,7 +34,9 @@ static void usage() {
         "sub0llm \u2014 staged CPU transformer LM (config baked in at build time)\n\n"
         "  sub0llm train <model.bin> [corpus] [--steps N --batch N --lr F --seed N]\n"
         "      corpus defaults to the one this build was configured with:\n"
-        "      {}\n\n"
+        "      {}\n"
+        "      --steps 0 (default) auto-sizes the run to the corpus and stops on a\n"
+        "      validation plateau; <model.bin>.ckpt allows crash-safe resume.\n\n"
         "  sub0llm gen   <model.bin> \"<prompt>\" [--n N --temp F --topk N --seed N]\n\n"
         "  sub0llm vocab [tokenizer.bin] [--limit N]\n"
         "      print the build's BPE vocabulary table (defaults to the baked-in tokenizer)\n\n"
@@ -60,7 +62,7 @@ int main(int argc, char** argv) {
         // Optional positional corpus (third arg if it isn't a flag); else default.
         const char* corpus = DEFAULT_CORPUS;
         if (argc >= 4 && argv[3][0] != '-') corpus = argv[3];
-        int steps = arg_int(argc, argv, "--steps", 3000);
+        int steps = arg_int(argc, argv, "--steps", 0);   // 0 = auto (corpus-relative max)
         int batch = arg_int(argc, argv, "--batch", 8);
         float lr  = arg_float(argc, argv, "--lr", 0.001f);
         unsigned seed = (unsigned)arg_int(argc, argv, "--seed", 42);

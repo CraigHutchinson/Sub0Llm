@@ -503,6 +503,11 @@ const char* default_corpus()     { return DEFAULT_CORPUS; }
 const char* default_corpus_tok() { return DEFAULT_CORPUS_TOK; }
 const char* default_tokenizer()  { return DEFAULT_TOKENIZER; }
 
+std::size_t trainable_floats() { return PARAM_FLOATS; }
+float*      params_ptr()       { return g_param_data.data(); }
+float*      adam_m_ptr()       { return g_param_m.data(); }
+float*      adam_v_ptr()       { return g_param_vel.data(); }
+
 // ============================================================================
 //  Runtime BPE tokenizer (loaded from tokenizer.bin)
 // ============================================================================
