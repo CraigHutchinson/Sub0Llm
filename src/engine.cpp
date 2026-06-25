@@ -31,9 +31,18 @@
 #include <utility>
 #include <vector>
 
+// OpenMP gate. The data-parallel training path is the whole point of the worker pool;
+// a build that silently loses OpenMP (e.g. find_package's flaky libomp probe on
+// clang/Windows) would compile fine and then run every "thread" serially -- a silent
+// perf regression that is painful to diagnose after the fact. So unless the build
+// explicitly opts out (-DSUB0_REQUIRE_OPENMP=OFF), a missing _OPENMP is a hard compile
+// error here rather than a quiet fallback. Do NOT relax this to an unconditional stub.
 #if defined(_OPENMP)
 #include <omp.h>
+#elif defined(SUB0_REQUIRE_OPENMP)
+#error "OpenMP required but _OPENMP is undefined: this translation unit was compiled without OpenMP, so the data-parallel path would silently run single-threaded. Reconfigure with OpenMP available, or pass -DSUB0_REQUIRE_OPENMP=OFF to build single-threaded on purpose."
 #else
+// Intentional single-threaded fallback (configured with -DSUB0_REQUIRE_OPENMP=OFF).
 static inline int omp_get_thread_num()  { return 0; }
 static inline int omp_get_num_threads() { return 1; }
 static inline int omp_get_max_threads() { return 1; }

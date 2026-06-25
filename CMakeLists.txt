@@ -46,6 +46,43 @@ endif()
 
 find_package(OpenMP)
 
+# OpenMP drives the data-parallel training path. Without it the engine silently falls
+# back to single-thread stubs and `tune`/`bench` show no scaling at all -- an easily
+# missed regression -- so a missing OpenMP is a hard, explained error by default.
+option(SUB0_REQUIRE_OPENMP "Fail configuration if OpenMP is unavailable (the data-parallel path needs it)" ON)
+
+if(OpenMP_CXX_FOUND)
+  set(SUB0_OPENMP_TARGET OpenMP::OpenMP_CXX)
+  message(STATUS "OpenMP: enabled via find_package (${OpenMP_CXX_FLAGS})")
+else()
+  # find_package's library probe is fragile with clang on Windows: it can fail to
+  # locate libomp even though the compiler fully supports -fopenmp=libomp (which
+  # auto-links the runtime). Probe the flag directly and drive it ourselves if it
+  # works, so a flaky find_package no longer silently disables all parallelism.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS "-fopenmp=libomp")
+  check_cxx_source_compiles(
+    "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }"
+    SUB0_OPENMP_FLAG_WORKS)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(SUB0_OPENMP_FLAG_WORKS)
+    add_library(sub0_openmp INTERFACE)
+    target_compile_options(sub0_openmp INTERFACE -fopenmp=libomp)
+    target_link_options(sub0_openmp INTERFACE -fopenmp=libomp)
+    set(SUB0_OPENMP_TARGET sub0_openmp)
+    message(STATUS "OpenMP: find_package failed; using -fopenmp=libomp directly")
+  elseif(SUB0_REQUIRE_OPENMP)
+    message(FATAL_ERROR
+      "OpenMP not found and '-fopenmp=libomp' does not compile.\n"
+      "  The data-parallel training path REQUIRES OpenMP; without it the engine runs\n"
+      "  single-threaded and `tune`/`bench` show no thread scaling (a silent perf\n"
+      "  regression). Install an OpenMP runtime (libomp) for this toolchain and\n"
+      "  reconfigure. To build single-threaded ON PURPOSE, pass -DSUB0_REQUIRE_OPENMP=OFF.")
+  else()
+    message(WARNING "OpenMP unavailable -- building SINGLE-THREADED (SUB0_REQUIRE_OPENMP=OFF).")
+  endif()
+endif()
+
 # Transcendental math path: fast vectorizable approximations (default) vs the exact
 # std::exp/std::erf path. Compile-time only -- the unused branch is eliminated.
 option(SUB0_EXACT_MATH "Use exact std::exp/std::erf instead of the fast approximations" OFF)
@@ -77,7 +114,7 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/tinystories.txt" CACHE FILEPATH "training corpus (drives vocab)")
 set(SUB0_D_MODEL  96 CACHE STRING "embedding / residual width")
-set(SUB0_N_LAYERS 3  CACHE STRING "transformer blocks")
+set(SUB0_N_LAYERS 5  CACHE STRING "transformer blocks")
 set(SUB0_N_HEADS  4  CACHE STRING "attention heads")
 set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
@@ -132,8 +169,13 @@ target_compile_options(sub0_core PRIVATE
 if(SUB0_EXACT_MATH)
   target_compile_definitions(sub0_core PRIVATE SUB0_EXACT_MATH)
 endif()
-if(OpenMP_CXX_FOUND)
-  target_link_libraries(sub0_core PUBLIC OpenMP::OpenMP_CXX)
+if(SUB0_OPENMP_TARGET)
+  target_link_libraries(sub0_core PUBLIC ${SUB0_OPENMP_TARGET})
+endif()
+# Propagated to every TU compiled against the core so a build that lost OpenMP fails
+# loudly at compile time (see the #error in engine.cpp) instead of running serially.
+if(SUB0_REQUIRE_OPENMP)
+  target_compile_definitions(sub0_core PUBLIC SUB0_REQUIRE_OPENMP)
 endif()
 
 # --- Stage 4: backend stage libraries ---------------------------------------

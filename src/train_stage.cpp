@@ -18,6 +18,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/coherence.hpp"
+#include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
 
 #include <algorithm>
@@ -25,7 +26,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -73,37 +73,26 @@ constexpr int    PLATEAU_MIN_IMPROVE = 4;     // >= this many decreasing -> keep
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
 constexpr std::uint32_t CKPT_VERSION = 1u;
 
-// --- corpus.tok loading -----------------------------------------------------
-enum class TokError { Missing, BadMagic, Truncated };
-
-// Contents of corpus.tok: the token stream plus the vocabulary size it was produced
-// for, so the caller can verify it matches the engine's compiled-in VOCAB.
-struct TokData {
-    int vocab = 0;                 // vocabulary the file was tokenized against
-    std::vector<int> data;         // flat token-id stream
-};
-
-// Read the pre-tokenized corpus (corpus.tok, "S0TK") into a flat id array. Returning
-// std::expected makes the data unreachable until the caller has handled the error.
-std::expected<TokData, TokError> load_tokens(const std::string& path) {
-    std::ifstream is(path, std::ios::binary);
-    if (!is) return std::unexpected(TokError::Missing);
-    auto rd = [&] { std::uint32_t v{}; is.read(reinterpret_cast<char*>(&v), 4); return v; };
-    if (rd() != 0x4B543053u) return std::unexpected(TokError::BadMagic);  // "S0TK"
-    TokData out;
-    out.vocab = static_cast<int>(rd());
-    const std::uint32_t ntok = rd();
-    out.data.resize(ntok);
-    is.read(reinterpret_cast<char*>(out.data.data()), static_cast<std::streamsize>(ntok) * sizeof(int));
-    if (!is) return std::unexpected(TokError::Truncated);
-    return out;
+// --- corpus.tok access ------------------------------------------------------
+// The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
+// pages the stream in on demand, so it may exceed RAM without a giant allocation -- the
+// out-of-core path for a FineWeb-scale corpus. Random-window training and the fixed-
+// window eval index the mapping directly. A diagnostic for each mapping failure mode.
+const char* tokmap_error(sub0::TokMap::Err e) {
+    using E = sub0::TokMap::Err;
+    switch (e) {
+        case E::Missing:   return "cannot open token file";
+        case E::BadMagic:  return "not a corpus.tok file (bad magic)";
+        case E::Truncated: return "truncated (token count exceeds file size)";
+        default:           return "ok";
+    }
 }
 
 // --- Validation NELBO -------------------------------------------------------
 // Mean cross-entropy per token over a fixed, evenly-spaced set of windows in the
 // held-out tail. Fixed windows make the metric comparable across evals (so the
 // plateau sign test sees signal, not resampling noise) and bound the cost.
-double evaluate(const std::vector<int>& data, std::size_t val_start) {
+double evaluate(std::span<const int> data, std::size_t val_start) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
     const std::size_t span = last - val_start;
@@ -129,7 +118,7 @@ double evaluate(const std::vector<int>& data, std::size_t val_start) {
 // the model's sampling entropy to its reading entropy. Unlike cross-entropy (inflated by
 // model error -> perplexity 5.17 here), entropy compares the model to ITSELF, so the
 // matched temperature is not biased upward by an imperfect fit and centers near 1.
-double mean_entropy(const std::vector<int>& data, std::size_t val_start) {
+double mean_entropy(std::span<const int> data, std::size_t val_start) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
     const std::size_t span = last - val_start;
@@ -319,16 +308,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (tok_path.size() < 4 || tok_path.compare(tok_path.size() - 4, 4, ".tok") != 0)
         tok_path = sub0::default_corpus_tok();
 
-    std::expected<TokData, TokError> tok = load_tokens(tok_path);
-    if (!tok) {
-        switch (tok.error()) {
-            case TokError::Missing:
-                std::println(stderr, "train: cannot open token file '{}'", tok_path); break;
-            case TokError::BadMagic:
-                std::println(stderr, "train: '{}' is not a corpus.tok file (bad magic)", tok_path); break;
-            case TokError::Truncated:
-                std::println(stderr, "train: '{}' is truncated (token count exceeds file size)", tok_path); break;
-        }
+    sub0::TokMap tok(tok_path);
+    if (!tok.ok()) {
+        std::println(stderr, "train: {} '{}'", tokmap_error(tok.error()), tok_path);
         return 1;
     }
 
@@ -336,15 +318,15 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // matching VOCAB into the engine, so within a build they always agree -- but a
     // stale, hand-built, or foreign .tok passed on the command line would index the
     // embedding table out of bounds. Reject it up front rather than corrupt memory.
-    if (tok->vocab != VOCAB) {
+    if (tok.vocab() != VOCAB) {
         std::println(stderr,
                      "train: '{}' was tokenized for vocab {} but this engine was built for VOCAB {}.\n"
                      "       Reconfigure/rebuild against this corpus, or pass a matching .tok.",
-                     tok_path, tok->vocab, VOCAB);
+                     tok_path, tok.vocab(), VOCAB);
         return 1;
     }
 
-    std::vector<int>& data = tok->data;
+    const std::span<const int> data = tok.tokens();
     // Need a validation tail plus a training region each large enough for a window.
     const std::size_t min_tokens = 2 * (static_cast<std::size_t>(SEQ_LEN) + 2);
     if (data.size() < min_tokens) {
@@ -354,8 +336,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     }
 
     // Defense in depth: even with a matching vocab field, a corrupt file could hold
-    // an out-of-range id. One linear scan is cheap next to training and turns a
-    // silent OOB gather into a clear diagnostic.
+    // an out-of-range id. One linear scan turns a silent OOB gather into a clear
+    // diagnostic; it also faults in the whole mapping once, but training's random
+    // windows would touch most of it across epochs anyway.
     for (size_t i = 0; i < data.size(); ++i)
         if (data[i] < 0 || data[i] >= VOCAB) {
             std::println(stderr, "train: '{}' token {} = {} is out of range [0,{})",
@@ -465,6 +448,19 @@ Stat summarize(std::vector<std::uint64_t>& v) {
 }
 }  // namespace
 
+// Surface the threading mode loudly. A build that lost OpenMP runs every "thread"
+// serially; without this banner that only shows up as mysteriously flat scaling in
+// the numbers below, which is exactly the silent failure this guards against.
+static void report_threading() {
+#if defined(_OPENMP)
+    std::println("threading: OpenMP enabled ({} hardware threads available)", omp_get_max_threads());
+#else
+    std::println("threading: !! OpenMP DISABLED -- every run is SINGLE-THREADED; thread");
+    std::println("           scaling below is meaningless. Rebuild with OpenMP. !!");
+#endif
+    std::fflush(stdout);
+}
+
 // Single-thread, cycle-accurate microbenchmark of the training hot path. It is the
 // control baseline for optimization: pinned to one core, OpenMP forced to one
 // thread, timed in rdtsc cycles, reported as the min (un-throttled cost) and median
@@ -480,12 +476,12 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
     omp_set_num_threads(threads > 0 ? threads : 1);
 #endif
 
-    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
-    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+    sub0::TokMap tok(sub0::default_corpus_tok());
+    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
         std::println(stderr, "bench: cannot load a usable corpus.tok");
         return 1;
     }
-    const std::vector<int>& data = tok->data;
+    const std::span<const int> data = tok.tokens();
     sub0::build_model();
     sub0::AdamW opt(0.001f);
     std::mt19937 rng(123);
@@ -533,6 +529,7 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
     const Stat sf = summarize(fwd), sb = summarize(bwd), so = summarize(optc), ss = summarize(step);
     auto us = [&](std::uint64_t cyc) { return tsc_ghz > 0 ? cyc / (tsc_ghz * 1000.0) : 0.0; };
 
+    report_threading();
     std::println("--- single-thread hot-path bench ({} iters, 1 thread, pinned) ---", iters);
     std::println("TSC ~{:.2f} GHz | min cycles/window (median in parens), us at TSC rate", tsc_ghz);
     std::println("  forward    {:>10}  ({:>10})   {:.1f} us", sf.lo, sf.med, us(sf.lo));
@@ -607,7 +604,7 @@ namespace {
 // the coarse sweep uses a short burst for speed, the confirmation a long throttled run.
 // Random run-to-run noise is handled upstream by the search's median-of-samples
 // confirmation, so a single honest measurement is returned here (no optimistic best-of).
-double measure_dp_throughput(const std::vector<int>& data, std::mt19937& rng,
+double measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
                              int threads, int windows_per_thread, int steps) {
 #if defined(_OPENMP)
     omp_set_num_threads(threads > 0 ? threads : 1);
@@ -633,12 +630,12 @@ double measure_dp_throughput(const std::vector<int>& data, std::mt19937& rng,
 }  // namespace
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
-    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
-    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+    sub0::TokMap tok(sub0::default_corpus_tok());
+    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
         std::println(stderr, "tune: cannot load a usable corpus.tok");
         return 1;
     }
-    const std::vector<int>& data = tok->data;
+    const std::span<const int> data = tok.tokens();
     sub0::build_model();
     std::mt19937 rng(123);
 
@@ -677,6 +674,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     };
 
     std::println("--- auto-tune throughput (knobs: threads 1..{}, windows/thread {{1,2,4,8,16}}) ---", cap);
+    report_threading();
     std::fflush(stdout);
 
     sub0::tune::Options opt;
@@ -755,7 +753,7 @@ struct GenStats { double ppl = 0.0; double rep4 = 0.0; };
 // common random numbers across temperatures, so the perplexity-vs-temperature curve is
 // smooth enough to bisect cleanly. Sampling uses temperature+top-k (the real gen path);
 // scoring uses the full T=1 softmax so the number is comparable to real-text perplexity.
-GenStats gen_self_stats(const std::vector<int>& data, std::size_t val_start,
+GenStats gen_self_stats(std::span<const int> data, std::size_t val_start,
                         float temp, int topk, int n_seeds, int gen_len, unsigned cr_seed) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     const std::size_t span = (last > val_start) ? last - val_start : 0;
@@ -798,7 +796,7 @@ GenStats gen_self_stats(const std::vector<int>& data, std::size_t val_start,
 // the same number of equal-length windows spread across the held-out tail. Measuring
 // real text over one long contiguous span instead would inflate it (names/phrases recur
 // across many sentences), making the gen-vs-real comparison apples-to-oranges.
-double real_windowed_repeat(const std::vector<int>& data, std::size_t val_start,
+double real_windowed_repeat(std::span<const int> data, std::size_t val_start,
                             int n_seeds, int win) {
     if (data.size() <= static_cast<std::size_t>(win) + 1) return 0.0;
     const std::size_t last = data.size() - 1 - static_cast<std::size_t>(win);
@@ -819,12 +817,12 @@ using sub0::coherence::interp_cross;
 }  // namespace
 
 extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose) {
-    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
-    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+    sub0::TokMap tok(sub0::default_corpus_tok());
+    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
         std::println(stderr, "autotemp: cannot load a usable corpus.tok");
         return 1;
     }
-    const std::vector<int>& data = tok->data;
+    const std::span<const int> data = tok.tokens();
 
     sub0::build_model();
     if (!sub0::load_model(model_in)) {
