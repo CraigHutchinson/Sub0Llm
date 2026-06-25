@@ -114,20 +114,50 @@ int main(int argc, char** argv) {
     long quote_repl = 0;
     const std::string norm = normalize_text(text, quote_repl);
 
-    // 2. Attested lowercase words license Capitalized/UPPER collapses; genuine
-    //    names (whose lowercase never appears) stay verbatim.
-    std::unordered_set<std::string> attested;
+    // 2. Decide which lowercase words license a Capitalized/UPPER collapse to a
+    //    case marker. A word qualifies if it appears lowercase AND is not really a
+    //    proper noun. The tell for a proper noun is *position*: sentence-initial
+    //    capitals are positional ("The ..."), but a capital that follows a lowercase
+    //    word mid-sentence ("...to Spot") is a name. So per lowercase form we count
+    //    lowercase uses against mid-sentence-capital uses; a form whose name uses
+    //    dominate is withheld from `attested`, keeping e.g. the dog "Spot" a distinct
+    //    verbatim token instead of folding it onto the noun <|cap|>spot.
+    auto preceded_by_lowercase = [&](std::size_t start) {
+        std::size_t k = start;                       // skip only horizontal space: a
+        while (k > 0 && (norm[k - 1] == ' ' || norm[k - 1] == '\t')) --k;  // newline is a line start
+        return k > 0 && is_lower(static_cast<unsigned char>(norm[k - 1]));
+    };
+    std::unordered_map<std::string, long> lower_count, midcap_count;
     for (std::size_t i = 0, n = norm.size(); i < n;) {
         const unsigned char c = static_cast<unsigned char>(norm[i]);
         if (!is_alpha(c)) { ++i; continue; }
         std::size_t j = i;
-        bool all_lower = true;
+        bool all_lower = true, rest_lower = true;
         while (j < n && is_alpha(static_cast<unsigned char>(norm[j]))) {
-            if (!is_lower(static_cast<unsigned char>(norm[j]))) all_lower = false;
+            const unsigned char ch = static_cast<unsigned char>(norm[j]);
+            if (!is_lower(ch)) all_lower = false;
+            if (j > i && !is_lower(ch)) rest_lower = false;
             ++j;
         }
-        if (all_lower) attested.insert(norm.substr(i, j - i));
+        const std::string w = norm.substr(i, j - i);
+        if (all_lower) {
+            lower_count[w] += 1;
+        } else if (is_upper(static_cast<unsigned char>(w[0])) && rest_lower) {  // "Spot", "The"
+            if (preceded_by_lowercase(i)) {
+                std::string lw = w;
+                lw[0] = static_cast<char>(to_lower(static_cast<unsigned char>(lw[0])));
+                midcap_count[lw] += 1;
+            }
+        }
         i = j;
+    }
+    std::unordered_set<std::string> attested;
+    long names_withheld = 0;
+    for (const auto& [w, lc] : lower_count) {
+        const auto it = midcap_count.find(w);
+        const long mid = (it == midcap_count.end()) ? 0 : it->second;
+        if (mid > lc) { ++names_withheld; continue; }  // name sense dominates -> keep verbatim
+        attested.insert(w);
     }
 
     // 3. Truecase into a base-symbol stream (bytes + <|cap|>/<|up|> markers).
@@ -325,6 +355,7 @@ int main(int argc, char** argv) {
     std::println(stderr, "alpha words (total / unique):    {} / {}", st.words, word_syms.size());
     std::println(stderr, "  collapsed <|cap|> / <|up|>:    {} / {}", st.cap, st.up);
     std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
+    std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
     std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
     std::println(stderr, "total tokens:                    {}", tokens.size());
     std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);

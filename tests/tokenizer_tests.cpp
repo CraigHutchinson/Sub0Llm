@@ -89,6 +89,23 @@ TEST_CASE("typographic input round-trips through the build tokenizer", "[tokeniz
     REQUIRE(sub0::detokenize(sub0::encode(in)) == sub0::casing::normalize_text(in, r));
 }
 
+TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokenizer]") {
+    REQUIRE(tokenizer_ready());
+    // "Spot" (the dog) appears capitalized mid-sentence far more than the noun
+    // "spot" appears lowercase, so the configurator withholds it from `attested`:
+    // "Spot" stays a distinct verbatim token rather than folding onto <|cap|>spot.
+    // This is the inverse of the "They"/"they" case-sharing contract above.
+    const std::vector<int> name = sub0::encode("Spot");
+    const std::vector<int> noun = sub0::encode("spot");
+    REQUIRE_FALSE(name.empty());
+    REQUIRE(name != noun);
+    const bool encoded_as_cap_plus_noun =
+        name.size() == noun.size() + 1 &&
+        std::vector<int>(name.begin() + 1, name.end()) == noun;
+    REQUIRE_FALSE(encoded_as_cap_plus_noun);
+    REQUIRE(sub0::detokenize(name) == "Spot");  // capital preserved on the round-trip
+}
+
 TEST_CASE("encode is deterministic", "[tokenizer]") {
     REQUIRE(tokenizer_ready());
     const std::string text = "the dog ran and the cat slept";
