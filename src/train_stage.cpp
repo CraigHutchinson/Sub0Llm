@@ -362,6 +362,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::fflush(stdout);
 
     std::uniform_int_distribution<size_t> startd(0, val_start - SEQ_LEN - 2);
+    std::vector<size_t> starts(batch);
 
     using clock = std::chrono::steady_clock;
     auto win_t0 = clock::now();
@@ -370,16 +371,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     bool stop = false;
 
     for (long step = rs.step + 1; step <= max_steps && !stop; ++step) {
-        opt.zero_grad();
-        float step_loss = 0.f;
-        for (int b = 0; b < batch; ++b) {
-            size_t s = startd(rng);
-            sub0::graph_reset();
-            sub0::Node* logits = sub0::forward(data.data() + s, SEQ_LEN);
-            sub0::Node* loss   = sub0::cross_entropy(logits, data.data() + s + 1);
-            step_loss += loss->data[0] / batch;
-            sub0::backward(loss, 1.f / batch);
-        }
+        // Draw the window starts on the main thread (keeps the RNG stream, hence
+        // resume, deterministic), then run the batch data-parallel across threads.
+        for (int b = 0; b < batch; ++b) starts[b] = startd(rng);
+        const float step_loss = sub0::train_batch(data.data(), starts.data(), batch, SEQ_LEN);
         opt.step();
         run_loss += step_loss; ++run_n;
         rs.step = step;
@@ -472,6 +467,7 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads) {
         sub0::Node* loss = sub0::cross_entropy(logits, y);
         const std::uint64_t s2 = cpu_cycles();
         sub0::backward(loss, 1.f);
+        sub0::reduce_gradients();        // single-window: publish grad for the optimizer
         const std::uint64_t s3 = cpu_cycles();
         opt.step();
         const std::uint64_t s4 = cpu_cycles();

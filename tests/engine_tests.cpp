@@ -98,6 +98,7 @@ TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
         sub0::graph_reset();
         sub0::Node* lg = sub0::forward(ids.data(), 8);
         sub0::backward(sub0::cross_entropy(lg, tgt.data()), 1.f);
+        sub0::reduce_gradients();
         opt.step();
     }
 
@@ -106,6 +107,7 @@ TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
     sub0::graph_reset();
     sub0::Node* logits = sub0::forward(ids.data(), 8);
     sub0::backward(sub0::cross_entropy(logits, tgt.data()), 1.f);
+    sub0::reduce_gradients();   // publish accumulator -> the gradient grad_ptr() exposes
     const std::size_t n = sub0::trainable_floats();
     std::vector<float> g(sub0::grad_ptr(), sub0::grad_ptr() + n);
     std::vector<float> base(sub0::params_ptr(), sub0::params_ptr() + n);
@@ -148,6 +150,44 @@ TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
     }
 }
 
+TEST_CASE("train_batch gradient matches sequential accumulation", "[engine][grad]") {
+    sub0::build_model();
+    const int T = 8, batch = 5;
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    std::vector<int> data(2000);
+    for (int& v : data) v = tok(rng);
+    std::uniform_int_distribution<std::size_t> pick(0, data.size() - T - 2);
+    std::vector<std::size_t> starts(batch);
+    for (auto& s : starts) s = pick(rng);
+
+    const std::size_t n = sub0::trainable_floats();
+
+    // Sequential reference: accumulate every window's 1/batch-scaled grad on one thread.
+    sub0::AdamW opt(0.01f);
+    opt.zero_grad();
+    double seq_loss = 0.0;
+    for (int b = 0; b < batch; ++b) {
+        sub0::graph_reset();
+        sub0::Node* lg = sub0::forward(data.data() + starts[b], T);
+        sub0::Node* loss = sub0::cross_entropy(lg, data.data() + starts[b] + 1);
+        seq_loss += loss->data[0];
+        sub0::backward(loss, 1.f / batch);
+    }
+    sub0::reduce_gradients();
+    std::vector<float> seq(sub0::grad_ptr(), sub0::grad_ptr() + n);   // reduced single-thread grad
+
+    // Data-parallel: same windows, split across threads, summed in train_batch.
+    const float par_loss = sub0::train_batch(data.data(), starts.data(), batch, T);
+    std::vector<float> par(sub0::grad_ptr(), sub0::grad_ptr() + n);   // reduced multi-thread grad
+
+    REQUIRE(par_loss == Catch::Approx(seq_loss / batch).epsilon(1e-4));
+    double max_abs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) max_abs = std::max(max_abs, std::abs((double)seq[i] - par[i]));
+    INFO("max abs grad diff = " << max_abs);
+    REQUIRE(max_abs < 1e-4);
+}
+
 TEST_CASE("one window can be overfit: AdamW drives the loss down", "[engine]") {
     sub0::build_model();
     std::vector<int> ids, tgt;
@@ -161,6 +201,7 @@ TEST_CASE("one window can be overfit: AdamW drives the loss down", "[engine]") {
         sub0::Node* logits = sub0::forward(ids.data(), 16);
         sub0::Node* loss   = sub0::cross_entropy(logits, tgt.data());
         sub0::backward(loss, 1.f);
+        sub0::reduce_gradients();
         opt.step();
     }
     const float l1 = window_loss(ids, tgt);

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -27,6 +28,14 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#else
+static inline int omp_get_thread_num()  { return 0; }
+static inline int omp_get_num_threads() { return 1; }
+static inline int omp_get_max_threads() { return 1; }
+#endif
 
 namespace sub0 {
 
@@ -67,14 +76,31 @@ constexpr size_t MAX_NODES = 16 + 16 * (size_t)N_LAYERS;
 //  Static storage
 // ============================================================================
 
+// Shared across all worker threads: the weights (read-only during fwd/bwd), the
+// optimizer moments (touched only by AdamW::step on the main thread), and the
+// REDUCED gradient that AdamW::step consumes.
 static std::array<float, PARAM_FLOATS> g_param_data{};
 static std::array<float, PARAM_FLOATS> g_param_grad{};
 static std::array<float, PARAM_FLOATS> g_param_m{};
 static std::array<float, PARAM_FLOATS> g_param_vel{};
 
-static std::array<float, ACT_CAP> g_act_data{};
-static std::array<float, ACT_CAP> g_act_grad{};
-static size_t g_act_used = 0;
+// Per-worker buffers for data-parallel batches. They are STATICALLY allocated as a
+// fixed pool indexed by OpenMP thread id -- not thread_local: a multi-MB thread_local
+// in a DLL overruns Windows' static-TLS block and faults. BSS is demand-paged, so
+// only the worker slots a run actually touches become resident. Each thread caches
+// pointers into its slot in (small) thread_local handles, keeping the hot paths
+// pointer-direct. Slot 0 serves all single-window work (gen / eval / bench).
+constexpr int MAX_WORKERS = 32;
+static std::array<std::array<float, PARAM_FLOATS>, MAX_WORKERS> g_grad_pool{};  // grad accumulators
+static std::array<std::array<float, ACT_CAP>, MAX_WORKERS>      g_actd_pool{};  // activation values
+static std::array<std::array<float, ACT_CAP>, MAX_WORKERS>      g_actg_pool{};  // activation grads
+static float* g_tgrad_ptrs[MAX_WORKERS] = {};
+static std::atomic<bool> g_params_init{false};
+
+thread_local float* tl_grad    = nullptr;   // -> g_grad_pool[tid]
+thread_local float* g_act_data = nullptr;   // -> g_actd_pool[tid]
+thread_local float* g_act_grad = nullptr;   // -> g_actg_pool[tid]
+thread_local size_t g_act_used = 0;
 
 static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
     if (g_act_used + n > ACT_CAP) {
@@ -84,21 +110,22 @@ static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
     }
     size_t off = g_act_used;
     g_act_used += n;
-    std::span<float> d(g_act_data.data() + off, n);
-    std::span<float> gr(g_act_grad.data() + off, n);
+    std::span<float> d(g_act_data + off, n);
+    std::span<float> gr(g_act_grad + off, n);
     std::fill(d.begin(), d.end(), 0.f);
     std::fill(gr.begin(), gr.end(), 0.f);
     return {d, gr};
 }
 
-static std::array<Node, NUM_PARAMS> g_param_nodes;
-static std::array<Node, MAX_NODES>  g_pool;
-static size_t g_pool_used = 0;
+thread_local std::array<Node, NUM_PARAMS> g_param_nodes;
+thread_local std::array<Node, MAX_NODES>  g_pool;
+thread_local size_t g_pool_used = 0;
 
 struct ParamView { size_t off, n; bool decay; };
-static std::array<ParamView, NUM_PARAMS> g_param_views;
-static size_t g_param_used = 0;
-static int g_pcount = 0;
+thread_local std::array<ParamView, NUM_PARAMS> g_param_views;
+thread_local size_t g_param_used = 0;
+thread_local int g_pcount = 0;
+thread_local bool g_thread_built = false;
 
 // When a model was loaded with weights already in their final (ternary) form,
 // the linear op must not re-quantize them (absmean re-quantization is not
@@ -111,8 +138,8 @@ static Node* mk_param(int r, int c, bool decay) {
     Node& nd = g_param_nodes[g_pcount];
     nd = Node{};
     nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
-    nd.data = std::span<float>(g_param_data.data() + off, n);
-    nd.grad = std::span<float>(g_param_grad.data() + off, n);
+    nd.data = std::span<float>(g_param_data.data() + off, n);   // shared weights
+    nd.grad = std::span<float>(tl_grad + off, n);               // this thread's grad accumulator
     g_param_views[g_pcount] = {off, n, decay};
     ++g_pcount;
     return &nd;
@@ -219,7 +246,6 @@ static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
         Wf = sd.data();
     }
     const float* X = x->data.data();
-    #pragma omp parallel for
     for (int t = 0; t < T; ++t) {
         float* __restrict Yr        = y->data.data() + (size_t)t * out;
         const float* __restrict Xr  = X + (size_t)t * in;
@@ -361,8 +387,7 @@ static void backward_node(Node& n) {
         const float* dY = n.grad.data();
         const float* X = x->data.data();
         // dX = dY . W^T : inner loop over `o` is contiguous in both operands (a dot
-        // product reduction); parallel over rows t (each writes a distinct x->grad row).
-        #pragma omp parallel for
+        // product reduction). Per-window; data-parallelism is at the batch level.
         for (int t = 0; t < T; ++t) {
             const float* __restrict dYr = dY + (size_t)t * out;
             float* __restrict xg        = x->grad.data() + (size_t)t * in;
@@ -376,8 +401,6 @@ static void backward_node(Node& n) {
         }
         // dW = X^T . dY : iterate (p, t, o) so the inner loop over `o` is a contiguous
         // axpy into W->grad's row (the old (p,o,t) order strided over t -> no vectorize).
-        // Still parallel over p, so each thread owns a distinct W->grad row (race-free).
-        #pragma omp parallel for
         for (int p = 0; p < in; ++p) {
             float* __restrict Wg = W->grad.data() + (size_t)p * out;
             for (int t = 0; t < T; ++t) {
@@ -489,36 +512,54 @@ struct Model {
     Node* lm_head;
     Node* lm_bias;
 
-    void build() {
+    // Lay out the parameter nodes for the CALLING thread: data spans into the shared
+    // weights, grad spans into this thread's accumulator. Deterministic offsets, so
+    // every thread agrees on the layout. No weight initialization here.
+    void build_layout() {
         g_param_used = 0; g_pcount = 0;
+        tok_emb = mk_param(VOCAB, D_MODEL, false);
+        pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
+        for (auto& L : layers) {
+            L.ln1 = mk_param(1, D_MODEL, false);
+            L.ln2 = mk_param(1, D_MODEL, false);
+            L.Wq = mk_param(D_MODEL, D_MODEL, true);
+            L.Wk = mk_param(D_MODEL, D_MODEL, true);
+            L.Wv = mk_param(D_MODEL, D_MODEL, true);
+            L.Wo = mk_param(D_MODEL, D_MODEL, true);
+            L.W1 = mk_param(D_MODEL, D_FF, true);
+            L.b1 = mk_param(1, D_FF, false);
+            L.W2 = mk_param(D_FF, D_MODEL, true);
+            L.b2 = mk_param(1, D_MODEL, false);
+        }
+        ln_f = mk_param(1, D_MODEL, false);
+        lm_head = mk_param(D_MODEL, VOCAB, true);
+        lm_bias = mk_param(1, VOCAB, false);
+    }
+
+    // Randomly initialize the SHARED weights through this thread's node layout.
+    // Called once (main thread); biases stay zero from the static arena.
+    void init_weights() {
         std::mt19937 rng(1234);
         auto randn = [&](Node* t, float std) {
             std::normal_distribution<float> nd(0.f, std);
             for (auto& x : t->data) x = nd(rng);
         };
         auto ones = [](Node* t) { std::fill(t->data.begin(), t->data.end(), 1.f); };
-
-        tok_emb = mk_param(VOCAB, D_MODEL, false);   randn(tok_emb, 0.02f);
-        pos_emb = mk_param(SEQ_LEN, D_MODEL, false); randn(pos_emb, 0.02f);
+        randn(tok_emb, 0.02f);
+        randn(pos_emb, 0.02f);
         for (auto& L : layers) {
-            L.ln1 = mk_param(1, D_MODEL, false); ones(L.ln1);
-            L.ln2 = mk_param(1, D_MODEL, false); ones(L.ln2);
-            L.Wq = mk_param(D_MODEL, D_MODEL, true); randn(L.Wq, 0.02f);
-            L.Wk = mk_param(D_MODEL, D_MODEL, true); randn(L.Wk, 0.02f);
-            L.Wv = mk_param(D_MODEL, D_MODEL, true); randn(L.Wv, 0.02f);
-            L.Wo = mk_param(D_MODEL, D_MODEL, true); randn(L.Wo, 0.02f);
-            L.W1 = mk_param(D_MODEL, D_FF, true); randn(L.W1, 0.02f);
-            L.b1 = mk_param(1, D_FF, false);
-            L.W2 = mk_param(D_FF, D_MODEL, true); randn(L.W2, 0.02f);
-            L.b2 = mk_param(1, D_MODEL, false);
+            ones(L.ln1); ones(L.ln2);
+            randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
+            randn(L.W1, 0.02f); randn(L.W2, 0.02f);
         }
-        ln_f = mk_param(1, D_MODEL, false); ones(ln_f);
-        lm_head = mk_param(D_MODEL, VOCAB, true); randn(lm_head, 0.02f);
-        lm_bias = mk_param(1, VOCAB, false);
+        ones(ln_f);
+        randn(lm_head, 0.02f);
     }
 
     Node* forward(const int* ids, int T) {
-        static int pos_ids[SEQ_LEN];
+        // Persistent per-thread: op_embed stores this pointer and backward reads it
+        // after forward returns, so it must outlive the call (a local would dangle).
+        static thread_local int pos_ids[SEQ_LEN];
         for (int t = 0; t < T; ++t) pos_ids[t] = t;
         constexpr bool q = USE_TERNARY;
         Node* h = op_add(op_embed(tok_emb, ids, T), op_embed(pos_emb, pos_ids, T));
@@ -537,7 +578,20 @@ struct Model {
     }
 };
 
-static Model g_model;
+thread_local Model g_model;
+
+// Build the calling thread's graph state once: allocate its heap buffers, lay out
+// the parameter nodes, and register its gradient accumulator for the reduction.
+static void ensure_thread_built() {
+    if (g_thread_built) return;
+    const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
+    tl_grad    = g_grad_pool[tid].data();
+    g_act_data = g_actd_pool[tid].data();
+    g_act_grad = g_actg_pool[tid].data();
+    g_model.build_layout();                               // grad spans now reference this slot
+    g_tgrad_ptrs[tid] = tl_grad;
+    g_thread_built = true;
+}
 }  // anonymous namespace
 
 // ============================================================================
@@ -557,7 +611,10 @@ struct Header {
 //  Exposed API
 // ============================================================================
 
-void build_model() { g_model.build(); }
+void build_model() {
+    ensure_thread_built();                       // this (main) thread's node layout
+    if (!g_params_init.exchange(true)) g_model.init_weights();   // randomize shared weights once
+}
 
 void save_model(const char* path) {
     std::ofstream os(path, std::ios::binary);
@@ -600,7 +657,7 @@ const char* default_tokenizer()  { return DEFAULT_TOKENIZER; }
 
 std::size_t trainable_floats() { return PARAM_FLOATS; }
 float*      params_ptr()       { return g_param_data.data(); }
-float*      grad_ptr()         { return g_param_grad.data(); }
+float*      grad_ptr()         { return g_param_grad.data(); }   // reduced grad the optimizer reads
 float*      adam_m_ptr()       { return g_param_m.data(); }
 float*      adam_v_ptr()       { return g_param_vel.data(); }
 
@@ -794,7 +851,7 @@ std::vector<TokenEntry> vocab_entries() {
 
 void graph_reset() { g_pool_used = 0; g_act_used = 0; }
 
-Node* forward(const int* ids, int T) { return g_model.forward(ids, T); }
+Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
 
 void backward(Node* loss, float seed) {
@@ -802,11 +859,45 @@ void backward(Node* loss, float seed) {
     for (size_t i = g_pool_used; i-- > 0; ) backward_node(g_pool[i]);
 }
 
+// Single-window reduction: publish this thread's accumulator as the shared gradient
+// the optimizer consumes. (train_batch does the parallel multi-thread reduction.)
+void reduce_gradients() { std::copy(tl_grad, tl_grad + PARAM_FLOATS, g_param_grad.begin()); }
+
+// Data-parallel minibatch: each window's full forward+backward runs on its own
+// thread into a private gradient accumulator, then the accumulators are summed into
+// the shared gradient. Returns the mean loss; call AdamW::step() afterwards.
+float train_batch(const int* data, const std::size_t* starts, int batch, int T) {
+    double total = 0.0;
+    #pragma omp parallel num_threads(std::min(omp_get_max_threads(), MAX_WORKERS))
+    {
+        ensure_thread_built();
+        std::fill(tl_grad, tl_grad + PARAM_FLOATS, 0.f);
+        #pragma omp for reduction(+ : total) schedule(static)
+        for (int b = 0; b < batch; ++b) {
+            graph_reset();
+            Node* logits = g_model.forward(data + starts[b], T);
+            Node* loss   = op_cross_entropy(logits, data + starts[b] + 1);
+            total += loss->data[0];
+            backward(loss, 1.f / static_cast<float>(batch));
+        }
+        // (implicit barrier above: every thread's tl_grad is complete and registered)
+        const int nthreads = omp_get_num_threads();
+        #pragma omp for schedule(static)
+        for (std::size_t i = 0; i < PARAM_FLOATS; ++i) {
+            float s = 0.f;
+            for (int t = 0; t < nthreads; ++t)
+                if (g_tgrad_ptrs[t]) s += g_tgrad_ptrs[t][i];
+            g_param_grad[i] = s;
+        }
+    }
+    return static_cast<float>(total / batch);
+}
+
 // --- AdamW ------------------------------------------------------------------
 
 AdamW::AdamW(float lr) : lr_(lr) {}
 
-void AdamW::zero_grad() { g_param_grad.fill(0.f); }
+void AdamW::zero_grad() { ensure_thread_built(); std::fill(tl_grad, tl_grad + PARAM_FLOATS, 0.f); }
 
 void AdamW::step() {
     double sq = 0.0;

@@ -89,6 +89,12 @@ SUB0_API void  graph_reset();                                   // reset arena +
 SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB]
 SUB0_API Node* cross_entropy(Node* logits, const int* targets); // -> mean loss [1,1]
 SUB0_API void  backward(Node* loss, float seed);                // reverse walk
+SUB0_API void  reduce_gradients();                              // publish single-window grad
+
+// Data-parallel minibatch: forward+backward each window on its own thread, then sum
+// the per-thread gradients into the shared gradient. Returns mean loss; then step().
+// `starts[b]` is the token offset of window b (x = data+starts[b], y = +1).
+SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 class SUB0_API AdamW {
