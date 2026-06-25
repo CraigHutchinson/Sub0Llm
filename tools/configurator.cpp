@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -149,6 +150,10 @@ int main(int argc, char** argv) {
     // never splits a glyph, a word unit, or the truecaser/name-detector look-back.
     // ----------------------------------------------------------------------
 
+    // Phase timers: corpus ingest is the cost that grows with the corpus, so it is the
+    // baseline to optimise against (parallelising the streaming passes is the lever).
+    const auto _t0 = std::chrono::steady_clock::now();
+
     // --- Pass 1: decide which lowercase forms license a Capitalized/UPPER -> marker
     //     collapse. A form qualifies if it appears lowercase AND is not really a proper
     //     noun. The tell is *position*: sentence-initial capitals are positional
@@ -208,6 +213,7 @@ int main(int argc, char** argv) {
         attested.insert(w);
     }
     lower_count = {}; midcap_count = {};   // free; only `attested` is needed onward
+    const auto _t1 = std::chrono::steady_clock::now();
 
     // --- Pass 2: truecase each chunk into a base-symbol stream (bytes + <|cap|>/<|up|>
     //     markers), then pre-tokenize. A word unit (run of word bytes per word_unit_end)
@@ -268,6 +274,8 @@ int main(int argc, char** argv) {
     for (std::vector<int>& w : word_syms)
         for (int& s : w) s = byte_base[s];
 
+    const auto _t2 = std::chrono::steady_clock::now();
+
     // --- BPE: greedily merge the most frequent adjacent pair (weighted by word frequency)
     //     until the target vocabulary size or the per-pair floor is reached. Operates only
     //     on the bounded unique-word table -- no corpus-length state.
@@ -313,6 +321,7 @@ int main(int argc, char** argv) {
             s.swap(ns);
         }
     }
+    const auto _t3 = std::chrono::steady_clock::now();
 
     const std::filesystem::path gen_dir  = std::filesystem::path(out).parent_path();
     const std::filesystem::path tok_path = gen_dir / "corpus.tok";
@@ -379,6 +388,7 @@ int main(int argc, char** argv) {
         std::error_code ec;
         std::filesystem::remove(tok_path, ec);
     }
+    const auto _t4 = std::chrono::steady_clock::now();
 
     // 9. Write the runtime tokenizer (base alphabet + merges + attested words).
     //    Generation uses this to encode prompts and detokenize output; training
@@ -475,6 +485,18 @@ int main(int argc, char** argv) {
     }
     std::println(stderr, "attested words / table size:     {} / {} bytes ({:.1f} KB)",
                  attested.size(), wordset_bytes, wordset_bytes / 1024.0);
+    // Ingest throughput: the baseline to optimise (it scales with the corpus). "MB/s corpus"
+    // is corpus bytes / wall time even though the corpus is read 2-3x -- the rate that matters
+    // for "how long to ingest this corpus". The streaming passes are the parallelisation target.
+    {
+        const auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        const double total = sec(_t0, _t4);
+        const double cmb   = static_cast<double>(raw_bytes) / 1e6;
+        std::println(stderr,
+            "ingest: {:.2f} GB | pass1 {:.1f}s | pass2 {:.1f}s | BPE {:.1f}s | pass3 {:.1f}s | total {:.1f}s ({:.0f} MB/s corpus)",
+            static_cast<double>(raw_bytes) / 1e9, sec(_t0, _t1), sec(_t1, _t2), sec(_t2, _t3), sec(_t3, _t4),
+            total, total > 0 ? cmb / total : 0.0);
+    }
     std::println(stderr, "round-trip truecase / tokenize:  OK / {}", tok_rt ? "OK" : "FAIL");
     std::println(stderr, "corpus.tok / tokenizer.bin:      {} | {}",
                  emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
