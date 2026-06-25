@@ -445,11 +445,14 @@ int main(int argc, char** argv) {
     }
     for (const auto& [p, c] : pc) heap.push({c, p});
 
-    // Adjust a pair's count by `d` (merge-phase) and re-push the new value so the heap always
-    // holds the current count for every changed pair; index `w` under the pair when adding.
-    auto bump = [&](const std::pair<int, int>& p, long d, int w) {
-        const long c = (pc[p] += d);
-        heap.push({c, p});
+    // Adjust a pair's count by `d` and note it as touched; index word `w` under it when adding.
+    // The heap is NOT pushed here -- a merge touching millions of words changes only a few
+    // DISTINCT pairs, so we push each touched pair ONCE at the end of the merge (below) instead
+    // of per touch. pc stays exact, so the selection (hence the vocabulary) is unchanged.
+    std::unordered_set<std::pair<int, int>, PairHash> touched;
+    auto adj = [&](const std::pair<int, int>& p, long d, int w) {
+        pc[p] += d;
+        touched.insert(p);
         if (w >= 0) pair_words[p].push_back(w);
     };
 
@@ -476,6 +479,7 @@ int main(int argc, char** argv) {
         pair_words.erase(best);
         std::sort(wl.begin(), wl.end());
         wl.erase(std::unique(wl.begin(), wl.end()), wl.end());
+        touched.clear();
         for (const int w : wl) {
             std::vector<int>& s = word_syms[static_cast<std::size_t>(w)];
             bool has = false;
@@ -483,14 +487,18 @@ int main(int argc, char** argv) {
                 if (s[k] == best.first && s[k + 1] == best.second) { has = true; break; }
             if (!has) continue;                              // stale index entry
             const long f = word_freq[static_cast<std::size_t>(w)];
-            for (std::size_t k = 0; k + 1 < s.size(); ++k) bump({s[k], s[k + 1]}, -f, -1);  // remove old
+            for (std::size_t k = 0; k + 1 < s.size(); ++k) adj({s[k], s[k + 1]}, -f, -1);  // remove old
             std::vector<int> ns; ns.reserve(s.size());
             for (std::size_t k = 0; k < s.size();) {
                 if (k + 1 < s.size() && s[k] == best.first && s[k + 1] == best.second) { ns.push_back(new_id); k += 2; }
                 else { ns.push_back(s[k]); ++k; }
             }
             s.swap(ns);
-            for (std::size_t k = 0; k + 1 < s.size(); ++k) bump({s[k], s[k + 1]}, f, w);     // add new + index
+            for (std::size_t k = 0; k + 1 < s.size(); ++k) adj({s[k], s[k + 1]}, f, w);     // add new + index
+        }
+        for (const auto& p : touched) {                      // one heap push per changed pair
+            const auto it = pc.find(p);
+            if (it != pc.end() && it->second > 0) heap.push({it->second, p});
         }
         pc.erase(best);
     }
