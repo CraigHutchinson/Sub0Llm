@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -130,6 +131,52 @@ static Node* mk_node(Op op, int r, int c) {
 static inline float& el(std::span<float> s, int cols, int i, int j) { return s[(size_t)i * cols + j]; }
 
 // ============================================================================
+//  Fast transcendental math (vectorizable), toggled by g_fast_math
+// ============================================================================
+// Softmax exp and GELU dominate the non-GEMM forward/backward cost and std::exp/
+// std::erf are scalar libm calls. These branchless approximations let clang
+// vectorize the softmax/GELU loops; the exact path stays behind the flag.
+
+static bool g_fast_math = [] {
+    const char* e = std::getenv("SUB0_EXACT_MATH");
+    return !(e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
+}();
+
+// exp(x) to ~1e-6 over the softmax/GELU range. Range-reduce x = k*ln2 + r, then
+// exp(x) = 2^k * poly(r); assemble 2^k from the float exponent bits. Branchless so
+// `#pragma omp simd` vectorizes the calling loop.
+static inline float fast_exp(float x) {
+    x = x < -87.f ? -87.f : (x > 88.f ? 88.f : x);
+    const float k = std::floor(x * 1.4426950409f + 0.5f);
+    const float r = x - k * 0.6931471805f;
+    float p = 0.0013888939f;
+    p = p * r + 0.0083333680f;
+    p = p * r + 0.0416666418f;
+    p = p * r + 0.1666666664f;
+    p = p * r + 0.5000000000f;
+    p = p * r + 1.0000000000f;
+    p = p * r + 1.0000000000f;
+    const std::uint32_t bits = static_cast<std::uint32_t>(static_cast<int>(k) + 127) << 23;
+    return p * std::bit_cast<float>(bits);
+}
+static inline float fast_tanh(float x) {            // tanh via fast_exp, saturates to +-1
+    const float e = fast_exp(-2.f * x);
+    return (1.f - e) / (1.f + e);
+}
+// tanh-form GELU (matches GPT-2's approximation, ~3e-4 vs the erf form): value and
+// derivative, kept mutually consistent so the gradient check passes in fast mode.
+constexpr float GELU_C = 0.7978845608f;             // sqrt(2/pi)
+constexpr float GELU_A = 0.0447150000f;
+static inline float gelu_fast(float v) {
+    return 0.5f * v * (1.f + fast_tanh(GELU_C * (v + GELU_A * v * v * v)));
+}
+static inline float dgelu_fast(float v) {
+    const float t  = fast_tanh(GELU_C * (v + GELU_A * v * v * v));
+    const float du = GELU_C * (1.f + 3.f * GELU_A * v * v);
+    return 0.5f * (1.f + t) + 0.5f * v * (1.f - t * t) * du;
+}
+
+// ============================================================================
 //  Differentiable ops (forward builders)
 // ============================================================================
 
@@ -214,10 +261,15 @@ static Node* op_rmsnorm(Node* x, Node* gamma) {
 static Node* op_gelu(Node* x) {
     Node* y = mk_node(Op::GELU, x->rows, x->cols);
     y->a = x;
-    const float inv_sqrt2 = 0.70710678f;
-    for (size_t i = 0; i < x->data.size(); ++i) {
-        float v = x->data[i];
-        y->data[i] = 0.5f * v * (1.f + std::erf(v * inv_sqrt2));
+    const float* __restrict xd = x->data.data();
+    float* __restrict yd       = y->data.data();
+    const size_t n = x->data.size();
+    if (g_fast_math) {
+        #pragma omp simd
+        for (size_t i = 0; i < n; ++i) yd[i] = gelu_fast(xd[i]);
+    } else {
+        const float inv_sqrt2 = 0.70710678f;
+        for (size_t i = 0; i < n; ++i) yd[i] = 0.5f * xd[i] * (1.f + std::erf(xd[i] * inv_sqrt2));
     }
     return y;
 }
@@ -245,7 +297,8 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
                 s *= scale; sc[j] = s; mx = std::max(mx, s);
             }
             float Z = 0.f;
-            for (int j = 0; j <= i; ++j) { sc[j] = std::exp(sc[j] - mx); Z += sc[j]; }
+            if (g_fast_math) for (int j = 0; j <= i; ++j) { sc[j] = fast_exp(sc[j] - mx); Z += sc[j]; }
+            else             for (int j = 0; j <= i; ++j) { sc[j] = std::exp(sc[j] - mx);  Z += sc[j]; }
             for (int j = 0; j <= i; ++j) {
                 float p = sc[j] / Z;
                 P[Pidx(h, i, j)] = p;
@@ -268,8 +321,16 @@ static Node* op_cross_entropy(Node* logits, const int* targets) {
         float mx = -1e30f;
         for (int j = 0; j < V; ++j) mx = std::max(mx, el(logits->data, V, t, j));
         float Z = 0.f;
-        for (int j = 0; j < V; ++j) { float e = std::exp(el(logits->data, V, t, j) - mx); probs[(size_t)t * V + j] = e; Z += e; }
-        for (int j = 0; j < V; ++j) probs[(size_t)t * V + j] /= Z;
+        const float* __restrict lr = logits->data.data() + (size_t)t * V;
+        float* __restrict pr       = probs.data() + (size_t)t * V;
+        if (g_fast_math) {
+            #pragma omp simd reduction(+ : Z)
+            for (int j = 0; j < V; ++j) { float e = fast_exp(lr[j] - mx); pr[j] = e; Z += e; }
+        } else {
+            for (int j = 0; j < V; ++j) { float e = std::exp(lr[j] - mx); pr[j] = e; Z += e; }
+        }
+        const float invZ = 1.f / Z;
+        for (int j = 0; j < V; ++j) pr[j] *= invZ;
         total += -std::log(std::max(1e-9f, probs[(size_t)t * V + targets[t]]));
     }
     loss->data[0] = total / T;
@@ -348,12 +409,21 @@ static void backward_node(Node& n) {
     }
     case Op::GELU: {
         Node* x = n.a;
-        const float inv_sqrt2 = 0.70710678f, inv_sqrt2pi = 0.39894228f;
-        for (size_t i = 0; i < x->data.size(); ++i) {
-            float v = x->data[i];
-            float cdf = 0.5f * (1.f + std::erf(v * inv_sqrt2));
-            float pdf = inv_sqrt2pi * std::exp(-0.5f * v * v);
-            x->grad[i] += n.grad[i] * (cdf + v * pdf);
+        const float* __restrict xd  = x->data.data();
+        const float* __restrict gy  = n.grad.data();
+        float* __restrict gx        = x->grad.data();
+        const size_t n_el = x->data.size();
+        if (g_fast_math) {
+            #pragma omp simd
+            for (size_t i = 0; i < n_el; ++i) gx[i] += gy[i] * dgelu_fast(xd[i]);
+        } else {
+            const float inv_sqrt2 = 0.70710678f, inv_sqrt2pi = 0.39894228f;
+            for (size_t i = 0; i < n_el; ++i) {
+                float v = xd[i];
+                float cdf = 0.5f * (1.f + std::erf(v * inv_sqrt2));
+                float pdf = inv_sqrt2pi * std::exp(-0.5f * v * v);
+                gx[i] += gy[i] * (cdf + v * pdf);
+            }
         }
         break;
     }
@@ -514,11 +584,15 @@ bool load_model(const char* path) {
 
 void print_config() {
     std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
-                 "static mem: params {:.1f}MB acts {:.1f}MB",
+                 "static mem: params {:.1f}MB acts {:.1f}MB | math: {}",
                  D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                  USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
-                 4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6);
+                 4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6,
+                 g_fast_math ? "fast" : "exact");
 }
+
+void set_fast_math(bool on) { g_fast_math = on; }
+bool fast_math()            { return g_fast_math; }
 
 const char* default_corpus()     { return DEFAULT_CORPUS; }
 const char* default_corpus_tok() { return DEFAULT_CORPUS_TOK; }
