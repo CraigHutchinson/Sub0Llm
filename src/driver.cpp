@@ -8,6 +8,7 @@
 
 #include "sub0/core.hpp"  // for DEFAULT_CORPUS (generated config)
 
+#include <cmath>
 #include <print>
 #include <random>
 #include <string>
@@ -32,17 +33,26 @@ int main(int argc, char** argv) {
     app.set_help_all_flag("--help-all", "Show help for every subcommand");
 
     // --- train ---------------------------------------------------------------
+    // Default the minibatch to the tuned data-parallel width (threads x windows/thread,
+    // baked in by sub0-configure) so a default run saturates the cores. lr is the
+    // batch-8 default scaled by sqrt(batch/8) -- a bigger batch means fewer, lower-
+    // variance updates, so it wants a proportionally larger step (sqrt rule for Adam).
+    constexpr int   LR_BASE_BATCH = 8;
+    constexpr float LR_BASE       = 0.001f;
     std::string train_model, train_corpus{DEFAULT_CORPUS};
-    int   train_steps = 0, train_batch = 8;
-    float train_lr    = 0.001f;
+    int   train_steps = 0, train_batch = DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD;
+    float train_lr    = LR_BASE;
     unsigned train_seed = 42;
     auto* train = app.add_subcommand("train", "Train a model into <model.bin> (resumes from <model.bin>.ckpt)");
     train->add_option("model", train_model, "Output model path")->required();
     train->add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
     train->add_option("--steps", train_steps,
                       "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
-    train->add_option("--batch", train_batch, "Minibatch size")->capture_default_str();
-    train->add_option("--lr",    train_lr,    "Learning rate")->capture_default_str();
+    train->add_option("--batch", train_batch, "Minibatch size (default: tuned data-parallel width)")
+         ->capture_default_str();
+    auto* train_lr_opt =
+        train->add_option("--lr", train_lr, "Learning rate (default: 0.001 scaled by sqrt(batch/8))")
+             ->capture_default_str();
     train->add_option("--seed",  train_seed,  "RNG seed")->capture_default_str();
 
     // --- gen -----------------------------------------------------------------
@@ -86,9 +96,12 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    if (*train)
+    if (*train) {
+        if (train_lr_opt->count() == 0 && train_batch > 0)   // couple lr to batch unless pinned
+            train_lr = LR_BASE * std::sqrt(static_cast<float>(train_batch) / LR_BASE_BATCH);
         return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                                 train_steps, train_batch, train_lr, train_seed);
+    }
     if (*gen) {
         if (gen_seed_opt->count() == 0) gen_seed = std::random_device{}();  // fresh seed unless pinned
         return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(),

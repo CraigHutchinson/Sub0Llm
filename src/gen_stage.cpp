@@ -36,32 +36,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
         const int last = logits->rows - 1;
-
-        std::array<float, VOCAB> l;
-        for (int j = 0; j < VOCAB; ++j)
-            l[j] = logits->data[(size_t)last * VOCAB + j] / std::max(1e-6f, temp);
-
-        if (topk > 0 && topk < VOCAB) {
-            std::array<int, VOCAB> idx;
-            for (int j = 0; j < VOCAB; ++j) idx[j] = j;
-            std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
-                              [&](int a, int b) { return l[a] > l[b]; });
-            std::array<float, VOCAB> keep;
-            keep.fill(-1e30f);
-            for (int t = 0; t < topk; ++t) keep[idx[t]] = l[idx[t]];
-            l = keep;
-        }
-        float mx = -1e30f;
-        for (float x : l) mx = std::max(mx, x);
-        float Z = 0.f;
-        for (float& x : l) { x = std::exp(x - mx); Z += x; }
-        for (float& x : l) x /= Z;
-
-        std::uniform_real_distribution<float> ud(0.f, 1.f);
-        float r = ud(rng), acc = 0.f;
-        int pick = VOCAB - 1;
-        for (int j = 0; j < VOCAB; ++j) { acc += l[j]; if (r <= acc) { pick = j; break; } }
-        ctx.push_back(pick);
+        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng));
     }
     sub0::graph_reset();
     std::println("{}", sub0::detokenize(ctx));

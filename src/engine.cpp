@@ -894,6 +894,30 @@ std::vector<TokenEntry> vocab_entries() {
     return rows;
 }
 
+int sample_token(const float* logits, float temp, int topk, std::mt19937& rng) {
+    std::array<float, VOCAB> l;
+    const float invT = 1.f / std::max(1e-6f, temp);
+    for (int j = 0; j < VOCAB; ++j) l[j] = logits[j] * invT;
+    if (topk > 0 && topk < VOCAB) {                       // keep only the top-k logits
+        std::array<int, VOCAB> idx;
+        for (int j = 0; j < VOCAB; ++j) idx[j] = j;
+        std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
+                          [&](int a, int b) { return l[a] > l[b]; });
+        std::array<float, VOCAB> keep;
+        keep.fill(-1e30f);
+        for (int t = 0; t < topk; ++t) keep[idx[t]] = l[idx[t]];
+        l = keep;
+    }
+    float mx = -1e30f;
+    for (float x : l) mx = std::max(mx, x);
+    float Z = 0.f;
+    for (float& x : l) { x = std::exp(x - mx); Z += x; }  // softmax (unnormalized; scale r by Z)
+    std::uniform_real_distribution<float> ud(0.f, 1.f);
+    float r = ud(rng) * Z, acc = 0.f;
+    for (int j = 0; j < VOCAB; ++j) { acc += l[j]; if (r <= acc) return j; }
+    return VOCAB - 1;
+}
+
 void graph_reset() { W->pool_used = 0; W->act_used = 0; }
 
 Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
@@ -913,7 +937,7 @@ void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.begin()); }
 // the shared gradient. Returns the mean loss; call AdamW::step() afterwards.
 float train_batch(const int* data, const std::size_t* starts, int batch, int T) {
     double total = 0.0;
-    #pragma omp parallel num_threads(std::min(omp_get_max_threads(), MAX_WORKERS))
+    #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
         ensure_thread_built();
         std::ranges::fill(W->grad, 0.f);

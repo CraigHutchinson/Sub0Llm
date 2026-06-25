@@ -245,7 +245,9 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     return true;
 }
 
-// A short greedy-ish sample, used for mid-training previews.
+// A short mid-training sample. Uses the SAME temperature/top-k sampler as `gen` so
+// the preview reflects real generation quality -- the old greedy+noise hack made a
+// coherent model look like word-salad.
 std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
@@ -254,14 +256,7 @@ std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
         const int last = logits->rows - 1;
-        int best = 0; float bv = -1e30f;
-        for (int j = 0; j < VOCAB; ++j) {
-            float v = logits->data[(size_t)last * VOCAB + j];
-            if (v > bv) { bv = v; best = j; }
-        }
-        std::uniform_real_distribution<float> ud(0.f, 1.f);
-        if (ud(rng) < 0.3f) best = std::min(best + 1, VOCAB - 1);
-        ctx.push_back(best);
+        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, 0.7f, 20, rng));
     }
     sub0::graph_reset();
     return sub0::detokenize(ctx);

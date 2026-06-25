@@ -13,6 +13,7 @@
 #include "sub0_config.hpp"  // generated: D_MODEL, N_LAYERS, ..., VOCAB, VOCAB_CHARS, ...
 
 #include <cstdint>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -71,6 +72,10 @@ SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer
 SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.bin
 SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
 SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
+
+// Sample one token id from a logits row (length VOCAB) with temperature + top-k.
+// Shared by generation and the training preview so both use the same correct sampler.
+SUB0_API int sample_token(const float* logits, float temp, int topk, std::mt19937& rng);
 
 // One row of the vocabulary, for inspection tooling. `text` is a printable
 // rendering of the token's expansion (control/high bytes escaped, case markers
