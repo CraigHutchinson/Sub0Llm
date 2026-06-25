@@ -10,6 +10,7 @@ out/
 /models
 
 # Generated/large corpus artifacts (not source)
-*.words          # cached corpus-scan state (configurator ScanState)
+# *.words = cached corpus-scan state (configurator ScanState)
+*.words
 data/fineweb_edu.txt
 data/fineweb_edu.txt.done
