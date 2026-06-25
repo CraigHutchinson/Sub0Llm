@@ -19,6 +19,7 @@ extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
+extern "C" int sub0_bench_stage(int iters, int threads);
 
 static int arg_int(int c, char** v, const char* k, int d) {
     for (int i = 1; i < c - 1; ++i) if (!std::strcmp(v[i], k)) return std::atoi(v[i + 1]);
@@ -40,6 +41,8 @@ static void usage() {
         "  sub0llm gen   <model.bin> \"<prompt>\" [--n N --temp F --topk N --seed N]\n\n"
         "  sub0llm vocab [tokenizer.bin] [--limit N]\n"
         "      print the build's BPE vocabulary table (defaults to the baked-in tokenizer)\n\n"
+        "  sub0llm bench [--iters N --threads N]\n"
+        "      cycle-accurate single-thread hot-path benchmark (forward/backward/optimizer)\n\n"
         "  Reconfigure dimensions/corpus/vocab by re-running cmake with -DSUB0_* and rebuilding.",
         DEFAULT_CORPUS);
 }
@@ -53,6 +56,12 @@ int main(int argc, char** argv) {
         const char* tok = (argc >= 3 && argv[2][0] != '-') ? argv[2] : nullptr;
         int limit = arg_int(argc, argv, "--limit", 0);  // 0 = all
         return sub0_vocab_stage(tok, limit);
+    }
+
+    if (mode == "bench") {
+        int iters   = arg_int(argc, argv, "--iters", 200);
+        int threads = arg_int(argc, argv, "--threads", 1);  // single-thread control by default
+        return sub0_bench_stage(iters, threads);
     }
 
     if (argc < 3) { usage(); return 1; }

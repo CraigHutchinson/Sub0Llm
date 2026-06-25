@@ -173,14 +173,16 @@ static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
     }
     const float* X = x->data.data();
     #pragma omp parallel for
-    for (int t = 0; t < T; ++t)
+    for (int t = 0; t < T; ++t) {
+        float* __restrict Yr        = y->data.data() + (size_t)t * out;
+        const float* __restrict Xr  = X + (size_t)t * in;
         for (int p = 0; p < in; ++p) {
-            float xtp = X[(size_t)t * in + p];
-            if (xtp == 0.f) continue;
-            const float* Wr = Wf + (size_t)p * out;
-            float* Yr = y->data.data() + (size_t)t * out;
-            for (int o = 0; o < out; ++o) Yr[o] += xtp * Wr[o];
+            const float xtp = Xr[p];
+            if (xtp == 0.f) continue;                       // ternary weights make this sparse
+            const float* __restrict Wr = Wf + (size_t)p * out;
+            for (int o = 0; o < out; ++o) Yr[o] += xtp * Wr[o];  // contiguous axpy -> vectorizes
         }
+    }
     if (bias)
         for (int t = 0; t < T; ++t)
             for (int o = 0; o < out; ++o) el(y->data, out, t, o) += bias->data[o];
@@ -288,22 +290,32 @@ static void backward_node(Node& n) {
         const float* Wf = (n.ternary && !n.scratch.empty()) ? n.scratch.data() : W->data.data();
         const float* dY = n.grad.data();
         const float* X = x->data.data();
+        // dX = dY . W^T : inner loop over `o` is contiguous in both operands (a dot
+        // product reduction); parallel over rows t (each writes a distinct x->grad row).
         #pragma omp parallel for
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            const float* __restrict dYr = dY + (size_t)t * out;
+            float* __restrict xg        = x->grad.data() + (size_t)t * in;
             for (int p = 0; p < in; ++p) {
+                const float* __restrict Wr = Wf + (size_t)p * out;
                 float s = 0.f;
-                const float* dYr = dY + (size_t)t * out;
-                const float* Wr = Wf + (size_t)p * out;
+                #pragma omp simd reduction(+ : s)            // allow vectorizing the dot product
                 for (int o = 0; o < out; ++o) s += dYr[o] * Wr[o];
-                x->grad[(size_t)t * in + p] += s;
+                xg[p] += s;
             }
+        }
+        // dW = X^T . dY : iterate (p, t, o) so the inner loop over `o` is a contiguous
+        // axpy into W->grad's row (the old (p,o,t) order strided over t -> no vectorize).
+        // Still parallel over p, so each thread owns a distinct W->grad row (race-free).
         #pragma omp parallel for
-        for (int p = 0; p < in; ++p)
-            for (int o = 0; o < out; ++o) {
-                float s = 0.f;
-                for (int t = 0; t < T; ++t) s += X[(size_t)t * in + p] * dY[(size_t)t * out + o];
-                W->grad[(size_t)p * out + o] += s;
+        for (int p = 0; p < in; ++p) {
+            float* __restrict Wg = W->grad.data() + (size_t)p * out;
+            for (int t = 0; t < T; ++t) {
+                const float xtp = X[(size_t)t * in + p];
+                const float* __restrict dYr = dY + (size_t)t * out;
+                for (int o = 0; o < out; ++o) Wg[o] += xtp * dYr[o];
             }
+        }
         if (n.bias)
             for (int t = 0; t < T; ++t)
                 for (int o = 0; o < out; ++o) n.bias->grad[o] += dY[(size_t)t * out + o];

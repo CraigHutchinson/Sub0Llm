@@ -34,7 +34,29 @@
 #include <string>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+#if defined(_WIN32)
+#define NOMINMAX                 // keep std::min/std::max, not the windows.h macros
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 namespace {
+
+// Reference-cycle counter (rdtsc). The TSC is invariant on this class of CPU, so
+// it ticks at a fixed rate independent of the core's current (thermally drifting)
+// frequency. We therefore report the MINIMUM over many iterations: the fastest
+// iteration is the one that ran un-throttled and un-preempted, which is the most
+// reproducible measure of a code path's intrinsic cost.
+inline std::uint64_t cpu_cycles() {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ia32_rdtsc();
+#else
+    return __rdtsc();
+#endif
+}
 
 // --- Schedule constants (all corpus-relative; see file header) --------------
 constexpr double VAL_FRACTION        = 0.05;  // tail held out for validation NELBO
@@ -396,5 +418,90 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::println("  --- sample ---\n  {}", preview("the ", 120, rng));
     std::println("{} at step {} (best val_nelbo {:.4f}) -> {}",
                  stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_out);
+    return 0;
+}
+
+namespace {
+// Min and median of a cycle-count sample, the two robust summaries we report.
+struct Stat { std::uint64_t lo, med; };
+Stat summarize(std::vector<std::uint64_t>& v) {
+    std::sort(v.begin(), v.end());
+    return { v.front(), v[v.size() / 2] };
+}
+}  // namespace
+
+// Single-thread, cycle-accurate microbenchmark of the training hot path. It is the
+// control baseline for optimization: pinned to one core, OpenMP forced to one
+// thread, timed in rdtsc cycles, reported as the min (un-throttled cost) and median
+// over many iterations so thermal drift and scheduling don't move the number.
+extern "C" SUB0_API int sub0_bench_stage(int iters, int threads) {
+    if (iters <= 0) iters = 200;
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), 1ull);     // pin to logical CPU 0 (a P-core)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+#if defined(_OPENMP)
+    omp_set_num_threads(threads > 0 ? threads : 1);
+#endif
+
+    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
+    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+        std::println(stderr, "bench: cannot load a usable corpus.tok");
+        return 1;
+    }
+    const std::vector<int>& data = tok->data;
+    sub0::build_model();
+    sub0::AdamW opt(0.001f);
+    std::mt19937 rng(123);
+    std::uniform_int_distribution<size_t> startd(0, data.size() - SEQ_LEN - 2);
+
+    std::vector<std::uint64_t> fwd, bwd, optc, step;
+    fwd.reserve(iters); bwd.reserve(iters); optc.reserve(iters); step.reserve(iters);
+
+    const int warmup = std::max(5, iters / 10);
+    for (int it = -warmup; it < iters; ++it) {
+        const size_t s = startd(rng);
+        const int* x = data.data() + s;
+        const int* y = data.data() + s + 1;
+
+        opt.zero_grad();
+        const std::uint64_t s0 = cpu_cycles();
+        sub0::graph_reset();
+        sub0::Node* logits = sub0::forward(x, SEQ_LEN);
+        const std::uint64_t s1 = cpu_cycles();
+        sub0::Node* loss = sub0::cross_entropy(logits, y);
+        const std::uint64_t s2 = cpu_cycles();
+        sub0::backward(loss, 1.f);
+        const std::uint64_t s3 = cpu_cycles();
+        opt.step();
+        const std::uint64_t s4 = cpu_cycles();
+
+        if (it >= 0) {
+            fwd.push_back(s1 - s0);
+            bwd.push_back(s3 - s2);
+            optc.push_back(s4 - s3);
+            step.push_back(s4 - s0);
+        }
+    }
+
+    // Wall time of one representative window to anchor cycles to a TSC frequency.
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t c0 = cpu_cycles();
+    constexpr int CAL = 2000;
+    for (int i = 0; i < CAL; ++i) { sub0::graph_reset(); (void)sub0::forward(data.data() + startd(rng), SEQ_LEN); }
+    const std::uint64_t c1 = cpu_cycles();
+    const double cal_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double tsc_ghz = cal_s > 0 ? static_cast<double>(c1 - c0) / cal_s / 1e9 : 0.0;
+
+    const Stat sf = summarize(fwd), sb = summarize(bwd), so = summarize(optc), ss = summarize(step);
+    auto us = [&](std::uint64_t cyc) { return tsc_ghz > 0 ? cyc / (tsc_ghz * 1000.0) : 0.0; };
+
+    std::println("--- single-thread hot-path bench ({} iters, 1 thread, pinned) ---", iters);
+    std::println("TSC ~{:.2f} GHz | min cycles/window (median in parens), us at TSC rate", tsc_ghz);
+    std::println("  forward    {:>10}  ({:>10})   {:.1f} us", sf.lo, sf.med, us(sf.lo));
+    std::println("  backward   {:>10}  ({:>10})   {:.1f} us", sb.lo, sb.med, us(sb.lo));
+    std::println("  optimizer  {:>10}  ({:>10})   {:.1f} us", so.lo, so.med, us(so.lo));
+    std::println("  full step  {:>10}  ({:>10})   {:.1f} us", ss.lo, ss.med, us(ss.lo));
+    std::println("  -> min full-step throughput: {:.0f} window/s", ss.lo ? tsc_ghz * 1e9 / ss.lo : 0.0);
     return 0;
 }
