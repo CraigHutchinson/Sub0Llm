@@ -119,17 +119,41 @@ set(SUB0_N_HEADS  4  CACHE STRING "attention heads")
 set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
-# Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training).
+# Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
 # OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
 # raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
-# tokenizer.bin are emitted either way, so the engine still builds. Translate to the
-# configurator's integer flag.
-option(SUB0_CORPUS_TOK "Pre-tokenize the corpus to corpus.tok (OFF = train tokenizes on demand)" ON)
-if(SUB0_CORPUS_TOK)
-  set(SUB0_CORPUS_TOK_FLAG 1)
+# tokenizer.bin are emitted either way, so the engine still builds.
+#
+# AUTO (the default) decides by SCALE rather than a fixed threshold: pre-tokenizing is a
+# clear win while the token copy stays page-cacheable, so emit it when the estimated
+# corpus.tok (~2x the text) fits in half of physical RAM, and switch to on-demand for a
+# larger corpus (where the mmap can't stay resident and the disk cost is large). Override
+# with -DSUB0_CORPUS_TOK=ON or =OFF.
+set(SUB0_CORPUS_TOK "AUTO" CACHE STRING "Pre-tokenize corpus.tok: ON / OFF / AUTO (by corpus size vs RAM)")
+set_property(CACHE SUB0_CORPUS_TOK PROPERTY STRINGS AUTO ON OFF)
+
+cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
+set(_corpus_bytes 0)
+if(EXISTS "${SUB0_CORPUS}")
+  file(SIZE "${SUB0_CORPUS}" _corpus_bytes)
+endif()
+math(EXPR _est_tok_mb  "(${_corpus_bytes} * 2) / 1048576")   # corpus.tok ~ 2x the text
+math(EXPR _half_ram_mb "${_ram_mb} / 2")
+if(_est_tok_mb GREATER _half_ram_mb)
+  set(_auto_tok 0)   # token copy would not fit comfortably in RAM -> on demand
 else()
+  set(_auto_tok 1)   # fits -> pre-tokenize for fast random-access training
+endif()
+
+if(SUB0_CORPUS_TOK STREQUAL "AUTO")
+  set(SUB0_CORPUS_TOK_FLAG ${_auto_tok})
+elseif(SUB0_CORPUS_TOK)            # ON / 1 / TRUE
+  set(SUB0_CORPUS_TOK_FLAG 1)
+else()                             # OFF / 0 / FALSE
   set(SUB0_CORPUS_TOK_FLAG 0)
 endif()
+message(STATUS "corpus.tok: SUB0_CORPUS_TOK=${SUB0_CORPUS_TOK} -> emit=${SUB0_CORPUS_TOK_FLAG} "
+               "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
 
 # --- Stage 1: the configurator (host tool, depends on nothing generated) -----
 add_executable(sub0-configure tools/configurator.cpp)
