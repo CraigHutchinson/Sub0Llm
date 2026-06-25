@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <print>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -407,26 +408,59 @@ int main(int argc, char** argv) {
     for (std::vector<int>& w : word_syms)
         for (int& s : w) s = byte_base[s];
 
-    // --- BPE: greedily merge the most frequent adjacent pair (weighted by word frequency)
-    //     until the target vocabulary size or the per-pair floor is reached. Operates only
-    //     on the bounded unique-word table -- no corpus-length state.
+    // --- BPE (incremental): greedily merge the most frequent adjacent pair (weighted by word
+    //     frequency) until the target vocab or the per-pair floor. The naive form rebuilt the
+    //     ENTIRE pair-count map every merge (O(merges x total_symbols)) -- pathological on a
+    //     large corpus (3h+ stuck on 43GB FineWeb). Here pair counts are maintained
+    //     INCREMENTALLY: a pair->words index finds the few words a merge touches, each is
+    //     re-counted in place, and a lazy-deletion max-heap yields the best pair without
+    //     rescanning. The merge order is identical (same counts, same max-count / smallest-pair
+    //     tie-break) so the output stays byte-identical -- just far faster.
     std::vector<std::vector<int>> expansion(static_cast<std::size_t>(n_base));
     for (int id = 0; id < n_base; ++id)
         expansion[static_cast<std::size_t>(id)] = {base_symbol[static_cast<std::size_t>(id)]};
     std::vector<std::pair<int, int>> merges;
     int vocab = n_base;
-    while (vocab < vocab_target) {
-        std::unordered_map<std::pair<int, int>, long, PairHash> pc;
-        for (std::size_t w = 0; w < word_syms.size(); ++w) {
-            const std::vector<int>& s = word_syms[w];
-            const long f = word_freq[w];
-            for (std::size_t k = 0; k + 1 < s.size(); ++k) pc[{s[k], s[k + 1]}] += f;
+
+    std::unordered_map<std::pair<int, int>, long, PairHash> pc;          // current pair -> count
+    std::unordered_map<std::pair<int, int>, std::vector<int>, PairHash> pair_words;  // pair -> word ids
+    // Heap top = MAX count, then SMALLEST pair -- matching the naive tie-break so the merge
+    // sequence (hence the vocabulary) is identical. Lazy deletion: an entry is valid only while
+    // its count still equals pc[pair]; stale ones are skipped on pop.
+    struct HeapItem { long count; std::pair<int, int> pr; };
+    auto worse = [](const HeapItem& a, const HeapItem& b) {
+        return a.count != b.count ? a.count < b.count : a.pr > b.pr;
+    };
+    std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(worse)> heap(worse);
+
+    // Seed counts + index from the word table, then push each DISTINCT pair once.
+    for (std::size_t w = 0; w < word_syms.size(); ++w) {
+        const std::vector<int>& s = word_syms[w];
+        const long f = word_freq[w];
+        for (std::size_t k = 0; k + 1 < s.size(); ++k) {
+            const std::pair<int, int> p{s[k], s[k + 1]};
+            pc[p] += f;
+            pair_words[p].push_back(static_cast<int>(w));
         }
-        if (pc.empty()) break;
-        std::pair<int, int> best{0, 0};
-        long best_c = -1;
-        for (const auto& [p, c] : pc)
-            if (c > best_c || (c == best_c && p < best)) { best_c = c; best = p; }
+    }
+    for (const auto& [p, c] : pc) heap.push({c, p});
+
+    // Adjust a pair's count by `d` (merge-phase) and re-push the new value so the heap always
+    // holds the current count for every changed pair; index `w` under the pair when adding.
+    auto bump = [&](const std::pair<int, int>& p, long d, int w) {
+        const long c = (pc[p] += d);
+        heap.push({c, p});
+        if (w >= 0) pair_words[p].push_back(w);
+    };
+
+    while (vocab < vocab_target) {
+        std::pair<int, int> best{0, 0}; long best_c = -1;
+        while (!heap.empty()) {
+            const HeapItem top = heap.top();
+            const auto it = pc.find(top.pr);
+            if (it != pc.end() && it->second == top.count && top.count > 0) { best = top.pr; best_c = top.count; break; }
+            heap.pop();
+        }
         if (best_c < min_merge) break;
 
         const int new_id = vocab++;
@@ -436,21 +470,29 @@ int main(int argc, char** argv) {
                    expansion[static_cast<std::size_t>(best.second)].end());
         expansion.push_back(std::move(exp));
 
-        for (std::vector<int>& s : word_syms) {
-            if (s.size() < 2) continue;
-            std::vector<int> ns;
-            ns.reserve(s.size());
+        // Apply the merge only in the words that contain `best` (deduped; tolerate stale ids).
+        std::vector<int> wl;
+        if (auto pit = pair_words.find(best); pit != pair_words.end()) wl = std::move(pit->second);
+        pair_words.erase(best);
+        std::sort(wl.begin(), wl.end());
+        wl.erase(std::unique(wl.begin(), wl.end()), wl.end());
+        for (const int w : wl) {
+            std::vector<int>& s = word_syms[static_cast<std::size_t>(w)];
+            bool has = false;
+            for (std::size_t k = 0; k + 1 < s.size(); ++k)
+                if (s[k] == best.first && s[k + 1] == best.second) { has = true; break; }
+            if (!has) continue;                              // stale index entry
+            const long f = word_freq[static_cast<std::size_t>(w)];
+            for (std::size_t k = 0; k + 1 < s.size(); ++k) bump({s[k], s[k + 1]}, -f, -1);  // remove old
+            std::vector<int> ns; ns.reserve(s.size());
             for (std::size_t k = 0; k < s.size();) {
-                if (k + 1 < s.size() && s[k] == best.first && s[k + 1] == best.second) {
-                    ns.push_back(new_id);
-                    k += 2;
-                } else {
-                    ns.push_back(s[k]);
-                    ++k;
-                }
+                if (k + 1 < s.size() && s[k] == best.first && s[k + 1] == best.second) { ns.push_back(new_id); k += 2; }
+                else { ns.push_back(s[k]); ++k; }
             }
             s.swap(ns);
+            for (std::size_t k = 0; k + 1 < s.size(); ++k) bump({s[k], s[k + 1]}, f, w);     // add new + index
         }
+        pc.erase(best);
     }
     const auto _t3 = std::chrono::steady_clock::now();
 
