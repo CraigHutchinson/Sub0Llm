@@ -119,6 +119,18 @@ set(SUB0_N_HEADS  4  CACHE STRING "attention heads")
 set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
+# Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training).
+# OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
+# raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
+# tokenizer.bin are emitted either way, so the engine still builds. Translate to the
+# configurator's integer flag.
+option(SUB0_CORPUS_TOK "Pre-tokenize the corpus to corpus.tok (OFF = train tokenizes on demand)" ON)
+if(SUB0_CORPUS_TOK)
+  set(SUB0_CORPUS_TOK_FLAG 1)
+else()
+  set(SUB0_CORPUS_TOK_FLAG 0)
+endif()
+
 # --- Stage 1: the configurator (host tool, depends on nothing generated) -----
 add_executable(sub0-configure tools/configurator.cpp)
 target_include_directories(sub0-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
@@ -148,6 +160,7 @@ add_custom_command(
             --heads   ${SUB0_N_HEADS}
             --seq     ${SUB0_SEQ_LEN}
             --ternary ${SUB0_TERNARY}
+            --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             -o "${GEN_HEADER}"
   DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"

@@ -28,6 +28,7 @@
 #include <print>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -372,6 +373,11 @@ int main(int argc, char** argv) {
             ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);
         }
         ts.close();
+    } else {
+        // Drop any stale corpus.tok from a previous emit so training reliably falls back to
+        // on-demand tokenization instead of mmapping an out-of-date token copy.
+        std::error_code ec;
+        std::filesystem::remove(tok_path, ec);
     }
 
     // 9. Write the runtime tokenizer (base alphabet + merges + attested words).
