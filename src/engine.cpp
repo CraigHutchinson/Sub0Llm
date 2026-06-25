@@ -21,8 +21,10 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <mdspan>
 #include <print>
 #include <random>
+#include <ranges>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,6 +37,13 @@
 static inline int omp_get_thread_num()  { return 0; }
 static inline int omp_get_num_threads() { return 1; }
 static inline int omp_get_max_threads() { return 1; }
+#endif
+
+// x86 SSE/AVX control register access, used to flush subnormal floats to zero
+// (FTZ/DAZ) in the hot loops, where a subnormal operand triggers a slow assist.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define SUB0_X86 1
 #endif
 
 namespace sub0 {
@@ -84,48 +93,46 @@ static std::array<float, PARAM_FLOATS> g_param_grad{};
 static std::array<float, PARAM_FLOATS> g_param_m{};
 static std::array<float, PARAM_FLOATS> g_param_vel{};
 
-// Per-worker buffers for data-parallel batches. They are STATICALLY allocated as a
-// fixed pool indexed by OpenMP thread id -- not thread_local: a multi-MB thread_local
-// in a DLL overruns Windows' static-TLS block and faults. BSS is demand-paged, so
-// only the worker slots a run actually touches become resident. Each thread caches
-// pointers into its slot in (small) thread_local handles, keeping the hot paths
-// pointer-direct. Slot 0 serves all single-window work (gen / eval / bench).
-constexpr int MAX_WORKERS = 32;
-static std::array<std::array<float, PARAM_FLOATS>, MAX_WORKERS> g_grad_pool{};  // grad accumulators
-static std::array<std::array<float, ACT_CAP>, MAX_WORKERS>      g_actd_pool{};  // activation values
-static std::array<std::array<float, ACT_CAP>, MAX_WORKERS>      g_actg_pool{};  // activation grads
-static float* g_tgrad_ptrs[MAX_WORKERS] = {};
-static std::atomic<bool> g_params_init{false};
+struct ParamView { size_t off, n; bool decay; };
 
-thread_local float* tl_grad    = nullptr;   // -> g_grad_pool[tid]
-thread_local float* g_act_data = nullptr;   // -> g_actd_pool[tid]
-thread_local float* g_act_grad = nullptr;   // -> g_actg_pool[tid]
-thread_local size_t g_act_used = 0;
+// All per-thread state for a data-parallel window lives in one Worker. Workers are
+// a STATICALLY allocated pool indexed by OpenMP thread id -- not thread_local: a
+// multi-MB thread_local in a DLL overruns Windows' static-TLS block and faults. BSS
+// is demand-paged, so only the slots a run actually touches become resident. Each
+// thread binds its slot once into the thread_local handle `W` (see
+// ensure_thread_built), keeping the hot paths pointer-direct. Slot 0 serves all
+// single-window work (gen / eval / bench). The pool is sized to MAX_WORKERS, a
+// hardware-scaled constant cached into the generated config by sub0-configure.
+struct Worker {
+    std::array<float, PARAM_FLOATS> grad{};        // gradient accumulator (this slot)
+    std::array<float, ACT_CAP>      act_data{};    // activation arena: values
+    std::array<float, ACT_CAP>      act_grad{};    // activation arena: grads
+    std::array<Node, NUM_PARAMS>    param_nodes{}; // parameter leaves (data->shared, grad->this)
+    std::array<Node, MAX_NODES>     pool{};        // forward-graph node pool
+    std::array<ParamView, NUM_PARAMS> views{};     // optimizer parameter spans
+    size_t act_used = 0, pool_used = 0, pcount = 0, pused = 0;
+};
+static std::array<Worker, MAX_WORKERS> g_workers{};
+static std::atomic<bool> g_params_init{false};
+// nullptr until this thread runs ensure_thread_built(); a non-null W is the single
+// per-thread "bound and laid out" flag (its own TLS lifetime tracks the OS thread,
+// so each thread builds its g_model exactly once even if OpenMP reuses slots).
+thread_local Worker* W = nullptr;
 
 static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
-    if (g_act_used + n > ACT_CAP) {
+    if (W->act_used + n > ACT_CAP) {
         std::println(stderr, "fatal: activation arena overflow (need {}, cap {})",
-                     g_act_used + n, ACT_CAP);
+                     W->act_used + n, ACT_CAP);
         std::abort();
     }
-    size_t off = g_act_used;
-    g_act_used += n;
-    std::span<float> d(g_act_data + off, n);
-    std::span<float> gr(g_act_grad + off, n);
+    size_t off = W->act_used;
+    W->act_used += n;
+    std::span<float> d(W->act_data.data() + off, n);
+    std::span<float> gr(W->act_grad.data() + off, n);
     std::fill(d.begin(), d.end(), 0.f);
     std::fill(gr.begin(), gr.end(), 0.f);
     return {d, gr};
 }
-
-thread_local std::array<Node, NUM_PARAMS> g_param_nodes;
-thread_local std::array<Node, MAX_NODES>  g_pool;
-thread_local size_t g_pool_used = 0;
-
-struct ParamView { size_t off, n; bool decay; };
-thread_local std::array<ParamView, NUM_PARAMS> g_param_views;
-thread_local size_t g_param_used = 0;
-thread_local int g_pcount = 0;
-thread_local bool g_thread_built = false;
 
 // When a model was loaded with weights already in their final (ternary) form,
 // the linear op must not re-quantize them (absmean re-quantization is not
@@ -133,21 +140,21 @@ thread_local bool g_thread_built = false;
 static bool g_packed_inference = false;
 
 static Node* mk_param(int r, int c, bool decay) {
-    size_t n = (size_t)r * c, off = g_param_used;
-    g_param_used += n;
-    Node& nd = g_param_nodes[g_pcount];
+    size_t n = (size_t)r * c, off = W->pused;
+    W->pused += n;
+    Node& nd = W->param_nodes[W->pcount];
     nd = Node{};
     nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
     nd.data = std::span<float>(g_param_data.data() + off, n);   // shared weights
-    nd.grad = std::span<float>(tl_grad + off, n);               // this thread's grad accumulator
-    g_param_views[g_pcount] = {off, n, decay};
-    ++g_pcount;
+    nd.grad = std::span<float>(W->grad.data() + off, n);        // this thread's grad accumulator
+    W->views[W->pcount] = {off, n, decay};
+    ++W->pcount;
     return &nd;
 }
 
 static Node* mk_node(Op op, int r, int c) {
-    if (g_pool_used >= MAX_NODES) { std::println(stderr, "fatal: node pool overflow"); std::abort(); }
-    Node& nd = g_pool[g_pool_used++];
+    if (W->pool_used >= MAX_NODES) { std::println(stderr, "fatal: node pool overflow"); std::abort(); }
+    Node& nd = W->pool[W->pool_used++];
     nd = Node{};
     nd.op = op; nd.rows = r; nd.cols = c;
     auto [d, gr] = arena_alloc((size_t)r * c);
@@ -155,19 +162,27 @@ static Node* mk_node(Op op, int r, int c) {
     return &nd;
 }
 
-static inline float& el(std::span<float> s, int cols, int i, int j) { return s[(size_t)i * cols + j]; }
+// 2D row-major view over a Node's flat [rows x cols] span (data or grad). Replaces
+// hand-rolled i*cols+j indexing in the scalar/scatter paths; the hot vectorized
+// kernels keep their __restrict row pointers.
+using Mat = std::mdspan<float, std::dextents<std::size_t, 2>>;
+static inline Mat mat(std::span<float> s, int rows, int cols) {
+    return Mat(s.data(), static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
+}
 
 // ============================================================================
-//  Fast transcendental math (vectorizable), toggled by g_fast_math
+//  Fast transcendental math (vectorizable), selected at compile time
 // ============================================================================
 // Softmax exp and GELU dominate the non-GEMM forward/backward cost and std::exp/
 // std::erf are scalar libm calls. These branchless approximations let clang
-// vectorize the softmax/GELU loops; the exact path stays behind the flag.
-
-static bool g_fast_math = [] {
-    const char* e = std::getenv("SUB0_EXACT_MATH");
-    return !(e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
-}();
+// vectorize the softmax/GELU loops; the exact path stays behind FAST_MATH. The
+// choice is a compile-time constant (define SUB0_EXACT_MATH to take the exact
+// path), so the unused branch is eliminated rather than tested per element.
+#ifdef SUB0_EXACT_MATH
+constexpr bool FAST_MATH = false;
+#else
+constexpr bool FAST_MATH = true;
+#endif
 
 // exp(x) to ~1e-6 over the softmax/GELU range. Range-reduce x = k*ln2 + r, then
 // exp(x) = 2^k * poly(r); assemble 2^k from the float exponent bits. Branchless so
@@ -211,23 +226,29 @@ static Node* op_embed(Node* table, const int* ids, int T) {
     const int C = table->cols;
     Node* out = mk_node(Op::Embed, T, C);
     out->w = table; out->ids = ids;
+    Mat o = mat(out->data, T, C), tab = mat(table->data, table->rows, C);
     for (int t = 0; t < T; ++t)
-        for (int j = 0; j < C; ++j) el(out->data, C, t, j) = el(table->data, C, ids[t], j);
+        for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
     return out;
 }
 
 static Node* op_add(Node* a, Node* b) {
     Node* out = mk_node(Op::Add, a->rows, a->cols);
     out->a = a; out->b = b;
-    for (size_t i = 0; i < out->data.size(); ++i) out->data[i] = a->data[i] + b->data[i];
+    const size_t n = out->data.size();
+    #pragma omp simd
+    for (size_t i = 0; i < n; ++i) out->data[i] = a->data[i] + b->data[i];
     return out;
 }
 
 static void ternarize_into(std::span<const float> w, std::span<float> q) {
+    const size_t n = w.size();
     double s = 0.0;
-    for (float v : w) s += std::fabs(v);
-    float scale = (float)(s / std::max<size_t>(1, w.size())) + 1e-8f;
-    for (size_t i = 0; i < w.size(); ++i) {
+    #pragma omp simd reduction(+ : s)
+    for (size_t i = 0; i < n; ++i) s += std::fabs(w[i]);
+    float scale = (float)(s / std::max<size_t>(1, n)) + 1e-8f;
+    #pragma omp simd
+    for (size_t i = 0; i < n; ++i) {
         float r = w[i] / scale;
         float t = r > 0.5f ? 1.f : (r < -0.5f ? -1.f : 0.f);
         q[i] = t * scale;
@@ -256,9 +277,11 @@ static Node* op_linear(Node* x, Node* W, Node* bias, bool ternary) {
             for (int o = 0; o < out; ++o) Yr[o] += xtp * Wr[o];  // contiguous axpy -> vectorizes
         }
     }
-    if (bias)
+    if (bias) {
+        Mat ym = mat(y->data, T, out);
         for (int t = 0; t < T; ++t)
-            for (int o = 0; o < out; ++o) el(y->data, out, t, o) += bias->data[o];
+            for (int o = 0; o < out; ++o) ym[t, o] += bias->data[o];
+    }
     return y;
 }
 
@@ -290,7 +313,7 @@ static Node* op_gelu(Node* x) {
     const float* __restrict xd = x->data.data();
     float* __restrict yd       = y->data.data();
     const size_t n = x->data.size();
-    if (g_fast_math) {
+    if constexpr (FAST_MATH) {
         #pragma omp simd
         for (size_t i = 0; i < n; ++i) yd[i] = gelu_fast(xd[i]);
     } else {
@@ -323,8 +346,8 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
                 s *= scale; sc[j] = s; mx = std::max(mx, s);
             }
             float Z = 0.f;
-            if (g_fast_math) for (int j = 0; j <= i; ++j) { sc[j] = fast_exp(sc[j] - mx); Z += sc[j]; }
-            else             for (int j = 0; j <= i; ++j) { sc[j] = std::exp(sc[j] - mx);  Z += sc[j]; }
+            if constexpr (FAST_MATH) for (int j = 0; j <= i; ++j) { sc[j] = fast_exp(sc[j] - mx); Z += sc[j]; }
+            else                     for (int j = 0; j <= i; ++j) { sc[j] = std::exp(sc[j] - mx);  Z += sc[j]; }
             for (int j = 0; j <= i; ++j) {
                 float p = sc[j] / Z;
                 P[Pidx(h, i, j)] = p;
@@ -344,12 +367,12 @@ static Node* op_cross_entropy(Node* logits, const int* targets) {
     loss->scratch = probs;
     float total = 0.f;
     for (int t = 0; t < T; ++t) {
-        float mx = -1e30f;
-        for (int j = 0; j < V; ++j) mx = std::max(mx, el(logits->data, V, t, j));
-        float Z = 0.f;
         const float* __restrict lr = logits->data.data() + (size_t)t * V;
         float* __restrict pr       = probs.data() + (size_t)t * V;
-        if (g_fast_math) {
+        float mx = -1e30f;
+        for (int j = 0; j < V; ++j) mx = std::max(mx, lr[j]);
+        float Z = 0.f;
+        if constexpr (FAST_MATH) {
             #pragma omp simd reduction(+ : Z)
             for (int j = 0; j < V; ++j) { float e = fast_exp(lr[j] - mx); pr[j] = e; Z += e; }
         } else {
@@ -372,8 +395,9 @@ static void backward_node(Node& n) {
     case Op::Leaf: break;
     case Op::Embed: {
         const int T = n.rows, C = n.cols;
+        Mat wg = mat(n.w->grad, n.w->rows, C), ng = mat(n.grad, T, C);
         for (int t = 0; t < T; ++t)
-            for (int j = 0; j < C; ++j) el(n.w->grad, C, n.ids[t], j) += el(n.grad, C, t, j);
+            for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
         break;
     }
     case Op::Add: {
@@ -410,21 +434,26 @@ static void backward_node(Node& n) {
             }
         }
         if (n.bias)
-            for (int t = 0; t < T; ++t)
+            for (int t = 0; t < T; ++t) {
+                #pragma omp simd
                 for (int o = 0; o < out; ++o) n.bias->grad[o] += dY[(size_t)t * out + o];
+            }
         break;
     }
     case Op::RMSNorm: {
         Node* x = n.a; Node* g = n.w;
         const int T = x->rows, C = x->cols;
         std::span<float> rinv = n.scratch;
+        Mat gy = mat(n.grad, T, C), xd = mat(x->data, T, C), xg = mat(x->grad, T, C);
         for (int t = 0; t < T; ++t) {
             float S = 0.f;
-            for (int j = 0; j < C; ++j) S += el(n.grad, C, t, j) * g->data[j] * el(x->data, C, t, j);
+            #pragma omp simd reduction(+ : S)
+            for (int j = 0; j < C; ++j) S += gy[t, j] * g->data[j] * xd[t, j];
             float r = rinv[t], r3 = r * r * r;
+            #pragma omp simd
             for (int j = 0; j < C; ++j) {
-                float xj = el(x->data, C, t, j), dy = el(n.grad, C, t, j), gj = g->data[j];
-                el(x->grad, C, t, j) += r * dy * gj - (xj * r3 / C) * S;
+                float xj = xd[t, j], dy = gy[t, j], gj = g->data[j];
+                xg[t, j] += r * dy * gj - (xj * r3 / C) * S;
                 g->grad[j] += dy * xj * r;
             }
         }
@@ -436,7 +465,7 @@ static void backward_node(Node& n) {
         const float* __restrict gy  = n.grad.data();
         float* __restrict gx        = x->grad.data();
         const size_t n_el = x->data.size();
-        if (g_fast_math) {
+        if constexpr (FAST_MATH) {
             #pragma omp simd
             for (size_t i = 0; i < n_el; ++i) gx[i] += gy[i] * dgelu_fast(xd[i]);
         } else {
@@ -456,26 +485,31 @@ static void backward_node(Node& n) {
         const float scale = 1.f / std::sqrt((float)d);
         std::span<float> P = n.scratch;
         auto Pidx = [T](int h, int i, int j) { return ((size_t)h * T + i) * T + j; };
+        Mat ng = mat(n.grad, T, C), vg = mat(v->grad, T, C), vd = mat(v->data, T, C);
+        Mat qg = mat(q->grad, T, C), kg = mat(k->grad, T, C);
+        Mat qd = mat(q->data, T, C), kd = mat(k->data, T, C);
         for (int h = 0; h < H; ++h) {
             int off = h * d;
             for (int i = 0; i < T; ++i) {
                 std::array<float, SEQ_LEN> dP{};
                 for (int j = 0; j <= i; ++j) {
                     float p = P[Pidx(h, i, j)], dp = 0.f;
+                    #pragma omp simd reduction(+ : dp)
                     for (int a = 0; a < d; ++a) {
-                        float dout = el(n.grad, C, i, off + a);
-                        el(v->grad, C, j, off + a) += p * dout;
-                        dp += dout * el(v->data, C, j, off + a);
+                        float dout = ng[i, off + a];
+                        vg[j, off + a] += p * dout;
+                        dp += dout * vd[j, off + a];
                     }
                     dP[j] = dp;
                 }
                 float dot = 0.f;
+                #pragma omp simd reduction(+ : dot)
                 for (int j = 0; j <= i; ++j) dot += P[Pidx(h, i, j)] * dP[j];
                 for (int j = 0; j <= i; ++j) {
                     float ds = P[Pidx(h, i, j)] * (dP[j] - dot) * scale;
                     for (int a = 0; a < d; ++a) {
-                        el(q->grad, C, i, off + a) += ds * el(k->data, C, j, off + a);
-                        el(k->grad, C, j, off + a) += ds * el(q->data, C, i, off + a);
+                        qg[i, off + a] += ds * kd[j, off + a];
+                        kg[j, off + a] += ds * qd[i, off + a];
                     }
                 }
             }
@@ -487,10 +521,11 @@ static void backward_node(Node& n) {
         const int T = logits->rows, V = logits->cols;
         std::span<float> probs = n.scratch;
         float g = n.grad[0] / T;
+        Mat lg = mat(logits->grad, T, V);
         for (int t = 0; t < T; ++t)
             for (int j = 0; j < V; ++j) {
                 float p = probs[(size_t)t * V + j];
-                el(logits->grad, V, t, j) += g * (p - (j == n.ids[t] ? 1.f : 0.f));
+                lg[t, j] += g * (p - (j == n.ids[t] ? 1.f : 0.f));
             }
         break;
     }
@@ -516,7 +551,7 @@ struct Model {
     // weights, grad spans into this thread's accumulator. Deterministic offsets, so
     // every thread agrees on the layout. No weight initialization here.
     void build_layout() {
-        g_param_used = 0; g_pcount = 0;
+        W->pused = 0; W->pcount = 0;
         tok_emb = mk_param(VOCAB, D_MODEL, false);
         pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
         for (auto& L : layers) {
@@ -580,17 +615,28 @@ struct Model {
 
 thread_local Model g_model;
 
-// Build the calling thread's graph state once: allocate its heap buffers, lay out
-// the parameter nodes, and register its gradient accumulator for the reduction.
+// Flush-to-zero (FTZ) + denormals-are-zero (DAZ). A subnormal float operand traps
+// into a slow microcode assist on x86 (often ~100x a normal op); the fast-math
+// approximations and decaying gradients can produce them in the hot loops. MXCSR is
+// per-thread, so every compute thread sets this once (via ensure_thread_built). The
+// model tolerates flushing these near-zero values -- they are underflow noise here.
+static inline void set_flush_denormals() {
+#if defined(SUB0_X86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
+// Bind the calling thread to its Worker slot and lay out its parameter nodes once.
+// `W` (thread_local) doubles as the guard: once non-null the thread is bound and
+// g_model is populated, so the hot path early-outs without touching the OpenMP
+// runtime. Buffers are static BSS (not heap); the reduction reads each slot's grad
+// directly, so there is nothing to register.
 static void ensure_thread_built() {
-    if (g_thread_built) return;
-    const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
-    tl_grad    = g_grad_pool[tid].data();
-    g_act_data = g_actd_pool[tid].data();
-    g_act_grad = g_actg_pool[tid].data();
+    if (W) return;
+    set_flush_denormals();                                // FTZ/DAZ for this thread's MXCSR
+    W = &g_workers[omp_get_thread_num() % MAX_WORKERS];   // clamp; train_batch caps the width
     g_model.build_layout();                               // grad spans now reference this slot
-    g_tgrad_ptrs[tid] = tl_grad;
-    g_thread_built = true;
 }
 }  // anonymous namespace
 
@@ -645,11 +691,10 @@ void print_config() {
                  D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                  USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
                  4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6,
-                 g_fast_math ? "fast" : "exact");
+                 FAST_MATH ? "fast" : "exact");
 }
 
-void set_fast_math(bool on) { g_fast_math = on; }
-bool fast_math()            { return g_fast_math; }
+bool fast_math() { return FAST_MATH; }
 
 const char* default_corpus()     { return DEFAULT_CORPUS; }
 const char* default_corpus_tok() { return DEFAULT_CORPUS_TOK; }
@@ -849,19 +894,19 @@ std::vector<TokenEntry> vocab_entries() {
     return rows;
 }
 
-void graph_reset() { g_pool_used = 0; g_act_used = 0; }
+void graph_reset() { W->pool_used = 0; W->act_used = 0; }
 
 Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
 
 void backward(Node* loss, float seed) {
     loss->grad[0] = seed;
-    for (size_t i = g_pool_used; i-- > 0; ) backward_node(g_pool[i]);
+    for (Node& n : W->pool | std::views::take(W->pool_used) | std::views::reverse) backward_node(n);
 }
 
 // Single-window reduction: publish this thread's accumulator as the shared gradient
 // the optimizer consumes. (train_batch does the parallel multi-thread reduction.)
-void reduce_gradients() { std::copy(tl_grad, tl_grad + PARAM_FLOATS, g_param_grad.begin()); }
+void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.begin()); }
 
 // Data-parallel minibatch: each window's full forward+backward runs on its own
 // thread into a private gradient accumulator, then the accumulators are summed into
@@ -871,7 +916,7 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T) 
     #pragma omp parallel num_threads(std::min(omp_get_max_threads(), MAX_WORKERS))
     {
         ensure_thread_built();
-        std::fill(tl_grad, tl_grad + PARAM_FLOATS, 0.f);
+        std::ranges::fill(W->grad, 0.f);
         #pragma omp for reduction(+ : total) schedule(static)
         for (int b = 0; b < batch; ++b) {
             graph_reset();
@@ -880,13 +925,13 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T) 
             total += loss->data[0];
             backward(loss, 1.f / static_cast<float>(batch));
         }
-        // (implicit barrier above: every thread's tl_grad is complete and registered)
+        // (implicit barrier above: every thread's grad slot is complete)
         const int nthreads = omp_get_num_threads();
         #pragma omp for schedule(static)
         for (std::size_t i = 0; i < PARAM_FLOATS; ++i) {
             float s = 0.f;
             for (int t = 0; t < nthreads; ++t)
-                if (g_tgrad_ptrs[t]) s += g_tgrad_ptrs[t][i];
+                s += g_workers[t].grad[i];
             g_param_grad[i] = s;
         }
     }
@@ -897,19 +942,22 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T) 
 
 AdamW::AdamW(float lr) : lr_(lr) {}
 
-void AdamW::zero_grad() { ensure_thread_built(); std::fill(tl_grad, tl_grad + PARAM_FLOATS, 0.f); }
+void AdamW::zero_grad() { ensure_thread_built(); std::ranges::fill(W->grad, 0.f); }
 
 void AdamW::step() {
     double sq = 0.0;
-    for (float g : g_param_grad) sq += (double)g * g;
+    #pragma omp simd reduction(+ : sq)
+    for (size_t i = 0; i < PARAM_FLOATS; ++i) { double g = g_param_grad[i]; sq += g * g; }
     float norm = (float)std::sqrt(sq);
     float gs = (norm > clip_) ? clip_ / (norm + 1e-6f) : 1.f;
 
     ++t_;
     float bc1 = 1.f - std::pow(b1_, (float)t_);
     float bc2 = 1.f - std::pow(b2_, (float)t_);
-    for (int pi = 0; pi < g_pcount; ++pi) {
-        const ParamView& pv = g_param_views[pi];
+    for (size_t pi = 0; pi < W->pcount; ++pi) {
+        const ParamView& pv = W->views[pi];
+        const float wd = pv.decay ? wd_ : 0.f;   // hoist the invariant branch so the loop vectorizes
+        #pragma omp simd
         for (size_t i = pv.off; i < pv.off + pv.n; ++i) {
             float g = g_param_grad[i] * gs;
             g_param_m[i]   = b1_ * g_param_m[i]   + (1 - b1_) * g;
@@ -917,7 +965,7 @@ void AdamW::step() {
             float mhat = g_param_m[i] / bc1;
             float vhat = g_param_vel[i] / bc2;
             g_param_data[i] -= lr_ * mhat / (std::sqrt(vhat) + eps_);
-            if (pv.decay) g_param_data[i] -= lr_ * wd_ * g_param_data[i];
+            g_param_data[i] -= lr_ * wd * g_param_data[i];
         }
     }
 }

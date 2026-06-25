@@ -46,6 +46,10 @@ endif()
 
 find_package(OpenMP)
 
+# Transcendental math path: fast vectorizable approximations (default) vs the exact
+# std::exp/std::erf path. Compile-time only -- the unused branch is eliminated.
+option(SUB0_EXACT_MATH "Use exact std::exp/std::erf instead of the fast approximations" OFF)
+
 # --- Dependency management via CPM -----------------------------------------
 include(cmake/get_cpm.cmake)
 
@@ -59,6 +63,16 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 # TODO(json): when JSON support is needed (e.g. config/metadata/tokenizer files),
 # use simdjson (Apache-2.0): CPMAddPackage("gh:simdjson/simdjson@3.10.1"). Not added
 # yet -- the project has no JSON usage, so we avoid an unused dependency for now.
+
+# TODO(tune): the `tune` autotuner uses an in-tree search (include/sub0/tune.hpp).
+# Prior art surveyed -- the mature auto-tuning stacks (Optuna, NNI, scikit-optimize,
+# Vizier, FLAML) are Python; the C++ options are biteopt (header-only derivative-free
+# global optimiser), CMA-ES, NLopt (DIRECT) and dlib's find_max_global. None were
+# pulled: our space is tiny, discrete and low-cardinality, where a deterministic coarse
+# grid + basin refinement is both near-optimal and -- unlike the stochastic optimisers
+# -- unit testable, and none of them supply the Knob/Objective framework we actually
+# want. Escalate to biteopt (gh:avaneev/biteopt, header-only) only if the search space
+# becomes continuous / high-dimensional.
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/tinystories.txt" CACHE FILEPATH "training corpus (drives vocab)")
@@ -77,6 +91,16 @@ target_link_libraries(sub0-configure PRIVATE CLI11::CLI11)
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
 set(GEN_HEADER "${GEN_DIR}/sub0_config.hpp")
 file(MAKE_DIRECTORY "${GEN_DIR}")
+
+# Persisted tuned-defaults cache. `sub0llm tune` writes the best threads /
+# windows-per-thread here; the configurator reads it back to bake DEFAULT_THREADS /
+# DEFAULT_WINDOWS_PER_THREAD into the header. Touched once so it always exists as a
+# build dependency — a tune-updated (newer) cache then retriggers config regen.
+set(GEN_TUNE_CACHE "${GEN_DIR}/sub0_tune.cache")
+if(NOT EXISTS "${GEN_TUNE_CACHE}")
+  file(WRITE "${GEN_TUNE_CACHE}" "")
+endif()
+
 add_custom_command(
   OUTPUT  "${GEN_HEADER}"
   BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
@@ -87,8 +111,9 @@ add_custom_command(
             --heads   ${SUB0_N_HEADS}
             --seq     ${SUB0_SEQ_LEN}
             --ternary ${SUB0_TERNARY}
+            --tune-cache "${GEN_TUNE_CACHE}"
             -o "${GEN_HEADER}"
-  DEPENDS sub0-configure "${SUB0_CORPUS}"
+  DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
   COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
   VERBATIM
 )
@@ -98,6 +123,15 @@ add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
 add_library(sub0_core SHARED src/engine.cpp)
 add_dependencies(sub0_core sub0_generate_config)
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+# The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
+# the errno side-effect of the math libcalls is dead weight that stops the optimizer
+# from emitting vectorized vsqrtps. Dropping it changes no computed value (it is not a
+# fast-math reassociation flag) and lets the update loop vectorize.
+target_compile_options(sub0_core PRIVATE
+  $<$<CXX_COMPILER_ID:Clang,GNU>:-fno-math-errno>)
+if(SUB0_EXACT_MATH)
+  target_compile_definitions(sub0_core PRIVATE SUB0_EXACT_MATH)
+endif()
 if(OpenMP_CXX_FOUND)
   target_link_libraries(sub0_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
@@ -113,7 +147,7 @@ target_link_libraries(sub0_gen PRIVATE sub0_core)
 add_executable(sub0llm src/driver.cpp)
 add_dependencies(sub0llm sub0_generate_config)          # for DEFAULT_CORPUS in the header
 target_include_directories(sub0llm PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
-target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen)
+target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen CLI11::CLI11)
 
 # Let the driver find the stage libs next to it without install/LD_LIBRARY_PATH.
 set_target_properties(sub0llm PROPERTIES

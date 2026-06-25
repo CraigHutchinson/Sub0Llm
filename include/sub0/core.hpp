@@ -55,10 +55,10 @@ SUB0_API void save_model(const char* path);        // write params to disk
 SUB0_API void print_config();                      // human-readable config + memory line
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and
-// backward passes. On by default; set SUB0_EXACT_MATH=1 in the environment, or call
-// set_fast_math(false), to fall back to the exact std::exp/std::erf path. The
-// approximations are ~1e-6 and training-equivalent, but the switch stays for A/B.
-SUB0_API void set_fast_math(bool on);
+// backward passes. Selected at compile time: configure with SUB0_EXACT_MATH=ON (or
+// define SUB0_EXACT_MATH) to compile the exact std::exp/std::erf path instead. The
+// approximations are ~1e-6 and training-equivalent. fast_math() reports the
+// compiled-in choice.
 SUB0_API bool fast_math();
 SUB0_API const char* default_corpus();             // baked-in corpus path
 SUB0_API const char* default_corpus_tok();         // baked-in tokenized corpus (corpus.tok)

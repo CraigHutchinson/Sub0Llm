@@ -8,10 +8,11 @@
 
 #include "sub0/core.hpp"  // for DEFAULT_CORPUS (generated config)
 
-#include <cstdlib>
-#include <cstring>
 #include <print>
 #include <random>
+#include <string>
+
+#include <CLI/CLI.hpp>
 
 // Entry points provided by the stage libraries we link against.
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
@@ -19,74 +20,86 @@ extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
-extern "C" int sub0_bench_stage(int iters, int threads);
-
-static int arg_int(int c, char** v, const char* k, int d) {
-    for (int i = 1; i < c - 1; ++i) if (!std::strcmp(v[i], k)) return std::atoi(v[i + 1]);
-    return d;
-}
-static float arg_float(int c, char** v, const char* k, float d) {
-    for (int i = 1; i < c - 1; ++i) if (!std::strcmp(v[i], k)) return (float)std::atof(v[i + 1]);
-    return d;
-}
-
-static void usage() {
-    std::println(
-        "sub0llm \u2014 staged CPU transformer LM (config baked in at build time)\n\n"
-        "  sub0llm train <model.bin> [corpus] [--steps N --batch N --lr F --seed N]\n"
-        "      corpus defaults to the one this build was configured with:\n"
-        "      {}\n"
-        "      --steps 0 (default) auto-sizes the run to the corpus and stops on a\n"
-        "      validation plateau; <model.bin>.ckpt allows crash-safe resume.\n\n"
-        "  sub0llm gen   <model.bin> \"<prompt>\" [--n N --temp F --topk N --seed N]\n\n"
-        "  sub0llm vocab [tokenizer.bin] [--limit N]\n"
-        "      print the build's BPE vocabulary table (defaults to the baked-in tokenizer)\n\n"
-        "  sub0llm bench [--iters N --threads N]\n"
-        "      cycle-accurate single-thread hot-path benchmark (forward/backward/optimizer)\n\n"
-        "  Reconfigure dimensions/corpus/vocab by re-running cmake with -DSUB0_* and rebuilding.",
-        DEFAULT_CORPUS);
-}
+extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
+extern "C" int sub0_tune_stage(int max_threads, int verbose);
 
 int main(int argc, char** argv) {
-    if (argc < 2) { usage(); return 1; }
-    std::string mode = argv[1];
+    // CLI11 rejects unknown options and positionals by default (allow_extras is off),
+    // so a mistyped flag is a hard error with a usage hint -- not a silent no-op that
+    // runs with stale defaults. require_subcommand(1) enforces exactly one mode.
+    CLI::App app{"sub0llm \u2014 staged CPU transformer LM (config baked in at build time)"};
+    app.require_subcommand(1);
+    app.set_help_all_flag("--help-all", "Show help for every subcommand");
 
-    if (mode == "vocab") {
-        // Optional positional tokenizer path (second arg if it isn't a flag); else default.
-        const char* tok = (argc >= 3 && argv[2][0] != '-') ? argv[2] : nullptr;
-        int limit = arg_int(argc, argv, "--limit", 0);  // 0 = all
-        return sub0_vocab_stage(tok, limit);
-    }
+    // --- train ---------------------------------------------------------------
+    std::string train_model, train_corpus{DEFAULT_CORPUS};
+    int   train_steps = 0, train_batch = 8;
+    float train_lr    = 0.001f;
+    unsigned train_seed = 42;
+    auto* train = app.add_subcommand("train", "Train a model into <model.bin> (resumes from <model.bin>.ckpt)");
+    train->add_option("model", train_model, "Output model path")->required();
+    train->add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
+    train->add_option("--steps", train_steps,
+                      "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
+    train->add_option("--batch", train_batch, "Minibatch size")->capture_default_str();
+    train->add_option("--lr",    train_lr,    "Learning rate")->capture_default_str();
+    train->add_option("--seed",  train_seed,  "RNG seed")->capture_default_str();
 
-    if (mode == "bench") {
-        int iters   = arg_int(argc, argv, "--iters", 200);
-        int threads = arg_int(argc, argv, "--threads", 1);  // single-thread control by default
-        return sub0_bench_stage(iters, threads);
-    }
+    // --- gen -----------------------------------------------------------------
+    std::string gen_model, gen_prompt;
+    int   gen_n = 200, gen_topk = 20;
+    float gen_temp = 0.8f;
+    unsigned gen_seed = 0;
+    auto* gen = app.add_subcommand("gen", "Generate text from a trained model");
+    gen->add_option("model",  gen_model,  "Trained model path")->required();
+    gen->add_option("prompt", gen_prompt, "Prompt text")->required();
+    gen->add_option("--n",    gen_n,    "Tokens to generate")->capture_default_str();
+    gen->add_option("--temp", gen_temp, "Sampling temperature")->capture_default_str();
+    gen->add_option("--topk", gen_topk, "Top-k sampling cutoff")->capture_default_str();
+    auto* gen_seed_opt = gen->add_option("--seed", gen_seed, "RNG seed (default: random)");
 
-    if (argc < 3) { usage(); return 1; }
+    // --- vocab ---------------------------------------------------------------
+    std::string vocab_tok;
+    int vocab_limit = 0;
+    auto* vocab = app.add_subcommand("vocab", "Print the build's BPE vocabulary table");
+    vocab->add_option("tokenizer", vocab_tok, "Tokenizer path (defaults to the baked-in tokenizer)");
+    vocab->add_option("--limit", vocab_limit, "Max entries to print (0 = all)")->capture_default_str();
 
-    if (mode == "train") {
-        const char* model_out = argv[2];
-        // Optional positional corpus (third arg if it isn't a flag); else default.
-        const char* corpus = DEFAULT_CORPUS;
-        if (argc >= 4 && argv[3][0] != '-') corpus = argv[3];
-        int steps = arg_int(argc, argv, "--steps", 0);   // 0 = auto (corpus-relative max)
-        int batch = arg_int(argc, argv, "--batch", 8);
-        float lr  = arg_float(argc, argv, "--lr", 0.001f);
-        unsigned seed = (unsigned)arg_int(argc, argv, "--seed", 42);
-        return sub0_train_stage(corpus, model_out, steps, batch, lr, seed);
+    // --- bench ---------------------------------------------------------------
+    int bench_iters = 200, bench_threads = DEFAULT_THREADS, bench_wpt = DEFAULT_WINDOWS_PER_THREAD;
+    auto* bench = app.add_subcommand("bench", "Cycle-accurate hot-path benchmark (forward/backward/optimizer)");
+    bench->add_option("--iters,--steps", bench_iters,
+                      "Iterations to time (--steps is an alias for the natural reflex)")->capture_default_str();
+    bench->add_option("--threads", bench_threads,
+                      "Data-parallel worker threads (defaults to the tuned/hardware count; 1 = single-thread control)")
+         ->capture_default_str();
+    bench->add_option("--windows-per-thread", bench_wpt,
+                      "Windows each thread carries in the data-parallel minibatch")->capture_default_str();
+
+    // --- tune ----------------------------------------------------------------
+    int  tune_max_threads = 0;   // 0 = hardware_concurrency
+    bool tune_quiet = false;
+    auto* tune = app.add_subcommand("tune", "Auto-tune runtime knobs (threads, batch granularity) for peak throughput");
+    tune->add_option("--max-threads", tune_max_threads,
+                     "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
+    tune->add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
+
+    CLI11_PARSE(app, argc, argv);
+
+    if (*train)
+        return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
+                                train_steps, train_batch, train_lr, train_seed);
+    if (*gen) {
+        if (gen_seed_opt->count() == 0) gen_seed = std::random_device{}();  // fresh seed unless pinned
+        return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(),
+                              gen_n, gen_temp, gen_topk, gen_seed);
     }
-    if (mode == "gen") {
-        if (argc < 4) { usage(); return 1; }
-        const char* model_in = argv[2];
-        const char* prompt = argv[3];
-        int n = arg_int(argc, argv, "--n", 200);
-        float temp = arg_float(argc, argv, "--temp", 0.8f);
-        int topk = arg_int(argc, argv, "--topk", 20);
-        unsigned seed = (unsigned)arg_int(argc, argv, "--seed", (int)std::random_device{}());
-        return sub0_gen_stage(model_in, prompt, n, temp, topk, seed);
-    }
-    usage();
-    return 1;
+    if (*vocab)
+        return sub0_vocab_stage(vocab_tok.empty() ? nullptr : vocab_tok.c_str(), vocab_limit);
+    if (*bench)
+        return sub0_bench_stage(bench_iters, bench_threads, bench_wpt);
+    if (*tune)
+        return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1);
+
+    return 1;  // unreachable: require_subcommand(1) guarantees one of the above
 }

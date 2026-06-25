@@ -17,6 +17,7 @@
 // crashed run resumes exactly.
 
 #include "sub0/core.hpp"
+#include "sub0/tune.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +33,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_OPENMP)
@@ -429,10 +431,11 @@ Stat summarize(std::vector<std::uint64_t>& v) {
 // control baseline for optimization: pinned to one core, OpenMP forced to one
 // thread, timed in rdtsc cycles, reported as the min (un-throttled cost) and median
 // over many iterations so thermal drift and scheduling don't move the number.
-extern "C" SUB0_API int sub0_bench_stage(int iters, int threads) {
+extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per_thread) {
     if (iters <= 0) iters = 200;
 #if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), 1ull);     // pin to logical CPU 0 (a P-core)
+    const DWORD_PTR prev_aff =
+        SetThreadAffinityMask(GetCurrentThread(), 1ull);  // pin to logical CPU 0 (a P-core)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
 #if defined(_OPENMP)
@@ -499,5 +502,193 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads) {
     std::println("  optimizer  {:>10}  ({:>10})   {:.1f} us", so.lo, so.med, us(so.lo));
     std::println("  full step  {:>10}  ({:>10})   {:.1f} us", ss.lo, ss.med, us(ss.lo));
     std::println("  -> min full-step throughput: {:.0f} window/s", ss.lo ? tsc_ghz * 1e9 / ss.lo : 0.0);
+
+    // --- Data-parallel minibatch throughput ---------------------------------
+    // Exercises train_batch end to end: each window's forward+backward runs on its
+    // own thread into a private Worker slot, then the per-slot gradients are summed
+    // into the shared gradient. This is the path the Worker memory layout affects --
+    // the single cross-thread loop strides over slots -- so it is the control for
+    // deciding whether to split the gradient accumulator out of the Worker struct.
+    // Compare window/s here against the single-thread full step above to read off
+    // both multi-thread scaling and the reduction overhead.
+#if defined(_WIN32)
+    if (prev_aff) SetThreadAffinityMask(GetCurrentThread(), prev_aff);  // unpin for multi-core
+#endif
+    {
+        // The minibatch scales with the thread count: each thread carries a fixed
+        // WINDOWS_PER_THREAD windows, so per-thread work is constant across thread
+        // counts and the "Nx vs 1-thread" figure is a clean scaling read. (The old
+        // max(active*4, 16) floor clamped the batch below 4 threads and skewed that
+        // comparison.) biters = iters/4 keeps this section's wall time ~matched to the
+        // single-thread section, since `active` threads chew through B windows per step.
+        // windows/thread is tunable (the `tune` subcommand searches it) and passed in.
+        const int WINDOWS_PER_THREAD = windows_per_thread > 0 ? windows_per_thread : 4;
+        const int active = threads > 0 ? threads : 1;
+        const int B = active * WINDOWS_PER_THREAD;
+        std::vector<std::size_t> starts(static_cast<size_t>(B));
+        std::vector<std::uint64_t> batch_cyc;
+        const int bwarm = 3, biters = std::max(20, iters / 4);
+        batch_cyc.reserve(static_cast<size_t>(biters));
+        for (int it = -bwarm; it < biters; ++it) {
+            for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);
+            const std::uint64_t b0 = cpu_cycles();
+            sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
+            const std::uint64_t b1 = cpu_cycles();
+            if (it >= 0) batch_cyc.push_back(b1 - b0);
+        }
+        const Stat sbatch = summarize(batch_cyc);
+        const double per_window = static_cast<double>(sbatch.lo) / B;
+        std::println("--- data-parallel minibatch ({} threads, batch {} = {} windows/thread) ---",
+                     active, B, WINDOWS_PER_THREAD);
+        std::println("  batch      {:>10}  ({:>10})   {:.1f} us", sbatch.lo, sbatch.med, us(sbatch.lo));
+        std::println("  -> {:.0f} window/s  ({:.0f} cycles/window, {:.2f}x vs 1-thread full step)",
+                     per_window > 0 ? tsc_ghz * 1e9 / per_window : 0.0, per_window,
+                     per_window > 0 ? static_cast<double>(ss.lo) / per_window : 0.0);
+    }
     return 0;
 }
+
+// --- Auto-tune ---------------------------------------------------------------
+// `sub0llm tune` searches the runtime knobs that govern data-parallel throughput
+// (thread count and per-thread batch granularity) and reports the configuration
+// with the highest measured window/s. The search itself lives in the engine-free
+// sub0::tune module; this stage only supplies the knobs and a measurement-backed
+// objective, which keeps the math in tune.hpp unit testable in isolation.
+//
+// TODO(tune-train): a training auto-tuner is the natural next user of sub0::tune --
+// build a Space over learning-rate / batch ladders and pass an objective of
+// -validation_NELBO (best-of-N short runs) to maximize(). No change to tune.hpp is
+// needed; only a new objective lambda and knob set here.
+namespace {
+
+// Wall-clock throughput (window/s) of `steps` consecutive train_batch calls at a given
+// thread count and per-thread window count. Throughput is the metric that matters long
+// term, and it is deliberately NOT cycle-normalised: a longer `steps` lets the cores
+// heat up and thermally throttle, so the number reflects the SUSTAINED rate a real
+// training run would see. That is why the tuner raises `steps` as it narrows down --
+// the coarse sweep uses a short burst for speed, the confirmation a long throttled run.
+// Random run-to-run noise is handled upstream by the search's median-of-samples
+// confirmation, so a single honest measurement is returned here (no optimistic best-of).
+double measure_dp_throughput(const std::vector<int>& data, std::mt19937& rng,
+                             int threads, int windows_per_thread, int steps) {
+#if defined(_OPENMP)
+    omp_set_num_threads(threads > 0 ? threads : 1);
+#endif
+    const int active = threads > 0 ? threads : 1;
+    const int B = active * std::max(1, windows_per_thread);
+    std::uniform_int_distribution<size_t> startd(0, data.size() - SEQ_LEN - 2);
+    std::vector<std::size_t> starts(static_cast<size_t>(B));
+
+    for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);  // warm caches
+    sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
+
+    const int n = std::max(1, steps);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int s = 0; s < n; ++s) {
+        for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);
+        sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return secs > 0 ? static_cast<double>(n) * B / secs : 0.0;
+}
+
+}  // namespace
+
+extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
+    std::expected<TokData, TokError> tok = load_tokens(sub0::default_corpus_tok());
+    if (!tok || tok->vocab != VOCAB || tok->data.size() <= static_cast<size_t>(SEQ_LEN) + 2) {
+        std::println(stderr, "tune: cannot load a usable corpus.tok");
+        return 1;
+    }
+    const std::vector<int>& data = tok->data;
+    sub0::build_model();
+    std::mt19937 rng(123);
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const int cap = max_threads > 0 ? std::min<int>(max_threads, static_cast<int>(hw))
+                                     : static_cast<int>(hw);
+
+    // The knob space. Extensible: append a Knob and read it by index in the objective.
+    std::vector<double> thread_vals;
+    for (int t = 1; t <= cap; ++t) thread_vals.push_back(static_cast<double>(t));
+    sub0::tune::Space space = {
+        {"threads",        thread_vals},
+        {"windows/thread", {1, 2, 4, 8, 16}},
+    };
+
+    // Objective: maximize measured window/s. tune::maximize never sees the engine.
+    // Reports each configuration live (the search can run many evals; buffering the
+    // whole trace to the end would look like a long hang), tracking the running best.
+    // `steps` grows as the search narrows (driven by on_phase below) so the precise,
+    // narrowing-down measurements run long enough to thermally throttle -- the regime a
+    // sustained training run actually operates in.
+    int steps = 8;
+    double running_best = 0.0;
+    sub0::tune::Objective objective = [&](const sub0::tune::Assignment& a) {
+        const int threads = static_cast<int>(std::lround(a[0]));
+        const int wpt     = static_cast<int>(std::lround(a[1]));
+        const double wps  = measure_dp_throughput(data, rng, threads, wpt, steps);
+        if (verbose) {
+            const bool best = wps > running_best;
+            std::println("  threads={:>2}  windows/thread={:>2}  ->  {:>6.0f} window/s{}",
+                         threads, wpt, wps, best ? "   <- best" : "");
+            std::fflush(stdout);   // stream progress as it happens, don't buffer to the end
+        }
+        running_best = std::max(running_best, wps);
+        return wps;
+    };
+
+    std::println("--- auto-tune throughput (knobs: threads 1..{}, windows/thread {{1,2,4,8,16}}) ---", cap);
+    std::fflush(stdout);
+
+    sub0::tune::Options opt;
+    // After the hot coarse sweep, pause briefly before each refinement pass and
+    // confirmation round so the cores shed heat and the narrowing-down readings are
+    // steadier (the search core stays pure -- the pause lives here).
+    opt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+    // Lengthen each measurement as the search narrows: a quick burst while exploring
+    // broadly, then progressively longer throttled runs while pinning down the winner.
+    // The phase header also makes it clear in the live output which stage we are in.
+    opt.on_phase = [&](sub0::tune::Phase p) {
+        switch (p) {
+            case sub0::tune::Phase::Explore:
+                steps = 8;
+                std::println("[explore] wide sweep, short runs");
+                break;
+            case sub0::tune::Phase::Refine:
+                steps = 24;
+                std::println("[refine]  narrowing in, longer runs");
+                break;
+            case sub0::tune::Phase::Confirm:
+                steps = 64;
+                std::println("[confirm] re-measuring finalists, longest runs (dropping clear losers)");
+                break;
+        }
+        std::fflush(stdout);
+    };
+    sub0::tune::Result r = sub0::tune::maximize(space, objective, opt);
+
+    const int best_threads = static_cast<int>(std::lround(r.best[0]));
+    const int best_wpt     = static_cast<int>(std::lround(r.best[1]));
+    const double single = measure_dp_throughput(data, rng, 1, best_wpt, 64);  // long run, matched to confirm
+    std::println("");
+    std::println("evaluated {} measurements; winner confirmed over {} samples", r.evaluations, r.best_samples);
+    std::println("best: threads={}  windows/thread={}  ->  {:.0f} window/s  ({:.2f}x vs 1 thread)",
+                 best_threads, best_wpt, r.best_score, single > 0 ? r.best_score / single : 0.0);
+    std::println("apply with:  sub0llm bench --threads {} --windows-per-thread {}", best_threads, best_wpt);
+
+    // Persist the winning configuration so the next build bakes it into the config
+    // header as DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD (see sub0-configure).
+    if (DEFAULT_TUNE_CACHE[0] == '\0') {
+        std::println("(no tune cache configured; tuned defaults not persisted)");
+    } else if (std::ofstream cache(DEFAULT_TUNE_CACHE, std::ios::trunc); cache) {
+        cache << "threads=" << best_threads << "\n"
+              << "windows_per_thread=" << best_wpt << "\n";
+        std::println("persisted tuned defaults to {}", DEFAULT_TUNE_CACHE);
+        std::println("rebuild to bake them in:  cmake --build --preset native");
+    } else {
+        std::println(stderr, "warning: could not write tune cache '{}'", DEFAULT_TUNE_CACHE);
+    }
+    return 0;
+}
+
