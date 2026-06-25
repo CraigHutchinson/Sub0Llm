@@ -102,6 +102,7 @@ private:
 // resume a run exactly. All three buffers are trainable_floats() long.
 SUB0_API std::size_t trainable_floats();   // == PARAM_FLOATS
 SUB0_API float*      params_ptr();         // parameter values
+SUB0_API float*      grad_ptr();           // parameter gradients (filled by backward)
 SUB0_API float*      adam_m_ptr();         // Adam first-moment estimates
 SUB0_API float*      adam_v_ptr();         // Adam second-moment estimates
 

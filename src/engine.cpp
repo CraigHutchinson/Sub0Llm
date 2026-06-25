@@ -196,13 +196,17 @@ static Node* op_rmsnorm(Node* x, Node* gamma) {
     y->a = x; y->w = gamma;
     auto [rinv, rinv_g] = arena_alloc(T);
     y->scratch = rinv;
+    const float* __restrict G = gamma->data.data();
     for (int t = 0; t < T; ++t) {
+        const float* __restrict xr = x->data.data() + (size_t)t * C;
+        float* __restrict yr       = y->data.data() + (size_t)t * C;
         float ms = 0.f;
-        for (int j = 0; j < C; ++j) ms += el(x->data, C, t, j) * el(x->data, C, t, j);
+        #pragma omp simd reduction(+ : ms)
+        for (int j = 0; j < C; ++j) ms += xr[j] * xr[j];
         ms /= C;
         float r = 1.f / std::sqrt(ms + eps);
         rinv[t] = r;
-        for (int j = 0; j < C; ++j) el(y->data, C, t, j) = el(x->data, C, t, j) * r * gamma->data[j];
+        for (int j = 0; j < C; ++j) yr[j] = xr[j] * r * G[j];
     }
     return y;
 }
@@ -229,11 +233,15 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     for (int h = 0; h < H; ++h) {
         int off = h * d;
         for (int i = 0; i < T; ++i) {
+            const float* __restrict qi = q->data.data() + (size_t)i * C + off;
+            float* __restrict oi       = out->data.data() + (size_t)i * C + off;
             float mx = -1e30f;
             std::array<float, SEQ_LEN> sc{};
             for (int j = 0; j <= i; ++j) {
+                const float* __restrict kj = k->data.data() + (size_t)j * C + off;
                 float s = 0.f;
-                for (int a = 0; a < d; ++a) s += el(q->data, C, i, off + a) * el(k->data, C, j, off + a);
+                #pragma omp simd reduction(+ : s)
+                for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
                 s *= scale; sc[j] = s; mx = std::max(mx, s);
             }
             float Z = 0.f;
@@ -241,7 +249,8 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
             for (int j = 0; j <= i; ++j) {
                 float p = sc[j] / Z;
                 P[Pidx(h, i, j)] = p;
-                for (int a = 0; a < d; ++a) el(out->data, C, i, off + a) += p * el(v->data, C, j, off + a);
+                const float* __restrict vj = v->data.data() + (size_t)j * C + off;
+                for (int a = 0; a < d; ++a) oi[a] += p * vj[a];      // contiguous axpy
             }
         }
     }
@@ -517,6 +526,7 @@ const char* default_tokenizer()  { return DEFAULT_TOKENIZER; }
 
 std::size_t trainable_floats() { return PARAM_FLOATS; }
 float*      params_ptr()       { return g_param_data.data(); }
+float*      grad_ptr()         { return g_param_grad.data(); }
 float*      adam_m_ptr()       { return g_param_m.data(); }
 float*      adam_v_ptr()       { return g_param_vel.data(); }
 
