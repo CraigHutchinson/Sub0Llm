@@ -91,6 +91,119 @@ bool for_each_chunk(const std::string& path, Fn&& fn) {
     return true;
 }
 
+// --- Intermediate scan state (the cacheable output of the expensive corpus passes) -------
+// A complete snapshot of what passes 1-2 produce: the bounded name-detection COUNTS, the
+// unique-word frequency table, the alphabet usage and aggregate stats. This is the
+// expensive-to-produce, cheap-to-store intermediate -- caching it lets a re-run with a
+// different vocab size (or after a crash, or to re-tokenize for the JOIN scheme) SKIP the
+// multi-pass corpus scan. It is the RAW, pre-BPE data so it is reusable across vocab targets;
+// it keeps the name COUNTS (not just the derived `attested`) so the state is MERGEABLE -- a
+// future step can sum two corpora's ScanStates to build a joint vocabulary or extend one
+// incrementally across sessions. Binary: compact + fast for millions of words, validated by
+// corpus size+mtime and a logic version. (A JSON/simdjson encoding would bloat the
+// millions-of-words table ~4x and parse slower; binary stays while the format is internal and
+// stable. Revisit only if the state must cross tools/languages.) Bump WCACHE_VERSION whenever
+// casing.hpp's normalization/truecasing changes, since the cached tables encode that logic.
+constexpr std::uint32_t WCACHE_MAGIC   = 0x43573053u;  // "S0WC"
+constexpr std::uint32_t WCACHE_VERSION = 1u;
+
+struct ScanState {
+    std::size_t raw_bytes = 0, norm_bytes = 0;
+    long quote_repl = 0;
+    sub0::casing::TokStats st;
+    std::array<int, 256> byte_used{};                 // 0/1 usage flags
+    bool used_cap = false, used_up = false;
+    std::unordered_map<std::string, long> lower_count, midcap_count;  // mergeable name stats
+    std::vector<std::vector<int>> word_syms;          // unique word -> raw byte-symbol sequence
+    std::vector<long> word_freq;
+};
+
+template <class T> void wr(std::ostream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof v);
+}
+template <class T> T rd(std::istream& is) {
+    T v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v;
+}
+void wr_counts(std::ostream& os, const std::unordered_map<std::string, long>& m) {
+    wr(os, static_cast<std::uint64_t>(m.size()));
+    for (const auto& [w, c] : m) {
+        wr(os, static_cast<std::uint16_t>(w.size()));
+        os.write(w.data(), static_cast<std::streamsize>(w.size()));
+        wr(os, static_cast<std::int64_t>(c));
+    }
+}
+bool rd_counts(std::istream& is, std::unordered_map<std::string, long>& m) {
+    const std::uint64_t n = rd<std::uint64_t>(is);
+    m.clear(); m.reserve(n);
+    std::string w;
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::uint16_t len = rd<std::uint16_t>(is);
+        w.resize(len); is.read(w.data(), len);
+        m.emplace(w, static_cast<long>(rd<std::int64_t>(is)));
+    }
+    return static_cast<bool>(is);
+}
+
+// Save the scan state next to the corpus (<corpus>.words), keyed to the corpus file.
+void save_scan_state(const std::string& path, const std::string& corpus, const ScanState& S) {
+    std::ofstream os(path, std::ios::binary);
+    if (!os) { std::println(stderr, "warning: cannot write scan cache '{}'", path); return; }
+    std::error_code ec;
+    wr(os, WCACHE_MAGIC); wr(os, WCACHE_VERSION);
+    wr(os, static_cast<std::uint64_t>(std::filesystem::file_size(corpus, ec)));
+    wr(os, static_cast<std::int64_t>(std::filesystem::last_write_time(corpus, ec).time_since_epoch().count()));
+    wr(os, static_cast<std::uint64_t>(S.raw_bytes)); wr(os, static_cast<std::uint64_t>(S.norm_bytes));
+    wr(os, static_cast<std::int64_t>(S.quote_repl));
+    wr(os, static_cast<std::int64_t>(S.st.words)); wr(os, static_cast<std::int64_t>(S.st.cap));
+    wr(os, static_cast<std::int64_t>(S.st.up));    wr(os, static_cast<std::int64_t>(S.st.names));
+    for (int b = 0; b < 256; ++b) wr(os, static_cast<std::uint8_t>(S.byte_used[b] ? 1 : 0));
+    wr(os, static_cast<std::uint8_t>(S.used_cap ? 1 : 0)); wr(os, static_cast<std::uint8_t>(S.used_up ? 1 : 0));
+    wr_counts(os, S.lower_count); wr_counts(os, S.midcap_count);
+    wr(os, static_cast<std::uint64_t>(S.word_syms.size()));
+    std::vector<std::uint8_t> bb;
+    for (std::size_t i = 0; i < S.word_syms.size(); ++i) {
+        wr(os, static_cast<std::uint64_t>(S.word_freq[i]));
+        const std::vector<int>& seq = S.word_syms[i];
+        wr(os, static_cast<std::uint16_t>(seq.size()));
+        bb.assign(seq.begin(), seq.end());                 // ints 0..255 -> bytes
+        os.write(reinterpret_cast<const char*>(bb.data()), static_cast<std::streamsize>(bb.size()));
+    }
+}
+
+// Load + validate against the corpus (size+mtime+version). Returns false (leaving S untouched-
+// enough to fall back to a full scan) if absent, stale or malformed.
+bool load_scan_state(const std::string& path, const std::string& corpus, ScanState& S) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return false;
+    if (rd<std::uint32_t>(is) != WCACHE_MAGIC || rd<std::uint32_t>(is) != WCACHE_VERSION) return false;
+    std::error_code ec;
+    if (rd<std::uint64_t>(is) != std::filesystem::file_size(corpus, ec)) return false;
+    if (rd<std::int64_t>(is) !=
+        static_cast<std::int64_t>(std::filesystem::last_write_time(corpus, ec).time_since_epoch().count()))
+        return false;
+    S.raw_bytes = static_cast<std::size_t>(rd<std::uint64_t>(is));
+    S.norm_bytes = static_cast<std::size_t>(rd<std::uint64_t>(is));
+    S.quote_repl = static_cast<long>(rd<std::int64_t>(is));
+    S.st.words = rd<std::int64_t>(is); S.st.cap = rd<std::int64_t>(is);
+    S.st.up = rd<std::int64_t>(is);    S.st.names = rd<std::int64_t>(is);
+    S.byte_used.fill(0);
+    for (int b = 0; b < 256; ++b) S.byte_used[b] = rd<std::uint8_t>(is) ? 1 : 0;
+    S.used_cap = rd<std::uint8_t>(is) != 0; S.used_up = rd<std::uint8_t>(is) != 0;
+    if (!rd_counts(is, S.lower_count) || !rd_counts(is, S.midcap_count)) return false;
+    const std::uint64_t nw = rd<std::uint64_t>(is);
+    S.word_syms.clear(); S.word_syms.reserve(nw);
+    S.word_freq.clear(); S.word_freq.reserve(nw);
+    std::vector<std::uint8_t> bb;
+    for (std::uint64_t i = 0; i < nw; ++i) {
+        const long f = static_cast<long>(rd<std::uint64_t>(is));
+        const std::uint16_t len = rd<std::uint16_t>(is);
+        bb.resize(len); is.read(reinterpret_cast<char*>(bb.data()), len);
+        S.word_syms.emplace_back(bb.begin(), bb.end());
+        S.word_freq.push_back(f);
+    }
+    return static_cast<bool>(is);
+}
+
 }  // namespace
 
 using namespace sub0::casing;
@@ -151,111 +264,131 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------------
 
     // Phase timers: corpus ingest is the cost that grows with the corpus, so it is the
-    // baseline to optimise against (parallelising the streaming passes is the lever).
+    // baseline to optimise against (caching the scan + parallelising the passes are levers).
     const auto _t0 = std::chrono::steady_clock::now();
 
-    // --- Pass 1: decide which lowercase forms license a Capitalized/UPPER -> marker
-    //     collapse. A form qualifies if it appears lowercase AND is not really a proper
-    //     noun. The tell is *position*: sentence-initial capitals are positional
-    //     ("The ..."), but a capital following a lowercase word mid-sentence ("...to Spot")
-    //     is a name. Per lowercase form we count lowercase uses vs mid-sentence-capital
-    //     uses; a form whose name uses dominate is withheld from `attested`, keeping e.g.
-    //     the dog "Spot" verbatim instead of folding it onto the noun <|cap|>spot.
-    std::size_t raw_bytes = 0, norm_bytes = 0;
-    long quote_repl = 0;
-    std::unordered_map<std::string, long> lower_count, midcap_count;
-    const bool open_ok = for_each_chunk(corpus, [&](std::string_view chunk) {
-        raw_bytes += chunk.size();
-        long qr = 0;
-        const std::string norm = normalize_text(std::string(chunk), qr);
-        quote_repl += qr;
-        norm_bytes += norm.size();
-        // Chunk-initial words follow a newline, hence are line starts -- matching the
-        // whole-corpus rule (newline is a line start), so no cross-chunk look-back needed.
-        auto preceded_by_lowercase = [&](std::size_t start) {
-            std::size_t k = start;
-            while (k > 0 && (norm[k - 1] == ' ' || norm[k - 1] == '\t')) --k;
-            return k > 0 && is_lower(static_cast<unsigned char>(norm[k - 1]));
-        };
-        for (std::size_t i = 0, n = norm.size(); i < n;) {
-            const unsigned char c = static_cast<unsigned char>(norm[i]);
-            if (!is_alpha(c)) { ++i; continue; }
-            std::size_t j = i;
-            bool all_lower = true, rest_lower = true;
-            while (j < n && is_alpha(static_cast<unsigned char>(norm[j]))) {
-                const unsigned char ch = static_cast<unsigned char>(norm[j]);
-                if (!is_lower(ch)) all_lower = false;
-                if (j > i && !is_lower(ch)) rest_lower = false;
-                ++j;
-            }
-            const std::string w = norm.substr(i, j - i);
-            if (all_lower) {
-                lower_count[w] += 1;
-            } else if (is_upper(static_cast<unsigned char>(w[0])) && rest_lower) {  // "Spot", "The"
-                if (preceded_by_lowercase(i)) {
-                    std::string lw = w;
-                    lw[0] = static_cast<char>(to_lower(static_cast<unsigned char>(lw[0])));
-                    midcap_count[lw] += 1;
-                }
-            }
-            i = j;
-        }
-    });
-    if (!open_ok)      { std::println(stderr, "configure error: cannot read corpus '{}'", corpus); return 1; }
-    if (raw_bytes == 0) { std::println(stderr, "configure error: empty corpus"); return 1; }
-
+    // The expensive corpus scan (passes 1-2) produces a bounded ScanState. Cache it next to
+    // the corpus (<corpus>.words, validated by size+mtime+version) so a re-run with a
+    // different vocab, after a crash, or to re-tokenize for a new scheme reloads it and SKIPS
+    // the scan. The name COUNTS are kept (not just the derived `attested`) so the state is
+    // mergeable for a future multi-corpus / incremental tokenizer.
+    ScanState S;
     std::unordered_set<std::string> attested;
     long names_withheld = 0;
-    for (const auto& [w, lc] : lower_count) {
-        const auto it = midcap_count.find(w);
-        const long mid = (it == midcap_count.end()) ? 0 : it->second;
-        if (mid > lc) { ++names_withheld; continue; }  // name sense dominates -> keep verbatim
-        attested.insert(w);
-    }
-    lower_count = {}; midcap_count = {};   // free; only `attested` is needed onward
-    const auto _t1 = std::chrono::steady_clock::now();
-
-    // --- Pass 2: truecase each chunk into a base-symbol stream (bytes + <|cap|>/<|up|>
-    //     markers), then pre-tokenize. A word unit (run of word bytes per word_unit_end)
-    //     becomes one entry in the unique-word table; everything else -- punctuation,
-    //     spaces, and the markers -- is a standalone symbol that never participates in
-    //     merges (keeping markers atomic is the point of truecasing). The table is keyed by
-    //     the RAW byte-symbol sequence so it is independent of the not-yet-fixed base
-    //     alphabet; we also record which byte values / markers actually occur.
-    TokStats st;
-    std::array<int, 256> byte_used; byte_used.fill(0);
-    bool used_cap = false, used_up = false;
-    std::vector<std::vector<int>> word_syms;   // unique word -> symbol sequence (raw byte values)
-    std::vector<long> word_freq;
-    std::unordered_map<std::string, int> word_index;
-    for_each_chunk(corpus, [&](std::string_view chunk) {
-        long qr = 0;
-        const std::string  norm   = normalize_text(std::string(chunk), qr);
-        const std::vector<int> stream = truecase_tokenize(norm, attested, &st);
-        for (std::size_t i = 0, n = stream.size(); i < n;) {
-            const std::size_t end = word_unit_end(stream, i);
-            if (end == i) {                                  // standalone symbol
-                const int s = stream[i];
-                if (s == TOK_CAP)      used_cap = true;
-                else if (s == TOK_UP)  used_up = true;
-                else                   byte_used[s] = 1;
-                ++i; continue;
-            }
-            std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                 stream.begin() + static_cast<std::ptrdiff_t>(end));  // raw byte values
-            for (int b : seq) byte_used[b] = 1;
-            const std::string key = seq_key(seq);
-            auto it = word_index.find(key);
-            if (it == word_index.end()) {
-                word_index.emplace(key, static_cast<int>(word_syms.size()));
-                word_syms.push_back(std::move(seq));
-                word_freq.push_back(1);
-            } else {
-                word_freq[static_cast<std::size_t>(it->second)] += 1;
-            }
-            i = end;
+    std::unordered_map<std::string, int> word_index;       // raw-key -> word id (also used by Pass 3)
+    auto derive_attested = [&] {
+        // Re-derivable from the (mergeable) name counts: a lowercase form is attested unless
+        // its mid-sentence-capital ("name") uses dominate its lowercase uses.
+        attested.clear(); names_withheld = 0;
+        for (const auto& [w, lc] : S.lower_count) {
+            const auto it = S.midcap_count.find(w);
+            const long mid = (it == S.midcap_count.end()) ? 0 : it->second;
+            if (mid > lc) { ++names_withheld; continue; }
+            attested.insert(w);
         }
-    });
+    };
+
+    std::chrono::steady_clock::time_point _t1{}, _t2{};
+    const std::string cache_path = std::string(corpus) + ".words";
+    if (load_scan_state(cache_path, corpus, S)) {
+        derive_attested();
+        for (std::size_t i = 0; i < S.word_syms.size(); ++i)
+            word_index.emplace(seq_key(S.word_syms[i]), static_cast<int>(i));
+        _t1 = _t2 = std::chrono::steady_clock::now();
+        std::println(stderr, "scan cache: HIT '{}' ({} words, {} attested) -- corpus scan skipped",
+                     cache_path, S.word_syms.size(), attested.size());
+    } else {
+        // --- Pass 1: decide which lowercase forms license a Capitalized/UPPER -> marker
+        //     collapse. The tell is *position*: a capital following a lowercase word
+        //     mid-sentence ("...to Spot") is a name; per lowercase form we count lowercase
+        //     uses vs mid-sentence-capital uses, withholding name-dominant forms from `attested`.
+        const bool open_ok = for_each_chunk(corpus, [&](std::string_view chunk) {
+            S.raw_bytes += chunk.size();
+            long qr = 0;
+            const std::string norm = normalize_text(std::string(chunk), qr);
+            S.quote_repl += qr;
+            S.norm_bytes += norm.size();
+            auto preceded_by_lowercase = [&](std::size_t start) {
+                std::size_t k = start;
+                while (k > 0 && (norm[k - 1] == ' ' || norm[k - 1] == '\t')) --k;
+                return k > 0 && is_lower(static_cast<unsigned char>(norm[k - 1]));
+            };
+            for (std::size_t i = 0, n = norm.size(); i < n;) {
+                const unsigned char c = static_cast<unsigned char>(norm[i]);
+                if (!is_alpha(c)) { ++i; continue; }
+                std::size_t j = i;
+                bool all_lower = true, rest_lower = true;
+                while (j < n && is_alpha(static_cast<unsigned char>(norm[j]))) {
+                    const unsigned char ch = static_cast<unsigned char>(norm[j]);
+                    if (!is_lower(ch)) all_lower = false;
+                    if (j > i && !is_lower(ch)) rest_lower = false;
+                    ++j;
+                }
+                const std::string w = norm.substr(i, j - i);
+                if (all_lower) {
+                    S.lower_count[w] += 1;
+                } else if (is_upper(static_cast<unsigned char>(w[0])) && rest_lower) {  // "Spot", "The"
+                    if (preceded_by_lowercase(i)) {
+                        std::string lw = w;
+                        lw[0] = static_cast<char>(to_lower(static_cast<unsigned char>(lw[0])));
+                        S.midcap_count[lw] += 1;
+                    }
+                }
+                i = j;
+            }
+        });
+        if (!open_ok)         { std::println(stderr, "configure error: cannot read corpus '{}'", corpus); return 1; }
+        if (S.raw_bytes == 0) { std::println(stderr, "configure error: empty corpus"); return 1; }
+        derive_attested();
+        _t1 = std::chrono::steady_clock::now();
+
+        // --- Pass 2: truecase each chunk + pre-tokenize into the unique-word table. A word
+        //     unit (run of word bytes per word_unit_end) becomes one table entry keyed by its
+        //     RAW byte-symbol sequence (independent of the not-yet-fixed base alphabet);
+        //     punctuation, spaces and the markers are standalone symbols that never merge. We
+        //     also record which byte values / markers actually occur.
+        for_each_chunk(corpus, [&](std::string_view chunk) {
+            long qr = 0;
+            const std::string  norm   = normalize_text(std::string(chunk), qr);
+            const std::vector<int> stream = truecase_tokenize(norm, attested, &S.st);
+            for (std::size_t i = 0, n = stream.size(); i < n;) {
+                const std::size_t end = word_unit_end(stream, i);
+                if (end == i) {                                  // standalone symbol
+                    const int s = stream[i];
+                    if (s == TOK_CAP)      S.used_cap = true;
+                    else if (s == TOK_UP)  S.used_up = true;
+                    else                   S.byte_used[s] = 1;
+                    ++i; continue;
+                }
+                std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                     stream.begin() + static_cast<std::ptrdiff_t>(end));  // raw byte values
+                for (int b : seq) S.byte_used[b] = 1;
+                const std::string key = seq_key(seq);
+                auto it = word_index.find(key);
+                if (it == word_index.end()) {
+                    word_index.emplace(key, static_cast<int>(S.word_syms.size()));
+                    S.word_syms.push_back(std::move(seq));
+                    S.word_freq.push_back(1);
+                } else {
+                    S.word_freq[static_cast<std::size_t>(it->second)] += 1;
+                }
+                i = end;
+            }
+        });
+        _t2 = std::chrono::steady_clock::now();
+        save_scan_state(cache_path, corpus, S);
+        std::println(stderr, "scan cache: saved '{}' ({} words)", cache_path, S.word_syms.size());
+    }
+
+    // Aliases so the downstream base-alphabet / BPE / emit / reporting code is unchanged.
+    auto& byte_used = S.byte_used;
+    const bool used_cap = S.used_cap, used_up = S.used_up;
+    auto& word_syms = S.word_syms;
+    auto& word_freq = S.word_freq;
+    const sub0::casing::TokStats& st = S.st;
+    const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
+    const long quote_repl = S.quote_repl;
+    S.lower_count = {}; S.midcap_count = {};   // attested derived; free the mergeable name counts
 
     // Fix the base alphabet: distinct byte values used (in byte order) then the markers --
     // the same ordering as before, so base ids match and BPE tie-breaking is unchanged.
@@ -273,8 +406,6 @@ int main(int argc, char** argv) {
     // it preserves pair frequencies AND tie-breaking -> identical merges.
     for (std::vector<int>& w : word_syms)
         for (int& s : w) s = byte_base[s];
-
-    const auto _t2 = std::chrono::steady_clock::now();
 
     // --- BPE: greedily merge the most frequent adjacent pair (weighted by word frequency)
     //     until the target vocabulary size or the per-pair floor is reached. Operates only
@@ -404,8 +535,12 @@ int main(int argc, char** argv) {
         for (int code : base_symbol) wu16(static_cast<std::uint16_t>(code));
         wu32(static_cast<std::uint32_t>(merges.size()));
         for (const auto& [a, b] : merges) { wu32(static_cast<std::uint32_t>(a)); wu32(static_cast<std::uint32_t>(b)); }
-        wu32(static_cast<std::uint32_t>(attested.size()));
-        for (const std::string& w : attested) {
+        // Sorted so tokenizer.bin is byte-deterministic regardless of set iteration order
+        // (which the scan-cache load path reshuffles); membership is order-independent anyway.
+        std::vector<std::string> att(attested.begin(), attested.end());
+        std::sort(att.begin(), att.end());
+        wu32(static_cast<std::uint32_t>(att.size()));
+        for (const std::string& w : att) {
             wu16(static_cast<std::uint16_t>(w.size()));
             tz.write(w.data(), static_cast<std::streamsize>(w.size()));
         }

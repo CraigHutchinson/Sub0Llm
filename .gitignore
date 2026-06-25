@@ -8,3 +8,8 @@ out/
 /sub0llm
 /build*
 /models
+
+# Generated/large corpus artifacts (not source)
+*.words          # cached corpus-scan state (configurator ScanState)
+data/fineweb_edu.txt
+data/fineweb_edu.txt.done
