@@ -9,6 +9,8 @@
 
 #include "sub0/core.hpp"   // trainable_floats()
 
+#include <algorithm>
+#include <cmath>
 #include <random>
 #include <vector>
 
@@ -19,6 +21,7 @@ extern "C" int  sub0_cuda_upload_params(const float* host);
 extern "C" int  sub0_cuda_download_params(float* host);
 extern "C" int  sub0_cuda_linear(const float* X, int T, int in, int out,
                                  const float* W, const float* bias, float* Y);
+extern "C" int  sub0_cuda_forward(const int* ids, int T, float* out_logits);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -59,5 +62,30 @@ TEST_CASE("CUDA dense linear matches a CPU reference", "[cuda]") {
                 acc += X[static_cast<std::size_t>(t) * in + p] * W[static_cast<std::size_t>(p) * out + o];
             REQUIRE(Yg[static_cast<std::size_t>(t) * out + o] == Catch::Approx(acc).margin(1e-2));
         }
+}
+
+TEST_CASE("CUDA forward matches the CPU engine logits", "[cuda]") {
+    sub0::build_model();                                     // random-init params
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);  // mirror them to the device
+
+    const int T = 16;
+    std::vector<int> ids(static_cast<std::size_t>(T));
+    std::mt19937 rng(21);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int& x : ids) x = tok(rng);
+
+    sub0::graph_reset();
+    sub0::Node* lg = sub0::forward(ids.data(), T);           // CPU logits [T, VOCAB]
+    const std::vector<float> cpu(lg->data.begin(), lg->data.end());
+
+    std::vector<float> gpu(static_cast<std::size_t>(T) * VOCAB, 0.0f);
+    REQUIRE(sub0_cuda_forward(ids.data(), T, gpu.data()) == 0);
+
+    double max_abs = 0.0;
+    for (std::size_t i = 0; i < cpu.size(); ++i)
+        max_abs = std::max(max_abs, static_cast<double>(std::fabs(cpu[i] - gpu[i])));
+    INFO("max abs logit diff = " << max_abs);
+    REQUIRE(max_abs < 1e-2);          // same op sequence; GPU uses CUDA fast-math (__expf/rsqrtf)
+    sub0_cuda_shutdown();
 }
 
