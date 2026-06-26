@@ -445,16 +445,11 @@ int main(int argc, char** argv) {
     }
     for (const auto& [p, c] : pc) heap.push({c, p});
 
-    // Adjust a pair's count by `d` and note it as touched; index word `w` under it when adding.
-    // The heap is NOT pushed here -- a merge touching millions of words changes only a few
-    // DISTINCT pairs, so we push each touched pair ONCE at the end of the merge (below) instead
-    // of per touch. pc stays exact, so the selection (hence the vocabulary) is unchanged.
+    // Per-merge scratch: the set of pairs whose count changed (pushed to the heap ONCE at the
+    // end of the merge -- a merge touching millions of words changes only a few DISTINCT pairs,
+    // so per-touch pushes were wasteful), and a small reused word-local pair-delta map.
     std::unordered_set<std::pair<int, int>, PairHash> touched;
-    auto adj = [&](const std::pair<int, int>& p, long d, int w) {
-        pc[p] += d;
-        touched.insert(p);
-        if (w >= 0) pair_words[p].push_back(w);
-    };
+    std::unordered_map<std::pair<int, int>, int, PairHash> wd;
 
     while (vocab < vocab_target) {
         std::pair<int, int> best{0, 0}; long best_c = -1;
@@ -482,19 +477,28 @@ int main(int argc, char** argv) {
         touched.clear();
         for (const int w : wl) {
             std::vector<int>& s = word_syms[static_cast<std::size_t>(w)];
-            bool has = false;
-            for (std::size_t k = 0; k + 1 < s.size(); ++k)
-                if (s[k] == best.first && s[k + 1] == best.second) { has = true; break; }
-            if (!has) continue;                              // stale index entry
-            const long f = word_freq[static_cast<std::size_t>(w)];
-            for (std::size_t k = 0; k + 1 < s.size(); ++k) adj({s[k], s[k + 1]}, -f, -1);  // remove old
+            // Rebuild with best -> new_id (greedy, left-to-right), detecting whether it changed.
             std::vector<int> ns; ns.reserve(s.size());
+            bool changed = false;
             for (std::size_t k = 0; k < s.size();) {
-                if (k + 1 < s.size() && s[k] == best.first && s[k + 1] == best.second) { ns.push_back(new_id); k += 2; }
+                if (k + 1 < s.size() && s[k] == best.first && s[k + 1] == best.second) { ns.push_back(new_id); k += 2; changed = true; }
                 else { ns.push_back(s[k]); ++k; }
             }
+            if (!changed) continue;                          // stale index entry
+            const long f = word_freq[static_cast<std::size_t>(w)];
+            // Net pair-count change = (old pair multiset) - (new pair multiset). Only pairs with a
+            // non-zero net actually changed, so we touch the big pc map / heap / index for those
+            // alone -- the bulk of the bookkeeping stays in this small, cache-hot, word-local map.
+            wd.clear();
+            for (std::size_t k = 0; k + 1 < s.size();  ++k) wd[{s[k], s[k + 1]}]   += 1;
+            for (std::size_t k = 0; k + 1 < ns.size(); ++k) wd[{ns[k], ns[k + 1]}] -= 1;
+            for (const auto& [p, d] : wd) {
+                if (d == 0) continue;
+                pc[p] -= static_cast<long>(d) * f;
+                touched.insert(p);
+                if (d < 0) pair_words[p].push_back(w);       // pair now present (more) in this word
+            }
             s.swap(ns);
-            for (std::size_t k = 0; k + 1 < s.size(); ++k) adj({s[k], s[k + 1]}, f, w);     // add new + index
         }
         for (const auto& p : touched) {                      // one heap push per changed pair
             const auto it = pc.find(p);
