@@ -97,6 +97,15 @@ cublasHandle_t g_cublas = nullptr;
 // baked value.
 using CudaTf32 = sub0::Knob<bool, CUDA_TF32>;
 
+// Attention-backward strategy as a workload knob (per-query vs per-head, see the two kernels
+// below). MEASURED 2026-06 on sm_120: per-head wins at the default batch 384 (~178k vs ~162k
+// tok/s, no atomic contention) but per-query wins massively at small batch (3.4x at batch 32,
+// where head-per-thread starves the device). Default = per-head (false), tuned for the batch-384
+// default. Runtime-mutable under SUB0_TUNING for the GPU autotuner. TODO(gpu-autotune): bake this
+// from the tune cache via the configurator (like CUDA_TF32) once the GPU autotune stage exists.
+constexpr bool ATTN_BWD_PER_QUERY_DEFAULT = false;
+using AttnBwdPerQuery = sub0::Knob<bool, ATTN_BWD_PER_QUERY_DEFAULT>;
+
 // Dedicated stream for all device work so the forward can be captured into a CUDA graph
 // (capturing the legacy default stream is disallowed). Plus the captured executable graph and
 // the (batch,T) it was captured for -- recaptured when the shape or the GEMM math mode changes.
@@ -364,15 +373,23 @@ __global__ void gelu_backward_kernel(const float* __restrict__ x, const float* _
     if (i < n) dx[i] = dy[i] * dev_dgelu(x[i]);
 }
 
-// Causal attention backward (op_attn): one thread per (window b, head h) owns that head's
-// columns [off, off+d), so dq/dk/dv accumulate with NO cross-thread races. q/k/v and dq/dk/dv
-// are stride-in_stride sub-blocks of the fused QKV buffer; dout/att are packed (stride C). The
-// dq/dk/dv buffer must be zeroed before launch. Mirrors the CPU backward exactly.
-__global__ void attn_backward_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                                     const float* __restrict__ v, const float* __restrict__ P,
-                                     const float* __restrict__ dout, float* __restrict__ dq,
-                                     float* __restrict__ dk, float* __restrict__ dv,
-                                     int batch, int T, int C, int H, int in_stride) {
+// Causal attention backward (op_attn) -- TWO strategies, selected by a workload knob because the
+// best one depends on batch (measured crossover ~batch 256 on sm_120):
+//
+//  * HEAD-per-thread (attn_backward_head_kernel): one thread per (window b, head h) owns the whole
+//    head, so dq/dk/dv accumulate with NO atomics. Best at large batch (enough heads to fill the
+//    device; no atomic contention) -- the default at batch 384.
+//  * QUERY-per-thread (attn_backward_query_kernel): one thread per (b, h, query i). dq[i] is owned
+//    (no race) but dk[j]/dv[j] sum over queries i>=j via atomicAdd. Exposes batch*H*T threads (T=64x
+//    more), winning big at small batch where the head scheme starves the device (3.4x at batch 32),
+//    at the cost of atomic contention that overtakes it at large batch.
+//
+// Both mirror the CPU backward exactly. The dq/dk/dv buffer must be zeroed before launch.
+__global__ void attn_backward_head_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                          const float* __restrict__ v, const float* __restrict__ P,
+                                          const float* __restrict__ dout, float* __restrict__ dq,
+                                          float* __restrict__ dk, float* __restrict__ dv,
+                                          int batch, int T, int C, int H, int in_stride) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over batch*H
     if (idx >= batch * H) return;
     const int b = idx / H, h = idx % H;
@@ -402,6 +419,44 @@ __global__ void attn_backward_kernel(const float* __restrict__ q, const float* _
             float* dkj      = dk + in_base + static_cast<size_t>(j) * in_stride + off;
             for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; dkj[a] += ds * qi[a]; }
         }
+    }
+}
+__global__ void attn_backward_query_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                           const float* __restrict__ v, const float* __restrict__ P,
+                                           const float* __restrict__ dout, float* __restrict__ dq,
+                                           float* __restrict__ dk, float* __restrict__ dv,
+                                           int batch, int T, int C, int H, int in_stride) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over batch*H*T
+    const int per = H * T;
+    const int b   = idx / per;
+    if (b >= batch) return;
+    const int rem = idx - b * per;
+    const int h   = rem / T;
+    const int i   = rem % T;
+    const int d = C / H, off = h * d;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+    const size_t Prow     = ((static_cast<size_t>(b) * H + h) * T + i) * T;
+    const float* douti = dout + out_base + static_cast<size_t>(i) * C + off;
+    float dP[SEQ_LEN];
+    for (int j = 0; j <= i; ++j) {                            // dv[j] += p*douti ; dP[j] = douti . v[j]
+        const float p = P[Prow + j];
+        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        float* dvj      = dv + in_base + static_cast<size_t>(j) * in_stride + off;
+        float dp = 0.f;
+        for (int a = 0; a < d; ++a) { atomicAdd(&dvj[a], p * douti[a]); dp += douti[a] * vj[a]; }
+        dP[j] = dp;
+    }
+    float dot = 0.f;
+    for (int j = 0; j <= i; ++j) dot += P[Prow + j] * dP[j];
+    const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+    float* dqi      = dq + in_base + static_cast<size_t>(i) * in_stride + off;   // owned by query i
+    for (int j = 0; j <= i; ++j) {
+        const float ds = P[Prow + j] * (dP[j] - dot) * scale;
+        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        float* dkj      = dk + in_base + static_cast<size_t>(j) * in_stride + off;
+        for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; atomicAdd(&dkj[a], ds * qi[a]); }
     }
 }
 
@@ -571,14 +626,26 @@ inline void launch_gelu_bwd(const float* x, const float* dy, float* dx, int n) {
 inline void launch_attn_bwd(const float* qkv, const float* P, const float* dout, float* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
     const int block = 64;
-    const int total = batch * H;
-    attn_backward_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
-        qkv, qkv + C, qkv + 2 * C, P, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
+    if (AttnBwdPerQuery::get()) {
+        const int total = batch * H * T;          // one thread per (window, head, query) -- small batch
+        attn_backward_query_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
+            qkv, qkv + C, qkv + 2 * C, P, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
+    } else {
+        const int total = batch * H;              // one thread per (window, head) -- large batch (default)
+        attn_backward_head_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
+            qkv, qkv + C, qkv + 2 * C, P, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
+    }
 }
 
 // Max minibatch the resident forward scratch is sized for: the CPU's tuned data-parallel
 // width, so the GPU forward covers the same batch training uses. A forward requesting more
 // windows than this is rejected.
+// MEASURED 2026-06 on sm_120 (train step, tok/s): batch 64 -> 62k, 128 -> 105k, 256 -> 157k,
+// 384 -> 176k, 512 -> 191k, 768 -> 195k, 1024 -> 209k. Throughput SATURATES past ~512 (384->1024
+// is only +17% while the batch -- a training hyperparameter -- grows 2.7x), so raising this cap
+// has limited value; the per-step fixed overhead dominating small batches is the better target.
+// TODO(gpu-autotune): expose this as a GPU batch knob + size the scratch to the actual batch
+// (instead of always the max) so larger batches don't over-allocate VRAM at small batch.
 constexpr int MAX_FWD_BATCH =
     DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD > 0 ? DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD : 8;
 
@@ -1250,6 +1317,13 @@ SUB0_CUDA_API void sub0_cuda_set_tf32(int on) {
     set_handle_tf32(on != 0);      // force the handle mode now (for the bench / parity tests)
 }
 
+// Select the attention-backward strategy (per_query != 0 -> query-per-thread, else head-per-thread).
+// Runtime knob for the GPU autotuner: per-head wins at large batch, per-query at small batch (no-op
+// in a non-tuning build, where the baked ATTN_BWD_PER_QUERY_DEFAULT is used).
+SUB0_CUDA_API void sub0_cuda_set_attn_bwd(int per_query) {
+    AttnBwdPerQuery::set(per_query != 0);
+}
+
 // Profile the device forward: time `iters` runs of the resident kernel chain (no host
 // transfers) under FP32 then TF32 math and print avg ms + the speedup. Self-contained
 // (allocates the param mirror + scratch, ids = token 0; GEMM timing is data-independent).
@@ -1294,5 +1368,51 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     std::printf("cuda bench forward: batch=%d T=%d M=%d iters=%d | eager FP32 %.3f ms | eager TF32 %.3f ms | "
                 "graph FP32 %.3f ms | graph %.2fx vs eager\n",
                 batch, T, M, iters, fp32, tf32, graph, graph > 0.0 ? fp32 / graph : 0.0);
+    return 0;
+}
+
+// Profile a full TRAINING step (forward_train + backward_device + AdamW) at a given batch, and
+// print ms/step + throughput (tok/s = batch*T/step). Self-contained: synthetic params (small
+// constant) + synthetic ids/targets -- GEMM/kernel timing is data-independent. This is the device
+// measurement primitive the GPU autotuner will sweep over batch / kernel-config knobs. Returns the
+// step time in `out_ms` (nullable). batch is clamped to MAX_FWD_BATCH.
+SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms) {
+    if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    if (sub0_cuda_init() || fwd_alloc() || train_alloc() || opt_alloc()) return 1;
+    ensure_cublas();
+    set_handle_tf32(CudaTf32::get());
+    const int M = batch * T;
+
+    // Synthetic, finite weights so nothing overflows; build the fused QKV from them once.
+    std::vector<float> hp(sub0::PARAM_FLOATS, 0.02f);
+    cudaMemcpy(g_dev_params, hp.data(), sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice);
+    build_qkv_weights();
+    cudaMemset(g_dev_m, 0, sub0::PARAM_FLOATS * sizeof(float));
+    cudaMemset(g_dev_vel, 0, sub0::PARAM_FLOATS * sizeof(float));
+    std::vector<int> hid(static_cast<size_t>(M)), htg(static_cast<size_t>(M));
+    for (int i = 0; i < M; ++i) { hid[i] = i % VOCAB; htg[i] = (i + 1) % VOCAB; }
+    cudaMemcpy(g_fwd.dids,     hid.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_tr.dtargets,  htg.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
+
+    auto one_step = [&](long t) {
+        forward_train(batch, T);
+        backward_device(batch, T);
+        device_adam_step(0.001f, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+    };
+    for (long w = 1; w <= 3; ++w) one_step(w);                        // warmup
+    cudaStreamSynchronize(g_stream);
+    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s, g_stream);
+    for (int it = 0; it < iters; ++it) one_step(it + 4);
+    cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
+    float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    const double per = static_cast<double>(ms) / iters;
+    const double toks = per > 0.0 ? (static_cast<double>(M) * 1000.0) / per : 0.0;
+    std::printf("cuda bench train: batch=%d T=%d M=%d iters=%d | step %.3f ms | %.0f tok/s\n",
+                batch, T, M, iters, per, toks);
+    if (out_ms) *out_ms = per;
     return 0;
 }
