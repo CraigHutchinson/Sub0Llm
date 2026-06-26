@@ -9,6 +9,7 @@
 #include "sub0/core.hpp"  // for DEFAULT_CORPUS (generated config)
 
 #include <cmath>
+#include <map>
 #include <print>
 #include <random>
 #include <string>
@@ -22,7 +23,7 @@ extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
-extern "C" int sub0_tune_stage(int max_threads, int verbose);
+extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend);
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
 extern "C" int sub0_models_stage(int prune, int verbose);
 
@@ -94,10 +95,16 @@ int main(int argc, char** argv) {
     // --- tune ----------------------------------------------------------------
     int  tune_max_threads = 0;   // 0 = hardware_concurrency
     bool tune_quiet = false;
+    int  tune_backend = 0;       // 0=auto, 1=all, 2=cpu, 3=gpu (CheckedTransformer maps the string)
     auto* tune = app.add_subcommand("tune", "Auto-tune runtime knobs (threads, batch granularity) for peak throughput");
     tune->add_option("--max-threads", tune_max_threads,
                      "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
     tune->add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
+    tune->add_option("--backend", tune_backend,
+                     "Which backend(s) to tune: auto (CPU + GPU if present) | all | cpu | gpu (skip CPU, keep its cached tuning)")
+        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{
+            {"auto", 0}, {"all", 1}, {"cpu", 2}, {"gpu", 3}}, CLI::ignore_case))
+        ->default_str("auto");
 
     // --- autotemp ------------------------------------------------------------
     // The coherence analogue of `tune`: search the sampling temperature whose
@@ -138,7 +145,7 @@ int main(int argc, char** argv) {
     if (*bench)
         return sub0_bench_stage(bench_iters, bench_threads, bench_wpt);
     if (*tune)
-        return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1);
+        return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1, tune_backend);
     if (*autotemp)
         return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
     if (*models)

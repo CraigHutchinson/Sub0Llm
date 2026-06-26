@@ -13,6 +13,7 @@
 
 #include "sub0/layout.hpp"   // PARAM_FLOATS + model dims + COMPUTE_MODE / CUDA_ARCH / HAS_CUDA
 #include "sub0/knob.hpp"     // Knob<T,Baked>: compile-time-baked / runtime-tunable knobs
+#include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the CPU tuner
 
 #include <cstdio>
 #include <vector>
@@ -1387,11 +1388,23 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     return 0;
 }
 
+// Adaptive timing bounds (shared with the CPU tuner via sub0/bench.hpp). Rather than a fixed
+// iteration count -- which makes profiling time balloon as the per-step cost grows with batch --
+// we size the timed run to a wall-time BUDGET so every measurement costs roughly the same. These
+// are the GPU-flavoured defaults (a couple of warmups cover clock ramp + graph capture).
+static constexpr sub0::bench::Budget TUNE_BUDGET{
+    .budget_ms = 1200.0, .warmup = 2, .min_iters = 3, .max_iters = 60,
+};
+
 // Time a full TRAINING step (forward_train + backward_device + AdamW) at a given batch: synthetic
-// finite params + ids/targets (timing is data-independent), 3 warmups, then `iters` timed steps.
-// Writes the mean step time (ms) to *out_ms. Quiet -- callers print. batch clamped to MAX_FWD_BATCH.
-static int time_train_step(int batch, int T, int iters, double* out_ms) {
-    if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
+// finite params + ids/targets (timing is data-independent), warmups, then timed steps. Writes the
+// mean step time (ms) to *out_ms. Quiet -- callers print. batch clamped to MAX_FWD_BATCH.
+//   iters > 0  : run exactly that many timed steps (explicit benchmark).
+//   iters <= 0 : auto-size the run to `budget_ms` of wall time -- probe once to estimate the
+//                per-step cost, then run clamp(budget/est, MIN, MAX) steps. Keeps the profiling
+//                wall-time ~constant across batch sizes instead of growing with the workload.
+static int time_train_step(int batch, int T, int iters, double budget_ms, double* out_ms) {
+    if (T < 1 || T > SEQ_LEN) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
     if (sub0_cuda_init() || fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
@@ -1410,20 +1423,35 @@ static int time_train_step(int batch, int T, int iters, double* out_ms) {
     cudaMemcpy(g_fwd.dids,     hid.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(g_tr.dtargets,  htg.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
 
-    auto one_step = [&](long t) {
+    long step = 0;
+    auto one_step = [&]() {
         forward_train(batch, T);
         backward_device(batch, T);
-        device_adam_step(0.001f, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+        device_adam_step(0.001f, ++step, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
     };
-    for (long w = 1; w <= 3; ++w) one_step(w);                        // warmup
-    cudaStreamSynchronize(g_stream);
-    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s, g_stream);
-    for (int it = 0; it < iters; ++it) one_step(it + 4);
-    cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
-    float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
-    cudaEventDestroy(s); cudaEventDestroy(e);
-    if (out_ms) *out_ms = static_cast<double>(ms) / iters;
+    // Time `n` steps on the stream and return the elapsed milliseconds (GPU event timing is precise).
+    auto run_timed = [&](int n) -> double {
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        cudaEventRecord(s, g_stream);
+        for (int i = 0; i < n; ++i) one_step();
+        cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
+        float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        return static_cast<double>(ms);
+    };
+
+    if (iters > 0) {                                                 // explicit fixed-iteration benchmark
+        for (int w = 0; w < TUNE_BUDGET.warmup; ++w) one_step();     // warmup
+        cudaStreamSynchronize(g_stream);
+        const double total = run_timed(iters);
+        if (out_ms) *out_ms = total / iters;
+        return 0;
+    }
+    // Budget mode: shared adaptive sizing (warmup + probe + clamp(budget/est, min, max)).
+    sub0::bench::Budget b = TUNE_BUDGET;
+    if (budget_ms > 0.0) b.budget_ms = budget_ms;
+    const sub0::bench::Timing t = sub0::bench::adaptive_time(one_step, run_timed, b);
+    if (out_ms) *out_ms = t.per_step_ms;
     return 0;
 }
 
@@ -1432,7 +1460,7 @@ static int time_train_step(int batch, int T, int iters, double* out_ms) {
 // time in `out_ms` (nullable).
 SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms) {
     double per = 0.0;
-    if (time_train_step(batch, T, iters, &per)) return 1;
+    if (time_train_step(batch, T, iters, 0.0, &per)) return 1;
     const int M = (batch < 1 ? 1 : (batch > MAX_FWD_BATCH ? MAX_FWD_BATCH : batch)) * T;
     const double toks = per > 0.0 ? (static_cast<double>(M) * 1000.0) / per : 0.0;
     std::printf("cuda bench train: batch=%d T=%d M=%d iters=%d | step %.3f ms | %.0f tok/s\n",
@@ -1442,7 +1470,8 @@ SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double*
 }
 
 // Quiet training-step timer for the autotuner: measures with the CURRENT knob state (TF32 /
-// attn-backward, set via sub0_cuda_set_*), writes mean ms/step to *out_ms, prints nothing.
-SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, int iters, double* out_ms) {
-    return time_train_step(batch, T, iters, out_ms);
+// attn-backward, set via sub0_cuda_set_*), sizing the timed run to `budget_ms` of wall time so
+// every batch profiles in roughly the same time. Writes mean ms/step to *out_ms, prints nothing.
+SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
+    return time_train_step(batch, T, 0, budget_ms, out_ms);
 }

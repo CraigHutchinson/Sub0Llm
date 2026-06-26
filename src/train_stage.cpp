@@ -21,6 +21,7 @@
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
+#include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 
 // Code version + models root, baked in by CMake (configure-time) so a model records what
 // produced it and lands in a structured directory. Fallbacks keep the file compilable alone.
@@ -74,7 +75,7 @@ extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int bat
                                      float lr, long t, double* out_loss);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" void sub0_cuda_set_attn_bwd(int per_query);
-extern "C" int  sub0_cuda_time_train_step(int batch, int T, int iters, double* out_ms);
+extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 #endif
 
 namespace {
@@ -489,6 +490,9 @@ struct GpuTrainer {
 };
 }  // namespace
 
+// Shared run-context banner (model/compute/training-backend), defined below; train and tune share it.
+static void report_run_context(bool gpu_train);
+
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed) {
     // Training consumes the pre-tokenized corpus produced by the configurator, not
@@ -649,9 +653,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
 
     std::print("corpus: {} | ", src_desc);
-    sub0::print_config();
-    std::println("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
-                                                    : "CPU (data-parallel minibatch)");
+    report_run_context(gpu_train);
     std::println("schedule: {} steps/epoch | warmup {} | eval every {} | max {} steps ({} epochs){}{}",
                  epoch_steps, warmup_steps, eval_every, max_steps,
                  (max_steps + epoch_steps - 1) / epoch_steps,
@@ -761,6 +763,17 @@ static void report_threading() {
     std::println("threading: !! OpenMP DISABLED -- every run is SINGLE-THREADED; thread");
     std::println("           scaling below is meaningless. Rebuild with OpenMP. !!");
 #endif
+    std::fflush(stdout);
+}
+
+// Shared run-context banner so `train`, `tune`, ... all report the same model/compute facts up
+// front. Lines 1-2 (model dims + static memory + compute mode + CUDA availability) come from the
+// backend's print_config(); the third names the training path that will actually execute, so the
+// throughput numbers that follow are read against the right backend.
+static void report_run_context(bool gpu_train) {
+    sub0::print_config();
+    std::println("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
+                                                    : "CPU (data-parallel minibatch)");
     std::fflush(stdout);
 }
 
@@ -897,16 +910,18 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
 // needed; only a new objective lambda and knob set here.
 namespace {
 
-// Wall-clock throughput (window/s) of `steps` consecutive train_batch calls at a given
-// thread count and per-thread window count. Throughput is the metric that matters long
-// term, and it is deliberately NOT cycle-normalised: a longer `steps` lets the cores
-// heat up and thermally throttle, so the number reflects the SUSTAINED rate a real
-// training run would see. That is why the tuner raises `steps` as it narrows down --
-// the coarse sweep uses a short burst for speed, the confirmation a long throttled run.
-// Random run-to-run noise is handled upstream by the search's median-of-samples
-// confirmation, so a single honest measurement is returned here (no optimistic best-of).
-double measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
-                             int threads, int windows_per_thread, int steps) {
+// Wall-clock throughput (window/s) of consecutive train_batch calls at a given thread count and
+// per-thread window count, measured with the SHARED budget-sized timer (sub0/bench.hpp) -- the
+// same adaption the GPU sweep uses. Rather than a fixed step count, the run is sized to a wall-time
+// budget: a quick burst while exploring broadly, a longer throttled run while pinning the winner
+// (a longer budget lets the cores heat up and thermally throttle, so the number reflects the
+// SUSTAINED rate a real training run sees). Returns the throughput AND the wall time spent
+// profiling (so the live trace -- and a captured log -- shows where the tuner spent its time).
+// Random run-to-run noise is handled upstream by the search's median-of-samples confirmation.
+struct DpMeasure { double window_per_s = 0.0; double profile_ms = 0.0; int steps = 0; };
+
+DpMeasure measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
+                                int threads, int windows_per_thread, double budget_ms) {
 #if defined(_OPENMP)
     omp_set_num_threads(threads > 0 ? threads : 1);
 #endif
@@ -915,22 +930,48 @@ double measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
     std::uniform_int_distribution<size_t> startd(0, data.size() - SEQ_LEN - 2);
     std::vector<std::size_t> starts(static_cast<size_t>(B));
 
-    for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);  // warm caches
-    sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
-
-    const int n = std::max(1, steps);
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int s = 0; s < n; ++s) {
+    auto one_step = [&] {
         for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);
         sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
-    }
-    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return secs > 0 ? static_cast<double>(n) * B / secs : 0.0;
+    };
+    auto run_timed = [&](int n) -> double {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < n; ++s) one_step();
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    // CPU-flavoured bounds: one warmup pass primes caches; allow many short steps for the fast
+    // multi-thread configs while keeping the budget in charge of the wall time.
+    const sub0::bench::Budget b{ .budget_ms = budget_ms, .warmup = 1, .min_iters = 4, .max_iters = 4096 };
+    const sub0::bench::Timing t = sub0::bench::adaptive_time(one_step, run_timed, b);
+    const double wps = t.per_step_ms > 0.0 ? static_cast<double>(B) * 1000.0 / t.per_step_ms : 0.0;
+    return { wps, t.total_ms, t.iters };
+}
+
+// Read an int value for `key` from the tune cache ("key=value" lines), leaving *out untouched if
+// the cache or key is absent. Lets `tune --gpu` carry the existing CPU tuning (threads / windows)
+// forward instead of clobbering it when it rewrites the cache.
+bool read_tune_cache_value(const char* key, int* out) {
+    if (DEFAULT_TUNE_CACHE[0] == '\0') return false;
+    std::ifstream in(DEFAULT_TUNE_CACHE);
+    if (!in) return false;
+    const std::string want = std::string(key) + "=";
+    for (std::string line; std::getline(in, line); )
+        if (line.rfind(want, 0) == 0) { *out = std::atoi(line.c_str() + want.size()); return true; }
+    return false;
 }
 
 }  // namespace
 
-extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
+// Backend selector for sub0_tune_stage (kept an int for the C ABI): 0=auto, 1=all, 2=cpu, 3=gpu.
+// `auto` and `all` both tune the CPU sweep plus the GPU device-step knobs when a CUDA device is
+// present; `cpu` tunes only the data-parallel sweep; `gpu` tunes only the device-step knobs and
+// carries the cached CPU tuning forward. The driver maps the --backend string onto these.
+enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, TUNE_BACKEND_GPU = 3 };
+
+extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend) {
+    const bool run_cpu = backend != TUNE_BACKEND_GPU;   // gpu-only skips the CPU sweep
+    const bool run_gpu = backend != TUNE_BACKEND_CPU;   // cpu-only skips the device-step sweep
+
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
     const std::span<const int> data = load_corpus_tokens(tok, od_buf, "tune");
@@ -938,79 +979,103 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     sub0::build_model();
     std::mt19937 rng(123);
 
+    // Lead with the same model/compute context the training run prints, so a captured tune log
+    // records the dimensions the throughput numbers below were measured against. The training
+    // backend reflects the path this tune will exercise (the GPU device step when CUDA is present
+    // and not excluded via --backend cpu).
+    report_run_context(run_gpu && HAS_CUDA);
+
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     const int cap = max_threads > 0 ? std::min<int>(max_threads, static_cast<int>(hw))
                                      : static_cast<int>(hw);
 
-    // The knob space. Extensible: append a Knob and read it by index in the objective.
-    std::vector<double> thread_vals;
-    for (int t = 1; t <= cap; ++t) thread_vals.push_back(static_cast<double>(t));
-    sub0::tune::Space space = {
-        {"threads",        thread_vals},
-        {"windows/thread", {1, 2, 4, 8, 16}},
-    };
+    // CPU data-parallel result. Filled by the CPU sweep below; when --backend gpu skips that sweep
+    // we carry the existing CPU tuning forward (cache, else baked defaults) so the rewrite never
+    // clobbers it.
+    int best_threads = DEFAULT_THREADS;
+    int best_wpt     = DEFAULT_WINDOWS_PER_THREAD;
 
-    // Objective: maximize measured window/s. tune::maximize never sees the engine.
-    // Reports each configuration live (the search can run many evals; buffering the
-    // whole trace to the end would look like a long hang), tracking the running best.
-    // `steps` grows as the search narrows (driven by on_phase below) so the precise,
-    // narrowing-down measurements run long enough to thermally throttle -- the regime a
-    // sustained training run actually operates in.
-    int steps = 8;
-    double running_best = 0.0;
-    sub0::tune::Objective objective = [&](const sub0::tune::Assignment& a) {
-        const int threads = static_cast<int>(std::lround(a[0]));
-        const int wpt     = static_cast<int>(std::lround(a[1]));
-        const double wps  = measure_dp_throughput(data, rng, threads, wpt, steps);
-        if (verbose) {
-            const bool best = wps > running_best;
-            std::println("  threads={:>2}  windows/thread={:>2}  ->  {:>6.0f} window/s{}",
-                         threads, wpt, wps, best ? "   <- best" : "");
-            std::fflush(stdout);   // stream progress as it happens, don't buffer to the end
-        }
-        running_best = std::max(running_best, wps);
-        return wps;
-    };
+    if (run_cpu) {
+        // The knob space. Extensible: append a Knob and read it by index in the objective.
+        std::vector<double> thread_vals;
+        for (int t = 1; t <= cap; ++t) thread_vals.push_back(static_cast<double>(t));
+        sub0::tune::Space space = {
+            {"threads",        thread_vals},
+            {"windows/thread", {1, 2, 4, 8, 16}},
+        };
 
-    std::println("--- auto-tune throughput (knobs: threads 1..{}, windows/thread {{1,2,4,8,16}}) ---", cap);
-    report_threading();
-    std::fflush(stdout);
+        // Objective: maximize measured window/s. tune::maximize never sees the engine. Reports each
+        // configuration live (buffering the whole trace to the end would look like a long hang),
+        // tracking the running best. The wall-time BUDGET grows as the search narrows (driven by
+        // on_phase below) so the precise, narrowing-down measurements run long enough to thermally
+        // throttle -- the regime a sustained training run actually operates in -- while every point
+        // still costs ~the same wall time regardless of how fast that configuration is.
+        double budget_ms = 200.0;
+        double running_best = 0.0;
+        sub0::tune::Objective objective = [&](const sub0::tune::Assignment& a) {
+            const int threads = static_cast<int>(std::lround(a[0]));
+            const int wpt     = static_cast<int>(std::lround(a[1]));
+            const DpMeasure m = measure_dp_throughput(data, rng, threads, wpt, budget_ms);
+            if (verbose) {
+                const bool best = m.window_per_s > running_best;
+                std::println("  threads={:>2}  windows/thread={:>2}  ->  {:>6.0f} window/s  "
+                             "({:.2f}s / {} steps){}",
+                             threads, wpt, m.window_per_s, m.profile_ms / 1000.0, m.steps,
+                             best ? "   <- best" : "");
+                std::fflush(stdout);   // stream progress as it happens, don't buffer to the end
+            }
+            running_best = std::max(running_best, m.window_per_s);
+            return m.window_per_s;
+        };
 
-    sub0::tune::Options opt;
-    // After the hot coarse sweep, pause briefly before each refinement pass and
-    // confirmation round so the cores shed heat and the narrowing-down readings are
-    // steadier (the search core stays pure -- the pause lives here).
-    opt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
-    // Lengthen each measurement as the search narrows: a quick burst while exploring
-    // broadly, then progressively longer throttled runs while pinning down the winner.
-    // The phase header also makes it clear in the live output which stage we are in.
-    opt.on_phase = [&](sub0::tune::Phase p) {
-        switch (p) {
-            case sub0::tune::Phase::Explore:
-                steps = 8;
-                std::println("[explore] wide sweep, short runs");
-                break;
-            case sub0::tune::Phase::Refine:
-                steps = 24;
-                std::println("[refine]  narrowing in, longer runs");
-                break;
-            case sub0::tune::Phase::Confirm:
-                steps = 64;
-                std::println("[confirm] re-measuring finalists, longest runs (dropping clear losers)");
-                break;
-        }
+        std::println("--- auto-tune throughput (knobs: threads 1..{}, windows/thread {{1,2,4,8,16}}) ---", cap);
+        report_threading();
         std::fflush(stdout);
-    };
-    sub0::tune::Result r = sub0::tune::maximize(space, objective, opt);
 
-    const int best_threads = static_cast<int>(std::lround(r.best[0]));
-    const int best_wpt     = static_cast<int>(std::lround(r.best[1]));
-    const double single = measure_dp_throughput(data, rng, 1, best_wpt, 64);  // long run, matched to confirm
-    std::println("");
-    std::println("evaluated {} measurements; winner confirmed over {} samples", r.evaluations, r.best_samples);
-    std::println("best: threads={}  windows/thread={}  ->  {:.0f} window/s  ({:.2f}x vs 1 thread)",
-                 best_threads, best_wpt, r.best_score, single > 0 ? r.best_score / single : 0.0);
-    std::println("apply with:  sub0llm bench --threads {} --windows-per-thread {}", best_threads, best_wpt);
+        sub0::tune::Options opt;
+        // After the hot coarse sweep, pause briefly before each refinement pass and confirmation
+        // round so the cores shed heat and the narrowing-down readings are steadier.
+        opt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+        // Lengthen each measurement's budget as the search narrows: a quick burst while exploring
+        // broadly, then progressively longer throttled runs while pinning down the winner. The
+        // phase header also makes it clear in the live output (and a captured log) which stage we
+        // are in.
+        opt.on_phase = [&](sub0::tune::Phase p) {
+            switch (p) {
+                case sub0::tune::Phase::Explore:
+                    budget_ms = 200.0;
+                    std::println("[explore] wide sweep, short runs (~0.2s/point)");
+                    break;
+                case sub0::tune::Phase::Refine:
+                    budget_ms = 500.0;
+                    std::println("[refine]  narrowing in, longer runs (~0.5s/point)");
+                    break;
+                case sub0::tune::Phase::Confirm:
+                    budget_ms = 1200.0;
+                    std::println("[confirm] re-measuring finalists, longest runs (~1.2s/point, dropping clear losers)");
+                    break;
+            }
+            std::fflush(stdout);
+        };
+        sub0::tune::Result r = sub0::tune::maximize(space, objective, opt);
+
+        best_threads = static_cast<int>(std::lround(r.best[0]));
+        best_wpt     = static_cast<int>(std::lround(r.best[1]));
+        const double single = measure_dp_throughput(data, rng, 1, best_wpt, 1200.0).window_per_s;
+        std::println("");
+        std::println("evaluated {} measurements; winner confirmed over {} samples", r.evaluations, r.best_samples);
+        std::println("best: threads={}  windows/thread={}  ->  {:.0f} window/s  ({:.2f}x vs 1 thread)",
+                     best_threads, best_wpt, r.best_score, single > 0 ? r.best_score / single : 0.0);
+        std::println("apply with:  sub0llm bench --threads {} --windows-per-thread {}", best_threads, best_wpt);
+    } else {
+        // --backend gpu: skip the CPU sweep. Carry the existing CPU tuning forward (cache wins over
+        // the baked defaults) so we tune only the GPU knobs and rewrite the cache without losing it.
+        read_tune_cache_value("threads", &best_threads);
+        read_tune_cache_value("windows_per_thread", &best_wpt);
+        std::println("--- GPU-only tune (CPU sweep skipped; carrying threads={} windows/thread={}) ---",
+                     best_threads, best_wpt);
+        std::fflush(stdout);
+    }
 
     // GPU device-step tuning (Phase 2e+): when the CUDA backend is built and a device is present,
     // also tune the GPU throughput knobs by timing the resident training step. The BATCH is tuned
@@ -1019,33 +1084,43 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     int gpu_batch = best_threads * best_wpt;        // default: the CPU-tuned data-parallel width
     int gpu_tf32  = CUDA_TF32 ? 1 : 0;
     int gpu_attn  = 0;                              // per-head attention backward (the default)
+    if (!run_gpu) {                                 // --backend cpu: keep any cached GPU knobs intact
+        read_tune_cache_value("gpu_batch", &gpu_batch);
+        read_tune_cache_value("cuda_tf32", &gpu_tf32);
+        read_tune_cache_value("attn_bwd_per_query", &gpu_attn);
+    }
 #if defined(SUB0_BUILD_CUDA)
-    if (HAS_CUDA && sub0_cuda_init() == 0) {
+    if (run_gpu && HAS_CUDA && sub0_cuda_init() == 0) {
         std::println("");
         std::println("--- GPU device-step tuning (knobs: batch, TF32, attn-backward) ---");
         report_threading();
+        // Every device measurement is sized to a fixed wall-time budget (Google-Benchmark style):
+        // the timer probes once then runs only as many steps as fit the budget, so a big-batch step
+        // (slow) and a small-batch step (fast) each profile in roughly the same time instead of the
+        // cost ballooning with the workload.
+        constexpr double kBudgetMs = 1200.0;
         // 1) Batch sweep: throughput climbs with batch then saturates (bigger GEMM M = better GPU
-        //    utilization). Pick the knee -- the smallest batch within 8% of the peak tok/s -- to get
-        //    most of the throughput at the most training-friendly (smallest) batch.
+        //    utilization). We stop at the KNEE -- the first batch whose throughput gain over the
+        //    previous one drops below 6% -- so we never pay to profile the largest, slowest batches
+        //    once the curve has flattened.
         sub0_cuda_set_tf32(0); sub0_cuda_set_attn_bwd(0);
-        std::vector<std::pair<int, double>> curve;
+        int    knee = 0;            // largest batch that still earned a >=6% throughput gain
+        double prev_tok = 0.0;
         for (int b : {64, 128, 256, 384, 512, 768, 1024}) {
             double ms = 0.0;
-            if (sub0_cuda_time_train_step(b, SEQ_LEN, 25, &ms) != 0 || ms <= 0.0) break;   // VRAM cap -> stop
+            const auto t0 = std::chrono::steady_clock::now();
+            const int rc = sub0_cuda_time_train_step(b, SEQ_LEN, kBudgetMs, &ms);
+            const double profile_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (rc != 0 || ms <= 0.0) break;                          // VRAM cap -> stop
             const double tok = static_cast<double>(b) * SEQ_LEN * 1000.0 / ms;
-            curve.emplace_back(b, tok);
-            std::println("  batch={:>4}  ->  {:>8.0f} tok/s  ({:.2f} ms/step)", b, tok, ms);
+            std::println("  batch={:>4}  ->  {:>8.0f} tok/s  ({:.2f} ms/step, {:.2f}s)", b, tok, ms, profile_s);
             std::fflush(stdout);
+            if (knee == 0) { knee = b; prev_tok = tok; continue; }   // first point always accepted
+            if ((tok - prev_tok) / prev_tok < 0.06) break;           // plateau: keep the previous knee
+            knee = b; prev_tok = tok;                                // this batch earned its larger size
         }
-        if (!curve.empty()) {
-            // Knee = the largest batch reached before throughput growth flattens (the next step
-            // gains < 6%): most of the throughput without an unnecessarily large training batch.
-            gpu_batch = curve.front().first;
-            for (std::size_t i = 1; i < curve.size(); ++i) {
-                const double gain = (curve[i].second - curve[i - 1].second) / curve[i - 1].second;
-                if (gain < 0.06) break;
-                gpu_batch = curve[i].first;
-            }
+        if (knee != 0) {
+            gpu_batch = knee;
             std::println("  -> batch knee = {} (throughput plateau; next-step gain < 6%)", gpu_batch);
         }
 #if defined(SUB0_TUNING)
@@ -1055,11 +1130,14 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
             for (int attn = 0; attn <= 1; ++attn) {
                 sub0_cuda_set_tf32(tf32); sub0_cuda_set_attn_bwd(attn);
                 double ms = 0.0;
-                if (sub0_cuda_time_train_step(gpu_batch, SEQ_LEN, 30, &ms) != 0 || ms <= 0.0) continue;
+                const auto t0 = std::chrono::steady_clock::now();
+                const int rc = sub0_cuda_time_train_step(gpu_batch, SEQ_LEN, kBudgetMs, &ms);
+                const double profile_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (rc != 0 || ms <= 0.0) continue;
                 const double tok = static_cast<double>(gpu_batch) * SEQ_LEN * 1000.0 / ms;
                 const bool best = tok > best_tok;
-                std::println("  tf32={}  attn_bwd={:<5}  ->  {:>8.0f} tok/s{}",
-                             tf32, attn ? "query" : "head", tok, best ? "   <- best" : "");
+                std::println("  tf32={}  attn_bwd={:<5}  ->  {:>8.0f} tok/s  ({:.2f}s){}",
+                             tf32, attn ? "query" : "head", tok, profile_s, best ? "   <- best" : "");
                 std::fflush(stdout);
                 if (best) { best_tok = tok; gpu_tf32 = tf32; gpu_attn = attn; }
             }
