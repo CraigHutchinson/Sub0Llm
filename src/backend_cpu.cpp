@@ -660,6 +660,16 @@ void print_config() {
                  USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
                  4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6,
                  FAST_MATH ? "fast" : "exact");
+    // Compute backend + the host GPU detected at configure time (constexpr facts from
+    // sub0_config.hpp). COMPUTE_MODE is the backend actually compiled in; HAS_CUDA flags
+    // that a Phase-2 GPU build is possible on this host.
+    constexpr const char* backend =
+        COMPUTE_MODE == ComputeBackend::Gpu    ? "GPU"    :
+        COMPUTE_MODE == ComputeBackend::Hybrid ? "HYBRID" : "CPU";
+    if constexpr (HAS_CUDA)
+        std::println("compute: {} | CUDA available: sm_{} ({} MB VRAM)", backend, CUDA_ARCH, GPU_VRAM_MB);
+    else
+        std::println("compute: {} | CUDA: none", backend);
 }
 
 bool fast_math() { return FAST_MATH; }

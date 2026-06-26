@@ -292,6 +292,10 @@ int main(int argc, char** argv) {
     int min_merge    = 2;
     int emit_tok     = 1;
     std::string tune_cache;
+    int has_cuda    = 0;   // CUDA toolkit + device detected at configure time
+    int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
+    int gpu_vram_mb = 0;   // GPU VRAM in MB
+    int compute     = 0;   // resolved backend: 0=CPU, 1=GPU, 2=HYBRID
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
        ->required()->check(CLI::ExistingFile);
@@ -313,6 +317,15 @@ int main(int argc, char** argv) {
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
        ->capture_default_str();
+    app.add_option("--has-cuda", has_cuda, "1 = a CUDA toolkit + device was detected at configure time")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--cuda-arch", cuda_arch,
+                   "Detected GPU compute capability as an int (e.g. 120 for sm_120; 0 = none)")
+       ->capture_default_str();
+    app.add_option("--gpu-vram-mb", gpu_vram_mb, "Detected GPU VRAM in MB (0 = none)")
+       ->capture_default_str();
+    app.add_option("--compute", compute, "Resolved compute backend: 0=CPU, 1=GPU, 2=HYBRID")
+       ->capture_default_str()->check(CLI::Range(0, 2));
 
     CLI11_PARSE(app, argc, argv);
 
@@ -788,6 +801,17 @@ int main(int argc, char** argv) {
     os << "constexpr int  MAX_WORKERS               = " << max_workers     << ";\n";
     os << "constexpr int  DEFAULT_THREADS           = " << default_threads << ";\n";
     os << "constexpr int  DEFAULT_WINDOWS_PER_THREAD = " << default_wpt    << ";\n\n";
+    // --- Compute backend (resolved at configure time) ----------------------
+    // The host build detects the CUDA toolkit + device and picks ONE backend; the
+    // engine compiles only that path. HAS_CUDA records availability (so AUTO can flip
+    // to GPU once the device backend lands); COMPUTE_MODE is the backend actually built.
+    os << "// --- Compute backend (resolved at configure time) ----------------------\n";
+    os << "enum class ComputeBackend { Cpu, Gpu, Hybrid };\n";
+    os << "constexpr bool           HAS_CUDA     = " << (has_cuda ? "true" : "false") << ";\n";
+    os << "constexpr ComputeBackend COMPUTE_MODE = ComputeBackend::"
+       << (compute == 1 ? "Gpu" : compute == 2 ? "Hybrid" : "Cpu") << ";\n";
+    os << "constexpr int            CUDA_ARCH    = " << cuda_arch   << ";\n";
+    os << "constexpr int            GPU_VRAM_MB  = " << gpu_vram_mb << ";\n\n";
     emit_path("DEFAULT_CORPUS",     abspath);
     emit_path("DEFAULT_CORPUS_TOK", std::filesystem::absolute(tok_path).string());
     emit_path("DEFAULT_TOKENIZER",  std::filesystem::absolute(tkz_path).string());

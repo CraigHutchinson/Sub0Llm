@@ -173,6 +173,10 @@ add_custom_command(
             --ternary ${SUB0_TERNARY}
             --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
+            --has-cuda ${SUB0_HAS_CUDA}
+            --cuda-arch ${SUB0_CUDA_ARCH}
+            --gpu-vram-mb ${SUB0_GPU_VRAM_MB}
+            --compute ${SUB0_COMPUTE_MODE_INT}
             -o "${GEN_HEADER}"
   DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
   COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
