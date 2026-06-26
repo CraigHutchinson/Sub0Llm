@@ -124,4 +124,14 @@ SUB0_API float*      grad_ptr();           // parameter gradients (filled by bac
 SUB0_API float*      adam_m_ptr();         // Adam first-moment estimates
 SUB0_API float*      adam_v_ptr();         // Adam second-moment estimates
 
+// --- Backend host/device parameter sync -------------------------------------
+// On a device (GPU) backend the live parameters and Adam moments reside in device
+// memory; params_ptr()/adam_*_ptr() then return host staging buffers. These hooks
+// move the trainable state across that boundary around serialization: call
+// sync_params_to_host() before reading the buffers for a save, and
+// sync_params_to_device() after writing them on a load. On the CPU backend the
+// buffers ARE the live copy, so both are no-ops.
+SUB0_API void sync_params_to_host();
+SUB0_API void sync_params_to_device();
+
 }  // namespace sub0

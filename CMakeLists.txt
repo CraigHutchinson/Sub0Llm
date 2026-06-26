@@ -37,51 +37,19 @@ if(SUB0_NATIVE)
   if(SUB0_HAS_MARCH_NATIVE)
     # Release-only: a -march=native Debug build would also be CPU-specific but is
     # not what anyone debugging wants, and the speed only matters for real runs.
-    add_compile_options($<$<CONFIG:Release>:-march=native>)
+    # Scoped to the CXX language so a future CUDA backend's nvcc host compile never
+    # sees this clang-only flag (the super-build isolates toolchains too; this is the
+    # belt-and-suspenders for the single-tree case).
+    add_compile_options($<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-march=native>)
     message(STATUS "SUB0_NATIVE: building for this machine's CPU (-march=native)")
   else()
     message(WARNING "SUB0_NATIVE requested but the compiler rejects -march=native; using a generic build")
   endif()
 endif()
 
-find_package(OpenMP)
-
-# OpenMP drives the data-parallel training path. Without it the engine silently falls
-# back to single-thread stubs and `tune`/`bench` show no scaling at all -- an easily
-# missed regression -- so a missing OpenMP is a hard, explained error by default.
-option(SUB0_REQUIRE_OPENMP "Fail configuration if OpenMP is unavailable (the data-parallel path needs it)" ON)
-
-if(OpenMP_CXX_FOUND)
-  set(SUB0_OPENMP_TARGET OpenMP::OpenMP_CXX)
-  message(STATUS "OpenMP: enabled via find_package (${OpenMP_CXX_FLAGS})")
-else()
-  # find_package's library probe is fragile with clang on Windows: it can fail to
-  # locate libomp even though the compiler fully supports -fopenmp=libomp (which
-  # auto-links the runtime). Probe the flag directly and drive it ourselves if it
-  # works, so a flaky find_package no longer silently disables all parallelism.
-  include(CheckCXXSourceCompiles)
-  set(CMAKE_REQUIRED_FLAGS "-fopenmp=libomp")
-  check_cxx_source_compiles(
-    "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }"
-    SUB0_OPENMP_FLAG_WORKS)
-  unset(CMAKE_REQUIRED_FLAGS)
-  if(SUB0_OPENMP_FLAG_WORKS)
-    add_library(sub0_openmp INTERFACE)
-    target_compile_options(sub0_openmp INTERFACE -fopenmp=libomp)
-    target_link_options(sub0_openmp INTERFACE -fopenmp=libomp)
-    set(SUB0_OPENMP_TARGET sub0_openmp)
-    message(STATUS "OpenMP: find_package failed; using -fopenmp=libomp directly")
-  elseif(SUB0_REQUIRE_OPENMP)
-    message(FATAL_ERROR
-      "OpenMP not found and '-fopenmp=libomp' does not compile.\n"
-      "  The data-parallel training path REQUIRES OpenMP; without it the engine runs\n"
-      "  single-threaded and `tune`/`bench` show no thread scaling (a silent perf\n"
-      "  regression). Install an OpenMP runtime (libomp) for this toolchain and\n"
-      "  reconfigure. To build single-threaded ON PURPOSE, pass -DSUB0_REQUIRE_OPENMP=OFF.")
-  else()
-    message(WARNING "OpenMP unavailable -- building SINGLE-THREADED (SUB0_REQUIRE_OPENMP=OFF).")
-  endif()
-endif()
+# OpenMP detection lives in cmake/OpenMP.cmake and is included on the normal build path
+# below (after the super-build short-circuit), so it sets SUB0_OPENMP_TARGET before
+# sub0_core links it -- without blocking the super-build orchestrator on an OpenMP probe.
 
 # Transcendental math path: fast vectorizable approximations (default) vs the exact
 # std::exp/std::erf path. Compile-time only -- the unused branch is eliminated.
@@ -155,6 +123,23 @@ endif()
 message(STATUS "corpus.tok: SUB0_CORPUS_TOK=${SUB0_CORPUS_TOK} -> emit=${SUB0_CORPUS_TOK_FLAG} "
                "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
 
+# --- Compute-backend selection (CPU / GPU / HYBRID axis) ---------------------
+# Picks SUB0_BACKEND_SOURCES for sub0_core and enforces the backend invariants
+# (e.g. ternary is CPU-only for now). Needs SUB0_TERNARY (set above).
+include(cmake/Backends.cmake)
+
+# --- Multi-compiler super-build orchestrator (opt-in) -----------------------
+# Default OFF -> plain single-tree clang build, artifacts in ${CMAKE_BINARY_DIR} next
+# to the driver. ON -> isolates each backend's toolchain (clang vs nvcc) in its own
+# sub-build; the orchestrator defines the child builds and the top-level returns here.
+include(cmake/SuperBuild.cmake)
+if(SUB0_SUPERBUILD)
+  return()
+endif()
+
+# --- OpenMP (data-parallel training) ----------------------------------------
+include(cmake/OpenMP.cmake)
+
 # --- Stage 1: the configurator (host tool, depends on nothing generated) -----
 add_executable(sub0-configure tools/configurator.cpp)
 target_include_directories(sub0-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
@@ -194,7 +179,11 @@ add_custom_command(
 add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
 
 # --- Stage 3: engine core (shared), compiled against the generated header ----
-add_library(sub0_core SHARED src/engine.cpp)
+# Two translation units, one shared library: engine_core.cpp is the backend-agnostic
+# part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
+# CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
+# replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
+add_library(sub0_core SHARED src/engine_core.cpp ${SUB0_BACKEND_SOURCES})
 add_dependencies(sub0_core sub0_generate_config)
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so

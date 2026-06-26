@@ -294,6 +294,7 @@ void save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     for (double e : rs.evals) wr(os, e);
 
     const auto bytes = static_cast<std::streamsize>(nfloat * sizeof(float));
+    sub0::sync_params_to_host();   // device backends: stage live params/moments into the *_ptr() buffers
     os.write(reinterpret_cast<const char*>(sub0::params_ptr()), bytes);
     os.write(reinterpret_cast<const char*>(sub0::adam_m_ptr()), bytes);
     os.write(reinterpret_cast<const char*>(sub0::adam_v_ptr()), bytes);
@@ -346,6 +347,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     is.read(reinterpret_cast<char*>(sub0::adam_m_ptr()), bytes);
     is.read(reinterpret_cast<char*>(sub0::adam_v_ptr()), bytes);
     if (!is) { std::println(stderr, "train: checkpoint '{}' truncated -- starting fresh", path); return false; }
+    sub0::sync_params_to_device();   // device backends: push loaded params/moments to the live copy
     return true;
 }
 
