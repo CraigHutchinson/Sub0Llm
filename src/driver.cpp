@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     constexpr int   LR_BASE_BATCH = 8;
     constexpr float LR_BASE       = 0.001f;
     std::string train_model, train_corpus{DEFAULT_CORPUS};
-    int   train_steps = 0, train_batch = DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD;
+    int   train_steps = 0, train_batch = 0;     // 0 = auto (resolved from the baked defaults below)
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
     auto* train = app.add_subcommand("train",
@@ -53,8 +53,8 @@ int main(int argc, char** argv) {
     train->add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
     train->add_option("--steps", train_steps,
                       "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
-    train->add_option("--batch", train_batch, "Minibatch size (default: tuned data-parallel width)")
-         ->capture_default_str();
+    train->add_option("--batch", train_batch,
+                      "Minibatch size (0 = auto: tuned GPU batch on a CUDA build, else CPU data-parallel width)");
     auto* train_lr_opt =
         train->add_option("--lr", train_lr, "Learning rate (default: 0.001 scaled by sqrt(batch/8))")
              ->capture_default_str();
@@ -121,7 +121,9 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     if (*train) {
-        if (train_lr_opt->count() == 0 && train_batch > 0)   // couple lr to batch unless pinned
+        if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
+            train_batch = HAS_CUDA ? DEFAULT_GPU_BATCH : (DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD);
+        if (train_lr_opt->count() == 0)   // couple lr to batch unless pinned (sqrt rule for Adam)
             train_lr = LR_BASE * std::sqrt(static_cast<float>(train_batch) / LR_BASE_BATCH);
         return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                                 train_steps, train_batch, train_lr, train_seed);

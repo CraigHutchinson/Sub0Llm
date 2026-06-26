@@ -98,13 +98,11 @@ cublasHandle_t g_cublas = nullptr;
 using CudaTf32 = sub0::Knob<bool, CUDA_TF32>;
 
 // Attention-backward strategy as a workload knob (per-query vs per-head, see the two kernels
-// below). MEASURED 2026-06 on sm_120: per-head wins at the default batch 384 (~178k vs ~162k
-// tok/s, no atomic contention) but per-query wins massively at small batch (3.4x at batch 32,
-// where head-per-thread starves the device). Default = per-head (false), tuned for the batch-384
-// default. Runtime-mutable under SUB0_TUNING for the GPU autotuner. TODO(gpu-autotune): bake this
-// from the tune cache via the configurator (like CUDA_TF32) once the GPU autotune stage exists.
-constexpr bool ATTN_BWD_PER_QUERY_DEFAULT = false;
-using AttnBwdPerQuery = sub0::Knob<bool, ATTN_BWD_PER_QUERY_DEFAULT>;
+// below). MEASURED 2026-06 on sm_120: per-head wins at large batch (no atomic contention) but
+// per-query wins massively at small batch (3.4x at batch 32). The baked default is the configured
+// ATTN_BWD_PER_QUERY (emitted by the configurator from the tune cache, like CUDA_TF32); runtime-
+// mutable under SUB0_TUNING for the GPU autotuner via sub0_cuda_set_attn_bwd.
+using AttnBwdPerQuery = sub0::Knob<bool, ATTN_BWD_PER_QUERY>;
 
 // Dedicated stream for all device work so the forward can be captured into a CUDA graph
 // (capturing the legacy default stream is disallowed). Plus the captured executable graph and
@@ -637,21 +635,18 @@ inline void launch_attn_bwd(const float* qkv, const float* P, const float* dout,
     }
 }
 
-// Max minibatch the resident forward scratch is sized for: the CPU's tuned data-parallel
-// width, so the GPU forward covers the same batch training uses. A forward requesting more
-// windows than this is rejected.
-// MEASURED 2026-06 on sm_120 (train step, tok/s): batch 64 -> 62k, 128 -> 105k, 256 -> 157k,
-// 384 -> 176k, 512 -> 191k, 768 -> 195k, 1024 -> 209k. Throughput SATURATES past ~512 (384->1024
-// is only +17% while the batch -- a training hyperparameter -- grows 2.7x), so raising this cap
-// has limited value; the per-step fixed overhead dominating small batches is the better target.
-// TODO(gpu-autotune): expose this as a GPU batch knob + size the scratch to the actual batch
-// (instead of always the max) so larger batches don't over-allocate VRAM at small batch.
-constexpr int MAX_FWD_BATCH =
-    DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD > 0 ? DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD : 8;
+// Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's
+// data-parallel width: the GPU wants a larger batch (bigger GEMM M = better utilization). The
+// scratch is sized to the ACTUAL batch requested (grow-on-demand, see fwd_alloc/train_alloc), so a
+// small-batch run does not over-allocate; this is just the ceiling a request is validated against.
+// MEASURED 2026-06 on sm_120 (train tok/s): 64->62k 128->105k 256->157k 384->176k 512->191k
+// 768->195k 1024->209k -- throughput keeps rising but with diminishing returns past ~512. cudaMalloc
+// failure (too big for VRAM) is handled gracefully (the alloc returns nonzero, the caller errors).
+constexpr int MAX_FWD_BATCH = 1024;
 
-// Resident forward scratch: allocated once for the full M = MAX_FWD_BATCH * SEQ_LEN row
-// count and reused by every sub0_cuda_forward, so the hot path has no per-call cudaMalloc
-// churn. Freed by sub0_cuda_shutdown.
+// Resident forward scratch. The batch-dependent buffers are sized to the largest batch seen so far
+// (g_fwd_cap, grown on demand); the fused-QKV weight buffers (wqkv) are batch-independent and built
+// once at upload. Freed by sub0_cuda_shutdown.
 struct FwdScratch {
     int*   dids   = nullptr;
     float* h      = nullptr;
@@ -665,14 +660,37 @@ struct FwdScratch {
     float* ff2    = nullptr;
     float* logits = nullptr;
     float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, 3C], built once at upload
-    bool   inited = false;
 };
 FwdScratch g_fwd;
+int        g_fwd_cap = 0;              // batch the batch-dependent forward buffers are sized for
 
-int fwd_alloc() {
-    if (g_fwd.inited) return 0;
-    ensure_stream();                                  // device work + graph capture run on g_stream
-    const size_t Mm = static_cast<size_t>(MAX_FWD_BATCH) * SEQ_LEN;
+// Batch-independent fused-QKV weight buffers (built at upload). Kept across batch grows.
+int wqkv_alloc() {
+    if (g_fwd.wqkv[0]) return 0;
+    ensure_stream();
+    for (int l = 0; l < N_LAYERS; ++l)
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+    return 0;
+}
+
+// Free only the batch-dependent forward buffers (for a grow-realloc); leaves wqkv intact.
+void invalidate_graph();           // fwd: a grow-realloc frees buffers the captured graph references
+void fwd_free_batch() {
+    invalidate_graph();            // the captured forward graph references these buffers -> drop it
+    cudaFree(g_fwd.dids); cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
+    cudaFree(g_fwd.att);  cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
+    cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
+    g_fwd.dids = nullptr; g_fwd.h = g_fwd.a = g_fwd.qkv = g_fwd.att = g_fwd.proj = g_fwd.fbuf =
+        g_fwd.ff1 = g_fwd.gact = g_fwd.ff2 = g_fwd.logits = nullptr;
+    g_fwd_cap = 0;
+}
+
+// Ensure the forward scratch covers `batch` (grow-on-demand) plus the wqkv buffers.
+int fwd_alloc(int batch) {
+    if (wqkv_alloc()) return 1;
+    if (g_fwd_cap >= batch && g_fwd.dids) return 0;        // already big enough
+    fwd_free_batch();                                      // grow: drop the old (smaller) buffers
+    const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
@@ -685,18 +703,13 @@ int fwd_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
-    for (int l = 0; l < N_LAYERS; ++l)
-        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
-    g_fwd.inited = true;
+    g_fwd_cap = batch;
     return 0;
 }
 
 void fwd_free() {
-    cudaFree(g_fwd.dids);  cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
-    cudaFree(g_fwd.att);   cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
-    cudaFree(g_fwd.gact);  cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
-    for (int l = 0; l < N_LAYERS; ++l) cudaFree(g_fwd.wqkv[l]);
-    g_fwd = FwdScratch{};
+    fwd_free_batch();
+    for (int l = 0; l < N_LAYERS; ++l) { cudaFree(g_fwd.wqkv[l]); g_fwd.wqkv[l] = nullptr; }
 }
 
 // Resident TRAINING scratch (Phase 2d): the forward saves every activation the backward needs
@@ -732,16 +745,18 @@ struct TrainScratch {
     float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
     int*   dtargets = nullptr;     // [M] next-token targets for cross-entropy
-    bool   inited  = false;
 };
 TrainScratch g_tr;
+int          g_tr_cap = 0;         // batch the training buffers are sized for
 
-int train_alloc() {
-    if (g_tr.inited) return 0;
+void train_free();                 // fwd: train_alloc frees the old buffers before a grow-realloc
+int train_alloc(int batch) {
+    if (g_tr_cap >= batch && g_tr.h_in[0]) return 0;       // already big enough
+    if (g_tr.h_in[0]) train_free();                        // grow: drop the old (smaller) buffers
     ensure_stream();
-    const size_t Mm = static_cast<size_t>(MAX_FWD_BATCH) * SEQ_LEN;
+    const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
-    const size_t PB = static_cast<size_t>(MAX_FWD_BATCH) * N_HEADS * SEQ_LEN * SEQ_LEN;
+    const size_t PB = static_cast<size_t>(batch) * N_HEADS * SEQ_LEN * SEQ_LEN;
     for (int l = 0; l < N_LAYERS; ++l) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[l],  MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv1[l], Mm * sizeof(float)));
@@ -770,7 +785,7 @@ int train_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
-    g_tr.inited = true;
+    g_tr_cap = batch;
     return 0;
 }
 
@@ -785,6 +800,7 @@ void train_free() {
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); cudaFree(g_tr.dlogits);
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets);
     g_tr = TrainScratch{};
+    g_tr_cap = 0;
 }
 
 
@@ -1149,7 +1165,7 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
 
 SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
     if (!g_dev_params) { const int r = sub0_cuda_init(); if (r) return r; }
-    if (fwd_alloc()) return 1;                   // ensure the fused-QKV weight buffers exist
+    if (wqkv_alloc()) return 1;                  // ensure the fused-QKV weight buffers exist
     SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_params, host, sub0::PARAM_FLOATS * sizeof(float),
                                     cudaMemcpyHostToDevice, g_stream));
     build_qkv_weights();                         // rebuild the fused [Wq|Wk|Wv] from the new weights
@@ -1236,7 +1252,7 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
-    if (fwd_alloc()) return 1;
+    if (fwd_alloc(batch)) return 1;
     ensure_cublas();
     if (capture_graph(batch, T)) return 1;       // capture once per shape (replay thereafter)
     const int M = batch * T;
@@ -1258,7 +1274,7 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
 static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, double* out_loss) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
-    if (fwd_alloc() || train_alloc() || opt_alloc()) return 1;
+    if (fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
     ensure_cublas();
     set_handle_tf32(CudaTf32::get());            // training uses the baked math mode
     const int M = batch * T;
@@ -1333,7 +1349,7 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
     if (sub0_cuda_init()) return 1;
-    if (fwd_alloc()) return 1;
+    if (fwd_alloc(batch)) return 1;
     const int M = batch * T;
     cudaMemset(g_fwd.dids, 0, static_cast<size_t>(M) * sizeof(int));   // ids = token 0
 
@@ -1378,7 +1394,7 @@ static int time_train_step(int batch, int T, int iters, double* out_ms) {
     if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
-    if (sub0_cuda_init() || fwd_alloc() || train_alloc() || opt_alloc()) return 1;
+    if (sub0_cuda_init() || fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
     ensure_cublas();
     set_handle_tf32(CudaTf32::get());
     const int M = batch * T;

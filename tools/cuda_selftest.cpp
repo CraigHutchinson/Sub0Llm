@@ -18,7 +18,7 @@ int main() {
     sub0_cuda_benchmark(1, 64, 2000);    // generation-scale (small M): expect launch-bound -> graph wins
     // Training-step throughput vs batch (the dimension knob): tok/s should climb with batch until
     // the GEMMs saturate the device -- the curve the GPU autotuner will use to pick the batch.
-    for (int b : {32, 64, 128, 256, 384})
-        sub0_cuda_train_benchmark(b, 64, 50, nullptr);
+    for (int b : {64, 128, 256, 384, 512, 768, 1024})
+        sub0_cuda_train_benchmark(b, 64, 40, nullptr);
     return 0;
 }
