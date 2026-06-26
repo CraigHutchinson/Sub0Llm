@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.20)
-project(sub0llm CXX)
+cmake_minimum_required(VERSION 3.28...4.2)
+project(sub0llm VERSION 0.1.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # sub0llm is a staged build. The model's dimensions and vocabulary are compiled
@@ -21,6 +21,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+# Emit compile_commands.json for clangd / editor tooling (harmless for Ninja/Makefiles).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()

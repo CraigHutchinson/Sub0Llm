@@ -19,11 +19,12 @@ else()
   # auto-links the runtime). Probe the flag directly and drive it ourselves if it
   # works, so a flaky find_package no longer silently disables all parallelism.
   include(CheckCXXSourceCompiles)
-  set(CMAKE_REQUIRED_FLAGS "-fopenmp=libomp")
-  check_cxx_source_compiles(
-    "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }"
-    SUB0_OPENMP_FLAG_WORKS)
-  unset(CMAKE_REQUIRED_FLAGS)
+  block()
+    set(CMAKE_REQUIRED_FLAGS "-fopenmp=libomp")   # scoped to this block, never leaks
+    check_cxx_source_compiles(
+      "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }"
+      SUB0_OPENMP_FLAG_WORKS)
+  endblock()
   if(SUB0_OPENMP_FLAG_WORKS)
     add_library(sub0_openmp INTERFACE)
     target_compile_options(sub0_openmp INTERFACE -fopenmp=libomp)
