@@ -142,13 +142,12 @@ endif()
 # --- OpenMP (data-parallel training) ----------------------------------------
 include(cmake/OpenMP.cmake)
 
-# --- Optional CUDA backend build (Phase 2 skeleton) -------------------------
-# Opt-in: builds src/backend_cuda.cu with nvcc (sm_${SUB0_CUDA_ARCH}) into a shared lib
-# plus a self-test exe, proving the multi-compiler pipeline (clang C++ + nvcc .cu). The
-# CPU engine is unaffected -- this is the build-integration step before the GPU backend
-# implements the engine API. enable_language(CUDA) is called here so nvcc is set up
-# before the targets below; the actual targets are defined next to sub0_core.
-option(SUB0_BUILD_CUDA "Build the CUDA backend skeleton + self-test (needs nvcc + a CUDA device)" OFF)
+# --- Optional CUDA device-training backend ----------------------------------
+# SUB0_BUILD_CUDA is DERIVED from SUB0_COMPUTE in cmake/Backends.cmake (GPU/AUTO-with-device
+# -> ON), so SUB0_COMPUTE is the single user-facing switch. When ON, builds src/backend_cuda.cu
+# with nvcc (sm_${SUB0_CUDA_ARCH}) into a shared lib + self-test, and links it into the train
+# stage for the device training fast-path. enable_language(CUDA) is called here so nvcc is set
+# up before the targets below; the actual targets are defined next to sub0_core.
 if(SUB0_BUILD_CUDA)
   if(NOT SUB0_HAS_CUDA)
     message(FATAL_ERROR "SUB0_BUILD_CUDA=ON but no CUDA toolkit/device was detected at configure time.")

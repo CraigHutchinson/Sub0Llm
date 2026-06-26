@@ -5,19 +5,25 @@
 # switch for the pure cases, so every dead path is eliminated and every optimization
 # pathway stays open. SUB0_COMPUTE picks the target:
 #
-#   CPU    - scalar + OpenMP backend (src/backend_cpu.cpp)   [default, always built]
-#   GPU    - CUDA backend (src/backend_cuda.cu, nvcc)        [Phase 2 -- not yet]
-#   HYBRID - CPU + CUDA, autotuned split                     [Phase 3 -- not yet]
-#   AUTO   - resolve the best available at configure time    [Phase 1: -> CPU/GPU]
+#   CPU    - scalar + OpenMP backend (src/backend_cpu.cpp)         [always the engine]
+#   GPU    - CPU engine + CUDA device TRAINING (src/backend_cuda.cu, nvcc)
+#   HYBRID - CPU + CUDA, autotuned split                           [Phase 3 -- not yet]
+#   AUTO   - resolve the best available at configure time (-> GPU if a CUDA device is
+#            present, else CPU)                                    [default]
+#
+# The CPU backend is ALWAYS the engine (the sub0:: API: forward / generation / sampling
+# / eval); it is the baseline and the GPU's numerical-parity reference. GPU mode keeps
+# that CPU engine and ADDITIONALLY builds the CUDA backend so the training loop runs on
+# the device (the train-stage fast-path) -- generation/eval stay on the CPU engine until
+# a full GPU engine lands (Phase 3 / HYBRID). So SUB0_COMPUTE drives whether the CUDA
+# backend is built (SUB0_BUILD_CUDA, derived below), not which engine sub0_core compiles.
 #
 # Outputs (consumed by the top-level build):
 #   SUB0_COMPUTE_RESOLVED - the concrete mode after AUTO resolution
-#   SUB0_BACKEND_SOURCES  - the compute-backend translation unit(s) for sub0_core
-#
-# The CPU backend is ALWAYS compiled: it is the baseline and the numerical parity
-# reference the GPU backend is validated against.
+#   SUB0_BACKEND_SOURCES  - the engine translation unit(s) for sub0_core (always CPU)
+#   SUB0_BUILD_CUDA       - whether to build the CUDA device-training backend (derived)
 
-set(SUB0_COMPUTE "CPU" CACHE STRING "Compute backend: AUTO / CPU / GPU / HYBRID")
+set(SUB0_COMPUTE "AUTO" CACHE STRING "Compute backend: AUTO / CPU / GPU / HYBRID")
 set_property(CACHE SUB0_COMPUTE PROPERTY STRINGS AUTO CPU GPU HYBRID)
 
 # Performance-knob expression (see include/sub0/knob.hpp). SUB0_TUNING ON builds knobs as
@@ -76,22 +82,36 @@ else()
   message(STATUS "CUDA: no toolkit found -- CPU-only host")
 endif()
 
-# AUTO resolves to the best AVAILABLE backend. Until the GPU backend lands (Phase 2)
-# there is nothing to resolve to but CPU, even when a CUDA device is present; HAS_CUDA
-# is still baked so a Phase-2 build can flip AUTO -> GPU.
+# AUTO resolves to the best AVAILABLE backend: GPU when a CUDA device was detected at
+# configure time, else CPU.
 set(SUB0_COMPUTE_RESOLVED "${SUB0_COMPUTE}")
 if(SUB0_COMPUTE STREQUAL "AUTO")
-  set(SUB0_COMPUTE_RESOLVED "CPU")
+  if(SUB0_HAS_CUDA)
+    set(SUB0_COMPUTE_RESOLVED "GPU")
+  else()
+    set(SUB0_COMPUTE_RESOLVED "CPU")
+  endif()
 endif()
 
+# The engine sub0_core compiles is ALWAYS the CPU backend (the sub0:: API + parity reference).
+# GPU mode additionally builds the CUDA device-training backend; SUB0_BUILD_CUDA is DERIVED from
+# the resolved mode (it is not an independent toggle), so SUB0_COMPUTE is the single switch.
 set(SUB0_BACKEND_SOURCES src/backend_cpu.cpp)
 
 if(SUB0_COMPUTE_RESOLVED STREQUAL "CPU")
-  # baseline only
-elseif(SUB0_COMPUTE_RESOLVED STREQUAL "GPU" OR SUB0_COMPUTE_RESOLVED STREQUAL "HYBRID")
+  set(SUB0_BUILD_CUDA OFF CACHE BOOL "Build the CUDA device-training backend (derived from SUB0_COMPUTE)" FORCE)
+elseif(SUB0_COMPUTE_RESOLVED STREQUAL "GPU")
+  if(NOT SUB0_HAS_CUDA)
+    message(FATAL_ERROR
+      "SUB0_COMPUTE=GPU but no CUDA toolkit/device was detected at configure time. Install the "
+      "CUDA toolkit and ensure a device is visible (nvidia-smi), or build with -DSUB0_COMPUTE=CPU "
+      "(or AUTO, which falls back to CPU when no device is present).")
+  endif()
+  set(SUB0_BUILD_CUDA ON CACHE BOOL "Build the CUDA device-training backend (derived from SUB0_COMPUTE)" FORCE)
+elseif(SUB0_COMPUTE_RESOLVED STREQUAL "HYBRID")
   message(FATAL_ERROR
-    "SUB0_COMPUTE=${SUB0_COMPUTE} selects a GPU backend, which is not implemented yet "
-    "(Phase 2: src/backend_cuda.cu via nvcc). Build with -DSUB0_COMPUTE=CPU for now.")
+    "SUB0_COMPUTE=HYBRID (an autotuned CPU/GPU split) is not implemented yet (Phase 3). Use "
+    "-DSUB0_COMPUTE=GPU for device training, or -DSUB0_COMPUTE=CPU.")
 else()
   message(FATAL_ERROR "SUB0_COMPUTE='${SUB0_COMPUTE}' is invalid (choose AUTO / CPU / GPU / HYBRID).")
 endif()
@@ -108,7 +128,10 @@ if(SUB0_TERNARY AND NOT SUB0_COMPUTE_RESOLVED STREQUAL "CPU")
 endif()
 
 message(STATUS "compute backend: SUB0_COMPUTE=${SUB0_COMPUTE} -> ${SUB0_COMPUTE_RESOLVED} "
-               "(sources: ${SUB0_BACKEND_SOURCES})")
+               "(engine: ${SUB0_BACKEND_SOURCES})")
+if(SUB0_COMPUTE_RESOLVED STREQUAL "GPU")
+  message(STATUS "  GPU mode: training runs on the device (CUDA); generation/eval on the CPU engine")
+endif()
 
 # Integer encoding of the resolved backend for the configurator (--compute): 0/1/2.
 if(SUB0_COMPUTE_RESOLVED STREQUAL "GPU")
