@@ -56,6 +56,27 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
     if (i < n) y[i] = a * x[i] + y[i];
 }
 
+// Device parameter mirror: the model's flat weight blob (PARAM_FLOATS floats) lives here
+// during a GPU run. The host params_ptr()/checkpoint buffers sync to/from it via the
+// upload/download entry points below (the device half of the sync_params hooks).
+float* g_dev_params = nullptr;
+
+// Dense linear: Y[T,out] = X[T,in] . W[in,out] (+ bias[out]). Matches op_linear's dense
+// (non-ternary) path -- one thread per (t,o) output element, summing over `in` in the same
+// order as the CPU. The building block of every projection and the lm_head; the batched
+// cuBLASLt form arrives in 2c, this naive kernel is the parity baseline.
+__global__ void linear_kernel(const float* __restrict__ X, const float* __restrict__ W,
+                              const float* __restrict__ bias, float* __restrict__ Y,
+                              int T, int in, int out) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y * blockDim.y + threadIdx.y;
+    if (t < T && o < out) {
+        float acc = bias ? bias[o] : 0.0f;
+        for (int p = 0; p < in; ++p) acc += X[t * in + p] * W[p * out + o];
+        Y[t * out + o] = acc;
+    }
+}
+
 }  // namespace
 
 // Self-test: confirm the toolchain built device code for THIS GPU and that H2D, kernel
@@ -102,5 +123,76 @@ SUB0_CUDA_API int sub0_cuda_selftest() {
         return 2;
     }
     std::printf("cuda selftest: OK (%d elements, y = 3*x + y == 5)\n", n);
+    return 0;
+}
+
+// ============================================================================
+//  Device parameter mirror (the device half of the sync_params hooks)
+// ============================================================================
+// Phase 2b: allocate the device weight blob and move it host<->device. When this file
+// becomes the active backend these back sync_params_to_device/host directly; for now the
+// parity tests drive them. Idempotent init; upload auto-inits.
+
+SUB0_CUDA_API int sub0_cuda_init() {
+    if (g_dev_params) return 0;
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_params, sub0::PARAM_FLOATS * sizeof(float)));
+    return 0;
+}
+
+SUB0_CUDA_API void sub0_cuda_shutdown() {
+    if (g_dev_params) cudaFree(g_dev_params);
+    g_dev_params = nullptr;
+}
+
+SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
+    if (!g_dev_params) { const int r = sub0_cuda_init(); if (r) return r; }
+    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_params, host, sub0::PARAM_FLOATS * sizeof(float),
+                               cudaMemcpyHostToDevice));
+    return 0;
+}
+
+SUB0_CUDA_API int sub0_cuda_download_params(float* host) {
+    if (!g_dev_params) return 1;
+    SUB0_CUDA_CHECK(cudaMemcpy(host, g_dev_params, sub0::PARAM_FLOATS * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+// ============================================================================
+//  Dense linear (parity building block)
+// ============================================================================
+// Y[T,out] = X[T,in] . W[in,out] (+ bias). Takes host pointers, runs on the device and
+// returns the result -- a self-contained kernel the CPU-parity test drives. Per-call
+// device allocations are fine for the test harness; the real forward keeps them resident.
+SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
+                                   const float* W, const float* bias, float* Y) {
+    const size_t xb = static_cast<size_t>(T) * in * sizeof(float);
+    const size_t wb = static_cast<size_t>(in) * out * sizeof(float);
+    const size_t yb = static_cast<size_t>(T) * out * sizeof(float);
+    const size_t bb = static_cast<size_t>(out) * sizeof(float);
+
+    float* dX = nullptr;
+    float* dW = nullptr;
+    float* dY = nullptr;
+    float* dB = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dX, xb));
+    SUB0_CUDA_CHECK(cudaMalloc(&dW, wb));
+    SUB0_CUDA_CHECK(cudaMalloc(&dY, yb));
+    if (bias) SUB0_CUDA_CHECK(cudaMalloc(&dB, bb));
+    SUB0_CUDA_CHECK(cudaMemcpy(dX, X, xb, cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dW, W, wb, cudaMemcpyHostToDevice));
+    if (bias) SUB0_CUDA_CHECK(cudaMemcpy(dB, bias, bb, cudaMemcpyHostToDevice));
+
+    const dim3 block(16, 16);
+    const dim3 grid((out + block.x - 1) / block.x, (T + block.y - 1) / block.y);
+    linear_kernel<<<grid, block>>>(dX, dW, dB, dY, T, in, out);
+    SUB0_CUDA_CHECK(cudaGetLastError());
+    SUB0_CUDA_CHECK(cudaDeviceSynchronize());
+
+    SUB0_CUDA_CHECK(cudaMemcpy(Y, dY, yb, cudaMemcpyDeviceToHost));
+    cudaFree(dX);
+    cudaFree(dW);
+    cudaFree(dY);
+    if (dB) cudaFree(dB);
     return 0;
 }
