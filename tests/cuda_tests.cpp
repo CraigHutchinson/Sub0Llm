@@ -23,6 +23,9 @@ extern "C" int  sub0_cuda_linear(const float* X, int T, int in, int out,
                                  const float* W, const float* bias, float* Y);
 extern "C" int  sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits);
 extern "C" void sub0_cuda_set_tf32(int on);
+extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
+                                   float* out_grad, double* out_loss);
+extern "C" int  sub0_cuda_adam_step(float lr, long t);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -147,6 +150,102 @@ TEST_CASE("CUDA TF32 forward stays close to the CPU logits", "[cuda]") {
     INFO("max abs logit diff (TF32) = " << max_abs);
     REQUIRE(max_abs < 5e-2);          // TF32 trades mantissa bits: looser but still bounded
     sub0_cuda_set_tf32(0);            // restore FP32 for any later tests
+    sub0_cuda_shutdown();
+}
+
+// Build a contiguous random token stream and the matching per-window starts so the CPU
+// train_batch and the GPU backward see the identical (ids, targets) over batch*T rows.
+static void make_windows(int batch, int T, unsigned seed, std::vector<int>& data,
+                         std::vector<std::size_t>& starts, std::vector<int>& ids,
+                         std::vector<int>& targets) {
+    const int M = batch * T;
+    data.resize(static_cast<std::size_t>(M) + 1);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int& x : data) x = tok(rng);
+    starts.resize(batch);
+    for (int b = 0; b < batch; ++b) starts[b] = static_cast<std::size_t>(b) * T;
+    ids.assign(data.begin(), data.begin() + M);            // window b inputs  = data[b*T + t]
+    targets.assign(data.begin() + 1, data.begin() + M + 1);// window b targets = data[b*T + t + 1]
+}
+
+TEST_CASE("CUDA backward matches the CPU reduced gradient", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);                                  // full FP32 for a tight parity gate
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 55, data, starts, ids, targets);
+
+    // CPU reference: the reduced gradient the optimizer consumes after a minibatch.
+    sub0::train_batch(data.data(), starts.data(), batch, T);
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    std::vector<float> gpu_grad(n, 0.0f);
+    double loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss) == 0);
+
+    // Relative L2 over the whole gradient: the GPU's CUDA fast-math differs from the CPU's at
+    // ~1e-6 per op and those differences accumulate through the reverse pass, so compare norms.
+    double num = 0.0, den = 0.0, maxabs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+        num += d * d;
+        den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+        maxabs = std::max(maxabs, std::fabs(d));
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    INFO("grad rel-L2 = " << rel << "  max abs = " << maxabs << "  loss = " << loss);
+    REQUIRE(rel < 1e-2);
+    sub0_cuda_shutdown();
+}
+
+TEST_CASE("CUDA AdamW step matches the CPU optimizer update", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 66, data, starts, ids, targets);
+
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> p0(sub0::params_ptr(), sub0::params_ptr() + n);   // shared start point
+
+    // CPU: one AdamW step from zeroed moments. Capture the parameter delta it produces.
+    std::fill(sub0::adam_m_ptr(), sub0::adam_m_ptr() + n, 0.0f);
+    std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.0f);
+    sub0::train_batch(data.data(), starts.data(), batch, T);
+    sub0::AdamW opt(0.001f);
+    opt.step();
+    const std::vector<float> p_cpu(sub0::params_ptr(), sub0::params_ptr() + n);
+
+    // GPU: backward (fills the device grad, zeroes moments) then one AdamW step at t=1.
+    std::vector<float> tmp(n);
+    double loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 1) == 0);
+    std::vector<float> p_gpu(n);
+    REQUIRE(sub0_cuda_download_params(p_gpu.data()) == 0);
+
+    // Compare the UPDATE deltas (p - p0): the parameters are dominated by p0, so comparing the
+    // small steps is the meaningful gate (otherwise grad differences would be masked).
+    double num = 0.0, den = 0.0, maxabs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double dc = static_cast<double>(p_cpu[i]) - p0[i];
+        const double dg = static_cast<double>(p_gpu[i]) - p0[i];
+        const double d  = dg - dc;
+        num += d * d;
+        den += dc * dc;
+        maxabs = std::max(maxabs, std::fabs(d));
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    INFO("param-delta rel-L2 = " << rel << "  max abs = " << maxabs);
+    REQUIRE(rel < 2e-2);
     sub0_cuda_shutdown();
 }
 
