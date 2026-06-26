@@ -75,6 +75,14 @@ cublasHandle_t g_cublas = nullptr;
 // baked value.
 using CudaTf32 = sub0::Knob<bool, CUDA_TF32>;
 
+// Dedicated stream for all device work so the forward can be captured into a CUDA graph
+// (capturing the legacy default stream is disallowed). Plus the captured executable graph and
+// the (batch,T) it was captured for -- recaptured when the shape or the GEMM math mode changes.
+cudaStream_t    g_stream      = nullptr;
+cudaGraphExec_t g_graph_exec  = nullptr;
+int             g_graph_batch = -1;
+int             g_graph_T     = -1;
+
 // Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
 // (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
 __global__ void bias_add_kernel(float* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
@@ -176,14 +184,27 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
+inline void ensure_stream() { if (!g_stream) cudaStreamCreate(&g_stream); }
+
+// Invalidate the captured CUDA graph (defined below) -- a changed forward shape or GEMM math
+// mode makes it stale, so it must be recaptured.
+void invalidate_graph();
+
 // Set the cuBLAS handle's math mode directly -- used to compare modes in the benchmark and to
-// force a mode in the parity tests, independent of the baked knob.
+// force a mode in the parity tests, independent of the baked knob. The mode is baked into a
+// captured graph's algo, so changing it invalidates the graph.
 inline void set_handle_tf32(bool on) {
     if (g_cublas) cublasSetMathMode(g_cublas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+    invalidate_graph();
 }
 inline void apply_math_mode() { set_handle_tf32(CudaTf32::get()); }   // production default = baked knob
 inline void ensure_cublas() {
-    if (!g_cublas) { cublasCreate(&g_cublas); apply_math_mode(); }
+    if (!g_cublas) {
+        cublasCreate(&g_cublas);
+        ensure_stream();
+        cublasSetStream(g_cublas, g_stream);   // all GEMMs on the capture stream
+        apply_math_mode();
+    }
 }
 // Y[M,out] = X[M,in] . W[in,out] (+ bias) via cuBLAS. cublasSgemm is column-major, so we
 // compute the column-major Y^T = W^T . X^T -- which, read back row-major, IS Y = X . W:
@@ -198,26 +219,26 @@ inline void launch_linear(const float* dX, const float* dW, const float* dB, flo
                 &alpha, dW, out, dX, in, &beta, dY, out);
     if (dB) {
         const int n = M * out, block = 256;
-        bias_add_kernel<<<(n + block - 1) / block, block>>>(dY, dB, M, out);
+        bias_add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, out);
     }
 }
 inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T, int C) {
     const int block = 64;
-    rmsnorm_kernel<<<(T + block - 1) / block, block>>>(dX, dG, dY, T, C);
+    rmsnorm_kernel<<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, T, C);
 }
 inline void launch_gelu(const float* dX, float* dY, int n) {
     const int block = 256;
-    gelu_kernel<<<(n + block - 1) / block, block>>>(dX, dY, n);
+    gelu_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dX, dY, n);
 }
 inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     const int block = 256;
-    add_kernel<<<(n + block - 1) / block, block>>>(dA, dB, dC, n);
+    add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
                         int batch, int T, int C, int H) {
     const int block = 64;
     const int total = batch * H * T;
-    attn_kernel<<<(total + block - 1) / block, block>>>(dQ, dK, dV, dOut, batch, T, C, H);
+    attn_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H);
 }
 
 // Max minibatch the resident forward scratch is sized for: the CPU's tuned data-parallel
@@ -249,6 +270,7 @@ FwdScratch g_fwd;
 
 int fwd_alloc() {
     if (g_fwd.inited) return 0;
+    ensure_stream();                                  // device work + graph capture run on g_stream
     const size_t Mm = static_cast<size_t>(MAX_FWD_BATCH) * SEQ_LEN;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
@@ -309,7 +331,7 @@ void forward_device(int batch, int T) {
     {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-        embed_add_kernel<<<grid, block>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
+        embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -339,6 +361,35 @@ void forward_device(int batch, int T) {
     }
     launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
     launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V);  // logits = a . lm_head + lm_bias
+}
+
+// Drop any captured graph (shape or math-mode change -> recapture on the next forward).
+void invalidate_graph() {
+    if (g_graph_exec) { cudaGraphExecDestroy(g_graph_exec); g_graph_exec = nullptr; }
+    g_graph_batch = -1;
+    g_graph_T     = -1;
+}
+
+// Capture forward_device(batch,T) into an executable CUDA graph (once per shape + math mode),
+// collapsing the ~100 per-forward kernel launches into a single graph launch. The stream must
+// be idle when called (callers streamSync between forwards). A warmup pass first lets cuBLAS do
+// any lazy allocation OUTSIDE capture (cudaMalloc during capture is illegal). Returns 0 on ok.
+int capture_graph(int batch, int T) {
+    if (g_graph_exec && g_graph_batch == batch && g_graph_T == T) return 0;
+    invalidate_graph();
+    ensure_cublas();
+    SUB0_CUDA_CHECK(cudaMemsetAsync(g_fwd.dids, 0, static_cast<size_t>(batch) * T * sizeof(int), g_stream));
+    forward_device(batch, T);                            // warmup (safe ids=0): cuBLAS lazy alloc
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    cudaGraph_t graph = nullptr;
+    SUB0_CUDA_CHECK(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
+    forward_device(batch, T);
+    SUB0_CUDA_CHECK(cudaStreamEndCapture(g_stream, &graph));
+    SUB0_CUDA_CHECK(cudaGraphInstantiate(&g_graph_exec, graph, 0));
+    cudaGraphDestroy(graph);
+    g_graph_batch = batch;
+    g_graph_T     = T;
+    return 0;
 }
 
 }  // namespace
@@ -404,10 +455,12 @@ SUB0_CUDA_API int sub0_cuda_init() {
 }
 
 SUB0_CUDA_API void sub0_cuda_shutdown() {
+    invalidate_graph();
     if (g_dev_params) cudaFree(g_dev_params);
     g_dev_params = nullptr;
     fwd_free();                                  // release the resident forward scratch too
     if (g_cublas) { cublasDestroy(g_cublas); g_cublas = nullptr; }
+    if (g_stream) { cudaStreamDestroy(g_stream); g_stream = nullptr; }
 }
 
 SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
@@ -471,15 +524,17 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
-    const int rc = fwd_alloc();
-    if (rc) return rc;
+    if (fwd_alloc()) return 1;
+    ensure_cublas();
+    if (capture_graph(batch, T)) return 1;       // capture once per shape (replay thereafter)
     const int M = batch * T;
-    SUB0_CUDA_CHECK(cudaMemcpy(g_fwd.dids, ids, static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice));
-    forward_device(batch, T);
-    SUB0_CUDA_CHECK(cudaGetLastError());
-    SUB0_CUDA_CHECK(cudaDeviceSynchronize());
-    SUB0_CUDA_CHECK(cudaMemcpy(out_logits, g_fwd.logits, static_cast<size_t>(M) * VOCAB * sizeof(float),
-                               cudaMemcpyDeviceToHost));
+    // H2D ids -> graph replay -> D2H logits, all ordered on the capture stream.
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_fwd.dids, ids, static_cast<size_t>(M) * sizeof(int),
+                                    cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaGraphLaunch(g_graph_exec, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(out_logits, g_fwd.logits, static_cast<size_t>(M) * VOCAB * sizeof(float),
+                                    cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     return 0;
 }
 
@@ -505,21 +560,36 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     const int M = batch * T;
     cudaMemset(g_fwd.dids, 0, static_cast<size_t>(M) * sizeof(int));   // ids = token 0
 
-    auto time_avg = [&](bool tf32) -> double {
-        ensure_cublas(); set_handle_tf32(tf32);
+    auto time_eager = [&](bool tf32) -> double {
+        set_handle_tf32(tf32);                                         // also invalidates the graph
         for (int w = 0; w < 5; ++w) forward_device(batch, T);         // warmup
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(g_stream);
         cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-        cudaEventRecord(s);
+        cudaEventRecord(s, g_stream);
         for (int it = 0; it < iters; ++it) forward_device(batch, T);
-        cudaEventRecord(e); cudaEventSynchronize(e);
+        cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
         float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
         cudaEventDestroy(s); cudaEventDestroy(e);
         return static_cast<double>(ms) / iters;
     };
-    const double fp32 = time_avg(false);
-    const double tf32 = time_avg(true);
-    std::printf("cuda bench forward: batch=%d T=%d M=%d iters=%d | FP32 %.3f ms | TF32 %.3f ms | %.2fx\n",
-                batch, T, M, iters, fp32, tf32, tf32 > 0.0 ? fp32 / tf32 : 0.0);
+    auto time_graph = [&]() -> double {
+        capture_graph(batch, T);                                      // FP32 (set just below)
+        for (int w = 0; w < 5; ++w) cudaGraphLaunch(g_graph_exec, g_stream);
+        cudaStreamSynchronize(g_stream);
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        cudaEventRecord(s, g_stream);
+        for (int it = 0; it < iters; ++it) cudaGraphLaunch(g_graph_exec, g_stream);
+        cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
+        float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        return static_cast<double>(ms) / iters;
+    };
+    const double fp32 = time_eager(false);
+    const double tf32 = time_eager(true);
+    set_handle_tf32(false);                                           // capture the graph in FP32
+    const double graph = time_graph();
+    std::printf("cuda bench forward: batch=%d T=%d M=%d iters=%d | eager FP32 %.3f ms | eager TF32 %.3f ms | "
+                "graph FP32 %.3f ms | graph %.2fx vs eager\n",
+                batch, T, M, iters, fp32, tf32, graph, graph > 0.0 ? fp32 / graph : 0.0);
     return 0;
 }
