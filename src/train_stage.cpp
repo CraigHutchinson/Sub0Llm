@@ -71,6 +71,9 @@ extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
 extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                      float lr, long t, double* out_loss);
+extern "C" void sub0_cuda_set_tf32(int on);
+extern "C" void sub0_cuda_set_attn_bwd(int per_query);
+extern "C" int  sub0_cuda_time_train_step(int batch, int T, int iters, double* out_ms);
 #endif
 
 namespace {
@@ -1021,6 +1024,50 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     } else {
         std::println(stderr, "warning: could not write tune cache '{}'", DEFAULT_TUNE_CACHE);
     }
+
+    // GPU device-step knob tuning (Phase 2e+): when the CUDA backend is built and a device is
+    // present, also tune the GPU perf knobs (TF32 GEMM math, attention-backward strategy) by timing
+    // the resident training step. Under SUB0_TUNING the knobs are runtime-mutable so we sweep them;
+    // otherwise they are baked, so we report the baked config and point at the tuning build.
+#if defined(SUB0_BUILD_CUDA)
+    if (HAS_CUDA && sub0_cuda_init() == 0) {
+        const int gbatch = DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD;   // the default training batch
+        std::println("");
+        std::println("--- GPU device-step tuning (knobs: TF32, attn-backward; batch {}) ---", gbatch);
+        report_threading();
+#if defined(SUB0_TUNING)
+        double best_tok = 0.0; int best_tf32 = 0, best_attn = 0;
+        for (int tf32 = 0; tf32 <= 1; ++tf32)
+            for (int attn = 0; attn <= 1; ++attn) {
+                sub0_cuda_set_tf32(tf32);
+                sub0_cuda_set_attn_bwd(attn);
+                double ms = 0.0;
+                if (sub0_cuda_time_train_step(gbatch, SEQ_LEN, 30, &ms) != 0 || ms <= 0.0) continue;
+                const double tok = static_cast<double>(gbatch) * SEQ_LEN * 1000.0 / ms;
+                const bool best = tok > best_tok;
+                std::println("  tf32={}  attn_bwd={:<5}  ->  {:>8.0f} tok/s  ({:.2f} ms/step){}",
+                             tf32, attn ? "query" : "head", tok, ms, best ? "   <- best" : "");
+                std::fflush(stdout);
+                if (best) { best_tok = tok; best_tf32 = tf32; best_attn = attn; }
+            }
+        sub0_cuda_set_tf32(best_tf32); sub0_cuda_set_attn_bwd(best_attn);   // leave the winner applied
+        std::println("best GPU: tf32={}  attn_bwd={}  ->  {:.0f} tok/s", best_tf32,
+                     best_attn ? "query" : "head", best_tok);
+        std::println("bake with:  cmake --preset native -DSUB0_CUDA_TF32={} ...  (and set the attn-backward",
+                     best_tf32 ? "ON" : "OFF");
+        std::println("            default to {} in backend_cuda.cu), then rebuild without -DSUB0_TUNING.",
+                     best_attn ? "per-query" : "per-head");
+#else
+        double ms = 0.0;
+        const double tok = (sub0_cuda_time_train_step(gbatch, SEQ_LEN, 30, &ms) == 0 && ms > 0.0)
+                               ? static_cast<double>(gbatch) * SEQ_LEN * 1000.0 / ms : 0.0;
+        std::println("  baked config  ->  {:.0f} tok/s  ({:.2f} ms/step)", tok, ms);
+        std::println("  GPU knobs (TF32, attn-backward) are baked in this build; rebuild with");
+        std::println("  -DSUB0_TUNING=ON to sweep and tune them.");
+#endif
+        sub0_cuda_shutdown();
+    }
+#endif
     return 0;
 }
 

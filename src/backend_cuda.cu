@@ -1371,12 +1371,10 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     return 0;
 }
 
-// Profile a full TRAINING step (forward_train + backward_device + AdamW) at a given batch, and
-// print ms/step + throughput (tok/s = batch*T/step). Self-contained: synthetic params (small
-// constant) + synthetic ids/targets -- GEMM/kernel timing is data-independent. This is the device
-// measurement primitive the GPU autotuner will sweep over batch / kernel-config knobs. Returns the
-// step time in `out_ms` (nullable). batch is clamped to MAX_FWD_BATCH.
-SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms) {
+// Time a full TRAINING step (forward_train + backward_device + AdamW) at a given batch: synthetic
+// finite params + ids/targets (timing is data-independent), 3 warmups, then `iters` timed steps.
+// Writes the mean step time (ms) to *out_ms. Quiet -- callers print. batch clamped to MAX_FWD_BATCH.
+static int time_train_step(int batch, int T, int iters, double* out_ms) {
     if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
@@ -1409,10 +1407,26 @@ SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double*
     cudaEventRecord(e, g_stream); cudaEventSynchronize(e);
     float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
     cudaEventDestroy(s); cudaEventDestroy(e);
-    const double per = static_cast<double>(ms) / iters;
+    if (out_ms) *out_ms = static_cast<double>(ms) / iters;
+    return 0;
+}
+
+// Profile a full TRAINING step at a given batch and print ms/step + throughput (tok/s). The device
+// measurement primitive the GPU autotuner sweeps over batch / kernel-config knobs. Returns the step
+// time in `out_ms` (nullable).
+SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms) {
+    double per = 0.0;
+    if (time_train_step(batch, T, iters, &per)) return 1;
+    const int M = (batch < 1 ? 1 : (batch > MAX_FWD_BATCH ? MAX_FWD_BATCH : batch)) * T;
     const double toks = per > 0.0 ? (static_cast<double>(M) * 1000.0) / per : 0.0;
     std::printf("cuda bench train: batch=%d T=%d M=%d iters=%d | step %.3f ms | %.0f tok/s\n",
-                batch, T, M, iters, per, toks);
+                (M / T), T, M, iters, per, toks);
     if (out_ms) *out_ms = per;
     return 0;
+}
+
+// Quiet training-step timer for the autotuner: measures with the CURRENT knob state (TF32 /
+// attn-backward, set via sub0_cuda_set_*), writes mean ms/step to *out_ms, prints nothing.
+SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, int iters, double* out_ms) {
+    return time_train_step(batch, T, iters, out_ms);
 }
