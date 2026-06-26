@@ -219,6 +219,19 @@ endif()
 add_library(sub0_train SHARED src/train_stage.cpp)
 target_link_libraries(sub0_train PRIVATE sub0_core)
 
+# The train/models stages tag each model with the code version that produced it and lay
+# them out under a models root. Pass both as compile definitions (configure-time) ONLY to
+# this stage, so a new commit does not force an engine-core rebuild. Reconfigure to refresh.
+execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" rev-parse --short HEAD
+                OUTPUT_VARIABLE SUB0_GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET RESULT_VARIABLE _git_rc)
+if(NOT _git_rc EQUAL 0 OR SUB0_GIT_SHA STREQUAL "")
+  set(SUB0_GIT_SHA "nogit")
+endif()
+target_compile_definitions(sub0_train PRIVATE
+  SUB0_GIT_SHA="${SUB0_GIT_SHA}"
+  SUB0_MODELS_ROOT="${CMAKE_SOURCE_DIR}/models")
+
 add_library(sub0_gen SHARED src/gen_stage.cpp)
 target_link_libraries(sub0_gen PRIVATE sub0_core)
 

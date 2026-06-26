@@ -24,6 +24,7 @@ extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose);
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
+extern "C" int sub0_models_stage(int prune, int verbose);
 
 int main(int argc, char** argv) {
     // CLI11 rejects unknown options and positionals by default (allow_extras is off),
@@ -44,8 +45,11 @@ int main(int argc, char** argv) {
     int   train_steps = 0, train_batch = DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD;
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
-    auto* train = app.add_subcommand("train", "Train a model into <model.bin> (resumes from <model.bin>.ckpt)");
-    train->add_option("model", train_model, "Output model path")->required();
+    auto* train = app.add_subcommand("train",
+        "Train a model (resumes from its .ckpt). With no path, auto-creates a structured, "
+        "registered model directory under the models root; see `sub0llm models`.");
+    train->add_option("model", train_model,
+                      "Output model path (optional; omit to auto-name by corpus+dims+git SHA)");
     train->add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
     train->add_option("--steps", train_steps,
                       "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
@@ -107,6 +111,13 @@ int main(int argc, char** argv) {
     autotemp->add_option("--seed", at_seed, "RNG seed for the generation sweep")->capture_default_str();
     autotemp->add_flag("--quiet", at_quiet, "Print only the recommendation, not the temperature sweep");
 
+    // --- models --------------------------------------------------------------
+    // Discover trained models (the registry = the per-model meta.txt files) and flag which
+    // load into this build; --prune reclaims architecture-incompatible ones.
+    bool models_prune = false;
+    auto* models = app.add_subcommand("models", "List trained models; --prune removes ones incompatible with this build");
+    models->add_flag("--prune", models_prune, "Delete models whose architecture this build cannot load");
+
     CLI11_PARSE(app, argc, argv);
 
     if (*train) {
@@ -128,6 +139,8 @@ int main(int argc, char** argv) {
         return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1);
     if (*autotemp)
         return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
+    if (*models)
+        return sub0_models_stage(models_prune ? 1 : 0, 1);
 
     return 1;  // unreachable: require_subcommand(1) guarantees one of the above
 }

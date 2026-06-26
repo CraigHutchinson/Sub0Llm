@@ -18,8 +18,18 @@
 
 #include "sub0/core.hpp"
 #include "sub0/coherence.hpp"
+#include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
+
+// Code version + models root, baked in by CMake (configure-time) so a model records what
+// produced it and lands in a structured directory. Fallbacks keep the file compilable alone.
+#ifndef SUB0_GIT_SHA
+#define SUB0_GIT_SHA "nogit"
+#endif
+#ifndef SUB0_MODELS_ROOT
+#define SUB0_MODELS_ROOT "models"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -467,10 +477,40 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::mt19937 rng(seed);
     RunState rs;
 
+    // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
+    // structured, identity-named directory (corpus + dims + git SHA) under the models root and
+    // register it with a meta.txt, so `models` can discover it and prune incompatible ones. The
+    // derived path is deterministic, so re-running `train` with no path resumes the same model.
+    std::string model_path;
+    std::filesystem::path meta_dir;
+    const std::string created = sub0::registry::now_iso();
+    if (model_out && *model_out) {
+        model_path = model_out;
+    } else {
+        meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
+                                             D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
+                                             static_cast<int>(USE_TERNARY), SUB0_GIT_SHA);
+        std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
+        model_path = (meta_dir / "model.bin").string();
+        std::println("model dir: {}", model_path);
+    }
+    auto write_meta = [&](const char* status) {
+        if (meta_dir.empty()) return;
+        sub0::registry::ModelMeta m;
+        m.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
+        m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
+        m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
+        m.git_sha = SUB0_GIT_SHA; m.created = created;
+        m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
+        m.status = status;
+        sub0::registry::write_meta(meta_dir, m);
+    };
+    write_meta("training");   // register early so an interrupted run still leaves a discoverable model
+
     // Resume if a checkpoint for this output exists (overwrites the fresh model and
     // restores batch/lr/seed, so the schedule below is computed from the resumed
     // batch, not whatever the command line happened to pass).
-    const std::string ckpt_path = std::string(model_out) + ".ckpt";
+    const std::string ckpt_path = model_path + ".ckpt";
     long adam_t = 0;
     const bool resumed = load_checkpoint(ckpt_path, rng, rs, batch, lr, seed, adam_t);
 
@@ -549,18 +589,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
             // Checkpoint + latest model every interval (covers the warmup phase too).
             save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
-            sub0::save_model(model_out);
+            sub0::save_model(model_path.c_str());
+            write_meta("training");          // refresh best_val_nelbo as it improves
 
             run_loss = 0.0; run_n = 0;
             win_t0 = clock::now(); win_steps0 = step;
         }
     }
 
-    sub0::save_model(model_out);
+    sub0::save_model(model_path.c_str());
     save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
+    write_meta(stop ? "plateaued" : "trained");
     std::println("  --- sample ---\n  {}", preview("the ", 120, rng));
     std::println("{} at step {} (best val_nelbo {:.4f}) -> {}",
-                 stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_out);
+                 stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
     return 0;
 }
 
@@ -1034,6 +1076,48 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
     std::println("recommended --temp {:.2f}", rec);
     std::println("  --- sample @ temp {:.2f} ---\n  {}", rec, preview_at("the ", 80, rec, AUTOTEMP_TOPK, prng));
     std::println("apply with:  sub0llm gen {} \"<prompt>\" --temp {:.2f}", model_in, rec);
+    return 0;
+}
+
+// --- Model registry ----------------------------------------------------------
+// `sub0llm models` discovers every trained model (scans the meta.txt under the models root --
+// the registry is the set of those files, so it never drifts out of sync) and flags which load
+// into THIS build (matching architecture dims). `--prune` reclaims the incompatible ones, whose
+// checkpoints this engine could never load anyway. Destructive, so it is opt-in via the flag.
+extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
+    (void)verbose;
+    namespace reg = sub0::registry;
+    std::vector<reg::ModelMeta> models = reg::scan(SUB0_MODELS_ROOT);
+    std::println("models root: {}  ({} model{})", SUB0_MODELS_ROOT, models.size(), models.size() == 1 ? "" : "s");
+    std::println("this build:  d{} l{} h{} sq{} v{}{} @ {}",
+                 D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, USE_TERNARY ? "t" : "", SUB0_GIT_SHA);
+    if (models.empty()) { std::println("(none yet -- `sub0llm train` creates one)"); return 0; }
+
+    auto loadable = [&](const reg::ModelMeta& m) {
+        return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, static_cast<int>(USE_TERNARY));
+    };
+    std::sort(models.begin(), models.end(),
+              [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });
+
+    std::println("{:<3} {:<50} {:>9}  {:<10} {}", "use", "model", "val_nelbo", "status", "corpus");
+    for (const reg::ModelMeta& m : models)
+        std::println("{:<3} {:<50} {:>9}  {:<10} {}", loadable(m) ? " * " : " x ",
+                     m.dir.filename().string(),
+                     m.best_val_nelbo >= 0 ? std::format("{:.4f}", m.best_val_nelbo) : "-",
+                     m.status, m.corpus);
+    std::println("(* loadable by this build | x incompatible architecture)");
+
+    if (prune) {
+        int removed = 0;
+        for (const reg::ModelMeta& m : models) {
+            if (loadable(m)) continue;
+            std::error_code ec;
+            const auto n = std::filesystem::remove_all(m.dir, ec);
+            if (!ec) { std::println("pruned {} ({} entries)", m.dir.filename().string(), n); ++removed; }
+            else     std::println(stderr, "warning: could not prune {}", m.dir.string());
+        }
+        std::println("pruned {} incompatible model(s)", removed);
+    }
     return 0;
 }
 
