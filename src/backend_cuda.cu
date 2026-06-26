@@ -12,6 +12,7 @@
 // the memory plan in the repo notes (VRAM = hard fast budget, +shared = soft ceiling).
 
 #include "sub0/layout.hpp"   // PARAM_FLOATS + model dims + COMPUTE_MODE / CUDA_ARCH / HAS_CUDA
+#include "sub0/knob.hpp"     // Knob<T,Baked>: compile-time-baked / runtime-tunable knobs
 
 #include <cstdio>
 #include <vector>
@@ -63,13 +64,16 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
 float* g_dev_params = nullptr;
 
 // cuBLAS handle for the dense GEMMs (every Linear + the lm_head). Created lazily, destroyed
-// in sub0_cuda_shutdown. g_tf32 selects TF32 tensor-core math vs full FP32; it is a runtime
-// knob (sub0_cuda_set_tf32) and a candidate autotuner knob. MEASURED 2026-06 on sm_120: TF32
-// gives NO speedup at this model's GEMM shapes (small K=96/384) -- 0.98x vs FP32 in
-// sub0_cuda_benchmark -- and loses precision, so the default is FP32. The knob stays for
-// larger models / other GPUs where the contraction dims make tensor cores pay off.
+// in sub0_cuda_shutdown.
 cublasHandle_t g_cublas = nullptr;
-bool           g_tf32   = false;
+
+// TF32 tensor-core GEMM math expressed as a sub0::Knob: the baked default is the configured
+// CUDA_TF32 (a compile-time constant in a normal build; runtime-mutable under SUB0_TUNING so
+// the autotuner can sweep it). MEASURED 2026-06 on sm_120: TF32 gives NO speedup at this
+// model's small-K GEMMs (96/384) -- 0.98x vs FP32 -- so CUDA_TF32 defaults off. The benchmark
+// and sub0_cuda_set_tf32 drive the cuBLAS handle directly to compare modes regardless of the
+// baked value.
+using CudaTf32 = sub0::Knob<bool, CUDA_TF32>;
 
 // Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
 // (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
@@ -172,9 +176,12 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
-inline void apply_math_mode() {
-    if (g_cublas) cublasSetMathMode(g_cublas, g_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+// Set the cuBLAS handle's math mode directly -- used to compare modes in the benchmark and to
+// force a mode in the parity tests, independent of the baked knob.
+inline void set_handle_tf32(bool on) {
+    if (g_cublas) cublasSetMathMode(g_cublas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
 }
+inline void apply_math_mode() { set_handle_tf32(CudaTf32::get()); }   // production default = baked knob
 inline void ensure_cublas() {
     if (!g_cublas) { cublasCreate(&g_cublas); apply_math_mode(); }
 }
@@ -480,9 +487,9 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
 // knob -- the optimum depends on the host + GEMM shapes, so it is intended to feed the
 // autotuner. Parity tests force FP32 here for a tight gate.
 SUB0_CUDA_API void sub0_cuda_set_tf32(int on) {
-    g_tf32 = (on != 0);
     ensure_cublas();
-    apply_math_mode();
+    CudaTf32::set(on != 0);        // sweep the knob (a no-op in a non-tuning build)
+    set_handle_tf32(on != 0);      // force the handle mode now (for the bench / parity tests)
 }
 
 // Profile the device forward: time `iters` runs of the resident kernel chain (no host
@@ -499,7 +506,7 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
     cudaMemset(g_fwd.dids, 0, static_cast<size_t>(M) * sizeof(int));   // ids = token 0
 
     auto time_avg = [&](bool tf32) -> double {
-        g_tf32 = tf32; ensure_cublas(); apply_math_mode();
+        ensure_cublas(); set_handle_tf32(tf32);
         for (int w = 0; w < 5; ++w) forward_device(batch, T);         // warmup
         cudaDeviceSynchronize();
         cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);

@@ -20,6 +20,19 @@
 set(SUB0_COMPUTE "CPU" CACHE STRING "Compute backend: AUTO / CPU / GPU / HYBRID")
 set_property(CACHE SUB0_COMPUTE PROPERTY STRINGS AUTO CPU GPU HYBRID)
 
+# Performance-knob expression (see include/sub0/knob.hpp). SUB0_TUNING ON builds knobs as
+# runtime-mutable so the autotuner can sweep them; OFF (default) bakes them as compile-time
+# constants so hot paths fold the branch away. Individual knobs (e.g. SUB0_CUDA_TF32) carry
+# the baked value -- normally written by the autotuner into the tune cache and emitted by the
+# configurator, like DEFAULT_THREADS.
+option(SUB0_TUNING "Build performance knobs as runtime-tunable (autotuner) instead of baked constants" OFF)
+option(SUB0_CUDA_TF32 "Bake TF32 tensor-core GEMM math ON (measured: no win at small K, default OFF)" OFF)
+if(SUB0_CUDA_TF32)
+  set(SUB0_CUDA_TF32_FLAG 1)
+else()
+  set(SUB0_CUDA_TF32_FLAG 0)
+endif()
+
 # CUDA detection (facts only -- the GPU backend compiles in Phase 2). find_package
 # locates the toolkit WITHOUT enabling the CUDA language (that happens in Phase 2 when
 # .cu files exist); nvidia-smi gives the first device's compute capability + VRAM. These

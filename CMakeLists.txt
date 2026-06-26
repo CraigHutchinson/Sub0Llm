@@ -193,6 +193,7 @@ add_custom_command(
             --gpu-vram-mb ${SUB0_GPU_VRAM_MB}
             --gpu-shared-mb ${SUB0_GPU_SHARED_MB}
             --compute ${SUB0_COMPUTE_MODE_INT}
+            --cuda-tf32 ${SUB0_CUDA_TF32_FLAG}
             -o "${GEN_HEADER}"
   DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
   COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
@@ -226,6 +227,12 @@ if(SUB0_REQUIRE_OPENMP)
   target_compile_definitions(sub0_core PUBLIC SUB0_REQUIRE_OPENMP)
 endif()
 
+# Performance-knob tuning mode (include/sub0/knob.hpp): PUBLIC so any TU using a Knob sees it.
+# OFF (default) bakes knobs as compile-time constants; ON makes them runtime-tunable.
+if(SUB0_TUNING)
+  target_compile_definitions(sub0_core PUBLIC SUB0_TUNING)
+endif()
+
 # --- CUDA backend skeleton (Phase 2; built only when SUB0_BUILD_CUDA) --------
 # Compiled by nvcc; meets the clang world only at the extern "C" self-test boundary.
 # Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
@@ -243,6 +250,9 @@ if(SUB0_BUILD_CUDA)
   # also relax div/sqrt rounding); just the denormal flush.
   target_compile_options(sub0_backend_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=true>)
   target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart CUDA::cublas)
+  if(SUB0_TUNING)
+    target_compile_definitions(sub0_backend_cuda PRIVATE SUB0_TUNING)
+  endif()
 
   add_executable(sub0-cuda-selftest tools/cuda_selftest.cpp)
   target_link_libraries(sub0-cuda-selftest PRIVATE sub0_backend_cuda)

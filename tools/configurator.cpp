@@ -297,6 +297,7 @@ int main(int argc, char** argv) {
     int gpu_vram_mb = 0;   // dedicated GPU VRAM in MB
     int gpu_shared_mb = 0; // shared/overflow system memory the GPU can address (WDDM), MB
     int compute     = 0;   // resolved backend: 0=CPU, 1=GPU, 2=HYBRID
+    int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
        ->required()->check(CLI::ExistingFile);
@@ -330,6 +331,8 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--compute", compute, "Resolved compute backend: 0=CPU, 1=GPU, 2=HYBRID")
        ->capture_default_str()->check(CLI::Range(0, 2));
+    app.add_option("--cuda-tf32", cuda_tf32, "Bake TF32 tensor-core GEMM math on (1) or off (0)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
 
     CLI11_PARSE(app, argc, argv);
 
@@ -820,7 +823,11 @@ int main(int argc, char** argv) {
     os << "// Exceeding GPU_VRAM_MB does NOT OOM on Windows -- it spills here and THRASHES over PCIe;\n";
     os << "// the same region can also back zero-copy / mapped host transfers. Treat VRAM as the hard\n";
     os << "// fast budget and (VRAM + shared) as the soft ceiling. 0 where there is no WDDM shared mem.\n";
-    os << "constexpr int            GPU_SHARED_MEM_MB = " << gpu_shared_mb << ";\n\n";
+    os << "constexpr int            GPU_SHARED_MEM_MB = " << gpu_shared_mb << ";\n";
+    os << "// CUDA_TF32: bake TF32 tensor-core GEMM math (an autotuner knob; measured to give no\n";
+    os << "// win at this model's small-K GEMMs, so default off). A SUB0_TUNING build overrides it\n";
+    os << "// at runtime via the sub0::Knob mechanism; otherwise it is a baked compile-time constant.\n";
+    os << "constexpr bool           CUDA_TF32    = " << (cuda_tf32 ? "true" : "false") << ";\n\n";
     emit_path("DEFAULT_CORPUS",     abspath);
     emit_path("DEFAULT_CORPUS_TOK", std::filesystem::absolute(tok_path).string());
     emit_path("DEFAULT_TOKENIZER",  std::filesystem::absolute(tkz_path).string());
