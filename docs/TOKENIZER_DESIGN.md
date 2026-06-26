@@ -29,16 +29,22 @@ This shifts base ids → a new vocabulary, so it lands with this scheme as a cle
 
 ## 2. Whitespace — implicit single space, specialise the rest
 
-| Pattern | Frequency (tinystories) | Encoding |
-|---|---|---|
-| Single space between content | 40.7% | **implicit** (default boundary) — free |
-| No space at a boundary | ~16% | **JOIN** sentinel (also the 2-token compose op) |
-| Single newline | 1.4% | `NEWLINE` token |
-| Paragraph break `\n\n` | common | `PARA` token (1 token, not 2 newlines) |
-| Indentation / repeated spaces | code/structured | **run-length** `SPACE2/3/4/8`, `TAB`, `TAB2…` |
+**Measured on FineWeb** (see [TOKENIZER_WS_PUNCT_STATS.md](TOKENIZER_WS_PUNCT_STATS.md) — % of
+whitespace *runs*):
 
-Run-length widths are chosen from the **measured** whitespace-run histogram, not assumed.
-After a `NEWLINE`, an 8-space indent is one `SPACE8`, not eight tokens.
+| Pattern | FineWeb (runs) | Encoding |
+|---|---:|---|
+| Single space between content | **97.2 %** | **implicit** (default boundary) — free |
+| No space at a boundary | 92 % of word→punct | **JOIN** sentinel (also the 2-token compose op) |
+| Single newline | 2.6 % | `NEWLINE` token |
+| Paragraph break `\n\n` | 0.13 % | `PARA` token (1 token, not 2 newlines) |
+| Indentation / repeated spaces | **0.004 %** (prose) | **run-length** `SPACE2/3/4/8`, `TAB`, `TAB2…` — *corpus-conditional* |
+
+Run-length widths are chosen from the **measured** whitespace-run histogram, not assumed. After a
+`NEWLINE`, an 8-space indent is one `SPACE8`, not eight tokens. **For clean prose (FineWeb)
+multi-space runs and tabs are statistically nonexistent, so `SPACE_N`/`TAB` are NOT minted** — they
+stay specified and are minted only when a corpus's measured frequency clears a floor (code/markdown
+/TSV). This is the "only mint a special if it clears a measured floor" rule (§6) applied per corpus.
 
 ## 3. Punctuation — directional pairs
 
@@ -53,6 +59,12 @@ This (a) disambiguates open/close, (b) gives the model a **matched pair to atten
 separate JOIN is needed. Both decode back to the same byte → lossless. Mismatched/line-initial
 quotes (messy web text) fall back to a bare quote + JOIN. Brackets/parens are already
 directional characters, so they need only JOIN for spacing.
+
+**Measured (FineWeb, [stats](TOKENIZER_WS_PUNCT_STATS.md) §C):** `"` is **48.8 % open / 41.1 %
+close** (90 % cleanly directional) → `OPEN_DQUOTE`/`CLOSE_DQUOTE` are decisively justified. `'`
+is **81.6 % glue/glue = contraction apostrophes** (already kept inside the word-unit), only ~18 %
+true quotes → `OPEN_SQUOTE`/`CLOSE_SQUOTE` **deferred** (low floor; bare `'` + JOIN fallback).
+`(`/`)`/`[`/`]` are ~94 %/≈99 % directional already → char + JOIN, no new token.
 
 ## 4. Word encoding & the SPELL region
 
@@ -89,10 +101,21 @@ correctness-critical part and is gated by the per-chunk round-trip check.
 
 ## 6. Special-token inventory
 
-`JOIN`, `NEWLINE`, `PARA`, `SPACE2/3/4/8`, `TAB`(+levels), `OPEN_DQUOTE`/`CLOSE_DQUOTE`,
-`OPEN_SQUOTE`/`CLOSE_SQUOTE`, `SPELL_START`/`SPELL_END`, `CAP`/`UP` (existing). ~18–24 tokens
-out of 2048+. **Only mint a special token if it clears a measured frequency floor** — rare
-specials dilute training signal.
+Full specified set: `JOIN`, `NEWLINE`, `PARA`, `SPACE2/3/4/8`, `TAB`(+levels),
+`OPEN_DQUOTE`/`CLOSE_DQUOTE`, `OPEN_SQUOTE`/`CLOSE_SQUOTE`, `SPELL_START`/`SPELL_END`,
+`CAP`/`UP` (existing). **Only mint a special token if it clears a measured frequency floor** —
+rare specials dilute training signal.
+
+**Minted for FineWeb** ([measured](TOKENIZER_WS_PUNCT_STATS.md)) — the active set is small:
+
+| Minted (prose) | Corpus-conditional (mint when measured) | Deferred |
+|---|---|---|
+| `JOIN`, `NEWLINE`, `PARA`, `OPEN_DQUOTE`, `CLOSE_DQUOTE`, (`CAP`/`UP`) | `SPACE2/3/4/8`, `TAB`(+levels) | `OPEN_SQUOTE`/`CLOSE_SQUOTE` |
+| `SPELL_START`/`SPELL_END` pending the §4 word-`N` measurement | — | — |
+
+That is **5 new tokens** for clean prose, not ~18–24. The whitespace/tab specials are not deleted
+— the configurator histograms each corpus at configure time and mints the ones that clear the floor
+(code/markdown would add `SPACE_N`/`TAB`). See [stats](TOKENIZER_WS_PUNCT_STATS.md).
 
 ## 7. Data-driven specialisation (the step before implementing)
 
@@ -100,6 +123,11 @@ Extend the corpus analysis to histogram (a) whitespace-run lengths and (b) punct
 spacing contexts, then pick the specialised token set from the head of those distributions.
 Validate the scheme by **tokens/doc reduction** *and* an **ablation** that the model actually
 uses the structure (perplexity/coherence improves, not just compression).
+
+**DONE for FineWeb** → [TOKENIZER_WS_PUNCT_STATS.md](TOKENIZER_WS_PUNCT_STATS.md) (the measured
+ws-run + punct-spacing histograms and the token decisions they imply; §2/§3/§6 above are now
+grounded in it). Still to measure: the word sub-token `N` histogram (§4, needs BPE → in the
+configurator). The ablation runs after the scheme is implemented.
 
 ## 8. Concepts we don't yet employ (one-liners)
 
@@ -115,7 +143,9 @@ uses the structure (perplexity/coherence improves, not just compression).
 ## 9. Dependencies & sequencing
 
 1. Incremental BPE — **done** (re-tokenization must be cheap to iterate schemes).
-2. Ingest single-thread optimisation (then parallel passes) — fast cycle times on a partial corpus.
-3. Measure the ws/punct distribution (§7) → fix the special-token set from data.
+2. Ingest single-thread optimisation, then **parallel passes — done** (`0643d19`, ~5×) — fast
+   cycle times on a partial corpus.
+3. Measure the ws/punct distribution (§7) → fix the special-token set from data —
+   **done** ([stats](TOKENIZER_WS_PUNCT_STATS.md)); word-`N` histogram (§4) still pending in the configurator.
 4. Complete base alphabet (§1) + implement the decode FSM (§5) + round-trip tests.
 5. Retrain (clean version break).
