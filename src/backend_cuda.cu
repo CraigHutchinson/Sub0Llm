@@ -63,8 +63,13 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
 float* g_dev_params = nullptr;
 
 // cuBLAS handle for the dense GEMMs (every Linear + the lm_head). Created lazily, destroyed
-// in sub0_cuda_shutdown. Default (FP32) math; TF32 tensor-core math is a later opt-in.
+// in sub0_cuda_shutdown. g_tf32 selects TF32 tensor-core math vs full FP32; it is a runtime
+// knob (sub0_cuda_set_tf32) and a candidate autotuner knob. MEASURED 2026-06 on sm_120: TF32
+// gives NO speedup at this model's GEMM shapes (small K=96/384) -- 0.98x vs FP32 in
+// sub0_cuda_benchmark -- and loses precision, so the default is FP32. The knob stays for
+// larger models / other GPUs where the contraction dims make tensor cores pay off.
 cublasHandle_t g_cublas = nullptr;
+bool           g_tf32   = false;
 
 // Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
 // (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
@@ -167,8 +172,11 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
+inline void apply_math_mode() {
+    if (g_cublas) cublasSetMathMode(g_cublas, g_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+}
 inline void ensure_cublas() {
-    if (!g_cublas) cublasCreate(&g_cublas);
+    if (!g_cublas) { cublasCreate(&g_cublas); apply_math_mode(); }
 }
 // Y[M,out] = X[M,in] . W[in,out] (+ bias) via cuBLAS. cublasSgemm is column-major, so we
 // compute the column-major Y^T = W^T . X^T -- which, read back row-major, IS Y = X . W:
@@ -259,6 +267,71 @@ void fwd_free() {
     cudaFree(g_fwd.fbuf);  cudaFree(g_fwd.ff1);  cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);
     cudaFree(g_fwd.logits);
     g_fwd = FwdScratch{};
+}
+
+// Device-side forward chain (no host transfers): assumes g_fwd.dids is populated and the
+// params uploaded; writes logits into g_fwd.logits over M = batch*T rows. Shared by
+// sub0_cuda_forward and the benchmark so both run the IDENTICAL kernel sequence.
+void forward_device(int batch, int T) {
+    const auto&  L  = sub0::PARAM_LAYOUT;
+    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    const int    M  = batch * T;
+    const int    MC = M * C, MF = M * F;
+    float* const base = g_dev_params;
+
+    const float* tok_emb = base + L[0].off;
+    const float* pos_emb = base + L[1].off;
+    const int    fi      = 2 + 10 * N_LAYERS;          // index of ln_f
+    const float* ln_f    = base + L[fi + 0].off;
+    const float* lm_head = base + L[fi + 1].off;
+    const float* lm_bias = base + L[fi + 2].off;
+
+    float* h    = g_fwd.h;
+    float* a    = g_fwd.a;
+    float* q    = g_fwd.q;
+    float* kk   = g_fwd.kk;
+    float* vv   = g_fwd.vv;
+    float* att  = g_fwd.att;
+    float* proj = g_fwd.proj;
+    float* fbuf = g_fwd.fbuf;
+    float* ff1  = g_fwd.ff1;
+    float* gact = g_fwd.gact;
+    float* ff2  = g_fwd.ff2;
+
+    // h = tok_emb[ids] + pos_emb  (over all M rows; position = row % T)
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+        embed_add_kernel<<<grid, block>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
+    }
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const int    b0  = 2 + 10 * l;
+        const float* ln1 = base + L[b0 + 0].off;
+        const float* ln2 = base + L[b0 + 1].off;
+        const float* Wq  = base + L[b0 + 2].off;
+        const float* Wk  = base + L[b0 + 3].off;
+        const float* Wv  = base + L[b0 + 4].off;
+        const float* Wo  = base + L[b0 + 5].off;
+        const float* W1  = base + L[b0 + 6].off;
+        const float* b1  = base + L[b0 + 7].off;
+        const float* W2  = base + L[b0 + 8].off;
+        const float* b2  = base + L[b0 + 9].off;
+
+        launch_rmsnorm(h, ln1, a, M, C);                  // a = rmsnorm(h, ln1)
+        launch_linear(a, Wq, nullptr, q,  M, C, C);       // q,k,v = a . Wq/Wk/Wv
+        launch_linear(a, Wk, nullptr, kk, M, C, C);
+        launch_linear(a, Wv, nullptr, vv, M, C, C);
+        launch_attn(q, kk, vv, att, batch, T, C, H);      // per-window causal attention
+        launch_linear(att, Wo, nullptr, proj, M, C, C);   // proj = att . Wo
+        launch_add(h, proj, h, MC);                       // h = h + proj
+        launch_rmsnorm(h, ln2, fbuf, M, C);               // f = rmsnorm(h, ln2)
+        launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
+        launch_gelu(ff1, gact, MF);                       // gelu
+        launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
+        launch_add(h, ff2, h, MC);                        // h = h + ff2
+    }
+    launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
+    launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V);  // logits = a . lm_head + lm_bias
 }
 
 }  // namespace
@@ -386,83 +459,60 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 // ============================================================================
 // Runs the same op sequence as Model::forward over a BATCH of windows: M = batch*T rows.
 // Every Linear / RMSNorm / GELU / residual runs over all M rows at once; attention is
-// per-window causal (windows independent). Slices the uploaded weight blob (g_dev_params)
-// by the shared constexpr PARAM_LAYOUT. Requires sub0_cuda_upload_params() first. ids is
-// [batch*T]; out_logits receives [batch*T, VOCAB]. Scratch is resident (sized for
-// MAX_FWD_BATCH*SEQ_LEN); 2c next: cuBLASLt GEMMs + CUDA-graph capture.
+// per-window causal (windows independent). Requires sub0_cuda_upload_params() first. ids is
+// [batch*T]; out_logits receives [batch*T, VOCAB]. Scratch is resident.
 SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
     const int rc = fwd_alloc();
     if (rc) return rc;
-
-    const auto&  L  = sub0::PARAM_LAYOUT;
-    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
-    const int    M  = batch * T;
-    const int    MC = M * C, MF = M * F;
-    float* const base = g_dev_params;
-
-    const float* tok_emb = base + L[0].off;
-    const float* pos_emb = base + L[1].off;
-    const int    fi      = 2 + 10 * N_LAYERS;          // index of ln_f
-    const float* ln_f    = base + L[fi + 0].off;
-    const float* lm_head = base + L[fi + 1].off;
-    const float* lm_bias = base + L[fi + 2].off;
-
-    int*   dids   = g_fwd.dids;
-    float* h      = g_fwd.h;
-    float* a      = g_fwd.a;
-    float* q      = g_fwd.q;
-    float* kk     = g_fwd.kk;
-    float* vv     = g_fwd.vv;
-    float* att    = g_fwd.att;
-    float* proj   = g_fwd.proj;
-    float* fbuf   = g_fwd.fbuf;
-    float* ff1    = g_fwd.ff1;
-    float* gact   = g_fwd.gact;
-    float* ff2    = g_fwd.ff2;
-    float* logits = g_fwd.logits;
-    SUB0_CUDA_CHECK(cudaMemcpy(dids, ids, static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice));
-
-    // h = tok_emb[ids] + pos_emb  (over all M rows; position = row % T)
-    {
-        const dim3 block(16, 16);
-        const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-        embed_add_kernel<<<grid, block>>>(tok_emb, pos_emb, dids, h, M, T, C);
-    }
-
-    for (int l = 0; l < N_LAYERS; ++l) {
-        const int    b0  = 2 + 10 * l;
-        const float* ln1 = base + L[b0 + 0].off;
-        const float* ln2 = base + L[b0 + 1].off;
-        const float* Wq  = base + L[b0 + 2].off;
-        const float* Wk  = base + L[b0 + 3].off;
-        const float* Wv  = base + L[b0 + 4].off;
-        const float* Wo  = base + L[b0 + 5].off;
-        const float* W1  = base + L[b0 + 6].off;
-        const float* b1  = base + L[b0 + 7].off;
-        const float* W2  = base + L[b0 + 8].off;
-        const float* b2  = base + L[b0 + 9].off;
-
-        launch_rmsnorm(h, ln1, a, M, C);                  // a = rmsnorm(h, ln1)
-        launch_linear(a, Wq, nullptr, q,  M, C, C);       // q,k,v = a . Wq/Wk/Wv
-        launch_linear(a, Wk, nullptr, kk, M, C, C);
-        launch_linear(a, Wv, nullptr, vv, M, C, C);
-        launch_attn(q, kk, vv, att, batch, T, C, H);      // per-window causal attention
-        launch_linear(att, Wo, nullptr, proj, M, C, C);   // proj = att . Wo
-        launch_add(h, proj, h, MC);                       // h = h + proj
-        launch_rmsnorm(h, ln2, fbuf, M, C);               // f = rmsnorm(h, ln2)
-        launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
-        launch_gelu(ff1, gact, MF);                       // gelu
-        launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
-        launch_add(h, ff2, h, MC);                        // h = h + ff2
-    }
-    launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
-    launch_linear(a, lm_head, lm_bias, logits, M, C, V);  // logits = a . lm_head + lm_bias
-
+    const int M = batch * T;
+    SUB0_CUDA_CHECK(cudaMemcpy(g_fwd.dids, ids, static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice));
+    forward_device(batch, T);
     SUB0_CUDA_CHECK(cudaGetLastError());
     SUB0_CUDA_CHECK(cudaDeviceSynchronize());
-    SUB0_CUDA_CHECK(cudaMemcpy(out_logits, logits, static_cast<size_t>(M) * V * sizeof(float),
+    SUB0_CUDA_CHECK(cudaMemcpy(out_logits, g_fwd.logits, static_cast<size_t>(M) * VOCAB * sizeof(float),
                                cudaMemcpyDeviceToHost));
-    return 0;   // scratch is resident -- freed by sub0_cuda_shutdown
+    return 0;
+}
+
+// Select TF32 tensor-core GEMM math (on != 0) vs full FP32 for subsequent forwards. Runtime
+// knob -- the optimum depends on the host + GEMM shapes, so it is intended to feed the
+// autotuner. Parity tests force FP32 here for a tight gate.
+SUB0_CUDA_API void sub0_cuda_set_tf32(int on) {
+    g_tf32 = (on != 0);
+    ensure_cublas();
+    apply_math_mode();
+}
+
+// Profile the device forward: time `iters` runs of the resident kernel chain (no host
+// transfers) under FP32 then TF32 math and print avg ms + the speedup. Self-contained
+// (allocates the param mirror + scratch, ids = token 0; GEMM timing is data-independent).
+// batch is clamped to MAX_FWD_BATCH.
+SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
+    if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    if (sub0_cuda_init()) return 1;
+    if (fwd_alloc()) return 1;
+    const int M = batch * T;
+    cudaMemset(g_fwd.dids, 0, static_cast<size_t>(M) * sizeof(int));   // ids = token 0
+
+    auto time_avg = [&](bool tf32) -> double {
+        g_tf32 = tf32; ensure_cublas(); apply_math_mode();
+        for (int w = 0; w < 5; ++w) forward_device(batch, T);         // warmup
+        cudaDeviceSynchronize();
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        cudaEventRecord(s);
+        for (int it = 0; it < iters; ++it) forward_device(batch, T);
+        cudaEventRecord(e); cudaEventSynchronize(e);
+        float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        return static_cast<double>(ms) / iters;
+    };
+    const double fp32 = time_avg(false);
+    const double tf32 = time_avg(true);
+    std::printf("cuda bench forward: batch=%d T=%d M=%d iters=%d | FP32 %.3f ms | TF32 %.3f ms | %.2fx\n",
+                batch, T, M, iters, fp32, tf32, tf32 > 0.0 ? fp32 / tf32 : 0.0);
+    return 0;
 }
