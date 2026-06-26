@@ -61,19 +61,20 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
 // upload/download entry points below (the device half of the sync_params hooks).
 float* g_dev_params = nullptr;
 
-// Dense linear: Y[T,out] = X[T,in] . W[in,out] (+ bias[out]). Matches op_linear's dense
-// (non-ternary) path -- one thread per (t,o) output element, summing over `in` in the same
-// order as the CPU. The building block of every projection and the lm_head; the batched
-// cuBLASLt form arrives in 2c, this naive kernel is the parity baseline.
+// Dense linear: Y[M,out] = X[M,in] . W[in,out] (+ bias[out]). Matches op_linear's dense
+// (non-ternary) path -- one thread per (row m, col o), summing over `in` in the same order
+// as the CPU. M is the total row count (batch*T when batched). The building block of every
+// projection and the lm_head; the batched cuBLASLt form arrives next, this is the parity
+// baseline.
 __global__ void linear_kernel(const float* __restrict__ X, const float* __restrict__ W,
                               const float* __restrict__ bias, float* __restrict__ Y,
-                              int T, int in, int out) {
+                              int M, int in, int out) {
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y * blockDim.y + threadIdx.y;
-    if (t < T && o < out) {
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && o < out) {
         float acc = bias ? bias[o] : 0.0f;
-        for (int p = 0; p < in; ++p) acc += X[t * in + p] * W[p * out + o];
-        Y[t * out + o] = acc;
+        for (int p = 0; p < in; ++p) acc += X[m * in + p] * W[p * out + o];
+        Y[m * out + o] = acc;
     }
 }
 
@@ -92,26 +93,30 @@ __device__ inline float dev_gelu(float v) {
     return 0.5f * v * (1.f + dev_tanh(0.7978845608f * (v + 0.0447150000f * v * v * v)));
 }
 
-// h[t,j] = tok_emb[ids[t], j] + pos_emb[t, j]  (op_embed + op_add: first forward step).
+// h[m,j] = tok_emb[ids[m], j] + pos_emb[t, j], where m is the global row over batch*T and
+// t = m % T is the position WITHIN the window (op_embed + op_add: first forward step).
 __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                 const int* __restrict__ ids, float* __restrict__ h, int T, int C) {
+                                 const int* __restrict__ ids, float* __restrict__ h, int M, int T, int C) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y * blockDim.y + threadIdx.y;
-    if (t < T && j < C) h[t * C + j] = tok_emb[ids[t] * C + j] + pos_emb[t * C + j];
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && j < C) {
+        const int t = m % T;
+        h[m * C + j] = tok_emb[ids[m] * C + j] + pos_emb[t * C + j];
+    }
 }
 
-// y[t,j] = x[t,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
+// y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
 __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
-                               float* __restrict__ y, int T, int C) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t < T) {
+                               float* __restrict__ y, int rows, int C) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < rows) {
         const float eps = 1e-5f;
-        const float* xr = x + static_cast<size_t>(t) * C;
+        const float* xr = x + static_cast<size_t>(m) * C;
         float ms = 0.f;
         for (int j = 0; j < C; ++j) ms += xr[j] * xr[j];
         ms /= C;
         const float r = rsqrtf(ms + eps);              // CUDA fast reciprocal sqrt
-        float* yr = y + static_cast<size_t>(t) * C;
+        float* yr = y + static_cast<size_t>(m) * C;
         for (int j = 0; j < C; ++j) yr[j] = xr[j] * r * gamma[j];
     }
 }
@@ -129,34 +134,39 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
     if (i < n) c[i] = a[i] + b[i];
 }
 
-// Causal multi-head attention (op_attn, FAST_MATH softmax). One thread per (head, query i):
-// scores over j<=i, fast_exp softmax, weighted sum of v. T is bounded by SEQ_LEN.
+// Causal multi-head attention over a BATCH of windows (op_attn, FAST_MATH softmax). One
+// thread per (window b, head h, query i): scores over j<=i WITHIN the window, __expf
+// softmax, weighted sum of v. Windows are independent -- no cross-window attention.
 __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict__ k,
                             const float* __restrict__ v, float* __restrict__ out,
-                            int T, int C, int H) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx = head*T + i
-    const int h = idx / T;
-    const int i = idx % T;
-    if (h >= H || i >= T) return;
-    const int   d     = C / H;
-    const int   off   = h * d;
-    const float scale = 1.0f / sqrtf(static_cast<float>(d));
+                            int batch, int T, int C, int H) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx over batch*H*T
+    const int per = H * T;
+    const int b   = idx / per;
+    if (b >= batch) return;
+    const int rem = idx - b * per;
+    const int h   = rem / T;
+    const int i   = rem % T;
+    const int    d     = C / H;
+    const int    off   = h * d;
+    const float  scale = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t base  = static_cast<size_t>(b) * T * C;     // window b's first row
     float sc[SEQ_LEN];
-    const float* qi = q + static_cast<size_t>(i) * C + off;
+    const float* qi = q + base + static_cast<size_t>(i) * C + off;
     float mx = -1e30f;
     for (int j = 0; j <= i; ++j) {
-        const float* kj = k + static_cast<size_t>(j) * C + off;
+        const float* kj = k + base + static_cast<size_t>(j) * C + off;
         float s = 0.f;
         for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
         s *= scale; sc[j] = s; if (s > mx) mx = s;
     }
     float Z = 0.f;
     for (int j = 0; j <= i; ++j) { sc[j] = __expf(sc[j] - mx); Z += sc[j]; }   // SFU fast exp
-    float* oi = out + static_cast<size_t>(i) * C + off;
+    float* oi = out + base + static_cast<size_t>(i) * C + off;
     for (int a = 0; a < d; ++a) oi[a] = 0.f;
     for (int j = 0; j <= i; ++j) {
         const float pj = sc[j] / Z;
-        const float* vj = v + static_cast<size_t>(j) * C + off;
+        const float* vj = v + base + static_cast<size_t>(j) * C + off;
         for (int a = 0; a < d; ++a) oi[a] += pj * vj[a];
     }
 }
@@ -181,15 +191,21 @@ inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     add_kernel<<<(n + block - 1) / block, block>>>(dA, dB, dC, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
-                        int T, int C, int H) {
+                        int batch, int T, int C, int H) {
     const int block = 64;
-    const int total = H * T;
-    attn_kernel<<<(total + block - 1) / block, block>>>(dQ, dK, dV, dOut, T, C, H);
+    const int total = batch * H * T;
+    attn_kernel<<<(total + block - 1) / block, block>>>(dQ, dK, dV, dOut, batch, T, C, H);
 }
 
-// Resident forward scratch: allocated once for T = SEQ_LEN (the max window) and reused by
-// every sub0_cuda_forward, so the hot path has no per-call cudaMalloc churn. Freed by
-// sub0_cuda_shutdown. (2c step; batching to M = B*T and cuBLASLt GEMMs build on this.)
+// Max minibatch the resident forward scratch is sized for: the CPU's tuned data-parallel
+// width, so the GPU forward covers the same batch training uses. A forward requesting more
+// windows than this is rejected.
+constexpr int MAX_FWD_BATCH =
+    DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD > 0 ? DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD : 8;
+
+// Resident forward scratch: allocated once for the full M = MAX_FWD_BATCH * SEQ_LEN row
+// count and reused by every sub0_cuda_forward, so the hot path has no per-call cudaMalloc
+// churn. Freed by sub0_cuda_shutdown.
 struct FwdScratch {
     int*   dids   = nullptr;
     float* h      = nullptr;
@@ -210,21 +226,21 @@ FwdScratch g_fwd;
 
 int fwd_alloc() {
     if (g_fwd.inited) return 0;
-    const size_t Tm = SEQ_LEN;
-    const size_t TC = Tm * D_MODEL, TF = Tm * D_FF, TV = Tm * VOCAB;
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Tm * sizeof(int)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.q,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.kk,     TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.vv,     TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff1,    TF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   TF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, TV * sizeof(float)));
+    const size_t Mm = static_cast<size_t>(MAX_FWD_BATCH) * SEQ_LEN;
+    const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.q,      MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.kk,     MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.vv,     MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff1,    MF * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
     g_fwd.inited = true;
     return 0;
 }
@@ -361,14 +377,22 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 // ============================================================================
 //  Full forward pass (single window) -> logits, CPU-parity gated
 // ============================================================================
-// Runs the same op sequence as Model::forward in backend_cpu.cpp on the device, slicing
-// the uploaded weight blob (g_dev_params) by the shared constexpr PARAM_LAYOUT. Requires
-// sub0_cuda_upload_params() first. out_logits receives [T, VOCAB]. Scratch is RESIDENT
-// (allocated once for T=SEQ_LEN, reused) -- no per-call cudaMalloc. 2c next: batch M = B*T.
-SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
+// Runs the same op sequence as Model::forward over a BATCH of windows: M = batch*T rows.
+// Every Linear / RMSNorm / GELU / residual runs over all M rows at once; attention is
+// per-window causal (windows independent). Slices the uploaded weight blob (g_dev_params)
+// by the shared constexpr PARAM_LAYOUT. Requires sub0_cuda_upload_params() first. ids is
+// [batch*T]; out_logits receives [batch*T, VOCAB]. Scratch is resident (sized for
+// MAX_FWD_BATCH*SEQ_LEN); 2c next: cuBLASLt GEMMs + CUDA-graph capture.
+SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits) {
     if (!g_dev_params) return 1;
-    const auto&  L = sub0::PARAM_LAYOUT;
-    const int    C = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
+    const int rc = fwd_alloc();
+    if (rc) return rc;
+
+    const auto&  L  = sub0::PARAM_LAYOUT;
+    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    const int    M  = batch * T;
+    const int    MC = M * C, MF = M * F;
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
@@ -378,12 +402,6 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
     const float* lm_head = base + L[fi + 1].off;
     const float* lm_bias = base + L[fi + 2].off;
 
-    const size_t TC = static_cast<size_t>(T) * C;
-    const size_t TF = static_cast<size_t>(T) * F;
-    const size_t TV = static_cast<size_t>(T) * V;
-
-    const int rc = fwd_alloc();
-    if (rc) return rc;
     int*   dids   = g_fwd.dids;
     float* h      = g_fwd.h;
     float* a      = g_fwd.a;
@@ -397,13 +415,13 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
     float* gact   = g_fwd.gact;
     float* ff2    = g_fwd.ff2;
     float* logits = g_fwd.logits;
-    SUB0_CUDA_CHECK(cudaMemcpy(dids, ids, static_cast<size_t>(T) * sizeof(int), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dids, ids, static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice));
 
-    // h = tok_emb[ids] + pos_emb
+    // h = tok_emb[ids] + pos_emb  (over all M rows; position = row % T)
     {
         const dim3 block(16, 16);
-        const dim3 grid((C + block.x - 1) / block.x, (T + block.y - 1) / block.y);
-        embed_add_kernel<<<grid, block>>>(tok_emb, pos_emb, dids, h, T, C);
+        const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+        embed_add_kernel<<<grid, block>>>(tok_emb, pos_emb, dids, h, M, T, C);
     }
 
     for (int l = 0; l < N_LAYERS; ++l) {
@@ -419,24 +437,25 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
         const float* W2  = base + L[b0 + 8].off;
         const float* b2  = base + L[b0 + 9].off;
 
-        launch_rmsnorm(h, ln1, a, T, C);                  // a = rmsnorm(h, ln1)
-        launch_linear(a, Wq, nullptr, q,  T, C, C);       // q,k,v = a . Wq/Wk/Wv
-        launch_linear(a, Wk, nullptr, kk, T, C, C);
-        launch_linear(a, Wv, nullptr, vv, T, C, C);
-        launch_attn(q, kk, vv, att, T, C, H);             // att = attn(q,k,v)
-        launch_linear(att, Wo, nullptr, proj, T, C, C);   // proj = att . Wo
-        launch_add(h, proj, h, static_cast<int>(TC));     // h = h + proj
-        launch_rmsnorm(h, ln2, fbuf, T, C);               // f = rmsnorm(h, ln2)
-        launch_linear(fbuf, W1, b1, ff1, T, C, F);        // ff1 = f . W1 + b1
-        launch_gelu(ff1, gact, static_cast<int>(TF));     // gelu
-        launch_linear(gact, W2, b2, ff2, T, F, C);        // ff2 = gelu . W2 + b2
-        launch_add(h, ff2, h, static_cast<int>(TC));      // h = h + ff2
+        launch_rmsnorm(h, ln1, a, M, C);                  // a = rmsnorm(h, ln1)
+        launch_linear(a, Wq, nullptr, q,  M, C, C);       // q,k,v = a . Wq/Wk/Wv
+        launch_linear(a, Wk, nullptr, kk, M, C, C);
+        launch_linear(a, Wv, nullptr, vv, M, C, C);
+        launch_attn(q, kk, vv, att, batch, T, C, H);      // per-window causal attention
+        launch_linear(att, Wo, nullptr, proj, M, C, C);   // proj = att . Wo
+        launch_add(h, proj, h, MC);                       // h = h + proj
+        launch_rmsnorm(h, ln2, fbuf, M, C);               // f = rmsnorm(h, ln2)
+        launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
+        launch_gelu(ff1, gact, MF);                       // gelu
+        launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
+        launch_add(h, ff2, h, MC);                        // h = h + ff2
     }
-    launch_rmsnorm(h, ln_f, a, T, C);                     // a = rmsnorm(h, ln_f)
-    launch_linear(a, lm_head, lm_bias, logits, T, C, V);  // logits = a . lm_head + lm_bias
+    launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
+    launch_linear(a, lm_head, lm_bias, logits, M, C, V);  // logits = a . lm_head + lm_bias
 
     SUB0_CUDA_CHECK(cudaGetLastError());
     SUB0_CUDA_CHECK(cudaDeviceSynchronize());
-    SUB0_CUDA_CHECK(cudaMemcpy(out_logits, logits, TV * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(out_logits, logits, static_cast<size_t>(M) * V * sizeof(float),
+                               cudaMemcpyDeviceToHost));
     return 0;   // scratch is resident -- freed by sub0_cuda_shutdown
 }
