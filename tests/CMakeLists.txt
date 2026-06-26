@@ -22,8 +22,8 @@ target_include_directories(sub0_tests PRIVATE
 target_link_libraries(sub0_tests PRIVATE sub0_core Catch2::Catch2WithMain)
 
 # GPU backend smoke test: compiled + linked only when the CUDA backend is built. The
-# nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll, so the existing DL_PATHS
-# below already covers it at discovery/run time.
+# nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll; its CUDA runtime deps are
+# covered by the toolkit bin added to DL_PATHS below.
 if(SUB0_BUILD_CUDA)
   target_sources(sub0_tests PRIVATE cuda_tests.cpp)
   target_link_libraries(sub0_tests PRIVATE sub0_backend_cuda)
@@ -34,7 +34,20 @@ set_target_properties(sub0_tests PROPERTIES
   BUILD_RPATH "$ORIGIN"
   INSTALL_RPATH "$ORIGIN")
 
-# On Windows the loader has no rpath; DL_PATHS adds sub0_core's directory to the
-# search path used during both test discovery and execution.
+# On Windows the loader has no rpath; DL_PATHS adds the needed DLL directories to the search
+# path used during test discovery and execution: sub0_core.dll (and sub0_backend_cuda.dll) sit
+# next to the test binary, and when the CUDA backend is built sub0_backend_cuda.dll additionally
+# needs the CUDA runtime DLLs (cudart/cublas) from the toolkit bin.
+#
+# DISCOVERY_MODE PRE_TEST: enumerate the test cases at `ctest` time, NOT during the build. Running
+# the CUDA-linked test exe at build time made every build depend on the CUDA runtime DLLs being
+# loadable in the build shell's environment (a missing/unfindable cublas surfaced as a cryptic
+# 0xc000007b and FAILED the build). Deferring to test time -- where DL_PATHS is applied -- keeps
+# the build robust on any host.
+set(_sub0_test_dl_paths "$<TARGET_FILE_DIR:sub0_core>")
+if(SUB0_BUILD_CUDA AND CUDAToolkit_BIN_DIR)
+  list(APPEND _sub0_test_dl_paths "${CUDAToolkit_BIN_DIR}")
+endif()
 catch_discover_tests(sub0_tests
-  DL_PATHS "$<TARGET_FILE_DIR:sub0_core>")
+  DL_PATHS ${_sub0_test_dl_paths}
+  DISCOVERY_MODE PRE_TEST)
