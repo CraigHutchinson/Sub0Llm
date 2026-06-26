@@ -182,6 +182,30 @@ private:
     std::size_t size_ = 0;
 };
 
+// Load a usable token corpus for the single-buffer tools (tune / bench / autotemp): prefer the
+// baked corpus.tok memory map, otherwise tokenize a bounded buffer on demand from the raw text
+// corpus -- the SAME auto-fallback the trainer uses, so these tools work on an on-demand build
+// (no corpus.tok) instead of bailing out. The returned span stays valid for as long as the
+// caller's `tok` (the mmap) and `od_buf` (the on-demand storage) live; on failure it is empty
+// and a diagnostic naming `tool` has already been printed.
+std::span<const int> load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_buf, const char* tool) {
+    if (tok.ok() && tok.vocab() == VOCAB && tok.tokens().size() > static_cast<std::size_t>(SEQ_LEN) + 2)
+        return tok.tokens();                       // baked corpus.tok (the fast path)
+
+    // No usable corpus.tok -> tokenize on demand from the raw corpus (matches the train stage).
+    sub0::load_tokenizer(sub0::default_tokenizer());   // on-demand encode needs the runtime tokenizer
+    TextCorpus text;
+    if (text.open(sub0::default_corpus())) {
+        std::mt19937 rng(123);
+        text.fill_random(0, text.bytes(), OD_TRAIN_BUF_TOK, rng, od_buf);
+    }
+    if (od_buf.size() > static_cast<std::size_t>(SEQ_LEN) + 2) return od_buf;
+
+    std::println(stderr, "{}: no usable corpus.tok ('{}') and cannot tokenize the raw corpus '{}'",
+                 tool, sub0::default_corpus_tok(), sub0::default_corpus());
+    return {};
+}
+
 // --- Validation NELBO -------------------------------------------------------
 // Mean cross-entropy per token over a fixed, evenly-spaced set of windows in the
 // held-out tail. Fixed windows make the metric comparable across evals (so the
@@ -753,11 +777,9 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
 #endif
 
     sub0::TokMap tok(sub0::default_corpus_tok());
-    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
-        std::println(stderr, "bench: cannot load a usable corpus.tok");
-        return 1;
-    }
-    const std::span<const int> data = tok.tokens();
+    std::vector<int> od_buf;
+    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "bench");
+    if (data.empty()) return 1;
     sub0::build_model();
     sub0::AdamW opt(0.001f);
     std::mt19937 rng(123);
@@ -907,11 +929,9 @@ double measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose) {
     sub0::TokMap tok(sub0::default_corpus_tok());
-    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
-        std::println(stderr, "tune: cannot load a usable corpus.tok");
-        return 1;
-    }
-    const std::span<const int> data = tok.tokens();
+    std::vector<int> od_buf;
+    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "tune");
+    if (data.empty()) return 1;
     sub0::build_model();
     std::mt19937 rng(123);
 
@@ -1094,11 +1114,9 @@ using sub0::coherence::interp_cross;
 
 extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose) {
     sub0::TokMap tok(sub0::default_corpus_tok());
-    if (!tok.ok() || tok.vocab() != VOCAB || tok.tokens().size() <= static_cast<size_t>(SEQ_LEN) + 2) {
-        std::println(stderr, "autotemp: cannot load a usable corpus.tok");
-        return 1;
-    }
-    const std::span<const int> data = tok.tokens();
+    std::vector<int> od_buf;
+    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "autotemp");
+    if (data.empty()) return 1;
 
     sub0::build_model();
     if (!sub0::load_model(model_in)) {
