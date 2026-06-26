@@ -142,6 +142,21 @@ endif()
 # --- OpenMP (data-parallel training) ----------------------------------------
 include(cmake/OpenMP.cmake)
 
+# --- Optional CUDA backend build (Phase 2 skeleton) -------------------------
+# Opt-in: builds src/backend_cuda.cu with nvcc (sm_${SUB0_CUDA_ARCH}) into a shared lib
+# plus a self-test exe, proving the multi-compiler pipeline (clang C++ + nvcc .cu). The
+# CPU engine is unaffected -- this is the build-integration step before the GPU backend
+# implements the engine API. enable_language(CUDA) is called here so nvcc is set up
+# before the targets below; the actual targets are defined next to sub0_core.
+option(SUB0_BUILD_CUDA "Build the CUDA backend skeleton + self-test (needs nvcc + a CUDA device)" OFF)
+if(SUB0_BUILD_CUDA)
+  if(NOT SUB0_HAS_CUDA)
+    message(FATAL_ERROR "SUB0_BUILD_CUDA=ON but no CUDA toolkit/device was detected at configure time.")
+  endif()
+  enable_language(CUDA)
+  message(STATUS "CUDA backend: nvcc enabled, target sm_${SUB0_CUDA_ARCH}")
+endif()
+
 # --- Stage 1: the configurator (host tool, depends on nothing generated) -----
 add_executable(sub0-configure tools/configurator.cpp)
 target_include_directories(sub0-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
@@ -209,6 +224,25 @@ endif()
 # loudly at compile time (see the #error in engine.cpp) instead of running serially.
 if(SUB0_REQUIRE_OPENMP)
   target_compile_definitions(sub0_core PUBLIC SUB0_REQUIRE_OPENMP)
+endif()
+
+# --- CUDA backend skeleton (Phase 2; built only when SUB0_BUILD_CUDA) --------
+# Compiled by nvcc; meets the clang world only at the extern "C" self-test boundary.
+# Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
+if(SUB0_BUILD_CUDA)
+  add_library(sub0_backend_cuda SHARED src/backend_cuda.cu)
+  add_dependencies(sub0_backend_cuda sub0_generate_config)
+  target_include_directories(sub0_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+  set_target_properties(sub0_backend_cuda PROPERTIES
+    CUDA_ARCHITECTURES "${SUB0_CUDA_ARCH}"
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON)
+  target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart)
+
+  add_executable(sub0-cuda-selftest tools/cuda_selftest.cpp)
+  target_link_libraries(sub0-cuda-selftest PRIVATE sub0_backend_cuda)
+  set_target_properties(sub0-cuda-selftest PROPERTIES
+    BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 endif()
 
 # --- Stage 4: backend stage libraries ---------------------------------------
