@@ -7,7 +7,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
-#include "sub0/core.hpp"   // trainable_floats()
+#include "sub0/core.hpp"     // trainable_floats()
+#include "sub0/memplan.hpp"  // the pure footprint model under test
 
 #include <algorithm>
 #include <cmath>
@@ -26,6 +27,8 @@ extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
                                    float* out_grad, double* out_loss);
 extern "C" int  sub0_cuda_adam_step(float lr, long t);
+extern "C" int  sub0_cuda_train_predicted_mb(int batch);
+extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -285,6 +288,37 @@ TEST_CASE("CUDA forward stays finite under saturating GELU activations", "[cuda]
     REQUIRE(maxabs < 0.05 * maxcpu + 1e-2);   // matches the CPU's clamped saturation
 
     std::copy(saved.begin(), saved.end(), sub0::params_ptr());   // restore for later tests
+    sub0_cuda_shutdown();
+}
+
+// This build's dimensions for the pure footprint model (sub0/memplan.hpp), straight from the config.
+static constexpr sub0::memplan::Dims kTestDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+
+// The footprint model must agree with the canonical parameter layout: param_floats() re-derives
+// PARAM_FLOATS from dims (so the configurator can call it without layout.hpp). If they diverge,
+// every footprint prediction is wrong by a constant -- catch it here, decoupled from the device.
+TEST_CASE("memplan param_floats matches the canonical layout", "[cuda][memplan]") {
+    REQUIRE(sub0::memplan::param_floats(kTestDims) == sub0::trainable_floats());
+}
+
+// The drift check the whole footprint scheme rests on: predict the resident training VRAM from the
+// pure model, then ALLOCATE it for real and measure the device delta (cudaMemGetInfo). They must
+// agree to within allocation-rounding noise. If a buffer is added/removed/resized in
+// backend_cuda.cu without updating memplan.hpp, the gap blows past the tolerance and this fails --
+// exactly the "we didn't maintain the calculation" regression we want to catch automatically.
+TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]") {
+    for (const int batch : {32, 64, 128}) {
+        double predicted_mb = 0.0, actual_mb = 0.0;
+        REQUIRE(sub0_cuda_train_footprint(batch, &predicted_mb, &actual_mb) == 0);
+        WARN("batch=" << batch << "  predicted=" << predicted_mb << " MiB  measured=" << actual_mb
+             << " MiB  gap=" << (actual_mb - predicted_mb) << " MiB");
+        REQUIRE(actual_mb > 0.0);
+        // The measured delta is our exact byte sum plus per-cudaMalloc rounding and WDDM free-memory
+        // noise -- a bounded, batch-independent offset, NOT a percentage. So we allow a fixed MiB
+        // slack (sub0::memplan::FOOTPRINT_TOLERANCE_MB). A missing/extra/resized buffer shifts the
+        // gap by hundreds of MiB -- far outside this band -- which is the regression we want to catch.
+        CHECK(predicted_mb == Catch::Approx(actual_mb).margin(sub0::memplan::FOOTPRINT_TOLERANCE_MB));
+    }
     sub0_cuda_shutdown();
 }
 

@@ -14,6 +14,7 @@
 #include "sub0/layout.hpp"   // PARAM_FLOATS + model dims + COMPUTE_MODE / CUDA_ARCH / HAS_CUDA
 #include "sub0/knob.hpp"     // Knob<T,Baked>: compile-time-baked / runtime-tunable knobs
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the CPU tuner
+#include "sub0/memplan.hpp"  // train_resident_bytes: the predicted footprint this file is validated against
 
 #include <cstdio>
 #include <vector>
@@ -1474,4 +1475,42 @@ SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double*
 // every batch profiles in roughly the same time. Writes mean ms/step to *out_ms, prints nothing.
 SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
     return time_train_step(batch, T, 0, budget_ms, out_ms);
+}
+
+// This build's model dimensions, packaged for the pure footprint model (sub0/memplan.hpp).
+static constexpr sub0::memplan::Dims kFootprintDims{
+    D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+};
+
+// Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device
+// work -- callers that only need the prediction (the runtime guard, the configurator) use this.
+SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    return sub0::memplan::train_resident_mb(kFootprintDims, batch);
+}
+
+// Self-validating footprint probe: allocate the FULL resident training set for `batch` on a clean
+// device, measure the actual VRAM it consumed (cudaMemGetInfo delta), and return that alongside the
+// pure model's prediction. The gap is how far the memplan.hpp mirror has drifted from the real
+// allocations in this file -- the CUDA footprint test asserts it stays tiny, so adding/removing a
+// device buffer without updating the mirror fails CI instead of silently mis-predicting in the field.
+// Both outputs are MiB; either pointer may be null. Leaves the scratch allocated (callers re-tune or
+// shut down as usual). Returns nonzero on a device/allocation failure.
+SUB0_CUDA_API int sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb) {
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    sub0_cuda_shutdown();                                   // clean slate so the delta is purely ours
+    std::size_t free_before = 0, total = 0;
+    if (cudaMemGetInfo(&free_before, &total) != cudaSuccess) return 1;
+    if (sub0_cuda_init() || fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
+    cudaDeviceSynchronize();                                // ensure the allocations are physically resident
+    std::size_t free_after = 0;
+    if (cudaMemGetInfo(&free_after, &total) != cudaSuccess) return 1;
+    const double actual = free_before > free_after ? static_cast<double>(free_before - free_after) : 0.0;
+    const double predicted = static_cast<double>(sub0::memplan::train_resident_bytes(kFootprintDims, batch));
+    constexpr double MiB = 1024.0 * 1024.0;
+    if (predicted_mb) *predicted_mb = predicted / MiB;
+    if (actual_mb)    *actual_mb    = actual / MiB;
+    return 0;
 }

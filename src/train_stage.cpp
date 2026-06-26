@@ -22,6 +22,7 @@
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
+#include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
 // Code version + models root, baked in by CMake (configure-time) so a model records what
 // produced it and lands in a structured directory. Fallbacks keep the file compilable alone.
@@ -76,6 +77,8 @@ extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int bat
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" void sub0_cuda_set_attn_bwd(int per_query);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
+// Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
+extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 #endif
 
 namespace {
@@ -968,6 +971,11 @@ bool read_tune_cache_value(const char* key, int* out) {
 // carries the cached CPU tuning forward. The driver maps the --backend string onto these.
 enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, TUNE_BACKEND_GPU = 3 };
 
+// This build's dimensions for the pure footprint model (sub0/memplan.hpp): lets the GPU sweep
+// predict the resident VRAM a training batch needs BEFORE allocating it, and lets the run
+// cross-check that prediction against the device's actual usage.
+static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend) {
     const bool run_cpu = backend != TUNE_BACKEND_GPU;   // gpu-only skips the CPU sweep
     const bool run_gpu = backend != TUNE_BACKEND_CPU;   // cpu-only skips the device-step sweep
@@ -1092,60 +1100,133 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
 #if defined(SUB0_BUILD_CUDA)
     if (run_gpu && HAS_CUDA && sub0_cuda_init() == 0) {
         std::println("");
+#if defined(SUB0_TUNING)
         std::println("--- GPU device-step tuning (knobs: batch, TF32, attn-backward) ---");
+#else
+        std::println("--- GPU device-step tuning (knob: batch; TF32/attn-backward baked) ---");
+#endif
         report_threading();
-        // Every device measurement is sized to a fixed wall-time budget (Google-Benchmark style):
-        // the timer probes once then runs only as many steps as fit the budget, so a big-batch step
-        // (slow) and a small-batch step (fast) each profile in roughly the same time instead of the
-        // cost ballooning with the workload.
-        constexpr double kBudgetMs = 1200.0;
-        // 1) Batch sweep: throughput climbs with batch then saturates (bigger GEMM M = better GPU
-        //    utilization). We stop at the KNEE -- the first batch whose throughput gain over the
-        //    previous one drops below 6% -- so we never pay to profile the largest, slowest batches
-        //    once the curve has flattened.
-        sub0_cuda_set_tf32(0); sub0_cuda_set_attn_bwd(0);
-        int    knee = 0;            // largest batch that still earned a >=6% throughput gain
-        double prev_tok = 0.0;
-        for (int b : {64, 128, 256, 384, 512, 768, 1024}) {
+
+        // Auto-validate the footprint model against reality before trusting it to gate the sweep:
+        // allocate the smallest grid batch for real and compare the measured VRAM delta to the pure
+        // prediction. A meaningful gap means memplan.hpp has drifted from the allocations in
+        // backend_cuda.cu -- warn loudly (and the CUDA footprint test fails) so the predictive guard
+        // below, which trusts the prediction, is never silently steering on a stale formula.
+        {
+            double pred_mb = 0.0, act_mb = 0.0;
+            if (sub0_cuda_train_footprint(64, &pred_mb, &act_mb) == 0 && act_mb > 0.0) {
+                const double gap = std::fabs(pred_mb - act_mb);
+                std::println("footprint check @ batch 64: predicted {:.0f} MiB | measured {:.0f} MiB | gap {:.0f} MiB{}",
+                             pred_mb, act_mb, gap,
+                             gap > sub0::memplan::FOOTPRINT_TOLERANCE_MB
+                                 ? "  !! memplan.hpp is STALE -- update the device footprint model !!" : "");
+                std::fflush(stdout);
+            }
+        }
+
+        // The SAME robust search the CPU sweep uses (sub0::tune::maximize): a joint coarse grid +
+        // top-basin refinement + median-of-samples confirmation. This replaces the old single-pass
+        // batch sweep that stopped at the first sub-6% throughput gain -- a rule a single noisy
+        // reading could trip early, and which silently settled on a LOCAL trough (the measured curve
+        // dips at batch 512 below 384 before climbing higher again at 768, so "first plateau" picked
+        // the worse of two peaks). The joint grid is the right tool because the knobs INTERACT: the
+        // per-query attention backward wins at small batch but loses to per-head at large batch
+        // (atomic contention), so the best attn strategy depends on the chosen batch. Objective =
+        // measured tok/s; the device timer is budget-sized so each sample costs ~the same wall time.
+        sub0_cuda_set_tf32(CUDA_TF32 ? 1 : 0); sub0_cuda_set_attn_bwd(0);   // baseline for batch-only builds
+        sub0::tune::Space gspace = { {"batch", {64, 128, 256, 384, 512, 768, 1024}} };
+#if defined(SUB0_TUNING)
+        gspace.push_back({"tf32",     {0, 1}});
+        gspace.push_back({"attn_bwd", {0, 1}});
+#endif
+        // Format the optional knob columns (TF32 / attn strategy) only when they are in the space.
+        auto knob_suffix = [](const sub0::tune::Assignment& a) -> std::string {
+            std::string s;
+            if (a.size() > 1) s += std::format("  tf32={}", static_cast<int>(std::lround(a[1])));
+            if (a.size() > 2) s += std::format("  attn={:<5}", std::lround(a[2]) ? "query" : "head");
+            return s;
+        };
+
+        double gbudget_ms = 400.0;          // grown per phase via on_phase below
+        double grunning_best = 0.0;
+        sub0::tune::Objective gobjective = [&](const sub0::tune::Assignment& a) -> double {
+            const int batch = static_cast<int>(std::lround(a[0]));
+            // Predictive VRAM guard: never even TIME a batch whose resident footprint cannot fit in
+            // dedicated VRAM. On Windows an over-budget cudaMalloc does NOT OOM -- it silently spills
+            // to WDDM shared memory and THRASHES over PCIe, so the measurement would "succeed" at a
+            // ruinous ~10x-slower rate and pollute the search. Predict up front and skip instead.
+            if (GPU_VRAM_MB > 0) {
+                const int need = sub0::memplan::train_resident_mb(kGpuDims, batch);
+                if (need > GPU_VRAM_MB) {
+                    if (verbose) {
+                        std::println("  batch={:>4}{}  ->  predicted {} MiB > {} MiB VRAM, skipping (would spill)",
+                                     batch, knob_suffix(a), need, GPU_VRAM_MB);
+                        std::fflush(stdout);
+                    }
+                    return 0.0;
+                }
+            }
+            if (a.size() > 1) sub0_cuda_set_tf32(static_cast<int>(std::lround(a[1])));
+            if (a.size() > 2) sub0_cuda_set_attn_bwd(static_cast<int>(std::lround(a[2])));
             double ms = 0.0;
             const auto t0 = std::chrono::steady_clock::now();
-            const int rc = sub0_cuda_time_train_step(b, SEQ_LEN, kBudgetMs, &ms);
+            const int rc = sub0_cuda_time_train_step(batch, SEQ_LEN, gbudget_ms, &ms);
             const double profile_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (rc != 0 || ms <= 0.0) break;                          // VRAM cap -> stop
-            const double tok = static_cast<double>(b) * SEQ_LEN * 1000.0 / ms;
-            std::println("  batch={:>4}  ->  {:>8.0f} tok/s  ({:.2f} ms/step, {:.2f}s)", b, tok, ms, profile_s);
-            std::fflush(stdout);
-            if (knee == 0) { knee = b; prev_tok = tok; continue; }   // first point always accepted
-            if ((tok - prev_tok) / prev_tok < 0.06) break;           // plateau: keep the previous knee
-            knee = b; prev_tok = tok;                                // this batch earned its larger size
-        }
-        if (knee != 0) {
-            gpu_batch = knee;
-            std::println("  -> batch knee = {} (throughput plateau; next-step gain < 6%)", gpu_batch);
-        }
-#if defined(SUB0_TUNING)
-        // 2) At the chosen batch, sweep the runtime knobs (TF32 x attention-backward).
-        double best_tok = 0.0;
-        for (int tf32 = 0; tf32 <= 1; ++tf32)
-            for (int attn = 0; attn <= 1; ++attn) {
-                sub0_cuda_set_tf32(tf32); sub0_cuda_set_attn_bwd(attn);
-                double ms = 0.0;
-                const auto t0 = std::chrono::steady_clock::now();
-                const int rc = sub0_cuda_time_train_step(gpu_batch, SEQ_LEN, kBudgetMs, &ms);
-                const double profile_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                if (rc != 0 || ms <= 0.0) continue;
-                const double tok = static_cast<double>(gpu_batch) * SEQ_LEN * 1000.0 / ms;
-                const bool best = tok > best_tok;
-                std::println("  tf32={}  attn_bwd={:<5}  ->  {:>8.0f} tok/s  ({:.2f}s){}",
-                             tf32, attn ? "query" : "head", tok, profile_s, best ? "   <- best" : "");
-                std::fflush(stdout);
-                if (best) { best_tok = tok; gpu_tf32 = tf32; gpu_attn = attn; }
+            // VRAM cap / timing failure -> worst score so the search steers away (and keeps probing
+            // the smaller batches) instead of aborting the whole sweep on one allocation failure.
+            if (rc != 0 || ms <= 0.0) {
+                if (verbose) {
+                    std::println("  batch={:>4}{}  ->  alloc/timing failed  ({:.2f}s)",
+                                 batch, knob_suffix(a), profile_s);
+                    std::fflush(stdout);
+                }
+                return 0.0;
             }
-        std::println("best GPU: batch={}  tf32={}  attn_bwd={}  ->  {:.0f} tok/s",
-                     gpu_batch, gpu_tf32, gpu_attn ? "query" : "head", best_tok);
+            const double tok = static_cast<double>(batch) * SEQ_LEN * 1000.0 / ms;
+            if (verbose) {
+                const bool best = tok > grunning_best;
+                std::println("  batch={:>4}{}  ->  {:>8.0f} tok/s  ({:.2f} ms/step, {:.2f}s){}",
+                             batch, knob_suffix(a), tok, ms, profile_s, best ? "   <- best" : "");
+                std::fflush(stdout);
+            }
+            grunning_best = std::max(grunning_best, tok);
+            return tok;
+        };
+
+        sub0::tune::Options gopt;
+        gopt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+        gopt.confirm_rounds = 2;            // GPU steps cost seconds each: lighter confirmation than CPU
+        gopt.on_phase = [&](sub0::tune::Phase p) {
+            switch (p) {
+                case sub0::tune::Phase::Explore:
+                    gbudget_ms = 400.0;
+                    std::println("[explore] joint batch x knob grid (~0.4s/sample)");
+                    break;
+                case sub0::tune::Phase::Refine:
+                    gbudget_ms = 700.0;
+                    std::println("[refine]  zooming the leading basins (~0.7s/sample)");
+                    break;
+                case sub0::tune::Phase::Confirm:
+                    gbudget_ms = 1000.0;
+                    std::println("[confirm] re-measuring finalists by median (~1.0s/sample)");
+                    break;
+            }
+            std::fflush(stdout);
+        };
+        const sub0::tune::Result gr = sub0::tune::maximize(gspace, gobjective, gopt);
+
+        gpu_batch = static_cast<int>(std::lround(gr.best[0]));
+#if defined(SUB0_TUNING)
+        gpu_tf32 = static_cast<int>(std::lround(gr.best[1]));
+        gpu_attn = static_cast<int>(std::lround(gr.best[2]));
 #else
         std::println("  (TF32 / attn-backward are baked in this build; rebuild with -DSUB0_TUNING=ON to tune them)");
 #endif
+        std::println("");
+        std::println("evaluated {} device measurements; winner confirmed over {} samples",
+                     gr.evaluations, gr.best_samples);
+        std::println("best GPU: batch={}  tf32={}  attn_bwd={}  ->  {:.0f} tok/s (median)",
+                     gpu_batch, gpu_tf32, gpu_attn ? "query" : "head", gr.best_score);
         sub0_cuda_shutdown();
     }
 #endif
