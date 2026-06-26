@@ -82,10 +82,10 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 # becomes continuous / high-dimensional.
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
-set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/tinystories.txt" CACHE FILEPATH "training corpus (drives vocab)")
-set(SUB0_D_MODEL  96 CACHE STRING "embedding / residual width")
-set(SUB0_N_LAYERS 5  CACHE STRING "transformer blocks")
-set(SUB0_N_HEADS  4  CACHE STRING "attention heads")
+set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
+set(SUB0_D_MODEL  192 CACHE STRING "embedding / residual width")
+set(SUB0_N_LAYERS 8  CACHE STRING "transformer blocks")
+set(SUB0_N_HEADS  6  CACHE STRING "attention heads")
 set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
