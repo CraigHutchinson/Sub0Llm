@@ -14,3 +14,6 @@ out/
 *.words
 data/fineweb_edu.txt
 data/fineweb_edu.txt.done
+# derived slices for smoke/throughput runs (recreated from the full corpus on demand)
+data/fineweb_smoke.txt
+data/cfg_test.txt

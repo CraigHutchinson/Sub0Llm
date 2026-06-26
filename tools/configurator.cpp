@@ -90,6 +90,77 @@ bool for_each_chunk(const std::string& path, Fn&& fn) {
     return true;
 }
 
+// Like for_each_chunk but over the byte range [start, end) of the file. Both ends are
+// expected to be newline-aligned (see segment_bounds), so the range is a whole number of
+// lines and feeding it to `fn` is byte-identical to streaming the whole file -- this is the
+// unit a worker thread owns when the passes run in parallel. Reads only its own range, in
+// CHUNK_BYTES sub-chunks, so the resident set per worker stays bounded out-of-core.
+template <class Fn>
+bool for_each_chunk_range(const std::string& path, std::size_t start, std::size_t end, Fn&& fn) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return false;
+    if (start >= end) return true;
+    is.seekg(static_cast<std::streamoff>(start));
+    std::string buf, block(CHUNK_BYTES, '\0');
+    std::size_t remaining = end - start;
+    while (remaining > 0) {
+        const std::size_t want = std::min(remaining, CHUNK_BYTES);
+        is.read(block.data(), static_cast<std::streamsize>(want));
+        const std::streamsize got = is.gcount();
+        if (got <= 0) { if (!buf.empty()) fn(std::string_view{buf}); break; }
+        buf.append(block.data(), static_cast<std::size_t>(got));
+        remaining -= static_cast<std::size_t>(got);
+        if (remaining == 0) { if (!buf.empty()) fn(std::string_view{buf}); break; }
+        const std::size_t nl = buf.rfind('\n');
+        if (nl == std::string::npos) continue;
+        fn(std::string_view{buf.data(), nl + 1});
+        buf.erase(0, nl + 1);
+    }
+    return true;
+}
+
+// Split [0, fsz) into `nseg` ranges whose interior boundaries land just AFTER a newline, so
+// no line (and no word/glyph/look-back) is ever split -- the same invariant that makes
+// chunking byte-identical to whole-file processing. Each interior cut starts at the even
+// offset i*fsz/nseg and advances to the next newline. Returns nseg+1 monotonic offsets.
+std::vector<std::size_t> segment_bounds(const std::string& path, std::size_t fsz, int nseg) {
+    std::vector<std::size_t> b(static_cast<std::size_t>(nseg) + 1);
+    b[0] = 0; b[static_cast<std::size_t>(nseg)] = fsz;
+    std::ifstream is(path, std::ios::binary);
+    std::string blk(1u << 20, '\0');
+    for (int i = 1; i < nseg; ++i) {
+        std::size_t pos = fsz * static_cast<std::size_t>(i) / static_cast<std::size_t>(nseg);
+        if (pos <= b[static_cast<std::size_t>(i) - 1]) { b[static_cast<std::size_t>(i)] = b[static_cast<std::size_t>(i) - 1]; continue; }
+        is.clear(); is.seekg(static_cast<std::streamoff>(pos));
+        std::size_t adv = 0; bool found = false;                   // scan forward to the next '\n'
+        while (!found) {
+            is.read(blk.data(), static_cast<std::streamsize>(blk.size()));
+            const std::streamsize got = is.gcount();
+            if (got <= 0) break;
+            for (std::streamsize k = 0; k < got; ++k) { ++adv; if (blk[static_cast<std::size_t>(k)] == '\n') { found = true; break; } }
+        }
+        std::size_t boundary = found ? std::min(pos + adv, fsz) : fsz;   // just past the newline
+        if (boundary < b[static_cast<std::size_t>(i) - 1]) boundary = b[static_cast<std::size_t>(i) - 1];
+        b[static_cast<std::size_t>(i)] = boundary;
+    }
+    for (int i = 1; i <= nseg; ++i)
+        if (b[static_cast<std::size_t>(i)] < b[static_cast<std::size_t>(i) - 1]) b[static_cast<std::size_t>(i)] = b[static_cast<std::size_t>(i) - 1];
+    return b;
+}
+
+// Run `body(t, start, end)` on each of `nseg` newline-aligned segments concurrently, one
+// std::thread per segment (the configurator links no OpenMP -- it is a standalone host tool).
+template <class Body>
+void parallel_segments(const std::vector<std::size_t>& bnd, int nseg, Body&& body) {
+    std::vector<std::thread> th;
+    th.reserve(static_cast<std::size_t>(nseg));
+    for (int t = 0; t < nseg; ++t)
+        th.emplace_back([&, t] {
+            body(t, bnd[static_cast<std::size_t>(t)], bnd[static_cast<std::size_t>(t) + 1]);
+        });
+    for (auto& x : th) x.join();
+}
+
 // --- Intermediate scan state (the cacheable output of the expensive corpus passes) -------
 // A complete snapshot of what passes 1-2 produce: the bounded name-detection COUNTS, the
 // unique-word frequency table, the alphabet usage and aggregate stats. This is the
@@ -297,92 +368,158 @@ int main(int argc, char** argv) {
         std::println(stderr, "scan cache: HIT '{}' ({} words, {} attested) -- corpus scan skipped",
                      cache_path, S.word_syms.size(), attested.size());
     } else {
-        // --- Pass 1: decide which lowercase forms license a Capitalized/UPPER -> marker
-        //     collapse. The tell is *position*: a capital following a lowercase word
+        // The corpus scan (passes 1-2) is the cost that scales with the corpus and is
+        // CPU-bound (normalize + truecase + table build, far below disk bandwidth), so it is
+        // run DATA-PARALLEL: the file is split into newline-aligned segments (one per worker),
+        // each worker scans its own segment into THREAD-LOCAL tables, and the tables are merged
+        // afterwards. Correctness rests on two facts: a newline never splits a unit/look-back
+        // (so per-segment results equal whole-file results), and every downstream artifact is
+        // INVARIANT to word-table ordering -- the base alphabet is byte-ordered, and BPE picks
+        // each merge by (count, pair) where counts are order-independent sums and pair ids are
+        // byte-derived. So the merged tables (hence tokenizer.bin / corpus.tok) are byte-
+        // identical to the single-thread scan regardless of how the corpus is partitioned.
+        std::error_code fec;
+        const std::size_t fsz = static_cast<std::size_t>(std::filesystem::file_size(corpus, fec));
+        if (fec || fsz == 0) { std::println(stderr, "configure error: empty corpus"); return 1; }
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        // >= ~16 MB per segment so the merge/thread overhead is amortised; capped at the cores.
+        int nseg = static_cast<int>(std::min<std::size_t>(hw, std::max<std::size_t>(1, fsz / (16u << 20))));
+        if (nseg < 1) nseg = 1;
+        const std::vector<std::size_t> bnd = segment_bounds(corpus, fsz, nseg);
+
+        // --- Pass 1 (parallel): decide which lowercase forms license a Capitalized/UPPER ->
+        //     marker collapse. The tell is *position*: a capital following a lowercase word
         //     mid-sentence ("...to Spot") is a name; per lowercase form we count lowercase
         //     uses vs mid-sentence-capital uses, withholding name-dominant forms from `attested`.
-        const bool open_ok = for_each_chunk(corpus, [&](std::string_view chunk) {
-            S.raw_bytes += chunk.size();
-            long qr = 0;
-            const std::string norm = normalize_text(std::string(chunk), qr);
-            S.quote_repl += qr;
-            S.norm_bytes += norm.size();
-            auto preceded_by_lowercase = [&](std::size_t start) {
-                std::size_t k = start;
-                while (k > 0 && (norm[k - 1] == ' ' || norm[k - 1] == '\t')) --k;
-                return k > 0 && is_lower(static_cast<unsigned char>(norm[k - 1]));
-            };
-            for (std::size_t i = 0, n = norm.size(); i < n;) {
-                const unsigned char c = static_cast<unsigned char>(norm[i]);
-                if (!is_alpha(c)) { ++i; continue; }
-                std::size_t j = i;
-                bool all_lower = true, rest_lower = true;
-                while (j < n && is_alpha(static_cast<unsigned char>(norm[j]))) {
-                    const unsigned char ch = static_cast<unsigned char>(norm[j]);
-                    if (!is_lower(ch)) all_lower = false;
-                    if (j > i && !is_lower(ch)) rest_lower = false;
-                    ++j;
-                }
-                const std::string w = norm.substr(i, j - i);
-                if (all_lower) {
-                    S.lower_count[w] += 1;
-                } else if (is_upper(static_cast<unsigned char>(w[0])) && rest_lower) {  // "Spot", "The"
-                    if (preceded_by_lowercase(i)) {
-                        std::string lw = w;
-                        lw[0] = static_cast<char>(to_lower(static_cast<unsigned char>(lw[0])));
-                        S.midcap_count[lw] += 1;
+        //     Each worker accumulates local name counts + byte tallies; we sum them after.
+        struct P1Local {
+            std::unordered_map<std::string, long long> lower_count, midcap_count;
+            std::size_t raw = 0, norm = 0; long long qr = 0; bool ok = false;
+        };
+        std::vector<P1Local> p1(static_cast<std::size_t>(nseg));
+        parallel_segments(bnd, nseg, [&](int t, std::size_t a, std::size_t b) {
+            P1Local& L = p1[static_cast<std::size_t>(t)];
+            L.ok = for_each_chunk_range(corpus, a, b, [&](std::string_view chunk) {
+                L.raw += chunk.size();
+                long qr = 0;
+                const std::string norm = normalize_text(std::string(chunk), qr);
+                L.qr += qr;
+                L.norm += norm.size();
+                auto preceded_by_lowercase = [&](std::size_t start) {
+                    std::size_t k = start;
+                    while (k > 0 && (norm[k - 1] == ' ' || norm[k - 1] == '\t')) --k;
+                    return k > 0 && is_lower(static_cast<unsigned char>(norm[k - 1]));
+                };
+                for (std::size_t i = 0, n = norm.size(); i < n;) {
+                    const unsigned char c = static_cast<unsigned char>(norm[i]);
+                    if (!is_alpha(c)) { ++i; continue; }
+                    std::size_t j = i;
+                    bool all_lower = true, rest_lower = true;
+                    while (j < n && is_alpha(static_cast<unsigned char>(norm[j]))) {
+                        const unsigned char ch = static_cast<unsigned char>(norm[j]);
+                        if (!is_lower(ch)) all_lower = false;
+                        if (j > i && !is_lower(ch)) rest_lower = false;
+                        ++j;
                     }
+                    const std::string w = norm.substr(i, j - i);
+                    if (all_lower) {
+                        L.lower_count[w] += 1;
+                    } else if (is_upper(static_cast<unsigned char>(w[0])) && rest_lower) {  // "Spot", "The"
+                        if (preceded_by_lowercase(i)) {
+                            std::string lw = w;
+                            lw[0] = static_cast<char>(to_lower(static_cast<unsigned char>(lw[0])));
+                            L.midcap_count[lw] += 1;
+                        }
+                    }
+                    i = j;
                 }
-                i = j;
-            }
+            });
         });
-        if (!open_ok)         { std::println(stderr, "configure error: cannot read corpus '{}'", corpus); return 1; }
+        for (P1Local& L : p1) {
+            if (!L.ok) { std::println(stderr, "configure error: cannot read corpus '{}'", corpus); return 1; }
+            S.raw_bytes += L.raw; S.norm_bytes += L.norm; S.quote_repl += L.qr;
+            for (const auto& [w, c] : L.lower_count)  S.lower_count[w]  += c;   // sums commute -> order-free
+            for (const auto& [w, c] : L.midcap_count) S.midcap_count[w] += c;
+            L.lower_count = {}; L.midcap_count = {};                            // free as we merge
+        }
         if (S.raw_bytes == 0) { std::println(stderr, "configure error: empty corpus"); return 1; }
         derive_attested();
         _t1 = std::chrono::steady_clock::now();
 
-        // --- Pass 2: truecase each chunk + pre-tokenize into the unique-word table. A word
-        //     unit (run of word bytes per word_unit_end) becomes one table entry keyed by its
-        //     RAW byte-symbol sequence (independent of the not-yet-fixed base alphabet);
-        //     punctuation, spaces and the markers are standalone symbols that never merge. We
-        //     also record which byte values / markers actually occur.
-        for_each_chunk(corpus, [&](std::string_view chunk) {
-            long qr = 0;
-            const std::string  norm   = normalize_text(std::string(chunk), qr);
-            const std::vector<int> stream = truecase_tokenize(norm, attested, &S.st);
-            for (std::size_t i = 0, n = stream.size(); i < n;) {
-                const std::size_t end = word_unit_end(stream, i);
-                if (end == i) {                                  // standalone symbol
-                    const int s = stream[i];
-                    if (s == TOK_CAP)      S.used_cap = true;
-                    else if (s == TOK_UP)  S.used_up = true;
-                    else                   S.byte_used[s] = 1;
-                    ++i; continue;
+        // --- Pass 2 (parallel): truecase each chunk + pre-tokenize into the unique-word table.
+        //     A word unit (run of word bytes per word_unit_end) becomes one table entry keyed by
+        //     its RAW byte-symbol sequence (independent of the not-yet-fixed base alphabet);
+        //     punctuation, spaces and the markers are standalone symbols that never merge. Each
+        //     worker builds a local table; we fold the locals into the global one afterwards.
+        struct P2Local {
+            std::unordered_map<std::string, int> index;
+            std::vector<std::vector<int>> word_syms;
+            std::vector<long long> word_freq;
+            std::array<int, 256> byte_used{};
+            bool used_cap = false, used_up = false;
+            sub0::casing::TokStats st;
+        };
+        std::vector<P2Local> p2(static_cast<std::size_t>(nseg));
+        parallel_segments(bnd, nseg, [&](int t, std::size_t a, std::size_t b) {
+            P2Local& L = p2[static_cast<std::size_t>(t)];
+            for_each_chunk_range(corpus, a, b, [&](std::string_view chunk) {
+                long qr = 0;
+                const std::string  norm   = normalize_text(std::string(chunk), qr);
+                const std::vector<int> stream = truecase_tokenize(norm, attested, &L.st);
+                for (std::size_t i = 0, n = stream.size(); i < n;) {
+                    const std::size_t end = word_unit_end(stream, i);
+                    if (end == i) {                                  // standalone symbol
+                        const int s = stream[i];
+                        if (s == TOK_CAP)      L.used_cap = true;
+                        else if (s == TOK_UP)  L.used_up = true;
+                        else                   L.byte_used[s] = 1;
+                        ++i; continue;
+                    }
+                    // Build the lookup key directly from the byte run (1 byte/symbol, usually in
+                    // std::string's small buffer -> no heap), and only allocate the word's symbol
+                    // vector / mark its bytes on a CACHE MISS. Repeated words (the vast majority of
+                    // occurrences) then cost just a key build + a counter bump -- no per-occurrence
+                    // vector allocation.
+                    std::string key(end - i, '\0');
+                    for (std::size_t k = i; k < end; ++k) key[k - i] = static_cast<char>(stream[k] & 0xFF);
+                    auto it = L.index.find(key);
+                    if (it == L.index.end()) {
+                        std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                             stream.begin() + static_cast<std::ptrdiff_t>(end));
+                        for (int bb : seq) L.byte_used[bb] = 1;
+                        L.index.emplace(std::move(key), static_cast<int>(L.word_syms.size()));
+                        L.word_syms.push_back(std::move(seq));
+                        L.word_freq.push_back(1);
+                    } else {
+                        L.word_freq[static_cast<std::size_t>(it->second)] += 1;
+                    }
+                    i = end;
                 }
-                // Build the lookup key directly from the byte run (1 byte/symbol, usually in
-                // std::string's small buffer -> no heap), and only allocate the word's symbol
-                // vector / mark its bytes on a CACHE MISS. Repeated words (the vast majority of
-                // occurrences) then cost just a key build + a counter bump -- no per-occurrence
-                // vector allocation.
-                std::string key(end - i, '\0');
-                for (std::size_t k = i; k < end; ++k) key[k - i] = static_cast<char>(stream[k] & 0xFF);
-                auto it = word_index.find(key);
-                if (it == word_index.end()) {
-                    std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                         stream.begin() + static_cast<std::ptrdiff_t>(end));
-                    for (int b : seq) S.byte_used[b] = 1;
-                    word_index.emplace(std::move(key), static_cast<int>(S.word_syms.size()));
-                    S.word_syms.push_back(std::move(seq));
-                    S.word_freq.push_back(1);
-                } else {
-                    S.word_freq[static_cast<std::size_t>(it->second)] += 1;
-                }
-                i = end;
-            }
+            });
         });
+        // Fold the worker tables into the global one. word_index ids are assigned in merge order
+        // (immaterial to the outputs); per-word frequencies are summed across workers.
+        for (P2Local& L : p2) {
+            for (int bb = 0; bb < 256; ++bb) if (L.byte_used[bb]) S.byte_used[bb] = 1;
+            S.used_cap = S.used_cap || L.used_cap;
+            S.used_up  = S.used_up  || L.used_up;
+            S.st.words += L.st.words; S.st.cap += L.st.cap; S.st.up += L.st.up; S.st.names += L.st.names;
+            for (std::size_t i = 0; i < L.word_syms.size(); ++i) {
+                const std::string k = seq_key(L.word_syms[i]);
+                auto it = word_index.find(k);
+                if (it == word_index.end()) {
+                    word_index.emplace(k, static_cast<int>(S.word_syms.size()));
+                    S.word_syms.push_back(std::move(L.word_syms[i]));
+                    S.word_freq.push_back(L.word_freq[i]);
+                } else {
+                    S.word_freq[static_cast<std::size_t>(it->second)] += L.word_freq[i];
+                }
+            }
+            L.index = {}; L.word_syms = {}; L.word_freq = {};                  // free as we merge
+        }
         _t2 = std::chrono::steady_clock::now();
         save_scan_state(cache_path, corpus, S);
-        std::println(stderr, "scan cache: saved '{}' ({} words)", cache_path, S.word_syms.size());
+        std::println(stderr, "scan cache: saved '{}' ({} words, {} segments)", cache_path, S.word_syms.size(), nseg);
     }
 
     // Aliases so the downstream base-alphabet / BPE / emit / reporting code is unchanged.
