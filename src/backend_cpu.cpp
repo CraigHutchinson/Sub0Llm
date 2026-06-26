@@ -667,7 +667,8 @@ void print_config() {
         COMPUTE_MODE == ComputeBackend::Gpu    ? "GPU"    :
         COMPUTE_MODE == ComputeBackend::Hybrid ? "HYBRID" : "CPU";
     if constexpr (HAS_CUDA)
-        std::println("compute: {} | CUDA available: sm_{} ({} MB VRAM)", backend, CUDA_ARCH, GPU_VRAM_MB);
+        std::println("compute: {} | CUDA available: sm_{} ({} MB VRAM + {} MB shared overflow)",
+                     backend, CUDA_ARCH, GPU_VRAM_MB, GPU_SHARED_MEM_MB);
     else
         std::println("compute: {} | CUDA: none", backend);
 }

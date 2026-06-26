@@ -28,6 +28,7 @@ set_property(CACHE SUB0_COMPUTE PROPERTY STRINGS AUTO CPU GPU HYBRID)
 set(SUB0_HAS_CUDA 0)
 set(SUB0_CUDA_ARCH 0)
 set(SUB0_GPU_VRAM_MB 0)
+set(SUB0_GPU_SHARED_MB 0)
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
   find_program(SUB0_NVIDIA_SMI nvidia-smi)
@@ -47,7 +48,17 @@ if(CUDAToolkit_FOUND)
       set(SUB0_HAS_CUDA 1)
     endif()
   endif()
-  message(STATUS "CUDA: toolkit ${CUDAToolkit_VERSION} found; device sm_${SUB0_CUDA_ARCH}, ${SUB0_GPU_VRAM_MB} MB VRAM")
+  # Shared GPU memory: on Windows (WDDM) the GPU can address a slice of system RAM as
+  # overflow -- exceeding dedicated VRAM thrashes over PCIe instead of OOMing, and the
+  # same region can back zero-copy/mapped host transfers. The WDDM default is ~half of
+  # system RAM (matches Task Manager's "Shared GPU memory" / DXGI SharedSystemMemory).
+  # 0 on platforms without it (e.g. Linux discrete CUDA, where overflow hard-OOMs).
+  if(SUB0_HAS_CUDA AND WIN32)
+    cmake_host_system_information(RESULT _sub0_ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
+    math(EXPR SUB0_GPU_SHARED_MB "${_sub0_ram_mb} / 2")
+  endif()
+  message(STATUS "CUDA: toolkit ${CUDAToolkit_VERSION} found; device sm_${SUB0_CUDA_ARCH}, "
+                 "${SUB0_GPU_VRAM_MB} MB VRAM + ${SUB0_GPU_SHARED_MB} MB shared (overflow)")
 else()
   message(STATUS "CUDA: no toolkit found -- CPU-only host")
 endif()

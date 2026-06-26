@@ -294,7 +294,8 @@ int main(int argc, char** argv) {
     std::string tune_cache;
     int has_cuda    = 0;   // CUDA toolkit + device detected at configure time
     int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
-    int gpu_vram_mb = 0;   // GPU VRAM in MB
+    int gpu_vram_mb = 0;   // dedicated GPU VRAM in MB
+    int gpu_shared_mb = 0; // shared/overflow system memory the GPU can address (WDDM), MB
     int compute     = 0;   // resolved backend: 0=CPU, 1=GPU, 2=HYBRID
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
@@ -322,7 +323,10 @@ int main(int argc, char** argv) {
     app.add_option("--cuda-arch", cuda_arch,
                    "Detected GPU compute capability as an int (e.g. 120 for sm_120; 0 = none)")
        ->capture_default_str();
-    app.add_option("--gpu-vram-mb", gpu_vram_mb, "Detected GPU VRAM in MB (0 = none)")
+    app.add_option("--gpu-vram-mb", gpu_vram_mb, "Detected dedicated GPU VRAM in MB (0 = none)")
+       ->capture_default_str();
+    app.add_option("--gpu-shared-mb", gpu_shared_mb,
+                   "Shared/overflow system memory the GPU can address in MB (WDDM; 0 = none)")
        ->capture_default_str();
     app.add_option("--compute", compute, "Resolved compute backend: 0=CPU, 1=GPU, 2=HYBRID")
        ->capture_default_str()->check(CLI::Range(0, 2));
@@ -811,7 +815,12 @@ int main(int argc, char** argv) {
     os << "constexpr ComputeBackend COMPUTE_MODE = ComputeBackend::"
        << (compute == 1 ? "Gpu" : compute == 2 ? "Hybrid" : "Cpu") << ";\n";
     os << "constexpr int            CUDA_ARCH    = " << cuda_arch   << ";\n";
-    os << "constexpr int            GPU_VRAM_MB  = " << gpu_vram_mb << ";\n\n";
+    os << "constexpr int            GPU_VRAM_MB  = " << gpu_vram_mb << ";  // dedicated VRAM (fast budget)\n";
+    os << "// GPU_SHARED_MEM_MB: system RAM the GPU may address as overflow (WDDM shared memory).\n";
+    os << "// Exceeding GPU_VRAM_MB does NOT OOM on Windows -- it spills here and THRASHES over PCIe;\n";
+    os << "// the same region can also back zero-copy / mapped host transfers. Treat VRAM as the hard\n";
+    os << "// fast budget and (VRAM + shared) as the soft ceiling. 0 where there is no WDDM shared mem.\n";
+    os << "constexpr int            GPU_SHARED_MEM_MB = " << gpu_shared_mb << ";\n\n";
     emit_path("DEFAULT_CORPUS",     abspath);
     emit_path("DEFAULT_CORPUS_TOK", std::filesystem::absolute(tok_path).string());
     emit_path("DEFAULT_TOKENIZER",  std::filesystem::absolute(tkz_path).string());
