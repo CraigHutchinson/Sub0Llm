@@ -187,6 +187,56 @@ inline void launch_attn(const float* dQ, const float* dK, const float* dV, float
     attn_kernel<<<(total + block - 1) / block, block>>>(dQ, dK, dV, dOut, T, C, H);
 }
 
+// Resident forward scratch: allocated once for T = SEQ_LEN (the max window) and reused by
+// every sub0_cuda_forward, so the hot path has no per-call cudaMalloc churn. Freed by
+// sub0_cuda_shutdown. (2c step; batching to M = B*T and cuBLASLt GEMMs build on this.)
+struct FwdScratch {
+    int*   dids   = nullptr;
+    float* h      = nullptr;
+    float* a      = nullptr;
+    float* q      = nullptr;
+    float* kk     = nullptr;
+    float* vv     = nullptr;
+    float* att    = nullptr;
+    float* proj   = nullptr;
+    float* fbuf   = nullptr;
+    float* ff1    = nullptr;
+    float* gact   = nullptr;
+    float* ff2    = nullptr;
+    float* logits = nullptr;
+    bool   inited = false;
+};
+FwdScratch g_fwd;
+
+int fwd_alloc() {
+    if (g_fwd.inited) return 0;
+    const size_t Tm = SEQ_LEN;
+    const size_t TC = Tm * D_MODEL, TF = Tm * D_FF, TV = Tm * VOCAB;
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Tm * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.q,      TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.kk,     TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.vv,     TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff1,    TF * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   TF * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    TC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, TV * sizeof(float)));
+    g_fwd.inited = true;
+    return 0;
+}
+
+void fwd_free() {
+    cudaFree(g_fwd.dids);  cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.q);
+    cudaFree(g_fwd.kk);    cudaFree(g_fwd.vv);   cudaFree(g_fwd.att);  cudaFree(g_fwd.proj);
+    cudaFree(g_fwd.fbuf);  cudaFree(g_fwd.ff1);  cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);
+    cudaFree(g_fwd.logits);
+    g_fwd = FwdScratch{};
+}
+
 }  // namespace
 
 // Self-test: confirm the toolchain built device code for THIS GPU and that H2D, kernel
@@ -252,6 +302,7 @@ SUB0_CUDA_API int sub0_cuda_init() {
 SUB0_CUDA_API void sub0_cuda_shutdown() {
     if (g_dev_params) cudaFree(g_dev_params);
     g_dev_params = nullptr;
+    fwd_free();                                  // release the resident forward scratch too
 }
 
 SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
@@ -312,8 +363,8 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 // ============================================================================
 // Runs the same op sequence as Model::forward in backend_cpu.cpp on the device, slicing
 // the uploaded weight blob (g_dev_params) by the shared constexpr PARAM_LAYOUT. Requires
-// sub0_cuda_upload_params() first. out_logits receives [T, VOCAB]. Per-call device scratch
-// (Phase 2b correctness baseline); 2c makes the buffers resident and batches M = B*T.
+// sub0_cuda_upload_params() first. out_logits receives [T, VOCAB]. Scratch is RESIDENT
+// (allocated once for T=SEQ_LEN, reused) -- no per-call cudaMalloc. 2c next: batch M = B*T.
 SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
     if (!g_dev_params) return 1;
     const auto&  L = sub0::PARAM_LAYOUT;
@@ -331,32 +382,21 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
     const size_t TF = static_cast<size_t>(T) * F;
     const size_t TV = static_cast<size_t>(T) * V;
 
-    int*   dids   = nullptr;
-    float* h      = nullptr;
-    float* a      = nullptr;
-    float* q      = nullptr;
-    float* kk     = nullptr;
-    float* vv     = nullptr;
-    float* att    = nullptr;
-    float* proj   = nullptr;
-    float* fbuf   = nullptr;
-    float* ff1    = nullptr;
-    float* gact   = nullptr;
-    float* ff2    = nullptr;
-    float* logits = nullptr;
-    SUB0_CUDA_CHECK(cudaMalloc(&dids, static_cast<size_t>(T) * sizeof(int)));
-    SUB0_CUDA_CHECK(cudaMalloc(&h,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&a,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&q,      TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&kk,     TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&vv,     TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&att,    TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&proj,   TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&fbuf,   TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&ff1,    TF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&gact,   TF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&ff2,    TC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&logits, TV * sizeof(float)));
+    const int rc = fwd_alloc();
+    if (rc) return rc;
+    int*   dids   = g_fwd.dids;
+    float* h      = g_fwd.h;
+    float* a      = g_fwd.a;
+    float* q      = g_fwd.q;
+    float* kk     = g_fwd.kk;
+    float* vv     = g_fwd.vv;
+    float* att    = g_fwd.att;
+    float* proj   = g_fwd.proj;
+    float* fbuf   = g_fwd.fbuf;
+    float* ff1    = g_fwd.ff1;
+    float* gact   = g_fwd.gact;
+    float* ff2    = g_fwd.ff2;
+    float* logits = g_fwd.logits;
     SUB0_CUDA_CHECK(cudaMemcpy(dids, ids, static_cast<size_t>(T) * sizeof(int), cudaMemcpyHostToDevice));
 
     // h = tok_emb[ids] + pos_emb
@@ -398,9 +438,5 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int T, float* out_logits) {
     SUB0_CUDA_CHECK(cudaGetLastError());
     SUB0_CUDA_CHECK(cudaDeviceSynchronize());
     SUB0_CUDA_CHECK(cudaMemcpy(out_logits, logits, TV * sizeof(float), cudaMemcpyDeviceToHost));
-
-    cudaFree(dids); cudaFree(h); cudaFree(a); cudaFree(q); cudaFree(kk); cudaFree(vv);
-    cudaFree(att); cudaFree(proj); cudaFree(fbuf); cudaFree(ff1); cudaFree(gact);
-    cudaFree(ff2); cudaFree(logits);
-    return 0;
+    return 0;   // scratch is resident -- freed by sub0_cuda_shutdown
 }
