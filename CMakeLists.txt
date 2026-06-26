@@ -264,6 +264,14 @@ endif()
 add_library(sub0_train SHARED src/train_stage.cpp)
 target_link_libraries(sub0_train PRIVATE sub0_core)
 
+# Phase 2e: when the CUDA backend is built, link it into the train stage and flag the GPU
+# training fast-path on. The train stage reaches the device through the extern "C" seam
+# (sub0_cuda_train_step etc.); without this it transparently runs the CPU loop.
+if(SUB0_BUILD_CUDA)
+  target_link_libraries(sub0_train PRIVATE sub0_backend_cuda)
+  target_compile_definitions(sub0_train PRIVATE SUB0_BUILD_CUDA)
+endif()
+
 # The train/models stages tag each model with the code version that produced it and lay
 # them out under a models root. Pass both as compile definitions (configure-time) ONLY to
 # this stage, so a new commit does not force an engine-core rebuild. Reconfigure to refresh.

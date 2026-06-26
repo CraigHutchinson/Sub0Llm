@@ -120,7 +120,14 @@ __global__ void bias_add_kernel(float* __restrict__ Y, const float* __restrict__
 // dev_tanh keeps the tanh-form GELU shape (matching the CPU's GPT-2-style approx) built on
 // __expf, so the GELU stays consistent with the CPU op_gelu.
 __device__ inline float dev_tanh(float x) {
-    const float e = __expf(-2.f * x);
+    // Clamp the exponent exactly like the CPU fast_exp ([-87,88]) BEFORE __expf. Without this a
+    // large negative GELU input makes -2x large positive, __expf overflows to +Inf, and the tanh
+    // becomes (1-Inf)/(1+Inf) = NaN -- harmless at small init but it poisons the weights once
+    // training grows the activations (the cause of GPU-training divergence). Clamping saturates
+    // to +-1 like the CPU path instead.
+    float a = -2.f * x;
+    a = a < -87.f ? -87.f : (a > 88.f ? 88.f : a);
+    const float e = __expf(a);
     return (1.f - e) / (1.f + e);
 }
 __device__ inline float dev_gelu(float v) {
@@ -1088,6 +1095,23 @@ SUB0_CUDA_API int sub0_cuda_download_params(float* host) {
     if (!g_dev_params) return 1;
     SUB0_CUDA_CHECK(cudaMemcpy(host, g_dev_params, sub0::PARAM_FLOATS * sizeof(float),
                                cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+// AdamW moment sync (for crash-safe checkpoint / resume): the optimizer state lives on the device
+// during a GPU run, so the train stage round-trips it through the host adam_m/adam_v buffers
+// around save/load -- mirroring the param sync above. Both are PARAM_FLOATS long.
+SUB0_CUDA_API int sub0_cuda_download_opt(float* host_m, float* host_v) {
+    if (!g_dev_m || !g_dev_vel) return 1;
+    SUB0_CUDA_CHECK(cudaMemcpy(host_m, g_dev_m,   sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(host_v, g_dev_vel, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+SUB0_CUDA_API int sub0_cuda_upload_opt(const float* host_m, const float* host_v) {
+    if (opt_alloc()) return 1;                   // ensure the moment buffers exist
+    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_m,   host_m, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_vel, host_v, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice));
     return 0;
 }
 

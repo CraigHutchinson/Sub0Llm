@@ -249,3 +249,42 @@ TEST_CASE("CUDA AdamW step matches the CPU optimizer update", "[cuda]") {
     sub0_cuda_shutdown();
 }
 
+// Regression for the GPU-training divergence: amplify the weights so GELU inputs reach the
+// saturation regime where the device tanh's __expf used to overflow to NaN (harmless at small
+// init, but it poisoned the weights once training grew the activations). The forward must stay
+// finite and track the CPU's clamped fast-math saturation.
+TEST_CASE("CUDA forward stays finite under saturating GELU activations", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> saved(sub0::params_ptr(), sub0::params_ptr() + n);
+    for (std::size_t i = 0; i < n; ++i) sub0::params_ptr()[i] = saved[i] * 6.0f;   // push into saturation
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int T = 16;
+    std::vector<int> ids(static_cast<std::size_t>(T));
+    std::mt19937 rng(99);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int& x : ids) x = tok(rng);
+
+    sub0::graph_reset();
+    sub0::Node* lg = sub0::forward(ids.data(), T);
+    const std::vector<float> cpu(lg->data.begin(), lg->data.end());
+    std::vector<float> gpu(static_cast<std::size_t>(T) * VOCAB, 0.0f);
+    REQUIRE(sub0_cuda_forward(ids.data(), 1, T, gpu.data()) == 0);
+
+    bool   finite = true;
+    double maxabs = 0.0, maxcpu = 0.0;
+    for (std::size_t i = 0; i < cpu.size(); ++i) {
+        finite = finite && std::isfinite(gpu[i]);
+        maxabs = std::max(maxabs, static_cast<double>(std::fabs(cpu[i] - gpu[i])));
+        maxcpu = std::max(maxcpu, static_cast<double>(std::fabs(cpu[i])));
+    }
+    INFO("saturated: max abs diff = " << maxabs << "  max|cpu| = " << maxcpu);
+    REQUIRE(finite);                          // dev_tanh must not overflow to NaN/Inf
+    REQUIRE(maxabs < 0.05 * maxcpu + 1e-2);   // matches the CPU's clamped saturation
+
+    std::copy(saved.begin(), saved.end(), sub0::params_ptr());   // restore for later tests
+    sub0_cuda_shutdown();
+}
+

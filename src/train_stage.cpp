@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -54,6 +55,22 @@
 #define NOMINMAX                 // keep std::min/std::max, not the windows.h macros
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+
+// GPU training fast-path (Phase 2e). When the CUDA backend is compiled in (SUB0_BUILD_CUDA) and a
+// device initializes, the training loop keeps the parameters resident on the GPU and runs each
+// step (forward + backward + AdamW) there via sub0_cuda_train_step, syncing back to the host
+// param/optimizer arenas only at eval/checkpoint boundaries (where the CPU eval/save/preview code
+// runs unchanged). The device path is gradient/AdamW parity-tested against this CPU backend.
+#if defined(SUB0_BUILD_CUDA)
+extern "C" int  sub0_cuda_init();
+extern "C" void sub0_cuda_shutdown();
+extern "C" int  sub0_cuda_upload_params(const float* host);
+extern "C" int  sub0_cuda_download_params(float* host);
+extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
+extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
+extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
+                                     float lr, long t, double* out_loss);
 #endif
 
 namespace {
@@ -375,6 +392,76 @@ std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
 
 }  // namespace
 
+// Device training session (Phase 2e): keeps the parameters resident on the GPU and runs each
+// forward+backward+AdamW step there, syncing back to the host param/optimizer arenas only at the
+// eval/checkpoint boundaries where the unchanged CPU eval/save/preview code runs. No-op (active
+// stays false) unless the CUDA backend is compiled in and a device initializes.
+namespace {
+struct GpuTrainer {
+    bool active = false;
+    long t = 0;                       // AdamW step counter driving the device bias correction
+    std::vector<int> ids, targets;    // per-step [batch*SEQ_LEN] window buffers
+
+    // Enable the device path: requires the CUDA backend, a device, and a batch within the
+    // resident scratch width. Uploads the current host params (+ optimizer moments, zero on a
+    // fresh run / restored on resume). Returns false to fall back to the CPU loop.
+    bool enable(int batch, long resume_t) {
+#if defined(SUB0_BUILD_CUDA)
+        constexpr int kCap = (DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD > 0)
+                                 ? DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD : 8;
+        if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
+        if (!HAS_CUDA || batch > kCap) return false;
+        if (sub0_cuda_init() != 0) return false;
+        if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) return false;
+        sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
+        t = resume_t;
+        active = true;
+        ids.resize(static_cast<std::size_t>(batch) * SEQ_LEN);
+        targets.resize(ids.size());
+        return true;
+#else
+        (void)batch; (void)resume_t; return false;
+#endif
+    }
+
+    // One resident device step over the sampled window starts; returns the mean loss. Builds the
+    // [batch*SEQ_LEN] id/target windows (x = data[start+s], y = data[start+s+1]) like the CPU path.
+    float step([[maybe_unused]] std::span<const int> data, [[maybe_unused]] const std::size_t* starts,
+               [[maybe_unused]] int batch, [[maybe_unused]] float lr) {
+#if defined(SUB0_BUILD_CUDA)
+        for (int b = 0; b < batch; ++b) {
+            const int* w = data.data() + starts[b];
+            for (int s = 0; s < SEQ_LEN; ++s) {
+                ids[static_cast<std::size_t>(b) * SEQ_LEN + s]     = w[s];
+                targets[static_cast<std::size_t>(b) * SEQ_LEN + s] = w[s + 1];
+            }
+        }
+        double loss = 0.0;
+        sub0_cuda_train_step(ids.data(), targets.data(), batch, SEQ_LEN, lr, ++t, &loss);
+        return static_cast<float>(loss);
+#else
+        return 0.0f;
+#endif
+    }
+
+    // Refresh the host param + optimizer arenas from the device (before eval / checkpoint / save).
+    void sync_to_host() {
+#if defined(SUB0_BUILD_CUDA)
+        if (!active) return;
+        sub0_cuda_download_params(sub0::params_ptr());
+        sub0_cuda_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
+#endif
+    }
+
+    void shutdown() {
+#if defined(SUB0_BUILD_CUDA)
+        if (active) sub0_cuda_shutdown();
+#endif
+        active = false;
+    }
+};
+}  // namespace
+
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed) {
     // Training consumes the pre-tokenized corpus produced by the configurator, not
@@ -519,6 +606,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::AdamW opt(lr);
     if (resumed) opt.set_step_count(adam_t);
 
+    // Phase 2e: try to run the training loop on the GPU (params resident on device). Falls back
+    // to the CPU data-parallel path when the CUDA backend is absent, no device initializes, or the
+    // batch exceeds the device's resident scratch width.
+    GpuTrainer gpu;
+    const bool gpu_train = gpu.enable(batch, opt.step_count());
+
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
     // plateau-stopped, so an estimate is fine).
@@ -530,6 +623,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::print("corpus: {} | ", src_desc);
     sub0::print_config();
+    std::println("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
+                                                    : "CPU (data-parallel minibatch)");
     std::println("schedule: {} steps/epoch | warmup {} | eval every {} | max {} steps ({} epochs){}{}",
                  epoch_steps, warmup_steps, eval_every, max_steps,
                  (max_steps + epoch_steps - 1) / epoch_steps,
@@ -562,14 +657,24 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         ++steps_since_refresh;
 
         // Draw the window starts on the main thread (keeps the RNG stream, hence
-        // resume, deterministic), then run the batch data-parallel across threads.
+        // resume, deterministic), then run the batch -- on the GPU when enabled, else
+        // data-parallel across CPU threads.
         for (int b = 0; b < batch; ++b) starts[b] = startd(rng);
-        const float step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, SEQ_LEN);
-        opt.step();
+        float step_loss;
+        if (gpu_train) {
+            step_loss = gpu.step(train_span, starts.data(), batch, lr);
+            opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
+        } else {
+            step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, SEQ_LEN);
+            opt.step();
+        }
         run_loss += step_loss; ++run_n;
         rs.step = step;
 
         if (step % eval_every == 0 || step == max_steps) {
+            // Refresh the host param/optimizer arenas from the device so the CPU eval/save/preview
+            // code below sees the current weights (no-op on the CPU path).
+            gpu.sync_to_host();
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
             const double wps   = secs > 0 ? static_cast<double>((step - win_steps0) * batch) / secs : 0.0;
@@ -599,12 +704,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
     }
 
+    gpu.sync_to_host();    // ensure the host arenas hold the final device weights before saving
     sub0::save_model(model_path.c_str());
     save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
     write_meta(stop ? "plateaued" : "trained");
     std::println("  --- sample ---\n  {}", preview("the ", 120, rng));
     std::println("{} at step {} (best val_nelbo {:.4f}) -> {}",
                  stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
+    gpu.shutdown();        // release the device session (no-op on the CPU path)
     return 0;
 }
 
