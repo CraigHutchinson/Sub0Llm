@@ -9,6 +9,7 @@ include(Catch)
 add_executable(sub0_tests
   tokenizer_tests.cpp
   engine_tests.cpp
+  layout_tests.cpp
   tune_tests.cpp
   coherence_tests.cpp
 )
@@ -19,6 +20,14 @@ target_include_directories(sub0_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${GEN_DIR}")
 target_link_libraries(sub0_tests PRIVATE sub0_core Catch2::Catch2WithMain)
+
+# GPU backend smoke test: compiled + linked only when the CUDA backend is built. The
+# nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll, so the existing DL_PATHS
+# below already covers it at discovery/run time.
+if(SUB0_BUILD_CUDA)
+  target_sources(sub0_tests PRIVATE cuda_tests.cpp)
+  target_link_libraries(sub0_tests PRIVATE sub0_backend_cuda)
+endif()
 
 # Find the sub0_core shared lib next to the test binary at runtime.
 set_target_properties(sub0_tests PROPERTIES

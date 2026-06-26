@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -220,6 +221,31 @@ TEST_CASE("model save/load round-trips the parameters exactly", "[engine]") {
     REQUIRE(sub0::load_model(path.c_str()));
     for (std::size_t i = 0; i < n; ++i) REQUIRE(sub0::params_ptr()[i] == before[i]);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("CPU param-sync hooks are no-ops that preserve the parameters", "[engine]") {
+    sub0::build_model();
+    const std::size_t n = sub0::trainable_floats();
+    std::vector<float> before(sub0::params_ptr(), sub0::params_ptr() + n);
+    sub0::sync_params_to_host();     // CPU: params already live in host memory
+    sub0::sync_params_to_device();   // CPU: no device copy to push to
+    for (std::size_t i = 0; i < n; ++i) REQUIRE(sub0::params_ptr()[i] == before[i]);
+}
+
+TEST_CASE("load_model rejects files that are not a matching model", "[engine]") {
+    sub0::build_model();
+    const std::size_t n = sub0::trainable_floats();
+    std::vector<float> before(sub0::params_ptr(), sub0::params_ptr() + n);
+
+    // A short junk file: the header magic/config check must reject it and leave the
+    // in-memory parameters untouched (a stale/foreign file never trains the wrong thing).
+    const auto path = (std::filesystem::temp_directory_path() / "sub0_bad_model.bin").string();
+    { std::ofstream os(path, std::ios::binary); const char junk[8] = {1, 2, 3, 4, 5, 6, 7, 8}; os.write(junk, sizeof junk); }
+    REQUIRE_FALSE(sub0::load_model(path.c_str()));
+    for (std::size_t i = 0; i < n; ++i) REQUIRE(sub0::params_ptr()[i] == before[i]);
+    std::filesystem::remove(path);
+
+    REQUIRE_FALSE(sub0::load_model("sub0_definitely_missing_model.bin"));  // absent file -> false
 }
 
 TEST_CASE("AdamW step counter survives get/set", "[engine]") {
