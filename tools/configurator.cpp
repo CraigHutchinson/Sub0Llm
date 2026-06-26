@@ -51,14 +51,12 @@ struct PairHash {
     }
 };
 
-// Serialize a base-id sequence to a string key (two bytes per id; ids < 65536),
-// so word units can index an unordered_map.
+// Serialize a word's symbol sequence to a string key for the unique-word map. Word symbols
+// are byte values (0..255), so one byte per symbol is a lossless, compact key -- short enough
+// to stay in std::string's small-buffer (no heap alloc) for typical words.
 inline std::string seq_key(const std::vector<int>& s) {
-    std::string k(s.size() * 2, '\0');
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        k[2 * i]     = static_cast<char>(s[i] & 0xFF);
-        k[2 * i + 1] = static_cast<char>((s[i] >> 8) & 0xFF);
-    }
+    std::string k(s.size(), '\0');
+    for (std::size_t i = 0; i < s.size(); ++i) k[i] = static_cast<char>(s[i] & 0xFF);
     return k;
 }
 
@@ -361,13 +359,19 @@ int main(int argc, char** argv) {
                     else                   S.byte_used[s] = 1;
                     ++i; continue;
                 }
-                std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                     stream.begin() + static_cast<std::ptrdiff_t>(end));  // raw byte values
-                for (int b : seq) S.byte_used[b] = 1;
-                const std::string key = seq_key(seq);
+                // Build the lookup key directly from the byte run (1 byte/symbol, usually in
+                // std::string's small buffer -> no heap), and only allocate the word's symbol
+                // vector / mark its bytes on a CACHE MISS. Repeated words (the vast majority of
+                // occurrences) then cost just a key build + a counter bump -- no per-occurrence
+                // vector allocation.
+                std::string key(end - i, '\0');
+                for (std::size_t k = i; k < end; ++k) key[k - i] = static_cast<char>(stream[k] & 0xFF);
                 auto it = word_index.find(key);
                 if (it == word_index.end()) {
-                    word_index.emplace(key, static_cast<int>(S.word_syms.size()));
+                    std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                         stream.begin() + static_cast<std::ptrdiff_t>(end));
+                    for (int b : seq) S.byte_used[b] = 1;
+                    word_index.emplace(std::move(key), static_cast<int>(S.word_syms.size()));
                     S.word_syms.push_back(std::move(seq));
                     S.word_freq.push_back(1);
                 } else {
