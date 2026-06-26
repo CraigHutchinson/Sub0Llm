@@ -242,7 +242,7 @@ if(SUB0_BUILD_CUDA)
   # hot loops and the slow-path handling is wasted work. NOT --use_fast_math (that would
   # also relax div/sqrt rounding); just the denormal flush.
   target_compile_options(sub0_backend_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=true>)
-  target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart)
+  target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart CUDA::cublas)
 
   add_executable(sub0-cuda-selftest tools/cuda_selftest.cpp)
   target_link_libraries(sub0-cuda-selftest PRIVATE sub0_backend_cuda)

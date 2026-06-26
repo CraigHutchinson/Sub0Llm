@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 // Export macro for the CUDA backend's C-ABI entry points (the clang-built host links
 // against the import lib, so the symbols must leave the DLL). The full backend will
@@ -61,21 +62,15 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
 // upload/download entry points below (the device half of the sync_params hooks).
 float* g_dev_params = nullptr;
 
-// Dense linear: Y[M,out] = X[M,in] . W[in,out] (+ bias[out]). Matches op_linear's dense
-// (non-ternary) path -- one thread per (row m, col o), summing over `in` in the same order
-// as the CPU. M is the total row count (batch*T when batched). The building block of every
-// projection and the lm_head; the batched cuBLASLt form arrives next, this is the parity
-// baseline.
-__global__ void linear_kernel(const float* __restrict__ X, const float* __restrict__ W,
-                              const float* __restrict__ bias, float* __restrict__ Y,
-                              int M, int in, int out) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m < M && o < out) {
-        float acc = bias ? bias[o] : 0.0f;
-        for (int p = 0; p < in; ++p) acc += X[m * in + p] * W[p * out + o];
-        Y[m * out + o] = acc;
-    }
+// cuBLAS handle for the dense GEMMs (every Linear + the lm_head). Created lazily, destroyed
+// in sub0_cuda_shutdown. Default (FP32) math; TF32 tensor-core math is a later opt-in.
+cublasHandle_t g_cublas = nullptr;
+
+// Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
+// (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
+__global__ void bias_add_kernel(float* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < M * N) Y[idx] += bias[idx % N];
 }
 
 // --- Fast transcendental math (CUDA native intrinsics) ----------------------
@@ -172,11 +167,24 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
+inline void ensure_cublas() {
+    if (!g_cublas) cublasCreate(&g_cublas);
+}
+// Y[M,out] = X[M,in] . W[in,out] (+ bias) via cuBLAS. cublasSgemm is column-major, so we
+// compute the column-major Y^T = W^T . X^T -- which, read back row-major, IS Y = X . W:
+//   cublasSgemm(N,N, out,M,in, a, W,out, X,in, b, Y,out). Bias (no epilogue in the legacy
+// API) is a cheap broadcast-add kernel afterwards. Same default stream as the kernels, so
+// ordering is preserved.
 inline void launch_linear(const float* dX, const float* dW, const float* dB, float* dY,
-                          int T, int in, int out) {
-    const dim3 block(16, 16);
-    const dim3 grid((out + block.x - 1) / block.x, (T + block.y - 1) / block.y);
-    linear_kernel<<<grid, block>>>(dX, dW, dB, dY, T, in, out);
+                          int M, int in, int out) {
+    ensure_cublas();
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, out, M, in,
+                &alpha, dW, out, dX, in, &beta, dY, out);
+    if (dB) {
+        const int n = M * out, block = 256;
+        bias_add_kernel<<<(n + block - 1) / block, block>>>(dY, dB, M, out);
+    }
 }
 inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T, int C) {
     const int block = 64;
@@ -319,6 +327,7 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
     if (g_dev_params) cudaFree(g_dev_params);
     g_dev_params = nullptr;
     fwd_free();                                  // release the resident forward scratch too
+    if (g_cublas) { cublasDestroy(g_cublas); g_cublas = nullptr; }
 }
 
 SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
@@ -360,9 +369,7 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
     SUB0_CUDA_CHECK(cudaMemcpy(dW, W, wb, cudaMemcpyHostToDevice));
     if (bias) SUB0_CUDA_CHECK(cudaMemcpy(dB, bias, bb, cudaMemcpyHostToDevice));
 
-    const dim3 block(16, 16);
-    const dim3 grid((out + block.x - 1) / block.x, (T + block.y - 1) / block.y);
-    linear_kernel<<<grid, block>>>(dX, dW, dB, dY, T, in, out);
+    launch_linear(dX, dW, dB, dY, T, in, out);   // cuBLAS GEMM (+ bias) -- same path as the forward
     SUB0_CUDA_CHECK(cudaGetLastError());
     SUB0_CUDA_CHECK(cudaDeviceSynchronize());
 
