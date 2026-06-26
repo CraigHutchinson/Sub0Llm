@@ -118,6 +118,8 @@ __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float*
 }
 
 // y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
+// TODO(perf): one thread per row serializes the C-length reduction. For larger C a block-per-row
+// warp/shared reduction (or a fused rmsnorm+linear epilogue) would cut memory traffic.
 __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
                                float* __restrict__ y, int rows, int C) {
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,11 +149,15 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
 }
 
 // Causal multi-head attention over a BATCH of windows (op_attn, FAST_MATH softmax). One
-// thread per (window b, head h, query i): scores over j<=i WITHIN the window, __expf
-// softmax, weighted sum of v. Windows are independent -- no cross-window attention.
+// TODO(perf): naive O(T^2) per thread with a float sc[SEQ_LEN] in local memory. For longer T a
+// flash-attention-style tiled/online-softmax kernel (shared-mem K/V tiles, no sc[] spill) would
+// be far more bandwidth- and occupancy-efficient. Fine at SEQ_LEN=64.
+// thread per (window b, head h, query i): scores over j<=i WITHIN the window, __expf softmax,
+// weighted sum of v. q/k/v rows are `in_stride` apart (= 3C when they are sub-blocks of the
+// fused QKV buffer); the output is a packed [M,C] buffer (stride C). Windows are independent.
 __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict__ k,
                             const float* __restrict__ v, float* __restrict__ out,
-                            int batch, int T, int C, int H) {
+                            int batch, int T, int C, int H, int in_stride) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx over batch*H*T
     const int per = H * T;
     const int b   = idx / per;
@@ -159,27 +165,43 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     const int rem = idx - b * per;
     const int h   = rem / T;
     const int i   = rem % T;
-    const int    d     = C / H;
-    const int    off   = h * d;
-    const float  scale = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t base  = static_cast<size_t>(b) * T * C;     // window b's first row
+    const int    d        = C / H;
+    const int    off      = h * d;
+    const float  scale    = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;   // q/k/v rows are in_stride apart
+    const size_t out_base = static_cast<size_t>(b) * T * C;
     float sc[SEQ_LEN];
-    const float* qi = q + base + static_cast<size_t>(i) * C + off;
+    const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
     float mx = -1e30f;
     for (int j = 0; j <= i; ++j) {
-        const float* kj = k + base + static_cast<size_t>(j) * C + off;
+        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
         float s = 0.f;
         for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
         s *= scale; sc[j] = s; if (s > mx) mx = s;
     }
     float Z = 0.f;
     for (int j = 0; j <= i; ++j) { sc[j] = __expf(sc[j] - mx); Z += sc[j]; }   // SFU fast exp
-    float* oi = out + base + static_cast<size_t>(i) * C + off;
+    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
     for (int a = 0; a < d; ++a) oi[a] = 0.f;
     for (int j = 0; j <= i; ++j) {
         const float pj = sc[j] / Z;
-        const float* vj = v + base + static_cast<size_t>(j) * C + off;
+        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
         for (int a = 0; a < d; ++a) oi[a] += pj * vj[a];
+    }
+}
+
+// Build the fused QKV weight Wqkv[C, 3C] (row-major) from Wq,Wk,Wv [C,C]: row p holds
+// [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
+// into one a . Wqkv -> [M, 3C] (better-shaped GEMM + fewer launches).
+__global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __restrict__ Wk,
+                                 const float* __restrict__ Wv, float* __restrict__ Wqkv, int C) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over C*C elements of one source matrix
+    if (idx < C * C) {
+        const int p = idx / C, c = idx % C;
+        const int row = p * 3 * C;
+        Wqkv[row + c]         = Wq[idx];
+        Wqkv[row + C + c]     = Wk[idx];
+        Wqkv[row + 2 * C + c] = Wv[idx];
     }
 }
 
@@ -211,6 +233,10 @@ inline void ensure_cublas() {
 //   cublasSgemm(N,N, out,M,in, a, W,out, X,in, b, Y,out). Bias (no epilogue in the legacy
 // API) is a cheap broadcast-add kernel afterwards. Same default stream as the kernels, so
 // ordering is preserved.
+// TODO(perf): migrate to cublasLt (cublasLtMatmul) with a fused bias+GELU epilogue to drop the
+// separate bias_add/gelu launches. TODO(perf): at K=D_MODEL=96 these GEMMs are launch/occupancy
+// bound -- FP16/BF16 storage + tensor cores (or batched-strided GEMM across layers) is the real
+// lever; QKV fusion measured neutral at training scale (M=4096).
 inline void launch_linear(const float* dX, const float* dW, const float* dB, float* dY,
                           int M, int in, int out) {
     ensure_cublas();
@@ -235,10 +261,10 @@ inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
-                        int batch, int T, int C, int H) {
+                        int batch, int T, int C, int H, int in_stride) {
     const int block = 64;
     const int total = batch * H * T;
-    attn_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H);
+    attn_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
 }
 
 // Max minibatch the resident forward scratch is sized for: the CPU's tuned data-parallel
@@ -254,9 +280,7 @@ struct FwdScratch {
     int*   dids   = nullptr;
     float* h      = nullptr;
     float* a      = nullptr;
-    float* q      = nullptr;
-    float* kk     = nullptr;
-    float* vv     = nullptr;
+    float* qkv    = nullptr;            // fused [M, 3C] projections (q|k|v sub-blocks)
     float* att    = nullptr;
     float* proj   = nullptr;
     float* fbuf   = nullptr;
@@ -264,6 +288,7 @@ struct FwdScratch {
     float* gact   = nullptr;
     float* ff2    = nullptr;
     float* logits = nullptr;
+    float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, 3C], built once at upload
     bool   inited = false;
 };
 FwdScratch g_fwd;
@@ -276,9 +301,7 @@ int fwd_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.q,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.kk,     MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.vv,     MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.qkv,    Mm * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   MC * sizeof(float)));
@@ -286,15 +309,17 @@ int fwd_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
+    for (int l = 0; l < N_LAYERS; ++l)
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
     g_fwd.inited = true;
     return 0;
 }
 
 void fwd_free() {
-    cudaFree(g_fwd.dids);  cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.q);
-    cudaFree(g_fwd.kk);    cudaFree(g_fwd.vv);   cudaFree(g_fwd.att);  cudaFree(g_fwd.proj);
-    cudaFree(g_fwd.fbuf);  cudaFree(g_fwd.ff1);  cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);
-    cudaFree(g_fwd.logits);
+    cudaFree(g_fwd.dids);  cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
+    cudaFree(g_fwd.att);   cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
+    cudaFree(g_fwd.gact);  cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
+    for (int l = 0; l < N_LAYERS; ++l) cudaFree(g_fwd.wqkv[l]);
     g_fwd = FwdScratch{};
 }
 
@@ -317,9 +342,7 @@ void forward_device(int batch, int T) {
 
     float* h    = g_fwd.h;
     float* a    = g_fwd.a;
-    float* q    = g_fwd.q;
-    float* kk   = g_fwd.kk;
-    float* vv   = g_fwd.vv;
+    float* qkv  = g_fwd.qkv;
     float* att  = g_fwd.att;
     float* proj = g_fwd.proj;
     float* fbuf = g_fwd.fbuf;
@@ -337,23 +360,18 @@ void forward_device(int batch, int T) {
         const int    b0  = 2 + 10 * l;
         const float* ln1 = base + L[b0 + 0].off;
         const float* ln2 = base + L[b0 + 1].off;
-        const float* Wq  = base + L[b0 + 2].off;
-        const float* Wk  = base + L[b0 + 3].off;
-        const float* Wv  = base + L[b0 + 4].off;
         const float* Wo  = base + L[b0 + 5].off;
         const float* W1  = base + L[b0 + 6].off;
         const float* b1  = base + L[b0 + 7].off;
         const float* W2  = base + L[b0 + 8].off;
         const float* b2  = base + L[b0 + 9].off;
 
-        launch_rmsnorm(h, ln1, a, M, C);                  // a = rmsnorm(h, ln1)
-        launch_linear(a, Wq, nullptr, q,  M, C, C);       // q,k,v = a . Wq/Wk/Wv
-        launch_linear(a, Wk, nullptr, kk, M, C, C);
-        launch_linear(a, Wv, nullptr, vv, M, C, C);
-        launch_attn(q, kk, vv, att, batch, T, C, H);      // per-window causal attention
-        launch_linear(att, Wo, nullptr, proj, M, C, C);   // proj = att . Wo
-        launch_add(h, proj, h, MC);                       // h = h + proj
-        launch_rmsnorm(h, ln2, fbuf, M, C);               // f = rmsnorm(h, ln2)
+        launch_rmsnorm(h, ln1, a, M, C);                      // a = rmsnorm(h, ln1)
+        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
+        launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
+        launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
+        launch_add(h, proj, h, MC);                          // h = h + proj
+        launch_rmsnorm(h, ln2, fbuf, M, C);                  // f = rmsnorm(h, ln2)
         launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
         launch_gelu(ff1, gact, MF);                       // gelu
         launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
@@ -390,6 +408,24 @@ int capture_graph(int batch, int T) {
     g_graph_batch = batch;
     g_graph_T     = T;
     return 0;
+}
+
+// Materialize the per-layer fused QKV weight (g_fwd.wqkv[l] = [Wq|Wk|Wv]) from the uploaded
+// param blob. Called once whenever the weights change (upload/load). TODO(qkv-train): once the
+// device backend trains in place, the optimizer updates Wq/Wk/Wv in g_dev_params each step, so
+// this rebuild must run inside the step (cheap: N_LAYERS*C*C threads) -- or store QKV fused
+// natively and slice it back for the layout-table serialization.
+void build_qkv_weights() {
+    const auto& L = sub0::PARAM_LAYOUT;
+    const int   C = D_MODEL;
+    const int   n = C * C, block = 256, grid = (n + block - 1) / block;
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const int    b0 = 2 + 10 * l;
+        const float* Wq = g_dev_params + L[b0 + 2].off;
+        const float* Wk = g_dev_params + L[b0 + 3].off;
+        const float* Wv = g_dev_params + L[b0 + 4].off;
+        build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l], C);
+    }
 }
 
 }  // namespace
@@ -465,8 +501,12 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
 
 SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
     if (!g_dev_params) { const int r = sub0_cuda_init(); if (r) return r; }
-    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_params, host, sub0::PARAM_FLOATS * sizeof(float),
-                               cudaMemcpyHostToDevice));
+    if (fwd_alloc()) return 1;                   // ensure the fused-QKV weight buffers exist
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_params, host, sub0::PARAM_FLOATS * sizeof(float),
+                                    cudaMemcpyHostToDevice, g_stream));
+    build_qkv_weights();                         // rebuild the fused [Wq|Wk|Wv] from the new weights
+    invalidate_graph();                          // weights changed -> recapture the forward graph
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     return 0;
 }
 
@@ -483,6 +523,8 @@ SUB0_CUDA_API int sub0_cuda_download_params(float* host) {
 // Y[T,out] = X[T,in] . W[in,out] (+ bias). Takes host pointers, runs on the device and
 // returns the result -- a self-contained kernel the CPU-parity test drives. Per-call
 // device allocations are fine for the test harness; the real forward keeps them resident.
+// TODO(robustness): the SUB0_CUDA_CHECK early-returns leak any already-allocated dX/dW/dY/dB.
+// Acceptable for the test harness (process exits); add RAII/goto-cleanup if this ever ships.
 SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
                                    const float* W, const float* bias, float* Y) {
     const size_t xb = static_cast<size_t>(T) * in * sizeof(float);
@@ -521,6 +563,9 @@ SUB0_CUDA_API int sub0_cuda_linear(const float* X, int T, int in, int out,
 // Every Linear / RMSNorm / GELU / residual runs over all M rows at once; attention is
 // per-window causal (windows independent). Requires sub0_cuda_upload_params() first. ids is
 // [batch*T]; out_logits receives [batch*T, VOCAB]. Scratch is resident.
+// TODO(phase-2d): forward-only today -- training still runs on the CPU backend. Next is a device
+// backward + AdamW (gated by a gradient-parity test vs CPU) so a full step stays on the GPU;
+// that also makes build_qkv_weights part of the step (see TODO(qkv-train)).
 SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
