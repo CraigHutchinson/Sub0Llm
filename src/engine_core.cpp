@@ -12,6 +12,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/casing.hpp"
+#include "sub0/tokenizer.hpp"
 #include "sub0/layout.hpp"
 
 #include <algorithm>
@@ -85,145 +86,28 @@ const char* default_tokenizer()  { return DEFAULT_TOKENIZER; }
 
 namespace {
 
-struct PairHash {
-    std::size_t operator()(const std::pair<int, int>& p) const noexcept {
-        return (static_cast<std::size_t>(static_cast<std::uint32_t>(p.first)) << 32) ^
-               static_cast<std::uint32_t>(p.second);
-    }
-};
-
-struct Tokenizer {
-    bool loaded = false;
-    int  vocab  = 0;
-    int  n_base = 0;
-    std::array<int, 256> byte_base{};  // byte value -> base id (-1 if unused)
-    int  cap_id = -1, up_id = -1;      // base ids of the case markers
-    std::vector<std::vector<int>> expansion;  // id -> base symbol codes (0-255, 256, 257)
-    std::unordered_map<std::pair<int, int>, int, PairHash> merge_rank;  // (left,right) -> merge index
-    std::unordered_set<std::string> attested;  // lowercase words eligible for case collapse
-
-    int sym_to_base(int code) const {
-        if (code == casing::TOK_CAP) return cap_id;
-        if (code == casing::TOK_UP)  return up_id;
-        return byte_base[static_cast<unsigned char>(code)];
-    }
-};
-
-Tokenizer g_tok;
-
-template <class T> T read_pod(std::ifstream& is) {
-    T v{};
-    is.read(reinterpret_cast<char*>(&v), sizeof v);
-    return v;
-}
-
-// Apply learned merges to one pre-token word (sequence of base ids), lowest rank
-// first, then append the resulting ids to `out`. This reproduces the corpus
-// tokenization for the same word, keeping prompts in-distribution.
-void bpe_encode_word(std::vector<int>& seq, std::vector<int>& out) {
-    while (seq.size() >= 2) {
-        int best_rank = std::numeric_limits<int>::max(), best_pos = -1;
-        for (std::size_t k = 0; k + 1 < seq.size(); ++k) {
-            auto it = g_tok.merge_rank.find({seq[k], seq[k + 1]});
-            if (it != g_tok.merge_rank.end() && it->second < best_rank) {
-                best_rank = it->second;
-                best_pos  = static_cast<int>(k);
-            }
-        }
-        if (best_pos < 0) break;
-        seq[static_cast<std::size_t>(best_pos)] = g_tok.n_base + best_rank;
-        seq.erase(seq.begin() + best_pos + 1);
-    }
-    for (int id : seq) out.push_back(id);
-}
+// The runtime tokenizer state. Loading, encoding and detokenizing all delegate to
+// the shared sub0::tok library (src/tokenizer.cpp), the single definition used by
+// the build-time configurator too — so prompts encode byte-identically to the way
+// the corpus was tokenized at build time.
+tok::Tokenizer g_tok;
 
 }  // namespace
 
 bool load_tokenizer(const char* path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) { std::println(stderr, "tokenizer: cannot open '{}'", path); return false; }
-    if (read_pod<std::uint32_t>(is) != 0x5A543053u) {  // "S0TZ"
-        std::println(stderr, "tokenizer: bad magic in '{}'", path);
-        return false;
-    }
-    Tokenizer t;
-    t.vocab  = static_cast<int>(read_pod<std::uint32_t>(is));
-    t.n_base = static_cast<int>(read_pod<std::uint32_t>(is));
-    t.byte_base.fill(-1);
-    t.expansion.resize(static_cast<std::size_t>(t.n_base));
-    for (int i = 0; i < t.n_base; ++i) {
-        const int code = static_cast<int>(read_pod<std::uint16_t>(is));
-        t.expansion[static_cast<std::size_t>(i)] = {code};
-        if (code == casing::TOK_CAP)     t.cap_id = i;
-        else if (code == casing::TOK_UP) t.up_id  = i;
-        else                             t.byte_base[static_cast<unsigned char>(code)] = i;
-    }
-    const int n_merges = static_cast<int>(read_pod<std::uint32_t>(is));
-    t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));
-    for (int i = 0; i < n_merges; ++i) {
-        const int a = static_cast<int>(read_pod<std::uint32_t>(is));
-        const int b = static_cast<int>(read_pod<std::uint32_t>(is));
-        t.merge_rank.emplace(std::pair{a, b}, i);
-        std::vector<int> exp = t.expansion[static_cast<std::size_t>(a)];
-        exp.insert(exp.end(), t.expansion[static_cast<std::size_t>(b)].begin(),
-                   t.expansion[static_cast<std::size_t>(b)].end());
-        t.expansion.push_back(std::move(exp));
-    }
-    const int n_words = static_cast<int>(read_pod<std::uint32_t>(is));
-    for (int i = 0; i < n_words; ++i) {
-        const int len = static_cast<int>(read_pod<std::uint16_t>(is));
-        std::string w(static_cast<std::size_t>(len), '\0');
-        is.read(w.data(), len);
-        t.attested.insert(std::move(w));
-    }
-    if (!is) { std::println(stderr, "tokenizer: truncated '{}'", path); return false; }
+    tok::Tokenizer t;
+    if (!tok::deserialize(t, is)) { std::println(stderr, "tokenizer: bad or truncated '{}'", path); return false; }
     if (t.vocab != VOCAB)
         std::println(stderr, "tokenizer: vocab {} != built-in VOCAB {} (stale artifact?)", t.vocab, VOCAB);
-    t.loaded = true;
     g_tok = std::move(t);
     return true;
 }
 
-std::vector<int> encode(const std::string& text) {
-    std::vector<int> out;
-    if (!g_tok.loaded) return out;
-    long replaced = 0;
-    const std::string norm = casing::normalize_text(text, replaced);
-    const std::vector<int> stream = casing::truecase_tokenize(norm, g_tok.attested, nullptr);
+std::vector<int> encode(const std::string& text) { return tok::encode(g_tok, text); }
 
-    // Mirror the configurator's pre-tokenization exactly (casing::word_unit_end):
-    // word units are letter runs incl. accented UTF-8 and interior apostrophes, the
-    // case markers stay atomic. A prompt's "They" thus encodes as <|cap|> + the
-    // shared `they` token, in-distribution with training.
-    out.reserve(stream.size());
-    for (std::size_t i = 0, n = stream.size(); i < n;) {
-        const std::size_t end = casing::word_unit_end(stream, i);
-        if (end == i) {
-            const int id = g_tok.sym_to_base(stream[i]);
-            if (id >= 0) out.push_back(id);
-            ++i;
-            continue;
-        }
-        std::vector<int> seq;
-        for (std::size_t k = i; k < end; ++k) {
-            const int id = g_tok.sym_to_base(stream[k]);
-            if (id >= 0) seq.push_back(id);
-        }
-        bpe_encode_word(seq, out);
-        i = end;
-    }
-    return out;
-}
-
-std::string detokenize(const std::vector<int>& ids) {
-    std::vector<int> stream;
-    for (int id : ids) {
-        if (id < 0 || id >= static_cast<int>(g_tok.expansion.size())) continue;
-        const std::vector<int>& e = g_tok.expansion[static_cast<std::size_t>(id)];
-        stream.insert(stream.end(), e.begin(), e.end());
-    }
-    return casing::detokenize(stream);
-}
+std::string detokenize(const std::vector<int>& ids) { return tok::detokenize(g_tok, ids); }
 
 namespace {
 // Render a token's expansion (base-symbol codes) into a printable string: case

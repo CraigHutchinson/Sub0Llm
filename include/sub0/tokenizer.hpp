@@ -1,0 +1,136 @@
+// sub0/tokenizer.hpp — the reusable BPE tokenizer: learn from a corpus, encode,
+// detokenize, (de)serialize.
+//
+// This is the single definition of the truecasing + BPE vocabulary the project is
+// built around, factored out of the build-time configurator so it can run on an
+// IN-MEMORY corpus too. Both consumers share it:
+//   - sub0-configure streams a (possibly out-of-core) corpus through Scan and learn()
+//     to emit tokenizer.bin / corpus.tok;
+//   - the engine loads a serialized Tokenizer and encode()s prompts at runtime;
+//   - the unit tests learn a tiny in-memory corpus and assert the encode/detokenize
+//     contracts deterministically, with no dependency on the baked production corpus.
+//
+// Like casing.hpp, this header is intentionally free of any dependency on the
+// generated config (no VOCAB, no sub0_config.hpp), so the configurator — which must
+// not depend on the engine it configures — can use it.
+
+#pragma once
+
+#include "sub0/casing.hpp"
+
+#include <array>
+#include <cstdint>
+#include <iosfwd>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace sub0::tok {
+
+// Hash for an adjacent-symbol pair, used by the BPE merge tables (configurator and
+// the runtime merge_rank). Defined once here so both sides agree.
+struct PairHash {
+    std::size_t operator()(const std::pair<int, int>& p) const noexcept {
+        return (static_cast<std::size_t>(static_cast<std::uint32_t>(p.first)) << 32) ^
+               static_cast<std::uint32_t>(p.second);
+    }
+};
+
+// --- Corpus scan -----------------------------------------------------------
+// The mergeable, in-memory result of the two corpus passes that precede BPE. It is
+// fed text in arbitrary newline-aligned chunks (whole corpus, a streamed chunk, or
+// one parallel segment) and folded together with merge_*; the merged result is
+// byte-identical to scanning the whole corpus in one piece because a newline never
+// splits a word unit or the truecaser/name-detector look-back.
+//
+// Two passes, because pass 2 needs the global `attested` set derived from all of
+// pass 1: call add_names() over the whole corpus first, derive_attested(), then
+// add_words() over the whole corpus.
+struct Scan {
+    // Pass 1 — name detection: per lowercase form, how often it appears all-lowercase
+    // vs. capitalized mid-sentence (a "name" use). A form whose name uses dominate is
+    // withheld from case collapse (see derive_attested).
+    std::unordered_map<std::string, long long> lower_count, midcap_count;
+
+    // Pass 2 — unique word table: each word unit keyed by its raw byte-symbol sequence.
+    std::unordered_map<std::string, int> index;     // raw-key -> word id
+    std::vector<std::vector<int>>        word_syms;  // word id -> symbol sequence (raw bytes;
+                                                     //            remapped to base ids by learn())
+    std::vector<long long>               word_freq;  // word id -> occurrence count
+    std::array<int, 256>                 byte_used{};// 0/1 byte usage flags
+    bool                                 used_cap = false, used_up = false;
+    casing::TokStats                     st;
+
+    // Aggregate counters (configurator reporting).
+    std::size_t raw_bytes = 0, norm_bytes = 0;
+    long long   quote_repl = 0;
+
+    // Pass 1 over one in-memory chunk.
+    void add_names(std::string_view chunk);
+    // Fold another Scan's pass-1 state into this one, clearing the source's tables.
+    void merge_names(Scan& other);
+
+    // Pass 2 over one in-memory chunk, using the derived `attested` set.
+    void add_words(std::string_view chunk, const std::unordered_set<std::string>& attested);
+    // Fold another Scan's pass-2 state into this one, clearing the source's tables.
+    void merge_words(Scan& other);
+
+    // Rebuild `index` from `word_syms` (used after loading a cached scan).
+    void rebuild_index();
+};
+
+// Derive the set of lowercase forms eligible for Capitalized/UPPER -> marker collapse:
+// a form is attested unless its mid-sentence-capital ("name") uses dominate its
+// lowercase uses. `withheld`, if non-null, receives the count of withheld names.
+std::unordered_set<std::string> derive_attested(const Scan& s, long long* withheld = nullptr);
+
+// --- Learned tokenizer -----------------------------------------------------
+// The in-memory tokenizer: a base alphabet (used byte values then the case markers),
+// an ordered BPE merge list, and the attested set. Both the runtime engine and the
+// configurator hold one of these.
+struct Tokenizer {
+    bool                 loaded = false;
+    int                  vocab  = 0;   // n_base + merges.size()
+    int                  n_base = 0;   // base alphabet size
+    std::array<int, 256> byte_base{};  // byte value -> base id (-1 if unused)
+    int                  cap_id = -1, up_id = -1;  // base ids of the case markers
+    std::vector<int>     base_symbol;              // base id -> symbol code (0..255, 256 cap, 257 up)
+    std::vector<std::pair<int, int>> merges;       // ordered learned merges (left,right)
+    std::unordered_map<std::pair<int, int>, int, PairHash> merge_rank;  // (l,r) -> merge index
+    std::vector<std::vector<int>>    expansion;    // id -> base symbol codes
+    std::unordered_set<std::string>  attested;     // lowercase words eligible for case collapse
+
+    int sym_to_base(int code) const {
+        if (code == casing::TOK_CAP) return cap_id;
+        if (code == casing::TOK_UP)  return up_id;
+        return byte_base[static_cast<unsigned char>(code)];
+    }
+};
+
+struct LearnOptions {
+    int vocab_target = 2048;  // target vocabulary size (base symbols + markers + merges)
+    int min_merge    = 2;     // stop merging once the best pair occurs fewer than this many times
+};
+
+// Learn the base alphabet + BPE merges from a completed scan and the derived attested
+// set. REMAPS scan.word_syms in place from raw byte symbols to final token ids (so the
+// caller can emit a tokenized corpus from scan.index + scan.word_syms afterwards).
+Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
+                const LearnOptions& opts = {});
+
+// Convenience for tests / small corpora: scan an in-memory corpus end to end (names ->
+// attested -> words) and learn. The corpus is processed whole, single-threaded.
+Tokenizer learn(std::string_view corpus, const LearnOptions& opts = {});
+
+// --- Encode / detokenize (operate on a given tokenizer) --------------------
+std::vector<int> encode(const Tokenizer& t, const std::string& text);
+std::string      detokenize(const Tokenizer& t, const std::vector<int>& ids);
+
+// --- Serialization (tokenizer.bin: base alphabet + merges + attested words) -
+void serialize(const Tokenizer& t, std::ostream& os);
+bool deserialize(Tokenizer& t, std::istream& is);
+
+}  // namespace sub0::tok

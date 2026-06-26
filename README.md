@@ -11,6 +11,9 @@ data-parallel across cores; storage is static (BSS), not heap. There is no Pytho
 - An **OpenMP** runtime (`libomp`) for the multi-threaded training path. The build *fails loudly*
   if OpenMP is missing (the data-parallel path needs it); to build single-threaded on purpose,
   pass `-DSUB0_REQUIRE_OPENMP=OFF`.
+- *(Optional, GPU training)* the **CUDA Toolkit** (`nvcc`) and an NVIDIA device. The CUDA backend
+  is auto-detected; see [Building with the CUDA backend](#building-with-the-cuda-backend-windows)
+  for the one Windows-specific setup step.
 
 ## Build
 
@@ -21,6 +24,32 @@ ctest --preset native          # run the unit tests
 ```
 
 The `native` preset is an `-march=native` Release build. `debug` and `release` presets also exist.
+
+### Building with the CUDA backend (Windows)
+
+When a CUDA toolkit and device are present, the GPU training backend is built automatically. On
+Windows, `nvcc` compiles `.cu` files using **MSVC `cl.exe`** as its host compiler, so `cl.exe`
+and the MSVC/Windows-SDK headers and libraries must be on your environment. A plain PowerShell
+session does not have these, and configure fails with:
+
+```
+nvcc fatal : Cannot find compiler 'cl.exe' in PATH
+```
+
+Fix: run the commands from a **Visual Studio developer environment** so the MSVC toolchain is on
+`PATH`. Either:
+
+- open the **“x64 Native Tools Command Prompt for VS”** from the Start menu, **or**
+- initialize an existing shell once by running `vcvars64.bat`, e.g. from PowerShell:
+
+  ```pwsh
+  & "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+  ```
+
+  (adjust the path to your VS edition/year), **or** launch from the *Developer PowerShell for VS*.
+
+Then run the normal build commands above from that environment. The CPU-only build has no such
+requirement — only the CUDA backend needs `cl.exe`.
 
 ## Quick start
 

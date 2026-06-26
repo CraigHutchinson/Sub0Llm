@@ -157,9 +157,20 @@ if(SUB0_BUILD_CUDA)
 endif()
 
 # --- Stage 1: the configurator (host tool, depends on nothing generated) -----
+# --- Tokenizer utility library (config-free) --------------------------------
+# The truecasing + BPE tokenizer (corpus scan, merge learning, encode/detokenize,
+# (de)serialize), factored out so BOTH the build-time configurator and the runtime
+# engine share one definition — and so the tests can learn a tiny in-memory corpus
+# instead of asserting against the baked production vocabulary. It depends only on
+# casing.hpp + the standard library (no generated config), so the configurator can
+# link it without depending on the engine it configures.
+add_library(sub0_tok STATIC src/tokenizer.cpp)
+target_include_directories(sub0_tok PUBLIC "${CMAKE_SOURCE_DIR}/include")
+set_target_properties(sub0_tok PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_executable(sub0-configure tools/configurator.cpp)
 target_include_directories(sub0-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0-configure PRIVATE CLI11::CLI11)
+target_link_libraries(sub0-configure PRIVATE CLI11::CLI11 sub0_tok)
 
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
@@ -208,6 +219,9 @@ add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
 add_library(sub0_core SHARED src/engine_core.cpp ${SUB0_BACKEND_SOURCES})
 add_dependencies(sub0_core sub0_generate_config)
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+# The runtime tokenizer (encode/detokenize/load) is the same sub0_tok used by the
+# configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
+target_link_libraries(sub0_core PRIVATE sub0_tok)
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
 # the errno side-effect of the math libcalls is dead weight that stops the optimizer
 # from emitting vectorized vsqrtps. Dropping it changes no computed value (it is not a

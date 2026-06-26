@@ -9,6 +9,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/casing.hpp"
+#include "sub0/tokenizer.hpp"
 
 #include <string>
 #include <vector>
@@ -90,20 +91,48 @@ TEST_CASE("typographic input round-trips through the build tokenizer", "[tokeniz
 }
 
 TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokenizer]") {
-    REQUIRE(tokenizer_ready());
-    // "Spot" (the dog) appears capitalized mid-sentence far more than the noun
-    // "spot" appears lowercase, so the configurator withholds it from `attested`:
-    // "Spot" stays a distinct verbatim token rather than folding onto <|cap|>spot.
-    // This is the inverse of the "They"/"they" case-sharing contract above.
-    const std::vector<int> name = sub0::encode("Spot");
-    const std::vector<int> noun = sub0::encode("spot");
+    // The inverse of the "They"/"they" sharing contract above. When a capitalized
+    // word dominates its lowercase form in the corpus, derive_attested withholds that
+    // form from case collapse, so the name stays a distinct *verbatim* token (e.g. the
+    // dog "Spot") rather than folding onto <|cap|>spot. Whether a word qualifies is a
+    // property of the corpus, so this builds a tiny deterministic in-memory corpus and
+    // learns a tokenizer on it directly -- no dependency on the baked production vocab.
+    //
+    // "Spot" appears only capitalized mid-sentence (always preceded by a lowercase
+    // word, the name-use signal) with a single lowercase "spot"; "they" appears only
+    // lowercase but for one sentence-initial "They" (which is not a name use).
+    std::string corpus;
+    for (int i = 0; i < 200; ++i)
+        corpus += "the dog Spot ran and Spot played with Spot all day .\n";
+    corpus += "i found a spot on the wall .\n";   // lone lowercase use of the shadowed noun
+    for (int i = 0; i < 200; ++i)
+        corpus += "they went home and they slept and they were happy .\n";
+    corpus += "They went home today .\n";          // lone sentence-initial cap (not a name use)
+
+    const sub0::tok::Tokenizer t = sub0::tok::learn(corpus);
+
+    // The mechanism under test: "spot" (name-dominated) is withheld; "they" is attested.
+    REQUIRE(t.attested.count("spot") == 0);
+    REQUIRE(t.attested.count("they") == 1);
+
+    // The withheld name stays a verbatim capitalized token: NOT <|cap|> + the noun.
+    const std::vector<int> name = sub0::tok::encode(t, "Spot");
+    const std::vector<int> noun = sub0::tok::encode(t, "spot");
     REQUIRE_FALSE(name.empty());
     REQUIRE(name != noun);
     const bool encoded_as_cap_plus_noun =
         name.size() == noun.size() + 1 &&
+        name.front() == t.cap_id &&
         std::vector<int>(name.begin() + 1, name.end()) == noun;
     REQUIRE_FALSE(encoded_as_cap_plus_noun);
-    REQUIRE(sub0::detokenize(name) == "Spot");  // capital preserved on the round-trip
+    REQUIRE(sub0::tok::detokenize(t, name) == "Spot");  // capital preserved on the round-trip
+
+    // Control: the attested word DOES case-share -- "They" = <|cap|> + "they".
+    const std::vector<int> they_low = sub0::tok::encode(t, "they");
+    const std::vector<int> they_cap = sub0::tok::encode(t, "They");
+    REQUIRE(they_cap.size() == they_low.size() + 1);
+    REQUIRE(they_cap.front() == t.cap_id);
+    REQUIRE(std::vector<int>(they_cap.begin() + 1, they_cap.end()) == they_low);
 }
 
 TEST_CASE("encode is deterministic", "[tokenizer]") {
