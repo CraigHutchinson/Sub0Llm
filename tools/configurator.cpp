@@ -108,13 +108,13 @@ constexpr std::uint32_t WCACHE_VERSION = 1u;
 
 struct ScanState {
     std::size_t raw_bytes = 0, norm_bytes = 0;
-    long quote_repl = 0;
+    long long quote_repl = 0;
     sub0::casing::TokStats st;
     std::array<int, 256> byte_used{};                 // 0/1 usage flags
     bool used_cap = false, used_up = false;
-    std::unordered_map<std::string, long> lower_count, midcap_count;  // mergeable name stats
+    std::unordered_map<std::string, long long> lower_count, midcap_count;  // mergeable name stats (64-bit counts)
     std::vector<std::vector<int>> word_syms;          // unique word -> raw byte-symbol sequence
-    std::vector<long> word_freq;
+    std::vector<long long> word_freq;                 // 64-bit: a frequent word can exceed 2^31 on a large corpus
 };
 
 template <class T> void wr(std::ostream& os, const T& v) {
@@ -123,7 +123,7 @@ template <class T> void wr(std::ostream& os, const T& v) {
 template <class T> T rd(std::istream& is) {
     T v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v;
 }
-void wr_counts(std::ostream& os, const std::unordered_map<std::string, long>& m) {
+void wr_counts(std::ostream& os, const std::unordered_map<std::string, long long>& m) {
     wr(os, static_cast<std::uint64_t>(m.size()));
     for (const auto& [w, c] : m) {
         wr(os, static_cast<std::uint16_t>(w.size()));
@@ -131,14 +131,14 @@ void wr_counts(std::ostream& os, const std::unordered_map<std::string, long>& m)
         wr(os, static_cast<std::int64_t>(c));
     }
 }
-bool rd_counts(std::istream& is, std::unordered_map<std::string, long>& m) {
+bool rd_counts(std::istream& is, std::unordered_map<std::string, long long>& m) {
     const std::uint64_t n = rd<std::uint64_t>(is);
     m.clear(); m.reserve(n);
     std::string w;
     for (std::uint64_t i = 0; i < n; ++i) {
         const std::uint16_t len = rd<std::uint16_t>(is);
         w.resize(len); is.read(w.data(), len);
-        m.emplace(w, static_cast<long>(rd<std::int64_t>(is)));
+        m.emplace(w, static_cast<long long>(rd<std::int64_t>(is)));
     }
     return static_cast<bool>(is);
 }
@@ -182,7 +182,7 @@ bool load_scan_state(const std::string& path, const std::string& corpus, ScanSta
         return false;
     S.raw_bytes = static_cast<std::size_t>(rd<std::uint64_t>(is));
     S.norm_bytes = static_cast<std::size_t>(rd<std::uint64_t>(is));
-    S.quote_repl = static_cast<long>(rd<std::int64_t>(is));
+    S.quote_repl = static_cast<long long>(rd<std::int64_t>(is));
     S.st.words = rd<std::int64_t>(is); S.st.cap = rd<std::int64_t>(is);
     S.st.up = rd<std::int64_t>(is);    S.st.names = rd<std::int64_t>(is);
     S.byte_used.fill(0);
@@ -194,7 +194,7 @@ bool load_scan_state(const std::string& path, const std::string& corpus, ScanSta
     S.word_freq.clear(); S.word_freq.reserve(nw);
     std::vector<std::uint8_t> bb;
     for (std::uint64_t i = 0; i < nw; ++i) {
-        const long f = static_cast<long>(rd<std::uint64_t>(is));
+        const long long f = static_cast<long long>(rd<std::uint64_t>(is));
         const std::uint16_t len = rd<std::uint16_t>(is);
         bb.resize(len); is.read(reinterpret_cast<char*>(bb.data()), len);
         S.word_syms.emplace_back(bb.begin(), bb.end());
@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
     // mergeable for a future multi-corpus / incremental tokenizer.
     ScanState S;
     std::unordered_set<std::string> attested;
-    long names_withheld = 0;
+    long long names_withheld = 0;
     std::unordered_map<std::string, int> word_index;       // raw-key -> word id (also used by Pass 3)
     auto derive_attested = [&] {
         // Re-derivable from the (mergeable) name counts: a lowercase form is attested unless
@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
         attested.clear(); names_withheld = 0;
         for (const auto& [w, lc] : S.lower_count) {
             const auto it = S.midcap_count.find(w);
-            const long mid = (it == S.midcap_count.end()) ? 0 : it->second;
+            const long long mid = (it == S.midcap_count.end()) ? 0 : it->second;
             if (mid > lc) { ++names_withheld; continue; }
             attested.insert(w);
         }
@@ -392,7 +392,7 @@ int main(int argc, char** argv) {
     auto& word_freq = S.word_freq;
     const sub0::casing::TokStats& st = S.st;
     const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
-    const long quote_repl = S.quote_repl;
+    const long long quote_repl = S.quote_repl;
     S.lower_count = {}; S.midcap_count = {};   // attested derived; free the mergeable name counts
 
     // Fix the base alphabet: distinct byte values used (in byte order) then the markers --
@@ -426,12 +426,12 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int, int>> merges;
     int vocab = n_base;
 
-    std::unordered_map<std::pair<int, int>, long, PairHash> pc;          // current pair -> count
+    std::unordered_map<std::pair<int, int>, long long, PairHash> pc;     // current pair -> count (64-bit)
     std::unordered_map<std::pair<int, int>, std::vector<int>, PairHash> pair_words;  // pair -> word ids
     // Heap top = MAX count, then SMALLEST pair -- matching the naive tie-break so the merge
     // sequence (hence the vocabulary) is identical. Lazy deletion: an entry is valid only while
     // its count still equals pc[pair]; stale ones are skipped on pop.
-    struct HeapItem { long count; std::pair<int, int> pr; };
+    struct HeapItem { long long count; std::pair<int, int> pr; };
     auto worse = [](const HeapItem& a, const HeapItem& b) {
         return a.count != b.count ? a.count < b.count : a.pr > b.pr;
     };
@@ -440,7 +440,7 @@ int main(int argc, char** argv) {
     // Seed counts + index from the word table, then push each DISTINCT pair once.
     for (std::size_t w = 0; w < word_syms.size(); ++w) {
         const std::vector<int>& s = word_syms[w];
-        const long f = word_freq[w];
+        const long long f = word_freq[w];
         for (std::size_t k = 0; k + 1 < s.size(); ++k) {
             const std::pair<int, int> p{s[k], s[k + 1]};
             pc[p] += f;
@@ -456,7 +456,7 @@ int main(int argc, char** argv) {
     std::unordered_map<std::pair<int, int>, int, PairHash> wd;
 
     while (vocab < vocab_target) {
-        std::pair<int, int> best{0, 0}; long best_c = -1;
+        std::pair<int, int> best{0, 0}; long long best_c = -1;
         while (!heap.empty()) {
             const HeapItem top = heap.top();
             const auto it = pc.find(top.pr);
@@ -489,7 +489,7 @@ int main(int argc, char** argv) {
                 else { ns.push_back(s[k]); ++k; }
             }
             if (!changed) continue;                          // stale index entry
-            const long f = word_freq[static_cast<std::size_t>(w)];
+            const long long f = word_freq[static_cast<std::size_t>(w)];
             // Net pair-count change = (old pair multiset) - (new pair multiset). Only pairs with a
             // non-zero net actually changed, so we touch the big pc map / heap / index for those
             // alone -- the bulk of the bookkeeping stays in this small, cache-hot, word-local map.
@@ -498,7 +498,7 @@ int main(int argc, char** argv) {
             for (std::size_t k = 0; k + 1 < ns.size(); ++k) wd[{ns[k], ns[k + 1]}] -= 1;
             for (const auto& [p, d] : wd) {
                 if (d == 0) continue;
-                pc[p] -= static_cast<long>(d) * f;
+                pc[p] -= static_cast<long long>(d) * f;
                 touched.insert(p);
                 if (d < 0) pair_words[p].push_back(w);       // pair now present (more) in this word
             }

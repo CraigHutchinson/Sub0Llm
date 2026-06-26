@@ -44,10 +44,10 @@ inline bool is_word_byte(int s) {
 
 // Per-corpus truecasing statistics (configurator reporting only).
 struct TokStats {
-    long words = 0;  // alpha runs seen
-    long cap   = 0;  // collapsed to <|cap|> + lowercase
-    long up    = 0;  // collapsed to <|up|>  + lowercase
-    long names = 0;  // capitalized/upper words left verbatim (corpus-aware)
+    long long words = 0;  // alpha runs seen
+    long long cap   = 0;  // collapsed to <|cap|> + lowercase
+    long long up    = 0;  // collapsed to <|up|>  + lowercase
+    long long names = 0;  // capitalized/upper words left verbatim (corpus-aware) (64-bit: a large corpus has >2^31 words)
 };
 
 // Fold "fancy" typographic glyphs to their ASCII equivalents. The corpus carries
