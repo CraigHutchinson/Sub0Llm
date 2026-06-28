@@ -28,6 +28,7 @@
 #include <fstream>
 #include <limits>
 #include <mdspan>
+#include <memory>
 #include <print>
 #include <random>
 #include <ranges>
@@ -97,14 +98,16 @@ static std::array<float, PARAM_FLOATS> g_param_vel{};
 
 struct ParamView { size_t off, n; bool decay; };
 
-// All per-thread state for a data-parallel window lives in one Worker. Workers are
-// a STATICALLY allocated pool indexed by OpenMP thread id -- not thread_local: a
-// multi-MB thread_local in a DLL overruns Windows' static-TLS block and faults. BSS
-// is demand-paged, so only the slots a run actually touches become resident. Each
-// thread binds its slot once into the thread_local handle `W` (see
-// ensure_thread_built), keeping the hot paths pointer-direct. Slot 0 serves all
-// single-window work (gen / eval / bench). The pool is sized to MAX_WORKERS, a
-// hardware-scaled constant cached into the generated config by sub0-configure.
+// All per-thread state for a data-parallel window lives in one Worker. Workers are a pool indexed
+// by OpenMP thread id -- not thread_local (a multi-MB thread_local in a DLL overruns Windows'
+// static-TLS block and faults). Each Worker is LAZILY HEAP-ALLOCATED on first use: only the slots
+// a run actually touches allocate (a GPU run or gen/eval/bench uses just slot 0), and -- critically
+// for large models -- the per-worker arrays (a PARAM_FLOATS gradient + activation arenas) stay OFF
+// the DLL's static image, which a static pool would otherwise bloat past the PE 4GB SizeOfImage
+// limit (the image fails to load with STATUS_INVALID_IMAGE_FORMAT). Each thread binds its slot once
+// into the thread_local handle `W` (see ensure_thread_built), keeping the hot paths pointer-direct.
+// The pool is sized to MAX_WORKERS, a hardware-scaled constant cached into the config; only the
+// MAX_WORKERS unique_ptr handles (not the Workers) live in BSS.
 struct Worker {
     std::array<float, PARAM_FLOATS> grad{};        // gradient accumulator (this slot)
     std::array<float, ACT_CAP>      act_data{};    // activation arena: values
@@ -114,7 +117,7 @@ struct Worker {
     std::array<ParamView, NUM_PARAMS> views{};     // optimizer parameter spans
     size_t act_used = 0, pool_used = 0, pcount = 0, pused = 0;
 };
-static std::array<Worker, MAX_WORKERS> g_workers{};
+static std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers{};
 static std::atomic<bool> g_params_init{false};
 // nullptr until this thread runs ensure_thread_built(); a non-null W is the single
 // per-thread "bound and laid out" flag (its own TLS lifetime tracks the OS thread,
@@ -705,8 +708,11 @@ static inline void set_flush_denormals() {
 static void ensure_thread_built() {
     if (W) return;
     set_flush_denormals();                                // FTZ/DAZ for this thread's MXCSR
-    W = &g_workers[omp_get_thread_num() % MAX_WORKERS];   // clamp; train_batch caps the width
-    g_model.build_layout();                               // grad spans now reference this slot
+    const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
+    // Each thread owns its slot (unique tid within the team), so this lazy alloc needs no lock.
+    if (!g_workers[tid]) g_workers[tid] = std::make_unique<Worker>();
+    W = g_workers[tid].get();                             // grad spans now reference this slot
+    g_model.build_layout();
 }
 }  // anonymous namespace
 
@@ -776,8 +782,11 @@ void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.begin()); }
 
 // Data-parallel minibatch: each window's full forward+backward runs on its own
 // thread into a private gradient accumulator, then the accumulators are summed into
-// the shared gradient. Returns the mean loss; call AdamW::step() afterwards.
-float train_batch(const int* data, const std::size_t* starts, int batch, int T) {
+// the shared gradient. Returns the mean loss; call AdamW::step() afterwards. When
+// `lengths` is given, window b trains at its own length lengths[b] (<= T) -- so a short
+// document trains on exactly its tokens with no padding (the CPU processes each window
+// independently, so it needs no loss mask, unlike the batched GPU path).
+float train_batch(const int* data, const std::size_t* starts, int batch, int T, const int* lengths) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
@@ -785,8 +794,9 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T) 
         std::ranges::fill(W->grad, 0.f);
         #pragma omp for reduction(+ : total) schedule(static)
         for (int b = 0; b < batch; ++b) {
+            const int Tb = lengths ? lengths[b] : T;
             graph_reset();
-            Node* logits = g_model.forward(data + starts[b], T);
+            Node* logits = g_model.forward(data + starts[b], Tb);
             Node* loss   = op_cross_entropy(logits, data + starts[b] + 1);
             total += loss->data[0];
             backward(loss, 1.f / static_cast<float>(batch));
@@ -797,7 +807,7 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T) 
         for (std::size_t i = 0; i < PARAM_FLOATS; ++i) {
             float s = 0.f;
             for (int t = 0; t < nthreads; ++t)
-                s += g_workers[t].grad[i];
+                s += g_workers[t]->grad[i];
             g_param_grad[i] = s;
         }
     }

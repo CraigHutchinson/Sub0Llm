@@ -98,8 +98,11 @@ SUB0_API void  reduce_gradients();                              // publish singl
 
 // Data-parallel minibatch: forward+backward each window on its own thread, then sum
 // the per-thread gradients into the shared gradient. Returns mean loss; then step().
-// `starts[b]` is the token offset of window b (x = data+starts[b], y = +1).
-SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T);
+// `starts[b]` is the token offset of window b (x = data+starts[b], y = +1). `lengths`,
+// if non-null, gives window b's trained length (<= T) so short documents train at their
+// own length instead of a fixed T; null means every window is exactly T.
+SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T,
+                           const int* lengths = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 class SUB0_API AdamW {

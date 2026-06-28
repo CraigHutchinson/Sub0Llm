@@ -94,35 +94,40 @@ TEST_CASE("variable-length training windows run across a range of T", "[engine]"
 
 TEST_CASE("window sampler keeps each training window inside one document", "[window]") {
     // Documents occupy [0,100), [100,160), [160,400) of 400 trainable tokens. For any sampled
-    // start, the whole window -- inputs [start,start+T) plus the last shifted target at start+T --
-    // must stay within the single document that contains `start` (unless that document is too short
-    // for T, where the sampler is allowed to fall back to a flat window).
+    // window, the inputs [start,start+len) and the last shifted target at start+len must stay within
+    // the single document that contains `start`. A document too short for the full width T is no
+    // longer skipped -- it yields a shorter window (len < T) that the caller pads; verify that path
+    // is exercised (the 60-token middle document at the larger widths).
     const std::vector<std::uint32_t> docs = {0u, 100u, 160u};
     const std::size_t train_tok = 400;
     std::mt19937 rng(123);
-    for (int T : {1, 8, 33, 64}) {
+    bool saw_short = false;
+    for (int T : {8, 33, 64, 200}) {
         for (int it = 0; it < 5000; ++it) {
-            const std::size_t s = sub0::sample_window_start(rng, T, train_tok,
-                                                            std::span<const std::uint32_t>(docs));
-            REQUIRE(s + static_cast<std::size_t>(T) < train_tok);   // window fits the train range
-            std::size_t ds = 0, de = train_tok;                     // document containing s
+            const sub0::Window w = sub0::sample_window(rng, T, train_tok,
+                                                       std::span<const std::uint32_t>(docs));
+            REQUIRE(w.len >= 1);
+            REQUIRE(w.len <= T);
+            REQUIRE(w.start + static_cast<std::size_t>(w.len) < train_tok);   // last target in range
+            std::size_t ds = 0, de = train_tok;                              // document containing start
             for (std::size_t k = 0; k < docs.size(); ++k)
-                if (docs[k] <= s) { ds = docs[k]; de = (k + 1 < docs.size()) ? docs[k + 1] : train_tok; }
-            if (de - ds >= static_cast<std::size_t>(T) + 1) {       // doc can hold the window
-                REQUIRE(s >= ds);
-                REQUIRE(s + static_cast<std::size_t>(T) < de);      // no crossing into the next doc
-            }
+                if (docs[k] <= w.start) { ds = docs[k]; de = (k + 1 < docs.size()) ? docs[k + 1] : train_tok; }
+            REQUIRE(w.start >= ds);
+            REQUIRE(w.start + static_cast<std::size_t>(w.len) < de);          // window + target in-doc
+            if (w.len < T) saw_short = true;
         }
     }
+    REQUIRE(saw_short);   // short documents are trained (as padded windows), not dropped
 }
 
-TEST_CASE("window sampler with no document index gives a valid uniform start", "[window]") {
+TEST_CASE("window sampler with no document index gives a valid full-width window", "[window]") {
     std::mt19937 rng(7);
     const std::size_t train_tok = 200;
     const int T = 16;
     for (int it = 0; it < 2000; ++it) {
-        const std::size_t s = sub0::sample_window_start(rng, T, train_tok, {});
-        REQUIRE(s + static_cast<std::size_t>(T) < train_tok);
+        const sub0::Window w = sub0::sample_window(rng, T, train_tok, {});
+        REQUIRE(w.len == T);
+        REQUIRE(w.start + static_cast<std::size_t>(T) < train_tok);
     }
 }
 

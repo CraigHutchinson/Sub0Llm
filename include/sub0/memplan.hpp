@@ -96,6 +96,7 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
                         + Mm * V * FLOAT        // dlogits  [M,V]
                         + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]
+                        + u64(batch) * INT      // lengths   [batch] (per-window padding mask)
                         + DBL;                  // loss [1] (double)
     return L * per_layer + final_blk + grad;
 }

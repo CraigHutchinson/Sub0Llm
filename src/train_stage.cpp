@@ -74,7 +74,7 @@ extern "C" int  sub0_cuda_download_params(float* host);
 extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
 extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
-                                     float lr, long t, double* out_loss);
+                                     float lr, long t, double* out_loss, const int* lengths);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" void sub0_cuda_set_attn_bwd(int per_query);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
@@ -107,12 +107,13 @@ constexpr int    MAX_EPOCHS_BACKSTOP = 30;    // ceiling if no plateau is detect
 constexpr int    PLATEAU_WINDOW      = 6;     // deltas inspected by the sign test
 constexpr int    PLATEAU_MIN_IMPROVE = 4;     // >= this many decreasing -> keep going
 
-// Variable-length training: each step draws a window length T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
+// Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context
-// lengths stops the model overfitting to exactly SEQ_LEN and makes it robust to short prompts.
-// For a tiny context there is no room to vary, so MIN_TRAIN_SEQ collapses to SEQ_LEN (fixed).
-// Set SUB0_FIXED_SEQ=1 at runtime to force fixed full-length windows (A/B and reproducibility).
-constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? SEQ_LEN / 2 : SEQ_LEN;
+// lengths stops the model overfitting to exactly SEQ_LEN and makes it robust to short prompts. The
+// floor is kept low (SEQ_LEN/8) so most documents fit a full window AND so short documents -- which
+// are padded up to T with the loss masked off -- waste little compute. For a tiny context there is
+// no room to vary, so MIN_TRAIN_SEQ collapses to SEQ_LEN (fixed). SUB0_FIXED_SEQ=1 forces full T.
+constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? std::max(8, SEQ_LEN / 8) : SEQ_LEN;
 
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
 constexpr std::uint32_t CKPT_VERSION = 1u;
@@ -464,22 +465,30 @@ struct GpuTrainer {
 #endif
     }
 
-    // One resident device step over the sampled window starts; returns the mean loss. Builds the
-    // [batch*T] id/target windows (x = data[start+s], y = data[start+s+1]) like the CPU path. T may
-    // be < SEQ_LEN (variable-length training); the resident scratch is sized for SEQ_LEN, so a
-    // shorter T just fills the leading batch*T rows of the max-size buffers.
+    // One resident device step over the sampled windows; returns the mean loss. Builds the
+    // [batch*T] id/target windows (x = data[start+s], y = data[start+s+1]); a window shorter than T
+    // (a short document) fills its leading `lengths[b]` rows and PADS the rest, with the trailing
+    // positions loss-masked on the device via the same `lengths` array -- so no document is dropped
+    // and the padding contributes no gradient (causal attention keeps it out of the real tokens).
     float step([[maybe_unused]] std::span<const int> data, [[maybe_unused]] const std::size_t* starts,
-               [[maybe_unused]] int batch, [[maybe_unused]] int T, [[maybe_unused]] float lr) {
+               [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
+               [[maybe_unused]] int T, [[maybe_unused]] float lr) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
-            const int* w = data.data() + starts[b];
-            for (int s = 0; s < T; ++s) {
+            const int* w   = data.data() + starts[b];
+            const int  len = lengths ? lengths[b] : T;
+            int s = 0;
+            for (; s < len; ++s) {
                 ids[static_cast<std::size_t>(b) * T + s]     = w[s];
                 targets[static_cast<std::size_t>(b) * T + s] = w[s + 1];
             }
+            for (; s < T; ++s) {                       // pad the tail of a short window (loss-masked)
+                ids[static_cast<std::size_t>(b) * T + s]     = 0;
+                targets[static_cast<std::size_t>(b) * T + s] = 0;
+            }
         }
         double loss = 0.0;
-        sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss);
+        sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -686,6 +695,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::fflush(stdout);
 
     std::vector<size_t> starts(batch);
+    std::vector<int>    win_len(batch);   // per-window trained length (< seq_t for short documents)
     long steps_since_refresh = 0;
 
     using clock = std::chrono::steady_clock;
@@ -720,14 +730,17 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // resume, deterministic), then run the batch -- on the GPU when enabled, else
         // data-parallel across CPU threads.
         const int seq_t = vary_seq ? std::uniform_int_distribution<int>(MIN_TRAIN_SEQ, SEQ_LEN)(rng) : SEQ_LEN;
-        for (int b = 0; b < batch; ++b)
-            starts[b] = sub0::sample_window_start(rng, seq_t, train_span.size(), doc_index);
+        for (int b = 0; b < batch; ++b) {
+            const sub0::Window win = sub0::sample_window(rng, seq_t, train_span.size(), doc_index);
+            starts[b]  = win.start;
+            win_len[b] = win.len;
+        }
         float step_loss;
         if (gpu_train) {
-            step_loss = gpu.step(train_span, starts.data(), batch, seq_t, lr);
+            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch, seq_t, lr);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
-            step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, seq_t);
+            step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, seq_t, win_len.data());
             opt.step();
         }
         run_loss += step_loss; ++run_n;

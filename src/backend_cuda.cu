@@ -366,28 +366,39 @@ __global__ void rope_backward_kernel(float* __restrict__ dqkv, int batch, int T,
 //  Backward kernels (Phase 2d) -- mirror src/backend_cpu.cpp backward_node()
 // ============================================================================
 
-// Cross-entropy backward (op_cross_entropy): one thread per row m over [M,V]. Recomputes the
-// row softmax, accumulates the mean loss (-log p[target], summed; host divides by M) and writes
-// dlogits[m,j] = (1/M)(p - onehot). invM folds the CPU's (1/batch)*(1/T) seed since M = batch*T.
+// Cross-entropy backward (op_cross_entropy): one thread per row m over [M,V]. Row m belongs to
+// window b = m/T at position t = m%T. Positions t >= lengths[b] are PADDING (a short document
+// padded up to T): they get zero gradient and add no loss. Each trained row is weighted 1/(batch*
+// len[b]) so the loss/grad is the per-window mean over its real length, then the mean over the
+// batch -- identical to the CPU train_batch reduction, and exactly 1/M when every window is full
+// (len == T, lengths == nullptr), which keeps the dense gradient-parity gate unchanged.
 __global__ void ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
                                    float* __restrict__ dlogits, double* __restrict__ loss_acc,
-                                   int M, int V, float invM) {
+                                   int M, int V, int T, int batch, const int* __restrict__ lengths) {
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M) return;
+    const int b   = m / T;
+    const int t   = m - b * T;
+    const int len = lengths ? lengths[b] : T;
+    float* dl     = dlogits + static_cast<size_t>(m) * V;
+    if (t >= len) {                                  // padding row: inert (no grad, no loss)
+        for (int j = 0; j < V; ++j) dl[j] = 0.f;
+        return;
+    }
     const float* lr = logits + static_cast<size_t>(m) * V;
-    float* dl       = dlogits + static_cast<size_t>(m) * V;
     const int tgt   = targets[m];
     float mx = -1e30f;
     for (int j = 0; j < V; ++j) mx = fmaxf(mx, lr[j]);
     float Z = 0.f;
     for (int j = 0; j < V; ++j) Z += __expf(lr[j] - mx);
     const float invZ = 1.f / Z;
+    const float w    = 1.0f / (static_cast<float>(batch) * static_cast<float>(len));   // per-window mean
     for (int j = 0; j < V; ++j) {
         const float p = __expf(lr[j] - mx) * invZ;
-        dl[j] = invM * (p - (j == tgt ? 1.f : 0.f));
+        dl[j] = w * (p - (j == tgt ? 1.f : 0.f));
     }
     const float ptgt = __expf(lr[tgt] - mx) * invZ;
-    atomicAdd(loss_acc, static_cast<double>(-__logf(fmaxf(1e-9f, ptgt))));
+    atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
 }
 
 // Bias gradient: dbias[o] = sum_m dY[m,o] (one thread per output column).
@@ -823,6 +834,7 @@ struct TrainScratch {
     float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
     int*   dtargets = nullptr;     // [M] next-token targets for cross-entropy
+    int*   lengths  = nullptr;     // [batch] per-window trained length (padding mask for short docs)
 };
 TrainScratch g_tr;
 int          g_tr_cap = 0;         // batch the training buffers are sized for
@@ -863,6 +875,7 @@ int train_alloc(int batch) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(batch) * sizeof(int)));
     g_tr_cap = batch;
     return 0;
 }
@@ -876,7 +889,7 @@ void train_free() {
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); cudaFree(g_tr.dlogits);
-    cudaFree(g_tr.dwqkv); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets);
+    cudaFree(g_tr.dwqkv); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
     g_tr = TrainScratch{};
     g_tr_cap = 0;
 }
@@ -1061,7 +1074,7 @@ void forward_train(int batch, int T) {
 // backward kernels accumulate into it (residual skip + through-norm paths), exactly like the CPU
 // tape walk. Weight/bias grads are written straight to their PARAM_LAYOUT offsets (each weight is
 // used once per forward). Loss scaling invM = 1/M makes the result equal the CPU train_batch grad.
-void backward_device(int batch, int T) {
+void backward_device(int batch, int T, const int* d_lengths) {
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
     const int    M  = batch * T;
@@ -1073,11 +1086,11 @@ void backward_device(int batch, int T) {
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(gb, 0, sub0::PARAM_FLOATS * sizeof(float), g_stream));
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.loss, 0, sizeof(double), g_stream));
 
-    // cross-entropy: dlogits = (1/M)(p - onehot), loss += -log p[target]
+    // cross-entropy: per-window-mean dlogits with padding masked out (d_lengths; nullptr = all full T)
     {
         const int block = 256;
         ce_backward_kernel<<<(M + block - 1) / block, block, 0, g_stream>>>(
-            g_tr.logits, g_tr.dtargets, g_tr.dlogits, g_tr.loss, M, V, 1.0f / static_cast<float>(M));
+            g_tr.logits, g_tr.dtargets, g_tr.dlogits, g_tr.loss, M, V, T, batch, d_lengths);
     }
     // lm_head: dW/dbias -> grad blob, da = grad into a_final
     launch_linear_bwd(g_tr.a_final, pb + L[fi + 1].off, g_tr.dlogits, g_tr.da,
@@ -1364,7 +1377,8 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
 // ============================================================================
 // Shared driver: upload ids+targets, run the activation-saving forward and the reverse pass into
 // g_dev_grad, sync, and read back the mean cross-entropy. Requires upload_params() first.
-static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, double* out_loss) {
+static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, double* out_loss,
+                       const int* lengths = nullptr) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
     if (fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
@@ -1375,21 +1389,28 @@ static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, dou
                                     cudaMemcpyHostToDevice, g_stream));
     SUB0_CUDA_CHECK(cudaMemcpyAsync(g_tr.dtargets, targets, static_cast<size_t>(M) * sizeof(int),
                                     cudaMemcpyHostToDevice, g_stream));
+    const int* d_lengths = nullptr;              // null => every window is full T (dense path)
+    if (lengths) {
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_tr.lengths, lengths, static_cast<size_t>(batch) * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+        d_lengths = g_tr.lengths;
+    }
     forward_train(batch, T);
-    backward_device(batch, T);
+    backward_device(batch, T, d_lengths);
     double loss = 0.0;
     SUB0_CUDA_CHECK(cudaMemcpyAsync(&loss, g_tr.loss, sizeof(double), cudaMemcpyDeviceToHost, g_stream));
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
-    if (out_loss) *out_loss = loss / M;          // mean cross-entropy (matches CPU train_batch)
+    if (out_loss) *out_loss = loss;              // the CE kernel already produced the mean
     return 0;
 }
 
 // Forward+backward only: fills out_grad[PARAM_FLOATS] with the reduced gradient (for the
 // gradient-parity test against the CPU train_batch grad). Optionally returns the mean loss.
+// `lengths` (optional) masks short-window padding exactly as the training step does.
 SUB0_CUDA_API int sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
-                                     float* out_grad, double* out_loss) {
-    if (run_fwd_bwd(ids, targets, batch, T, out_loss)) return 1;
+                                     float* out_grad, double* out_loss, const int* lengths) {
+    if (run_fwd_bwd(ids, targets, batch, T, out_loss, lengths)) return 1;
     SUB0_CUDA_CHECK(cudaMemcpy(out_grad, g_dev_grad, sub0::PARAM_FLOATS * sizeof(float),
                                cudaMemcpyDeviceToHost));
     return 0;
@@ -1407,10 +1428,11 @@ SUB0_CUDA_API int sub0_cuda_adam_step(float lr, long t) {
 }
 
 // Full device training step: forward + backward + AdamW, returning the mean loss. The end-to-end
-// path the GPU train stage will drive once it replaces the CPU backend.
+// path the GPU train stage will drive once it replaces the CPU backend. `lengths` (optional) gives
+// each window's trained length so short documents padded up to T train only on their real tokens.
 SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
-                                       float lr, long t, double* out_loss) {
-    if (run_fwd_bwd(ids, targets, batch, T, out_loss)) return 1;
+                                       float lr, long t, double* out_loss, const int* lengths) {
+    if (run_fwd_bwd(ids, targets, batch, T, out_loss, lengths)) return 1;
     device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
@@ -1518,7 +1540,7 @@ static int time_train_step(int batch, int T, int iters, double budget_ms, double
     long step = 0;
     auto one_step = [&]() {
         forward_train(batch, T);
-        backward_device(batch, T);
+        backward_device(batch, T, nullptr);
         device_adam_step(0.001f, ++step, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
     };
     // Time `n` steps on the stream and return the elapsed milliseconds (GPU event timing is precise).

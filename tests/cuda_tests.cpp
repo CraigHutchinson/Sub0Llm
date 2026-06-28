@@ -25,7 +25,7 @@ extern "C" int  sub0_cuda_linear(const float* X, int T, int in, int out,
 extern "C" int  sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
-                                   float* out_grad, double* out_loss);
+                                   float* out_grad, double* out_loss, const int* lengths = nullptr);
 extern "C" int  sub0_cuda_adam_step(float lr, long t);
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
@@ -206,6 +206,51 @@ TEST_CASE("CUDA backward matches the CPU reduced gradient", "[cuda]") {
     sub0_cuda_shutdown();
 }
 
+TEST_CASE("CUDA backward matches the CPU gradient with short padded windows", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    // A batch of mixed lengths: some windows shorter than T (a short document padded up to T). The
+    // CPU trains each window at its own length; the GPU pads and masks the loss via `lengths`. The
+    // reduced gradients must still agree -- the padding must contribute nothing.
+    const int batch = 4, T = 8;
+    const std::vector<int> lengths = {8, 5, 3, 7};
+    std::vector<int> data(static_cast<std::size_t>(batch) * T + 1);
+    std::mt19937 rng(77);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int& x : data) x = tok(rng);
+    std::vector<std::size_t> starts(batch);
+    for (int b = 0; b < batch; ++b) starts[b] = static_cast<std::size_t>(b) * T;
+
+    sub0::train_batch(data.data(), starts.data(), batch, T, lengths.data());     // CPU reference
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    std::vector<int> ids(static_cast<std::size_t>(batch) * T), targets(static_cast<std::size_t>(batch) * T);
+    for (int b = 0; b < batch; ++b)
+        for (int s = 0; s < T; ++s) {
+            const bool real = s < lengths[b];
+            ids[static_cast<std::size_t>(b) * T + s]     = real ? data[starts[b] + s]     : 0;
+            targets[static_cast<std::size_t>(b) * T + s] = real ? data[starts[b] + s + 1] : 0;
+        }
+    std::vector<float> gpu_grad(n, 0.0f);
+    double loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss,
+                              lengths.data()) == 0);
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+        num += d * d;
+        den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    INFO("padded grad rel-L2 = " << rel << "  loss = " << loss);
+    REQUIRE(rel < 1e-2);
+    sub0_cuda_shutdown();
+}
+
 TEST_CASE("CUDA AdamW step matches the CPU optimizer update", "[cuda]") {
     sub0::build_model();
     sub0_cuda_set_tf32(0);
@@ -313,6 +358,17 @@ TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]")
         WARN("batch=" << batch << "  predicted=" << predicted_mb << " MiB  measured=" << actual_mb
              << " MiB  gap=" << (actual_mb - predicted_mb) << " MiB");
         REQUIRE(actual_mb > 0.0);
+        // The cudaMemGetInfo measurement only counts DEDICATED VRAM. Once the footprint approaches
+        // the dedicated budget it spills to WDDM shared memory, which the free-memory delta does NOT
+        // see -- so a too-large prediction is structurally un-measurable (measured plateaus while
+        // predicted keeps growing). Only validate parity for batches comfortably inside VRAM; the
+        // larger batches still print their gap above for inspection. (For a small model all three
+        // batches fit and are checked; the guard only excuses the genuinely over-budget ones.)
+        if (GPU_VRAM_MB > 0 && predicted_mb > 0.8 * static_cast<double>(GPU_VRAM_MB)) {
+            WARN("batch=" << batch << " predicted " << predicted_mb
+                 << " MiB is near/over the VRAM budget; measurement spills to shared, skipping parity");
+            continue;
+        }
         // The measured delta is our exact byte sum plus per-cudaMalloc rounding and WDDM free-memory
         // noise -- a bounded, batch-independent offset, NOT a percentage. So we allow a fixed MiB
         // slack (sub0::memplan::FOOTPRINT_TOLERANCE_MB). A missing/extra/resized buffer shifts the
