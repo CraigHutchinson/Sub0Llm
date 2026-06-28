@@ -620,12 +620,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::string model_path;
     std::filesystem::path meta_dir;
     const std::string created = sub0::registry::now_iso();
+    long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
     if (model_out && *model_out) {
         model_path = model_out;
     } else {
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                                             static_cast<int>(USE_TERNARY), SUB0_GIT_SHA);
+                                             static_cast<int>(USE_TERNARY),
+                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
         std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
         model_path = (meta_dir / "model.bin").string();
         std::println("model dir: {}", model_path);
@@ -636,7 +638,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
         m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
         m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
+        m.pos_encoding = static_cast<int>(POS_ENCODING);
         m.git_sha = SUB0_GIT_SHA; m.created = created;
+        m.updated = sub0::registry::now_iso();
+        m.steps = rs.step;
+        m.epochs = static_cast<double>(rs.step) / static_cast<double>(epoch_steps);
+        m.tokens_seen = static_cast<long long>(rs.step) * batch * SEQ_LEN;  // approximate (variable T)
+        m.batch = batch; m.lr = lr; m.seed = seed;
         m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
         m.status = status;
         sub0::registry::write_meta(meta_dir, m);
@@ -663,7 +671,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
     // plateau-stopped, so an estimate is fine).
     const long tokens_per_step = static_cast<long>(batch) * SEQ_LEN;
-    const long epoch_steps  = std::max<long>(1, (static_cast<long>(est_train_tokens) + tokens_per_step - 1) / tokens_per_step);
+    epoch_steps  = std::max<long>(1, (static_cast<long>(est_train_tokens) + tokens_per_step - 1) / tokens_per_step);
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
@@ -1483,7 +1491,8 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
     if (models.empty()) { std::println("(none yet -- `sub0llm train` creates one)"); return 0; }
 
     auto loadable = [&](const reg::ModelMeta& m) {
-        return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, static_cast<int>(USE_TERNARY));
+        return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
+                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING));
     };
     std::sort(models.begin(), models.end(),
               [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });

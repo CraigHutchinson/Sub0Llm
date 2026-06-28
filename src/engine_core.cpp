@@ -43,9 +43,10 @@ namespace sub0 {
 
 namespace {
 struct Header {
-    char magic[4] = {'S', '0', 'L', '4'};
+    char magic[4] = {'S', '0', 'L', '5'};
     int d_model = D_MODEL, n_layers = N_LAYERS, n_heads = N_HEADS;
     int d_ff = D_FF, seq_len = SEQ_LEN, vocab = VOCAB, ternary = USE_TERNARY;
+    int pos_encoding = static_cast<int>(POS_ENCODING);   // 0 = absolute learned, 1 = RoPE
     uint64_t param_floats = PARAM_FLOATS;
 };
 }
@@ -66,7 +67,8 @@ bool load_model(const char* path) {
     if (std::memcmp(h.magic, ref.magic, 4) != 0 ||
         h.d_model != ref.d_model || h.n_layers != ref.n_layers || h.n_heads != ref.n_heads ||
         h.d_ff != ref.d_ff || h.seq_len != ref.seq_len || h.vocab != ref.vocab ||
-        h.ternary != ref.ternary || h.param_floats != ref.param_floats) {
+        h.ternary != ref.ternary || h.pos_encoding != ref.pos_encoding ||
+        h.param_floats != ref.param_floats) {
         std::println(stderr, "error: model was built with a different (constexpr) config");
         return false;
     }
