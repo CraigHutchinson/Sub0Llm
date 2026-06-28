@@ -71,6 +71,24 @@ TEST_CASE("untrained cross-entropy is near ln(VOCAB)", "[engine]") {
     REQUIRE(loss < 1.5f * uniform);
 }
 
+TEST_CASE("variable-length training windows run across a range of T", "[engine]") {
+    sub0::build_model();
+    // The training loop draws a per-step window length T in [MIN_TRAIN_SEQ, SEQ_LEN]; every such
+    // length must run cleanly through forward -> loss -> backward and yield a finite, non-trivial
+    // loss (a fixed-SEQ_LEN assumption anywhere in the stack would crash or misindex on short T).
+    std::mt19937 rng(99);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int T : {8, 17, 32, SEQ_LEN}) {
+        std::vector<int> data(static_cast<std::size_t>(T) + 1);
+        for (int& v : data) v = tok(rng);
+        const std::vector<std::size_t> starts(1, std::size_t{0});
+        const float loss = sub0::train_batch(data.data(), starts.data(), 1, T);
+        INFO("T = " << T << "  loss = " << loss);
+        REQUIRE(loss > 0.0f);          // > 0 also rejects NaN (NaN compares false)
+        REQUIRE(loss < 100.0f);        // finite and near the untrained ln(VOCAB) scale
+    }
+}
+
 TEST_CASE("attention is causal: future tokens cannot change past logits", "[engine]") {
     sub0::build_model();
     std::vector<int> ids, tgt;
