@@ -114,6 +114,23 @@ cmake --preset native -DSUB0_D_MODEL=128 -DSUB0_N_LAYERS=6 -DSUB0_N_HEADS=4 -DSU
 `SUB0_D_MODEL`, `SUB0_N_LAYERS`, `SUB0_N_HEADS`, `SUB0_SEQ_LEN`, `SUB0_TERNARY`, `SUB0_CORPUS`,
 `SUB0_CORPUS_TOK` (ON/OFF/AUTO), `SUB0_EXACT_MATH` (exact vs fast transcendentals).
 
+### Positional encoding
+
+`SUB0_POS_ENCODING` selects how position is injected (compile-time):
+
+- **`ROPE`** (default) — rotary embeddings applied to Q/K inside attention. Encodes *relative*
+  position in the attention dot-product, uses no learned position table, and extends to longer
+  contexts far better than learned absolute embeddings. `SUB0_ROPE_THETA` (default `10000`) is its
+  frequency base.
+- **`ABSOLUTE`** — a learned `pos_emb[SEQ_LEN, D_MODEL]` table added to the token embedding.
+
+```sh
+cmake --preset native -DSUB0_POS_ENCODING=ROPE -DSUB0_ROPE_THETA=10000
+```
+
+The two schemes share the same weight layout, so a model is only comparable to others built with
+the **same** `SUB0_POS_ENCODING`.
+
 ## Tooling
 
 | Command | Purpose |

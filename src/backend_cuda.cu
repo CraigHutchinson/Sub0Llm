@@ -162,6 +162,15 @@ __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float*
     }
 }
 
+// Token-only embedding (RoPE path): h[m,j] = tok_emb[ids[m], j]. Position is injected later by
+// the RoPE rotation inside attention, so there is no pos_emb add here.
+__global__ void embed_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
+                             float* __restrict__ h, int M, int C) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && j < C) h[m * C + j] = tok_emb[ids[m] * C + j];
+}
+
 // y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
 // TODO(perf): one thread per row serializes the C-length reduction. For larger C a block-per-row
 // warp/shared reduction (or a fused rmsnorm+linear epilogue) would cut memory traffic.
@@ -306,6 +315,51 @@ __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __re
         Wqkv[row + C + c]     = Wk[idx];
         Wqkv[row + 2 * C + c] = Wv[idx];
     }
+}
+
+// RoPE forward: rotate the Q and K sub-blocks (columns [0,C) and [C,2C)) of the fused [*, 3C]
+// qkv buffer in place, in interleaved pairs per head; V (cols [2C,3C)) is left alone. One thread
+// per (row m, global pair pg over C/2). pos = m % T (position within the window). Mirrors the CPU
+// op_rope; the math (CUDA __sincosf/powf vs CPU std::) agrees to fast-math tolerance.
+__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, int C, int H,
+                            int in_stride, float theta) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;   // pair over C/2 (heads x d/2)
+    const int m  = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
+    if (m >= batch * T || pg >= C / 2) return;
+    const int d  = C / H, half = d / 2;
+    const int h  = pg / half, mi = pg % half;
+    const int a0 = h * d + 2 * mi;
+    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d);
+    float sn, cs; __sincosf(ang, &sn, &cs);
+    float* row = qkv + static_cast<size_t>(m) * in_stride;
+    const float q0 = row[a0],     q1 = row[a0 + 1];
+    row[a0]         = q0 * cs - q1 * sn;
+    row[a0 + 1]     = q0 * sn + q1 * cs;
+    const float k0 = row[C + a0], k1 = row[C + a0 + 1];
+    row[C + a0]     = k0 * cs - k1 * sn;
+    row[C + a0 + 1] = k0 * sn + k1 * cs;
+}
+
+// RoPE backward: inverse rotation (R^T) of the dQ and dK sub-blocks of the fused [*, 3C] dqkv
+// gradient buffer in place (dV untouched), converting grad w.r.t. the ROTATED q/k that attention
+// used back to grad w.r.t. the projected (pre-rotation) q/k for the qkv-GEMM backward.
+__global__ void rope_backward_kernel(float* __restrict__ dqkv, int batch, int T, int C, int H,
+                                     int in_stride, float theta) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m  = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= batch * T || pg >= C / 2) return;
+    const int d  = C / H, half = d / 2;
+    const int h  = pg / half, mi = pg % half;
+    const int a0 = h * d + 2 * mi;
+    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d);
+    float sn, cs; __sincosf(ang, &sn, &cs);
+    float* row = dqkv + static_cast<size_t>(m) * in_stride;
+    const float gq0 = row[a0],     gq1 = row[a0 + 1];
+    row[a0]         =  gq0 * cs + gq1 * sn;
+    row[a0 + 1]     = -gq0 * sn + gq1 * cs;
+    const float gk0 = row[C + a0], gk1 = row[C + a0 + 1];
+    row[C + a0]     =  gk0 * cs + gk1 * sn;
+    row[C + a0 + 1] = -gk0 * sn + gk1 * cs;
 }
 
 // ============================================================================
@@ -475,6 +529,16 @@ __global__ void embed_backward_kernel(const float* __restrict__ dh, const int* _
     }
 }
 
+// Token-only embedding backward (RoPE path): scatter the residual-stream grad into tok_emb only
+// (no pos_emb, which carries no gradient under RoPE).
+__global__ void embed_backward_token_kernel(const float* __restrict__ dh, const int* __restrict__ ids,
+                                            float* __restrict__ dtok, int M, int C) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && j < C)
+        atomicAdd(&dtok[static_cast<size_t>(ids[m]) * C + j], dh[static_cast<size_t>(m) * C + j]);
+}
+
 // Split the fused QKV weight gradient dWqkv[C,3C] back into the per-projection grads dWq/dWk/dWv
 // [C,C] at their param-blob offsets (inverse of build_qkv_kernel). One thread per [C,C] element.
 __global__ void split_dqkv_kernel(const float* __restrict__ dWqkv, float* __restrict__ dWq,
@@ -593,6 +657,18 @@ inline void launch_attn_train(const float* dQ, const float* dK, const float* dV,
     const int block = 64;
     const int total = batch * H * T;
     attn_train_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, dP, batch, T, C, H, in_stride);
+}
+// RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
+// One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows.
+inline void launch_rope(float* qkv, int batch, int T, int C, int H, int in_stride) {
+    const dim3 block(32, 8);
+    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_kernel<<<grid, block, 0, g_stream>>>(qkv, batch, T, C, H, in_stride, ROPE_THETA);
+}
+inline void launch_rope_bwd(float* dqkv, int batch, int T, int C, int H, int in_stride) {
+    const dim3 block(32, 8);
+    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_backward_kernel<<<grid, block, 0, g_stream>>>(dqkv, batch, T, C, H, in_stride, ROPE_THETA);
 }
 
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
@@ -817,7 +893,7 @@ void forward_device(int batch, int T) {
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
-    const float* pos_emb = base + L[1].off;
+    [[maybe_unused]] const float* pos_emb = base + L[1].off;
     const int    fi      = 2 + 10 * N_LAYERS;          // index of ln_f
     const float* ln_f    = base + L[fi + 0].off;
     const float* lm_head = base + L[fi + 1].off;
@@ -833,11 +909,14 @@ void forward_device(int batch, int T) {
     float* gact = g_fwd.gact;
     float* ff2  = g_fwd.ff2;
 
-    // h = tok_emb[ids] + pos_emb  (over all M rows; position = row % T)
+    // h = tok_emb[ids] (+ pos_emb under Absolute); position = row % T
     {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-        embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
+        if constexpr (POS_ENCODING == PosEncoding::Absolute)
+            embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
+        else
+            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M, C);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -851,6 +930,7 @@ void forward_device(int batch, int T) {
 
         launch_rmsnorm(h, ln1, a, M, C);                      // a = rmsnorm(h, ln1)
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T, C, H, 3 * C);
         launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
         launch_add(h, proj, h, MC);                          // h = h + proj
@@ -932,16 +1012,19 @@ void forward_train(int batch, int T) {
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
-    const float* pos_emb = base + L[1].off;
+    [[maybe_unused]] const float* pos_emb = base + L[1].off;
     const int    fi      = 2 + 10 * N_LAYERS;
     const float* ln_f    = base + L[fi + 0].off;
     const float* lm_head = base + L[fi + 1].off;
     const float* lm_bias = base + L[fi + 2].off;
 
-    {   // h_in[0] = tok_emb[ids] + pos_emb
+    {   // h_in[0] = tok_emb[ids] (+ pos_emb under Absolute)
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-        embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T, C);
+        if constexpr (POS_ENCODING == PosEncoding::Absolute)
+            embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T, C);
+        else
+            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, C);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -958,6 +1041,7 @@ void forward_train(int batch, int T) {
 
         launch_rmsnorm_train(hin, ln1, g_tr.a[l], g_tr.rinv1[l], M, C);              // a = rmsnorm(hin,ln1)
         launch_linear(g_tr.a[l], g_fwd.wqkv[l], nullptr, g_tr.qkv[l], M, C, 3 * C);  // fused qkv
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv[l], batch, T, C, H, 3 * C);
         launch_attn_train(g_tr.qkv[l], g_tr.qkv[l] + C, g_tr.qkv[l] + 2 * C,
                           g_tr.att[l], g_tr.P[l], batch, T, C, H, 3 * C);            // att + save P
         launch_linear(g_tr.att[l], Wo, nullptr, hmid, M, C, C);                      // hmid = proj
@@ -1018,6 +1102,9 @@ void backward_device(int batch, int T) {
                           gb + L[b0 + 5].off, nullptr, M, C, C);
         SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dqkv, 0, static_cast<size_t>(M) * 3 * C * sizeof(float), g_stream));
         launch_attn_bwd(g_tr.qkv[l], g_tr.P[l], g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
+        // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
+        // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd(g_tr.dqkv, batch, T, C, H, 3 * C);
         // qkv backward (input a): da = grad into a, dWqkv -> split into dWq/dWk/dWv
         launch_linear_bwd(g_tr.a[l], g_fwd.wqkv[l], g_tr.dqkv, g_tr.da,
                           g_tr.dwqkv, nullptr, M, C, 3 * C);
@@ -1029,12 +1116,16 @@ void backward_device(int batch, int T) {
         launch_rmsnorm_bwd(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
                            g_tr.dh, gb + L[b0 + 0].off, M, C);                       // dh += -> d(h_in)
     }
-    // embed backward: scatter dh into tok_emb / pos_emb grads
+    // embed backward: scatter dh into tok_emb (+ pos_emb under Absolute) grads
     {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-        embed_backward_kernel<<<grid, block, 0, g_stream>>>(
-            g_tr.dh, g_fwd.dids, gb + L[0].off, gb + L[1].off, M, T, C);
+        if constexpr (POS_ENCODING == PosEncoding::Absolute)
+            embed_backward_kernel<<<grid, block, 0, g_stream>>>(
+                g_tr.dh, g_fwd.dids, gb + L[0].off, gb + L[1].off, M, T, C);
+        else
+            embed_backward_token_kernel<<<grid, block, 0, g_stream>>>(
+                g_tr.dh, g_fwd.dids, gb + L[0].off, M, C);
     }
 }
 

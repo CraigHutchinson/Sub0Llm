@@ -89,6 +89,20 @@ set(SUB0_N_HEADS  6  CACHE STRING "attention heads")
 set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
+# Positional encoding scheme (compile-time, an enum so future schemes can be added).
+# ROPE (rotary) is the DEFAULT: it encodes RELATIVE position directly in the attention
+# dot-product, needs no learned position table, and extends to longer contexts far better
+# than learned ABSOLUTE embeddings (which cannot extrapolate past their trained length).
+# SUB0_ROPE_THETA is RoPE's frequency base -- the per-scheme tuning knob.
+set(SUB0_POS_ENCODING "ROPE" CACHE STRING "Positional encoding: ROPE (rotary) or ABSOLUTE (learned)")
+set_property(CACHE SUB0_POS_ENCODING PROPERTY STRINGS ROPE ABSOLUTE)
+set(SUB0_ROPE_THETA "10000" CACHE STRING "RoPE frequency base (theta)")
+if(SUB0_POS_ENCODING STREQUAL "ABSOLUTE")
+  set(SUB0_POS_ENCODING_INT 0)
+else()
+  set(SUB0_POS_ENCODING_INT 1)   # ROPE (default)
+endif()
+
 # Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
 # OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
 # raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
@@ -196,6 +210,8 @@ add_custom_command(
             --heads   ${SUB0_N_HEADS}
             --seq     ${SUB0_SEQ_LEN}
             --ternary ${SUB0_TERNARY}
+            --pos-encoding ${SUB0_POS_ENCODING_INT}
+            --rope-theta ${SUB0_ROPE_THETA}
             --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             --has-cuda ${SUB0_HAS_CUDA}

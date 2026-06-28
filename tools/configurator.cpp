@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <print>
 #include <queue>
@@ -278,6 +279,8 @@ int main(int argc, char** argv) {
     int n_heads      = 4;
     int seq_len      = 64;
     int ternary      = 0;
+    int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
+    double rope_theta = 10000.0;// RoPE frequency base
     int vocab_target = 2048;
     int min_merge    = 2;
     int emit_tok     = 1;
@@ -298,6 +301,11 @@ int main(int argc, char** argv) {
     app.add_option("--seq",    seq_len, "Context window length")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
        ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--pos-encoding", pos_encoding,
+                   "Positional encoding scheme: 0 = absolute learned, 1 = RoPE (rotary)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--rope-theta", rope_theta, "RoPE frequency base (theta)")
+       ->capture_default_str();
     app.add_option("--vocab",  vocab_target, "Target BPE vocabulary size (base symbols + markers + merges)")
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
@@ -583,6 +591,16 @@ int main(int argc, char** argv) {
     os << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
     os << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
     os << "constexpr int  VOCAB       = " << vocab << ";\n\n";
+    // --- Positional encoding (compile-time, an enum for future schemes) -----
+    // Absolute = a learned pos_emb[SEQ_LEN, D_MODEL] added to the token embedding (cannot
+    // extrapolate past SEQ_LEN). Rope = rotary embeddings applied to Q/K inside attention,
+    // encoding RELATIVE position with no learned table and far better length behaviour.
+    os << "// --- Positional encoding (compile-time) --------------------------------\n";
+    os << "enum class PosEncoding { Absolute, Rope };\n";
+    os << "constexpr PosEncoding POS_ENCODING = PosEncoding::"
+       << (pos_encoding == 0 ? "Absolute" : "Rope") << ";\n";
+    os << "// ROPE_THETA: RoPE frequency base; angle(pos, pair m) = pos * THETA^(-2m/D_HEAD).\n";
+    os << "constexpr float       ROPE_THETA   = " << std::format("{:.1f}", rope_theta) << "f;\n\n";
     os << "// --- Cached hardware facts + persisted tuned runtime defaults -----------\n";
     os << "constexpr int  HW_CONCURRENCY            = " << hw_concurrency  << ";\n";
     os << "constexpr int  MAX_WORKERS               = " << max_workers     << ";\n";

@@ -36,7 +36,7 @@ namespace sub0 {
 // matching gradient view and the bookkeeping needed for reverse-mode autodiff.
 // Stages treat Node pointers as opaque handles (forward -> loss -> backward),
 // except for reading logits via the `data` span.
-enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Attn, CrossEnt };
+enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt };
 
 struct Node {
     Op op = Op::Leaf;

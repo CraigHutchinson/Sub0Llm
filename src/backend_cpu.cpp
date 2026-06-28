@@ -75,7 +75,8 @@ consteval size_t calc_act_cap() {
     const size_t T = SEQ_LEN, C = D_MODEL, F = D_FF, H = N_HEADS, V = VOCAB;
     size_t base = 3 * T * C;
     size_t per  = 10 * T * C + 2 * T * F + H * T * T + 2 * T
-                + (USE_TERNARY ? (size_t)4 * C * C + 2 * C * F : 0);
+                + (USE_TERNARY ? (size_t)4 * C * C + 2 * C * F : 0)
+                + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0);  // op_rope(q), op_rope(k)
     size_t fin  = T * C + 2 * T * V + 64;
     return base + (size_t)N_LAYERS * per + fin;
 }
@@ -324,6 +325,37 @@ static Node* op_gelu(Node* x) {
     return y;
 }
 
+// RoPE (rotary positional embedding): rotate each head's d-dimensional sub-vector of x by a
+// position-dependent angle, in interleaved pairs (x[2m], x[2m+1]). Applied to the Q and K
+// projections before attention, so the score q_i . k_j ends up depending only on the RELATIVE
+// offset (i - j) -- no learned position table, and the rotation is an orthogonal map whose
+// backward is the inverse rotation. The position of row t is t (position within the window).
+// inv_freq[m] = ROPE_THETA^(-2m/d); a head dimension d is assumed even (an odd tail is left
+// unrotated, which is the identity for that lone component).
+static Node* op_rope(Node* x, int H) {
+    const int T = x->rows, C = x->cols, d = C / H, half = d / 2;
+    Node* y = mk_node(Op::Rope, T, C);
+    y->a = x; y->heads = H;
+    const float* __restrict xd = x->data.data();
+    float* __restrict yd       = y->data.data();
+    for (int t = 0; t < T; ++t) {
+        const float* __restrict xr = xd + (size_t)t * C;
+        float* __restrict yr       = yd + (size_t)t * C;
+        for (int h = 0; h < H; ++h) {
+            const int off = h * d;
+            for (int m = 0; m < half; ++m) {
+                const float ang = t * std::pow(ROPE_THETA, -2.f * m / d);
+                const float cs = std::cos(ang), sn = std::sin(ang);
+                const float x0 = xr[off + 2 * m], x1 = xr[off + 2 * m + 1];
+                yr[off + 2 * m]     = x0 * cs - x1 * sn;
+                yr[off + 2 * m + 1] = x0 * sn + x1 * cs;
+            }
+            if (2 * half < d) yr[off + d - 1] = xr[off + d - 1];   // odd-d tail: identity
+        }
+    }
+    return y;
+}
+
 static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     const int T = q->rows, C = q->cols, d = C / H;
     const float scale = 1.f / std::sqrt((float)d);
@@ -480,6 +512,30 @@ static void backward_node(Node& n) {
         }
         break;
     }
+    case Op::Rope: {
+        // Inverse rotation (R^T): grad of the un-rotated input from the grad of the rotated
+        // output. Mirrors op_rope exactly; accumulates into x->grad.
+        Node* x = n.a;
+        const int T = x->rows, C = x->cols, H = n.heads, d = C / H, half = d / 2;
+        const float* __restrict gy = n.grad.data();
+        float* __restrict gx       = x->grad.data();
+        for (int t = 0; t < T; ++t) {
+            const float* __restrict gyr = gy + (size_t)t * C;
+            float* __restrict gxr       = gx + (size_t)t * C;
+            for (int h = 0; h < H; ++h) {
+                const int off = h * d;
+                for (int m = 0; m < half; ++m) {
+                    const float ang = t * std::pow(ROPE_THETA, -2.f * m / d);
+                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    const float g0 = gyr[off + 2 * m], g1 = gyr[off + 2 * m + 1];
+                    gxr[off + 2 * m]     +=  g0 * cs + g1 * sn;
+                    gxr[off + 2 * m + 1] += -g0 * sn + g1 * cs;
+                }
+                if (2 * half < d) gxr[off + d - 1] += gyr[off + d - 1];
+            }
+        }
+        break;
+    }
     case Op::Attn: {
         Node* q = n.a; Node* k = n.b; Node* v = n.bias;
         const int T = q->rows, C = q->cols, H = n.heads, d = C / H;
@@ -582,7 +638,10 @@ struct Model {
         };
         auto ones = [](Node* t) { std::fill(t->data.begin(), t->data.end(), 1.f); };
         randn(tok_emb, 0.02f);
-        randn(pos_emb, 0.02f);
+        // Under RoPE the position table is unused (kept in the layout for format stability);
+        // zero it so the checkpoint is deterministic and it never perturbs anything.
+        if constexpr (POS_ENCODING == PosEncoding::Absolute) randn(pos_emb, 0.02f);
+        else                                                 std::fill(pos_emb->data.begin(), pos_emb->data.end(), 0.f);
         for (auto& L : layers) {
             ones(L.ln1); ones(L.ln2);
             randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
@@ -596,14 +655,24 @@ struct Model {
         // Persistent per-thread: op_embed stores this pointer and backward reads it
         // after forward returns, so it must outlive the call (a local would dangle).
         static thread_local int pos_ids[SEQ_LEN];
-        for (int t = 0; t < T; ++t) pos_ids[t] = t;
         constexpr bool q = USE_TERNARY;
-        Node* h = op_add(op_embed(tok_emb, ids, T), op_embed(pos_emb, pos_ids, T));
+        Node* h;
+        if constexpr (POS_ENCODING == PosEncoding::Absolute) {
+            for (int t = 0; t < T; ++t) pos_ids[t] = t;
+            h = op_add(op_embed(tok_emb, ids, T), op_embed(pos_emb, pos_ids, T));
+        } else {
+            h = op_embed(tok_emb, ids, T);   // RoPE injects position inside attention instead
+        }
         for (auto& L : layers) {
             Node* a = op_rmsnorm(h, L.ln1);
-            Node* att = op_attn(op_linear(a, L.Wq, nullptr, q),
-                                op_linear(a, L.Wk, nullptr, q),
-                                op_linear(a, L.Wv, nullptr, q), N_HEADS);
+            Node* qn = op_linear(a, L.Wq, nullptr, q);
+            Node* kn = op_linear(a, L.Wk, nullptr, q);
+            Node* vn = op_linear(a, L.Wv, nullptr, q);
+            if constexpr (POS_ENCODING == PosEncoding::Rope) {
+                qn = op_rope(qn, N_HEADS);
+                kn = op_rope(kn, N_HEADS);
+            }
+            Node* att = op_attn(qn, kn, vn, N_HEADS);
             h = op_add(h, op_linear(att, L.Wo, nullptr, q));
             Node* f = op_rmsnorm(h, L.ln2);
             f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);

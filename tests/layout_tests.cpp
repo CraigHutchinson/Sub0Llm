@@ -53,3 +53,14 @@ TEST_CASE("baked compute-backend facts are self-consistent", "[config]") {
     // Shared/overflow memory is a non-negative MB figure (0 where there is no WDDM shared mem).
     STATIC_REQUIRE(GPU_SHARED_MEM_MB >= 0);
 }
+
+TEST_CASE("positional encoding facts are consistent", "[config]") {
+    // RoPE (the default) injects RELATIVE position inside attention via a rotation of Q/K and
+    // carries no gradient in its layout slot; Absolute uses a learned pos_emb table added to the
+    // token embedding. Either way the scheme is one of the two enumerators, ROPE_THETA is a
+    // positive frequency base, and the position table KEEPS its layout slot across schemes (kept
+    // for checkpoint-format stability), so NUM_PARAMS is unchanged.
+    STATIC_REQUIRE((POS_ENCODING == PosEncoding::Rope || POS_ENCODING == PosEncoding::Absolute));
+    STATIC_REQUIRE(ROPE_THETA > 0.0f);
+    STATIC_REQUIRE(sub0::PARAM_LAYOUT[1].kind == sub0::PKind::PosEmb);   // slot retained
+}
