@@ -138,6 +138,7 @@ the **same** `SUB0_POS_ENCODING`.
 | `train` | train (auto-sized, plateau-stopped, crash-safe checkpoints) |
 | `gen` | sample a continuation (`--temp`, `--topk`, `--n`) |
 | `models [--prune]` | list / prune trained models |
+| `report` | diagnose model sizing vs its corpus; per-knob retrain guidance |
 | `autotemp` | pick a coherence temperature by matching held-out perplexity |
 | `vocab` | print the BPE vocabulary table |
 | `bench` | cycle-accurate hot-path benchmark (the optimization control) |

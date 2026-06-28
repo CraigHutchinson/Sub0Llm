@@ -25,6 +25,7 @@ extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend);
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
+extern "C" int sub0_report_stage(const char* model_in);
 extern "C" int sub0_models_stage(int prune, int verbose);
 
 int main(int argc, char** argv) {
@@ -125,6 +126,15 @@ int main(int argc, char** argv) {
     auto* models = app.add_subcommand("models", "List trained models; --prune removes ones incompatible with this build");
     models->add_flag("--prune", models_prune, "Delete models whose architecture this build cannot load");
 
+    // --- report --------------------------------------------------------------
+    // Diagnose whether the baked architecture is correctly sized for its corpus and emit per-knob
+    // retrain guidance (train/val gap, bits-per-byte, Chinchilla tokens/param, head_dim, aspect).
+    std::string report_model;
+    auto* report = app.add_subcommand("report",
+        "Diagnose model sizing vs its corpus and suggest which dimension knobs to change");
+    report->add_option("model", report_model,
+                       "Trained model to include train/val loss diagnosis (optional; omit for structural-only)");
+
     CLI11_PARSE(app, argc, argv);
 
     if (*train) {
@@ -150,6 +160,8 @@ int main(int argc, char** argv) {
         return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
     if (*models)
         return sub0_models_stage(models_prune ? 1 : 0, 1);
+    if (*report)
+        return sub0_report_stage(report_model.empty() ? nullptr : report_model.c_str());
 
     return 1;  // unreachable: require_subcommand(1) guarantees one of the above
 }
