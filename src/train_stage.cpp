@@ -21,6 +21,7 @@
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
+#include "sub0/window.hpp"   // sample_window_start: keep each training window inside one document
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -530,6 +531,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const bool on_demand = !tok.ok();
 
     std::span<const int> train_span, val_span;
+    std::span<const std::uint32_t> doc_index;  // document-start token indices (empty => flat sampling)
     std::vector<int> train_buf, val_buf;       // on-demand backing storage
     TextCorpus text;                           // on-demand raw-corpus reader
     std::mt19937 buf_rng;                      // separate stream: refilling never perturbs `rng`
@@ -572,6 +574,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const std::size_t val_start = data.size() - val_tokens;
         train_span = data.first(val_start);
         val_span   = data.subspan(val_start);
+        doc_index  = tok.doc_starts();   // boundary-aware sampling when the corpus.tok carries it
         est_train_tokens = val_start;
         src_desc = std::format("{} ({} tokens; {} train / {} val)", tok_path, data.size(), val_start, val_tokens);
     } else {
@@ -674,7 +677,6 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                  resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
     std::fflush(stdout);
 
-    std::uniform_int_distribution<size_t> startd(0, train_span.size() - SEQ_LEN - 2);
     std::vector<size_t> starts(batch);
     long steps_since_refresh = 0;
 
@@ -697,12 +699,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // On-demand: refill the rotating shuffle buffer once per eval interval from new
         // random regions, so the run traverses the whole corpus over time. buf_rng is a
         // separate stream, so this never perturbs the resume-critical `rng`. The refill may
-        // reallocate train_buf, so re-bind the span and the sampler to the new storage.
+        // reallocate train_buf, so re-bind the span (the sampler reads train_span.size() live).
         if (on_demand && steps_since_refresh >= eval_every) {
             buf_rng.seed(static_cast<std::uint32_t>(seed) ^ (0x9E3779B9u * static_cast<std::uint32_t>(++refresh_n)));
             text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
             train_span = train_buf;
-            startd = std::uniform_int_distribution<size_t>(0, train_span.size() - SEQ_LEN - 2);
             steps_since_refresh = 0;
         }
         ++steps_since_refresh;
@@ -711,7 +712,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // resume, deterministic), then run the batch -- on the GPU when enabled, else
         // data-parallel across CPU threads.
         const int seq_t = vary_seq ? std::uniform_int_distribution<int>(MIN_TRAIN_SEQ, SEQ_LEN)(rng) : SEQ_LEN;
-        for (int b = 0; b < batch; ++b) starts[b] = startd(rng);
+        for (int b = 0; b < batch; ++b)
+            starts[b] = sub0::sample_window_start(rng, seq_t, train_span.size(), doc_index);
         float step_loss;
         if (gpu_train) {
             step_loss = gpu.step(train_span, starts.data(), batch, seq_t, lr);

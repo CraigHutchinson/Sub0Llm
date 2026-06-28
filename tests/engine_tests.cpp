@@ -11,14 +11,17 @@
 #include <catch2/catch_approx.hpp>
 
 #include "sub0/core.hpp"
+#include "sub0/window.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <random>
+#include <span>
 #include <vector>
 
 namespace {
@@ -86,6 +89,40 @@ TEST_CASE("variable-length training windows run across a range of T", "[engine]"
         INFO("T = " << T << "  loss = " << loss);
         REQUIRE(loss > 0.0f);          // > 0 also rejects NaN (NaN compares false)
         REQUIRE(loss < 100.0f);        // finite and near the untrained ln(VOCAB) scale
+    }
+}
+
+TEST_CASE("window sampler keeps each training window inside one document", "[window]") {
+    // Documents occupy [0,100), [100,160), [160,400) of 400 trainable tokens. For any sampled
+    // start, the whole window -- inputs [start,start+T) plus the last shifted target at start+T --
+    // must stay within the single document that contains `start` (unless that document is too short
+    // for T, where the sampler is allowed to fall back to a flat window).
+    const std::vector<std::uint32_t> docs = {0u, 100u, 160u};
+    const std::size_t train_tok = 400;
+    std::mt19937 rng(123);
+    for (int T : {1, 8, 33, 64}) {
+        for (int it = 0; it < 5000; ++it) {
+            const std::size_t s = sub0::sample_window_start(rng, T, train_tok,
+                                                            std::span<const std::uint32_t>(docs));
+            REQUIRE(s + static_cast<std::size_t>(T) < train_tok);   // window fits the train range
+            std::size_t ds = 0, de = train_tok;                     // document containing s
+            for (std::size_t k = 0; k < docs.size(); ++k)
+                if (docs[k] <= s) { ds = docs[k]; de = (k + 1 < docs.size()) ? docs[k + 1] : train_tok; }
+            if (de - ds >= static_cast<std::size_t>(T) + 1) {       // doc can hold the window
+                REQUIRE(s >= ds);
+                REQUIRE(s + static_cast<std::size_t>(T) < de);      // no crossing into the next doc
+            }
+        }
+    }
+}
+
+TEST_CASE("window sampler with no document index gives a valid uniform start", "[window]") {
+    std::mt19937 rng(7);
+    const std::size_t train_tok = 200;
+    const int T = 16;
+    for (int it = 0; it < 2000; ++it) {
+        const std::size_t s = sub0::sample_window_start(rng, T, train_tok, {});
+        REQUIRE(s + static_cast<std::size_t>(T) < train_tok);
     }
 }
 

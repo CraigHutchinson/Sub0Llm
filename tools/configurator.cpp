@@ -456,16 +456,26 @@ int main(int argc, char** argv) {
     //     Losslessness is verified per chunk by reconstructing the base symbols; the id
     //     array's length is back-patched after the count is known.
     std::size_t token_count = 0;
+    std::size_t doc_count   = 0;
     bool tok_rt = true;
     if (emit_tok) {
         std::ofstream ts(tok_path, std::ios::binary);
         if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_path.string()); return 1; }
         {
-            const std::uint32_t magic = 0x4B543053u, vfield = static_cast<std::uint32_t>(vocab), nfield = 0u;
+            const std::uint32_t magic = 0x44543053u,                // "S0TD" (doc-aware corpus.tok)
+                                vfield = static_cast<std::uint32_t>(vocab), zero = 0u;
             ts.write(reinterpret_cast<const char*>(&magic),  sizeof magic);
             ts.write(reinterpret_cast<const char*>(&vfield), sizeof vfield);
-            ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);  // patched below
+            ts.write(reinterpret_cast<const char*>(&zero),   sizeof zero);  // ntok, patched below
+            ts.write(reinterpret_cast<const char*>(&zero),   sizeof zero);  // ndoc, patched below
         }
+        // Document boundaries: get_fineweb.py separates documents with a blank line ("\n\n"), and a
+        // newline is always emitted as its own base token (non-alpha bytes never BPE-merge), so a
+        // run of >=2 newline tokens marks a document break -- the next token starts a new document.
+        // Record each document's start token index so training keeps windows inside one document.
+        const std::int32_t nl_id = static_cast<std::int32_t>(sym_to_base(10));  // base id of '\n'
+        std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
+        int nl_run = 0;
         std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
         std::vector<int> recon;                   // per-chunk reconstruction (bounded)
         for_each_chunk(corpus, [&](std::string_view chunk) {
@@ -493,14 +503,27 @@ int main(int argc, char** argv) {
                 recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
                              expansion[static_cast<std::size_t>(id)].end());
             if (recon != stream) tok_rt = false;
+            // Record document starts in this chunk (global token index = chunk base + local index).
+            for (std::size_t li = 0; li < out_tokens.size(); ++li) {
+                if (out_tokens[li] == nl_id) { ++nl_run; continue; }
+                if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
+                nl_run = 0;
+            }
             ts.write(reinterpret_cast<const char*>(out_tokens.data()),
                      static_cast<std::streamsize>(out_tokens.size() * sizeof(std::int32_t)));
             token_count += out_tokens.size();
         });
+        // Append the document-start index after the token stream, then back-patch ntok + ndoc.
+        ts.write(reinterpret_cast<const char*>(doc_starts.data()),
+                 static_cast<std::streamsize>(doc_starts.size() * sizeof(std::uint32_t)));
+        doc_count = doc_starts.size();
         {
-            const std::uint32_t nfield = static_cast<std::uint32_t>(token_count);  // back-patch ntok
+            const std::uint32_t nfield = static_cast<std::uint32_t>(token_count);
+            const std::uint32_t dfield = static_cast<std::uint32_t>(doc_starts.size());
             ts.seekp(8, std::ios::beg);
             ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);
+            ts.seekp(12, std::ios::beg);
+            ts.write(reinterpret_cast<const char*>(&dfield), sizeof dfield);
         }
         ts.close();
     } else {
@@ -653,6 +676,7 @@ int main(int argc, char** argv) {
     std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
     if (emit_tok) {
         std::println(stderr, "total tokens:                    {}", token_count);
+        std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
         std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
     } else {
         std::println(stderr, "corpus.tok:                      skipped (--corpus-tok 0; on-demand)");
