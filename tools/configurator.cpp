@@ -288,6 +288,7 @@ int main(int argc, char** argv) {
     int vocab_target = 2048;
     int min_merge    = 2;
     int emit_tok     = 1;
+    int join_scheme  = 0;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
     std::string tune_cache;
     int has_cuda    = 0;   // CUDA toolkit + device detected at configure time
     int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
@@ -323,6 +324,10 @@ int main(int argc, char** argv) {
     app.add_option("--corpus-tok", emit_tok,
                    "1 = pre-tokenize the whole corpus to corpus.tok; 0 = skip it and let training tokenize "
                    "on demand (avoids the ~2x-on-disk token copy for a huge corpus)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--join", join_scheme,
+                   "1 = JOIN/implicit-space tokenizer (complete 256-byte base + JOIN/NEWLINE/PARA markers; "
+                   "single inter-word space is free). 0 = legacy space-as-token scheme.")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
@@ -438,7 +443,7 @@ int main(int argc, char** argv) {
     // S.word_syms in place from raw byte symbols to final token ids, so Pass 3 can emit the
     // tokenized corpus from S.index + S.word_syms. The learned Tokenizer carries the base
     // alphabet, the ordered merges, the per-id expansion and the attested set.
-    const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge});
+    const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge, join_scheme != 0});
 
     // Aliases so the downstream emit / reporting code reads the learned tokenizer + scan stats.
     const auto& word_syms   = S.word_syms;   // now final token-id sequences
@@ -483,39 +488,57 @@ int main(int argc, char** argv) {
         // newline is always emitted as its own base token (non-alpha bytes never BPE-merge), so a
         // run of >=2 newline tokens marks a document break -- the next token starts a new document.
         // Record each document's start token index so training keeps windows inside one document.
-        const std::int32_t nl_id = static_cast<std::int32_t>(sym_to_base(10));  // base id of '\n'
+        const bool join = (join_scheme != 0);
+        const std::int32_t nl_id      = static_cast<std::int32_t>(sym_to_base(10));      // base id of '\n'
+        const std::int32_t para_id    = join ? static_cast<std::int32_t>(tkz.para_id)    : -1;
+        const std::int32_t newline_id = join ? static_cast<std::int32_t>(tkz.newline_id) : -1;
         std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
         int nl_run = 0;
         std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
-        std::vector<int> recon;                   // per-chunk reconstruction (bounded)
+        std::vector<int> recon;                   // per-chunk reconstruction (legacy round-trip 2)
         for_each_chunk(corpus, [&](std::string_view chunk) {
             long qr = 0;
             const std::string norm = normalize_text(std::string(chunk), qr);
-            const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
-            if (detokenize(stream) != norm) tok_rt = false;     // round-trip 1: truecasing
             out_tokens.clear();
-            for (std::size_t i = 0, n = stream.size(); i < n;) {
-                const std::size_t end = word_unit_end(stream, i);
-                if (end == i) { out_tokens.push_back(sym_to_base(stream[i])); ++i; continue; }
-                std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                     stream.begin() + static_cast<std::ptrdiff_t>(end));
-                auto it = word_index.find(seq_key(seq));
-                if (it == word_index.end()) {                   // unreachable if passes agree
-                    for (int b : seq) out_tokens.push_back(sym_to_base(b));
-                    tok_rt = false;
-                } else {
-                    for (int id : word_syms[static_cast<std::size_t>(it->second)]) out_tokens.push_back(id);
+            if (join) {
+                // JOIN scheme: encode the chunk with the learned tokenizer (implicit single space +
+                // JOIN/NEWLINE/PARA + verbatim fallback). The single contract is the round-trip
+                // detokenize(encode(chunk)) == normalize_text(chunk).
+                const std::vector<int> ids = tok::encode(tkz, std::string(chunk));
+                if (tok::detokenize(tkz, ids) != norm) tok_rt = false;
+                out_tokens.assign(ids.begin(), ids.end());
+            } else {
+                const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
+                if (detokenize(stream) != norm) tok_rt = false;     // round-trip 1: truecasing
+                for (std::size_t i = 0, n = stream.size(); i < n;) {
+                    const std::size_t end = word_unit_end(stream, i);
+                    if (end == i) { out_tokens.push_back(sym_to_base(stream[i])); ++i; continue; }
+                    std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                         stream.begin() + static_cast<std::ptrdiff_t>(end));
+                    auto it = word_index.find(seq_key(seq));
+                    if (it == word_index.end()) {                   // unreachable if passes agree
+                        for (int b : seq) out_tokens.push_back(sym_to_base(b));
+                        tok_rt = false;
+                    } else {
+                        for (int id : word_syms[static_cast<std::size_t>(it->second)]) out_tokens.push_back(id);
+                    }
+                    i = end;
                 }
-                i = end;
+                recon.clear();                                       // round-trip 2: tokenization
+                for (std::int32_t id : out_tokens)
+                    recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
+                                 expansion[static_cast<std::size_t>(id)].end());
+                if (recon != stream) tok_rt = false;
             }
-            recon.clear();                                       // round-trip 2: tokenization
-            for (std::int32_t id : out_tokens)
-                recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
-                             expansion[static_cast<std::size_t>(id)].end());
-            if (recon != stream) tok_rt = false;
-            // Record document starts in this chunk (global token index = chunk base + local index).
+            // Document boundaries (global token index = chunk base + local index). A blank line
+            // separates documents: legacy counts >=2 consecutive '\n' tokens; the JOIN scheme emits
+            // "\n\n" as one PARA token (weight 2) and a lone "\n" as NEWLINE / '\n' (weight 1), so a
+            // cumulative newline weight >= 2 before the next content token marks the break.
             for (std::size_t li = 0; li < out_tokens.size(); ++li) {
-                if (out_tokens[li] == nl_id) { ++nl_run; continue; }
+                const std::int32_t tk = out_tokens[li];
+                const int w = join ? (tk == para_id ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0))
+                                   : (tk == nl_id ? 1 : 0);
+                if (w > 0) { nl_run += w; continue; }
                 if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
                 nl_run = 0;
             }

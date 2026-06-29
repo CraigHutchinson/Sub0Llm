@@ -175,6 +175,18 @@ endif()
 message(STATUS "corpus.tok: SUB0_CORPUS_TOK=${SUB0_CORPUS_TOK} -> emit=${SUB0_CORPUS_TOK_FLAG} "
                "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
 
+# JOIN / implicit-space tokenizer. A clean break from the legacy space-as-token scheme: the
+# single inter-word space becomes free (~28% fewer tokens on tinystories), the base alphabet is
+# the complete 256 bytes + JOIN/NEWLINE/PARA markers. Changes tokenizer.bin + corpus.tok, so a
+# build with this flipped is INCOMPATIBLE with models trained under the other setting (retrain).
+option(SUB0_JOIN_TOKENIZER "Use the JOIN/implicit-space tokenizer (clean break; retrain required)" OFF)
+if(SUB0_JOIN_TOKENIZER)
+  set(SUB0_JOIN_FLAG 1)
+else()
+  set(SUB0_JOIN_FLAG 0)
+endif()
+message(STATUS "tokenizer: SUB0_JOIN_TOKENIZER=${SUB0_JOIN_TOKENIZER} -> --join ${SUB0_JOIN_FLAG}")
+
 # --- Compute-backend selection (CPU / GPU / HYBRID axis) ---------------------
 # Picks SUB0_BACKEND_SOURCES for sub0_core and enforces the backend invariants
 # (e.g. ternary is CPU-only for now). Needs SUB0_TERNARY (set above).
@@ -252,6 +264,7 @@ add_custom_command(
             --prec-gemm ${SUB0_PRECISION_GEMM_INT}
             --prec-act ${SUB0_PRECISION_ACT_INT}
             --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
+            --join ${SUB0_JOIN_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             --has-cuda ${SUB0_HAS_CUDA}
             --cuda-arch ${SUB0_CUDA_ARCH}
