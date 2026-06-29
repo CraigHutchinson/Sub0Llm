@@ -107,7 +107,10 @@ constexpr double TICK_SECONDS        = 180.0;  // heartbeat: interim progress li
 constexpr int    EVAL_WINDOWS_MAX    = 128;   // bounded cost per eval
 constexpr int    MAX_EPOCHS_BACKSTOP = 30;    // ceiling if no plateau is detected
 constexpr int    PLATEAU_WINDOW      = 6;     // evals fitted by the least-squares trend test
-constexpr double PLATEAU_MIN_REL     = 0.02;  // stop when the best-fit drop over the window < 2%
+constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop over the window < 0.5%
+                                              // (~0.8%/epoch). 2% was too loose: it stopped on slow-
+                                              // but-real tails (d96 @1.985 and d128 @2.68 both still
+                                              // improving ~1.5%/window) well before the true floor.
 
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context

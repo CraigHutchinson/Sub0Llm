@@ -100,7 +100,7 @@ using sub0::coherence::trend_plateaued;
 
 TEST_CASE("trend_plateaued: needs a full window before it can fire", "[coherence]") {
     const std::vector<double> few = {3.4, 3.3, 3.2};       // < window+1 points
-    REQUIRE_FALSE(trend_plateaued(few, 6, 0.02));
+    REQUIRE_FALSE(trend_plateaued(few, 6, 0.005));
 }
 
 TEST_CASE("trend_plateaued: a strongly-but-noisily descending run does NOT stop", "[coherence]") {
@@ -108,28 +108,32 @@ TEST_CASE("trend_plateaued: a strongly-but-noisily descending run does NOT stop"
     // (step 72): the curve fell 3.381 -> 3.174 over the window (~6%) despite two upticks. The
     // best-fit gradient must keep it training.
     const std::vector<double> d128 = {3.381, 3.444, 3.305, 3.311, 3.233, 3.165, 3.174};
-    REQUIRE_FALSE(trend_plateaued(d128, 6, 0.02));
+    REQUIRE_FALSE(trend_plateaued(d128, 6, 0.005));
 }
 
-TEST_CASE("trend_plateaued: a series bouncing on its floor DOES stop", "[coherence]") {
-    // REAL d96 L5 H4 val NELBO tail near convergence (steps ~340-364): net drop ~1% over the window
-    // with the same kind of upticks -> the fitted trend is ~flat, so this is a genuine plateau.
-    const std::vector<double> d96 = {2.0097, 2.0160, 1.9938, 1.9972, 1.9880, 1.9803, 1.9850};
-    REQUIRE(trend_plateaued(d96, 6, 0.02));
+TEST_CASE("trend_plateaued: a still-slowly-improving tail does NOT stop at the tight floor", "[coherence]") {
+    // REAL d96 L5 H4 tail near where it was STOPPED (steps ~340-364, val ~1.985). Best-fit shows it
+    // was still shedding ~1.7% per window -- NOT a true floor. The old 2% threshold called this a
+    // plateau and quit early; the tightened 0.5% floor correctly keeps training toward lower NELBO.
+    const std::vector<double> d96_tail = {2.0097, 2.0160, 1.9938, 1.9972, 1.9880, 1.9803, 1.9850};
+    REQUIRE_FALSE(trend_plateaued(d96_tail, 6, 0.005));
 }
 
 TEST_CASE("trend_plateaued: an early fast-descending run does NOT stop", "[coherence]") {
     // REAL d128 warmup-to-early descent (steps ~20-44): a clean steep drop, obviously not a plateau.
     const std::vector<double> early = {3.9700, 3.9495, 3.8576, 3.7367, 3.5716, 3.4508, 3.3882};
-    REQUIRE_FALSE(trend_plateaued(early, 6, 0.02));
+    REQUIRE_FALSE(trend_plateaued(early, 6, 0.005));
 }
 
-TEST_CASE("trend_plateaued: a dead-flat series stops; a steady slope does not", "[coherence]") {
+TEST_CASE("trend_plateaued: a genuine floor stops; a real slope does not", "[coherence]") {
     const std::vector<double> flat = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    REQUIRE(trend_plateaued(flat, 6, 0.02));
-    // Steady -0.5%/eval => -3% over a 6-window, well past the 2% floor: keep training.
+    REQUIRE(trend_plateaued(flat, 6, 0.005));
+    // Barely-improving tail at a true floor: ~0.05%/window net -> below 0.5% -> stop.
+    const std::vector<double> floor = {1.9010, 1.9008, 1.9006, 1.9007, 1.9005, 1.9004, 1.9005};
+    REQUIRE(trend_plateaued(floor, 6, 0.005));
+    // Steady -0.2%/eval => -1.2% over a 6-window, past the 0.5% floor: keep training.
     std::vector<double> slope;
-    for (int i = 0; i < 7; ++i) slope.push_back(2.0 * (1.0 - 0.005 * i));
-    REQUIRE_FALSE(trend_plateaued(slope, 6, 0.02));
+    for (int i = 0; i < 7; ++i) slope.push_back(2.0 * (1.0 - 0.002 * i));
+    REQUIRE_FALSE(trend_plateaued(slope, 6, 0.005));
 }
 
