@@ -1154,6 +1154,15 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
     // also tune the GPU throughput knobs by timing the resident training step. The BATCH is tuned
     // in any build (it is a direct dimension, not a Knob); TF32 and the attention-backward strategy
     // are runtime-mutable only under SUB0_TUNING, so they are swept there and baked otherwise.
+    //
+    // TODO(dynamic-training-mode): extend SUB0_TUNING into a "dynamic training" build where the MODEL
+    // dimensions (d_model / n_layers / n_heads / d_ff) are runtime parameters instead of baked
+    // constexpr. Today they are compile-time (best cache locality + folded hot loops), so comparing
+    // e.g. n_heads = 3 vs 4 vs 5 needs a reconfigure+rebuild per point. A dynamic mode would trade
+    // that speed for the flexibility to sweep architecture knobs in one process (a probe-train per
+    // candidate, ranked by short-budget val NELBO -- see the `report` early-indicator discussion),
+    // making automatic dimension search possible. Slower kernels (dims not known at compile time),
+    // so gate it behind SUB0_TUNING and keep the baked path as the production default.
     int gpu_batch = best_threads * best_wpt;        // default: the CPU-tuned data-parallel width
     int gpu_tf32  = CUDA_TF32 ? 1 : 0;
     int gpu_attn  = 0;                              // per-head attention backward (the default)
