@@ -49,7 +49,6 @@ namespace {
 // F32 today; BF16 halves the per-token train scratch on sm_80+ once the kernels are templated.
 // FP32 accumulate is preserved (cuBLAS computeType / kernel math both stay float regardless).
 using act_t = std::conditional_t<ACT_DTYPE == Dtype::BF16, __nv_bfloat16, float>;
-constexpr cudaDataType_t ACT_CUDA = (ACT_DTYPE == Dtype::BF16) ? CUDA_R_16BF : CUDA_R_32F;
 [[maybe_unused]] __device__ inline float  to_f32(float v)         { return v; }
 [[maybe_unused]] __device__ inline float  to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
 [[maybe_unused]] __device__ inline void   st_act(float* p, float v)         { *p = v; }
@@ -318,43 +317,6 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     for (int a = 0; a < d; ++a) oi[a] = acc[a] * inv;
 }
 
-// Training attention: identical to attn_kernel. P is NOT stored (P-free flash): the backward
-// recomputes the softmax from the saved q/k, trading a little FLOPs for ~batch*H*T*T floats/layer
-// of VRAM -- the gap between caps batch ~32 and ~256 at large T.
-__global__ void attn_train_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                                  const float* __restrict__ v, float* __restrict__ out,
-                                  int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx over batch*H*T
-    const int per = H * T;
-    const int b   = idx / per;
-    if (b >= batch) return;
-    const int rem = idx - b * per;
-    const int h   = rem / T;
-    const int i   = rem % T;
-    const int    d        = C / H;
-    const int    off      = h * d;
-    const float  scale    = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
-    const size_t out_base = static_cast<size_t>(b) * T * C;
-    const size_t Prow     = ((static_cast<size_t>(b) * H + h) * T + i) * T;
-    const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    // Online (flash) softmax for the value accumulator (no sc[SEQ_LEN] spill), then a second pass
-    // recomputes p and writes the causal P row the backward pass consumes.
-    float m = -1e30f, Z = 0.f, acc[128] = {};   // head_dim assumed <= 128
-    for (int j = 0; j <= i; ++j) {
-        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
-        const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn);
-        Z = Z * c + e;
-        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * vj[a];
-        m = mn;
-    }
-    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
-    const float invZ = 1.f / Z;
-    for (int a = 0; a < d; ++a) oi[a] = acc[a] * invZ;
-}
-
 // Build the fused QKV weight Wqkv[C, 3C] (row-major) from Wq,Wk,Wv [C,C]: row p holds
 // [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
 // into one a . Wqkv -> [M, 3C] (better-shaped GEMM + fewer launches).
@@ -391,28 +353,6 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, int C, in
     const float k0 = row[C + a0], k1 = row[C + a0 + 1];
     row[C + a0]     = k0 * cs - k1 * sn;
     row[C + a0 + 1] = k0 * sn + k1 * cs;
-}
-
-// RoPE backward: inverse rotation (R^T) of the dQ and dK sub-blocks of the fused [*, 3C] dqkv
-// gradient buffer in place (dV untouched), converting grad w.r.t. the ROTATED q/k that attention
-// used back to grad w.r.t. the projected (pre-rotation) q/k for the qkv-GEMM backward.
-__global__ void rope_backward_kernel(float* __restrict__ dqkv, int batch, int T, int C, int H,
-                                     int in_stride, float theta) {
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m  = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m >= batch * T || pg >= C / 2) return;
-    const int d  = C / H, half = d / 2;
-    const int h  = pg / half, mi = pg % half;
-    const int a0 = h * d + 2 * mi;
-    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d);
-    float sn, cs; __sincosf(ang, &sn, &cs);
-    float* row = dqkv + static_cast<size_t>(m) * in_stride;
-    const float gq0 = row[a0],     gq1 = row[a0 + 1];
-    row[a0]         =  gq0 * cs + gq1 * sn;
-    row[a0 + 1]     = -gq0 * sn + gq1 * cs;
-    const float gk0 = row[C + a0], gk1 = row[C + a0 + 1];
-    row[C + a0]     =  gk0 * cs + gk1 * sn;
-    row[C + a0 + 1] = -gk0 * sn + gk1 * cs;
 }
 
 // ============================================================================
@@ -535,122 +475,14 @@ __global__ void rmsnorm_backward_kernel(const float* __restrict__ x, const float
     }
 }
 
-// GELU backward (op_gelu): dx[i] = dy[i] * dgelu(x[i]). Writes (input grad buffer is fresh).
-__global__ void gelu_backward_kernel(const float* __restrict__ x, const float* __restrict__ dy,
-                                     float* __restrict__ dx, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dx[i] = dy[i] * dev_dgelu(x[i]);
-}
-
 // Causal attention backward (op_attn) -- TWO strategies, selected by a workload knob because the
 // best one depends on batch (measured crossover ~batch 256 on sm_120):
-//
-//  * HEAD-per-thread (attn_backward_head_kernel): one thread per (window b, head h) owns the whole
-//    head, so dq/dk/dv accumulate with NO atomics. Best at large batch (enough heads to fill the
-//    device; no atomic contention) -- the default at batch 384.
-//  * QUERY-per-thread (attn_backward_query_kernel): one thread per (b, h, query i). dq[i] is owned
-//    (no race) but dk[j]/dv[j] sum over queries i>=j via atomicAdd. Exposes batch*H*T threads (T=64x
-//    more), winning big at small batch where the head scheme starves the device (3.4x at batch 32),
-//    at the cost of atomic contention that overtakes it at large batch.
-//
-// Both mirror the CPU backward exactly. The dq/dk/dv buffer must be zeroed before launch.
-__global__ void attn_backward_head_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                                          const float* __restrict__ v,
-                                          const float* __restrict__ dout, float* __restrict__ dq,
-                                          float* __restrict__ dk, float* __restrict__ dv,
-                                          int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over batch*H
-    if (idx >= batch * H) return;
-    const int b = idx / H, h = idx % H;
-    const int d = C / H, off = h * d;
-    const float scale = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
-    const size_t out_base = static_cast<size_t>(b) * T * C;
-    for (int i = 0; i < T; ++i) {
-        const float* qi    = q + in_base + static_cast<size_t>(i) * in_stride + off;
-        const float* douti = dout + out_base + static_cast<size_t>(i) * C + off;
-        float m = -1e30f, Z = 0.f;                           // recompute row softmax (no stored P)
-        for (int j = 0; j <= i; ++j) {
-            const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-            float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
-            const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn;
-        }
-        const float invZ = 1.f / Z;
-        float dot = 0.f;
-        for (int j = 0; j <= i; ++j) {                       // dv[j] += p*douti ; dot += p*(douti.v[j])
-            const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-            float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
-            const float p = __expf(s * scale - m) * invZ;
-            const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-            float* dvj      = dv + in_base + static_cast<size_t>(j) * in_stride + off;
-            float dp = 0.f;
-            for (int a = 0; a < d; ++a) { dvj[a] += p * douti[a]; dp += douti[a] * vj[a]; }
-            dot += p * dp;
-        }
-        float* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
-        for (int j = 0; j <= i; ++j) {
-            const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-            const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-            float s = 0.f, dp = 0.f;
-            for (int a = 0; a < d; ++a) { s += qi[a] * kj[a]; dp += douti[a] * vj[a]; }
-            const float p = __expf(s * scale - m) * invZ;
-            const float ds = p * (dp - dot) * scale;
-            float* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
-            for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; dkj[a] += ds * qi[a]; }
-        }
-    }
-}
-__global__ void attn_backward_query_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                                           const float* __restrict__ v,
-                                           const float* __restrict__ dout, float* __restrict__ dq,
-                                           float* __restrict__ dk, float* __restrict__ dv,
-                                           int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over batch*H*T
-    const int per = H * T;
-    const int b   = idx / per;
-    if (b >= batch) return;
-    const int rem = idx - b * per;
-    const int h   = rem / T;
-    const int i   = rem % T;
-    const int d = C / H, off = h * d;
-    const float scale = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
-    const size_t out_base = static_cast<size_t>(b) * T * C;
-    const float* qi    = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    const float* douti = dout + out_base + static_cast<size_t>(i) * C + off;
-    float m = -1e30f, Z = 0.f;                               // recompute row softmax (no stored P)
-    for (int j = 0; j <= i; ++j) {
-        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
-        const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn;
-    }
-    const float invZ = 1.f / Z;
-    float dot = 0.f;
-    for (int j = 0; j <= i; ++j) {                           // dv[j] += p*douti ; dot += p*(douti.v[j])
-        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
-        const float p = __expf(s * scale - m) * invZ;
-        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        float* dvj      = dv + in_base + static_cast<size_t>(j) * in_stride + off;
-        float dp = 0.f;
-        for (int a = 0; a < d; ++a) { atomicAdd(&dvj[a], p * douti[a]); dp += douti[a] * vj[a]; }
-        dot += p * dp;
-    }
-    float* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;   // owned by query i
-    for (int j = 0; j <= i; ++j) {
-        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f, dp = 0.f;
-        for (int a = 0; a < d; ++a) { s += qi[a] * kj[a]; dp += douti[a] * vj[a]; }
-        const float p = __expf(s * scale - m) * invZ;
-        const float ds = p * (dp - dot) * scale;
-        float* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; atomicAdd(&dkj[a], ds * qi[a]); }
-    }
-}
-
-// act-typed attention backward: q/k/v and dqkv in the store type, dout act, FP32 softmax+accum.
-// Mirrors attn_backward_head/query exactly; dqkv must be zeroed before launch. Two schemes by knob.
+//  * HEAD-per-thread (attn_backward_head_act_kernel): one thread per (window b, head h) owns the
+//    whole head, so dq/dk/dv accumulate with NO atomics. Best at large batch -- default at 384.
+//  * QUERY-per-thread (attn_backward_query_act_kernel): one thread per (b, h, query i); dq[i] owned,
+//    dk[j]/dv[j] sum over queries i>=j atomically. batch*H*T threads win at small batch (3.4x at 32).
+// Both mirror the CPU backward exactly. The dq/dk/dv buffer must be zeroed before launch. q/k/v and
+// dqkv are the store type (F32 build == FP32 path; BF16 reads/writes bf16 with FP32 softmax+accum).
 template <class A>
 __global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
                                           const A* __restrict__ v, const A* __restrict__ dout,
@@ -912,23 +744,12 @@ inline void launch_attn(const float* dQ, const float* dK, const float* dV, float
     const int total = batch * H * T;
     attn_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
 }
-inline void launch_attn_train(const float* dQ, const float* dK, const float* dV, float* dOut,
-                              int batch, int T, int C, int H, int in_stride) {
-    const int block = 64;
-    const int total = batch * H * T;
-    attn_train_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
-}
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
 // One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows.
 inline void launch_rope(float* qkv, int batch, int T, int C, int H, int in_stride) {
     const dim3 block(32, 8);
     const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
     rope_kernel<<<grid, block, 0, g_stream>>>(qkv, batch, T, C, H, in_stride, ROPE_THETA);
-}
-inline void launch_rope_bwd(float* dqkv, int batch, int T, int C, int H, int in_stride) {
-    const dim3 block(32, 8);
-    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_backward_kernel<<<grid, block, 0, g_stream>>>(dqkv, batch, T, C, H, in_stride, ROPE_THETA);
 }
 template <class A> inline void launch_rope_t(A* qkv, int batch, int T, int C, int H, int in_stride) {
     const dim3 block(32, 8);
@@ -969,24 +790,6 @@ inline void launch_rmsnorm_bwd(const float* x, const float* gamma, const float* 
     rmsnorm_backward_kernel<<<(rows + block - 1) / block, block, 0, g_stream>>>(
         x, gamma, rinv, dy, dx, dgamma, rows, C);
 }
-inline void launch_gelu_bwd(const float* x, const float* dy, float* dx, int n) {
-    const int block = 256;
-    gelu_backward_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(x, dy, dx, n);
-}
-inline void launch_attn_bwd(const float* qkv, const float* dout, float* dqkv,
-                            int batch, int T, int C, int H, int in_stride) {
-    const int block = 64;
-    if (AttnBwdPerQuery::get()) {
-        const int total = batch * H * T;          // one thread per (window, head, query) -- small batch
-        attn_backward_query_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
-            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
-    } else {
-        const int total = batch * H;              // one thread per (window, head) -- large batch (default)
-        attn_backward_head_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
-            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
-    }
-}
-
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
 template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
                               int batch, int T, int C, int H, int in_stride) {
