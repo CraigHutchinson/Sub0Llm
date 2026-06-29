@@ -1513,7 +1513,7 @@ extern "C" SUB0_API int sub0_memplan_stage() {
                  persist + mib(mp::fwd_scratch_bytes(d, 1)));
 
     std::println("");
-    std::println("training footprint by batch (persistent + fwd + train scratch):");
+    std::println("training footprint by batch (persistent + dids + train scratch):");
     for (const int b : {32, 64, 128, 256, 512, 1024}) {
         const int need = mp::train_resident_mb(d, b);
         std::println("  batch {:>5}: {:>7} MiB  {}", b, need,
@@ -1521,8 +1521,8 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     }
     const int db = DEFAULT_GPU_BATCH;
     std::println("");
-    std::println("breakdown @ DEFAULT_GPU_BATCH={}: persistent {:.0f} | fwd {:.0f} | train-scratch {:.0f} = {:.0f} MiB",
-                 db, persist, mib(mp::fwd_scratch_bytes(d, db)), mib(mp::train_scratch_bytes(d, db)),
+    std::println("breakdown @ DEFAULT_GPU_BATCH={}: persistent {:.0f} | dids {:.0f} | train-scratch {:.0f} = {:.0f} MiB",
+                 db, persist, mib(mp::fwd_dids_bytes(d, db)), mib(mp::train_scratch_bytes(d, db)),
                  mib(mp::train_resident_bytes(d, db)));
     std::println("");
     std::println("knobs: train scratch ~ batch * seq (acts) ; attention is O(seq^2); params ~ d^2*layers.");
