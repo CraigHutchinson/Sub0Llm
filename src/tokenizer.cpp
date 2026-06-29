@@ -202,11 +202,15 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
         // encodable, no silent drop of out-of-corpus characters) followed by the markers,
         // ALWAYS present so the base alphabet is corpus-independent and the ids are stable.
         for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
-        t.cap_id     = add_marker(TOK_CAP);
-        t.up_id      = add_marker(TOK_UP);
-        t.join_id    = add_marker(TOK_JOIN);
-        t.newline_id = add_marker(TOK_NEWLINE);
-        t.para_id    = add_marker(TOK_PARA);
+        t.cap_id        = add_marker(TOK_CAP);
+        t.up_id         = add_marker(TOK_UP);
+        t.join_id       = add_marker(TOK_JOIN);
+        t.newline_id    = add_marker(TOK_NEWLINE);
+        t.para_id       = add_marker(TOK_PARA);
+        t.odquote_id    = add_marker(TOK_ODQUOTE);
+        t.cdquote_id    = add_marker(TOK_CDQUOTE);
+        t.spell_start_id = add_marker(TOK_SPELL_START);
+        t.spell_end_id  = add_marker(TOK_SPELL_END);
         t.join_scheme = true;
     } else {
         // Legacy scheme: only the byte values the corpus actually used (in byte order) then
@@ -336,93 +340,128 @@ namespace {
 // whitespace run between content tokens; the decoder emits such bytes verbatim.
 inline bool is_ws_byte(int s) { return s == ' ' || s == '\t' || s == '\n' || s == '\r'; }
 
-// JOIN-scheme encode. `stream` is the truecased byte+marker stream. A single inter-content
-// space is implicit (no token); JOIN suppresses the implicit space (glued punctuation, and
-// the splits inside a multi-token word); NEWLINE/PARA encode the common newline runs; any
-// other whitespace is emitted verbatim as literal byte tokens (lossless, rare in prose).
-// See docs/TOKENIZER_DESIGN.md §2,§4,§5.
+// JOIN-scheme encode. `stream` is the truecased byte+marker stream. The encoder mirrors the
+// decoder's pending-space state `dps` so it emits exactly the tokens that reconstruct the text:
+//  - a single inter-content space is implicit (no token); JOIN cancels a pending space (glue);
+//  - a lone '\n' -> NEWLINE, "\n\n" -> PARA, any other whitespace -> verbatim byte tokens;
+//  - a double quote with ` "x` spacing -> OPEN_DQUOTE, `x" ` -> CLOSE_DQUOTE (bundles the space);
+//  - a word of N BPE sub-tokens: N=1 bare, N=2 sub JOIN sub, N>=3 SPELL_START sub.. SPELL_END.
+// See docs/TOKENIZER_DESIGN.md §2-§5.
 void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector<int>& out) {
     const std::size_t n = stream.size();
-    bool prev_content = false;
+    bool dps = false;                 // decoder's pending_space after the last emitted token
     std::vector<int> seq, sub;
+    auto emit_byte = [&](int b) { out.push_back(t.byte_base[static_cast<std::size_t>(b)]); };
+    // Realize the inter-content whitespace run [lo,hi) under the current dps (mirrors the decoder).
+    auto realize_gap = [&](std::size_t lo, std::size_t hi) {
+        const std::size_t gap = hi - lo;
+        if (gap == 0) {
+            if (dps) { out.push_back(t.join_id); dps = false; }       // glue: cancel the pending space
+        } else if (gap == 1 && stream[lo] == ' ') {
+            if (!dps) emit_byte(' ');                                 // space with no pending one -> literal
+        } else if (gap == 1 && stream[lo] == '\n') {
+            out.push_back(t.newline_id); dps = false;
+        } else if (gap == 2 && stream[lo] == '\n' && stream[lo + 1] == '\n') {
+            out.push_back(t.para_id); dps = false;
+        } else {
+            for (std::size_t k = lo; k < hi; ++k) emit_byte(stream[k]);
+            dps = false;
+        }
+    };
     std::size_t i = 0;
     while (i < n) {
         std::size_t g = i;
         while (g < n && is_ws_byte(stream[g])) ++g;     // whitespace gap [i, g)
-        const std::size_t gap = g - i;
-        const bool content_after = (g < n);
-        if (gap > 0) {
-            const bool inter = prev_content && content_after;
-            if (inter && gap == 1 && stream[i] == ' ') {
-                // implicit single inter-content space -- emit nothing (the common case, free)
-            } else if (gap == 1 && stream[i] == '\n') {
-                out.push_back(t.newline_id);
-            } else if (gap == 2 && stream[i] == '\n' && stream[i + 1] == '\n') {
-                out.push_back(t.para_id);
-            } else {                                    // verbatim: leading/trailing/multi/tab/CR runs
-                for (std::size_t k = i; k < g; ++k) out.push_back(t.byte_base[static_cast<std::size_t>(stream[k])]);
-            }
-        } else if (prev_content && content_after) {
-            out.push_back(t.join_id);                   // adjacent content with no space -> glue
+        if (g >= n) {                                   // trailing whitespace (no content follows)
+            const std::size_t gap = g - i;
+            if (gap == 1 && stream[i] == '\n') out.push_back(t.newline_id);
+            else if (gap == 2 && stream[i] == '\n' && stream[i + 1] == '\n') out.push_back(t.para_id);
+            else for (std::size_t k = i; k < g; ++k) emit_byte(stream[k]);
+            break;
         }
+        // Directional double quote: bundle the common spacing into one OPEN/CLOSE token.
+        if (stream[g] == '"') {
+            const std::size_t gap = g - i;
+            const bool after_glue = (g + 1 < n && !is_ws_byte(stream[g + 1]));
+            if (gap == 1 && stream[i] == ' ' && dps && after_glue) {  // ` "x` -> OPEN
+                out.push_back(t.odquote_id); dps = false; i = g + 1; continue;
+            }
+            if (gap == 0 && dps && !after_glue) {                     // `x" ` -> CLOSE
+                out.push_back(t.cdquote_id); dps = true; i = g + 1; continue;
+            }
+            // else: fall through to the bare-quote path
+        }
+        realize_gap(i, g);
         i = g;
-        if (i >= n) break;
-        // Content item: any case markers, then a word unit (BPE + intra-word JOINs) or one byte.
+        // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
             out.push_back(stream[i] == TOK_CAP ? t.cap_id : t.up_id);
             ++i;
         }
         if (i >= n) break;
         const std::size_t end = word_unit_end(stream, i);
-        if (end == i) {                                 // a standalone byte (punctuation, digit, ...)
-            out.push_back(t.byte_base[static_cast<std::size_t>(stream[i])]);
-            ++i;
+        if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
+            emit_byte(stream[i]); dps = true; ++i;
         } else {
             seq.assign(stream.begin() + static_cast<std::ptrdiff_t>(i),
                        stream.begin() + static_cast<std::ptrdiff_t>(end));
             for (int& s : seq) s = t.byte_base[static_cast<std::size_t>(s)];
             sub.clear();
             bpe_encode_word(t, seq, sub);
-            for (std::size_t k = 0; k < sub.size(); ++k) {
-                if (k > 0) out.push_back(t.join_id);    // intra-word: no implicit space between sub-tokens
-                out.push_back(sub[k]);
+            const std::size_t N = sub.size();
+            if (N >= 3) {                               // SPELL-encapsulate: 2 delimiters <= N-1 JOINs
+                out.push_back(t.spell_start_id);
+                for (int id : sub) out.push_back(id);
+                out.push_back(t.spell_end_id);
+            } else if (N == 2) {                        // sun+day: a single JOIN between the two
+                out.push_back(sub[0]); out.push_back(t.join_id); out.push_back(sub[1]);
+            } else {                                    // common single-token word
+                for (int id : sub) out.push_back(id);
             }
+            dps = true;
             i = end;
         }
-        prev_content = true;
     }
 }
 
-// JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space
-// between content tokens, cleared by JOIN; whitespace/markers emit their literal spacing;
-// case markers re-case the upcoming word (CAP = first letter, UP = whole word across its
-// JOINed sub-tokens). detokenize_join(encode_join(x)) == normalize_text(x) by construction.
+// JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space between
+// content tokens (`dps`), cancelled by JOIN; OPEN/CLOSE_DQUOTE emit a quote with their bundled
+// spacing; SPELL_START..SPELL_END is a spaceless group (`in_spell`) whose sub-tokens glue with no
+// internal spaces; case markers re-case the upcoming word (CAP = first letter, UP = whole word,
+// carried across its JOINed / SPELL sub-tokens). detokenize_join(encode_join(x)) == normalize_text(x).
 std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
     std::string out;
-    bool pending_space = false;
-    int  case_mode = 0;     // 0 none, 1 cap-first-letter, 2 upper-whole-word
+    bool dps = false;        // pending space before the next content token
+    bool in_spell = false;   // inside a SPELL_START..SPELL_END spaceless group
+    int  case_mode = 0;      // 0 none, 1 cap-first-letter, 2 upper-whole-word
     const std::size_t m = ids.size();
     for (std::size_t k = 0; k < m; ++k) {
         const int id = ids[k];
-        if (id == t.join_id)    { pending_space = false; continue; }
-        if (id == t.newline_id) { out += '\n';   pending_space = false; case_mode = 0; continue; }
-        if (id == t.para_id)    { out += "\n\n"; pending_space = false; case_mode = 0; continue; }
-        if (id == t.cap_id)     { case_mode = 1; continue; }
-        if (id == t.up_id)      { case_mode = 2; continue; }
+        if (id == t.join_id)         { dps = false; continue; }
+        if (id == t.newline_id)      { out += '\n';   dps = false; case_mode = 0; continue; }
+        if (id == t.para_id)         { out += "\n\n"; dps = false; case_mode = 0; continue; }
+        if (id == t.cap_id)          { case_mode = 1; continue; }
+        if (id == t.up_id)           { case_mode = 2; continue; }
+        if (id == t.odquote_id)      { if (dps) out += ' '; out += '"'; dps = false; case_mode = 0; continue; }
+        if (id == t.cdquote_id)      { out += '"'; dps = true; case_mode = 0; continue; }
+        if (id == t.spell_start_id)  { if (dps) out += ' '; in_spell = true; dps = false; continue; }
+        if (id == t.spell_end_id)    { in_spell = false; dps = true; case_mode = 0; continue; }
         if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
-            out += static_cast<char>(id); pending_space = false; case_mode = 0; continue;
+            out += static_cast<char>(id); dps = false; case_mode = 0; continue;
         }
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
-        if (pending_space) out += ' ';
+        if (!in_spell && dps) out += ' ';               // leading implicit space (never inside a SPELL group)
         for (int code : t.expansion[static_cast<std::size_t>(id)]) {
             const unsigned char c = static_cast<unsigned char>(code);
             if (case_mode == 1 && is_alpha(c))      { out += static_cast<char>(to_upper(c)); case_mode = 0; }
             else if (case_mode == 2 && is_alpha(c)) { out += static_cast<char>(to_upper(c)); }
             else                                    { out += static_cast<char>(c); }
         }
-        pending_space = true;
-        // UP applies to the whole word; keep it across the word's JOINed sub-tokens, reset at end.
-        if (case_mode == 2 && !(k + 1 < m && ids[k + 1] == t.join_id)) case_mode = 0;
+        if (!in_spell) {
+            dps = true;
+            // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
+            if (case_mode == 2 && !(k + 1 < m && ids[k + 1] == t.join_id)) case_mode = 0;
+        }
     }
     return out;
 }
@@ -507,12 +546,16 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         const int code = static_cast<int>(ru16());
         t.base_symbol[static_cast<std::size_t>(i)] = code;
         t.expansion[static_cast<std::size_t>(i)] = {code};
-        if      (code == TOK_CAP)     t.cap_id = i;
-        else if (code == TOK_UP)      t.up_id  = i;
-        else if (code == TOK_JOIN)    { t.join_id    = i; t.join_scheme = true; }  // join scheme detected
-        else if (code == TOK_NEWLINE) t.newline_id = i;
-        else if (code == TOK_PARA)    t.para_id    = i;
-        else                          t.byte_base[static_cast<unsigned char>(code)] = i;
+        if      (code == TOK_CAP)         t.cap_id = i;
+        else if (code == TOK_UP)          t.up_id  = i;
+        else if (code == TOK_JOIN)        { t.join_id = i; t.join_scheme = true; }  // join scheme detected
+        else if (code == TOK_NEWLINE)     t.newline_id = i;
+        else if (code == TOK_PARA)        t.para_id    = i;
+        else if (code == TOK_ODQUOTE)     t.odquote_id = i;
+        else if (code == TOK_CDQUOTE)     t.cdquote_id = i;
+        else if (code == TOK_SPELL_START) t.spell_start_id = i;
+        else if (code == TOK_SPELL_END)   t.spell_end_id   = i;
+        else                              t.byte_base[static_cast<unsigned char>(code)] = i;
     }
     const int n_merges = static_cast<int>(ru32());
     t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));

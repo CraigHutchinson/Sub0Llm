@@ -12,6 +12,7 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -94,12 +95,16 @@ TEST_CASE("encode is deterministic", "[tok]") {
 TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
     REQUIRE(t.join_scheme);
-    REQUIRE(t.n_base == 261);                 // 256 bytes + CAP,UP,JOIN,NEWLINE,PARA
+    REQUIRE(t.n_base == 265);                 // 256 bytes + CAP,UP,JOIN,NEWLINE,PARA,ODQUOTE,CDQUOTE,SPELL_START,SPELL_END
     REQUIRE(t.cap_id == 256);
     REQUIRE(t.up_id == 257);
     REQUIRE(t.join_id == 258);
     REQUIRE(t.newline_id == 259);
     REQUIRE(t.para_id == 260);
+    REQUIRE(t.odquote_id == 261);
+    REQUIRE(t.cdquote_id == 262);
+    REQUIRE(t.spell_start_id == 263);
+    REQUIRE(t.spell_end_id == 264);
     REQUIRE(t.vocab > t.n_base);              // merges still learned on top
 }
 
@@ -155,4 +160,37 @@ TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip"
 TEST_CASE("JOIN scheme: encode is deterministic", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
     REQUIRE(sub0::tok::encode(t, "the cat, sat.") == sub0::tok::encode(t, "the cat, sat."));
+}
+
+TEST_CASE("JOIN scheme: directional double quotes round-trip + bundle spacing", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    REQUIRE(round_trips(t, "she said \"hello\" and left ."));
+    REQUIRE(round_trips(t, "\"quoted start\" then text"));     // leading open quote
+    REQUIRE(round_trips(t, "a \"b\" c \"d e\" f"));            // multiple pairs, multi-word quote
+    REQUIRE(round_trips(t, "end with a quote\""));             // trailing bare quote
+    REQUIRE(round_trips(t, "no\"space\"quotes"));              // glue/glue -> bare fallback
+    // ` "hi"` encodes the open as ONE OPEN_DQUOTE and the close as ONE CLOSE_DQUOTE (bundled).
+    const std::vector<int> ids = sub0::tok::encode(t, "said \"hi\"");
+    REQUIRE(std::count(ids.begin(), ids.end(), t.odquote_id) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), t.cdquote_id) == 1);
+}
+
+TEST_CASE("JOIN scheme: SPELL encapsulation for long/OOV words round-trips", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    REQUIRE(round_trips(t, "the antidisestablishmentarianism word"));
+    REQUIRE(round_trips(t, "DoThisFooBar and NASA acronyms"));
+    REQUIRE(round_trips(t, "pneumonoultramicroscopicsilicovolcanoconiosis"));
+    // a long word splits into N>=3 BPE sub-tokens -> exactly one balanced SPELL_START/END pair.
+    const std::vector<int> ids = sub0::tok::encode(t, "antidisestablishmentarianism");
+    REQUIRE(std::count(ids.begin(), ids.end(), t.spell_start_id) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), t.spell_end_id) == 1);
+    REQUIRE(std::find(ids.begin(), ids.end(), t.spell_start_id)
+          < std::find(ids.begin(), ids.end(), t.spell_end_id));
+}
+
+TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    REQUIRE(round_trips(t, "She said, \"Don't touch the antidisestablishment thing!\""));
+    REQUIRE(round_trips(t, "ANTIDISESTABLISHMENT"));          // all-caps long word: UP across the SPELL group
+    REQUIRE(round_trips(t, "The Supercalifragilistic word ends here ."));
 }

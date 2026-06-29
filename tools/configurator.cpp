@@ -738,6 +738,23 @@ int main(int argc, char** argv) {
     std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
     std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
     std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
+    // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme this is the
+    // word-encoding lever: N=1 bare, N=2 one JOIN, N>=3 SPELL-encapsulated -- so N>=3 is the SPELL
+    // rate. Frequency-weighted, so it reflects the real token stream (common words dominate).
+    {
+        long long occ[4] = {0, 0, 0, 0};   // by occurrence: N==1, ==2, ==3, >=4
+        long long tot = 0;
+        for (std::size_t w = 0; w < word_syms.size(); ++w) {
+            const std::size_t N = word_syms[w].size();
+            const long long f = S.word_freq[w];
+            occ[N <= 1 ? 0 : N == 2 ? 1 : N == 3 ? 2 : 3] += f;
+            tot += f;
+        }
+        const double d = static_cast<double>(std::max<long long>(1, tot));
+        std::println(stderr, "word sub-token N (by occ):       N1 {:.1f}% / N2 {:.1f}% / N>=3 {:.1f}% (SPELL in join mode)",
+                     100.0 * static_cast<double>(occ[0]) / d, 100.0 * static_cast<double>(occ[1]) / d,
+                     100.0 * static_cast<double>(occ[2] + occ[3]) / d);
+    }
     if (emit_tok) {
         std::println(stderr, "total tokens:                    {}", token_count);
         std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);

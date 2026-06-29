@@ -147,14 +147,17 @@ configurator). The ablation runs after the scheme is implemented.
    cycle times on a partial corpus.
 3. Measure the ws/punct distribution (§7) → fix the special-token set from data —
    **done** ([stats](TOKENIZER_WS_PUNCT_STATS.md)); word-`N` histogram (§4) still pending in the configurator.
-4. Complete base alphabet (§1) + implement the decode FSM (§5) + round-trip tests —
-   **library DONE** (`sub0::tok`, `LearnOptions::join_scheme`, default off): complete 256-byte
-   base + always-on `CAP/UP/JOIN/NEWLINE/PARA`, implicit single space, JOIN for glue +
-   intra-word sub-token splits, `NEWLINE`/`PARA`, verbatim-whitespace fallback; encode/decode
-   FSM + serialize scheme-detection. Validated by the isolated `sub0_tok_tests` target
-   (round-trips spacing/punctuation/case/whitespace/out-of-corpus bytes). **Deferred:**
-   directional quotes (§3) and `SPELL` encapsulation for N≥3 words (§4) — today a multi-token
-   word uses N−1 JOINs (lossless, slightly more tokens for rare long/OOV words).
-5. **Wire into the pipeline** (configurator `corpus.tok` emission + a build flag) then **retrain**
-   (clean version break). Until the flag flips, the legacy space-as-token scheme stays the
-   default, so existing models/`corpus.tok` remain valid.
+4. Complete base alphabet (§1) + decode FSM (§5) + round-trip tests — **DONE** (`sub0::tok`,
+   `LearnOptions::join_scheme`, default off). Complete 256-byte base + always-on
+   `CAP/UP/JOIN/NEWLINE/PARA/OPEN_DQUOTE/CLOSE_DQUOTE/SPELL_START/SPELL_END` (n_base 265). The
+   encode/decode mirror a pending-space state `dps` (+ `in_spell`): implicit single space, JOIN
+   for glue, `NEWLINE`/`PARA`, verbatim-whitespace fallback, **directional double quotes (§3)**,
+   and **`SPELL` encapsulation for N≥3 words (§4)** with `CAP`/`UP` carried across a word's
+   sub-tokens. Validated by `sub0_tok_tests` (67 assertions, both schemes). Single-quote
+   directional tokens stay **deferred** (data: `'` is 82% contractions, already in the word-unit).
+5. **Wire into the pipeline + measure — DONE** (`SUB0_JOIN_TOKENIZER` build flag → `sub0-configure
+   --join` → `corpus.tok` via `sub0::tok::encode`; engine deserialises + uses the FSM). tinystories
+   A/B (same d160 model): **−29.0% tokens, bits/byte −4.2% (matched GPU) to −8.7%**, lossless,
+   coherent generation. The configurator reports the word-`N` histogram (tinystories: N1 92.9% /
+   N2 4.4% / N≥3 2.7% SPELL). Flag defaults off, so existing models/`corpus.tok` stay valid; a
+   retrain under the flag is the deliberate clean break.
