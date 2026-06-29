@@ -40,7 +40,8 @@ Two empirical facts from this session make it tractable:
 `sub0_config.hpp` by the configurator. This is deliberate (cache locality, folded
 hot loops, no per-op dim plumbing). Consequence: **each candidate architecture needs
 a reconfigure + rebuild.** The outer search therefore spans process boundaries and is
-naturally **script-orchestrated**, not a single in-process loop.
+naturally **orchestrated by CMake itself** (the project's super-build already builds the
+tree per-dims; see §7), not a single in-process loop.
 
 (The `TODO(dynamic-training-mode)` in `train_stage.cpp` proposes a `SUB0_TUNING`
 build where dims become runtime parameters; that would later collapse the rebuilds
@@ -53,11 +54,12 @@ and allow a true in-process `sub0llm model-tune`. This design targets the
 
 ```
  ┌──────────────────────────────────────────────────────────────────────┐
- │  scripts/model_tune.ps1   (orchestrator — owns the configure/build loop)│
+ │  cmake -P cmake/ModelTune.cmake   (orchestrator — CMake-native loop)   │
+ │  (driven by the `model-tune` custom target; no bespoke shell tooling) │
  │     loop:                                                              │
  │       next = sub0llm report --propose      # the "brain": history→point │
  │       break if CONVERGED                                              │
- │       cmake --preset native -D<next dims>  # reconfigure              │
+ │       cmake --preset native -D<next dims>  # reconfigure (isolated dir) │
  │       cmake --build --preset native        # rebuild                 │
  │       sub0llm tune --backend gpu           # INNER compute-tune       │
  │       cmake --build --preset native        # bake tuned batch        │
@@ -72,9 +74,11 @@ and allow a true in-process `sub0llm model-tune`. This design targets the
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Layer 1 — `scripts/model_tune.ps1`**: the orchestrator. It is the only piece that
-  knows how to reconfigure + rebuild. It reuses the existing `tune` and `train` and
-  `report` subcommands unchanged, just sequenced.
+- **Layer 1 — `cmake/ModelTune.cmake`** (run via `cmake -P`, exposed as a `model-tune`
+  custom target): the orchestrator. It is the only piece that knows how to reconfigure +
+  rebuild. **It is written in CMake, not a shell script** — see §7 for why the super-build
+  the repo already has is the natural home and how the adaptive loop folds in. It reuses
+  the existing `tune` / `train` / `report` subcommands unchanged, just sequenced.
 - **Layer 2 — `report --propose` (the brain)**: a **pure, stateless** function of the
   recorded history → the next dimension point (or "converged"). The *history is the
   state*; there is no hidden optimiser state on disk. This mirrors the project's
@@ -224,43 +228,98 @@ This is the **same ask/tell shape** as the inner tuner, just at the model layer.
 
 ---
 
-## 7. The orchestrator: `scripts/model_tune.ps1`
+## 7. Orchestration in CMake (fold into the super-build — no bespoke tooling)
 
-```powershell
-param([int]$ProbeEpochs = 2, [int]$MaxCandidates = 20, [string]$Corpus = "data/tinystories.txt")
+The repo already has a **super-build** (`cmake/SuperBuild.cmake`, `SUB0_SUPERBUILD`): a
+recursive self-call that `ExternalProject_Add`s the *same source tree* once per
+component with forwarded cache vars — and it already forwards **`SUB0_D_MODEL`,
+`SUB0_N_LAYERS`, `SUB0_N_HEADS`, `SUB0_SEQ_LEN`** into each child, collecting artifacts
+into a shared bin dir. In other words, *"build this tree N times with different model
+dims, isolated, into one place"* is **already the mechanism**. So the orchestrator does
+not need a separate language — it folds into CMake, giving a single cross-platform entry
+point (`cmake --build --preset native --target model-tune`) instead of a `.ps1`.
 
-for ($i = 0; $i -lt $MaxCandidates; $i++) {
-    # 1. ASK: pure proposer reads the registry history and proposes the next point.
-    $p = & $exe report --propose --probe-epochs $ProbeEpochs --json | ConvertFrom-Json
-    if ($p.converged) { Write-Host "CONVERGED: $($p.best)"; break }
+There are two CMake-native shapes; the design uses **(B)** as the driver and offers
+**(A)** for exhaustive sweeps.
 
-    # 2. CONFIGURE + BUILD the proposed dims (baked constexpr -> rebuild required).
-    cmake --preset native -DSUB0_CORPUS=$Corpus `
-        -DSUB0_D_MODEL=$($p.next.d_model) -DSUB0_N_LAYERS=$($p.next.n_layers) `
-        -DSUB0_N_HEADS=$($p.next.n_heads)
-    cmake --build --preset native
+### (A) Declarative super-build grid — for a STATIC sweep
 
-    # 3. INNER compute-tune (batch/TF32/attn) for THESE dims, then bake it.
-    & $exe tune --backend gpu
-    cmake --build --preset native
+A `SUB0_MODEL_TUNE_GRID` mode where the top-level enumerates a fixed ladder/grid and
+emits one `ExternalProject_Add` per candidate (each a child build of this tree with its
+own `-DSUB0_D_MODEL=… -DSUB0_N_HEADS=…`), whose **build/test steps run the probe-train +
+report**. Children are serialised with `ExternalProject_Add_StepDependencies` because the
+GPU is a single shared resource; a final aggregation target reads the history and prints
+the ranking. This reuses the existing super-build verbatim and is the cleanest fit for a
+*coordinate-sweep-as-grid* or an exhaustive ladder.
 
-    # 4. TELL: probe-train to the budget; meta.txt records best val + tokens_seen.
-    & $exe train --steps 0 --probe-epochs $ProbeEpochs
+Limitation: **CMake's dependency graph is fixed at configure time**, so a declarative
+super-build cannot *react* to a probe result to choose the next point — it can only run a
+**pre-enumerated** set. That is fine for a grid, not for adaptive ask/tell.
 
-    # 5. RECORD: report writes metrics + samples into the model dir and history.tsv.
-    & $exe report (Get-LatestModel) 
-}
-& $exe report --propose --json | ... # final ranking table
+### (B) CMake `-P` orchestration script — for the ADAPTIVE loop (default)
+
+The adaptive coordinate descent needs "propose → build → probe → propose" where each
+point depends on the previous *runtime* result. CMake's **script mode (`cmake -P`)** is a
+full imperative interpreter with `while`/`foreach` and `execute_process`, so the loop
+lives in CMake, not a shell:
+
+```cmake
+# cmake/ModelTune.cmake  —  run via:  cmake -P cmake/ModelTune.cmake
+#                          or target:  cmake --build --preset native --target model-tune
+set(EXE "${BIN}/sub0llm")
+foreach(i RANGE ${MAX_CANDIDATES})
+  # 1. ASK: the pure proposer reads the registry history -> next point (or CONVERGED).
+  execute_process(COMMAND ${EXE} report --propose --probe-epochs ${PROBE_EPOCHS} --json
+                  OUTPUT_VARIABLE J)
+  string(JSON CONVERGED GET "${J}" converged)
+  if(CONVERGED)
+    break()
+  endif()
+  string(JSON D GET "${J}" next d_model)   # + n_layers / n_heads ...
+
+  # 2. CONFIGURE + BUILD the proposed dims (baked constexpr -> rebuild). Isolated build
+  #    dir per candidate mirrors the super-build's per-child isolation.
+  execute_process(COMMAND ${CMAKE_COMMAND} --preset native
+                          -DSUB0_D_MODEL=${D} -DSUB0_N_LAYERS=${L} -DSUB0_N_HEADS=${H})
+  execute_process(COMMAND ${CMAKE_COMMAND} --build --preset native)
+
+  # 3. INNER compute-tune for THESE dims, then bake it.
+  execute_process(COMMAND ${EXE} tune --backend gpu)
+  execute_process(COMMAND ${CMAKE_COMMAND} --build --preset native)
+
+  # 4. TELL: probe-train to the budget (meta.txt records best val + tokens_seen).
+  execute_process(COMMAND ${EXE} train --steps 0 --probe-epochs ${PROBE_EPOCHS})
+
+  # 5. RECORD: report writes metrics + samples into the model dir and history.tsv.
+  execute_process(COMMAND ${EXE} report --propose)   # also prints the human report
+endforeach()
 ```
 
-Notes:
-- The script is the only place that reconfigures/rebuilds. Everything else is existing
-  subcommands, sequenced.
-- `train --probe-epochs N` is a small new flag = "auto-size like `--steps 0` but cap the
-  backstop at N epochs" (the probe budget). Falls back to the plateau detector if it
-  plateaus sooner.
-- On Windows, the rebuild relinks DLLs — the script must not run while another
-  `sub0llm` holds them (it is sequential, so fine).
+A thin `add_custom_target(model-tune COMMAND ${CMAKE_COMMAND} -P
+${CMAKE_SOURCE_DIR}/cmake/ModelTune.cmake -D... )`, added only when `SUB0_MODEL_TUNE=ON`,
+makes it a first-class build target. `string(JSON ...)` (CMake ≥ 3.19) parses the
+proposer's `--json`, so no text munging.
+
+### Why CMake, not a shell script
+
+- **No extra tooling / language**: it is the same `cmake` already required to build;
+  cross-platform (Windows/Linux) for free, unlike `.ps1`.
+- **Reuses the super-build's proven dim-forwarding** and per-child isolation pattern.
+- **Single entry point**: `--target model-tune` sits beside the normal build targets.
+- The **adaptive intelligence stays out of CMake** (in the pure `report --propose`), so
+  CMake is only the sequencer — which is exactly what `cmake -P` is good at, and avoids
+  pushing search logic into a build system.
+
+### What CMake should NOT do here
+
+Do not encode the search math (ladders, coordinate descent, feasibility) in CMake — that
+belongs in the pure, unit-tested `model_search.hpp` behind `report --propose`. CMake only
+*drives* (configure/build/run/serialise). This keeps the brain testable and the orchestrator
+a dumb, reliable loop.
+
+> On Windows the rebuild relinks DLLs — the loop is strictly sequential, so nothing holds
+> them during a rebuild. The inner `tune`/`train` run to completion before the next
+> `cmake --build`, matching the manual workflow used to validate this design.
 
 ---
 
@@ -300,7 +359,7 @@ Notes:
 | objective | measured tok/s (ms) | probe-train val_nelbo (minutes) |
 | feasibility skip | VRAM-over batch → skip | VRAM/param-band → skip |
 | robustness | median-of-samples confirm | re-probe top-K longer (confirm) |
-| driver | in-process lambda | script (rebuild per point) + stateless proposer |
+| driver | in-process lambda | CMake `-P` loop (`model-tune` target) + stateless proposer |
 | result | baked into `sub0_config.hpp` | baked dims + recorded in registry/history |
 
 ---
@@ -312,8 +371,10 @@ Notes:
   that reproduces the d96/d128/d160 ranking). No build/train wiring yet.
 - **P1 — `report --propose`.** Wire the proposer to the registry + emit PROPOSE/CONVERGED
   + `--json`. Add `bits_per_byte`/`probe_epochs` to `ModelMeta` and the history TSV.
-- **P2 — `scripts/model_tune.ps1`** orchestrator + `train --probe-epochs`. End-to-end
-  on tinystories; produce the ranking table.
+- **P2 — `cmake/ModelTune.cmake`** (adaptive `cmake -P` loop) + a `model-tune` custom
+  target, plus `train --probe-epochs`. Optionally the declarative `SUB0_MODEL_TUNE_GRID`
+  super-build mode for exhaustive sweeps. End-to-end on tinystories; produce the ranking
+  table. No new language/tooling — it folds into the existing super-build.
 - **P3 — confirm phase** (re-probe top-K longer) + head-utilisation early indicator
   (mean attention entropy + head similarity) folded into `report` to prune head counts
   without a full probe.
