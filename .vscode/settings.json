@@ -2,6 +2,19 @@
     "chat.tools.terminal.autoApprove": {
         "&": true,
         "clang++": true,
-        "nvcc": true
+        "nvcc": true,
+        "Push-Location": true,
+        "ctest": true,
+        "Pop-Location": true,
+        ".\\sub0llm.exe": true,
+        "/^cmd /c \"`\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64\\.bat`\" >nul 2>&1 && cmake --build --preset native\" 2>&1 \\| Select-Object -Last 15$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "./tests/sub0_tests.exe": true,
+        "/^cmd /c \"`\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64\\.bat`\" >nul 2>&1 && cmake --preset native && cmake --build --preset native\" 2>&1 \\| Select-Object -Last 50$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

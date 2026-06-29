@@ -450,6 +450,7 @@ struct GpuTrainer {
     bool enable(int batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
         constexpr int kCap = 1024;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
+        //TODO: Remove getenv calls
         if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
         if (!HAS_CUDA || batch > kCap) return false;
         if (sub0_cuda_init() != 0) return false;
@@ -711,6 +712,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     double run_loss = 0.0; int run_n = 0;
     bool stop = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
+    //TODO: Remove getenv calls
     const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr);
 
     for (long step = rs.step + 1; step <= max_steps && !stop; ++step) {

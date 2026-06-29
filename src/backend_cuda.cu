@@ -42,12 +42,6 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
-// Precision wiring status: GEMM_DTYPE BF16 is live (cublasGemmEx 32F_FAST_16BF). BF16 activation
-// *storage* (ACT_DTYPE) needs every saved buffer + rmsnorm/gelu/attn/add templated on the element
-// type and bf16 weight copies; until that lands, the configurator keeps ACT_DTYPE F32 (AUTO) so
-// this stays a hard stop rather than a silent half-conversion. Lift it with the bf16 storage pass.
-static_assert(ACT_DTYPE == Dtype::F32,
-    "BF16 activation storage is not wired yet; build with -DSUB0_PRECISION_ACT=F32/AUTO (TODO(bf16-acts)).");
 
 namespace {
 
@@ -894,30 +888,30 @@ void fwd_free() {
 // (no recompute), plus the gradient temporaries that thread the reverse pass. Sized once for the
 // full M = MAX_FWD_BATCH * SEQ_LEN. Allocated lazily by train_alloc, freed by sub0_cuda_shutdown.
 struct TrainScratch {
-    // per-layer saved forward activations
+    // per-layer saved forward activations (residual h_* stay F32; transient scratch is act_t)
     float* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
     float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
-    float* a    = nullptr;         // [M,C] rmsnorm1 output scratch -- recomputed from h_in in backward (not per-layer)
-    float* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
-    float* att  = nullptr;         // [M,C] attention output scratch -- recomputed from qkv in backward (not per-layer)
+    act_t* a    = nullptr;         // [M,C] rmsnorm1 output scratch -- recomputed from h_in in backward (not per-layer)
+    act_t* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
+    act_t* att  = nullptr;         // [M,C] attention output scratch -- recomputed from qkv in backward (not per-layer)
     float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
-    float* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
-    float* ff1  = nullptr;         // [M,F] pre-GELU scratch -- recomputed from fbuf in backward (not per-layer)
-    float* gact = nullptr;         // [M,F] GELU output scratch -- recomputed from fbuf in backward (not per-layer)
+    act_t* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
+    act_t* ff1  = nullptr;         // [M,F] pre-GELU scratch -- recomputed from fbuf in backward (not per-layer)
+    act_t* gact = nullptr;         // [M,F] GELU output scratch -- recomputed from fbuf in backward (not per-layer)
     // final block
     float* h_final = nullptr;      // [M,C] last residual stream (= rmsnorm_f input)
     float* rinv_f  = nullptr;      // [M]
     float* a_final = nullptr;      // [M,C] rmsnorm_f output (= lm_head input)
     float* logits  = nullptr;      // [M,V]
-    // gradient temporaries (reused across layers)
+    // gradient temporaries (reused across layers); dh threads the residual stream in F32
     float* dh      = nullptr;      // [M,C] running residual-stream grad
-    float* da      = nullptr;      // [M,C]
-    float* dqkv    = nullptr;      // [M,3C]
-    float* datt    = nullptr;      // [M,C]
-    float* dfbuf   = nullptr;      // [M,C]
-    float* dff1    = nullptr;      // [M,F]
-    float* dgact   = nullptr;      // [M,F]
+    act_t* da      = nullptr;      // [M,C]
+    act_t* dqkv    = nullptr;      // [M,3C]
+    act_t* datt    = nullptr;      // [M,C]
+    act_t* dfbuf   = nullptr;      // [M,C]
+    act_t* dff1    = nullptr;      // [M,F]
+    act_t* dgact   = nullptr;      // [M,F]
     float* dlogits = nullptr;      // [M,V]
     float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)

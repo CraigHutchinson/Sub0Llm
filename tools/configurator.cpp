@@ -652,10 +652,7 @@ int main(int argc, char** argv) {
         }
     };
     const std::string gemm_dt = resolve_dtype(prec_gemm, "GEMM");
-    // Activation storage in BF16 needs every saved buffer + its kernels templated on the element
-    // type; until that lands, AUTO keeps activations F32 (BF16 cuts the train scratch ~2x). Explicit
-    // --prec-act BF16 still resolves so it can be wired/measured incrementally.
-    const std::string act_dt  = (prec_act == 9) ? "F32" : resolve_dtype(prec_act, "activations");
+    const std::string act_dt  = resolve_dtype(prec_act, "activations");
     os << "// --- Reduced precision: per-section Dtype (FP32 accumulate + FP32 master weights) ---\n";
     os << "// F16/Q8/Q4 are reserved for future backends; only F32/BF16 are wired today.\n";
     os << "enum class Dtype { F32, BF16, F16, Q8, Q4 };\n";
