@@ -637,6 +637,22 @@ inline void ensure_cublas() {
         apply_math_mode();
     }
 }
+
+// cuBLAS compute type for the FP32-storage GEMMs: when the config bakes GEMM BF16 AND the tensor
+// path is enabled (CudaTf32 knob; parity tests force it off), use 32F_FAST_16BF -- inputs/outputs
+// stay FP32 in memory, cuBLAS down-converts to BF16 for the tensor cores and accumulates in FP32.
+// Otherwise pure FP32. Keeps the parity gate FP32-exact while making "GEMM BF16" genuinely active.
+inline cublasComputeType_t gemm_compute() {
+    return (GEMM_DTYPE == Dtype::BF16 && CudaTf32::get()) ? CUBLAS_COMPUTE_32F_FAST_16BF
+                                                          : CUBLAS_COMPUTE_32F;
+}
+// Thin cublasGemmEx wrapper (FP32 A/B/C) honoring gemm_compute(); replaces cublasSgemm everywhere.
+inline void gemm(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+                 const float* A, int lda, const float* B, int ldb, float* C, int ldc) {
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
+                 &beta, C, CUDA_R_32F, ldc, gemm_compute(), CUBLAS_GEMM_DEFAULT);
+}
 // Y[M,out] = X[M,in] . W[in,out] (+ bias) via cuBLAS. cublasSgemm is column-major, so we
 // compute the column-major Y^T = W^T . X^T -- which, read back row-major, IS Y = X . W:
 //   cublasSgemm(N,N, out,M,in, a, W,out, X,in, b, Y,out). Bias (no epilogue in the legacy
@@ -649,9 +665,7 @@ inline void ensure_cublas() {
 inline void launch_linear(const float* dX, const float* dW, const float* dB, float* dY,
                           int M, int in, int out) {
     ensure_cublas();
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, out, M, in,
-                &alpha, dW, out, dX, in, &beta, dY, out);
+    gemm(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out);
     if (dB) {
         const int n = M * out, block = 256;
         bias_add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, out);
@@ -705,12 +719,9 @@ inline void launch_rope_bwd(float* dqkv, int batch, int T, int C, int H, int in_
 // for the bottom of the graph (no input grad needed).
 inline void launch_linear_bwd(const float* dX_in, const float* dW_in, const float* dY,
                               float* dX, float* dW, float* dbias, int M, int in, int out) {
-    const float alpha = 1.0f, beta = 0.0f;
     if (dX)
-        cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, in, M, out,
-                    &alpha, dW_in, out, dY, out, &beta, dX, in);     // dX = dY . W^T
-    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, out, in, M,
-                &alpha, dY, out, dX_in, in, &beta, dW, out);         // dW = X^T . dY
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW_in, out, dY, out, dX, in);   // dX = dY . W^T
+    gemm(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW = X^T . dY
     if (dbias) {
         const int block = 128;
         bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out);
