@@ -178,8 +178,9 @@ One "evaluation" = train the freshly-built model for a **fixed short budget** an
 validation loss. Fairness rules (so dims, not confounds, are compared):
 
 - **Equal tokens seen, not equal steps.** Batch differs per dims (the inner tune sets
-  it). Compare `val_nelbo` at a fixed `tokens_seen` target (e.g. 2 epochs' worth), not
-  a fixed step count, because batch×steps = tokens.
+  it — cheaply, via the **delta** compute-tune of §7, not a full sweep). Compare
+  `val_nelbo` at a fixed `tokens_seen` target (e.g. 2 epochs' worth), not a fixed step
+  count, because batch×steps = tokens.
 - **Fixed seed** and fixed LR policy (`lr = base·sqrt(batch/8)` is already
   batch-aware, which is what we want).
 - **Primary metric = `val_nelbo`**; **secondary = `bits_per_byte`** (normalised by
@@ -225,6 +226,56 @@ Behaviour:
    script).
 
 This is the **same ask/tell shape** as the inner tuner, just at the model layer.
+
+### 6.1 Worked command-line examples (hardening the interaction)
+
+```sh
+# --- the common case: one end-to-end adaptive model-tune on the current corpus ---
+cmake --build --preset native --target model-tune
+
+# Bounded search (forwarded into cmake -P): <=12 candidates, 1.5-epoch probes,
+# d_model restricted to [96,320]. The target passes these through to ModelTune.cmake.
+cmake --build --preset native --target model-tune -- \
+      -DMAX_CANDIDATES=12 -DPROBE_EPOCHS=1.5 -DD_MODEL_RANGE=96:320
+
+# Run the orchestrator directly (no target) -- e.g. from CI:
+cmake -P cmake/ModelTune.cmake -DBIN=out/build/native -DPROBE_EPOCHS=2 -DMAX_CANDIDATES=20
+
+# --- inspect WITHOUT building/training: just ask what it would do next ---
+sub0llm report models/sub0llm_tinystories_d160l5h4sq256v2048r_95872a8 --propose
+sub0llm report --propose --json                 # machine-readable, for the loop / CI
+sub0llm report --propose --d-model 128:256 --layers 4:8 --heads-band 40:64
+
+# --- one candidate by hand (exactly what the loop does per point) ---
+cmake --preset native -DSUB0_D_MODEL=160 -DSUB0_N_LAYERS=5 -DSUB0_N_HEADS=4
+cmake --build --preset native
+sub0llm tune --backend gpu --delta              # SCOPED compute re-tune (§7)
+cmake --build --preset native                  # bake the (delta-)tuned batch
+sub0llm train --steps 0 --probe-epochs 2        # probe-train to the budget
+sub0llm report models/<new-dir>                 # record metrics + samples + history
+
+# --- exhaustive declarative grid instead of adaptive (rides the super-build) ---
+cmake --preset native -DSUB0_SUPERBUILD=ON -DSUB0_MODEL_TUNE_GRID=ON
+cmake --build --preset native                  # builds + probes every grid point, serialised
+
+# --- resume an interrupted search: SAME command (the registry IS the state) ---
+cmake --build --preset native --target model-tune
+
+# --- final ranking from recorded history, no training ---
+Get-Content models/model_tune_history.tsv       # or: sub0llm report --propose --json | jq .
+```
+
+Interaction-hardening rules the CLI must honour:
+
+- `--propose` **without a model** is valid (cold start): it proposes a sensible first
+  point from the corpus alone (the structural guidance already does this today).
+- `--propose --json` is **the only contract the orchestrator depends on**; the human text
+  is advisory. The JSON schema is pinned: `{converged:bool, phase:str, next:{d_model,
+  n_layers, n_heads, d_ff}, best:{...}, rationale:str}`.
+- Unknown/over-budget proposals are impossible by construction: `propose_next` only emits
+  feasible points (§9), so the loop never builds a model that cannot train.
+- Every invocation is idempotent w.r.t. the registry: re-running `--propose` without a new
+  probe returns the *same* next point (pure function of history).
 
 ---
 
@@ -283,8 +334,9 @@ foreach(i RANGE ${MAX_CANDIDATES})
                           -DSUB0_D_MODEL=${D} -DSUB0_N_LAYERS=${L} -DSUB0_N_HEADS=${H})
   execute_process(COMMAND ${CMAKE_COMMAND} --build --preset native)
 
-  # 3. INNER compute-tune for THESE dims, then bake it.
-  execute_process(COMMAND ${EXE} tune --backend gpu)
+  # 3. INNER compute-tune for THESE dims, then bake it. SCOPED to a delta around the
+  #    previous best (see "Delta compute-tune" below) so this stays cheap per candidate.
+  execute_process(COMMAND ${EXE} tune --backend gpu --delta)
   execute_process(COMMAND ${CMAKE_COMMAND} --build --preset native)
 
   # 4. TELL: probe-train to the budget (meta.txt records best val + tokens_seen).
@@ -299,6 +351,41 @@ A thin `add_custom_target(model-tune COMMAND ${CMAKE_COMMAND} -P
 ${CMAKE_SOURCE_DIR}/cmake/ModelTune.cmake -D... )`, added only when `SUB0_MODEL_TUNE=ON`,
 makes it a first-class build target. `string(JSON ...)` (CMake ≥ 3.19) parses the
 proposer's `--json`, so no text munging.
+
+### Delta (incremental) compute-tune — keep the per-candidate cost down
+
+The inner compute-tune (`sub0llm tune`) is itself minutes per candidate (each batch
+sample times a real device step through Explore/Refine/Confirm). Re-running the **full**
+batch ladder for every architecture would dominate the model-tune wall-clock. The design
+therefore scopes it: the model-tune drives a **delta** compute-tune that searches only a
+neighbourhood **around the current baked values**, because the optimum moves predictably
+between adjacent candidates.
+
+```
+sub0llm tune --backend gpu --delta [--around <batch>] [--scope N]
+```
+
+- **Why a delta is enough.** A wider/deeper model has a larger per-token footprint, so its
+  VRAM-fit batch *ceiling* shifts **smoothly and predictably** — `memplan` already computes
+  it. TF32 and the attention-backward strategy almost never flip for a one-step dims change
+  (and are baked anyway in a non-`SUB0_TUNING` build). So the only knob that really needs
+  re-fitting is the **batch**, and only locally.
+- **Seed.** Start from the previously baked `DEFAULT_GPU_BATCH`, rescaled by the footprint
+  ratio: `new_batch ≈ old_batch × footprint(old_dims) / footprint(new_dims)`, then clamped
+  to the runtime VRAM ceiling (`max_batch_for_vram`). This lands in the right basin before
+  any timing.
+- **Scope.** Probe only the seed ±`N` ladder steps (`--scope`, default 1–2), i.e. one
+  *increase/decrease* from current — not `64 → ceiling`. Confirm the local winner; skip the
+  global sweep. This is the compute analogue of the model search's **Refine** step: once a
+  good basin is known, zoom locally.
+- **Cold start / override.** The first candidate (no cache) falls back to a **full** tune;
+  thereafter every step is a cheap delta. `--full` forces a complete sweep on demand.
+
+> Trade-off: a delta risks missing a far-off better batch, but since the batch optimum is
+> known to track the (predictable) footprint monotonically, the local search almost always
+> finds it — at a fraction of the wall-clock. The model-tune can also re-assert a full tune
+> on the **final** chosen architecture, where getting the production batch exactly right
+> matters and the one-off cost is justified.
 
 ### Why CMake, not a shell script
 
@@ -372,7 +459,8 @@ a dumb, reliable loop.
 - **P1 — `report --propose`.** Wire the proposer to the registry + emit PROPOSE/CONVERGED
   + `--json`. Add `bits_per_byte`/`probe_epochs` to `ModelMeta` and the history TSV.
 - **P2 — `cmake/ModelTune.cmake`** (adaptive `cmake -P` loop) + a `model-tune` custom
-  target, plus `train --probe-epochs`. Optionally the declarative `SUB0_MODEL_TUNE_GRID`
+  target, plus `train --probe-epochs` and `tune --delta`/`--scope` (scoped compute
+  re-tune around the current batch). Optionally the declarative `SUB0_MODEL_TUNE_GRID`
   super-build mode for exhaustive sweeps. End-to-end on tinystories; produce the ranking
   table. No new language/tooling — it folds into the existing super-build.
 - **P3 — confirm phase** (re-probe top-K longer) + head-utilisation early indicator
@@ -390,8 +478,9 @@ a dumb, reliable loop.
   comparison + the confirm phase. (Empirically 1.5–2 ep sufficed here, but harder
   corpora may need more.)
 - **Rebuild dominates wall-clock.** ~30s rebuild + minutes/probe × ~axes×steps
-  candidates. Coordinate descent keeps the candidate count low; dynamic mode (P4)
-  removes the rebuild entirely.
+  candidates. Coordinate descent keeps the candidate count low; the **delta compute-tune**
+  (§7) cuts the per-candidate inner-tune from a full batch sweep to a local ±1 probe; and
+  dynamic mode (P4) removes the rebuild entirely.
 - **Comparability scope.** `--propose` must restrict to one `corpus/seq/vocab` family;
   cross-family comparison is meaningless (different loss scales).
 - **Metric choice.** `val_nelbo` for same-vocab search; `bits_per_byte` when `vocab` is
