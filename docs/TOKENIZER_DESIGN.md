@@ -131,14 +131,44 @@ configurator). The ablation runs after the scheme is implemented.
 
 ## 8. Concepts we don't yet employ (one-liners)
 
+The unifying bet: several of these are the **same shape** — a *paired-delimiter region* (open + close
+markers the model attends as a bracket) and/or a *separable affix* token. If enough cases reduce to
+one or two mechanisms, the system becomes elegant: `OPEN_DQUOTE`/`CLOSE_DQUOTE` and
+`SPELL_START`/`SPELL_END` are the first two instances; the rest below should reuse them.
+
+* **Extensible paired-delimiter regions** — generalise the directional-quote mechanism into a *family*
+  of OPEN/CLOSE pairs driven by a table: `()` `[]` `{}` `<>`, back-/single-quotes, etc. (today only `"`).
+  One classify-by-spacing-context encoder + one `in_region` decoder state covers them all. Brackets are
+  already directional glyphs (need only spacing), so this is mostly a data-driven token table + the
+  generic FSM. Source code (lots of `(){}[]<>`) is the natural stress corpus — **dogfood our own C++**.
+* **CamelCase / snake_case structural splitting** — `ThisIsMyAwesomeFunction`, `my_snake_case`,
+  `kDoThisFooBar` are compound identifiers. Today they fall into one SPELL group (N≥3) as opaque bytes.
+  Better: split on the *internal boundaries* (capital-camel-joins; `_` snake-joins) into real sub-word
+  tokens joined by a marker the model can attend — so `Function`/`Awesome` reuse their normal word
+  tokens. A region/JOIN concept, not opaque spelling. (`save_scan_state` etc. are snake-join examples.)
+* **`'s` possessive (separable affix)** — make the possessive clitic `'s` its own token rather than
+  `'` + `s`, so it attends BOTH the owner (name) and the owned object — a common, learnable relation.
+  A concrete instance of factored morphology; if several affixes (`'s`, `n't`, `'re`, `-ing`, `-ed`,
+  plural `-s`) clear a frequency floor, a small **separable-affix** mechanism becomes worth it.
+* **Acronym generation / spelling-awareness** — a word *token* hides its spelling, so the model can't
+  form/expand acronyms (NASA ↔ National Aeronautics…) from a token alone. Needs a path to the verbatim
+  letters: a `SPELL` token that forces a word to be emitted letter-by-letter, reachable by a
+  reasoning/thinking loop. Likely a future investigation unless an elegant in-line form appears.
 * **Misspelling robustness** — train on corrupted spellings → correct word; the SPELL region is the denoising unit (`quix`→`quick`), a natural fit for the diffusion paradigm.
-* **CamelCase / acronym compounds** — `DoThisFooBar`, `NASA` as SPELL-encapsulated spaceless groups with internal case markers.
+* **Vocab size + word-boundary-aligned BPE** — when a word must split, prefer sub-tokens that are
+  themselves *whole shorter words* (`sun`+`day`) over arbitrary fragments (`su`+`nd`+`ay`), and consider
+  a larger vocab so common words stay N=1. A merge-scoring / vocab-budget lever to investigate (today
+  plain frequency-greedy BPE can pick mid-word fragments). Measure with the word-`N` histogram.
 * **Attention-based pairing** — open/close quote and SPELL_START/END as matched pairs the model learns to bind; net benefit is empirical.
 * **Cross-JOIN BPE merges** — optionally let BPE absorb very frequent compounds into one token (a knob), trading composition for compactness.
 * **Digit-runs as word-units** — numbers BPE-merge like words (today digits are standalone, which implicit-space would mis-split).
 * **Factored morphology** — lemma + separable case/number/possession/tense axes (a small morphological analyser) layered above BPE.
 * **Verbosity/latency slider** — meaning-preserving terseness dial once a gist/coarsening generator exists.
 * **Mergeable vocabularies** — sum two corpora's scan-states (counts kept) for a joint or incremental tokenizer across sessions.
+* **Testing methodology** — round-trip property tests over (a) worked examples per construct, (b) a
+  **dogfooded** corpus of the project's own source (exercises brackets/braces/CamelCase/snake_case),
+  and (c) **malformed/random-mutation stress** (fuzz: random byte flips/insertions must still satisfy
+  `detokenize(encode(x)) == normalize_text(x)`). Capture each real failure (e.g. `NASA's`) as a pinned case.
 
 ## 9. Dependencies & sequencing
 
