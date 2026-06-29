@@ -194,3 +194,14 @@ TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
     REQUIRE(round_trips(t, "ANTIDISESTABLISHMENT"));          // all-caps long word: UP across the SPELL group
     REQUIRE(round_trips(t, "The Supercalifragilistic word ends here ."));
 }
+
+// Regression: an all-caps word + a possessive/contraction ("NASA's") truecases to UP + the
+// lowercase form, but word_unit_end keeps "nasa's" as ONE unit (interior apostrophe). UP must
+// stop at the apostrophe so the post-' "s" stays lowercase -- mirrors casing::detokenize.
+TEST_CASE("JOIN scheme: UP stops at an interior apostrophe", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    REQUIRE(round_trips(t, "THE's end"));                    // UP on THE, lowercase 's (the NASA's bug)
+    REQUIRE(round_trips(t, "the DOG's bone is here"));       // "dog" is attested -> UP collapse
+    REQUIRE(round_trips(t, "She's happy and they're here")); // CAP + contraction
+    REQUIRE(round_trips(t, "don't won't can't"));            // plain contractions
+}

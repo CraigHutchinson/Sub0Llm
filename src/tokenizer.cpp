@@ -340,6 +340,11 @@ namespace {
 // whitespace run between content tokens; the decoder emits such bytes verbatim.
 inline bool is_ws_byte(int s) { return s == ' ' || s == '\t' || s == '\n' || s == '\r'; }
 
+// Pending re-casing the decoder applies to the next content, set by a CAP/UP marker.
+// CapFirst capitalises the first alpha letter then clears; UpWord upper-cases the alpha
+// run and clears at the first non-alpha or the word's end (mirrors casing::detokenize).
+enum class Recase { None, CapFirst, UpWord };
+
 // JOIN-scheme encode. `stream` is the truecased byte+marker stream. The encoder mirrors the
 // decoder's pending-space state `dps` so it emits exactly the tokens that reconstruct the text:
 //  - a single inter-content space is implicit (no token); JOIN cancels a pending space (glue);
@@ -431,36 +436,37 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
 // carried across its JOINed / SPELL sub-tokens). detokenize_join(encode_join(x)) == normalize_text(x).
 std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
     std::string out;
-    bool dps = false;        // pending space before the next content token
-    bool in_spell = false;   // inside a SPELL_START..SPELL_END spaceless group
-    int  case_mode = 0;      // 0 none, 1 cap-first-letter, 2 upper-whole-word
+    bool   dps = false;            // pending space before the next content token
+    bool   in_spell = false;       // inside a SPELL_START..SPELL_END spaceless group
+    Recase recase = Recase::None;  // pending re-casing for the next content
     const std::size_t m = ids.size();
     for (std::size_t k = 0; k < m; ++k) {
         const int id = ids[k];
         if (id == t.join_id)         { dps = false; continue; }
-        if (id == t.newline_id)      { out += '\n';   dps = false; case_mode = 0; continue; }
-        if (id == t.para_id)         { out += "\n\n"; dps = false; case_mode = 0; continue; }
-        if (id == t.cap_id)          { case_mode = 1; continue; }
-        if (id == t.up_id)           { case_mode = 2; continue; }
-        if (id == t.odquote_id)      { if (dps) out += ' '; out += '"'; dps = false; case_mode = 0; continue; }
-        if (id == t.cdquote_id)      { out += '"'; dps = true; case_mode = 0; continue; }
+        if (id == t.newline_id)      { out += '\n';   dps = false; recase = Recase::None; continue; }
+        if (id == t.para_id)         { out += "\n\n"; dps = false; recase = Recase::None; continue; }
+        if (id == t.cap_id)          { recase = Recase::CapFirst; continue; }
+        if (id == t.up_id)           { recase = Recase::UpWord;   continue; }
+        if (id == t.odquote_id)      { if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue; }
+        if (id == t.cdquote_id)      { out += '"'; dps = true; recase = Recase::None; continue; }
         if (id == t.spell_start_id)  { if (dps) out += ' '; in_spell = true; dps = false; continue; }
-        if (id == t.spell_end_id)    { in_spell = false; dps = true; case_mode = 0; continue; }
+        if (id == t.spell_end_id)    { in_spell = false; dps = true; recase = Recase::None; continue; }
         if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
-            out += static_cast<char>(id); dps = false; case_mode = 0; continue;
+            out += static_cast<char>(id); dps = false; recase = Recase::None; continue;
         }
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
         if (!in_spell && dps) out += ' ';               // leading implicit space (never inside a SPELL group)
         for (int code : t.expansion[static_cast<std::size_t>(id)]) {
             const unsigned char c = static_cast<unsigned char>(code);
-            if (case_mode == 1 && is_alpha(c))      { out += static_cast<char>(to_upper(c)); case_mode = 0; }
-            else if (case_mode == 2 && is_alpha(c)) { out += static_cast<char>(to_upper(c)); }
-            else                                    { out += static_cast<char>(c); }
+            if      (recase == Recase::CapFirst && is_alpha(c)) { out += static_cast<char>(to_upper(c)); recase = Recase::None; }
+            else if (recase == Recase::UpWord   && is_alpha(c)) { out += static_cast<char>(to_upper(c)); }
+            else if (recase == Recase::UpWord)                  { out += static_cast<char>(c); recase = Recase::None; }  // UP ends at a non-alpha (the ' in "NASA's")
+            else                                                { out += static_cast<char>(c); }
         }
         if (!in_spell) {
             dps = true;
             // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
-            if (case_mode == 2 && !(k + 1 < m && ids[k + 1] == t.join_id)) case_mode = 0;
+            if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == t.join_id)) recase = Recase::None;
         }
     }
     return out;
