@@ -254,6 +254,26 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] + b[i];
 }
+// act-typed add: c = a + b in the store type (F32 build == add_kernel).
+template <class A>
+__global__ void add_act_kernel(const A* __restrict__ a, const A* __restrict__ b, A* __restrict__ c, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) st_act(&c[i], to_f32(a[i]) + to_f32(b[i]));
+}
+// act-typed RMSNorm-train: y = rmsnorm(x)*gamma, saving rinv; reads/writes store type, FP32 math.
+template <class A>
+__global__ void rmsnorm_train_act_kernel(const A* __restrict__ x, const float* __restrict__ gamma,
+                                         A* __restrict__ y, float* __restrict__ rinv, int rows, int C) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < rows) {
+        const float eps = 1e-5f;
+        const A* xr = x + static_cast<size_t>(m) * C;
+        float ms = 0.f; for (int j = 0; j < C; ++j) { const float v = to_f32(xr[j]); ms += v * v; }
+        ms /= C; const float r = rsqrtf(ms + eps); rinv[m] = r;
+        A* yr = y + static_cast<size_t>(m) * C;
+        for (int j = 0; j < C; ++j) st_act(&yr[j], to_f32(xr[j]) * r * gamma[j]);
+    }
+}
 
 // Causal multi-head attention over a BATCH of windows (op_attn, FAST_MATH softmax). One
 // TODO(perf): naive O(T^2) per thread with a float sc[SEQ_LEN] in local memory. For longer T a
