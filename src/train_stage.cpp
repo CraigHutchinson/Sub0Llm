@@ -635,6 +635,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
     if (model_out && *model_out) {
         model_path = model_out;
+        meta_dir   = std::filesystem::path(model_path).parent_path();   // keep meta.txt beside the
+        // model so an explicit-path run (including a resume) still records provenance, not just the
+        // auto-named layout below. A bare filename (no parent) leaves meta_dir empty -> write_meta skips.
     } else {
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
@@ -800,7 +803,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::save_model(model_path.c_str());
     save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
     write_meta(stop ? "plateaued" : "trained");
-    std::println("  --- sample ---\n  {}", preview("the ", 120, rng));
+    // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
+    // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
+    // reaches it). This exercises the real long-context behaviour the trained window supports.
+    std::println("  --- sample ({}-token context) ---\n  {}", SEQ_LEN, preview("the ", SEQ_LEN, rng));
     std::println("{} at step {} (best val_nelbo {:.4f}) -> {}",
                  stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
     gpu.shutdown();        // release the device session (no-op on the CPU path)
@@ -1584,6 +1590,16 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     if (data.empty()) return 1;
     sub0::build_model();
 
+    // Tee every report line to stdout AND a buffer, so the same text can be persisted next to the
+    // model for retrospective per-version comparison (no rebuild/rerun needed to recall the metrics).
+    std::string report_txt;
+    auto emit = [&]<class... A>(std::format_string<A...> fmt, A&&... a) {
+        std::string line = std::format(fmt, std::forward<A>(a)...);
+        std::puts(line.c_str());
+        report_txt += line;
+        report_txt += '\n';
+    };
+
     // The held-out split mirrors training (last VAL_FRACTION); train metrics use the head.
     const std::size_t val_tokens = std::max<std::size_t>(
         static_cast<std::size_t>(SEQ_LEN) + 2,
@@ -1605,16 +1621,16 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         if (!ec && !data.empty()) bytes_per_tok = static_cast<double>(sz) / static_cast<double>(data.size());
     }
 
-    std::println("model report");
-    std::println("architecture: d_model {} | n_layers {} | n_heads {} (head_dim {}) | seq_len {} | vocab {} | pos {}",
+    emit("model report");
+    emit("architecture: d_model {} | n_layers {} | n_heads {} (head_dim {}) | seq_len {} | vocab {} | pos {}",
                  D_MODEL, N_LAYERS, N_HEADS, head_dim, SEQ_LEN, VOCAB,
                  POS_ENCODING == PosEncoding::Rope ? "RoPE" : "absolute");
-    std::println("parameters:   {:.2f}M trainable floats", params / 1e6);
+    emit("parameters:   {:.2f}M trainable floats", params / 1e6);
 
     if (model_in && *model_in) {   // training provenance from the meta.txt next to the model
         sub0::registry::ModelMeta m;
         if (sub0::registry::read_meta(std::filesystem::path(model_in).parent_path(), m) && m.steps > 0)
-            std::println("training:     steps {} | epochs {:.2f} | tokens_seen {} | seed {}",
+            emit("training:     steps {} | epochs {:.2f} | tokens_seen {} | seed {}",
                          m.steps, m.epochs, m.tokens_seen, m.seed);
     }
 
@@ -1622,8 +1638,10 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     // under a different config/scheme -- the header guard refuses it), keeping structural guidance.
     bool   have_loss = false, overfit = false, underfit_quality = false;
     double rel_gap = 0.0;
+    bool   model_loaded = false;
     if (model_in && *model_in) {
         if (sub0::load_model(model_in)) {
+            model_loaded = true;
             const double train_nelbo = evaluate(train_span, 0);
             const double val_nelbo   = evaluate(val_span, 0);
             const double gap = val_nelbo - train_nelbo;
@@ -1632,31 +1650,43 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
             overfit          = rel_gap > 0.15;
             underfit_quality = bpb > 1.2;     // clean web text should approach ~1.0 bits/byte
             have_loss = true;
-            std::println("");
-            std::println("quality:");
-            std::println("  train nelbo {:.4f}  (ppl {:.2f})", train_nelbo, std::exp(train_nelbo));
-            std::println("  val   nelbo {:.4f}  (ppl {:.2f})", val_nelbo, std::exp(val_nelbo));
-            std::println("  train/val gap {:.4f}  ({:.1f}%)  -> {}", gap, 100.0 * rel_gap,
+            emit("");
+            emit("quality:");
+            emit("  train nelbo {:.4f}  (ppl {:.2f})", train_nelbo, std::exp(train_nelbo));
+            emit("  val   nelbo {:.4f}  (ppl {:.2f})", val_nelbo, std::exp(val_nelbo));
+            emit("  train/val gap {:.4f}  ({:.1f}%)  -> {}", gap, 100.0 * rel_gap,
                          overfit ? "OVERFITTING (model too large / too little data)"
                                  : rel_gap < 0.03 ? "not overfitting (capacity / optimization bound)"
                                                   : "healthy generalization gap");
             if (bytes_per_tok > 0)
-                std::println("  bits/byte   {:.3f}  (corpus ~{:.2f} bytes/token)  -> {}", bpb, bytes_per_tok,
+                emit("  bits/byte   {:.3f}  (corpus ~{:.2f} bytes/token)  -> {}", bpb, bytes_per_tok,
                              bpb > 1.2 ? "well above ~1.0: real headroom"
                                        : bpb > 0.9 ? "near a good small-model range" : "strong");
         } else {
-            std::println("note: '{}' did not load into this build (different config/scheme); "
+            emit("note: '{}' did not load into this build (different config/scheme); "
                          "showing structural guidance only.", model_in);
         }
     } else {
-        std::println("note: no model given -- showing structural (corpus-fit) guidance only.");
+        emit("note: no model given -- showing structural (corpus-fit) guidance only.");
+    }
+
+    // Grounding samples: actual generations at the gen defaults so a reader (and the saved report)
+    // can judge quality directly, not just by the loss numbers. Two temperatures bracket the
+    // determinism/diversity trade-off; the full SEQ_LEN length exercises the trained context window.
+    if (model_loaded) {
+        sub0::load_tokenizer(sub0::default_tokenizer());   // encode/detokenize for the sample print
+        std::mt19937 rng(1234);                            // fixed seed -> reproducible report samples
+        emit("");
+        emit("samples ({}-token context, prompt \"the \"):", SEQ_LEN);
+        emit("  [temp 0.4]  {}", preview_at("the ", SEQ_LEN, 0.4f, 20, rng));
+        emit("  [temp 0.7]  {}", preview_at("the ", SEQ_LEN, 0.7f, 20, rng));
     }
 
     const double tok_per_param = params > 0 ? static_cast<double>(train_tokens) / params : 0.0;
-    std::println("");
-    std::println("corpus fit (Chinchilla compute-optimal ~20 tokens/param):");
-    std::println("  train tokens  {:.2f}M", train_tokens / 1e6);
-    std::println("  tokens/param  {:.1f}  -> {}", tok_per_param,
+    emit("");
+    emit("corpus fit (Chinchilla compute-optimal ~20 tokens/param):");
+    emit("  train tokens  {:.2f}M", train_tokens / 1e6);
+    emit("  tokens/param  {:.1f}  -> {}", tok_per_param,
                  tok_per_param > 40 ? "data-rich: the model is UNDERSIZED for this corpus"
                  : tok_per_param < 5 ? "data-limited: model may be oversized / undertrained"
                                      : "near compute-optimal");
@@ -1683,33 +1713,55 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     if (bytes_per_tok > 0 && bytes_per_tok < 2.5) { v_vocab = 1; r_vocab = std::format("bytes/token {:.2f} low: a larger vocab compresses better (cost: embedding params)", bytes_per_tok); }
     else                                          { r_vocab = "compression reasonable"; }
 
-    std::println("");
-    std::println("per-knob guidance (must / should / could / ok):");
-    std::println("  d_model  {:<5} [{}] {}", D_MODEL,  verdict_word(v_d),     r_d);
-    std::println("  n_layers {:<5} [{}] {}", N_LAYERS, verdict_word(v_l),     r_l);
-    std::println("  n_heads  {:<5} [{}] {}", N_HEADS,  verdict_word(v_h),     r_h);
-    std::println("  seq_len  {:<5} [{}] {}", SEQ_LEN,  verdict_word(v_seq),   r_seq);
-    std::println("  vocab    {:<5} [{}] {}", VOCAB,    verdict_word(v_vocab), r_vocab);
+    emit("");
+    emit("per-knob guidance (must / should / could / ok):");
+    emit("  d_model  {:<5} [{}] {}", D_MODEL,  verdict_word(v_d),     r_d);
+    emit("  n_layers {:<5} [{}] {}", N_LAYERS, verdict_word(v_l),     r_l);
+    emit("  n_heads  {:<5} [{}] {}", N_HEADS,  verdict_word(v_h),     r_h);
+    emit("  seq_len  {:<5} [{}] {}", SEQ_LEN,  verdict_word(v_seq),   r_seq);
+    emit("  vocab    {:<5} [{}] {}", VOCAB,    verdict_word(v_vocab), r_vocab);
 
-    // Concrete next-size suggestion when growing: ~20 tokens/param, head_dim 64, balanced aspect ~40.
+    // Concrete next-size suggestion when growing. Two grow drivers need different targets:
+    //   * data-rich (tokens/param > 40): Chinchilla says size UP to ~train_tokens/20 params;
+    //   * quality-bound (poor bits/byte at sane tokens/param): spend more capacity than now.
+    // Use the LARGER of the two so a "grow" never suggests fewer params than the current model
+    // (the old train_tokens/20-only target could undercut the current size and contradict the
+    // "MUST widen" verdict). Search head_dim-64 widths STARTING ABOVE the current d_model, and keep
+    // depth >= current (width is the primary lever; don't cut layers just to hit an aspect target).
     if (grow && train_tokens > 0) {
-        const long long target_p = train_tokens / 20;
-        long long best_p = 0; int best_C = D_MODEL, best_L = N_LAYERS, best_H = N_HEADS;
-        for (int C = 128; C <= 1024; C += 64) {
-            const int H = C / 64;                                                       // head_dim = 64
-            const int L = std::clamp(static_cast<int>(std::lround(C / 40.0)), 2, 24);   // aspect ~40
+        const long long chinchilla = train_tokens / 20;
+        const long long target_p   = std::max<long long>(chinchilla, static_cast<long long>(params * 1.8));
+        const int       C_start    = ((D_MODEL / 64) + 1) * 64;                     // next head_dim-64 width up
+        long long best_p = 0; int best_C = C_start, best_L = N_LAYERS, best_H = C_start / 64;
+        for (int C = C_start; C <= 1024; C += 64) {
+            const int H = C / 64;                                                   // head_dim = 64
+            const int L = std::clamp(std::max(N_LAYERS, static_cast<int>(std::lround(C / 40.0))), 2, 24);
             const long long p = static_cast<long long>(
                 sub0::memplan::param_floats({C, L, H, 4 * C, SEQ_LEN, VOCAB}));
             if (best_p == 0 || std::llabs(p - target_p) < std::llabs(best_p - target_p)) {
                 best_p = p; best_C = C; best_L = L; best_H = H;
             }
         }
-        std::println("");
-        std::println("suggested next size (target ~{:.1f}M params = train_tokens/20):", target_p / 1e6);
-        std::println("  cmake --preset native -DSUB0_D_MODEL={} -DSUB0_N_LAYERS={} -DSUB0_N_HEADS={}",
+        emit("");
+        emit("suggested next size (target ~{:.1f}M params; max of Chinchilla {:.1f}M and 1.8x current):",
+                     target_p / 1e6, chinchilla / 1e6);
+        emit("  cmake --preset native -DSUB0_D_MODEL={} -DSUB0_N_LAYERS={} -DSUB0_N_HEADS={}",
                      best_C, best_L, best_H);
-        std::println("  -> d{} L{} H{} (head_dim 64, aspect {:.0f}) ~= {:.1f}M params; then `sub0llm train`",
+        emit("  -> d{} L{} H{} (head_dim 64, aspect {:.0f}) ~= {:.2f}M params; then `sub0llm train`",
                      best_C, best_L, best_H, static_cast<double>(best_C) / best_L, best_p / 1e6);
+    }
+
+    // Persist the report next to the model so each trained version keeps its own metrics + samples
+    // for later comparison without re-running (the corpus eval + generation are the slow parts).
+    if (model_in && *model_in) {
+        const std::filesystem::path dir = std::filesystem::path(model_in).parent_path();
+        const std::filesystem::path out = dir / "report.txt";
+        if (std::ofstream f{out}; f) {
+            f << report_txt;
+            std::println("\nsaved report -> {}", out.string());
+        } else {
+            std::println("\nwarning: could not write report to {}", out.string());
+        }
     }
     return 0;
 }
