@@ -78,15 +78,13 @@ constexpr u64 fwd_scratch_bytes(const Dims& d, int batch) {
 
 // Resident training scratch (train_alloc), grown to `batch`. One term per cudaMalloc in train_alloc.
 constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
-    const u64 C = u64(d.d_model), L = u64(d.n_layers), H = u64(d.n_heads), F = u64(d.d_ff);
+    const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);
     const u64 Mm = u64(batch) * T;
-    const u64 PB = u64(batch) * H * T * T;
     const u64 per_layer = 5 * Mm * C * FLOAT    // h_in, a, att, h_mid, fbuf  [M,C]
                         + 2 * Mm * FLOAT        // rinv1, rinv2  [M]
                         + Mm * 3 * C * FLOAT    // qkv   [M,3C]
-                        + PB * FLOAT            // P     [batch,H,T,T]
-                        + 2 * Mm * F * FLOAT;   // ff1, gact  [M,F]
+                        + 2 * Mm * F * FLOAT;   // ff1, gact  [M,F]  (P-free flash: no [batch,H,T,T])
     const u64 final_blk = 2 * Mm * C * FLOAT    // h_final, a_final  [M,C]
                         + Mm * FLOAT            // rinv_f  [M]
                         + Mm * V * FLOAT;       // logits  [M,V]
