@@ -652,7 +652,9 @@ int main(int argc, char** argv) {
         }
     };
     const std::string gemm_dt = resolve_dtype(prec_gemm, "GEMM");
-    const std::string act_dt  = resolve_dtype(prec_act, "activations");
+    // BF16 activation storage works (FFN buffers), but cannot meet the F32-CPU 1e-2 parity gate, so
+    // AUTO keeps activations F32; --prec-act BF16 opts in (~2x less FFN scratch) for memory-bound runs.
+    const std::string act_dt  = (prec_act == 9) ? "F32" : resolve_dtype(prec_act, "activations");
     os << "// --- Reduced precision: per-section Dtype (FP32 accumulate + FP32 master weights) ---\n";
     os << "// F16/Q8/Q4 are reserved for future backends; only F32/BF16 are wired today.\n";
     os << "enum class Dtype { F32, BF16, F16, Q8, Q4 };\n";

@@ -1214,7 +1214,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
             // to WDDM shared memory and THRASHES over PCIe, so the measurement would "succeed" at a
             // ruinous ~10x-slower rate and pollute the search. Predict up front and skip instead.
             if (GPU_VRAM_MB > 0) {
-                const int need = sub0::memplan::train_resident_mb(kGpuDims, batch);
+                const int need = sub0::memplan::train_resident_mb(kGpuDims, batch, ACT_DTYPE == Dtype::BF16 ? 2 : 4);
                 if (need > GPU_VRAM_MB) {
                     if (verbose) {
                         std::println("  batch={:>4}{}  ->  predicted {} MiB > {} MiB VRAM, skipping (would spill)",
@@ -1517,15 +1517,16 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     std::println("");
     std::println("training footprint by batch (persistent + dids + train scratch):");
     for (const int b : {32, 64, 128, 256, 512, 1024}) {
-        const int need = mp::train_resident_mb(d, b);
+        const auto aB = static_cast<sub0::memplan::u64>(ACT_DTYPE == Dtype::BF16 ? 2 : 4);
+    const int need = mp::train_resident_mb(d, b, aB);
         std::println("  batch {:>5}: {:>7} MiB  {}", b, need,
                      vram <= 0 ? "" : need > vram ? "!! over VRAM (spills to shared, ~10x slower)" : "fits");
     }
     const int db = DEFAULT_GPU_BATCH;
     std::println("");
     std::println("breakdown @ DEFAULT_GPU_BATCH={}: persistent {:.0f} | dids {:.0f} | train-scratch {:.0f} = {:.0f} MiB",
-                 db, persist, mib(mp::fwd_dids_bytes(d, db)), mib(mp::train_scratch_bytes(d, db)),
-                 mib(mp::train_resident_bytes(d, db)));
+                 db, persist, mib(mp::fwd_dids_bytes(d, db)), mib(mp::train_scratch_bytes(d, db, ACT_DTYPE == Dtype::BF16 ? 2 : 4)),
+                 mib(mp::train_resident_bytes(d, db, ACT_DTYPE == Dtype::BF16 ? 2 : 4)));
     std::println("");
     std::println("knobs: train scratch ~ batch * seq (acts) ; attention is O(seq^2); params ~ d^2*layers.");
     std::println("  - halve seq -> ~halve activations + 4x less attention; raise/lower batch scales linearly;");

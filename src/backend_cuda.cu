@@ -54,6 +54,11 @@ constexpr cudaDataType_t ACT_CUDA = (ACT_DTYPE == Dtype::BF16) ? CUDA_R_16BF : C
 [[maybe_unused]] __device__ inline float  to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
 [[maybe_unused]] __device__ inline void   st_act(float* p, float v)         { *p = v; }
 [[maybe_unused]] __device__ inline void   st_act(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+// Down-cast a float buffer into the act_t store type (bf16 weight mirrors + dh16). F32: plain copy.
+__global__ void f32_to_act_kernel(const float* __restrict__ x, act_t* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) st_act(&y[i], x[i]);
+}
 
 // CUDA error check for the self-test: report file:line + the error string and bail out
 // of the calling function with a nonzero code. The full backend will route failures
@@ -254,17 +259,17 @@ __global__ void add_act_kernel(const A* __restrict__ a, const A* __restrict__ b,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) st_act(&c[i], to_f32(a[i]) + to_f32(b[i]));
 }
-// act-typed RMSNorm-train: y = rmsnorm(x)*gamma, saving rinv; reads/writes store type, FP32 math.
-template <class A>
-__global__ void rmsnorm_train_act_kernel(const A* __restrict__ x, const float* __restrict__ gamma,
-                                         A* __restrict__ y, float* __restrict__ rinv, int rows, int C) {
+// act-typed RMSNorm-train: y = rmsnorm(x)*gamma, saving rinv; in X / out Y store types, FP32 math.
+template <class X, class Y>
+__global__ void rmsnorm_train_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
+                                         Y* __restrict__ y, float* __restrict__ rinv, int rows, int C) {
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m < rows) {
         const float eps = 1e-5f;
-        const A* xr = x + static_cast<size_t>(m) * C;
+        const X* xr = x + static_cast<size_t>(m) * C;
         float ms = 0.f; for (int j = 0; j < C; ++j) { const float v = to_f32(xr[j]); ms += v * v; }
         ms /= C; const float r = rsqrtf(ms + eps); rinv[m] = r;
-        A* yr = y + static_cast<size_t>(m) * C;
+        Y* yr = y + static_cast<size_t>(m) * C;
         for (int j = 0; j < C; ++j) st_act(&yr[j], to_f32(xr[j]) * r * gamma[j]);
     }
 }
@@ -452,6 +457,15 @@ __global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict
     if (o >= N) return;
     float s = 0.f;
     for (int m = 0; m < M; ++m) s += dY[static_cast<size_t>(m) * N + o];
+    dbias[o] = s;
+}
+// act-typed bias gradient: dbias[o] = sum_m dY_act[m,o], reading the bf16 store with FP32 accum.
+template <class A>
+__global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict__ dbias, int M, int N) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= N) return;
+    float s = 0.f;
+    for (int m = 0; m < M; ++m) s += to_f32(dY[static_cast<size_t>(m) * N + o]);
     dbias[o] = s;
 }
 
@@ -702,6 +716,18 @@ inline void gemm(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int
     cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
                  &beta, C, CUDA_R_32F, ldc, gemm_compute(), CUBLAS_GEMM_DEFAULT);
 }
+template <class T> constexpr cudaDataType_t cu_type() {
+    return std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_32F;
+}
+// Mixed-type GemmEx: A/B share type IN, output type OUT; FP32 accumulate always. Used for bf16
+// activation GEMMs (IN=bf16 weights+acts) writing either bf16 (chained) or f32 (residual) output.
+template <class IN, class OUT>
+inline void gemm_t(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+                   const IN* A, int lda, const IN* B, int ldb, OUT* C, int ldc) {
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, cu_type<IN>(), lda, B, cu_type<IN>(), ldb,
+                 &beta, C, cu_type<OUT>(), ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
 // Y[M,out] = X[M,in] . W[in,out] (+ bias) via cuBLAS. cublasSgemm is column-major, so we
 // compute the column-major Y^T = W^T . X^T -- which, read back row-major, IS Y = X . W:
 //   cublasSgemm(N,N, out,M,in, a, W,out, X,in, b, Y,out). Bias (no epilogue in the legacy
@@ -720,6 +746,13 @@ inline void launch_linear(const float* dX, const float* dW, const float* dB, flo
         bias_add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, out);
     }
 }
+// act-typed linear: X(IN) . W(IN) -> Y(OUT), bias OUT. IN=act_t for bf16 GEMMs (W is the bf16
+// mirror); OUT chains bf16 or lands f32 at a residual boundary. No bias on the bf16 chain GEMMs.
+template <class IN, class OUT>
+inline void launch_linear_t(const IN* dX, const IN* dW, OUT* dY, int M, int in, int out) {
+    ensure_cublas();
+    gemm_t<IN, OUT>(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out);
+}
 inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T, int C) {
     const int block = 64;
     rmsnorm_kernel<<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, T, C);
@@ -735,6 +768,32 @@ inline void launch_gelu(const float* dX, float* dY, int n) {
 inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     const int block = 256;
     add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
+}
+// act-typed FFN launchers (bf16 storage): rmsnorm f32->act, bias-add on act, gelu/gelu-bwd act.
+template <class X, class Y>
+inline void launch_rmsnorm_train_t(const X* dX, const float* dG, Y* dY, float* dRinv, int T, int C) {
+    const int block = 64;
+    rmsnorm_train_act_kernel<X, Y><<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, dRinv, T, C);
+}
+template <class A>
+__global__ void bias_add_act_kernel(A* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M * N) st_act(&Y[i], to_f32(Y[i]) + bias[i % N]);
+}
+template <class A> inline void launch_bias_act(A* dY, const float* dB, int M, int N) {
+    const int n = M * N, block = 256;
+    bias_add_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, N);
+}
+template <class A> inline void launch_gelu_t(const A* dX, A* dY, int n) {
+    const int block = 256; gelu_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dX, dY, n);
+}
+template <class A>
+__global__ void gelu_backward_act_kernel(const A* __restrict__ x, const A* __restrict__ dy, A* __restrict__ dx, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) st_act(&dx[i], to_f32(dy[i]) * dev_dgelu(to_f32(x[i])));
+}
+template <class A> inline void launch_gelu_bwd_t(const A* x, const A* dy, A* dx, int n) {
+    const int block = 256; gelu_backward_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(x, dy, dx, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
                         int batch, int T, int C, int H, int in_stride) {
@@ -775,6 +834,13 @@ inline void launch_linear_bwd(const float* dX_in, const float* dW_in, const floa
         const int block = 128;
         bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out);
     }
+}
+// act-typed linear backward: bf16 inputs/grads, dW lands F32 in the grad blob, dbias optional F32.
+template <class IN, class DX>
+inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
+                                DX* dX, float* dW, int M, int in, int out) {
+    if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in);   // dX=dY.W^T
+    gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW=X^T.dY
 }
 inline void launch_rmsnorm_bwd(const float* x, const float* gamma, const float* rinv,
                                const float* dy, float* dx, float* dgamma, int rows, int C) {
@@ -891,9 +957,9 @@ struct TrainScratch {
     // per-layer saved forward activations (residual h_* stay F32; transient scratch is act_t)
     float* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
     float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
-    act_t* a    = nullptr;         // [M,C] rmsnorm1 output scratch -- recomputed from h_in in backward (not per-layer)
-    act_t* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
-    act_t* att  = nullptr;         // [M,C] attention output scratch -- recomputed from qkv in backward (not per-layer)
+    float* a    = nullptr;         // [M,C] rmsnorm1 output scratch -- recomputed from h_in in backward (not per-layer)
+    float* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
+    float* att  = nullptr;         // [M,C] attention output scratch -- recomputed from qkv in backward (not per-layer)
     float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
     act_t* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
@@ -906,20 +972,24 @@ struct TrainScratch {
     float* logits  = nullptr;      // [M,V]
     // gradient temporaries (reused across layers); dh threads the residual stream in F32
     float* dh      = nullptr;      // [M,C] running residual-stream grad
-    act_t* da      = nullptr;      // [M,C]
-    act_t* dqkv    = nullptr;      // [M,3C]
-    act_t* datt    = nullptr;      // [M,C]
-    act_t* dfbuf   = nullptr;      // [M,C]
+    float* da      = nullptr;      // [M,C]
+    float* dqkv    = nullptr;      // [M,3C]
+    float* datt    = nullptr;      // [M,C]
+    float* dfbuf   = nullptr;      // [M,C]
     act_t* dff1    = nullptr;      // [M,F]
     act_t* dgact   = nullptr;      // [M,F]
     float* dlogits = nullptr;      // [M,V]
     float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
+    act_t* dh16    = nullptr;      // [M,C] bf16 cast of dh (FFN W2 backward operand)
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
     int*   dtargets = nullptr;     // [M] next-token targets for cross-entropy
     int*   lengths  = nullptr;     // [batch] per-window trained length (padding mask for short docs)
 };
 TrainScratch g_tr;
 int          g_tr_cap = 0;         // batch the training buffers are sized for
+// Per-layer bf16 weight mirrors for the FFN GEMMs (built from the F32 master on upload/step).
+act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
+act_t* g_w2_16[N_LAYERS] = {};     // [F,C]
 
 void train_free();                 // fwd: train_alloc frees the old buffers before a grow-realloc
 int train_alloc(int batch) {
@@ -937,9 +1007,9 @@ int train_alloc(int batch) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
     }
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a,      MC * sizeof(float)));   // single (checkpoint scratch)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf,   MC * sizeof(float)));   // single (checkpoint scratch)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(float)));   // single (checkpoint scratch)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(float)));   // single (checkpoint scratch)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf,   MC * sizeof(act_t)));  // single (checkpoint scratch, bf16)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(float)));  // single (checkpoint scratch)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att,    MC * sizeof(float)));   // single (checkpoint scratch)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(float)));
@@ -951,10 +1021,11 @@ int train_alloc(int batch) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.datt,    MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dfbuf,   MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(act_t)));
     g_tr.dlogits = g_tr.logits;                 // CE backward is in-place: dlogits overwrites logits [M,V]
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh16,    MC * sizeof(act_t)));   // bf16 cast of dh for FFN W2 bwd
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(batch) * sizeof(int)));
@@ -971,7 +1042,7 @@ void train_free() {
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
-    cudaFree(g_tr.dwqkv); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
+    cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
     g_tr = TrainScratch{};
     g_tr_cap = 0;
 }
@@ -1084,6 +1155,23 @@ void build_qkv_weights() {
         const float* Wv = g_dev_params + L[b0 + 4].off;
         build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l], C);
     }
+    if constexpr (ACT_DTYPE == Dtype::BF16) {            // refresh FFN bf16 weight mirrors
+        const int F = D_FF;
+        const int nce = C * F, gce = (nce + 255) / 256;
+        for (int l = 0; l < N_LAYERS; ++l) {
+            const int b0 = 2 + 10 * l;
+            if (!g_w1_16[l]) cudaMalloc(&g_w1_16[l], static_cast<size_t>(C) * F * sizeof(act_t));
+            if (!g_w2_16[l]) cudaMalloc(&g_w2_16[l], static_cast<size_t>(F) * C * sizeof(act_t));
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 6].off, g_w1_16[l], nce);
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 8].off, g_w2_16[l], nce);
+        }
+    } else {                                             // F32: mirrors alias the master weights (no copy)
+        for (int l = 0; l < N_LAYERS; ++l) {
+            const int b0 = 2 + 10 * l;
+            g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 6].off);
+            g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 8].off);
+        }
+    }
 }
 
 // ============================================================================
@@ -1141,10 +1229,12 @@ void forward_train(int batch, int T) {
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
         launch_linear(g_tr.att, Wo, nullptr, hmid, M, C, C);                         // hmid = proj
         launch_add(hin, hmid, hmid, MC);                                            // hmid = hin + proj
-        launch_rmsnorm_train(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);            // f = rmsnorm(hmid,ln2)
-        launch_linear(g_tr.fbuf, W1, b1, g_tr.ff1, M, C, F);                        // ff1 = f.W1 + b1
-        launch_gelu(g_tr.ff1, g_tr.gact, MF);                                       // gelu
-        launch_linear(g_tr.gact, W2, b2, next, M, F, C);                            // next = ff2 = gelu.W2 + b2
+        launch_rmsnorm_train_t<float, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);   // fbuf bf16
+        launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
+        launch_bias_act(g_tr.ff1, b1, M, F);                                       // ff1 = f.W1 + b1
+        launch_gelu_t(g_tr.ff1, g_tr.gact, MF);                                     // gelu
+        launch_linear_t<act_t, float>(g_tr.gact, g_w2_16[l], next, M, F, C);        // next = ff2
+        { const int n2 = M * C, bk = 256; bias_add_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(next, b2, M, C); }
         launch_add(hmid, next, next, MC);                                           // next = hmid + ff2
     }
     launch_rmsnorm_train(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);      // a_final = rmsnorm(h,ln_f)
@@ -1186,15 +1276,17 @@ void backward_device(int batch, int T, const int* d_lengths) {
         const int b0 = 2 + 10 * l;
         const float* W1 = pb + L[b0 + 6].off, *b1 = pb + L[b0 + 7].off;
         // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then ff1/gact, before use
-        launch_rmsnorm_train(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M, C);
-        launch_linear(g_tr.fbuf, W1, b1, g_tr.ff1, M, C, F);                        // ff1 = f.W1 + b1
-        launch_gelu(g_tr.ff1, g_tr.gact, MF);                                       // gelu
-        // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact)
-        launch_linear_bwd(g_tr.gact, pb + L[b0 + 8].off, g_tr.dh, g_tr.dgact,
-                          gb + L[b0 + 8].off, gb + L[b0 + 9].off, M, F, C);
-        launch_gelu_bwd(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                       // dff1
-        launch_linear_bwd(g_tr.fbuf, pb + L[b0 + 6].off, g_tr.dff1, g_tr.dfbuf,
-                          gb + L[b0 + 6].off, gb + L[b0 + 7].off, M, C, F);          // W1 backward
+        launch_rmsnorm_train_t<float, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M, C);
+        launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
+        launch_bias_act(g_tr.ff1, b1, M, F);
+        launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
+        // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact); dh->bf16
+        { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
+        launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + 8].off, M, F, C);
+        { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + 9].off, M, C); }
+        launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
+        launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + 6].off, M, C, F);
+        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M, F); }
         launch_rmsnorm_bwd(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + 1].off, M, C);                       // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att)
@@ -1696,7 +1788,7 @@ static constexpr sub0::memplan::Dims kFootprintDims{
 SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
-    return sub0::memplan::train_resident_mb(kFootprintDims, batch);
+    return sub0::memplan::train_resident_mb(kFootprintDims, batch, sizeof(act_t));
 }
 
 // Self-validating footprint probe: allocate the FULL resident training set for `batch` on a clean
@@ -1717,7 +1809,7 @@ SUB0_CUDA_API int sub0_cuda_train_footprint(int batch, double* predicted_mb, dou
     std::size_t free_after = 0;
     if (cudaMemGetInfo(&free_after, &total) != cudaSuccess) return 1;
     const double actual = free_before > free_after ? static_cast<double>(free_before - free_after) : 0.0;
-    const double predicted = static_cast<double>(sub0::memplan::train_resident_bytes(kFootprintDims, batch));
+    const double predicted = static_cast<double>(sub0::memplan::train_resident_bytes(kFootprintDims, batch, sizeof(act_t)));
     constexpr double MiB = 1024.0 * 1024.0;
     if (predicted_mb) *predicted_mb = predicted / MiB;
     if (actual_mb)    *actual_mb    = actual / MiB;

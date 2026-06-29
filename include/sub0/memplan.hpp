@@ -77,7 +77,7 @@ constexpr u64 fwd_scratch_bytes(const Dims& d, int batch) {
 }
 
 // Resident training scratch (train_alloc), grown to `batch`. One term per cudaMalloc in train_alloc.
-constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
+constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);
     const u64 Mm = u64(batch) * T;
@@ -86,13 +86,15 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
     const u64 final_blk = 2 * Mm * C * FLOAT    // h_final, a_final  [M,C]
                         + Mm * FLOAT            // rinv_f  [M]
                         + Mm * V * FLOAT        // logits  [M,V]
-                        + 2 * Mm * C * FLOAT    // a, fbuf  [M,C] single checkpoint scratch (recomputed in bwd)
-                        + 2 * Mm * F * FLOAT    // ff1, gact  [M,F] single checkpoint scratch (recomputed in bwd)
+                        + Mm * C * FLOAT        // a [M,C] single checkpoint scratch
+                        + Mm * C * A            // fbuf [M,C] bf16 FFN checkpoint scratch
+                        + 2 * Mm * F * A        // ff1, gact  [M,F] bf16 FFN scratch
                         + Mm * 3 * C * FLOAT    // qkv [M,3C] single checkpoint scratch (recomputed in bwd)
                         + Mm * C * FLOAT;       // att [M,C] single checkpoint scratch (recomputed in bwd)
-    const u64 grad      = 4 * Mm * C * FLOAT    // dh, da, datt, dfbuf  [M,C]
+    const u64 grad      = 3 * Mm * C * FLOAT    // dh, da, datt  [M,C]
+                        + Mm * C * (FLOAT + A)  // dfbuf [M,C] f32 + dh16 [M,C] bf16
                         + Mm * 3 * C * FLOAT    // dqkv  [M,3C]
-                        + 2 * Mm * F * FLOAT    // dff1, dgact  [M,F]
+                        + 2 * Mm * F * A        // dff1, dgact  [M,F] bf16
                         + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]
                         + u64(batch) * INT      // lengths   [batch] (per-window padding mask)
@@ -108,14 +110,14 @@ constexpr u64 fwd_dids_bytes(const Dims& d, int batch) {
 
 // Total resident device bytes for one training step at `batch` (persistent + dids + train scratch).
 // fwd_scratch_bytes is the inference-only path; training carries just dids, not the full forward set.
-constexpr u64 train_resident_bytes(const Dims& d, int batch) {
-    return persistent_bytes(d) + fwd_dids_bytes(d, batch) + train_scratch_bytes(d, batch);
+constexpr u64 train_resident_bytes(const Dims& d, int batch, u64 A = FLOAT) {
+    return persistent_bytes(d) + fwd_dids_bytes(d, batch) + train_scratch_bytes(d, batch, A);
 }
 
 // Footprint in whole MiB, rounded UP -- the same unit GPU_VRAM_MB (from nvidia-smi) is expressed in,
 // so a `predicted_mb > GPU_VRAM_MB` comparison is apples-to-apples.
-constexpr int train_resident_mb(const Dims& d, int batch) {
-    const u64 b = train_resident_bytes(d, batch);
+constexpr int train_resident_mb(const Dims& d, int batch, u64 A = FLOAT) {
+    const u64 b = train_resident_bytes(d, batch, A);
     return int((b + (u64(1) << 20) - 1) >> 20);
 }
 
