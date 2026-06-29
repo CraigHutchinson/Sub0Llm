@@ -189,17 +189,36 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
                 const LearnOptions& opts) {
     Tokenizer t;
 
-    // Fix the base alphabet: distinct byte values used (in byte order) then the
-    // markers. BPE tie-breaking is by (count, pair) on these byte-derived ids, so the
-    // merge sequence is deterministic and order-independent of the scan.
+    // Fix the base alphabet. BPE tie-breaking is by (count, pair) on these byte-derived
+    // ids, so the merge sequence is deterministic and order-independent of the scan.
     t.byte_base.fill(-1);
-    for (int b = 0; b < 256; ++b)
-        if (scan.byte_used[static_cast<std::size_t>(b)]) {
-            t.byte_base[static_cast<std::size_t>(b)] = static_cast<int>(t.base_symbol.size());
-            t.base_symbol.push_back(b);
-        }
-    if (scan.used_cap) { t.cap_id = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_CAP); }
-    if (scan.used_up)  { t.up_id  = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_UP); }
+    auto add_marker = [&](int code) {                 // append a marker, return its base id
+        const int id = static_cast<int>(t.base_symbol.size());
+        t.base_symbol.push_back(code);
+        return id;
+    };
+    if (opts.join_scheme) {
+        // JOIN scheme: the COMPLETE 256-byte alphabet (a total tokenizer -- any byte is
+        // encodable, no silent drop of out-of-corpus characters) followed by the markers,
+        // ALWAYS present so the base alphabet is corpus-independent and the ids are stable.
+        for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
+        t.cap_id     = add_marker(TOK_CAP);
+        t.up_id      = add_marker(TOK_UP);
+        t.join_id    = add_marker(TOK_JOIN);
+        t.newline_id = add_marker(TOK_NEWLINE);
+        t.para_id    = add_marker(TOK_PARA);
+        t.join_scheme = true;
+    } else {
+        // Legacy scheme: only the byte values the corpus actually used (in byte order) then
+        // the markers that were actually emitted -- a compact, corpus-derived alphabet.
+        for (int b = 0; b < 256; ++b)
+            if (scan.byte_used[static_cast<std::size_t>(b)]) {
+                t.byte_base[static_cast<std::size_t>(b)] = static_cast<int>(t.base_symbol.size());
+                t.base_symbol.push_back(b);
+            }
+        if (scan.used_cap) { t.cap_id = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_CAP); }
+        if (scan.used_up)  { t.up_id  = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_UP); }
+    }
     t.n_base = static_cast<int>(t.base_symbol.size());
 
     // Remap the word table from raw byte symbols to base ids (a bijection on used
@@ -311,6 +330,105 @@ Tokenizer learn(std::string_view corpus, const LearnOptions& opts) {
 //  encode / detokenize
 // ============================================================================
 
+namespace {
+
+// True iff `s` is a whitespace BYTE (not a marker). The JOIN encoder classifies the
+// whitespace run between content tokens; the decoder emits such bytes verbatim.
+inline bool is_ws_byte(int s) { return s == ' ' || s == '\t' || s == '\n' || s == '\r'; }
+
+// JOIN-scheme encode. `stream` is the truecased byte+marker stream. A single inter-content
+// space is implicit (no token); JOIN suppresses the implicit space (glued punctuation, and
+// the splits inside a multi-token word); NEWLINE/PARA encode the common newline runs; any
+// other whitespace is emitted verbatim as literal byte tokens (lossless, rare in prose).
+// See docs/TOKENIZER_DESIGN.md §2,§4,§5.
+void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector<int>& out) {
+    const std::size_t n = stream.size();
+    bool prev_content = false;
+    std::vector<int> seq, sub;
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t g = i;
+        while (g < n && is_ws_byte(stream[g])) ++g;     // whitespace gap [i, g)
+        const std::size_t gap = g - i;
+        const bool content_after = (g < n);
+        if (gap > 0) {
+            const bool inter = prev_content && content_after;
+            if (inter && gap == 1 && stream[i] == ' ') {
+                // implicit single inter-content space -- emit nothing (the common case, free)
+            } else if (gap == 1 && stream[i] == '\n') {
+                out.push_back(t.newline_id);
+            } else if (gap == 2 && stream[i] == '\n' && stream[i + 1] == '\n') {
+                out.push_back(t.para_id);
+            } else {                                    // verbatim: leading/trailing/multi/tab/CR runs
+                for (std::size_t k = i; k < g; ++k) out.push_back(t.byte_base[static_cast<std::size_t>(stream[k])]);
+            }
+        } else if (prev_content && content_after) {
+            out.push_back(t.join_id);                   // adjacent content with no space -> glue
+        }
+        i = g;
+        if (i >= n) break;
+        // Content item: any case markers, then a word unit (BPE + intra-word JOINs) or one byte.
+        while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
+            out.push_back(stream[i] == TOK_CAP ? t.cap_id : t.up_id);
+            ++i;
+        }
+        if (i >= n) break;
+        const std::size_t end = word_unit_end(stream, i);
+        if (end == i) {                                 // a standalone byte (punctuation, digit, ...)
+            out.push_back(t.byte_base[static_cast<std::size_t>(stream[i])]);
+            ++i;
+        } else {
+            seq.assign(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                       stream.begin() + static_cast<std::ptrdiff_t>(end));
+            for (int& s : seq) s = t.byte_base[static_cast<std::size_t>(s)];
+            sub.clear();
+            bpe_encode_word(t, seq, sub);
+            for (std::size_t k = 0; k < sub.size(); ++k) {
+                if (k > 0) out.push_back(t.join_id);    // intra-word: no implicit space between sub-tokens
+                out.push_back(sub[k]);
+            }
+            i = end;
+        }
+        prev_content = true;
+    }
+}
+
+// JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space
+// between content tokens, cleared by JOIN; whitespace/markers emit their literal spacing;
+// case markers re-case the upcoming word (CAP = first letter, UP = whole word across its
+// JOINed sub-tokens). detokenize_join(encode_join(x)) == normalize_text(x) by construction.
+std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
+    std::string out;
+    bool pending_space = false;
+    int  case_mode = 0;     // 0 none, 1 cap-first-letter, 2 upper-whole-word
+    const std::size_t m = ids.size();
+    for (std::size_t k = 0; k < m; ++k) {
+        const int id = ids[k];
+        if (id == t.join_id)    { pending_space = false; continue; }
+        if (id == t.newline_id) { out += '\n';   pending_space = false; case_mode = 0; continue; }
+        if (id == t.para_id)    { out += "\n\n"; pending_space = false; case_mode = 0; continue; }
+        if (id == t.cap_id)     { case_mode = 1; continue; }
+        if (id == t.up_id)      { case_mode = 2; continue; }
+        if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
+            out += static_cast<char>(id); pending_space = false; case_mode = 0; continue;
+        }
+        if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
+        if (pending_space) out += ' ';
+        for (int code : t.expansion[static_cast<std::size_t>(id)]) {
+            const unsigned char c = static_cast<unsigned char>(code);
+            if (case_mode == 1 && is_alpha(c))      { out += static_cast<char>(to_upper(c)); case_mode = 0; }
+            else if (case_mode == 2 && is_alpha(c)) { out += static_cast<char>(to_upper(c)); }
+            else                                    { out += static_cast<char>(c); }
+        }
+        pending_space = true;
+        // UP applies to the whole word; keep it across the word's JOINed sub-tokens, reset at end.
+        if (case_mode == 2 && !(k + 1 < m && ids[k + 1] == t.join_id)) case_mode = 0;
+    }
+    return out;
+}
+
+}  // namespace
+
 std::vector<int> encode(const Tokenizer& t, const std::string& text) {
     std::vector<int> out;
     if (!t.loaded) return out;
@@ -319,6 +437,7 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
     const std::vector<int> stream = truecase_tokenize(norm, t.attested, nullptr);
 
     out.reserve(stream.size());
+    if (t.join_scheme) { encode_join(t, stream, out); return out; }
     for (std::size_t i = 0, n = stream.size(); i < n;) {
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {
@@ -339,6 +458,7 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
 }
 
 std::string detokenize(const Tokenizer& t, const std::vector<int>& ids) {
+    if (t.join_scheme) return detokenize_join(t, ids);
     std::vector<int> stream;
     for (int id : ids) {
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;
@@ -387,9 +507,12 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         const int code = static_cast<int>(ru16());
         t.base_symbol[static_cast<std::size_t>(i)] = code;
         t.expansion[static_cast<std::size_t>(i)] = {code};
-        if (code == TOK_CAP)      t.cap_id = i;
-        else if (code == TOK_UP)  t.up_id  = i;
-        else                      t.byte_base[static_cast<unsigned char>(code)] = i;
+        if      (code == TOK_CAP)     t.cap_id = i;
+        else if (code == TOK_UP)      t.up_id  = i;
+        else if (code == TOK_JOIN)    { t.join_id    = i; t.join_scheme = true; }  // join scheme detected
+        else if (code == TOK_NEWLINE) t.newline_id = i;
+        else if (code == TOK_PARA)    t.para_id    = i;
+        else                          t.byte_base[static_cast<unsigned char>(code)] = i;
     }
     const int n_merges = static_cast<int>(ru32());
     t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));

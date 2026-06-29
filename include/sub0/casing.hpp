@@ -23,6 +23,13 @@ namespace sub0::casing {
 constexpr int TOK_CAP = 256;  // next word: capitalize first letter  (<|cap|>)
 constexpr int TOK_UP  = 257;  // next word: upper-case the whole word (<|up|>)
 
+// JOIN-scheme spacing markers (symbol codes above the byte + case-marker range). The
+// implicit-space tokenizer makes a single inter-token space free; these specialise the
+// rest (see docs/TOKENIZER_DESIGN.md). Only minted when the join scheme is enabled.
+constexpr int TOK_JOIN    = 258;  // suppress the implicit inter-token space (glue / intra-word)
+constexpr int TOK_NEWLINE = 259;  // a single '\n'
+constexpr int TOK_PARA    = 260;  // a paragraph break "\n\n"
+
 inline bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 inline bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
 inline bool          is_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }

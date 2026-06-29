@@ -97,6 +97,11 @@ struct Tokenizer {
     int                  n_base = 0;   // base alphabet size
     std::array<int, 256> byte_base{};  // byte value -> base id (-1 if unused)
     int                  cap_id = -1, up_id = -1;  // base ids of the case markers
+    // JOIN scheme (implicit-space tokenizer). When set, the base alphabet is the complete
+    // 256 bytes + the markers, and encode/detokenize use the spacing FSM instead of
+    // space-as-byte. Detected on load from the presence of TOK_JOIN in the base alphabet.
+    bool                 join_scheme = false;
+    int                  join_id = -1, newline_id = -1, para_id = -1;
     std::vector<int>     base_symbol;              // base id -> symbol code (0..255, 256 cap, 257 up)
     std::vector<std::pair<int, int>> merges;       // ordered learned merges (left,right)
     std::unordered_map<std::pair<int, int>, int, PairHash> merge_rank;  // (l,r) -> merge index
@@ -111,8 +116,9 @@ struct Tokenizer {
 };
 
 struct LearnOptions {
-    int vocab_target = 2048;  // target vocabulary size (base symbols + markers + merges)
-    int min_merge    = 2;     // stop merging once the best pair occurs fewer than this many times
+    int  vocab_target = 2048;  // target vocabulary size (base symbols + markers + merges)
+    int  min_merge    = 2;     // stop merging once the best pair occurs fewer than this many times
+    bool join_scheme  = false; // JOIN/implicit-space scheme: complete 256-byte base + spacing markers
 };
 
 // Learn the base alphabet + BPE merges from a completed scan and the derived attested
