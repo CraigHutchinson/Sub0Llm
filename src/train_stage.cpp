@@ -1695,9 +1695,13 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
 
     int v_d = 0, v_l = 0, v_h = 0, v_seq = 0, v_vocab = 0;
     std::string r_d, r_l, r_h, r_seq, r_vocab;
-    if (head_dim < 32)       { v_h = 3; r_h = std::format("head_dim {} < 32: raise d_model or lower n_heads (target 64)", head_dim); }
-    else if (head_dim < 48)  { v_h = 2; r_h = std::format("head_dim {} below the usual 64; prefer raising d_model", head_dim); }
-    else if (head_dim < 64)  { v_h = 1; r_h = std::format("head_dim {} just below 64", head_dim); }
+    // Head guidance: prefer RAISING d_model (keeping the head count) over lowering n_heads. Measured
+    // on tinystories: dropping 4 heads -> 2 to reach head_dim 64 (d128 H2) converged WORSE (val 2.44)
+    // than the smaller 4-head d96 (1.985); widening to 4x40 (d160 H4) won outright (1.461). Head count
+    // matters more than head_dim here, so do NOT trade heads away for head_dim.
+    if (head_dim < 32)       { v_h = 3; r_h = std::format("head_dim {} < 32: raise d_model, KEEP heads (dropping heads to widen head_dim measured worse)", head_dim); }
+    else if (head_dim < 48)  { v_h = 2; r_h = std::format("head_dim {} < 48: raise d_model (keep heads)", head_dim); }
+    else if (head_dim < 64)  { v_h = 1; r_h = std::format("head_dim {} just below 64 (fine; raise d_model if growing)", head_dim); }
     else if (head_dim > 160) { v_h = 1; r_h = std::format("head_dim {} large; more heads would add expressiveness", head_dim); }
     else                     { r_h = std::format("head_dim {} in the healthy 64-128 range", head_dim); }
     if (grow)                { v_d = head_dim < 64 ? 3 : 2; r_d = "capacity-bound: widen the residual stream (primary lever)"; }
@@ -1723,31 +1727,31 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     // Concrete next-size suggestion when growing. Two grow drivers need different targets:
     //   * data-rich (tokens/param > 40): Chinchilla says size UP to ~train_tokens/20 params;
     //   * quality-bound (poor bits/byte at sane tokens/param): spend more capacity than now.
-    // Use the LARGER of the two so a "grow" never suggests fewer params than the current model
-    // (the old train_tokens/20-only target could undercut the current size and contradict the
-    // "MUST widen" verdict). Search head_dim-64 widths STARTING ABOVE the current d_model, and keep
-    // depth >= current (width is the primary lever; don't cut layers just to hit an aspect target).
+    // Use the LARGER of the two so a "grow" never suggests fewer params than the current model.
+    // Strategy: KEEP the current head count (it is the proven knob -- see the head guidance above)
+    // and widen d_model, which raises head_dim naturally. Search widths that are a multiple of
+    // n_heads (so head_dim is integral) starting above the current d_model, depth >= current.
     if (grow && train_tokens > 0) {
         const long long chinchilla = train_tokens / 20;
         const long long target_p   = std::max<long long>(chinchilla, static_cast<long long>(params * 1.8));
-        const int       C_start    = ((D_MODEL / 64) + 1) * 64;                     // next head_dim-64 width up
-        long long best_p = 0; int best_C = C_start, best_L = N_LAYERS, best_H = C_start / 64;
-        for (int C = C_start; C <= 1024; C += 64) {
-            const int H = C / 64;                                                   // head_dim = 64
+        const int       step       = std::max(N_HEADS, 16);                         // keep C a head multiple
+        const int       C_start    = ((D_MODEL / step) + 1) * step;                 // next multiple up
+        long long best_p = 0; int best_C = C_start, best_L = N_LAYERS;
+        for (int C = C_start; C <= 2048; C += step) {
             const int L = std::clamp(std::max(N_LAYERS, static_cast<int>(std::lround(C / 40.0))), 2, 24);
             const long long p = static_cast<long long>(
-                sub0::memplan::param_floats({C, L, H, 4 * C, SEQ_LEN, VOCAB}));
+                sub0::memplan::param_floats({C, L, N_HEADS, 4 * C, SEQ_LEN, VOCAB}));
             if (best_p == 0 || std::llabs(p - target_p) < std::llabs(best_p - target_p)) {
-                best_p = p; best_C = C; best_L = L; best_H = H;
+                best_p = p; best_C = C; best_L = L;
             }
         }
         emit("");
         emit("suggested next size (target ~{:.1f}M params; max of Chinchilla {:.1f}M and 1.8x current):",
                      target_p / 1e6, chinchilla / 1e6);
         emit("  cmake --preset native -DSUB0_D_MODEL={} -DSUB0_N_LAYERS={} -DSUB0_N_HEADS={}",
-                     best_C, best_L, best_H);
-        emit("  -> d{} L{} H{} (head_dim 64, aspect {:.0f}) ~= {:.2f}M params; then `sub0llm train`",
-                     best_C, best_L, best_H, static_cast<double>(best_C) / best_L, best_p / 1e6);
+                     best_C, best_L, N_HEADS);
+        emit("  -> d{} L{} H{} (head_dim {}, aspect {:.0f}) ~= {:.2f}M params; then `sub0llm train`",
+                     best_C, best_L, N_HEADS, best_C / N_HEADS, static_cast<double>(best_C) / best_L, best_p / 1e6);
     }
 
     // Persist the report next to the model so each trained version keeps its own metrics + samples
