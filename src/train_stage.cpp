@@ -106,8 +106,8 @@ constexpr double EVAL_INTERVAL_EPOCHS = 0.10; // eval/checkpoint cadence
 constexpr double TICK_SECONDS        = 180.0;  // heartbeat: interim progress line between evals
 constexpr int    EVAL_WINDOWS_MAX    = 128;   // bounded cost per eval
 constexpr int    MAX_EPOCHS_BACKSTOP = 30;    // ceiling if no plateau is detected
-constexpr int    PLATEAU_WINDOW      = 6;     // deltas inspected by the sign test
-constexpr int    PLATEAU_MIN_IMPROVE = 4;     // >= this many decreasing -> keep going
+constexpr int    PLATEAU_WINDOW      = 6;     // evals fitted by the least-squares trend test
+constexpr double PLATEAU_MIN_REL     = 0.02;  // stop when the best-fit drop over the window < 2%
 
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context
@@ -287,17 +287,13 @@ double mean_entropy(std::span<const int> data, std::size_t val_start) {
 
 using sub0::coherence::ngram_repeat;   // pure n-gram repeat metric (see coherence.hpp)
 
-// Plateau as a sign test: among the last PLATEAU_WINDOW eval-to-eval deltas, count
-// how many decreased. Still trending down if at least PLATEAU_MIN_IMPROVE did;
-// otherwise the series is bouncing around a floor -> stop. Comparing only signs
-// (not magnitudes) avoids a noise-sensitive improvement threshold.
+// Plateau via the pure least-squares trend test (coherence::trend_plateaued): fit a line to the last
+// PLATEAU_WINDOW+1 evals and stop only when that best-fit gradient implies the series is still
+// shedding less than PLATEAU_MIN_REL of the current level across the window. The fitted gradient is
+// representative of the real downward trend and shrugs off the per-eval noise that tripped the old
+// sign test (which false-stopped a strongly-but-noisily descending run -- see coherence_tests).
 bool plateaued(const std::vector<double>& evals) {
-    if (static_cast<int>(evals.size()) < PLATEAU_WINDOW + 1) return false;
-    const std::size_t n = evals.size();
-    int improving = 0;
-    for (int k = 0; k < PLATEAU_WINDOW; ++k)
-        if (evals[n - 1 - k] < evals[n - 2 - k]) ++improving;
-    return improving < PLATEAU_MIN_IMPROVE;
+    return sub0::coherence::trend_plateaued(evals, PLATEAU_WINDOW, PLATEAU_MIN_REL);
 }
 
 // --- Checkpoint (full optimizer + loop state, for exact resume) -------------

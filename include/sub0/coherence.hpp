@@ -66,4 +66,30 @@ inline Crossing interp_cross(const std::vector<float>& temp, const std::vector<d
     return (target > y.front()) ? Crossing{temp.front(), false} : Crossing{temp.back(), false};
 }
 
+// Plateau detector for a (noisily) decreasing validation series -- e.g. val NELBO sampled every few
+// steps. Fits a least-squares line to the LAST `window`+1 points and asks how much that BEST-FIT
+// trend implies the series fell ACROSS the window, relative to the current level. Using the fitted
+// gradient -- not endpoint differences or a sign count -- is the robust choice: a few upward blips on
+// a strongly descending curve barely move the regression line, so a genuinely-improving run is not
+// stopped early (the failure the sign test had); a series truly bouncing around a floor has ~zero
+// slope and IS stopped. Returns true (plateaued) when the fitted relative drop over the window is
+// below `min_rel`. Needs `window`+1 samples; returns false until then (keep training). `min_rel` is
+// a fraction (e.g. 0.02 = the fit must still be shedding >=2% of the current level per window).
+inline bool trend_plateaued(const std::vector<double>& series, int window, double min_rel) {
+    const int m = window + 1;
+    if (window < 1 || static_cast<int>(series.size()) < m) return false;
+    const std::size_t n = series.size();
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int i = 0; i < m; ++i) {
+        const double x = i;                          // eval index within the window (0..window)
+        const double y = series[n - m + i];
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    const double denom = m * sxx - sx * sx;
+    const double slope = denom != 0.0 ? (m * sxy - sx * sy) / denom : 0.0;   // per-eval change (<0 = improving)
+    const double level = series[n - 1];
+    const double rel_trend = level > 0.0 ? (-slope * window) / level : 0.0;  // fitted drop over window (>0 = improving)
+    return rel_trend < min_rel;
+}
+
 }  // namespace sub0::coherence
