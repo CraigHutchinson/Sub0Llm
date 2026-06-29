@@ -415,6 +415,47 @@ __global__ void rope_backward_kernel(float* __restrict__ dqkv, int batch, int T,
 //  Backward kernels (Phase 2d) -- mirror src/backend_cpu.cpp backward_node()
 // ============================================================================
 
+// act-typed attention forward (flash, P-free) -- q/k/v/out in the store type, FP32 softmax.
+template <class A>
+__global__ void attn_train_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
+                                       const A* __restrict__ v, A* __restrict__ out,
+                                       int batch, int T, int C, int H, int in_stride) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x; const int per = H * T;
+    const int b = idx / per; if (b >= batch) return;
+    const int rem = idx - b * per, h = rem / T, i = rem % T, d = C / H, off = h * d;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
+    const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+    float m = -1e30f, Z = 0.f, acc[128] = {};
+    for (int j = 0; j <= i; ++j) {
+        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
+        const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn); Z = Z * c + e;
+        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * to_f32(vj[a]); m = mn;
+    }
+    A* oi = out + out_base + static_cast<size_t>(i) * C + off; const float invZ = 1.f / Z;
+    for (int a = 0; a < d; ++a) st_act(&oi[a], acc[a] * invZ);
+}
+template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, int C, int H, int in_stride, float theta) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= batch * T || pg >= C / 2) return;
+    const int d = C / H, half = d / 2, h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
+    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
+    A* row = qkv + static_cast<size_t>(m) * in_stride;
+    const float q0 = to_f32(row[a0]), q1 = to_f32(row[a0 + 1]); st_act(&row[a0], q0*cs-q1*sn); st_act(&row[a0+1], q0*sn+q1*cs);
+    const float k0 = to_f32(row[C+a0]), k1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], k0*cs-k1*sn); st_act(&row[C+a0+1], k0*sn+k1*cs);
+}
+template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, int C, int H, int in_stride, float theta) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= batch * T || pg >= C / 2) return;
+    const int d = C / H, half = d / 2, h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
+    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
+    A* row = dq + static_cast<size_t>(m) * in_stride;
+    const float g0 = to_f32(row[a0]), g1 = to_f32(row[a0+1]); st_act(&row[a0], g0*cs+g1*sn); st_act(&row[a0+1], -g0*sn+g1*cs);
+    const float h0 = to_f32(row[C+a0]), h1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], h0*cs+h1*sn); st_act(&row[C+a0+1], -h0*sn+h1*cs);
+}
+
 // Cross-entropy backward (op_cross_entropy): one thread per row m over [M,V]. Row m belongs to
 // window b = m/T at position t = m%T. Positions t >= lengths[b] are PADDING (a short document
 // padded up to T): they get zero gradient and add no loss. Each trained row is weighted 1/(batch*
@@ -990,6 +1031,8 @@ int          g_tr_cap = 0;         // batch the training buffers are sized for
 // Per-layer bf16 weight mirrors for the FFN GEMMs (built from the F32 master on upload/step).
 act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
 act_t* g_w2_16[N_LAYERS] = {};     // [F,C]
+act_t* g_wo16[N_LAYERS]  = {};     // [C,C] attention output proj mirror
+act_t* g_wqkv16[N_LAYERS] = {};    // [C,3C] fused QKV mirror (bf16 acts) / alias under f32
 
 void train_free();                 // fwd: train_alloc frees the old buffers before a grow-realloc
 int train_alloc(int batch) {
@@ -1162,14 +1205,22 @@ void build_qkv_weights() {
             const int b0 = 2 + 10 * l;
             if (!g_w1_16[l]) cudaMalloc(&g_w1_16[l], static_cast<size_t>(C) * F * sizeof(act_t));
             if (!g_w2_16[l]) cudaMalloc(&g_w2_16[l], static_cast<size_t>(F) * C * sizeof(act_t));
+            if (!g_wo16[l])  cudaMalloc(&g_wo16[l],  static_cast<size_t>(C) * C * sizeof(act_t));
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 6].off, g_w1_16[l], nce);
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 8].off, g_w2_16[l], nce);
+            { const int ncc = C * C, gcc = (ncc + 255) / 256;
+              f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + 5].off, g_wo16[l], ncc); }
+            { const int n3 = C * 3 * C, g3 = (n3 + 255) / 256;
+              if (!g_wqkv16[l]) cudaMalloc(&g_wqkv16[l], static_cast<size_t>(C) * 3 * C * sizeof(act_t));
+              f32_to_act_kernel<<<g3, 256, 0, g_stream>>>(g_fwd.wqkv[l], g_wqkv16[l], n3); }
         }
     } else {                                             // F32: mirrors alias the master weights (no copy)
         for (int l = 0; l < N_LAYERS; ++l) {
             const int b0 = 2 + 10 * l;
             g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 6].off);
             g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 8].off);
+            g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 5].off);
+            g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
         }
     }
 }
