@@ -831,8 +831,8 @@ struct TrainScratch {
     // per-layer saved forward activations
     float* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
     float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
-    float* a    [N_LAYERS] = {};   // [M,C] rmsnorm1 output (= qkv input)
-    float* qkv  [N_LAYERS] = {};   // [M,3C] fused q|k|v (= attn input)
+    float* a    [N_LAYERS] = {};   // [M,C] rmsnorm1 output (= qkv input; checkpoint for qkv recompute)
+    float* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
     float* att  [N_LAYERS] = {};   // [M,C] attention output (= Wo input)
     float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
@@ -868,11 +868,15 @@ int train_alloc(int batch) {
     ensure_stream();
     const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
+    // TODO(mem): att[l] is still saved per layer ([M,C]*L). It is recomputable from a[l] via a full
+    // attention forward (qkv is already checkpointed), so checkpointing it too would drop another
+    // per-layer [M,C] -- bigger batches at the cost of one extra flash-attn pass per layer in bwd.
+    // TODO(mem): F32 activations dominate train scratch; storing them BF16 (sm>=80) roughly halves
+    // per-layer/final buffers, the biggest remaining lever for larger batches.
     for (int l = 0; l < N_LAYERS; ++l) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[l],  MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv1[l], Mm * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a[l],     MC * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv[l],   Mm * 3 * D_MODEL * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att[l],   MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
@@ -880,6 +884,7 @@ int train_alloc(int batch) {
     }
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(float)));   // single (checkpoint scratch)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(float)));   // single (checkpoint scratch)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(float)));  // single (checkpoint scratch)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a_final, MC * sizeof(float)));
@@ -902,11 +907,11 @@ int train_alloc(int batch) {
 
 void train_free() {
     for (int l = 0; l < N_LAYERS; ++l) {
-        cudaFree(g_tr.h_in[l]);  cudaFree(g_tr.rinv1[l]); cudaFree(g_tr.a[l]);    cudaFree(g_tr.qkv[l]);
+        cudaFree(g_tr.h_in[l]);  cudaFree(g_tr.rinv1[l]); cudaFree(g_tr.a[l]);
         cudaFree(g_tr.att[l]);   cudaFree(g_tr.h_mid[l]); cudaFree(g_tr.rinv2[l]);
         cudaFree(g_tr.fbuf[l]);
     }
-    cudaFree(g_tr.ff1); cudaFree(g_tr.gact);
+    cudaFree(g_tr.ff1); cudaFree(g_tr.gact); cudaFree(g_tr.qkv);
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
@@ -1074,9 +1079,9 @@ void forward_train(int batch, int T) {
         float* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
         launch_rmsnorm_train(hin, ln1, g_tr.a[l], g_tr.rinv1[l], M, C);              // a = rmsnorm(hin,ln1)
-        launch_linear(g_tr.a[l], g_fwd.wqkv[l], nullptr, g_tr.qkv[l], M, C, 3 * C);  // fused qkv
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv[l], batch, T, C, H, 3 * C);
-        launch_attn_train(g_tr.qkv[l], g_tr.qkv[l] + C, g_tr.qkv[l] + 2 * C,
+        launch_linear(g_tr.a[l], g_fwd.wqkv[l], nullptr, g_tr.qkv, M, C, 3 * C);    // fused qkv
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv, batch, T, C, H, 3 * C);
+        launch_attn_train(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att[l], batch, T, C, H, 3 * C);                       // attention (P-free)
         launch_linear(g_tr.att[l], Wo, nullptr, hmid, M, C, C);                      // hmid = proj
         launch_add(hin, hmid, hmid, MC);                                            // hmid = hin + proj
@@ -1139,7 +1144,10 @@ void backward_device(int batch, int T, const int* d_lengths) {
         launch_linear_bwd(g_tr.att[l], pb + L[b0 + 5].off, g_tr.dh, g_tr.datt,
                           gb + L[b0 + 5].off, nullptr, M, C, C);
         SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dqkv, 0, static_cast<size_t>(M) * 3 * C * sizeof(float), g_stream));
-        launch_attn_bwd(g_tr.qkv[l], g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
+        // checkpoint: qkv was not saved -- recompute from the saved a[l] (+rope) for attn backward
+        launch_linear(g_tr.a[l], g_fwd.wqkv[l], nullptr, g_tr.qkv, M, C, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv, batch, T, C, H, 3 * C);
+        launch_attn_bwd(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd(g_tr.dqkv, batch, T, C, H, 3 * C);
@@ -1176,6 +1184,10 @@ int opt_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_grad,  n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_m,     n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_vel,   n * sizeof(float)));
+    // TODO(mem): g_dev_decay is a full float[PARAM_FLOATS] 0/1 mask (~param-size, batch-independent).
+    // A uint8 mask, a packed bitset, or deriving decay from PARAM_LAYOUT segment ids in the kernel
+    // would reclaim ~3/4 of it. Persistent (not per-batch), so a modest win -- but every MB freed is
+    // headroom for a larger training batch, which is the bigger lever.
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_decay, n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_normsq, sizeof(double)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_m,   0, n * sizeof(float)));
