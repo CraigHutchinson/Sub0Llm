@@ -40,6 +40,13 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
+// Precision wiring status: GEMM_DTYPE BF16 is live (cublasGemmEx 32F_FAST_16BF). BF16 activation
+// *storage* (ACT_DTYPE) needs every saved buffer + rmsnorm/gelu/attn/add templated on the element
+// type and bf16 weight copies; until that lands, the configurator keeps ACT_DTYPE F32 (AUTO) so
+// this stays a hard stop rather than a silent half-conversion. Lift it with the bf16 storage pass.
+static_assert(ACT_DTYPE == Dtype::F32,
+    "BF16 activation storage is not wired yet; build with -DSUB0_PRECISION_ACT=F32/AUTO (TODO(bf16-acts)).");
+
 namespace {
 
 // CUDA error check for the self-test: report file:line + the error string and bail out
