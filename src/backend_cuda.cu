@@ -1129,10 +1129,14 @@ void build_qkv_weights() {
 // variants of rmsnorm/attn (which also save rinv / the softmax weights P). Assumes g_fwd.dids is
 // populated, params uploaded and g_fwd.wqkv[] built. Eager (not graph-captured): the backward
 // reads these buffers, so the whole step runs as plain stream-ordered launches.
-// TODO(perf): once stable, CUDA-graph-capture the whole fwd+bwd+AdamW step (topology is static)
-// to collapse the ~200 launches -- the training-step analogue of the inference graph.
-// TODO(mem): the saved-activation scratch is ~1.5GB at MAX_FWD_BATCH; gradient checkpointing
-// (recompute a/qkv/att in backward) or FP16 activation storage would cut this sharply.
+// NOTE(perf): deliberately NOT graph-captured. The inference forward IS captured (capture_graph)
+// because gen is launch-bound; training is COMPUTE-bound (measured graph 1.00x at M=4096), so a
+// step graph buys nothing, and the AdamW step has a host-in-the-loop break that prevents single-
+// graph capture anyway (D2H grad-norm -> host clip scale + pow bias-correction). Revisit only if a
+// future device-side global-norm clip removes that sync AND a small-batch/launch-bound regime appears.
+// TODO(mem): saved-activation scratch dominates at large batch; a/qkv/att are already checkpointed
+// (recomputed in backward) and acts + residual stream are bf16, so batch 512 now fits 8GB. Further
+// cuts would need checkpointing the per-layer residual (h_in/h_mid) too, recomputed from the input.
 void forward_train(int batch, int T) {
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
