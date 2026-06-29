@@ -281,6 +281,7 @@ int main(int argc, char** argv) {
     int ternary      = 0;
     int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
     double rope_theta = 10000.0;// RoPE frequency base
+    int bf16         = 2;       // 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
     int vocab_target = 2048;
     int min_merge    = 2;
     int emit_tok     = 1;
@@ -306,6 +307,8 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--rope-theta", rope_theta, "RoPE frequency base (theta)")
        ->capture_default_str();
+    app.add_option("--bf16", bf16, "BF16 mixed precision: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)")
+       ->capture_default_str()->check(CLI::Range(0, 2));
     app.add_option("--vocab",  vocab_target, "Target BPE vocabulary size (base symbols + markers + merges)")
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
@@ -624,6 +627,17 @@ int main(int argc, char** argv) {
        << (pos_encoding == 0 ? "Absolute" : "Rope") << ";\n";
     os << "// ROPE_THETA: RoPE frequency base; angle(pos, pair m) = pos * THETA^(-2m/D_HEAD).\n";
     os << "constexpr float       ROPE_THETA   = " << std::format("{:.1f}", rope_theta) << "f;\n\n";
+    // --- Reduced precision (per-section, baked) -----------------------------
+    // BF16 compute/storage (FP32 accumulate, FP32 master weights) where the GPU supports it; the
+    // numerically sensitive sections stay FP32. AUTO follows the detected arch (BF16 needs sm_80+).
+    const bool bf16_ok = (bf16 == 1) || (bf16 == 2 && cuda_arch >= 80);
+    os << "// --- Reduced precision: BF16 where capable (FP32 accumulate + FP32 master weights) ---\n";
+    os << "enum class Dtype { F32, BF16 };\n";
+    os << "constexpr bool  BF16_OK       = " << (bf16_ok ? "true" : "false") << ";  // GPU supports BF16\n";
+    os << "constexpr Dtype GEMM_DTYPE    = Dtype::" << (bf16_ok ? "BF16" : "F32") << ";  // block GEMM inputs\n";
+    os << "constexpr Dtype ACT_DTYPE     = Dtype::" << (bf16_ok ? "BF16" : "F32") << ";  // saved activations (VRAM)\n";
+    os << "constexpr Dtype MASTER_DTYPE  = Dtype::F32;   // params + AdamW moments stay FP32\n";
+    os << "constexpr Dtype HEAD_DTYPE    = Dtype::F32;   // lm_head + logits + softmax stay FP32\n\n";
     os << "// --- Cached hardware facts + persisted tuned runtime defaults -----------\n";
     os << "constexpr int  HW_CONCURRENCY            = " << hw_concurrency  << ";\n";
     os << "constexpr int  MAX_WORKERS               = " << max_workers     << ";\n";

@@ -83,10 +83,10 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
-set(SUB0_D_MODEL  192 CACHE STRING "embedding / residual width")
-set(SUB0_N_LAYERS 8  CACHE STRING "transformer blocks")
-set(SUB0_N_HEADS  6  CACHE STRING "attention heads")
-set(SUB0_SEQ_LEN  64 CACHE STRING "context window")
+set(SUB0_D_MODEL  448 CACHE STRING "embedding / residual width")
+set(SUB0_N_LAYERS 11  CACHE STRING "transformer blocks")
+set(SUB0_N_HEADS  7  CACHE STRING "attention heads")
+set(SUB0_SEQ_LEN  256 CACHE STRING "context window")
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
 # Positional encoding scheme (compile-time, an enum so future schemes can be added).
@@ -101,6 +101,21 @@ if(SUB0_POS_ENCODING STREQUAL "ABSOLUTE")
   set(SUB0_POS_ENCODING_INT 0)
 else()
   set(SUB0_POS_ENCODING_INT 1)   # ROPE (default)
+endif()
+
+# Reduced precision (BF16). Compute-bound GEMM inputs + saved activations can be BF16 with FP32
+# accumulate + FP32 master weights -- halving bandwidth/VRAM with no loss-scaling (BF16 keeps FP32's
+# exponent range). AUTO enables it when the GPU supports it (Blackwell sm_120 does, >= sm_80); the
+# configurator bakes per-section dtypes so numerically sensitive parts (lm_head, norms, AdamW) stay
+# FP32. The types are compile-time, so unused-precision branches cost nothing.
+set(SUB0_BF16 "AUTO" CACHE STRING "BF16 mixed precision: AUTO (on if GPU >= sm_80) / ON / OFF")
+set_property(CACHE SUB0_BF16 PROPERTY STRINGS AUTO ON OFF)
+if(SUB0_BF16 STREQUAL "ON")
+  set(SUB0_BF16_INT 1)
+elseif(SUB0_BF16 STREQUAL "OFF")
+  set(SUB0_BF16_INT 0)
+else()
+  set(SUB0_BF16_INT 2)   # AUTO: configurator decides from the detected GPU arch
 endif()
 
 # Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
@@ -212,6 +227,7 @@ add_custom_command(
             --ternary ${SUB0_TERNARY}
             --pos-encoding ${SUB0_POS_ENCODING_INT}
             --rope-theta ${SUB0_ROPE_THETA}
+            --bf16 ${SUB0_BF16_INT}
             --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             --has-cuda ${SUB0_HAS_CUDA}
