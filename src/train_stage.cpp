@@ -139,7 +139,7 @@ const char* tokmap_error(sub0::TokMap::Err e) {
 }
 
 // --- On-demand tokenization (out-of-core, no corpus.tok) --------------------
-// When the build skipped corpus.tok (--corpus-tok 0) the token copy is never written to
+// When the build skipped corpus.tok (--corpus-pretok 0) the token copy is never written to
 // disk (~2x saved). Training instead tokenizes contiguous regions of the RAW text corpus
 // on the fly with the runtime tokenizer (sub0::encode, which reproduces the configurator's
 // truecasing + BPE) into bounded in-memory buffers: a rotating training buffer refilled
@@ -535,7 +535,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     // Where training windows come from. train_span is sampled for training windows; val_span
     // is the fixed held-out eval region. Backed either by the corpus.tok memory map, or --
-    // when no corpus.tok was built (--corpus-tok 0) -- by bounded in-memory buffers tokenized
+    // when no corpus.tok was built (--corpus-pretok 0) -- by bounded in-memory buffers tokenized
     // on demand from the raw corpus (see TextCorpus): no token copy on disk, RAM capped by
     // the buffers. The rotating training buffer is refilled each interval inside the loop.
     sub0::TokMap tok(tok_path);
@@ -641,7 +641,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
                                              static_cast<int>(USE_TERNARY),
-                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
+                                             static_cast<int>(POS_ENCODING),
+                                             static_cast<int>(JOIN_TOKENIZER), SUB0_GIT_SHA);
         std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
         model_path = (meta_dir / "model.bin").string();
         std::println("model dir: {}", model_path);
@@ -653,6 +654,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
         m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
         m.pos_encoding = static_cast<int>(POS_ENCODING);
+        m.join_tokenizer = static_cast<int>(JOIN_TOKENIZER);
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
@@ -1788,13 +1790,16 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
     namespace reg = sub0::registry;
     std::vector<reg::ModelMeta> models = reg::scan(SUB0_MODELS_ROOT);
     std::println("models root: {}  ({} model{})", SUB0_MODELS_ROOT, models.size(), models.size() == 1 ? "" : "s");
-    std::println("this build:  d{} l{} h{} sq{} v{}{} @ {}",
-                 D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, USE_TERNARY ? "t" : "", SUB0_GIT_SHA);
+    std::println("this build:  d{} l{} h{} sq{} v{}{}{}{} @ {}",
+                 D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, USE_TERNARY ? "t" : "",
+                 reg::pos_tag(static_cast<int>(POS_ENCODING)),
+                 reg::join_tag(static_cast<int>(JOIN_TOKENIZER)), SUB0_GIT_SHA);
     if (models.empty()) { std::println("(none yet -- `sub0llm train` creates one)"); return 0; }
 
     auto loadable = [&](const reg::ModelMeta& m) {
         return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING));
+                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
+                               static_cast<int>(JOIN_TOKENIZER));
     };
     std::sort(models.begin(), models.end(),
               [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });

@@ -149,8 +149,8 @@ _sub0_prec_int(SUB0_PRECISION_ACT  SUB0_PRECISION_ACT_INT)
 # corpus.tok (~2x the text) fits in half of physical RAM, and switch to on-demand for a
 # larger corpus (where the mmap can't stay resident and the disk cost is large). Override
 # with -DSUB0_CORPUS_TOK=ON or =OFF.
-set(SUB0_CORPUS_TOK "AUTO" CACHE STRING "Pre-tokenize corpus.tok: ON / OFF / AUTO (by corpus size vs RAM)")
-set_property(CACHE SUB0_CORPUS_TOK PROPERTY STRINGS AUTO ON OFF)
+set(SUB0_CORPUS_PRETOK "AUTO" CACHE STRING "Pre-tokenize corpus.tok: ON / OFF / AUTO (by corpus size vs RAM)")
+set_property(CACHE SUB0_CORPUS_PRETOK PROPERTY STRINGS AUTO ON OFF)
 
 cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
 set(_corpus_bytes 0)
@@ -160,26 +160,26 @@ endif()
 math(EXPR _est_tok_mb  "(${_corpus_bytes} * 2) / 1048576")   # corpus.tok ~ 2x the text
 math(EXPR _half_ram_mb "${_ram_mb} / 2")
 if(_est_tok_mb GREATER _half_ram_mb)
-  set(_auto_tok 0)   # token copy would not fit comfortably in RAM -> on demand
+  set(_auto_pretok 0)   # token copy would not fit comfortably in RAM -> on demand
 else()
-  set(_auto_tok 1)   # fits -> pre-tokenize for fast random-access training
+  set(_auto_pretok 1)   # fits -> pre-tokenize for fast random-access training
 endif()
 
-if(SUB0_CORPUS_TOK STREQUAL "AUTO")
-  set(SUB0_CORPUS_TOK_FLAG ${_auto_tok})
-elseif(SUB0_CORPUS_TOK)            # ON / 1 / TRUE
-  set(SUB0_CORPUS_TOK_FLAG 1)
+if(SUB0_CORPUS_PRETOK STREQUAL "AUTO")
+  set(SUB0_CORPUS_PRETOK_FLAG ${_auto_pretok})
+elseif(SUB0_CORPUS_PRETOK)            # ON / 1 / TRUE
+  set(SUB0_CORPUS_PRETOK_FLAG 1)
 else()                             # OFF / 0 / FALSE
-  set(SUB0_CORPUS_TOK_FLAG 0)
+  set(SUB0_CORPUS_PRETOK_FLAG 0)
 endif()
-message(STATUS "corpus.tok: SUB0_CORPUS_TOK=${SUB0_CORPUS_TOK} -> emit=${SUB0_CORPUS_TOK_FLAG} "
+message(STATUS "corpus.tok: SUB0_CORPUS_PRETOK=${SUB0_CORPUS_PRETOK} -> emit=${SUB0_CORPUS_PRETOK_FLAG} "
                "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
 
 # JOIN / implicit-space tokenizer. A clean break from the legacy space-as-token scheme: the
 # single inter-word space becomes free (~28% fewer tokens on tinystories), the base alphabet is
 # the complete 256 bytes + JOIN/NEWLINE/PARA markers. Changes tokenizer.bin + corpus.tok, so a
 # build with this flipped is INCOMPATIBLE with models trained under the other setting (retrain).
-option(SUB0_JOIN_TOKENIZER "Use the JOIN/implicit-space tokenizer (clean break; retrain required)" OFF)
+option(SUB0_JOIN_TOKENIZER "Use the JOIN/implicit-space tokenizer (clean break; retrain required)" ON)
 if(SUB0_JOIN_TOKENIZER)
   set(SUB0_JOIN_FLAG 1)
 else()
@@ -263,7 +263,7 @@ add_custom_command(
             --bf16 ${SUB0_BF16_INT}
             --prec-gemm ${SUB0_PRECISION_GEMM_INT}
             --prec-act ${SUB0_PRECISION_ACT_INT}
-            --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
+            --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
             --join ${SUB0_JOIN_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             --has-cuda ${SUB0_HAS_CUDA}

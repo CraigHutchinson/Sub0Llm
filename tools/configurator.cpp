@@ -321,7 +321,7 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
        ->capture_default_str();
-    app.add_option("--corpus-tok", emit_tok,
+    app.add_option("--corpus-pretok", emit_tok,
                    "1 = pre-tokenize the whole corpus to corpus.tok; 0 = skip it and let training tokenize "
                    "on demand (avoids the ~2x-on-disk token copy for a huge corpus)")
        ->capture_default_str()->check(CLI::Range(0, 1));
@@ -464,7 +464,7 @@ int main(int argc, char** argv) {
     const std::filesystem::path tkz_path = gen_dir / "tokenizer.bin";
 
     // --- Pass 3 (optional): stream the corpus once more and emit the merged token stream to
-    //     corpus.tok incrementally (never materialised in memory). Skipped when --corpus-tok
+    //     corpus.tok incrementally (never materialised in memory). Skipped when --corpus-pretok
     //     0: training then tokenizes windows on demand from the raw corpus + tokenizer.bin,
     //     avoiding the ~2x-on-disk token copy for a huge corpus. Each word unit looks up its
     //     post-BPE id sequence in the table; standalone symbols map straight to base ids.
@@ -494,6 +494,7 @@ int main(int argc, char** argv) {
         const std::int32_t newline_id = join ? static_cast<std::int32_t>(tkz.newline_id) : -1;
         std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
         int nl_run = 0;
+        bool rt_reported = false;                                   // print the first round-trip divergence once
         std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
         std::vector<int> recon;                   // per-chunk reconstruction (legacy round-trip 2)
         for_each_chunk(corpus, [&](std::string_view chunk) {
@@ -505,7 +506,24 @@ int main(int argc, char** argv) {
                 // JOIN/NEWLINE/PARA + verbatim fallback). The single contract is the round-trip
                 // detokenize(encode(chunk)) == normalize_text(chunk).
                 const std::vector<int> ids = tok::encode(tkz, std::string(chunk));
-                if (tok::detokenize(tkz, ids) != norm) tok_rt = false;
+                const std::string dec = tok::detokenize(tkz, ids);
+                if (dec != norm) {
+                    tok_rt = false;
+                    if (!rt_reported) {                            // show the first divergence (expected vs actual)
+                        rt_reported = true;
+                        std::size_t p = 0;
+                        while (p < dec.size() && p < norm.size() && dec[p] == norm[p]) ++p;
+                        const std::size_t lo = p > 48 ? p - 48 : 0;
+                        auto vis = [](std::string s) {             // make newlines/tabs visible
+                            std::string o; for (char c : s) {
+                                if (c == '\n') o += "\\n"; else if (c == '\t') o += "\\t"; else o += c;
+                            } return o;
+                        };
+                        std::println(stderr, "ROUND-TRIP FAIL at byte {} (norm {}B / dec {}B):", p, norm.size(), dec.size());
+                        std::println(stderr, "  expected: ...{}...", vis(norm.substr(lo, 96)));
+                        std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lo, 96)));
+                    }
+                }
                 out_tokens.assign(ids.begin(), ids.end());
             } else {
                 const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
@@ -646,7 +664,11 @@ int main(int argc, char** argv) {
     os << "constexpr int  D_FF        = 4 * D_MODEL;\n";
     os << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
     os << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
-    os << "constexpr int  VOCAB       = " << vocab << ";\n\n";
+    os << "constexpr int  VOCAB       = " << vocab << ";\n";
+    // JOIN_TOKENIZER: the implicit-space tokenizer scheme is baked in (it changes corpus.tok +
+    // tokenizer.bin meaning, so models built under it are incompatible with legacy ones). The
+    // registry tags the model dir with it; the engine uses it only for provenance/compatibility.
+    os << "constexpr bool JOIN_TOKENIZER = " << (join_scheme ? "true" : "false") << ";\n\n";
     // --- Positional encoding (compile-time, an enum for future schemes) -----
     // Absolute = a learned pos_emb[SEQ_LEN, D_MODEL] added to the token embedding (cannot
     // extrapolate past SEQ_LEN). Rope = rotary embeddings applied to Q/K inside attention,
@@ -760,7 +782,7 @@ int main(int argc, char** argv) {
         std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
         std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
     } else {
-        std::println(stderr, "corpus.tok:                      skipped (--corpus-tok 0; on-demand)");
+        std::println(stderr, "corpus.tok:                      skipped (--corpus-pretok 0; on-demand)");
     }
     std::println(stderr, "attested words / table size:     {} / {} bytes ({:.1f} KB)",
                  attested.size(), wordset_bytes, wordset_bytes / 1024.0);
