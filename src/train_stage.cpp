@@ -1502,7 +1502,7 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     std::println("memory plan: d{} L{} H{} ff{} seq{} v{} | params {:.1f}M | VRAM {} MiB (+{} shared)",
                  D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                  mp::param_floats(d) / 1e6, vram, GPU_SHARED_MEM_MB);
-    std::println("precision: GEMM {} | activations {} | master FP32  (BF16_OK={})",
+    std::println("precision: GEMM {} | activations {} | master FP32  (BF16_OK={}; backend storage still FP32 -- BF16 path not yet wired)",
                  GEMM_DTYPE == Dtype::BF16 ? "BF16" : "F32", ACT_DTYPE == Dtype::BF16 ? "BF16" : "F32", BF16_OK);
 
     const double persist = mib(mp::persistent_bytes(d));
