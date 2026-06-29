@@ -8,6 +8,7 @@
 #include <catch2/catch_approx.hpp>
 
 #include "sub0/core.hpp"     // trainable_floats()
+#include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
 
 #include <algorithm>
@@ -208,6 +209,51 @@ TEST_CASE("CUDA backward matches the CPU reduced gradient", "[cuda]") {
     // F32 storage parity is tight; BF16 storage cannot match raw magnitudes (3 decimal digits) so we
     // assert it points the SAME direction as the CPU gradient and stays finite -- behaviour, not bits.
     REQUIRE(std::isfinite(loss));
+    if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
+    else                                    REQUIRE(rel < 1e-2);
+    sub0_cuda_shutdown();
+}
+
+// Bisection probe: cosine of ONLY the attention-projection grads (Wq/Wk/Wv/Wo) against the CPU.
+// The attention saved buffers (a/qkv/att) and their grads (da/dqkv/datt) feed exactly these four
+// weights; isolating them attributes a BF16 regression to the attention path rather than the FFN
+// (which the reduced-gradient test already covers). Tighter than the full-grad gate so a single
+// flipped buffer is visible: F32 must match closely, BF16 must still point the same direction.
+TEST_CASE("CUDA attention-only gradient stays aligned with the CPU", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 55, data, starts, ids, targets);
+
+    sub0::train_batch(data.data(), starts.data(), batch, T);
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    std::vector<float> gpu_grad(n, 0.0f);
+    double loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss) == 0);
+
+    // Accumulate cosine/rel-L2 over only the Q/K/V/O weight tensors (every layer).
+    double num = 0.0, den = 0.0, dot = 0.0, gn = 0.0;
+    for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+        const bool attn = p.kind == sub0::PKind::Wq || p.kind == sub0::PKind::Wk ||
+                          p.kind == sub0::PKind::Wv || p.kind == sub0::PKind::Wo;
+        if (!attn) continue;
+        for (std::size_t i = p.off; i < p.off + p.n(); ++i) {
+            const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+            num += d * d;
+            den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+            dot += static_cast<double>(gpu_grad[i]) * cpu_grad[i];
+            gn  += static_cast<double>(gpu_grad[i]) * gpu_grad[i];
+        }
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    const double cos = dot / std::max(std::sqrt(gn * den), 1e-30);
+    INFO("attn grad rel-L2 = " << rel << "  cos = " << cos);
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
     else                                    REQUIRE(rel < 1e-2);
     sub0_cuda_shutdown();
