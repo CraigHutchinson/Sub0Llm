@@ -80,6 +80,8 @@ extern "C" void sub0_cuda_set_attn_bwd(int per_query);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 // Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
+// Free dedicated VRAM (MiB) after the CUDA/cuBLAS context exists -- the usable budget for the ladder.
+extern "C" int  sub0_cuda_free_vram_mb();
 #endif
 
 namespace {
@@ -450,7 +452,7 @@ struct GpuTrainer {
     bool enable(int batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
         constexpr int kCap = 4096;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
-        //TODO: Remove getenv calls
+        //TODO: Remove getenv calls - these are tmeporary and we should use commandline/compiletime
         if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
         if (!HAS_CUDA || batch > kCap) return false;
         if (sub0_cuda_init() != 0) return false;
@@ -1198,13 +1200,22 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // get TUNED automatically on bigger cards / smaller models; the guard below still skips misfits.
         constexpr int kTuneMaxBatch = 4096;         // sanity cap == MAX_FWD_BATCH (device scratch ceiling)
         const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
-        const int cap   = sub0::memplan::max_batch_for_vram(kGpuDims, GPU_VRAM_MB, kTuneMaxBatch, act_b);
+        // Budget against ACTUAL free VRAM, not the baked GPU_VRAM_MB spec: the spec is the card total,
+        // but the usable budget is total minus the CUDA context/driver reservation (which the pure
+        // footprint model cannot see -- that gap is why a batch the model said "fits" still spilled at
+        // ~8.3 GB on an 8 GB card). Reserve a further headroom for the cuBLAS GEMM workspace (allocated
+        // lazily on the first matmul, AFTER this measurement) plus allocator fragmentation.
+        constexpr int kVramHeadroomMB = 512;        // cuBLAS workspace + fragmentation slack
+        const int free_mb = sub0_cuda_free_vram_mb();
+        const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
+                                - kVramHeadroomMB;
+        const int cap   = sub0::memplan::max_batch_for_vram(kGpuDims, vram_budget, kTuneMaxBatch, act_b);
         std::vector<int> batch_ladder;
         for (int b = 64; b < cap; b *= 2) batch_ladder.push_back(b);
         if (cap >= 64) batch_ladder.push_back(cap);             // top rung = the exact VRAM ceiling
         if (batch_ladder.empty()) batch_ladder.push_back(std::max(1, cap));
-        std::println("batch ladder (VRAM-fit, {} MiB budget): {} rungs, max batch {}",
-                     GPU_VRAM_MB, batch_ladder.size(), cap);
+        std::println("batch ladder (VRAM-fit, {} MiB usable of {} free / {} spec): {} rungs, max batch {}",
+                     vram_budget, free_mb, GPU_VRAM_MB, batch_ladder.size(), cap);
         sub0::tune::Space gspace = { {"batch", std::vector<double>(batch_ladder.begin(), batch_ladder.end())} };
 #if defined(SUB0_TUNING)
         gspace.push_back({"tf32",     {0, 1}});
@@ -1222,16 +1233,17 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         double grunning_best = 0.0;
         sub0::tune::Objective gobjective = [&](const sub0::tune::Assignment& a) -> double {
             const int batch = static_cast<int>(std::lround(a[0]));
-            // Predictive VRAM guard: never even TIME a batch whose resident footprint cannot fit in
-            // dedicated VRAM. On Windows an over-budget cudaMalloc does NOT OOM -- it silently spills
-            // to WDDM shared memory and THRASHES over PCIe, so the measurement would "succeed" at a
-            // ruinous ~10x-slower rate and pollute the search. Predict up front and skip instead.
-            if (GPU_VRAM_MB > 0) {
+            // Predictive VRAM guard: never even TIME a batch whose resident footprint cannot fit the
+            // usable VRAM budget (free minus context/cuBLAS headroom, computed above). On Windows an
+            // over-budget cudaMalloc does NOT OOM -- it silently spills to WDDM shared memory and
+            // THRASHES over PCIe, so the measurement would "succeed" at a ruinous ~10x-slower rate and
+            // pollute the search. Predict up front and skip instead.
+            if (vram_budget > 0) {
                 const int need = sub0::memplan::train_resident_mb(kGpuDims, batch, ACT_DTYPE == Dtype::BF16 ? 2 : 4);
-                if (need > GPU_VRAM_MB) {
+                if (need > vram_budget) {
                     if (verbose) {
-                        std::println("  batch={:>4}{}  ->  predicted {} MiB > {} MiB VRAM, skipping (would spill)",
-                                     batch, knob_suffix(a), need, GPU_VRAM_MB);
+                        std::println("  batch={:>4}{}  ->  predicted {} MiB > {} MiB usable, skipping (would spill)",
+                                     batch, knob_suffix(a), need, vram_budget);
                         std::fflush(stdout);
                     }
                     return 0.0;
