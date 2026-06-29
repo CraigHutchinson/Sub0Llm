@@ -91,7 +91,6 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
     const u64 grad      = 4 * Mm * C * FLOAT    // dh, da, datt, dfbuf  [M,C]
                         + Mm * 3 * C * FLOAT    // dqkv  [M,3C]
                         + 2 * Mm * F * FLOAT    // dff1, dgact  [M,F]
-                        + Mm * V * FLOAT        // dlogits  [M,V]
                         + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]
                         + u64(batch) * INT      // lengths   [batch] (per-window padding mask)

@@ -388,11 +388,12 @@ __global__ void ce_backward_kernel(const float* __restrict__ logits, const int* 
     for (int j = 0; j < V; ++j) Z += __expf(lr[j] - mx);
     const float invZ = 1.f / Z;
     const float w    = 1.0f / (static_cast<float>(batch) * static_cast<float>(len));   // per-window mean
+    float ptgt = 0.f;                                // capture before any write (dlogits may alias logits)
     for (int j = 0; j < V; ++j) {
         const float p = __expf(lr[j] - mx) * invZ;
-        dl[j] = w * (p - (j == tgt ? 1.f : 0.f));
+        if (j == tgt) ptgt = p;
+        dl[j] = w * (p - (j == tgt ? 1.f : 0.f));    // safe in-place: reads lr[j] then writes dl[j]
     }
-    const float ptgt = __expf(lr[tgt] - mx) * invZ;
     atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
 }
 
@@ -890,7 +891,7 @@ int train_alloc(int batch) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dfbuf,   MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dlogits, MV * sizeof(float)));
+    g_tr.dlogits = g_tr.logits;                 // CE backward is in-place: dlogits overwrites logits [M,V]
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
@@ -907,7 +908,7 @@ void train_free() {
     }
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
-    cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); cudaFree(g_tr.dlogits);
+    cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
     g_tr = TrainScratch{};
     g_tr_cap = 0;
