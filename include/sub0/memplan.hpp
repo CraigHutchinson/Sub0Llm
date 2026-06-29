@@ -99,9 +99,16 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
     return L * per_layer + final_blk + grad;
 }
 
-// Total resident device bytes for one training step at `batch` (persistent + both scratch sets).
+// Forward scratch a training step keeps resident: only the token-id buffer. Training reads from the
+// activation-saving g_tr arenas, so fwd_alloc(batch, full=false) skips h..logits -- just dids[M].
+constexpr u64 fwd_dids_bytes(const Dims& d, int batch) {
+    return u64(batch) * u64(d.seq_len) * INT;   // dids [M]
+}
+
+// Total resident device bytes for one training step at `batch` (persistent + dids + train scratch).
+// fwd_scratch_bytes is the inference-only path; training carries just dids, not the full forward set.
 constexpr u64 train_resident_bytes(const Dims& d, int batch) {
-    return persistent_bytes(d) + fwd_scratch_bytes(d, batch) + train_scratch_bytes(d, batch);
+    return persistent_bytes(d) + fwd_dids_bytes(d, batch) + train_scratch_bytes(d, batch);
 }
 
 // Footprint in whole MiB, rounded UP -- the same unit GPU_VRAM_MB (from nvidia-smi) is expressed in,

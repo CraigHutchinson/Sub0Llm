@@ -767,6 +767,7 @@ struct FwdScratch {
 };
 FwdScratch g_fwd;
 int        g_fwd_cap = 0;              // batch the batch-dependent forward buffers are sized for
+int        g_fwd_full = 0;             // 1 = full inference scratch allocated; 0 = dids-only (training)
 
 // Batch-independent fused-QKV weight buffers (built at upload). Kept across batch grows.
 int wqkv_alloc() {
@@ -787,27 +788,33 @@ void fwd_free_batch() {
     g_fwd.dids = nullptr; g_fwd.h = g_fwd.a = g_fwd.qkv = g_fwd.att = g_fwd.proj = g_fwd.fbuf =
         g_fwd.ff1 = g_fwd.gact = g_fwd.ff2 = g_fwd.logits = nullptr;
     g_fwd_cap = 0;
+    g_fwd_full = 0;
 }
 
-// Ensure the forward scratch covers `batch` (grow-on-demand) plus the wqkv buffers.
-int fwd_alloc(int batch) {
+// Ensure the forward scratch covers `batch` (grow-on-demand) plus the wqkv buffers. `full` allocates
+// the inference activation scratch (h..logits); training passes full=false (it reads from g_tr, only
+// needs dids + wqkv) -- skipping ~6 [M,C]/[M,F]/[M,V] buffers saves hundreds of MiB during training.
+int fwd_alloc(int batch, bool full = true) {
     if (wqkv_alloc()) return 1;
-    if (g_fwd_cap >= batch && g_fwd.dids) return 0;        // already big enough
+    if (g_fwd_cap >= batch && g_fwd.dids && (!full || g_fwd_full)) return 0;   // already big enough
     fwd_free_batch();                                      // grow: drop the old (smaller) buffers
     const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.qkv,    Mm * 3 * D_MODEL * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff1,    MF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
+    if (full) {
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.qkv,    Mm * 3 * D_MODEL * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff1,    MF * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
+    }
     g_fwd_cap = batch;
+    g_fwd_full = full ? 1 : 0;
     return 0;
 }
 
@@ -1393,7 +1400,7 @@ static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, dou
                        const int* lengths = nullptr) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
-    if (fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
+    if (fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
     ensure_cublas();
     set_handle_tf32(CudaTf32::get());            // training uses the baked math mode
     const int M = batch * T;
@@ -1533,7 +1540,7 @@ static int time_train_step(int batch, int T, int iters, double budget_ms, double
     if (T < 1 || T > SEQ_LEN) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
-    if (sub0_cuda_init() || fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
+    if (sub0_cuda_init() || fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
     ensure_cublas();
     set_handle_tf32(CudaTf32::get());
     const int M = batch * T;
@@ -1628,7 +1635,7 @@ SUB0_CUDA_API int sub0_cuda_train_footprint(int batch, double* predicted_mb, dou
     sub0_cuda_shutdown();                                   // clean slate so the delta is purely ours
     std::size_t free_before = 0, total = 0;
     if (cudaMemGetInfo(&free_before, &total) != cudaSuccess) return 1;
-    if (sub0_cuda_init() || fwd_alloc(batch) || train_alloc(batch) || opt_alloc()) return 1;
+    if (sub0_cuda_init() || fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
     cudaDeviceSynchronize();                                // ensure the allocations are physically resident
     std::size_t free_after = 0;
     if (cudaMemGetInfo(&free_after, &total) != cudaSuccess) return 1;
