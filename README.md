@@ -139,6 +139,7 @@ the **same** `SUB0_POS_ENCODING`.
 | `gen` | sample a continuation (`--temp`, `--topk`, `--n`) |
 | `models [--prune]` | list / prune trained models |
 | `report` | diagnose model sizing vs its corpus; per-knob retrain guidance |
+| `memplan` | predicted train/gen memory footprints (breakdown + batch sweep vs VRAM) |
 | `autotemp` | pick a coherence temperature by matching held-out perplexity |
 | `vocab` | print the BPE vocabulary table |
 | `bench` | cycle-accurate hot-path benchmark (the optimization control) |

@@ -26,6 +26,7 @@ extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend);
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
 extern "C" int sub0_report_stage(const char* model_in);
+extern "C" int sub0_memplan_stage();
 extern "C" int sub0_models_stage(int prune, int verbose);
 
 int main(int argc, char** argv) {
@@ -135,6 +136,10 @@ int main(int argc, char** argv) {
     report->add_option("model", report_model,
                        "Trained model to include train/val loss diagnosis (optional; omit for structural-only)");
 
+    // --- memplan -------------------------------------------------------------
+    auto* memplan = app.add_subcommand("memplan",
+        "Report predicted train/gen device memory footprints (breakdown + batch sweep vs VRAM)");
+
     CLI11_PARSE(app, argc, argv);
 
     if (*train) {
@@ -162,6 +167,8 @@ int main(int argc, char** argv) {
         return sub0_models_stage(models_prune ? 1 : 0, 1);
     if (*report)
         return sub0_report_stage(report_model.empty() ? nullptr : report_model.c_str());
+    if (*memplan)
+        return sub0_memplan_stage();
 
     return 1;  // unreachable: require_subcommand(1) guarantees one of the above
 }

@@ -1489,6 +1489,48 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
     return 0;
 }
 
+// --- Memory plan --------------------------------------------------------------
+// `sub0llm memplan` reports the predicted device footprint for generation and training using the
+// pure model (sub0/memplan.hpp), broken down by component, with a batch sweep vs the VRAM budget
+// and guidance on the knobs that move it. No device needed -- this is the same prediction the
+// configurator and tuner gate on, surfaced for planning a model/batch/context that fits.
+extern "C" SUB0_API int sub0_memplan_stage() {
+    namespace mp = sub0::memplan;
+    const mp::Dims d{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+    auto mib = [](unsigned long long b) { return static_cast<double>(b) / (1024.0 * 1024.0); };
+    const int vram = GPU_VRAM_MB;
+    std::println("memory plan: d{} L{} H{} ff{} seq{} v{} | params {:.1f}M | VRAM {} MiB (+{} shared)",
+                 D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                 mp::param_floats(d) / 1e6, vram, GPU_SHARED_MEM_MB);
+    std::println("precision: GEMM {} | activations {} | master FP32  (BF16_OK={})",
+                 GEMM_DTYPE == Dtype::BF16 ? "BF16" : "F32", ACT_DTYPE == Dtype::BF16 ? "BF16" : "F32", BF16_OK);
+
+    const double persist = mib(mp::persistent_bytes(d));
+    std::println("");
+    std::println("persistent (resident, batch-independent): {:.0f} MiB", persist);
+    std::println("  params + grad + m + vel + decay (5x) + fused QKV weights");
+    std::println("generation (batch 1): persistent + fwd scratch = {:.0f} MiB",
+                 persist + mib(mp::fwd_scratch_bytes(d, 1)));
+
+    std::println("");
+    std::println("training footprint by batch (persistent + fwd + train scratch):");
+    for (const int b : {32, 64, 128, 256, 512, 1024}) {
+        const int need = mp::train_resident_mb(d, b);
+        std::println("  batch {:>5}: {:>7} MiB  {}", b, need,
+                     vram <= 0 ? "" : need > vram ? "!! over VRAM (spills to shared, ~10x slower)" : "fits");
+    }
+    const int db = DEFAULT_GPU_BATCH;
+    std::println("");
+    std::println("breakdown @ DEFAULT_GPU_BATCH={}: persistent {:.0f} | fwd {:.0f} | train-scratch {:.0f} = {:.0f} MiB",
+                 db, persist, mib(mp::fwd_scratch_bytes(d, db)), mib(mp::train_scratch_bytes(d, db)),
+                 mib(mp::train_resident_bytes(d, db)));
+    std::println("");
+    std::println("knobs: train scratch ~ batch * seq (acts) ; attention is O(seq^2); params ~ d^2*layers.");
+    std::println("  - halve seq -> ~halve activations + 4x less attention; raise/lower batch scales linearly;");
+    std::println("  - BF16 activations would ~halve the train scratch; smaller d/layers cuts params + acts.");
+    return 0;
+}
+
 // --- Model fitness report ----------------------------------------------------
 // `sub0llm report [model]` interrogates how well the baked architecture is sized for its corpus
 // and prints per-knob guidance for a retrain. It combines three signals that, together, separate
