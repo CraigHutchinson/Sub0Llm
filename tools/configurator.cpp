@@ -23,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -281,7 +282,9 @@ int main(int argc, char** argv) {
     int ternary      = 0;
     int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
     double rope_theta = 10000.0;// RoPE frequency base
-    int bf16         = 2;       // 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
+    int bf16         = 2;       // float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
+    int prec_gemm    = 9;       // GEMM input precision: 0=F32,1=BF16,2=F16; 9=AUTO (16b if capable)
+    int prec_act     = 9;       // saved-activation storage precision: same codes; 9=AUTO
     int vocab_target = 2048;
     int min_merge    = 2;
     int emit_tok     = 1;
@@ -307,8 +310,12 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--rope-theta", rope_theta, "RoPE frequency base (theta)")
        ->capture_default_str();
-    app.add_option("--bf16", bf16, "BF16 mixed precision: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)")
+    app.add_option("--bf16", bf16, "Float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)")
        ->capture_default_str()->check(CLI::Range(0, 2));
+    app.add_option("--prec-gemm", prec_gemm, "GEMM input precision: 0=F32,1=BF16,2=F16,9=AUTO")
+       ->capture_default_str()->check(CLI::Range(0, 9));
+    app.add_option("--prec-act", prec_act, "Saved-activation storage precision: 0=F32,1=BF16,2=F16,9=AUTO")
+       ->capture_default_str()->check(CLI::Range(0, 9));
     app.add_option("--vocab",  vocab_target, "Target BPE vocabulary size (base symbols + markers + merges)")
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
@@ -628,14 +635,32 @@ int main(int argc, char** argv) {
     os << "// ROPE_THETA: RoPE frequency base; angle(pos, pair m) = pos * THETA^(-2m/D_HEAD).\n";
     os << "constexpr float       ROPE_THETA   = " << std::format("{:.1f}", rope_theta) << "f;\n\n";
     // --- Reduced precision (per-section, baked) -----------------------------
-    // BF16 compute/storage (FP32 accumulate, FP32 master weights) where the GPU supports it; the
-    // numerically sensitive sections stay FP32. AUTO follows the detected arch (BF16 needs sm_80+).
-    const bool bf16_ok = (bf16 == 1) || (bf16 == 2 && cuda_arch >= 80);
-    os << "// --- Reduced precision: BF16 where capable (FP32 accumulate + FP32 master weights) ---\n";
-    os << "enum class Dtype { F32, BF16 };\n";
-    os << "constexpr bool  BF16_OK       = " << (bf16_ok ? "true" : "false") << ";  // GPU supports BF16\n";
-    os << "constexpr Dtype GEMM_DTYPE    = Dtype::" << (bf16_ok ? "BF16" : "F32") << ";  // block GEMM inputs\n";
-    os << "constexpr Dtype ACT_DTYPE     = Dtype::" << (bf16_ok ? "BF16" : "F32") << ";  // saved activations (VRAM)\n";
+    // Float16 capability is a detected hardware fact: BF16 needs sm_80+. We currently support BF16
+    // only; FP16 (and future integer quant) are reserved enum values so per-section knobs stay
+    // forward-compatible, but selecting them errors here until the backends implement them. Each
+    // pipeline section (GEMM inputs, saved activations) picks a Dtype independently; numerically
+    // sensitive sections (master weights, head/logits/softmax) stay FP32.
+    const bool f16_ok = (bf16 == 1) || (bf16 == 2 && cuda_arch >= 80);
+    // Resolve a per-section code (0=F32,1=BF16,2=F16,9=AUTO) to a Dtype name, erroring on the
+    // not-yet-supported choices. AUTO -> the capable 16-bit float (BF16) else F32.
+    const auto resolve_dtype = [&](int code, const char* section) -> std::string {
+        switch (code) {
+            case 0: return "F32";
+            case 1: if (!f16_ok) { std::fprintf(stderr, "configure error: BF16 %s requested but no BF16-capable GPU\n", section); std::exit(2); } return "BF16";
+            case 2: std::fprintf(stderr, "configure error: F16 %s not yet supported (BF16 only)\n", section); std::exit(2);
+            default: return f16_ok ? "BF16" : "F32";   // AUTO
+        }
+    };
+    const std::string gemm_dt = resolve_dtype(prec_gemm, "GEMM");
+    const std::string act_dt  = resolve_dtype(prec_act, "activations");
+    os << "// --- Reduced precision: per-section Dtype (FP32 accumulate + FP32 master weights) ---\n";
+    os << "// F16/Q8/Q4 are reserved for future backends; only F32/BF16 are wired today.\n";
+    os << "enum class Dtype { F32, BF16, F16, Q8, Q4 };\n";
+    os << "constexpr bool  FLOAT16_OK    = " << (f16_ok ? "true" : "false") << ";  // GPU supports a 16-bit float\n";
+    os << "constexpr Dtype FLOAT16_KIND  = Dtype::BF16;  // which 16-bit float this platform uses\n";
+    os << "constexpr bool  BF16_OK       = " << (f16_ok ? "true" : "false") << ";  // alias: BF16 is the supported f16\n";
+    os << "constexpr Dtype GEMM_DTYPE    = Dtype::" << gemm_dt << ";  // block GEMM inputs\n";
+    os << "constexpr Dtype ACT_DTYPE     = Dtype::" << act_dt  << ";  // saved activations (VRAM)\n";
     os << "constexpr Dtype MASTER_DTYPE  = Dtype::F32;   // params + AdamW moments stay FP32\n";
     os << "constexpr Dtype HEAD_DTYPE    = Dtype::F32;   // lm_head + logits + softmax stay FP32\n\n";
     os << "// --- Cached hardware facts + persisted tuned runtime defaults -----------\n";

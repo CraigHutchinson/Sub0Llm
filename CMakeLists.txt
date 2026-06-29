@@ -118,6 +118,27 @@ else()
   set(SUB0_BF16_INT 2)   # AUTO: configurator decides from the detected GPU arch
 endif()
 
+# Per-section precision selection (extensible: AUTO picks the detected 16-bit float; F16/Q8/Q4 are
+# reserved for future backends and currently error in the configurator). The float16 *capability*
+# is SUB0_BF16 above; these choose WHERE the 16-bit type is used. F32 forces full precision.
+function(_sub0_prec_int var out)
+  if(${var} STREQUAL "F32")
+    set(${out} 0 PARENT_SCOPE)
+  elseif(${var} STREQUAL "BF16")
+    set(${out} 1 PARENT_SCOPE)
+  elseif(${var} STREQUAL "F16")
+    set(${out} 2 PARENT_SCOPE)
+  else()
+    set(${out} 9 PARENT_SCOPE)   # AUTO
+  endif()
+endfunction()
+set(SUB0_PRECISION_GEMM "AUTO" CACHE STRING "GEMM input precision: AUTO / F32 / BF16 / F16")
+set_property(CACHE SUB0_PRECISION_GEMM PROPERTY STRINGS AUTO F32 BF16 F16)
+set(SUB0_PRECISION_ACT  "AUTO" CACHE STRING "Saved-activation storage precision: AUTO / F32 / BF16 / F16")
+set_property(CACHE SUB0_PRECISION_ACT PROPERTY STRINGS AUTO F32 BF16 F16)
+_sub0_prec_int(SUB0_PRECISION_GEMM SUB0_PRECISION_GEMM_INT)
+_sub0_prec_int(SUB0_PRECISION_ACT  SUB0_PRECISION_ACT_INT)
+
 # Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
 # OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
 # raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
@@ -228,6 +249,8 @@ add_custom_command(
             --pos-encoding ${SUB0_POS_ENCODING_INT}
             --rope-theta ${SUB0_ROPE_THETA}
             --bf16 ${SUB0_BF16_INT}
+            --prec-gemm ${SUB0_PRECISION_GEMM_INT}
+            --prec-act ${SUB0_PRECISION_ACT_INT}
             --corpus-tok ${SUB0_CORPUS_TOK_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
             --has-cuda ${SUB0_HAS_CUDA}
