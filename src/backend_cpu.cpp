@@ -8,6 +8,12 @@
 // AdamW + the host/device parameter-sync hooks), so a GPU backend can replace this
 // translation unit wholesale behind the same include/sub0/core.hpp API.
 //
+// Precision: the CPU backend computes in FP32 only. The per-section Dtype config
+// (GEMM_DTYPE/ACT_DTYPE in sub0_config.hpp) selects reduced precision (BF16) on the GPU
+// backend; on CPU every section is FP32 regardless, which is the F32 baseline those
+// dtypes accumulate against. Future CPU reduced-precision support would key off the
+// same Dtype enum.
+//
 // Statically allocated: every model dimension is a compile-time constant, so all
 // parameter and activation memory lives in fixed-size std::array buffers in BSS,
 // reused with no per-step heap allocation. The parameter layout is the shared
