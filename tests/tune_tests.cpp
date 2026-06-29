@@ -12,6 +12,7 @@
 #include <map>
 
 #include "sub0/tune.hpp"
+#include "sub0/memplan.hpp"
 
 using sub0::tune::Knob;
 using sub0::tune::Space;
@@ -209,3 +210,33 @@ TEST_CASE("a single-candidate knob is handled", "[tune]") {
     CHECK(r.best[0] == 4.0);
     CHECK(r.best[1] == 3.0);
 }
+
+// memplan::max_batch_for_vram backs the tuner's runtime batch ceiling: it must return the LARGEST
+// batch that still fits the VRAM budget (and that batch must actually fit, the next one must not),
+// stay monotonic, honour the hard cap, and degrade sensibly when VRAM is unknown or tiny.
+TEST_CASE("max_batch_for_vram returns the largest fitting batch", "[tune][memplan]") {
+    using namespace sub0::memplan;
+    constexpr Dims d{ 448, 11, 7, 1792, 256, 2048 };   // a representative model
+    constexpr int cap = 4096;
+
+    SECTION("the result fits and the next step does not") {
+        const int vram = 8151, act = 2;                 // 8 GB, bf16 activations
+        const int b = max_batch_for_vram(d, vram, cap, act);
+        REQUIRE(b > 0);
+        REQUIRE(b < cap);
+        CHECK(train_resident_mb(d, b, act) <= vram);
+        CHECK(train_resident_mb(d, b + 1, act) > vram);
+    }
+    SECTION("more VRAM never lowers the ceiling (monotonic)") {
+        CHECK(max_batch_for_vram(d, 16000, cap, 2) >= max_batch_for_vram(d, 8151, cap, 2));
+        CHECK(max_batch_for_vram(d, 8151, cap, 2)  >= max_batch_for_vram(d, 4000, cap, 2));
+    }
+    SECTION("bf16 fits a bigger batch than f32") {
+        CHECK(max_batch_for_vram(d, 8151, cap, 2) >= max_batch_for_vram(d, 8151, cap, 4));
+    }
+    SECTION("unknown VRAM defers to the hard cap; a tiny budget yields none") {
+        CHECK(max_batch_for_vram(d, 0, cap, 2) == cap);
+        CHECK(max_batch_for_vram(d, 1, cap, 2) == 0);
+    }
+}
+

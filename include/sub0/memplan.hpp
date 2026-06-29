@@ -136,4 +136,19 @@ constexpr int train_resident_mb(const Dims& d, int batch, u64 A = FLOAT) {
 // any non-trivial batch, far outside this band, so the check stays sensitive to real breakage.
 constexpr double FOOTPRINT_TOLERANCE_MB = 128.0;
 
+// Largest minibatch whose resident training footprint fits `vram_mb`, bounded by `hard_cap`. Inverts
+// train_resident_mb (monotonically increasing in batch) by binary search. Returns hard_cap when VRAM
+// is unknown (vram_mb <= 0), or 0 if even batch 1 cannot fit. Lets the GPU tuner size its batch
+// ladder to the ACTUAL device at runtime instead of a baked dimension list. act_bytes = 2 bf16 / 4 f32.
+constexpr int max_batch_for_vram(const Dims& d, int vram_mb, int hard_cap, u64 act_bytes = FLOAT) {
+    if (vram_mb <= 0) return hard_cap;
+    int lo = 1, hi = hard_cap, best = 0;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (train_resident_mb(d, mid, act_bytes) <= vram_mb) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return best;
+}
+
 }  // namespace sub0::memplan

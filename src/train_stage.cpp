@@ -449,7 +449,7 @@ struct GpuTrainer {
     // fresh run / restored on resume). Returns false to fall back to the CPU loop.
     bool enable(int batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
-        constexpr int kCap = 1024;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
+        constexpr int kCap = 4096;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
         //TODO: Remove getenv calls
         if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
         if (!HAS_CUDA || batch > kCap) return false;
@@ -1192,7 +1192,20 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // (atomic contention), so the best attn strategy depends on the chosen batch. Objective =
         // measured tok/s; the device timer is budget-sized so each sample costs ~the same wall time.
         sub0_cuda_set_tf32(CUDA_TF32 ? 1 : 0); sub0_cuda_set_attn_bwd(0);   // baseline for batch-only builds
-        sub0::tune::Space gspace = { {"batch", {64, 128, 256, 384, 512, 768, 1024}} };
+        // Runtime VRAM-fit batch ladder instead of a baked list: compute the largest batch whose
+        // resident footprint fits dedicated VRAM (memplan::max_batch_for_vram), then double 64..ceiling.
+        // bf16's halved footprint lifts that ceiling well past the old static 1024, so larger batches
+        // get TUNED automatically on bigger cards / smaller models; the guard below still skips misfits.
+        constexpr int kTuneMaxBatch = 4096;         // sanity cap == MAX_FWD_BATCH (device scratch ceiling)
+        const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
+        const int cap   = sub0::memplan::max_batch_for_vram(kGpuDims, GPU_VRAM_MB, kTuneMaxBatch, act_b);
+        std::vector<int> batch_ladder;
+        for (int b = 64; b < cap; b *= 2) batch_ladder.push_back(b);
+        if (cap >= 64) batch_ladder.push_back(cap);             // top rung = the exact VRAM ceiling
+        if (batch_ladder.empty()) batch_ladder.push_back(std::max(1, cap));
+        std::println("batch ladder (VRAM-fit, {} MiB budget): {} rungs, max batch {}",
+                     GPU_VRAM_MB, batch_ladder.size(), cap);
+        sub0::tune::Space gspace = { {"batch", std::vector<double>(batch_ladder.begin(), batch_ladder.end())} };
 #if defined(SUB0_TUNING)
         gspace.push_back({"tf32",     {0, 1}});
         gspace.push_back({"attn_bwd", {0, 1}});

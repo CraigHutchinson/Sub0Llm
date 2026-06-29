@@ -817,7 +817,9 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
 // MEASURED 2026-06 on sm_120 (train tok/s): 64->62k 128->105k 256->157k 384->176k 512->191k
 // 768->195k 1024->209k -- throughput keeps rising but with diminishing returns past ~512. cudaMalloc
 // failure (too big for VRAM) is handled gracefully (the alloc returns nonzero, the caller errors).
-constexpr int MAX_FWD_BATCH = 1024;
+// This is just a sanity ceiling: the real per-run upper bound is set by VRAM (memplan::max_batch_for_vram),
+// computed at tune time, so bf16's halved footprint can reach batches the old 1024 list could not.
+constexpr int MAX_FWD_BATCH = 4096;
 
 // Resident forward scratch. The batch-dependent buffers are sized to the largest batch seen so far
 // (g_fwd_cap, grown on demand); the fused-QKV weight buffers (wqkv) are batch-independent and built
