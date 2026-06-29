@@ -83,11 +83,11 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch) {
     const u64 Mm = u64(batch) * T;
     const u64 per_layer = 5 * Mm * C * FLOAT    // h_in, a, att, h_mid, fbuf  [M,C]
                         + 2 * Mm * FLOAT        // rinv1, rinv2  [M]
-                        + Mm * 3 * C * FLOAT    // qkv   [M,3C]
-                        + 2 * Mm * F * FLOAT;   // ff1, gact  [M,F]  (P-free flash: no [batch,H,T,T])
+                        + Mm * 3 * C * FLOAT;   // qkv   [M,3C]  (P-free flash: no [batch,H,T,T]; ff1/gact checkpointed)
     const u64 final_blk = 2 * Mm * C * FLOAT    // h_final, a_final  [M,C]
                         + Mm * FLOAT            // rinv_f  [M]
-                        + Mm * V * FLOAT;       // logits  [M,V]
+                        + Mm * V * FLOAT        // logits  [M,V]
+                        + 2 * Mm * F * FLOAT;   // ff1, gact  [M,F] single checkpoint scratch (recomputed in bwd)
     const u64 grad      = 4 * Mm * C * FLOAT    // dh, da, datt, dfbuf  [M,C]
                         + Mm * 3 * C * FLOAT    // dqkv  [M,3C]
                         + 2 * Mm * F * FLOAT    // dff1, dgact  [M,F]

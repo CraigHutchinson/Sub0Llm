@@ -836,9 +836,9 @@ struct TrainScratch {
     float* att  [N_LAYERS] = {};   // [M,C] attention output (= Wo input)
     float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
-    float* fbuf [N_LAYERS] = {};   // [M,C] rmsnorm2 output (= W1 input)
-    float* ff1  [N_LAYERS] = {};   // [M,F] pre-GELU (= GELU input)
-    float* gact [N_LAYERS] = {};   // [M,F] GELU output (= W2 input)
+    float* fbuf [N_LAYERS] = {};   // [M,C] rmsnorm2 output (= W1 input; checkpoint for ff1/gact recompute)
+    float* ff1  = nullptr;         // [M,F] pre-GELU scratch -- recomputed from fbuf in backward (not per-layer)
+    float* gact = nullptr;         // [M,F] GELU output scratch -- recomputed from fbuf in backward (not per-layer)
     // final block
     float* h_final = nullptr;      // [M,C] last residual stream (= rmsnorm_f input)
     float* rinv_f  = nullptr;      // [M]
@@ -877,9 +877,9 @@ int train_alloc(int batch) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf[l],  MC * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1[l],   MF * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact[l],  MF * sizeof(float)));
     }
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(float)));   // single (checkpoint scratch)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(float)));   // single (checkpoint scratch)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a_final, MC * sizeof(float)));
@@ -904,8 +904,9 @@ void train_free() {
     for (int l = 0; l < N_LAYERS; ++l) {
         cudaFree(g_tr.h_in[l]);  cudaFree(g_tr.rinv1[l]); cudaFree(g_tr.a[l]);    cudaFree(g_tr.qkv[l]);
         cudaFree(g_tr.att[l]);   cudaFree(g_tr.h_mid[l]); cudaFree(g_tr.rinv2[l]);
-        cudaFree(g_tr.fbuf[l]);  cudaFree(g_tr.ff1[l]);   cudaFree(g_tr.gact[l]);
+        cudaFree(g_tr.fbuf[l]);
     }
+    cudaFree(g_tr.ff1); cudaFree(g_tr.gact);
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
@@ -1080,9 +1081,9 @@ void forward_train(int batch, int T) {
         launch_linear(g_tr.att[l], Wo, nullptr, hmid, M, C, C);                      // hmid = proj
         launch_add(hin, hmid, hmid, MC);                                            // hmid = hin + proj
         launch_rmsnorm_train(hmid, ln2, g_tr.fbuf[l], g_tr.rinv2[l], M, C);         // f = rmsnorm(hmid,ln2)
-        launch_linear(g_tr.fbuf[l], W1, b1, g_tr.ff1[l], M, C, F);                  // ff1 = f.W1 + b1
-        launch_gelu(g_tr.ff1[l], g_tr.gact[l], MF);                                 // gelu
-        launch_linear(g_tr.gact[l], W2, b2, next, M, F, C);                         // next = ff2 = gelu.W2 + b2
+        launch_linear(g_tr.fbuf[l], W1, b1, g_tr.ff1, M, C, F);                     // ff1 = f.W1 + b1
+        launch_gelu(g_tr.ff1, g_tr.gact, MF);                                       // gelu
+        launch_linear(g_tr.gact, W2, b2, next, M, F, C);                            // next = ff2 = gelu.W2 + b2
         launch_add(hmid, next, next, MC);                                           // next = hmid + ff2
     }
     launch_rmsnorm_train(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);      // a_final = rmsnorm(h,ln_f)
@@ -1122,10 +1123,14 @@ void backward_device(int batch, int T, const int* d_lengths) {
 
     for (int l = N_LAYERS - 1; l >= 0; --l) {
         const int b0 = 2 + 10 * l;
+        const float* W1 = pb + L[b0 + 6].off, *b1 = pb + L[b0 + 7].off;
+        // checkpoint: ff1/gact were not saved -- recompute from the saved fbuf[l] before using them
+        launch_linear(g_tr.fbuf[l], W1, b1, g_tr.ff1, M, C, F);                     // ff1 = f.W1 + b1
+        launch_gelu(g_tr.ff1, g_tr.gact, MF);                                       // gelu
         // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact)
-        launch_linear_bwd(g_tr.gact[l], pb + L[b0 + 8].off, g_tr.dh, g_tr.dgact,
+        launch_linear_bwd(g_tr.gact, pb + L[b0 + 8].off, g_tr.dh, g_tr.dgact,
                           gb + L[b0 + 8].off, gb + L[b0 + 9].off, M, F, C);
-        launch_gelu_bwd(g_tr.ff1[l], g_tr.dgact, g_tr.dff1, MF);                    // dff1
+        launch_gelu_bwd(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                       // dff1
         launch_linear_bwd(g_tr.fbuf[l], pb + L[b0 + 6].off, g_tr.dff1, g_tr.dfbuf,
                           gb + L[b0 + 6].off, gb + L[b0 + 7].off, M, C, F);          // W1 backward
         launch_rmsnorm_bwd(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
