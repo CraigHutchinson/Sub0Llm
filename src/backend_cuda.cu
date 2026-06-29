@@ -242,24 +242,22 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     const float  scale    = 1.0f / sqrtf(static_cast<float>(d));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;   // q/k/v rows are in_stride apart
     const size_t out_base = static_cast<size_t>(b) * T * C;
-    float sc[SEQ_LEN];
     const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    float mx = -1e30f;
+    // Online (flash) softmax: stream keys, keeping a running max m, sum Z and value accumulator
+    // acc[head_dim] -- no float sc[SEQ_LEN] local array, so occupancy holds up at large T.
+    float m = -1e30f, Z = 0.f, acc[128] = {};   // head_dim assumed <= 128
     for (int j = 0; j <= i; ++j) {
         const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f;
-        for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
-        s *= scale; sc[j] = s; if (s > mx) mx = s;
-    }
-    float Z = 0.f;
-    for (int j = 0; j <= i; ++j) { sc[j] = __expf(sc[j] - mx); Z += sc[j]; }   // SFU fast exp
-    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
-    for (int a = 0; a < d; ++a) oi[a] = 0.f;
-    for (int j = 0; j <= i; ++j) {
-        const float pj = sc[j] / Z;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
+        const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn);
+        Z = Z * c + e;
         const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) oi[a] += pj * vj[a];
+        for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * vj[a];
+        m = mn;
     }
+    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
+    const float inv = 1.f / Z;
+    for (int a = 0; a < d; ++a) oi[a] = acc[a] * inv;
 }
 
 // Training attention: identical math to attn_kernel but also writes the softmax weights P (one
@@ -280,25 +278,26 @@ __global__ void attn_train_kernel(const float* __restrict__ q, const float* __re
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
     const size_t Prow     = ((static_cast<size_t>(b) * H + h) * T + i) * T;
-    float sc[SEQ_LEN];
     const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    float mx = -1e30f;
+    // Online (flash) softmax for the value accumulator (no sc[SEQ_LEN] spill), then a second pass
+    // recomputes p and writes the causal P row the backward pass consumes.
+    float m = -1e30f, Z = 0.f, acc[128] = {};   // head_dim assumed <= 128
     for (int j = 0; j <= i; ++j) {
         const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f;
-        for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
-        s *= scale; sc[j] = s; if (s > mx) mx = s;
-    }
-    float Z = 0.f;
-    for (int j = 0; j <= i; ++j) { sc[j] = __expf(sc[j] - mx); Z += sc[j]; }
-    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
-    for (int a = 0; a < d; ++a) oi[a] = 0.f;
-    const float invZ = 1.f / Z;
-    for (int j = 0; j <= i; ++j) {
-        const float pj = sc[j] * invZ;
-        P[Prow + j] = pj;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
+        const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn);
+        Z = Z * c + e;
         const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) oi[a] += pj * vj[a];
+        for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * vj[a];
+        m = mn;
+    }
+    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
+    const float invZ = 1.f / Z;
+    for (int a = 0; a < d; ++a) oi[a] = acc[a] * invZ;
+    for (int j = 0; j <= i; ++j) {
+        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
+        P[Prow + j] = __expf(s * scale - m) * invZ;
     }
 }
 
@@ -463,23 +462,24 @@ __global__ void attn_backward_head_kernel(const float* __restrict__ q, const flo
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
     const size_t Pbase    = (static_cast<size_t>(b) * H + h) * T * T;
-    float dP[SEQ_LEN];
     for (int i = 0; i < T; ++i) {
         const float* douti = dout + out_base + static_cast<size_t>(i) * C + off;
-        for (int j = 0; j <= i; ++j) {
+        float dot = 0.f;
+        for (int j = 0; j <= i; ++j) {                       // dv[j] += p*douti ; dot += p*(douti.v[j])
             const float p = P[Pbase + static_cast<size_t>(i) * T + j];
             const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
             float* dvj      = dv + in_base + static_cast<size_t>(j) * in_stride + off;
             float dp = 0.f;
             for (int a = 0; a < d; ++a) { dvj[a] += p * douti[a]; dp += douti[a] * vj[a]; }
-            dP[j] = dp;
+            dot += p * dp;
         }
-        float dot = 0.f;
-        for (int j = 0; j <= i; ++j) dot += P[Pbase + static_cast<size_t>(i) * T + j] * dP[j];
         const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
         float* dqi      = dq + in_base + static_cast<size_t>(i) * in_stride + off;
-        for (int j = 0; j <= i; ++j) {
-            const float ds = P[Pbase + static_cast<size_t>(i) * T + j] * (dP[j] - dot) * scale;
+        for (int j = 0; j <= i; ++j) {                       // recompute dp -> ds; no dP[T] local spill
+            const float p = P[Pbase + static_cast<size_t>(i) * T + j];
+            const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+            float dp = 0.f; for (int a = 0; a < d; ++a) dp += douti[a] * vj[a];
+            const float ds = p * (dp - dot) * scale;
             const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
             float* dkj      = dk + in_base + static_cast<size_t>(j) * in_stride + off;
             for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; dkj[a] += ds * qi[a]; }
@@ -504,21 +504,22 @@ __global__ void attn_backward_query_kernel(const float* __restrict__ q, const fl
     const size_t out_base = static_cast<size_t>(b) * T * C;
     const size_t Prow     = ((static_cast<size_t>(b) * H + h) * T + i) * T;
     const float* douti = dout + out_base + static_cast<size_t>(i) * C + off;
-    float dP[SEQ_LEN];
-    for (int j = 0; j <= i; ++j) {                            // dv[j] += p*douti ; dP[j] = douti . v[j]
+    float dot = 0.f;
+    for (int j = 0; j <= i; ++j) {                            // dv[j] += p*douti ; dot += p*(douti.v[j])
         const float p = P[Prow + j];
         const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
         float* dvj      = dv + in_base + static_cast<size_t>(j) * in_stride + off;
         float dp = 0.f;
         for (int a = 0; a < d; ++a) { atomicAdd(&dvj[a], p * douti[a]); dp += douti[a] * vj[a]; }
-        dP[j] = dp;
+        dot += p * dp;
     }
-    float dot = 0.f;
-    for (int j = 0; j <= i; ++j) dot += P[Prow + j] * dP[j];
     const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
     float* dqi      = dq + in_base + static_cast<size_t>(i) * in_stride + off;   // owned by query i
-    for (int j = 0; j <= i; ++j) {
-        const float ds = P[Prow + j] * (dP[j] - dot) * scale;
+    for (int j = 0; j <= i; ++j) {                           // recompute dp -> ds; no dP[T] local spill
+        const float p = P[Prow + j];
+        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        float dp = 0.f; for (int a = 0; a < d; ++a) dp += douti[a] * vj[a];
+        const float ds = p * (dp - dot) * scale;
         const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
         float* dkj      = dk + in_base + static_cast<size_t>(j) * in_stride + off;
         for (int a = 0; a < d; ++a) { dqi[a] += ds * kj[a]; atomicAdd(&dkj[a], ds * qi[a]); }
