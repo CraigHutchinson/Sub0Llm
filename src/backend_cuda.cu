@@ -190,6 +190,16 @@ __global__ void embed_kernel(const float* __restrict__ tok_emb, const int* __res
     if (m < M && j < C) h[m * C + j] = tok_emb[ids[m] * C + j];
 }
 
+// Activation-typed variants: write into the saved-activation store type (act_t). F32 build keeps
+// these identical to the float kernels above; BF16 stores half-width with FP32 source.
+template <class A>
+__global__ void embed_act_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
+                                 A* __restrict__ h, int M, int C) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && j < C) st_act(&h[m * C + j], tok_emb[ids[m] * C + j]);
+}
+
 // y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
 // TODO(perf): one thread per row serializes the C-length reduction. For larger C a block-per-row
 // warp/shared reduction (or a fused rmsnorm+linear epilogue) would cut memory traffic.
@@ -230,6 +240,12 @@ __global__ void rmsnorm_train_kernel(const float* __restrict__ x, const float* _
 __global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = dev_gelu(x[i]);
+}
+// act-typed GELU: y = gelu(x), reading/writing the store type (F32 build == gelu_kernel).
+template <class A>
+__global__ void gelu_act_kernel(const A* __restrict__ x, A* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) st_act(&y[i], dev_gelu(to_f32(x[i])));
 }
 
 // Elementwise add: c[i] = a[i] + b[i] (residual connections; safe in-place when c == a).
