@@ -211,6 +211,10 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
         t.cdquote_id    = add_marker(TOK_CDQUOTE);
         t.spell_start_id = add_marker(TOK_SPELL_START);
         t.spell_end_id  = add_marker(TOK_SPELL_END);
+        t.space2_id     = add_marker(TOK_SPACE2);
+        t.space4_id     = add_marker(TOK_SPACE4);
+        t.tab2_id       = add_marker(TOK_TAB2);
+        t.tab4_id       = add_marker(TOK_TAB4);
         t.join_scheme = true;
     } else {
         // Legacy scheme: only the byte values the corpus actually used (in byte order) then
@@ -357,31 +361,42 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
     bool dps = false;                 // decoder's pending_space after the last emitted token
     std::vector<int> seq, sub;
     auto emit_byte = [&](int b) { out.push_back(t.byte_base[static_cast<std::size_t>(b)]); };
-    // Realize the inter-content whitespace run [lo,hi) under the current dps (mirrors the decoder).
-    auto realize_gap = [&](std::size_t lo, std::size_t hi) {
+    // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
+    // implicit (free) under a pending space; an empty inter-content gap glues with JOIN; any
+    // other run is tiled into NEWLINE/PARA + run-length SPACE2/4 / TAB2/4 tokens, with a verbatim
+    // byte for an odd remainder ('\r', a lone space/tab, ...). `inter_content` is false for the
+    // trailing run (no following content), where a single space must stay literal, not implicit.
+    auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content) {
         const std::size_t gap = hi - lo;
         if (gap == 0) {
             if (dps) { out.push_back(t.join_id); dps = false; }       // glue: cancel the pending space
-        } else if (gap == 1 && stream[lo] == ' ') {
-            if (!dps) emit_byte(' ');                                 // space with no pending one -> literal
-        } else if (gap == 1 && stream[lo] == '\n') {
-            out.push_back(t.newline_id); dps = false;
-        } else if (gap == 2 && stream[lo] == '\n' && stream[lo + 1] == '\n') {
-            out.push_back(t.para_id); dps = false;
-        } else {
-            for (std::size_t k = lo; k < hi; ++k) emit_byte(stream[k]);
-            dps = false;
+            return;
         }
+        if (inter_content && gap == 1 && stream[lo] == ' ' && dps) return;  // implicit single space
+        for (std::size_t k = lo; k < hi;) {
+            const int c = stream[k];
+            if (c == '\n' && k + 1 < hi && stream[k + 1] == '\n') { out.push_back(t.para_id);    k += 2; }
+            else if (c == '\n')                                   { out.push_back(t.newline_id); k += 1; }
+            else if (c == ' ') {
+                std::size_t run = 0; while (k + run < hi && stream[k + run] == ' ')  ++run;
+                for (; run >= 4; run -= 4, k += 4) out.push_back(t.space4_id);
+                for (; run >= 2; run -= 2, k += 2) out.push_back(t.space2_id);
+                if (run == 1) { emit_byte(' '); ++k; }
+            } else if (c == '\t') {
+                std::size_t run = 0; while (k + run < hi && stream[k + run] == '\t') ++run;
+                for (; run >= 4; run -= 4, k += 4) out.push_back(t.tab4_id);
+                for (; run >= 2; run -= 2, k += 2) out.push_back(t.tab2_id);
+                if (run == 1) { emit_byte('\t'); ++k; }
+            } else { emit_byte(c); ++k; }                            // '\r' or other whitespace byte
+        }
+        dps = false;
     };
     std::size_t i = 0;
     while (i < n) {
         std::size_t g = i;
         while (g < n && is_ws_byte(stream[g])) ++g;     // whitespace gap [i, g)
         if (g >= n) {                                   // trailing whitespace (no content follows)
-            const std::size_t gap = g - i;
-            if (gap == 1 && stream[i] == '\n') out.push_back(t.newline_id);
-            else if (gap == 2 && stream[i] == '\n' && stream[i + 1] == '\n') out.push_back(t.para_id);
-            else for (std::size_t k = i; k < g; ++k) emit_byte(stream[k]);
+            tile_ws(i, g, /*inter_content=*/false);
             break;
         }
         // Directional double quote: bundle the common spacing into one OPEN/CLOSE token.
@@ -396,7 +411,7 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
             }
             // else: fall through to the bare-quote path
         }
-        realize_gap(i, g);
+        tile_ws(i, g, /*inter_content=*/true);
         i = g;
         // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
@@ -445,6 +460,10 @@ std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
         if (id == t.join_id)         { dps = false; continue; }
         if (id == t.newline_id)      { out += '\n';   dps = false; recase = Recase::None; continue; }
         if (id == t.para_id)         { out += "\n\n"; dps = false; recase = Recase::None; continue; }
+        if (id == t.space2_id)       { out += "  ";       dps = false; recase = Recase::None; continue; }
+        if (id == t.space4_id)       { out += "    ";     dps = false; recase = Recase::None; continue; }
+        if (id == t.tab2_id)         { out += "\t\t";     dps = false; recase = Recase::None; continue; }
+        if (id == t.tab4_id)         { out += "\t\t\t\t"; dps = false; recase = Recase::None; continue; }
         if (id == t.cap_id)          { recase = Recase::CapFirst; continue; }
         if (id == t.up_id)           { recase = Recase::UpWord;   continue; }
         if (id == t.odquote_id)      { if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue; }
@@ -561,6 +580,10 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         else if (code == TOK_CDQUOTE)     t.cdquote_id = i;
         else if (code == TOK_SPELL_START) t.spell_start_id = i;
         else if (code == TOK_SPELL_END)   t.spell_end_id   = i;
+        else if (code == TOK_SPACE2)      t.space2_id = i;
+        else if (code == TOK_SPACE4)      t.space4_id = i;
+        else if (code == TOK_TAB2)        t.tab2_id   = i;
+        else if (code == TOK_TAB4)        t.tab4_id   = i;
         else                              t.byte_base[static_cast<unsigned char>(code)] = i;
     }
     const int n_merges = static_cast<int>(ru32());

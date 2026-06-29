@@ -24,8 +24,13 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_tok Catch2::Catch2WithMa
 # Pure tokenizer-library tests: link ONLY sub0_tok + Catch2, NOT the engine. The tokenizer
 # is config-independent, so this target builds and runs without sub0_core / the generated
 # header -- fast to iterate, and unaffected when a training run locks the engine DLLs.
-add_executable(sub0_tok_tests tok_lib_tests.cpp)
+#   tok_lib_tests.cpp       — pinned worked examples (one construct per assertion)
+#   tok_roundtrip_fuzz.cpp  — generative net: dogfood the project's own source + random
+#                             mutation/blob fuzz + a token-pattern report. SUB0_SOURCE_DIR
+#                             lets it read the real tree for the dogfood/pattern cases.
+add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp)
 target_include_directories(sub0_tok_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0_tok_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_tok_tests PRIVATE sub0_tok Catch2::Catch2WithMain)
 catch_discover_tests(sub0_tok_tests)
 

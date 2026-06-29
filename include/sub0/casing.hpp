@@ -13,6 +13,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -33,6 +34,15 @@ constexpr int TOK_ODQUOTE = 261;  // opening double quote: ` "` (space-before, g
 constexpr int TOK_CDQUOTE = 262;  // closing double quote: `" ` (glue-before, space-after)
 constexpr int TOK_SPELL_START = 263;  // start of a spaceless group (N>=3 sub-token word; OOV/acronym/CamelCase)
 constexpr int TOK_SPELL_END   = 264;  // end of the spaceless group
+// Run-length whitespace tokens: a single inter-word space is free (implicit), but multi-space
+// runs (indentation, alignment) and tab runs otherwise cost one verbatim byte EACH. These tile
+// such runs greedily (4s before 2s, remainder as a verbatim byte) -- 2/4 cover the dominant
+// 2/4/8-wide indentation. The encoder only emits them for runs >= 2; a lone space/tab stays a
+// byte. See docs/TOKENIZER_DESIGN.md §6.
+constexpr int TOK_SPACE2 = 265;  // "  "   (two spaces)
+constexpr int TOK_SPACE4 = 266;  // "    " (four spaces)
+constexpr int TOK_TAB2   = 267;  // "\t\t"
+constexpr int TOK_TAB4   = 268;  // "\t\t\t\t"
 
 inline bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 inline bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
@@ -97,20 +107,49 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
     return out;
 }
 
+// An "interior connector": a byte that binds two word bytes into ONE unit when flanked by
+// them on both sides. The apostrophe keeps "don't"/"Lily's" whole; the underscore and hyphen
+// keep snake_case ("save_scan_state") and hyphenated compounds ("well-known",
+// "non-commercial") whole so BPE merges across them instead of paying a JOIN per separator
+// (each glued separator otherwise costs two JOIN tokens). A leading/trailing connector still
+// splits off (it is not flanked). See docs/TOKENIZER_DESIGN.md §8.
+inline bool is_interior_connector(int c) { return c == '\'' || c == '_' || c == '-'; }
+
 // End (exclusive) of the word unit beginning at `s[i]`, or `i` itself if `s[i]`
 // does not start one. A unit is a maximal run of word bytes (see is_word_byte)
-// with interior apostrophes kept — an apostrophe flanked by word bytes on both
-// sides, so "don't"/"Lily's" stay whole while a leading/trailing ' splits off.
+// with interior connectors kept (see is_interior_connector).
 inline std::size_t word_unit_end(const std::vector<int>& s, std::size_t i) {
     if (i >= s.size() || !is_word_byte(s[i])) return i;
     std::size_t j = i + 1;
     while (j < s.size()) {
         if (is_word_byte(s[j])) { ++j; continue; }
-        if (s[j] == '\'' && j + 1 < s.size() &&
+        if (is_interior_connector(s[j]) && j + 1 < s.size() &&
             is_word_byte(s[j - 1]) && is_word_byte(s[j + 1])) { ++j; continue; }
         break;
     }
     return j;
+}
+
+// Split a mixed-case alpha run into CamelCase / PascalCase segments at case transitions, so
+// each piece reuses the lowercase BPE merges + a CAP/UP marker instead of shattering into
+// near-character SPELL tokens (interior capitals are distinct bytes that never match the
+// lowercase merges). Boundaries: a lowercase->uppercase hump ("aA", e.g. "myFunc" -> my|Func)
+// and the last upper of an acronym run before a lowercase ("AAa", e.g. "HTMLParser" ->
+// HTML|Parser). Returns the per-segment lengths; a single element means the run is not
+// CamelCase-decomposable (a plain word/acronym handled by the normal path). See §8.
+inline std::vector<std::size_t> camel_segments(std::string_view w) {
+    std::vector<std::size_t> lens;
+    const std::size_t n = w.size();
+    std::size_t start = 0;
+    for (std::size_t k = 0; k + 1 < n; ++k) {
+        const unsigned char a = static_cast<unsigned char>(w[k]), b = static_cast<unsigned char>(w[k + 1]);
+        const bool hump = is_lower(a) && is_upper(b);
+        const bool acro = is_upper(a) && is_upper(b) &&
+                          k + 2 < n && is_lower(static_cast<unsigned char>(w[k + 2]));
+        if (hump || acro) { lens.push_back(k + 1 - start); start = k + 1; }
+    }
+    lens.push_back(n - start);
+    return lens;
 }
 
 // Corpus-aware truecasing. Each alpha word is classified:
@@ -127,33 +166,31 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
     std::vector<int> toks;
     toks.reserve(text.size());
     const std::size_t n = text.size();
-    for (std::size_t i = 0; i < n;) {
-        const unsigned char c = static_cast<unsigned char>(text[i]);
-        if (!is_alpha(c)) { toks.push_back(c); ++i; continue; }
 
-        std::size_t j = i;
-        while (j < n && is_alpha(static_cast<unsigned char>(text[j]))) ++j;
-        const std::string w = text.substr(i, j - i);
-        if (st) ++st->words;
-
-        std::string lw;
-        lw.reserve(w.size());
-        for (unsigned char ch : w) lw.push_back(static_cast<char>(to_lower(ch)));
-
+    // Emit ONE (sub-)word: classify its case and either collapse to a CAP/UP marker + the
+    // lowercase form, or keep it verbatim. `force_collapse` is set for CamelCase segments
+    // (the capital is structural word-boundary signal, not a name), so they always collapse
+    // and reuse the lowercase merges; a top-level word collapses only if its lowercase form
+    // is `attested` (a name-dominated form like "Spot" stays a distinct verbatim token).
+    auto emit_word = [&](std::string_view seg, bool force_collapse) {
+        const bool first_upper = is_upper(static_cast<unsigned char>(seg[0]));
         bool rest_lower = true, all_upper = true;
-        for (std::size_t k = 1; k < w.size(); ++k)
-            if (!is_lower(static_cast<unsigned char>(w[k]))) rest_lower = false;
-        for (unsigned char ch : w)
-            if (!is_upper(ch)) all_upper = false;
+        for (std::size_t k = 0; k < seg.size(); ++k) {
+            const unsigned char ch = static_cast<unsigned char>(seg[k]);
+            if (!is_upper(ch))         all_upper = false;
+            if (k > 0 && !is_lower(ch)) rest_lower = false;
+        }
+        std::string lw;
+        lw.reserve(seg.size());
+        for (unsigned char ch : seg) lw.push_back(static_cast<char>(to_lower(ch)));
 
-        const bool first_upper = is_upper(static_cast<unsigned char>(w[0]));
-        const bool capitalized = first_upper && rest_lower;   // "The", single "I"
-        const bool upper       = all_upper && w.size() >= 2;  // "HELLO"
-        const bool attested_lw = attested.contains(lw);
+        const bool capitalized = first_upper && rest_lower;     // "The", single "I", "Non"
+        const bool upper       = all_upper && seg.size() >= 2;  // "HELLO", "HTML"
+        const bool collapse    = force_collapse || attested.contains(lw);
 
         int marker = -1;
-        if (upper && attested_lw)            marker = TOK_UP;
-        else if (capitalized && attested_lw) marker = TOK_CAP;
+        if (upper && collapse)            marker = TOK_UP;
+        else if (capitalized && collapse) marker = TOK_CAP;
 
         if (marker >= 0) {
             toks.push_back(marker);
@@ -161,7 +198,30 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
             for (unsigned char ch : lw) toks.push_back(ch);
         } else {
             if (st && first_upper) ++st->names;  // capitalized but not collapsed -> kept verbatim
+            for (unsigned char ch : seg) toks.push_back(ch);
+        }
+    };
+
+    for (std::size_t i = 0; i < n;) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (!is_alpha(c)) { toks.push_back(c); ++i; continue; }
+
+        std::size_t j = i;
+        bool any_upper = false;
+        while (j < n && is_alpha(static_cast<unsigned char>(text[j]))) {
+            if (is_upper(static_cast<unsigned char>(text[j]))) any_upper = true;
+            ++j;
+        }
+        const std::string_view w(text.data() + i, j - i);
+        if (st) ++st->words;
+
+        if (!any_upper) {                                       // all-lowercase fast path
             for (unsigned char ch : w) toks.push_back(ch);
+        } else if (const auto segs = camel_segments(w); segs.size() >= 2) {
+            std::size_t off = 0;                                // CamelCase -> one collapsed word per segment
+            for (std::size_t len : segs) { emit_word(w.substr(off, len), /*force_collapse=*/true); off += len; }
+        } else {
+            emit_word(w, /*force_collapse=*/false);             // plain word / acronym (attestation-gated)
         }
         i = j;
     }

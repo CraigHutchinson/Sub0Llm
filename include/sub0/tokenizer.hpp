@@ -104,6 +104,8 @@ struct Tokenizer {
     int                  join_id = -1, newline_id = -1, para_id = -1;
     int                  odquote_id = -1, cdquote_id = -1;        // directional double quotes (§3)
     int                  spell_start_id = -1, spell_end_id = -1;  // spaceless-group delimiters (§4, N>=3 words)
+    int                  space2_id = -1, space4_id = -1;          // run-length whitespace tokens (§6)
+    int                  tab2_id = -1, tab4_id = -1;
     std::vector<int>     base_symbol;              // base id -> symbol code (0..255, 256 cap, 257 up)
     std::vector<std::pair<int, int>> merges;       // ordered learned merges (left,right)
     std::unordered_map<std::pair<int, int>, int, PairHash> merge_rank;  // (l,r) -> merge index

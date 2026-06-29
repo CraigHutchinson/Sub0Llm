@@ -95,7 +95,7 @@ TEST_CASE("encode is deterministic", "[tok]") {
 TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
     REQUIRE(t.join_scheme);
-    REQUIRE(t.n_base == 265);                 // 256 bytes + CAP,UP,JOIN,NEWLINE,PARA,ODQUOTE,CDQUOTE,SPELL_START,SPELL_END
+    REQUIRE(t.n_base == 269);                 // 256 bytes + 13 markers
     REQUIRE(t.cap_id == 256);
     REQUIRE(t.up_id == 257);
     REQUIRE(t.join_id == 258);
@@ -105,6 +105,10 @@ TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     REQUIRE(t.cdquote_id == 262);
     REQUIRE(t.spell_start_id == 263);
     REQUIRE(t.spell_end_id == 264);
+    REQUIRE(t.space2_id == 265);
+    REQUIRE(t.space4_id == 266);
+    REQUIRE(t.tab2_id == 267);
+    REQUIRE(t.tab4_id == 268);
     REQUIRE(t.vocab > t.n_base);              // merges still learned on top
 }
 
@@ -130,10 +134,40 @@ TEST_CASE("JOIN scheme: round-trips whitespace variety", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
     REQUIRE(round_trips(t, "line one\nline two"));             // single newline -> NEWLINE
     REQUIRE(round_trips(t, "para one\n\npara two"));           // blank line  -> PARA
-    REQUIRE(round_trips(t, "a  b   c"));                       // multi-space -> verbatim
-    REQUIRE(round_trips(t, "tab\there"));                      // tab         -> verbatim
+    REQUIRE(round_trips(t, "a  b   c"));                       // multi-space -> SPACE2 (+ byte)
+    REQUIRE(round_trips(t, "tab\there"));                      // lone tab    -> verbatim byte
     REQUIRE(round_trips(t, " leading and trailing "));         // edge whitespace
-    REQUIRE(round_trips(t, "x\n\n\ny"));                       // 3 newlines  -> verbatim
+    REQUIRE(round_trips(t, "x\n\n\ny"));                       // 3 newlines  -> PARA + NEWLINE
+}
+
+// Run-length whitespace: multi-space/tab runs collapse to SPACE2/4 / TAB2/4 (so code
+// indentation stops costing one token per space); a single inter-word space stays free.
+TEST_CASE("JOIN scheme: run-length whitespace tokens collapse indentation", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    auto enc = [&](const std::string& s) { return sub0::tok::encode(t, s); };
+
+    // 4-space indent after a newline -> NEWLINE + SPACE4 (was 1 nl byte + 4 space bytes).
+    const std::vector<int> ind = enc("a\n    b");
+    REQUIRE(std::count(ind.begin(), ind.end(), t.newline_id) == 1);
+    REQUIRE(std::count(ind.begin(), ind.end(), t.space4_id) == 1);
+    REQUIRE(std::count(ind.begin(), ind.end(), ' ') == 0);    // no literal space bytes
+    REQUIRE(round_trips(t, "a\n    b"));
+
+    // Greedy tiling: 8->2xSPACE4, 6->SPACE4+SPACE2, 3->SPACE2+space, 2->SPACE2.
+    const std::vector<int> sp8 = enc("a\n        b");
+    REQUIRE(std::count(sp8.begin(), sp8.end(), t.space4_id) == 2);
+    REQUIRE(round_trips(t, "x        y"));                     // 8 spaces
+    REQUIRE(round_trips(t, "x      y"));                       // 6 spaces
+    REQUIRE(round_trips(t, "x   y"));                          // 3 spaces (SPACE2 + 1)
+    const std::vector<int> sp2 = enc("x  y");                  // 2 spaces -> exactly one SPACE2
+    REQUIRE(std::count(sp2.begin(), sp2.end(), t.space2_id) == 1);
+
+    // Tabs tile the same way; a single inter-word space is still implicit (free).
+    const std::vector<int> tb4 = enc("a\t\t\t\tb");
+    REQUIRE(std::count(tb4.begin(), tb4.end(), t.tab4_id) == 1);
+    REQUIRE(round_trips(t, "a\t\tb\tc"));                      // TAB2 + lone tab byte
+    for (int id : enc("the dog ran")) REQUIRE(id != t.space2_id);   // single spaces never tile
+    REQUIRE(round_trips(t, "\n\t  mixed\n\n    indent\t\t"));  // mixed nl/tab/space + trailing
 }
 
 TEST_CASE("JOIN scheme: complete base encodes out-of-corpus bytes", "[tok][join]") {
@@ -193,6 +227,39 @@ TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
     REQUIRE(round_trips(t, "She said, \"Don't touch the antidisestablishment thing!\""));
     REQUIRE(round_trips(t, "ANTIDISESTABLISHMENT"));          // all-caps long word: UP across the SPELL group
     REQUIRE(round_trips(t, "The Supercalifragilistic word ends here ."));
+}
+
+// CamelCase / PascalCase splits at case transitions into one collapsed sub-word per segment
+// (each reusing the lowercase merges) instead of shattering into near-character SPELL tokens.
+TEST_CASE("JOIN scheme: CamelCase splits into per-segment case markers", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    // "NonCommercial" -> Non | Commercial : two capitalised segments -> two CAP markers.
+    const std::vector<int> nc = sub0::tok::encode(t, "NonCommercial");
+    REQUIRE(std::count(nc.begin(), nc.end(), t.cap_id) == 2);
+    REQUIRE(round_trips(t, "NonCommercial"));
+    // "HTMLParser" -> HTML (acronym, UP) | Parser (CAP).
+    const std::vector<int> hp = sub0::tok::encode(t, "HTMLParser");
+    REQUIRE(std::count(hp.begin(), hp.end(), t.up_id) == 1);
+    REQUIRE(std::count(hp.begin(), hp.end(), t.cap_id) == 1);
+    REQUIRE(round_trips(t, "HTMLParser"));
+    // camelCase: a leading lowercase segment (no marker) + a capitalised one.
+    REQUIRE(round_trips(t, "myAwesomeFunction"));
+    REQUIRE(round_trips(t, "macOS and iOS devices"));
+    REQUIRE(round_trips(t, "Commons Attribution-NonCommercial-NoDerivs"));
+}
+
+// snake_case / hyphenated compounds: the interior '_' and '-' bind the word into ONE unit
+// (no JOIN per separator) so BPE merges across them; round-trip is preserved.
+TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const std::vector<int> ss = sub0::tok::encode(t, "save_scan_state");
+    REQUIRE(std::count(ss.begin(), ss.end(), t.join_id) == 0);   // one unit, not save<J>_<J>scan...
+    REQUIRE(round_trips(t, "save_scan_state"));
+    const std::vector<int> wk = sub0::tok::encode(t, "well-known");
+    REQUIRE(std::count(wk.begin(), wk.end(), t.join_id) == 0);
+    REQUIRE(round_trips(t, "well-known and non-commercial"));
+    // A leading/trailing separator is NOT interior -> still splits off (round-trip holds).
+    REQUIRE(round_trips(t, "--flag -x _leading trailing_"));
 }
 
 // Regression: an all-caps word + a possessive/contraction ("NASA's") truecases to UP + the
