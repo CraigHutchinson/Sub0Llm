@@ -81,9 +81,10 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);
     const u64 Mm = u64(batch) * T;
-    const u64 per_layer = 2 * Mm * C * FLOAT    // h_in, h_mid  [M,C]
+    const u64 per_layer = 2 * Mm * C * A        // h_in, h_mid  [M,C] bf16 residual stream
                         + 2 * Mm * FLOAT;       // rinv1, rinv2  [M]  (a/qkv/att/ff1/gact checkpointed -> single, below)
-    const u64 final_blk = 2 * Mm * C * FLOAT    // h_final, a_final  [M,C]
+    const u64 final_blk = Mm * C * A            // h_final [M,C] bf16 residual
+                        + Mm * C * FLOAT        // a_final [M,C] f32 (lm_head input stays f32)
                         + Mm * FLOAT            // rinv_f  [M]
                         + Mm * V * FLOAT        // logits  [M,V]
                         + Mm * C * A            // a [M,C] single checkpoint scratch (bf16)

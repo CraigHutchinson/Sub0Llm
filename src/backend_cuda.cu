@@ -201,6 +201,13 @@ __global__ void embed_act_kernel(const float* __restrict__ tok_emb, const int* _
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) st_act(&h[m * C + j], tok_emb[ids[m] * C + j]);
 }
+template <class A>
+__global__ void embed_add_act_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
+                                     const int* __restrict__ ids, A* __restrict__ h, int M, int T, int C) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m < M && j < C) { const int t = m % T; st_act(&h[m * C + j], tok_emb[ids[m] * C + j] + pos_emb[t * C + j]); }
+}
 
 // y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
 // TODO(perf): one thread per row serializes the C-length reduction. For larger C a block-per-row
@@ -215,24 +222,6 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restr
         for (int j = 0; j < C; ++j) ms += xr[j] * xr[j];
         ms /= C;
         const float r = rsqrtf(ms + eps);              // CUDA fast reciprocal sqrt
-        float* yr = y + static_cast<size_t>(m) * C;
-        for (int j = 0; j < C; ++j) yr[j] = xr[j] * r * gamma[j];
-    }
-}
-
-// Training RMSNorm: same as rmsnorm_kernel but also saves the per-row reciprocal-rms `rinv` that
-// the backward pass needs (so backward uses the exact value forward produced).
-__global__ void rmsnorm_train_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
-                                     float* __restrict__ y, float* __restrict__ rinv, int rows, int C) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m < rows) {
-        const float eps = 1e-5f;
-        const float* xr = x + static_cast<size_t>(m) * C;
-        float ms = 0.f;
-        for (int j = 0; j < C; ++j) ms += xr[j] * xr[j];
-        ms /= C;
-        const float r = rsqrtf(ms + eps);
-        rinv[m] = r;
         float* yr = y + static_cast<size_t>(m) * C;
         for (int j = 0; j < C; ++j) yr[j] = xr[j] * r * gamma[j];
     }
@@ -454,22 +443,23 @@ __global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict
     dbias[o] = s;
 }
 
-// RMSNorm backward (op_rmsnorm): one row/thread. ACCUMULATES dx into the running residual-stream
-// gradient (+=) and dgamma (atomic, shared across rows). Mirrors the CPU formula exactly.
-__global__ void rmsnorm_backward_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
-                                        const float* __restrict__ rinv, const float* __restrict__ dy,
-                                        float* __restrict__ dx, float* __restrict__ dgamma,
-                                        int rows, int C) {
+// RMSNorm backward: one row/thread. ACCUMULATES dx into the running residual-stream gradient (+=)
+// and dgamma (atomic). Residual input x is the store type; dy/dx and dgamma stay F32. F32 build:
+// X=float; BF16: reads the half-width residual. Mirrors the CPU formula exactly.
+template <class X>
+__global__ void rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
+                                            const float* __restrict__ rinv, const float* __restrict__ dy,
+                                            float* __restrict__ dx, float* __restrict__ dgamma, int rows, int C) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= rows) return;
-    const float* xr  = x  + static_cast<size_t>(t) * C;
+    const X*     xr  = x  + static_cast<size_t>(t) * C;
     const float* dyr = dy + static_cast<size_t>(t) * C;
     float*       dxr = dx + static_cast<size_t>(t) * C;
     float S = 0.f;
-    for (int j = 0; j < C; ++j) S += dyr[j] * gamma[j] * xr[j];
+    for (int j = 0; j < C; ++j) S += dyr[j] * gamma[j] * to_f32(xr[j]);
     const float r = rinv[t], r3 = r * r * r;
     for (int j = 0; j < C; ++j) {
-        const float xj = xr[j], dyj = dyr[j], gj = gamma[j];
+        const float xj = to_f32(xr[j]), dyj = dyr[j], gj = gamma[j];
         dxr[j] += r * dyj * gj - (xj * r3 / C) * S;
         atomicAdd(&dgamma[j], dyj * xj * r);
     }
@@ -700,10 +690,6 @@ inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T, i
     const int block = 64;
     rmsnorm_kernel<<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, T, C);
 }
-inline void launch_rmsnorm_train(const float* dX, const float* dG, float* dY, float* dRinv, int T, int C) {
-    const int block = 64;
-    rmsnorm_train_kernel<<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, dRinv, T, C);
-}
 inline void launch_gelu(const float* dX, float* dY, int n) {
     const int block = 256;
     gelu_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dX, dY, n);
@@ -711,6 +697,10 @@ inline void launch_gelu(const float* dX, float* dY, int n) {
 inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     const int block = 256;
     add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
+}
+template <class A> inline void launch_add_t(const A* dA, const A* dB, A* dC, int n) {
+    const int block = 256;
+    add_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
 }
 // act-typed FFN launchers (bf16 storage): rmsnorm f32->act, bias-add on act, gelu/gelu-bwd act.
 template <class X, class Y>
@@ -784,10 +774,10 @@ inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
     if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in);   // dX=dY.W^T
     gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW=X^T.dY
 }
-inline void launch_rmsnorm_bwd(const float* x, const float* gamma, const float* rinv,
+template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
                                const float* dy, float* dx, float* dgamma, int rows, int C) {
     const int block = 64;
-    rmsnorm_backward_kernel<<<(rows + block - 1) / block, block, 0, g_stream>>>(
+    rmsnorm_backward_act_kernel<X><<<(rows + block - 1) / block, block, 0, g_stream>>>(
         x, gamma, rinv, dy, dx, dgamma, rows, C);
 }
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
@@ -900,19 +890,19 @@ void fwd_free() {
 // (no recompute), plus the gradient temporaries that thread the reverse pass. Sized once for the
 // full M = MAX_FWD_BATCH * SEQ_LEN. Allocated lazily by train_alloc, freed by sub0_cuda_shutdown.
 struct TrainScratch {
-    // per-layer saved forward activations (residual h_* stay F32; transient scratch is act_t)
-    float* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
+    // per-layer saved forward activations (residual stream stored bf16; transient scratch is act_t)
+    act_t* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
     float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
     act_t* a    = nullptr;         // [M,C] rmsnorm1 output scratch (bf16) -- recomputed from h_in in backward (not per-layer)
     act_t* qkv  = nullptr;         // [M,3C] fused q|k|v scratch (bf16) -- recomputed from a in backward (not per-layer)
     act_t* att  = nullptr;         // [M,C] attention output scratch (bf16) -- recomputed from qkv in backward (not per-layer)
-    float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
+    act_t* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
     act_t* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
     act_t* ff1  = nullptr;         // [M,F] pre-GELU scratch -- recomputed from fbuf in backward (not per-layer)
     act_t* gact = nullptr;         // [M,F] GELU output scratch -- recomputed from fbuf in backward (not per-layer)
     // final block
-    float* h_final = nullptr;      // [M,C] last residual stream (= rmsnorm_f input)
+    act_t* h_final = nullptr;      // [M,C] last residual stream (= rmsnorm_f input)
     float* rinv_f  = nullptr;      // [M]
     float* a_final = nullptr;      // [M,C] rmsnorm_f output (= lm_head input)
     float* logits  = nullptr;      // [M,V]
@@ -949,9 +939,9 @@ int train_alloc(int batch) {
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
     for (int l = 0; l < N_LAYERS; ++l) {
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[l],  MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[l],  MC * sizeof(act_t)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv1[l], Mm * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(act_t)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
     }
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a,      MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
@@ -960,7 +950,7 @@ int train_alloc(int batch) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att,    MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a_final, MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.logits,  MV * sizeof(float)));
@@ -1161,9 +1151,9 @@ void forward_train(int batch, int T) {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
-            embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T, C);
+            embed_add_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T, C);
         else
-            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, C);
+            embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, C);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -1173,26 +1163,26 @@ void forward_train(int batch, int T) {
         const float* b1  = base + L[b0 + 7].off;
         const float* W2  = base + L[b0 + 8].off;
         const float* b2  = base + L[b0 + 9].off;
-        float* const hin  = g_tr.h_in[l];
-        float* const hmid = g_tr.h_mid[l];
-        float* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
+        act_t* const hin  = g_tr.h_in[l];
+        act_t* const hmid = g_tr.h_mid[l];
+        act_t* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
-        launch_rmsnorm_train_t<float, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M, C);       // a = rmsnorm(hin,ln1) bf16
+        launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M, C);       // a = rmsnorm(hin,ln1) bf16
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
-        launch_linear_t<act_t, float>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16 GEMM -> f32)
-        launch_add(hin, hmid, hmid, MC);                                            // hmid = hin + proj
-        launch_rmsnorm_train_t<float, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);   // fbuf bf16
+        launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
+        launch_add_t<act_t>(hin, hmid, hmid, MC);                                   // hmid = hin + proj
+        launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);   // fbuf bf16
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
         launch_bias_act(g_tr.ff1, b1, M, F);                                       // ff1 = f.W1 + b1
         launch_gelu_t(g_tr.ff1, g_tr.gact, MF);                                     // gelu
-        launch_linear_t<act_t, float>(g_tr.gact, g_w2_16[l], next, M, F, C);        // next = ff2
-        { const int n2 = M * C, bk = 256; bias_add_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(next, b2, M, C); }
-        launch_add(hmid, next, next, MC);                                           // next = hmid + ff2
+        launch_linear_t<act_t, act_t>(g_tr.gact, g_w2_16[l], next, M, F, C);        // next = ff2 bf16
+        launch_bias_act(next, b2, M, C);
+        launch_add_t<act_t>(hmid, next, next, MC);                                  // next = hmid + ff2
     }
-    launch_rmsnorm_train(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);      // a_final = rmsnorm(h,ln_f)
+    launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);  // a_final f32
     launch_linear(g_tr.a_final, lm_head, lm_bias, g_tr.logits, M, C, V);           // logits
 }
 
@@ -1224,14 +1214,14 @@ void backward_device(int batch, int T, const int* d_lengths) {
                       gb + L[fi + 1].off, gb + L[fi + 2].off, M, C, V);
     // rmsnorm_f: dh starts here (grad into h_final)
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dh, 0, static_cast<size_t>(MC) * sizeof(float), g_stream));
-    launch_rmsnorm_bwd(g_tr.h_final, pb + L[fi + 0].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
+    launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + 0].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
                        gb + L[fi + 0].off, M, C);
 
     for (int l = N_LAYERS - 1; l >= 0; --l) {
         const int b0 = 2 + 10 * l;
         const float* W1 = pb + L[b0 + 6].off, *b1 = pb + L[b0 + 7].off;
         // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then ff1/gact, before use
-        launch_rmsnorm_train_t<float, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M, C);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M, C);
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
         launch_bias_act(g_tr.ff1, b1, M, F);
         launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
@@ -1242,11 +1232,11 @@ void backward_device(int batch, int T, const int* d_lengths) {
         launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
         launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + 6].off, M, C, F);
         { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M, F); }
-        launch_rmsnorm_bwd(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + 1].off, M, C);                       // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
-        launch_rmsnorm_train_t<float, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
@@ -1264,7 +1254,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
             split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
                 g_tr.dwqkv, gb + L[b0 + 2].off, gb + L[b0 + 3].off, gb + L[b0 + 4].off, C);
         }
-        launch_rmsnorm_bwd(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
                            g_tr.dh, gb + L[b0 + 0].off, M, C);                       // dh += -> d(h_in)
     }
     // embed backward: scatter dh into tok_emb (+ pos_emb under Absolute) grads
