@@ -19,8 +19,10 @@
 #include <cstdio>
 #include <vector>
 #include <cmath>
+#include <type_traits>
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 
 // Export macro for the CUDA backend's C-ABI entry points (the clang-built host links
@@ -48,6 +50,16 @@ static_assert(ACT_DTYPE == Dtype::F32,
     "BF16 activation storage is not wired yet; build with -DSUB0_PRECISION_ACT=F32/AUTO (TODO(bf16-acts)).");
 
 namespace {
+
+// Saved-activation element type. ACT_DTYPE selects the storage precision (configurator-baked):
+// F32 today; BF16 halves the per-token train scratch on sm_80+ once the kernels are templated.
+// FP32 accumulate is preserved (cuBLAS computeType / kernel math both stay float regardless).
+using act_t = std::conditional_t<ACT_DTYPE == Dtype::BF16, __nv_bfloat16, float>;
+constexpr cudaDataType_t ACT_CUDA = (ACT_DTYPE == Dtype::BF16) ? CUDA_R_16BF : CUDA_R_32F;
+[[maybe_unused]] __device__ inline float  to_f32(float v)         { return v; }
+[[maybe_unused]] __device__ inline float  to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+[[maybe_unused]] __device__ inline void   st_act(float* p, float v)         { *p = v; }
+[[maybe_unused]] __device__ inline void   st_act(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 // CUDA error check for the self-test: report file:line + the error string and bail out
 // of the calling function with a nonzero code. The full backend will route failures
