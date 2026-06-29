@@ -86,14 +86,15 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 final_blk = 2 * Mm * C * FLOAT    // h_final, a_final  [M,C]
                         + Mm * FLOAT            // rinv_f  [M]
                         + Mm * V * FLOAT        // logits  [M,V]
-                        + Mm * C * FLOAT        // a [M,C] single checkpoint scratch
+                        + Mm * C * A            // a [M,C] single checkpoint scratch (bf16)
                         + Mm * C * A            // fbuf [M,C] bf16 FFN checkpoint scratch
                         + 2 * Mm * F * A        // ff1, gact  [M,F] bf16 FFN scratch
-                        + Mm * 3 * C * FLOAT    // qkv [M,3C] single checkpoint scratch (recomputed in bwd)
-                        + Mm * C * FLOAT;       // att [M,C] single checkpoint scratch (recomputed in bwd)
-    const u64 grad      = 3 * Mm * C * FLOAT    // dh, da, datt  [M,C]
+                        + Mm * 3 * C * A        // qkv [M,3C] single checkpoint scratch (bf16, recomputed in bwd)
+                        + Mm * C * A;           // att [M,C] single checkpoint scratch (bf16, recomputed in bwd)
+    const u64 grad      = 2 * Mm * C * FLOAT    // dh, da  [M,C] f32
+                        + Mm * C * A            // datt [M,C] bf16
                         + Mm * C * (FLOAT + A)  // dfbuf [M,C] f32 + dh16 [M,C] bf16
-                        + Mm * 3 * C * FLOAT    // dqkv  [M,3C]
+                        + Mm * 3 * C * A        // dqkv  [M,3C] bf16
                         + 2 * Mm * F * A        // dff1, dgact  [M,F] bf16
                         + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]

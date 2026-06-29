@@ -54,6 +54,10 @@ constexpr cudaDataType_t ACT_CUDA = (ACT_DTYPE == Dtype::BF16) ? CUDA_R_16BF : C
 [[maybe_unused]] __device__ inline float  to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
 [[maybe_unused]] __device__ inline void   st_act(float* p, float v)         { *p = v; }
 [[maybe_unused]] __device__ inline void   st_act(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+[[maybe_unused]] __device__ inline void   atomicAdd_act(float* p, float v)         { atomicAdd(p, v); }
+// bf16 atomic-add fallback: read-modify-write (no native bf16 atomic). Only the query-scheme attn
+// backward uses it; the head scheme (bf16 default) is atomic-free so contention is not exercised.
+[[maybe_unused]] __device__ inline void   atomicAdd_act(__nv_bfloat16* p, float v) { *p = __float2bfloat16(__bfloat162float(*p) + v); }
 // Down-cast a float buffer into the act_t store type (bf16 weight mirrors + dh16). F32: plain copy.
 __global__ void f32_to_act_kernel(const float* __restrict__ x, act_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -645,6 +649,72 @@ __global__ void attn_backward_query_kernel(const float* __restrict__ q, const fl
     }
 }
 
+// act-typed attention backward: q/k/v and dqkv in the store type, dout act, FP32 softmax+accum.
+// Mirrors attn_backward_head/query exactly; dqkv must be zeroed before launch. Two schemes by knob.
+template <class A>
+__global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
+                                          const A* __restrict__ v, const A* __restrict__ dout,
+                                          A* __restrict__ dq, A* __restrict__ dk, A* __restrict__ dv,
+                                          int batch, int T, int C, int H, int in_stride) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch * H) return;
+    const int b = idx / H, h = idx % H, d = C / H, off = h * d;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
+    for (int i = 0; i < T; ++i) {
+        const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+        const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
+        float m = -1e30f, Z = 0.f;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+            float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
+            const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn; }
+        const float invZ = 1.f / Z; float dot = 0.f;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+            float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]);
+            const float p = __expf(s * scale - m) * invZ; const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+            A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off; float dp = 0.f;
+            for (int a = 0; a < d; ++a) { st_act(&dvj[a], to_f32(dvj[a]) + p * to_f32(di[a])); dp += to_f32(di[a]) * to_f32(vj[a]); }
+            dot += p * dp; }
+        A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+            const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off; float s = 0.f, dp = 0.f;
+            for (int a = 0; a < d; ++a) { s += to_f32(qi[a]) * to_f32(kj[a]); dp += to_f32(di[a]) * to_f32(vj[a]); }
+            const float p = __expf(s * scale - m) * invZ, ds = p * (dp - dot) * scale;
+            A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
+            for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); st_act(&dkj[a], to_f32(dkj[a]) + ds * to_f32(qi[a])); } }
+    }
+}
+template <class A>
+__global__ void attn_backward_query_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
+                                           const A* __restrict__ v, const A* __restrict__ dout,
+                                           A* __restrict__ dq, A* __restrict__ dk, A* __restrict__ dv,
+                                           int batch, int T, int C, int H, int in_stride) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x; const int per = H * T;
+    const int b = idx / per; if (b >= batch) return;
+    const int rem = idx - b * per, h = rem / T, i = rem % T, d = C / H, off = h * d;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d));
+    const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
+    const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+    const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
+    float m = -1e30f, Z = 0.f;
+    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
+        const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn; }
+    const float invZ = 1.f / Z; float dot = 0.f;
+    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]);
+        const float p = __expf(s * scale - m) * invZ; const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off; float dp = 0.f;
+        for (int a = 0; a < d; ++a) { atomicAdd_act(&dvj[a], p * to_f32(di[a])); dp += to_f32(di[a]) * to_f32(vj[a]); }
+        dot += p * dp; }
+    A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
+    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off; float s = 0.f, dp = 0.f;
+        for (int a = 0; a < d; ++a) { s += to_f32(qi[a]) * to_f32(kj[a]); dp += to_f32(di[a]) * to_f32(vj[a]); }
+        const float p = __expf(s * scale - m) * invZ, ds = p * (dp - dot) * scale;
+        A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
+        for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); atomicAdd_act(&dkj[a], ds * to_f32(qi[a])); } }
+}
+
 // Embedding backward (op_embed x2): scatter-add the residual-stream grad into tok_emb / pos_emb
 // rows. Multiple rows map to the same token/position, so accumulation is atomic. One thread per
 // (row m, channel j). pos = m % T (position within the window).
@@ -860,6 +930,16 @@ inline void launch_rope_bwd(float* dqkv, int batch, int T, int C, int H, int in_
     const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
     rope_backward_kernel<<<grid, block, 0, g_stream>>>(dqkv, batch, T, C, H, in_stride, ROPE_THETA);
 }
+template <class A> inline void launch_rope_t(A* qkv, int batch, int T, int C, int H, int in_stride) {
+    const dim3 block(32, 8);
+    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_act_kernel<A><<<grid, block, 0, g_stream>>>(qkv, batch, T, C, H, in_stride, ROPE_THETA);
+}
+template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T, int C, int H, int in_stride) {
+    const dim3 block(32, 8);
+    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_bwd_act_kernel<A><<<grid, block, 0, g_stream>>>(dqkv, batch, T, C, H, in_stride, ROPE_THETA);
+}
 
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
 // and upstream grad dY[M,out], produce dX[M,in] = dY.W^T and dW[in,out] = X^T.dY via two cuBLAS
@@ -903,6 +983,26 @@ inline void launch_attn_bwd(const float* qkv, const float* dout, float* dqkv,
     } else {
         const int total = batch * H;              // one thread per (window, head) -- large batch (default)
         attn_backward_head_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(
+            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
+    }
+}
+
+// act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
+template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
+                              int batch, int T, int C, int H, int in_stride) {
+    const int block = 64, total = batch * H * T;
+    attn_train_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
+}
+template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
+                            int batch, int T, int C, int H, int in_stride) {
+    const int block = 64;
+    if (AttnBwdPerQuery::get()) {
+        const int total = batch * H * T;
+        attn_backward_query_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(
+            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
+    } else {
+        const int total = batch * H;
+        attn_backward_head_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(
             qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
     }
 }
@@ -998,9 +1098,9 @@ struct TrainScratch {
     // per-layer saved forward activations (residual h_* stay F32; transient scratch is act_t)
     float* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
     float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
-    float* a    = nullptr;         // [M,C] rmsnorm1 output scratch -- recomputed from h_in in backward (not per-layer)
-    float* qkv  = nullptr;         // [M,3C] fused q|k|v scratch -- recomputed from a in backward (not per-layer)
-    float* att  = nullptr;         // [M,C] attention output scratch -- recomputed from qkv in backward (not per-layer)
+    act_t* a    = nullptr;         // [M,C] rmsnorm1 output scratch (bf16) -- recomputed from h_in in backward (not per-layer)
+    act_t* qkv  = nullptr;         // [M,3C] fused q|k|v scratch (bf16) -- recomputed from a in backward (not per-layer)
+    act_t* att  = nullptr;         // [M,C] attention output scratch (bf16) -- recomputed from qkv in backward (not per-layer)
     float* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
     float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
     act_t* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
@@ -1013,9 +1113,9 @@ struct TrainScratch {
     float* logits  = nullptr;      // [M,V]
     // gradient temporaries (reused across layers); dh threads the residual stream in F32
     float* dh      = nullptr;      // [M,C] running residual-stream grad
-    float* da      = nullptr;      // [M,C]
-    float* dqkv    = nullptr;      // [M,3C]
-    float* datt    = nullptr;      // [M,C]
+    float* da      = nullptr;      // [M,C] f32 (feeds rmsnorm1 bwd dy)
+    act_t* dqkv    = nullptr;      // [M,3C] bf16
+    act_t* datt    = nullptr;      // [M,C] bf16
     float* dfbuf   = nullptr;      // [M,C]
     act_t* dff1    = nullptr;      // [M,F]
     act_t* dgact   = nullptr;      // [M,F]
@@ -1049,20 +1149,20 @@ int train_alloc(int batch) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
     }
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a,      MC * sizeof(float)));   // single (checkpoint scratch)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a,      MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf,   MC * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(float)));  // single (checkpoint scratch)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att,    MC * sizeof(float)));   // single (checkpoint scratch)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(act_t)));  // single (checkpoint scratch, bf16)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att,    MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a_final, MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.logits,  MV * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh,      MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.da,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * 3 * D_MODEL * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.datt,    MC * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * 3 * D_MODEL * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.datt,    MC * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dfbuf,   MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(act_t)));
@@ -1264,7 +1364,6 @@ void forward_train(int batch, int T) {
         const int    b0  = 2 + 10 * l;
         const float* ln1 = base + L[b0 + 0].off;
         const float* ln2 = base + L[b0 + 1].off;
-        const float* Wo  = base + L[b0 + 5].off;
         const float* W1  = base + L[b0 + 6].off;
         const float* b1  = base + L[b0 + 7].off;
         const float* W2  = base + L[b0 + 8].off;
@@ -1273,12 +1372,12 @@ void forward_train(int batch, int T) {
         float* const hmid = g_tr.h_mid[l];
         float* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
-        launch_rmsnorm_train(hin, ln1, g_tr.a, g_tr.rinv1[l], M, C);                // a = rmsnorm(hin,ln1)
-        launch_linear(g_tr.a, g_fwd.wqkv[l], nullptr, g_tr.qkv, M, C, 3 * C);        // fused qkv
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv, batch, T, C, H, 3 * C);
-        launch_attn_train(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
+        launch_rmsnorm_train_t<float, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M, C);       // a = rmsnorm(hin,ln1) bf16
+        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
+        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
-        launch_linear(g_tr.att, Wo, nullptr, hmid, M, C, C);                         // hmid = proj
+        launch_linear_t<act_t, float>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16 GEMM -> f32)
         launch_add(hin, hmid, hmid, MC);                                            // hmid = hin + proj
         launch_rmsnorm_train_t<float, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);   // fbuf bf16
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
@@ -1340,22 +1439,21 @@ void backward_device(int batch, int T, const int* d_lengths) {
         { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M, F); }
         launch_rmsnorm_bwd(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + 1].off, M, C);                       // dh += -> d(h_mid)
-        // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att)
+        // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
-        launch_rmsnorm_train(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
-        launch_linear(g_tr.a, g_fwd.wqkv[l], nullptr, g_tr.qkv, M, C, 3 * C);
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(g_tr.qkv, batch, T, C, H, 3 * C);
-        launch_attn_train(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
-        launch_linear_bwd(g_tr.att, pb + L[b0 + 5].off, g_tr.dh, g_tr.datt,
-                          gb + L[b0 + 5].off, nullptr, M, C, C);
-        SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dqkv, 0, static_cast<size_t>(M) * 3 * C * sizeof(float), g_stream));
-        launch_attn_bwd(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
+        launch_rmsnorm_train_t<float, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
+        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
+        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
+        { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
+        launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + 5].off, M, C, C);
+        SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dqkv, 0, static_cast<size_t>(M) * 3 * C * sizeof(act_t), g_stream));
+        launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd(g_tr.dqkv, batch, T, C, H, 3 * C);
-        // qkv backward (input a): da = grad into a, dWqkv -> split into dWq/dWk/dWv
-        launch_linear_bwd(g_tr.a, g_fwd.wqkv[l], g_tr.dqkv, g_tr.da,
-                          g_tr.dwqkv, nullptr, M, C, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd_t<act_t>(g_tr.dqkv, batch, T, C, H, 3 * C);
+        // qkv backward (input a): da = grad into a (f32), dWqkv -> split into dWq/dWk/dWv
+        launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, 3 * C);
         {
             const int n = C * C, block = 256;
             split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
