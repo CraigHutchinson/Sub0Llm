@@ -287,6 +287,7 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
 
         const int new_id = vocab++;
         t.merges.push_back(best);
+        t.merge_count.push_back(best_c);   // tokens this merge removes from the corpus (vocab-curve benefit)
         std::vector<int> exp = t.expansion[static_cast<std::size_t>(best.first)];
         exp.insert(exp.end(), t.expansion[static_cast<std::size_t>(best.second)].begin(),
                    t.expansion[static_cast<std::size_t>(best.second)].end());

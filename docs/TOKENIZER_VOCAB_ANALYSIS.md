@@ -59,6 +59,33 @@ that reuses our existing pieces: the `Scan` word table (corpus vocab + counts) a
 table as the candidate seed, and the existing JOIN encode/decode FSM + the round-trip tests as the
 regression guard (the *vocabulary* changes; the spacing/casing scheme does not).
 
+## Reporting the ideal vocab size (the "crux")
+
+`--dump-vocab` also writes `<prefix>.vocab_curve.txt` and prints the **ideal vocab size**. Each BPE
+merge's selection-count is *exactly* the corpus tokens it removes, so `total_word_tokens(n_base+k) =
+total_word_bytes − Σ_{i<k} merge_count[i]` gives the **whole bytes/token-vs-vocab curve from one
+learn**. As vocab collapses toward the base alphabet, bytes/token → 1.0 (character encoding — the
+"devolves to char" floor); as it grows the curve flattens. The knee is reported as the vocab
+capturing X% of the total achievable token reduction.
+
+TinyStories (learn to vocab 16000):
+
+| vocab | bytes/token | tokens saved by that merge |
+|---:|---:|---:|
+| 269 | 1.00 | — (char floor) |
+| 525 | 2.30 | 7,611 |
+| 1293 | 3.17 | 933 |
+| 2317 | 3.50 | 267 |
+| 4365 | 3.73 | 69 |
+| 8461 | 3.80 | 5 |
+| 11035 | 3.81 | 2 (BPE exhausts useful merges) |
+
+→ **Ideal vocab (knee): 90% of compression @ ~1008, 95% @ ~1694, 99% @ ~3965.** bytes/token climbs
+1.0 → 3.50 by vocab ~2300, then only → 3.81 over the next 5× vocab. So for TinyStories the current
+2048 is well-placed; below ~1000 it slides toward char encoding, above ~4000 it pays vocab for <1%.
+BPE also hits a hard ceiling at 11035 (no pair occurs ≥ min_merge). A larger/richer corpus (FineWeb)
+shifts the whole curve right — run the curve there to size its vocab.
+
 ## Next steps
 
 1. Dumps are in place — review `corpus_vocab` / `token_vocab` / `ngrams` for FineWeb (run

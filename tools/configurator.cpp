@@ -348,6 +348,46 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
         for (std::size_t i = 0; i < v.size() && i < 30000; ++i)
             std::println(os, "{}\t{}\t{}", v[i].first, v[i].second.size(), vis(v[i].second));
     }
+
+    // 4. Vocab-size curve + ideal-size detection. Each BPE merge removes merge_count[i] corpus tokens,
+    //    so total_word_tokens(n_base+k) = total_word_bytes - sum_{i<k} merge_count[i] gives the WHOLE
+    //    curve from ONE learn. As vocab collapses toward the base alphabet, bytes/token -> 1 (character
+    //    encoding -- the "devolves to char" floor); as it grows the curve flattens (diminishing
+    //    returns). The "ideal" vocab is the knee, reported as the size capturing X% of the total
+    //    achievable token reduction. Run --dump-vocab with a generous --vocab to extend the curve past
+    //    the knee.
+    {
+        long long total_bytes = 0;
+        for (const auto& [key, id] : S.index) total_bytes += S.word_freq[static_cast<std::size_t>(id)] * static_cast<long long>(key.size());
+        const int nm = static_cast<int>(tkz.merge_count.size());
+        std::vector<long long> cum(static_cast<std::size_t>(nm) + 1, 0);
+        for (int i = 0; i < nm; ++i) cum[static_cast<std::size_t>(i) + 1] = cum[static_cast<std::size_t>(i)] + tkz.merge_count[static_cast<std::size_t>(i)];
+        const long long total_reduction = cum[static_cast<std::size_t>(nm)];
+        auto tokens_at = [&](int k) { return total_bytes - cum[static_cast<std::size_t>(std::min(k, nm))]; };
+        auto bpt_at    = [&](int k) { const long long tk = tokens_at(k); return tk > 0 ? static_cast<double>(total_bytes) / static_cast<double>(tk) : 0.0; };
+        auto vocab_at_frac = [&](double frac) {
+            const long long target = static_cast<long long>(frac * static_cast<double>(total_reduction));
+            int k = 0; while (k < nm && cum[static_cast<std::size_t>(k)] < target) ++k;
+            return tkz.n_base + k;
+        };
+        {
+            std::ofstream os(prefix + ".vocab_curve.txt");
+            std::println(os, "# vocab-size curve (word encoding): total_word_bytes={}, base_vocab={}, max_vocab={}",
+                         total_bytes, tkz.n_base, tkz.n_base + nm);
+            std::println(os, "# vocab<TAB>total_word_tokens<TAB>bytes_per_token<TAB>tokens_saved_by_this_merge");
+            std::vector<int> ks{0};
+            for (int k = 1; k <= nm; k *= 2) ks.push_back(k);
+            if (ks.back() != nm) ks.push_back(nm);
+            for (int k : ks)
+                std::println(os, "{}\t{}\t{:.3f}\t{}", tkz.n_base + k, tokens_at(k), bpt_at(k),
+                             (k > 0 && k <= nm) ? tkz.merge_count[static_cast<std::size_t>(k - 1)] : 0);
+        }
+        std::println(stderr,
+            "vocab curve: char-level bytes/token=1.00 -> full vocab {} bytes/token={:.2f}. "
+            "Ideal vocab (knee): 90% of compression @ ~{}, 95% @ ~{}, 99% @ ~{} "
+            "(diminishing returns beyond -- raise --vocab to extend the curve).",
+            tkz.n_base + nm, bpt_at(nm), vocab_at_frac(0.90), vocab_at_frac(0.95), vocab_at_frac(0.99));
+    }
 }
 
 }  // namespace

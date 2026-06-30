@@ -108,6 +108,9 @@ struct Tokenizer {
     int                  tab2_id = -1, tab4_id = -1;
     std::vector<int>     base_symbol;              // base id -> symbol code (0..255, 256 cap, 257 up)
     std::vector<std::pair<int, int>> merges;       // ordered learned merges (left,right)
+    std::vector<long long>           merge_count;  // per-merge occurrence count at selection = corpus
+                                                   // tokens that merge removes (the vocab-curve benefit;
+                                                   // learn-time only, not serialized)
     std::unordered_map<std::pair<int, int>, int, PairHash> merge_rank;  // (l,r) -> merge index
     std::vector<std::vector<int>>    expansion;    // id -> base symbol codes
     std::unordered_set<std::string>  attested;     // lowercase words eligible for case collapse
