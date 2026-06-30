@@ -15,7 +15,7 @@ add_executable(sub0_tests
 )
 
 # Tests compile against the engine API and the generated config header.
-add_dependencies(sub0_tests sub0_generate_config)
+sub0_autoconfigure_dep(sub0_tests)
 target_include_directories(sub0_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${GEN_DIR}")

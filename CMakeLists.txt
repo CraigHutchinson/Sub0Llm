@@ -83,6 +83,12 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
+# Auto-run the configurator during the build to (re)generate the config headers. ON (default) keeps the
+# convenient one-shot `cmake --build` flow. OFF gives the pure staged workflow: build sub0llm-configure,
+# run it yourself (`sub0llm-configure --corpus <c>`), then build the engine -- the build never regenerates
+# config behind your back. `cmake --build <dir> --target sub0_generate_config` regenerates on demand in
+# either mode. See docs/WORKFLOW_ARCHITECTURE.md.
+option(SUB0_AUTO_CONFIGURE "Auto-run the configurator during the build (OFF = run sub0llm-configure manually)" ON)
 # Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0llm-configure AUTO-SIZES
 # them from the corpus scale and bakes them into the generated header. To pin a size, run the
 # configurator directly: `sub0llm-configure --corpus <c> --dmodel N --layers N ... -o <header>`.
@@ -253,26 +259,56 @@ endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/sub0_build_facts.hpp.in" "${GEN_DIR}/sub0_build_facts.hpp" @ONLY)
 target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 
-add_custom_command(
-  OUTPUT  "${GEN_HEADER}"
-  BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
-             "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
-  COMMAND sub0llm-configure
-            --corpus  "${SUB0_CORPUS}"
-            --ternary ${SUB0_TERNARY}
-            --pos-encoding ${SUB0_POS_ENCODING_INT}
-            --rope-theta ${SUB0_ROPE_THETA}
-            --bf16 ${SUB0_BF16_INT}
-            --prec-gemm ${SUB0_PRECISION_GEMM_INT}
-            --prec-act ${SUB0_PRECISION_ACT_INT}
-            --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
-            --join ${SUB0_JOIN_FLAG}
-            --cuda-tf32 ${SUB0_CUDA_TF32_FLAG}
-  DEPENDS sub0llm-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
-  COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
-  VERBATIM
-)
-add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
+# The configurator invocation, shared by the auto-regen (OUTPUT) and the on-demand manual paths.
+set(_sub0_configure_cmd sub0llm-configure
+      --corpus  "${SUB0_CORPUS}"
+      --ternary ${SUB0_TERNARY}
+      --pos-encoding ${SUB0_POS_ENCODING_INT}
+      --rope-theta ${SUB0_ROPE_THETA}
+      --bf16 ${SUB0_BF16_INT}
+      --prec-gemm ${SUB0_PRECISION_GEMM_INT}
+      --prec-act ${SUB0_PRECISION_ACT_INT}
+      --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
+      --join ${SUB0_JOIN_FLAG}
+      --cuda-tf32 ${SUB0_CUDA_TF32_FLAG})
+
+if(SUB0_AUTO_CONFIGURE)
+  # ON: regenerate the header as a build artifact -- only when the corpus / configurator / tune cache
+  # change -- so a plain `cmake --build` is one-shot. Engine targets auto-depend on it (below).
+  add_custom_command(
+    OUTPUT  "${GEN_HEADER}"
+    BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
+               "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
+    COMMAND ${_sub0_configure_cmd}
+    DEPENDS sub0llm-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
+    COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
+    VERBATIM)
+  add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
+  message(STATUS "SUB0_AUTO_CONFIGURE=ON: the build (re)generates the config headers via sub0llm-configure")
+else()
+  # OFF: the build NEVER regenerates config behind your back. sub0_generate_config is an explicit,
+  # on-demand target (`cmake --build <dir> --target sub0_generate_config`, or just run sub0llm-configure);
+  # the engine compiles against whatever header already exists. A missing header is a clear compile error.
+  add_custom_target(sub0_generate_config
+    COMMAND ${_sub0_configure_cmd}
+    DEPENDS sub0llm-configure
+    COMMENT "Configuring on demand (SUB0_AUTO_CONFIGURE=OFF): ${SUB0_CORPUS}"
+    VERBATIM)
+  if(NOT EXISTS "${GEN_HEADER}")
+    message(STATUS "SUB0_AUTO_CONFIGURE=OFF and no config header yet -- run `sub0llm-configure --corpus <c>` "
+                   "(or `cmake --build ${CMAKE_BINARY_DIR} --target sub0_generate_config`) before building the engine")
+  else()
+    message(STATUS "SUB0_AUTO_CONFIGURE=OFF: building against the existing config (regen via the sub0_generate_config target)")
+  endif()
+endif()
+
+# Make a target auto-depend on the generated config ONLY when SUB0_AUTO_CONFIGURE is ON, so the build
+# regenerates it before compiling. When OFF this is a no-op: targets compile against the existing header.
+function(sub0_autoconfigure_dep tgt)
+  if(SUB0_AUTO_CONFIGURE)
+    add_dependencies(${tgt} sub0_generate_config)
+  endif()
+endfunction()
 
 # --- Stage 3: engine core (shared), compiled against the generated header ----
 # Two translation units, one shared library: engine_core.cpp is the backend-agnostic
@@ -280,7 +316,7 @@ add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
 add_library(sub0_core SHARED src/engine_core.cpp ${SUB0_BACKEND_SOURCES})
-add_dependencies(sub0_core sub0_generate_config)
+sub0_autoconfigure_dep(sub0_core)
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_tok used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
@@ -314,7 +350,7 @@ endif()
 # Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
 if(SUB0_BUILD_CUDA)
   add_library(sub0_backend_cuda SHARED src/backend_cuda.cu)
-  add_dependencies(sub0_backend_cuda sub0_generate_config)
+  sub0_autoconfigure_dep(sub0_backend_cuda)
   target_include_directories(sub0_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
   set_target_properties(sub0_backend_cuda PROPERTIES
     CUDA_ARCHITECTURES "${SUB0_CUDA_ARCH}"
@@ -366,7 +402,7 @@ target_link_libraries(sub0_gen PRIVATE sub0_core)
 
 # --- Stage 5: the thin driver executable ------------------------------------
 add_executable(sub0llm src/driver.cpp)
-add_dependencies(sub0llm sub0_generate_config)          # for DEFAULT_CORPUS in the header
+sub0_autoconfigure_dep(sub0llm)          # for DEFAULT_CORPUS in the header
 target_include_directories(sub0llm PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen CLI11::CLI11)
 
@@ -382,7 +418,7 @@ set_target_properties(sub0llm PROPERTIES
 # so a stage tool cannot build before `configure` has produced the config it is compiled against.
 foreach(_stage train gen tune)
   add_executable(sub0llm-${_stage} tools/sub0llm-${_stage}.cpp)
-  add_dependencies(sub0llm-${_stage} sub0_generate_config)
+  sub0_autoconfigure_dep(sub0llm-${_stage})
   target_include_directories(sub0llm-${_stage} PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
   target_link_libraries(sub0llm-${_stage} PRIVATE CLI11::CLI11)
   set_target_properties(sub0llm-${_stage} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
