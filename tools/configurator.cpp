@@ -436,14 +436,17 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
 // corpus gets a compact model, a web-scale corpus a larger one -- so a fresh corpus trains a sensibly
 // sized model without hand-tuning. Any dim left 0 on the CLI takes this default; an explicit
 // --dmodel/--layers/... pins it. (~d192 for tinystories, ~d448 for fineweb-smoke.)
-struct AutoDims { int d, layers, heads, seq; };
+// vocab tracks the curve-knee findings (--dump-vocab): tinystories ideal ~1.7-4k, fineweb ~5.7-12k;
+// the ladder rounds up to a default a richer corpus justifies. The exact ideal is the curve knee --
+// this is the coarse default a fresh corpus gets without analysis.
+struct AutoDims { int d, layers, heads, seq, vocab; };
 inline AutoDims autosize_dims(std::uintmax_t corpus_bytes) {
     const double mb = static_cast<double>(corpus_bytes) / 1e6;
-    if (mb <    64.0) return {192,  6, 6, 256};   // ~tinystories (22 MB)
-    if (mb <   512.0) return {320,  8, 8, 256};
-    if (mb <  4096.0) return {448, 11, 7, 256};   // ~fineweb_smoke (1 GB)
-    if (mb < 32768.0) return {640, 14, 8, 512};
-    return                  {768, 16, 8, 512};    // ~full fineweb (45 GB)
+    if (mb <    64.0) return {192,  6, 6, 256,  4096};   // ~tinystories (22 MB)
+    if (mb <   512.0) return {320,  8, 8, 256,  8192};
+    if (mb <  4096.0) return {448, 11, 7, 256, 16384};   // ~fineweb_smoke (1 GB)
+    if (mb < 32768.0) return {640, 14, 8, 512, 24576};
+    return                  {768, 16, 8, 512, 32768};    // ~full fineweb (45 GB)
 }
 
 }  // namespace
@@ -465,7 +468,7 @@ int main(int argc, char** argv) {
     int bf16         = 2;       // float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
     int prec_gemm    = 9;       // GEMM input precision: 0=F32,1=BF16,2=F16; 9=AUTO (16b if capable)
     int prec_act     = 9;       // saved-activation storage precision: same codes; 9=AUTO
-    int vocab_target = 2048;
+    int vocab_target = 0;       // 0 = auto-size from corpus scale (autosize_dims.vocab); nonzero pins it
     int min_merge    = 2;
     int emit_tok     = 1;
     int join_scheme  = 1;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
@@ -500,7 +503,7 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 9));
     app.add_option("--dump-vocab", dump_vocab,
                    "Write readable vocabulary-analysis dumps to <prefix>.{corpus_vocab,token_vocab,ngrams}.txt and exit");
-    app.add_option("--vocab",  vocab_target, "Target BPE vocabulary size (base symbols + markers + merges)")
+    app.add_option("--vocab",  vocab_target, "Target vocabulary size (base + markers + word pieces; 0 = auto from corpus)")
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
        ->capture_default_str();
@@ -538,12 +541,13 @@ int main(int argc, char** argv) {
         std::error_code ec;
         const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, ec);
         const AutoDims a = autosize_dims(ec ? 0 : corpus_bytes);
-        if (d_model  == 0) d_model  = a.d;
-        if (n_layers == 0) n_layers = a.layers;
-        if (n_heads  == 0) n_heads  = a.heads;
-        if (seq_len  == 0) seq_len  = a.seq;
-        std::println(stderr, "auto-size: corpus {:.0f} MB -> d={} L={} H={} seq={} (0-valued dims; --dmodel etc. pin)",
-                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len);
+        if (d_model      == 0) d_model      = a.d;
+        if (n_layers     == 0) n_layers     = a.layers;
+        if (n_heads      == 0) n_heads      = a.heads;
+        if (seq_len      == 0) seq_len      = a.seq;
+        if (vocab_target == 0) vocab_target = a.vocab;
+        std::println(stderr, "auto-size: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} (0-valued; CLI pins)",
+                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target);
     }
 
     if (d_model % n_heads != 0) {
