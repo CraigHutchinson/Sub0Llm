@@ -250,6 +250,7 @@ endif()
 add_custom_command(
   OUTPUT  "${GEN_HEADER}"
   BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
+             "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
   COMMAND sub0-configure
             --corpus  "${SUB0_CORPUS}"
             --ternary ${SUB0_TERNARY}
