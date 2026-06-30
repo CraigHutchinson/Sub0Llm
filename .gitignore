@@ -12,8 +12,11 @@ out/
 # Generated/large corpus artifacts (not source)
 # *.words = cached corpus-scan state (configurator ScanState)
 *.words
+# *.model = per-corpus model-dims sidecar (auto-seeded by sub0-configure; force-add to pin a shared size)
+*.model
 data/fineweb_edu.txt
 data/fineweb_edu.txt.done
 # derived slices for smoke/throughput runs (recreated from the full corpus on demand)
 data/fineweb_smoke.txt
-data/cfg_test.txtruns/
+data/cfg_test.txt
+runs/
