@@ -85,6 +85,11 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
     out.reserve(in.size());
     replaced = 0;
     const std::size_t n = in.size();
+    // TODO(simd, hot): this scans every corpus byte for two rare lead bytes (0xE2 UTF-8
+    // punct, 0x60 backtick). The fast path is "byte is neither" -- a vectorized scan
+    // (find the next 0xE2/0x60 with SSE/AVX, bulk-copy the run between) would cut this to
+    // near-memcpy speed on the >99% of bytes that pass through unchanged. Runs over the
+    // whole corpus during configuration.
     for (std::size_t i = 0; i < n;) {
         const unsigned char c = static_cast<unsigned char>(in[i]);
         // General-punctuation block U+2013..U+2026 is encoded E2 80 xx.
@@ -160,6 +165,13 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
 //   - otherwise (names, mixed) -> emitted verbatim, so "Lily"/"Tom" stay atomic
 // Non-alpha bytes pass through unchanged. Output is a stream of byte values plus
 // the TOK_CAP/TOK_UP marker codes. `st` may be null when stats are not wanted.
+// TODO(simd/cuda, hot): the configurator runs normalize_text -> truecase_tokenize ->
+// encode over the WHOLE corpus (GBs). The pipeline is per-byte but EMBARRASSINGLY PARALLEL
+// across newline-aligned chunks (a newline never splits a word unit or the casing look-back),
+// which the configurator already exploits with std::thread. Two future levers: (1) SIMD the
+// alpha-run scan below (classify 16/32 bytes at once: is_alpha / is_upper masks drive the
+// run boundaries); (2) a CUDA tokenizer -- one block per chunk -- since the merge table +
+// attested set are read-only and the work is regular. Flagged for later (see TOKENIZER_REVIEW.md).
 inline std::vector<int> truecase_tokenize(const std::string& text,
                                           const std::unordered_set<std::string>& attested,
                                           TokStats* st) {

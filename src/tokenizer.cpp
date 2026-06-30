@@ -32,6 +32,14 @@ std::string seq_key(const std::vector<int>& s) {
 // Apply learned merges to one pre-token word (a sequence of base ids), lowest rank
 // first, then append the resulting ids to `out`. Reproduces the corpus tokenization
 // for the same word so prompts stay in-distribution with training.
+//
+// TODO(perf, hot): this is O(N^2 * merges) per word -- each merge rescans every adjacent
+// pair for the lowest rank. It runs for EVERY word occurrence during corpus.tok emission
+// (configurator), but a corpus is Zipfian -- the same few thousand words dominate. The big
+// win is MEMOIZATION: cache word-bytes -> encoded ids (the unique-word table already exists
+// in Scan during learn; the emission path re-encodes from scratch). With a cache the
+// per-unique-word cost amortizes to ~zero. Secondary: a priority-queue / linked-list BPE
+// (as learn() already uses) removes the inner rescan for the rare long/OOV word.
 void bpe_encode_word(const Tokenizer& t, std::vector<int>& seq, std::vector<int>& out) {
     while (seq.size() >= 2) {
         int best_rank = std::numeric_limits<int>::max(), best_pos = -1;
