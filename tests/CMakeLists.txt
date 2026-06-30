@@ -28,7 +28,7 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_tok Catch2::Catch2WithMa
 #   tok_roundtrip_fuzz.cpp  — generative net: dogfood the project's own source + random
 #                             mutation/blob fuzz + a token-pattern report. SUB0_SOURCE_DIR
 #                             lets it read the real tree for the dogfood/pattern cases.
-add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp)
+add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp config_tests.cpp)
 target_include_directories(sub0_tok_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_tok_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_tok_tests PRIVATE sub0_tok Catch2::Catch2WithMain)

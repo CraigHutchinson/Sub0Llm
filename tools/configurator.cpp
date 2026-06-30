@@ -46,6 +46,7 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
+#include "sub0/config_util.hpp"// sub0::config — pure, unit-tested config decisions (autosize / tune-cache / precision)
 
 namespace tok = sub0::tok;
 
@@ -432,23 +433,6 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
     }
 }
 
-// Auto-size the model dimensions from the corpus scale (file bytes). A coarse ladder -- a small story
-// corpus gets a compact model, a web-scale corpus a larger one -- so a fresh corpus trains a sensibly
-// sized model without hand-tuning. Any dim left 0 on the CLI takes this default; an explicit
-// --dmodel/--layers/... pins it. (~d192 for tinystories, ~d448 for fineweb-smoke.)
-// vocab tracks the curve-knee findings (--dump-vocab): tinystories ideal ~1.7-4k, fineweb ~5.7-12k;
-// the ladder rounds up to a default a richer corpus justifies. The exact ideal is the curve knee --
-// this is the coarse default a fresh corpus gets without analysis.
-struct AutoDims { int d, layers, heads, seq, vocab; };
-inline AutoDims autosize_dims(std::uintmax_t corpus_bytes) {
-    const double mb = static_cast<double>(corpus_bytes) / 1e6;
-    if (mb <    64.0) return {192,  6, 6, 256,  4096};   // ~tinystories (22 MB)
-    if (mb <   512.0) return {320,  8, 8, 256,  8192};
-    if (mb <  4096.0) return {448, 11, 7, 256, 16384};   // ~fineweb_smoke (1 GB)
-    if (mb < 32768.0) return {640, 14, 8, 512, 24576};
-    return                  {768, 16, 8, 512, 32768};    // ~full fineweb (45 GB)
-}
-
 }  // namespace
 
 using namespace sub0::casing;
@@ -540,12 +524,9 @@ int main(int argc, char** argv) {
     {
         std::error_code ec;
         const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, ec);
-        const AutoDims a = autosize_dims(ec ? 0 : corpus_bytes);
-        if (d_model      == 0) d_model      = a.d;
-        if (n_layers     == 0) n_layers     = a.layers;
-        if (n_heads      == 0) n_heads      = a.heads;
-        if (seq_len      == 0) seq_len      = a.seq;
-        if (vocab_target == 0) vocab_target = a.vocab;
+        const sub0::config::ModelDims r = sub0::config::apply_autosize(
+            {d_model, n_layers, n_heads, seq_len, vocab_target}, ec ? 0 : corpus_bytes);
+        d_model = r.d_model; n_layers = r.n_layers; n_heads = r.n_heads; seq_len = r.seq_len; vocab_target = r.vocab;
         std::println(stderr, "auto-size: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} (0-valued; CLI pins)",
                      (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target);
     }
@@ -822,30 +803,15 @@ int main(int argc, char** argv) {
     // fall back to the hardware core count and a conservative windows/thread of 4.
     const unsigned hw_concurrency = std::max(1u, std::thread::hardware_concurrency());
     const int      max_workers    = static_cast<int>(hw_concurrency);
-    int            default_threads = static_cast<int>(hw_concurrency);
-    int            default_wpt     = 4;
-    int            default_gpu_batch    = 0;   // 0 -> derive from the CPU width below
-    int            attn_bwd_per_query   = 0;   // GPU attention-backward strategy (0=per-head)
-    bool           tf32_from_cache      = false;
     std::string    tune_cache_abs;
-    if (!tune_cache.empty()) {
-        tune_cache_abs = std::filesystem::absolute(tune_cache).string();
-        std::ifstream tc(tune_cache);
-        for (std::string line; std::getline(tc, line); ) {
-            const auto eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            const std::string key = line.substr(0, eq);
-            const int         val = std::atoi(line.substr(eq + 1).c_str());
-            if      (key == "threads"            && val > 0) default_threads   = val;
-            else if (key == "windows_per_thread" && val > 0) default_wpt       = val;
-            else if (key == "gpu_batch"          && val > 0) default_gpu_batch = val;
-            else if (key == "attn_bwd_per_query")            attn_bwd_per_query = (val != 0);
-            else if (key == "cuda_tf32") { cuda_tf32 = (val != 0); tf32_from_cache = true; }
-        }
-    }
-    // The tuned GPU batch defaults to the CPU data-parallel width until `tune` measures one.
-    if (default_gpu_batch <= 0) default_gpu_batch = default_threads * default_wpt;
-    (void)tf32_from_cache;   // (cache value already folded into cuda_tf32 above)
+    std::ifstream  tc;                                       // a non-open stream yields no lines -> defaults
+    if (!tune_cache.empty()) { tune_cache_abs = std::filesystem::absolute(tune_cache).string(); tc.open(tune_cache); }
+    const sub0::config::TuneDefaults td = sub0::config::parse_tune_cache(tc, static_cast<int>(hw_concurrency));
+    const int default_threads    = td.threads;
+    const int default_wpt        = td.windows_per_thread;
+    const int default_gpu_batch  = td.gpu_batch;            // already derived from the width if untuned
+    const int attn_bwd_per_query = td.attn_bwd_per_query;
+    if (td.tf32_from_cache) cuda_tf32 = td.cuda_tf32 ? 1 : 0;
 
     // Fail the build on a GPU batch that cannot fit. DEFAULT_GPU_BATCH sizes the resident device
     // training scratch; on Windows an over-budget cudaMalloc does not OOM, it silently spills to WDDM
@@ -898,16 +864,18 @@ int main(int argc, char** argv) {
     // forward-compatible, but selecting them errors here until the backends implement them. Each
     // pipeline section (GEMM inputs, saved activations) picks a Dtype independently; numerically
     // sensitive sections (master weights, head/logits/softmax) stay FP32.
-    const bool f16_ok = (bf16 == 1) || (bf16 == 2 && cuda_arch >= 80);
-    // Resolve a per-section code (0=F32,1=BF16,2=F16,9=AUTO) to a Dtype name, erroring on the
-    // not-yet-supported choices. AUTO -> the capable 16-bit float (BF16) else F32.
+    const bool f16_ok = sub0::config::f16_capable(bf16, cuda_arch);
+    // Resolve a per-section code (0=F32,1=BF16,2=F16,9=AUTO) to a Dtype name via the unit-tested
+    // sub0::config::resolve_precision; the not-yet-supported choices error here (I/O stays in main()).
     const auto resolve_dtype = [&](int code, const char* section) -> std::string {
-        switch (code) {
-            case 0: return "F32";
-            case 1: if (!f16_ok) { std::fprintf(stderr, "configure error: BF16 %s requested but no BF16-capable GPU\n", section); std::exit(2); } return "BF16";
-            case 2: std::fprintf(stderr, "configure error: F16 %s not yet supported (BF16 only)\n", section); std::exit(2);
-            default: return f16_ok ? "BF16" : "F32";   // AUTO
+        const sub0::config::Precision p = sub0::config::resolve_precision(code, f16_ok);
+        if (p.status == sub0::config::PrecStatus::NeedsF16Hardware) {
+            std::fprintf(stderr, "configure error: BF16 %s requested but no BF16-capable GPU\n", section); std::exit(2);
         }
+        if (p.status == sub0::config::PrecStatus::F16Unsupported) {
+            std::fprintf(stderr, "configure error: F16 %s not yet supported (BF16 only)\n", section); std::exit(2);
+        }
+        return p.dtype;
     };
     const std::string gemm_dt = resolve_dtype(prec_gemm, "GEMM");
     // BF16 activation storage (FFN) cuts train scratch; checked by direction/finiteness, not raw f32
