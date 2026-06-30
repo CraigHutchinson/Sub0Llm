@@ -260,6 +260,17 @@ TEST_CASE("apply: installs schedule, deadline and live phase budget onto Options
     CHECK(seen[2] == Phase::Confirm);
 }
 
+TEST_CASE("monotonic axis: ternary chop reaches the top end with few evals", "[tune]") {
+    // The threads-scale-to-the-core-count case: throughput rises monotonically with the knob, so
+    // the optimum is the top index. The refinement must REACH it while doing far fewer evals than
+    // the axis has points -- a binary/ternary chop, not an exhaustive window scan of every value.
+    Space space = {{"threads", sub0::tune::linear_steps(1, 51, 51)}};   // 51 candidate thread counts
+    auto obj = [](const Assignment& a) { return a[0]; };                // strictly increasing
+    auto r = maximize(space, obj);
+    CHECK(r.best[0] == 51.0);                                           // converged to the top end
+    CHECK(r.evaluations < 30);                                          // log-narrowing, not 51+ evals
+}
+
 TEST_CASE("adaptive_time: per-test cap stops at one step when a step exceeds the budget", "[tune][bench]") {
     sub0::bench::Budget b;
     b.budget_ms = 300.0; b.warmup = 2; b.min_iters = 3;

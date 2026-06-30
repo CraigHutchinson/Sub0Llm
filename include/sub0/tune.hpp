@@ -286,8 +286,15 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
                      [](const auto& a, const auto& b) { return a.first > b.first; });
     const int basins = std::min(static_cast<int>(coarse.size()), top_basins);
 
-    // 3. Refine each basin: coordinate-descent zoom in a +/-stride window that recenters
-    //    each pass, so it walks to the exact local optimum even past the initial window.
+    // 3. Refine each basin by coordinate descent, narrowing each axis with a TERNARY CHOP rather
+    //    than scanning every point in the +/-stride window. Within a basin (the coarse grid already
+    //    localized it) each axis is ~unimodal, so probing two interior thirds and discarding the
+    //    worse outer third converges in O(log range) evals -- the "binary chop driven by the delta
+    //    between checks" -- and a monotonic axis (throughput rising with threads/batch to the core
+    //    count) collapses straight to its top end instead of re-scanning the whole window every pass.
+    //    Every probe is cached, so the final winner is still the global max over ALL points measured
+    //    (chop probes included), and the confirm phase re-measures finalists -- so the unimodal
+    //    assumption only steers WHERE to look, it cannot crown an unmeasured point.
     if (opt.on_phase) opt.on_phase(Phase::Refine);
     for (int b = 0; b < basins; ++b) {
         if (stop()) break;                  // budget exhausted -> skip remaining basins
@@ -299,13 +306,18 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
             const double prev = basin_best;
             for (int k = 0; k < K; ++k) {
                 const int n = static_cast<int>(space[static_cast<std::size_t>(k)].values.size());
-                const int lo = std::max(0, cur[static_cast<std::size_t>(k)] - stride[static_cast<std::size_t>(k)]);
-                const int hi = std::min(n - 1, cur[static_cast<std::size_t>(k)] + stride[static_cast<std::size_t>(k)]);
+                int lo = std::max(0, cur[static_cast<std::size_t>(k)] - stride[static_cast<std::size_t>(k)]);
+                int hi = std::min(n - 1, cur[static_cast<std::size_t>(k)] + stride[static_cast<std::size_t>(k)]);
                 std::vector<int> probe = cur;
+                auto at = [&](int i) { probe[static_cast<std::size_t>(k)] = i; return eval_at(probe); };
+                while (hi - lo > 2) {                   // ternary chop: discard the worse outer third
+                    const int m1 = lo + (hi - lo) / 3;
+                    const int m2 = hi - (hi - lo) / 3;
+                    if (at(m1) < at(m2)) lo = m1 + 1; else hi = m2 - 1;
+                }
                 int best_i = cur[static_cast<std::size_t>(k)];
-                for (int i = lo; i <= hi; ++i) {
-                    probe[static_cast<std::size_t>(k)] = i;
-                    const double s = eval_at(probe);
+                for (int i = lo; i <= hi; ++i) {        // pin the exact max in the collapsed bracket
+                    const double s = at(i);
                     if (s > basin_best) { basin_best = s; best_i = i; }
                 }
                 cur[static_cast<std::size_t>(k)] = best_i;
