@@ -6,6 +6,7 @@
 // generated config so the configurator can use it.
 
 #include "sub0/tokenizer.hpp"
+#include "sub0/unigram.hpp"
 
 #include <algorithm>
 #include <istream>
@@ -55,6 +56,43 @@ void bpe_encode_word(const Tokenizer& t, std::vector<int>& seq, std::vector<int>
         seq.erase(seq.begin() + best_pos + 1);
     }
     for (int id : seq) out.push_back(id);
+}
+
+// Unigram word encoder: Viterbi-segment the byte run stream[lo,hi) into the min Σ −log p piece-id
+// sequence (piece_index / piece_logp). Every base byte is a candidate, so dp[L] is always reachable;
+// the explicit fallback keeps it total even if a byte were somehow absent. Replaces bpe_encode_word
+// when the tokenizer is in Unigram mode (t.max_piece > 0).
+void viterbi_encode_word(const Tokenizer& t, const std::vector<int>& stream, std::size_t lo, std::size_t hi,
+                         std::vector<int>& out) {
+    const int    L   = static_cast<int>(hi - lo);
+    const double INF = std::numeric_limits<double>::infinity();
+    std::vector<double> dp(static_cast<std::size_t>(L) + 1, INF);
+    std::vector<int>    bi(static_cast<std::size_t>(L) + 1, -1), bid(static_cast<std::size_t>(L) + 1, -1);
+    dp[0] = 0.0;
+    std::string key;
+    for (int a = 0; a < L; ++a) {
+        if (dp[static_cast<std::size_t>(a)] == INF) continue;
+        const int lmax = std::min(t.max_piece, L - a);
+        key.resize(0);
+        for (int l = 1; l <= lmax; ++l) {
+            key.push_back(static_cast<char>(stream[lo + static_cast<std::size_t>(a + l - 1)] & 0xFF));
+            const auto it = t.piece_index.find(key);
+            if (it == t.piece_index.end()) continue;
+            const double cost = dp[static_cast<std::size_t>(a)] - static_cast<double>(t.piece_logp[static_cast<std::size_t>(it->second)]);
+            if (cost < dp[static_cast<std::size_t>(a + l)]) {
+                dp[static_cast<std::size_t>(a + l)]  = cost;
+                bi[static_cast<std::size_t>(a + l)]  = a;
+                bid[static_cast<std::size_t>(a + l)] = it->second;
+            }
+        }
+    }
+    if (dp[static_cast<std::size_t>(L)] == INF) {                       // unreachable -> raw bytes
+        for (int a = 0; a < L; ++a) out.push_back(t.byte_base[static_cast<std::size_t>(stream[lo + static_cast<std::size_t>(a)] & 0xFF)]);
+        return;
+    }
+    std::vector<int> rev;
+    for (int j = L; j > 0;) { rev.push_back(bid[static_cast<std::size_t>(j)]); j = bi[static_cast<std::size_t>(j)]; }
+    for (auto r = rev.rbegin(); r != rev.rend(); ++r) out.push_back(*r);
 }
 
 }  // namespace
@@ -237,15 +275,72 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
     }
     t.n_base = static_cast<int>(t.base_symbol.size());
 
-    // Remap the word table from raw byte symbols to base ids (a bijection on used
-    // bytes, preserving pair frequencies and tie-breaking -> identical merges). After
-    // this, scan.word_syms holds base ids; BPE below rewrites them to final token ids.
-    for (std::vector<int>& w : scan.word_syms)
-        for (int& s : w) s = t.byte_base[static_cast<std::size_t>(s)];
-
     t.expansion.resize(static_cast<std::size_t>(t.n_base));
     for (int id = 0; id < t.n_base; ++id)
         t.expansion[static_cast<std::size_t>(id)] = {t.base_symbol[static_cast<std::size_t>(id)]};
+
+    // Unigram LM word vocabulary (the DEFAULT). Learn the pieces top-down from the RAW word table
+    // (no remap), then map them onto the base alphabet: a single-byte piece reuses its base id, a
+    // multi-byte piece becomes a new id. Word encoding is then Viterbi over piece_index/piece_logp
+    // (set up here) instead of the greedy merge replay -- globally occurrence-optimal, no dead slots.
+    if (opts.method == LearnOptions::Method::Unigram) {
+        std::vector<std::pair<std::string, long long>> words;
+        words.reserve(scan.word_syms.size());
+        for (std::size_t w = 0; w < scan.word_syms.size(); ++w) {
+            std::string s;
+            s.reserve(scan.word_syms[w].size());
+            for (int b : scan.word_syms[w]) s.push_back(static_cast<char>(b & 0xFF));
+            words.push_back({std::move(s), scan.word_freq[w]});
+        }
+        UnigramOptions uo;
+        uo.target    = opts.vocab_target;
+        uo.min_count = opts.min_merge;
+        const Unigram u = learn_unigram(words, uo);
+
+        double min_lp = 0.0;
+        for (double lp : u.logp) min_lp = std::min(min_lp, lp);
+        const float floor_lp = static_cast<float>(min_lp - 5.0);    // unseen bytes: usable but a last resort
+        t.piece_logp.assign(static_cast<std::size_t>(t.n_base), floor_lp);   // markers stay at floor (not in index)
+        for (int id = 0; id < u.size(); ++id) {
+            const std::string& s = u.token[static_cast<std::size_t>(id)];
+            const float lp = static_cast<float>(u.logp[static_cast<std::size_t>(id)]);
+            if (s.size() == 1) {
+                const int bid = t.byte_base[static_cast<unsigned char>(s[0])];
+                if (bid >= 0) { t.piece_logp[static_cast<std::size_t>(bid)] = lp; t.piece_index[s] = bid; }
+            } else {
+                const int pid = static_cast<int>(t.expansion.size());
+                std::vector<int> codes;
+                codes.reserve(s.size());
+                for (char c : s) codes.push_back(static_cast<unsigned char>(c));
+                t.expansion.push_back(std::move(codes));
+                t.piece_logp.push_back(lp);
+                t.piece_index.emplace(s, pid);
+            }
+        }
+        // Every base byte must be a Viterbi candidate so any input segments, including a byte the
+        // corpus never showed (floor-scored single token).
+        for (int b = 0; b < 256; ++b) {
+            const int bid = t.byte_base[static_cast<std::size_t>(b)];
+            if (bid >= 0) t.piece_index.emplace(std::string(1, static_cast<char>(b)), bid);
+        }
+        t.max_piece = std::max(1, u.max_len);
+        t.vocab     = static_cast<int>(t.expansion.size());
+        // Remap the scan word table to the Viterbi piece-id segmentation (parallels the BPE remap), so
+        // the configurator emits / reports read final ids uniformly for both methods.
+        for (std::vector<int>& w : scan.word_syms) {
+            std::vector<int> ids;
+            viterbi_encode_word(t, w, 0, w.size(), ids);
+            w = std::move(ids);
+        }
+        t.attested  = attested;
+        t.loaded    = true;
+        return t;
+    }
+
+    // --- BPE (method == BPE): remap the word table to base ids, then greedy merge. Kept for the
+    //     vocabulary A/B + the bytes/token curve; no longer the default word encoder. ---
+    for (std::vector<int>& w : scan.word_syms)
+        for (int& s : w) s = t.byte_base[static_cast<std::size_t>(s)];
     int vocab = t.n_base;
 
     std::vector<std::vector<int>>& word_syms = scan.word_syms;
@@ -432,11 +527,15 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
         if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
             emit_byte(stream[i]); dps = true; ++i;
         } else {
-            seq.assign(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                       stream.begin() + static_cast<std::ptrdiff_t>(end));
-            for (int& s : seq) s = t.byte_base[static_cast<std::size_t>(s)];
             sub.clear();
-            bpe_encode_word(t, seq, sub);
+            if (t.max_piece > 0) {                      // Unigram: Viterbi over the raw word bytes
+                viterbi_encode_word(t, stream, i, end, sub);
+            } else {                                    // BPE: remap to base ids, greedy merge
+                seq.assign(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                           stream.begin() + static_cast<std::ptrdiff_t>(end));
+                for (int& s : seq) s = t.byte_base[static_cast<std::size_t>(s)];
+                bpe_encode_word(t, seq, sub);
+            }
             const std::size_t N = sub.size();
             if (N >= 3) {                               // SPELL-encapsulate: 2 delimiters <= N-1 JOINs
                 out.push_back(t.spell_start_id);
@@ -519,12 +618,16 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
             ++i;
             continue;
         }
-        std::vector<int> seq;
-        for (std::size_t k = i; k < end; ++k) {
-            const int id = t.sym_to_base(stream[k]);
-            if (id >= 0) seq.push_back(id);
+        if (t.max_piece > 0) {                          // Unigram word encoding
+            viterbi_encode_word(t, stream, i, end, out);
+        } else {
+            std::vector<int> seq;
+            for (std::size_t k = i; k < end; ++k) {
+                const int id = t.sym_to_base(stream[k]);
+                if (id >= 0) seq.push_back(id);
+            }
+            bpe_encode_word(t, seq, out);
         }
-        bpe_encode_word(t, seq, out);
         i = end;
     }
     return out;
@@ -548,12 +651,27 @@ std::string detokenize(const Tokenizer& t, const std::vector<int>& ids) {
 void serialize(const Tokenizer& t, std::ostream& os) {
     auto wu32 = [&](std::uint32_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     auto wu16 = [&](std::uint16_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
+    auto wf32 = [&](float v)         { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     wu32(0x5A543053u);  // "S0TZ"
     wu32(static_cast<std::uint32_t>(t.vocab));
     wu32(static_cast<std::uint32_t>(t.n_base));
     for (int code : t.base_symbol) wu16(static_cast<std::uint16_t>(code));
-    wu32(static_cast<std::uint32_t>(t.merges.size()));
-    for (const auto& [a, b] : t.merges) { wu32(static_cast<std::uint32_t>(a)); wu32(static_cast<std::uint32_t>(b)); }
+    // Word-vocabulary kind: 1 = Unigram (pieces + log-probs, the default), 0 = legacy BPE merges.
+    if (t.max_piece > 0) {
+        wu32(1u);
+        wu32(static_cast<std::uint32_t>(t.max_piece));
+        for (int id = 0; id < t.vocab; ++id)
+            wf32(id < static_cast<int>(t.piece_logp.size()) ? t.piece_logp[static_cast<std::size_t>(id)] : -1e30f);
+        for (int id = t.n_base; id < t.vocab; ++id) {              // each piece is a byte sequence
+            const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+            wu16(static_cast<std::uint16_t>(e.size()));
+            for (int code : e) os.put(static_cast<char>(code & 0xFF));
+        }
+    } else {
+        wu32(0u);
+        wu32(static_cast<std::uint32_t>(t.merges.size()));
+        for (const auto& [a, b] : t.merges) { wu32(static_cast<std::uint32_t>(a)); wu32(static_cast<std::uint32_t>(b)); }
+    }
     // Sorted so the artifact is byte-deterministic regardless of set iteration order;
     // membership is order-independent anyway.
     std::vector<std::string> att(t.attested.begin(), t.attested.end());
@@ -568,6 +686,7 @@ void serialize(const Tokenizer& t, std::ostream& os) {
 bool deserialize(Tokenizer& out, std::istream& is) {
     auto ru32 = [&] { std::uint32_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto ru16 = [&] { std::uint16_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
+    auto rf32 = [&] { float v{};         is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     if (ru32() != 0x5A543053u) return false;  // "S0TZ"
 
     Tokenizer t;
@@ -595,18 +714,37 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         else if (code == TOK_TAB4)        t.tab4_id   = i;
         else                              t.byte_base[static_cast<unsigned char>(code)] = i;
     }
-    const int n_merges = static_cast<int>(ru32());
-    t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));
-    t.merges.reserve(static_cast<std::size_t>(n_merges));
-    for (int i = 0; i < n_merges; ++i) {
-        const int a = static_cast<int>(ru32());
-        const int b = static_cast<int>(ru32());
-        t.merges.emplace_back(a, b);
-        t.merge_rank.emplace(std::pair{a, b}, i);
-        std::vector<int> exp = t.expansion[static_cast<std::size_t>(a)];
-        exp.insert(exp.end(), t.expansion[static_cast<std::size_t>(b)].begin(),
-                   t.expansion[static_cast<std::size_t>(b)].end());
-        t.expansion.push_back(std::move(exp));
+    const int kind = static_cast<int>(ru32());
+    if (kind == 1) {                                                   // Unigram: pieces + log-probs
+        t.max_piece = static_cast<int>(ru32());
+        t.piece_logp.resize(static_cast<std::size_t>(t.vocab));
+        for (int id = 0; id < t.vocab; ++id) t.piece_logp[static_cast<std::size_t>(id)] = rf32();
+        t.expansion.reserve(static_cast<std::size_t>(t.vocab));
+        for (int id = t.n_base; id < t.vocab; ++id) {
+            const int len = static_cast<int>(ru16());
+            std::vector<int> codes(static_cast<std::size_t>(len));
+            std::string s(static_cast<std::size_t>(len), '\0');
+            for (int k = 0; k < len; ++k) { const int c = static_cast<unsigned char>(is.get()); codes[static_cast<std::size_t>(k)] = c; s[static_cast<std::size_t>(k)] = static_cast<char>(c); }
+            t.expansion.push_back(std::move(codes));
+            t.piece_index.emplace(std::move(s), id);
+        }
+        for (int b = 0; b < 256; ++b)                                 // single bytes are candidates too
+            if (t.byte_base[static_cast<std::size_t>(b)] >= 0)
+                t.piece_index.emplace(std::string(1, static_cast<char>(b)), t.byte_base[static_cast<std::size_t>(b)]);
+    } else {                                                          // legacy BPE merges
+        const int n_merges = static_cast<int>(ru32());
+        t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));
+        t.merges.reserve(static_cast<std::size_t>(n_merges));
+        for (int i = 0; i < n_merges; ++i) {
+            const int a = static_cast<int>(ru32());
+            const int b = static_cast<int>(ru32());
+            t.merges.emplace_back(a, b);
+            t.merge_rank.emplace(std::pair{a, b}, i);
+            std::vector<int> exp = t.expansion[static_cast<std::size_t>(a)];
+            exp.insert(exp.end(), t.expansion[static_cast<std::size_t>(b)].begin(),
+                       t.expansion[static_cast<std::size_t>(b)].end());
+            t.expansion.push_back(std::move(exp));
+        }
     }
     const int n_words = static_cast<int>(ru32());
     for (int i = 0; i < n_words; ++i) {

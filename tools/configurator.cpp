@@ -614,10 +614,15 @@ int main(int argc, char** argv) {
     // alphabet, the ordered merges, the per-id expansion and the attested set.
     const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge, join_scheme != 0});
 
-    // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header).
+    // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header). The
+    // vocab curve + the BPE side of the A/B need the greedy merges, but `tkz` above is now Unigram (the
+    // default), so learn a BPE tokenizer for the comparison here (it remaps S.word_syms to BPE ids,
+    // which the A/B reads; the A/B re-learns Unigram internally).
     if (!dump_vocab.empty()) {
-        dump_vocab_files(S, tkz, dump_vocab);
-        std::println(stderr, "vocab dumps written: {}.{{corpus_vocab,token_vocab,ngrams}}.txt", dump_vocab);
+        const tok::Tokenizer tkz_bpe = tok::learn(S, attested,
+            {vocab_target, min_merge, join_scheme != 0, tok::LearnOptions::Method::BPE});
+        dump_vocab_files(S, tkz_bpe, dump_vocab);
+        std::println(stderr, "vocab dumps written: {}.{{corpus_vocab,token_vocab,ngrams,vocab_curve,unigram_vocab}}.txt", dump_vocab);
         return 0;
     }
 
@@ -980,8 +985,9 @@ int main(int argc, char** argv) {
     std::println(stderr, "-----------------------------------------------");
     if (!tok_rt) { std::println(stderr, "configure error: tokenization round-trip failed"); return 1; }
 
-    std::println("sub0-configure: vocab={} (base {} + {} merges), d={} L={} H={} seq={}{} -> {}",
-                 vocab, n_base, merges.size(), d_model, n_layers, n_heads, seq_len,
+    std::println("sub0-configure: vocab={} (base {} + {} {}), d={} L={} H={} seq={}{} -> {}",
+                 vocab, n_base, vocab - n_base, tkz.max_piece > 0 ? "unigram pieces" : "BPE merges",
+                 d_model, n_layers, n_heads, seq_len,
                  ternary ? " (ternary)" : "", out);
     return 0;
 }

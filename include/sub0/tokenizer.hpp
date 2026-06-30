@@ -115,6 +115,14 @@ struct Tokenizer {
     std::vector<std::vector<int>>    expansion;    // id -> base symbol codes
     std::unordered_set<std::string>  attested;     // lowercase words eligible for case collapse
 
+    // Unigram LM word encoding (the default; replaces the BPE merges above). When `max_piece > 0` the
+    // word encoder is Viterbi over `piece_index` (byte-string -> id) scored by `piece_logp` (per id),
+    // instead of the greedy merge replay. Base bytes + learned pieces are both candidates; markers are
+    // not. See sub0/unigram.hpp.
+    std::vector<float>                     piece_logp;   // id -> log prob (Viterbi cost = -logp); -inf for non-pieces
+    std::unordered_map<std::string, int>   piece_index;  // byte sequence -> id
+    int                                    max_piece = 0;// longest piece (0 = BPE/merge mode)
+
     int sym_to_base(int code) const {
         if (code == casing::TOK_CAP) return cap_id;
         if (code == casing::TOK_UP)  return up_id;
@@ -123,9 +131,13 @@ struct Tokenizer {
 };
 
 struct LearnOptions {
-    int  vocab_target = 2048;  // target vocabulary size (base symbols + markers + merges)
-    int  min_merge    = 2;     // stop merging once the best pair occurs fewer than this many times
-    bool join_scheme  = false; // JOIN/implicit-space scheme: complete 256-byte base + spacing markers
+    // Word-vocabulary method: Unigram LM (default; global, occurrence-optimal, no dead tokens) or the
+    // legacy greedy BPE merges (kept for the vocab A/B + curve analysis).
+    enum class Method { Unigram, BPE };
+    int    vocab_target = 2048;  // target vocabulary size (base symbols + markers + word pieces/merges)
+    int    min_merge    = 2;     // BPE: stop merging once the best pair occurs fewer than this many times
+    bool   join_scheme  = false; // JOIN/implicit-space scheme: complete 256-byte base + spacing markers
+    Method method       = Method::Unigram;
 };
 
 // Learn the base alphabet + BPE merges from a completed scan and the derived attested
