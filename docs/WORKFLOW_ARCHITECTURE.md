@@ -61,13 +61,17 @@ that turns runtime-discovered facts into compile-time constants.
 1. **Bake build facts into `sub0llm-configure`** (`configure_file` → `sub0_build_facts.hpp`); drop the
    mirrored CLI args from the CMake `add_custom_command`. ✅ **DONE** — device caps + output paths are
    baked; the command keeps `--corpus` + the user-overridable knobs.
-2. **Gate the stage targets on configure.** ✅ **DONE (dependency form)** — each `sub0llm-<stage>` target
-   `add_dependencies(... sub0_generate_config)`, so it cannot build before the config header exists;
-   `sub0llm-configure` itself has no such dependency (state-1 buildable). The hard `EXISTS`-gate +
-   `CMAKE_CONFIGURE_DEPENDS` (fresh checkout builds *only* the configurator) is the stricter variant,
-   deferred — the auto-generate convenience already produces the header, and the core decouple holds:
-   dims live in tool-owned headers, so `sub0llm-configure …` + `cmake --build` re-sizes with **no CMake
-   reconfigure**.
+2. **Gate the stage targets on configure + a lever to fully decouple.** ✅ **DONE** — each
+   `sub0llm-<stage>` auto-depends on `sub0_generate_config` (so it can't build before the config exists);
+   `sub0llm-configure` itself has no such dependency (state-1 buildable). **`SUB0_AUTO_CONFIGURE`**
+   (default ON) is the lever: ON keeps the one-shot convenience (the build regenerates config when the
+   corpus/tool/tune-cache change); **OFF** is the pure staged workflow — the build never regenerates
+   behind your back, `sub0_generate_config` becomes an explicit on-demand target, and the engine compiles
+   against the existing header (gating only the dependency was insufficient — the header is a custom-command
+   OUTPUT, so OFF swaps it for a COMMAND-only target). Even with ON the core decouple holds: dims live in
+   tool-owned headers, so `sub0llm-configure …` + `cmake --build` re-sizes with **no CMake reconfigure**.
+   The strict `EXISTS`-gate + `CMAKE_CONFIGURE_DEPENDS` (fresh checkout builds *only* the configurator)
+   remains an optional stricter variant.
 3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
    the engine share one site. ⏳ pending (internal cleanup; today the configurator links `sub0_tok` +
    the header-only frontend bits directly).

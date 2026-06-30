@@ -35,6 +35,11 @@ On the first configure the configurator runs automatically and emits, into the b
 - `sub0_system.hpp` — the *machine* (precision, thread/batch defaults, CUDA backend), per host
 - `sub0_config.hpp` — a thin umbrella over both (what the engine includes)
 
+This build-time auto-configuration is the default (`SUB0_AUTO_CONFIGURE=ON`). Pass
+`-DSUB0_AUTO_CONFIGURE=OFF` for the **pure staged workflow** — the build never regenerates config behind
+your back; you run `sub0llm-configure` (or `cmake --build <dir> --target sub0_generate_config`) yourself,
+then build. The stage tools (`sub0llm-train/-gen/-tune`) are separate executables for exactly this.
+
 ### Building with the CUDA backend (Windows)
 
 When a CUDA toolkit and device are present, the GPU training backend is built automatically. On
