@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <istream>
 #include <string>
+#include <vector>
 
 namespace sub0::config {
 
@@ -87,6 +89,32 @@ inline Precision resolve_precision(int code, bool f16_ok) {
         case 2:  return {"", PrecStatus::F16Unsupported};
         default: return {f16_ok ? "BF16" : "F32", PrecStatus::Ok};   // 9 = AUTO
     }
+}
+
+// --- Vocabulary-size curve (the "ideal vocab" knee) ------------------------
+// A BPE merge i removes `merge_counts[i]` corpus tokens, so total_word_tokens(n_base+k) =
+// total_word_bytes − Σ_{i<k} merge_counts[i] traces the whole bytes/token-vs-vocab curve. These pure
+// summaries drive the --dump-vocab report; tested in isolation.
+
+// The vocab size capturing `frac` (0..1) of the total achievable token reduction -- the
+// diminishing-returns knee. Returns n_base when there is no reduction.
+inline int vocab_at_fraction(long long total_reduction, const std::vector<long long>& merge_counts,
+                             int n_base, double frac) {
+    if (total_reduction <= 0) return n_base;
+    const long long target = static_cast<long long>(frac * static_cast<double>(total_reduction));
+    long long cum = 0;
+    int k = 0;
+    for (; k < static_cast<int>(merge_counts.size()) && cum < target; ++k) cum += merge_counts[k];
+    return n_base + k;
+}
+
+// bytes/token at vocab n_base+k (1.0 at the character-encoding floor, rising as vocab grows).
+inline double bytes_per_token_at(long long total_bytes, const std::vector<long long>& merge_counts, int k) {
+    const int kk = std::min(k, static_cast<int>(merge_counts.size()));
+    long long cum = 0;
+    for (int i = 0; i < kk; ++i) cum += merge_counts[static_cast<std::size_t>(i)];
+    const long long tok = total_bytes - cum;
+    return tok > 0 ? static_cast<double>(total_bytes) / static_cast<double>(tok) : 0.0;
 }
 
 }  // namespace sub0::config

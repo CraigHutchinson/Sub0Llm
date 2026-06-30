@@ -361,17 +361,14 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
     {
         long long total_bytes = 0;
         for (const auto& [key, id] : S.index) total_bytes += S.word_freq[static_cast<std::size_t>(id)] * static_cast<long long>(key.size());
-        const int nm = static_cast<int>(tkz.merge_count.size());
+        const std::vector<long long>& mc = tkz.merge_count;
+        const int nm = static_cast<int>(mc.size());
         std::vector<long long> cum(static_cast<std::size_t>(nm) + 1, 0);
-        for (int i = 0; i < nm; ++i) cum[static_cast<std::size_t>(i) + 1] = cum[static_cast<std::size_t>(i)] + tkz.merge_count[static_cast<std::size_t>(i)];
+        for (int i = 0; i < nm; ++i) cum[static_cast<std::size_t>(i) + 1] = cum[static_cast<std::size_t>(i)] + mc[static_cast<std::size_t>(i)];
         const long long total_reduction = cum[static_cast<std::size_t>(nm)];
         auto tokens_at = [&](int k) { return total_bytes - cum[static_cast<std::size_t>(std::min(k, nm))]; };
-        auto bpt_at    = [&](int k) { const long long tk = tokens_at(k); return tk > 0 ? static_cast<double>(total_bytes) / static_cast<double>(tk) : 0.0; };
-        auto vocab_at_frac = [&](double frac) {
-            const long long target = static_cast<long long>(frac * static_cast<double>(total_reduction));
-            int k = 0; while (k < nm && cum[static_cast<std::size_t>(k)] < target) ++k;
-            return tkz.n_base + k;
-        };
+        auto bpt_at    = [&](int k) { return sub0::config::bytes_per_token_at(total_bytes, mc, k); };
+        auto vocab_at_frac = [&](double frac) { return sub0::config::vocab_at_fraction(total_reduction, mc, tkz.n_base, frac); };
         {
             std::ofstream os(prefix + ".vocab_curve.txt");
             std::println(os, "# vocab-size curve (word encoding): total_word_bytes={}, base_vocab={}, max_vocab={}",

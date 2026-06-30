@@ -4,10 +4,12 @@
 // parse (defaults + each key + the derived GPU batch), and precision resolution (codes + capability).
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "sub0/config_util.hpp"
 
 #include <sstream>
+#include <vector>
 
 using namespace sub0::config;
 
@@ -81,6 +83,23 @@ TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[confi
     const TuneDefaults db = parse_tune_cache(bad, 12);
     CHECK(db.threads == 12);                              // 0 rejected -> hardware
     CHECK(db.windows_per_thread == 4);                   // -1 rejected -> default
+}
+
+TEST_CASE("vocab curve: the ideal-vocab knee + bytes/token", "[config][vocab]") {
+    // Decreasing per-merge benefits (BPE picks the highest-count pair first) -> the compression curve.
+    const std::vector<long long> counts = {1000, 500, 200, 100, 50, 25, 10, 5};   // total reduction 1890
+    const int n_base = 269;
+
+    // The knee = vocab capturing X% of the total reduction.
+    CHECK(vocab_at_fraction(1890, counts, n_base, 0.50) == n_base + 1);   // 945 reached after merge 1
+    CHECK(vocab_at_fraction(1890, counts, n_base, 0.90) == n_base + 4);   // 1701 reached after merge 4
+    CHECK(vocab_at_fraction(1890, counts, n_base, 1.00) == n_base + 8);   // all merges
+    CHECK(vocab_at_fraction(0,    {},     n_base, 0.90) == n_base);       // no reduction -> base only
+
+    // bytes/token rises monotonically from the character-encoding floor as vocab grows.
+    const long long total_bytes = 2000;                                  // = total_word_tokens at k=0
+    CHECK(bytes_per_token_at(total_bytes, counts, 0) == Catch::Approx(1.0));
+    CHECK(bytes_per_token_at(total_bytes, counts, 8) > bytes_per_token_at(total_bytes, counts, 1));
 }
 
 TEST_CASE("f16_capable + resolve_precision: codes and capability", "[config][precision]") {
