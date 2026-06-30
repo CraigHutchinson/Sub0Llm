@@ -1228,6 +1228,11 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 std::fflush(stdout);
             }
         }
+        // The footprint probe above LEAVES its batch-64 set (~1.5 GB) resident. Free it before
+        // measuring free VRAM below, else the budget -- and the VRAM-fit batch ceiling derived from
+        // it -- is under-counted by that set (the conservative 293 we saw). The CUDA context survives
+        // shutdown, so the sweep's first measurement re-allocs from a clean, accurately-budgeted slate.
+        sub0_cuda_shutdown();
 
         // The SAME robust search the CPU sweep uses (sub0::tune::maximize): a joint coarse grid +
         // top-basin refinement + median-of-samples confirmation. This replaces the old single-pass

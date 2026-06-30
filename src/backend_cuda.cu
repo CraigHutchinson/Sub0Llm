@@ -1740,14 +1740,17 @@ SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
     return sub0::memplan::train_resident_mb(kFootprintDims, batch, sizeof(act_t));
 }
 
-// Currently-free dedicated VRAM in MiB, measured AFTER the CUDA context + cuBLAS handle exist (so the
-// driver context overhead the pure footprint model cannot see is already subtracted). The GPU tuner
-// budgets its batch ladder against THIS rather than the baked GPU_VRAM_MB total: the baked value is
-// the card's spec, but the usable budget is total minus context/driver reservations, which is why a
-// batch the pure model says "fits" the spec can still spill. Returns 0 on failure (caller falls back).
+// Currently-free dedicated VRAM in MiB. The GPU tuner budgets its batch ladder against THIS rather
+// than the baked GPU_VRAM_MB spec, because the usable budget is the card total minus the CUDA
+// context/driver reservation (~1 GB) the pure footprint model cannot see -- which is why a batch the
+// model says "fits" the spec can still spill. We force ONLY the context (cudaFree(nullptr) is the
+// canonical no-op that triggers lazy context creation) so that reservation is already subtracted from
+// the figure, but we do NOT allocate the param blob or realize cuBLAS here: the previous
+// sub0_cuda_init()/ensure_cublas() allocated exactly the memory we are trying to measure free (it
+// drove the budget negative -- "showed -2gb"). cuBLAS workspace is allocated lazily on the first GEMM,
+// AFTER this probe, so the caller reserves headroom for it. Returns 0 on failure (caller falls back).
 SUB0_CUDA_API int sub0_cuda_free_vram_mb() {
-    if (sub0_cuda_init() != 0) return 0;
-    ensure_cublas();                                       // realize the cuBLAS context before measuring
+    cudaFree(nullptr);                                     // ensure the context exists; allocates nothing
     std::size_t free_b = 0, total = 0;
     if (cudaMemGetInfo(&free_b, &total) != cudaSuccess) return 0;
     return static_cast<int>(free_b / (1024 * 1024));
