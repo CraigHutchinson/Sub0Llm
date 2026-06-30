@@ -83,10 +83,9 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
-set(SUB0_D_MODEL  448 CACHE STRING "embedding / residual width")
-set(SUB0_N_LAYERS 11  CACHE STRING "transformer blocks")
-set(SUB0_N_HEADS  7  CACHE STRING "attention heads")
-set(SUB0_SEQ_LEN  256 CACHE STRING "context window")
+# Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0-configure AUTO-SIZES
+# them from the corpus scale and bakes them into the generated header. To pin a size, run the
+# configurator directly: `sub0-configure --corpus <c> --dmodel N --layers N ... -o <header>`.
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
 # Positional encoding scheme (compile-time, an enum so future schemes can be added).
@@ -253,10 +252,6 @@ add_custom_command(
   BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
   COMMAND sub0-configure
             --corpus  "${SUB0_CORPUS}"
-            --dmodel  ${SUB0_D_MODEL}
-            --layers  ${SUB0_N_LAYERS}
-            --heads   ${SUB0_N_HEADS}
-            --seq     ${SUB0_SEQ_LEN}
             --ternary ${SUB0_TERNARY}
             --pos-encoding ${SUB0_POS_ENCODING_INT}
             --rope-theta ${SUB0_ROPE_THETA}

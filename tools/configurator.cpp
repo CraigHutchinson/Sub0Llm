@@ -432,6 +432,20 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
     }
 }
 
+// Auto-size the model dimensions from the corpus scale (file bytes). A coarse ladder -- a small story
+// corpus gets a compact model, a web-scale corpus a larger one -- so a fresh corpus trains a sensibly
+// sized model without hand-tuning. Any dim left 0 on the CLI takes this default; an explicit
+// --dmodel/--layers/... pins it. (~d192 for tinystories, ~d448 for fineweb-smoke.)
+struct AutoDims { int d, layers, heads, seq; };
+inline AutoDims autosize_dims(std::uintmax_t corpus_bytes) {
+    const double mb = static_cast<double>(corpus_bytes) / 1e6;
+    if (mb <    64.0) return {192,  6, 6, 256};   // ~tinystories (22 MB)
+    if (mb <   512.0) return {320,  8, 8, 256};
+    if (mb <  4096.0) return {448, 11, 7, 256};   // ~fineweb_smoke (1 GB)
+    if (mb < 32768.0) return {640, 14, 8, 512};
+    return                  {768, 16, 8, 512};    // ~full fineweb (45 GB)
+}
+
 }  // namespace
 
 using namespace sub0::casing;
@@ -441,10 +455,10 @@ int main(int argc, char** argv) {
 
     std::string corpus;
     std::string out;
-    int d_model      = 96;
-    int n_layers     = 3;
-    int n_heads      = 4;
-    int seq_len      = 64;
+    int d_model      = 0;       // 0 = auto-size from corpus scale (autosize_dims); any nonzero pins it
+    int n_layers     = 0;
+    int n_heads      = 0;
+    int seq_len      = 0;
     int ternary      = 0;
     int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
     double rope_theta = 10000.0;// RoPE frequency base
@@ -454,7 +468,7 @@ int main(int argc, char** argv) {
     int vocab_target = 2048;
     int min_merge    = 2;
     int emit_tok     = 1;
-    int join_scheme  = 0;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
+    int join_scheme  = 1;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
     std::string tune_cache;
     int has_cuda    = 0;   // CUDA toolkit + device detected at configure time
     int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
@@ -467,10 +481,10 @@ int main(int argc, char** argv) {
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
        ->required()->check(CLI::ExistingFile);
     app.add_option("-o",       out,     "Output generated header path")->required();
-    app.add_option("--dmodel", d_model, "Embedding / residual width")->capture_default_str();
-    app.add_option("--layers", n_layers,"Transformer block count")->capture_default_str();
-    app.add_option("--heads",  n_heads, "Attention head count")->capture_default_str();
-    app.add_option("--seq",    seq_len, "Context window length")->capture_default_str();
+    app.add_option("--dmodel", d_model, "Embedding / residual width (0 = auto-size from corpus)")->capture_default_str();
+    app.add_option("--layers", n_layers,"Transformer block count (0 = auto)")->capture_default_str();
+    app.add_option("--heads",  n_heads, "Attention head count (0 = auto)")->capture_default_str();
+    app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--pos-encoding", pos_encoding,
@@ -517,6 +531,20 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
 
     CLI11_PARSE(app, argc, argv);
+
+    // Auto-size any dimension left at 0 from the corpus scale (the configurator owns the defaults; an
+    // explicit --dmodel/... still wins). The corpus file exists (required + ExistingFile).
+    {
+        std::error_code ec;
+        const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, ec);
+        const AutoDims a = autosize_dims(ec ? 0 : corpus_bytes);
+        if (d_model  == 0) d_model  = a.d;
+        if (n_layers == 0) n_layers = a.layers;
+        if (n_heads  == 0) n_heads  = a.heads;
+        if (seq_len  == 0) seq_len  = a.seq;
+        std::println(stderr, "auto-size: corpus {:.0f} MB -> d={} L={} H={} seq={} (0-valued dims; --dmodel etc. pin)",
+                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len);
+    }
 
     if (d_model % n_heads != 0) {
         std::println(stderr, "configure error: dmodel ({}) not divisible by heads ({})",
