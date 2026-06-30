@@ -266,6 +266,90 @@ bool load_scan_state(const std::string& path, const std::string& corpus, sub0::t
     return static_cast<bool>(is);
 }
 
+// Readable vocabulary-analysis dumps (--dump-vocab). Three files for reviewing how the tokenizer
+// compacts the corpus and whether the vocab size / BPE merges are well spent:
+//   <prefix>.corpus_vocab.txt — every unique word-unit (truecased) + occurrence count, freq-desc.
+//   <prefix>.token_vocab.txt  — every learned token (base byte / marker / merge), its text, and the
+//                               corpus occurrences it covers (so over/under-used tokens + tail waste
+//                               are visible at a glance).
+//   <prefix>.ngrams.txt       — k-char substring frequencies (k=2..16) over the corpus vocab, weighted
+//                               by word count: the common "tion"/"ing"/"ience" chunks a sub-token
+//                               scheme would target, independent of the BPE merge ORDER. The basis for
+//                               a ground-up "longest common sub-section" vocabulariser.
+void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::string& prefix) {
+    auto vis = [](const std::string& k) {
+        std::string o;
+        for (unsigned char c : k) {
+            if (c >= 32 && c < 127) o += static_cast<char>(c);
+            else { char b[8]; std::snprintf(b, sizeof b, "\\x%02x", c); o += b; }
+        }
+        return o;
+    };
+    auto by_count_desc = [](const auto& a, const auto& b) { return a.first > b.first; };
+
+    // 1. Corpus vocabulary: (count, word) freq-desc.
+    std::vector<std::pair<long long, std::string>> cv;
+    cv.reserve(S.index.size());
+    long long total_occ = 0;
+    for (const auto& [key, id] : S.index) {
+        const long long f = S.word_freq[static_cast<std::size_t>(id)];
+        cv.push_back({f, key});
+        total_occ += f;
+    }
+    std::sort(cv.begin(), cv.end(), by_count_desc);
+    {
+        std::ofstream os(prefix + ".corpus_vocab.txt");
+        std::println(os, "# corpus vocabulary: {} unique word-units, {} total occurrences (truecased; count<TAB>word, freq-desc)",
+                     cv.size(), total_occ);
+        for (const auto& [c, w] : cv) std::println(os, "{}\t{}", c, vis(w));
+    }
+
+    // 2. Token vocabulary: per learned token, the corpus occurrences it covers (sum of word counts
+    //    over every word whose final id-sequence includes it -- S.word_syms holds those final ids).
+    {
+        std::vector<long long> occ(static_cast<std::size_t>(tkz.vocab), 0);
+        for (std::size_t w = 0; w < S.word_syms.size(); ++w) {
+            const long long f = S.word_freq[w];
+            for (int tid : S.word_syms[w]) if (tid >= 0 && tid < tkz.vocab) occ[static_cast<std::size_t>(tid)] += f;
+        }
+        std::ofstream os(prefix + ".token_vocab.txt");
+        std::println(os, "# token vocabulary: {} tokens (base {} + {} merges); id<TAB>kind<TAB>occurrences<TAB>text",
+                     tkz.vocab, tkz.n_base, tkz.merges.size());
+        for (int id = 0; id < tkz.vocab; ++id) {
+            std::string text;
+            for (int code : tkz.expansion[static_cast<std::size_t>(id)])
+                text += (code >= 0 && code < 256) ? vis(std::string(1, static_cast<char>(code)))
+                                                  : std::format("<{}>", code);
+            const char* kind = id >= tkz.n_base ? "merge"
+                             : (tkz.base_symbol[static_cast<std::size_t>(id)] < 256 ? "byte" : "marker");
+            std::println(os, "{}\t{}\t{}\t{}", id, kind, occ[static_cast<std::size_t>(id)], text);
+        }
+    }
+
+    // 3. k-char substring (n-gram) frequencies over the corpus vocab, weighted by word count. This is
+    //    the order-independent view of the common sub-chunks (BPE's merges depend on greedy order;
+    //    this does not), the input a "minimise tokens by occurrence" search would consume.
+    {
+        std::unordered_map<std::string, long long> ng;
+        for (const auto& [key, id] : S.index) {
+            const long long f = S.word_freq[static_cast<std::size_t>(id)];
+            const int n = static_cast<int>(key.size());
+            const int kmax = std::min(n, 16);
+            for (int k = 2; k <= kmax; ++k)
+                for (int i = 0; i + k <= n; ++i) ng[key.substr(static_cast<std::size_t>(i), static_cast<std::size_t>(k))] += f;
+        }
+        std::vector<std::pair<long long, std::string>> v;
+        v.reserve(ng.size());
+        for (const auto& [s, c] : ng) v.push_back({c, s});
+        std::sort(v.begin(), v.end(), by_count_desc);
+        std::ofstream os(prefix + ".ngrams.txt");
+        std::println(os, "# {} distinct k-char substrings (k=2..16) over the corpus vocab, freq-weighted; count<TAB>len<TAB>substring, desc (top 30000)",
+                     v.size());
+        for (std::size_t i = 0; i < v.size() && i < 30000; ++i)
+            std::println(os, "{}\t{}\t{}", v[i].first, v[i].second.size(), vis(v[i].second));
+    }
+}
+
 }  // namespace
 
 using namespace sub0::casing;
@@ -296,6 +380,7 @@ int main(int argc, char** argv) {
     int gpu_shared_mb = 0; // shared/overflow system memory the GPU can address (WDDM), MB
     int compute     = 0;   // resolved backend: 0=CPU, 1=GPU, 2=HYBRID
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
+    std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
        ->required()->check(CLI::ExistingFile);
@@ -317,6 +402,8 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 9));
     app.add_option("--prec-act", prec_act, "Saved-activation storage precision: 0=F32,1=BF16,2=F16,9=AUTO")
        ->capture_default_str()->check(CLI::Range(0, 9));
+    app.add_option("--dump-vocab", dump_vocab,
+                   "Write readable vocabulary-analysis dumps to <prefix>.{corpus_vocab,token_vocab,ngrams}.txt and exit");
     app.add_option("--vocab",  vocab_target, "Target BPE vocabulary size (base symbols + markers + merges)")
        ->capture_default_str();
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
@@ -444,6 +531,13 @@ int main(int argc, char** argv) {
     // tokenized corpus from S.index + S.word_syms. The learned Tokenizer carries the base
     // alphabet, the ordered merges, the per-id expansion and the attested set.
     const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge, join_scheme != 0});
+
+    // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header).
+    if (!dump_vocab.empty()) {
+        dump_vocab_files(S, tkz, dump_vocab);
+        std::println(stderr, "vocab dumps written: {}.{{corpus_vocab,token_vocab,ngrams}}.txt", dump_vocab);
+        return 0;
+    }
 
     // Aliases so the downstream emit / reporting code reads the learned tokenizer + scan stats.
     const auto& word_syms   = S.word_syms;   // now final token-id sequences
