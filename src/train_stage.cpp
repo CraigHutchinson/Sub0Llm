@@ -1068,17 +1068,18 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
     const bool run_cpu = backend != TUNE_BACKEND_GPU;   // gpu-only skips the CPU sweep
     const bool run_gpu = backend != TUNE_BACKEND_CPU;   // cpu-only skips the device-step sweep
 
-    // Fixed wall-clock budget: lay down the coarse shape first, then narrow into the troughs
-    // only as long as time allows (tune::Options::should_stop). When both sweeps run, the CPU
-    // sweep gets a fraction and the GPU device-step sweep the remainder, so neither starves.
-    const auto  tune_start  = std::chrono::steady_clock::now();
-    const int   budget_total = budget_s > 0 ? budget_s : (thorough ? 600 : 120);
-    const double cpu_frac    = (run_cpu && run_gpu) ? 0.45 : 1.0;
-    const auto  cpu_deadline = tune_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                std::chrono::duration<double>(budget_total * cpu_frac));
-    const auto  gpu_deadline = tune_start + std::chrono::seconds(budget_total);
-    std::println("tune budget: {} s ({}){}", budget_total, thorough ? "thorough" : "fast",
-                 run_cpu && run_gpu ? std::format(" -- CPU<={:.0f}s then GPU", budget_total * cpu_frac) : "");
+    // NO global timeout: each sample is bounded by its own PER-TEST budget (the Schedule's per-phase
+    // budget_ms, enforced by bench::adaptive_time's per-test wall cap), so the whole knob grid is
+    // measured -- no important point is skipped (a global deadline would skip whatever it didn't reach
+    // first). `--seconds` is an optional hard SAFETY backstop only (0 = none, the default).
+    const auto tune_start = std::chrono::steady_clock::now();
+    std::function<bool()> safety_stop = nullptr;
+    if (budget_s > 0)
+        safety_stop = [end = tune_start + std::chrono::seconds(budget_s)] {
+            return std::chrono::steady_clock::now() > end;
+        };
+    std::println("tune: per-test budget ({}){}", thorough ? "thorough" : "fast",
+                 budget_s > 0 ? std::format(" | safety cap {}s", budget_s) : std::string{});
 
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
@@ -1146,8 +1147,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         sub0::tune::Options opt;
         opt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
         const sub0::tune::Schedule sched = sub0::tune::schedule_for(thorough != 0, /*gpu=*/false);
-        sub0::tune::apply(opt, sched,
-            [&] { return std::chrono::steady_clock::now() > cpu_deadline; }, &budget_ms,
+        sub0::tune::apply(opt, sched, safety_stop, &budget_ms,
             [&](sub0::tune::Phase p) {
                 switch (p) {
                     case sub0::tune::Phase::Explore:
@@ -1160,8 +1160,8 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 std::fflush(stdout);
             });
         sub0::tune::Result r = sub0::tune::maximize(space, objective, opt);
-        if (std::chrono::steady_clock::now() > cpu_deadline)
-            std::println("[budget] CPU sweep stopped at its time budget -- reporting best so far");
+        if (safety_stop && safety_stop())
+            std::println("[budget] CPU sweep hit the --seconds safety cap -- reporting best so far");
 
         best_threads = static_cast<int>(std::lround(r.best[0]));
         best_wpt     = static_cast<int>(std::lround(r.best[1]));
@@ -1321,13 +1321,29 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
             return tok;
         };
 
+        // One-time device warmup BEFORE the search. A fresh CUDA context pays its cold start --
+        // cuBLAS handle/workspace + first-matmul autotuning (~100s) plus the resident-param malloc --
+        // on the very first timed step. Left uncharged that single cold sample blew the WHOLE time
+        // budget before the batch ladder was even explored (the tune then cached the one batch it
+        // managed to measure as "best"). A couple of discarded steps at a mid-ladder batch realize the
+        // context + prime cuBLAS so every measured point below reflects steady-state throughput.
+        {
+            const int warm_batch = batch_ladder[batch_ladder.size() / 2];
+            double warm_ms = 0.0;
+            const auto wt0 = std::chrono::steady_clock::now();
+            sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms);   // primes context + cuBLAS
+            sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms);   // steady-state read
+            std::println("device warmup @ batch {}: {:.0f} ms/step (primed in {:.1f}s)", warm_batch, warm_ms,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - wt0).count());
+            std::fflush(stdout);
+        }
+
         // Same shared schedule, GPU profile (device steps cost ~seconds: longer per phase, lighter
         // confirm). Only the device-step deadline and the per-phase log line differ from the CPU sweep.
         sub0::tune::Options gopt;
         gopt.settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
         const sub0::tune::Schedule gsched = sub0::tune::schedule_for(thorough != 0, /*gpu=*/true);
-        sub0::tune::apply(gopt, gsched,
-            [&] { return std::chrono::steady_clock::now() > gpu_deadline; }, &gbudget_ms,
+        sub0::tune::apply(gopt, gsched, safety_stop, &gbudget_ms,
             [&](sub0::tune::Phase p) {
                 switch (p) {
                     case sub0::tune::Phase::Explore:
@@ -1340,8 +1356,8 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 std::fflush(stdout);
             });
         const sub0::tune::Result gr = sub0::tune::maximize(gspace, gobjective, gopt);
-        if (std::chrono::steady_clock::now() > gpu_deadline)
-            std::println("[budget] GPU sweep stopped at its time budget -- reporting best so far");
+        if (safety_stop && safety_stop())
+            std::println("[budget] GPU sweep hit the --seconds safety cap -- reporting best so far");
 
         gpu_batch = static_cast<int>(std::lround(gr.best[0]));
 #if defined(SUB0_TUNING)

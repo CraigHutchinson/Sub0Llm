@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     tune->add_flag("--thorough", tune_thorough,
                    "Aggressive search: wider grid + more re-measurement (longer default budget) for a tighter optimum");
     tune->add_option("--seconds", tune_seconds,
-                     "Wall-clock time budget in seconds (0 = profile default: fast 120 / thorough 600)");
+                     "Optional hard safety cap in seconds (0 = none; each sample is bounded per-test, so the full grid is measured)");
     tune->add_option("--backend", tune_backend,
                      "Which backend(s) to tune: auto (CPU + GPU if present) | all | cpu | gpu (skip CPU, keep its cached tuning)")
         ->transform(CLI::CheckedTransformer(std::map<std::string, int>{

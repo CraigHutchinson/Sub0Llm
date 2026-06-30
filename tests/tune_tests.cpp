@@ -12,6 +12,7 @@
 #include <map>
 
 #include "sub0/tune.hpp"
+#include "sub0/bench.hpp"
 #include "sub0/memplan.hpp"
 
 using sub0::tune::Knob;
@@ -257,6 +258,26 @@ TEST_CASE("apply: installs schedule, deadline and live phase budget onto Options
     REQUIRE(seen.size() == 3);
     CHECK(seen[0] == Phase::Explore);
     CHECK(seen[2] == Phase::Confirm);
+}
+
+TEST_CASE("adaptive_time: per-test cap stops at one step when a step exceeds the budget", "[tune][bench]") {
+    sub0::bench::Budget b;
+    b.budget_ms = 300.0; b.warmup = 2; b.min_iters = 3;
+
+    // SLOW step (5s >> 300ms budget): the single probe IS the measurement -- do NOT run min_iters
+    // more multi-second steps. This per-test wall cap is what lets the sweep measure the whole grid
+    // without a global timeout that would skip the points it never reached.
+    int warm = 0;
+    const sub0::bench::Timing slow =
+        sub0::bench::adaptive_time([&] { ++warm; }, [](int n) { return 5000.0 * n; }, b);
+    CHECK(slow.iters == 1);                                   // one probe step, not min_iters (=3)
+    CHECK(slow.per_step_ms == Catch::Approx(5000.0));
+    CHECK(warm == b.warmup);                                  // warmup still runs (clock ramp)
+
+    // FAST step (1ms << budget): many fit, so the min_iters floor applies for a stable reading.
+    const sub0::bench::Timing fast =
+        sub0::bench::adaptive_time([] {}, [](int n) { return 1.0 * n; }, b);
+    CHECK(fast.iters >= b.min_iters);
 }
 
 TEST_CASE("search is deterministic across runs", "[tune]") {

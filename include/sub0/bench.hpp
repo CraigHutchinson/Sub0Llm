@@ -45,6 +45,14 @@ Timing adaptive_time(Step&& step, RunTimed&& run_timed, const Budget& b = {}) {
     const double budget = b.budget_ms > 0.0 ? b.budget_ms : Budget{}.budget_ms;
     const double probe  = run_timed(1);                       // one timed probe (doubles as extra warmup)
     const double est    = probe > 1e-3 ? probe : 1e-3;        // guard against a zero/garbage probe
+
+    // PER-TEST wall cap: if a SINGLE step already meets the budget, that probe IS the measurement.
+    // min_iters is a floor for FAST steps (so jitter averages out), NOT a mandate to run several
+    // more multi-second steps on a SLOW one. Honouring the budget per sample is what keeps the whole
+    // sweep bounded WITHOUT a global timeout that would skip grid points -- each point still gets a
+    // (noisy, 1-step) reading, then refinement re-measures only the promising troughs more steadily.
+    if (probe >= budget) return Timing{ .per_step_ms = probe, .total_ms = probe, .iters = 1 };
+
     const int    sized  = static_cast<int>(budget / est);
     const int    n      = std::clamp(sized, b.min_iters, b.max_iters);
 
