@@ -114,6 +114,13 @@ struct Options {
     // noisy), then refinement/confirmation narrow into the troughs for only as long as the
     // budget allows. Null = run to convergence (the deterministic default).
     std::function<bool()> should_stop = nullptr;
+    // Coarse-pass strategy. false (default) = the joint CARTESIAN grid: robust to non-separable /
+    // cross-interfering axes (where the best value of one knob depends on another) but coarse_points^K
+    // evals. true = COORDINATE DESCENT: sweep one axis at a time holding the others at their running
+    // best -- K * coarse_points evals, correct and far cheaper WHEN the axes are separable (the
+    // empirically-observed case for threads / windows-per-thread / batch). The tuner sets this true by
+    // default and false under --thorough (where the joint grid earns its cost).
+    bool separable = false;
 };
 
 // --- Budgeted-sweep schedule (shared by every caller, unit-tested) ---------
@@ -258,10 +265,35 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
         if (s.empty() || s.back() != n - 1) s.push_back(n - 1);   // anchor the top end
     }
 
-    // 1. Coarse global grid: evaluate the Cartesian product of the per-axis samples.
+    // 1. Coarse pass: lay down the basin seed(s) the refinement then narrows.
     if (opt.on_phase) opt.on_phase(Phase::Explore);
     std::vector<std::pair<double, std::vector<int>>> coarse;
-    {
+    if (opt.separable) {
+        // COORDINATE DESCENT (prior art: coordinate search / line search on a separable objective):
+        // start each axis at its middle coarse sample, then sweep ONE axis at a time over its coarse
+        // samples holding the others at their running best. K * coarse_points evals instead of the
+        // product -- e.g. threads(6) + wpt(5) = 11, not 30 -- and exact when the axes don't
+        // cross-interfere. A single seed results; the ternary refinement below fine-tunes it.
+        std::vector<int> cur(static_cast<std::size_t>(K));
+        for (int k = 0; k < K; ++k) {
+            const std::vector<int>& s = axis_samples[static_cast<std::size_t>(k)];
+            cur[static_cast<std::size_t>(k)] = s[s.size() / 2];               // middle coarse sample
+        }
+        for (int k = 0; k < K && !stop(); ++k) {
+            const std::vector<int>& s = axis_samples[static_cast<std::size_t>(k)];
+            std::vector<int> probe = cur;
+            double best = -std::numeric_limits<double>::infinity();
+            int best_i = cur[static_cast<std::size_t>(k)];
+            for (const int idx : s) {
+                probe[static_cast<std::size_t>(k)] = idx;
+                const double v = eval_at(probe);
+                if (v > best) { best = v; best_i = idx; }
+            }
+            cur[static_cast<std::size_t>(k)] = best_i;
+        }
+        coarse.push_back({eval_at(cur), cur});
+    } else {
+        // JOINT CARTESIAN grid (--thorough): the coarse_points^K product, robust to cross-interference.
         std::vector<int> pick(static_cast<std::size_t>(K), 0);   // mixed-radix index into axis_samples
         for (;;) {
             // Budget guard: once exhausted, stop laying down coarse points but keep at least

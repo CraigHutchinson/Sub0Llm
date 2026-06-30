@@ -32,6 +32,8 @@ extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 extern "C" int  sub0_cuda_free_vram_mb();
 extern "C" int  sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
+extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
+                                        double* fwd_ms, double* bwd_ms, double* adam_ms);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -416,7 +418,7 @@ TEST_CASE("memplan param_floats matches the canonical layout", "[cuda][memplan]"
 // backend_cuda.cu without updating memplan.hpp, the gap blows past the tolerance and this fails --
 // exactly the "we didn't maintain the calculation" regression we want to catch automatically.
 TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]") {
-    for (const int batch : {32, 64, 128}) {
+    for (const int batch : {32, 64, 128, 256}) {           // 256 = the training batch (~4.7 GB); within VRAM
         double predicted_mb = 0.0, actual_mb = 0.0;
         REQUIRE(sub0_cuda_train_footprint(batch, &predicted_mb, &actual_mb) == 0);
         WARN("batch=" << batch << "  predicted=" << predicted_mb << " MiB  measured=" << actual_mb
@@ -492,6 +494,20 @@ TEST_CASE("CUDA forward stays correct across a batch grow (graph re-capture)", "
         INFO("batch " << batch << " max abs logit diff = " << max_abs);
         REQUIRE(max_abs < 1e-2);
     }
+    sub0_cuda_shutdown();
+}
+
+// Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
+// the checkpointed activations (a memory-for-compute trade) so it is expected to be heavy; this
+// surfaces the split so the throughput rework (optional checkpointing, on-device clip) is data-driven.
+TEST_CASE("CUDA per-phase profile attributes the step (forward/backward/adam)", "[cuda][.bench]") {
+    double f = 0.0, b = 0.0, a = 0.0;
+    REQUIRE(sub0_cuda_train_profile(32, 128, 10, &f, &b, &a) == 0);
+    const double tot = f + b + a;
+    WARN("step phases (ms): forward=" << f << "  backward=" << b << "  adam=" << a << "  | total=" << tot
+         << "  (backward recomputes checkpointed activations; adam carries the grad-norm host sync)");
+    REQUIRE(tot > 0.0);
+    CHECK(std::isfinite(f)); CHECK(std::isfinite(b)); CHECK(std::isfinite(a));
     sub0_cuda_shutdown();
 }
 

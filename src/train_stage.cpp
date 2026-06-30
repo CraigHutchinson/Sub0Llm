@@ -1159,6 +1159,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 }
                 std::fflush(stdout);
             });
+        opt.separable = (thorough == 0);    // fast: coordinate-descent (threads/wpt separable); thorough: joint grid
         sub0::tune::Result r = sub0::tune::maximize(space, objective, opt);
         if (safety_stop && safety_stop())
             std::println("[budget] CPU sweep hit the --seconds safety cap -- reporting best so far");
@@ -1360,6 +1361,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 }
                 std::fflush(stdout);
             });
+        gopt.separable = (thorough == 0);   // fast: coordinate-descent; thorough: joint batch x knob grid
         const sub0::tune::Result gr = sub0::tune::maximize(gspace, gobjective, gopt);
         if (safety_stop && safety_stop())
             std::println("[budget] GPU sweep hit the --seconds safety cap -- reporting best so far");

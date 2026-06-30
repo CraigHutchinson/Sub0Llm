@@ -1727,6 +1727,57 @@ SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, double budget_ms, 
     return time_train_step(batch, T, 0, budget_ms, out_ms);
 }
 
+// Per-phase profiler: times forward_train / backward_device / device_adam_step SEPARATELY via CUDA
+// events so the step cost can be attributed -- the small-GEMM forward vs the checkpoint-RECOMPUTE
+// backward vs the AdamW update (which carries the grad-norm host sync). Data-independent like
+// time_train_step; warms up (clock + cuBLAS) then averages `iters` timed steps. Any out ptr may be null.
+SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
+                                          double* fwd_ms, double* bwd_ms, double* adam_ms) {
+    if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    if (sub0_cuda_init() || fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
+    ensure_cublas();
+    set_handle_tf32(CudaTf32::get());
+    const int M = batch * T;
+    std::vector<float> hp(sub0::PARAM_FLOATS, 0.02f);
+    cudaMemcpy(g_dev_params, hp.data(), sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice);
+    build_qkv_weights();
+    cudaMemset(g_dev_m,   0, sub0::PARAM_FLOATS * sizeof(float));
+    cudaMemset(g_dev_vel, 0, sub0::PARAM_FLOATS * sizeof(float));
+    std::vector<int> hid(static_cast<size_t>(M)), htg(static_cast<size_t>(M));
+    for (int i = 0; i < M; ++i) { hid[i] = i % VOCAB; htg[i] = (i + 1) % VOCAB; }
+    cudaMemcpy(g_fwd.dids,    hid.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_tr.dtargets, htg.data(), static_cast<size_t>(M) * sizeof(int), cudaMemcpyHostToDevice);
+
+    long t = 0;
+    auto one = [&] {
+        forward_train(batch, T);
+        backward_device(batch, T, nullptr);
+        device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+    };
+    for (int w = 0; w < std::max(4, iters); ++w) one();        // warm the clock + cuBLAS before timing
+    cudaStreamSynchronize(g_stream);
+
+    cudaEvent_t e0, e1, e2, e3;
+    cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2); cudaEventCreate(&e3);
+    double fsum = 0.0, bsum = 0.0, asum = 0.0;
+    for (int i = 0; i < iters; ++i) {
+        cudaEventRecord(e0, g_stream); forward_train(batch, T);
+        cudaEventRecord(e1, g_stream); backward_device(batch, T, nullptr);
+        cudaEventRecord(e2, g_stream); device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+        cudaEventRecord(e3, g_stream); cudaEventSynchronize(e3);
+        float f = 0.f, b = 0.f, a = 0.f;
+        cudaEventElapsedTime(&f, e0, e1); cudaEventElapsedTime(&b, e1, e2); cudaEventElapsedTime(&a, e2, e3);
+        fsum += f; bsum += b; asum += a;
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2); cudaEventDestroy(e3);
+    if (fwd_ms)  *fwd_ms  = fsum / iters;
+    if (bwd_ms)  *bwd_ms  = bsum / iters;
+    if (adam_ms) *adam_ms = asum / iters;
+    return 0;
+}
+
 // This build's model dimensions, packaged for the pure footprint model (sub0/memplan.hpp).
 static constexpr sub0::memplan::Dims kFootprintDims{
     D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,

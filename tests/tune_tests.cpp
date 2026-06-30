@@ -260,6 +260,29 @@ TEST_CASE("apply: installs schedule, deadline and live phase budget onto Options
     CHECK(seen[2] == Phase::Confirm);
 }
 
+TEST_CASE("separable coordinate-descent finds the optimum in fewer evals than the joint grid", "[tune]") {
+    // A separable 2-knob objective (peak at threads=5, wpt=8, no cross term) -- the threads x wpt
+    // case. Coordinate descent sweeps each axis once (holding the other at its running best) instead
+    // of the Cartesian product, so it converges with strictly fewer evals while landing on the same
+    // optimum. (Cross-interfering landscapes still need the joint grid; that is the --thorough path,
+    // exercised by the cross-interference test, which runs on the default joint Options.)
+    Space space = {
+        {"threads", sub0::tune::linear_steps(1, 12, 12)},
+        {"wpt",     {1, 2, 4, 8, 16, 32}},
+    };
+    auto obj = [](const Assignment& a) { return -std::pow(a[0] - 5.0, 2.0) - std::pow(a[1] - 8.0, 2.0); };
+
+    sub0::tune::Options sep;  sep.separable = true;
+    const auto r = maximize(space, obj, sep);
+    CHECK(r.best[0] == 5.0);
+    CHECK(r.best[1] == 8.0);
+
+    const auto rj = maximize(space, obj, {});            // default = joint Cartesian grid
+    CHECK(rj.best[0] == 5.0);
+    CHECK(rj.best[1] == 8.0);
+    CHECK(r.evaluations < rj.evaluations);               // coordinate descent is strictly cheaper
+}
+
 TEST_CASE("monotonic axis: ternary chop reaches the top end with few evals", "[tune]") {
     // The threads-scale-to-the-core-count case: throughput rises monotonically with the knob, so
     // the optimum is the top index. The refinement must REACH it while doing far fewer evals than
