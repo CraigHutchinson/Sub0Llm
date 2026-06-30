@@ -110,6 +110,8 @@ public:
     explicit AdamW(float lr);
     void zero_grad();
     void step();
+    void  set_lr(float lr) { lr_ = lr; }         // per-step LR schedule (warmup + decay)
+    float lr() const { return lr_; }
     long step_count() const { return t_; }      // bias-correction counter (for checkpoints)
     void set_step_count(long t) { t_ = t; }      // restore on resume
 private:

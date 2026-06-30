@@ -111,6 +111,7 @@ constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop ove
                                               // (~0.8%/epoch). 2% was too loose: it stopped on slow-
                                               // but-real tails (d96 @1.985 and d128 @2.68 both still
                                               // improving ~1.5%/window) well before the true floor.
+constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
 
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context
@@ -297,6 +298,19 @@ using sub0::coherence::ngram_repeat;   // pure n-gram repeat metric (see coheren
 // sign test (which false-stopped a strongly-but-noisily descending run -- see coherence_tests).
 bool plateaued(const std::vector<double>& evals) {
     return sub0::coherence::trend_plateaued(evals, PLATEAU_WINDOW, PLATEAU_MIN_REL);
+}
+
+// Per-step learning rate: a LINEAR WARMUP to the peak over `warmup` steps, then a horizon-free
+// INVERSE-SQRT DECAY (lr proportional to 1/sqrt(step)). We previously trained at a CONSTANT lr
+// (no warmup, no decay), which makes a model oscillate around a high floor instead of settling
+// into the minimum -- the exact stall we saw (train+val flat ~3.28 with the lr bouncing the loss).
+// Warmup avoids the early high-lr instability; the decay lets it descend past that floor. The
+// inverse-sqrt form needs NO total-step horizon, so it fits the plateau-stopped, never-a-fixed-
+// step-count schedule, and is recomputed from the global step so resume is exact.
+inline float lr_schedule(long step, float peak, long warmup) {
+    if (warmup < 1) warmup = 1;
+    const float s = static_cast<float>(step), w = static_cast<float>(warmup);
+    return step < warmup ? peak * (s / w) : peak * std::sqrt(w / s);
 }
 
 // --- Checkpoint (full optimizer + loop state, for exact resume) -------------
@@ -691,14 +705,18 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
+    const long lr_warmup_steps = std::max<long>(10, std::lround(LR_WARMUP_EPOCHS * epoch_steps));
+    const float peak_lr = lr;   // `lr` is the peak; lr_schedule(step) warms up to it then decays
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train);
-    std::println("schedule: {} steps/epoch | warmup {} | eval every {} | max {} steps ({} epochs){}{}",
+    std::println("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
                  epoch_steps, warmup_steps, eval_every, max_steps,
                  (max_steps + epoch_steps - 1) / epoch_steps,
                  on_demand ? " | on-demand" : "",
                  resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
+    std::println("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
+                 peak_lr, batch, lr_warmup_steps);
     std::fflush(stdout);
 
     std::vector<size_t> starts(batch);
@@ -743,11 +761,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             starts[b]  = win.start;
             win_len[b] = win.len;
         }
+        const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
         float step_loss;
         if (gpu_train) {
-            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch, seq_t, lr);
+            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch, seq_t, lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
+            opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW update
             step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, seq_t, win_len.data());
             opt.step();
         }
