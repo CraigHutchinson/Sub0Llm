@@ -97,10 +97,8 @@ struct Tokenizer {
     int                  n_base = 0;   // base alphabet size
     std::array<int, 256> byte_base{};  // byte value -> base id (-1 if unused)
     int                  cap_id = -1, up_id = -1;  // base ids of the case markers
-    // JOIN scheme (implicit-space tokenizer). When set, the base alphabet is the complete
-    // 256 bytes + the markers, and encode/detokenize use the spacing FSM instead of
-    // space-as-byte. Detected on load from the presence of TOK_JOIN in the base alphabet.
-    bool                 join_scheme = false;
+    // JOIN (implicit-space) markers. The base alphabet is the complete 256 bytes + these markers, and
+    // encode/detokenize use the spacing FSM. This is the only scheme.
     int                  join_id = -1, newline_id = -1, para_id = -1;
     int                  odquote_id = -1, cdquote_id = -1;        // directional double quotes (§3)
     int                  spell_start_id = -1, spell_end_id = -1;  // spaceless-group delimiters (§4, N>=3 words)
@@ -122,12 +120,6 @@ struct Tokenizer {
     std::vector<float>                     piece_logp;   // id -> log prob (Viterbi cost = -logp); -inf for non-pieces
     std::unordered_map<std::string, int>   piece_index;  // byte sequence -> id
     int                                    max_piece = 0;// longest piece (0 = BPE/merge mode)
-
-    int sym_to_base(int code) const {
-        if (code == casing::TOK_CAP) return cap_id;
-        if (code == casing::TOK_UP)  return up_id;
-        return byte_base[static_cast<unsigned char>(code)];
-    }
 };
 
 struct LearnOptions {
@@ -136,7 +128,6 @@ struct LearnOptions {
     enum class Method { Unigram, BPE };
     int    vocab_target = 2048;  // target vocabulary size (base symbols + markers + word pieces/merges)
     int    min_merge    = 2;     // BPE: stop merging once the best pair occurs fewer than this many times
-    bool   join_scheme  = false; // JOIN/implicit-space scheme: complete 256-byte base + spacing markers
     Method method       = Method::Unigram;
 };
 

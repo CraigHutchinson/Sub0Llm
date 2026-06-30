@@ -169,7 +169,7 @@ std::string read_file(const std::filesystem::path& p) {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("round-trip: worked examples across constructs", "[tok][fuzz]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<std::string> cases = {
         // hyphen-joined, capitalized, CamelCase compounds (the user's example)
         "Commons Attribution-NonCommercial-NoDerivs",
@@ -220,7 +220,7 @@ TEST_CASE("round-trip: dogfood the project's own C++ source", "[tok][fuzz][dogfo
         if (corpus.size() < 1u << 21) corpus += text;   // cap the learn set at ~2 MB
         contents.emplace_back(p.filename().string(), std::move(text));
     }
-    const Tokenizer t = sub0::tok::learn(corpus, {.vocab_target = 4096, .join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(corpus, {.vocab_target = 4096});
 
     int fails = 0;
     std::string reports;
@@ -275,7 +275,7 @@ std::string mutate(std::string s, std::mt19937& rng, int nmut) {
 }  // namespace
 
 TEST_CASE("round-trip: fuzz mutated seeds", "[tok][fuzz]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     std::mt19937 rng(0x5EED5EEDu);                      // fixed -> reproducible
     int fails = 0;
     std::string reports;
@@ -290,7 +290,7 @@ TEST_CASE("round-trip: fuzz mutated seeds", "[tok][fuzz]") {
 }
 
 TEST_CASE("round-trip: fuzz random byte blobs", "[tok][fuzz]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     std::mt19937 rng(0xB10BB10Bu);
     std::uniform_int_distribution<int> len(0, 200), byte(0, 255);
     int fails = 0;
@@ -310,7 +310,7 @@ TEST_CASE("round-trip: fuzz random byte blobs", "[tok][fuzz]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("patterns: token breakdown of surprising constructs", "[tok][patterns]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<std::string> examples = {
         "Commons Attribution-NonCommercial-NoDerivs",   // hyphen-joined + CamelCase
         "ThisIsMyAwesomeFunction",                      // CamelCase identifier
@@ -341,7 +341,7 @@ TEST_CASE("patterns: how the project's own source tokenizes", "[tok][patterns]")
         if (corpus.size() < 1u << 21) corpus += text;
     }
     REQUIRE_FALSE(corpus.empty());
-    const Tokenizer t = sub0::tok::learn(corpus, {.vocab_target = 4096, .join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(corpus, {.vocab_target = 4096});
 
     long r = 0;
     const std::string norm = sub0::casing::normalize_text(corpus, r);

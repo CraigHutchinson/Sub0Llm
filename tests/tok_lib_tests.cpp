@@ -137,8 +137,8 @@ TEST_CASE("encode is deterministic", "[tok]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
-    REQUIRE(t.join_scheme);
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    REQUIRE(t.join_id >= 0);
     REQUIRE(t.n_base == 269);                 // 256 bytes + 13 markers
     REQUIRE(t.cap_id == 256);
     REQUIRE(t.up_id == 257);
@@ -157,7 +157,7 @@ TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
 }
 
 TEST_CASE("JOIN scheme: a single inter-word space costs no token", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<int> ids = sub0::tok::encode(t, "the dog ran");
     REQUIRE_FALSE(ids.empty());
     for (int id : ids) REQUIRE(id != ' ');    // spaces are implicit, never a literal byte token
@@ -165,7 +165,7 @@ TEST_CASE("JOIN scheme: a single inter-word space costs no token", "[tok][join]"
 }
 
 TEST_CASE("JOIN scheme: round-trips spacing, punctuation and case", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "the quick brown fox ."));
     REQUIRE(round_trips(t, "the cat, the dog; and a fox."));   // glued punctuation -> JOIN
     REQUIRE(round_trips(t, "glued.text.no.spaces"));           // all glued
@@ -175,7 +175,7 @@ TEST_CASE("JOIN scheme: round-trips spacing, punctuation and case", "[tok][join]
 }
 
 TEST_CASE("JOIN scheme: round-trips whitespace variety", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "line one\nline two"));             // single newline -> NEWLINE
     REQUIRE(round_trips(t, "para one\n\npara two"));           // blank line  -> PARA
     REQUIRE(round_trips(t, "a  b   c"));                       // multi-space -> SPACE2 (+ byte)
@@ -187,7 +187,7 @@ TEST_CASE("JOIN scheme: round-trips whitespace variety", "[tok][join]") {
 // Run-length whitespace: multi-space/tab runs collapse to SPACE2/4 / TAB2/4 (so code
 // indentation stops costing one token per space); a single inter-word space stays free.
 TEST_CASE("JOIN scheme: run-length whitespace tokens collapse indentation", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     auto enc = [&](const std::string& s) { return sub0::tok::encode(t, s); };
 
     // 4-space indent after a newline -> NEWLINE + SPACE4 (was 1 nl byte + 4 space bytes).
@@ -215,7 +215,7 @@ TEST_CASE("JOIN scheme: run-length whitespace tokens collapse indentation", "[to
 }
 
 TEST_CASE("JOIN scheme: complete base encodes out-of-corpus bytes", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     // Symbols the tiny corpus may never contain still round-trip -- the total 256-byte base
     // means no input character is silently dropped (the §1 correctness fix).
     REQUIRE(round_trips(t, "email me @ x%y/z+~"));
@@ -224,24 +224,24 @@ TEST_CASE("JOIN scheme: complete base encodes out-of-corpus bytes", "[tok][join]
 }
 
 TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     std::ostringstream os(std::ios::binary);
     sub0::tok::serialize(t, os);
     std::istringstream is(os.str(), std::ios::binary);
     Tokenizer t2;
     REQUIRE(sub0::tok::deserialize(t2, is));
-    REQUIRE(t2.join_scheme);                  // scheme inferred from the base alphabet
+    REQUIRE(t2.join_id >= 0);                  // scheme inferred from the base alphabet
     REQUIRE(t2.join_id == t.join_id);
     REQUIRE(round_trips(t2, "The cat, the dog.\nLine two here."));
 }
 
 TEST_CASE("JOIN scheme: encode is deterministic", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(sub0::tok::encode(t, "the cat, sat.") == sub0::tok::encode(t, "the cat, sat."));
 }
 
 TEST_CASE("JOIN scheme: directional double quotes round-trip + bundle spacing", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "she said \"hello\" and left ."));
     REQUIRE(round_trips(t, "\"quoted start\" then text"));     // leading open quote
     REQUIRE(round_trips(t, "a \"b\" c \"d e\" f"));            // multiple pairs, multi-word quote
@@ -254,7 +254,7 @@ TEST_CASE("JOIN scheme: directional double quotes round-trip + bundle spacing", 
 }
 
 TEST_CASE("JOIN scheme: SPELL encapsulation for long/OOV words round-trips", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "the antidisestablishmentarianism word"));
     REQUIRE(round_trips(t, "DoThisFooBar and NASA acronyms"));
     REQUIRE(round_trips(t, "pneumonoultramicroscopicsilicovolcanoconiosis"));
@@ -267,7 +267,7 @@ TEST_CASE("JOIN scheme: SPELL encapsulation for long/OOV words round-trips", "[t
 }
 
 TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "She said, \"Don't touch the antidisestablishment thing!\""));
     REQUIRE(round_trips(t, "ANTIDISESTABLISHMENT"));          // all-caps long word: UP across the SPELL group
     REQUIRE(round_trips(t, "The Supercalifragilistic word ends here ."));
@@ -276,7 +276,7 @@ TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
 // CamelCase / PascalCase splits at case transitions into one collapsed sub-word per segment
 // (each reusing the lowercase merges) instead of shattering into near-character SPELL tokens.
 TEST_CASE("JOIN scheme: CamelCase splits into per-segment case markers", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     // "NonCommercial" -> Non | Commercial : two capitalised segments -> two CAP markers.
     const std::vector<int> nc = sub0::tok::encode(t, "NonCommercial");
     REQUIRE(std::count(nc.begin(), nc.end(), t.cap_id) == 2);
@@ -295,7 +295,7 @@ TEST_CASE("JOIN scheme: CamelCase splits into per-segment case markers", "[tok][
 // snake_case / hyphenated compounds: the interior '_' and '-' bind the word into ONE unit
 // (no JOIN per separator) so BPE merges across them; round-trip is preserved.
 TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<int> ss = sub0::tok::encode(t, "save_scan_state");
     REQUIRE(std::count(ss.begin(), ss.end(), t.join_id) == 0);   // one unit, not save<J>_<J>scan...
     REQUIRE(round_trips(t, "save_scan_state"));
@@ -310,7 +310,7 @@ TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]"
 // lowercase form, but word_unit_end keeps "nasa's" as ONE unit (interior apostrophe). UP must
 // stop at the apostrophe so the post-' "s" stays lowercase -- mirrors casing::detokenize.
 TEST_CASE("JOIN scheme: UP stops at an interior apostrophe", "[tok][join]") {
-    const Tokenizer t = sub0::tok::learn(kCorpus, {.join_scheme = true});
+    const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "THE's end"));                    // UP on THE, lowercase 's (the NASA's bug)
     REQUIRE(round_trips(t, "the DOG's bone is here"));       // "dog" is attested -> UP collapse
     REQUIRE(round_trips(t, "She's happy and they're here")); // CAP + contraction

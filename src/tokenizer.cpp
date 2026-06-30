@@ -243,36 +243,24 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
         t.base_symbol.push_back(code);
         return id;
     };
-    if (opts.join_scheme) {
-        // JOIN scheme: the COMPLETE 256-byte alphabet (a total tokenizer -- any byte is
-        // encodable, no silent drop of out-of-corpus characters) followed by the markers,
-        // ALWAYS present so the base alphabet is corpus-independent and the ids are stable.
-        for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
-        t.cap_id        = add_marker(TOK_CAP);
-        t.up_id         = add_marker(TOK_UP);
-        t.join_id       = add_marker(TOK_JOIN);
-        t.newline_id    = add_marker(TOK_NEWLINE);
-        t.para_id       = add_marker(TOK_PARA);
-        t.odquote_id    = add_marker(TOK_ODQUOTE);
-        t.cdquote_id    = add_marker(TOK_CDQUOTE);
-        t.spell_start_id = add_marker(TOK_SPELL_START);
-        t.spell_end_id  = add_marker(TOK_SPELL_END);
-        t.space2_id     = add_marker(TOK_SPACE2);
-        t.space4_id     = add_marker(TOK_SPACE4);
-        t.tab2_id       = add_marker(TOK_TAB2);
-        t.tab4_id       = add_marker(TOK_TAB4);
-        t.join_scheme = true;
-    } else {
-        // Legacy scheme: only the byte values the corpus actually used (in byte order) then
-        // the markers that were actually emitted -- a compact, corpus-derived alphabet.
-        for (int b = 0; b < 256; ++b)
-            if (scan.byte_used[static_cast<std::size_t>(b)]) {
-                t.byte_base[static_cast<std::size_t>(b)] = static_cast<int>(t.base_symbol.size());
-                t.base_symbol.push_back(b);
-            }
-        if (scan.used_cap) { t.cap_id = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_CAP); }
-        if (scan.used_up)  { t.up_id  = static_cast<int>(t.base_symbol.size()); t.base_symbol.push_back(TOK_UP); }
-    }
+    // The COMPLETE 256-byte alphabet (a total tokenizer -- any byte is encodable, no silent drop of
+    // out-of-corpus characters) followed by the spacing/case markers, ALWAYS present so the base
+    // alphabet is corpus-independent and the ids are stable. This is the only scheme (the legacy
+    // corpus-derived "space-as-a-byte-token" alphabet was retired with the old models).
+    for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
+    t.cap_id        = add_marker(TOK_CAP);
+    t.up_id         = add_marker(TOK_UP);
+    t.join_id       = add_marker(TOK_JOIN);
+    t.newline_id    = add_marker(TOK_NEWLINE);
+    t.para_id       = add_marker(TOK_PARA);
+    t.odquote_id    = add_marker(TOK_ODQUOTE);
+    t.cdquote_id    = add_marker(TOK_CDQUOTE);
+    t.spell_start_id = add_marker(TOK_SPELL_START);
+    t.spell_end_id  = add_marker(TOK_SPELL_END);
+    t.space2_id     = add_marker(TOK_SPACE2);
+    t.space4_id     = add_marker(TOK_SPACE4);
+    t.tab2_id       = add_marker(TOK_TAB2);
+    t.tab4_id       = add_marker(TOK_TAB4);
     t.n_base = static_cast<int>(t.base_symbol.size());
 
     t.expansion.resize(static_cast<std::size_t>(t.n_base));
@@ -609,39 +597,12 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
     const std::vector<int> stream = truecase_tokenize(norm, t.attested, nullptr);
 
     out.reserve(stream.size());
-    if (t.join_scheme) { encode_join(t, stream, out); return out; }
-    for (std::size_t i = 0, n = stream.size(); i < n;) {
-        const std::size_t end = word_unit_end(stream, i);
-        if (end == i) {
-            const int id = t.sym_to_base(stream[i]);
-            if (id >= 0) out.push_back(id);
-            ++i;
-            continue;
-        }
-        if (t.max_piece > 0) {                          // Unigram word encoding
-            viterbi_encode_word(t, stream, i, end, out);
-        } else {
-            std::vector<int> seq;
-            for (std::size_t k = i; k < end; ++k) {
-                const int id = t.sym_to_base(stream[k]);
-                if (id >= 0) seq.push_back(id);
-            }
-            bpe_encode_word(t, seq, out);
-        }
-        i = end;
-    }
+    encode_join(t, stream, out);               // the JOIN encoder (handles word -> Viterbi/BPE internally)
     return out;
 }
 
 std::string detokenize(const Tokenizer& t, const std::vector<int>& ids) {
-    if (t.join_scheme) return detokenize_join(t, ids);
-    std::vector<int> stream;
-    for (int id : ids) {
-        if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;
-        const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
-        stream.insert(stream.end(), e.begin(), e.end());
-    }
-    return casing::detokenize(stream);
+    return detokenize_join(t, ids);
 }
 
 // ============================================================================
@@ -701,7 +662,7 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         t.expansion[static_cast<std::size_t>(i)] = {code};
         if      (code == TOK_CAP)         t.cap_id = i;
         else if (code == TOK_UP)          t.up_id  = i;
-        else if (code == TOK_JOIN)        { t.join_id = i; t.join_scheme = true; }  // join scheme detected
+        else if (code == TOK_JOIN)        t.join_id = i;
         else if (code == TOK_NEWLINE)     t.newline_id = i;
         else if (code == TOK_PARA)        t.para_id    = i;
         else if (code == TOK_ODQUOTE)     t.odquote_id = i;

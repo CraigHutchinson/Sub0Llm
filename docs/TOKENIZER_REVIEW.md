@@ -12,9 +12,21 @@ Ordered by value/effort.
 
 ## 1. Remove the legacy (non-JOIN) tokenizer path  *(major refactor; highest cleanup value)*
 
-The JOIN scheme is the default and **all old models were discarded** (no backwards compat). The
-legacy "space-as-a-byte-token" scheme is now dead weight that forks every core routine behind a
-`join_scheme` flag, doubling the surface that must stay correct. Remove it.
+**Phase A — library + tests + configurator: ✅ DONE.** `learn` always mints the full 256-byte base +
+markers; `encode`/`detokenize` collapsed to the single JOIN path; `deserialize` no longer scheme-detects;
+`Tokenizer::join_scheme`, `LearnOptions::join_scheme` and the now-unused `sym_to_base` are gone. Tests
+dropped the `.join_scheme = true` opt (JOIN is the only scheme) and the field asserts became `join_id >= 0`.
+Verified: 224 engine-free assertions incl the 8000-case round-trip fuzz, and the configurator round-trips.
+
+**Phase B — build/registry plumbing: ⏳ remaining.** Retire the now-vestigial flags: `SUB0_JOIN_TOKENIZER`
++ `SUB0_JOIN_FLAG` + the `--join` CLI (now metadata-only, the library ignores it), the `JOIN_TOKENIZER`
+constexpr, `registry.hpp`'s `join_tokenizer` field / `j` tag / `compatible()` arg, and `train_stage`'s
+pass-through. Needs a full build (engine + registry + the model-naming change) so it is its own commit;
+update `frontend_tests` (the `rj` dir-name + the `compatible()` join arg) with it.
+
+The original rationale (kept for context): the JOIN scheme is the default and **all old models were
+discarded** (no backwards compat); the legacy "space-as-a-byte-token" scheme forked every core routine
+behind a `join_scheme` flag, doubling the surface that must stay correct.
 
 **Extent (what the legacy path touches):**
 - `tokenizer.cpp`: the `else` branch in `learn` (corpus-derived partial alphabet, no markers),

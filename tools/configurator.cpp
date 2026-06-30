@@ -639,7 +639,7 @@ int main(int argc, char** argv) {
     // S.word_syms in place from raw byte symbols to final token ids, so Pass 3 can emit the
     // tokenized corpus from S.index + S.word_syms. The learned Tokenizer carries the base
     // alphabet, the ordered merges, the per-id expansion and the attested set.
-    const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge, join_scheme != 0});
+    const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge});  // always JOIN scheme
 
     // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header). The
     // vocab curve + the BPE side of the A/B need the greedy merges, but `tkz` above is now Unigram (the
@@ -647,7 +647,7 @@ int main(int argc, char** argv) {
     // which the A/B reads; the A/B re-learns Unigram internally).
     if (!dump_vocab.empty()) {
         const tok::Tokenizer tkz_bpe = tok::learn(S, attested,
-            {vocab_target, min_merge, join_scheme != 0, tok::LearnOptions::Method::BPE});
+            {vocab_target, min_merge, tok::LearnOptions::Method::BPE});
         dump_vocab_files(S, tkz_bpe, dump_vocab);
         std::println(stderr, "vocab dumps written: {}.{{corpus_vocab,token_vocab,ngrams,vocab_curve,unigram_vocab}}.txt", dump_vocab);
         return 0;
@@ -660,7 +660,11 @@ int main(int argc, char** argv) {
     const int   n_base      = tkz.n_base;
     const int   vocab       = tkz.vocab;
     const auto& merges      = tkz.merges;
-    auto sym_to_base = [&](int s) { return tkz.sym_to_base(s); };
+    auto sym_to_base = [&](int s) -> int {   // marker/byte symbol -> base id (configurator reporting)
+        if (s == sub0::casing::TOK_CAP) return tkz.cap_id;
+        if (s == sub0::casing::TOK_UP)  return tkz.up_id;
+        return tkz.byte_base[static_cast<unsigned char>(s)];
+    };
     const sub0::casing::TokStats& st = S.st;
     const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
     const long long quote_repl = S.quote_repl;
