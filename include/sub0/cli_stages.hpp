@@ -1,0 +1,178 @@
+// cli_stages.hpp — the per-stage CLI runners, factored out of the driver so each is defined ONCE and
+// reused by both the umbrella `sub0llm` executable and the thin per-stage executables
+// (sub0llm-train / -gen / -tune). Each runner builds its own CLI::App, parses, and dispatches into the
+// stage shared libraries through their extern "C" entry points; it carries no model logic. Including
+// this pulls in the generated config (DEFAULT_CORPUS / HAS_CUDA / tuned defaults), so anything that uses
+// it is a post-configure (state-2) tool — the configurator itself never includes it.
+
+#pragma once
+
+#include "sub0/core.hpp"  // generated config: DEFAULT_CORPUS, HAS_CUDA, DEFAULT_THREADS, ...
+
+#include <cmath>
+#include <map>
+#include <print>
+#include <random>
+#include <string>
+
+#include <CLI/CLI.hpp>
+
+// Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
+extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
+                                int steps, int batch, float lr, unsigned seed);
+extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
+                              int n, float temp, int topk, unsigned seed);
+extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
+extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
+extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend, int thorough, int budget_s);
+extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
+extern "C" int sub0_report_stage(const char* model_in);
+extern "C" int sub0_memplan_stage();
+extern "C" int sub0_models_stage(int prune, int verbose);
+
+namespace sub0cli {
+
+// --- train -----------------------------------------------------------------
+// Default the minibatch to the tuned data-parallel width (threads x windows/thread, baked in by the
+// configurator) so a default run saturates the cores. lr is the batch-8 default scaled by
+// sqrt(batch/8) -- a bigger batch means fewer, lower-variance updates, so it wants a proportionally
+// larger step (sqrt rule for Adam).
+inline int run_train(int argc, char** argv) {
+    constexpr int   LR_BASE_BATCH = 8;
+    constexpr float LR_BASE       = 0.001f;
+    CLI::App app{"sub0llm-train — train a model (resumes from its .ckpt); auto-names a registered "
+                 "model dir when no path is given"};
+    std::string train_model, train_corpus{DEFAULT_CORPUS};
+    int   train_steps = 0, train_batch = 0;
+    float train_lr    = LR_BASE;
+    unsigned train_seed = 42;
+    app.add_option("model", train_model,
+                   "Output model path (optional; omit to auto-name by corpus+dims+git SHA)");
+    app.add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
+    app.add_option("--steps", train_steps,
+                   "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
+    app.add_option("--batch", train_batch,
+                   "Minibatch size (0 = auto: tuned GPU batch on a CUDA build, else CPU data-parallel width)");
+    auto* train_lr_opt =
+        app.add_option("--lr", train_lr, "Learning rate (default: 0.001 scaled by sqrt(batch/8))")
+           ->capture_default_str();
+    app.add_option("--seed", train_seed, "RNG seed")->capture_default_str();
+    CLI11_PARSE(app, argc, argv);
+
+    if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
+        train_batch = HAS_CUDA ? DEFAULT_GPU_BATCH : (DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD);
+    if (train_lr_opt->count() == 0)   // couple lr to batch unless pinned (sqrt rule for Adam)
+        train_lr = LR_BASE * std::sqrt(static_cast<float>(train_batch) / LR_BASE_BATCH);
+    return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
+                            train_steps, train_batch, train_lr, train_seed);
+}
+
+// --- gen -------------------------------------------------------------------
+inline int run_gen(int argc, char** argv) {
+    CLI::App app{"sub0llm-gen — generate text from a trained model"};
+    std::string gen_model, gen_prompt;
+    int   gen_n = 200, gen_topk = 20;
+    float gen_temp = 0.8f;
+    unsigned gen_seed = 0;
+    app.add_option("model",  gen_model,  "Trained model path")->required();
+    app.add_option("prompt", gen_prompt, "Prompt text")->required();
+    app.add_option("--n",    gen_n,    "Tokens to generate")->capture_default_str();
+    app.add_option("--temp", gen_temp, "Sampling temperature")->capture_default_str();
+    app.add_option("--topk", gen_topk, "Top-k sampling cutoff")->capture_default_str();
+    auto* gen_seed_opt = app.add_option("--seed", gen_seed, "RNG seed (default: random)");
+    CLI11_PARSE(app, argc, argv);
+
+    if (gen_seed_opt->count() == 0) gen_seed = std::random_device{}();  // fresh seed unless pinned
+    return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(), gen_n, gen_temp, gen_topk, gen_seed);
+}
+
+// --- tune ------------------------------------------------------------------
+inline int run_tune(int argc, char** argv) {
+    CLI::App app{"sub0llm-tune — auto-tune runtime knobs (threads, batch granularity) for throughput"};
+    int  tune_max_threads = 0;   // 0 = hardware_concurrency
+    bool tune_quiet = false, tune_thorough = false;
+    int  tune_seconds = 0;       // 0 = profile default (fast 120s / thorough 600s)
+    int  tune_backend = 0;       // 0=auto, 1=all, 2=cpu, 3=gpu
+    app.add_option("--max-threads", tune_max_threads,
+                   "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
+    app.add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
+    app.add_flag("--thorough", tune_thorough,
+                 "Aggressive search: wider grid + more re-measurement (longer default budget)");
+    app.add_option("--seconds", tune_seconds,
+                   "Optional hard safety cap in seconds (0 = none; each sample is bounded per-test)");
+    app.add_option("--backend", tune_backend,
+                   "Backend(s) to tune: auto (CPU + GPU if present) | all | cpu | gpu")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{
+           {"auto", 0}, {"all", 1}, {"cpu", 2}, {"gpu", 3}}, CLI::ignore_case))
+       ->default_str("auto");
+    CLI11_PARSE(app, argc, argv);
+
+    return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1, tune_backend,
+                           tune_thorough ? 1 : 0, tune_seconds);
+}
+
+// --- vocab -----------------------------------------------------------------
+inline int run_vocab(int argc, char** argv) {
+    CLI::App app{"sub0llm vocab — print the build's vocabulary table"};
+    std::string vocab_tok;
+    int vocab_limit = 0;
+    app.add_option("tokenizer", vocab_tok, "Tokenizer path (defaults to the baked-in tokenizer)");
+    app.add_option("--limit", vocab_limit, "Max entries to print (0 = all)")->capture_default_str();
+    CLI11_PARSE(app, argc, argv);
+    return sub0_vocab_stage(vocab_tok.empty() ? nullptr : vocab_tok.c_str(), vocab_limit);
+}
+
+// --- bench -----------------------------------------------------------------
+inline int run_bench(int argc, char** argv) {
+    CLI::App app{"sub0llm bench — cycle-accurate hot-path benchmark (forward/backward/optimizer)"};
+    int bench_iters = 200, bench_threads = DEFAULT_THREADS, bench_wpt = DEFAULT_WINDOWS_PER_THREAD;
+    app.add_option("--iters,--steps", bench_iters, "Iterations to time")->capture_default_str();
+    app.add_option("--threads", bench_threads,
+                   "Data-parallel worker threads (defaults to the tuned/hardware count; 1 = control)")
+       ->capture_default_str();
+    app.add_option("--windows-per-thread", bench_wpt,
+                   "Windows each thread carries in the data-parallel minibatch")->capture_default_str();
+    CLI11_PARSE(app, argc, argv);
+    return sub0_bench_stage(bench_iters, bench_threads, bench_wpt);
+}
+
+// --- autotemp --------------------------------------------------------------
+inline int run_autotemp(int argc, char** argv) {
+    CLI::App app{"sub0llm autotemp — pick the sampling temperature matching held-out text perplexity"};
+    std::string at_model;
+    unsigned at_seed = 42;
+    bool at_quiet = false;
+    app.add_option("model", at_model, "Trained model path")->required();
+    app.add_option("--seed", at_seed, "RNG seed for the generation sweep")->capture_default_str();
+    app.add_flag("--quiet", at_quiet, "Print only the recommendation, not the temperature sweep");
+    CLI11_PARSE(app, argc, argv);
+    return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
+}
+
+// --- models ----------------------------------------------------------------
+inline int run_models(int argc, char** argv) {
+    CLI::App app{"sub0llm models — list trained models; --prune removes ones incompatible with this build"};
+    bool models_prune = false;
+    app.add_flag("--prune", models_prune, "Delete models whose architecture this build cannot load");
+    CLI11_PARSE(app, argc, argv);
+    return sub0_models_stage(models_prune ? 1 : 0, 1);
+}
+
+// --- report ----------------------------------------------------------------
+inline int run_report(int argc, char** argv) {
+    CLI::App app{"sub0llm report — diagnose model sizing vs its corpus; suggest dimension knobs"};
+    std::string report_model;
+    app.add_option("model", report_model,
+                   "Trained model to include train/val loss diagnosis (optional; omit for structural-only)");
+    CLI11_PARSE(app, argc, argv);
+    return sub0_report_stage(report_model.empty() ? nullptr : report_model.c_str());
+}
+
+// --- memplan ---------------------------------------------------------------
+inline int run_memplan(int argc, char** argv) {
+    CLI::App app{"sub0llm memplan — predicted train/gen device memory footprints (vs VRAM)"};
+    CLI11_PARSE(app, argc, argv);
+    return sub0_memplan_stage();
+}
+
+}  // namespace sub0cli

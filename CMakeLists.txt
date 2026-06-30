@@ -6,7 +6,7 @@ project(sub0llm VERSION 0.1.0 LANGUAGES CXX)
 # in as constexpr constants, so the configuration is generated *during the build*
 # and the engine is compiled against it:
 #
-#   sub0-configure (stage 1, config-independent)
+#   sub0llm-configure (stage 1, config-independent)
 #        | reads the corpus + the SUB0_* args below
 #        v
 #   generated/sub0_config.hpp   (constexpr dims + corpus-derived vocab)
@@ -83,9 +83,9 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
-# Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0-configure AUTO-SIZES
+# Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0llm-configure AUTO-SIZES
 # them from the corpus scale and bakes them into the generated header. To pin a size, run the
-# configurator directly: `sub0-configure --corpus <c> --dmodel N --layers N ... -o <header>`.
+# configurator directly: `sub0llm-configure --corpus <c> --dmodel N --layers N ... -o <header>`.
 set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
 # Positional encoding scheme (compile-time, an enum so future schemes can be added).
@@ -229,9 +229,9 @@ add_library(sub0_tok STATIC src/tokenizer.cpp src/unigram.cpp)
 target_include_directories(sub0_tok PUBLIC "${CMAKE_SOURCE_DIR}/include")
 set_target_properties(sub0_tok PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_executable(sub0-configure tools/configurator.cpp)
-target_include_directories(sub0-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(sub0-configure PRIVATE CLI11::CLI11 sub0_tok)
+add_executable(sub0llm-configure tools/configurator.cpp)
+target_include_directories(sub0llm-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-configure PRIVATE CLI11::CLI11 sub0_tok)
 
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
@@ -247,17 +247,17 @@ if(NOT EXISTS "${GEN_TUNE_CACHE}")
   file(WRITE "${GEN_TUNE_CACHE}" "")
 endif()
 
-# Bake the build-known facts (detected device caps + the generated-output paths) INTO sub0-configure,
+# Bake the build-known facts (detected device caps + the generated-output paths) INTO sub0llm-configure,
 # so the command line below stops mirroring them and the tool is self-sufficient when run directly.
 # These become the CLI defaults; each stays overridable. See docs/WORKFLOW_ARCHITECTURE.md (Stage 1).
 configure_file("${CMAKE_SOURCE_DIR}/cmake/sub0_build_facts.hpp.in" "${GEN_DIR}/sub0_build_facts.hpp" @ONLY)
-target_include_directories(sub0-configure PRIVATE "${GEN_DIR}")
+target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 
 add_custom_command(
   OUTPUT  "${GEN_HEADER}"
   BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
              "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
-  COMMAND sub0-configure
+  COMMAND sub0llm-configure
             --corpus  "${SUB0_CORPUS}"
             --ternary ${SUB0_TERNARY}
             --pos-encoding ${SUB0_POS_ENCODING_INT}
@@ -268,7 +268,7 @@ add_custom_command(
             --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
             --join ${SUB0_JOIN_FLAG}
             --cuda-tf32 ${SUB0_CUDA_TF32_FLAG}
-  DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
+  DEPENDS sub0llm-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
   COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
   VERBATIM
 )
@@ -374,6 +374,23 @@ target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen CLI11::CLI11)
 set_target_properties(sub0llm PROPERTIES
   BUILD_RPATH "$ORIGIN"
   INSTALL_RPATH "$ORIGIN")
+
+# --- Stage 5b: the per-stage executables (thin mains over the shared runners) -
+# Each is an OPTIONAL, separately-buildable stage tool that reuses the same sub0cli::run_* runner the
+# umbrella `sub0llm` dispatches to (cli_stages.hpp) -- so arg parsing + stage dispatch are defined once.
+# They are GATED on the configured engine: each depends on sub0_generate_config (the generated header),
+# so a stage tool cannot build before `configure` has produced the config it is compiled against.
+foreach(_stage train gen tune)
+  add_executable(sub0llm-${_stage} tools/sub0llm-${_stage}.cpp)
+  add_dependencies(sub0llm-${_stage} sub0_generate_config)
+  target_include_directories(sub0llm-${_stage} PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+  target_link_libraries(sub0llm-${_stage} PRIVATE CLI11::CLI11)
+  set_target_properties(sub0llm-${_stage} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endforeach()
+# train + tune live in the train stage lib; gen in the gen stage lib.
+target_link_libraries(sub0llm-train PRIVATE sub0_train)
+target_link_libraries(sub0llm-tune  PRIVATE sub0_train)
+target_link_libraries(sub0llm-gen   PRIVATE sub0_gen)
 
 # --- Tests ------------------------------------------------------------------
 option(SUB0_BUILD_TESTS "Build the unit test suite" ON)
