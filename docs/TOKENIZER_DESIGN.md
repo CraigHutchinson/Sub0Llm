@@ -38,13 +38,17 @@ whitespace *runs*):
 | No space at a boundary | 92 % of word→punct | **JOIN** sentinel (also the 2-token compose op) |
 | Single newline | 2.6 % | `NEWLINE` token |
 | Paragraph break `\n\n` | 0.13 % | `PARA` token (1 token, not 2 newlines) |
-| Indentation / repeated spaces | **0.004 %** (prose) | **run-length** `SPACE2/3/4/8`, `TAB`, `TAB2…` — *corpus-conditional* |
+| Indentation / repeated spaces | **0.004 %** (prose), **huge in code** | **run-length** `SPACE2`/`SPACE4`/`TAB2`/`TAB4` — **DONE** |
 
-Run-length widths are chosen from the **measured** whitespace-run histogram, not assumed. After a
-`NEWLINE`, an 8-space indent is one `SPACE8`, not eight tokens. **For clean prose (FineWeb)
-multi-space runs and tabs are statistically nonexistent, so `SPACE_N`/`TAB` are NOT minted** — they
-stay specified and are minted only when a corpus's measured frequency clears a floor (code/markdown
-/TSV). This is the "only mint a special if it clears a measured floor" rule (§6) applied per corpus.
+Run-length tokens greedily tile any space/tab run (4s before 2s, an odd remainder as a verbatim
+byte): after a `NEWLINE`, an 8-space indent is `SPACE4 SPACE4`, not eight tokens; a single
+inter-word space stays implicit (free), a lone space/tab stays a byte. **Implemented as four
+always-present markers** (`SPACE2/SPACE4/TAB2/TAB4`, base ids 265–268) rather than
+corpus-conditional: they cost only four reserved ids, and the tiler simply never emits them for
+clean prose (so prose pays nothing) while collapsing code indentation hard. **Measured impact on
+our own C++ source: verbatim space bytes 60 232 → 1 035, newline bytes 9 024 → 0, bytes/token
++22 %.** Wider widths (`SPACE8`, `TAB8`) remain a cheap future addition if a corpus's histogram
+warrants — but 2/4 already cover the dominant 2/4/8 indentation by tiling.
 
 ## 3. Punctuation — directional pairs
 

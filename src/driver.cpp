@@ -23,7 +23,7 @@ extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
-extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend);
+extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend, int thorough, int budget_s);
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
 extern "C" int sub0_report_stage(const char* model_in);
 extern "C" int sub0_memplan_stage();
@@ -97,11 +97,17 @@ int main(int argc, char** argv) {
     // --- tune ----------------------------------------------------------------
     int  tune_max_threads = 0;   // 0 = hardware_concurrency
     bool tune_quiet = false;
+    bool tune_thorough = false;
+    int  tune_seconds = 0;       // 0 = profile default (fast 120s / thorough 600s)
     int  tune_backend = 0;       // 0=auto, 1=all, 2=cpu, 3=gpu (CheckedTransformer maps the string)
     auto* tune = app.add_subcommand("tune", "Auto-tune runtime knobs (threads, batch granularity) for peak throughput");
     tune->add_option("--max-threads", tune_max_threads,
                      "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
     tune->add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
+    tune->add_flag("--thorough", tune_thorough,
+                   "Aggressive search: wider grid + more re-measurement (longer default budget) for a tighter optimum");
+    tune->add_option("--seconds", tune_seconds,
+                     "Wall-clock time budget in seconds (0 = profile default: fast 120 / thorough 600)");
     tune->add_option("--backend", tune_backend,
                      "Which backend(s) to tune: auto (CPU + GPU if present) | all | cpu | gpu (skip CPU, keep its cached tuning)")
         ->transform(CLI::CheckedTransformer(std::map<std::string, int>{
@@ -160,7 +166,8 @@ int main(int argc, char** argv) {
     if (*bench)
         return sub0_bench_stage(bench_iters, bench_threads, bench_wpt);
     if (*tune)
-        return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1, tune_backend);
+        return sub0_tune_stage(tune_max_threads, tune_quiet ? 0 : 1, tune_backend,
+                               tune_thorough ? 1 : 0, tune_seconds);
     if (*autotemp)
         return sub0_autotemp_stage(at_model.c_str(), at_seed, at_quiet ? 0 : 1);
     if (*models)

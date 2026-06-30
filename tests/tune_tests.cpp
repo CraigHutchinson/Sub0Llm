@@ -181,6 +181,84 @@ TEST_CASE("on_phase hook reports Explore, Refine and Confirm", "[tune]") {
     CHECK(r.best[0] == 5.0);
 }
 
+TEST_CASE("should_stop bounds the search yet still returns a winner", "[tune]") {
+    // The time-budget hook (used by `sub0llm tune` to cap wall time): once it trips, the
+    // search stops laying down new work but must still report the best point measured so
+    // far. Here we trip it after a handful of evaluations and require both that the search
+    // was cut short (few evals) AND that a valid winner is still returned.
+    Space space = {
+        {"a", sub0::tune::linear_steps(0, 30, 31)},
+        {"b", sub0::tune::linear_steps(0, 30, 31)},
+    };
+    auto obj = [](const Assignment& a) { return -(std::pow(a[0] - 12.0, 2.0) + std::pow(a[1] - 7.0, 2.0)); };
+
+    int budget = 5;                                  // allow only ~5 measurements then "time out"
+    sub0::tune::Options opt;
+    opt.should_stop = [&] { return budget-- <= 0; };
+    auto r = maximize(space, obj, opt);
+
+    CHECK(r.evaluations <= 12);                       // cut short well before a full search
+    CHECK_FALSE(r.best_index.empty());               // but a winner is still reported
+    CHECK(r.best.size() == 2);
+
+    // A null should_stop (the default) must be unaffected -- runs to convergence as before.
+    int budget2 = 0;                                 // unused
+    (void)budget2;
+    sub0::tune::Options conv;
+    auto r2 = maximize(space, obj, conv);
+    CHECK(r2.best[0] == 12.0);
+    CHECK(r2.best[1] == 7.0);
+    CHECK(r2.evaluations > r.evaluations);           // the bounded run did strictly less work
+}
+
+TEST_CASE("schedule_for: fast vs thorough and CPU vs GPU profiles", "[tune]") {
+    using sub0::tune::schedule_for;
+    using sub0::tune::Phase;
+    const auto fast_cpu = schedule_for(/*thorough=*/false, /*gpu=*/false);
+    const auto thor_cpu = schedule_for(/*thorough=*/true,  /*gpu=*/false);
+    const auto fast_gpu = schedule_for(/*thorough=*/false, /*gpu=*/true);
+
+    CHECK(thor_cpu.coarse_points  > fast_cpu.coarse_points);   // thorough widens the grid
+    CHECK(thor_cpu.confirm_rounds > fast_cpu.confirm_rounds);  // and re-measures more
+    CHECK(thor_cpu.explore_ms    >= fast_cpu.explore_ms);      // with longer measurements
+    // GPU steps cost ~seconds: longer per-phase budgets, lighter confirm than the CPU sweep.
+    CHECK(fast_gpu.explore_ms     > fast_cpu.explore_ms);
+    CHECK(fast_gpu.confirm_rounds <= fast_cpu.confirm_rounds);
+    // Cheap explore -> longer confirm ordering holds (the whole point of escalating effort).
+    CHECK(fast_cpu.phase_ms(Phase::Explore) < fast_cpu.phase_ms(Phase::Confirm));
+    CHECK(fast_gpu.phase_ms(Phase::Refine)  < fast_gpu.phase_ms(Phase::Confirm));
+}
+
+TEST_CASE("apply: installs schedule, deadline and live phase budget onto Options", "[tune]") {
+    using namespace sub0::tune;
+    Schedule s;
+    s.coarse_points = 7; s.max_passes = 3; s.confirm_top = 2; s.confirm_rounds = 1;
+    s.explore_ms = 50; s.refine_ms = 150; s.confirm_ms = 400;
+
+    Options opt;
+    double budget_ms = -1;
+    std::vector<Phase> seen;
+    bool stop = false;
+    apply(opt, s, [&] { return stop; }, &budget_ms, [&](Phase p) { seen.push_back(p); });
+
+    CHECK(opt.coarse_points  == 7);     // effort knobs copied across
+    CHECK(opt.max_passes     == 3);
+    CHECK(opt.confirm_top    == 2);
+    CHECK(opt.confirm_rounds == 1);
+    REQUIRE(opt.should_stop);
+    CHECK_FALSE(opt.should_stop());     // deadline predicate is wired through
+    stop = true;
+    CHECK(opt.should_stop());
+
+    REQUIRE(opt.on_phase);              // on_phase publishes the live budget + forwards to logging
+    opt.on_phase(Phase::Explore); CHECK(budget_ms == 50.0);
+    opt.on_phase(Phase::Refine);  CHECK(budget_ms == 150.0);
+    opt.on_phase(Phase::Confirm); CHECK(budget_ms == 400.0);
+    REQUIRE(seen.size() == 3);
+    CHECK(seen[0] == Phase::Explore);
+    CHECK(seen[2] == Phase::Confirm);
+}
+
 TEST_CASE("search is deterministic across runs", "[tune]") {
     Space space = {
         {"a", sub0::tune::linear_steps(0, 30, 31)},

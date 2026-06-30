@@ -107,7 +107,62 @@ struct Options {
     // effort (longer timed runs) on Refine/Confirm so the precise readings reflect
     // sustained, throttled throughput rather than a brief un-throttled burst.
     std::function<void(Phase)> on_phase = nullptr;
+    // Optional hard stop (a wall-clock time BUDGET): checked before each coarse point,
+    // each refinement pass and each confirmation round. When it returns true the search
+    // stops EARLY but gracefully -- it still returns the best point measured so far. This
+    // is what bounds total tune time: the coarse grid lays down the shape first (cheap,
+    // noisy), then refinement/confirmation narrow into the troughs for only as long as the
+    // budget allows. Null = run to convergence (the deterministic default).
+    std::function<bool()> should_stop = nullptr;
 };
+
+// --- Budgeted-sweep schedule (shared by every caller, unit-tested) ---------
+// The effort knobs + per-phase measurement budget for a time-bounded sweep. Both the CPU
+// (throughput) and GPU (device-step) tuners want the same shape -- a cheap/noisy coarse pass
+// then progressively longer narrowing runs, with a fast vs `thorough` level -- so the numbers
+// live here ONCE (not copy-pasted per sweep) and can be asserted in isolation. Pure: no I/O,
+// no engine, no clock; `apply` installs it onto Options, the caller supplies the deadline and
+// any logging. `gpu` selects the device-step budgets (steps cost ~seconds, so longer per phase
+// and a lighter confirm than the CPU sweep).
+struct Schedule {
+    int    coarse_points = 5, max_passes = 4, confirm_top = 3, confirm_rounds = 2;
+    double explore_ms = 120.0, refine_ms = 400.0, confirm_ms = 800.0;  // measurement budget per phase
+    double phase_ms(Phase p) const {
+        return p == Phase::Explore ? explore_ms : (p == Phase::Refine ? refine_ms : confirm_ms);
+    }
+};
+
+// The fast (default) and `thorough` schedules for a CPU vs GPU sweep -- the single source of
+// truth for those magic numbers. Fast keeps the coarse shape cheap and the confirm tail short
+// (the wall-clock deadline is the real cap); thorough widens the grid and re-measures more for
+// a tighter, lower-noise optimum when time is not the constraint.
+inline Schedule schedule_for(bool thorough, bool gpu) {
+    Schedule s;
+    s.coarse_points  = thorough ? 8 : 5;
+    s.max_passes     = thorough ? 8 : 4;
+    s.confirm_top    = thorough ? 4 : 3;
+    s.confirm_rounds = gpu ? (thorough ? 3 : 2)   // GPU steps cost seconds: confirm lighter
+                           : (thorough ? 4 : 2);
+    if (gpu) { s.explore_ms = thorough ? 500.0 : 300.0; s.refine_ms = thorough ? 800.0 : 600.0; s.confirm_ms = thorough ? 1200.0 : 900.0; }
+    else     { s.explore_ms = thorough ? 250.0 : 120.0; s.refine_ms = thorough ? 600.0 : 400.0; s.confirm_ms = thorough ? 1200.0 : 800.0; }
+    return s;
+}
+
+// Wire a Schedule + a wall-clock `deadline` predicate into Options: copies the effort knobs,
+// installs should_stop, and builds an on_phase that publishes the live per-phase measurement
+// budget into *budget_ms (the caller's objective reads it) before invoking `also` (logging).
+inline void apply(Options& opt, const Schedule& s, std::function<bool()> deadline,
+                  double* budget_ms, std::function<void(Phase)> also = nullptr) {
+    opt.coarse_points  = s.coarse_points;
+    opt.max_passes     = s.max_passes;
+    opt.confirm_top    = s.confirm_top;
+    opt.confirm_rounds = s.confirm_rounds;
+    opt.should_stop    = std::move(deadline);
+    opt.on_phase = [s, budget_ms, also = std::move(also)](Phase p) {
+        if (budget_ms) *budget_ms = s.phase_ms(p);
+        if (also) also(p);
+    };
+}
 
 // A single objective measurement, recorded in call order for inspection/tests.
 struct Eval {
@@ -155,6 +210,7 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
     if (K == 0) return R;
     const int coarse_points = std::max(2, opt.coarse_points);
     const int top_basins    = std::max(1, opt.top_basins);
+    auto stop = [&] { return opt.should_stop && opt.should_stop(); };   // time-budget exhausted?
 
     std::map<std::vector<int>, std::vector<double>> samples;   // index -> all measurements
 
@@ -208,6 +264,9 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
     {
         std::vector<int> pick(static_cast<std::size_t>(K), 0);   // mixed-radix index into axis_samples
         for (;;) {
+            // Budget guard: once exhausted, stop laying down coarse points but keep at least
+            // one so a basin seed (and a winner) always exists.
+            if (!coarse.empty() && stop()) break;
             std::vector<int> point(static_cast<std::size_t>(K));
             for (int k = 0; k < K; ++k)
                 point[static_cast<std::size_t>(k)] =
@@ -231,9 +290,11 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
     //    each pass, so it walks to the exact local optimum even past the initial window.
     if (opt.on_phase) opt.on_phase(Phase::Refine);
     for (int b = 0; b < basins; ++b) {
+        if (stop()) break;                  // budget exhausted -> skip remaining basins
         std::vector<int> cur = coarse[static_cast<std::size_t>(b)].second;
         double basin_best = eval_at(cur);
         for (int pass = 0; pass < std::max(1, opt.max_passes); ++pass) {
+            if (stop()) break;
             if (opt.settle) opt.settle();   // cool-down before narrowing down -- steadier readings
             const double prev = basin_best;
             for (int k = 0; k < K; ++k) {
@@ -293,6 +354,7 @@ inline Result maximize(const Space& space, const Objective& objective, const Opt
         }
 
         for (int round = 0; round < opt.confirm_rounds; ++round) {
+            if (stop()) break;              // budget exhausted -> stop re-measuring, rank what we have
             if (opt.settle) opt.settle();   // cool-down before each confirmation round
             for (const auto& idx : finalists) sample(idx);
 
