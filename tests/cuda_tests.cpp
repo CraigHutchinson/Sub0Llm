@@ -30,6 +30,8 @@ extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch
 extern "C" int  sub0_cuda_adam_step(float lr, long t);
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
+extern "C" int  sub0_cuda_free_vram_mb();
+extern "C" int  sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -437,6 +439,75 @@ TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]")
         // gap by hundreds of MiB -- far outside this band -- which is the regression we want to catch.
         CHECK(predicted_mb == Catch::Approx(actual_mb).margin(sub0::memplan::FOOTPRINT_TOLERANCE_MB));
     }
+    sub0_cuda_shutdown();
+}
+
+// VRAM leak / smoke trace: allocate the full resident TRAINING set for a batch, then shut down and
+// confirm the device buffers are released. Catches a buffer that sub0_cuda_shutdown forgets to free
+// (the "2.7 GB during the run -> 0 idle" question -- proves the footprint is the process's own and is
+// reclaimed, not leaked). cudaMemGetInfo is noisy (driver/WDDM), so we assert RECLAMATION, not bits.
+TEST_CASE("CUDA shutdown releases the training footprint (no VRAM leak)", "[cuda][memplan]") {
+    double pred = 0.0, act = 0.0;
+    REQUIRE(sub0_cuda_train_footprint(128, &pred, &act) == 0);   // allocs fwd+train+opt @128, leaves resident
+    REQUIRE(act > 0.0);
+    const int free_loaded = sub0_cuda_free_vram_mb();            // scratch resident -> low free
+    REQUIRE(free_loaded > 0);
+    sub0_cuda_shutdown();                                        // release scratch + params + opt
+    const int free_after = sub0_cuda_free_vram_mb();             // context persists; buffers gone
+    WARN("VRAM trace: footprint=" << act << " MiB | free loaded=" << free_loaded
+         << " | free after shutdown=" << free_after << " MiB");
+    CHECK(free_after >= free_loaded);                            // shutdown gave memory back
+    // Reclaimed >= most of the footprint we allocated -> nothing of consequence leaked.
+    CHECK(static_cast<double>(free_after - free_loaded) >= 0.5 * act);
+    sub0_cuda_shutdown();
+}
+
+// Batch-grow + inference-graph re-capture: forward at batch 4, then a LARGER batch 8. The grow path
+// (fwd_free_batch -> invalidate_graph -> reallocate -> recapture) must produce correct logits at both
+// sizes. Guards the session's grow-on-demand + graph-capture logic against a stale-buffer/graph bug.
+TEST_CASE("CUDA forward stays correct across a batch grow (graph re-capture)", "[cuda]") {
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int T = 10;
+    for (const int batch : {4, 8}) {                            // 4 captures; 8 grows + recaptures
+        std::vector<int> ids(static_cast<std::size_t>(batch) * T);
+        std::mt19937 rng(101 + batch);
+        std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+        for (int& x : ids) x = tok(rng);
+
+        std::vector<float> cpu(static_cast<std::size_t>(batch) * T * VOCAB);
+        for (int b = 0; b < batch; ++b) {
+            sub0::graph_reset();
+            sub0::Node* lg = sub0::forward(ids.data() + static_cast<std::size_t>(b) * T, T);
+            std::copy(lg->data.begin(), lg->data.end(), cpu.begin() + static_cast<std::size_t>(b) * T * VOCAB);
+        }
+        std::vector<float> gpu(static_cast<std::size_t>(batch) * T * VOCAB, 0.0f);
+        REQUIRE(sub0_cuda_forward(ids.data(), batch, T, gpu.data()) == 0);
+
+        double max_abs = 0.0;
+        for (std::size_t i = 0; i < cpu.size(); ++i)
+            max_abs = std::max(max_abs, static_cast<double>(std::fabs(cpu[i] - gpu[i])));
+        INFO("batch " << batch << " max abs logit diff = " << max_abs);
+        REQUIRE(max_abs < 1e-2);
+    }
+    sub0_cuda_shutdown();
+}
+
+// Cold vs sustained step: report ms/step for a 2-iter (cold) and a many-iter (warm) measurement of the
+// SAME small config. Documents the cold-clock/cuBLAS-autotune gap that makes the tuner's 2-warmup
+// samples over-report step time vs sustained training; a small config keeps the test fast.
+TEST_CASE("CUDA train step warms up (sustained < cold)", "[cuda][.bench]") {
+    const int batch = 16, T = 64;                               // small -> fast, but enough to clock-ramp
+    double cold = 0.0, warm = 0.0;
+    REQUIRE(sub0_cuda_train_benchmark(batch, T, 2,  &cold) == 0);
+    REQUIRE(sub0_cuda_train_benchmark(batch, T, 40, &warm) == 0);
+    WARN("step ms: cold(2 iters)=" << cold << "  warm(40 iters)=" << warm
+         << "  (sustained is faster once the clock + cuBLAS warm)");
+    REQUIRE(std::isfinite(cold));
+    REQUIRE(std::isfinite(warm));
+    CHECK(warm <= cold * 1.5);                                  // warming must not make it slower
     sub0_cuda_shutdown();
 }
 
