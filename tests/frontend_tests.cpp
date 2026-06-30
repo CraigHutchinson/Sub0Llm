@@ -1,0 +1,85 @@
+// frontend_tests.cpp — engine-free unit tests for the FRONTEND (pre-model) logic that the configurator
+// and the stage tools share but the engine doesn't define: the device-memory planner (sub0/memplan.hpp)
+// and the model registry's identity/compat rules (sub0/registry.hpp). Both are header-only and std-only,
+// so they run in the fast engine-free sub0_tok_tests target -- no engine build, no GPU. This is the
+// payoff of the frontend separation: pre-model logic gets covered without the engine. These two areas
+// were directly behind this session's work (the gpu_batch VRAM clamp + `models --prune`).
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "sub0/memplan.hpp"
+#include "sub0/registry.hpp"
+
+#include <string>
+
+// --- memplan: the VRAM math behind the configurator clamp + the GPU tuner's batch cap --------------
+TEST_CASE("memplan: training footprint is monotonic in batch and scales with the model", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+    const Dims d192{192,  6, 6,  768, 256,  4096};   // tinystories-scale
+    const Dims d448{448, 11, 7, 1792, 256, 16384};   // fineweb-smoke-scale
+
+    // Resident footprint never decreases as the batch grows (max_batch_for_vram relies on this to invert it).
+    CHECK(train_resident_mb(d192, 1)  <= train_resident_mb(d192, 8));
+    CHECK(train_resident_mb(d192, 8)  <= train_resident_mb(d192, 64));
+    CHECK(train_resident_mb(d192, 64) <= train_resident_mb(d192, 256));
+
+    // A bigger model needs more VRAM at the same batch; bf16 activations cost no more than f32.
+    CHECK(train_resident_mb(d448, 64) > train_resident_mb(d192, 64));
+    CHECK(train_resident_mb(d448, 64, /*bf16*/2) <= train_resident_mb(d448, 64, /*f32*/4));
+}
+
+TEST_CASE("memplan: max_batch_for_vram inverts the footprint (clamp + tuner cap)", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+    const Dims d448{448, 11, 7, 1792, 256, 16384};
+    constexpr int cap = 4096;                        // MAX_FWD_BATCH device-scratch ceiling
+
+    // No device budget known -> defer to the hard cap.
+    CHECK(max_batch_for_vram(d448, 0, cap) == cap);
+
+    // On an 8 GiB budget the result FITS and is maximal: best+1 overflows (unless it hit the cap).
+    const int b = max_batch_for_vram(d448, 8151, cap);
+    REQUIRE(b >= 1);
+    CHECK(train_resident_mb(d448, b) <= 8151);
+    if (b < cap) CHECK(train_resident_mb(d448, b + 1) > 8151);
+
+    // The configurator clamp invariant: a stale over-budget batch (d448 @256 needs ~11 GiB) clamps DOWN
+    // to a batch that fits -- the same primitive the tuner bounds its sweep with, so the two agree.
+    constexpr int stale = 256;
+    REQUIRE(train_resident_mb(d448, stale) > 8151);
+    const int clamped = max_batch_for_vram(d448, 8151, stale);
+    CHECK(clamped < stale);
+    CHECK(clamped >= 1);
+    CHECK(train_resident_mb(d448, clamped) <= 8151);
+
+    // A budget too small for even batch 1 -> 0 (the configurator's hard-error path).
+    CHECK(max_batch_for_vram(d448, 1, cap) == 0);
+}
+
+// --- registry: the model identity + compatibility behind auto-naming and `models --prune` ---------
+TEST_CASE("registry: corpus_tag is a lowercased, filesystem-safe stem", "[frontend][registry]") {
+    using sub0::registry::corpus_tag;
+    CHECK(corpus_tag("data/TinyStories.txt") == "tinystories");   // stem, lowercased
+    CHECK(corpus_tag("/abs/Fine-Web_99.txt") == "fine_web_99");   // non-alnum (- and _) -> '_'
+    CHECK(corpus_tag("") == "corpus");                            // empty -> fallback
+}
+
+TEST_CASE("registry: model_dir encodes identity; compatible() gates loading (the prune rule)", "[frontend][registry]") {
+    using namespace sub0::registry;
+
+    // The directory name IS the identity: d/l/h/sq/v + ternary/rope/join tags + git sha.
+    const auto dir = model_dir("models", "data/tinystories.txt", 192, 6, 6, 256, 4306,
+                               /*ternary*/0, /*pos=rope*/1, /*join*/1, "abc123");
+    CHECK(dir.filename().string() == "sub0llm_tinystories_d192l6h6sq256v4306rj_abc123");
+    CHECK(model_dir("models", "c.txt", 1,1,1,1,1, 0,0,0, "").filename().string().ends_with("_nogit"));
+
+    // compatible(): an exact match loads; ANY differing dimension/flag makes it incompatible -- this is
+    // what flagged the pruned d448 v2048 models 'x incompatible architecture' against a d192 v4306 build.
+    ModelMeta m;
+    m.d_model = 192; m.n_layers = 6; m.n_heads = 6; m.seq_len = 256; m.vocab = 4306;
+    m.ternary = 0; m.pos_encoding = 1; m.join_tokenizer = 1;
+    CHECK(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 1));          // exact -> loadable
+    CHECK_FALSE(compatible(m, 448, 6, 6, 256, 4306, 0, 1, 1));    // d_model differs
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 2048, 0, 1, 1));    // vocab differs (the pruned case)
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 0, 1));    // pos_encoding differs
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0));    // tokenizer scheme differs
+}

@@ -21,14 +21,16 @@ target_include_directories(sub0_tests PRIVATE
   "${GEN_DIR}")
 target_link_libraries(sub0_tests PRIVATE sub0_core sub0_tok Catch2::Catch2WithMain)
 
-# Pure tokenizer-library tests: link ONLY sub0_tok + Catch2, NOT the engine. The tokenizer
-# is config-independent, so this target builds and runs without sub0_core / the generated
-# header -- fast to iterate, and unaffected when a training run locks the engine DLLs.
-#   tok_lib_tests.cpp       — pinned worked examples (one construct per assertion)
+# Engine-free FRONTEND tests: link ONLY sub0_tok + Catch2, NOT the engine. The tokenizer + the
+# pre-model logic are config-independent, so this target builds and runs without sub0_core / the
+# generated header -- fast to iterate, and unaffected when a training run locks the engine DLLs.
+#   tok_lib_tests.cpp       — pinned tokenizer worked examples (one construct per assertion)
 #   tok_roundtrip_fuzz.cpp  — generative net: dogfood the project's own source + random
 #                             mutation/blob fuzz + a token-pattern report. SUB0_SOURCE_DIR
 #                             lets it read the real tree for the dogfood/pattern cases.
-add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp config_tests.cpp)
+#   config_tests.cpp        — pure config decisions (sub0::config): autosize/tune-cache/precision/vocab-curve
+#   frontend_tests.cpp      — memplan VRAM math (clamp + tuner cap) + registry identity/compat (prune)
+add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp config_tests.cpp frontend_tests.cpp)
 target_include_directories(sub0_tok_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_tok_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_tok_tests PRIVATE sub0_tok Catch2::Catch2WithMain)
