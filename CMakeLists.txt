@@ -247,6 +247,12 @@ if(NOT EXISTS "${GEN_TUNE_CACHE}")
   file(WRITE "${GEN_TUNE_CACHE}" "")
 endif()
 
+# Bake the build-known facts (detected device caps + the generated-output paths) INTO sub0-configure,
+# so the command line below stops mirroring them and the tool is self-sufficient when run directly.
+# These become the CLI defaults; each stays overridable. See docs/WORKFLOW_ARCHITECTURE.md (Stage 1).
+configure_file("${CMAKE_SOURCE_DIR}/cmake/sub0_build_facts.hpp.in" "${GEN_DIR}/sub0_build_facts.hpp" @ONLY)
+target_include_directories(sub0-configure PRIVATE "${GEN_DIR}")
+
 add_custom_command(
   OUTPUT  "${GEN_HEADER}"
   BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
@@ -261,13 +267,7 @@ add_custom_command(
             --prec-act ${SUB0_PRECISION_ACT_INT}
             --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
             --join ${SUB0_JOIN_FLAG}
-            --tune-cache "${GEN_TUNE_CACHE}"
-            --has-cuda ${SUB0_BUILD_CUDA_INT}
-            --cuda-arch ${SUB0_CUDA_ARCH}
-            --gpu-vram-mb ${SUB0_GPU_VRAM_MB}
-            --gpu-shared-mb ${SUB0_GPU_SHARED_MB}
             --cuda-tf32 ${SUB0_CUDA_TF32_FLAG}
-            -o "${GEN_HEADER}"
   DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
   COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
   VERBATIM

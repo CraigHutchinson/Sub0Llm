@@ -47,6 +47,7 @@
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 #include "sub0/config_util.hpp"// sub0::config — pure, unit-tested config decisions (autosize / tune-cache / precision)
+#include "sub0_build_facts.hpp" // CMake-baked build facts (device caps + output paths) -> the CLI defaults
 
 namespace tok = sub0::tok;
 
@@ -438,7 +439,7 @@ int main(int argc, char** argv) {
     CLI::App app{"sub0-configure: truecase + BPE a corpus, emit the tokenized corpus and a constexpr config header"};
 
     std::string corpus;
-    std::string out;
+    std::string out = sub0::build_facts::GEN_HEADER;   // default: the build's generated umbrella header
     int d_model      = 0;       // 0 = auto-size from corpus scale (autosize_dims); any nonzero pins it
     int n_layers     = 0;
     int n_heads      = 0;
@@ -453,18 +454,19 @@ int main(int argc, char** argv) {
     int min_merge    = 2;
     int emit_tok     = 1;
     int join_scheme  = 1;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
-    std::string tune_cache;
-    int has_cuda    = 0;   // 1 = the CUDA device-training backend was BUILT (CMake's existence check)
-    int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
-    int gpu_vram_mb = 0;   // dedicated GPU VRAM in MB
-    int gpu_shared_mb = 0; // shared/overflow system memory the GPU can address (WDDM), MB
+    std::string tune_cache = sub0::build_facts::GEN_TUNE_CACHE;  // default: the build's tune cache
+    int has_cuda    = sub0::build_facts::HAS_CUDA;      // 1 = the CUDA device-training backend was BUILT
+    int cuda_arch   = sub0::build_facts::CUDA_ARCH;     // GPU compute capability as an int (e.g. 120 for sm_120)
+    int gpu_vram_mb = sub0::build_facts::GPU_VRAM_MB;   // dedicated GPU VRAM in MB
+    int gpu_shared_mb = sub0::build_facts::GPU_SHARED_MB; // shared/overflow system memory (WDDM), MB
     int compute     = -1;  // backend to USE: 0=CPU, 1=GPU, 2=HYBRID; -1 = decide from has_cuda
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
 
     app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
        ->required()->check(CLI::ExistingFile);
-    app.add_option("-o",       out,     "Output generated header path")->required();
+    app.add_option("-o",       out,     "Output generated umbrella header path (default: the build's generated dir)")
+       ->capture_default_str();
     app.add_option("--dmodel", d_model, "Embedding / residual width (0 = auto-size from corpus)")->capture_default_str();
     app.add_option("--layers", n_layers,"Transformer block count (0 = auto)")->capture_default_str();
     app.add_option("--heads",  n_heads, "Attention head count (0 = auto)")->capture_default_str();
