@@ -262,11 +262,10 @@ add_custom_command(
             --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
             --join ${SUB0_JOIN_FLAG}
             --tune-cache "${GEN_TUNE_CACHE}"
-            --has-cuda ${SUB0_HAS_CUDA}
+            --has-cuda ${SUB0_BUILD_CUDA_INT}
             --cuda-arch ${SUB0_CUDA_ARCH}
             --gpu-vram-mb ${SUB0_GPU_VRAM_MB}
             --gpu-shared-mb ${SUB0_GPU_SHARED_MB}
-            --compute ${SUB0_COMPUTE_MODE_INT}
             --cuda-tf32 ${SUB0_CUDA_TF32_FLAG}
             -o "${GEN_HEADER}"
   DEPENDS sub0-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"

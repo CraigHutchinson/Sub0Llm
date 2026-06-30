@@ -133,11 +133,11 @@ if(SUB0_COMPUTE_RESOLVED STREQUAL "GPU")
   message(STATUS "  GPU mode: training runs on the device (CUDA); generation/eval on the CPU engine")
 endif()
 
-# Integer encoding of the resolved backend for the configurator (--compute): 0/1/2.
-if(SUB0_COMPUTE_RESOLVED STREQUAL "GPU")
-  set(SUB0_COMPUTE_MODE_INT 1)
-elseif(SUB0_COMPUTE_RESOLVED STREQUAL "HYBRID")
-  set(SUB0_COMPUTE_MODE_INT 2)
+# CMake decides whether the CUDA backend EXISTS / is built; the configurator decides whether to USE it
+# (COMPUTE_MODE). Pass the build fact as a 0/1 int for --has-cuda; the configurator defaults the mode to
+# GPU when the backend is built, else CPU. (SUB0_COMPUTE stays the build-side switch via SUB0_BUILD_CUDA.)
+if(SUB0_BUILD_CUDA)
+  set(SUB0_BUILD_CUDA_INT 1)
 else()
-  set(SUB0_COMPUTE_MODE_INT 0)
+  set(SUB0_BUILD_CUDA_INT 0)
 endif()

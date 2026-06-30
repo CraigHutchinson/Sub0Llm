@@ -454,11 +454,11 @@ int main(int argc, char** argv) {
     int emit_tok     = 1;
     int join_scheme  = 1;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
     std::string tune_cache;
-    int has_cuda    = 0;   // CUDA toolkit + device detected at configure time
+    int has_cuda    = 0;   // 1 = the CUDA device-training backend was BUILT (CMake's existence check)
     int cuda_arch   = 0;   // GPU compute capability as an int (e.g. 120 for sm_120)
     int gpu_vram_mb = 0;   // dedicated GPU VRAM in MB
     int gpu_shared_mb = 0; // shared/overflow system memory the GPU can address (WDDM), MB
-    int compute     = 0;   // resolved backend: 0=CPU, 1=GPU, 2=HYBRID
+    int compute     = -1;  // backend to USE: 0=CPU, 1=GPU, 2=HYBRID; -1 = decide from has_cuda
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
 
@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
        ->capture_default_str();
-    app.add_option("--has-cuda", has_cuda, "1 = a CUDA toolkit + device was detected at configure time")
+    app.add_option("--has-cuda", has_cuda, "1 = the CUDA device-training backend was built (CMake's CUDA existence check)")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--cuda-arch", cuda_arch,
                    "Detected GPU compute capability as an int (e.g. 120 for sm_120; 0 = none)")
@@ -509,12 +509,21 @@ int main(int argc, char** argv) {
     app.add_option("--gpu-shared-mb", gpu_shared_mb,
                    "Shared/overflow system memory the GPU can address in MB (WDDM; 0 = none)")
        ->capture_default_str();
-    app.add_option("--compute", compute, "Resolved compute backend: 0=CPU, 1=GPU, 2=HYBRID")
-       ->capture_default_str()->check(CLI::Range(0, 2));
+    app.add_option("--compute", compute, "Backend to use: 0=CPU, 1=GPU, 2=HYBRID; -1 = auto (GPU when the CUDA backend is built)")
+       ->capture_default_str()->check(CLI::Range(-1, 2));
     app.add_option("--cuda-tf32", cuda_tf32, "Bake TF32 tensor-core GEMM math on (1) or off (0)")
        ->capture_default_str()->check(CLI::Range(0, 1));
 
     CLI11_PARSE(app, argc, argv);
+
+    // The configurator DECIDES whether to USE CUDA: default the compute backend to GPU when the CUDA
+    // device backend was built (has_cuda, from CMake's existence check), else CPU. An explicit
+    // --compute overrides (e.g. CPU on a GPU build). CMake checks existence; the configurator picks.
+    if (compute < 0) compute = has_cuda ? 1 : 0;
+    if (compute != 0 && !has_cuda) {
+        std::println(stderr, "configure warning: --compute={} requested but no CUDA backend is built; using CPU", compute);
+        compute = 0;
+    }
 
     // Resolve the model dims with precedence CLI (nonzero) > <corpus>.model sidecar > auto-size, so a
     // pinned size PERSISTS across re-runs (a build-time auto-regen keeps it). Seed the sidecar if
@@ -901,7 +910,9 @@ int main(int argc, char** argv) {
     sos << "constexpr int  DEFAULT_WINDOWS_PER_THREAD = " << default_wpt    << ";\n";
     sos << "// DEFAULT_GPU_BATCH: tuned device-training minibatch; CPU data-parallel width until `tune` sets it.\n";
     sos << "constexpr int  DEFAULT_GPU_BATCH         = " << default_gpu_batch << ";\n\n";
-    sos << "// --- Compute backend (resolved at configure time) ----------------------\n";
+    sos << "// --- Compute backend ---------------------------------------------------\n";
+    sos << "// HAS_CUDA: the CUDA device backend was built (CMake's existence check). COMPUTE_MODE: the\n";
+    sos << "// backend the configurator chose to USE (GPU by default when HAS_CUDA, else CPU; --compute pins).\n";
     sos << "enum class ComputeBackend { Cpu, Gpu, Hybrid };\n";
     sos << "constexpr bool           HAS_CUDA     = " << (has_cuda ? "true" : "false") << ";\n";
     sos << "constexpr ComputeBackend COMPUTE_MODE = ComputeBackend::" << (compute == 1 ? "Gpu" : compute == 2 ? "Hybrid" : "Cpu") << ";\n";
