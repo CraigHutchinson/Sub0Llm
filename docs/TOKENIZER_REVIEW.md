@@ -31,7 +31,7 @@ legacy "space-as-a-byte-token" scheme is now dead weight that forks every core r
 **Plan:** make JOIN the *only* scheme in the library first (delete the branches; `learn` always
 mints the full 256-byte base + 13 markers), update `tok_lib_tests` (its "current scheme" cases
 currently exercise the legacy `learn(corpus)` with no opts), and confirm green with the
-engine-free `sub0_tok_tests` (fast, no GPU). Then retire the build/registry plumbing
+engine-free `sub0_frontend_tests` (fast, no GPU). Then retire the build/registry plumbing
 (`SUB0_JOIN_TOKENIZER`, the `j` tag, `--join`) in a second commit, since that needs a full
 configure+build. Net: ~one parallel code path and several conditionals deleted, no behaviour
 change for current (JOIN) models.

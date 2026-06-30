@@ -187,7 +187,7 @@ one or two mechanisms, the system becomes elegant: `OPEN_DQUOTE`/`CLOSE_DQUOTE` 
    encode/decode mirror a pending-space state `dps` (+ `in_spell`): implicit single space, JOIN
    for glue, `NEWLINE`/`PARA`, verbatim-whitespace fallback, **directional double quotes (§3)**,
    and **`SPELL` encapsulation for N≥3 words (§4)** with `CAP`/`UP` carried across a word's
-   sub-tokens. Validated by `sub0_tok_tests` (67 assertions, both schemes). Single-quote
+   sub-tokens. Validated by `sub0_frontend_tests` (67 assertions, both schemes). Single-quote
    directional tokens stay **deferred** (data: `'` is 82% contractions, already in the word-unit).
 5. **Wire into the pipeline + measure — DONE** (`SUB0_JOIN_TOKENIZER` build flag → `sub0llm-configure
    --join` → `corpus.tok` via `sub0::tok::encode`; engine deserialises + uses the FSM). tinystories

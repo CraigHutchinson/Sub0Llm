@@ -19,9 +19,9 @@ sub0_autoconfigure_dep(sub0_tests)
 target_include_directories(sub0_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
   "${GEN_DIR}")
-target_link_libraries(sub0_tests PRIVATE sub0_core sub0_tok Catch2::Catch2WithMain)
+target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2WithMain)
 
-# Engine-free FRONTEND tests: link ONLY sub0_tok + Catch2, NOT the engine. The tokenizer + the
+# Engine-free FRONTEND tests: link ONLY sub0_frontend + Catch2, NOT the engine. The tokenizer + the
 # pre-model logic are config-independent, so this target builds and runs without sub0_core / the
 # generated header -- fast to iterate, and unaffected when a training run locks the engine DLLs.
 #   tok_lib_tests.cpp       — pinned tokenizer worked examples (one construct per assertion)
@@ -30,11 +30,11 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_tok Catch2::Catch2WithMa
 #                             lets it read the real tree for the dogfood/pattern cases.
 #   config_tests.cpp        — pure config decisions (sub0::config): autosize/tune-cache/precision/vocab-curve
 #   frontend_tests.cpp      — memplan VRAM math (clamp + tuner cap) + registry identity/compat (prune)
-add_executable(sub0_tok_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp config_tests.cpp frontend_tests.cpp)
-target_include_directories(sub0_tok_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
-target_compile_definitions(sub0_tok_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(sub0_tok_tests PRIVATE sub0_tok Catch2::Catch2WithMain)
-catch_discover_tests(sub0_tok_tests)
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp config_tests.cpp frontend_tests.cpp)
+target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
+catch_discover_tests(sub0_frontend_tests)
 
 # GPU backend smoke test: compiled + linked only when the CUDA backend is built. The
 # nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll; its CUDA runtime deps are

@@ -73,8 +73,9 @@ that turns runtime-discovered facts into compile-time constants.
    The strict `EXISTS`-gate + `CMAKE_CONFIGURE_DEPENDS` (fresh checkout builds *only* the configurator)
    remains an optional stricter variant.
 3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
-   the engine share one site. ⏳ pending (internal cleanup; today the configurator links `sub0_tok` +
-   the header-only frontend bits directly).
+   the engine share one site. ✅ **DONE** — the static lib `sub0_frontend` (was `sub0_tok`) compiles the
+   tokenizer/unigram and exposes the header-only pre-model logic via its PUBLIC include; the configurator
+   and the engine both link it, and the engine-free `sub0_frontend_tests` target covers it.
 4. **Split the driver** into thin `sub0llm-{configure,train,gen,tune}` exes over shared runners. ✅
    **DONE** — `include/sub0/cli_stages.hpp` defines each `run_*` once; the umbrella `sub0llm` dispatches
    to them and the stage exes are thin `main()`s; diagnostics (vocab/bench/models/report/memplan) stay
@@ -92,7 +93,7 @@ doesn't define: `config_util`, `memplan`, `registry`, `casing`, `tokenizer`, `un
 + std-only today). Its separation buys two things beyond tidiness:
 
 ### 1. Testability — the immediate, measured payoff
-Header-only + std-only ⇒ it runs in the **fast engine-free** `sub0_tok_tests` target (no engine build, no
+Header-only + std-only ⇒ it runs in the **fast engine-free** `sub0_frontend_tests` target (no engine build, no
 GPU). First slice **done** (`tests/frontend_tests.cpp`): `memplan` (the VRAM clamp/cap math — monotone
 footprint, `max_batch_for_vram` inversion, the clamp invariant) and `registry` (`corpus_tag` / `model_dir`
 identity + `compatible()` — the `models --prune` rule) — the two areas this session changed, previously
@@ -108,7 +109,7 @@ decoupled state-1 self-probe and stays deferred — CMake bakes the device facts
 
 ### Tokenizer / vocab as engine-free frontend tools — judgement: **YES**, for diagnostics + interchange
 A `sub0llm-tokenizer` tool (links `sub0_frontend`, **not** the engine) is worth building:
-- **Why engine-free is the point.** Inspecting/exporting a tokenizer needs only `sub0_tok`. Today
+- **Why engine-free is the point.** Inspecting/exporting a tokenizer needs only `sub0_frontend`. Today
   `sub0llm vocab` lives in the *train* stage lib, so you must build the whole engine to print a vocab
   table — wrong coupling. Moving it frees diagnostics from the engine and from a configured build.
 - **Diagnostics**: `encode "text"` (show the token stream — debug the CamelCase-shatter / indented-code
