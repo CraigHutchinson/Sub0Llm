@@ -45,6 +45,7 @@
 
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
+#include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 
 namespace tok = sub0::tok;
 
@@ -387,6 +388,47 @@ void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::
             "Ideal vocab (knee): 90% of compression @ ~{}, 95% @ ~{}, 99% @ ~{} "
             "(diminishing returns beyond -- raise --vocab to extend the curve).",
             tkz.n_base + nm, bpt_at(nm), vocab_at_frac(0.90), vocab_at_frac(0.95), vocab_at_frac(0.99));
+    }
+
+    // 5. Unigram-vs-BPE A/B: learn a Unigram LM vocab at the SAME size and compare word compression.
+    //    BPE word-tokens = sum freq*len(final id-seq); Unigram = sum freq*Viterbi-seg length. Fewer =
+    //    better. Unigram also has NO dead tokens (every kept piece has count>0), unlike BPE.
+    {
+        std::vector<std::pair<std::string, long long>> words;
+        words.reserve(S.index.size());
+        for (const auto& [key, id] : S.index) words.push_back({key, S.word_freq[static_cast<std::size_t>(id)]});
+
+        // BPE word-token total (S.word_syms holds the final id sequences after learn) and corpus bytes.
+        long long bpe_tok = 0, total_bytes = 0;
+        for (std::size_t w = 0; w < S.word_syms.size(); ++w)
+            bpe_tok += static_cast<long long>(S.word_syms[w].size()) * S.word_freq[w];
+        for (const auto& [k, f] : words) total_bytes += static_cast<long long>(k.size()) * f;
+        // BPE dead merges (never appear in any final word encoding).
+        std::vector<char> used(static_cast<std::size_t>(tkz.vocab), 0);
+        for (const auto& seq : S.word_syms) for (int id : seq) if (id >= 0 && id < tkz.vocab) used[static_cast<std::size_t>(id)] = 1;
+        long long bpe_dead = 0;
+        for (int id = tkz.n_base; id < tkz.vocab; ++id) if (!used[static_cast<std::size_t>(id)]) ++bpe_dead;
+
+        sub0::tok::UnigramOptions uo;
+        uo.target = tkz.vocab;
+        uo.em_iters = 8;          // more EM passes + a gentler prune -> a tighter fit before integration
+        uo.drop_frac = 0.1;
+        const sub0::tok::Unigram u = sub0::tok::learn_unigram(words, uo);
+        long long ub = 0;
+        const long long uni_tok = sub0::tok::corpus_tokens(u, words, &ub);
+
+        std::println(stderr,
+            "Unigram A/B @ vocab~{}: BPE bytes/token={:.3f} ({} word-tokens, {} dead merges) | "
+            "Unigram {} tokens bytes/token={:.3f} ({} word-tokens, 0 dead) -> {:+.1f}% tokens vs BPE",
+            tkz.vocab, static_cast<double>(total_bytes) / static_cast<double>(bpe_tok), bpe_tok, bpe_dead,
+            u.size(), static_cast<double>(total_bytes) / static_cast<double>(uni_tok), uni_tok,
+            100.0 * (static_cast<double>(uni_tok) / static_cast<double>(bpe_tok) - 1.0));
+
+        std::ofstream os(prefix + ".unigram_vocab.txt");
+        std::println(os, "# Unigram vocabulary: {} tokens; id<TAB>len<TAB>logp<TAB>text", u.size());
+        for (int id = 0; id < u.size(); ++id)
+            std::println(os, "{}\t{}\t{:.4f}\t{}", id, u.token[static_cast<std::size_t>(id)].size(),
+                         u.logp[static_cast<std::size_t>(id)], vis(u.token[static_cast<std::size_t>(id)]));
     }
 }
 

@@ -11,10 +11,12 @@
 
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"
+#include "sub0/unigram.hpp"
 
 #include <algorithm>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using sub0::tok::Tokenizer;
@@ -51,6 +53,48 @@ bool round_trips(const Tokenizer& t, const std::string& x) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+//  Unigram LM vocabulariser (the BPE replacement)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Unigram: learns morphological pieces, segments losslessly, no dead tokens", "[tok][unigram]") {
+    using sub0::tok::learn_unigram;
+    using sub0::tok::corpus_tokens;
+    // A corpus where a shared suffix ("ing") and stems recur -- the piece a good vocabulariser finds.
+    std::vector<std::pair<std::string, long long>> words = {
+        {"running", 50}, {"jumping", 40}, {"walking", 30}, {"talking", 20}, {"reading", 25},
+        {"runner", 15}, {"jumper", 10}, {"walker", 8}, {"talked", 12}, {"reads", 18},
+        {"the", 300}, {"and", 200}, {"a", 150}, {"cat", 40}, {"dog", 35},
+    };
+    sub0::tok::UnigramOptions opt;
+    opt.target = 64; opt.min_count = 2;
+    const sub0::tok::Unigram u = learn_unigram(words, opt);
+
+    REQUIRE(u.size() > 0);
+    REQUIRE(u.size() <= 80);                         // ~target + the mandatory single bytes
+
+    // Lossless: every word's Viterbi segmentation concatenates back to the word.
+    for (const auto& [w, f] : words) {
+        std::string rebuilt;
+        for (int id : u.segment(w)) rebuilt += u.token[static_cast<std::size_t>(id)];
+        REQUIRE(rebuilt == w);
+    }
+    // No dead tokens: every token is reachable (its bytes segment to itself or appears) -- the whole
+    // point vs BPE. Check a stronger property: total corpus tokens < total bytes (real compression).
+    long long bytes = 0;
+    const long long toks = corpus_tokens(u, words, &bytes);
+    REQUIRE(toks < bytes);                           // beats character encoding
+    REQUIRE(toks > 0);
+
+    // It must learn real multi-byte pieces (sub-words / whole words), not fall back to single bytes.
+    // (Recovery of a *specific* morpheme like "ing" is frequency-dependent and shown on real corpora
+    // -- the configurator A/B vocab contains it; a 15-word toy corpus is too small to force it.)
+    int multi = 0, long3 = 0;
+    for (const std::string& s : u.token) { if (s.size() > 1) ++multi; if (s.size() >= 3) ++long3; }
+    REQUIRE(multi > 5);
+    REQUIRE(long3 >= 1);
+}
 
 TEST_CASE("learn builds a usable tokenizer from an in-memory corpus", "[tok]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);

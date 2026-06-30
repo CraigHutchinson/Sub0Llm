@@ -226,7 +226,7 @@ endif()
 # instead of asserting against the baked production vocabulary. It depends only on
 # casing.hpp + the standard library (no generated config), so the configurator can
 # link it without depending on the engine it configures.
-add_library(sub0_tok STATIC src/tokenizer.cpp)
+add_library(sub0_tok STATIC src/tokenizer.cpp src/unigram.cpp)
 target_include_directories(sub0_tok PUBLIC "${CMAKE_SOURCE_DIR}/include")
 set_target_properties(sub0_tok PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
