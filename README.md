@@ -1,16 +1,19 @@
 # Sub0Llm
 
-A single-engine **CPU transformer language model in C++23**. The model's dimensions and its
-BPE vocabulary are *baked in at build time*: a configurator tokenizes the corpus, derives the
-vocabulary, and emits a `constexpr` config header the engine is compiled against. Training is
-data-parallel across cores; storage is static (BSS), not heap. There is no Python runtime.
+A single-engine **CPU/GPU transformer language model in C++23**. The model's dimensions and its
+vocabulary are *baked in at build time*: a configurator tokenizes the corpus, **auto-sizes** the model
+to the corpus scale, derives the vocabulary, and emits `constexpr` config headers the engine is compiled
+against. Training is data-parallel across cores (or on the CUDA device when one is present); storage is
+static (BSS), not heap. There is no Python runtime.
+
+The build is **self-configuring**: point it at a corpus and it picks a sensible model size, vocabulary,
+precision, thread count and (if a GPU is present) the device backend — every choice overridable.
 
 ## Prerequisites
 
 - **Clang** (C++23: `std::print`, `<format>`), **CMake ≥ 3.20**, **Ninja**.
 - An **OpenMP** runtime (`libomp`) for the multi-threaded training path. The build *fails loudly*
-  if OpenMP is missing (the data-parallel path needs it); to build single-threaded on purpose,
-  pass `-DSUB0_REQUIRE_OPENMP=OFF`.
+  if OpenMP is missing; to build single-threaded on purpose, pass `-DSUB0_REQUIRE_OPENMP=OFF`.
 - *(Optional, GPU training)* the **CUDA Toolkit** (`nvcc`) and an NVIDIA device. The CUDA backend
   is auto-detected; see [Building with the CUDA backend](#building-with-the-cuda-backend-windows)
   for the one Windows-specific setup step.
@@ -18,38 +21,35 @@ data-parallel across cores; storage is static (BSS), not heap. There is no Pytho
 ## Build
 
 ```sh
-cmake --preset native          # configure (tokenizes the corpus, bakes the config header)
+cmake --preset native          # configure: tokenize the corpus, auto-size the model, bake the headers
 cmake --build --preset native  # build -> out/build/native/sub0llm(.exe)
 ctest --preset native          # run the unit tests
 ```
 
 The `native` preset is an `-march=native` Release build. `debug` and `release` presets also exist.
 
+On the first configure the configurator runs automatically and emits, into the build's `generated/` dir,
+**split** headers the engine compiles against (see [Configuration](#configuration)):
+
+- `sub0_corpus.hpp` — the model *identity* (dims, vocab, tokenizer scheme), frozen per corpus
+- `sub0_system.hpp` — the *machine* (precision, thread/batch defaults, CUDA backend), per host
+- `sub0_config.hpp` — a thin umbrella over both (what the engine includes)
+
 ### Building with the CUDA backend (Windows)
 
 When a CUDA toolkit and device are present, the GPU training backend is built automatically. On
-Windows, `nvcc` compiles `.cu` files using **MSVC `cl.exe`** as its host compiler, so `cl.exe`
-and the MSVC/Windows-SDK headers and libraries must be on your environment. A plain PowerShell
-session does not have these, and configure fails with:
+Windows, `nvcc` compiles `.cu` files using **MSVC `cl.exe`** as its host compiler, so `cl.exe` and the
+MSVC/Windows-SDK headers/libraries must be on your environment. A plain PowerShell session does not have
+these, and configure fails with `nvcc fatal : Cannot find compiler 'cl.exe' in PATH`.
 
+Fix: run the build from a **Visual Studio developer environment** — open the *“x64 Native Tools Command
+Prompt for VS”*, or initialize a shell once with `vcvars64.bat`:
+
+```pwsh
+& "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 ```
-nvcc fatal : Cannot find compiler 'cl.exe' in PATH
-```
 
-Fix: run the commands from a **Visual Studio developer environment** so the MSVC toolchain is on
-`PATH`. Either:
-
-- open the **“x64 Native Tools Command Prompt for VS”** from the Start menu, **or**
-- initialize an existing shell once by running `vcvars64.bat`, e.g. from PowerShell:
-
-  ```pwsh
-  & "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-  ```
-
-  (adjust the path to your VS edition/year), **or** launch from the *Developer PowerShell for VS*.
-
-Then run the normal build commands above from that environment. The CPU-only build has no such
-requirement — only the CUDA backend needs `cl.exe`.
+The CPU-only build has no such requirement — only the CUDA backend needs `cl.exe`.
 
 ## Quick start
 
@@ -63,33 +63,73 @@ $exe autotemp <model.bin>           # pick a sampling temperature by matching he
 ```
 
 `train` with **no path** creates and registers a structured model directory (see *Models* below);
-pass an explicit path to control it yourself. `--steps 0` (default) auto-sizes the run to the
-corpus and stops on a validation plateau.
+`--steps 0` (default) auto-sizes the run to the corpus and stops on a validation plateau. The GPU
+backend is used automatically when it was built (see *Compute backend* below).
+
+## Configuration
+
+**You do not set the model dimensions** — the configurator auto-sizes `d_model / n_layers / n_heads /
+seq_len / vocab` from the corpus byte-scale. To re-configure, run the configurator directly (or edit the
+sidecar) and rebuild — **no CMake reconfigure** is needed, because the dimensions live in the generated
+headers the tool owns, not in CMake:
+
+```sh
+configure=out/build/native/sub0-configure
+$configure --corpus data/tinystories.txt              # auto-size + emit the headers
+$configure --corpus data/tinystories.txt --dmodel 256 # pin a dimension (the rest still auto-size)
+cmake --build --preset native                         # recompiles against the new headers
+```
+
+A chosen size **persists** in a `<corpus>.model` sidecar (key=value), so it survives later re-runs.
+The resolution precedence is **CLI flag > sidecar > auto-size**.
+
+| What | Owner | Notes |
+|---|---|---|
+| `d_model / n_layers / n_heads / seq_len / vocab` | configurator | auto-sized from corpus; `--dmodel`… pins; `<corpus>.model` persists |
+| tokenizer (Unigram LM, JOIN scheme), precision | configurator | derived; `--join`, `--prec-gemm/--prec-act` override |
+| compute backend (CPU vs GPU) | configurator | **GPU when the CUDA backend was built**, else CPU; `--compute` pins |
+| whether CUDA *exists* / is built | CMake | detects the toolkit + device; `-DSUB0_COMPUTE=CPU` forces a CPU-only build |
+| corpus, positional encoding, ternary | CMake cache (`SUB0_CORPUS` …) | explicit user intent |
+
+See [docs/CONFIGURE_ARCHITECTURE.md](docs/CONFIGURE_ARCHITECTURE.md) for the build-state model and
+[docs/WORKFLOW_ARCHITECTURE.md](docs/WORKFLOW_ARCHITECTURE.md) for the staged user-driven workflow roadmap.
+
+### Compute backend
+
+CMake checks whether CUDA *exists* (toolkit + device → it builds the `nvcc` device backend); the
+configurator decides whether to *use* it (`COMPUTE_MODE`). With a device present, `cmake --preset native`
+builds the GPU training backend and the configurator defaults to it. Force CPU-only with
+`-DSUB0_COMPUTE=CPU`, or keep the backend but run on the CPU with `sub0-configure --compute 0`.
+
+### Positional encoding
+
+`SUB0_POS_ENCODING` selects how position is injected (compile-time): **`ROPE`** (default) — rotary
+embeddings on Q/K, relative position, no learned table, extends to longer contexts; **`ABSOLUTE`** — a
+learned `pos_emb[SEQ_LEN, D_MODEL]` table. `SUB0_ROPE_THETA` (default `10000`) is RoPE's frequency base.
+A model is only comparable to others built with the **same** scheme.
 
 ## Using a larger corpus (out-of-core)
 
-The default corpus is small (`data/tinystories.txt`). To train on something big like
-**FineWeb-Edu**, fetch it with the helper (needs `pip install huggingface_hub duckdb`):
+The default corpus is small (`data/tinystories.txt`). For something big like **FineWeb-Edu**:
 
 ```sh
-python scripts/get_fineweb.py --out data/fineweb_edu.txt        # ~46GB; --shards N for a slice
+python scripts/get_fineweb.py --out data/fineweb_edu.txt   # ~46GB; --shards N for a slice
 cmake --preset native -DSUB0_CORPUS="$(pwd)/data/fineweb_edu.txt"
-cmake --build --preset native
+cmake --build --preset native                              # auto-sizes UP to a larger model
 $exe train
 ```
 
-`SUB0_CORPUS_TOK=AUTO` (default) decides by scale whether to pre-tokenize the corpus to
-`corpus.tok` (fast random-access training) or **tokenize on demand** from the raw text when the
-token copy would not fit comfortably in RAM — so a corpus larger than memory just works. The
-configurator caches its scan (`<corpus>.words`) so re-configuring with a different vocab skips
-the multi-pass scan.
+`SUB0_CORPUS_TOK=AUTO` (default) decides by scale whether to pre-tokenize the corpus to `corpus.tok`
+(fast random-access training) or **tokenize on demand** from the raw text when the token copy would not
+fit comfortably in RAM — so a corpus larger than memory just works. The configurator caches its scan
+(`<corpus>.words`) so re-configuring with a different vocab skips the multi-pass scan.
 
 ## Models
 
 Each trained model is its own directory under `models/`, named for its identity:
 
 ```
-models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t]_<gitSHA>/
+models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t][r]_<gitSHA>/
   model.bin  model.bin.ckpt  meta.txt
 ```
 
@@ -100,36 +140,7 @@ $exe models            # list models; '*' = loadable by this build, 'x' = incomp
 $exe models --prune    # delete models whose architecture this build can no longer load
 ```
 
-The auto-derived path is deterministic, so re-running `train` resumes the same model from its
-checkpoint.
-
-## Configuration
-
-Model dimensions and the corpus are CMake cache variables (re-tokenizes/recompiles on change):
-
-```sh
-cmake --preset native -DSUB0_D_MODEL=128 -DSUB0_N_LAYERS=6 -DSUB0_N_HEADS=4 -DSUB0_SEQ_LEN=64
-```
-
-`SUB0_D_MODEL`, `SUB0_N_LAYERS`, `SUB0_N_HEADS`, `SUB0_SEQ_LEN`, `SUB0_TERNARY`, `SUB0_CORPUS`,
-`SUB0_CORPUS_TOK` (ON/OFF/AUTO), `SUB0_EXACT_MATH` (exact vs fast transcendentals).
-
-### Positional encoding
-
-`SUB0_POS_ENCODING` selects how position is injected (compile-time):
-
-- **`ROPE`** (default) — rotary embeddings applied to Q/K inside attention. Encodes *relative*
-  position in the attention dot-product, uses no learned position table, and extends to longer
-  contexts far better than learned absolute embeddings. `SUB0_ROPE_THETA` (default `10000`) is its
-  frequency base.
-- **`ABSOLUTE`** — a learned `pos_emb[SEQ_LEN, D_MODEL]` table added to the token embedding.
-
-```sh
-cmake --preset native -DSUB0_POS_ENCODING=ROPE -DSUB0_ROPE_THETA=10000
-```
-
-The two schemes share the same weight layout, so a model is only comparable to others built with
-the **same** `SUB0_POS_ENCODING`.
+The auto-derived path is deterministic, so re-running `train` resumes the same model from its checkpoint.
 
 ## Tooling
 
@@ -141,17 +152,21 @@ the **same** `SUB0_POS_ENCODING`.
 | `report` | diagnose model sizing vs its corpus; per-knob retrain guidance |
 | `memplan` | predicted train/gen memory footprints (breakdown + batch sweep vs VRAM) |
 | `autotemp` | pick a coherence temperature by matching held-out perplexity |
-| `vocab` | print the BPE vocabulary table |
+| `vocab` | print the (Unigram) vocabulary table |
 | `bench` | cycle-accurate hot-path benchmark (the optimization control) |
 | `tune` | auto-tune threads / batch granularity for throughput |
+
+`sub0-configure` is the separate build-time/​user-runnable configurator (`--dump-vocab` also writes
+readable corpus/token/vocab-curve analysis files).
 
 ## Layout
 
 ```
-src/        engine (engine.cpp) + stages (train_stage, gen_stage)
-include/    public headers (core, casing, tokmap, registry, tune, coherence)
-tools/      sub0-configure (build-time tokenizer)
+src/        engine (engine_core + backend_cpu/backend_cuda) + stages (train_stage, gen_stage) + driver
+include/    public headers (core, casing, tokenizer, unigram, memplan, registry, config_util, tune)
+tools/      sub0-configure (configurator) + cuda_selftest
+cmake/      backend detection + the sub0_build_facts.hpp.in template
 scripts/    data-acquisition helpers (get_fineweb.py)
-tests/      Catch2 unit tests
-docs/       design notes (TOKENIZER_DESIGN.md)
+tests/      Catch2 unit tests (engine + the engine-free tokenizer/config suite)
+docs/       design notes (tokenizer, configure + workflow architecture, CUDA review)
 ```
