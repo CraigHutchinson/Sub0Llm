@@ -829,27 +829,35 @@ int main(int argc, char** argv) {
     const sub0::config::TuneDefaults td = sub0::config::parse_tune_cache(tc, static_cast<int>(hw_concurrency));
     const int default_threads    = td.threads;
     const int default_wpt        = td.windows_per_thread;
-    const int default_gpu_batch  = td.gpu_batch;            // already derived from the width if untuned
+    int       default_gpu_batch  = td.gpu_batch;            // derived from the width if untuned; clamped to VRAM below
     const int attn_bwd_per_query = td.attn_bwd_per_query;
     if (td.tf32_from_cache) cuda_tf32 = td.cuda_tf32 ? 1 : 0;
 
-    // Fail the build on a GPU batch that cannot fit. DEFAULT_GPU_BATCH sizes the resident device
-    // training scratch; on Windows an over-budget cudaMalloc does not OOM, it silently spills to WDDM
-    // shared memory and thrashes over PCIe (~10x slower) -- a silent performance cliff, not a crash.
-    // We know the model dims and the VRAM budget right here, so pre-compute the footprint (the SAME
-    // pure model the backend is validated against) and turn the misconfiguration into a hard configure
-    // error instead of baking a batch that will spill at the first training step.
+    // Keep DEFAULT_GPU_BATCH within the VRAM budget. The batch sizes the resident device training
+    // scratch; on Windows an over-budget cudaMalloc does not OOM, it silently spills to WDDM shared
+    // memory and thrashes over PCIe (~10x slower) -- a silent performance cliff. A cached batch tuned
+    // for a SMALLER model goes stale when the corpus auto-sizes UP, so rather than hard-blocking the
+    // build we CLAMP to the largest batch that fits -- the SAME memplan primitive the tuner bounds its
+    // sweep with, so the two agree -- and warn to re-tune for the optimum. Only a model too big for
+    // even batch 1 is a hard error.
     if (has_cuda && gpu_vram_mb > 0) {
         const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, 4 * d_model, seq_len, vocab };
         const int need = sub0::memplan::train_resident_mb(dims, default_gpu_batch);
         if (need > gpu_vram_mb) {
-            std::println(stderr,
-                         "configure error: DEFAULT_GPU_BATCH={} needs ~{} MiB of resident VRAM but only "
-                         "{} MiB is available.\n"
-                         "       Re-tune (`sub0llm tune --backend gpu`) so a fitting batch is persisted, or "
-                         "reduce the model size, before rebuilding.",
-                         default_gpu_batch, need, gpu_vram_mb);
-            return 1;
+            const int fit = sub0::memplan::max_batch_for_vram(dims, gpu_vram_mb, default_gpu_batch);
+            if (fit >= 1) {
+                std::println(stderr,
+                             "configure warning: cached DEFAULT_GPU_BATCH={} needs ~{} MiB but only {} MiB VRAM "
+                             "is available -- clamping to {}. Re-tune (`sub0llm-tune --backend gpu`) for the optimum.",
+                             default_gpu_batch, need, gpu_vram_mb, fit);
+                default_gpu_batch = fit;
+            } else {
+                std::println(stderr,
+                             "configure error: the model needs ~{} MiB for even batch 1 but only {} MiB VRAM is "
+                             "available. Reduce the model size (or build CPU-only) before rebuilding.",
+                             sub0::memplan::train_resident_mb(dims, 1), gpu_vram_mb);
+                return 1;
+            }
         }
     }
 
