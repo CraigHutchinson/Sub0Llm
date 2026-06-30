@@ -28,16 +28,47 @@ inline ModelDims autosize(std::uintmax_t corpus_bytes) {
     return                  {768, 16, 8, 512, 32768};    // ~full fineweb (45 GB)
 }
 
-// Fill any field left 0 (the "auto" sentinel) from the corpus-scaled default; a nonzero field (an
-// explicit --dmodel/--vocab/... ) is preserved. Returns the resolved dims.
-inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes) {
-    const ModelDims a = autosize(corpus_bytes);
-    if (pinned.d_model  == 0) pinned.d_model  = a.d_model;
-    if (pinned.n_layers == 0) pinned.n_layers = a.n_layers;
-    if (pinned.n_heads  == 0) pinned.n_heads  = a.n_heads;
-    if (pinned.seq_len  == 0) pinned.seq_len  = a.seq_len;
-    if (pinned.vocab    == 0) pinned.vocab    = a.vocab;
+// Fill any field of `pinned` left 0 (the "auto" sentinel) from `fallback`; a nonzero field (an
+// explicit --dmodel/... or a sidecar pin) is preserved. The resolution precedence is built by
+// chaining: CLI -> sidecar -> auto-size.
+inline ModelDims fill_defaults(ModelDims pinned, const ModelDims& fallback) {
+    if (pinned.d_model  == 0) pinned.d_model  = fallback.d_model;
+    if (pinned.n_layers == 0) pinned.n_layers = fallback.n_layers;
+    if (pinned.n_heads  == 0) pinned.n_heads  = fallback.n_heads;
+    if (pinned.seq_len  == 0) pinned.seq_len  = fallback.seq_len;
+    if (pinned.vocab    == 0) pinned.vocab    = fallback.vocab;
     return pinned;
+}
+inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes) {
+    return fill_defaults(pinned, autosize(corpus_bytes));
+}
+
+// --- Per-corpus model sidecar (<corpus>.model) -----------------------------
+// A key=value sidecar so a chosen size PERSISTS across configurator re-runs (a build-time auto-regen
+// then keeps the user's pins instead of re-auto-sizing). Pure parse/format; the file I/O stays in the
+// configurator. A 0 field means "unset" (defer to auto-size).
+inline ModelDims parse_model_sidecar(std::istream& is) {
+    ModelDims m;
+    for (std::string line; std::getline(is, line);) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq);
+        const int         v = std::atoi(line.substr(eq + 1).c_str());
+        if      (k == "d_model")  m.d_model  = v;
+        else if (k == "n_layers") m.n_layers = v;
+        else if (k == "n_heads")  m.n_heads  = v;
+        else if (k == "seq_len")  m.seq_len  = v;
+        else if (k == "vocab")    m.vocab    = v;
+    }
+    return m;
+}
+inline std::string format_model_sidecar(const ModelDims& m) {
+    return "# sub0 per-corpus model config (auto-seeded; edit to pin a size, then rebuild)\n"
+           "d_model="  + std::to_string(m.d_model)  + "\n"
+           "n_layers=" + std::to_string(m.n_layers) + "\n"
+           "n_heads="  + std::to_string(m.n_heads)  + "\n"
+           "seq_len="  + std::to_string(m.seq_len)  + "\n"
+           "vocab="    + std::to_string(m.vocab)    + "\n";
 }
 
 // --- Tuned runtime defaults (from the tune cache) --------------------------

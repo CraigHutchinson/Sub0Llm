@@ -58,6 +58,29 @@ TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][auto
     CHECK(r.vocab == 4096);                               // auto
 }
 
+TEST_CASE("model sidecar: parse/format round-trip + fill_defaults precedence", "[config][sidecar]") {
+    std::istringstream s("# a comment\nd_model=256\nn_layers=8\nn_heads=8\nseq_len=512\nvocab=16000\njunk\n");
+    const ModelDims m = parse_model_sidecar(s);
+    CHECK(m.d_model == 256);
+    CHECK(m.n_layers == 8);
+    CHECK(m.vocab == 16000);
+
+    // format -> parse round-trips the values.
+    std::istringstream s2(format_model_sidecar(m));
+    const ModelDims m2 = parse_model_sidecar(s2);
+    CHECK(m2.d_model == 256);
+    CHECK(m2.seq_len == 512);
+    CHECK(m2.vocab == 16000);
+
+    // Precedence: a nonzero (CLI) field is preserved; a 0 field is filled from the sidecar.
+    ModelDims cli;
+    cli.d_model = 384;                                   // pinned on the CLI
+    const ModelDims filled = fill_defaults(cli, m);
+    CHECK(filled.d_model == 384);                        // CLI wins
+    CHECK(filled.n_layers == 8);                         // sidecar fills the rest
+    CHECK(filled.vocab == 16000);
+}
+
 TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[config][tune]") {
     // Empty cache -> hardware threads, conservative wpt, GPU batch derived from the width.
     std::istringstream empty("");

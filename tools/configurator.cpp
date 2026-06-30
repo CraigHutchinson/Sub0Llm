@@ -516,16 +516,22 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    // Auto-size any dimension left at 0 from the corpus scale (the configurator owns the defaults; an
-    // explicit --dmodel/... still wins). The corpus file exists (required + ExistingFile).
+    // Resolve the model dims with precedence CLI (nonzero) > <corpus>.model sidecar > auto-size, so a
+    // pinned size PERSISTS across re-runs (a build-time auto-regen keeps it). Seed the sidecar if
+    // absent so it is there to edit. The corpus file exists (required + ExistingFile).
     {
         std::error_code ec;
         const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, ec);
-        const sub0::config::ModelDims r = sub0::config::apply_autosize(
-            {d_model, n_layers, n_heads, seq_len, vocab_target}, ec ? 0 : corpus_bytes);
-        d_model = r.d_model; n_layers = r.n_layers; n_heads = r.n_heads; seq_len = r.seq_len; vocab_target = r.vocab;
-        std::println(stderr, "auto-size: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} (0-valued; CLI pins)",
-                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target);
+        const std::string sidecar = corpus + ".model";
+        sub0::config::ModelDims dims{d_model, n_layers, n_heads, seq_len, vocab_target};   // CLI (0 = auto)
+        bool have_sidecar = false;
+        if (std::ifstream sf(sidecar); sf) { dims = sub0::config::fill_defaults(dims, sub0::config::parse_model_sidecar(sf)); have_sidecar = true; }
+        dims = sub0::config::apply_autosize(dims, ec ? 0 : corpus_bytes);                  // fill the rest
+        d_model = dims.d_model; n_layers = dims.n_layers; n_heads = dims.n_heads; seq_len = dims.seq_len; vocab_target = dims.vocab;
+        if (!have_sidecar) { if (std::ofstream sf(sidecar); sf) sf << sub0::config::format_model_sidecar(dims); }
+        std::println(stderr, "model dims: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} ({}; CLI pins)",
+                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target,
+                     have_sidecar ? "from " + std::filesystem::path(sidecar).filename().string() : "auto-sized + seeded sidecar");
     }
 
     if (d_model % n_heads != 0) {
