@@ -74,7 +74,7 @@ sidecar) and rebuild — **no CMake reconfigure** is needed, because the dimensi
 headers the tool owns, not in CMake:
 
 ```sh
-configure=out/build/native/sub0-configure
+configure=out/build/native/sub0llm-configure
 $configure --corpus data/tinystories.txt              # auto-size + emit the headers
 $configure --corpus data/tinystories.txt --dmodel 256 # pin a dimension (the rest still auto-size)
 cmake --build --preset native                         # recompiles against the new headers
@@ -99,7 +99,7 @@ See [docs/CONFIGURE_ARCHITECTURE.md](docs/CONFIGURE_ARCHITECTURE.md) for the bui
 CMake checks whether CUDA *exists* (toolkit + device → it builds the `nvcc` device backend); the
 configurator decides whether to *use* it (`COMPUTE_MODE`). With a device present, `cmake --preset native`
 builds the GPU training backend and the configurator defaults to it. Force CPU-only with
-`-DSUB0_COMPUTE=CPU`, or keep the backend but run on the CPU with `sub0-configure --compute 0`.
+`-DSUB0_COMPUTE=CPU`, or keep the backend but run on the CPU with `sub0llm-configure --compute 0`.
 
 ### Positional encoding
 
@@ -156,15 +156,18 @@ The auto-derived path is deterministic, so re-running `train` resumes the same m
 | `bench` | cycle-accurate hot-path benchmark (the optimization control) |
 | `tune` | auto-tune threads / batch granularity for throughput |
 
-`sub0-configure` is the separate build-time/​user-runnable configurator (`--dump-vocab` also writes
-readable corpus/token/vocab-curve analysis files).
+The pipeline stages are **also standalone executables** — `sub0llm-configure`, `sub0llm-train`,
+`sub0llm-gen`, `sub0llm-tune` — so each stage can be built/run on its own (`sub0llm-train --steps 0` ≡
+`sub0llm train --steps 0`). The stage tools share one runner definition with the umbrella
+(`include/sub0/cli_stages.hpp`) and are gated on the configured engine. `sub0llm-configure` is the
+config-independent front (`--dump-vocab` also writes readable corpus/token/vocab-curve analysis files).
 
 ## Layout
 
 ```
 src/        engine (engine_core + backend_cpu/backend_cuda) + stages (train_stage, gen_stage) + driver
-include/    public headers (core, casing, tokenizer, unigram, memplan, registry, config_util, tune)
-tools/      sub0-configure (configurator) + cuda_selftest
+include/    public headers (core, casing, tokenizer, unigram, memplan, registry, config_util, cli_stages)
+tools/      sub0llm-configure + sub0llm-{train,gen,tune} (thin stage mains) + cuda_selftest
 cmake/      backend detection + the sub0_build_facts.hpp.in template
 scripts/    data-acquisition helpers (get_fineweb.py)
 tests/      Catch2 unit tests (engine + the engine-free tokenizer/config suite)

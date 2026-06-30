@@ -59,14 +59,24 @@ that turns runtime-discovered facts into compile-time constants.
 ## Staged implementation plan
 
 1. **Bake build facts into `sub0llm-configure`** (`configure_file` → `sub0_build_facts.hpp`); drop the
-   mirrored CLI args from the CMake `add_custom_command` (`--has-cuda/--cuda-arch/--gpu-*/-o`/paths…).
-   Keeps `--corpus` + the user-overridable knobs. ← shrinks the CMake/configure duplication.
-2. **Gate the engine + stage targets** on `EXISTS ${GEN_HEADER}` + `CMAKE_CONFIGURE_DEPENDS`; make the
-   `add_custom_command` a *convenience* (still seeds a fresh checkout) but the documented path is the tool.
+   mirrored CLI args from the CMake `add_custom_command`. ✅ **DONE** — device caps + output paths are
+   baked; the command keeps `--corpus` + the user-overridable knobs.
+2. **Gate the stage targets on configure.** ✅ **DONE (dependency form)** — each `sub0llm-<stage>` target
+   `add_dependencies(... sub0_generate_config)`, so it cannot build before the config header exists;
+   `sub0llm-configure` itself has no such dependency (state-1 buildable). The hard `EXISTS`-gate +
+   `CMAKE_CONFIGURE_DEPENDS` (fresh checkout builds *only* the configurator) is the stricter variant,
+   deferred — the auto-generate convenience already produces the header, and the core decouple holds:
+   dims live in tool-owned headers, so `sub0llm-configure …` + `cmake --build` re-sizes with **no CMake
+   reconfigure**.
 3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
-   the engine share one site.
-4. **Split the driver** into `sub0llm-{configure,tune,train,gen}` (thin `main()`s over the stage libs),
-   gated per (2); fold the diagnostics (vocab/bench/models/report/memplan) into the nearest stage.
-5. **(stretch)** a `workflow` convenience target; the fully-decoupled state-1 self-probe (`frontend_cuda`).
+   the engine share one site. ⏳ pending (internal cleanup; today the configurator links `sub0_tok` +
+   the header-only frontend bits directly).
+4. **Split the driver** into thin `sub0llm-{configure,train,gen,tune}` exes over shared runners. ✅
+   **DONE** — `include/sub0/cli_stages.hpp` defines each `run_*` once; the umbrella `sub0llm` dispatches
+   to them and the stage exes are thin `main()`s; diagnostics (vocab/bench/models/report/memplan) stay
+   on the umbrella.
+5. **(stretch)** a `workflow` convenience target; the strict `EXISTS`-gate; the state-1 `frontend_cuda`
+   self-probe. ⏳ pending.
 
-Stage 1–2 deliver the core want (user-called configure, simpler CMake); 3–4 are the thin-tools cleanup.
+Stages 1, 2 (dependency form) and 4 are done — the user-callable stage tools + the shrunk, non-mirroring
+CMake are in place. Remaining: the `sub0_frontend` extraction and the strict fresh-checkout gating.

@@ -1,6 +1,6 @@
 # Tokenizer Vocabulary Analysis
 
-A `sub0-configure --dump-vocab <prefix>` mode writes three readable files for reviewing how the
+A `sub0llm-configure --dump-vocab <prefix>` mode writes three readable files for reviewing how the
 tokenizer compacts a corpus (scan + learn, then exit — no `corpus.tok`/header):
 - `<prefix>.corpus_vocab.txt` — every unique word-unit (truecased) + occurrence count, freq-desc.
 - `<prefix>.token_vocab.txt` — every learned token (byte / marker / merge), its text, and the corpus
@@ -89,7 +89,7 @@ shifts the whole curve right — run the curve there to size its vocab.
 ## Next steps
 
 1. Dumps are in place — review `corpus_vocab` / `token_vocab` / `ngrams` for FineWeb (run
-   `sub0-configure --corpus data/fineweb_smoke.txt --dump-vocab …`; slower, uses the `.words` cache).
+   `sub0llm-configure --corpus data/fineweb_smoke.txt --dump-vocab …`; slower, uses the `.words` cache).
 2. Decide the target vocab size from the FineWeb `corpus_vocab` size + a coverage curve (what fraction
    of occurrences single-token coverage buys at 8k / 16k / 32k).
 3. Prototype the Unigram vocabulariser (candidate seed → Viterbi cost → prune) as an alternative to

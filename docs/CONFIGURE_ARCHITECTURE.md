@@ -1,13 +1,13 @@
-# Configuration architecture — `sub0-configure` owns the config
+# Configuration architecture — `sub0llm-configure` owns the config
 
-Goal: make `sub0-configure` the **user-runnable source of truth** for configuration. It auto-derives
+Goal: make `sub0llm-configure` the **user-runnable source of truth** for configuration. It auto-derives
 sensible defaults (model size from the corpus, system config by probing the machine, tokenizer/vocab
-from the corpus) and bakes them into generated headers. Changing a default is `sub0-configure --x`
+from the corpus) and bakes them into generated headers. Changing a default is `sub0llm-configure --x`
 + build — **not** a CMake reconfigure. CMake stops carrying settings the configurator can decide.
 
 ## The three build states
 
-1. **Fresh checkout (no generated headers).** `sub0-configure` builds with *no* dependency on the
+1. **Fresh checkout (no generated headers).** `sub0llm-configure` builds with *no* dependency on the
    generated headers (it includes only `casing/tokenizer/unigram/memplan`, never `sub0_config.hpp`), so
    it can always be built and run first. The user *may* run it explicitly to (re)generate the headers;
    as a convenience the CMake build also auto-generates them (idempotent: same corpus + sidecar → same
@@ -75,7 +75,7 @@ sizing ladder is the coarse default, to be refined against measured val-loss per
 2. **Split headers** (`sub0_corpus.hpp` + `sub0_system.hpp` behind the `sub0_config.hpp` umbrella). ✅
 3. **CUDA detection** — resolved: stays in CMake (it drives `nvcc` at configure time; see above). ✅
 4. **Decouple re-config from a CMake reconfigure** — ✅ via auto-size + the `<corpus>.model` sidecar:
-   changing a size is `sub0-configure …` (or edit the sidecar) then `cmake --build`. The
+   changing a size is `sub0llm-configure …` (or edit the sidecar) then `cmake --build`. The
    `add_custom_command` remains the convenience that auto-generates the headers for a fresh checkout.
 
 All four stages are complete; the pure decisions live in `sub0::config` (`config_util.hpp`) and are
