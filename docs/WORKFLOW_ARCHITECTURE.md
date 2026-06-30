@@ -84,3 +84,46 @@ that turns runtime-discovered facts into compile-time constants.
 
 Stages 1, 2 (dependency form) and 4 are done — the user-callable stage tools + the shrunk, non-mirroring
 CMake are in place. Remaining: the `sub0_frontend` extraction and the strict fresh-checkout gating.
+
+## Frontend layer — testability + tooling (groundwork for the Stage-3 cleanup)
+
+The **frontend** is the engine-free, pre-model logic the configurator + stage tools share but the engine
+doesn't define: `config_util`, `memplan`, `registry`, `casing`, `tokenizer`, `unigram` (all header-only
++ std-only today). Its separation buys two things beyond tidiness:
+
+### 1. Testability — the immediate, measured payoff
+Header-only + std-only ⇒ it runs in the **fast engine-free** `sub0_tok_tests` target (no engine build, no
+GPU). First slice **done** (`tests/frontend_tests.cpp`): `memplan` (the VRAM clamp/cap math — monotone
+footprint, `max_batch_for_vram` inversion, the clamp invariant) and `registry` (`corpus_tag` / `model_dir`
+identity + `compatible()` — the `models --prune` rule) — the two areas this session changed, previously
+tested only via the slow engine-linked target (`memplan`) or **not at all** (`registry`). 200 → 224
+assertions. **Gaps still open**: `casing` edge cases (only covered indirectly via the tokenizer), registry
+meta read/write + `scan` (needs a temp-dir I/O fixture), the configurator's header *emit* (integration only).
+
+### 2. `sub0_frontend` lib (Stage 3) — one named home + one test target
+Extract a `sub0_frontend` static lib (the headers above) that both the configurator and the stage tools
+link, plus a single `sub0_frontend_tests`. Low-risk (a CMake + include reshuffle; the engine-free test
+target already proves the value). `frontend_cuda` (a runtime device probe) is only needed for the fully
+decoupled state-1 self-probe and stays deferred — CMake bakes the device facts today.
+
+### Tokenizer / vocab as engine-free frontend tools — judgement: **YES**, for diagnostics + interchange
+A `sub0llm-tokenizer` tool (links `sub0_frontend`, **not** the engine) is worth building:
+- **Why engine-free is the point.** Inspecting/exporting a tokenizer needs only `sub0_tok`. Today
+  `sub0llm vocab` lives in the *train* stage lib, so you must build the whole engine to print a vocab
+  table — wrong coupling. Moving it frees diagnostics from the engine and from a configured build.
+- **Diagnostics**: `encode "text"` (show the token stream — debug the CamelCase-shatter / indented-code
+  pathologies), `decode <ids>`, `roundtrip <file>` (ad-hoc lossless check on real content, vs the fuzz
+  net), `vocab [--limit]` (moved off the engine).
+- **Interchange**: `export --format json|tsv` (token↔id, piece, logp) for external/cross-tokenizer
+  analysis and the planned diffusion-viz scrubber.
+- **NOT a corpus preprocessor.** Bulk corpus→`corpus.tok` stays the configurator's job (it owns the scan,
+  the out-of-core pipeline, the `.words` cache); don't duplicate it. `--dump-vocab` also stays in the
+  configurator (it needs the corpus scan + the BPE-vs-Unigram A/B + the vocab curve). The tool operates on
+  a **built** `tokenizer.bin` + arbitrary sample input — the lighter, post-build inspector/exporter.
+- **Test payoff**: engine-free, its round-trip is the existing fuzz property, and the export format is
+  schema-checkable — more coverage in the fast target.
+
+**Workflow integration**: after a configure run, `sub0llm-tokenizer vocab/encode` sanity-checks the
+tokenization *before* committing to a long train; `export` feeds external comparison + the viz scrubber.
+Sequencing: do the `sub0_frontend` lib first (gives the tool + its tests a home), then the tool absorbing
+`vocab` off the engine, then `encode/decode/roundtrip/export`.
