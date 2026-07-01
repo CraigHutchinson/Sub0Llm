@@ -425,3 +425,14 @@ if(SUB0_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# --- Benchmarks (opt-in) ----------------------------------------------------
+# First-class microbenchmarks for the optimization work: statistical timing (warmup + repetitions +
+# mean/stddev) instead of ad-hoc printf. Uses Catch2's benchmark support (already a project dep and it
+# builds cleanly on this clang-on-Windows toolchain -- Google Benchmark's cmake injects MSVC /W4 /MP
+# flags into clang++ and mis-probes std::regex, so it is not viable here). Host/CPU hot paths only;
+# device (CUDA) throughput stays on the cudaEvent-based sub0-cuda-selftest. Opt-in. See benchmarks/.
+option(SUB0_BUILD_BENCHMARKS "Build the microbenchmark suite (Catch2 benchmarks)" OFF)
+if(SUB0_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif()
