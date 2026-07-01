@@ -46,6 +46,7 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"  // sub0::tok — the shared truecasing + BPE tokenizer (scan/learn/serialize)
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
+#include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
 #include "sub0/config_util.hpp"// sub0::config — pure, unit-tested config decisions (autosize / tune-cache / precision)
 #include "sub0_build_facts.hpp" // CMake-baked build facts (device caps + output paths) -> the CLI defaults
 
@@ -698,14 +699,11 @@ int main(int argc, char** argv) {
     if (emit_tok) {
         std::ofstream ts(tok_path, std::ios::binary);
         if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_path.string()); return 1; }
-        {
-            const std::uint32_t magic = 0x44543053u,                // "S0TD" (doc-aware corpus.tok)
-                                vfield = static_cast<std::uint32_t>(vocab), zero = 0u;
-            ts.write(reinterpret_cast<const char*>(&magic),  sizeof magic);
-            ts.write(reinterpret_cast<const char*>(&vfield), sizeof vfield);
-            ts.write(reinterpret_cast<const char*>(&zero),   sizeof zero);  // ntok, patched below
-            ts.write(reinterpret_cast<const char*>(&zero),   sizeof zero);  // ndoc, patched below
-        }
+        // v2 corpus.tok: u64 counts (a 46 GB corpus is ~14B tokens, past the legacy u32) + the minimal
+        // byte-aligned token width for this vocab (16/24/32 bits) instead of a fixed int32.
+        sub0::TokWriter tw(ts, vocab);
+        std::vector<std::uint8_t> pack_scratch;
+        std::println(stderr, "corpus.tok: {} bits/token (vocab {})", tw.bytes_per_token() * 8, vocab);
         // Document boundaries: get_fineweb.py separates documents with a blank line ("\n\n"), and a
         // newline is always emitted as its own base token (non-alpha bytes never BPE-merge), so a
         // run of >=2 newline tokens marks a document break -- the next token starts a new document.
@@ -713,7 +711,7 @@ int main(int argc, char** argv) {
         const std::int32_t nl_id      = static_cast<std::int32_t>(sym_to_base(10));      // base id of '\n'
         const std::int32_t para_id    = static_cast<std::int32_t>(tkz.para_id);          // JOIN is the only scheme
         const std::int32_t newline_id = static_cast<std::int32_t>(tkz.newline_id);
-        std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
+        std::vector<std::uint64_t> doc_starts{0u};                  // document 0 begins at token 0 (u64: ~14B tokens)
         int nl_run = 0;
         // Tokenize Pass 3, PARALLEL: encode a batch of newline-aligned chunks concurrently (each is
         // independent -- tok::encode reads the const tokenizer), then write them in FILE ORDER and fold
@@ -769,11 +767,10 @@ int main(int argc, char** argv) {
                     const std::int32_t tk = toks[li];
                     const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
                     if (w > 0) { nl_run += w; continue; }
-                    if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
+                    if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint64_t>(token_count + li));
                     nl_run = 0;
                 }
-                ts.write(reinterpret_cast<const char*>(toks.data()),
-                         static_cast<std::streamsize>(toks.size() * sizeof(std::int32_t)));
+                tw.append(toks.data(), toks.size(), pack_scratch);   // pack to the v2 width + write
                 token_count += toks.size();
                 bytes_done  += batch[static_cast<std::size_t>(i)].size();
             }
@@ -793,18 +790,8 @@ int main(int argc, char** argv) {
             if (static_cast<int>(batch.size()) >= nth) flush();
         });
         flush();                                                    // final partial batch
-        // Append the document-start index after the token stream, then back-patch ntok + ndoc.
-        ts.write(reinterpret_cast<const char*>(doc_starts.data()),
-                 static_cast<std::streamsize>(doc_starts.size() * sizeof(std::uint32_t)));
+        tw.finish(doc_starts);                                      // u64 doc index + back-patch ntok/ndoc
         doc_count = doc_starts.size();
-        {
-            const std::uint32_t nfield = static_cast<std::uint32_t>(token_count);
-            const std::uint32_t dfield = static_cast<std::uint32_t>(doc_starts.size());
-            ts.seekp(8, std::ios::beg);
-            ts.write(reinterpret_cast<const char*>(&nfield), sizeof nfield);
-            ts.seekp(12, std::ios::beg);
-            ts.write(reinterpret_cast<const char*>(&dfield), sizeof dfield);
-        }
         ts.close();
     } else {
         // Drop any stale corpus.tok from a previous emit so training reliably falls back to

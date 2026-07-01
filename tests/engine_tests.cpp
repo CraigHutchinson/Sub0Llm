@@ -98,14 +98,14 @@ TEST_CASE("window sampler keeps each training window inside one document", "[win
     // the single document that contains `start`. A document too short for the full width T is no
     // longer skipped -- it yields a shorter window (len < T) that the caller pads; verify that path
     // is exercised (the 60-token middle document at the larger widths).
-    const std::vector<std::uint32_t> docs = {0u, 100u, 160u};
+    const std::vector<std::uint64_t> docs = {0u, 100u, 160u};
     const std::size_t train_tok = 400;
     std::mt19937 rng(123);
     bool saw_short = false;
     for (int T : {8, 33, 64, 200}) {
         for (int it = 0; it < 5000; ++it) {
             const sub0::Window w = sub0::sample_window(rng, T, train_tok,
-                                                       std::span<const std::uint32_t>(docs));
+                                                       std::span<const std::uint64_t>(docs));
             REQUIRE(w.len >= 1);
             REQUIRE(w.len <= T);
             REQUIRE(w.start + static_cast<std::size_t>(w.len) < train_tok);   // last target in range

@@ -39,7 +39,7 @@ struct Window {
 // trainable tokens (every index used stays in [0, train_tok)). With an empty index the result is a
 // flat full-width window. Single-token documents are skipped (no input/target pair to learn from).
 inline Window sample_window(std::mt19937& rng, int T, std::size_t train_tok,
-                            std::span<const std::uint32_t> docs) {
+                            std::span<const std::uint64_t> docs) {
     const std::size_t Tsz  = static_cast<std::size_t>(T);
     const std::size_t full = Tsz + 1;   // a full window needs T inputs + the last shifted target
     if (docs.empty()) {
@@ -50,7 +50,7 @@ inline Window sample_window(std::mt19937& rng, int T, std::size_t train_tok,
     for (int tries = 0; tries < 8; ++tries) {
         const std::size_t pos = uni(rng);
         const std::size_t k = static_cast<std::size_t>(
-            std::upper_bound(docs.begin(), docs.end(), static_cast<std::uint32_t>(pos)) - docs.begin()) - 1;
+            std::upper_bound(docs.begin(), docs.end(), static_cast<std::uint64_t>(pos)) - docs.begin()) - 1;
         const std::size_t ds = docs[k];
         std::size_t de = (k + 1 < docs.size()) ? static_cast<std::size_t>(docs[k + 1]) : train_tok;
         if (de > train_tok) de = train_tok;                 // a doc straddling the train/val split

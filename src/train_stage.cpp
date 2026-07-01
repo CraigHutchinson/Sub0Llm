@@ -213,7 +213,7 @@ private:
 // (no corpus.tok) instead of bailing out. The returned span stays valid for as long as the
 // caller's `tok` (the mmap) and `od_buf` (the on-demand storage) live; on failure it is empty
 // and a diagnostic naming `tool` has already been printed.
-std::span<const int> load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_buf, const char* tool) {
+sub0::TokView load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_buf, const char* tool) {
     if (tok.ok() && tok.vocab() == VOCAB && tok.tokens().size() > static_cast<std::size_t>(SEQ_LEN) + 2)
         return tok.tokens();                       // baked corpus.tok (the fast path)
 
@@ -224,7 +224,8 @@ std::span<const int> load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_
         std::mt19937 rng(123);
         text.fill_random(0, text.bytes(), OD_TRAIN_BUF_TOK, rng, od_buf);
     }
-    if (od_buf.size() > static_cast<std::size_t>(SEQ_LEN) + 2) return od_buf;
+    if (od_buf.size() > static_cast<std::size_t>(SEQ_LEN) + 2)
+        return sub0::TokView::over_int32(od_buf.data(), od_buf.size());   // on-demand int32 buffer as a TokView
 
     sub0::log::error("{}: no usable corpus.tok ('{}') and cannot tokenize the raw corpus '{}'",
                  tool, sub0::default_corpus_tok(), sub0::default_corpus());
@@ -235,7 +236,7 @@ std::span<const int> load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_
 // Mean cross-entropy per token over a fixed, evenly-spaced set of windows in the
 // held-out tail. Fixed windows make the metric comparable across evals (so the
 // plateau sign test sees signal, not resampling noise) and bound the cost.
-double evaluate(std::span<const int> data, std::size_t val_start) {
+double evaluate(sub0::TokView data, std::size_t val_start) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
     const std::size_t span = last - val_start;
@@ -243,12 +244,14 @@ double evaluate(std::span<const int> data, std::size_t val_start) {
     const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
     const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
     double total = 0.0;
+    int win[SEQ_LEN + 1];                                   // materialize the window (token view may be uint16-packed)
     for (int w = 0; w < nw; ++w) {
         std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
         if (s > last) s = last;
+        data.copy_to(s, SEQ_LEN + 1, win);
         sub0::graph_reset();
-        sub0::Node* logits = sub0::forward(data.data() + s, SEQ_LEN);
-        sub0::Node* loss   = sub0::cross_entropy(logits, data.data() + s + 1);
+        sub0::Node* logits = sub0::forward(win, SEQ_LEN);
+        sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
         total += loss->data[0];
     }
     sub0::graph_reset();
@@ -261,7 +264,7 @@ double evaluate(std::span<const int> data, std::size_t val_start) {
 // the model's sampling entropy to its reading entropy. Unlike cross-entropy (inflated by
 // model error -> perplexity 5.17 here), entropy compares the model to ITSELF, so the
 // matched temperature is not biased upward by an imperfect fit and centers near 1.
-double mean_entropy(std::span<const int> data, std::size_t val_start) {
+double mean_entropy(sub0::TokView data, std::size_t val_start) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
     const std::size_t span = last - val_start;
@@ -269,11 +272,13 @@ double mean_entropy(std::span<const int> data, std::size_t val_start) {
     const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
     const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
     double total = 0.0; long n = 0;
+    int win[SEQ_LEN + 1];                                   // materialize the window (token view may be uint16-packed)
     for (int w = 0; w < nw; ++w) {
         std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
         if (s > last) s = last;
+        data.copy_to(s, SEQ_LEN, win);
         sub0::graph_reset();
-        sub0::Node* logits = sub0::forward(data.data() + s, SEQ_LEN);
+        sub0::Node* logits = sub0::forward(win, SEQ_LEN);
         for (int r = 0; r < logits->rows; ++r) {
             const float* row = logits->data.data() + static_cast<std::size_t>(r) * VOCAB;
             float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
@@ -539,17 +544,17 @@ struct GpuTrainer {
     // (a short document) fills its leading `lengths[b]` rows and PADS the rest, with the trailing
     // positions loss-masked on the device via the same `lengths` array -- so no document is dropped
     // and the padding contributes no gradient (causal attention keeps it out of the real tokens).
-    float step([[maybe_unused]] std::span<const int> data, [[maybe_unused]] const std::size_t* starts,
+    float step([[maybe_unused]] sub0::TokView data, [[maybe_unused]] const std::size_t* starts,
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
                [[maybe_unused]] int T, [[maybe_unused]] float lr) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
-            const int* w   = data.data() + starts[b];
+            const std::size_t w = starts[b];               // window base into the token view (width-agnostic)
             const int  len = lengths ? lengths[b] : T;
             int s = 0;
             for (; s < len; ++s) {
-                ids[static_cast<std::size_t>(b) * T + s]     = w[s];
-                targets[static_cast<std::size_t>(b) * T + s] = w[s + 1];
+                ids[static_cast<std::size_t>(b) * T + s]     = data[w + static_cast<std::size_t>(s)];
+                targets[static_cast<std::size_t>(b) * T + s] = data[w + static_cast<std::size_t>(s) + 1];
             }
             for (; s < T; ++s) {                       // pad the tail of a short window (loss-masked)
                 ids[static_cast<std::size_t>(b) * T + s]     = 0;
@@ -608,8 +613,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::TokMap tok(tok_path);
     const bool on_demand = !tok.ok();
 
-    std::span<const int> train_span, val_span;
-    std::span<const std::uint32_t> doc_index;  // document-start token indices (empty => flat sampling)
+    sub0::TokView train_span, val_span;
+    std::span<const std::uint64_t> doc_index;  // document-start token indices (empty => flat sampling)
     std::vector<int> train_buf, val_buf;       // on-demand backing storage
     TextCorpus text;                           // on-demand raw-corpus reader
     std::mt19937 buf_rng;                      // separate stream: refilling never perturbs `rng`
@@ -628,7 +633,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                          tok_path, tok.vocab(), VOCAB);
             return 1;
         }
-        const std::span<const int> data = tok.tokens();
+        const sub0::TokView data = tok.tokens();
         const std::size_t min_tokens = 2 * (static_cast<std::size_t>(SEQ_LEN) + 2);
         if (data.size() < min_tokens) {
             sub0::log::error("train: '{}' has only {} tokens, too few for seq_len {} (need >= {})",
@@ -677,8 +682,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                          raw, need);
             return 1;
         }
-        train_span = train_buf;
-        val_span   = val_buf;
+        train_span = sub0::TokView::over_int32(train_buf.data(), train_buf.size());
+        val_span   = sub0::TokView::over_int32(val_buf.data(), val_buf.size());
         // Estimate tokens/byte from one region to size the epoch schedule (heuristic only).
         std::vector<int> probe; text.encode_region(0, probe);
         const double tpb = probe.empty() ? 0.5 : static_cast<double>(probe.size()) / static_cast<double>(OD_REGION_BYTES);
@@ -785,6 +790,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::vector<size_t> starts(batch);
     std::vector<int>    win_len(batch);   // per-window trained length (< seq_t for short documents)
+    std::vector<int>    cpu_win;          // CPU path: materialized window tokens (view may be uint16-packed)
+    std::vector<size_t> cpu_starts(batch);
     long steps_since_refresh = 0;
 
     using clock = std::chrono::steady_clock;
@@ -811,7 +818,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         if (on_demand && steps_since_refresh >= eval_every) {
             buf_rng.seed(static_cast<std::uint32_t>(seed) ^ (0x9E3779B9u * static_cast<std::uint32_t>(++refresh_n)));
             text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
-            train_span = train_buf;
+            train_span = sub0::TokView::over_int32(train_buf.data(), train_buf.size());
             steps_since_refresh = 0;
         }
         ++steps_since_refresh;
@@ -832,7 +839,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW update
-            step_loss = sub0::train_batch(train_span.data(), starts.data(), batch, seq_t, win_len.data());
+            cpu_win.resize(static_cast<std::size_t>(batch) * (seq_t + 1));   // materialize windows for the CPU engine
+            for (int b = 0; b < batch; ++b) {
+                train_span.copy_to(starts[b], static_cast<std::size_t>(win_len[b]) + 1,
+                                   &cpu_win[static_cast<std::size_t>(b) * (seq_t + 1)]);
+                cpu_starts[b] = static_cast<std::size_t>(b) * (seq_t + 1);
+            }
+            step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch, seq_t, win_len.data());
             opt.step();
         }
         run_loss += step_loss; ++run_n;
@@ -951,7 +964,7 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
 
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
-    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "bench");
+    const sub0::TokView data = load_corpus_tokens(tok, od_buf, "bench");
     if (data.empty()) return 1;
     sub0::build_model();
     sub0::AdamW opt(0.001f);
@@ -962,10 +975,12 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
     fwd.reserve(iters); bwd.reserve(iters); optc.reserve(iters); step.reserve(iters);
 
     const int warmup = std::max(5, iters / 10);
+    int win[SEQ_LEN + 1];                                   // materialize the window (token view may be uint16-packed)
     for (int it = -warmup; it < iters; ++it) {
         const size_t s = startd(rng);
-        const int* x = data.data() + s;
-        const int* y = data.data() + s + 1;
+        data.copy_to(s, SEQ_LEN + 1, win);
+        const int* x = win;
+        const int* y = win + 1;
 
         opt.zero_grad();
         const std::uint64_t s0 = cpu_cycles();
@@ -992,7 +1007,7 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
     const auto t0 = std::chrono::steady_clock::now();
     const std::uint64_t c0 = cpu_cycles();
     constexpr int CAL = 2000;
-    for (int i = 0; i < CAL; ++i) { sub0::graph_reset(); (void)sub0::forward(data.data() + startd(rng), SEQ_LEN); }
+    for (int i = 0; i < CAL; ++i) { data.copy_to(startd(rng), SEQ_LEN, win); sub0::graph_reset(); (void)sub0::forward(win, SEQ_LEN); }
     const std::uint64_t c1 = cpu_cycles();
     const double cal_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const double tsc_ghz = cal_s > 0 ? static_cast<double>(c1 - c0) / cal_s / 1e9 : 0.0;
@@ -1031,14 +1046,19 @@ extern "C" SUB0_API int sub0_bench_stage(int iters, int threads, int windows_per
         const int WINDOWS_PER_THREAD = windows_per_thread > 0 ? windows_per_thread : 4;
         const int active = threads > 0 ? threads : 1;
         const int B = active * WINDOWS_PER_THREAD;
-        std::vector<std::size_t> starts(static_cast<size_t>(B));
+        std::vector<std::size_t> starts(static_cast<size_t>(B)), mstarts(static_cast<size_t>(B));
+        std::vector<int> mbuf(static_cast<size_t>(B) * (SEQ_LEN + 1));   // materialized windows (uint16-packed view)
         std::vector<std::uint64_t> batch_cyc;
         const int bwarm = 3, biters = std::max(20, iters / 4);
         batch_cyc.reserve(static_cast<size_t>(biters));
         for (int it = -bwarm; it < biters; ++it) {
-            for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);
+            for (int b = 0; b < B; ++b) {
+                starts[static_cast<size_t>(b)] = startd(rng);
+                data.copy_to(starts[static_cast<size_t>(b)], SEQ_LEN + 1, &mbuf[static_cast<size_t>(b) * (SEQ_LEN + 1)]);
+                mstarts[static_cast<size_t>(b)] = static_cast<size_t>(b) * (SEQ_LEN + 1);
+            }
             const std::uint64_t b0 = cpu_cycles();
-            sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
+            sub0::train_batch(mbuf.data(), mstarts.data(), B, SEQ_LEN);
             const std::uint64_t b1 = cpu_cycles();
             if (it >= 0) batch_cyc.push_back(b1 - b0);
         }
@@ -1077,7 +1097,7 @@ namespace {
 // Random run-to-run noise is handled upstream by the search's median-of-samples confirmation.
 struct DpMeasure { double window_per_s = 0.0; double profile_ms = 0.0; int steps = 0; };
 
-DpMeasure measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
+DpMeasure measure_dp_throughput(sub0::TokView data, std::mt19937& rng,
                                 int threads, int windows_per_thread, double budget_ms) {
 #if defined(_OPENMP)
     omp_set_num_threads(threads > 0 ? threads : 1);
@@ -1085,11 +1105,16 @@ DpMeasure measure_dp_throughput(std::span<const int> data, std::mt19937& rng,
     const int active = threads > 0 ? threads : 1;
     const int B = active * std::max(1, windows_per_thread);
     std::uniform_int_distribution<size_t> startd(0, data.size() - SEQ_LEN - 2);
-    std::vector<std::size_t> starts(static_cast<size_t>(B));
+    std::vector<std::size_t> starts(static_cast<size_t>(B)), mstarts(static_cast<size_t>(B));
+    std::vector<int> mbuf(static_cast<size_t>(B) * (SEQ_LEN + 1));   // materialized windows (uint16-packed view)
 
     auto one_step = [&] {
-        for (int b = 0; b < B; ++b) starts[static_cast<size_t>(b)] = startd(rng);
-        sub0::train_batch(data.data(), starts.data(), B, SEQ_LEN);
+        for (int b = 0; b < B; ++b) {
+            starts[static_cast<size_t>(b)] = startd(rng);
+            data.copy_to(starts[static_cast<size_t>(b)], SEQ_LEN + 1, &mbuf[static_cast<size_t>(b) * (SEQ_LEN + 1)]);
+            mstarts[static_cast<size_t>(b)] = static_cast<size_t>(b) * (SEQ_LEN + 1);
+        }
+        sub0::train_batch(mbuf.data(), mstarts.data(), B, SEQ_LEN);
     };
     auto run_timed = [&](int n) -> double {
         const auto t0 = std::chrono::steady_clock::now();
@@ -1150,7 +1175,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
 
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
-    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "tune");
+    const sub0::TokView data = load_corpus_tokens(tok, od_buf, "tune");
     if (data.empty()) return 1;
     sub0::build_model();
     std::mt19937 rng(123);
@@ -1484,7 +1509,7 @@ struct GenStats { double ppl = 0.0; double rep4 = 0.0; };
 // common random numbers across temperatures, so the perplexity-vs-temperature curve is
 // smooth enough to bisect cleanly. Sampling uses temperature+top-k (the real gen path);
 // scoring uses the full T=1 softmax so the number is comparable to real-text perplexity.
-GenStats gen_self_stats(std::span<const int> data, std::size_t val_start,
+GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
                         float temp, int topk, int n_seeds, int gen_len, unsigned cr_seed) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     const std::size_t span = (last > val_start) ? last - val_start : 0;
@@ -1497,8 +1522,8 @@ GenStats gen_self_stats(std::span<const int> data, std::size_t val_start,
         std::size_t s = val_start +
             (n_seeds > 1 ? static_cast<std::size_t>(k) * span / static_cast<std::size_t>(n_seeds - 1) : 0);
         if (s > last) s = last;
-        std::vector<int> ctx(data.begin() + static_cast<std::ptrdiff_t>(s),
-                             data.begin() + static_cast<std::ptrdiff_t>(s) + prefix_len);
+        std::vector<int> ctx(static_cast<std::size_t>(prefix_len));   // materialize the seed prefix (uint16-packed view)
+        data.copy_to(s, static_cast<std::size_t>(prefix_len), ctx.data());
         gen.clear();
         for (int g = 0; g < gen_len; ++g) {
             const int T = std::min(static_cast<int>(ctx.size()), SEQ_LEN);
@@ -1527,17 +1552,19 @@ GenStats gen_self_stats(std::span<const int> data, std::size_t val_start,
 // the same number of equal-length windows spread across the held-out tail. Measuring
 // real text over one long contiguous span instead would inflate it (names/phrases recur
 // across many sentences), making the gen-vs-real comparison apples-to-oranges.
-double real_windowed_repeat(std::span<const int> data, std::size_t val_start,
+double real_windowed_repeat(sub0::TokView data, std::size_t val_start,
                             int n_seeds, int win) {
     if (data.size() <= static_cast<std::size_t>(win) + 1) return 0.0;
     const std::size_t last = data.size() - 1 - static_cast<std::size_t>(win);
     const std::size_t span = (last > val_start) ? last - val_start : 0;
     double sum = 0.0;
+    std::vector<int> wbuf(static_cast<std::size_t>(win));           // materialize the window (uint16-packed view)
     for (int k = 0; k < n_seeds; ++k) {
         std::size_t s = val_start +
             (n_seeds > 1 ? static_cast<std::size_t>(k) * span / static_cast<std::size_t>(n_seeds - 1) : 0);
         if (s > last) s = last;
-        sum += ngram_repeat(data.data() + s, win);
+        data.copy_to(s, static_cast<std::size_t>(win), wbuf.data());
+        sum += ngram_repeat(wbuf.data(), win);
     }
     return n_seeds > 0 ? sum / static_cast<double>(n_seeds) : 0.0;
 }
@@ -1550,7 +1577,7 @@ using sub0::coherence::interp_cross;
 extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose) {
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
-    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "autotemp");
+    const sub0::TokView data = load_corpus_tokens(tok, od_buf, "autotemp");
     if (data.empty()) return 1;
 
     sub0::build_model();
@@ -1705,7 +1732,7 @@ const char* verdict_word(int level) {   // 0 ok, 1 could, 2 should, 3 must
 extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
-    const std::span<const int> data = load_corpus_tokens(tok, od_buf, "report");
+    const sub0::TokView data = load_corpus_tokens(tok, od_buf, "report");
     if (data.empty()) return 1;
     sub0::build_model();
 
@@ -1724,8 +1751,8 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         static_cast<std::size_t>(SEQ_LEN) + 2,
         static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
     const std::size_t val_start = data.size() - val_tokens;
-    const std::span<const int> train_span = data.first(val_start);
-    const std::span<const int> val_span   = data.subspan(val_start);
+    const sub0::TokView train_span = data.first(val_start);
+    const sub0::TokView val_span   = data.subspan(val_start);
 
     const long long params       = static_cast<long long>(sub0::trainable_floats());
     const int       head_dim     = D_MODEL / N_HEADS;
