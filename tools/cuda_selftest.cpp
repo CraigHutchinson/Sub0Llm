@@ -13,6 +13,7 @@ extern "C" int sub0_cuda_selftest();
 extern "C" int sub0_cuda_benchmark(int batch, int T, int iters);
 extern "C" int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
 extern "C" int sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
+extern "C" int sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 
 // Any argument -> "bench only": skip the host-reference grad/AdamW parity check (a slow plain-C++
 // reference pass, impractical at large model dims) so this is a fast kernel driver at the training
@@ -30,13 +31,16 @@ int main(int argc, char** argv) {
     // `attn` mode: naive-vs-tiled flash-attention forward parity + speedup at the training config
     // (fast: attention kernels only, no full step). The device correctness/regression guard.
     if (argc > 1 && std::strcmp(argv[1], "attn") == 0) {
-        return sub0_cuda_attn_check(184, 256, 50, nullptr, nullptr);
+        const int rf = sub0_cuda_attn_check(184, 256, 50, nullptr, nullptr);
+        const int rb = sub0_cuda_attn_bwd_check(184, 256, 30, nullptr, nullptr);
+        return rf ? rf : rb;
     }
     if (argc <= 1) {
         const int rc = sub0_cuda_selftest();
         if (rc != 0) return rc;
     }
-    sub0_cuda_attn_check(184, 256, 50, nullptr, nullptr);   // flash-attn forward parity + speedup
+    sub0_cuda_attn_check(184, 256, 50, nullptr, nullptr);       // flash-attn forward parity + speedup
+    sub0_cuda_attn_bwd_check(184, 256, 30, nullptr, nullptr);   // flash-attn backward parity + speedup
     sub0_cuda_benchmark(1, 64, 2000);    // generation-scale (small M): launch-bound -> graph wins
     sub0_cuda_benchmark(64, 64, 100);    // training-scale (large M): compute-bound
     sub0_cuda_benchmark(184, 256, 40);   // the actual fineweb training config (batch 184, T 256): FP32 vs TF32

@@ -35,6 +35,7 @@ extern "C" int  sub0_cuda_train_benchmark(int batch, int T, int iters, double* o
 extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
                                         double* fwd_ms, double* bwd_ms, double* adam_ms);
 extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
+extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -279,6 +280,21 @@ TEST_CASE("CUDA flash-attention forward matches the naive kernel and is faster",
     REQUIRE(rc == 0);              // returns nonzero only on a parity failure
     REQUIRE(reldiff < 5e-2);       // tiled == naive to bf16 rounding
     REQUIRE(speedup > 2.0);        // tiling intact (regression guard; observed ~8.5x at d448)
+    sub0_cuda_shutdown();
+}
+
+// Flash attention BACKWARD guard. Correctness is gated tightly by the CPU-fp32 gradient tests above;
+// this is a speed + gross-sanity guard. The naive reference accumulates dq/dk/dv in bf16, so it
+// carries ~sqrt(T)*bf16_eps accumulation noise the FP32-accumulating tiled kernels do not -- hence the
+// looser (0.15) parity bound here vs the bit-exact forward. The dimensionless speedup ratio is the
+// stable regression signal (huge: the naive backward is low-parallelism, ~45x slower at d448).
+TEST_CASE("CUDA flash-attention backward matches the naive kernel and is much faster", "[cuda]") {
+    double reldiff = 1.0, speedup = 0.0;
+    const int rc = sub0_cuda_attn_bwd_check(128, SEQ_LEN, 30, &reldiff, &speedup);
+    WARN("flash attn backward: max rel diff = " << reldiff << "   speedup = " << speedup << "x");
+    REQUIRE(rc == 0);              // returns nonzero only on a gross parity failure
+    REQUIRE(reldiff < 1.5e-1);     // within bf16-accumulation noise of the naive reference
+    REQUIRE(speedup > 3.0);        // tiling + parallelism intact (observed ~45x at d448)
     sub0_cuda_shutdown();
 }
 

@@ -583,6 +583,184 @@ __global__ void attn_backward_query_act_kernel(const A* __restrict__ q, const A*
         for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); atomicAdd_act(&dkj[a], ds * to_f32(qi[a])); } }
 }
 
+// ---- Flash-style TILED attention BACKWARD (the hot-path replacement for the two naive kernels) ----
+// The naive kernels above are either low-parallelism (head-per-thread: only batch*H threads) or
+// atomic-heavy (query-per-thread: bf16 RMW races), and both re-stream K/V/Q from global O(T) times.
+// This mirrors the FlashAttention backward: THREE atomic-free kernels, each parallel over the full
+// (b,h,T) grid and staging the contracted dimension through shared memory. Per-query softmax stats
+// (m_i, 1/Z_i, dot_i = <dout_i, out_i>) are precomputed once, then dq is accumulated query-parallel
+// (owned per query -> no atomics) and dk/dv key-parallel (owned per key -> no atomics). Uses the SAVED
+// attention output `att` for dot_i (= out_i), so no value re-accumulation is needed to get it. The
+// arithmetic matches the naive backward to bf16 rounding (gated on device by sub0_cuda_attn_check).
+// The flat per-(b,h,i) stats index is ((b*H)+h)*T + i (H = gridDim.y).
+
+// (1) Per-query stats: m_i (max scaled score), 1/Z_i, and dot_i = sum_{j<=i} p_ij <dout_i, v_j>
+//     ( = <dout_i, out_i> ). Two tiled key-passes: pass A gets m/Z from shared K; pass B gets dot in
+//     FP32 from shared K+V (recomputed p). Computing dot in fp32 -- rather than from the bf16-rounded
+//     saved output -- keeps ds = p*(dp - dot) matching the naive backward through near-cancellation.
+template <class A, int HD, int TILE_K>
+__global__ void __launch_bounds__(kAttnTileQ)
+attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
+                      const A* __restrict__ dout, float* __restrict__ stat_m, float* __restrict__ stat_invZ,
+                      float* __restrict__ stat_dot, int T, int C, int in_stride) {
+    __shared__ float Ks[TILE_K * HD];
+    __shared__ float Vs[TILE_K * HD];
+    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    q0 = blockIdx.x * blockDim.x, i = q0 + threadIdx.x;
+    const int    off = h * HD;
+    const float  scale    = rsqrtf(static_cast<float>(HD));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+    float qr[HD], dr[HD];
+    if (i < T) {
+        const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+        const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) { qr[a] = to_f32(qi[a]); dr[a] = to_f32(di[a]); }
+    }
+    const int jmax = min(T, q0 + static_cast<int>(blockDim.x));
+    float m = -1e30f, Z = 0.f;
+    for (int j0 = 0; j0 < jmax; j0 += TILE_K) {                        // pass A: m, Z (shared K)
+        const int tk = min(TILE_K, jmax - j0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
+            const int jl = e / HD, a = e - jl * HD;
+            Ks[e] = to_f32(k[in_base + static_cast<size_t>(j0 + jl) * in_stride + off + a]); }
+        __syncthreads();
+        if (i < T) { const int jend = min(tk, i - j0 + 1);
+            for (int jl = 0; jl < jend; ++jl) { const float* ks = Ks + jl * HD;
+                float s = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) s += qr[a] * ks[a];
+                s *= scale;
+                const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn; } }
+    }
+    const float invZ = (i < T) ? 1.f / Z : 0.f;
+    float dot = 0.f;
+    for (int j0 = 0; j0 < jmax; j0 += TILE_K) {                        // pass B: dot = sum p_ij <dout_i, v_j>
+        const int tk = min(TILE_K, jmax - j0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
+            const int jl = e / HD, a = e - jl * HD;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            Ks[e] = to_f32(k[row + a]); Vs[e] = to_f32(v[row + a]); }
+        __syncthreads();
+        if (i < T) { const int jend = min(tk, i - j0 + 1);
+            for (int jl = 0; jl < jend; ++jl) { const float* ks = Ks + jl * HD; const float* vs = Vs + jl * HD;
+                float s = 0.f, dp = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) { s += qr[a] * ks[a]; dp += dr[a] * vs[a]; }
+                dot += __expf(s * scale - m) * invZ * dp; } }
+    }
+    if (i < T) {
+        const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + i;
+        stat_m[sidx] = m; stat_invZ[sidx] = invZ; stat_dot[sidx] = dot;
+    }
+}
+
+// (2) dq (query-parallel, tiled over keys): dq_i = sum_{j<=i} ds_ij k_j, owned per query (no atomics).
+template <class A, int HD, int TILE_K>
+__global__ void __launch_bounds__(kAttnTileQ)
+attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
+                   const A* __restrict__ dout, const float* __restrict__ stat_m,
+                   const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
+                   A* __restrict__ dq, int T, int C, int in_stride) {
+    __shared__ float Ks[TILE_K * HD];
+    __shared__ float Vs[TILE_K * HD];
+    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    q0 = blockIdx.x * blockDim.x, i = q0 + threadIdx.x;
+    const int    off = h * HD;
+    const float  scale    = rsqrtf(static_cast<float>(HD));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+    float qr[HD], dr[HD], dqa[HD];
+    float mi = 0.f, invZi = 0.f, doti = 0.f;
+    if (i < T) {
+        const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+        const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) { qr[a] = to_f32(qi[a]); dr[a] = to_f32(di[a]); dqa[a] = 0.f; }
+        const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + i;
+        mi = stat_m[sidx]; invZi = stat_invZ[sidx]; doti = stat_dot[sidx];
+    }
+    const int jmax = min(T, q0 + static_cast<int>(blockDim.x));
+    for (int j0 = 0; j0 < jmax; j0 += TILE_K) {
+        const int tk = min(TILE_K, jmax - j0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
+            const int jl = e / HD, a = e - jl * HD;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            Ks[e] = to_f32(k[row + a]); Vs[e] = to_f32(v[row + a]); }
+        __syncthreads();
+        if (i < T) { const int jend = min(tk, i - j0 + 1);
+            for (int jl = 0; jl < jend; ++jl) { const float* ks = Ks + jl * HD; const float* vs = Vs + jl * HD;
+                float s = 0.f, dp = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) { s += qr[a] * ks[a]; dp += dr[a] * vs[a]; }
+                const float p = __expf(s * scale - mi) * invZi, ds = p * (dp - doti) * scale;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) dqa[a] += ds * ks[a]; } }
+    }
+    if (i < T) { A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) st_act(&dqi[a], dqa[a]); }
+}
+
+// (3) dk/dv (key-parallel, tiled over queries): dv_j = sum_{i>=j} p_ij dout_i, dk_j = sum_{i>=j}
+//     ds_ij q_i, both owned per key (no atomics). Stages the query tile (q, dout, stats) to shared.
+template <class A, int HD, int TILE_Q>
+__global__ void __launch_bounds__(kAttnTileQ)
+attn_bwd_dkv_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
+                    const A* __restrict__ dout, const float* __restrict__ stat_m,
+                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
+                    A* __restrict__ dk, A* __restrict__ dv, int T, int C, int in_stride) {
+    __shared__ float Qs[TILE_Q * HD];
+    __shared__ float Ds[TILE_Q * HD];
+    __shared__ float Sm[TILE_Q], Sz[TILE_Q], Sd[TILE_Q];
+    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    k0 = blockIdx.x * blockDim.x, j = k0 + threadIdx.x;      // this thread's KEY
+    const int    off = h * HD;
+    const float  scale    = rsqrtf(static_cast<float>(HD));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+    float kr[HD], vr[HD], dka[HD], dva[HD];
+    if (j < T) {
+        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; dva[a] = 0.f; }
+    }
+    for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
+        const int ti = min(TILE_Q, T - i0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
+            const int il = e / HD, a = e - il * HD;
+            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + off + a]);
+            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + off + a]); }
+        for (int il = threadIdx.x; il < ti; il += blockDim.x) {
+            const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + (i0 + il);
+            Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; Sd[il] = stat_dot[sidx]; }
+        __syncthreads();
+        if (j < T) {
+            for (int il = 0; il < ti; ++il) { const int i = i0 + il;
+                if (i < j) continue;                                     // causal: key j only seen by i >= j
+                const float* qs = Qs + il * HD; const float* dsr = Ds + il * HD;
+                float s = 0.f, dp = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
+                const float p = __expf(s * scale - Sm[il]) * Sz[il], dsc = p * (dp - Sd[il]) * scale;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) { dva[a] += p * dsr[a]; dka[a] += dsc * qs[a]; } }
+        }
+    }
+    if (j < T) {
+        A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
+        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) { st_act(&dkj[a], dka[a]); st_act(&dvj[a], dva[a]); }
+    }
+}
+
 // Embedding backward (op_embed x2): scatter-add the residual-stream grad into tok_emb / pos_emb
 // rows. Multiple rows map to the same token/position, so accumulation is atomic. One thread per
 // (row m, channel j). pos = m % T (position within the window).
@@ -835,18 +1013,43 @@ template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, con
     const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
     attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
+
+// Per-query softmax-stats scratch for the flash backward (m_i, 1/Z_i, dot_i), each batch*H*T floats.
+// Grown on demand (like the fwd/train scratch) and reused across steps; freed in train_free().
+float* g_bwd_m = nullptr; float* g_bwd_invZ = nullptr; float* g_bwd_dot = nullptr;
+size_t g_bwd_stats_cap = 0;
+inline int ensure_bwd_stats(size_t n) {
+    if (n <= g_bwd_stats_cap) return 0;
+    if (g_bwd_m)    cudaFree(g_bwd_m);
+    if (g_bwd_invZ) cudaFree(g_bwd_invZ);
+    if (g_bwd_dot)  cudaFree(g_bwd_dot);
+    g_bwd_stats_cap = 0;
+    if (cudaMalloc(&g_bwd_m,    n * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&g_bwd_invZ, n * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&g_bwd_dot,  n * sizeof(float)) != cudaSuccess) return 1;
+    g_bwd_stats_cap = n;
+    return 0;
+}
+inline void free_bwd_stats() {
+    if (g_bwd_m)    cudaFree(g_bwd_m);
+    if (g_bwd_invZ) cudaFree(g_bwd_invZ);
+    if (g_bwd_dot)  cudaFree(g_bwd_dot);
+    g_bwd_m = g_bwd_invZ = g_bwd_dot = nullptr; g_bwd_stats_cap = 0;
+}
+
+// Flash attention backward: stats -> dq (query-parallel) -> dk/dv (key-parallel), all atomic-free.
+// dqkv need NOT be pre-zeroed (each dq_i / dk_j / dv_j is written exactly once, in full).
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
-    const int block = 64;
-    if (AttnBwdPerQuery::get()) {
-        const int total = batch * H * T;
-        attn_backward_query_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(
-            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
-    } else {
-        const int total = batch * H;
-        attn_backward_head_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(
-            qkv, qkv + C, qkv + 2 * C, dout, dqkv, dqkv + C, dqkv + 2 * C, batch, T, C, H, in_stride);
-    }
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();
+    if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
+    const dim3 block(kAttnTileQ);
+    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    const A* q = qkv; const A* k = qkv + C; const A* v = qkv + 2 * C;
+    A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
+    attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
+    attn_bwd_dq_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
+    attn_bwd_dkv_kernel<A, HD, kAttnTileQ><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, dv, T, C, in_stride);
 }
 
 // Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's
@@ -1030,6 +1233,7 @@ void train_free() {
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
+    free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
     g_tr_cap = 0;
 }
@@ -1296,7 +1500,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
         launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + 5].off, M, C, C);
-        SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dqkv, 0, static_cast<size_t>(M) * 3 * C * sizeof(act_t), g_stream));
+        // flash backward writes each dq/dk/dv exactly once (no atomics), so no pre-zero is needed.
         launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
@@ -1771,6 +1975,97 @@ SUB0_CUDA_API int sub0_cuda_attn_check(int batch, int T, int iters,
     cudaFree(dqf); cudaFree(dqkv); cudaFree(dref); cudaFree(dtes); cudaFree(fref); cudaFree(ftes);
     const bool ok = reldiff < 5e-2;
     std::printf("cuda attn check: batch=%d T=%d HD=%d | naive %.3f ms  tiled %.3f ms = %.1fx | "
+                "max rel diff %.2e  %s\n", batch, T, HD, naive_ms, tiled_ms, speedup, reldiff, ok ? "OK" : "FAIL");
+    if (out_maxreldiff) *out_maxreldiff = reldiff;
+    if (out_speedup)    *out_speedup    = speedup;
+    return ok ? 0 : 2;
+}
+
+// On-device correctness + speed guard for the flash attention BACKWARD (the three atomic-free tiled
+// kernels vs the naive head-per-thread reference, which is itself atomic-free and CPU-grad-gated).
+// Runs both on the same random q/k/v/dout at the training config, compares the full dq|dk|dv grad
+// buffer (must agree to bf16 rounding -- the tiled path takes dot_i from the bf16-rounded saved
+// output, so it is not bit-exact but very close), and reports a dimensionless speedup RATIO (the
+// stable regression guard). Returns nonzero only on a PARITY failure.
+SUB0_CUDA_API int sub0_cuda_attn_bwd_check(int batch, int T, int iters,
+                                           double* out_maxreldiff, double* out_speedup) {
+    if (T < 1 || T > SEQ_LEN) return 1;
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    if (iters < 1) iters = 30;
+    if (sub0_cuda_init()) return 1;
+    const int    C = D_MODEL, H = N_HEADS, M = batch * T;
+    const size_t nqkv = static_cast<size_t>(M) * 3 * C, natt = static_cast<size_t>(M) * C;
+    constexpr int HD = D_HEAD;
+
+    std::vector<float> h(nqkv);                                         // random q/k/v
+    unsigned s = 0x85ebca6bu;
+    for (size_t i = 0; i < nqkv; ++i) { s = s * 1664525u + 1013904223u; h[i] = static_cast<float>(s >> 8) / 8388608.0f - 1.0f; }
+    std::vector<float> hd(natt);                                        // random dout
+    for (size_t i = 0; i < natt; ++i) { s = s * 1664525u + 1013904223u; hd[i] = static_cast<float>(s >> 8) / 8388608.0f - 1.0f; }
+
+    float* dqf = nullptr; float* ddf = nullptr; act_t* dqkv = nullptr; act_t* ddout = nullptr;
+    act_t* dref = nullptr; act_t* dtes = nullptr; float* fref = nullptr; float* ftes = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dqf,  nqkv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ddf,  natt * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dqkv, nqkv * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ddout, natt * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dref, nqkv * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dtes, nqkv * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&fref, nqkv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ftes, nqkv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dqf, h.data(),  nqkv * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(ddf, hd.data(), natt * sizeof(float), cudaMemcpyHostToDevice));
+    { const int bk = 256;
+      f32_to_act_kernel<<<static_cast<int>((nqkv + bk - 1) / bk), bk, 0, g_stream>>>(dqf, dqkv, static_cast<int>(nqkv));
+      f32_to_act_kernel<<<static_cast<int>((natt + bk - 1) / bk), bk, 0, g_stream>>>(ddf, ddout, static_cast<int>(natt)); }
+
+    auto run_naive = [&] {                                             // atomic-free head-per-thread reference
+        cudaMemsetAsync(dref, 0, nqkv * sizeof(act_t), g_stream);      // it accumulates with +=
+        const int blk = 64, total = batch * H;
+        attn_backward_head_act_kernel<act_t><<<(total + blk - 1) / blk, blk, 0, g_stream>>>(
+            dqkv, dqkv + C, dqkv + 2 * C, ddout, dref, dref + C, dref + 2 * C, batch, T, C, H, 3 * C);
+    };
+    auto run_tiled = [&] { launch_attn_bwd_t<act_t>(dqkv, ddout, dtes, batch, T, C, H, 3 * C); };
+    run_naive(); run_tiled();
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    { const int bk = 256, n = static_cast<int>(nqkv);
+      act_to_f32_kernel<<<(n + bk - 1) / bk, bk, 0, g_stream>>>(dref, fref, n);
+      act_to_f32_kernel<<<(n + bk - 1) / bk, bk, 0, g_stream>>>(dtes, ftes, n); }
+    std::vector<float> a(nqkv), bvals(nqkv);
+    SUB0_CUDA_CHECK(cudaMemcpy(a.data(),     fref, nqkv * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(bvals.data(), ftes, nqkv * sizeof(float), cudaMemcpyDeviceToHost));
+    double maxabs = 0.0, maxmag = 1e-30;
+    for (size_t i = 0; i < nqkv; ++i) {
+        const double d = std::fabs(static_cast<double>(a[i]) - bvals[i]), mg = std::fabs(static_cast<double>(a[i]));
+        if (d > maxabs) maxabs = d;
+        if (mg > maxmag) maxmag = mg;
+    }
+    const double reldiff = maxabs / maxmag;
+
+    auto timed = [&](auto&& fn) -> double {
+        for (int w = 0; w < 5; ++w) fn();
+        cudaStreamSynchronize(g_stream);
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventRecord(e0, g_stream);
+        for (int it = 0; it < iters; ++it) fn();
+        cudaEventRecord(e1, g_stream); cudaEventSynchronize(e1);
+        float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1); cudaEventDestroy(e0); cudaEventDestroy(e1);
+        return static_cast<double>(ms) / iters;
+    };
+    const double naive_ms = timed(run_naive), tiled_ms = timed(run_tiled);
+    const double speedup  = tiled_ms > 0.0 ? naive_ms / tiled_ms : 0.0;
+
+    cudaFree(dqf); cudaFree(ddf); cudaFree(dqkv); cudaFree(ddout);
+    cudaFree(dref); cudaFree(dtes); cudaFree(fref); cudaFree(ftes);
+    // NOTE: the naive reference ACCUMULATES dq/dk/dv in bf16 (read-modify-write per step), so it
+    // carries ~sqrt(T)*bf16_eps (~6% at T=256) of accumulation noise; the tiled kernels accumulate
+    // in FP32 and round once, so they are the MORE accurate of the two. This coarse gate only catches
+    // gross breakage -- the tight correctness gate is the CPU-fp32 gradient parity test (cuda_tests).
+    const bool ok = reldiff < 1.5e-1;
+    std::printf("cuda attn-bwd check: batch=%d T=%d HD=%d | naive %.3f ms  tiled %.3f ms = %.1fx | "
                 "max rel diff %.2e  %s\n", batch, T, HD, naive_ms, tiled_ms, speedup, reldiff, ok ? "OK" : "FAIL");
     if (out_maxreldiff) *out_maxreldiff = reldiff;
     if (out_speedup)    *out_speedup    = speedup;
