@@ -349,6 +349,15 @@ __global__ void attn_train_act_kernel(const A* __restrict__ q, const A* __restri
 template <int HD> constexpr int attn_tile_k() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
 constexpr int kAttnTileQ = 64;
 
+// Query-tile size for the dk/dv backward kernel, which stages BOTH q and dout (2*TILE_Q*HD floats,
+// plus 3 per-query stats). At the fixed 64 that overflows the 48 KB static shared-memory limit once
+// HD grows (HD=96 -> 2*64*96*4 + 3*64*4 = 49920 B > 49152): shrink the staged query tile for large HD
+// so it fits, exactly as attn_tile_k does for the key tile. The tile is DECOUPLED from the 64-thread
+// (64-key) block -- the staging loops stride by blockDim.x and the query loop steps by TILE_Q from the
+// key-tile base, so causality and the result are unchanged for any TILE_Q. (Register pressure at large
+// HD is a separate, still-open perf item: 4*HD accumulators spill; a DV/DK split would help.)
+template <int HD> constexpr int attn_tile_q() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
+
 template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(kAttnTileQ)
 attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
@@ -1008,7 +1017,7 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
     A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
     attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
     attn_bwd_dq_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
-    attn_bwd_dkv_kernel<A, HD, kAttnTileQ><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, dv, T, C, in_stride);
+    attn_bwd_dkv_kernel<A, HD, attn_tile_q<HD>()><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, dv, T, C, in_stride);
 }
 
 // Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's

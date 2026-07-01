@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <print>
 #include <random>
 #include <string>
@@ -18,12 +19,21 @@
 extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                         int n, float temp, int topk, unsigned seed) {
     sub0::build_model();                 // establish parameter-node layout
-    if (!sub0::load_model(model_in)) {   // overwrite with trained weights
+    if (!sub0::load_model(model_in)) {   // overwrite with trained weights (also reads the vocab fingerprint)
         std::println(stderr, "gen: cannot load model '{}'", model_in);
         return 1;
     }
-    if (!sub0::load_tokenizer(sub0::default_tokenizer())) {
-        std::println(stderr, "gen: cannot load tokenizer '{}'", sub0::default_tokenizer());
+    // Decode with the vocab this model was TRAINED against, not whatever the build tree currently holds:
+    // prefer the tokenizer.bin bundled beside the model, falling back to the baked default. The
+    // fingerprint guard in load_tokenizer then rejects a mismatch loudly rather than emitting garble.
+    std::string tok_path = sub0::default_tokenizer();
+    if (model_in && *model_in) {
+        const std::filesystem::path bundled = std::filesystem::path(model_in).parent_path() / "tokenizer.bin";
+        std::error_code ec;
+        if (std::filesystem::exists(bundled, ec)) tok_path = bundled.string();
+    }
+    if (!sub0::load_tokenizer(tok_path.c_str())) {
+        std::println(stderr, "gen: cannot load tokenizer '{}'", tok_path);
         return 1;
     }
 

@@ -14,6 +14,7 @@
 #include "sub0/unigram.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -238,6 +239,40 @@ TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip"
 TEST_CASE("JOIN scheme: encode is deterministic", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(sub0::tok::encode(t, "the cat, sat.") == sub0::tok::encode(t, "the cat, sat."));
+}
+
+// The fingerprint is what a trained model stamps to pin its decoder identity. Three properties matter:
+// it is deterministic; it SURVIVES a serialize->deserialize round-trip (the value a saved model carries
+// must equal the value gen recomputes from the reloaded tokenizer.bin, or the guard false-positives);
+// and it is SENSITIVE (a different vocab fingerprints differently, so a mismatch is actually caught).
+TEST_CASE("fingerprint: deterministic + survives a serialize round-trip", "[tok][fingerprint]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::uint64_t fp = sub0::tok::fingerprint(t);
+    REQUIRE(fp != 0);
+    REQUIRE(sub0::tok::fingerprint(t) == fp);                       // deterministic
+
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::istringstream is(os.str(), std::ios::binary);
+    Tokenizer t2;
+    REQUIRE(sub0::tok::deserialize(t2, is));
+    REQUIRE(sub0::tok::fingerprint(t2) == fp);                      // round-trip stable (the guard relies on this)
+}
+
+TEST_CASE("fingerprint: distinguishes a different vocabulary", "[tok][fingerprint]") {
+    const Tokenizer a = sub0::tok::learn(kCorpus);
+    // A different corpus -> a different learned vocab -> a different fingerprint. This is exactly the
+    // reconfigure-for-another-corpus case the model/decoder guard must catch.
+    const std::string other = [] {
+        std::string c;
+        for (int i = 0; i < 50; ++i)
+            c += "machines compute numbers quickly and store results in memory banks .\n"
+                 "The algorithm sorts the array then searches it in logarithmic time .\n"
+                 "PROGRAM output was 42 and the process exited cleanly at last .\n";
+        return c;
+    }();
+    const Tokenizer b = sub0::tok::learn(other);
+    REQUIRE(sub0::tok::fingerprint(a) != sub0::tok::fingerprint(b));
 }
 
 TEST_CASE("JOIN scheme: directional double quotes round-trip + bundle spacing", "[tok][join]") {

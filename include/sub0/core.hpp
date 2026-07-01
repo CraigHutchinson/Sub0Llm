@@ -72,6 +72,9 @@ SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer
 SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.bin
 SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
 SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
+// 64-bit identity fingerprint of the loaded tokenizer (0 if none). save_model stamps this so a
+// model and a mismatched decoder are caught loudly on load instead of detokenizing to garble.
+SUB0_API std::uint64_t tokenizer_fingerprint();
 
 // Sample one token id from a logits row (length VOCAB) with temperature + top-k.
 // Shared by generation and the training preview so both use the same correct sampler.

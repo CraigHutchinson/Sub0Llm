@@ -13,6 +13,7 @@
 #include <limits>
 #include <ostream>
 #include <queue>
+#include <sstream>
 #include <unordered_set>
 
 namespace sub0::tok {
@@ -645,6 +646,15 @@ void serialize(const Tokenizer& t, std::ostream& os) {
         wu16(static_cast<std::uint16_t>(w.size()));
         os.write(w.data(), static_cast<std::streamsize>(w.size()));
     }
+}
+
+std::uint64_t fingerprint(const Tokenizer& t) {
+    std::ostringstream os(std::ios::binary);   // the serialized form IS the identity; hash it
+    serialize(t, os);
+    const std::string s = os.str();
+    std::uint64_t h = 1469598103934665603ull;  // FNV-1a (64-bit) offset basis
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
 }
 
 bool deserialize(Tokenizer& out, std::istream& is) {

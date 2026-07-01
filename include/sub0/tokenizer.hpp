@@ -154,4 +154,12 @@ std::string      detokenize(const Tokenizer& t, const std::vector<int>& ids);
 void serialize(const Tokenizer& t, std::ostream& os);
 bool deserialize(Tokenizer& t, std::istream& is);
 
+// A 64-bit identity fingerprint of a tokenizer: an FNV-1a hash over its serialized bytes, so two
+// tokenizers fingerprint equal IFF they encode/detokenize identically (same base alphabet, merges/
+// pieces and attested set). A trained model stamps this so a decoder that does not match the vocab it
+// was trained against is caught loudly instead of silently emitting garble. Stable across a
+// serialize->deserialize round-trip (the value a saved model carries equals the value a reloaded
+// tokenizer.bin computes), and independent of attested-set iteration order (serialize sorts it).
+std::uint64_t fingerprint(const Tokenizer& t);
+
 }  // namespace sub0::tok

@@ -722,6 +722,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // so a long/background run keeps its own trajectory next to the weights + meta.txt.
     if (!meta_dir.empty()) sub0::log::set_file((meta_dir / "train.log").string());
     sub0::log::line("model dir: {}", model_path);
+    // Bundle the tokenizer.bin this model is trained against INTO the model directory, so the model dir
+    // is a self-contained artifact (model.bin + meta.txt + tokenizer.bin). gen prefers this bundled copy
+    // over the build tree's tokenizer.bin -- which a later `configure` for another corpus would overwrite,
+    // silently mismatching the decoder to the weights (see engine_core's fingerprint guard).
+    if (!meta_dir.empty()) {
+        std::error_code ec;
+        const std::filesystem::path src = sub0::default_tokenizer();
+        const std::filesystem::path dst = meta_dir / "tokenizer.bin";
+        if (std::filesystem::exists(src) && std::filesystem::weakly_canonical(src, ec) !=
+                                            std::filesystem::weakly_canonical(dst, ec)) {
+            std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) sub0::log::warn("could not bundle tokenizer.bin into the model dir: {}", ec.message());
+        }
+    }
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
         sub0::registry::ModelMeta m;
