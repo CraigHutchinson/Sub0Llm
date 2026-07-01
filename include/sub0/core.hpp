@@ -92,6 +92,11 @@ SUB0_API std::vector<TokenEntry> vocab_entries();  // requires load_tokenizer() 
 // --- Forward / loss / backward ---------------------------------------------
 SUB0_API void  graph_reset();                                   // reset arena + node pool
 SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB]
+// Incremental single-token inference (KV-cache): kv_reset() before a generation, then forward_one()
+// per token -> logits [VOCAB]. O(T) per token instead of forward()'s O(T^2). Dense (non-ternary),
+// positions < SEQ_LEN. See src/backend_cpu.cpp.
+SUB0_API void        kv_reset();
+SUB0_API const float* forward_one(int id, int pos);
 SUB0_API Node* cross_entropy(Node* logits, const int* targets); // -> mean loss [1,1]
 SUB0_API void  backward(Node* loss, float seed);                // reverse walk
 SUB0_API void  reduce_gradients();                              // publish single-window grad

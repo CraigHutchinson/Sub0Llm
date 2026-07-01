@@ -146,6 +146,39 @@ TEST_CASE("attention is causal: future tokens cannot change past logits", "[engi
     for (int j = 0; j < VOCAB; ++j) REQUIRE(perturbed->data[j] == row0[j]);  // position 0 unchanged
 }
 
+// The KV-cache incremental decode (forward_one) must reproduce the full forward's per-position
+// logits: for a sequence, forward_one(id_t, t) after prefilling 0..t-1 attends the same causal
+// context as forward()'s row t, so their logits agree to fast-math reduction tolerance. This is the
+// correctness gate for the O(T)-per-token gen fast path. (Dense builds only; ternary skips the path.)
+TEST_CASE("forward_one (KV-cache) matches the full forward per position", "[engine]") {
+    if constexpr (!USE_TERNARY) {
+        sub0::build_model();
+        const int L = std::min(24, SEQ_LEN);
+        std::vector<int> ids(L);
+        std::mt19937 rng(99);
+        for (int& x : ids) x = static_cast<int>(rng() % VOCAB);
+
+        sub0::graph_reset();
+        sub0::Node* full = sub0::forward(ids.data(), L);
+        const std::vector<float> ref(full->data.begin(), full->data.begin() + static_cast<size_t>(L) * VOCAB);
+
+        sub0::kv_reset();
+        double worst = 0.0;
+        for (int pos = 0; pos < L; ++pos) {
+            const float* one = sub0::forward_one(ids[pos], pos);
+            const float* rr  = ref.data() + static_cast<size_t>(pos) * VOCAB;
+            double maxabs = 0.0, maxmag = 1e-30;
+            for (int j = 0; j < VOCAB; ++j) {
+                maxabs = std::max(maxabs, std::fabs(static_cast<double>(one[j]) - rr[j]));
+                maxmag = std::max(maxmag, std::fabs(static_cast<double>(rr[j])));
+            }
+            worst = std::max(worst, maxabs / maxmag);
+        }
+        INFO("worst per-position rel diff = " << worst);
+        REQUIRE(worst < 1e-3);
+    }
+}
+
 TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
     sub0::build_model();
     std::vector<int> ids, tgt;

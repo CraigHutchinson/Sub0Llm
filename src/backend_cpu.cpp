@@ -603,6 +603,63 @@ static void backward_node(Node& n) {
 // ============================================================================
 
 namespace {
+// --- Incremental single-token inference (KV-cache) --------------------------
+// forward() recomputes the WHOLE context every token, so autoregressive gen is O(n*T^2). forward_one
+// keeps a per-layer K/V cache and, given the new token + its position, runs the network over just
+// that ONE row -- appending its K/V and attending the single new query against the cache. Per token
+// this is O(T) attention + O(1) rows through the projections/FFN/head, instead of O(T) rows through
+// everything. The row helpers below replicate the dense op_* math EXACTLY (same accumulation order),
+// so forward_one's logits match forward()'s last row to fast-math tolerance (gated by a unit test).
+// Dense weights only (the sparse-ternary linear path is not mirrored here); a ternary build keeps
+// the full-forward gen path. Positions must stay < SEQ_LEN (gen falls back past the window).
+struct KVCache {
+    std::vector<float> k, v;                                    // [N_LAYERS][SEQ_LEN][D_MODEL], flat
+    void reset() {
+        const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_MODEL;
+        if (k.size() != n) { k.assign(n, 0.f); v.assign(n, 0.f); }
+    }
+    float* krow(int l, int pos) { return k.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_MODEL; }
+    float* vrow(int l, int pos) { return v.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_MODEL; }
+};
+thread_local KVCache g_kv;                                      // gen is single-threaded; lazily sized
+
+// y[out] = x[in] . W[in,out]  (+ bias); dense, same order as op_linear's non-ternary path.
+static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
+                              float* __restrict y, int in, int out) {
+    for (int o = 0; o < out; ++o) y[o] = 0.f;
+    const float* __restrict Wf = W->data.data();
+    for (int p = 0; p < in; ++p) {
+        const float xp = x[p];
+        if (xp == 0.f) continue;
+        const float* __restrict Wr = Wf + static_cast<size_t>(p) * out;
+        for (int o = 0; o < out; ++o) y[o] += xp * Wr[o];
+    }
+    if (bias) for (int o = 0; o < out; ++o) y[o] += bias->data[o];
+}
+static inline void rmsnorm_row(const float* __restrict x, const Node* gamma, float* __restrict y, int C) {
+    float ms = 0.f; for (int j = 0; j < C; ++j) ms += x[j] * x[j]; ms /= C;
+    const float r = 1.f / std::sqrt(ms + 1e-5f);
+    const float* __restrict G = gamma->data.data();
+    for (int j = 0; j < C; ++j) y[j] = x[j] * r * G[j];
+}
+static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // rotate Q/K in place (t = pos)
+    const int d = C / H, half = d / 2;
+    for (int h = 0; h < H; ++h) {
+        const int off = h * d;
+        for (int m = 0; m < half; ++m) {
+            const float ang = pos * std::pow(ROPE_THETA, -2.f * m / d);
+            const float cs = std::cos(ang), sn = std::sin(ang);
+            const float x0 = x[off + 2 * m], x1 = x[off + 2 * m + 1];
+            x[off + 2 * m]     = x0 * cs - x1 * sn;
+            x[off + 2 * m + 1] = x0 * sn + x1 * cs;
+        }
+    }
+}
+static inline float gelu_row(float v) {
+    if constexpr (FAST_MATH) return gelu_fast(v);
+    else return 0.5f * v * (1.f + std::erf(v * 0.70710678f));
+}
+
 struct Layer { Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2; };
 
 struct Model {
@@ -690,6 +747,61 @@ struct Model {
         h = op_rmsnorm(h, ln_f);
         return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
     }
+
+    // Incremental single-token forward using the KV-cache (see KVCache above). Runs token `id` at
+    // window position `pos` through the network over one row, updates the cache, and returns its
+    // logits [VOCAB] (thread-local). Requires g_kv.reset() at the start of a generation and pos in
+    // [0, SEQ_LEN). Dense weights only -- callers gate on !USE_TERNARY.
+    const float* forward_one(int id, int pos) {
+        static thread_local std::array<float, VOCAB> logits;
+        constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
+        const float scale = 1.f / std::sqrt(static_cast<float>(d));
+        float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
+
+        const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
+        for (int j = 0; j < C; ++j) h[j] = emb[j];
+        if constexpr (POS_ENCODING == PosEncoding::Absolute) {
+            const float* pe = pos_emb->data.data() + static_cast<size_t>(pos) * C;
+            for (int j = 0; j < C; ++j) h[j] += pe[j];
+        }
+        for (int l = 0; l < N_LAYERS; ++l) {
+            Layer& L = layers[l];
+            rmsnorm_row(h, L.ln1, a, C);
+            linear_row(a, L.Wq, nullptr, qn, C, C);
+            linear_row(a, L.Wk, nullptr, kn, C, C);
+            linear_row(a, L.Wv, nullptr, vn, C, C);
+            if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, H, C); }
+            float* kc = g_kv.krow(l, pos); float* vc = g_kv.vrow(l, pos);        // append this token's K/V
+            for (int j = 0; j < C; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
+            for (int hd = 0; hd < H; ++hd) {                                     // attend query pos over j<=pos
+                const int off = hd * d;
+                std::array<float, SEQ_LEN> sc{};
+                float mx = -1e30f;
+                for (int j = 0; j <= pos; ++j) {
+                    const float* kj = g_kv.krow(l, j) + off;
+                    float s = 0.f; for (int aa = 0; aa < d; ++aa) s += qn[off + aa] * kj[aa];
+                    s *= scale; sc[j] = s; mx = std::max(mx, s);
+                }
+                float Z = 0.f;
+                for (int j = 0; j <= pos; ++j) { sc[j] = FAST_MATH ? fast_exp(sc[j] - mx) : std::exp(sc[j] - mx); Z += sc[j]; }
+                for (int aa = 0; aa < d; ++aa) att[off + aa] = 0.f;
+                for (int j = 0; j <= pos; ++j) {
+                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(l, j) + off;
+                    for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
+                }
+            }
+            linear_row(att, L.Wo, nullptr, proj, C, C);
+            for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
+            rmsnorm_row(h, L.ln2, a, C);
+            linear_row(a, L.W1, L.b1, f1, C, D_FF);
+            for (int j = 0; j < D_FF; ++j) f1[j] = gelu_row(f1[j]);
+            linear_row(f1, L.W2, L.b2, proj, D_FF, C);
+            for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
+        }
+        rmsnorm_row(h, ln_f, a, C);
+        linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
+        return logits.data();
+    }
 };
 
 thread_local Model g_model;
@@ -776,6 +888,11 @@ void graph_reset() { W->pool_used = 0; W->act_used = 0; }
 
 Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
+
+// Incremental single-token inference (KV-cache). kv_reset() clears/sizes the cache at the start of a
+// generation; forward_one(id, pos) returns the logits [VOCAB] for the next token. See KVCache above.
+void kv_reset() { g_kv.reset(); }
+const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
 
 void backward(Node* loss, float seed) {
     loss->grad[0] = seed;

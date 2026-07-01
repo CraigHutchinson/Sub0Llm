@@ -31,6 +31,25 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     if (ctx.empty()) ctx.push_back(0);
     std::mt19937 rng(seed);
 
+    // Fast path: a KV-cache incremental decode (O(T) per token) whenever the whole context fits the
+    // trained window and the weights are dense. forward_one's logits match the full forward to
+    // fast-math tolerance, so the sampled continuation is the same -- just far cheaper. The general
+    // path (ternary weights, or a context that slides past SEQ_LEN) keeps the exact full-forward loop.
+    if constexpr (!USE_TERNARY) {
+        if (static_cast<int>(ctx.size()) + n <= SEQ_LEN) {
+            sub0::kv_reset();
+            const float* logits = nullptr;
+            for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)   // prefill the prompt
+                logits = sub0::forward_one(ctx[pos], pos);
+            for (int s = 0; s < n; ++s) {
+                ctx.push_back(sub0::sample_token(logits, temp, topk, rng));
+                logits = sub0::forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1);
+            }
+            std::println("{}", sub0::detokenize(ctx));
+            return 0;
+        }
+    }
+
     for (int s = 0; s < n; ++s) {
         int T = std::min((int)ctx.size(), SEQ_LEN);
         sub0::graph_reset();
