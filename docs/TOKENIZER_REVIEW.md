@@ -18,11 +18,12 @@ markers; `encode`/`detokenize` collapsed to the single JOIN path; `deserialize` 
 dropped the `.join_scheme = true` opt (JOIN is the only scheme) and the field asserts became `join_id >= 0`.
 Verified: 224 engine-free assertions incl the 8000-case round-trip fuzz, and the configurator round-trips.
 
-**Phase B — build/registry plumbing: ⏳ remaining.** Retire the now-vestigial flags: `SUB0_JOIN_TOKENIZER`
-+ `SUB0_JOIN_FLAG` + the `--join` CLI (now metadata-only, the library ignores it), the `JOIN_TOKENIZER`
-constexpr, `registry.hpp`'s `join_tokenizer` field / `j` tag / `compatible()` arg, and `train_stage`'s
-pass-through. Needs a full build (engine + registry + the model-naming change) so it is its own commit;
-update `frontend_tests` (the `rj` dir-name + the `compatible()` join arg) with it.
+**Phase B — build/registry plumbing: ✅ DONE.** Retired the now-vestigial flags: `SUB0_JOIN_TOKENIZER` +
+`SUB0_JOIN_FLAG` + the `--join` CLI, the `JOIN_TOKENIZER` constexpr, `registry.hpp`'s `join_tokenizer`
+field / `j` tag / `compatible()` arg, and `train_stage`'s pass-through. The configurator's corpus.tok
+emit also lost its last `if(join)/else` legacy fork (and the now-dead `seq_key`/`word_index`/`recon`).
+Model dirs are now `…v<V>r_<sha>` (no `j`). `frontend_tests` updated (the `r` dir-name + the shorter
+`compatible()`); full ctest 110/110.
 
 The original rationale (kept for context): the JOIN scheme is the default and **all old models were
 discarded** (no backwards compat); the legacy "space-as-a-byte-token" scheme forked every core routine

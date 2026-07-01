@@ -53,14 +53,6 @@ namespace tok = sub0::tok;
 
 namespace {
 
-// Serialize a word's symbol sequence to a string key for the unique-word map. Word symbols
-// are byte values (0..255), so one byte per symbol is a lossless, compact key -- short enough
-// to stay in std::string's small-buffer (no heap alloc) for typical words.
-inline std::string seq_key(const std::vector<int>& s) {
-    std::string k(s.size(), '\0');
-    for (std::size_t i = 0; i < s.size(); ++i) k[i] = static_cast<char>(s[i] & 0xFF);
-    return k;
-}
 
 constexpr std::size_t CHUNK_BYTES = 32u << 20;  // ~32 MB per streamed corpus chunk
 
@@ -453,7 +445,6 @@ int main(int argc, char** argv) {
     int vocab_target = 0;       // 0 = auto-size from corpus scale (autosize_dims.vocab); nonzero pins it
     int min_merge    = 2;
     int emit_tok     = 1;
-    int join_scheme  = 1;       // 1 = JOIN/implicit-space tokenizer (complete 256 base + spacing markers)
     std::string tune_cache = sub0::build_facts::GEN_TUNE_CACHE;  // default: the build's tune cache
     int has_cuda    = sub0::build_facts::HAS_CUDA;      // 1 = the CUDA device-training backend was BUILT
     int cuda_arch   = sub0::build_facts::CUDA_ARCH;     // GPU compute capability as an int (e.g. 120 for sm_120)
@@ -493,10 +484,6 @@ int main(int argc, char** argv) {
     app.add_option("--corpus-pretok", emit_tok,
                    "1 = pre-tokenize the whole corpus to corpus.tok; 0 = skip it and let training tokenize "
                    "on demand (avoids the ~2x-on-disk token copy for a huge corpus)")
-       ->capture_default_str()->check(CLI::Range(0, 1));
-    app.add_option("--join", join_scheme,
-                   "1 = JOIN/implicit-space tokenizer (complete 256-byte base + JOIN/NEWLINE/PARA markers; "
-                   "single inter-word space is free). 0 = legacy space-as-token scheme.")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
@@ -655,7 +642,6 @@ int main(int argc, char** argv) {
 
     // Aliases so the downstream emit / reporting code reads the learned tokenizer + scan stats.
     const auto& word_syms   = S.word_syms;   // now final token-id sequences
-    const auto& word_index  = S.index;       // raw-key -> word id
     const auto& expansion   = tkz.expansion;
     const int   n_base      = tkz.n_base;
     const int   vocab       = tkz.vocab;
@@ -700,74 +686,47 @@ int main(int argc, char** argv) {
         // newline is always emitted as its own base token (non-alpha bytes never BPE-merge), so a
         // run of >=2 newline tokens marks a document break -- the next token starts a new document.
         // Record each document's start token index so training keeps windows inside one document.
-        const bool join = (join_scheme != 0);
         const std::int32_t nl_id      = static_cast<std::int32_t>(sym_to_base(10));      // base id of '\n'
-        const std::int32_t para_id    = join ? static_cast<std::int32_t>(tkz.para_id)    : -1;
-        const std::int32_t newline_id = join ? static_cast<std::int32_t>(tkz.newline_id) : -1;
+        const std::int32_t para_id    = static_cast<std::int32_t>(tkz.para_id);          // JOIN is the only scheme
+        const std::int32_t newline_id = static_cast<std::int32_t>(tkz.newline_id);
         std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
         int nl_run = 0;
         bool rt_reported = false;                                   // print the first round-trip divergence once
         std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
-        std::vector<int> recon;                   // per-chunk reconstruction (legacy round-trip 2)
         for_each_chunk(corpus, [&](std::string_view chunk) {
             long qr = 0;
             const std::string norm = normalize_text(std::string(chunk), qr);
             out_tokens.clear();
-            if (join) {
-                // JOIN scheme: encode the chunk with the learned tokenizer (implicit single space +
-                // JOIN/NEWLINE/PARA + verbatim fallback). The single contract is the round-trip
-                // detokenize(encode(chunk)) == normalize_text(chunk).
-                const std::vector<int> ids = tok::encode(tkz, std::string(chunk));
-                const std::string dec = tok::detokenize(tkz, ids);
-                if (dec != norm) {
-                    tok_rt = false;
-                    if (!rt_reported) {                            // show the first divergence (expected vs actual)
-                        rt_reported = true;
-                        std::size_t p = 0;
-                        while (p < dec.size() && p < norm.size() && dec[p] == norm[p]) ++p;
-                        const std::size_t lo = p > 48 ? p - 48 : 0;
-                        auto vis = [](std::string s) {             // make newlines/tabs visible
-                            std::string o; for (char c : s) {
-                                if (c == '\n') o += "\\n"; else if (c == '\t') o += "\\t"; else o += c;
-                            } return o;
-                        };
-                        std::println(stderr, "ROUND-TRIP FAIL at byte {} (norm {}B / dec {}B):", p, norm.size(), dec.size());
-                        std::println(stderr, "  expected: ...{}...", vis(norm.substr(lo, 96)));
-                        std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lo, 96)));
-                    }
+            // Encode the chunk with the learned tokenizer (implicit single space + JOIN/NEWLINE/PARA +
+            // verbatim fallback). The single contract is the round-trip
+            // detokenize(encode(chunk)) == normalize_text(chunk).
+            const std::vector<int> ids = tok::encode(tkz, std::string(chunk));
+            const std::string dec = tok::detokenize(tkz, ids);
+            if (dec != norm) {
+                tok_rt = false;
+                if (!rt_reported) {                            // show the first divergence (expected vs actual)
+                    rt_reported = true;
+                    std::size_t p = 0;
+                    while (p < dec.size() && p < norm.size() && dec[p] == norm[p]) ++p;
+                    const std::size_t lo = p > 48 ? p - 48 : 0;
+                    auto vis = [](std::string s) {             // make newlines/tabs visible
+                        std::string o; for (char c : s) {
+                            if (c == '\n') o += "\\n"; else if (c == '\t') o += "\\t"; else o += c;
+                        } return o;
+                    };
+                    std::println(stderr, "ROUND-TRIP FAIL at byte {} (norm {}B / dec {}B):", p, norm.size(), dec.size());
+                    std::println(stderr, "  expected: ...{}...", vis(norm.substr(lo, 96)));
+                    std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lo, 96)));
                 }
-                out_tokens.assign(ids.begin(), ids.end());
-            } else {
-                const std::vector<int> stream = truecase_tokenize(norm, attested, nullptr);
-                if (detokenize(stream) != norm) tok_rt = false;     // round-trip 1: truecasing
-                for (std::size_t i = 0, n = stream.size(); i < n;) {
-                    const std::size_t end = word_unit_end(stream, i);
-                    if (end == i) { out_tokens.push_back(sym_to_base(stream[i])); ++i; continue; }
-                    std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                                         stream.begin() + static_cast<std::ptrdiff_t>(end));
-                    auto it = word_index.find(seq_key(seq));
-                    if (it == word_index.end()) {                   // unreachable if passes agree
-                        for (int b : seq) out_tokens.push_back(sym_to_base(b));
-                        tok_rt = false;
-                    } else {
-                        for (int id : word_syms[static_cast<std::size_t>(it->second)]) out_tokens.push_back(id);
-                    }
-                    i = end;
-                }
-                recon.clear();                                       // round-trip 2: tokenization
-                for (std::int32_t id : out_tokens)
-                    recon.insert(recon.end(), expansion[static_cast<std::size_t>(id)].begin(),
-                                 expansion[static_cast<std::size_t>(id)].end());
-                if (recon != stream) tok_rt = false;
             }
+            out_tokens.assign(ids.begin(), ids.end());
             // Document boundaries (global token index = chunk base + local index). A blank line
             // separates documents: legacy counts >=2 consecutive '\n' tokens; the JOIN scheme emits
             // "\n\n" as one PARA token (weight 2) and a lone "\n" as NEWLINE / '\n' (weight 1), so a
             // cumulative newline weight >= 2 before the next content token marks the break.
             for (std::size_t li = 0; li < out_tokens.size(); ++li) {
                 const std::int32_t tk = out_tokens[li];
-                const int w = join ? (tk == para_id ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0))
-                                   : (tk == nl_id ? 1 : 0);
+                const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
                 if (w > 0) { nl_run += w; continue; }
                 if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
                 nl_run = 0;
@@ -893,8 +852,6 @@ int main(int argc, char** argv) {
     cos << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
     cos << "constexpr int  VOCAB       = " << vocab << ";\n";
-    cos << "// JOIN_TOKENIZER: the implicit-space tokenizer scheme (changes corpus.tok/tokenizer.bin meaning).\n";
-    cos << "constexpr bool JOIN_TOKENIZER = " << (join_scheme ? "true" : "false") << ";\n\n";
     cos << "// --- Positional encoding (compile-time) --------------------------------\n";
     cos << "enum class PosEncoding { Absolute, Rope };\n";
     cos << "constexpr PosEncoding POS_ENCODING = PosEncoding::" << (pos_encoding == 0 ? "Absolute" : "Rope") << ";\n";

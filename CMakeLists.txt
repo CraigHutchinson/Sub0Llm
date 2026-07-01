@@ -180,17 +180,9 @@ endif()
 message(STATUS "corpus.tok: SUB0_CORPUS_PRETOK=${SUB0_CORPUS_PRETOK} -> emit=${SUB0_CORPUS_PRETOK_FLAG} "
                "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
 
-# JOIN / implicit-space tokenizer. A clean break from the legacy space-as-token scheme: the
-# single inter-word space becomes free (~28% fewer tokens on tinystories), the base alphabet is
-# the complete 256 bytes + JOIN/NEWLINE/PARA markers. Changes tokenizer.bin + corpus.tok, so a
-# build with this flipped is INCOMPATIBLE with models trained under the other setting (retrain).
-option(SUB0_JOIN_TOKENIZER "Use the JOIN/implicit-space tokenizer (clean break; retrain required)" ON)
-if(SUB0_JOIN_TOKENIZER)
-  set(SUB0_JOIN_FLAG 1)
-else()
-  set(SUB0_JOIN_FLAG 0)
-endif()
-message(STATUS "tokenizer: SUB0_JOIN_TOKENIZER=${SUB0_JOIN_TOKENIZER} -> --join ${SUB0_JOIN_FLAG}")
+# The JOIN / implicit-space tokenizer (complete 256-byte base + JOIN/NEWLINE/PARA markers; single
+# inter-word space is free) is now the ONLY scheme -- the legacy space-as-token path was removed, so
+# there is no flag: the configurator always mints it.
 
 # --- Compute-backend selection (CPU / GPU / HYBRID axis) ---------------------
 # Picks SUB0_BACKEND_SOURCES for sub0_core and enforces the backend invariants
@@ -269,7 +261,6 @@ set(_sub0_configure_cmd sub0llm-configure
       --prec-gemm ${SUB0_PRECISION_GEMM_INT}
       --prec-act ${SUB0_PRECISION_ACT_INT}
       --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
-      --join ${SUB0_JOIN_FLAG}
       --cuda-tf32 ${SUB0_CUDA_TF32_FLAG})
 
 if(SUB0_AUTO_CONFIGURE)

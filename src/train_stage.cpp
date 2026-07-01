@@ -656,8 +656,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
                                              static_cast<int>(USE_TERNARY),
-                                             static_cast<int>(POS_ENCODING),
-                                             static_cast<int>(JOIN_TOKENIZER), SUB0_GIT_SHA);
+                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
         std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
         model_path = (meta_dir / "model.bin").string();
     }
@@ -672,7 +671,6 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
         m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
         m.pos_encoding = static_cast<int>(POS_ENCODING);
-        m.join_tokenizer = static_cast<int>(JOIN_TOKENIZER);
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
@@ -1846,16 +1844,14 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
     namespace reg = sub0::registry;
     std::vector<reg::ModelMeta> models = reg::scan(SUB0_MODELS_ROOT);
     std::println("models root: {}  ({} model{})", SUB0_MODELS_ROOT, models.size(), models.size() == 1 ? "" : "s");
-    std::println("this build:  d{} l{} h{} sq{} v{}{}{}{} @ {}",
+    std::println("this build:  d{} l{} h{} sq{} v{}{}{} @ {}",
                  D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, USE_TERNARY ? "t" : "",
-                 reg::pos_tag(static_cast<int>(POS_ENCODING)),
-                 reg::join_tag(static_cast<int>(JOIN_TOKENIZER)), SUB0_GIT_SHA);
+                 reg::pos_tag(static_cast<int>(POS_ENCODING)), SUB0_GIT_SHA);
     if (models.empty()) { std::println("(none yet -- `sub0llm train` creates one)"); return 0; }
 
     auto loadable = [&](const reg::ModelMeta& m) {
         return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
-                               static_cast<int>(JOIN_TOKENIZER));
+                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING));
     };
     std::sort(models.begin(), models.end(),
               [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });

@@ -34,7 +34,6 @@ struct ModelMeta {
     std::string corpus, git_sha, created, updated, status;
     int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0, ternary = 0;
     int pos_encoding = 0;                     // 0 = absolute learned (legacy default), 1 = RoPE
-    int join_tokenizer = 0;                   // 0 = legacy space-as-token, 1 = JOIN/implicit-space
     // Training state (provenance of the run that produced this snapshot).
     long long steps = 0;                      // optimizer iterations completed
     double epochs = 0.0;                      // fractional epochs of the corpus covered
@@ -48,9 +47,6 @@ struct ModelMeta {
 
 // Dir-name tag for the positional-encoding scheme (absolute is the legacy default -> untagged).
 inline const char* pos_tag(int pos_enc) { return pos_enc == 1 ? "r" : ""; }
-
-// Dir-name tag for the tokenizer scheme (legacy space-as-token is the default -> untagged).
-inline const char* join_tag(int join) { return join ? "j" : ""; }
 
 // A short, filesystem-safe tag for a corpus path: its stem, lowercased, non-alnum -> '_'.
 inline std::string corpus_tag(const std::string& corpus_path) {
@@ -68,12 +64,12 @@ inline std::string corpus_tag(const std::string& corpus_path) {
 // The identity-encoding directory for a model (no I/O).
 inline std::filesystem::path model_dir(const std::filesystem::path& models_root,
                                        const std::string& corpus, int d, int l, int h,
-                                       int seq, int vocab, int ternary, int pos_enc, int join,
+                                       int seq, int vocab, int ternary, int pos_enc,
                                        const std::string& sha) {
     std::string name = "sub0llm_" + corpus_tag(corpus) +
                        "_d" + std::to_string(d) + "l" + std::to_string(l) + "h" + std::to_string(h) +
                        "sq" + std::to_string(seq) + "v" + std::to_string(vocab) +
-                       (ternary ? "t" : "") + pos_tag(pos_enc) + join_tag(join) +
+                       (ternary ? "t" : "") + pos_tag(pos_enc) +
                        "_" + (sha.empty() ? "nogit" : sha);
     return models_root / name;
 }
@@ -104,7 +100,6 @@ inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
        << "vocab="           << m.vocab     << "\n"
        << "ternary="         << m.ternary   << "\n"
        << "pos_encoding="    << m.pos_encoding << "\n"
-       << "join_tokenizer="  << m.join_tokenizer << "\n"
        << "git_sha="         << m.git_sha   << "\n"
        << "created="         << m.created   << "\n"
        << "updated="         << m.updated   << "\n"
@@ -138,7 +133,6 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
         else if (k == "vocab")          m.vocab = as_int(v);
         else if (k == "ternary")        m.ternary = as_int(v);
         else if (k == "pos_encoding")   m.pos_encoding = as_int(v);
-        else if (k == "join_tokenizer") m.join_tokenizer = as_int(v);
         else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
         else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
         else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);
@@ -168,10 +162,10 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
 // (ternary, positional-encoding scheme, tokenizer scheme) match exactly -- a same-shape mismatch
 // would load silently but compute nonsense (the JOIN tokenizer's token ids mean different text).
 inline bool compatible(const ModelMeta& m, int d, int l, int h, int seq, int vocab, int ternary,
-                       int pos_enc, int join) {
+                       int pos_enc) {
     return m.d_model == d && m.n_layers == l && m.n_heads == h &&
            m.seq_len == seq && m.vocab == vocab && m.ternary == ternary &&
-           m.pos_encoding == pos_enc && m.join_tokenizer == join;
+           m.pos_encoding == pos_enc;
 }
 
 }  // namespace sub0::registry
