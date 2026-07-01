@@ -1886,7 +1886,7 @@ SUB0_CUDA_API int sub0_cuda_forward_one_check(int T, int iters, double* out_maxr
     if (sub0_cuda_init()) return 1;
     std::vector<float> hp(sub0::PARAM_FLOATS);                          // small random weights (finite logits)
     unsigned s = 0x243f6a88u;
-    for (auto& x : hp) { s = s * 1664525u + 1013904223u; x = (static_cast<float>(s >> 9) / 8388608.0f - 1.0f) * 0.05f; }
+    for (auto& x : hp) { s = s * 1664525u + 1013904223u; x = (static_cast<float>(s >> 9) / 8388608.0f - 1.0f) * 0.02f; }
     if (sub0_cuda_upload_params(hp.data())) return 1;                   // also builds the fused wqkv
     std::vector<int> ids(static_cast<size_t>(T));
     for (int& x : ids) { s = s * 1664525u + 1013904223u; x = static_cast<int>(s % static_cast<unsigned>(VOCAB)); }
