@@ -622,11 +622,22 @@ int main(int argc, char** argv) {
         std::println(stderr, "scan cache: saved '{}' ({} words, {} segments)", cache_path, S.word_syms.size(), nseg);
     }
 
-    // Learn the base alphabet + BPE merges from the scan (sub0::tok::learn). This REMAPS
-    // S.word_syms in place from raw byte symbols to final token ids, so Pass 3 can emit the
-    // tokenized corpus from S.index + S.word_syms. The learned Tokenizer carries the base
-    // alphabet, the ordered merges, the per-id expansion and the attested set.
-    const tok::Tokenizer tkz = tok::learn(S, attested, {vocab_target, min_merge});  // always JOIN scheme
+    // Learn the base alphabet + word pieces from the scan (sub0::tok::learn). This REMAPS S.word_syms
+    // in place from raw byte symbols to final token ids, so Pass 3 can emit the tokenized corpus from
+    // S.index + S.word_syms. The Unigram EM/prune runs multi-threaded with per-round progress, and for
+    // a huge corpus it learns from the frequent-word HEAD only: the Zipf tail of rare/hapax words is
+    // near-lossless to drop (single bytes keep every word encodable) but would otherwise dominate the
+    // O(unique-words) iteration count. The cap self-scales -- it is a no-op below ~2M unique words.
+    tok::LearnOptions lopts;
+    lopts.vocab_target    = vocab_target;
+    lopts.min_merge       = min_merge;
+    lopts.verbose         = true;                 // the configurator is a CLI tool -- show learn progress
+    lopts.max_learn_words = 2'000'000;            // frequent-word head for the EM/prune (near-lossless)
+    const auto _tl0 = std::chrono::steady_clock::now();
+    std::println(stderr, "learning {} vocab from {} unique words (unigram, multi-threaded)...", vocab_target, S.word_syms.size());
+    const tok::Tokenizer tkz = tok::learn(S, attested, lopts);   // always JOIN scheme
+    std::println(stderr, "vocab learned in {:.1f}s",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - _tl0).count());
 
     // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header). The
     // vocab curve + the BPE side of the A/B need the greedy merges, but `tkz` above is now Unigram (the
@@ -693,6 +704,11 @@ int main(int argc, char** argv) {
         int nl_run = 0;
         bool rt_reported = false;                                   // print the first round-trip divergence once
         std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
+        std::size_t bytes_done = 0;                                 // tokenize progress (Pass 3 streams the whole corpus)
+        const double tot_gb = static_cast<double>(S.raw_bytes) / 1e9;
+        const auto _p3t0 = std::chrono::steady_clock::now();
+        auto _p3last = _p3t0;
+        std::println(stderr, "tokenizing corpus -> corpus.tok ({:.1f} GB)...", tot_gb);
         for_each_chunk(corpus, [&](std::string_view chunk) {
             long qr = 0;
             const std::string norm = normalize_text(std::string(chunk), qr);
@@ -734,6 +750,16 @@ int main(int argc, char** argv) {
             ts.write(reinterpret_cast<const char*>(out_tokens.data()),
                      static_cast<std::streamsize>(out_tokens.size() * sizeof(std::int32_t)));
             token_count += out_tokens.size();
+            bytes_done  += chunk.size();
+            const auto _now = std::chrono::steady_clock::now();     // throughput heartbeat every ~2s
+            if (std::chrono::duration<double>(_now - _p3last).count() >= 2.0) {
+                _p3last = _now;
+                const double gb = static_cast<double>(bytes_done) / 1e9;
+                const double secs = std::chrono::duration<double>(_now - _p3t0).count();
+                std::println(stderr, "  tokenizing: {:.1f} / {:.1f} GB ({:.0f}%)  {:.0f} MB/s  {} tokens",
+                             gb, tot_gb, tot_gb > 0 ? 100.0 * gb / tot_gb : 0.0,
+                             secs > 0 ? static_cast<double>(bytes_done) / 1e6 / secs : 0.0, token_count);
+            }
         });
         // Append the document-start index after the token stream, then back-patch ntok + ndoc.
         ts.write(reinterpret_cast<const char*>(doc_starts.data()),

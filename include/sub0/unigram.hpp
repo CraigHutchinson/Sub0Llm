@@ -46,6 +46,13 @@ struct UnigramOptions {
     int    em_iters   = 4;     // EM passes between prunes
     double drop_frac  = 0.2;   // fraction of prunable tokens removed each prune round
     long long min_count = 2;   // a candidate must occur at least this many times to seed
+    // Learn-set reduction (a huge corpus has millions of rare/hapax unique words that barely move the
+    // vocabulary but dominate the EM/prune iteration count; single bytes always keep every word
+    // encodable, so dropping the rare tail is near-lossless). Both default to "no reduction".
+    long long min_word_freq   = 1;   // drop learn-set words rarer than this before EM/prune
+    long long max_learn_words = 0;   // 0 = all; else keep only the top-N most-frequent words
+    int    threads    = 0;     // EM/prune parallelism; 0 = hardware_concurrency
+    bool   verbose    = false; // print seed size + per-prune-round progress to stderr
 };
 
 // Learn a Unigram vocab from (word-bytes, frequency) pairs. Single bytes that appear are mandatory;

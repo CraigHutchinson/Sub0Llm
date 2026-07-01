@@ -129,6 +129,11 @@ struct LearnOptions {
     int    vocab_target = 2048;  // target vocabulary size (base symbols + markers + word pieces/merges)
     int    min_merge    = 2;     // BPE: stop merging once the best pair occurs fewer than this many times
     Method method       = Method::Unigram;
+    // Unigram learn-set reduction + progress (for huge corpora: the rare-word tail is near-lossless to
+    // drop and the EM/prune parallelises). Passed straight through to UnigramOptions.
+    long long min_word_freq   = 1;   // drop learn-set words rarer than this
+    long long max_learn_words = 0;   // 0 = all; else cap to the top-N most-frequent words
+    bool   verbose      = false; // per-prune-round progress to stderr
 };
 
 // Learn the base alphabet + BPE merges from a completed scan and the derived attested

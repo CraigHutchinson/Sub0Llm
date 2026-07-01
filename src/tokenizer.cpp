@@ -281,8 +281,11 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
             words.push_back({std::move(s), scan.word_freq[w]});
         }
         UnigramOptions uo;
-        uo.target    = opts.vocab_target;
-        uo.min_count = opts.min_merge;
+        uo.target          = opts.vocab_target;
+        uo.min_count       = opts.min_merge;
+        uo.min_word_freq   = opts.min_word_freq;      // learn-set reduction (huge corpora)
+        uo.max_learn_words = opts.max_learn_words;
+        uo.verbose         = opts.verbose;
         const Unigram u = learn_unigram(words, uo);
 
         double min_lp = 0.0;
