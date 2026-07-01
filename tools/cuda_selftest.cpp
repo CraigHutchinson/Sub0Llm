@@ -14,6 +14,7 @@ extern "C" int sub0_cuda_benchmark(int batch, int T, int iters);
 extern "C" int sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
 extern "C" int sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
+extern "C" int sub0_cuda_forward_one_check(int T, int iters, double* out_maxreldiff, double* out_toks);
 
 // Any argument -> "bench only": skip the host-reference grad/AdamW parity check (a slow plain-C++
 // reference pass, impractical at large model dims) so this is a fast kernel driver at the training
@@ -34,6 +35,10 @@ int main(int argc, char** argv) {
         const int rf = sub0_cuda_attn_check(184, 256, 50, nullptr, nullptr);
         const int rb = sub0_cuda_attn_bwd_check(184, 256, 30, nullptr, nullptr);
         return rf ? rf : rb;
+    }
+    // `decode` mode: GPU forward_one (KV-cache) parity vs the full forward + decode tok/s.
+    if (argc > 1 && std::strcmp(argv[1], "decode") == 0) {
+        return sub0_cuda_forward_one_check(256, 300, nullptr, nullptr);
     }
     if (argc <= 1) {
         const int rc = sub0_cuda_selftest();
