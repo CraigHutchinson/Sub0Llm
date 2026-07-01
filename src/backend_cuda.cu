@@ -1391,6 +1391,11 @@ SUB0_CUDA_API int sub0_cuda_selftest() {
 
 SUB0_CUDA_API int sub0_cuda_init() {
     if (g_dev_params) return 0;
+    // Block (sleep) the host thread on device syncs instead of spinning a core at 100%: the resident
+    // training step is GPU-bound, so busy-waiting the per-step sync just wastes a CPU core (and its
+    // power/heat) for no throughput. Must precede the first runtime call that creates the context; a
+    // non-zero return (context already active) is harmless, so it is intentionally not checked.
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_params, sub0::PARAM_FLOATS * sizeof(float)));
     return 0;
 }
