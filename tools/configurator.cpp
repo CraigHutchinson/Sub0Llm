@@ -793,7 +793,6 @@ int main(int argc, char** argv) {
     const int default_threads    = td.threads;
     const int default_wpt        = td.windows_per_thread;
     int       default_gpu_batch  = td.gpu_batch;            // derived from the width if untuned; clamped to VRAM below
-    const int attn_bwd_per_query = td.attn_bwd_per_query;
     if (td.tf32_from_cache) cuda_tf32 = td.cuda_tf32 ? 1 : 0;
 
     // Keep DEFAULT_GPU_BATCH within the VRAM budget. The batch sizes the resident device training
@@ -891,9 +890,8 @@ int main(int argc, char** argv) {
     sos << "constexpr int            GPU_VRAM_MB  = " << gpu_vram_mb << ";  // dedicated VRAM (fast budget)\n";
     sos << "// GPU_SHARED_MEM_MB: WDDM shared memory the GPU overflows into (no OOM, but THRASHES over PCIe).\n";
     sos << "constexpr int            GPU_SHARED_MEM_MB = " << gpu_shared_mb << ";\n";
-    sos << "// CUDA_TF32 / ATTN_BWD_PER_QUERY: tuned GPU knobs (`tune` persists the measured winners).\n";
-    sos << "constexpr bool           CUDA_TF32    = " << (cuda_tf32 ? "true" : "false") << ";\n";
-    sos << "constexpr bool           ATTN_BWD_PER_QUERY = " << (attn_bwd_per_query ? "true" : "false") << ";\n\n";
+    sos << "// CUDA_TF32: tuned GPU knob (`tune` persists the measured winner).\n";
+    sos << "constexpr bool           CUDA_TF32    = " << (cuda_tf32 ? "true" : "false") << ";\n\n";
     emit_path(sos, "DEFAULT_TUNE_CACHE", tune_cache_abs);
 
     // --- umbrella: the single header the engine includes ---

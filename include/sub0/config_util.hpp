@@ -78,7 +78,6 @@ struct TuneDefaults {
     int  threads            = 1;
     int  windows_per_thread = 4;
     int  gpu_batch          = 0;   // 0 -> derived = threads * windows_per_thread (set on return)
-    int  attn_bwd_per_query = 0;
     bool cuda_tf32          = false;
     bool tf32_from_cache    = false;
 };
@@ -94,7 +93,6 @@ inline TuneDefaults parse_tune_cache(std::istream& is, int hw_concurrency) {
         if      (key == "threads"            && val > 0) d.threads            = val;
         else if (key == "windows_per_thread" && val > 0) d.windows_per_thread = val;
         else if (key == "gpu_batch"          && val > 0) d.gpu_batch          = val;
-        else if (key == "attn_bwd_per_query")            d.attn_bwd_per_query = (val != 0);
         else if (key == "cuda_tf32")                   { d.cuda_tf32 = (val != 0); d.tf32_from_cache = true; }
     }
     if (d.gpu_batch <= 0) d.gpu_batch = d.threads * d.windows_per_thread;

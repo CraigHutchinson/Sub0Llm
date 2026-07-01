@@ -90,14 +90,14 @@ TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[confi
     CHECK(d0.gpu_batch == 24 * 4);                        // derived (no tuned value)
     CHECK_FALSE(d0.tf32_from_cache);
 
-    // A populated cache overrides each field; an explicit gpu_batch wins over the derived one.
+    // A populated cache overrides each field; an explicit gpu_batch wins over the derived one. The
+    // retired attn_bwd_per_query key (flash backward is now unconditional) must be ignored, not error.
     std::istringstream cache(
         "threads=8\nwindows_per_thread=2\ngpu_batch=293\nattn_bwd_per_query=1\ncuda_tf32=1\n");
     const TuneDefaults d = parse_tune_cache(cache, 24);
     CHECK(d.threads == 8);
     CHECK(d.windows_per_thread == 2);
     CHECK(d.gpu_batch == 293);                            // not 8*2
-    CHECK(d.attn_bwd_per_query == 1);
     CHECK(d.cuda_tf32);
     CHECK(d.tf32_from_cache);                             // so the caller knows to honour it
 

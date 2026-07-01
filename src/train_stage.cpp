@@ -77,7 +77,6 @@ extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
 extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                      float lr, long t, double* out_loss, const int* lengths);
 extern "C" void sub0_cuda_set_tf32(int on);
-extern "C" void sub0_cuda_set_attn_bwd(int per_query);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 // Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
@@ -1265,11 +1264,9 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
     // so gate it behind SUB0_TUNING and keep the baked path as the production default.
     int gpu_batch = best_threads * best_wpt;        // default: the CPU-tuned data-parallel width
     int gpu_tf32  = CUDA_TF32 ? 1 : 0;
-    int gpu_attn  = 0;                              // per-head attention backward (the default)
     if (!run_gpu) {                                 // --backend cpu: keep any cached GPU knobs intact
         read_tune_cache_value("gpu_batch", &gpu_batch);
         read_tune_cache_value("cuda_tf32", &gpu_tf32);
-        read_tune_cache_value("attn_bwd_per_query", &gpu_attn);
     }
 #if defined(SUB0_BUILD_CUDA)
     if (run_gpu && HAS_CUDA && sub0_cuda_init() == 0) {
@@ -1308,11 +1305,10 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // batch sweep that stopped at the first sub-6% throughput gain -- a rule a single noisy
         // reading could trip early, and which silently settled on a LOCAL trough (the measured curve
         // dips at batch 512 below 384 before climbing higher again at 768, so "first plateau" picked
-        // the worse of two peaks). The joint grid is the right tool because the knobs INTERACT: the
-        // per-query attention backward wins at small batch but loses to per-head at large batch
-        // (atomic contention), so the best attn strategy depends on the chosen batch. Objective =
-        // measured tok/s; the device timer is budget-sized so each sample costs ~the same wall time.
-        sub0_cuda_set_tf32(CUDA_TF32 ? 1 : 0); sub0_cuda_set_attn_bwd(0);   // baseline for batch-only builds
+        // the worse of two peaks). Objective = measured tok/s; the device timer is budget-sized so
+        // each sample costs ~the same wall time. (The attention backward is now the flash tiled path
+        // unconditionally, so batch and TF32 are the only device knobs left to sweep.)
+        sub0_cuda_set_tf32(CUDA_TF32 ? 1 : 0);      // baseline for batch-only builds
         // Runtime VRAM-fit batch ladder instead of a baked list: compute the largest batch whose
         // resident footprint fits dedicated VRAM (memplan::max_batch_for_vram), then double 64..ceiling.
         // bf16's halved footprint lifts that ceiling well past the old static 1024, so larger batches
@@ -1338,14 +1334,10 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         sub0::tune::Space gspace = { {"batch", std::vector<double>(batch_ladder.begin(), batch_ladder.end())} };
 #if defined(SUB0_TUNING)
         gspace.push_back({"tf32",     {0, 1}});
-        gspace.push_back({"attn_bwd", {0, 1}});
 #endif
-        // Format the optional knob columns (TF32 / attn strategy) only when they are in the space.
+        // Format the optional TF32 knob column only when it is in the space.
         auto knob_suffix = [](const sub0::tune::Assignment& a) -> std::string {
-            std::string s;
-            if (a.size() > 1) s += std::format("  tf32={}", static_cast<int>(std::lround(a[1])));
-            if (a.size() > 2) s += std::format("  attn={:<5}", std::lround(a[2]) ? "query" : "head");
-            return s;
+            return a.size() > 1 ? std::format("  tf32={}", static_cast<int>(std::lround(a[1]))) : std::string();
         };
 
         double gbudget_ms = 400.0;          // grown per phase via on_phase below
@@ -1369,7 +1361,6 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                 }
             }
             if (a.size() > 1) sub0_cuda_set_tf32(static_cast<int>(std::lround(a[1])));
-            if (a.size() > 2) sub0_cuda_set_attn_bwd(static_cast<int>(std::lround(a[2])));
             double ms = 0.0;
             const auto t0 = std::chrono::steady_clock::now();
             const int rc = sub0_cuda_time_train_step(batch, SEQ_LEN, gbudget_ms, &ms);
@@ -1437,21 +1428,20 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         gpu_batch = static_cast<int>(std::lround(gr.best[0]));
 #if defined(SUB0_TUNING)
         gpu_tf32 = static_cast<int>(std::lround(gr.best[1]));
-        gpu_attn = static_cast<int>(std::lround(gr.best[2]));
 #else
-        std::println("  (TF32 / attn-backward are baked in this build; rebuild with -DSUB0_TUNING=ON to tune them)");
+        std::println("  (TF32 is baked in this build; rebuild with -DSUB0_TUNING=ON to tune it)");
 #endif
         std::println("");
         std::println("evaluated {} device measurements; winner confirmed over {} samples",
                      gr.evaluations, gr.best_samples);
-        std::println("best GPU: batch={}  tf32={}  attn_bwd={}  ->  {:.0f} tok/s (median)",
-                     gpu_batch, gpu_tf32, gpu_attn ? "query" : "head", gr.best_score);
+        std::println("best GPU: batch={}  tf32={}  ->  {:.0f} tok/s (median)",
+                     gpu_batch, gpu_tf32, gr.best_score);
         sub0_cuda_shutdown();
     }
 #endif
 
     // Persist ALL tuned throughput knobs ONCE so the next build bakes them into the config header
-    // (DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD / DEFAULT_GPU_BATCH / CUDA_TF32 / ATTN_BWD_PER_QUERY).
+    // (DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD / DEFAULT_GPU_BATCH / CUDA_TF32).
     if (DEFAULT_TUNE_CACHE[0] == '\0') {
         std::println("(no tune cache configured; tuned defaults not persisted)");
     } else if (std::ofstream cache(DEFAULT_TUNE_CACHE, std::ios::trunc); cache) {
@@ -1459,8 +1449,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
               << "windows_per_thread=" << best_wpt << "\n";
 #if defined(SUB0_BUILD_CUDA)
         cache << "gpu_batch=" << gpu_batch << "\n"
-              << "cuda_tf32=" << gpu_tf32 << "\n"
-              << "attn_bwd_per_query=" << gpu_attn << "\n";
+              << "cuda_tf32=" << gpu_tf32 << "\n";
 #endif
         std::println("persisted tuned defaults to {}", DEFAULT_TUNE_CACHE);
         std::println("rebuild to bake them in:  cmake --build --preset native");

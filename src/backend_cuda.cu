@@ -126,13 +126,6 @@ cublasHandle_t g_cublas = nullptr;
 // baked value.
 using CudaTf32 = sub0::Knob<bool, CUDA_TF32>;
 
-// Attention-backward strategy as a workload knob (per-query vs per-head, see the two kernels
-// below). MEASURED 2026-06 on sm_120: per-head wins at large batch (no atomic contention) but
-// per-query wins massively at small batch (3.4x at batch 32). The baked default is the configured
-// ATTN_BWD_PER_QUERY (emitted by the configurator from the tune cache, like CUDA_TF32); runtime-
-// mutable under SUB0_TUNING for the GPU autotuner via sub0_cuda_set_attn_bwd.
-using AttnBwdPerQuery = sub0::Knob<bool, ATTN_BWD_PER_QUERY>;
-
 // Dedicated stream for all device work so the forward can be captured into a CUDA graph
 // (capturing the legacy default stream is disallowed). Plus the captured executable graph and
 // the (batch,T) it was captured for -- recaptured when the shape or the GEMM math mode changes.
@@ -511,14 +504,11 @@ __global__ void rmsnorm_backward_act_kernel(const X* __restrict__ x, const float
     }
 }
 
-// Causal attention backward (op_attn) -- TWO strategies, selected by a workload knob because the
-// best one depends on batch (measured crossover ~batch 256 on sm_120):
-//  * HEAD-per-thread (attn_backward_head_act_kernel): one thread per (window b, head h) owns the
-//    whole head, so dq/dk/dv accumulate with NO atomics. Best at large batch -- default at 384.
-//  * QUERY-per-thread (attn_backward_query_act_kernel): one thread per (b, h, query i); dq[i] owned,
-//    dk[j]/dv[j] sum over queries i>=j atomically. batch*H*T threads win at small batch (3.4x at 32).
-// Both mirror the CPU backward exactly. The dq/dk/dv buffer must be zeroed before launch. q/k/v and
-// dqkv are the store type (F32 build == FP32 path; BF16 reads/writes bf16 with FP32 softmax+accum).
+// Naive causal attention backward (op_attn), HEAD-per-thread: one thread per (window b, head h) owns
+// the whole head, so dq/dk/dv accumulate with NO atomics. Superseded on the hot path by the flash
+// tiled backward below; KEPT as the on-device parity REFERENCE the tiled kernels are checked against
+// (sub0_cuda_attn_bwd_check). The dq/dk/dv buffer must be zeroed before launch. q/k/v and dqkv are
+// the store type (F32 build == FP32 path; BF16 reads/writes bf16 with FP32 softmax+accum).
 template <class A>
 __global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
                                           const A* __restrict__ v, const A* __restrict__ dout,
@@ -550,37 +540,6 @@ __global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* 
             A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
             for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); st_act(&dkj[a], to_f32(dkj[a]) + ds * to_f32(qi[a])); } }
     }
-}
-template <class A>
-__global__ void attn_backward_query_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
-                                           const A* __restrict__ v, const A* __restrict__ dout,
-                                           A* __restrict__ dq, A* __restrict__ dk, A* __restrict__ dv,
-                                           int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x; const int per = H * T;
-    const int b = idx / per; if (b >= batch) return;
-    const int rem = idx - b * per, h = rem / T, i = rem % T, d = C / H, off = h * d;
-    const float scale = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
-    const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
-    float m = -1e30f, Z = 0.f;
-    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
-        const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn; }
-    const float invZ = 1.f / Z; float dot = 0.f;
-    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]);
-        const float p = __expf(s * scale - m) * invZ; const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off; float dp = 0.f;
-        for (int a = 0; a < d; ++a) { atomicAdd_act(&dvj[a], p * to_f32(di[a])); dp += to_f32(di[a]) * to_f32(vj[a]); }
-        dot += p * dp; }
-    A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
-    for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off; float s = 0.f, dp = 0.f;
-        for (int a = 0; a < d; ++a) { s += to_f32(qi[a]) * to_f32(kj[a]); dp += to_f32(di[a]) * to_f32(vj[a]); }
-        const float p = __expf(s * scale - m) * invZ, ds = p * (dp - dot) * scale;
-        A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); atomicAdd_act(&dkj[a], ds * to_f32(qi[a])); } }
 }
 
 // ---- Flash-style TILED attention BACKWARD (the hot-path replacement for the two naive kernels) ----
@@ -1841,13 +1800,6 @@ SUB0_CUDA_API void sub0_cuda_set_tf32(int on) {
     ensure_cublas();
     CudaTf32::set(on != 0);        // sweep the knob (a no-op in a non-tuning build)
     set_handle_tf32(on != 0);      // force the handle mode now (for the bench / parity tests)
-}
-
-// Select the attention-backward strategy (per_query != 0 -> query-per-thread, else head-per-thread).
-// Runtime knob for the GPU autotuner: per-head wins at large batch, per-query at small batch (no-op
-// in a non-tuning build, where the baked ATTN_BWD_PER_QUERY_DEFAULT is used).
-SUB0_CUDA_API void sub0_cuda_set_attn_bwd(int per_query) {
-    AttnBwdPerQuery::set(per_query != 0);
 }
 
 // Profile the device forward: time `iters` runs of the resident kernel chain (no host
