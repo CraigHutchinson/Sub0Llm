@@ -636,8 +636,21 @@ int main(int argc, char** argv) {
     const auto _tl0 = std::chrono::steady_clock::now();
     std::println(stderr, "learning {} vocab from {} unique words (unigram, multi-threaded)...", vocab_target, S.word_syms.size());
     const tok::Tokenizer tkz = tok::learn(S, attested, lopts);   // always JOIN scheme
-    std::println(stderr, "vocab learned in {:.1f}s",
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - _tl0).count());
+    {   // Post-learn summary: the FINAL vocabulary + the compression it achieves over the word corpus
+        // (word bytes / word tokens, from the now-remapped S.word_syms). This is the headline "how many
+        // tokens did we settle on" the long tokenize pass below is about to encode the corpus into.
+        long long tot_tok = 0, tot_by = 0;
+        for (const auto& [key, id] : S.index) {
+            const long long f = S.word_freq[static_cast<std::size_t>(id)];
+            tot_tok += f * static_cast<long long>(S.word_syms[static_cast<std::size_t>(id)].size());
+            tot_by  += f * static_cast<long long>(key.size());
+        }
+        std::println(stderr, "vocab learned in {:.1f}s: {} tokens = {} base + {} word pieces (target {}) | "
+                     "{:.3f} bytes/token over the word corpus",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - _tl0).count(),
+                     tkz.vocab, tkz.n_base, tkz.vocab - tkz.n_base, vocab_target,
+                     tot_tok > 0 ? static_cast<double>(tot_by) / static_cast<double>(tot_tok) : 0.0);
+    }
 
     // Analysis mode: write the readable vocabulary dumps and exit (no corpus.tok / config header). The
     // vocab curve + the BPE side of the A/B need the greedy merges, but `tkz` above is now Unigram (the
@@ -702,55 +715,68 @@ int main(int argc, char** argv) {
         const std::int32_t newline_id = static_cast<std::int32_t>(tkz.newline_id);
         std::vector<std::uint32_t> doc_starts{0u};                  // document 0 begins at token 0
         int nl_run = 0;
-        bool rt_reported = false;                                   // print the first round-trip divergence once
-        std::vector<std::int32_t> out_tokens;     // per-chunk emit buffer (bounded by the chunk)
-        std::size_t bytes_done = 0;                                 // tokenize progress (Pass 3 streams the whole corpus)
+        // Tokenize Pass 3, PARALLEL: encode a batch of newline-aligned chunks concurrently (each is
+        // independent -- tok::encode reads the const tokenizer), then write them in FILE ORDER and fold
+        // the doc-boundary + count state sequentially. The per-word Viterbi encode is the cost, so this
+        // lifts the pass off one core (~8 MB/s) toward the disk/memory ceiling.
+        const int nth = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        std::vector<std::string> batch; batch.reserve(static_cast<std::size_t>(nth));
+        std::vector<std::vector<std::int32_t>> outs(static_cast<std::size_t>(nth));
+        std::vector<char> rtok(static_cast<std::size_t>(nth), 1);
+        bool rt_reported = false;
+        std::size_t bytes_done = 0;
         const double tot_gb = static_cast<double>(S.raw_bytes) / 1e9;
         const auto _p3t0 = std::chrono::steady_clock::now();
         auto _p3last = _p3t0;
-        std::println(stderr, "tokenizing corpus -> corpus.tok ({:.1f} GB)...", tot_gb);
-        for_each_chunk(corpus, [&](std::string_view chunk) {
-            long qr = 0;
-            const std::string norm = normalize_text(std::string(chunk), qr);
-            out_tokens.clear();
-            // Encode the chunk with the learned tokenizer (implicit single space + JOIN/NEWLINE/PARA +
-            // verbatim fallback). The single contract is the round-trip
-            // detokenize(encode(chunk)) == normalize_text(chunk).
-            const std::vector<int> ids = tok::encode(tkz, std::string(chunk));
-            const std::string dec = tok::detokenize(tkz, ids);
-            if (dec != norm) {
-                tok_rt = false;
-                if (!rt_reported) {                            // show the first divergence (expected vs actual)
-                    rt_reported = true;
-                    std::size_t p = 0;
-                    while (p < dec.size() && p < norm.size() && dec[p] == norm[p]) ++p;
-                    const std::size_t lo = p > 48 ? p - 48 : 0;
-                    auto vis = [](std::string s) {             // make newlines/tabs visible
-                        std::string o; for (char c : s) {
-                            if (c == '\n') o += "\\n"; else if (c == '\t') o += "\\t"; else o += c;
-                        } return o;
-                    };
-                    std::println(stderr, "ROUND-TRIP FAIL at byte {} (norm {}B / dec {}B):", p, norm.size(), dec.size());
-                    std::println(stderr, "  expected: ...{}...", vis(norm.substr(lo, 96)));
-                    std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lo, 96)));
+        std::println(stderr, "tokenizing corpus -> corpus.tok ({:.1f} GB, {} threads)...", tot_gb, nth);
+
+        auto flush = [&] {
+            const int k = static_cast<int>(batch.size());
+            if (k == 0) return;
+            std::vector<std::thread> th;                            // parallel encode over the batch
+            const int per = (k + nth - 1) / nth;
+            for (int t = 0; t < nth; ++t) {
+                const int lo = std::min(k, t * per), hi = std::min(k, lo + per);
+                if (lo >= hi) break;
+                th.emplace_back([&, lo, hi] {
+                    for (int i = lo; i < hi; ++i) {
+                        long qr = 0;
+                        const std::string norm = normalize_text(batch[static_cast<std::size_t>(i)], qr);
+                        const std::vector<int> ids = tok::encode(tkz, batch[static_cast<std::size_t>(i)]);
+                        rtok[static_cast<std::size_t>(i)] = (tok::detokenize(tkz, ids) == norm) ? 1 : 0;
+                        outs[static_cast<std::size_t>(i)].assign(ids.begin(), ids.end());
+                    }
+                });
+            }
+            for (auto& x : th) x.join();
+            for (int i = 0; i < k; ++i) {                           // write in file order; sequential state
+                const std::vector<std::int32_t>& toks = outs[static_cast<std::size_t>(i)];
+                if (!rtok[static_cast<std::size_t>(i)]) {
+                    tok_rt = false;
+                    if (!rt_reported) {                            // re-encode this chunk to show the first divergence (rare)
+                        rt_reported = true;
+                        long qr = 0; const std::string norm = normalize_text(batch[static_cast<std::size_t>(i)], qr);
+                        const std::string dec = tok::detokenize(tkz, tok::encode(tkz, batch[static_cast<std::size_t>(i)]));
+                        std::size_t p = 0; while (p < dec.size() && p < norm.size() && dec[p] == norm[p]) ++p;
+                        const std::size_t lc = p > 48 ? p - 48 : 0;
+                        auto vis = [](std::string s) { std::string o; for (char c : s) { if (c=='\n') o+="\\n"; else if (c=='\t') o+="\\t"; else o+=c; } return o; };
+                        std::println(stderr, "ROUND-TRIP FAIL at byte {} (norm {}B / dec {}B):", p, norm.size(), dec.size());
+                        std::println(stderr, "  expected: ...{}...", vis(norm.substr(lc, 96)));
+                        std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lc, 96)));
+                    }
                 }
+                for (std::size_t li = 0; li < toks.size(); ++li) {  // doc boundaries (global index = token_count + li)
+                    const std::int32_t tk = toks[li];
+                    const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
+                    if (w > 0) { nl_run += w; continue; }
+                    if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
+                    nl_run = 0;
+                }
+                ts.write(reinterpret_cast<const char*>(toks.data()),
+                         static_cast<std::streamsize>(toks.size() * sizeof(std::int32_t)));
+                token_count += toks.size();
+                bytes_done  += batch[static_cast<std::size_t>(i)].size();
             }
-            out_tokens.assign(ids.begin(), ids.end());
-            // Document boundaries (global token index = chunk base + local index). A blank line
-            // separates documents: legacy counts >=2 consecutive '\n' tokens; the JOIN scheme emits
-            // "\n\n" as one PARA token (weight 2) and a lone "\n" as NEWLINE / '\n' (weight 1), so a
-            // cumulative newline weight >= 2 before the next content token marks the break.
-            for (std::size_t li = 0; li < out_tokens.size(); ++li) {
-                const std::int32_t tk = out_tokens[li];
-                const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
-                if (w > 0) { nl_run += w; continue; }
-                if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint32_t>(token_count + li));
-                nl_run = 0;
-            }
-            ts.write(reinterpret_cast<const char*>(out_tokens.data()),
-                     static_cast<std::streamsize>(out_tokens.size() * sizeof(std::int32_t)));
-            token_count += out_tokens.size();
-            bytes_done  += chunk.size();
             const auto _now = std::chrono::steady_clock::now();     // throughput heartbeat every ~2s
             if (std::chrono::duration<double>(_now - _p3last).count() >= 2.0) {
                 _p3last = _now;
@@ -760,7 +786,13 @@ int main(int argc, char** argv) {
                              gb, tot_gb, tot_gb > 0 ? 100.0 * gb / tot_gb : 0.0,
                              secs > 0 ? static_cast<double>(bytes_done) / 1e6 / secs : 0.0, token_count);
             }
+            batch.clear();
+        };
+        for_each_chunk(corpus, [&](std::string_view chunk) {
+            batch.emplace_back(chunk);
+            if (static_cast<int>(batch.size()) >= nth) flush();
         });
+        flush();                                                    // final partial batch
         // Append the document-start index after the token stream, then back-patch ntok + ndoc.
         ts.write(reinterpret_cast<const char*>(doc_starts.data()),
                  static_cast<std::streamsize>(doc_starts.size() * sizeof(std::uint32_t)));
