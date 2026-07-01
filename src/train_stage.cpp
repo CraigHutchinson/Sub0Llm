@@ -18,6 +18,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/coherence.hpp"
+#include "sub0/log.hpp"      // sub0::log — leveled diagnostics + the <model_dir>/train.log tee
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
@@ -113,16 +114,6 @@ constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop ove
                                               // improving ~1.5%/window) well before the true floor.
 constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
 
-// Training-progress tee: everything printed through tlog() goes to stdout AND, once a run has a model
-// directory, to <model_dir>/train.log -- so a long/background run keeps its own trajectory log next to
-// the weights. Opened per-run in sub0_train_stage (append, so a resume continues the same log).
-static std::ofstream g_train_log;
-template <class... A>
-static void tlog(std::format_string<A...> fmt, A&&... args) {
-    const std::string s = std::format(fmt, std::forward<A>(args)...);
-    std::println("{}", s);
-    if (g_train_log.is_open()) { g_train_log << s << '\n'; g_train_log.flush(); }
-}
 
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context
@@ -236,7 +227,7 @@ std::span<const int> load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_
     }
     if (od_buf.size() > static_cast<std::size_t>(SEQ_LEN) + 2) return od_buf;
 
-    std::println(stderr, "{}: no usable corpus.tok ('{}') and cannot tokenize the raw corpus '{}'",
+    sub0::log::error("{}: no usable corpus.tok ('{}') and cannot tokenize the raw corpus '{}'",
                  tool, sub0::default_corpus_tok(), sub0::default_corpus());
     return {};
 }
@@ -356,7 +347,7 @@ void save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
                      const RunState& rs, int batch, float lr, unsigned seed) {
     const std::string tmp = path + ".tmp";
     std::ofstream os(tmp, std::ios::binary);
-    if (!os) { std::println(stderr, "train: cannot write checkpoint '{}'", tmp); return; }
+    if (!os) { sub0::log::error("train: cannot write checkpoint '{}'", tmp); return; }
 
     wr(os, CKPT_MAGIC); wr(os, CKPT_VERSION);
     for (int c : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) wr(os, c);
@@ -384,7 +375,7 @@ void save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     os.write(reinterpret_cast<const char*>(sub0::adam_m_ptr()), bytes);
     os.write(reinterpret_cast<const char*>(sub0::adam_v_ptr()), bytes);
     os.flush();
-    if (!os) { std::println(stderr, "train: checkpoint write failed '{}'", tmp); return; }
+    if (!os) { sub0::log::error("train: checkpoint write failed '{}'", tmp); return; }
     os.close();
     atomic_replace(tmp, path);
 }
@@ -399,7 +390,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     std::ifstream is(path, std::ios::binary);
     if (!is) return false;
     if (rd<std::uint32_t>(is) != CKPT_MAGIC || rd<std::uint32_t>(is) != CKPT_VERSION) {
-        std::println(stderr, "train: ignoring checkpoint '{}' (bad magic/version)", path);
+        sub0::log::warn("ignoring checkpoint '{}' (bad magic/version)", path);
         return false;
     }
     bool ok = true;
@@ -407,7 +398,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
         if (rd<int>(is) != ref) ok = false;
     const std::uint64_t nfloat = rd<std::uint64_t>(is);
     if (!ok || nfloat != sub0::trainable_floats()) {
-        std::println(stderr, "train: ignoring checkpoint '{}' (built for a different config)", path);
+        sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
         return false;
     }
 
@@ -431,7 +422,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     is.read(reinterpret_cast<char*>(sub0::params_ptr()), bytes);
     is.read(reinterpret_cast<char*>(sub0::adam_m_ptr()), bytes);
     is.read(reinterpret_cast<char*>(sub0::adam_v_ptr()), bytes);
-    if (!is) { std::println(stderr, "train: checkpoint '{}' truncated -- starting fresh", path); return false; }
+    if (!is) { sub0::log::warn("checkpoint '{}' truncated -- starting fresh", path); return false; }
     sub0::sync_params_to_device();   // device backends: push loaded params/moments to the live copy
     return true;
 }
@@ -581,8 +572,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // VOCAB into the engine, so within a build they always agree -- but a stale, hand-built,
         // or foreign .tok would index the embedding table out of bounds. Reject it up front.
         if (tok.vocab() != VOCAB) {
-            std::println(stderr,
-                         "train: '{}' was tokenized for vocab {} but this engine was built for VOCAB {}.\n"
+            sub0::log::error(                         "train: '{}' was tokenized for vocab {} but this engine was built for VOCAB {}.\n"
                          "       Reconfigure/rebuild against this corpus, or pass a matching .tok.",
                          tok_path, tok.vocab(), VOCAB);
             return 1;
@@ -590,7 +580,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const std::span<const int> data = tok.tokens();
         const std::size_t min_tokens = 2 * (static_cast<std::size_t>(SEQ_LEN) + 2);
         if (data.size() < min_tokens) {
-            std::println(stderr, "train: '{}' has only {} tokens, too few for seq_len {} (need >= {})",
+            sub0::log::error("train: '{}' has only {} tokens, too few for seq_len {} (need >= {})",
                          tok_path, data.size(), SEQ_LEN, min_tokens);
             return 1;
         }
@@ -599,7 +589,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // but training's random windows touch most of it across epochs anyway).
         for (std::size_t i = 0; i < data.size(); ++i)
             if (data[i] < 0 || data[i] >= VOCAB) {
-                std::println(stderr, "train: '{}' token {} = {} is out of range [0,{})",
+                sub0::log::error("train: '{}' token {} = {} is out of range [0,{})",
                              tok_path, i, data[i], VOCAB);
                 return 1;
             }
@@ -618,7 +608,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // BYTES; tokenize a fixed validation buffer once and the first shuffle buffer now.
         const char* raw = sub0::default_corpus();
         if (!text.open(raw)) {
-            std::println(stderr, "train: no corpus.tok ('{}') and cannot open raw corpus '{}'", tok_path, raw);
+            sub0::log::error("train: no corpus.tok ('{}') and cannot open raw corpus '{}'", tok_path, raw);
             return 1;
         }
         const std::size_t total = text.bytes();
@@ -632,7 +622,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
         const std::size_t need = static_cast<std::size_t>(SEQ_LEN) + 2;
         if (val_buf.size() < need || train_buf.size() < need) {
-            std::println(stderr, "train: on-demand corpus '{}' too small to tokenize a window (need >= {} tokens)",
+            sub0::log::error("train: on-demand corpus '{}' too small to tokenize a window (need >= {} tokens)",
                          raw, need);
             return 1;
         }
@@ -673,8 +663,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     }
     // Tee this run's progress into <model_dir>/train.log (append: a resume continues the same log),
     // so a long/background run keeps its own trajectory next to the weights + meta.txt.
-    if (!meta_dir.empty()) g_train_log.open(meta_dir / "train.log", std::ios::app);
-    tlog("model dir: {}", model_path);
+    if (!meta_dir.empty()) sub0::log::set_file((meta_dir / "train.log").string());
+    sub0::log::line("model dir: {}", model_path);
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
         sub0::registry::ModelMeta m;
@@ -724,12 +714,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train);
-    tlog("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
+    sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
          epoch_steps, warmup_steps, eval_every, max_steps,
          (max_steps + epoch_steps - 1) / epoch_steps,
          on_demand ? " | on-demand" : "",
          resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
-    tlog("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
+    sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
          peak_lr, batch, lr_warmup_steps);
     std::fflush(stdout);
 
@@ -807,7 +797,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
                 if (plateaued(rs.evals)) stop = true;
             }
-            tlog("step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
+            sub0::log::line("step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
                  step, max_steps, frac_epoch, run_loss / std::max(1, run_n),
                  wps, wps * SEQ_LEN, eval_str);
             std::fflush(stdout);
@@ -827,7 +817,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>((step - last_log_step) * batch) / since : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
-            tlog("  ~ step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
+            sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
                  step, max_steps, frac_epoch, run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step;
@@ -841,8 +831,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
     // reaches it). This exercises the real long-context behaviour the trained window supports.
-    tlog("  --- sample ({}-token context) ---\n  {}", SEQ_LEN, preview("the ", SEQ_LEN, rng));
-    tlog("{} at step {} (best val_nelbo {:.4f}) -> {}",
+    sub0::log::line("  --- sample ({}-token context) ---\n  {}", SEQ_LEN, preview("the ", SEQ_LEN, rng));
+    sub0::log::line("{} at step {} (best val_nelbo {:.4f}) -> {}",
          stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
     gpu.shutdown();        // release the device session (no-op on the CPU path)
     return 0;
@@ -876,7 +866,7 @@ static void report_threading() {
 // throughput numbers that follow are read against the right backend.
 static void report_run_context(bool gpu_train) {
     sub0::print_config();   // engine config line (console only; the same dims are in the model's meta.txt)
-    tlog("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
+    sub0::log::line("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
                                            : "CPU (data-parallel minibatch)");
     std::fflush(stdout);
 }
@@ -1411,7 +1401,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         std::println("persisted tuned defaults to {}", DEFAULT_TUNE_CACHE);
         std::println("rebuild to bake them in:  cmake --build --preset native");
     } else {
-        std::println(stderr, "warning: could not write tune cache '{}'", DEFAULT_TUNE_CACHE);
+        sub0::log::warn("could not write tune cache '{}'", DEFAULT_TUNE_CACHE);
     }
     return 0;
 }
@@ -1512,7 +1502,7 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
 
     sub0::build_model();
     if (!sub0::load_model(model_in)) {
-        std::println(stderr, "autotemp: cannot load model '{}'", model_in);
+        sub0::log::error("autotemp: cannot load model '{}'", model_in);
         return 1;
     }
     sub0::load_tokenizer(sub0::default_tokenizer());    // for the sample print
@@ -1885,7 +1875,7 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
             std::error_code ec;
             const auto n = std::filesystem::remove_all(m.dir, ec);
             if (!ec) { std::println("pruned {} ({} entries)", m.dir.filename().string(), n); ++removed; }
-            else     std::println(stderr, "warning: could not prune {}", m.dir.string());
+            else     sub0::log::warn("could not prune {}", m.dir.string());
         }
         std::println("pruned {} incompatible model(s)", removed);
     }

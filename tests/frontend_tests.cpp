@@ -9,7 +9,13 @@
 
 #include "sub0/memplan.hpp"
 #include "sub0/registry.hpp"
+#include "sub0/log.hpp"
 
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <random>
+#include <sstream>
 #include <string>
 
 // --- memplan: the VRAM math behind the configurator clamp + the GPU tuner's batch cap --------------
@@ -53,6 +59,34 @@ TEST_CASE("memplan: max_batch_for_vram inverts the footprint (clamp + tuner cap)
 
     // A budget too small for even batch 1 -> 0 (the configurator's hard-error path).
     CHECK(max_batch_for_vram(d448, 1, cap) == 0);
+}
+
+// --- log: leveled diagnostics + the file tee that backs <model_dir>/train.log --------------------
+TEST_CASE("log: level filtering + file tee (prefix on leveled, none on raw lines)", "[frontend][log]") {
+    namespace log = sub0::log;
+    // Unique sink per run so a just-exited run's file handle can never collide/lock this one.
+    const auto tmp = std::filesystem::temp_directory_path() /
+                     std::format("sub0_log_test_{}.log", std::random_device{}());
+    REQUIRE(log::set_file(tmp.string(), /*append=*/false));
+
+    log::set_level(log::Level::Warn);          // threshold: drop info/debug, keep error/warn
+    log::error("err {}", 1);
+    log::warn("warn {}", 2);
+    log::info("info {}", 3);                    // below threshold -> dropped
+    log::line("raw {}", 4);                     // raw program output -> always tee'd, no level prefix
+    log::close_file();
+
+    std::ifstream f(tmp);
+    std::stringstream ss; ss << f.rdbuf();
+    const std::string out = ss.str();
+    CHECK(out.find("[error] err 1") != std::string::npos);
+    CHECK(out.find("[warn] warn 2")  != std::string::npos);
+    CHECK(out.find("info 3")         == std::string::npos);   // filtered out by the threshold
+    CHECK(out.find("raw 4")          != std::string::npos);   // raw line present...
+    CHECK(out.find("[info]")         == std::string::npos);   // ...with no prefix, and no info leaked
+
+    log::set_level(log::Level::Info);          // restore the default for any later test
+    std::error_code ec; std::filesystem::remove(tmp, ec);   // best-effort cleanup
 }
 
 // --- registry: the model identity + compatibility behind auto-naming and `models --prune` ---------
