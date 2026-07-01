@@ -113,6 +113,17 @@ constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop ove
                                               // improving ~1.5%/window) well before the true floor.
 constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
 
+// Training-progress tee: everything printed through tlog() goes to stdout AND, once a run has a model
+// directory, to <model_dir>/train.log -- so a long/background run keeps its own trajectory log next to
+// the weights. Opened per-run in sub0_train_stage (append, so a resume continues the same log).
+static std::ofstream g_train_log;
+template <class... A>
+static void tlog(std::format_string<A...> fmt, A&&... args) {
+    const std::string s = std::format(fmt, std::forward<A>(args)...);
+    std::println("{}", s);
+    if (g_train_log.is_open()) { g_train_log << s << '\n'; g_train_log.flush(); }
+}
+
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
 // across the batch (so the GPU keeps a single M = batch*T GEMM). Exposing a range of context
 // lengths stops the model overfitting to exactly SEQ_LEN and makes it robust to short prompts. The
@@ -659,8 +670,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                              static_cast<int>(JOIN_TOKENIZER), SUB0_GIT_SHA);
         std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
         model_path = (meta_dir / "model.bin").string();
-        std::println("model dir: {}", model_path);
     }
+    // Tee this run's progress into <model_dir>/train.log (append: a resume continues the same log),
+    // so a long/background run keeps its own trajectory next to the weights + meta.txt.
+    if (!meta_dir.empty()) g_train_log.open(meta_dir / "train.log", std::ios::app);
+    tlog("model dir: {}", model_path);
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
         sub0::registry::ModelMeta m;
@@ -710,13 +724,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train);
-    std::println("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
-                 epoch_steps, warmup_steps, eval_every, max_steps,
-                 (max_steps + epoch_steps - 1) / epoch_steps,
-                 on_demand ? " | on-demand" : "",
-                 resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
-    std::println("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
-                 peak_lr, batch, lr_warmup_steps);
+    tlog("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
+         epoch_steps, warmup_steps, eval_every, max_steps,
+         (max_steps + epoch_steps - 1) / epoch_steps,
+         on_demand ? " | on-demand" : "",
+         resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
+    tlog("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
+         peak_lr, batch, lr_warmup_steps);
     std::fflush(stdout);
 
     std::vector<size_t> starts(batch);
@@ -793,9 +807,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
                 if (plateaued(rs.evals)) stop = true;
             }
-            std::println("step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
-                         step, max_steps, frac_epoch, run_loss / std::max(1, run_n),
-                         wps, wps * SEQ_LEN, eval_str);
+            tlog("step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
+                 step, max_steps, frac_epoch, run_loss / std::max(1, run_n),
+                 wps, wps * SEQ_LEN, eval_str);
             std::fflush(stdout);
 
             // Checkpoint + latest model every interval (covers the warmup phase too).
@@ -813,8 +827,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>((step - last_log_step) * batch) / since : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
-            std::println("  ~ step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
-                         step, max_steps, frac_epoch, run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
+            tlog("  ~ step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
+                 step, max_steps, frac_epoch, run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step;
         }
@@ -827,9 +841,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
     // reaches it). This exercises the real long-context behaviour the trained window supports.
-    std::println("  --- sample ({}-token context) ---\n  {}", SEQ_LEN, preview("the ", SEQ_LEN, rng));
-    std::println("{} at step {} (best val_nelbo {:.4f}) -> {}",
-                 stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
+    tlog("  --- sample ({}-token context) ---\n  {}", SEQ_LEN, preview("the ", SEQ_LEN, rng));
+    tlog("{} at step {} (best val_nelbo {:.4f}) -> {}",
+         stop ? "plateaued" : "reached max steps", rs.step, rs.best_loss, model_path);
     gpu.shutdown();        // release the device session (no-op on the CPU path)
     return 0;
 }
@@ -861,9 +875,9 @@ static void report_threading() {
 // backend's print_config(); the third names the training path that will actually execute, so the
 // throughput numbers that follow are read against the right backend.
 static void report_run_context(bool gpu_train) {
-    sub0::print_config();
-    std::println("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
-                                                    : "CPU (data-parallel minibatch)");
+    sub0::print_config();   // engine config line (console only; the same dims are in the model's meta.txt)
+    tlog("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
+                                           : "CPU (data-parallel minibatch)");
     std::fflush(stdout);
 }
 
