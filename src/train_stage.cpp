@@ -649,9 +649,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
     if (model_out && *model_out) {
         model_path = model_out;
-        meta_dir   = std::filesystem::path(model_path).parent_path();   // keep meta.txt beside the
-        // model so an explicit-path run (including a resume) still records provenance, not just the
-        // auto-named layout below. A bare filename (no parent) leaves meta_dir empty -> write_meta skips.
+        // Accept a model DIRECTORY too (e.g. resuming `models/<name>`): use its model.bin, so a dir path
+        // doesn't mis-resolve the checkpoint to "<dir>.ckpt", silently start fresh, and nest a new dir.
+        if (std::filesystem::is_directory(model_path))
+            model_path = (std::filesystem::path(model_path) / "model.bin").string();
+        meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
     } else {
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
@@ -681,14 +683,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.status = status;
         sub0::registry::write_meta(meta_dir, m);
     };
-    write_meta("training");   // register early so an interrupted run still leaves a discoverable model
-
-    // Resume if a checkpoint for this output exists (overwrites the fresh model and
-    // restores batch/lr/seed, so the schedule below is computed from the resumed
-    // batch, not whatever the command line happened to pass).
+    // Resume if a checkpoint for this output exists (overwrites the fresh model and restores
+    // batch/lr/seed, so the schedule below is computed from the resumed batch, not the command line).
     const std::string ckpt_path = model_path + ".ckpt";
     long adam_t = 0;
+    const bool ckpt_existed = std::filesystem::exists(ckpt_path);
     const bool resumed = load_checkpoint(ckpt_path, rng, rs, batch, lr, seed, adam_t);
+    if (ckpt_existed && !resumed) {          // a real checkpoint this build can't read -- don't clobber it
+        sub0::log::error("checkpoint '{}' exists but is incompatible with this build; refusing to overwrite "
+                         "it. Remove it (or train to a fresh path) to start over.", ckpt_path);
+        return 1;
+    }
+    if (resumed)                             // make the resume UNMISSABLE (not buried in the schedule line)
+        sub0::log::info("RESUMING from step {} (best val_nelbo {:.4f}) -- continuing, NOT starting fresh",
+                        rs.step, rs.best_loss);
 
     sub0::AdamW opt(lr);
     if (resumed) opt.set_step_count(adam_t);
@@ -712,14 +720,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train);
-    sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}{}",
+    sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}",
          epoch_steps, warmup_steps, eval_every, max_steps,
          (max_steps + epoch_steps - 1) / epoch_steps,
-         on_demand ? " | on-demand" : "",
-         resumed ? std::format(" | RESUMED at step {}", rs.step) : std::string{});
+         on_demand ? " | on-demand" : "");   // the resume is announced prominently above, not buried here
     sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
          peak_lr, batch, lr_warmup_steps);
     std::fflush(stdout);
+    // Register/refresh the model now that epoch_steps is known -- so meta.txt shows the correct step +
+    // epoch immediately (a resume no longer looks like steps=0), and an interrupted run stays discoverable.
+    write_meta("training");
 
     std::vector<size_t> starts(batch);
     std::vector<int>    win_len(batch);   // per-window trained length (< seq_t for short documents)
