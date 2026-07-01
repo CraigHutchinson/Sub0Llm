@@ -427,6 +427,58 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     return true;
 }
 
+// --- Progress-named checkpoint retention ------------------------------------
+// Checkpoints are saved as "<model>.step<NNNNNNNNN>.ckpt" (zero-padded so a lexicographic sort is
+// also temporal), so successive saves never overwrite each other and any stage stays resumable.
+// `--keep N` bounds how many are retained (the newest N by step; keep<0 = keep ALL, a dev option).
+// Resume picks the highest-step checkpoint, falling back to a legacy "<model>.ckpt" from older builds.
+std::string ckpt_step_path(const std::string& model_path, long step) {
+    return std::format("{}.step{:09d}.ckpt", model_path, step);
+}
+std::string legacy_ckpt_path(const std::string& model_path) { return model_path + ".ckpt"; }
+
+// (step, path) for every progress-named checkpoint of this model, ascending by step.
+std::vector<std::pair<long, std::filesystem::path>> list_step_ckpts(const std::string& model_path) {
+    std::vector<std::pair<long, std::filesystem::path>> out;
+    const std::filesystem::path mp(model_path);
+    const std::filesystem::path dir = mp.parent_path();
+    const std::string prefix = mp.filename().string() + ".step";           // "model.bin.step"
+    const std::string suffix = ".ckpt";
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(dir.empty() ? std::filesystem::path(".") : dir, ec)) {
+        if (ec) break;
+        const std::string name = de.path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        const std::string digits = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        char* end = nullptr; const long st = std::strtol(digits.c_str(), &end, 10);
+        if (end && *end == '\0') out.emplace_back(st, de.path());
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    return out;
+}
+
+// The newest checkpoint to resume from: highest-step progress file, else the legacy path (or "").
+std::string latest_ckpt_path(const std::string& model_path) {
+    const auto v = list_step_ckpts(model_path);
+    if (!v.empty()) return v.back().second.string();
+    const std::string legacy = legacy_ckpt_path(model_path);
+    return std::filesystem::exists(legacy) ? legacy : std::string();
+}
+
+// Keep only the newest `keep` progress checkpoints (keep<0 = keep all). Prunes the oldest first, then
+// removes any legacy single-file "<model>.ckpt" once progress files exist (it is then redundant).
+void prune_ckpts(const std::string& model_path, int keep) {
+    if (keep < 0) return;
+    const auto v = list_step_ckpts(model_path);
+    std::error_code ec;
+    if (static_cast<int>(v.size()) > keep)
+        for (size_t i = 0; i + static_cast<size_t>(keep) < v.size(); ++i)   // drop the oldest
+            std::filesystem::remove(v[i].second, ec);
+    if (!v.empty()) std::filesystem::remove(legacy_ckpt_path(model_path), ec);
+}
+
 // A short text sample at a given temperature/top-k. Uses the SAME sampler as `gen`
 // so the output reflects real generation quality -- the old greedy+noise hack made a
 // coherent model look like word-salad.
@@ -535,7 +587,7 @@ struct GpuTrainer {
 static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
-                                          int steps, int batch, float lr, unsigned seed) {
+                                          int steps, int batch, float lr, unsigned seed, int keep) {
     // Training consumes the pre-tokenized corpus produced by the configurator, not
     // raw text. Any argument that is not a .tok file (including the driver's default
     // .txt corpus path) is intentionally ignored in favour of this build's baked-in
@@ -683,15 +735,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.status = status;
         sub0::registry::write_meta(meta_dir, m);
     };
-    // Resume if a checkpoint for this output exists (overwrites the fresh model and restores
-    // batch/lr/seed, so the schedule below is computed from the resumed batch, not the command line).
-    const std::string ckpt_path = model_path + ".ckpt";
+    // Resume from the newest checkpoint for this output (progress-named, or a legacy single file):
+    // overwrites the fresh model and restores batch/lr/seed, so the schedule below is computed from
+    // the resumed batch, not the command line.
+    const std::string resume_ckpt = latest_ckpt_path(model_path);
     long adam_t = 0;
-    const bool ckpt_existed = std::filesystem::exists(ckpt_path);
-    const bool resumed = load_checkpoint(ckpt_path, rng, rs, batch, lr, seed, adam_t);
+    const bool ckpt_existed = !resume_ckpt.empty();
+    const bool resumed = ckpt_existed && load_checkpoint(resume_ckpt, rng, rs, batch, lr, seed, adam_t);
     if (ckpt_existed && !resumed) {          // a real checkpoint this build can't read -- don't clobber it
         sub0::log::error("checkpoint '{}' exists but is incompatible with this build; refusing to overwrite "
-                         "it. Remove it (or train to a fresh path) to start over.", ckpt_path);
+                         "it. Remove it (or train to a fresh path) to start over.", resume_ckpt);
         return 1;
     }
     if (resumed)                             // make the resume UNMISSABLE (not buried in the schedule line)
@@ -810,8 +863,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                  wps, wps * SEQ_LEN, eval_str);
             std::fflush(stdout);
 
-            // Checkpoint + latest model every interval (covers the warmup phase too).
-            save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
+            // Progress-named checkpoint + latest model every interval (covers warmup too); prune to
+            // the newest `keep` so a long run doesn't fill the disk with 0.5 GB checkpoints.
+            save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed);
+            prune_ckpts(model_path, keep);
             sub0::save_model(model_path.c_str());
             write_meta("training");          // refresh best_val_nelbo as it improves
 
@@ -834,7 +889,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     gpu.sync_to_host();    // ensure the host arenas hold the final device weights before saving
     sub0::save_model(model_path.c_str());
-    save_checkpoint(ckpt_path, opt.step_count(), rng, rs, batch, lr, seed);
+    save_checkpoint(ckpt_step_path(model_path, rs.step), opt.step_count(), rng, rs, batch, lr, seed);
+    prune_ckpts(model_path, keep);
     write_meta(stop ? "plateaued" : "trained");
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never

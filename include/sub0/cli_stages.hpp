@@ -19,7 +19,7 @@
 
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
-                                int steps, int batch, float lr, unsigned seed);
+                                int steps, int batch, float lr, unsigned seed, int keep);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
@@ -46,6 +46,7 @@ inline int run_train(int argc, char** argv) {
     int   train_steps = 0, train_batch = 0;
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
+    std::string train_keep = "3";
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims+git SHA)");
     app.add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
@@ -57,14 +58,19 @@ inline int run_train(int argc, char** argv) {
         app.add_option("--lr", train_lr, "Learning rate (default: 0.001 scaled by sqrt(batch/8))")
            ->capture_default_str();
     app.add_option("--seed", train_seed, "RNG seed")->capture_default_str();
+    app.add_option("--keep", train_keep,
+                   "Progress-named checkpoints to retain (N, or ALL to keep every stage)")->capture_default_str();
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
         train_batch = HAS_CUDA ? DEFAULT_GPU_BATCH : (DEFAULT_THREADS * DEFAULT_WINDOWS_PER_THREAD);
     if (train_lr_opt->count() == 0)   // couple lr to batch unless pinned (sqrt rule for Adam)
         train_lr = LR_BASE * std::sqrt(static_cast<float>(train_batch) / LR_BASE_BATCH);
+    int keep = 3;                      // "ALL"/"all" -> keep every checkpoint (keep<0 sentinel)
+    if (train_keep == "ALL" || train_keep == "all") keep = -1;
+    else { try { keep = std::max(1, std::stoi(train_keep)); } catch (...) { keep = 3; } }
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
-                            train_steps, train_batch, train_lr, train_seed);
+                            train_steps, train_batch, train_lr, train_seed, keep);
 }
 
 // --- gen -------------------------------------------------------------------
