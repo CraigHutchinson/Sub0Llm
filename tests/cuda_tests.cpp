@@ -34,6 +34,7 @@ extern "C" int  sub0_cuda_free_vram_mb();
 extern "C" int  sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
 extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
                                         double* fwd_ms, double* bwd_ms, double* adam_ms);
+extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -260,6 +261,24 @@ TEST_CASE("CUDA attention-only gradient stays aligned with the CPU", "[cuda]") {
     INFO("attn grad rel-L2 = " << rel << "  cos = " << cos);
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
     else                                    REQUIRE(rel < 1e-2);
+    sub0_cuda_shutdown();
+}
+
+// Flash attention FORWARD guard: the tiled kernel (attn_fwd_tiled_kernel, the hot path) must (1)
+// produce the SAME output as the naive reference (attn_train_act_kernel) -- they share the
+// increasing-j online-softmax recurrence, so agreement is to ~bf16 rounding -- and (2) be a good
+// deal faster. The speedup is a RATIO (tiled vs naive on identical inputs, same GPU state), so it is
+// dimensionless: it does NOT drift with clocks/thermals/host load the way an absolute-ms floor
+// would, which makes it a stable structural check that the shared-memory tiling stayed intact. The
+// 2x floor is far below the ~8.5x seen at d448/T256 -- it exists to fail loudly if a future edit
+// silently reverts the kernel to streaming K/V from global (ratio would collapse toward 1x).
+TEST_CASE("CUDA flash-attention forward matches the naive kernel and is faster", "[cuda]") {
+    double reldiff = 1.0, speedup = 0.0;
+    const int rc = sub0_cuda_attn_check(128, SEQ_LEN, 50, &reldiff, &speedup);
+    WARN("flash attn forward: max rel diff = " << reldiff << "   speedup = " << speedup << "x");
+    REQUIRE(rc == 0);              // returns nonzero only on a parity failure
+    REQUIRE(reldiff < 5e-2);       // tiled == naive to bf16 rounding
+    REQUIRE(speedup > 2.0);        // tiling intact (regression guard; observed ~8.5x at d448)
     sub0_cuda_shutdown();
 }
 

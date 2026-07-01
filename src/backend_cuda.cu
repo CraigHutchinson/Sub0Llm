@@ -62,6 +62,12 @@ __global__ void f32_to_act_kernel(const float* __restrict__ x, act_t* __restrict
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) st_act(&y[i], x[i]);
 }
+// Up-cast the act_t store type back to float (used by the attention naive-vs-tiled self-check to
+// bring bf16 device buffers to the host for comparison; F32 build == plain copy).
+__global__ void act_to_f32_kernel(const act_t* __restrict__ x, float* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = to_f32(x[i]);
+}
 
 // CUDA error check for the self-test: report file:line + the error string and bail out
 // of the calling function with a nonzero code. The full backend will route failures
@@ -266,45 +272,10 @@ __global__ void rmsnorm_train_act_kernel(const X* __restrict__ x, const float* _
     }
 }
 
-// Causal multi-head attention over a BATCH of windows (op_attn, FAST_MATH softmax). One
-// TODO(perf): naive O(T^2) per thread with a float sc[SEQ_LEN] in local memory. For longer T a
-// flash-attention-style tiled/online-softmax kernel (shared-mem K/V tiles, no sc[] spill) would
-// be far more bandwidth- and occupancy-efficient. Fine at SEQ_LEN=64.
-// thread per (window b, head h, query i): scores over j<=i WITHIN the window, __expf softmax,
-// weighted sum of v. q/k/v rows are `in_stride` apart (= 3C when they are sub-blocks of the
-// fused QKV buffer); the output is a packed [M,C] buffer (stride C). Windows are independent.
-__global__ void attn_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                            const float* __restrict__ v, float* __restrict__ out,
-                            int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx over batch*H*T
-    const int per = H * T;
-    const int b   = idx / per;
-    if (b >= batch) return;
-    const int rem = idx - b * per;
-    const int h   = rem / T;
-    const int i   = rem % T;
-    const int    d        = C / H;
-    const int    off      = h * d;
-    const float  scale    = 1.0f / sqrtf(static_cast<float>(d));
-    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;   // q/k/v rows are in_stride apart
-    const size_t out_base = static_cast<size_t>(b) * T * C;
-    const float* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-    // Online (flash) softmax: stream keys, keeping a running max m, sum Z and value accumulator
-    // acc[head_dim] -- no float sc[SEQ_LEN] local array, so occupancy holds up at large T.
-    float m = -1e30f, Z = 0.f, acc[128] = {};   // head_dim assumed <= 128
-    for (int j = 0; j <= i; ++j) {
-        const float* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-        float s = 0.f; for (int a = 0; a < d; ++a) s += qi[a] * kj[a]; s *= scale;
-        const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn);
-        Z = Z * c + e;
-        const float* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-        for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * vj[a];
-        m = mn;
-    }
-    float* oi = out + out_base + static_cast<size_t>(i) * C + off;
-    const float inv = 1.f / Z;
-    for (int a = 0; a < d; ++a) oi[a] = acc[a] * inv;
-}
+// Causal multi-head attention (op_attn) is served by the flash-style attn_fwd_tiled_kernel below
+// (used for BOTH inference and training, via launch_attn / launch_attn_train_t). The naive
+// one-thread-per-query variant survives only as attn_train_act_kernel, kept as the on-device parity
+// REFERENCE the self-test compares the tiled kernel against (sub0_cuda_attn_check).
 
 // Build the fused QKV weight Wqkv[C, 3C] (row-major) from Wq,Wk,Wv [C,C]: row p holds
 // [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
@@ -370,6 +341,81 @@ __global__ void attn_train_act_kernel(const A* __restrict__ q, const A* __restri
     A* oi = out + out_base + static_cast<size_t>(i) * C + off; const float invZ = 1.f / Z;
     for (int a = 0; a < d; ++a) st_act(&oi[a], acc[a] * invZ);
 }
+
+// ---- Flash-style TILED attention forward (the hot-path replacement for attn_train_act_kernel) ----
+// The naive kernel above is L1/TEX-cache-bound: every query thread re-streams ALL of K and V from
+// global, so each K/V row is read O(T) times (ncu at d448/T256: L1/TEX 93%, Memory 90%, Compute 19%,
+// = 92% of the forward). This tiles the keys through shared memory. A block owns TILE_Q queries of
+// ONE (b,h) -- grid = (T-tiles, H, batch) -- stages each K/V tile into shared ONCE, and all TILE_Q
+// queries in the block reuse it (the redundant global reads collapse by ~TILE_Q). q and the online-
+// softmax accumulator live in registers (HD = D_HEAD is compile-time, so the per-channel loops fully
+// unroll and the streamed data never spills to local/L1). Keys are still consumed in INCREASING j,
+// exactly like the naive kernel, so the online-softmax arithmetic -- and therefore the result -- is
+// bit-identical to attn_train_act_kernel (gated on device by sub0_cuda_attn_check, naive vs tiled).
+// HD = head dim, TILE_Q = queries per block, TILE_K = keys staged per shared tile.
+template <int HD> constexpr int attn_tile_k() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
+constexpr int kAttnTileQ = 64;
+
+template <class A, int HD, int TILE_K>
+__global__ void __launch_bounds__(kAttnTileQ)
+attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
+                      A* __restrict__ out, int T, int C, int in_stride) {
+    __shared__ float Ks[TILE_K * HD];
+    __shared__ float Vs[TILE_K * HD];
+    const int    b  = blockIdx.z, h = blockIdx.y;
+    const int    q0 = blockIdx.x * blockDim.x;               // first query of this block
+    const int    i  = q0 + threadIdx.x;                      // this thread's query (block owns one (b,h))
+    const int    off = h * HD;
+    const float  scale    = rsqrtf(static_cast<float>(HD));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+
+    float qr[HD];                                            // this query's row, cached in registers
+    if (i < T) {
+        const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) qr[a] = to_f32(qi[a]);
+    }
+    float m = -1e30f, Z = 0.f, acc[HD];
+    #pragma unroll
+    for (int a = 0; a < HD; ++a) acc[a] = 0.f;
+
+    const int jmax = min(T, q0 + static_cast<int>(blockDim.x));   // no query in this block attends j >= jmax
+    for (int j0 = 0; j0 < jmax; j0 += TILE_K) {
+        const int tk = min(TILE_K, jmax - j0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) { // cooperative K/V tile load (all threads)
+            const int    jl  = e / HD, a = e - jl * HD;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            Ks[e] = to_f32(k[row + a]);
+            Vs[e] = to_f32(v[row + a]);
+        }
+        __syncthreads();
+        if (i < T) {
+            const int jend = min(tk, i - j0 + 1);            // causal: only keys j <= i (<=0 -> skip tile)
+            for (int jl = 0; jl < jend; ++jl) {
+                const float* ks = Ks + jl * HD;
+                float s = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) s += qr[a] * ks[a];
+                s *= scale;
+                const float mn = fmaxf(m, s), c = __expf(m - mn), e2 = __expf(s - mn);
+                Z = Z * c + e2;
+                const float* vs = Vs + jl * HD;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) acc[a] = acc[a] * c + e2 * vs[a];
+                m = mn;
+            }
+        }
+    }
+    if (i < T) {
+        A* oi = out + out_base + static_cast<size_t>(i) * C + off;
+        const float invZ = 1.f / Z;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) st_act(&oi[a], acc[a] * invZ);
+    }
+}
+
 template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, int C, int H, int in_stride, float theta) {
     const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= C / 2) return;
@@ -730,9 +776,10 @@ template <class A> inline void launch_gelu_bwd_t(const A* x, const A* dy, A* dx,
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
                         int batch, int T, int C, int H, int in_stride) {
-    const int block = 64;
-    const int total = batch * H * T;
-    attn_kernel<<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
+    const dim3 block(kAttnTileQ);
+    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    attn_fwd_tiled_kernel<float, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
 // One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows.
@@ -783,8 +830,10 @@ template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gam
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
 template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
                               int batch, int T, int C, int H, int in_stride) {
-    const int block = 64, total = batch * H * T;
-    attn_train_act_kernel<A><<<(total + block - 1) / block, block, 0, g_stream>>>(dQ, dK, dV, dOut, batch, T, C, H, in_stride);
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
+    const dim3 block(kAttnTileQ);
+    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
@@ -1642,6 +1691,90 @@ SUB0_CUDA_API int sub0_cuda_benchmark(int batch, int T, int iters) {
                 "graph FP32 %.3f ms | graph %.2fx vs eager\n",
                 batch, T, M, iters, fp32, tf32, graph, graph > 0.0 ? fp32 / graph : 0.0);
     return 0;
+}
+
+// On-device correctness + speed guard for the flash attention FORWARD. Runs the naive reference
+// (attn_train_act_kernel) and the tiled kernel (attn_fwd_tiled_kernel) on the SAME random q/k/v at
+// the training config, then (1) compares outputs -- both consume keys in increasing j with the same
+// online-softmax recurrence, so they must agree to ~bf16 rounding -- and (2) times both for a
+// dimensionless speedup RATIO. The ratio is the regression guard the Catch2 test asserts on: unlike
+// an absolute-ms floor it does NOT drift with GPU clocks or host load (both kernels ride the same
+// conditions), so it is a stable structural check that the tiling stayed intact. Returns nonzero
+// only on a PARITY failure (a real bug); the caller chooses the minimum speedup to require.
+SUB0_CUDA_API int sub0_cuda_attn_check(int batch, int T, int iters,
+                                       double* out_maxreldiff, double* out_speedup) {
+    if (T < 1 || T > SEQ_LEN) return 1;
+    if (batch < 1) batch = 1;
+    if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
+    if (iters < 1) iters = 50;
+    if (sub0_cuda_init()) return 1;
+    const int    C = D_MODEL, H = N_HEADS, M = batch * T;
+    const size_t nqkv = static_cast<size_t>(M) * 3 * C;                 // fused q|k|v, in_stride = 3C
+    const size_t natt = static_cast<size_t>(M) * C;
+
+    std::vector<float> h(nqkv);                                         // random q/k/v (host -> f32 -> act_t)
+    unsigned s = 0x9e3779b9u;
+    for (size_t i = 0; i < nqkv; ++i) { s = s * 1664525u + 1013904223u; h[i] = static_cast<float>(s >> 8) / 8388608.0f - 1.0f; }
+    float* dqf = nullptr; act_t* dqkv = nullptr; act_t* dref = nullptr; act_t* dtes = nullptr;
+    float* fref = nullptr; float* ftes = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dqf,  nqkv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dqkv, nqkv * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dref, natt * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dtes, natt * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&fref, natt * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ftes, natt * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dqf, h.data(), nqkv * sizeof(float), cudaMemcpyHostToDevice));
+    { const int bk = 256; f32_to_act_kernel<<<static_cast<int>((nqkv + bk - 1) / bk), bk, 0, g_stream>>>(dqf, dqkv, static_cast<int>(nqkv)); }
+
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();
+    auto run_naive = [&] {
+        const int blk = 64, total = batch * H * T;
+        attn_train_act_kernel<act_t><<<(total + blk - 1) / blk, blk, 0, g_stream>>>(
+            dqkv, dqkv + C, dqkv + 2 * C, dref, batch, T, C, H, 3 * C);
+    };
+    auto run_tiled = [&] {
+        const dim3 block(kAttnTileQ), grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+        attn_fwd_tiled_kernel<act_t, HD, TK><<<grid, block, 0, g_stream>>>(
+            dqkv, dqkv + C, dqkv + 2 * C, dtes, T, C, 3 * C);
+    };
+    run_naive(); run_tiled();
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    { const int bk = 256, n = static_cast<int>(natt);                  // bring both outputs to f32 for the host
+      act_to_f32_kernel<<<(n + bk - 1) / bk, bk, 0, g_stream>>>(dref, fref, n);
+      act_to_f32_kernel<<<(n + bk - 1) / bk, bk, 0, g_stream>>>(dtes, ftes, n); }
+    std::vector<float> a(natt), bvals(natt);
+    SUB0_CUDA_CHECK(cudaMemcpy(a.data(),     fref, natt * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(bvals.data(), ftes, natt * sizeof(float), cudaMemcpyDeviceToHost));
+    double maxabs = 0.0, maxmag = 1e-30;
+    for (size_t i = 0; i < natt; ++i) {
+        const double d = std::fabs(static_cast<double>(a[i]) - bvals[i]), mg = std::fabs(static_cast<double>(a[i]));
+        if (d > maxabs) maxabs = d;
+        if (mg > maxmag) maxmag = mg;
+    }
+    const double reldiff = maxabs / maxmag;
+
+    auto timed = [&](auto&& fn) -> double {                            // GPU-event time; the RATIO is the guard
+        for (int w = 0; w < 5; ++w) fn();
+        cudaStreamSynchronize(g_stream);
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventRecord(e0, g_stream);
+        for (int it = 0; it < iters; ++it) fn();
+        cudaEventRecord(e1, g_stream); cudaEventSynchronize(e1);
+        float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1); cudaEventDestroy(e0); cudaEventDestroy(e1);
+        return static_cast<double>(ms) / iters;
+    };
+    const double naive_ms = timed(run_naive), tiled_ms = timed(run_tiled);
+    const double speedup  = tiled_ms > 0.0 ? naive_ms / tiled_ms : 0.0;
+
+    cudaFree(dqf); cudaFree(dqkv); cudaFree(dref); cudaFree(dtes); cudaFree(fref); cudaFree(ftes);
+    const bool ok = reldiff < 5e-2;
+    std::printf("cuda attn check: batch=%d T=%d HD=%d | naive %.3f ms  tiled %.3f ms = %.1fx | "
+                "max rel diff %.2e  %s\n", batch, T, HD, naive_ms, tiled_ms, speedup, reldiff, ok ? "OK" : "FAIL");
+    if (out_maxreldiff) *out_maxreldiff = reldiff;
+    if (out_speedup)    *out_speedup    = speedup;
+    return ok ? 0 : 2;
 }
 
 // Adaptive timing bounds (shared with the CPU tuner via sub0/bench.hpp). Rather than a fixed
