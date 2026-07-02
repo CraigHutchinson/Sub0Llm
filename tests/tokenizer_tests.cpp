@@ -1,7 +1,7 @@
 // tokenizer_tests.cpp — BPE tokenizer round-trip contract tests.
 //
 // The tokenizer is learned at build time by sub0-configure and serialized to
-// tokenizer.bin. These tests load that artifact and pin the encode/detokenize
+// tokenizer.tok. These tests load that artifact and pin the encode/detokenize
 // contract: detokenize(encode(x)) reproduces x for in-alphabet text, including
 // truecasing of capitalized words and all-caps words.
 

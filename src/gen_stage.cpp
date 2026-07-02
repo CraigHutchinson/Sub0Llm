@@ -53,11 +53,11 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         return 1;
     }
     // Decode with the vocab this model was TRAINED against, not whatever the build tree currently holds:
-    // prefer the tokenizer.bin bundled beside the model, falling back to the baked default. The
+    // prefer the tokenizer.tok bundled beside the model, falling back to the baked default. The
     // fingerprint guard in load_tokenizer then rejects a mismatch loudly rather than emitting garble.
     std::string tok_path = sub0::default_tokenizer();
     if (model_in && *model_in) {
-        const std::filesystem::path bundled = std::filesystem::path(model_in).parent_path() / "tokenizer.bin";
+        const std::filesystem::path bundled = std::filesystem::path(model_in).parent_path() / "tokenizer.tok";
         std::error_code ec;
         if (std::filesystem::exists(bundled, ec)) tok_path = bundled.string();
     }
@@ -123,7 +123,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
 }
 
 // Dump the build's BPE vocabulary as a readable table. Inspection only; no model
-// is loaded. `tokenizer_path` may be null to use the baked-in tokenizer.bin, and
+// is loaded. `tokenizer_path` may be null to use the baked-in tokenizer.tok, and
 // `limit <= 0` prints every entry.
 extern "C" SUB0_API int sub0_vocab_stage(const char* tokenizer_path, int limit) {
     const char* path = tokenizer_path ? tokenizer_path : sub0::default_tokenizer();

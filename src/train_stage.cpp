@@ -345,6 +345,43 @@ void atomic_replace(const std::filesystem::path& tmp, const std::filesystem::pat
     }
 }
 
+// Pin an artifact from the live build tree into the model directory: self-contained, and immune to a
+// later `configure` (for another corpus, or a plain rebuild) overwriting the shared build-tree copy
+// out from under a LIVE run -- the failure mode a stray build command hit mid-session (a targeted,
+// unrelated build still cascaded into the auto-configure step and nearly clobbered a live train's
+// corpus.tok; see the memory notes on this). Training then loads its tokenizer/corpus exclusively
+// from this frozen copy, so the model.bin fingerprint stamped throughout the run stays consistent
+// with what actually trained it, and the run survives a stray reconfigure entirely.
+//
+// Prefers a HARDLINK (near-instant, zero extra disk -- correct even for a many-GB corpus.tok, since
+// the configurator's writer never mutates a file in place: it writes a .tmp then atomically renames
+// it over the target, which repoints the build tree's directory entry to NEW data while this
+// hardlink's entry keeps pointing at the OLD data, untouched). Falls back to a real copy only for
+// files under `copy_fallback_max_bytes` (a full copy of a many-GB corpus.tok would be slow/costly
+// exactly when hardlinking matters most); above that limit a failed hardlink just warns and the
+// caller keeps using the live path (same risk as before this fix, not worse). Returns the path to
+// use: the pinned copy on success, `src` unchanged on failure/skip.
+std::filesystem::path bundle_into_model_dir(const std::filesystem::path& src,
+                                            const std::filesystem::path& dst,
+                                            std::uintmax_t copy_fallback_max_bytes) {
+    std::error_code ec;
+    if (!std::filesystem::exists(src, ec)) return src;
+    if (std::filesystem::weakly_canonical(src, ec) == std::filesystem::weakly_canonical(dst, ec)) return src;
+    std::filesystem::remove(dst, ec);                          // drop a stale pin from an earlier run
+    ec.clear();
+    std::filesystem::create_hard_link(src, dst, ec);
+    if (!ec) return dst;
+    const std::uintmax_t sz = std::filesystem::file_size(src, ec);
+    if (!ec && sz <= copy_fallback_max_bytes) {
+        ec.clear();
+        std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) return dst;
+    }
+    sub0::log::warn("could not pin '{}' into the model dir: {} -- training will read the live build-tree "
+                    "copy, which a later `configure` run could change underneath it", src.string(), ec.message());
+    return src;
+}
+
 // Write magic + the constexpr config (validated on load) + continuation state +
 // RNG + eval history + parameters + both Adam moments. Written to a temp file then
 // renamed so a crash mid-write never corrupts a usable checkpoint. The step budget
@@ -595,17 +632,66 @@ static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep) {
+    // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
+    // structured, identity-named directory (corpus + dims + git SHA) under the models root and
+    // register it with a meta.txt, so `models` can discover it and prune incompatible ones. The
+    // derived path is deterministic, so re-running `train` with no path resumes the same model.
+    // Resolved FIRST (before touching the tokenizer/corpus) so the pinning below has somewhere to
+    // pin into.
+    std::string model_path;
+    std::filesystem::path meta_dir;
+    const std::string created = sub0::registry::now_iso();
+    long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
+    if (model_out && *model_out) {
+        model_path = model_out;
+        // Accept a model DIRECTORY too (e.g. resuming `models/<name>`): use its model.bin, so a dir path
+        // doesn't mis-resolve the checkpoint to "<dir>.ckpt", silently start fresh, and nest a new dir.
+        if (std::filesystem::is_directory(model_path))
+            model_path = (std::filesystem::path(model_path) / "model.bin").string();
+        meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
+    } else {
+        meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
+                                             D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
+                                             static_cast<int>(USE_TERNARY),
+                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
+        model_path = (meta_dir / "model.bin").string();
+    }
+    // Create the model directory up front (an explicit --out path may name a directory that doesn't
+    // exist yet -- previously only the auto-derived branch above did this, so train.log's set_file
+    // silently failed to open for a fresh explicit path; the pinning below has the same requirement).
+    if (!meta_dir.empty()) { std::error_code ec; std::filesystem::create_directories(meta_dir, ec); }
+    // Tee this run's progress into <model_dir>/train.log (append: a resume continues the same log),
+    // so a long/background run keeps its own trajectory next to the weights + meta.txt -- set up
+    // before the tokenizer/corpus loading below so a startup failure there is captured too.
+    if (!meta_dir.empty()) sub0::log::set_file((meta_dir / "train.log").string());
+    sub0::log::line("model dir: {}", model_path);
+
     // Training consumes the pre-tokenized corpus produced by the configurator, not
     // raw text. Any argument that is not a .tok file (including the driver's default
     // .txt corpus path) is intentionally ignored in favour of this build's baked-in
     // corpus.tok: the engine's VOCAB is fixed at configure time, so only the .tok the
     // configurator emitted for it can be trained against. To train on different text,
     // reconfigure/rebuild so the configurator retokenizes and re-bakes VOCAB.
+    //
+    // Both the tokenizer and the resolved corpus.tok are PINNED into the model directory (hardlink;
+    // see bundle_into_model_dir) before this run reads either one, so the model dir is self-contained
+    // and the whole run -- including every model.bin fingerprint stamped along the way -- is immune
+    // to a later `configure` (for another corpus, or a plain rebuild) changing the live build-tree
+    // copies out from under it. Without this, a stray build in the SAME directory (even one that
+    // doesn't touch the configurator) can cascade into a re-tokenize that clobbers the very corpus.tok
+    // this run has open.
     std::string tok_path = corpus_path ? corpus_path : "";
     if (tok_path.size() < 4 || tok_path.compare(tok_path.size() - 4, 4, ".tok") != 0)
         tok_path = sub0::default_corpus_tok();
+    std::string tok_tokenizer_path = sub0::default_tokenizer();
+    if (!meta_dir.empty()) {
+        tok_tokenizer_path = bundle_into_model_dir(tok_tokenizer_path, meta_dir / "tokenizer.tok",
+                                                    1ull << 30).string();               // small: always copy-able
+        tok_path = bundle_into_model_dir(tok_path, meta_dir / "corpus.tok",
+                                         1ull << 30).string();                          // may be many GB: hardlink only
+    }
 
-    sub0::load_tokenizer(sub0::default_tokenizer());   // previews + on-demand encode
+    sub0::load_tokenizer(tok_tokenizer_path.c_str());   // previews + on-demand encode
     sub0::build_model();
 
     // Where training windows come from. train_span is sampled for training windows; val_span
@@ -698,47 +784,6 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::mt19937 rng(seed);
     RunState rs;
 
-    // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
-    // structured, identity-named directory (corpus + dims + git SHA) under the models root and
-    // register it with a meta.txt, so `models` can discover it and prune incompatible ones. The
-    // derived path is deterministic, so re-running `train` with no path resumes the same model.
-    std::string model_path;
-    std::filesystem::path meta_dir;
-    const std::string created = sub0::registry::now_iso();
-    long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
-    if (model_out && *model_out) {
-        model_path = model_out;
-        // Accept a model DIRECTORY too (e.g. resuming `models/<name>`): use its model.bin, so a dir path
-        // doesn't mis-resolve the checkpoint to "<dir>.ckpt", silently start fresh, and nest a new dir.
-        if (std::filesystem::is_directory(model_path))
-            model_path = (std::filesystem::path(model_path) / "model.bin").string();
-        meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
-    } else {
-        meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
-                                             D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                                             static_cast<int>(USE_TERNARY),
-                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
-        std::error_code ec; std::filesystem::create_directories(meta_dir, ec);
-        model_path = (meta_dir / "model.bin").string();
-    }
-    // Tee this run's progress into <model_dir>/train.log (append: a resume continues the same log),
-    // so a long/background run keeps its own trajectory next to the weights + meta.txt.
-    if (!meta_dir.empty()) sub0::log::set_file((meta_dir / "train.log").string());
-    sub0::log::line("model dir: {}", model_path);
-    // Bundle the tokenizer.bin this model is trained against INTO the model directory, so the model dir
-    // is a self-contained artifact (model.bin + meta.txt + tokenizer.bin). gen prefers this bundled copy
-    // over the build tree's tokenizer.bin -- which a later `configure` for another corpus would overwrite,
-    // silently mismatching the decoder to the weights (see engine_core's fingerprint guard).
-    if (!meta_dir.empty()) {
-        std::error_code ec;
-        const std::filesystem::path src = sub0::default_tokenizer();
-        const std::filesystem::path dst = meta_dir / "tokenizer.bin";
-        if (std::filesystem::exists(src) && std::filesystem::weakly_canonical(src, ec) !=
-                                            std::filesystem::weakly_canonical(dst, ec)) {
-            std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
-            if (ec) sub0::log::warn("could not bundle tokenizer.bin into the model dir: {}", ec.message());
-        }
-    }
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
         sub0::registry::ModelMeta m;

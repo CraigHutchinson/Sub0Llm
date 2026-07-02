@@ -120,7 +120,7 @@ A `sub0llm-tokenizer` tool (links `sub0_frontend`, **not** the engine) is worth 
 - **NOT a corpus preprocessor.** Bulk corpus→`corpus.tok` stays the configurator's job (it owns the scan,
   the out-of-core pipeline, the `.words` cache); don't duplicate it. `--dump-vocab` also stays in the
   configurator (it needs the corpus scan + the BPE-vs-Unigram A/B + the vocab curve). The tool operates on
-  a **built** `tokenizer.bin` + arbitrary sample input — the lighter, post-build inspector/exporter.
+  a **built** `tokenizer.tok` + arbitrary sample input — the lighter, post-build inspector/exporter.
 - **Test payoff**: engine-free, its round-trip is the existing fuzz property, and the export format is
   schema-checkable — more coverage in the fast target.
 

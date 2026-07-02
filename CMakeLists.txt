@@ -147,7 +147,7 @@ _sub0_prec_int(SUB0_PRECISION_ACT  SUB0_PRECISION_ACT_INT)
 # Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
 # OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
 # raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
-# tokenizer.bin are emitted either way, so the engine still builds.
+# tokenizer.tok are emitted either way, so the engine still builds.
 #
 # AUTO (the default) decides by SCALE rather than a fixed threshold: pre-tokenizing is a
 # clear win while the token copy stays page-cacheable, so emit it when the estimated
@@ -268,7 +268,7 @@ if(SUB0_AUTO_CONFIGURE)
   # change -- so a plain `cmake --build` is one-shot. Engine targets auto-depend on it (below).
   add_custom_command(
     OUTPUT  "${GEN_HEADER}"
-    BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.bin"
+    BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.tok"
                "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
     COMMAND ${_sub0_configure_cmd}
     DEPENDS sub0llm-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"

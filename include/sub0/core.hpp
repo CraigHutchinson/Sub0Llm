@@ -63,13 +63,13 @@ SUB0_API void print_config();                      // human-readable config + me
 SUB0_API bool fast_math();
 SUB0_API const char* default_corpus();             // baked-in corpus path
 SUB0_API const char* default_corpus_tok();         // baked-in tokenized corpus (corpus.tok)
-SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer (tokenizer.bin)
+SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer (tokenizer.tok)
 
 // --- Tokenizer (BPE, learned at build time, loaded at runtime) -------------
 // The corpus is pre-tokenized by sub0-configure, so training reads token ids
 // directly. Only generation needs the tokenizer: encode() turns a prompt into
 // ids (corpus-aware truecasing + BPE), detokenize() turns ids back into text.
-SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.bin
+SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.tok
 SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
 SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
 // 64-bit identity fingerprint of the loaded tokenizer (0 if none). save_model stamps this so a

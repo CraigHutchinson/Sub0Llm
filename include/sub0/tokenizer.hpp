@@ -5,7 +5,7 @@
 // built around, factored out of the build-time configurator so it can run on an
 // IN-MEMORY corpus too. Both consumers share it:
 //   - sub0-configure streams a (possibly out-of-core) corpus through Scan and learn()
-//     to emit tokenizer.bin / corpus.tok;
+//     to emit tokenizer.tok / corpus.tok;
 //   - the engine loads a serialized Tokenizer and encode()s prompts at runtime;
 //   - the unit tests learn a tiny in-memory corpus and assert the encode/detokenize
 //     contracts deterministically, with no dependency on the baked production corpus.
@@ -150,7 +150,7 @@ Tokenizer learn(std::string_view corpus, const LearnOptions& opts = {});
 std::vector<int> encode(const Tokenizer& t, const std::string& text);
 std::string      detokenize(const Tokenizer& t, const std::vector<int>& ids);
 
-// --- Serialization (tokenizer.bin: base alphabet + merges + attested words) -
+// --- Serialization (tokenizer.tok: base alphabet + merges + attested words) -
 void serialize(const Tokenizer& t, std::ostream& os);
 bool deserialize(Tokenizer& t, std::istream& is);
 
@@ -159,7 +159,7 @@ bool deserialize(Tokenizer& t, std::istream& is);
 // pieces and attested set). A trained model stamps this so a decoder that does not match the vocab it
 // was trained against is caught loudly instead of silently emitting garble. Stable across a
 // serialize->deserialize round-trip (the value a saved model carries equals the value a reloaded
-// tokenizer.bin computes), and independent of attested-set iteration order (serialize sorts it).
+// tokenizer.tok computes), and independent of attested-set iteration order (serialize sorts it).
 std::uint64_t fingerprint(const Tokenizer& t);
 
 }  // namespace sub0::tok

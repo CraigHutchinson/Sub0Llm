@@ -1,5 +1,5 @@
 // tok_lib_tests.cpp — pure sub0::tok library tests, with NO dependency on the engine
-// or the baked production tokenizer.bin. The tokenizer was factored into a reusable
+// or the baked production tokenizer.tok. The tokenizer was factored into a reusable
 // library precisely so it can be exercised on small in-memory test corpora here,
 // deterministically and fast. This target (sub0_tok_tests) links only sub0_tok +
 // Catch2, so it builds and runs even while the engine DLLs are locked by a training run.
@@ -243,7 +243,7 @@ TEST_CASE("JOIN scheme: encode is deterministic", "[tok][join]") {
 
 // The fingerprint is what a trained model stamps to pin its decoder identity. Three properties matter:
 // it is deterministic; it SURVIVES a serialize->deserialize round-trip (the value a saved model carries
-// must equal the value gen recomputes from the reloaded tokenizer.bin, or the guard false-positives);
+// must equal the value gen recomputes from the reloaded tokenizer.tok, or the guard false-positives);
 // and it is SENSITIVE (a different vocab fingerprints differently, so a mismatch is actually caught).
 TEST_CASE("fingerprint: deterministic + survives a serialize round-trip", "[tok][fingerprint]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);

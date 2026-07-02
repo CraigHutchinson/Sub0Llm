@@ -8,7 +8,7 @@
 //
 //   - <out>            the constexpr header (model dims + final VOCAB + paths)
 //   - corpus.tok       the tokenized corpus (int32 stream) consumed by training
-//   - tokenizer.bin    the runtime tokenizer (base alphabet + merges + attested
+//   - tokenizer.tok    the runtime tokenizer (base alphabet + merges + attested
 //                      words) used only to encode prompts and detokenize output
 //
 // Training and generation therefore consume integer tokens directly; only
@@ -199,6 +199,22 @@ private:
     std::size_t cap_;
     bool done_ = false;
 };
+
+// Rename tmp -> dst, replacing any existing file at dst. So a crash/kill mid-write never leaves a
+// truncated corpus.tok / tokenizer.tok behind (the readable file at `dst` is always either the old
+// complete one or the new complete one, never a partial write) -- mirrors train_stage.cpp's
+// atomic_replace. This is also what makes a model dir's HARDLINKED pin of these files safe: a rename
+// repoints ONLY the `dst` directory entry to the new data, leaving any other hardlink (e.g. the one
+// train_stage.cpp pins into a model directory before it starts reading) pointing at the OLD data,
+// untouched -- an in-place truncate+rewrite at a fixed path would not have that property.
+void atomic_replace(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
+    std::error_code ec;
+    std::filesystem::rename(tmp, dst, ec);
+    if (ec) {  // some platforms (Windows) won't clobber an existing target
+        std::filesystem::remove(dst, ec);
+        std::filesystem::rename(tmp, dst, ec);
+    }
+}
 
 // --- Intermediate scan state (the cacheable output of the expensive corpus passes) -------
 // A complete snapshot of what passes 1-2 produce: the bounded name-detection COUNTS, the
@@ -624,7 +640,7 @@ int main(int argc, char** argv) {
         // look-back (so per-segment results equal whole-file results), and every downstream
         // artifact is INVARIANT to word-table ordering -- the base alphabet is byte-ordered, and
         // BPE picks each merge by (count, pair) where counts are order-independent sums and pair
-        // ids are byte-derived. So the merged scan (hence tokenizer.bin / corpus.tok) is byte-
+        // ids are byte-derived. So the merged scan (hence tokenizer.tok / corpus.tok) is byte-
         // identical to the single-thread scan regardless of how the corpus is partitioned.
         std::error_code fec;
         const std::size_t fsz = static_cast<std::size_t>(std::filesystem::file_size(corpus, fec));
@@ -728,11 +744,11 @@ int main(int argc, char** argv) {
 
     const std::filesystem::path gen_dir  = std::filesystem::path(out).parent_path();
     const std::filesystem::path tok_path = gen_dir / "corpus.tok";
-    const std::filesystem::path tkz_path = gen_dir / "tokenizer.bin";
+    const std::filesystem::path tkz_path = gen_dir / "tokenizer.tok";
 
     // --- Pass 3 (optional): stream the corpus once more and emit the merged token stream to
     //     corpus.tok incrementally (never materialised in memory). Skipped when --corpus-pretok
-    //     0: training then tokenizes windows on demand from the raw corpus + tokenizer.bin,
+    //     0: training then tokenizes windows on demand from the raw corpus + tokenizer.tok,
     //     avoiding the ~2x-on-disk token copy for a huge corpus. Each word unit looks up its
     //     post-BPE id sequence in the table; standalone symbols map straight to base ids.
     //     Losslessness is verified per chunk by reconstructing the base symbols; the id
@@ -740,9 +756,10 @@ int main(int argc, char** argv) {
     std::size_t token_count = 0;
     std::size_t doc_count   = 0;
     bool tok_rt = true;
+    const std::filesystem::path tok_tmp_path = tok_path.string() + ".tmp";
     if (emit_tok) {
-        std::ofstream ts(tok_path, std::ios::binary);
-        if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_path.string()); return 1; }
+        std::ofstream ts(tok_tmp_path, std::ios::binary);
+        if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_tmp_path.string()); return 1; }
         // v2 corpus.tok: u64 counts (a 46 GB corpus is ~14B tokens, past the legacy u32) + the minimal
         // byte-aligned token width for this vocab (16/24/32 bits) instead of a fixed int32.
         sub0::TokWriter tw(ts, vocab);
@@ -849,6 +866,10 @@ int main(int argc, char** argv) {
         tw.finish(doc_starts);                                      // u64 doc index + back-patch ntok/ndoc
         doc_count = doc_starts.size();
         ts.close();
+        // Atomic publish: a reader (training) that already has corpus.tok open, or a HARDLINKED pin
+        // of it in a model directory, is unaffected by this rename -- it keeps seeing the old complete
+        // file. Only a fresh open of `tok_path` after this point sees the new one.
+        atomic_replace(tok_tmp_path, tok_path);
     } else {
         // Drop any stale corpus.tok from a previous emit so training reliably falls back to
         // on-demand tokenization instead of mmapping an out-of-date token copy.
@@ -859,11 +880,14 @@ int main(int argc, char** argv) {
 
     // 9. Write the runtime tokenizer (base alphabet + merges + attested words).
     //    Generation uses this to encode prompts and detokenize output; training
-    //    needs only corpus.tok.
+    //    needs only corpus.tok. Same atomic tmp+rename publish as corpus.tok above.
     {
-        std::ofstream tz(tkz_path, std::ios::binary);
-        if (!tz) { std::println(stderr, "configure error: cannot write '{}'", tkz_path.string()); return 1; }
+        const std::filesystem::path tkz_tmp_path = tkz_path.string() + ".tmp";
+        std::ofstream tz(tkz_tmp_path, std::ios::binary);
+        if (!tz) { std::println(stderr, "configure error: cannot write '{}'", tkz_tmp_path.string()); return 1; }
         tok::serialize(tkz, tz);
+        tz.close();
+        atomic_replace(tkz_tmp_path, tkz_path);
     }
 
     // 10. Emit the generated headers, SPLIT so the corpus and the machine vary independently:
@@ -1054,7 +1078,7 @@ int main(int argc, char** argv) {
             total, total > 0 ? cmb / total : 0.0);
     }
     std::println(stderr, "round-trip truecase / tokenize:  OK / {}", tok_rt ? "OK" : "FAIL");
-    std::println(stderr, "corpus.tok / tokenizer.bin:      {} | {}",
+    std::println(stderr, "corpus.tok / tokenizer.tok:      {} | {}",
                  emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
     std::println(stderr, "-----------------------------------------------");
     if (!tok_rt) { std::println(stderr, "configure error: tokenization round-trip failed"); return 1; }
