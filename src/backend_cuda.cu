@@ -225,9 +225,12 @@ __device__ inline float dev_dgelu(float v) {
 }
 
 // h[m,j] = tok_emb[ids[m], j] + pos_emb[t, j], where m is the global row over batch*T and
-// t = m % T is the position WITHIN the window (op_embed + op_add: first forward step).
+// t = m % T is the position WITHIN the window (op_embed + op_add: first forward step). C is D_MODEL
+// at every call site below -- constexpr-folded (no loop to unroll here, pure elementwise; the win is
+// just the dropped runtime parameter). M/T stay runtime (genuinely vary).
 __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                 const int* __restrict__ ids, float* __restrict__ h, int M, int T, int C) {
+                                 const int* __restrict__ ids, float* __restrict__ h, int M, int T) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) {
@@ -239,7 +242,8 @@ __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float*
 // Token-only embedding (RoPE path): h[m,j] = tok_emb[ids[m], j]. Position is injected later by
 // the RoPE rotation inside attention, so there is no pos_emb add here.
 __global__ void embed_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
-                             float* __restrict__ h, int M, int C) {
+                             float* __restrict__ h, int M) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) h[m * C + j] = tok_emb[ids[m] * C + j];
@@ -249,14 +253,16 @@ __global__ void embed_kernel(const float* __restrict__ tok_emb, const int* __res
 // these identical to the float kernels above; BF16 stores half-width with FP32 source.
 template <class A>
 __global__ void embed_act_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
-                                 A* __restrict__ h, int M, int C) {
+                                 A* __restrict__ h, int M) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) st_act(&h[m * C + j], tok_emb[ids[m] * C + j]);
 }
 template <class A>
 __global__ void embed_add_act_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                     const int* __restrict__ ids, A* __restrict__ h, int M, int T, int C) {
+                                     const int* __restrict__ ids, A* __restrict__ h, int M, int T) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) { const int t = m % T; st_act(&h[m * C + j], tok_emb[ids[m] * C + j] + pos_emb[t * C + j]); }
@@ -348,8 +354,11 @@ rmsnorm_train_act_kernel(const X* __restrict__ x, const float* __restrict__ gamm
 // Build the fused QKV weight Wqkv[C, 3C] (row-major) from Wq,Wk,Wv [C,C]: row p holds
 // [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
 // into one a . Wqkv -> [M, 3C] (better-shaped GEMM + fewer launches).
+// C is D_MODEL at its one call site -- constexpr-folded, so the p=idx/C, c=idx%C split (GPU integer
+// div/mod has no native instruction) resolves at compile time instead of once per thread per layer.
 __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __restrict__ Wk,
-                                 const float* __restrict__ Wv, float* __restrict__ Wqkv, int C) {
+                                 const float* __restrict__ Wv, float* __restrict__ Wqkv) {
+    constexpr int C = D_MODEL;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over C*C elements of one source matrix
     if (idx < C * C) {
         const int p = idx / C, c = idx % C;
@@ -364,12 +373,18 @@ __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __re
 // qkv buffer in place, in interleaved pairs per head; V (cols [2C,3C)) is left alone. One thread
 // per (row m, global pair pg over C/2). pos = m % T (position within the window). Mirrors the CPU
 // op_rope; the math (CUDA __sincosf/powf vs CPU std::) agrees to fast-math tolerance.
-__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, int C, int H,
-                            int in_stride, float theta) {
+//
+// C, H, in_stride are D_MODEL/N_HEADS/3*D_MODEL at every call site (confirmed by grep) -- baked
+// constexpr, so used directly instead of as parameters. This also folds `d = C/H` from a per-thread
+// runtime division into the already-baked D_HEAD constant (GPU integer div/mod has no native
+// instruction; this ran over M*D_MODEL/2 threads every layer, every forward AND backward pass under
+// RoPE). T/batch stay runtime (genuinely vary, same as ce_backward_kernel's T).
+__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta) {
+    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL;
+    constexpr int d = D_HEAD, half = d / 2;
     const int pg = blockIdx.x * blockDim.x + threadIdx.x;   // pair over C/2 (heads x d/2)
     const int m  = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
     if (m >= batch * T || pg >= C / 2) return;
-    const int d  = C / H, half = d / 2;
     const int h  = pg / half, mi = pg % half;
     const int a0 = h * d + 2 * mi;
     const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d);
@@ -503,19 +518,22 @@ attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
     }
 }
 
-template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, int C, int H, int in_stride, float theta) {
+// C/H/in_stride constexpr-folded (D_MODEL/N_HEADS/3*D_MODEL, every call site) -- see rope_kernel above.
+template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, float theta) {
+    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL, d = D_HEAD, half = d / 2;
     const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= C / 2) return;
-    const int d = C / H, half = d / 2, h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
+    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
     const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
     A* row = qkv + static_cast<size_t>(m) * in_stride;
     const float q0 = to_f32(row[a0]), q1 = to_f32(row[a0 + 1]); st_act(&row[a0], q0*cs-q1*sn); st_act(&row[a0+1], q0*sn+q1*cs);
     const float k0 = to_f32(row[C+a0]), k1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], k0*cs-k1*sn); st_act(&row[C+a0+1], k0*sn+k1*cs);
 }
-template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, int C, int H, int in_stride, float theta) {
+template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, float theta) {
+    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL, d = D_HEAD, half = d / 2;
     const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= C / 2) return;
-    const int d = C / H, half = d / 2, h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
+    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
     const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
     A* row = dq + static_cast<size_t>(m) * in_stride;
     const float g0 = to_f32(row[a0]), g1 = to_f32(row[a0+1]); st_act(&row[a0], g0*cs+g1*sn); st_act(&row[a0+1], -g0*sn+g1*cs);
@@ -965,8 +983,10 @@ __global__ void embed_backward_token_kernel(const float* __restrict__ dh, const 
 
 // Split the fused QKV weight gradient dWqkv[C,3C] back into the per-projection grads dWq/dWk/dWv
 // [C,C] at their param-blob offsets (inverse of build_qkv_kernel). One thread per [C,C] element.
+// C is D_MODEL at its one call site -- constexpr-folded, same div/mod-fold reasoning as above.
 __global__ void split_dqkv_kernel(const float* __restrict__ dWqkv, float* __restrict__ dWq,
-                                  float* __restrict__ dWk, float* __restrict__ dWv, int C) {
+                                  float* __restrict__ dWk, float* __restrict__ dWv) {
+    constexpr int C = D_MODEL;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < C * C) {
         const int p = idx / C, c = idx % C;
@@ -1147,21 +1167,22 @@ inline void launch_attn(const float* dQ, const float* dK, const float* dV, float
     attn_fwd_tiled_kernel<float, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
-// One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows.
-inline void launch_rope(float* qkv, int batch, int T, int C, int H, int in_stride) {
+// One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows. C/H/in_stride dropped
+// as parameters -- constexpr-folded inside the kernels themselves, see rope_kernel above.
+inline void launch_rope(float* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_kernel<<<grid, block, 0, g_stream>>>(qkv, batch, T, C, H, in_stride, ROPE_THETA);
+    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_kernel<<<grid, block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
 }
-template <class A> inline void launch_rope_t(A* qkv, int batch, int T, int C, int H, int in_stride) {
+template <class A> inline void launch_rope_t(A* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_act_kernel<A><<<grid, block, 0, g_stream>>>(qkv, batch, T, C, H, in_stride, ROPE_THETA);
+    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_act_kernel<A><<<grid, block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
 }
-template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T, int C, int H, int in_stride) {
+template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((C / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_bwd_act_kernel<A><<<grid, block, 0, g_stream>>>(dqkv, batch, T, C, H, in_stride, ROPE_THETA);
+    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
+    rope_bwd_act_kernel<A><<<grid, block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA);
 }
 
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
@@ -1462,11 +1483,13 @@ __global__ void embed_one_kernel(const float* __restrict__ tok_emb, const float*
     h[j] = v;
 }
 // RoPE one row: rotate q (cols [0,C)) and k (cols [C,2C)) of a fused [3C] qkv row at position pos
-// (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched.
-__global__ void rope_one_kernel(float* __restrict__ qkv, int C, int H, int pos, float theta) {
+// (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched. C/H constexpr-folded (D_MODEL/
+// N_HEADS, its one call site) -- see rope_kernel above; pos stays runtime (the decode position).
+__global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta) {
+    constexpr int C = D_MODEL, d = D_HEAD, half = d / 2;
     const int pg = blockIdx.x * blockDim.x + threadIdx.x;
     if (pg >= C / 2) return;
-    const int d = C / H, half = d / 2, h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
+    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
     const float ang = static_cast<float>(pos) * powf(theta, -2.0f * mi / d);
     float sn, cs; __sincosf(ang, &sn, &cs);
     const float q0 = qkv[a0],     q1 = qkv[a0 + 1];     qkv[a0]     = q0 * cs - q1 * sn; qkv[a0 + 1]     = q0 * sn + q1 * cs;
@@ -1475,10 +1498,12 @@ __global__ void rope_one_kernel(float* __restrict__ qkv, int C, int H, int pos, 
 // Decode attention: the single (roped) query q[C] attends the cached K/V (rows over [SEQ_LEN,C]) for
 // j=0..pos -> att[C]. One block per head; blockDim=128. Shared: the query head + scores[pos+1]. The
 // math is the last-query row of op_attn, so att matches the full forward's final row to fp tolerance.
+// C is D_MODEL at its one call site -- constexpr-folded. H was a dead parameter (never read in the
+// body; the caller uses it only to size the launch's grid.x, one block per head, not passed in here).
 template <int HD>
 __global__ void attn_decode_kernel(const float* __restrict__ q, const float* __restrict__ kcache,
-                                   const float* __restrict__ vcache, float* __restrict__ att,
-                                   int pos, int C, int H) {
+                                   const float* __restrict__ vcache, float* __restrict__ att, int pos) {
+    constexpr int C = D_MODEL;
     extern __shared__ float sh[];                 // qh[HD] then sc[pos+1]
     float* qh = sh;
     float* sc = sh + HD;
@@ -1540,7 +1565,7 @@ void forward_one_device(int id, int pos) {
         launch_rmsnorm(h, ln1, a, 1);
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
-            const int blk = 128; rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, C, H, pos, ROPE_THETA);
+            const int blk = 128; rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
         }
         float* kc = g_kv_k + (static_cast<size_t>(l) * SEQ_LEN + pos) * C;          // append this token's K/V
         float* vc = g_kv_v + (static_cast<size_t>(l) * SEQ_LEN + pos) * C;
@@ -1548,7 +1573,7 @@ void forward_one_device(int id, int pos) {
         cudaMemcpyAsync(vc, qkv + 2 * C, C * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
           attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(l) * SEQ_LEN * C,
-                                                            g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C, att, pos, C, H); }
+                                                            g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C, att, pos); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
@@ -1593,9 +1618,9 @@ void forward_device(int batch, int T) {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
-            embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T, C);
+            embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T);
         else
-            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M, C);
+            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -1609,7 +1634,7 @@ void forward_device(int batch, int T) {
 
         launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1)
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T, C, H, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
         launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
         launch_add(h, proj, h, MC);                          // h = h + proj
@@ -1666,7 +1691,7 @@ void build_qkv_weights() {
         const float* Wq = g_dev_params + L[b0 + 2].off;
         const float* Wk = g_dev_params + L[b0 + 3].off;
         const float* Wv = g_dev_params + L[b0 + 4].off;
-        build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l], C);
+        build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
     }
     if constexpr (ACT_DTYPE == Dtype::BF16) {            // refresh FFN bf16 weight mirrors
         const int F = D_FF;
@@ -1731,9 +1756,9 @@ void forward_train(int batch, int T) {
         const dim3 block(16, 16);
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
-            embed_add_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T, C);
+            embed_add_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T);
         else
-            embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, C);
+            embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
@@ -1749,7 +1774,7 @@ void forward_train(int batch, int T) {
 
         launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M);          // a = rmsnorm(hin,ln1) bf16
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
@@ -1818,7 +1843,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
         launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M);
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
         launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + 5].off, M, C, C);
@@ -1826,13 +1851,13 @@ void backward_device(int batch, int T, const int* d_lengths) {
         launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd_t<act_t>(g_tr.dqkv, batch, T, C, H, 3 * C);
+        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd_t<act_t>(g_tr.dqkv, batch, T);
         // qkv backward (input a): da = grad into a (f32), dWqkv -> split into dWq/dWk/dWv
         launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, 3 * C);
         {
             const int n = C * C, block = 256;
             split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
-                g_tr.dwqkv, gb + L[b0 + 2].off, gb + L[b0 + 3].off, gb + L[b0 + 4].off, C);
+                g_tr.dwqkv, gb + L[b0 + 2].off, gb + L[b0 + 3].off, gb + L[b0 + 4].off);
         }
         launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
                            g_tr.dh, gb + L[b0 + 0].off, M);                          // dh += -> d(h_in)
