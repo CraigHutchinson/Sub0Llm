@@ -35,6 +35,7 @@
 #include <limits>
 #include <mdspan>
 #include <memory>
+#include <mutex>
 #include <print>
 #include <random>
 #include <ranges>
@@ -94,13 +95,26 @@ constexpr size_t MAX_NODES = 16 + 16 * (size_t)N_LAYERS;
 //  Static storage
 // ============================================================================
 
-// Shared across all worker threads: the weights (read-only during fwd/bwd), the
-// optimizer moments (touched only by AdamW::step on the main thread), and the
-// REDUCED gradient that AdamW::step consumes.
-static std::array<float, PARAM_FLOATS> g_param_data{};
-static std::array<float, PARAM_FLOATS> g_param_grad{};
-static std::array<float, PARAM_FLOATS> g_param_m{};
-static std::array<float, PARAM_FLOATS> g_param_vel{};
+// Shared across all worker threads: the weights (read-only during fwd/bwd), the optimizer moments
+// (touched only by AdamW::step on the main thread), and the REDUCED gradient that AdamW::step consumes.
+// HEAP-allocated (not static std::array): at a large config these are 4*PARAM_FLOATS floats -- e.g.
+// d768 ~= 2.6 GB -- and as zero-init BSS they push the DLL's SizeOfImage past what the Windows loader
+// will map, so the image fails to load with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This is the same
+// reason the per-thread Worker arrays below are heap-allocated. ensure_shared_params() allocates them
+// once (zeroed) before any parameter node references them; unique_ptr<float[]> keeps [] and .get().
+static std::unique_ptr<float[]> g_param_data;
+static std::unique_ptr<float[]> g_param_grad;
+static std::unique_ptr<float[]> g_param_m;
+static std::unique_ptr<float[]> g_param_vel;
+static std::once_flag           g_shared_params_once;
+static void ensure_shared_params() {
+    std::call_once(g_shared_params_once, [] {
+        g_param_data = std::make_unique<float[]>(PARAM_FLOATS);   // value-initialized -> zeroed
+        g_param_grad = std::make_unique<float[]>(PARAM_FLOATS);
+        g_param_m    = std::make_unique<float[]>(PARAM_FLOATS);
+        g_param_vel  = std::make_unique<float[]>(PARAM_FLOATS);
+    });
+}
 
 struct ParamView { size_t off, n; bool decay; };
 
@@ -156,7 +170,7 @@ static Node* mk_param(int r, int c, bool decay) {
     Node& nd = W->param_nodes[W->pcount];
     nd = Node{};
     nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
-    nd.data = std::span<float>(g_param_data.data() + off, n);   // shared weights
+    nd.data = std::span<float>(g_param_data.get() + off, n);    // shared weights
     nd.grad = std::span<float>(W->grad.data() + off, n);        // this thread's grad accumulator
     W->views[W->pcount] = {off, n, decay};
     ++W->pcount;
@@ -821,10 +835,11 @@ static inline void set_flush_denormals() {
 // Bind the calling thread to its Worker slot and lay out its parameter nodes once.
 // `W` (thread_local) doubles as the guard: once non-null the thread is bound and
 // g_model is populated, so the hot path early-outs without touching the OpenMP
-// runtime. Buffers are static BSS (not heap); the reduction reads each slot's grad
-// directly, so there is nothing to register.
+// runtime. The shared arenas and each Worker are heap-allocated (see above); the
+// reduction reads each slot's grad directly, so there is nothing to register.
 static void ensure_thread_built() {
     if (W) return;
+    ensure_shared_params();                               // heap-alloc the shared weight/grad/moment arenas once
     set_flush_denormals();                                // FTZ/DAZ for this thread's MXCSR
     const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
     // Each thread owns its slot (unique tid within the team), so this lazy alloc needs no lock.
@@ -848,7 +863,7 @@ void build_model() {
 
 void print_config() {
     std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
-                 "static mem: params {:.1f}MB acts {:.1f}MB | math: {}",
+                 "heap mem: params {:.1f}MB acts {:.1f}MB | math: {}",
                  D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                  USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
                  4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6,
@@ -869,10 +884,10 @@ void print_config() {
 bool fast_math() { return FAST_MATH; }
 
 std::size_t trainable_floats() { return PARAM_FLOATS; }
-float*      params_ptr()       { return g_param_data.data(); }
-float*      grad_ptr()         { return g_param_grad.data(); }   // reduced grad the optimizer reads
-float*      adam_m_ptr()       { return g_param_m.data(); }
-float*      adam_v_ptr()       { return g_param_vel.data(); }
+float*      params_ptr()       { ensure_shared_params(); return g_param_data.get(); }
+float*      grad_ptr()         { ensure_shared_params(); return g_param_grad.get(); }  // reduced grad the optimizer reads
+float*      adam_m_ptr()       { ensure_shared_params(); return g_param_m.get(); }
+float*      adam_v_ptr()       { ensure_shared_params(); return g_param_vel.get(); }
 
 // CPU backend: parameters already live in host memory, so the host/device sync hooks
 // are no-ops. A device backend overrides these to copy the params_ptr()/adam_*_ptr()
@@ -901,7 +916,7 @@ void backward(Node* loss, float seed) {
 
 // Single-window reduction: publish this thread's accumulator as the shared gradient
 // the optimizer consumes. (train_batch does the parallel multi-thread reduction.)
-void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.begin()); }
+void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.get()); }
 
 // Data-parallel minibatch: each window's full forward+backward runs on its own
 // thread into a private gradient accumulator, then the accumulators are summed into
