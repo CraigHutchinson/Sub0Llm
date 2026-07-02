@@ -513,40 +513,59 @@ template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int b
     const float h0 = to_f32(row[C+a0]), h1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], h0*cs+h1*sn); st_act(&row[C+a0+1], -h0*sn+h1*cs);
 }
 
-// Cross-entropy backward (op_cross_entropy): one thread per row m over [M,V]. Row m belongs to
-// window b = m/T at position t = m%T. Positions t >= lengths[b] are PADDING (a short document
-// padded up to T): they get zero gradient and add no loss. Each trained row is weighted 1/(batch*
-// len[b]) so the loss/grad is the per-window mean over its real length, then the mean over the
-// batch -- identical to the CPU train_batch reduction, and exactly 1/M when every window is full
-// (len == T, lengths == nullptr), which keeps the dense gradient-parity gate unchanged.
-__global__ void ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
-                                   float* __restrict__ dlogits, double* __restrict__ loss_acc,
-                                   int M, int V, int T, int batch, const int* __restrict__ lengths) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+// Cross-entropy backward (op_cross_entropy): one BLOCK per row m over [M,V], threads striding
+// coalesced over V (was one thread per row doing 3 fully sequential O(V) passes -- ncu at V=16489
+// measured 30.3ms/call, 28% occupancy, 4.7% compute throughput, the same uncoalesced-warp pattern as
+// the rmsnorm kernels above: adjacent threads owned adjacent ROWS, so a fixed loop iteration touched
+// addresses V floats apart). Row m belongs to window b = m/T at position t = m%T. Positions
+// t >= lengths[b] are PADDING (a short document padded up to T): they get zero gradient and add no
+// loss. Each trained row is weighted 1/(batch*len[b]) so the loss/grad is the per-window mean over its
+// real length, then the mean over the batch -- identical to the CPU train_batch reduction, and exactly
+// 1/M when every window is full (len == T, lengths == nullptr), which keeps the dense gradient-parity
+// gate unchanged.
+//
+// V is VOCAB, a baked constexpr (this kernel's one call site always passes it), used directly instead
+// of as a parameter. UNLIKE D_MODEL in the rmsnorm kernels above, V is NOT unrolled -- it runs into
+// the tens of thousands (32873 in the production config), so a full #pragma unroll would be a
+// code-size/I-cache disaster for a handful fewer loop-branch instructions; the real win here is
+// coalescing + parallelizing the O(V) work across BLOCK threads, same as the reduction itself. T stays
+// a runtime parameter (unlike V, it genuinely varies -- benchmark/self-test paths call this with a
+// window length shorter than SEQ_LEN).
+template <int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
+                   float* __restrict__ dlogits, double* __restrict__ loss_acc,
+                   int M, int T, int batch, const int* __restrict__ lengths) {
+    constexpr int V = VOCAB;
+    const int m = blockIdx.x;
     if (m >= M) return;
     const int b   = m / T;
     const int t   = m - b * T;
     const int len = lengths ? lengths[b] : T;
     float* dl     = dlogits + static_cast<size_t>(m) * V;
     if (t >= len) {                                  // padding row: inert (no grad, no loss)
-        for (int j = 0; j < V; ++j) dl[j] = 0.f;
+        for (int j = threadIdx.x; j < V; j += BLOCK) dl[j] = 0.f;
         return;
     }
     const float* lr = logits + static_cast<size_t>(m) * V;
     const int tgt   = targets[m];
-    float mx = -1e30f;
-    for (int j = 0; j < V; ++j) mx = fmaxf(mx, lr[j]);
-    float Z = 0.f;
-    for (int j = 0; j < V; ++j) Z += __expf(lr[j] - mx);
+    float mx_partial = -1e30f;
+    for (int j = threadIdx.x; j < V; j += BLOCK) mx_partial = fmaxf(mx_partial, lr[j]);
+    const float mx = block_reduce_max<BLOCK>(mx_partial);
+    float Z_partial = 0.f;
+    for (int j = threadIdx.x; j < V; j += BLOCK) Z_partial += __expf(lr[j] - mx);
+    const float Z = block_reduce_sum<BLOCK>(Z_partial);
     const float invZ = 1.f / Z;
     const float w    = 1.0f / (static_cast<float>(batch) * static_cast<float>(len));   // per-window mean
-    float ptgt = 0.f;                                // capture before any write (dlogits may alias logits)
-    for (int j = 0; j < V; ++j) {
+    float ptgt_partial = 0.f;                        // capture before any write (dlogits may alias logits)
+    for (int j = threadIdx.x; j < V; j += BLOCK) {
         const float p = __expf(lr[j] - mx) * invZ;
-        if (j == tgt) ptgt = p;
+        if (j == tgt) ptgt_partial = p;               // exactly one thread across the block owns j==tgt
         dl[j] = w * (p - (j == tgt ? 1.f : 0.f));    // safe in-place: reads lr[j] then writes dl[j]
     }
-    atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
+    const float ptgt = block_reduce_sum<BLOCK>(ptgt_partial);   // sum isolates the one nonzero contributor
+    if (threadIdx.x == 0)
+        atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
 }
 
 // Bias gradient: dbias[o] = sum_m dY[m,o] (one thread per output column).
@@ -1751,9 +1770,9 @@ void backward_device(int batch, int T, const int* d_lengths) {
 
     // cross-entropy: per-window-mean dlogits with padding masked out (d_lengths; nullptr = all full T)
     {
-        const int block = 256;
-        ce_backward_kernel<<<(M + block - 1) / block, block, 0, g_stream>>>(
-            g_tr.logits, g_tr.dtargets, g_tr.dlogits, g_tr.loss, M, V, T, batch, d_lengths);
+        constexpr int kCeBlock = 256;   // one block per row; see ce_backward_kernel above
+        ce_backward_kernel<kCeBlock><<<M, kCeBlock, 0, g_stream>>>(
+            g_tr.logits, g_tr.dtargets, g_tr.dlogits, g_tr.loss, M, T, batch, d_lengths);
     }
     // lm_head: dW/dbias -> grad blob, da = grad into a_final
     launch_linear_bwd(g_tr.a_final, pb + L[fi + 1].off, g_tr.dlogits, g_tr.da,
