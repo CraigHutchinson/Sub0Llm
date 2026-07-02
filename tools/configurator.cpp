@@ -921,36 +921,10 @@ int main(int argc, char** argv) {
     int       default_gpu_batch  = td.gpu_batch;            // derived from the width if untuned; clamped to VRAM below
     if (td.tf32_from_cache) cuda_tf32 = td.cuda_tf32 ? 1 : 0;
 
-    // Keep DEFAULT_GPU_BATCH within the VRAM budget. The batch sizes the resident device training
-    // scratch; on Windows an over-budget cudaMalloc does not OOM, it silently spills to WDDM shared
-    // memory and thrashes over PCIe (~10x slower) -- a silent performance cliff. A cached batch tuned
-    // for a SMALLER model goes stale when the corpus auto-sizes UP, so rather than hard-blocking the
-    // build we CLAMP to the largest batch that fits -- the SAME memplan primitive the tuner bounds its
-    // sweep with, so the two agree -- and warn to re-tune for the optimum. Only a model too big for
-    // even batch 1 is a hard error.
-    if (has_cuda && gpu_vram_mb > 0) {
-        const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, 4 * d_model, seq_len, vocab };
-        const int need = sub0::memplan::train_resident_mb(dims, default_gpu_batch);
-        if (need > gpu_vram_mb) {
-            const int fit = sub0::memplan::max_batch_for_vram(dims, gpu_vram_mb, default_gpu_batch);
-            if (fit >= 1) {
-                std::println(stderr,
-                             "configure warning: cached DEFAULT_GPU_BATCH={} needs ~{} MiB but only {} MiB VRAM "
-                             "is available -- clamping to {}. Re-tune (`sub0llm-tune --backend gpu`) for the optimum.",
-                             default_gpu_batch, need, gpu_vram_mb, fit);
-                default_gpu_batch = fit;
-            } else {
-                std::println(stderr,
-                             "configure error: the model needs ~{} MiB for even batch 1 but only {} MiB VRAM is "
-                             "available. Reduce the model size (or build CPU-only) before rebuilding.",
-                             sub0::memplan::train_resident_mb(dims, 1), gpu_vram_mb);
-                return 1;
-            }
-        }
-    }
-
-    // Resolve precision FIRST (it can error) so no header is half-written on a bad --prec choice.
-    // Float16 capability is a detected hardware fact (BF16 needs sm_80+); F16/Q8/Q4 are reserved.
+    // Resolve precision FIRST (it can error, so no header is half-written on a bad --prec choice; it
+    // is ALSO needed by the VRAM clamp just below -- activation byte width changes the resident
+    // footprint by 2x, so this must run before that clamp, not after it as it used to). Float16
+    // capability is a detected hardware fact (BF16 needs sm_80+); F16/Q8/Q4 are reserved.
     const bool f16_ok = sub0::config::f16_capable(bf16, cuda_arch);
     const auto resolve_dtype = [&](int code, const char* section) -> std::string {
         const sub0::config::Precision p = sub0::config::resolve_precision(code, f16_ok);
@@ -964,6 +938,41 @@ int main(int argc, char** argv) {
     };
     const std::string gemm_dt = resolve_dtype(prec_gemm, "GEMM");
     const std::string act_dt  = resolve_dtype(prec_act, "activations");
+
+    // Keep DEFAULT_GPU_BATCH within the VRAM budget. The batch sizes the resident device training
+    // scratch; on Windows an over-budget cudaMalloc does not OOM, it silently spills to WDDM shared
+    // memory and thrashes over PCIe (~10x slower) -- a silent performance cliff. A cached batch tuned
+    // for a SMALLER model goes stale when the corpus auto-sizes UP, so rather than hard-blocking the
+    // build we CLAMP to the largest batch that fits -- the SAME memplan primitive the tuner bounds its
+    // sweep with, so the two agree -- and warn to re-tune for the optimum. Only a model too big for
+    // even batch 1 is a hard error.
+    //
+    // act_bytes MUST match the activation precision actually resolved above: this clamp used to
+    // default to memplan::FLOAT (4 bytes) unconditionally, silently modeling the F32 footprint on a
+    // BF16 build (2 bytes) -- a real ~2x sizing error that happened to roughly cancel against a
+    // separate missing-headroom gap at this project's exact current config, so it wasn't visibly
+    // broken, but is not a bet worth relying on for other dims/cards.
+    if (has_cuda && gpu_vram_mb > 0) {
+        const sub0::memplan::u64 act_bytes = (act_dt == "BF16") ? 2 : sub0::memplan::FLOAT;
+        const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, 4 * d_model, seq_len, vocab };
+        const int need = sub0::memplan::train_resident_mb(dims, default_gpu_batch, act_bytes);
+        if (need > gpu_vram_mb) {
+            const int fit = sub0::memplan::max_batch_for_vram(dims, gpu_vram_mb, default_gpu_batch, act_bytes);
+            if (fit >= 1) {
+                std::println(stderr,
+                             "configure warning: cached DEFAULT_GPU_BATCH={} needs ~{} MiB but only {} MiB VRAM "
+                             "is available -- clamping to {}. Re-tune (`sub0llm-tune --backend gpu`) for the optimum.",
+                             default_gpu_batch, need, gpu_vram_mb, fit);
+                default_gpu_batch = fit;
+            } else {
+                std::println(stderr,
+                             "configure error: the model needs ~{} MiB for even batch 1 but only {} MiB VRAM is "
+                             "available. Reduce the model size (or build CPU-only) before rebuilding.",
+                             sub0::memplan::train_resident_mb(dims, 1, act_bytes), gpu_vram_mb);
+                return 1;
+            }
+        }
+    }
 
     // --- corpus header: the model identity (dims + vocab + tokenizer scheme + paths), per corpus ---
     cos << "// AUTO-GENERATED by sub0-configure (corpus-specific). Do not edit.\n";
