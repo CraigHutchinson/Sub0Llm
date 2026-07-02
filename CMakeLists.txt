@@ -83,12 +83,17 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
 # --- Stage-1 "runtime arguments": passed through as cache variables ----------
 set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
-# Auto-run the configurator during the build to (re)generate the config headers. ON (default) keeps the
-# convenient one-shot `cmake --build` flow. OFF gives the pure staged workflow: build sub0llm-configure,
-# run it yourself (`sub0llm-configure --corpus <c>`), then build the engine -- the build never regenerates
-# config behind your back. `cmake --build <dir> --target sub0_generate_config` regenerates on demand in
-# either mode. See docs/WORKFLOW_ARCHITECTURE.md.
-option(SUB0_AUTO_CONFIGURE "Auto-run the configurator during the build (OFF = run sub0llm-configure manually)" ON)
+# Auto-run the configurator during the build to (re)generate the config headers. OFF (default, since
+# 2026-07-02) is the pure staged workflow: build sub0llm-configure, run it yourself
+# (`sub0llm-configure --corpus <c>`, or scripts/workflow.ps1), then build the engine -- the build never
+# regenerates config behind your back. Flipped from the original ON default after a large (46 GB)
+# corpus reconfigure, triggered silently as a side effect of an unrelated `cmake --build`, was hard to
+# distinguish from a hung build and got accidentally re-launched concurrently by repeated retries --
+# an easy mistake ON invites because the expensive step isn't a command you typed. ON keeps the
+# one-shot `cmake --build` convenience (the build regenerates config whenever the corpus/tool/tune
+# cache changed) for anyone who prefers it. `cmake --build <dir> --target sub0_generate_config`
+# regenerates on demand in either mode. See docs/WORKFLOW_ARCHITECTURE.md.
+option(SUB0_AUTO_CONFIGURE "Auto-run the configurator during the build (OFF = run sub0llm-configure manually)" OFF)
 # Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0llm-configure AUTO-SIZES
 # them from the corpus scale and bakes them into the generated header. To pin a size, run the
 # configurator directly: `sub0llm-configure --corpus <c> --dmodel N --layers N ... -o <header>`.

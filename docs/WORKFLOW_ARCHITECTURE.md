@@ -64,14 +64,20 @@ that turns runtime-discovered facts into compile-time constants.
 2. **Gate the stage targets on configure + a lever to fully decouple.** ✅ **DONE** — each
    `sub0llm-<stage>` auto-depends on `sub0_generate_config` (so it can't build before the config exists);
    `sub0llm-configure` itself has no such dependency (state-1 buildable). **`SUB0_AUTO_CONFIGURE`**
-   (default ON) is the lever: ON keeps the one-shot convenience (the build regenerates config when the
-   corpus/tool/tune-cache change); **OFF** is the pure staged workflow — the build never regenerates
-   behind your back, `sub0_generate_config` becomes an explicit on-demand target, and the engine compiles
-   against the existing header (gating only the dependency was insufficient — the header is a custom-command
-   OUTPUT, so OFF swaps it for a COMMAND-only target). Even with ON the core decouple holds: dims live in
-   tool-owned headers, so `sub0llm-configure …` + `cmake --build` re-sizes with **no CMake reconfigure**.
-   The strict `EXISTS`-gate + `CMAKE_CONFIGURE_DEPENDS` (fresh checkout builds *only* the configurator)
-   remains an optional stricter variant.
+   (default **OFF**, since 2026-07-02 — was ON) is the lever: OFF is the pure staged workflow — the build
+   never regenerates behind your back, `sub0_generate_config` becomes an explicit on-demand target, and
+   the engine compiles against the existing header (gating only the dependency was insufficient — the
+   header is a custom-command OUTPUT, so OFF swaps it for a COMMAND-only target). ON keeps the one-shot
+   convenience (the build regenerates config when the corpus/tool/tune-cache change) for anyone who
+   prefers it. **Why OFF is now the default**: a large corpus reconfigure triggered silently as a side
+   effect of an unrelated `cmake --build` is hard to tell apart from a hung build, and retrying it (a
+   natural reaction to an apparently-stuck build) can launch a second reconfigure concurrently with the
+   first, racing on the same output files — precisely because the expensive step wasn't something anyone
+   typed, there was nothing to *not* retry. `scripts/workflow.ps1` now does the explicit
+   `sub0llm-configure` step itself, so this default flip doesn't change its behavior. Even with OFF the
+   core decouple holds: dims live in tool-owned headers, so `sub0llm-configure …` + `cmake --build`
+   re-sizes with **no CMake reconfigure**. The strict `EXISTS`-gate + `CMAKE_CONFIGURE_DEPENDS` (fresh
+   checkout builds *only* the configurator) remains an optional stricter variant.
 3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
    the engine share one site. ✅ **DONE** — the static lib `sub0_frontend` (was `sub0_tok`) compiles the
    tokenizer/unigram and exposes the header-only pre-model logic via its PUBLIC include; the configurator
