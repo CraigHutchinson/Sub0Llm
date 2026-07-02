@@ -358,6 +358,16 @@ constexpr int kAttnTileQ = 64;
 // HD is a separate, still-open perf item: 4*HD accumulators spill; a DV/DK split would help.)
 template <int HD> constexpr int attn_tile_q() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
 
+// Warp-cooperative channel split for the dq kernel: LANES threads (a power of 2) share one query,
+// each owning HD/LANES channels of qr/dr/dqa, so the per-thread register need drops from 3*HD to
+// 3*(HD/LANES). Only engaged where the FULL 3*HD would exceed the 255-register architectural cap
+// (verified via ptxas -v -- neither #pragma unroll nor a smaller __launch_bounds__ hint change that
+// cap; 255 is a hardware ceiling, not a launch-config artifact). LANES=1 makes every formula in the
+// kernel below reduce algebraically to today's single-thread-per-query code (lane=0, HALF=HD), so
+// existing small-HD builds (e.g. ts_gpu's HD=32) take an UNCHANGED path -- this only activates at
+// large HD (e.g. native's HD=96, where 3*96=288 > 255).
+template <int HD> __host__ __device__ constexpr int attn_dq_lanes() { return (3 * HD > 255 && HD % 2 == 0) ? 2 : 1; }
+
 template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(kAttnTileQ)
 attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
@@ -627,51 +637,69 @@ attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
 }
 
 // (2) dq (query-parallel, tiled over keys): dq_i = sum_{j<=i} ds_ij k_j, owned per query (no atomics).
+// LANES threads warp-cooperate per query at large HD (attn_dq_lanes<HD>() above): each owns HALF =
+// HD/LANES channels of qr/dr/dqa (register need 3*HALF instead of 3*HD), and the two partial dot
+// products (s, dp) that need the FULL HD range are combined via a warp-shuffle XOR between the pair.
+// LANES=1 makes lane=0, HALF=HD, qi_local=threadIdx.x, and the `if constexpr` shuffle branch compile
+// away entirely -- algebraically IDENTICAL to the pre-split single-thread-per-query kernel, so small-
+// HD builds are unaffected in code path or performance.
 template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(kAttnTileQ)
 attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
                    A* __restrict__ dq, int T, int C, int in_stride) {
+    constexpr int LANES = attn_dq_lanes<HD>();
+    constexpr int HALF  = HD / LANES;
     __shared__ float Ks[TILE_K * HD];
     __shared__ float Vs[TILE_K * HD];
     const int    b = blockIdx.z, h = blockIdx.y;
-    const int    q0 = blockIdx.x * blockDim.x, i = q0 + threadIdx.x;
-    const int    off = h * HD;
+    const int    lane     = threadIdx.x % LANES;              // which HALF-channel slice this thread owns
+    const int    qi_local = threadIdx.x / LANES;               // this pair's query slot within the block
+    const int    q0 = blockIdx.x * (static_cast<int>(blockDim.x) / LANES), i = q0 + qi_local;
+    const int    stage_off = h * HD;                           // unshifted: Ks/Vs staging covers the FULL HD
+    const int    off = stage_off + lane * HALF;                 // shifted: this thread's own channel half
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
-    float qr[HD], dr[HD], dqa[HD];
+    float qr[HALF], dr[HALF], dqa[HALF];
     float mi = 0.f, invZi = 0.f, doti = 0.f;
     if (i < T) {
-        const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
-        const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
+        const A* qi_p = q + in_base + static_cast<size_t>(i) * in_stride + off;
+        const A* di_p = dout + out_base + static_cast<size_t>(i) * C + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) { qr[a] = to_f32(qi[a]); dr[a] = to_f32(di[a]); dqa[a] = 0.f; }
+        for (int a = 0; a < HALF; ++a) { qr[a] = to_f32(qi_p[a]); dr[a] = to_f32(di_p[a]); dqa[a] = 0.f; }
         const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + i;
         mi = stat_m[sidx]; invZi = stat_invZ[sidx]; doti = stat_dot[sidx];
     }
-    const int jmax = min(T, q0 + static_cast<int>(blockDim.x));
+    const int jmax = min(T, q0 + static_cast<int>(blockDim.x) / LANES);
     for (int j0 = 0; j0 < jmax; j0 += TILE_K) {
         const int tk = min(TILE_K, jmax - j0);
         __syncthreads();
         for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
             const int jl = e / HD, a = e - jl * HD;
-            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + stage_off;
             Ks[e] = to_f32(k[row + a]); Vs[e] = to_f32(v[row + a]); }
         __syncthreads();
         if (i < T) { const int jend = min(tk, i - j0 + 1);
-            for (int jl = 0; jl < jend; ++jl) { const float* ks = Ks + jl * HD; const float* vs = Vs + jl * HD;
+            for (int jl = 0; jl < jend; ++jl) {
+                const float* ks = Ks + jl * HD + lane * HALF;   // this thread's channel half of key j
+                const float* vs = Vs + jl * HD + lane * HALF;
                 float s = 0.f, dp = 0.f;
                 #pragma unroll
-                for (int a = 0; a < HD; ++a) { s += qr[a] * ks[a]; dp += dr[a] * vs[a]; }
+                for (int a = 0; a < HALF; ++a) { s += qr[a] * ks[a]; dp += dr[a] * vs[a]; }
+                if constexpr (LANES > 1) {                      // combine the two lanes' partial dot products
+                    const unsigned mask = __activemask();       // pair is always both-active or both-inactive
+                    s  += __shfl_xor_sync(mask, s,  1);          // (same query i -> same i<T branch outcome)
+                    dp += __shfl_xor_sync(mask, dp, 1);
+                }
                 const float p = __expf(s * scale - mi) * invZi, ds = p * (dp - doti) * scale;
                 #pragma unroll
-                for (int a = 0; a < HD; ++a) dqa[a] += ds * ks[a]; } }
+                for (int a = 0; a < HALF; ++a) dqa[a] += ds * ks[a]; } }
     }
     if (i < T) { A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) st_act(&dqi[a], dqa[a]); }
+        for (int a = 0; a < HALF; ++a) st_act(&dqi[a], dqa[a]); }
 }
 
 // (3) dk/dv (key-parallel, tiled over queries), SPLIT into two kernels by register need. The combined
@@ -1071,13 +1099,17 @@ inline void free_bwd_stats() {
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
+    constexpr int DQ_LANES = attn_dq_lanes<HD>();
     if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
     const dim3 block(kAttnTileQ);
     const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    // dq's block covers kAttnTileQ/DQ_LANES queries (LANES threads warp-cooperate per query at large
+    // HD; see attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks.
+    const dim3 grid_dq((T + kAttnTileQ / DQ_LANES - 1) / (kAttnTileQ / DQ_LANES), H, batch);
     const A* q = qkv; const A* k = qkv + C; const A* v = qkv + 2 * C;
     A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
     attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
-    attn_bwd_dq_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
+    attn_bwd_dq_kernel<A, HD, TK><<<grid_dq, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
     attn_bwd_dv_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, dout, g_bwd_m, g_bwd_invZ, dv, T, C, in_stride);
     attn_bwd_dk_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
 }
@@ -2299,6 +2331,39 @@ SUB0_CUDA_API int sub0_cuda_attn_bwd_check(int batch, int T, int iters,
     if (out_maxreldiff) *out_maxreldiff = reldiff;
     if (out_speedup)    *out_speedup    = speedup;
     return ok ? 0 : 2;
+}
+
+// Register/local-memory-spill regression guard for the five flash-attention kernels: query the
+// ACTUAL compiled kernel attributes via the CUDA runtime (cudaFuncGetAttributes), not by parsing
+// ptxas -v text output -- deterministic and load-independent, same philosophy as the speedup RATIO
+// above (not wall-clock). cudaFuncAttributes::localSizeBytes > 0 means the kernel is spilling
+// per-thread state to local memory. See the dq/dv/dk register-split work: stats/dq/dv/fwd must stay
+// at ZERO spill (each was driven there deliberately); dk keeps a small, bounded spill by design (its
+// 3*HD register need has no further clean split -- see the comment above attn_bwd_dv_kernel). This
+// function only MEASURES; a Catch2 test applies the actual pass/fail thresholds, so a future change
+// to any of these kernels' resident state gets caught here before it silently re-spills at scale.
+// Any out-pointer may be null. Returns nonzero only if a query itself fails (e.g. a bad device).
+SUB0_CUDA_API int sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill,
+                                          int* dq_regs, int* dq_spill,
+                                          int* dv_regs, int* dv_spill,
+                                          int* dk_regs, int* dk_spill,
+                                          int* fwd_regs, int* fwd_spill) {
+    if (sub0_cuda_init()) return 1;
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
+    cudaFuncAttributes attr;
+    auto query = [&](const void* fn, int* regs, int* spill) -> bool {
+        if (cudaFuncGetAttributes(&attr, fn) != cudaSuccess) return false;
+        if (regs)  *regs  = attr.numRegs;
+        if (spill) *spill = static_cast<int>(attr.localSizeBytes);
+        return true;
+    };
+    bool ok = true;
+    ok &= query(reinterpret_cast<const void*>(&attn_bwd_stats_kernel<act_t, HD, TK>), stats_regs, stats_spill);
+    ok &= query(reinterpret_cast<const void*>(&attn_bwd_dq_kernel<act_t, HD, TK>),    dq_regs,    dq_spill);
+    ok &= query(reinterpret_cast<const void*>(&attn_bwd_dv_kernel<act_t, HD, TQ>),    dv_regs,    dv_spill);
+    ok &= query(reinterpret_cast<const void*>(&attn_bwd_dk_kernel<act_t, HD, TQ>),    dk_regs,    dk_spill);
+    ok &= query(reinterpret_cast<const void*>(&attn_fwd_tiled_kernel<act_t, HD, TK>), fwd_regs,   fwd_spill);
+    return ok ? 0 : 1;
 }
 
 // Adaptive timing bounds (shared with the CPU tuner via sub0/bench.hpp). Rather than a fixed

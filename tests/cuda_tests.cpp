@@ -38,6 +38,9 @@ extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_ma
 extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int  sub0_cuda_kv_reset();
 extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
+extern "C" int  sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill, int* dq_regs, int* dq_spill,
+                                        int* dv_regs, int* dv_spill, int* dk_regs, int* dk_spill,
+                                        int* fwd_regs, int* fwd_spill);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -297,6 +300,41 @@ TEST_CASE("CUDA flash-attention backward matches the naive kernel and is much fa
     REQUIRE(rc == 0);              // returns nonzero only on a gross parity failure
     REQUIRE(reldiff < 1.5e-1);     // within bf16-accumulation noise of the naive reference
     REQUIRE(speedup > 3.0);        // tiling + parallelism intact (observed ~45x at d448)
+    sub0_cuda_shutdown();
+}
+
+// Register/local-memory-spill regression guard for the five flash-attention kernels (forward tile +
+// the four backward kernels). Queries the ACTUAL compiled kernel attributes via cudaFuncGetAttributes
+// (deterministic, load-independent -- same philosophy as the speedup ratio above, not wall-clock), so
+// a future change to any of these kernels' resident per-thread state is caught here, not discovered
+// later via a slow, easy-to-miss manual ptxas -v audit. stats/dq/dv/fwd were each deliberately driven
+// to ZERO register spill (dq via a warp-cooperative channel split -- 2 threads share a query, each
+// holding HD/2 channels, combined via warp shuffle; dv by dropping the v/stat_dot state dv doesn't
+// need). dk's 3*HD register need (kr+vr+dka) has no further clean split (dk_j needs kr AND vr
+// together for the same score computation dv_j doesn't), so it accepts a SMALL, bounded spill by
+// design once 3*HD exceeds the architecture's 255-register-per-thread cap -- bounded here so a
+// regression that grows it back toward the pre-split combined kernel's 1172B still fails loudly.
+TEST_CASE("CUDA attention kernels stay within their register/spill budget", "[cuda]") {
+    int stats_regs = 0, stats_spill = 0, dq_regs = 0, dq_spill = 0, dv_regs = 0, dv_spill = 0,
+        dk_regs = 0, dk_spill = 0, fwd_regs = 0, fwd_spill = 0;
+    REQUIRE(sub0_cuda_attn_regcheck(&stats_regs, &stats_spill, &dq_regs, &dq_spill, &dv_regs, &dv_spill,
+                                    &dk_regs, &dk_spill, &fwd_regs, &fwd_spill) == 0);
+    INFO("stats: " << stats_regs << " regs, " << stats_spill << "B spill");
+    INFO("dq:    " << dq_regs << " regs, " << dq_spill << "B spill");
+    INFO("dv:    " << dv_regs << " regs, " << dv_spill << "B spill");
+    INFO("dk:    " << dk_regs << " regs, " << dk_spill << "B spill");
+    INFO("fwd:   " << fwd_regs << " regs, " << fwd_spill << "B spill");
+    CHECK(stats_spill == 0);
+    CHECK(dq_spill    == 0);
+    CHECK(dv_spill    == 0);
+    CHECK(fwd_spill   == 0);
+    if constexpr (3 * D_HEAD > 255) {
+        CHECK(dk_spill > 0);    // the accepted, by-design spill once 3*HD exceeds the register cap
+        CHECK(dk_spill < 800);  // regression bound: above the measured ~560B (HD=96), well below the
+                                 // pre-split combined kernel's 1172B
+    } else {
+        CHECK(dk_spill == 0);   // small HD: 3*HD already fits under the cap, no spill expected at all
+    }
     sub0_cuda_shutdown();
 }
 
