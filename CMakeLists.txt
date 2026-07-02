@@ -391,6 +391,13 @@ target_compile_definitions(sub0_train PRIVATE
 add_library(sub0_gen SHARED src/gen_stage.cpp)
 target_link_libraries(sub0_gen PRIVATE sub0_core)
 
+# Phase 2e follow-up: GPU KV-cache decode (sub0_cuda_forward_one), parity-validated against a trained
+# model (cuda_tests.cpp) -- link it in the same way sub0_train links the training fast-path above.
+if(SUB0_BUILD_CUDA)
+  target_link_libraries(sub0_gen PRIVATE sub0_backend_cuda)
+  target_compile_definitions(sub0_gen PRIVATE SUB0_BUILD_CUDA)
+endif()
+
 # --- Stage 5: the thin driver executable ------------------------------------
 add_executable(sub0llm src/driver.cpp)
 sub0_autoconfigure_dep(sub0llm)          # for DEFAULT_CORPUS in the header

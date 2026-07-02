@@ -36,6 +36,8 @@ extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
                                         double* fwd_ms, double* bwd_ms, double* adam_ms);
 extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
+extern "C" int  sub0_cuda_kv_reset();
+extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
 
 TEST_CASE("CUDA backend self-test runs on the device", "[cuda]") {
     REQUIRE(sub0_cuda_selftest() == 0);
@@ -295,6 +297,70 @@ TEST_CASE("CUDA flash-attention backward matches the naive kernel and is much fa
     REQUIRE(rc == 0);              // returns nonzero only on a gross parity failure
     REQUIRE(reldiff < 1.5e-1);     // within bf16-accumulation noise of the naive reference
     REQUIRE(speedup > 3.0);        // tiling + parallelism intact (observed ~45x at d448)
+    sub0_cuda_shutdown();
+}
+
+// GPU forward_one (KV-cache decode) parity, validated against a SHARPENED (non-random) model rather
+// than raw random init. Random-init logits are near-flat, so the decode path's two-pass softmax and
+// the full forward's flash online-softmax can each round differently and FLIP the argmax on
+// essentially a coin toss, amplifying over layers -- a known benign artifact, not a kernel bug (see
+// engine memory notes on the d448 random-weight divergence). ANY real training moves the model off
+// that knife-edge. Overfitting one short, fully-deterministic sequence (next-token has a unique
+// correct answer at every position, so a real gradient signal exists from step 1) sharpens the logits
+// without the cost of a real corpus. If decode still disagrees with the full forward here, the
+// mismatch is a genuine kernel bug, not argmax noise under near-uniform logits.
+// Hidden (like [.bench]): 150 single-threaded CPU training steps (batch=1, no thread parallelism
+// across a single window) make this the slowest case in the suite (~4min at d768) despite being a
+// correctness gate, not a benchmark. Run explicitly when touching GPU decode: `sub0_tests
+// "*forward_one decode*"`.
+TEST_CASE("CUDA forward_one decode matches full forward once the model is trained (non-random weights)",
+         "[cuda][.slow]") {
+    sub0::build_model();
+
+    // ids cycle 0..K-1 repeating: given the causal prefix, next-token is uniquely determined at every
+    // position (zero label noise), so the loss has real signal to descend from step 1.
+    const int T = std::min(16, SEQ_LEN);
+    const int K = 6;
+    std::vector<int> data(static_cast<std::size_t>(T) + 1);
+    for (int i = 0; i < static_cast<int>(data.size()); ++i) data[i] = i % K;
+    const std::vector<std::size_t> starts(1, std::size_t{0});
+
+    sub0::AdamW opt(0.01f);
+    float loss = 0.0f;
+    for (int s = 0; s < 150; ++s) {
+        loss = sub0::train_batch(data.data(), starts.data(), 1, T);
+        opt.step();
+    }
+    const float uniform = std::log(static_cast<float>(VOCAB));   // untrained loss floor
+    INFO("post-training loss = " << loss << "  (uniform baseline ~= " << uniform << ")");
+    REQUIRE(loss < 0.85f * uniform);      // real learning happened, not still at the random-init floor
+
+    sub0_cuda_set_tf32(0);                                    // full FP32 for a tight parity gate
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const std::vector<int> ids(data.begin(), data.begin() + T);
+    std::vector<float> full(static_cast<std::size_t>(T) * VOCAB);
+    REQUIRE(sub0_cuda_forward(ids.data(), 1, T, full.data()) == 0);
+
+    REQUIRE(sub0_cuda_kv_reset() == 0);
+    auto argmax = [](const float* p, int n) { int b = 0; for (int j = 1; j < n; ++j) if (p[j] > p[b]) b = j; return b; };
+    std::vector<float> one(static_cast<std::size_t>(VOCAB));
+    int agree = 0;
+    double maxrel = 0.0;
+    for (int pos = 0; pos < T; ++pos) {
+        REQUIRE(sub0_cuda_forward_one(ids[pos], pos, one.data()) == 0);
+        const float* ref = full.data() + static_cast<std::size_t>(pos) * VOCAB;
+        double maxabs = 0.0, maxmag = 1e-30;
+        for (int j = 0; j < VOCAB; ++j) {
+            maxabs = std::max(maxabs, static_cast<double>(std::fabs(one[j] - ref[j])));
+            maxmag = std::max(maxmag, static_cast<double>(std::fabs(ref[j])));
+        }
+        maxrel = std::max(maxrel, maxabs / maxmag);
+        if (argmax(one.data(), VOCAB) == argmax(ref, VOCAB)) ++agree;
+    }
+    const double top1_pct = 100.0 * agree / T;
+    INFO("decode vs full-forward top-1 agreement = " << top1_pct << "%  max rel diff = " << maxrel);
+    REQUIRE(top1_pct >= 98.0);   // trained (sharp) logits: no amplification floor -- expect near-exact
     sub0_cuda_shutdown();
 }
 
