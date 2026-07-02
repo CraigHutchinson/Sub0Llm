@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <print>
 #include <random>
@@ -656,6 +657,38 @@ struct ConsoleCtrlGuard {};   // no-op off Windows (this project builds Windows-
 #endif
 }  // namespace
 
+// Single-instance guard: refuses a SECOND sub0llm-train against the SAME model directory. Two
+// processes racing on one checkpoint is a real failure mode hit this session (a duplicate configurator
+// race, and a resumed run whose process outlived its own "trained" completion and kept the corpus.tok
+// mapping open) -- a named OS mutex, scoped to the model directory's canonicalized path (not global:
+// training two DIFFERENT models concurrently is legitimate and common), fails fast with a clear message
+// instead of letting two writers corrupt the same checkpoint. Scope is the directory, not model_path's
+// exact string, so `models/x` and `models/x/model.bin` (both accepted as --out) collide correctly.
+#if defined(_WIN32)
+struct SingleInstanceGuard {
+    HANDLE mutex_ = nullptr;
+    bool   held_  = false;
+
+    explicit SingleInstanceGuard(const std::filesystem::path& model_dir) {
+        std::error_code ec;
+        const std::string canon = std::filesystem::weakly_canonical(model_dir, ec).string();
+        const std::size_t h = std::hash<std::string>{}(canon.empty() ? model_dir.string() : canon);
+        // "Local\" (not "Global\"): scoped to this user session, matching every other artifact this
+        // tool touches; mutex names must also avoid backslashes, which the hash sidesteps entirely.
+        const std::string name = std::format("Local\\sub0llm-train-{:016x}", h);
+        mutex_ = CreateMutexA(nullptr, TRUE, name.c_str());
+        held_  = mutex_ != nullptr && GetLastError() != ERROR_ALREADY_EXISTS;
+    }
+    ~SingleInstanceGuard() { if (mutex_) { if (held_) ReleaseMutex(mutex_); CloseHandle(mutex_); } }
+    bool held() const { return held_; }
+};
+#else
+struct SingleInstanceGuard {
+    explicit SingleInstanceGuard(const std::filesystem::path&) {}
+    bool held() const { return true; }   // no-op off Windows (see ConsoleCtrlGuard above)
+};
+#endif
+
 // Shared run-context banner (model/compute/training-backend), defined below; train and tune share it.
 static void report_run_context(bool gpu_train);
 
@@ -685,6 +718,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                              static_cast<int>(USE_TERNARY),
                                              static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
         model_path = (meta_dir / "model.bin").string();
+    }
+    // Refuse a second concurrent run against this same model dir (see SingleInstanceGuard above) --
+    // checked before any directory/log/GPU work so a rejected launch leaves no side effects.
+    const SingleInstanceGuard _single_instance_guard(meta_dir);
+    if (!_single_instance_guard.held()) {
+        sub0::log::error("train: another sub0llm-train is already running against '{}' -- refusing to "
+                         "start a second one (they would race on the same checkpoint)", meta_dir.string());
+        return 1;
     }
     // Create the model directory up front (an explicit --out path may name a directory that doesn't
     // exist yet -- previously only the auto-derived branch above did this, so train.log's set_file
