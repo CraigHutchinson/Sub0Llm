@@ -262,22 +262,31 @@ __global__ void embed_add_act_kernel(const float* __restrict__ tok_emb, const fl
     if (m < M && j < C) { const int t = m % T; st_act(&h[m * C + j], tok_emb[ids[m] * C + j] + pos_emb[t * C + j]); }
 }
 
-// y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward; one row/thread).
-// TODO(perf): one thread per row serializes the C-length reduction. For larger C a block-per-row
-// warp/shared reduction (or a fused rmsnorm+linear epilogue) would cut memory traffic.
-__global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
-                               float* __restrict__ y, int rows, int C) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m < rows) {
-        const float eps = 1e-5f;
-        const float* xr = x + static_cast<size_t>(m) * C;
-        float ms = 0.f;
-        for (int j = 0; j < C; ++j) ms += xr[j] * xr[j];
-        ms /= C;
-        const float r = rsqrtf(ms + eps);              // CUDA fast reciprocal sqrt
-        float* yr = y + static_cast<size_t>(m) * C;
-        for (int j = 0; j < C; ++j) yr[j] = xr[j] * r * gamma[j];
-    }
+// y[m,j] = x[m,j] * (1/sqrt(mean_j x^2 + eps)) * gamma[j]  (op_rmsnorm forward). One BLOCK per row,
+// threads striding coalesced over D_MODEL -- was one thread per row (the fix and reasoning are
+// identical to rmsnorm_train_act_kernel above, which has the full ncu evidence for the same
+// one-thread-per-row anti-pattern; this is the plain non-training sibling used by generation/decode,
+// including the per-TOKEN decode hot path where rows==1 -- under the old layout that meant 63 of 64
+// threads in the launch sat idle every single token). D_MODEL used directly (constexpr, never a
+// runtime size at any call site) instead of as a parameter.
+template <int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma,
+              float* __restrict__ y, int rows) {
+    constexpr int   C    = D_MODEL;
+    constexpr float invC = 1.0f / static_cast<float>(C);
+    constexpr float eps  = 1e-5f;
+    const int m = blockIdx.x;
+    if (m >= rows) return;
+    const float* xr = x + static_cast<size_t>(m) * C;
+    float partial = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) partial += xr[j] * xr[j];
+    const float ms = block_reduce_sum<BLOCK>(partial) * invC;
+    const float r  = rsqrtf(ms + eps);                  // CUDA fast reciprocal sqrt
+    float* yr = y + static_cast<size_t>(m) * C;
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) yr[j] = xr[j] * r * gamma[j];
 }
 
 // Elementwise tanh-form GELU (op_gelu, FAST_MATH path).
@@ -576,9 +585,15 @@ __global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict
     for (int m = 0; m < M; ++m) s += dY[static_cast<size_t>(m) * N + o];
     dbias[o] = s;
 }
-// act-typed bias gradient: dbias[o] = sum_m dY_act[m,o], reading the bf16 store with FP32 accum.
+// act-typed bias gradient: dbias[o] = sum_m dY_act[m,o], reading the bf16 store with FP32 accum. This
+// kernel's memory pattern is already fine (adjacent threads o, o+1 read adjacent columns at each fixed
+// m -- coalesced across the warp); unlike the row-reduction kernels above, there's no block-per-row fix
+// to apply here. N is D_FF at this kernel's one call site (a baked constexpr, unlike bias_grad_kernel
+// below whose N genuinely varies across ITS call sites -- confirmed by checking every one), so it's
+// used directly rather than as a parameter; the M-loop stays runtime (M varies) with nothing to unroll.
 template <class A>
-__global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict__ dbias, int M, int N) {
+__global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict__ dbias, int M) {
+    constexpr int N = D_FF;
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= N) return;
     float s = 0.f;
@@ -1082,9 +1097,9 @@ inline void launch_linear_t(const IN* dX, const IN* dW, OUT* dY, int M, int in, 
     ensure_cublas();
     gemm_t<IN, OUT>(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out);
 }
-inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T, int C) {
-    const int block = 64;
-    rmsnorm_kernel<<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, T, C);
+inline void launch_rmsnorm(const float* dX, const float* dG, float* dY, int T) {
+    constexpr int kNormBlock = 64;   // one block per row; divides every D_MODEL this project bakes
+    rmsnorm_kernel<kNormBlock><<<T, kNormBlock, 0, g_stream>>>(dX, dG, dY, T);
 }
 inline void launch_gelu(const float* dX, float* dY, int n) {
     const int block = 256;
@@ -1522,7 +1537,7 @@ void forward_one_device(int id, int pos) {
         const float* ln1 = base + L[b0 + 0].off, *ln2 = base + L[b0 + 1].off;
         const float* Wo  = base + L[b0 + 5].off, *W1 = base + L[b0 + 6].off, *b1 = base + L[b0 + 7].off;
         const float* W2  = base + L[b0 + 8].off, *b2 = base + L[b0 + 9].off;
-        launch_rmsnorm(h, ln1, a, 1, C);
+        launch_rmsnorm(h, ln1, a, 1);
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
             const int blk = 128; rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, C, H, pos, ROPE_THETA);
@@ -1536,13 +1551,13 @@ void forward_one_device(int id, int pos) {
                                                             g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C, att, pos, C, H); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
-        launch_rmsnorm(h, ln2, fbuf, 1, C);
+        launch_rmsnorm(h, ln2, fbuf, 1);
         launch_linear(fbuf, W1, b1, ff1, 1, C, F);
         launch_gelu(ff1, gact, F);
         launch_linear(gact, W2, b2, ff2, 1, F, C);
         launch_add(h, ff2, h, C);
     }
-    launch_rmsnorm(h, ln_f, a, 1, C);
+    launch_rmsnorm(h, ln_f, a, 1);
     launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V, /*force_tc=*/true);
 }
 
@@ -1592,19 +1607,19 @@ void forward_device(int batch, int T) {
         const float* W2  = base + L[b0 + 8].off;
         const float* b2  = base + L[b0 + 9].off;
 
-        launch_rmsnorm(h, ln1, a, M, C);                      // a = rmsnorm(h, ln1)
+        launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1)
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T, C, H, 3 * C);
         launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
         launch_add(h, proj, h, MC);                          // h = h + proj
-        launch_rmsnorm(h, ln2, fbuf, M, C);                  // f = rmsnorm(h, ln2)
+        launch_rmsnorm(h, ln2, fbuf, M);                     // f = rmsnorm(h, ln2)
         launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
         launch_gelu(ff1, gact, MF);                       // gelu
         launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
         launch_add(h, ff2, h, MC);                        // h = h + ff2
     }
-    launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
+    launch_rmsnorm(h, ln_f, a, M);                        // a = rmsnorm(h, ln_f)
     launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V, /*force_tc=*/true);  // logits = a . lm_head + lm_bias
 }
 
@@ -1796,7 +1811,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
         { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + 9].off, M, C); }
         launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
         launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + 6].off, M, C, F);
-        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M, F); }
+        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M); }
         launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + 1].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
