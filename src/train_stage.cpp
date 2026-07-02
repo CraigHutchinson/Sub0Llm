@@ -104,6 +104,9 @@ constexpr double VAL_FRACTION        = 0.05;  // tail held out for validation NE
 constexpr double EVAL_WARMUP_EPOCHS  = 0.50;  // no eval until this much coverage
 constexpr double EVAL_INTERVAL_EPOCHS = 0.10; // eval/checkpoint cadence
 constexpr double TICK_SECONDS        = 180.0;  // heartbeat: interim progress line between evals
+constexpr double CKPT_SECONDS        = 3600.0; // crash-resistance checkpoint on a wall-clock tick,
+                                               // independent of the (far rarer) eval cadence -- so an
+                                               // unattended run never loses more than ~1h of progress
 constexpr int    EVAL_WINDOWS_MAX    = 128;   // bounded cost per eval
 constexpr int    MAX_EPOCHS_BACKSTOP = 30;    // ceiling if no plateau is detected
 constexpr int    PLATEAU_WINDOW      = 6;     // evals fitted by the least-squares trend test
@@ -823,6 +826,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // be it an eval or a tick.
     auto last_log = win_t0;
     long last_log_step = win_steps0;
+    auto last_ckpt = win_t0;   // wall-clock timer for the crash-resistance checkpoint tick (CKPT_SECONDS)
     double run_loss = 0.0; int run_n = 0;
     bool stop = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
@@ -904,6 +908,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             run_loss = 0.0; run_n = 0;
             win_t0 = clock::now(); win_steps0 = step;
             last_log = win_t0; last_log_step = step;          // an eval counts as a log: reset the tick timer
+            last_ckpt = win_t0;                               // ...and it checkpointed: reset the ckpt tick
         } else if (std::chrono::duration<double>(clock::now() - last_log).count() >= TICK_SECONDS) {
             // Interim heartbeat between evals: train loss (running avg since the last eval) +
             // throughput since the last printed line. No val NELBO here -- that stays on the eval
@@ -915,6 +920,21 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                  step, max_steps, frac_epoch, run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step;
+        }
+
+        // Crash-resistance checkpoint on a wall-clock tick, independent of the (far rarer) eval
+        // cadence -- with FineWeb's ~78k-step eval interval that would otherwise be the only save,
+        // ~20h apart. An eval already saved + reset last_ckpt above, so this only fires on the long
+        // stretches between evals. No val NELBO / plateau check here: it is purely a resume point.
+        if (!is_eval && std::chrono::duration<double>(clock::now() - last_ckpt).count() >= CKPT_SECONDS) {
+            gpu.sync_to_host();                               // pull live device weights into the host arenas
+            save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed);
+            prune_ckpts(model_path, keep);
+            sub0::save_model(model_path.c_str());
+            write_meta("training");
+            last_ckpt = clock::now();
+            sub0::log::line("  [checkpoint @ step {} ({:.0f}m crash-resistance tick)]", step, CKPT_SECONDS / 60.0);
+            std::fflush(stdout);
         }
     }
 
