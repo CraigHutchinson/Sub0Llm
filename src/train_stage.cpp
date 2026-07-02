@@ -36,6 +36,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -627,11 +628,40 @@ struct GpuTrainer {
 };
 }  // namespace
 
+// Graceful stop (Ctrl+C, a console window closing, or `taskkill` WITHOUT /F -- all deliver the same
+// console control event on Windows) so an interrupted run saves a checkpoint at the step it reached
+// instead of losing everything back to the last periodic save. The training loop polls this flag once
+// per step (cheap) rather than trying to save directly from the OS callback, which can fire on a
+// separate thread while a step is mid-flight.
+namespace {
+std::atomic<bool> g_graceful_stop{false};
+
+#if defined(_WIN32)
+BOOL WINAPI console_ctrl_handler(DWORD /*ctrl_type*/) {
+    g_graceful_stop.store(true);
+    return TRUE;   // handled -- without this Windows terminates immediately instead of giving the
+                   // process a chance to notice the flag and save (it still grants only a few
+                   // seconds before force-killing, comfortably more than one training step takes).
+}
+// RAII: registers the handler for this scope's lifetime and unregisters it on the way out, so a
+// training run never leaves a dangling handler pointing at a function whose enclosing call has
+// already returned.
+struct ConsoleCtrlGuard {
+    ConsoleCtrlGuard()  { SetConsoleCtrlHandler(console_ctrl_handler, TRUE); }
+    ~ConsoleCtrlGuard() { SetConsoleCtrlHandler(console_ctrl_handler, FALSE); }
+};
+#else
+struct ConsoleCtrlGuard {};   // no-op off Windows (this project builds Windows-first; SIGINT/SIGTERM
+                              // via std::signal would be the POSIX equivalent if ever needed there)
+#endif
+}  // namespace
+
 // Shared run-context banner (model/compute/training-backend), defined below; train and tune share it.
 static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep) {
+    const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims + git SHA) under the models root and
     // register it with a meta.txt, so `models` can discover it and prune incompatible ones. The
@@ -873,7 +903,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     long last_log_step = win_steps0;
     auto last_ckpt = win_t0;   // wall-clock timer for the crash-resistance checkpoint tick (CKPT_SECONDS)
     double run_loss = 0.0; int run_n = 0;
-    bool stop = false;
+    bool stop = false, graceful_stop = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
     //TODO: Remove getenv calls
     const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr);
@@ -918,6 +948,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
         run_loss += step_loss; ++run_n;
         rs.step = step;
+
+        if (g_graceful_stop.load()) {
+            sub0::log::line("  [graceful stop requested @ step {} -- saving before exit]", step);
+            std::fflush(stdout);
+            stop = graceful_stop = true;
+        }
 
         const bool is_eval = (step % eval_every == 0 || step == max_steps);
         if (is_eval) {
@@ -987,7 +1023,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::save_model(model_path.c_str());
     save_checkpoint(ckpt_step_path(model_path, rs.step), opt.step_count(), rng, rs, batch, lr, seed);
     prune_ckpts(model_path, keep);
-    write_meta(stop ? "plateaued" : "trained");
+    write_meta(graceful_stop ? "stopped" : (stop ? "plateaued" : "trained"));
+    if (graceful_stop) {
+        // The checkpoint above is already safely on disk -- skip the sample generation (a full
+        // SEQ_LEN-token decode can take real time at a large model) so a Ctrl+C / window-close
+        // request exits promptly, comfortably inside the OS's grace period before a force-kill.
+        sub0::log::line("stopped (graceful) at step {} (best val_nelbo {:.4f}) -> {}",
+             rs.step, rs.best_loss, model_path);
+        gpu.shutdown();
+        return 0;
+    }
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
     // reaches it). This exercises the real long-context behaviour the trained window supports.
