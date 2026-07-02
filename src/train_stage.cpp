@@ -781,8 +781,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
     // plateau-stopped, so an estimate is fine).
-    const long tokens_per_step = static_cast<long>(batch) * SEQ_LEN;
-    epoch_steps  = std::max<long>(1, (static_cast<long>(est_train_tokens) + tokens_per_step - 1) / tokens_per_step);
+    const std::size_t tokens_per_step = static_cast<std::size_t>(batch) * SEQ_LEN;
+    // est_train_tokens is 64-bit: a large corpus (FineWeb ~= 12 B tokens) overflows a 32-bit `long`
+    // (LLP64 Windows) -- casting it to long wrapped NEGATIVE, collapsing epoch_steps to 1 (so the run
+    // stopped after MAX_EPOCHS_BACKSTOP *steps* and evaluated every step). Compute in size_t, then
+    // narrow the (bounded, < 2^31) step count.
+    epoch_steps  = static_cast<long>(std::max<std::size_t>(
+        1, (est_train_tokens + tokens_per_step - 1) / tokens_per_step));
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
