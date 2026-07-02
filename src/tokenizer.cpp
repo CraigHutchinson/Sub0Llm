@@ -9,6 +9,7 @@
 #include "sub0/unigram.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <istream>
 #include <limits>
 #include <ostream>
@@ -238,31 +239,33 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
 
     // Fix the base alphabet. BPE tie-breaking is by (count, pair) on these byte-derived
     // ids, so the merge sequence is deterministic and order-independent of the scan.
+    //
+    // Every id assigned in this block is a SCHEME constant, not something discovered from the
+    // corpus: base id == byte value for the 256 raw bytes (no offset), and the 14 markers always
+    // register in this exact order right after them. So every *_id below is a direct assignment
+    // from the matching casing::TOK_* constexpr, not a value read back from the append -- these ids
+    // are determined by the tokenizer CODE version, the same for every corpus. add_marker still
+    // pushes each code into base_symbol/expansion (which genuinely are populated, not constant --
+    // expansion in particular gets extended further below with the corpus's own learned pieces).
     t.byte_base.fill(-1);
-    auto add_marker = [&](int code) {                 // append a marker, return its base id
-        const int id = static_cast<int>(t.base_symbol.size());
-        t.base_symbol.push_back(code);
-        return id;
-    };
-    // The COMPLETE 256-byte alphabet (a total tokenizer -- any byte is encodable, no silent drop of
-    // out-of-corpus characters) followed by the spacing/case markers, ALWAYS present so the base
-    // alphabet is corpus-independent and the ids are stable. This is the only scheme (the legacy
-    // corpus-derived "space-as-a-byte-token" alphabet was retired with the old models).
+    auto add_marker = [&](int code) { t.base_symbol.push_back(code); };
     for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
-    t.cap_id        = add_marker(TOK_CAP);
-    t.up_id         = add_marker(TOK_UP);
-    t.join_id       = add_marker(TOK_JOIN);
-    t.newline_id    = add_marker(TOK_NEWLINE);
-    t.para_id       = add_marker(TOK_PARA);
-    t.odquote_id    = add_marker(TOK_ODQUOTE);
-    t.cdquote_id    = add_marker(TOK_CDQUOTE);
-    t.spell_start_id = add_marker(TOK_SPELL_START);
-    t.spell_end_id  = add_marker(TOK_SPELL_END);
-    t.space2_id     = add_marker(TOK_SPACE2);
-    t.space4_id     = add_marker(TOK_SPACE4);
-    t.tab2_id       = add_marker(TOK_TAB2);
-    t.tab4_id       = add_marker(TOK_TAB4);
+    add_marker(TOK_EOS);         t.eos_id         = TOK_EOS;
+    add_marker(TOK_CAP);         t.cap_id         = TOK_CAP;
+    add_marker(TOK_UP);          t.up_id          = TOK_UP;
+    add_marker(TOK_JOIN);        t.join_id        = TOK_JOIN;
+    add_marker(TOK_NEWLINE);     t.newline_id     = TOK_NEWLINE;
+    add_marker(TOK_PARA);        t.para_id        = TOK_PARA;
+    add_marker(TOK_ODQUOTE);     t.odquote_id     = TOK_ODQUOTE;
+    add_marker(TOK_CDQUOTE);     t.cdquote_id     = TOK_CDQUOTE;
+    add_marker(TOK_SPELL_START); t.spell_start_id = TOK_SPELL_START;
+    add_marker(TOK_SPELL_END);   t.spell_end_id   = TOK_SPELL_END;
+    add_marker(TOK_SPACE2);      t.space2_id      = TOK_SPACE2;
+    add_marker(TOK_SPACE4);      t.space4_id      = TOK_SPACE4;
+    add_marker(TOK_TAB2);        t.tab2_id        = TOK_TAB2;
+    add_marker(TOK_TAB4);        t.tab4_id        = TOK_TAB4;
     t.n_base = static_cast<int>(t.base_symbol.size());
+    assert(t.n_base == 270 && "base alphabet layout drifted: 256 bytes + 14 fixed markers");
 
     t.expansion.resize(static_cast<std::size_t>(t.n_base));
     for (int id = 0; id < t.n_base; ++id)
@@ -487,6 +490,13 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
         }
         dps = false;
     };
+    // Literal end-of-document marker (the standard GPT-2/3 `<|endoftext|>` stop signal), inserted
+    // between documents by the corpus extraction scripts (see casing.hpp's TOK_EOS comment). All
+    // 13 bytes are ordinary ASCII, so without this check they would just fall through to normal
+    // word/byte encoding (an opaque, meaningless multi-token sequence to the model). Checked
+    // whole -- not case/BPE-processed -- so it collapses to exactly one token every time.
+    static constexpr char EOS_LITERAL[] = "<|endoftext|>";
+    constexpr std::size_t EOS_LEN = sizeof(EOS_LITERAL) - 1;   // exclude the trailing NUL
     std::size_t i = 0;
     while (i < n) {
         std::size_t g = i;
@@ -494,6 +504,14 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
         if (g >= n) {                                   // trailing whitespace (no content follows)
             tile_ws(i, g, /*inter_content=*/false);
             break;
+        }
+        if (g + EOS_LEN <= n &&
+            std::equal(EOS_LITERAL, EOS_LITERAL + EOS_LEN, stream.begin() + static_cast<std::ptrdiff_t>(g))) {
+            tile_ws(i, g, /*inter_content=*/true);
+            out.push_back(t.eos_id);
+            dps = false;
+            i = g + EOS_LEN;
+            continue;
         }
         // Directional double quote: bundle the common spacing into one OPEN/CLOSE token.
         if (stream[g] == '"') {
@@ -560,6 +578,7 @@ std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
         if (id == t.join_id)         { dps = false; continue; }
         if (id == t.newline_id)      { out += '\n';   dps = false; recase = Recase::None; continue; }
         if (id == t.para_id)         { out += "\n\n"; dps = false; recase = Recase::None; continue; }
+        if (id == t.eos_id)          { if (dps) out += ' '; out += "<|endoftext|>"; dps = false; recase = Recase::None; continue; }
         if (id == t.space2_id)       { out += "  ";       dps = false; recase = Recase::None; continue; }
         if (id == t.space4_id)       { out += "    ";     dps = false; recase = Recase::None; continue; }
         if (id == t.tab2_id)         { out += "\t\t";     dps = false; recase = Recase::None; continue; }
@@ -609,15 +628,41 @@ std::string detokenize(const Tokenizer& t, const std::vector<int>& ids) {
     return detokenize_join(t, ids);
 }
 
+void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_index,
+                         const Tokenizer& t, int& nl_run, std::vector<std::uint64_t>& doc_starts) {
+    const std::int32_t nl_id      = static_cast<std::int32_t>(t.byte_base[static_cast<unsigned char>('\n')]);
+    const std::int32_t para_id    = static_cast<std::int32_t>(t.para_id);
+    const std::int32_t newline_id = static_cast<std::int32_t>(t.newline_id);
+    const std::int32_t eos_id     = static_cast<std::int32_t>(t.eos_id);
+    for (std::size_t li = 0; li < toks.size(); ++li) {
+        const std::int32_t tk = toks[li];
+        if (tk == eos_id) {   // explicit marker: the NEXT token starts a new document
+            // A trailing EOS as the corpus's very last token pushes a boundary equal to the final
+            // token count -- harmless: sample_window's uniform draw never reaches that exact
+            // position, so it only ever resolves back to the preceding (real) document's own end.
+            doc_starts.push_back(base_index + li + 1);
+            nl_run = 0;
+            continue;
+        }
+        const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
+        if (w > 0) { nl_run += w; continue; }
+        if (nl_run >= 2) doc_starts.push_back(base_index + li);
+        nl_run = 0;
+    }
+}
+
 // ============================================================================
-//  Serialization (tokenizer.bin "S0TZ")
+//  Serialization (tokenizer.tok "S0TE" -- bumped from the pre-EOS "S0TZ": TOK_EOS's value (256)
+//  numerically coincides with the OLD scheme's TOK_CAP, so a stale pre-EOS file must be REJECTED
+//  outright rather than risk silently reinterpreting its CAP marker as EOS. See the TOK_EOS
+//  comment in casing.hpp and the eos_id verification below.)
 // ============================================================================
 
 void serialize(const Tokenizer& t, std::ostream& os) {
     auto wu32 = [&](std::uint32_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     auto wu16 = [&](std::uint16_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     auto wf32 = [&](float v)         { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
-    wu32(0x5A543053u);  // "S0TZ"
+    wu32(0x45543053u);  // "S0TE"
     wu32(static_cast<std::uint32_t>(t.vocab));
     wu32(static_cast<std::uint32_t>(t.n_base));
     for (int code : t.base_symbol) wu16(static_cast<std::uint16_t>(code));
@@ -661,7 +706,7 @@ bool deserialize(Tokenizer& out, std::istream& is) {
     auto ru32 = [&] { std::uint32_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto ru16 = [&] { std::uint16_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto rf32 = [&] { float v{};         is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
-    if (ru32() != 0x5A543053u) return false;  // "S0TZ"
+    if (ru32() != 0x45543053u) return false;  // "S0TE" (a pre-EOS "S0TZ" file is rejected, not misread)
 
     Tokenizer t;
     t.vocab  = static_cast<int>(ru32());
@@ -673,21 +718,28 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         const int code = static_cast<int>(ru16());
         t.base_symbol[static_cast<std::size_t>(i)] = code;
         t.expansion[static_cast<std::size_t>(i)] = {code};
-        if      (code == TOK_CAP)         t.cap_id = i;
-        else if (code == TOK_UP)          t.up_id  = i;
-        else if (code == TOK_JOIN)        t.join_id = i;
-        else if (code == TOK_NEWLINE)     t.newline_id = i;
-        else if (code == TOK_PARA)        t.para_id    = i;
-        else if (code == TOK_ODQUOTE)     t.odquote_id = i;
-        else if (code == TOK_CDQUOTE)     t.cdquote_id = i;
-        else if (code == TOK_SPELL_START) t.spell_start_id = i;
-        else if (code == TOK_SPELL_END)   t.spell_end_id   = i;
-        else if (code == TOK_SPACE2)      t.space2_id = i;
-        else if (code == TOK_SPACE4)      t.space4_id = i;
-        else if (code == TOK_TAB2)        t.tab2_id   = i;
-        else if (code == TOK_TAB4)        t.tab4_id   = i;
-        else                              t.byte_base[static_cast<unsigned char>(code)] = i;
+        if (i < 256) {                    // base id == byte value with no offset (see learn())
+            if (code != i) return false;  // a corrupt/foreign file, not this scheme -- reject
+            t.byte_base[static_cast<std::size_t>(i)] = i;
+        }
     }
+    // The 14 fixed markers occupy base ids [256,270) in this EXACT order -- a scheme constant
+    // (see learn()), not something to discover per-file. VERIFY the loaded layout matches (a
+    // corrupt or foreign file fails here, loudly, rather than silently misassigning ids -- e.g.
+    // this is exactly what stops a pre-EOS file's TOK_CAP=256 from being misread as TOK_EOS=256,
+    // on top of the magic-number bump above already rejecting it), then assign the *_id fields
+    // from the compile-time constants directly, not from where the scan happened to find them.
+    if (t.n_base < 270) return false;
+    const auto& bs = t.base_symbol;
+    if (bs[256] != TOK_EOS || bs[257] != TOK_CAP || bs[258] != TOK_UP || bs[259] != TOK_JOIN ||
+        bs[260] != TOK_NEWLINE || bs[261] != TOK_PARA || bs[262] != TOK_ODQUOTE || bs[263] != TOK_CDQUOTE ||
+        bs[264] != TOK_SPELL_START || bs[265] != TOK_SPELL_END || bs[266] != TOK_SPACE2 ||
+        bs[267] != TOK_SPACE4 || bs[268] != TOK_TAB2 || bs[269] != TOK_TAB4)
+        return false;
+    t.eos_id = TOK_EOS; t.cap_id = TOK_CAP; t.up_id = TOK_UP; t.join_id = TOK_JOIN;
+    t.newline_id = TOK_NEWLINE; t.para_id = TOK_PARA; t.odquote_id = TOK_ODQUOTE; t.cdquote_id = TOK_CDQUOTE;
+    t.spell_start_id = TOK_SPELL_START; t.spell_end_id = TOK_SPELL_END; t.space2_id = TOK_SPACE2;
+    t.space4_id = TOK_SPACE4; t.tab2_id = TOK_TAB2; t.tab4_id = TOK_TAB4;
     const int kind = static_cast<int>(ru32());
     if (kind == 1) {                                                   // Unigram: pieces + log-probs
         t.max_piece = static_cast<int>(ru32());

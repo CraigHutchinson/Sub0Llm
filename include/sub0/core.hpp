@@ -75,6 +75,10 @@ SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
 // 64-bit identity fingerprint of the loaded tokenizer (0 if none). save_model stamps this so a
 // model and a mismatched decoder are caught loudly on load instead of detokenizing to garble.
 SUB0_API std::uint64_t tokenizer_fingerprint();
+// id of the loaded tokenizer's explicit end-of-document marker (<|endoftext|>), or -1 if none is
+// loaded / the tokenizer predates it. gen stops sampling when it draws this id, instead of always
+// running to a fixed token budget -- the model's learned stop signal (see casing.hpp's TOK_EOS).
+SUB0_API int eos_token_id();
 
 // Sample one token id from a logits row (length VOCAB) with temperature + top-k.
 // Shared by generation and the training preview so both use the same correct sampler.

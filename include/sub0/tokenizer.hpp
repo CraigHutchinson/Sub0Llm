@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <iosfwd>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -104,6 +105,7 @@ struct Tokenizer {
     int                  spell_start_id = -1, spell_end_id = -1;  // spaceless-group delimiters (§4, N>=3 words)
     int                  space2_id = -1, space4_id = -1;          // run-length whitespace tokens (§6)
     int                  tab2_id = -1, tab4_id = -1;
+    int                  eos_id = -1;   // explicit end-of-document marker (literal <|endoftext|>, §9)
     std::vector<int>     base_symbol;              // base id -> symbol code (0..255, 256 cap, 257 up)
     std::vector<std::pair<int, int>> merges;       // ordered learned merges (left,right)
     std::vector<long long>           merge_count;  // per-merge occurrence count at selection = corpus
@@ -149,6 +151,21 @@ Tokenizer learn(std::string_view corpus, const LearnOptions& opts = {});
 // --- Encode / detokenize (operate on a given tokenizer) --------------------
 std::vector<int> encode(const Tokenizer& t, const std::string& text);
 std::string      detokenize(const Tokenizer& t, const std::vector<int>& ids);
+
+// --- Document-boundary scan (for the training-window sampler; see sub0/window.hpp) -------------
+// Scans one chunk of already-encoded tokens for document boundaries and appends each newly found
+// document's start index (corpus-wide) to `doc_starts`. `base_index` is the corpus-wide index of
+// toks[0] (a running total, so this can be folded over a streamed/parallel-tokenized corpus one
+// chunk at a time); `nl_run` carries the blank-line-run count across chunks. PREFERS the explicit
+// eos_id marker (the literal `<|endoftext|>` the extraction scripts insert between documents --
+// unambiguous, so the next token always starts a new document); FALLS BACK to a run of >=2 newline
+// tokens ("\n\n") for corpora tokenized before the marker existed (or without it). The two signals
+// never both fire on the same corpus (get_fineweb.py's marker format uses single newlines around
+// it), so this is a clean dual-mode fallback, not a heuristic needing per-corpus tuning. Caller
+// seeds `doc_starts` with {0} before the first chunk (document 0 starts at token 0); this function
+// only ever appends.
+void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_index,
+                         const Tokenizer& t, int& nl_run, std::vector<std::uint64_t>& doc_starts);
 
 // --- Serialization (tokenizer.tok: base alphabet + merges + attested words) -
 void serialize(const Tokenizer& t, std::ostream& os);

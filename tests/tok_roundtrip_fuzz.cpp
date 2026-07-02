@@ -68,6 +68,7 @@ std::string describe_tokens(const Tokenizer& t, const std::vector<int>& ids) {
         if      (id == t.join_id)        o += "<J>";
         else if (id == t.newline_id)     o += "<NL>";
         else if (id == t.para_id)        o += "<P>";
+        else if (id == t.eos_id)         o += "<EOS>";
         else if (id == t.cap_id)         o += "<C>";
         else if (id == t.up_id)          o += "<U>";
         else if (id == t.odquote_id)     o += "<OQ>";
@@ -347,13 +348,14 @@ TEST_CASE("patterns: how the project's own source tokenizes", "[tok][patterns]")
     const std::string norm = sub0::casing::normalize_text(corpus, r);
     const std::vector<int> ids = sub0::tok::encode(t, norm);
 
-    long long n_join = 0, n_nl = 0, n_para = 0, n_odq = 0, n_cdq = 0, n_spell = 0, n_spell_sub = 0;
+    long long n_join = 0, n_nl = 0, n_para = 0, n_odq = 0, n_cdq = 0, n_spell = 0, n_spell_sub = 0, n_eos = 0;
     long long ws_space = 0, ws_tab = 0, ws_nl = 0, ws_cr = 0;     // verbatim whitespace BYTES
     bool in_spell = false;
     for (int id : ids) {
         if      (id == t.join_id)        ++n_join;
         else if (id == t.newline_id)     ++n_nl;
         else if (id == t.para_id)        ++n_para;
+        else if (id == t.eos_id)         ++n_eos;
         else if (id == t.odquote_id)     ++n_odq;
         else if (id == t.cdquote_id)     ++n_cdq;
         else if (id == t.spell_start_id) { ++n_spell; in_spell = true; }
@@ -379,7 +381,7 @@ TEST_CASE("patterns: how the project's own source tokenizes", "[tok][patterns]")
            "  bytes/token=" + std::to_string(bpt) + "\n";
     rep += "markers: JOIN=" + std::to_string(n_join) + " NEWLINE=" + std::to_string(n_nl) +
            " PARA=" + std::to_string(n_para) + " ODQ=" + std::to_string(n_odq) +
-           " CDQ=" + std::to_string(n_cdq) + " SPELL=" + std::to_string(n_spell) +
+           " CDQ=" + std::to_string(n_cdq) + " EOS=" + std::to_string(n_eos) + " SPELL=" + std::to_string(n_spell) +
            " (avg sub " + std::to_string(n_spell ? static_cast<double>(n_spell_sub) / static_cast<double>(n_spell) : 0.0) + ")\n";
     rep += "verbatim ws bytes: space=" + std::to_string(ws_space) + " tab=" + std::to_string(ws_tab) +
            " nl=" + std::to_string(ws_nl) + " cr=" + std::to_string(ws_cr) + "\n";

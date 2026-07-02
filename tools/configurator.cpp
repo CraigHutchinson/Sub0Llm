@@ -765,13 +765,17 @@ int main(int argc, char** argv) {
         sub0::TokWriter tw(ts, vocab);
         std::vector<std::uint8_t> pack_scratch;
         std::println(stderr, "corpus.tok: {} bits/token (vocab {})", tw.bytes_per_token() * 8, vocab);
-        // Document boundaries: get_fineweb.py separates documents with a blank line ("\n\n"), and a
-        // newline is always emitted as its own base token (non-alpha bytes never BPE-merge), so a
-        // run of >=2 newline tokens marks a document break -- the next token starts a new document.
-        // Record each document's start token index so training keeps windows inside one document.
-        const std::int32_t nl_id      = static_cast<std::int32_t>(sym_to_base(10));      // base id of '\n'
-        const std::int32_t para_id    = static_cast<std::int32_t>(tkz.para_id);          // JOIN is the only scheme
-        const std::int32_t newline_id = static_cast<std::int32_t>(tkz.newline_id);
+        // Document boundaries: PREFERRED signal is the explicit eos_id token (the literal
+        // `<|endoftext|>` marker the extraction scripts insert between documents, see casing.hpp's
+        // TOK_EOS comment) -- unambiguous, unlike a blank line which also occurs mid-document as an
+        // ordinary paragraph break. FALLBACK for corpora extracted before this (or without the
+        // marker): a run of >=2 newline tokens ("\n\n") still marks a break. Both conditions are
+        // just OR'd -- a corpus with explicit EOS markers never produces a "\n\n" false-positive
+        // (get_fineweb.py's new format uses single newlines around the marker), so this is a clean,
+        // automatic dual-mode fallback, not a heuristic that needs tuning per corpus.
+        // Record each document's start token index so training keeps windows inside one document
+        // (the scan logic itself -- eos_id-preferred, \n\n-fallback -- lives in sub0::tok::
+        // scan_doc_boundaries so tests/engine_tests.cpp can exercise it without duplicating it).
         std::vector<std::uint64_t> doc_starts{0u};                  // document 0 begins at token 0 (u64: ~14B tokens)
         int nl_run = 0;
         // Tokenize Pass 3, PARALLEL + IO-OVERLAPPED: a dedicated reader thread streams newline-aligned
@@ -841,13 +845,10 @@ int main(int argc, char** argv) {
                         std::println(stderr, "  actual:   ...{}...", vis(dec.substr(lc, 96)));
                     }
                 }
-                for (std::size_t li = 0; li < toks.size(); ++li) {  // doc boundaries (global index = token_count + li)
-                    const std::int32_t tk = toks[li];
-                    const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
-                    if (w > 0) { nl_run += w; continue; }
-                    if (nl_run >= 2) doc_starts.push_back(static_cast<std::uint64_t>(token_count + li));
-                    nl_run = 0;
-                }
+                // doc boundaries (global index = token_count + li)
+                sub0::tok::scan_doc_boundaries(
+                    std::span<const std::int32_t>(toks.data(), toks.size()),
+                    static_cast<std::uint64_t>(token_count), tkz, nl_run, doc_starts);
                 tw.append(toks.data(), toks.size(), pack_scratch);   // pack to the v2 width + write
                 token_count += toks.size();
                 bytes_done  += batch[static_cast<std::size_t>(i)].size();

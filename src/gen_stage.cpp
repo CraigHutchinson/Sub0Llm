@@ -69,6 +69,11 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
     std::mt19937 rng(seed);
+    // The model's learned stop signal (see casing.hpp's TOK_EOS): sampling loops below check for it
+    // BEFORE pushing, so it never enters ctx / gets printed -- generation just ends naturally instead
+    // of always running to the fixed token budget `n`. -1 (no tokenizer eos_id, e.g. a pre-EOS model)
+    // never matches a real sampled id, so this degrades to today's fixed-budget behavior transparently.
+    const int eos_id = sub0::eos_token_id();
 
     // Fast path: a KV-cache incremental decode (O(T) per token) whenever the whole context fits the
     // trained window and the weights are dense. forward_one's logits match the full forward to
@@ -89,7 +94,9 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                     sub0_cuda_forward_one(ctx[pos], pos, gpu_logits.data());
                 logits = gpu_logits.data();
                 for (int s = 0; s < n; ++s) {
-                    ctx.push_back(sub0::sample_token(logits, temp, topk, rng));
+                    const int next = sub0::sample_token(logits, temp, topk, rng);
+                    if (next == eos_id) break;   // learned stop signal: end here, don't print the marker
+                    ctx.push_back(next);
                     sub0_cuda_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, gpu_logits.data());
                 }
                 sub0_cuda_shutdown();
@@ -102,7 +109,9 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)   // prefill the prompt
                 logits = sub0::forward_one(ctx[pos], pos);
             for (int s = 0; s < n; ++s) {
-                ctx.push_back(sub0::sample_token(logits, temp, topk, rng));
+                const int next = sub0::sample_token(logits, temp, topk, rng);
+                if (next == eos_id) break;       // learned stop signal: end here, don't print the marker
+                ctx.push_back(next);
                 logits = sub0::forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1);
             }
             std::println("{}", sub0::detokenize(ctx));
@@ -115,7 +124,9 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
         const int last = logits->rows - 1;
-        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng));
+        const int next = sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng);
+        if (next == eos_id) break;   // learned stop signal: end here, don't print the marker
+        ctx.push_back(next);
     }
     sub0::graph_reset();
     std::println("{}", sub0::detokenize(ctx));

@@ -347,3 +347,25 @@ TEST_CASE("AdamW step counter survives get/set", "[engine]") {
     opt.set_step_count(123);
     REQUIRE(opt.step_count() == 123);
 }
+
+// gen's stopping condition (gen_stage.cpp: `if (next == eos_id) break;`, identical across all three
+// decode loops -- GPU KV-cache, CPU KV-cache, full-forward) is a one-line check once `next` can
+// equal eos_id; the mechanism worth actually testing is that half, at the token-id level -- not by
+// inferring a stop from shorter-than-expected generated text, which an undertrained model can produce
+// for unrelated reasons (see the memory notes on this: length is not evidence). This uses the exact
+// two calls gen_stage.cpp makes -- sub0::eos_token_id() and sub0::sample_token() -- so it is a real
+// mechanism test of the primitives gen relies on, not a re-implementation of them.
+TEST_CASE("gen's EOS stop condition: sample_token returns eos_id when the model favors it", "[engine][gen]") {
+    REQUIRE(sub0::load_tokenizer(sub0::default_tokenizer()));
+    const int eos_id = sub0::eos_token_id();
+    REQUIRE(eos_id >= 0);              // the build's tokenizer carries the fixed EOS marker
+    REQUIRE(eos_id < VOCAB);
+
+    std::vector<float> logits(VOCAB, -10.f);
+    logits[static_cast<std::size_t>(eos_id)] = 10.f;   // overwhelmingly the argmax
+    std::mt19937 rng(1);
+    for (int trial = 0; trial < 20; ++trial) {
+        const int next = sub0::sample_token(logits.data(), /*temp=*/0.8f, /*topk=*/1, rng);
+        REQUIRE(next == eos_id);       // top-1 sampling must return it -- gen's `next == eos_id` fires
+    }
+}

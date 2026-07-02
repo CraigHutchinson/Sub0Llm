@@ -19,30 +19,52 @@
 
 namespace sub0::casing {
 
+// Explicit end-of-document marker: the literal `<|endoftext|>` (the standard GPT-2/3 stop
+// signal), inserted by the corpus extraction scripts BETWEEN documents (scripts/get_fineweb.py,
+// scripts/get_tinystories.py) -- an unambiguous boundary, unlike a bare blank line, which also
+// occurs mid-document as an ordinary paragraph break. Without this the model was never trained
+// on the pair "last real content token -> what comes next": sample_window's document-boundary
+// cap means the last trainable target inside a document is the document's own final token, so a
+// document literally has no "successor" in the training signal unless that final token IS this
+// marker. Collapses to one token like PARA/NEWLINE; the configurator's doc-boundary detection
+// prefers it over the "\n\n" heuristic when present (see tools/configurator.cpp), and gen stops
+// generating when it samples this token instead of running to a fixed budget.
+//
+// Deliberately the FIRST marker (id 256, right after the complete 0..255 byte range), not
+// appended after the others: this keeps base id == raw byte value for every byte token, with NO
+// offset to account for -- so char-level content stays directly discoverable in a raw dump of
+// corpus.tok (any token id < 256 IS that literal byte, no translation needed) and any future
+// tooling that masks/filters by id range (`id < 256` = raw byte, `id >= 256` = a marker/learned
+// piece) keeps working without adjustment. NUL (0x00, the classic C-string terminator -- the
+// same "0 means end" intuition EOS echoes) stays its own ordinary byte token at id 0, distinct
+// from eos_id (256): a stray NUL leaking into messy/binary-contaminated corpus data is NOT the
+// same event as an intentional document boundary, so it must not be silently treated as one.
+constexpr int TOK_EOS = 256;
+
 // Symbol codes for the two case markers, carried in the byte-symbol stream just
 // above the 0..255 byte range.
-constexpr int TOK_CAP = 256;  // next word: capitalize first letter  (<|cap|>)
-constexpr int TOK_UP  = 257;  // next word: upper-case the whole word (<|up|>)
+constexpr int TOK_CAP = 257;  // next word: capitalize first letter  (<|cap|>)
+constexpr int TOK_UP  = 258;  // next word: upper-case the whole word (<|up|>)
 
 // JOIN-scheme spacing markers (symbol codes above the byte + case-marker range). The
 // implicit-space tokenizer makes a single inter-token space free; these specialise the
 // rest (see docs/TOKENIZER_DESIGN.md). Only minted when the join scheme is enabled.
-constexpr int TOK_JOIN    = 258;  // suppress the implicit inter-token space (glue / intra-word)
-constexpr int TOK_NEWLINE = 259;  // a single '\n'
-constexpr int TOK_PARA    = 260;  // a paragraph break "\n\n"
-constexpr int TOK_ODQUOTE = 261;  // opening double quote: ` "` (space-before, glue-after)
-constexpr int TOK_CDQUOTE = 262;  // closing double quote: `" ` (glue-before, space-after)
-constexpr int TOK_SPELL_START = 263;  // start of a spaceless group (N>=3 sub-token word; OOV/acronym/CamelCase)
-constexpr int TOK_SPELL_END   = 264;  // end of the spaceless group
+constexpr int TOK_JOIN    = 259;  // suppress the implicit inter-token space (glue / intra-word)
+constexpr int TOK_NEWLINE = 260;  // a single '\n'
+constexpr int TOK_PARA    = 261;  // a paragraph break "\n\n"
+constexpr int TOK_ODQUOTE = 262;  // opening double quote: ` "` (space-before, glue-after)
+constexpr int TOK_CDQUOTE = 263;  // closing double quote: `" ` (glue-before, space-after)
+constexpr int TOK_SPELL_START = 264;  // start of a spaceless group (N>=3 sub-token word; OOV/acronym/CamelCase)
+constexpr int TOK_SPELL_END   = 265;  // end of the spaceless group
 // Run-length whitespace tokens: a single inter-word space is free (implicit), but multi-space
 // runs (indentation, alignment) and tab runs otherwise cost one verbatim byte EACH. These tile
 // such runs greedily (4s before 2s, remainder as a verbatim byte) -- 2/4 cover the dominant
 // 2/4/8-wide indentation. The encoder only emits them for runs >= 2; a lone space/tab stays a
 // byte. See docs/TOKENIZER_DESIGN.md §6.
-constexpr int TOK_SPACE2 = 265;  // "  "   (two spaces)
-constexpr int TOK_SPACE4 = 266;  // "    " (four spaces)
-constexpr int TOK_TAB2   = 267;  // "\t\t"
-constexpr int TOK_TAB4   = 268;  // "\t\t\t\t"
+constexpr int TOK_SPACE2 = 266;  // "  "   (two spaces)
+constexpr int TOK_SPACE4 = 267;  // "    " (four spaces)
+constexpr int TOK_TAB2   = 268;  // "\t\t"
+constexpr int TOK_TAB4   = 269;  // "\t\t\t\t"
 
 inline bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 inline bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }

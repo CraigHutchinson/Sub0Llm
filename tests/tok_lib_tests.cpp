@@ -12,9 +12,12 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"
 #include "sub0/unigram.hpp"
+#include "sub0/window.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <random>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -140,21 +143,79 @@ TEST_CASE("encode is deterministic", "[tok]") {
 TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(t.join_id >= 0);
-    REQUIRE(t.n_base == 269);                 // 256 bytes + 13 markers
-    REQUIRE(t.cap_id == 256);
-    REQUIRE(t.up_id == 257);
-    REQUIRE(t.join_id == 258);
-    REQUIRE(t.newline_id == 259);
-    REQUIRE(t.para_id == 260);
-    REQUIRE(t.odquote_id == 261);
-    REQUIRE(t.cdquote_id == 262);
-    REQUIRE(t.spell_start_id == 263);
-    REQUIRE(t.spell_end_id == 264);
-    REQUIRE(t.space2_id == 265);
-    REQUIRE(t.space4_id == 266);
-    REQUIRE(t.tab2_id == 267);
-    REQUIRE(t.tab4_id == 268);
+    REQUIRE(t.n_base == 270);                 // 256 bytes + 14 markers (incl. eos_id)
+    REQUIRE(t.eos_id == 256);                 // FIRST marker, right after the byte range (see casing.hpp)
+    REQUIRE(t.cap_id == 257);
+    REQUIRE(t.up_id == 258);
+    REQUIRE(t.join_id == 259);
+    REQUIRE(t.newline_id == 260);
+    REQUIRE(t.para_id == 261);
+    REQUIRE(t.odquote_id == 262);
+    REQUIRE(t.cdquote_id == 263);
+    REQUIRE(t.spell_start_id == 264);
+    REQUIRE(t.spell_end_id == 265);
+    REQUIRE(t.space2_id == 266);
+    REQUIRE(t.space4_id == 267);
+    REQUIRE(t.tab2_id == 268);
+    REQUIRE(t.tab4_id == 269);
     REQUIRE(t.vocab > t.n_base);              // merges still learned on top
+}
+
+// Regression: detokenize_join originally had no eos_id case at all (round-trip fell through to a
+// garbled default), and once added, it still dropped the pending implicit space before the literal
+// (unlike the general word path and odquote_id, which both check `dps`) -- caught by the project's own
+// dogfood test, since several source files literally contain the string "<|endoftext|>" in comments.
+TEST_CASE("JOIN scheme: round-trips the literal <|endoftext|> EOS marker", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::vector<int> ids = sub0::tok::encode(t, "the dog ran <|endoftext|> the cat slept");
+    REQUIRE(std::count(ids.begin(), ids.end(), t.eos_id) == 1);   // collapses to exactly one token
+    REQUIRE(round_trips(t, "the dog ran <|endoftext|> the cat slept"));
+    REQUIRE(round_trips(t, "word <|endoftext|>"));                // pending space before EOS (the bug)
+    REQUIRE(round_trips(t, "<|endoftext|>word"));                 // EOS glued to the next word
+    REQUIRE(round_trips(t, "one<|endoftext|>\ntwo<|endoftext|>\n"));  // back-to-back documents
+}
+
+// Mechanism test (user request 2026-07-02): prove the FULL training-corpus pipeline actually lets
+// the model see EOS as a trainable target, not just that sample_window's index arithmetic CAN reach
+// a document boundary (engine_tests.cpp's "window sampler keeps each training window inside one
+// document" already covers that generically, with a synthetic doc index and random token ids). This
+// exercises the REAL chain a corpus goes through: tokenizer.encode() places eos_id, the shared
+// scan_doc_boundaries() (also used by tools/configurator.cpp -- see its declaration in
+// tokenizer.hpp) turns that into a doc index, and sample_window() (window.hpp) draws windows from
+// it -- checking the ACTUAL token id at the sampled target position, not an assumed one. This is
+// exactly the gap the whole EOS feature exists to close (see casing.hpp's TOK_EOS comment): without
+// it, a short document's sampled window would stop one token short of ever training "last content
+// token -> what comes next".
+TEST_CASE("training pipeline: EOS is a reachable, in-window target (not cut off)", "[tok][join][window]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    // Two short documents, back to back -- short enough that sample_window's "short doc: whole
+    // document" path is taken deterministically (cap well under any reasonable T), not just hit by
+    // chance, so a target of eos_id is guaranteed whenever the sampler resolves into document 0.
+    const std::string mini = "the cat sat .<|endoftext|>\nthe dog ran .<|endoftext|>\n";
+    const std::vector<int> ids32 = sub0::tok::encode(t, mini);
+    REQUIRE(std::count(ids32.begin(), ids32.end(), t.eos_id) == 2);
+    const std::vector<std::int32_t> toks(ids32.begin(), ids32.end());
+
+    std::vector<std::uint64_t> doc_starts{0u};
+    int nl_run = 0;
+    sub0::tok::scan_doc_boundaries(std::span<const std::int32_t>(toks), 0u, t, nl_run, doc_starts);
+    REQUIRE(doc_starts.size() == 3);            // doc0 (seeded) + a boundary after each of the 2 EOS tokens
+    // The boundary scan_doc_boundaries recorded for document 0 must point one-past a REAL eos_id in
+    // the actual encoded stream -- not just an index that happens to satisfy the arithmetic.
+    REQUIRE(toks[doc_starts[1] - 1] == t.eos_id);
+
+    // sample_window must actually surface that position as a trainable target across real draws.
+    std::mt19937 rng(11);
+    bool saw_eos_target = false;
+    for (int it = 0; it < 500; ++it) {
+        const sub0::Window w = sub0::sample_window(rng, 64, toks.size(),
+                                                   std::span<const std::uint64_t>(doc_starts));
+        REQUIRE(w.len >= 1);
+        const std::size_t target_pos = w.start + static_cast<std::size_t>(w.len);
+        REQUIRE(target_pos < toks.size());
+        if (toks[target_pos] == t.eos_id) saw_eos_target = true;
+    }
+    REQUIRE(saw_eos_target);                    // the model DOES get trained on "last token -> EOS"
 }
 
 TEST_CASE("JOIN scheme: a single inter-word space costs no token", "[tok][join]") {
