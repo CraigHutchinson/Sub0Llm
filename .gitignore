@@ -19,4 +19,8 @@ data/fineweb_edu.txt.done
 # derived slices for smoke/throughput runs (recreated from the full corpus on demand)
 data/fineweb_smoke.txt
 data/cfg_test.txt
+# fetched via scripts/get_tinystories.py, same category as the fineweb corpora above -- was an
+# untracked-in-spirit 133-byte stub in git history that grew to a real multi-GB corpus without ever
+# being added here
+data/tinystories.txt
 runs/
