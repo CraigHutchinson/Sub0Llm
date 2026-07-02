@@ -352,6 +352,16 @@ if(SUB0_BUILD_CUDA)
   # hot loops and the slow-path handling is wasted work. NOT --use_fast_math (that would
   # also relax div/sqrt rounding); just the denormal flush.
   target_compile_options(sub0_backend_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ftz=true>)
+  # Suppress nvcc diag #20280-D on embed_add_act_kernel<__nv_bfloat16>: it warns that a __global__
+  # template instantiation "must have a definition in the current translation unit" under whole-
+  # program compilation (-rdc=false, our mode -- this project is a single .cu file with no cross-TU
+  # device linking). Verified benign: the sole instantiation point (backend_cuda.cu, forward_train)
+  # is in the SAME translation unit as the definition, so the condition the warning describes is
+  # already satisfied; the kernel runs correctly (parity-tested by the forward/backward CUDA tests).
+  # nvcc's own suggested fix for a genuinely benign case is -static-global-template-stub=false or
+  # this diag suppression -- picked the latter since it is scoped to exactly this advisory.
+  target_compile_options(sub0_backend_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe;--diag_suppress=20280>)
   target_link_libraries(sub0_backend_cuda PRIVATE CUDA::cudart CUDA::cublas)
   if(SUB0_TUNING)
     target_compile_definitions(sub0_backend_cuda PRIVATE SUB0_TUNING)
@@ -366,6 +376,11 @@ endif()
 # --- Stage 4: backend stage libraries ---------------------------------------
 add_library(sub0_train SHARED src/train_stage.cpp)
 target_link_libraries(sub0_train PRIVATE sub0_core)
+# MSVC's CRT headers flag std::getenv deprecated (favoring _dupenv_s); the two SUB0_TRAIN_CPU /
+# SUB0_FIXED_SEQ toggles are simple read-only env lookups with no buffer to overflow, so the
+# "insecure" warning has nothing to protect against here -- suppress it rather than take on a
+# Windows-only API for zero safety benefit.
+target_compile_definitions(sub0_train PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # Phase 2e: when the CUDA backend is built, link it into the train stage and flag the GPU
 # training fast-path on. The train stage reaches the device through the extern "C" seam

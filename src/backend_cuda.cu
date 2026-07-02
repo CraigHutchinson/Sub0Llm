@@ -674,14 +674,75 @@ attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
         for (int a = 0; a < HD; ++a) st_act(&dqi[a], dqa[a]); }
 }
 
-// (3) dk/dv (key-parallel, tiled over queries): dv_j = sum_{i>=j} p_ij dout_i, dk_j = sum_{i>=j}
-//     ds_ij q_i, both owned per key (no atomics). Stages the query tile (q, dout, stats) to shared.
+// (3) dk/dv (key-parallel, tiled over queries), SPLIT into two kernels by register need. The combined
+// kernel held kr+vr+dka+dva = 4*HD float registers per thread -- fine at HD<=64 (256 regs, the
+// architectural cap) but AT HD=96 (native's d768 config) that is 384, over the 255-register hard limit,
+// so ptxas spilled ~50% of them to local memory (measured: 255 regs used, 984B stack frame, 1172B
+// spill store/load -- occupancy-limiting AND adds off-register traffic every launch). dv_j = sum p_ij
+// dout_i depends only on p (hence kr, for the QK score) -- NOT on v at all, so it splits cleanly into
+// its own 2*HD-register kernel. dk_j = sum ds_ij q_i needs BOTH kr (for p) and vr (for dp, feeding ds)
+// together, so it cannot split further; its 3*HD register need (288 at HD=96) is a real, unavoidable
+// reduction from 4*HD, verified at ptxas level (below) to still spill some but far less than the
+// combined kernel. Splitting trades one dk/dv kernel launch for two independent ones (no shared state
+// between them -- same causal tiling, same stats reads); dv drops stat_dot/v/Sd entirely (dv doesn't
+// need them), so it is also lighter on shared memory and global bandwidth, not just registers.
 template <class A, int HD, int TILE_Q>
 __global__ void __launch_bounds__(kAttnTileQ)
-attn_bwd_dkv_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
-                    const A* __restrict__ dout, const float* __restrict__ stat_m,
-                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
-                    A* __restrict__ dk, A* __restrict__ dv, int T, int C, int in_stride) {
+attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
+                   const A* __restrict__ dout, const float* __restrict__ stat_m,
+                   const float* __restrict__ stat_invZ,
+                   A* __restrict__ dv, int T, int C, int in_stride) {
+    __shared__ float Qs[TILE_Q * HD];
+    __shared__ float Ds[TILE_Q * HD];
+    __shared__ float Sm[TILE_Q], Sz[TILE_Q];
+    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    k0 = blockIdx.x * blockDim.x, j = k0 + threadIdx.x;      // this thread's KEY
+    const int    off = h * HD;
+    const float  scale    = rsqrtf(static_cast<float>(HD));
+    const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
+    const size_t out_base = static_cast<size_t>(b) * T * C;
+    float kr[HD], dva[HD];
+    if (j < T) {
+        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); dva[a] = 0.f; }
+    }
+    for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
+        const int ti = min(TILE_Q, T - i0);
+        __syncthreads();
+        for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
+            const int il = e / HD, a = e - il * HD;
+            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + off + a]);
+            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + off + a]); }
+        for (int il = threadIdx.x; il < ti; il += blockDim.x) {
+            const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + (i0 + il);
+            Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; }
+        __syncthreads();
+        if (j < T) {
+            for (int il = 0; il < ti; ++il) { const int i = i0 + il;
+                if (i < j) continue;                                     // causal: key j only seen by i >= j
+                const float* qs = Qs + il * HD; const float* dsr = Ds + il * HD;
+                float s = 0.f;
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) s += qs[a] * kr[a];
+                const float p = __expf(s * scale - Sm[il]) * Sz[il];
+                #pragma unroll
+                for (int a = 0; a < HD; ++a) dva[a] += p * dsr[a]; }
+        }
+    }
+    if (j < T) {
+        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off;
+        #pragma unroll
+        for (int a = 0; a < HD; ++a) st_act(&dvj[a], dva[a]);
+    }
+}
+
+template <class A, int HD, int TILE_Q>
+__global__ void __launch_bounds__(kAttnTileQ)
+attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
+                   const A* __restrict__ dout, const float* __restrict__ stat_m,
+                   const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
+                   A* __restrict__ dk, int T, int C, int in_stride) {
     __shared__ float Qs[TILE_Q * HD];
     __shared__ float Ds[TILE_Q * HD];
     __shared__ float Sm[TILE_Q], Sz[TILE_Q], Sd[TILE_Q];
@@ -691,12 +752,12 @@ attn_bwd_dkv_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* _
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
-    float kr[HD], vr[HD], dka[HD], dva[HD];
+    float kr[HD], vr[HD], dka[HD];
     if (j < T) {
         const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
         const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; dva[a] = 0.f; }
+        for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; }
     }
     for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
         const int ti = min(TILE_Q, T - i0);
@@ -718,14 +779,13 @@ attn_bwd_dkv_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* _
                 for (int a = 0; a < HD; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
                 const float p = __expf(s * scale - Sm[il]) * Sz[il], dsc = p * (dp - Sd[il]) * scale;
                 #pragma unroll
-                for (int a = 0; a < HD; ++a) { dva[a] += p * dsr[a]; dka[a] += dsc * qs[a]; } }
+                for (int a = 0; a < HD; ++a) dka[a] += dsc * qs[a]; }
         }
     }
     if (j < T) {
         A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
-        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) { st_act(&dkj[a], dka[a]); st_act(&dvj[a], dva[a]); }
+        for (int a = 0; a < HD; ++a) st_act(&dkj[a], dka[a]);
     }
 }
 
@@ -1005,11 +1065,12 @@ inline void free_bwd_stats() {
     g_bwd_m = g_bwd_invZ = g_bwd_dot = nullptr; g_bwd_stats_cap = 0;
 }
 
-// Flash attention backward: stats -> dq (query-parallel) -> dk/dv (key-parallel), all atomic-free.
-// dqkv need NOT be pre-zeroed (each dq_i / dk_j / dv_j is written exactly once, in full).
+// Flash attention backward: stats -> dq (query-parallel) -> dv, dk (key-parallel, register-split; see
+// the comment above attn_bwd_dv_kernel), all atomic-free. dqkv need NOT be pre-zeroed (each dq_i /
+// dk_j / dv_j is written exactly once, in full).
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
-    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();
+    constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
     if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
     const dim3 block(kAttnTileQ);
     const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
@@ -1017,7 +1078,8 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
     A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
     attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
     attn_bwd_dq_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
-    attn_bwd_dkv_kernel<A, HD, attn_tile_q<HD>()><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, dv, T, C, in_stride);
+    attn_bwd_dv_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, dout, g_bwd_m, g_bwd_invZ, dv, T, C, in_stride);
+    attn_bwd_dk_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
 }
 
 // Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's
