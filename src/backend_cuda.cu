@@ -305,18 +305,30 @@ __global__ void add_act_kernel(const A* __restrict__ a, const A* __restrict__ b,
     if (i < n) st_act(&c[i], to_f32(a[i]) + to_f32(b[i]));
 }
 // act-typed RMSNorm-train: y = rmsnorm(x)*gamma, saving rinv; in X / out Y store types, FP32 math.
-template <class X, class Y>
-__global__ void rmsnorm_train_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
-                                         Y* __restrict__ y, float* __restrict__ rinv, int rows, int C) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m < rows) {
-        const float eps = 1e-5f;
-        const X* xr = x + static_cast<size_t>(m) * C;
-        float ms = 0.f; for (int j = 0; j < C; ++j) { const float v = to_f32(xr[j]); ms += v * v; }
-        ms /= C; const float r = rsqrtf(ms + eps); rinv[m] = r;
-        Y* yr = y + static_cast<size_t>(m) * C;
-        for (int j = 0; j < C; ++j) st_act(&yr[j], to_f32(xr[j]) * r * gamma[j]);
-    }
+// One BLOCK per row, threads striding coalesced over D_MODEL -- same fix and same reasoning as
+// rmsnorm_backward_act_kernel above (that comment has the full ncu evidence): one-thread-per-row put
+// a warp's simultaneous loads C floats apart with no coalescing. D_MODEL is compile-time constexpr
+// (never a runtime size at any call site), so it's used directly rather than taken as a parameter,
+// which also lets the strided loops fully unroll and folds the /C divide into a constant multiply.
+template <class X, class Y, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+rmsnorm_train_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
+                         Y* __restrict__ y, float* __restrict__ rinv, int rows) {
+    constexpr int   C    = D_MODEL;
+    constexpr float invC = 1.0f / static_cast<float>(C);
+    constexpr float eps  = 1e-5f;
+    const int m = blockIdx.x;
+    if (m >= rows) return;
+    const X* xr = x + static_cast<size_t>(m) * C;
+    float partial = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) { const float v = to_f32(xr[j]); partial += v * v; }
+    const float ms = block_reduce_sum<BLOCK>(partial) * invC;
+    const float r = rsqrtf(ms + eps);
+    if (threadIdx.x == 0) rinv[m] = r;
+    Y* yr = y + static_cast<size_t>(m) * C;
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) st_act(&yr[j], to_f32(xr[j]) * r * gamma[j]);
 }
 
 // Causal multi-head attention (op_attn) is served by the flash-style attn_fwd_tiled_kernel below
@@ -1069,9 +1081,9 @@ template <class A> inline void launch_add_t(const A* dA, const A* dB, A* dC, int
 }
 // act-typed FFN launchers (bf16 storage): rmsnorm f32->act, bias-add on act, gelu/gelu-bwd act.
 template <class X, class Y>
-inline void launch_rmsnorm_train_t(const X* dX, const float* dG, Y* dY, float* dRinv, int T, int C) {
-    const int block = 64;
-    rmsnorm_train_act_kernel<X, Y><<<(T + block - 1) / block, block, 0, g_stream>>>(dX, dG, dY, dRinv, T, C);
+inline void launch_rmsnorm_train_t(const X* dX, const float* dG, Y* dY, float* dRinv, int T) {
+    constexpr int kNormBlock = 64;   // one block per row; divides every D_MODEL this project bakes
+    rmsnorm_train_act_kernel<X, Y, kNormBlock><<<T, kNormBlock, 0, g_stream>>>(dX, dG, dY, dRinv, T);
 }
 template <class A>
 __global__ void bias_add_act_kernel(A* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
@@ -1701,14 +1713,14 @@ void forward_train(int batch, int T) {
         act_t* const hmid = g_tr.h_mid[l];
         act_t* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
-        launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M, C);       // a = rmsnorm(hin,ln1) bf16
+        launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M);          // a = rmsnorm(hin,ln1) bf16
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
         launch_add_t<act_t>(hin, hmid, hmid, MC);                                   // hmid = hin + proj
-        launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M, C);   // fbuf bf16
+        launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M);      // fbuf bf16
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
         launch_bias_act(g_tr.ff1, b1, M, F);                                       // ff1 = f.W1 + b1
         launch_gelu_t(g_tr.ff1, g_tr.gact, MF);                                     // gelu
@@ -1716,7 +1728,7 @@ void forward_train(int batch, int T) {
         launch_bias_act(next, b2, M, C);
         launch_add_t<act_t>(hmid, next, next, MC);                                  // next = hmid + ff2
     }
-    launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);  // a_final f32
+    launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M);     // a_final f32
     launch_linear(g_tr.a_final, lm_head, lm_bias, g_tr.logits, M, C, V, /*force_tc=*/true);  // logits
 }
 
@@ -1755,7 +1767,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
         const int b0 = 2 + 10 * l;
         const float* W1 = pb + L[b0 + 6].off, *b1 = pb + L[b0 + 7].off;
         // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then ff1/gact, before use
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M, C);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M);
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
         launch_bias_act(g_tr.ff1, b1, M, F);
         launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
@@ -1770,7 +1782,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
                            g_tr.dh, gb + L[b0 + 1].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M);
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T, C, H, 3 * C);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
