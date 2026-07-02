@@ -22,12 +22,15 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <print>
 #include <queue>
 #include <string>
@@ -155,6 +158,47 @@ void parallel_segments(const std::vector<std::size_t>& bnd, int nseg, Body&& bod
         });
     for (auto& x : th) x.join();
 }
+
+// Bounded single-producer/single-consumer queue of ready-to-encode batches (Pass 3's IO/compute
+// overlap): a dedicated reader thread fills it straight off disk while the main thread drains it
+// (parallel encode + sequential write), so reading batch N+1 runs concurrently with encoding +
+// writing batch N -- previously strictly sequential (read all of N, THEN encode+write it, THEN read
+// N+1), so the disk sat idle during every encode/write phase and the CPU sat idle during every read.
+// Capacity 2 double-buffers (one batch draining, one prefetched) without unbounded memory growth.
+template <class T>
+class BoundedQueue {
+public:
+    explicit BoundedQueue(std::size_t cap) : cap_(cap) {}
+    void push(T item) {
+        std::unique_lock<std::mutex> lk(m_);
+        not_full_.wait(lk, [&] { return q_.size() < cap_; });
+        q_.push_back(std::move(item));
+        lk.unlock();
+        not_empty_.notify_one();
+    }
+    // Blocks for the next item; returns false once the producer has closed() and the queue is
+    // drained (the "no more work" signal -- distinct from a momentarily-empty-but-still-open queue).
+    bool pop(T& out) {
+        std::unique_lock<std::mutex> lk(m_);
+        not_empty_.wait(lk, [&] { return !q_.empty() || done_; });
+        if (q_.empty()) return false;
+        out = std::move(q_.front());
+        q_.pop_front();
+        lk.unlock();
+        not_full_.notify_one();
+        return true;
+    }
+    void close() {
+        { std::lock_guard<std::mutex> lk(m_); done_ = true; }
+        not_empty_.notify_all();
+    }
+private:
+    std::mutex m_;
+    std::condition_variable not_full_, not_empty_;
+    std::deque<T> q_;
+    std::size_t cap_;
+    bool done_ = false;
+};
 
 // --- Intermediate scan state (the cacheable output of the expensive corpus passes) -------
 // A complete snapshot of what passes 1-2 produce: the bounded name-detection COUNTS, the
@@ -713,12 +757,15 @@ int main(int argc, char** argv) {
         const std::int32_t newline_id = static_cast<std::int32_t>(tkz.newline_id);
         std::vector<std::uint64_t> doc_starts{0u};                  // document 0 begins at token 0 (u64: ~14B tokens)
         int nl_run = 0;
-        // Tokenize Pass 3, PARALLEL: encode a batch of newline-aligned chunks concurrently (each is
-        // independent -- tok::encode reads the const tokenizer), then write them in FILE ORDER and fold
-        // the doc-boundary + count state sequentially. The per-word Viterbi encode is the cost, so this
+        // Tokenize Pass 3, PARALLEL + IO-OVERLAPPED: a dedicated reader thread streams newline-aligned
+        // chunks off disk into batches on a bounded queue (BoundedQueue above), while THIS thread pops
+        // a ready batch, fans it out to `nth` encode workers (each is independent -- tok::encode reads
+        // the const tokenizer), then writes the results in FILE ORDER and folds the doc-boundary +
+        // count state sequentially. Reading batch N+1 now runs concurrently with encoding/writing batch
+        // N (previously strictly sequential: read all of N, THEN encode+write it, THEN read N+1 -- disk
+        // idle during encode, CPU idle during read). The per-word Viterbi encode is the cost, so this
         // lifts the pass off one core (~8 MB/s) toward the disk/memory ceiling.
         const int nth = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-        std::vector<std::string> batch; batch.reserve(static_cast<std::size_t>(nth));
         std::vector<std::vector<std::int32_t>> outs(static_cast<std::size_t>(nth));
         std::vector<char> rtok(static_cast<std::size_t>(nth), 1);
         bool rt_reported = false;
@@ -728,9 +775,23 @@ int main(int argc, char** argv) {
         auto _p3last = _p3t0;
         std::println(stderr, "tokenizing corpus -> corpus.tok ({:.1f} GB, {} threads)...", tot_gb, nth);
 
-        auto flush = [&] {
+        BoundedQueue<std::vector<std::string>> bq(2);   // 2 batches: one draining, one prefetched
+        std::thread reader([&] {
+            std::vector<std::string> batch; batch.reserve(static_cast<std::size_t>(nth));
+            for_each_chunk(corpus, [&](std::string_view chunk) {
+                batch.emplace_back(chunk);
+                if (static_cast<int>(batch.size()) >= nth) {
+                    bq.push(std::move(batch));
+                    batch = std::vector<std::string>(); batch.reserve(static_cast<std::size_t>(nth));
+                }
+            });
+            if (!batch.empty()) bq.push(std::move(batch));
+            bq.close();
+        });
+
+        std::vector<std::string> batch;
+        while (bq.pop(batch)) {
             const int k = static_cast<int>(batch.size());
-            if (k == 0) return;
             std::vector<std::thread> th;                            // parallel encode over the batch
             const int per = (k + nth - 1) / nth;
             for (int t = 0; t < nth; ++t) {
@@ -783,13 +844,8 @@ int main(int argc, char** argv) {
                              gb, tot_gb, tot_gb > 0 ? 100.0 * gb / tot_gb : 0.0,
                              secs > 0 ? static_cast<double>(bytes_done) / 1e6 / secs : 0.0, token_count);
             }
-            batch.clear();
-        };
-        for_each_chunk(corpus, [&](std::string_view chunk) {
-            batch.emplace_back(chunk);
-            if (static_cast<int>(batch.size()) >= nth) flush();
-        });
-        flush();                                                    // final partial batch
+        }
+        reader.join();
         tw.finish(doc_starts);                                      // u64 doc index + back-patch ntok/ndoc
         doc_count = doc_starts.size();
         ts.close();
