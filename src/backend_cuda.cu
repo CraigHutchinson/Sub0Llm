@@ -190,9 +190,14 @@ int             g_graph_T     = -1;
 
 // Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
 // (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
+// idx/bound computed in 64-bit: M*N (lm_head's bias-add is M=batch*T against N=VOCAB) overflows
+// signed 32-bit at ordinary training sizes -- e.g. batch=128, T=512, VOCAB=32873 already exceeds
+// INT32_MAX. Verified via this project's own generated config, not a hypothetical: a plain `int`
+// product here is silent UB (observed as either a corrupted grid or a bias-add skipped for most
+// rows), not a future-proofing nicety.
 __global__ void bias_add_kernel(float* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < M * N) Y[idx] += bias[idx % N];
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < static_cast<long long>(M) * N) Y[idx] += bias[idx % N];
 }
 
 // --- Fast transcendental math (CUDA native intrinsics) ----------------------
@@ -959,9 +964,12 @@ attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
 // Embedding backward (op_embed x2): scatter-add the residual-stream grad into tok_emb / pos_emb
 // rows. Multiple rows map to the same token/position, so accumulation is atomic. One thread per
 // (row m, channel j). pos = m % T (position within the window).
+// C is D_MODEL at this kernel's one call site -- constexpr-folded; T stays runtime (genuinely
+// varies, same reasoning as ce_backward_kernel's T).
 __global__ void embed_backward_kernel(const float* __restrict__ dh, const int* __restrict__ ids,
                                       float* __restrict__ dtok, float* __restrict__ dpos,
-                                      int M, int T, int C) {
+                                      int M, int T) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C) {
@@ -973,8 +981,10 @@ __global__ void embed_backward_kernel(const float* __restrict__ dh, const int* _
 
 // Token-only embedding backward (RoPE path): scatter the residual-stream grad into tok_emb only
 // (no pos_emb, which carries no gradient under RoPE).
+// C is D_MODEL at this kernel's one call site -- constexpr-folded.
 __global__ void embed_backward_token_kernel(const float* __restrict__ dh, const int* __restrict__ ids,
-                                            float* __restrict__ dtok, int M, int C) {
+                                            float* __restrict__ dtok, int M) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m < M && j < C)
@@ -1106,8 +1116,12 @@ inline void launch_linear(const float* dX, const float* dW, const float* dB, flo
     ensure_cublas();
     gemm(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out, force_tc);
     if (dB) {
-        const int n = M * out, block = 256;
-        bias_add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, out);
+        // 64-bit: M*out (lm_head: out=VOCAB) overflows int32 well within reachable batch sizes --
+        // see bias_add_kernel's comment. grid.x itself stays far under the 2^31-1 hardware cap.
+        const long long n = static_cast<long long>(M) * out;
+        const int block = 256;
+        const int grid = static_cast<int>((n + block - 1) / block);
+        bias_add_kernel<<<grid, block, 0, g_stream>>>(dY, dB, M, out);
     }
 }
 // act-typed linear: X(IN) . W(IN) -> Y(OUT), bias OUT. IN=act_t for bf16 GEMMs (W is the bf16
@@ -1139,14 +1153,18 @@ inline void launch_rmsnorm_train_t(const X* dX, const float* dG, Y* dY, float* d
     constexpr int kNormBlock = 64;   // one block per row; divides every D_MODEL this project bakes
     rmsnorm_train_act_kernel<X, Y, kNormBlock><<<T, kNormBlock, 0, g_stream>>>(dX, dG, dY, dRinv, T);
 }
+// 64-bit index/bound -- same overflow reasoning as bias_add_kernel above (this one is reached at a
+// higher batch, N=D_FF scale, but the same UB applies once it is).
 template <class A>
 __global__ void bias_add_act_kernel(A* __restrict__ Y, const float* __restrict__ bias, int M, int N) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < M * N) st_act(&Y[i], to_f32(Y[i]) + bias[i % N]);
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < static_cast<long long>(M) * N) st_act(&Y[i], to_f32(Y[i]) + bias[i % N]);
 }
 template <class A> inline void launch_bias_act(A* dY, const float* dB, int M, int N) {
-    const int n = M * N, block = 256;
-    bias_add_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, N);
+    const long long n = static_cast<long long>(M) * N;
+    const int block = 256;
+    const int grid = static_cast<int>((n + block - 1) / block);
+    bias_add_act_kernel<A><<<grid, block, 0, g_stream>>>(dY, dB, M, N);
 }
 template <class A> inline void launch_gelu_t(const A* dX, A* dY, int n) {
     const int block = 256; gelu_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dX, dY, n);
@@ -1474,8 +1492,10 @@ inline int kv_alloc() {
 inline void kv_free() { if (g_kv_k) cudaFree(g_kv_k); if (g_kv_v) cudaFree(g_kv_v); g_kv_k = g_kv_v = nullptr; }
 
 // Embed one token into h[C] (+ pos_emb[pos] under Absolute; pos_emb == nullptr under RoPE).
+// C is D_MODEL at this kernel's one call site (the per-token decode path) -- constexpr-folded.
 __global__ void embed_one_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                 int id, int pos, float* __restrict__ h, int C) {
+                                 int id, int pos, float* __restrict__ h) {
+    constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= C) return;
     float v = tok_emb[static_cast<size_t>(id) * C + j];
@@ -1556,7 +1576,7 @@ void forward_one_device(int id, int pos) {
     float* proj = g_fwd.proj; float* fbuf = g_fwd.fbuf; float* ff1 = g_fwd.ff1; float* gact = g_fwd.gact; float* ff2 = g_fwd.ff2;
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
-      embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h, C); }
+      embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h); }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = 2 + 10 * l;
         const float* ln1 = base + L[b0 + 0].off, *ln2 = base + L[b0 + 1].off;
@@ -1868,10 +1888,10 @@ void backward_device(int batch, int T, const int* d_lengths) {
         const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
             embed_backward_kernel<<<grid, block, 0, g_stream>>>(
-                g_tr.dh, g_fwd.dids, gb + L[0].off, gb + L[1].off, M, T, C);
+                g_tr.dh, g_fwd.dids, gb + L[0].off, gb + L[1].off, M, T);
         else
             embed_backward_token_kernel<<<grid, block, 0, g_stream>>>(
-                g_tr.dh, g_fwd.dids, gb + L[0].off, M, C);
+                g_tr.dh, g_fwd.dids, gb + L[0].off, M);
     }
 }
 
