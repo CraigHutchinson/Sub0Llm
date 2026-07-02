@@ -57,6 +57,60 @@ using act_t = std::conditional_t<ACT_DTYPE == Dtype::BF16, __nv_bfloat16, float>
 // bf16 atomic-add fallback: read-modify-write (no native bf16 atomic). Only the query-scheme attn
 // backward uses it; the head scheme (bf16 default) is atomic-free so contention is not exercised.
 [[maybe_unused]] __device__ inline void   atomicAdd_act(__nv_bfloat16* p, float v) { *p = __float2bfloat16(__bfloat162float(*p) + v); }
+
+// Block-wide sum reduction, returned to EVERY thread (broadcast): warp-shuffle butterfly within each
+// warp, then one more shuffle-reduce across per-warp partials via shared memory. BLOCK must be a
+// compile-time power-of-two multiple of 32 (every caller launches with a fixed, template-known block
+// size). The trailing __syncthreads() guards a second call reusing warp_sums[] in the same kernel
+// (e.g. ce_backward's max-then-sum-of-exp) against a thread racing ahead into the next reduction's
+// writes before every thread has finished reading this one's broadcast value.
+template <int BLOCK>
+[[maybe_unused]] __device__ inline float block_reduce_sum(float val) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) val += __shfl_down_sync(0xffffffffu, val, off);
+    if constexpr (BLOCK > 32) {
+        __shared__ float warp_sums[BLOCK / 32];
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        if (lane == 0) warp_sums[wid] = val;
+        __syncthreads();
+        if (wid == 0) {
+            val = (lane < BLOCK / 32) ? warp_sums[lane] : 0.f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) val += __shfl_down_sync(0xffffffffu, val, off);
+            if (lane == 0) warp_sums[0] = val;
+        }
+        __syncthreads();
+        val = warp_sums[0];
+        __syncthreads();
+    } else {
+        val = __shfl_sync(0xffffffffu, val, 0);
+    }
+    return val;
+}
+// Same, but returns the block-wide MAX (used by ce_backward's softmax-stabilizing row max).
+template <int BLOCK>
+[[maybe_unused]] __device__ inline float block_reduce_max(float val) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) val = fmaxf(val, __shfl_down_sync(0xffffffffu, val, off));
+    if constexpr (BLOCK > 32) {
+        __shared__ float warp_maxs[BLOCK / 32];
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        if (lane == 0) warp_maxs[wid] = val;
+        __syncthreads();
+        if (wid == 0) {
+            val = (lane < BLOCK / 32) ? warp_maxs[lane] : -1e30f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) val = fmaxf(val, __shfl_down_sync(0xffffffffu, val, off));
+            if (lane == 0) warp_maxs[0] = val;
+        }
+        __syncthreads();
+        val = warp_maxs[0];
+        __syncthreads();
+    } else {
+        val = __shfl_sync(0xffffffffu, val, 0);
+    }
+    return val;
+}
 // Down-cast a float buffer into the act_t store type (bf16 weight mirrors + dh16). F32: plain copy.
 __global__ void f32_to_act_kernel(const float* __restrict__ x, act_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -501,24 +555,45 @@ __global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict
     dbias[o] = s;
 }
 
-// RMSNorm backward: one row/thread. ACCUMULATES dx into the running residual-stream gradient (+=)
-// and dgamma (atomic). Residual input x is the store type; dy/dx and dgamma stay F32. F32 build:
-// X=float; BF16: reads the half-width residual. Mirrors the CPU formula exactly.
-template <class X>
-__global__ void rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
-                                            const float* __restrict__ rinv, const float* __restrict__ dy,
-                                            float* __restrict__ dx, float* __restrict__ dgamma, int rows, int C) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+// RMSNorm backward: one BLOCK per row, threads striding coalesced over D_MODEL (was one thread per
+// row -- ncu measured that at 26-28% occupancy, 3% compute throughput, 77-78% of warp cycles stalled
+// on L1TEX scoreboard dependencies, because at a fixed loop iteration j, adjacent threads (adjacent
+// rows) touch addresses D_MODEL floats apart -- no coalescing across the warp at all). Here thread `k`
+// of the block reads column k, k+BLOCK, k+2*BLOCK, ... of the SAME row, so a warp's simultaneous loads
+// land in one contiguous span; the row's S = sum_j dy[j]*gamma[j]*x[j] is then a block_reduce_sum
+// instead of a sequential accumulation.
+//
+// D_MODEL is baked constexpr (one build = one architecture), not a runtime size -- rmsnorm always
+// normalizes the full residual stream, never a differently-sized slice, at every call site in this
+// file. Taking it as a compile-time constant instead of a parameter lets the strided loops fully
+// unroll (their trip count is then also compile time) and folds the /D_MODEL divide into a constant
+// multiply. BLOCK=64 (see launch_rmsnorm_bwd_t) evenly divides every D_MODEL this project currently
+// bakes (192/448/768), so no thread does a ragged final iteration.
+//
+// ACCUMULATES dx into the running residual-stream gradient (+=) and dgamma (atomic). Residual input x
+// is the store type; dy/dx and dgamma stay F32. F32 build: X=float; BF16: reads the half-width
+// residual. Mirrors the CPU formula exactly.
+template <class X, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
+                            const float* __restrict__ rinv, const float* __restrict__ dy,
+                            float* __restrict__ dx, float* __restrict__ dgamma, int rows) {
+    constexpr int   C    = D_MODEL;
+    constexpr float invC = 1.0f / static_cast<float>(C);
+    const int t = blockIdx.x;
     if (t >= rows) return;
     const X*     xr  = x  + static_cast<size_t>(t) * C;
     const float* dyr = dy + static_cast<size_t>(t) * C;
     float*       dxr = dx + static_cast<size_t>(t) * C;
-    float S = 0.f;
-    for (int j = 0; j < C; ++j) S += dyr[j] * gamma[j] * to_f32(xr[j]);
+    float partial = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) partial += dyr[j] * gamma[j] * to_f32(xr[j]);
+    const float S = block_reduce_sum<BLOCK>(partial);
     const float r = rinv[t], r3 = r * r * r;
-    for (int j = 0; j < C; ++j) {
+    #pragma unroll
+    for (int j = threadIdx.x; j < C; j += BLOCK) {
         const float xj = to_f32(xr[j]), dyj = dyr[j], gj = gamma[j];
-        dxr[j] += r * dyj * gj - (xj * r3 / C) * S;
+        dxr[j] += r * dyj * gj - (xj * r3 * invC) * S;
         atomicAdd(&dgamma[j], dyj * xj * r);
     }
 }
@@ -1067,10 +1142,10 @@ inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
     gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW=X^T.dY
 }
 template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
-                               const float* dy, float* dx, float* dgamma, int rows, int C) {
-    const int block = 64;
-    rmsnorm_backward_act_kernel<X><<<(rows + block - 1) / block, block, 0, g_stream>>>(
-        x, gamma, rinv, dy, dx, dgamma, rows, C);
+                               const float* dy, float* dx, float* dgamma, int rows) {
+    constexpr int kNormBlock = 64;   // one block per row; divides every D_MODEL this project bakes
+    rmsnorm_backward_act_kernel<X, kNormBlock><<<rows, kNormBlock, 0, g_stream>>>(
+        x, gamma, rinv, dy, dx, dgamma, rows);
 }
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
 template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
@@ -1674,7 +1749,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
     // rmsnorm_f: dh starts here (grad into h_final)
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dh, 0, static_cast<size_t>(MC) * sizeof(float), g_stream));
     launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + 0].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
-                       gb + L[fi + 0].off, M, C);
+                       gb + L[fi + 0].off, M);
 
     for (int l = N_LAYERS - 1; l >= 0; --l) {
         const int b0 = 2 + 10 * l;
@@ -1692,7 +1767,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
         launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + 6].off, M, C, F);
         { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M, F); }
         launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
-                           g_tr.dh, gb + L[b0 + 1].off, M, C);                       // dh += -> d(h_mid)
+                           g_tr.dh, gb + L[b0 + 1].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
         launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M, C);
@@ -1714,7 +1789,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
                 g_tr.dwqkv, gb + L[b0 + 2].off, gb + L[b0 + 3].off, gb + L[b0 + 4].off, C);
         }
         launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
-                           g_tr.dh, gb + L[b0 + 0].off, M, C);                       // dh += -> d(h_in)
+                           g_tr.dh, gb + L[b0 + 0].off, M);                          // dh += -> d(h_in)
     }
     // embed backward: scatter dh into tok_emb (+ pos_emb under Absolute) grads
     {
