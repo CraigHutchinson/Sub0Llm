@@ -918,16 +918,26 @@ inline void ensure_cublas() {
 // path is enabled (CudaTf32 knob; parity tests force it off), use 32F_FAST_16BF -- inputs/outputs
 // stay FP32 in memory, cuBLAS down-converts to BF16 for the tensor cores and accumulates in FP32.
 // Otherwise pure FP32. Keeps the parity gate FP32-exact while making "GEMM BF16" genuinely active.
-inline cublasComputeType_t gemm_compute() {
-    return (GEMM_DTYPE == Dtype::BF16 && CudaTf32::get()) ? CUBLAS_COMPUTE_32F_FAST_16BF
-                                                          : CUBLAS_COMPUTE_32F;
+// `force_tc` requests bf16-tensor-core compute (FAST_16BF) whenever GEMM_DTYPE==BF16, independent
+// of the CudaTf32 knob -- for GEMMs where cuBLAS's own algorithm heuristic (under the knob's default
+// plain CUBLAS_COMPUTE_32F) does not reliably land on a tensor-core kernel by itself. Measured (nsys,
+// 2026-07-02): the lm_head GEMM's awkward VOCAB-wide N (e.g. 32873) falls back to a CUDA-core SGEMM
+// (magma_sgemmEx_kernel, ~60-100ms/call) while every other GEMM in the same forward/backward pass
+// (QKV/attn-out/FFN, all "nicer" N like D_MODEL/D_FF) already lands on a bf16 tensor-op CUTLASS
+// kernel (<1ms/call) under that SAME default compute type -- so the rest of the network is already
+// running at this precision level; only the lm_head wasn't getting it. Explicit request only for
+// that call site; every other caller's already-working behavior is untouched.
+inline cublasComputeType_t gemm_compute(bool force_tc = false) {
+    return (GEMM_DTYPE == Dtype::BF16 && (force_tc || CudaTf32::get())) ? CUBLAS_COMPUTE_32F_FAST_16BF
+                                                                        : CUBLAS_COMPUTE_32F;
 }
 // Thin cublasGemmEx wrapper (FP32 A/B/C) honoring gemm_compute(); replaces cublasSgemm everywhere.
 inline void gemm(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
-                 const float* A, int lda, const float* B, int ldb, float* C, int ldc) {
+                 const float* A, int lda, const float* B, int ldb, float* C, int ldc,
+                 bool force_tc = false) {
     const float alpha = 1.0f, beta = 0.0f;
     cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
-                 &beta, C, CUDA_R_32F, ldc, gemm_compute(), CUBLAS_GEMM_DEFAULT);
+                 &beta, C, CUDA_R_32F, ldc, gemm_compute(force_tc), CUBLAS_GEMM_DEFAULT);
 }
 template <class T> constexpr cudaDataType_t cu_type() {
     return std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_32F;
@@ -951,9 +961,9 @@ inline void gemm_t(cublasOperation_t opA, cublasOperation_t opB, int m, int n, i
 // bound -- FP16/BF16 storage + tensor cores (or batched-strided GEMM across layers) is the real
 // lever; QKV fusion measured neutral at training scale (M=4096).
 inline void launch_linear(const float* dX, const float* dW, const float* dB, float* dY,
-                          int M, int in, int out) {
+                          int M, int in, int out, bool force_tc = false) {
     ensure_cublas();
-    gemm(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out);
+    gemm(CUBLAS_OP_N, CUBLAS_OP_N, out, M, in, dW, out, dX, in, dY, out, force_tc);
     if (dB) {
         const int n = M * out, block = 256;
         bias_add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dY, dB, M, out);
@@ -1039,10 +1049,11 @@ template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T, int 
 // straight into the param grad blob (beta=0; each weight is used once per forward). dX may be null
 // for the bottom of the graph (no input grad needed).
 inline void launch_linear_bwd(const float* dX_in, const float* dW_in, const float* dY,
-                              float* dX, float* dW, float* dbias, int M, int in, int out) {
+                              float* dX, float* dW, float* dbias, int M, int in, int out,
+                              bool force_tc = false) {
     if (dX)
-        gemm(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW_in, out, dY, out, dX, in);   // dX = dY . W^T
-    gemm(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW = X^T . dY
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW_in, out, dY, out, dX, in, force_tc);   // dX = dY . W^T
+    gemm(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out, force_tc);        // dW = X^T . dY
     if (dbias) {
         const int block = 128;
         bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out);
@@ -1426,7 +1437,7 @@ void forward_one_device(int id, int pos) {
         launch_add(h, ff2, h, C);
     }
     launch_rmsnorm(h, ln_f, a, 1, C);
-    launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V);
+    launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V, /*force_tc=*/true);
 }
 
 // Device-side forward chain (no host transfers): assumes g_fwd.dids is populated and the
@@ -1488,7 +1499,7 @@ void forward_device(int batch, int T) {
         launch_add(h, ff2, h, MC);                        // h = h + ff2
     }
     launch_rmsnorm(h, ln_f, a, M, C);                     // a = rmsnorm(h, ln_f)
-    launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V);  // logits = a . lm_head + lm_bias
+    launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V, /*force_tc=*/true);  // logits = a . lm_head + lm_bias
 }
 
 // Drop any captured graph (shape or math-mode change -> recapture on the next forward).
@@ -1631,7 +1642,7 @@ void forward_train(int batch, int T) {
         launch_add_t<act_t>(hmid, next, next, MC);                                  // next = hmid + ff2
     }
     launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M, C);  // a_final f32
-    launch_linear(g_tr.a_final, lm_head, lm_bias, g_tr.logits, M, C, V);           // logits
+    launch_linear(g_tr.a_final, lm_head, lm_bias, g_tr.logits, M, C, V, /*force_tc=*/true);  // logits
 }
 
 // Reverse pass: consumes the saved activations, writes the reduced gradient into g_dev_grad and
@@ -1659,7 +1670,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
     }
     // lm_head: dW/dbias -> grad blob, da = grad into a_final
     launch_linear_bwd(g_tr.a_final, pb + L[fi + 1].off, g_tr.dlogits, g_tr.da,
-                      gb + L[fi + 1].off, gb + L[fi + 2].off, M, C, V);
+                      gb + L[fi + 1].off, gb + L[fi + 2].off, M, C, V, /*force_tc=*/true);
     // rmsnorm_f: dh starts here (grad into h_final)
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dh, 0, static_cast<size_t>(MC) * sizeof(float), g_stream));
     launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + 0].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
