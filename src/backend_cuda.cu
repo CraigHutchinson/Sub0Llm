@@ -167,6 +167,9 @@ float* g_dev_m     = nullptr;
 float* g_dev_vel   = nullptr;
 unsigned char* g_dev_decay = nullptr;   // 0/1 weight-decay mask; see adam_step_kernel
 double* g_dev_normsq = nullptr;   // [1] global grad sum-of-squares (AdamW clip, double like CPU)
+float*  g_dev_gs     = nullptr;   // [1] grad-clip scale, computed on-device from g_dev_normsq (see
+                                  // grad_clip_scale_kernel) -- avoids a host readback of normsq just
+                                  // to compute this one scalar (device_adam_step).
 
 // cuBLAS handle for the dense GEMMs (every Linear + the lm_head). Created lazily, destroyed
 // in sub0_cuda_shutdown.
@@ -1058,17 +1061,29 @@ __global__ void grad_normsq_kernel(const float* __restrict__ grad, double* __res
     if (tid == 0) atomicAdd(normsq, sm[0]);
 }
 
+// One-thread kernel: reads the grad L2 normsq the previous kernel just accumulated and writes the
+// AdamW clip scale gs = (norm > clip) ? clip/(norm+eps) : 1 -- entirely on-device, so adam_step_kernel
+// below can read it via pointer instead of the host needing normsq back just to compute this one
+// scalar (see device_adam_step: this is what lets the per-step normsq readback sync disappear).
+__global__ void grad_clip_scale_kernel(const double* __restrict__ normsq, float clip,
+                                       float* __restrict__ gs) {
+    const float norm = sqrtf(static_cast<float>(*normsq));
+    *gs = (norm > clip) ? clip / (norm + 1e-6f) : 1.0f;
+}
+
 // AdamW per-parameter update (op-for-op identical to AdamW::step on the CPU). gs = global grad
-// clip scale, bc1/bc2 = bias corrections, decay = 0/1 mask (wd applies to matrices only). decay is
-// uint8 (a 0/1 flag needs no more): this array is PARAM_FLOATS long and persists for the whole run,
-// so its storage type is pure overhead -- was float (4B/param, 627MB at production scale), now 1B.
+// clip scale (device-resident scalar -- see grad_clip_scale_kernel above), bc1/bc2 = bias
+// corrections, decay = 0/1 mask (wd applies to matrices only). decay is uint8 (a 0/1 flag needs no
+// more): this array is PARAM_FLOATS long and persists for the whole run, so its storage type is pure
+// overhead -- was float (4B/param, 627MB at production scale), now 1B.
 __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict__ grad,
                                  float* __restrict__ m, float* __restrict__ vel,
-                                 const unsigned char* __restrict__ decay, int n, float gs, float lr,
+                                 const unsigned char* __restrict__ decay, int n,
+                                 const float* __restrict__ gs_ptr, float lr,
                                  float b1, float b2, float eps, float wd, float bc1, float bc2) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = grad[i] * gs;
+    const float g = grad[i] * (*gs_ptr);
     m[i]   = b1 * m[i]   + (1.f - b1) * g;
     vel[i] = b2 * vel[i] + (1.f - b2) * g * g;
     const float mhat = m[i] / bc1;
@@ -1971,6 +1986,7 @@ int opt_alloc() {
     // a larger training batch, the bigger lever).
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_decay, n * sizeof(unsigned char)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_normsq, sizeof(double)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_gs, sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_m,   0, n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_vel, 0, n * sizeof(float)));
     // weight-decay mask: 1 for matrices (PARAM_LAYOUT decay flag), 0 for biases/norms.
@@ -1987,30 +2003,33 @@ int opt_alloc() {
 
 void opt_free() {
     cudaFree(g_dev_grad);  cudaFree(g_dev_m);    cudaFree(g_dev_vel);
-    cudaFree(g_dev_decay); cudaFree(g_dev_normsq);
+    cudaFree(g_dev_decay); cudaFree(g_dev_normsq); cudaFree(g_dev_gs);
     g_dev_grad = g_dev_m = g_dev_vel = nullptr;
     g_dev_decay = nullptr;
     g_dev_normsq = nullptr;
+    g_dev_gs = nullptr;
 }
 
 // One AdamW step over the whole param blob, op-for-op identical to AdamW::step on the CPU: global
 // grad L2 clip (double accumulation), then the per-parameter moment update with the decay mask.
 // `t` is the post-increment step counter (>=1) the host optimizer drives. Rebuilds the fused QKV
 // weights (Wq/Wk/Wv just changed) and invalidates the inference graph afterwards.
+//
+// NO host sync here (unlike the pre-2026-07 version): the clip scale gs is computed ON DEVICE by
+// grad_clip_scale_kernel from g_dev_normsq and read by adam_step_kernel via pointer, so nothing here
+// needs normsq back on the host at all. bc1/bc2 are already host-computable from `t` alone (no
+// device dependency). This is the second of two per-step syncs removed 2026-07 -- run_fwd_bwd's loss
+// readback (below) was the other -- leaving a single sync at the end of sub0_cuda_train_step.
 void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd, float clip) {
     const int n = static_cast<int>(sub0::PARAM_FLOATS);
     const int block = 256, grid = (n + block - 1) / block;
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_dev_normsq, 0, sizeof(double), g_stream));
     grad_normsq_kernel<<<grid, block, 0, g_stream>>>(g_dev_grad, g_dev_normsq, n);
-    double normsq = 0.0;
-    SUB0_CUDA_CHECK_VOID(cudaMemcpyAsync(&normsq, g_dev_normsq, sizeof(double), cudaMemcpyDeviceToHost, g_stream));
-    SUB0_CUDA_CHECK_VOID(cudaStreamSynchronize(g_stream));
-    const float norm = static_cast<float>(std::sqrt(normsq));
-    const float gs   = (norm > clip) ? clip / (norm + 1e-6f) : 1.0f;
+    grad_clip_scale_kernel<<<1, 1, 0, g_stream>>>(g_dev_normsq, clip, g_dev_gs);
     const float bc1  = 1.0f - std::pow(b1, static_cast<float>(t));
     const float bc2  = 1.0f - std::pow(b2, static_cast<float>(t));
     adam_step_kernel<<<grid, block, 0, g_stream>>>(g_dev_params, g_dev_grad, g_dev_m, g_dev_vel,
-                                                   g_dev_decay, n, gs, lr, b1, b2, eps, wd, bc1, bc2);
+                                                   g_dev_decay, n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2);
     build_qkv_weights();      // Wq/Wk/Wv changed -> refresh the fused inference/train weight
     invalidate_graph();       // params changed -> recapture the forward graph on next inference
 }

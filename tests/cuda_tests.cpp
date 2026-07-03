@@ -784,14 +784,18 @@ TEST_CASE("CUDA gradient scale is invariant to duplicating the batch", "[cuda]")
 
 // Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
 // the checkpointed activations (a memory-for-compute trade) so it is expected to be heavy; this
-// surfaces the split so the throughput rework (optional checkpointing, on-device clip) is data-driven.
+// surfaces the split so further throughput rework (optional checkpointing) is data-driven. The
+// grad-clip scale is computed on-device (grad_clip_scale_kernel, 2026-07) instead of a host
+// round-trip, so "adam" no longer carries that bubble -- this profile is how the ~10% drop in the
+// adam phase's elapsed time was confirmed.
 TEST_CASE("CUDA per-phase profile attributes the step (forward/backward/adam)", "[cuda][.bench]") {
     CudaGuard _cuda_guard;
     double f = 0.0, b = 0.0, a = 0.0;
     REQUIRE(sub0_cuda_train_profile(32, 128, 10, &f, &b, &a) == 0);
     const double tot = f + b + a;
     WARN("step phases (ms): forward=" << f << "  backward=" << b << "  adam=" << a << "  | total=" << tot
-         << "  (backward recomputes checkpointed activations; adam carries the grad-norm host sync)");
+         << "  (backward recomputes checkpointed activations; grad-clip scale is on-device, no host "
+            "round-trip)");
     REQUIRE(tot > 0.0);
     CHECK(std::isfinite(f)); CHECK(std::isfinite(b)); CHECK(std::isfinite(a));
 }
