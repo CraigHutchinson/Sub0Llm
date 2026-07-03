@@ -2816,6 +2816,9 @@ SUB0_CUDA_API int sub0_cuda_train_footprint(int batch, double* predicted_mb, dou
     std::size_t free_before = 0, total = 0;
     if (cudaMemGetInfo(&free_before, &total) != cudaSuccess) return 1;
     if (sub0_cuda_init() || fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
+    build_qkv_weights();    // BF16 builds: also resident-allocates g_w1_16/g_w2_16/g_wo16/g_wqkv16
+                             // (persistent_bytes() counts these -- see memplan.hpp), so the measured
+                             // delta below stays comparable to the prediction instead of undercounting it.
     cudaDeviceSynchronize();                                // ensure the allocations are physically resident
     std::size_t free_after = 0;
     if (cudaMemGetInfo(&free_after, &total) != cudaSuccess) return 1;

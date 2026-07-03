@@ -67,12 +67,21 @@ constexpr u64 param_floats(const Dims& d) {
 // optimizer arenas (g_dev_grad/m/vel/decay) + the norm accumulator (g_dev_normsq), plus the
 // per-layer fused-QKV weights (g_fwd.wqkv, [C,3C] each, built once at upload). decay is a uint8
 // 0/1 mask (not float -- narrowed 2026-07, see backend_cuda.cu's opt_alloc/adam_step_kernel).
-constexpr u64 persistent_bytes(const Dims& d) {
-    const u64 C = u64(d.d_model), L = u64(d.n_layers);
+// A = activation dtype width (FLOAT for an F32 build, 2 for BF16). A BF16 build ALSO keeps a
+// second, narrower copy of every GEMM weight (g_w1_16/g_w2_16/g_wo16/g_wqkv16, built once by
+// build_qkv_weights() and kept resident for the run) alongside the F32 master in g_dev_params --
+// an F32 build has no separate mirrors (they alias the master weights directly, backend_cuda.cu's
+// build_qkv_weights() F32 branch), so this term is 0 there. Previously uncounted here (~216 MiB at
+// production dims), silently absorbed by the footprint test's tolerance band -- see
+// sub0_cuda_train_footprint(), which now also builds these mirrors before measuring so the
+// PREDICTED and MEASURED deltas stay comparable.
+constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
+    const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     return 4 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel
          + param_floats(d) * UINT8              // g_dev_decay (uint8 mask)
          + DBL                                  // g_dev_normsq [1] (double)
-         + L * (3 * C * C) * FLOAT;             // g_fwd.wqkv[l] = [C, 3C]
+         + L * (3 * C * C) * FLOAT               // g_fwd.wqkv[l] = [C, 3C] (F32 staging, all builds)
+         + (A < FLOAT ? L * (2 * C * F + 4 * C * C) * A : 0);  // BF16-only: g_w1_16+g_w2_16+g_wo16+g_wqkv16
 }
 
 // Resident forward scratch (fwd_alloc), grown to `batch`. One term per cudaMalloc in fwd_alloc.
@@ -124,7 +133,7 @@ constexpr u64 fwd_dids_bytes(const Dims& d, int batch) {
 // Total resident device bytes for one training step at `batch` (persistent + dids + train scratch).
 // fwd_scratch_bytes is the inference-only path; training carries just dids, not the full forward set.
 constexpr u64 train_resident_bytes(const Dims& d, int batch, u64 A = FLOAT) {
-    return persistent_bytes(d) + fwd_dids_bytes(d, batch) + train_scratch_bytes(d, batch, A);
+    return persistent_bytes(d, A) + fwd_dids_bytes(d, batch) + train_scratch_bytes(d, batch, A);
 }
 
 // Footprint in whole MiB, rounded UP -- the same unit GPU_VRAM_MB (from nvidia-smi) is expressed in,

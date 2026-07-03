@@ -1854,10 +1854,11 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     std::println("precision: GEMM {} | activations {} | master FP32  (BF16_OK={}; FFN scratch BF16-stored, parity gated by direction)",
                  GEMM_DTYPE == Dtype::BF16 ? "BF16" : "F32", ACT_DTYPE == Dtype::BF16 ? "BF16" : "F32", BF16_OK);
 
-    const double persist = mib(mp::persistent_bytes(d));
+    const double persist = mib(mp::persistent_bytes(d, ACT_DTYPE == Dtype::BF16 ? 2 : 4));
     std::println("");
     std::println("persistent (resident, batch-independent): {:.0f} MiB", persist);
-    std::println("  params + grad + m + vel + decay (5x) + fused QKV weights");
+    std::println("  params + grad + m + vel + decay (5x) + fused QKV weights{}",
+                 ACT_DTYPE == Dtype::BF16 ? " + BF16 weight mirrors" : "");
     std::println("generation (batch 1): persistent + fwd scratch = {:.0f} MiB",
                  persist + mib(mp::fwd_scratch_bytes(d, 1)));
 
