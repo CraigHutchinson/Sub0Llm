@@ -322,13 +322,13 @@ TEST_CASE("CUDA flash-attention backward matches the naive kernel and is much fa
 // the four backward kernels). Queries the ACTUAL compiled kernel attributes via cudaFuncGetAttributes
 // (deterministic, load-independent -- same philosophy as the speedup ratio above, not wall-clock), so
 // a future change to any of these kernels' resident per-thread state is caught here, not discovered
-// later via a slow, easy-to-miss manual ptxas -v audit. stats/dq/dv/fwd were each deliberately driven
-// to ZERO register spill (dq via a warp-cooperative channel split -- 2 threads share a query, each
-// holding HD/2 channels, combined via warp shuffle; dv by dropping the v/stat_dot state dv doesn't
-// need). dk's 3*HD register need (kr+vr+dka) has no further clean split (dk_j needs kr AND vr
-// together for the same score computation dv_j doesn't), so it accepts a SMALL, bounded spill by
-// design once 3*HD exceeds the architecture's 255-register-per-thread cap -- bounded here so a
-// regression that grows it back toward the pre-split combined kernel's 1172B still fails loudly.
+// later via a slow, easy-to-miss manual ptxas -v audit. All five are driven to ZERO register spill:
+// dq and dk both via a warp-cooperative channel split (2 threads share a query/key, each holding
+// HD/LANES channels, the two half-width dot products combined via warp shuffle -- attn_dq_lanes /
+// attn_dk_lanes in backend_cuda.cu), dv by dropping the v/stat_dot state dv doesn't need. The naive
+// "3*HD > 255" register-count formula undercounts real pressure (loop scalars, staging pointers): dq
+// and dk both measured a real spill at HD=64 despite 3*HD=192 looking safe on paper, which is why the
+// split threshold is empirically set at 3*HD >= 192, not > 255 (see attn_dq_lanes's comment).
 TEST_CASE("CUDA attention kernels stay within their register/spill budget", "[cuda]") {
     CudaGuard _cuda_guard;
     int stats_regs = 0, stats_spill = 0, dq_regs = 0, dq_spill = 0, dv_regs = 0, dv_spill = 0,
@@ -344,13 +344,7 @@ TEST_CASE("CUDA attention kernels stay within their register/spill budget", "[cu
     CHECK(dq_spill    == 0);
     CHECK(dv_spill    == 0);
     CHECK(fwd_spill   == 0);
-    if constexpr (3 * D_HEAD > 255) {
-        CHECK(dk_spill > 0);    // the accepted, by-design spill once 3*HD exceeds the register cap
-        CHECK(dk_spill < 800);  // regression bound: above the measured ~560B (HD=96), well below the
-                                 // pre-split combined kernel's 1172B
-    } else {
-        CHECK(dk_spill == 0);   // small HD: 3*HD already fits under the cap, no spill expected at all
-    }
+    CHECK(dk_spill    == 0);
 }
 
 // GPU forward_one (KV-cache decode) parity, validated against a SHARPENED (non-random) model rather
