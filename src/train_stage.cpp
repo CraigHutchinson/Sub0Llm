@@ -612,12 +612,22 @@ struct GpuTrainer {
     // resident scratch width. Uploads the current host params (+ optimizer moments, zero on a
     // fresh run / restored on resume). Returns false to fall back to the CPU loop.
     //
-    // `ids`/`targets` stay sized at batch*SEQ_LEN (the token budget) regardless of how the caller's
-    // per-step (batch_t, seq_t) pairs vary under the token-budget scheduler below: every admitted
-    // pair satisfies batch_t*seq_t <= batch*SEQ_LEN by construction (that IS the token budget), so
-    // this buffer is already big enough for any of them -- no resize needed here even though batch_t
-    // can individually exceed `batch` at a short seq_t.
-    bool enable(int batch, long resume_t) {
+    // `batch` is IN/OUT: optimistic-allocate-then-fallback. Tries the FULL requested batch (a
+    // checkpoint's saved value, or the tuned DEFAULT_GPU_BATCH) via a REAL cudaMalloc attempt first,
+    // rather than pre-emptively shrinking it from a VRAM *prediction* -- the card, driver, or a
+    // concurrent GPU load can differ from whenever this batch was last tuned/written, in EITHER
+    // direction, so trusting the live allocator's actual answer is more reliable (and less
+    // needlessly conservative) than a predicted budget. Only falls back to a smaller,
+    // conservatively-predicted floor if the optimistic attempt genuinely fails; if even the floor
+    // doesn't fit, gives up on GPU entirely (returns false, caller uses the CPU path).
+    //
+    // `ids`/`targets` stay sized at (the FINAL, possibly-fallen-back) batch*SEQ_LEN (the token
+    // budget) regardless of how the caller's per-step (batch_t, seq_t) pairs vary under the
+    // token-budget scheduler below: every admitted pair satisfies batch_t*seq_t <= batch*SEQ_LEN by
+    // construction (that IS the token budget), so this buffer is already big enough for any of them
+    // -- no separate resize needed even though batch_t can individually exceed `batch` at a short
+    // seq_t.
+    bool enable(int& batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
         constexpr int kCap = 4096;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
         //TODO: Remove getenv calls - these are tmeporary and we should use commandline/compiletime
@@ -627,9 +637,22 @@ struct GpuTrainer {
         if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) return false;
         sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
         // Pin the row budget up front (batch*SEQ_LEN rows) so no per-step (batch_t, seq_t) pair
-        // ever triggers a grow-realloc mid-run -- a clean VRAM failure here falls back to the CPU
-        // path before training starts instead of surfacing as an OOM on some later step.
-        if (sub0_cuda_train_reserve(batch) != 0) return false;
+        // ever triggers a grow-realloc mid-run. A failed sub0_cuda_train_reserve leaves the backend's
+        // scratch in a consistent (if partial) state -- the retry below's OWN reserve call correctly
+        // frees and rebuilds from scratch, no special cleanup needed here.
+        if (sub0_cuda_train_reserve(batch) != 0) {
+            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+            const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
+            constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
+            const int free_mb = sub0_cuda_free_vram_mb();
+            const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
+                                    - kVramHeadroomMB;
+            const int floor = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
+            if (floor < 1 || sub0_cuda_train_reserve(floor) != 0) return false;   // even the floor doesn't fit
+            sub0::log::warn("batch {} did not fit VRAM -- falling back to {} ({} MiB usable of {} free)",
+                            batch, floor, vram_budget, free_mb);
+            batch = floor;
+        }
         t = resume_t;
         active = true;
         ids.resize(static_cast<std::size_t>(batch) * SEQ_LEN);
@@ -965,29 +988,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             sub0::log::info("  checkpoint overrides this invocation's settings: batch {} -> {}, "
                             "lr {:.2e} -> {:.2e}, seed {} -> {} (the checkpoint's values win on resume)",
                             requested_batch, batch, requested_lr, lr, requested_seed, seed);
-#if defined(SUB0_BUILD_CUDA)
-        // A checkpoint's saved batch was fit against VRAM at the time it was tuned/written -- the
-        // card, driver, or a concurrent GPU load can differ on resume. Every OTHER path that picks a
-        // batch (the configurator's DEFAULT_GPU_BATCH clamp, the tuner's VRAM-fit ladder) validates
-        // against VRAM; this one didn't, so a resumed run could silently spill to WDDM shared memory
-        // (the ~10x cliff those other clamps exist to prevent) with zero warning. hard_cap=batch means
-        // this is a no-op (fit == batch) whenever the resumed batch still fits.
-        if (!std::getenv("SUB0_TRAIN_CPU")) {
-            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
-            const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
-            constexpr int kVramHeadroomMB = 512;   // matches the tuner's cuBLAS-workspace/fragmentation slack
-            const int free_mb = sub0_cuda_free_vram_mb();
-            const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
-                                    - kVramHeadroomMB;
-            const int fit = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
-            if (fit > 0 && fit < batch) {
-                sub0::log::warn("resumed batch {} needs more VRAM than is currently available ({} MiB "
-                                "usable of {} free) -- clamping to {} to avoid a WDDM shared-memory spill",
-                                batch, vram_budget, free_mb, fit);
-                batch = fit;
-            }
-        }
-#endif
+        // VRAM re-validation against a possibly-different card/driver/GPU-load than whenever this
+        // batch was tuned/written happens inside GpuTrainer::enable() below (optimistic-allocate,
+        // fall back to a conservative estimate only if the real allocation genuinely fails) -- not
+        // here as a pre-emptive prediction, which risked clamping a batch that would have actually
+        // fit fine (the same "wasted capacity" question a live VRAM measurement can over-trigger on).
     }
     tokens_seen_est = static_cast<long long>(rs.step) * batch * SEQ_LEN;   // batch/rs.step now resume-final
 

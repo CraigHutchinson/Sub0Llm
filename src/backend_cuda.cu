@@ -2442,8 +2442,18 @@ SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int b
 // starts, instead of discovering the OOM on step 1.
 SUB0_CUDA_API int sub0_cuda_train_reserve(int batch) {
     if (batch < 1 || batch > MAX_FWD_BATCH) return 1;
-    if (fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
-    if (ensure_bwd_stats(static_cast<size_t>(batch) * N_HEADS * SEQ_LEN)) return 1;
+    // On ANY failure below, unconditionally release whatever partially succeeded before returning --
+    // fwd_alloc/train_alloc/ensure_bwd_stats each fail mid-sequence (e.g. train_alloc's ~20-buffer
+    // cudaMalloc chain can succeed on the first dozen and fail on a later, larger one) leaving real,
+    // sizeable VRAM resident with capacity still marked 0. A caller measuring free VRAM right after a
+    // failed reserve (to size a smaller fallback attempt, see GpuTrainer::enable) would otherwise see
+    // that leftover partial allocation as "in use", undercounting what's really available once this
+    // function's own next call (or anyone else's) frees it anyway.
+    if (fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc() ||
+        ensure_bwd_stats(static_cast<size_t>(batch) * N_HEADS * SEQ_LEN)) {
+        fwd_free_batch(); train_free(); opt_free(); free_bwd_stats();
+        return 1;
+    }
     return 0;
 }
 
@@ -2884,7 +2894,17 @@ SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
 // sub0_cuda_init()/ensure_cublas() allocated exactly the memory we are trying to measure free (it
 // drove the budget negative -- "showed -2gb"). cuBLAS workspace is allocated lazily on the first GEMM,
 // AFTER this probe, so the caller reserves headroom for it. Returns 0 on failure (caller falls back).
+//
+// Clears any PENDING sticky CUDA error first: this is also the probe GpuTrainer::enable() calls to
+// compute a fallback batch right after an optimistic sub0_cuda_train_reserve() attempt failed (a real
+// cudaMalloc OOM) -- an unhandled CUDA error is sticky and poisons every subsequent call on the same
+// context, including THIS one's cudaMemGetInfo, until something consumes it. Without this, the
+// fallback path silently measured free_mb=0 (not genuinely zero -- cudaMemGetInfo itself failing) and
+// fell back to the less-accurate static-spec-minus-headroom budget instead of the real, more
+// conservative live figure, right when accuracy matters most (immediately after proving the naive
+// estimate was too optimistic).
 SUB0_CUDA_API int sub0_cuda_free_vram_mb() {
+    cudaGetLastError();                                    // clear any pending sticky error (see above)
     cudaFree(nullptr);                                     // ensure the context exists; allocates nothing
     std::size_t free_b = 0, total = 0;
     if (cudaMemGetInfo(&free_b, &total) != cudaSuccess) return 0;
