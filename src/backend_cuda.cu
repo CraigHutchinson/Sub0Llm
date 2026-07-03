@@ -635,13 +635,17 @@ ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ tar
         atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
 }
 
-// Bias gradient: dbias[o] = sum_m dY[m,o] (one thread per output column).
-__global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict__ dbias, int M, int N) {
+// Bias gradient: dbias[o] = sum_m dY[m,o] (one thread per output column). `accumulate` mirrors
+// gemm()'s beta: false OVERWRITES dbias (every existing call site), true adds this call's column
+// sum into it -- not used by any call site yet (see gemm()'s beta comment); default keeps every
+// existing call's behavior unchanged.
+__global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict__ dbias, int M, int N,
+                                 bool accumulate = false) {
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= N) return;
     float s = 0.f;
     for (int m = 0; m < M; ++m) s += dY[static_cast<size_t>(m) * N + o];
-    dbias[o] = s;
+    dbias[o] = accumulate ? dbias[o] + s : s;
 }
 // act-typed bias gradient: dbias[o] = sum_m dY_act[m,o], reading the bf16 store with FP32 accum. This
 // kernel's memory pattern is already fine (adjacent threads o, o+1 read adjacent columns at each fixed
@@ -1152,10 +1156,14 @@ inline cublasComputeType_t gemm_compute(bool force_tc = false) {
                                                                         : CUBLAS_COMPUTE_32F;
 }
 // Thin cublasGemmEx wrapper (FP32 A/B/C) honoring gemm_compute(); replaces cublasSgemm everywhere.
+// beta defaults to 0 (OVERWRITE C) -- the behavior of every pre-existing call site. beta=1
+// ACCUMULATES C += A.B; not used by any call site yet (added groundwork for a future row-chunked
+// GEMM, e.g. splitting the lm_head backward over M -- see Wave 8 in memory), but exercised directly
+// by its own dedicated test so it's verified correct before anything depends on it.
 inline void gemm(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
                  const float* A, int lda, const float* B, int ldb, float* C, int ldc,
-                 bool force_tc = false) {
-    const float alpha = 1.0f, beta = 0.0f;
+                 bool force_tc = false, float beta = 0.0f) {
+    const float alpha = 1.0f;
     cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
                  &beta, C, CUDA_R_32F, ldc, gemm_compute(force_tc), CUBLAS_GEMM_DEFAULT);
 }
@@ -1274,18 +1282,23 @@ template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
 
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
 // and upstream grad dY[M,out], produce dX[M,in] = dY.W^T and dW[in,out] = X^T.dY via two cuBLAS
-// GEMMs (same column-major trick as launch_linear), plus the bias column-sum. dW/dbias write
-// straight into the param grad blob (beta=0; each weight is used once per forward). dX may be null
-// for the bottom of the graph (no input grad needed).
+// GEMMs (same column-major trick as launch_linear), plus the bias column-sum. With the default
+// accumulate=false, dW/dbias write straight into the param grad blob (beta=0; each weight is used
+// once per forward). accumulate=true switches ONLY the dW GEMM and the dbias column-sum to +=
+// (their M dimension is a reduction axis, so a row-chunked caller must sum partial contributions
+// into a pre-zeroed output); not used by any call site yet -- see gemm()'s beta comment. dX stays
+// an overwrite either way -- its rows are per-chunk DISJOINT, each written exactly once. dX may be
+// null for the bottom of the graph (no input grad needed).
 inline void launch_linear_bwd(const float* dX_in, const float* dW_in, const float* dY,
                               float* dX, float* dW, float* dbias, int M, int in, int out,
-                              bool force_tc = false) {
+                              bool force_tc = false, bool accumulate = false) {
     if (dX)
         gemm(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW_in, out, dY, out, dX, in, force_tc);   // dX = dY . W^T
-    gemm(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out, force_tc);        // dW = X^T . dY
+    gemm(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out, force_tc,
+         accumulate ? 1.0f : 0.0f);                                                          // dW (+)= X^T . dY
     if (dbias) {
         const int block = 128;
-        bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out);
+        bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out, accumulate);
     }
 }
 // act-typed linear backward: bf16 inputs/grads, dW lands F32 in the grad blob, dbias optional F32.
@@ -2698,6 +2711,74 @@ SUB0_CUDA_API int sub0_cuda_attn_bwd_check(int batch, int T, int iters,
     if (out_maxreldiff) *out_maxreldiff = reldiff;
     if (out_speedup)    *out_speedup    = speedup;
     return ok ? 0 : 2;
+}
+
+// Verifies gemm()'s beta=1 accumulate mode and bias_grad_kernel's/launch_linear_bwd's accumulate
+// flag that ride on it -- groundwork added for a future row-chunked GEMM (e.g. splitting the
+// lm_head backward over M) but not yet used by any real call site, so this is its only coverage
+// today. Splits a [M,in]x[M,out] backward into two row-chunks (chunk 1 overwrites dW/dbias, chunk 2
+// accumulates into the SAME buffers) and compares against a single full-M reference call -- if
+// dW/dbias's math correctly splits as a sum over disjoint row ranges (it does: dW[i,o] =
+// sum_m X[m,i]*dY[m,o] splits cleanly at any row boundary), the two must match up to GEMM
+// reassociation noise, not the wrong-shape/wrong-scale error a real accumulate-mode bug would cause.
+SUB0_CUDA_API int sub0_cuda_test_accumulate_check(int M, int in, int out, double* out_maxreldiff) {
+    if (M < 2 || in < 1 || out < 1) return 1;
+    if (sub0_cuda_init()) return 1;
+    ensure_cublas();
+    const int M1 = M / 2, M2 = M - M1;
+
+    std::vector<float> hX(static_cast<size_t>(M) * in), hdY(static_cast<size_t>(M) * out);
+    unsigned s = 0x9e3779b9u;
+    auto randf = [&] { s = s * 1664525u + 1013904223u; return static_cast<float>(s >> 8) / 8388608.0f - 1.0f; };
+    for (auto& v : hX)  v = randf();
+    for (auto& v : hdY) v = randf();
+
+    float *dX_in = nullptr, *dY = nullptr;
+    float *dW_ref = nullptr, *dbias_ref = nullptr, *dW_chunk = nullptr, *dbias_chunk = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dX_in, hX.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dY,    hdY.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dW_ref,      static_cast<size_t>(in) * out * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dbias_ref,   static_cast<size_t>(out) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dW_chunk,    static_cast<size_t>(in) * out * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dbias_chunk, static_cast<size_t>(out) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dX_in, hX.data(),  hX.size()  * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dY,    hdY.data(), hdY.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Reference: single full-M call, accumulate=false (the existing, already-trusted behavior).
+    launch_linear_bwd(dX_in, nullptr, dY, nullptr, dW_ref, dbias_ref, M, in, out);
+
+    // Chunked: same X/dY split at row M1 -- chunk 1 overwrites dW_chunk/dbias_chunk, chunk 2
+    // accumulates into the SAME buffers. [M,in]/[M,out] are row-major, so row M1 starts at offset
+    // M1*in / M1*out floats.
+    launch_linear_bwd(dX_in, nullptr, dY, nullptr, dW_chunk, dbias_chunk, M1, in, out, false, false);
+    launch_linear_bwd(dX_in + static_cast<size_t>(M1) * in, nullptr, dY + static_cast<size_t>(M1) * out,
+                      nullptr, dW_chunk, dbias_chunk, M2, in, out, false, true);
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hW_ref(static_cast<size_t>(in) * out), hW_chunk(static_cast<size_t>(in) * out);
+    std::vector<float> hb_ref(out), hb_chunk(out);
+    SUB0_CUDA_CHECK(cudaMemcpy(hW_ref.data(),   dW_ref,      hW_ref.size()   * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hW_chunk.data(), dW_chunk,    hW_chunk.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hb_ref.data(),   dbias_ref,   hb_ref.size()   * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hb_chunk.data(), dbias_chunk, hb_chunk.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    double maxrel = 0.0;
+    for (size_t i = 0; i < hW_ref.size(); ++i) {
+        const double d = std::fabs(static_cast<double>(hW_chunk[i]) - hW_ref[i]);
+        const double denom = std::max(1e-6, static_cast<double>(std::fabs(hW_ref[i])));
+        maxrel = std::max(maxrel, d / denom);
+    }
+    for (size_t i = 0; i < hb_ref.size(); ++i) {
+        const double d = std::fabs(static_cast<double>(hb_chunk[i]) - hb_ref[i]);
+        const double denom = std::max(1e-6, static_cast<double>(std::fabs(hb_ref[i])));
+        maxrel = std::max(maxrel, d / denom);
+    }
+    if (out_maxreldiff) *out_maxreldiff = maxrel;
+
+    cudaFree(dX_in); cudaFree(dY);
+    cudaFree(dW_ref); cudaFree(dbias_ref); cudaFree(dW_chunk); cudaFree(dbias_chunk);
+    return 0;
 }
 
 // Register/local-memory-spill regression guard for the five flash-attention kernels: query the

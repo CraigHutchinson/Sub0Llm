@@ -36,6 +36,7 @@ extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
                                         double* fwd_ms, double* bwd_ms, double* adam_ms);
 extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
+extern "C" int  sub0_cuda_test_accumulate_check(int M, int in, int out, double* out_maxreldiff);
 extern "C" int  sub0_cuda_kv_reset();
 extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
 extern "C" int  sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill, int* dq_regs, int* dq_spill,
@@ -319,6 +320,22 @@ TEST_CASE("CUDA flash-attention backward matches the naive kernel and is much fa
     REQUIRE(rc == 0);              // returns nonzero only on a gross parity failure
     REQUIRE(reldiff < 1.5e-1);     // within bf16-accumulation noise of the naive reference
     REQUIRE(speedup > 3.0);        // tiling + parallelism intact (observed ~45x at d448)
+}
+
+// gemm()'s beta=1 accumulate mode (and bias_grad_kernel's/launch_linear_bwd's accumulate flag riding
+// on it) has no real call site yet -- added as groundwork for a future row-chunked GEMM (e.g.
+// splitting the lm_head backward over M to shrink its dominant per-window scratch buffer). This is
+// its ONLY coverage: a row-chunked dW/dbias computation must match a single full-M reference call,
+// since the underlying math (dW = sum_m X[m]*dY[m], dbias = sum_m dY[m]) splits cleanly across any
+// row boundary -- a real accumulate-mode bug would show up as a wrong scale/shape, not GEMM
+// reassociation-level noise, so this bound is tight.
+TEST_CASE("CUDA gemm/bias_grad/launch_linear_bwd accumulate mode matches a full-M reference", "[cuda]") {
+    CudaGuard _cuda_guard;
+    double reldiff = 1.0;
+    const int rc = sub0_cuda_test_accumulate_check(96, 40, 56, &reldiff);
+    WARN("accumulate check: max rel diff = " << reldiff);
+    REQUIRE(rc == 0);
+    REQUIRE(reldiff < 1e-3);
 }
 
 // Register/local-memory-spill regression guard for the five flash-attention kernels (forward tile +
