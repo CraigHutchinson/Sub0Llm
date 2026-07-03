@@ -455,13 +455,27 @@ template <int HD> constexpr int attn_tile_q() { return HD <= 64 ? 64 : (HD <= 12
 
 // Warp-cooperative channel split for the dq kernel: LANES threads (a power of 2) share one query,
 // each owning HD/LANES channels of qr/dr/dqa, so the per-thread register need drops from 3*HD to
-// 3*(HD/LANES). Only engaged where the FULL 3*HD would exceed the 255-register architectural cap
-// (verified via ptxas -v -- neither #pragma unroll nor a smaller __launch_bounds__ hint change that
-// cap; 255 is a hardware ceiling, not a launch-config artifact). LANES=1 makes every formula in the
-// kernel below reduce algebraically to today's single-thread-per-query code (lane=0, HALF=HD), so
-// existing small-HD builds (e.g. ts_gpu's HD=32) take an UNCHANGED path -- this only activates at
-// large HD (e.g. native's HD=96, where 3*96=288 > 255).
-template <int HD> __host__ __device__ constexpr int attn_dq_lanes() { return (3 * HD > 255 && HD % 2 == 0) ? 2 : 1; }
+// 3*(HD/LANES). Engaged once the raw 3*HD array footprint APPROACHES the 255-register architectural
+// cap (verified via ptxas -v -- neither #pragma unroll nor a smaller __launch_bounds__ hint change
+// that cap; 255 is a hardware ceiling, not a launch-config artifact). The trigger is NOT simply
+// "3*HD > 255": measured via cudaFuncGetAttributes (sub0_cuda_attn_regcheck), HD=64 (3*HD=192,
+// comfortably under 255 by the raw-array count alone) still compiled to 255 regs + 56B spill --
+// per-thread state beyond the three raw arrays (softmax stats, shared-memory staging pointers, loop
+// induction) adds real, non-negligible register pressure the naive formula doesn't count. HD=32
+// (3*HD=96) measured 0 spill, so the threshold is moved down to 3*HD >= 192 (HD >= 64) to also
+// cover that case, while leaving HD=32 on the unsplit LANES=1 path. LANES=1 makes every formula in
+// the kernel below reduce algebraically to the single-thread-per-query code (lane=0, HALF=HD), so
+// small-HD builds are otherwise unaffected in code path or performance.
+template <int HD> __host__ __device__ constexpr int attn_dq_lanes() { return (3 * HD >= 192 && HD % 2 == 0) ? 2 : 1; }
+
+// Same channel-split idea, applied to the dk kernel below: LANES threads share one KEY, each owning
+// HD/LANES channels of kr/vr/dka. dk_j = sum_i ds_ij q_i needs both the QK score (via kr) and the
+// dp = <dout_i, v_j> term (via vr) to form the scalar ds_ij -- structurally the SAME shape as dq's
+// s/dp pair, just with q/k roles swapped (dk owns the key, streams q/dout; dq owns the query, streams
+// k/v), so the identical warp-shuffle-combine trick applies. Same empirically-grounded threshold as
+// attn_dq_lanes (see its comment): kept as a separate function since the two kernels' register
+// pressure could diverge in the future even though the formula is identical today.
+template <int HD> __host__ __device__ constexpr int attn_dk_lanes() { return (3 * HD >= 192 && HD % 2 == 0) ? 2 : 1; }
 
 template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(kAttnTileQ)
@@ -853,11 +867,14 @@ attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
 // spill store/load -- occupancy-limiting AND adds off-register traffic every launch). dv_j = sum p_ij
 // dout_i depends only on p (hence kr, for the QK score) -- NOT on v at all, so it splits cleanly into
 // its own 2*HD-register kernel. dk_j = sum ds_ij q_i needs BOTH kr (for p) and vr (for dp, feeding ds)
-// together, so it cannot split further; its 3*HD register need (288 at HD=96) is a real, unavoidable
-// reduction from 4*HD, verified at ptxas level (below) to still spill some but far less than the
-// combined kernel. Splitting trades one dk/dv kernel launch for two independent ones (no shared state
-// between them -- same causal tiling, same stats reads); dv drops stat_dot/v/Sd entirely (dv doesn't
-// need them), so it is also lighter on shared memory and global bandwidth, not just registers.
+// together, so the 4->3*HD reduction alone isn't enough at large HD -- but it turns out to have the
+// SAME shape as dq's s/dp pair (two independent half-width dot products combined into one scalar), so
+// it takes the identical warp-cooperative channel split (attn_dk_lanes<HD>() above), dropping the
+// per-thread need to 3*(HD/LANES) and eliminating the spill entirely rather than just bounding it (see
+// attn_bwd_dk_kernel below). Splitting trades one dk/dv kernel launch for two independent ones (no
+// shared state between them -- same causal tiling, same stats reads); dv drops stat_dot/v/Sd entirely
+// (dv doesn't need them), so it is also lighter on shared memory and global bandwidth, not just
+// registers.
 template <class A, int HD, int TILE_Q>
 __global__ void __launch_bounds__(kAttnTileQ)
 attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
@@ -909,35 +926,46 @@ attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
     }
 }
 
+// LANES threads warp-cooperate per key at large HD (attn_dk_lanes<HD>() above): each owns HALF =
+// HD/LANES channels of kr/vr/dka, and the two partial dot products (s, dp) that need the FULL HD
+// range are combined via a warp-shuffle XOR between the pair -- the mirror image of attn_bwd_dq_kernel
+// above (there the OWNED state is q/dout and the STREAMED tiles are k/v; here the OWNED state is k/v
+// and the STREAMED tiles are q/dout). LANES=1 reduces every formula below to the pre-split
+// single-thread-per-key kernel (lane=0, HALF=HD), so small-HD builds are unaffected.
 template <class A, int HD, int TILE_Q>
 __global__ void __launch_bounds__(kAttnTileQ)
 attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
                    A* __restrict__ dk, int T, int C, int in_stride) {
+    constexpr int LANES = attn_dk_lanes<HD>();
+    constexpr int HALF  = HD / LANES;
     __shared__ float Qs[TILE_Q * HD];
     __shared__ float Ds[TILE_Q * HD];
     __shared__ float Sm[TILE_Q], Sz[TILE_Q], Sd[TILE_Q];
     const int    b = blockIdx.z, h = blockIdx.y;
-    const int    k0 = blockIdx.x * blockDim.x, j = k0 + threadIdx.x;      // this thread's KEY
-    const int    off = h * HD;
+    const int    lane    = threadIdx.x % LANES;               // which HALF-channel slice this thread owns
+    const int    j_local = threadIdx.x / LANES;                // this pair's key slot within the block
+    const int    k0 = blockIdx.x * (static_cast<int>(blockDim.x) / LANES), j = k0 + j_local;  // this thread's KEY
+    const int    stage_off = h * HD;                           // unshifted: Qs/Ds staging covers the FULL HD
+    const int    off = stage_off + lane * HALF;                 // shifted: this thread's own channel half
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
-    float kr[HD], vr[HD], dka[HD];
+    float kr[HALF], vr[HALF], dka[HALF];
     if (j < T) {
         const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
         const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; }
+        for (int a = 0; a < HALF; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; }
     }
     for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
         const int ti = min(TILE_Q, T - i0);
         __syncthreads();
         for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
             const int il = e / HD, a = e - il * HD;
-            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + off + a]);
-            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + off + a]); }
+            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + stage_off + a]);
+            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + stage_off + a]); }
         for (int il = threadIdx.x; il < ti; il += blockDim.x) {
             const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + (i0 + il);
             Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; Sd[il] = stat_dot[sidx]; }
@@ -945,19 +973,25 @@ attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
         if (j < T) {
             for (int il = 0; il < ti; ++il) { const int i = i0 + il;
                 if (i < j) continue;                                     // causal: key j only seen by i >= j
-                const float* qs = Qs + il * HD; const float* dsr = Ds + il * HD;
+                const float* qs = Qs + il * HD + lane * HALF;    // this thread's channel half of query i
+                const float* dsr = Ds + il * HD + lane * HALF;
                 float s = 0.f, dp = 0.f;
                 #pragma unroll
-                for (int a = 0; a < HD; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
+                for (int a = 0; a < HALF; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
+                if constexpr (LANES > 1) {                      // combine the two lanes' partial dot products
+                    const unsigned mask = __activemask();       // pair is always both-active or both-inactive
+                    s  += __shfl_xor_sync(mask, s,  1);          // (same key j -> same j<T / i<j branch outcome)
+                    dp += __shfl_xor_sync(mask, dp, 1);
+                }
                 const float p = __expf(s * scale - Sm[il]) * Sz[il], dsc = p * (dp - Sd[il]) * scale;
                 #pragma unroll
-                for (int a = 0; a < HD; ++a) dka[a] += dsc * qs[a]; }
+                for (int a = 0; a < HALF; ++a) dka[a] += dsc * qs[a]; }
         }
     }
     if (j < T) {
         A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
         #pragma unroll
-        for (int a = 0; a < HD; ++a) st_act(&dkj[a], dka[a]);
+        for (int a = 0; a < HALF; ++a) st_act(&dkj[a], dka[a]);
     }
 }
 
@@ -1273,18 +1307,21 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
                             int batch, int T, int C, int H, int in_stride) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
     constexpr int DQ_LANES = attn_dq_lanes<HD>();
+    constexpr int DK_LANES = attn_dk_lanes<HD>();
     if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
     const dim3 block(kAttnTileQ);
     const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
     // dq's block covers kAttnTileQ/DQ_LANES queries (LANES threads warp-cooperate per query at large
-    // HD; see attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks.
+    // HD; see attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks. dk is
+    // the same idea over keys instead of queries (attn_dk_lanes).
     const dim3 grid_dq((T + kAttnTileQ / DQ_LANES - 1) / (kAttnTileQ / DQ_LANES), H, batch);
+    const dim3 grid_dk((T + kAttnTileQ / DK_LANES - 1) / (kAttnTileQ / DK_LANES), H, batch);
     const A* q = qkv; const A* k = qkv + C; const A* v = qkv + 2 * C;
     A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
     attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
     attn_bwd_dq_kernel<A, HD, TK><<<grid_dq, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
     attn_bwd_dv_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, dout, g_bwd_m, g_bwd_invZ, dv, T, C, in_stride);
-    attn_bwd_dk_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
+    attn_bwd_dk_kernel<A, HD, TQ><<<grid_dk, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
 }
 
 // Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's
