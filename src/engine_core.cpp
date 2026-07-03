@@ -80,9 +80,10 @@ void warn_tok_model_mismatch() {
 }
 }
 
-void save_model(const char* path) {
+bool save_model(const char* path) {
     sync_params_to_host();                       // pull live weights into the host staging buffer
     std::ofstream os(path, std::ios::binary);
+    if (!os) return false;                        // e.g. transient lock/permission error
     Header h;
     os.write((const char*)&h, sizeof(h));
     os.write((const char*)params_ptr(), (std::streamsize)(PARAM_FLOATS * sizeof(float)));
@@ -92,6 +93,7 @@ void save_model(const char* path) {
     // reads back as fingerprint 0 (unknown), i.e. no guard. No format-magic bump needed.
     const std::uint64_t fp = g_tok.loaded ? tok::fingerprint(g_tok) : 0;
     os.write((const char*)&fp, sizeof(fp));
+    return os.good();
 }
 
 bool load_model(const char* path) {

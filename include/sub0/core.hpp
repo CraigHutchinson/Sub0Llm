@@ -52,7 +52,7 @@ struct Node {
 // --- Model lifecycle --------------------------------------------------------
 SUB0_API void build_model();                       // allocate param layout + random init
 SUB0_API bool load_model(const char* path);        // overwrite params from disk
-SUB0_API void save_model(const char* path);        // write params to disk
+SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
 SUB0_API void print_config();                      // human-readable config + memory line
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and

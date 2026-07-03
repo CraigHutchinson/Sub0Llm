@@ -338,13 +338,23 @@ template <class T> T rd(std::istream& is) {
     T v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v;
 }
 
-void atomic_replace(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
+// Returns false (and logs) if BOTH the plain rename and the remove-then-rename fallback fail -- e.g.
+// dst is held open by an antivirus scan, a cloud-sync client, or another process (a `sub0llm-gen`
+// reading model.bin). Previously silent on this path: a failed replace left `tmp` on disk with the
+// caller having no idea the checkpoint didn't land.
+bool atomic_replace(const std::filesystem::path& tmp, const std::filesystem::path& dst) {
     std::error_code ec;
     std::filesystem::rename(tmp, dst, ec);
     if (ec) {  // some platforms (Windows) won't clobber an existing target
         std::filesystem::remove(dst, ec);
         std::filesystem::rename(tmp, dst, ec);
     }
+    if (ec) {
+        sub0::log::warn("train: could not move '{}' -> '{}': {} (the write itself succeeded; '{}' is "
+                        "left on disk)", tmp.string(), dst.string(), ec.message(), tmp.string());
+        return false;
+    }
+    return true;
 }
 
 // Pin an artifact from the live build tree into the model directory: self-contained, and immune to a
@@ -389,11 +399,18 @@ std::filesystem::path bundle_into_model_dir(const std::filesystem::path& src,
 // renamed so a crash mid-write never corrupts a usable checkpoint. The step budget
 // (max_steps) is deliberately NOT stored: it is a per-invocation policy, so a
 // resumed run continues toward the budget the *current* call asks for.
-void save_checkpoint(const std::string& path, long adam_t, const std::mt19937& rng,
+//
+// Returns false on any I/O failure (open/write/replace). Deliberately does NOT retry or block here:
+// this is called from the training loop's own periodic cadence (every eval interval, or every
+// CKPT_SECONDS crash-resistance tick), so a transient failure (an antivirus scan, a cloud-sync lock)
+// self-heals at the NEXT call a few minutes later without training ever stalling on it -- see the
+// call sites for the warn-and-continue handling. Retry-with-backoff-and-fallback-filename is reserved
+// for the END-of-training save, the one point where there is no "next interval" to retry at.
+bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& rng,
                      const RunState& rs, int batch, float lr, unsigned seed) {
     const std::string tmp = path + ".tmp";
     std::ofstream os(tmp, std::ios::binary);
-    if (!os) { sub0::log::error("train: cannot write checkpoint '{}'", tmp); return; }
+    if (!os) { sub0::log::warn("train: cannot write checkpoint '{}'", tmp); return false; }
 
     wr(os, CKPT_MAGIC); wr(os, CKPT_VERSION);
     for (int c : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) wr(os, c);
@@ -421,9 +438,28 @@ void save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     os.write(reinterpret_cast<const char*>(sub0::adam_m_ptr()), bytes);
     os.write(reinterpret_cast<const char*>(sub0::adam_v_ptr()), bytes);
     os.flush();
-    if (!os) { sub0::log::error("train: checkpoint write failed '{}'", tmp); return; }
+    if (!os) { sub0::log::warn("train: checkpoint write failed '{}'", tmp); return false; }
     os.close();
-    atomic_replace(tmp, path);
+    return atomic_replace(tmp, path);
+}
+
+// Bounded retry-with-backoff for a save action that MUST eventually succeed -- used only at the very
+// end of training, where (unlike the periodic saves above) there is no later checkpoint interval to
+// naturally retry at. `what` names the action for the log. Blocking here is fine: training is already
+// finished, so a few seconds' delay costs nothing the way it would mid-run.
+template <class F>
+bool retry_with_backoff(F&& attempt, const char* what) {
+    constexpr int kMaxAttempts = 5;
+    constexpr auto kRetryDelay = std::chrono::seconds(3);
+    for (int i = 0; i < kMaxAttempts; ++i) {
+        if (attempt()) return true;
+        if (i + 1 < kMaxAttempts) {
+            sub0::log::warn("{} failed (attempt {}/{}) -- retrying in {}s...",
+                            what, i + 1, kMaxAttempts, kRetryDelay.count());
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+    return false;
 }
 
 // Restore a checkpoint onto an already-built model. Returns false (leaving the
@@ -1045,10 +1081,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             std::fflush(stdout);
 
             // Progress-named checkpoint + latest model every interval (covers warmup too); prune to
-            // the newest `keep` so a long run doesn't fill the disk with 0.5 GB checkpoints.
-            save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed);
+            // the newest `keep` so a long run doesn't fill the disk with 0.5 GB checkpoints. Neither
+            // save blocks/retries here on failure (a transient lock -- antivirus, cloud sync, a
+            // concurrent `sub0llm-gen` reading model.bin) -- training keeps going, and the NEXT
+            // interval's save is the retry. Only the end-of-training save (below the loop) needs
+            // real retry-with-backoff, since there is no later interval to fall back on there.
+            if (!save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed))
+                sub0::log::warn("checkpoint save failed at step {} -- will retry at the next interval", step);
             prune_ckpts(model_path, keep);
-            sub0::save_model(model_path.c_str());
+            if (!sub0::save_model(model_path.c_str()))
+                sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
             write_meta("training");          // refresh best_val_nelbo as it improves
 
             run_loss = 0.0; run_n = 0;
@@ -1074,9 +1116,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // stretches between evals. No val NELBO / plateau check here: it is purely a resume point.
         if (!is_eval && std::chrono::duration<double>(clock::now() - last_ckpt).count() >= CKPT_SECONDS) {
             gpu.sync_to_host();                               // pull live device weights into the host arenas
-            save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed);
+            if (!save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed))
+                sub0::log::warn("checkpoint save failed at step {} -- will retry at the next interval", step);
             prune_ckpts(model_path, keep);
-            sub0::save_model(model_path.c_str());
+            if (!sub0::save_model(model_path.c_str()))
+                sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
             write_meta("training");
             last_ckpt = clock::now();
             sub0::log::line("  [checkpoint @ step {} ({:.0f}m crash-resistance tick)]", step, CKPT_SECONDS / 60.0);
@@ -1085,19 +1129,47 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     }
 
     gpu.sync_to_host();    // ensure the host arenas hold the final device weights before saving
-    sub0::save_model(model_path.c_str());
-    save_checkpoint(ckpt_step_path(model_path, rs.step), opt.step_count(), rng, rs, batch, lr, seed);
-    prune_ckpts(model_path, keep);
-    write_meta(graceful_stop ? "stopped" : (stop ? "plateaued" : "trained"));
     if (graceful_stop) {
-        // The checkpoint above is already safely on disk -- skip the sample generation (a full
-        // SEQ_LEN-token decode can take real time at a large model) so a Ctrl+C / window-close
-        // request exits promptly, comfortably inside the OS's grace period before a force-kill.
+        // Time-sensitive: a Ctrl+C/console-close handler has a short OS grace period before a
+        // force-kill, so this deliberately does NOT retry-with-backoff -- blocking here risks
+        // blowing that grace period and getting force-killed mid-retry, losing MORE than a single
+        // quick (possibly failed) attempt would. Still surfaces a failure instead of staying silent.
+        if (!sub0::save_model(model_path.c_str()))
+            sub0::log::error("model.bin save failed during graceful stop -- the checkpoint below is "
+                             "the authoritative record");
+        if (!save_checkpoint(ckpt_step_path(model_path, rs.step), opt.step_count(), rng, rs, batch, lr, seed))
+            sub0::log::error("checkpoint save failed during graceful stop at step {} -- training "
+                             "progress may not be on disk", rs.step);
+        prune_ckpts(model_path, keep);
+        write_meta("stopped");
+        // The checkpoint above is already (best-effort) on disk -- skip the sample generation (a full
+        // SEQ_LEN-token decode can take real time at a large model) so the exit stays prompt.
         sub0::log::line("stopped (graceful) at step {} (best val_nelbo {:.4f}) -> {}",
              rs.step, rs.best_loss, model_path);
         gpu.shutdown();
         return 0;
     }
+    // Normal end of training (plateau or max-steps): no responsiveness pressure, so this is the one
+    // save that gets a real retry-with-backoff -- and, if that still isn't enough, a fallback
+    // filename -- since unlike the periodic saves during the loop, there is no later checkpoint
+    // interval left to naturally retry at once training has actually finished.
+    if (!retry_with_backoff([&] { return sub0::save_model(model_path.c_str()); }, "final model.bin save"))
+        sub0::log::error("model.bin save failed after retries; the checkpoint below is the "
+                         "authoritative record");
+    const std::string final_ckpt = ckpt_step_path(model_path, rs.step);
+    if (!retry_with_backoff([&] {
+            return save_checkpoint(final_ckpt, opt.step_count(), rng, rs, batch, lr, seed);
+        }, "final checkpoint save")) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string fallback = final_ckpt + ".rescue-" + std::to_string(now);
+        sub0::log::error("final checkpoint repeatedly failed to save to '{}' -- falling back to '{}'",
+                         final_ckpt, fallback);
+        if (!save_checkpoint(fallback, opt.step_count(), rng, rs, batch, lr, seed))
+            sub0::log::error("fallback checkpoint save ALSO failed -- training progress may be lost");
+    }
+    prune_ckpts(model_path, keep);
+    write_meta(stop ? "plateaued" : "trained");
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
     // reaches it). This exercises the real long-context behaviour the trained window supports.
