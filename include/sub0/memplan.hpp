@@ -41,6 +41,7 @@ using u64 = unsigned long long;
 inline constexpr u64 FLOAT = sizeof(float);
 inline constexpr u64 INT   = sizeof(int);
 inline constexpr u64 DBL   = sizeof(double);
+inline constexpr u64 UINT8 = 1;   // g_dev_decay: a 0/1 mask, stored as the narrowest type that holds it
 
 // Trainable float count -- the exact sum PARAM_LAYOUT produces in layout.hpp, re-derived here
 // from dims so the configurator (which cannot include layout.hpp) gets the same number. The CUDA
@@ -57,10 +58,12 @@ constexpr u64 param_floats(const Dims& d) {
 
 // Persistent, batch-independent device memory: the param mirror (g_dev_params) + the four
 // optimizer arenas (g_dev_grad/m/vel/decay) + the norm accumulator (g_dev_normsq), plus the
-// per-layer fused-QKV weights (g_fwd.wqkv, [C,3C] each, built once at upload).
+// per-layer fused-QKV weights (g_fwd.wqkv, [C,3C] each, built once at upload). decay is a uint8
+// 0/1 mask (not float -- narrowed 2026-07, see backend_cuda.cu's opt_alloc/adam_step_kernel).
 constexpr u64 persistent_bytes(const Dims& d) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers);
-    return 5 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel + decay
+    return 4 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel
+         + param_floats(d) * UINT8              // g_dev_decay (uint8 mask)
          + DBL                                  // g_dev_normsq [1] (double)
          + L * (3 * C * C) * FLOAT;             // g_fwd.wqkv[l] = [C, 3C]
 }

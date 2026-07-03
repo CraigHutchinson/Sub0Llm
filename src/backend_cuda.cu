@@ -165,7 +165,7 @@ float* g_dev_params = nullptr;
 float* g_dev_grad  = nullptr;
 float* g_dev_m     = nullptr;
 float* g_dev_vel   = nullptr;
-float* g_dev_decay = nullptr;
+unsigned char* g_dev_decay = nullptr;   // 0/1 weight-decay mask; see adam_step_kernel
 double* g_dev_normsq = nullptr;   // [1] global grad sum-of-squares (AdamW clip, double like CPU)
 
 // cuBLAS handle for the dense GEMMs (every Linear + the lm_head). Created lazily, destroyed
@@ -1025,10 +1025,12 @@ __global__ void grad_normsq_kernel(const float* __restrict__ grad, double* __res
 }
 
 // AdamW per-parameter update (op-for-op identical to AdamW::step on the CPU). gs = global grad
-// clip scale, bc1/bc2 = bias corrections, decay = 0/1 mask (wd applies to matrices only).
+// clip scale, bc1/bc2 = bias corrections, decay = 0/1 mask (wd applies to matrices only). decay is
+// uint8 (a 0/1 flag needs no more): this array is PARAM_FLOATS long and persists for the whole run,
+// so its storage type is pure overhead -- was float (4B/param, 627MB at production scale), now 1B.
 __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict__ grad,
                                  float* __restrict__ m, float* __restrict__ vel,
-                                 const float* __restrict__ decay, int n, float gs, float lr,
+                                 const unsigned char* __restrict__ decay, int n, float gs, float lr,
                                  float b1, float b2, float eps, float wd, float bc1, float bc2) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1904,30 +1906,30 @@ int opt_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_grad,  n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_m,     n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_vel,   n * sizeof(float)));
-    // TODO(mem): g_dev_decay is a full float[PARAM_FLOATS] 0/1 mask (~param-size, batch-independent).
-    // A uint8 mask, a packed bitset, or deriving decay from PARAM_LAYOUT segment ids in the kernel
-    // would reclaim ~3/4 of it. Persistent (not per-batch), so a modest win -- but every MB freed is
-    // headroom for a larger training batch, which is the bigger lever.
-    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_decay, n * sizeof(float)));
+    // uint8 mask (a 0/1 flag needs no more than 1 byte -- was float, 4x the storage for the same
+    // information; persistent for the whole run, so every byte here is permanent headroom lost to
+    // a larger training batch, the bigger lever).
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_decay, n * sizeof(unsigned char)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_normsq, sizeof(double)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_m,   0, n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_vel, 0, n * sizeof(float)));
     // weight-decay mask: 1 for matrices (PARAM_LAYOUT decay flag), 0 for biases/norms.
-    std::vector<float> mask(n, 0.0f);
+    std::vector<unsigned char> mask(n, 0);
     const auto& L = sub0::PARAM_LAYOUT;
     for (const auto& pv : L) {
-        const float d = pv.decay ? 1.0f : 0.0f;
+        const unsigned char d = pv.decay ? 1 : 0;
         const size_t cnt = static_cast<size_t>(pv.rows) * pv.cols;
         for (size_t i = 0; i < cnt; ++i) mask[pv.off + i] = d;
     }
-    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_decay, mask.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_decay, mask.data(), n * sizeof(unsigned char), cudaMemcpyHostToDevice));
     return 0;
 }
 
 void opt_free() {
     cudaFree(g_dev_grad);  cudaFree(g_dev_m);    cudaFree(g_dev_vel);
     cudaFree(g_dev_decay); cudaFree(g_dev_normsq);
-    g_dev_grad = g_dev_m = g_dev_vel = g_dev_decay = nullptr;
+    g_dev_grad = g_dev_m = g_dev_vel = nullptr;
+    g_dev_decay = nullptr;
     g_dev_normsq = nullptr;
 }
 
