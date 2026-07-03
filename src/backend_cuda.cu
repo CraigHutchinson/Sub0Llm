@@ -377,6 +377,24 @@ __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __re
     }
 }
 
+// Same fused layout, writing DIRECTLY to the activation (bf16) mirror instead of staging through an
+// F32 intermediate -- what BF16 training uses (build_qkv_weights() below) so it never needs the
+// F32 g_fwd.wqkv buffer at all. st_act rounds each element on the store, identical to building the
+// F32 buffer above and converting it afterward, minus the extra read+write pass over 3*C*C elements.
+template <class A>
+__global__ void build_qkv_act_kernel(const float* __restrict__ Wq, const float* __restrict__ Wk,
+                                     const float* __restrict__ Wv, A* __restrict__ Wqkv) {
+    constexpr int C = D_MODEL;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < C * C) {
+        const int p = idx / C, c = idx % C;
+        const int row = p * 3 * C;
+        st_act(&Wqkv[row + c],         Wq[idx]);
+        st_act(&Wqkv[row + C + c],     Wk[idx]);
+        st_act(&Wqkv[row + 2 * C + c], Wv[idx]);
+    }
+}
+
 // RoPE forward: rotate the Q and K sub-blocks (columns [0,C) and [C,2C)) of the fused [*, 3C]
 // qkv buffer in place, in interleaved pairs per head; V (cols [2C,3C)) is left alone. One thread
 // per (row m, global pair pg over C/2). pos = m % T (position within the window). Mirrors the CPU
@@ -1374,9 +1392,21 @@ size_t     g_fwd_rows = 0;             // total [M] ROW capacity the batch-depen
                                        // step can trade batch against T inside one reserved budget)
 int        g_fwd_full = 0;             // 1 = full inference scratch allocated; 0 = dids-only (training)
 long long  g_fwd_grows = 0;            // monotonic (re)allocation count -- test observability
+// BF16 builds only: true when the lazily-built F32 wqkv (ensure_wqkv_f32, for sub0_cuda_forward /
+// sub0_cuda_forward_one) is stale relative to the current weights -- set by build_qkv_weights() on
+// every weight change, cleared once ensure_wqkv_f32() rebuilds it.
+bool g_wqkv_f32_dirty = true;
 
-// Batch-independent fused-QKV weight buffers (built at upload). Kept across batch grows.
+// Batch-independent fused-QKV weight buffer (F32, [C,3C] per layer). BF16 builds no longer keep
+// this resident during training -- build_qkv_weights() below writes the bf16 mirror (g_wqkv16)
+// DIRECTLY from Wq/Wk/Wv instead of staging through this F32 buffer, so it's dead weight for a pure
+// training run (~108 MiB at production dims). The F32 CUDA inference paths (sub0_cuda_forward,
+// sub0_cuda_forward_one) still need it -- see ensure_wqkv_f32() below, which allocates+builds it
+// lazily, on demand, only in a process that actually calls them. F32-activation builds are
+// unaffected: g_wqkv16 there ALIASES this buffer directly (build_qkv_weights()'s F32 branch), so it
+// stays eagerly built exactly as before.
 int wqkv_alloc() {
+    if constexpr (ACT_DTYPE == Dtype::BF16) return 0;   // handled by ensure_wqkv_f32() / build_qkv_weights()
     if (g_fwd.wqkv[0]) return 0;
     ensure_stream();
     for (int l = 0; l < N_LAYERS; ++l)
@@ -1434,6 +1464,7 @@ int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
 void fwd_free() {
     fwd_free_batch();
     for (int l = 0; l < N_LAYERS; ++l) { cudaFree(g_fwd.wqkv[l]); g_fwd.wqkv[l] = nullptr; }
+    g_wqkv_f32_dirty = true;   // BF16: force ensure_wqkv_f32() to rebuild after the next (re)alloc
 }
 
 // Resident TRAINING scratch (Phase 2d): the forward saves every activation the backward needs
@@ -1774,47 +1805,82 @@ int capture_graph(int batch, int T) {
     return 0;
 }
 
-// Materialize the per-layer fused QKV weight (g_fwd.wqkv[l] = [Wq|Wk|Wv]) from the uploaded
-// param blob. Called once whenever the weights change (upload/load). TODO(qkv-train): once the
-// device backend trains in place, the optimizer updates Wq/Wk/Wv in g_dev_params each step, so
-// this rebuild must run inside the step (cheap: N_LAYERS*C*C threads) -- or store QKV fused
-// natively and slice it back for the layout-table serialization.
+// Materialize the per-layer fused QKV weight from the uploaded param blob. Called once whenever the
+// weights change (upload/load/every AdamW step). TODO(qkv-train): this rebuild runs inside every
+// device training step (cheap: N_LAYERS*C*C threads) -- or store QKV fused natively and slice it
+// back for the layout-table serialization.
+//
+// BF16 builds write g_wqkv16 DIRECTLY from Wq/Wk/Wv (build_qkv_act_kernel) -- no F32 g_fwd.wqkv
+// staging buffer at all, since training never reads it (only the bf16 mirror feeds the training
+// GEMMs). That buffer is dead weight during training (~108 MiB at production dims): marks
+// g_wqkv_f32_dirty so the F32 CUDA inference paths (ensure_wqkv_f32, sub0_cuda_forward /
+// sub0_cuda_forward_one) rebuild their own lazily-allocated copy on next use instead of reading a
+// stale one -- this is what keeps an interleaved train-then-infer call (e.g. the forward_one/full-
+// forward parity check) correct.
+//
+// F32 builds are UNCHANGED from before this split: g_fwd.wqkv is eagerly built here (same
+// build_qkv_kernel as always) and every mirror aliases the master weights directly (no copy).
 void build_qkv_weights() {
     const auto& L = sub0::PARAM_LAYOUT;
     const int   C = D_MODEL;
     const int   n = C * C, block = 256, grid = (n + block - 1) / block;
-    for (int l = 0; l < N_LAYERS; ++l) {
-        const int    b0 = 2 + 10 * l;
-        const float* Wq = g_dev_params + L[b0 + 2].off;
-        const float* Wk = g_dev_params + L[b0 + 3].off;
-        const float* Wv = g_dev_params + L[b0 + 4].off;
-        build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
-    }
-    if constexpr (ACT_DTYPE == Dtype::BF16) {            // refresh FFN bf16 weight mirrors
+    if constexpr (ACT_DTYPE == Dtype::BF16) {
+        g_wqkv_f32_dirty = true;
         const int F = D_FF;
         const int nce = C * F, gce = (nce + 255) / 256;
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int b0 = 2 + 10 * l;
-            if (!g_w1_16[l]) cudaMalloc(&g_w1_16[l], static_cast<size_t>(C) * F * sizeof(act_t));
-            if (!g_w2_16[l]) cudaMalloc(&g_w2_16[l], static_cast<size_t>(F) * C * sizeof(act_t));
-            if (!g_wo16[l])  cudaMalloc(&g_wo16[l],  static_cast<size_t>(C) * C * sizeof(act_t));
+            const int    b0 = 2 + 10 * l;
+            const float* Wq = g_dev_params + L[b0 + 2].off;
+            const float* Wk = g_dev_params + L[b0 + 3].off;
+            const float* Wv = g_dev_params + L[b0 + 4].off;
+            if (!g_w1_16[l])   cudaMalloc(&g_w1_16[l],   static_cast<size_t>(C) * F * sizeof(act_t));
+            if (!g_w2_16[l])   cudaMalloc(&g_w2_16[l],   static_cast<size_t>(F) * C * sizeof(act_t));
+            if (!g_wo16[l])    cudaMalloc(&g_wo16[l],    static_cast<size_t>(C) * C * sizeof(act_t));
+            if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * 3 * C * sizeof(act_t));
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 6].off, g_w1_16[l], nce);
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 8].off, g_w2_16[l], nce);
             { const int ncc = C * C, gcc = (ncc + 255) / 256;
               f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + 5].off, g_wo16[l], ncc); }
-            { const int n3 = C * 3 * C, g3 = (n3 + 255) / 256;
-              if (!g_wqkv16[l]) cudaMalloc(&g_wqkv16[l], static_cast<size_t>(C) * 3 * C * sizeof(act_t));
-              f32_to_act_kernel<<<g3, 256, 0, g_stream>>>(g_fwd.wqkv[l], g_wqkv16[l], n3); }
+            build_qkv_act_kernel<act_t><<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_wqkv16[l]);
         }
     } else {                                             // F32: mirrors alias the master weights (no copy)
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int b0 = 2 + 10 * l;
+            const int    b0 = 2 + 10 * l;
+            const float* Wq = g_dev_params + L[b0 + 2].off;
+            const float* Wk = g_dev_params + L[b0 + 3].off;
+            const float* Wv = g_dev_params + L[b0 + 4].off;
+            build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
             g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 6].off);
             g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 8].off);
             g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 5].off);
             g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
         }
     }
+}
+
+// Lazily (re)builds the F32 fused QKV weight for the CUDA inference-only paths (sub0_cuda_forward,
+// sub0_cuda_forward_one) on a BF16 build, which otherwise keeps only the bf16 mirror resident (see
+// build_qkv_weights() above). No-op on an F32 build: g_fwd.wqkv there is already kept current by
+// build_qkv_weights() directly, exactly as before this split.
+int ensure_wqkv_f32() {
+    if constexpr (ACT_DTYPE != Dtype::BF16) return 0;
+    if (!g_fwd.wqkv[0]) {
+        ensure_stream();
+        for (int l = 0; l < N_LAYERS; ++l)
+            SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+        g_wqkv_f32_dirty = true;         // freshly (re)allocated -- garbage until populated below
+    }
+    if (g_wqkv_f32_dirty) {
+        const auto& L = sub0::PARAM_LAYOUT;
+        const int C = D_MODEL, n = C * C, block = 256, grid = (n + block - 1) / block;
+        for (int l = 0; l < N_LAYERS; ++l) {
+            const int b0 = 2 + 10 * l;
+            build_qkv_kernel<<<grid, block, 0, g_stream>>>(g_dev_params + L[b0 + 2].off,
+                g_dev_params + L[b0 + 3].off, g_dev_params + L[b0 + 4].off, g_fwd.wqkv[l]);
+        }
+        g_wqkv_f32_dirty = false;
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -1824,8 +1890,10 @@ void build_qkv_weights() {
 // Forward pass that SAVES every activation the backward needs into g_tr (no recompute). Same op
 // sequence as forward_device but writes to the per-layer training buffers and uses the train
 // variants of rmsnorm/attn (which also save rinv / the softmax weights P). Assumes g_fwd.dids is
-// populated, params uploaded and g_fwd.wqkv[] built. Eager (not graph-captured): the backward
-// reads these buffers, so the whole step runs as plain stream-ordered launches.
+// populated, params uploaded and g_wqkv16[]/g_w1_16[]/g_w2_16[]/g_wo16[] built (build_qkv_weights) --
+// training reads ONLY the bf16 mirrors, never the F32 g_fwd.wqkv (that buffer is inference-only, see
+// ensure_wqkv_f32). Eager (not graph-captured): the backward reads these buffers, so the whole step
+// runs as plain stream-ordered launches.
 // NOTE(perf): deliberately NOT graph-captured. A step graph is an EFFICIENCY change -- it removes
 // per-launch CPU/driver management overhead (~200 launches -> 1), not a compute change. The inference
 // forward IS captured (capture_graph) because gen is launch-bound; training is COMPUTE-bound (measured
@@ -2203,6 +2271,7 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
     if (fwd_alloc(batch)) return 1;
+    if (ensure_wqkv_f32()) return 1;             // BF16: (re)build the F32 mirror this path reads
     ensure_cublas();
     if (capture_graph(batch, T)) return 1;       // capture once per shape (replay thereafter)
     const int M = batch * T;
@@ -2229,6 +2298,7 @@ SUB0_CUDA_API int sub0_cuda_kv_reset() {
 SUB0_CUDA_API int sub0_cuda_forward_one(int id, int pos, float* out_logits) {
     if (!g_dev_params || !g_kv_k) return 1;
     if (id < 0 || id >= VOCAB || pos < 0 || pos >= SEQ_LEN) return 1;
+    if (ensure_wqkv_f32()) return 1;               // BF16: (re)build the F32 mirror this path reads
     set_handle_tf32(false);                       // tight FP32 inference math (parity with the CPU path)
     forward_one_device(id, pos);
     SUB0_CUDA_CHECK(cudaMemcpyAsync(out_logits, g_fwd.logits, VOCAB * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
