@@ -78,6 +78,9 @@ extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
 extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                      float lr, long t, double* out_loss, const int* lengths);
+// Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
+// pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
+extern "C" int  sub0_cuda_train_reserve(int batch);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 // Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
@@ -608,6 +611,12 @@ struct GpuTrainer {
     // Enable the device path: requires the CUDA backend, a device, and a batch within the
     // resident scratch width. Uploads the current host params (+ optimizer moments, zero on a
     // fresh run / restored on resume). Returns false to fall back to the CPU loop.
+    //
+    // `ids`/`targets` stay sized at batch*SEQ_LEN (the token budget) regardless of how the caller's
+    // per-step (batch_t, seq_t) pairs vary under the token-budget scheduler below: every admitted
+    // pair satisfies batch_t*seq_t <= batch*SEQ_LEN by construction (that IS the token budget), so
+    // this buffer is already big enough for any of them -- no resize needed here even though batch_t
+    // can individually exceed `batch` at a short seq_t.
     bool enable(int batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
         constexpr int kCap = 4096;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
@@ -617,6 +626,10 @@ struct GpuTrainer {
         if (sub0_cuda_init() != 0) return false;
         if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) return false;
         sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
+        // Pin the row budget up front (batch*SEQ_LEN rows) so no per-step (batch_t, seq_t) pair
+        // ever triggers a grow-realloc mid-run -- a clean VRAM failure here falls back to the CPU
+        // path before training starts instead of surfacing as an OOM on some later step.
+        if (sub0_cuda_train_reserve(batch) != 0) return false;
         t = resume_t;
         active = true;
         ids.resize(static_cast<std::size_t>(batch) * SEQ_LEN);
@@ -900,6 +913,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::mt19937 rng(seed);
     RunState rs;
+    // tokens_seen (meta.txt, informational): seeded below once the resume block below settles
+    // rs.step/batch to their final values (rs.step*batch*SEQ_LEN -- the same approximation used
+    // before the token-budget scheduler existed, a reasonable carry-forward estimate on resume since
+    // the exact historical per-step seq_t isn't in the checkpoint), then accumulated EXACTLY from
+    // real per-step batch_t*seq_t for the rest of this invocation. Declared here (not where it's
+    // seeded) so write_meta's [&] capture below can see it.
+    long long tokens_seen_est = 0;
 
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
@@ -912,7 +932,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
         m.epochs = static_cast<double>(rs.step) / static_cast<double>(epoch_steps);
-        m.tokens_seen = static_cast<long long>(rs.step) * batch * SEQ_LEN;  // approximate (variable T)
+        m.tokens_seen = tokens_seen_est;
         m.batch = batch; m.lr = lr; m.seed = seed;
         m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
         m.status = status;
@@ -969,6 +989,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
 #endif
     }
+    tokens_seen_est = static_cast<long long>(rs.step) * batch * SEQ_LEN;   // batch/rs.step now resume-final
 
     sub0::AdamW opt(lr);
     if (resumed) opt.set_step_count(adam_t);
@@ -1008,10 +1029,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // epoch immediately (a resume no longer looks like steps=0), and an interrupted run stays discoverable.
     write_meta("training");
 
-    std::vector<size_t> starts(batch);
-    std::vector<int>    win_len(batch);   // per-window trained length (< seq_t for short documents)
+    // Token-budget scheduling (see `batch_t` in the loop below): a short-T step trades batch UP to
+    // hold batch_t*seq_t roughly constant at tokens_per_step, so the window-indexed arrays here need
+    // capacity for the LARGEST batch_t the scheduler can produce -- achieved at the smallest allowed
+    // seq_t (MIN_TRAIN_SEQ). Using the exact same integer-division formula as the per-step
+    // computation (tokens_per_step / seq_t) rather than an approximation keeps this bound exact, not
+    // just "probably enough". Capped at MAX_DEVICE_BATCH, the same hard ceiling
+    // sub0_cuda_train_reserve/fwd_alloc/train_alloc enforce on the device side.
+    const int max_batch_t = static_cast<int>(std::min<std::size_t>(
+        tokens_per_step / static_cast<std::size_t>(MIN_TRAIN_SEQ),
+        static_cast<std::size_t>(sub0::memplan::MAX_DEVICE_BATCH)));
+    std::vector<size_t> starts(max_batch_t);
+    std::vector<int>    win_len(max_batch_t);   // per-window trained length (< seq_t for short documents)
     std::vector<int>    cpu_win;          // CPU path: materialized window tokens (view may be uint16-packed)
-    std::vector<size_t> cpu_starts(batch);
+    std::vector<size_t> cpu_starts(max_batch_t);
     long steps_since_refresh = 0;
 
     using clock = std::chrono::steady_clock;
@@ -1026,6 +1057,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     long last_log_step = win_steps0;
     auto last_ckpt = win_t0;   // wall-clock timer for the crash-resistance checkpoint tick (CKPT_SECONDS)
     double run_loss = 0.0; int run_n = 0;
+    // Windows/sec used to key off (step - win_steps0)*batch, correct only when every step processed
+    // exactly `batch` windows. The token-budget scheduler below varies batch_t per step, so
+    // throughput is tracked directly as a running window count instead, snapshotted at each reset
+    // point exactly like win_steps0/last_log_step are for steps.
+    long long total_windows = 0, windows_at_win_t0 = 0, windows_at_last_log = 0;
     bool stop = false, graceful_stop = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
     //TODO: Remove getenv calls
@@ -1048,7 +1084,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // resume, deterministic), then run the batch -- on the GPU when enabled, else
         // data-parallel across CPU threads.
         const int seq_t = vary_seq ? std::uniform_int_distribution<int>(MIN_TRAIN_SEQ, SEQ_LEN)(rng) : SEQ_LEN;
-        for (int b = 0; b < batch; ++b) {
+        // Token-budget batching: trade batch UP as seq_t shrinks so batch_t*seq_t holds roughly
+        // constant at tokens_per_step (batch*SEQ_LEN) instead of wasting the fixed per-step overhead
+        // (AdamW traffic, grad memset, QKV-mirror rebuild, host syncs) on a short-T step that only
+        // fills a fraction of the reserved row budget. When vary_seq is off, seq_t == SEQ_LEN always
+        // and this reduces to batch_t == batch exactly (tokens_per_step / SEQ_LEN == batch, no
+        // rounding loss) -- bit-for-bit the pre-scheduler behavior.
+        const int batch_t = static_cast<int>(tokens_per_step / static_cast<std::size_t>(seq_t));
+        for (int b = 0; b < batch_t; ++b) {
             const sub0::Window win = sub0::sample_window(rng, seq_t, train_span.size(), doc_index);
             starts[b]  = win.start;
             win_len[b] = win.len;
@@ -1056,20 +1099,22 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
         float step_loss;
         if (gpu_train) {
-            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch, seq_t, lr_t);
+            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW update
-            cpu_win.resize(static_cast<std::size_t>(batch) * (seq_t + 1));   // materialize windows for the CPU engine
-            for (int b = 0; b < batch; ++b) {
+            cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
+            for (int b = 0; b < batch_t; ++b) {
                 train_span.copy_to(starts[b], static_cast<std::size_t>(win_len[b]) + 1,
                                    &cpu_win[static_cast<std::size_t>(b) * (seq_t + 1)]);
                 cpu_starts[b] = static_cast<std::size_t>(b) * (seq_t + 1);
             }
-            step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch, seq_t, win_len.data());
+            step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data());
             opt.step();
         }
         run_loss += step_loss; ++run_n;
+        total_windows += batch_t;                          // for wps: batch_t varies per step now
+        tokens_seen_est += static_cast<long long>(batch_t) * seq_t;
         rs.step = step;
 
         if (g_graceful_stop.load()) {
@@ -1085,7 +1130,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             gpu.sync_to_host();
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
-            const double wps   = secs > 0 ? static_cast<double>((step - win_steps0) * batch) / secs : 0.0;
+            const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
 
             // Validation NELBO only once enough of the corpus has been seen.
@@ -1098,7 +1143,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (plateaued(rs.evals)) stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
-            const double eta_next_epoch = wps > 0 ? static_cast<double>(steps_to_next_epoch) * batch / wps : -1.0;
+            // Step-rate directly (not via wps/batch): batch_t now varies per step, so a fixed
+            // "windows per step" conversion factor no longer applies -- steps_to_next_epoch is
+            // already in step units, so dividing by the interval's own step rate is exact.
+            const long steps_completed = step - win_steps0;
+            const double eta_next_epoch = (secs > 0 && steps_completed > 0)
+                ? static_cast<double>(steps_to_next_epoch) * secs / steps_completed : -1.0;
             sub0::log::line("step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
                  step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n),
                  wps, wps * SEQ_LEN, eval_str);
@@ -1118,22 +1168,24 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             write_meta("training");          // refresh best_val_nelbo as it improves
 
             run_loss = 0.0; run_n = 0;
-            win_t0 = clock::now(); win_steps0 = step;
-            last_log = win_t0; last_log_step = step;          // an eval counts as a log: reset the tick timer
+            win_t0 = clock::now(); win_steps0 = step; windows_at_win_t0 = total_windows;
+            last_log = win_t0; last_log_step = step; windows_at_last_log = total_windows;  // an eval counts as a log: reset the tick timer
             last_ckpt = win_t0;                               // ...and it checkpointed: reset the ckpt tick
         } else if (std::chrono::duration<double>(clock::now() - last_log).count() >= TICK_SECONDS) {
             // Interim heartbeat between evals: train loss (running avg since the last eval) +
             // throughput since the last printed line. No val NELBO here -- that stays on the eval
             // cadence (it is the expensive, plateau-driving measurement).
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
-            const double wps   = since > 0 ? static_cast<double>((step - last_log_step) * batch) / since : 0.0;
+            const double wps   = since > 0 ? static_cast<double>(total_windows - windows_at_last_log) / since : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
-            const double eta_next_epoch = wps > 0 ? static_cast<double>(steps_to_next_epoch) * batch / wps : -1.0;
+            const long steps_completed = step - last_log_step;
+            const double eta_next_epoch = (since > 0 && steps_completed > 0)
+                ? static_cast<double>(steps_to_next_epoch) * since / steps_completed : -1.0;
             sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
                  step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
-            last_log = clock::now(); last_log_step = step;
+            last_log = clock::now(); last_log_step = step; windows_at_last_log = total_windows;
         }
 
         // Crash-resistance checkpoint on a wall-clock tick, independent of the (far rarer) eval
