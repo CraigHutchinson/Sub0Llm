@@ -910,7 +910,15 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     };
     // Resume from the newest checkpoint for this output (progress-named, or a legacy single file):
     // overwrites the fresh model and restores batch/lr/seed, so the schedule below is computed from
-    // the resumed batch, not the command line.
+    // the resumed batch, not the command line. Snapshot what THIS invocation asked for (the CLI's
+    // resolved --batch/--lr/--seed, e.g. DEFAULT_GPU_BATCH when --batch was left at its auto default)
+    // before load_checkpoint overwrites them, so a silent override is at least made visible below --
+    // previously a resumed run could differ from what was requested/tuned this time with zero log
+    // line explaining why, which read as "the binary must not have rebuilt" rather than "this is an
+    // intentional resume".
+    const int requested_batch = batch;
+    const float requested_lr = lr;
+    const unsigned requested_seed = seed;
     const std::string resume_ckpt = latest_ckpt_path(model_path);
     long adam_t = 0;
     const bool ckpt_existed = !resume_ckpt.empty();
@@ -923,6 +931,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (resumed) {                           // make the resume UNMISSABLE (not buried in the schedule line)
         sub0::log::info("RESUMING from step {} (best val_nelbo {:.4f}) -- continuing, NOT starting fresh",
                         rs.step, rs.best_loss);
+        if (batch != requested_batch || lr != requested_lr || seed != requested_seed)
+            sub0::log::info("  checkpoint overrides this invocation's settings: batch {} -> {}, "
+                            "lr {:.2e} -> {:.2e}, seed {} -> {} (the checkpoint's values win on resume)",
+                            requested_batch, batch, requested_lr, lr, requested_seed, seed);
 #if defined(SUB0_BUILD_CUDA)
         // A checkpoint's saved batch was fit against VRAM at the time it was tuned/written -- the
         // card, driver, or a concurrent GPU load can differ on resume. Every OTHER path that picks a
