@@ -41,6 +41,9 @@ extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
 extern "C" int  sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill, int* dq_regs, int* dq_spill,
                                         int* dv_regs, int* dv_spill, int* dk_regs, int* dk_spill,
                                         int* fwd_regs, int* fwd_spill);
+extern "C" int  sub0_cuda_train_reserve(int batch);
+extern "C" int  sub0_cuda_scratch_stats(long long* fwd_rows, long long* tr_rows,
+                                        long long* fwd_grows, long long* tr_grows);
 
 namespace {
 // RAII: guarantees sub0_cuda_shutdown() runs even when a REQUIRE above throws mid-test (Catch2's
@@ -659,6 +662,124 @@ TEST_CASE("CUDA forward stays correct across a batch grow (graph re-capture)", "
         // now, not a property of this GEMM.)
         REQUIRE(max_abs < 3e-2);
     }
+}
+
+// Row-budget growth semantics (token-budget batching under vary_seq): after reserving
+// `kBase * SEQ_LEN` rows, EVERY (batch, T) pair whose product fits that budget -- including batches
+// LARGER than the reserving batch at shorter T, the exact trade the training loop makes -- must be
+// served by the existing buffers with NO reallocation, and exceeding the budget must grow. This is
+// the guard against the old `g_tr_cap >= batch` check silently resizing the whole training scratch
+// to batch_t * SEQ_LEN rows (a VRAM blowout) the first time a short-T step scaled its batch up.
+TEST_CASE("CUDA training scratch trades batch against T inside one row budget", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_init() == 0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    constexpr int kBase = 8;                              // reserve = kBase * SEQ_LEN rows
+    REQUIRE(sub0_cuda_train_reserve(kBase) == 0);
+    long long fwd_rows = 0, tr_rows = 0, fwd_grows0 = 0, tr_grows0 = 0;
+    REQUIRE(sub0_cuda_scratch_stats(&fwd_rows, &tr_rows, &fwd_grows0, &tr_grows0) == 0);
+    REQUIRE(tr_rows  == static_cast<long long>(kBase) * SEQ_LEN);
+    REQUIRE(fwd_rows == static_cast<long long>(kBase) * SEQ_LEN);
+
+    const std::size_t n = sub0::trainable_floats();
+    std::vector<float> grad(n);
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+
+    // In-budget pairs: full shape, batch scaled 2x/4x/8x at T/2 / T/4 / T/8, and a tiny step.
+    for (const int k : {1, 2, 4, 8}) {
+        const int batch = kBase * k, T = std::max(1, SEQ_LEN / k);
+        INFO("in-budget step batch=" << batch << " T=" << T);
+        make_windows(batch, T, 900u + static_cast<unsigned>(k), data, starts, ids, targets);
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, grad.data(), &loss) == 0);
+        REQUIRE(std::isfinite(loss));
+    }
+    {
+        make_windows(1, 8, 990, data, starts, ids, targets);   // far under budget: also no realloc
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), 1, 8, grad.data(), &loss) == 0);
+    }
+    long long fwd_grows1 = 0, tr_grows1 = 0;
+    REQUIRE(sub0_cuda_scratch_stats(nullptr, nullptr, &fwd_grows1, &tr_grows1) == 0);
+    CHECK(tr_grows1  == tr_grows0);                        // zero reallocations inside the budget
+    CHECK(fwd_grows1 == fwd_grows0);
+
+    // One row past the budget (batch = kBase+1 at full T) must grow, exactly once, to the new product.
+    {
+        const int batch = kBase + 1;
+        make_windows(batch, SEQ_LEN, 991, data, starts, ids, targets);
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, SEQ_LEN, grad.data(), &loss) == 0);
+        REQUIRE(std::isfinite(loss));
+    }
+    long long tr_rows2 = 0, fwd_grows2 = 0, tr_grows2 = 0;
+    REQUIRE(sub0_cuda_scratch_stats(nullptr, &tr_rows2, &fwd_grows2, &tr_grows2) == 0);
+    CHECK(tr_grows2  == tr_grows1 + 1);
+    CHECK(fwd_grows2 == fwd_grows1 + 1);
+    CHECK(tr_rows2   == static_cast<long long>(kBase + 1) * SEQ_LEN);
+}
+
+// Gradient-scale pin for the effective-batch trade: presenting the SAME windows twice at 2x the
+// batch must leave the mean loss AND the reduced gradient unchanged -- ce_backward_kernel weights
+// each row 1/(batch*len[b]) with the ACTUAL per-call batch, so a step that scales batch_t up at
+// short T keeps gradient magnitude identical to the nominal-batch step. A wrong denominator (e.g.
+// still using the tuned batch) would show up here as an exact 2x, far outside the tolerance.
+TEST_CASE("CUDA gradient scale is invariant to duplicating the batch", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);                                 // full FP32 for a tight gate
+    // Suite-order independence: build_model randomizes the shared host params only ONCE per
+    // process, and earlier tests (the AdamW parity case) step them -- a stepped model here sits
+    // near softmax saturation (loss ~19.4), where shape-dependent GEMM rounding between the M and
+    // 2M calls amplifies far past the tolerance bands below (measured cos 0.987 / ratio 0.87 in
+    // full-suite order vs 0.99997 / 0.9993 in isolation). Re-seed deterministically small instead.
+    {
+        std::mt19937 prng(4242);
+        std::normal_distribution<float> w(0.0f, 0.02f);
+        float* p = sub0::params_ptr();
+        for (std::size_t i = 0; i < sub0::trainable_floats(); ++i) p[i] = w(prng);
+    }
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 16;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 77, data, starts, ids, targets);
+
+    const std::size_t n = sub0::trainable_floats();
+    std::vector<float> g1(n), g2(n);
+    double loss1 = 0.0, loss2 = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, g1.data(), &loss1) == 0);
+
+    std::vector<int> ids2(ids), targets2(targets);         // the same windows, twice
+    ids2.insert(ids2.end(), ids.begin(), ids.end());
+    targets2.insert(targets2.end(), targets.begin(), targets.end());
+    REQUIRE(sub0_cuda_backward(ids2.data(), targets2.data(), 2 * batch, T, g2.data(), &loss2) == 0);
+
+    REQUIRE(std::isfinite(loss1));
+    // The two calls run DIFFERENT GEMM shapes (M vs 2M), so cuBLAS tiles/reduces in a different
+    // order and -- under bf16 activation storage -- the logits themselves differ at ~1e-4 rel
+    // (measured: loss 8.39651 vs 8.39559 on the d192 build). That rounding shows up as a few 1e-3
+    // of gradient rel-L2, so the SCALE assertions are direction + norm-ratio, where a wrong batch
+    // denominator is an exact 2x (ratio 0.5, cos unchanged) -- far outside these bands.
+    CHECK(loss2 == Catch::Approx(loss1).epsilon(1e-3));
+    double dot = 0.0, n1 = 0.0, n2 = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        dot += static_cast<double>(g1[i]) * g2[i];
+        n1  += static_cast<double>(g1[i]) * g1[i];
+        n2  += static_cast<double>(g2[i]) * g2[i];
+    }
+    const double cos   = dot / std::max(std::sqrt(n1 * n2), 1e-30);
+    const double ratio = std::sqrt(n2 / std::max(n1, 1e-30));
+    INFO("duplicated-batch grad cos = " << cos << "  |g2|/|g1| = " << ratio
+         << "  loss1 = " << loss1 << "  loss2 = " << loss2);
+    CHECK(cos > 0.995);
+    CHECK(ratio > 0.95);
+    CHECK(ratio < 1.05);
 }
 
 // Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
