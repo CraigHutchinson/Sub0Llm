@@ -884,9 +884,33 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                          "it. Remove it (or train to a fresh path) to start over.", resume_ckpt);
         return 1;
     }
-    if (resumed)                             // make the resume UNMISSABLE (not buried in the schedule line)
+    if (resumed) {                           // make the resume UNMISSABLE (not buried in the schedule line)
         sub0::log::info("RESUMING from step {} (best val_nelbo {:.4f}) -- continuing, NOT starting fresh",
                         rs.step, rs.best_loss);
+#if defined(SUB0_BUILD_CUDA)
+        // A checkpoint's saved batch was fit against VRAM at the time it was tuned/written -- the
+        // card, driver, or a concurrent GPU load can differ on resume. Every OTHER path that picks a
+        // batch (the configurator's DEFAULT_GPU_BATCH clamp, the tuner's VRAM-fit ladder) validates
+        // against VRAM; this one didn't, so a resumed run could silently spill to WDDM shared memory
+        // (the ~10x cliff those other clamps exist to prevent) with zero warning. hard_cap=batch means
+        // this is a no-op (fit == batch) whenever the resumed batch still fits.
+        if (!std::getenv("SUB0_TRAIN_CPU")) {
+            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+            const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
+            constexpr int kVramHeadroomMB = 512;   // matches the tuner's cuBLAS-workspace/fragmentation slack
+            const int free_mb = sub0_cuda_free_vram_mb();
+            const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
+                                    - kVramHeadroomMB;
+            const int fit = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
+            if (fit > 0 && fit < batch) {
+                sub0::log::warn("resumed batch {} needs more VRAM than is currently available ({} MiB "
+                                "usable of {} free) -- clamping to {} to avoid a WDDM shared-memory spill",
+                                batch, vram_budget, free_mb, fit);
+                batch = fit;
+            }
+        }
+#endif
+    }
 
     sub0::AdamW opt(lr);
     if (resumed) opt.set_step_count(adam_t);
