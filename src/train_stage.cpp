@@ -324,6 +324,16 @@ inline float lr_schedule(long step, float peak, long warmup) {
     return step < warmup ? peak * (s / w) : peak * std::sqrt(w / s);
 }
 
+// Human-scaled duration for an ETA figure -- a raw 40000-second estimate is harder to parse at a
+// glance than "11.1h". Negative/non-finite (wps not yet measurable, e.g. the very first interval)
+// prints as "?" rather than a nonsense duration.
+inline std::string format_eta(double secs) {
+    if (!(secs >= 0.0) || !std::isfinite(secs)) return "?";
+    if (secs < 60.0)   return std::format("{:.0f}s", secs);
+    if (secs < 3600.0) return std::format("{:.1f}m", secs / 60.0);
+    return std::format("{:.1f}h", secs / 3600.0);
+}
+
 // --- Checkpoint (full optimizer + loop state, for exact resume) -------------
 struct RunState {
     long step = 0;
@@ -1087,8 +1097,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
                 if (plateaued(rs.evals)) stop = true;
             }
-            sub0::log::line("step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
-                 step, max_steps, frac_epoch, run_loss / std::max(1, run_n),
+            const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
+            const double eta_next_epoch = wps > 0 ? static_cast<double>(steps_to_next_epoch) * batch / wps : -1.0;
+            sub0::log::line("step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
+                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n),
                  wps, wps * SEQ_LEN, eval_str);
             std::fflush(stdout);
 
@@ -1116,8 +1128,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>((step - last_log_step) * batch) / since : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
-            sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
-                 step, max_steps, frac_epoch, run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
+            const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
+            const double eta_next_epoch = wps > 0 ? static_cast<double>(steps_to_next_epoch) * batch / wps : -1.0;
+            sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
+                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step;
         }
