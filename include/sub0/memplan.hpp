@@ -43,6 +43,13 @@ inline constexpr u64 INT   = sizeof(int);
 inline constexpr u64 DBL   = sizeof(double);
 inline constexpr u64 UINT8 = 1;   // g_dev_decay: a 0/1 mask, stored as the narrowest type that holds it
 
+// Hard ceiling on the minibatch any device entry point will size scratch for (backend_cuda.cu
+// validates/clamps against this as MAX_FWD_BATCH). Lives here -- not in the backend -- because it is
+// also (a) the size of the constant per-window `lengths` device buffer counted in
+// train_scratch_bytes below, and (b) the bound the training loop's token-budget batch scheduler
+// clamps its per-step effective batch to (train_stage.cpp), so all three stay one number.
+inline constexpr int MAX_DEVICE_BATCH = 4096;
+
 // Trainable float count -- the exact sum PARAM_LAYOUT produces in layout.hpp, re-derived here
 // from dims so the configurator (which cannot include layout.hpp) gets the same number. The CUDA
 // footprint test asserts param_floats(dims) == sub0::PARAM_FLOATS, catching any layout drift.
@@ -102,7 +109,8 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
                         + 2 * Mm * F * A        // dff1, dgact  [M,F] bf16
                         + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]
-                        + u64(batch) * INT      // lengths   [batch] (per-window padding mask)
+                        + u64(MAX_DEVICE_BATCH) * INT   // lengths [MAX_DEVICE_BATCH] (constant: covers any
+                                                        // effective batch the row budget admits, see train_alloc)
                         + DBL;                  // loss [1] (double)
     return L * per_layer + final_blk + grad;
 }

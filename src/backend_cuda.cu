@@ -1296,7 +1296,8 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
 // failure (too big for VRAM) is handled gracefully (the alloc returns nonzero, the caller errors).
 // This is just a sanity ceiling: the real per-run upper bound is set by VRAM (memplan::max_batch_for_vram),
 // computed at tune time, so bf16's halved footprint can reach batches the old 1024 list could not.
-constexpr int MAX_FWD_BATCH = 4096;
+// One number shared with the footprint model and the train stage's token-budget batch scheduler.
+constexpr int MAX_FWD_BATCH = sub0::memplan::MAX_DEVICE_BATCH;
 
 // Resident forward scratch. The batch-dependent buffers are sized to the largest batch seen so far
 // (g_fwd_cap, grown on demand); the fused-QKV weight buffers (wqkv) are batch-independent and built
@@ -1316,8 +1317,11 @@ struct FwdScratch {
     float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, 3C], built once at upload
 };
 FwdScratch g_fwd;
-int        g_fwd_cap = 0;              // batch the batch-dependent forward buffers are sized for
+size_t     g_fwd_rows = 0;             // total [M] ROW capacity the batch-dependent buffers are sized for
+                                       // (batch*T row-product, NOT a batch count -- so a varied-T training
+                                       // step can trade batch against T inside one reserved budget)
 int        g_fwd_full = 0;             // 1 = full inference scratch allocated; 0 = dids-only (training)
+long long  g_fwd_grows = 0;            // monotonic (re)allocation count -- test observability
 
 // Batch-independent fused-QKV weight buffers (built at upload). Kept across batch grows.
 int wqkv_alloc() {
@@ -1337,18 +1341,25 @@ void fwd_free_batch() {
     cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
     g_fwd.dids = nullptr; g_fwd.h = g_fwd.a = g_fwd.qkv = g_fwd.att = g_fwd.proj = g_fwd.fbuf =
         g_fwd.ff1 = g_fwd.gact = g_fwd.ff2 = g_fwd.logits = nullptr;
-    g_fwd_cap = 0;
+    g_fwd_rows = 0;
     g_fwd_full = 0;
 }
 
-// Ensure the forward scratch covers `batch` (grow-on-demand) plus the wqkv buffers. `full` allocates
-// the inference activation scratch (h..logits); training passes full=false (it reads from g_tr, only
-// needs dids + wqkv) -- skipping ~6 [M,C]/[M,F]/[M,V] buffers saves hundreds of MiB during training.
-int fwd_alloc(int batch, bool full = true) {
+// Ensure the forward scratch covers batch*T rows (grow-on-demand) plus the wqkv buffers. Capacity is
+// the ROW PRODUCT, not the batch: any (batch, T) pair whose batch*T fits the reserved rows is served
+// without reallocating, so the training loop can grow its effective batch as T shrinks inside one
+// fixed token budget (batch_t*T ~= tuned_batch*SEQ_LEN). T defaults to SEQ_LEN, which reproduces the
+// old "sized for `batch` full-length windows" behavior exactly for every caller that passes a plain
+// batch. `full` allocates the inference activation scratch (h..logits); training passes full=false
+// (it reads from g_tr, only needs dids + wqkv) -- skipping ~6 [M,C]/[M,F]/[M,V] buffers saves
+// hundreds of MiB during training.
+int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
     if (wqkv_alloc()) return 1;
-    if (g_fwd_cap >= batch && g_fwd.dids && (!full || g_fwd_full)) return 0;   // already big enough
+    const size_t need = static_cast<size_t>(batch) * static_cast<size_t>(T);
+    if (g_fwd_rows >= need && g_fwd.dids && (!full || g_fwd_full)) return 0;   // already big enough
     fwd_free_batch();                                      // grow: drop the old (smaller) buffers
-    const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
+    ++g_fwd_grows;
+    const size_t Mm = need;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
     SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.dids,   Mm * sizeof(int)));
     if (full) {
@@ -1363,7 +1374,7 @@ int fwd_alloc(int batch, bool full = true) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
     }
-    g_fwd_cap = batch;
+    g_fwd_rows = Mm;
     g_fwd_full = full ? 1 : 0;
     return 0;
 }
@@ -1374,8 +1385,8 @@ void fwd_free() {
 }
 
 // Resident TRAINING scratch (Phase 2d): the forward saves every activation the backward needs
-// (no recompute), plus the gradient temporaries that thread the reverse pass. Sized once for the
-// full M = MAX_FWD_BATCH * SEQ_LEN. Allocated lazily by train_alloc, freed by sub0_cuda_shutdown.
+// (no recompute), plus the gradient temporaries that thread the reverse pass. Sized to a ROW budget
+// (batch*T product, grown on demand -- see train_alloc). Freed by sub0_cuda_shutdown.
 struct TrainScratch {
     // per-layer saved forward activations (residual stream stored bf16; transient scratch is act_t)
     act_t* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
@@ -1406,10 +1417,13 @@ struct TrainScratch {
     act_t* dh16    = nullptr;      // [M,C] bf16 cast of dh (FFN W2 backward operand)
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
     int*   dtargets = nullptr;     // [M] next-token targets for cross-entropy
-    int*   lengths  = nullptr;     // [batch] per-window trained length (padding mask for short docs)
+    int*   lengths  = nullptr;     // [MAX_FWD_BATCH] per-window trained length (padding mask for short
+                                   // docs) -- constant-sized (16 KiB) so it covers ANY effective batch
+                                   // the row budget admits, decoupled from the rows the scratch grows to
 };
 TrainScratch g_tr;
-int          g_tr_cap = 0;         // batch the training buffers are sized for
+size_t       g_tr_rows = 0;        // total [M] ROW capacity (batch*T product) the buffers are sized for
+long long    g_tr_grows = 0;       // monotonic (re)allocation count -- test observability
 // Per-layer bf16 weight mirrors for the FFN GEMMs (built from the F32 master on upload/step).
 act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
 act_t* g_w2_16[N_LAYERS] = {};     // [F,C]
@@ -1417,11 +1431,17 @@ act_t* g_wo16[N_LAYERS]  = {};     // [C,C] attention output proj mirror
 act_t* g_wqkv16[N_LAYERS] = {};    // [C,3C] fused QKV mirror (bf16 acts) / alias under f32
 
 void train_free();                 // fwd: train_alloc frees the old buffers before a grow-realloc
-int train_alloc(int batch) {
-    if (g_tr_cap >= batch && g_tr.h_in[0]) return 0;       // already big enough
+// Row-product capacity, exactly like fwd_alloc above: any (batch, T) with batch*T <= g_tr_rows is
+// served without reallocating; T defaults to SEQ_LEN so existing plain-batch callers keep their old
+// sizing bit-for-bit. Callers that vary (batch, T) per step should reserve the full budget up front
+// (sub0_cuda_train_reserve) so the varying products never trigger a grow-realloc mid-run.
+int train_alloc(int batch, int T = SEQ_LEN) {
+    const size_t need = static_cast<size_t>(batch) * static_cast<size_t>(T);
+    if (g_tr_rows >= need && g_tr.h_in[0]) return 0;       // already big enough
     if (g_tr.h_in[0]) train_free();                        // grow: drop the old (smaller) buffers
     ensure_stream();
-    const size_t Mm = static_cast<size_t>(batch) * SEQ_LEN;
+    ++g_tr_grows;
+    const size_t Mm = need;
     const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
@@ -1453,8 +1473,11 @@ int train_alloc(int batch) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh16,    MC * sizeof(act_t)));   // bf16 cast of dh for FFN W2 bwd
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(batch) * sizeof(int)));
-    g_tr_cap = batch;
+    // lengths is indexed [0, batch) at step time, where batch can be any value up to MAX_FWD_BATCH
+    // that the row budget admits (a short-T step runs MORE windows). Constant-size it to the ceiling
+    // (16 KiB) instead of the reserving batch, so no legal (batch, T) pair can overrun it.
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));
+    g_tr_rows = Mm;
     return 0;
 }
 
@@ -1470,7 +1493,7 @@ void train_free() {
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
     free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
-    g_tr_cap = 0;
+    g_tr_rows = 0;
 }
 
 
@@ -2223,7 +2246,9 @@ static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, dou
                        const int* lengths = nullptr) {
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
-    if (fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
+    // Row-product sizing: a step only needs batch*T rows, so a varied-T caller that keeps
+    // batch*T inside a previously reserved budget (sub0_cuda_train_reserve) never reallocates here.
+    if (fwd_alloc(batch, false, T) || train_alloc(batch, T) || opt_alloc()) return 1;
     ensure_cublas();
     set_handle_tf32(CudaTf32::get());            // training uses the baked math mode
     const int M = batch * T;
@@ -2278,6 +2303,33 @@ SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int b
     device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// Reserve the full training row budget (batch * SEQ_LEN rows) up front. A varied-T training loop
+// calls this ONCE with its nominal/tuned batch, then every per-step (batch_t, T) whose product fits
+// the budget reuses the same buffers -- without this, the first short-T step would size the scratch
+// to ITS product and each new per-step maximum would trigger a full grow-realloc (~30 cudaMallocs +
+// graph invalidation) mid-run. Also pre-sizes the flash-backward stats scratch to its own ceiling
+// (batch * N_HEADS * SEQ_LEN >= batch_t * N_HEADS * T for every admitted pair) for the same reason.
+// Failure (VRAM) is a clean nonzero so the caller can fall back to the CPU path BEFORE training
+// starts, instead of discovering the OOM on step 1.
+SUB0_CUDA_API int sub0_cuda_train_reserve(int batch) {
+    if (batch < 1 || batch > MAX_FWD_BATCH) return 1;
+    if (fwd_alloc(batch, false) || train_alloc(batch) || opt_alloc()) return 1;
+    if (ensure_bwd_stats(static_cast<size_t>(batch) * N_HEADS * SEQ_LEN)) return 1;
+    return 0;
+}
+
+// Scratch observability for the row-budget tests: current row capacities and the monotonic
+// (re)allocation counts (bumped every time fwd_alloc/train_alloc actually allocates, NOT on the
+// capacity-hit fast path). Any pointer may be null.
+SUB0_CUDA_API int sub0_cuda_scratch_stats(long long* fwd_rows, long long* tr_rows,
+                                          long long* fwd_grows, long long* tr_grows) {
+    if (fwd_rows)  *fwd_rows  = static_cast<long long>(g_fwd_rows);
+    if (tr_rows)   *tr_rows   = static_cast<long long>(g_tr_rows);
+    if (fwd_grows) *fwd_grows = g_fwd_grows;
+    if (tr_grows)  *tr_grows  = g_tr_grows;
     return 0;
 }
 
