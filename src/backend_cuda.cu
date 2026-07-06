@@ -42,6 +42,38 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
+// SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights) has no CUDA kernel yet
+// -- op_swiglu and the Wg/W1/W2-as-up/down layout only exist in backend_cpu.cpp today. Hard stop here
+// rather than silently computing the wrong (plain-GELU) forward on a gated model's weights. The
+// configurator also refuses --gated-ffn 1 with a GPU compute backend (an earlier, clearer error);
+// this is the safety net for anyone who bypasses that (e.g. hand-editing the generated header).
+// TODO(gated-ffn-gpu): a SwiGLU forward/backward kernel + the Wg param slot, then lift this guard.
+static_assert(!USE_GATED_FFN,
+    "the CUDA backend has no SwiGLU-gated-FFN kernel yet; --gated-ffn is CPU-only for now (TODO(gated-ffn-gpu)).");
+
+// Tied embeddings (USE_TIED_EMBEDDINGS): the LM head reuses tok_emb (transposed) instead of its own
+// matrix+bias -- see op_tied_head in backend_cpu.cpp for the reference semantics. Every forward/
+// forward_one/backward path below now branches on USE_TIED_EMBEDDINGS with `if constexpr`, mirroring
+// backend_cpu.cpp's Model struct: the tied-head forward is one new GEMM shape (launch_tied_head,
+// tok_emb read transposed via CUBLAS_OP_T -- cuBLAS already supports this operand natively, same
+// mechanism as launch_linear_bwd's existing dX GEMM), and the backward has TWO accumulating
+// contributions into tok_emb's grad (the tied head's own dtable = dY^T @ a_final, reusing
+// launch_linear_bwd's dW GEMM shape with accumulate=true, plus the pre-existing embedding-lookup
+// scatter-add) -- see launch_tied_head_bwd below. The configurator's --tie-embeddings/--compute
+// refusal has been lifted to match. (No static_assert left for this axis -- ternary/gated-FFN above
+// remain CPU-only and keep their guards; this one is now a real, tested GPU capability.)
+
+// QK-norm (USE_QK_NORM): per-head RMSNorm on Q/K right after their projection, before RoPE (see
+// op_qknorm in backend_cpu.cpp for the reference semantics). GPU support landed: qknorm_act_kernel /
+// qknorm_save_act_kernel / qknorm_backward_act_kernel below, `if constexpr (USE_QK_NORM)`-gated at
+// each forward/backward call site, mirroring backend_cpu.cpp's Model struct. The per-layer
+// PARAM_LAYOUT offsets this file indexes are resolved through the named kQNorm/kKNorm/kW1/etc.
+// constants (see "per-layer parameter slot offsets" below) rather than the old fixed "+5 for Wo,
+// +6 for W1" arithmetic, so the q_norm/k_norm slots inserted between Wo and the FFN block shift
+// every later offset correctly from a single source of truth. The configurator's --qk-norm/--compute
+// refusal has been lifted to match. (No static_assert left for this axis -- ternary/gated-FFN above
+// remain CPU-only and keep their guards.)
+
 
 namespace {
 
@@ -160,12 +192,14 @@ __global__ void axpy_kernel(float a, const float* __restrict__ x, float* __restr
 float* g_dev_params = nullptr;
 
 // Optimizer state mirrors (Phase 2d), all PARAM_FLOATS long: the reduced gradient the device
-// backward writes, the AdamW first/second moments, and a 0/1 weight-decay mask derived once from
-// PARAM_LAYOUT (decay applies to matrices, not biases/norms -- matches the CPU ParamView.decay).
+// backward writes and the AdamW first/second moments. Weight decay no longer needs a persistent
+// PARAM_FLOATS-long mask buffer at all -- see g_decay_ranges below (a handful of compile-time-known
+// ranges in __constant__ memory, derived from PARAM_LAYOUT) -- matches the CPU ParamView.decay
+// exactly (verified exhaustively, offset by offset, by layout_tests.cpp's "DECAY_RANGES exactly
+// reproduces..." test).
 float* g_dev_grad  = nullptr;
 float* g_dev_m     = nullptr;
 float* g_dev_vel   = nullptr;
-unsigned char* g_dev_decay = nullptr;   // 0/1 weight-decay mask; see adam_step_kernel
 double* g_dev_normsq = nullptr;   // [1] global grad sum-of-squares (AdamW clip, double like CPU)
 float*  g_dev_gs     = nullptr;   // [1] grad-clip scale, computed on-device from g_dev_normsq (see
                                   // grad_clip_scale_kernel) -- avoids a host readback of normsq just
@@ -424,6 +458,69 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float the
     row[C + a0 + 1] = k0 * sn + k1 * cs;
 }
 
+// QK-norm forward (USE_QK_NORM, op_qknorm/qknorm_row in backend_cpu.cpp): RMSNorm applied
+// INDEPENDENTLY to each head's D_HEAD-wide slice of the fused [rows,3C] qkv buffer's Q (or K)
+// sub-block, IN PLACE, right after the QKV GEMM and before rope_kernel/rope_act_kernel touch the
+// same buffer -- a separate per-head statistic from op_rmsnorm's whole-row one, same reason as the
+// CPU op (see its comment): mixing every head into one norm statistic would defeat the point of a
+// per-head stabilizer. One block per (row, head, which): blockIdx.x = row, blockIdx.y = head,
+// blockIdx.z = 0 selects the Q sub-block / 1 selects K (cols [2C,3C), V, is never touched, same
+// convention as rope_kernel above). BLOCK=32 (one warp): D_HEAD is 32-96 at this project's scales, an
+// order of magnitude narrower than D_MODEL's own rmsnorm reduction, so a single warp's strided loop +
+// shuffle-reduce (block_reduce_sum's BLOCK<=32 path, no cross-warp shared-memory step needed) covers
+// it. H/DH are template params (not D_MODEL/N_HEADS/D_HEAD directly) so the dims-independent CUDA
+// self-test can instantiate a toy shape in the SAME binary as the baked production shape.
+template <class A, int H, int DH, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
+    constexpr int   C     = H * DH, in_stride = 3 * C;
+    constexpr float invDH = 1.0f / static_cast<float>(DH);
+    constexpr float eps   = 1e-5f;
+    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;   // which: 0 = Q, 1 = K
+    const int off = which * C + h * DH;
+    A* xr = qkv + static_cast<size_t>(row) * in_stride + off;
+    const float* g = (which == 0) ? qgamma : kgamma;
+    float partial = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) { const float v = to_f32(xr[j]); partial += v * v; }
+    const float ms = block_reduce_sum<BLOCK>(partial) * invDH;
+    const float r  = rsqrtf(ms + eps);
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) st_act(&xr[j], to_f32(xr[j]) * r * g[j]);
+}
+
+// Same as qknorm_act_kernel, but first stashes the PRE-norm x into qk_pre[rows,2C] (same Q|K layout,
+// col offset `which*C + h*DH`, just a 2C- instead of 3C-wide row stride) before overwriting qkv in
+// place. Used ONLY by backward_device's checkpoint-recompute pass: the forward chain immediately
+// applies RoPE to the SAME buffer right after qknorm (rope_kernel/rope_act_kernel), so nothing else
+// in this file's resident scratch still holds the pre-norm values by the time qknorm_backward_act_kernel
+// needs them (RoPE's own backward runs first, since RoPE sits AFTER qknorm in the forward graph) --
+// see the TrainScratch::qk_pre comment in memplan.hpp's train_scratch_bytes for the full reasoning.
+template <class A, int H, int DH, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+qknorm_save_act_kernel(A* __restrict__ qkv, A* __restrict__ qk_pre,
+                       const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
+    constexpr int   C        = H * DH, in_stride = 3 * C, pre_stride = 2 * C;
+    constexpr float invDH    = 1.0f / static_cast<float>(DH);
+    constexpr float eps      = 1e-5f;
+    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;
+    const int off = which * C + h * DH;
+    A* xr = qkv    + static_cast<size_t>(row) * in_stride  + off;
+    A* pr = qk_pre + static_cast<size_t>(row) * pre_stride + off;
+    const float* g = (which == 0) ? qgamma : kgamma;
+    float partial = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) {
+        const float v = to_f32(xr[j]);
+        st_act(&pr[j], v);
+        partial += v * v;
+    }
+    const float ms = block_reduce_sum<BLOCK>(partial) * invDH;
+    const float r  = rsqrtf(ms + eps);
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) st_act(&xr[j], to_f32(xr[j]) * r * g[j]);
+}
+
 // ============================================================================
 //  Backward kernels (Phase 2d) -- mirror src/backend_cpu.cpp backward_node()
 // ============================================================================
@@ -598,16 +695,26 @@ template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int b
 // coalescing + parallelizing the O(V) work across BLOCK threads, same as the reduction itself. T stays
 // a runtime parameter (unlike V, it genuinely varies -- benchmark/self-test paths call this with a
 // window length shorter than SEQ_LEN).
+//
+// `row_offset`: this kernel is now called ONCE PER ROW-CHUNK (see head_ce_chunked below), each call
+// covering only `M` (the CHUNK's row count, not the full training M) rows starting at absolute row
+// `row_offset`. `logits`/`dlogits`/`targets` are already chunk-relative pointers (the caller does that
+// arithmetic), so the per-row math indexed by the LOCAL `m` stays correct as-is -- but `b`/`t` (and
+// therefore `lengths[b]`) depend on the row's ABSOLUTE position in the full M, which `row_offset`
+// supplies. Every row's cross-entropy math is otherwise fully independent of every other row (no
+// cross-row reduction inside this kernel), and `loss_acc`'s atomicAdd is already safe across however
+// many separate kernel launches touch it, so chunking needs nothing else here.
 template <int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
                    float* __restrict__ dlogits, double* __restrict__ loss_acc,
-                   int M, int T, int batch, const int* __restrict__ lengths) {
+                   int M, int T, int batch, const int* __restrict__ lengths, int row_offset) {
     constexpr int V = VOCAB;
     const int m = blockIdx.x;
     if (m >= M) return;
-    const int b   = m / T;
-    const int t   = m - b * T;
+    const int abs_m = row_offset + m;
+    const int b   = abs_m / T;
+    const int t   = abs_m - b * T;
     const int len = lengths ? lengths[b] : T;
     float* dl     = dlogits + static_cast<size_t>(m) * V;
     if (t >= len) {                                  // padding row: inert (no grad, no loss)
@@ -703,6 +810,76 @@ rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ g
         const float xj = to_f32(xr[j]), dyj = dyr[j], gj = gamma[j];
         dxr[j] += r * dyj * gj - (xj * r3 * invC) * S;
         atomicAdd(&dgamma[j], dyj * xj * r);
+    }
+}
+
+// QK-norm backward: same math shape as rmsnorm_backward_act_kernel, grouped per (row, head, {q,k})
+// over width DH instead of once per row over D_MODEL (mirrors backend_cpu.cpp's Op::QKNorm case --
+// see its comment for why this is a separate op from Op::RMSNorm's backward, not a reshaped reuse of
+// it). Reads the pre-norm x from qk_pre (stashed by qknorm_save_act_kernel during the recompute
+// pass) and OVERWRITES dqkv's Q/K sub-block IN PLACE: `dqkv` arrives holding dy (grad w.r.t. this
+// op's OUTPUT, i.e. RoPE's backward has already converted it from "grad w.r.t. roped Q/K" back to
+// "grad w.r.t. qknorm's output" -- see backward_device's call ordering) and leaves holding dx (grad
+// w.r.t. this op's INPUT, i.e. the raw QKV-GEMM output, exactly what the qkv-GEMM's own backward
+// needs next). Each block owns a disjoint (row,head,which) slice, so the in-place overwrite is safe
+// with no cross-block aliasing. r is recomputed from the saved pre-norm x (one extra strided pass)
+// rather than a saved rinv -- the reduction is small (D_HEAD wide), so a persistent rinv buffer isn't
+// worth the extra scratch allocation. NOTE on precision: qk_pre is stored at act_t (bf16 on a BF16
+// build, matching this file's usual training-activation convention -- see TrainScratch's other bf16
+// fields), so the x this kernel's reduction reads is whatever bf16-rounded value
+// qknorm_save_act_kernel wrote. The recomputed r is therefore self-consistent with the SAME rounded x
+// the rest of this exact pipeline already operates on, in FP32 math -- NOT a bit-identical replay of
+// the forward's own r (that would require x to be resident in F32, which it isn't on a BF16 build).
+// This is the same precision budget every other BF16 checkpoint-recompute in this file already
+// accepts (a/qkv/att/fbuf/ff1/gact are all bf16-stored and recomputed the same way in backward_device).
+// dgamma accumulates via atomicAdd exactly like rmsnorm_backward_act_kernel's dgamma, but the fan-in
+// per address is H times worse here: gamma is one [1,DH] vector shared across every row AND every head
+// (rmsnorm's gamma is [1,C], written by M writers per address; qknorm's gamma is [1,DH], written by
+// M*H writers per address -- at production dims (M=4096, H=7) that is ~28,672 blocks atomically
+// incrementing each of just 64 floats). ncu measured this on a real training step (backward_device,
+// M=4096, D_MODEL=448/N_HEADS=7/D_HEAD=64, BF16): 411us vs 118us (qknorm_act_kernel, forward) and 145us
+// (qknorm_save_act_kernel, the backward recompute pass) -- a real ~2.8-3.5x slowdown, NOT explained by
+// occupancy (achieved 48.3% here vs 30.8-35.5% for the other two -- MORE warps resident, not fewer) or
+// raw throughput (13.1% compute/memory, the lowest of the three). The Warp State Statistics section
+// attributes 75.8% of the average 91.6 stalled cycles/instruction to an L1TEX long-scoreboard
+// dependency -- consistent with atomic RMW round-trip serialization on the handful of hot addresses,
+// not a bandwidth or compute ceiling. In absolute terms this is ~4.5ms of a ~59ms backward_device step
+// (11 layers x ~411us) at this scale, roughly 6-8% of the whole step -- a real, attributable cost, but
+// not the dominant one (the GEMM-heavy FFN/attention backward passes still dwarf it). Left as plain
+// per-thread atomicAdd rather than a grid-level partial-sum-then-reduce split (the fix that would
+// actually cut the fan-in) because the measured cost is moderate, not severe, and this project's
+// standing rule is to add that complexity only once ncu shows it is actually warranted -- worth
+// revisiting if a future profile shows this kernel's share of the step growing (e.g. at a much larger
+// N_HEADS, which raises the fan-in further without changing DH).
+template <class A, int H, int DH, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+qknorm_backward_act_kernel(const A* __restrict__ qk_pre, const float* __restrict__ qgamma,
+                           const float* __restrict__ kgamma, A* __restrict__ dqkv,
+                           float* __restrict__ dqgamma, float* __restrict__ dkgamma) {
+    constexpr int   C        = H * DH, in_stride = 3 * C, pre_stride = 2 * C;
+    constexpr float invDH    = 1.0f / static_cast<float>(DH);
+    constexpr float eps      = 1e-5f;
+    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;
+    const int off = which * C + h * DH;
+    const A* xr  = qk_pre + static_cast<size_t>(row) * pre_stride + off;
+    A*       dyr = dqkv   + static_cast<size_t>(row) * in_stride  + off;   // in: dy, out: dx (in place)
+    const float* g  = (which == 0) ? qgamma  : kgamma;
+    float*       dg = (which == 0) ? dqgamma : dkgamma;
+    float ms = 0.f, S = 0.f;
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) {
+        const float xj = to_f32(xr[j]);
+        ms += xj * xj;
+        S  += to_f32(dyr[j]) * g[j] * xj;
+    }
+    ms = block_reduce_sum<BLOCK>(ms) * invDH;
+    S  = block_reduce_sum<BLOCK>(S);
+    const float r = rsqrtf(ms + eps), r3 = r * r * r;
+    #pragma unroll
+    for (int j = threadIdx.x; j < DH; j += BLOCK) {
+        const float xj = to_f32(xr[j]), dyj = to_f32(dyr[j]), gj = g[j];
+        st_act(&dyr[j], dyj * r * gj - (xj * r3 * invDH) * S);
+        atomicAdd(&dg[j], dyj * xj * r);
     }
 }
 
@@ -1093,14 +1270,30 @@ __global__ void grad_clip_scale_kernel(const double* __restrict__ normsq, float 
     *gs = (norm > clip) ? clip / (norm + 1e-6f) : 1.0f;
 }
 
+// Weight-decay ranges (sub0::DECAY_RANGES, layout.hpp), mirrored into __constant__ memory once at
+// opt_alloc time. Small (a few dozen entries even at production scale -- adjacent decay=true
+// PARAM_LAYOUT tensors merge into one range) and read identically by every thread every step, so
+// __constant__'s broadcast cache serves it far better than a PARAM_FLOATS-long global-memory mask
+// ever could -- this REPLACES that mask buffer entirely (was 1B/param persistent, ~157 MiB at
+// production scale; now zero persistent bytes, just this tiny compile-time-sized table).
+__constant__ sub0::DecayRange g_decay_ranges[sub0::NUM_DECAY_RANGES];
+
+// Linear scan over g_decay_ranges: NUM_DECAY_RANGES is tiny (a couple ranges per layer, verified by
+// layout_tests.cpp's exhaustive coverage test), so this is negligible next to the surrounding
+// sqrt/div-heavy Adam math -- no persistent-memory cost, unlike a lookup table would be.
+__device__ __forceinline__ bool is_decay_param(int i) {
+    #pragma unroll
+    for (int r = 0; r < sub0::NUM_DECAY_RANGES; ++r)
+        if (i >= static_cast<int>(g_decay_ranges[r].start) && i < static_cast<int>(g_decay_ranges[r].end))
+            return true;
+    return false;
+}
+
 // AdamW per-parameter update (op-for-op identical to AdamW::step on the CPU). gs = global grad
 // clip scale (device-resident scalar -- see grad_clip_scale_kernel above), bc1/bc2 = bias
-// corrections, decay = 0/1 mask (wd applies to matrices only). decay is uint8 (a 0/1 flag needs no
-// more): this array is PARAM_FLOATS long and persists for the whole run, so its storage type is pure
-// overhead -- was float (4B/param, 627MB at production scale), now 1B.
+// corrections; weight decay (matrices only) comes from is_decay_param(i) above, not a mask buffer.
 __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict__ grad,
-                                 float* __restrict__ m, float* __restrict__ vel,
-                                 const unsigned char* __restrict__ decay, int n,
+                                 float* __restrict__ m, float* __restrict__ vel, int n,
                                  const float* __restrict__ gs_ptr, float lr,
                                  float b1, float b2, float eps, float wd, float bc1, float bc2) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1111,7 +1304,7 @@ __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict_
     const float mhat = m[i] / bc1;
     const float vhat = vel[i] / bc2;
     p[i] -= lr * mhat / (sqrtf(vhat) + eps);
-    p[i] -= lr * (decay[i] * wd) * p[i];
+    p[i] -= lr * (is_decay_param(i) ? wd : 0.f) * p[i];
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
@@ -1280,6 +1473,39 @@ template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
     rope_bwd_act_kernel<A><<<grid, block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA);
 }
 
+// QK-norm: per-head RMSNorm on the Q/K sub-blocks of the fused qkv buffer, in place, right after the
+// QKV GEMM and before RoPE (see qknorm_act_kernel above). Grid = (rows, N_HEADS, 2): z=0 covers the Q
+// sub-block, z=1 covers K (V, cols [2C,3C), is never touched). N_HEADS/D_HEAD are baked constexpr
+// (one build = one architecture), used directly rather than as parameters, same convention as
+// rope_kernel's C/H. `rows` (M = batch*T, or 1 for the per-token decode step) rides grid.x, which has
+// a far larger CUDA limit than grid.y/z -- same placement rope_kernel gives its own M-sized axis.
+template <class A> inline void launch_qknorm_t(A* qkv, const float* qgamma, const float* kgamma, int rows) {
+    constexpr int kQkBlock = 32;   // one warp: D_HEAD (32-96 at this project's scales) is an order of
+                                    // magnitude under D_MODEL, so block_reduce_sum's BLOCK<=32 path
+                                    // (no cross-warp shared-memory step) already covers the reduction.
+    const dim3 grid(rows, N_HEADS, 2);
+    qknorm_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma);
+}
+// Same, but also stashes the pre-norm Q/K into qk_pre[rows,2C] -- see qknorm_save_act_kernel above.
+// Used only by backward_device's checkpoint-recompute pass.
+template <class A>
+inline void launch_qknorm_save_t(A* qkv, A* qk_pre, const float* qgamma, const float* kgamma, int rows) {
+    constexpr int kQkBlock = 32;
+    const dim3 grid(rows, N_HEADS, 2);
+    qknorm_save_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma);
+}
+// QK-norm backward: converts dqkv's Q/K sub-blocks in place from "grad w.r.t. qknorm's output" to
+// "grad w.r.t. qknorm's input", reading the pre-norm x from qk_pre -- see qknorm_backward_act_kernel
+// above for the full call-ordering reasoning.
+template <class A>
+inline void launch_qknorm_bwd_t(const A* qk_pre, const float* qgamma, const float* kgamma,
+                                A* dqkv, float* dqgamma, float* dkgamma, int rows) {
+    constexpr int kQkBlock = 32;
+    const dim3 grid(rows, N_HEADS, 2);
+    qknorm_backward_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
+        qk_pre, qgamma, kgamma, dqkv, dqgamma, dkgamma);
+}
+
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
 // and upstream grad dY[M,out], produce dX[M,in] = dY.W^T and dW[in,out] = X^T.dY via two cuBLAS
 // GEMMs (same column-major trick as launch_linear), plus the bias column-sum. With the default
@@ -1301,6 +1527,48 @@ inline void launch_linear_bwd(const float* dX_in, const float* dW_in, const floa
         bias_grad_kernel<<<(out + block - 1) / block, block, 0, g_stream>>>(dY, dbias, M, out, accumulate);
     }
 }
+
+// Tied-embedding head (USE_TIED_EMBEDDINGS): the LM head reuses tok_emb [V,C] (V=VOCAB rows, C=D_MODEL
+// cols -- the SAME table op_embed reads for lookup) instead of a separate [C,V] lm_head matrix + bias.
+// Mirrors backend_cpu.cpp's op_tied_head/Op::TiedHead exactly (see that file's comment for why the
+// forward pays a transposed-access cost -- inherent to weight tying -- while both backward passes stay
+// GEMM-efficient). C/V are runtime parameters (not baked D_MODEL/VOCAB) so a single instantiation
+// serves every call site AND a dims-independent self-test at any scale, matching launch_linear's own
+// in/out convention.
+//
+// Forward: logits[M,V] = a[M,C] . tok_emb[V,C]^T. tok_emb is stored row-major [V,C] (needed for
+// op_embed's row-major lookup); reading it into cuBLAS with opA=CUBLAS_OP_T recovers exactly tok_emb^T
+// as the [C,V] forward "weight" -- the SAME row-major-via-column-major transpose-recovery trick
+// launch_linear_bwd's dX GEMM above already relies on, so this is the same gemm() primitive, just a
+// new operand-role combination (not new cuBLAS usage). No bias (tied heads drop the head bias too).
+inline void launch_tied_head(const float* dA, const float* dTok, float* dLogits,
+                              int M, int C, int V, bool force_tc = false) {
+    ensure_cublas();
+    gemm(CUBLAS_OP_T, CUBLAS_OP_N, V, M, C, dTok, C, dA, C, dLogits, V, force_tc);
+}
+
+// Tied-embedding head backward. Two independent GEMMs (no bias):
+//   dA[M,C]      = dY[M,V] . tok_emb[V,C]        -- grad into `a` (the rmsnorm_f output). The SAME
+//                  forward-shaped GEMM as launch_linear's (tok_emb used UNTRANSPOSED, as a plain
+//                  [in=V,out=C] weight) -- axpy-efficient, no transpose needed.
+//   dTok[V,C]   += dY[M,V]^T . dA_in[M,C]        -- grad into tok_emb, ACCUMULATING (beta=1.0
+//                  unconditionally, never a plain overwrite): this is one of TWO contributions
+//                  tok_emb's gradient receives this step, the other being the ordinary embedding-
+//                  lookup scatter-add (embed_backward_kernel / embed_backward_token_kernel elsewhere
+//                  in backward_device). Matches backend_cpu.cpp's Op::TiedHead / Op::Embed exactly:
+//                  both are plain += there too (see backend_cpu.cpp:636-661 and :522-528), so this
+//                  stays correct regardless of which of the two writers runs first -- unlike
+//                  launch_linear_bwd's own dW (used once per forward, so it defaults to overwrite),
+//                  tok_emb here is used TWICE per forward (lookup + head), so it must always add.
+// dA may be null if the caller has no use for it (no such caller today; kept for symmetry with
+// launch_linear_bwd's own dX-may-be-null convention).
+inline void launch_tied_head_bwd(const float* dA_in, const float* dTok, const float* dY,
+                                  float* dA, float* dTokGrad, int M, int C, int V, bool force_tc = false) {
+    ensure_cublas();
+    if (dA) gemm(CUBLAS_OP_N, CUBLAS_OP_N, C, M, V, dTok, C, dY, V, dA, C, force_tc);           // dA = dY . tok_emb
+    gemm(CUBLAS_OP_N, CUBLAS_OP_T, C, V, M, dA_in, C, dY, V, dTokGrad, C, force_tc, 1.0f);       // dTok += a^T . dY
+}
+
 // act-typed linear backward: bf16 inputs/grads, dW lands F32 in the grad blob, dbias optional F32.
 template <class IN, class DX>
 inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
@@ -1323,6 +1591,8 @@ template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, con
     attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 
+//TODO: We should be able to know the upper lilmit of the scratch size needed for backward, and allocate it once.
+// this risks OOM during flight and overhead of alloc/fragmentation.
 // Per-query softmax-stats scratch for the flash backward (m_i, 1/Z_i, dot_i), each batch*H*T floats.
 // Grown on demand (like the fwd/train scratch) and reused across steps; freed in train_free().
 float* g_bwd_m = nullptr; float* g_bwd_invZ = nullptr; float* g_bwd_dot = nullptr;
@@ -1382,6 +1652,7 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
 // One number shared with the footprint model and the train stage's token-budget batch scheduler.
 constexpr int MAX_FWD_BATCH = sub0::memplan::MAX_DEVICE_BATCH;
 
+//TODO: As with other cases - the sizes could be determiend ahead of time for the execution atleast?
 // Resident forward scratch. The batch-dependent buffers are sized to the largest batch seen so far
 // (g_fwd_cap, grown on demand); the fused-QKV weight buffers (wqkv) are batch-independent and built
 // once at upload. Freed by sub0_cuda_shutdown.
@@ -1499,7 +1770,7 @@ struct TrainScratch {
     act_t* h_final = nullptr;      // [M,C] last residual stream (= rmsnorm_f input)
     float* rinv_f  = nullptr;      // [M]
     float* a_final = nullptr;      // [M,C] rmsnorm_f output (= lm_head input)
-    float* logits  = nullptr;      // [M,V]
+    float* logits  = nullptr;      // [chunk_rows,V] (chunked -- see head_ce_chunked/g_tr_logits_chunk)
     // gradient temporaries (reused across layers); dh threads the residual stream in F32
     float* dh      = nullptr;      // [M,C] running residual-stream grad
     float* da      = nullptr;      // [M,C] f32 (feeds rmsnorm1 bwd dy)
@@ -1508,7 +1779,7 @@ struct TrainScratch {
     float* dfbuf   = nullptr;      // [M,C]
     act_t* dff1    = nullptr;      // [M,F]
     act_t* dgact   = nullptr;      // [M,F]
-    float* dlogits = nullptr;      // [M,V]
+    float* dlogits = nullptr;      // [chunk_rows,V] (chunked -- see head_ce_chunked/g_tr_logits_chunk)
     float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
     act_t* dh16    = nullptr;      // [M,C] bf16 cast of dh (FFN W2 backward operand)
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
@@ -1516,9 +1787,19 @@ struct TrainScratch {
     int*   lengths  = nullptr;     // [MAX_FWD_BATCH] per-window trained length (padding mask for short
                                    // docs) -- constant-sized (16 KiB) so it covers ANY effective batch
                                    // the row budget admits, decoupled from the rows the scratch grows to
+    act_t* qk_pre   = nullptr;     // [M,2C] pre-norm Q|K stash (USE_QK_NORM only, else stays null and
+                                   // costs nothing) -- see qknorm_save_act_kernel's comment and
+                                   // memplan.hpp's train_scratch_bytes qk_pre term for why this can't
+                                   // just be recomputed or aliased onto an existing checkpoint buffer:
+                                   // qkv itself is overwritten by RoPE right after qknorm in the
+                                   // forward graph, so nothing else survives to hold the pre-norm value
+                                   // by the time qknorm's own backward (which runs AFTER RoPE's
+                                   // backward, since RoPE sits after qknorm going forward) needs it.
 };
 TrainScratch g_tr;
 size_t       g_tr_rows = 0;        // total [M] ROW capacity (batch*T product) the buffers are sized for
+size_t       g_tr_logits_chunk = 0; // row CAPACITY of g_tr.logits/dlogits (<= g_tr_rows) -- see
+                                    // sub0::memplan::logits_chunk_rows / head_ce_chunked below
 long long    g_tr_grows = 0;       // monotonic (re)allocation count -- test observability
 // Per-layer bf16 weight mirrors for the FFN GEMMs (built from the F32 master on upload/step).
 act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
@@ -1538,7 +1819,13 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     ensure_stream();
     ++g_tr_grows;
     const size_t Mm = need;
-    const size_t MC = Mm * D_MODEL, MF = Mm * D_FF, MV = Mm * VOCAB;
+    const size_t MC = Mm * D_MODEL, MF = Mm * D_FF;
+    // logits/dlogits are CHUNKED (head_ce_chunked processes M in row-chunks of at most this many rows
+    // instead of one [M,V] shot -- V dwarfs every other per-row scratch term at this project's typical
+    // vocab scale, see sub0::memplan::logits_n_chunks' comment for the derivation) -- allocate only
+    // [g_tr_logits_chunk, V], not [Mm, V].
+    g_tr_logits_chunk = sub0::memplan::logits_chunk_rows(VOCAB, D_FF, Mm);
+    const size_t MV = g_tr_logits_chunk * VOCAB;
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
     for (int l = 0; l < N_LAYERS; ++l) {
@@ -1556,7 +1843,7 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a_final, MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.logits,  MV * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.logits,  MV * sizeof(float)));  // [g_tr_logits_chunk,V], chunked
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh,      MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.da,      MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * 3 * D_MODEL * sizeof(act_t)));
@@ -1564,7 +1851,7 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dfbuf,   MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(act_t)));
-    g_tr.dlogits = g_tr.logits;                 // CE backward is in-place: dlogits overwrites logits [M,V]
+    g_tr.dlogits = g_tr.logits;                 // CE backward is in-place: dlogits overwrites logits (chunked)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh16,    MC * sizeof(act_t)));   // bf16 cast of dh for FFN W2 bwd
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
@@ -1573,6 +1860,9 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     // that the row budget admits (a short-T step runs MORE windows). Constant-size it to the ceiling
     // (16 KiB) instead of the reserving batch, so no legal (batch, T) pair can overrun it.
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));
+    // qk_pre [M,2C]: only when USE_QK_NORM (see the TrainScratch::qk_pre comment) -- zero bytes and
+    // stays nullptr on the default (qk-norm off) build.
+    if constexpr (USE_QK_NORM) SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qk_pre, Mm * 2 * D_MODEL * sizeof(act_t)));
     g_tr_rows = Mm;
     return 0;
 }
@@ -1587,6 +1877,7 @@ void train_free() {
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
+    if constexpr (USE_QK_NORM) cudaFree(g_tr.qk_pre);   // no-op (cudaFree(nullptr) is well-defined) when off
     free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
     g_tr_rows = 0;
@@ -1680,6 +1971,54 @@ __global__ void attn_decode_kernel(const float* __restrict__ q, const float* __r
     }
 }
 
+// ============================================================================
+//  Per-layer parameter slot offsets (PARAM_LAYOUT indices) -- single source of truth
+// ============================================================================
+// Every layer occupies a FIXED run of consecutive PARAM_LAYOUT slots: 10 without QK-norm
+// (ln1,ln2,Wq,Wk,Wv,Wo,W1,b1,W2,b2), 12 with it (the same 10 plus q_norm,k_norm inserted between Wo
+// and the FFN block -- see layout.hpp's make_param_layout). The functions below used to compute
+// "+5 for Wo", "+6 for W1", etc. independently at every call site (forward_one_device, forward_device,
+// build_qkv_weights x2, ensure_wqkv_f32, forward_train, head_ce_chunked, backward_device -- 12 sites
+// total) -- adding USE_QK_NORM's 2 new slots would have needed every one of those updated in
+// lock-step, with no compiler help if one was missed (a wrong offset silently reads/writes the wrong
+// tensor's data; it doesn't fail to compile or even necessarily fail at runtime). These named
+// constants are now the ONE place that arithmetic lives; every call site indexes
+// `L[layer_base(l) + kWo]` etc. instead. check_layer_offsets()'s static_assert below cross-checks
+// them against the REAL PARAM_LAYOUT table (not just against each other), so a mistake here is a
+// compile error, not a silent wrong-tensor read.
+constexpr int kLn1 = 0, kLn2 = 1, kWq = 2, kWk = 3, kWv = 4, kWo = 5;
+constexpr int kQNorm = 6, kKNorm = 7;                        // present only when USE_QK_NORM (else unused)
+constexpr int kW1  = USE_QK_NORM ? 8 : 6;
+constexpr int kB1  = kW1 + 1, kW2 = kW1 + 2, kB2 = kW1 + 3;  // plain (non-gated) FFN shape -- see the
+                                                              // USE_GATED_FFN static_assert above: this
+                                                              // file never needs the gated 9/11-slot shape.
+constexpr int kLPer = USE_QK_NORM ? 12 : 10;                 // params per transformer block
+constexpr int layer_base(int l) { return 2 + kLPer * l; }
+constexpr int kFinalBase = 2 + kLPer * N_LAYERS;             // index of ln_f (tail block start)
+constexpr int kLnF = 0, kLmHead = 1, kLmBias = 2;            // offsets within the tail block
+
+consteval bool check_layer_offsets() {
+    using sub0::PKind;
+    const auto& Lc = sub0::PARAM_LAYOUT;
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const int b = layer_base(l);
+        if (Lc[b + kLn1].kind != PKind::Ln1 || Lc[b + kLn2].kind != PKind::Ln2 ||
+            Lc[b + kWq].kind  != PKind::Wq  || Lc[b + kWk].kind  != PKind::Wk  ||
+            Lc[b + kWv].kind  != PKind::Wv  || Lc[b + kWo].kind  != PKind::Wo)
+            return false;
+        if constexpr (USE_QK_NORM) {
+            if (Lc[b + kQNorm].kind != PKind::QNorm || Lc[b + kKNorm].kind != PKind::KNorm) return false;
+        }
+        if (Lc[b + kW1].kind != PKind::W1 || Lc[b + kB1].kind != PKind::B1 ||
+            Lc[b + kW2].kind != PKind::W2 || Lc[b + kB2].kind != PKind::B2)
+            return false;
+    }
+    return Lc[kFinalBase + kLnF].kind == PKind::LnF;
+}
+static_assert(check_layer_offsets(),
+    "layer_base()/kLn1../kFinalBase drifted from the real PARAM_LAYOUT table -- update the constants "
+    "above to match make_param_layout() in layout.hpp.");
+
 // One decode step on the device: token `id` at window position `pos`, reusing the M=1 dense launches
 // and the K/V cache. Writes logits into g_fwd.logits[0..VOCAB). Requires uploaded params + wqkv +
 // fwd_alloc(1) + kv_alloc(); the caller resets pos to 0 at the start of a sequence.
@@ -1689,22 +2028,27 @@ void forward_one_device(int id, int pos) {
     float* const base = g_dev_params;
     const float* tok_emb = base + L[0].off;
     const float* pos_emb = base + L[1].off;
-    const int    fi      = 2 + 10 * N_LAYERS;
-    const float* ln_f    = base + L[fi + 0].off;
-    const float* lm_head = base + L[fi + 1].off;
-    const float* lm_bias = base + L[fi + 2].off;
+    const int    fi      = kFinalBase;
+    const float* ln_f    = base + L[fi + kLnF].off;
+    [[maybe_unused]] const float* lm_head = nullptr;
+    [[maybe_unused]] const float* lm_bias = nullptr;
+    if constexpr (!USE_TIED_EMBEDDINGS) { lm_head = base + L[fi + kLmHead].off; lm_bias = base + L[fi + kLmBias].off; }
     float* h = g_fwd.h; float* a = g_fwd.a; float* qkv = g_fwd.qkv; float* att = g_fwd.att;
     float* proj = g_fwd.proj; float* fbuf = g_fwd.fbuf; float* ff1 = g_fwd.ff1; float* gact = g_fwd.gact; float* ff2 = g_fwd.ff2;
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
       embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h); }
     for (int l = 0; l < N_LAYERS; ++l) {
-        const int    b0  = 2 + 10 * l;
-        const float* ln1 = base + L[b0 + 0].off, *ln2 = base + L[b0 + 1].off;
-        const float* Wo  = base + L[b0 + 5].off, *W1 = base + L[b0 + 6].off, *b1 = base + L[b0 + 7].off;
-        const float* W2  = base + L[b0 + 8].off, *b2 = base + L[b0 + 9].off;
+        const int    b0  = layer_base(l);
+        const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
+        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off, *b1 = base + L[b0 + kB1].off;
+        const float* W2  = base + L[b0 + kW2].off, *b2 = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* qgamma = nullptr;
+        [[maybe_unused]] const float* kgamma = nullptr;
+        if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
         launch_rmsnorm(h, ln1, a, 1);
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
+        if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
             const int blk = 128; rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
         }
@@ -1724,7 +2068,8 @@ void forward_one_device(int id, int pos) {
         launch_add(h, ff2, h, C);
     }
     launch_rmsnorm(h, ln_f, a, 1);
-    launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V, /*force_tc=*/true);
+    if constexpr (USE_TIED_EMBEDDINGS) launch_tied_head(a, tok_emb, g_fwd.logits, 1, C, V, /*force_tc=*/true);
+    else                               launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V, /*force_tc=*/true);
 }
 
 // Device-side forward chain (no host transfers): assumes g_fwd.dids is populated and the
@@ -1739,10 +2084,11 @@ void forward_device(int batch, int T) {
 
     const float* tok_emb = base + L[0].off;
     [[maybe_unused]] const float* pos_emb = base + L[1].off;
-    const int    fi      = 2 + 10 * N_LAYERS;          // index of ln_f
-    const float* ln_f    = base + L[fi + 0].off;
-    const float* lm_head = base + L[fi + 1].off;
-    const float* lm_bias = base + L[fi + 2].off;
+    const int    fi      = kFinalBase;          // index of ln_f
+    const float* ln_f    = base + L[fi + kLnF].off;
+    [[maybe_unused]] const float* lm_head = nullptr;
+    [[maybe_unused]] const float* lm_bias = nullptr;
+    if constexpr (!USE_TIED_EMBEDDINGS) { lm_head = base + L[fi + kLmHead].off; lm_bias = base + L[fi + kLmBias].off; }
 
     float* h    = g_fwd.h;
     float* a    = g_fwd.a;
@@ -1764,17 +2110,21 @@ void forward_device(int batch, int T) {
             embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
-        const int    b0  = 2 + 10 * l;
-        const float* ln1 = base + L[b0 + 0].off;
-        const float* ln2 = base + L[b0 + 1].off;
-        const float* Wo  = base + L[b0 + 5].off;
-        const float* W1  = base + L[b0 + 6].off;
-        const float* b1  = base + L[b0 + 7].off;
-        const float* W2  = base + L[b0 + 8].off;
-        const float* b2  = base + L[b0 + 9].off;
+        const int    b0  = layer_base(l);
+        const float* ln1 = base + L[b0 + kLn1].off;
+        const float* ln2 = base + L[b0 + kLn2].off;
+        const float* Wo  = base + L[b0 + kWo].off;
+        const float* W1  = base + L[b0 + kW1].off;
+        const float* b1  = base + L[b0 + kB1].off;
+        const float* W2  = base + L[b0 + kW2].off;
+        const float* b2  = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* qgamma = nullptr;
+        [[maybe_unused]] const float* kgamma = nullptr;
+        if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
 
         launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1)
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
+        if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, M);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
         launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
@@ -1786,7 +2136,10 @@ void forward_device(int batch, int T) {
         launch_add(h, ff2, h, MC);                        // h = h + ff2
     }
     launch_rmsnorm(h, ln_f, a, M);                        // a = rmsnorm(h, ln_f)
-    launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V, /*force_tc=*/true);  // logits = a . lm_head + lm_bias
+    if constexpr (USE_TIED_EMBEDDINGS)                    // logits = a . tok_emb^T (tied head, no bias)
+        launch_tied_head(a, tok_emb, g_fwd.logits, M, C, V, /*force_tc=*/true);
+    else                                                   // logits = a . lm_head + lm_bias
+        launch_linear(a, lm_head, lm_bias, g_fwd.logits, M, C, V, /*force_tc=*/true);
 }
 
 // Drop any captured graph (shape or math-mode change -> recapture on the next forward).
@@ -1842,30 +2195,30 @@ void build_qkv_weights() {
         const int F = D_FF;
         const int nce = C * F, gce = (nce + 255) / 256;
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int    b0 = 2 + 10 * l;
-            const float* Wq = g_dev_params + L[b0 + 2].off;
-            const float* Wk = g_dev_params + L[b0 + 3].off;
-            const float* Wv = g_dev_params + L[b0 + 4].off;
+            const int    b0 = layer_base(l);
+            const float* Wq = g_dev_params + L[b0 + kWq].off;
+            const float* Wk = g_dev_params + L[b0 + kWk].off;
+            const float* Wv = g_dev_params + L[b0 + kWv].off;
             if (!g_w1_16[l])   cudaMalloc(&g_w1_16[l],   static_cast<size_t>(C) * F * sizeof(act_t));
             if (!g_w2_16[l])   cudaMalloc(&g_w2_16[l],   static_cast<size_t>(F) * C * sizeof(act_t));
             if (!g_wo16[l])    cudaMalloc(&g_wo16[l],    static_cast<size_t>(C) * C * sizeof(act_t));
             if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * 3 * C * sizeof(act_t));
-            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 6].off, g_w1_16[l], nce);
-            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + 8].off, g_w2_16[l], nce);
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW1].off, g_w1_16[l], nce);
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW2].off, g_w2_16[l], nce);
             { const int ncc = C * C, gcc = (ncc + 255) / 256;
-              f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + 5].off, g_wo16[l], ncc); }
+              f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWo].off, g_wo16[l], ncc); }
             build_qkv_act_kernel<act_t><<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_wqkv16[l]);
         }
     } else {                                             // F32: mirrors alias the master weights (no copy)
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int    b0 = 2 + 10 * l;
-            const float* Wq = g_dev_params + L[b0 + 2].off;
-            const float* Wk = g_dev_params + L[b0 + 3].off;
-            const float* Wv = g_dev_params + L[b0 + 4].off;
+            const int    b0 = layer_base(l);
+            const float* Wq = g_dev_params + L[b0 + kWq].off;
+            const float* Wk = g_dev_params + L[b0 + kWk].off;
+            const float* Wv = g_dev_params + L[b0 + kWv].off;
             build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
-            g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 6].off);
-            g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 8].off);
-            g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + 5].off);
+            g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW1].off);
+            g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW2].off);
+            g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWo].off);
             g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
         }
     }
@@ -1887,9 +2240,9 @@ int ensure_wqkv_f32() {
         const auto& L = sub0::PARAM_LAYOUT;
         const int C = D_MODEL, n = C * C, block = 256, grid = (n + block - 1) / block;
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int b0 = 2 + 10 * l;
-            build_qkv_kernel<<<grid, block, 0, g_stream>>>(g_dev_params + L[b0 + 2].off,
-                g_dev_params + L[b0 + 3].off, g_dev_params + L[b0 + 4].off, g_fwd.wqkv[l]);
+            const int b0 = layer_base(l);
+            build_qkv_kernel<<<grid, block, 0, g_stream>>>(g_dev_params + L[b0 + kWq].off,
+                g_dev_params + L[b0 + kWk].off, g_dev_params + L[b0 + kWv].off, g_fwd.wqkv[l]);
         }
         g_wqkv_f32_dirty = false;
     }
@@ -1916,19 +2269,22 @@ int ensure_wqkv_f32() {
 // TODO(mem): saved-activation scratch dominates at large batch; a/qkv/att are already checkpointed
 // (recomputed in backward) and acts + residual stream are bf16, so batch 512 now fits 8GB. Further
 // cuts would need checkpointing the per-layer residual (h_in/h_mid) too, recomputed from the input.
+// NOTE: this no longer computes logits -- the lm_head/tied-head forward now lives in head_ce_chunked
+// (called from backward_device, row-chunked over M along with the cross-entropy fwd+bwd and the
+// lm_head/tied-head backward -- see that function's comment). forward_train ends at a_final; every
+// call site (run_fwd_bwd, the training benchmarks/profiler below) already calls backward_device
+// unconditionally on the very next line, so this is a safe split, not a behavior change.
 void forward_train(int batch, int T) {
     const auto&  L  = sub0::PARAM_LAYOUT;
-    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    const int    C  = D_MODEL, F = D_FF, H = N_HEADS;
     const int    M  = batch * T;
     const int    MC = M * C, MF = M * F;
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
     [[maybe_unused]] const float* pos_emb = base + L[1].off;
-    const int    fi      = 2 + 10 * N_LAYERS;
-    const float* ln_f    = base + L[fi + 0].off;
-    const float* lm_head = base + L[fi + 1].off;
-    const float* lm_bias = base + L[fi + 2].off;
+    const int    fi      = kFinalBase;
+    const float* ln_f    = base + L[fi + kLnF].off;
 
     {   // h_in[0] = tok_emb[ids] (+ pos_emb under Absolute)
         const dim3 block(16, 16);
@@ -1939,19 +2295,26 @@ void forward_train(int batch, int T) {
             embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
-        const int    b0  = 2 + 10 * l;
-        const float* ln1 = base + L[b0 + 0].off;
-        const float* ln2 = base + L[b0 + 1].off;
-        const float* W1  = base + L[b0 + 6].off;
-        const float* b1  = base + L[b0 + 7].off;
-        const float* W2  = base + L[b0 + 8].off;
-        const float* b2  = base + L[b0 + 9].off;
+        const int    b0  = layer_base(l);
+        const float* ln1 = base + L[b0 + kLn1].off;
+        const float* ln2 = base + L[b0 + kLn2].off;
+        const float* W1  = base + L[b0 + kW1].off;
+        const float* b1  = base + L[b0 + kB1].off;
+        const float* W2  = base + L[b0 + kW2].off;
+        const float* b2  = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* qgamma = nullptr;
+        [[maybe_unused]] const float* kgamma = nullptr;
+        if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
         act_t* const hin  = g_tr.h_in[l];
         act_t* const hmid = g_tr.h_mid[l];
         act_t* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
         launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M);          // a = rmsnorm(hin,ln1) bf16
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
+        // Plain (non-save) variant here: this qkv buffer is a CHECKPOINT (recomputed from scratch in
+        // backward_device -- see that function's own qknorm call, which uses the SAVE variant because
+        // its recompute is where the pre-norm x actually needs to survive for qknorm's own backward).
+        if constexpr (USE_QK_NORM) launch_qknorm_t<act_t>(g_tr.qkv, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
                           g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
@@ -1966,7 +2329,66 @@ void forward_train(int batch, int T) {
         launch_add_t<act_t>(hmid, next, next, MC);                                  // next = hmid + ff2
     }
     launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M);     // a_final f32
-    launch_linear(g_tr.a_final, lm_head, lm_bias, g_tr.logits, M, C, V, /*force_tc=*/true);  // logits
+}
+
+// Chunked lm_head/tied-head forward -> cross-entropy fwd+bwd -> lm_head/tied-head backward. Processes
+// M rows in row-chunks of at most g_tr_logits_chunk (the [chunk_rows,V] g_tr.logits/dlogits scratch
+// buffer is allocated ONCE at that capacity in train_alloc and reused across every chunk) instead of
+// one [M,V] shot -- V (~16.5k at this project's production scale) makes a full [M,V] buffer the
+// single largest per-window TRAINING scratch buffer (~55-60% of it), so chunking it is the main lever
+// for raising the VRAM-fit training batch (see sub0::memplan::logits_n_chunks for the derivation).
+// Mathematically IDENTICAL to the old unchunked path: g_tr_logits_chunk >= M degenerates to exactly
+// one chunk covering the whole M (today's behavior verbatim), zero extra overhead in that case.
+//
+// Called from backward_device in place of its old single CE+head-backward block. Per chunk:
+//   * head forward OVERWRITES the same reused [chunk_rows,V] g_tr.logits (a fresh value every chunk,
+//     no accumulation -- mirrors op_linear/op_tied_head's forward, each row used once).
+//   * ce_backward_kernel needs the chunk's ABSOLUTE row offset (its row_offset param) to compute the
+//     right window/position (b=abs_m/T, t=abs_m%T) and lengths[b] -- passing chunk-LOCAL indices here
+//     would silently corrupt every row past the first chunk boundary. Its loss_acc atomicAdd is
+//     already safe across however many chunks call it (accumulates regardless of launch count).
+//   * head backward: dA (grad into a_final) is an OVERWRITE per chunk -- each chunk's rows are
+//     disjoint, exactly like launch_linear_bwd's own dX/dA convention for a row-chunked caller (see
+//     its doc comment). dW/dbias (untied) or dtok_emb (tied) ACCUMULATE (beta=1) across every chunk
+//     into the SAME grad slots backward_device already zeroed once before this runs -- untied passes
+//     accumulate=true explicitly (launch_linear_bwd defaults to false, the single-shot-per-forward
+//     case its other call sites want); tied's launch_tied_head_bwd already always accumulates
+//     unconditionally (added for the tied-embeddings two-contribution case), reused here verbatim.
+void head_ce_chunked(int batch, int T, const int* d_lengths) {
+    const auto&  L  = sub0::PARAM_LAYOUT;
+    const int    C  = D_MODEL, V = VOCAB;
+    const int    M  = batch * T;
+    const int    fi = kFinalBase;
+    float* const pb = g_dev_params;
+    float* const gb = g_dev_grad;
+    const float* tok_emb = pb + L[0].off;
+    [[maybe_unused]] const float* lm_head = nullptr;
+    [[maybe_unused]] const float* lm_bias = nullptr;
+    if constexpr (!USE_TIED_EMBEDDINGS) { lm_head = pb + L[fi + kLmHead].off; lm_bias = pb + L[fi + kLmBias].off; }
+
+    constexpr int kCeBlock = 256;   // one block per row; see ce_backward_kernel above
+    const int chunk_cap = static_cast<int>(g_tr_logits_chunk);
+    for (int m0 = 0; m0 < M; m0 += chunk_cap) {
+        const int rows = (M - m0 < chunk_cap) ? (M - m0) : chunk_cap;
+        const float* a_chunk   = g_tr.a_final  + static_cast<size_t>(m0) * C;
+        float*       da_chunk  = g_tr.da       + static_cast<size_t>(m0) * C;
+        const int*   tgt_chunk = g_tr.dtargets + m0;
+
+        if constexpr (USE_TIED_EMBEDDINGS)
+            launch_tied_head(a_chunk, tok_emb, g_tr.logits, rows, C, V, /*force_tc=*/true);
+        else
+            launch_linear(a_chunk, lm_head, lm_bias, g_tr.logits, rows, C, V, /*force_tc=*/true);
+
+        ce_backward_kernel<kCeBlock><<<rows, kCeBlock, 0, g_stream>>>(
+            g_tr.logits, tgt_chunk, g_tr.dlogits, g_tr.loss, rows, T, batch, d_lengths, m0);
+
+        if constexpr (USE_TIED_EMBEDDINGS)
+            launch_tied_head_bwd(a_chunk, tok_emb, g_tr.dlogits, da_chunk, gb + L[0].off, rows, C, V, /*force_tc=*/true);
+        else
+            launch_linear_bwd(a_chunk, lm_head, g_tr.dlogits, da_chunk,
+                              gb + L[fi + kLmHead].off, gb + L[fi + kLmBias].off, rows, C, V,
+                              /*force_tc=*/true, /*accumulate=*/true);
+    }
 }
 
 // Reverse pass: consumes the saved activations, writes the reduced gradient into g_dev_grad and
@@ -1976,69 +2398,82 @@ void forward_train(int batch, int T) {
 // used once per forward). Loss scaling invM = 1/M makes the result equal the CPU train_batch grad.
 void backward_device(int batch, int T, const int* d_lengths) {
     const auto&  L  = sub0::PARAM_LAYOUT;
-    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    const int    C  = D_MODEL, F = D_FF, H = N_HEADS;
     const int    M  = batch * T;
     const int    MC = M * C, MF = M * F;
     float* const pb = g_dev_params;
     float* const gb = g_dev_grad;
-    const int    fi = 2 + 10 * N_LAYERS;
+    const int    fi = kFinalBase;
 
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(gb, 0, sub0::PARAM_FLOATS * sizeof(float), g_stream));
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.loss, 0, sizeof(double), g_stream));
 
-    // cross-entropy: per-window-mean dlogits with padding masked out (d_lengths; nullptr = all full T)
-    {
-        constexpr int kCeBlock = 256;   // one block per row; see ce_backward_kernel above
-        ce_backward_kernel<kCeBlock><<<M, kCeBlock, 0, g_stream>>>(
-            g_tr.logits, g_tr.dtargets, g_tr.dlogits, g_tr.loss, M, T, batch, d_lengths);
-    }
-    // lm_head: dW/dbias -> grad blob, da = grad into a_final
-    launch_linear_bwd(g_tr.a_final, pb + L[fi + 1].off, g_tr.dlogits, g_tr.da,
-                      gb + L[fi + 1].off, gb + L[fi + 2].off, M, C, V, /*force_tc=*/true);
+    // chunked cross-entropy + lm_head/tied-head fwd+bwd -- see head_ce_chunked's own comment.
+    head_ce_chunked(batch, T, d_lengths);
     // rmsnorm_f: dh starts here (grad into h_final)
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dh, 0, static_cast<size_t>(MC) * sizeof(float), g_stream));
-    launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + 0].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
-                       gb + L[fi + 0].off, M);
+    launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + kLnF].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
+                       gb + L[fi + kLnF].off, M);
 
     for (int l = N_LAYERS - 1; l >= 0; --l) {
-        const int b0 = 2 + 10 * l;
-        const float* W1 = pb + L[b0 + 6].off, *b1 = pb + L[b0 + 7].off;
+        const int b0 = layer_base(l);
+        const float* W1 = pb + L[b0 + kW1].off, *b1 = pb + L[b0 + kB1].off;
+        [[maybe_unused]] const float* qgamma = nullptr;
+        [[maybe_unused]] const float* kgamma = nullptr;
+        [[maybe_unused]] float*       dqgamma = nullptr;
+        [[maybe_unused]] float*       dkgamma = nullptr;
+        if constexpr (USE_QK_NORM) {
+            qgamma  = pb + L[b0 + kQNorm].off; kgamma  = pb + L[b0 + kKNorm].off;
+            dqgamma = gb + L[b0 + kQNorm].off; dkgamma = gb + L[b0 + kKNorm].off;
+        }
         // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then ff1/gact, before use
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.fbuf, g_tr.rinv2[l], M);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.fbuf, g_tr.rinv2[l], M);
         launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
         launch_bias_act(g_tr.ff1, b1, M, F);
         launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
         // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact); dh->bf16
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
-        launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + 8].off, M, F, C);
-        { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + 9].off, M, C); }
+        launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + kW2].off, M, F, C);
+        { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + kB2].off, M, C); }
         launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
-        launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + 6].off, M, C, F);
-        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + 7].off, M); }
-        launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + 1].off, g_tr.rinv2[l], g_tr.dfbuf,
-                           g_tr.dh, gb + L[b0 + 1].off, M);                          // dh += -> d(h_mid)
+        launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + kW1].off, M, C, F);
+        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + kB1].off, M); }
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.rinv2[l], g_tr.dfbuf,
+                           g_tr.dh, gb + L[b0 + kLn2].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
-        // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+rope), then attention
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.a, g_tr.rinv1[l], M);
+        // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+qknorm+rope), then attention
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + kLn1].off, g_tr.a, g_tr.rinv1[l], M);
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
+        // QK-norm recompute: the SAVE variant (unlike forward_train's plain launch_qknorm_t) because
+        // this pre-norm x must survive until qknorm's own backward runs below, AFTER attention's and
+        // RoPE's backward -- see qknorm_save_act_kernel's comment and the TrainScratch::qk_pre note in
+        // memplan.hpp's train_scratch_bytes.
+        if constexpr (USE_QK_NORM) launch_qknorm_save_t<act_t>(g_tr.qkv, g_tr.qk_pre, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
-        launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + 5].off, M, C, C);
+        launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + kWo].off, M, C, C);
         // flash backward writes each dq/dk/dv exactly once (no atomics), so no pre-zero is needed.
         launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
-        // projected q/k before the qkv-GEMM backward (inverse rotation). dV is untouched.
+        // qknorm output (or the projected q/k directly, without QK-norm) before qknorm's own backward
+        // (if enabled) and the qkv-GEMM backward (inverse rotation). dV is untouched.
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_bwd_t<act_t>(g_tr.dqkv, batch, T);
+        // QK-norm backward: converts dqkv's Q/K sub-blocks in place from "grad w.r.t. qknorm's output"
+        // (what RoPE's backward just produced) to "grad w.r.t. qknorm's input" (= the raw QKV-GEMM
+        // output), which the qkv-GEMM backward below needs. Must run AFTER RoPE's backward and BEFORE
+        // the qkv-GEMM backward, matching the forward order (qknorm then RoPE) run in reverse.
+        if constexpr (USE_QK_NORM)
+            launch_qknorm_bwd_t<act_t>(g_tr.qk_pre, qgamma, kgamma, g_tr.dqkv, dqgamma, dkgamma, M);
         // qkv backward (input a): da = grad into a (f32), dWqkv -> split into dWq/dWk/dWv
         launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, 3 * C);
         {
             const int n = C * C, block = 256;
             split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
-                g_tr.dwqkv, gb + L[b0 + 2].off, gb + L[b0 + 3].off, gb + L[b0 + 4].off);
+                g_tr.dwqkv, gb + L[b0 + kWq].off, gb + L[b0 + kWk].off, gb + L[b0 + kWv].off);
         }
-        launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + 0].off, g_tr.rinv1[l], g_tr.da,
-                           g_tr.dh, gb + L[b0 + 0].off, M);                          // dh += -> d(h_in)
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + kLn1].off, g_tr.rinv1[l], g_tr.da,
+                           g_tr.dh, gb + L[b0 + kLn1].off, M);                          // dh += -> d(h_in)
     }
     // embed backward: scatter dh into tok_emb (+ pos_emb under Absolute) grads
     {
@@ -2053,8 +2488,10 @@ void backward_device(int batch, int T, const int* d_lengths) {
     }
 }
 
-// AdamW state: the reduced grad, the two moments (zeroed), the 0/1 decay mask (built from
-// PARAM_LAYOUT) and the double norm accumulator. Allocated lazily alongside the train scratch.
+// AdamW state: the reduced grad, the two moments (zeroed), and the double norm accumulator.
+// Allocated lazily alongside the train scratch. The weight-decay ranges are compile-time-known
+// (sub0::DECAY_RANGES, layout.hpp) -- copied once into __constant__ memory here, not a persistent
+// per-parameter mask.
 int opt_alloc() {
     if (g_dev_grad) return 0;
     ensure_stream();
@@ -2062,31 +2499,19 @@ int opt_alloc() {
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_grad,  n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_m,     n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_vel,   n * sizeof(float)));
-    // uint8 mask (a 0/1 flag needs no more than 1 byte -- was float, 4x the storage for the same
-    // information; persistent for the whole run, so every byte here is permanent headroom lost to
-    // a larger training batch, the bigger lever).
-    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_decay, n * sizeof(unsigned char)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_normsq, sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_dev_gs, sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_m,   0, n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemset(g_dev_vel, 0, n * sizeof(float)));
-    // weight-decay mask: 1 for matrices (PARAM_LAYOUT decay flag), 0 for biases/norms.
-    std::vector<unsigned char> mask(n, 0);
-    const auto& L = sub0::PARAM_LAYOUT;
-    for (const auto& pv : L) {
-        const unsigned char d = pv.decay ? 1 : 0;
-        const size_t cnt = static_cast<size_t>(pv.rows) * pv.cols;
-        for (size_t i = 0; i < cnt; ++i) mask[pv.off + i] = d;
-    }
-    SUB0_CUDA_CHECK(cudaMemcpy(g_dev_decay, mask.data(), n * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpyToSymbol(g_decay_ranges, sub0::DECAY_RANGES.data(),
+                                       sizeof(sub0::DecayRange) * sub0::NUM_DECAY_RANGES));
     return 0;
 }
 
 void opt_free() {
     cudaFree(g_dev_grad);  cudaFree(g_dev_m);    cudaFree(g_dev_vel);
-    cudaFree(g_dev_decay); cudaFree(g_dev_normsq); cudaFree(g_dev_gs);
+    cudaFree(g_dev_normsq); cudaFree(g_dev_gs);
     g_dev_grad = g_dev_m = g_dev_vel = nullptr;
-    g_dev_decay = nullptr;
     g_dev_normsq = nullptr;
     g_dev_gs = nullptr;
 }
@@ -2110,7 +2535,7 @@ void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd,
     const float bc1  = 1.0f - std::pow(b1, static_cast<float>(t));
     const float bc2  = 1.0f - std::pow(b2, static_cast<float>(t));
     adam_step_kernel<<<grid, block, 0, g_stream>>>(g_dev_params, g_dev_grad, g_dev_m, g_dev_vel,
-                                                   g_dev_decay, n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2);
+                                                   n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2);
     build_qkv_weights();      // Wq/Wk/Wv changed -> refresh the fused inference/train weight
     invalidate_graph();       // params changed -> recapture the forward graph on next inference
 }
@@ -2781,6 +3206,377 @@ SUB0_CUDA_API int sub0_cuda_test_accumulate_check(int M, int in, int out, double
     return 0;
 }
 
+// Dims-independent GEMM self-test for the tied-embedding head (launch_tied_head /
+// launch_tied_head_bwd, USE_TIED_EMBEDDINGS's GPU forward+backward). Parameterized by runtime
+// M/C/V (not the baked D_MODEL/VOCAB), same convention as sub0_cuda_test_accumulate_check above, so
+// ONE binary exercises both a toy scale and a production-like scale (e.g. C=448, V=4306 -- this
+// project's actual production d448/vocab config) with no rebuild. Builds random
+// table[V,C]/a[M,C]/dY[M,V] on host, computes the CPU reference forward+backward in double
+// precision (mirrors backend_cpu.cpp's op_tied_head / Op::TiedHead exactly: logits[m,v] =
+// dot(a[m,:],table[v,:]); dA[m,c] = sum_v dY[m,v]*table[v,c]; dTable[v,c] += sum_m dY[m,v]*a[m,c]),
+// then compares against the GPU helpers. The backward check pre-seeds the device dTable buffer with
+// a random NONZERO pattern before calling launch_tied_head_bwd, so it directly exercises the
+// ACCUMULATE (not overwrite-from-zero) semantics backward_device relies on -- by the time the tied
+// head's own backward runs, tok_emb's grad slot may already carry the embedding-lookup scatter-add's
+// contribution (or vice versa; launch_tied_head_bwd must add correctly either way).
+SUB0_CUDA_API int sub0_cuda_tied_head_check(int M, int C, int V,
+                                            double* out_relL2_fwd, double* out_relL2_bwd) {
+    if (M < 1 || C < 1 || V < 1) return 1;
+    if (sub0_cuda_init()) return 1;
+    sub0_cuda_set_tf32(0);   // tight FP32 gate, same convention as the other CPU-parity checks
+    ensure_cublas();
+
+    std::vector<float> hTable(static_cast<size_t>(V) * C), hA(static_cast<size_t>(M) * C),
+                        hDY(static_cast<size_t>(M) * V), hDTableSeed(static_cast<size_t>(V) * C);
+    unsigned s = 0x1b873593u;
+    auto randf = [&] { s = s * 1664525u + 1013904223u; return static_cast<float>(s >> 8) / 8388608.0f - 1.0f; };
+    for (auto& v : hTable)      v = randf() * 0.1f;
+    for (auto& v : hA)          v = randf() * 0.1f;
+    for (auto& v : hDY)         v = randf() * 0.1f;
+    for (auto& v : hDTableSeed) v = randf() * 0.1f;
+
+    float *dTable = nullptr, *dA = nullptr, *dLogits = nullptr;
+    float *dDY = nullptr, *dDA = nullptr, *dDTable = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dTable,  hTable.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dA,      hA.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dLogits, static_cast<size_t>(M) * V * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDY,     hDY.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDA,     hA.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDTable, hTable.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dTable, hTable.data(), hTable.size() * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dA,     hA.data(),     hA.size()     * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDY,    hDY.data(),    hDY.size()    * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDTable, hDTableSeed.data(), hDTableSeed.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    launch_tied_head(dA, dTable, dLogits, M, C, V, /*force_tc=*/false);                    // forward
+    launch_tied_head_bwd(dA, dTable, dDY, dDA, dDTable, M, C, V, /*force_tc=*/false);       // backward (dDTable pre-seeded)
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hLogits(static_cast<size_t>(M) * V), hDA(hA.size()), hDTable(hTable.size());
+    SUB0_CUDA_CHECK(cudaMemcpy(hLogits.data(), dLogits, hLogits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDA.data(),     dDA,     hDA.size()     * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDTable.data(), dDTable, hDTable.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    cudaFree(dTable); cudaFree(dA); cudaFree(dLogits); cudaFree(dDY); cudaFree(dDA); cudaFree(dDTable);
+
+    // CPU reference, double precision, mirrors op_tied_head / Op::TiedHead exactly. Compared via a
+    // WHOLE-ARRAY relative-L2 norm (sqrt(sum(d^2)/sum(ref^2))), the same metric the whole-model
+    // "CUDA backward matches the CPU reduced gradient" test uses -- NOT a per-element max-relative
+    // diff: at this scale (M*V up to ~275k dot products for the production-like case) a per-element
+    // max-relative metric is dominated by whichever entry happens to land near a zero-crossing by
+    // chance (a near-zero reference denominator inflates an otherwise-tiny absolute rounding
+    // difference into a large ratio) -- an artifact of the METRIC, not a real GEMM bug. The whole-
+    // array L2 norm is robust to that: a genuine axis-order/transpose bug shows up as a large L2
+    // relative error (order 1 or worse), while ordinary FP32 accumulation rounding stays at the
+    // 1e-6..1e-5 level regardless of how many near-zero individual entries exist.
+    double num_fwd = 0.0, den_fwd = 0.0;
+    for (int m = 0; m < M; ++m) {
+        for (int v = 0; v < V; ++v) {
+            double acc = 0.0;
+            for (int c = 0; c < C; ++c)
+                acc += static_cast<double>(hA[static_cast<size_t>(m) * C + c]) * hTable[static_cast<size_t>(v) * C + c];
+            const double gpu = hLogits[static_cast<size_t>(m) * V + v];
+            const double d = gpu - acc;
+            num_fwd += d * d;
+            den_fwd += acc * acc;
+        }
+    }
+    double num_bwd = 0.0, den_bwd = 0.0;
+    for (int m = 0; m < M; ++m) {                                            // dA[m,c] = sum_v dY[m,v]*table[v,c]
+        for (int c = 0; c < C; ++c) {
+            double acc = 0.0;
+            for (int v = 0; v < V; ++v)
+                acc += static_cast<double>(hDY[static_cast<size_t>(m) * V + v]) * hTable[static_cast<size_t>(v) * C + c];
+            const double gpu = hDA[static_cast<size_t>(m) * C + c];
+            const double d = gpu - acc;
+            num_bwd += d * d;
+            den_bwd += acc * acc;
+        }
+    }
+    for (int v = 0; v < V; ++v) {                        // dTable[v,c] = seed[v,c] + sum_m dY[m,v]*a[m,c]
+        for (int c = 0; c < C; ++c) {
+            double acc = static_cast<double>(hDTableSeed[static_cast<size_t>(v) * C + c]);
+            for (int m = 0; m < M; ++m)
+                acc += static_cast<double>(hDY[static_cast<size_t>(m) * V + v]) * hA[static_cast<size_t>(m) * C + c];
+            const double gpu = hDTable[static_cast<size_t>(v) * C + c];
+            const double d = gpu - acc;
+            num_bwd += d * d;
+            den_bwd += acc * acc;
+        }
+    }
+
+    if (out_relL2_fwd) *out_relL2_fwd = std::sqrt(num_fwd / std::max(den_fwd, 1e-30));
+    if (out_relL2_bwd) *out_relL2_bwd = std::sqrt(num_bwd / std::max(den_bwd, 1e-30));
+    return 0;
+}
+
+// Dims-independent CPU-vs-GPU parity self-test for QK-norm (qknorm_act_kernel / qknorm_save_act_kernel
+// / qknorm_backward_act_kernel). H/DH are TEMPLATE parameters on the kernels themselves (baked
+// constexpr, this file's own convention for per-head-shape kernels -- unlike the tied-head check's
+// runtime M/C/V, which are genuine cuBLAS GEMM dims), so this helper is itself a template and the
+// public entry point below dispatches to a small fixed set of instantiations -- a toy shape and a
+// production-like shape (H=7,DH=64: this project's actual production d448/N_HEADS=7 config) -- rather
+// than one dims-independent runtime-parameterized function. Always F32 (act_t=float): the test's job
+// is to prove the MATH, independent of whatever ACT_DTYPE the CURRENT build happens to bake, same
+// reasoning as sub0_cuda_tied_head_check's tf32-off/F32 convention for its own GEMM check.
+//
+// Forward: builds a random qkv[rows,3C] (C=H*DH, near-1 gamma so it exercises a realistic operating
+// point) on host, runs qknorm_act_kernel, and compares against a CPU reference that mirrors
+// backend_cpu.cpp's op_qknorm exactly (per-(row,head) mean-square over the DH-wide slice, r =
+// 1/sqrt(ms+eps), y = x*r*gamma) in double precision. The V sub-block (cols [2C,3C)) is checked
+// BYTE-IDENTICAL to the input, since qknorm must never touch it.
+//
+// Backward: re-derives qk_pre via qknorm_save_act_kernel (the same recompute path backward_device
+// itself uses) from a FRESH copy of the pre-norm qkv, then runs qknorm_backward_act_kernel with a
+// random upstream dy and dgamma buffers SEEDED with a random NONZERO pattern beforehand (same
+// technique as sub0_cuda_tied_head_check's dTable seeding) to directly exercise the atomicAdd
+// ACCUMULATE semantics the kernel relies on. Compared against a CPU reference mirroring
+// backend_cpu.cpp's Op::QKNorm backward case exactly (double precision), including the in-place
+// dy->dx overwrite and the dgamma += convention.
+template <int H, int DH>
+static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_bwd) {
+    constexpr int C = H * DH, kQkBlock = 32;
+    ensure_stream();
+    std::vector<float> hQkv(static_cast<size_t>(rows) * 3 * C), hQgamma(DH), hKgamma(DH);
+    unsigned s = 0x9e3779b9u;
+    auto randf = [&] { s = s * 1664525u + 1013904223u; return static_cast<float>(s >> 8) / 8388608.0f - 1.0f; };
+    for (auto& v : hQkv)    v = randf() * 0.5f;
+    for (auto& v : hQgamma) v = 1.0f + randf() * 0.1f;   // near-1, like a trained gamma
+    for (auto& v : hKgamma) v = 1.0f + randf() * 0.1f;
+
+    float *dQkv = nullptr, *dQgamma = nullptr, *dKgamma = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dQkv,    hQkv.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dQgamma, static_cast<size_t>(DH) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dKgamma, static_cast<size_t>(DH) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dQkv,    hQkv.data(),    hQkv.size() * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dQgamma, hQgamma.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dKgamma, hKgamma.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
+
+    const dim3 grid(rows, H, 2);
+    qknorm_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma);
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hQkvOut(hQkv.size());
+    SUB0_CUDA_CHECK(cudaMemcpy(hQkvOut.data(), dQkv, hQkv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // CPU reference forward, mirrors op_qknorm exactly (double precision).
+    std::vector<double> refQkv(hQkv.begin(), hQkv.end());
+    auto qknorm_ref_fwd = [&](std::vector<double>& buf, const std::vector<float>& gamma, int which) {
+        for (int r = 0; r < rows; ++r) {
+            for (int h = 0; h < H; ++h) {
+                const size_t base = static_cast<size_t>(r) * 3 * C + static_cast<size_t>(which) * C + static_cast<size_t>(h) * DH;
+                double ms = 0.0;
+                for (int j = 0; j < DH; ++j) ms += buf[base + j] * buf[base + j];
+                ms /= DH;
+                const double rr = 1.0 / std::sqrt(ms + 1e-5);
+                for (int j = 0; j < DH; ++j) buf[base + j] = buf[base + j] * rr * gamma[j];
+            }
+        }
+    };
+    qknorm_ref_fwd(refQkv, hQgamma, 0);
+    qknorm_ref_fwd(refQkv, hKgamma, 1);
+
+    double numF = 0.0, denF = 0.0;
+    bool v_untouched = true;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < 3 * C; ++c) {
+            const size_t idx = static_cast<size_t>(r) * 3 * C + c;
+            if (c >= 2 * C) { if (hQkvOut[idx] != hQkv[idx]) v_untouched = false; continue; }   // V: untouched
+            const double d = static_cast<double>(hQkvOut[idx]) - refQkv[idx];
+            numF += d * d;
+            denF += refQkv[idx] * refQkv[idx];
+        }
+    }
+    if (out_relL2_fwd) *out_relL2_fwd = v_untouched ? std::sqrt(numF / std::max(denF, 1e-30)) : 1e30;
+
+    // Backward: recompute qk_pre via the SAVE variant from a FRESH copy of the pre-norm qkv (mirrors
+    // backward_device's own recompute path), then run the backward kernel with a random upstream dy
+    // and NONZERO-seeded dgamma buffers.
+    // NOTE: qk_pre is `float*` here (matching this test's A=float instantiation throughout), NOT the
+    // production act_t -- the self-test always runs the kernels' F32 instantiation regardless of the
+    // current build's ACT_DTYPE (see this function's own header comment), so every buffer must agree
+    // on A=float, including qk_pre.
+    float* dQkv2 = nullptr; float* dQkPre = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dQkv2, hQkv.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dQkv2, hQkv.data(), hQkv.size() * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMalloc(&dQkPre, static_cast<size_t>(rows) * 2 * C * sizeof(float)));
+    qknorm_save_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma);
+
+    std::vector<float> hDy(hQkv.size());
+    for (auto& v : hDy) v = randf() * 0.3f;
+    float* dDqkv = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dDqkv, hDy.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDqkv, hDy.data(), hDy.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    std::vector<float> hDqgammaSeed(DH), hDkgammaSeed(DH);
+    for (auto& v : hDqgammaSeed) v = randf();
+    for (auto& v : hDkgammaSeed) v = randf();
+    float *dDqgamma = nullptr, *dDkgamma = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dDqgamma, static_cast<size_t>(DH) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDkgamma, static_cast<size_t>(DH) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDqgamma, hDqgammaSeed.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDkgamma, hDkgammaSeed.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
+
+    qknorm_backward_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
+        dQkPre, dQgamma, dKgamma, dDqkv, dDqgamma, dDkgamma);
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hDx(hDy.size()), hDqgamma(DH), hDkgamma(DH);
+    SUB0_CUDA_CHECK(cudaMemcpy(hDx.data(), dDqkv, hDx.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDqgamma.data(), dDqgamma, static_cast<size_t>(DH) * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDkgamma.data(), dDkgamma, static_cast<size_t>(DH) * sizeof(float), cudaMemcpyDeviceToHost));
+
+    cudaFree(dQkv); cudaFree(dQgamma); cudaFree(dKgamma); cudaFree(dQkv2); cudaFree(dQkPre);
+    cudaFree(dDqkv); cudaFree(dDqgamma); cudaFree(dDkgamma);
+
+    // CPU reference backward, mirrors Op::QKNorm's backward exactly (double precision): reads the SAME
+    // pre-norm x (hQkv) and gamma the GPU path used, overwrites refDx IN PLACE (dy -> dx) exactly like
+    // the kernel does, and accumulates (+=) into the seeded dgamma.
+    std::vector<double> refDx(hDy.begin(), hDy.end());
+    std::vector<double> refDqgamma(hDqgammaSeed.begin(), hDqgammaSeed.end());
+    std::vector<double> refDkgamma(hDkgammaSeed.begin(), hDkgammaSeed.end());
+    auto qknorm_ref_bwd = [&](const std::vector<float>& gamma, std::vector<double>& dgamma, int which) {
+        for (int r = 0; r < rows; ++r) {
+            for (int h = 0; h < H; ++h) {
+                const size_t base = static_cast<size_t>(r) * 3 * C + static_cast<size_t>(which) * C + static_cast<size_t>(h) * DH;
+                double ms = 0.0, S = 0.0;
+                for (int j = 0; j < DH; ++j) {
+                    const double xj = hQkv[base + j];
+                    ms += xj * xj;
+                    S  += refDx[base + j] * gamma[j] * xj;
+                }
+                ms /= DH;
+                const double rr = 1.0 / std::sqrt(ms + 1e-5), r3 = rr * rr * rr;
+                for (int j = 0; j < DH; ++j) {
+                    const double xj = hQkv[base + j], dyj = refDx[base + j], gj = gamma[j];
+                    const double dx = dyj * rr * gj - (xj * r3 / DH) * S;
+                    dgamma[j] += dyj * xj * rr;
+                    refDx[base + j] = dx;   // in place, matches the kernel's own in-place dy->dx overwrite
+                }
+            }
+        }
+    };
+    qknorm_ref_bwd(hQgamma, refDqgamma, 0);
+    qknorm_ref_bwd(hKgamma, refDkgamma, 1);
+
+    double numB = 0.0, denB = 0.0;
+    for (int r = 0; r < rows; ++r) {
+        for (int which = 0; which < 2; ++which) {
+            for (int c = 0; c < C; ++c) {
+                const size_t idx = static_cast<size_t>(r) * 3 * C + static_cast<size_t>(which) * C + c;
+                const double d = static_cast<double>(hDx[idx]) - refDx[idx];
+                numB += d * d; denB += refDx[idx] * refDx[idx];
+            }
+        }
+    }
+    for (int j = 0; j < DH; ++j) {
+        double d = static_cast<double>(hDqgamma[j]) - refDqgamma[j]; numB += d * d; denB += refDqgamma[j] * refDqgamma[j];
+        d = static_cast<double>(hDkgamma[j]) - refDkgamma[j];        numB += d * d; denB += refDkgamma[j] * refDkgamma[j];
+    }
+    if (out_relL2_bwd) *out_relL2_bwd = std::sqrt(numB / std::max(denB, 1e-30));
+    return 0;
+}
+
+// Public entry point: dispatches to qknorm_check_impl<H,DH> for a small fixed set of (H,DH) shapes
+// (H/DH are template params on the kernels, not runtime dims -- see qknorm_check_impl's own comment).
+// shape_sel: 0 = toy (H=2,DH=8), 1 = production-like (H=7,DH=64 -- this project's actual production
+// d448/N_HEADS=7 config). Returns 2 for an unrecognized shape_sel, 1 on a bad `rows`/device failure.
+SUB0_CUDA_API int sub0_cuda_qknorm_check(int shape_sel, int rows, double* out_relL2_fwd, double* out_relL2_bwd) {
+    if (rows < 1) return 1;
+    if (sub0_cuda_init()) return 1;
+    switch (shape_sel) {
+        case 0: return qknorm_check_impl<2, 8>(rows, out_relL2_fwd, out_relL2_bwd);
+        case 1: return qknorm_check_impl<7, 64>(rows, out_relL2_fwd, out_relL2_bwd);
+        default: return 2;
+    }
+}
+
+// Verifies ce_backward_kernel's row_offset parameter directly: chunking a [M,V] logits/dlogits/loss
+// computation into row-chunks (an explicit, test-controlled chunk_cap, independent of the production
+// N_CHUNKS derivation in memplan.hpp -- head_ce_chunked in this file is the real caller) must produce
+// IDENTICAL dlogits and loss to a single full-M call. This is the direct correctness proof for the
+// exact bug risk row_offset exists to prevent: a chunk after the first computing the wrong window/
+// position index (b=abs_m/T) would silently corrupt every row past the first chunk boundary (wrong
+// lengths[b] lookup -> wrong padding/real classification -> wrong loss weight), not fail loudly.
+//
+// Builds random logits/targets/lengths on host (lengths so both the "padding" and "real" branches get
+// exercised across chunks), runs ce_backward_kernel ONCE at full M (row_offset=0) as the reference,
+// then in an explicit chunked loop (row_offset=m0 per call; chunk_cap need not divide M evenly --
+// callers are expected to force a non-full last chunk to stress exactly that boundary), and compares
+// dlogits (whole-array rel-L2, same reasoning as sub0_cuda_tied_head_check -- robust to a few near-
+// zero individual entries) and loss (plain relative diff, one scalar; atomicAdd already accumulates
+// correctly across separate kernel launches, this just confirms end-to-end).
+SUB0_CUDA_API int sub0_cuda_ce_chunk_check(int M, int T, int batch, int chunk_cap,
+                                           double* out_relL2_dlogits, double* out_reldiff_loss) {
+    if (M < 1 || T < 1 || batch < 1 || chunk_cap < 1 || batch * T != M) return 1;
+    if (sub0_cuda_init()) return 1;
+    constexpr int V = VOCAB;
+
+    std::vector<float> hLogits(static_cast<size_t>(M) * V);
+    std::vector<int>   hTargets(static_cast<size_t>(M));
+    std::vector<int>   hLengths(static_cast<size_t>(batch));
+    unsigned s = 0x2545f491u;
+    auto randf = [&] { s = s * 1664525u + 1013904223u; return static_cast<float>(s >> 8) / 8388608.0f - 1.0f; };
+    auto randi = [&](int n) { s = s * 1664525u + 1013904223u; return static_cast<int>(s % static_cast<unsigned>(n)); };
+    for (auto& v : hLogits)  v = randf();
+    for (auto& x : hTargets) x = randi(V);
+    for (auto& x : hLengths) x = 1 + randi(T);   // [1,T] -- exercises both padding and real rows
+
+    float* dLogits = nullptr; int* dTargets = nullptr; int* dLengths = nullptr;
+    float* dDlogitsRef = nullptr; float* dDlogitsChunk = nullptr;
+    double* dLossRef = nullptr; double* dLossChunk = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dLogits,  hLogits.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dTargets, hTargets.size() * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dLengths, hLengths.size() * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDlogitsRef,   hLogits.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDlogitsChunk, hLogits.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dLossRef,   sizeof(double)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dLossChunk, sizeof(double)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dLogits,  hLogits.data(),  hLogits.size()  * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dTargets, hTargets.data(), hTargets.size() * sizeof(int),   cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dLengths, hLengths.data(), hLengths.size() * sizeof(int),   cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemsetAsync(dLossRef,   0, sizeof(double), g_stream));
+    SUB0_CUDA_CHECK(cudaMemsetAsync(dLossChunk, 0, sizeof(double), g_stream));
+
+    constexpr int kCeBlock = 256;
+    // Reference: one call over the whole M, row_offset=0 (today's unchunked shape).
+    ce_backward_kernel<kCeBlock><<<M, kCeBlock, 0, g_stream>>>(
+        dLogits, dTargets, dDlogitsRef, dLossRef, M, T, batch, dLengths, 0);
+    // Chunked: identical inputs, split at chunk_cap (may not divide M evenly -- exercises a non-full
+    // last chunk), each call given its own absolute row_offset.
+    for (int m0 = 0; m0 < M; m0 += chunk_cap) {
+        const int rows = (M - m0 < chunk_cap) ? (M - m0) : chunk_cap;
+        ce_backward_kernel<kCeBlock><<<rows, kCeBlock, 0, g_stream>>>(
+            dLogits + static_cast<size_t>(m0) * V, dTargets + m0,
+            dDlogitsChunk + static_cast<size_t>(m0) * V, dLossChunk, rows, T, batch, dLengths, m0);
+    }
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hDlogitsRef(hLogits.size()), hDlogitsChunk(hLogits.size());
+    double hLossRef = 0.0, hLossChunk = 0.0;
+    SUB0_CUDA_CHECK(cudaMemcpy(hDlogitsRef.data(),   dDlogitsRef,   hDlogitsRef.size()   * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDlogitsChunk.data(), dDlogitsChunk, hDlogitsChunk.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(&hLossRef,   dLossRef,   sizeof(double), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(&hLossChunk, dLossChunk, sizeof(double), cudaMemcpyDeviceToHost));
+
+    cudaFree(dLogits); cudaFree(dTargets); cudaFree(dLengths);
+    cudaFree(dDlogitsRef); cudaFree(dDlogitsChunk); cudaFree(dLossRef); cudaFree(dLossChunk);
+
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < hDlogitsRef.size(); ++i) {
+        const double d = static_cast<double>(hDlogitsChunk[i]) - hDlogitsRef[i];
+        num += d * d;
+        den += static_cast<double>(hDlogitsRef[i]) * hDlogitsRef[i];
+    }
+    if (out_relL2_dlogits) *out_relL2_dlogits = std::sqrt(num / std::max(den, 1e-30));
+    if (out_reldiff_loss)  *out_reldiff_loss  = std::fabs(hLossChunk - hLossRef) / std::max(1e-12, std::fabs(hLossRef));
+    return 0;
+}
+
 // Register/local-memory-spill regression guard for the five flash-attention kernels: query the
 // ACTUAL compiled kernel attributes via the CUDA runtime (cudaFuncGetAttributes), not by parsing
 // ptxas -v text output -- deterministic and load-independent, same philosophy as the speedup RATIO
@@ -2954,8 +3750,14 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
 }
 
 // This build's model dimensions, packaged for the pure footprint model (sub0/memplan.hpp).
+// `tied` must match USE_TIED_EMBEDDINGS: param_floats()'s head term (and every persistent-byte
+// prediction downstream of it) differs by VOCAB*(D_MODEL+1) floats otherwise -- missed on the first
+// pass (this Dims instance is separate from cuda_tests.cpp's own kTestDims and the configurator's
+// own Dims construction; all three needed the same fix independently), caught by "memplan prediction
+// matches measured device usage" failing at a real tied+GPU production build. `qk_norm` must match
+// USE_QK_NORM the same way (adds the q_norm/k_norm gamma floats + the qk_pre training scratch term).
 static constexpr sub0::memplan::Dims kFootprintDims{
-    D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+    D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, USE_TIED_EMBEDDINGS, USE_QK_NORM,
 };
 
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device

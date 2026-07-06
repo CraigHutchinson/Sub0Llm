@@ -42,6 +42,14 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+  #define NOMINMAX
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>   // GlobalMemoryStatusEx -- total_physical_ram_bytes() below
+#else
+  #include <unistd.h>    // sysconf -- total_physical_ram_bytes() below
+#endif
+
 #include <CLI/CLI.hpp>
 
 #include "sub0/memplan.hpp"  // train_resident_mb: predict the GPU batch footprint to fail misconfig early
@@ -57,6 +65,18 @@ namespace tok = sub0::tok;
 
 namespace {
 
+// Total physical RAM in bytes (0 if it cannot be determined -- should_pretokenize treats that as
+// "don't block on it"). Only consumer is the --corpus-pretok AUTO resolution below.
+std::uintmax_t total_physical_ram_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX st{}; st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? static_cast<std::uintmax_t>(st.ullTotalPhys) : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGE_SIZE);
+    return (pages > 0 && page_size > 0)
+        ? static_cast<std::uintmax_t>(pages) * static_cast<std::uintmax_t>(page_size) : 0;
+#endif
+}
 
 constexpr std::size_t CHUNK_BYTES = 32u << 20;  // ~32 MB per streamed corpus chunk
 
@@ -322,6 +342,51 @@ bool load_scan_state(const std::string& path, const std::string& corpus, sub0::t
     return static_cast<bool>(is);
 }
 
+// --- Tokenizer/corpus.tok reuse stamp -------------------------------------------------------
+// The scan cache above (.words) only skips passes 1-2; the vocab LEARN (EM/prune) and the full
+// corpus.tok tokenize pass (Pass 3) are far more expensive for a large corpus, and both are pure
+// functions of exactly three things beyond the corpus bytes themselves: vocab_target, min_merge,
+// and whether corpus.tok was requested at all (the tokenizer scheme is always JOIN, so it is not
+// a variable). When those and the corpus are unchanged since the last configure run, and
+// tokenizer.tok/corpus.tok already exist and parse, re-deriving the SAME tokenizer and
+// re-encoding the SAME corpus into the SAME bytes is pure waste -- for a FineWeb-scale corpus
+// that waste dominates a `sub0llm-configure` re-run made only to change an unrelated knob
+// (precision, dims, tune-cache). Stamped next to tokenizer.tok, validated the same way as the
+// scan cache (corpus size+mtime+version) plus the learn parameters.
+constexpr std::uint32_t TOKSTAMP_MAGIC   = 0x53543053u;  // "S0TS"
+constexpr std::uint32_t TOKSTAMP_VERSION = 1u;
+
+void save_tok_stamp(const std::string& path, const std::string& corpus,
+                     int vocab_target, int min_merge, int emit_tok) {
+    std::ofstream os(path, std::ios::binary);
+    if (!os) { std::println(stderr, "warning: cannot write tokenizer stamp '{}'", path); return; }
+    std::error_code ec;
+    wr(os, TOKSTAMP_MAGIC); wr(os, TOKSTAMP_VERSION);
+    wr(os, static_cast<std::uint64_t>(std::filesystem::file_size(corpus, ec)));
+    wr(os, static_cast<std::int64_t>(std::filesystem::last_write_time(corpus, ec).time_since_epoch().count()));
+    wr(os, static_cast<std::int32_t>(vocab_target));
+    wr(os, static_cast<std::int32_t>(min_merge));
+    wr(os, static_cast<std::int32_t>(emit_tok));
+}
+
+// True iff the stamp at `path` was written for this exact (corpus size+mtime, vocab_target,
+// min_merge, emit_tok) combination. Absent, stale or malformed -> false (fall back to a full run).
+bool tok_stamp_matches(const std::string& path, const std::string& corpus,
+                        int vocab_target, int min_merge, int emit_tok) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return false;
+    if (rd<std::uint32_t>(is) != TOKSTAMP_MAGIC || rd<std::uint32_t>(is) != TOKSTAMP_VERSION) return false;
+    std::error_code ec;
+    if (rd<std::uint64_t>(is) != static_cast<std::uint64_t>(std::filesystem::file_size(corpus, ec))) return false;
+    if (rd<std::int64_t>(is) !=
+        static_cast<std::int64_t>(std::filesystem::last_write_time(corpus, ec).time_since_epoch().count()))
+        return false;
+    if (rd<std::int32_t>(is) != static_cast<std::int32_t>(vocab_target)) return false;
+    if (rd<std::int32_t>(is) != static_cast<std::int32_t>(min_merge)) return false;
+    if (rd<std::int32_t>(is) != static_cast<std::int32_t>(emit_tok)) return false;
+    return static_cast<bool>(is);
+}
+
 // Readable vocabulary-analysis dumps (--dump-vocab). Three files for reviewing how the tokenizer
 // compacts the corpus and whether the vocab size / BPE merges are well spent:
 //   <prefix>.corpus_vocab.txt — every unique word-unit (truecased) + occurrence count, freq-desc.
@@ -498,6 +563,14 @@ int main(int argc, char** argv) {
     int n_heads      = 0;
     int seq_len      = 0;
     int ternary      = 0;
+    int gated_ffn    = 0;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
+                                 // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family
+                                 // convention, for importing open weights of that shape
+    int tie_embeddings = 0;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
+                                 // matrix+bias -- a real param-count win at this project's small-model
+                                 // scale (embedding+head is often the biggest single param chunk)
+    int qk_norm      = 0;       // 1 = RMSNorm applied per-head to Q/K right after their projection,
+                                 // before RoPE (Gemma2-style) -- stabilizes attention-logit magnitude
     int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
     double rope_theta = 10000.0;// RoPE frequency base
     int bf16         = 2;       // float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)
@@ -505,7 +578,7 @@ int main(int argc, char** argv) {
     int prec_act     = 9;       // saved-activation storage precision: same codes; 9=AUTO
     int vocab_target = 0;       // 0 = auto-size from corpus scale (autosize_dims.vocab); nonzero pins it
     int min_merge    = 2;
-    int emit_tok     = 1;
+    int emit_tok     = 2;       // pretokenize corpus.tok: 0=off, 1=on, 2=AUTO (by corpus size vs half RAM)
     std::string tune_cache = sub0::build_facts::GEN_TUNE_CACHE;  // default: the build's tune cache
     int has_cuda    = sub0::build_facts::HAS_CUDA;      // 1 = the CUDA device-training backend was BUILT
     int cuda_arch   = sub0::build_facts::CUDA_ARCH;     // GPU compute capability as an int (e.g. 120 for sm_120)
@@ -524,6 +597,18 @@ int main(int argc, char** argv) {
     app.add_option("--heads",  n_heads, "Attention head count (0 = auto)")->capture_default_str();
     app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--gated-ffn", gated_ffn,
+                   "1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the plain "
+                   "2-matrix GELU+bias FFN -- for importing GGUF/Llama-family weights (CPU-only today)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--tie-embeddings", tie_embeddings,
+                   "1 = the LM head reuses the token embedding matrix (transposed) instead of its own "
+                   "matrix+bias -- fewer params, no separate head weight")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--qk-norm", qk_norm,
+                   "1 = RMSNorm applied per-head to Q/K right after their projection, before RoPE "
+                   "(Gemma2-style) -- stabilizes attention-logit magnitude")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--pos-encoding", pos_encoding,
                    "Positional encoding scheme: 0 = absolute learned, 1 = RoPE (rotary)")
@@ -544,8 +629,10 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--corpus-pretok", emit_tok,
                    "1 = pre-tokenize the whole corpus to corpus.tok; 0 = skip it and let training tokenize "
-                   "on demand (avoids the ~2x-on-disk token copy for a huge corpus)")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "on demand (avoids the on-disk token copy -- corpus.tok is itself ~0.6x the source size "
+                   "-- for a corpus too large to keep resident); 2 = AUTO (by corpus size vs half of "
+                   "physical RAM)")
+       ->capture_default_str()->check(CLI::Range(0, 2));
     app.add_option("--tune-cache", tune_cache,
                    "Persisted tuned-defaults cache; read to bake DEFAULT_THREADS / DEFAULT_WINDOWS_PER_THREAD")
        ->capture_default_str();
@@ -574,23 +661,52 @@ int main(int argc, char** argv) {
         std::println(stderr, "configure warning: --compute={} requested but no CUDA backend is built; using CPU", compute);
         compute = 0;
     }
+    // Gated (SwiGLU) FFN is CPU-only for now -- the CUDA backend has no kernel for it yet (a build
+    // that tried would fail loud at compile time via a static_assert in backend_cuda.cu regardless,
+    // but catching it here is a clearer, earlier error). Same shape of restriction as ternary's.
+    if (gated_ffn && compute != 0) {
+        std::println(stderr, "configure error: --gated-ffn=1 is CPU-only for now (no CUDA kernel yet); "
+                             "pass --compute 0, or drop --gated-ffn.");
+        return 1;
+    }
+    // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
+    // gated purely by `if constexpr (USE_TIED_EMBEDDINGS)` at each forward/backward call site -- no
+    // static_assert restriction left for this axis), so --tie-embeddings=1 is now valid with any
+    // --compute backend. QK-norm: GPU support landed the same way (qknorm_act_kernel/
+    // qknorm_backward_act_kernel in backend_cuda.cu, `if constexpr (USE_QK_NORM)`-gated at each
+    // forward/backward call site) -- --qk-norm=1 is now valid with any --compute backend too.
+    // (Ternary/gated-FFN remain CPU-only -- see their own checks above.)
 
     // Resolve the model dims with precedence CLI (nonzero) > <corpus>.model sidecar > auto-size, so a
     // pinned size PERSISTS across re-runs (a build-time auto-regen keeps it). Seed the sidecar if
     // absent so it is there to edit. The corpus file exists (required + ExistingFile).
+    std::error_code corpus_size_ec;
+    const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, corpus_size_ec);
     {
-        std::error_code ec;
-        const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, ec);
         const std::string sidecar = corpus + ".model";
         sub0::config::ModelDims dims{d_model, n_layers, n_heads, seq_len, vocab_target};   // CLI (0 = auto)
         bool have_sidecar = false;
         if (std::ifstream sf(sidecar); sf) { dims = sub0::config::fill_defaults(dims, sub0::config::parse_model_sidecar(sf)); have_sidecar = true; }
-        dims = sub0::config::apply_autosize(dims, ec ? 0 : corpus_bytes);                  // fill the rest
+        dims = sub0::config::apply_autosize(dims, corpus_size_ec ? 0 : corpus_bytes);       // fill the rest
         d_model = dims.d_model; n_layers = dims.n_layers; n_heads = dims.n_heads; seq_len = dims.seq_len; vocab_target = dims.vocab;
         if (!have_sidecar) { if (std::ofstream sf(sidecar); sf) sf << sub0::config::format_model_sidecar(dims); }
         std::println(stderr, "model dims: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} ({}; CLI pins)",
-                     (ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target,
+                     (corpus_size_ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target,
                      have_sidecar ? "from " + std::filesystem::path(sidecar).filename().string() : "auto-sized + seeded sidecar");
+    }
+
+    // --corpus-pretok AUTO (2): resolve by corpus size vs half of physical RAM, mirroring the old
+    // CMake-level heuristic (now removed -- the corpus path used to have to be a CMake cache variable
+    // for this decision to see it; the tool has --corpus directly, so the decision belongs here).
+    if (emit_tok == 2) {
+        const std::uintmax_t ram_bytes = total_physical_ram_bytes();
+        const bool pretok = sub0::config::should_pretokenize(corpus_size_ec ? 0 : corpus_bytes, ram_bytes);
+        std::println(stderr, "corpus.tok: --corpus-pretok=AUTO -> {} (corpus {:.0f} MB est-tok {:.0f} MB vs {:.0f} MB half-RAM)",
+                     pretok ? "emit" : "skip (on-demand)",
+                     (corpus_size_ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6),
+                     (corpus_size_ec ? 0.0 : static_cast<double>(corpus_bytes) * 2 / 1e6),
+                     static_cast<double>(ram_bytes) / 2e6);
+        emit_tok = pretok ? 1 : 0;
     }
 
     if (d_model % n_heads != 0) {
@@ -598,8 +714,39 @@ int main(int argc, char** argv) {
                      d_model, n_heads);
         return 1;
     }
+    // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
+    // so the two styles land at roughly the same total FFN param count -- see d_ff_for's doc comment.
+    const int d_ff = sub0::config::d_ff_for(d_model, gated_ffn != 0);
 
     const std::string abspath = std::filesystem::absolute(corpus).string();
+
+    const std::filesystem::path gen_dir        = std::filesystem::path(out).parent_path();
+    const std::filesystem::path tok_path       = gen_dir / "corpus.tok";
+    const std::filesystem::path tkz_path       = gen_dir / "tokenizer.tok";
+    const std::filesystem::path tok_stamp_path = gen_dir / "tokenizer.stamp";
+
+    // ----------------------------------------------------------------------
+    // Reuse fast-path: tokenizer.tok/corpus.tok are pure functions of the corpus bytes +
+    // vocab_target + min_merge + emit_tok (see tok_stamp_matches above). When the stamp says
+    // none of those changed since the last configure run, and the files still parse, skip the
+    // scan/learn/tokenize entirely -- a re-run made only to change an unrelated knob (a dims
+    // pin, precision, tune-cache) would otherwise re-tokenize a FineWeb-scale corpus for
+    // nothing. Never applies in --dump-vocab analysis mode, which needs the full scan
+    // regardless of what is already on disk.
+    // ----------------------------------------------------------------------
+    tok::Tokenizer tkz;
+    bool reused = false;
+    if (dump_vocab.empty() &&
+        tok_stamp_matches(tok_stamp_path.string(), corpus, vocab_target, min_merge, emit_tok)) {
+        std::ifstream tzin(tkz_path, std::ios::binary);
+        if (tzin && tok::deserialize(tkz, tzin)) {
+            reused = true;
+            if (emit_tok) {
+                const sub0::TokMap tm(tok_path.string());   // corpus.tok must also exist and match
+                reused = tm.ok() && tm.vocab() == tkz.vocab;
+            }
+        }
+    }
 
     // ----------------------------------------------------------------------
     // Out-of-core tokenization: the corpus is STREAMED in newline-aligned chunks (never
@@ -613,17 +760,30 @@ int main(int argc, char** argv) {
     // Phase timers: corpus ingest is the cost that grows with the corpus, so it is the
     // baseline to optimise against (caching the scan + parallelising the passes are levers).
     const auto _t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point _t1 = _t0, _t2 = _t0, _t3 = _t0, _t4 = _t0;
+
+    tok::Scan S;
+    std::unordered_set<std::string> attested;
+    long long names_withheld = 0;
+    std::size_t token_count = 0, doc_count = 0;
+    bool tok_rt = true;
+
+    if (reused) {
+        if (emit_tok) {
+            const sub0::TokMap tm(tok_path.string());
+            token_count = tm.tokens().size();
+            doc_count   = tm.doc_starts().size();
+        }
+        std::println(stderr, "reuse: tokenizer.tok{} unchanged since the last configure (corpus + vocab {} + "
+                     "min-merge {} match) -- scan/learn/tokenize skipped",
+                     emit_tok ? " + corpus.tok" : "", vocab_target, min_merge);
+    } else {
 
     // The expensive corpus scan (passes 1-2) produces a bounded ScanState. Cache it next to
     // the corpus (<corpus>.words, validated by size+mtime+version) so a re-run with a
     // different vocab, after a crash, or to re-tokenize for a new scheme reloads it and SKIPS
     // the scan. The name COUNTS are kept (not just the derived `attested`) so the state is
     // mergeable for a future multi-corpus / incremental tokenizer.
-    tok::Scan S;
-    std::unordered_set<std::string> attested;
-    long long names_withheld = 0;
-
-    std::chrono::steady_clock::time_point _t1{}, _t2{};
     const std::string cache_path = std::string(corpus) + ".words";
     if (load_scan_state(cache_path, corpus, S)) {
         attested = tok::derive_attested(S, &names_withheld);
@@ -696,7 +856,7 @@ int main(int argc, char** argv) {
     lopts.max_learn_words = 2'000'000;            // frequent-word head for the EM/prune (near-lossless)
     const auto _tl0 = std::chrono::steady_clock::now();
     std::println(stderr, "learning {} vocab from {} unique words (unigram, multi-threaded)...", vocab_target, S.word_syms.size());
-    const tok::Tokenizer tkz = tok::learn(S, attested, lopts);   // always JOIN scheme
+    tkz = tok::learn(S, attested, lopts);   // always JOIN scheme (fills the outer tkz declared above)
     {   // Post-learn summary: the FINAL vocabulary + the compression it achieves over the word corpus
         // (word bytes / word tokens, from the now-remapped S.word_syms). This is the headline "how many
         // tokens did we settle on" the long tokenize pass below is about to encode the corpus into.
@@ -725,46 +885,25 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Aliases so the downstream emit / reporting code reads the learned tokenizer + scan stats.
-    const auto& word_syms   = S.word_syms;   // now final token-id sequences
-    const auto& expansion   = tkz.expansion;
-    const int   n_base      = tkz.n_base;
-    const int   vocab       = tkz.vocab;
-    const auto& merges      = tkz.merges;
-    auto sym_to_base = [&](int s) -> int {   // marker/byte symbol -> base id (configurator reporting)
-        if (s == sub0::casing::TOK_CAP) return tkz.cap_id;
-        if (s == sub0::casing::TOK_UP)  return tkz.up_id;
-        return tkz.byte_base[static_cast<unsigned char>(s)];
-    };
-    const sub0::casing::TokStats& st = S.st;
-    const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
-    const long long quote_repl = S.quote_repl;
-
-    const auto _t3 = std::chrono::steady_clock::now();
-
-    const std::filesystem::path gen_dir  = std::filesystem::path(out).parent_path();
-    const std::filesystem::path tok_path = gen_dir / "corpus.tok";
-    const std::filesystem::path tkz_path = gen_dir / "tokenizer.tok";
+    _t3 = std::chrono::steady_clock::now();
 
     // --- Pass 3 (optional): stream the corpus once more and emit the merged token stream to
     //     corpus.tok incrementally (never materialised in memory). Skipped when --corpus-pretok
     //     0: training then tokenizes windows on demand from the raw corpus + tokenizer.tok,
-    //     avoiding the ~2x-on-disk token copy for a huge corpus. Each word unit looks up its
-    //     post-BPE id sequence in the table; standalone symbols map straight to base ids.
+    //     avoiding the on-disk token copy (corpus.tok is itself ~0.6x the source size, see
+    //     should_pretokenize in config_util.hpp) for a corpus too large to keep resident. Each word
+    //     unit looks up its post-BPE id sequence in the table; standalone symbols map straight to base ids.
     //     Losslessness is verified per chunk by reconstructing the base symbols; the id
     //     array's length is back-patched after the count is known.
-    std::size_t token_count = 0;
-    std::size_t doc_count   = 0;
-    bool tok_rt = true;
     const std::filesystem::path tok_tmp_path = tok_path.string() + ".tmp";
     if (emit_tok) {
         std::ofstream ts(tok_tmp_path, std::ios::binary);
         if (!ts) { std::println(stderr, "configure error: cannot write '{}'", tok_tmp_path.string()); return 1; }
         // v2 corpus.tok: u64 counts (a 46 GB corpus is ~14B tokens, past the legacy u32) + the minimal
         // byte-aligned token width for this vocab (16/24/32 bits) instead of a fixed int32.
-        sub0::TokWriter tw(ts, vocab);
+        sub0::TokWriter tw(ts, tkz.vocab);
         std::vector<std::uint8_t> pack_scratch;
-        std::println(stderr, "corpus.tok: {} bits/token (vocab {})", tw.bytes_per_token() * 8, vocab);
+        std::println(stderr, "corpus.tok: {} bits/token (vocab {})", tw.bytes_per_token() * 8, tkz.vocab);
         // Document boundaries: PREFERRED signal is the explicit eos_id token (the literal
         // `<|endoftext|>` marker the extraction scripts insert between documents, see casing.hpp's
         // TOK_EOS comment) -- unambiguous, unlike a blank line which also occurs mid-document as an
@@ -877,7 +1016,7 @@ int main(int argc, char** argv) {
         std::error_code ec;
         std::filesystem::remove(tok_path, ec);
     }
-    const auto _t4 = std::chrono::steady_clock::now();
+    _t4 = std::chrono::steady_clock::now();
 
     // 9. Write the runtime tokenizer (base alphabet + merges + attested words).
     //    Generation uses this to encode prompts and detokenize output; training
@@ -891,12 +1030,20 @@ int main(int argc, char** argv) {
         atomic_replace(tkz_tmp_path, tkz_path);
     }
 
+    // Stamp tokenizer.tok/corpus.tok with the inputs that produced them, so a future configure
+    // run against the same corpus + vocab_target + min_merge + emit_tok hits the reuse fast-path
+    // above instead of re-deriving them.
+    save_tok_stamp(tok_stamp_path.string(), corpus, vocab_target, min_merge, emit_tok);
+    }  // end fresh (!reused) branch
+
+    const int n_base = tkz.n_base, vocab = tkz.vocab;
+
     // 10. Emit the generated headers, SPLIT so the corpus and the machine vary independently:
     //   sub0_corpus.hpp  -- model dims + vocab + tokenizer scheme + artifact paths (frozen per corpus)
     //   sub0_system.hpp  -- precision + cached hardware facts + tuned runtime defaults (per machine)
     //   <out> (sub0_config.hpp) -- a thin umbrella that #includes both (what the engine includes).
     // See docs/CONFIGURE_ARCHITECTURE.md.
-    std::ofstream cos(gen_dir / "sub0_corpus.hpp", std::ios::binary);   // corpus-specific (gen_dir from step 8)
+    std::ofstream cos(gen_dir / "sub0_corpus.hpp", std::ios::binary);   // corpus-specific
     std::ofstream sos(gen_dir / "sub0_system.hpp", std::ios::binary);   // system-specific
     std::ofstream os(out, std::ios::binary);                            // umbrella
     if (!cos || !sos || !os) { std::println(stderr, "configure error: cannot write the generated headers in '{}'", gen_dir.string()); return 1; }
@@ -954,7 +1101,12 @@ int main(int argc, char** argv) {
     // broken, but is not a bet worth relying on for other dims/cards.
     if (has_cuda && gpu_vram_mb > 0) {
         const sub0::memplan::u64 act_bytes = (act_dt == "BF16") ? 2 : sub0::memplan::FLOAT;
-        const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, 4 * d_model, seq_len, vocab };
+        // tied=true drops param_floats()'s lm_head/lm_bias term (see memplan.hpp); must match
+        // USE_TIED_EMBEDDINGS or this VRAM prediction over-estimates a tied model's footprint.
+        // qk_norm=true adds the q_norm/k_norm gamma floats + the qk_pre training scratch term;
+        // must match USE_QK_NORM the same way.
+        const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, d_ff, seq_len, vocab,
+                                         tie_embeddings != 0, qk_norm != 0 };
         const int need = sub0::memplan::train_resident_mb(dims, default_gpu_batch, act_bytes);
         if (need > gpu_vram_mb) {
             const int fit = sub0::memplan::max_batch_for_vram(dims, gpu_vram_mb, default_gpu_batch, act_bytes);
@@ -982,9 +1134,22 @@ int main(int argc, char** argv) {
     cos << "constexpr int  N_LAYERS    = " << n_layers << ";\n";
     cos << "constexpr int  N_HEADS     = " << n_heads  << ";\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
-    cos << "constexpr int  D_FF        = 4 * D_MODEL;\n";
+    // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
+    // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.
+    cos << "constexpr int  D_FF        = " << d_ff << ";\n";
     cos << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
+    // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
+    // include/sub0/layout.hpp. CPU-only for now (guarded above and by a backend_cuda.cu static_assert).
+    cos << "constexpr bool USE_GATED_FFN = " << (gated_ffn ? "true" : "false") << ";\n";
+    // Tied embeddings: the LM head reuses tok_emb (transposed) instead of its own matrix+bias --
+    // see op_tied_head in backend_cpu.cpp. No dims/checkpoint-shape interaction with USE_GATED_FFN,
+    // the two are independent axes.
+    cos << "constexpr bool USE_TIED_EMBEDDINGS = " << (tie_embeddings ? "true" : "false") << ";\n";
+    // QK-norm: RMSNorm applied per-head to Q/K right after their projection, before RoPE -- see
+    // op_qknorm in backend_cpu.cpp (CPU) / qknorm_act_kernel in backend_cuda.cu (GPU). Valid with
+    // any --compute backend; independent axis from USE_GATED_FFN/USE_TIED_EMBEDDINGS.
+    cos << "constexpr bool USE_QK_NORM = " << (qk_norm ? "true" : "false") << ";\n";
     cos << "constexpr int  VOCAB       = " << vocab << ";\n";
     cos << "// --- Positional encoding (compile-time) --------------------------------\n";
     cos << "enum class PosEncoding { Absolute, Rope };\n";
@@ -1035,67 +1200,83 @@ int main(int argc, char** argv) {
     os << "#include \"sub0_corpus.hpp\"\n";
     os << "#include \"sub0_system.hpp\"\n";
 
-    // 11. Report the real numbers.
-    const double bytes_per_tok =
-        token_count == 0 ? 0.0 : static_cast<double>(norm_bytes) / static_cast<double>(token_count);
-    std::size_t wordset_bytes = 0;
-    for (const std::string& w : attested) wordset_bytes += w.size() + 1;
+    // 11. Report the real numbers (the full scan/learn diagnostics only apply when this run
+    //     actually derived them; a reused tokenizer gets a short confirmation instead).
+    if (!reused) {
+        const auto& word_syms   = S.word_syms;
+        const auto& merges      = tkz.merges;
+        const sub0::casing::TokStats& st = S.st;
+        const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
+        const long long quote_repl = S.quote_repl;
+        const double bytes_per_tok =
+            token_count == 0 ? 0.0 : static_cast<double>(norm_bytes) / static_cast<double>(token_count);
+        std::size_t wordset_bytes = 0;
+        for (const std::string& w : attested) wordset_bytes += w.size() + 1;
 
-    std::println(stderr, "--- BPE truecasing tokenizer (real numbers) ---");
-    std::println(stderr, "corpus bytes (raw / normalized): {} / {}", raw_bytes, norm_bytes);
-    std::println(stderr, "quote glyphs collapsed:          {}", quote_repl);
-    std::println(stderr, "alpha words (total / unique):    {} / {}", st.words, word_syms.size());
-    std::println(stderr, "  collapsed <|cap|> / <|up|>:    {} / {}", st.cap, st.up);
-    std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
-    std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
-    std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
-    // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme this is the
-    // word-encoding lever: N=1 bare, N=2 one JOIN, N>=3 SPELL-encapsulated -- so N>=3 is the SPELL
-    // rate. Frequency-weighted, so it reflects the real token stream (common words dominate).
-    {
-        long long occ[4] = {0, 0, 0, 0};   // by occurrence: N==1, ==2, ==3, >=4
-        long long tot = 0;
-        for (std::size_t w = 0; w < word_syms.size(); ++w) {
-            const std::size_t N = word_syms[w].size();
-            const long long f = S.word_freq[w];
-            occ[N <= 1 ? 0 : N == 2 ? 1 : N == 3 ? 2 : 3] += f;
-            tot += f;
+        std::println(stderr, "--- BPE truecasing tokenizer (real numbers) ---");
+        std::println(stderr, "corpus bytes (raw / normalized): {} / {}", raw_bytes, norm_bytes);
+        std::println(stderr, "quote glyphs collapsed:          {}", quote_repl);
+        std::println(stderr, "alpha words (total / unique):    {} / {}", st.words, word_syms.size());
+        std::println(stderr, "  collapsed <|cap|> / <|up|>:    {} / {}", st.cap, st.up);
+        std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
+        std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
+        std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
+        // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme this is the
+        // word-encoding lever: N=1 bare, N=2 one JOIN, N>=3 SPELL-encapsulated -- so N>=3 is the SPELL
+        // rate. Frequency-weighted, so it reflects the real token stream (common words dominate).
+        {
+            long long occ[4] = {0, 0, 0, 0};   // by occurrence: N==1, ==2, ==3, >=4
+            long long tot = 0;
+            for (std::size_t w = 0; w < word_syms.size(); ++w) {
+                const std::size_t N = word_syms[w].size();
+                const long long f = S.word_freq[w];
+                occ[N <= 1 ? 0 : N == 2 ? 1 : N == 3 ? 2 : 3] += f;
+                tot += f;
+            }
+            const double d = static_cast<double>(std::max<long long>(1, tot));
+            std::println(stderr, "word sub-token N (by occ):       N1 {:.1f}% / N2 {:.1f}% / N>=3 {:.1f}% (SPELL in join mode)",
+                         100.0 * static_cast<double>(occ[0]) / d, 100.0 * static_cast<double>(occ[1]) / d,
+                         100.0 * static_cast<double>(occ[2] + occ[3]) / d);
         }
-        const double d = static_cast<double>(std::max<long long>(1, tot));
-        std::println(stderr, "word sub-token N (by occ):       N1 {:.1f}% / N2 {:.1f}% / N>=3 {:.1f}% (SPELL in join mode)",
-                     100.0 * static_cast<double>(occ[0]) / d, 100.0 * static_cast<double>(occ[1]) / d,
-                     100.0 * static_cast<double>(occ[2] + occ[3]) / d);
-    }
-    if (emit_tok) {
-        std::println(stderr, "total tokens:                    {}", token_count);
-        std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
-        std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
+        if (emit_tok) {
+            std::println(stderr, "total tokens:                    {}", token_count);
+            std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
+            std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
+        } else {
+            std::println(stderr, "corpus.tok:                      skipped (--corpus-pretok 0; on-demand)");
+        }
+        std::println(stderr, "attested words / table size:     {} / {} bytes ({:.1f} KB)",
+                     attested.size(), wordset_bytes, wordset_bytes / 1024.0);
+        // Ingest throughput: the baseline to optimise (it scales with the corpus). "MB/s corpus"
+        // is corpus bytes / wall time even though the corpus is read 2-3x -- the rate that matters
+        // for "how long to ingest this corpus". The streaming passes are the parallelisation target.
+        {
+            const auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+            const double total = sec(_t0, _t4);
+            const double cmb   = static_cast<double>(raw_bytes) / 1e6;
+            std::println(stderr,
+                "ingest: {:.2f} GB | pass1 {:.1f}s | pass2 {:.1f}s | BPE {:.1f}s | pass3 {:.1f}s | total {:.1f}s ({:.0f} MB/s corpus)",
+                static_cast<double>(raw_bytes) / 1e9, sec(_t0, _t1), sec(_t1, _t2), sec(_t2, _t3), sec(_t3, _t4),
+                total, total > 0 ? cmb / total : 0.0);
+        }
+        std::println(stderr, "round-trip truecase / tokenize:  OK / {}", tok_rt ? "OK" : "FAIL");
+        std::println(stderr, "corpus.tok / tokenizer.tok:      {} | {}",
+                     emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
+        std::println(stderr, "-----------------------------------------------");
+        if (!tok_rt) { std::println(stderr, "configure error: tokenization round-trip failed"); return 1; }
     } else {
-        std::println(stderr, "corpus.tok:                      skipped (--corpus-pretok 0; on-demand)");
+        std::println(stderr, "--- BPE truecasing tokenizer (reused, unchanged since the last configure) ---");
+        std::println(stderr, "base symbols / vocab:            {} / {}", n_base, vocab);
+        if (emit_tok) std::println(stderr, "total tokens / documents:        {} / {}", token_count, doc_count);
+        std::println(stderr, "corpus.tok / tokenizer.tok:      {} | {}",
+                     emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
+        std::println(stderr, "-----------------------------------------------");
     }
-    std::println(stderr, "attested words / table size:     {} / {} bytes ({:.1f} KB)",
-                 attested.size(), wordset_bytes, wordset_bytes / 1024.0);
-    // Ingest throughput: the baseline to optimise (it scales with the corpus). "MB/s corpus"
-    // is corpus bytes / wall time even though the corpus is read 2-3x -- the rate that matters
-    // for "how long to ingest this corpus". The streaming passes are the parallelisation target.
-    {
-        const auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-        const double total = sec(_t0, _t4);
-        const double cmb   = static_cast<double>(raw_bytes) / 1e6;
-        std::println(stderr,
-            "ingest: {:.2f} GB | pass1 {:.1f}s | pass2 {:.1f}s | BPE {:.1f}s | pass3 {:.1f}s | total {:.1f}s ({:.0f} MB/s corpus)",
-            static_cast<double>(raw_bytes) / 1e9, sec(_t0, _t1), sec(_t1, _t2), sec(_t2, _t3), sec(_t3, _t4),
-            total, total > 0 ? cmb / total : 0.0);
-    }
-    std::println(stderr, "round-trip truecase / tokenize:  OK / {}", tok_rt ? "OK" : "FAIL");
-    std::println(stderr, "corpus.tok / tokenizer.tok:      {} | {}",
-                 emit_tok ? tok_path.string() : std::string("(on-demand)"), tkz_path.string());
-    std::println(stderr, "-----------------------------------------------");
-    if (!tok_rt) { std::println(stderr, "configure error: tokenization round-trip failed"); return 1; }
 
-    std::println("sub0-configure: vocab={} (base {} + {} {}), d={} L={} H={} seq={}{} -> {}",
+    std::println("sub0-configure: vocab={} (base {} + {} {}), d={} L={} H={} seq={}{}{}{}{} -> {}",
                  vocab, n_base, vocab - n_base, tkz.max_piece > 0 ? "unigram pieces" : "BPE merges",
                  d_model, n_layers, n_heads, seq_len,
-                 ternary ? " (ternary)" : "", out);
+                 ternary ? " (ternary)" : "", gated_ffn ? " (gated-ffn)" : "",
+                 tie_embeddings ? " (tied)" : "", qk_norm ? " (qk-norm)" : "", out);
     return 0;
 }

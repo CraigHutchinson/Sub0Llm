@@ -37,6 +37,12 @@ extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
 extern "C" int  sub0_cuda_attn_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* out_maxreldiff, double* out_speedup);
 extern "C" int  sub0_cuda_test_accumulate_check(int M, int in, int out, double* out_maxreldiff);
+extern "C" int  sub0_cuda_tied_head_check(int M, int C, int V,
+                                          double* out_relL2_fwd, double* out_relL2_bwd);
+extern "C" int  sub0_cuda_ce_chunk_check(int M, int T, int batch, int chunk_cap,
+                                         double* out_relL2_dlogits, double* out_reldiff_loss);
+extern "C" int  sub0_cuda_qknorm_check(int shape_sel, int rows,
+                                       double* out_relL2_fwd, double* out_relL2_bwd);
 extern "C" int  sub0_cuda_kv_reset();
 extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
 extern "C" int  sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill, int* dq_regs, int* dq_spill,
@@ -289,6 +295,103 @@ TEST_CASE("CUDA attention-only gradient stays aligned with the CPU", "[cuda]") {
     else                                    REQUIRE(rel < 1e-2);
 }
 
+// Bisection probe for tied embeddings specifically: isolate JUST the TokEmb slice of the full
+// gradient vector, the same style as the attention-only bisection above. TokEmb is the ONE tensor
+// that receives TWO distinct backward contributions when USE_TIED_EMBEDDINGS (the embedding-lookup
+// scatter-add AND the tied head's own dY^T.a term, accumulated via launch_tied_head_bwd -- see
+// backward_device in backend_cuda.cu) -- every other tensor gets exactly one. The whole-vector test
+// above ("CUDA backward matches the CPU reduced gradient") already covers this generically (it would
+// catch a badly wrong contribution), but a bug where just ONE of the two contributions is dropped or
+// double-counted could in principle be diluted by the L2 norm of the rest of the gradient; isolating
+// TokEmb directly removes that risk. `if constexpr`-gated so it contributes ZERO assertions (and
+// costs nothing) in the default untied CUDA test build -- only meaningful once a --tie-embeddings 1
+// --compute 1 build actually exercises the tied path.
+TEST_CASE("CUDA tied-embedding gradient (tok_emb) stays aligned with the CPU", "[cuda]") {
+    if constexpr (USE_TIED_EMBEDDINGS) {
+        CudaGuard _cuda_guard;
+        sub0::build_model();
+        sub0_cuda_set_tf32(0);
+        REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+        const int batch = 4, T = 8;
+        std::vector<int> data, ids, targets;
+        std::vector<std::size_t> starts;
+        make_windows(batch, T, 88, data, starts, ids, targets);
+
+        sub0::train_batch(data.data(), starts.data(), batch, T);
+        const std::size_t n = sub0::trainable_floats();
+        const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+        std::vector<float> gpu_grad(n, 0.0f);
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss) == 0);
+
+        double num = 0.0, den = 0.0, maxabs = 0.0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            if (p.kind != sub0::PKind::TokEmb) continue;
+            for (std::size_t i = p.off; i < p.off + p.n(); ++i) {
+                const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+                num += d * d;
+                den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+                maxabs = std::max(maxabs, std::fabs(d));
+            }
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        INFO("tok_emb grad rel-L2 = " << rel << "  max abs = " << maxabs << "  loss = " << loss);
+        REQUIRE(std::isfinite(loss));
+        if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(rel < 0.3);   // BF16: behaviour, not bit-parity
+        else                                    REQUIRE(rel < 1e-2);
+    }
+}
+
+// Bisection probe for QK-norm specifically, the same style as the tied-embedding bisection above:
+// isolate JUST the QNorm/KNorm gamma slices of the full gradient vector. These are the newest tensors
+// in the layout (inserted between Wo and the FFN block -- see layout.hpp) and the whole-vector test
+// above ("CUDA backward matches the CPU reduced gradient") already covers them generically, but a bug
+// specific to qknorm_backward_act_kernel's atomicAdd dgamma accumulation (e.g. one layer's gamma
+// picking up another layer's contribution, or the in-place dy->dx overwrite corrupting a later read)
+// could in principle be diluted by the L2 norm of the rest of the gradient; isolating these two
+// per-layer [1,D_HEAD] slices directly removes that risk. `if constexpr`-gated so it contributes ZERO
+// assertions (and costs nothing) in the default qk-norm-off CUDA test build -- only meaningful once a
+// --qk-norm 1 --compute 1 build actually exercises the QK-norm path.
+TEST_CASE("CUDA QK-norm gradient (q_norm/k_norm) stays aligned with the CPU", "[cuda]") {
+    if constexpr (USE_QK_NORM) {
+        CudaGuard _cuda_guard;
+        sub0::build_model();
+        sub0_cuda_set_tf32(0);
+        REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+        const int batch = 4, T = 8;
+        std::vector<int> data, ids, targets;
+        std::vector<std::size_t> starts;
+        make_windows(batch, T, 99, data, starts, ids, targets);
+
+        sub0::train_batch(data.data(), starts.data(), batch, T);
+        const std::size_t n = sub0::trainable_floats();
+        const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+        std::vector<float> gpu_grad(n, 0.0f);
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss) == 0);
+
+        double num = 0.0, den = 0.0, maxabs = 0.0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            if (p.kind != sub0::PKind::QNorm && p.kind != sub0::PKind::KNorm) continue;
+            for (std::size_t i = p.off; i < p.off + p.n(); ++i) {
+                const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+                num += d * d;
+                den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+                maxabs = std::max(maxabs, std::fabs(d));
+            }
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        INFO("q_norm/k_norm grad rel-L2 = " << rel << "  max abs = " << maxabs << "  loss = " << loss);
+        REQUIRE(std::isfinite(loss));
+        if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(rel < 0.3);   // BF16: behaviour, not bit-parity
+        else                                    REQUIRE(rel < 1e-2);
+    }
+}
+
 // Flash attention FORWARD guard: the tiled kernel (attn_fwd_tiled_kernel, the hot path) must (1)
 // produce the SAME output as the naive reference (attn_train_act_kernel) -- they share the
 // increasing-j online-softmax recurrence, so agreement is to ~bf16 rounding -- and (2) be a good
@@ -336,6 +439,73 @@ TEST_CASE("CUDA gemm/bias_grad/launch_linear_bwd accumulate mode matches a full-
     WARN("accumulate check: max rel diff = " << reldiff);
     REQUIRE(rc == 0);
     REQUIRE(reldiff < 1e-3);
+}
+
+// Dims-independent GEMM check for the tied-embedding head's GPU forward+backward
+// (launch_tied_head / launch_tied_head_bwd -- see backend_cuda.cu). Runs at TWO scales in this one
+// binary (no rebuild needed, unlike the whole-model parity tests below, since C/V here are runtime
+// params, not the baked D_MODEL/VOCAB): a toy scale and a production-like scale matching this
+// project's actual production d448/vocab config, per the project's "test more than one scale"
+// standing rule (a real precedent exists of a bug reproducing only at production dims). This is
+// independent of whether the CURRENT build has USE_TIED_EMBEDDINGS on -- it exercises the raw GEMM
+// primitive directly, so it is meaningful (and cheap) even in the default untied CUDA test build.
+TEST_CASE("CUDA tied-head GEMM forward+backward matches a hand-computed reference", "[cuda]") {
+    CudaGuard _cuda_guard;
+    for (const auto& [M, C, V] : {std::tuple{4, 8, 16}, std::tuple{64, 448, 4306}}) {
+        double fwd_reldiff = 1.0, bwd_reldiff = 1.0;
+        const int rc = sub0_cuda_tied_head_check(M, C, V, &fwd_reldiff, &bwd_reldiff);
+        WARN("tied-head check: M=" << M << " C=" << C << " V=" << V
+             << " | fwd rel-L2 = " << fwd_reldiff << " | bwd rel-L2 = " << bwd_reldiff);
+        REQUIRE(rc == 0);
+        REQUIRE(fwd_reldiff < 1e-3);
+        REQUIRE(bwd_reldiff < 1e-3);
+    }
+}
+
+// Direct correctness proof for ce_backward_kernel's row_offset parameter (head_ce_chunked's chunked
+// lm_head/tied-head/cross-entropy lever, "B1"): chunking a [M,V] logits/dlogits/loss computation over
+// row-chunks must match a single full-M call exactly. Two scales (toy + production-like V), and at
+// EACH scale chunk_cap is chosen to NOT evenly divide M, so the last chunk is deliberately short --
+// stressing exactly the boundary risk (a wrong absolute row index past the first chunk would silently
+// corrupt every subsequent row's window/position lookup, not fail loudly).
+TEST_CASE("CUDA cross-entropy chunking (row_offset) matches a single full-M call", "[cuda]") {
+    CudaGuard _cuda_guard;
+    struct Case { int T, batch, chunk_cap; };
+    for (const auto& c : {Case{8, 3, 7}, Case{256, 3, 300}}) {
+        const int M = c.batch * c.T;
+        double relL2_dlogits = 1.0, reldiff_loss = 1.0;
+        const int rc = sub0_cuda_ce_chunk_check(M, c.T, c.batch, c.chunk_cap, &relL2_dlogits, &reldiff_loss);
+        INFO("last chunk rows = " << (M % c.chunk_cap == 0 ? c.chunk_cap : M % c.chunk_cap));
+        WARN("ce chunk check: M=" << M << " T=" << c.T << " batch=" << c.batch << " chunk_cap=" << c.chunk_cap
+             << " | dlogits rel-L2 = " << relL2_dlogits << " | loss reldiff = " << reldiff_loss);
+        REQUIRE(rc == 0);
+        REQUIRE(relL2_dlogits < 1e-6);
+        REQUIRE(reldiff_loss < 1e-6);
+    }
+}
+
+// Dims-independent CPU-vs-GPU parity check for QK-norm's forward+backward kernels (qknorm_act_kernel /
+// qknorm_save_act_kernel / qknorm_backward_act_kernel), the same convention as the tied-head GEMM check
+// above: TWO shapes in this one binary (H/DH are template params on the kernels, so sub0_cuda_qknorm_check
+// dispatches via an explicit shape_sel rather than taking H/DH at runtime -- see its own comment), a toy
+// scale and a production-like scale (H=7,DH=64 -- this project's actual production d448/N_HEADS=7
+// config), each run at two row counts. Meaningful (and cheap) in ANY CUDA build regardless of whether
+// USE_QK_NORM is on -- it exercises the raw kernels directly, same reasoning as the tied-head check
+// being independent of USE_TIED_EMBEDDINGS. The backward check internally pre-seeds dgamma with a
+// random NONZERO pattern before calling the kernel, proving the atomicAdd ACCUMULATE semantics
+// backward_device's per-layer q_norm/k_norm grad slots rely on (see qknorm_check_impl's own comment).
+TEST_CASE("CUDA QK-norm kernels forward+backward match a hand-computed reference", "[cuda]") {
+    CudaGuard _cuda_guard;
+    struct Case { int shape_sel; int H, DH; int rows; };
+    for (const auto& c : {Case{0, 2, 8, 5}, Case{0, 2, 8, 37}, Case{1, 7, 64, 3}, Case{1, 7, 64, 64}}) {
+        double fwd_relL2 = 1.0, bwd_relL2 = 1.0;
+        const int rc = sub0_cuda_qknorm_check(c.shape_sel, c.rows, &fwd_relL2, &bwd_relL2);
+        WARN("qknorm check: H=" << c.H << " DH=" << c.DH << " rows=" << c.rows
+             << " | fwd rel-L2 = " << fwd_relL2 << " | bwd rel-L2 = " << bwd_relL2);
+        REQUIRE(rc == 0);
+        REQUIRE(fwd_relL2 < 1e-5);   // includes the V-sub-block-untouched check (1e30 sentinel on failure)
+        REQUIRE(bwd_relL2 < 1e-5);
+    }
 }
 
 // Register/local-memory-spill regression guard for the five flash-attention kernels (forward tile +
@@ -571,13 +741,41 @@ TEST_CASE("CUDA forward stays finite under saturating GELU activations", "[cuda]
 }
 
 // This build's dimensions for the pure footprint model (sub0/memplan.hpp), straight from the config.
-static constexpr sub0::memplan::Dims kTestDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+// `tied` must match USE_TIED_EMBEDDINGS -- param_floats()'s head term differs (ln_f alone vs
+// ln_f+lm_head+lm_bias), so a tied build with this left false would fail the very next test.
+// `qk_norm` must match USE_QK_NORM the same way (adds the q_norm/k_norm gamma floats).
+static constexpr sub0::memplan::Dims kTestDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                                                USE_TIED_EMBEDDINGS, USE_QK_NORM };
 
 // The footprint model must agree with the canonical parameter layout: param_floats() re-derives
 // PARAM_FLOATS from dims (so the configurator can call it without layout.hpp). If they diverge,
 // every footprint prediction is wrong by a constant -- catch it here, decoupled from the device.
 TEST_CASE("memplan param_floats matches the canonical layout", "[cuda][memplan]") {
     REQUIRE(sub0::memplan::param_floats(kTestDims) == sub0::trainable_floats());
+}
+
+// Pins logits_n_chunks/logits_chunk_rows' derivation (the "B1" chunked lm_head/CE lever) against
+// hand-computed expectations, independent of any specific build's baked VOCAB/D_FF, so a future change
+// to the ceil(vocab/d_ff)-clamped-to-[1,8] formula is caught here rather than only showing up as a
+// throughput/memory regression later.
+TEST_CASE("memplan logits_n_chunks/logits_chunk_rows match their derivation", "[cuda][memplan]") {
+    CHECK(sub0::memplan::logits_n_chunks(100, 256) == 1);      // vocab < d_ff -> no chunking needed
+    CHECK(sub0::memplan::logits_n_chunks(256, 256) == 1);      // exactly equal -> ceil(1) = 1
+    CHECK(sub0::memplan::logits_n_chunks(257, 256) == 2);      // just over -> ceil(257/256) = 2
+    CHECK(sub0::memplan::logits_n_chunks(2048, 256) == 8);     // ceil(8) = 8, right at the clamp
+    CHECK(sub0::memplan::logits_n_chunks(1000000, 256) == 8);  // far beyond the clamp -> stays 8
+    CHECK(sub0::memplan::logits_n_chunks(16517, 1792) == 8);   // this project's real production dims
+
+    CHECK(sub0::memplan::logits_chunk_rows(2048, 256, 1000) == 125);  // 8 chunks: ceil(1000/8) = 125
+    CHECK(sub0::memplan::logits_chunk_rows(100, 256, 1000) == 1000);  // 1 chunk: the whole thing
+
+    // General property, checked against THIS build's own baked VOCAB/D_FF: chunk_rows * n_chunks must
+    // always cover total_rows (no row left unallocated), and chunk_rows must be no smaller than the
+    // exact (unrounded) even split.
+    const int n = sub0::memplan::logits_n_chunks(VOCAB, D_FF);
+    const auto rows = sub0::memplan::logits_chunk_rows(VOCAB, D_FF, 12345);
+    CHECK(rows * static_cast<sub0::memplan::u64>(n) >= 12345);
+    CHECK(rows >= 12345 / static_cast<sub0::memplan::u64>(n));
 }
 
 // The drift check the whole footprint scheme rests on: predict the resident training VRAM from the

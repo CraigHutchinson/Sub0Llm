@@ -120,6 +120,12 @@ constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop ove
                                               // but-real tails (d96 @1.985 and d128 @2.68 both still
                                               // improving ~1.5%/window) well before the true floor.
 constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
+// Muon's own reference peak lr (github.com/KellerJordan/Muon) -- unrelated in scale to AdamW's
+// batch-derived peak_lr below (Muon's orthogonalized updates have a very different magnitude/
+// geometry from AdamW's per-element-normalized ones), shares the SAME warmup/decay shape via
+// lr_schedule() but at this separate peak. Not batch-scaled: Muon's own convention doesn't use
+// Adam's sqrt(batch) heuristic.
+constexpr float  MUON_LR_BASE        = 0.02f;
 
 
 // Variable-length training: each step draws a window width T in [MIN_TRAIN_SEQ, SEQ_LEN], shared
@@ -149,8 +155,9 @@ const char* tokmap_error(sub0::TokMap::Err e) {
 }
 
 // --- On-demand tokenization (out-of-core, no corpus.tok) --------------------
-// When the build skipped corpus.tok (--corpus-pretok 0) the token copy is never written to
-// disk (~2x saved). Training instead tokenizes contiguous regions of the RAW text corpus
+// When the build skipped corpus.tok (--corpus-pretok 0) the token copy (itself ~0.6x the source
+// size, see should_pretokenize in config_util.hpp) is never written to disk. Training instead
+// tokenizes contiguous regions of the RAW text corpus
 // on the fly with the runtime tokenizer (sub0::encode, which reproduces the configurator's
 // truecasing + BPE) into bounded in-memory buffers: a rotating training buffer refilled
 // from new random regions each interval (so the run still traverses the whole corpus) and
@@ -641,7 +648,9 @@ struct GpuTrainer {
         // scratch in a consistent (if partial) state -- the retry below's OWN reserve call correctly
         // frees and rebuilds from scratch, no special cleanup needed here.
         if (sub0_cuda_train_reserve(batch) != 0) {
-            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+            // tied/qk_norm must match USE_TIED_EMBEDDINGS/USE_QK_NORM -- see memplan.hpp's Dims comments.
+            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                                             USE_TIED_EMBEDDINGS, USE_QK_NORM };
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
             const int free_mb = sub0_cuda_free_vram_mb();
@@ -775,7 +784,8 @@ struct SingleInstanceGuard {
 static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
-                                          int steps, int batch, float lr, unsigned seed, int keep) {
+                                          int steps, int batch, float lr, unsigned seed, int keep,
+                                          int optimizer) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims + git SHA) under the models root and
@@ -798,7 +808,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
                                              static_cast<int>(USE_TERNARY),
-                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA);
+                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA,
+                                             static_cast<int>(USE_GATED_FFN),
+                                             static_cast<int>(USE_TIED_EMBEDDINGS),
+                                             static_cast<int>(USE_QK_NORM));
         model_path = (meta_dir / "model.bin").string();
     }
     // Refuse a second concurrent run against this same model dir (see SingleInstanceGuard above) --
@@ -926,9 +939,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
         train_span = sub0::TokView::over_int32(train_buf.data(), train_buf.size());
         val_span   = sub0::TokView::over_int32(val_buf.data(), val_buf.size());
-        // Estimate tokens/byte from one region to size the epoch schedule (heuristic only).
-        std::vector<int> probe; text.encode_region(0, probe);
-        const double tpb = probe.empty() ? 0.5 : static_cast<double>(probe.size()) / static_cast<double>(OD_REGION_BYTES);
+        // Estimate tokens/byte to size the epoch schedule (heuristic only). Sampled from several
+        // regions spread across the corpus rather than just the first one: token density is not
+        // uniform (FineWeb-style corpora cluster document types), so a single region at offset 0
+        // is a noisy, potentially biased sample -- this was measured to undershoot the true count
+        // by ~4-5% on a real run. Averaging OD_TPB_SAMPLES evenly-spaced regions still reads only a
+        // few hundred KB total (trivial next to a multi-GB corpus) but is far more representative.
+        constexpr int OD_TPB_SAMPLES = 8;
+        std::vector<int> probe;
+        double tpb_sum = 0.0;
+        int    tpb_n   = 0;
+        for (int i = 0; i < OD_TPB_SAMPLES; ++i) {
+            const std::size_t off = (train_byte_hi * static_cast<std::size_t>(i)) / OD_TPB_SAMPLES;
+            probe.clear();
+            text.encode_region(off, probe);
+            if (!probe.empty()) {
+                tpb_sum += static_cast<double>(probe.size()) / static_cast<double>(OD_REGION_BYTES);
+                ++tpb_n;
+            }
+        }
+        const double tpb = tpb_n > 0 ? tpb_sum / tpb_n : 0.5;
         est_train_tokens = static_cast<std::size_t>(static_cast<double>(train_byte_hi) * tpb);
         src_desc = std::format("{} (on-demand; ~{} train tok est / {}-tok shuffle buf / {}-tok val buf)",
                                raw, est_train_tokens, train_buf.size(), val_buf.size());
@@ -951,6 +981,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
         m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
         m.pos_encoding = static_cast<int>(POS_ENCODING);
+        m.gated_ffn = static_cast<int>(USE_GATED_FFN);
+        m.tied_embeddings = static_cast<int>(USE_TIED_EMBEDDINGS);
+        m.qk_norm = static_cast<int>(USE_QK_NORM);
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
@@ -996,7 +1029,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     }
     tokens_seen_est = static_cast<long long>(rs.step) * batch * SEQ_LEN;   // batch/rs.step now resume-final
 
-    sub0::AdamW opt(lr);
+    sub0::AdamW opt(lr, optimizer == 1);
     if (resumed) opt.set_step_count(adam_t);
 
     // Phase 2e: try to run the training loop on the GPU (params resident on device). Falls back
@@ -1004,6 +1037,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // batch exceeds the device's resident scratch width.
     GpuTrainer gpu;
     const bool gpu_train = gpu.enable(batch, opt.step_count());
+    // Muon only affects AdamW::step(), the CPU path -- the GPU path runs its own separate optimizer
+    // kernel (backend_cuda.cu's adam_step_kernel), untouched. Warn rather than silently ignoring the
+    // request: a run that expected Muon and silently got plain AdamW on GPU would be a confusing,
+    // hard-to-notice behavior change.
+    if (optimizer == 1 && gpu_train)
+        sub0::log::warn("--optimizer muon requested but this run is using the GPU path; Muon is "
+                        "CPU-only for now (TODO(muon-gpu)) -- training with AdamW on GPU instead.");
 
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
@@ -1029,6 +1069,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
          on_demand ? " | on-demand" : "");   // the resume is announced prominently above, not buried here
     sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
          peak_lr, batch, lr_warmup_steps);
+    if (opt.use_muon())
+        sub0::log::line("optimizer: Muon (hidden 2D weight matrices) + AdamW (embeddings, head, norms, "
+                        "biases) | muon lr peak {:.2e}", MUON_LR_BASE);
     std::fflush(stdout);
     // Register/refresh the model now that epoch_steps is known -- so meta.txt shows the correct step +
     // epoch immediately (a resume no longer looks like steps=0), and an interrupted run stays discoverable.
@@ -1107,7 +1150,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
-            opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW update
+            opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update
+            if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
+                opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
             cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
             for (int b = 0; b < batch_t; ++b) {
                 train_span.copy_to(starts[b], static_cast<std::size_t>(win_len[b]) + 1,
@@ -1184,9 +1229,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const double wps   = since > 0 ? static_cast<double>(total_windows - windows_at_last_log) / since : 0.0;
             const double frac_epoch = static_cast<double>(step) / epoch_steps;
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
-            const long steps_completed = step - last_log_step;
-            const double eta_next_epoch = (since > 0 && steps_completed > 0)
-                ? static_cast<double>(steps_to_next_epoch) * since / steps_completed : -1.0;
+            // ETA uses the rate over the CUMULATIVE window since the last eval (win_t0/win_steps0,
+            // TICK_SECONDS * many ticks wide), not just the last TICK_SECONDS tick: a single 3-minute
+            // tick's step rate is noisy enough (scheduling jitter, window-length variance) that keying
+            // the ETA off it alone made the printed estimate visibly jump between ticks instead of
+            // converging. The instant `wps` above is still worth showing as-is (it IS the current-tick
+            // rate); only the ETA benefits from the wider, steadier sample.
+            const double eta_secs = std::chrono::duration<double>(clock::now() - win_t0).count();
+            const long   eta_steps_completed = step - win_steps0;
+            const double eta_next_epoch = (eta_secs > 0 && eta_steps_completed > 0)
+                ? static_cast<double>(steps_to_next_epoch) * eta_secs / eta_steps_completed : -1.0;
             sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
                  step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
             std::fflush(stdout);
@@ -1501,11 +1553,20 @@ enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, 
 
 // This build's dimensions for the pure footprint model (sub0/memplan.hpp): lets the GPU sweep
 // predict the resident VRAM a training batch needs BEFORE allocating it, and lets the run
-// cross-check that prediction against the device's actual usage.
-static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+// cross-check that prediction against the device's actual usage. `tied`/`qk_norm` must match
+// USE_TIED_EMBEDDINGS/USE_QK_NORM -- see memplan.hpp's Dims comments.
+static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                                               USE_TIED_EMBEDDINGS, USE_QK_NORM };
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend,
                                         int thorough, int budget_s) {
+    // AUTO resolves to GPU-only when a CUDA device is available: that is the only backend this
+    // project trains against today, and the CPU sweep is both slow (its own search loop) and its
+    // result goes unused by a GPU run. ALL always runs both, for anyone who explicitly wants the CPU
+    // numbers too. Once a real hybrid CPU-offload training path exists, AUTO should decide between
+    // GPU-only and CPU+GPU based on whether tuning the CPU side is actually worthwhile then -- not a
+    // concern yet, so this is deliberately the simple binary case, not a placeholder for it.
+    if (backend == TUNE_BACKEND_AUTO && HAS_CUDA) backend = TUNE_BACKEND_GPU;
     const bool run_cpu = backend != TUNE_BACKEND_GPU;   // gpu-only skips the CPU sweep
     const bool run_gpu = backend != TUNE_BACKEND_CPU;   // cpu-only skips the device-step sweep
 
@@ -2276,14 +2337,17 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
     namespace reg = sub0::registry;
     std::vector<reg::ModelMeta> models = reg::scan(SUB0_MODELS_ROOT);
     std::println("models root: {}  ({} model{})", SUB0_MODELS_ROOT, models.size(), models.size() == 1 ? "" : "s");
-    std::println("this build:  d{} l{} h{} sq{} v{}{}{} @ {}",
+    std::println("this build:  d{} l{} h{} sq{} v{}{}{}{}{}{} @ {}",
                  D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB, USE_TERNARY ? "t" : "",
-                 reg::pos_tag(static_cast<int>(POS_ENCODING)), SUB0_GIT_SHA);
+                 reg::pos_tag(static_cast<int>(POS_ENCODING)), USE_GATED_FFN ? "g" : "",
+                 USE_TIED_EMBEDDINGS ? "w" : "", USE_QK_NORM ? "q" : "", SUB0_GIT_SHA);
     if (models.empty()) { std::println("(none yet -- `sub0llm train` creates one)"); return 0; }
 
     auto loadable = [&](const reg::ModelMeta& m) {
         return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING));
+                               static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
+                               static_cast<int>(USE_GATED_FFN), static_cast<int>(USE_TIED_EMBEDDINGS),
+                               static_cast<int>(USE_QK_NORM));
     };
     std::sort(models.begin(), models.end(),
               [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });

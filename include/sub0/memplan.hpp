@@ -34,6 +34,18 @@ struct Dims {
     int d_ff;      // F: feed-forward width (= 4*C in this engine)
     int seq_len;   // T: context window
     int vocab;     // V: token count
+    // Tied embeddings (USE_TIED_EMBEDDINGS): the LM head reuses tok_emb instead of its own
+    // matrix+bias, dropping param_floats()'s "head" term from ln_f+lm_head+lm_bias down to ln_f
+    // alone (see layout.hpp's make_param_layout tail). Defaults false so every pre-existing
+    // aggregate-init call site (which only lists the first 6 fields) keeps modeling the untied
+    // shape exactly as before -- only a caller that actually builds a tied model needs to pass it.
+    bool tied = false;
+    // QK-norm (USE_QK_NORM): adds a [1,D_HEAD] q_norm + k_norm gamma pair per layer (see layout.hpp's
+    // make_param_layout, inserted between Wo and the FFN block) and one extra TRAINING-only scratch
+    // buffer (the pre-norm Q/K stash backward needs -- see train_scratch_bytes' qk_pre term below).
+    // Defaults false for the same reason `tied` does: every pre-existing aggregate-init call site
+    // keeps modeling the non-qk-norm shape exactly as before.
+    bool qk_norm = false;
 };
 
 using u64 = unsigned long long;
@@ -41,7 +53,6 @@ using u64 = unsigned long long;
 inline constexpr u64 FLOAT = sizeof(float);
 inline constexpr u64 INT   = sizeof(int);
 inline constexpr u64 DBL   = sizeof(double);
-inline constexpr u64 UINT8 = 1;   // g_dev_decay: a 0/1 mask, stored as the narrowest type that holds it
 
 // Hard ceiling on the minibatch any device entry point will size scratch for (backend_cuda.cu
 // validates/clamps against this as MAX_FWD_BATCH). Lives here -- not in the backend -- because it is
@@ -55,18 +66,24 @@ inline constexpr int MAX_DEVICE_BATCH = 4096;
 // footprint test asserts param_floats(dims) == sub0::PARAM_FLOATS, catching any layout drift.
 constexpr u64 param_floats(const Dims& d) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff), T = u64(d.seq_len), V = u64(d.vocab);
+    const u64 H  = u64(d.n_heads), DH = H > 0 ? C / H : 0;   // D_HEAD = C/H
     const u64 emb   = V * C + T * C;            // tok_emb [V,C] + pos_emb [T,C]
     const u64 block = 2 * C                     // ln1 + ln2          [C] each
                     + 4 * C * C                 // Wq Wk Wv Wo        [C,C]
+                    + (d.qk_norm ? 2 * DH : 0)  // q_norm + k_norm [1,D_HEAD] each (USE_QK_NORM only)
                     + 2 * C * F + F + C;         // W1 [C,F], b1 [F], W2 [F,C], b2 [C]
-    const u64 head  = C + C * V + V;            // ln_f [C] + lm_head [C,V] + lm_bias [V]
+    // head: ln_f [C] alone when tied (the head reuses tok_emb, already counted in `emb` above --
+    // no separate lm_head/lm_bias slot, see layout.hpp's make_param_layout); ln_f + lm_head [C,V] +
+    // lm_bias [V] otherwise.
+    const u64 head  = d.tied ? C : (C + C * V + V);
     return emb + L * block + head;
 }
 
-// Persistent, batch-independent device memory: the param mirror (g_dev_params) + the four
-// optimizer arenas (g_dev_grad/m/vel/decay) + the norm accumulator (g_dev_normsq) + the on-device
-// grad-clip scale (g_dev_gs). decay is a uint8 0/1 mask (not float -- narrowed 2026-07, see
-// backend_cuda.cu's opt_alloc/adam_step_kernel).
+// Persistent, batch-independent device memory: the param mirror (g_dev_params) + the three
+// optimizer arenas (g_dev_grad/m/vel) + the norm accumulator (g_dev_normsq) + the on-device
+// grad-clip scale (g_dev_gs). Weight decay costs ZERO persistent bytes (2026-07): it used to be a
+// PARAM_FLOATS-long uint8 mask, now it's a handful of compile-time-known ranges in __constant__
+// memory (g_decay_ranges, backend_cuda.cu) -- see layout.hpp's DECAY_RANGES.
 // A = activation dtype width (FLOAT for an F32 build, 2 for BF16). A BF16 build keeps a second,
 // narrower copy of every GEMM weight (g_w1_16/g_w2_16/g_wo16/g_wqkv16, built DIRECTLY from the F32
 // master by build_qkv_weights()) instead of the F32 fused-QKV staging buffer (g_fwd.wqkv) -- that
@@ -80,11 +97,42 @@ constexpr u64 param_floats(const Dims& d) {
 constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     return 4 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel
-         + param_floats(d) * UINT8              // g_dev_decay (uint8 mask)
          + DBL                                  // g_dev_normsq [1] (double)
          + FLOAT                                // g_dev_gs [1] (on-device grad-clip scale, 2026-07)
          + (A >= FLOAT ? L * (3 * C * C) * FLOAT : 0)           // g_fwd.wqkv[l] = [C,3C] F32 (F32 builds only)
          + (A < FLOAT ? L * (2 * C * F + 4 * C * C) * A : 0);  // BF16-only: g_w1_16+g_w2_16+g_wo16+g_wqkv16
+}
+
+// Row-chunk count for the TRAINING [chunk_rows,V] logits/dlogits scratch buffer (train_alloc /
+// g_tr.logits in backend_cuda.cu -- NOT the inference-only fwd_alloc/g_fwd.logits below, which never
+// runs cross-entropy and stays a plain [M,V] buffer). At this project's typical V >> C/F scale, a
+// full [M,V] logits buffer is the single largest per-window TRAINING scratch buffer (~55-60% of it
+// at production dims) -- see train_scratch_bytes' `logits` term. Chunking the lm_head/tied-head
+// forward -> cross-entropy -> lm_head/tied-head backward chain over row-chunks of the M dimension
+// (instead of one [M,V] shot) lets that one buffer shrink to [chunk_rows,V], reused across chunks.
+//
+// ceil(vocab/d_ff) is the ratio, not a fixed constant: it targets the CHUNKED buffer to land at
+// roughly the same byte-scale as this model's OTHER large per-row activations, which all scale with
+// d_ff (ff1/gact/dff1/dgact, the next-widest per-row buffers after logits) rather than vocab -- i.e.
+// "how many d_ff-sized pieces would a vocab-sized buffer need to be split into to match that scale."
+// Clamped to [1,8]: 1 when vocab is already small relative to d_ff (no chunking needed -- chunk_rows
+// == total_rows, degenerating to exactly today's single-shot behavior, zero overhead); capped at 8
+// because the marginal memory win beyond that is small relative to the extra GEMM/kernel launches per
+// training step -- a real production-dims calculation (D_MODEL=448, D_FF=1792, VOCAB=16517) shows
+// K=8 already captures ~87% of the theoretical maximum reduction this lever can offer (48.9% of
+// 55.9%), while K=16 only adds another ~3.5 percentage points for double the launches.
+constexpr int logits_n_chunks(int vocab, int d_ff) {
+    int k = (vocab + d_ff - 1) / d_ff;   // ceil(vocab/d_ff)
+    if (k < 1) k = 1;
+    if (k > 8) k = 8;
+    return k;
+}
+// Row-chunk CAPACITY: the [chunk_rows,V] training logits/dlogits buffer is allocated ONCE at this
+// size (train_alloc) and reused across every chunk iteration and every training step within the same
+// row budget; `total_rows` is that reserved row budget (train_alloc's Mm, i.e. batch*seq_len).
+constexpr u64 logits_chunk_rows(int vocab, int d_ff, u64 total_rows) {
+    const u64 n = u64(logits_n_chunks(vocab, d_ff));
+    return (total_rows + n - 1) / n;
 }
 
 // Resident forward scratch (fwd_alloc), grown to `batch`. One term per cudaMalloc in fwd_alloc.
@@ -108,7 +156,7 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 final_blk = Mm * C * A            // h_final [M,C] bf16 residual
                         + Mm * C * FLOAT        // a_final [M,C] f32 (lm_head input stays f32)
                         + Mm * FLOAT            // rinv_f  [M]
-                        + Mm * V * FLOAT        // logits  [M,V]
+                        + logits_chunk_rows(int(V), int(F), Mm) * V * FLOAT  // logits [chunk_rows,V] (chunked)
                         + Mm * C * A            // a [M,C] single checkpoint scratch (bf16)
                         + Mm * C * A            // fbuf [M,C] bf16 FFN checkpoint scratch
                         + 2 * Mm * F * A        // ff1, gact  [M,F] bf16 FFN scratch
@@ -124,7 +172,13 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
                         + u64(MAX_DEVICE_BATCH) * INT   // lengths [MAX_DEVICE_BATCH] (constant: covers any
                                                         // effective batch the row budget admits, see train_alloc)
                         + DBL;                  // loss [1] (double)
-    return L * per_layer + final_blk + grad;
+    // qk_pre [M,2C] act_t: the pre-norm Q/K stash QK-norm's backward needs (USE_QK_NORM only). The
+    // backward recompute overwrites g_tr.qkv in place with RoPE's output immediately after the QKV
+    // GEMM, before qknorm's own backward (which sits BEFORE RoPE in the forward graph) ever runs --
+    // by the time it would need the pre-norm values, they no longer survive anywhere else. Zero bytes
+    // when qk_norm is off (the common case).
+    const u64 qk_pre    = d.qk_norm ? Mm * 2 * C * A : 0;
+    return L * per_layer + final_blk + grad + qk_pre;
 }
 
 // Forward scratch a training step keeps resident: only the token-id buffer. Training reads from the
