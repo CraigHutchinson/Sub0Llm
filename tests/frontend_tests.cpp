@@ -100,20 +100,32 @@ TEST_CASE("registry: corpus_tag is a lowercased, filesystem-safe stem", "[fronte
 TEST_CASE("registry: model_dir encodes identity; compatible() gates loading (the prune rule)", "[frontend][registry]") {
     using namespace sub0::registry;
 
-    // The directory name IS the identity: d/l/h/sq/v + ternary/rope tags + git sha (JOIN is the only
-    // tokenizer scheme now, so there is no 'j' tag).
+    // The directory name IS the identity: d/l/h/sq/v + ternary/rope/gated-ffn/tied-embed tags + git
+    // sha (JOIN is the only tokenizer scheme now, so there is no 'j' tag).
     const auto dir = model_dir("models", "data/tinystories.txt", 192, 6, 6, 256, 4306,
                                /*ternary*/0, /*pos=rope*/1, "abc123");
     CHECK(dir.filename().string() == "sub0llm_tinystories_d192l6h6sq256v4306r_abc123");
     CHECK(model_dir("models", "c.txt", 1,1,1,1,1, 0,0, "").filename().string().ends_with("_nogit"));
+    CHECK(model_dir("models", "data/tinystories.txt", 192, 6, 6, 256, 4306,
+                    /*ternary*/0, /*pos=rope*/1, "abc123", /*gated_ffn*/1).filename().string()
+          == "sub0llm_tinystories_d192l6h6sq256v4306rg_abc123");
+    CHECK(model_dir("models", "data/tinystories.txt", 192, 6, 6, 256, 4306,
+                    /*ternary*/0, /*pos=rope*/1, "abc123", /*gated_ffn*/0, /*tied*/1).filename().string()
+          == "sub0llm_tinystories_d192l6h6sq256v4306rw_abc123");
+    CHECK(model_dir("models", "data/tinystories.txt", 192, 6, 6, 256, 4306,
+                    /*ternary*/0, /*pos=rope*/1, "abc123", /*gated_ffn*/0, /*tied*/0, /*qk_norm*/1).filename().string()
+          == "sub0llm_tinystories_d192l6h6sq256v4306rq_abc123");
 
     // compatible(): an exact match loads; ANY differing dimension/flag makes it incompatible -- this is
     // what flagged the pruned d448 v2048 models 'x incompatible architecture' against a d192 v4306 build.
     ModelMeta m;
     m.d_model = 192; m.n_layers = 6; m.n_heads = 6; m.seq_len = 256; m.vocab = 4306;
-    m.ternary = 0; m.pos_encoding = 1;
+    m.ternary = 0; m.pos_encoding = 1; m.gated_ffn = 0; m.tied_embeddings = 0; m.qk_norm = 0;
     CHECK(compatible(m, 192, 6, 6, 256, 4306, 0, 1));            // exact -> loadable
     CHECK_FALSE(compatible(m, 448, 6, 6, 256, 4306, 0, 1));      // d_model differs
     CHECK_FALSE(compatible(m, 192, 6, 6, 256, 2048, 0, 1));      // vocab differs (the pruned case)
     CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 0));      // pos_encoding differs
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 1));   // gated_ffn differs
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 1)); // tied_embeddings differs
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 1)); // qk_norm differs
 }

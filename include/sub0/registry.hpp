@@ -9,7 +9,10 @@
 //
 // The optional suffix letters encode build variants that change the weights' meaning without
 // changing their shape: 't' = ternary block weights, 'r' = RoPE positional encoding (absolute
-// learned positions, the legacy default, are untagged).
+// learned positions, the legacy default, are untagged), 'g' = SwiGLU-gated FFN (the plain
+// GELU+bias FFN, the legacy default, is untagged), 'w' = tied embeddings (the head reuses tok_emb;
+// an untied head, its own matrix+bias, the legacy default, is untagged), 'q' = QK-norm (per-head
+// RMSNorm on Q/K before RoPE; no norm, the legacy default, is untagged).
 //
 // The "registry" is just the set of meta.txt files: discovery scans them (no separate
 // index to drift out of sync), and a model is COMPATIBLE with the current build iff its
@@ -34,6 +37,9 @@ struct ModelMeta {
     std::string corpus, git_sha, created, updated, status;
     int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0, ternary = 0;
     int pos_encoding = 0;                     // 0 = absolute learned (legacy default), 1 = RoPE
+    int gated_ffn = 0;                        // 0 = plain GELU+bias FFN (legacy default), 1 = SwiGLU-gated
+    int tied_embeddings = 0;                  // 0 = untied head (legacy default), 1 = head reuses tok_emb
+    int qk_norm = 0;                          // 0 = no QK-norm (legacy default), 1 = per-head RMSNorm on Q/K
     // Training state (provenance of the run that produced this snapshot).
     long long steps = 0;                      // optimizer iterations completed
     double epochs = 0.0;                      // fractional epochs of the corpus covered
@@ -65,11 +71,13 @@ inline std::string corpus_tag(const std::string& corpus_path) {
 inline std::filesystem::path model_dir(const std::filesystem::path& models_root,
                                        const std::string& corpus, int d, int l, int h,
                                        int seq, int vocab, int ternary, int pos_enc,
-                                       const std::string& sha) {
+                                       const std::string& sha, int gated_ffn = 0,
+                                       int tied_embeddings = 0, int qk_norm = 0) {
     std::string name = "sub0llm_" + corpus_tag(corpus) +
                        "_d" + std::to_string(d) + "l" + std::to_string(l) + "h" + std::to_string(h) +
                        "sq" + std::to_string(seq) + "v" + std::to_string(vocab) +
-                       (ternary ? "t" : "") + pos_tag(pos_enc) +
+                       (ternary ? "t" : "") + pos_tag(pos_enc) + (gated_ffn ? "g" : "") +
+                       (tied_embeddings ? "w" : "") + (qk_norm ? "q" : "") +
                        "_" + (sha.empty() ? "nogit" : sha);
     return models_root / name;
 }
@@ -100,6 +108,9 @@ inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
        << "vocab="           << m.vocab     << "\n"
        << "ternary="         << m.ternary   << "\n"
        << "pos_encoding="    << m.pos_encoding << "\n"
+       << "gated_ffn="       << m.gated_ffn << "\n"
+       << "tied_embeddings=" << m.tied_embeddings << "\n"
+       << "qk_norm="         << m.qk_norm << "\n"
        << "git_sha="         << m.git_sha   << "\n"
        << "created="         << m.created   << "\n"
        << "updated="         << m.updated   << "\n"
@@ -133,6 +144,9 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
         else if (k == "vocab")          m.vocab = as_int(v);
         else if (k == "ternary")        m.ternary = as_int(v);
         else if (k == "pos_encoding")   m.pos_encoding = as_int(v);
+        else if (k == "gated_ffn")      m.gated_ffn = as_int(v);
+        else if (k == "tied_embeddings") m.tied_embeddings = as_int(v);
+        else if (k == "qk_norm")        m.qk_norm = as_int(v);
         else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
         else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
         else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);
@@ -159,13 +173,17 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
 }
 
 // A model loads into the current build only if its architecture dims AND weight-meaning variants
-// (ternary, positional-encoding scheme, tokenizer scheme) match exactly -- a same-shape mismatch
-// would load silently but compute nonsense (the JOIN tokenizer's token ids mean different text).
+// (ternary, positional-encoding scheme, gated-FFN scheme, tied-embeddings scheme, tokenizer scheme)
+// match exactly -- a same-shape mismatch would load silently but compute nonsense (the JOIN
+// tokenizer's token ids mean different text). This is a DIAGNOSTIC check (`models`/`models --prune`);
+// the actual load-time gate is engine_core.cpp's binary Header comparison, which is authoritative
+// regardless of what this says.
 inline bool compatible(const ModelMeta& m, int d, int l, int h, int seq, int vocab, int ternary,
-                       int pos_enc) {
+                       int pos_enc, int gated_ffn = 0, int tied_embeddings = 0, int qk_norm = 0) {
     return m.d_model == d && m.n_layers == l && m.n_heads == h &&
            m.seq_len == seq && m.vocab == vocab && m.ternary == ternary &&
-           m.pos_encoding == pos_enc;
+           m.pos_encoding == pos_enc && m.gated_ffn == gated_ffn &&
+           m.tied_embeddings == tied_embeddings && m.qk_norm == qk_norm;
 }
 
 }  // namespace sub0::registry
