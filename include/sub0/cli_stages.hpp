@@ -19,9 +19,10 @@
 
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
-                                int steps, int batch, float lr, unsigned seed, int keep);
+                                int steps, int batch, float lr, unsigned seed, int keep,
+                                int optimizer);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
-                              int n, float temp, int topk, unsigned seed);
+                              int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend, int thorough, int budget_s);
@@ -47,6 +48,7 @@ inline int run_train(int argc, char** argv) {
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
     std::string train_keep = "3";
+    int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims+git SHA)");
     app.add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
@@ -60,6 +62,11 @@ inline int run_train(int argc, char** argv) {
     app.add_option("--seed", train_seed, "RNG seed")->capture_default_str();
     app.add_option("--keep", train_keep,
                    "Progress-named checkpoints to retain (N, or ALL to keep every stage)")->capture_default_str();
+    app.add_option("--optimizer", train_optimizer,
+                   "adamw (default) | muon (hidden 2D weight matrices on Muon, everything else stays "
+                   "AdamW -- CPU-only for now)")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"adamw", 0}, {"muon", 1}}, CLI::ignore_case))
+       ->default_str("adamw");
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -70,7 +77,7 @@ inline int run_train(int argc, char** argv) {
     if (train_keep == "ALL" || train_keep == "all") keep = -1;
     else { try { keep = std::max(1, std::stoi(train_keep)); } catch (...) { keep = 3; } }
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
-                            train_steps, train_batch, train_lr, train_seed, keep);
+                            train_steps, train_batch, train_lr, train_seed, keep, train_optimizer);
 }
 
 // --- gen -------------------------------------------------------------------
@@ -80,16 +87,24 @@ inline int run_gen(int argc, char** argv) {
     int   gen_n = 200, gen_topk = 20;
     float gen_temp = 0.8f;
     unsigned gen_seed = 0;
+    int   gen_attn_sinks = 0;   // 0 = off (today's plain sliding-window fallback past SEQ_LEN)
     app.add_option("model",  gen_model,  "Trained model path")->required();
     app.add_option("prompt", gen_prompt, "Prompt text")->required();
     app.add_option("--n",    gen_n,    "Tokens to generate")->capture_default_str();
     app.add_option("--temp", gen_temp, "Sampling temperature")->capture_default_str();
     app.add_option("--topk", gen_topk, "Top-k sampling cutoff")->capture_default_str();
     auto* gen_seed_opt = app.add_option("--seed", gen_seed, "RNG seed (default: random)");
+    app.add_option("--attn-sinks", gen_attn_sinks,
+                   "StreamingLLM-style attention sinks: once the prompt+generation would exceed the "
+                   "trained context window, keep this many tokens from the START of the sequence "
+                   "resident alongside the most recent tokens, instead of a plain sliding window "
+                   "that drops them (0 = off, plain sliding window)")
+       ->capture_default_str();
     CLI11_PARSE(app, argc, argv);
 
     if (gen_seed_opt->count() == 0) gen_seed = std::random_device{}();  // fresh seed unless pinned
-    return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(), gen_n, gen_temp, gen_topk, gen_seed);
+    return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(), gen_n, gen_temp, gen_topk, gen_seed,
+                          gen_attn_sinks);
 }
 
 // --- tune ------------------------------------------------------------------
@@ -98,7 +113,9 @@ inline int run_tune(int argc, char** argv) {
     int  tune_max_threads = 0;   // 0 = hardware_concurrency
     bool tune_quiet = false, tune_thorough = false;
     int  tune_seconds = 0;       // 0 = profile default (fast 120s / thorough 600s)
-    int  tune_backend = 0;       // 0=auto, 1=all, 2=cpu, 3=gpu
+    int  tune_backend = 0;       // 0=auto, 1=all, 2=cpu, 3=gpu -- sub0_tune_stage resolves auto to
+                                 // gpu-only when a CUDA device is present (the CPU sweep is slow and
+                                 // its result goes unused by a GPU run); `all` always runs both.
     app.add_option("--max-threads", tune_max_threads,
                    "Cap on threads to consider (0 = hardware_concurrency)")->capture_default_str();
     app.add_flag("--quiet", tune_quiet, "Print only the winning configuration, not the search trace");
@@ -107,7 +124,7 @@ inline int run_tune(int argc, char** argv) {
     app.add_option("--seconds", tune_seconds,
                    "Optional hard safety cap in seconds (0 = none; each sample is bounded per-test)");
     app.add_option("--backend", tune_backend,
-                   "Backend(s) to tune: auto (CPU + GPU if present) | all | cpu | gpu")
+                   "Backend(s) to tune: auto (GPU-only if present, else CPU) | all (always both) | cpu | gpu")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{
            {"auto", 0}, {"all", 1}, {"cpu", 2}, {"gpu", 3}}, CLI::ignore_case))
        ->default_str("auto");

@@ -46,7 +46,7 @@ static bool gpu_decode_enable() {
 }
 
 extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
-                                        int n, float temp, int topk, unsigned seed) {
+                                        int n, float temp, int topk, unsigned seed, int attn_sinks) {
     sub0::build_model();                 // establish parameter-node layout
     if (!sub0::load_model(model_in)) {   // overwrite with trained weights (also reads the vocab fingerprint)
         std::println(stderr, "gen: cannot load model '{}'", model_in);
@@ -119,10 +119,34 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         }
     }
 
+    // Sink tokens: clamped so the "recent" half of the window never shrinks below SEQ_LEN/2 even if
+    // the caller asks for an unreasonably large --attn-sinks.
+    const int n_sink = attn_sinks > 0 ? std::min(attn_sinks, SEQ_LEN / 2) : 0;
+    std::vector<int> window;   // scratch, rebuilt each step once sinks are active; reused to avoid realloc
     for (int s = 0; s < n; ++s) {
-        int T = std::min((int)ctx.size(), SEQ_LEN);
+        int T;
+        const int* win;
+        // Once ctx has grown past the trained window, a plain last-SEQ_LEN slice drops the sequence's
+        // opening tokens entirely -- StreamingLLM's observation is that those early tokens soak up a
+        // disproportionate share of attention mass regardless of their content, so dropping them can
+        // degrade quality more than their content alone would suggest. Keep the first n_sink tokens
+        // resident alongside the most recent (SEQ_LEN - n_sink), forming a contiguous SEQ_LEN window.
+        // RoPE only encodes RELATIVE row position within a forward() call (row index, not the token's
+        // true absolute step), so reassigning the sinks to rows [0,n_sink) and the recent tail to
+        // [n_sink,SEQ_LEN) needs no change to op_rope/forward() at all -- both halves land in-
+        // distribution positions every step, with no artificial position gap between them.
+        if (n_sink > 0 && static_cast<int>(ctx.size()) > SEQ_LEN) {
+            const int n_recent = SEQ_LEN - n_sink;
+            window.assign(ctx.begin(), ctx.begin() + n_sink);
+            window.insert(window.end(), ctx.end() - n_recent, ctx.end());
+            T = SEQ_LEN;
+            win = window.data();
+        } else {
+            T = std::min((int)ctx.size(), SEQ_LEN);
+            win = ctx.data() + (ctx.size() - T);
+        }
         sub0::graph_reset();
-        sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
+        sub0::Node* logits = sub0::forward(win, T);
         const int last = logits->rows - 1;
         const int next = sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng);
         if (next == eos_id) break;   // learned stop signal: end here, don't print the marker
