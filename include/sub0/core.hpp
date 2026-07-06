@@ -36,7 +36,7 @@ namespace sub0 {
 // matching gradient view and the bookkeeping needed for reverse-mode autodiff.
 // Stages treat Node pointers as opaque handles (forward -> loss -> backward),
 // except for reading logits via the `data` span.
-enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt };
+enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt, SwiGLU, TiedHead, QKNorm };
 
 struct Node {
     Op op = Op::Leaf;
@@ -117,18 +117,40 @@ SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch
                            const int* lengths = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
+// AdamW by default; optionally a HYBRID Muon+AdamW split when `use_muon` is set: the hidden 2D GEMM
+// weight matrices (Wq/Wk/Wv/Wo/W1/W2/Wg) route through Muon's orthogonalized-momentum update
+// (include/sub0/muon.hpp), everything else (embeddings, the output head, norm gains, biases) stays
+// on plain AdamW -- this is Muon's own documented usage pattern (see muon.hpp), not a project
+// invention. Muon needs its own, much larger learning rate (its updates are normalized very
+// differently from AdamW's) -- set independently via set_muon_lr(), not derived from set_lr().
+// CPU-only for now (the CUDA backend has its own separate optimizer kernel, untouched).
+//
+// TODO(muon-constexpr): `use_muon` is a RUNTIME choice (a `--optimizer` CLI flag), which is a
+// deliberate but TEMPORARY exception to this project's normal rule (every decision knowable upfront
+// is baked as constexpr/compile-time, e.g. USE_TERNARY/USE_GATED_FFN/POS_ENCODING) -- chosen only so
+// A/B'ing optimizers needs no rebuild (unlike a dims/architecture choice, the optimizer doesn't touch
+// PARAM_LAYOUT/checkpoint shape). Once A/B evidence justifies committing to a default, convert to a
+// configure-time `constexpr bool USE_MUON` (baked into sub0_system.hpp, a machine/training-run choice
+// like the tuned runtime defaults, not a model-identity one) so AdamW::step()'s per-param dispatch
+// becomes `if constexpr` and the unused path compiles away. See memory: compile-time-decisions-preferred.
 class SUB0_API AdamW {
 public:
-    explicit AdamW(float lr);
+    explicit AdamW(float lr, bool use_muon = false);
     void zero_grad();
     void step();
-    void  set_lr(float lr) { lr_ = lr; }         // per-step LR schedule (warmup + decay)
+    void  set_lr(float lr) { lr_ = lr; }         // per-step LR schedule (warmup + decay), AdamW-routed params
     float lr() const { return lr_; }
+    void  set_muon_lr(float lr) { muon_lr_ = lr; }   // per-step LR schedule for Muon-routed params
+    float muon_lr() const { return muon_lr_; }
+    bool  use_muon() const { return use_muon_; }
     long step_count() const { return t_; }      // bias-correction counter (for checkpoints)
     void set_step_count(long t) { t_ = t; }      // restore on resume
 private:
     float lr_, b1_ = 0.9f, b2_ = 0.95f, eps_ = 1e-8f, wd_ = 0.01f, clip_ = 1.0f;
     long t_ = 0;
+    bool  use_muon_ = false;
+    float muon_lr_ = 0.02f;         // Muon's own reference default (unrelated scale to AdamW's lr_)
+    float muon_beta_ = 0.95f;       // Muon's momentum EMA coefficient (reference default)
 };
 
 // --- Trainable-state access (for crash-safe checkpointing) ------------------

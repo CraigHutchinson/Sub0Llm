@@ -42,6 +42,12 @@ namespace sub0 {
 // without changing the file format.
 
 namespace {
+// NOTE: adding a field here changes sizeof(Header) and breaks resuming EVERY existing checkpoint
+// (old bytes no longer line up) -- so USE_GATED_FFN deliberately does NOT get its own field. It does
+// not need one: param_floats already differs between a gated and a non-gated build at identical
+// d_model/n_layers/n_heads/seq_len/vocab (gated: 3*C*F per layer; plain: 2*C*F+F+C; these are never
+// equal for this project's fixed F=4*C convention), so the existing param_floats check below already
+// catches a gated/non-gated mismatch -- one less checkpoint-format break for an orthogonal feature.
 struct Header {
     char magic[4] = {'S', '0', 'L', '5'};
     int d_model = D_MODEL, n_layers = N_LAYERS, n_heads = N_HEADS;
