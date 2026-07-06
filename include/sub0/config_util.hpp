@@ -43,6 +43,22 @@ inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes) {
     return fill_defaults(pinned, autosize(corpus_bytes));
 }
 
+// FFN hidden width: 4*D_MODEL for the plain (2-matrix, GELU+bias) FFN -- this project's long-standing
+// default -- or, when gated (SwiGLU: 3 matrices, no bias), a width chosen so the two FFN styles land
+// at roughly the SAME total param count at the same D_MODEL, rather than gating silently costing 50%
+// more FFN params for a same-width swap. Derivation: plain params = 2*D*F_plain, gated params =
+// 3*D*F_gated; equal when F_gated = (2/3)*F_plain = (2/3)*4*D = (8/3)*D -- this project's OWN 4x
+// convention determines the 8/3 ratio, it is not copied from elsewhere (it happens to match the
+// common "SwiGLU ~8/3" convention in the literature, which was derived the same way against ITS
+// baseline's 4x). Rounded UP to the next multiple of 64 (never below 64) for GEMM-friendly shapes,
+// matching the common convention of ceiling rather than rounding to nearest (never undershoots).
+inline int d_ff_for(int d_model, bool gated_ffn) {
+    if (!gated_ffn) return 4 * d_model;
+    const int exact = d_model * 8 / 3;
+    constexpr int kMultiple = 64;
+    return std::max(kMultiple, ((exact + kMultiple - 1) / kMultiple) * kMultiple);
+}
+
 // --- Per-corpus model sidecar (<corpus>.model) -----------------------------
 // A key=value sidecar so a chosen size PERSISTS across configurator re-runs (a build-time auto-regen
 // then keeps the user's pins instead of re-auto-sizing). Pure parse/format; the file I/O stays in the
@@ -118,6 +134,27 @@ inline Precision resolve_precision(int code, bool f16_ok) {
         case 2:  return {"", PrecStatus::F16Unsupported};
         default: return {f16_ok ? "BF16" : "F32", PrecStatus::Ok};   // 9 = AUTO
     }
+}
+
+// --- Pretokenize-vs-on-demand decision --------------------------------------
+// Pre-tokenizing the whole corpus to corpus.tok is a clear win for fast random-access training while
+// that token copy stays page-cacheable; a corpus large enough that it can't stay resident is better
+// served tokenizing windows on demand (out-of-core: no on-disk token copy, no RAM pressure). AUTO
+// decides by SCALE rather than a fixed threshold: pre-tokenize when the estimated corpus.tok fits in
+// half of physical RAM, on-demand otherwise. Pure (both sizes are already-known inputs) so it is
+// unit-testable without a real filesystem/OS RAM query.
+//
+// corpus.tok is SMALLER than the source, not larger: the v2 format packs 2 bytes/token for any vocab
+// up to 65536 (every autosize() dims ladder entry stays under that), and real corpora measured in this
+// project compress to ~3.3-3.8 source bytes/token (JOIN + Unigram pieces), so corpus.tok lands around
+// 0.55-0.6x the source size (measured: a 46.1 GB fineweb corpus produced a 26.7 GB corpus.tok; a 2.23 GB
+// corpus produced a 1.34 GB one -- both ~0.6x). 3/4 is a deliberately conservative upper bound above
+// that (covers a corpus that compresses worse than this project's prose corpora) while still being far
+// closer to reality than treating corpus.tok as 2x the source, which used to make AUTO skip
+// pre-tokenizing corpora that would in fact fit comfortably.
+inline bool should_pretokenize(std::uintmax_t corpus_bytes, std::uintmax_t ram_bytes) {
+    const std::uintmax_t est_tok_bytes = corpus_bytes * 3 / 4;
+    return ram_bytes == 0 || est_tok_bytes <= ram_bytes / 2; // unknown RAM -> don't block on it, pretokenize
 }
 
 // --- Vocabulary-size curve (the "ideal vocab" knee) ------------------------

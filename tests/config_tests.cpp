@@ -58,6 +58,31 @@ TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][auto
     CHECK(r.vocab == 4096);                               // auto
 }
 
+TEST_CASE("d_ff_for: plain FFN unchanged, gated FFN roughly param-matched to it", "[config][dims]") {
+    // Plain: unchanged 4x convention, exactly, regardless of d_model.
+    CHECK(d_ff_for(448, false) == 4 * 448);
+    CHECK(d_ff_for(32, false) == 4 * 32);
+
+    // Gated: rounded up to a multiple of 64, never below 64.
+    CHECK(d_ff_for(448, true) == 1216);   // exact 8/3*448=1194.67 (int div: 1194) -> ceil to 1216
+    CHECK(d_ff_for(32, true) == 128);     // exact 8/3*32=85.33 (int div: 85) -> ceil to 128
+    CHECK(d_ff_for(0, true) == 64);       // degenerate d_model: floors at the minimum multiple
+
+    // The actual point: total FFN params (excluding the negligible bias) should land close between
+    // plain (2*D*F) and gated (3*D*F) at the SAME d_model -- not the pre-rebalance "gated costs 50%
+    // more" outcome. Allow up to ~15% drift from the 64-rounding, but no more (this is the whole
+    // reason d_ff_for exists, not an incidental property).
+    for (int d : {128, 192, 256, 448, 640, 768}) {
+        const long long plain_params = 2LL * d * d_ff_for(d, false);
+        const long long gated_params = 3LL * d * d_ff_for(d, true);
+        const double ratio = static_cast<double>(gated_params) / static_cast<double>(plain_params);
+        INFO("d_model=" << d << " plain_ff=" << d_ff_for(d, false) << " gated_ff=" << d_ff_for(d, true)
+                        << " ratio=" << ratio);
+        CHECK(ratio > 0.85);
+        CHECK(ratio < 1.15);
+    }
+}
+
 TEST_CASE("model sidecar: parse/format round-trip + fill_defaults precedence", "[config][sidecar]") {
     std::istringstream s("# a comment\nd_model=256\nn_layers=8\nn_heads=8\nseq_len=512\nvocab=16000\njunk\n");
     const ModelDims m = parse_model_sidecar(s);
