@@ -5,8 +5,11 @@
 // quantized vs float tensors, and basic KV-metadata round-tripping).
 
 #include "sub0/gguf.hpp"
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <cmath>
 #include <cstring>
+#include <span>
 
 using namespace sub0::gguf;
 
@@ -73,6 +76,18 @@ public:
         full.resize(std::min(n, full.size()));
         return full;
     }
+
+    // Pad up to the next multiple of `align` (default 32, matching the Reader's default when no
+    // general.alignment KV is set) -- mirrors where the Reader computes the data section to start.
+    // Call once, after the last add_tensor(), before add_data(). NOT part of finish()'s job: a file
+    // with no tensor data (the metadata-only tests above) has no data section to align to.
+    void pad_to_data_section(std::uint64_t align = 32) {
+        const std::uint64_t rem = buf_.size() % align;
+        if (rem != 0) buf_.insert(buf_.end(), align - rem, std::uint8_t{0});
+    }
+    // Appends raw tensor data bytes. Caller is responsible for pad_to_data_section() first and for
+    // using offsets (in add_tensor's `offset` param) consistent with the append order here.
+    void add_data(std::span<const std::uint8_t> bytes) { buf_.insert(buf_.end(), bytes.begin(), bytes.end()); }
 
 private:
     template <class T> void push_pod(T v) {
@@ -294,4 +309,140 @@ TEST_CASE("gguf compat: a missing layer is reported, not silently ignored", "[gg
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r, /*expect_layers=*/2);
     CHECK_FALSE(rep.missing.empty());
+}
+
+// --- tensor data access + dequantization (step 2 of the import spike) -----------------------------
+
+TEST_CASE("gguf: f16_to_f32 matches known IEEE-754 binary16 bit patterns", "[gguf]") {
+    CHECK(f16_to_f32(0x3C00) == 1.0f);
+    CHECK(f16_to_f32(0xC000) == -2.0f);
+    CHECK(f16_to_f32(0x0000) == 0.0f);
+    CHECK(f16_to_f32(0x4200) == 3.0f);
+    CHECK(f16_to_f32(0x7BFF) == 65504.0f);              // largest finite half
+    CHECK(f16_to_f32(0x0001) == 5.9604644775390625e-08f); // smallest subnormal
+    CHECK(f16_to_f32(0x03FF) == Catch::Approx(6.097555161e-05).epsilon(1e-6)); // largest subnormal
+    CHECK(std::isinf(f16_to_f32(0x7C00)));
+    CHECK(f16_to_f32(0x7C00) > 0);
+    CHECK(std::isinf(f16_to_f32(0xFC00)));
+    CHECK(f16_to_f32(0xFC00) < 0);
+}
+
+TEST_CASE("gguf: data_offset aligns past the tensor table to a 32-byte boundary", "[gguf]") {
+    GgufBuilder b;
+    b.add_string_kv("general.architecture", "llama");   // a few KVs so the table isn't already aligned
+    b.add_tensor("token_embd.weight", {4, 4}, /*type=*/0, /*offset=*/0);
+    const auto buf = b.finish();
+    Reader r(buf);
+    REQUIRE(r.ok());
+    CHECK(r.data_offset() % 32 == 0);
+    CHECK(r.data_offset() >= buf.size());   // padding never moves it BEFORE the table's own end
+}
+
+TEST_CASE("gguf: tensor_bytes round-trips exact F32 data through to_f32", "[gguf]") {
+    GgufBuilder b;
+    const std::vector<float> src = {1.0f, -2.5f, 0.0f, 3.25f};
+    b.add_tensor("w", {static_cast<std::uint64_t>(src.size())}, /*type=F32*/ 0, /*offset=*/0);
+    b.pad_to_data_section();
+    std::span<const std::uint8_t> raw_src(reinterpret_cast<const std::uint8_t*>(src.data()), src.size() * sizeof(float));
+    b.add_data(raw_src);
+
+    Reader r(b.finish());
+    REQUIRE(r.ok());
+    const TensorInfo* t = r.find_tensor("w");
+    REQUIRE(t != nullptr);
+    CHECK(r.tensor_byte_size(*t) == src.size() * sizeof(float));
+
+    const auto raw = r.tensor_bytes(*t);
+    REQUIRE(raw.size() == src.size() * sizeof(float));
+    std::vector<float> decoded;
+    REQUIRE(to_f32(*t, raw, decoded));
+    REQUIRE(decoded.size() == src.size());
+    for (std::size_t i = 0; i < src.size(); ++i) CHECK(decoded[i] == src[i]);
+}
+
+TEST_CASE("gguf: dequantize_q8_0 decodes a hand-built block exactly", "[gguf]") {
+    // One block_q8_0: a little-endian f16 scale (2.0, bits 0x4000) then 32 int8 quants 0..31.
+    // Expected value[i] = qs[i] * 2.0.
+    std::vector<std::uint8_t> raw(34, 0);
+    raw[0] = 0x00; raw[1] = 0x40;                        // f16 2.0, little-endian
+    for (int i = 0; i < 32; ++i) raw[2 + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i);
+    std::vector<float> out;
+    REQUIRE(dequantize_q8_0(raw, 32, out));
+    REQUIRE(out.size() == 32);
+    for (int i = 0; i < 32; ++i) CHECK(out[static_cast<std::size_t>(i)] == static_cast<float>(i) * 2.0f);
+}
+
+TEST_CASE("gguf: dequantize_q8_0 handles a partial final block (n not a multiple of 32)", "[gguf]") {
+    // Two blocks' worth of bytes (68), but only 40 elements requested -- the second block is only
+    // half-consumed. Scale 1.0 (bits 0x3C00) in both blocks for simplicity; quants = index within block.
+    std::vector<std::uint8_t> raw(68, 0);
+    for (int b = 0; b < 2; ++b) {
+        raw[static_cast<std::size_t>(b) * 34] = 0x00; raw[static_cast<std::size_t>(b) * 34 + 1] = 0x3C;
+        for (int i = 0; i < 32; ++i) raw[static_cast<std::size_t>(b) * 34 + 2 + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i);
+    }
+    std::vector<float> out;
+    REQUIRE(dequantize_q8_0(raw, 40, out));
+    REQUIRE(out.size() == 40);
+    for (int i = 0; i < 32; ++i) CHECK(out[static_cast<std::size_t>(i)] == static_cast<float>(i));
+    for (int i = 0; i < 8; ++i) CHECK(out[32 + static_cast<std::size_t>(i)] == static_cast<float>(i));  // second block, first 8
+}
+
+TEST_CASE("gguf: dequantize_q8_0 rejects a raw buffer shorter than the declared element count needs", "[gguf]") {
+    std::vector<std::uint8_t> raw(33, 0);   // one byte short of a full 34-byte block
+    std::vector<float> out;
+    CHECK_FALSE(dequantize_q8_0(raw, 32, out));
+}
+
+TEST_CASE("gguf: a real Q8_0 tensor round-trips through Reader::tensor_bytes + to_f32", "[gguf]") {
+    // Two blocks (64 elements) of Q8_0 data for a [64] tensor, embedded via the same
+    // pad_to_data_section()/add_data() path a real writer's alignment would produce.
+    GgufBuilder b;
+    b.add_tensor("w", {64}, /*type=Q8_0*/ 8, /*offset=*/0);
+    b.pad_to_data_section();
+    std::vector<std::uint8_t> data(68, 0);
+    data[0] = 0x00; data[1] = 0x3C;             // block 0 scale 1.0
+    data[34] = 0x00; data[35] = 0x40;           // block 1 scale 2.0
+    for (int i = 0; i < 32; ++i) data[2 + static_cast<std::size_t>(i)]      = static_cast<std::uint8_t>(i);
+    for (int i = 0; i < 32; ++i) data[36 + static_cast<std::size_t>(i)]     = static_cast<std::uint8_t>(i);
+    b.add_data(data);
+
+    Reader r(b.finish());
+    REQUIRE(r.ok());
+    const TensorInfo* t = r.find_tensor("w");
+    REQUIRE(t != nullptr);
+    CHECK(t->is_q8_0());
+    const auto raw = r.tensor_bytes(*t);
+    REQUIRE(raw.size() == 68);
+    std::vector<float> decoded;
+    REQUIRE(to_f32(*t, raw, decoded));
+    REQUIRE(decoded.size() == 64);
+    for (int i = 0; i < 32; ++i) CHECK(decoded[static_cast<std::size_t>(i)] == static_cast<float>(i) * 1.0f);
+    for (int i = 0; i < 32; ++i) CHECK(decoded[32 + static_cast<std::size_t>(i)] == static_cast<float>(i) * 2.0f);
+}
+
+TEST_CASE("gguf: tensor_bytes returns empty on a truncated/out-of-bounds data section", "[gguf]") {
+    GgufBuilder b;
+    b.add_tensor("w", {64}, /*type=F32*/ 0, /*offset=*/0);   // needs 256 bytes, none appended
+    Reader r(b.finish());
+    REQUIRE(r.ok());
+    const TensorInfo* t = r.find_tensor("w");
+    REQUIRE(t != nullptr);
+    CHECK(r.tensor_bytes(*t).empty());
+}
+
+TEST_CASE("gguf: to_f32 refuses an unsupported quantized type rather than misreading it", "[gguf]") {
+    GgufBuilder b;
+    b.add_tensor("w", {32}, /*type=*/2 /* Q4_0, not implemented */, /*offset=*/0);
+    b.pad_to_data_section();
+    std::vector<std::uint8_t> junk(64, 0xAB);
+    b.add_data(junk);
+    Reader r(b.finish());
+    REQUIRE(r.ok());
+    const TensorInfo* t = r.find_tensor("w");
+    REQUIRE(t != nullptr);
+    // tensor_byte_size returns 0 for an unrecognized type -> tensor_bytes is empty -> to_f32 on the
+    // (empty) span also correctly fails, so a caller checking either return value is safe.
+    CHECK(r.tensor_byte_size(*t) == 0);
+    std::vector<float> out;
+    CHECK_FALSE(to_f32(*t, r.tensor_bytes(*t), out));
 }

@@ -35,10 +35,13 @@ enum class ValueType : std::uint32_t {
     Float32 = 6, Bool = 7, String = 8, Array = 9, UInt64 = 10, Int64 = 11, Float64 = 12,
 };
 
-// GGML tensor element type IDs this reader recognizes as "importable today" (plain float storage).
-// Everything else (the many block-quantized Q4_*/Q5_*/Q8_*/K-quant types) is reported by its raw id
-// so a caller can say "quantized, dequantize first" rather than silently misreading bytes.
-enum class TensorType : std::uint32_t { F32 = 0, F16 = 1 };
+// GGML tensor element type IDs this reader recognizes. F32/F16 are plain storage (read as-is); Q8_0
+// is the one block-quantized format this reader can DEQUANTIZE (see dequantize_q8_0 below) -- picked
+// first because it is what the validated real-file import candidate (llama-160m) ships as, and it is
+// the simplest ggml quant format (uniform per-block scale, no sub-block structure). Everything else
+// (Q4_*/Q5_*/K-quants/...) is reported by its raw id so a caller can say "quantized, not supported
+// yet" rather than silently misreading bytes.
+enum class TensorType : std::uint32_t { F32 = 0, F16 = 1, Q8_0 = 8 };
 
 // --- parsed structures -------------------------------------------------------------------------
 
@@ -65,6 +68,7 @@ struct TensorInfo {
 
     bool is_f32() const { return type_raw == static_cast<std::uint32_t>(TensorType::F32); }
     bool is_f16() const { return type_raw == static_cast<std::uint32_t>(TensorType::F16); }
+    bool is_q8_0() const { return type_raw == static_cast<std::uint32_t>(TensorType::Q8_0); }
     bool is_plain_float() const { return is_f32() || is_f16(); }
     std::uint64_t element_count() const {
         std::uint64_t n = 1;
@@ -99,9 +103,37 @@ public:
         return nullptr;
     }
 
+    // --- tensor data access (the part step 1's reader deliberately skipped) --------------------
+    // Absolute byte offset (into the buffer this Reader was constructed over) where the tensor
+    // data section begins: the tensor info table, padded up to `general.alignment` (default 32,
+    // per the GGUF spec) -- every TensorInfo::offset is relative to THIS, not to the file start.
+    std::uint64_t data_offset() const { return data_offset_; }
+
+    // Byte length of one tensor's raw (still-encoded) data: n_elements * width for F32/F16, or
+    // block_count * 34 for Q8_0 (2-byte f16 scale + 32 int8 quants per 32-element block). 0 for a
+    // type this reader does not know the size rule for (an unsupported quant format).
+    std::uint64_t tensor_byte_size(const TensorInfo& t) const {
+        const std::uint64_t n = t.element_count();
+        if (t.is_f32()) return n * 4;
+        if (t.is_f16()) return n * 2;
+        if (t.is_q8_0()) return ((n + 31) / 32) * 34;
+        return 0;
+    }
+
+    // The raw (still-encoded) bytes for one tensor, bounds-checked against the buffer -- empty if
+    // the type's size is unknown (tensor_byte_size returned 0) or the file is truncated/malformed.
+    std::span<const std::uint8_t> tensor_bytes(const TensorInfo& t) const {
+        const std::uint64_t sz = tensor_byte_size(t);
+        if (sz == 0) return {};
+        const std::uint64_t off = data_offset_ + t.offset;
+        if (off > buf_.size() || sz > buf_.size() - off) return {};
+        return buf_.subspan(static_cast<std::size_t>(off), static_cast<std::size_t>(sz));
+    }
+
 private:
     Err                           err_ = Err::Truncated;
     std::uint32_t                  version_ = 0;
+    std::uint64_t                  data_offset_ = 0;
     std::map<std::string, Value> meta_;
     std::vector<TensorInfo>      tensors_;
 
@@ -206,9 +238,98 @@ private:
             if (!read_pod(t.type_raw) || !read_pod(t.offset)) { err_ = Err::Truncated; return; }
             tensors_.push_back(std::move(t));
         }
-        err_ = Err::Ok;   // the (alignment-padded) data section starts at pos_; this reader stops here
+
+        // Data section starts at pos_, rounded up to general.alignment (u32 KV, default 32 when
+        // absent -- per the GGUF spec). Every TensorInfo::offset above is relative to THIS point.
+        std::uint64_t alignment = 32;
+        if (const auto it = meta_.find("general.alignment"); it != meta_.end()) {
+            const Value& av = it->second;
+            if (av.kind == Value::Kind::UInt) alignment = av.u;
+            else if (av.kind == Value::Kind::Int && av.i > 0) alignment = static_cast<std::uint64_t>(av.i);
+        }
+        if (alignment == 0) alignment = 32;
+        data_offset_ = (static_cast<std::uint64_t>(pos_) + alignment - 1) / alignment * alignment;
+
+        err_ = Err::Ok;
     }
 };
+
+// --- dequantization (raw tensor bytes -> F32) -----------------------------------------------------
+
+// IEEE-754 binary16 -> binary32. Standard sign/exponent/mantissa bit-manipulation (subnormal- and
+// inf/nan-aware) -- ggml's f16 scale factors (Q8_0's block delta) and any F16-stored tensor both need
+// this; there is no <stdfloat> std::float16_t support on this toolchain yet.
+inline float f16_to_f32(std::uint16_t h) {
+    std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+    std::uint32_t exp  = (h >> 10) & 0x1Fu;
+    std::uint32_t mant = h & 0x3FFu;
+    std::uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;                                    // +-0
+        } else {                                             // subnormal half -> normalized float
+            int e = -1;
+            do { mant <<= 1; ++e; } while (!(mant & 0x400u));
+            mant &= 0x3FFu;
+            bits = sign | (static_cast<std::uint32_t>(127 - 15 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);           // inf / nan (mantissa preserved -> nan payload)
+    } else {
+        bits = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+// Dequantize a ggml block_q8_0 buffer: each 32-element block is a little-endian f16 scale `d`
+// followed by 32 int8 quants `q`; value[i] = q[i] * d. `raw` must be at least
+// ceil(n_elements/32)*34 bytes (Reader::tensor_bytes already sizes it exactly this way). Returns
+// false only if `raw` is shorter than that -- a truncated/malformed tensor, not decoded partially.
+inline bool dequantize_q8_0(std::span<const std::uint8_t> raw, std::uint64_t n_elements,
+                            std::vector<float>& out) {
+    constexpr std::uint64_t kBlockElems = 32, kBlockBytes = 34;
+    const std::uint64_t blocks = (n_elements + kBlockElems - 1) / kBlockElems;
+    if (raw.size() < blocks * kBlockBytes) return false;
+    out.resize(static_cast<std::size_t>(n_elements));
+    std::uint64_t written = 0;
+    for (std::uint64_t b = 0; b < blocks; ++b) {
+        const std::uint8_t* blk = raw.data() + b * kBlockBytes;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, blk, sizeof d_bits);
+        const float d = f16_to_f32(d_bits);
+        const auto* q = reinterpret_cast<const std::int8_t*>(blk + 2);
+        for (std::uint64_t i = 0; i < kBlockElems && written < n_elements; ++i, ++written)
+            out[static_cast<std::size_t>(written)] = static_cast<float>(q[i]) * d;
+    }
+    return true;
+}
+
+// Convert one tensor's raw (still-encoded) bytes to F32, dispatching on its type: F32 is a straight
+// copy, F16 is widened elementwise, Q8_0 is dequantized. Returns false for any other (unsupported)
+// quantized type -- the caller should treat that as "cannot import this tensor yet", not guess.
+inline bool to_f32(const TensorInfo& t, std::span<const std::uint8_t> raw, std::vector<float>& out) {
+    const std::uint64_t n = t.element_count();
+    if (t.is_f32()) {
+        if (raw.size() < n * 4) return false;
+        out.resize(static_cast<std::size_t>(n));
+        std::memcpy(out.data(), raw.data(), static_cast<std::size_t>(n) * 4);
+        return true;
+    }
+    if (t.is_f16()) {
+        if (raw.size() < n * 2) return false;
+        out.resize(static_cast<std::size_t>(n));
+        for (std::uint64_t i = 0; i < n; ++i) {
+            std::uint16_t h;
+            std::memcpy(&h, raw.data() + i * 2, sizeof h);
+            out[static_cast<std::size_t>(i)] = f16_to_f32(h);
+        }
+        return true;
+    }
+    if (t.is_q8_0()) return dequantize_q8_0(raw, n, out);
+    return false;
+}
 
 // --- import-compatibility report ------------------------------------------------------------------
 
