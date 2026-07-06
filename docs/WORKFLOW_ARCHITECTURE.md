@@ -7,18 +7,31 @@ mirroring what the configurator already does and a re-config is a tool run, **no
 ## Target workflow
 
 ```
-cmake --preset native                 # 1. configure the build; only the frontend tools can build yet
-cmake --build --preset native         #    -> builds sub0llm-configure (no generated header needed)
-./out/build/native/sub0llm-configure --corpus ./data/foo.txt    # 2. derive + emit the config headers
-cmake --build --preset native         #    -> header now exists -> engine + stage tools build
+cmake --preset native                                            # 1. configure the build
+cmake --build --preset native --target sub0llm-configure         #    -> just the configurator (no
+                                                                   #       generated header needed)
+./out/build/native/sub0llm-configure --corpus ./data/foo.txt     # 2. derive + emit the config headers
+cmake --build --preset native                                    #    -> header now exists -> engine
+                                                                   #       + stage tools build
 ./out/build/native/sub0llm-tune       # 3. measure + persist the tuned runtime knobs
 cmake --build --preset native         #    -> bakes the tuned knobs (state 3)
 ./out/build/native/sub0llm-train      # 4. train (uses tuned knobs, else the configure estimates)
 ./out/build/native/sub0llm-gen "Once there was a dog"           # 5. generate
 ```
 
+`scripts/workflow.ps1` wraps steps 1-2 (and optionally 3-5) into one command. There is no CMake
+orchestration of step 2 at all -- `sub0llm-configure` is a plain executable target with no generated
+inputs, so it always builds; the engine/stage targets are unconditionally defined too, but simply fail
+to compile with a clear "file not found" on the generated header until step 2 has actually run. A
+scoped `--target sub0llm-configure` build is required first on a fresh checkout (an unscoped
+`cmake --build` would otherwise also try, and fail, to build the not-yet-configurable engine targets).
+
 Every stage is **auto-derived/defaulted** (memory-ladder GPU batch, P-cores−1 CPU width, vocab knee,
-…); only `--corpus` is required, and even that could default. A rebuild between stages is the seam
+pretokenize-vs-on-demand by corpus size vs RAM, …); only `--corpus` is required. Every one of these
+knobs is `sub0llm-configure`'s own CLI flag with its own sensible default -- CMake carries NONE of
+them (see `SUB0_TERNARY`'s comment in `CMakeLists.txt` for why: a cache variable here would just be a
+second, driftable source of truth for something the tool already owns outright, since it takes the
+corpus path directly and needs no CMake orchestration to run). A rebuild between stages is the seam
 that turns runtime-discovered facts into compile-time constants.
 
 ## Layering (one logic site, thin tools)
@@ -45,13 +58,16 @@ that turns runtime-discovered facts into compile-time constants.
   producer ever needs the emitter.
 - **Implicit stage-chaining (a stage kicks off the next build)? No (by default).** On Windows the running
   exe is locked, so a stage rebuilding/overwriting itself is fragile, and self-invoking `cmake --build`
-  buries the build graph inside a binary. Keep stages pure (do the stage, exit). The *gating* below makes
-  the explicit `build → run → build` loop friction-free (no manual reconfigure); a thin top-level
-  `workflow` convenience target can chain them for those who want one command.
-- **Build-stage gating.** `if(EXISTS ${GEN_HEADER})` guards the engine + stage targets, and
-  `CMAKE_CONFIGURE_DEPENDS` watches the header so its *appearance* auto-reconfigures on the next
-  `cmake --build`. Fresh checkout → only `sub0llm-configure`; after it runs → tune/train/gen build. No
-  explicit reconfigure between stages.
+  buries the build graph inside a binary. Keep stages pure (do the stage, exit). `scripts/workflow.ps1`
+  chains the explicit `build → run → build` loop into one command for those who want it; it is a plain
+  script over the same CLI invocations, not a CMake target, so it adds no orchestration for CMake to
+  drift out of sync with.
+- **Build-stage gating? Considered, not built.** An earlier draft of this plan had `if(EXISTS ${GEN_HEADER})`
+  guard the engine + stage targets, with `CMAKE_CONFIGURE_DEPENDS` watching the header so its *appearance*
+  would auto-reconfigure the next `cmake --build`. Superseded by item 2's final design below: the targets
+  are unconditionally defined, and a missing generated header is just a plain compile error ("file not
+  found") on `sub0llm-configure`'s output, same as any other missing header — no CMake-tracked dependency
+  edge, no reconfigure-on-appearance magic, nothing to get out of sync.
 - **`frontend_cuda` / `backend_cpu` discipline.** Keep `backend_*` strictly *compute*. Pre-model device
   facts come from CMake (`configure_file`), so a runtime `frontend_cuda` probe is only needed for the
   fully-decoupled state-1 self-probe — defer it. `sub0_frontend` holds the shared pre-model logic.
@@ -59,25 +75,37 @@ that turns runtime-discovered facts into compile-time constants.
 ## Staged implementation plan
 
 1. **Bake build facts into `sub0llm-configure`** (`configure_file` → `sub0_build_facts.hpp`); drop the
-   mirrored CLI args from the CMake `add_custom_command`. ✅ **DONE** — device caps + output paths are
-   baked; the command keeps `--corpus` + the user-overridable knobs.
-2. **Gate the stage targets on configure + a lever to fully decouple.** ✅ **DONE** — each
-   `sub0llm-<stage>` auto-depends on `sub0_generate_config` (so it can't build before the config exists);
-   `sub0llm-configure` itself has no such dependency (state-1 buildable). **`SUB0_AUTO_CONFIGURE`**
-   (default **OFF**, since 2026-07-02 — was ON) is the lever: OFF is the pure staged workflow — the build
-   never regenerates behind your back, `sub0_generate_config` becomes an explicit on-demand target, and
-   the engine compiles against the existing header (gating only the dependency was insufficient — the
-   header is a custom-command OUTPUT, so OFF swaps it for a COMMAND-only target). ON keeps the one-shot
-   convenience (the build regenerates config when the corpus/tool/tune-cache change) for anyone who
-   prefers it. **Why OFF is now the default**: a large corpus reconfigure triggered silently as a side
-   effect of an unrelated `cmake --build` is hard to tell apart from a hung build, and retrying it (a
-   natural reaction to an apparently-stuck build) can launch a second reconfigure concurrently with the
-   first, racing on the same output files — precisely because the expensive step wasn't something anyone
-   typed, there was nothing to *not* retry. `scripts/workflow.ps1` now does the explicit
-   `sub0llm-configure` step itself, so this default flip doesn't change its behavior. Even with OFF the
-   core decouple holds: dims live in tool-owned headers, so `sub0llm-configure …` + `cmake --build`
-   re-sizes with **no CMake reconfigure**. The strict `EXISTS`-gate + `CMAKE_CONFIGURE_DEPENDS` (fresh
-   checkout builds *only* the configurator) remains an optional stricter variant.
+   mirrored CLI args from CMake entirely. ✅ **DONE** — device caps + output paths are baked as CLI
+   defaults; every model/corpus/precision knob is the tool's own flag now (see below).
+2. **Remove CMake orchestration of configure entirely — there is no lever, because there is nothing
+   left to toggle.** ✅ **DONE (2026-07-03), superseding the SUB0_AUTO_CONFIGURE lever below.** The
+   `sub0_generate_config` custom target, the `SUB0_AUTO_CONFIGURE` option, and the ON/OFF branching that
+   used to build it are all GONE — along with the CMake cache variables that only existed to seed that
+   target's command line (`SUB0_CORPUS`, `SUB0_POS_ENCODING`, `SUB0_ROPE_THETA`, `SUB0_BF16`,
+   `SUB0_PRECISION_GEMM`, `SUB0_PRECISION_ACT`; `SUB0_CORPUS_PRETOK`'s AUTO-by-corpus-size-vs-RAM
+   heuristic moved into `sub0llm-configure` itself, since the tool has `--corpus` directly and no longer
+   needs CMake to hand it a path). Run `sub0llm-configure --corpus <c> [--dmodel N ...]` directly (or
+   `scripts/workflow.ps1`) -- there is no `sub0_generate_config` target to build instead. The engine and
+   stage-tool targets are unconditionally defined and simply fail to compile with a plain "file not
+   found" if the generated header doesn't exist yet; there is no dependency edge to gate them on, by
+   design -- a CMake-tracked dependency on a file written by a process CMake doesn't orchestrate would
+   only be able to notice staleness via mtime anyway, which plain compilation already does for free via
+   the normal header-dependency scan. **Why this is the end state, not just a defaults flip (superseding
+   the OFF-by-default SUB0_AUTO_CONFIGURE compromise below):** a large corpus reconfigure triggered
+   silently as a side effect of an unrelated `cmake --build` was hard to tell apart from a hung build,
+   and retrying it (a natural reaction to an apparently-stuck build) could launch a second reconfigure
+   concurrently with the first, racing on the same output files. Toggling the default to OFF reduced the
+   frequency but not the possibility, since the machinery (and the temptation to flip it back ON) still
+   existed; removing the machinery removes the failure mode outright. `sub0llm-configure` was already
+   fully self-sufficient (build facts baked in, every knob a CLI default) before this -- the CMake side
+   was pure duplication.
+   <details><summary>Superseded: the SUB0_AUTO_CONFIGURE lever (removed 2026-07-03)</summary>
+   Historical note, kept for context on prior build logs mentioning it. Each `sub0llm-<stage>` used to
+   auto-depend on a `sub0_generate_config` custom target when `SUB0_AUTO_CONFIGURE=ON` (regenerate the
+   header as a build artifact whenever the corpus/tool/tune-cache changed); `OFF` (the default since
+   2026-07-02) made it an explicit on-demand target instead. Both modes still ran the configurator
+   *through CMake*, which is the part now removed entirely.
+   </details>
 3. **Extract `sub0_frontend`** (config_util/memplan/casing/tokenizer/unigram/registry) so the tools and
    the engine share one site. ✅ **DONE** — the static lib `sub0_frontend` (was `sub0_tok`) compiles the
    tokenizer/unigram and exposes the header-only pre-model logic via its PUBLIC include; the configurator
@@ -86,11 +114,16 @@ that turns runtime-discovered facts into compile-time constants.
    **DONE** — `include/sub0/cli_stages.hpp` defines each `run_*` once; the umbrella `sub0llm` dispatches
    to them and the stage exes are thin `main()`s; diagnostics (vocab/bench/models/report/memplan) stay
    on the umbrella.
-5. **(stretch)** a `workflow` convenience target; the strict `EXISTS`-gate; the state-1 `frontend_cuda`
-   self-probe. ⏳ pending.
+5. **(stretch)** a `workflow` convenience wrapper; the state-1 `frontend_cuda` self-probe.
+   `scripts/workflow.ps1` **DONE** — a plain script chaining the CLI invocations (see above), not a CMake
+   target; the strict `EXISTS`-gate this item originally paired it with is superseded/moot (see the
+   "Build-stage gating" fork above — item 2 settled on unconditional targets + plain compile errors
+   instead). `frontend_cuda` self-probe ⏳ still pending, deferred per the "`frontend_cuda` / `backend_cpu`
+   discipline" fork above.
 
-Stages 1, 2 (dependency form) and 4 are done — the user-callable stage tools + the shrunk, non-mirroring
-CMake are in place. Remaining: the `sub0_frontend` extraction and the strict fresh-checkout gating.
+Stages 1-4 are done — the user-callable stage tools, the `sub0_frontend` extraction, and the shrunk,
+non-mirroring CMake are all in place, plus the `workflow.ps1` convenience wrapper from item 5. Remaining:
+only the state-1 `frontend_cuda` self-probe, deferred (not blocking).
 
 ## Frontend layer — testability + tooling (groundwork for the Stage-3 cleanup)
 

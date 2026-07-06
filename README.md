@@ -21,24 +21,31 @@ precision, thread count and (if a GPU is present) the device backend — every c
 ## Build
 
 ```sh
-cmake --preset native          # configure: tokenize the corpus, auto-size the model, bake the headers
-cmake --build --preset native  # build -> out/build/native/sub0llm(.exe)
-ctest --preset native          # run the unit tests
+cmake --preset native                                        # configure the build (CUDA/backend detection)
+cmake --build --preset native --target sub0llm-configure      # build just the configurator
+out/build/native/sub0llm-configure --corpus data/tinystories.txt  # tokenize + auto-size + bake headers
+cmake --build --preset native                                 # build the engine + stage tools
+ctest --preset native                                          # run the unit tests
 ```
 
 The `native` preset is an `-march=native` Release build. `debug` and `release` presets also exist.
 
-On the first configure the configurator runs automatically and emits, into the build's `generated/` dir,
-**split** headers the engine compiles against (see [Configuration](#configuration)):
+`sub0llm-configure` is a plain executable with no generated inputs, so it always builds first. The engine
+and stage-tool targets are unconditionally defined too, but simply fail to compile with a plain "file not
+found" on the generated header until the configure step above has actually run once — there is no
+CMake-orchestrated config step, and the build never regenerates config behind your back. Re-running
+`sub0llm-configure` (a different corpus, an override flag) and rebuilding is how you reconfigure.
+
+On configure it emits, into the build's `generated/` dir, **split** headers the engine compiles against
+(see [Configuration](#configuration)):
 
 - `sub0_corpus.hpp` — the model *identity* (dims, vocab, tokenizer scheme), frozen per corpus
 - `sub0_system.hpp` — the *machine* (precision, thread/batch defaults, CUDA backend), per host
 - `sub0_config.hpp` — a thin umbrella over both (what the engine includes)
 
-This build-time auto-configuration is the default (`SUB0_AUTO_CONFIGURE=ON`). Pass
-`-DSUB0_AUTO_CONFIGURE=OFF` for the **pure staged workflow** — the build never regenerates config behind
-your back; you run `sub0llm-configure` (or `cmake --build <dir> --target sub0_generate_config`) yourself,
-then build. The stage tools (`sub0llm-train/-gen/-tune`) are separate executables for exactly this.
+The stage tools (`sub0llm-train/-gen/-tune`) are separate executables, built alongside `sub0llm` in the
+step above. `scripts/workflow.ps1` wraps this whole sequence into one command; see
+[docs/WORKFLOW_ARCHITECTURE.md](docs/WORKFLOW_ARCHITECTURE.md) for the full staged-workflow design.
 
 ### Building with the CUDA backend (Windows)
 
@@ -94,7 +101,8 @@ The resolution precedence is **CLI flag > sidecar > auto-size**.
 | tokenizer (Unigram LM, JOIN scheme), precision | configurator | derived; `--join`, `--prec-gemm/--prec-act` override |
 | compute backend (CPU vs GPU) | configurator | **GPU when the CUDA backend was built**, else CPU; `--compute` pins |
 | whether CUDA *exists* / is built | CMake | detects the toolkit + device; `-DSUB0_COMPUTE=CPU` forces a CPU-only build |
-| corpus, positional encoding, ternary | CMake cache (`SUB0_CORPUS` …) | explicit user intent |
+| corpus, positional encoding | configurator | `--corpus` (required), `--pos-encoding`/`--rope-theta` |
+| ternary block weights | CMake cache (`SUB0_TERNARY`) **and** configurator (`--ternary`) | CMake picks the *source files* compiled in (ternary is CPU-only for now); the configurator bakes the *flag* the engine reads — keep both in sync |
 
 See [docs/CONFIGURE_ARCHITECTURE.md](docs/CONFIGURE_ARCHITECTURE.md) for the build-state model and
 [docs/WORKFLOW_ARCHITECTURE.md](docs/WORKFLOW_ARCHITECTURE.md) for the staged user-driven workflow roadmap.
@@ -108,25 +116,27 @@ builds the GPU training backend and the configurator defaults to it. Force CPU-o
 
 ### Positional encoding
 
-`SUB0_POS_ENCODING` selects how position is injected (compile-time): **`ROPE`** (default) — rotary
-embeddings on Q/K, relative position, no learned table, extends to longer contexts; **`ABSOLUTE`** — a
-learned `pos_emb[SEQ_LEN, D_MODEL]` table. `SUB0_ROPE_THETA` (default `10000`) is RoPE's frequency base.
-A model is only comparable to others built with the **same** scheme.
+`sub0llm-configure --pos-encoding` selects how position is injected (baked as `constexpr` into the
+generated header): **`1` = RoPE** (default) — rotary embeddings on Q/K, relative position, no learned
+table, extends to longer contexts; **`0` = ABSOLUTE** — a learned `pos_emb[SEQ_LEN, D_MODEL]` table.
+`--rope-theta` (default `10000`) is RoPE's frequency base. A model is only comparable to others built
+with the **same** scheme.
 
 ## Using a larger corpus (out-of-core)
 
 The default corpus is small (`data/tinystories.txt`). For something big like **FineWeb-Edu**:
 
 ```sh
-python scripts/get_fineweb.py --out data/fineweb_edu.txt   # ~46GB; --shards N for a slice
-cmake --preset native -DSUB0_CORPUS="$(pwd)/data/fineweb_edu.txt"
-cmake --build --preset native                              # auto-sizes UP to a larger model
+python scripts/get_fineweb.py --out data/fineweb_edu.txt          # ~46GB; --shards N for a slice
+out/build/native/sub0llm-configure --corpus data/fineweb_edu.txt  # auto-sizes UP to a larger model
+cmake --build --preset native
 $exe train
 ```
 
-`SUB0_CORPUS_TOK=AUTO` (default) decides by scale whether to pre-tokenize the corpus to `corpus.tok`
-(fast random-access training) or **tokenize on demand** from the raw text when the token copy would not
-fit comfortably in RAM — so a corpus larger than memory just works. The configurator caches its scan
+`--corpus-pretok` (`2` = AUTO, the default) decides by scale whether to pre-tokenize the corpus to
+`corpus.tok` (fast random-access training) or **tokenize on demand** from the raw text when the token
+copy would not fit comfortably in RAM (estimated `corpus.tok` size vs half of physical RAM) — so a
+corpus larger than memory just works; `1`/`0` force it on/off. The configurator caches its scan
 (`<corpus>.words`) so re-configuring with a different vocab skips the multi-pass scan.
 
 ## Models
@@ -164,7 +174,8 @@ The auto-derived path is deterministic, so re-running `train` resumes the same m
 The pipeline stages are **also standalone executables** — `sub0llm-configure`, `sub0llm-train`,
 `sub0llm-gen`, `sub0llm-tune` — so each stage can be built/run on its own (`sub0llm-train --steps 0` ≡
 `sub0llm train --steps 0`). The stage tools share one runner definition with the umbrella
-(`include/sub0/cli_stages.hpp`) and are gated on the configured engine. `sub0llm-configure` is the
+(`include/sub0/cli_stages.hpp`); each compiles against whatever generated header already exists, so a
+missing config header is a plain compile error, not a silent auto-regenerate. `sub0llm-configure` is the
 config-independent front (`--dump-vocab` also writes readable corpus/token/vocab-curve analysis files).
 
 ## Layout

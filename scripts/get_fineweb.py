@@ -20,8 +20,8 @@ Usage:
     python scripts/get_fineweb.py [--out data/fineweb_edu.txt] [--shards 14] [--subset sample/10BT]
 
 The full sample/10BT is ~46GB of text (~12M unique words); pass --shards N for a smaller
-slice. Point the build at it with:  cmake --preset native -DSUB0_CORPUS=<abs path to out>
-(SUB0_CORPUS_TOK=AUTO will then choose on-demand tokenization for a corpus this large).
+slice. Point the configurator at it with:  sub0llm-configure --corpus <abs path to out>
+(--corpus-pretok defaults to AUTO, which will choose on-demand tokenization for a corpus this large).
 """
 import argparse, os, time
 

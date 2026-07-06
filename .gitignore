@@ -8,6 +8,9 @@ out/
 /sub0llm
 /build*
 /models
+/models_archive
+# Claude Code's local session/tooling state (machine-specific paths, per-agent worktree permissions)
+/.claude/
 
 # Generated/large corpus artifacts (not source)
 # *.words = cached corpus-scan state (configurator ScanState)

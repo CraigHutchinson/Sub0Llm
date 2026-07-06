@@ -9,9 +9,11 @@ from the corpus) and bakes them into generated headers. Changing a default is `s
 
 1. **Fresh checkout (no generated headers).** `sub0llm-configure` builds with *no* dependency on the
    generated headers (it includes only `casing/tokenizer/unigram/memplan`, never `sub0_config.hpp`), so
-   it can always be built and run first. The user *may* run it explicitly to (re)generate the headers;
-   as a convenience the CMake build also auto-generates them (idempotent: same corpus + sidecar → same
-   headers), so a plain `cmake --build` of a fresh checkout still works without a manual step.
+   it can always be built and run first: `cmake --build <dir> --target sub0llm-configure`, then
+   `sub0llm-configure --corpus <c>`. There is no CMake-orchestrated auto-generation step — the engine and
+   stage-tool targets are unconditionally defined but simply fail to compile with a plain "file not
+   found" on the generated header until that run has happened (see
+   [WORKFLOW_ARCHITECTURE.md](WORKFLOW_ARCHITECTURE.md)).
 2. **Configured (model baked, tune runtime-tweakable).** The corpus header bakes the model dims +
    vocab (compile-time, for the folded hot loops). Tune params (threads / GPU batch / TF32) have
    configurator-provided defaults but stay **runtime-adjustable** (the tune cache / CLI), so a model
@@ -75,8 +77,10 @@ sizing ladder is the coarse default, to be refined against measured val-loss per
 2. **Split headers** (`sub0_corpus.hpp` + `sub0_system.hpp` behind the `sub0_config.hpp` umbrella). ✅
 3. **CUDA detection** — resolved: stays in CMake (it drives `nvcc` at configure time; see above). ✅
 4. **Decouple re-config from a CMake reconfigure** — ✅ via auto-size + the `<corpus>.model` sidecar:
-   changing a size is `sub0llm-configure …` (or edit the sidecar) then `cmake --build`. The
-   `add_custom_command` remains the convenience that auto-generates the headers for a fresh checkout.
+   changing a size is `sub0llm-configure …` (or edit the sidecar) then `cmake --build`. There is no
+   CMake-side auto-generation left to keep in sync with this — `sub0llm-configure` is run directly (or
+   via `scripts/workflow.ps1`); see [WORKFLOW_ARCHITECTURE.md](WORKFLOW_ARCHITECTURE.md) for why that is
+   the deliberate end state, not a stopgap.
 
 All four stages are complete; the pure decisions live in `sub0::config` (`config_util.hpp`) and are
 unit-tested in `tests/config_tests.cpp`.

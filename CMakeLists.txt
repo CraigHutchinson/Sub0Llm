@@ -81,113 +81,17 @@ CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 # want. Escalate to biteopt (gh:avaneev/biteopt, header-only) only if the search space
 # becomes continuous / high-dimensional.
 
-# --- Stage-1 "runtime arguments": passed through as cache variables ----------
-set(SUB0_CORPUS   "${CMAKE_SOURCE_DIR}/data/fineweb_smoke.txt" CACHE FILEPATH "training corpus (drives vocab)")
-# Auto-run the configurator during the build to (re)generate the config headers. OFF (default, since
-# 2026-07-02) is the pure staged workflow: build sub0llm-configure, run it yourself
-# (`sub0llm-configure --corpus <c>`, or scripts/workflow.ps1), then build the engine -- the build never
-# regenerates config behind your back. Flipped from the original ON default after a large (46 GB)
-# corpus reconfigure, triggered silently as a side effect of an unrelated `cmake --build`, was hard to
-# distinguish from a hung build and got accidentally re-launched concurrently by repeated retries --
-# an easy mistake ON invites because the expensive step isn't a command you typed. ON keeps the
-# one-shot `cmake --build` convenience (the build regenerates config whenever the corpus/tool/tune
-# cache changed) for anyone who prefers it. `cmake --build <dir> --target sub0_generate_config`
-# regenerates on demand in either mode. See docs/WORKFLOW_ARCHITECTURE.md.
-option(SUB0_AUTO_CONFIGURE "Auto-run the configurator during the build (OFF = run sub0llm-configure manually)" OFF)
-# Model DIMS (d_model / layers / heads / seq) are no longer a CMake knob: sub0llm-configure AUTO-SIZES
-# them from the corpus scale and bakes them into the generated header. To pin a size, run the
-# configurator directly: `sub0llm-configure --corpus <c> --dmodel N --layers N ... -o <header>`.
-set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
-
-# Positional encoding scheme (compile-time, an enum so future schemes can be added).
-# ROPE (rotary) is the DEFAULT: it encodes RELATIVE position directly in the attention
-# dot-product, needs no learned position table, and extends to longer contexts far better
-# than learned ABSOLUTE embeddings (which cannot extrapolate past their trained length).
-# SUB0_ROPE_THETA is RoPE's frequency base -- the per-scheme tuning knob.
-set(SUB0_POS_ENCODING "ROPE" CACHE STRING "Positional encoding: ROPE (rotary) or ABSOLUTE (learned)")
-set_property(CACHE SUB0_POS_ENCODING PROPERTY STRINGS ROPE ABSOLUTE)
-set(SUB0_ROPE_THETA "10000" CACHE STRING "RoPE frequency base (theta)")
-if(SUB0_POS_ENCODING STREQUAL "ABSOLUTE")
-  set(SUB0_POS_ENCODING_INT 0)
-else()
-  set(SUB0_POS_ENCODING_INT 1)   # ROPE (default)
-endif()
-
-# Reduced precision (BF16). Compute-bound GEMM inputs + saved activations can be BF16 with FP32
-# accumulate + FP32 master weights -- halving bandwidth/VRAM with no loss-scaling (BF16 keeps FP32's
-# exponent range). AUTO enables it when the GPU supports it (Blackwell sm_120 does, >= sm_80); the
-# configurator bakes per-section dtypes so numerically sensitive parts (lm_head, norms, AdamW) stay
-# FP32. The types are compile-time, so unused-precision branches cost nothing.
-set(SUB0_BF16 "AUTO" CACHE STRING "BF16 mixed precision: AUTO (on if GPU >= sm_80) / ON / OFF")
-set_property(CACHE SUB0_BF16 PROPERTY STRINGS AUTO ON OFF)
-if(SUB0_BF16 STREQUAL "ON")
-  set(SUB0_BF16_INT 1)
-elseif(SUB0_BF16 STREQUAL "OFF")
-  set(SUB0_BF16_INT 0)
-else()
-  set(SUB0_BF16_INT 2)   # AUTO: configurator decides from the detected GPU arch
-endif()
-
-# Per-section precision selection (extensible: AUTO picks the detected 16-bit float; F16/Q8/Q4 are
-# reserved for future backends and currently error in the configurator). The float16 *capability*
-# is SUB0_BF16 above; these choose WHERE the 16-bit type is used. F32 forces full precision.
-function(_sub0_prec_int var out)
-  if(${var} STREQUAL "F32")
-    set(${out} 0 PARENT_SCOPE)
-  elseif(${var} STREQUAL "BF16")
-    set(${out} 1 PARENT_SCOPE)
-  elseif(${var} STREQUAL "F16")
-    set(${out} 2 PARENT_SCOPE)
-  else()
-    set(${out} 9 PARENT_SCOPE)   # AUTO
-  endif()
-endfunction()
-set(SUB0_PRECISION_GEMM "AUTO" CACHE STRING "GEMM input precision: AUTO / F32 / BF16 / F16")
-set_property(CACHE SUB0_PRECISION_GEMM PROPERTY STRINGS AUTO F32 BF16 F16)
-set(SUB0_PRECISION_ACT  "AUTO" CACHE STRING "Saved-activation storage precision: AUTO / F32 / BF16 / F16")
-set_property(CACHE SUB0_PRECISION_ACT PROPERTY STRINGS AUTO F32 BF16 F16)
-_sub0_prec_int(SUB0_PRECISION_GEMM SUB0_PRECISION_GEMM_INT)
-_sub0_prec_int(SUB0_PRECISION_ACT  SUB0_PRECISION_ACT_INT)
-
-# Pre-tokenize the whole corpus to corpus.tok at build time (fast random-access training)?
-# OFF skips that ~2x-on-disk token copy: training then tokenizes windows on demand from the
-# raw corpus -- the out-of-core path for a corpus too large to duplicate. The header and
-# tokenizer.tok are emitted either way, so the engine still builds.
+# --- Stage-1 "runtime arguments" -------------------------------------------
+# The corpus, model dims, positional encoding, precision, and pretokenize-vs-on-demand choice are
+# ALL sub0llm-configure's own CLI flags now (--corpus/--dmodel/--pos-encoding/--bf16/--prec-gemm/
+# --prec-act/--corpus-pretok, each with its own sensible default) -- run it directly
+# (`sub0llm-configure --corpus <c> ...`, or scripts/workflow.ps1), not through CMake. The staged
+# workflow (see docs/WORKFLOW_ARCHITECTURE.md) never orchestrates that step, so there is nothing
+# here to mirror it into; a CMake cache variable would only invite two sources of truth to drift.
 #
-# AUTO (the default) decides by SCALE rather than a fixed threshold: pre-tokenizing is a
-# clear win while the token copy stays page-cacheable, so emit it when the estimated
-# corpus.tok (~2x the text) fits in half of physical RAM, and switch to on-demand for a
-# larger corpus (where the mmap can't stay resident and the disk cost is large). Override
-# with -DSUB0_CORPUS_TOK=ON or =OFF.
-set(SUB0_CORPUS_PRETOK "AUTO" CACHE STRING "Pre-tokenize corpus.tok: ON / OFF / AUTO (by corpus size vs RAM)")
-set_property(CACHE SUB0_CORPUS_PRETOK PROPERTY STRINGS AUTO ON OFF)
-
-cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
-set(_corpus_bytes 0)
-if(EXISTS "${SUB0_CORPUS}")
-  file(SIZE "${SUB0_CORPUS}" _corpus_bytes)
-endif()
-math(EXPR _est_tok_mb  "(${_corpus_bytes} * 2) / 1048576")   # corpus.tok ~ 2x the text
-math(EXPR _half_ram_mb "${_ram_mb} / 2")
-if(_est_tok_mb GREATER _half_ram_mb)
-  set(_auto_pretok 0)   # token copy would not fit comfortably in RAM -> on demand
-else()
-  set(_auto_pretok 1)   # fits -> pre-tokenize for fast random-access training
-endif()
-
-if(SUB0_CORPUS_PRETOK STREQUAL "AUTO")
-  set(SUB0_CORPUS_PRETOK_FLAG ${_auto_pretok})
-elseif(SUB0_CORPUS_PRETOK)            # ON / 1 / TRUE
-  set(SUB0_CORPUS_PRETOK_FLAG 1)
-else()                             # OFF / 0 / FALSE
-  set(SUB0_CORPUS_PRETOK_FLAG 0)
-endif()
-message(STATUS "corpus.tok: SUB0_CORPUS_PRETOK=${SUB0_CORPUS_PRETOK} -> emit=${SUB0_CORPUS_PRETOK_FLAG} "
-               "(corpus ${_est_tok_mb}MB est-tok vs ${_half_ram_mb}MB half-RAM)")
-
-# The JOIN / implicit-space tokenizer (complete 256-byte base + JOIN/NEWLINE/PARA markers; single
-# inter-word space is free) is now the ONLY scheme -- the legacy space-as-token path was removed, so
-# there is no flag: the configurator always mints it.
+# SUB0_TERNARY is the one exception: cmake/Backends.cmake ALSO reads it directly (ternary is
+# CPU-only for now, a real build-time backend-selection constraint independent of the configurator).
+set(SUB0_TERNARY  0  CACHE STRING "1 = BitNet-style ternary block weights")
 
 # --- Compute-backend selection (CPU / GPU / HYBRID axis) ---------------------
 # Picks SUB0_BACKEND_SOURCES for sub0_core and enforces the backend invariants
@@ -256,63 +160,12 @@ endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/sub0_build_facts.hpp.in" "${GEN_DIR}/sub0_build_facts.hpp" @ONLY)
 target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 
-# The configurator invocation, shared by the auto-regen (OUTPUT) and the on-demand manual paths.
-set(_sub0_configure_cmd sub0llm-configure
-      --corpus  "${SUB0_CORPUS}"
-      --ternary ${SUB0_TERNARY}
-      --pos-encoding ${SUB0_POS_ENCODING_INT}
-      --rope-theta ${SUB0_ROPE_THETA}
-      --bf16 ${SUB0_BF16_INT}
-      --prec-gemm ${SUB0_PRECISION_GEMM_INT}
-      --prec-act ${SUB0_PRECISION_ACT_INT}
-      --corpus-pretok ${SUB0_CORPUS_PRETOK_FLAG}
-      --cuda-tf32 ${SUB0_CUDA_TF32_FLAG})
-
-if(SUB0_AUTO_CONFIGURE)
-  # ON: regenerate the header as a build artifact -- only when the corpus / configurator / tune cache
-  # change -- so a plain `cmake --build` is one-shot. Engine targets auto-depend on it (below).
-  add_custom_command(
-    OUTPUT  "${GEN_HEADER}"
-    BYPRODUCTS "${GEN_DIR}/corpus.tok" "${GEN_DIR}/tokenizer.tok"
-               "${GEN_DIR}/sub0_corpus.hpp" "${GEN_DIR}/sub0_system.hpp"
-    COMMAND ${_sub0_configure_cmd}
-    DEPENDS sub0llm-configure "${SUB0_CORPUS}" "${GEN_TUNE_CACHE}"
-    COMMENT "Configuring: deriving vocab from ${SUB0_CORPUS} and baking constexpr config"
-    VERBATIM)
-  add_custom_target(sub0_generate_config DEPENDS "${GEN_HEADER}")
-  message(STATUS "SUB0_AUTO_CONFIGURE=ON: the build (re)generates the config headers via sub0llm-configure")
-else()
-  # OFF: the build NEVER regenerates config behind your back. sub0_generate_config is an explicit,
-  # on-demand target (`cmake --build <dir> --target sub0_generate_config`, or just run sub0llm-configure);
-  # the engine compiles against whatever header already exists. A missing header is a clear compile error.
-  add_custom_target(sub0_generate_config
-    COMMAND ${_sub0_configure_cmd}
-    DEPENDS sub0llm-configure
-    COMMENT "Configuring on demand (SUB0_AUTO_CONFIGURE=OFF): ${SUB0_CORPUS}"
-    VERBATIM)
-  if(NOT EXISTS "${GEN_HEADER}")
-    message(STATUS "SUB0_AUTO_CONFIGURE=OFF and no config header yet -- run `sub0llm-configure --corpus <c>` "
-                   "(or `cmake --build ${CMAKE_BINARY_DIR} --target sub0_generate_config`) before building the engine")
-  else()
-    message(STATUS "SUB0_AUTO_CONFIGURE=OFF: building against the existing config (regen via the sub0_generate_config target)")
-  endif()
-endif()
-
-# Make a target auto-depend on the generated config ONLY when SUB0_AUTO_CONFIGURE is ON, so the build
-# regenerates it before compiling. When OFF this is a no-op: targets compile against the existing header.
-function(sub0_autoconfigure_dep tgt)
-  if(SUB0_AUTO_CONFIGURE)
-    add_dependencies(${tgt} sub0_generate_config)
-  endif()
-endfunction()
-
 # --- Stage 3: engine core (shared), compiled against the generated header ----
 # Two translation units, one shared library: engine_core.cpp is the backend-agnostic
 # part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
 add_library(sub0_core SHARED src/engine_core.cpp ${SUB0_BACKEND_SOURCES})
-sub0_autoconfigure_dep(sub0_core)
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
@@ -346,7 +199,6 @@ endif()
 # Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
 if(SUB0_BUILD_CUDA)
   add_library(sub0_backend_cuda SHARED src/backend_cuda.cu)
-  sub0_autoconfigure_dep(sub0_backend_cuda)
   target_include_directories(sub0_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
   set_target_properties(sub0_backend_cuda PROPERTIES
     CUDA_ARCHITECTURES "${SUB0_CUDA_ARCH}"
@@ -420,7 +272,6 @@ endif()
 
 # --- Stage 5: the thin driver executable ------------------------------------
 add_executable(sub0llm src/driver.cpp)
-sub0_autoconfigure_dep(sub0llm)          # for DEFAULT_CORPUS in the header
 target_include_directories(sub0llm PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 target_link_libraries(sub0llm PRIVATE sub0_train sub0_gen CLI11::CLI11)
 
@@ -432,11 +283,11 @@ set_target_properties(sub0llm PROPERTIES
 # --- Stage 5b: the per-stage executables (thin mains over the shared runners) -
 # Each is an OPTIONAL, separately-buildable stage tool that reuses the same sub0cli::run_* runner the
 # umbrella `sub0llm` dispatches to (cli_stages.hpp) -- so arg parsing + stage dispatch are defined once.
-# They are GATED on the configured engine: each depends on sub0_generate_config (the generated header),
-# so a stage tool cannot build before `configure` has produced the config it is compiled against.
+# Each compiles against whatever config header already exists in ${GEN_DIR}: run
+# `sub0llm-configure --corpus <c>` first (see docs/WORKFLOW_ARCHITECTURE.md) -- a missing header is a
+# clear compile error, not a silent auto-regenerate.
 foreach(_stage train gen tune)
   add_executable(sub0llm-${_stage} tools/sub0llm-${_stage}.cpp)
-  sub0_autoconfigure_dep(sub0llm-${_stage})
   target_include_directories(sub0llm-${_stage} PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
   target_link_libraries(sub0llm-${_stage} PRIVATE CLI11::CLI11)
   set_target_properties(sub0llm-${_stage} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")

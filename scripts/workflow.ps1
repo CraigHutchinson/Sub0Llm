@@ -4,11 +4,9 @@
 
 .DESCRIPTION
   Wraps the manual sequence in docs/WORKFLOW_ARCHITECTURE.md's "Target workflow" section into one
-  command: create/reuse a CMake build dir bound to -Corpus, build the configurator, run it EXPLICITLY
-  via the `sub0_generate_config` target (a visible, typed step -- SUB0_AUTO_CONFIGURE defaults OFF, see
-  CMakeLists.txt, precisely so a corpus reconfigure is never a silent side effect of an unrelated build:
-  on a large corpus it can run long enough to look like a hang, and retrying a "stuck" build then races
-  a second reconfigure against the first on the same output files), build the stage tools (not the test
+  command: create/reuse a CMake build dir, build the sub0llm-configure EXECUTABLE, run it directly
+  (`sub0llm-configure.exe --corpus <c>`, not a CMake target -- there is no CMake-orchestrated config
+  step; the build never regenerates config behind your back), build the stage tools (not the test
   suites), optionally tune, train, then run gen once as a sanity check.
 
   This is a convenience wrapper, not a new code path: every step just shells out to the same
@@ -19,7 +17,8 @@
   Subdirectory under out/build/. Reused across runs (idempotent reconfigure) unless -Clean is passed.
 
 .PARAMETER Corpus
-  Path to the training corpus (repo-relative or absolute).
+  Path to the training corpus (repo-relative or absolute). Passed to sub0llm-configure's --corpus,
+  never to CMake -- the corpus is a tool argument, not a build-config knob.
 
 .PARAMETER Compute
   AUTO / CPU / GPU / HYBRID -- see cmake/Backends.cmake. AUTO (default) uses the GPU if one is found.
@@ -30,6 +29,12 @@
 .PARAMETER Tune
   Run sub0llm-tune before training and rebuild so the baked DEFAULT_THREADS picks up its result.
   Off by default: training runs fine on the un-tuned defaults, and tuning adds its own search time.
+
+.PARAMETER SkipConfigure
+  Skip the build+run of sub0llm-configure entirely and reuse whatever config header the build dir
+  already has (e.g. a prior run against the same corpus). Useful for iterating on the stage tools /
+  training loop without re-deriving the vocabulary each time, especially on a large corpus where that
+  can take minutes. The generated header must already exist -- the stage tools fail to compile if not.
 
 .EXAMPLE
   scripts/workflow.ps1 -BuildDir smoke -Corpus data/tinystories.txt -Steps 500
@@ -48,6 +53,7 @@ param(
     [int]$Steps        = 0,
     [switch]$Tune,
     [switch]$Clean,
+    [switch]$SkipConfigure,
     [string]$ModelPath = "",
     [string]$Prompt    = "Once upon a time",
     [int]$GenTokens    = 200,
@@ -103,14 +109,16 @@ Invoke-Checked cmake @(
     "-S", $RepoRoot, "-B", $Bin, "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release", "-DSUB0_NATIVE=ON",
     "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
-    "-DSUB0_CORPUS=$CorpusPath", "-DSUB0_COMPUTE=$Compute"
+    "-DSUB0_COMPUTE=$Compute"
 )
 
-Write-Host "=== build: configurator ===" -ForegroundColor Yellow
-Invoke-Checked cmake @("--build", $Bin, "--target", "sub0llm-configure")
+if (-not $SkipConfigure) {
+  Write-Host "=== build: configurator ===" -ForegroundColor Yellow
+  Invoke-Checked cmake @("--build", $Bin, "--target", "sub0llm-configure")
 
-Write-Host "=== configure: deriving vocab from $CorpusPath (this can take a while on a large corpus) ===" -ForegroundColor Yellow
-Invoke-Checked cmake @("--build", $Bin, "--target", "sub0_generate_config")
+  Write-Host "=== configure: deriving vocab from $CorpusPath (this can take a while on a large corpus) ===" -ForegroundColor Yellow
+  Invoke-Checked (Join-Path $Bin "sub0llm-configure.exe") @("--corpus", $CorpusPath)
+}
 
 Write-Host "=== build: stage tools ===" -ForegroundColor Yellow
 Invoke-Checked cmake @("--build", $Bin, "--target", "sub0llm-train", "sub0llm-gen", "sub0llm-tune")
