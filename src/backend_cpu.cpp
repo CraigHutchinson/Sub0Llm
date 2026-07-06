@@ -21,6 +21,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/layout.hpp"
+#include "sub0/muon.hpp"
 
 #include <algorithm>
 #include <array>
@@ -82,14 +83,21 @@ namespace sub0 {
 consteval size_t calc_act_cap() {
     const size_t T = SEQ_LEN, C = D_MODEL, F = D_FF, H = N_HEADS, V = VOCAB;
     size_t base = 3 * T * C;
-    size_t per  = 10 * T * C + 2 * T * F + H * T * T + 2 * T
-                + (USE_TERNARY ? (size_t)4 * C * C + 2 * C * F : 0)
-                + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0);  // op_rope(q), op_rope(k)
+    // FFN activation nodes: plain (W1-out, gelu-out) = 2*T*F; gated (gate-out, up-out, swiglu-out)
+    // = 3*T*F (one extra T*F node -- see op_swiglu in the forward pass).
+    size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
+                + (USE_TERNARY ? (size_t)4 * C * C + (USE_GATED_FFN ? 3 : 2) * C * F : 0)
+                + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0)   // op_rope(q), op_rope(k)
+                + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0);  // op_qknorm(q), op_qknorm(k) + rinv scratch
     size_t fin  = T * C + 2 * T * V + 64;
     return base + (size_t)N_LAYERS * per + fin;
 }
 constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
-constexpr size_t MAX_NODES = 16 + 16 * (size_t)N_LAYERS;
+// The gated FFN adds one extra per-layer node (gate-linear + up-linear + swiglu vs. W1-linear +
+// gelu) -- a generous flat per-layer headroom either way, not a tight count. QK-norm adds 2 more
+// per-layer nodes (op_qknorm(q), op_qknorm(k)).
+constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)N_LAYERS
+                                + (USE_QK_NORM ? 2 * (size_t)N_LAYERS : 0);
 
 // ============================================================================
 //  Static storage
@@ -230,6 +238,7 @@ static inline float fast_tanh(float x) {            // tanh via fast_exp, satura
     const float e = fast_exp(-2.f * x);
     return (1.f - e) / (1.f + e);
 }
+static inline float fast_sigmoid(float x) { return 1.f / (1.f + fast_exp(-x)); }
 // tanh-form GELU (matches GPT-2's approximation, ~3e-4 vs the erf form): value and
 // derivative, kept mutually consistent so the gradient check passes in fast mode.
 constexpr float GELU_C = 0.7978845608f;             // sqrt(2/pi)
@@ -241,6 +250,14 @@ static inline float dgelu_fast(float v) {
     const float t  = fast_tanh(GELU_C * (v + GELU_A * v * v * v));
     const float du = GELU_C * (1.f + 3.f * GELU_A * v * v);
     return 0.5f * (1.f + t) + 0.5f * v * (1.f - t * t) * du;
+}
+// SiLU/Swish: silu(v) = v * sigmoid(v); value and derivative kept mutually consistent (same fast_exp
+// basis as GELU above) so the gradient check passes in fast mode. Used by the SwiGLU-gated FFN
+// (USE_GATED_FFN): silu(gate) * up, the GGUF/Llama-family FFN convention this variant exists to import.
+static inline float silu_fast(float v) { return v * fast_sigmoid(v); }
+static inline float dsilu_fast(float v) {
+    const float s = fast_sigmoid(v);
+    return s * (1.f + v * (1.f - s));
 }
 
 // ============================================================================
@@ -332,6 +349,37 @@ static Node* op_rmsnorm(Node* x, Node* gamma) {
     return y;
 }
 
+// QK-norm: RMSNorm applied independently to EACH head's D_HEAD-length slice of Q/K (a single
+// [1,D_HEAD] gamma shared across heads, same convention as Gemma2's query/key norm), applied right
+// after the Q/K projection and before RoPE. This is NOT a generalization of op_rmsnorm's math onto
+// groups -- mixing every head into one norm statistic (what calling op_rmsnorm on the whole row
+// would do) defeats the point of a PER-HEAD stabilizer, so this is a separate op with its own
+// per-(t,head) rinv scratch, mirroring op_rmsnorm's structure at the per-head granularity instead.
+static Node* op_qknorm(Node* x, Node* gamma, int H) {
+    const int T = x->rows, C = x->cols, d = C / H;
+    const float eps = 1e-5f;
+    Node* y = mk_node(Op::QKNorm, T, C);
+    y->a = x; y->w = gamma; y->heads = H;
+    auto [rinv, rinv_g] = arena_alloc((size_t)T * H);
+    y->scratch = rinv;
+    const float* __restrict G = gamma->data.data();
+    for (int t = 0; t < T; ++t) {
+        const float* __restrict xr = x->data.data() + (size_t)t * C;
+        float* __restrict yr       = y->data.data() + (size_t)t * C;
+        for (int h = 0; h < H; ++h) {
+            const int off = h * d;
+            float ms = 0.f;
+            #pragma omp simd reduction(+ : ms)
+            for (int j = 0; j < d; ++j) ms += xr[off + j] * xr[off + j];
+            ms /= d;
+            const float r = 1.f / std::sqrt(ms + eps);
+            rinv[(size_t)t * H + h] = r;
+            for (int j = 0; j < d; ++j) yr[off + j] = xr[off + j] * r * G[j];
+        }
+    }
+    return y;
+}
+
 static Node* op_gelu(Node* x) {
     Node* y = mk_node(Op::GELU, x->rows, x->cols);
     y->a = x;
@@ -344,6 +392,62 @@ static Node* op_gelu(Node* x) {
     } else {
         const float inv_sqrt2 = 0.70710678f;
         for (size_t i = 0; i < n; ++i) yd[i] = 0.5f * xd[i] * (1.f + std::erf(xd[i] * inv_sqrt2));
+    }
+    return y;
+}
+
+// SwiGLU gate: y = silu(gate_pre) * up_pre, elementwise (gate_pre/up_pre are two separate linear
+// projections of the same input -- the caller builds `op_linear(x, Wgate, ...)` and
+// `op_linear(x, Wup, ...)` and passes both here, same two-input shape as op_add). The GGUF/Llama-family
+// gated FFN: h = SwiGLU(x@Wgate, x@Wup); out = h@Wdown (no FFN bias in that convention).
+static Node* op_swiglu(Node* gate_pre, Node* up_pre) {
+    Node* y = mk_node(Op::SwiGLU, gate_pre->rows, gate_pre->cols);
+    y->a = gate_pre; y->b = up_pre;
+    const float* __restrict gd = gate_pre->data.data();
+    const float* __restrict ud = up_pre->data.data();
+    float* __restrict yd       = y->data.data();
+    const size_t n = y->data.size();
+    if constexpr (FAST_MATH) {
+        #pragma omp simd
+        for (size_t i = 0; i < n; ++i) yd[i] = silu_fast(gd[i]) * ud[i];
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            const float g = gd[i];
+            const float silu = g / (1.f + std::exp(-g));
+            yd[i] = silu * ud[i];
+        }
+    }
+    return y;
+}
+
+// Tied-embedding LM head: logits[t,v] = dot(x[t,:], table[v,:]), no bias (the common tied-embedding
+// convention drops the head bias too). `table` is the SAME [VOCAB,D_MODEL] tok_emb tensor op_embed
+// reads for lookup -- there is no separate head weight when USE_TIED_EMBEDDINGS.
+//
+// This is INHERENTLY a dot-product-per-output-column pattern, not op_linear's axpy style: op_embed
+// needs tok_emb row-major-by-vocab for efficient row lookup, but an axpy-style head GEMM would want
+// D_MODEL as the contiguous/outer axis instead -- one physical layout cannot be efficient for both
+// uses, so the forward here pays a genuinely slower access pattern than an untied head's op_linear
+// call (same total FLOPs, worse vectorization per output). This is inherent to weight tying, not a
+// bug -- see the weight-tying memory note for the measured cost. Both BACKWARD passes stay
+// axpy-efficient (they reduce to exactly op_linear's own forward/dW shapes), so only the forward
+// pays this cost.
+static Node* op_tied_head(Node* x, Node* table) {
+    const int T = x->rows, C = x->cols, V = table->rows;   // table (tok_emb): [V, C], V=VOCAB
+    Node* y = mk_node(Op::TiedHead, T, V);
+    y->a = x; y->w = table;
+    const float* __restrict X  = x->data.data();
+    const float* __restrict Tb = table->data.data();
+    for (int t = 0; t < T; ++t) {
+        const float* __restrict xt = X + static_cast<size_t>(t) * C;
+        float* __restrict yr = y->data.data() + static_cast<size_t>(t) * V;
+        for (int v = 0; v < V; ++v) {
+            const float* __restrict tv = Tb + static_cast<size_t>(v) * C;
+            double s = 0.0;
+            #pragma omp simd reduction(+ : s)
+            for (int c = 0; c < C; ++c) s += static_cast<double>(xt[c]) * tv[c];
+            yr[v] = static_cast<float>(s);
+        }
     }
     return y;
 }
@@ -515,6 +619,31 @@ static void backward_node(Node& n) {
         }
         break;
     }
+    case Op::QKNorm: {
+        // Same math as Op::RMSNorm, applied independently per (t,head) group of width d=C/H
+        // instead of once per whole row -- see op_qknorm's comment for why this isn't just
+        // op_rmsnorm called with a reshaped view.
+        Node* x = n.a; Node* g = n.w;
+        const int T = x->rows, C = x->cols, H = n.heads, d = C / H;
+        std::span<float> rinv = n.scratch;
+        Mat gy = mat(n.grad, T, C), xd = mat(x->data, T, C), xg = mat(x->grad, T, C);
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < H; ++h) {
+                const int off = h * d;
+                float S = 0.f;
+                #pragma omp simd reduction(+ : S)
+                for (int j = 0; j < d; ++j) S += gy[t, off + j] * g->data[j] * xd[t, off + j];
+                float r = rinv[(size_t)t * H + h], r3 = r * r * r;
+                #pragma omp simd
+                for (int j = 0; j < d; ++j) {
+                    float xj = xd[t, off + j], dy = gy[t, off + j], gj = g->data[j];
+                    xg[t, off + j] += r * dy * gj - (xj * r3 / d) * S;
+                    g->grad[j] += dy * xj * r;
+                }
+            }
+        }
+        break;
+    }
     case Op::GELU: {
         Node* x = n.a;
         const float* __restrict xd  = x->data.data();
@@ -531,6 +660,60 @@ static void backward_node(Node& n) {
                 float cdf = 0.5f * (1.f + std::erf(v * inv_sqrt2));
                 float pdf = inv_sqrt2pi * std::exp(-0.5f * v * v);
                 gx[i] += gy[i] * (cdf + v * pdf);
+            }
+        }
+        break;
+    }
+    case Op::SwiGLU: {
+        // y = silu(gate) * up  ->  d(gate) = dy * up * dsilu(gate), d(up) = dy * silu(gate).
+        Node* gate = n.a; Node* up = n.b;
+        const float* __restrict gd = gate->data.data();
+        const float* __restrict ud = up->data.data();
+        const float* __restrict gy = n.grad.data();
+        float* __restrict gg       = gate->grad.data();
+        float* __restrict ug       = up->grad.data();
+        const size_t n_el = n.data.size();
+        if constexpr (FAST_MATH) {
+            #pragma omp simd
+            for (size_t i = 0; i < n_el; ++i) {
+                const float g = gd[i], dy = gy[i];
+                gg[i] += dy * ud[i] * dsilu_fast(g);
+                ug[i] += dy * silu_fast(g);
+            }
+        } else {
+            for (size_t i = 0; i < n_el; ++i) {
+                const float g = gd[i], dy = gy[i];
+                const float s = 1.f / (1.f + std::exp(-g));
+                const float silu = g * s;
+                const float dsilu = s * (1.f + g * (1.f - s));
+                gg[i] += dy * ud[i] * dsilu;
+                ug[i] += dy * silu;
+            }
+        }
+        break;
+    }
+    case Op::TiedHead: {
+        // y[t,v] = dot(x[t,:], table[v,:])  ->  dx = dY @ table (op_linear's forward shape,
+        // in=V out=C), dtable[v,:] += dY[t,v]*x[t,:] (op_linear's dW shape). Both axpy-efficient --
+        // only the forward pays the transposed-access cost (see op_tied_head's comment). Looping t
+        // outer/v inner for BOTH accumulations (combined into one pass) keeps every row access
+        // sequential; the reverse order would stride through dY with stride V (V is VOCAB, large).
+        Node* x = n.a; Node* table = n.w;
+        const int T = n.rows, V = n.cols, C = x->cols;
+        const float* __restrict dY = n.grad.data();
+        const float* __restrict X  = x->data.data();
+        const float* __restrict Tb = table->data.data();
+        for (int t = 0; t < T; ++t) {
+            const float* __restrict dYr = dY + static_cast<size_t>(t) * V;
+            const float* __restrict xt  = X  + static_cast<size_t>(t) * C;
+            float* __restrict xg        = x->grad.data() + static_cast<size_t>(t) * C;
+            for (int v = 0; v < V; ++v) {
+                const float dyv = dYr[v];
+                if (dyv == 0.f) continue;
+                const float* __restrict tv = Tb + static_cast<size_t>(v) * C;
+                float* __restrict tg       = table->grad.data() + static_cast<size_t>(v) * C;
+                #pragma omp simd
+                for (int c = 0; c < C; ++c) { xg[c] += dyv * tv[c]; tg[c] += dyv * xt[c]; }
             }
         }
         break;
@@ -650,11 +833,34 @@ static inline void linear_row(const float* __restrict x, const Node* W, const No
     }
     if (bias) for (int o = 0; o < out; ++o) y[o] += bias->data[o];
 }
+// Tied-embedding head, single-row (generation) form: y[v] = dot(x[:], table[v,:]), no bias -- see
+// op_tied_head's comment for why this is a dot-product pattern rather than linear_row's axpy one.
+static inline void tied_head_row(const float* __restrict x, const Node* table,
+                                 float* __restrict y, int C, int V) {
+    const float* __restrict Tb = table->data.data();
+    for (int v = 0; v < V; ++v) {
+        const float* __restrict tv = Tb + static_cast<size_t>(v) * C;
+        float s = 0.f;
+        #pragma omp simd reduction(+ : s)
+        for (int c = 0; c < C; ++c) s += x[c] * tv[c];
+        y[v] = s;
+    }
+}
 static inline void rmsnorm_row(const float* __restrict x, const Node* gamma, float* __restrict y, int C) {
     float ms = 0.f; for (int j = 0; j < C; ++j) ms += x[j] * x[j]; ms /= C;
     const float r = 1.f / std::sqrt(ms + 1e-5f);
     const float* __restrict G = gamma->data.data();
     for (int j = 0; j < C; ++j) y[j] = x[j] * r * G[j];
+}
+static inline void qknorm_row(float* __restrict x, const Node* gamma, int H, int C) {   // in place, mirrors rope_row
+    const int d = C / H;
+    const float* __restrict G = gamma->data.data();
+    for (int h = 0; h < H; ++h) {
+        const int off = h * d;
+        float ms = 0.f; for (int j = 0; j < d; ++j) ms += x[off + j] * x[off + j]; ms /= d;
+        const float r = 1.f / std::sqrt(ms + 1e-5f);
+        for (int j = 0; j < d; ++j) x[off + j] *= r * G[j];
+    }
 }
 static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // rotate Q/K in place (t = pos)
     const int d = C / H, half = d / 2;
@@ -673,16 +879,24 @@ static inline float gelu_row(float v) {
     if constexpr (FAST_MATH) return gelu_fast(v);
     else return 0.5f * v * (1.f + std::erf(v * 0.70710678f));
 }
+static inline float silu_row(float v) {
+    if constexpr (FAST_MATH) return silu_fast(v);
+    else return v / (1.f + std::exp(-v));
+}
 
-struct Layer { Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2; };
+// Wg (gate matrix) is only used when USE_GATED_FFN; b1/b2 (FFN biases) only when !USE_GATED_FFN;
+// q_norm/k_norm only when USE_QK_NORM -- the always-present fields keep this struct's shape
+// independent of the compile-time choice, cheaper than conditionally compiling the struct itself,
+// and unused pointers just stay nullptr.
+struct Layer { Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm; };
 
 struct Model {
     Node* tok_emb;
     Node* pos_emb;
     std::array<Layer, N_LAYERS> layers;
     Node* ln_f;
-    Node* lm_head;
-    Node* lm_bias;
+    Node* lm_head;   // nullptr when USE_TIED_EMBEDDINGS -- the head reads tok_emb directly instead
+    Node* lm_bias;   // nullptr when USE_TIED_EMBEDDINGS -- tied models drop the head bias too
 
     // Lay out the parameter nodes for the CALLING thread: data spans into the shared
     // weights, grad spans into this thread's accumulator. Deterministic offsets, so
@@ -698,14 +912,28 @@ struct Model {
             L.Wk = mk_param(D_MODEL, D_MODEL, true);
             L.Wv = mk_param(D_MODEL, D_MODEL, true);
             L.Wo = mk_param(D_MODEL, D_MODEL, true);
-            L.W1 = mk_param(D_MODEL, D_FF, true);
-            L.b1 = mk_param(1, D_FF, false);
-            L.W2 = mk_param(D_FF, D_MODEL, true);
-            L.b2 = mk_param(1, D_MODEL, false);
+            // Order here MUST match layout.hpp's make_param_layout() exactly -- it IS the
+            // serialization order (see that file's header comment).
+            if constexpr (USE_QK_NORM) {
+                L.q_norm = mk_param(1, D_HEAD, false);
+                L.k_norm = mk_param(1, D_HEAD, false);
+            }
+            if constexpr (USE_GATED_FFN) {
+                L.Wg = mk_param(D_MODEL, D_FF, true);   // gate
+                L.W1 = mk_param(D_MODEL, D_FF, true);   // up
+                L.W2 = mk_param(D_FF, D_MODEL, true);   // down (no bias)
+            } else {
+                L.W1 = mk_param(D_MODEL, D_FF, true);
+                L.b1 = mk_param(1, D_FF, false);
+                L.W2 = mk_param(D_FF, D_MODEL, true);
+                L.b2 = mk_param(1, D_MODEL, false);
+            }
         }
         ln_f = mk_param(1, D_MODEL, false);
-        lm_head = mk_param(D_MODEL, VOCAB, true);
-        lm_bias = mk_param(1, VOCAB, false);
+        if constexpr (!USE_TIED_EMBEDDINGS) {
+            lm_head = mk_param(D_MODEL, VOCAB, true);
+            lm_bias = mk_param(1, VOCAB, false);
+        }
     }
 
     // Randomly initialize the SHARED weights through this thread's node layout.
@@ -725,10 +953,12 @@ struct Model {
         for (auto& L : layers) {
             ones(L.ln1); ones(L.ln2);
             randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
+            if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
+            if constexpr (USE_GATED_FFN) randn(L.Wg, 0.02f);
             randn(L.W1, 0.02f); randn(L.W2, 0.02f);
         }
         ones(ln_f);
-        randn(lm_head, 0.02f);
+        if constexpr (!USE_TIED_EMBEDDINGS) randn(lm_head, 0.02f);
     }
 
     Node* forward(const int* ids, int T) {
@@ -748,6 +978,10 @@ struct Model {
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
             Node* vn = op_linear(a, L.Wv, nullptr, q);
+            if constexpr (USE_QK_NORM) {
+                qn = op_qknorm(qn, L.q_norm, N_HEADS);
+                kn = op_qknorm(kn, L.k_norm, N_HEADS);
+            }
             if constexpr (POS_ENCODING == PosEncoding::Rope) {
                 qn = op_rope(qn, N_HEADS);
                 kn = op_rope(kn, N_HEADS);
@@ -755,11 +989,18 @@ struct Model {
             Node* att = op_attn(qn, kn, vn, N_HEADS);
             h = op_add(h, op_linear(att, L.Wo, nullptr, q));
             Node* f = op_rmsnorm(h, L.ln2);
-            f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
+            if constexpr (USE_GATED_FFN) {
+                Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
+                Node* up_pre   = op_linear(f, L.W1, nullptr, q);
+                f = op_linear(op_swiglu(gate_pre, up_pre), L.W2, nullptr, q);
+            } else {
+                f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
+            }
             h = op_add(h, f);
         }
         h = op_rmsnorm(h, ln_f);
-        return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
+        if constexpr (USE_TIED_EMBEDDINGS) return op_tied_head(h, tok_emb);
+        else                               return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
     }
 
     // Incremental single-token forward using the KV-cache (see KVCache above). Runs token `id` at
@@ -771,6 +1012,7 @@ struct Model {
         constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
         float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
+        [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
 
         const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
         for (int j = 0; j < C; ++j) h[j] = emb[j];
@@ -784,6 +1026,7 @@ struct Model {
             linear_row(a, L.Wq, nullptr, qn, C, C);
             linear_row(a, L.Wk, nullptr, kn, C, C);
             linear_row(a, L.Wv, nullptr, vn, C, C);
+            if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, H, C); }
             if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, H, C); }
             float* kc = g_kv.krow(l, pos); float* vc = g_kv.vrow(l, pos);        // append this token's K/V
             for (int j = 0; j < C; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
@@ -807,13 +1050,21 @@ struct Model {
             linear_row(att, L.Wo, nullptr, proj, C, C);
             for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
             rmsnorm_row(h, L.ln2, a, C);
-            linear_row(a, L.W1, L.b1, f1, C, D_FF);
-            for (int j = 0; j < D_FF; ++j) f1[j] = gelu_row(f1[j]);
-            linear_row(f1, L.W2, L.b2, proj, D_FF, C);
+            if constexpr (USE_GATED_FFN) {
+                linear_row(a, L.Wg, nullptr, g1, C, D_FF);
+                linear_row(a, L.W1, nullptr, f1, C, D_FF);
+                for (int j = 0; j < D_FF; ++j) f1[j] = silu_row(g1[j]) * f1[j];
+                linear_row(f1, L.W2, nullptr, proj, D_FF, C);
+            } else {
+                linear_row(a, L.W1, L.b1, f1, C, D_FF);
+                for (int j = 0; j < D_FF; ++j) f1[j] = gelu_row(f1[j]);
+                linear_row(f1, L.W2, L.b2, proj, D_FF, C);
+            }
             for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
         }
         rmsnorm_row(h, ln_f, a, C);
-        linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
+        if constexpr (USE_TIED_EMBEDDINGS) tied_head_row(a, tok_emb, logits.data(), C, VOCAB);
+        else                               linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
         return logits.data();
     }
 };
@@ -952,11 +1203,35 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T, 
     return static_cast<float>(total / batch);
 }
 
-// --- AdamW ------------------------------------------------------------------
+// --- AdamW (optionally hybrid with Muon) -------------------------------------
 
-AdamW::AdamW(float lr) : lr_(lr) {}
+AdamW::AdamW(float lr, bool use_muon) : lr_(lr), use_muon_(use_muon) {}
 
 void AdamW::zero_grad() { ensure_thread_built(); std::ranges::fill(W->grad, 0.f); }
+
+// One Muon-routed weight matrix's update: momentum EMA -> Nesterov lookahead -> Newton-Schulz
+// orthogonalization (sub0/muon.hpp) -> fan-ratio scale -> decoupled weight decay -> apply. Reuses
+// AdamW's own g_param_m arena as Muon's momentum buffer (g_param_vel goes UNUSED for these params,
+// left at zero) so the checkpoint format needs no new field for this -- see the design note on
+// AdamW in include/sub0/core.hpp. `gs` is the same global gradient-clip scale the AdamW path uses,
+// applied here too so clipping stays uniform across the whole model regardless of routing.
+static void muon_step_one(std::size_t off, int rows, int cols, float lr, float beta, float wd, float gs) {
+    const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    std::vector<float> upd(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const float g = g_param_grad[off + i] * gs;
+        float& m = g_param_m[off + i];
+        m = beta * m + (1.f - beta) * g;             // momentum EMA (muon_update's momentum.lerp_)
+        upd[i] = (1.f - beta) * g + beta * m;         // Nesterov lookahead (grad.lerp_(momentum, beta))
+    }
+    sub0::muon::newton_schulz5(upd.data(), rows, cols, upd.data(), 5);
+    const float scale = sub0::muon::scale_factor(rows, cols);
+    for (std::size_t i = 0; i < n; ++i) {
+        float& p = g_param_data[off + i];
+        p -= lr * wd * p;             // decoupled weight decay, same convention as the AdamW path
+        p -= lr * scale * upd[i];
+    }
+}
 
 void AdamW::step() {
     double sq = 0.0;
@@ -968,11 +1243,20 @@ void AdamW::step() {
     ++t_;
     float bc1 = 1.f - std::pow(b1_, (float)t_);
     float bc2 = 1.f - std::pow(b2_, (float)t_);
-    for (size_t pi = 0; pi < W->pcount; ++pi) {
-        const ParamView& pv = W->views[pi];
-        const float wd = pv.decay ? wd_ : 0.f;   // hoist the invariant branch so the loop vectorizes
+    // PARAM_LAYOUT (layout.hpp) walks the SAME sequential param slots build_layout()'s mk_param()
+    // calls created (that lock-step is this table's whole reason to exist), so it doubles here as
+    // the shape+kind lookup W->views alone doesn't carry.
+    for (const ParamDesc& pd : PARAM_LAYOUT) {
+        const bool muon_eligible = use_muon_ &&
+            (pd.kind == PKind::Wq || pd.kind == PKind::Wk || pd.kind == PKind::Wv || pd.kind == PKind::Wo ||
+             pd.kind == PKind::W1 || pd.kind == PKind::W2 || pd.kind == PKind::Wg);
+        if (muon_eligible) {
+            muon_step_one(pd.off, pd.rows, pd.cols, muon_lr_, muon_beta_, wd_, gs);
+            continue;
+        }
+        const float wd = pd.decay ? wd_ : 0.f;   // hoist the invariant branch so the loop vectorizes
         #pragma omp simd
-        for (size_t i = pv.off; i < pv.off + pv.n; ++i) {
+        for (size_t i = pd.off; i < pd.off + pd.n(); ++i) {
             float g = g_param_grad[i] * gs;
             g_param_m[i]   = b1_ * g_param_m[i]   + (1 - b1_) * g;
             g_param_vel[i] = b2_ * g_param_vel[i] + (1 - b2_) * g * g;
