@@ -140,4 +140,13 @@ if(SUB0_BUILD_CUDA)
   set(SUB0_BUILD_CUDA_INT 1)
 else()
   set(SUB0_BUILD_CUDA_INT 0)
+  # A build that isn't USING the device must bake a self-consistent config: HAS_CUDA=false
+  # implies CUDA_ARCH/GPU_VRAM_MB/GPU_SHARED_MB are zero too (see layout_tests.cpp's own
+  # "HAS_CUDA || CUDA_ARCH == 0" invariant). Detection above populates these unconditionally
+  # from whatever hardware IS present (informational -- the "CUDA: toolkit found" log line
+  # already ran using the real values), but forcing -DSUB0_COMPUTE=CPU on a machine that HAS
+  # a CUDA device must not leak that device's capability into a CPU-only build's defaults.
+  set(SUB0_CUDA_ARCH 0)
+  set(SUB0_GPU_VRAM_MB 0)
+  set(SUB0_GPU_SHARED_MB 0)
 endif()
