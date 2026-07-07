@@ -584,8 +584,27 @@ __global__ void attn_train_act_kernel(const A* __restrict__ q, const A* __restri
 // exactly like the naive kernel, so the online-softmax arithmetic -- and therefore the result -- is
 // bit-identical to attn_train_act_kernel (gated on device by sub0_cuda_attn_check, naive vs tiled).
 // HD = head dim, TILE_Q = queries per block, TILE_K = keys staged per shared tile.
-template <int HD> constexpr int attn_tile_k() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
-constexpr int kAttnTileQ = 64;
+//
+// TILE_K/TILE_Q at HD<=64 shrunk 64->32 (2026-07, isolated-harness investigation): ncu --set full
+// on all five flash-attention kernels at production dims (d448/T256) found occupancy is NOT purely
+// register-bound -- Block Limit Shared Mem (2-3 blocks/SM at TILE=64's 32-33.5KB/block) sits AT OR
+// BELOW Block Limit Registers (4-6 blocks/SM), so the 32-33.5KB static Ks/Vs shared-memory tile is a
+// co-binding occupancy constraint, not just the register footprint. Halving it to 16-16.8KB (paired
+// with attn_block_q<HD>() below widening the block 64->128) lets twice as many blocks land per SM.
+// Measured (isolated harness, bit-exact vs this file's kernels, verified via cudaFuncGetAttributes +
+// ncu, 3 independent process launches to rule out this GPU's thermal drift): achieved occupancy
+// ~11.7-12.1%/8.2% -> ~22.7-24.5% at HD=64, wall-clock 1.6-2.3x across all five kernels, 0.0 parity
+// diff (pure tile/grid-shape change, no arithmetic touched). HD=32 gains too (1.3-1.5x on fwd/stats/
+// dv; smaller on dq/dk, which are separately register-bound there regardless of tile size -- not
+// this change's target). The >64 branches (already smem-overflow-driven, see attn_tile_q's own
+// comment below) are UNCHANGED -- this only touches the HD<=64 path, which is what was measured.
+template <int HD> constexpr int attn_tile_k() { return HD <= 64 ? 32 : (HD <= 128 ? 32 : 16); }
+// Block size (threads/block = queries-or-keys per block) for the five flash-attention kernels below.
+// HD-templated (not a flat constant) for the same reason attn_tile_k/attn_tile_q already are: the
+// widened 128 is only validated for HD<=64 (see above); every other HD keeps the original 64,
+// unchanged in every byte of its compiled output. Single source of truth for the five kernels'
+// __launch_bounds__ and every launch_attn*/self-test call site's block/grid math below.
+template <int HD> constexpr int attn_block_q() { return HD <= 64 ? 128 : 64; }
 
 // Query-tile size for the dk/dv backward kernel, which stages BOTH q and dout (2*TILE_Q*HD floats,
 // plus 3 per-query stats). At the fixed 64 that overflows the 48 KB static shared-memory limit once
@@ -594,7 +613,12 @@ constexpr int kAttnTileQ = 64;
 // (64-key) block -- the staging loops stride by blockDim.x and the query loop steps by TILE_Q from the
 // key-tile base, so causality and the result are unchanged for any TILE_Q. (Register pressure at large
 // HD is a separate, still-open perf item: 4*HD accumulators spill; a DV/DK split would help.)
-template <int HD> constexpr int attn_tile_q() { return HD <= 64 ? 64 : (HD <= 128 ? 32 : 16); }
+//
+// HD<=64 branch shrunk 64->32, same occupancy reasoning and same measurements as attn_tile_k above
+// (this tile is 2*TILE_Q*HD+3*TILE_Q floats vs attn_tile_k's 2*TILE_K*HD -- structurally the same
+// shared-memory-per-block story, just for the dv/dk kernels' query tile instead of fwd/stats/dq's key
+// tile). The >64 branches stay untouched, same as attn_tile_k.
+template <int HD> constexpr int attn_tile_q() { return HD <= 64 ? 32 : (HD <= 128 ? 32 : 16); }
 
 // Warp-cooperative channel split for the dq kernel: LANES threads (a power of 2) share one query,
 // each owning HD/LANES channels of qr/dr/dqa, so the per-thread register need drops from 3*HD to
@@ -621,7 +645,7 @@ template <int HD> __host__ __device__ constexpr int attn_dq_lanes() { return (3 
 template <int HD> __host__ __device__ constexpr int attn_dk_lanes() { return (3 * HD >= 192 && HD % 2 == 0) ? 2 : 1; }
 
 template <class A, int HD, int TILE_K>
-__global__ void __launch_bounds__(kAttnTileQ)
+__global__ void __launch_bounds__(attn_block_q<HD>())
 attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                       A* __restrict__ out, int T, int C, int in_stride) {
     __shared__ float Ks[TILE_K * HD];
@@ -1055,7 +1079,7 @@ __global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* 
 //     FP32 from shared K+V (recomputed p). Computing dot in fp32 -- rather than from the bf16-rounded
 //     saved output -- keeps ds = p*(dp - dot) matching the naive backward through near-cancellation.
 template <class A, int HD, int TILE_K>
-__global__ void __launch_bounds__(kAttnTileQ)
+__global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                       const A* __restrict__ dout, float* __restrict__ stat_m, float* __restrict__ stat_invZ,
                       float* __restrict__ stat_dot, int T, int C, int in_stride) {
@@ -1122,7 +1146,7 @@ attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
 // away entirely -- algebraically IDENTICAL to the pre-split single-thread-per-query kernel, so small-
 // HD builds are unaffected in code path or performance.
 template <class A, int HD, int TILE_K>
-__global__ void __launch_bounds__(kAttnTileQ)
+__global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
@@ -1196,7 +1220,7 @@ attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
 // (dv doesn't need them), so it is also lighter on shared memory and global bandwidth, not just
 // registers.
 template <class A, int HD, int TILE_Q>
-__global__ void __launch_bounds__(kAttnTileQ)
+__global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ,
@@ -1253,7 +1277,7 @@ attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
 // and the STREAMED tiles are q/dout). LANES=1 reduces every formula below to the pre-split
 // single-thread-per-key kernel (lane=0, HALF=HD), so small-HD builds are unaffected.
 template <class A, int HD, int TILE_Q>
-__global__ void __launch_bounds__(kAttnTileQ)
+__global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
@@ -1571,8 +1595,9 @@ template <class A> inline void launch_gelu_bwd_t(const A* x, const A* dy, A* dx,
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
                         int batch, int T, int C, int H, int in_stride) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
-    const dim3 block(kAttnTileQ);
-    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    constexpr int BQ = attn_block_q<HD>();
+    const dim3 block(BQ);
+    const dim3 grid((T + BQ - 1) / BQ, H, batch);
     attn_fwd_tiled_kernel<float, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
@@ -1714,8 +1739,9 @@ template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gam
 template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
                               int batch, int T, int C, int H, int in_stride) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
-    const dim3 block(kAttnTileQ);
-    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+    constexpr int BQ = attn_block_q<HD>();
+    const dim3 block(BQ);
+    const dim3 grid((T + BQ - 1) / BQ, H, batch);
     attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
 }
 
@@ -1750,16 +1776,17 @@ inline void free_bwd_stats() {
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
                             int batch, int T, int C, int H, int in_stride) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
+    constexpr int BQ = attn_block_q<HD>();
     constexpr int DQ_LANES = attn_dq_lanes<HD>();
     constexpr int DK_LANES = attn_dk_lanes<HD>();
     if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
-    const dim3 block(kAttnTileQ);
-    const dim3 grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
-    // dq's block covers kAttnTileQ/DQ_LANES queries (LANES threads warp-cooperate per query at large
-    // HD; see attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks. dk is
-    // the same idea over keys instead of queries (attn_dk_lanes).
-    const dim3 grid_dq((T + kAttnTileQ / DQ_LANES - 1) / (kAttnTileQ / DQ_LANES), H, batch);
-    const dim3 grid_dk((T + kAttnTileQ / DK_LANES - 1) / (kAttnTileQ / DK_LANES), H, batch);
+    const dim3 block(BQ);
+    const dim3 grid((T + BQ - 1) / BQ, H, batch);
+    // dq's block covers BQ/DQ_LANES queries (LANES threads warp-cooperate per query at large HD; see
+    // attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks. dk is the same
+    // idea over keys instead of queries (attn_dk_lanes).
+    const dim3 grid_dq((T + BQ / DQ_LANES - 1) / (BQ / DQ_LANES), H, batch);
+    const dim3 grid_dk((T + BQ / DK_LANES - 1) / (BQ / DK_LANES), H, batch);
     const A* q = qkv; const A* k = qkv + C; const A* v = qkv + 2 * C;
     A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
     attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
@@ -3322,7 +3349,8 @@ SUB0_CUDA_API int sub0_cuda_attn_check(int batch, int T, int iters,
             dqkv, dqkv + C, dqkv + 2 * C, dref, batch, T, C, H, 3 * C);
     };
     auto run_tiled = [&] {
-        const dim3 block(kAttnTileQ), grid((T + kAttnTileQ - 1) / kAttnTileQ, H, batch);
+        constexpr int BQ = attn_block_q<HD>();
+        const dim3 block(BQ), grid((T + BQ - 1) / BQ, H, batch);
         attn_fwd_tiled_kernel<act_t, HD, TK><<<grid, block, 0, g_stream>>>(
             dqkv, dqkv + C, dqkv + 2 * C, dtes, T, C, 3 * C);
     };
