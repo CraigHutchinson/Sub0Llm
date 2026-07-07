@@ -18,6 +18,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/coherence.hpp"
+#include "sub0/config_util.hpp"  // sub0::config::kTokensPerParam — the SAME target ratio autosize() uses
 #include "sub0/log.hpp"      // sub0::log — leveled diagnostics + the <model_dir>/train.log tee
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
@@ -2243,17 +2244,24 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         emit("  [temp 0.7]  {}", preview_at("the ", SEQ_LEN, 0.7f, 20, rng));
     }
 
+    // Same target ratio autosize() sizes fresh corpora against (sub0::config::kTokensPerParam,
+    // config_util.hpp) -- NOT raw Chinchilla-optimal (20:1); see that constant's own doc comment for
+    // why this project targets well above pure compute-optimal. The healthy band is a 0.25x-2x spread
+    // around it, the same multiplicative width the old hardcoded 5-40 band used around its (then) 20.
+    constexpr double kDataRichMul = 2.0, kDataLimitedMul = 0.25;
     const double tok_per_param = params > 0 ? static_cast<double>(train_tokens) / params : 0.0;
     emit("");
-    emit("corpus fit (Chinchilla compute-optimal ~20 tokens/param):");
+    emit("corpus fit (target ~{:.0f} tokens/param -- see sub0::config::kTokensPerParam):", sub0::config::kTokensPerParam);
     emit("  train tokens  {:.2f}M", train_tokens / 1e6);
     emit("  tokens/param  {:.1f}  -> {}", tok_per_param,
-                 tok_per_param > 40 ? "data-rich: the model is UNDERSIZED for this corpus"
-                 : tok_per_param < 5 ? "data-limited: model may be oversized / undertrained"
-                                     : "near compute-optimal");
+                 tok_per_param > sub0::config::kTokensPerParam * kDataRichMul
+                     ? "data-rich: the model is UNDERSIZED for this corpus"
+                 : tok_per_param < sub0::config::kTokensPerParam * kDataLimitedMul
+                     ? "data-limited: model may be oversized / undertrained"
+                     : "near the target ratio");
 
     // Grow capacity unless we are actually overfitting.
-    const bool grow = !overfit && (tok_per_param > 40 || underfit_quality);
+    const bool grow = !overfit && (tok_per_param > sub0::config::kTokensPerParam * kDataRichMul || underfit_quality);
 
     int v_d = 0, v_l = 0, v_h = 0, v_seq = 0, v_vocab = 0;
     std::string r_d, r_l, r_h, r_seq, r_vocab;
@@ -2287,20 +2295,25 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     emit("  vocab    {:<5} [{}] {}", VOCAB,    verdict_word(v_vocab), r_vocab);
 
     // Concrete next-size suggestion when growing. Two grow drivers need different targets:
-    //   * data-rich (tokens/param > 40): Chinchilla says size UP to ~train_tokens/20 params;
+    //   * data-rich (tokens/param above the data-rich threshold): size UP to
+    //     ~train_tokens/kTokensPerParam params (the SAME ratio autosize() targets for a fresh corpus);
     //   * quality-bound (poor bits/byte at sane tokens/param): spend more capacity than now.
     // Use the LARGER of the two so a "grow" never suggests fewer params than the current model.
     // Strategy: KEEP the current head count (it is the proven knob -- see the head guidance above)
     // and widen d_model, which raises head_dim naturally. Search widths that are a multiple of
     // n_heads (so head_dim is integral) starting above the current d_model, depth >= current.
     if (grow && train_tokens > 0) {
-        const long long chinchilla = train_tokens / 20;
-        const long long target_p   = std::max<long long>(chinchilla, static_cast<long long>(params * 1.8));
+        const long long ratio_target = static_cast<long long>(train_tokens / sub0::config::kTokensPerParam);
+        const long long target_p     = std::max<long long>(ratio_target, static_cast<long long>(params * 1.8));
+        // Same aspect-ratio curve autosize() uses (config_util.hpp), pinned to the OVERALL target like
+        // autosize()'s own shape search -- not recomputed per candidate C, and not the old independently
+        // -hardcoded "C/40.0" this project used before the curve was made scale-dependent and shared.
+        const double    aspect     = sub0::config::aspect_for_params(static_cast<double>(target_p));
         const int       step       = std::max(N_HEADS, 16);                         // keep C a head multiple
         const int       C_start    = ((D_MODEL / step) + 1) * step;                 // next multiple up
         long long best_p = 0; int best_C = C_start, best_L = N_LAYERS;
         for (int C = C_start; C <= 2048; C += step) {
-            const int L = std::clamp(std::max(N_LAYERS, static_cast<int>(std::lround(C / 40.0))), 2, 24);
+            const int L = std::clamp(std::max(N_LAYERS, static_cast<int>(std::lround(C / aspect))), 2, 24);
             const long long p = static_cast<long long>(
                 sub0::memplan::param_floats({C, L, N_HEADS, 4 * C, SEQ_LEN, VOCAB}));
             if (best_p == 0 || std::llabs(p - target_p) < std::llabs(best_p - target_p)) {
@@ -2308,10 +2321,13 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
             }
         }
         emit("");
-        emit("suggested next size (target ~{:.1f}M params; max of Chinchilla {:.1f}M and 1.8x current):",
-                     target_p / 1e6, chinchilla / 1e6);
-        emit("  cmake --preset native -DSUB0_D_MODEL={} -DSUB0_N_LAYERS={} -DSUB0_N_HEADS={}",
+        emit("suggested next size (target ~{:.1f}M params; max of ratio-target {:.1f}M and 1.8x current):",
+                     target_p / 1e6, ratio_target / 1e6);
+        // sub0llm-configure owns dims now, not CMake (SUB0_AUTO_CONFIGURE was removed) -- pin via its
+        // CLI flags, matching the README's own documented re-configure workflow.
+        emit("  sub0llm-configure --corpus <corpus> --dmodel {} --layers {} --heads {}",
                      best_C, best_L, N_HEADS);
+        emit("  cmake --build --preset native");
         emit("  -> d{} L{} H{} (head_dim {}, aspect {:.0f}) ~= {:.2f}M params; then `sub0llm train`",
                      best_C, best_L, N_HEADS, best_C / N_HEADS, static_cast<double>(best_C) / best_L, best_p / 1e6);
     }

@@ -77,14 +77,29 @@ namespace sub0::config {
 // corpus from producing a degenerate shape even with no VRAM budget known.
 struct ModelDims { int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0; };
 
+// Target tokens/param ratio -- see point 2 above: conservative vs. real small-model practice
+// (192-14,800:1), well above pure Chinchilla (20:1). NAMESPACE SCOPE (not local to autosize()) so
+// `sub0llm report`'s corpus-fit diagnostic (train_stage.cpp) can reference the SAME constant instead
+// of an independently-hardcoded copy that can silently drift from this one -- exactly the class of
+// bug a stale `preview()` temperature default (0.7 vs gen's real 0.8) turned out to be elsewhere in
+// this codebase, found and fixed the same session this constant was hoisted for that reason.
+inline constexpr double kTokensPerParam = 100.0;
+
+// Width/depth aspect ratio (d_model / n_layers) interpolates log-linearly in target_params between a
+// small-scale floor (TinyStories' own ~1M-param reference configs, aspect 8-32) and a large-scale
+// ceiling (SmolLM2-1.7B's own real aspect ratio, ~85) -- see autosize()'s own doc comment (point 3) for
+// the full reasoning. NAMESPACE SCOPE for the same reason kTokensPerParam is: `sub0llm report`'s
+// next-size search (train_stage.cpp) needs the identical curve, not an independently-hardcoded ratio
+// that can silently go stale the way a fixed "40.0" here already had before this was shared.
+inline constexpr double kAspectMin = 16.0, kAspectMax = 85.0, kAspectMinParams = 1e6, kAspectRefParams = 1.7e9;
+inline double aspect_for_params(double params) {
+    const double aspect_ref = std::log10(kAspectRefParams / kAspectMinParams);
+    const double t = std::log10(std::max(params, kAspectMinParams) / kAspectMinParams);
+    return std::clamp(kAspectMin + (kAspectMax - kAspectMin) * (t / aspect_ref), kAspectMin, kAspectMax);
+}
+
 inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double size_scale = 1.0) {
     constexpr double kBytesPerToken   = 4.0;    // a-priori estimate; refined post-tokenization
-    constexpr double kTokensPerParam  = 100.0;  // see point 2 above: conservative vs. real small-model
-                                                 // practice (192-14,800:1), well above pure Chinchilla (20:1)
-    // Width/depth aspect ratio (d_model / n_layers) interpolates log-linearly in target_params between
-    // a small-scale floor (TinyStories' own ~1M-param reference configs, aspect 8-32) and a large-scale
-    // ceiling (SmolLM2-1.7B's own real aspect ratio, ~85) -- see point 3 above.
-    constexpr double kAspectMin = 16.0, kAspectMax = 85.0, kAspectMinParams = 1e6, kAspectRefParams = 1.7e9;
     constexpr int    kHeadDim         = 64;     // "founded" head width -- see project memory
     constexpr double kVocabScale = 8.0, kVocabBeta = 0.4;         // Heaps'-law-style vocab growth
     constexpr int    kMinVocab = 1024, kMaxVocab = 49152;         // token IDs must fit this project's
@@ -100,12 +115,6 @@ inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double s
     const double tokens = static_cast<double>(corpus_bytes) / kBytesPerToken;
     const double target_params = std::max(1.0, size_scale * tokens / kTokensPerParam);
 
-    const double aspect_ref = std::log10(kAspectRefParams / kAspectMinParams);
-    const auto   aspect_for = [&](double params) {
-        const double t = std::log10(std::max(params, kAspectMinParams) / kAspectMinParams);
-        return std::clamp(kAspectMin + (kAspectMax - kAspectMin) * (t / aspect_ref), kAspectMin, kAspectMax);
-    };
-
     const double vocab_raw = kVocabScale * std::pow(std::max(1.0, tokens), kVocabBeta);
     const int    vocab = std::clamp(static_cast<int>(std::lround(vocab_raw / 512.0)) * 512,
                                      kMinVocab, kMaxVocab);
@@ -115,7 +124,7 @@ inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double s
     // The aspect ratio itself stays pinned to the ORIGINAL corpus-derived target_params throughout (not
     // recomputed per shrink step): it answers "how deep should a model of the scale THIS CORPUS
     // justifies be," a separate question from "how far does hardware then force us to shrink it."
-    const double aspect = aspect_for(target_params);
+    const double aspect = aspect_for_params(target_params);
     const auto shape_for = [&](int n_heads) {
         const int d_model  = std::min(kMaxDModel, n_heads * kHeadDim);
         n_heads             = d_model / kHeadDim;   // re-derive: exact by construction
