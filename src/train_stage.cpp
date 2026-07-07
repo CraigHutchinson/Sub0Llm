@@ -598,9 +598,13 @@ std::string preview_at(const std::string& prompt, int n, float temp, int topk, s
     return sub0::detokenize(ctx);
 }
 
-// Mid-training preview at the generation defaults (temp 0.7, top-k 20).
+// End-of-training preview (the only caller is the "reached max steps" print below, not a
+// mid-training eval tick) at `gen`'s own defaults -- temp 0.8, top-k 20 (cli_stages.hpp's
+// gen_temp/gen_topk). Was 0.7 here (a stale mismatch, not a deliberate choice: this project has
+// no single shared constant for the pair, so the two drifted apart) -- fixed so the printed
+// sample is representative of what `sub0llm gen model.bin <prompt>` actually produces.
 std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
-    return preview_at(prompt, n, 0.7f, 20, rng);
+    return preview_at(prompt, n, 0.8f, 20, rng);
 }
 
 }  // namespace
