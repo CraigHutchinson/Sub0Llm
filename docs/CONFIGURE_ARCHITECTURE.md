@@ -64,12 +64,27 @@ emitted `CUDA_ARCH` constexpr desync from the arch the backend was actually comp
 (`nvidia-smi` self-probe is verified to return e.g. `12.0, 8151` here, so the data is available if a
 future fully-decoupled bootstrap ever wants it — but it is not a win today.)
 
-## Auto-sizing ladder (current)
+## Auto-sizing (current)
 
-`autosize(corpus_bytes)` — coarse, overridable: `<64 MB → d192 L6 H6 seq256` (tinystories);
-`<512 MB → d320 L8 H8`; `<4 GB → d448 L11 H7 seq256` (fineweb-smoke); `<32 GB → d640 L14 H8 seq512`;
-else `d768 L16 H8 seq512`. The `--dump-vocab` vocab-curve already reports the ideal vocab; the
-sizing ladder is the coarse default, to be refined against measured val-loss per corpus.
+`autosize(corpus_bytes, vram_mb, size_scale)` — formula-based, overridable: every dimension is a
+smooth, monotonic function of corpus scale, not a handful of hand-picked per-bucket values. Token
+count is estimated from raw bytes (~4 bytes/token, refined for real by tokenization); the target
+parameter budget follows a tokens/param ratio well above pure Chinchilla-optimal (100:1, informed by
+real small-model practice — TinyStories' own reference configs, SmolLM2, the FineWeb-Edu paper's own
+ablation model); that budget decomposes into `d_model`/`n_layers` via a width/depth aspect ratio that
+itself scales with model size (deeper/narrower at small scale, matching TinyStories/SmolLM2's own real
+configs; wider at large scale, matching SmolLM2-1.7B), snapped to `head_dim=64`-multiples
+(head-divisibility falls out automatically); vocab follows Heaps'-law-style sublinear growth in token
+count, as a separate axis from the capacity budget; `seq_len` scales mildly with model width. A
+hardware-aware clamp (`vram_mb`, 0 = unknown/CPU-only = no-op) shrinks the shape until it fits the
+detected GPU's VRAM at batch=1, so pointing the configurator at a big corpus never outright fails on a
+modest card by default (an explicit `--dmodel` override that intentionally exceeds VRAM still hits the
+existing hard-error path below, correctly). `--size-scale` (default 1.0) is a caller-chosen multiplier
+on the target-parameter budget — a minimal/fast/safe vs. more generous starting point, same formula.
+See the function's own doc comment in `include/sub0/config_util.hpp` for the full reasoning and
+citations. The
+`--dump-vocab` vocab-curve remains the source of truth for the IDEAL vocab once a corpus is actually
+scanned; this is the informed starting point before that analysis exists.
 
 ## Migration stages
 

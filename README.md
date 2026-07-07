@@ -95,6 +95,12 @@ cmake --build --preset native                         # recompiles against the n
 A chosen size **persists** in a `<corpus>.model` sidecar (key=value), so it survives later re-runs.
 The resolution precedence is **CLI flag > sidecar > auto-size**.
 
+Auto-sizing is hardware-aware: it won't suggest a shape that can't fit the detected GPU's VRAM at
+batch=1. `--size-scale 0.5` (smaller/faster/safer) or `--size-scale 2.0` (more generous) scales the
+target-parameter budget without changing the underlying formula — see
+[docs/CONFIGURE_ARCHITECTURE.md](docs/CONFIGURE_ARCHITECTURE.md#auto-sizing-current) for the reasoning
+(scaling-law + real reference-model grounded, not hand-picked buckets).
+
 | What | Owner | Notes |
 |---|---|---|
 | `d_model / n_layers / n_heads / seq_len / vocab` | configurator | auto-sized from corpus; `--dmodel`… pins; `<corpus>.model` persists |

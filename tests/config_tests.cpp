@@ -13,38 +13,119 @@
 
 using namespace sub0::config;
 
-TEST_CASE("autosize: corpus scale picks the model ladder", "[config][autosize]") {
+TEST_CASE("autosize: corpus scale drives a smooth, formula-based model shape", "[config][autosize]") {
     const std::uintmax_t MB = 1000000;
-    // TinyStories-scale (22 MB) -> the compact model the user pins as ~d196.
+
+    // TinyStories-scale (22 MB): tiny enough that the params floor binds. d128/L8 matches the ORIGINAL
+    // TinyStories paper's own ~2.5M-param reference config almost exactly (their real reference: 8
+    // layers, embedding dim 128) -- a genuine prior-art match, not a coincidence of the floor clamp.
     const ModelDims tiny = autosize(22 * MB);
-    CHECK(tiny.d_model == 192);
-    CHECK(tiny.n_layers == 6);
+    CHECK(tiny.d_model == 128);
+    CHECK(tiny.n_layers == 8);
+    CHECK(tiny.n_heads == 2);
+    CHECK(tiny.seq_len == 256);
     CHECK(tiny.vocab == 4096);
     CHECK(tiny.d_model % tiny.n_heads == 0);          // must stay head-divisible
 
-    // FineWeb-smoke-scale (1 GB) -> the larger model.
+    // 1 GB: comfortably past the floor, smoothly smaller than the old coarse-bucket value (which gave
+    // d448 for BOTH 1 GB and this project's real ~2.2 GB tinystories.txt corpus despite them differing
+    // more than 2x in scale).
     const ModelDims fw = autosize(1024 * MB);
-    CHECK(fw.d_model == 448);
-    CHECK(fw.n_layers == 11);
-    CHECK(fw.vocab == 16384);
+    CHECK(fw.d_model == 192);
+    CHECK(fw.n_layers == 8);
+    CHECK(fw.n_heads == 3);
+    CHECK(fw.seq_len == 256);
+    CHECK(fw.vocab == 18432);
 
-    // Monotonic non-decreasing in corpus size across the rungs (bigger corpus never shrinks the model).
-    int prev_d = 0, prev_v = 0;
-    for (std::uintmax_t mb : {1u, 200u, 2000u, 10000u, 60000u}) {
+    // This project's real tinystories.txt corpus (~2227.75 MB, the actual on-disk full
+    // TinyStoriesV2-GPT4 train split): d256/L8, ~19M params -- much closer to what real small-model
+    // research on THIS KIND of data actually uses (see the formula's own doc comment for the TinyStories
+    // paper / SmolLM2 / FineWeb-Edu-ablation reference points that informed this) than a naive
+    // Chinchilla-strict formula would suggest.
+    const ModelDims real = autosize(static_cast<std::uintmax_t>(2227.753162 * MB));
+    CHECK(real.d_model == 256);
+    CHECK(real.n_layers == 8);
+    CHECK(real.n_heads == 4);
+    CHECK(real.seq_len == 256);
+    CHECK(real.vocab == 25088);
+
+    // Monotonic non-decreasing in corpus size across a wide sweep (bigger corpus never shrinks the
+    // model), and stays head-divisible everywhere -- including well past the OLD ladder's hard 768
+    // ceiling, which this formula has no equivalent of (only the generous kMaxDModel safety clamp).
+    int prev_d = 0, prev_l = 0, prev_v = 0, prev_seq = 0;
+    for (std::uintmax_t mb : {1u, 22u, 200u, 1024u, 2000u, 10000u, 32768u, 60000u, 100000u}) {
         const ModelDims m = autosize(mb * MB);
-        CHECK(m.d_model >= prev_d);
-        CHECK(m.vocab   >= prev_v);
+        CHECK(m.d_model  >= prev_d);
+        CHECK(m.n_layers >= prev_l);
+        CHECK(m.vocab    >= prev_v);
+        CHECK(m.seq_len  >= prev_seq);
         CHECK(m.d_model % m.n_heads == 0);
-        prev_d = m.d_model; prev_v = m.vocab;
+        CHECK(m.n_heads >= 2);
+        prev_d = m.d_model; prev_l = m.n_layers; prev_v = m.vocab; prev_seq = m.seq_len;
     }
+    // A genuinely huge corpus keeps scaling UP instead of saturating at the old fixed ceiling.
+    CHECK(autosize(100000 * MB).d_model > autosize(10000 * MB).d_model);
+}
+
+TEST_CASE("autosize: hardware-aware VRAM clamp never suggests an unbuildable shape", "[config][autosize]") {
+    const std::uintmax_t MB = 1000000;
+
+    // This project's own REAL fineweb_edu.txt corpus (~46.1 GB) with no VRAM budget known (0 = CPU-only
+    // or undetected) -- comfortably fits an 8 GB-class card already (~3.6 GiB), demonstrating the
+    // conservative tokens/param ratio alone (not the clamp) is what keeps this reachable by default.
+    const ModelDims unclamped = autosize(static_cast<std::uintmax_t>(46119.4394 * MB));
+    CHECK(unclamped.d_model == 832);
+    CHECK(unclamped.n_layers == 14);
+    CHECK(unclamped.n_heads == 13);
+
+    // A genuinely huge (hypothetical) corpus DOES exceed an 8151 MiB budget (this project's own real
+    // detected VRAM) without the clamp -- the clamp then shrinks it to fit, one head at a time, holding
+    // vocab fixed (a separate axis, per the formula's own doc comment) rather than starving it.
+    const std::uintmax_t huge = 500000ull * MB;
+    const ModelDims noclamp = autosize(huge, /*vram_mb=*/0);
+    const ModelDims clamped = autosize(huge, /*vram_mb=*/8151);
+    CHECK(clamped.d_model <= noclamp.d_model);
+    CHECK(clamped.vocab == noclamp.vocab);            // vocab doesn't compete for the VRAM budget
+    CHECK(clamped.d_model % clamped.n_heads == 0);
+    CHECK(clamped.n_heads >= 2);                      // the shrink loop never goes below the floor
+
+    // The realized shape's own approximate footprint (matching the formula's internal calibration:
+    // 12*L*d^2 + 2*V*d params, ~18 bytes/param) actually fits the requested budget.
+    const double params = 12.0 * clamped.n_layers * static_cast<double>(clamped.d_model) * clamped.d_model
+                         + 2.0 * clamped.vocab * clamped.d_model;
+    CHECK(params * 18.0 / 1e6 <= 8151.0);
+
+    // A smaller card clamps further; monotonic in the budget itself (more VRAM never shrinks the model).
+    const ModelDims smallCard = autosize(huge, /*vram_mb=*/4096);
+    CHECK(smallCard.d_model <= clamped.d_model);
+
+    // vram_mb=0 is a true no-op: identical to the un-clamped call, not "clamp to zero".
+    CHECK(autosize(huge, 0).d_model == noclamp.d_model);
+}
+
+TEST_CASE("autosize: size_scale is a minimal<->ideal lever on the SAME formula", "[config][autosize]") {
+    const std::uintmax_t bytes = static_cast<std::uintmax_t>(2227.753162 * 1000000);   // tinystories.txt
+
+    const ModelDims minimal = autosize(bytes, 0, 0.5);
+    const ModelDims base    = autosize(bytes, 0, 1.0);
+    const ModelDims ideal   = autosize(bytes, 0, 2.0);
+
+    CHECK(minimal.d_model <= base.d_model);
+    CHECK(base.d_model    <= ideal.d_model);
+    CHECK(minimal.d_model < ideal.d_model);      // a real difference, not a no-op
+    // Vocab is corpus-token-count-derived, not capacity-derived -- the lever doesn't move it at all.
+    CHECK(minimal.vocab == base.vocab);
+    CHECK(base.vocab == ideal.vocab);
+    CHECK(minimal.d_model % minimal.n_heads == 0);
+    CHECK(ideal.d_model % ideal.n_heads == 0);
 }
 
 TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][autosize]") {
-    const std::uintmax_t bytes = 22ull * 1000000;       // -> auto d192 L6 H6 seq256 v4096
+    const std::uintmax_t bytes = 22ull * 1000000;       // -> auto d128 L8 H2 seq256 v4096
 
     // All auto.
     const ModelDims all = apply_autosize({}, bytes);
-    CHECK(all.d_model == 192);
+    CHECK(all.d_model == 128);
     CHECK(all.vocab == 4096);
 
     // Pin d_model + heads; the rest auto-size (and the pinned values are preserved exactly).
@@ -53,7 +134,7 @@ TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][auto
     const ModelDims r = apply_autosize(pinned, bytes);
     CHECK(r.d_model == 256);                              // pinned
     CHECK(r.n_heads == 8);                                // pinned
-    CHECK(r.n_layers == 6);                               // auto
+    CHECK(r.n_layers == 8);                               // auto
     CHECK(r.seq_len == 256);                              // auto
     CHECK(r.vocab == 4096);                               // auto
 }

@@ -577,6 +577,9 @@ int main(int argc, char** argv) {
     int prec_gemm    = 9;       // GEMM input precision: 0=F32,1=BF16,2=F16; 9=AUTO (16b if capable)
     int prec_act     = 9;       // saved-activation storage precision: same codes; 9=AUTO
     int vocab_target = 0;       // 0 = auto-size from corpus scale (autosize_dims.vocab); nonzero pins it
+    double size_scale = 1.0;    // multiplier on the auto-sizer's target-parameter budget: <1 = smaller/
+                                 // faster/safer starting point, >1 = more generous -- same formula
+                                 // throughout, just a different point on it (see config_util.hpp)
     int min_merge    = 2;
     int emit_tok     = 2;       // pretokenize corpus.tok: 0=off, 1=on, 2=AUTO (by corpus size vs half RAM)
     std::string tune_cache = sub0::build_facts::GEN_TUNE_CACHE;  // default: the build's tune cache
@@ -625,6 +628,11 @@ int main(int argc, char** argv) {
                    "Write readable vocabulary-analysis dumps to <prefix>.{corpus_vocab,token_vocab,ngrams}.txt and exit");
     app.add_option("--vocab",  vocab_target, "Target vocabulary size (base + markers + word pieces; 0 = auto from corpus)")
        ->capture_default_str();
+    app.add_option("--size-scale", size_scale,
+                   "Multiplier on the auto-sizer's target-parameter budget: <1 = a smaller/faster/safer "
+                   "starting point, >1 = more generous. Only affects auto-sized dims (--dmodel etc. or a "
+                   "pinned <corpus>.model sidecar override this entirely, same as always).")
+       ->capture_default_str()->check(CLI::PositiveNumber);
     app.add_option("--min-merge", min_merge, "Stop merging once the best pair occurs fewer than this many times")
        ->capture_default_str();
     app.add_option("--corpus-pretok", emit_tok,
@@ -687,7 +695,11 @@ int main(int argc, char** argv) {
         sub0::config::ModelDims dims{d_model, n_layers, n_heads, seq_len, vocab_target};   // CLI (0 = auto)
         bool have_sidecar = false;
         if (std::ifstream sf(sidecar); sf) { dims = sub0::config::fill_defaults(dims, sub0::config::parse_model_sidecar(sf)); have_sidecar = true; }
-        dims = sub0::config::apply_autosize(dims, corpus_size_ec ? 0 : corpus_bytes);       // fill the rest
+        // VRAM budget only applies when GPU is the RESOLVED backend (compute, already resolved above) --
+        // an explicit --compute 0 on a CUDA-capable build trains on CPU for this run, so clamping to the
+        // (irrelevant here) detected VRAM would shrink the auto-sized shape for no reason.
+        const int vram_budget = (compute == 0) ? 0 : gpu_vram_mb;
+        dims = sub0::config::apply_autosize(dims, corpus_size_ec ? 0 : corpus_bytes, vram_budget, size_scale);
         d_model = dims.d_model; n_layers = dims.n_layers; n_heads = dims.n_heads; seq_len = dims.seq_len; vocab_target = dims.vocab;
         if (!have_sidecar) { if (std::ofstream sf(sidecar); sf) sf << sub0::config::format_model_sidecar(dims); }
         std::println(stderr, "model dims: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} ({}; CLI pins)",

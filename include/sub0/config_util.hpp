@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <istream>
@@ -15,17 +16,137 @@ namespace sub0::config {
 
 // --- Model auto-sizing -----------------------------------------------------
 // The dimensions a corpus of a given size justifies, so a fresh corpus trains a sensibly-sized model
-// without hand-tuning. A coarse ladder by corpus bytes (vocab tracks the --dump-vocab curve-knee
-// findings); the exact ideal vocab is the curve knee, this is the default before analysis.
+// as a STARTING POINT without hand-tuning -- always overridable (CLI flag > <corpus>.model sidecar >
+// this). Formula-based, not a lookup table: every dimension is a smooth, monotonic function of corpus
+// scale, grounded in established scaling-law understanding AND real reference models actually trained
+// on comparable data, rather than a handful of hand-picked per-bucket values.
+//
+// 1) Token count is estimated from raw corpus bytes via a fixed bytes/token ratio -- this project's own
+//    tokenizer lands around 3.3-4 bytes/token on real English corpora once the JOIN scheme's
+//    space-folding applies (measured: 3.336 on the real tinystories.txt scan). This whole function runs
+//    BEFORE any real tokenization, so it can only ever be a starting estimate anyway -- the vocab-curve
+//    knee (`--dump-vocab`) refines it for real once the corpus is actually scanned.
+// 2) The target trainable-parameter budget uses a tokens/param ratio well above Chinchilla's pure
+//    compute-optimal 20:1 (Hoffmann et al. 2022) -- real small-model practice consistently trains far
+//    past compute-optimal because, at this scale, DATA is cheap relative to keeping the model small
+//    and deployable: SmolLM2-135M used ~14,800 tokens/param, SmolLM2-1.7B ~6,470, and even the
+//    FineWeb-Edu paper's own from-scratch ablation model (a much closer match to this project's
+//    regime -- a research-scale run, not a dedicated mega-lab training campaign) used ~192 tokens/param.
+//    100:1 is a deliberately conservative middle ground given this project's corpus is FIXED and finite
+//    (not an effectively-unlimited web-scale stream) -- its own empirical finding backs the same
+//    DIRECTION even at 20:1: the dims_analysis.py capacity sweep on the (then) 22 MB tinystories corpus
+//    found a train<val gap appearing at 5.8M params, ~1.3 tokens/param, drastically below even
+//    Chinchilla's ratio -- i.e. the corpus, not capacity, was already the ceiling there.
+// 3) That budget becomes a transformer body: N_body = 12 * n_layers * d_model^2 (the standard
+//    attention (4d^2/layer) + 4x-FFN (8d^2/layer) parameter-count identity), decomposed via a
+//    width/depth aspect ratio (d_model / n_layers) and snapped to head_dim=64-multiples (this
+//    project's own "founded" head width, see project memory) -- head-divisibility and a non-degenerate
+//    head_dim both fall out of that snapping automatically, not as a separate check. The aspect ratio
+//    itself SCALES WITH MODEL SIZE rather than staying fixed: real small models are proportionally much
+//    DEEPER than large ones -- the TinyStories paper's own reference configs keep n_layers=8 fixed from
+//    1M to 28M params (varying only width: d=64/128/256, aspect ratio 8-32), while SmolLM2-1.7B widens
+//    to d=2048/L=24 (aspect ratio ~85) and explicitly documents "prioritize depth over width" as the
+//    strategy for its smaller 135M/360M variants. A single fixed ratio can't capture that -- it's
+//    interpolated log-linearly in target_params between a small-scale floor and a large-scale ceiling,
+//    both taken directly from those real reference points rather than picked arbitrarily.
+// 4) Vocabulary follows Heaps'-law-style sublinear growth in token count (empirically, natural-language
+//    vocabulary diversity grows roughly as tokens^0.4, not linearly with corpus size) -- deliberately a
+//    SEPARATE axis from the capacity budget above, not competing with it for the same params (at very
+//    small corpus scale, embedding+head params can otherwise dominate the naive budget entirely and
+//    starve the transformer body to a degenerate size).
+// 5) seq_len scales mildly with model width (a bigger model can productively use more context) rather
+//    than with corpus bytes directly, since no per-document length statistic exists yet at this point
+//    in the pipeline (only the configure-time corpus byte count, not a scan).
+// 6) A hardware-aware clamp: if the detected GPU's VRAM (0 = unknown/CPU-only, in which case this is a
+//    no-op) can't fit even batch=1 of the naive suggestion, the shape is shrunk step-by-step (dropping
+//    one head at a time, recomputing everything derived from it, vocab held fixed since it doesn't
+//    compete for the same budget) until it does. This is what makes "point it at a big corpus" never
+//    outright FAIL on a modest GPU by default -- an explicit --dmodel override that intentionally
+//    exceeds available VRAM still hits the configurator's existing hard-error path downstream (see
+//    tools/configurator.cpp's own VRAM-clamp comment), which is correct: that's a deliberate choice,
+//    not an auto-suggestion gone wrong. The byte-budget-per-parameter constant here is a coarse
+//    approximation (real footprint also depends on batch/seq/activation precision, all handled exactly
+//    by memplan.hpp downstream) calibrated against a real measurement, not guessed.
+// 7) size_scale (default 1.0) is a caller-chosen multiplier on the target-parameter budget, from a
+//    minimal/fast/safe starting point (< 1.0) to a more generous one (> 1.0) -- the SAME formula and
+//    reasoning throughout, just a different point on it, rather than a second unrelated sizing scheme.
+//
+// Every dimension is monotonic non-decreasing in corpus_bytes (smooth functions composed with rounding,
+// clamping and the VRAM shrink-loop all stay monotonic; property-tested), d_model stays exactly
+// head-divisible by construction, and generous [min,max] clamps keep a pathologically tiny or huge
+// corpus from producing a degenerate shape even with no VRAM budget known.
 struct ModelDims { int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0; };
 
-inline ModelDims autosize(std::uintmax_t corpus_bytes) {
-    const double mb = static_cast<double>(corpus_bytes) / 1e6;
-    if (mb <    64.0) return {192,  6, 6, 256,  4096};   // ~tinystories (22 MB)
-    if (mb <   512.0) return {320,  8, 8, 256,  8192};
-    if (mb <  4096.0) return {448, 11, 7, 256, 16384};   // ~fineweb_smoke (1 GB)
-    if (mb < 32768.0) return {640, 14, 8, 512, 24576};
-    return                  {768, 16, 8, 512, 32768};    // ~full fineweb (45 GB)
+inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double size_scale = 1.0) {
+    constexpr double kBytesPerToken   = 4.0;    // a-priori estimate; refined post-tokenization
+    constexpr double kTokensPerParam  = 100.0;  // see point 2 above: conservative vs. real small-model
+                                                 // practice (192-14,800:1), well above pure Chinchilla (20:1)
+    // Width/depth aspect ratio (d_model / n_layers) interpolates log-linearly in target_params between
+    // a small-scale floor (TinyStories' own ~1M-param reference configs, aspect 8-32) and a large-scale
+    // ceiling (SmolLM2-1.7B's own real aspect ratio, ~85) -- see point 3 above.
+    constexpr double kAspectMin = 16.0, kAspectMax = 85.0, kAspectMinParams = 1e6, kAspectRefParams = 1.7e9;
+    constexpr int    kHeadDim         = 64;     // "founded" head width -- see project memory
+    constexpr double kVocabScale = 8.0, kVocabBeta = 0.4;         // Heaps'-law-style vocab growth
+    constexpr int    kMinVocab = 1024, kMaxVocab = 49152;         // token IDs must fit this project's
+                                                                   // uint16 corpus.tok encoding (<=65536)
+    constexpr int    kMinHeads = 2,    kMaxDModel = 2048;         // 2048 = 32 * kHeadDim, exact
+    constexpr int    kMinLayers = 4,   kMaxLayers = 48;
+    constexpr int    kMinSeq = 128,    kMaxSeq = 1024;
+    // Calibrated against a real measurement (this project's own memplan.hpp, BF16 activations, batch=1):
+    // a 651.9M-param shape needed ~11,158 MiB, i.e. ~17.1 bytes/param; 18 leaves a small margin so this
+    // coarse pre-check stays on the safe side of memplan's own exact byte-level accounting downstream.
+    constexpr double kBytesPerParamVram = 18.0;
+
+    const double tokens = static_cast<double>(corpus_bytes) / kBytesPerToken;
+    const double target_params = std::max(1.0, size_scale * tokens / kTokensPerParam);
+
+    const double aspect_ref = std::log10(kAspectRefParams / kAspectMinParams);
+    const auto   aspect_for = [&](double params) {
+        const double t = std::log10(std::max(params, kAspectMinParams) / kAspectMinParams);
+        return std::clamp(kAspectMin + (kAspectMax - kAspectMin) * (t / aspect_ref), kAspectMin, kAspectMax);
+    };
+
+    const double vocab_raw = kVocabScale * std::pow(std::max(1.0, tokens), kVocabBeta);
+    const int    vocab = std::clamp(static_cast<int>(std::lround(vocab_raw / 512.0)) * 512,
+                                     kMinVocab, kMaxVocab);
+
+    // Shape (d_model, n_layers, seq_len, realized param count) for a given head count -- everything
+    // downstream of n_heads is exactly determined, so the VRAM shrink-loop below just walks n_heads down.
+    // The aspect ratio itself stays pinned to the ORIGINAL corpus-derived target_params throughout (not
+    // recomputed per shrink step): it answers "how deep should a model of the scale THIS CORPUS
+    // justifies be," a separate question from "how far does hardware then force us to shrink it."
+    const double aspect = aspect_for(target_params);
+    const auto shape_for = [&](int n_heads) {
+        const int d_model  = std::min(kMaxDModel, n_heads * kHeadDim);
+        n_heads             = d_model / kHeadDim;   // re-derive: exact by construction
+        const int n_layers  = std::clamp(static_cast<int>(std::lround(d_model / aspect)),
+                                          kMinLayers, kMaxLayers);
+        const double seq_raw = 256.0 * std::sqrt(static_cast<double>(d_model) / 192.0);
+        const int    seq_len = std::clamp(static_cast<int>(std::lround(seq_raw / 128.0)) * 128,
+                                           kMinSeq, kMaxSeq);
+        const double realized_params = 12.0 * n_layers * static_cast<double>(d_model) * d_model
+                                      + 2.0 * vocab * d_model;
+        return std::tuple{d_model, n_layers, n_heads, seq_len, realized_params};
+    };
+
+    // N_body = 12*L*d^2, L = d/aspect  =>  N_body = (12/aspect) * d^3.
+    const double d_raw = std::cbrt(target_params * aspect / 12.0);
+    int n_heads = std::max(kMinHeads, static_cast<int>(std::lround(d_raw / kHeadDim)));
+
+    auto [d_model, n_layers, n_heads_final, seq_len, realized_params] = shape_for(n_heads);
+
+    // Hardware-aware clamp (point 6 above): shrink one head at a time -- recomputing everything derived
+    // from it, including vocab's own (fixed) contribution to realized_params -- until it fits, rather
+    // than a one-shot pre-estimate that can't see vocab's cost until the shape is actually known.
+    if (vram_mb > 0) {
+        const double budget_params = static_cast<double>(vram_mb) * 1e6 / kBytesPerParamVram;
+        while (realized_params > budget_params && n_heads_final > kMinHeads) {
+            --n_heads_final;
+            std::tie(d_model, n_layers, n_heads_final, seq_len, realized_params) = shape_for(n_heads_final);
+        }
+    }
+
+    return {d_model, n_layers, n_heads_final, seq_len, vocab};
 }
 
 // Fill any field of `pinned` left 0 (the "auto" sentinel) from `fallback`; a nonzero field (an
@@ -39,8 +160,9 @@ inline ModelDims fill_defaults(ModelDims pinned, const ModelDims& fallback) {
     if (pinned.vocab    == 0) pinned.vocab    = fallback.vocab;
     return pinned;
 }
-inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes) {
-    return fill_defaults(pinned, autosize(corpus_bytes));
+inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes, int vram_mb = 0,
+                                 double size_scale = 1.0) {
+    return fill_defaults(pinned, autosize(corpus_bytes, vram_mb, size_scale));
 }
 
 // FFN hidden width: 4*D_MODEL for the plain (2-matrix, GELU+bias) FFN -- this project's long-standing
