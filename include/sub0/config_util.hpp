@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "sub0/memplan.hpp"   // sub0::memplan::{Dims, max_batch_for_vram} -- gpu_batch_estimate() below
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -296,6 +298,7 @@ struct TuneDefaults {
     int  gpu_batch          = 0;   // 0 -> derived = threads * windows_per_thread (set on return)
     bool cuda_tf32          = false;
     bool tf32_from_cache    = false;
+    bool gpu_batch_from_cache = false;   // true only if a REAL `tune --backend gpu` result was read
 };
 
 inline TuneDefaults parse_tune_cache(std::istream& is, int hw_concurrency) {
@@ -308,11 +311,40 @@ inline TuneDefaults parse_tune_cache(std::istream& is, int hw_concurrency) {
         const int         val = std::atoi(line.substr(eq + 1).c_str());
         if      (key == "threads"            && val > 0) d.threads            = val;
         else if (key == "windows_per_thread" && val > 0) d.windows_per_thread = val;
-        else if (key == "gpu_batch"          && val > 0) d.gpu_batch          = val;
+        else if (key == "gpu_batch"          && val > 0) { d.gpu_batch = val; d.gpu_batch_from_cache = true; }
         else if (key == "cuda_tf32")                   { d.cuda_tf32 = (val != 0); d.tf32_from_cache = true; }
     }
     if (d.gpu_batch <= 0) d.gpu_batch = d.threads * d.windows_per_thread;
     return d;
+}
+
+// A VRAM-aware starting batch for an UNTUNED GPU build (no real `tune --backend gpu` result exists
+// yet) -- used only as the pre-tune default, never overriding a real cached tune result. Before this,
+// an untuned GPU build's DEFAULT_GPU_BATCH fell back to threads*windows_per_thread (the CPU
+// data-parallel width), which has nothing to do with GPU VRAM or throughput -- confirmed as a real,
+// live gap: a production GPU training run measured only 31% of an 8 GB card's VRAM in use at exactly
+// that CPU-derived batch (96), because a real tune had never been run for that build (see this
+// project's own "GPU batch undertuned / VRAM headroom" notes). Estimates the largest batch that
+// plausibly fits (`memplan::max_batch_for_vram`, the SAME primitive the tuner bounds its own search
+// with, so the two never disagree in spirit) against a HEADROOM-reserved budget -- `headroom_mb`
+// mirrors the tuner's own reservation for the cuBLAS GEMM workspace (allocated lazily on the first
+// matmul, invisible to the pure footprint model) plus allocator fragmentation, without which an
+// over-budget cudaMalloc doesn't fail loudly on Windows, it silently spills to WDDM shared memory and
+// thrashes over PCIe (~10x slower) -- a silent performance cliff worse than under-using VRAM. Rounded
+// DOWN to a multiple of `align` (default 32, the CUDA warp size and a safe divisor of the tensor-core
+// tile shapes cuBLAS/CUTLASS actually use) so the estimate lands on a clean, GEMM-friendly boundary
+// instead of whatever number a raw binary search happens to produce. This is a REASONABLE starting
+// point, not a substitute for actually tuning: the tuner's own search found throughput is
+// NON-monotonic in batch on this hardware (a real dip at 512 that recovers by 768), so the true
+// optimum can land on either side of this estimate -- `sub0llm tune --backend gpu` is still how you
+// find it exactly.
+inline int gpu_batch_estimate(const sub0::memplan::Dims& dims, int vram_mb, int hard_cap,
+                              sub0::memplan::u64 act_bytes, int headroom_mb = 512, int align = 32) {
+    if (vram_mb <= 0) return 0;             // unknown VRAM -> caller keeps its own (CPU-width) fallback
+    const int budget = vram_mb - headroom_mb;
+    if (budget <= 0) return 0;
+    const int fit = sub0::memplan::max_batch_for_vram(dims, budget, hard_cap, act_bytes);
+    return (fit >= align) ? (fit / align) * align : fit;   // too small to round without hitting 0
 }
 
 // --- Reduced-precision resolution ------------------------------------------

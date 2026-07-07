@@ -240,6 +240,7 @@ TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[confi
     CHECK(d0.windows_per_thread == 4);
     CHECK(d0.gpu_batch == 24 * 4);                        // derived (no tuned value)
     CHECK_FALSE(d0.tf32_from_cache);
+    CHECK_FALSE(d0.gpu_batch_from_cache);                 // so the caller knows this is NOT a real tune result
 
     // A populated cache overrides each field; an explicit gpu_batch wins over the derived one. The
     // retired attn_bwd_per_query key (flash backward is now unconditional) must be ignored, not error.
@@ -249,6 +250,7 @@ TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[confi
     CHECK(d.threads == 8);
     CHECK(d.windows_per_thread == 2);
     CHECK(d.gpu_batch == 293);                            // not 8*2
+    CHECK(d.gpu_batch_from_cache);                        // a REAL tuned value, caller should trust it
     CHECK(d.cuda_tf32);
     CHECK(d.tf32_from_cache);                             // so the caller knows to honour it
 
@@ -257,6 +259,41 @@ TEST_CASE("parse_tune_cache: defaults, keys, and the derived GPU batch", "[confi
     const TuneDefaults db = parse_tune_cache(bad, 12);
     CHECK(db.threads == 12);                              // 0 rejected -> hardware
     CHECK(db.windows_per_thread == 4);                   // -1 rejected -> default
+}
+
+TEST_CASE("gpu_batch_estimate: VRAM-scaled default for an UNTUNED GPU build", "[config][tune][gpu]") {
+    // A real-scale dims (d448/L11/H7, roughly this project's own TinyStories production model).
+    const sub0::memplan::Dims dims{448, 11, 7, 4 * 448, 256, 16517};
+    constexpr int kCap = 4096;
+
+    // Unknown VRAM -> the caller keeps its own (CPU-width) fallback, not a bogus guess.
+    CHECK(gpu_batch_estimate(dims, 0, kCap, sub0::memplan::FLOAT) == 0);
+    CHECK(gpu_batch_estimate(dims, -1, kCap, sub0::memplan::FLOAT) == 0);
+
+    // A real 8 GB card (this project's own dev machine): the estimate must (a) be a clean multiple of
+    // the default align (32), (b) actually fit within (vram_mb - headroom) when re-measured, and
+    // (c) be a meaningful improvement over the CPU-width-derived fallback this replaces (96 in
+    // production -- see the project's own "GPU batch undertuned" finding).
+    const int est8gb = gpu_batch_estimate(dims, 8151, kCap, sub0::memplan::FLOAT);
+    CHECK(est8gb % 32 == 0);
+    CHECK(est8gb > 96);
+    CHECK(sub0::memplan::train_resident_mb(dims, est8gb, sub0::memplan::FLOAT) <= 8151 - 512);
+
+    // Monotonic in VRAM: a bigger card never yields a SMALLER estimate.
+    const int est16gb = gpu_batch_estimate(dims, 16000, kCap, sub0::memplan::FLOAT);
+    CHECK(est16gb >= est8gb);
+
+    // BF16 activations halve the footprint -> a bigger batch fits the SAME VRAM than FLOAT would.
+    const int est8gb_bf16 = gpu_batch_estimate(dims, 8151, kCap, 2);
+    CHECK(est8gb_bf16 >= est8gb);
+
+    // Headroom actually shrinks the budget: a bigger headroom_mb never yields a bigger estimate.
+    const int est_more_headroom = gpu_batch_estimate(dims, 8151, kCap, sub0::memplan::FLOAT, 2048);
+    CHECK(est_more_headroom <= est8gb);
+
+    // VRAM at or below the headroom reservation alone -> nothing left to fit, returns 0 (not negative
+    // or a stale value), matching max_batch_for_vram's own "0 if even batch 1 cannot fit" contract.
+    CHECK(gpu_batch_estimate(dims, 400, kCap, sub0::memplan::FLOAT) == 0);   // headroom alone is 512
 }
 
 TEST_CASE("vocab curve: the ideal-vocab knee + bytes/token", "[config][vocab]") {

@@ -1127,6 +1127,16 @@ int main(int argc, char** argv) {
         // must match USE_QK_NORM the same way.
         const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, d_ff, seq_len, vocab,
                                          tie_embeddings != 0, qk_norm != 0 };
+        // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
+        // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
+        // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc
+        // comment -- this is exactly the gap a real production run was caught hitting: 31% VRAM used
+        // at batch 96 because that build had never been tuned for GPU).
+        if (!td.gpu_batch_from_cache) {
+            constexpr int kTuneMaxBatch = 4096;   // sanity ceiling, matches sub0_tune_stage's own cap
+            const int est = sub0::config::gpu_batch_estimate(dims, gpu_vram_mb, kTuneMaxBatch, act_bytes);
+            if (est > default_gpu_batch) default_gpu_batch = est;
+        }
         const int need = sub0::memplan::train_resident_mb(dims, default_gpu_batch, act_bytes);
         if (need > gpu_vram_mb) {
             const int fit = sub0::memplan::max_batch_for_vram(dims, gpu_vram_mb, default_gpu_batch, act_bytes);
@@ -1198,7 +1208,8 @@ int main(int argc, char** argv) {
     sos << "constexpr int  MAX_WORKERS               = " << max_workers     << ";\n";
     sos << "constexpr int  DEFAULT_THREADS           = " << default_threads << ";\n";
     sos << "constexpr int  DEFAULT_WINDOWS_PER_THREAD = " << default_wpt    << ";\n";
-    sos << "// DEFAULT_GPU_BATCH: tuned device-training minibatch; CPU data-parallel width until `tune` sets it.\n";
+    sos << "// DEFAULT_GPU_BATCH: tuned device-training minibatch, or (until `tune --backend gpu` runs) a\n";
+    sos << "// VRAM-scaled estimate (gpu_batch_estimate) -- see its own doc comment in config_util.hpp.\n";
     sos << "constexpr int  DEFAULT_GPU_BATCH         = " << default_gpu_batch << ";\n\n";
     sos << "// --- Compute backend ---------------------------------------------------\n";
     sos << "// HAS_CUDA: the CUDA device backend was built (CMake's existence check). COMPUTE_MODE: the\n";
