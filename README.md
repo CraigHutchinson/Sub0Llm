@@ -122,6 +122,28 @@ table, extends to longer contexts; **`0` = ABSOLUTE** — a learned `pos_emb[SEQ
 `--rope-theta` (default `10000`) is RoPE's frequency base. A model is only comparable to others built
 with the **same** scheme.
 
+### Architecture options
+
+A handful of shape/algorithm choices beyond dims and precision, each `constexpr`-baked at configure
+time (except `--attn-sinks`, a generation-time flag). All started CPU-only; GPU parity is landing
+incrementally (see the *Backend* column). `--gated-ffn`/`--ternary` on a GPU build are rejected at
+configure time with a clear error, not a silent fallback; `--optimizer muon` on the GPU path currently
+only warns and trains with AdamW instead (a known gap, not yet as strict as the other two). Train and
+gen must agree on these: they're part of a model's identity, like dims and vocab.
+
+| Flag | What it does | Backend | Further reading |
+|---|---|---|---|
+| `--tie-embeddings 1` | LM head reuses the token embedding matrix (transposed) instead of its own matrix+bias — fewer params, no separate head weight | CPU + GPU | [Why not tie embeddings?](https://ishanjmukherjee.github.io/why-not-tie-embeddings) |
+| `--qk-norm 1` | RMSNorm applied per-head to Q/K right after their projection, before RoPE (Gemma2-style) — stabilizes attention-logit magnitude | CPU + GPU | [QK norm is probably a free lunch](https://ishanjmukherjee.github.io/qk-norm) |
+| `--gated-ffn 1` | SwiGLU-gated FFN (`Wgate`/`Wup`/`Wdown`, no FFN bias) instead of the plain 2-matrix GELU+bias FFN — for importing GGUF/Llama-family weights | CPU only | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) (the SwiGLU paper) |
+| `--ternary 1` | BitNet-style ternary (`{-1,0,1}`) block weights | CPU only | [The Era of 1-bit LLMs (BitNet b1.58)](https://arxiv.org/abs/2402.17764) |
+| `--pos-encoding 1` (default) | RoPE — see [above](#positional-encoding) | CPU + GPU | [RoFormer](https://arxiv.org/abs/2104.09864) |
+| `--optimizer muon` (`train`) | Hidden 2D weight matrices trained with Muon (Newton-Schulz orthogonalized updates); embeddings, norms, biases, and the LM head stay on AdamW | CPU only | [Muon: an optimizer for hidden layers](https://kellerjordan.github.io/posts/muon/) |
+| `--attn-sinks N` (`gen`) | Once prompt+generation would exceed the trained context window, keep `N` tokens from the **start** of the sequence resident alongside the most recent tokens, instead of a plain sliding window that drops them | CPU + GPU | [Efficient Streaming LMs with Attention Sinks](https://arxiv.org/abs/2309.17453) (StreamingLLM) |
+
+The [ishanjmukherjee.github.io](https://ishanjmukherjee.github.io/) blog (linked twice above) is a good
+general companion for these kinds of small-but-load-bearing architecture decisions.
+
 ## Using a larger corpus (out-of-core)
 
 The default corpus is small (`data/tinystories.txt`). For something big like **FineWeb-Edu**:
