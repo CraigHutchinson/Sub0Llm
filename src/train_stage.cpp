@@ -138,7 +138,7 @@ constexpr float  MUON_LR_BASE        = 0.02f;
 constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? std::max(8, SEQ_LEN / 8) : SEQ_LEN;
 
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
-constexpr std::uint32_t CKPT_VERSION = 1u;
+constexpr std::uint32_t CKPT_VERSION = 2u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption)
 
 // --- corpus.tok access ------------------------------------------------------
 // The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
@@ -349,6 +349,7 @@ inline std::string format_eta(double secs) {
 struct RunState {
     long step = 0;
     double best_loss = std::numeric_limits<double>::infinity();
+    long best_step = -1;          // step of the best eval so far -- prune_ckpts() exempts it
     std::vector<double> evals;
 };
 
@@ -441,6 +442,7 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     wr(os, static_cast<std::int64_t>(rs.step));
     wr(os, static_cast<std::int64_t>(adam_t));
     wr(os, rs.best_loss);
+    wr(os, static_cast<std::int64_t>(rs.best_step));
     wr(os, static_cast<std::int32_t>(batch));
     wr(os, static_cast<std::uint32_t>(seed));
     wr(os, lr);
@@ -508,6 +510,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     rs.step      = static_cast<long>(rd<std::int64_t>(is));
     adam_t       = static_cast<long>(rd<std::int64_t>(is));
     rs.best_loss = rd<double>(is);
+    rs.best_step = static_cast<long>(rd<std::int64_t>(is));
     batch        = rd<std::int32_t>(is);
     seed         = rd<std::uint32_t>(is);
     lr           = rd<float>(is);
@@ -570,15 +573,22 @@ std::string latest_ckpt_path(const std::string& model_path) {
     return std::filesystem::exists(legacy) ? legacy : std::string();
 }
 
-// Keep only the newest `keep` progress checkpoints (keep<0 = keep all). Prunes the oldest first, then
-// removes any legacy single-file "<model>.ckpt" once progress files exist (it is then redundant).
-void prune_ckpts(const std::string& model_path, int keep) {
+// Keep the newest `keep` progress checkpoints (keep<0 = keep all), and ALWAYS additionally keep
+// best_step (the checkpoint at the lowest val_nelbo seen so far), even if it has aged out of the
+// newest-`keep` window -- otherwise a plateau developing right after the best eval rotates the best
+// checkpoint out before the plateau detector (which needs PLATEAU_WINDOW more evals of evidence)
+// ever gets to stop training on it, silently losing the best model this run ever produced in favor
+// of a later, worse one. Prunes the oldest first, then removes any legacy single-file
+// "<model>.ckpt" once progress files exist (it is then redundant).
+void prune_ckpts(const std::string& model_path, int keep, long best_step) {
     if (keep < 0) return;
     const auto v = list_step_ckpts(model_path);
     std::error_code ec;
-    if (static_cast<int>(v.size()) > keep)
-        for (size_t i = 0; i + static_cast<size_t>(keep) < v.size(); ++i)   // drop the oldest
-            std::filesystem::remove(v[i].second, ec);
+    std::vector<std::pair<long, std::filesystem::path>> prunable;
+    for (const auto& e : v) if (e.first != best_step) prunable.push_back(e);
+    if (static_cast<int>(prunable.size()) > keep)
+        for (size_t i = 0; i + static_cast<size_t>(keep) < prunable.size(); ++i)   // drop the oldest
+            std::filesystem::remove(prunable[i].second, ec);
     if (!v.empty()) std::filesystem::remove(legacy_ckpt_path(model_path), ec);
 }
 
@@ -1193,7 +1203,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             if (step >= warmup_steps) {
                 const double nelbo = evaluate(val_span, 0);
                 rs.evals.push_back(nelbo);
-                rs.best_loss = std::min(rs.best_loss, nelbo);
+                if (nelbo < rs.best_loss) { rs.best_loss = nelbo; rs.best_step = step; }
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
                 if (plateaued(rs.evals)) stop = true;
             }
@@ -1217,7 +1227,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // real retry-with-backoff, since there is no later interval to fall back on there.
             if (!save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed))
                 sub0::log::warn("checkpoint save failed at step {} -- will retry at the next interval", step);
-            prune_ckpts(model_path, keep);
+            prune_ckpts(model_path, keep, rs.best_step);
             if (!sub0::save_model(model_path.c_str()))
                 sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
             write_meta("training");          // refresh best_val_nelbo as it improves
@@ -1258,7 +1268,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             gpu.sync_to_host();                               // pull live device weights into the host arenas
             if (!save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed))
                 sub0::log::warn("checkpoint save failed at step {} -- will retry at the next interval", step);
-            prune_ckpts(model_path, keep);
+            prune_ckpts(model_path, keep, rs.best_step);
             if (!sub0::save_model(model_path.c_str()))
                 sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
             write_meta("training");
@@ -1280,7 +1290,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         if (!save_checkpoint(ckpt_step_path(model_path, rs.step), opt.step_count(), rng, rs, batch, lr, seed))
             sub0::log::error("checkpoint save failed during graceful stop at step {} -- training "
                              "progress may not be on disk", rs.step);
-        prune_ckpts(model_path, keep);
+        prune_ckpts(model_path, keep, rs.best_step);
         write_meta("stopped");
         // The checkpoint above is already (best-effort) on disk -- skip the sample generation (a full
         // SEQ_LEN-token decode can take real time at a large model) so the exit stays prompt.
@@ -1308,7 +1318,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         if (!save_checkpoint(fallback, opt.step_count(), rng, rs, batch, lr, seed))
             sub0::log::error("fallback checkpoint save ALSO failed -- training progress may be lost");
     }
-    prune_ckpts(model_path, keep);
+    prune_ckpts(model_path, keep, rs.best_step);
     write_meta(stop ? "plateaued" : "trained");
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
@@ -2232,16 +2242,28 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         emit("note: no model given -- showing structural (corpus-fit) guidance only.");
     }
 
-    // Grounding samples: actual generations at the gen defaults so a reader (and the saved report)
-    // can judge quality directly, not just by the loss numbers. Two temperatures bracket the
-    // determinism/diversity trade-off; the full SEQ_LEN length exercises the trained context window.
+    // Grounding samples: actual generations at a fixed grid of (prompt, temperature) so a reader --
+    // and, more importantly, a LATER cross-model-size comparison reading the saved report.txt files
+    // side by side -- can judge quality directly under identical conditions, not just from the loss
+    // numbers. Two prompts (the training preview's own "the ", and the common story-opening "Once upon
+    // a time" also used in this project's own data/tinystories_findings.txt reference) x three
+    // temperatures (0.4 near-deterministic, 0.7, and 0.8 -- gen's own real default, cli_stages.hpp's
+    // gen_temp) -- top-k 20 matches gen's default throughout. One shared, fixed-seed RNG stream across
+    // the whole grid (not independently reseeded per cell) keeps the WHOLE battery reproducible as a
+    // unit, matching this function's existing convention. Full SEQ_LEN length on every sample, even
+    // though that costs real CPU time on a big model, so every cell exercises the trained context
+    // window identically -- consistency across the grid matters more than saving time here.
     if (model_loaded) {
         sub0::load_tokenizer(sub0::default_tokenizer());   // encode/detokenize for the sample print
         std::mt19937 rng(1234);                            // fixed seed -> reproducible report samples
         emit("");
-        emit("samples ({}-token context, prompt \"the \"):", SEQ_LEN);
-        emit("  [temp 0.4]  {}", preview_at("the ", SEQ_LEN, 0.4f, 20, rng));
-        emit("  [temp 0.7]  {}", preview_at("the ", SEQ_LEN, 0.7f, 20, rng));
+        emit("samples ({}-token context, fixed seed 1234, top-k 20):", SEQ_LEN);
+        for (const char* prompt : {"the ", "Once upon a time"}) {
+            emit("  prompt \"{}\":", prompt);
+            for (float temp : {0.4f, 0.7f, 0.8f}) {
+                emit("    [temp {:.1f}]  {}", temp, preview_at(prompt, SEQ_LEN, temp, 20, rng));
+            }
+        }
     }
 
     // Same target ratio autosize() sizes fresh corpora against (sub0::config::kTokensPerParam,
@@ -2391,6 +2413,99 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
         }
         std::println("pruned {} incompatible model(s)", removed);
     }
+    return 0;
+}
+
+// --- Bundle --------------------------------------------------------------------
+// `sub0llm bundle <model>` copies THIS build's own runtime binaries (the umbrella exe + the
+// libraries gen/report actually load -- core+gen+train, deliberately NOT the CUDA backend, since
+// generation/eval always run on the CPU engine regardless of how the model was trained) into the
+// model's own directory. Opt-in and separate from `train`: every model directory's dims are pinned
+// to the exact build that produced it (see `sub0llm models`' own loadable/incompatible split), so a
+// LATER, differently-configured build of this same repo can no longer load an old checkpoint.
+// Bundling a copy of the exact binaries that CAN load it turns "reconfigure + rebuild to compare an
+// old model" into "run the bundled copy from its own model dir" -- valuable for a cross-model-size
+// research sweep (train several sizes, keep each buildable/runnable side by side), not a routine
+// step every `train` run needs.
+extern "C" SUB0_API int sub0_bundle_stage(const char* model_in) {
+    if (!model_in || !*model_in) { sub0::log::error("bundle: a model path is required"); return 1; }
+    const std::filesystem::path model_dir = std::filesystem::path(model_in).parent_path();
+    if (model_dir.empty() || !std::filesystem::exists(model_dir)) {
+        sub0::log::error("bundle: model directory not found: {}", model_dir.string());
+        return 1;
+    }
+
+#if defined(_WIN32)
+    char self_path[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameA(nullptr, self_path, MAX_PATH);
+    if (n == 0 || n == MAX_PATH) {
+        sub0::log::error("bundle: could not resolve this executable's own path");
+        return 1;
+    }
+    const std::filesystem::path self_dir = std::filesystem::path(self_path).parent_path();
+#else
+    sub0::log::error("bundle: not implemented on this platform");
+    return 1;
+#endif
+
+    static constexpr const char* kFiles[] = {
+        "sub0llm.exe", "sub0_core.dll", "sub0_gen.dll", "sub0_train.dll",
+    };
+    const std::filesystem::path bundle_dir = model_dir / "bin";
+    std::error_code ec;
+    std::filesystem::create_directories(bundle_dir, ec);
+    int copied = 0;
+    for (const char* name : kFiles) {
+        const std::filesystem::path src = self_dir / name;
+        if (!std::filesystem::exists(src)) {
+            sub0::log::warn("bundle: missing {} in {} (skipped)", name, self_dir.string());
+            continue;
+        }
+        std::filesystem::copy_file(src, bundle_dir / name,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) { sub0::log::warn("bundle: could not copy {}: {}", name, ec.message()); continue; }
+        ++copied;
+    }
+    std::println("bundled {} file(s) from {} -> {}", copied, self_dir.string(), bundle_dir.string());
+    if (copied > 0)
+        std::println("run later without rebuilding: {}\\sub0llm.exe report \"{}\"", bundle_dir.string(), model_in);
+    return copied > 0 ? 0 : 1;
+}
+
+// --- Checkpoint -> model.bin conversion ---------------------------------------
+// `sub0llm ckpt2model <ckpt> <model_out>` extracts just the weights from a full training
+// checkpoint (which also carries optimizer moments, RNG state, and eval history -- a DIFFERENT
+// binary layout from model.bin's, see save_model()/load_model() in engine_core.cpp) into a plain
+// model.bin that gen/report can load directly. This is the missing piece that makes prune_ckpts'
+// best-checkpoint exemption actually useful: keeping the best .ckpt on disk is pointless if the
+// only way to run generation against it is resuming a full training session just to get model.bin
+// re-saved from it (model.bin itself is overwritten with the LATEST weights on every eval tick, not
+// the best).
+extern "C" SUB0_API int sub0_ckpt2model_stage(const char* ckpt_in, const char* model_out) {
+    if (!ckpt_in || !*ckpt_in || !model_out || !*model_out) {
+        sub0::log::error("ckpt2model: both a checkpoint and an output model path are required");
+        return 1;
+    }
+    // Prefer the tokenizer sitting next to the checkpoint (what training actually bundled in, see
+    // bundle_into_model_dir) so the written model.bin's fingerprint trailer matches what gen/report
+    // expect; fall back to this build's own default tokenizer only if the model dir has none.
+    const std::filesystem::path sibling_tok = std::filesystem::path(ckpt_in).parent_path() / "tokenizer.tok";
+    sub0::load_tokenizer(std::filesystem::exists(sibling_tok) ? sibling_tok.string().c_str()
+                                                               : sub0::default_tokenizer());
+    sub0::build_model();   // allocates the param/Adam arenas load_checkpoint() reads into
+
+    std::mt19937 rng; RunState rs; int batch = 0; float lr = 0.0f; unsigned seed = 0; long adam_t = 0;
+    if (!load_checkpoint(ckpt_in, rng, rs, batch, lr, seed, adam_t)) {
+        sub0::log::error("ckpt2model: could not load checkpoint '{}' (see the warning above)", ckpt_in);
+        return 1;
+    }
+    if (!sub0::save_model(model_out)) {
+        sub0::log::error("ckpt2model: could not write '{}'", model_out);
+        return 1;
+    }
+    std::println("{} (step {}, best-so-far val_nelbo {}) -> {}", ckpt_in, rs.step,
+                 rs.best_loss < std::numeric_limits<double>::infinity() ? std::format("{:.4f}", rs.best_loss) : "-",
+                 model_out);
     return 0;
 }
 

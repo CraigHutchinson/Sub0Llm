@@ -194,6 +194,8 @@ The auto-derived path is deterministic, so re-running `train` resumes the same m
 | `models [--prune]` | list / prune trained models |
 | `report` | diagnose model sizing vs its corpus; per-knob retrain guidance |
 | `memplan` | predicted train/gen memory footprints (breakdown + batch sweep vs VRAM) |
+| `bundle <model>` | copy this build's exe+DLLs into a model dir; run it later without rebuilding |
+| `ckpt2model <ckpt> <out>` | extract weights from a training checkpoint into a `model.bin` gen/report can load |
 | `autotemp` | pick a coherence temperature by matching held-out perplexity |
 | `vocab` | print the (Unigram) vocabulary table |
 | `bench` | cycle-accurate hot-path benchmark (the optimization control) |

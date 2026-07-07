@@ -24,7 +24,9 @@ void usage() {
         "  autotemp  pick a sampling temperature\n"
         "  models    list / prune trained models\n"
         "  report    diagnose model sizing vs corpus\n"
-        "  memplan   predicted train/gen memory footprints\n\n"
+        "  memplan   predicted train/gen memory footprints\n"
+        "  bundle    copy this build's binaries into a model dir (run later w/o rebuilding)\n"
+        "  ckpt2model  extract weights from a .ckpt into a model.bin gen/report can load\n\n"
         "Run 'sub0llm <command> --help' for a command's options.");
 }
 }  // namespace
@@ -50,6 +52,8 @@ int main(int argc, char** argv) {
     if (cmd == "models")   return run_models(sub_argc, sub_argv);
     if (cmd == "report")   return run_report(sub_argc, sub_argv);
     if (cmd == "memplan")  return run_memplan(sub_argc, sub_argv);
+    if (cmd == "bundle")   return run_bundle(sub_argc, sub_argv);
+    if (cmd == "ckpt2model") return run_ckpt2model(sub_argc, sub_argv);
 
     std::println(stderr, "sub0llm: unknown command '{}'\n", cmd);
     usage();

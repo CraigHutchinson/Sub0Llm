@@ -30,6 +30,8 @@ extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verb
 extern "C" int sub0_report_stage(const char* model_in);
 extern "C" int sub0_memplan_stage();
 extern "C" int sub0_models_stage(int prune, int verbose);
+extern "C" int sub0_bundle_stage(const char* model_in);
+extern "C" int sub0_ckpt2model_stage(const char* ckpt_in, const char* model_out);
 
 namespace sub0cli {
 
@@ -196,6 +198,31 @@ inline int run_memplan(int argc, char** argv) {
     CLI::App app{"sub0llm memplan — predicted train/gen device memory footprints (vs VRAM)"};
     CLI11_PARSE(app, argc, argv);
     return sub0_memplan_stage();
+}
+
+// --- bundle ------------------------------------------------------------------
+inline int run_bundle(int argc, char** argv) {
+    CLI::App app{"sub0llm bundle — copy this build's exe+DLLs into a model dir so it can be run "
+                 "later (gen/report) without rebuilding, even after this build's dims change. "
+                 "Opt-in: not part of a normal train/gen workflow, meant for cross-model-size "
+                 "comparisons where several incompatible builds need to stay runnable side by side."};
+    std::string bundle_model;
+    app.add_option("model", bundle_model, "Trained model path (dims must match THIS build)")->required();
+    CLI11_PARSE(app, argc, argv);
+    return sub0_bundle_stage(bundle_model.c_str());
+}
+
+// --- ckpt2model ----------------------------------------------------------------
+inline int run_ckpt2model(int argc, char** argv) {
+    CLI::App app{"sub0llm ckpt2model — extract weights from a training checkpoint (.ckpt, includes "
+                 "optimizer/RNG state) into a model.bin gen/report can load directly. Lets you inspect "
+                 "an OLDER checkpoint (e.g. the best-val_nelbo one, kept by prune_ckpts alongside the "
+                 "newest N) without resuming a full training run."};
+    std::string ck_in, ck_out;
+    app.add_option("checkpoint", ck_in, "Input .ckpt path")->required();
+    app.add_option("model_out", ck_out, "Output model.bin path")->required();
+    CLI11_PARSE(app, argc, argv);
+    return sub0_ckpt2model_stage(ck_in.c_str(), ck_out.c_str());
 }
 
 }  // namespace sub0cli
