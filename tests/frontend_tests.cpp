@@ -48,9 +48,12 @@ TEST_CASE("memplan: max_batch_for_vram inverts the footprint (clamp + tuner cap)
     CHECK(train_resident_mb(d448, b) <= 8151);
     if (b < cap) CHECK(train_resident_mb(d448, b + 1) > 8151);
 
-    // The configurator clamp invariant: a stale over-budget batch (d448 @256 needs ~11 GiB) clamps DOWN
-    // to a batch that fits -- the same primitive the tuner bounds its sweep with, so the two agree.
-    constexpr int stale = 256;
+    // The configurator clamp invariant: a stale over-budget batch clamps DOWN to a batch that fits --
+    // the same primitive the tuner bounds its sweep with, so the two agree. Reuse b+1 (already proven
+    // just above to exceed the budget, given b < cap held there) instead of a hardcoded batch constant
+    // -- a fixed "256 needs ~11 GiB" assumption went stale on its own once the B1 chunked-lm_head/CE
+    // VRAM work (c05c6ff) cut real usage at that batch to ~7.2 GiB, silently flipping this REQUIRE.
+    const int stale = b + 1;
     REQUIRE(train_resident_mb(d448, stale) > 8151);
     const int clamped = max_batch_for_vram(d448, 8151, stale);
     CHECK(clamped < stale);
