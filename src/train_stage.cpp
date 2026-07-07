@@ -494,7 +494,16 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
                      int& batch, float& lr, unsigned& seed, long& adam_t) {
     std::ifstream is(path, std::ios::binary);
     if (!is) return false;
-    if (rd<std::uint32_t>(is) != CKPT_MAGIC || rd<std::uint32_t>(is) != CKPT_VERSION) {
+    const std::uint32_t magic = rd<std::uint32_t>(is);
+    const std::uint32_t version = rd<std::uint32_t>(is);
+    // v1->v2 only ADDED a field (best_step) -- the weights/optimizer/RNG bytes underneath are
+    // byte-identical, unlike e.g. the RoPE convention bump (a genuine math change, where reading an
+    // old checkpoint with new code would silently mean something different). Reading v1 here too
+    // (defaulting best_step to "unknown") matters in practice, not just in principle: a live training
+    // run keeps writing v1 checkpoints with its own already-running (pre-bump) binary until it is
+    // actually restarted, and this is also the resume path -- rejecting v1 outright would force a
+    // fresh restart the next time that run is resumed after a rebuild, discarding real GPU-hours.
+    if (magic != CKPT_MAGIC || (version != 1u && version != CKPT_VERSION)) {
         sub0::log::warn("ignoring checkpoint '{}' (bad magic/version)", path);
         return false;
     }
@@ -510,7 +519,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     rs.step      = static_cast<long>(rd<std::int64_t>(is));
     adam_t       = static_cast<long>(rd<std::int64_t>(is));
     rs.best_loss = rd<double>(is);
-    rs.best_step = static_cast<long>(rd<std::int64_t>(is));
+    rs.best_step = (version >= 2u) ? static_cast<long>(rd<std::int64_t>(is)) : -1;
     batch        = rd<std::int32_t>(is);
     seed         = rd<std::uint32_t>(is);
     lr           = rd<float>(is);
