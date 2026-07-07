@@ -139,6 +139,36 @@ TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][auto
     CHECK(r.vocab == 4096);                               // auto
 }
 
+TEST_CASE("token calibration: parse/format round-trip, sum-then-divide, and autosize() wiring", "[config][autosize][calibration]") {
+    // Round-trip: format then re-parse recovers the exact totals.
+    const TokenCalibration seed{48346287060ull, 14070509477ull};   // this project's real tinystories+fineweb_edu seed
+    std::istringstream ss(format_token_calibration(seed));
+    const TokenCalibration parsed = parse_token_calibration(ss);
+    CHECK(parsed.total_bytes == seed.total_bytes);
+    CHECK(parsed.total_tokens == seed.total_tokens);
+
+    // Sum-then-divide, not an average of per-corpus averages: a huge corpus outweighs a tiny one.
+    CHECK(bytes_per_token_calibrated(seed) == Catch::Approx(3.436).epsilon(0.001));
+
+    // No accumulated data (a fresh checkout, or an empty/corrupt file) -> the caller's fallback, unchanged.
+    CHECK(bytes_per_token_calibrated(TokenCalibration{}, 4.0) == 4.0);
+    CHECK(bytes_per_token_calibrated(TokenCalibration{}, 3.5) == 3.5);
+
+    // Ignores unknown keys and blank lines (forward-compatible, matches parse_model_sidecar's own leniency).
+    std::istringstream messy("# a comment\ngarbage_key=999\ntotal_bytes=100\n\ntotal_tokens=25\n");
+    const TokenCalibration m = parse_token_calibration(messy);
+    CHECK(m.total_bytes == 100);
+    CHECK(m.total_tokens == 25);
+    CHECK(bytes_per_token_calibrated(m) == Catch::Approx(4.0));
+
+    // A calibrated ratio actually changes autosize()'s output vs the generic 4.0 default (a smaller
+    // bytes/token means MORE estimated tokens for the same corpus_bytes, so a bigger suggested model).
+    const std::uintmax_t bytes = static_cast<std::uintmax_t>(2227.753162 * 1000000);   // tinystories.txt
+    const ModelDims generic     = autosize(bytes, 0, 1.0, 4.0);
+    const ModelDims calibrated  = autosize(bytes, 0, 1.0, bytes_per_token_calibrated(seed));
+    CHECK(calibrated.d_model >= generic.d_model);
+}
+
 TEST_CASE("d_ff_for: plain FFN unchanged, gated FFN roughly param-matched to it", "[config][dims]") {
     // Plain: unchanged 4x convention, exactly, regardless of d_model.
     CHECK(d_ff_for(448, false) == 4 * 448);

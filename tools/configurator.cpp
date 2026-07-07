@@ -699,7 +699,15 @@ int main(int argc, char** argv) {
         // an explicit --compute 0 on a CUDA-capable build trains on CPU for this run, so clamping to the
         // (irrelevant here) detected VRAM would shrink the auto-sized shape for no reason.
         const int vram_budget = (compute == 0) ? 0 : gpu_vram_mb;
-        dims = sub0::config::apply_autosize(dims, corpus_size_ec ? 0 : corpus_bytes, vram_budget, size_scale);
+        // Cross-corpus bytes/token calibration (see config_util.hpp's TokenCalibration): CWD-relative,
+        // matching how --corpus itself is conventionally invoked (repo root) rather than corpus-relative
+        // like the .model sidecar above -- this is a project-wide prior, not a per-corpus one.
+        double bytes_per_token = 4.0;
+        if (std::ifstream cf("data/tokenizer_calibration.txt"); cf) {
+            bytes_per_token = sub0::config::bytes_per_token_calibrated(sub0::config::parse_token_calibration(cf));
+        }
+        dims = sub0::config::apply_autosize(dims, corpus_size_ec ? 0 : corpus_bytes, vram_budget, size_scale,
+                                             bytes_per_token);
         d_model = dims.d_model; n_layers = dims.n_layers; n_heads = dims.n_heads; seq_len = dims.seq_len; vocab_target = dims.vocab;
         if (!have_sidecar) { if (std::ofstream sf(sidecar); sf) sf << sub0::config::format_model_sidecar(dims); }
         std::println(stderr, "model dims: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} ({}; CLI pins)",
@@ -1254,6 +1262,17 @@ int main(int argc, char** argv) {
             std::println(stderr, "total tokens:                    {}", token_count);
             std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
             std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
+            // Feed this REAL measurement back into the cross-corpus calibration (config_util.hpp's
+            // TokenCalibration) so the NEXT corpus's auto-sizing starts from a slightly better prior.
+            // Only reachable here (a fresh, non-reused, fully-pretokenized run), never on a cache hit --
+            // re-running configure against an unchanged corpus must not double-count the same tokens.
+            if (token_count > 0) {
+                sub0::config::TokenCalibration cal;
+                if (std::ifstream cf("data/tokenizer_calibration.txt"); cf) cal = sub0::config::parse_token_calibration(cf);
+                cal.total_bytes  += norm_bytes;
+                cal.total_tokens += token_count;
+                if (std::ofstream cf("data/tokenizer_calibration.txt"); cf) cf << sub0::config::format_token_calibration(cal);
+            }
         } else {
             std::println(stderr, "corpus.tok:                      skipped (--corpus-pretok 0; on-demand)");
         }

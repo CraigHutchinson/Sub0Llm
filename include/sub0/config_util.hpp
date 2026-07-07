@@ -21,11 +21,18 @@ namespace sub0::config {
 // scale, grounded in established scaling-law understanding AND real reference models actually trained
 // on comparable data, rather than a handful of hand-picked per-bucket values.
 //
-// 1) Token count is estimated from raw corpus bytes via a fixed bytes/token ratio -- this project's own
-//    tokenizer lands around 3.3-4 bytes/token on real English corpora once the JOIN scheme's
-//    space-folding applies (measured: 3.336 on the real tinystories.txt scan). This whole function runs
-//    BEFORE any real tokenization, so it can only ever be a starting estimate anyway -- the vocab-curve
-//    knee (`--dump-vocab`) refines it for real once the corpus is actually scanned.
+// 1) Token count is estimated from raw corpus bytes via a bytes/token ratio -- this whole function runs
+//    BEFORE any real tokenization, so it can only ever be a starting estimate. The ratio itself is
+//    CALIBRATED, not a one-off guess: `bytes_per_token` defaults to a generic 4.0 floor, but
+//    `tools/configurator.cpp` passes in the REAL running average from `data/tokenizer_calibration.txt`
+//    (see TokenCalibration below) -- an accumulated (total_bytes, total_tokens) pair across every real
+//    corpus this project's own sub0llm-configure has ever tokenized, refined a little further each time
+//    a genuinely new corpus is processed (not on a cache-hit reuse of an already-scanned one). Seeded
+//    from this project's own tinystories.txt (3.336 bytes/token) and fineweb_edu.txt (3.441, the
+//    biggest real reference so far, and the dominant contributor since it's ~20x more tokens) --
+//    combined: 3.436. The vocab-curve knee (`--dump-vocab`) is a separate, more PRECISE per-corpus
+//    refinement once a specific corpus is actually scanned; this is the cross-corpus prior that seeds
+//    the estimate before that happens.
 // 2) The target trainable-parameter budget uses a tokens/param ratio well above Chinchilla's pure
 //    compute-optimal 20:1 (Hoffmann et al. 2022) -- real small-model practice consistently trains far
 //    past compute-optimal because, at this scale, DATA is cheap relative to keeping the model small
@@ -98,8 +105,8 @@ inline double aspect_for_params(double params) {
     return std::clamp(kAspectMin + (kAspectMax - kAspectMin) * (t / aspect_ref), kAspectMin, kAspectMax);
 }
 
-inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double size_scale = 1.0) {
-    constexpr double kBytesPerToken   = 4.0;    // a-priori estimate; refined post-tokenization
+inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double size_scale = 1.0,
+                           double bytes_per_token = 4.0) {
     constexpr int    kHeadDim         = 64;     // "founded" head width -- see project memory
     constexpr double kVocabScale = 8.0, kVocabBeta = 0.4;         // Heaps'-law-style vocab growth
     constexpr int    kMinVocab = 1024, kMaxVocab = 49152;         // token IDs must fit this project's
@@ -111,8 +118,9 @@ inline ModelDims autosize(std::uintmax_t corpus_bytes, int vram_mb = 0, double s
     // a 651.9M-param shape needed ~11,158 MiB, i.e. ~17.1 bytes/param; 18 leaves a small margin so this
     // coarse pre-check stays on the safe side of memplan's own exact byte-level accounting downstream.
     constexpr double kBytesPerParamVram = 18.0;
+    if (bytes_per_token <= 0.0) bytes_per_token = 4.0;   // guard a corrupt/zero calibration file
 
-    const double tokens = static_cast<double>(corpus_bytes) / kBytesPerToken;
+    const double tokens = static_cast<double>(corpus_bytes) / bytes_per_token;
     const double target_params = std::max(1.0, size_scale * tokens / kTokensPerParam);
 
     const double vocab_raw = kVocabScale * std::pow(std::max(1.0, tokens), kVocabBeta);
@@ -170,8 +178,46 @@ inline ModelDims fill_defaults(ModelDims pinned, const ModelDims& fallback) {
     return pinned;
 }
 inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes, int vram_mb = 0,
-                                 double size_scale = 1.0) {
-    return fill_defaults(pinned, autosize(corpus_bytes, vram_mb, size_scale));
+                                 double size_scale = 1.0, double bytes_per_token = 4.0) {
+    return fill_defaults(pinned, autosize(corpus_bytes, vram_mb, size_scale, bytes_per_token));
+}
+
+// --- Cross-corpus tokenizer bytes/token calibration (data/tokenizer_calibration.txt) -----------
+// A running (total_bytes, total_tokens) accumulator across every corpus this project's own
+// sub0llm-configure has ever REALLY tokenized (a fresh scan, never a cache-hit reuse of an
+// already-scanned corpus -- see the configurator's own update call site), so autosize()'s a-priori
+// bytes/token estimate keeps improving as more real corpora are processed instead of staying pinned
+// to one generic guess forever. Sum-then-divide (not an average of per-corpus averages) so a huge
+// corpus correctly outweighs a tiny one, matching how the seed values (tinystories.txt + the much
+// bigger fineweb_edu.txt) were combined by hand before this ever ran automatically. Pure parse/format
+// (matching the <corpus>.model sidecar's own convention below); the file I/O stays in the configurator.
+struct TokenCalibration { std::uintmax_t total_bytes = 0, total_tokens = 0; };
+
+inline TokenCalibration parse_token_calibration(std::istream& is) {
+    TokenCalibration c;
+    for (std::string line; std::getline(is, line);) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq);
+        const std::uintmax_t v = std::strtoull(line.substr(eq + 1).c_str(), nullptr, 10);
+        if      (k == "total_bytes")  c.total_bytes  = v;
+        else if (k == "total_tokens") c.total_tokens = v;
+    }
+    return c;
+}
+inline std::string format_token_calibration(const TokenCalibration& c) {
+    return "# sub0 tokenizer bytes/token calibration (auto-accumulated by sub0llm-configure across\n"
+           "# every REAL tokenization run -- see autosize()'s own doc comment, point 1). Sum across\n"
+           "# every corpus processed so far; bytes_per_token = total_bytes / total_tokens.\n"
+           "total_bytes="  + std::to_string(c.total_bytes)  + "\n"
+           "total_tokens=" + std::to_string(c.total_tokens) + "\n";
+}
+// The calibrated estimate, or `fallback` (autosize()'s own generic 4.0 default) if nothing has been
+// accumulated yet (a fresh checkout with no calibration file, or a corrupt/empty one).
+inline double bytes_per_token_calibrated(const TokenCalibration& c, double fallback = 4.0) {
+    return c.total_tokens > 0
+        ? static_cast<double>(c.total_bytes) / static_cast<double>(c.total_tokens)
+        : fallback;
 }
 
 // FFN hidden width: 4*D_MODEL for the plain (2-matrix, GELU+bias) FFN -- this project's long-standing
