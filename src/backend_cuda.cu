@@ -225,6 +225,31 @@ cudaGraphExec_t g_graph_exec  = nullptr;
 int             g_graph_batch = -1;
 int             g_graph_T     = -1;
 
+// Captured graph for the per-token decode step (forward_one_device_graphed) -- see g_decode_state and
+// capture_decode_graph() below. Unlike g_graph_exec above (recaptured per (batch,T) shape), this one
+// has no shape axis to key on: forward_one_device_graphed is always M=1, so a single captured instance
+// is reused across every token of every generation session until something invalidates it (KV-cache
+// reset, a param upload, or a math-mode change -- see invalidate_decode_graph()'s call sites).
+cudaGraphExec_t g_decode_graph_exec = nullptr;
+
+// Lazily cached SM count (queried once via cudaDeviceGetAttribute, reused thereafter -- avoids a
+// per-launch device-property query). Used below to size the grid-stride dgamma-reduction kernels'
+// block count off the ACTUAL device, not a guessed constant (this project's "derive bounds from known
+// scale, not fixed thresholds" convention -- see rmsnorm_backward_act_kernel/qknorm_backward_act_kernel).
+int g_sm_count = 0;
+inline int sm_count() {
+    if (g_sm_count == 0) {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        g_sm_count = (n > 0) ? n : 20;   // sane fallback if the query somehow fails
+    }
+    return g_sm_count;
+}
+// dgamma_grid_blocks (grid-size cap for rmsnorm_backward_act_kernel/qknorm_backward_act_kernel) is
+// defined further below, right after those two kernels -- it needs their addresses for
+// cudaOccupancyMaxActiveBlocksPerMultiprocessor, so it can't live up here with sm_count().
+
 // Broadcast bias add: Y[m,o] += bias[o] over all M rows. Applied after the cuBLAS GEMM
 // (the legacy cublasSgemm has no bias epilogue) to add the linear's bias.
 // idx/bound computed in 64-bit: M*N (lm_head's bias-add is M=batch*T against N=VOCAB) overflows
@@ -778,6 +803,22 @@ __global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict
 // land in one contiguous span; the row's S = sum_j dy[j]*gamma[j]*x[j] is then a block_reduce_sum
 // instead of a sequential accumulation.
 //
+// Flush a block's per-thread partial dgamma accumulators to global memory: one atomicAdd per channel
+// the thread owns, called ONCE per block (after a caller-side grid-stride loop has finished summing
+// every row/triple that block was assigned into dg_acc, entirely in registers) rather than once per
+// row. Shared by rmsnorm_backward_act_kernel and qknorm_backward_act_kernel below -- both hit the
+// identical atomicAdd-fan-in problem (many blocks all incrementing the same handful of gamma-gradient
+// addresses; see each kernel's own comment for the ncu evidence) and both fix it the same way, just at
+// different WIDTHs (D_MODEL vs D_HEAD) -- so the flush itself is the one piece worth sharing (DRY),
+// rather than duplicating this loop in both kernel bodies. NJ is deduced from dg_acc's array extent, so
+// the caller's `constexpr int NJ = (WIDTH + BLOCK - 1) / BLOCK;` is the single source of truth for how
+// many channels each thread owns.
+template <int WIDTH, int BLOCK, int NJ>
+__device__ inline void flush_dgamma_partial(const float (&dg_acc)[NJ], float* __restrict__ dg) {
+    #pragma unroll
+    for (int k = 0, j = threadIdx.x; j < WIDTH; j += BLOCK, ++k) atomicAdd(&dg[j], dg_acc[k]);
+}
+//
 // D_MODEL is baked constexpr (one build = one architecture), not a runtime size -- rmsnorm always
 // normalizes the full residual stream, never a differently-sized slice, at every call site in this
 // file. Taking it as a compile-time constant instead of a parameter lets the strided loops fully
@@ -785,9 +826,29 @@ __global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict
 // multiply. BLOCK=64 (see launch_rmsnorm_bwd_t) evenly divides every D_MODEL this project currently
 // bakes (192/448/768), so no thread does a ragged final iteration.
 //
-// ACCUMULATES dx into the running residual-stream gradient (+=) and dgamma (atomic). Residual input x
-// is the store type; dy/dx and dgamma stay F32. F32 build: X=float; BF16: reads the half-width
-// residual. Mirrors the CPU formula exactly.
+// ACCUMULATES dx into the running residual-stream gradient (+=) and dgamma. Residual input x is the
+// store type; dy/dx and dgamma stay F32. F32 build: X=float; BF16: reads the half-width residual.
+// Mirrors the CPU formula exactly.
+//
+// dgamma reduction: ncu-profiled on a real training step (production d448/L11/H7, batch=128, this
+// project's Phase-2-audit session) at 619-625us/call, 95.67% achieved occupancy (NOT occupancy-limited
+// -- near its own ceiling already), 84.4% memory throughput, but 92-94% of the ~83-90 average stalled
+// cycles/instruction attributed to an L1TEX long-scoreboard dependency -- the same atomicAdd-fan-in
+// signature qknorm_backward_act_kernel below already documents (there: 75.8% of stall cycles, same root
+// cause). The ORIGINAL version launched one block per ROW (`t = blockIdx.x`, grid.x == rows), so every
+// one of up to ~32K rows issued its own atomicAdd into one of just D_MODEL addresses -- since occupancy
+// was already near-ceiling, more warps-in-flight wasn't the lever; fewer total atomicAdds was. Below,
+// each block now grid-strides over MULTIPLE rows (gridDim.x capped by dgamma_grid_blocks/sm_count(),
+// see that helper's comment) and keeps a PER-THREAD REGISTER accumulator (dg_acc, one slot per channel
+// the thread owns -- BLOCK divides D_MODEL evenly at every dims this project bakes, so no ragged tail)
+// across the whole stride loop, flushing to global dgamma with flush_dgamma_partial() ONCE per block
+// at the very end instead of once per row. This cuts total atomicAdds (and thus the fan-in on each
+// address) from `rows` to `gridDim.x` -- typically 1-2 orders of magnitude at production batch sizes,
+// while degenerating EXACTLY to the pre-fix one-block-per-row behavior whenever rows is already small
+// (dgamma_grid_blocks returns rows unchanged below its cap), so tiny-dims tests are unaffected. The dx
+// math itself is untouched -- only the block/grid structure and the dgamma accumulation path changed,
+// so results are numerically equivalent to the old version up to floating-point summation-order
+// differences (gated by this project's existing relL2/gradient-check tolerances, not bit-exact).
 template <class X, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ gamma,
@@ -795,22 +856,25 @@ rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ g
                             float* __restrict__ dx, float* __restrict__ dgamma, int rows) {
     constexpr int   C    = D_MODEL;
     constexpr float invC = 1.0f / static_cast<float>(C);
-    const int t = blockIdx.x;
-    if (t >= rows) return;
-    const X*     xr  = x  + static_cast<size_t>(t) * C;
-    const float* dyr = dy + static_cast<size_t>(t) * C;
-    float*       dxr = dx + static_cast<size_t>(t) * C;
-    float partial = 0.f;
-    #pragma unroll
-    for (int j = threadIdx.x; j < C; j += BLOCK) partial += dyr[j] * gamma[j] * to_f32(xr[j]);
-    const float S = block_reduce_sum<BLOCK>(partial);
-    const float r = rinv[t], r3 = r * r * r;
-    #pragma unroll
-    for (int j = threadIdx.x; j < C; j += BLOCK) {
-        const float xj = to_f32(xr[j]), dyj = dyr[j], gj = gamma[j];
-        dxr[j] += r * dyj * gj - (xj * r3 * invC) * S;
-        atomicAdd(&dgamma[j], dyj * xj * r);
+    constexpr int   NJ   = (C + BLOCK - 1) / BLOCK;   // dgamma channels owned per thread (ceil)
+    float dg_acc[NJ] = {};
+    for (int t = blockIdx.x; t < rows; t += gridDim.x) {
+        const X*     xr  = x  + static_cast<size_t>(t) * C;
+        const float* dyr = dy + static_cast<size_t>(t) * C;
+        float*       dxr = dx + static_cast<size_t>(t) * C;
+        float partial = 0.f;
+        #pragma unroll
+        for (int j = threadIdx.x; j < C; j += BLOCK) partial += dyr[j] * gamma[j] * to_f32(xr[j]);
+        const float S = block_reduce_sum<BLOCK>(partial);
+        const float r = rinv[t], r3 = r * r * r;
+        #pragma unroll
+        for (int k = 0, j = threadIdx.x; j < C; j += BLOCK, ++k) {
+            const float xj = to_f32(xr[j]), dyj = dyr[j], gj = gamma[j];
+            dxr[j] += r * dyj * gj - (xj * r3 * invC) * S;
+            dg_acc[k] += dyj * xj * r;
+        }
     }
+    flush_dgamma_partial<C, BLOCK>(dg_acc, dgamma);
 }
 
 // QK-norm backward: same math shape as rmsnorm_backward_act_kernel, grouped per (row, head, {q,k})
@@ -821,66 +885,120 @@ rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ g
 // op's OUTPUT, i.e. RoPE's backward has already converted it from "grad w.r.t. roped Q/K" back to
 // "grad w.r.t. qknorm's output" -- see backward_device's call ordering) and leaves holding dx (grad
 // w.r.t. this op's INPUT, i.e. the raw QKV-GEMM output, exactly what the qkv-GEMM's own backward
-// needs next). Each block owns a disjoint (row,head,which) slice, so the in-place overwrite is safe
-// with no cross-block aliasing. r is recomputed from the saved pre-norm x (one extra strided pass)
-// rather than a saved rinv -- the reduction is small (D_HEAD wide), so a persistent rinv buffer isn't
-// worth the extra scratch allocation. NOTE on precision: qk_pre is stored at act_t (bf16 on a BF16
-// build, matching this file's usual training-activation convention -- see TrainScratch's other bf16
-// fields), so the x this kernel's reduction reads is whatever bf16-rounded value
-// qknorm_save_act_kernel wrote. The recomputed r is therefore self-consistent with the SAME rounded x
-// the rest of this exact pipeline already operates on, in FP32 math -- NOT a bit-identical replay of
-// the forward's own r (that would require x to be resident in F32, which it isn't on a BF16 build).
-// This is the same precision budget every other BF16 checkpoint-recompute in this file already
-// accepts (a/qkv/att/fbuf/ff1/gact are all bf16-stored and recomputed the same way in backward_device).
-// dgamma accumulates via atomicAdd exactly like rmsnorm_backward_act_kernel's dgamma, but the fan-in
-// per address is H times worse here: gamma is one [1,DH] vector shared across every row AND every head
-// (rmsnorm's gamma is [1,C], written by M writers per address; qknorm's gamma is [1,DH], written by
-// M*H writers per address -- at production dims (M=4096, H=7) that is ~28,672 blocks atomically
-// incrementing each of just 64 floats). ncu measured this on a real training step (backward_device,
-// M=4096, D_MODEL=448/N_HEADS=7/D_HEAD=64, BF16): 411us vs 118us (qknorm_act_kernel, forward) and 145us
-// (qknorm_save_act_kernel, the backward recompute pass) -- a real ~2.8-3.5x slowdown, NOT explained by
-// occupancy (achieved 48.3% here vs 30.8-35.5% for the other two -- MORE warps resident, not fewer) or
-// raw throughput (13.1% compute/memory, the lowest of the three). The Warp State Statistics section
-// attributes 75.8% of the average 91.6 stalled cycles/instruction to an L1TEX long-scoreboard
-// dependency -- consistent with atomic RMW round-trip serialization on the handful of hot addresses,
-// not a bandwidth or compute ceiling. In absolute terms this is ~4.5ms of a ~59ms backward_device step
-// (11 layers x ~411us) at this scale, roughly 6-8% of the whole step -- a real, attributable cost, but
-// not the dominant one (the GEMM-heavy FFN/attention backward passes still dwarf it). Left as plain
-// per-thread atomicAdd rather than a grid-level partial-sum-then-reduce split (the fix that would
-// actually cut the fan-in) because the measured cost is moderate, not severe, and this project's
-// standing rule is to add that complexity only once ncu shows it is actually warranted -- worth
-// revisiting if a future profile shows this kernel's share of the step growing (e.g. at a much larger
-// N_HEADS, which raises the fan-in further without changing DH).
+// needs next). r is recomputed from the saved pre-norm x (one extra strided pass) rather than a saved
+// rinv -- the reduction is small (D_HEAD wide), so a persistent rinv buffer isn't worth the extra
+// scratch allocation. NOTE on precision: qk_pre is stored at act_t (bf16 on a BF16 build, matching this
+// file's usual training-activation convention -- see TrainScratch's other bf16 fields), so the x this
+// kernel's reduction reads is whatever bf16-rounded value qknorm_save_act_kernel wrote. The recomputed
+// r is therefore self-consistent with the SAME rounded x the rest of this exact pipeline already
+// operates on, in FP32 math -- NOT a bit-identical replay of the forward's own r (that would require x
+// to be resident in F32, which it isn't on a BF16 build). This is the same precision budget every other
+// BF16 checkpoint-recompute in this file already accepts (a/qkv/att/fbuf/ff1/gact are all bf16-stored
+// and recomputed the same way in backward_device).
+//
+// dgamma reduction: this kernel's fan-in is H times worse than rmsnorm_backward_act_kernel's -- gamma
+// is one [1,DH] vector shared across every row AND every head (rmsnorm's gamma is [1,C], written by M
+// writers per address; qknorm's gamma is [1,DH], written by M*H writers per address -- at production
+// dims, M=4096,H=7, that was ~28,672 writers contending on just 64 floats). ncu measured this on a real
+// training step (backward_device, M=4096, D_MODEL=448/N_HEADS=7/D_HEAD=64, BF16): 411us vs 118us
+// (qknorm_act_kernel, forward) and 145us (qknorm_save_act_kernel, the backward recompute pass) -- a
+// real ~2.8-3.5x slowdown, NOT explained by occupancy (achieved 48.3% here vs 30.8-35.5% for the other
+// two -- MORE warps resident, not fewer) or raw throughput (13.1% compute/memory, the lowest of the
+// three). The Warp State Statistics section attributed 75.8% of the average 91.6 stalled
+// cycles/instruction to an L1TEX long-scoreboard dependency -- consistent with atomic RMW round-trip
+// serialization on the handful of hot addresses, not a bandwidth or compute ceiling. That was left as
+// plain per-thread atomicAdd at the time ("fix only once ncu shows it's warranted, not preemptively");
+// a later fresh Phase-2-audit profile found rmsnorm_backward_act_kernel above has the IDENTICAL root
+// cause (92-94% of its own stalls, same L1TEX-long-scoreboard signature) and is called roughly 2x as
+// often per step (always-on, vs qknorm-only-when-enabled) -- making a SHARED fix worth doing for both
+// at once rather than treating this as one isolated 6-8%-of-a-step cost. Below: the SAME technique as
+// rmsnorm_backward_act_kernel (grid-stride over multiple (row,head) pairs per block instead of one
+// block per triple, a per-thread register accumulator across the stride loop, one flush_dgamma_partial
+// atomicAdd-per-channel at the end instead of one per triple) -- folding `head` into the same
+// grid-stride axis as `row` (not a separate grid dimension) is correct here specifically BECAUSE gamma
+// has no per-head sub-range: every head's contribution lands on the exact same DH addresses, so there
+// is no reason to keep row and head on separate axes once the goal is cutting the address's total
+// writer count. `which` (Q vs K) stays a distinct grid.z, since Q and K write to DIFFERENT gamma buffers
+// (dqgamma/dkgamma) with no shared contention to fold together.
 template <class A, int H, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 qknorm_backward_act_kernel(const A* __restrict__ qk_pre, const float* __restrict__ qgamma,
                            const float* __restrict__ kgamma, A* __restrict__ dqkv,
-                           float* __restrict__ dqgamma, float* __restrict__ dkgamma) {
+                           float* __restrict__ dqgamma, float* __restrict__ dkgamma, int rows) {
     constexpr int   C        = H * DH, in_stride = 3 * C, pre_stride = 2 * C;
     constexpr float invDH    = 1.0f / static_cast<float>(DH);
     constexpr float eps      = 1e-5f;
-    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;
-    const int off = which * C + h * DH;
-    const A* xr  = qk_pre + static_cast<size_t>(row) * pre_stride + off;
-    A*       dyr = dqkv   + static_cast<size_t>(row) * in_stride  + off;   // in: dy, out: dx (in place)
+    constexpr int   NJ       = (DH + BLOCK - 1) / BLOCK;   // dgamma channels owned per thread (ceil)
+    const int which = blockIdx.z;
     const float* g  = (which == 0) ? qgamma  : kgamma;
     float*       dg = (which == 0) ? dqgamma : dkgamma;
-    float ms = 0.f, S = 0.f;
-    #pragma unroll
-    for (int j = threadIdx.x; j < DH; j += BLOCK) {
-        const float xj = to_f32(xr[j]);
-        ms += xj * xj;
-        S  += to_f32(dyr[j]) * g[j] * xj;
+    const int total = rows * H;                            // flattened (row,head) grid-stride extent
+    float dg_acc[NJ] = {};
+    for (int rh = blockIdx.x; rh < total; rh += gridDim.x) {
+        const int row = rh / H, h = rh % H;
+        const int off = which * C + h * DH;
+        const A* xr  = qk_pre + static_cast<size_t>(row) * pre_stride + off;
+        A*       dyr = dqkv   + static_cast<size_t>(row) * in_stride  + off;   // in: dy, out: dx (in place)
+        float ms = 0.f, S = 0.f;
+        #pragma unroll
+        for (int j = threadIdx.x; j < DH; j += BLOCK) {
+            const float xj = to_f32(xr[j]);
+            ms += xj * xj;
+            S  += to_f32(dyr[j]) * g[j] * xj;
+        }
+        ms = block_reduce_sum<BLOCK>(ms) * invDH;
+        S  = block_reduce_sum<BLOCK>(S);
+        const float r = rsqrtf(ms + eps), r3 = r * r * r;
+        #pragma unroll
+        for (int k = 0, j = threadIdx.x; j < DH; j += BLOCK, ++k) {
+            const float xj = to_f32(xr[j]), dyj = to_f32(dyr[j]), gj = g[j];
+            st_act(&dyr[j], dyj * r * gj - (xj * r3 * invDH) * S);
+            dg_acc[k] += dyj * xj * r;
+        }
     }
-    ms = block_reduce_sum<BLOCK>(ms) * invDH;
-    S  = block_reduce_sum<BLOCK>(S);
-    const float r = rsqrtf(ms + eps), r3 = r * r * r;
-    #pragma unroll
-    for (int j = threadIdx.x; j < DH; j += BLOCK) {
-        const float xj = to_f32(xr[j]), dyj = to_f32(dyr[j]), gj = g[j];
-        st_act(&dyr[j], dyj * r * gj - (xj * r3 * invDH) * S);
-        atomicAdd(&dg[j], dyj * xj * r);
+    flush_dgamma_partial<DH, BLOCK>(dg_acc, dg);
+}
+
+// Actual max resident blocks/SM for a SPECIFIC compiled kernel + launch config, queried ONCE via CUDA's
+// own occupancy API (cudaOccupancyMaxActiveBlocksPerMultiprocessor) and cached -- the answer is a pure
+// function of the compiled kernel's register/shared-mem footprint and never changes at runtime, so one
+// query per distinct template instantiation is enough. This replaces an EARLIER cut of this fix that
+// used a guessed constant multiplier (32) for dgamma_grid_blocks below: ncu showed that guess produced
+// "Waves Per SM: 1.33" (grid size not a whole multiple of the REAL block limit) with a flagged partial
+// trailing wave costing up to 50% of the kernel's own runtime -- a real, measured regression from
+// guessing instead of asking CUDA directly. BLOCK is fixed at each helper's one real call site (64 for
+// rmsnorm, 32 for qknorm), so there is no risk of the same cache serving two different block sizes.
+template <class X> inline int rmsnorm_bwd_blocks_per_sm() {
+    static int cached = 0;
+    if (cached == 0) {
+        int blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsnorm_backward_act_kernel<X, 64>, 64, 0);
+        cached = (blocks > 0) ? blocks : 1;
     }
+    return cached;
+}
+template <class A, int H, int DH> inline int qknorm_bwd_blocks_per_sm() {
+    static int cached = 0;
+    if (cached == 0) {
+        int blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, qknorm_backward_act_kernel<A, H, DH, 32>, 32, 0);
+        cached = (blocks > 0) ? blocks : 1;
+    }
+    return cached;
+}
+// Grid-size cap for the dgamma-reducing backward kernels (rmsnorm_backward_act_kernel,
+// qknorm_backward_act_kernel): `blocks_per_sm` (the REAL occupancy ceiling, from
+// rmsnorm_bwd_blocks_per_sm/qknorm_bwd_blocks_per_sm above) times sm_count() times kDgammaWaves whole
+// waves -- landing on a WHOLE number of full-occupancy waves (no partial trailing wave -- see the
+// occupancy helpers' own comment for why that matters) while keeping the total block count (= the
+// atomicAdd fan-in on dgamma's handful of addresses, now ONE atomicAdd per block instead of one per
+// row) far below the row count. Degenerates to exactly `total_rows` blocks (the pre-fix
+// one-block-per-unit behavior) whenever total_rows is already <= the computed cap, e.g. every
+// small-dims unit test.
+constexpr int kDgammaWaves = 4;
+inline int dgamma_grid_blocks(long long total_rows, int blocks_per_sm) {
+    const long long cap = static_cast<long long>(blocks_per_sm) * sm_count() * kDgammaWaves;
+    return static_cast<int>(std::min(total_rows, cap));
 }
 
 // Naive causal attention backward (op_attn), HEAD-per-thread: one thread per (window b, head h) owns
@@ -1310,16 +1428,19 @@ __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict_
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
 inline void ensure_stream() { if (!g_stream) cudaStreamCreate(&g_stream); }
 
-// Invalidate the captured CUDA graph (defined below) -- a changed forward shape or GEMM math
-// mode makes it stale, so it must be recaptured.
+// Invalidate the captured CUDA graphs (defined below) -- a changed forward shape or GEMM math
+// mode makes them stale, so they must be recaptured. Two graphs share this trigger: g_graph_exec (the
+// batched forward, keyed by (batch,T)) and g_decode_graph_exec (the per-token decode step).
 void invalidate_graph();
+void invalidate_decode_graph();
 
 // Set the cuBLAS handle's math mode directly -- used to compare modes in the benchmark and to
 // force a mode in the parity tests, independent of the baked knob. The mode is baked into a
-// captured graph's algo, so changing it invalidates the graph.
+// captured graph's algo, so changing it invalidates both captured graphs.
 inline void set_handle_tf32(bool on) {
     if (g_cublas) cublasSetMathMode(g_cublas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
     invalidate_graph();
+    invalidate_decode_graph();
 }
 inline void apply_math_mode() { set_handle_tf32(CudaTf32::get()); }   // production default = baked knob
 inline void ensure_cublas() {
@@ -1496,14 +1617,17 @@ inline void launch_qknorm_save_t(A* qkv, A* qk_pre, const float* qgamma, const f
 }
 // QK-norm backward: converts dqkv's Q/K sub-blocks in place from "grad w.r.t. qknorm's output" to
 // "grad w.r.t. qknorm's input", reading the pre-norm x from qk_pre -- see qknorm_backward_act_kernel
-// above for the full call-ordering reasoning.
+// above for the full call-ordering reasoning. grid.x is capped via dgamma_grid_blocks (row*head folded
+// into one grid-stride axis -- see that kernel's own comment for why); grid.z stays 2 (Q vs K, distinct
+// output buffers).
 template <class A>
 inline void launch_qknorm_bwd_t(const A* qk_pre, const float* qgamma, const float* kgamma,
                                 A* dqkv, float* dqgamma, float* dkgamma, int rows) {
     constexpr int kQkBlock = 32;
-    const dim3 grid(rows, N_HEADS, 2);
+    const dim3 grid(dgamma_grid_blocks(static_cast<long long>(rows) * N_HEADS,
+                                       qknorm_bwd_blocks_per_sm<A, N_HEADS, D_HEAD>()), 1, 2);
     qknorm_backward_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
-        qk_pre, qgamma, kgamma, dqkv, dqgamma, dkgamma);
+        qk_pre, qgamma, kgamma, dqkv, dqgamma, dkgamma, rows);
 }
 
 // Linear backward (mirrors the Op::Linear case): given the forward input X[M,in], weight W[in,out]
@@ -1578,8 +1702,12 @@ inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
 }
 template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
                                const float* dy, float* dx, float* dgamma, int rows) {
-    constexpr int kNormBlock = 64;   // one block per row; divides every D_MODEL this project bakes
-    rmsnorm_backward_act_kernel<X, kNormBlock><<<rows, kNormBlock, 0, g_stream>>>(
+    constexpr int kNormBlock = 64;   // divides every D_MODEL this project bakes
+    // grid.x capped via dgamma_grid_blocks -- see rmsnorm_backward_act_kernel's own comment for why
+    // (bounds the dgamma atomicAdd fan-in to gridDim.x instead of `rows`); degenerates to `rows` blocks
+    // (the pre-fix one-block-per-row shape) whenever rows is already small.
+    const int blocks = dgamma_grid_blocks(rows, rmsnorm_bwd_blocks_per_sm<X>());
+    rmsnorm_backward_act_kernel<X, kNormBlock><<<blocks, kNormBlock, 0, g_stream>>>(
         x, gamma, rinv, dy, dx, dgamma, rows);
 }
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
@@ -1700,8 +1828,10 @@ int wqkv_alloc() {
 
 // Free only the batch-dependent forward buffers (for a grow-realloc); leaves wqkv intact.
 void invalidate_graph();           // fwd: a grow-realloc frees buffers the captured graph references
+void invalidate_decode_graph();    // ...and the decode graph, which references the SAME g_fwd buffers
 void fwd_free_batch() {
     invalidate_graph();            // the captured forward graph references these buffers -> drop it
+    invalidate_decode_graph();     // so does the decode graph (forward_one_device_graphed uses g_fwd too)
     cudaFree(g_fwd.dids); cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
     cudaFree(g_fwd.att);  cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
     cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
@@ -1894,47 +2024,111 @@ void train_free() {
 float* g_kv_k = nullptr;   // [N_LAYERS * SEQ_LEN * D_MODEL] -- roped K per (layer, position)
 float* g_kv_v = nullptr;   // [N_LAYERS * SEQ_LEN * D_MODEL] -- V per (layer, position)
 
+// [2] = {id, pos} for the current decode token, device-resident. Written by ONE small H2D memcpy
+// before each captured-graph replay (see replay_decode_graph below) instead of baking id/pos as
+// kernel-launch VALUE arguments -- a graph's node arguments are fixed at capture time, so a per-token
+// value would need re-capturing (or per-node patching) every call; reading id/pos from this fixed
+// buffer's CONTENTS instead means the graph's structure (and every node's arguments) is IDENTICAL
+// across every token, exactly like this file's existing batched-forward capture_graph()/cudaGraphLaunch
+// pattern (fixed buffers, changing contents) -- see capture_decode_graph()'s own comment.
+int* g_decode_state = nullptr;
+
 inline int kv_alloc() {
     if (g_kv_k) return 0;
     const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_MODEL;
     if (cudaMalloc(&g_kv_k, n * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&g_kv_v, n * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&g_decode_state, 2 * sizeof(int)) != cudaSuccess) return 1;
     return 0;
 }
-inline void kv_free() { if (g_kv_k) cudaFree(g_kv_k); if (g_kv_v) cudaFree(g_kv_v); g_kv_k = g_kv_v = nullptr; }
+inline void kv_free() {
+    if (g_kv_k) cudaFree(g_kv_k);
+    if (g_kv_v) cudaFree(g_kv_v);
+    if (g_decode_state) cudaFree(g_decode_state);
+    g_kv_k = g_kv_v = nullptr;
+    g_decode_state = nullptr;
+}
 
 // Embed one token into h[C] (+ pos_emb[pos] under Absolute; pos_emb == nullptr under RoPE).
 // C is D_MODEL at this kernel's one call site (the per-token decode path) -- constexpr-folded.
+// Body factored out so the plain (id/pos by VALUE, used by the eager eager forward_one_device path
+// below) and the _g graphed variant (id/pos read from a device pointer -- see g_decode_state's own
+// comment for why) share one implementation instead of two copies of the same math.
+__device__ inline void embed_one_body(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
+                                      int id, int pos, float* __restrict__ h, int j) {
+    constexpr int C = D_MODEL;
+    float v = tok_emb[static_cast<size_t>(id) * C + j];
+    if (pos_emb) v += pos_emb[static_cast<size_t>(pos) * C + j];
+    h[j] = v;
+}
 __global__ void embed_one_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
                                  int id, int pos, float* __restrict__ h) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= C) return;
-    float v = tok_emb[static_cast<size_t>(id) * C + j];
-    if (pos_emb) v += pos_emb[static_cast<size_t>(pos) * C + j];
-    h[j] = v;
+    embed_one_body(tok_emb, pos_emb, id, pos, h, j);
+}
+// Graphed-decode variant: id/pos come from g_decode_state[0]/[1] instead of by-value kernel arguments,
+// so this node's captured arguments never change between tokens (only the buffer's CONTENTS do) -- see
+// g_decode_state's own comment and capture_decode_graph() below.
+__global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
+                                   const int* __restrict__ id_pos, float* __restrict__ h) {
+    constexpr int C = D_MODEL;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= C) return;
+    embed_one_body(tok_emb, pos_emb, id_pos[0], id_pos[1], h, j);
 }
 // RoPE one row: rotate q (cols [0,C)) and k (cols [C,2C)) of a fused [3C] qkv row at position pos
 // (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched. C/H constexpr-folded (D_MODEL/
-// N_HEADS, its one call site) -- see rope_kernel above; pos stays runtime (the decode position).
-__global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta) {
+// N_HEADS, its one call site) -- see rope_kernel above; pos stays runtime (the decode position). Body
+// factored out for the same reason as embed_one_body above.
+__device__ inline void rope_one_body(float* __restrict__ qkv, int pos, float theta, int pg) {
     constexpr int C = D_MODEL, d = D_HEAD, half = d / 2;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pg >= C / 2) return;
     const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
     const float ang = static_cast<float>(pos) * powf(theta, -2.0f * mi / d);
     float sn, cs; __sincosf(ang, &sn, &cs);
     const float q0 = qkv[a0],     q1 = qkv[a0 + 1];     qkv[a0]     = q0 * cs - q1 * sn; qkv[a0 + 1]     = q0 * sn + q1 * cs;
     const float k0 = qkv[C + a0], k1 = qkv[C + a0 + 1]; qkv[C + a0] = k0 * cs - k1 * sn; qkv[C + a0 + 1] = k0 * sn + k1 * cs;
 }
+__global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta) {
+    constexpr int C = D_MODEL;
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pg >= C / 2) return;
+    rope_one_body(qkv, pos, theta, pg);
+}
+// Graphed-decode variant: pos read from g_decode_state[1] -- see embed_one_kernel_g's own comment.
+__global__ void rope_one_kernel_g(float* __restrict__ qkv, const int* __restrict__ pos_ptr, float theta) {
+    constexpr int C = D_MODEL;
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pg >= C / 2) return;
+    rope_one_body(qkv, *pos_ptr, theta, pg);
+}
+// Appends this token's K/V (from the just-computed qkv row) into the per-layer KV-cache at position
+// *pos_ptr -- the GRAPHED-decode counterpart of forward_one_device's two raw cudaMemcpyAsync D2D calls.
+// A captured memcpy node's destination ADDRESS is fixed at capture time, so appending at a NEW position
+// every token (a genuinely different device address per call, not just a different scalar value) needs
+// the offset computed INSIDE a kernel that reads pos from a device pointer, rather than a host-computed
+// destination pointer baked into the node at capture time. kcache_base/vcache_base are this LAYER's
+// cache base (g_kv_k/g_kv_v + l*SEQ_LEN*C) -- fixed per node, since a given layer's node is always that
+// same layer across every replay; only `pos` (read from device memory) varies.
+__global__ void kv_append_kernel(const float* __restrict__ qkv, float* __restrict__ kcache_base,
+                                 float* __restrict__ vcache_base, const int* __restrict__ pos_ptr) {
+    constexpr int C = D_MODEL;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= C) return;
+    const int pos = *pos_ptr;
+    kcache_base[static_cast<size_t>(pos) * C + j] = qkv[C + j];
+    vcache_base[static_cast<size_t>(pos) * C + j] = qkv[2 * C + j];
+}
 // Decode attention: the single (roped) query q[C] attends the cached K/V (rows over [SEQ_LEN,C]) for
 // j=0..pos -> att[C]. One block per head; blockDim=128. Shared: the query head + scores[pos+1]. The
 // math is the last-query row of op_attn, so att matches the full forward's final row to fp tolerance.
 // C is D_MODEL at its one call site -- constexpr-folded. H was a dead parameter (never read in the
 // body; the caller uses it only to size the launch's grid.x, one block per head, not passed in here).
+// Body factored out for the same reason as embed_one_body above.
 template <int HD>
-__global__ void attn_decode_kernel(const float* __restrict__ q, const float* __restrict__ kcache,
-                                   const float* __restrict__ vcache, float* __restrict__ att, int pos) {
+__device__ inline void attn_decode_body(const float* __restrict__ q, const float* __restrict__ kcache,
+                                        const float* __restrict__ vcache, float* __restrict__ att, int pos) {
     constexpr int C = D_MODEL;
     extern __shared__ float sh[];                 // qh[HD] then sc[pos+1]
     float* qh = sh;
@@ -1969,6 +2163,18 @@ __global__ void attn_decode_kernel(const float* __restrict__ q, const float* __r
         for (int j = 0; j <= pos; ++j) acc += sc[j] * vcache[static_cast<size_t>(j) * C + off + a];
         att[off + a] = acc;
     }
+}
+template <int HD>
+__global__ void attn_decode_kernel(const float* __restrict__ q, const float* __restrict__ kcache,
+                                   const float* __restrict__ vcache, float* __restrict__ att, int pos) {
+    attn_decode_body<HD>(q, kcache, vcache, att, pos);
+}
+// Graphed-decode variant: pos read from g_decode_state[1] -- see embed_one_kernel_g's own comment.
+template <int HD>
+__global__ void attn_decode_kernel_g(const float* __restrict__ q, const float* __restrict__ kcache,
+                                     const float* __restrict__ vcache, float* __restrict__ att,
+                                     const int* __restrict__ pos_ptr) {
+    attn_decode_body<HD>(q, kcache, vcache, att, *pos_ptr);
 }
 
 // ============================================================================
@@ -2059,6 +2265,64 @@ void forward_one_device(int id, int pos) {
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
           attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(l) * SEQ_LEN * C,
                                                             g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C, att, pos); }
+        launch_linear(att, Wo, nullptr, proj, 1, C, C);
+        launch_add(h, proj, h, C);
+        launch_rmsnorm(h, ln2, fbuf, 1);
+        launch_linear(fbuf, W1, b1, ff1, 1, C, F);
+        launch_gelu(ff1, gact, F);
+        launch_linear(gact, W2, b2, ff2, 1, F, C);
+        launch_add(h, ff2, h, C);
+    }
+    launch_rmsnorm(h, ln_f, a, 1);
+    if constexpr (USE_TIED_EMBEDDINGS) launch_tied_head(a, tok_emb, g_fwd.logits, 1, C, V, /*force_tc=*/true);
+    else                               launch_linear(a, lm_head, lm_bias, g_fwd.logits, 1, C, V, /*force_tc=*/true);
+}
+
+// Graphed counterpart of forward_one_device: IDENTICAL op sequence and math, but reads id/pos from
+// g_decode_state instead of taking them as arguments (embed_one_kernel_g/rope_one_kernel_g/
+// attn_decode_kernel_g) and appends K/V via kv_append_kernel instead of a raw pos-addressed
+// cudaMemcpyAsync (see g_decode_state's and kv_append_kernel's own comments for why). Every OTHER
+// launch here (rmsnorm/linear/gelu/add/qknorm) is already pos/id-independent -- pure fixed-buffer-to-
+// fixed-buffer ops -- so this function only differs from forward_one_device at the 4 spots that
+// actually touch id/pos. Called from exactly ONE place: capture_decode_graph()'s stream-capture block,
+// never eagerly -- see that function for why (this is the CAPTURE TEMPLATE, not a callable decode step).
+void forward_one_device_graphed() {
+    const auto&  L  = sub0::PARAM_LAYOUT;
+    const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
+    float* const base = g_dev_params;
+    const float* tok_emb = base + L[0].off;
+    const float* pos_emb = base + L[1].off;
+    const int    fi      = kFinalBase;
+    const float* ln_f    = base + L[fi + kLnF].off;
+    [[maybe_unused]] const float* lm_head = nullptr;
+    [[maybe_unused]] const float* lm_bias = nullptr;
+    if constexpr (!USE_TIED_EMBEDDINGS) { lm_head = base + L[fi + kLmHead].off; lm_bias = base + L[fi + kLmBias].off; }
+    float* h = g_fwd.h; float* a = g_fwd.a; float* qkv = g_fwd.qkv; float* att = g_fwd.att;
+    float* proj = g_fwd.proj; float* fbuf = g_fwd.fbuf; float* ff1 = g_fwd.ff1; float* gact = g_fwd.gact; float* ff2 = g_fwd.ff2;
+    const int* id_ptr  = g_decode_state;
+    const int* pos_ptr = g_decode_state + 1;
+
+    { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
+      embed_one_kernel_g<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id_ptr, h); }
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const int    b0  = layer_base(l);
+        const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
+        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off, *b1 = base + L[b0 + kB1].off;
+        const float* W2  = base + L[b0 + kW2].off, *b2 = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* qgamma = nullptr;
+        [[maybe_unused]] const float* kgamma = nullptr;
+        if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
+        launch_rmsnorm(h, ln1, a, 1);
+        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
+        if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
+        if constexpr (POS_ENCODING == PosEncoding::Rope) {
+            const int blk = 128; rope_one_kernel_g<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA);
+        }
+        float* kc_base = g_kv_k + static_cast<size_t>(l) * SEQ_LEN * C;   // this layer's cache base (fixed
+        float* vc_base = g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C;  // per node -- pos read on-device)
+        { const int blk = 256; kv_append_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(qkv, kc_base, vc_base, pos_ptr); }
+        { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
+          attn_decode_kernel_g<HD><<<H, 128, shb, g_stream>>>(qkv, kc_base, vc_base, att, pos_ptr); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
@@ -2168,6 +2432,40 @@ int capture_graph(int batch, int T) {
     cudaGraphDestroy(graph);
     g_graph_batch = batch;
     g_graph_T     = T;
+    return 0;
+}
+
+// Drop the captured decode graph (see g_decode_state / g_decode_graph_exec's own comments) -- called
+// everywhere invalidate_graph() above is (KV-cache reset, a param upload/download-triggered rebuild, or
+// a math-mode change), since forward_one_device_graphed reads the SAME g_dev_params/g_fwd/g_kv_k/g_kv_v
+// buffers the batched graph does and is just as stale under any of those events.
+void invalidate_decode_graph() {
+    if (g_decode_graph_exec) { cudaGraphExecDestroy(g_decode_graph_exec); g_decode_graph_exec = nullptr; }
+}
+
+// Capture forward_one_device_graphed() into an executable CUDA graph (once per KV-cache session --
+// see invalidate_decode_graph()'s call sites for what forces a recapture), collapsing decode's
+// ~147 per-token kernel launches into a single graph launch. Mirrors capture_graph() above exactly:
+// a warmup pass OUTSIDE capture lets cuBLAS's GEMV path do any lazy allocation (cudaMalloc during
+// capture is illegal), then the real capture/instantiate. The warmup's actual id/pos value is
+// irrelevant (0/0, same convention as capture_graph's ids=0 warmup) -- only the STRUCTURE is captured;
+// every real token's id/pos arrives afterward via g_decode_state's contents, never by recapturing.
+// Requires g_decode_state to already be allocated (kv_alloc, called by sub0_cuda_kv_reset before this)
+// and g_fwd.wqkv/ensure_wqkv_f32 already built (same precondition sub0_cuda_forward_one already has).
+// Returns 0 on ok.
+int capture_decode_graph() {
+    if (g_decode_graph_exec) return 0;
+    ensure_cublas();
+    const int warmup_id_pos[2] = { 0, 0 };
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_decode_state, warmup_id_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, g_stream));
+    forward_one_device_graphed();                         // warmup (safe id=pos=0): cuBLAS lazy alloc
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    cudaGraph_t graph = nullptr;
+    SUB0_CUDA_CHECK(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal));
+    forward_one_device_graphed();
+    SUB0_CUDA_CHECK(cudaStreamEndCapture(g_stream, &graph));
+    SUB0_CUDA_CHECK(cudaGraphInstantiate(&g_decode_graph_exec, graph, 0));
+    cudaGraphDestroy(graph);
     return 0;
 }
 
@@ -2538,6 +2836,9 @@ void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd,
                                                    n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2);
     build_qkv_weights();      // Wq/Wk/Wv changed -> refresh the fused inference/train weight
     invalidate_graph();       // params changed -> recapture the forward graph on next inference
+    invalidate_decode_graph();  // ...and the decode graph (defensive: training and decode don't share a
+                                // process in this project's normal usage, but cuda_tests.cpp DOES train
+                                // then decode in-process in at least one parity test)
 }
 
 }  // namespace
@@ -2609,6 +2910,7 @@ SUB0_CUDA_API int sub0_cuda_init() {
 
 SUB0_CUDA_API void sub0_cuda_shutdown() {
     invalidate_graph();
+    invalidate_decode_graph();
     if (g_dev_params) cudaFree(g_dev_params);
     g_dev_params = nullptr;
     fwd_free();                                  // release the resident forward scratch too
@@ -2626,6 +2928,7 @@ SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
                                     cudaMemcpyHostToDevice, g_stream));
     build_qkv_weights();                         // rebuild the fused [Wq|Wk|Wv] from the new weights
     invalidate_graph();                          // weights changed -> recapture the forward graph
+    invalidate_decode_graph();                   // ...and the decode graph
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     return 0;
 }
@@ -2725,20 +3028,36 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
 
 // Reset the decode KV-cache for a new sequence: ensure the M=1 forward scratch + the K/V cache exist.
 // (Positions are supplied per call, so "reset" just guarantees the buffers.) Requires uploaded params.
+//
+// set_handle_tf32(false) (tight FP32 inference math, parity with the CPU path) lives HERE, once per
+// generation session, rather than inside sub0_cuda_forward_one below -- it used to run on EVERY decode
+// token, but the handle's math mode doesn't change between tokens within one generation, so repeating
+// it ~150-200x/session (once per sampled token) was pure waste on an already launch-count-dominated
+// hot path (see the Phase-1 decode-loop audit: GPU busy only ~31% of decode wall-time, dominated by
+// per-token kernel-launch dispatch, not by this kind of redundant call -- still, free to remove).
 SUB0_CUDA_API int sub0_cuda_kv_reset() {
     if (!g_dev_params) return 1;
     if (fwd_alloc(1) || kv_alloc()) return 1;
     ensure_cublas();
+    set_handle_tf32(false);
     return 0;
 }
-// One decode step: token `id` at window position `pos` (0-based, < SEQ_LEN). Runs forward_one_device
-// and copies the logits [VOCAB] to the host. Requires sub0_cuda_upload_params + sub0_cuda_kv_reset.
+// One decode step: token `id` at window position `pos` (0-based, < SEQ_LEN). Runs the CAPTURED decode
+// graph (forward_one_device_graphed, one cudaGraphLaunch instead of forward_one_device's ~147
+// individual kernel launches -- see the Phase-2 decode-loop audit: GPU busy was only ~31% of decode
+// wall-time, cudaLaunchKernel alone was 68.6% of it, dominated by per-token launch dispatch, not actual
+// GPU work) and copies the logits [VOCAB] to the host. Requires sub0_cuda_upload_params +
+// sub0_cuda_kv_reset (which also sets the FP32 math mode this path needs, and allocates g_decode_state
+// -- see that function's comment). Captures the graph lazily on first use per session (or after any
+// invalidate_decode_graph() trigger); every call after that is just the {id,pos} memcpy + graph replay.
 SUB0_CUDA_API int sub0_cuda_forward_one(int id, int pos, float* out_logits) {
     if (!g_dev_params || !g_kv_k) return 1;
     if (id < 0 || id >= VOCAB || pos < 0 || pos >= SEQ_LEN) return 1;
     if (ensure_wqkv_f32()) return 1;               // BF16: (re)build the F32 mirror this path reads
-    set_handle_tf32(false);                       // tight FP32 inference math (parity with the CPU path)
-    forward_one_device(id, pos);
+    if (capture_decode_graph()) return 1;          // no-op if already captured for this session
+    const int h_id_pos[2] = { id, pos };
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_decode_state, h_id_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaGraphLaunch(g_decode_graph_exec, g_stream));
     SUB0_CUDA_CHECK(cudaMemcpyAsync(out_logits, g_fwd.logits, VOCAB * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
@@ -3419,8 +3738,12 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     SUB0_CUDA_CHECK(cudaMemcpy(dDqgamma, hDqgammaSeed.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
     SUB0_CUDA_CHECK(cudaMemcpy(dDkgamma, hDkgammaSeed.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
 
-    qknorm_backward_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
-        dQkPre, dQgamma, dKgamma, dDqkv, dDqgamma, dDkgamma);
+    // Backward kernel's grid differs from the forward's `grid` above -- row*head folded into one
+    // grid-stride axis, capped via dgamma_grid_blocks (see qknorm_backward_act_kernel's own comment).
+    const dim3 bwd_grid(dgamma_grid_blocks(static_cast<long long>(rows) * H,
+                                           qknorm_bwd_blocks_per_sm<float, H, DH>()), 1, 2);
+    qknorm_backward_act_kernel<float, H, DH, kQkBlock><<<bwd_grid, kQkBlock, 0, g_stream>>>(
+        dQkPre, dQgamma, dKgamma, dDqkv, dDqgamma, dDkgamma, rows);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
 
