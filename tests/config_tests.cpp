@@ -139,26 +139,41 @@ TEST_CASE("apply_autosize: 0 fields auto, nonzero fields pinned", "[config][auto
     CHECK(r.vocab == 4096);                               // auto
 }
 
-TEST_CASE("token calibration: parse/format round-trip, sum-then-divide, and autosize() wiring", "[config][autosize][calibration]") {
-    // Round-trip: format then re-parse recovers the exact totals.
-    const TokenCalibration seed{48346287060ull, 14070509477ull};   // this project's real tinystories+fineweb_edu seed
+TEST_CASE("token calibration: per-corpus ledger round-trip, upsert idempotency, sum-then-divide", "[config][autosize][calibration]") {
+    // Round-trip: format then re-parse recovers the exact per-corpus entries.
+    TokenCalibration seed;                     // this project's real tinystories+fineweb_edu seed
+    upsert_token_calibration(seed, "tinystories.txt", 2226847660ull, 667617584ull);
+    upsert_token_calibration(seed, "fineweb_edu.txt", 46119439400ull, 13402891893ull);
     std::istringstream ss(format_token_calibration(seed));
     const TokenCalibration parsed = parse_token_calibration(ss);
-    CHECK(parsed.total_bytes == seed.total_bytes);
-    CHECK(parsed.total_tokens == seed.total_tokens);
+    REQUIRE(parsed.entries.size() == 2);
+    CHECK(parsed.entries[0].corpus == "tinystories.txt");
+    CHECK(parsed.entries[0].bytes  == 2226847660ull);
+    CHECK(parsed.entries[1].tokens == 13402891893ull);
 
     // Sum-then-divide, not an average of per-corpus averages: a huge corpus outweighs a tiny one.
     CHECK(bytes_per_token_calibrated(seed) == Catch::Approx(3.436).epsilon(0.001));
+
+    // Upsert is idempotent: re-measuring an ALREADY-listed corpus (e.g. re-tokenized in a different
+    // build dir) REPLACES its entry rather than adding a second one -- the real bug this ledger
+    // design replaced a flat running-total accumulator to fix (see upsert_token_calibration's own
+    // doc comment). The combined ratio must be UNCHANGED by a repeat measurement of the same corpus.
+    TokenCalibration reseeded = seed;
+    upsert_token_calibration(reseeded, "tinystories.txt", 2226847660ull, 667617584ull);
+    CHECK(reseeded.entries.size() == 2);   // still 2, not 3 -- no duplicate row
+    CHECK(bytes_per_token_calibrated(reseeded) == Catch::Approx(bytes_per_token_calibrated(seed)));
 
     // No accumulated data (a fresh checkout, or an empty/corrupt file) -> the caller's fallback, unchanged.
     CHECK(bytes_per_token_calibrated(TokenCalibration{}, 4.0) == 4.0);
     CHECK(bytes_per_token_calibrated(TokenCalibration{}, 3.5) == 3.5);
 
-    // Ignores unknown keys and blank lines (forward-compatible, matches parse_model_sidecar's own leniency).
-    std::istringstream messy("# a comment\ngarbage_key=999\ntotal_bytes=100\n\ntotal_tokens=25\n");
+    // Ignores comments, blank lines, and malformed rows (forward-compatible, matches
+    // parse_model_sidecar's own leniency).
+    std::istringstream messy("# a comment\ngarbage line with no tabs\n\ncorpus_a\t100\t25\n");
     const TokenCalibration m = parse_token_calibration(messy);
-    CHECK(m.total_bytes == 100);
-    CHECK(m.total_tokens == 25);
+    REQUIRE(m.entries.size() == 1);
+    CHECK(m.entries[0].bytes == 100);
+    CHECK(m.entries[0].tokens == 25);
     CHECK(bytes_per_token_calibrated(m) == Catch::Approx(4.0));
 
     // A calibrated ratio actually changes autosize()'s output vs the generic 4.0 default (a smaller

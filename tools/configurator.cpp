@@ -1264,13 +1264,16 @@ int main(int argc, char** argv) {
             std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
             // Feed this REAL measurement back into the cross-corpus calibration (config_util.hpp's
             // TokenCalibration) so the NEXT corpus's auto-sizing starts from a slightly better prior.
-            // Only reachable here (a fresh, non-reused, fully-pretokenized run), never on a cache hit --
-            // re-running configure against an unchanged corpus must not double-count the same tokens.
+            // Only reachable here (a fresh, non-reused, fully-pretokenized run), never on a cache hit.
+            // Keyed by corpus path and UPSERTED (not accumulated): this same run can be reached again
+            // from a different build dir that forces a fresh re-tokenize of the SAME corpus (a new
+            // --dmodel/--layers/--heads pin, a fresh checkout, ...), and a flat running total would
+            // double-count it every time -- see upsert_token_calibration()'s own doc comment.
             if (token_count > 0) {
                 sub0::config::TokenCalibration cal;
                 if (std::ifstream cf("data/tokenizer_calibration.txt"); cf) cal = sub0::config::parse_token_calibration(cf);
-                cal.total_bytes  += norm_bytes;
-                cal.total_tokens += token_count;
+                sub0::config::upsert_token_calibration(
+                    cal, std::filesystem::weakly_canonical(corpus).string(), norm_bytes, token_count);
                 if (std::ofstream cf("data/tokenizer_calibration.txt"); cf) cf << sub0::config::format_token_calibration(cal);
             }
         } else {

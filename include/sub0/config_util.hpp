@@ -24,11 +24,11 @@ namespace sub0::config {
 // 1) Token count is estimated from raw corpus bytes via a bytes/token ratio -- this whole function runs
 //    BEFORE any real tokenization, so it can only ever be a starting estimate. The ratio itself is
 //    CALIBRATED, not a one-off guess: `bytes_per_token` defaults to a generic 4.0 floor, but
-//    `tools/configurator.cpp` passes in the REAL running average from `data/tokenizer_calibration.txt`
-//    (see TokenCalibration below) -- an accumulated (total_bytes, total_tokens) pair across every real
-//    corpus this project's own sub0llm-configure has ever tokenized, refined a little further each time
-//    a genuinely new corpus is processed (not on a cache-hit reuse of an already-scanned one). Seeded
-//    from this project's own tinystories.txt (3.336 bytes/token) and fineweb_edu.txt (3.441, the
+//    `tools/configurator.cpp` passes in the REAL combined average from `data/tokenizer_calibration.txt`
+//    (see TokenCalibration below) -- a per-corpus LEDGER, one (bytes, tokens) entry per corpus this
+//    project's own sub0llm-configure has ever tokenized, upserted (not accumulated) each time a fresh
+//    tokenization happens so re-measuring the same corpus from a different build dir never double-counts
+//    it. Seeded from this project's own tinystories.txt (3.336 bytes/token) and fineweb_edu.txt (3.441, the
 //    biggest real reference so far, and the dominant contributor since it's ~20x more tokens) --
 //    combined: 3.436. The vocab-curve knee (`--dump-vocab`) is a separate, more PRECISE per-corpus
 //    refinement once a specific corpus is actually scanned; this is the cross-corpus prior that seeds
@@ -183,41 +183,64 @@ inline ModelDims apply_autosize(ModelDims pinned, std::uintmax_t corpus_bytes, i
 }
 
 // --- Cross-corpus tokenizer bytes/token calibration (data/tokenizer_calibration.txt) -----------
-// A running (total_bytes, total_tokens) accumulator across every corpus this project's own
-// sub0llm-configure has ever REALLY tokenized (a fresh scan, never a cache-hit reuse of an
-// already-scanned corpus -- see the configurator's own update call site), so autosize()'s a-priori
+// A per-corpus LEDGER (one (bytes, tokens) entry per distinct corpus path), so autosize()'s a-priori
 // bytes/token estimate keeps improving as more real corpora are processed instead of staying pinned
-// to one generic guess forever. Sum-then-divide (not an average of per-corpus averages) so a huge
-// corpus correctly outweighs a tiny one, matching how the seed values (tinystories.txt + the much
-// bigger fineweb_edu.txt) were combined by hand before this ever ran automatically. Pure parse/format
-// (matching the <corpus>.model sidecar's own convention below); the file I/O stays in the configurator.
-struct TokenCalibration { std::uintmax_t total_bytes = 0, total_tokens = 0; };
+// to one generic guess forever. Keyed by corpus path rather than a single running total: the same
+// named corpus (e.g. tinystories.txt) gets re-tokenized fresh in every new/reconfigured build
+// directory this project uses (ts_smoke, ts_cuda, a one-off test dir, ...), and a flat accumulator
+// would add that corpus's contribution again on every one of those -- silently inflating its weight
+// in the combined estimate every time someone spins up a new build dir for the SAME corpus. An
+// upsert (replace this corpus's entry, don't add to a total) makes re-measuring idempotent: the
+// calibration reflects each corpus's real bytes/token exactly once, no matter how many times or
+// where it gets tokenized. bytes_per_token_calibrated() sums bytes and tokens ACROSS entries
+// (sum-then-divide, not an average of per-corpus averages) so a huge corpus still correctly
+// outweighs a tiny one -- matching how the original two-corpus seed (tinystories.txt + the much
+// bigger fineweb_edu.txt) was combined by hand before this ever ran automatically. Pure parse/format/
+// upsert (matching the <corpus>.model sidecar's own convention below); the file I/O stays in the
+// configurator.
+struct TokCorpusEntry { std::string corpus; std::uintmax_t bytes = 0, tokens = 0; };
+struct TokenCalibration { std::vector<TokCorpusEntry> entries; };
 
 inline TokenCalibration parse_token_calibration(std::istream& is) {
     TokenCalibration c;
     for (std::string line; std::getline(is, line);) {
-        const auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string k = line.substr(0, eq);
-        const std::uintmax_t v = std::strtoull(line.substr(eq + 1).c_str(), nullptr, 10);
-        if      (k == "total_bytes")  c.total_bytes  = v;
-        else if (k == "total_tokens") c.total_tokens = v;
+        if (line.empty() || line[0] == '#') continue;
+        const auto t1 = line.find('\t');
+        const auto t2 = (t1 == std::string::npos) ? std::string::npos : line.find('\t', t1 + 1);
+        if (t1 == std::string::npos || t2 == std::string::npos) continue;
+        TokCorpusEntry e;
+        e.corpus = line.substr(0, t1);
+        e.bytes  = std::strtoull(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+        e.tokens = std::strtoull(line.substr(t2 + 1).c_str(), nullptr, 10);
+        if (!e.corpus.empty()) c.entries.push_back(std::move(e));
     }
     return c;
 }
 inline std::string format_token_calibration(const TokenCalibration& c) {
-    return "# sub0 tokenizer bytes/token calibration (auto-accumulated by sub0llm-configure across\n"
-           "# every REAL tokenization run -- see autosize()'s own doc comment, point 1). Sum across\n"
-           "# every corpus processed so far; bytes_per_token = total_bytes / total_tokens.\n"
-           "total_bytes="  + std::to_string(c.total_bytes)  + "\n"
-           "total_tokens=" + std::to_string(c.total_tokens) + "\n";
+    std::string out =
+        "# sub0 tokenizer bytes/token calibration ledger (auto-accumulated by sub0llm-configure --\n"
+        "# see autosize()'s own doc comment, point 1). One line per DISTINCT corpus (re-tokenizing an\n"
+        "# already-listed corpus REPLACES its entry, so this stays correct across many build dirs).\n"
+        "# path\\tbytes\\ttokens\n";
+    for (const TokCorpusEntry& e : c.entries)
+        out += e.corpus + "\t" + std::to_string(e.bytes) + "\t" + std::to_string(e.tokens) + "\n";
+    return out;
+}
+// Idempotent upsert: a fresh measurement of `corpus` replaces its existing entry (if any) rather
+// than accumulating on top of it, so tokenizing the same corpus again -- in a different build dir,
+// or after an unrelated config change forces a re-tokenize -- never double-counts it.
+inline void upsert_token_calibration(TokenCalibration& c, const std::string& corpus,
+                                     std::uintmax_t bytes, std::uintmax_t tokens) {
+    for (TokCorpusEntry& e : c.entries)
+        if (e.corpus == corpus) { e.bytes = bytes; e.tokens = tokens; return; }
+    c.entries.push_back({corpus, bytes, tokens});
 }
 // The calibrated estimate, or `fallback` (autosize()'s own generic 4.0 default) if nothing has been
 // accumulated yet (a fresh checkout with no calibration file, or a corrupt/empty one).
 inline double bytes_per_token_calibrated(const TokenCalibration& c, double fallback = 4.0) {
-    return c.total_tokens > 0
-        ? static_cast<double>(c.total_bytes) / static_cast<double>(c.total_tokens)
-        : fallback;
+    std::uintmax_t bytes = 0, tokens = 0;
+    for (const TokCorpusEntry& e : c.entries) { bytes += e.bytes; tokens += e.tokens; }
+    return tokens > 0 ? static_cast<double>(bytes) / static_cast<double>(tokens) : fallback;
 }
 
 // FFN hidden width: 4*D_MODEL for the plain (2-matrix, GELU+bias) FFN -- this project's long-standing

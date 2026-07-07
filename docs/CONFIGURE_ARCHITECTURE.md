@@ -70,10 +70,11 @@ future fully-decoupled bootstrap ever wants it — but it is not a win today.)
 dimension is a smooth, monotonic function of corpus scale, not a handful of hand-picked per-bucket
 values. Token count is estimated from raw bytes via `bytes_per_token`, which the configurator reads
 from `data/tokenizer_calibration.txt` (falling back to a generic 4.0 if that file is absent) — a
-running (total_bytes, total_tokens) sum across every corpus this project's own tokenizer has actually
-processed (seeded from tinystories.txt + fineweb_edu.txt: 3.436 combined), updated automatically after
-every fresh (non-reused) tokenization so the estimate keeps improving as more real corpora are
-processed. See `TokenCalibration` in `include/sub0/config_util.hpp`. The target
+per-corpus LEDGER (one bytes/tokens entry per corpus path, seeded from tinystories.txt +
+fineweb_edu.txt: 3.436 combined), UPSERTED after every fresh (non-reused) tokenization so re-measuring
+the same corpus from a different build dir replaces its entry instead of double-counting it, while the
+estimate keeps improving as genuinely new corpora are processed. See `TokenCalibration` in
+`include/sub0/config_util.hpp`. The target
 parameter budget follows a tokens/param ratio well above pure Chinchilla-optimal (100:1, informed by
 real small-model practice — TinyStories' own reference configs, SmolLM2, the FineWeb-Edu paper's own
 ablation model); that budget decomposes into `d_model`/`n_layers` via a width/depth aspect ratio that
