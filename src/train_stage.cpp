@@ -608,12 +608,20 @@ void prune_ckpts(const std::string& model_path, int keep, long best_step) {
 std::string preview_at(const std::string& prompt, int n, float temp, int topk, std::mt19937& rng) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
+    // Same learned stop signal gen_stage.cpp's decode loops check (see core.hpp's eos_token_id()
+    // doc comment): stop BEFORE pushing so the marker is never printed, instead of always running
+    // to the fixed token budget `n`. Without this, previews/report.txt samples ran straight through
+    // EOS and kept sampling past it -- a context the model was never trained to continue from (every
+    // training document ends there), producing the `<|endoftext|>`-chained rambling this fixes.
+    const int eos_id = sub0::eos_token_id();
     for (int s = 0; s < n; ++s) {
         int T = std::min((int)ctx.size(), SEQ_LEN);
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
         const int last = logits->rows - 1;
-        ctx.push_back(sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng));
+        const int next = sub0::sample_token(logits->data.data() + (size_t)last * VOCAB, temp, topk, rng);
+        if (next == eos_id) break;
+        ctx.push_back(next);
     }
     sub0::graph_reset();
     return sub0::detokenize(ctx);
@@ -1957,6 +1965,7 @@ GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
     const std::size_t span = (last > val_start) ? last - val_start : 0;
     const int prefix_len = std::max(1, std::min(SEQ_LEN / 4, 16));
     std::mt19937 rng(cr_seed);                          // common random numbers across temps
+    const int eos_id = sub0::eos_token_id();             // same learned stop signal as gen/preview_at
 
     double nll_sum = 0.0, rep_sum = 0.0; long nll_n = 0;
     std::vector<int> gen; gen.reserve(static_cast<std::size_t>(gen_len));
@@ -1973,6 +1982,11 @@ GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
             sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
             const float* row = logits->data.data() + static_cast<std::size_t>(logits->rows - 1) * VOCAB;
             const int tok = sub0::sample_token(row, temp, topk, rng);
+            // A natural EOS here is the model reaching a real, learned document end -- sampling past
+            // it would score an out-of-distribution continuation (no document ever trains on
+            // "what comes after EOS") as if it were representative degeneration/repetition at this
+            // temperature, corrupting the exact statistic this tuner calibrates against.
+            if (tok == eos_id) break;
             // Surprise of the chosen token under the TRUE (T=1) model distribution.
             float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
             double Z = 0.0; for (int j = 0; j < VOCAB; ++j) Z += std::exp(static_cast<double>(row[j] - mx));
