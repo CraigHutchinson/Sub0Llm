@@ -141,7 +141,7 @@ gen must agree on these: they're part of a model's identity, like dims and vocab
 |---|---|---|---|
 | `--tie-embeddings 1` | LM head reuses the token embedding matrix (transposed) instead of its own matrix+bias — fewer params, no separate head weight | CPU + GPU | [Why not tie embeddings?](https://ishanjmukherjee.github.io/why-not-tie-embeddings) |
 | `--qk-norm 1` | RMSNorm applied per-head to Q/K right after their projection, before RoPE (Gemma2-style) — stabilizes attention-logit magnitude | CPU + GPU | [QK norm is probably a free lunch](https://ishanjmukherjee.github.io/qk-norm) |
-| `--gated-ffn 1` | SwiGLU-gated FFN (`Wgate`/`Wup`/`Wdown`, no FFN bias) instead of the plain 2-matrix GELU+bias FFN — for importing GGUF/Llama-family weights | CPU only | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) (the SwiGLU paper) |
+| `--gated-ffn 1` | SwiGLU-gated FFN (`Wgate`/`Wup`/`Wdown`, no FFN bias) instead of the plain 2-matrix GELU+bias FFN — for importing GGUF/Llama-family weights | CPU + GPU | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) (the SwiGLU paper) |
 | `--ternary 1` | BitNet-style ternary (`{-1,0,1}`) block weights | CPU only | [The Era of 1-bit LLMs (BitNet b1.58)](https://arxiv.org/abs/2402.17764) |
 | `--pos-encoding 1` (default) | RoPE — see [above](#positional-encoding) | CPU + GPU | [RoFormer](https://arxiv.org/abs/2104.09864) |
 | `--optimizer muon` (`train`) | Hidden 2D weight matrices trained with Muon (Newton-Schulz orthogonalized updates); embeddings, norms, biases, and the LM head stay on AdamW | CPU only | [Muon: an optimizer for hidden layers](https://kellerjordan.github.io/posts/muon/) |

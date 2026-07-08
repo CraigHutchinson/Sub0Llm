@@ -42,14 +42,19 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
-// SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights) has no CUDA kernel yet
-// -- op_swiglu and the Wg/W1/W2-as-up/down layout only exist in backend_cpu.cpp today. Hard stop here
-// rather than silently computing the wrong (plain-GELU) forward on a gated model's weights. The
-// configurator also refuses --gated-ffn 1 with a GPU compute backend (an earlier, clearer error);
-// this is the safety net for anyone who bypasses that (e.g. hand-editing the generated header).
-// TODO(gated-ffn-gpu): a SwiGLU forward/backward kernel + the Wg param slot, then lift this guard.
-static_assert(!USE_GATED_FFN,
-    "the CUDA backend has no SwiGLU-gated-FFN kernel yet; --gated-ffn is CPU-only for now (TODO(gated-ffn-gpu)).");
+// SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights): GPU support landed.
+// swiglu_kernel/swiglu_act_kernel/swiglu_backward_act_kernel below implement op_swiglu's forward/
+// backward exactly (see backend_cpu.cpp), `if constexpr (USE_GATED_FFN)`-gated at each forward/
+// forward_one/backward call site, mirroring backend_cpu.cpp's Model struct. The per-layer PARAM_LAYOUT
+// offsets this file indexes are resolved through the named kWg/kW1/kW2/etc. constants (see "per-layer
+// parameter slot offsets" below), which now bake the gated 9/11-slot layer shape (Wg,W1,W2, no
+// b1/b2) alongside the plain 10/12-slot one. The backward's checkpoint-recompute (fbuf/ff1/gact are
+// NOT saved per-layer, see forward_train's own comment) means the gated backward recomputes THREE
+// intermediates (gate_pre, up_pre, and their SwiGLU combination) by reusing the plain path's existing
+// ff1/gact/dff1/dgact `[M,F]` scratch buffers under role-remapping rather than adding new ones -- see
+// backward_device's gated FFN branch for the exact sequence and buffer roles at each step. The
+// configurator's --gated-ffn/--compute refusal has been lifted to match. (No static_assert left for
+// this axis -- ternary above remains CPU-only and keeps its guard.)
 
 // Tied embeddings (USE_TIED_EMBEDDINGS): the LM head reuses tok_emb (transposed) instead of its own
 // matrix+bias -- see op_tied_head in backend_cpu.cpp for the reference semantics. Every forward/
@@ -60,8 +65,8 @@ static_assert(!USE_GATED_FFN,
 // contributions into tok_emb's grad (the tied head's own dtable = dY^T @ a_final, reusing
 // launch_linear_bwd's dW GEMM shape with accumulate=true, plus the pre-existing embedding-lookup
 // scatter-add) -- see launch_tied_head_bwd below. The configurator's --tie-embeddings/--compute
-// refusal has been lifted to match. (No static_assert left for this axis -- ternary/gated-FFN above
-// remain CPU-only and keep their guards; this one is now a real, tested GPU capability.)
+// refusal has been lifted to match. (No static_assert left for this axis -- ternary above remains
+// CPU-only and keeps its guard; this one is now a real, tested GPU capability.)
 
 // QK-norm (USE_QK_NORM): per-head RMSNorm on Q/K right after their projection, before RoPE (see
 // op_qknorm in backend_cpu.cpp for the reference semantics). GPU support landed: qknorm_act_kernel /
@@ -71,8 +76,8 @@ static_assert(!USE_GATED_FFN,
 // constants (see "per-layer parameter slot offsets" below) rather than the old fixed "+5 for Wo,
 // +6 for W1" arithmetic, so the q_norm/k_norm slots inserted between Wo and the FFN block shift
 // every later offset correctly from a single source of truth. The configurator's --qk-norm/--compute
-// refusal has been lifted to match. (No static_assert left for this axis -- ternary/gated-FFN above
-// remain CPU-only and keep their guards.)
+// refusal has been lifted to match. (No static_assert left for this axis -- ternary above remains
+// CPU-only and keeps its guard.)
 
 
 namespace {
@@ -290,6 +295,21 @@ __device__ inline float dev_dgelu(float v) {
     const float du = 0.7978845608f * (1.f + 3.f * 0.0447150000f * v * v);
     return 0.5f * (1.f + t) + 0.5f * v * (1.f - t * t) * du;
 }
+// SiLU/Swish (silu(v) = v*sigmoid(v)) built on the same __expf basis as dev_tanh/dev_gelu above, for
+// consistency with the CPU's FAST_MATH fast_sigmoid (which shares fast_exp with fast_tanh). Used by
+// the SwiGLU-gated FFN (USE_GATED_FFN): silu(gate) * up -- see op_swiglu/silu_fast in backend_cpu.cpp.
+// Unlike dev_tanh, this needs NO overflow clamp: __expf(-v) saturates to +Inf as v -> -inf, giving
+// sigmoid -> 0 and silu -> 0 (IEEE-safe: 1/(1+Inf) = 0, no NaN), the correct limiting value -- no
+// poisoned-weights failure mode analogous to the unclamped tanh one dev_tanh's comment describes.
+__device__ inline float dev_silu(float v) {
+    return v / (1.f + __expf(-v));
+}
+// SiLU derivative, kept consistent with dev_silu so the backward gradient matches the CPU reference
+// (dsilu_fast in backend_cpu.cpp): d/dv[v*sigmoid(v)] = sigmoid(v)*(1 + v*(1-sigmoid(v))).
+__device__ inline float dev_dsilu(float v) {
+    const float s = 1.f / (1.f + __expf(-v));
+    return s * (1.f + v * (1.f - s));
+}
 
 // h[m,j] = tok_emb[ids[m], j] + pos_emb[t, j], where m is the global row over batch*T and
 // t = m % T is the position WITHIN the window (op_embed + op_add: first forward step). C is D_MODEL
@@ -372,6 +392,23 @@ template <class A>
 __global__ void gelu_act_kernel(const A* __restrict__ x, A* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) st_act(&y[i], dev_gelu(to_f32(x[i])));
+}
+
+// SwiGLU (op_swiglu, USE_GATED_FFN's FFN nonlinearity): y = silu(gate_pre) * up_pre, elementwise. Each
+// thread reads its own gate[i]/up[i] into locals BEFORE writing y[i], so the caller may alias y ==
+// up_pre for an in-place update (no cross-thread dependency -- every thread only ever touches index i).
+__global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                              float* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { const float g = gate[i], u = up[i]; y[i] = dev_silu(g) * u; }
+}
+// act-typed SwiGLU: y = silu(gate)*up in the store type (F32 build == swiglu_kernel). Same in-place-
+// on-up_pre aliasing convention as the plain kernel above.
+template <class A>
+__global__ void swiglu_act_kernel(const A* __restrict__ gate, const A* __restrict__ up,
+                                  A* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { const float g = to_f32(gate[i]), u = to_f32(up[i]); st_act(&y[i], dev_silu(g) * u); }
 }
 
 // Elementwise add: c[i] = a[i] + b[i] (residual connections; safe in-place when c == a).
@@ -1510,10 +1547,14 @@ template <class T> constexpr cudaDataType_t cu_type() {
 }
 // Mixed-type GemmEx: A/B share type IN, output type OUT; FP32 accumulate always. Used for bf16
 // activation GEMMs (IN=bf16 weights+acts) writing either bf16 (chained) or f32 (residual) output.
+// beta defaults to 0 (OVERWRITE C), the behavior of every pre-existing call site; beta=1 ACCUMULATES
+// C += A.B -- same convention as the FP32 gemm()'s own beta parameter above, added for
+// launch_linear_bwd_t's accumulate_dx mode (USE_GATED_FFN's backward needs dfbuf to receive TWO
+// contributions, from Wg's and W1's dX GEMMs -- see backward_device's gated FFN branch).
 template <class IN, class OUT>
 inline void gemm_t(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
-                   const IN* A, int lda, const IN* B, int ldb, OUT* C, int ldc) {
-    const float alpha = 1.0f, beta = 0.0f;
+                   const IN* A, int lda, const IN* B, int ldb, OUT* C, int ldc, float beta = 0.0f) {
+    const float alpha = 1.0f;
     cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, cu_type<IN>(), lda, B, cu_type<IN>(), ldb,
                  &beta, C, cu_type<OUT>(), ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
@@ -1554,6 +1595,12 @@ inline void launch_gelu(const float* dX, float* dY, int n) {
     const int block = 256;
     gelu_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dX, dY, n);
 }
+// SwiGLU forward (USE_GATED_FFN): y = silu(gate)*up, F32 buffers (the F32 inference paths -- see
+// gelu_kernel/launch_gelu above for the same F32-vs-act_t split). `y` may alias `up` (see swiglu_kernel).
+inline void launch_swiglu(const float* dGate, const float* dUp, float* dY, int n) {
+    const int block = 256;
+    swiglu_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dGate, dUp, dY, n);
+}
 inline void launch_add(const float* dA, const float* dB, float* dC, int n) {
     const int block = 256;
     add_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(dA, dB, dC, n);
@@ -1591,6 +1638,33 @@ __global__ void gelu_backward_act_kernel(const A* __restrict__ x, const A* __res
 }
 template <class A> inline void launch_gelu_bwd_t(const A* x, const A* dy, A* dx, int n) {
     const int block = 256; gelu_backward_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(x, dy, dx, n);
+}
+// act-typed SwiGLU forward (USE_GATED_FFN): y = silu(gate)*up. `y` may alias `up` (swiglu_act_kernel).
+template <class A> inline void launch_swiglu_t(const A* dGate, const A* dUp, A* dY, int n) {
+    const int block = 256; swiglu_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(dGate, dUp, dY, n);
+}
+// SwiGLU backward: y = silu(gate)*up -> dgate = dy*up*dsilu(gate), dup = dy*silu(gate). Each thread
+// reads gate[i]/up[i]/dy[i] into locals before writing dgate[i]/dup[i], so the caller may alias
+// dup == dy for an in-place update (same reasoning as the forward kernel's y==up aliasing) -- dgate
+// must NOT alias dy or up (it is written from a fresh read of both, but a caller writing dgate over
+// gate/up itself would corrupt the OTHER output's read within the same thread; dgate may safely alias
+// a buffer no longer needed by this thread, e.g. the plain-FFN ff1/dff1 checkpoint scratch).
+template <class A>
+__global__ void swiglu_backward_act_kernel(const A* __restrict__ gate, const A* __restrict__ up,
+                                           const A* __restrict__ dy, A* __restrict__ dgate,
+                                           A* __restrict__ dup, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = to_f32(gate[i]), u = to_f32(up[i]), d = to_f32(dy[i]);
+    const float silu  = dev_silu(g);
+    const float dsilu = dev_dsilu(g);
+    st_act(&dgate[i], d * u * dsilu);
+    st_act(&dup[i],   d * silu);
+}
+template <class A>
+inline void launch_swiglu_bwd_t(const A* gate, const A* up, const A* dy, A* dgate, A* dup, int n) {
+    const int block = 256;
+    swiglu_backward_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(gate, up, dy, dgate, dup, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
                         int batch, int T, int C, int H, int in_stride) {
@@ -1719,10 +1793,16 @@ inline void launch_tied_head_bwd(const float* dA_in, const float* dTok, const fl
 }
 
 // act-typed linear backward: bf16 inputs/grads, dW lands F32 in the grad blob, dbias optional F32.
+// accumulate_dx (default false, every pre-existing call site's behavior unchanged) switches ONLY the
+// dX GEMM to beta=1 (dX += dY.W^T instead of overwrite) -- for a caller whose dX slot receives more
+// than one contribution in the same backward pass (USE_GATED_FFN: dfbuf accumulates from both Wg's and
+// W1's dX GEMM, mirroring launch_linear_bwd's own FP32 accumulate parameter and its dedicated
+// sub0_cuda_test_accumulate_check coverage).
 template <class IN, class DX>
 inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
-                                DX* dX, float* dW, int M, int in, int out) {
-    if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in);   // dX=dY.W^T
+                                DX* dX, float* dW, int M, int in, int out, bool accumulate_dx = false) {
+    if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in,
+                           accumulate_dx ? 1.0f : 0.0f);                                        // dX (+)= dY.W^T
     gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW=X^T.dY
 }
 template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
@@ -1961,6 +2041,7 @@ long long    g_tr_grows = 0;       // monotonic (re)allocation count -- test obs
 // Per-layer bf16 weight mirrors for the FFN GEMMs (built from the F32 master on upload/step).
 act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
 act_t* g_w2_16[N_LAYERS] = {};     // [F,C]
+act_t* g_wg16[N_LAYERS]  = {};     // [C,F] gate matrix mirror -- USE_GATED_FFN only (else stays all-null, unused)
 act_t* g_wo16[N_LAYERS]  = {};     // [C,C] attention output proj mirror
 act_t* g_wqkv16[N_LAYERS] = {};    // [C,3C] fused QKV mirror (bf16 acts) / alias under f32
 
@@ -2207,25 +2288,32 @@ __global__ void attn_decode_kernel_g(const float* __restrict__ q, const float* _
 // ============================================================================
 //  Per-layer parameter slot offsets (PARAM_LAYOUT indices) -- single source of truth
 // ============================================================================
-// Every layer occupies a FIXED run of consecutive PARAM_LAYOUT slots: 10 without QK-norm
-// (ln1,ln2,Wq,Wk,Wv,Wo,W1,b1,W2,b2), 12 with it (the same 10 plus q_norm,k_norm inserted between Wo
-// and the FFN block -- see layout.hpp's make_param_layout). The functions below used to compute
-// "+5 for Wo", "+6 for W1", etc. independently at every call site (forward_one_device, forward_device,
+// Every layer occupies a FIXED run of consecutive PARAM_LAYOUT slots: 10 without QK-norm/gated-FFN
+// (ln1,ln2,Wq,Wk,Wv,Wo,W1,b1,W2,b2), +2 with QK-norm (q_norm,k_norm inserted between Wo and the FFN
+// block), and the FFN block itself is 4 slots (W1,b1,W2,b2) normally or 3 (Wg,W1,W2, no biases) when
+// USE_GATED_FFN -- see layout.hpp's make_param_layout. The functions below used to compute "+5 for Wo",
+// "+6 for W1", etc. independently at every call site (forward_one_device, forward_device,
 // build_qkv_weights x2, ensure_wqkv_f32, forward_train, head_ce_chunked, backward_device -- 12 sites
-// total) -- adding USE_QK_NORM's 2 new slots would have needed every one of those updated in
-// lock-step, with no compiler help if one was missed (a wrong offset silently reads/writes the wrong
-// tensor's data; it doesn't fail to compile or even necessarily fail at runtime). These named
-// constants are now the ONE place that arithmetic lives; every call site indexes
+// total) -- adding USE_QK_NORM's 2 new slots (or USE_GATED_FFN's shrunk FFN block) would have needed
+// every one of those updated in lock-step, with no compiler help if one was missed (a wrong offset
+// silently reads/writes the wrong tensor's data; it doesn't fail to compile or even necessarily fail at
+// runtime). These named constants are now the ONE place that arithmetic lives; every call site indexes
 // `L[layer_base(l) + kWo]` etc. instead. check_layer_offsets()'s static_assert below cross-checks
 // them against the REAL PARAM_LAYOUT table (not just against each other), so a mistake here is a
 // compile error, not a silent wrong-tensor read.
 constexpr int kLn1 = 0, kLn2 = 1, kWq = 2, kWk = 3, kWv = 4, kWo = 5;
 constexpr int kQNorm = 6, kKNorm = 7;                        // present only when USE_QK_NORM (else unused)
-constexpr int kW1  = USE_QK_NORM ? 8 : 6;
-constexpr int kB1  = kW1 + 1, kW2 = kW1 + 2, kB2 = kW1 + 3;  // plain (non-gated) FFN shape -- see the
-                                                              // USE_GATED_FFN static_assert above: this
-                                                              // file never needs the gated 9/11-slot shape.
-constexpr int kLPer = USE_QK_NORM ? 12 : 10;                 // params per transformer block
+constexpr int kFfnBase = USE_QK_NORM ? 8 : 6;
+constexpr int kWg  = kFfnBase;                               // gate matrix -- USE_GATED_FFN only (else unused)
+constexpr int kW1  = kFfnBase + (USE_GATED_FFN ? 1 : 0);     // gated: "up" projection; plain: the only FFN-in weight
+constexpr int kW2  = kW1 + (USE_GATED_FFN ? 1 : 2);          // gated: Wg,W1,W2 (3 slots); plain: W1,b1,W2 (3 slots to here)
+constexpr int kB1  = kW1 + 1, kB2 = kW1 + 3;                 // plain (non-gated) FFN bias slots only -- MEANINGLESS
+                                                              // (and, on the last layer of a tied+gated build,
+                                                              // OUT OF BOUNDS) when USE_GATED_FFN. Every call site
+                                                              // reading L[.. + kB1/kB2] MUST be guarded
+                                                              // `if constexpr (!USE_GATED_FFN)` -- see the b1/b2
+                                                              // pointer inits below, none may run unconditionally.
+constexpr int kLPer = 2 + 4 + (USE_QK_NORM ? 2 : 0) + (USE_GATED_FFN ? 3 : 4);  // params per transformer block
 constexpr int layer_base(int l) { return 2 + kLPer * l; }
 constexpr int kFinalBase = 2 + kLPer * N_LAYERS;             // index of ln_f (tail block start)
 constexpr int kLnF = 0, kLmHead = 1, kLmBias = 2;            // offsets within the tail block
@@ -2242,9 +2330,15 @@ consteval bool check_layer_offsets() {
         if constexpr (USE_QK_NORM) {
             if (Lc[b + kQNorm].kind != PKind::QNorm || Lc[b + kKNorm].kind != PKind::KNorm) return false;
         }
-        if (Lc[b + kW1].kind != PKind::W1 || Lc[b + kB1].kind != PKind::B1 ||
-            Lc[b + kW2].kind != PKind::W2 || Lc[b + kB2].kind != PKind::B2)
-            return false;
+        if constexpr (USE_GATED_FFN) {
+            if (Lc[b + kWg].kind != PKind::Wg || Lc[b + kW1].kind != PKind::W1 ||
+                Lc[b + kW2].kind != PKind::W2)
+                return false;
+        } else {
+            if (Lc[b + kW1].kind != PKind::W1 || Lc[b + kB1].kind != PKind::B1 ||
+                Lc[b + kW2].kind != PKind::W2 || Lc[b + kB2].kind != PKind::B2)
+                return false;
+        }
     }
     return Lc[kFinalBase + kLnF].kind == PKind::LnF;
 }
@@ -2274,8 +2368,13 @@ void forward_one_device(int id, int pos) {
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
-        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off, *b1 = base + L[b0 + kB1].off;
-        const float* W2  = base + L[b0 + kW2].off, *b2 = base + L[b0 + kB2].off;
+        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off;
+        const float* W2  = base + L[b0 + kW2].off;
+        [[maybe_unused]] const float* Wg = nullptr;
+        [[maybe_unused]] const float* b1 = nullptr;
+        [[maybe_unused]] const float* b2 = nullptr;
+        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + kWg].off;
+        else                         { b1 = base + L[b0 + kB1].off; b2 = base + L[b0 + kB2].off; }
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
@@ -2295,9 +2394,16 @@ void forward_one_device(int id, int pos) {
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
-        launch_linear(fbuf, W1, b1, ff1, 1, C, F);
-        launch_gelu(ff1, gact, F);
-        launch_linear(gact, W2, b2, ff2, 1, F, C);
+        if constexpr (USE_GATED_FFN) {
+            launch_linear(fbuf, Wg, nullptr, ff1, 1, C, F);    // ff1 = gate_pre = fbuf . Wg
+            launch_linear(fbuf, W1, nullptr, gact, 1, C, F);   // gact = up_pre   = fbuf . W1
+            launch_swiglu(ff1, gact, gact, F);                 // gact = silu(gate_pre) * up_pre (in place)
+            launch_linear(gact, W2, nullptr, ff2, 1, F, C);
+        } else {
+            launch_linear(fbuf, W1, b1, ff1, 1, C, F);
+            launch_gelu(ff1, gact, F);
+            launch_linear(gact, W2, b2, ff2, 1, F, C);
+        }
         launch_add(h, ff2, h, C);
     }
     launch_rmsnorm(h, ln_f, a, 1);
@@ -2334,8 +2440,13 @@ void forward_one_device_graphed() {
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
-        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off, *b1 = base + L[b0 + kB1].off;
-        const float* W2  = base + L[b0 + kW2].off, *b2 = base + L[b0 + kB2].off;
+        const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off;
+        const float* W2  = base + L[b0 + kW2].off;
+        [[maybe_unused]] const float* Wg = nullptr;
+        [[maybe_unused]] const float* b1 = nullptr;
+        [[maybe_unused]] const float* b2 = nullptr;
+        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + kWg].off;
+        else                         { b1 = base + L[b0 + kB1].off; b2 = base + L[b0 + kB2].off; }
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
@@ -2353,9 +2464,16 @@ void forward_one_device_graphed() {
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
-        launch_linear(fbuf, W1, b1, ff1, 1, C, F);
-        launch_gelu(ff1, gact, F);
-        launch_linear(gact, W2, b2, ff2, 1, F, C);
+        if constexpr (USE_GATED_FFN) {
+            launch_linear(fbuf, Wg, nullptr, ff1, 1, C, F);    // ff1 = gate_pre = fbuf . Wg
+            launch_linear(fbuf, W1, nullptr, gact, 1, C, F);   // gact = up_pre   = fbuf . W1
+            launch_swiglu(ff1, gact, gact, F);                 // gact = silu(gate_pre) * up_pre (in place)
+            launch_linear(gact, W2, nullptr, ff2, 1, F, C);
+        } else {
+            launch_linear(fbuf, W1, b1, ff1, 1, C, F);
+            launch_gelu(ff1, gact, F);
+            launch_linear(gact, W2, b2, ff2, 1, F, C);
+        }
         launch_add(h, ff2, h, C);
     }
     launch_rmsnorm(h, ln_f, a, 1);
@@ -2406,9 +2524,12 @@ void forward_device(int batch, int T) {
         const float* ln2 = base + L[b0 + kLn2].off;
         const float* Wo  = base + L[b0 + kWo].off;
         const float* W1  = base + L[b0 + kW1].off;
-        const float* b1  = base + L[b0 + kB1].off;
         const float* W2  = base + L[b0 + kW2].off;
-        const float* b2  = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* Wg = nullptr;
+        [[maybe_unused]] const float* b1 = nullptr;
+        [[maybe_unused]] const float* b2 = nullptr;
+        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + kWg].off;
+        else                         { b1 = base + L[b0 + kB1].off; b2 = base + L[b0 + kB2].off; }
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
@@ -2421,9 +2542,16 @@ void forward_device(int batch, int T) {
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
         launch_add(h, proj, h, MC);                          // h = h + proj
         launch_rmsnorm(h, ln2, fbuf, M);                     // f = rmsnorm(h, ln2)
-        launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
-        launch_gelu(ff1, gact, MF);                       // gelu
-        launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
+        if constexpr (USE_GATED_FFN) {
+            launch_linear(fbuf, Wg, nullptr, ff1, M, C, F);   // ff1 = gate_pre = f . Wg
+            launch_linear(fbuf, W1, nullptr, gact, M, C, F);  // gact = up_pre   = f . W1
+            launch_swiglu(ff1, gact, gact, MF);               // gact = silu(gate_pre) * up_pre (in place)
+            launch_linear(gact, W2, nullptr, ff2, M, F, C);
+        } else {
+            launch_linear(fbuf, W1, b1, ff1, M, C, F);        // ff1 = f . W1 + b1
+            launch_gelu(ff1, gact, MF);                       // gelu
+            launch_linear(gact, W2, b2, ff2, M, F, C);        // ff2 = gelu . W2 + b2
+        }
         launch_add(h, ff2, h, MC);                        // h = h + ff2
     }
     launch_rmsnorm(h, ln_f, a, M);                        // a = rmsnorm(h, ln_f)
@@ -2530,6 +2658,10 @@ void build_qkv_weights() {
             if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * 3 * C * sizeof(act_t));
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW1].off, g_w1_16[l], nce);
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW2].off, g_w2_16[l], nce);
+            if constexpr (USE_GATED_FFN) {   // gate matrix mirror -- same [C,F] shape as W1's
+                if (!g_wg16[l]) cudaMalloc(&g_wg16[l], static_cast<size_t>(C) * F * sizeof(act_t));
+                f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWg].off, g_wg16[l], nce);
+            }
             { const int ncc = C * C, gcc = (ncc + 255) / 256;
               f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWo].off, g_wo16[l], ncc); }
             build_qkv_act_kernel<act_t><<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_wqkv16[l]);
@@ -2543,6 +2675,7 @@ void build_qkv_weights() {
             build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
             g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW1].off);
             g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW2].off);
+            if constexpr (USE_GATED_FFN) g_wg16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWg].off);
             g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWo].off);
             g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
         }
@@ -2624,9 +2757,12 @@ void forward_train(int batch, int T) {
         const float* ln1 = base + L[b0 + kLn1].off;
         const float* ln2 = base + L[b0 + kLn2].off;
         const float* W1  = base + L[b0 + kW1].off;
-        const float* b1  = base + L[b0 + kB1].off;
         const float* W2  = base + L[b0 + kW2].off;
-        const float* b2  = base + L[b0 + kB2].off;
+        [[maybe_unused]] const float* Wg = nullptr;
+        [[maybe_unused]] const float* b1 = nullptr;
+        [[maybe_unused]] const float* b2 = nullptr;
+        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + kWg].off;
+        else                         { b1 = base + L[b0 + kB1].off; b2 = base + L[b0 + kB2].off; }
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
@@ -2646,11 +2782,18 @@ void forward_train(int batch, int T) {
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
         launch_add_t<act_t>(hin, hmid, hmid, MC);                                   // hmid = hin + proj
         launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M);      // fbuf bf16
-        launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
-        launch_bias_act(g_tr.ff1, b1, M, F);                                       // ff1 = f.W1 + b1
-        launch_gelu_t(g_tr.ff1, g_tr.gact, MF);                                     // gelu
-        launch_linear_t<act_t, act_t>(g_tr.gact, g_w2_16[l], next, M, F, C);        // next = ff2 bf16
-        launch_bias_act(next, b2, M, C);
+        if constexpr (USE_GATED_FFN) {
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_wg16[l], g_tr.ff1, M, C, F);   // ff1 = gate_pre
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.gact, M, C, F); // gact = up_pre
+            launch_swiglu_t<act_t>(g_tr.ff1, g_tr.gact, g_tr.gact, MF);               // gact = silu(gate_pre)*up_pre (in place)
+            launch_linear_t<act_t, act_t>(g_tr.gact, g_w2_16[l], next, M, F, C);      // next = ff2 bf16
+        } else {
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
+            launch_bias_act(g_tr.ff1, b1, M, F);                                       // ff1 = f.W1 + b1
+            launch_gelu_t(g_tr.ff1, g_tr.gact, MF);                                     // gelu
+            launch_linear_t<act_t, act_t>(g_tr.gact, g_w2_16[l], next, M, F, C);        // next = ff2 bf16
+            launch_bias_act(next, b2, M, C);
+        }
         launch_add_t<act_t>(hmid, next, next, MC);                                  // next = hmid + ff2
     }
     launch_rmsnorm_train_t<act_t, float>(g_tr.h_final, ln_f, g_tr.a_final, g_tr.rinv_f, M);     // a_final f32
@@ -2742,7 +2885,8 @@ void backward_device(int batch, int T, const int* d_lengths) {
 
     for (int l = N_LAYERS - 1; l >= 0; --l) {
         const int b0 = layer_base(l);
-        const float* W1 = pb + L[b0 + kW1].off, *b1 = pb + L[b0 + kB1].off;
+        [[maybe_unused]] const float* b1 = nullptr;
+        if constexpr (!USE_GATED_FFN) b1 = pb + L[b0 + kB1].off;
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         [[maybe_unused]] float*       dqgamma = nullptr;
@@ -2751,18 +2895,41 @@ void backward_device(int batch, int T, const int* d_lengths) {
             qgamma  = pb + L[b0 + kQNorm].off; kgamma  = pb + L[b0 + kKNorm].off;
             dqgamma = gb + L[b0 + kQNorm].off; dkgamma = gb + L[b0 + kKNorm].off;
         }
-        // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then ff1/gact, before use
+        // checkpoint: fbuf/ff1/gact not saved -- recompute fbuf from h_mid, then the FFN-in
+        // intermediate(s), before use. USE_GATED_FFN recomputes THREE intermediates (gate_pre, up_pre,
+        // and their SwiGLU combination hswi) where the plain path recomputes only two (ff1 pre-GELU,
+        // gact post-GELU) -- see the top-of-file "SwiGLU-gated FFN" comment for why. Buffer roles are
+        // REMAPPED under gated (no new [M,F] buffers): ff1 <- gate_pre, gact <- up_pre, dff1 <- hswi
+        // (the W2 GEMM's input) then, after W2's backward, dff1 <- dgate and dgact <- dup.
         launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.fbuf, g_tr.rinv2[l], M);
-        launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
-        launch_bias_act(g_tr.ff1, b1, M, F);
-        launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
-        // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact); dh->bf16
-        { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
-        launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + kW2].off, M, F, C);
-        { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + kB2].off, M, C); }
-        launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
-        launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + kW1].off, M, C, F);
-        { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + kB1].off, M); }
+        if constexpr (USE_GATED_FFN) {
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_wg16[l], g_tr.ff1,  M, C, F);   // ff1  = gate_pre
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.gact, M, C, F);  // gact = up_pre
+            launch_swiglu_t<act_t>(g_tr.ff1, g_tr.gact, g_tr.dff1, MF);                // dff1 = hswi = silu(gate_pre)*up_pre
+            // ff residual: dh = grad into layer output = d(hswi @ W2). W2 backward (input hswi=dff1); dh->bf16
+            { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
+            launch_linear_bwd_t<act_t, act_t>(g_tr.dff1, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + kW2].off, M, F, C);
+            // dgact currently holds d(hswi); SwiGLU backward turns it into dgate (-> dff1, overwrite) and
+            // dup (-> dgact, in place over its own dy input -- see swiglu_backward_act_kernel's aliasing note).
+            launch_swiglu_bwd_t<act_t>(g_tr.ff1, g_tr.gact, g_tr.dgact, g_tr.dff1, g_tr.dgact, MF);
+            // Wg backward (dX = dfbuf, OVERWRITE -- the first of dfbuf's two contributions this layer).
+            launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_wg16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + kWg].off, M, C, F);
+            // W1 (up) backward (dX = dfbuf, ACCUMULATE -- the second contribution; must run AFTER the
+            // Wg backward above so the overwrite lands first, in the same stream order).
+            launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dgact, g_tr.dfbuf, gb + L[b0 + kW1].off,
+                                              M, C, F, /*accumulate_dx=*/true);
+        } else {
+            launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.ff1, M, C, F);
+            launch_bias_act(g_tr.ff1, b1, M, F);
+            launch_gelu_t(g_tr.ff1, g_tr.gact, MF);
+            // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact); dh->bf16
+            { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
+            launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + kW2].off, M, F, C);
+            { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + kB2].off, M, C); }
+            launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
+            launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + kW1].off, M, C, F);
+            { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + kB1].off, M); }
+        }
         launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.rinv2[l], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + kLn2].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
@@ -3658,6 +3825,94 @@ SUB0_CUDA_API int sub0_cuda_tied_head_check(int M, int C, int V,
     return 0;
 }
 
+// Dims-independent CPU-vs-GPU parity self-test for SwiGLU (swiglu_kernel/swiglu_act_kernel/
+// swiglu_backward_act_kernel, USE_GATED_FFN's FFN nonlinearity -- see op_swiglu/Op::SwiGLU in
+// backend_cpu.cpp for the reference semantics). M/F are runtime parameters (plain elementwise kernels,
+// no template shape dependence unlike QK-norm's per-head kernels), so ONE instantiation serves both a
+// toy scale and a production-like scale (M=64,F=1792) with no rebuild, matching sub0_cuda_tied_head_
+// check's own convention. Always F32 (act_t=float): the test's job is to prove the MATH, independent
+// of whatever ACT_DTYPE the CURRENT build bakes.
+//
+// Forward is checked TWICE: once into a fresh (non-aliased) output buffer, and once with the output
+// aliased onto up_pre (y == up), the in-place convention every real call site uses (forward_one_device/
+// forward_device/forward_train/backward_device all write the SwiGLU output back over their "up_pre"
+// buffer) -- proving the aliasing is actually safe, not just assumed safe from the kernel's per-thread
+// read-before-write structure. Backward is checked with dup ALIASED onto dy (the same in-place
+// convention backward_device's role-remapped dgact buffer relies on -- see that function's own SwiGLU
+// backward comment), verified against a CPU reference in double precision.
+SUB0_CUDA_API int sub0_cuda_swiglu_check(int M, int F, double* out_relL2_fwd, double* out_relL2_bwd) {
+    if (M < 1 || F < 1) return 1;
+    if (sub0_cuda_init()) return 1;
+    ensure_stream();
+
+    const size_t n = static_cast<size_t>(M) * F;
+    std::vector<float> hGate(n), hUp(n), hDy(n);
+    unsigned s = 0x2545f491u;
+    auto randf = [&] { s = s * 1664525u + 1013904223u; return static_cast<float>(s >> 8) / 8388608.0f - 1.0f; };
+    for (auto& v : hGate) v = randf() * 2.0f;   // wider range than tied-head's 0.1x: exercise SiLU's
+    for (auto& v : hUp)   v = randf() * 2.0f;   // curvature away from the near-linear origin region
+    for (auto& v : hDy)   v = randf() * 0.5f;
+
+    float *dGate = nullptr, *dUp = nullptr, *dY = nullptr, *dUpAliased = nullptr;
+    float *dDy = nullptr, *dDgate = nullptr, *dDup = nullptr, *dDyAliased = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dGate,      n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dUp,        n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dY,         n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dUpAliased, n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDy,        n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDgate,     n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDup,       n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dDyAliased, n * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpy(dGate, hGate.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dUp,   hUp.data(),   n * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dUpAliased, hUp.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDy,   hDy.data(),   n * sizeof(float), cudaMemcpyHostToDevice));
+    SUB0_CUDA_CHECK(cudaMemcpy(dDyAliased, hDy.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    launch_swiglu(dGate, dUp, dY, static_cast<int>(n));                    // non-aliased forward
+    launch_swiglu(dGate, dUpAliased, dUpAliased, static_cast<int>(n));     // in-place (y == up) forward
+    launch_swiglu_bwd_t<float>(dGate, dUp, dDy, dDgate, dDup, static_cast<int>(n));                 // non-aliased backward
+    launch_swiglu_bwd_t<float>(dGate, dUp, dDyAliased, dDgate, dDyAliased, static_cast<int>(n));    // dup aliased onto dy
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> hY(n), hYAliased(n), hDgate(n), hDup(n), hDupAliased(n);
+    SUB0_CUDA_CHECK(cudaMemcpy(hY.data(),         dY,         n * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hYAliased.data(),  dUpAliased, n * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDgate.data(),     dDgate,     n * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDup.data(),       dDup,       n * sizeof(float), cudaMemcpyDeviceToHost));
+    SUB0_CUDA_CHECK(cudaMemcpy(hDupAliased.data(), dDyAliased, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    cudaFree(dGate); cudaFree(dUp); cudaFree(dY); cudaFree(dUpAliased);
+    cudaFree(dDy); cudaFree(dDgate); cudaFree(dDup); cudaFree(dDyAliased);
+
+    // CPU reference, double precision, mirrors op_swiglu/Op::SwiGLU exactly.
+    double num_fwd = 0.0, den_fwd = 0.0, num_bwd = 0.0, den_bwd = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double g = hGate[i], u = hUp[i], dy = hDy[i];
+        const double sg = 1.0 / (1.0 + std::exp(-g));
+        const double silu = g * sg;
+        const double dsilu = sg * (1.0 + g * (1.0 - sg));
+        const double y_ref = silu * u;
+        const double dgate_ref = dy * u * dsilu;
+        const double dup_ref   = dy * silu;
+
+        const double dy0 = static_cast<double>(hY[i]) - y_ref;
+        const double dy1 = static_cast<double>(hYAliased[i]) - y_ref;         // in-place forward must match too
+        num_fwd += dy0 * dy0 + dy1 * dy1;
+        den_fwd += 2.0 * y_ref * y_ref;
+
+        const double dg0 = static_cast<double>(hDgate[i]) - dgate_ref;
+        const double du0 = static_cast<double>(hDup[i]) - dup_ref;
+        const double du1 = static_cast<double>(hDupAliased[i]) - dup_ref;     // dup-aliased-onto-dy must match too
+        num_bwd += dg0 * dg0 + du0 * du0 + du1 * du1;
+        den_bwd += dgate_ref * dgate_ref + 2.0 * dup_ref * dup_ref;
+    }
+    if (out_relL2_fwd) *out_relL2_fwd = std::sqrt(num_fwd / std::max(den_fwd, 1e-30));
+    if (out_relL2_bwd) *out_relL2_bwd = std::sqrt(num_bwd / std::max(den_bwd, 1e-30));
+    return 0;
+}
+
 // Dims-independent CPU-vs-GPU parity self-test for QK-norm (qknorm_act_kernel / qknorm_save_act_kernel
 // / qknorm_backward_act_kernel). H/DH are TEMPLATE parameters on the kernels themselves (baked
 // constexpr, this file's own convention for per-head-shape kernels -- unlike the tied-head check's
@@ -4107,8 +4362,10 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
 // own Dims construction; all three needed the same fix independently), caught by "memplan prediction
 // matches measured device usage" failing at a real tied+GPU production build. `qk_norm` must match
 // USE_QK_NORM the same way (adds the q_norm/k_norm gamma floats + the qk_pre training scratch term).
+// `gated` must match USE_GATED_FFN the same way (Wg replaces the b1/b2 bias floats and adds a third
+// bf16 GEMM-weight mirror -- see memplan.hpp's Dims/param_floats/persistent_bytes comments).
 static constexpr sub0::memplan::Dims kFootprintDims{
-    D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, USE_TIED_EMBEDDINGS, USE_QK_NORM,
+    D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
 };
 
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device

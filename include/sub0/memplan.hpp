@@ -46,6 +46,15 @@ struct Dims {
     // Defaults false for the same reason `tied` does: every pre-existing aggregate-init call site
     // keeps modeling the non-qk-norm shape exactly as before.
     bool qk_norm = false;
+    // Gated (SwiGLU) FFN (USE_GATED_FFN): replaces the plain FFN's W1[C,F]+b1[F]+W2[F,C]+b2[C] (2*C*F +
+    // F + C floats) with Wg[C,F]+W1[C,F]+W2[F,C], no biases (3*C*F floats) -- see layout.hpp's
+    // make_param_layout. A GPU build also keeps a THIRD bf16 GEMM-weight mirror (g_wg16, alongside
+    // g_w1_16/g_w2_16) instead of two -- see persistent_bytes' BF16 term below. Training scratch is
+    // UNCHANGED (backward_device's checkpoint-recompute reuses the plain path's existing ff1/gact/
+    // dff1/dgact [M,F] buffers under role-remapping rather than adding new ones -- see that function's
+    // own comment for the exact buffer-role sequence). Defaults false for the same reason `tied`/
+    // `qk_norm` do: every pre-existing aggregate-init call site keeps modeling the plain-FFN shape.
+    bool gated = false;
 };
 
 using u64 = unsigned long long;
@@ -71,7 +80,9 @@ constexpr u64 param_floats(const Dims& d) {
     const u64 block = 2 * C                     // ln1 + ln2          [C] each
                     + 4 * C * C                 // Wq Wk Wv Wo        [C,C]
                     + (d.qk_norm ? 2 * DH : 0)  // q_norm + k_norm [1,D_HEAD] each (USE_QK_NORM only)
-                    + 2 * C * F + F + C;         // W1 [C,F], b1 [F], W2 [F,C], b2 [C]
+                    // gated: Wg [C,F], W1 [C,F], W2 [F,C], no biases (3*C*F). plain: W1 [C,F], b1 [F],
+                    // W2 [F,C], b2 [C] (2*C*F + F + C).
+                    + (d.gated ? 3 * C * F : (2 * C * F + F + C));
     // head: ln_f [C] alone when tied (the head reuses tok_emb, already counted in `emb` above --
     // no separate lm_head/lm_bias slot, see layout.hpp's make_param_layout); ln_f + lm_head [C,V] +
     // lm_bias [V] otherwise.
@@ -96,11 +107,12 @@ constexpr u64 param_floats(const Dims& d) {
 // and MEASURED deltas stay comparable.
 constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
+    const u64 ffn_mirrors = (d.gated ? 3 : 2) * C * F;   // gated: g_wg16+g_w1_16+g_w2_16; plain: g_w1_16+g_w2_16
     return 4 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel
          + DBL                                  // g_dev_normsq [1] (double)
          + FLOAT                                // g_dev_gs [1] (on-device grad-clip scale, 2026-07)
-         + (A >= FLOAT ? L * (3 * C * C) * FLOAT : 0)           // g_fwd.wqkv[l] = [C,3C] F32 (F32 builds only)
-         + (A < FLOAT ? L * (2 * C * F + 4 * C * C) * A : 0);  // BF16-only: g_w1_16+g_w2_16+g_wo16+g_wqkv16
+         + (A >= FLOAT ? L * (3 * C * C) * FLOAT : 0)          // g_fwd.wqkv[l] = [C,3C] F32 (F32 builds only)
+         + (A < FLOAT ? L * (ffn_mirrors + 4 * C * C) * A : 0); // BF16-only: g_w[g]1_16+g_w2_16+g_wo16+g_wqkv16
 }
 
 // Row-chunk count for the TRAINING [chunk_rows,V] logits/dlogits scratch buffer (train_alloc /
@@ -147,6 +159,10 @@ constexpr u64 fwd_scratch_bytes(const Dims& d, int batch) {
 }
 
 // Resident training scratch (train_alloc), grown to `batch`. One term per cudaMalloc in train_alloc.
+// USE_GATED_FFN needs NO extra terms here: backward_device's checkpoint-recompute reuses the plain
+// path's existing ff1/gact/dff1/dgact [M,F] buffers under role-remapping (ff1<-gate_pre, gact<-up_pre,
+// dff1<-hswi then dgate, dgact<-d_hswi then dup) instead of allocating a dedicated SwiGLU-output
+// buffer -- see backward_device's own comment for the exact per-step sequence this relies on.
 constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);

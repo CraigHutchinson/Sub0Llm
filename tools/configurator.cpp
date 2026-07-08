@@ -669,21 +669,17 @@ int main(int argc, char** argv) {
         std::println(stderr, "configure warning: --compute={} requested but no CUDA backend is built; using CPU", compute);
         compute = 0;
     }
-    // Gated (SwiGLU) FFN is CPU-only for now -- the CUDA backend has no kernel for it yet (a build
-    // that tried would fail loud at compile time via a static_assert in backend_cuda.cu regardless,
-    // but catching it here is a clearer, earlier error). Same shape of restriction as ternary's.
-    if (gated_ffn && compute != 0) {
-        std::println(stderr, "configure error: --gated-ffn=1 is CPU-only for now (no CUDA kernel yet); "
-                             "pass --compute 0, or drop --gated-ffn.");
-        return 1;
-    }
     // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
     // gated purely by `if constexpr (USE_TIED_EMBEDDINGS)` at each forward/backward call site -- no
     // static_assert restriction left for this axis), so --tie-embeddings=1 is now valid with any
     // --compute backend. QK-norm: GPU support landed the same way (qknorm_act_kernel/
     // qknorm_backward_act_kernel in backend_cuda.cu, `if constexpr (USE_QK_NORM)`-gated at each
-    // forward/backward call site) -- --qk-norm=1 is now valid with any --compute backend too.
-    // (Ternary/gated-FFN remain CPU-only -- see their own checks above.)
+    // forward/backward call site) -- --qk-norm=1 is now valid with any --compute backend too. Gated
+    // (SwiGLU) FFN: GPU support landed the same way too (swiglu_kernel/swiglu_act_kernel/
+    // swiglu_backward_act_kernel in backend_cuda.cu, `if constexpr (USE_GATED_FFN)`-gated at each
+    // forward/backward call site) -- --gated-ffn=1 is now valid with any --compute backend too.
+    // (Ternary remains CPU-only -- see cmake/Backends.cmake's FATAL_ERROR guard and the backend_cuda.cu
+    // static_assert for that axis.)
 
     // Resolve the model dims with precedence CLI (nonzero) > <corpus>.model sidecar > auto-size, so a
     // pinned size PERSISTS across re-runs (a build-time auto-regen keeps it). Seed the sidecar if
@@ -1124,9 +1120,11 @@ int main(int argc, char** argv) {
         // tied=true drops param_floats()'s lm_head/lm_bias term (see memplan.hpp); must match
         // USE_TIED_EMBEDDINGS or this VRAM prediction over-estimates a tied model's footprint.
         // qk_norm=true adds the q_norm/k_norm gamma floats + the qk_pre training scratch term;
-        // must match USE_QK_NORM the same way.
+        // must match USE_QK_NORM the same way. gated=true replaces the plain FFN's b1/b2 bias floats
+        // with a third Wg weight matrix (and a third bf16 GEMM-weight mirror); must match
+        // USE_GATED_FFN the same way.
         const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, d_ff, seq_len, vocab,
-                                         tie_embeddings != 0, qk_norm != 0 };
+                                         tie_embeddings != 0, qk_norm != 0, gated_ffn != 0 };
         // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
         // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
         // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc
@@ -1170,7 +1168,8 @@ int main(int argc, char** argv) {
     cos << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
-    // include/sub0/layout.hpp. CPU-only for now (guarded above and by a backend_cuda.cu static_assert).
+    // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
+    // swiglu_backward_act_kernel in backend_cuda.cu).
     cos << "constexpr bool USE_GATED_FFN = " << (gated_ffn ? "true" : "false") << ";\n";
     // Tied embeddings: the LM head reuses tok_emb (transposed) instead of its own matrix+bias --
     // see op_tied_head in backend_cpu.cpp. No dims/checkpoint-shape interaction with USE_GATED_FFN,

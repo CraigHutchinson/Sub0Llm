@@ -672,9 +672,10 @@ struct GpuTrainer {
         // scratch in a consistent (if partial) state -- the retry below's OWN reserve call correctly
         // frees and rebuilds from scratch, no special cleanup needed here.
         if (sub0_cuda_train_reserve(batch) != 0) {
-            // tied/qk_norm must match USE_TIED_EMBEDDINGS/USE_QK_NORM -- see memplan.hpp's Dims comments.
+            // tied/qk_norm/gated must match USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see
+            // memplan.hpp's Dims comments.
             const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                             USE_TIED_EMBEDDINGS, USE_QK_NORM };
+                                             USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
             const int free_mb = sub0_cuda_free_vram_mb();
@@ -1577,10 +1578,10 @@ enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, 
 
 // This build's dimensions for the pure footprint model (sub0/memplan.hpp): lets the GPU sweep
 // predict the resident VRAM a training batch needs BEFORE allocating it, and lets the run
-// cross-check that prediction against the device's actual usage. `tied`/`qk_norm` must match
-// USE_TIED_EMBEDDINGS/USE_QK_NORM -- see memplan.hpp's Dims comments.
+// cross-check that prediction against the device's actual usage. `tied`/`qk_norm`/`gated` must match
+// USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see memplan.hpp's Dims comments.
 static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                               USE_TIED_EMBEDDINGS, USE_QK_NORM };
+                                               USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend,
                                         int thorough, int budget_s) {

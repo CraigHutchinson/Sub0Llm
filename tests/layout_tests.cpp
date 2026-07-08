@@ -76,14 +76,14 @@ TEST_CASE("baked compute-backend facts are self-consistent", "[config]") {
     // BitNet/ternary is CPU-only: a ternary build must never select a GPU/HYBRID backend
     // (the same invariant the CMake guard and the backend_cuda.cu static_assert enforce).
     STATIC_REQUIRE(!USE_TERNARY || COMPUTE_MODE == ComputeBackend::Cpu);
-    // SwiGLU-gated FFN is CPU-only too (no CUDA kernel yet) -- same invariant, enforced by the
-    // configurator's --gated-ffn/--compute check and the backend_cuda.cu static_assert.
-    STATIC_REQUIRE(!USE_GATED_FFN || COMPUTE_MODE == ComputeBackend::Cpu);
     // Tied embeddings: GPU support landed (launch_tied_head/launch_tied_head_bwd in backend_cuda.cu,
     // `if constexpr`-gated), so there is no CPU-only invariant left to assert for this axis -- it is
     // valid with any COMPUTE_MODE now.
     // QK-norm: GPU support landed the same way (qknorm_act_kernel/qknorm_backward_act_kernel in
     // backend_cuda.cu, `if constexpr`-gated) -- no CPU-only invariant left for this axis either.
+    // SwiGLU-gated FFN: GPU support landed the same way too (swiglu_kernel/swiglu_act_kernel/
+    // swiglu_backward_act_kernel in backend_cuda.cu, `if constexpr`-gated) -- no CPU-only invariant
+    // left for this axis either.
     // A detected CUDA host has its arch + VRAM facts populated; an absent one zeroes them.
     STATIC_REQUIRE(!HAS_CUDA || (CUDA_ARCH > 0 && GPU_VRAM_MB > 0));
     STATIC_REQUIRE(HAS_CUDA || CUDA_ARCH == 0);

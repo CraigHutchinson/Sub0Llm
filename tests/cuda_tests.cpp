@@ -39,6 +39,7 @@ extern "C" int  sub0_cuda_attn_bwd_check(int batch, int T, int iters, double* ou
 extern "C" int  sub0_cuda_test_accumulate_check(int M, int in, int out, double* out_maxreldiff);
 extern "C" int  sub0_cuda_tied_head_check(int M, int C, int V,
                                           double* out_relL2_fwd, double* out_relL2_bwd);
+extern "C" int  sub0_cuda_swiglu_check(int M, int F, double* out_relL2_fwd, double* out_relL2_bwd);
 extern "C" int  sub0_cuda_ce_chunk_check(int M, int T, int batch, int chunk_cap,
                                          double* out_relL2_dlogits, double* out_reldiff_loss);
 extern "C" int  sub0_cuda_qknorm_check(int shape_sel, int rows,
@@ -462,6 +463,81 @@ TEST_CASE("CUDA tied-head GEMM forward+backward matches a hand-computed referenc
     }
 }
 
+// Dims-independent CPU-vs-GPU parity check for SwiGLU (swiglu_kernel/swiglu_act_kernel/
+// swiglu_backward_act_kernel -- USE_GATED_FFN's FFN nonlinearity, see backend_cuda.cu). Runs at TWO
+// scales in this one binary (M/F are runtime params, not baked dims): a toy shape and a production-
+// like shape (M=64,F=1792 -- this project's actual production D_FF). Meaningful (and cheap) in ANY
+// CUDA build regardless of whether USE_GATED_FFN is on -- it exercises the raw kernels directly, same
+// reasoning as the tied-head check above being independent of USE_TIED_EMBEDDINGS. Internally exercises
+// BOTH the non-aliased forward AND the in-place (y==up_pre) forward every real call site uses, plus
+// BOTH the non-aliased backward AND the dup-aliased-onto-dy backward backward_device's role-remapped
+// buffers rely on -- see sub0_cuda_swiglu_check's own comment.
+TEST_CASE("CUDA SwiGLU kernels forward+backward match a hand-computed reference", "[cuda]") {
+    CudaGuard _cuda_guard;
+    for (const auto& [M, F] : {std::pair{4, 8}, std::pair{64, 1792}}) {
+        double fwd_relL2 = 1.0, bwd_relL2 = 1.0;
+        const int rc = sub0_cuda_swiglu_check(M, F, &fwd_relL2, &bwd_relL2);
+        WARN("swiglu check: M=" << M << " F=" << F
+             << " | fwd rel-L2 = " << fwd_relL2 << " | bwd rel-L2 = " << bwd_relL2);
+        REQUIRE(rc == 0);
+        REQUIRE(fwd_relL2 < 1e-5);
+        REQUIRE(bwd_relL2 < 1e-5);
+    }
+}
+
+// Bisection probe for gated-FFN specifically, the same style as the tied-embedding/QK-norm bisection
+// probes above: isolate JUST the Wg/W1/W2 gradient slices of the full gradient vector (USE_GATED_FFN's
+// three FFN weight tensors -- the ones backward_device's role-remapped ff1/gact/dff1/dgact buffer reuse
+// (see that function's own comment) is riskiest for) against the CPU reference. The whole-vector test
+// above ("CUDA backward matches the CPU reduced gradient") already covers this generically, but a bug
+// specific to the buffer-role remapping (e.g. reading a stale gate_pre/up_pre after it was overwritten
+// by the wrong step) could in principle be diluted by the L2 norm of the rest of the gradient;
+// isolating these three per-layer weight tensors directly removes that risk. `if constexpr`-gated so it
+// contributes ZERO assertions (and costs nothing) in the default plain-FFN CUDA test build -- only
+// meaningful once a --gated-ffn 1 --compute 1 build actually exercises the gated path.
+TEST_CASE("CUDA gated-FFN gradient (Wg/W1/W2) stays aligned with the CPU", "[cuda]") {
+    if constexpr (USE_GATED_FFN) {
+        CudaGuard _cuda_guard;
+        sub0::build_model();
+        sub0_cuda_set_tf32(0);
+        REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+        const int batch = 4, T = 8;
+        std::vector<int> data, ids, targets;
+        std::vector<std::size_t> starts;
+        make_windows(batch, T, 111, data, starts, ids, targets);
+
+        sub0::train_batch(data.data(), starts.data(), batch, T);
+        const std::size_t n = sub0::trainable_floats();
+        const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+        std::vector<float> gpu_grad(n, 0.0f);
+        double loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &loss) == 0);
+
+        double num = 0.0, den = 0.0, maxabs = 0.0, dot = 0.0, gn = 0.0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            const bool ffn = p.kind == sub0::PKind::Wg || p.kind == sub0::PKind::W1 ||
+                             p.kind == sub0::PKind::W2;
+            if (!ffn) continue;
+            for (std::size_t i = p.off; i < p.off + p.n(); ++i) {
+                const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+                num += d * d;
+                den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+                dot += static_cast<double>(gpu_grad[i]) * cpu_grad[i];
+                gn  += static_cast<double>(gpu_grad[i]) * gpu_grad[i];
+                maxabs = std::max(maxabs, std::fabs(d));
+            }
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        const double cos = dot / std::max(std::sqrt(gn * den), 1e-30);
+        INFO("gated-FFN grad rel-L2 = " << rel << "  cos = " << cos << "  max abs = " << maxabs << "  loss = " << loss);
+        REQUIRE(std::isfinite(loss));
+        if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
+        else                                    REQUIRE(rel < 1e-2);
+    }
+}
+
 // Direct correctness proof for ce_backward_kernel's row_offset parameter (head_ce_chunked's chunked
 // lm_head/tied-head/cross-entropy lever, "B1"): chunking a [M,V] logits/dlogits/loss computation over
 // row-chunks must match a single full-M call exactly. Two scales (toy + production-like V), and at
@@ -743,9 +819,10 @@ TEST_CASE("CUDA forward stays finite under saturating GELU activations", "[cuda]
 // This build's dimensions for the pure footprint model (sub0/memplan.hpp), straight from the config.
 // `tied` must match USE_TIED_EMBEDDINGS -- param_floats()'s head term differs (ln_f alone vs
 // ln_f+lm_head+lm_bias), so a tied build with this left false would fail the very next test.
-// `qk_norm` must match USE_QK_NORM the same way (adds the q_norm/k_norm gamma floats).
+// `qk_norm` must match USE_QK_NORM the same way (adds the q_norm/k_norm gamma floats). `gated` must
+// match USE_GATED_FFN the same way (Wg replaces the b1/b2 bias floats).
 static constexpr sub0::memplan::Dims kTestDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                                USE_TIED_EMBEDDINGS, USE_QK_NORM };
+                                                USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
 
 // The footprint model must agree with the canonical parameter layout: param_floats() re-derives
 // PARAM_FLOATS from dims (so the configurator can call it without layout.hpp). If they diverge,
