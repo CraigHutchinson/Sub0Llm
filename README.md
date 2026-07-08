@@ -131,11 +131,11 @@ with the **same** scheme.
 ### Architecture options
 
 A handful of shape/algorithm choices beyond dims and precision, each `constexpr`-baked at configure
-time (except `--attn-sinks`, a generation-time flag). All started CPU-only; GPU parity is landing
-incrementally (see the *Backend* column). `--gated-ffn`/`--ternary` on a GPU build are rejected at
-configure time with a clear error, not a silent fallback; `--optimizer muon` on the GPU path currently
-only warns and trains with AdamW instead (a known gap, not yet as strict as the other two). Train and
-gen must agree on these: they're part of a model's identity, like dims and vocab.
+time (except `--attn-sinks`, a generation-time flag, and `--optimizer`, a runtime training-only
+flag -- see its own row below). All started CPU-only; GPU parity is landing incrementally (see the
+*Backend* column). `--gated-ffn`/`--ternary` on a GPU build are rejected at configure time with a
+clear error, not a silent fallback. Train and gen must agree on these: they're part of a model's
+identity, like dims and vocab.
 
 | Flag | What it does | Backend | Further reading |
 |---|---|---|---|
@@ -144,7 +144,7 @@ gen must agree on these: they're part of a model's identity, like dims and vocab
 | `--gated-ffn 1` | SwiGLU-gated FFN (`Wgate`/`Wup`/`Wdown`, no FFN bias) instead of the plain 2-matrix GELU+bias FFN — for importing GGUF/Llama-family weights | CPU + GPU | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) (the SwiGLU paper) |
 | `--ternary 1` | BitNet-style ternary (`{-1,0,1}`) block weights | CPU only | [The Era of 1-bit LLMs (BitNet b1.58)](https://arxiv.org/abs/2402.17764) |
 | `--pos-encoding 1` (default) | RoPE — see [above](#positional-encoding) | CPU + GPU | [RoFormer](https://arxiv.org/abs/2104.09864) |
-| `--optimizer muon` (`train`) | Hidden 2D weight matrices trained with Muon (Newton-Schulz orthogonalized updates); embeddings, norms, biases, and the LM head stay on AdamW | CPU only | [Muon: an optimizer for hidden layers](https://kellerjordan.github.io/posts/muon/) |
+| `--optimizer muon` (`train`) | Hidden 2D weight matrices trained with Muon (Newton-Schulz orthogonalized updates); embeddings, norms, biases, and the LM head stay on AdamW | CPU + GPU | [Muon: an optimizer for hidden layers](https://kellerjordan.github.io/posts/muon/) |
 | `--attn-sinks N` (`gen`) | Once prompt+generation would exceed the trained context window, keep `N` tokens from the **start** of the sequence resident alongside the most recent tokens, instead of a plain sliding window that drops them | CPU + GPU | [Efficient Streaming LMs with Attention Sinks](https://arxiv.org/abs/2309.17453) (StreamingLLM) |
 
 The [ishanjmukherjee.github.io](https://ishanjmukherjee.github.io/) blog (linked twice above) is a good

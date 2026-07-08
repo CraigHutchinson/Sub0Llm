@@ -1247,9 +1247,7 @@ void AdamW::step() {
     // calls created (that lock-step is this table's whole reason to exist), so it doubles here as
     // the shape+kind lookup W->views alone doesn't carry.
     for (const ParamDesc& pd : PARAM_LAYOUT) {
-        const bool muon_eligible = use_muon_ &&
-            (pd.kind == PKind::Wq || pd.kind == PKind::Wk || pd.kind == PKind::Wv || pd.kind == PKind::Wo ||
-             pd.kind == PKind::W1 || pd.kind == PKind::W2 || pd.kind == PKind::Wg);
+        const bool muon_eligible = use_muon_ && is_muon_kind(pd.kind);   // shared set, layout.hpp
         if (muon_eligible) {
             muon_step_one(pd.off, pd.rows, pd.cols, muon_lr_, muon_beta_, wd_, gs);
             continue;

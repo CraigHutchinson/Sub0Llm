@@ -10,6 +10,7 @@
 #include "sub0/core.hpp"     // trainable_floats()
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
+#include "sub0/muon.hpp"     // sub0::muon::newton_schulz5 -- the CPU reference the GPU Muon tests check against
 
 #include <algorithm>
 #include <cmath>
@@ -21,13 +22,16 @@ extern "C" int  sub0_cuda_init();
 extern "C" void sub0_cuda_shutdown();
 extern "C" int  sub0_cuda_upload_params(const float* host);
 extern "C" int  sub0_cuda_download_params(float* host);
+extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
+extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_linear(const float* X, int T, int in, int out,
                                  const float* W, const float* bias, float* Y);
 extern "C" int  sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
                                    float* out_grad, double* out_loss, const int* lengths = nullptr);
-extern "C" int  sub0_cuda_adam_step(float lr, long t);
+extern "C" int  sub0_cuda_adam_step(float lr, long t, float muon_lr);
+extern "C" int  sub0_cuda_muon_ns_check(const float* in, int rows, int cols, int force_tf32, float* out);
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 extern "C" int  sub0_cuda_free_vram_mb();
@@ -753,7 +757,7 @@ TEST_CASE("CUDA AdamW step matches the CPU optimizer update", "[cuda]") {
     std::vector<float> tmp(n);
     double loss = 0.0;
     REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, tmp.data(), &loss) == 0);
-    REQUIRE(sub0_cuda_adam_step(0.001f, 1) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 1, 0.0f) == 0);   // muon_lr=0 -> pure AdamW, unchanged behavior
     std::vector<float> p_gpu(n);
     REQUIRE(sub0_cuda_download_params(p_gpu.data()) == 0);
 
@@ -775,6 +779,309 @@ TEST_CASE("CUDA AdamW step matches the CPU optimizer update", "[cuda]") {
     INFO("param-delta rel-L2 = " << rel << "  cos = " << cos << "  max abs = " << maxabs);
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);   // same update direction
     else                                    REQUIRE(rel < 2e-2);
+}
+
+// GPU Newton-Schulz self-test: sub0_cuda_muon_ns_check runs the EXACT device pipeline
+// device_adam_step's per-matrix Muon loop uses (backend_cuda.cu's muon_newton_schulz_device) in
+// isolation, comparable directly against sub0::muon::newton_schulz5 (the CPU reference,
+// include/sub0/muon.hpp) -- the single riskiest, most novel piece of this GPU port (Phase 1
+// audit): the CPU's physical transpose-for-compute-efficiency step is replaced entirely by cuBLAS
+// op-flag algebra on the GPU side, so this deliberately covers BOTH rows>cols and rows<cols at toy
+// AND this BUILD's actual production shape (D_MODEL x D_FF and its transpose) -- same shape-list
+// idea as muon_tests.cpp's own CPU test. Shapes are deliberately expressed relative to D_MODEL/D_FF
+// rather than hardcoded absolute numbers: sub0_cuda_muon_ns_check reuses ensure_muon_scratch's
+// buffers, which are sized to THIS build's own sub0::MUON_MAX_MN/MUON_MAX_MM (a compile-time
+// constant derived from the CURRENT build's PARAM_LAYOUT, not a fixed number) -- a hardcoded
+// {448,1792} would silently exceed a smaller test build's scratch and fail with rc!=0 (caught
+// exactly this way when this test was first run against a d32 build). Using D_MODEL/D_FF means
+// this test is production-shape-exact whenever compiled into a production-dims build, and still
+// exercises "this build's own biggest matrix, both orientations" at any other scale. Two checks per
+// shape: (1) rel-L2 against the CPU reference (WARNed, informational -- 5-step Newton-Schulz
+// amplifies perturbations by design, and CPU-double vs GPU-float accumulation order legitimately
+// differs, so this is not the hard gate); (2) the CPU-INDEPENDENT Gram-property check (off-diagonal
+// collapse, bounded diagonal -- identical bounds to muon_tests.cpp's CPU test) as the TRUE
+// correctness authority, per the Phase 1 precision recommendation ("treat the Gram-property check
+// as the true correctness authority, not just the parity number").
+TEST_CASE("CUDA Muon Newton-Schulz matches the CPU reference and the Gram property", "[cuda]") {
+    CudaGuard _cuda_guard;
+    struct { int rows, cols; } shapes[] = {{4, 4}, {4, 16}, {16, 4},
+                                           {D_MODEL, D_MODEL}, {D_MODEL, D_FF}, {D_FF, D_MODEL}};
+    for (auto [rows, cols] : shapes) {
+        std::mt19937 rng(42);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> in(static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
+        for (float& v : in) v = nd(rng);
+
+        std::vector<float> cpu_out(in.size());
+        sub0::muon::newton_schulz5(in.data(), rows, cols, cpu_out.data(), 5);
+
+        std::vector<float> gpu_out(in.size());
+        REQUIRE(sub0_cuda_muon_ns_check(in.data(), rows, cols, 0, gpu_out.data()) == 0);
+
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            const double d = static_cast<double>(gpu_out[i]) - cpu_out[i];
+            num += d * d;
+            den += static_cast<double>(cpu_out[i]) * cpu_out[i];
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        WARN("muon NS check: rows=" << rows << " cols=" << cols << " | rel-L2 vs CPU reference = " << rel);
+
+        // Independent re-derivation of the Gram-matrix property check (not reusing any GPU or CPU
+        // newton_schulz5 code) -- same working-orientation convention as muon_tests.cpp's gram_stats.
+        const int m = std::min(rows, cols), n = std::max(rows, cols);
+        std::vector<float> Xw(static_cast<std::size_t>(m) * static_cast<std::size_t>(n));
+        if (rows > cols) {
+            for (int i = 0; i < rows; ++i)
+                for (int j = 0; j < cols; ++j)
+                    Xw[static_cast<std::size_t>(j) * n + i] = gpu_out[static_cast<std::size_t>(i) * cols + j];
+        } else {
+            Xw = gpu_out;
+        }
+        double max_offdiag = 0.0, min_diag = 1e30, max_diag = -1e30;
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < m; ++j) {
+                double s = 0.0;
+                for (int k = 0; k < n; ++k)
+                    s += static_cast<double>(Xw[static_cast<std::size_t>(i) * n + k]) *
+                         static_cast<double>(Xw[static_cast<std::size_t>(j) * n + k]);
+                if (i == j) { min_diag = std::min(min_diag, s); max_diag = std::max(max_diag, s); }
+                else        max_offdiag = std::max(max_offdiag, std::fabs(s));
+            }
+        }
+        INFO("shape [" << rows << "," << cols << "] max_offdiag=" << max_offdiag
+             << " min_diag=" << min_diag << " max_diag=" << max_diag);
+        CHECK(max_offdiag < 0.3);
+        CHECK(min_diag > 0.3);
+        CHECK(max_diag < 2.0);
+    }
+}
+
+// TF32-leakage regression, the direct reproduction case for the #1 hazard this port's Phase 1
+// audit flagged: run_fwd_bwd sets the SHARED cuBLAS handle to TF32 tensor-op math on EVERY training
+// step (set_handle_tf32), so a Muon GEMM going through the ordinary gemm()/gemm_compute() path
+// could silently inherit reduced-precision math from an unrelated forward-pass knob.
+// gemm_muon's CUBLAS_COMPUTE_32F_PEDANTIC compute type exists specifically to be immune to this.
+// Direct proof: run the SAME input through muon_newton_schulz_device with the handle's math mode
+// forced to TF32 vs left at its default, and require the two outputs are nearly identical -- a
+// tolerance far tighter than TF32's characteristic ~1e-3 relative error (so this test would FAIL
+// LOUDLY if PEDANTIC ever stopped being honored), but not asserted bit-exact (cuBLAS's own
+// algorithm-selection heuristic is permitted to legitimately vary its summation order between the
+// two handle states even under an identical, non-reduced-precision compute type).
+TEST_CASE("CUDA Muon Newton-Schulz is immune to the shared handle's TF32 math mode", "[cuda]") {
+    CudaGuard _cuda_guard;
+    // This build's own actual production shape (D_MODEL x D_FF) -- see the NS self-test's comment
+    // above for why this can't be a hardcoded absolute shape (bounded by ensure_muon_scratch's
+    // build-specific MUON_MAX_MN/MUON_MAX_MM capacity).
+    const int rows = D_MODEL, cols = D_FF;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> in(static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
+    for (float& v : in) v = nd(rng);
+
+    std::vector<float> out_plain(in.size()), out_tf32(in.size());
+    REQUIRE(sub0_cuda_muon_ns_check(in.data(), rows, cols, 0, out_plain.data()) == 0);
+    REQUIRE(sub0_cuda_muon_ns_check(in.data(), rows, cols, 1, out_tf32.data()) == 0);
+
+    double maxabsdiff = 0.0, maxrel = 0.0;
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const double d = std::fabs(static_cast<double>(out_plain[i]) - out_tf32[i]);
+        maxabsdiff = std::max(maxabsdiff, d);
+        maxrel = std::max(maxrel, d / std::max(std::fabs(static_cast<double>(out_plain[i])), 1e-6));
+    }
+    WARN("muon NS TF32-forced-on max abs diff = " << maxabsdiff << " | max rel diff = " << maxrel);
+    REQUIRE(maxrel < 1e-5);   // >=1000x tighter than TF32's ~1e-3 characteristic error -- proves immunity
+}
+
+// Whole-step bisection probe for Muon specifically, the same style as the tied-embedding/QK-norm/
+// gated-FFN bisection probes elsewhere in this file: start CPU and GPU from an IDENTICAL parameter
+// state, take one hybrid Muon+AdamW step on each, and compare the resulting parameter DELTAS on
+// the Muon-eligible slices separately from the non-Muon slices (must match plain-AdamW parity
+// exactly, unaffected by this feature) and the momentum state itself. Runtime-flagged (NOT
+// `if constexpr`-gated, unlike the gated-FFN/QK-norm/tied-embedding probes -- Muon eligibility is a
+// runtime --optimizer choice, not a compile-time config), so this runs in EVERY CUDA build.
+//
+// Includes the two direct hazard-reproduction assertions this port's Phase 1 audit specifically
+// flagged: (1) g_dev_vel's Muon-eligible slices must be EXACTLY 0.0f after the step -- the direct
+// proof that adam_step_kernel's is_muon_param skip is working (a bug here would silently corrupt
+// Muon's own momentum, which lives in the SAME m[] arena under a different update rule -- see
+// device_adam_step's own comment, and the coordinator's explicit approval of rejecting the
+// "zero the Muon grad slices" alternative for exactly this reason); (2) the Muon-eligible slices of
+// g_dev_m (Muon's momentum) match the CPU's own g_param_m for the same slices, confirming the
+// momentum EMA itself -- not just the final parameter delta -- is correct.
+TEST_CASE("CUDA Muon step matches the CPU hybrid optimizer update", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 77, data, starts, ids, targets);
+
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> p0(sub0::params_ptr(), sub0::params_ptr() + n);
+
+    // CPU: one hybrid Muon+AdamW step from zeroed moments.
+    std::fill(sub0::adam_m_ptr(), sub0::adam_m_ptr() + n, 0.0f);
+    std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.0f);
+    sub0::train_batch(data.data(), starts.data(), batch, T);
+    sub0::AdamW opt(0.001f, /*use_muon=*/true);
+    opt.set_muon_lr(0.02f);
+    opt.step();
+    const std::vector<float> p_cpu(sub0::params_ptr(), sub0::params_ptr() + n);
+    const std::vector<float> m_cpu(sub0::adam_m_ptr(), sub0::adam_m_ptr() + n);
+
+    // GPU: backward (fills the device grad, zeroes moments) then one hybrid step at t=1, SAME
+    // muon_lr as the CPU side above.
+    std::vector<float> tmp(n);
+    double loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 1, 0.02f) == 0);
+    std::vector<float> p_gpu(n), m_gpu(n), v_gpu(n);
+    REQUIRE(sub0_cuda_download_params(p_gpu.data()) == 0);
+    REQUIRE(sub0_cuda_download_opt(m_gpu.data(), v_gpu.data()) == 0);
+
+    // Two independent metrics per group (Muon-slice / non-Muon-slice / momentum), same reasoning as
+    // "CUDA AdamW step matches the CPU optimizer update" and the gated-FFN bisection probe above:
+    // rel-L2 on the raw delta is the tight, direct gate under FP32 activations, but is NOT the
+    // right metric under this build's BF16 activation/GEMM storage -- bf16's ~3-decimal-digit
+    // mantissa means CPU-vs-GPU deltas on individual near-zero elements can differ by a large
+    // RELATIVE amount while still pointing the same direction overall; cosine similarity (does the
+    // GPU delta point the same way as the CPU delta, in aggregate) is this file's own established
+    // BF16 gate for exactly this reason. Confirmed empirically, not assumed: an earlier version of
+    // this test used rel-L2 unconditionally under BF16 too and passed at tiny (d32/L2) and
+    // gated-FFN (d32/L2) scale by chance, then failed hard at production scale (d448/L11) -- non-
+    // muon-slice rel-L2 = 0.52 -- once there were enough BF16-rounded elements for that measurement
+    // artifact to dominate; cosine similarity is stable across all three scales (see this test's own
+    // INFO line for the measured numbers).
+    double muon_num = 0.0, muon_den = 0.0, muon_dot = 0.0, muon_gn = 0.0;
+    double adam_num = 0.0, adam_den = 0.0, adam_dot = 0.0, adam_gn = 0.0;
+    double m_num = 0.0, m_den = 0.0, m_dot = 0.0, m_gn = 0.0;
+    float max_vel_muon = 0.0f;
+    for (const sub0::ParamDesc& pd : sub0::PARAM_LAYOUT) {
+        const bool muon = sub0::is_muon_kind(pd.kind);
+        for (std::size_t i = pd.off; i < pd.off + pd.n(); ++i) {
+            const double dc = static_cast<double>(p_cpu[i]) - p0[i];
+            const double dg = static_cast<double>(p_gpu[i]) - p0[i];
+            if (muon) {
+                const double dm = dg - dc;
+                muon_num += dm * dm; muon_den += dc * dc; muon_dot += dg * dc; muon_gn += dg * dg;
+                const double mc = static_cast<double>(m_cpu[i]), mg = static_cast<double>(m_gpu[i]);
+                const double dmm = mg - mc;
+                m_num += dmm * dmm; m_den += mc * mc; m_dot += mg * mc; m_gn += mg * mg;
+                max_vel_muon = std::max(max_vel_muon, std::fabs(v_gpu[i]));   // tripwire: must stay exactly 0
+            } else {
+                const double da = dg - dc;
+                adam_num += da * da; adam_den += dc * dc; adam_dot += dg * dc; adam_gn += dg * dg;
+            }
+        }
+    }
+    const double muon_rel = std::sqrt(muon_num / std::max(muon_den, 1e-30));
+    const double adam_rel = std::sqrt(adam_num / std::max(adam_den, 1e-30));
+    const double m_rel    = std::sqrt(m_num / std::max(m_den, 1e-30));
+    const double muon_cos = muon_dot / std::max(std::sqrt(muon_gn * muon_den), 1e-30);
+    const double adam_cos = adam_dot / std::max(std::sqrt(adam_gn * adam_den), 1e-30);
+    const double m_cos    = m_dot / std::max(std::sqrt(m_gn * m_den), 1e-30);
+    INFO("muon-slice delta rel-L2 = " << muon_rel << " cos = " << muon_cos
+         << " | non-muon-slice delta rel-L2 = " << adam_rel << " cos = " << adam_cos
+         << " | muon momentum (m) rel-L2 = " << m_rel << " cos = " << m_cos
+         << " | max |vel| on muon slices = " << max_vel_muon);
+    REQUIRE(std::isfinite(loss));
+    REQUIRE(max_vel_muon == 0.0f);        // direct hazard-reproduction: no double-update/momentum corruption
+    if constexpr (ACT_DTYPE == Dtype::BF16) {
+        REQUIRE(adam_cos > 0.7);          // same gate/threshold as the plain-AdamW BF16 precedent
+        REQUIRE(m_cos > 0.7);
+        REQUIRE(muon_cos > 0.5);          // looser than the AdamW bar: Newton-Schulz's quintic
+                                           // amplification (Phase 1 audit) means small CPU/GPU float
+                                           // differences compound over 5 iterations more than a plain
+                                           // elementwise AdamW update does; tighten once more scales'
+                                           // worth of measured numbers (this test's own INFO line) are in.
+    } else {
+        REQUIRE(adam_rel < 1e-2);         // non-Muon slices: unaffected, same bar as the plain-AdamW test
+        REQUIRE(m_rel < 1e-2);            // Muon's own momentum EMA matches the CPU reference
+        REQUIRE(muon_rel < 1e-1);         // looser than the AdamW bar, same reasoning as the BF16
+                                           // muon_cos bound above.
+    }
+}
+
+// Checkpoint/state round-trip, confirmed EMPIRICALLY (not just by tracing code -- per explicit
+// Phase 3 review guidance: "cheap to verify directly, and checkpoint compatibility bugs are
+// exactly the kind of thing that look obviously-fine on paper and aren't"). Mimics
+// train_stage.cpp's actual save_checkpoint/load_checkpoint round-trip mechanism -- a raw memcpy of
+// params_ptr()/adam_m_ptr()/adam_v_ptr() via sub0_cuda_download_params/download_opt on save, then
+// upload_params/upload_opt on resume -- without depending on train_stage.cpp's own file-I/O
+// internals (private to that translation unit): two hybrid Muon+AdamW steps run UNINTERRUPTED
+// should land on very nearly the IDENTICAL final (params, m, vel) as the same two steps with a
+// full device-state download+upload round trip (i.e. exactly what a save+resume does) injected
+// between them.
+//
+// NOT asserted bit-exact, even though the round trip itself is a lossless memcpy: the two paths'
+// SECOND backward() call is a genuinely SEPARATE kernel-launch sequence (not a replay), and CUDA's
+// atomicAdd-based reductions (embed_backward_kernel's scatter-add, the grad-clip/Frobenius-norm
+// block-reduces) are not guaranteed bit-stable in summation order across separate launches even
+// for byte-identical inputs -- confirmed empirically here (measured ~1e-10-scale absolute drift on
+// m/vel, exactly zero on params, first run), not assumed. The tolerance below is set far above
+// that measured noise floor and far below the scale a genuine round-trip bug (a dropped field, a
+// wrong buffer, byte-order corruption) would produce.
+constexpr double CKPT_ROUNDTRIP_TOL = 1e-6;   // absolute; see comment above for the noise-floor evidence
+TEST_CASE("CUDA Muon momentum state round-trips a save/resume cycle exactly", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> p0(sub0::params_ptr(), sub0::params_ptr() + n);
+    const std::vector<float> zero(n, 0.0f);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data1, ids1, targets1; std::vector<std::size_t> starts1;
+    make_windows(batch, T, 21, data1, starts1, ids1, targets1);
+    std::vector<int> data2, ids2, targets2; std::vector<std::size_t> starts2;
+    make_windows(batch, T, 22, data2, starts2, ids2, targets2);
+    std::vector<float> tmp(n);
+    double loss = 0.0;
+
+    // Reference: two steps, uninterrupted.
+    REQUIRE(sub0_cuda_upload_params(p0.data()) == 0);
+    REQUIRE(sub0_cuda_upload_opt(zero.data(), zero.data()) == 0);
+    REQUIRE(sub0_cuda_backward(ids1.data(), targets1.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 1, 0.02f) == 0);
+    REQUIRE(sub0_cuda_backward(ids2.data(), targets2.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 2, 0.02f) == 0);
+    std::vector<float> p_ref(n), m_ref(n), v_ref(n);
+    REQUIRE(sub0_cuda_download_params(p_ref.data()) == 0);
+    REQUIRE(sub0_cuda_download_opt(m_ref.data(), v_ref.data()) == 0);
+
+    // Round-tripped: step 1, download EVERYTHING (== save_checkpoint's param+m+vel write), re-upload
+    // (== load_checkpoint's param+m+vel read, simulating a resumed process), step 2.
+    REQUIRE(sub0_cuda_upload_params(p0.data()) == 0);
+    REQUIRE(sub0_cuda_upload_opt(zero.data(), zero.data()) == 0);
+    REQUIRE(sub0_cuda_backward(ids1.data(), targets1.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 1, 0.02f) == 0);
+    std::vector<float> p_mid(n), m_mid(n), v_mid(n);
+    REQUIRE(sub0_cuda_download_params(p_mid.data()) == 0);
+    REQUIRE(sub0_cuda_download_opt(m_mid.data(), v_mid.data()) == 0);
+    REQUIRE(sub0_cuda_upload_params(p_mid.data()) == 0);
+    REQUIRE(sub0_cuda_upload_opt(m_mid.data(), v_mid.data()) == 0);
+    REQUIRE(sub0_cuda_backward(ids2.data(), targets2.data(), batch, T, tmp.data(), &loss) == 0);
+    REQUIRE(sub0_cuda_adam_step(0.001f, 2, 0.02f) == 0);
+    std::vector<float> p_rt(n), m_rt(n), v_rt(n);
+    REQUIRE(sub0_cuda_download_params(p_rt.data()) == 0);
+    REQUIRE(sub0_cuda_download_opt(m_rt.data(), v_rt.data()) == 0);
+
+    double maxdiff_p = 0.0, maxdiff_m = 0.0, maxdiff_v = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        maxdiff_p = std::max(maxdiff_p, std::fabs(static_cast<double>(p_ref[i]) - p_rt[i]));
+        maxdiff_m = std::max(maxdiff_m, std::fabs(static_cast<double>(m_ref[i]) - m_rt[i]));
+        maxdiff_v = std::max(maxdiff_v, std::fabs(static_cast<double>(v_ref[i]) - v_rt[i]));
+    }
+    INFO("checkpoint round-trip max abs diff: params=" << maxdiff_p << " m=" << maxdiff_m << " vel=" << maxdiff_v
+         << " (tolerance " << CKPT_ROUNDTRIP_TOL << " -- see this test's own comment for why this isn't 0.0)");
+    REQUIRE(maxdiff_p < CKPT_ROUNDTRIP_TOL);
+    REQUIRE(maxdiff_m < CKPT_ROUNDTRIP_TOL);
+    REQUIRE(maxdiff_v < CKPT_ROUNDTRIP_TOL);
 }
 
 // Regression for the GPU-training divergence: amplify the weights so GELU inputs reach the

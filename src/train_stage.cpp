@@ -78,7 +78,8 @@ extern "C" int  sub0_cuda_download_params(float* host);
 extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
 extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
-                                     float lr, long t, double* out_loss, const int* lengths);
+                                     float lr, long t, double* out_loss, const int* lengths,
+                                     float muon_lr);
 // Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
 // pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
 extern "C" int  sub0_cuda_train_reserve(int batch);
@@ -704,7 +705,8 @@ struct GpuTrainer {
     // and the padding contributes no gradient (causal attention keeps it out of the real tokens).
     float step([[maybe_unused]] sub0::TokView data, [[maybe_unused]] const std::size_t* starts,
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
-               [[maybe_unused]] int T, [[maybe_unused]] float lr) {
+               [[maybe_unused]] int T, [[maybe_unused]] float lr,
+               [[maybe_unused]] float muon_lr = 0.f) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
             const std::size_t w = starts[b];               // window base into the token view (width-agnostic)
@@ -720,7 +722,11 @@ struct GpuTrainer {
             }
         }
         double loss = 0.0;
-        sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths);
+        // muon_lr <= 0 is pure AdamW on the GPU path (bit-identical to before this feature existed);
+        // > 0 hybridizes with Muon on the Muon-eligible matrices -- see sub0_cuda_train_step's own
+        // comment (backend_cuda.cu) and the call site below (mirrors the CPU branch's own
+        // opt.use_muon() ? lr_schedule(..., MUON_LR_BASE, ...) : implicit-AdamW-only computation).
+        sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -1059,16 +1065,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     // Phase 2e: try to run the training loop on the GPU (params resident on device). Falls back
     // to the CPU data-parallel path when the CUDA backend is absent, no device initializes, or the
-    // batch exceeds the device's resident scratch width.
+    // batch exceeds the device's resident scratch width. Muon (--optimizer muon) is honored on
+    // BOTH paths: the GPU path routes the Muon-eligible weight matrices through its own device
+    // Newton-Schulz pipeline (backend_cuda.cu's device_adam_step / muon_step_matrix), the same
+    // hybrid dispatch shape as the CPU's AdamW::step -- see the per-step call site below for the
+    // muon_lr computation. (Previously this silently fell back to pure AdamW on GPU with a warning;
+    // GPU Muon support removed the need for that fallback entirely.)
     GpuTrainer gpu;
     const bool gpu_train = gpu.enable(batch, opt.step_count());
-    // Muon only affects AdamW::step(), the CPU path -- the GPU path runs its own separate optimizer
-    // kernel (backend_cuda.cu's adam_step_kernel), untouched. Warn rather than silently ignoring the
-    // request: a run that expected Muon and silently got plain AdamW on GPU would be a confusing,
-    // hard-to-notice behavior change.
-    if (optimizer == 1 && gpu_train)
-        sub0::log::warn("--optimizer muon requested but this run is using the GPU path; Muon is "
-                        "CPU-only for now (TODO(muon-gpu)) -- training with AdamW on GPU instead.");
 
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
@@ -1172,7 +1176,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
         float step_loss;
         if (gpu_train) {
-            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t);
+            // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
+            // 0.f when Muon isn't selected, which sub0_cuda_train_step treats as pure AdamW.
+            const float muon_lr_t = opt.use_muon() ? lr_schedule(step, MUON_LR_BASE, lr_warmup_steps) : 0.f;
+            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update

@@ -66,7 +66,7 @@ inline int run_train(int argc, char** argv) {
                    "Progress-named checkpoints to retain (N, or ALL to keep every stage)")->capture_default_str();
     app.add_option("--optimizer", train_optimizer,
                    "adamw (default) | muon (hidden 2D weight matrices on Muon, everything else stays "
-                   "AdamW -- CPU-only for now)")
+                   "AdamW -- CPU and GPU)")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"adamw", 0}, {"muon", 1}}, CLI::ignore_case))
        ->default_str("adamw");
     CLI11_PARSE(app, argc, argv);

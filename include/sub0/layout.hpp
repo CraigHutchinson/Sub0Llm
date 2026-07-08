@@ -16,6 +16,7 @@
 
 #include "sub0_config.hpp"  // D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, D_FF, VOCAB, D_HEAD, USE_TERNARY, USE_GATED_FFN, USE_TIED_EMBEDDINGS, USE_QK_NORM
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 
@@ -107,6 +108,18 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
 
 inline constexpr std::array<ParamDesc, NUM_PARAMS> PARAM_LAYOUT = make_param_layout();
 
+// Muon-eligible parameter kinds: the hidden 2D GEMM weight matrices that route through
+// Newton-Schulz orthogonalized-momentum updates instead of AdamW's per-element update, when
+// --optimizer muon is selected (Keller Jordan et al.; see include/sub0/muon.hpp). Embeddings,
+// the output head, and 1D params (norm gains, biases) always stay on AdamW. Defined ONCE here
+// (not duplicated per-backend) so the CPU hybrid dispatch (AdamW::step, backend_cpu.cpp) and the
+// GPU hybrid dispatch (device_adam_step, backend_cuda.cu) can never drift out of sync on which
+// kinds route through Muon -- backend_cpu.cpp used to inline this exact kind set locally.
+inline constexpr bool is_muon_kind(PKind k) {
+    return k == PKind::Wq || k == PKind::Wk || k == PKind::Wv || k == PKind::Wo ||
+           k == PKind::W1 || k == PKind::W2 || k == PKind::Wg;
+}
+
 // A compact [start,end) float-offset range where AdamW weight decay applies, merging adjacent
 // decay=true PARAM_LAYOUT entries into one run (e.g. Wq,Wk,Wv,Wo,W1 are 5 consecutive decay=true
 // tensors -- one range covers all of them). Lets a flat-index kernel (backend_cuda.cu's
@@ -138,6 +151,65 @@ consteval std::array<DecayRange, NUM_DECAY_RANGES> make_decay_ranges() {
     return out;
 }
 inline constexpr std::array<DecayRange, NUM_DECAY_RANGES> DECAY_RANGES = make_decay_ranges();
+
+// Same [start,end) run-merging idea as DECAY_RANGES, but for is_muon_kind() instead of p.decay --
+// lets a flat-index GPU kernel (backend_cuda.cu's adam_step_kernel) test "does this parameter
+// route through Muon instead" via a handful of compile-time-known range comparisons, so the
+// AdamW kernel can SKIP Muon-routed parameters (which the host-side per-matrix Muon loop already
+// updated) instead of double-updating them. Deliberately a separate table from DECAY_RANGES, not
+// reused/merged with it: a param can be muon-eligible AND decay=true simultaneously (every
+// Muon-eligible kind currently is), so the two predicates are independent, not nested. Kept as a
+// parallel, non-templated implementation of the same run-merging logic (not factored into a
+// shared helper) so DECAY_RANGES -- exhaustively covered by layout_tests.cpp's offset-by-offset
+// test -- is not touched by this change; the marginal DRY win of a generic template was judged
+// not worth risking a regression in already-tested code.
+consteval int count_muon_ranges() {
+    int n = 0;
+    bool in_run = false;
+    for (const ParamDesc& p : PARAM_LAYOUT) {
+        if (is_muon_kind(p.kind)) { if (!in_run) ++n; in_run = true; }
+        else                      { in_run = false; }
+    }
+    return n;
+}
+inline constexpr int NUM_MUON_RANGES = count_muon_ranges();
+
+consteval std::array<DecayRange, NUM_MUON_RANGES> make_muon_ranges() {
+    std::array<DecayRange, NUM_MUON_RANGES> out{};
+    int idx = -1;
+    for (const ParamDesc& p : PARAM_LAYOUT) {
+        if (!is_muon_kind(p.kind)) continue;
+        if (idx >= 0 && out[idx].end == p.off) out[idx].end += p.n();   // extend the current run
+        else                                   out[++idx] = DecayRange{p.off, p.off + p.n()};
+    }
+    return out;
+}
+inline constexpr std::array<DecayRange, NUM_MUON_RANGES> MUON_RANGES = make_muon_ranges();
+
+// Upper bounds on a Muon-eligible matrix's element count (rows*cols, the "[m,n]" working size)
+// and its square Gram-matrix element count (min(rows,cols)^2, the "[m,m]" working size), taken
+// over every Muon-eligible PARAM_LAYOUT entry. The GPU Newton-Schulz scratch buffers (backend_cuda.cu)
+// are sized ONCE to these ceilings and reused for every matrix/every step (AGENTS.md #1: no
+// per-call heap/device allocation) -- every actual call is bounded by ITS OWN current rows*cols,
+// never by the (possibly larger) scratch buffer's own capacity.
+consteval std::size_t compute_muon_max_mn() {
+    std::size_t mx = 0;
+    for (const ParamDesc& p : PARAM_LAYOUT)
+        if (is_muon_kind(p.kind)) mx = std::max(mx, p.n());
+    return mx;
+}
+inline constexpr std::size_t MUON_MAX_MN = compute_muon_max_mn();
+
+consteval std::size_t compute_muon_max_mm() {
+    std::size_t mx = 0;
+    for (const ParamDesc& p : PARAM_LAYOUT)
+        if (is_muon_kind(p.kind)) {
+            const std::size_t m = static_cast<std::size_t>(std::min(p.rows, p.cols));
+            mx = std::max(mx, m * m);
+        }
+    return mx;
+}
+inline constexpr std::size_t MUON_MAX_MM = compute_muon_max_mm();
 
 // Total trainable floats = sum of every tensor's element count. This replaces the
 // hand-rolled size calculation; the on-disk checkpoint and every parameter arena

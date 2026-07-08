@@ -123,7 +123,9 @@ SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch
 // on plain AdamW -- this is Muon's own documented usage pattern (see muon.hpp), not a project
 // invention. Muon needs its own, much larger learning rate (its updates are normalized very
 // differently from AdamW's) -- set independently via set_muon_lr(), not derived from set_lr().
-// CPU-only for now (the CUDA backend has its own separate optimizer kernel, untouched).
+// This class (AdamW::step) is the CPU implementation; the CUDA backend has its own separate,
+// numerically-equivalent device pipeline (backend_cuda.cu's device_adam_step / muon_step_matrix /
+// muon_newton_schulz_device) reached the same way, via --optimizer muon on a GPU build.
 //
 // TODO(muon-constexpr): `use_muon` is a RUNTIME choice (a `--optimizer` CLI flag), which is a
 // deliberate but TEMPORARY exception to this project's normal rule (every decision knowable upfront

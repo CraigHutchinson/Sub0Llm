@@ -15,7 +15,11 @@
 #include "sub0/knob.hpp"     // Knob<T,Baked>: compile-time-baked / runtime-tunable knobs
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the CPU tuner
 #include "sub0/memplan.hpp"  // train_resident_bytes: the predicted footprint this file is validated against
+#include "sub0/muon.hpp"     // sub0::muon::scale_factor -- the GPU Newton-Schulz math itself is
+                              // reimplemented below via cuBLAS (see muon_newton_schulz_device);
+                              // only the tiny host-side post-orthogonalization scale is shared
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -1468,15 +1472,45 @@ __device__ __forceinline__ bool is_decay_param(int i) {
     return false;
 }
 
+// Muon-routed ranges (sub0::MUON_RANGES, layout.hpp), mirrored into __constant__ memory once at
+// opt_alloc time -- ALWAYS uploaded (like g_decay_ranges), independent of whether this particular
+// run actually uses Muon: a non-Muon run's ranges simply never match any Muon-eligible-kind
+// parameter's grad, which is precisely the correct behavior (adam_step_kernel below falls through
+// to its ordinary per-element update for every parameter, exactly as before this feature existed).
+__constant__ sub0::DecayRange g_muon_ranges[sub0::NUM_MUON_RANGES];
+
+// Linear scan, same shape/cost as is_decay_param above.
+__device__ __forceinline__ bool is_muon_param(int i) {
+    #pragma unroll
+    for (int r = 0; r < sub0::NUM_MUON_RANGES; ++r)
+        if (i >= static_cast<int>(g_muon_ranges[r].start) && i < static_cast<int>(g_muon_ranges[r].end))
+            return true;
+    return false;
+}
+
 // AdamW per-parameter update (op-for-op identical to AdamW::step on the CPU). gs = global grad
 // clip scale (device-resident scalar -- see grad_clip_scale_kernel above), bc1/bc2 = bias
 // corrections; weight decay (matrices only) comes from is_decay_param(i) above, not a mask buffer.
+// `muon_active` (== this step's muon_lr > 0, see device_adam_step) gates the Muon skip: Muon
+// ELIGIBILITY (is_muon_param/g_muon_ranges) is a compile-time-derived property of a parameter's
+// KIND (Wq/Wk/.../Wg) and is uploaded unconditionally regardless of whether any given run actually
+// uses Muon, so checking is_muon_param(i) WITHOUT this gate would skip those parameters' ordinary
+// AdamW update on every pure-AdamW GPU run too -- silently leaving the majority of the model's
+// trainable weights (every Muon-ELIGIBLE-kind matrix) never updated at all whenever muon_lr<=0.
+// (Caught by this port's own CUDA test suite: "CUDA AdamW step matches the CPU optimizer update"
+// failed hard -- cos 0.32 instead of >0.7 -- before this gate was added; a genuinely load-bearing
+// regression test, not a hypothetical.) When `muon_active` IS true, device_adam_step's per-matrix
+// host loop (muon_step_matrix, below) already updated these parameters AND their slice of m[]
+// (Muon's own momentum buffer -- see that function's comment) before this kernel runs, so running
+// the ordinary Adam update here too would double-update p[] and corrupt Muon's momentum.
 __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict__ grad,
                                  float* __restrict__ m, float* __restrict__ vel, int n,
                                  const float* __restrict__ gs_ptr, float lr,
-                                 float b1, float b2, float eps, float wd, float bc1, float bc2) {
+                                 float b1, float b2, float eps, float wd, float bc1, float bc2,
+                                 bool muon_active) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (muon_active && is_muon_param(i)) return;
     const float g = grad[i] * (*gs_ptr);
     m[i]   = b1 * m[i]   + (1.f - b1) * g;
     vel[i] = b2 * vel[i] + (1.f - b2) * g * g;
@@ -1484,6 +1518,61 @@ __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict_
     const float vhat = vel[i] / bc2;
     p[i] -= lr * mhat / (sqrtf(vhat) + eps);
     p[i] -= lr * (is_decay_param(i) ? wd : 0.f) * p[i];
+}
+
+// --- Muon (hybrid optimizer) elementwise device kernels ---------------------------------------
+// GPU port of include/sub0/muon.hpp's Newton-Schulz building blocks + src/backend_cpu.cpp's
+// muon_step_one hybrid dispatch. The matrix-product pieces (GEMMs) live further down, past the
+// cuBLAS wrapper helpers (gemm_muon, muon_newton_schulz_device) -- these four are the purely
+// elementwise pieces, kept here alongside adam_step_kernel since they don't need cuBLAS.
+
+// upd[i] = Nesterov-lookahead gradient; m[i] updated to the new momentum EMA IN PLACE (this is
+// g_dev_m's own slice for this parameter, reused as Muon's momentum buffer exactly like the CPU's
+// muon_step_one -- g_dev_vel stays untouched/zero for these params, so the checkpoint format needs
+// no new field). gs_ptr is the SAME global grad-clip scale the plain-AdamW path uses (device
+// pointer, see grad_clip_scale_kernel) -- clipping stays uniform across routings.
+__global__ void muon_ema_nesterov_kernel(float* __restrict__ m, const float* __restrict__ grad,
+                                         float* __restrict__ upd, int n, float beta,
+                                         const float* __restrict__ gs_ptr) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = grad[i] * (*gs_ptr);
+    const float mnew = beta * m[i] + (1.f - beta) * g;
+    m[i]   = mnew;
+    upd[i] = (1.f - beta) * g + beta * mnew;
+}
+
+// x[i] /= norm, norm = sqrt(*ss_ptr) + 1e-7f -- same epsilon as the CPU reference (muon.hpp), same
+// division (not the reciprocal-multiply the CPU file's own TODO comment flags as a possible future
+// speedup -- kept as literal division here too, matching the reference exactly rather than
+// introducing a new algebraic variant this port wasn't asked to validate). *ss_ptr is accumulated
+// in DOUBLE by grad_normsq_kernel, reused verbatim (not a new reduction kernel) -- Phase 1 audit's
+// precision recommendation: double for the Frobenius norm only, float everywhere else.
+__global__ void muon_normalize_kernel(float* __restrict__ x, int n, const double* __restrict__ ss_ptr) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float norm = sqrtf(static_cast<float>(*ss_ptr)) + 1e-7f;
+    x[i] /= norm;
+}
+
+// out[i] = alpha*x[i] + beta*y[i]. Used for both of Newton-Schulz's per-iteration elementwise
+// combines: B = b*A + c*AA (out==x==A, y==AA, beta=c) and X = a*X + BX (out==x==X, y==BX, beta=1).
+// Safe with out aliasing x (each thread only ever reads its own index before writing it).
+__global__ void axpby_kernel(float* __restrict__ out, const float* __restrict__ x,
+                             const float* __restrict__ y, float alpha, float beta, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = alpha * x[i] + beta * y[i];
+}
+
+// Final apply: decoupled weight decay then the orthogonalized-update step, same order as the CPU's
+// muon_step_one. `upd` here is the post-Newton-Schulz result, already in p's own native
+// [rows,cols] row-major orientation (see muon_newton_schulz_device -- there is no un-transpose step).
+__global__ void muon_apply_kernel(float* __restrict__ p, const float* __restrict__ upd, int n,
+                                  float lr, float wd, float scale) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    p[i] -= lr * wd * p[i];
+    p[i] -= lr * scale * upd[i];
 }
 
 // --- Device-pointer launchers (no host alloc; drive the resident forward chain) ---
@@ -1541,6 +1630,22 @@ inline void gemm(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int
     const float alpha = 1.0f;
     cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
                  &beta, C, CUDA_R_32F, ldc, gemm_compute(force_tc), CUBLAS_GEMM_DEFAULT);
+}
+// Muon-dedicated GEMM: same row-major-via-cuBLAS calling convention as gemm() above, but ALWAYS
+// CUBLAS_COMPUTE_32F_PEDANTIC, independent of gemm_compute()'s knob-driven TF32/BF16 choice.
+// Why this can't just reuse gemm(): run_fwd_bwd sets the SHARED cuBLAS handle to TF32 tensor-op
+// math on EVERY training step (set_handle_tf32/apply_math_mode), so a Muon GEMM going through the
+// ordinary gemm()/gemm_compute() path could silently inherit reduced-precision math from an
+// unrelated forward-pass knob -- a real, project-flagged hazard (a wrong precision choice here
+// "silently produces a worse optimizer, not a crash", AGENTS.md). PEDANTIC is the cuBLAS compute
+// type documented to disable tensor-core/reduced-precision paths regardless of the handle's math
+// mode, so this makes Newton-Schulz's GEMMs immune to that knob by construction, not by convention
+// -- see cuda_tests.cpp's TF32-forced-on regression test, the direct proof case for this hazard.
+inline void gemm_muon(cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+                      const float* A, int lda, const float* B, int ldb, float* C, int ldc) {
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas, opA, opB, m, n, k, &alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
+                 &beta, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
 }
 template <class T> constexpr cudaDataType_t cu_type() {
     return std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_32F;
@@ -2980,10 +3085,138 @@ void backward_device(int batch, int T, const int* d_lengths) {
     }
 }
 
+// --- Muon (hybrid optimizer) matrix-level pipeline --------------------------------------------
+// Scratch for GPU Newton-Schulz, sized ONCE to the largest Muon-eligible matrix (sub0::MUON_MAX_MN
+// / sub0::MUON_MAX_MM, layout.hpp) and reused for every eligible matrix, every step (AGENTS.md #1
+// -- every call below is bounded by ITS OWN current rows*cols/m*m, never by these buffers' own
+// capacity). `upd`/`bx` are always in a matrix's NATIVE [rows,cols] row-major orientation; `a`/`aa`
+// are the [m,m] (m=min(rows,cols)) Gram-matrix scratch. Allocated LAZILY (not in opt_alloc) so an
+// AdamW-only GPU run pays zero extra VRAM for this feature (AGENTS.md #4) -- ~8 MiB at this
+// project's production d448/D_FF=1792 shape once a Muon run actually touches it.
+float*  g_dev_muon_upd = nullptr;
+float*  g_dev_muon_bx  = nullptr;
+float*  g_dev_muon_a   = nullptr;
+float*  g_dev_muon_aa  = nullptr;
+double* g_dev_muon_ss  = nullptr;   // [1] Frobenius norm-sq accumulator (double, like grad clip)
+
+int ensure_muon_scratch() {
+    if (g_dev_muon_upd) return 0;
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_muon_upd, sub0::MUON_MAX_MN * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_muon_bx,  sub0::MUON_MAX_MN * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_muon_a,   sub0::MUON_MAX_MM * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_muon_aa,  sub0::MUON_MAX_MM * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_muon_ss,  sizeof(double)));
+    return 0;
+}
+void free_muon_scratch() {
+    cudaFree(g_dev_muon_upd); cudaFree(g_dev_muon_bx);
+    cudaFree(g_dev_muon_a);   cudaFree(g_dev_muon_aa);
+    cudaFree(g_dev_muon_ss);
+    g_dev_muon_upd = g_dev_muon_bx = g_dev_muon_a = g_dev_muon_aa = nullptr;
+    g_dev_muon_ss = nullptr;
+}
+
+// GPU Newton-Schulz orthogonalization (5 default iterations) -- the GPU counterpart of
+// sub0::muon::newton_schulz5 (include/sub0/muon.hpp). `upd` (device, rows*cols floats) holds the
+// Nesterov-lookahead gradient on entry, in its NATIVE row-major [rows,cols] layout (the same
+// layout the parameter/gradient blob itself uses -- NOT the CPU reference's internal [m,n]
+// (m=min(rows,cols)) "working orientation" buffer). On return, `upd` holds the orthogonalized
+// result, STILL in that same native [rows,cols] layout, ready for muon_apply_kernel to subtract
+// directly from p[] -- there is no un-transpose step anywhere in this function.
+//
+// Why no transpose is needed at all (the CPU reference's physical transpose-for-compute-
+// efficiency step, muon.hpp lines ~66-73/133-140, is a pure compute-cost optimization for a
+// row-major CPU loop; it has no GPU equivalent because cuBLAS already gives GEMM op-flag control
+// over which operand is read transposed, for free, from the SAME buffer):
+//
+//   cuBLAS is column-major. A row-major buffer M of logical shape [P,Q] (element (i,j) at offset
+//   i*Q+j), handed to cuBLAS with ld=Q, is READ by cuBLAS as a column-major matrix M_cm[Q,P] with
+//   M_cm(j,i) = M(i,j) -- i.e. M_cm == M^T, unconditionally. This project's launch_linear (see its
+//   own comment above) establishes the standard consequence: to compute a ROW-MAJOR product
+//   C[p,q] = L[p,k] . R[k,q] via cuBLAS, call cublasGemmEx(opR, opL, q, p, k, R_buf, ldR, L_buf,
+//   ldL, C_buf, q) -- operands SWAPPED (R first), each op flag N/T selecting whether that operand
+//   is used as its OWN native row-major shape (N) or that shape's transpose (T).
+//
+//   Applying this to Newton-Schulz's three per-iteration products, where U (== `upd`, native
+//   [rows,cols], m=min(rows,cols), n=max(rows,cols)) stands in for the CPU reference's Xp buffer
+//   (Xp==U when rows<=cols; Xp==U^T when rows>cols):
+//
+//   1) A[m,m] = Xp @ Xp^T (the Gram matrix, ALWAYS contracting over n, the large dimension):
+//        rows<=cols: A = U @ U^T   -> gemm_muon(OP_T, OP_N, rows, rows, cols, U, cols, U, cols, A, rows)
+//        rows>cols:  A = U^T @ U   -> gemm_muon(OP_N, OP_T, cols, cols, rows, U, cols, U, cols, A, cols)
+//      (U supplied as BOTH operands -- legal and safe: read-only, matches the op flags derived
+//      above, no data race since neither call writes U.)
+//   2) AA[m,m] = A @ A -- square, no transpose subtlety either way:
+//        gemm_muon(OP_N, OP_N, m, m, m, A, m, A, m, AA, m)
+//   3) BX_native[rows,cols] = "B @ Xp" re-expressed so the OUTPUT lands directly in U's native
+//      orientation (never Xp's [m,n] working orientation) -- the crux of avoiding a final
+//      un-transpose entirely:
+//        rows<=cols (Xp==U, so B@Xp is already native [rows,cols]):
+//              gemm_muon(OP_N, OP_N, cols, rows, rows, U, cols, B, m, BX, cols)
+//        rows>cols (Xp==U^T, so BX=B@Xp -> BX^T = Xp^T@B^T = U@B^T, which IS what we want since we
+//                   need BX's TRANSPOSE to land in U's native orientation for the next
+//                   iteration/the final apply):
+//              gemm_muon(OP_T, OP_N, cols, rows, cols, B, m, U, cols, BX, cols)
+//      (B lives in the `a` scratch buffer after the axpby combine below overwrites it in place.)
+//   4) B = b*A + c*AA (elementwise, in place into A -- axpby_kernel)
+//   5) U = a*U + BX (elementwise, native [rows,cols] -- axpby_kernel), which becomes the NEXT
+//      iteration's U with no reorientation needed, and IS the final result after the last iteration.
+//
+// This derivation is the single riskiest, most novel piece of this GPU port (Phase 1 audit) --
+// verified against the CPU double-accumulated reference AND an independent Gram-property check
+// (off-diagonal collapse, bounded diagonal) at BOTH rows>cols and rows<cols shapes, toy and
+// production, by cuda_tests.cpp's "CUDA Muon Newton-Schulz" test.
+inline void muon_newton_schulz_device(float* upd, int rows, int cols, int steps = 5) {
+    constexpr float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    const bool transposed = rows > cols;
+    const int m = transposed ? cols : rows;
+    const int mn = rows * cols;
+    const int mm = m * m;
+    const int block = 256;
+
+    SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_dev_muon_ss, 0, sizeof(double), g_stream));
+    grad_normsq_kernel<<<(mn + block - 1) / block, block, 0, g_stream>>>(upd, g_dev_muon_ss, mn);
+    muon_normalize_kernel<<<(mn + block - 1) / block, block, 0, g_stream>>>(upd, mn, g_dev_muon_ss);
+
+    float* A  = g_dev_muon_a;
+    float* AA = g_dev_muon_aa;
+    float* BX = g_dev_muon_bx;
+    for (int it = 0; it < steps; ++it) {
+        if (!transposed) gemm_muon(CUBLAS_OP_T, CUBLAS_OP_N, rows, rows, cols, upd, cols, upd, cols, A, rows);
+        else              gemm_muon(CUBLAS_OP_N, CUBLAS_OP_T, cols, cols, rows, upd, cols, upd, cols, A, cols);
+        gemm_muon(CUBLAS_OP_N, CUBLAS_OP_N, m, m, m, A, m, A, m, AA, m);
+        axpby_kernel<<<(mm + block - 1) / block, block, 0, g_stream>>>(A, A, AA, b, c, mm);
+        if (!transposed) gemm_muon(CUBLAS_OP_N, CUBLAS_OP_N, cols, rows, rows, upd, cols, A, m, BX, cols);
+        else              gemm_muon(CUBLAS_OP_T, CUBLAS_OP_N, cols, rows, cols, A, m, upd, cols, BX, cols);
+        axpby_kernel<<<(mn + block - 1) / block, block, 0, g_stream>>>(upd, upd, BX, a, 1.0f, mn);
+    }
+}
+
+// One Muon-routed weight matrix's GPU update: momentum EMA + Nesterov lookahead ->
+// muon_newton_schulz_device -> fan-ratio scale -> decoupled weight decay -> apply. Mirrors
+// src/backend_cpu.cpp's muon_step_one exactly (same op order, same reuse of the AdamW momentum
+// arena, same scale_factor call) -- see that function's own comment for the checkpoint-
+// compatibility reasoning (g_dev_vel stays untouched/zero for these params). `beta` is Muon's own
+// momentum EMA coefficient -- hardcoded to 0.95f at the one call site below, matching
+// include/sub0/core.hpp's AdamW::muon_beta_ default (never independently configurable on the CPU
+// side either, so no new surface here -- AGENTS.md #8).
+void muon_step_matrix(std::size_t off, int rows, int cols, float lr, float beta, float wd) {
+    ensure_muon_scratch();
+    const int n = rows * cols, block = 256;
+    muon_ema_nesterov_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
+        g_dev_m + off, g_dev_grad + off, g_dev_muon_upd, n, beta, g_dev_gs);
+    muon_newton_schulz_device(g_dev_muon_upd, rows, cols, 5);
+    const float scale = sub0::muon::scale_factor(rows, cols);
+    muon_apply_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
+        g_dev_params + off, g_dev_muon_upd, n, lr, wd, scale);
+}
+
 // AdamW state: the reduced grad, the two moments (zeroed), and the double norm accumulator.
 // Allocated lazily alongside the train scratch. The weight-decay ranges are compile-time-known
 // (sub0::DECAY_RANGES, layout.hpp) -- copied once into __constant__ memory here, not a persistent
-// per-parameter mask.
+// per-parameter mask. g_muon_ranges (sub0::MUON_RANGES) is uploaded here too, ALWAYS (not
+// conditionally on Muon being used) -- same reasoning as g_decay_ranges: it's a tiny compile-time
+// table, cheap to always upload, and correct-by-construction for a non-Muon run (see is_muon_param).
 int opt_alloc() {
     if (g_dev_grad) return 0;
     ensure_stream();
@@ -2997,6 +3230,8 @@ int opt_alloc() {
     SUB0_CUDA_CHECK(cudaMemset(g_dev_vel, 0, n * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemcpyToSymbol(g_decay_ranges, sub0::DECAY_RANGES.data(),
                                        sizeof(sub0::DecayRange) * sub0::NUM_DECAY_RANGES));
+    SUB0_CUDA_CHECK(cudaMemcpyToSymbol(g_muon_ranges, sub0::MUON_RANGES.data(),
+                                       sizeof(sub0::DecayRange) * sub0::NUM_MUON_RANGES));
     return 0;
 }
 
@@ -3006,6 +3241,7 @@ void opt_free() {
     g_dev_grad = g_dev_m = g_dev_vel = nullptr;
     g_dev_normsq = nullptr;
     g_dev_gs = nullptr;
+    free_muon_scratch();
 }
 
 // One AdamW step over the whole param blob, op-for-op identical to AdamW::step on the CPU: global
@@ -3018,7 +3254,19 @@ void opt_free() {
 // needs normsq back on the host at all. bc1/bc2 are already host-computable from `t` alone (no
 // device dependency). This is the second of two per-step syncs removed 2026-07 -- run_fwd_bwd's loss
 // readback (below) was the other -- leaving a single sync at the end of sub0_cuda_train_step.
-void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd, float clip) {
+//
+// `muon_lr` <= 0 means pure AdamW (bit-identical to this function's pre-Muon behavior -- the
+// per-matrix loop below never runs, adam_step_kernel's is_muon_param check always evaluates false
+// against zero-touched-but-still-valid ranges the same way it would for any non-Muon-eligible
+// index). `muon_lr` > 0 routes the Muon-eligible matrices (sub0::is_muon_kind) through
+// muon_step_matrix FIRST (host loop over PARAM_LAYOUT, matrix by matrix -- mirrors the CPU's
+// AdamW::step loop structure, unlike the flat elementwise adam_step_kernel below), then the flat
+// AdamW kernel runs over everything else, skipping the ranges Muon just updated
+// (is_muon_param/g_muon_ranges) so nothing is double-updated. Order between the two doesn't affect
+// correctness (disjoint parameter ranges, same stream g_stream serializes both regardless) --
+// matrix-level work first here purely as the more natural reading order.
+void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd, float clip,
+                      float muon_lr) {
     const int n = static_cast<int>(sub0::PARAM_FLOATS);
     const int block = 256, grid = (n + block - 1) / block;
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_dev_normsq, 0, sizeof(double), g_stream));
@@ -3026,8 +3274,15 @@ void device_adam_step(float lr, long t, float b1, float b2, float eps, float wd,
     grad_clip_scale_kernel<<<1, 1, 0, g_stream>>>(g_dev_normsq, clip, g_dev_gs);
     const float bc1  = 1.0f - std::pow(b1, static_cast<float>(t));
     const float bc2  = 1.0f - std::pow(b2, static_cast<float>(t));
+    if (muon_lr > 0.f) {
+        constexpr float MUON_BETA = 0.95f;   // core.hpp's AdamW::muon_beta_ default -- see muon_step_matrix
+        for (const sub0::ParamDesc& pd : sub0::PARAM_LAYOUT)
+            if (sub0::is_muon_kind(pd.kind))
+                muon_step_matrix(pd.off, pd.rows, pd.cols, muon_lr, MUON_BETA, wd);
+    }
     adam_step_kernel<<<grid, block, 0, g_stream>>>(g_dev_params, g_dev_grad, g_dev_m, g_dev_vel,
-                                                   n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2);
+                                                   n, g_dev_gs, lr, b1, b2, eps, wd, bc1, bc2,
+                                                   muon_lr > 0.f);
     build_qkv_weights();      // Wq/Wk/Wv changed -> refresh the fused inference/train weight
     invalidate_graph();       // params changed -> recapture the forward graph on next inference
     invalidate_decode_graph();  // ...and the decode graph (defensive: training and decode don't share a
@@ -3362,10 +3617,13 @@ SUB0_CUDA_API int sub0_cuda_backward(const int* ids, const int* targets, int bat
 
 // AdamW step over the device gradient (after sub0_cuda_backward). `t` is the post-increment step
 // counter the host optimizer maintains. Uses the CPU AdamW defaults so the two stay in lockstep.
-SUB0_CUDA_API int sub0_cuda_adam_step(float lr, long t) {
+// `muon_lr` <= 0 is pure AdamW (the pre-Muon behavior, bit-identical); > 0 routes the Muon-eligible
+// matrices through Newton-Schulz at that (separate, typically much larger) learning rate -- see
+// device_adam_step's own comment.
+SUB0_CUDA_API int sub0_cuda_adam_step(float lr, long t, float muon_lr) {
     if (!g_dev_grad) return 1;
     ensure_cublas();
-    device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+    device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, muon_lr);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -3374,10 +3632,14 @@ SUB0_CUDA_API int sub0_cuda_adam_step(float lr, long t) {
 // Full device training step: forward + backward + AdamW, returning the mean loss. The end-to-end
 // path the GPU train stage will drive once it replaces the CPU backend. `lengths` (optional) gives
 // each window's trained length so short documents padded up to T train only on their real tokens.
+// `muon_lr` <= 0 is pure AdamW; > 0 hybridizes with Muon on the Muon-eligible matrices (see
+// device_adam_step). The CPU train stage computes this the same way opt.use_muon() gates the CPU
+// AdamW path's own Muon branch (see train_stage.cpp's GpuTrainer::step call site).
 SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
-                                       float lr, long t, double* out_loss, const int* lengths) {
+                                       float lr, long t, double* out_loss, const int* lengths,
+                                       float muon_lr) {
     if (run_fwd_bwd(ids, targets, batch, T, out_loss, lengths)) return 1;
-    device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+    device_adam_step(lr, t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, muon_lr);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -4100,6 +4362,40 @@ SUB0_CUDA_API int sub0_cuda_qknorm_check(int shape_sel, int rows, double* out_re
     }
 }
 
+// GPU Newton-Schulz self-test hook: runs muon_newton_schulz_device (the EXACT device pipeline
+// device_adam_step's per-matrix Muon loop uses) directly on a caller-supplied [rows,cols] matrix,
+// bypassing the surrounding momentum/Nesterov/apply steps -- so cuda_tests.cpp can compare its
+// output DIRECTLY against sub0::muon::newton_schulz5 (the CPU reference, include/sub0/muon.hpp) at
+// both toy and production shapes, both rows>cols and rows<cols (the cuBLAS op-flag-algebra
+// derivation this port's Phase 1 audit flagged as its single riskiest, most novel piece -- see
+// muon_newton_schulz_device's own comment for that derivation).
+//
+// `force_tf32` (nonzero) sets the SHARED cuBLAS handle to TF32 tensor-op math BEFORE running,
+// restoring the baked/knob default afterward -- the direct reproduction case for "does a Muon GEMM
+// silently inherit the training-step TF32 knob" (run_fwd_bwd calls set_handle_tf32 every training
+// step); gemm_muon's CUBLAS_COMPUTE_32F_PEDANTIC compute type exists specifically to be immune to
+// this, and the test asserts the result is bit-identical whether this is 0 or 1.
+SUB0_CUDA_API int sub0_cuda_muon_ns_check(const float* in, int rows, int cols, int force_tf32,
+                                          float* out) {
+    if (rows < 1 || cols < 1) return 1;
+    const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    const size_t m = static_cast<size_t>(std::min(rows, cols));
+    if (n > sub0::MUON_MAX_MN || m * m > sub0::MUON_MAX_MM) return 1;   // scratch too small for this shape
+    if (sub0_cuda_init()) return 1;
+    ensure_cublas();
+    if (force_tf32) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+    if (ensure_muon_scratch()) return 1;
+
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_muon_upd, in, n * sizeof(float), cudaMemcpyHostToDevice, g_stream));
+    muon_newton_schulz_device(g_dev_muon_upd, rows, cols, 5);
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(out, g_dev_muon_upd, n * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+
+    if (force_tf32) apply_math_mode();   // restore the baked/knob default math mode for whatever runs next
+    return 0;
+}
+
 // Verifies ce_backward_kernel's row_offset parameter directly: chunking a [M,V] logits/dlogits/loss
 // computation into row-chunks (an explicit, test-controlled chunk_cap, independent of the production
 // N_CHUNKS derivation in memplan.hpp -- head_ce_chunked in this file is the real caller) must produce
@@ -4255,7 +4551,7 @@ static int time_train_step(int batch, int T, int iters, double budget_ms, double
     auto one_step = [&]() {
         forward_train(batch, T);
         backward_device(batch, T, nullptr);
-        device_adam_step(0.001f, ++step, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+        device_adam_step(0.001f, ++step, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);   // pure AdamW (this benchmark isn't Muon-specific)
     };
     // Time `n` steps on the stream and return the elapsed milliseconds (GPU event timing is precise).
     auto run_timed = [&](int n) -> double {
@@ -4331,7 +4627,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
     auto one = [&] {
         forward_train(batch, T);
         backward_device(batch, T, nullptr);
-        device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+        device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);   // pure AdamW (this benchmark isn't Muon-specific)
     };
     for (int w = 0; w < std::max(4, iters); ++w) one();        // warm the clock + cuBLAS before timing
     cudaStreamSynchronize(g_stream);
@@ -4342,7 +4638,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
     for (int i = 0; i < iters; ++i) {
         cudaEventRecord(e0, g_stream); forward_train(batch, T);
         cudaEventRecord(e1, g_stream); backward_device(batch, T, nullptr);
-        cudaEventRecord(e2, g_stream); device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f);
+        cudaEventRecord(e2, g_stream); device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);
         cudaEventRecord(e3, g_stream); cudaEventSynchronize(e3);
         float f = 0.f, b = 0.f, a = 0.f;
         cudaEventElapsedTime(&f, e0, e1); cudaEventElapsedTime(&b, e1, e2); cudaEventElapsedTime(&a, e2, e3);
