@@ -2592,13 +2592,17 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* co
 
     // Filter BEFORE anything else, so the plain listing, --prune, --metrics, and --refresh all agree
     // on the same selected set (an empty filter arg -> no restriction on that axis). --sha is a
-    // prefix match (short shas are the norm); --since/--until compare directly against meta.txt's
-    // fixed-width ISO `created` string, no date parsing needed.
+    // prefix match (short shas are the norm); --since/--until compare against just the DATE portion
+    // of meta.txt's fixed-width ISO `created` string (its first 10 chars, "YYYY-MM-DD") -- comparing
+    // the full "YYYY-MM-DDTHH:MM:SSZ" timestamp against a bare date would make --until wrongly
+    // exclude every model created ON that date (any same-day timestamp sorts lexicographically AFTER
+    // the bare date string), while --since's lower-bound direction happens to work either way.
     auto matches = [&](const reg::ModelMeta& m) {
         if (corpus_filter && *corpus_filter && m.corpus.find(corpus_filter) == std::string::npos) return false;
         if (sha_filter && *sha_filter && m.git_sha.rfind(sha_filter, 0) != 0) return false;
-        if (since && *since && m.created < since) return false;
-        if (until && *until && m.created > until) return false;
+        const std::string created_date = m.created.substr(0, std::min<std::size_t>(10, m.created.size()));
+        if (since && *since && created_date < since) return false;
+        if (until && *until && created_date > until) return false;
         return true;
     };
     std::vector<reg::ModelMeta> sel;
