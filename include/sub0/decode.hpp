@@ -16,6 +16,7 @@
 
 #include "sub0/core.hpp"
 
+#include <cstdio>
 #include <functional>
 #include <random>
 #include <vector>
@@ -80,16 +81,36 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
     if (n <= 0) return;
 #if defined(SUB0_BUILD_CUDA)
     if (use_gpu) {
+        // A device fault here (illegal memory access or similar) leaves the CUDA context permanently
+        // corrupted for the rest of the process (CUDA errors are sticky) -- every subsequent
+        // forward_one call would return stale/garbage logits, which sample_token would then happily
+        // sample from as if they were real, producing plausible-looking but meaningless continuation
+        // text with no indication anything went wrong. Stop generating (keep whatever's already in
+        // `ctx`, matching an early EOS stop) the moment any device call fails, rather than trusting
+        // corrupted state -- same principle as GpuTrainer's step()/sync_to_host() failure handling in
+        // train_stage.cpp, see [[gpu-illegal-access-hardware-fault-not-code-bug]].
         std::vector<float> logits(VOCAB);
-        sub0_cuda_kv_reset();
-        for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)   // prefill the primed context
-            sub0_cuda_forward_one(ctx[pos], pos, logits.data());
+        if (sub0_cuda_kv_reset() != 0) {
+            std::fprintf(stderr, "decode: GPU KV-cache reset failed -- stopping generation early\n");
+            return;
+        }
+        for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos) {  // prefill the primed context
+            if (sub0_cuda_forward_one(ctx[pos], pos, logits.data()) != 0) {
+                std::fprintf(stderr, "decode: GPU forward_one failed during prefill -- stopping "
+                                     "generation early\n");
+                return;
+            }
+        }
         for (int s = 0; s < n; ++s) {
             const int next = sub0::sample_token(logits.data(), temp, topk, rng);
             if (next == eos_id) break;         // learned stop signal -- never push the marker token
             if (on_token) on_token(logits.data(), next);
             ctx.push_back(next);
-            sub0_cuda_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, logits.data());
+            if (sub0_cuda_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, logits.data()) != 0) {
+                std::fprintf(stderr, "decode: GPU forward_one failed at generated token %d -- "
+                                     "stopping generation early\n", s);
+                return;
+            }
         }
         return;
     }
