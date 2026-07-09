@@ -11,6 +11,7 @@
 #include <catch2/catch_approx.hpp>
 
 #include "sub0/core.hpp"
+#include "sub0/decode.hpp"
 #include "sub0/window.hpp"
 
 #include <algorithm>
@@ -367,5 +368,48 @@ TEST_CASE("gen's EOS stop condition: sample_token returns eos_id when the model 
     for (int trial = 0; trial < 20; ++trial) {
         const int next = sub0::sample_token(logits.data(), /*temp=*/0.8f, /*topk=*/1, rng);
         REQUIRE(next == eos_id);       // top-1 sampling must return it -- gen's `next == eos_id` fires
+    }
+}
+
+// Regression: preview_at/gen_self_stats (train_stage.cpp) now generate via the SAME shared decode
+// loop gen_stage.cpp uses -- sub0::kv_decode_generate (sub0/decode.hpp) -- instead of their own
+// duplicated logic. The mechanism test above pins the PRIMITIVE (sample_token can return eos_id); this
+// exercises the shared LOOP itself: a refactor that accidentally pushed the sampled token before
+// checking it against eos_id would append -- and preview_at/report would then print -- the literal
+// "<|endoftext|>" marker text, exactly the bug commit a016d17 fixed. Overfits a trivial, fully-
+// deterministic pattern (every position's target is eos_id) so the model reliably predicts eos_id next
+// after a real (non-eos) priming token -- converges in a handful of steps, unlike the CUDA parity
+// test's cycling pattern (cuda_tests.cpp, 150 steps), so this stays fast enough for the default
+// (non-[.slow]) suite. Exercises the CPU KV-cache branch (this test binary has no SUB0_BUILD_CUDA);
+// the GPU branch is the identical `if (next == eos_id) break;` shape (see decode.hpp) already covered
+// end-to-end by "CUDA forward_one decode matches full forward..." in cuda_tests.cpp.
+TEST_CASE("kv_decode_generate stops before pushing EOS (never emits <|endoftext|>)", "[engine][gen]") {
+    if constexpr (!USE_TERNARY) {
+        sub0::build_model();
+        REQUIRE(sub0::load_tokenizer(sub0::default_tokenizer()));
+        const int eos_id = sub0::eos_token_id();
+        REQUIRE(eos_id >= 0);
+
+        const int T = std::min(4, SEQ_LEN);
+        std::vector<int> data(static_cast<std::size_t>(T) + 1, eos_id);
+        data[0] = (eos_id + 1) % VOCAB;                 // one real, non-eos priming token
+        const std::vector<std::size_t> starts(1, std::size_t{0});
+        sub0::AdamW opt(0.05f);
+        float loss = 0.f;
+        for (int s = 0; s < 15; ++s) {
+            loss = sub0::train_batch(data.data(), starts.data(), 1, T);
+            opt.step();
+        }
+        const float uniform = std::log(static_cast<float>(VOCAB));
+        INFO("post-training loss = " << loss << "  (uniform baseline ~= " << uniform << ")");
+        REQUIRE(loss < 0.3f * uniform);   // confidently biased toward predicting eos_id next
+
+        std::vector<int> ctx = {data[0]};   // prime with the SAME non-eos token, like a real prompt
+        std::mt19937 rng(7);
+        sub0::kv_decode_generate(ctx, /*n=*/8, /*temp=*/0.8f, /*topk=*/1, rng, eos_id, /*use_gpu=*/false);
+
+        REQUIRE(ctx.size() == 1);           // nothing appended -- eos_id was the very next pick
+        for (int t : ctx) REQUIRE(t != eos_id);
+        REQUIRE(sub0::detokenize(ctx).find("<|endoftext|>") == std::string::npos);
     }
 }

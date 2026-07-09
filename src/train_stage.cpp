@@ -18,6 +18,9 @@
 
 #include "sub0/core.hpp"
 #include "sub0/coherence.hpp"
+#include "sub0/decode.hpp"   // shared KV-cache decode loop (GPU-first, CPU-fallback, EOS-stop) for
+                             // preview_at/gen_self_stats -- also declares the init/shutdown/upload_params/
+                             // set_tf32 seam GpuTrainer below reuses, so those aren't re-declared here
 #include "sub0/config_util.hpp"  // sub0::config::kTokensPerParam — the SAME target ratio autosize() uses
 #include "sub0/log.hpp"      // sub0::log — leveled diagnostics + the <model_dir>/train.log tee
 #include "sub0/evalcache.hpp"
@@ -72,9 +75,8 @@
 // param/optimizer arenas only at eval/checkpoint boundaries (where the CPU eval/save/preview code
 // runs unchanged). The device path is gradient/AdamW parity-tested against this CPU backend.
 #if defined(SUB0_BUILD_CUDA)
-extern "C" int  sub0_cuda_init();
-extern "C" void sub0_cuda_shutdown();
-extern "C" int  sub0_cuda_upload_params(const float* host);
+// init/shutdown/upload_params/set_tf32 come from sub0/decode.hpp (shared with the decode fast path);
+// only the training-specific device entry points are declared here.
 extern "C" int  sub0_cuda_download_params(float* host);
 extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
 extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
@@ -84,7 +86,6 @@ extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int bat
 // Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
 // pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
 extern "C" int  sub0_cuda_train_reserve(int batch);
-extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 // Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
@@ -606,7 +607,18 @@ void prune_ckpts(const std::string& model_path, int keep, long best_step) {
 // A short text sample at a given temperature/top-k. Uses the SAME sampler as `gen`
 // so the output reflects real generation quality -- the old greedy+noise hack made a
 // coherent model look like word-salad.
-std::string preview_at(const std::string& prompt, int n, float temp, int topk, std::mt19937& rng) {
+//
+// Fast path: the same KV-cache decode gen_stage.cpp uses (sub0/decode.hpp), whenever the whole
+// generation fits the trained window and the weights are dense -- `use_gpu` selects a GPU session an
+// earlier sub0::DecodeSession already brought up (pass sess.use_gpu; callers making several preview_at
+// calls in a row -- report's sample battery, autotemp's final sample -- should share ONE session
+// rather than re-paying CUDA init/upload per call). Callers may ask for up to a full SEQ_LEN-token
+// sample (the end-of-training print exercises the long-context path deliberately), which together
+// with a non-empty prompt CAN exceed SEQ_LEN -- that falls through to the slower full-forward
+// sliding-window loop below (a plain last-SEQ_LEN slice; preview_at never needs attention sinks, a
+// gen-only --attn-sinks feature).
+std::string preview_at(const std::string& prompt, int n, float temp, int topk, std::mt19937& rng,
+                       bool use_gpu) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
     // Same learned stop signal gen_stage.cpp's decode loops check (see core.hpp's eos_token_id()
@@ -615,6 +627,12 @@ std::string preview_at(const std::string& prompt, int n, float temp, int topk, s
     // EOS and kept sampling past it -- a context the model was never trained to continue from (every
     // training document ends there), producing the `<|endoftext|>`-chained rambling this fixes.
     const int eos_id = sub0::eos_token_id();
+    if constexpr (!USE_TERNARY) {
+        if (static_cast<int>(ctx.size()) + n <= SEQ_LEN) {
+            sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, use_gpu);
+            return sub0::detokenize(ctx);
+        }
+    }
     for (int s = 0; s < n; ++s) {
         int T = std::min((int)ctx.size(), SEQ_LEN);
         sub0::graph_reset();
@@ -632,9 +650,14 @@ std::string preview_at(const std::string& prompt, int n, float temp, int topk, s
 // mid-training eval tick) at `gen`'s own defaults -- temp 0.8, top-k 20 (cli_stages.hpp's
 // gen_temp/gen_topk). Was 0.7 here (a stale mismatch, not a deliberate choice: this project has
 // no single shared constant for the pair, so the two drifted apart) -- fixed so the printed
-// sample is representative of what `sub0llm gen model.bin <prompt>` actually produces.
+// sample is representative of what `sub0llm gen model.bin <prompt>` actually produces. Owns its own
+// (single-shot) DecodeSession: called once, right before the training run's own gpu.shutdown() --
+// harmless even when a GPU training session is still nominally "active" at that point, since
+// gpu_decode_try_enable()/gpu_decode_shutdown() are idempotent/safe to call on top of it (see
+// sub0/decode.hpp) and nothing device-side happens after this in sub0_train_stage.
 std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
-    return preview_at(prompt, n, 0.8f, 20, rng);
+    sub0::DecodeSession sess;
+    return preview_at(prompt, n, 0.8f, 20, rng, sess.use_gpu);
 }
 
 }  // namespace
@@ -2006,8 +2029,15 @@ struct GenStats { double ppl = 0.0; double rep4 = 0.0; };
 // common random numbers across temperatures, so the perplexity-vs-temperature curve is
 // smooth enough to bisect cleanly. Sampling uses temperature+top-k (the real gen path);
 // scoring uses the full T=1 softmax so the number is comparable to real-text perplexity.
+//
+// Fast path: the same KV-cache decode gen_stage.cpp/preview_at use (sub0/decode.hpp) per seed, via
+// kv_decode_generate's on_token hook -- it fires once per token actually emitted (never for eos_id),
+// handing back the exact logits row it was sampled from, so the NLL below is scored from that same
+// row instead of a second forward pass. `use_gpu` selects a GPU session the caller already brought up
+// (compute_raw_metrics shares ONE across the whole temperature grid -- this runs n_seeds times PER
+// temperature, so re-enabling per seed would re-pay CUDA init/upload/graph-capture ~10x over).
 GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
-                        float temp, int topk, int n_seeds, int gen_len, unsigned cr_seed) {
+                        float temp, int topk, int n_seeds, int gen_len, unsigned cr_seed, bool use_gpu) {
     const std::size_t last = data.size() - SEQ_LEN - 1;
     const std::size_t span = (last > val_start) ? last - val_start : 0;
     const int prefix_len = std::max(1, std::min(SEQ_LEN / 4, 16));
@@ -2016,6 +2046,18 @@ GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
 
     double nll_sum = 0.0, rep_sum = 0.0; long nll_n = 0;
     std::vector<int> gen; gen.reserve(static_cast<std::size_t>(gen_len));
+    // Surprise of the chosen token under the TRUE (T=1) model distribution. A natural EOS never
+    // reaches here (kv_decode_generate/the fallback loop below both stop before calling this for
+    // eos_id) -- sampling past it would score an out-of-distribution continuation (no document ever
+    // trains on "what comes after EOS") as if it were representative degeneration/repetition at this
+    // temperature, corrupting the exact statistic this tuner calibrates against.
+    auto score_token = [&](const float* row, int tok) {
+        float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
+        double Z = 0.0; for (int j = 0; j < VOCAB; ++j) Z += std::exp(static_cast<double>(row[j] - mx));
+        nll_sum += -(static_cast<double>(row[tok] - mx) - std::log(Z));
+        ++nll_n;
+        gen.push_back(tok);
+    };
     for (int k = 0; k < n_seeds; ++k) {
         std::size_t s = val_start +
             (n_seeds > 1 ? static_cast<std::size_t>(k) * span / static_cast<std::size_t>(n_seeds - 1) : 0);
@@ -2023,24 +2065,24 @@ GenStats gen_self_stats(sub0::TokView data, std::size_t val_start,
         std::vector<int> ctx(static_cast<std::size_t>(prefix_len));   // materialize the seed prefix (uint16-packed view)
         data.copy_to(s, static_cast<std::size_t>(prefix_len), ctx.data());
         gen.clear();
-        for (int g = 0; g < gen_len; ++g) {
-            const int T = std::min(static_cast<int>(ctx.size()), SEQ_LEN);
-            sub0::graph_reset();
-            sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
-            const float* row = logits->data.data() + static_cast<std::size_t>(logits->rows - 1) * VOCAB;
-            const int tok = sub0::sample_token(row, temp, topk, rng);
-            // A natural EOS here is the model reaching a real, learned document end -- sampling past
-            // it would score an out-of-distribution continuation (no document ever trains on
-            // "what comes after EOS") as if it were representative degeneration/repetition at this
-            // temperature, corrupting the exact statistic this tuner calibrates against.
-            if (tok == eos_id) break;
-            // Surprise of the chosen token under the TRUE (T=1) model distribution.
-            float mx = -1e30f; for (int j = 0; j < VOCAB; ++j) mx = std::max(mx, row[j]);
-            double Z = 0.0; for (int j = 0; j < VOCAB; ++j) Z += std::exp(static_cast<double>(row[j] - mx));
-            nll_sum += -(static_cast<double>(row[tok] - mx) - std::log(Z));
-            ++nll_n;
-            gen.push_back(tok);
-            ctx.push_back(tok);
+        bool fast = false;
+        if constexpr (!USE_TERNARY) {
+            if (static_cast<int>(ctx.size()) + gen_len <= SEQ_LEN) {
+                sub0::kv_decode_generate(ctx, gen_len, temp, topk, rng, eos_id, use_gpu, score_token);
+                fast = true;
+            }
+        }
+        if (!fast) {
+            for (int g = 0; g < gen_len; ++g) {
+                const int T = std::min(static_cast<int>(ctx.size()), SEQ_LEN);
+                sub0::graph_reset();
+                sub0::Node* logits = sub0::forward(ctx.data() + (ctx.size() - T), T);
+                const float* row = logits->data.data() + static_cast<std::size_t>(logits->rows - 1) * VOCAB;
+                const int tok = sub0::sample_token(row, temp, topk, rng);
+                if (tok == eos_id) break;
+                score_token(row, tok);
+                ctx.push_back(tok);
+            }
         }
         rep_sum += ngram_repeat(gen.data(), static_cast<int>(gen.size()));
     }
@@ -2106,9 +2148,12 @@ static sub0::evalcache::EvalMetrics compute_raw_metrics(sub0::TokView data, std:
         m.grid.temp = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.4f};
         m.grid.gen_ppl.resize(m.grid.temp.size());
         m.grid.rep4.resize(m.grid.temp.size());
+        // One GPU decode session shared across the WHOLE grid (11 temps x N_SEEDS seeds each --
+        // re-enabling per seed would re-pay CUDA init/upload/graph-capture ~110x over, see decode.hpp).
+        sub0::DecodeSession sess;
         for (std::size_t i = 0; i < m.grid.temp.size(); ++i) {
             const GenStats g = gen_self_stats(data, val_start, m.grid.temp[i], AUTOTEMP_TOPK,
-                                              N_SEEDS, GEN_LEN, seed);
+                                              N_SEEDS, GEN_LEN, seed, sess.use_gpu);
             m.grid.gen_ppl[i] = g.ppl; m.grid.rep4[i] = g.rep4;
         }
     }
@@ -2208,7 +2253,9 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
                      "             1.0; the real lever is capacity/training, not temperature.");
     std::println("");
     std::println("recommended --temp {:.2f}", rec);
-    std::println("  --- sample @ temp {:.2f} ---\n  {}", rec, preview_at("the ", 80, rec, AUTOTEMP_TOPK, prng));
+    sub0::DecodeSession preview_sess;
+    std::println("  --- sample @ temp {:.2f} ---\n  {}", rec,
+                 preview_at("the ", 80, rec, AUTOTEMP_TOPK, prng, preview_sess.use_gpu));
     std::println("apply with:  sub0llm gen {} \"<prompt>\" --temp {:.2f}", model_in, rec);
     return 0;
 }
@@ -2393,10 +2440,13 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         std::mt19937 rng(1234);                            // fixed seed -> reproducible report samples
         emit("");
         emit("samples ({}-token context, fixed seed 1234, top-k 20):", SEQ_LEN);
+        // One GPU decode session shared across the whole 2-prompt x 3-temp battery (6 generations) --
+        // re-enabling per generation would re-pay CUDA init/upload/graph-capture 6x over, see decode.hpp.
+        sub0::DecodeSession sess;
         for (const char* prompt : {"the ", "Once upon a time"}) {
             emit("  prompt \"{}\":", prompt);
             for (float temp : {0.4f, 0.7f, 0.8f}) {
-                emit("    [temp {:.1f}]  {}", temp, preview_at(prompt, SEQ_LEN, temp, 20, rng));
+                emit("    [temp {:.1f}]  {}", temp, preview_at(prompt, SEQ_LEN, temp, 20, rng, sess.use_gpu));
             }
         }
     }

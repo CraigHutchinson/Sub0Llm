@@ -5,6 +5,7 @@
 // temperature and top-k. Prints the continuation. Exposes one C entry point.
 
 #include "sub0/core.hpp"
+#include "sub0/decode.hpp"  // shared KV-cache decode loop (GPU-first, CPU-fallback, EOS-stop)
 
 #include <algorithm>
 #include <array>
@@ -22,28 +23,6 @@
 // diverges under random weights (a benign flash-vs-two-pass softmax amplification, not a kernel bug --
 // see the memory notes on the d448 random-weight investigation). Device forward_one is FP32-only
 // (matches the CPU path's dense assumption), so this mirrors USE_TERNARY gating below.
-#if defined(SUB0_BUILD_CUDA)
-extern "C" int  sub0_cuda_init();
-extern "C" void sub0_cuda_shutdown();
-extern "C" int  sub0_cuda_upload_params(const float* host);
-extern "C" void sub0_cuda_set_tf32(int on);
-extern "C" int  sub0_cuda_kv_reset();
-extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
-#endif
-
-// Try to bring up the GPU KV-cache decode path for this generation: requires the CUDA backend
-// compiled in and a device to initialize. Uploads the just-loaded weights once. Falls back to the CPU
-// path (false) on any failure -- generation still completes, just at the CPU's per-token cost.
-static bool gpu_decode_enable() {
-#if defined(SUB0_BUILD_CUDA)
-    if (!HAS_CUDA) return false;
-    if (sub0_cuda_init() != 0) return false;
-    sub0_cuda_set_tf32(0);   // match the FP32 config the parity test validated
-    return sub0_cuda_upload_params(sub0::params_ptr()) == 0;
-#else
-    return false;
-#endif
-}
 
 extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                         int n, float temp, int topk, unsigned seed, int attn_sinks) {
@@ -83,37 +62,10 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // path (ternary weights, or a context that slides past SEQ_LEN) keeps the exact full-forward loop.
     if constexpr (!USE_TERNARY) {
         if (static_cast<int>(ctx.size()) + n <= SEQ_LEN) {
-            std::vector<float> gpu_logits;              // only sized when the GPU path is active
-            const float* logits = nullptr;
-#if defined(SUB0_BUILD_CUDA)
-            if (gpu_decode_enable()) {
-                std::println(stderr, "gen: decode backend GPU (device KV-cache)");
-                gpu_logits.resize(VOCAB);
-                sub0_cuda_kv_reset();
-                for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)   // prefill the prompt
-                    sub0_cuda_forward_one(ctx[pos], pos, gpu_logits.data());
-                logits = gpu_logits.data();
-                for (int s = 0; s < n; ++s) {
-                    const int next = sub0::sample_token(logits, temp, topk, rng);
-                    if (next == eos_id) break;   // learned stop signal: end here, don't print the marker
-                    ctx.push_back(next);
-                    sub0_cuda_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, gpu_logits.data());
-                }
-                sub0_cuda_shutdown();
-                std::println("{}", sub0::detokenize(ctx));
-                return 0;
-            }
-#endif
-            std::println(stderr, "gen: decode backend CPU (KV-cache)");
-            sub0::kv_reset();
-            for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)   // prefill the prompt
-                logits = sub0::forward_one(ctx[pos], pos);
-            for (int s = 0; s < n; ++s) {
-                const int next = sub0::sample_token(logits, temp, topk, rng);
-                if (next == eos_id) break;       // learned stop signal: end here, don't print the marker
-                ctx.push_back(next);
-                logits = sub0::forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1);
-            }
+            sub0::DecodeSession sess;
+            std::println(stderr, "gen: decode backend {}",
+                        sess.use_gpu ? "GPU (device KV-cache)" : "CPU (KV-cache)");
+            sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, sess.use_gpu);
             std::println("{}", sub0::detokenize(ctx));
             return 0;
         }
