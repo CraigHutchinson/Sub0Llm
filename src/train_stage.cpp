@@ -671,6 +671,12 @@ struct GpuTrainer {
     bool active = false;
     long t = 0;                       // AdamW step counter driving the device bias correction
     std::vector<int> ids, targets;    // per-step [batch*SEQ_LEN] window buffers
+    // Set by step()/sync_to_host() on their most recent call. A device fault (illegal memory access
+    // or similar -- see [[gpu-illegal-access-hardware-fault-not-code-bug]], a real hardware fault hit
+    // this exact session) leaves the CUDA context permanently corrupted for the rest of the process
+    // (CUDA errors are sticky); the caller must stop touching the device entirely once this is false,
+    // not just log and keep training on stale/garbage state.
+    bool ok = true;
 
     // Enable the device path: requires the CUDA backend, a device, and a batch within the
     // resident scratch width. Uploads the current host params (+ optimizer moments, zero on a
@@ -758,7 +764,7 @@ struct GpuTrainer {
         // > 0 hybridizes with Muon on the Muon-eligible matrices -- see sub0_cuda_train_step's own
         // comment (backend_cuda.cu) and the call site below (mirrors the CPU branch's own
         // opt.use_muon() ? lr_schedule(..., MUON_LR_BASE, ...) : implicit-AdamW-only computation).
-        sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr);
+        ok = (sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr) == 0);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -766,11 +772,16 @@ struct GpuTrainer {
     }
 
     // Refresh the host param + optimizer arenas from the device (before eval / checkpoint / save).
-    void sync_to_host() {
+    // Returns false on a device failure -- the caller must NOT trust the host arenas (or proceed to
+    // save/eval from them) when this happens; see `ok`'s own comment above.
+    bool sync_to_host() {
 #if defined(SUB0_BUILD_CUDA)
-        if (!active) return;
-        sub0_cuda_download_params(sub0::params_ptr());
-        sub0_cuda_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
+        if (!active) return true;
+        ok = sub0_cuda_download_params(sub0::params_ptr()) == 0 &&
+             sub0_cuda_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) == 0;
+        return ok;
+#else
+        return true;
 #endif
     }
 
@@ -1218,6 +1229,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // point exactly like win_steps0/last_log_step are for steps.
     long long total_windows = 0, windows_at_win_t0 = 0, windows_at_last_log = 0;
     bool stop = false, graceful_stop = false;
+    // A device fault mid-run (a real hardware fault hit this exact codebase once already -- see
+    // [[gpu-illegal-access-hardware-fault-not-code-bug]]): stops the loop WITHOUT touching the device
+    // again (no sync/eval/save on corrupted or stale host state), leaving the last periodic checkpoint
+    // on disk untouched and its meta.txt status still "training" -- a plain `sub0llm train` with no
+    // path will detect that unfinished run and offer to resume it (see registry.hpp's auto-resume).
+    bool device_failed = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
     //TODO: Remove getenv calls
     const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr);
@@ -1259,6 +1276,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const float muon_lr_t = opt.use_muon() ? lr_schedule(step, MUON_LR_BASE, lr_warmup_steps) : 0.f;
             step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
+            if (!gpu.ok) {
+                sub0::log::error("training: GPU step failed (device fault) at step {} -- stopping "
+                                 "immediately without a final save; the last periodic checkpoint on "
+                                 "disk is untouched and resumable.", step);
+                device_failed = true;
+                break;   // don't touch the device again this run -- not even the bookkeeping below
+            }
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update
             if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
@@ -1286,8 +1310,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const bool is_eval = (step % eval_every == 0 || step == max_steps);
         if (is_eval) {
             // Refresh the host param/optimizer arenas from the device so the CPU eval/save/preview
-            // code below sees the current weights (no-op on the CPU path).
-            gpu.sync_to_host();
+            // code below sees the current weights (no-op on the CPU path). A failure here means the
+            // eval/save below would run on stale or corrupted host state -- stop instead of risking a
+            // confidently-wrong plateau/save on garbage data (see device_failed's own comment).
+            if (!gpu.sync_to_host()) {
+                sub0::log::error("training: device sync failed at step {} -- stopping immediately "
+                                 "without a final save; the last periodic checkpoint on disk is "
+                                 "untouched and resumable.", step);
+                device_failed = true;
+                break;
+            }
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
             const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
@@ -1360,7 +1392,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // ~20h apart. An eval already saved + reset last_ckpt above, so this only fires on the long
         // stretches between evals. No val NELBO / plateau check here: it is purely a resume point.
         if (!is_eval && std::chrono::duration<double>(clock::now() - last_ckpt).count() >= CKPT_SECONDS) {
-            gpu.sync_to_host();                               // pull live device weights into the host arenas
+            if (!gpu.sync_to_host()) {                        // pull live device weights into the host arenas
+                sub0::log::error("training: device sync failed at step {} (crash-resistance tick) -- "
+                                 "stopping immediately without a final save; the last periodic "
+                                 "checkpoint on disk is untouched and resumable.", step);
+                device_failed = true;
+                break;
+            }
             if (!save_checkpoint(ckpt_step_path(model_path, step), opt.step_count(), rng, rs, batch, lr, seed))
                 sub0::log::warn("checkpoint save failed at step {} -- will retry at the next interval", step);
             prune_ckpts(model_path, keep, rs.best_step);
@@ -1373,7 +1411,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
     }
 
-    gpu.sync_to_host();    // ensure the host arenas hold the final device weights before saving
+    // A device failure already broke out of the loop above without touching the device again -- do
+    // NOT attempt sync_to_host()/save here either, that would either fail again or (worse) silently
+    // write stale/corrupted weights over the last GOOD checkpoint. Exit loudly with the last periodic
+    // checkpoint's status ("training") left exactly as it was -- see device_failed's own comment for
+    // why that's the right resumable state to leave behind.
+    if (device_failed) {
+        sub0::log::error("training: stopped at step {} due to a device failure -- no final save was "
+                         "attempted. The most recent periodic checkpoint (from before this happened) "
+                         "is untouched on disk; a bare `sub0llm train` will detect it as unfinished "
+                         "and offer to resume it.", rs.step);
+        gpu.shutdown();
+        return 1;
+    }
+    if (!gpu.sync_to_host()) {   // ensure the host arenas hold the final device weights before saving
+        sub0::log::error("training: final device sync failed at step {} -- refusing to overwrite "
+                         "model.bin/checkpoint with what would be stale or corrupted weights. The "
+                         "most recent periodic checkpoint on disk is untouched and resumable.", rs.step);
+        gpu.shutdown();
+        return 1;
+    }
     if (graceful_stop) {
         // Time-sensitive: a Ctrl+C/console-close handler has a short OS grace period before a
         // force-kill, so this deliberately does NOT retry-with-backoff -- blocking here risks

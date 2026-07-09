@@ -164,9 +164,13 @@ __global__ void act_to_f32_kernel(const act_t* __restrict__ x, float* __restrict
     if (i < n) y[i] = to_f32(x[i]);
 }
 
-// CUDA error check for the self-test: report file:line + the error string and bail out
-// of the calling function with a nonzero code. The full backend will route failures
-// through the engine's fatal path instead.
+// CUDA error check: report file:line + the error string and bail out of the calling function with a
+// nonzero code. `sub0_cuda_train_step`'s own trailing sync+cudaGetLastError use this to surface any
+// async failure from the kernels launched inside it (including the void-returning helpers below,
+// whose own errors are stream-ordered and only actually detected here); `GpuTrainer::step()`
+// (train_stage.cpp) checks THAT return code and stops the training loop on a device fault instead of
+// continuing to train on a corrupted context -- see [[gpu-illegal-access-hardware-fault-not-code-bug]]
+// for the real incident this was missing for.
 #define SUB0_CUDA_CHECK(expr)                                                          \
     do {                                                                               \
         const cudaError_t _err = (expr);                                              \
