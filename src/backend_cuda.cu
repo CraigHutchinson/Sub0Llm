@@ -3350,7 +3350,7 @@ SUB0_CUDA_API int sub0_cuda_selftest() {
 // becomes the active backend these back sync_params_to_device/host directly; for now the
 // parity tests drive them. Idempotent init; upload auto-inits.
 
-SUB0_CUDA_API int sub0_cuda_init() {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_init() {
     if (g_dev_params) return 0;
     // Block (sleep) the host thread on device syncs instead of spinning a core at 100%: the resident
     // training step is GPU-bound, so busy-waiting the per-step sync just wastes a CPU core (and its
@@ -3374,7 +3374,7 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = nullptr; }
 }
 
-SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_upload_params(const float* host) {
     if (!g_dev_params) { const int r = sub0_cuda_init(); if (r) return r; }
     if (wqkv_alloc()) return 1;                  // ensure the fused-QKV weight buffers exist
     SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_params, host, sub0::PARAM_FLOATS * sizeof(float),
@@ -3386,7 +3386,7 @@ SUB0_CUDA_API int sub0_cuda_upload_params(const float* host) {
     return 0;
 }
 
-SUB0_CUDA_API int sub0_cuda_download_params(float* host) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_download_params(float* host) {
     if (!g_dev_params) return 1;
     SUB0_CUDA_CHECK(cudaMemcpy(host, g_dev_params, sub0::PARAM_FLOATS * sizeof(float),
                                cudaMemcpyDeviceToHost));
@@ -3396,14 +3396,14 @@ SUB0_CUDA_API int sub0_cuda_download_params(float* host) {
 // AdamW moment sync (for crash-safe checkpoint / resume): the optimizer state lives on the device
 // during a GPU run, so the train stage round-trips it through the host adam_m/adam_v buffers
 // around save/load -- mirroring the param sync above. Both are PARAM_FLOATS long.
-SUB0_CUDA_API int sub0_cuda_download_opt(float* host_m, float* host_v) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_download_opt(float* host_m, float* host_v) {
     if (!g_dev_m || !g_dev_vel) return 1;
     SUB0_CUDA_CHECK(cudaMemcpy(host_m, g_dev_m,   sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyDeviceToHost));
     SUB0_CUDA_CHECK(cudaMemcpy(host_v, g_dev_vel, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyDeviceToHost));
     return 0;
 }
 
-SUB0_CUDA_API int sub0_cuda_upload_opt(const float* host_m, const float* host_v) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_upload_opt(const float* host_m, const float* host_v) {
     if (opt_alloc()) return 1;                   // ensure the moment buffers exist
     SUB0_CUDA_CHECK(cudaMemcpy(g_dev_m,   host_m, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice));
     SUB0_CUDA_CHECK(cudaMemcpy(g_dev_vel, host_v, sub0::PARAM_FLOATS * sizeof(float), cudaMemcpyHostToDevice));
@@ -3488,7 +3488,7 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
 // it ~150-200x/session (once per sampled token) was pure waste on an already launch-count-dominated
 // hot path (see the Phase-1 decode-loop audit: GPU busy only ~31% of decode wall-time, dominated by
 // per-token kernel-launch dispatch, not by this kind of redundant call -- still, free to remove).
-SUB0_CUDA_API int sub0_cuda_kv_reset() {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_kv_reset() {
     if (!g_dev_params) return 1;
     if (fwd_alloc(1) || kv_alloc()) return 1;
     ensure_cublas();
@@ -3503,7 +3503,7 @@ SUB0_CUDA_API int sub0_cuda_kv_reset() {
 // sub0_cuda_kv_reset (which also sets the FP32 math mode this path needs, and allocates g_decode_state
 // -- see that function's comment). Captures the graph lazily on first use per session (or after any
 // invalidate_decode_graph() trigger); every call after that is just the {id,pos} memcpy + graph replay.
-SUB0_CUDA_API int sub0_cuda_forward_one(int id, int pos, float* out_logits) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_one(int id, int pos, float* out_logits) {
     if (!g_dev_params || !g_kv_k) return 1;
     if (id < 0 || id >= VOCAB || pos < 0 || pos >= SEQ_LEN) return 1;
     if (ensure_wqkv_f32()) return 1;               // BF16: (re)build the F32 mirror this path reads
@@ -3639,7 +3639,7 @@ SUB0_CUDA_API int sub0_cuda_adam_step(float lr, long t, float muon_lr) {
 // `muon_lr` <= 0 is pure AdamW; > 0 hybridizes with Muon on the Muon-eligible matrices (see
 // device_adam_step). The CPU train stage computes this the same way opt.use_muon() gates the CPU
 // AdamW path's own Muon branch (see train_stage.cpp's GpuTrainer::step call site).
-SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                        float lr, long t, double* out_loss, const int* lengths,
                                        float muon_lr) {
     if (run_fwd_bwd(ids, targets, batch, T, out_loss, lengths)) return 1;
@@ -3657,7 +3657,7 @@ SUB0_CUDA_API int sub0_cuda_train_step(const int* ids, const int* targets, int b
 // (batch * N_HEADS * SEQ_LEN >= batch_t * N_HEADS * T for every admitted pair) for the same reason.
 // Failure (VRAM) is a clean nonzero so the caller can fall back to the CPU path BEFORE training
 // starts, instead of discovering the OOM on step 1.
-SUB0_CUDA_API int sub0_cuda_train_reserve(int batch) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_train_reserve(int batch) {
     if (batch < 1 || batch > MAX_FWD_BATCH) return 1;
     // On ANY failure below, unconditionally release whatever partially succeeded before returning --
     // fwd_alloc/train_alloc/ensure_bwd_stats each fail mid-sequence (e.g. train_alloc's ~20-buffer
@@ -4600,7 +4600,7 @@ SUB0_CUDA_API int sub0_cuda_train_benchmark(int batch, int T, int iters, double*
 // Quiet training-step timer for the autotuner: measures with the CURRENT knob state (TF32 /
 // attn-backward, set via sub0_cuda_set_*), sizing the timed run to `budget_ms` of wall time so
 // every batch profiles in roughly the same time. Writes mean ms/step to *out_ms, prints nothing.
-SUB0_CUDA_API int sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
     return time_train_step(batch, T, 0, budget_ms, out_ms);
 }
 
@@ -4709,7 +4709,7 @@ SUB0_CUDA_API int sub0_cuda_free_vram_mb() {
 // device buffer without updating the mirror fails CI instead of silently mis-predicting in the field.
 // Both outputs are MiB; either pointer may be null. Leaves the scratch allocated (callers re-tune or
 // shut down as usual). Returns nonzero on a device/allocation failure.
-SUB0_CUDA_API int sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb) {
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb) {
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
     sub0_cuda_shutdown();                                   // clean slate so the delta is purely ours

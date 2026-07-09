@@ -51,8 +51,8 @@ struct Node {
 
 // --- Model lifecycle --------------------------------------------------------
 SUB0_API void build_model();                       // allocate param layout + random init
-SUB0_API bool load_model(const char* path);        // overwrite params from disk
-SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
+[[nodiscard]] SUB0_API bool load_model(const char* path);        // overwrite params from disk
+[[nodiscard]] SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
 SUB0_API void print_config();                      // human-readable config + memory line
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and
@@ -69,7 +69,7 @@ SUB0_API const char* default_tokenizer();          // baked-in runtime tokenizer
 // The corpus is pre-tokenized by sub0-configure, so training reads token ids
 // directly. Only generation needs the tokenizer: encode() turns a prompt into
 // ids (corpus-aware truecasing + BPE), detokenize() turns ids back into text.
-SUB0_API bool        load_tokenizer(const char* path);          // parse tokenizer.tok
+[[nodiscard]] SUB0_API bool load_tokenizer(const char* path);   // parse tokenizer.tok
 SUB0_API std::vector<int> encode(const std::string& text);      // truecase + BPE -> ids
 SUB0_API std::string detokenize(const std::vector<int>& ids);   // ids -> text
 // 64-bit identity fingerprint of the loaded tokenizer (0 if none). save_model stamps this so a

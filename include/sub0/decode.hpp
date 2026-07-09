@@ -22,12 +22,15 @@
 #include <vector>
 
 #if defined(SUB0_BUILD_CUDA)
-extern "C" int  sub0_cuda_init();
+// [[nodiscard]] on every status-code return: a discarded failure here is exactly the class of bug
+// that let kv_decode_generate sample from stale/garbage logits with no indication anything failed --
+// see this file's own kv_decode_generate comment and [[gpu-failure-detection-hardening]].
+extern "C" [[nodiscard]] int  sub0_cuda_init();
 extern "C" void sub0_cuda_shutdown();
-extern "C" int  sub0_cuda_upload_params(const float* host);
+extern "C" [[nodiscard]] int  sub0_cuda_upload_params(const float* host);
 extern "C" void sub0_cuda_set_tf32(int on);
-extern "C" int  sub0_cuda_kv_reset();
-extern "C" int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
+extern "C" [[nodiscard]] int  sub0_cuda_kv_reset();
+extern "C" [[nodiscard]] int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
 #endif
 
 namespace sub0 {

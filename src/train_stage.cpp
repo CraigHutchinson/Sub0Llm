@@ -77,18 +77,21 @@
 #if defined(SUB0_BUILD_CUDA)
 // init/shutdown/upload_params/set_tf32 come from sub0/decode.hpp (shared with the decode fast path);
 // only the training-specific device entry points are declared here.
-extern "C" int  sub0_cuda_download_params(float* host);
-extern "C" int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
-extern "C" int  sub0_cuda_download_opt(float* host_m, float* host_v);
-extern "C" int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
+// [[nodiscard]] on every status-code return here: a discarded return is exactly the class of bug
+// that let the training loop keep "training" on a corrupted device context for thousands of steps
+// after a real hardware fault -- see [[gpu-failure-detection-hardening]].
+extern "C" [[nodiscard]] int  sub0_cuda_download_params(float* host);
+extern "C" [[nodiscard]] int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
+extern "C" [[nodiscard]] int  sub0_cuda_download_opt(float* host_m, float* host_v);
+extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                      float lr, long t, double* out_loss, const int* lengths,
                                      float muon_lr);
 // Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
 // pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
-extern "C" int  sub0_cuda_train_reserve(int batch);
-extern "C" int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
+extern "C" [[nodiscard]] int  sub0_cuda_train_reserve(int batch);
+extern "C" [[nodiscard]] int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 // Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
-extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
+extern "C" [[nodiscard]] int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 // Free dedicated VRAM (MiB) after the CUDA/cuBLAS context exists -- the usable budget for the ladder.
 extern "C" int  sub0_cuda_free_vram_mb();
 #endif
@@ -237,7 +240,11 @@ sub0::TokView load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_buf, co
         return tok.tokens();                       // baked corpus.tok (the fast path)
 
     // No usable corpus.tok -> tokenize on demand from the raw corpus (matches the train stage).
-    sub0::load_tokenizer(sub0::default_tokenizer());   // on-demand encode needs the runtime tokenizer
+    if (!sub0::load_tokenizer(sub0::default_tokenizer())) {   // on-demand encode needs the runtime tokenizer
+        sub0::log::error("{}: cannot load this build's tokenizer ('{}') -- on-demand tokenization "
+                         "would silently encode against the wrong vocabulary", tool, sub0::default_tokenizer());
+        return {};
+    }
     TextCorpus text;
     if (text.open(sub0::default_corpus())) {
         std::mt19937 rng(123);
@@ -697,7 +704,7 @@ struct GpuTrainer {
     // construction (that IS the token budget), so this buffer is already big enough for any of them
     // -- no separate resize needed even though batch_t can individually exceed `batch` at a short
     // seq_t.
-    bool enable(int& batch, long resume_t) {
+    [[nodiscard]] bool enable(int& batch, long resume_t) {
 #if defined(SUB0_BUILD_CUDA)
         constexpr int kCap = 4096;                  // matches MAX_FWD_BATCH (the device scratch ceiling)
         //TODO: Remove getenv calls - these are tmeporary and we should use commandline/compiletime
@@ -774,7 +781,7 @@ struct GpuTrainer {
     // Refresh the host param + optimizer arenas from the device (before eval / checkpoint / save).
     // Returns false on a device failure -- the caller must NOT trust the host arenas (or proceed to
     // save/eval from them) when this happens; see `ok`'s own comment above.
-    bool sync_to_host() {
+    [[nodiscard]] bool sync_to_host() {
 #if defined(SUB0_BUILD_CUDA)
         if (!active) return true;
         ok = sub0_cuda_download_params(sub0::params_ptr()) == 0 &&
@@ -976,7 +983,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                          1ull << 30).string();                          // may be many GB: hardlink only
     }
 
-    sub0::load_tokenizer(tok_tokenizer_path.c_str());   // previews + on-demand encode
+    // Not fatal to training itself (corpus.tok is pre-tokenized; the loss loop below never calls
+    // encode/decode) -- only the periodic preview prints would come out garbled -- so warn and
+    // continue rather than aborting a run that would otherwise train correctly.
+    if (!sub0::load_tokenizer(tok_tokenizer_path.c_str()))
+        sub0::log::warn("train: cannot load tokenizer '{}' -- training will proceed, but preview "
+                        "samples will be garbled", tok_tokenizer_path);
     sub0::build_model();
 
     // Where training windows come from. train_span is sampled for training windows; val_span
@@ -1998,8 +2010,13 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
             const int warm_batch = batch_ladder[batch_ladder.size() / 2];
             double warm_ms = 0.0;
             const auto wt0 = std::chrono::steady_clock::now();
-            sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms);   // primes context + cuBLAS
-            sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms);   // steady-state read
+            const bool warm_ok = sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) == 0;  // primes context + cuBLAS
+            if (warm_ok && sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) != 0)         // steady-state read
+                sub0::log::warn("device warmup's steady-state read failed -- the tune sweep below will "
+                                "likely surface the same problem, but timings up to that point may be off");
+            if (!warm_ok)
+                sub0::log::warn("device warmup failed at batch {} -- the tune sweep below will likely "
+                                "hit the same problem for every batch it tries", warm_batch);
             std::println("device warmup @ batch {}: {:.0f} ms/step (primed in {:.1f}s)", warm_batch, warm_ms,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - wt0).count());
             std::fflush(stdout);
@@ -2229,7 +2246,15 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
         sub0::log::error("autotemp: cannot load model '{}'", model_in);
         return 1;
     }
-    sub0::load_tokenizer(sub0::default_tokenizer());    // for the sample print
+    // Not just cosmetic here: gen_self_stats' EOS-stop check depends on eos_token_id(), which
+    // returns -1 with no tokenizer loaded -- exactly the bug models --refresh had (fixed 4bf29fc)
+    // before this same check was added here. A silent failure would corrupt the whole measurement,
+    // not just the printed sample, so this fails loudly instead of warning-and-continuing.
+    if (!sub0::load_tokenizer(sub0::default_tokenizer())) {
+        sub0::log::error("autotemp: cannot load this build's tokenizer -- the EOS-stop signal "
+                         "would be wrong for the whole measurement, not just the printed sample");
+        return 1;
+    }
 
     // The SAME held-out split the trainer uses, so the target perplexity is measured on
     // text the model never trained on.
@@ -2493,7 +2518,10 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     // though that costs real CPU time on a big model, so every cell exercises the trained context
     // window identically -- consistency across the grid matters more than saving time here.
     if (model_loaded) {
-        sub0::load_tokenizer(sub0::default_tokenizer());   // encode/detokenize for the sample print
+        // Not fatal to the report as a whole (the NELBO/bits-per-byte quality numbers above are
+        // already computed and printed) -- only these samples would come out garbled.
+        if (!sub0::load_tokenizer(sub0::default_tokenizer()))
+            sub0::log::warn("report: cannot load tokenizer -- the sample section below will be garbled");
         std::mt19937 rng(1234);                            // fixed seed -> reproducible report samples
         emit("");
         emit("samples ({}-token context, fixed seed 1234, top-k 20):", SEQ_LEN);
@@ -2681,8 +2709,14 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* co
             sub0::build_model();   // once, reused for every loadable model in the loop below
             // gen_self_stats resolves the EOS-stop signal via sub0::eos_token_id(), which returns -1
             // (no tokenizer loaded) unless this is called -- without it, generation never stops early,
-            // silently inflating the measured repetition/perplexity exactly like the bug a016d17 fixed.
-            sub0::load_tokenizer(sub0::default_tokenizer());
+            // silently inflating the measured repetition/perplexity exactly like the bug a016d17 fixed
+            // (and the identical bug this exact call site had until 4bf29fc -- the return value wasn't
+            // even checked then, so a failure here would have reintroduced the same corruption).
+            if (!sub0::load_tokenizer(sub0::default_tokenizer())) {
+                sub0::log::error("models --refresh: cannot load this build's tokenizer -- refusing to "
+                                 "measure with a broken EOS-stop signal (see the comment above)");
+                return 1;
+            }
             sub0::TokMap tok(sub0::default_corpus_tok());
             std::vector<int> od_buf;
             const sub0::TokView data = load_corpus_tokens(tok, od_buf, "models --refresh");
@@ -2843,8 +2877,17 @@ extern "C" SUB0_API int sub0_ckpt2model_stage(const char* ckpt_in, const char* m
     // bundle_into_model_dir) so the written model.bin's fingerprint trailer matches what gen/report
     // expect; fall back to this build's own default tokenizer only if the model dir has none.
     const std::filesystem::path sibling_tok = std::filesystem::path(ckpt_in).parent_path() / "tokenizer.tok";
-    sub0::load_tokenizer(std::filesystem::exists(sibling_tok) ? sibling_tok.string().c_str()
-                                                               : sub0::default_tokenizer());
+    const std::string tok_path = std::filesystem::exists(sibling_tok) ? sibling_tok.string()
+                                                                       : sub0::default_tokenizer();
+    if (!sub0::load_tokenizer(tok_path.c_str())) {
+        // Not cosmetic here: save_model() below stamps the loaded tokenizer's fingerprint into
+        // model.bin's own trailer (see tokenizer_fingerprint()'s doc comment) -- writing one with no
+        // tokenizer loaded produces a model.bin whose fingerprint gen/report will reject as
+        // mismatched (or silently accept as "no tokenizer," worse), defeating this tool's one job.
+        sub0::log::error("ckpt2model: cannot load tokenizer '{}' -- the written model.bin would carry "
+                         "a wrong/missing fingerprint", tok_path);
+        return 1;
+    }
     sub0::build_model();   // allocates the param/Adam arenas load_checkpoint() reads into
 
     std::mt19937 rng; RunState rs; int batch = 0; float lr = 0.0f; unsigned seed = 0; long adam_t = 0;

@@ -309,7 +309,7 @@ TEST_CASE("model save/load round-trips the parameters exactly", "[engine]") {
     std::vector<float> before(sub0::params_ptr(), sub0::params_ptr() + n);
 
     const auto path = (std::filesystem::temp_directory_path() / "sub0_test_model.bin").string();
-    sub0::save_model(path.c_str());
+    REQUIRE(sub0::save_model(path.c_str()));
 
     for (std::size_t i = 0; i < n; ++i) sub0::params_ptr()[i] = -1234.5f;  // clobber
     REQUIRE(sub0::load_model(path.c_str()));
