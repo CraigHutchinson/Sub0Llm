@@ -25,7 +25,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -146,7 +145,6 @@ struct Worker {
     size_t act_used = 0, pool_used = 0, pcount = 0, pused = 0;
 };
 static std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers{};
-static std::atomic<bool> g_params_init{false};
 // nullptr until this thread runs ensure_thread_built(); a non-null W is the single
 // per-thread "bound and laid out" flag (its own TLS lifetime tracks the OS thread,
 // so each thread builds its g_model exactly once even if OpenMP reuses slots).
@@ -936,8 +934,9 @@ struct Model {
         }
     }
 
-    // Randomly initialize the SHARED weights through this thread's node layout.
-    // Called once (main thread); biases stay zero from the static arena.
+    // Randomly initialize the SHARED weights through this thread's node layout, from a fixed seed
+    // (deterministic, so every caller -- production and tests alike -- gets the identical baseline
+    // model). Biases stay zero from the static arena.
     void init_weights() {
         std::mt19937 rng(1234);
         auto randn = [&](Node* t, float std) {
@@ -1105,8 +1104,17 @@ static void ensure_thread_built() {
 // ============================================================================
 
 void build_model() {
-    ensure_thread_built();                       // this (main) thread's node layout
-    if (!g_params_init.exchange(true)) g_model.init_weights();   // randomize shared weights once
+    ensure_thread_built();      // this (main) thread's node layout
+    // Unconditional, not "once": every real caller (each production stage -- train/gen/report/...)
+    // invokes this exactly once per process, immediately followed by load_model()/load_checkpoint()
+    // whenever a prior model exists, so re-running the deterministic init here is a no-op in
+    // practice for them. Test suites are the one place that calls build_model() many times in one
+    // process (once per TEST_CASE) EXPECTING a fresh baseline model each time -- a guard that only
+    // randomized on the process's first call silently left every later test's "fresh" model as
+    // whatever gradient/optimizer steps earlier tests had left in the shared param arena, which
+    // surfaced as order-dependent CPU/GPU parity failures once params drifted far enough from
+    // init-scale (e.g. after Muon/AdamW step tests or the saturating-activation test ran first).
+    g_model.init_weights();
 }
 
 // save_model / load_model live in engine_core.cpp: serialization is backend-agnostic
