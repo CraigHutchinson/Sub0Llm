@@ -705,7 +705,7 @@ struct GpuTrainer {
         if (!HAS_CUDA || batch > kCap) return false;
         if (sub0_cuda_init() != 0) return false;
         if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) return false;
-        sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr());
+        if (sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) != 0) return false;
         // Pin the row budget up front (batch*SEQ_LEN rows) so no per-step (batch_t, seq_t) pair
         // ever triggers a grow-realloc mid-run. A failed sub0_cuda_train_reserve leaves the backend's
         // scratch in a consistent (if partial) state -- the retry below's OWN reserve call correctly
