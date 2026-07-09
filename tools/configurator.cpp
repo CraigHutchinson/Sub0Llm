@@ -603,7 +603,8 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--gated-ffn", gated_ffn,
                    "1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the plain "
-                   "2-matrix GELU+bias FFN -- for importing GGUF/Llama-family weights (CPU-only today)")
+                   "2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention, for "
+                   "importing open weights of that shape (CPU and GPU)")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--tie-embeddings", tie_embeddings,
                    "1 = the LM head reuses the token embedding matrix (transposed) instead of its own "

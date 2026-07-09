@@ -20,6 +20,7 @@
 #include "sub0/coherence.hpp"
 #include "sub0/config_util.hpp"  // sub0::config::kTokensPerParam — the SAME target ratio autosize() uses
 #include "sub0/log.hpp"      // sub0::log — leveled diagnostics + the <model_dir>/train.log tee
+#include "sub0/evalcache.hpp"
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
@@ -824,14 +825,12 @@ static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
-                                          int optimizer) {
+                                          int optimizer, int resume_mode) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
-    // structured, identity-named directory (corpus + dims + git SHA) under the models root and
-    // register it with a meta.txt, so `models` can discover it and prune incompatible ones. The
-    // derived path is deterministic, so re-running `train` with no path resumes the same model.
-    // Resolved FIRST (before touching the tokenizer/corpus) so the pinning below has somewhere to
-    // pin into.
+    // structured, identity-named directory (corpus + dims) under the models root and register it
+    // with a meta.txt, so `models` can discover it and prune incompatible ones. Resolved FIRST
+    // (before touching the tokenizer/corpus) so the pinning below has somewhere to pin into.
     std::string model_path;
     std::filesystem::path meta_dir;
     const std::string created = sub0::registry::now_iso();
@@ -844,13 +843,60 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             model_path = (std::filesystem::path(model_path) / "model.bin").string();
         meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
     } else {
-        meta_dir = sub0::registry::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
-                                             D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
-                                             static_cast<int>(USE_TERNARY),
-                                             static_cast<int>(POS_ENCODING), SUB0_GIT_SHA,
-                                             static_cast<int>(USE_GATED_FFN),
-                                             static_cast<int>(USE_TIED_EMBEDDINGS),
-                                             static_cast<int>(USE_QK_NORM));
+        // No explicit path: find the most recent model dir with the SAME corpus + architecture
+        // (registry::compatible() -- dims/flags, deliberately NOT the git SHA, see registry.hpp's
+        // own doc comment) and decide whether to resume it or start a fresh, dated one. Architecture
+        // match is the real "can these weights load" gate; whether the code version changed since
+        // is a separate, softer question this block resolves via --resume/--fresh when ambiguous.
+        namespace reg = sub0::registry;
+        const std::string corpus_key = reg::corpus_tag(sub0::default_corpus());
+        const std::vector<reg::ModelMeta> candidates = reg::scan(SUB0_MODELS_ROOT);
+        const reg::ModelMeta* best = nullptr;
+        for (const reg::ModelMeta& m : candidates) {
+            if (m.corpus != corpus_key) continue;
+            if (!reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
+                                 static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
+                                 static_cast<int>(USE_GATED_FFN), static_cast<int>(USE_TIED_EMBEDDINGS),
+                                 static_cast<int>(USE_QK_NORM)))
+                continue;
+            if (!best || m.updated > best->updated) best = &m;   // fixed-width ISO -> lexicographic = chronological
+        }
+
+        if (resume_mode == 1 && !best) {   // --resume with nothing to resume
+            sub0::log::error("train: --resume requested but no existing model dir matches this "
+                             "build's corpus+architecture yet.");
+            return 1;
+        }
+        bool do_resume = false;
+        if (best && resume_mode != 2) {   // resume_mode 2 = --fresh always skips this entirely
+            const bool in_progress = best->status == "training";   // the only non-terminal status
+            const bool sha_matches = best->git_sha == SUB0_GIT_SHA;
+            if (resume_mode == 1) {
+                do_resume = true;
+            } else if (in_progress && sha_matches) {
+                do_resume = true;   // unambiguous: same code, run didn't reach a clean stop
+            } else if (in_progress && !sha_matches) {
+                sub0::log::error(
+                    "train: '{}' looks unfinished (status=training) but was trained by a different "
+                    "code version ({} vs this build's {}) -- pass --resume to continue it anyway, or "
+                    "--fresh to start a new dated model instead.",
+                    best->dir.string(), best->git_sha.empty() ? "nogit" : best->git_sha, SUB0_GIT_SHA);
+                return 1;
+            } else {
+                sub0::log::line("train: previous matching run '{}' already {} -- starting a new "
+                                "dated model (pass --resume to continue it instead)",
+                                best->dir.filename().string(), best->status);
+            }
+        }
+
+        meta_dir = do_resume ? best->dir
+                             : reg::model_dir(SUB0_MODELS_ROOT, sub0::default_corpus(),
+                                              D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
+                                              static_cast<int>(USE_TERNARY),
+                                              static_cast<int>(POS_ENCODING), reg::now_datetag(),
+                                              static_cast<int>(USE_GATED_FFN),
+                                              static_cast<int>(USE_TIED_EMBEDDINGS),
+                                              static_cast<int>(USE_QK_NORM));
         model_path = (meta_dir / "model.bin").string();
     }
     // Refuse a second concurrent run against this same model dir (see SingleInstanceGuard above) --
@@ -1023,6 +1069,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.gated_ffn = static_cast<int>(USE_GATED_FFN);
         m.tied_embeddings = static_cast<int>(USE_TIED_EMBEDDINGS);
         m.qk_norm = static_cast<int>(USE_QK_NORM);
+        m.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
@@ -2030,7 +2077,46 @@ using sub0::coherence::interp_cross;
 
 }  // namespace
 
+// Shared by `report`, `autotemp`, and `models --refresh`: the RAW measurements that require actually
+// running the model (a forward pass over held-out data, and -- if `want_autotemp_grid` -- a full
+// generation sweep). See evalcache.hpp's own header comment for why this is split from the DERIVED
+// values (bits/byte, tokens/param, autotemp's interpolated crossing temperatures) every caller
+// recomputes fresh from these numbers instead of storing them too. Assumes `sub0::build_model()` was
+// already called by the caller (so `models --refresh` can call it once and loop over many models);
+// loads `model_in` itself. `EvalMetrics.steps` stays at its default -1 if the load fails -- callers
+// check `sub0::load_model`'s own return directly rather than relying on that as the failure signal,
+// since -1 is also a perfectly valid "never measured" value elsewhere in this cache.
+static sub0::evalcache::EvalMetrics compute_raw_metrics(sub0::TokView data, std::size_t val_start,
+                                                         bool want_autotemp_grid, unsigned seed) {
+    sub0::evalcache::EvalMetrics m;
+    const sub0::TokView train_span = data.first(val_start);
+    const sub0::TokView val_span   = data.subspan(val_start);
+    m.train_nelbo = evaluate(train_span, 0);
+    m.val_nelbo   = evaluate(val_span, 0);
+    {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(sub0::default_corpus(), ec);
+        if (!ec && !data.empty()) m.bytes_per_tok = static_cast<double>(sz) / static_cast<double>(data.size());
+    }
+    if (want_autotemp_grid) {
+        constexpr int AUTOTEMP_TOPK = 20;
+        constexpr int N_SEEDS = 10, GEN_LEN = 96;   // long windows so repetition/looping is visible
+        m.target_ppl = std::exp(mean_entropy(data, val_start));
+        m.target_rep = real_windowed_repeat(data, val_start, N_SEEDS, GEN_LEN);
+        m.grid.temp = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.4f};
+        m.grid.gen_ppl.resize(m.grid.temp.size());
+        m.grid.rep4.resize(m.grid.temp.size());
+        for (std::size_t i = 0; i < m.grid.temp.size(); ++i) {
+            const GenStats g = gen_self_stats(data, val_start, m.grid.temp[i], AUTOTEMP_TOPK,
+                                              N_SEEDS, GEN_LEN, seed);
+            m.grid.gen_ppl[i] = g.ppl; m.grid.rep4[i] = g.rep4;
+        }
+    }
+    return m;
+}
+
 extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose) {
+    constexpr int AUTOTEMP_TOPK = 20;   // matches gen's default; also used by compute_raw_metrics' own sweep
     sub0::TokMap tok(sub0::default_corpus_tok());
     std::vector<int> od_buf;
     const sub0::TokView data = load_corpus_tokens(tok, od_buf, "autotemp");
@@ -2050,40 +2136,43 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
         static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
     const std::size_t val_start = data.size() - val_tokens;
 
-    // Sweep/scoring config. Top-k mirrors gen's default so the recommended temperature
-    // transfers directly to the real generation path.
-    constexpr int AUTOTEMP_TOPK = 20;
-    constexpr int N_SEEDS = 10, GEN_LEN = 96;   // long windows so repetition/looping is visible
-
-    // Two self-validating anchors from the real held-out text:
-    //  * perplexity -- the model's reading entropy (compares the model to itself, so an
-    //    imperfect fit does not bias it; we match generation perplexity to this);
-    //  * repetition -- real text's 4-gram repeat rate, measured the SAME windowed way as
-    //    the generations, so the comparison is fair. This is the robust anchor: it is a
-    //    surface property of real text, independent of whether the model is well-calibrated.
-    const double ce_ppl    = std::exp(evaluate(data, val_start));          // headline (inflated by model error)
-    const double target_ppl = std::exp(mean_entropy(data, val_start));    // entropy-perplexity (match target)
-    const double target_rep = real_windowed_repeat(data, val_start, N_SEEDS, GEN_LEN);
+    const sub0::evalcache::EvalMetrics raw = compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, seed);
+    const double ce_ppl     = std::exp(raw.val_nelbo);   // headline (inflated by model error) -- exp(val_nelbo), not a separate measurement
+    const double target_ppl = raw.target_ppl;
+    const double target_rep = raw.target_rep;
 
     std::println("autotemp: model {}", model_in);
     std::println("held-out (real text): cross-entropy perplexity {:.2f} | reading entropy {:.2f} | 4-gram repeat {:.1f}%",
                  ce_ppl, target_ppl, 100.0 * target_rep);
     std::fflush(stdout);
 
-    // One honest sweep over a fixed temperature grid; the table IS the evidence. gen_ppl
-    // rises with temperature, 4-gram repeat falls, so each target has exactly one crossing
-    // -- recovered by interpolation (no noisy bisection, and both anchors from one pass).
-    const std::vector<float> grid = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.4f};
-    std::vector<double> ppls(grid.size()), reps(grid.size());
-    if (verbose) std::println("  {:>6}   {:>10}   {:>10}", "temp", "gen_ppl", "4gram-rep");
-    for (std::size_t i = 0; i < grid.size(); ++i) {
-        const GenStats g = gen_self_stats(data, val_start, grid[i], AUTOTEMP_TOPK, N_SEEDS, GEN_LEN, seed);
-        ppls[i] = g.ppl; reps[i] = g.rep4;
-        if (verbose) {
-            std::println("  {:>6.2f}   {:>10.3f}   {:>9.1f}%{}{}", grid[i], g.ppl, 100.0 * g.rep4,
-                         g.ppl >= target_ppl ? "  ppl>=tgt" : "", g.rep4 <= target_rep ? "  rep<=tgt" : "");
+    // The grid IS the evidence (already computed above); this loop just prints it. gen_ppl rises
+    // with temperature, 4-gram repeat falls, so each target has exactly one crossing -- recovered by
+    // interpolation below (no noisy bisection, and both anchors from the one sweep already run).
+    const std::vector<float>& grid = raw.grid.temp;
+    const std::vector<double>& ppls = raw.grid.gen_ppl;
+    const std::vector<double>& reps = raw.grid.rep4;
+    if (verbose) {
+        std::println("  {:>6}   {:>10}   {:>10}", "temp", "gen_ppl", "4gram-rep");
+        for (std::size_t i = 0; i < grid.size(); ++i) {
+            std::println("  {:>6.2f}   {:>10.3f}   {:>9.1f}%{}{}", grid[i], ppls[i], 100.0 * reps[i],
+                         ppls[i] >= target_ppl ? "  ppl>=tgt" : "", reps[i] <= target_rep ? "  rep<=tgt" : "");
             std::fflush(stdout);
         }
+    }
+
+    // Cache this run's raw numbers, preserving whatever report_stage already wrote (train/val
+    // NELBO, bytes_per_tok) rather than overwriting those fields with autotemp's own defaults.
+    if (model_in && *model_in) {
+        const std::filesystem::path metrics_dir = std::filesystem::path(model_in).parent_path();
+        sub0::registry::ModelMeta meta;
+        sub0::registry::read_meta(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
+        sub0::evalcache::EvalMetrics cached;
+        sub0::evalcache::read_metrics(metrics_dir, cached);   // ok if this returns false (nothing cached yet)
+        cached.steps = meta.steps;
+        cached.measured_at = sub0::registry::now_iso();
+        cached.target_ppl = raw.target_ppl; cached.target_rep = raw.target_rep; cached.grid = raw.grid;
+        sub0::evalcache::write_metrics(metrics_dir, cached);
     }
 
     const Crossing by_ppl = interp_cross(grid, ppls, target_ppl, /*increasing=*/true);
@@ -2208,8 +2297,7 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
         static_cast<std::size_t>(SEQ_LEN) + 2,
         static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
     const std::size_t val_start = data.size() - val_tokens;
-    const sub0::TokView train_span = data.first(val_start);
-    const sub0::TokView val_span   = data.subspan(val_start);
+    const sub0::TokView train_span = data.first(val_start);   // val_span lives inside compute_raw_metrics now
 
     const long long params       = static_cast<long long>(sub0::trainable_floats());
     const int       head_dim     = D_MODEL / N_HEADS;
@@ -2245,8 +2333,10 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     if (model_in && *model_in) {
         if (sub0::load_model(model_in)) {
             model_loaded = true;
-            const double train_nelbo = evaluate(train_span, 0);
-            const double val_nelbo   = evaluate(val_span, 0);
+            const sub0::evalcache::EvalMetrics raw =
+                compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/false, 0);
+            const double train_nelbo = raw.train_nelbo;
+            const double val_nelbo   = raw.val_nelbo;
             const double gap = val_nelbo - train_nelbo;
             rel_gap = val_nelbo > 0 ? gap / val_nelbo : 0.0;
             const double bpb = bytes_per_tok > 0 ? val_nelbo / (0.6931471805599453 * bytes_per_tok) : 0.0;
@@ -2265,6 +2355,20 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
                 emit("  bits/byte   {:.3f}  (corpus ~{:.2f} bytes/token)  -> {}", bpb, bytes_per_tok,
                              bpb > 1.2 ? "well above ~1.0: real headroom"
                                        : bpb > 0.9 ? "near a good small-model range" : "strong");
+
+            // Cache this run's raw numbers, preserving whatever autotemp_stage already wrote
+            // (target_ppl/target_rep/grid) rather than overwriting those fields with report's defaults.
+            {
+                const std::filesystem::path metrics_dir = std::filesystem::path(model_in).parent_path();
+                sub0::registry::ModelMeta meta;
+                sub0::registry::read_meta(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
+                sub0::evalcache::EvalMetrics cached;
+                sub0::evalcache::read_metrics(metrics_dir, cached);   // ok if this returns false (nothing cached yet)
+                cached.steps = meta.steps;
+                cached.measured_at = sub0::registry::now_iso();
+                cached.train_nelbo = train_nelbo; cached.val_nelbo = val_nelbo; cached.bytes_per_tok = bytes_per_tok;
+                sub0::evalcache::write_metrics(metrics_dir, cached);
+            }
         } else {
             emit("note: '{}' did not load into this build (different config/scheme); "
                          "showing structural guidance only.", model_in);

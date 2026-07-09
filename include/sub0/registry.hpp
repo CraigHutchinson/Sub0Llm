@@ -1,8 +1,8 @@
 // registry.hpp -- model storage layout + a self-describing model index.
 //
 // Every trained model lives in its own directory under a models root, named for its
-// IDENTITY -- corpus + architecture dims + the git SHA of the code that trained it:
-//   models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t][r]_<sha>/
+// IDENTITY -- corpus + architecture dims + a date+time tag for the training attempt:
+//   models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t][r]_<YYYYMMDD-HHMMSS>/
 //     model.bin        the parameters
 //     model.bin.ckpt   the resumable optimizer/loop state
 //     meta.txt         key=value provenance (below)
@@ -14,12 +14,19 @@
 // an untied head, its own matrix+bias, the legacy default, is untagged), 'q' = QK-norm (per-head
 // RMSNorm on Q/K before RoPE; no norm, the legacy default, is untagged).
 //
+// The directory tag is a date+time, NOT the git SHA: the SHA changes on every commit (even an
+// unrelated log-message fix), but architecture/weight-format compatibility is the thing that
+// actually determines whether a checkpoint can resume -- see `compatible()` below, which already
+// checks dims/flags and deliberately ignores the SHA. Keying the directory name to the SHA meant a
+// trivial commit between stopping and resuming a multi-day run would silently start a fresh model
+// instead of resuming it. The SHA is still recorded in meta.txt as a provenance/audit field (see
+// ModelMeta::git_sha) -- just no longer part of directory identity or resume-matching.
+//
 // The "registry" is just the set of meta.txt files: discovery scans them (no separate
 // index to drift out of sync), and a model is COMPATIBLE with the current build iff its
 // architecture dims match -- the checkpoint can only load into a matching engine, so
-// dim-mismatched models are dead weight a `prune` can reclaim. The git SHA tags the code
-// version for spotting obsolete-but-compatible models. Pure std + <filesystem>; the engine
-// supplies the compile-time dims.
+// dim-mismatched models are dead weight a `prune` can reclaim. Pure std + <filesystem>; the
+// engine supplies the compile-time dims.
 #pragma once
 
 #include <array>
@@ -40,6 +47,7 @@ struct ModelMeta {
     int gated_ffn = 0;                        // 0 = plain GELU+bias FFN (legacy default), 1 = SwiGLU-gated
     int tied_embeddings = 0;                  // 0 = untied head (legacy default), 1 = head reuses tok_emb
     int qk_norm = 0;                          // 0 = no QK-norm (legacy default), 1 = per-head RMSNorm on Q/K
+    int optimizer = 0;                        // 0 = AdamW (legacy default), 1 = Muon (hidden 2D matrices)
     // Training state (provenance of the run that produced this snapshot).
     long long steps = 0;                      // optimizer iterations completed
     double epochs = 0.0;                      // fractional epochs of the corpus covered
@@ -67,18 +75,20 @@ inline std::string corpus_tag(const std::string& corpus_path) {
     return t;
 }
 
-// The identity-encoding directory for a model (no I/O).
+// The identity-encoding directory for a model (no I/O). `datetime_tag` identifies this specific
+// training ATTEMPT (see `now_datetag()`) -- it is NOT a compatibility check; that's `compatible()`
+// below, driven by dims/flags alone.
 inline std::filesystem::path model_dir(const std::filesystem::path& models_root,
                                        const std::string& corpus, int d, int l, int h,
                                        int seq, int vocab, int ternary, int pos_enc,
-                                       const std::string& sha, int gated_ffn = 0,
+                                       const std::string& datetime_tag, int gated_ffn = 0,
                                        int tied_embeddings = 0, int qk_norm = 0) {
     std::string name = "sub0llm_" + corpus_tag(corpus) +
                        "_d" + std::to_string(d) + "l" + std::to_string(l) + "h" + std::to_string(h) +
                        "sq" + std::to_string(seq) + "v" + std::to_string(vocab) +
                        (ternary ? "t" : "") + pos_tag(pos_enc) + (gated_ffn ? "g" : "") +
                        (tied_embeddings ? "w" : "") + (qk_norm ? "q" : "") +
-                       "_" + (sha.empty() ? "nogit" : sha);
+                       "_" + (datetime_tag.empty() ? "unknown" : datetime_tag);
     return models_root / name;
 }
 
@@ -92,6 +102,21 @@ inline std::string now_iso() {
 #endif
     char buf[32];
     std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+// A filesystem-safe date+time tag for directory names: no ':' or 'T' (Windows disallows ':' in
+// filenames), still fixed-width and lexicographically sortable like `now_iso()`.
+inline std::string now_datetag() {
+    const auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y%m%d-%H%M%S", &tm);
     return buf;
 }
 
@@ -111,6 +136,7 @@ inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
        << "gated_ffn="       << m.gated_ffn << "\n"
        << "tied_embeddings=" << m.tied_embeddings << "\n"
        << "qk_norm="         << m.qk_norm << "\n"
+       << "optimizer="       << m.optimizer << "\n"
        << "git_sha="         << m.git_sha   << "\n"
        << "created="         << m.created   << "\n"
        << "updated="         << m.updated   << "\n"
@@ -147,6 +173,7 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
         else if (k == "gated_ffn")      m.gated_ffn = as_int(v);
         else if (k == "tied_embeddings") m.tied_embeddings = as_int(v);
         else if (k == "qk_norm")        m.qk_norm = as_int(v);
+        else if (k == "optimizer")      m.optimizer = as_int(v);
         else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
         else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
         else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);

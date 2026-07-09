@@ -20,7 +20,7 @@
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
-                                int optimizer);
+                                int optimizer, int resume_mode);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
@@ -51,8 +51,9 @@ inline int run_train(int argc, char** argv) {
     unsigned train_seed = 42;
     std::string train_keep = "3";
     int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
+    bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
-                   "Output model path (optional; omit to auto-name by corpus+dims+git SHA)");
+                   "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
     app.add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
     app.add_option("--steps", train_steps,
                    "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
@@ -69,6 +70,12 @@ inline int run_train(int argc, char** argv) {
                    "AdamW -- CPU and GPU)")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"adamw", 0}, {"muon", 1}}, CLI::ignore_case))
        ->default_str("adamw");
+    auto* resume_flag = app.add_flag("--resume", train_resume,
+                   "No explicit model path: force-resume the most recent matching-architecture model "
+                   "dir, even if it already finished or the code version changed underneath it");
+    app.add_flag("--fresh", train_fresh,
+                "No explicit model path: force a brand-new dated model dir, even if a resumable one exists")
+       ->excludes(resume_flag);
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -78,8 +85,10 @@ inline int run_train(int argc, char** argv) {
     int keep = 3;                      // "ALL"/"all" -> keep every checkpoint (keep<0 sentinel)
     if (train_keep == "ALL" || train_keep == "all") keep = -1;
     else { try { keep = std::max(1, std::stoi(train_keep)); } catch (...) { keep = 3; } }
+    const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
-                            train_steps, train_batch, train_lr, train_seed, keep, train_optimizer);
+                            train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
+                            resume_mode);
 }
 
 // --- gen -------------------------------------------------------------------
