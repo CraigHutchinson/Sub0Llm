@@ -2559,9 +2559,22 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
 // the registry is the set of those files, so it never drifts out of sync) and flags which load
 // into THIS build (matching architecture dims). `--prune` reclaims the incompatible ones, whose
 // checkpoints this engine could never load anyway. Destructive, so it is opt-in via the flag.
-extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
+// The SAME "recommended temperature" derivation autotemp_stage prints (rec = min(by_rep.temp,
+// TEMP_CEILING)) -- reused, not reimplemented, against a model's cached grid. Returns -1 when no
+// autotemp grid has been cached yet (nothing to derive from).
+static double recommended_temp_from_cache(const sub0::evalcache::EvalMetrics& m) {
+    if (m.grid.temp.empty() || m.target_rep < 0) return -1.0;
+    constexpr float TEMP_CEILING = 1.0f;
+    const Crossing by_rep = interp_cross(m.grid.temp, m.grid.rep4, m.target_rep, /*increasing=*/false);
+    return std::min(static_cast<double>(by_rep.temp), static_cast<double>(TEMP_CEILING));
+}
+
+extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* corpus_filter,
+                                          const char* sha_filter, const char* since, const char* until,
+                                          int metrics, int refresh, int force) {
     (void)verbose;
     namespace reg = sub0::registry;
+    namespace ec  = sub0::evalcache;
     std::vector<reg::ModelMeta> models = reg::scan(SUB0_MODELS_ROOT);
     std::println("models root: {}  ({} model{})", SUB0_MODELS_ROOT, models.size(), models.size() == 1 ? "" : "s");
     std::println("this build:  d{} l{} h{} sq{} v{}{}{}{}{}{} @ {}",
@@ -2576,11 +2589,105 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
                                static_cast<int>(USE_GATED_FFN), static_cast<int>(USE_TIED_EMBEDDINGS),
                                static_cast<int>(USE_QK_NORM));
     };
-    std::sort(models.begin(), models.end(),
+
+    // Filter BEFORE anything else, so the plain listing, --prune, --metrics, and --refresh all agree
+    // on the same selected set (an empty filter arg -> no restriction on that axis). --sha is a
+    // prefix match (short shas are the norm); --since/--until compare directly against meta.txt's
+    // fixed-width ISO `created` string, no date parsing needed.
+    auto matches = [&](const reg::ModelMeta& m) {
+        if (corpus_filter && *corpus_filter && m.corpus.find(corpus_filter) == std::string::npos) return false;
+        if (sha_filter && *sha_filter && m.git_sha.rfind(sha_filter, 0) != 0) return false;
+        if (since && *since && m.created < since) return false;
+        if (until && *until && m.created > until) return false;
+        return true;
+    };
+    std::vector<reg::ModelMeta> sel;
+    for (reg::ModelMeta& m : models) if (matches(m)) sel.push_back(std::move(m));
+    std::sort(sel.begin(), sel.end(),
               [](const reg::ModelMeta& a, const reg::ModelMeta& b) { return a.dir.filename() < b.dir.filename(); });
+    if (sel.empty() && (corpus_filter && *corpus_filter || sha_filter && *sha_filter ||
+                        (since && *since) || (until && *until))) {
+        std::println("(no models match the given filter)");
+        return 0;
+    }
+
+    if (metrics || refresh) {
+        if (refresh) {
+            int n_loadable = 0;
+            for (const reg::ModelMeta& m : sel) if (loadable(m)) ++n_loadable;
+            std::println("refreshing up to {} loadable, filtered model(s) ({} total filtered, {} skipped "
+                         "as incompatible with this build)...", n_loadable, sel.size(), sel.size() - static_cast<std::size_t>(n_loadable));
+            sub0::build_model();   // once, reused for every loadable model in the loop below
+            // gen_self_stats resolves the EOS-stop signal via sub0::eos_token_id(), which returns -1
+            // (no tokenizer loaded) unless this is called -- without it, generation never stops early,
+            // silently inflating the measured repetition/perplexity exactly like the bug a016d17 fixed.
+            sub0::load_tokenizer(sub0::default_tokenizer());
+            sub0::TokMap tok(sub0::default_corpus_tok());
+            std::vector<int> od_buf;
+            const sub0::TokView data = load_corpus_tokens(tok, od_buf, "models --refresh");
+            if (data.empty()) { sub0::log::error("models --refresh: could not load this build's corpus"); return 1; }
+            const std::size_t val_tokens = std::max<std::size_t>(
+                static_cast<std::size_t>(SEQ_LEN) + 2,
+                static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
+            const std::size_t val_start = data.size() - val_tokens;
+            int n_done = 0;
+            for (const reg::ModelMeta& m : sel) {
+                if (!loadable(m)) continue;
+                ec::EvalMetrics cached;
+                const bool had_cache = ec::read_metrics(m.dir, cached);
+                if (!force && had_cache && cached.steps == m.steps) continue;   // already fresh
+                const std::string model_path = (m.dir / "model.bin").string();
+                if (!sub0::load_model(model_path.c_str())) {
+                    sub0::log::warn("models --refresh: '{}' did not load (skipped)", m.dir.filename().string());
+                    continue;
+                }
+                const ec::EvalMetrics raw = compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, 42);
+                ec::EvalMetrics out;
+                out.steps = m.steps; out.measured_at = reg::now_iso();
+                out.train_nelbo = raw.train_nelbo; out.val_nelbo = raw.val_nelbo; out.bytes_per_tok = raw.bytes_per_tok;
+                out.target_ppl = raw.target_ppl; out.target_rep = raw.target_rep; out.grid = raw.grid;
+                ec::write_metrics(m.dir, out);
+                std::println("  refreshed {}  (val_nelbo {:.4f})", m.dir.filename().string(), out.val_nelbo);
+                ++n_done;
+            }
+            std::println("refreshed {} model(s)", n_done);
+        }
+
+        std::println("");
+        std::println("{:<3} {:<48} {:>5} {:>3} {:>3} {:>7} {:>9} {:>7} {:>5} {:>4}  {}",
+                     "use", "model", "d", "L", "H", "params", "val_nelbo", "bits/B", "temp", "opt", "corpus");
+        for (const reg::ModelMeta& m : sel) {
+            ec::EvalMetrics cm;
+            const bool has = ec::read_metrics(m.dir, cm);
+            if (!has) {
+                const bool has_bin = std::filesystem::exists(m.dir / "bin");
+                std::println("{:<3} {:<48} {:>5} {:>3} {:>3}  -- not yet measured --{}",
+                             loadable(m) ? " * " : " x ", m.dir.filename().string(),
+                             m.d_model, m.n_layers, m.n_heads,
+                             has_bin ? "  (bin/ present -- run report/autotemp via it)" : "");
+                continue;
+            }
+            const int d_ff = sub0::config::d_ff_for(m.d_model, m.gated_ffn);
+            const auto params = sub0::memplan::param_floats(sub0::memplan::Dims{
+                m.d_model, m.n_layers, m.n_heads, d_ff, m.seq_len, m.vocab,
+                static_cast<bool>(m.tied_embeddings), static_cast<bool>(m.qk_norm), static_cast<bool>(m.gated_ffn)});
+            const double bpb = cm.val_nelbo >= 0 && cm.bytes_per_tok > 0
+                ? cm.val_nelbo / (0.6931471805599453 * cm.bytes_per_tok) : -1.0;
+            const double temp = recommended_temp_from_cache(cm);
+            std::println("{:<3} {:<48} {:>5} {:>3} {:>3} {:>6.1f}M {:>9} {:>7} {:>5} {:>4}  {}",
+                         loadable(m) ? " * " : " x ", m.dir.filename().string(),
+                         m.d_model, m.n_layers, m.n_heads, params / 1e6,
+                         cm.val_nelbo >= 0 ? std::format("{:.4f}", cm.val_nelbo) : "-",
+                         bpb >= 0 ? std::format("{:.3f}", bpb) : "-",
+                         temp >= 0 ? std::format("{:.2f}", temp) : "-",
+                         m.optimizer ? "muon" : "adamw", m.corpus);
+        }
+        std::println("(* loadable by this build | x incompatible architecture)");
+        return 0;
+    }
 
     std::println("{:<3} {:<50} {:>9}  {:<10} {}", "use", "model", "val_nelbo", "status", "corpus");
-    for (const reg::ModelMeta& m : models)
+    for (const reg::ModelMeta& m : sel)
         std::println("{:<3} {:<50} {:>9}  {:<10} {}", loadable(m) ? " * " : " x ",
                      m.dir.filename().string(),
                      m.best_val_nelbo >= 0 ? std::format("{:.4f}", m.best_val_nelbo) : "-",
@@ -2589,12 +2696,12 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose) {
 
     if (prune) {
         int removed = 0;
-        for (const reg::ModelMeta& m : models) {
+        for (const reg::ModelMeta& m : sel) {
             if (loadable(m)) continue;
-            std::error_code ec;
-            const auto n = std::filesystem::remove_all(m.dir, ec);
-            if (!ec) { std::println("pruned {} ({} entries)", m.dir.filename().string(), n); ++removed; }
-            else     sub0::log::warn("could not prune {}", m.dir.string());
+            std::error_code ec2;
+            const auto n = std::filesystem::remove_all(m.dir, ec2);
+            if (!ec2) { std::println("pruned {} ({} entries)", m.dir.filename().string(), n); ++removed; }
+            else      sub0::log::warn("could not prune {}", m.dir.string());
         }
         std::println("pruned {} incompatible model(s)", removed);
     }

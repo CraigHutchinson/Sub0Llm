@@ -29,7 +29,9 @@ extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend, int th
 extern "C" int sub0_autotemp_stage(const char* model_in, unsigned seed, int verbose);
 extern "C" int sub0_report_stage(const char* model_in);
 extern "C" int sub0_memplan_stage();
-extern "C" int sub0_models_stage(int prune, int verbose);
+extern "C" int sub0_models_stage(int prune, int verbose, const char* corpus_filter,
+                                 const char* sha_filter, const char* since, const char* until,
+                                 int metrics, int refresh, int force);
 extern "C" int sub0_bundle_stage(const char* model_in);
 extern "C" int sub0_ckpt2model_stage(const char* ckpt_in, const char* model_out);
 
@@ -185,11 +187,27 @@ inline int run_autotemp(int argc, char** argv) {
 
 // --- models ----------------------------------------------------------------
 inline int run_models(int argc, char** argv) {
-    CLI::App app{"sub0llm models — list trained models; --prune removes ones incompatible with this build"};
-    bool models_prune = false;
+    CLI::App app{"sub0llm models — list trained models; --prune removes ones incompatible with this build; "
+                 "--metrics/--refresh show a filterable, cached cross-model comparison table"};
+    bool models_prune = false, models_metrics = false, models_refresh = false, models_force = false;
+    std::string models_corpus, models_sha, models_since, models_until;
     app.add_flag("--prune", models_prune, "Delete models whose architecture this build cannot load");
+    app.add_option("--corpus", models_corpus, "Filter: only models trained on a corpus matching this substring");
+    app.add_option("--sha", models_sha, "Filter: only models tagged with a git SHA starting with this");
+    app.add_option("--since", models_since, "Filter: only models created on/after this ISO date (YYYY-MM-DD)");
+    app.add_option("--until", models_until, "Filter: only models created on/before this ISO date (YYYY-MM-DD)");
+    app.add_flag("--metrics", models_metrics,
+                "Print a comparison table (dims/params/val_nelbo/bits-per-byte/autotemp temp) from each "
+                "model's cached metrics.txt, read-only");
+    app.add_flag("--refresh", models_refresh,
+                "Like --metrics, but first compute+cache report/autotemp's raw numbers for any filtered, "
+                "loadable model with a missing or stale cache");
+    app.add_flag("--force", models_force, "With --refresh, recompute every filtered loadable model unconditionally")
+       ->needs("--refresh");
     CLI11_PARSE(app, argc, argv);
-    return sub0_models_stage(models_prune ? 1 : 0, 1);
+    return sub0_models_stage(models_prune ? 1 : 0, 1,
+                             models_corpus.c_str(), models_sha.c_str(), models_since.c_str(), models_until.c_str(),
+                             models_metrics ? 1 : 0, models_refresh ? 1 : 0, models_force ? 1 : 0);
 }
 
 // --- report ----------------------------------------------------------------
