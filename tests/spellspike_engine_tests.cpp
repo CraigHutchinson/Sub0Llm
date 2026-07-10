@@ -33,7 +33,7 @@ using sub0::tok::Tokenizer;
 
 constexpr int    kBatch        = 16;
 constexpr int    kWindowT      = 40;     // task traces are short; must be <= SEQ_LEN
-constexpr int    kEvalRounds   = 5;
+constexpr int    kEvalRounds   = 10;
 constexpr int    kStepsPerEval = 300;
 constexpr int    kMaxEvalWords = 40;
 constexpr int    kTasksPerWord = 16;
