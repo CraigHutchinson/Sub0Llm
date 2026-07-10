@@ -219,3 +219,10 @@ scripts/    data-acquisition helpers (get_fineweb.py)
 tests/      Catch2 unit tests (engine + the engine-free tokenizer/config suite)
 docs/       design notes (tokenizer, configure + workflow architecture, CUDA review)
 ```
+
+## Roadmap
+
+[docs/ROADMAP.md](docs/ROADMAP.md) lays out where the corpus/data-sourcing and architecture decisions
+are headed: from the current tiny-fluency + knowledge-scale lines toward conversational competence,
+reasoning, tool use, and — as the stretch goal — agentic C++ coding, via a family of small,
+purpose-sized models rather than one large dense one.
