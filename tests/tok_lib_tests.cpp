@@ -167,7 +167,11 @@ TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     REQUIRE(sub0::casing::TOK_GLUE_CBRACKET == 275);
     REQUIRE(sub0::casing::TOK_GLUE_OBRACE == 276);
     REQUIRE(sub0::casing::TOK_GLUE_CBRACE == 277);
-    REQUIRE(sub0::casing::TOK_RESERVED_0 == 278);
+    REQUIRE(sub0::casing::TOK_UNCOMBINE == 278);      // renamed from TOK_RESERVED_0 for the token-granularity spike
+    REQUIRE(sub0::casing::TOK_UNCOMBINE_END == 279);  // renamed from TOK_RESERVED_1
+    REQUIRE(sub0::casing::TOK_COMBINE == 280);        // renamed from TOK_RESERVED_2
+    REQUIRE(sub0::casing::TOK_COMBINE_END == 281);    // renamed from TOK_RESERVED_3
+    REQUIRE(sub0::casing::TOK_RESERVED_4 == 282);
     REQUIRE(sub0::casing::TOK_RESERVED_9 == 287);
     REQUIRE(sub0::casing::TOK_MARKER_COUNT == 288);
     REQUIRE(t.vocab > t.n_base);              // merges still learned on top

@@ -59,9 +59,11 @@ TEST_CASE("to_interchange: known markers get their real literal text", "[tok][in
     REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_GLUE_OPAREN)].text == "(");
     REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_GLUE_CPAREN)].text == ")");
     REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_NEWLINE)].text == "\n");
-    // A reserved (not-yet-assigned) marker still gets a total, non-empty placeholder -- never the
-    // wrapped-byte garbage detokenize_join's own reserved-id guard exists to avoid (see casing.hpp).
-    REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_RESERVED_0)].text == "<|reserved_0|>");
+    // A named-but-inert control marker (an uncombine-spike request token) and a still-reserved marker
+    // both get a total, non-empty placeholder -- never the wrapped-byte garbage detokenize_join's own
+    // reserved-id guard exists to avoid (see casing.hpp).
+    REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_UNCOMBINE)].text == "<|uncombine|>");
+    REQUIRE(ic.tokens[static_cast<std::size_t>(sub0::casing::TOK_RESERVED_4)].text == "<|reserved_4|>");
 }
 
 TEST_CASE("to_interchange: piece text matches the tokenizer's own expansion bytes", "[tok][interchange]") {

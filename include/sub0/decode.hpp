@@ -15,6 +15,7 @@
 #pragma once
 
 #include "sub0/core.hpp"
+#include "sub0/casing.hpp"   // TOK_UNCOMBINE / TOK_COMBINE marker ids (kv_decode_ops below)
 
 #include <cstdio>
 #include <functional>
@@ -131,6 +132,55 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         ctx.push_back(next);
         logits = sub0::forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1);
     }
+}
+
+// --- Combine / uncombine interception (token-granularity spike; CPU KV-cache, greedy) ------------
+// Autoregressive GREEDY decode in which the model can REQUEST deterministic tokenizer-layer
+// operations that this loop fulfils (see sub0/spellspike.hpp + the TOK_UNCOMBINE/TOK_COMBINE comment
+// in casing.hpp): the model learns to INVOKE, the tokenizer layer supplies the content. The ops are
+// passed as callbacks so this stays engine-only (no tokenizer include here):
+//   expand(token)  -> the token's constituent fragments               (fulfils a TOK_UNCOMBINE)
+//   combine(frags) -> those fragments' minimal vocab token(s)          (fulfils a TOK_COMBINE region)
+// Injected tokens ARE fed through the model (forward_one, so it attends to them) but are never
+// sampled/scored -- the harness provides them, the model only drives. Returns the full produced
+// context INCLUDING the injected spans, so the caller can read off the answer / round-trip result.
+// Greedy + CPU KV-cache only: this is the spike's eval path; productionizing would fold the same
+// interception into kv_decode_generate's sampling loop (this deliberately does NOT touch that
+// battle-tested, GPU-capable function while the mechanism is unproven).
+inline std::vector<int> kv_decode_ops(
+        std::vector<int> ctx, int max_steps, int eos_id,
+        const std::function<std::vector<int>(int)>& expand,
+        const std::function<std::vector<int>(const std::vector<int>&)>& combine) {
+    auto argmax = [](const float* row) {
+        int best = 0; float bv = row[0];
+        for (int v = 1; v < VOCAB; ++v) if (row[v] > bv) { bv = row[v]; best = v; }
+        return best;
+    };
+    sub0::kv_reset();
+    const float* logits = nullptr;
+    for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos) logits = sub0::forward_one(ctx[pos], pos);
+    auto feed = [&](int tok) { ctx.push_back(tok); logits = sub0::forward_one(tok, static_cast<int>(ctx.size()) - 1); };
+
+    for (int s = 0; s < max_steps && static_cast<int>(ctx.size()) < SEQ_LEN - 1; ++s) {
+        const int next = argmax(logits);
+        if (next == eos_id) break;
+        feed(next);
+        if (next == casing::TOK_UNCOMBINE) {
+            const int tgt = ctx.size() >= 2 ? ctx[ctx.size() - 2] : -1;   // expand the PRECEDING token
+            if (tgt >= 0) {
+                for (int f : expand(tgt)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(f); }
+                if (static_cast<int>(ctx.size()) < SEQ_LEN - 1) feed(casing::TOK_UNCOMBINE_END);
+            }
+        } else if (next == casing::TOK_COMBINE_END) {
+            std::size_t open = ctx.size();                               // find the matching TOK_COMBINE
+            for (std::size_t i = ctx.size(); i-- > 0;) if (ctx[i] == casing::TOK_COMBINE) { open = i; break; }
+            if (open < ctx.size()) {
+                const std::vector<int> frags(ctx.begin() + static_cast<std::ptrdiff_t>(open) + 1, ctx.end() - 1);
+                for (int ct : combine(frags)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(ct); }
+            }
+        }
+    }
+    return ctx;
 }
 
 // RAII: brings up a GPU decode session (if available) for a BATCH of kv_decode_generate calls made

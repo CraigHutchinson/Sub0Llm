@@ -104,6 +104,13 @@ SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T,
 // positions < SEQ_LEN. See src/backend_cpu.cpp.
 SUB0_API void        kv_reset();
 SUB0_API const float* forward_one(int id, int pos);
+// A target of LOSS_IGNORE_INDEX means "do not train on this position": cross_entropy adds no loss and
+// no gradient for it, and normalizes by the count of ACTIVE (non-ignored) positions (PyTorch's
+// `ignore_index` + reduction='mean'). Valid token ids are [0,VOCAB), so a negative is unambiguous.
+// The foundation for span loss-masking -- the spike's harness-injected spans, and future
+// instruction-tuning's prompt/user turns (train only on the assistant span). When no target is
+// negative, active == the row count, so the loss/gradient are IDENTICAL to the unmasked path.
+constexpr int LOSS_IGNORE_INDEX = -1;
 SUB0_API Node* cross_entropy(Node* logits, const int* targets); // -> mean loss [1,1]
 SUB0_API void  backward(Node* loss, float seed);                // reverse walk
 SUB0_API void  reduce_gradients();                              // publish single-window grad
@@ -113,8 +120,11 @@ SUB0_API void  reduce_gradients();                              // publish singl
 // `starts[b]` is the token offset of window b (x = data+starts[b], y = +1). `lengths`,
 // if non-null, gives window b's trained length (<= T) so short documents train at their
 // own length instead of a fixed T; null means every window is exactly T.
+// `loss_mask`, if non-null, is a per-token 0/1 array parallel to `data`: predicting token p
+// contributes to the loss only if loss_mask[p] != 0 (masked target positions become
+// LOSS_IGNORE_INDEX; see above). null = every in-length position trains, i.e. today's behavior.
 SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T,
-                           const int* lengths = nullptr);
+                           const int* lengths = nullptr, const std::uint8_t* loss_mask = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 // AdamW by default; optionally a HYBRID Muon+AdamW split when `use_muon` is set: the hidden 2D GEMM

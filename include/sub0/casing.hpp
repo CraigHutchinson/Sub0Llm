@@ -125,7 +125,27 @@ enum TokenId : int {
     // encode-side literal match and no decode-side effect (detokenize_join's switch has no case for
     // it, and the fallback path explicitly no-ops any unassigned marker id rather than mis-decoding
     // it as a byte -- see detokenize_join) until a future workstream gives one meaning.
-    TOK_RESERVED_0, TOK_RESERVED_1, TOK_RESERVED_2, TOK_RESERVED_3,
+    //
+    // COMBINE / UNCOMBINE region markers: four reserved slots RENAMED (not inserted -- the same
+    // headroom-consuming pattern the bracket-glue markers used above) for the token-granularity
+    // research spike (docs/ROADMAP.md; project memory spellspike-poc-results). They are CONTROL
+    // tokens the model emits to REQUEST a deterministic tokenizer-layer operation, NOT text-encoding
+    // markers: nothing in encode_join/detokenize_join emits or matches them (inert in the text path,
+    // same as any reserved slot). The decode-loop interceptor (sub0/decode.hpp) fulfils the request:
+    //   UNCOMBINE: the model emits `TOK_UNCOMBINE <token>`; the harness expands that token into its
+    //     constituent byte/sub-token fragments (from the tokenizer's own `expansion` -- known, exact,
+    //     free) and injects them followed by TOK_UNCOMBINE_END, so the model can then READ the
+    //     characters it could not see inside one opaque token (spelling, Nth-char, char-counting).
+    //   COMBINE: the model emits `TOK_COMBINE <fragments...> TOK_COMBINE_END`; the harness
+    //     re-tokenizes that fragment span back into its minimal vocab token(s) -- the inverse op.
+    // The point is NOT to memorise spellings in weights (the first spike proved that does not
+    // generalise) but to learn to INVOKE these ops; round-trip fidelity (combine(uncombine(t))==t)
+    // is the success measure. See sub0/spellspike.hpp for the curriculum and decode.hpp for the
+    // interceptor.
+    TOK_UNCOMBINE,       // request: expand the next token into its fragments
+    TOK_UNCOMBINE_END,   // harness-injected: end of the injected fragment span
+    TOK_COMBINE,         // request: contract the following fragment span into its token(s)
+    TOK_COMBINE_END,     // end of the fragment span to contract
     TOK_RESERVED_4, TOK_RESERVED_5, TOK_RESERVED_6, TOK_RESERVED_7,
     TOK_RESERVED_8, TOK_RESERVED_9,
 

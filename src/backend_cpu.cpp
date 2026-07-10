@@ -517,6 +517,15 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     return out;
 }
 
+// Count of ACTIVE (non-ignored) target positions -- the normalizer both the forward loss and the
+// CrossEnt backward divide by, so they must agree. A target < 0 (LOSS_IGNORE_INDEX) is masked out.
+// With no masking this is just T (identical to the pre-masking behavior).
+static int ce_active(const int* targets, int T) {
+    int a = 0;
+    for (int t = 0; t < T; ++t) a += (targets[t] >= 0);
+    return a;
+}
+
 static Node* op_cross_entropy(Node* logits, const int* targets) {
     const int T = logits->rows, V = logits->cols;
     Node* loss = mk_node(Op::CrossEnt, 1, 1);
@@ -527,6 +536,8 @@ static Node* op_cross_entropy(Node* logits, const int* targets) {
     for (int t = 0; t < T; ++t) {
         const float* __restrict lr = logits->data.data() + (size_t)t * V;
         float* __restrict pr       = probs.data() + (size_t)t * V;
+        // A masked position still gets its softmax computed (so backward's scratch is populated
+        // uniformly) but contributes no loss; backward likewise skips it.
         float mx = -1e30f;
         for (int j = 0; j < V; ++j) mx = std::max(mx, lr[j]);
         float Z = 0.f;
@@ -538,9 +549,10 @@ static Node* op_cross_entropy(Node* logits, const int* targets) {
         }
         const float invZ = 1.f / Z;
         for (int j = 0; j < V; ++j) pr[j] *= invZ;
-        total += -std::log(std::max(1e-9f, probs[(size_t)t * V + targets[t]]));
+        if (targets[t] >= 0)                                   // skip LOSS_IGNORE_INDEX positions
+            total += -std::log(std::max(1e-9f, probs[(size_t)t * V + targets[t]]));
     }
-    loss->data[0] = total / T;
+    loss->data[0] = total / static_cast<float>(std::max(1, ce_active(targets, T)));
     return loss;
 }
 
@@ -781,13 +793,18 @@ static void backward_node(Node& n) {
         Node* logits = n.a;
         const int T = logits->rows, V = logits->cols;
         std::span<float> probs = n.scratch;
-        float g = n.grad[0] / T;
+        // Divide by the SAME active count the forward used (recomputed from ids, O(T)), so a masked
+        // position dilutes neither the loss nor the gradient. A masked row (n.ids[t] < 0) is skipped
+        // entirely, leaving its logit-grad at the arena's zero (graph_reset zeroes grads) -- no signal.
+        const float g = n.grad[0] / static_cast<float>(std::max(1, ce_active(n.ids, T)));
         Mat lg = mat(logits->grad, T, V);
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            if (n.ids[t] < 0) continue;                       // LOSS_IGNORE_INDEX: zero gradient row
             for (int j = 0; j < V; ++j) {
                 float p = probs[(size_t)t * V + j];
                 lg[t, j] += g * (p - (j == n.ids[t] ? 1.f : 0.f));
             }
+        }
         break;
     }
     }
@@ -1181,20 +1198,35 @@ void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.get()); }
 // thread into a private gradient accumulator, then the accumulators are summed into
 // the shared gradient. Returns the mean loss; call AdamW::step() afterwards. When
 // `lengths` is given, window b trains at its own length lengths[b] (<= T) -- so a short
-// document trains on exactly its tokens with no padding (the CPU processes each window
-// independently, so it needs no loss mask, unlike the batched GPU path).
-float train_batch(const int* data, const std::size_t* starts, int batch, int T, const int* lengths) {
+// document trains on exactly its tokens with no padding (an END mask). `loss_mask`, if given,
+// is an INTERIOR mask: a per-token 0/1 array parallel to `data` where predicting token p counts
+// only if loss_mask[p] != 0 -- masked target positions become LOSS_IGNORE_INDEX, which
+// op_cross_entropy skips (no loss, no grad) and normalizes around. null = today's behavior.
+float train_batch(const int* data, const std::size_t* starts, int batch, int T,
+                  const int* lengths, const std::uint8_t* loss_mask) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
         ensure_thread_built();
         std::ranges::fill(W->grad, 0.f);
+        // Per-window targets buffer (only when masking): reused across this thread's windows, and
+        // read by op_cross_entropy/backward within the SAME iteration before it is next resized.
+        thread_local std::vector<int> masked_tgt;
         #pragma omp for reduction(+ : total) schedule(static)
         for (int b = 0; b < batch; ++b) {
             const int Tb = lengths ? lengths[b] : T;
+            const int* tgt = data + starts[b] + 1;
+            if (loss_mask) {
+                masked_tgt.resize(static_cast<std::size_t>(Tb));
+                for (int i = 0; i < Tb; ++i) {
+                    const std::size_t p = starts[b] + static_cast<std::size_t>(i) + 1;
+                    masked_tgt[static_cast<std::size_t>(i)] = loss_mask[p] ? data[p] : LOSS_IGNORE_INDEX;
+                }
+                tgt = masked_tgt.data();
+            }
             graph_reset();
             Node* logits = g_model.forward(data + starts[b], Tb);
-            Node* loss   = op_cross_entropy(logits, data + starts[b] + 1);
+            Node* loss   = op_cross_entropy(logits, tgt);
             total += loss->data[0];
             backward(loss, 1.f / static_cast<float>(batch));
         }

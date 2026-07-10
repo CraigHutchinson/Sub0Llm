@@ -39,10 +39,10 @@ std::string marker_literal(TokenId id) {
         case TOK_GLUE_CBRACKET:   return "]";
         case TOK_GLUE_OBRACE:     return "{";
         case TOK_GLUE_CBRACE:     return "}";
-        case TOK_RESERVED_0:      return "<|reserved_0|>";
-        case TOK_RESERVED_1:      return "<|reserved_1|>";
-        case TOK_RESERVED_2:      return "<|reserved_2|>";
-        case TOK_RESERVED_3:      return "<|reserved_3|>";
+        case TOK_UNCOMBINE:       return "<|uncombine|>";
+        case TOK_UNCOMBINE_END:   return "<|/uncombine|>";
+        case TOK_COMBINE:         return "<|combine|>";
+        case TOK_COMBINE_END:     return "<|/combine|>";
         case TOK_RESERVED_4:      return "<|reserved_4|>";
         case TOK_RESERVED_5:      return "<|reserved_5|>";
         case TOK_RESERVED_6:      return "<|reserved_6|>";
