@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <span>
 #include <sstream>
@@ -127,7 +128,7 @@ TEST_CASE("case markers keep the word token case-shared", "[tok]") {
     const std::vector<int> cap = sub0::tok::encode(t, "They");
     REQUIRE_FALSE(low.empty());
     REQUIRE(cap.size() == low.size() + 1);   // a leading <|cap|> marker, same tail
-    REQUIRE(cap.front() == t.cap_id);
+    REQUIRE(cap.front() == sub0::casing::TOK_CAP);
     REQUIRE(std::vector<int>(cap.begin() + 1, cap.end()) == low);
 }
 
@@ -142,22 +143,33 @@ TEST_CASE("encode is deterministic", "[tok]") {
 
 TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
-    REQUIRE(t.join_id >= 0);
-    REQUIRE(t.n_base == 270);                 // 256 bytes + 14 markers (incl. eos_id)
-    REQUIRE(t.eos_id == 256);                 // FIRST marker, right after the byte range (see casing.hpp)
-    REQUIRE(t.cap_id == 257);
-    REQUIRE(t.up_id == 258);
-    REQUIRE(t.join_id == 259);
-    REQUIRE(t.newline_id == 260);
-    REQUIRE(t.para_id == 261);
-    REQUIRE(t.odquote_id == 262);
-    REQUIRE(t.cdquote_id == 263);
-    REQUIRE(t.spell_start_id == 264);
-    REQUIRE(t.spell_end_id == 265);
-    REQUIRE(t.space2_id == 266);
-    REQUIRE(t.space4_id == 267);
-    REQUIRE(t.tab2_id == 268);
-    REQUIRE(t.tab4_id == 269);
+    REQUIRE(sub0::casing::TOK_JOIN >= 0);
+    REQUIRE(t.n_base == 288);                 // 256 bytes + 32 markers (14 original + 2 turn + 6 bracket-glue + 10 reserved)
+    REQUIRE(sub0::casing::TOK_EOS == 256);                 // FIRST marker, right after the byte range (see casing.hpp)
+    REQUIRE(sub0::casing::TOK_CAP == 257);
+    REQUIRE(sub0::casing::TOK_UP == 258);
+    REQUIRE(sub0::casing::TOK_JOIN == 259);
+    REQUIRE(sub0::casing::TOK_NEWLINE == 260);
+    REQUIRE(sub0::casing::TOK_PARA == 261);
+    REQUIRE(sub0::casing::TOK_ODQUOTE == 262);
+    REQUIRE(sub0::casing::TOK_CDQUOTE == 263);
+    REQUIRE(sub0::casing::TOK_SPELL_START == 264);
+    REQUIRE(sub0::casing::TOK_SPELL_END == 265);
+    REQUIRE(sub0::casing::TOK_SPACE2 == 266);
+    REQUIRE(sub0::casing::TOK_SPACE4 == 267);
+    REQUIRE(sub0::casing::TOK_TAB2 == 268);
+    REQUIRE(sub0::casing::TOK_TAB4 == 269);
+    REQUIRE(sub0::casing::TOK_TURN_START == 270);
+    REQUIRE(sub0::casing::TOK_TURN_END == 271);
+    REQUIRE(sub0::casing::TOK_GLUE_OPAREN == 272);
+    REQUIRE(sub0::casing::TOK_GLUE_CPAREN == 273);
+    REQUIRE(sub0::casing::TOK_GLUE_OBRACKET == 274);
+    REQUIRE(sub0::casing::TOK_GLUE_CBRACKET == 275);
+    REQUIRE(sub0::casing::TOK_GLUE_OBRACE == 276);
+    REQUIRE(sub0::casing::TOK_GLUE_CBRACE == 277);
+    REQUIRE(sub0::casing::TOK_RESERVED_0 == 278);
+    REQUIRE(sub0::casing::TOK_RESERVED_9 == 287);
+    REQUIRE(sub0::casing::TOK_MARKER_COUNT == 288);
     REQUIRE(t.vocab > t.n_base);              // merges still learned on top
 }
 
@@ -168,11 +180,37 @@ TEST_CASE("JOIN scheme: complete base alphabet + markers", "[tok][join]") {
 TEST_CASE("JOIN scheme: round-trips the literal <|endoftext|> EOS marker", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<int> ids = sub0::tok::encode(t, "the dog ran <|endoftext|> the cat slept");
-    REQUIRE(std::count(ids.begin(), ids.end(), t.eos_id) == 1);   // collapses to exactly one token
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_EOS) == 1);   // collapses to exactly one token
     REQUIRE(round_trips(t, "the dog ran <|endoftext|> the cat slept"));
     REQUIRE(round_trips(t, "word <|endoftext|>"));                // pending space before EOS (the bug)
     REQUIRE(round_trips(t, "<|endoftext|>word"));                 // EOS glued to the next word
     REQUIRE(round_trips(t, "one<|endoftext|>\ntwo<|endoftext|>\n"));  // back-to-back documents
+}
+
+// Stage 2: the ChatML-adopted turn markers, verbatim literal match (see casing.hpp's TOK_TURN_START
+// comment) -- same worked-example shape as the EOS test above (bare, isolation, pending-space,
+// glued), plus the specific adjacency the design requires: TOK_TURN_START glues to the role word
+// that follows it (no space token/JOIN needed), and TOK_TURN_END glues to whatever precedes it.
+TEST_CASE("JOIN scheme: round-trips the literal <|im_start|>/<|im_end|> turn markers", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::vector<int> ids = sub0::tok::encode(t, "<|im_start|>user\nhello<|im_end|>");
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_TURN_START) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_TURN_END) == 1);
+    // TOK_TURN_START is immediately followed by the role word with NO JOIN -- the role text is
+    // glued directly onto the marker, same as ChatML's own "<|im_start|>user" (no space).
+    const auto start_it = std::find(ids.begin(), ids.end(), sub0::casing::TOK_TURN_START);
+    REQUIRE(start_it != ids.end());
+    REQUIRE(*(start_it + 1) != sub0::casing::TOK_JOIN);
+    REQUIRE(round_trips(t, "<|im_start|>user\nhello<|im_end|>"));
+    REQUIRE(round_trips(t, "<|im_start|>system\nyou are helpful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>"));
+    REQUIRE(round_trips(t, "word <|im_end|>"));                   // pending space before END (mirrors EOS)
+    REQUIRE(round_trips(t, "<|im_start|>word"));                  // START glued to the next word
+    REQUIRE(round_trips(t, "a full chat: <|im_start|>assistant\nHi there!<|im_end|>"));  // punctuation-adjacent
+    // A full multi-turn round-trip -- the realistic shape this marker family exists for.
+    REQUIRE(round_trips(t,
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n"
+        "<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n"));
 }
 
 // Mechanism test (user request 2026-07-02): prove the FULL training-corpus pipeline actually lets
@@ -193,7 +231,7 @@ TEST_CASE("training pipeline: EOS is a reachable, in-window target (not cut off)
     // chance, so a target of eos_id is guaranteed whenever the sampler resolves into document 0.
     const std::string mini = "the cat sat .<|endoftext|>\nthe dog ran .<|endoftext|>\n";
     const std::vector<int> ids32 = sub0::tok::encode(t, mini);
-    REQUIRE(std::count(ids32.begin(), ids32.end(), t.eos_id) == 2);
+    REQUIRE(std::count(ids32.begin(), ids32.end(), sub0::casing::TOK_EOS) == 2);
     const std::vector<std::int32_t> toks(ids32.begin(), ids32.end());
 
     std::vector<std::uint64_t> doc_starts{0u};
@@ -202,7 +240,7 @@ TEST_CASE("training pipeline: EOS is a reachable, in-window target (not cut off)
     REQUIRE(doc_starts.size() == 3);            // doc0 (seeded) + a boundary after each of the 2 EOS tokens
     // The boundary scan_doc_boundaries recorded for document 0 must point one-past a REAL eos_id in
     // the actual encoded stream -- not just an index that happens to satisfy the arithmetic.
-    REQUIRE(toks[doc_starts[1] - 1] == t.eos_id);
+    REQUIRE(toks[doc_starts[1] - 1] == sub0::casing::TOK_EOS);
 
     // sample_window must actually surface that position as a trainable target across real draws.
     std::mt19937 rng(11);
@@ -213,9 +251,27 @@ TEST_CASE("training pipeline: EOS is a reachable, in-window target (not cut off)
         REQUIRE(w.len >= 1);
         const std::size_t target_pos = w.start + static_cast<std::size_t>(w.len);
         REQUIRE(target_pos < toks.size());
-        if (toks[target_pos] == t.eos_id) saw_eos_target = true;
+        if (toks[target_pos] == sub0::casing::TOK_EOS) saw_eos_target = true;
     }
     REQUIRE(saw_eos_target);                    // the model DOES get trained on "last token -> EOS"
+}
+
+// TOK_TURN_END must stay a document-boundary NON-event: scan_doc_boundaries only recognizes
+// TOK_EOS (or a >=2 newline run) as a boundary, so a document containing chat turns doesn't get
+// spuriously chopped at every assistant-turn end -- that would break sample_window's within-one-
+// document guarantee for ordinary conversational documents. See casing.hpp's TOK_TURN_END comment.
+TEST_CASE("JOIN scheme: TOK_TURN_END is not treated as a document boundary", "[tok][join][window]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::string chat = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\nhi<|im_end|>\n";
+    const std::vector<int> ids32 = sub0::tok::encode(t, chat);
+    REQUIRE(std::count(ids32.begin(), ids32.end(), sub0::casing::TOK_TURN_END) == 2);
+    REQUIRE(std::count(ids32.begin(), ids32.end(), sub0::casing::TOK_EOS) == 0);
+    const std::vector<std::int32_t> toks(ids32.begin(), ids32.end());
+
+    std::vector<std::uint64_t> doc_starts{0u};
+    int nl_run = 0;
+    sub0::tok::scan_doc_boundaries(std::span<const std::int32_t>(toks), 0u, t, nl_run, doc_starts);
+    REQUIRE(doc_starts.size() == 1);            // just the seeded doc0 -- no TOK_TURN_END boundary fired
 }
 
 TEST_CASE("JOIN scheme: a single inter-word space costs no token", "[tok][join]") {
@@ -254,25 +310,25 @@ TEST_CASE("JOIN scheme: run-length whitespace tokens collapse indentation", "[to
 
     // 4-space indent after a newline -> NEWLINE + SPACE4 (was 1 nl byte + 4 space bytes).
     const std::vector<int> ind = enc("a\n    b");
-    REQUIRE(std::count(ind.begin(), ind.end(), t.newline_id) == 1);
-    REQUIRE(std::count(ind.begin(), ind.end(), t.space4_id) == 1);
+    REQUIRE(std::count(ind.begin(), ind.end(), sub0::casing::TOK_NEWLINE) == 1);
+    REQUIRE(std::count(ind.begin(), ind.end(), sub0::casing::TOK_SPACE4) == 1);
     REQUIRE(std::count(ind.begin(), ind.end(), ' ') == 0);    // no literal space bytes
     REQUIRE(round_trips(t, "a\n    b"));
 
     // Greedy tiling: 8->2xSPACE4, 6->SPACE4+SPACE2, 3->SPACE2+space, 2->SPACE2.
     const std::vector<int> sp8 = enc("a\n        b");
-    REQUIRE(std::count(sp8.begin(), sp8.end(), t.space4_id) == 2);
+    REQUIRE(std::count(sp8.begin(), sp8.end(), sub0::casing::TOK_SPACE4) == 2);
     REQUIRE(round_trips(t, "x        y"));                     // 8 spaces
     REQUIRE(round_trips(t, "x      y"));                       // 6 spaces
     REQUIRE(round_trips(t, "x   y"));                          // 3 spaces (SPACE2 + 1)
     const std::vector<int> sp2 = enc("x  y");                  // 2 spaces -> exactly one SPACE2
-    REQUIRE(std::count(sp2.begin(), sp2.end(), t.space2_id) == 1);
+    REQUIRE(std::count(sp2.begin(), sp2.end(), sub0::casing::TOK_SPACE2) == 1);
 
     // Tabs tile the same way; a single inter-word space is still implicit (free).
     const std::vector<int> tb4 = enc("a\t\t\t\tb");
-    REQUIRE(std::count(tb4.begin(), tb4.end(), t.tab4_id) == 1);
+    REQUIRE(std::count(tb4.begin(), tb4.end(), sub0::casing::TOK_TAB4) == 1);
     REQUIRE(round_trips(t, "a\t\tb\tc"));                      // TAB2 + lone tab byte
-    for (int id : enc("the dog ran")) REQUIRE(id != t.space2_id);   // single spaces never tile
+    for (int id : enc("the dog ran")) REQUIRE(id != sub0::casing::TOK_SPACE2);   // single spaces never tile
     REQUIRE(round_trips(t, "\n\t  mixed\n\n    indent\t\t"));  // mixed nl/tab/space + trailing
 }
 
@@ -292,9 +348,64 @@ TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip"
     std::istringstream is(os.str(), std::ios::binary);
     Tokenizer t2;
     REQUIRE(sub0::tok::deserialize(t2, is));
-    REQUIRE(t2.join_id >= 0);                  // scheme inferred from the base alphabet
-    REQUIRE(t2.join_id == t.join_id);
+    REQUIRE(t2.n_base == t.n_base);                        // base alphabet size survived the round-trip
     REQUIRE(round_trips(t2, "The cat, the dog.\nLine two here."));
+}
+
+// The runtime tokenizer only ever loads kind==1 (Unigram) -- a pre-WS2 file's legacy BPE-merge
+// encoding (kind 0) must be rejected outright, not decoded (there is no BPE word encoder left to
+// use it with). Corrupt a real, otherwise-valid blob at the exact `kind` field offset (magic +
+// kSchemeVersion + vocab + n_base, each a u32, then n_base u16 base-symbol codes) rather than
+// hand-building the whole binary format, so this stays correct if the format around it ever changes.
+TEST_CASE("deserialize rejects a legacy kind==0 (BPE) blob", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::string blob = os.str();
+    const std::size_t kind_offset = 4 + 4 + 4 + 4 + static_cast<std::size_t>(t.n_base) * 2;
+    REQUIRE(kind_offset + 4 <= blob.size());
+    REQUIRE(blob[kind_offset] == 1);       // sanity: this really is the kind byte, currently 1 (Unigram)
+    blob[kind_offset] = 0;                 // corrupt to the legacy BPE discriminator
+    std::istringstream is(blob, std::ios::binary);
+    Tokenizer t2;
+    REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
+}
+
+// Stage 2 bumped the magic "S0TE" -> "S0TF" (TOK_MARKER_COUNT grew 14 -> 32, shifting where
+// learned piece ids start) -- a stale pre-Stage-2 file must be rejected outright, not silently
+// misread with its piece ids offset by the wrong amount. Same discipline as the earlier
+// "S0TZ"->"S0TE" bump (see docs/TOKENIZER_REVIEW.md and the comment above serialize()).
+TEST_CASE("deserialize rejects a stale pre-Stage-2 (S0TE) magic", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::string blob = os.str();
+    REQUIRE(blob.size() >= 4);
+    std::uint32_t old_magic = 0x45543053u;  // "S0TE"
+    std::memcpy(blob.data(), &old_magic, sizeof old_magic);
+    std::istringstream is(blob, std::ios::binary);
+    Tokenizer t2;
+    REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
+}
+
+// learn_bpe_analysis() is analysis-only (--dump-vocab's A/B + vocab-curve tool, never the runtime
+// word encoder -- see its own doc comment in tokenizer.hpp) but was previously untested in either
+// direction. Sanity-check it still produces a coherent BpeAnalysisVocab: some merges learned, the
+// merge count matches vocab growth beyond the base alphabet, and the base alphabet itself is the
+// same fixed scheme learn() produces (base_symbol[i] == i for the whole base region).
+TEST_CASE("learn_bpe_analysis produces a sane analysis-only vocabulary", "[tok][bpe]") {
+    sub0::tok::Scan s;
+    s.add_names(kCorpus);
+    const auto attested = sub0::tok::derive_attested(s);
+    s.add_words(kCorpus, attested);
+    const sub0::tok::BpeAnalysisVocab bpe = sub0::tok::learn_bpe_analysis(s, /*vocab_target=*/600, /*min_merge=*/2);
+    REQUIRE(bpe.n_base > 0);
+    REQUIRE(bpe.vocab > bpe.n_base);                              // at least one merge was learned
+    REQUIRE(bpe.merges.size() == bpe.merge_count.size());
+    REQUIRE(static_cast<int>(bpe.merges.size()) == bpe.vocab - bpe.n_base);
+    REQUIRE(static_cast<int>(bpe.base_symbol.size()) == bpe.n_base);
+    REQUIRE(static_cast<int>(bpe.expansion.size()) == bpe.vocab);
+    for (int i = 0; i < bpe.n_base; ++i) REQUIRE(bpe.base_symbol[static_cast<std::size_t>(i)] == i);
 }
 
 TEST_CASE("JOIN scheme: encode is deterministic", "[tok][join]") {
@@ -345,8 +456,44 @@ TEST_CASE("JOIN scheme: directional double quotes round-trip + bundle spacing", 
     REQUIRE(round_trips(t, "no\"space\"quotes"));              // glue/glue -> bare fallback
     // ` "hi"` encodes the open as ONE OPEN_DQUOTE and the close as ONE CLOSE_DQUOTE (bundled).
     const std::vector<int> ids = sub0::tok::encode(t, "said \"hi\"");
-    REQUIRE(std::count(ids.begin(), ids.end(), t.odquote_id) == 1);
-    REQUIRE(std::count(ids.begin(), ids.end(), t.cdquote_id) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_ODQUOTE) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_CDQUOTE) == 1);
+}
+
+// Regression, from a real 100MB-TinyStories-dialogue re-measurement (docs/TOKENIZER_REVIEW.md
+// §5.8): a quote right after a bare '\n' (a new line/paragraph starting with dialogue) was 87.8% of
+// all fallback-to-bare-byte cases -- by far the dominant miss. FIXED: it now fires TOK_ODQUOTE
+// (preceded by its own TOK_NEWLINE, so the exact newline byte still round-trips). Pinned as the
+// corrected behavior.
+TEST_CASE("JOIN scheme: line-initial opening quote fires ODQUOTE, not a bare fallback", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::string x = "she said hello.\n\"Are you coming?\" he asked.";
+    const std::vector<int> ids = sub0::tok::encode(t, x);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_NEWLINE) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_ODQUOTE) == 1);
+    // The NEWLINE must immediately precede the ODQUOTE -- this is specifically the "glue the
+    // newline's own token right up against the quote marker" mechanism, not just "both appear".
+    const auto nl_it = std::find(ids.begin(), ids.end(), sub0::casing::TOK_NEWLINE);
+    REQUIRE(nl_it != ids.end());
+    REQUIRE(*(nl_it + 1) == sub0::casing::TOK_ODQUOTE);
+    REQUIRE(round_trips(t, x));
+    REQUIRE(round_trips(t, "para one.\n\nparagraph two.\n\"Quoted at a fresh paragraph.\""));
+    REQUIRE(round_trips(t, "\"Quoted at the very start of the text.\" said no one."));
+}
+
+// Regression, same re-measurement: British/logical-style quoting (punctuation immediately after the
+// closing quote, e.g. `"Hello", she said`) was 8.6% of fallbacks -- a real but ~20x smaller effect
+// than the line-initial case above, left as documented, KNOWN, pinned behavior (not fixed -- a
+// correct general fix needs a broader trailing-punctuation-byte design, out of scope for this pass).
+TEST_CASE("JOIN scheme: British-style punctuation-after-close quote is a known bare fallback", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    // The OPEN quote is preceded by a space, so it fires normally (isolates the miss to CLOSE only).
+    const std::string x = "she said \"hello\", nodding.";
+    const std::vector<int> ids = sub0::tok::encode(t, x);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_ODQUOTE) == 1);   // open still fires fine
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_CDQUOTE) == 0);   // known miss, not fixed
+    REQUIRE(std::count(ids.begin(), ids.end(), '"') == 1);                        // the close falls back to a bare byte
+    REQUIRE(round_trips(t, x));   // still round-trips correctly, just at a higher token cost
 }
 
 TEST_CASE("JOIN scheme: SPELL encapsulation for long/OOV words round-trips", "[tok][join]") {
@@ -356,10 +503,10 @@ TEST_CASE("JOIN scheme: SPELL encapsulation for long/OOV words round-trips", "[t
     REQUIRE(round_trips(t, "pneumonoultramicroscopicsilicovolcanoconiosis"));
     // a long word splits into N>=3 BPE sub-tokens -> exactly one balanced SPELL_START/END pair.
     const std::vector<int> ids = sub0::tok::encode(t, "antidisestablishmentarianism");
-    REQUIRE(std::count(ids.begin(), ids.end(), t.spell_start_id) == 1);
-    REQUIRE(std::count(ids.begin(), ids.end(), t.spell_end_id) == 1);
-    REQUIRE(std::find(ids.begin(), ids.end(), t.spell_start_id)
-          < std::find(ids.begin(), ids.end(), t.spell_end_id));
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_SPELL_START) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_SPELL_END) == 1);
+    REQUIRE(std::find(ids.begin(), ids.end(), sub0::casing::TOK_SPELL_START)
+          < std::find(ids.begin(), ids.end(), sub0::casing::TOK_SPELL_END));
 }
 
 TEST_CASE("JOIN scheme: case carries across SPELL + quotes", "[tok][join]") {
@@ -375,12 +522,12 @@ TEST_CASE("JOIN scheme: CamelCase splits into per-segment case markers", "[tok][
     const Tokenizer t = sub0::tok::learn(kCorpus);
     // "NonCommercial" -> Non | Commercial : two capitalised segments -> two CAP markers.
     const std::vector<int> nc = sub0::tok::encode(t, "NonCommercial");
-    REQUIRE(std::count(nc.begin(), nc.end(), t.cap_id) == 2);
+    REQUIRE(std::count(nc.begin(), nc.end(), sub0::casing::TOK_CAP) == 2);
     REQUIRE(round_trips(t, "NonCommercial"));
     // "HTMLParser" -> HTML (acronym, UP) | Parser (CAP).
     const std::vector<int> hp = sub0::tok::encode(t, "HTMLParser");
-    REQUIRE(std::count(hp.begin(), hp.end(), t.up_id) == 1);
-    REQUIRE(std::count(hp.begin(), hp.end(), t.cap_id) == 1);
+    REQUIRE(std::count(hp.begin(), hp.end(), sub0::casing::TOK_UP) == 1);
+    REQUIRE(std::count(hp.begin(), hp.end(), sub0::casing::TOK_CAP) == 1);
     REQUIRE(round_trips(t, "HTMLParser"));
     // camelCase: a leading lowercase segment (no marker) + a capitalised one.
     REQUIRE(round_trips(t, "myAwesomeFunction"));
@@ -393,18 +540,58 @@ TEST_CASE("JOIN scheme: CamelCase splits into per-segment case markers", "[tok][
 TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     const std::vector<int> ss = sub0::tok::encode(t, "save_scan_state");
-    REQUIRE(std::count(ss.begin(), ss.end(), t.join_id) == 0);   // one unit, not save<J>_<J>scan...
+    REQUIRE(std::count(ss.begin(), ss.end(), sub0::casing::TOK_JOIN) == 0);   // one unit, not save<J>_<J>scan...
     REQUIRE(round_trips(t, "save_scan_state"));
     const std::vector<int> wk = sub0::tok::encode(t, "well-known");
-    REQUIRE(std::count(wk.begin(), wk.end(), t.join_id) == 0);
+    REQUIRE(std::count(wk.begin(), wk.end(), sub0::casing::TOK_JOIN) == 0);
     REQUIRE(round_trips(t, "well-known and non-commercial"));
     // A leading/trailing separator is NOT interior -> still splits off (round-trip holds).
     REQUIRE(round_trips(t, "--flag -x _leading trailing_"));
 }
 
+// WS5b: bracket-glue markers collapse the JOIN tax on a bracket glued directly to what precedes it.
+// Unlike quotes, `(`/`)`/`[`/`]`/`{`/`}` are already unambiguous distinct bytes, so these markers
+// exist purely to save tokens, not to disambiguate direction -- verify the SAVINGS directly (not
+// just round-trip), since that's the whole point of WS5b (see docs/TOKENIZER_REVIEW.md §5.9).
+TEST_CASE("JOIN scheme: bracket glue collapses the JOIN tax on glued brackets", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    // "f(x)" -- old: f,JOIN,(,JOIN,x,JOIN,) = 7 tokens. new: f,GLUE_OPAREN,x,GLUE_CPAREN = 4 tokens
+    // (assuming f/x are single-piece words in this tiny learned vocab -- checked structurally below,
+    // not by a hardcoded count, so this doesn't break if the vocab's piece-count for f/x ever shifts).
+    const std::vector<int> ids = sub0::tok::encode(t, "f(x)");
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_GLUE_OPAREN) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_GLUE_CPAREN) == 1);
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_JOIN) == 0);   // both JOINs eliminated
+    REQUIRE(round_trips(t, "f(x)"));
+
+    // A bracket preceded by a REAL space is NOT bundled (that spacing was already free/implicit) --
+    // falls through to the ordinary byte path unchanged, still round-trips, no glue marker fires.
+    const std::vector<int> spaced = sub0::tok::encode(t, "f (x)");
+    REQUIRE(std::count(spaced.begin(), spaced.end(), sub0::casing::TOK_GLUE_OPAREN) == 0);
+    REQUIRE(round_trips(t, "f (x)"));
+    REQUIRE(round_trips(t, "f( x )"));       // internally-spaced style: correctness, not optimized
+    REQUIRE(round_trips(t, "f( x)"));        // asymmetric: spaced-open, glued-close
+    REQUIRE(round_trips(t, "f(x )"));        // asymmetric: glued-open, spaced-close
+
+    // Nested and mixed families.
+    REQUIRE(round_trips(t, "((a))"));
+    REQUIRE(round_trips(t, "a[i]"));
+    REQUIRE(round_trips(t, "foo() {"));
+    REQUIRE(round_trips(t, "f(x) and (y)"));
+    REQUIRE(round_trips(t, "{code}[index]"));   // the exact case a first attempt at this got wrong
+    REQUIRE(round_trips(t, "std::vector<int> v(3);"));   // angle brackets stay excluded, unaffected
+    REQUIRE(round_trips(t, "map[key] = fn(a, b, {1, 2, 3});"));
+
+    // Brackets adjacent to quotes, case markers and SPELL groups -- the marker interactions WS5's
+    // own review flagged as worth checking explicitly, not just brackets in isolation.
+    REQUIRE(round_trips(t, "she said \"call foo(x)\" and left"));
+    REQUIRE(round_trips(t, "(Capitalized) and (ALLCAPS)"));
+    REQUIRE(round_trips(t, "(antidisestablishmentarianism)"));   // SPELL group inside parens
+}
+
 // Regression: an all-caps word + a possessive/contraction ("NASA's") truecases to UP + the
 // lowercase form, but word_unit_end keeps "nasa's" as ONE unit (interior apostrophe). UP must
-// stop at the apostrophe so the post-' "s" stays lowercase -- mirrors casing::detokenize.
+// stop at the apostrophe so the post-' "s" stays lowercase -- mirrors detokenize_join's UpWord rule.
 TEST_CASE("JOIN scheme: UP stops at an interior apostrophe", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     REQUIRE(round_trips(t, "THE's end"));                    // UP on THE, lowercase 's (the NASA's bug)

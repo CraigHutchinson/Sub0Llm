@@ -132,13 +132,33 @@ endif()
 # registry (model identity/compat), casing. Factored out so BOTH the configurator and the runtime engine
 # share ONE definition, and so the engine-free tests cover it without building the engine. Depends only
 # on the standard library (no generated config), so the configurator links it without the engine.
-add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp)
+add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp)
 target_include_directories(sub0_frontend PUBLIC "${CMAKE_SOURCE_DIR}/include")
 set_target_properties(sub0_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# WS6: casing.hpp's normalize_text/truecase_tokenize use `#pragma omp simd` (this project's
+# existing auto-vectorization convention, see src/backend_cpu.cpp) over their hot per-byte classify
+# loops. `sub0_frontend` never links the full OpenMP runtime (only sub0_core does, for the
+# data-parallel training path -- see cmake/OpenMP.cmake) -- without at least `-fopenmp-simd`, those
+# pragmas are silently inert (ignored, not an error) and the loops stay plain scalar. This flag
+# enables ONLY simd-pragma recognition, no threading runtime, so it's free to add here regardless
+# of whether the full OpenMP probe above succeeded.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-fopenmp-simd" SUB0_HAS_OPENMP_SIMD_FLAG)
+if(SUB0_HAS_OPENMP_SIMD_FLAG)
+  target_compile_options(sub0_frontend PRIVATE -fopenmp-simd)
+endif()
 
 add_executable(sub0llm-configure tools/configurator.cpp)
 target_include_directories(sub0llm-configure PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-configure PRIVATE CLI11::CLI11 sub0_frontend)
+
+# WS7: engine-free tokenizer inspection/interchange (docs/WORKFLOW_ARCHITECTURE.md's "Tokenizer /
+# vocab as engine-free frontend tools" section) -- links sub0_frontend only, same as
+# sub0llm-configure above, never the engine. Config-independent (no GEN_DIR dependency), unlike
+# sub0llm-configure below, since it only reads an already-built tokenizer.tok, not a corpus.
+add_executable(sub0llm-tokenizer tools/sub0llm-tokenizer.cpp)
+target_include_directories(sub0llm-tokenizer PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0_frontend)
 
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")

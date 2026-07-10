@@ -397,7 +397,7 @@ bool tok_stamp_matches(const std::string& path, const std::string& corpus,
 //                               by word count: the common "tion"/"ing"/"ience" chunks a sub-token
 //                               scheme would target, independent of the BPE merge ORDER. The basis for
 //                               a ground-up "longest common sub-section" vocabulariser.
-void dump_vocab_files(const tok::Scan& S, const tok::Tokenizer& tkz, const std::string& prefix) {
+void dump_vocab_files(const tok::Scan& S, const tok::BpeAnalysisVocab& tkz, const std::string& prefix) {
     auto vis = [](const std::string& k) {
         std::string o;
         for (unsigned char c : k) {
@@ -895,8 +895,7 @@ int main(int argc, char** argv) {
     // default), so learn a BPE tokenizer for the comparison here (it remaps S.word_syms to BPE ids,
     // which the A/B reads; the A/B re-learns Unigram internally).
     if (!dump_vocab.empty()) {
-        const tok::Tokenizer tkz_bpe = tok::learn(S, attested,
-            {vocab_target, min_merge, tok::LearnOptions::Method::BPE});
+        const tok::BpeAnalysisVocab tkz_bpe = tok::learn_bpe_analysis(S, vocab_target, min_merge);
         dump_vocab_files(S, tkz_bpe, dump_vocab);
         std::println(stderr, "vocab dumps written: {}.{{corpus_vocab,token_vocab,ngrams,vocab_curve,unigram_vocab}}.txt", dump_vocab);
         return 0;
@@ -1235,7 +1234,6 @@ int main(int argc, char** argv) {
     //     actually derived them; a reused tokenizer gets a short confirmation instead).
     if (!reused) {
         const auto& word_syms   = S.word_syms;
-        const auto& merges      = tkz.merges;
         const sub0::casing::TokStats& st = S.st;
         const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
         const long long quote_repl = S.quote_repl;
@@ -1251,7 +1249,7 @@ int main(int argc, char** argv) {
         std::println(stderr, "  collapsed <|cap|> / <|up|>:    {} / {}", st.cap, st.up);
         std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
         std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
-        std::println(stderr, "base symbols / merges / vocab:   {} / {} / {}", n_base, merges.size(), vocab);
+        std::println(stderr, "base symbols / word pieces / vocab: {} / {} / {}", n_base, vocab - n_base, vocab);
         // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme this is the
         // word-encoding lever: N=1 bare, N=2 one JOIN, N>=3 SPELL-encapsulated -- so N>=3 is the SPELL
         // rate. Frequency-weighted, so it reflects the real token stream (common words dominate).

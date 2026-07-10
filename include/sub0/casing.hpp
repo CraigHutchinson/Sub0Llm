@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -19,59 +21,138 @@
 
 namespace sub0::casing {
 
-// Explicit end-of-document marker: the literal `<|endoftext|>` (the standard GPT-2/3 stop
-// signal), inserted by the corpus extraction scripts BETWEEN documents (scripts/get_fineweb.py,
-// scripts/get_tinystories.py) -- an unambiguous boundary, unlike a bare blank line, which also
-// occurs mid-document as an ordinary paragraph break. Without this the model was never trained
-// on the pair "last real content token -> what comes next": sample_window's document-boundary
-// cap means the last trainable target inside a document is the document's own final token, so a
-// document literally has no "successor" in the training signal unless that final token IS this
-// marker. Collapses to one token like PARA/NEWLINE; the configurator's doc-boundary detection
-// prefers it over the "\n\n" heuristic when present (see tools/configurator.cpp), and gen stops
-// generating when it samples this token instead of running to a fixed budget.
-//
-// Deliberately the FIRST marker (id 256, right after the complete 0..255 byte range), not
-// appended after the others: this keeps base id == raw byte value for every byte token, with NO
-// offset to account for -- so char-level content stays directly discoverable in a raw dump of
-// corpus.tok (any token id < 256 IS that literal byte, no translation needed) and any future
-// tooling that masks/filters by id range (`id < 256` = raw byte, `id >= 256` = a marker/learned
-// piece) keeps working without adjustment. NUL (0x00, the classic C-string terminator -- the
-// same "0 means end" intuition EOS echoes) stays its own ordinary byte token at id 0, distinct
-// from eos_id (256): a stray NUL leaking into messy/binary-contaminated corpus data is NOT the
-// same event as an intentional document boundary, so it must not be silently treated as one.
-constexpr int TOK_EOS = 256;
+// The fixed token-id scheme: the complete 256-byte range (0..255, base id == byte value) plus
+// these named markers. Unscoped + auto-incrementing (only TOK_EOS has an explicit value, the
+// rest follow): auto-increment is what makes a duplicate value a compile-time impossibility
+// (plain `constexpr int`/`enum class` with hand-typed values does not -- C++ only diagnoses
+// duplicate *names*), and unscoped keeps every existing plain-`int` comparison site (elsewhere in
+// this file, tokenizer.cpp, engine_core.cpp) compiling unchanged -- see
+// docs/TOKENIZER_REVIEW.md §5.4/§5.5 for the full reasoning.
+enum TokenId : int {
+    // Deliberately the FIRST marker (id 256, right after the complete 0..255 byte range), not
+    // appended after the others: this keeps base id == raw byte value for every byte token, with
+    // NO offset to account for -- so char-level content stays directly discoverable in a raw dump
+    // of corpus.tok (any token id < 256 IS that literal byte, no translation needed) and any
+    // future tooling that masks/filters by id range (`id < 256` = raw byte, `id >= 256` = a
+    // marker/learned piece) keeps working without adjustment. NUL (0x00, the classic C-string
+    // terminator -- the same "0 means end" intuition EOS echoes) stays its own ordinary byte token
+    // at id 0, distinct from TOK_EOS (256): a stray NUL leaking into messy/binary-contaminated
+    // corpus data is NOT the same event as an intentional document boundary, so it must not be
+    // silently treated as one.
+    //
+    // Explicit end-of-document marker: the literal `<|endoftext|>` (the standard GPT-2/3 stop
+    // signal), inserted by the corpus extraction scripts BETWEEN documents
+    // (scripts/get_fineweb.py, scripts/get_tinystories.py) -- an unambiguous boundary, unlike a
+    // bare blank line, which also occurs mid-document as an ordinary paragraph break. Without
+    // this the model was never trained on the pair "last real content token -> what comes next":
+    // sample_window's document-boundary cap means the last trainable target inside a document is
+    // the document's own final token, so a document literally has no "successor" in the training
+    // signal unless that final token IS this marker. Collapses to one token like PARA/NEWLINE;
+    // the configurator's doc-boundary detection prefers it over the "\n\n" heuristic when present
+    // (see tools/configurator.cpp), and gen stops generating when it samples this token instead
+    // of running to a fixed budget.
+    TOK_EOS = 256,
 
-// Symbol codes for the two case markers, carried in the byte-symbol stream just
-// above the 0..255 byte range.
-constexpr int TOK_CAP = 257;  // next word: capitalize first letter  (<|cap|>)
-constexpr int TOK_UP  = 258;  // next word: upper-case the whole word (<|up|>)
+    // The two case markers, carried in the byte-symbol stream just above the 0..255 byte range.
+    TOK_CAP,  // next word: capitalize first letter  (<|cap|>)
+    TOK_UP,   // next word: upper-case the whole word (<|up|>)
 
-// JOIN-scheme spacing markers (symbol codes above the byte + case-marker range). The
-// implicit-space tokenizer makes a single inter-token space free; these specialise the
-// rest (see docs/TOKENIZER_DESIGN.md). Only minted when the join scheme is enabled.
-constexpr int TOK_JOIN    = 259;  // suppress the implicit inter-token space (glue / intra-word)
-constexpr int TOK_NEWLINE = 260;  // a single '\n'
-constexpr int TOK_PARA    = 261;  // a paragraph break "\n\n"
-constexpr int TOK_ODQUOTE = 262;  // opening double quote: ` "` (space-before, glue-after)
-constexpr int TOK_CDQUOTE = 263;  // closing double quote: `" ` (glue-before, space-after)
-constexpr int TOK_SPELL_START = 264;  // start of a spaceless group (N>=3 sub-token word; OOV/acronym/CamelCase)
-constexpr int TOK_SPELL_END   = 265;  // end of the spaceless group
-// Run-length whitespace tokens: a single inter-word space is free (implicit), but multi-space
-// runs (indentation, alignment) and tab runs otherwise cost one verbatim byte EACH. These tile
-// such runs greedily (4s before 2s, remainder as a verbatim byte) -- 2/4 cover the dominant
-// 2/4/8-wide indentation. The encoder only emits them for runs >= 2; a lone space/tab stays a
-// byte. See docs/TOKENIZER_DESIGN.md §6.
-constexpr int TOK_SPACE2 = 266;  // "  "   (two spaces)
-constexpr int TOK_SPACE4 = 267;  // "    " (four spaces)
-constexpr int TOK_TAB2   = 268;  // "\t\t"
-constexpr int TOK_TAB4   = 269;  // "\t\t\t\t"
+    // JOIN-scheme spacing markers (symbol codes above the byte + case-marker range). The
+    // implicit-space tokenizer makes a single inter-token space free; these specialise the
+    // rest (see docs/TOKENIZER_DESIGN.md).
+    TOK_JOIN,         // suppress the implicit inter-token space (glue / intra-word)
+    TOK_NEWLINE,      // a single '\n'
+    TOK_PARA,         // a paragraph break "\n\n"
+    TOK_ODQUOTE,      // opening double quote: ` "` (space-before, glue-after)
+    TOK_CDQUOTE,      // closing double quote: `" ` (glue-before, space-after)
+    TOK_SPELL_START,  // start of a spaceless group (N>=3 sub-token word; OOV/acronym/CamelCase)
+    TOK_SPELL_END,    // end of the spaceless group
 
-inline bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-inline bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
-inline bool          is_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }
-inline bool          is_space(unsigned char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
-inline unsigned char to_lower(unsigned char c) { return is_upper(c) ? static_cast<unsigned char>(c + 32) : c; }
-inline unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cast<unsigned char>(c - 32) : c; }
+    // Run-length whitespace tokens: a single inter-word space is free (implicit), but multi-space
+    // runs (indentation, alignment) and tab runs otherwise cost one verbatim byte EACH. These
+    // tile such runs greedily (4s before 2s, remainder as a verbatim byte) -- 2/4 cover the
+    // dominant 2/4/8-wide indentation. The encoder only emits them for runs >= 2; a lone
+    // space/tab stays a byte. See docs/TOKENIZER_DESIGN.md §6.
+    TOK_SPACE2,  // "  "   (two spaces)
+    TOK_SPACE4,  // "    " (four spaces)
+    TOK_TAB2,    // "\t\t"
+    TOK_TAB4,    // "\t\t\t\t"
+
+    // Conversational turn boundaries (Stage 2). Deliberately just 2 markers, not one per role:
+    // matches both ChatML (`<|im_start|>`/`<|im_end|>`) and Gemma (`<start_of_turn>`/
+    // `<end_of_turn>`) -- neither mints a per-role token id, the role name ("system"/"user"/
+    // "assistant"/"model"/"tool") flows through as ordinary text right after TOK_TURN_START, which
+    // the existing Unigram vocab already tokenizes fine with no new mechanism. Literal strings
+    // adopted verbatim from ChatML (not invented) so corpora that already ship in ChatML (much of
+    // SmolTalk/UltraChat/OASST) need no reformatting, and any future GGUF/HF export stays
+    // interoperable. TOK_TURN_END is kept distinct from TOK_EOS (not reused) even though both can
+    // end a document: matches ChatML/Llama-3 precedent and future instruction-tuning loss-masking
+    // needs a clean assistant-span boundary that a document-boundary marker can't double as. See
+    // docs/TOKENIZER_REVIEW.md §5.8.
+    TOK_TURN_START,  // `<|im_start|>` -- glued to the role word that follows (no space)
+    TOK_TURN_END,    // `<|im_end|>`   -- glued to the content that precedes it (no space)
+
+    // WS5b: bracket-glue markers (6 of the 16 reserved slots, RENAMED not inserted -- see the
+    // reserved-headroom comment this replaces below; n_base/TOK_MARKER_COUNT are unchanged by this,
+    // only kSchemeVersion bumps, since the base alphabet layout didn't move). `(` `[` `{` `)` `]`
+    // `}` are already unambiguous distinct bytes (unlike `"`), so unlike the quote markers these
+    // don't exist to disambiguate direction -- they exist purely to collapse the JOIN tax:
+    // `f(x)` cost 7 tokens (f,JOIN,(,JOIN,x,JOIN,)) before this, because EVERY zero-gap adjacency
+    // pays a JOIN. Each open-bracket marker fires when the byte is glued to what precedes it
+    // (mirrors TOK_CDQUOTE's trigger shape: `gap==0 && dps`) and, unlike a quote, ALSO clears `dps`
+    // afterward (mirrors TOK_ODQUOTE's/TOK_SPELL_START's after-effect: the content immediately
+    // inside typically glues too, e.g. "f(x" or "[i") -- so one marker absorbs BOTH the JOIN that
+    // would precede the bracket AND the JOIN that would follow it. Each close-bracket marker fires
+    // on the same glued-before condition but leaves `dps` true afterward (closing brackets are
+    // typically followed by a space in real prose/code, ") the" / ") {"). A bracket preceded by a
+    // real space (not glued) is NOT bundled -- that spacing was already free (implicit) before this
+    // change and still falls through to the ordinary byte path unchanged, so "f( x )" still
+    // round-trips, just without the extra savings this only targets the measured glued case. See
+    // docs/TOKENIZER_REVIEW.md §5.9.
+    TOK_GLUE_OPAREN, TOK_GLUE_CPAREN,      // `(` `)` glued to what precedes
+    TOK_GLUE_OBRACKET, TOK_GLUE_CBRACKET,  // `[` `]` glued to what precedes
+    TOK_GLUE_OBRACE, TOK_GLUE_CBRACE,      // `{` `}` glued to what precedes
+
+    // Reserved headroom (Stage 2/3: reasoning delimiters like <think>/</think>, tool-call
+    // structure -- see docs/ROADMAP.md). Since this enum's own extension is ALREADY a forced
+    // re-tokenization (every learned piece id shifts, because pieces start at n_base), reserving
+    // slots now means a future marker family is a rename of an existing enumerator (nothing
+    // downstream shifts again), not another insertion (exactly what just happened above for the
+    // bracket-glue markers). Rounds the marker region to ~32 total, not Llama-3's 256-slot
+    // extravagance -- a reserved id is a dead vocab row, and at this project's tiny scale (vocab is
+    // a large fraction of total params at d128-d768) that isn't free. Each reserved id gets a
+    // base_symbol/expansion entry like any marker (required by the on-disk format) but no
+    // encode-side literal match and no decode-side effect (detokenize_join's switch has no case for
+    // it, and the fallback path explicitly no-ops any unassigned marker id rather than mis-decoding
+    // it as a byte -- see detokenize_join) until a future workstream gives one meaning.
+    TOK_RESERVED_0, TOK_RESERVED_1, TOK_RESERVED_2, TOK_RESERVED_3,
+    TOK_RESERVED_4, TOK_RESERVED_5, TOK_RESERVED_6, TOK_RESERVED_7,
+    TOK_RESERVED_8, TOK_RESERVED_9,
+
+    TOK_MARKER_COUNT,  // sentinel: one past the last marker id; also == n_base - 256
+};
+static_assert(TOK_MARKER_COUNT - TOK_EOS == 32,
+             "marker count drifted -- update learn()'s n_base assert and deserialize()'s "
+             "verification loop bound together (both derive from this same enum)");
+
+// Versions the encode_join/detokenize_join TRANSITION RULES (spacing FSM, quote directionality,
+// SPELL threshold, ...), independent of the base-alphabet layout above. Written into serialize()'s
+// existing output, so it rides the same fingerprint() hash -- no second, parallel reject mechanism
+// alongside the magic number.
+//   1 -> 2 (this bump): two transition-rule-only changes that do NOT touch n_base/base_symbol/
+//   TOK_MARKER_COUNT (so the magic number alone wouldn't catch them): the line-initial opening-quote
+//   fix (a quote right after a bare '\n' now fires TOK_ODQUOTE instead of falling back to a bare
+//   byte) and the WS5b bracket-glue markers (TOK_GLUE_OPAREN etc., renamed from previously-reserved,
+//   previously-inert slots into ones with real encode/decode effects -- see docs/TOKENIZER_REVIEW.md
+//   §5.8/§5.9). Bundled into one bump since both landed in the same pre-release Stage 2 diff.
+constexpr std::uint32_t kSchemeVersion = 2;
+
+constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
+constexpr bool          is_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }
+constexpr bool          is_space(unsigned char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
+constexpr unsigned char to_lower(unsigned char c) { return is_upper(c) ? static_cast<unsigned char>(c + 32) : c; }
+constexpr unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cast<unsigned char>(c - 32) : c; }
 
 // A "word byte" for pre-tokenization: ASCII letters plus any UTF-8 multibyte byte
 // (>= 0x80). Treating the continuation/lead bytes of accented letters as word
@@ -80,7 +161,7 @@ inline unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cas
 // -- is folded to ASCII by normalize_text first, so the only multibyte sequences
 // left in the stream are genuine letters and a few rare symbols.) Markers (>= 256)
 // are deliberately excluded so they stay atomic case operators.
-inline bool is_word_byte(int s) {
+constexpr bool is_word_byte(int s) {
     return s >= 0 && s <= 0xFF &&
            (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
 }
@@ -107,16 +188,31 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
     out.reserve(in.size());
     replaced = 0;
     const std::size_t n = in.size();
-    // TODO(simd, hot): this scans every corpus byte for two rare lead bytes (0xE2 UTF-8
-    // punct, 0x60 backtick). The fast path is "byte is neither" -- a vectorized scan
-    // (find the next 0xE2/0x60 with SSE/AVX, bulk-copy the run between) would cut this to
-    // near-memcpy speed on the >99% of bytes that pass through unchanged. Runs over the
-    // whole corpus during configuration.
-    for (std::size_t i = 0; i < n;) {
-        const unsigned char c = static_cast<unsigned char>(in[i]);
+    // WS6: this scans every corpus byte for two rare lead bytes (0xE2 UTF-8 punct, 0x60 backtick).
+    // The fast path is "byte is neither" -- >99% of real prose. Two-pass, matching this project's
+    // established `#pragma omp simd` auto-vectorization convention (see src/backend_cpu.cpp) rather
+    // than hand-written intrinsics: pass 1 is a branchless per-byte classify the compiler can
+    // vectorize (no data-dependent control flow, so it lowers to a compare+or over 16/32 bytes at
+    // once); pass 2 walks the resulting flags and BULK-copies each pass-through run in one
+    // `std::string::append` instead of one `push_back` per byte, then only re-examines the (rare)
+    // flagged positions with the original scalar replacement logic. `flag` is a plain byte array,
+    // not `std::vector<bool>` (bit-packed, defeats vectorization) -- it holds 0/1, not `bool`,
+    // because `#pragma omp simd` needs a type the compiler can write in wide, uniform lanes.
+    std::vector<unsigned char> flag(n);
+    const unsigned char* ip = reinterpret_cast<const unsigned char*>(in.data());
+    #pragma omp simd
+    for (std::size_t i = 0; i < n; ++i)
+        flag[i] = static_cast<unsigned char>((ip[i] == 0xE2) | (ip[i] == '`'));
+
+    std::size_t i = 0, run_start = 0;
+    while (i < n) {
+        if (!flag[i]) { ++i; continue; }
+        if (i > run_start) out.append(in, run_start, i - run_start);   // bulk-copy the pass-through run
+
+        const unsigned char c = ip[i];
         // General-punctuation block U+2013..U+2026 is encoded E2 80 xx.
-        if (c == 0xE2 && i + 2 < n && static_cast<unsigned char>(in[i + 1]) == 0x80) {
-            const unsigned char t = static_cast<unsigned char>(in[i + 2]);
+        if (c == 0xE2 && i + 2 < n && ip[i + 1] == 0x80) {
+            const unsigned char t = ip[i + 2];
             const char* rep = nullptr;
             switch (t) {
                 case 0x98: case 0x99: rep = "'";   break;  // ‘ ’ single quotes / apostrophe
@@ -125,12 +221,17 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
                 case 0xA6:            rep = "...";  break;  // … ellipsis
                 default: break;
             }
-            if (rep) { out += rep; ++replaced; i += 3; continue; }
+            if (rep) { out += rep; ++replaced; i += 3; run_start = i; continue; }
+            // An 0xE2 lead byte not followed by a recognized codepoint: falls through and is
+            // copied as its own single byte below, exactly like the pre-WS6 scalar behavior did
+            // (the loop there also just fell through to the unconditional push_back at the bottom).
+        } else if (c == '`') {
+            out.push_back('\''); ++replaced; ++i; run_start = i; continue;  // ASCII backtick
         }
-        if (c == '`') { out.push_back('\''); ++replaced; ++i; continue; }  // ASCII backtick
         out.push_back(static_cast<char>(c));
-        ++i;
+        ++i; run_start = i;
     }
+    if (n > run_start) out.append(in, run_start, n - run_start);   // final pass-through run
     return out;
 }
 
@@ -140,12 +241,14 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
 // "non-commercial") whole so BPE merges across them instead of paying a JOIN per separator
 // (each glued separator otherwise costs two JOIN tokens). A leading/trailing connector still
 // splits off (it is not flanked). See docs/TOKENIZER_DESIGN.md §8.
-inline bool is_interior_connector(int c) { return c == '\'' || c == '_' || c == '-'; }
+constexpr bool is_interior_connector(int c) { return c == '\'' || c == '_' || c == '-'; }
 
 // End (exclusive) of the word unit beginning at `s[i]`, or `i` itself if `s[i]`
 // does not start one. A unit is a maximal run of word bytes (see is_word_byte)
-// with interior connectors kept (see is_interior_connector).
-inline std::size_t word_unit_end(const std::vector<int>& s, std::size_t i) {
+// with interior connectors kept (see is_interior_connector). Read-only view -- `s` is
+// never mutated or resized here, so a span accepts a vector, a subrange, or any other
+// contiguous int buffer without a copy.
+inline std::size_t word_unit_end(std::span<const int> s, std::size_t i) {
     if (i >= s.size() || !is_word_byte(s[i])) return i;
     std::size_t j = i + 1;
     while (j < s.size()) {
@@ -187,13 +290,28 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
 //   - otherwise (names, mixed) -> emitted verbatim, so "Lily"/"Tom" stay atomic
 // Non-alpha bytes pass through unchanged. Output is a stream of byte values plus
 // the TOK_CAP/TOK_UP marker codes. `st` may be null when stats are not wanted.
-// TODO(simd/cuda, hot): the configurator runs normalize_text -> truecase_tokenize ->
-// encode over the WHOLE corpus (GBs). The pipeline is per-byte but EMBARRASSINGLY PARALLEL
-// across newline-aligned chunks (a newline never splits a word unit or the casing look-back),
-// which the configurator already exploits with std::thread. Two future levers: (1) SIMD the
-// alpha-run scan below (classify 16/32 bytes at once: is_alpha / is_upper masks drive the
-// run boundaries); (2) a CUDA tokenizer -- one block per chunk -- since the merge table +
-// attested set are read-only and the work is regular. Flagged for later (see TOKENIZER_REVIEW.md).
+// WS6/CUDA: the configurator runs normalize_text -> truecase_tokenize -> encode over the WHOLE
+// corpus (GBs). The pipeline is per-byte but EMBARRASSINGLY PARALLEL across newline-aligned chunks
+// (a newline never splits a word unit or the casing look-back), which the configurator already
+// exploits with std::thread. A future lever: a CUDA tokenizer -- one block per chunk -- since the
+// merge table + attested set are read-only and the work is regular. Flagged for later (see
+// TOKENIZER_REVIEW.md).
+//
+// WS6 investigated SIMD-ing this function and deliberately did NOT change it -- worth recording
+// why, so this isn't re-attempted blind. Measured on 500MB of real prose: the boundary-scan
+// (finding where each alpha run starts/ends) is only ~30% of this function's total cost; the
+// dominant cost is per-word case CLASSIFICATION (emit_word below: a lowercase copy, an `attested`
+// hash lookup), which is inherently NOT a SIMD target (branchy, allocates, hashes). Two rewrites
+// were tried and measured, not assumed: (1) a whole-text is_alpha/is_upper mask precomputed up
+// front -- net SLOWER, since `sub0_frontend` (this header's actual compile target) gets no OpenMP
+// flag by default (only `sub0_core` does, see cmake/OpenMP.cmake) so the `#pragma omp simd` was
+// inert, and the extra two n-sized allocations were pure overhead; (2) bulk-appending each run via
+// `resize`+store instead of one `push_back` per byte, even after adding `-fopenmp-simd` to
+// `sub0_frontend` and gating it behind a length threshold (push_back wins for the length-1 runs
+// that dominate real prose) -- an INTERLEAVED same-process A/B (this laptop has real thermal
+// confounds on separate sequential process runs, see the project's own perf-testing notes) showed
+// the "improved" version within +-3% of the original, i.e. noise, not a real win. Not worth the
+// added complexity for a measured non-result. See docs/TOKENIZER_REVIEW.md's WS6 section.
 inline std::vector<int> truecase_tokenize(const std::string& text,
                                           const std::unordered_set<std::string>& attested,
                                           TokStats* st) {
@@ -260,32 +378,6 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
         i = j;
     }
     return toks;
-}
-
-// Inverse of truecase_tokenize: markers retroactively re-case the following
-// alpha run. detokenize(truecase_tokenize(x)) == x for any text x.
-inline std::string detokenize(const std::vector<int>& toks) {
-    std::string out;
-    int pending = 0;  // 0 none, 1 cap (first letter), 2 up (whole run)
-    for (int t : toks) {
-        if (t == TOK_CAP) { pending = 1; continue; }
-        if (t == TOK_UP)  { pending = 2; continue; }
-        const unsigned char c = static_cast<unsigned char>(t);
-        if (pending == 1 && is_alpha(c)) {
-            out.push_back(static_cast<char>(to_upper(c)));
-            pending = 0;  // capitalize first letter only
-        } else if (pending == 2) {
-            if (is_alpha(c)) {
-                out.push_back(static_cast<char>(to_upper(c)));
-            } else {
-                pending = 0;  // run ended
-                out.push_back(static_cast<char>(c));
-            }
-        } else {
-            out.push_back(static_cast<char>(c));
-        }
-    }
-    return out;
 }
 
 }  // namespace sub0::casing

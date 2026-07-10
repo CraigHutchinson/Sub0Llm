@@ -32,39 +32,11 @@ std::string seq_key(const std::vector<int>& s) {
     return k;
 }
 
-// Apply learned merges to one pre-token word (a sequence of base ids), lowest rank
-// first, then append the resulting ids to `out`. Reproduces the corpus tokenization
-// for the same word so prompts stay in-distribution with training.
-//
-// TODO(perf, hot): this is O(N^2 * merges) per word -- each merge rescans every adjacent
-// pair for the lowest rank. It runs for EVERY word occurrence during corpus.tok emission
-// (configurator), but a corpus is Zipfian -- the same few thousand words dominate. The big
-// win is MEMOIZATION: cache word-bytes -> encoded ids (the unique-word table already exists
-// in Scan during learn; the emission path re-encodes from scratch). With a cache the
-// per-unique-word cost amortizes to ~zero. Secondary: a priority-queue / linked-list BPE
-// (as learn() already uses) removes the inner rescan for the rare long/OOV word.
-void bpe_encode_word(const Tokenizer& t, std::vector<int>& seq, std::vector<int>& out) {
-    while (seq.size() >= 2) {
-        int best_rank = std::numeric_limits<int>::max(), best_pos = -1;
-        for (std::size_t k = 0; k + 1 < seq.size(); ++k) {
-            const auto it = t.merge_rank.find({seq[k], seq[k + 1]});
-            if (it != t.merge_rank.end() && it->second < best_rank) {
-                best_rank = it->second;
-                best_pos  = static_cast<int>(k);
-            }
-        }
-        if (best_pos < 0) break;
-        seq[static_cast<std::size_t>(best_pos)] = t.n_base + best_rank;
-        seq.erase(seq.begin() + best_pos + 1);
-    }
-    for (int id : seq) out.push_back(id);
-}
-
 // Unigram word encoder: Viterbi-segment the byte run stream[lo,hi) into the min Σ −log p piece-id
 // sequence (piece_index / piece_logp). Every base byte is a candidate, so dp[L] is always reachable;
-// the explicit fallback keeps it total even if a byte were somehow absent. Replaces bpe_encode_word
-// when the tokenizer is in Unigram mode (t.max_piece > 0).
-void viterbi_encode_word(const Tokenizer& t, const std::vector<int>& stream, std::size_t lo, std::size_t hi,
+// the explicit fallback keeps it total even if a byte were somehow absent. The runtime tokenizer's
+// only word encoder (see tokenizer.hpp's Tokenizer/learn() doc comments).
+void viterbi_encode_word(const Tokenizer& t, std::span<const int> stream, std::size_t lo, std::size_t hi,
                          std::vector<int>& out) {
     const int    L   = static_cast<int>(hi - lo);
     const double INF = std::numeric_limits<double>::infinity();
@@ -89,7 +61,7 @@ void viterbi_encode_word(const Tokenizer& t, const std::vector<int>& stream, std
         }
     }
     if (dp[static_cast<std::size_t>(L)] == INF) {                       // unreachable -> raw bytes
-        for (int a = 0; a < L; ++a) out.push_back(t.byte_base[static_cast<std::size_t>(stream[lo + static_cast<std::size_t>(a)] & 0xFF)]);
+        for (int a = 0; a < L; ++a) out.push_back(stream[lo + static_cast<std::size_t>(a)] & 0xFF);  // base id == byte value
         return;
     }
     std::vector<int> rev;
@@ -230,112 +202,116 @@ std::unordered_set<std::string> derive_attested(const Scan& s, long long* withhe
 }
 
 // ============================================================================
-//  learn — base alphabet + incremental BPE
+//  learn — base alphabet + Unigram LM word-piece vocabulary (the runtime tokenizer)
 // ============================================================================
 
 Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
                 const LearnOptions& opts) {
     Tokenizer t;
 
-    // Fix the base alphabet. BPE tie-breaking is by (count, pair) on these byte-derived
-    // ids, so the merge sequence is deterministic and order-independent of the scan.
+    // Fix the base alphabet.
     //
-    // Every id assigned in this block is a SCHEME constant, not something discovered from the
-    // corpus: base id == byte value for the 256 raw bytes (no offset), and the 14 markers always
-    // register in this exact order right after them. So every *_id below is a direct assignment
-    // from the matching casing::TOK_* constexpr, not a value read back from the append -- these ids
-    // are determined by the tokenizer CODE version, the same for every corpus. add_marker still
-    // pushes each code into base_symbol/expansion (which genuinely are populated, not constant --
-    // expansion in particular gets extended further below with the corpus's own learned pieces).
-    t.byte_base.fill(-1);
-    auto add_marker = [&](int code) { t.base_symbol.push_back(code); };
-    for (int b = 0; b < 256; ++b) { t.byte_base[static_cast<std::size_t>(b)] = b; t.base_symbol.push_back(b); }
-    add_marker(TOK_EOS);         t.eos_id         = TOK_EOS;
-    add_marker(TOK_CAP);         t.cap_id         = TOK_CAP;
-    add_marker(TOK_UP);          t.up_id          = TOK_UP;
-    add_marker(TOK_JOIN);        t.join_id        = TOK_JOIN;
-    add_marker(TOK_NEWLINE);     t.newline_id     = TOK_NEWLINE;
-    add_marker(TOK_PARA);        t.para_id        = TOK_PARA;
-    add_marker(TOK_ODQUOTE);     t.odquote_id     = TOK_ODQUOTE;
-    add_marker(TOK_CDQUOTE);     t.cdquote_id     = TOK_CDQUOTE;
-    add_marker(TOK_SPELL_START); t.spell_start_id = TOK_SPELL_START;
-    add_marker(TOK_SPELL_END);   t.spell_end_id   = TOK_SPELL_END;
-    add_marker(TOK_SPACE2);      t.space2_id      = TOK_SPACE2;
-    add_marker(TOK_SPACE4);      t.space4_id      = TOK_SPACE4;
-    add_marker(TOK_TAB2);        t.tab2_id        = TOK_TAB2;
-    add_marker(TOK_TAB4);        t.tab4_id        = TOK_TAB4;
+    // Every id in this block is a SCHEME constant, not something discovered from the corpus: base
+    // id == symbol code for the whole fixed alphabet -- the 256 raw bytes (no offset) followed by
+    // the markers in exactly TokenId's declared order (TOK_EOS..TOK_MARKER_COUNT-1), which is why
+    // this is just two counting loops rather than one line per marker: base_symbol[i] == i holds
+    // uniformly across both ranges (verified the same way on load, see deserialize()).
+    for (int b = 0; b < 256; ++b) t.base_symbol.push_back(b);
+    for (int m = TOK_EOS; m < TOK_MARKER_COUNT; ++m) t.base_symbol.push_back(m);
     t.n_base = static_cast<int>(t.base_symbol.size());
-    assert(t.n_base == 270 && "base alphabet layout drifted: 256 bytes + 14 fixed markers");
+    assert(t.n_base == TOK_MARKER_COUNT && "base alphabet layout drifted from TokenId's declared markers");
 
     t.expansion.resize(static_cast<std::size_t>(t.n_base));
     for (int id = 0; id < t.n_base; ++id)
         t.expansion[static_cast<std::size_t>(id)] = {t.base_symbol[static_cast<std::size_t>(id)]};
 
-    // Unigram LM word vocabulary (the DEFAULT). Learn the pieces top-down from the RAW word table
-    // (no remap), then map them onto the base alphabet: a single-byte piece reuses its base id, a
-    // multi-byte piece becomes a new id. Word encoding is then Viterbi over piece_index/piece_logp
-    // (set up here) instead of the greedy merge replay -- globally occurrence-optimal, no dead slots.
-    if (opts.method == LearnOptions::Method::Unigram) {
-        std::vector<std::pair<std::string, long long>> words;
-        words.reserve(scan.word_syms.size());
-        for (std::size_t w = 0; w < scan.word_syms.size(); ++w) {
-            std::string s;
-            s.reserve(scan.word_syms[w].size());
-            for (int b : scan.word_syms[w]) s.push_back(static_cast<char>(b & 0xFF));
-            words.push_back({std::move(s), scan.word_freq[w]});
-        }
-        UnigramOptions uo;
-        uo.target          = opts.vocab_target;
-        uo.min_count       = opts.min_merge;
-        uo.min_word_freq   = opts.min_word_freq;      // learn-set reduction (huge corpora)
-        uo.max_learn_words = opts.max_learn_words;
-        uo.verbose         = opts.verbose;
-        const Unigram u = learn_unigram(words, uo);
-
-        double min_lp = 0.0;
-        for (double lp : u.logp) min_lp = std::min(min_lp, lp);
-        const float floor_lp = static_cast<float>(min_lp - 5.0);    // unseen bytes: usable but a last resort
-        t.piece_logp.assign(static_cast<std::size_t>(t.n_base), floor_lp);   // markers stay at floor (not in index)
-        for (int id = 0; id < u.size(); ++id) {
-            const std::string& s = u.token[static_cast<std::size_t>(id)];
-            const float lp = static_cast<float>(u.logp[static_cast<std::size_t>(id)]);
-            if (s.size() == 1) {
-                const int bid = t.byte_base[static_cast<unsigned char>(s[0])];
-                if (bid >= 0) { t.piece_logp[static_cast<std::size_t>(bid)] = lp; t.piece_index[s] = bid; }
-            } else {
-                const int pid = static_cast<int>(t.expansion.size());
-                std::vector<int> codes;
-                codes.reserve(s.size());
-                for (char c : s) codes.push_back(static_cast<unsigned char>(c));
-                t.expansion.push_back(std::move(codes));
-                t.piece_logp.push_back(lp);
-                t.piece_index.emplace(s, pid);
-            }
-        }
-        // Every base byte must be a Viterbi candidate so any input segments, including a byte the
-        // corpus never showed (floor-scored single token).
-        for (int b = 0; b < 256; ++b) {
-            const int bid = t.byte_base[static_cast<std::size_t>(b)];
-            if (bid >= 0) t.piece_index.emplace(std::string(1, static_cast<char>(b)), bid);
-        }
-        t.max_piece = std::max(1, u.max_len);
-        t.vocab     = static_cast<int>(t.expansion.size());
-        // Remap the scan word table to the Viterbi piece-id segmentation (parallels the BPE remap), so
-        // the configurator emits / reports read final ids uniformly for both methods.
-        for (std::vector<int>& w : scan.word_syms) {
-            std::vector<int> ids;
-            viterbi_encode_word(t, w, 0, w.size(), ids);
-            w = std::move(ids);
-        }
-        t.attested  = attested;
-        t.loaded    = true;
-        return t;
+    // Unigram LM word vocabulary. Learn the pieces top-down from the RAW word table (no remap),
+    // then map them onto the base alphabet: a single-byte piece reuses its base id, a multi-byte
+    // piece becomes a new id. Word encoding is then Viterbi over piece_index/piece_logp (set up
+    // here) -- globally occurrence-optimal, no dead slots (unlike greedy BPE, see
+    // learn_bpe_analysis() below, which this runtime path no longer uses).
+    std::vector<std::pair<std::string, long long>> words;
+    words.reserve(scan.word_syms.size());
+    for (std::size_t w = 0; w < scan.word_syms.size(); ++w) {
+        std::string s;
+        s.reserve(scan.word_syms[w].size());
+        for (int b : scan.word_syms[w]) s.push_back(static_cast<char>(b & 0xFF));
+        words.push_back({std::move(s), scan.word_freq[w]});
     }
+    UnigramOptions uo;
+    uo.target          = opts.vocab_target;
+    uo.min_count       = opts.min_merge;
+    uo.min_word_freq   = opts.min_word_freq;      // learn-set reduction (huge corpora)
+    uo.max_learn_words = opts.max_learn_words;
+    uo.verbose         = opts.verbose;
+    const Unigram u = learn_unigram(words, uo);
 
-    // --- BPE (method == BPE): remap the word table to base ids, then greedy merge. Kept for the
-    //     vocabulary A/B + the bytes/token curve; no longer the default word encoder. ---
-    for (std::vector<int>& w : scan.word_syms)
-        for (int& s : w) s = t.byte_base[static_cast<std::size_t>(s)];
+    double min_lp = 0.0;
+    for (double lp : u.logp) min_lp = std::min(min_lp, lp);
+    const float floor_lp = static_cast<float>(min_lp - 5.0);    // unseen bytes: usable but a last resort
+    t.piece_logp.assign(static_cast<std::size_t>(t.n_base), floor_lp);   // markers stay at floor (not in index)
+    for (int id = 0; id < u.size(); ++id) {
+        const std::string& s = u.token[static_cast<std::size_t>(id)];
+        const float lp = static_cast<float>(u.logp[static_cast<std::size_t>(id)]);
+        if (s.size() == 1) {
+            const int bid = static_cast<unsigned char>(s[0]);   // base id == byte value
+            t.piece_logp[static_cast<std::size_t>(bid)] = lp;
+            t.piece_index[s] = bid;
+        } else {
+            const int pid = static_cast<int>(t.expansion.size());
+            std::vector<int> codes;
+            codes.reserve(s.size());
+            for (char c : s) codes.push_back(static_cast<unsigned char>(c));
+            t.expansion.push_back(std::move(codes));
+            t.piece_logp.push_back(lp);
+            t.piece_index.emplace(s, pid);
+        }
+    }
+    // Every base byte must be a Viterbi candidate so any input segments, including a byte the
+    // corpus never showed (floor-scored single token).
+    for (int b = 0; b < 256; ++b) t.piece_index.emplace(std::string(1, static_cast<char>(b)), b);
+    t.max_piece = std::max(1, u.max_len);
+    t.vocab     = static_cast<int>(t.expansion.size());
+    // Remap the scan word table to the Viterbi piece-id segmentation, so the configurator emits /
+    // reports read the final tokenized ids directly.
+    for (std::vector<int>& w : scan.word_syms) {
+        std::vector<int> ids;
+        viterbi_encode_word(t, w, 0, w.size(), ids);
+        w = std::move(ids);
+    }
+    t.attested = attested;
+    t.loaded   = true;
+    return t;
+}
+
+Tokenizer learn(std::string_view corpus, const LearnOptions& opts) {
+    Scan s;
+    s.add_names(corpus);
+    const std::unordered_set<std::string> attested = derive_attested(s);
+    s.add_words(corpus, attested);
+    return learn(s, attested, opts);
+}
+
+// ============================================================================
+//  learn_bpe_analysis — offline greedy-merge BPE (--dump-vocab A/B + curve only)
+// ============================================================================
+
+BpeAnalysisVocab learn_bpe_analysis(Scan& scan, int vocab_target, int min_merge) {
+    BpeAnalysisVocab t;
+
+    // Same fixed base alphabet as learn() above (see its comment) -- duplicated, not shared, since
+    // Tokenizer and BpeAnalysisVocab are different types with no common base; this is the one
+    // remaining place BPE tie-breaking needs base id == symbol code to be deterministic.
+    for (int b = 0; b < 256; ++b) t.base_symbol.push_back(b);
+    for (int m = TOK_EOS; m < TOK_MARKER_COUNT; ++m) t.base_symbol.push_back(m);
+    t.n_base = static_cast<int>(t.base_symbol.size());
+    assert(t.n_base == TOK_MARKER_COUNT && "base alphabet layout drifted from TokenId's declared markers");
+    t.expansion.resize(static_cast<std::size_t>(t.n_base));
+    for (int id = 0; id < t.n_base; ++id)
+        t.expansion[static_cast<std::size_t>(id)] = {t.base_symbol[static_cast<std::size_t>(id)]};
+
+    // Greedy merge over the word table (already base ids -- base id == byte value, so
+    // scan.word_syms's raw bytes need no remap).
     int vocab = t.n_base;
 
     std::vector<std::vector<int>>& word_syms = scan.word_syms;
@@ -365,7 +341,7 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
     std::unordered_set<std::pair<int, int>, PairHash> touched;
     std::unordered_map<std::pair<int, int>, int, PairHash> wd;
 
-    while (vocab < opts.vocab_target) {
+    while (vocab < vocab_target) {
         std::pair<int, int> best{0, 0}; long long best_c = -1;
         while (!heap.empty()) {
             const HeapItem top = heap.top();
@@ -373,7 +349,7 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
             if (it != pc.end() && it->second == top.count && top.count > 0) { best = top.pr; best_c = top.count; break; }
             heap.pop();
         }
-        if (best_c < opts.min_merge) break;
+        if (best_c < min_merge) break;
 
         const int new_id = vocab++;
         t.merges.push_back(best);
@@ -418,19 +394,7 @@ Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
     }
 
     t.vocab = vocab;
-    for (std::size_t i = 0; i < t.merges.size(); ++i)
-        t.merge_rank.emplace(t.merges[i], static_cast<int>(i));
-    t.attested = attested;
-    t.loaded   = true;
     return t;
-}
-
-Tokenizer learn(std::string_view corpus, const LearnOptions& opts) {
-    Scan s;
-    s.add_names(corpus);
-    const std::unordered_set<std::string> attested = derive_attested(s);
-    s.add_words(corpus, attested);
-    return learn(s, attested, opts);
 }
 
 // ============================================================================
@@ -445,21 +409,44 @@ inline bool is_ws_byte(int s) { return s == ' ' || s == '\t' || s == '\n' || s =
 
 // Pending re-casing the decoder applies to the next content, set by a CAP/UP marker.
 // CapFirst capitalises the first alpha letter then clears; UpWord upper-cases the alpha
-// run and clears at the first non-alpha or the word's end (mirrors casing::detokenize).
+// run and clears at the first non-alpha or the word's end.
 enum class Recase { None, CapFirst, UpWord };
+
+// Literal-matched structural markers: text the encoder recognizes whole, never case/BPE-processed.
+// NOT every marker is here -- only the ones identified by an exact text match (EOS, the turn
+// boundaries); JOIN/NEWLINE/quotes/SPELL/SPACE*/TAB* are derived from spacing CONTEXT instead (see
+// encode_join's tile_ws/quote-handling), so they don't belong in this table.
+struct LiteralMarker { std::string_view text; int id; };
+constexpr std::array<LiteralMarker, 3> kLiteralMarkers = {{
+    {"<|endoftext|>", TOK_EOS}, {"<|im_start|>", TOK_TURN_START}, {"<|im_end|>", TOK_TURN_END},
+}};
+
+// WS5b bracket-glue: byte -> marker id, one row per bracket, keyed by the literal byte value (NOT a
+// linear-scan table like kLiteralMarkers -- brackets are single bytes, not multi-byte literals, so a
+// direct switch/lookup is both simpler and cheaper). Angle brackets `<`/`>` are deliberately excluded
+// (too overloaded -- comparisons/generics/HTML, see docs/TOKENIZER_REVIEW.md §5.3).
+constexpr int glue_marker_for(int byte) {
+    switch (byte) {
+        case '(': return TOK_GLUE_OPAREN;   case ')': return TOK_GLUE_CPAREN;
+        case '[': return TOK_GLUE_OBRACKET; case ']': return TOK_GLUE_CBRACKET;
+        case '{': return TOK_GLUE_OBRACE;   case '}': return TOK_GLUE_CBRACE;
+        default:  return -1;
+    }
+}
+constexpr bool is_close_bracket(int byte) { return byte == ')' || byte == ']' || byte == '}'; }
 
 // JOIN-scheme encode. `stream` is the truecased byte+marker stream. The encoder mirrors the
 // decoder's pending-space state `dps` so it emits exactly the tokens that reconstruct the text:
 //  - a single inter-content space is implicit (no token); JOIN cancels a pending space (glue);
 //  - a lone '\n' -> NEWLINE, "\n\n" -> PARA, any other whitespace -> verbatim byte tokens;
 //  - a double quote with ` "x` spacing -> OPEN_DQUOTE, `x" ` -> CLOSE_DQUOTE (bundles the space);
-//  - a word of N BPE sub-tokens: N=1 bare, N=2 sub JOIN sub, N>=3 SPELL_START sub.. SPELL_END.
+//  - a word of N word-piece sub-tokens: N=1 bare, N=2 sub JOIN sub, N>=3 SPELL_START sub.. SPELL_END.
 // See docs/TOKENIZER_DESIGN.md §2-§5.
-void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector<int>& out) {
+void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<int>& out) {
     const std::size_t n = stream.size();
     bool dps = false;                 // decoder's pending_space after the last emitted token
-    std::vector<int> seq, sub;
-    auto emit_byte = [&](int b) { out.push_back(t.byte_base[static_cast<std::size_t>(b)]); };
+    std::vector<int> sub;
+    auto emit_byte = [&](int b) { out.push_back(b); };  // base id == byte value
     // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
     // implicit (free) under a pending space; an empty inter-content gap glues with JOIN; any
     // other run is tiled into NEWLINE/PARA + run-length SPACE2/4 / TAB2/4 tokens, with a verbatim
@@ -468,35 +455,28 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
     auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content) {
         const std::size_t gap = hi - lo;
         if (gap == 0) {
-            if (dps) { out.push_back(t.join_id); dps = false; }       // glue: cancel the pending space
+            if (dps) { out.push_back(TOK_JOIN); dps = false; }       // glue: cancel the pending space
             return;
         }
         if (inter_content && gap == 1 && stream[lo] == ' ' && dps) return;  // implicit single space
         for (std::size_t k = lo; k < hi;) {
             const int c = stream[k];
-            if (c == '\n' && k + 1 < hi && stream[k + 1] == '\n') { out.push_back(t.para_id);    k += 2; }
-            else if (c == '\n')                                   { out.push_back(t.newline_id); k += 1; }
+            if (c == '\n' && k + 1 < hi && stream[k + 1] == '\n') { out.push_back(TOK_PARA);    k += 2; }
+            else if (c == '\n')                                   { out.push_back(TOK_NEWLINE); k += 1; }
             else if (c == ' ') {
                 std::size_t run = 0; while (k + run < hi && stream[k + run] == ' ')  ++run;
-                for (; run >= 4; run -= 4, k += 4) out.push_back(t.space4_id);
-                for (; run >= 2; run -= 2, k += 2) out.push_back(t.space2_id);
+                for (; run >= 4; run -= 4, k += 4) out.push_back(TOK_SPACE4);
+                for (; run >= 2; run -= 2, k += 2) out.push_back(TOK_SPACE2);
                 if (run == 1) { emit_byte(' '); ++k; }
             } else if (c == '\t') {
                 std::size_t run = 0; while (k + run < hi && stream[k + run] == '\t') ++run;
-                for (; run >= 4; run -= 4, k += 4) out.push_back(t.tab4_id);
-                for (; run >= 2; run -= 2, k += 2) out.push_back(t.tab2_id);
+                for (; run >= 4; run -= 4, k += 4) out.push_back(TOK_TAB4);
+                for (; run >= 2; run -= 2, k += 2) out.push_back(TOK_TAB2);
                 if (run == 1) { emit_byte('\t'); ++k; }
             } else { emit_byte(c); ++k; }                            // '\r' or other whitespace byte
         }
         dps = false;
     };
-    // Literal end-of-document marker (the standard GPT-2/3 `<|endoftext|>` stop signal), inserted
-    // between documents by the corpus extraction scripts (see casing.hpp's TOK_EOS comment). All
-    // 13 bytes are ordinary ASCII, so without this check they would just fall through to normal
-    // word/byte encoding (an opaque, meaningless multi-token sequence to the model). Checked
-    // whole -- not case/BPE-processed -- so it collapses to exactly one token every time.
-    static constexpr char EOS_LITERAL[] = "<|endoftext|>";
-    constexpr std::size_t EOS_LEN = sizeof(EOS_LITERAL) - 1;   // exclude the trailing NUL
     std::size_t i = 0;
     while (i < n) {
         std::size_t g = i;
@@ -505,31 +485,77 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
             tile_ws(i, g, /*inter_content=*/false);
             break;
         }
-        if (g + EOS_LEN <= n &&
-            std::equal(EOS_LITERAL, EOS_LITERAL + EOS_LEN, stream.begin() + static_cast<std::ptrdiff_t>(g))) {
-            tile_ws(i, g, /*inter_content=*/true);
-            out.push_back(t.eos_id);
-            dps = false;
-            i = g + EOS_LEN;
-            continue;
+        // Literal structural markers (the standard GPT-2/3 `<|endoftext|>` stop signal, plus the
+        // ChatML-adopted turn markers, §5.6) -- all ordinary ASCII, so without this check they'd
+        // fall through to normal word/byte encoding (an opaque, meaningless multi-token sequence to
+        // the model). Checked whole -- not case/BPE-processed -- so each collapses to exactly one
+        // token. All three literals start with '<', which nothing else in ordinary prose does at a
+        // word-start position anywhere near as often -- gate the table scan behind that one byte
+        // compare so the common (non-'<') case is CHEAPER than the old unconditional EOS check, not
+        // more expensive, despite checking 3 literals instead of 1.
+        if (stream[g] == '<') {
+            bool matched = false;
+            for (const LiteralMarker& lm : kLiteralMarkers) {
+                if (g + lm.text.size() <= n &&
+                    std::equal(lm.text.begin(), lm.text.end(), stream.begin() + static_cast<std::ptrdiff_t>(g))) {
+                    tile_ws(i, g, /*inter_content=*/true);
+                    out.push_back(lm.id);
+                    dps = false;
+                    i = g + lm.text.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
         }
         // Directional double quote: bundle the common spacing into one OPEN/CLOSE token.
         if (stream[g] == '"') {
             const std::size_t gap = g - i;
             const bool after_glue = (g + 1 < n && !is_ws_byte(stream[g + 1]));
             if (gap == 1 && stream[i] == ' ' && dps && after_glue) {  // ` "x` -> OPEN
-                out.push_back(t.odquote_id); dps = false; i = g + 1; continue;
+                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
+            }
+            // Line-initial opening quote (measured on real TinyStories dialogue: 55389/576762 = 9.6%
+            // of ALL quote occurrences -- 87.8% of the fallback total, by far the dominant miss, see
+            // docs/TOKENIZER_REVIEW.md §5.8). A quote right after a single '\n' is OPEN-shaped
+            // (glued to the content that follows) but the plain OPEN check above requires the
+            // preceding whitespace to literally BE a space, which a newline never is. The newline
+            // still needs its own NEWLINE token (its exact identity must survive the round-trip --
+            // reconstructing it as a plain space would silently flatten line structure), but the
+            // quote itself doesn't need `dps` to be true first: TOK_ODQUOTE's decoder only emits a
+            // leading space `if (dps)`, and `dps` is already false right after a NEWLINE (decode's
+            // own NEWLINE case sets it), so this is a pure win with NO decode-side change needed --
+            // it just recognizes a case the generic OPEN check couldn't reach.
+            if (gap == 1 && stream[i] == '\n' && after_glue) {  // "\n\"x" -> NEWLINE, then OPEN
+                out.push_back(TOK_NEWLINE);
+                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
             }
             if (gap == 0 && dps && !after_glue) {                     // `x" ` -> CLOSE
-                out.push_back(t.cdquote_id); dps = true; i = g + 1; continue;
+                out.push_back(TOK_CDQUOTE); dps = true; i = g + 1; continue;
             }
             // else: fall through to the bare-quote path
+        }
+        // Bracket glue (WS5b): collapse the JOIN tax on a bracket glued directly to what precedes it
+        // (`f(`, `)y`, `((`, ...) into ONE token, instead of [JOIN, byte]. Unlike the quote markers,
+        // this never needs to disambiguate direction (the byte itself already says open vs. close) --
+        // it exists purely to eliminate the JOIN. Only fires on the GENUINELY glued case (gap==0 &&
+        // dps): a bracket preceded by a real space ("f (x)") was already free before this and is left
+        // alone, falling through unchanged to the ordinary byte path below. An OPEN marker also clears
+        // `dps` afterward (mirrors TOK_ODQUOTE/TOK_SPELL_START: content right inside a bracket is
+        // typically glued too, "f(x" / "[i" -- one marker absorbs the JOIN on BOTH sides); a CLOSE
+        // marker leaves `dps` true (closing brackets are typically followed by a space in real
+        // prose/code, ") the" / ") {"). See docs/TOKENIZER_REVIEW.md §5.9.
+        if (const int gm = glue_marker_for(stream[g]); gm >= 0 && g == i && dps) {
+            out.push_back(gm);
+            dps = is_close_bracket(stream[g]);   // open -> false (glue-after too); close -> true
+            i = g + 1;
+            continue;
         }
         tile_ws(i, g, /*inter_content=*/true);
         i = g;
         // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
-            out.push_back(stream[i] == TOK_CAP ? t.cap_id : t.up_id);
+            out.push_back(stream[i]);
             ++i;
         }
         if (i >= n) break;
@@ -538,21 +564,14 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
             emit_byte(stream[i]); dps = true; ++i;
         } else {
             sub.clear();
-            if (t.max_piece > 0) {                      // Unigram: Viterbi over the raw word bytes
-                viterbi_encode_word(t, stream, i, end, sub);
-            } else {                                    // BPE: remap to base ids, greedy merge
-                seq.assign(stream.begin() + static_cast<std::ptrdiff_t>(i),
-                           stream.begin() + static_cast<std::ptrdiff_t>(end));
-                for (int& s : seq) s = t.byte_base[static_cast<std::size_t>(s)];
-                bpe_encode_word(t, seq, sub);
-            }
+            viterbi_encode_word(t, stream, i, end, sub);   // the runtime tokenizer's only word encoder
             const std::size_t N = sub.size();
             if (N >= 3) {                               // SPELL-encapsulate: 2 delimiters <= N-1 JOINs
-                out.push_back(t.spell_start_id);
+                out.push_back(TOK_SPELL_START);
                 for (int id : sub) out.push_back(id);
-                out.push_back(t.spell_end_id);
+                out.push_back(TOK_SPELL_END);
             } else if (N == 2) {                        // sun+day: a single JOIN between the two
-                out.push_back(sub[0]); out.push_back(t.join_id); out.push_back(sub[1]);
+                out.push_back(sub[0]); out.push_back(TOK_JOIN); out.push_back(sub[1]);
             } else {                                    // common single-token word
                 for (int id : sub) out.push_back(id);
             }
@@ -567,7 +586,7 @@ void encode_join(const Tokenizer& t, const std::vector<int>& stream, std::vector
 // spacing; SPELL_START..SPELL_END is a spaceless group (`in_spell`) whose sub-tokens glue with no
 // internal spaces; case markers re-case the upcoming word (CAP = first letter, UP = whole word,
 // carried across its JOINed / SPELL sub-tokens). detokenize_join(encode_join(x)) == normalize_text(x).
-std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
+std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
     std::string out;
     bool   dps = false;            // pending space before the next content token
     bool   in_spell = false;       // inside a SPELL_START..SPELL_END spaceless group
@@ -575,20 +594,50 @@ std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
     const std::size_t m = ids.size();
     for (std::size_t k = 0; k < m; ++k) {
         const int id = ids[k];
-        if (id == t.join_id)         { dps = false; continue; }
-        if (id == t.newline_id)      { out += '\n';   dps = false; recase = Recase::None; continue; }
-        if (id == t.para_id)         { out += "\n\n"; dps = false; recase = Recase::None; continue; }
-        if (id == t.eos_id)          { if (dps) out += ' '; out += "<|endoftext|>"; dps = false; recase = Recase::None; continue; }
-        if (id == t.space2_id)       { out += "  ";       dps = false; recase = Recase::None; continue; }
-        if (id == t.space4_id)       { out += "    ";     dps = false; recase = Recase::None; continue; }
-        if (id == t.tab2_id)         { out += "\t\t";     dps = false; recase = Recase::None; continue; }
-        if (id == t.tab4_id)         { out += "\t\t\t\t"; dps = false; recase = Recase::None; continue; }
-        if (id == t.cap_id)          { recase = Recase::CapFirst; continue; }
-        if (id == t.up_id)           { recase = Recase::UpWord;   continue; }
-        if (id == t.odquote_id)      { if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue; }
-        if (id == t.cdquote_id)      { out += '"'; dps = true; recase = Recase::None; continue; }
-        if (id == t.spell_start_id)  { if (dps) out += ' '; in_spell = true; dps = false; continue; }
-        if (id == t.spell_end_id)    { in_spell = false; dps = true; recase = Recase::None; continue; }
+        // Markers occupy a small, dense, compile-time-constant range (TOK_EOS..TOK_MARKER_COUNT-1)
+        // -- a switch here is a jump table the compiler can verify at compile time, unlike an
+        // if-chain against runtime fields. Ordinary content (piece ids >= n_base, or a raw byte
+        // < 256) is the overwhelmingly common case and falls straight to `default`.
+        switch (id) {
+            case TOK_JOIN:        dps = false; continue;
+            case TOK_NEWLINE:     out += '\n';   dps = false; recase = Recase::None; continue;
+            case TOK_PARA:        out += "\n\n"; dps = false; recase = Recase::None; continue;
+            case TOK_EOS:         if (dps) out += ' '; out += "<|endoftext|>"; dps = false; recase = Recase::None; continue;
+            case TOK_TURN_START:  if (dps) out += ' '; out += "<|im_start|>";  dps = false; recase = Recase::None; continue;
+            case TOK_TURN_END:    if (dps) out += ' '; out += "<|im_end|>";    dps = false; recase = Recase::None; continue;
+            case TOK_SPACE2:      out += "  ";       dps = false; recase = Recase::None; continue;
+            case TOK_SPACE4:      out += "    ";     dps = false; recase = Recase::None; continue;
+            case TOK_TAB2:        out += "\t\t";     dps = false; recase = Recase::None; continue;
+            case TOK_TAB4:        out += "\t\t\t\t"; dps = false; recase = Recase::None; continue;
+            case TOK_CAP:         recase = Recase::CapFirst; continue;
+            case TOK_UP:          recase = Recase::UpWord;   continue;
+            case TOK_ODQUOTE:     if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue;
+            case TOK_CDQUOTE:     out += '"'; dps = true; recase = Recase::None; continue;
+            case TOK_SPELL_START: if (dps) out += ' '; in_spell = true; dps = false; continue;
+            case TOK_SPELL_END:   in_spell = false; dps = true; recase = Recase::None; continue;
+            // WS5b bracket glue: unlike the quote/EOS markers above, these never check `dps` for a
+            // leading space -- encode only ever emits one when the bracket was ALREADY glued (gap==0
+            // && dps), so a leading space would be wrong by construction, not just unnecessary. Open
+            // markers clear dps (content right inside typically glues too); close markers leave it
+            // true (typically followed by a space). recase is deliberately left untouched (brackets
+            // don't interact with case markers in this encoder's own output).
+            case TOK_GLUE_OPAREN:   out += '('; dps = false; continue;
+            case TOK_GLUE_CPAREN:   out += ')'; dps = true;  continue;
+            case TOK_GLUE_OBRACKET: out += '['; dps = false; continue;
+            case TOK_GLUE_CBRACKET: out += ']'; dps = true;  continue;
+            case TOK_GLUE_OBRACE:   out += '{'; dps = false; continue;
+            case TOK_GLUE_CBRACE:   out += '}'; dps = true;  continue;
+            default: break;
+        }
+        // A marker id inside the fixed scheme range with no case above: reserved headroom the
+        // format has a base_symbol/expansion row for but no assigned effect yet (see casing.hpp's
+        // TOK_RESERVED_* comment). Its expansion is a single "byte" whose code is its own id
+        // (>255) -- falling through to the generic content path below would truncate that to
+        // `static_cast<unsigned char>`, emitting a wrong, wrapped-around byte instead of nothing.
+        // A trained model CAN sample one of these (they're real embedding/output rows), so this
+        // guard is reachable at gen time, not just a paranoia check. No-op until a future
+        // workstream assigns the id a real case above.
+        if (id >= TOK_EOS && id < TOK_MARKER_COUNT) continue;
         if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
             out += static_cast<char>(id); dps = false; recase = Recase::None; continue;
         }
@@ -604,7 +653,7 @@ std::string detokenize_join(const Tokenizer& t, const std::vector<int>& ids) {
         if (!in_spell) {
             dps = true;
             // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
-            if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == t.join_id)) recase = Recase::None;
+            if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == TOK_JOIN)) recase = Recase::None;
         }
     }
     return out;
@@ -620,20 +669,20 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
     const std::vector<int> stream = truecase_tokenize(norm, t.attested, nullptr);
 
     out.reserve(stream.size());
-    encode_join(t, stream, out);               // the JOIN encoder (handles word -> Viterbi/BPE internally)
+    encode_join(t, stream, out);               // the JOIN encoder (handles word -> Viterbi internally)
     return out;
 }
 
-std::string detokenize(const Tokenizer& t, const std::vector<int>& ids) {
+std::string detokenize(const Tokenizer& t, std::span<const int> ids) {
     return detokenize_join(t, ids);
 }
 
 void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_index,
-                         const Tokenizer& t, int& nl_run, std::vector<std::uint64_t>& doc_starts) {
-    const std::int32_t nl_id      = static_cast<std::int32_t>(t.byte_base[static_cast<unsigned char>('\n')]);
-    const std::int32_t para_id    = static_cast<std::int32_t>(t.para_id);
-    const std::int32_t newline_id = static_cast<std::int32_t>(t.newline_id);
-    const std::int32_t eos_id     = static_cast<std::int32_t>(t.eos_id);
+                         const Tokenizer&, int& nl_run, std::vector<std::uint64_t>& doc_starts) {
+    constexpr std::int32_t nl_id      = static_cast<std::int32_t>('\n');  // base id == byte value
+    constexpr std::int32_t para_id    = static_cast<std::int32_t>(TOK_PARA);
+    constexpr std::int32_t newline_id = static_cast<std::int32_t>(TOK_NEWLINE);
+    constexpr std::int32_t eos_id     = static_cast<std::int32_t>(TOK_EOS);
     for (std::size_t li = 0; li < toks.size(); ++li) {
         const std::int32_t tk = toks[li];
         if (tk == eos_id) {   // explicit marker: the NEXT token starts a new document
@@ -652,35 +701,37 @@ void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_
 }
 
 // ============================================================================
-//  Serialization (tokenizer.tok "S0TE" -- bumped from the pre-EOS "S0TZ": TOK_EOS's value (256)
-//  numerically coincides with the OLD scheme's TOK_CAP, so a stale pre-EOS file must be REJECTED
-//  outright rather than risk silently reinterpreting its CAP marker as EOS. See the TOK_EOS
-//  comment in casing.hpp and the eos_id verification below.)
+//  Serialization (tokenizer.tok "S0TF" -- bumped from "S0TE": Stage 2 (docs/TOKENIZER_REVIEW.md
+//  §5.8) extends TOK_MARKER_COUNT from 14 to 32 (turn markers + reserved headroom), which
+//  shifts where learned piece ids start (n_base changes) -- an old "S0TE" file's ids would silently
+//  misalign under the new scheme rather than fail to load, so it must be REJECTED outright, the
+//  same discipline as the earlier "S0TZ"->"S0TE" bump. See the TOK_EOS comment in casing.hpp and
+//  the base_symbol verification below. Carries kSchemeVersion right after the magic (see its own
+//  doc comment in casing.hpp) so a future transition-rule-only change has somewhere to signal from
+//  without needing another magic bump.)
 // ============================================================================
 
 void serialize(const Tokenizer& t, std::ostream& os) {
     auto wu32 = [&](std::uint32_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     auto wu16 = [&](std::uint16_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
     auto wf32 = [&](float v)         { os.write(reinterpret_cast<const char*>(&v), sizeof v); };
-    wu32(0x45543053u);  // "S0TE"
+    wu32(0x46543053u);  // "S0TF"
+    wu32(kSchemeVersion);
     wu32(static_cast<std::uint32_t>(t.vocab));
     wu32(static_cast<std::uint32_t>(t.n_base));
     for (int code : t.base_symbol) wu16(static_cast<std::uint16_t>(code));
-    // Word-vocabulary kind: 1 = Unigram (pieces + log-probs, the default), 0 = legacy BPE merges.
-    if (t.max_piece > 0) {
-        wu32(1u);
-        wu32(static_cast<std::uint32_t>(t.max_piece));
-        for (int id = 0; id < t.vocab; ++id)
-            wf32(id < static_cast<int>(t.piece_logp.size()) ? t.piece_logp[static_cast<std::size_t>(id)] : -1e30f);
-        for (int id = t.n_base; id < t.vocab; ++id) {              // each piece is a byte sequence
-            const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
-            wu16(static_cast<std::uint16_t>(e.size()));
-            for (int code : e) os.put(static_cast<char>(code & 0xFF));
-        }
-    } else {
-        wu32(0u);
-        wu32(static_cast<std::uint32_t>(t.merges.size()));
-        for (const auto& [a, b] : t.merges) { wu32(static_cast<std::uint32_t>(a)); wu32(static_cast<std::uint32_t>(b)); }
+    // Word-vocabulary kind: always 1 (Unigram, pieces + log-probs) -- the only runtime-loadable
+    // kind (see deserialize(), which rejects anything else outright). The discriminator itself
+    // stays in the format for forward compatibility, not because this build ever writes another
+    // value.
+    wu32(1u);
+    wu32(static_cast<std::uint32_t>(t.max_piece));
+    for (int id = 0; id < t.vocab; ++id)
+        wf32(id < static_cast<int>(t.piece_logp.size()) ? t.piece_logp[static_cast<std::size_t>(id)] : -1e30f);
+    for (int id = t.n_base; id < t.vocab; ++id) {              // each piece is a byte sequence
+        const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+        wu16(static_cast<std::uint16_t>(e.size()));
+        for (int code : e) os.put(static_cast<char>(code & 0xFF));
     }
     // Sorted so the artifact is byte-deterministic regardless of set iteration order;
     // membership is order-independent anyway.
@@ -706,72 +757,51 @@ bool deserialize(Tokenizer& out, std::istream& is) {
     auto ru32 = [&] { std::uint32_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto ru16 = [&] { std::uint16_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto rf32 = [&] { float v{};         is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
-    if (ru32() != 0x45543053u) return false;  // "S0TE" (a pre-EOS "S0TZ" file is rejected, not misread)
+    if (ru32() != 0x46543053u) return false;  // "S0TF" (a pre-Stage-2 "S0TE" file is rejected, not misread)
+    (void)ru32();  // kSchemeVersion: nothing to branch on yet (this build understands exactly one
+                    // version); read to keep the stream cursor aligned for the fields that follow.
 
     Tokenizer t;
     t.vocab  = static_cast<int>(ru32());
     t.n_base = static_cast<int>(ru32());
-    t.byte_base.fill(-1);
+    // The fixed scheme (256 raw bytes + the markers, TOK_EOS..TOK_MARKER_COUNT-1) must be fully
+    // present -- a corrupt/foreign/stale-version file is rejected outright, not partially read.
+    if (t.n_base < TOK_MARKER_COUNT) return false;
     t.base_symbol.resize(static_cast<std::size_t>(t.n_base));
     t.expansion.resize(static_cast<std::size_t>(t.n_base));
     for (int i = 0; i < t.n_base; ++i) {
         const int code = static_cast<int>(ru16());
         t.base_symbol[static_cast<std::size_t>(i)] = code;
         t.expansion[static_cast<std::size_t>(i)] = {code};
-        if (i < 256) {                    // base id == byte value with no offset (see learn())
-            if (code != i) return false;  // a corrupt/foreign file, not this scheme -- reject
-            t.byte_base[static_cast<std::size_t>(i)] = i;
-        }
+        // base id == symbol code across the WHOLE fixed scheme (bytes 0..255, then the markers) --
+        // a single uniform VERIFY, not a byte-range check plus a separate 14-way marker check (see
+        // learn(): base_symbol[i]==i holds identically for both ranges by construction). A corrupt
+        // or foreign file fails here, loudly, rather than silently misassigning ids -- e.g. this is
+        // exactly what stops a pre-EOS file's TOK_CAP=256 from being misread as TOK_EOS=256, on top
+        // of the magic-number bump above already rejecting it. Ids past TOK_MARKER_COUNT (learned
+        // pieces, or a future file's reserved-marker headroom this build doesn't know about yet)
+        // aren't checked here -- this build doesn't need to understand them to load correctly.
+        if (i < TOK_MARKER_COUNT && code != i) return false;
     }
-    // The 14 fixed markers occupy base ids [256,270) in this EXACT order -- a scheme constant
-    // (see learn()), not something to discover per-file. VERIFY the loaded layout matches (a
-    // corrupt or foreign file fails here, loudly, rather than silently misassigning ids -- e.g.
-    // this is exactly what stops a pre-EOS file's TOK_CAP=256 from being misread as TOK_EOS=256,
-    // on top of the magic-number bump above already rejecting it), then assign the *_id fields
-    // from the compile-time constants directly, not from where the scan happened to find them.
-    if (t.n_base < 270) return false;
-    const auto& bs = t.base_symbol;
-    if (bs[256] != TOK_EOS || bs[257] != TOK_CAP || bs[258] != TOK_UP || bs[259] != TOK_JOIN ||
-        bs[260] != TOK_NEWLINE || bs[261] != TOK_PARA || bs[262] != TOK_ODQUOTE || bs[263] != TOK_CDQUOTE ||
-        bs[264] != TOK_SPELL_START || bs[265] != TOK_SPELL_END || bs[266] != TOK_SPACE2 ||
-        bs[267] != TOK_SPACE4 || bs[268] != TOK_TAB2 || bs[269] != TOK_TAB4)
-        return false;
-    t.eos_id = TOK_EOS; t.cap_id = TOK_CAP; t.up_id = TOK_UP; t.join_id = TOK_JOIN;
-    t.newline_id = TOK_NEWLINE; t.para_id = TOK_PARA; t.odquote_id = TOK_ODQUOTE; t.cdquote_id = TOK_CDQUOTE;
-    t.spell_start_id = TOK_SPELL_START; t.spell_end_id = TOK_SPELL_END; t.space2_id = TOK_SPACE2;
-    t.space4_id = TOK_SPACE4; t.tab2_id = TOK_TAB2; t.tab4_id = TOK_TAB4;
+    // Word-vocabulary kind: only 1 (Unigram, pieces + log-probs) is loadable at runtime -- a
+    // pre-WS2 file's legacy BPE-merge encoding (kind 0) is rejected outright, not decoded, since
+    // this build's encode()/detokenize() no longer has a BPE word encoder to use it with.
     const int kind = static_cast<int>(ru32());
-    if (kind == 1) {                                                   // Unigram: pieces + log-probs
-        t.max_piece = static_cast<int>(ru32());
-        t.piece_logp.resize(static_cast<std::size_t>(t.vocab));
-        for (int id = 0; id < t.vocab; ++id) t.piece_logp[static_cast<std::size_t>(id)] = rf32();
-        t.expansion.reserve(static_cast<std::size_t>(t.vocab));
-        for (int id = t.n_base; id < t.vocab; ++id) {
-            const int len = static_cast<int>(ru16());
-            std::vector<int> codes(static_cast<std::size_t>(len));
-            std::string s(static_cast<std::size_t>(len), '\0');
-            for (int k = 0; k < len; ++k) { const int c = static_cast<unsigned char>(is.get()); codes[static_cast<std::size_t>(k)] = c; s[static_cast<std::size_t>(k)] = static_cast<char>(c); }
-            t.expansion.push_back(std::move(codes));
-            t.piece_index.emplace(std::move(s), id);
-        }
-        for (int b = 0; b < 256; ++b)                                 // single bytes are candidates too
-            if (t.byte_base[static_cast<std::size_t>(b)] >= 0)
-                t.piece_index.emplace(std::string(1, static_cast<char>(b)), t.byte_base[static_cast<std::size_t>(b)]);
-    } else {                                                          // legacy BPE merges
-        const int n_merges = static_cast<int>(ru32());
-        t.expansion.reserve(static_cast<std::size_t>(t.n_base + n_merges));
-        t.merges.reserve(static_cast<std::size_t>(n_merges));
-        for (int i = 0; i < n_merges; ++i) {
-            const int a = static_cast<int>(ru32());
-            const int b = static_cast<int>(ru32());
-            t.merges.emplace_back(a, b);
-            t.merge_rank.emplace(std::pair{a, b}, i);
-            std::vector<int> exp = t.expansion[static_cast<std::size_t>(a)];
-            exp.insert(exp.end(), t.expansion[static_cast<std::size_t>(b)].begin(),
-                       t.expansion[static_cast<std::size_t>(b)].end());
-            t.expansion.push_back(std::move(exp));
-        }
+    if (kind != 1) return false;
+    t.max_piece = static_cast<int>(ru32());
+    t.piece_logp.resize(static_cast<std::size_t>(t.vocab));
+    for (int id = 0; id < t.vocab; ++id) t.piece_logp[static_cast<std::size_t>(id)] = rf32();
+    t.expansion.reserve(static_cast<std::size_t>(t.vocab));
+    for (int id = t.n_base; id < t.vocab; ++id) {
+        const int len = static_cast<int>(ru16());
+        std::vector<int> codes(static_cast<std::size_t>(len));
+        std::string s(static_cast<std::size_t>(len), '\0');
+        for (int k = 0; k < len; ++k) { const int c = static_cast<unsigned char>(is.get()); codes[static_cast<std::size_t>(k)] = c; s[static_cast<std::size_t>(k)] = static_cast<char>(c); }
+        t.expansion.push_back(std::move(codes));
+        t.piece_index.emplace(std::move(s), id);
     }
+    for (int b = 0; b < 256; ++b)                                 // single bytes are candidates too
+        t.piece_index.emplace(std::string(1, static_cast<char>(b)), b);   // base id == byte value
     const int n_words = static_cast<int>(ru32());
     for (int i = 0; i < n_words; ++i) {
         const int len = static_cast<int>(ru16());

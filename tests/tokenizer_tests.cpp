@@ -122,7 +122,7 @@ TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokeniz
     REQUIRE(name != noun);
     const bool encoded_as_cap_plus_noun =
         name.size() == noun.size() + 1 &&
-        name.front() == t.cap_id &&
+        name.front() == sub0::casing::TOK_CAP &&
         std::vector<int>(name.begin() + 1, name.end()) == noun;
     REQUIRE_FALSE(encoded_as_cap_plus_noun);
     REQUIRE(sub0::tok::detokenize(t, name) == "Spot");  // capital preserved on the round-trip
@@ -131,7 +131,7 @@ TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokeniz
     const std::vector<int> they_low = sub0::tok::encode(t, "they");
     const std::vector<int> they_cap = sub0::tok::encode(t, "They");
     REQUIRE(they_cap.size() == they_low.size() + 1);
-    REQUIRE(they_cap.front() == t.cap_id);
+    REQUIRE(they_cap.front() == sub0::casing::TOK_CAP);
     REQUIRE(std::vector<int>(they_cap.begin() + 1, they_cap.end()) == they_low);
 }
 

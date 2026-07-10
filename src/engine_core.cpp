@@ -138,7 +138,7 @@ const char* default_tokenizer()  { return DEFAULT_TOKENIZER; }
 // ============================================================================
 
 std::uint64_t tokenizer_fingerprint() { return g_tok.loaded ? tok::fingerprint(g_tok) : 0; }
-int eos_token_id() { return g_tok.loaded ? g_tok.eos_id : -1; }
+int eos_token_id() { return g_tok.loaded ? casing::TOK_EOS : -1; }
 
 bool load_tokenizer(const char* path) {
     std::ifstream is(path, std::ios::binary);

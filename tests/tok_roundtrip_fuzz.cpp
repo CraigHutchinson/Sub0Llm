@@ -65,16 +65,26 @@ struct RtResult {
 std::string describe_tokens(const Tokenizer& t, const std::vector<int>& ids) {
     std::string o;
     for (int id : ids) {
-        if      (id == t.join_id)        o += "<J>";
-        else if (id == t.newline_id)     o += "<NL>";
-        else if (id == t.para_id)        o += "<P>";
-        else if (id == t.eos_id)         o += "<EOS>";
-        else if (id == t.cap_id)         o += "<C>";
-        else if (id == t.up_id)          o += "<U>";
-        else if (id == t.odquote_id)     o += "<OQ>";
-        else if (id == t.cdquote_id)     o += "<CQ>";
-        else if (id == t.spell_start_id) o += "<[";
-        else if (id == t.spell_end_id)   o += "]>";
+        if      (id == sub0::casing::TOK_JOIN)        o += "<J>";
+        else if (id == sub0::casing::TOK_NEWLINE)     o += "<NL>";
+        else if (id == sub0::casing::TOK_PARA)        o += "<P>";
+        else if (id == sub0::casing::TOK_EOS)         o += "<EOS>";
+        else if (id == sub0::casing::TOK_CAP)         o += "<C>";
+        else if (id == sub0::casing::TOK_UP)          o += "<U>";
+        else if (id == sub0::casing::TOK_ODQUOTE)     o += "<OQ>";
+        else if (id == sub0::casing::TOK_CDQUOTE)     o += "<CQ>";
+        else if (id == sub0::casing::TOK_SPELL_START) o += "<[";
+        else if (id == sub0::casing::TOK_SPELL_END)   o += "]>";
+        else if (id == sub0::casing::TOK_TURN_START)  o += "<TS>";
+        else if (id == sub0::casing::TOK_TURN_END)    o += "<TE>";
+        // Note: deliberately NOT "<[" / "]>" -- those already render TOK_SPELL_START/END above;
+        // reusing them here would make the debug breakdown ambiguous between the two marker families.
+        else if (id == sub0::casing::TOK_GLUE_OPAREN)   o += "<G(";
+        else if (id == sub0::casing::TOK_GLUE_CPAREN)   o += ")G>";
+        else if (id == sub0::casing::TOK_GLUE_OBRACKET) o += "<G[";
+        else if (id == sub0::casing::TOK_GLUE_CBRACKET) o += "]G>";
+        else if (id == sub0::casing::TOK_GLUE_OBRACE)   o += "<G{";
+        else if (id == sub0::casing::TOK_GLUE_CBRACE)   o += "}G>";
         else if (id >= 0 && id < static_cast<int>(t.expansion.size())) {
             std::string w;
             for (int code : t.expansion[static_cast<std::size_t>(id)]) w += static_cast<char>(code);
@@ -191,6 +201,19 @@ TEST_CASE("round-trip: worked examples across constructs", "[tok][fuzz]") {
         "line one\nline two\n\npara two\n\tindented\n    four spaces",
         // numbers, mixed
         "v1.2.3-rc4 build #4567 (0xDEADBEEF)",
+        // Stage 2: ChatML-adopted turn markers (§5.6) -- glued to the role word, glued to the
+        // preceding content, adjacent to case markers and a multi-turn conversation shape.
+        "<|im_start|>user\nWhat's the weather?<|im_end|>",
+        "<|im_start|>system\nYou are Helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>",
+        "word<|im_end|> <|im_start|>NextWord",
+        // WS5b: bracket-glue, the asymmetric/mixed cases the plan explicitly called out (§5.9).
+        "f(x) and (y)",
+        "a[i]",
+        "foo() {",
+        "((a))",
+        "f( x )",
+        "map[key] = fn(a, b, {1, 2, 3});",
+        "{code}[index]",
     };
     int fails = 0;
     std::string reports;
@@ -253,6 +276,8 @@ const std::vector<std::string> kSeeds = {
     "caf\xC3\xA9" " pi\xC3\xB1" "ata na\xC3\xAF" "ve",   // UTF-8 multibyte letters (café piñata naïve)
     "save_scan_state CamelCaseWord",
     "   leading and trailing   ",
+    "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello!<|im_end|>",
+    "f(x) and (y) and [z] and {w}",
 };
 
 // Apply `nmut` random single-byte mutations (flip / insert / delete / duplicate) to `s`.
@@ -352,21 +377,21 @@ TEST_CASE("patterns: how the project's own source tokenizes", "[tok][patterns]")
     long long ws_space = 0, ws_tab = 0, ws_nl = 0, ws_cr = 0;     // verbatim whitespace BYTES
     bool in_spell = false;
     for (int id : ids) {
-        if      (id == t.join_id)        ++n_join;
-        else if (id == t.newline_id)     ++n_nl;
-        else if (id == t.para_id)        ++n_para;
-        else if (id == t.eos_id)         ++n_eos;
-        else if (id == t.odquote_id)     ++n_odq;
-        else if (id == t.cdquote_id)     ++n_cdq;
-        else if (id == t.spell_start_id) { ++n_spell; in_spell = true; }
-        else if (id == t.spell_end_id)   in_spell = false;
+        if      (id == sub0::casing::TOK_JOIN)        ++n_join;
+        else if (id == sub0::casing::TOK_NEWLINE)     ++n_nl;
+        else if (id == sub0::casing::TOK_PARA)        ++n_para;
+        else if (id == sub0::casing::TOK_EOS)         ++n_eos;
+        else if (id == sub0::casing::TOK_ODQUOTE)     ++n_odq;
+        else if (id == sub0::casing::TOK_CDQUOTE)     ++n_cdq;
+        else if (id == sub0::casing::TOK_SPELL_START) { ++n_spell; in_spell = true; }
+        else if (id == sub0::casing::TOK_SPELL_END)   in_spell = false;
         else if (id >= 0 && id < 256) {
             if      (id == ' ')  ++ws_space;
             else if (id == '\t') ++ws_tab;
             else if (id == '\n') ++ws_nl;
             else if (id == '\r') ++ws_cr;
         }
-        if (in_spell && id != t.spell_start_id) ++n_spell_sub;
+        if (in_spell && id != sub0::casing::TOK_SPELL_START) ++n_spell_sub;
     }
     // The "indentation" surprise: a '\n' immediately followed by a space/tab can never become a
     // lone NEWLINE token (the gap is >1), so it falls back to verbatim whitespace bytes. Count
