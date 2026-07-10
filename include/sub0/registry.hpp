@@ -32,11 +32,26 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+
+// Export macro for read_config_json's out-of-line definition (src/run_config.cpp, compiled once
+// into sub0_core): every other function in this header is `inline` and compiled directly into
+// each consumer's own translation unit, so this is the one symbol here that actually crosses the
+// sub0_core.dll boundary and needs it. A self-contained copy of core.hpp's own SUB0_API (not an
+// include of core.hpp itself) -- this header is deliberately pure std + <filesystem>, no engine
+// dependency, matching its own doc comment above.
+#ifndef SUB0_API
+  #if defined(_WIN32)
+    #define SUB0_API __declspec(dllexport)
+  #else
+    #define SUB0_API __attribute__((visibility("default")))
+  #endif
+#endif
 
 namespace sub0::registry {
 
@@ -58,6 +73,100 @@ struct ModelMeta {
     double best_val_nelbo = -1.0;             // -1 = not yet evaluated
     std::filesystem::path dir;                // the model's directory (set by scan)
 };
+
+// --- RunConfig: the single source of truth for a model directory's TRAINING RECIPE -------------
+//
+// Born from a real incident: a GPU-fault auto-resume once silently continued training under plain
+// AdamW instead of the Muon it had used for its first 7728 steps, because the optimizer choice was
+// derived purely from the CURRENT invocation's CLI flag with no cross-check against what the model
+// had actually been trained with -- `ModelMeta::optimizer` above was written to meta.txt every run
+// but never read back. `RunConfig` fixes the CLASS of bug, not just that one field: it is the one
+// place a new training-recipe option is declared, and by construction that declaration is *also*
+// its serialization -- add a row to SUB0_RUN_CONFIG_FIELDS below and the field is written to and
+// read from every model directory's config.json automatically (write_config_json/read_config_json
+// are generated from this one list, not hand-maintained in three separate places that could drift
+// out of sync with each other, which is exactly how the optimizer bug happened in the first place).
+//
+// Scope, deliberately not "every setting in the program": holds CHOICES that must not silently
+// drift across a resume and have no other authoritative home.
+//   - Architecture dims/flags ARE included, even though they're also `constexpr` at compile time
+//     and also duplicated in `ModelMeta` -- see `compatible()`'s doc comment above for why that
+//     redundancy is load-bearing (cross-build-config filtering before any model.bin is opened).
+//   - `batch`/`lr`/`seed` ARE included for completeness/comparison, but are NOT re-enforced on
+//     resume here -- they already have a correct, tightly-coupled authoritative home in the
+//     `.ckpt` binary (see train_stage.cpp's `load_checkpoint`), which wins on resume with its own
+//     log line. config.json's copy is informational, same role as meta.txt's copy.
+//   - `optimizer` IS re-enforced on resume (see train_stage.cpp) -- it has no checkpoint-binary
+//     home and no other read-back path, which is precisely the gap that caused the incident above.
+//   - Deliberately EXCLUDED: per-invocation POLICY that has no "correct" persisted value to protect
+//     (`steps`/`keep`/`resume_mode` -- see train_stage.cpp's own comment on why `steps` specifically
+//     is never persisted) and per-STEP state that already lives in the checkpoint (RNG state, Adam
+//     moment buffers, eval history) -- config.json is not a second copy of the checkpoint.
+#define SUB0_RUN_CONFIG_FIELDS(X)         \
+    X(std::string, corpus,          "")   \
+    X(int,         d_model,         0)    \
+    X(int,         n_layers,        0)    \
+    X(int,         n_heads,         0)    \
+    X(int,         seq_len,         0)    \
+    X(int,         vocab,           0)    \
+    X(int,         ternary,         0)    \
+    X(int,         pos_encoding,    0)    \
+    X(int,         gated_ffn,       0)    \
+    X(int,         tied_embeddings, 0)    \
+    X(int,         qk_norm,         0)    \
+    X(int,         optimizer,       0)    \
+    X(int,         batch,           0)    \
+    X(double,      lr,              0.0)  \
+    X(unsigned,    seed,            0u)
+
+struct RunConfig {
+#define SUB0_RUN_CONFIG_DECL(type, name, def) type name = def;
+    SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_DECL)
+#undef SUB0_RUN_CONFIG_DECL
+};
+
+namespace detail {
+inline void json_write(std::ostream& os, const std::string& v) {
+    os << '"';
+    for (unsigned char c : v) {
+        if (c == '"' || c == '\\')      { os << '\\' << static_cast<char>(c); }
+        else if (c == '\n')             { os << "\\n"; }
+        else if (c == '\r')             { os << "\\r"; }
+        else if (c == '\t')             { os << "\\t"; }
+        else if (c < 0x20 || c >= 0x7F) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); os << b; }
+        else                             { os << static_cast<char>(c); }
+    }
+    os << '"';
+}
+inline void json_write(std::ostream& os, int v)      { os << v; }
+inline void json_write(std::ostream& os, unsigned v) { os << v; }
+inline void json_write(std::ostream& os, double v)   { os << v; }
+}  // namespace detail
+
+// Writes <dir>/config.json, one field per SUB0_RUN_CONFIG_FIELDS row -- see RunConfig's own doc
+// comment. Hand-rolled (not simdjson, which is a parser): a flat object of scalars needs no library
+// to emit correctly, and this keeps the write path dependency-free for every caller.
+inline void write_config_json(const RunConfig& c, const std::filesystem::path& dir) {
+    std::error_code ec; std::filesystem::create_directories(dir, ec);
+    std::ofstream os(dir / "config.json", std::ios::trunc);
+    if (!os) return;
+    os << "{\n";
+    bool first = true;
+#define SUB0_RUN_CONFIG_WRITE(type, name, def) \
+    os << (first ? "" : ",\n") << "  \"" #name "\": "; detail::json_write(os, c.name); first = false;
+    SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_WRITE)
+#undef SUB0_RUN_CONFIG_WRITE
+    os << "\n}\n";
+}
+
+// Reads <dir>/config.json into `c`. Returns false if the file is missing or fails to parse -- an
+// OLD model directory predating this feature has no config.json at all, and callers must treat
+// that as "no persisted recipe available" (fall back to whatever they'd otherwise do), not an
+// error. Implemented in src/run_config.cpp via simdjson::ondemand (single forward pass over the
+// object's keys, one branch per SUB0_RUN_CONFIG_FIELDS row -- this project's JSON convention:
+// register handlers, don't build a DOM tree) so declaring it here keeps this header simdjson-free
+// for every consumer that only ever calls it, never simdjson types directly.
+[[nodiscard]] SUB0_API bool read_config_json(RunConfig& c, const std::filesystem::path& dir);
 
 // Dir-name tag for the positional-encoding scheme (absolute is the legacy default -> untagged).
 inline const char* pos_tag(int pos_enc) { return pos_enc == 1 ? "r" : ""; }

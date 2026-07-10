@@ -1105,23 +1105,43 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // seeded) so write_meta's [&] capture below can see it.
     long long tokens_seen_est = 0;
 
+    // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
+    // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
+    // `batch`/`lr`/`seed` currently ARE (which the resume-reconciliation block below may have just
+    // adjusted), never a stale snapshot. `write_meta` below derives meta.txt's overlapping fields
+    // FROM this, instead of setting them a second, independent time -- one source, two artifacts,
+    // so they cannot drift apart from each other.
+    auto build_run_config = [&] {
+        sub0::registry::RunConfig cfg;
+        cfg.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
+        cfg.d_model = D_MODEL; cfg.n_layers = N_LAYERS; cfg.n_heads = N_HEADS;
+        cfg.seq_len = SEQ_LEN; cfg.vocab = VOCAB; cfg.ternary = static_cast<int>(USE_TERNARY);
+        cfg.pos_encoding = static_cast<int>(POS_ENCODING);
+        cfg.gated_ffn = static_cast<int>(USE_GATED_FFN);
+        cfg.tied_embeddings = static_cast<int>(USE_TIED_EMBEDDINGS);
+        cfg.qk_norm = static_cast<int>(USE_QK_NORM);
+        cfg.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
+        cfg.batch = batch; cfg.lr = lr; cfg.seed = seed;
+        return cfg;
+    };
+
     auto write_meta = [&](const char* status) {
         if (meta_dir.empty()) return;
+        const sub0::registry::RunConfig cfg = build_run_config();
+        sub0::registry::write_config_json(cfg, meta_dir);
         sub0::registry::ModelMeta m;
-        m.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
-        m.d_model = D_MODEL; m.n_layers = N_LAYERS; m.n_heads = N_HEADS;
-        m.seq_len = SEQ_LEN; m.vocab = VOCAB; m.ternary = static_cast<int>(USE_TERNARY);
-        m.pos_encoding = static_cast<int>(POS_ENCODING);
-        m.gated_ffn = static_cast<int>(USE_GATED_FFN);
-        m.tied_embeddings = static_cast<int>(USE_TIED_EMBEDDINGS);
-        m.qk_norm = static_cast<int>(USE_QK_NORM);
-        m.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
+        m.corpus = cfg.corpus;
+        m.d_model = cfg.d_model; m.n_layers = cfg.n_layers; m.n_heads = cfg.n_heads;
+        m.seq_len = cfg.seq_len; m.vocab = cfg.vocab; m.ternary = cfg.ternary;
+        m.pos_encoding = cfg.pos_encoding; m.gated_ffn = cfg.gated_ffn;
+        m.tied_embeddings = cfg.tied_embeddings; m.qk_norm = cfg.qk_norm;
+        m.optimizer = cfg.optimizer;
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
         m.epochs = static_cast<double>(rs.step) / static_cast<double>(epoch_steps);
         m.tokens_seen = tokens_seen_est;
-        m.batch = batch; m.lr = lr; m.seed = seed;
+        m.batch = cfg.batch; m.lr = cfg.lr; m.seed = cfg.seed;
         m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
         m.status = status;
         sub0::registry::write_meta(meta_dir, m);
@@ -1160,6 +1180,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // fit fine (the same "wasted capacity" question a live VRAM measurement can over-trigger on).
     }
     tokens_seen_est = static_cast<long long>(rs.step) * batch * SEQ_LEN;   // batch/rs.step now resume-final
+
+    // Config-recipe reconciliation: unlike batch/lr/seed above, `optimizer` has no home in the
+    // `.ckpt` binary and was previously derived PURELY from this invocation's CLI flag on every
+    // resume, with nothing to cross-check it against -- the exact gap that once let a GPU-fault
+    // auto-resume silently continue a Muon-trained run under plain AdamW instead (see
+    // registry.hpp's RunConfig doc comment for the full incident). If this model directory already
+    // has a persisted config.json (written by an earlier run under this fix), its `optimizer` is
+    // now authoritative on resume too, same discipline as batch/lr/seed just above. A directory
+    // predating this fix has no config.json yet -- `read_config_json` returns false and this
+    // invocation's own value is used unchanged, same as before (no regression for old models; they
+    // gain the protection the moment they're next saved under this build).
+    if (resumed && !meta_dir.empty()) {
+        sub0::registry::RunConfig persisted;
+        if (sub0::registry::read_config_json(persisted, meta_dir) && persisted.optimizer != optimizer) {
+            sub0::log::info("  config.json overrides this invocation's optimizer: {} -> {} "
+                            "(the persisted recipe wins on resume, same as batch/lr/seed above)",
+                            optimizer == 1 ? "muon" : "adamw", persisted.optimizer == 1 ? "muon" : "adamw");
+            optimizer = persisted.optimizer;
+        }
+    }
 
     sub0::AdamW opt(lr, optimizer == 1);
     if (resumed) opt.set_step_count(adam_t);

@@ -12,6 +12,7 @@ add_executable(sub0_tests
   layout_tests.cpp
   tune_tests.cpp
   coherence_tests.cpp
+  run_config_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.

@@ -67,9 +67,12 @@ include(cmake/get_cpm.cmake)
 # earlier amedoeyes/cli idea, which was AGPL + xmake-only.) Until then CLI11 stays.
 CPMAddPackage("gh:CLIUtils/CLI11@2.4.2")
 
-# TODO(json): when JSON support is needed (e.g. config/metadata/tokenizer files),
-# use simdjson (Apache-2.0): CPMAddPackage("gh:simdjson/simdjson@3.10.1"). Not added
-# yet -- the project has no JSON usage, so we avoid an unused dependency for now.
+# JSON: simdjson (Apache-2.0), for config.json (include/sub0/registry.hpp's RunConfig --
+# read_config_json in src/run_config.cpp). Single-pass ondemand reads only (this project's JSON
+# convention: register a handler per key, one forward pass -- no DOM tree), matching how sparse
+# these config files are. Writing is hand-rolled inline in registry.hpp (no library needed to emit
+# a flat object of scalars) -- simdjson is a parser, not a serializer.
+CPMAddPackage("gh:simdjson/simdjson@3.10.1")
 
 # TODO(tune): the `tune` autotuner uses an in-tree search (include/sub0/tune.hpp).
 # Prior art surveyed -- the mature auto-tuning stacks (Optuna, NNI, scikit-optimize,
@@ -185,11 +188,15 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
-add_library(sub0_core SHARED src/engine_core.cpp ${SUB0_BACKEND_SOURCES})
+add_library(sub0_core SHARED src/engine_core.cpp src/run_config.cpp ${SUB0_BACKEND_SOURCES})
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
 target_link_libraries(sub0_core PRIVATE sub0_frontend)
+# run_config.cpp's read_config_json (registry.hpp's RunConfig) uses simdjson to parse config.json.
+# PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain std::-typed function declared
+# in registry.hpp -- simdjson's own types never leak across that boundary.
+target_link_libraries(sub0_core PRIVATE simdjson::simdjson)
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
 # the errno side-effect of the math libcalls is dead weight that stops the optimizer
 # from emitting vectorized vsqrtps. Dropping it changes no computed value (it is not a
