@@ -259,7 +259,12 @@ endif()
 
 # --- Stage 4: backend stage libraries ---------------------------------------
 add_library(sub0_train SHARED src/train_stage.cpp)
-target_link_libraries(sub0_train PRIVATE sub0_core)
+# sub0_frontend (the tokenizer) links in DIRECTLY, not just transitively via sub0_core (which links
+# it PRIVATE, so its symbols aren't re-exported): --spell-mix deserializes tokenizer.tok into a raw
+# sub0::tok::Tokenizer and generates the uncombine curriculum (sub0/spellspike.hpp) as a blend source.
+# It's a static PIC lib, so this embeds its own copy in sub0_train.dll -- the stateless tokenizer
+# functions have no cross-DLL shared state, so a second copy is harmless.
+target_link_libraries(sub0_train PRIVATE sub0_core sub0_frontend)
 # MSVC's CRT headers flag std::getenv deprecated (favoring _dupenv_s); the two SUB0_TRAIN_CPU /
 # SUB0_FIXED_SEQ toggles are simple read-only env lookups with no buffer to overflow, so the
 # "insecure" warning has nothing to protect against here -- suppress it rather than take on a
@@ -288,7 +293,10 @@ target_compile_definitions(sub0_train PRIVATE
   SUB0_MODELS_ROOT="${CMAKE_SOURCE_DIR}/models")
 
 add_library(sub0_gen SHARED src/gen_stage.cpp)
-target_link_libraries(sub0_gen PRIVATE sub0_core)
+# sub0_frontend links in directly (as with sub0_train above): a model trained with --spell-mix drives
+# gen's uncombine/combine interceptor, which deserializes tokenizer.tok into a raw sub0::tok::Tokenizer
+# to build the expand/combine callbacks the decode loop calls.
+target_link_libraries(sub0_gen PRIVATE sub0_core sub0_frontend)
 
 # Phase 2e follow-up: GPU KV-cache decode (sub0_cuda_forward_one), parity-validated against a trained
 # model (cuda_tests.cpp) -- link it in the same way sub0_train links the training fast-path above.

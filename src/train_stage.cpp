@@ -28,6 +28,8 @@
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
 #include "sub0/window.hpp"   // sample_window_start: keep each training window inside one document
+#include "sub0/blend.hpp"    // weighted per-window multi-source blending (base corpus + curriculum)
+#include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a --spell-mix blend source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -743,23 +745,31 @@ struct GpuTrainer {
 #endif
     }
 
-    // One resident device step over the sampled windows; returns the mean loss. Builds the
-    // [batch*T] id/target windows (x = data[start+s], y = data[start+s+1]); a window shorter than T
-    // (a short document) fills its leading `lengths[b]` rows and PADS the rest, with the trailing
-    // positions loss-masked on the device via the same `lengths` array -- so no document is dropped
-    // and the padding contributes no gradient (causal attention keeps it out of the real tokens).
-    float step([[maybe_unused]] sub0::TokView data, [[maybe_unused]] const std::size_t* starts,
+    // One resident device step over the sampled windows; returns the mean loss. Each window b is
+    // materialized from its blend source `sources[src_idx[b]]` (x = view[start+s], y = view[start+s+1]);
+    // a window shorter than T (a short document) fills its leading `lengths[b]` rows and PADS the rest,
+    // with the trailing positions loss-masked on the device via the same `lengths` array -- so no
+    // document is dropped and the padding contributes no gradient (causal attention keeps it out of the
+    // real tokens). A masked source additionally writes LOSS_IGNORE_INDEX into the masked target rows
+    // (the interior mask); this needs the device ignore-index cross-entropy, so the caller currently
+    // gates masked sources off the GPU path until that kernel lands (see the train loop's any_masked
+    // guard) -- the mask branch here is inert until then.
+    float step([[maybe_unused]] const std::vector<sub0::BlendSource>& sources,
+               [[maybe_unused]] const int* src_idx, [[maybe_unused]] const std::size_t* starts,
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
                [[maybe_unused]] int T, [[maybe_unused]] float lr,
                [[maybe_unused]] float muon_lr = 0.f) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
-            const std::size_t w = starts[b];               // window base into the token view (width-agnostic)
+            const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
+            const std::size_t w = starts[b];               // window base into the source's token view
             const int  len = lengths ? lengths[b] : T;
             int s = 0;
             for (; s < len; ++s) {
-                ids[static_cast<std::size_t>(b) * T + s]     = data[w + static_cast<std::size_t>(s)];
-                targets[static_cast<std::size_t>(b) * T + s] = data[w + static_cast<std::size_t>(s) + 1];
+                const std::size_t tp = w + static_cast<std::size_t>(s) + 1;   // target token index
+                ids[static_cast<std::size_t>(b) * T + s]     = src.view[w + static_cast<std::size_t>(s)];
+                targets[static_cast<std::size_t>(b) * T + s] =
+                    (src.masked() && !src.mask[tp]) ? sub0::LOSS_IGNORE_INDEX : src.view[tp];
             }
             for (; s < T; ++s) {                       // pad the tail of a short window (loss-masked)
                 ids[static_cast<std::size_t>(b) * T + s]     = 0;
@@ -866,7 +876,7 @@ static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
-                                          int optimizer, int resume_mode) {
+                                          int optimizer, int resume_mode, float spell_mix) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1122,6 +1132,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.qk_norm = static_cast<int>(USE_QK_NORM);
         cfg.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
         cfg.batch = batch; cfg.lr = lr; cfg.seed = seed;
+        cfg.spell_mix = spell_mix;   // the blend recipe: re-enforced on resume like optimizer (below)
         return cfg;
     };
 
@@ -1193,11 +1204,22 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // gain the protection the moment they're next saved under this build).
     if (resumed && !meta_dir.empty()) {
         sub0::registry::RunConfig persisted;
-        if (sub0::registry::read_config_json(persisted, meta_dir) && persisted.optimizer != optimizer) {
-            sub0::log::info("  config.json overrides this invocation's optimizer: {} -> {} "
-                            "(the persisted recipe wins on resume, same as batch/lr/seed above)",
-                            optimizer == 1 ? "muon" : "adamw", persisted.optimizer == 1 ? "muon" : "adamw");
-            optimizer = persisted.optimizer;
+        if (sub0::registry::read_config_json(persisted, meta_dir)) {
+            if (persisted.optimizer != optimizer) {
+                sub0::log::info("  config.json overrides this invocation's optimizer: {} -> {} "
+                                "(the persisted recipe wins on resume, same as batch/lr/seed above)",
+                                optimizer == 1 ? "muon" : "adamw", persisted.optimizer == 1 ? "muon" : "adamw");
+                optimizer = persisted.optimizer;
+            }
+            // The blend recipe must not silently change across a resume either -- a run that mixed in
+            // the uncombine curriculum must keep mixing it (and at the same fraction) when it resumes,
+            // exactly the class of drift the optimizer field above guards against.
+            if (persisted.spell_mix != static_cast<double>(spell_mix)) {
+                sub0::log::info("  config.json overrides this invocation's --spell-mix: {:.3f} -> {:.3f} "
+                                "(the persisted blend recipe wins on resume)",
+                                static_cast<double>(spell_mix), persisted.spell_mix);
+                spell_mix = static_cast<float>(persisted.spell_mix);
+            }
         }
     }
 
@@ -1259,9 +1281,70 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         static_cast<std::size_t>(sub0::memplan::MAX_DEVICE_BATCH)));
     std::vector<size_t> starts(max_batch_t);
     std::vector<int>    win_len(max_batch_t);   // per-window trained length (< seq_t for short documents)
+    std::vector<int>    src_idx(max_batch_t);   // per-window blend source index (all 0 for a single-source run)
     std::vector<int>    cpu_win;          // CPU path: materialized window tokens (view may be uint16-packed)
     std::vector<size_t> cpu_starts(max_batch_t);
+    std::vector<std::uint8_t> cpu_mask;   // CPU path: per-window loss mask parallel to cpu_win (only when a source is masked)
     long steps_since_refresh = 0;
+
+    // The blend: the weighted sources this run draws windows from. Source 0 is always the base
+    // corpus; a run's blend spec appends further sources (the uncombine curriculum, and later
+    // conversational/reasoning corpora). A single unmasked source makes the loop below bit-identical
+    // to the pre-blend single-corpus path (sample_blend draws no extra rng, loss_mask stays null).
+    std::vector<sub0::BlendSource> sources;
+    sources.push_back(sub0::BlendSource{ train_span, doc_index, {}, 1.0 });
+    constexpr std::size_t kBaseSource = 0;
+    // --spell-mix: blend in the synthetic uncombine/combine curriculum as a second, MASKED source.
+    // Generated once from the production tokenizer (deserialized here) over every eligible word
+    // piece, so the model learns to REQUEST character-level ops on any word (the mask grades only the
+    // op-invocation + answer, never the harness-injected content -- see spellspike.hpp). `spell_ds`
+    // must outlive the training loop: the source below borrows spans into it.
+    sub0::spellspike::Dataset spell_ds;
+    if (spell_mix > 0.f) {
+        sub0::tok::Tokenizer tk;
+        std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
+        if (!tis.good() || !sub0::tok::deserialize(tk, tis)) {
+            sub0::log::error("train: --spell-mix set but the tokenizer '{}' could not be loaded",
+                             sub0::default_tokenizer());
+            return 1;
+        }
+        if (tk.vocab != VOCAB) {
+            sub0::log::error("train: --spell-mix tokenizer vocab {} != engine VOCAB {} (rebuild against "
+                             "this corpus)", tk.vocab, VOCAB);
+            return 1;
+        }
+        // Drill EVERY eligible word (drilled_frac 1.0): production wants full vocab coverage, and the
+        // spike proved the mechanism generalizes, so there is no need to hold words out here. Seeded
+        // off the run seed so the curriculum is deterministic and reproduced identically on resume.
+        const sub0::spellspike::WordSplit split =
+            sub0::spellspike::split_task_words(tk, /*drilled_frac=*/1.0, /*seed=*/seed);
+        sub0::spellspike::DatasetOptions dopt;
+        dopt.tasks_per_word = 12;
+        dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C0113B1EULL;   // distinct stream from window sampling
+        spell_ds = sub0::spellspike::build_dataset(tk, split, dopt);
+        sources[kBaseSource].weight = 1.0 - static_cast<double>(spell_mix);   // remaining windows -> base
+        sources.push_back(sub0::BlendSource{
+            sub0::TokView::over_int32(spell_ds.tokens.data(), spell_ds.tokens.size()),
+            std::span<const std::uint64_t>(spell_ds.doc_starts),
+            std::span<const std::uint8_t>(spell_ds.mask),
+            static_cast<double>(spell_mix) });
+        sub0::log::line("blend: base {:.0f}% + uncombine curriculum {:.0f}% "
+                        "({} task words, {} traces, {} tokens)",
+                        (1.0 - static_cast<double>(spell_mix)) * 100.0, static_cast<double>(spell_mix) * 100.0,
+                        split.drilled.size(), spell_ds.doc_starts.size() - 1, spell_ds.tokens.size());
+    }
+    const bool any_masked = std::any_of(sources.begin(), sources.end(),
+                                        [](const sub0::BlendSource& s) { return s.masked(); });
+    // Masked-source blending needs the ignore-index cross-entropy on whichever backend runs it. The
+    // CPU path has it (train_batch's loss_mask); the GPU ce_backward_kernel ignore-index change is
+    // still pending, so refuse a masked blend on the GPU rather than silently mistrain the masked
+    // spans. An unmasked multi-corpus blend runs on either backend today.
+    if (gpu_train && any_masked) {
+        sub0::log::error("train: masked-source blending needs the GPU ignore-index cross-entropy "
+                         "kernel, which is not built yet -- run this blend on the CPU backend "
+                         "(build with SUB0_COMPUTE=CPU) or drop the masked source.");
+        return 1;
+    }
 
     using clock = std::chrono::steady_clock;
     auto win_t0 = clock::now();
@@ -1300,6 +1383,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             buf_rng.seed(static_cast<std::uint32_t>(seed) ^ (0x9E3779B9u * static_cast<std::uint32_t>(++refresh_n)));
             text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
             train_span = sub0::TokView::over_int32(train_buf.data(), train_buf.size());
+            sources[kBaseSource].view = train_span;   // the refill reallocates the base buffer -- rebind its source
             steps_since_refresh = 0;
         }
         ++steps_since_refresh;
@@ -1316,9 +1400,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // rounding loss) -- bit-for-bit the pre-scheduler behavior.
         const int batch_t = static_cast<int>(tokens_per_step / static_cast<std::size_t>(seq_t));
         for (int b = 0; b < batch_t; ++b) {
-            const sub0::Window win = sub0::sample_window(rng, seq_t, train_span.size(), doc_index);
-            starts[b]  = win.start;
-            win_len[b] = win.len;
+            const sub0::BlendDraw d = sub0::sample_blend(rng, seq_t, sources);   // pick a source, window inside it
+            src_idx[b] = d.src;
+            starts[b]  = d.win.start;
+            win_len[b] = d.win.len;
         }
         const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
         float step_loss;
@@ -1326,7 +1411,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
             // 0.f when Muon isn't selected, which sub0_cuda_train_step treats as pure AdamW.
             const float muon_lr_t = opt.use_muon() ? lr_schedule(step, MUON_LR_BASE, lr_warmup_steps) : 0.f;
-            step_loss = gpu.step(train_span, starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
+            step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
             if (!gpu.ok) {
                 sub0::log::error("training: GPU step failed (device fault) at step {} -- stopping "
@@ -1340,12 +1425,23 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
                 opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
             cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
+            if (any_masked) cpu_mask.resize(cpu_win.size());   // parallel loss mask (only when a source carries one)
             for (int b = 0; b < batch_t; ++b) {
-                train_span.copy_to(starts[b], static_cast<std::size_t>(win_len[b]) + 1,
-                                   &cpu_win[static_cast<std::size_t>(b) * (seq_t + 1)]);
-                cpu_starts[b] = static_cast<std::size_t>(b) * (seq_t + 1);
+                const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
+                const std::size_t base = static_cast<std::size_t>(b) * (seq_t + 1);
+                const std::size_t n = static_cast<std::size_t>(win_len[b]) + 1;   // inputs + the last shifted target
+                src.view.copy_to(starts[b], n, &cpu_win[base]);
+                if (any_masked) {
+                    // Aligned to cpu_win: 1 = trained, 0 = masked. An unmasked source trains every
+                    // position; a masked source copies its per-token mask for this window. train_batch
+                    // reads the mask at the TARGET index (base+i+1), so this parallel copy suffices.
+                    for (std::size_t i = 0; i < n; ++i)
+                        cpu_mask[base + i] = src.masked() ? src.mask[starts[b] + i] : std::uint8_t{1};
+                }
+                cpu_starts[b] = base;
             }
-            step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data());
+            step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data(),
+                                          any_masked ? cpu_mask.data() : nullptr);
             opt.step();
         }
         run_loss += step_loss; ++run_n;

@@ -1,6 +1,6 @@
 // spellspike_engine_tests.cpp -- the engine-side harness for the combine/uncombine token-granularity
 // spike. Train a tiny model on the synthetic logic curriculum (spellspike.hpp), then measure -- via
-// the LIVE decode interceptor (decode.hpp's kv_decode_ops) -- whether it learned to INVOKE uncombine
+// the LIVE decode interceptor (decode.hpp's kv_decode_generate) -- whether it learned to INVOKE uncombine
 // and USE the injected characters to answer character-level questions it otherwise couldn't. The
 // headline is HELD-OUT accuracy: a correct answer for a word never seen in training is only possible
 // by using the harness-provided characters, not memory. Round-trip (uncombine then combine back)
@@ -55,11 +55,16 @@ struct Ops {
     }
 };
 
-// Run the live interceptor from a task prompt and return the produced context.
+// Run the live interceptor from a task prompt and return the produced context. Greedy decode
+// (topk=1 -> argmax) via kv_decode_generate's folded-in interception, CPU KV-cache.
 std::vector<int> run_task(const Ops& ops, const std::vector<int>& prompt) {
-    return sub0::kv_decode_ops(prompt, /*max_steps=*/kWindowT, cas::TOK_EOS,
-                               [&](int t) { return ops.expand(t); },
-                               [&](const std::vector<int>& f) { return ops.combine(f); });
+    std::vector<int> ctx = prompt;
+    std::mt19937 rng(0);   // topk=1 is deterministic; rng only satisfies the signature
+    sub0::kv_decode_generate(ctx, /*n=*/kWindowT, /*temp=*/1.f, /*topk=*/1, rng, cas::TOK_EOS,
+                             /*use_gpu=*/false, /*on_token=*/{},
+                             [&](int t) { return ops.expand(t); },
+                             [&](const std::vector<int>& f) { return ops.combine(f); });
+    return ctx;
 }
 
 // The model's answer token = the token right after the '=' separator (nth/count tasks).

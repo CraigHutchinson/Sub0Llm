@@ -117,7 +117,8 @@ struct ModelMeta {
     X(int,         optimizer,       0)    \
     X(int,         batch,           0)    \
     X(double,      lr,              0.0)  \
-    X(unsigned,    seed,            0u)
+    X(unsigned,    seed,            0u)   \
+    X(double,      spell_mix,       0.0)
 
 struct RunConfig {
 #define SUB0_RUN_CONFIG_DECL(type, name, def) type name = def;

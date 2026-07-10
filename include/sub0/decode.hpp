@@ -15,7 +15,7 @@
 #pragma once
 
 #include "sub0/core.hpp"
-#include "sub0/casing.hpp"   // TOK_UNCOMBINE / TOK_COMBINE marker ids (kv_decode_ops below)
+#include "sub0/casing.hpp"   // TOK_UNCOMBINE / TOK_COMBINE marker ids (kv_decode_generate interception)
 
 #include <cstdio>
 #include <functional>
@@ -79,12 +79,26 @@ inline void gpu_decode_shutdown() {
 // per token actually appended (never for eos_id), with the [VOCAB] logits row it was sampled from, so
 // a caller needing per-step statistics (gen_self_stats' NLL under the true T=1 distribution) gets them
 // without a second forward pass.
+//
+// Combine/uncombine INTERCEPTION (folded in from the former standalone kv_decode_ops): when BOTH
+// `expand` and `combine` are provided, the model can REQUEST deterministic tokenizer-layer operations
+// that this loop fulfils (see sub0/spellspike.hpp + the TOK_UNCOMBINE/TOK_COMBINE comment in
+// casing.hpp) -- the model learns to INVOKE, the tokenizer layer supplies the content:
+//   expand(token)  -> the token's constituent fragments        (fulfils an emitted TOK_UNCOMBINE)
+//   combine(frags) -> those fragments' minimal vocab token(s)   (fulfils a TOK_COMBINE region)
+// Injected tokens ARE fed through the model (forward_one, so it attends to them) but never sampled.
+// Interception runs on the CPU KV-cache path (the device-decode interceptor is a pending follow-on),
+// so a caller that supplies the callbacks gets CPU decode regardless of `use_gpu`. With no callbacks
+// (the default) this is byte-for-byte the original generate loop -- every existing caller is unchanged.
 inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int topk, std::mt19937& rng,
                                int eos_id, bool use_gpu,
-                               const std::function<void(const float*, int)>& on_token = {}) {
+                               const std::function<void(const float*, int)>& on_token = {},
+                               const std::function<std::vector<int>(int)>& expand = {},
+                               const std::function<std::vector<int>(const std::vector<int>&)>& combine = {}) {
     if (n <= 0) return;
+    const bool intercept = static_cast<bool>(expand) && static_cast<bool>(combine);
 #if defined(SUB0_BUILD_CUDA)
-    if (use_gpu) {
+    if (use_gpu && !intercept) {   // interception is CPU-only for now -> fall through to the CPU path
         // A device fault here (illegal memory access or similar) leaves the CUDA context permanently
         // corrupted for the rest of the process (CUDA errors are sticky) -- every subsequent
         // forward_one call would return stale/garbage logits, which sample_token would then happily
@@ -125,46 +139,20 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
     const float* logits = nullptr;
     for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)       // prefill the primed context
         logits = sub0::forward_one(ctx[pos], pos);
-    for (int s = 0; s < n; ++s) {
+    // Feed a token through the KV-cache (used for both sampled and harness-injected tokens).
+    auto feed = [&](int tok) { ctx.push_back(tok); logits = sub0::forward_one(tok, static_cast<int>(ctx.size()) - 1); };
+    // The extra `ctx.size() < SEQ_LEN` guard only matters in interception mode, where injected spans
+    // can grow ctx past the n-token budget the non-intercept precondition (ctx.size()+n <= SEQ_LEN)
+    // otherwise guarantees; it never fires without interception, so that path is byte-identical.
+    for (int s = 0; s < n && static_cast<int>(ctx.size()) < SEQ_LEN; ++s) {
         const int next = sub0::sample_token(logits, temp, topk, rng);
         if (next == eos_id) break;             // learned stop signal -- never push the marker token
         if (on_token) on_token(logits, next);
-        ctx.push_back(next);
-        logits = sub0::forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1);
-    }
-}
-
-// --- Combine / uncombine interception (token-granularity spike; CPU KV-cache, greedy) ------------
-// Autoregressive GREEDY decode in which the model can REQUEST deterministic tokenizer-layer
-// operations that this loop fulfils (see sub0/spellspike.hpp + the TOK_UNCOMBINE/TOK_COMBINE comment
-// in casing.hpp): the model learns to INVOKE, the tokenizer layer supplies the content. The ops are
-// passed as callbacks so this stays engine-only (no tokenizer include here):
-//   expand(token)  -> the token's constituent fragments               (fulfils a TOK_UNCOMBINE)
-//   combine(frags) -> those fragments' minimal vocab token(s)          (fulfils a TOK_COMBINE region)
-// Injected tokens ARE fed through the model (forward_one, so it attends to them) but are never
-// sampled/scored -- the harness provides them, the model only drives. Returns the full produced
-// context INCLUDING the injected spans, so the caller can read off the answer / round-trip result.
-// Greedy + CPU KV-cache only: this is the spike's eval path; productionizing would fold the same
-// interception into kv_decode_generate's sampling loop (this deliberately does NOT touch that
-// battle-tested, GPU-capable function while the mechanism is unproven).
-inline std::vector<int> kv_decode_ops(
-        std::vector<int> ctx, int max_steps, int eos_id,
-        const std::function<std::vector<int>(int)>& expand,
-        const std::function<std::vector<int>(const std::vector<int>&)>& combine) {
-    auto argmax = [](const float* row) {
-        int best = 0; float bv = row[0];
-        for (int v = 1; v < VOCAB; ++v) if (row[v] > bv) { bv = row[v]; best = v; }
-        return best;
-    };
-    sub0::kv_reset();
-    const float* logits = nullptr;
-    for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos) logits = sub0::forward_one(ctx[pos], pos);
-    auto feed = [&](int tok) { ctx.push_back(tok); logits = sub0::forward_one(tok, static_cast<int>(ctx.size()) - 1); };
-
-    for (int s = 0; s < max_steps && static_cast<int>(ctx.size()) < SEQ_LEN - 1; ++s) {
-        const int next = argmax(logits);
-        if (next == eos_id) break;
         feed(next);
+        if (!intercept) continue;
+        // The model emitted a marker: fulfil the requested op by INJECTING its content (fed through
+        // the model so it attends to it, but never sampled). Guarded so injections never run past the
+        // trained window. See the former kv_decode_ops (now folded here) and sub0/spellspike.hpp.
         if (next == casing::TOK_UNCOMBINE) {
             const int tgt = ctx.size() >= 2 ? ctx[ctx.size() - 2] : -1;   // expand the PRECEDING token
             if (tgt >= 0) {
@@ -180,7 +168,6 @@ inline std::vector<int> kv_decode_ops(
             }
         }
     }
-    return ctx;
 }
 
 // RAII: brings up a GPU decode session (if available) for a BATCH of kv_decode_generate calls made

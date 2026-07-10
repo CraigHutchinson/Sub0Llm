@@ -20,7 +20,7 @@
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
-                                int optimizer, int resume_mode);
+                                int optimizer, int resume_mode, float spell_mix);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
@@ -53,6 +53,7 @@ inline int run_train(int argc, char** argv) {
     unsigned train_seed = 42;
     std::string train_keep = "3";
     int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
+    float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -78,6 +79,12 @@ inline int run_train(int argc, char** argv) {
     app.add_flag("--fresh", train_fresh,
                 "No explicit model path: force a brand-new dated model dir, even if a resumable one exists")
        ->excludes(resume_flag);
+    app.add_option("--spell-mix", train_spell_mix,
+                   "Fraction of training windows drawn from the synthetic uncombine/combine curriculum "
+                   "(0 = base corpus only; e.g. 0.1 = ~10% curriculum). Teaches the model to REQUEST "
+                   "character-level tokenizer ops (spell/count) that gen fulfils. CPU backend only "
+                   "until the GPU ignore-index kernel lands.")
+       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -90,7 +97,7 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode);
+                            resume_mode, train_spell_mix);
 }
 
 // --- gen -------------------------------------------------------------------
