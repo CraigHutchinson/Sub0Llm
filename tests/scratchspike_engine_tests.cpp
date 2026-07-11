@@ -74,12 +74,14 @@ struct ScratchOps {
     }
 };
 
-// Run the live interceptor from a task prompt: reset the table, pre-bind slot 0 to this OOV, then greedy
-// decode (topk=1) with the binding-table callbacks. Returns the full produced context.
-std::vector<int> run_task(ScratchOps& ops, const std::string& oov, const std::vector<int>& prompt) {
+// Run the live interceptor from a task: reset the table, pre-bind slot i to the task's binds[i]
+// (single task binds slot 0; a multi task binds all K), then greedy decode (topk=1) with the
+// binding-table callbacks. Returns the full produced context.
+std::vector<int> run_task(ScratchOps& ops, const ss::Task& k) {
     ops.reset();
-    ops.bind(ss::scratch_slot(0), ss::oov_bytes(oov));
-    std::vector<int> ctx = prompt;
+    for (int i = 0; i < static_cast<int>(k.binds.size()); ++i)
+        ops.bind(ss::scratch_slot(i), ss::oov_bytes(k.binds[static_cast<std::size_t>(i)]));
+    std::vector<int> ctx = k.prompt;
     std::mt19937 rng(0);
     sub0::kv_decode_generate(ctx, /*n=*/kWindowT, /*temp=*/1.f, /*topk=*/1, rng, cas::TOK_EOS,
                              /*use_gpu=*/false, /*on_token=*/{},
@@ -100,7 +102,7 @@ int combine_result(const std::vector<int>& out) {
 struct Acc { int ok = 0, n = 0; double rate() const { return n ? static_cast<double>(ok) / n : 0.0; } };
 struct TaskAcc { Acc nth, rt; };
 
-// nth-char at every index of the OOV + one round-trip per OOV, over an OOV subset.
+// nth-char at every index of the OOV + one round-trip per OOV, over an OOV subset (single-binding).
 TaskAcc eval_tasks(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) {
     TaskAcc a;
     const int slot0 = ss::scratch_slot(0);
@@ -108,10 +110,22 @@ TaskAcc eval_tasks(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::
         const std::vector<int> bytes = ss::oov_bytes(oov);
         for (int pos = 0; pos < static_cast<int>(bytes.size()); ++pos) {
             const ss::Task k = ss::nth_char_task(tk, oov, pos);
-            a.nth.ok += (answer_after_sep(run_task(ops, oov, k.prompt)) == k.answer_byte); ++a.nth.n;
+            a.nth.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.nth.n;
         }
         const ss::Task rt = ss::roundtrip_task(tk, oov);
-        a.rt.ok += (combine_result(run_task(ops, oov, rt.prompt)) == slot0); ++a.rt.n;   // recombine -> same slot
+        a.rt.ok += (combine_result(run_task(ops, rt)) == slot0); ++a.rt.n;   // recombine -> same slot
+    }
+    return a;
+}
+
+// Multi-binding: K slots bound per context, query one at random. Measures whether resolution stays
+// correct amid K-1 competing bindings (attention + KV interference) vs the single-binding baseline.
+Acc eval_multi(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    Acc a;
+    std::mt19937_64 rng(seed);
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
+        const ss::Task k = ss::pick_multi_task(tk, oovs, qi, K, rng);
+        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
     }
     return a;
 }
@@ -180,4 +194,48 @@ TEST_CASE("scratchspike: a tiny model resolving dynamically-bound scratch tokens
     WARN(report);
 
     REQUIRE(std::isfinite(last_held_nth));
+}
+
+TEST_CASE("scratchspike: multi-binding disambiguation amid competing slots (drilled vs held-out)", "[.scratchspike]") {
+    REQUIRE(kWindowT <= SEQ_LEN);
+    constexpr int kK = 3;   // slots bound per context
+
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    REQUIRE(kK <= ss::SCRATCH_POOL);
+    ScratchOps ops{tk, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_multi(tk, split, kK, dopt);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model();
+    std::string report = "\n=== scratchspike MULTI-binding (K=" + std::to_string(kK) + " slots/context, VOCAB=" +
+                         std::to_string(VOCAB) + " D_MODEL=" + std::to_string(D_MODEL) +
+                         " drilled=" + std::to_string(split.drilled.size()) +
+                         " held_out=" + std::to_string(split.held_out.size()) + ") ===\n"
+                         "  (query one of K bound slots; the model must resolve the RIGHT one amid the others)\n";
+
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    double last_held = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng);
+        const Acc d = eval_multi(tk, ops, split.drilled, kK, /*seed=*/7);
+        const Acc h = eval_multi(tk, ops, split.held_out, kK, /*seed=*/11);
+        last_held = h.rate();
+        char line[192];
+        std::snprintf(line, sizeof line, "  step %5d | DRILLED nth=%.3f | HELD-OUT nth=%.3f\n",
+                      (r + 1) * kStepsPerEval, d.rate(), h.rate());
+        report += line;
+    }
+    WARN(report);
+
+    REQUIRE(std::isfinite(last_held));
 }

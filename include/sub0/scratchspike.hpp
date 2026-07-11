@@ -72,11 +72,12 @@ inline std::vector<int> oov_bytes(const std::string& oov) {
 // fragments) or it is prompt/binding context -- so training grades ONLY invoking the ops + the answer,
 // never the harness-provided content (the memorization the first spike showed does not generalize).
 struct Task {
-    std::vector<int>          prompt;    // fed to the model at eval (the DEFINE + the query)
+    std::vector<int>          prompt;    // fed to the model at eval (the query context)
     std::vector<int>          trace;     // full baked sequence (training)
     std::vector<std::uint8_t> mask;      // parallel to trace: 1 = trained, 0 = masked (injected/context)
     int                       answer_byte = -1;
-    std::string               oov;       // the bound OOV (for eval bookkeeping / held-out probe)
+    std::string               oov;       // the QUERIED OOV (held-out bookkeeping)
+    std::vector<std::string>  binds;     // slot i is pre-bound to binds[i] (harness); single task = {oov}
 };
 
 namespace detail {
@@ -102,7 +103,7 @@ inline void append_resolve(Task& k, const std::vector<int>& bytes) {
 // prompt: [# n <slot>]   trace: [# n <slot>] [UNCOMBINE <oov> UNCOMBINE_END] [= answer EOS]
 inline Task nth_char_task(const tok::Tokenizer& /*t*/, const std::string& oov, int n, int slot = 0) {
     const std::vector<int> bytes = oov_bytes(oov);
-    Task k; k.oov = oov;
+    Task k; k.oov = oov; k.binds = {oov};
     k.answer_byte = (n >= 0 && n < static_cast<int>(bytes.size())) ? bytes[static_cast<std::size_t>(n)] : '?';
     detail::append_query(k, Q_NTH);
     detail::append_query(k, '0' + n);
@@ -120,7 +121,7 @@ inline Task nth_char_task(const tok::Tokenizer& /*t*/, const std::string& oov, i
 // trace: [~ <slot>] [UNCOMBINE <oov> UNCOMBINE_END] [COMBINE <copied oov> COMBINE_END] <slot> EOS
 inline Task roundtrip_task(const tok::Tokenizer& /*t*/, const std::string& oov, int slot = 0) {
     const std::vector<int> bytes = oov_bytes(oov);
-    Task k; k.oov = oov;
+    Task k; k.oov = oov; k.binds = {oov};
     detail::append_query(k, Q_RT);
     detail::append_query(k, scratch_slot(slot));
     detail::append_resolve(k, bytes);
@@ -128,6 +129,27 @@ inline Task roundtrip_task(const tok::Tokenizer& /*t*/, const std::string& oov, 
     for (int b : bytes) detail::push(k, b, 1);              // the model must COPY the resolved fragments
     detail::push(k, casing::TOK_COMBINE_END, 1);
     detail::push(k, scratch_slot(slot), 0);                // interceptor-injected: the recombined slot
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
+// MULTI-BINDING: K distinct OOVs occupy slots 0..K-1 (all pre-bound by the harness). The context opens
+// with a symbol-table preamble listing all K slot tokens (so they compete in attention + the KV-cache),
+// then queries the Nth char of ONE of them -- the model must resolve the RIGHT slot amid the others.
+// This is the interference/disambiguation test single-binding cannot exercise. prompt:
+// [<slot_0..slot_{K-1}>  # n <slot_q>]   trace: prompt [UNCOMBINE <oov_q> UNCOMBINE_END] [= answer EOS]
+inline Task multi_nth_char_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
+                                int query_idx, int n) {
+    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    const std::vector<int> bytes = oov_bytes(k.oov);
+    k.answer_byte = (n >= 0 && n < static_cast<int>(bytes.size())) ? bytes[static_cast<std::size_t>(n)] : '?';
+    for (int i = 0; i < static_cast<int>(oovs.size()); ++i) detail::append_query(k, scratch_slot(i));  // preamble
+    detail::append_query(k, Q_NTH);
+    detail::append_query(k, '0' + n);
+    detail::append_query(k, scratch_slot(query_idx));      // query the chosen slot
+    detail::append_resolve(k, bytes);
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
     detail::push(k, casing::TOK_EOS, 1);
     return k;
 }
@@ -180,6 +202,44 @@ inline Dataset build_dataset(const tok::Tokenizer& t, const OovSplit& split, con
             }
         }
     }
+    std::shuffle(docs.begin(), docs.end(), rng);
+
+    Dataset ds;
+    ds.doc_starts.push_back(0);
+    for (const Task& d : docs) {
+        ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
+        ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
+        ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
+    }
+    return ds;
+}
+
+// Pick K distinct OOVs from `pool` (the query target first, then K-1 random distractors), shuffled so
+// the target lands in a random slot; returns the built multi-binding task. Shared by the dataset
+// builder and the harness so training and eval use the identical construction.
+inline Task pick_multi_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                            int target_idx, int K, std::mt19937_64& rng) {
+    std::vector<std::string> oovs{ pool[static_cast<std::size_t>(target_idx)] };
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    while (static_cast<int>(oovs.size()) < K) {
+        const std::string& cand = pool[pick(rng)];
+        if (std::find(oovs.begin(), oovs.end(), cand) == oovs.end()) oovs.push_back(cand);
+    }
+    std::shuffle(oovs.begin(), oovs.end(), rng);
+    const int qi = static_cast<int>(std::find(oovs.begin(), oovs.end(), pool[static_cast<std::size_t>(target_idx)]) - oovs.begin());
+    const int len = static_cast<int>(pool[static_cast<std::size_t>(target_idx)].size());
+    std::uniform_int_distribution<int> pn(0, len - 1);
+    return multi_nth_char_task(t, oovs, qi, pn(rng));
+}
+
+// Multi-binding training set: for each drilled OOV as the query target, `tasks_per_oov` docs each with
+// K-1 random drilled distractors. Same shape as build_dataset otherwise.
+inline Dataset build_dataset_multi(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_multi_task(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
 
     Dataset ds;
