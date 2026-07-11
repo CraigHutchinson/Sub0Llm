@@ -36,6 +36,8 @@ namespace sub0::scratchspike {
 // with spellspike so a model can be trained on both curricula together later.
 constexpr int Q_NTH = '#';   // "# n <slot>" -> the Nth character of the slot's bound fragments
 constexpr int Q_RT  = '~';   // "~ <slot>"   -> uncombine then combine back (binding round-trip)
+constexpr int Q_DEF = '&';   // "& <oov>"    -> the model emits combine to BIND the oov (model-driven)
+constexpr int Q_SEL = '?';   // "<slot tag>* ? <tag>" -> select the slot carrying the queried tag
 constexpr int SEP   = '=';   // separates the question from the answer
 
 // The reserved SCRATCH SLOT pool. A handful is enough to prove single- and multi-binding in the spike;
@@ -154,6 +156,46 @@ inline Task multi_nth_char_task(const tok::Tokenizer& /*t*/, const std::vector<s
     return k;
 }
 
+// MODEL-DRIVEN BINDING (#1): the model must EMIT combine to define an OOV given in the prompt -- the
+// interceptor's combine callback assigns a free slot and records slot->fragments. Success = the model
+// COPIED the OOV correctly into the combine region, so the slot binds to the right bytes (measured by
+// the harness reading the resulting binding). No pre-binding: this tests the model DRIVING the binding,
+// not just resolving a harness-supplied one -- the "when/how to bind" half the pre-bound tasks sidestep.
+// prompt: [& <oov bytes>]   trace: [& <oov>] [COMBINE <oov copy> COMBINE_END] <slot> EOS
+inline Task define_task(const tok::Tokenizer& /*t*/, const std::string& oov, int slot = 0) {
+    const std::vector<int> bytes = oov_bytes(oov);
+    Task k; k.oov = oov;                                    // binds stays EMPTY -> harness does NOT pre-bind
+    detail::append_query(k, Q_DEF);
+    for (int b : bytes) detail::append_query(k, b);         // the OOV to define (given context)
+    detail::push(k, casing::TOK_COMBINE, 1);
+    for (int b : bytes) detail::push(k, b, 1);              // the model COPIES the OOV to bind it (graded)
+    detail::push(k, casing::TOK_COMBINE_END, 1);
+    detail::push(k, scratch_slot(slot), 0);                // interceptor-injected slot (masked)
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
+// REASON-OVER-SLOTS (#2): K slots (pre-bound) are each tagged with a distinct byte in a preamble
+// [slot_0 tag_0 ... slot_{K-1} tag_{K-1}], then the query asks which slot carries tag_j. The model must
+// output slot_j -- using the slots as distinct in-context ENTITIES it recalls by association, over
+// generic embedding-less reserved ids. The answer is the SLOT (not a char), so success needs no
+// resolution, only correct selection. prompt: [<slot_i tag_i>* ? tag_j]   trace: prompt [= <slot_j> EOS]
+inline Task select_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
+                        const std::vector<int>& tags, int query_idx) {
+    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    for (int i = 0; i < static_cast<int>(oovs.size()); ++i) {   // slot<->tag pairing preamble (context)
+        detail::append_query(k, scratch_slot(i));
+        detail::append_query(k, tags[static_cast<std::size_t>(i)]);
+    }
+    detail::append_query(k, Q_SEL);
+    detail::append_query(k, tags[static_cast<std::size_t>(query_idx)]);
+    k.answer_byte = scratch_slot(query_idx);               // the graded answer IS the selected slot
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
 // A generated pool of OOVs, split into a DRILLED set (their tasks go into training) and a HELD-OUT set
 // (never trained on -- the clean no-memorization probe: answering a task for a held-out OOV is only
 // possible by resolving its in-context scratch binding, since the model never saw that OOV bound).
@@ -249,6 +291,54 @@ inline Dataset build_dataset_multi(const tok::Tokenizer& t, const OovSplit& spli
         ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
         ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
     }
+    return ds;
+}
+
+inline void append_doc(Dataset& ds, const Task& d) {
+    ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
+    ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
+    ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
+}
+
+// #1 model-driven binding training set: one define per drilled OOV (define_task is deterministic).
+inline Dataset build_dataset_define(const tok::Tokenizer& t, const OovSplit& split, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    for (const std::string& oov : split.drilled) docs.push_back(define_task(t, oov));
+    std::mt19937_64 rng(opt.seed);
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// Build a select task: K OOVs (target first, then K-1 distractors), K distinct byte tags, both shuffled
+// so tag<->slot pairing is non-positional, query one tag. Shared by the builder and the harness.
+inline Task pick_select_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                             int target_idx, int K, std::mt19937_64& rng) {
+    std::vector<std::string> oovs{ pool[static_cast<std::size_t>(target_idx)] };
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    while (static_cast<int>(oovs.size()) < K) {
+        const std::string& cand = pool[pick(rng)];
+        if (std::find(oovs.begin(), oovs.end(), cand) == oovs.end()) oovs.push_back(cand);
+    }
+    std::shuffle(oovs.begin(), oovs.end(), rng);
+    std::vector<int> tags;
+    for (int c = 'A'; static_cast<int>(tags.size()) < K; ++c) tags.push_back(c);   // distinct byte tags
+    std::shuffle(tags.begin(), tags.end(), rng);
+    const int query_idx = std::uniform_int_distribution<int>(0, K - 1)(rng);
+    return select_task(t, oovs, tags, query_idx);
+}
+
+// #2 reason-over-slots training set: for each drilled OOV as the target, tasks_per_oov select tasks.
+inline Dataset build_dataset_select(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_select_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
     return ds;
 }
 

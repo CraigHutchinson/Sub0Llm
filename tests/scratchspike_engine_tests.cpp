@@ -63,14 +63,18 @@ struct ScratchOps {
         if (token >= tk.n_base && token < tk.vocab) return tk.expansion[static_cast<std::size_t>(token)];
         return {token};
     }
-    std::vector<int> combine(const std::vector<int>& frags) const {
+    std::vector<int> combine(const std::vector<int>& frags) {
         std::string key;
         for (int f : frags) key.push_back(static_cast<char>(f & 0xFF));
         const auto it = tk.piece_index.find(key);
         if (it != tk.piece_index.end()) return {it->second};             // exact vocab piece -> that token
         for (std::size_t i = 0; i < bindings.size(); ++i)
             if (bindings[i] == frags) return {ss::SCRATCH_BASE + static_cast<int>(i)};   // existing binding -> its slot
-        return frags;                                                    // (eval pre-binds; unseen OOV stays fragments)
+        if (static_cast<int>(bindings.size()) < ss::SCRATCH_POOL) {      // model-driven bind: assign a free slot
+            bindings.push_back(frags);
+            return {ss::SCRATCH_BASE + static_cast<int>(bindings.size()) - 1};
+        }
+        return frags;                                                    // pool full -> no compression
     }
 };
 
@@ -125,6 +129,29 @@ Acc eval_multi(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::stri
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
         const ss::Task k = ss::pick_multi_task(tk, oovs, qi, K, rng);
+        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+    }
+    return a;
+}
+
+// #1 model-driven binding: no pre-bind; the model emits combine to define the OOV, and success = the
+// interceptor's resulting binding holds the RIGHT bytes (the model copied the OOV correctly).
+Acc eval_define(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) {
+    Acc a;
+    for (const std::string& oov : oovs) {
+        const ss::Task k = ss::define_task(tk, oov);
+        run_task(ops, k);   // k.binds empty -> the model's own combine performs the binding
+        a.ok += (!ops.bindings.empty() && ops.bindings[0] == ss::oov_bytes(oov)); ++a.n;
+    }
+    return a;
+}
+
+// #2 reason-over-slots: K tagged slots, query a tag -> the model must output the matching slot.
+Acc eval_select(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    Acc a;
+    std::mt19937_64 rng(seed);
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
+        const ss::Task k = ss::pick_select_task(tk, oovs, qi, K, rng);
         a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
     }
     return a;
@@ -238,4 +265,62 @@ TEST_CASE("scratchspike: multi-binding disambiguation amid competing slots (dril
     WARN(report);
 
     REQUIRE(std::isfinite(last_held));
+}
+
+// Shared trainer for the two model-drives-it tests below: load tokenizer, split OOVs, build the given
+// dataset, train, and report drilled vs held-out via the supplied evaluator. Returns the last held-out.
+template <class BuildDs, class Eval>
+double run_scratch_experiment(const char* title, const char* legend, BuildDs build_ds, Eval eval) {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{tk, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = build_ds(tk, split, dopt);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model();
+    std::string report = std::string("\n=== ") + title + " (VOCAB=" + std::to_string(VOCAB) +
+                         " D_MODEL=" + std::to_string(D_MODEL) + " drilled=" + std::to_string(split.drilled.size()) +
+                         " held_out=" + std::to_string(split.held_out.size()) + ") ===\n  " + legend + "\n";
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    double last_held = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng);
+        const Acc d = eval(tk, ops, split.drilled);
+        const Acc h = eval(tk, ops, split.held_out);
+        last_held = h.rate();
+        char line[160];
+        std::snprintf(line, sizeof line, "  step %5d | DRILLED %.3f | HELD-OUT %.3f\n",
+                      (r + 1) * kStepsPerEval, d.rate(), h.rate());
+        report += line;
+    }
+    WARN(report);
+    return last_held;
+}
+
+TEST_CASE("scratchspike: MODEL-DRIVEN binding -- the model emits combine to define an OOV", "[.scratchspike]") {
+    const double held = run_scratch_experiment(
+        "scratchspike #1 MODEL-DRIVEN binding",
+        "(no pre-bind: the model emits combine over the OOV; success = it copied it so the slot binds right)",
+        [](const Tokenizer& tk, const ss::OovSplit& s, const ss::DatasetOptions& o) { return ss::build_dataset_define(tk, s, o); },
+        [](const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) { return eval_define(tk, ops, oovs); });
+    REQUIRE(std::isfinite(held));
+}
+
+TEST_CASE("scratchspike: REASON-OVER-SLOTS -- select the slot carrying a queried tag", "[.scratchspike]") {
+    constexpr int kK = 3;
+    const double held = run_scratch_experiment(
+        "scratchspike #2 REASON-OVER-SLOTS (select, K=3)",
+        "(K tagged slots; query a tag -> output the matching slot: slots as distinct in-context entities)",
+        [](const Tokenizer& tk, const ss::OovSplit& s, const ss::DatasetOptions& o) { return ss::build_dataset_select(tk, s, kK, o); },
+        [](const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) { return eval_select(tk, ops, oovs, kK, 7); });
+    REQUIRE(std::isfinite(held));
 }
