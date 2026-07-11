@@ -130,8 +130,12 @@ SUB0_API void  reduce_gradients();                              // publish singl
 // `loss_mask`, if non-null, is a per-token 0/1 array parallel to `data`: predicting token p
 // contributes to the loss only if loss_mask[p] != 0 (masked target positions become
 // LOSS_IGNORE_INDEX; see above). null = every in-length position trains, i.e. today's behavior.
+// `win_binds`, if non-null, is a per-window array of `batch` pointers: win_binds[b] installs window b's
+// scratch-slot bindings (content-derived slot embeddings) for its forward+backward, null for none. Each
+// pointee must outlive this call. null (the default) => no content embeddings, today's behavior exactly.
 SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T,
-                           const int* lengths = nullptr, const std::uint8_t* loss_mask = nullptr);
+                           const int* lengths = nullptr, const std::uint8_t* loss_mask = nullptr,
+                           const ScratchBindings* const* win_binds = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 // AdamW by default; optionally a HYBRID Muon+AdamW split when `use_muon` is set: the hidden 2D GEMM

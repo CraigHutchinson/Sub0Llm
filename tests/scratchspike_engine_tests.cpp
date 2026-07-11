@@ -52,16 +52,21 @@ using ScratchOps = sub0::ScratchTable;
 // Run the live interceptor from a task: reset the table, pre-bind slot i to the task's binds[i]
 // (single task binds slot 0; a multi task binds all K), then greedy decode (topk=1) with the
 // binding-table callbacks. Returns the full produced context.
-std::vector<int> run_task(ScratchOps& ops, const ss::Task& k) {
+std::vector<int> run_task(ScratchOps& ops, const ss::Task& k, bool content_embed = false) {
     ops.reset();
     for (int i = 0; i < static_cast<int>(k.binds.size()); ++i)
         ops.bind(ss::scratch_slot(i), ss::oov_bytes(k.binds[static_cast<std::size_t>(i)]));
+    // Match training: if the model was trained WITH content-derived embeddings, feed this task's bindings
+    // to the decode forward_one too (else a bound slot embeds from the fixed row, a train/eval mismatch).
+    const sub0::ScratchBindings binds = ops.to_bindings();
+    if (content_embed) sub0::set_scratch_bindings(&binds);
     std::vector<int> ctx = k.prompt;
     std::mt19937 rng(0);
     sub0::kv_decode_generate(ctx, /*n=*/kWindowT, /*temp=*/1.f, /*topk=*/1, rng, cas::TOK_EOS,
                              /*use_gpu=*/false, /*on_token=*/{},
                              [&](int t) { return ops.expand(t); },
                              [&](const std::vector<int>& f) { return ops.combine(f); });
+    if (content_embed) sub0::set_scratch_bindings(nullptr);
     return ctx;
 }
 
@@ -129,12 +134,25 @@ Acc eval_select(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::str
 }
 
 // #4 CONTENT reason-over-slots: query a first-letter -> the slot whose OOV starts with it (needs content).
-Acc eval_content(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+Acc eval_content(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed,
+                 bool content_embed = false) {
     Acc a;
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
         const ss::Task k = ss::pick_content_select_task(tk, oovs, qi, K, rng);
-        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+        a.ok += (answer_after_sep(run_task(ops, k, content_embed)) == k.answer_byte); ++a.n;
+    }
+    return a;
+}
+
+// #4b CONTAINS reason-over-slots (order-agnostic): query a char -> the slot whose OOV contains it.
+Acc eval_contains(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed,
+                  bool content_embed = false) {
+    Acc a;
+    std::mt19937_64 rng(seed);
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
+        const ss::Task k = ss::pick_content_contains_task(tk, oovs, qi, K, rng);
+        a.ok += (answer_after_sep(run_task(ops, k, content_embed)) == k.answer_byte); ++a.n;
     }
     return a;
 }
@@ -151,18 +169,31 @@ void reset_opt_state() {
     std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.f);
 }
 
-void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng) {
+// `content_embed` on -> each window is trained WITH content-derived slot embeddings: its document's
+// bindings (ds.doc_bindings) are threaded to train_batch so a bound scratch slot embeds from its fragments.
+void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng, bool content_embed = false) {
     std::vector<std::size_t> starts(kBatch);
     std::vector<int>         lens(kBatch);
+    std::vector<sub0::ScratchBindings>        binds(kBatch);
+    std::vector<const sub0::ScratchBindings*> binds_ptr(kBatch);
     for (int s = 0; s < steps; ++s) {
         for (int b = 0; b < kBatch; ++b) {
             const sub0::Window w = sub0::sample_window(rng, kWindowT, ds.tokens.size(),
                                                        std::span<const std::uint64_t>(ds.doc_starts));
             starts[static_cast<std::size_t>(b)] = w.start;
             lens[static_cast<std::size_t>(b)]   = w.len;
+            if (content_embed) {
+                const std::size_t doc = static_cast<std::size_t>(
+                    std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
+                                     static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
+                binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+                    std::span<const std::vector<int>>(ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                binds_ptr[static_cast<std::size_t>(b)] = &binds[static_cast<std::size_t>(b)];
+            }
         }
         opt.zero_grad();
-        (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, kWindowT, lens.data(), ds.mask.data());
+        (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, kWindowT, lens.data(), ds.mask.data(),
+                                content_embed ? binds_ptr.data() : nullptr);
         opt.step();
     }
 }
@@ -331,6 +362,95 @@ TEST_CASE("scratchspike: CONTENT reason-over-slots -- select the slot whose OOV 
         [](const Tokenizer& tk, const ss::OovSplit& s, const ss::DatasetOptions& o) { return ss::build_dataset_content(tk, s, kK, o); },
         [](const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) { return eval_content(tk, ops, oovs, kK, 7); });
     REQUIRE(std::isfinite(held));
+}
+
+// The payoff of the content-derived-embedding engine change: the SAME content task (#4) that fails at
+// chance WITHOUT it, trained AND evaluated WITH content-derived slot embeddings (each bound slot embeds
+// from its fragments). If the embeddings carry the content signal, held-out should move off 1/K.
+TEST_CASE("scratchspike: CONTENT reasoning WITH content-derived slot embeddings (the engine change)", "[.scratchspike]") {
+    constexpr int kK = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_content(tk, split, kK, dopt);
+    REQUIRE(ds.doc_bindings.size() + 1 == ds.doc_starts.size());   // per-doc bindings are carried
+
+    sub0::build_model();
+    reset_opt_state();
+    std::string report = "\n=== scratchspike #4-CE CONTENT reasoning WITH content-derived embeddings (K=3) ===\n"
+                         "  (identical task to #4 which failed at chance ~1/K WITHOUT the engine change)\n";
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    double last_held = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng, /*content_embed=*/true);
+        const Acc d = eval_content(tk, ops, split.drilled,  kK, /*seed=*/7,  /*content_embed=*/true);
+        const Acc h = eval_content(tk, ops, split.held_out, kK, /*seed=*/11, /*content_embed=*/true);
+        last_held = h.rate();
+        char line[160];
+        std::snprintf(line, sizeof line, "  step %5d | DRILLED %.3f | HELD-OUT %.3f\n",
+                      (r + 1) * kStepsPerEval, d.rate(), h.rate());
+        report += line;
+    }
+    WARN(report);
+    REQUIRE(std::isfinite(last_held));
+}
+
+// A/B on an ORDER-AGNOSTIC content task (which slot CONTAINS char X): same task/everything, trained+eval'd
+// WITHOUT vs WITH content-derived embeddings. FINDING at d128: BOTH stay at chance (~1/K) and match closely
+// -- mean-pool embeddings do NOT deliver usable content reasoning here (the model converges to a degenerate
+// fixed-slot output; a specific char's presence is too diluted in a mean of ~5 byte rows to extract). This
+// is NOT a wiring no-op: "scratch embed: train_batch applies per-window content bindings" proves the content
+// bindings change the forward. The result MOTIVATES the reserved learned CharEncoder arm (per-char features)
+// over mean-pool -- exactly the pluggable extension the scaffold exists for. (First-letter #4 also needs
+// ORDER, which mean-pool discards entirely.)
+TEST_CASE("scratchspike: CONTAINS reasoning -- content-derived embeddings A/B (order-agnostic payoff)", "[.scratchspike]") {
+    constexpr int kK = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_contains(tk, split, kK, dopt);
+
+    auto run = [&](bool ce, double& drilled) {
+        sub0::build_model();
+        reset_opt_state();
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        double held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_steps(ds, opt, kStepsPerEval, rng, ce);
+            held    = eval_contains(tk, ops, split.held_out, kK, /*seed=*/11, ce).rate();
+            drilled = eval_contains(tk, ops, split.drilled,  kK, /*seed=*/7,  ce).rate();
+        }
+        return held;
+    };
+    double d_without = 0, d_with = 0;
+    const double without = run(false, d_without);
+    const double with_ce = run(true,  d_with);
+    char line[288];
+    std::snprintf(line, sizeof line,
+        "\n=== scratchspike CONTAINS content reasoning (K=3) @3000 (chance = %.3f) ===\n"
+        "  WITHOUT content-embed: drilled %.3f  held-out %.3f\n"
+        "  WITH    content-embed: drilled %.3f  held-out %.3f\n",
+        1.0 / kK, d_without, without, d_with, with_ce);
+    WARN(line);
+    REQUIRE(std::isfinite(with_ce));
 }
 
 // The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix

@@ -1236,7 +1236,8 @@ void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.get()); }
 // only if loss_mask[p] != 0 -- masked target positions become LOSS_IGNORE_INDEX, which
 // op_cross_entropy skips (no loss, no grad) and normalizes around. null = today's behavior.
 float train_batch(const int* data, const std::size_t* starts, int batch, int T,
-                  const int* lengths, const std::uint8_t* loss_mask) {
+                  const int* lengths, const std::uint8_t* loss_mask,
+                  const ScratchBindings* const* win_binds) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
@@ -1257,11 +1258,16 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                 }
                 tgt = masked_tgt.data();
             }
+            // Install this window's scratch-slot bindings (content-derived slot embeddings) for its
+            // forward+backward on this worker thread; cleared right after so it never leaks to the next
+            // window or beyond this call. null when unused -> plain tok_emb lookup.
+            if (win_binds) set_scratch_bindings(win_binds[b]);
             graph_reset();
             Node* logits = g_model.forward(data + starts[b], Tb);
             Node* loss   = op_cross_entropy(logits, tgt);
             total += loss->data[0];
             backward(loss, 1.f / static_cast<float>(batch));
+            if (win_binds) set_scratch_bindings(nullptr);
         }
         // (implicit barrier above: every thread's grad slot is complete)
         const int nthreads = omp_get_num_threads();

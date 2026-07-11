@@ -95,6 +95,26 @@ TEST_CASE("scratch embed: a bound slot embeds as its fragment mean in forward", 
     REQUIRE(any_checked);
 }
 
+// --- 2b. train_batch actually applies the per-window content bindings (the training-integration path) --
+TEST_CASE("scratch embed: train_batch applies per-window content bindings", "[scratch][embed]") {
+    sub0::build_model();
+    const int slot = sub0::scratch_slot_id(0);
+    // A single 3-position window (needs 4 tokens: 3 inputs + the last shifted target). The slot is input 1.
+    const std::vector<int> data = {'x', slot, 'y', 'z'};
+    const std::vector<std::size_t> starts = {0};
+
+    std::vector<std::vector<int>> tbl(sub0::SCRATCH_SLOT_COUNT);
+    tbl[0] = {'a', 'b', 'c'};
+    const sub0::ScratchBindings binds{ std::span<const std::vector<int>>(tbl), SlotEncoding::MeanPool };
+    const sub0::ScratchBindings* wb[1] = { &binds };
+
+    // Same weights (train_batch updates only grads, not params); the only difference is the slot's
+    // embedding source, so the forward loss must differ when the content bindings are threaded in.
+    const float loss_plain = sub0::train_batch(data.data(), starts.data(), 1, 3, nullptr, nullptr, nullptr);
+    const float loss_ce    = sub0::train_batch(data.data(), starts.data(), 1, 3, nullptr, nullptr, wb);
+    REQUIRE(loss_plain != loss_ce);
+}
+
 // --- 3. No bindings => byte-identical to the plain path -------------------------------------------
 TEST_CASE("scratch embed: no bindings leaves forward unchanged", "[scratch][embed]") {
     sub0::build_model();

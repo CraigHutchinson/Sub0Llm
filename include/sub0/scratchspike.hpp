@@ -39,6 +39,7 @@ constexpr int Q_RT  = '~';   // "~ <slot>"   -> uncombine then combine back (bin
 constexpr int Q_DEF = '&';   // "& <oov>"    -> the model emits combine to BIND the oov (model-driven)
 constexpr int Q_SEL = '?';   // "<slot tag>* ? <tag>" -> select the slot carrying the queried tag
 constexpr int Q_FST = '!';   // "<slot>* ! <c>" -> select the slot whose OOV starts with char c (CONTENT)
+constexpr int Q_HAS = '%';   // "<slot>* %% <c>" -> select the slot whose OOV CONTAINS char c (order-agnostic)
 constexpr int SEP   = '=';   // separates the question from the answer
 
 // The reserved SCRATCH SLOT pool. A handful is enough to prove single- and multi-binding in the spike;
@@ -215,6 +216,23 @@ inline Task content_select_task(const tok::Tokenizer& /*t*/, const std::vector<s
     return k;
 }
 
+// CONTENT-based, ORDER-AGNOSTIC (#4b): exactly one of the K bound OOVs CONTAINS the queried char; output
+// its slot. Unlike first-letter (positional), this needs only which chars are PRESENT -- what a mean-pool
+// content embedding carries -- so it's the clean test of whether content-derived embeddings deliver a
+// usable signal at all. `has_char` is a char known to be in oovs[query_idx] and in NO other listed oov.
+inline Task content_contains_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
+                                  int query_idx, int has_char) {
+    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    for (int i = 0; i < static_cast<int>(oovs.size()); ++i) detail::append_query(k, scratch_slot(i));
+    detail::append_query(k, Q_HAS);
+    detail::append_query(k, has_char);
+    k.answer_byte = scratch_slot(query_idx);
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
 // A generated pool of OOVs, split into a DRILLED set (their tasks go into training) and a HELD-OUT set
 // (never trained on -- the clean no-memorization probe: answering a task for a held-out OOV is only
 // possible by resolving its in-context scratch binding, since the model never saw that OOV bound).
@@ -242,11 +260,24 @@ struct DatasetOptions {
 
 // A flat training token stream + a parallel loss MASK + the document-start index the window sampler
 // (sub0/window.hpp) consumes -- one task trace per document, so a window never straddles two bindings.
+// `doc_bindings[d]` are document d's per-slot fragments (slot i -> byte ids of binds[i]) -- what the
+// engine needs for content-derived slot embeddings (a window inherits its document's bindings).
 struct Dataset {
-    std::vector<int>           tokens;
-    std::vector<std::uint8_t>  mask;
-    std::vector<std::uint64_t> doc_starts;
+    std::vector<int>                             tokens;
+    std::vector<std::uint8_t>                    mask;
+    std::vector<std::uint64_t>                   doc_starts;
+    std::vector<std::vector<std::vector<int>>>   doc_bindings;   // per doc: slot -> fragment token ids
 };
+
+// Append one task trace as a document, carrying its per-slot bindings (empty for tasks with no pre-bind).
+inline void append_doc(Dataset& ds, const Task& d) {
+    ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
+    ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
+    ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
+    std::vector<std::vector<int>> b;
+    for (const std::string& oov : d.binds) b.push_back(oov_bytes(oov));
+    ds.doc_bindings.push_back(std::move(b));
+}
 
 inline Dataset build_dataset(const tok::Tokenizer& t, const OovSplit& split, const DatasetOptions& opt) {
     std::vector<Task> docs;
@@ -267,11 +298,7 @@ inline Dataset build_dataset(const tok::Tokenizer& t, const OovSplit& split, con
 
     Dataset ds;
     ds.doc_starts.push_back(0);
-    for (const Task& d : docs) {
-        ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
-        ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
-        ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
-    }
+    for (const Task& d : docs) append_doc(ds, d);
     return ds;
 }
 
@@ -305,18 +332,8 @@ inline Dataset build_dataset_multi(const tok::Tokenizer& t, const OovSplit& spli
 
     Dataset ds;
     ds.doc_starts.push_back(0);
-    for (const Task& d : docs) {
-        ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
-        ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
-        ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
-    }
+    for (const Task& d : docs) append_doc(ds, d);
     return ds;
-}
-
-inline void append_doc(Dataset& ds, const Task& d) {
-    ds.tokens.insert(ds.tokens.end(), d.trace.begin(), d.trace.end());
-    ds.mask.insert(ds.mask.end(), d.mask.begin(), d.mask.end());
-    ds.doc_starts.push_back(static_cast<std::uint64_t>(ds.tokens.size()));
 }
 
 // #1 model-driven binding training set: one define per drilled OOV (define_task is deterministic).
@@ -386,6 +403,42 @@ inline Dataset build_dataset_content(const tok::Tokenizer& t, const OovSplit& sp
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
         for (int r = 0; r < opt.tasks_per_oov; ++r)
             docs.push_back(pick_content_select_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// #4b contains: K OOVs where a char in the TARGET is in NO distractor; query that char. Shared fwd/eval.
+inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                       int target_idx, int K, std::mt19937_64& rng) {
+    const std::string& target = pool[static_cast<std::size_t>(target_idx)];
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        std::vector<std::string> oovs{ target };
+        while (static_cast<int>(oovs.size()) < K) {
+            const std::string& cand = pool[pick(rng)];
+            if (std::find(oovs.begin(), oovs.end(), cand) == oovs.end()) oovs.push_back(cand);
+        }
+        std::string distract;                                   // all chars in the non-target OOVs
+        for (const std::string& o : oovs) if (o != target) distract += o;
+        int has = -1;
+        for (char ch : target) if (distract.find(ch) == std::string::npos) { has = static_cast<unsigned char>(ch); break; }
+        if (has < 0) continue;                                  // no char uniquely identifies the target -> retry
+        std::shuffle(oovs.begin(), oovs.end(), rng);
+        const int qi = static_cast<int>(std::find(oovs.begin(), oovs.end(), target) - oovs.begin());
+        return content_contains_task(t, oovs, qi, has);
+    }
+    std::vector<std::string> oovs(static_cast<std::size_t>(K), target);   // degenerate fallback (rare)
+    return content_contains_task(t, oovs, 0, static_cast<unsigned char>(target[0]));
+}
+
+inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_content_contains_task(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);
