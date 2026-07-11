@@ -1333,18 +1333,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                         (1.0 - static_cast<double>(spell_mix)) * 100.0, static_cast<double>(spell_mix) * 100.0,
                         split.drilled.size(), spell_ds.doc_starts.size() - 1, spell_ds.tokens.size());
     }
+    // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
+    // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward
+    // kernel's ignore-index path (targets < 0 inert + per-window active[] normalization). Both are
+    // parity-gated (tests/cuda_tests.cpp "CUDA masked (ignore-index) backward..."), so a masked blend
+    // runs on either backend.
     const bool any_masked = std::any_of(sources.begin(), sources.end(),
                                         [](const sub0::BlendSource& s) { return s.masked(); });
-    // Masked-source blending needs the ignore-index cross-entropy on whichever backend runs it. The
-    // CPU path has it (train_batch's loss_mask); the GPU ce_backward_kernel ignore-index change is
-    // still pending, so refuse a masked blend on the GPU rather than silently mistrain the masked
-    // spans. An unmasked multi-corpus blend runs on either backend today.
-    if (gpu_train && any_masked) {
-        sub0::log::error("train: masked-source blending needs the GPU ignore-index cross-entropy "
-                         "kernel, which is not built yet -- run this blend on the CPU backend "
-                         "(build with SUB0_COMPUTE=CPU) or drop the masked source.");
-        return 1;
-    }
 
     using clock = std::chrono::steady_clock;
     auto win_t0 = clock::now();
@@ -2036,11 +2031,15 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         {
             double pred_mb = 0.0, act_mb = 0.0;
             if (sub0_cuda_train_footprint(64, &pred_mb, &act_mb) == 0 && act_mb > 0.0) {
-                const double gap = std::fabs(pred_mb - act_mb);
-                std::println("footprint check @ batch 64: predicted {:.0f} MiB | measured {:.0f} MiB | gap {:.0f} MiB{}",
+                // Asymmetric (see memplan.hpp): under-prediction beyond the tight tolerance is the
+                // OOM-risk "stale" case; over-prediction is safe up to the wider band (tolerates the
+                // known steady d768 over-estimate without crying wolf every run).
+                const double gap = pred_mb - act_mb;   // >0 over-predict (safe), <0 under-predict (risky)
+                const bool stale = gap < -sub0::memplan::FOOTPRINT_TOLERANCE_MB
+                                || gap >  sub0::memplan::FOOTPRINT_OVERPREDICT_TOLERANCE_MB;
+                std::println("footprint check @ batch 64: predicted {:.0f} MiB | measured {:.0f} MiB | gap {:+.0f} MiB{}",
                              pred_mb, act_mb, gap,
-                             gap > sub0::memplan::FOOTPRINT_TOLERANCE_MB
-                                 ? "  !! memplan.hpp is STALE -- update the device footprint model !!" : "");
+                             stale ? "  !! memplan.hpp is STALE -- update the device footprint model !!" : "");
                 std::fflush(stdout);
             }
         }

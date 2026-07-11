@@ -105,14 +105,25 @@ TEST_CASE("CUDA dense linear matches a CPU reference", "[cuda]") {
 
     REQUIRE(sub0_cuda_linear(X.data(), T, in, out, W.data(), B.data(), Yg.data()) == 0);
 
-    // CPU reference: Y[t,o] = sum_p X[t,p]*W[p,o] + bias[o] (same p-order as the kernel).
+    // CPU reference: Y[t,o] = sum_p X[t,p]*W[p,o] + bias[o] (same p-order as the kernel). launch_linear
+    // is the PRODUCTION GEMM path, which on a BF16 build (GEMM_DTYPE == BF16) rounds its inputs to BF16
+    // -- so a near-zero output element (heavy cancellation of ~O(in) terms) carries large RELATIVE error
+    // and a tight per-element absolute gate is the wrong metric. Compare the whole-vector relative L2
+    // (magnitude-weighted, robust to those near-zero elements), BF16-aware like the gradient/tied-head
+    // parity checks. set_tf32(0) above pins the TF32 path off; it does NOT turn the BF16 GEMM into FP32.
+    double num = 0.0, den = 0.0;
     for (int t = 0; t < T; ++t)
         for (int o = 0; o < out; ++o) {
             float acc = B[static_cast<std::size_t>(o)];
             for (int p = 0; p < in; ++p)
                 acc += X[static_cast<std::size_t>(t) * in + p] * W[static_cast<std::size_t>(p) * out + o];
-            REQUIRE(Yg[static_cast<std::size_t>(t) * out + o] == Catch::Approx(acc).margin(1e-2));
+            const double d = static_cast<double>(Yg[static_cast<std::size_t>(t) * out + o]) - acc;
+            num += d * d; den += static_cast<double>(acc) * acc;
         }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    INFO("dense linear rel-L2 = " << rel);
+    if constexpr (GEMM_DTYPE == Dtype::BF16) REQUIRE(rel < 3e-2);   // BF16 GEMM: behaviour, not bit-parity
+    else                                     REQUIRE(rel < 1e-3);
 }
 
 TEST_CASE("CUDA forward matches the CPU engine logits", "[cuda]") {
@@ -251,6 +262,61 @@ TEST_CASE("CUDA backward matches the CPU reduced gradient", "[cuda]") {
     // F32 storage parity is tight; BF16 storage cannot match raw magnitudes (3 decimal digits) so we
     // assert it points the SAME direction as the CPU gradient and stays finite -- behaviour, not bits.
     REQUIRE(std::isfinite(loss));
+    if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
+    else                                    REQUIRE(rel < 1e-2);
+}
+
+// The ignore-index CE path (loss-masked training -- e.g. the uncombine curriculum's harness-injected
+// spans): a target < 0 (LOSS_IGNORE_INDEX) trains NO gradient and the per-window loss/grad normalizes
+// over the ACTIVE (non-ignored) count, not the raw length. Masks ~1/3 of the rows and checks the GPU
+// reduced gradient AND mean loss match the CPU train_batch loss_mask path -- so the device active[]
+// normalizer agrees with op_cross_entropy's ce_active. If the kernel wrongly normalized by length
+// instead of the active count, the grad magnitudes (and loss) would be off by ~len/active (~1.6x here)
+// -- far outside the gate below. (The dense test above already covers the active == length case.)
+TEST_CASE("CUDA masked (ignore-index) backward matches the CPU loss-masked gradient", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);                                  // full FP32 for a tight parity gate
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8, M = batch * T;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 55, data, starts, ids, targets);
+
+    // Row mask (1 = trained, 0 = ignored): every 3rd row, so each 8-row window keeps >= 5 active and
+    // none is fully masked. The CPU loss_mask is parallel to `data`, read at the TARGET position
+    // p = b*T + t + 1; the GPU instead sees those positions as LOSS_IGNORE_INDEX targets directly.
+    std::vector<std::uint8_t> row_train(static_cast<std::size_t>(M));
+    for (int m = 0; m < M; ++m) row_train[static_cast<std::size_t>(m)] = (m % 3 == 0) ? 0 : 1;
+    std::vector<std::uint8_t> loss_mask(static_cast<std::size_t>(M) + 1, 1);   // loss_mask[0] unused (p >= 1)
+    for (int m = 0; m < M; ++m) loss_mask[static_cast<std::size_t>(m) + 1] = row_train[static_cast<std::size_t>(m)];
+    std::vector<int> targets_masked(targets);
+    for (int m = 0; m < M; ++m)
+        if (!row_train[static_cast<std::size_t>(m)]) targets_masked[static_cast<std::size_t>(m)] = sub0::LOSS_IGNORE_INDEX;
+
+    // CPU reference: loss-masked reduced gradient + mean loss.
+    const float cpu_loss = sub0::train_batch(data.data(), starts.data(), batch, T, nullptr, loss_mask.data());
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    std::vector<float> gpu_grad(n, 0.0f);
+    double gpu_loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets_masked.data(), batch, T, gpu_grad.data(), &gpu_loss) == 0);
+
+    double num = 0.0, den = 0.0, dot = 0.0, gn = 0.0, maxabs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+        num += d * d; den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+        dot += static_cast<double>(gpu_grad[i]) * cpu_grad[i]; gn += static_cast<double>(gpu_grad[i]) * gpu_grad[i];
+        maxabs = std::max(maxabs, std::fabs(d));
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    const double cos = dot / std::max(std::sqrt(gn * den), 1e-30);
+    INFO("masked grad rel-L2 = " << rel << "  cos = " << cos << "  max abs = " << maxabs
+         << "  cpu_loss = " << cpu_loss << "  gpu_loss = " << gpu_loss);
+    REQUIRE(std::isfinite(gpu_loss));
+    REQUIRE(std::fabs(gpu_loss - static_cast<double>(cpu_loss)) < 1e-2);   // active-count normalization agrees
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
     else                                    REQUIRE(rel < 1e-2);
 }
@@ -462,8 +528,17 @@ TEST_CASE("CUDA tied-head GEMM forward+backward matches a hand-computed referenc
         WARN("tied-head check: M=" << M << " C=" << C << " V=" << V
              << " | fwd rel-L2 = " << fwd_reldiff << " | bwd rel-L2 = " << bwd_reldiff);
         REQUIRE(rc == 0);
-        REQUIRE(fwd_reldiff < 1e-3);
-        REQUIRE(bwd_reldiff < 1e-3);
+        // launch_tied_head forces tensor cores and, on a BF16 build (GEMM_DTYPE == BF16), rounds inputs
+        // to BF16 -- so the production-scale rel-L2 (deep V accumulation) sits at a few e-3, above the
+        // tight FP32-era 1e-3 gate. Widen for BF16 (still far below the >>1e-1 a real GEMM regression
+        // shows), the same regime-aware pattern as the gradient parity checks above.
+        if constexpr (GEMM_DTYPE == Dtype::BF16) {
+            REQUIRE(fwd_reldiff < 8e-3);
+            REQUIRE(bwd_reldiff < 8e-3);
+        } else {
+            REQUIRE(fwd_reldiff < 1e-3);
+            REQUIRE(bwd_reldiff < 1e-3);
+        }
     }
 }
 
@@ -1186,11 +1261,13 @@ TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]")
                  << " MiB is near/over the VRAM budget; measurement spills to shared, skipping parity");
             continue;
         }
-        // The measured delta is our exact byte sum plus per-cudaMalloc rounding and WDDM free-memory
-        // noise -- a bounded, batch-independent offset, NOT a percentage. So we allow a fixed MiB
-        // slack (sub0::memplan::FOOTPRINT_TOLERANCE_MB). A missing/extra/resized buffer shifts the
-        // gap by hundreds of MiB -- far outside this band -- which is the regression we want to catch.
-        CHECK(predicted_mb == Catch::Approx(actual_mb).margin(sub0::memplan::FOOTPRINT_TOLERANCE_MB));
+        // Asymmetric band (see memplan.hpp's FOOTPRINT_*_TOLERANCE_MB): UNDER-prediction is the
+        // dangerous, OOM-risk direction and stays tight; OVER-prediction is safe (reserve more than
+        // used) and gets a wider band that still catches a gross buffer drift but tolerates the known,
+        // documented steady d768 over-estimate. gap > 0 = over-predict (safe), < 0 = under-predict (risky).
+        const double gap = predicted_mb - actual_mb;
+        CHECK(gap > -sub0::memplan::FOOTPRINT_TOLERANCE_MB);             // never under-reserve beyond tolerance
+        CHECK(gap <  sub0::memplan::FOOTPRINT_OVERPREDICT_TOLERANCE_MB); // over-reserve stays bounded
     }
 }
 

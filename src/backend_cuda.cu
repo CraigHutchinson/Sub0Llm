@@ -802,7 +802,8 @@ template <int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
                    float* __restrict__ dlogits, double* __restrict__ loss_acc,
-                   int M, int T, int batch, const int* __restrict__ lengths, int row_offset) {
+                   int M, int T, int batch, const int* __restrict__ lengths,
+                   const int* __restrict__ active, int row_offset) {
     constexpr int V = VOCAB;
     const int m = blockIdx.x;
     if (m >= M) return;
@@ -811,12 +812,16 @@ ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ tar
     const int t   = abs_m - b * T;
     const int len = lengths ? lengths[b] : T;
     float* dl     = dlogits + static_cast<size_t>(m) * V;
-    if (t >= len) {                                  // padding row: inert (no grad, no loss)
+    const int tgt = targets[m];
+    // Inert rows contribute no loss and no gradient: a PADDING row (t >= len, a short document padded
+    // up to T) OR a MASKED row (tgt < 0 == LOSS_IGNORE_INDEX, a loss-masked position -- e.g. the
+    // uncombine curriculum's harness-injected spans). Both zero their dlogits and return, matching the
+    // CPU op_cross_entropy's skip.
+    if (t >= len || tgt < 0) {
         for (int j = threadIdx.x; j < V; j += BLOCK) dl[j] = 0.f;
         return;
     }
     const float* lr = logits + static_cast<size_t>(m) * V;
-    const int tgt   = targets[m];
     float mx_partial = -1e30f;
     for (int j = threadIdx.x; j < V; j += BLOCK) mx_partial = fmaxf(mx_partial, lr[j]);
     const float mx = block_reduce_max<BLOCK>(mx_partial);
@@ -824,7 +829,13 @@ ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ tar
     for (int j = threadIdx.x; j < V; j += BLOCK) Z_partial += __expf(lr[j] - mx);
     const float Z = block_reduce_sum<BLOCK>(Z_partial);
     const float invZ = 1.f / Z;
-    const float w    = 1.0f / (static_cast<float>(batch) * static_cast<float>(len));   // per-window mean
+    // Per-window mean over its ACTIVE (non-ignored) positions: active[b] when a loss mask is in play,
+    // else the window's trained length. active == nullptr is the dense/length-only path, where every
+    // in-length position is active, so this is bit-identical to before the mask existed (dense parity
+    // gate unchanged). The (denom<1?1:denom) guards a fully-masked window -- whose rows all returned
+    // above, so the divide never actually runs, but it keeps the weight finite regardless.
+    const int   denom = active ? active[b] : len;
+    const float w     = 1.0f / (static_cast<float>(batch) * static_cast<float>(denom < 1 ? 1 : denom));
     float ptgt_partial = 0.f;                        // capture before any write (dlogits may alias logits)
     for (int j = threadIdx.x; j < V; j += BLOCK) {
         const float p = __expf(lr[j] - mx) * invZ;
@@ -2133,6 +2144,9 @@ struct TrainScratch {
     int*   lengths  = nullptr;     // [MAX_FWD_BATCH] per-window trained length (padding mask for short
                                    // docs) -- constant-sized (16 KiB) so it covers ANY effective batch
                                    // the row budget admits, decoupled from the rows the scratch grows to
+    int*   active   = nullptr;     // [MAX_FWD_BATCH] per-window count of non-ignored targets (the CE
+                                   // loss-mask normalizer) -- only uploaded when a target is masked,
+                                   // else the CE kernel falls back to `lengths` (see ce_backward_kernel)
     act_t* qk_pre   = nullptr;     // [M,2C] pre-norm Q|K stash (USE_QK_NORM only, else stays null and
                                    // costs nothing) -- see qknorm_save_act_kernel's comment and
                                    // memplan.hpp's train_scratch_bytes qk_pre term for why this can't
@@ -2207,6 +2221,7 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     // that the row budget admits (a short-T step runs MORE windows). Constant-size it to the ceiling
     // (16 KiB) instead of the reserving batch, so no legal (batch, T) pair can overrun it.
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.lengths,  static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.active,   static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));  // CE mask normalizer
     // qk_pre [M,2C]: only when USE_QK_NORM (see the TrainScratch::qk_pre comment) -- zero bytes and
     // stays nullptr on the default (qk-norm off) build.
     if constexpr (USE_QK_NORM) SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qk_pre, Mm * 2 * D_MODEL * sizeof(act_t)));
@@ -2223,7 +2238,7 @@ void train_free() {
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
     cudaFree(g_tr.dh);   cudaFree(g_tr.da);   cudaFree(g_tr.dqkv); cudaFree(g_tr.datt);
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
-    cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths);
+    cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths); cudaFree(g_tr.active);
     if constexpr (USE_QK_NORM) cudaFree(g_tr.qk_pre);   // no-op (cudaFree(nullptr) is well-defined) when off
     free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
@@ -2931,7 +2946,7 @@ void forward_train(int batch, int T) {
 //     accumulate=true explicitly (launch_linear_bwd defaults to false, the single-shot-per-forward
 //     case its other call sites want); tied's launch_tied_head_bwd already always accumulates
 //     unconditionally (added for the tied-embeddings two-contribution case), reused here verbatim.
-void head_ce_chunked(int batch, int T, const int* d_lengths) {
+void head_ce_chunked(int batch, int T, const int* d_lengths, const int* d_active) {
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, V = VOCAB;
     const int    M  = batch * T;
@@ -2957,7 +2972,7 @@ void head_ce_chunked(int batch, int T, const int* d_lengths) {
             launch_linear(a_chunk, lm_head, lm_bias, g_tr.logits, rows, C, V, /*force_tc=*/true);
 
         ce_backward_kernel<kCeBlock><<<rows, kCeBlock, 0, g_stream>>>(
-            g_tr.logits, tgt_chunk, g_tr.dlogits, g_tr.loss, rows, T, batch, d_lengths, m0);
+            g_tr.logits, tgt_chunk, g_tr.dlogits, g_tr.loss, rows, T, batch, d_lengths, d_active, m0);
 
         if constexpr (USE_TIED_EMBEDDINGS)
             launch_tied_head_bwd(a_chunk, tok_emb, g_tr.dlogits, da_chunk, gb + L[0].off, rows, C, V, /*force_tc=*/true);
@@ -2973,7 +2988,7 @@ void head_ce_chunked(int batch, int T, const int* d_lengths) {
 // backward kernels accumulate into it (residual skip + through-norm paths), exactly like the CPU
 // tape walk. Weight/bias grads are written straight to their PARAM_LAYOUT offsets (each weight is
 // used once per forward). Loss scaling invM = 1/M makes the result equal the CPU train_batch grad.
-void backward_device(int batch, int T, const int* d_lengths) {
+void backward_device(int batch, int T, const int* d_lengths, const int* d_active) {
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, H = N_HEADS;
     const int    M  = batch * T;
@@ -2986,7 +3001,7 @@ void backward_device(int batch, int T, const int* d_lengths) {
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.loss, 0, sizeof(double), g_stream));
 
     // chunked cross-entropy + lm_head/tied-head fwd+bwd -- see head_ce_chunked's own comment.
-    head_ce_chunked(batch, T, d_lengths);
+    head_ce_chunked(batch, T, d_lengths, d_active);
     // rmsnorm_f: dh starts here (grad into h_final)
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.dh, 0, static_cast<size_t>(MC) * sizeof(float), g_stream));
     launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + kLnF].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
@@ -3598,8 +3613,29 @@ static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, dou
                                         cudaMemcpyHostToDevice, g_stream));
         d_lengths = g_tr.lengths;
     }
+    // Loss masking (ignore-index): a target < 0 (LOSS_IGNORE_INDEX) is a position the model must NOT be
+    // graded on -- e.g. the uncombine curriculum's harness-injected spans (see train_batch's loss_mask /
+    // sub0::LOSS_IGNORE_INDEX). When any are present, the per-window loss/grad normalizes over the ACTIVE
+    // (non-ignored) count, not the raw length, to match the CPU op_cross_entropy. Compute that count per
+    // window here (host-side, from the targets we already hold) and upload it. With no masked target this
+    // stays nullptr and the CE kernel uses `lengths` exactly as before -- the dense path is untouched.
+    const int* d_active = nullptr;
+    bool any_masked = false;
+    for (int i = 0; i < M; ++i) if (targets[i] < 0) { any_masked = true; break; }
+    if (any_masked) {
+        std::vector<int> active(static_cast<size_t>(batch), 0);
+        for (int b = 0; b < batch; ++b) {
+            const int len = lengths ? lengths[b] : T;
+            int a = 0;
+            for (int tt = 0; tt < len; ++tt) if (targets[static_cast<size_t>(b) * T + tt] >= 0) ++a;
+            active[static_cast<size_t>(b)] = a;
+        }
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_tr.active, active.data(), static_cast<size_t>(batch) * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+        d_active = g_tr.active;
+    }
     forward_train(batch, T);
-    backward_device(batch, T, d_lengths);
+    backward_device(batch, T, d_lengths, d_active);
     double loss = 0.0;
     SUB0_CUDA_CHECK(cudaMemcpyAsync(&loss, g_tr.loss, sizeof(double), cudaMemcpyDeviceToHost, g_stream));
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
@@ -4450,14 +4486,14 @@ SUB0_CUDA_API int sub0_cuda_ce_chunk_check(int M, int T, int batch, int chunk_ca
     constexpr int kCeBlock = 256;
     // Reference: one call over the whole M, row_offset=0 (today's unchunked shape).
     ce_backward_kernel<kCeBlock><<<M, kCeBlock, 0, g_stream>>>(
-        dLogits, dTargets, dDlogitsRef, dLossRef, M, T, batch, dLengths, 0);
+        dLogits, dTargets, dDlogitsRef, dLossRef, M, T, batch, dLengths, /*active=*/nullptr, 0);
     // Chunked: identical inputs, split at chunk_cap (may not divide M evenly -- exercises a non-full
     // last chunk), each call given its own absolute row_offset.
     for (int m0 = 0; m0 < M; m0 += chunk_cap) {
         const int rows = (M - m0 < chunk_cap) ? (M - m0) : chunk_cap;
         ce_backward_kernel<kCeBlock><<<rows, kCeBlock, 0, g_stream>>>(
             dLogits + static_cast<size_t>(m0) * V, dTargets + m0,
-            dDlogitsChunk + static_cast<size_t>(m0) * V, dLossChunk, rows, T, batch, dLengths, m0);
+            dDlogitsChunk + static_cast<size_t>(m0) * V, dLossChunk, rows, T, batch, dLengths, /*active=*/nullptr, m0);
     }
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
@@ -4554,7 +4590,7 @@ static int time_train_step(int batch, int T, int iters, double budget_ms, double
     long step = 0;
     auto one_step = [&]() {
         forward_train(batch, T);
-        backward_device(batch, T, nullptr);
+        backward_device(batch, T, nullptr, nullptr);
         device_adam_step(0.001f, ++step, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);   // pure AdamW (this benchmark isn't Muon-specific)
     };
     // Time `n` steps on the stream and return the elapsed milliseconds (GPU event timing is precise).
@@ -4630,7 +4666,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
     long t = 0;
     auto one = [&] {
         forward_train(batch, T);
-        backward_device(batch, T, nullptr);
+        backward_device(batch, T, nullptr, nullptr);
         device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);   // pure AdamW (this benchmark isn't Muon-specific)
     };
     for (int w = 0; w < std::max(4, iters); ++w) one();        // warm the clock + cuBLAS before timing
@@ -4641,7 +4677,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
     double fsum = 0.0, bsum = 0.0, asum = 0.0;
     for (int i = 0; i < iters; ++i) {
         cudaEventRecord(e0, g_stream); forward_train(batch, T);
-        cudaEventRecord(e1, g_stream); backward_device(batch, T, nullptr);
+        cudaEventRecord(e1, g_stream); backward_device(batch, T, nullptr, nullptr);
         cudaEventRecord(e2, g_stream); device_adam_step(0.001f, ++t, 0.9f, 0.95f, 1e-8f, 0.01f, 1.0f, 0.0f);
         cudaEventRecord(e3, g_stream); cudaEventSynchronize(e3);
         float f = 0.f, b = 0.f, a = 0.f;
