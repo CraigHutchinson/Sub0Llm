@@ -1339,11 +1339,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                         static_cast<double>(spell_mix) * 100.0,
                         split.drilled.size(), spell_ds.doc_starts.size() - 1, spell_ds.tokens.size());
     }
-    // --scratch-mix: blend in the scratch-token (context-translation) curriculum -- the model learns to
-    // RESOLVE a dynamically-bound scratch slot for an OOV (index its chars via uncombine), the mechanism
-    // the scratch spike proved generalizes (scratchspike.hpp; project memory
-    // scratch-tokens-context-translation-layer). Multi-binding curriculum (K slots/context) since that
-    // reached perfect held-out resolution. `scratch_ds` must outlive the loop (the source borrows it).
+    // --scratch-mix: blend in the scratch-token (context-translation) curriculum -- the two WORKING
+    // model-side capabilities the spike validated (scratchspike.hpp; project memory
+    // scratch-tokens-context-translation-layer): RESOLVE a dynamically-bound scratch slot for an OOV
+    // (index its chars via uncombine, generalizes to held-out OOVs) + associative REASON-over-slots
+    // (select a slot by its in-context tag). `scratch_ds` must outlive the loop (the source borrows it).
     sub0::scratchspike::Dataset scratch_ds;
     if (scratch_mix > 0.f) {
         sub0::tok::Tokenizer tk;
@@ -1359,7 +1359,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::scratchspike::DatasetOptions dopt;
         dopt.tasks_per_oov = 12;
         dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C2A7C40ULL;   // distinct stream
-        scratch_ds = sub0::scratchspike::build_dataset_multi(tk, split, kScratchK, dopt);
+        // The combined curriculum: the two WORKING model-side capabilities -- multi-slot RESOLUTION +
+        // associative REASON-over-slots (both generalize; content-select #4 + model-driven define #1 are
+        // excluded -- not learnable model-side at this scale, see scratchspike.hpp/build_dataset_scratch).
+        scratch_ds = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt);
         sources.push_back(sub0::BlendSource{
             sub0::TokView::over_int32(scratch_ds.tokens.data(), scratch_ds.tokens.size()),
             std::span<const std::uint64_t>(scratch_ds.doc_starts),

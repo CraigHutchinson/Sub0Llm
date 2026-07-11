@@ -38,6 +38,7 @@ constexpr int Q_NTH = '#';   // "# n <slot>" -> the Nth character of the slot's 
 constexpr int Q_RT  = '~';   // "~ <slot>"   -> uncombine then combine back (binding round-trip)
 constexpr int Q_DEF = '&';   // "& <oov>"    -> the model emits combine to BIND the oov (model-driven)
 constexpr int Q_SEL = '?';   // "<slot tag>* ? <tag>" -> select the slot carrying the queried tag
+constexpr int Q_FST = '!';   // "<slot>* ! <c>" -> select the slot whose OOV starts with char c (CONTENT)
 constexpr int SEP   = '=';   // separates the question from the answer
 
 // The reserved SCRATCH SLOT pool. A handful is enough to prove single- and multi-binding in the spike;
@@ -196,6 +197,24 @@ inline Task select_task(const tok::Tokenizer& /*t*/, const std::vector<std::stri
     return k;
 }
 
+// CONTENT-based reason-over-slots (#4): K slots bound to K OOVs with DISTINCT first letters; a preamble
+// lists only the slots (NO tags), then the query gives a first-letter and asks for the slot whose OOV
+// starts with it. Unlike select (associative: a tag paired with each slot in-context), the discriminator
+// is the slot's CONTENT -- which a generic reserved-id embedding does NOT carry. So this tests whether
+// the model can reason about slot content WITHOUT resolving each slot: the case that motivates
+// content-derived slot embeddings. prompt: [<slot_i>* ! <c>]   trace: prompt [= <slot_q> EOS]
+inline Task content_select_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs, int query_idx) {
+    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    for (int i = 0; i < static_cast<int>(oovs.size()); ++i) detail::append_query(k, scratch_slot(i));   // slots only
+    detail::append_query(k, Q_FST);
+    detail::append_query(k, static_cast<int>(static_cast<unsigned char>(oovs[static_cast<std::size_t>(query_idx)][0])));
+    k.answer_byte = scratch_slot(query_idx);
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
 // A generated pool of OOVs, split into a DRILLED set (their tasks go into training) and a HELD-OUT set
 // (never trained on -- the clean no-memorization probe: answering a task for a held-out OOV is only
 // possible by resolving its in-context scratch binding, since the model never saw that OOV bound).
@@ -336,6 +355,58 @@ inline Dataset build_dataset_select(const tok::Tokenizer& t, const OovSplit& spl
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
         for (int r = 0; r < opt.tasks_per_oov; ++r)
             docs.push_back(pick_select_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// #4 content-select: K OOVs with DISTINCT first letters (target + distractors that differ in first char),
+// query the target's first letter. Shared by the builder and the harness.
+inline Task pick_content_select_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                     int target_idx, int K, std::mt19937_64& rng) {
+    std::vector<std::string> oovs{ pool[static_cast<std::size_t>(target_idx)] };
+    std::vector<char> firsts{ pool[static_cast<std::size_t>(target_idx)][0] };
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    for (int guard = 0; static_cast<int>(oovs.size()) < K && guard < 2000; ++guard) {
+        const std::string& cand = pool[pick(rng)];
+        if (std::find(firsts.begin(), firsts.end(), cand[0]) == firsts.end()) {
+            oovs.push_back(cand); firsts.push_back(cand[0]);
+        }
+    }
+    std::shuffle(oovs.begin(), oovs.end(), rng);
+    const int qi = static_cast<int>(std::find(oovs.begin(), oovs.end(),
+                       pool[static_cast<std::size_t>(target_idx)]) - oovs.begin());
+    return content_select_task(t, oovs, qi);
+}
+
+inline Dataset build_dataset_content(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_content_select_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// The PRODUCTION scratch curriculum: the two WORKING model-side capabilities -- multi-slot RESOLUTION
+// (index a bound slot's chars, generalizes) + associative REASON-over-slots (select a slot by its
+// in-context tag). Deliberately EXCLUDES content-select (#4, needs content-derived embeddings) and
+// model-driven define (#1, copy-bottlenecked) -- neither is learnable model-side at this scale. The mix
+// is 3:1 RESOLUTION-heavy on purpose: associative is EASY (saturates fast) and a 50/50 mix let its
+// gradient starve the HARDER resolution task (resolution held-out dropped 0.31 solo -> 0.13); weighting
+// toward resolution protects the core capability while still teaching the easy associative one.
+inline Dataset build_dataset_scratch(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    std::uniform_int_distribution<int> pick_type(0, 3);   // 0..2 -> resolution (75%), 3 -> associative (25%)
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_type(rng) < 3 ? pick_multi_task(t, split.drilled, qi, K, rng)
+                                              : pick_select_task(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);

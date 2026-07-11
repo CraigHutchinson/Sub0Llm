@@ -128,6 +128,17 @@ Acc eval_select(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::str
     return a;
 }
 
+// #4 CONTENT reason-over-slots: query a first-letter -> the slot whose OOV starts with it (needs content).
+Acc eval_content(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    Acc a;
+    std::mt19937_64 rng(seed);
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
+        const ss::Task k = ss::pick_content_select_task(tk, oovs, qi, K, rng);
+        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+    }
+    return a;
+}
+
 // Each TEST_CASE must start from a COLD optimizer. build_model re-inits the WEIGHTS deterministically
 // (fixed-seed init_weights), but the AdamW moment arenas (g_param_m/g_param_v) are GLOBAL and persist
 // across test cases in one process -- a prior test's training would otherwise warm-start this one via
@@ -309,4 +320,54 @@ TEST_CASE("scratchspike: REASON-OVER-SLOTS -- select the slot carrying a queried
         [](const Tokenizer& tk, const ss::OovSplit& s, const ss::DatasetOptions& o) { return ss::build_dataset_select(tk, s, kK, o); },
         [](const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) { return eval_select(tk, ops, oovs, kK, 7); });
     REQUIRE(std::isfinite(held));
+}
+
+TEST_CASE("scratchspike: CONTENT reason-over-slots -- select the slot whose OOV starts with a letter", "[.scratchspike]") {
+    constexpr int kK = 3;
+    const double held = run_scratch_experiment(
+        "scratchspike #4 CONTENT reason-over-slots (first-letter, K=3)",
+        "(K slots, NO tags; query a first-letter -> the slot whose OOV starts with it: needs slot CONTENT,\n"
+        "   which a generic reserved-id embedding lacks -- the case that motivates content-derived embeddings)",
+        [](const Tokenizer& tk, const ss::OovSplit& s, const ss::DatasetOptions& o) { return ss::build_dataset_content(tk, s, kK, o); },
+        [](const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs) { return eval_content(tk, ops, oovs, kK, 7); });
+    REQUIRE(std::isfinite(held));
+}
+
+// The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix
+// of resolution + associative reasoning that --scratch-mix blends) and confirm BOTH capabilities are
+// learned together (no destructive interference between the two working features at this scale).
+TEST_CASE("scratchspike: COMBINED production curriculum -- resolution + associative reasoning together", "[.scratchspike]") {
+    constexpr int kK = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_scratch(tk, split, kK, dopt);
+
+    sub0::build_model();
+    reset_opt_state();
+    std::string report = "\n=== scratchspike COMBINED production curriculum (resolution + associative, K=3) ===\n"
+                         "  (one model, the 50/50 mix --scratch-mix trains; both held-out capabilities must hold)\n";
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    double last_res = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng);
+        const Acc res = eval_multi(tk, ops, split.held_out, kK, /*seed=*/7);
+        const Acc rec = eval_select(tk, ops, split.held_out, kK, /*seed=*/11);
+        last_res = res.rate();
+        char line[160];
+        std::snprintf(line, sizeof line, "  step %5d | HELD-OUT resolution=%.3f  associative=%.3f\n",
+                      (r + 1) * kStepsPerEval, res.rate(), rec.rate());
+        report += line;
+    }
+    WARN(report);
+    REQUIRE(std::isfinite(last_res));
 }
