@@ -9,6 +9,7 @@
 #include "sub0/core.hpp"
 #include "sub0/scratch_slots.hpp"
 
+#include <random>
 #include <span>
 #include <vector>
 
@@ -43,6 +44,40 @@ TEST_CASE("scratch encoder: mean-pool forward + backward adjoint are exact", "[s
     float zero[C];
     sub0::encode_slot(tab.data(), C, {}, SlotEncoding::MeanPool, zero);
     for (int j = 0; j < C; ++j) REQUIRE(zero[j] == 0.f);
+}
+
+// --- 1b. CharEncoder (learned per-fragment projection + relu, sum-pooled): forward + backward vs FD ---
+TEST_CASE("scratch encoder: CharEncoder forward + backward match finite differences", "[scratch][embed]") {
+    constexpr int C = 3;
+    std::vector<float> tab = { 0.5f, -0.3f, 0.2f,   -0.1f, 0.4f, 0.6f,   0.f, 0.f, 0.f };   // rows 0,1 used
+    std::vector<float> W(static_cast<std::size_t>(C) * C);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 0.6f);
+    for (float& x : W) x = nd(rng);
+    const std::vector<int> frags = {0, 1};
+    const float dout[C] = {1.0f, -0.5f, 0.7f};
+
+    auto loss = [&](const std::vector<float>& tabv, const std::vector<float>& Wv) {
+        float out[C];
+        sub0::encode_slot(tabv.data(), C, frags, SlotEncoding::CharEncoder, out, Wv.data());
+        float L = 0.f; for (int c = 0; c < C; ++c) L += dout[c] * out[c]; return L;   // <dout, out>
+    };
+
+    std::vector<float> Wg(W.size(), 0.f), Tg(tab.size(), 0.f);
+    sub0::encode_slot_bwd(dout, C, frags, SlotEncoding::CharEncoder, Tg.data(), tab.data(), W.data(), Wg.data());
+
+    const float eps = 1e-3f;
+    for (std::size_t i = 0; i < W.size(); ++i) {                       // dW vs finite difference
+        auto wp = W, wm = W; wp[i] += eps; wm[i] -= eps;
+        REQUIRE(Wg[i] == Catch::Approx((loss(tab, wp) - loss(tab, wm)) / (2 * eps)).margin(2e-2));
+    }
+    for (int f : frags) for (int k = 0; k < C; ++k) {                  // d(fragment row) vs finite difference
+        auto tp = tab, tm = tab;
+        tp[static_cast<std::size_t>(f) * C + k] += eps;
+        tm[static_cast<std::size_t>(f) * C + k] -= eps;
+        REQUIRE(Tg[static_cast<std::size_t>(f) * C + k] ==
+                Catch::Approx((loss(tp, W) - loss(tm, W)) / (2 * eps)).margin(2e-2));
+    }
 }
 
 // --- 2. The engine actually feeds the content-derived embedding into forward ----------------------

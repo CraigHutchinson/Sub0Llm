@@ -54,14 +54,32 @@ struct ScratchBindings {
     }
 };
 
-// Forward: out[0..C) = f(fragments) under `enc`. MeanPool = mean of the fragments' tok_emb rows. `tok_emb`
-// is the [vocab, C] embedding table (row-major); `frags` are token ids. Empty fragments -> zero row.
-inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out) {
+// Forward: out[0..C) = f(fragments) under `enc`. `tok_emb` is the [vocab, C] table (row-major); `frags`
+// are token ids; empty -> zero row.
+//   MeanPool    = mean of the fragments' tok_emb rows (no params -> `enc_w` unused).
+//   CharEncoder = sum over fragments of relu(enc_w . row): a learned per-fragment [C,C] projection then a
+//                 relu, SUM-pooled. `enc_w` [C,C] (row-major) is REQUIRED. The per-fragment transform +
+//                 relu give the model capacity to keep per-char features separable (the presence signal
+//                 mean-pool dilutes), which the content-reasoning A/B tests need.
+inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out,
+                        const float* enc_w = nullptr) {
     for (int j = 0; j < C; ++j) out[j] = 0.f;
     if (frags.empty()) return;
     switch (enc) {
+        case SlotEncoding::CharEncoder: {
+            for (int f : frags) {
+                const float* e = tok_emb + static_cast<std::size_t>(f) * C;
+                for (int c = 0; c < C; ++c) {
+                    const float* w = enc_w + static_cast<std::size_t>(c) * C;
+                    float z = 0.f;
+                    for (int k = 0; k < C; ++k) z += w[k] * e[k];
+                    out[c] += z > 0.f ? z : 0.f;                       // relu, summed over fragments
+                }
+            }
+            break;
+        }
         case SlotEncoding::MeanPool:
-        default: {   // CharEncoder/Hash reserved -> MeanPool until implemented
+        default: {   // Hash reserved -> MeanPool until implemented
             const float inv = 1.f / static_cast<float>(frags.size());
             for (int f : frags) {
                 const float* row = tok_emb + static_cast<std::size_t>(f) * C;
@@ -74,10 +92,28 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
 }
 
 // Backward (adjoint of encode_slot): scatter the slot-row grad `dout` into the fragment rows of
-// `tok_emb_grad`. MeanPool: each fragment row gets dout / nfrags (accumulated).
-inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags, SlotEncoding enc, float* tok_emb_grad) {
+// `tok_emb_grad` (and, for CharEncoder, into `enc_w_grad`). MeanPool: dout/nfrags per fragment row.
+// CharEncoder: recompute z per (fragment,channel), gate by relu, accumulate dW and the fragment-row grad.
+inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags, SlotEncoding enc,
+                            float* tok_emb_grad, const float* tok_emb = nullptr,
+                            const float* enc_w = nullptr, float* enc_w_grad = nullptr) {
     if (frags.empty()) return;
     switch (enc) {
+        case SlotEncoding::CharEncoder: {
+            for (int f : frags) {
+                const float* e  = tok_emb + static_cast<std::size_t>(f) * C;
+                float*       eg = tok_emb_grad + static_cast<std::size_t>(f) * C;
+                for (int c = 0; c < C; ++c) {
+                    const float* w  = enc_w + static_cast<std::size_t>(c) * C;
+                    float*       wg = enc_w_grad + static_cast<std::size_t>(c) * C;
+                    float z = 0.f;
+                    for (int k = 0; k < C; ++k) z += w[k] * e[k];
+                    const float dz = (z > 0.f) ? dout[c] : 0.f;        // relu gate; da[c] = dout[c]
+                    for (int k = 0; k < C; ++k) { wg[k] += dz * e[k]; eg[k] += dz * w[k]; }
+                }
+            }
+            break;
+        }
         case SlotEncoding::MeanPool:
         default: {
             const float inv = 1.f / static_cast<float>(frags.size());
