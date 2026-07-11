@@ -15,6 +15,7 @@ add_executable(sub0_tests
   run_config_tests.cpp
   loss_mask_tests.cpp
   spellspike_engine_tests.cpp
+  scratchspike_engine_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.
@@ -34,11 +35,12 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #   ws6_simd_differential_tests.cpp — WS6: scalar-vs-SIMD-rewrite byte/token-identical differential
 #   spellspike_tests.cpp     — spelling-curriculum generator structure (engine-free; the model harness is in sub0_tests)
 #   blend_tests.cpp          — weighted per-window corpus blender (engine-free; rng-neutrality + window bounds)
+#   scratchspike_tests.cpp   — scratch-token (context-translation) curriculum structure (engine-free; harness in sub0_tests)
 #   config_tests.cpp         — pure config decisions (sub0::config): autosize/tune-cache/precision/vocab-curve
 #   frontend_tests.cpp       — memplan VRAM math (clamp + tuner cap) + registry identity/compat (prune)
 #   gguf_tests.cpp           — GGUF header/KV/tensor-table parsing + Llama-MHA import-compat report
 #   muon_tests.cpp           — Newton-Schulz orthogonalization math (the Muon optimizer's core primitive)
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp)
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp)
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
