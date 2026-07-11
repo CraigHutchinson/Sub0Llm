@@ -8,6 +8,7 @@
 #include "sub0/decode.hpp"  // shared KV-cache decode loop (GPU-first, CPU-fallback, EOS-stop)
 #include "sub0/registry.hpp"    // read_config_json: is this model trained with the uncombine curriculum?
 #include "sub0/tokenizer.hpp"   // raw sub0::tok::Tokenizer for the uncombine/combine interceptor callbacks
+#include "sub0/scratch.hpp"     // ScratchTable: binding table backing both spell + scratch resolution
 
 #include <algorithm>
 #include <array>
@@ -58,35 +59,32 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // never matches a real sampled id, so this degrades to today's fixed-budget behavior transparently.
     const int eos_id = sub0::eos_token_id();
 
-    // Uncombine/combine interceptor: enabled ONLY for a model trained with the curriculum (its
-    // config.json records spell_mix > 0). A normal model never emits the markers, and enabling
-    // interception forces the CPU KV-cache decode (the device-decode interceptor is a pending
-    // follow-on), so gate it on the recipe rather than paying that cost for every model. When enabled,
-    // deserialize the raw tokenizer once and build the two callbacks the decode loop calls to fulfil a
-    // requested op (expand a token -> its byte fragments; combine fragments -> their minimal token).
-    // `raw_tok` lives for the whole function so the by-ref captures stay valid through decode.
+    // Combine/uncombine interceptor: enabled ONLY for a model trained with a curriculum that uses it
+    // (config.json records spell_mix > 0 and/or scratch_mix > 0). A normal model never emits the markers,
+    // and enabling interception forces the CPU KV-cache decode (the device-decode interceptor is a pending
+    // follow-on), so gate it on the recipe rather than paying that cost for every model. The stateful
+    // sub0::ScratchTable backs both features: expand/combine over vocab tokens (spell) AND over
+    // dynamically-bound scratch slots (scratch). allow_bind mints a scratch slot for an unseen OOV only
+    // for a scratch model -- a spell-only model's combine stays vocab-only. `raw_tok`/`scratch` live for
+    // the whole function so the by-ref captures stay valid through decode.
     sub0::tok::Tokenizer raw_tok;
+    sub0::ScratchTable   scratch;
     std::function<std::vector<int>(int)>                       expand;
     std::function<std::vector<int>(const std::vector<int>&)>   combine;
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
         sub0::registry::RunConfig cfg;
-        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) && cfg.spell_mix > 0.0) {
+        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) &&
+            (cfg.spell_mix > 0.0 || cfg.scratch_mix > 0.0)) {
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
-                expand = [&raw_tok](int token) -> std::vector<int> {
-                    if (token < raw_tok.n_base || token >= raw_tok.vocab) return {token};
-                    return raw_tok.expansion[static_cast<std::size_t>(token)];
-                };
-                combine = [&raw_tok](const std::vector<int>& frags) -> std::vector<int> {
-                    std::string key;
-                    for (int f : frags) key.push_back(static_cast<char>(f & 0xFF));
-                    const auto it = raw_tok.piece_index.find(key);
-                    return it != raw_tok.piece_index.end() ? std::vector<int>{it->second} : frags;
-                };
-                std::println(stderr, "gen: uncombine/combine interceptor enabled "
-                                     "(model trained with --spell-mix {:.2f})", cfg.spell_mix);
+                scratch.tk = &raw_tok;
+                scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
+                expand  = [&scratch](int token) { return scratch.expand(token); };
+                combine = [&scratch](const std::vector<int>& frags) { return scratch.combine(frags); };
+                std::println(stderr, "gen: combine/uncombine interceptor enabled "
+                                     "(spell-mix {:.2f}, scratch-mix {:.2f})", cfg.spell_mix, cfg.scratch_mix);
             }
         }
     }

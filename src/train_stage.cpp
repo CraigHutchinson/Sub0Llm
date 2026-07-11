@@ -30,6 +30,7 @@
 #include "sub0/window.hpp"   // sample_window_start: keep each training window inside one document
 #include "sub0/blend.hpp"    // weighted per-window multi-source blending (base corpus + curriculum)
 #include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a --spell-mix blend source)
+#include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a --scratch-mix blend source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -876,7 +877,7 @@ static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
-                                          int optimizer, int resume_mode, float spell_mix) {
+                                          int optimizer, int resume_mode, float spell_mix, float scratch_mix) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1132,7 +1133,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.qk_norm = static_cast<int>(USE_QK_NORM);
         cfg.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
         cfg.batch = batch; cfg.lr = lr; cfg.seed = seed;
-        cfg.spell_mix = spell_mix;   // the blend recipe: re-enforced on resume like optimizer (below)
+        cfg.spell_mix = spell_mix;     // the blend recipe: re-enforced on resume like optimizer (below)
+        cfg.scratch_mix = scratch_mix;
         return cfg;
     };
 
@@ -1219,6 +1221,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                 "(the persisted blend recipe wins on resume)",
                                 static_cast<double>(spell_mix), persisted.spell_mix);
                 spell_mix = static_cast<float>(persisted.spell_mix);
+            }
+            if (persisted.scratch_mix != static_cast<double>(scratch_mix)) {
+                sub0::log::info("  config.json overrides this invocation's --scratch-mix: {:.3f} -> {:.3f} "
+                                "(the persisted blend recipe wins on resume)",
+                                static_cast<double>(scratch_mix), persisted.scratch_mix);
+                scratch_mix = static_cast<float>(persisted.scratch_mix);
             }
         }
     }
@@ -1322,17 +1330,50 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         dopt.tasks_per_word = 12;
         dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C0113B1EULL;   // distinct stream from window sampling
         spell_ds = sub0::spellspike::build_dataset(tk, split, dopt);
-        sources[kBaseSource].weight = 1.0 - static_cast<double>(spell_mix);   // remaining windows -> base
         sources.push_back(sub0::BlendSource{
             sub0::TokView::over_int32(spell_ds.tokens.data(), spell_ds.tokens.size()),
             std::span<const std::uint64_t>(spell_ds.doc_starts),
             std::span<const std::uint8_t>(spell_ds.mask),
             static_cast<double>(spell_mix) });
-        sub0::log::line("blend: base {:.0f}% + uncombine curriculum {:.0f}% "
-                        "({} task words, {} traces, {} tokens)",
-                        (1.0 - static_cast<double>(spell_mix)) * 100.0, static_cast<double>(spell_mix) * 100.0,
+        sub0::log::line("blend: uncombine curriculum {:.0f}% ({} task words, {} traces, {} tokens)",
+                        static_cast<double>(spell_mix) * 100.0,
                         split.drilled.size(), spell_ds.doc_starts.size() - 1, spell_ds.tokens.size());
     }
+    // --scratch-mix: blend in the scratch-token (context-translation) curriculum -- the model learns to
+    // RESOLVE a dynamically-bound scratch slot for an OOV (index its chars via uncombine), the mechanism
+    // the scratch spike proved generalizes (scratchspike.hpp; project memory
+    // scratch-tokens-context-translation-layer). Multi-binding curriculum (K slots/context) since that
+    // reached perfect held-out resolution. `scratch_ds` must outlive the loop (the source borrows it).
+    sub0::scratchspike::Dataset scratch_ds;
+    if (scratch_mix > 0.f) {
+        sub0::tok::Tokenizer tk;
+        std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
+        if (!tis.good() || !sub0::tok::deserialize(tk, tis) || tk.vocab != VOCAB) {
+            sub0::log::error("train: --scratch-mix set but the tokenizer '{}' could not be loaded (or vocab "
+                             "!= engine VOCAB {})", sub0::default_tokenizer(), VOCAB);
+            return 1;
+        }
+        constexpr int kScratchK = sub0::scratchspike::SCRATCH_POOL;   // slots/context the curriculum exercises
+        const sub0::scratchspike::OovSplit split =
+            sub0::scratchspike::make_oov_split(tk, /*n_total=*/400, /*drilled_frac=*/1.0, /*seed=*/seed);
+        sub0::scratchspike::DatasetOptions dopt;
+        dopt.tasks_per_oov = 12;
+        dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C2A7C40ULL;   // distinct stream
+        scratch_ds = sub0::scratchspike::build_dataset_multi(tk, split, kScratchK, dopt);
+        sources.push_back(sub0::BlendSource{
+            sub0::TokView::over_int32(scratch_ds.tokens.data(), scratch_ds.tokens.size()),
+            std::span<const std::uint64_t>(scratch_ds.doc_starts),
+            std::span<const std::uint8_t>(scratch_ds.mask),
+            static_cast<double>(scratch_mix) });
+        sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, {} OOVs, {} traces, {} tokens)",
+                        static_cast<double>(scratch_mix) * 100.0, kScratchK, split.drilled.size(),
+                        scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
+    }
+    // The base corpus gets whatever fraction the curricula don't claim.
+    sources[kBaseSource].weight =
+        std::max(0.0, 1.0 - static_cast<double>(spell_mix) - static_cast<double>(scratch_mix));
+    if (spell_mix > 0.f || scratch_mix > 0.f)
+        sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
     // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
     // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward
     // kernel's ignore-index path (targets < 0 inert + per-window active[] normalization). Both are

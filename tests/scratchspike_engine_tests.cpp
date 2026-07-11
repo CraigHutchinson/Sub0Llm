@@ -17,6 +17,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/decode.hpp"
+#include "sub0/scratch.hpp"
 #include "sub0/scratchspike.hpp"
 #include "sub0/window.hpp"
 
@@ -42,41 +43,11 @@ constexpr int    kOovPool      = 400;   // many distinct OOVs -> force the gener
 constexpr double kDrilledFrac  = 0.7;
 constexpr float  kLr           = 0.003f;
 
-// The stateful interceptor: a per-context BINDING TABLE (slot -> fragments) plus the two deterministic
-// tokenizer-layer ops the decode loop calls. Reset per eval task; the harness pre-binds the scratch
-// slot to the task's OOV (simulating a prior in-context definition), then the model must resolve
-// references to it. combine also returns an EXISTING binding's slot (the round-trip's inverse leg).
-struct ScratchOps {
-    const Tokenizer&              tk;
-    std::vector<std::vector<int>> bindings;   // bindings[i] are the fragments of slot SCRATCH_BASE+i
-
-    void reset() { bindings.clear(); }
-    void bind(int slot, std::vector<int> frags) {
-        const std::size_t i = static_cast<std::size_t>(slot - ss::SCRATCH_BASE);
-        if (bindings.size() <= i) bindings.resize(i + 1);
-        bindings[i] = std::move(frags);
-    }
-    std::vector<int> expand(int token) const {
-        const int s = token - ss::SCRATCH_BASE;
-        if (s >= 0 && s < static_cast<int>(bindings.size()) && !bindings[static_cast<std::size_t>(s)].empty())
-            return bindings[static_cast<std::size_t>(s)];                 // scratch slot -> its bound fragments
-        if (token >= tk.n_base && token < tk.vocab) return tk.expansion[static_cast<std::size_t>(token)];
-        return {token};
-    }
-    std::vector<int> combine(const std::vector<int>& frags) {
-        std::string key;
-        for (int f : frags) key.push_back(static_cast<char>(f & 0xFF));
-        const auto it = tk.piece_index.find(key);
-        if (it != tk.piece_index.end()) return {it->second};             // exact vocab piece -> that token
-        for (std::size_t i = 0; i < bindings.size(); ++i)
-            if (bindings[i] == frags) return {ss::SCRATCH_BASE + static_cast<int>(i)};   // existing binding -> its slot
-        if (static_cast<int>(bindings.size()) < ss::SCRATCH_POOL) {      // model-driven bind: assign a free slot
-            bindings.push_back(frags);
-            return {ss::SCRATCH_BASE + static_cast<int>(bindings.size()) - 1};
-        }
-        return frags;                                                    // pool full -> no compression
-    }
-};
+// The stateful interceptor is the PRODUCTION binding table (sub0::ScratchTable, include/sub0/scratch.hpp)
+// -- the spike exercises the exact component gen_stage drives, no duplicate. Reset per eval task; the
+// harness pre-binds a scratch slot to the task's OOV (a prior in-context definition), then the model must
+// resolve references to it. combine returns an existing binding's slot, or (allow_bind) mints a fresh one.
+using ScratchOps = sub0::ScratchTable;
 
 // Run the live interceptor from a task: reset the table, pre-bind slot i to the task's binds[i]
 // (single task binds slot 0; a multi task binds all K), then greedy decode (topk=1) with the
@@ -157,6 +128,18 @@ Acc eval_select(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::str
     return a;
 }
 
+// Each TEST_CASE must start from a COLD optimizer. build_model re-inits the WEIGHTS deterministically
+// (fixed-seed init_weights), but the AdamW moment arenas (g_param_m/g_param_v) are GLOBAL and persist
+// across test cases in one process -- a prior test's training would otherwise warm-start this one via
+// leftover momentum, inflating convergence (this is exactly why an earlier "multi-binding = 1.000"
+// reading was really warm-started by the single-binding test that ran before it). Zero them so every
+// experiment is independent + reproducible whether run alone or as part of the suite.
+void reset_opt_state() {
+    const std::size_t n = sub0::trainable_floats();
+    std::fill(sub0::adam_m_ptr(), sub0::adam_m_ptr() + n, 0.f);
+    std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.f);
+}
+
 void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng) {
     std::vector<std::size_t> starts(kBatch);
     std::vector<int>         lens(kBatch);
@@ -185,7 +168,7 @@ TEST_CASE("scratchspike: a tiny model resolving dynamically-bound scratch tokens
         REQUIRE(sub0::tok::deserialize(tk, is));
     }
     REQUIRE(tk.vocab == VOCAB);
-    ScratchOps ops{tk, {}};
+    ScratchOps ops{&tk, true, {}};
 
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     REQUIRE_FALSE(split.drilled.empty());
@@ -196,6 +179,7 @@ TEST_CASE("scratchspike: a tiny model resolving dynamically-bound scratch tokens
     REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
 
     sub0::build_model();
+    reset_opt_state();   // cold optimizer per test (see reset_opt_state)
     std::string report = "\n=== scratchspike context-translation (VOCAB=" + std::to_string(VOCAB) +
                          " D_MODEL=" + std::to_string(D_MODEL) + " tied=" + std::to_string(USE_TIED_EMBEDDINGS) +
                          " oov_pool=" + std::to_string(kOovPool) +
@@ -235,7 +219,7 @@ TEST_CASE("scratchspike: multi-binding disambiguation amid competing slots (dril
     }
     REQUIRE(tk.vocab == VOCAB);
     REQUIRE(kK <= ss::SCRATCH_POOL);
-    ScratchOps ops{tk, {}};
+    ScratchOps ops{&tk, true, {}};
 
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
@@ -243,6 +227,7 @@ TEST_CASE("scratchspike: multi-binding disambiguation amid competing slots (dril
     REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
 
     sub0::build_model();
+    reset_opt_state();   // cold optimizer per test (see reset_opt_state)
     std::string report = "\n=== scratchspike MULTI-binding (K=" + std::to_string(kK) + " slots/context, VOCAB=" +
                          std::to_string(VOCAB) + " D_MODEL=" + std::to_string(D_MODEL) +
                          " drilled=" + std::to_string(split.drilled.size()) +
@@ -278,7 +263,7 @@ double run_scratch_experiment(const char* title, const char* legend, BuildDs bui
         REQUIRE(sub0::tok::deserialize(tk, is));
     }
     REQUIRE(tk.vocab == VOCAB);
-    ScratchOps ops{tk, {}};
+    ScratchOps ops{&tk, true, {}};
 
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
@@ -286,6 +271,7 @@ double run_scratch_experiment(const char* title, const char* legend, BuildDs bui
     REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
 
     sub0::build_model();
+    reset_opt_state();   // cold optimizer per test (see reset_opt_state)
     std::string report = std::string("\n=== ") + title + " (VOCAB=" + std::to_string(VOCAB) +
                          " D_MODEL=" + std::to_string(D_MODEL) + " drilled=" + std::to_string(split.drilled.size()) +
                          " held_out=" + std::to_string(split.held_out.size()) + ") ===\n  " + legend + "\n";

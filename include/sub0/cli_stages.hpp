@@ -20,7 +20,7 @@
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
-                                int optimizer, int resume_mode, float spell_mix);
+                                int optimizer, int resume_mode, float spell_mix, float scratch_mix);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
@@ -54,6 +54,7 @@ inline int run_train(int argc, char** argv) {
     std::string train_keep = "3";
     int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
     float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
+    float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -82,8 +83,12 @@ inline int run_train(int argc, char** argv) {
     app.add_option("--spell-mix", train_spell_mix,
                    "Fraction of training windows drawn from the synthetic uncombine/combine curriculum "
                    "(0 = base corpus only; e.g. 0.1 = ~10% curriculum). Teaches the model to REQUEST "
-                   "character-level tokenizer ops (spell/count) that gen fulfils. CPU backend only "
-                   "until the GPU ignore-index kernel lands.")
+                   "character-level tokenizer ops (spell/count) that gen fulfils.")
+       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
+    app.add_option("--scratch-mix", train_scratch_mix,
+                   "Fraction of training windows drawn from the scratch-token (context-translation) "
+                   "curriculum (0 = off). Teaches the model to RESOLVE a dynamically-bound scratch slot "
+                   "for an OOV, so an OOV costs 1 token per mention (gen resolves via a binding table).")
        ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
     CLI11_PARSE(app, argc, argv);
 
@@ -97,7 +102,7 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode, train_spell_mix);
+                            resume_mode, train_spell_mix, train_scratch_mix);
 }
 
 // --- gen -------------------------------------------------------------------
