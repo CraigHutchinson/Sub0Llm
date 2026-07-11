@@ -13,23 +13,16 @@
 
 #pragma once
 
-#include "sub0/casing.hpp"      // TOK_RESERVED_* slot ids
-#include "sub0/tokenizer.hpp"   // sub0::tok::Tokenizer (expansion / piece_index)
+#include "sub0/scratch_slots.hpp"   // the engine-safe foundation: slot range + ScratchBindings + encoders
+#include "sub0/tokenizer.hpp"       // sub0::tok::Tokenizer (expansion / piece_index)
 
 #include <string>
 #include <vector>
 
 namespace sub0 {
 
-// The reserved scratch-slot pool. slot i == SCRATCH_SLOT_BASE + i. The spike used TOK_RESERVED_4..7; the
-// production table exposes the full reserved headroom (TOK_RESERVED_4..9). A larger context-translation
-// layer would carve a bigger reserved range (a tokenizer-budget change) -- this is the current headroom.
-constexpr int SCRATCH_SLOT_BASE  = casing::TOK_RESERVED_4;
-constexpr int SCRATCH_SLOT_COUNT = casing::TOK_MARKER_COUNT - casing::TOK_RESERVED_4;   // 4..9 -> 6 slots
-constexpr int scratch_slot_id(int i) { return SCRATCH_SLOT_BASE + i; }
-constexpr bool is_scratch_slot(int token) {
-    return token >= SCRATCH_SLOT_BASE && token < SCRATCH_SLOT_BASE + SCRATCH_SLOT_COUNT;
-}
+// (Slot range constants -- SCRATCH_SLOT_BASE / SCRATCH_SLOT_COUNT / scratch_slot_id / is_scratch_slot --
+// now live in scratch_slots.hpp, the single engine-safe home, so the backend can share them.)
 
 // The per-context binding table + the two deterministic tokenizer-layer ops the decode interceptor
 // calls. `expand` and `combine` subsume the plain vocab case (a spell-only model uses expand/combine
@@ -48,6 +41,12 @@ struct ScratchTable {
         if (i < 0 || i >= SCRATCH_SLOT_COUNT) return;
         if (static_cast<int>(bindings.size()) <= i) bindings.resize(static_cast<std::size_t>(i) + 1);
         bindings[static_cast<std::size_t>(i)] = std::move(frags);
+    }
+
+    // The engine-facing view of these bindings (for content-derived slot embeddings; set via the engine's
+    // set_scratch_bindings before forward/decode). Borrows `bindings` -- valid while this table lives.
+    ScratchBindings to_bindings(SlotEncoding enc = SlotEncoding::MeanPool) const {
+        return ScratchBindings{ std::span<const std::vector<int>>(bindings), enc };
     }
 
     // Fulfil a TOK_UNCOMBINE: a scratch slot -> its bound fragments; a vocab word -> its expansion;

@@ -16,6 +16,7 @@ add_executable(sub0_tests
   loss_mask_tests.cpp
   spellspike_engine_tests.cpp
   scratchspike_engine_tests.cpp
+  scratch_embed_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.

@@ -22,6 +22,7 @@
 #include "sub0/core.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
+#include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
 
 #include <algorithm>
 #include <array>
@@ -262,13 +263,28 @@ static inline float dsilu_fast(float v) {
 //  Differentiable ops (forward builders)
 // ============================================================================
 
+// Per-context scratch-slot bindings for content-derived slot embeddings: when set, a BOUND scratch-slot
+// token embeds as a function of its fragments (encode_slot) instead of a fixed reserved-id row. null =>
+// today's plain tok_emb lookup, byte-for-byte. thread_local so each data-parallel train_batch worker
+// carries its own window's bindings; set via set_scratch_bindings before forward/forward_one. Backward
+// re-consults it (same thread, same step), so no per-node storage is needed.
+thread_local const ScratchBindings* g_scratch_binds = nullptr;
+
 static Node* op_embed(Node* table, const int* ids, int T) {
     const int C = table->cols;
     Node* out = mk_node(Op::Embed, T, C);
     out->w = table; out->ids = ids;
     Mat o = mat(out->data, T, C), tab = mat(table->data, table->rows, C);
-    for (int t = 0; t < T; ++t)
-        for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
+    const ScratchBindings* binds = g_scratch_binds;   // null (the common case) => plain lookup, unchanged
+    for (int t = 0; t < T; ++t) {
+        // A bound scratch slot embeds from its fragments; pos_emb ids (small positions) never satisfy
+        // is_scratch_slot, so this branch is naturally inert for the position table.
+        if (binds && is_scratch_slot(ids[t]) && binds->bound(ids[t]))
+            encode_slot(table->data.data(), C, binds->fragments(ids[t]), binds->encoding,
+                        out->data.data() + static_cast<std::size_t>(t) * C);
+        else
+            for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
+    }
     return out;
 }
 
@@ -566,8 +582,16 @@ static void backward_node(Node& n) {
     case Op::Embed: {
         const int T = n.rows, C = n.cols;
         Mat wg = mat(n.w->grad, n.w->rows, C), ng = mat(n.grad, T, C);
-        for (int t = 0; t < T; ++t)
-            for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
+        const ScratchBindings* binds = g_scratch_binds;
+        for (int t = 0; t < T; ++t) {
+            // Adjoint of op_embed's content-derived branch: a bound scratch slot's row grad flows to its
+            // fragment rows (encode_slot_bwd); else the plain scatter into the token's own row.
+            if (binds && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t]))
+                encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
+                                binds->fragments(n.ids[t]), binds->encoding, n.w->grad.data());
+            else
+                for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
+        }
         break;
     }
     case Op::Add: {
@@ -1030,8 +1054,12 @@ struct Model {
         float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
 
-        const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
-        for (int j = 0; j < C; ++j) h[j] = emb[j];
+        if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
+            encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h);
+        } else {
+            const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
+            for (int j = 0; j < C; ++j) h[j] = emb[j];
+        }
         if constexpr (POS_ENCODING == PosEncoding::Absolute) {
             const float* pe = pos_emb->data.data() + static_cast<size_t>(pos) * C;
             for (int j = 0; j < C; ++j) h[j] += pe[j];
@@ -1133,6 +1161,11 @@ void build_model() {
     // init-scale (e.g. after Muon/AdamW step tests or the saturating-activation test ran first).
     g_model.init_weights();
 }
+
+// Install (or clear, with nullptr) the per-context scratch-slot bindings the next forward/forward_one on
+// THIS thread will use for content-derived slot embeddings. The pointee must outlive the forward+backward
+// it drives. Null restores the plain tok_emb lookup exactly. See g_scratch_binds above.
+void set_scratch_bindings(const ScratchBindings* b) { g_scratch_binds = b; }
 
 // save_model / load_model live in engine_core.cpp: serialization is backend-agnostic
 // and goes through params_ptr() + the host/device sync hooks.

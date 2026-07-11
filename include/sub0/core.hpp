@@ -104,6 +104,13 @@ SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T,
 // positions < SEQ_LEN. See src/backend_cpu.cpp.
 SUB0_API void        kv_reset();
 SUB0_API const float* forward_one(int id, int pos);
+
+// Content-derived scratch-slot embeddings: install the per-context bindings the next forward/forward_one
+// on this thread uses (a BOUND scratch slot then embeds from its fragments instead of a fixed reserved-id
+// row). null clears it -> plain tok_emb lookup, unchanged. See include/sub0/scratch_slots.hpp for the
+// ScratchBindings view + the encoders; a forward declaration keeps this header free of that include.
+struct ScratchBindings;
+SUB0_API void set_scratch_bindings(const ScratchBindings* bindings);
 // A target of LOSS_IGNORE_INDEX means "do not train on this position": cross_entropy adds no loss and
 // no gradient for it, and normalizes by the count of ACTIVE (non-ignored) positions (PyTorch's
 // `ignore_index` + reduction='mean'). Valid token ids are [0,VOCAB), so a negative is unambiguous.
