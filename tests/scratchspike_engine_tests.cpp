@@ -52,13 +52,15 @@ using ScratchOps = sub0::ScratchTable;
 // Run the live interceptor from a task: reset the table, pre-bind slot i to the task's binds[i]
 // (single task binds slot 0; a multi task binds all K), then greedy decode (topk=1) with the
 // binding-table callbacks. Returns the full produced context.
-std::vector<int> run_task(ScratchOps& ops, const ss::Task& k, bool content_embed = false) {
+std::vector<int> run_task(ScratchOps& ops, const ss::Task& k, bool content_embed = false,
+                          sub0::SlotEncoding enc = sub0::SlotEncoding::MeanPool, const float* enc_w = nullptr) {
     ops.reset();
     for (int i = 0; i < static_cast<int>(k.binds.size()); ++i)
         ops.bind(ss::scratch_slot(i), ss::oov_bytes(k.binds[static_cast<std::size_t>(i)]));
     // Match training: if the model was trained WITH content-derived embeddings, feed this task's bindings
     // to the decode forward_one too (else a bound slot embeds from the fixed row, a train/eval mismatch).
-    const sub0::ScratchBindings binds = ops.to_bindings();
+    sub0::ScratchBindings binds = ops.to_bindings(enc);
+    binds.enc_w = enc_w;   // CharEncoder weights (eval needs no grad -> enc_w_grad stays null)
     if (content_embed) sub0::set_scratch_bindings(&binds);
     std::vector<int> ctx = k.prompt;
     std::mt19937 rng(0);
@@ -147,14 +149,68 @@ Acc eval_content(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::st
 
 // #4b CONTAINS reason-over-slots (order-agnostic): query a char -> the slot whose OOV contains it.
 Acc eval_contains(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed,
-                  bool content_embed = false) {
+                  bool content_embed = false, sub0::SlotEncoding enc = sub0::SlotEncoding::MeanPool,
+                  const float* enc_w = nullptr) {
     Acc a;
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
         const ss::Task k = ss::pick_content_contains_task(tk, oovs, qi, K, rng);
-        a.ok += (answer_after_sep(run_task(ops, k, content_embed)) == k.answer_byte); ++a.n;
+        a.ok += (answer_after_sep(run_task(ops, k, content_embed, enc, enc_w)) == k.answer_byte); ++a.n;
     }
     return a;
+}
+
+// Single-threaded CharEncoder training: the learned enc_w [C,C] has NO per-thread grad reduction (a
+// multi-threaded train_batch would race on enc_w_grad), so this runs the forward+backward loop on one
+// thread, accumulating the model grad (reduce_gradients + opt.step) AND the encoder grad (a plain SGD on
+// enc_w). use_ce=false trains the plain baseline (no content embeddings) the SAME single-threaded way, so
+// the A/B is apples-to-apples. Mirrors train_batch's masking (loss_mask -> LOSS_IGNORE_INDEX targets).
+struct EncAdam { std::vector<float> m, v; long t = 0; };
+void train_ce_steps(const ss::Dataset& ds, sub0::AdamW& opt, std::vector<float>& enc_w,
+                    std::vector<float>& enc_w_grad, EncAdam& ea, float enc_lr, int steps,
+                    std::mt19937& rng, bool use_ce) {
+    std::vector<int> masked_tgt(kWindowT);
+    for (int s = 0; s < steps; ++s) {
+        std::fill(enc_w_grad.begin(), enc_w_grad.end(), 0.f);
+        opt.zero_grad();
+        for (int b = 0; b < kBatch; ++b) {
+            const sub0::Window w = sub0::sample_window(rng, kWindowT, ds.tokens.size(),
+                                                       std::span<const std::uint64_t>(ds.doc_starts));
+            const int Tb = w.len;
+            for (int i = 0; i < Tb; ++i) {
+                const std::size_t p = w.start + static_cast<std::size_t>(i) + 1;
+                masked_tgt[static_cast<std::size_t>(i)] = ds.mask[p] ? ds.tokens[p] : sub0::LOSS_IGNORE_INDEX;
+            }
+            sub0::ScratchBindings binds{};
+            if (use_ce) {
+                const std::size_t doc = static_cast<std::size_t>(
+                    std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
+                                     static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
+                binds = sub0::ScratchBindings{ std::span<const std::vector<int>>(ds.doc_bindings[doc]),
+                                               sub0::SlotEncoding::CharEncoder, enc_w.data(), enc_w_grad.data() };
+                sub0::set_scratch_bindings(&binds);
+            }
+            sub0::graph_reset();
+            sub0::Node* logits = sub0::forward(ds.tokens.data() + w.start, Tb);
+            sub0::Node* loss   = sub0::cross_entropy(logits, masked_tgt.data());
+            sub0::backward(loss, 1.f / static_cast<float>(kBatch));   // seed averages over the batch
+            if (use_ce) sub0::set_scratch_bindings(nullptr);
+        }
+        sub0::reduce_gradients();
+        opt.step();
+        if (use_ce) {   // AdamW on the encoder weights (matches the model's optimizer class)
+            ++ea.t;
+            const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+            const float bc1 = 1.f - std::pow(b1, static_cast<float>(ea.t));
+            const float bc2 = 1.f - std::pow(b2, static_cast<float>(ea.t));
+            for (std::size_t i = 0; i < enc_w.size(); ++i) {
+                const float g = enc_w_grad[i];
+                ea.m[i] = b1 * ea.m[i] + (1.f - b1) * g;
+                ea.v[i] = b2 * ea.v[i] + (1.f - b2) * g * g;
+                enc_w[i] -= enc_lr * (ea.m[i] / bc1) / (std::sqrt(ea.v[i] / bc2) + eps);
+            }
+        }
+    }
 }
 
 // Each TEST_CASE must start from a COLD optimizer. build_model re-inits the WEIGHTS deterministically
@@ -449,6 +505,57 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- content-derived embeddings A/B (o
         "  WITHOUT content-embed: drilled %.3f  held-out %.3f\n"
         "  WITH    content-embed: drilled %.3f  held-out %.3f\n",
         1.0 / kK, d_without, without, d_with, with_ce);
+    WARN(line);
+    REQUIRE(std::isfinite(with_ce));
+}
+
+// The real content-embedding test: the SAME order-agnostic CONTAINS task, but the slot embeds via the
+// LEARNED CharEncoder (a per-fragment [C,C] projection + relu, sum-pooled) instead of mean-pool -- which
+// has capacity to keep a char's presence decodable. A/B: plain (no content) vs CharEncoder, both trained
+// single-threaded (the encoder grad has no per-thread reduction). If the learned encoder is the lever,
+// WITH should beat plain/chance where mean-pool could not.
+TEST_CASE("scratchspike: CONTAINS reasoning -- CharEncoder A/B (learned per-fragment projection)", "[.scratchspike]") {
+    constexpr int kK = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_contains(tk, split, kK, dopt);
+
+    const int C = D_MODEL;
+    std::vector<float> enc_w(static_cast<std::size_t>(C) * C), enc_w_grad(static_cast<std::size_t>(C) * C);
+
+    auto run = [&](bool ce) {
+        sub0::build_model();
+        reset_opt_state();
+        std::mt19937 wr(123);
+        std::normal_distribution<float> nd(0.f, 1.f / std::sqrt(static_cast<float>(C)));   // [C,C] linear init
+        for (float& x : enc_w) x = nd(wr);
+        EncAdam ea; ea.m.assign(enc_w.size(), 0.f); ea.v.assign(enc_w.size(), 0.f);
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        double held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_ce_steps(ds, opt, enc_w, enc_w_grad, ea, /*enc_lr=*/kLr, kStepsPerEval, rng, ce);
+            held = eval_contains(tk, ops, split.held_out, kK, /*seed=*/11, ce,
+                                 sub0::SlotEncoding::CharEncoder, ce ? enc_w.data() : nullptr).rate();
+        }
+        return held;
+    };
+    const double without = run(false);
+    const double with_ce = run(true);
+    char line[224];
+    std::snprintf(line, sizeof line,
+        "\n=== scratchspike CONTAINS via CharEncoder (K=3) @3000 (chance = %.3f) ===\n"
+        "  WITHOUT content (plain) = %.3f  |  WITH CharEncoder = %.3f\n",
+        1.0 / kK, without, with_ce);
     WARN(line);
     REQUIRE(std::isfinite(with_ce));
 }

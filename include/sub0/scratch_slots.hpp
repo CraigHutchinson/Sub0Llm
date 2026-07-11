@@ -42,6 +42,12 @@ enum class SlotEncoding { MeanPool, CharEncoder, Hash };
 struct ScratchBindings {
     std::span<const std::vector<int>> slots;                 // slots[i] = fragments of SCRATCH_SLOT_BASE+i
     SlotEncoding                      encoding = SlotEncoding::MeanPool;
+    // CharEncoder only: the learned [C,C] projection weights + a grad accumulator. Carried here (not the
+    // model's param arena) so the encoder can be spiked with no layout/checkpoint change -- the owner
+    // trains enc_w against enc_w_grad. null for MeanPool. (Single-threaded training: enc_w_grad has no
+    // per-thread reduction; a multi-threaded train_batch would race on it -- promote to a model param first.)
+    const float*                      enc_w = nullptr;
+    float*                            enc_w_grad = nullptr;
 
     bool bound(int token) const {
         const int i = token - SCRATCH_SLOT_BASE;

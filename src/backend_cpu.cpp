@@ -281,7 +281,7 @@ static Node* op_embed(Node* table, const int* ids, int T) {
         // is_scratch_slot, so this branch is naturally inert for the position table.
         if (binds && is_scratch_slot(ids[t]) && binds->bound(ids[t]))
             encode_slot(table->data.data(), C, binds->fragments(ids[t]), binds->encoding,
-                        out->data.data() + static_cast<std::size_t>(t) * C);
+                        out->data.data() + static_cast<std::size_t>(t) * C, binds->enc_w);
         else
             for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
     }
@@ -588,7 +588,8 @@ static void backward_node(Node& n) {
             // fragment rows (encode_slot_bwd); else the plain scatter into the token's own row.
             if (binds && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t]))
                 encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
-                                binds->fragments(n.ids[t]), binds->encoding, n.w->grad.data());
+                                binds->fragments(n.ids[t]), binds->encoding, n.w->grad.data(),
+                                n.w->data.data(), binds->enc_w, binds->enc_w_grad);
             else
                 for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
         }
@@ -1055,7 +1056,8 @@ struct Model {
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
 
         if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
-            encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h);
+            encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
+                        g_scratch_binds->enc_w);
         } else {
             const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
             for (int j = 0; j < C; ++j) h[j] = emb[j];
