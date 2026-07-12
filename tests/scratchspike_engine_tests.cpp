@@ -254,14 +254,17 @@ void reset_opt_state() {
 
 // `content_embed` on -> each window is trained WITH content-derived slot embeddings: its document's
 // bindings (ds.doc_bindings) are threaded to train_batch so a bound scratch slot embeds from its fragments.
-void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng, bool content_embed = false) {
+// `window` is the training-window width (default kWindowT; the K-sweep widens it for long local-CoT traces
+// at high K -- must be <= SEQ_LEN).
+void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng,
+                 bool content_embed = false, int window = kWindowT) {
     std::vector<std::size_t> starts(kBatch);
     std::vector<int>         lens(kBatch);
     std::vector<sub0::ScratchBindings>        binds(kBatch);
     std::vector<const sub0::ScratchBindings*> binds_ptr(kBatch);
     for (int s = 0; s < steps; ++s) {
         for (int b = 0; b < kBatch; ++b) {
-            const sub0::Window w = sub0::sample_window(rng, kWindowT, ds.tokens.size(),
+            const sub0::Window w = sub0::sample_window(rng, window, ds.tokens.size(),
                                                        std::span<const std::uint64_t>(ds.doc_starts));
             starts[static_cast<std::size_t>(b)] = w.start;
             lens[static_cast<std::size_t>(b)]   = w.len;
@@ -275,7 +278,7 @@ void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt1993
             }
         }
         opt.zero_grad();
-        (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, kWindowT, lens.data(), ds.mask.data(),
+        (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, window, lens.data(), ds.mask.data(),
                                 content_embed ? binds_ptr.data() : nullptr);
         opt.step();
     }
@@ -615,23 +618,25 @@ std::string trace_str(const std::vector<int>& out) {
 // held-out traces to `report`. The per-kind `one` rate is the localization signal; overall clearing the
 // ~0.40 presence-heuristic ceiling without it just means the model detects presence, not which slot.
 double route_a_run(const Tokenizer& tk, ScratchOps& ops, const ss::OovSplit& split, int K,
-                   const ss::Dataset& ds, ReasonPicker picker, std::string& report) {
-    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+                   const ss::Dataset& ds, ReasonPicker picker, std::string& report, int window = kWindowT,
+                   double* out_best_one = nullptr) {
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(window));
     sub0::build_model();
     reset_opt_state();
     sub0::AdamW opt(kLr);
     std::mt19937 rng(1);
     char head[224];
-    std::snprintf(head, sizeof head, "\n--- K=%d (mix 60/20/20; presence-heuristic ceiling ~0.40, lr = %.4f) ---\n", K, kLr);
+    std::snprintf(head, sizeof head, "\n--- K=%d (mix 60/20/20; presence-heuristic ceiling ~0.40, lr = %.4f, win %d) ---\n", K, kLr, window);
     report += head;
-    double last_held = 0.0, best_held = 0.0;
+    double last_held = 0.0, best_held = 0.0, best_one = 0.0;
     int best_step = 0;
     for (int r = 0; r < kEvalRounds; ++r) {
-        train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
+        train_steps(ds, opt, kStepsPerEval, rng, /*content_embed=*/false, window);   // plain masked training
         const ReasonAcc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7,  picker);
         const ReasonAcc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11, picker);
         last_held = h.overall.rate();
         if (h.overall.rate() > best_held) { best_held = h.overall.rate(); best_step = (r + 1) * kStepsPerEval; }
+        if (h.one.rate() > best_one) best_one = h.one.rate();
         char line[144];
         std::snprintf(line, sizeof line,
                       "  step %5d | DRILLED %.3f | HELD-OUT %.3f  [one %.2f none %.2f all %.2f]\n",
@@ -639,8 +644,10 @@ double route_a_run(const Tokenizer& tk, ScratchOps& ops, const ss::OovSplit& spl
                       h.one.rate(), h.non.rate(), h.uni.rate());
         report += line;
     }
-    char best[96];
-    std::snprintf(best, sizeof best, "  => BEST held-out %.3f @ step %d (last %.3f)\n", best_held, best_step, last_held);
+    if (out_best_one) *out_best_one = best_one;
+    char best[128];
+    std::snprintf(best, sizeof best, "  => BEST held-out %.3f @ step %d (best one %.3f, last %.3f)\n",
+                  best_held, best_step, best_one, last_held);
     report += best;
     std::mt19937_64 drng(11);
     for (int s = 0; s < 4 && s < static_cast<int>(split.held_out.size()); ++s) {
@@ -790,6 +797,52 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- CoT control (drop front list, no 
     WARN(report);
     REQUIRE(std::isfinite(h2));
     REQUIRE(std::isfinite(h3));
+}
+
+// MAXIMAL-K SWEEP: does the local-grounding win HOLD as K grows toward the scratch-pool limit (SCRATCH_POOL
+// slots), or does the final aggregation ("which of K verdicts is the +") break down? Because the per-slot
+// check is LOCAL, per-slot accuracy should be K-independent; the risk is the argmax-over-K-verdicts copy.
+// Each K needs a longer trace (~5 + 11K worst case), so this wants a wide-SEQ_LEN build (run at seq128 for
+// the full K=2..6); it auto-skips any K whose worst-case trace would not fit SEQ_LEN. The signal is the
+// per-K peak held-out `one` rate (random = 1/K); a clean run stays high across all K.
+TEST_CASE("scratchspike: CONTAINS reasoning -- maximal-K sweep (local grounding, K=2..pool)", "[.scratchspike]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+
+    const int window = SEQ_LEN - 1;   // widest training window this model allows (whole-doc for these traces)
+    std::string report = "\n=== scratchspike CONTAINS maximal-K sweep (local grounding; SEQ_LEN=" +
+                         std::to_string(SEQ_LEN) + ", pool=" + std::to_string(ss::SCRATCH_POOL) + ") ===\n"
+                         "  (per-K peak held-out `one` rate; random = 1/K. Does localization hold as K grows?)\n";
+    std::string summary = "  -- summary (K : peak held-out one-rate | random 1/K) --\n";
+    bool ran_any = false;
+    for (int K = 2; K <= ss::SCRATCH_POOL; ++K) {
+        const int worst_trace = 5 + 11 * K;                 // 2 (query) + K*(<=11) + 3 (answer)
+        if (worst_trace >= SEQ_LEN) {                       // would overflow context -> skip (need a wider build)
+            summary += "    K=" + std::to_string(K) + " : SKIPPED (trace ~" + std::to_string(worst_trace) +
+                       " >= SEQ_LEN " + std::to_string(SEQ_LEN) + ")\n";
+            continue;
+        }
+        double best_one = 0.0;
+        const double ov = route_a_run(tk, ops, split, K,
+                                      ss::build_dataset_contains_via(tk, split, K, dopt, ss::pick_content_contains_cot_local_task),
+                                      ss::pick_content_contains_cot_local_task, report, window, &best_one);
+        char sline[96];
+        std::snprintf(sline, sizeof sline, "    K=%d : one %.3f  (overall %.3f | random %.3f)\n",
+                      K, best_one, ov, 1.0 / K);
+        summary += sline;
+        ran_any = true;
+    }
+    WARN(report + "\n" + summary);
+    REQUIRE(ran_any);
 }
 
 // The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix

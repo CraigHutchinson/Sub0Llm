@@ -61,7 +61,7 @@ constexpr int VERD_NO  = '-';   // it does not
 // follow-up). Slots are assigned in BINDING ORDER within a context (first OOV bound -> slot 0), so the
 // baked training traces and the live interceptor agree deterministically.
 constexpr int SCRATCH_BASE = casing::TOK_RESERVED_4;   // slot i == SCRATCH_BASE + i
-constexpr int SCRATCH_POOL = 4;                        // TOK_RESERVED_4..7
+constexpr int SCRATCH_POOL = 6;                        // TOK_RESERVED_4..9 (the full reserved range -> max K=6)
 constexpr int scratch_slot(int i) { return SCRATCH_BASE + i; }
 
 // An OOV "word": a random lowercase byte string of length 3..6 that is NOT a single vocab piece (so it
