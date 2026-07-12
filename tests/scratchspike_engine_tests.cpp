@@ -168,13 +168,17 @@ Acc eval_contains(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::s
 // #4c CONTAINS via thinking-uncombine (Route A): the model RESOLVES each slot (emits <slot> UNCOMBINE; the
 // live interceptor injects the spelling from the binding table) then answers -- NO content embeddings. The
 // regime is a mix of THREE outcomes (a slot / ANS_NONE / ANS_ALL), so we tally overall AND per-kind: the
-// breakdown shows whether the model learned genuine per-word checking (all three) or a shortcut.
+// breakdown shows whether the model learned genuine per-word checking (all three) or a shortcut. `picker`
+// selects the task variant (plain resolve-then-answer, or the CoT per-slot-verdict scaffold); train and eval
+// must use the MATCHING picker so the generated protocol matches what was trained.
+using ReasonPicker = ss::Task (*)(const Tokenizer&, const std::vector<std::string>&, int, int, std::mt19937_64&);
 struct ReasonAcc { Acc overall, one, non, uni; };   // non = NONE-kind, uni = ALL-kind (universal)
-ReasonAcc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+ReasonAcc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs,
+                               int K, unsigned seed, ReasonPicker picker) {
     ReasonAcc a;
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
-        const ss::Task k = ss::pick_content_contains_reason_task(tk, oovs, qi, K, rng);
+        const ss::Task k = picker(tk, oovs, qi, K, rng);
         const bool ok = (answer_after_sep(run_task(ops, k)) == k.answer_byte);
         a.overall.ok += ok; ++a.overall.n;
         Acc& kind = (k.answer_byte == ss::ANS_NONE) ? a.non : (k.answer_byte == ss::ANS_ALL) ? a.uni : a.one;
@@ -592,6 +596,8 @@ std::string trace_str(const std::vector<int>& out) {
         if (t == ss::SEP) s += "= ";
         else if (t == ss::ANS_NONE) s += "NONE ";
         else if (t == ss::ANS_ALL) s += "ALL ";
+        else if (t == ss::VERD_YES) s += "+ ";
+        else if (t == ss::VERD_NO) s += "- ";
         else if (t == ss::Q_HAS) s += "% ";
         else if (t == cas::TOK_UNCOMBINE) s += "<U>";
         else if (t == cas::TOK_UNCOMBINE_END) s += "</U> ";
@@ -601,6 +607,50 @@ std::string trace_str(const std::vector<int>& out) {
         else s += "?" + std::to_string(t);
     }
     return s;
+}
+
+// Train Route A on a prebuilt dataset (the plain-reason or the CoT-verdict variant) and eval with the
+// MATCHING picker; returns PEAK held-out (the capability can peak mid-training then overfit/decay, so
+// last-round understates it). Appends per-round overall + per-kind (one/none/all) rates and a few generated
+// held-out traces to `report`. The per-kind `one` rate is the localization signal; overall clearing the
+// ~0.40 presence-heuristic ceiling without it just means the model detects presence, not which slot.
+double route_a_run(const Tokenizer& tk, ScratchOps& ops, const ss::OovSplit& split, int K,
+                   const ss::Dataset& ds, ReasonPicker picker, std::string& report) {
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    sub0::build_model();
+    reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    char head[224];
+    std::snprintf(head, sizeof head, "\n--- K=%d (mix 60/20/20; presence-heuristic ceiling ~0.40, lr = %.4f) ---\n", K, kLr);
+    report += head;
+    double last_held = 0.0, best_held = 0.0;
+    int best_step = 0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
+        const ReasonAcc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7,  picker);
+        const ReasonAcc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11, picker);
+        last_held = h.overall.rate();
+        if (h.overall.rate() > best_held) { best_held = h.overall.rate(); best_step = (r + 1) * kStepsPerEval; }
+        char line[144];
+        std::snprintf(line, sizeof line,
+                      "  step %5d | DRILLED %.3f | HELD-OUT %.3f  [one %.2f none %.2f all %.2f]\n",
+                      (r + 1) * kStepsPerEval, d.overall.rate(), h.overall.rate(),
+                      h.one.rate(), h.non.rate(), h.uni.rate());
+        report += line;
+    }
+    char best[96];
+    std::snprintf(best, sizeof best, "  => BEST held-out %.3f @ step %d (last %.3f)\n", best_held, best_step, last_held);
+    report += best;
+    std::mt19937_64 drng(11);
+    for (int s = 0; s < 4 && s < static_cast<int>(split.held_out.size()); ++s) {
+        const ss::Task k = picker(tk, split.held_out, s, K, drng);
+        const int ans = k.answer_byte;
+        const std::string want = (ans == ss::ANS_NONE) ? "NONE" : (ans == ss::ANS_ALL) ? "ALL"
+                                 : "S" + std::to_string(ans - ss::scratch_slot(0));
+        report += "    want " + want + " | " + trace_str(run_task(ops, k)) + "\n";
+    }
+    return best_held;
 }
 
 // ROUTE A payoff: can THINKING-UNCOMBINE solve the content question the bare slot embedding could not?
@@ -642,56 +692,42 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
 
-    // Train + eval Route A at a given fan-out K; return the PEAK held-out rate (the capability can peak
-    // mid-training then overfit/decay -- last-round understates it) and append a per-round trace + a couple
-    // of generated held-out samples to the report.
-    auto run_K = [&](int K, std::string& report) {
-        const ss::Dataset ds = ss::build_dataset_contains_reason(tk, split, K, dopt);
-        REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
-        sub0::build_model();
-        reset_opt_state();
-        sub0::AdamW opt(kLr);
-        std::mt19937 rng(1);
-        char head[224];
-        // Regime = ONE-heavy 60/20/20 (ONE/NONE/ALL). The "present->ALL, absent->NONE" heuristic scores
-        // ~0.40 (NONE+ALL) WITHOUT localizing -- so overall clearing ~0.40, and especially the per-kind
-        // `one` rate, is the real signal that the model learned to POINT to the matching slot.
-        std::snprintf(head, sizeof head, "\n--- K=%d (mix 60/20/20; presence-heuristic ceiling ~0.40, lr = %.4f) ---\n", K, kLr);
-        report += head;
-        double last_held = 0.0, best_held = 0.0;
-        int best_step = 0;
-        for (int r = 0; r < kEvalRounds; ++r) {
-            train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
-            const ReasonAcc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7);
-            const ReasonAcc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11);
-            last_held = h.overall.rate();
-            if (h.overall.rate() > best_held) { best_held = h.overall.rate(); best_step = (r + 1) * kStepsPerEval; }
-            char line[144];
-            std::snprintf(line, sizeof line,
-                          "  step %5d | DRILLED %.3f | HELD-OUT %.3f  [one %.2f none %.2f all %.2f]\n",
-                          (r + 1) * kStepsPerEval, d.overall.rate(), h.overall.rate(),
-                          h.one.rate(), h.non.rate(), h.uni.rate());
-            report += line;
-        }
-        char best[96];
-        std::snprintf(best, sizeof best, "  => BEST held-out %.3f @ step %d (last %.3f)\n",
-                      best_held, best_step, last_held);
-        report += best;
-        std::mt19937_64 drng(11);
-        for (int s = 0; s < 4 && s < static_cast<int>(split.held_out.size()); ++s) {
-            const ss::Task k = ss::pick_content_contains_reason_task(tk, split.held_out, s, K, drng);
-            const int ans = k.answer_byte;
-            const std::string want = (ans == ss::ANS_NONE) ? "NONE" : (ans == ss::ANS_ALL) ? "ALL"
-                                     : "S" + std::to_string(ans - ss::scratch_slot(0));
-            report += "    want " + want + " | " + trace_str(run_task(ops, k)) + "\n";
-        }
-        return best_held;
-    };
-
     std::string report = "\n=== scratchspike CONTAINS via thinking-uncombine (Route A: resolve then select) ===\n"
                          "  (held-out = never-bound OOVs; a correct answer PROVES resolve-then-select, not memorization)\n";
-    const double h2 = run_K(2, report);   // presence (none/all) solved; localization (one) is the wall
-    const double h3 = run_K(3, report);   // same shape at K=3 -- one-rate ~random, not a K-specific effect
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_reason(tk, split, 2, dopt),
+                                  ss::pick_content_contains_reason_task, report);   // presence solved; localization is the wall
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_reason(tk, split, 3, dopt),
+                                  ss::pick_content_contains_reason_task, report);   // one-rate ~random, not K-specific
+    WARN(report);
+    REQUIRE(std::isfinite(h2));
+    REQUIRE(std::isfinite(h3));
+}
+
+// LOCALIZATION SCAFFOLD: the SAME ONE-heavy contains regime, but the model emits a per-slot verdict (+/-)
+// right after resolving each slot ("show your work"). This turns the final answer from a hidden global
+// recall ("which spelling matched -> which slot") into "copy the slot that got a +", a short-range
+// induction -- directly targeting the LOCALIZATION wall the plain-reason regime can't clear (one-rate
+// ~random at d128 AND d256). The signal is the per-kind `one` rate: if explicit verdicts crack localization
+// it should rise well above random (0.5 at K=2, 0.33 at K=3).
+TEST_CASE("scratchspike: CONTAINS reasoning -- chain-of-thought verdicts (localization scaffold)", "[.scratchspike]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+
+    std::string report = "\n=== scratchspike CONTAINS via chain-of-thought verdicts (per-slot +/-) ===\n"
+                         "  (watch the per-kind `one` rate: does explicit per-slot checking crack localization?)\n";
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_cot(tk, split, 2, dopt),
+                                  ss::pick_content_contains_cot_task, report);
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_cot(tk, split, 3, dopt),
+                                  ss::pick_content_contains_cot_task, report);
     WARN(report);
     REQUIRE(std::isfinite(h2));
     REQUIRE(std::isfinite(h3));

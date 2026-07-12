@@ -49,6 +49,13 @@ constexpr int SEP   = '=';   // separates the question from the answer
 constexpr int ANS_NONE = '_';   // "%%<c>" -> NO bound slot's OOV contains c (forces checking every word)
 constexpr int ANS_ALL  = '@';   // "%%<c>" -> EVERY bound slot's OOV contains c
 
+// Per-slot VERDICT tokens for the chain-of-thought CONTAINS variant: right after resolving a slot, the
+// model emits whether THAT slot's spelling contains the queried char. Making the match a LOCAL, explicit
+// step (vs a hidden global recall at the end) turns final localization into "copy the slot that got a '+'"
+// -- a short-range induction. Opaque single tokens, meaning acquired from consistent use.
+constexpr int VERD_YES = '+';   // this slot's OOV contains the queried char
+constexpr int VERD_NO  = '-';   // it does not
+
 // The reserved SCRATCH SLOT pool. A handful is enough to prove single- and multi-binding in the spike;
 // a production context-translation layer would carve a much larger reserved range (a tokenizer-budget
 // follow-up). Slots are assigned in BINDING ORDER within a context (first OOV bound -> slot 0), so the
@@ -272,6 +279,33 @@ inline Task content_contains_reason_task(const tok::Tokenizer& /*t*/, const std:
     return k;
 }
 
+// CHAIN-OF-THOUGHT variant of the CONTAINS-reason task: identical prompt/answer, but right after resolving
+// each slot the model emits a GRADED per-slot VERDICT (VERD_YES/VERD_NO -- does THIS slot's spelling contain
+// the queried char). This scaffolds LOCALIZATION -- the wall the plain-reason task can't clear: each verdict
+// is a LOCAL content-match (the spelling was just injected, right there), and the final answer becomes "copy
+// the slot that got a '+'", a short-range induction, instead of a hidden global recall of which spelling
+// matched. Tests whether the model CAN localize when the reasoning is made explicit ("show your work").
+// trace: prompt [<slot_i> UNCOMBINE <bytes_i> UNCOMBINE_END <verdict_i>]* [= <answer> EOS]
+inline Task content_contains_cot_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
+                                      int answer_tok, int has_char) {
+    const int K = static_cast<int>(oovs.size());
+    Task k; k.binds = oovs; k.oov = oovs.empty() ? std::string{} : oovs[0];
+    for (int i = 0; i < K; ++i) detail::append_query(k, scratch_slot(i));
+    detail::append_query(k, Q_HAS);
+    detail::append_query(k, has_char);
+    for (int i = 0; i < K; ++i) {
+        detail::push(k, scratch_slot(i), 1);                               // graded: emit the slot to inspect
+        detail::append_resolve(k, oov_bytes(oovs[static_cast<std::size_t>(i)]));   // UNCOMBINE + injected bytes
+        const bool contains = oovs[static_cast<std::size_t>(i)].find(static_cast<char>(has_char)) != std::string::npos;
+        detail::push(k, contains ? VERD_YES : VERD_NO, 1);                 // graded: the per-slot verdict
+    }
+    k.answer_byte = answer_tok;
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
 // A generated pool of OOVs, split into a DRILLED set (their tasks go into training) and a HELD-OUT set
 // (never trained on -- the clean no-memorization probe: answering a task for a held-out OOV is only
 // possible by resolving its in-context scratch binding, since the model never saw that OOV bound).
@@ -478,20 +512,20 @@ inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vecto
     const ContainsPick p = pick_contains(pool, target_idx, K, rng);
     return content_contains_task(t, p.oovs, p.qi, p.has);
 }
-// Mixed CONTAINS-reason picker (shared by the dataset builder + the harness so train and eval construct
-// identically). Uniformly ONE of THREE outcomes over the same resolve-then-answer trace shape, so the model
-// must genuinely test EVERY word (see content_contains_reason_task): ONE (a char in exactly one oov ->
-// that slot), NONE (a char in no oov -> ANS_NONE), ALL (a char in every oov -> ANS_ALL). `anchor_idx` seeds
-// the oov set from `pool`; ALL of the oovs are drawn from `pool`, so a held-out probe stays valid for every
-// outcome. A NONE/ALL that cannot be constructed from the pool falls back to ONE.
-inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
-                                              int anchor_idx, int K, std::mt19937_64& rng) {
+// The selected CONTAINS case: the K oovs, the queried char, and the answer token (a slot / ANS_NONE /
+// ANS_ALL) -- shared by BOTH the plain-reason and the chain-of-thought task builders (and thus by train +
+// eval), so the only difference between the two regimes is the trace shape, never the selection.
+struct ContainsCase { std::vector<std::string> oovs; int has = 0; int answer = 0; };
+
+// Mixed CONTAINS-case selection. ONE-HEAVY (~60% ONE, 20% NONE, 20% ALL): NONE/ALL are EASY (a global
+// "present anywhere?" OR) and saturate fast while ONE is HARD (localize WHICH slot), so an equal split lets
+// the model settle for a present->ALL / absent->NONE heuristic (~0.67 for free) and never learn to point --
+// the same gradient-starvation the production curriculum's 3:1 weighting avoids. NONE/ALL keep the
+// elimination shortcut dead. All oovs are drawn from `pool`, so held-out probes stay valid for every outcome;
+// a NONE/ALL that cannot be constructed falls back to ONE.
+inline ContainsCase pick_contains_case(const std::vector<std::string>& pool, int anchor_idx, int K,
+                                       std::mt19937_64& rng) {
     std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
-    // ONE-HEAVY mix (~60% ONE, 20% NONE, 20% ALL). NONE/ALL are EASY (a global "present anywhere?" OR) and
-    // saturate fast; ONE is HARD (localize WHICH slot). An equal split lets the model settle for the
-    // present->ALL / absent->NONE heuristic (~0.67 for free) and never learn to point -- the same gradient-
-    // starvation the production curriculum's 3:1 weighting avoids. Weighting toward ONE keeps NONE/ALL in
-    // (so the elimination shortcut stays dead) while forcing the localization skill.
     const int roll = std::uniform_int_distribution<int>(0, 9)(rng);
     const int kind = (roll < 6) ? 0 : (roll < 8) ? 1 : 2;             // 0=ONE 1=NONE 2=ALL
 
@@ -508,7 +542,7 @@ inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std
                 if (present.find(static_cast<char>(c)) == std::string::npos) { has = c; break; }
             if (has < 0) continue;                                    // every letter appears -> retry (rare)
             std::shuffle(oovs.begin(), oovs.end(), rng);
-            return content_contains_reason_task(t, oovs, ANS_NONE, has);
+            return { std::move(oovs), has, ANS_NONE };
         }
     } else if (kind == 2) {                                          // ALL: a char present in every oov
         for (int attempt = 0; attempt < 64; ++attempt) {
@@ -527,11 +561,21 @@ inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std
             }
             if (static_cast<int>(oovs.size()) < K) continue;
             std::shuffle(oovs.begin(), oovs.end(), rng);
-            return content_contains_reason_task(t, oovs, ANS_ALL, c);
+            return { std::move(oovs), c, ANS_ALL };
         }
     }
     const ContainsPick p = pick_contains(pool, anchor_idx, K, rng);   // ONE (or NONE/ALL unconstructible)
-    return content_contains_reason_task(t, p.oovs, scratch_slot(p.qi), p.has);
+    return { p.oovs, p.has, scratch_slot(p.qi) };
+}
+inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                              int anchor_idx, int K, std::mt19937_64& rng) {
+    const ContainsCase c = pick_contains_case(pool, anchor_idx, K, rng);
+    return content_contains_reason_task(t, c.oovs, c.answer, c.has);
+}
+inline Task pick_content_contains_cot_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                           int anchor_idx, int K, std::mt19937_64& rng) {
+    const ContainsCase c = pick_contains_case(pool, anchor_idx, K, rng);
+    return content_contains_cot_task(t, c.oovs, c.answer, c.has);
 }
 
 inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
@@ -555,6 +599,20 @@ inline Dataset build_dataset_contains_reason(const tok::Tokenizer& t, const OovS
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
         for (int r = 0; r < opt.tasks_per_oov; ++r)
             docs.push_back(pick_content_contains_reason_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// Chain-of-thought variant of the contains curriculum: same ONE-heavy selection, but each doc emits a
+// per-slot verdict during resolution (content_contains_cot_task) to scaffold localization.
+inline Dataset build_dataset_contains_cot(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_content_contains_cot_task(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);
