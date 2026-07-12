@@ -733,6 +733,37 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- chain-of-thought verdicts (locali
     REQUIRE(std::isfinite(h3));
 }
 
+// LOCAL-QUERY variant: the CoT verdict, but the queried char is RESTATED immediately before each verdict
+// (so the check is over adjacent tokens: <bytes_i> <c> <verdict>) and the redundant front slot-list is
+// dropped. This removes BOTH crutches the plain CoT lacked -- far-off query recall AND segment isolation --
+// leaving the verdict a purely LOCAL "is this char in these recent bytes". THE crux test: if the per-kind
+// `one` rate now clears random, the wall was non-local binding (and localization is crackable by locality);
+// if it stays ~random, segment isolation itself is the wall. (Minor confound: also drops the front list, but
+// that list is redundant -- the resolve phase re-emits every slot.)
+TEST_CASE("scratchspike: CONTAINS reasoning -- CoT with LOCAL query restatement", "[.scratchspike]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+
+    std::string report = "\n=== scratchspike CONTAINS via CoT + LOCAL query restatement (<bytes> <c> <verdict>) ===\n"
+                         "  (crux: does making the per-slot check purely LOCAL lift the `one` rate off random?)\n";
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_cot(tk, split, 2, dopt, /*local=*/true),
+                                  ss::pick_content_contains_cot_local_task, report);
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_cot(tk, split, 3, dopt, /*local=*/true),
+                                  ss::pick_content_contains_cot_local_task, report);
+    WARN(report);
+    REQUIRE(std::isfinite(h2));
+    REQUIRE(std::isfinite(h3));
+}
+
 // The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix
 // of resolution + associative reasoning that --scratch-mix blends) and confirm BOTH capabilities are
 // learned together (no destructive interference between the two working features at this scale).
