@@ -42,6 +42,13 @@ constexpr int Q_FST = '!';   // "<slot>* ! <c>" -> select the slot whose OOV sta
 constexpr int Q_HAS = '%';   // "<slot>* %% <c>" -> select the slot whose OOV CONTAINS char c (order-agnostic)
 constexpr int SEP   = '=';   // separates the question from the answer
 
+// Answer tokens for the CONTAINS regime's universal/negative cases (the ALL and NONE outcomes that break
+// the "exactly one matches" elimination shortcut). Each is a single opaque byte token that carries no prior
+// meaning -- like a role/control token, it acquires its meaning purely from CONSISTENT use in the
+// curriculum. Chosen outside [a-z] so they never collide with an OOV fragment byte or a slot id.
+constexpr int ANS_NONE = '_';   // "%%<c>" -> NO bound slot's OOV contains c (forces checking every word)
+constexpr int ANS_ALL  = '@';   // "%%<c>" -> EVERY bound slot's OOV contains c
+
 // The reserved SCRATCH SLOT pool. A handful is enough to prove single- and multi-binding in the spike;
 // a production context-translation layer would carve a much larger reserved range (a tokenizer-budget
 // follow-up). Slots are assigned in BINDING ORDER within a context (first OOV bound -> slot 0), so the
@@ -236,16 +243,21 @@ inline Task content_contains_task(const tok::Tokenizer& /*t*/, const std::vector
 // #4c CONTAINS via THINKING-UNCOMBINE (Route A): the SAME query as content_contains, but instead of
 // answering off the content-free slot embedding in ONE hop, the model RESOLVES first. For each slot it
 // emits [<slot_i> UNCOMBINE] (both GRADED -- it must choose to resolve), the interceptor injects that
-// slot's fragments (MASKED), so every OOV's spelling enters the stream; then it selects the slot whose
-// spelling contains the queried char. Nothing is memorized (the bytes come from the binding table at
-// generation time), so a correct HELD-OUT answer proves the exact, learn-nothing resolution route solves
-// the content reasoning a bare slot embedding cannot -- the "spell it out when you need it" alternative to
-// content-derived embeddings. prompt: [<slot_i>* %% <c>]
-// trace: prompt [<slot_0> UNCOMBINE <bytes_0> UNCOMBINE_END] ... [<slot_{K-1}> ...] [= <slot_q> EOS]
+// slot's fragments (MASKED), so every OOV's spelling enters the stream; then it emits the ANSWER: the
+// matching slot, or ANS_NONE / ANS_ALL. Nothing is memorized (the bytes come from the binding table at
+// generation time), so a correct HELD-OUT answer proves the exact, learn-nothing resolution route.
+//
+// The answer is a caller-supplied token so the regime spans THREE outcomes over the same trace shape:
+// exactly-one-matches (answer = that slot), NONE matches (ANS_NONE), ALL match (ANS_ALL). Mixing NONE/ALL
+// in is what forces GENUINE per-word checking: with "exactly one" guaranteed, K=2 collapses to a single
+// check + elimination ("not word 0 -> word 1") that does NOT compose to K=3; once NONE/ALL are possible,
+// "not word 0" no longer determines the answer, so the model must actually test every word -- the
+// composable primitive the K=2 -> K=3 progression needs. prompt: [<slot_i>* %% <c>]
+// trace: prompt [<slot_0> UNCOMBINE <bytes_0> UNCOMBINE_END] ... [<slot_{K-1}> ...] [= <answer> EOS]
 inline Task content_contains_reason_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
-                                         int query_idx, int has_char) {
+                                         int answer_tok, int has_char) {
     const int K = static_cast<int>(oovs.size());
-    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    Task k; k.binds = oovs; k.oov = oovs.empty() ? std::string{} : oovs[0];   // held-out bookkeeping only
     for (int i = 0; i < K; ++i) detail::append_query(k, scratch_slot(i));   // the slot list (context)
     detail::append_query(k, Q_HAS);
     detail::append_query(k, has_char);
@@ -253,7 +265,7 @@ inline Task content_contains_reason_task(const tok::Tokenizer& /*t*/, const std:
         detail::push(k, scratch_slot(i), 1);                               // graded: emit the slot to inspect
         detail::append_resolve(k, oov_bytes(oovs[static_cast<std::size_t>(i)]));   // UNCOMBINE + injected bytes
     }
-    k.answer_byte = scratch_slot(query_idx);
+    k.answer_byte = answer_tok;                                            // a slot, ANS_NONE, or ANS_ALL
     detail::push(k, SEP, 1);
     detail::push(k, k.answer_byte, 1);
     detail::push(k, casing::TOK_EOS, 1);
@@ -466,10 +478,60 @@ inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vecto
     const ContainsPick p = pick_contains(pool, target_idx, K, rng);
     return content_contains_task(t, p.oovs, p.qi, p.has);
 }
+// Mixed CONTAINS-reason picker (shared by the dataset builder + the harness so train and eval construct
+// identically). Uniformly ONE of THREE outcomes over the same resolve-then-answer trace shape, so the model
+// must genuinely test EVERY word (see content_contains_reason_task): ONE (a char in exactly one oov ->
+// that slot), NONE (a char in no oov -> ANS_NONE), ALL (a char in every oov -> ANS_ALL). `anchor_idx` seeds
+// the oov set from `pool`; ALL of the oovs are drawn from `pool`, so a held-out probe stays valid for every
+// outcome. A NONE/ALL that cannot be constructed from the pool falls back to ONE.
 inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
-                                              int target_idx, int K, std::mt19937_64& rng) {
-    const ContainsPick p = pick_contains(pool, target_idx, K, rng);
-    return content_contains_reason_task(t, p.oovs, p.qi, p.has);
+                                              int anchor_idx, int K, std::mt19937_64& rng) {
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    // ONE-HEAVY mix (~60% ONE, 20% NONE, 20% ALL). NONE/ALL are EASY (a global "present anywhere?" OR) and
+    // saturate fast; ONE is HARD (localize WHICH slot). An equal split lets the model settle for the
+    // present->ALL / absent->NONE heuristic (~0.67 for free) and never learn to point -- the same gradient-
+    // starvation the production curriculum's 3:1 weighting avoids. Weighting toward ONE keeps NONE/ALL in
+    // (so the elimination shortcut stays dead) while forcing the localization skill.
+    const int roll = std::uniform_int_distribution<int>(0, 9)(rng);
+    const int kind = (roll < 6) ? 0 : (roll < 8) ? 1 : 2;             // 0=ONE 1=NONE 2=ALL
+
+    if (kind == 1) {                                                  // NONE: a char present in no oov
+        for (int attempt = 0; attempt < 256; ++attempt) {
+            std::vector<std::string> oovs{ pool[static_cast<std::size_t>(anchor_idx)] };
+            while (static_cast<int>(oovs.size()) < K) {
+                const std::string& cand = pool[pick(rng)];
+                if (std::find(oovs.begin(), oovs.end(), cand) == oovs.end()) oovs.push_back(cand);
+            }
+            std::string present; for (const std::string& o : oovs) present += o;
+            int has = -1;
+            for (int c = 'a'; c <= 'z'; ++c)
+                if (present.find(static_cast<char>(c)) == std::string::npos) { has = c; break; }
+            if (has < 0) continue;                                    // every letter appears -> retry (rare)
+            std::shuffle(oovs.begin(), oovs.end(), rng);
+            return content_contains_reason_task(t, oovs, ANS_NONE, has);
+        }
+    } else if (kind == 2) {                                          // ALL: a char present in every oov
+        for (int attempt = 0; attempt < 64; ++attempt) {
+            const int c = 'a' + static_cast<int>(rng() % 26);
+            std::vector<std::string> withc;                          // pool words containing c
+            for (const std::string& w : pool)
+                if (w.find(static_cast<char>(c)) != std::string::npos) withc.push_back(w);
+            if (static_cast<int>(withc.size()) < K) continue;        // not enough sharers -> try another char
+            std::vector<std::string> oovs;
+            if (pool[static_cast<std::size_t>(anchor_idx)].find(static_cast<char>(c)) != std::string::npos)
+                oovs.push_back(pool[static_cast<std::size_t>(anchor_idx)]);
+            std::uniform_int_distribution<std::size_t> wpick(0, withc.size() - 1);
+            for (int guard = 0; static_cast<int>(oovs.size()) < K && guard < 4000; ++guard) {
+                const std::string& cand = withc[wpick(rng)];
+                if (std::find(oovs.begin(), oovs.end(), cand) == oovs.end()) oovs.push_back(cand);
+            }
+            if (static_cast<int>(oovs.size()) < K) continue;
+            std::shuffle(oovs.begin(), oovs.end(), rng);
+            return content_contains_reason_task(t, oovs, ANS_ALL, c);
+        }
+    }
+    const ContainsPick p = pick_contains(pool, anchor_idx, K, rng);   // ONE (or NONE/ALL unconstructible)
+    return content_contains_reason_task(t, p.oovs, scratch_slot(p.qi), p.has);
 }
 
 inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {

@@ -167,14 +167,18 @@ Acc eval_contains(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::s
 
 // #4c CONTAINS via thinking-uncombine (Route A): the model RESOLVES each slot (emits <slot> UNCOMBINE; the
 // live interceptor injects the spelling from the binding table) then answers -- NO content embeddings. The
-// answer check is identical to eval_contains; the difference is entirely in the task (the reasoning trace)
-// and that success needs the model to have learned the resolve-then-answer procedure, generated here.
-Acc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
-    Acc a;
+// regime is a mix of THREE outcomes (a slot / ANS_NONE / ANS_ALL), so we tally overall AND per-kind: the
+// breakdown shows whether the model learned genuine per-word checking (all three) or a shortcut.
+struct ReasonAcc { Acc overall, one, non, uni; };   // non = NONE-kind, uni = ALL-kind (universal)
+ReasonAcc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    ReasonAcc a;
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
         const ss::Task k = ss::pick_content_contains_reason_task(tk, oovs, qi, K, rng);
-        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+        const bool ok = (answer_after_sep(run_task(ops, k)) == k.answer_byte);
+        a.overall.ok += ok; ++a.overall.n;
+        Acc& kind = (k.answer_byte == ss::ANS_NONE) ? a.non : (k.answer_byte == ss::ANS_ALL) ? a.uni : a.one;
+        kind.ok += ok; ++kind.n;
     }
     return a;
 }
@@ -586,6 +590,8 @@ std::string trace_str(const std::vector<int>& out) {
     std::string s;
     for (int t : out) {
         if (t == ss::SEP) s += "= ";
+        else if (t == ss::ANS_NONE) s += "NONE ";
+        else if (t == ss::ANS_ALL) s += "ALL ";
         else if (t == ss::Q_HAS) s += "% ";
         else if (t == cas::TOK_UNCOMBINE) s += "<U>";
         else if (t == cas::TOK_UNCOMBINE_END) s += "</U> ";
@@ -603,19 +609,26 @@ std::string trace_str(const std::vector<int>& out) {
 // cannot be memorization, only genuine in-context resolution + selection). This is the route the spelling
 // spike proved for in-vocab words, applied to per-context scratch bindings.
 //
-// FINDING: the resolve PROTOCOL is learned FLAWLESSLY at every K/size -- the model reliably emits
-// <slot> UNCOMBINE and the interceptor injects each spelling (verified in the dumped traces), even for
-// held-out OOVs. But the downstream char-match-and-select is CAPACITY-bound, and SCALE was probed (d256):
-//   * K=2 (chance 0.50): d128 peak ~0.72; d256 (LR-scaled) peak ~0.83 -- WORKS and generalizes.
-//   * K=3 (chance 0.33): collapses to a DEGENERATE constant slot (~chance) at BOTH d128 and d256 -- the
-//     3-way match exceeds even the 2x-wider model, which takes the always-S0 shortcut.
-// So Route A is not mechanism-limited (resolution is perfect); its ceiling is MODEL CAPACITY for the K-way
-// match -- the SAME wall Route B (content embeddings) hit. SCALE CAVEAT (why kLr scales with D_MODEL above):
-// the d128-tuned LR does NOT transfer -- at 0.003 both d256 shapes collapsed even at K=2; halving it
-// (0.003*128/256) recovered K=2. So a scale run must re-tune the recipe, else it measures a mistuned
-// optimizer, not capacity. K=3 needs more than 2x width (bigger still / more steps / a K=2->K=3 curriculum
-// -- open). Reported via WARN (a spike measurement, noisy on this laptop; peaks then can overfit -- hence
-// BEST held-out); the hard assert only pins that the run is finite. See docs/SCRATCH_TOKENS.md.
+// The regime is ONE-heavy 60/20/20 over ONE (a char in exactly one slot -> that slot) / NONE (ANS_NONE) /
+// ALL (ANS_ALL). NONE/ALL exist to KILL the elimination shortcut: with "exactly one matches" guaranteed,
+// K=2 collapses to a single check + inference ("not word 0 -> word 1") that does NOT compose to K=3.
+//
+// FINDING -- the task DECOMPOSES, and the wall is LOCALIZATION, not checking. The resolve PROTOCOL is
+// flawless at every K/size (emits <slot> UNCOMBINE, interceptor injects each spelling -- verified in the
+// dumped traces, held-out too). On top of that:
+//   * PRESENCE DETECTION (NONE / ALL -- is the char in no / every word) is learned nearly PERFECTLY (~1.0)
+//     at K=2 AND K=3 -- proof the model now genuinely checks EVERY word (the point of adding NONE/ALL).
+//   * LOCALIZATION (ONE -- WHICH slot has it) is the real wall: the per-kind `one` rate stays at ~random
+//     slot-guessing (~0.45 at K=2, ~0.25 at K=3) even when ONE is the majority class. With an EQUAL 1/3
+//     mix the model doesn't even try -- it takes a "present->ALL, absent->NONE" global-OR heuristic (~0.67
+//     overall, one~0.05); ONE-heavy forces it to point, and it points ~randomly. So it can tell you a char
+//     is present but not pin down which word -- an argmax/pointer op it can't do at this scale.
+// (Earlier ONE-ONLY regime: the old K=2 "0.72" was that elimination shortcut, not localization -- which is
+// why it never composed to K=3.) SCALE CAVEAT (why kLr scales with D_MODEL above): a d128-tuned LR does NOT
+// transfer -- at 0.003 a 2x-wider d256 collapsed; 0.003*128/256 recovered it. A scale run must re-tune the
+// recipe first. OPEN: does localization clear with scale (d256 ONE-heavy), more heads (parallel pointer
+// lanes), or a pointer-specific curriculum? Reported via WARN (noisy; peaks then overfits -> BEST held-out
+// + per-kind breakdown); the hard assert only pins the run is finite. See docs/SCRATCH_TOKENS.md.
 TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exact resolution)", "[.scratchspike]") {
     Tokenizer tk;
     {
@@ -640,19 +653,24 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
         sub0::AdamW opt(kLr);
         std::mt19937 rng(1);
         char head[224];
-        std::snprintf(head, sizeof head, "\n--- K=%d (chance = %.3f, lr = %.4f) ---\n", K, 1.0 / K, kLr);
+        // Regime = ONE-heavy 60/20/20 (ONE/NONE/ALL). The "present->ALL, absent->NONE" heuristic scores
+        // ~0.40 (NONE+ALL) WITHOUT localizing -- so overall clearing ~0.40, and especially the per-kind
+        // `one` rate, is the real signal that the model learned to POINT to the matching slot.
+        std::snprintf(head, sizeof head, "\n--- K=%d (mix 60/20/20; presence-heuristic ceiling ~0.40, lr = %.4f) ---\n", K, kLr);
         report += head;
         double last_held = 0.0, best_held = 0.0;
         int best_step = 0;
         for (int r = 0; r < kEvalRounds; ++r) {
             train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
-            const Acc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7);
-            const Acc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11);
-            last_held = h.rate();
-            if (h.rate() > best_held) { best_held = h.rate(); best_step = (r + 1) * kStepsPerEval; }
-            char line[80];
-            std::snprintf(line, sizeof line, "  step %5d | DRILLED %.3f | HELD-OUT %.3f\n",
-                          (r + 1) * kStepsPerEval, d.rate(), h.rate());
+            const ReasonAcc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7);
+            const ReasonAcc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11);
+            last_held = h.overall.rate();
+            if (h.overall.rate() > best_held) { best_held = h.overall.rate(); best_step = (r + 1) * kStepsPerEval; }
+            char line[144];
+            std::snprintf(line, sizeof line,
+                          "  step %5d | DRILLED %.3f | HELD-OUT %.3f  [one %.2f none %.2f all %.2f]\n",
+                          (r + 1) * kStepsPerEval, d.overall.rate(), h.overall.rate(),
+                          h.one.rate(), h.non.rate(), h.uni.rate());
             report += line;
         }
         char best[96];
@@ -660,18 +678,20 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
                       best_held, best_step, last_held);
         report += best;
         std::mt19937_64 drng(11);
-        for (int s = 0; s < 3 && s < static_cast<int>(split.held_out.size()); ++s) {
+        for (int s = 0; s < 4 && s < static_cast<int>(split.held_out.size()); ++s) {
             const ss::Task k = ss::pick_content_contains_reason_task(tk, split.held_out, s, K, drng);
-            report += "    want S" + std::to_string(k.answer_byte - ss::scratch_slot(0)) +
-                      " | " + trace_str(run_task(ops, k)) + "\n";
+            const int ans = k.answer_byte;
+            const std::string want = (ans == ss::ANS_NONE) ? "NONE" : (ans == ss::ANS_ALL) ? "ALL"
+                                     : "S" + std::to_string(ans - ss::scratch_slot(0));
+            report += "    want " + want + " | " + trace_str(run_task(ops, k)) + "\n";
         }
         return best_held;
     };
 
     std::string report = "\n=== scratchspike CONTAINS via thinking-uncombine (Route A: resolve then select) ===\n"
                          "  (held-out = never-bound OOVs; a correct answer PROVES resolve-then-select, not memorization)\n";
-    const double h2 = run_K(2, report);   // works: peak held-out clears chance and generalizes (d128 & d256)
-    const double h3 = run_K(3, report);   // capacity wall: collapses to a constant slot (~chance), d256 too
+    const double h2 = run_K(2, report);   // presence (none/all) solved; localization (one) is the wall
+    const double h3 = run_K(3, report);   // same shape at K=3 -- one-rate ~random, not a K-specific effect
     WARN(report);
     REQUIRE(std::isfinite(h2));
     REQUIRE(std::isfinite(h3));
