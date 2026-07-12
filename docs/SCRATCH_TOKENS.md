@@ -206,13 +206,29 @@ Modest numbers are expected: d128 is capacity-starved. Scale is the amplifier fo
 
 ## Status — the scale run
 
-All numbers above are at **d128** (4 layers, 4 heads) — the original spike size. Because the K=3 wall is a
-capacity limit, the live question is whether a bigger model clears it. A **d256** run is in progress: same
-`content_contains_reason` curriculum (Route A, no engine changes), auto-sized to **256-wide × 8 layers**
-(~4× the parameters and 2× the depth of the d128 spike), K=2 and K=3, 3000 steps each. The result to watch
-is the **K=3 held-out** rate: at d128 it sat at chance (~0.33); if the extra depth lets the model do the
-3-way match, it should climb above chance and, ideally, toward the K=2 number. This section will record the
-outcome once the run finishes. *(K=2 is expected to stay solid; it already works at d128.)*
+All the scorecard numbers are at **d128** (4 layers, 4 heads, head-dim 32) — the original spike size.
+Because the K=3 wall is a capacity limit, the live question is whether a bigger model clears it. Same
+`content_contains_reason` curriculum (Route A, no engine changes), K=2 and K=3, 3000 steps each.
+
+**Run 1 — d256, auto-sized to 8 layers × 2 heads (same lr/steps recipe): the naive scale-up REGRESSED.**
+
+| | d128 (4L/4H) | d256 (8L/2H) |
+|---|---|---|
+| K=2 held-out | ✅ 0.72 | ✗ **0.43** (collapsed to a constant slot) |
+| K=3 held-out | ✗ 0.33 (chance) | ✗ 0.33 (chance) |
+
+Making the model bigger *the naive way* not only failed to clear K=3 — it **lost the K=2 win**. This is
+almost certainly a **training/config confound, not a ceiling**: the auto-sizer traded width for depth
+(8 layers) but gave only **2 attention heads**, and it ran at the d128-tuned recipe. Two suspects: (1) 2
+heads is too few **parallel comparison lanes** for a K-way match — the very thing this task stresses; (2) an
+8-layer model is much deeper and likely **under-trained / needs warmup** at 3000 steps, so it fell into the
+degenerate always-`S0` basin the shallower model escaped. Lesson: bigger ≠ better *for free* — shape and
+recipe matter, and this task is head-count-sensitive.
+
+**Run 2 — d256, pinned to 4 layers × 8 heads (head-dim 32 — the *scaled working shape*): in progress.**
+Keeps everything proportional to the d128 config that worked (same depth, same head geometry) and only
+doubles width and head count. If parallel lanes were the problem, K=2 should recover and K=3 is the real
+test. Result lands here when it finishes.
 
 ## Where this is going
 
