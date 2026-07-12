@@ -160,6 +160,20 @@ Acc eval_contains(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::s
     return a;
 }
 
+// #4c CONTAINS via thinking-uncombine (Route A): the model RESOLVES each slot (emits <slot> UNCOMBINE; the
+// live interceptor injects the spelling from the binding table) then answers -- NO content embeddings. The
+// answer check is identical to eval_contains; the difference is entirely in the task (the reasoning trace)
+// and that success needs the model to have learned the resolve-then-answer procedure, generated here.
+Acc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    Acc a;
+    std::mt19937_64 rng(seed);
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
+        const ss::Task k = ss::pick_content_contains_reason_task(tk, oovs, qi, K, rng);
+        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+    }
+    return a;
+}
+
 // Single-threaded CharEncoder training: the learned enc_w [C,C] has NO per-thread grad reduction (a
 // multi-threaded train_batch would race on enc_w_grad), so this runs the forward+backward loop on one
 // thread, accumulating the model grad (reduce_gradients + opt.step) AND the encoder grad (a plain SGD on
@@ -558,6 +572,94 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- CharEncoder A/B (learned per-frag
         1.0 / kK, without, with_ce);
     WARN(line);
     REQUIRE(std::isfinite(with_ce));
+}
+
+// A produced-context stringifier (bytes as chars; slots as S0/S1..; markers named) -- lets the report
+// show what the model actually GENERATES, so a chance result is read as "reasoning too hard" only when
+// the resolve protocol (slot -> UNCOMBINE -> injected spelling -> = answer) is well-formed.
+std::string trace_str(const std::vector<int>& out) {
+    std::string s;
+    for (int t : out) {
+        if (t == ss::SEP) s += "= ";
+        else if (t == ss::Q_HAS) s += "% ";
+        else if (t == cas::TOK_UNCOMBINE) s += "<U>";
+        else if (t == cas::TOK_UNCOMBINE_END) s += "</U> ";
+        else if (t == cas::TOK_EOS) s += "<EOS>";
+        else if (ss::scratch_slot(0) <= t && t < ss::scratch_slot(ss::SCRATCH_POOL)) s += "S" + std::to_string(t - ss::scratch_slot(0)) + " ";
+        else if (t >= 32 && t < 127) s += static_cast<char>(t);
+        else s += "?" + std::to_string(t);
+    }
+    return s;
+}
+
+// ROUTE A payoff: can THINKING-UNCOMBINE solve the content question the bare slot embedding could not?
+// Train (PLAIN masked training, NO content embeddings) on the reasoning curriculum where the model
+// resolves every slot before answering; eval HELD-OUT OOVs (never bound in training -> a correct answer
+// cannot be memorization, only genuine in-context resolution + selection). This is the route the spelling
+// spike proved for in-vocab words, applied to per-context scratch bindings.
+//
+// FINDING (d128/4-layer, 3000 steps): the resolve PROTOCOL is learned FLAWLESSLY at every K -- the model
+// reliably emits <slot> UNCOMBINE and the interceptor injects each spelling (verified in the dumped
+// traces), even for held-out OOVs. But the downstream char-match-and-select is CAPACITY-bound:
+//   * K=2 (chance 0.50): held-out ~0.72 -- WORKS and generalizes (the exact, learn-nothing route delivers).
+//   * K=3 (chance 0.33): collapses to a DEGENERATE constant slot (~chance) -- the 3-way match exceeds this
+//     model's capacity, so it takes the always-S0 shortcut.
+// So Route A is not mechanism-limited (resolution is perfect at both K); its ceiling is MODEL CAPACITY for
+// the multi-way content match -- the SAME wall Route B (content embeddings) hit. Both make SCALE the
+// deciding experiment; run this at a larger whole-model size to see K=3+ clear chance. Reported via WARN
+// (a spike measurement, noisy on this laptop); the hard assert only pins that the run is finite.
+TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exact resolution)", "[.scratchspike]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+
+    // Train + eval Route A at a given fan-out K; return the final held-out rate and append a per-round
+    // trace + a couple of generated held-out samples to the report.
+    auto run_K = [&](int K, std::string& report) {
+        const ss::Dataset ds = ss::build_dataset_contains_reason(tk, split, K, dopt);
+        REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+        sub0::build_model();
+        reset_opt_state();
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        char head[224];
+        std::snprintf(head, sizeof head, "\n--- K=%d (chance = %.3f) ---\n", K, 1.0 / K);
+        report += head;
+        double last_held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
+            const Acc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7);
+            const Acc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11);
+            last_held = h.rate();
+            char line[80];
+            std::snprintf(line, sizeof line, "  step %5d | DRILLED %.3f | HELD-OUT %.3f\n",
+                          (r + 1) * kStepsPerEval, d.rate(), h.rate());
+            report += line;
+        }
+        std::mt19937_64 drng(11);
+        for (int s = 0; s < 3 && s < static_cast<int>(split.held_out.size()); ++s) {
+            const ss::Task k = ss::pick_content_contains_reason_task(tk, split.held_out, s, K, drng);
+            report += "    want S" + std::to_string(k.answer_byte - ss::scratch_slot(0)) +
+                      " | " + trace_str(run_task(ops, k)) + "\n";
+        }
+        return last_held;
+    };
+
+    std::string report = "\n=== scratchspike CONTAINS via thinking-uncombine (Route A: resolve then select) ===\n"
+                         "  (held-out = never-bound OOVs; a correct answer PROVES resolve-then-select, not memorization)\n";
+    const double h2 = run_K(2, report);   // works: held-out clears chance and generalizes
+    const double h3 = run_K(3, report);   // capacity wall: collapses to a constant slot (~chance)
+    WARN(report);
+    REQUIRE(std::isfinite(h2));
+    REQUIRE(std::isfinite(h3));
 }
 
 // The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix

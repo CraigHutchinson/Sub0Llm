@@ -233,6 +233,33 @@ inline Task content_contains_task(const tok::Tokenizer& /*t*/, const std::vector
     return k;
 }
 
+// #4c CONTAINS via THINKING-UNCOMBINE (Route A): the SAME query as content_contains, but instead of
+// answering off the content-free slot embedding in ONE hop, the model RESOLVES first. For each slot it
+// emits [<slot_i> UNCOMBINE] (both GRADED -- it must choose to resolve), the interceptor injects that
+// slot's fragments (MASKED), so every OOV's spelling enters the stream; then it selects the slot whose
+// spelling contains the queried char. Nothing is memorized (the bytes come from the binding table at
+// generation time), so a correct HELD-OUT answer proves the exact, learn-nothing resolution route solves
+// the content reasoning a bare slot embedding cannot -- the "spell it out when you need it" alternative to
+// content-derived embeddings. prompt: [<slot_i>* %% <c>]
+// trace: prompt [<slot_0> UNCOMBINE <bytes_0> UNCOMBINE_END] ... [<slot_{K-1}> ...] [= <slot_q> EOS]
+inline Task content_contains_reason_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
+                                         int query_idx, int has_char) {
+    const int K = static_cast<int>(oovs.size());
+    Task k; k.binds = oovs; k.oov = oovs[static_cast<std::size_t>(query_idx)];
+    for (int i = 0; i < K; ++i) detail::append_query(k, scratch_slot(i));   // the slot list (context)
+    detail::append_query(k, Q_HAS);
+    detail::append_query(k, has_char);
+    for (int i = 0; i < K; ++i) {                                           // THINKING: resolve every slot
+        detail::push(k, scratch_slot(i), 1);                               // graded: emit the slot to inspect
+        detail::append_resolve(k, oov_bytes(oovs[static_cast<std::size_t>(i)]));   // UNCOMBINE + injected bytes
+    }
+    k.answer_byte = scratch_slot(query_idx);
+    detail::push(k, SEP, 1);
+    detail::push(k, k.answer_byte, 1);
+    detail::push(k, casing::TOK_EOS, 1);
+    return k;
+}
+
 // A generated pool of OOVs, split into a DRILLED set (their tasks go into training) and a HELD-OUT set
 // (never trained on -- the clean no-memorization probe: answering a task for a held-out OOV is only
 // possible by resolving its in-context scratch binding, since the model never saw that OOV bound).
@@ -409,9 +436,11 @@ inline Dataset build_dataset_content(const tok::Tokenizer& t, const OovSplit& sp
     return ds;
 }
 
-// #4b contains: K OOVs where a char in the TARGET is in NO distractor; query that char. Shared fwd/eval.
-inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
-                                       int target_idx, int K, std::mt19937_64& rng) {
+// #4b contains SELECTION (shared by the single-hop and thinking-uncombine builders + the harness): K OOVs
+// (target + distractors) and a char that is in the TARGET but in NO distractor, so exactly one slot
+// matches. Returns the shuffled oovs, the target's landed slot index, and that unique char.
+struct ContainsPick { std::vector<std::string> oovs; int qi = 0; int has = 0; };
+inline ContainsPick pick_contains(const std::vector<std::string>& pool, int target_idx, int K, std::mt19937_64& rng) {
     const std::string& target = pool[static_cast<std::size_t>(target_idx)];
     std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
     for (int attempt = 0; attempt < 128; ++attempt) {
@@ -427,10 +456,20 @@ inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vecto
         if (has < 0) continue;                                  // no char uniquely identifies the target -> retry
         std::shuffle(oovs.begin(), oovs.end(), rng);
         const int qi = static_cast<int>(std::find(oovs.begin(), oovs.end(), target) - oovs.begin());
-        return content_contains_task(t, oovs, qi, has);
+        return { std::move(oovs), qi, has };
     }
-    std::vector<std::string> oovs(static_cast<std::size_t>(K), target);   // degenerate fallback (rare)
-    return content_contains_task(t, oovs, 0, static_cast<unsigned char>(target[0]));
+    return { std::vector<std::string>(static_cast<std::size_t>(K), target), 0,   // degenerate fallback (rare)
+             static_cast<unsigned char>(target[0]) };
+}
+inline Task pick_content_contains_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                       int target_idx, int K, std::mt19937_64& rng) {
+    const ContainsPick p = pick_contains(pool, target_idx, K, rng);
+    return content_contains_task(t, p.oovs, p.qi, p.has);
+}
+inline Task pick_content_contains_reason_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                              int target_idx, int K, std::mt19937_64& rng) {
+    const ContainsPick p = pick_contains(pool, target_idx, K, rng);
+    return content_contains_reason_task(t, p.oovs, p.qi, p.has);
 }
 
 inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
@@ -439,6 +478,21 @@ inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& s
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
         for (int r = 0; r < opt.tasks_per_oov; ++r)
             docs.push_back(pick_content_contains_task(t, split.drilled, qi, K, rng));
+    std::shuffle(docs.begin(), docs.end(), rng);
+    Dataset ds; ds.doc_starts.push_back(0);
+    for (const Task& d : docs) append_doc(ds, d);
+    return ds;
+}
+
+// Route A training set: the thinking-uncombine variant of the contains curriculum (same selection, but
+// each doc resolves every slot before answering). Plain masked training on these teaches the resolve-
+// then-answer procedure -- no content embeddings needed.
+inline Dataset build_dataset_contains_reason(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+    std::vector<Task> docs;
+    std::mt19937_64 rng(opt.seed);
+    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
+        for (int r = 0; r < opt.tasks_per_oov; ++r)
+            docs.push_back(pick_content_contains_reason_task(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);
