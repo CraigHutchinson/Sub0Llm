@@ -21,17 +21,22 @@ everything about the nickname works:
 3. ✅ **Spell the nickname back out on demand** (resolve / "uncombine") — works, *even for words the model
    never saw during training* — it reads the spelling from the context, it isn't memorizing.
 
-The **one** thing that doesn't work yet is the last mental step: **read several spelled-out words and pick
-the one that contains a given letter.** With 2 candidates it works (~72%); with 3 it gives up and just
-always picks the first one (scoring ~1-in-3 by luck).
+The last mental step — **read several spelled-out words and answer a question about which one contains a
+given letter** — splits into two sub-skills, and we now know exactly which one is the wall:
 
-And the crucial detail: this is **not** a plumbing failure. When there are 3 candidates the model *does*
-correctly spell all three out into the stream — the letters are right there in front of it — it just can't
-reliably do the *compare-three-and-choose* reasoning on top. That last step is really several operations
-stacked (hold the target letter, scan each word, test membership, find the unique match, remember whose
-nickname it was, say it), and a small model runs out of "working memory" to chain them. **It's a
-brain-size limit, not a mechanism limit** — which is exactly why the open question is *scale*, and why a
-bigger-model run is the deciding test (a d256 run is in progress; see [Status](#status--the-scale-run)).
+- ✅ **Checking** ("is the letter in *any* of them? in *all* of them?") — **works, nearly perfectly.** Ask
+  the model "does any word contain a Z?" and it reliably says yes/no, having genuinely looked at every word.
+- ❌ **Localizing** ("*which* word contains it?") — **this is the wall.** The model can tell the letter is
+  *there*, but can't reliably say *which* word it's in — it points almost at random.
+
+And the crucial detail: this is **not** a plumbing failure. The model *does* correctly spell every word out
+into the stream — the letters are right in front of it — and it can even do the yes/no presence check. What
+it can't do is the **pointer** step: match the letter to a word and then name *that word's* nickname. That's
+a lookup-and-point operation ("find the row that matches, report its label"), and a small model can't nail
+it. **It's a brain-size limit on one specific operation, not a plumbing limit** — so the open question is
+whether *scale*, *more attention heads* (parallel pointer lanes), or a *pointer-focused curriculum* buys it.
+(How we cornered this: see [What isn't working](#what-isnt-working-the-decomposition) and
+[Status](#status--the-scale-run).)
 
 ---
 
@@ -194,15 +199,40 @@ clear chance → a bigger model (the open question).
 | Content, plain slot | `content_contains` (no Route A/B) | ✗ chance |
 | Content, mean-pool (Route B) | `content_contains` | ✗ chance (dilution) |
 | Content, CharEncoder (Route B) | `content_contains` | ✅ above chance (0.392, modest) |
-| Content, resolve-then-select (Route A) | `content_contains_reason` K=2 | ✅ **0.72** held-out (generalizes) |
-| Content, resolve-then-select (Route A) | `content_contains_reason` K=3 | ✗ collapses to a constant slot (~chance) |
+| Route A, presence check | `content_contains_reason` NONE/ALL | ✅ **~1.00** (K=2 and K=3) — genuinely checks every word |
+| Route A, localization | `content_contains_reason` ONE (which slot) | ✗ **~random** slot-guess (the real wall) |
 
 **Read the two content rows together:** Route A's resolve protocol is perfect at both K (the spellings are
-in the stream); K=3 fails on the *match-and-select* step, not the resolution. Route B fails the same step
-from the other side. The shared bottleneck is model capacity for the K-way content match — the lever is
-scale, not the delivery mechanism.
+in the stream). The reasoning on top **decomposes**: the model learns the *presence* check but not the
+*localization* — see the next section. Route B fails from the other side (a lossy embedding). The lever is
+scale/architecture on the pointer step, not the delivery mechanism.
 
-Modest numbers are expected: d128 is capacity-starved. Scale is the amplifier for both routes.
+## What isn't working — the decomposition
+
+The single-hop scorecard rows (`content_contains`, ✗ chance) and the first Route-A runs looked like "the
+model can't reason about which slot." Adding the **ALL** and **NONE** cases (`content_contains_reason` now
+mixes ONE / NONE / ALL) cornered *exactly* which step fails.
+
+Why those cases matter: the original task guaranteed *exactly one* word matched, so K=2 was solvable by
+**elimination** — "not in word 0 ⇒ it's word 1" — a single check that never looks at word 1 and does **not**
+compose to K=3. (The old K=2 "0.72" was this shortcut, not real reasoning.) Once NONE/ALL are possible, "not
+in word 0" no longer determines the answer, so the model is forced to *actually test every word*.
+
+Result (d128), split by outcome:
+
+| Outcome | What it needs | Held-out result |
+|---|---|---|
+| **NONE** — no word has the letter | verify absence in *all* words | ✅ **~1.00** |
+| **ALL** — every word has it | verify presence in *all* words | ✅ **~1.00** |
+| **ONE** — one word has it → name *which* | verify + **localize + point to that slot** | ✗ **~random** (~0.45 K=2, ~0.25 K=3) |
+
+So the model **now genuinely checks every word** (NONE/ALL are perfect — the point of adding them) — but it
+still can't **localize**: point to *which* slot. Told to (an ONE-heavy 60/20/20 mix), it outputs a slot but
+picks almost at random; given an equal mix it doesn't even try, falling back to a "present→ALL, absent→NONE"
+global-OR heuristic (~0.67 overall, but ONE-rate ~0.05). The wall is a **pointer / argmax-over-words**
+operation — *find the row that matches and report its label* — not checking, and not specific to K=3.
+
+Modest numbers are expected: d128 is capacity-starved. Scale/architecture is the amplifier.
 
 ## Status — the scale run
 
@@ -254,11 +284,16 @@ One variable changed, and it cleanly separates recipe from capacity:
 - **K=3 still collapses** even with the corrected LR — always-`S0`, stuck from step 0.
 
 **Verdict.** Doubling width to d256 (done right) **recovers and slightly improves K=2 but does not reach
-K=3**. The 3-way match is genuine capacity that 2× width does not buy. Two lessons are now baked into the
-test (`scratchspike_engine_tests.cpp`): `kLr` **auto-scales ~1/width** (`0.003·128/D_MODEL`, validated at
-d128/d256) so a scale run isn't silently sabotaged by a stale LR; and the report tracks **peak** held-out
-(the capability can peak then overfit). Clearing K≥3 remains open and needs *more* than 2× width — a bigger
-model still, more steps, and/or a **K=2→K=3 curriculum** (bootstrap the reasoning at low fan-out, then widen).
+K=3**. Two lessons are now baked into the test (`scratchspike_engine_tests.cpp`): `kLr` **auto-scales
+~1/width** (`0.003·128/D_MODEL`, validated at d128/d256) so a scale run isn't silently sabotaged by a stale
+LR; and the report tracks **peak** held-out (the capability can peak then overfit).
+
+> **Note — these three runs predate the ALL/NONE decomposition above.** They were on the *old* one-match
+> regime, where "K=3 collapses" actually meant *localization* collapses (the K=2 "win" was the elimination
+> shortcut). The refined open question is therefore **not** "does K=3 work at scale" but **"does *localization*
+> (pointing to the right slot) clear** with scale, more heads (parallel pointer lanes), or a pointer-focused
+> curriculum?" The immediate next probe is the ONE-heavy regime at d256 (LR-scaled) — does the per-kind
+> `one`-rate rise above random?
 
 ## Where this is going
 
@@ -269,10 +304,11 @@ has no per-thread reduction, so a multi-threaded `train_batch` would race — tr
 single-threaded for now.
 
 Next steps, in order:
-1. **The deciding experiment — scale.** Both routes hit the same K-way-match wall at d128, so the open
-   question for *both* is whether a bigger model clears K≥3 content reasoning. **Route A can be scale-tested
-   immediately** — it needs **no engine changes** (plain masked training on `build_dataset_contains_reason`
-   at a larger model); if K=3 clears chance there, the resolve-then-select route is production-viable as-is.
+1. **Crack localization** — the one open wall. The model checks every word (NONE/ALL solved) but can't point
+   to *which* slot. Probes, cheapest first: (a) the ONE-heavy regime at **d256** (LR-scaled) — does the
+   `one`-rate rise above random? (b) **more heads** (parallel pointer lanes) — the pointer/argmax step may be
+   head-count-bound; (c) a **pointer-focused curriculum** or an easier localize-only task to bootstrap the
+   skill. All need **no engine changes** (plain masked training on `build_dataset_contains_reason`).
 2. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
    single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration
    for Route B, and lets Route B ride the same scale run.
