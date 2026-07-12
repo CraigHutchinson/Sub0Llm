@@ -694,9 +694,9 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
 
     std::string report = "\n=== scratchspike CONTAINS via thinking-uncombine (Route A: resolve then select) ===\n"
                          "  (held-out = never-bound OOVs; a correct answer PROVES resolve-then-select, not memorization)\n";
-    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_reason(tk, split, 2, dopt),
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_via(tk, split, 2, dopt, ss::pick_content_contains_reason_task),
                                   ss::pick_content_contains_reason_task, report);   // presence solved; localization is the wall
-    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_reason(tk, split, 3, dopt),
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_via(tk, split, 3, dopt, ss::pick_content_contains_reason_task),
                                   ss::pick_content_contains_reason_task, report);   // one-rate ~random, not K-specific
     WARN(report);
     REQUIRE(std::isfinite(h2));
@@ -724,9 +724,9 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- chain-of-thought verdicts (locali
 
     std::string report = "\n=== scratchspike CONTAINS via chain-of-thought verdicts (per-slot +/-) ===\n"
                          "  (watch the per-kind `one` rate: does explicit per-slot checking crack localization?)\n";
-    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_cot(tk, split, 2, dopt),
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_via(tk, split, 2, dopt, ss::pick_content_contains_cot_task),
                                   ss::pick_content_contains_cot_task, report);
-    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_cot(tk, split, 3, dopt),
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_via(tk, split, 3, dopt, ss::pick_content_contains_cot_task),
                                   ss::pick_content_contains_cot_task, report);
     WARN(report);
     REQUIRE(std::isfinite(h2));
@@ -755,10 +755,38 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- CoT with LOCAL query restatement"
 
     std::string report = "\n=== scratchspike CONTAINS via CoT + LOCAL query restatement (<bytes> <c> <verdict>) ===\n"
                          "  (crux: does making the per-slot check purely LOCAL lift the `one` rate off random?)\n";
-    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_cot(tk, split, 2, dopt, /*local=*/true),
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_via(tk, split, 2, dopt, ss::pick_content_contains_cot_local_task),
                                   ss::pick_content_contains_cot_local_task, report);
-    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_cot(tk, split, 3, dopt, /*local=*/true),
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_via(tk, split, 3, dopt, ss::pick_content_contains_cot_local_task),
                                   ss::pick_content_contains_cot_local_task, report);
+    WARN(report);
+    REQUIRE(std::isfinite(h2));
+    REQUIRE(std::isfinite(h3));
+}
+
+// CONFOUND CONTROL for the local-query win: drops the front slot-list (like local mode) but does NOT restate
+// the query. If the local win were just from the shorter context, this would also lift the `one` rate; if
+// (as expected) the restatement is the driver, this stays ~random like the plain CoT -- isolating LOCALITY
+// (query adjacent to the segment) as the mechanism that cracks localization.
+TEST_CASE("scratchspike: CONTAINS reasoning -- CoT control (drop front list, no restatement)", "[.scratchspike]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+
+    std::string report = "\n=== scratchspike CONTAINS CoT control (front list dropped, NO restatement) ===\n"
+                         "  (isolates the confound: if `one` stays ~random, the restatement -- not the drop -- is the driver)\n";
+    const double h2 = route_a_run(tk, ops, split, 2, ss::build_dataset_contains_via(tk, split, 2, dopt, ss::pick_content_contains_cot_ctrl_task),
+                                  ss::pick_content_contains_cot_ctrl_task, report);
+    const double h3 = route_a_run(tk, ops, split, 3, ss::build_dataset_contains_via(tk, split, 3, dopt, ss::pick_content_contains_cot_ctrl_task),
+                                  ss::pick_content_contains_cot_ctrl_task, report);
     WARN(report);
     REQUIRE(std::isfinite(h2));
     REQUIRE(std::isfinite(h3));

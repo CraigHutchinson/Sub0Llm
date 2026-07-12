@@ -293,18 +293,22 @@ inline Task content_contains_reason_task(const tok::Tokenizer& /*t*/, const std:
 // before each verdict (so the check is over adjacent tokens: <bytes_i> <c> <verdict>) and drops the now-
 // redundant front slot-list (which the resolve phase re-emits anyway) to fit the window. If verdicts go
 // right here, the wall was non-local binding (fixable); if not, segment isolation itself is the wall.
+// `restate_query` and `drop_front` are independent so the two effects can be separated: the LOCAL variant
+// sets both (restate the char next to each segment + drop the redundant front slot-list); a CONTROL sets
+// only `drop_front` (no restatement) to prove the restatement -- not the shorter context -- is what cracks
+// localization.
 inline Task content_contains_cot_task(const tok::Tokenizer& /*t*/, const std::vector<std::string>& oovs,
-                                      int answer_tok, int has_char, bool local_query = false) {
+                                      int answer_tok, int has_char, bool restate_query = false, bool drop_front = false) {
     const int K = static_cast<int>(oovs.size());
     Task k; k.binds = oovs; k.oov = oovs.empty() ? std::string{} : oovs[0];
-    if (!local_query)
-        for (int i = 0; i < K; ++i) detail::append_query(k, scratch_slot(i));   // front slot-list (omitted in local mode)
+    if (!drop_front)
+        for (int i = 0; i < K; ++i) detail::append_query(k, scratch_slot(i));   // front slot-list (redundant; droppable)
     detail::append_query(k, Q_HAS);
     detail::append_query(k, has_char);
     for (int i = 0; i < K; ++i) {
         detail::push(k, scratch_slot(i), 1);                               // graded: emit the slot to inspect
         detail::append_resolve(k, oov_bytes(oovs[static_cast<std::size_t>(i)]));   // UNCOMBINE + injected bytes
-        if (local_query) detail::push(k, has_char, 1);                     // graded: restate the query char LOCALLY
+        if (restate_query) detail::push(k, has_char, 1);                   // graded: restate the query char LOCALLY
         const bool contains = oovs[static_cast<std::size_t>(i)].find(static_cast<char>(has_char)) != std::string::npos;
         detail::push(k, contains ? VERD_YES : VERD_NO, 1);                 // graded: the per-slot verdict
     }
@@ -589,7 +593,14 @@ inline Task pick_content_contains_cot_task(const tok::Tokenizer& t, const std::v
 inline Task pick_content_contains_cot_local_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
                                                  int anchor_idx, int K, std::mt19937_64& rng) {
     const ContainsCase c = pick_contains_case(pool, anchor_idx, K, rng);
-    return content_contains_cot_task(t, c.oovs, c.answer, c.has, /*local_query=*/true);
+    return content_contains_cot_task(t, c.oovs, c.answer, c.has, /*restate_query=*/true, /*drop_front=*/true);
+}
+// Confound control for the local variant: drops the front slot-list like local mode but does NOT restate the
+// query -- isolates whether the win came from the restatement (expected) or just the shorter context.
+inline Task pick_content_contains_cot_ctrl_task(const tok::Tokenizer& t, const std::vector<std::string>& pool,
+                                                int anchor_idx, int K, std::mt19937_64& rng) {
+    const ContainsCase c = pick_contains_case(pool, anchor_idx, K, rng);
+    return content_contains_cot_task(t, c.oovs, c.answer, c.has, /*restate_query=*/false, /*drop_front=*/true);
 }
 
 inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
@@ -604,32 +615,20 @@ inline Dataset build_dataset_contains(const tok::Tokenizer& t, const OovSplit& s
     return ds;
 }
 
-// Route A training set: the thinking-uncombine variant of the contains curriculum (same selection, but
-// each doc resolves every slot before answering). Plain masked training on these teaches the resolve-
-// then-answer procedure -- no content embeddings needed.
-inline Dataset build_dataset_contains_reason(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
-    std::vector<Task> docs;
-    std::mt19937_64 rng(opt.seed);
-    for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
-        for (int r = 0; r < opt.tasks_per_oov; ++r)
-            docs.push_back(pick_content_contains_reason_task(t, split.drilled, qi, K, rng));
-    std::shuffle(docs.begin(), docs.end(), rng);
-    Dataset ds; ds.doc_starts.push_back(0);
-    for (const Task& d : docs) append_doc(ds, d);
-    return ds;
-}
+// A CONTAINS task picker: (tokenizer, pool, anchor, K, rng) -> Task. Lets one dataset builder serve every
+// contains variant (plain-reason / CoT / CoT-local / CoT-control) -- train and eval pass the SAME picker.
+// The Route A training set is build_dataset_contains_via(..., pick_content_contains_reason_task): each doc
+// resolves every slot before answering; plain masked training teaches the procedure (no content embeddings).
+using ContainsPicker = Task (*)(const tok::Tokenizer&, const std::vector<std::string>&, int, int, std::mt19937_64&);
 
-// Chain-of-thought variant of the contains curriculum: same ONE-heavy selection, but each doc emits a
-// per-slot verdict during resolution (content_contains_cot_task) to scaffold localization. `local_query`
-// picks the local-restatement variant (query char re-stated next to each segment, front slot-list dropped).
-inline Dataset build_dataset_contains_cot(const tok::Tokenizer& t, const OovSplit& split, int K,
-                                          const DatasetOptions& opt, bool local_query = false) {
+// Generic contains-curriculum builder: one doc per (drilled oov x tasks_per_oov) via `picker`.
+inline Dataset build_dataset_contains_via(const tok::Tokenizer& t, const OovSplit& split, int K,
+                                          const DatasetOptions& opt, ContainsPicker picker) {
     std::vector<Task> docs;
     std::mt19937_64 rng(opt.seed);
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
         for (int r = 0; r < opt.tasks_per_oov; ++r)
-            docs.push_back(local_query ? pick_content_contains_cot_local_task(t, split.drilled, qi, K, rng)
-                                       : pick_content_contains_cot_task(t, split.drilled, qi, K, rng));
+            docs.push_back(picker(t, split.drilled, qi, K, rng));
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);
