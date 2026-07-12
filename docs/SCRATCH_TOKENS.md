@@ -200,7 +200,7 @@ clear chance → a bigger model (the open question).
 | Content, mean-pool (Route B) | `content_contains` | ✗ chance (dilution) |
 | Content, CharEncoder (Route B) | `content_contains` | ✅ above chance (0.392, modest) |
 | Route A, presence check | `content_contains_reason` NONE/ALL | ✅ **~1.00** (K=2 and K=3) — genuinely checks every word |
-| Route A, localization | `content_contains_reason` ONE (which slot) | ✗ **~random** slot-guess (the real wall) |
+| Route A, localization | `content_contains_reason` ONE (which slot) | ✗ **~random** (survives 2× scale, 8 heads, ONE-heavy, CoT) |
 
 **Read the two content rows together:** Route A's resolve protocol is perfect at both K (the spellings are
 in the stream). The reasoning on top **decomposes**: the model learns the *presence* check but not the
@@ -229,10 +229,28 @@ Result (d128), split by outcome:
 So the model **now genuinely checks every word** (NONE/ALL are perfect — the point of adding them) — but it
 still can't **localize**: point to *which* slot. Told to (an ONE-heavy 60/20/20 mix), it outputs a slot but
 picks almost at random; given an equal mix it doesn't even try, falling back to a "present→ALL, absent→NONE"
-global-OR heuristic (~0.67 overall, but ONE-rate ~0.05). The wall is a **pointer / argmax-over-words**
-operation — *find the row that matches and report its label* — not checking, and not specific to K=3.
+global-OR heuristic (~0.67 overall, but ONE-rate ~0.05).
 
-Modest numbers are expected: d128 is capacity-starved. Scale/architecture is the amplifier.
+### Two probes that pin the wall down further
+
+**Scale doesn't buy it.** Re-running the ONE-heavy regime at **d256** (4L/8H, LR-scaled) leaves the ONE-rate
+at ~random (0.48 K=2 / 0.30 K=3) — unchanged from d128. 2× width and 8 heads don't help.
+
+**A chain-of-thought scaffold doesn't buy it either.** Idea: have the model emit a per-slot verdict (`+`/`−`,
+"does *this* slot contain the char") right after resolving each slot, so the final answer is just "copy the
+slot that got a `+`". The final copy *does* work when the verdicts are right — but the verdicts themselves
+come out wrong (`% t → uwqcos:+ tzi:−`, both inverted). Why: emitting slot *i*'s verdict requires isolating
+*that* slot's just-injected bytes from everything else — the **same** localization it can't do. So ONE-rate
+stays ~random (0.44 K=2 / 0.25 K=3).
+
+### The refined diagnosis: segment-local matching
+
+The wall isn't "point at the end" — it's **binding a content-match to a specific slot's byte-region**. The
+model can do a *global* scan ("is the char anywhere?" → NONE/ALL work perfectly) but not a *segment-local*
+one ("is the char in *this* word's bytes"). And it's **robust**: it survives 2× scale, more heads, ONE-heavy
+weighting, *and* an explicit per-slot verdict scaffold. This is not a quick recipe/scaffold fix — it likely
+needs substantially more scale, or a structural cue that makes segment boundaries attendable (e.g. restating
+the query *locally* next to each segment, positional/segment markers, or a much larger model).
 
 ## Status — the scale run
 
@@ -304,11 +322,13 @@ has no per-thread reduction, so a multi-threaded `train_batch` would race — tr
 single-threaded for now.
 
 Next steps, in order:
-1. **Crack localization** — the one open wall. The model checks every word (NONE/ALL solved) but can't point
-   to *which* slot. Probes, cheapest first: (a) the ONE-heavy regime at **d256** (LR-scaled) — does the
-   `one`-rate rise above random? (b) **more heads** (parallel pointer lanes) — the pointer/argmax step may be
-   head-count-bound; (c) a **pointer-focused curriculum** or an easier localize-only task to bootstrap the
-   skill. All need **no engine changes** (plain masked training on `build_dataset_contains_reason`).
+1. **Crack localization** — the one open wall, now pinned to *segment-local matching*. Probes (a) d256
+   ONE-heavy and (b) a CoT per-slot-verdict scaffold **both failed** (ONE-rate stayed ~random). Remaining
+   ideas, cheapest first: **local query restatement** (re-emit the queried char *next to each segment* so the
+   check is over adjacent tokens — note this overflows the 40-token window at K=3, so it needs a wider window
+   or a trimmed prompt); **structural segment markers** / positional cues that make each slot's byte-region
+   attendable; and, failing those, a **much larger model** (the wall survived 2× width, so this may need
+   ≥4–8×). All are plain masked-training changes — no engine work.
 2. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
    single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration
    for Route B, and lets Route B ride the same scale run.
