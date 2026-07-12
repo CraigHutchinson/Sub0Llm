@@ -225,10 +225,40 @@ heads is too few **parallel comparison lanes** for a K-way match — the very th
 degenerate always-`S0` basin the shallower model escaped. Lesson: bigger ≠ better *for free* — shape and
 recipe matter, and this task is head-count-sensitive.
 
-**Run 2 — d256, pinned to 4 layers × 8 heads (head-dim 32 — the *scaled working shape*): in progress.**
-Keeps everything proportional to the d128 config that worked (same depth, same head geometry) and only
-doubles width and head count. If parallel lanes were the problem, K=2 should recover and K=3 is the real
-test. Result lands here when it finishes.
+**Run 2 — d256, pinned to 4 layers × 8 heads (head-dim 32 — the *scaled working shape*): ALSO collapsed.**
+K=2 held-out flat at ~0.48 (never rises above chance), always-`S0`; K=3 chance. So the *scaled version of
+the exact shape that worked at d128* fails too — which **rules out head-count/shape** as the cause. Both
+d256 runs collapse to the degenerate basin at K=2, and the drilled curve is stuck from step 0 (no learning
+at all, vs d128 which climbed to 0.79). The common factor is **2× width at the same recipe** → the
+d128-tuned learning rate does not transfer.
+
+| | d128 (4L/4H) | d256 (8L/2H) | d256 (4L/8H) |
+|---|---|---|---|
+| K=2 held-out | ✅ 0.72 | ✗ 0.43 | ✗ 0.48 |
+| K=3 held-out | ✗ 0.33 | ✗ 0.33 | ✗ 0.33 |
+
+This is the well-known **hyperparameters-don't-transfer-across-scale** problem (cf. muP): a 2×-wider model
+generally wants roughly **½ the learning rate**.
+
+**Run 3 — d256 (4L/8H) at half the learning rate (0.003 → 0.0015): recipe confound CONFIRMED and FIXED.**
+One variable changed, and it cleanly separates recipe from capacity:
+
+| | d128 (4L/4H, lr .003) | d256 (4L/8H, lr .003) | d256 (4L/8H, lr .0015) |
+|---|---|---|---|
+| K=2 held-out (peak) | ✅ 0.72 | ✗ 0.48 (collapsed) | ✅ **0.83** (beats d128) |
+| K=3 held-out (peak) | ✗ 0.33 | ✗ 0.33 | ✗ **0.33** (still collapsed) |
+
+- **K=2 recovered** to a peak of **0.83** — *better* than d128. So the earlier d256 collapses were a mistuned
+  optimizer, not a ceiling. (It peaks around step 1500 then overfits/decays, so the test now reports **best**
+  held-out, not last.)
+- **K=3 still collapses** even with the corrected LR — always-`S0`, stuck from step 0.
+
+**Verdict.** Doubling width to d256 (done right) **recovers and slightly improves K=2 but does not reach
+K=3**. The 3-way match is genuine capacity that 2× width does not buy. Two lessons are now baked into the
+test (`scratchspike_engine_tests.cpp`): `kLr` **auto-scales ~1/width** (`0.003·128/D_MODEL`, validated at
+d128/d256) so a scale run isn't silently sabotaged by a stale LR; and the report tracks **peak** held-out
+(the capability can peak then overfit). Clearing K≥3 remains open and needs *more* than 2× width — a bigger
+model still, more steps, and/or a **K=2→K=3 curriculum** (bootstrap the reasoning at low fan-out, then widen).
 
 ## Where this is going
 

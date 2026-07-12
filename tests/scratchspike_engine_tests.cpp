@@ -41,7 +41,12 @@ constexpr int    kEvalRounds   = 10;
 constexpr int    kStepsPerEval = 300;
 constexpr int    kOovPool      = 400;   // many distinct OOVs -> force the general index op, not memorization
 constexpr double kDrilledFrac  = 0.7;
-constexpr float  kLr           = 0.003f;
+// Base LR 0.003 is tuned for the d128 spike; scale it ~1/width for larger builds so the recipe TRANSFERS
+// across model scale. A d128-tuned LR lands a 2x-wider model in the degenerate always-S0 basin and it never
+// escapes -- VALIDATED: at d256 both auto-config and the scaled-working shape collapsed at 0.003 but
+// recovered (K=2 peak 0.83) at 0.0015 == 0.003 * 128/256. Identical to 0.003 at d128 (the default build).
+// See docs/SCRATCH_TOKENS.md "Status -- the scale run".
+constexpr float  kLr           = 0.003f * (128.0f / static_cast<float>(D_MODEL));
 
 // The stateful interceptor is the PRODUCTION binding table (sub0::ScratchTable, include/sub0/scratch.hpp)
 // -- the spike exercises the exact component gen_stage drives, no duplicate. Reset per eval task; the
@@ -598,16 +603,19 @@ std::string trace_str(const std::vector<int>& out) {
 // cannot be memorization, only genuine in-context resolution + selection). This is the route the spelling
 // spike proved for in-vocab words, applied to per-context scratch bindings.
 //
-// FINDING (d128/4-layer, 3000 steps): the resolve PROTOCOL is learned FLAWLESSLY at every K -- the model
-// reliably emits <slot> UNCOMBINE and the interceptor injects each spelling (verified in the dumped
-// traces), even for held-out OOVs. But the downstream char-match-and-select is CAPACITY-bound:
-//   * K=2 (chance 0.50): held-out ~0.72 -- WORKS and generalizes (the exact, learn-nothing route delivers).
-//   * K=3 (chance 0.33): collapses to a DEGENERATE constant slot (~chance) -- the 3-way match exceeds this
-//     model's capacity, so it takes the always-S0 shortcut.
-// So Route A is not mechanism-limited (resolution is perfect at both K); its ceiling is MODEL CAPACITY for
-// the multi-way content match -- the SAME wall Route B (content embeddings) hit. Both make SCALE the
-// deciding experiment; run this at a larger whole-model size to see K=3+ clear chance. Reported via WARN
-// (a spike measurement, noisy on this laptop); the hard assert only pins that the run is finite.
+// FINDING: the resolve PROTOCOL is learned FLAWLESSLY at every K/size -- the model reliably emits
+// <slot> UNCOMBINE and the interceptor injects each spelling (verified in the dumped traces), even for
+// held-out OOVs. But the downstream char-match-and-select is CAPACITY-bound, and SCALE was probed (d256):
+//   * K=2 (chance 0.50): d128 peak ~0.72; d256 (LR-scaled) peak ~0.83 -- WORKS and generalizes.
+//   * K=3 (chance 0.33): collapses to a DEGENERATE constant slot (~chance) at BOTH d128 and d256 -- the
+//     3-way match exceeds even the 2x-wider model, which takes the always-S0 shortcut.
+// So Route A is not mechanism-limited (resolution is perfect); its ceiling is MODEL CAPACITY for the K-way
+// match -- the SAME wall Route B (content embeddings) hit. SCALE CAVEAT (why kLr scales with D_MODEL above):
+// the d128-tuned LR does NOT transfer -- at 0.003 both d256 shapes collapsed even at K=2; halving it
+// (0.003*128/256) recovered K=2. So a scale run must re-tune the recipe, else it measures a mistuned
+// optimizer, not capacity. K=3 needs more than 2x width (bigger still / more steps / a K=2->K=3 curriculum
+// -- open). Reported via WARN (a spike measurement, noisy on this laptop; peaks then can overfit -- hence
+// BEST held-out); the hard assert only pins that the run is finite. See docs/SCRATCH_TOKENS.md.
 TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exact resolution)", "[.scratchspike]") {
     Tokenizer tk;
     {
@@ -621,8 +629,9 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
 
-    // Train + eval Route A at a given fan-out K; return the final held-out rate and append a per-round
-    // trace + a couple of generated held-out samples to the report.
+    // Train + eval Route A at a given fan-out K; return the PEAK held-out rate (the capability can peak
+    // mid-training then overfit/decay -- last-round understates it) and append a per-round trace + a couple
+    // of generated held-out samples to the report.
     auto run_K = [&](int K, std::string& report) {
         const ss::Dataset ds = ss::build_dataset_contains_reason(tk, split, K, dopt);
         REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
@@ -631,32 +640,38 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- thinking-uncombine (Route A, exac
         sub0::AdamW opt(kLr);
         std::mt19937 rng(1);
         char head[224];
-        std::snprintf(head, sizeof head, "\n--- K=%d (chance = %.3f) ---\n", K, 1.0 / K);
+        std::snprintf(head, sizeof head, "\n--- K=%d (chance = %.3f, lr = %.4f) ---\n", K, 1.0 / K, kLr);
         report += head;
-        double last_held = 0.0;
+        double last_held = 0.0, best_held = 0.0;
+        int best_step = 0;
         for (int r = 0; r < kEvalRounds; ++r) {
             train_steps(ds, opt, kStepsPerEval, rng);   // plain masked training (Route A needs no content embeddings)
             const Acc d = eval_contains_reason(tk, ops, split.drilled,  K, /*seed=*/7);
             const Acc h = eval_contains_reason(tk, ops, split.held_out, K, /*seed=*/11);
             last_held = h.rate();
+            if (h.rate() > best_held) { best_held = h.rate(); best_step = (r + 1) * kStepsPerEval; }
             char line[80];
             std::snprintf(line, sizeof line, "  step %5d | DRILLED %.3f | HELD-OUT %.3f\n",
                           (r + 1) * kStepsPerEval, d.rate(), h.rate());
             report += line;
         }
+        char best[96];
+        std::snprintf(best, sizeof best, "  => BEST held-out %.3f @ step %d (last %.3f)\n",
+                      best_held, best_step, last_held);
+        report += best;
         std::mt19937_64 drng(11);
         for (int s = 0; s < 3 && s < static_cast<int>(split.held_out.size()); ++s) {
             const ss::Task k = ss::pick_content_contains_reason_task(tk, split.held_out, s, K, drng);
             report += "    want S" + std::to_string(k.answer_byte - ss::scratch_slot(0)) +
                       " | " + trace_str(run_task(ops, k)) + "\n";
         }
-        return last_held;
+        return best_held;
     };
 
     std::string report = "\n=== scratchspike CONTAINS via thinking-uncombine (Route A: resolve then select) ===\n"
                          "  (held-out = never-bound OOVs; a correct answer PROVES resolve-then-select, not memorization)\n";
-    const double h2 = run_K(2, report);   // works: held-out clears chance and generalizes
-    const double h3 = run_K(3, report);   // capacity wall: collapses to a constant slot (~chance)
+    const double h2 = run_K(2, report);   // works: peak held-out clears chance and generalizes (d128 & d256)
+    const double h3 = run_K(3, report);   // capacity wall: collapses to a constant slot (~chance), d256 too
     WARN(report);
     REQUIRE(std::isfinite(h2));
     REQUIRE(std::isfinite(h3));
