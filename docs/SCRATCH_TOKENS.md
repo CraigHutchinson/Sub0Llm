@@ -10,6 +10,31 @@ the project memory `scratch-tokens-context-translation-layer`. The spike code li
 
 ---
 
+## TL;DR — what works, and the one thing that doesn't (plain terms)
+
+Think of a scratch slot as a **temporary nickname** for a word the model doesn't have a token for. Almost
+everything about the nickname works:
+
+1. ✅ **Give an unknown word a nickname** (bind a slot) — works.
+2. ✅ **Use the nickname as a stand-in** — carry it through the text, refer back to it, pick it out by
+   association ("the one tagged ★") — works cleanly.
+3. ✅ **Spell the nickname back out on demand** (resolve / "uncombine") — works, *even for words the model
+   never saw during training* — it reads the spelling from the context, it isn't memorizing.
+
+The **one** thing that doesn't work yet is the last mental step: **read several spelled-out words and pick
+the one that contains a given letter.** With 2 candidates it works (~72%); with 3 it gives up and just
+always picks the first one (scoring ~1-in-3 by luck).
+
+And the crucial detail: this is **not** a plumbing failure. When there are 3 candidates the model *does*
+correctly spell all three out into the stream — the letters are right there in front of it — it just can't
+reliably do the *compare-three-and-choose* reasoning on top. That last step is really several operations
+stacked (hold the target letter, scan each word, test membership, find the unique match, remember whose
+nickname it was, say it), and a small model runs out of "working memory" to chain them. **It's a
+brain-size limit, not a mechanism limit** — which is exactly why the open question is *scale*, and why a
+bigger-model run is the deciding test (a d256 run is in progress; see [Status](#status--the-scale-run)).
+
+---
+
 ## The problem
 
 A model only knows a fixed vocabulary of tokens. A word that isn't on the list — a rare name, an OOV
@@ -178,6 +203,16 @@ from the other side. The shared bottleneck is model capacity for the K-way conte
 scale, not the delivery mechanism.
 
 Modest numbers are expected: d128 is capacity-starved. Scale is the amplifier for both routes.
+
+## Status — the scale run
+
+All numbers above are at **d128** (4 layers, 4 heads) — the original spike size. Because the K=3 wall is a
+capacity limit, the live question is whether a bigger model clears it. A **d256** run is in progress: same
+`content_contains_reason` curriculum (Route A, no engine changes), auto-sized to **256-wide × 8 layers**
+(~4× the parameters and 2× the depth of the d128 spike), K=2 and K=3, 3000 steps each. The result to watch
+is the **K=3 held-out** rate: at d128 it sat at chance (~0.33); if the extra depth lets the model do the
+3-way match, it should climb above chance and, ideally, toward the K=2 number. This section will record the
+outcome once the run finishes. *(K=2 is expected to stay solid; it already works at d128.)*
 
 ## Where this is going
 
