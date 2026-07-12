@@ -21,22 +21,22 @@ everything about the nickname works:
 3. ✅ **Spell the nickname back out on demand** (resolve / "uncombine") — works, *even for words the model
    never saw during training* — it reads the spelling from the context, it isn't memorizing.
 
-The last mental step — **read several spelled-out words and answer a question about which one contains a
-given letter** — splits into two sub-skills, and we now know exactly which one is the wall:
+The last mental step — **read several spelled-out words and answer which one contains a given letter** —
+splits into two sub-skills:
 
-- ✅ **Checking** ("is the letter in *any* of them? in *all* of them?") — **works, nearly perfectly.** Ask
-  the model "does any word contain a Z?" and it reliably says yes/no, having genuinely looked at every word.
-- ❌ **Localizing** ("*which* word contains it?") — **this is the wall.** The model can tell the letter is
-  *there*, but can't reliably say *which* word it's in — it points almost at random.
+- ✅ **Checking** ("is the letter in *any* / *all* of them?") — works nearly perfectly.
+- ⚠️ **Localizing** ("*which* word contains it?") — the hard one, but **now solved** (read on).
 
-And the crucial detail: this is **not** a plumbing failure. The model *does* correctly spell every word out
-into the stream — the letters are right in front of it — and it can even do the yes/no presence check. What
-it can't do is the **pointer** step: match the letter to a word and then name *that word's* nickname. That's
-a lookup-and-point operation ("find the row that matches, report its label"), and a small model can't nail
-it. **It's a brain-size limit on one specific operation, not a plumbing limit** — so the open question is
-whether *scale*, *more attention heads* (parallel pointer lanes), or a *pointer-focused curriculum* buys it.
-(How we cornered this: see [What isn't working](#what-isnt-working-the-decomposition) and
-[Status](#status--the-scale-run).)
+For a while localizing looked like a hard wall: the model could tell the letter was *there* but not *which*
+word — it pointed at random, and that survived a bigger model, more attention heads, and a "show your work"
+scaffold. The breakthrough was realizing **why**: the model couldn't hold the queried letter in mind while
+scanning words listed far earlier in the text. It's a *distance* problem, not a reasoning one.
+
+The fix is almost embarrassingly simple: **repeat the letter right next to each word as you check it**
+("looking for `z`… `cstk`? no. `tzi`? yes → that one"). With the question restated locally beside the data,
+the tiny d128 model gets it **100% right on held-out words at 3 candidates**. So the capability is *there*;
+it just needs the reasoning **grounded locally** — put the question next to the data, not paragraphs away.
+(How we cornered this: [What isn't working → what fixed it](#what-isnt-working-the-decomposition).)
 
 ---
 
@@ -200,7 +200,8 @@ clear chance → a bigger model (the open question).
 | Content, mean-pool (Route B) | `content_contains` | ✗ chance (dilution) |
 | Content, CharEncoder (Route B) | `content_contains` | ✅ above chance (0.392, modest) |
 | Route A, presence check | `content_contains_reason` NONE/ALL | ✅ **~1.00** (K=2 and K=3) — genuinely checks every word |
-| Route A, localization | `content_contains_reason` ONE (which slot) | ✗ **~random** (survives 2× scale, 8 heads, ONE-heavy, CoT) |
+| Route A, localization (plain) | `content_contains_reason` ONE (which slot) | ✗ **~random** (survives 2× scale, 8 heads, ONE-heavy, plain CoT) |
+| Route A, localization (**local grounding**) | CoT + local query restatement | ✅ **1.000 held-out K=3** — the fix |
 
 **Read the two content rows together:** Route A's resolve protocol is perfect at both K (the spellings are
 in the stream). The reasoning on top **decomposes**: the model learns the *presence* check but not the
@@ -243,14 +244,31 @@ come out wrong (`% t → uwqcos:+ tzi:−`, both inverted). Why: emitting slot *
 *that* slot's just-injected bytes from everything else — the **same** localization it can't do. So ONE-rate
 stays ~random (0.44 K=2 / 0.25 K=3).
 
-### The refined diagnosis: segment-local matching
+### The diagnosis, and what fixed it: local grounding
 
-The wall isn't "point at the end" — it's **binding a content-match to a specific slot's byte-region**. The
-model can do a *global* scan ("is the char anywhere?" → NONE/ALL work perfectly) but not a *segment-local*
-one ("is the char in *this* word's bytes"). And it's **robust**: it survives 2× scale, more heads, ONE-heavy
-weighting, *and* an explicit per-slot verdict scaffold. This is not a quick recipe/scaffold fix — it likely
-needs substantially more scale, or a structural cue that makes segment boundaries attendable (e.g. restating
-the query *locally* next to each segment, positional/segment markers, or a much larger model).
+The wall looked like **binding a content-match to a specific slot's byte-region**: the model does a *global*
+scan ("is the char anywhere?" → NONE/ALL perfect) but not a *segment-local* one ("is the char in *this*
+word's bytes"). It survived 2× scale, more heads, ONE-heavy weighting, and the CoT verdict scaffold — so it
+seemed to need much more model.
+
+It didn't. The real cause was narrower: the model couldn't **hold the queried char in mind while scanning
+segments listed far earlier** — a *non-local binding* problem, not segment isolation. The test: **restate the
+queried char immediately before each verdict** (`… <bytes_i> <c> <verdict_i>`), so the check is over adjacent
+tokens, and drop the now-redundant front slot-list. Result at d128:
+
+| Variant | K=2 `one`-rate | K=3 `one`-rate (overall) |
+|---|---|---|
+| plain CoT | ~0.44 | ~0.25 |
+| **local-query CoT** | **0.91** | **1.00** (held-out **1.000**) |
+| control (drop front list, *no* restatement) | — | ~0.35 (rules out the confound) |
+
+The traces are flawless and generalize to held-out OOVs:
+`want S2 | % z … cstk z− … uwqcos z− … tzi z+ = S2` ✓. The control — dropping the front list *without*
+restating — stays at ~random, so **the restatement (locality), not the shorter context, is the driver**.
+
+**Conclusion:** localization is *not* a capacity wall — the d128 model can do it perfectly. It just needs the
+reasoning **grounded locally**: put the query next to the data it's compared against. Scale/heads/CoT-alone
+don't help; local grounding does.
 
 ## Status — the scale run
 
@@ -308,10 +326,10 @@ LR; and the report tracks **peak** held-out (the capability can peak then overfi
 
 > **Note — these three runs predate the ALL/NONE decomposition above.** They were on the *old* one-match
 > regime, where "K=3 collapses" actually meant *localization* collapses (the K=2 "win" was the elimination
-> shortcut). The refined open question is therefore **not** "does K=3 work at scale" but **"does *localization*
-> (pointing to the right slot) clear** with scale, more heads (parallel pointer lanes), or a pointer-focused
-> curriculum?" The immediate next probe is the ONE-heavy regime at d256 (LR-scaled) — does the per-kind
-> `one`-rate rise above random?
+> shortcut). Follow-up settled it: scale does **not** buy localization (d256 ONE-heavy left the `one`-rate at
+> random), and neither does a plain CoT scaffold — but **local query restatement does** (held-out 1.000 at
+> K=3, d128). See [What isn't working → what fixed it](#what-isnt-working-the-decomposition). So the lever was
+> never scale; it was grounding the reasoning locally.
 
 ## Where this is going
 
@@ -322,13 +340,11 @@ has no per-thread reduction, so a multi-threaded `train_batch` would race — tr
 single-threaded for now.
 
 Next steps, in order:
-1. **Crack localization** — the one open wall, now pinned to *segment-local matching*. Probes (a) d256
-   ONE-heavy and (b) a CoT per-slot-verdict scaffold **both failed** (ONE-rate stayed ~random). Remaining
-   ideas, cheapest first: **local query restatement** (re-emit the queried char *next to each segment* so the
-   check is over adjacent tokens — note this overflows the 40-token window at K=3, so it needs a wider window
-   or a trimmed prompt); **structural segment markers** / positional cues that make each slot's byte-region
-   attendable; and, failing those, a **much larger model** (the wall survived 2× width, so this may need
-   ≥4–8×). All are plain masked-training changes — no engine work.
+1. ~~Crack localization~~ **— done.** Local query restatement solves it (held-out 1.000 at K=3, d128; the
+   confound control rules out context-length). The takeaway generalizes: **ground the reasoning locally** —
+   put the query next to the data. Follow-ups: confirm at higher K (4–6 candidates), and fold the local-CoT
+   trace shape into the production `--scratch-mix` curriculum so real models learn to answer content queries
+   over scratch slots by resolving + locally checking. (No engine changes — all masked-training curriculum.)
 2. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
    single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration
    for Route B, and lets Route B ride the same scale run.
