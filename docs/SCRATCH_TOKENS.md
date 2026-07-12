@@ -93,14 +93,26 @@ the stream" shortcut). This is the exact mechanism the in-vocabulary spelling sp
 └── prompt ──┘          └─ injected, MASKED ──┘        └ graded ┘
 ```
 
-**Status: works.** The `nth_char` / `roundtrip` tasks pass — this route is real and merged. It is the
-"spell it out when you need it" path.
+**Status: the mechanism works; the reasoning it enables is capacity-bound.** The `nth_char` / `roundtrip`
+tasks pass, and — tested directly on the content question (`content_contains_reason_task`: resolve *every*
+slot, then select the one whose spelling contains the queried char) — the resolve **protocol is learned
+flawlessly**: the model reliably emits `<slot> UNCOMBINE` and the interceptor injects every spelling into
+the stream, even for held-out OOVs (verified by dumping the generated traces). But the *downstream*
+char-match-and-select is model-capacity-bound at d128/4-layer:
+
+- **K=2** (chance 0.50): held-out **~0.72** — **works and generalizes**; the exact, learn-nothing route
+  delivers. Sample: `% b → S0=ezd S1=bvk(has b) → answer S1` ✓.
+- **K=3** (chance 0.33): **collapses to a degenerate constant slot** (~chance) — the 3-way match exceeds
+  this model's capacity, so it takes the always-`S0` shortcut even with all three spellings in the stream.
+
+So Route A is **not mechanism-limited** (resolution is perfect at both K); its ceiling is the model's
+capacity for the multi-way match — the **same wall Route B hits below**.
 
 - **Cost:** O(K × word-length) tokens — you must expand *every* slot you want to inspect.
 - **Signal:** full, exact spelling.
-- **Caveat:** on *scratch bindings* (read the spelling from context) it is only partially solved cold at
-  d128 (~0.31–0.46), weaker than the in-vocab spelling spike (0.97, productionised) because that one
-  recalls a spelling baked into weights rather than reading it from context.
+- **Caveat:** on *scratch bindings* (read the spelling from context) even single-slot resolution is only
+  partially solved cold at d128 (~0.31–0.46), weaker than the in-vocab spelling spike (0.97, productionised)
+  because that one recalls a spelling baked into weights rather than reading it from context.
 
 ### Route B — content-derived slot embeddings (bake content into the vector)
 
@@ -124,16 +136,25 @@ that this probe was built to deny the model the uncombine step on purpose.
 
 ### Which route when
 
-They are complementary, not substitutes:
+They are complementary, not substitutes — and they share one ceiling:
 
 | | Route A: uncombine + mask | Route B: content-derived embedding |
 |---|---|---|
 | How | model spells the slot back out, then reads it | slot embedding built from its fragments; answer directly |
 | Inference cost | O(K × word-length) tokens | **O(1)** token |
 | Signal | full, exact spelling | compressed (presence / first-letter), lossy |
-| Status | **works** (nth-char / round-trip) | mean-pool ✗, learned CharEncoder ✓ (modest at d128) |
+| Mechanism | ✅ flawless (resolves every slot, held-out too) | ✅ wired + FD-verified |
+| Content reasoning @ d128 | K=2 ✅ 0.72 · K=3 ✗ collapses (~chance) | K=3 mean-pool ✗ · CharEncoder ✓ 0.392 |
 
-Want a cheap content-*glance* → Route B. Want the exact spelling → Route A.
+The distinction that **is** real is **inference cost** (O(1) glance vs O(K·len) spell-out) and **signal
+fidelity** (exact vs lossy). The distinction that turned out **not** to separate them is the reasoning
+ceiling: **both routes hit the same capacity wall** on the multi-way (K=3) content match at d128 — Route A
+by collapsing to a constant slot, Route B by barely clearing chance. The spellings being *present* (Route A)
+is no easier for the model than the content being *embedded* (Route B); the bottleneck is the composed
+match-and-select, not how the content is delivered. **Scale is therefore the deciding experiment for both.**
+
+Want a cheap content-*glance* → Route B. Want the exact spelling → Route A. Want K≥3 content reasoning to
+clear chance → a bigger model (the open question).
 
 ---
 
@@ -148,6 +169,13 @@ Want a cheap content-*glance* → Route B. Want the exact spelling → Route A.
 | Content, plain slot | `content_contains` (no Route A/B) | ✗ chance |
 | Content, mean-pool (Route B) | `content_contains` | ✗ chance (dilution) |
 | Content, CharEncoder (Route B) | `content_contains` | ✅ above chance (0.392, modest) |
+| Content, resolve-then-select (Route A) | `content_contains_reason` K=2 | ✅ **0.72** held-out (generalizes) |
+| Content, resolve-then-select (Route A) | `content_contains_reason` K=3 | ✗ collapses to a constant slot (~chance) |
+
+**Read the two content rows together:** Route A's resolve protocol is perfect at both K (the spellings are
+in the stream); K=3 fails on the *match-and-select* step, not the resolution. Route B fails the same step
+from the other side. The shared bottleneck is model capacity for the K-way content match — the lever is
+scale, not the delivery mechanism.
 
 Modest numbers are expected: d128 is capacity-starved. Scale is the amplifier for both routes.
 
@@ -160,9 +188,13 @@ has no per-thread reduction, so a multi-threaded `train_batch` would race — tr
 single-threaded for now.
 
 Next steps, in order:
-1. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
-   single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration.
-2. **A d448+ scale run** — d128 caps the content-match gain.
+1. **The deciding experiment — scale.** Both routes hit the same K-way-match wall at d128, so the open
+   question for *both* is whether a bigger model clears K≥3 content reasoning. **Route A can be scale-tested
+   immediately** — it needs **no engine changes** (plain masked training on `build_dataset_contains_reason`
+   at a larger model); if K=3 clears chance there, the resolve-then-select route is production-viable as-is.
+2. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
+   single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration
+   for Route B, and lets Route B ride the same scale run.
 3. CUDA embed branch (parity-gated), gen wiring (`ScratchTable::to_bindings`), reserved-range growth, and
    an **order-aware** encoder (the first-letter task is missed by both mean-pool and the order-agnostic
    CharEncoder).
