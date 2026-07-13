@@ -20,6 +20,7 @@ add_executable(sub0_tests
   arithspike_engine_tests.cpp
   nodespike_engine_tests.cpp
   chainspike_engine_tests.cpp
+  node_frame_engine_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.
