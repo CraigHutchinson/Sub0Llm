@@ -93,6 +93,22 @@ discipline as checking a memory's claims against live code before acting on them
   — bridges instruction-following and reasoning density in one set, useful once conversational + basic
   reasoning are both working and need combining.
 
+**Connection to the deterministic-mechanisms thesis ([DETERMINISTIC_MECHANISMS.md](DETERMINISTIC_MECHANISMS.md)).**
+These math sets are not merely "reasoning-density" data — they are the *integrated* testbed for the
+delegation mechanism, and the place its **FILTER** pillar stops being optional. A grade-school word problem
+exercises all three pillars at once: the genuinely-fuzzy part (read the problem, pick the operation, sequence
+the steps) stays in-model, while every arithmetic step is a scalar-solvable span that must be **delegated to a
+node and masked from the loss** — otherwise the corpus *actively teaches the fuzzy arithmetic we are trying to
+eliminate* (exactly the failure arithspike pinned: fuzzy add never generalises, 0.000). GSM8K is especially
+apt because its worked solutions already carry inline **calculator annotations** (`<<48*2=96>>`) — a
+ready-made op-frame marking precisely the spans to delegate + mask, so the routing supervision is essentially
+pre-labelled. The recommended first math step is therefore **not** "train on GSM8K and measure accuracy" but
+"convert its calc-annotations into node calls with masked results, and test whether a small model learns the
+*routing* while the nodes do the arithmetic" — the arithspike result lifted from bare `A+B` into real
+multi-step word problems (PROVIDE + COMPOSE/chaining + FILTER working together). Synthetic sets we generate
+*and verify ourselves* (incl. via the Lean/mathlib oracle) are the cleanest source, since correctness of the
+masked answer is guaranteed by construction; GSM8K is the best-labelled *real* set to start from.
+
 ### E. Tool use / agentic behavior (bridges toward the stretch goal)
 - **Glaive function-calling v2** — synthetic, Apache-2.0, function/tool-call examples in a JSON-schema
   style. The most directly reusable existing set for teaching "call this tool with these arguments"
