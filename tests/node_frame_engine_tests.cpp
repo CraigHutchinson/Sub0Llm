@@ -126,3 +126,22 @@ TEST_CASE("node_frame: end-to-end -- model emits a TOK_TURN op region, the node 
     WARN(report);
     REQUIRE(std::isfinite(best));
 }
+
+// FORWARD-PASS resolution: a prompt that merely POSES a computation (ends in a completed op region) is
+// resolved during PREFILL -- a discrete forward-step delegation, no iterative generation/reasoning needed.
+// The result is deterministic (independent of the model's logits), so an untrained model suffices.
+TEST_CASE("node_frame: prefill resolves a prompt that ends in an op region (forward-pass delegation)", "[nodeframe]") {
+    sub0::build_model();
+    const auto compute = nd::make_compute_callback(nd::builtin());
+    // `12 + 34 = [op add]`  (prompt is 14 tokens; the injected result region follows it).
+    std::vector<int> ctx = {'1','2','+','3','4','=', nd::FRAME_OPEN,'o','p',' ','a','d','d', nd::FRAME_CLOSE};
+    const std::size_t plen = ctx.size();
+    std::mt19937 rng(0);
+    sub0::kv_decode_generate(ctx, /*n=*/1, 1.f, 1, rng, cas::TOK_EOS, false, {}, {}, {}, compute, nd::FRAME_CLOSE);
+    // `[46]` was injected in the forward pass, right after the prompt's op region.
+    REQUIRE(ctx.size() >= plen + 4);
+    REQUIRE(ctx[plen + 0] == nd::FRAME_OPEN);
+    REQUIRE(ctx[plen + 1] == '4');
+    REQUIRE(ctx[plen + 2] == '6');
+    REQUIRE(ctx[plen + 3] == nd::FRAME_CLOSE);
+}

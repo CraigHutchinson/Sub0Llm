@@ -149,21 +149,16 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         logits = sub0::forward_one(ctx[pos], pos);
     // Feed a token through the KV-cache (used for both sampled and harness-injected tokens).
     auto feed = [&](int tok) { ctx.push_back(tok); logits = sub0::forward_one(tok, static_cast<int>(ctx.size()) - 1); };
-    // The extra `ctx.size() < SEQ_LEN` guard only matters in interception mode, where injected spans
-    // can grow ctx past the n-token budget the non-intercept precondition (ctx.size()+n <= SEQ_LEN)
-    // otherwise guarantees; it never fires without interception, so that path is byte-identical.
-    for (int s = 0; s < n && static_cast<int>(ctx.size()) < SEQ_LEN; ++s) {
-        const int next = sub0::sample_token(logits, temp, topk, rng);
-        if (next == eos_id) break;             // learned stop signal -- never push the marker token
-        if (on_token) on_token(logits, next);
-        feed(next);
+    // Resolve a just-processed marker `next` (the last token in ctx): a DISCRETE FORWARD-STEP delegation --
+    // fulfil the requested deterministic op and INJECT its content (fed through the model so it attends to it,
+    // but never sampled; guarded so injections never run past the window). Factored so it fires BOTH after
+    // prefill (a prompt that ENDS in an op resolves in the forward pass -- no iterative generation needed) and
+    // per generated token. See the former kv_decode_ops (now folded here) and sub0/spellspike.hpp.
+    auto resolve = [&](int next) {
         if (do_compute && next == compute_marker) {   // deterministic node: inject its exact result
             for (int r : compute(ctx)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(r); }
         }
-        if (!intercept) continue;
-        // The model emitted a marker: fulfil the requested op by INJECTING its content (fed through
-        // the model so it attends to it, but never sampled). Guarded so injections never run past the
-        // trained window. See the former kv_decode_ops (now folded here) and sub0/spellspike.hpp.
+        if (!intercept) return;
         if (next == casing::TOK_UNCOMBINE) {
             const int tgt = ctx.size() >= 2 ? ctx[ctx.size() - 2] : -1;   // expand the PRECEDING token
             if (tgt >= 0) {
@@ -178,6 +173,20 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
                 for (int ct : combine(frags)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(ct); }
             }
         }
+    };
+    // FORWARD-PASS resolution of a prompt that ENDS in a completed op/marker: resolve it before generating, so
+    // a prompt that merely POSES a computation is answered in the forward pass, not an iterative reasoning
+    // loop. (Only the final marker -- a mid-prompt op would need a KV-cache-aware splice; backlog.)
+    if ((do_compute || intercept) && !ctx.empty() && static_cast<int>(ctx.size()) < SEQ_LEN) resolve(ctx.back());
+    // The extra `ctx.size() < SEQ_LEN` guard only matters in interception mode, where injected spans
+    // can grow ctx past the n-token budget the non-intercept precondition (ctx.size()+n <= SEQ_LEN)
+    // otherwise guarantees; it never fires without interception, so that path is byte-identical.
+    for (int s = 0; s < n && static_cast<int>(ctx.size()) < SEQ_LEN; ++s) {
+        const int next = sub0::sample_token(logits, temp, topk, rng);
+        if (next == eos_id) break;             // learned stop signal -- never push the marker token
+        if (on_token) on_token(logits, next);
+        feed(next);
+        resolve(next);
     }
 }
 
