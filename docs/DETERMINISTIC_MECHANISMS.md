@@ -117,6 +117,25 @@ Recommended order: (1) already have big-int add → extend to Boost.Multiprecisi
 (2) an **exprtk** numeric-expression node; (3) a **SymEngine** symbolic node. All fetch cleanly via the
 existing CPM setup. Avoid GiNaC (GPL) and be deliberate about GMP/MPFR (LGPL) given the project's licensing.
 
+**Complex results — a result is not always a plain decimal (exponents, powers, rationals, symbols).** `2^100`
+is 31 digits or the symbol `2^100`; `1.23e45` needs scientific form; division needs a rational; `sqrt(2)` is
+irrational. The node result type is therefore a **canonical numeric grammar** — `int | decimal | scientific
+(e) | rational (/) | symbolic (^, sqrt, …)` — emitted as **ordinary tokens** (digits, `.`, `e`, `-`, `^`, `/`
+are already in-vocab; **zero new tokenizer ids**, same ethos as the region frame). Each node declares which
+form it returns; the harness just injects those tokens. This is also where the **scalar re-entry** meets its
+match: `SlotEncoding::Scalar` already encodes any of these to `(sign, exp, mantissa)` for a bounded
+intermediate re-entry (§A), while the exact grammar string stays in the fragment binding for the terminal path.
+
+**Verified / symbolic backends — Lean + mathlib.** A step beyond a CAS: Lean's `mathlib` is a vast, *machine-
+checked* math library, so a Lean node can return not just an answer but a **proof-carrying** one (exact
+symbolic algebra, number theory, `decide`/`norm_num`-style verified equalities). Two honest roles, matched to
+its cost (JIT-elaborated tactics → up to seconds/query, a heavy toolchain — never an inline per-token decode
+node): (1) an **offline oracle for the FILTER pillar** — generate *and verify* the exact answers we mask
+scalar-solvable spans down to, so the training data's delegated results are provably correct (and to *mine*
+new scalar-solvable templates); (2) a **high-value external-process node** for the rare hard symbolic/proof
+query, sandboxed like the other heavy nodes (FLINT/Pari row). For fast inline symbolic work, SymEngine
+remains the embed; Lean/mathlib is the *correctness oracle* and the proof-grade escalation, not the hot path.
+
 ### 2. BIND — scratch tokens as symbolic (algebraic) variables
 
 A scratch slot is **algebraic notation.** Binding a precise value to a slot lets the model reason over the
@@ -249,6 +268,27 @@ the KV-cache: a neural prediction can only condition on what the KV holds.
 both per generated token *and after prefill*, so a prompt that merely *poses* a computation (ends in an op
 region, `12+34=[op add]`) is resolved in the **forward pass** — no generation loop.
 
+**TESTED — the scalar re-entry holds for magnitude/leading-digit reasoning, breaks below the encoding
+(`scalar_reentry` A/B, committed).** `SlotEncoding::Scalar` (`scratch_slots.hpp`) *is* the intermediate
+re-entry: the classical result re-enters as **one** bounded `(sign, base-10 exponent, leading mantissa
+digits)` vector — a fixed, stop-gradient encoding that is bounded *regardless of magnitude*, so a power's full
+expansion (`2^100`) and a scientific literal (`1.23e45`) map into the same vector as a small integer (the
+complex-result case, below). Single-number readout A/B (read a queried digit of a re-entered value; d128,
+mantissa = 4 leading digits), held-out:
+
+| re-entry channel | leading digit | trailing digit |
+|---|---|---|
+| DIGIT (N tokens) | 1.000 | 1.000 |
+| SCALAR (one vector) | **1.000** | 0.125 (≈ chance) |
+
+A one-vector re-entry is **as good as N digit tokens for the reasoning the encoding carries** (leading digits
+/ order-of-magnitude — comparisons, routing, sign/size decisions) and **provably chance where it is lossy**
+(the low-order digits it drops). That is the honest answer to *"will the brain-swap hold at scale?"* — **yes**
+for magnitude/leading-digit reasoning, **no** for low-digit precision, which is exactly why the *exact* value
+stays in the slot's fragment binding for the terminal/exact path. Widening the mantissa trades vector width
+for how deep the scalar stays exact; a **learned** number→vector encoder (the live backward choice below)
+could pack more discriminable value per dim — the natural next probe if the fixed encoding's ceiling bites.
+
 **Training-time resolution — the forward/backward analysis (decided: keep bake-train/live-infer).** A node is
 *non-differentiable* (classical code), so backward can only **stop-gradient** at its output: the result is a
 constant for autodiff. There is nothing to learn about an exact computation — only *routing*, which the loss
@@ -261,10 +301,12 @@ current **bake-train / live-infer** split *is* the right design (chainspike alre
 training, node-injected at eval, matched 1.000). Live training-time resolution only earns its keep for
 **non-teacher-forced operands** (the model generating operands itself) — a **free-running / RL** decision
 (reward on the routing, no grad through the node), to take *only if exposure bias proves real*. **Backlog:**
-(i) **mid-prompt** ops need a KV-cache-aware splice; (ii) **scalar-embedding** result — inject the value as
-*one vector* (à la the content-derived slot embedding) instead of digit tokens: this is where a *backward*
-choice is genuinely live — a **fixed** numeric encoding → stop-gradient, a **learned** number→vector encoder →
-gradient flows to the encoder; (iii) free-running/RL, only on demonstrated exposure bias.
+(i) **mid-prompt** ops need a KV-cache-aware splice; (ii) ~~**scalar-embedding** result — inject the value as
+*one vector* instead of digit tokens.~~ **DONE (fixed encoding):** `SlotEncoding::Scalar` + the A/B above —
+the fixed `(sign,exp,mantissa)` encoder is stop-gradient and holds for magnitude/leading-digit reasoning; the
+**learned** number→vector encoder (gradient flows to it) is the still-open half, worth it only if the fixed
+encoding's low-digit ceiling actually bites a target task; (iii) free-running/RL, only on demonstrated
+exposure bias.
 
 ### B. Fold combine/uncombine into the op registry
 
