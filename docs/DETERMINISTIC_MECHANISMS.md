@@ -36,6 +36,21 @@ The interceptor seam that powers all of this — the model emits a marker, the h
 and injects the result, the injected span is loss-masked — is **already a general tool-invocation point.**
 We have been building this architecture without naming it. This doc names it and asks what else it unlocks.
 
+### PROVEN — big-number addition (arithspike, committed)
+
+The thesis's crispest test now has a decisive answer. Same d128/4-layer model, same `A + B = ?` over 8–14
+digit integers, same 3000-step budget — only the mechanism differs (`include/sub0/arithspike.hpp`, a
+`compute` node added to `kv_decode_generate`):
+
+| | held-out exact-match | per-digit |
+|---|---|---|
+| **DELEGATION** (emit `COMPUTE`, exact add node injects the sum) | **1.000** (from step 300) | 1.000 |
+| **FUZZY** (model must produce the sum itself) | **0.000** (never) | ~0.10–0.15 |
+
+Delegation generalises **perfectly** to never-seen numbers because it only ever learns the routing; fuzzy
+internal arithmetic never generalises at all. **1.000 vs 0.000** — mechanism beats approximation by an
+infinite margin on a deterministic task. This is the template for everything below.
+
 ---
 
 ## The three pillars
@@ -44,25 +59,49 @@ A deterministic mechanism is only a "win" when all three are in place. Give the 
 fuzzy shortcut available, and it will take the shortcut; provide the shortcut but no node, and it stays
 fuzzy. You have to **set the mechanism up to win** on all three sides.
 
-### 1. PROVIDE — a deterministic node behind a marker token
+### 1. PROVIDE — a deterministic node behind a region frame (named in ordinary words)
 
-Generalise the `expand`/`combine` seam into a small registry of **computation nodes**: the model emits a
-marker (`TOK_COMPUTE` + an op selector + operands), the harness runs the exact function, and injects the
-result span (loss-masked). `expand`/`combine` become two nodes among many:
+Generalise the `expand`/`combine` seam into a small registry of **computation nodes**: the model opens a
+region, the harness runs the exact function, and injects the result span (loss-masked). The nodes are
+**non-differentiable** (classical code between generation steps, exactly like the existing interceptor); the
+model is trained on the *open-frame + op-name + operand* tokens (graded) and the injected result is masked —
+so gradient only ever flows to the **routing and operand selection**, never to a fuzzy internal copy.
 
-| Node | Model emits | Harness returns (injected, masked) |
+**Don't mint a token per op — use ONE region frame + a natural-language op name.** This is the same choice
+the tokenizer already made for chat: `TOK_TURN_START`/`TOK_TURN_END` are *two* markers, not one-per-role, and
+the role ("system"/"user"/"assistant") flows through as **ordinary text** the Unigram vocab already encodes
+([casing.hpp](../include/sub0/casing.hpp) §turn-boundaries; reserved headroom there explicitly anticipates
+"tool-call structure"). Apply the identical trick to compute: one delimiter pair, and the *op* is a word.
+
+```
+<|op|> add A B <|end|>          ▶ node("add", [A,B]) → exact result injected, masked
+<|op|> solve "x^2 = A" <|end|>  ▶ node("solve", …)   → the CAS's answer injected
+<|op|> uncombine <tok> <|end|>  ▶ expand (today's UNCOMBINE, re-expressed in the frame)
+```
+
+The op selector and operands are ordinary tokens the vocab already has, so **a new node costs ZERO tokenizer
+budget** — no reserved-id per op, no format bump. (Contrast: the scratch pool maxed at K=6 precisely because
+each slot is a reserved id; a region frame sidesteps that ceiling.) The registry keys on the op *word* after
+the frame-open, not on a dedicated token. `expand`/`combine`/`compute` all collapse into this one shape;
+today's per-op reserved markers (`TOK_UNCOMBINE`, …) and the arithspike's ASCII sentinels (`$`/`#`) are the
+*spike* encoding — the region-frame is the production one, and it's the natural home for the whole registry.
+
+### Solver nodes — what to embed (for "more complex maths")
+
+The add node is a few lines; the power is delegating to a real, permissively-licensed, **deterministic**
+library. Staged by capability (prefer MIT/BSD/Boost over GPL/LGPL for a permissive project; keep every node
+**pure and sandboxed** — no I/O, bounded time/memory, since operands are model-generated):
+
+| Capability | Candidate libraries | Notes |
 |---|---|---|
-| expand (exists) | `UNCOMBINE <tok>` | the token's fragments |
-| combine (exists) | `COMBINE <frags> COMBINE_END` | the minimal token(s) |
-| **arithmetic** | `COMPUTE add <A> <B>` | the exact sum |
-| **compare / sort** | `COMPUTE cmp <A> <B>` | `<` / `=` / `>` |
-| **lookup** | `COMPUTE date …` | the resolved value |
-| **solver** | `COMPUTE latex "…"` | the solver's output (CAS / math / units) |
+| Exact arithmetic / rationals / arbitrary-precision decimals | **Boost.Multiprecision** (`cpp_int`, `cpp_dec_float`; Boost licence, header-mostly); GMP/MPFR (LGPL) | upgrade the self-contained add node to exact rationals + decimals (the user's `.32232` case) |
+| General numeric expression eval | **exprtk** (MIT, header-only), **tinyexpr++** (zlib), muParser (BSD) | one "evaluate this expression exactly" node covers `+ - * / ^ %`, functions |
+| Symbolic algebra (solve / simplify / differentiate) | **SymEngine** (MIT, C++, CPM/CMake-friendly — SymPy's C++ backend) | the real "complex maths" node: `solve`, `simplify`, `diff`, `expand` |
+| Number theory / polynomials | FLINT, Pari/GP | heavier; likely an external-process node, not embedded |
 
-The nodes are **non-differentiable** (they're classical code), which is fine: they sit *between* generation
-steps, exactly like the existing interceptor. The model is trained on the *marker + operand* tokens (graded)
-and the injected result is masked — so gradient only ever flows to the **routing and operand selection**,
-never to a fuzzy internal copy of the computation.
+Recommended order: (1) already have big-int add → extend to Boost.Multiprecision for exact decimals/rationals;
+(2) an **exprtk** numeric-expression node; (3) a **SymEngine** symbolic node. All fetch cleanly via the
+existing CPM setup. Avoid GiNaC (GPL) and be deliberate about GMP/MPFR (LGPL) given the project's licensing.
 
 ### 2. BIND — scratch tokens as symbolic (algebraic) variables
 
@@ -170,18 +209,21 @@ filter pass.
 
 ## Staged plan (proposal)
 
-1. **Name and generalise the seam.** Refactor `expand`/`combine` into a small `ComputeNode` registry behind
-   one marker family; expand/combine become the first two entries. (Mostly a rename + an indirection —
-   low-risk, and it makes everything below additive.)
-2. **Numeric binding + one arithmetic node.** Bind a literal number to a scratch slot; add `COMPUTE add`.
-   Curriculum: `A + B = ?` over bound big numbers, answer via the node. Target: near-perfect at d128 with
-   trivial training (the thesis's crispest test — if big-number addition *isn't* near-free, the thesis is
-   wrong and we learn that cheaply).
-3. **The filter pass.** Start with a classical scanner (regex/grammar) that masks arithmetic results and
-   precise numerics in the corpus; measure whether it *stops* the model memorising answers. Add the small
-   scanning model only where the classical pass is ambiguous.
-4. **Widen the node set** (compare, sort, date, units) and test **chained** delegation via scratch-bound
-   intermediates.
+0. ~~Prove the thesis.~~ **DONE** — the arithspike (`compute` node + `arithspike.hpp`): big-number addition
+   delegation 1.000 vs fuzzy 0.000 on held-out. The seam and the masked-CE training already carry it.
+1. **The region frame.** Adopt one `<|op|> … <|end|>` delimiter pair (reuse/mirror `TOK_TURN_START/END`;
+   spend the reserved-headroom tool-call slot at most once) and a `ComputeNode` registry keyed on the op
+   *word*. Re-express expand/combine/compute in the frame so new nodes cost zero tokenizer budget. (Rename +
+   indirection; low-risk; makes everything below additive and un-caps the reserved-id ceiling.)
+2. **Exact + symbolic nodes.** Extend the add node to exact decimals/rationals (Boost.Multiprecision), then
+   add an **exprtk** numeric-expression node and a **SymEngine** symbolic node (solve/simplify/diff) — the
+   "more complex maths". Each pure + sandboxed.
+3. **The filter pass.** A classical scanner (regex/grammar) that masks arithmetic results and precise numerics
+   in the corpus; measure whether it *stops* the model memorising answers. Add the small scanning model only
+   where the classical pass is ambiguous.
+4. **Numeric BIND + chaining.** Bind literals to scratch slots (algebraic compression: 13 digits → 1 token
+   unless asked), and test **chained** delegation (compute A, feed to compare/sort) via scratch-bound
+   intermediates — the composition substrate.
 5. **Fold into `--scratch-mix`** alongside the resolution/associative/content capabilities already there.
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
