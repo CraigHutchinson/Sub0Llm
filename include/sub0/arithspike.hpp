@@ -84,8 +84,11 @@ inline void push_prompt(Task& k, int tok) { push(k, tok, 0); k.prompt.push_back(
 }
 
 // `delegate` -> the DELEGATION trace: [A + B =] COMPUTE (graded routing) [<sum> COMPUTE_END] (masked, node-
-// injected) EOS (graded). Else the FUZZY trace: [A + B =] <sum> (graded -- the model must compute it) EOS.
-inline Task make_task(const std::string& a, const std::string& b, bool delegate) {
+// injected) EOS (graded). Else the FUZZY/FACT trace: [A + B =] <sum> EOS. `grade_result` controls whether the
+// result digits are graded: true = a graded FUZZY target (the model must produce it); false = a FILTER-MASKED
+// corpus FACT (the digits are present as context but the model is NOT rewarded for producing them -- what a
+// corpus-filter pass does to a scalar-solvable span so it can't teach fuzzy memorisation).
+inline Task make_task(const std::string& a, const std::string& b, bool delegate, bool grade_result = true) {
     Task k; k.sum = add_ints(a, b);
     for (char c : a) detail::push_prompt(k, static_cast<unsigned char>(c));
     detail::push_prompt(k, OP_ADD);
@@ -97,7 +100,8 @@ inline Task make_task(const std::string& a, const std::string& b, bool delegate)
         detail::push(k, COMPUTE_END, 0);                                         // masked: node-injected
         detail::push(k, casing::TOK_EOS, 1);                                     // graded
     } else {
-        for (char c : k.sum) detail::push(k, static_cast<unsigned char>(c), 1);  // graded: FUZZY internal compute
+        const std::uint8_t g = grade_result ? 1 : 0;
+        for (char c : k.sum) detail::push(k, static_cast<unsigned char>(c), g);  // graded FUZZY, or masked FACT
         detail::push(k, casing::TOK_EOS, 1);
     }
     return k;

@@ -54,9 +54,10 @@ void train_steps(const as::Dataset& ds, sub0::AdamW& opt, int steps, std::mt1993
     }
 }
 
-struct Acc { int ok = 0, n = 0; long dig_ok = 0, dig_n = 0;
-    double rate()     const { return n ? static_cast<double>(ok) / n : 0.0; }
-    double dig_rate() const { return dig_n ? static_cast<double>(dig_ok) / static_cast<double>(dig_n) : 0.0; } };
+struct Acc { int ok = 0, n = 0, deleg = 0; long dig_ok = 0, dig_n = 0;
+    double rate()       const { return n ? static_cast<double>(ok) / n : 0.0; }
+    double deleg_rate() const { return n ? static_cast<double>(deleg) / n : 0.0; }
+    double dig_rate()   const { return dig_n ? static_cast<double>(dig_ok) / static_cast<double>(dig_n) : 0.0; } };
 
 // Right-aligned digit-match count between a produced answer and the truth (nuance: fuzzy tends to nail the
 // low-order digits and miss the rest).
@@ -70,21 +71,25 @@ void tally_digits(Acc& a, const std::string& got, const std::string& want) {
 }
 
 // Eval on FRESH random numbers (held-out). Delegation wires the add node into decode; fuzzy does not.
-Acc eval(std::mt19937_64& rng, int n_tasks, bool delegate) {
+// `topk` = 1 is greedy (picks the modal next-token); a larger topk SAMPLES, which surfaces any fuzzy
+// probability mass a contaminated model still carries after `=`.
+Acc eval(std::mt19937_64& rng, int n_tasks, bool delegate, int topk = 1) {
     Acc a;
     std::uniform_int_distribution<int> dd(kMinDigits, kMaxDigits);
     for (int i = 0; i < n_tasks; ++i) {
         const as::Task k = as::make_task(as::gen_int(rng, dd(rng)), as::gen_int(rng, dd(rng)), delegate);
         std::vector<int> ctx = k.prompt;
-        std::mt19937 grng(0);
+        std::mt19937 grng(static_cast<unsigned>(i) + 1);
         if (delegate)
-            sub0::kv_decode_generate(ctx, /*n=*/32, /*temp=*/1.f, /*topk=*/1, grng, cas::TOK_EOS,
+            sub0::kv_decode_generate(ctx, /*n=*/32, /*temp=*/1.f, topk, grng, cas::TOK_EOS,
                                      /*use_gpu=*/false, /*on_token=*/{}, /*expand=*/{}, /*combine=*/{},
                                      as::add_node, as::COMPUTE);
         else
-            sub0::kv_decode_generate(ctx, /*n=*/32, /*temp=*/1.f, /*topk=*/1, grng, cas::TOK_EOS, /*use_gpu=*/false);
+            sub0::kv_decode_generate(ctx, /*n=*/32, /*temp=*/1.f, topk, grng, cas::TOK_EOS, /*use_gpu=*/false);
         const std::string got = as::extract_answer(ctx);
         a.ok += (got == k.sum); ++a.n;
+        for (std::size_t j = k.prompt.size(); j < ctx.size(); ++j)   // did the model DELEGATE (emit COMPUTE)?
+            if (ctx[j] == as::COMPUTE) { ++a.deleg; break; }
         tally_digits(a, got, k.sum);
     }
     return a;
@@ -136,4 +141,66 @@ TEST_CASE("arithspike: big-number addition -- delegation vs fuzzy (deterministic
     WARN(report + verdict);
     REQUIRE(std::isfinite(d_best));
     REQUIRE(std::isfinite(f_best));
+}
+
+// PILLAR 3 -- the corpus FILTER. A realistic corpus teaches delegation AND contains plain arithmetic facts
+// (`A + B = <digits>`) as ordinary text. Open question (hence an A/B): do the unmasked facts CORRUPT the
+// model into fuzzy-guessing for `A + B =`, and does MASKING the fact results (the filter pass) fix it?
+//   CLEAN       -- fact results MASKED (the model is never rewarded for producing them -> can only delegate).
+//   CONTAMINATED-- fact results GRADED (the same prefix `A + B =` sometimes rewards digits, sometimes COMPUTE).
+// Eval WITH the node available; watch the DELEGATE rate (did it emit COMPUTE?) and held-out exact-match.
+TEST_CASE("arithspike: corpus FILTER -- masking scalar facts vs fuzzy contamination (A/B)", "[.arithspike]") {
+    const int window = std::min(56, SEQ_LEN - 1);
+
+    auto build_mixed = [&](std::uint64_t seed, int n, bool mask_facts) {
+        as::Dataset ds; ds.doc_starts.push_back(0);
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<int> dd(kMinDigits, kMaxDigits);
+        for (int i = 0; i < n; ++i) {
+            const std::string a = as::gen_int(rng, dd(rng)), b = as::gen_int(rng, dd(rng));
+            const bool deleg = (i % 2 == 0);   // 50% delegation examples, 50% plain arithmetic facts
+            as::append_doc(ds, deleg ? as::make_task(a, b, /*delegate=*/true)
+                                     : as::make_task(a, b, /*delegate=*/false, /*grade_result=*/!mask_facts));
+        }
+        return ds;
+    };
+
+    auto run = [&](bool mask_facts, std::string& log) {
+        const as::Dataset ds = build_mixed(/*seed=*/333ULL, /*n=*/6000, mask_facts);
+        REQUIRE(ds.tokens.size() > static_cast<std::size_t>(window));
+        sub0::build_model();
+        reset_opt_state();
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        char head[80];
+        std::snprintf(head, sizeof head, "\n--- %s facts ---\n", mask_facts ? "MASKED (filter applied)" : "UNMASKED (contaminated)");
+        log += head;
+        double best = 0.0;
+        for (int r = 0; r < 10; ++r) {
+            train_steps(ds, opt, 300, rng, window);
+            std::mt19937_64 eg(9999ULL), es(9999ULL);
+            const Acc g = eval(eg, /*n_tasks=*/120, /*delegate=*/true, /*topk=*/1);    // greedy: picks the mode
+            const Acc s = eval(es, /*n_tasks=*/120, /*delegate=*/true, /*topk=*/12);   // SAMPLED: surfaces fuzzy mass
+            best = std::max(best, g.rate());
+            char line[176];
+            std::snprintf(line, sizeof line,
+                          "  step %5d | greedy exact=%.3f del=%.3f | SAMPLED exact=%.3f del=%.3f\n",
+                          (r + 1) * 300, g.rate(), g.deleg_rate(), s.rate(), s.deleg_rate());
+            log += line;
+        }
+        return best;
+    };
+
+    std::string report = "\n=== arithspike corpus FILTER: does masking scalar facts stop fuzzy contamination? (d" +
+                         std::to_string(D_MODEL) + ") ===\n"
+                         "  (same corpus = 50% delegation + 50% plain facts; only difference is whether the fact result is masked)\n";
+    const double clean_best  = run(true,  report);
+    const double contam_best = run(false, report);
+    char verdict[160];
+    std::snprintf(verdict, sizeof verdict,
+                  "\n  => BEST held-out exact-match:  MASKED %.3f   vs   UNMASKED(contaminated) %.3f\n",
+                  clean_best, contam_best);
+    WARN(report + verdict);
+    REQUIRE(std::isfinite(clean_best));
+    REQUIRE(std::isfinite(contam_best));
 }
