@@ -229,7 +229,23 @@ work.
 The op-resolve is *one discrete step*: the moment an end-op marker is processed, the deterministic node runs
 and its result is injected as the next tokens (each fed through `forward_one`). Crucially this means the model
 **does not need an iterative thinking/reasoning mode** to compute — a single op is answered by one delegation
-step, not a chain-of-thought. **Done:** the interception is now factored (`decode.hpp resolve()`) and fires
+step, not a chain-of-thought.
+
+**Frame it as a PLUGGABLE PREDICTOR — the classical computer is swapped in as the "brain" for the op span.**
+Generation is a sequence of predictors: the neural model predicts the routing (the op region), and for the
+result span a classical computer *is* the predictor. Today the classical computer already does the predicting
+(the result is never sampled from the model), but we still run the model's `forward_one` on each result token
+— purely to update the KV-cache so the model can *attend* to the result later. The refinement: **skip the
+model forward too — the brain is genuinely off for that span.** Whether it can stay off is decided entirely by
+the KV-cache: a neural prediction can only condition on what the KV holds.
+- **Terminal op** (the result IS the final answer): nothing later depends on it → the brain stays fully off,
+  the classical computer writes the answer for **zero model forwards** (a long CAS answer = O(len) forwards
+  saved). A cheap, obviously-correct win.
+- **Intermediate op** (the model must reason *with* the result): it must re-enter the KV — and the efficient
+  re-entry is **one scalar embedding** (the value as a single vector), not N digit forwards. So a big-number
+  op goes from O(result-length) model forwards to **0** (terminal) or **1** (scalar re-entry); the classical
+  compute is ~free. This is the same build as the scalar-embedding result below (and the same backward choice:
+  fixed encoding → stop-grad, learned number→vector encoder → grad to the encoder). **Done:** the interception is now factored (`decode.hpp resolve()`) and fires
 both per generated token *and after prefill*, so a prompt that merely *poses* a computation (ends in an op
 region, `12+34=[op add]`) is resolved in the **forward pass** — no generation loop.
 
