@@ -231,11 +231,24 @@ and its result is injected as the next tokens (each fed through `forward_one`). 
 **does not need an iterative thinking/reasoning mode** to compute — a single op is answered by one delegation
 step, not a chain-of-thought. **Done:** the interception is now factored (`decode.hpp resolve()`) and fires
 both per generated token *and after prefill*, so a prompt that merely *poses* a computation (ends in an op
-region, `12+34=[op add]`) is resolved in the **forward pass** — no generation loop. **Next / backlog:**
-(i) **mid-prompt** ops (not just the final one) need a KV-cache-aware splice; (ii) **training-time** resolution
-— resolve ops live inside `forward()` during training instead of teacher-forcing the baked result; (iii) the
-result is injected as *digit tokens* today — a further step is injecting it as a **computed scalar embedding**
-(one vector, à la the content-derived slot embedding), so a value costs one position and needs no re-reading.
+region, `12+34=[op add]`) is resolved in the **forward pass** — no generation loop.
+
+**Training-time resolution — the forward/backward analysis (decided: keep bake-train/live-infer).** A node is
+*non-differentiable* (classical code), so backward can only **stop-gradient** at its output: the result is a
+constant for autodiff. There is nothing to learn about an exact computation — only *routing*, which the loss
+on the op-header tokens already fully supervises (through-node gradient is both unnecessary and ill-defined:
+the task fixes the operands, so there's no "better operand" for a gradient to find). And for teacher-forced
+training, "bake the result offline" and "resolve live in `forward()` + stop-gradient" produce **identical
+gradients** (given the operands the result is the same constant either way) — so baking is strictly better:
+same signal, computed once instead of every epoch (matters for an expensive CAS node), no engine change. The
+current **bake-train / live-infer** split *is* the right design (chainspike already does it: states baked in
+training, node-injected at eval, matched 1.000). Live training-time resolution only earns its keep for
+**non-teacher-forced operands** (the model generating operands itself) — a **free-running / RL** decision
+(reward on the routing, no grad through the node), to take *only if exposure bias proves real*. **Backlog:**
+(i) **mid-prompt** ops need a KV-cache-aware splice; (ii) **scalar-embedding** result — inject the value as
+*one vector* (à la the content-derived slot embedding) instead of digit tokens: this is where a *backward*
+choice is genuinely live — a **fixed** numeric encoding → stop-gradient, a **learned** number→vector encoder →
+gradient flows to the encoder; (iii) free-running/RL, only on demonstrated exposure bias.
 
 ### B. Fold combine/uncombine into the op registry
 
