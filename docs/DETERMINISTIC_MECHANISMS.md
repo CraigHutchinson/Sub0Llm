@@ -219,6 +219,55 @@ filter pass.
 
 ---
 
+## Architecture directions (open considerations)
+
+Design directions raised while building this out — recorded so they inform (and don't get lost from) later
+work.
+
+### A. Resolution is a discrete FORWARD-STEP event, not an iterative reasoning loop
+
+The op-resolve is *one discrete step*: the moment an end-op marker is processed, the deterministic node runs
+and its result is injected as the next tokens (each fed through `forward_one`). Crucially this means the model
+**does not need an iterative thinking/reasoning mode** to compute — a single op is answered by one delegation
+step, not a chain-of-thought. **Done:** the interception is now factored (`decode.hpp resolve()`) and fires
+both per generated token *and after prefill*, so a prompt that merely *poses* a computation (ends in an op
+region, `12+34=[op add]`) is resolved in the **forward pass** — no generation loop. **Next / backlog:**
+(i) **mid-prompt** ops (not just the final one) need a KV-cache-aware splice; (ii) **training-time** resolution
+— resolve ops live inside `forward()` during training instead of teacher-forcing the baked result; (iii) the
+result is injected as *digit tokens* today — a further step is injecting it as a **computed scalar embedding**
+(one vector, à la the content-derived slot embedding), so a value costs one position and needs no re-reading.
+
+### B. Fold combine/uncombine into the op registry
+
+`expand`/`combine` are already interceptor ops; they could become registry entries (`[op uncombine <tok>]`)
+so there is **one** marker family and dispatch. **Trade-off (why it's a consideration, not a given):** they
+are *token-group* operations — an expression *over/producing tokens* — whereas compute nodes are *value*
+operations (operands → a value). The registry's `NodeFn` (strings→string) doesn't fit token-group I/O cleanly.
+Unifying wants a second node signature (tokens→tokens) or an adapter. **Backlog** — low urgency; the win is
+homogenisation, not capability.
+
+### C. Scratch tokens: named regions vs reserved ids
+
+Scratch slots are reserved ids today (`TOK_RESERVED_4..9`) — which is exactly why the pool **caps at K=6**,
+and why a binding is a *special* id that can't be trained toward, stored in a corpus, or survive a
+re-tokenisation (it's short-term, context-specific memory). The alternative the region-frame work suggests:
+express a slot as a **named region** — `<|scratch> a` — with an ordinary in-vocab name, exactly like an op
+(`[op add]`). Then:
+
+- **Unlimited slots, zero reserved-id cost** — names never run out (the very ceiling the scratch content work
+  hit). nodespike already evidences this: WORD names route as well as dedicated tokens, no penalty.
+- **Survives encode/decode** as ordinary text, and the binding (name → fragments/value) can be **persisted to
+  an external store** → the substrate for *long-term* memory, not just in-context.
+- vs a "vocab+1 offset" per slot (the user's alternative): same *dispatch* effect, but it re-introduces a
+  bounded, special-id pool that doesn't persist as text — so named regions strictly dominate for *unbounded +
+  persistable* slots; the offset only wins if a slot must be a single token for KV/length reasons.
+
+Recommendation: migrate scratch slots to named regions (unifying with the op frame), keeping a single-token
+form only where a binding must occupy one position. This uncaps the pool and opens the long-term-memory path.
+**Backlog** (a real refactor of the binding table + curricula).
+
+---
+
 ## Open questions / risks
 
 - **Routing accuracy is the new bottleneck.** The model must reliably decide *when* to invoke a node and
@@ -257,9 +306,12 @@ filter pass.
    O(k) running-accumulator/scratch-bound intermediates or a wider context). Delegation composes.
    *Remaining:* **numeric BIND** — bind literals to scratch slots (13 digits → 1 token unless asked) as the
    O(k) composition substrate.
-5. **Production wiring.** The node registry substrate (`nodes.hpp`) is in; the remaining work is the real
-   region frame (reuse `TOK_TURN_START/END`), the decode-interceptor dispatch onto the registry, and folding
-   a compute-delegation curriculum into `--scratch-mix` alongside resolution/associative/content.
+5. ~~Production op frame LIVE.~~ **DONE** — `nodes.hpp` (registry) + `node_frame.hpp` dispatch the registry
+   through `kv_decode_generate`'s compute seam on the EXISTING `TOK_TURN_START/END` markers (zero new ids; an
+   OP region is `TOK_TURN_START op <name> <operands> TOK_TURN_END`, a chat tool-call). End-to-end: a d128 model
+   emits `[op add]` for `A + B =` → the node injects the exact sum → held-out **1.000**. Non-op regions inert.
+   *Remaining:* fold a compute-delegation **curriculum** into `--scratch-mix`; a decode-to-text step for a full
+   Unigram deployment (the byte parse suffices for this project's byte-heavy tokenizer); real library nodes.
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
 whether a *small* model wins with near-zero training. That is the homogenised bet: **teach the model to use
