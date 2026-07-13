@@ -11,6 +11,7 @@
 
 #include <random>
 #include <span>
+#include <string>
 #include <vector>
 
 using sub0::SlotEncoding;
@@ -78,6 +79,76 @@ TEST_CASE("scratch encoder: CharEncoder forward + backward match finite differen
         REQUIRE(Tg[static_cast<std::size_t>(f) * C + k] ==
                 Catch::Approx((loss(tp, W) - loss(tm, W)) / (2 * eps)).margin(2e-2));
     }
+}
+
+// --- 1c. Scalar: fixed scientific encoding of the value the fragments spell (the brain-swap re-entry) ---
+namespace {
+std::vector<int> frags_of(const std::string& s) {   // digit/sign/point/exp chars -> byte token ids
+    std::vector<int> f; f.reserve(s.size());
+    for (char c : s) f.push_back(static_cast<unsigned char>(c));
+    return f;
+}
+}  // namespace
+
+TEST_CASE("scratch encoder: Scalar parses value into (sign, exponent, mantissa)", "[scratch][embed]") {
+    using sub0::SCALAR_MANT_DIGITS;
+
+    {   // plain integer 12345 = 1.2345e4
+        auto p = sub0::parse_scalar(std::span<const int>(frags_of("12345")));
+        REQUIRE(p.ok); REQUIRE(p.sign == 1); REQUIRE(p.exp == 4);
+        const int want[SCALAR_MANT_DIGITS] = {1, 2, 3, 4};
+        for (int d = 0; d < SCALAR_MANT_DIGITS; ++d) REQUIRE(p.mant[d] == want[d]);
+    }
+    {   // negative scientific -6.02e23
+        const auto f = frags_of("-6.02e23");
+        auto p = sub0::parse_scalar(std::span<const int>(f));
+        REQUIRE(p.ok); REQUIRE(p.sign == -1); REQUIRE(p.exp == 23);
+        const int want[SCALAR_MANT_DIGITS] = {6, 0, 2, 0};
+        for (int d = 0; d < SCALAR_MANT_DIGITS; ++d) REQUIRE(p.mant[d] == want[d]);
+    }
+    {   // 2^100 expanded (31 digits) -- a power maps into the SAME bounded encoding, E=30
+        const auto f = frags_of("1267650600228229401496703205376");
+        auto p = sub0::parse_scalar(std::span<const int>(f));
+        REQUIRE(p.ok); REQUIRE(p.sign == 1); REQUIRE(p.exp == 30);
+        const int want[SCALAR_MANT_DIGITS] = {1, 2, 6, 7};
+        for (int d = 0; d < SCALAR_MANT_DIGITS; ++d) REQUIRE(p.mant[d] == want[d]);
+    }
+    {   // small fraction 0.00456 = 4.56e-3 (leading zeros handled)
+        const auto f = frags_of("0.00456");
+        auto p = sub0::parse_scalar(std::span<const int>(f));
+        REQUIRE(p.ok); REQUIRE(p.sign == 1); REQUIRE(p.exp == -3);
+        const int want[SCALAR_MANT_DIGITS] = {4, 5, 6, 0};
+        for (int d = 0; d < SCALAR_MANT_DIGITS; ++d) REQUIRE(p.mant[d] == want[d]);
+    }
+    {   // exact zero -> sign 0
+        const auto f = frags_of("0");
+        auto p = sub0::parse_scalar(std::span<const int>(f));
+        REQUIRE(p.ok); REQUIRE(p.sign == 0); REQUIRE(p.exp == 0);
+    }
+    {   // an un-evaluated symbolic form is NOT a plain literal -> ok=false (encoder emits a zero row)
+        const auto f = frags_of("2^100");
+        auto p = sub0::parse_scalar(std::span<const int>(f));
+        REQUIRE_FALSE(p.ok);
+    }
+}
+
+TEST_CASE("scratch encoder: Scalar writes the bounded layout and has no gradient", "[scratch][embed]") {
+    using sub0::SCALAR_MANT_DIGITS; using sub0::SCALAR_EXP_SCALE; using sub0::SCALAR_AMP;
+    constexpr int C = 8;
+    const auto f = frags_of("-6.02e23");
+    float out[C];
+    sub0::encode_slot(nullptr, C, std::span<const int>(f), SlotEncoding::Scalar, out);   // tok_emb unused
+    REQUIRE(out[0] == -1.f * SCALAR_AMP);                       // sign
+    REQUIRE(out[1] == (23.f / SCALAR_EXP_SCALE) * SCALAR_AMP);  // exponent
+    const int mant[SCALAR_MANT_DIGITS] = {6, 0, 2, 0};
+    for (int d = 0; d < SCALAR_MANT_DIGITS; ++d) REQUIRE(out[2 + d] == (mant[d] / 9.f) * SCALAR_AMP);
+    for (int j = 2 + SCALAR_MANT_DIGITS; j < C; ++j) REQUIRE(out[j] == 0.f);   // rest zero (bounded, sparse)
+
+    // Backward is a no-op: a fixed encoding of discrete digit tokens carries no gradient.
+    std::vector<float> tok_grad(4 * C, 1.f);   // sentinel; must stay untouched
+    const float dout[C] = {1, 1, 1, 1, 1, 1, 1, 1};
+    sub0::encode_slot_bwd(dout, C, std::span<const int>(f), SlotEncoding::Scalar, tok_grad.data());
+    for (float g : tok_grad) REQUIRE(g == 1.f);
 }
 
 // --- 2. The engine actually feeds the content-derived embedding into forward ----------------------
