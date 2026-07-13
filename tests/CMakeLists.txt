@@ -18,6 +18,7 @@ add_executable(sub0_tests
   scratchspike_engine_tests.cpp
   scratch_embed_tests.cpp
   arithspike_engine_tests.cpp
+  nodespike_engine_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.
