@@ -86,6 +86,11 @@ inline void gpu_decode_shutdown() {
 // casing.hpp) -- the model learns to INVOKE, the tokenizer layer supplies the content:
 //   expand(token)  -> the token's constituent fragments        (fulfils an emitted TOK_UNCOMBINE)
 //   combine(frags) -> those fragments' minimal vocab token(s)   (fulfils a TOK_COMBINE region)
+// The SAME seam generalises to any DETERMINISTIC COMPUTE NODE (see docs/DETERMINISTIC_MECHANISMS.md): when
+// the model emits `compute_marker`, the loop calls `compute(ctx)` (given the context up to and including the
+// marker -- the node parses its own operands from it) and injects the returned tokens. This is how the model
+// learns to DELEGATE exact scalar computation (arithmetic, sort, ...) instead of approximating it -- routing
+// is learned, the answer is exact. `compute` is independent of expand/combine (a compute-only caller works).
 // Injected tokens ARE fed through the model (forward_one, so it attends to them) but never sampled.
 // Interception runs on the CPU KV-cache path (the device-decode interceptor is a pending follow-on),
 // so a caller that supplies the callbacks gets CPU decode regardless of `use_gpu`. With no callbacks
@@ -94,11 +99,14 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
                                int eos_id, bool use_gpu,
                                const std::function<void(const float*, int)>& on_token = {},
                                const std::function<std::vector<int>(int)>& expand = {},
-                               const std::function<std::vector<int>(const std::vector<int>&)>& combine = {}) {
+                               const std::function<std::vector<int>(const std::vector<int>&)>& combine = {},
+                               const std::function<std::vector<int>(const std::vector<int>&)>& compute = {},
+                               int compute_marker = -1) {
     if (n <= 0) return;
     const bool intercept = static_cast<bool>(expand) && static_cast<bool>(combine);
+    const bool do_compute = static_cast<bool>(compute) && compute_marker >= 0;
 #if defined(SUB0_BUILD_CUDA)
-    if (use_gpu && !intercept) {   // interception is CPU-only for now -> fall through to the CPU path
+    if (use_gpu && !intercept && !do_compute) {   // interception is CPU-only for now -> fall through to CPU
         // A device fault here (illegal memory access or similar) leaves the CUDA context permanently
         // corrupted for the rest of the process (CUDA errors are sticky) -- every subsequent
         // forward_one call would return stale/garbage logits, which sample_token would then happily
@@ -149,6 +157,9 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         if (next == eos_id) break;             // learned stop signal -- never push the marker token
         if (on_token) on_token(logits, next);
         feed(next);
+        if (do_compute && next == compute_marker) {   // deterministic node: inject its exact result
+            for (int r : compute(ctx)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(r); }
+        }
         if (!intercept) continue;
         // The model emitted a marker: fulfil the requested op by INJECTING its content (fed through
         // the model so it attends to it, but never sampled). Guarded so injections never run past the
