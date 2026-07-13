@@ -58,9 +58,12 @@ infinite margin on a deterministic task. This is the template for everything bel
 | 1. PROVIDE (delegate vs approximate) | `arithspike` | delegation **1.000** vs fuzzy **0.000** held-out |
 | 1b. Region frame — WORD op-names vs dedicated tokens | `nodespike` (4 ops) | **1.000 == 1.000** — words route as well as tokens, for free |
 | 3. FILTER — mask scalar facts vs contamination | `arithspike` filter A/B | masked clean (sampled **1.000**) vs contaminated (sampled **~0.90**, ~10% fuzzy leak) |
+| 4. COMPOSE — dynamic-turn chained reduction | `chainspike` (var. length) | trained k=2..6 **1.000**; held-out length k=7 **1.000** (k=8 only fails on context overflow) |
 
 The region-frame result validates the natural-language-marker design (§1); the filter result is nuanced
-(§3). Pillar 2 (numeric BIND) and chaining are the remaining unbuilt pieces.
+(§3); chaining shows delegation **composes over a dynamic number of turns and length-generalises** (§4/staged
+plan). The **production node registry** (`include/sub0/nodes.hpp`) is now a first-class, tested substrate.
+Pillar 2 (numeric BIND) and the end-to-end production wiring are the remaining pieces.
 
 ---
 
@@ -248,10 +251,15 @@ filter pass.
 3. ~~Filter pass (spike A/B).~~ **TESTED** — masking scalar facts yields a clean, sampling-robust delegation
    distribution; contamination leaks ~10% under sampling (greedy self-corrects). *Still to build:* the
    classical scanner (regex/grammar) + the small model for ambiguous spans, on the real corpus path.
-4. **Numeric BIND + chaining.** Bind literals to scratch slots (algebraic compression: 13 digits → 1 token
-   unless asked), and test **chained** delegation (compute A, feed to compare/sort) via scratch-bound
-   intermediates — the composition substrate.
-5. **Fold into `--scratch-mix`** alongside the resolution/associative/content capabilities already there.
+4. ~~Chaining (dynamic turns).~~ **DONE (spike)** — chainspike: reduce a variable-length sum via a dynamic
+   number of node calls, the model deciding termination locally. Trained k=2..6 = 1.000; held-out length
+   k=7 = 1.000 (length-generalises; k=8 fails *only* on context overflow — the O(k²) re-emit, fixable with an
+   O(k) running-accumulator/scratch-bound intermediates or a wider context). Delegation composes.
+   *Remaining:* **numeric BIND** — bind literals to scratch slots (13 digits → 1 token unless asked) as the
+   O(k) composition substrate.
+5. **Production wiring.** The node registry substrate (`nodes.hpp`) is in; the remaining work is the real
+   region frame (reuse `TOK_TURN_START/END`), the decode-interceptor dispatch onto the registry, and folding
+   a compute-delegation curriculum into `--scratch-mix` alongside resolution/associative/content.
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
 whether a *small* model wins with near-zero training. That is the homogenised bet: **teach the model to use
