@@ -642,14 +642,37 @@ inline Dataset build_dataset_contains_via(const tok::Tokenizer& t, const OovSpli
 // is 3:1 RESOLUTION-heavy on purpose: associative is EASY (saturates fast) and a 50/50 mix let its
 // gradient starve the HARDER resolution task (resolution held-out dropped 0.31 solo -> 0.13); weighting
 // toward resolution protects the core capability while still teaching the easy associative one.
-inline Dataset build_dataset_scratch(const tok::Tokenizer& t, const OovSplit& split, int K, const DatasetOptions& opt) {
+// `contains_k >= 2` adds the third VALIDATED capability -- CONTENT reasoning over slots (which slot's OOV
+// contains a queried char) via LOCAL-GROUNDED CoT (resolve each slot, restate the query beside it, verdict,
+// answer). That trace is much LONGER (~5 + 11*contains_k) than resolution/associative, so the CALLER sizes
+// contains_k to the model's SEQ_LEN (0 = omit -- e.g. a context too short to hold the trace).
+//
+// Mix = 45% content / 45% resolution / 10% associative. Difficulty ordering (measured): content-localization
+// and resolution are BOTH HARD and COMPETE (notably on the shared UNCOMBINE pattern -- content continues to
+// a verdict+slot, resolution to a char), while associative is EASY and saturates at any share. A minority
+// share STARVES a hard task: 20% content -> content ~random (res/assoc fine); 30% resolution -> resolution
+// ~random (content/assoc fine). So the two hard tasks split the bulk evenly and associative gets a sliver.
+// (Both hard tasks still want more absolute steps than a short run gives; a real production run -- 10x+ the
+// steps -- has ample budget for both.) contains_k=0 reproduces the original 75/25 resolution+associative
+// stream exactly.
+inline Dataset build_dataset_scratch(const tok::Tokenizer& t, const OovSplit& split, int K,
+                                     const DatasetOptions& opt, int contains_k = 0) {
     std::vector<Task> docs;
     std::mt19937_64 rng(opt.seed);
-    std::uniform_int_distribution<int> pick_type(0, 3);   // 0..2 -> resolution (75%), 3 -> associative (25%)
+    std::uniform_int_distribution<int> pick4(0, 3);       // 0..2 resolution (75%), 3 associative (25%)
+    std::uniform_int_distribution<int> pick20(0, 19);     // 0..8 content / 9..17 resolve / 18..19 associative
     for (int qi = 0; qi < static_cast<int>(split.drilled.size()); ++qi)
-        for (int r = 0; r < opt.tasks_per_oov; ++r)
-            docs.push_back(pick_type(rng) < 3 ? pick_multi_task(t, split.drilled, qi, K, rng)
+        for (int r = 0; r < opt.tasks_per_oov; ++r) {
+            if (contains_k >= 2) {
+                const int roll = pick20(rng);
+                docs.push_back(roll < 9  ? pick_content_contains_cot_local_task(t, split.drilled, qi, contains_k, rng)
+                             : roll < 18 ? pick_multi_task(t, split.drilled, qi, K, rng)
+                                         : pick_select_task(t, split.drilled, qi, K, rng));
+            } else {
+                docs.push_back(pick4(rng) < 3 ? pick_multi_task(t, split.drilled, qi, K, rng)
                                               : pick_select_task(t, split.drilled, qi, K, rng));
+            }
+        }
     std::shuffle(docs.begin(), docs.end(), rng);
     Dataset ds; ds.doc_starts.push_back(0);
     for (const Task& d : docs) append_doc(ds, d);

@@ -845,11 +845,13 @@ TEST_CASE("scratchspike: CONTAINS reasoning -- maximal-K sweep (local grounding,
     REQUIRE(ran_any);
 }
 
-// The MERGE validation: train on the exact production curriculum (build_dataset_scratch -- the 50/50 mix
-// of resolution + associative reasoning that --scratch-mix blends) and confirm BOTH capabilities are
-// learned together (no destructive interference between the two working features at this scale).
-TEST_CASE("scratchspike: COMBINED production curriculum -- resolution + associative reasoning together", "[.scratchspike]") {
+// The MERGE validation: train on the exact production curriculum (build_dataset_scratch with contains_k>0 --
+// the resolution + associative + CONTENT-reasoning mix that --scratch-mix now blends) and confirm ALL THREE
+// held-out capabilities are learned together, with no destructive interference. Uses contains_k=3 so the
+// local-CoT content trace (~38 tokens) fits the default window.
+TEST_CASE("scratchspike: COMBINED production curriculum -- resolution + associative + content together", "[.scratchspike]") {
     constexpr int kK = 3;
+    constexpr int kContainsK = 3;
     Tokenizer tk;
     {
         std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
@@ -861,23 +863,29 @@ TEST_CASE("scratchspike: COMBINED production curriculum -- resolution + associat
 
     const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
     ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
-    const ss::Dataset ds = ss::build_dataset_scratch(tk, split, kK, dopt);
+    const ss::Dataset ds = ss::build_dataset_scratch(tk, split, kK, dopt, kContainsK);
 
     sub0::build_model();
     reset_opt_state();
-    std::string report = "\n=== scratchspike COMBINED production curriculum (resolution + associative, K=3) ===\n"
-                         "  (one model, the 50/50 mix --scratch-mix trains; both held-out capabilities must hold)\n";
+    std::string report = "\n=== scratchspike COMBINED production curriculum (resolution + associative + content, K=3) ===\n"
+                         "  (one model, the mix --scratch-mix trains; ALL THREE held-out capabilities must hold together)\n";
     sub0::AdamW opt(kLr);
     std::mt19937 rng(1);
+    // A production-realistic budget: content and resolution are BOTH hard and compete, so a short run can't
+    // max both (a 3000-step run starved whichever got the minority share). Real training is 10x+ longer.
+    constexpr int kRounds = 12, kStepsPer = 600;   // 7200 steps
     double last_res = 0.0;
-    for (int r = 0; r < kEvalRounds; ++r) {
-        train_steps(ds, opt, kStepsPerEval, rng);
+    for (int r = 0; r < kRounds; ++r) {
+        train_steps(ds, opt, kStepsPer, rng);
         const Acc res = eval_multi(tk, ops, split.held_out, kK, /*seed=*/7);
         const Acc rec = eval_select(tk, ops, split.held_out, kK, /*seed=*/11);
+        const ReasonAcc con = eval_contains_reason(tk, ops, split.held_out, kContainsK, /*seed=*/13,
+                                                   ss::pick_content_contains_cot_local_task);
         last_res = res.rate();
-        char line[160];
-        std::snprintf(line, sizeof line, "  step %5d | HELD-OUT resolution=%.3f  associative=%.3f\n",
-                      (r + 1) * kStepsPerEval, res.rate(), rec.rate());
+        char line[200];
+        std::snprintf(line, sizeof line,
+                      "  step %5d | HELD-OUT resolution=%.3f  associative=%.3f  content[one %.2f/all %.3f]\n",
+                      (r + 1) * kStepsPer, res.rate(), rec.rate(), con.one.rate(), con.overall.rate());
         report += line;
     }
     WARN(report);

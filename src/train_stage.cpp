@@ -1359,18 +1359,25 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::scratchspike::DatasetOptions dopt;
         dopt.tasks_per_oov = 12;
         dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C2A7C40ULL;   // distinct stream
-        // The combined curriculum: the two WORKING model-side capabilities -- multi-slot RESOLUTION +
-        // associative REASON-over-slots (both generalize; content-select #4 + model-driven define #1 are
-        // excluded -- not learnable model-side at this scale, see scratchspike.hpp/build_dataset_scratch).
-        scratch_ds = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt);
+        // The combined curriculum: the THREE WORKING model-side capabilities -- multi-slot RESOLUTION +
+        // associative REASON-over-slots + CONTENT reasoning (which slot's OOV contains a char, via
+        // local-grounded CoT: resolve, restate the query beside each slot, verdict, answer -- validated to
+        // generalize to held-out OOVs, project memory scratch-tokens-context-translation-layer). Model-driven
+        // define (#1) stays excluded (copy-bottlenecked at this scale). The content trace is LONG (~5+11*K),
+        // so contains_k is sized to SEQ_LEN; a too-short context omits it. Capped at 4: the maximal-K sweep
+        // found localization holds above random up to the pool's K=6 but the margin degrades/gets noisy past
+        // K~4 (K=3 robustly ~0.9-1.0), so 4 is the reliable production ceiling.
+        const int contains_k = std::min({kScratchK, 4, std::max(0, (SEQ_LEN - 8) / 11)});
+        scratch_ds = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt,
+                                                               contains_k >= 2 ? contains_k : 0);
         sources.push_back(sub0::BlendSource{
             sub0::TokView::over_int32(scratch_ds.tokens.data(), scratch_ds.tokens.size()),
             std::span<const std::uint64_t>(scratch_ds.doc_starts),
             std::span<const std::uint8_t>(scratch_ds.mask),
             static_cast<double>(scratch_mix) });
-        sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, {} OOVs, {} traces, {} tokens)",
-                        static_cast<double>(scratch_mix) * 100.0, kScratchK, split.drilled.size(),
-                        scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
+        sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, content-K={}, {} OOVs, {} traces, {} tokens)",
+                        static_cast<double>(scratch_mix) * 100.0, kScratchK, contains_k >= 2 ? contains_k : 0,
+                        split.drilled.size(), scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
     }
     // The base corpus gets whatever fraction the curricula don't claim.
     sources[kBaseSource].weight =
