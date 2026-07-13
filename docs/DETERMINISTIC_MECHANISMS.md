@@ -51,6 +51,17 @@ Delegation generalises **perfectly** to never-seen numbers because it only ever 
 internal arithmetic never generalises at all. **1.000 vs 0.000** — mechanism beats approximation by an
 infinite margin on a deterministic task. This is the template for everything below.
 
+**All three pillars are now proven with data** (spike tests, d128):
+
+| Pillar | Test | Result |
+|---|---|---|
+| 1. PROVIDE (delegate vs approximate) | `arithspike` | delegation **1.000** vs fuzzy **0.000** held-out |
+| 1b. Region frame — WORD op-names vs dedicated tokens | `nodespike` (4 ops) | **1.000 == 1.000** — words route as well as tokens, for free |
+| 3. FILTER — mask scalar facts vs contamination | `arithspike` filter A/B | masked clean (sampled **1.000**) vs contaminated (sampled **~0.90**, ~10% fuzzy leak) |
+
+The region-frame result validates the natural-language-marker design (§1); the filter result is nuanced
+(§3). Pillar 2 (numeric BIND) and chaining are the remaining unbuilt pieces.
+
 ---
 
 ## The three pillars
@@ -147,6 +158,23 @@ incentive to be fuzzy.** So a corpus pre-pass must find scalar-solvable spans an
 The principle mirrors the spike exactly: *the only path to the answer must be the mechanism.* We proved this
 matters — masking the injected spelling was what made char-reasoning generalise instead of memorise.
 
+**What the filter A/B actually showed (nuanced — measure, don't assume).** A corpus of 50% delegation + 50%
+plain arithmetic facts, masked vs unmasked, evaluated with the node available:
+
+- **Greedy decoding self-corrects.** Even contaminated (facts graded), greedy delegates 100% and scores
+  1.000 — because `COMPUTE` is the **modal** next-token after `=` (one frequent, learnable token beats the
+  dispersed, *unpredictable* fuzzy digits). Contamination is *invisible* to greedy.
+- **Sampling exposes the residue.** The contaminated model still carries **~10% fuzzy probability mass**
+  (only ~10%, not 50% — a deterministic target the model can't compute earns high loss, so its learned
+  probability stays low), which leaks under sampling → sampled score ~0.90.
+- **Masking removes it entirely** → a clean distribution, 1.000 even sampled.
+
+So the filter's job is precise: it isn't needed for greedy *correctness* (the mechanism self-selects, since
+delegating is the low-loss option), but it is needed for a **clean, sampling/temperature-robust distribution**
+— and it becomes *essential* for any scalar pattern the corpus covers with facts but **no** delegation
+alternative (there, fuzzy is the model's only rewarded path). Mask, or ensure delegation coverage; never
+leave an unmasked fuzzy-only scalar span.
+
 ---
 
 ## Why this is the "root of effective training" question
@@ -209,18 +237,17 @@ filter pass.
 
 ## Staged plan (proposal)
 
-0. ~~Prove the thesis.~~ **DONE** — the arithspike (`compute` node + `arithspike.hpp`): big-number addition
-   delegation 1.000 vs fuzzy 0.000 on held-out. The seam and the masked-CE training already carry it.
-1. **The region frame.** Adopt one `<|op|> … <|end|>` delimiter pair (reuse/mirror `TOK_TURN_START/END`;
-   spend the reserved-headroom tool-call slot at most once) and a `ComputeNode` registry keyed on the op
-   *word*. Re-express expand/combine/compute in the frame so new nodes cost zero tokenizer budget. (Rename +
-   indirection; low-risk; makes everything below additive and un-caps the reserved-id ceiling.)
+0. ~~Prove the thesis.~~ **DONE** — arithspike: delegation 1.000 vs fuzzy 0.000 held-out.
+1. ~~Region frame + registry (spike).~~ **DONE** — nodespike: one `{ … }` frame + a word-keyed `ComputeNode`
+   registry over 4 ops; WORD op-names route as well as dedicated tokens (1.000 == 1.000), so new nodes cost
+   zero tokenizer budget. *Production form still to land:* adopt the real `<|op|> … <|end|>` delimiter
+   (reuse/mirror `TOK_TURN_START/END`; one reserved slot at most) and move expand/combine/compute onto it.
 2. **Exact + symbolic nodes.** Extend the add node to exact decimals/rationals (Boost.Multiprecision), then
    add an **exprtk** numeric-expression node and a **SymEngine** symbolic node (solve/simplify/diff) — the
    "more complex maths". Each pure + sandboxed.
-3. **The filter pass.** A classical scanner (regex/grammar) that masks arithmetic results and precise numerics
-   in the corpus; measure whether it *stops* the model memorising answers. Add the small scanning model only
-   where the classical pass is ambiguous.
+3. ~~Filter pass (spike A/B).~~ **TESTED** — masking scalar facts yields a clean, sampling-robust delegation
+   distribution; contamination leaks ~10% under sampling (greedy self-corrects). *Still to build:* the
+   classical scanner (regex/grammar) + the small model for ambiguous spans, on the real corpus path.
 4. **Numeric BIND + chaining.** Bind literals to scratch slots (algebraic compression: 13 digits → 1 token
    unless asked), and test **chained** delegation (compute A, feed to compare/sort) via scratch-bound
    intermediates — the composition substrate.
