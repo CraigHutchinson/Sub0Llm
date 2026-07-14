@@ -19,6 +19,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sub0::nodes {
@@ -83,6 +84,81 @@ inline std::string div(const std::string& a, const std::string& b) {   // a/b, E
     return norm(q);
 }
 
+// --- General expression evaluator (the `math` node) ----------------------------------------------------
+// Parsing an arithmetic expression -- operator precedence, parentheses, associativity -- is itself a
+// DETERMINISTIC job, so it belongs in the node, not in the model. `[op math 6 + 8 * 10 - 5]` resolves in ONE
+// frame (= 81); the model just copies the expression it is reasoning about, and the node handles the rest.
+// The per-op nodes (add/sub/mul/div) are this node's EXACT big-number primitives -- nothing here is `double`.
+//
+// Lex an expression string into ordered tokens: digit-runs (numbers), lowercase letter-runs (the op-name),
+// and each operator / paren as its own single-char token. Whitespace and other bytes delimit. Operators are
+// single ANSI bytes, so this is a trivial one-pass lexer.
+inline std::vector<std::string> lex_str(std::string_view s) {
+    std::vector<std::string> toks; std::string cur; char cls = 0;   // 'w' word, 'n' number
+    auto flush = [&] { if (!cur.empty()) toks.push_back(cur); cur.clear(); cls = 0; };
+    for (char c : s) {
+        if (c >= 'a' && c <= 'z')      { if (cls == 'n') flush(); cur.push_back(c); cls = 'w'; }
+        else if (c >= '0' && c <= '9') { if (cls == 'w') flush(); cur.push_back(c); cls = 'n'; }
+        else if (c=='+'||c=='-'||c=='*'||c=='/'||c=='^'||c=='('||c==')') { flush(); toks.emplace_back(1, c); }
+        else flush();
+    }
+    flush();
+    return toks;
+}
+
+namespace detail {
+// Exact signed big-integer for the evaluator (the primitives above are unsigned; expressions need signs
+// because an intermediate like `5 - 8` is negative).
+struct Big { bool neg = false; std::string mag = "0"; };
+inline Big bnorm(Big x) { x.mag = norm(x.mag); if (x.mag == "0") x.neg = false; return x; }
+inline Big bneg(Big x)  { x.neg = !x.neg; return bnorm(x); }
+inline Big badd(Big a, Big b) {
+    if (a.neg == b.neg) return bnorm({a.neg, add(a.mag, b.mag)});
+    const int c = cmp(a.mag, b.mag);
+    if (c == 0) return {false, "0"};
+    return c > 0 ? bnorm({a.neg, sub(a.mag, b.mag)}) : bnorm({b.neg, sub(b.mag, a.mag)});
+}
+inline Big bmul(Big a, Big b) { return bnorm({a.neg != b.neg, mul(a.mag, b.mag)}); }
+
+// Recursive-descent parser over a token list. Precedence: ^ (right-assoc) > * / > + -, with parens and unary
+// +/-. `err` is set on any malformed input, unknown token, non-exact division, or a runaway power -> the
+// node then declines (returns "") rather than emitting a wrong answer.
+struct Ev {
+    const std::vector<std::string>& t; std::size_t i = 0; bool err = false;
+    explicit Ev(const std::vector<std::string>& toks) : t(toks) {}
+    static bool isnum(const std::string& s) { if (s.empty()) return false; for (char c : s) if (c < '0' || c > '9') return false; return true; }
+    Big pnum() { if (i >= t.size() || !isnum(t[i])) { err = true; return {}; } return bnorm({false, t[i++]}); }
+    Big base() {
+        if (err || i >= t.size()) { err = true; return {}; }
+        if (t[i] == "(") { ++i; Big v = expr(); if (err) return {}; if (i >= t.size() || t[i] != ")") { err = true; return {}; } ++i; return v; }
+        if (t[i] == "-") { ++i; return bneg(base()); }
+        if (t[i] == "+") { ++i; return base(); }
+        return pnum();
+    }
+    Big bdiv(Big a, Big b) { std::string q = div(a.mag, b.mag); if (q.empty()) { err = true; return {}; } return bnorm({a.neg != b.neg, q}); }
+    Big bpow(Big a, Big b) {
+        if (b.neg || b.mag.size() > 4) { err = true; return {}; }      // non-negative, bounded integer exponent
+        int e = 0; for (char c : b.mag) e = e * 10 + (c - '0');
+        if (e > 1000) { err = true; return {}; }                       // guard a runaway expansion
+        Big r{false, "1"}; for (int k = 0; k < e && !err; ++k) r = bmul(r, a); return r;
+    }
+    Big factor() { Big v = base(); if (!err && i < t.size() && t[i] == "^") { ++i; Big r = factor(); if (err) return {}; return bpow(v, r); } return v; }
+    Big term()   { Big v = factor(); while (!err && i < t.size() && (t[i] == "*" || t[i] == "/")) { const std::string op = t[i++]; Big r = factor(); if (err) break; v = (op == "*") ? bmul(v, r) : bdiv(v, r); } return v; }
+    Big expr()   { Big v = term();   while (!err && i < t.size() && (t[i] == "+" || t[i] == "-")) { const std::string op = t[i++]; Big r = term();   if (err) break; v = (op == "+") ? badd(v, r) : badd(v, bneg(r)); } return v; }
+};
+}  // namespace detail
+
+// Evaluate a tokenized expression (numbers + single-char operators + parens) to an EXACT decimal string.
+// Every token must be consumed; any error -> "" (the node declines, never a wrong answer).
+inline std::string eval_expr(const std::vector<std::string>& toks) {
+    if (toks.empty()) return {};
+    detail::Ev ev(toks);
+    const detail::Big v = ev.expr();
+    if (ev.err || ev.i != toks.size()) return {};
+    return (v.neg ? "-" : "") + v.mag;
+}
+inline std::string eval(std::string_view s) { return eval_expr(lex_str(s)); }   // ergonomic: lex then evaluate
+
 // --- The registry --------------------------------------------------------------------------------------
 // A node maps operand strings -> an exact result string. N-ary (a vector), so it generalises past binary ops
 // to expression-eval / CAS nodes later (same registry, same dispatch). Empty result = malformed operands.
@@ -113,6 +189,9 @@ inline Registry builtin() {
     r.register_node("div", [](const std::vector<std::string>& o) { return o.size() >= 2 ? div(o[0], o[1]) : std::string{}; });
     r.register_node("max", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) >= 0 ? o[0] : o[1]) : std::string{}; });
     r.register_node("min", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) <= 0 ? o[0] : o[1]) : std::string{}; });
+    // The general expression node: operands are the lexed tokens (numbers + operators), evaluated with full
+    // precedence -- `[op math 6 + 8 * 10 - 5]` -> 81 in ONE frame (add/sub/mul/div stay as its primitives).
+    r.register_node("math", [](const std::vector<std::string>& o) { return eval_expr(o); });
     return r;
 }
 

@@ -54,17 +54,20 @@ make_compute_callback(Registry reg, std::function<std::string(int)> slot_deref =
         int open = -1;
         for (int i = close - 1; i >= 0; --i) if (ctx[i] == FRAME_OPEN) { open = i; break; }
         if (open < 0) return {};
-        const WordsNums in = scan_region(ctx, open + 1, close);
-        if (in.words.size() < 2 || in.words[0] != "op") return {};          // not an OP region -> inert
-        std::vector<std::string> operands;
-        if (slot_deref)                                                     // BIND: dereference bound slots in scope
+        // The op region's ASCII bytes -> ordered tokens, OPERATORS PRESERVED (`+ - * / ^ ( )`), so an
+        // expression survives intact for the `math` node -- `[op math 6+8*10-5]`. Bound-slot ids (>=128)
+        // drop out of this string and are dereferenced via slot_deref below instead.
+        std::string region;
+        for (int i = open + 1; i < close; ++i) { const int t = ctx[i]; if (t >= 0 && t < 128) region.push_back(static_cast<char>(t)); }
+        const std::vector<std::string> toks = lex_str(region);
+        if (toks.size() < 2 || toks[0] != "op") return {};                  // not an OP region -> inert
+        const std::string& name = toks[1];
+        std::vector<std::string> operands(toks.begin() + 2, toks.end());    // in-frame args: numbers + operators
+        if (operands.empty() && slot_deref)                                 // BIND: dereference bound slots in scope
             for (int i = 0; i < open; ++i)
                 if (is_scratch_slot(ctx[i])) { std::string v = slot_deref(ctx[i]); if (!v.empty()) operands.push_back(std::move(v)); }
-        if (operands.empty()) {                                             // inline: in-region nums, else preceding expr
-            operands = in.nums;
-            if (operands.empty()) operands = scan_region(ctx, 0, open).nums;
-        }
-        const std::string res = reg.run(in.words[1], operands);
+        if (operands.empty()) operands = scan_region(ctx, 0, open).nums;    // else the preceding inline expr (A + B =)
+        const std::string res = reg.run(name, operands);
         if (res.empty()) return {};                                         // unknown op / bad operands -> inert
         std::vector<int> out; out.push_back(FRAME_OPEN);
         for (char c : res) out.push_back(static_cast<unsigned char>(c));

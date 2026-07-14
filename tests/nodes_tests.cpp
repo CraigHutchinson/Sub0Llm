@@ -41,7 +41,7 @@ TEST_CASE("nodes: exact big-number primitives (arbitrary length)", "[nodes]") {
 
 TEST_CASE("nodes: built-in registry dispatches by op-name", "[nodes]") {
     const nd::Registry r = nd::builtin();
-    REQUIRE(r.size() == 6);
+    REQUIRE(r.size() == 7);
     REQUIRE(r.run("add", {"7", "8"}) == "15");
     REQUIRE(r.run("sub", {"8", "3"}) == "5");
     REQUIRE(r.run("mul", {"7", "8"}) == "56");
@@ -62,7 +62,7 @@ TEST_CASE("nodes: registry is extensible -- a new node is one register_node call
     r.register_node("sum3", [](const std::vector<std::string>& o) {
         return o.size() >= 3 ? nd::add(nd::add(o[0], o[1]), o[2]) : std::string{};
     });
-    REQUIRE(r.size() == 7);
+    REQUIRE(r.size() == 8);
     REQUIRE(r.run("sum3", {"100", "20", "3"}) == "123");    // a 3-ary node, zero new tokenizer cost
     REQUIRE(r.run("add",  {"100", "20"}) == "120");         // built-ins still work
 }
@@ -80,9 +80,36 @@ TEST_CASE("nodes: region-frame compute callback dispatches TOK_TURN op-regions",
     // Big numbers stay exact end to end.
     REQUIRE(str_of(compute(ctx_of("[op add 999999999999 1]"))) == "[1000000000000]");
 
+    // The general `math` node: a WHOLE expression in one frame (operators survive the region parse),
+    // precedence + parens handled by the node -- the model just copies the expression it is reasoning about.
+    REQUIRE(str_of(compute(ctx_of("[op math 6+8*10-5]"))) == "[81]");
+    REQUIRE(str_of(compute(ctx_of("[op math (6+8)*10]"))) == "[140]");
+    REQUIRE(str_of(compute(ctx_of("[op math 48/2]"))) == "[24]");
+    REQUIRE(compute(ctx_of("[op math 7/2]")).empty());   // non-exact division -> node declines (inert)
+
     // Inert cases (no injection): a chat turn, an unknown op, and the injected RESULT region (no `op` word) --
     // so a result region never re-triggers the node.
     REQUIRE(compute(ctx_of("[user hello]")).empty());
     REQUIRE(compute(ctx_of("[op divide 6 2]")).empty());
     REQUIRE(compute(ctx_of("[46]")).empty());
+}
+
+// The general expression node evaluated directly (the `math` node's core): exact, signed, precedence-aware.
+TEST_CASE("nodes: math expression evaluator -- precedence, parens, associativity, exact big-int", "[nodes][math]") {
+    REQUIRE(nd::eval("6+8*10-5")        == "81");    // * binds before + -
+    REQUIRE(nd::eval("(6+8)*10")        == "140");   // parens override
+    REQUIRE(nd::eval("2^10")            == "1024");
+    REQUIRE(nd::eval("2^3^2")           == "512");    // ^ right-assoc: 2^(3^2) = 2^9
+    REQUIRE(nd::eval("100-40-30")       == "30");     // - left-assoc
+    REQUIRE(nd::eval("5-8+10")          == "7");      // signed intermediate (5-8 = -3)
+    REQUIRE(nd::eval("-3+5")            == "2");      // unary minus
+    REQUIRE(nd::eval("48/2")            == "24");
+    REQUIRE(nd::eval("1000000*1000000") == "1000000000000");   // exact big-int, no overflow
+
+    // Declines (returns "") rather than ever emitting a wrong answer:
+    REQUIRE(nd::eval("7/2").empty());     // non-exact division
+    REQUIRE(nd::eval("5/0").empty());     // division by zero
+    REQUIRE(nd::eval("6+").empty());      // malformed (dangling operator)
+    REQUIRE(nd::eval("(6+8").empty());    // unbalanced paren
+    REQUIRE(nd::eval("").empty());
 }
