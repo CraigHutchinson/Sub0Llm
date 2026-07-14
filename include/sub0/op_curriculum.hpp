@@ -122,6 +122,14 @@ inline void emit_chain(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& r
     ds.doc_starts.push_back(ds.tokens.size());
 }
 
+// An EVAL problem: the prompt (prose + expression, up to the `=`) and the gold answer the node should
+// produce. A trained op model should emit a bare `[op math]` the collapse callback resolves to `gold`.
+struct EvalProblem { std::string prompt, gold; };
+inline EvalProblem gen_eval(std::mt19937_64& rng, int maxdig) {
+    const std::string expr = detail::gen_expr(rng, maxdig);
+    return { std::string(detail::gen_prose(rng)) + expr + "=", nodes::eval(expr) };
+}
+
 // Build the full curriculum: `n_examples` problems, `chain_frac` of them 2-step collapse chains, the rest
 // single-step. Every op result collapses to a slot (uniform).
 inline Dataset build_dataset(const tok::Tokenizer& tk, const Options& opt) {

@@ -17,6 +17,7 @@ void usage() {
         "Stages (also available as standalone executables):\n"
         "  train     train a model            (sub0llm-train)\n"
         "  gen       generate text            (sub0llm-gen)\n"
+        "  eval      score an op-delegation model (delegation + exact-match + routing)\n"
         "  tune      auto-tune runtime knobs  (sub0llm-tune)\n"
         "Diagnostics:\n"
         "  vocab     print the vocabulary table\n"
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "train")    return run_train(sub_argc, sub_argv);
     if (cmd == "gen")      return run_gen(sub_argc, sub_argv);
+    if (cmd == "eval")     return run_eval(sub_argc, sub_argv);
     if (cmd == "tune")     return run_tune(sub_argc, sub_argv);
     if (cmd == "vocab")    return run_vocab(sub_argc, sub_argv);
     if (cmd == "bench")    return run_bench(sub_argc, sub_argv);

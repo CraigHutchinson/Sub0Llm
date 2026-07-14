@@ -24,6 +24,7 @@ extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 float op_mix);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
+extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
 extern "C" int sub0_bench_stage(int iters, int threads, int windows_per_thread);
 extern "C" int sub0_tune_stage(int max_threads, int verbose, int backend, int thorough, int budget_s);
@@ -138,6 +139,21 @@ inline int run_gen(int argc, char** argv) {
     if (gen_seed_opt->count() == 0) gen_seed = std::random_device{}();  // fresh seed unless pinned
     return sub0_gen_stage(gen_model.c_str(), gen_prompt.c_str(), gen_n, gen_temp, gen_topk, gen_seed,
                           gen_attn_sinks);
+}
+
+// --- eval ------------------------------------------------------------------
+// Score an --op-mix (op-delegation) model on synthetic arithmetic: delegation rate, exact-match, and
+// routing accuracy (arithmetic is exact by construction, so a miss localises to routing).
+inline int run_eval(int argc, char** argv) {
+    CLI::App app{"sub0llm-eval — score an op-delegation model (delegation rate + exact-match + routing accuracy)"};
+    std::string eval_model;
+    unsigned    eval_seed = 4242;
+    int         eval_n    = 300;
+    app.add_option("model", eval_model, "Trained model path (a model trained with --op-mix)")->required();
+    app.add_option("--seed", eval_seed, "RNG seed for the synthetic problems")->capture_default_str();
+    app.add_option("--problems", eval_n, "Number of synthetic problems to score")->capture_default_str();
+    CLI11_PARSE(app, argc, argv);
+    return sub0_eval_stage(eval_model.c_str(), eval_seed, eval_n);
 }
 
 // --- tune ------------------------------------------------------------------

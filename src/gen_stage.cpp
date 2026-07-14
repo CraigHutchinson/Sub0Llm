@@ -10,6 +10,7 @@
 #include "sub0/tokenizer.hpp"   // raw sub0::tok::Tokenizer for the uncombine/combine interceptor callbacks
 #include "sub0/scratch.hpp"     // ScratchTable: binding table backing both spell + scratch resolution
 #include "sub0/node_frame.hpp"  // op frame: dispatch deterministic compute nodes through the TOK_TURN region
+#include "sub0/op_curriculum.hpp" // gen_eval: synthetic op problems for the native `eval` scorer
 
 #include <algorithm>
 #include <array>
@@ -196,6 +197,70 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     sub0::graph_reset();
     expand_op_slots(ctx);   // collapsed op results -> their value digits for display
     std::println("{}", sub0::detokenize(ctx));
+    return 0;
+}
+
+// Native op-delegation eval: score a trained --op-mix model. Generate synthetic arithmetic problems,
+// run the model through the SAME production collapse callback gen uses, and report the decomposed metrics a
+// well-formed-math task affords -- because the node is exact, a miss is a ROUTING error, not arithmetic.
+extern "C" SUB0_API int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems) {
+    sub0::build_model();
+    if (!sub0::load_model(model_in)) { std::println(stderr, "eval: cannot load model '{}'", model_in); return 1; }
+    std::string tok_path = sub0::default_tokenizer();
+    if (model_in && *model_in) {
+        const std::filesystem::path bundled = std::filesystem::path(model_in).parent_path() / "tokenizer.tok";
+        std::error_code ec; if (std::filesystem::exists(bundled, ec)) tok_path = bundled.string();
+    }
+    if (!sub0::load_tokenizer(tok_path.c_str())) { std::println(stderr, "eval: cannot load tokenizer '{}'", tok_path); return 1; }
+    const int eos_id = sub0::eos_token_id();
+
+    double op_mix = 0.0;
+    if (model_in && *model_in) {
+        const std::filesystem::path mp(model_in);
+        const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
+        sub0::registry::RunConfig cfg;
+        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir)) op_mix = cfg.op_mix;
+    }
+    if (op_mix <= 0.0)
+        std::println(stderr, "eval: warning -- model config.json op-mix {:.2f} (not an op-delegation model; "
+                             "expect delegation ~0)", op_mix);
+
+    // The production collapse callback (mirrors gen_stage): resolve the op, bind the result to the next
+    // scratch slot, inject that token. The last bound slot's value is the model's answer.
+    sub0::ScratchTable scratch;
+    auto inner = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), [&scratch](int s) { return scratch.value(s); });
+    auto compute = [&scratch, inner](const std::vector<int>& c) -> std::vector<int> {
+        const std::vector<int> r = inner(c);
+        if (r.empty()) return r;
+        std::string val;
+        for (int t : r) if (t != sub0::nodes::FRAME_OPEN && t != sub0::nodes::FRAME_CLOSE) val.push_back(static_cast<char>(t));
+        const int idx = static_cast<int>(scratch.bindings.size());
+        if (val.empty() || idx >= sub0::SCRATCH_SLOT_COUNT) return r;
+        std::vector<int> frags; for (char ch : val) frags.push_back(static_cast<unsigned char>(ch));
+        scratch.bind(sub0::SCRATCH_SLOT_BASE + idx, std::move(frags));
+        return { sub0::SCRATCH_SLOT_BASE + idx };
+    };
+
+    const int n = n_problems > 0 ? n_problems : 300;
+    std::mt19937_64 ev(seed ? seed : 4242u);
+    std::mt19937    grng(0);
+    int exact = 0, delegated = 0;
+    for (int i = 0; i < n; ++i) {
+        const sub0::op_curriculum::EvalProblem pr = sub0::op_curriculum::gen_eval(ev, 3);
+        std::vector<int> ctx = sub0::encode(pr.prompt);
+        if (static_cast<int>(ctx.size()) + 8 >= SEQ_LEN) continue;
+        scratch.reset();
+        sub0::kv_decode_generate(ctx, 24, 1.f, 1, grng, eos_id, false, {}, {}, {}, compute, sub0::nodes::FRAME_CLOSE);
+        const bool did = !scratch.bindings.empty();
+        const std::string got = did ? scratch.value(sub0::SCRATCH_SLOT_BASE + static_cast<int>(scratch.bindings.size()) - 1)
+                                    : std::string{};
+        delegated += did;
+        exact     += (got == pr.gold);
+    }
+    const double dl = delegated / double(n), ex = exact / double(n);
+    std::println("op-eval ({} problems): delegation-rate {:.3f}  exact-match {:.3f}  routing-accuracy {:.3f}",
+                 n, dl, ex, delegated ? exact / double(delegated) : 0.0);
+    std::println("  (arithmetic is exact by construction when delegation fires -- a miss is a ROUTING error)");
     return 0;
 }
 
