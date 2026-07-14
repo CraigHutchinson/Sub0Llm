@@ -41,9 +41,11 @@ TEST_CASE("nodes: exact big-number primitives (arbitrary length)", "[nodes]") {
 
 TEST_CASE("nodes: built-in registry dispatches by op-name", "[nodes]") {
     const nd::Registry r = nd::builtin();
-    REQUIRE(r.size() == 4);
+    REQUIRE(r.size() == 6);
     REQUIRE(r.run("add", {"7", "8"}) == "15");
     REQUIRE(r.run("sub", {"8", "3"}) == "5");
+    REQUIRE(r.run("mul", {"7", "8"}) == "56");
+    REQUIRE(r.run("div", {"56", "8"}) == "7");
     REQUIRE(r.run("max", {"8", "3"}) == "8");
     REQUIRE(r.run("min", {"8", "3"}) == "3");
     // Comparison ops return the WHOLE winning operand (big numbers), not a truncation.
@@ -60,7 +62,7 @@ TEST_CASE("nodes: registry is extensible -- a new node is one register_node call
     r.register_node("sum3", [](const std::vector<std::string>& o) {
         return o.size() >= 3 ? nd::add(nd::add(o[0], o[1]), o[2]) : std::string{};
     });
-    REQUIRE(r.size() == 5);
+    REQUIRE(r.size() == 7);
     REQUIRE(r.run("sum3", {"100", "20", "3"}) == "123");    // a 3-ary node, zero new tokenizer cost
     REQUIRE(r.run("add",  {"100", "20"}) == "120");         // built-ins still work
 }
