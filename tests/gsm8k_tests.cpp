@@ -99,14 +99,15 @@ TEST_CASE("gsm8k: bad annotations are filtered, not learned", "[gsm8k]") {
 
 // --- The training-stream builder: grade routing, mask results, de-dup the repeated answer ---------------
 TEST_CASE("gsm8k: build_stream emits an exact graded-frame / masked-result token stream", "[gsm8k]") {
-    // Minimal case, asserted token-for-token: `a=<<2+3=5>> 5 b` -> `a=` [op math 2+3] (5 masked) ` b`.
-    const gs::Example ex = gs::build_stream("a=<<2+3=5>> 5 b", byte_encode);
+    // Minimal case, token-for-token: `2+3=<<2+3=5>> 5 b` -> `2+3=` [op math] (5 masked) ` b`. The frame is
+    // BARE (`op math`) -- the expression `2+3` is already in the graded prose right before it.
+    const gs::Example ex = gs::build_stream("2+3=<<2+3=5>> 5 b", byte_encode);
 
     std::vector<int> et; std::vector<std::uint8_t> em;
     auto g = [&](int t) { et.push_back(t); em.push_back(1); };
     auto m = [&](int t) { et.push_back(t); em.push_back(0); };
-    g('a'); g('=');
-    g(cas::TOK_TURN_START); for (char c : std::string("op math 2+3")) g(static_cast<unsigned char>(c)); g(cas::TOK_TURN_END);
+    g('2'); g('+'); g('3'); g('=');
+    g(cas::TOK_TURN_START); for (char c : std::string("op math")) g(static_cast<unsigned char>(c)); g(cas::TOK_TURN_END);
     m('5');
     g(' '); g('b');
 
@@ -134,8 +135,10 @@ TEST_CASE("gsm8k: build_stream on the real solution masks exactly the two result
 // callback (node_frame.hpp) to the right result -- a model trained on these frames, run through gen's wired
 // callback, gets the node's exact answer.
 TEST_CASE("gsm8k: the emitted op-frame dispatches through the production callback", "[gsm8k]") {
-    gs::Op op; REQUIRE(gs::parse_annotation("6*7=42", op));
-    std::vector<int> ctx = gs::op_frame(op);                        // `[op math 6*7]`, ending in TOK_TURN_END
+    // The prose poses the expression, then the BARE `[op math]` routes -- the node reads `6*7` from context.
+    std::vector<int> ctx;
+    for (char c : std::string("6*7=")) ctx.push_back(static_cast<unsigned char>(c));
+    for (int t : gs::op_frame()) ctx.push_back(t);
     const auto compute = nd::make_compute_callback(nd::builtin());
     const std::vector<int> inj = compute(ctx);
     const std::vector<int> want = { cas::TOK_TURN_START, '4', '2', cas::TOK_TURN_END };

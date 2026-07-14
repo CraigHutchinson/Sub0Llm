@@ -68,13 +68,14 @@ inline std::vector<Segment> segment(std::string_view sol) {
 // already applies this; kept for callers that build an Op directly.)
 inline bool verify(const Op& op) { return nodes::eval(op.expr) == op.result; }
 
-// The op-frame the model learns to EMIT: `TOK_TURN_START op math <EXPR> TOK_TURN_END`. The model copies the
-// expression verbatim; the general `math` node parses + evaluates it (precedence, parens, exact).
-inline std::vector<int> op_frame(const Op& op) {
+// The op-frame the model learns to EMIT: a BARE `TOK_TURN_START op math TOK_TURN_END`. The expression is
+// already in the prose right before it (GSM8K writes `EXPR = <<EXPR=R>>`), so the model only routes -- the
+// node reads the posed expression from the preceding context (node_frame::preceding_expr). Emitting a bare
+// marker avoids making the model COPY the multi-digit expression into the frame (the localization wall).
+inline std::vector<int> op_frame() {
     std::vector<int> f;
     f.push_back(casing::TOK_TURN_START);
-    const std::string hdr = "op math " + op.expr;
-    for (char c : hdr) f.push_back(static_cast<unsigned char>(c));
+    for (char c : std::string("op math")) f.push_back(static_cast<unsigned char>(c));
     f.push_back(casing::TOK_TURN_END);
     return f;
 }
@@ -99,8 +100,8 @@ inline Example build_stream(std::string_view sol,
         const Segment& s = segs[k];
         if (!s.is_op)           { emit_text(s.text, 1); continue; }
         if (!verify(s.op))      { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
-        for (int t : op_frame(s.op)) emit(t, 1);                    // GRADED: `[op math EXPR]` (the routing)
-        for (char c : s.op.result)   emit(static_cast<unsigned char>(c), 0);   // MASKED: the node supplies it
+        for (int t : op_frame())   emit(t, 1);                     // GRADED: `[op math]` (route; expr is in the prose)
+        for (char c : s.op.result) emit(static_cast<unsigned char>(c), 0);   // MASKED: the node supplies it
         ++ex.ops;
         // Strip the redundant result GSM8K repeats right after the annotation (leading ws + R + word
         // boundary), so it is not ALSO written as graded prose.

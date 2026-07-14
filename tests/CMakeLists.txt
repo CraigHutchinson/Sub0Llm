@@ -23,6 +23,7 @@ add_executable(sub0_tests
   node_frame_engine_tests.cpp
   scalar_reentry_engine_tests.cpp
   numeric_bind_engine_tests.cpp
+  gsm8k_engine_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.

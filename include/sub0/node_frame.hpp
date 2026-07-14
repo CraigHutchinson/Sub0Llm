@@ -56,6 +56,22 @@ inline std::string region_expr(const std::vector<int>& ctx, int lo, int hi,
     return s;
 }
 
+// The TRAILING arithmetic expression posed just before the frame at `open`: scan back over expression tokens
+// (digits, operators, parens, bound slots, spaces, `=`), stopping at prose (a letter / other), then lex it.
+// This lets the model emit a BARE `[op math]` and delegate the expression it JUST WROTE -- `... 48/2 =
+// [op math]` -- WITHOUT copying it into the frame (copying multi-digit operands is the localization wall;
+// the expression is already in the context, so the node reads it there).
+inline std::vector<std::string> preceding_expr(const std::vector<int>& ctx, int open,
+                                               const std::function<std::string(int)>& slot_deref) {
+    auto is_expr = [&](int t) {
+        return (t >= '0' && t <= '9') || t == '+' || t == '-' || t == '*' || t == '/' || t == '^'
+            || t == '(' || t == ')' || t == '=' || t == ' ' || t == '\t' || is_scratch_slot(t);
+    };
+    int lo = open;
+    while (lo > 0 && is_expr(ctx[lo - 1])) --lo;
+    return lex_str(region_expr(ctx, lo, open, slot_deref));
+}
+
 // A kv_decode_generate `compute` callback bound to `reg` (copied in -> self-contained). Fires on TOK_TURN_END.
 // The op region is read as an EXPRESSION (operators `+ - * / ^ ( )` preserved), so the general `math` node
 // evaluates a whole formula in one frame. Optional `slot_deref` substitutes a bound scratch-slot id with the
@@ -72,8 +88,7 @@ make_compute_callback(Registry reg, std::function<std::string(int)> slot_deref =
         if (toks.size() < 2 || toks[0] != "op") return {};                  // not an OP region -> inert
         const std::string& name = toks[1];
         std::vector<std::string> operands(toks.begin() + 2, toks.end());    // the in-frame expression...
-        if (operands.empty())                                              // ...else the preceding posed one
-            operands = lex_str(region_expr(ctx, 0, open, slot_deref));
+        if (operands.empty()) operands = preceding_expr(ctx, open, slot_deref);   // ...else the preceding posed one
         const std::string res = reg.run(name, operands);
         if (res.empty()) return {};                                         // unknown op / bad expression -> inert
         std::vector<int> out; out.push_back(FRAME_OPEN);
