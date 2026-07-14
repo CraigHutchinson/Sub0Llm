@@ -41,12 +41,26 @@ TEST_CASE("nodes: exact big-number primitives (arbitrary length)", "[nodes]") {
 
 TEST_CASE("nodes: built-in registry dispatches by op-name", "[nodes]") {
     const nd::Registry r = nd::builtin();
-    REQUIRE(r.size() == 3);                         // math + max + min (per-op arithmetic frames are gone)
+    REQUIRE(r.size() == 8);                         // math + max + min + mod + gcd + abs + date + now
     REQUIRE(r.run("math", {"7", "+", "8"}) == "15");
     REQUIRE(r.run("max", {"8", "3"}) == "8");
     REQUIRE(r.run("min", {"8", "3"}) == "3");
     // Comparison ops return the WHOLE winning operand (big numbers), not a truncation.
     REQUIRE(r.run("max", {"12345678901234567890", "98765432109876543210"}) == "98765432109876543210");
+
+    // The extensible op TABLE, not just math: a few more PURE ops.
+    REQUIRE(r.run("mod", {"17", "5"}) == "2");
+    REQUIRE(r.run("gcd", {"48", "36"}) == "12");
+    REQUIRE(r.run("gcd", {"1000000000000", "48"}) == "16");   // big-int Euclid
+    REQUIRE(r.run("abs", {"-42"}) == "42");
+    REQUIRE(r.run("abs", {"42"}) == "42");
+
+    // The ops-vs-tools purity tag: math/gcd are pure (bakeable), the clock ops are impure-but-safe.
+    REQUIRE(r.is_pure("math"));
+    REQUIRE(r.is_pure("gcd"));
+    REQUIRE_FALSE(r.is_pure("date"));
+    REQUIRE_FALSE(r.is_pure("now"));
+    REQUIRE_FALSE(r.run("date", {}).empty());     // resolves live (YYYY-MM-DD); value not asserted (wall clock)
 
     // Per-op arithmetic frames are superseded by `math`; unknown ops / malformed operands still miss safely.
     REQUIRE(r.find("add") == nullptr);
@@ -60,7 +74,7 @@ TEST_CASE("nodes: registry is extensible -- a new node is one register_node call
     r.register_node("sum3", [](const std::vector<std::string>& o) {
         return o.size() >= 3 ? nd::add(nd::add(o[0], o[1]), o[2]) : std::string{};
     });
-    REQUIRE(r.size() == 4);
+    REQUIRE(r.size() == 9);
     REQUIRE(r.run("sum3", {"100", "20", "3"}) == "123");    // a 3-ary node, zero new tokenizer cost
     REQUIRE(r.run("math", {"100", "+", "20"}) == "120");    // built-ins still work
 }

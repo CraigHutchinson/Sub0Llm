@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <string>
@@ -82,6 +83,22 @@ inline std::string div(const std::string& a, const std::string& b) {   // a/b, E
     }
     if (cmp(cur, "0") != 0) return {};                                 // non-zero remainder -> not exact, decline
     return norm(q);
+}
+inline std::string mod(const std::string& a, const std::string& b) {   // a % b (the remainder) -> "" on /0
+    if (cmp(b, "0") == 0) return {};
+    std::string cur = "0";
+    for (char c : a) {
+        cur = norm(cur + c);
+        int d = 0;
+        for (int t = 9; t >= 1; --t) if (cmp(mul(b, std::string(1, static_cast<char>('0' + t))), cur) <= 0) { d = t; break; }
+        cur = sub(cur, mul(b, std::string(1, static_cast<char>('0' + d))));
+    }
+    return norm(cur);
+}
+inline std::string gcd(std::string a, std::string b) {                 // Euclid over big decimals
+    a = norm(a); b = norm(b);
+    while (cmp(b, "0") != 0) { std::string r = mod(a, b); a = b; b = r; }
+    return a;
 }
 
 // --- General expression evaluator (the `math` node) ----------------------------------------------------
@@ -166,18 +183,40 @@ using NodeFn = std::function<std::string(const std::vector<std::string>&)>;
 
 // name -> node. Extensible: a new capability is one register_node() call. Dispatch is by the op-name WORD the
 // model emits, so no reserved-id per op (nodespike proved word-naming carries no routing penalty).
+//
+// `pure` tags an op by the ops-vs-tools taxonomy (docs/DETERMINISTIC_MECHANISMS.md §1c): a PURE op is a
+// deterministic function of its operands (math, gcd, unit convert) -- safe to BAKE in the training curriculum.
+// An IMPURE-but-safe op (date/now/elapsed, read-only lookup) depends on runtime state, so it CANNOT be baked:
+// a curriculum trains only its routing and the value is resolved live. (Effectful TOOLS -- bash/write/http --
+// are a separate guarded tier, not registered here.) The bake vs mask-only decision is the tag's consumer.
 class Registry {
 public:
-    void register_node(std::string name, NodeFn fn) { map_[std::move(name)] = std::move(fn); }
-    const NodeFn* find(const std::string& name) const { const auto it = map_.find(name); return it == map_.end() ? nullptr : &it->second; }
+    void register_node(std::string name, NodeFn fn, bool pure = true) { map_[std::move(name)] = {std::move(fn), pure}; }
+    const NodeFn* find(const std::string& name) const { const auto it = map_.find(name); return it == map_.end() ? nullptr : &it->second.fn; }
+    bool is_pure(const std::string& name) const { const auto it = map_.find(name); return it == map_.end() ? true : it->second.pure; }
     std::string run(const std::string& name, const std::vector<std::string>& operands) const {
         const NodeFn* fn = find(name);
         return fn ? (*fn)(operands) : std::string{};
     }
     std::size_t size() const { return map_.size(); }
 private:
-    std::map<std::string, NodeFn> map_;
+    struct Entry { NodeFn fn; bool pure = true; };
+    std::map<std::string, Entry> map_;
 };
+
+// Impure-but-safe clock ops (no side effects; depend on wall-clock -> cannot be baked). Local time, using
+// the portable thread-safe converter (localtime_s on Windows, localtime_r elsewhere).
+inline std::string clock_str(const char* fmt) {
+    const std::time_t t = std::time(nullptr);
+    std::tm tmv{};
+#if defined(_WIN32)
+    if (localtime_s(&tmv, &t) != 0) return {};
+#else
+    if (localtime_r(&t, &tmv) == nullptr) return {};
+#endif
+    char buf[32];
+    return std::strftime(buf, sizeof buf, fmt, &tmv) ? std::string(buf) : std::string{};
+}
 
 // The built-in nodes. `math` is THE arithmetic op -- one general expression evaluator (precedence, parens,
 // exact big-int) supersedes the per-op add/sub/mul/div FRAMES, so those are not registered as dispatch nodes
@@ -192,6 +231,15 @@ inline Registry builtin() {
     r.register_node("math", [](const std::vector<std::string>& o) { return eval_expr(o); });
     r.register_node("max", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) >= 0 ? o[0] : o[1]) : std::string{}; });
     r.register_node("min", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) <= 0 ? o[0] : o[1]) : std::string{}; });
+    // A few more PURE ops -- the registry is an extensible table, not just `math` (docs §1c). Each is one
+    // register_node call, zero tokenizer budget (word op-name), and bakeable (deterministic).
+    r.register_node("mod", [](const std::vector<std::string>& o) { return o.size() >= 2 ? mod(o[0], o[1]) : std::string{}; });
+    r.register_node("gcd", [](const std::vector<std::string>& o) { return o.size() >= 2 ? gcd(o[0], o[1]) : std::string{}; });
+    r.register_node("abs", [](const std::vector<std::string>& o) { return o.empty() ? std::string{} : (o[0].starts_with('-') ? o[0].substr(1) : o[0]); });
+    // IMPURE-but-safe ops (no operands; depend on the wall clock -> pure=false, so a curriculum masks the
+    // result and resolves it live rather than baking it). The seed of the op catalog (date/now/elapsed/...).
+    r.register_node("date", [](const std::vector<std::string>&) { return clock_str("%Y-%m-%d"); }, /*pure=*/false);
+    r.register_node("now",  [](const std::vector<std::string>&) { return clock_str("%H:%M:%S"); }, /*pure=*/false);
     return r;
 }
 
