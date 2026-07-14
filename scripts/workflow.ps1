@@ -25,6 +25,14 @@
 
 .PARAMETER Steps
   Training steps; 0 (default) lets sub0llm-train auto-size to the corpus and stop on plateau.
+  (An explicit -Steps N always runs the full N -- plateau-stop is auto-mode only.)
+
+.PARAMETER OpMix
+  0 (default) = off. >0 blends the op-delegation curriculum (teach the model to ROUTE arithmetic to the
+  exact `math` node -- `[op math]`, which gen dispatches -- instead of computing it, including multi-step
+  collapse chains). Combine with -Corpus data/gsm8k.txt for the GSM8K math workflow. See
+  docs/DETERMINISTIC_MECHANISMS.md. (The proven arch stack -- gated FFN / tied embeddings / QK-norm / Muon --
+  is now configure/train default-ON, so no extra flag is needed for it.)
 
 .PARAMETER Tune
   Run sub0llm-tune before training and rebuild so the baked DEFAULT_THREADS picks up its result.
@@ -43,6 +51,12 @@
 .EXAMPLE
   scripts/workflow.ps1 -BuildDir prod -Corpus data/fineweb_edu.txt -Tune
   Full run: tune first, then train to the auto-sized step/plateau budget.
+
+.EXAMPLE
+  python scripts/get_gsm8k.py                       # -> data/gsm8k.txt
+  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -OpMix 0.3 -Steps 4000
+  GSM8K math workflow: configure+build for the GSM8K corpus, then train blending 30% op-delegation
+  curriculum so the model routes arithmetic to the exact node. Score with `sub0llm eval <model>/model.bin`.
 #>
 [CmdletBinding()]
 param(
@@ -51,6 +65,7 @@ param(
     [ValidateSet("AUTO", "CPU", "GPU", "HYBRID")]
     [string]$Compute   = "AUTO",
     [int]$Steps        = 0,
+    [double]$OpMix     = 0,
     [switch]$Tune,
     [switch]$Clean,
     [switch]$SkipConfigure,
@@ -133,6 +148,7 @@ Write-Host "=== train -> $ModelPath ===" -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path (Split-Path $ModelPath) | Out-Null
 $trainArgs = @()
 if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
+if ($OpMix -gt 0) { $trainArgs += @("--op-mix", "$OpMix") }   # blend the op-delegation (math routing) curriculum
 $trainArgs += @($ModelPath, $CorpusPath)
 Invoke-Checked (Join-Path $Bin "sub0llm-train.exe") $trainArgs
 
