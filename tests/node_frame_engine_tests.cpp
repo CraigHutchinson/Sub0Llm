@@ -50,7 +50,7 @@ Task make_task(const std::string& a, const std::string& b) {
     auto m  = [&](int t) { k.trace.push_back(t); k.mask.push_back(0); };
     for (char c : a) pp(static_cast<unsigned char>(c));
     pp('+'); for (char c : b) pp(static_cast<unsigned char>(c)); pp('=');
-    for (int t : nd::op_header("add")) g(t);                    // graded: `[op add]` (the routing)
+    for (int t : nd::op_header("math")) g(t);                   // graded: `[op math]` (the routing)
     m(nd::FRAME_OPEN); for (char c : k.sum) m(static_cast<unsigned char>(c)); m(nd::FRAME_CLOSE);   // masked: `[<sum>]`
     g(cas::TOK_EOS);
     return k;
@@ -133,8 +133,8 @@ TEST_CASE("node_frame: end-to-end -- model emits a TOK_TURN op region, the node 
 TEST_CASE("node_frame: prefill resolves a prompt that ends in an op region (forward-pass delegation)", "[nodeframe]") {
     sub0::build_model();
     const auto compute = nd::make_compute_callback(nd::builtin());
-    // `12 + 34 = [op add]`  (prompt is 14 tokens; the injected result region follows it).
-    std::vector<int> ctx = {'1','2','+','3','4','=', nd::FRAME_OPEN,'o','p',' ','a','d','d', nd::FRAME_CLOSE};
+    // `12 + 34 = [op math]`  (the injected result region follows the prompt).
+    std::vector<int> ctx = {'1','2','+','3','4','=', nd::FRAME_OPEN,'o','p',' ','m','a','t','h', nd::FRAME_CLOSE};
     const std::size_t plen = ctx.size();
     std::mt19937 rng(0);
     sub0::kv_decode_generate(ctx, /*n=*/1, 1.f, 1, rng, cas::TOK_EOS, false, {}, {}, {}, compute, nd::FRAME_CLOSE);

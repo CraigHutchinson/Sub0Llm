@@ -1,13 +1,13 @@
 // sub0/gsm8k.hpp -- convert GSM8K-style worked solutions into the op-curriculum (docs/ROADMAP.md §D, the
-// deterministic-mechanisms connection). GSM8K's solutions carry inline calculator annotations
-// `<<48/2=24>>` -- a ready-made op-frame marking exactly the arithmetic spans to DELEGATE (PROVIDE) and MASK
-// (FILTER). This module parses those annotations into verifiable op calls: the model will learn to EMIT the
-// routing `[op div 48 2]` while a deterministic node supplies the exact result, so it never learns the fuzzy
-// arithmetic (which arithspike showed never generalises).
+// deterministic-mechanisms connection). GSM8K's solutions carry inline calculator annotations `<<48/2=24>>`
+// -- a ready-made op-frame marking exactly the arithmetic spans to DELEGATE (PROVIDE) and MASK (FILTER).
+// Each annotation becomes `[op math EXPR]`: the model copies the expression verbatim and the general `math`
+// node (nodes.hpp) evaluates it exactly -- so it never learns the fuzzy arithmetic (which arithspike showed
+// never generalises). One general op, not a per-op frame per operator.
 //
-// Integer-op MVP: `+ - * /` over non-negative INTEGER operands (the bulk of grade-school annotations).
-// Decimal/negative/multi-op annotations fail the parse and stay as ordinary literal text (a documented
-// follow-on adds decimal/rational nodes). Engine + tokenizer free (nodes.hpp + std only) -- a FRONTEND module.
+// Integer-op MVP: an annotation is kept only if `nodes::eval(EXPR)` reproduces the stated integer result --
+// so decimals / non-integer division / malformed expressions are rejected (they stay as literal text). A
+// decimal/rational `math` node is the documented follow-on. Engine + tokenizer free -- a FRONTEND module.
 
 #pragma once
 
@@ -21,39 +21,25 @@
 
 namespace sub0::gsm8k {
 
-// A parsed calc-annotation `<<a<sym>b=result>>`: the registry op-name for the symbol + operands + the stated
-// result (kept for verification -- the node recomputes it).
-struct Op { char sym = 0; std::string name, a, b, result; };
+// A parsed calc-annotation `<<EXPR=RESULT>>`: the arithmetic expression (verbatim) + its stated result.
+struct Op { std::string expr, result; };
 
-inline const char* op_name(char sym) {
-    switch (sym) {
-        case '+': return "add"; case '-': return "sub"; case '*': return "mul"; case '/': return "div";
-        default:  return nullptr;
-    }
-}
-
-// Parse EXPR = "a<sym>b" (a SINGLE binary op over non-negative integer operands) and its stated RESULT.
-// False for anything else (decimals, negatives, spaces, multi-op) -- the integer-MVP filter.
-inline bool parse_annotation(std::string_view expr, std::string_view result, Op& out) {
-    auto all_digits = [](std::string_view s) {
-        if (s.empty()) return false;
-        for (char c : s) if (c < '0' || c > '9') return false;
-        return true;
-    };
-    std::size_t oppos = std::string_view::npos; char sym = 0;
-    for (std::size_t i = 1; i < expr.size(); ++i) {   // from 1: an operator at 0 would be a leading sign (unsupported)
-        const char c = expr[i];
-        if (c == '+' || c == '-' || c == '*' || c == '/') { oppos = i; sym = c; break; }
-    }
-    if (oppos == std::string_view::npos) return false;
-    const std::string_view a = expr.substr(0, oppos), b = expr.substr(oppos + 1);
-    if (!all_digits(a) || !all_digits(b) || !all_digits(result)) return false;
-    out.sym = sym; out.name = op_name(sym); out.a = std::string(a); out.b = std::string(b); out.result = std::string(result);
+// Split the annotation body "EXPR=RESULT" on the FIRST '=', keep it only if the `math` node reproduces the
+// result exactly (RESULT a non-negative integer). This single check IS the integer-MVP filter: `nodes::eval`
+// declines decimals / non-integer division / malformed input, so those annotations are rejected here.
+inline bool parse_annotation(std::string_view body, Op& out) {
+    const std::size_t eq = body.find('=');
+    if (eq == std::string_view::npos) return false;
+    const std::string_view expr = body.substr(0, eq), result = body.substr(eq + 1);
+    if (expr.empty() || result.empty()) return false;
+    for (char c : result) if (c < '0' || c > '9') return false;         // result is a plain integer literal
+    if (nodes::eval(expr) != result) return false;                      // FILTER: the node must reproduce it
+    out.expr = std::string(expr); out.result = std::string(result);
     return true;
 }
 
-// A solution split into alternating literal text and parsed op annotations. A `<<...>>` that fails the parse
-// is left in the literal text (the sentence is unchanged; it just isn't turned into an op).
+// A solution split into alternating literal text and parsed op annotations. A `<<...>>` that fails the
+// parse/verify is left in the literal text (the sentence is unchanged; it just isn't turned into an op).
 struct Segment { std::string text; bool is_op = false; Op op; };
 
 inline std::vector<Segment> segment(std::string_view sol) {
@@ -63,11 +49,8 @@ inline std::vector<Segment> segment(std::string_view sol) {
         if (sol[i] == '<' && i + 1 < sol.size() && sol[i + 1] == '<') {
             const std::size_t close = sol.find(">>", i + 2);
             if (close != std::string_view::npos) {
-                const std::string_view inner = sol.substr(i + 2, close - (i + 2));   // "expr=result"
-                const std::size_t eq = inner.find('=');
                 Op op;
-                if (eq != std::string_view::npos &&
-                    parse_annotation(inner.substr(0, eq), inner.substr(eq + 1), op)) {
+                if (parse_annotation(sol.substr(i + 2, close - (i + 2)), op)) {
                     if (!cur.empty()) { segs.push_back({std::move(cur), false, {}}); cur.clear(); }
                     segs.push_back({std::string(sol.substr(i, close + 2 - i)), true, op});
                     i = close + 2;
@@ -81,18 +64,16 @@ inline std::vector<Segment> segment(std::string_view sol) {
     return segs;
 }
 
-// FILTER-pillar guard: does running the deterministic node actually reproduce the annotation's stated result?
-// A mismatched annotation (bad label, or an op we compute differently) is dropped, not learned.
-inline bool verify(const Op& op, const nodes::Registry& reg) {
-    return reg.run(op.name, {op.a, op.b}) == op.result;
-}
+// FILTER-pillar guard: does the `math` node reproduce the annotation's stated result? (parse_annotation
+// already applies this; kept for callers that build an Op directly.)
+inline bool verify(const Op& op) { return nodes::eval(op.expr) == op.result; }
 
-// The op-frame the model learns to EMIT for `op`: `TOK_TURN_START op <name> <a> <b> TOK_TURN_END`. Operands
-// live in the frame (self-contained -- the node reads them there, not from ambiguous surrounding prose).
+// The op-frame the model learns to EMIT: `TOK_TURN_START op math <EXPR> TOK_TURN_END`. The model copies the
+// expression verbatim; the general `math` node parses + evaluates it (precedence, parens, exact).
 inline std::vector<int> op_frame(const Op& op) {
     std::vector<int> f;
     f.push_back(casing::TOK_TURN_START);
-    const std::string hdr = "op " + op.name + " " + op.a + " " + op.b;
+    const std::string hdr = "op math " + op.expr;
     for (char c : hdr) f.push_back(static_cast<unsigned char>(c));
     f.push_back(casing::TOK_TURN_END);
     return f;
@@ -108,8 +89,7 @@ struct Example { std::vector<int> tokens; std::vector<std::uint8_t> mask; int op
 // annotation as `EXPR = <<EXPR=R>> R`, so the R that follows the annotation is stripped from the prose (it
 // is delegated, not written): the op-frame is graded, then R is emitted once, masked.
 inline Example build_stream(std::string_view sol,
-                            const std::function<std::vector<int>(std::string_view)>& encode,
-                            const nodes::Registry& reg) {
+                            const std::function<std::vector<int>(std::string_view)>& encode) {
     Example ex;
     std::vector<Segment> segs = segment(sol);
     auto emit      = [&](int t, std::uint8_t m) { ex.tokens.push_back(t); ex.mask.push_back(m); };
@@ -117,12 +97,12 @@ inline Example build_stream(std::string_view sol,
 
     for (std::size_t k = 0; k < segs.size(); ++k) {
         const Segment& s = segs[k];
-        if (!s.is_op)               { emit_text(s.text, 1); continue; }
-        if (!verify(s.op, reg))     { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
-        for (int t : op_frame(s.op)) emit(t, 1);                    // GRADED: the routing the model must learn
+        if (!s.is_op)           { emit_text(s.text, 1); continue; }
+        if (!verify(s.op))      { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
+        for (int t : op_frame(s.op)) emit(t, 1);                    // GRADED: `[op math EXPR]` (the routing)
         for (char c : s.op.result)   emit(static_cast<unsigned char>(c), 0);   // MASKED: the node supplies it
         ++ex.ops;
-        // Strip the redundant result that GSM8K repeats right after the annotation (leading ws + R + word
+        // Strip the redundant result GSM8K repeats right after the annotation (leading ws + R + word
         // boundary), so it is not ALSO written as graded prose.
         if (k + 1 < segs.size() && !segs[k + 1].is_op) {
             std::string& nx = segs[k + 1].text;

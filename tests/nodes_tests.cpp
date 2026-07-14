@@ -41,19 +41,17 @@ TEST_CASE("nodes: exact big-number primitives (arbitrary length)", "[nodes]") {
 
 TEST_CASE("nodes: built-in registry dispatches by op-name", "[nodes]") {
     const nd::Registry r = nd::builtin();
-    REQUIRE(r.size() == 7);
-    REQUIRE(r.run("add", {"7", "8"}) == "15");
-    REQUIRE(r.run("sub", {"8", "3"}) == "5");
-    REQUIRE(r.run("mul", {"7", "8"}) == "56");
-    REQUIRE(r.run("div", {"56", "8"}) == "7");
+    REQUIRE(r.size() == 3);                         // math + max + min (per-op arithmetic frames are gone)
+    REQUIRE(r.run("math", {"7", "+", "8"}) == "15");
     REQUIRE(r.run("max", {"8", "3"}) == "8");
     REQUIRE(r.run("min", {"8", "3"}) == "3");
     // Comparison ops return the WHOLE winning operand (big numbers), not a truncation.
     REQUIRE(r.run("max", {"12345678901234567890", "98765432109876543210"}) == "98765432109876543210");
 
-    // Unknown op / malformed operands -> empty (a graceful miss, never a wrong answer).
+    // Per-op arithmetic frames are superseded by `math`; unknown ops / malformed operands still miss safely.
+    REQUIRE(r.find("add") == nullptr);
     REQUIRE(r.run("divide", {"6", "2"}).empty());
-    REQUIRE(r.run("add", {"7"}).empty());
+    REQUIRE(r.run("min", {"8"}).empty());
     REQUIRE(r.find("nope") == nullptr);
 }
 
@@ -62,9 +60,9 @@ TEST_CASE("nodes: registry is extensible -- a new node is one register_node call
     r.register_node("sum3", [](const std::vector<std::string>& o) {
         return o.size() >= 3 ? nd::add(nd::add(o[0], o[1]), o[2]) : std::string{};
     });
-    REQUIRE(r.size() == 8);
+    REQUIRE(r.size() == 4);
     REQUIRE(r.run("sum3", {"100", "20", "3"}) == "123");    // a 3-ary node, zero new tokenizer cost
-    REQUIRE(r.run("add",  {"100", "20"}) == "120");         // built-ins still work
+    REQUIRE(r.run("math", {"100", "+", "20"}) == "120");    // built-ins still work
 }
 
 // The PRODUCTION region-frame callback (node_frame.hpp): the TOK_TURN-delimited `[op <name> ...]` region the
@@ -72,13 +70,13 @@ TEST_CASE("nodes: registry is extensible -- a new node is one register_node call
 TEST_CASE("nodes: region-frame compute callback dispatches TOK_TURN op-regions", "[nodes]") {
     const auto compute = nd::make_compute_callback(nd::builtin());
 
-    // Operands inside the region (self-contained tool-call).
-    REQUIRE(str_of(compute(ctx_of("[op add 12 34]"))) == "[46]");
+    // A whole expression inside the region (self-contained tool-call), and a selection op.
+    REQUIRE(str_of(compute(ctx_of("[op math 12+34]"))) == "[46]");
     REQUIRE(str_of(compute(ctx_of("[op max 5 900]"))) == "[900]");
-    // Operands read from the preceding inline expression (region names only the op).
-    REQUIRE(str_of(compute(ctx_of("100+20=[op add]"))) == "[120]");
+    // Expression read from the preceding posed one (region names only the op).
+    REQUIRE(str_of(compute(ctx_of("100+20=[op math]"))) == "[120]");
     // Big numbers stay exact end to end.
-    REQUIRE(str_of(compute(ctx_of("[op add 999999999999 1]"))) == "[1000000000000]");
+    REQUIRE(str_of(compute(ctx_of("[op math 999999999999+1]"))) == "[1000000000000]");
 
     // The general `math` node: a WHOLE expression in one frame (operators survive the region parse),
     // precedence + parens handled by the node -- the model just copies the expression it is reasoning about.

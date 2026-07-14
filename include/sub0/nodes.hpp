@@ -179,19 +179,19 @@ private:
     std::map<std::string, NodeFn> map_;
 };
 
-// The built-in exact nodes (binary arithmetic + comparison, matching the spikes). Extend with an exprtk
-// numeric-expression node and a SymEngine symbolic node (solve/simplify) -- same registry (see the doc).
+// The built-in nodes. `math` is THE arithmetic op -- one general expression evaluator (precedence, parens,
+// exact big-int) supersedes the per-op add/sub/mul/div FRAMES, so those are not registered as dispatch nodes
+// (they remain this file's internal primitives that `eval_expr` runs on). `max`/`min` are selection ops
+// `math` does not express, so they stay. Extend with a SymEngine symbolic node (solve/simplify) -- same
+// registry (see docs/DETERMINISTIC_MECHANISMS.md).
 inline Registry builtin() {
     Registry r;
-    r.register_node("add", [](const std::vector<std::string>& o) { return o.size() >= 2 ? add(o[0], o[1]) : std::string{}; });
-    r.register_node("sub", [](const std::vector<std::string>& o) { return o.size() >= 2 ? sub(o[0], o[1]) : std::string{}; });
-    r.register_node("mul", [](const std::vector<std::string>& o) { return o.size() >= 2 ? mul(o[0], o[1]) : std::string{}; });
-    r.register_node("div", [](const std::vector<std::string>& o) { return o.size() >= 2 ? div(o[0], o[1]) : std::string{}; });
+    // The general expression node: operands are the lexed expression tokens (numbers + operators), evaluated
+    // with full precedence -- `[op math 6 + 8 * 10 - 5]` -> 81 in ONE frame. The model copies the expression
+    // it is reasoning about; the node does the parsing/precedence/arithmetic.
+    r.register_node("math", [](const std::vector<std::string>& o) { return eval_expr(o); });
     r.register_node("max", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) >= 0 ? o[0] : o[1]) : std::string{}; });
     r.register_node("min", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) <= 0 ? o[0] : o[1]) : std::string{}; });
-    // The general expression node: operands are the lexed tokens (numbers + operators), evaluated with full
-    // precedence -- `[op math 6 + 8 * 10 - 5]` -> 81 in ONE frame (add/sub/mul/div stay as its primitives).
-    r.register_node("math", [](const std::vector<std::string>& o) { return eval_expr(o); });
     return r;
 }
 

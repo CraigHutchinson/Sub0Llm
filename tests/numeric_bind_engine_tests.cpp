@@ -106,7 +106,7 @@ Pool build_pool(std::mt19937_64& rng, int n_tasks, bool delegate) {
 
         emit(SLOT0, 0); emit('+', 0); emit(SLOT1, 0); emit('=', 0);      // the algebraic query over symbols
         if (delegate) {
-            for (int id : nd::op_header("add")) emit(id, 1);            // GRADED: `[op add]` (the routing)
+            for (int id : nd::op_header("math")) emit(id, 1);           // GRADED: `[op math]` (the routing)
             emit(nd::FRAME_OPEN, 0);
             for (int id : digits_of(t.sum)) emit(id, 0);               // masked: the baked exact result
             emit(nd::FRAME_CLOSE, 0);
@@ -158,20 +158,23 @@ TEST_CASE("numeric bind: the node dereferences bound slots (not inline digits) a
     const sub0::ScratchBindings* active = &binds;
     const auto compute = sub0::bind::make_bind_compute_callback(nd::builtin(), &active);
 
-    // `S0 + S1 = [op add]` -- operands are the SLOTS, whose digits appear NOWHERE in the token stream.
-    std::vector<int> ctx = { SLOT0, '+', SLOT1, '=' };
-    for (int id : nd::op_header("add")) ctx.push_back(id);
+    // `[op math S0+S1]` -- the bound slots are NAMED in the expression; the node substitutes their values
+    // (123, 456) which appear NOWHERE in the token stream, then evaluates. -> [579].
+    std::vector<int> ctx = { nd::FRAME_OPEN };
+    for (char c : std::string("op math ")) ctx.push_back(static_cast<unsigned char>(c));
+    ctx.push_back(SLOT0); ctx.push_back('+'); ctx.push_back(SLOT1);
+    ctx.push_back(nd::FRAME_CLOSE);
     const std::vector<int> inj = compute(ctx);
-    // injected `[579]`  (123 + 456), reconstructed purely from the bindings.
-    std::vector<int> want = { nd::FRAME_OPEN, '5', '7', '9', nd::FRAME_CLOSE };
+    const std::vector<int> want = { nd::FRAME_OPEN, '5', '7', '9', nd::FRAME_CLOSE };
     REQUIRE(inj == want);
 
-    // A different op over the same bindings (extensibility): max -> 456.
-    std::vector<int> ctx2 = { SLOT0, '+', SLOT1, '=' };
-    for (int id : nd::op_header("max")) ctx2.push_back(id);
+    // A different op over the same bound slots (extensibility): `[op max S0 S1]` -> 456.
+    std::vector<int> ctx2 = { nd::FRAME_OPEN };
+    for (char c : std::string("op max ")) ctx2.push_back(static_cast<unsigned char>(c));
+    ctx2.push_back(SLOT0); ctx2.push_back(' '); ctx2.push_back(SLOT1);
+    ctx2.push_back(nd::FRAME_CLOSE);
     REQUIRE(sub0::bind::slot_value(binds, SLOT1) == "456");
-    const std::vector<int> inj2 = compute(ctx2);
-    REQUIRE(extract(inj2) == "456");
+    REQUIRE(extract(compute(ctx2)) == "456");
 }
 
 // ---- End-to-end A/B: delegation over bound symbols reaches 1.000; fuzzy (no node) is ~0 -----------------
