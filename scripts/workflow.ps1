@@ -54,11 +54,16 @@
 
 .EXAMPLE
   python scripts/get_gsm8k.py                       # -> data/gsm8k.txt
-  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -OpMix 0.5 -Gsm8k data/gsm8k.txt -Steps 4000
-  GSM8K math workflow: base corpus = GSM8K (reasoning fluency); -Gsm8k converts GSM8K's OWN <<expr=result>>
-  annotations to delegated [op math] frames as the op source, blended at -OpMix 0.5 -- so the model routes
-  GSM8K's arithmetic to the exact node instead of learning it. (Omit -Gsm8k for the synthetic curriculum.)
-  Score with `out/build/gsm8k/sub0llm.exe eval <model>/model.bin`.
+  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -Gsm8k data/gsm8k.txt -OpMix 0.8 -Batch 256 -Steps 2000
+  GSM8K math workflow. -Gsm8k converts GSM8K's OWN <<expr=result>> annotations to delegated [op math] frames
+  (the model routes GSM8K's arithmetic to the exact node instead of learning it). Notes from a real run:
+    * -OpMix HIGH (0.8): the base corpus (plain GSM8K) still shows the raw arithmetic as text, which FIGHTS
+      delegation -- a high op-mix makes the delegated version dominate. (Cleaner still: a NON-math base +
+      -Gsm8k, so nothing teaches inline arithmetic.)
+    * -Batch pinned: the GPU auto-batch over-shoots VRAM on small auto-sized models (crashes) -- pin it.
+  Verify by GENERATING on a GSM8K-style prompt (the training format), e.g.
+  `sub0llm-gen.exe <model> "Natalia sold 48/2 = "` -> emits [op math], node injects 24. (`sub0llm eval`
+  scores the SYNTHETIC format, which won't match a GSM8K-trained model.)
 #>
 [CmdletBinding()]
 param(
@@ -67,6 +72,7 @@ param(
     [ValidateSet("AUTO", "CPU", "GPU", "HYBRID")]
     [string]$Compute   = "AUTO",
     [int]$Steps        = 0,
+    [int]$Batch        = 0,
     [double]$OpMix     = 0,
     [string]$Gsm8k     = "",
     [switch]$Tune,
@@ -151,6 +157,7 @@ Write-Host "=== train -> $ModelPath ===" -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path (Split-Path $ModelPath) | Out-Null
 $trainArgs = @()
 if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
+if ($Batch -gt 0) { $trainArgs += @("--batch", "$Batch") }   # pin the batch (the GPU auto-batch over-shoots VRAM on small models)
 if ($OpMix -gt 0) { $trainArgs += @("--op-mix", "$OpMix") }   # blend the op-delegation (math routing) curriculum
 if ($Gsm8k)       { $trainArgs += @("--gsm8k", (Resolve-Path (Join-Path $RepoRoot $Gsm8k)).Path) }  # real GSM8K as the op source
 $trainArgs += @($ModelPath, $CorpusPath)
