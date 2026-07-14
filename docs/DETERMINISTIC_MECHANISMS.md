@@ -57,13 +57,16 @@ infinite margin on a deterministic task. This is the template for everything bel
 |---|---|---|
 | 1. PROVIDE (delegate vs approximate) | `arithspike` | delegation **1.000** vs fuzzy **0.000** held-out |
 | 1b. Region frame — WORD op-names vs dedicated tokens | `nodespike` (4 ops) | **1.000 == 1.000** — words route as well as tokens, for free |
+| 2. BIND — op over bound scratch slots (algebra) | `bindspike` A/B | delegation **1.000** vs fuzzy **0.000** — model reasons over the *symbol* (digits absent from its stream), node derefs the *value* |
 | 3. FILTER — mask scalar facts vs contamination | `arithspike` filter A/B | masked clean (sampled **1.000**) vs contaminated (sampled **~0.90**, ~10% fuzzy leak) |
 | 4. COMPOSE — dynamic-turn chained reduction | `chainspike` (var. length) | trained k=2..6 **1.000**; held-out length k=7 **1.000** (k=8 only fails on context overflow) |
 
 The region-frame result validates the natural-language-marker design (§1); the filter result is nuanced
 (§3); chaining shows delegation **composes over a dynamic number of turns and length-generalises** (§4/staged
 plan). The **production node registry** (`include/sub0/nodes.hpp`) is now a first-class, tested substrate.
-Pillar 2 (numeric BIND) and the end-to-end production wiring are the remaining pieces.
+Pillar 2 (numeric BIND) is now proven too (`bindspike` — op over bound slots, node dereferences the
+bindings); the **end-to-end production wiring** (the op/compute callback + `set_scratch_bindings` in
+`gen_stage.cpp` — today it wires only spell/scratch `expand`/`combine`) is the remaining piece.
 
 ---
 
@@ -156,6 +159,24 @@ The model does **not** learn digit-arithmetic. Algebraically, `A + B = X` is tri
 because it isn't doing arithmetic — it's doing *substitution + a node call.* This also slashes context and
 KV: a 13-digit number is one token unless the model *asks* (uncombine) for the digits. Scratch tokens are a
 **super-power for scalars** precisely because they are variable-binding.
+
+**TESTED (`bindspike` A/B, committed).** The whole flow above now runs end-to-end. Operands are bound scratch
+slots — the model sees `S0 + S1 =` where each `S`ᵢ is a single `SlotEncoding::Scalar` token (magnitude only;
+the exact digits appear *nowhere* in the token stream) — emits the routing `[op add]`, and the bind-aware
+node (`bindspike.hpp`, `make_bind_compute_callback`) resolves the operands by **dereferencing the slots from
+the binding table**, returning the exact sum. d128, held-out fresh number pairs:
+
+| arm | held-out exact |
+|---|---|
+| DELEGATION (route → node derefs the bindings) | **1.000** (from step 300) |
+| FUZZY (model must produce the sum from the Scalar slots) | **0.000** (never) |
+
+The **0.000 is the proof, not a disappointment**: the model *cannot* produce the sum because the digits are
+genuinely not in its reasoning stream — so the only path to the exact answer is the node dereferencing the
+binding. Two 13-digit numbers occupy two tokens; the model reasons over the *symbol* and delegates the
+arithmetic; the value never touches its activations. This is arithspike's 1.000-vs-0.000 lifted from inline
+digits onto **algebra** — pillar 2, closed. (`bindspike` is the spike; folding the bound-slot dereference
+into `node_frame.hpp` is the productionisation step, alongside the gen wiring.)
 
 This unifies threads that looked separate: OOV compression, spelling, and numeric/symbolic computation are
 all "bind a precise thing to a symbol; expand or compute on demand." One mechanism, one set of markers.
