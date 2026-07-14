@@ -36,6 +36,22 @@ bool json_read(simdjson::ondemand::value v, double& out) {
     out = d;
     return true;
 }
+// Field-aware read: a non-int field defers to the type-dispatched json_read above; an INT field accepts
+// EITHER a number OR a named enum string (pos_encoding="rope", optimizer="muon", gated_ffn="on", ...), so a
+// named config.json AND an old numeric one both load. Peek the JSON type first (ondemand values are
+// single-consume, so we must not speculatively get_int64 then get_string).
+template <class T> bool json_read_field(simdjson::ondemand::value v, std::string_view, T& out) { return json_read(v, out); }
+inline bool json_read_field(simdjson::ondemand::value v, std::string_view field, int& out) {
+    simdjson::ondemand::json_type t;
+    if (v.type().get(t)) return false;
+    if (t == simdjson::ondemand::json_type::number) return json_read(v, out);
+    if (t == simdjson::ondemand::json_type::string) {
+        std::string_view sv;
+        if (v.get_string().get(sv)) return false;
+        return sub0::registry::detail::enum_parse(field, sv, out);
+    }
+    return false;
+}
 }  // namespace
 
 bool read_config_json(RunConfig& c, const std::filesystem::path& dir) {
@@ -52,7 +68,7 @@ bool read_config_json(RunConfig& c, const std::filesystem::path& dir) {
         std::string_view key;
         if (field.unescaped_key().get(key)) continue;   // a malformed key: skip this field, keep going
 #define SUB0_RUN_CONFIG_READ(type, name, def) \
-        if (key == #name) { json_read(field.value(), c.name); continue; }
+        if (key == #name) { json_read_field(field.value(), #name, c.name); continue; }
         SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_READ)
 #undef SUB0_RUN_CONFIG_READ
         // An unrecognized key (a field from a future version of this schema, or a stray edit) is

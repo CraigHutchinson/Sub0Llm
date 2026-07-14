@@ -60,6 +60,30 @@ TEST_CASE("RunConfig: write_config_json/read_config_json round-trips every field
     CHECK(r.seed == c.seed);
 }
 
+TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still reads (back-compat)", "[registry][run_config]") {
+    ScratchDir scratch;
+    RunConfig c;
+    c.d_model = 512; c.pos_encoding = 1; c.optimizer = 1; c.gated_ffn = 1; c.tied_embeddings = 0; c.qk_norm = 1; c.ternary = 0;
+    sub0::registry::write_config_json(c, scratch.path);
+
+    // The written file uses readable names for the enum fields, plain numbers for the rest.
+    std::string text;
+    { std::ifstream is(scratch.path / "config.json"); text.assign(std::istreambuf_iterator<char>(is), {}); }
+    CHECK(text.find("\"pos_encoding\": \"rope\"")    != std::string::npos);
+    CHECK(text.find("\"optimizer\": \"muon\"")       != std::string::npos);
+    CHECK(text.find("\"gated_ffn\": \"on\"")         != std::string::npos);
+    CHECK(text.find("\"tied_embeddings\": \"off\"")  != std::string::npos);
+    CHECK(text.find("\"qk_norm\": \"on\"")           != std::string::npos);
+    CHECK(text.find("\"d_model\": 512")              != std::string::npos);   // numeric field unchanged
+
+    // A hand-written OLD-STYLE numeric config.json still loads (the reader accepts either form).
+    { std::ofstream os(scratch.path / "config.json");
+      os << "{\n  \"pos_encoding\": 1,\n  \"optimizer\": 1,\n  \"gated_ffn\": 0,\n  \"qk_norm\": 1,\n  \"d_model\": 448\n}\n"; }
+    RunConfig r;
+    REQUIRE(sub0::registry::read_config_json(r, scratch.path));
+    CHECK(r.pos_encoding == 1); CHECK(r.optimizer == 1); CHECK(r.gated_ffn == 0); CHECK(r.qk_norm == 1); CHECK(r.d_model == 448);
+}
+
 TEST_CASE("RunConfig: read_config_json returns false for a missing file, doesn't crash", "[registry][run_config]") {
     ScratchDir scratch;   // never written to -- no config.json exists in it
     RunConfig r;

@@ -144,6 +144,29 @@ inline void json_write(std::ostream& os, const std::string& v) {
 inline void json_write(std::ostream& os, int v)      { os << v; }
 inline void json_write(std::ostream& os, unsigned v) { os << v; }
 inline void json_write(std::ostream& os, double v)   { os << v; }
+
+// The enum-valued RunConfig fields print as NAMES (pos_encoding=rope, optimizer=muon, gated_ffn=on, ...)
+// for readability; every other field stays numeric. The int<->name mapping lives HERE only; the reader
+// (run_config.cpp) accepts EITHER form so old numeric config.json files still load. enum_name returns null
+// for a non-enum field or an out-of-range value (-> numeric fallback).
+inline const char* enum_name(std::string_view field, int v) {
+    auto nth = [v](std::initializer_list<const char*> names) -> const char* {
+        int i = 0; for (const char* n : names) if (i++ == v) return n; return nullptr; };
+    if (field == "pos_encoding") return nth({"learned", "rope"});
+    if (field == "optimizer")    return nth({"adamw", "muon"});
+    if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary")
+        return nth({"off", "on"});
+    return nullptr;
+}
+inline bool enum_parse(std::string_view field, std::string_view s, int& out) {
+    for (int v = 0;; ++v) { const char* n = enum_name(field, v); if (!n) return false; if (s == n) { out = v; return true; } }
+}
+// Field-aware write: an enum field emits its name (quoted string); everything else is numeric/string as-is.
+template <class T> void json_write_field(std::ostream& os, std::string_view, const T& v) { json_write(os, v); }
+inline void json_write_field(std::ostream& os, std::string_view field, int v) {
+    if (const char* nm = enum_name(field, v)) json_write(os, std::string(nm));
+    else json_write(os, v);
+}
 }  // namespace detail
 
 // Writes <dir>/config.json, one field per SUB0_RUN_CONFIG_FIELDS row -- see RunConfig's own doc
@@ -156,7 +179,7 @@ inline void write_config_json(const RunConfig& c, const std::filesystem::path& d
     os << "{\n";
     bool first = true;
 #define SUB0_RUN_CONFIG_WRITE(type, name, def) \
-    os << (first ? "" : ",\n") << "  \"" #name "\": "; detail::json_write(os, c.name); first = false;
+    os << (first ? "" : ",\n") << "  \"" #name "\": "; detail::json_write_field(os, #name, c.name); first = false;
     SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_WRITE)
 #undef SUB0_RUN_CONFIG_WRITE
     os << "\n}\n";
