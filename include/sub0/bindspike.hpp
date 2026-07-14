@@ -29,33 +29,16 @@ inline std::string slot_value(const ScratchBindings& b, int slot_id) {
 
 // A kv_decode_generate `compute` callback whose operands are the BOUND SLOTS in the preceding context,
 // dereferenced through the active bindings (`*binds`). `binds` is a pointer-to-pointer so the caller can
-// re-point it at each context's bindings without rebuilding the callback. Fires on TOK_TURN_END; on a
-// non-op region (or the injected result region) it is inert. Falls back to inline digits when no bound slot
-// precedes the op (so it degrades to node_frame's behaviour for a plain `A + B =`).
+// re-point it at each context's bindings without rebuilding the callback. Thin wrapper over the unified
+// production callback (node_frame::make_compute_callback), supplying a slot->value dereference over the
+// ScratchBindings; the frame parse / inline-digit fallback / inertness all live in that one place.
 inline std::function<std::vector<int>(const std::vector<int>&)>
 make_bind_compute_callback(nodes::Registry reg, const ScratchBindings* const* binds) {
-    return [reg = std::move(reg), binds](const std::vector<int>& ctx) -> std::vector<int> {
-        const int close = static_cast<int>(ctx.size()) - 1;                    // the TOK_TURN_END just fed
-        int open = -1;
-        for (int i = close - 1; i >= 0; --i) if (ctx[i] == nodes::FRAME_OPEN) { open = i; break; }
-        if (open < 0) return {};
-        const nodes::WordsNums in = nodes::scan_region(ctx, open + 1, close);
-        if (in.words.size() < 2 || in.words[0] != "op") return {};             // not an OP region -> inert
-
-        std::vector<std::string> operands;
+    auto deref = [binds](int slot_id) -> std::string {
         const ScratchBindings* b = binds ? *binds : nullptr;
-        if (b)                                                                 // dereference the bound slots in scope
-            for (int i = 0; i < open; ++i)
-                if (is_scratch_slot(ctx[i]) && b->bound(ctx[i])) operands.push_back(slot_value(*b, ctx[i]));
-        if (operands.empty()) operands = nodes::scan_region(ctx, 0, open).nums; // fallback: inline digits
-
-        const std::string res = reg.run(in.words[1], operands);
-        if (res.empty()) return {};
-        std::vector<int> out; out.push_back(nodes::FRAME_OPEN);
-        for (char c : res) out.push_back(static_cast<unsigned char>(c));
-        out.push_back(nodes::FRAME_CLOSE);
-        return out;
+        return (b && b->bound(slot_id)) ? slot_value(*b, slot_id) : std::string{};
     };
+    return nodes::make_compute_callback(std::move(reg), std::move(deref));
 }
 
 }  // namespace sub0::bind

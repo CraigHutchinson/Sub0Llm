@@ -49,6 +49,17 @@ struct ScratchTable {
         return ScratchBindings{ std::span<const std::vector<int>>(bindings), enc };
     }
 
+    // The value a bound scratch slot holds, as the string its fragments spell (empty if the slot is unbound
+    // or out of range). For the op interceptor's numeric-BIND dereference: `[op add S0 S1]` reads its
+    // operands from the bindings, not the token stream.
+    std::string value(int slot) const {
+        const int i = slot - SCRATCH_SLOT_BASE;
+        if (i < 0 || i >= static_cast<int>(bindings.size()) || bindings[static_cast<std::size_t>(i)].empty()) return {};
+        std::string s;
+        for (int f : bindings[static_cast<std::size_t>(i)]) if (f >= 0 && f < 128) s.push_back(static_cast<char>(f));
+        return s;
+    }
+
     // Fulfil a TOK_UNCOMBINE: a scratch slot -> its bound fragments; a vocab word -> its expansion;
     // anything else -> identity (a bare byte/marker expands to itself).
     std::vector<int> expand(int token) const {

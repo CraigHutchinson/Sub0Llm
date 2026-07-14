@@ -15,7 +15,8 @@
 #pragma once
 
 #include "sub0/nodes.hpp"
-#include "sub0/casing.hpp"   // TOK_TURN_START / TOK_TURN_END
+#include "sub0/casing.hpp"         // TOK_TURN_START / TOK_TURN_END
+#include "sub0/scratch_slots.hpp"  // is_scratch_slot -- bound-slot operand dereference (numeric BIND)
 
 #include <functional>
 #include <string>
@@ -42,16 +43,27 @@ inline WordsNums scan_region(const std::vector<int>& ctx, int lo, int hi) {
 }
 
 // A kv_decode_generate `compute` callback bound to `reg` (copied in -> self-contained). Fires on TOK_TURN_END.
-inline std::function<std::vector<int>(const std::vector<int>&)> make_compute_callback(Registry reg) {
-    return [reg = std::move(reg)](const std::vector<int>& ctx) -> std::vector<int> {
+// Optional `slot_deref` resolves a bound scratch-slot id to the value string it holds (numeric BIND): when
+// given, operands are the bound slots in scope (algebra over symbols), and it falls back to inline digits so a
+// plain `A + B =` still works. Without it, behaviour is the original inline-digit form. slot_deref returns ""
+// for an unbound slot (skipped). This is the single production op-dispatch home (bindspike.hpp wraps it).
+inline std::function<std::vector<int>(const std::vector<int>&)>
+make_compute_callback(Registry reg, std::function<std::string(int)> slot_deref = {}) {
+    return [reg = std::move(reg), slot_deref = std::move(slot_deref)](const std::vector<int>& ctx) -> std::vector<int> {
         const int close = static_cast<int>(ctx.size()) - 1;                 // the TOK_TURN_END just fed
         int open = -1;
         for (int i = close - 1; i >= 0; --i) if (ctx[i] == FRAME_OPEN) { open = i; break; }
         if (open < 0) return {};
         const WordsNums in = scan_region(ctx, open + 1, close);
         if (in.words.size() < 2 || in.words[0] != "op") return {};          // not an OP region -> inert
-        std::vector<std::string> operands = in.nums;                        // in-region operands...
-        if (operands.empty()) operands = scan_region(ctx, 0, open).nums;    // ...else the preceding inline expr
+        std::vector<std::string> operands;
+        if (slot_deref)                                                     // BIND: dereference bound slots in scope
+            for (int i = 0; i < open; ++i)
+                if (is_scratch_slot(ctx[i])) { std::string v = slot_deref(ctx[i]); if (!v.empty()) operands.push_back(std::move(v)); }
+        if (operands.empty()) {                                             // inline: in-region nums, else preceding expr
+            operands = in.nums;
+            if (operands.empty()) operands = scan_region(ctx, 0, open).nums;
+        }
         const std::string res = reg.run(in.words[1], operands);
         if (res.empty()) return {};                                         // unknown op / bad operands -> inert
         std::vector<int> out; out.push_back(FRAME_OPEN);

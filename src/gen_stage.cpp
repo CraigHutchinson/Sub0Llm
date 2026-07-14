@@ -9,6 +9,7 @@
 #include "sub0/registry.hpp"    // read_config_json: is this model trained with the uncombine curriculum?
 #include "sub0/tokenizer.hpp"   // raw sub0::tok::Tokenizer for the uncombine/combine interceptor callbacks
 #include "sub0/scratch.hpp"     // ScratchTable: binding table backing both spell + scratch resolution
+#include "sub0/node_frame.hpp"  // op frame: dispatch deterministic compute nodes through the TOK_TURN region
 
 #include <algorithm>
 #include <array>
@@ -71,6 +72,13 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     sub0::ScratchTable   scratch;
     std::function<std::vector<int>(int)>                       expand;
     std::function<std::vector<int>(const std::vector<int>&)>   combine;
+    // Op frame (deterministic compute nodes dispatched through the TOK_TURN region, node_frame.hpp). The
+    // callback is INERT for any turn that is not `[op <name> ...]` (a normal chat/role turn scans and
+    // returns nothing), so it is safe to enable alongside the interceptor with no extra recipe flag -- it
+    // only ever fires for a model that emits the op role. Its slot dereference reads operands from the
+    // ScratchTable bindings (numeric BIND: `[op add S0 S1]` resolves the bound slots), and falls back to
+    // inline digits (`A + B =`). Like the interceptor, it forces the CPU KV-cache decode.
+    std::function<std::vector<int>(const std::vector<int>&)>   compute;
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
@@ -83,7 +91,9 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                 scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
                 expand  = [&scratch](int token) { return scratch.expand(token); };
                 combine = [&scratch](const std::vector<int>& frags) { return scratch.combine(frags); };
-                std::println(stderr, "gen: combine/uncombine interceptor enabled "
+                compute = sub0::nodes::make_compute_callback(
+                    sub0::nodes::builtin(), [&scratch](int slot) { return scratch.value(slot); });
+                std::println(stderr, "gen: combine/uncombine + op interceptor enabled "
                                      "(spell-mix {:.2f}, scratch-mix {:.2f})", cfg.spell_mix, cfg.scratch_mix);
             }
         }
@@ -99,11 +109,13 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     if constexpr (!USE_TERNARY) {
         if (static_cast<int>(ctx.size()) + n <= SEQ_LEN) {
             sub0::DecodeSession sess;
-            const bool gpu = sess.use_gpu && !spell_enabled;   // interceptor is CPU-only for now
+            const bool intercept = spell_enabled || static_cast<bool>(compute);
+            const bool gpu = sess.use_gpu && !intercept;   // interceptor + op dispatch are CPU-only for now
             std::println(stderr, "gen: decode backend {}{}",
                         gpu ? "GPU (device KV-cache)" : "CPU (KV-cache)",
-                        spell_enabled ? " + uncombine interceptor" : "");
-            sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine);
+                        intercept ? " + uncombine/op interceptor" : "");
+            sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine,
+                                     compute, sub0::nodes::FRAME_CLOSE);
             std::println("{}", sub0::detokenize(ctx));
             return 0;
         }
