@@ -42,16 +42,33 @@ inline WordsNums scan_region(const std::vector<int>& ctx, int lo, int hi) {
     return w;
 }
 
+// A bracket-glue marker's literal byte (the Unigram tokenizer emits these instead of a glued `(`/`[`/`{` and
+// their closers), else 0. So `region_expr` reconstructs parenthesised expressions the tokenizer collapsed.
+inline char glue_bracket_byte(int t) {
+    switch (t) {
+        case casing::TOK_GLUE_OPAREN:   return '(';
+        case casing::TOK_GLUE_CPAREN:   return ')';
+        case casing::TOK_GLUE_OBRACKET: return '[';
+        case casing::TOK_GLUE_CBRACKET: return ']';
+        case casing::TOK_GLUE_OBRACE:   return '{';
+        case casing::TOK_GLUE_CBRACE:   return '}';
+        default:                        return 0;
+    }
+}
+
 // Render token span [lo,hi) as an expression string: ASCII bytes verbatim, each BOUND scratch slot
 // SUBSTITUTED with the value string it holds (numeric BIND -- the slot's digits enter the expression, so
-// `[op math S0+S1]` and `S0 + S1 = [op math]` both work). Unbound slots and non-ASCII tokens are skipped.
+// `[op math S0+S1]` and `S0 + S1 = [op math]` both work), glue-bracket markers restored to their byte. Every
+// other marker -- crucially the JOIN glue the Unigram tokenizer sprinkles between adjacent digit/operator
+// byte tokens -- is DROPPED, so `3<JOIN>7<JOIN>*<JOIN>5` reconstructs as `37*5`.
 inline std::string region_expr(const std::vector<int>& ctx, int lo, int hi,
                                const std::function<std::string(int)>& slot_deref) {
     std::string s;
     for (int i = lo; i < hi; ++i) {
         const int t = ctx[i];
-        if (slot_deref && is_scratch_slot(t)) s += slot_deref(t);
-        else if (t >= 0 && t < 128)          s.push_back(static_cast<char>(t));
+        if (slot_deref && is_scratch_slot(t)) { s += slot_deref(t); continue; }
+        if (t >= 0 && t < 128) { s.push_back(static_cast<char>(t)); continue; }
+        if (const char b = glue_bracket_byte(t)) s.push_back(b);   // else: JOIN / word-piece / marker -> drop
     }
     return s;
 }
@@ -65,7 +82,9 @@ inline std::vector<std::string> preceding_expr(const std::vector<int>& ctx, int 
                                                const std::function<std::string(int)>& slot_deref) {
     auto is_expr = [&](int t) {
         return (t >= '0' && t <= '9') || t == '+' || t == '-' || t == '*' || t == '/' || t == '^'
-            || t == '(' || t == ')' || t == '=' || t == ' ' || t == '\t' || is_scratch_slot(t);
+            || t == '(' || t == ')' || t == '=' || t == ' ' || t == '\t' || is_scratch_slot(t)
+            || t == casing::TOK_JOIN                                    // glue between adjacent expr byte tokens
+            || (t >= casing::TOK_GLUE_OPAREN && t <= casing::TOK_GLUE_CBRACE);   // glued brackets
     };
     int lo = open;
     while (lo > 0 && is_expr(ctx[lo - 1])) --lo;
