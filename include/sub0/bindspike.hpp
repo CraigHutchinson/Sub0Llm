@@ -41,4 +41,31 @@ make_bind_compute_callback(nodes::Registry reg, const ScratchBindings* const* bi
     return nodes::make_compute_callback(std::move(reg), std::move(deref));
 }
 
+// COLLAPSE (the result-side of BIND): a `compute` callback that resolves the op, then binds the exact result
+// to the next scratch slot and injects THAT ONE TOKEN instead of the result's digits. So a chained
+// computation refers to the previous result as a single symbol (`S0 - C`), turning the multi-digit
+// chaining-copy (the wall) into a one-token copy -- and the value stays exact in the binding for the node to
+// dereference. `slots` is the growing value table (slots[i] = value of SCRATCH_SLOT_BASE+i); it is BOTH the
+// dereference source (so `S0` in a later expression resolves) and where each new result is appended.
+// Falls back to the plain digit injection when the pool is full. (Spike: the production form binds into the
+// stateful gen ScratchTable and set_scratch_bindings for the Scalar embedding.)
+inline std::function<std::vector<int>(const std::vector<int>&)>
+make_collapse_callback(nodes::Registry reg, std::vector<std::string>* slots) {
+    auto deref = [slots](int slot_id) -> std::string {
+        const int i = slot_id - SCRATCH_SLOT_BASE;
+        return (slots && i >= 0 && i < static_cast<int>(slots->size())) ? (*slots)[static_cast<std::size_t>(i)] : std::string{};
+    };
+    auto inner = nodes::make_compute_callback(std::move(reg), deref);
+    return [inner = std::move(inner), slots](const std::vector<int>& ctx) -> std::vector<int> {
+        const std::vector<int> r = inner(ctx);                 // [FRAME_OPEN <result> FRAME_CLOSE] or {}
+        if (r.empty()) return r;
+        std::string val;                                       // the result value (may be signed)
+        for (int t : r) if (t != nodes::FRAME_OPEN && t != nodes::FRAME_CLOSE) val.push_back(static_cast<char>(t));
+        const int idx = static_cast<int>(slots->size());
+        if (val.empty() || idx >= SCRATCH_SLOT_COUNT) return r;   // pool full / bad -> plain digit injection
+        slots->push_back(val);
+        return { SCRATCH_SLOT_BASE + idx };                    // COLLAPSE: inject the single bound-slot token
+    };
+}
+
 }  // namespace sub0::bind

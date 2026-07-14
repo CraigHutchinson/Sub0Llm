@@ -177,6 +177,31 @@ TEST_CASE("numeric bind: the node dereferences bound slots (not inline digits) a
     REQUIRE(extract(compute(ctx2)) == "456");
 }
 
+// ---- Collapse: an op result binds to a slot; a CHAINED op references it as one symbol (no copy) ----------
+TEST_CASE("collapse: a result collapses to a slot; the next op derefs it (multi-step without the copy wall)",
+          "[nodecollapse]") {
+    std::vector<std::string> slots;
+    const auto cb = sub0::bind::make_collapse_callback(nd::builtin(), &slots);
+
+    // Step 1: `12+34 = [op math]` -> resolves 46, COLLAPSES it to slot S0 (one token, not the digits).
+    std::vector<int> ctx;
+    for (char c : std::string("12+34=")) ctx.push_back(static_cast<unsigned char>(c));
+    for (int t : nd::op_header("math")) ctx.push_back(t);
+    const std::vector<int> r1 = cb(ctx);
+    REQUIRE(r1 == std::vector<int>{ SLOT0 });
+    REQUIRE(slots == std::vector<std::string>{ "46" });
+    ctx.insert(ctx.end(), r1.begin(), r1.end());                 // simulate the injection into the stream
+
+    // Step 2: `S0 - 20 = [op math]` -- refers to the PREVIOUS result as ONE symbol S0 (a one-token copy, not
+    // a multi-digit copy). The node substitutes S0 -> 46, evaluates 46-20, and collapses 26 to S1.
+    ctx.push_back('-');
+    for (char c : std::string("20=")) ctx.push_back(static_cast<unsigned char>(c));
+    for (int t : nd::op_header("math")) ctx.push_back(t);
+    const std::vector<int> r2 = cb(ctx);
+    REQUIRE(r2 == std::vector<int>{ SLOT1 });
+    REQUIRE(slots == std::vector<std::string>{ "46", "26" });    // (12+34)-20 = 26, chained through the slot
+}
+
 // ---- End-to-end A/B: delegation over bound symbols reaches 1.000; fuzzy (no node) is ~0 -----------------
 TEST_CASE("numeric bind A/B: op over bound slots is exact; the model alone cannot (pillar 2)", "[.numericbind]") {
     const auto train_eval = [](std::string& report, const char* name, bool delegate) {
