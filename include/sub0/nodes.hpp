@@ -53,6 +53,35 @@ inline std::string sub(const std::string& a, const std::string& b) {   // |a-b|,
     std::reverse(r.begin(), r.end());
     return r;
 }
+// Strip leading zeros to the canonical form cmp() uses ("0" for all-zero).
+inline std::string norm(const std::string& a) {
+    const std::size_t i = a.find_first_not_of('0');
+    return (i == std::string::npos) ? "0" : a.substr(i);
+}
+inline std::string mul(const std::string& a, const std::string& b) {   // schoolbook long multiplication
+    if (a == "0" || b == "0" || a.empty() || b.empty()) return "0";
+    std::vector<int> p(a.size() + b.size(), 0);
+    for (int i = static_cast<int>(a.size()) - 1; i >= 0; --i)
+        for (int j = static_cast<int>(b.size()) - 1; j >= 0; --j) {
+            const int s = (a[i] - '0') * (b[j] - '0') + p[i + j + 1];
+            p[i + j + 1] = s % 10; p[i + j] += s / 10;
+        }
+    std::string r; for (int d : p) { if (r.empty() && d == 0) continue; r.push_back(static_cast<char>('0' + d)); }
+    return r.empty() ? "0" : r;
+}
+inline std::string div(const std::string& a, const std::string& b) {   // a/b, EXACT integer only -> "" otherwise
+    if (cmp(b, "0") == 0) return {};                                    // division by zero: node declines
+    std::string q, cur = "0";
+    for (char c : a) {
+        cur = norm(cur + c);                                            // bring down the next digit
+        int d = 0;
+        for (int t = 9; t >= 1; --t) if (cmp(mul(b, std::string(1, static_cast<char>('0' + t))), cur) <= 0) { d = t; break; }
+        q.push_back(static_cast<char>('0' + d));
+        cur = sub(cur, mul(b, std::string(1, static_cast<char>('0' + d))));
+    }
+    if (cmp(cur, "0") != 0) return {};                                 // non-zero remainder -> not exact, decline
+    return norm(q);
+}
 
 // --- The registry --------------------------------------------------------------------------------------
 // A node maps operand strings -> an exact result string. N-ary (a vector), so it generalises past binary ops
@@ -80,6 +109,8 @@ inline Registry builtin() {
     Registry r;
     r.register_node("add", [](const std::vector<std::string>& o) { return o.size() >= 2 ? add(o[0], o[1]) : std::string{}; });
     r.register_node("sub", [](const std::vector<std::string>& o) { return o.size() >= 2 ? sub(o[0], o[1]) : std::string{}; });
+    r.register_node("mul", [](const std::vector<std::string>& o) { return o.size() >= 2 ? mul(o[0], o[1]) : std::string{}; });
+    r.register_node("div", [](const std::vector<std::string>& o) { return o.size() >= 2 ? div(o[0], o[1]) : std::string{}; });
     r.register_node("max", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) >= 0 ? o[0] : o[1]) : std::string{}; });
     r.register_node("min", [](const std::vector<std::string>& o) { return o.size() >= 2 ? (cmp(o[0], o[1]) <= 0 ? o[0] : o[1]) : std::string{}; });
     return r;
