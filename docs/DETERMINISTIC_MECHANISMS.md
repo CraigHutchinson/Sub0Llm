@@ -82,6 +82,15 @@ lets the node read the expression already posed in the prose (`… 12+34 = [op m
 well-formed-math task affords. (Overtraining degrades this toy task past the early peak; a recipe-tuning item,
 not a mechanism one.)
 
+**Multi-step chaining — COLLAPSE decisively beats digit-copy (`[.chaincapstone]`, 1.000 vs 0.095).** Chaining
+`R2 = 7 + (A+B)` forces step 2 to *reference* the intermediate. If the intermediate stays as **digits** the
+model must copy into `7+R1`, a tiny model fails (best exact **0.095** — the copy wall again). If instead the
+result is **collapsed to a scratch-slot symbol** (`make_collapse_callback`: bind the exact value to a slot,
+inject that one token; the next op derefs it), the model references `7+S0` — one stable token — and chains
+**1.000, rock-stable every round, no overtraining**. This is the reusable principle, now proven twice:
+**never make the model copy a value — let it route over *symbols/context* and let the node/binding hold the
+value.** It is also the mechanism the "collapse a result to a scratch token" note (§1b) anticipated.
+
 ---
 
 ## The three pillars
