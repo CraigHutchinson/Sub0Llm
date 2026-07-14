@@ -10,6 +10,8 @@
 #include "sub0/scratch_slots.hpp"
 #include "sub0/casing.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -101,4 +103,28 @@ TEST_CASE("op_curriculum: collapse-chain examples have two frames and reference 
         ++chains;
     }
     REQUIRE(chains > 50);
+}
+
+TEST_CASE("op_curriculum: gsm8k_file_dataset converts REAL GSM8K annotations to collapsed op-frames", "[opcurric]") {
+    const auto tk = make_tok();
+    // A tiny GSM8K-format corpus: calc-annotations + <|endoftext|> separators, exactly get_gsm8k.py's shape.
+    const std::string corpus =
+        "how many?\nhe had 48/2 = <<48/2=24>> 24 left. then 48+24 = <<48+24=72>> 72 total.\n#### 72\n<|endoftext|>\n"
+        "and?\nso 3*10 = <<3*10=30>> 30 apples.\n#### 30\n<|endoftext|>\n";
+    const auto tmp = std::filesystem::temp_directory_path() / "sub0_gsm8k_curric_test.txt";
+    { std::ofstream os(tmp, std::ios::binary); os << corpus; }
+
+    const oc::Dataset ds = oc::gsm8k_file_dataset(tmp.string(), tk);
+    std::error_code ec; std::filesystem::remove(tmp, ec);
+
+    REQUIRE(ds.doc_starts.size() == 3);              // 2 problems + the leading 0
+    REQUIRE(ds.tokens.size() == ds.mask.size());
+    int frames = 0, masked = 0, slot_masked = 0;
+    for (std::size_t i = 0; i < ds.tokens.size(); ++i) {
+        if (ds.tokens[i] == cas::TOK_TURN_START) ++frames;
+        if (ds.mask[i] == 0) { ++masked; if (ds.tokens[i] == sub0::SCRATCH_SLOT_BASE) ++slot_masked; }
+    }
+    REQUIRE(frames == 3);        // 48/2, 48+24, 3*10 -> three delegated op-frames
+    REQUIRE(masked == 3);        // exactly the three collapsed results are masked
+    REQUIRE(slot_masked == 3);   // and each is the collapse SLOT (not the digits -- so no fuzzy arithmetic)
 }

@@ -26,9 +26,11 @@
 #include "sub0/nodes.hpp"          // eval / add / cmp -- exact verification
 #include "sub0/node_frame.hpp"     // op_header, FRAME markers
 #include "sub0/scratch_slots.hpp"  // SCRATCH_SLOT_BASE (the collapse slots)
+#include "sub0/gsm8k.hpp"          // build_stream: convert REAL GSM8K annotations to delegated op-frames
 #include "sub0/tokenizer.hpp"      // tok::encode (prose -> ids)
 
 #include <cstdint>
+#include <fstream>
 #include <random>
 #include <string>
 #include <string_view>
@@ -139,6 +141,35 @@ inline Dataset build_dataset(const tok::Tokenizer& tk, const Options& opt) {
     for (int i = 0; i < opt.n_examples; ++i) {
         if (u(rng) < opt.chain_frac) emit_chain(ds, tk, rng, opt.max_digits);
         else                         emit_single(ds, tk, rng, opt.max_digits);
+    }
+    return ds;
+}
+
+// Convert a REAL GSM8K corpus (get_gsm8k.py's output: <|endoftext|>-separated problems, calc-annotations
+// intact) into the delegated dataset: each `<<EXPR=R>>` becomes a graded `[op math]` with R collapsed to a
+// masked slot (via gsm8k::build_stream), so GSM8K's OWN arithmetic delegates instead of being learned as
+// text. Prose (question + reasoning) is graded. Documents that yield no verifiable op are skipped.
+inline Dataset gsm8k_file_dataset(const std::string& path, const tok::Tokenizer& tk) {
+    Dataset ds; ds.doc_starts.push_back(0);
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return ds;
+    const std::string all((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+    auto enc = [&tk](std::string_view s) { return tok::encode(tk, std::string(s)); };
+
+    const std::string sep = "<|endoftext|>";
+    for (std::size_t pos = 0; pos < all.size();) {
+        const std::size_t e = all.find(sep, pos);
+        const std::string_view doc(all.data() + pos, (e == std::string::npos ? all.size() : e) - pos);
+        if (!doc.empty()) {
+            const gsm8k::Example ex = gsm8k::build_stream(doc, enc, /*collapse=*/true);
+            if (ex.ops > 0 && !ex.tokens.empty()) {
+                ds.tokens.insert(ds.tokens.end(), ex.tokens.begin(), ex.tokens.end());
+                ds.mask.insert(ds.mask.end(), ex.mask.begin(), ex.mask.end());
+                ds.doc_starts.push_back(ds.tokens.size());
+            }
+        }
+        if (e == std::string::npos) break;
+        pos = e + sep.size();
     }
     return ds;
 }

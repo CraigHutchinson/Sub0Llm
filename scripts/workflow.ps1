@@ -54,9 +54,11 @@
 
 .EXAMPLE
   python scripts/get_gsm8k.py                       # -> data/gsm8k.txt
-  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -OpMix 0.3 -Steps 4000
-  GSM8K math workflow: configure+build for the GSM8K corpus, then train blending 30% op-delegation
-  curriculum so the model routes arithmetic to the exact node. Score with `sub0llm eval <model>/model.bin`.
+  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -OpMix 0.5 -Gsm8k data/gsm8k.txt -Steps 4000
+  GSM8K math workflow: base corpus = GSM8K (reasoning fluency); -Gsm8k converts GSM8K's OWN <<expr=result>>
+  annotations to delegated [op math] frames as the op source, blended at -OpMix 0.5 -- so the model routes
+  GSM8K's arithmetic to the exact node instead of learning it. (Omit -Gsm8k for the synthetic curriculum.)
+  Score with `out/build/gsm8k/sub0llm.exe eval <model>/model.bin`.
 #>
 [CmdletBinding()]
 param(
@@ -66,6 +68,7 @@ param(
     [string]$Compute   = "AUTO",
     [int]$Steps        = 0,
     [double]$OpMix     = 0,
+    [string]$Gsm8k     = "",
     [switch]$Tune,
     [switch]$Clean,
     [switch]$SkipConfigure,
@@ -149,6 +152,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $ModelPath) | Out-Null
 $trainArgs = @()
 if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
 if ($OpMix -gt 0) { $trainArgs += @("--op-mix", "$OpMix") }   # blend the op-delegation (math routing) curriculum
+if ($Gsm8k)       { $trainArgs += @("--gsm8k", (Resolve-Path (Join-Path $RepoRoot $Gsm8k)).Path) }  # real GSM8K as the op source
 $trainArgs += @($ModelPath, $CorpusPath)
 Invoke-Checked (Join-Path $Bin "sub0llm-train.exe") $trainArgs
 

@@ -21,7 +21,7 @@
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, float spell_mix, float scratch_mix,
-                                float op_mix);
+                                float op_mix, const char* gsm8k_path);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -59,6 +59,7 @@ inline int run_train(int argc, char** argv) {
     float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
     float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
     float train_op_mix = 0.f;      // 0 = off; >0 blends in the op-delegation (math node routing) curriculum
+    std::string train_gsm8k;       // if set (with --op-mix>0): draw the op curriculum from THIS real GSM8K file
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -100,6 +101,12 @@ inline int run_train(int argc, char** argv) {
                    "supplies the exact answer, which gen dispatches) rather than computing it -- including "
                    "multi-step chains via collapsed scratch slots. See docs/DETERMINISTIC_MECHANISMS.md.")
        ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
+    app.add_option("--gsm8k", train_gsm8k,
+                   "Path to a real GSM8K corpus (scripts/get_gsm8k.py's output). With --op-mix > 0, the op "
+                   "curriculum is drawn from THIS file -- its <<expr=result>> calc-annotations are converted "
+                   "to delegated [op math] frames (masked results) -- so GSM8K's OWN arithmetic delegates, "
+                   "instead of the synthetic generator. Omit for the synthetic curriculum.")
+       ->check(CLI::ExistingFile);
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -112,7 +119,8 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode, train_spell_mix, train_scratch_mix, train_op_mix);
+                            resume_mode, train_spell_mix, train_scratch_mix, train_op_mix,
+                            train_gsm8k.c_str());
 }
 
 // --- gen -------------------------------------------------------------------

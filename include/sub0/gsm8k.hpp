@@ -12,7 +12,8 @@
 #pragma once
 
 #include "sub0/nodes.hpp"
-#include "sub0/casing.hpp"   // TOK_TURN_START / TOK_TURN_END (the op-frame markers)
+#include "sub0/casing.hpp"        // TOK_TURN_START / TOK_TURN_END (the op-frame markers)
+#include "sub0/scratch_slots.hpp" // SCRATCH_SLOT_BASE (the collapsed-result slot)
 
 #include <functional>
 #include <string>
@@ -89,8 +90,14 @@ struct Example { std::vector<int> tokens; std::vector<std::uint8_t> mask; int op
 // tokenizer-agnostic and unit-testable (train_stage passes the real sub0::encode). GSM8K writes each
 // annotation as `EXPR = <<EXPR=R>> R`, so the R that follows the annotation is stripped from the prose (it
 // is delegated, not written): the op-frame is graded, then R is emitted once, masked.
+//
+// `collapse` (production/train use): the masked result is a single scratch SLOT token instead of R's digits,
+// matching op_curriculum + gen's collapse (gen binds the live result to the slot and expands it for display).
+// The chaining stays via the prose's literal numbers (the node reads the posed expression), so the slot is
+// only the injected-result placeholder -- one slot id suffices (the model never emits it; it is masked).
 inline Example build_stream(std::string_view sol,
-                            const std::function<std::vector<int>(std::string_view)>& encode) {
+                            const std::function<std::vector<int>(std::string_view)>& encode,
+                            bool collapse = false) {
     Example ex;
     std::vector<Segment> segs = segment(sol);
     auto emit      = [&](int t, std::uint8_t m) { ex.tokens.push_back(t); ex.mask.push_back(m); };
@@ -101,7 +108,8 @@ inline Example build_stream(std::string_view sol,
         if (!s.is_op)           { emit_text(s.text, 1); continue; }
         if (!verify(s.op))      { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
         for (int t : op_frame())   emit(t, 1);                     // GRADED: `[op math]` (route; expr is in the prose)
-        for (char c : s.op.result) emit(static_cast<unsigned char>(c), 0);   // MASKED: the node supplies it
+        if (collapse) emit(SCRATCH_SLOT_BASE, 0);                  // MASKED: collapsed-result slot
+        else for (char c : s.op.result) emit(static_cast<unsigned char>(c), 0);   // MASKED: the node's digits
         ++ex.ops;
         // Strip the redundant result GSM8K repeats right after the annotation (leading ws + R + word
         // boundary), so it is not ALSO written as graded prose.
