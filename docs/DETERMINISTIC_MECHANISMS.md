@@ -171,6 +171,36 @@ new scalar-solvable templates); (2) a **high-value external-process node** for t
 query, sandboxed like the other heavy nodes (FLINT/Pari row). For fast inline symbolic work, SymEngine
 remains the embed; Lean/mathlib is the *correctness oracle* and the proof-grade escalation, not the hot path.
 
+### 1c. Ops vs. tools — the safe, engine-embedded subset of tool-calling
+
+`math` is not the whole story: the registry is an **extensible table of operations**, and op-calling is the
+**safe, in-engine sibling of tool-calling**. Both share the *exact same model-facing mechanism* — emit a
+region-frame call, a handler runs, the result is injected (loss-masked) — so training a model to route to ops
+teaches precisely the skill that transfers to tool-use. The difference lives entirely in the **handler**, and
+it splits three ways along *purity × safety*:
+
+| Category | Examples | Purity | Training treatment | Safety |
+|---|---|---|---|---|
+| **Pure op** | math, unit convert, gcd, sort, string ops, base convert | deterministic `f(inputs)` | **bake** the result (teacher-forced, masked) — current design | always safe, even speculatively |
+| **Impure-but-safe op** | `date`, `now`, `elapsed`, RNG, **read-only** db / lookup | depends on runtime state, *no side effects* | **can't bake** → train only the *routing*, mask a placeholder, live-resolve the value | always safe |
+| **Tool** (effectful) | bash, http, db-**write**, file-write | side effects | never baked, live-only | **guarded** — authorization / sandbox / confirm |
+
+**Strategic consequence:** ops are pure-or-read-only and never touch bash/network/writes, so we can train the
+tool-use *routing* behaviour **massively and safely, entirely offline via generate-and-verify** — and it
+generalises to real, guarded tool-use. The op table is the safe training ground; a tool is the same frame with
+a safety gate bolted on. The bake/live split is already the forward/backward analysis (§A): pure → bakeable,
+impure-safe → the masking pillar handles it (mask the result, train the routing, inject live), effectful →
+out of the always-safe path.
+
+**Scope check — the substrate already supports this.** A new op is one `register_node(name, fn)` call, ZERO
+tokenizer budget (word op-name; nodespike). The `NodeFn` (`operands → result`) already covers **nullary**
+(`[op date]` → empty operands) and **variadic** ops, and the region frame carries an arbitrary op-name, so the
+heterogeneous catalog needs no mechanism change. What a fuller catalog *will* want (backlog, build when a
+consumer exists — [[only-add-arguments-we-need]]): a per-op **purity/safety tag** so the train-time baker
+knows bake vs. mask-only vs. gate, and a **tool tier** with the permission/sandbox layer for effectful calls.
+Useful near-term pure/impure-safe ops to seed the table: `date`/`now`/`elapsed`, unit + base conversion,
+`sort`/`min`/`max`/`gcd`, string ops, read-only key/db lookups.
+
 ### 2. BIND — scratch tokens as symbolic (algebraic) variables
 
 A scratch slot is **algebraic notation.** Binding a precise value to a slot lets the model reason over the
