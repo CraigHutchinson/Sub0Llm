@@ -120,6 +120,24 @@ Recommended order: (1) already have big-int add → extend to Boost.Multiprecisi
 (2) an **exprtk** numeric-expression node; (3) a **SymEngine** symbolic node. All fetch cleanly via the
 existing CPM setup. Avoid GiNaC (GPL) and be deliberate about GMP/MPFR (LGPL) given the project's licensing.
 
+**DONE — a native exact `math` expression node (commit 60cb5e9).** Rather than the model decomposing an
+expression into ordered binary op-frames and getting precedence right itself, ONE general node evaluates the
+whole thing: `[op math 6+8*10-5]` → **81** in a single frame. *Parsing + precedence is itself deterministic,
+so it belongs in the node, not the fuzzy model* — the model just copies the expression it is already reasoning
+about. `nodes.hpp`'s `eval_expr` is an **exact signed big-integer** recursive-descent evaluator (`^` right-assoc
+> `* /` > `+ -`, parens, unary ±) built on the add/sub/mul/div primitives — **no `double`**, and it declines
+(returns "") on non-exact division / div-by-zero / malformed input rather than ever emitting a wrong answer.
+The callback now passes the raw expression through (lexes the region with operators preserved). This is the
+in-house version of the exprtk row; exprtk/SymEngine remain the escalation for decimals/rationals and symbolic
+work. The per-op nodes stay as `math`'s primitives (and for the bound-slot BIND path). **Operators are single
+ANSI bytes**, so the lexer is trivial — a nice property of the byte-level tokenizer.
+
+**Follow-on — collapse a `math` result to a scratch token.** A computed result can be *bound to a scratch slot*
+(one token) instead of spilled as digits, so the model reasons over the symbol and `uncombine`s to the inner
+digits only if it actually needs them — the numeric-BIND substrate (§2) applied to *results*, not just inputs.
+Keeps the context/KV small for long chained calculations. Must be A/B-tested (does collapsing the result help
+or hurt downstream reasoning vs. leaving the digits inline). Backlog.
+
 **Complex results — a result is not always a plain decimal (exponents, powers, rationals, symbols).** `2^100`
 is 31 digits or the symbol `2^100`; `1.23e45` needs scientific form; division needs a rational; `sqrt(2)` is
 irrational. The node result type is therefore a **canonical numeric grammar** — `int | decimal | scientific
