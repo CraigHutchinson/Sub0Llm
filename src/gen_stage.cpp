@@ -79,26 +79,64 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // ScratchTable bindings (numeric BIND: `[op add S0 S1]` resolves the bound slots), and falls back to
     // inline digits (`A + B =`). Like the interceptor, it forces the CPU KV-cache decode.
     std::function<std::vector<int>(const std::vector<int>&)>   compute;
+    bool op_collapse = false;   // an --op-mix model: op results COLLAPSE to slots (expanded for display below)
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
         sub0::registry::RunConfig cfg;
-        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) &&
-            (cfg.spell_mix > 0.0 || cfg.scratch_mix > 0.0)) {
+        const bool have = !dir.empty() && sub0::registry::read_config_json(cfg, dir);
+        const bool sp_on = have && (cfg.spell_mix > 0.0 || cfg.scratch_mix > 0.0);
+        const bool op_on = have && cfg.op_mix > 0.0;
+        if (sp_on || op_on) {
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
-                scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
-                expand  = [&scratch](int token) { return scratch.expand(token); };
-                combine = [&scratch](const std::vector<int>& frags) { return scratch.combine(frags); };
-                compute = sub0::nodes::make_compute_callback(
-                    sub0::nodes::builtin(), [&scratch](int slot) { return scratch.value(slot); });
-                std::println(stderr, "gen: combine/uncombine + op interceptor enabled "
-                                     "(spell-mix {:.2f}, scratch-mix {:.2f})", cfg.spell_mix, cfg.scratch_mix);
+                if (sp_on) {
+                    scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
+                    expand  = [&scratch](int token) { return scratch.expand(token); };
+                    combine = [&scratch](const std::vector<int>& frags) { return scratch.combine(frags); };
+                }
+                // The op deref reads bound slots from the ScratchTable (numeric BIND + collapse-chain refs).
+                auto op_deref = [&scratch](int slot) { return scratch.value(slot); };
+                if (op_on) {
+                    // COLLAPSE: resolve the op, bind the exact result to the next free scratch slot, inject
+                    // that single slot token (not the digits) -- so a chained step references it as a symbol.
+                    auto inner = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
+                    compute = [&scratch, inner](const std::vector<int>& c) -> std::vector<int> {
+                        const std::vector<int> r = inner(c);
+                        if (r.empty()) return r;
+                        std::string val;
+                        for (int t : r) if (t != sub0::nodes::FRAME_OPEN && t != sub0::nodes::FRAME_CLOSE)
+                            val.push_back(static_cast<char>(t));
+                        const int idx = static_cast<int>(scratch.bindings.size());
+                        if (val.empty() || idx >= sub0::SCRATCH_SLOT_COUNT) return r;   // pool full -> digits
+                        std::vector<int> frags; for (char ch : val) frags.push_back(static_cast<unsigned char>(ch));
+                        scratch.bind(sub0::SCRATCH_SLOT_BASE + idx, std::move(frags));
+                        return { sub0::SCRATCH_SLOT_BASE + idx };
+                    };
+                    op_collapse = true;
+                } else {
+                    compute = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
+                }
+                std::println(stderr, "gen: interceptor enabled (spell-mix {:.2f}, scratch-mix {:.2f}, "
+                                     "op-mix {:.2f}{})", cfg.spell_mix, cfg.scratch_mix, cfg.op_mix,
+                             op_collapse ? ", collapse" : "");
             }
         }
     }
     const bool spell_enabled = static_cast<bool>(expand);
+    // An --op-mix model's op results are collapsed to scratch slots -- expand each bound slot back to its
+    // value digits for display (the model reasoned over the symbol; the reader wants the number).
+    auto expand_op_slots = [&scratch, op_collapse](std::vector<int>& c) {
+        if (!op_collapse) return;
+        std::vector<int> out; out.reserve(c.size());
+        for (int t : c) {
+            if (sub0::is_scratch_slot(t)) { const std::string v = scratch.value(t);
+                if (!v.empty()) { for (char ch : v) out.push_back(static_cast<unsigned char>(ch)); continue; } }
+            out.push_back(t);
+        }
+        c.swap(out);
+    };
 
     // Fast path: a KV-cache incremental decode (O(T) per token) whenever the whole context fits the
     // trained window and the weights are dense. forward_one's logits match the full forward to
@@ -116,6 +154,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                         intercept ? " + uncombine/op interceptor" : "");
             sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine,
                                      compute, sub0::nodes::FRAME_CLOSE);
+            expand_op_slots(ctx);   // collapsed op results -> their value digits for display
             std::println("{}", sub0::detokenize(ctx));
             return 0;
         }
@@ -155,6 +194,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         ctx.push_back(next);
     }
     sub0::graph_reset();
+    expand_op_slots(ctx);   // collapsed op results -> their value digits for display
     std::println("{}", sub0::detokenize(ctx));
     return 0;
 }

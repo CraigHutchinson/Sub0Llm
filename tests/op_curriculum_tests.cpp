@@ -49,25 +49,32 @@ TEST_CASE("op_curriculum: dataset structure is well-formed", "[opcurric]") {
     REQUIRE(masked > 0);                                             // results are masked (delegated)
 }
 
-TEST_CASE("op_curriculum: single-step frames dispatch to their masked result (FILTER guarantee)", "[opcurric]") {
+TEST_CASE("op_curriculum: single-step frames resolve via the node; result collapses to slot S0", "[opcurric]") {
     const auto tk = make_tok();
     oc::Options o; o.seed = 7; o.n_examples = 300; o.chain_frac = 0.0; o.max_digits = 3;   // single-step only
     const oc::Dataset ds = oc::build_dataset(tk, o);
     const auto compute = nd::make_compute_callback(nd::builtin());
+    const int S0 = sub0::SCRATCH_SLOT_BASE;
 
     int checked = 0;
     for (std::size_t d = 0; d + 1 < ds.doc_starts.size(); ++d) {
         const std::size_t lo = ds.doc_starts[d], hi = ds.doc_starts[d + 1];
-        // Find the op frame's TOK_TURN_END; run the callback over the doc prefix ending there.
+        // Run the callback over the doc prefix ending at the op frame's TOK_TURN_END: the posed expression
+        // must resolve to a number (the FILTER guarantee -- the frame is a real, resolvable op).
         std::size_t close = lo;
         for (std::size_t i = lo; i < hi; ++i) if (ds.tokens[i] == cas::TOK_TURN_END) { close = i; break; }
         REQUIRE(close > lo);
         const std::vector<int> ctx(ds.tokens.begin() + static_cast<std::ptrdiff_t>(lo),
                                    ds.tokens.begin() + static_cast<std::ptrdiff_t>(close) + 1);
         const std::vector<int> inj = compute(ctx);
-        REQUIRE_FALSE(inj.empty());                                  // the frame is a resolvable op
+        REQUIRE_FALSE(inj.empty());
         std::string got; for (int t : inj) if (t >= '0' && t <= '9') got.push_back(static_cast<char>(t));
-        REQUIRE(got == masked_digits(ds, lo, hi));                   // node result == the masked span
+        REQUIRE_FALSE(got.empty());                                  // a numeric result
+        // The result COLLAPSES to slot S0 (masked) -- uniform with chains. The only masked token is S0.
+        REQUIRE(masked_digits(ds, lo, hi).empty());                  // no masked DIGITS (result is a slot now)
+        int s0 = 0, masked = 0;
+        for (std::size_t i = lo; i < hi; ++i) if (ds.mask[i] == 0) { ++masked; if (ds.tokens[i] == S0) ++s0; }
+        REQUIRE(masked == 1); REQUIRE(s0 == 1);
         ++checked;
     }
     REQUIRE(checked > 100);

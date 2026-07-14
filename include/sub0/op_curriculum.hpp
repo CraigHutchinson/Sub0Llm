@@ -2,12 +2,16 @@
 // train_stage, mirroring spellspike/scratchspike). Synthetic, self-verifying arithmetic problems teach the
 // model to ROUTE to the `math` node rather than compute -- the two mechanisms the GSM8K chapter proved:
 //
-//   * SINGLE-STEP (contextual): `... A+B = [op math]` -- the model emits a bare op frame and the node reads
-//     the expression posed in the prose (node_frame::preceding_expr). Proved 0.935 held-out (gsm8k capstone).
+//   * SINGLE-STEP (contextual): `... A+B = [op math] <S0>` -- the model emits a bare op frame and the node
+//     reads the expression posed in the prose (node_frame::preceding_expr). Proved 0.935 held-out.
 //   * MULTI-STEP (collapse chain): `A+B = [op math] <S0> . S0-C = [op math] <S1>` -- the step-1 result is a
 //     SLOT SYMBOL the next step references (one token, not a multi-digit copy). Proved 1.000 vs digit-copy
-//     0.095 (the chaining A/B). At train time the slots are baked/masked tokens the model learns to emit;
-//     at gen time the collapse callback binds the live result and the node dereferences it.
+//     0.095 (the chaining A/B).
+//
+// EVERY op result COLLAPSES to a scratch slot (uniform), so gen's behaviour is uniform (always collapse: bind
+// the live result to a slot, inject that token, expand it for display) and a chained reference is always a
+// one-token symbol. At train time the slots are baked/masked tokens the model learns to emit; at gen time the
+// collapse callback binds the live result and the node dereferences it (gen_stage).
 //
 // Every arithmetic span is MASKED (the node supplies it -- the FILTER pillar), so the model NEVER learns the
 // fuzzy arithmetic. Digits + operators are byte tokens: the Unigram word-encoder's Viterbi runs only over
@@ -19,7 +23,6 @@
 
 #pragma once
 
-#include "sub0/gsm8k.hpp"          // build_stream (single-step contextual), op_frame markers
 #include "sub0/nodes.hpp"          // eval / add / cmp -- exact verification
 #include "sub0/node_frame.hpp"     // op_header, FRAME markers
 #include "sub0/scratch_slots.hpp"  // SCRATCH_SLOT_BASE (the collapse slots)
@@ -55,9 +58,8 @@ inline std::string gen_int(std::mt19937_64& rng, int digits) {   // no leading z
     return s;
 }
 
-// A single-step problem as a GSM8K-style solution: `<prose> EXPR = <<EXPR=R>> R .` (EXPR in the prose right
-// before the annotation, so the bare frame's preceding_expr reads it). op in {+,-,*}, exact integer result.
-inline std::string gen_single(std::mt19937_64& rng, int maxdig) {
+// A binary op over exact-integer operands: {+,-,*}, non-negative result. Returns the expression.
+inline std::string gen_expr(std::mt19937_64& rng, int maxdig) {
     std::uniform_int_distribution<int> dd(1, maxdig), pick(0, 2);
     std::string A = gen_int(rng, dd(rng)), B = gen_int(rng, dd(rng));
     char op = '+';
@@ -66,13 +68,28 @@ inline std::string gen_single(std::mt19937_64& rng, int maxdig) {
         case 2: op = '*'; A = gen_int(rng, std::min(2, maxdig)); B = gen_int(rng, std::min(2, maxdig)); break;
         default: break;
     }
-    const std::string expr = A + std::string(1, op) + B, res = nodes::eval(expr);
-    if (res.empty()) return gen_single(rng, maxdig);   // (shouldn't happen for + - *)
-    static const char* pre[] = { "total ", "so ", "we get ", "count ", "then " };
-    return std::string(pre[std::uniform_int_distribution<int>(0, 4)(rng)]) +
-           expr + "=<<" + expr + "=" + res + ">> " + res + ".";
+    return A + std::string(1, op) + B;
+}
+inline const char* gen_prose(std::mt19937_64& rng) {
+    static const char* pre[] = { "total ", "so ", "we get ", "count ", "then ", "answer " };
+    return pre[std::uniform_int_distribution<int>(0, 5)(rng)];
 }
 }  // namespace detail
+
+// Append a SINGLE-STEP contextual example: `<prose> EXPR = [op math] <S0 masked> .`. The model emits the bare
+// frame; the node reads EXPR from the prose; the result COLLAPSES to slot S0 (masked) -- uniform with chains.
+inline void emit_single(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& rng, int maxdig) {
+    const std::string expr = detail::gen_expr(rng, maxdig);
+    if (nodes::eval(expr).empty()) return;
+    auto g     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(1); };
+    auto m     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(0); };
+    auto gtext = [&](const std::string& s) { for (int t : tok::encode(tk, s)) g(t); };
+    gtext(std::string(detail::gen_prose(rng)) + expr + "=");
+    for (int t : nodes::op_header("math")) g(t);   // route
+    m(SCRATCH_SLOT_BASE);                          // result collapsed to slot S0 (masked)
+    gtext(".");
+    ds.doc_starts.push_back(ds.tokens.size());
+}
 
 // Append a 2-step COLLAPSE chain directly (it needs slot tokens, which build_stream doesn't emit):
 // `A+B = [op math] <S0 masked> . S0<op2>C = [op math] <S1 masked> .`  -- the step-1 result is slot S0, which
@@ -105,22 +122,15 @@ inline void emit_chain(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& r
     ds.doc_starts.push_back(ds.tokens.size());
 }
 
-// Build the full curriculum: `n_examples` problems, `chain_frac` of them 2-step collapse chains.
+// Build the full curriculum: `n_examples` problems, `chain_frac` of them 2-step collapse chains, the rest
+// single-step. Every op result collapses to a slot (uniform).
 inline Dataset build_dataset(const tok::Tokenizer& tk, const Options& opt) {
     Dataset ds; ds.doc_starts.push_back(0);
     std::mt19937_64 rng(opt.seed);
     std::uniform_real_distribution<double> u(0.0, 1.0);
-    auto enc = [&tk](std::string_view s) { return tok::encode(tk, std::string(s)); };
     for (int i = 0; i < opt.n_examples; ++i) {
-        if (u(rng) < opt.chain_frac) {
-            emit_chain(ds, tk, rng, opt.max_digits);
-        } else {
-            const gsm8k::Example ex = gsm8k::build_stream(detail::gen_single(rng, opt.max_digits), enc);
-            if (ex.ops == 0) continue;
-            ds.tokens.insert(ds.tokens.end(), ex.tokens.begin(), ex.tokens.end());
-            ds.mask.insert(ds.mask.end(), ex.mask.begin(), ex.mask.end());
-            ds.doc_starts.push_back(ds.tokens.size());
-        }
+        if (u(rng) < opt.chain_frac) emit_chain(ds, tk, rng, opt.max_digits);
+        else                         emit_single(ds, tk, rng, opt.max_digits);
     }
     return ds;
 }
