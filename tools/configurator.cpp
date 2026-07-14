@@ -563,13 +563,14 @@ int main(int argc, char** argv) {
     int n_heads      = 0;
     int seq_len      = 0;
     int ternary      = 0;
-    int gated_ffn    = 0;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
-                                 // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family
-                                 // convention, for importing open weights of that shape
-    int tie_embeddings = 0;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
-                                 // matrix+bias -- a real param-count win at this project's small-model
-                                 // scale (embedding+head is often the biggest single param chunk)
-    int qk_norm      = 0;       // 1 = RMSNorm applied per-head to Q/K right after their projection,
+    // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
+    // gated FFN, tied embeddings, QK-norm; project memory arch-features-off-by-default). Pass `--gated-ffn 0`
+    // etc. to opt out (e.g. importing a GGUF of a different shape).
+    int gated_ffn    = 1;       // 1 = SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) instead of the
+                                 // plain 2-matrix GELU+bias FFN -- matches the GGUF/Llama-family convention
+    int tie_embeddings = 1;    // 1 = the LM head reuses tok_emb (transposed) instead of its own
+                                 // matrix+bias -- a real param-count win at this project's small-model scale
+    int qk_norm      = 1;       // 1 = RMSNorm applied per-head to Q/K right after their projection,
                                  // before RoPE (Gemma2-style) -- stabilizes attention-logit magnitude
     int pos_encoding = 1;       // 0 = absolute learned, 1 = RoPE (default)
     double rope_theta = 10000.0;// RoPE frequency base

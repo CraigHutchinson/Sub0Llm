@@ -54,7 +54,8 @@ inline int run_train(int argc, char** argv) {
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
     std::string train_keep = "3";
-    int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
+    int train_optimizer = 1;   // 1=muon (hidden 2D matrices on Muon) + adamw (everything else) -- the proven
+                               // default (project memory arch-features-off-by-default); --optimizer adamw opts out
     float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
     float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
     float train_op_mix = 0.f;      // 0 = off; >0 blends in the op-delegation (math node routing) curriculum
@@ -73,10 +74,10 @@ inline int run_train(int argc, char** argv) {
     app.add_option("--keep", train_keep,
                    "Progress-named checkpoints to retain (N, or ALL to keep every stage)")->capture_default_str();
     app.add_option("--optimizer", train_optimizer,
-                   "adamw (default) | muon (hidden 2D weight matrices on Muon, everything else stays "
-                   "AdamW -- CPU and GPU)")
+                   "muon (default: hidden 2D weight matrices on Muon, everything else stays AdamW -- CPU and "
+                   "GPU) | adamw (opt out)")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"adamw", 0}, {"muon", 1}}, CLI::ignore_case))
-       ->default_str("adamw");
+       ->default_str("muon");
     auto* resume_flag = app.add_flag("--resume", train_resume,
                    "No explicit model path: force-resume the most recent matching-architecture model "
                    "dir, even if it already finished or the code version changed underneath it");
