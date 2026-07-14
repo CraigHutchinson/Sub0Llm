@@ -31,6 +31,7 @@
 #include "sub0/blend.hpp"    // weighted per-window multi-source blending (base corpus + curriculum)
 #include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a --spell-mix blend source)
 #include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a --scratch-mix blend source)
+#include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (a --op-mix blend source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -877,7 +878,8 @@ static void report_run_context(bool gpu_train);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
-                                          int optimizer, int resume_mode, float spell_mix, float scratch_mix) {
+                                          int optimizer, int resume_mode, float spell_mix, float scratch_mix,
+                                          float op_mix) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1135,6 +1137,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.batch = batch; cfg.lr = lr; cfg.seed = seed;
         cfg.spell_mix = spell_mix;     // the blend recipe: re-enforced on resume like optimizer (below)
         cfg.scratch_mix = scratch_mix;
+        cfg.op_mix = op_mix;
         return cfg;
     };
 
@@ -1227,6 +1230,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                 "(the persisted blend recipe wins on resume)",
                                 static_cast<double>(scratch_mix), persisted.scratch_mix);
                 scratch_mix = static_cast<float>(persisted.scratch_mix);
+            }
+            if (persisted.op_mix != static_cast<double>(op_mix)) {
+                sub0::log::info("  config.json overrides this invocation's --op-mix: {:.3f} -> {:.3f} "
+                                "(the persisted blend recipe wins on resume)",
+                                static_cast<double>(op_mix), persisted.op_mix);
+                op_mix = static_cast<float>(persisted.op_mix);
             }
         }
     }
@@ -1379,10 +1388,40 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                         static_cast<double>(scratch_mix) * 100.0, kScratchK, contains_k >= 2 ? contains_k : 0,
                         split.drilled.size(), scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
     }
+    // --op-mix: blend in the op-delegation curriculum (op_curriculum.hpp). Teaches the model to ROUTE
+    // arithmetic to the `math` node (emit a bare [op math]; the node reads the posed expression and supplies
+    // the exact answer, MASKED so the model never learns the arithmetic) -- including multi-step chains where
+    // an intermediate result is COLLAPSED to a scratch slot the next step references (the GSM8K chapter's
+    // proven mechanisms; docs/DETERMINISTIC_MECHANISMS.md). `op_ds` must outlive the loop (borrowed).
+    sub0::op_curriculum::Dataset op_ds;
+    if (op_mix > 0.f) {
+        sub0::tok::Tokenizer tk;
+        std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
+        if (!tis.good() || !sub0::tok::deserialize(tk, tis) || tk.vocab != VOCAB) {
+            sub0::log::error("train: --op-mix set but the tokenizer '{}' could not be loaded (or vocab != "
+                             "engine VOCAB {})", sub0::default_tokenizer(), VOCAB);
+            return 1;
+        }
+        sub0::op_curriculum::Options oopt;
+        oopt.seed = static_cast<std::uint64_t>(seed) ^ 0x0B5C11ED0FF1CEULL;   // distinct stream
+        oopt.n_examples = 6000;
+        oopt.chain_frac = 0.4;                                                 // 40% multi-step collapse chains
+        oopt.max_digits = std::max(2, std::min(4, (SEQ_LEN - 12) / 8));        // as many digits as the window fits
+        op_ds = sub0::op_curriculum::build_dataset(tk, oopt);
+        sources.push_back(sub0::BlendSource{
+            sub0::TokView::over_int32(op_ds.tokens.data(), op_ds.tokens.size()),
+            std::span<const std::uint64_t>(op_ds.doc_starts),
+            std::span<const std::uint8_t>(op_ds.mask),
+            static_cast<double>(op_mix) });
+        sub0::log::line("blend: op-delegation curriculum {:.0f}% ({} examples, {} tokens, chain-frac {:.2f})",
+                        static_cast<double>(op_mix) * 100.0, op_ds.doc_starts.size() - 1,
+                        op_ds.tokens.size(), oopt.chain_frac);
+    }
     // The base corpus gets whatever fraction the curricula don't claim.
     sources[kBaseSource].weight =
-        std::max(0.0, 1.0 - static_cast<double>(spell_mix) - static_cast<double>(scratch_mix));
-    if (spell_mix > 0.f || scratch_mix > 0.f)
+        std::max(0.0, 1.0 - static_cast<double>(spell_mix) - static_cast<double>(scratch_mix)
+                          - static_cast<double>(op_mix));
+    if (spell_mix > 0.f || scratch_mix > 0.f || op_mix > 0.f)
         sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
     // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
     // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward

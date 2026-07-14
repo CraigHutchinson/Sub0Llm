@@ -20,7 +20,8 @@
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
-                                int optimizer, int resume_mode, float spell_mix, float scratch_mix);
+                                int optimizer, int resume_mode, float spell_mix, float scratch_mix,
+                                float op_mix);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_vocab_stage(const char* tokenizer_path, int limit);
@@ -55,6 +56,7 @@ inline int run_train(int argc, char** argv) {
     int train_optimizer = 0;   // 0=adamw (default), 1=muon (hidden 2D matrices) + adamw (everything else)
     float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
     float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
+    float train_op_mix = 0.f;      // 0 = off; >0 blends in the op-delegation (math node routing) curriculum
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -90,6 +92,12 @@ inline int run_train(int argc, char** argv) {
                    "curriculum (0 = off). Teaches the model to RESOLVE a dynamically-bound scratch slot "
                    "for an OOV, so an OOV costs 1 token per mention (gen resolves via a binding table).")
        ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
+    app.add_option("--op-mix", train_op_mix,
+                   "Fraction of training windows drawn from the op-delegation curriculum (0 = off). Teaches "
+                   "the model to ROUTE arithmetic to the deterministic `math` node (emit [op math]; the node "
+                   "supplies the exact answer, which gen dispatches) rather than computing it -- including "
+                   "multi-step chains via collapsed scratch slots. See docs/DETERMINISTIC_MECHANISMS.md.")
+       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -102,7 +110,7 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode, train_spell_mix, train_scratch_mix);
+                            resume_mode, train_spell_mix, train_scratch_mix, train_op_mix);
 }
 
 // --- gen -------------------------------------------------------------------
