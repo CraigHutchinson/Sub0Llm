@@ -43,8 +43,9 @@ def main() -> None:
     def log(*a):
         print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
-    log(f"loading gsm8k/{args.config} [{args.split}]")
-    ds = load_dataset("gsm8k", args.config, split=args.split)
+    repo = "openai/gsm8k"   # the bare "gsm8k" id is deprecated; hub now requires namespace/name
+    log(f"loading {repo}/{args.config} [{args.split}]")
+    ds = load_dataset(repo, args.config, split=args.split)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     log(f"writing {len(ds)} problems -> {args.out} (annotations kept, <|endoftext|>-separated)")
