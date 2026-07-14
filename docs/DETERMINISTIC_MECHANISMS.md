@@ -68,6 +68,20 @@ Pillar 2 (numeric BIND) is now proven too (`bindspike` — op over bound slots, 
 bindings); the **end-to-end production wiring** (the op/compute callback + `set_scratch_bindings` in
 `gen_stage.cpp` — today it wires only spell/scratch `expand`/`combine`) is the remaining piece.
 
+**GSM8K capstone (`[.gsm8kcapstone]`) — end-to-end delegation IN PROSE, and a reusable lesson.** Arithmetic
+consolidated onto ONE general node: `[op math <expr>]` evaluates a whole formula (precedence, parens, exact
+big-int) — the per-op add/sub/mul/div FRAMES are removed (they stay as `math`'s internal primitives). A tiny
+d128 model trained on synthetic GSM8K-format problems (via `gsm8k::build_stream`) and decoded through the
+production callback reaches **delegation 1.000, exact-match 0.935**, and — because the node is exact —
+**generalises to 3-digit operands it never trained on (OOD exact 0.675)**. The lesson: **prefer *contextual*
+delegation over *self-contained* copy.** Making the model copy the expression into the frame
+(`[op math 12+34]`) hits the localization/copy wall (exact ~0.2–0.4, unstable); a **bare `[op math]`** that
+lets the node read the expression already posed in the prose (`… 12+34 = [op math]`, via
+`node_frame::preceding_expr`) sidesteps it entirely. Errors then localise to *routing* — arithmetic error is
+0 by construction whenever delegation fires — which is exactly the decomposed, auto-verifiable metric a
+well-formed-math task affords. (Overtraining degrades this toy task past the early peak; a recipe-tuning item,
+not a mechanism one.)
+
 ---
 
 ## The three pillars
