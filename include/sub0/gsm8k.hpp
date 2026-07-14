@@ -12,7 +12,9 @@
 #pragma once
 
 #include "sub0/nodes.hpp"
+#include "sub0/casing.hpp"   // TOK_TURN_START / TOK_TURN_END (the op-frame markers)
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -83,6 +85,55 @@ inline std::vector<Segment> segment(std::string_view sol) {
 // A mismatched annotation (bad label, or an op we compute differently) is dropped, not learned.
 inline bool verify(const Op& op, const nodes::Registry& reg) {
     return reg.run(op.name, {op.a, op.b}) == op.result;
+}
+
+// The op-frame the model learns to EMIT for `op`: `TOK_TURN_START op <name> <a> <b> TOK_TURN_END`. Operands
+// live in the frame (self-contained -- the node reads them there, not from ambiguous surrounding prose).
+inline std::vector<int> op_frame(const Op& op) {
+    std::vector<int> f;
+    f.push_back(casing::TOK_TURN_START);
+    const std::string hdr = "op " + op.name + " " + op.a + " " + op.b;
+    for (char c : hdr) f.push_back(static_cast<unsigned char>(c));
+    f.push_back(casing::TOK_TURN_END);
+    return f;
+}
+
+// A tokenized training example: prose + op-frames are GRADED (mask 1 -- the model learns the reasoning and
+// the routing); each verified annotation's RESULT is MASKED (mask 0 -- the node fills it, so the model never
+// learns the fuzzy arithmetic). `ops` verified annotations became op-frames; `dropped` failed verification.
+struct Example { std::vector<int> tokens; std::vector<std::uint8_t> mask; int ops = 0, dropped = 0; };
+
+// Build one Example from a GSM8K solution. `encode` tokenizes prose -- injected so this stays
+// tokenizer-agnostic and unit-testable (train_stage passes the real sub0::encode). GSM8K writes each
+// annotation as `EXPR = <<EXPR=R>> R`, so the R that follows the annotation is stripped from the prose (it
+// is delegated, not written): the op-frame is graded, then R is emitted once, masked.
+inline Example build_stream(std::string_view sol,
+                            const std::function<std::vector<int>(std::string_view)>& encode,
+                            const nodes::Registry& reg) {
+    Example ex;
+    std::vector<Segment> segs = segment(sol);
+    auto emit      = [&](int t, std::uint8_t m) { ex.tokens.push_back(t); ex.mask.push_back(m); };
+    auto emit_text = [&](std::string_view s, std::uint8_t m) { for (int t : encode(s)) emit(t, m); };
+
+    for (std::size_t k = 0; k < segs.size(); ++k) {
+        const Segment& s = segs[k];
+        if (!s.is_op)               { emit_text(s.text, 1); continue; }
+        if (!verify(s.op, reg))     { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
+        for (int t : op_frame(s.op)) emit(t, 1);                    // GRADED: the routing the model must learn
+        for (char c : s.op.result)   emit(static_cast<unsigned char>(c), 0);   // MASKED: the node supplies it
+        ++ex.ops;
+        // Strip the redundant result that GSM8K repeats right after the annotation (leading ws + R + word
+        // boundary), so it is not ALSO written as graded prose.
+        if (k + 1 < segs.size() && !segs[k + 1].is_op) {
+            std::string& nx = segs[k + 1].text;
+            std::size_t p = 0; while (p < nx.size() && (nx[p] == ' ' || nx[p] == '\t')) ++p;
+            const std::string& R = s.op.result;
+            const bool boundary = (p + R.size() >= nx.size()) ||
+                                  !(nx[p + R.size()] >= '0' && nx[p + R.size()] <= '9');
+            if (nx.compare(p, R.size(), R) == 0 && boundary) nx.erase(0, p + R.size());
+        }
+    }
+    return ex;
 }
 
 }  // namespace sub0::gsm8k
