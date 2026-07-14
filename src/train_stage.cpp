@@ -1565,7 +1565,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 rs.evals.push_back(nelbo);
                 if (nelbo < rs.best_loss) { rs.best_loss = nelbo; rs.best_step = step; }
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
-                if (plateaued(rs.evals)) stop = true;
+                // Plateau-stop only in AUTO mode (--steps 0). An explicit --steps N is a request to run
+                // exactly N steps (matching the flag's help), so a curriculum whose signal isn't in the base
+                // val split -- e.g. --op-mix -- is not cut short by the base corpus plateauing.
+                if (steps == 0 && plateaued(rs.evals)) stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // Step-rate directly (not via wps/batch): batch_t now varies per step, so a fixed
