@@ -26,7 +26,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+# -g alongside -O3: RelWithDebInfo-style Release -- full optimization, but every Release build also
+# emits CodeView debug info (a .pdb next to each DLL/EXE via lld-link), so a profiler (VTune, WPA) can
+# resolve real function names instead of `func@0xADDRESS` without a separate Debug build or reconfigure.
+# Debug info doesn't change the generated machine code, just link time and on-disk .pdb size.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
 # Native tuning. This project is always built on the machine the model will run
 # on, so an exact-CPU build is the intended default for real runs (the `native`
