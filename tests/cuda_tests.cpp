@@ -1458,6 +1458,70 @@ TEST_CASE("CUDA gradient scale is invariant to duplicating the batch", "[cuda]")
     CHECK(ratio < 1.05);
 }
 
+// Proves the gradient-merge math for a SOURCE-ROUTED hybrid CPU/GPU training step (design: project
+// memory hybrid-cpu-gpu-execution-design -- not yet wired into train_stage.cpp; this test exists to
+// verify the merge algorithm in isolation BEFORE touching the live training loop). content-embed forces
+// an entire step onto CPU today; the hybrid idea is to route ONLY the content-embed-needing windows to
+// CPU while the rest of the SAME step's batch runs on GPU, then combine the two independently-computed
+// gradients into one update. Both train_batch (CPU) and sub0_cuda_backward (GPU) are proven per-call
+// MEAN-normalized over THEIR OWN batch size ("CUDA gradient scale is invariant to duplicating the batch"
+// above, and backward_device's "invM = 1/M... makes the result equal the CPU train_batch grad" comment
+// in backend_cuda.cu) -- so combining two sub-batch means into one full-batch-equivalent mean requires
+// weighting each by its OWN share of the combined batch: combined = (n_cpu/n_total)*cpu_grad +
+// (n_gpu/n_total)*gpu_grad. This test partitions ONE batch of windows in half, computes each half's
+// gradient on its respective backend, combines them with that weighting, and checks the result against
+// a REFERENCE: the plain CPU train_batch gradient over the SAME windows as ONE undivided batch.
+TEST_CASE("CUDA+CPU hybrid split: weighted-merged gradient matches an undivided CPU batch", "[cuda]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);                                  // full FP32 for a tight parity gate
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int total = 8, cpu_n = 3, gpu_n = total - cpu_n, T = 8;   // uneven split -- exercises the weighting, not just a 50/50 average
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(total, T, 91, data, starts, ids, targets);
+
+    const std::size_t n = sub0::trainable_floats();
+
+    // Reference: the WHOLE batch as one undivided CPU train_batch call.
+    sub0::train_batch(data.data(), starts.data(), total, T);
+    const std::vector<float> ref_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    // Split: windows [0,cpu_n) on the CPU, windows [cpu_n,total) on the GPU -- same underlying windows,
+    // same weights, just partitioned (mirroring how a hybrid step would route by blend source).
+    sub0::train_batch(data.data(), starts.data(), cpu_n, T);
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    std::vector<float> gpu_grad(n, 0.0f);
+    double gpu_loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data() + static_cast<std::size_t>(cpu_n) * T,
+                               targets.data() + static_cast<std::size_t>(cpu_n) * T,
+                               gpu_n, T, gpu_grad.data(), &gpu_loss) == 0);
+
+    std::vector<float> combined(n);
+    const float w_cpu = static_cast<float>(cpu_n) / static_cast<float>(total);
+    const float w_gpu = static_cast<float>(gpu_n) / static_cast<float>(total);
+    for (std::size_t i = 0; i < n; ++i) combined[i] = w_cpu * cpu_grad[i] + w_gpu * gpu_grad[i];
+
+    // Same rel-L2/cos convention as "CUDA backward matches the CPU reduced gradient" above -- cross-
+    // backend fast-math differences accumulate through the reverse pass, so compare direction/magnitude,
+    // not bits.
+    double num = 0.0, den = 0.0, dot = 0.0, cn = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(combined[i]) - ref_grad[i];
+        num += d * d;
+        den += static_cast<double>(ref_grad[i]) * ref_grad[i];
+        dot += static_cast<double>(combined[i]) * ref_grad[i];
+        cn  += static_cast<double>(combined[i]) * combined[i];
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    const double cos = dot / std::max(std::sqrt(cn * den), 1e-30);
+    INFO("hybrid-merge grad rel-L2 = " << rel << "  cos = " << cos << "  gpu_loss = " << gpu_loss);
+    if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
+    else                                    REQUIRE(rel < 1e-2);
+}
+
 // Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
 // the checkpointed activations (a memory-for-compute trade) so it is expected to be heavy; this
 // surfaces the split so further throughput rework (optional checkpointing) is data-driven. The
