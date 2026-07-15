@@ -636,6 +636,68 @@ TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- ConvPool (char-CNN) 
     REQUIRE(std::isfinite(mean_cp));
 }
 
+// A/B on the ORDER-SENSITIVE content task (#4, "starts with X") via HRR (Candidate 2: Holographic Reduced
+// Representations, Plate 1995 -- circular-convolution binding of a fixed pseudo-random per-position role
+// vector with each fragment, summed; see scratch_slots.hpp and project memory
+// meanpool-alternatives-prior-art-and-math). Like Hash, HRR has NO learned params, so this uses the normal
+// train_steps path (baseline = MeanPool, matching Hash's own A/B for direct comparability), multi-seeded
+// from the start.
+TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- HRR (circular-convolution binding) A/B", "[.scratchspike]") {
+    constexpr int kK = 3;
+    constexpr unsigned kSeeds[] = {1, 2, 3};
+    constexpr int kNumSeeds = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_content(tk, split, kK, dopt);
+    REQUIRE(ds.doc_bindings.size() + 1 == ds.doc_starts.size());
+
+    auto run = [&](sub0::SlotEncoding enc, unsigned seed, double& drilled) {
+        sub0::build_model();
+        reset_opt_state();
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(seed);
+        double held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_steps(ds, opt, kStepsPerEval, rng, /*content_embed=*/true, kWindowT, enc);
+            drilled = eval_content(tk, ops, split.drilled,  kK, /*seed=*/7,  /*content_embed=*/true, enc).rate();
+            held    = eval_content(tk, ops, split.held_out, kK, /*seed=*/11, /*content_embed=*/true, enc).rate();
+        }
+        return held;
+    };
+
+    std::string report = "\n=== scratchspike #4 CONTENT (starts-with) via HRR (circular-convolution binding) "
+                         "(K=3) @3000, multi-seed ===\n";
+    char line[224];
+    double sum_mp = 0.0, sum_hrr = 0.0;
+    for (unsigned seed : kSeeds) {
+        double d_mp = 0.0, d_hrr = 0.0;
+        const double h_mp  = run(sub0::SlotEncoding::MeanPool, seed, d_mp);
+        const double h_hrr = run(sub0::SlotEncoding::HRR, seed, d_hrr);
+        sum_mp += h_mp; sum_hrr += h_hrr;
+        std::snprintf(line, sizeof line,
+            "  seed %u | MeanPool: drilled %.3f held-out %.3f | HRR: drilled %.3f held-out %.3f\n",
+            seed, d_mp, h_mp, d_hrr, h_hrr);
+        report += line;
+    }
+    const double mean_mp = sum_mp / static_cast<double>(kNumSeeds);
+    const double mean_hrr = sum_hrr / static_cast<double>(kNumSeeds);
+    std::snprintf(line, sizeof line, "  MEAN held-out (chance = 0.333): MeanPool %.3f | HRR %.3f\n",
+                 mean_mp, mean_hrr);
+    report += line;
+    WARN(report);
+    REQUIRE(std::isfinite(mean_mp));
+    REQUIRE(std::isfinite(mean_hrr));
+}
+
 // A/B on an ORDER-AGNOSTIC content task (which slot CONTAINS char X): same task/everything, trained+eval'd
 // WITHOUT vs WITH content-derived embeddings. FINDING at d128: BOTH stay at chance (~1/K) and match closely
 // -- mean-pool embeddings do NOT deliver usable content reasoning here (the model converges to a degenerate

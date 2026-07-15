@@ -226,6 +226,83 @@ TEST_CASE("scratch encoder: ConvPool is order-sensitive, unlike MeanPool/CharEnc
     for (int j = 0; j < C; ++j) REQUIRE(out_solo[j] == Catch::Approx(tab[1 * C + j]).margin(1e-5));
 }
 
+// --- 1b-vi. HRR (Holographic Reduced Representations, Plate 1995): circular-convolution binding of a
+// fixed pseudo-random per-position "role" vector with each fragment, summed. No learned params (like
+// Hash), but a mathematically DIFFERENT VSA binding operator (circular convolution vs. rotation) -- see
+// scratch_slots.hpp's HRR comment and project memory meanpool-alternatives-prior-art-and-math.
+TEST_CASE("scratch encoder: HRR forward + backward match finite differences", "[scratch][embed]") {
+    constexpr int C = 6;
+    std::vector<float> tab = {
+        0.5f, -0.3f, 0.2f, 0.1f, -0.4f, 0.6f,     // row 0
+       -0.1f,  0.4f, 0.6f, -0.2f, 0.3f, -0.5f,    // row 1
+        0.2f, -0.6f, 0.1f,  0.4f, -0.1f, 0.3f,    // row 2
+    };
+    const std::vector<int> frags = {0, 1, 2};
+    const float dout[C] = {1.0f, -0.5f, 0.7f, -0.2f, 0.3f, 0.4f};
+
+    auto loss = [&](const std::vector<float>& tabv) {
+        float out[C];
+        sub0::encode_slot(tabv.data(), C, frags, SlotEncoding::HRR, out);
+        float L = 0.f; for (int c = 0; c < C; ++c) L += dout[c] * out[c]; return L;
+    };
+
+    std::vector<float> Tg(tab.size(), 0.f);
+    sub0::encode_slot_bwd(dout, C, frags, SlotEncoding::HRR, Tg.data());
+
+    const float eps = 1e-3f;
+    for (int f : frags) for (int k = 0; k < C; ++k) {
+        auto tp = tab, tm = tab;
+        tp[static_cast<std::size_t>(f) * C + k] += eps;
+        tm[static_cast<std::size_t>(f) * C + k] -= eps;
+        REQUIRE(Tg[static_cast<std::size_t>(f) * C + k] ==
+                Catch::Approx((loss(tp) - loss(tm)) / (2 * eps)).margin(2e-2));
+    }
+}
+
+// --- 1b-vii. HRR is order-sensitive (unlike MeanPool/CharEncoder). Unlike Hash, HRR has no "position 0 =
+// identity" special case (the role vector at position 0 is a random binding, not an impulse), so this
+// test checks order-sensitivity + a same-fragments-single-vs-repeated sanity check instead of a
+// passthrough case.
+TEST_CASE("scratch encoder: HRR is order-sensitive, unlike MeanPool/CharEncoder", "[scratch][embed]") {
+    constexpr int C = 8;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> tab(static_cast<std::size_t>(4) * C);
+    for (float& x : tab) x = nd(rng);
+
+    const std::vector<int> fwd = {0, 1, 2};
+    const std::vector<int> rev = {2, 1, 0};   // same SET, reversed order
+
+    float out_fwd[C], out_rev[C];
+    sub0::encode_slot(tab.data(), C, fwd, SlotEncoding::HRR, out_fwd);
+    sub0::encode_slot(tab.data(), C, rev, SlotEncoding::HRR, out_rev);
+    bool differs = false;
+    for (int j = 0; j < C; ++j) if (out_fwd[j] != Catch::Approx(out_rev[j]).margin(1e-5)) differs = true;
+    REQUIRE(differs);
+
+    // Same MeanPool sanity floor as the Hash/ConvPool tests: confirm MeanPool stays order-invariant on
+    // these SAME fragments (Approx, not `==` -- summation order can differ in float ULPs).
+    float mp_fwd[C], mp_rev[C];
+    sub0::encode_slot(tab.data(), C, fwd, SlotEncoding::MeanPool, mp_fwd);
+    sub0::encode_slot(tab.data(), C, rev, SlotEncoding::MeanPool, mp_rev);
+    for (int j = 0; j < C; ++j) REQUIRE(mp_fwd[j] == Catch::Approx(mp_rev[j]).margin(1e-5));
+
+    // A single fragment's encoding is deterministic and depends only on ITS row + role[0] -- re-deriving
+    // it independently (not via encode_slot) confirms the circular-convolution math itself, not just that
+    // encode_slot is self-consistent.
+    const std::vector<int> solo = {2};
+    float out_solo[C];
+    sub0::encode_slot(tab.data(), C, solo, SlotEncoding::HRR, out_solo);
+    const std::vector<float>& roles = sub0::hrr_role_table(C);
+    const float* role0 = roles.data();
+    const float* filler = tab.data() + 2 * C;
+    for (int n = 0; n < C; ++n) {
+        float s = 0.f;
+        for (int k = 0; k < C; ++k) { int idx = n - k; if (idx < 0) idx += C; s += role0[k] * filler[idx]; }
+        REQUIRE(out_solo[n] == Catch::Approx(s).margin(1e-5));
+    }
+}
+
 // --- 1c. Scalar: fixed scientific encoding of the value the fragments spell (the brain-swap re-entry) ---
 namespace {
 std::vector<int> frags_of(const std::string& s) {   // digit/sign/point/exp chars -> byte token ids

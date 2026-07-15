@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -62,12 +63,43 @@ constexpr bool is_scratch_slot(int token) {
 //                 permutation-invariant: the two offset projections are DIFFERENT matrices, so swapping a
 //                 pair's order changes the window's activation, and maxpool's hard per-channel selection
 //                 depends on WHICH adjacent pair fired hardest. Candidate 3 from
-//                 meanpool-alternatives-prior-art-and-math; not yet A/B-verified.
+//                 meanpool-alternatives-prior-art-and-math -- spike-verified real, consistent edge, then
+//                 SUPERSEDED by HRR below (see the FINDING comments further down).
+//   HRR         - Holographic Reduced Representations (Plate 1995): bind(role_p, filler_p) = CIRCULAR
+//                 CONVOLUTION of a fixed pseudo-random unit-RMS "role" vector (keyed by fragment position
+//                 p, from a lazily-built, program-lifetime-cached table -- see hrr_role_table below) with
+//                 the fragment's tok_emb row, then SUM (bundle) across fragments. No learned params. NOT
+//                 permutation-invariant: circular convolution with a position-DEPENDENT role vector means
+//                 swapping two fragments' order binds them to different roles, changing the result --
+//                 mathematically distinct from Hash's rotation (a different real-valued VSA binding
+//                 operator, not just a re-derivation of it), Candidate 2 from
+//                 meanpool-alternatives-prior-art-and-math -- spike-verified DECISIVE winner over both
+//                 Hash and ConvPool (see the FINDING comments further down); the current leading
+//                 candidate, and needs no checkpoint-persistence work to reach production (no params).
 //   Scalar      - a fixed "scientific" encoding of the NUMERIC VALUE the fragments spell (sign, base-10
 //                 magnitude, leading digits). No params, no grad -- the classical-compute result re-entering
 //                 the model as ONE vector (the "brain-swap" scalar re-entry). Bounded regardless of
 //                 magnitude, so powers/exponents (2^100, 1.23e45) map in by construction; see below.
-enum class SlotEncoding { MeanPool, CharEncoder, Hash, ConvPool, Scalar };
+enum class SlotEncoding { MeanPool, CharEncoder, Hash, ConvPool, HRR, Scalar };
+
+// HRR's fixed "role" vectors: one per fragment POSITION (0-indexed, capped at HRR_MAX_POS -- generous
+// headroom over SCRATCH_SLOT_COUNT=6 for any future longer-fragment use, e.g. multi-token pattern spans),
+// pseudo-random with a FIXED seed (deterministic across runs/processes -- no state to persist, unlike a
+// learned param) and unit-RMS-ish scale (matches the token-embed amplitude convention, see project memory
+// conditioning-embedding-amplitude, so a single binding's magnitude lands near an ordinary embedding row's).
+// Built ONCE, lazily, on first use -- C is effectively a compile-time constant (D_MODEL) for the life of a
+// process, so this is the same "cache once, reuse" shape as cpu_affinity.hpp's detect_core_order().
+constexpr int HRR_MAX_POS = 16;
+inline const std::vector<float>& hrr_role_table(int C) {
+    static std::vector<float> table;
+    if (table.empty()) {
+        table.resize(static_cast<std::size_t>(HRR_MAX_POS) * static_cast<std::size_t>(C));
+        std::mt19937 rng(0xC0FFEEu);
+        std::normal_distribution<float> nd(0.f, 1.f / std::sqrt(static_cast<float>(C)));
+        for (float& x : table) x = nd(rng);
+    }
+    return table;
+}
 
 // FINDING (2026-07-16, spike scale d196, tests/scratchspike_engine_tests.cpp "CONTENT (starts-with)
 // reasoning -- Hash/RoPE positional-binding A/B"): on content_select_task (#4, "which slot's OOV starts
@@ -89,12 +121,20 @@ enum class SlotEncoding { MeanPool, CharEncoder, Hash, ConvPool, Scalar };
 // efficiency win, not the only path to correctness. See project memory
 // meanpool-alternatives-prior-art-and-math for the full reframing.
 //
-// FINDING (2026-07-16, same day, ConvPool -- ConvPool below): multi-seeded from the start this time,
-// baseline = fully plain (no content-embed), matching CharEncoder's own methodology. Mean held-out: plain
-// 0.344 (at chance 0.333, as expected), ConvPool 0.458 (gap +0.114 -- ~2.4x Hash's own gap). ConvPool won
-// EVERY seed, no ties or degenerate collapse (unlike Hash's seed 2). ConvPool is now the LEADING candidate
-// -- likely because it has learned, task-adaptive params where Hash's rotation is fixed, mirroring
-// CharEncoder's own "learned beats parameter-free" edge over MeanPool on the presence axis.
+// FINDING (2026-07-16, same day, ConvPool): multi-seeded from the start this time, baseline = fully
+// plain (no content-embed), matching CharEncoder's own methodology. Mean held-out: plain 0.344 (at chance
+// 0.333, as expected), ConvPool 0.458 (gap +0.114 -- ~2.4x Hash's own gap). ConvPool won EVERY seed, no
+// ties or degenerate collapse (unlike Hash's seed 2). SUPERSEDED same day by HRR below.
+//
+// FINDING (2026-07-16, same day, later still, HRR): mean held-out MeanPool 0.356, HRR 0.744 -- more than
+// DOUBLE chance (0.333), strong and consistent across all 3 seeds (no ties, no collapse), held-out
+// tracking drilled closely every seed (genuine generalization). Gap +0.388 is ~3.4x ConvPool's and ~8x
+// Hash's -- not incremental, qualitatively different. HRR is now the CLEAR LEADING candidate, and unlike
+// ConvPool/CharEncoder it needs NO learned params, so it does not depend on
+// TODO(charencoder-production)-style checkpoint persistence to reach production -- see project memory
+// meanpool-alternatives-prior-art-and-math for the full per-seed numbers and the plausible reason
+// (quasi-orthogonal random role vectors interfere far less than Hash's low-rank pairwise rotation or
+// ConvPool's locally-windowed view -- the STRUCTURAL binding operator matters more than learned capacity).
 constexpr float HASH_ROPE_THETA = 10000.f;   // matches the engine's own ROPE_THETA (backend_cpu.cpp) --
                                              // this header can't see that constant (no core.hpp dep), so
                                              // it's a local copy; the value is conventional, not coupled.
@@ -327,6 +367,24 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
             }
             break;
         }
+        case SlotEncoding::HRR: {
+            const std::vector<float>& roles = hrr_role_table(C);
+            for (std::size_t p = 0; p < frags.size(); ++p) {
+                const float* filler = tok_emb + static_cast<std::size_t>(frags[p]) * C;
+                const std::size_t pi = p < static_cast<std::size_t>(HRR_MAX_POS) ? p : static_cast<std::size_t>(HRR_MAX_POS - 1);
+                const float* role = roles.data() + pi * static_cast<std::size_t>(C);
+                // Circular convolution: out[n] += sum_k role[k] * filler[(n-k) mod C] -- bind(role_p, filler_p).
+                for (int n = 0; n < C; ++n) {
+                    float s = 0.f;
+                    for (int k = 0; k < C; ++k) {
+                        int idx = n - k; if (idx < 0) idx += C;
+                        s += role[k] * filler[idx];
+                    }
+                    out[n] += s;
+                }
+            }
+            break;
+        }
         case SlotEncoding::MeanPool:
         default: {
             const float inv = 1.f / static_cast<float>(frags.size());
@@ -417,6 +475,26 @@ inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags
                 for (int k = 0; k < C; ++k) {
                     wgr0[k] += dz * e0[k]; g0[k] += dz * wr0[k];
                     wgr1[k] += dz * e1[k]; g1[k] += dz * wr1[k];
+                }
+            }
+            break;
+        }
+        case SlotEncoding::HRR: {
+            // Adjoint of circular convolution by a FIXED role vector is circular CORRELATION by that same
+            // role vector: d(filler)[j] = sum_n dout[n] * role[(n-j) mod C]. No params, no tok_emb read
+            // (role depends only on position, like Hash's rotation).
+            const std::vector<float>& roles = hrr_role_table(C);
+            for (std::size_t p = 0; p < frags.size(); ++p) {
+                float* g = tok_emb_grad + static_cast<std::size_t>(frags[p]) * C;
+                const std::size_t pi = p < static_cast<std::size_t>(HRR_MAX_POS) ? p : static_cast<std::size_t>(HRR_MAX_POS - 1);
+                const float* role = roles.data() + pi * static_cast<std::size_t>(C);
+                for (int j = 0; j < C; ++j) {
+                    float s = 0.f;
+                    for (int n = 0; n < C; ++n) {
+                        int idx = n - j; if (idx < 0) idx += C;
+                        s += dout[n] * role[idx];
+                    }
+                    g[j] += s;
                 }
             }
             break;

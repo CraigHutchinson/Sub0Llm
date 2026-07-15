@@ -184,10 +184,13 @@ these): `Hash` (RoPE-style rotation of each fragment by its position, then sum -
 held-out 0.403 vs chance 0.333), `ConvPool` (Kim et al. 2016-style learned width-2 convolution + relu +
 maxpool -- stronger, consistent across seeds: mean held-out 0.458 vs plain 0.344, wins every seed tried),
 and `HRR` (Holographic Reduced Representations, Plate 1995 -- circular-convolution binding of a fixed
-role vector per position with each fragment, then sum). None are wired into production yet (blocked on
-checkpoint persistence for the two with learned params -- see project memory
-`slot-encoder-checkpoint-persistence-design`); see project memory `meanpool-alternatives-prior-art-and-math`
-for the full prior-art survey, math, and per-seed results.
+pseudo-random role vector per position with each fragment, then sum). **`HRR` wins decisively: mean
+held-out 0.744 -- more than double chance, ~3.4x ConvPool's margin and ~8x Hash's, consistent across every
+seed tried.** Needs NO learned parameters (unlike CharEncoder/ConvPool), so unlike them it does not depend
+on checkpoint persistence to reach production (see project memory `slot-encoder-checkpoint-persistence-design`
+for that separate, still-needed CharEncoder/ConvPool work). None of the three are wired into production yet;
+see project memory `meanpool-alternatives-prior-art-and-math` for the full prior-art survey, math, and
+per-seed results.
 
 **Hybrid CPU/GPU execution is the necessary next unlock, not an optional nicety.** `--content-embed`
 forces the ENTIRE training step onto CPU today (`gpu_train = !content_embed_active && ...` in
