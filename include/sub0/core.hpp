@@ -111,6 +111,14 @@ SUB0_API const float* forward_one(int id, int pos);
 // ScratchBindings view + the encoders; a forward declaration keeps this header free of that include.
 struct ScratchBindings;
 SUB0_API void set_scratch_bindings(const ScratchBindings* bindings);
+// Persistent (unbounded) slot range -- SPIKE, see scratch_slots.hpp's own comment on PersistentBindings
+// for the full design. Unlike set_scratch_bindings above, this is GLOBAL (not per-thread/per-window):
+// the table is read-only and immutable for the process once set, so every thread reads the same pointer
+// with no synchronization needed. null clears it -> no id is ever treated as persistent-slot-bound
+// (id >= VOCAB then composes an all-zero row rather than falling through to a raw table lookup -- see
+// is_persistent_slot's own comment for why that fallthrough must never happen).
+struct PersistentBindings;
+SUB0_API void set_persistent_bindings(const PersistentBindings* bindings);
 // A target of LOSS_IGNORE_INDEX means "do not train on this position": cross_entropy adds no loss and
 // no gradient for it, and normalizes by the count of ACTIVE (non-ignored) positions (PyTorch's
 // `ignore_index` + reduction='mean'). Valid token ids are [0,VOCAB), so a negative is unambiguous.

@@ -17,6 +17,7 @@ add_executable(sub0_tests
   spellspike_engine_tests.cpp
   scratchspike_engine_tests.cpp
   repeatspike_engine_tests.cpp
+  persistent_slots_engine_tests.cpp
   scratch_embed_tests.cpp
   arithspike_engine_tests.cpp
   nodespike_engine_tests.cpp

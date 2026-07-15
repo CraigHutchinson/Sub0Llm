@@ -139,6 +139,52 @@ struct ScratchBindings {
     }
 };
 
+// --- Persistent (unbounded) slot range -- SPIKE ------------------------------------------------------
+// A SECOND, structurally different id range from the ephemeral pool above: ids >= `base` (the caller's
+// VOCAB), open-ended (not capped at a fixed pool size), for a persistent compound-word cache (e.g. a
+// recurring multi-token OOV gets ONE stable id forever, composed live from its fragments -- see
+// docs/DETERMINISTIC_MECHANISMS.md's "persistent compound-word cache" extension note). Deliberately a
+// SEPARATE type from ScratchBindings, not a runtime-configurable base on it: the two ranges have
+// different LIFETIMES (this one is global/read-once/immutable for the process, never swapped per-window
+// the way the ephemeral pool's thread_local binding is) and different SIZE characteristics (a handful of
+// ephemeral slots reused per context vs. a potentially large, monotonically-growing persistent table) --
+// forcing them into one type would blur both. `base` is NOT baked in as a constant (unlike
+// SCRATCH_SLOT_BASE) because it's VOCAB, a fact this dependency-light header deliberately doesn't know
+// (no core.hpp/config include) -- callers that DO have VOCAB in scope pass it explicitly.
+//
+// Engine safety invariant this exists to close: VOCAB is compile-time-fixed, so an id >= VOCAB can never
+// be sampled by the model (sample_token is hard-bounded to [0,VOCAB)) -- such an id can only ever be
+// INJECTED by a harness. But nothing previously stopped one from reaching the plain `tab[id, ...]`
+// embedding-table lookup and reading out of bounds if it ever did arrive unbound. `is_persistent_slot`
+// is meant to be checked UNCONDITIONALLY for any id >= base, before any raw table index -- see
+// persistent_fragments() below, which is null/unbound-safe by construction (never a source of the OOB
+// this is closing).
+struct PersistentBindings {
+    std::span<const std::vector<int>> slots;                 // slots[i] = fragments of base+i
+    int                                base = 0;              // typically VOCAB; NOT compile-time (see above)
+    SlotEncoding                       encoding = SlotEncoding::MeanPool;
+
+    bool bound(int token) const {
+        const int i = token - base;
+        return i >= 0 && i < static_cast<int>(slots.size()) && !slots[static_cast<std::size_t>(i)].empty();
+    }
+    std::span<const int> fragments(int token) const {
+        const int i = token - base;
+        if (i < 0 || i >= static_cast<int>(slots.size())) return {};
+        return std::span<const int>(slots[static_cast<std::size_t>(i)]);
+    }
+};
+
+constexpr bool is_persistent_slot(int token, int base) { return token >= base; }
+
+// Null-safe fragment lookup: no table set, or `token` not bound in it, -> an EMPTY span (encode_slot's
+// documented empty-fragments contract is a zero row) rather than requiring every call site to branch on
+// `pb` being null. This is what lets engine call sites route EVERY id >= base through the same compose
+// path unconditionally, closing the OOB risk above regardless of whether a real table is bound yet.
+inline std::span<const int> persistent_fragments(const PersistentBindings* pb, int token) {
+    return (pb && pb->bound(token)) ? pb->fragments(token) : std::span<const int>{};
+}
+
 // Forward: out[0..C) = f(fragments) under `enc`. `tok_emb` is the [vocab, C] table (row-major); `frags`
 // are token ids; empty -> zero row.
 //   MeanPool    = mean of the fragments' tok_emb rows (no params -> `enc_w` unused).

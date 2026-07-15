@@ -271,6 +271,12 @@ static inline float dsilu_fast(float v) {
 // re-consults it (same thread, same step), so no per-node storage is needed.
 thread_local const ScratchBindings* g_scratch_binds = nullptr;
 
+// Persistent (unbounded) slot range -- SPIKE, see scratch_slots.hpp's PersistentBindings comment. Plain
+// global (NOT thread_local): read-only, immutable for the process once set via set_persistent_bindings
+// (its implementation lives near set_scratch_bindings below), so every thread safely reads the same
+// pointer with no synchronization. null (the default) => no id is ever persistent-slot-bound.
+const PersistentBindings* g_persistent_binds = nullptr;
+
 static Node* op_embed(Node* table, const int* ids, int T) {
     const int C = table->cols;
     Node* out = mk_node(Op::Embed, T, C);
@@ -280,11 +286,20 @@ static Node* op_embed(Node* table, const int* ids, int T) {
     for (int t = 0; t < T; ++t) {
         // A bound scratch slot embeds from its fragments; pos_emb ids (small positions) never satisfy
         // is_scratch_slot, so this branch is naturally inert for the position table.
-        if (binds && is_scratch_slot(ids[t]) && binds->bound(ids[t]))
+        if (binds && is_scratch_slot(ids[t]) && binds->bound(ids[t])) {
             encode_slot(table->data.data(), C, binds->fragments(ids[t]), binds->encoding,
                         out->data.data() + static_cast<std::size_t>(t) * C, binds->enc_w);
-        else
+        } else if (is_persistent_slot(ids[t], VOCAB)) {
+            // UNCONDITIONAL for any id >= VOCAB -- never falls through to tab[ids[t],j] below, which
+            // would read out of the table's [VOCAB,C] bounds. persistent_fragments is null/unbound-safe
+            // (empty -> encode_slot's zero-row contract), so this is correct whether or not a real
+            // persistent table is installed yet. See PersistentBindings' own comment, scratch_slots.hpp.
+            const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
+            encode_slot(table->data.data(), C, persistent_fragments(g_persistent_binds, ids[t]), enc,
+                        out->data.data() + static_cast<std::size_t>(t) * C, nullptr);
+        } else {
             for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
+        }
     }
     return out;
 }
@@ -587,12 +602,21 @@ static void backward_node(Node& n) {
         for (int t = 0; t < T; ++t) {
             // Adjoint of op_embed's content-derived branch: a bound scratch slot's row grad flows to its
             // fragment rows (encode_slot_bwd); else the plain scatter into the token's own row.
-            if (binds && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t]))
+            if (binds && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t])) {
                 encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
                                 binds->fragments(n.ids[t]), binds->encoding, n.w->grad.data(),
                                 n.w->data.data(), binds->enc_w, binds->enc_w_grad);
-            else
+            } else if (is_persistent_slot(n.ids[t], VOCAB)) {
+                // Same unconditional guard as op_embed's forward branch -- see its comment. An
+                // unbound/table-absent persistent id has empty fragments -> encode_slot_bwd early-
+                // returns (no gradient scattered anywhere), which is correct: nothing to update.
+                const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
+                encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
+                                persistent_fragments(g_persistent_binds, n.ids[t]), enc,
+                                n.w->grad.data(), n.w->data.data(), nullptr, nullptr);
+            } else {
                 for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
+            }
         }
         break;
     }
@@ -1059,6 +1083,11 @@ struct Model {
         if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
             encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
                         g_scratch_binds->enc_w);
+        } else if (is_persistent_slot(id, VOCAB)) {
+            // Same unconditional guard as op_embed's forward branch (backend_cpu.cpp) -- see its
+            // comment. Decode never runs backward, so this path only needs the forward compose.
+            const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
+            encode_slot(tok_emb->data.data(), C, persistent_fragments(g_persistent_binds, id), enc, h, nullptr);
         } else {
             const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
             for (int j = 0; j < C; ++j) h[j] = emb[j];
@@ -1171,6 +1200,11 @@ void build_model() {
 // THIS thread will use for content-derived slot embeddings. The pointee must outlive the forward+backward
 // it drives. Null restores the plain tok_emb lookup exactly. See g_scratch_binds above.
 void set_scratch_bindings(const ScratchBindings* b) { g_scratch_binds = b; }
+
+// Install (or clear) the persistent-slot table (declared near g_scratch_binds above). Unlike the
+// ephemeral table (rebound per window/context), this is read-only and immutable for the process once
+// set. The pointee must outlive every subsequent forward/forward_one/backward until cleared or replaced.
+void set_persistent_bindings(const PersistentBindings* b) { g_persistent_binds = b; }
 
 // save_model / load_model live in engine_core.cpp: serialization is backend-agnostic
 // and goes through params_ptr() + the host/device sync hooks.
