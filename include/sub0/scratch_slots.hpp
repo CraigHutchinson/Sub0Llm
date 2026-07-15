@@ -61,18 +61,18 @@ constexpr bool is_scratch_slot(int token) {
 //                 magnitude, so powers/exponents (2^100, 1.23e45) map in by construction; see below.
 enum class SlotEncoding { MeanPool, CharEncoder, Hash, Scalar };
 
-// FINDING (2026-07-16, spike scale d196, single run, tests/scratchspike_engine_tests.cpp "CONTENT
-// (starts-with) reasoning -- Hash/RoPE positional-binding A/B"): on content_select_task (#4, "which
-// slot's OOV starts with letter X" -- excluded from build_dataset_scratch because nothing else beats
-// chance ~1/K): MeanPool held-out 0.375 (chance 0.333, ~1 std-error, i.e. not really above chance, matching
-// the theoretical prediction that it CAN'T carry position); Hash held-out 0.450 (~2.7 std-errors above
-// chance), with held-out tracking drilled closely (0.450 vs 0.475) -- generalizing to unseen OOVs, not
-// memorizing. Modest (like b7896ab's own CharEncoder finding) but the DIRECTION is real: a positional
-// binding delivers a positional signal a permutation-invariant pool structurally cannot, exactly the
-// theory predicted. Single seed/run, spike scale -- not a multi-seed statistical confirmation or a
-// production-readiness claim (same caveat level b7896ab used for CharEncoder). Not yet wired into any
-// production curriculum or CLI flag -- SlotEncoding::Hash exists and works but nothing selects it outside
-// this spike test.
+// FINDING (2026-07-16, spike scale d196, tests/scratchspike_engine_tests.cpp "CONTENT (starts-with)
+// reasoning -- Hash/RoPE positional-binding A/B"): on content_select_task (#4, "which slot's OOV starts
+// with letter X" -- excluded from build_dataset_scratch because nothing else beats chance ~1/K): a first
+// single run looked strong (MeanPool held-out 0.375, Hash 0.450); a 3-training-seed follow-up (weight init
+// is deterministic here, only training ORDER varies) tempered that -- mean held-out MeanPool 0.356, Hash
+// 0.403 (chance 0.333), with one seed showing BOTH arms collapse to an IDENTICAL degenerate output (no gap
+// that seed -- the same failure mode b7896ab's own CONTAINS A/B first noted) and the other two showing a
+// clear Hash win. Directionally consistent (Hash never underperforms MeanPool across seeds) but NOT
+// statistically decisive at n=3 (paired t~2.0, df=2). Read this as "promising direction confirmed across
+// seeds, not yet a strong/reliable effect" -- weaker confidence than the first run alone suggested. Not yet
+// wired into any production curriculum or CLI flag -- SlotEncoding::Hash exists and works but nothing
+// selects it outside this spike test.
 // NOTE (motivation, not a correctness caveat): positional queries are NOT otherwise unanswerable -- the
 // existing combine/uncombine mechanism already gives a resolve-then-attend route (reveal a slot's real
 // fragment bytes into the stream, then plain attention handles "starts with"/"ends with"/Nth-char over

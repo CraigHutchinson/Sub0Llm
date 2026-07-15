@@ -502,8 +502,15 @@ TEST_CASE("scratchspike: CONTENT reasoning WITH content-derived slot embeddings 
 // meanpool-alternatives-prior-art-and-math). Hash has NO learned params, so both arms use the SAME
 // train_steps path (no separate single-threaded harness like CharEncoder needed). If positional binding is
 // the missing lever, WITH-Hash should move held-out off ~1/K where WITH-MeanPool could not.
+//
+// MULTI-SEED: build_model()'s weight init is deterministic (fixed-seed, not parameterized here), so the
+// only independently-variable axis is training ORDER (the window-sampling rng) -- run each arm across a
+// few different training-order seeds and report all of them plus the mean, rather than trusting a single
+// trajectory. A real finding should hold up across all seeds, not just the one originally tried.
 TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- Hash/RoPE positional-binding A/B", "[.scratchspike]") {
     constexpr int kK = 3;
+    constexpr unsigned kSeeds[] = {1, 2, 3};
+    constexpr int kNumSeeds = 3;
     Tokenizer tk;
     {
         std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
@@ -518,11 +525,11 @@ TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- Hash/RoPE positional
     const ss::Dataset ds = ss::build_dataset_content(tk, split, kK, dopt);
     REQUIRE(ds.doc_bindings.size() + 1 == ds.doc_starts.size());
 
-    auto run = [&](sub0::SlotEncoding enc, double& drilled) {
+    auto run = [&](sub0::SlotEncoding enc, unsigned seed, double& drilled) {
         sub0::build_model();
         reset_opt_state();
         sub0::AdamW opt(kLr);
-        std::mt19937 rng(1);
+        std::mt19937 rng(seed);
         double held = 0.0;
         for (int r = 0; r < kEvalRounds; ++r) {
             train_steps(ds, opt, kStepsPerEval, rng, /*content_embed=*/true, kWindowT, enc);
@@ -531,19 +538,29 @@ TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- Hash/RoPE positional
         }
         return held;
     };
-    double drilled_mp = 0.0, drilled_hash = 0.0;
-    const double held_mp   = run(sub0::SlotEncoding::MeanPool, drilled_mp);
-    const double held_hash = run(sub0::SlotEncoding::Hash, drilled_hash);
 
-    char line[288];
-    std::snprintf(line, sizeof line,
-        "\n=== scratchspike #4 CONTENT (starts-with) via Hash/RoPE positional binding (K=%d) @%d (chance = %.3f) ===\n"
-        "  MeanPool: DRILLED %.3f | HELD-OUT %.3f\n"
-        "  Hash:     DRILLED %.3f | HELD-OUT %.3f\n",
-        kK, kEvalRounds * kStepsPerEval, 1.0 / kK, drilled_mp, held_mp, drilled_hash, held_hash);
-    WARN(line);
-    REQUIRE(std::isfinite(held_mp));
-    REQUIRE(std::isfinite(held_hash));
+    std::string report = "\n=== scratchspike #4 CONTENT (starts-with) via Hash/RoPE positional binding "
+                         "(K=3) @3000, multi-seed ===\n";
+    char line[224];
+    double sum_mp = 0.0, sum_hash = 0.0;
+    for (unsigned seed : kSeeds) {
+        double d_mp = 0.0, d_hash = 0.0;
+        const double h_mp   = run(sub0::SlotEncoding::MeanPool, seed, d_mp);
+        const double h_hash = run(sub0::SlotEncoding::Hash, seed, d_hash);
+        sum_mp += h_mp; sum_hash += h_hash;
+        std::snprintf(line, sizeof line,
+            "  seed %u | MeanPool: drilled %.3f held-out %.3f | Hash: drilled %.3f held-out %.3f\n",
+            seed, d_mp, h_mp, d_hash, h_hash);
+        report += line;
+    }
+    const double mean_mp = sum_mp / static_cast<double>(kNumSeeds);
+    const double mean_hash = sum_hash / static_cast<double>(kNumSeeds);
+    std::snprintf(line, sizeof line, "  MEAN held-out (chance = 0.333): MeanPool %.3f | Hash %.3f\n",
+                 mean_mp, mean_hash);
+    report += line;
+    WARN(report);
+    REQUIRE(std::isfinite(mean_mp));
+    REQUIRE(std::isfinite(mean_hash));
 }
 
 // A/B on an ORDER-AGNOSTIC content task (which slot CONTAINS char X): same task/everything, trained+eval'd
