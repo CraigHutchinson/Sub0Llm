@@ -20,6 +20,7 @@
 // constexpr table in include/sub0/layout.hpp.
 
 #include "sub0/core.hpp"
+#include "sub0/cpu_affinity.hpp"    // P-core-first thread pinning (hybrid Intel CPUs) -- see its own header comment
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
@@ -1139,6 +1140,8 @@ static void ensure_thread_built() {
     ensure_shared_params();                               // heap-alloc the shared weight/grad/moment arenas once
     set_flush_denormals();                                // FTZ/DAZ for this thread's MXCSR
     const int tid = omp_get_thread_num() % MAX_WORKERS;   // clamp; train_batch caps the width
+    sub0::pin_current_thread_p_first(tid);                // P-cores first (see cpu_affinity.hpp); a hint,
+                                                            // never required -- silently no-ops if it fails
     // Each thread owns its slot (unique tid within the team), so this lazy alloc needs no lock.
     if (!g_workers[tid]) g_workers[tid] = std::make_unique<Worker>();
     W = g_workers[tid].get();                             // grad spans now reference this slot
@@ -1210,7 +1213,10 @@ void sync_params_to_device() {}
 // serialization (save_model / load_model) are backend-agnostic and live in
 // engine_core.cpp.
 
-void graph_reset() { W->pool_used = 0; W->act_used = 0; }
+// ensure_thread_built() matches forward()/forward_one() below: a caller running on a thread that has
+// never touched the engine before (e.g. a freshly-spawned OpenMP worker) must not dereference a null
+// thread_local W. Idempotent -- cheap to call even when W is already built.
+void graph_reset() { ensure_thread_built(); W->pool_used = 0; W->act_used = 0; }
 
 Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
@@ -1327,7 +1333,21 @@ void AdamW::step() {
     // PARAM_LAYOUT (layout.hpp) walks the SAME sequential param slots build_layout()'s mk_param()
     // calls created (that lock-step is this table's whole reason to exist), so it doubles here as
     // the shape+kind lookup W->views alone doesn't carry.
-    for (const ParamDesc& pd : PARAM_LAYOUT) {
+    //
+    // Data-parallel across param TENSORS -- this was entirely single-threaded before (confirmed
+    // empirically: a d448 CPU training run showed a repeating ~10s-busy / ~30s-near-idle-at-~1-core
+    // cycle on EVERY step, not just the periodic eval). Each PARAM_LAYOUT entry owns a DISJOINT
+    // [off, off+n) slice of every param/grad/moment array (that IS what "layout" means), so different
+    // entries never touch the same memory -- safe to run concurrently with no synchronization.
+    // muon_step_one's `upd` scratch buffer is a local std::vector per call, so concurrent calls for
+    // different matrices don't share it either. newton_schulz5 (muon.hpp) only uses `#pragma omp simd`
+    // internally, never `#pragma omp parallel` -- no nested-parallelism thread-explosion risk here.
+    // schedule(dynamic): Muon-eligible entries (newton_schulz5, several matrix multiplies) cost far
+    // more than plain-AdamW entries, so a static chunking would load-balance badly.
+    const int n_layout = static_cast<int>(PARAM_LAYOUT.size());
+    #pragma omp parallel for num_threads(DEFAULT_THREADS) schedule(dynamic)
+    for (int pi = 0; pi < n_layout; ++pi) {
+        const ParamDesc& pd = PARAM_LAYOUT[static_cast<std::size_t>(pi)];
         const bool muon_eligible = use_muon_ && is_muon_kind(pd.kind);   // shared set, layout.hpp
         if (muon_eligible) {
             muon_step_one(pd.off, pd.rows, pd.cols, muon_lr_, muon_beta_, wd_, gs);
