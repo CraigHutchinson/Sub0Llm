@@ -197,10 +197,12 @@ embedding table cannot represent without a real per-window device-side lookup ke
 `SUB0_COMPUTE=HYBRID` ("Phase 3", `cmake/Backends.cmake`). The tractable near-term path is narrower and
 already buildable on existing infrastructure: SOURCE-ROUTED splitting, where windows drawn from a
 content-embed-active blend source (`--scratch-mix`/`--op-mix`) run on CPU while every other window in the
-SAME batch (base corpus, etc. -- already tagged per-window via `src_idx`) runs on GPU concurrently,
-gradients merged before the shared optimizer step. This is what actually unblocks verifying any of the
-three encoders above at production scale in reasonable time, not just a throughput nicety -- see project
-memory `hybrid-cpu-gpu-execution-design` for the full design (not yet implemented).
+SAME batch (base corpus, etc. -- already tagged per-window via `src_idx`) runs on GPU, gradients merged
+before the shared optimizer step. `GpuTrainer::step()`'s CUDA call is synchronous today (it reads the
+step's loss back to the host before returning), so real overlap needs either a separate host thread for
+the CPU sub-batch or splitting the device call into launch/finish -- not "free" async overlap, see project
+memory `hybrid-cpu-gpu-execution-design` for the corrected design. Still what actually unblocks verifying
+any of the three encoders above at production scale in reasonable time, not just a throughput nicety.
 
 ---
 
