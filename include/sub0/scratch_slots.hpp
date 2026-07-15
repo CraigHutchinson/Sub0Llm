@@ -15,6 +15,7 @@
 
 #include "sub0/casing.hpp"   // TOK_RESERVED_* slot ids + TOK_MARKER_COUNT (engine-safe: no config/engine dep)
 
+#include <cmath>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -32,27 +33,56 @@ constexpr bool is_scratch_slot(int token) {
     return token >= SCRATCH_SLOT_BASE && token < SCRATCH_SLOT_BASE + SCRATCH_SLOT_COUNT;
 }
 
-// How a slot's bound fragments become its embedding. MeanPool + CharEncoder + Scalar are implemented; Hash
-// (order-aware pooling without new params) is a RESERVED extension point -- adding one is a new
-// encode_slot/encode_slot_bwd arm below, with no change to any caller. (Until it exists, it falls through
-// to MeanPool.)
-// TODO(order-sensitive-slot-encoding): neither MeanPool nor CharEncoder can carry fragment ORDER -- both
-// are `sum/mean of a per-fragment function`, the Deep Sets canonical form (Zaheer et al. 2017) for any
-// PERMUTATION-INVARIANT set function, so this is a representational ceiling, not a training gap (confirmed:
-// b7896ab's own CharEncoder finding was on the order-AGNOSTIC "contains X" probe, not "starts with X"; see
-// project memory scratch-content-embedding-meanpool-vs-charencoder). A RoPE-style positional rotation
-// applied to each fragment (by its position within the slot) before pooling is the leading candidate to
-// realize the Hash arm below with real order-sensitivity, at zero new params -- see project memory
-// meanpool-alternatives-prior-art-and-math for the full prior-art survey + ranked candidates.
+// How a slot's bound fragments become its embedding. All four arms are implemented.
+// MeanPool and CharEncoder are BOTH permutation-invariant -- `sum/mean of a per-fragment function` is the
+// Deep Sets canonical form (Zaheer et al. 2017) for any function invariant to reordering its inputs, so
+// neither can carry fragment ORDER no matter how much training (confirmed: b7896ab's own CharEncoder
+// finding was on the order-AGNOSTIC "contains X" probe, not "starts with X" -- see project memory
+// scratch-content-embedding-meanpool-vs-charencoder). Hash below closes that gap: a RoPE-style positional
+// rotation applied to each fragment (by its position within the slot) BEFORE summing, so the composed
+// vector is no longer symmetric under reordering -- see project memory meanpool-alternatives-prior-art-and-math
+// for the full prior-art survey (Deep Sets; Holographic Reduced Representations / Plate 1995; Fourier
+// HRR / VSA phase-binding, of which this rotate-then-bundle IS the real-valued form) this candidate came
+// from, and TODO(order-sensitive-slot-encoding) below for the still-open verification (A/B against
+// `content_select_task`, the #4 "starts with X" probe currently excluded from production because nothing
+// else beats chance at it).
 //   MeanPool    - mean of the fragments' tok_emb rows (no params). Permutation-invariant (order-blind).
 //   CharEncoder - a learned per-fragment [C,C] projection + relu, sum-pooled, adds params. Also
 //                 permutation-invariant (same canonical form as MeanPool) -- helps PRESENCE/contains
 //                 discrimination, not position.
+//   Hash        - RoPE-style positional binding: rotate fragment p's row by a p-dependent angle (position
+//                 0 = identity, so it passes through unrotated), then SUM across fragments. No learned
+//                 params. NOT permutation-invariant (a rotate-then-sum is order-sensitive by construction)
+//                 -- see TODO(order-sensitive-slot-encoding) below; not yet A/B-verified against a real
+//                 positional probe.
 //   Scalar      - a fixed "scientific" encoding of the NUMERIC VALUE the fragments spell (sign, base-10
 //                 magnitude, leading digits). No params, no grad -- the classical-compute result re-entering
 //                 the model as ONE vector (the "brain-swap" scalar re-entry). Bounded regardless of
 //                 magnitude, so powers/exponents (2^100, 1.23e45) map in by construction; see below.
 enum class SlotEncoding { MeanPool, CharEncoder, Hash, Scalar };
+
+// FINDING (2026-07-16, spike scale d196, single run, tests/scratchspike_engine_tests.cpp "CONTENT
+// (starts-with) reasoning -- Hash/RoPE positional-binding A/B"): on content_select_task (#4, "which
+// slot's OOV starts with letter X" -- excluded from build_dataset_scratch because nothing else beats
+// chance ~1/K): MeanPool held-out 0.375 (chance 0.333, ~1 std-error, i.e. not really above chance, matching
+// the theoretical prediction that it CAN'T carry position); Hash held-out 0.450 (~2.7 std-errors above
+// chance), with held-out tracking drilled closely (0.450 vs 0.475) -- generalizing to unseen OOVs, not
+// memorizing. Modest (like b7896ab's own CharEncoder finding) but the DIRECTION is real: a positional
+// binding delivers a positional signal a permutation-invariant pool structurally cannot, exactly the
+// theory predicted. Single seed/run, spike scale -- not a multi-seed statistical confirmation or a
+// production-readiness claim (same caveat level b7896ab used for CharEncoder). Not yet wired into any
+// production curriculum or CLI flag -- SlotEncoding::Hash exists and works but nothing selects it outside
+// this spike test.
+// NOTE (motivation, not a correctness caveat): positional queries are NOT otherwise unanswerable -- the
+// existing combine/uncombine mechanism already gives a resolve-then-attend route (reveal a slot's real
+// fragment bytes into the stream, then plain attention handles "starts with"/"ends with"/Nth-char over
+// literal tokens), exactly what #4b's CoT variant already validates. What Hash would buy, if the A/B
+// confirms it works, is answering in ONE attention hop over the slot token instead of a multi-step resolve
+// trace -- an efficiency win, not the only path to correctness. See project memory
+// meanpool-alternatives-prior-art-and-math for the full reframing.
+constexpr float HASH_ROPE_THETA = 10000.f;   // matches the engine's own ROPE_THETA (backend_cpu.cpp) --
+                                             // this header can't see that constant (no core.hpp dep), so
+                                             // it's a local copy; the value is conventional, not coupled.
 
 // --- Scalar encoding of a numeric value -------------------------------------------------------------
 // The classical computer resolves an op to an exact value (kept, exactly, in the slot's digit fragments);
@@ -206,6 +236,11 @@ inline std::span<const int> persistent_fragments(const PersistentBindings* pb, i
 //                 relu, SUM-pooled. `enc_w` [C,C] (row-major) is REQUIRED. The per-fragment transform +
 //                 relu give the model capacity to keep per-char features separable (the presence signal
 //                 mean-pool dilutes), which the content-reasoning A/B tests need.
+//   Hash        = sum over fragments of rotate(row, ang(position)): each fragment's row is rotated by an
+//                 angle depending on its POSITION within `frags` (0-indexed; position 0 = identity), then
+//                 summed. No params (`enc_w` unused). Interleaved-pair rotation, same convention as
+//                 op_rope (backend_cpu.cpp) but full-width (no head split) and over fragment position
+//                 instead of token position -- see HASH_ROPE_THETA above.
 inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out,
                         const float* enc_w = nullptr) {
     for (int j = 0; j < C; ++j) out[j] = 0.f;
@@ -234,8 +269,23 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
             }
             break;
         }
+        case SlotEncoding::Hash: {
+            const int half = C / 2;
+            for (std::size_t p = 0; p < frags.size(); ++p) {
+                const float* row = tok_emb + static_cast<std::size_t>(frags[p]) * C;
+                for (int m = 0; m < half; ++m) {
+                    const float ang = static_cast<float>(p) * std::pow(HASH_ROPE_THETA, -2.f * m / C);
+                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    const float x0 = row[2 * m], x1 = row[2 * m + 1];
+                    out[2 * m]     += x0 * cs - x1 * sn;
+                    out[2 * m + 1] += x0 * sn + x1 * cs;
+                }
+                if (2 * half < C) out[C - 1] += row[C - 1];   // odd tail: identity, still summed
+            }
+            break;
+        }
         case SlotEncoding::MeanPool:
-        default: {   // Hash reserved -> MeanPool until implemented
+        default: {
             const float inv = 1.f / static_cast<float>(frags.size());
             for (int f : frags) {
                 const float* row = tok_emb + static_cast<std::size_t>(f) * C;
@@ -250,6 +300,8 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
 // Backward (adjoint of encode_slot): scatter the slot-row grad `dout` into the fragment rows of
 // `tok_emb_grad` (and, for CharEncoder, into `enc_w_grad`). MeanPool: dout/nfrags per fragment row.
 // CharEncoder: recompute z per (fragment,channel), gate by relu, accumulate dW and the fragment-row grad.
+// Hash: rotation is orthogonal, so its adjoint is the INVERSE rotation (transpose = rotate by -position)
+// applied to dout -- no params, no tok_emb read (the angle depends only on position, not the row's value).
 inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags, SlotEncoding enc,
                             float* tok_emb_grad, const float* tok_emb = nullptr,
                             const float* enc_w = nullptr, float* enc_w_grad = nullptr) {
@@ -269,6 +321,21 @@ inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags
                     const float dz = (z > 0.f) ? dout[c] : 0.f;        // relu gate; da[c] = dout[c]
                     for (int k = 0; k < C; ++k) { wg[k] += dz * e[k]; eg[k] += dz * w[k]; }
                 }
+            }
+            break;
+        }
+        case SlotEncoding::Hash: {
+            const int half = C / 2;
+            for (std::size_t p = 0; p < frags.size(); ++p) {
+                float* g = tok_emb_grad + static_cast<std::size_t>(frags[p]) * C;
+                for (int m = 0; m < half; ++m) {
+                    const float ang = static_cast<float>(p) * std::pow(HASH_ROPE_THETA, -2.f * m / C);
+                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    const float d0 = dout[2 * m], d1 = dout[2 * m + 1];
+                    g[2 * m]     += d0 * cs + d1 * sn;
+                    g[2 * m + 1] += -d0 * sn + d1 * cs;
+                }
+                if (2 * half < C) g[C - 1] += dout[C - 1];
             }
             break;
         }

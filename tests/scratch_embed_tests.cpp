@@ -81,6 +81,76 @@ TEST_CASE("scratch encoder: CharEncoder forward + backward match finite differen
     }
 }
 
+// --- 1b-ii. Hash (RoPE-style positional binding): forward + backward vs finite differences ------------
+TEST_CASE("scratch encoder: Hash forward + backward match finite differences", "[scratch][embed]") {
+    constexpr int C = 6;   // even, so no odd-tail branch here (that's covered by the order test below)
+    std::vector<float> tab = {
+        0.5f, -0.3f, 0.2f, 0.1f, -0.4f, 0.6f,     // row 0
+       -0.1f,  0.4f, 0.6f, -0.2f, 0.3f, -0.5f,    // row 1
+        0.2f, -0.6f, 0.1f,  0.4f, -0.1f, 0.3f,    // row 2
+    };
+    const std::vector<int> frags = {0, 1, 2};   // three fragments -> positions 0,1,2
+    const float dout[C] = {1.0f, -0.5f, 0.7f, -0.2f, 0.3f, 0.4f};
+
+    auto loss = [&](const std::vector<float>& tabv) {
+        float out[C];
+        sub0::encode_slot(tabv.data(), C, frags, SlotEncoding::Hash, out);
+        float L = 0.f; for (int c = 0; c < C; ++c) L += dout[c] * out[c]; return L;
+    };
+
+    std::vector<float> Tg(tab.size(), 0.f);
+    sub0::encode_slot_bwd(dout, C, frags, SlotEncoding::Hash, Tg.data());
+
+    const float eps = 1e-3f;
+    for (int f : frags) for (int k = 0; k < C; ++k) {
+        auto tp = tab, tm = tab;
+        tp[static_cast<std::size_t>(f) * C + k] += eps;
+        tm[static_cast<std::size_t>(f) * C + k] -= eps;
+        REQUIRE(Tg[static_cast<std::size_t>(f) * C + k] ==
+                Catch::Approx((loss(tp) - loss(tm)) / (2 * eps)).margin(2e-2));
+    }
+}
+
+// --- 1b-iii. Hash is actually ORDER-SENSITIVE (unlike MeanPool/CharEncoder, which are provably
+// permutation-invariant by the Deep Sets canonical form -- see the TODO(order-sensitive-slot-encoding)
+// comment in scratch_slots.hpp). Two direct, training-free checks: (a) reordering the SAME fragments
+// changes the encoded vector, and (b) a lone fragment at position 0 passes through as its own raw row
+// (angle 0 = identity), the deterministic anchor a downstream model could learn to read off directly.
+TEST_CASE("scratch encoder: Hash is order-sensitive, unlike MeanPool/CharEncoder", "[scratch][embed]") {
+    constexpr int C = 8;   // even C: exercises the interleaved-pair path with no odd tail
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> tab(static_cast<std::size_t>(4) * C);
+    for (float& x : tab) x = nd(rng);
+
+    const std::vector<int> fwd = {0, 1, 2};
+    const std::vector<int> rev = {2, 1, 0};   // same SET, reversed order
+
+    float out_fwd[C], out_rev[C];
+    sub0::encode_slot(tab.data(), C, fwd, SlotEncoding::Hash, out_fwd);
+    sub0::encode_slot(tab.data(), C, rev, SlotEncoding::Hash, out_rev);
+    bool differs = false;
+    for (int j = 0; j < C; ++j) if (out_fwd[j] != Catch::Approx(out_rev[j]).margin(1e-5)) differs = true;
+    REQUIRE(differs);   // MeanPool/CharEncoder would be IDENTICAL here (order cannot matter to a sum/mean)
+
+    // Sanity floor: a MeanPool/CharEncoder-style check would ALSO see identical output on reorder --
+    // confirm that premise on the SAME fragments so this test's "differs" claim above isn't a fluke of
+    // the specific vectors chosen (MeanPool must be order-invariant BY CONSTRUCTION, not just empirically).
+    // Approx, not `==`: summing the same three rows in a different ORDER can differ in the last float ULPs
+    // (IEEE-754 addition isn't associative) even though the mathematical mean is order-invariant -- Hash's
+    // difference above (1e-5 margin) is many orders of magnitude larger than this rounding noise.
+    float mp_fwd[C], mp_rev[C];
+    sub0::encode_slot(tab.data(), C, fwd, SlotEncoding::MeanPool, mp_fwd);
+    sub0::encode_slot(tab.data(), C, rev, SlotEncoding::MeanPool, mp_rev);
+    for (int j = 0; j < C; ++j) REQUIRE(mp_fwd[j] == Catch::Approx(mp_rev[j]).margin(1e-5));
+
+    // A lone fragment at position 0 passes through as its own raw row (angle 0 -> identity rotation).
+    const std::vector<int> solo = {1};
+    float out_solo[C];
+    sub0::encode_slot(tab.data(), C, solo, SlotEncoding::Hash, out_solo);
+    for (int j = 0; j < C; ++j) REQUIRE(out_solo[j] == Catch::Approx(tab[1 * C + j]).margin(1e-5));
+}
+
 // --- 1c. Scalar: fixed scientific encoding of the value the fragments spell (the brain-swap re-entry) ---
 namespace {
 std::vector<int> frags_of(const std::string& s) {   // digit/sign/point/exp chars -> byte token ids

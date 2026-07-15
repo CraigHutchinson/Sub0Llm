@@ -140,14 +140,17 @@ Acc eval_select(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::str
     return a;
 }
 
-// #4 CONTENT reason-over-slots: query a first-letter -> the slot whose OOV starts with it (needs content).
+// #4 CONTENT reason-over-slots: query a first-letter -> the slot whose OOV starts with it (needs content
+// AND order -- MeanPool/CharEncoder are provably permutation-invariant so cannot address this; Hash is the
+// order-sensitive candidate, see TODO(order-sensitive-slot-encoding) in scratch_slots.hpp).
 Acc eval_content(const Tokenizer& tk, ScratchOps& ops, const std::vector<std::string>& oovs, int K, unsigned seed,
-                 bool content_embed = false) {
+                 bool content_embed = false, sub0::SlotEncoding enc = sub0::SlotEncoding::MeanPool,
+                 const float* enc_w = nullptr) {
     Acc a;
     std::mt19937_64 rng(seed);
     for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
         const ss::Task k = ss::pick_content_select_task(tk, oovs, qi, K, rng);
-        a.ok += (answer_after_sep(run_task(ops, k, content_embed)) == k.answer_byte); ++a.n;
+        a.ok += (answer_after_sep(run_task(ops, k, content_embed, enc, enc_w)) == k.answer_byte); ++a.n;
     }
     return a;
 }
@@ -254,10 +257,13 @@ void reset_opt_state() {
 
 // `content_embed` on -> each window is trained WITH content-derived slot embeddings: its document's
 // bindings (ds.doc_bindings) are threaded to train_batch so a bound scratch slot embeds from its fragments.
-// `window` is the training-window width (default kWindowT; the K-sweep widens it for long local-CoT traces
-// at high K -- must be <= SEQ_LEN).
+// `enc` selects the encoder (MeanPool default, matching every existing call site); Hash has no learned
+// params so -- unlike CharEncoder's train_ce_steps -- this stays the normal (possibly multi-threaded)
+// train_batch path, no separate single-threaded harness needed. `window` is the training-window width
+// (default kWindowT; the K-sweep widens it for long local-CoT traces at high K -- must be <= SEQ_LEN).
 void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng,
-                 bool content_embed = false, int window = kWindowT) {
+                 bool content_embed = false, int window = kWindowT,
+                 sub0::SlotEncoding enc = sub0::SlotEncoding::MeanPool) {
     std::vector<std::size_t> starts(kBatch);
     std::vector<int>         lens(kBatch);
     std::vector<sub0::ScratchBindings>        binds(kBatch);
@@ -273,7 +279,7 @@ void train_steps(const ss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt1993
                     std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
                                      static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
                 binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
-                    std::span<const std::vector<int>>(ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                    std::span<const std::vector<int>>(ds.doc_bindings[doc]), enc };
                 binds_ptr[static_cast<std::size_t>(b)] = &binds[static_cast<std::size_t>(b)];
             }
         }
@@ -488,6 +494,56 @@ TEST_CASE("scratchspike: CONTENT reasoning WITH content-derived slot embeddings 
     }
     WARN(report);
     REQUIRE(std::isfinite(last_held));
+}
+
+// A/B on the ORDER-SENSITIVE content task (#4, "starts with X"): MeanPool (proven above to sit at chance --
+// mean-pooling discards order entirely) vs Hash (RoPE-style positional binding, see the
+// TODO(order-sensitive-slot-encoding) comment in scratch_slots.hpp and project memory
+// meanpool-alternatives-prior-art-and-math). Hash has NO learned params, so both arms use the SAME
+// train_steps path (no separate single-threaded harness like CharEncoder needed). If positional binding is
+// the missing lever, WITH-Hash should move held-out off ~1/K where WITH-MeanPool could not.
+TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- Hash/RoPE positional-binding A/B", "[.scratchspike]") {
+    constexpr int kK = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_content(tk, split, kK, dopt);
+    REQUIRE(ds.doc_bindings.size() + 1 == ds.doc_starts.size());
+
+    auto run = [&](sub0::SlotEncoding enc, double& drilled) {
+        sub0::build_model();
+        reset_opt_state();
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        double held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_steps(ds, opt, kStepsPerEval, rng, /*content_embed=*/true, kWindowT, enc);
+            drilled = eval_content(tk, ops, split.drilled,  kK, /*seed=*/7,  /*content_embed=*/true, enc).rate();
+            held    = eval_content(tk, ops, split.held_out, kK, /*seed=*/11, /*content_embed=*/true, enc).rate();
+        }
+        return held;
+    };
+    double drilled_mp = 0.0, drilled_hash = 0.0;
+    const double held_mp   = run(sub0::SlotEncoding::MeanPool, drilled_mp);
+    const double held_hash = run(sub0::SlotEncoding::Hash, drilled_hash);
+
+    char line[288];
+    std::snprintf(line, sizeof line,
+        "\n=== scratchspike #4 CONTENT (starts-with) via Hash/RoPE positional binding (K=%d) @%d (chance = %.3f) ===\n"
+        "  MeanPool: DRILLED %.3f | HELD-OUT %.3f\n"
+        "  Hash:     DRILLED %.3f | HELD-OUT %.3f\n",
+        kK, kEvalRounds * kStepsPerEval, 1.0 / kK, drilled_mp, held_mp, drilled_hash, held_hash);
+    WARN(line);
+    REQUIRE(std::isfinite(held_mp));
+    REQUIRE(std::isfinite(held_hash));
 }
 
 // A/B on an ORDER-AGNOSTIC content task (which slot CONTAINS char X): same task/everything, trained+eval'd
