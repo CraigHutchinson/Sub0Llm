@@ -1264,20 +1264,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
     }
 
-    // content_embed needs --scratch-mix (the only curriculum that records structured slot->fragment
-    // binding data today -- scratchspike::Dataset::doc_bindings) and is incompatible with --op-mix (an
-    // op-collapsed slot is never trained with a content-derived embedding, since op-mix windows always
-    // pass null bindings below -- turning it on anyway would feed gen a vector the model never saw
-    // during training). Validated AFTER resume reconciliation so it reflects the FINAL scratch_mix/op_mix.
-    // TODO(content-embed-op-mix): the op_mix<=0.f restriction goes away once op_curriculum.hpp/gsm8k.hpp
-    // record doc_bindings for their collapsed results -- see their own TODO(content-embed-op-mix) markers.
-    content_embed_active = content_embed != 0 && scratch_mix > 0.f && op_mix <= 0.f;
-    if (content_embed && !content_embed_active) {
-        sub0::log::warn("--content-embed requested but disabled: {}",
-                        scratch_mix <= 0.f
-                            ? "no --scratch-mix source to bind from"
-                            : "incompatible with --op-mix > 0 (op-collapsed slots aren't trained this way yet)");
-    }
+    // content_embed needs at least one curriculum that records structured slot->fragment binding data
+    // (scratchspike::Dataset::doc_bindings / op_curriculum::Dataset::doc_bindings) -- plain base-corpus or
+    // --spell-mix windows carry no such table, so they always pass null bindings below (unchanged, plain
+    // reserved-id embedding). Validated AFTER resume reconciliation so it reflects the FINAL scratch_mix/op_mix.
+    content_embed_active = content_embed != 0 && (scratch_mix > 0.f || op_mix > 0.f);
+    if (content_embed && !content_embed_active)
+        sub0::log::warn("--content-embed requested but disabled: no --scratch-mix or --op-mix source to "
+                        "bind from");
 
     sub0::AdamW opt(lr, optimizer == 1);
     if (resumed) opt.set_step_count(adam_t);
@@ -1437,8 +1431,6 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, content-K={}, {} OOVs, {} traces, {} tokens)",
                         static_cast<double>(scratch_mix) * 100.0, kScratchK, contains_k >= 2 ? contains_k : 0,
                         split.drilled.size(), scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
-        if (content_embed_active)
-            sub0::log::line("blend: content-derived scratch embeddings ON (mean-pool, CPU-forced)");
     }
     // --op-mix: blend in the op-delegation curriculum (op_curriculum.hpp). Teaches the model to ROUTE
     // arithmetic to the `math` node (emit a bare [op math]; the node reads the posed expression and supplies
@@ -1446,6 +1438,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // an intermediate result is COLLAPSED to a scratch slot the next step references (the GSM8K chapter's
     // proven mechanisms; docs/DETERMINISTIC_MECHANISMS.md). `op_ds` must outlive the loop (borrowed).
     sub0::op_curriculum::Dataset op_ds;
+    std::size_t op_source_idx = static_cast<std::size_t>(-1);   // sentinel: no op source this run
     if (op_mix > 0.f) {
         sub0::tok::Tokenizer tk;
         std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
@@ -1476,6 +1469,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                             static_cast<double>(op_mix) * 100.0, op_ds.doc_starts.size() - 1,
                             op_ds.tokens.size(), oopt.chain_frac);
         }
+        op_source_idx = sources.size();
         sources.push_back(sub0::BlendSource{
             sub0::TokView::over_int32(op_ds.tokens.data(), op_ds.tokens.size()),
             std::span<const std::uint64_t>(op_ds.doc_starts),
@@ -1488,6 +1482,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                           - static_cast<double>(op_mix));
     if (spell_mix > 0.f || scratch_mix > 0.f || op_mix > 0.f)
         sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
+    if (content_embed_active)
+        sub0::log::line("blend: content-derived scratch embeddings ON (mean-pool, CPU-forced)");
     // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
     // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward
     // kernel's ignore-index path (targets < 0 inert + per-window active[] normalization). Both are
@@ -1595,15 +1591,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                         cpu_mask[base + i] = src.masked() ? src.mask[starts[b] + i] : std::uint8_t{1};
                 }
                 cpu_starts[b] = base;
-                // content_embed: a window drawn from the scratch-mix source gets its document's real
-                // slot->fragment bindings (scratch_ds.doc_bindings); every other window (base corpus,
-                // spell-mix, op-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
+                // content_embed: a window drawn from the scratch-mix or op-mix source gets its document's
+                // real slot->fragment bindings (scratch_ds/op_ds.doc_bindings); every other window (base
+                // corpus, spell-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
                 // matching what content_embed_active's validation guarantees those windows were (and
                 // still are) trained with.
                 if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
                     const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
                     step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
                         std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                    win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
+                } else if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == op_source_idx) {
+                    const std::size_t doc = sub0::doc_of(op_ds.doc_starts, starts[b]);
+                    step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+                        std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
                     win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
                 } else if (content_embed_active) {
                     win_binds[static_cast<std::size_t>(b)] = nullptr;

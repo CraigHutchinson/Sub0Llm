@@ -39,10 +39,15 @@
 namespace sub0::op_curriculum {
 
 // A masked token dataset in the shape the blender consumes (parallel tokens/mask + a document index).
+// `doc_bindings[d]` mirrors scratchspike::Dataset's shape (slot i -> SCRATCH_SLOT_BASE+i's fragment byte
+// ids for document d) -- what content-embed needs to bind a collapsed op result to a real vector instead of
+// a plain reserved-id row. One entry per document (parallel to doc_starts.size()-1); empty per-doc vector if
+// that document collapsed nothing (should not happen here -- every emitted example has >=1 op result).
 struct Dataset {
     std::vector<int>          tokens;
     std::vector<std::uint8_t> mask;        // 1 = graded (prose + routing), 0 = masked (delegated result)
     std::vector<std::uint64_t> doc_starts; // [0, len0, len0+len1, ...]  -- one entry per example + the total
+    std::vector<std::vector<std::vector<int>>> doc_bindings;  // per doc: slot -> fragment token ids
 };
 
 struct Options {
@@ -82,20 +87,18 @@ inline const char* gen_prose(std::mt19937_64& rng) {
 // frame; the node reads EXPR from the prose; the result COLLAPSES to slot S0 (masked) -- uniform with chains.
 inline void emit_single(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& rng, int maxdig) {
     const std::string expr = detail::gen_expr(rng, maxdig);
-    if (nodes::eval(expr).empty()) return;
+    const std::string result = nodes::eval(expr);
+    if (result.empty()) return;
     auto g     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(1); };
     auto m     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(0); };
     auto gtext = [&](const std::string& s) { for (int t : tok::encode(tk, s)) g(t); };
     gtext(std::string(detail::gen_prose(rng)) + expr + "=");
     for (int t : nodes::op_header("math")) g(t);   // route
-    // TODO(content-embed-op-mix): nodes::eval(expr) above computes the exact result but it's discarded --
-    // no doc_bindings-shaped side table like scratchspike::Dataset's (slot -> fragment ids) exists for
-    // this curriculum. That's why --content-embed currently requires --op-mix == 0 (train_stage.cpp) and
-    // why repeatspike's proven harness-collapse mechanism hasn't been connected to real GSM8K yet -- see
-    // project memory persistent-slot-range-engine-substrate and the smooth-noodling-kurzweil plan history.
     m(SCRATCH_SLOT_BASE);                          // result collapsed to slot S0 (masked)
     gtext(".");
     ds.doc_starts.push_back(ds.tokens.size());
+    std::vector<int> frags; for (char c : result) frags.push_back(static_cast<unsigned char>(c));
+    ds.doc_bindings.push_back({ std::move(frags) });   // slot 0 -> the result's byte fragments
 }
 
 // Append a 2-step COLLAPSE chain directly (it needs slot tokens, which build_stream doesn't emit):
@@ -119,7 +122,6 @@ inline void emit_chain(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& r
 
     gtext(A + "+" + B + "=");
     for (int t : nodes::op_header("math")) g(t);   // step-1 route
-    // TODO(content-embed-op-mix): r1/r2 above are discarded, same gap emit_single's TODO documents.
     m(S0);                                          // step-1 result COLLAPSED to slot S0 (masked)
     gtext(". ");                                    // separator
     g(S0);                                          // step-2 REFERENCE (the slot symbol, one token)
@@ -128,6 +130,9 @@ inline void emit_chain(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& r
     m(S1);                                          // step-2 result collapsed to S1 (masked)
     gtext(".");
     ds.doc_starts.push_back(ds.tokens.size());
+    std::vector<int> f1; for (char c : r1) f1.push_back(static_cast<unsigned char>(c));
+    std::vector<int> f2; for (char c : r2) f2.push_back(static_cast<unsigned char>(c));
+    ds.doc_bindings.push_back({ std::move(f1), std::move(f2) });   // slot 0 -> r1, slot 1 -> r2
 }
 
 // An EVAL problem: the prompt (prose + expression, up to the `=`) and the gold answer the node should
@@ -172,6 +177,7 @@ inline Dataset gsm8k_file_dataset(const std::string& path, const tok::Tokenizer&
                 ds.tokens.insert(ds.tokens.end(), ex.tokens.begin(), ex.tokens.end());
                 ds.mask.insert(ds.mask.end(), ex.mask.begin(), ex.mask.end());
                 ds.doc_starts.push_back(ds.tokens.size());
+                ds.doc_bindings.push_back(ex.bindings);   // slot i -> annotation i's result fragments
             }
         }
         if (e == std::string::npos) break;

@@ -122,9 +122,83 @@ TEST_CASE("op_curriculum: gsm8k_file_dataset converts REAL GSM8K annotations to 
     int frames = 0, masked = 0, slot_masked = 0;
     for (std::size_t i = 0; i < ds.tokens.size(); ++i) {
         if (ds.tokens[i] == cas::TOK_TURN_START) ++frames;
-        if (ds.mask[i] == 0) { ++masked; if (ds.tokens[i] == sub0::SCRATCH_SLOT_BASE) ++slot_masked; }
+        // Slots INCREMENT per annotation within a document (S0, S1, ...), not always S0 -- so any id in
+        // the reserved pool counts, not just the literal base (see gsm8k.hpp build_stream's comment).
+        if (ds.mask[i] == 0) { ++masked; if (sub0::is_scratch_slot(ds.tokens[i])) ++slot_masked; }
     }
     REQUIRE(frames == 3);        // 48/2, 48+24, 3*10 -> three delegated op-frames
     REQUIRE(masked == 3);        // exactly the three collapsed results are masked
-    REQUIRE(slot_masked == 3);   // and each is the collapse SLOT (not the digits -- so no fuzzy arithmetic)
+    REQUIRE(slot_masked == 3);   // and each is a collapse SLOT (not the digits -- so no fuzzy arithmetic)
+}
+
+TEST_CASE("op_curriculum: doc_bindings records each collapsed result's fragments, one binding per slot", "[opcurric]") {
+    const auto tk = make_tok();
+    oc::Options o; o.seed = 5; o.n_examples = 200; o.chain_frac = 0.0; o.max_digits = 3;   // single-step only
+    const oc::Dataset ds = oc::build_dataset(tk, o);
+
+    REQUIRE(ds.doc_bindings.size() == ds.doc_starts.size() - 1);   // one entry per document
+    int checked = 0;
+    for (std::size_t d = 0; d + 1 < ds.doc_starts.size(); ++d) {
+        REQUIRE(ds.doc_bindings[d].size() == 1);          // single-step -> exactly slot 0 bound
+        const std::vector<int>& frag = ds.doc_bindings[d][0];
+        REQUIRE_FALSE(frag.empty());
+        for (int t : frag) REQUIRE((t >= '0' && t <= '9'));   // the result's digits, byte-encoded
+        ++checked;
+    }
+    REQUIRE(checked > 100);
+}
+
+TEST_CASE("op_curriculum: chain doc_bindings binds slot 0 to r1 and slot 1 to r2", "[opcurric]") {
+    const auto tk = make_tok();
+    oc::Options o; o.seed = 9; o.n_examples = 150; o.chain_frac = 1.0; o.max_digits = 3;   // chains only
+    const oc::Dataset ds = oc::build_dataset(tk, o);
+    const auto compute = nd::make_compute_callback(nd::builtin());
+    const int S0 = sub0::SCRATCH_SLOT_BASE, S1 = sub0::SCRATCH_SLOT_BASE + 1;
+
+    int checked = 0;
+    for (std::size_t d = 0; d + 1 < ds.doc_starts.size(); ++d) {
+        REQUIRE(ds.doc_bindings[d].size() == 2);           // step-1 result (S0) + step-2 result (S1)
+        const std::size_t lo = ds.doc_starts[d], hi = ds.doc_starts[d + 1];
+        // Resolve step 1 directly via the production callback to cross-check doc_bindings[d][0] independently.
+        std::size_t close1 = lo;
+        for (std::size_t i = lo; i < hi; ++i) if (ds.tokens[i] == cas::TOK_TURN_END) { close1 = i; break; }
+        REQUIRE(close1 > lo);
+        const std::vector<int> ctx1(ds.tokens.begin() + static_cast<std::ptrdiff_t>(lo),
+                                    ds.tokens.begin() + static_cast<std::ptrdiff_t>(close1) + 1);
+        const std::vector<int> inj1 = compute(ctx1);
+        std::string r1; for (int t : inj1) if (t >= '0' && t <= '9') r1.push_back(static_cast<char>(t));
+        std::string bound1; for (int t : ds.doc_bindings[d][0]) bound1.push_back(static_cast<char>(t));
+        REQUIRE(bound1 == r1);
+        REQUIRE_FALSE(ds.doc_bindings[d][1].empty());      // step-2 result was also recorded
+        // The stream references S0 by the slot id, never r1's digits (the chaining-copy is the SYMBOL).
+        int s0 = 0, s1 = 0;
+        for (std::size_t i = lo; i < hi; ++i) { if (ds.tokens[i] == S0) ++s0; if (ds.tokens[i] == S1) ++s1; }
+        REQUIRE(s0 == 2); REQUIRE(s1 == 1);
+        ++checked;
+    }
+    REQUIRE(checked > 50);
+}
+
+TEST_CASE("op_curriculum: gsm8k_file_dataset doc_bindings match each annotation's stated result, one slot per annotation",
+         "[opcurric]") {
+    const auto tk = make_tok();
+    const std::string corpus =
+        "how many?\nhe had 48/2 = <<48/2=24>> 24 left. then 48+24 = <<48+24=72>> 72 total.\n#### 72\n<|endoftext|>\n"
+        "and?\nso 3*10 = <<3*10=30>> 30 apples.\n#### 30\n<|endoftext|>\n";
+    const auto tmp = std::filesystem::temp_directory_path() / "sub0_gsm8k_bindings_test.txt";
+    { std::ofstream os(tmp, std::ios::binary); os << corpus; }
+
+    const oc::Dataset ds = oc::gsm8k_file_dataset(tmp.string(), tk);
+    std::error_code ec; std::filesystem::remove(tmp, ec);
+
+    REQUIRE(ds.doc_bindings.size() == 2);
+    REQUIRE(ds.doc_bindings[0].size() == 2);   // problem 1: two annotations -> slot 0 (24) + slot 1 (72)
+    REQUIRE(ds.doc_bindings[1].size() == 1);   // problem 2: one annotation -> slot 0 (30)
+
+    auto as_str = [](const std::vector<int>& frag) {
+        std::string s; for (int t : frag) s.push_back(static_cast<char>(t)); return s;
+    };
+    REQUIRE(as_str(ds.doc_bindings[0][0]) == "24");
+    REQUIRE(as_str(ds.doc_bindings[0][1]) == "72");
+    REQUIRE(as_str(ds.doc_bindings[1][0]) == "30");
 }

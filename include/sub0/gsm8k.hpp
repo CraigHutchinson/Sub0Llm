@@ -88,7 +88,12 @@ inline std::vector<int> op_frame() {
 // A tokenized training example: prose + op-frames are GRADED (mask 1 -- the model learns the reasoning and
 // the routing); each verified annotation's RESULT is MASKED (mask 0 -- the node fills it, so the model never
 // learns the fuzzy arithmetic). `ops` verified annotations became op-frames; `dropped` failed verification.
-struct Example { std::vector<int> tokens; std::vector<std::uint8_t> mask; int ops = 0, dropped = 0; };
+// `bindings[i]` is the fragment byte ids collapse slot `SCRATCH_SLOT_BASE+i` was bound to (empty if `collapse`
+// was false, or if this document had more annotations than the slot pool -- see build_stream's cap).
+struct Example {
+    std::vector<int> tokens; std::vector<std::uint8_t> mask; int ops = 0, dropped = 0;
+    std::vector<std::vector<int>> bindings;
+};
 
 // Build one Example from a GSM8K solution. `encode` tokenizes prose -- injected so this stays
 // tokenizer-agnostic and unit-testable (train_stage passes the real sub0::encode). GSM8K writes each
@@ -98,7 +103,12 @@ struct Example { std::vector<int> tokens; std::vector<std::uint8_t> mask; int op
 // `collapse` (production/train use): the masked result is a single scratch SLOT token instead of R's digits,
 // matching op_curriculum + gen's collapse (gen binds the live result to the slot and expands it for display).
 // The chaining stays via the prose's literal numbers (the node reads the posed expression), so the slot is
-// only the injected-result placeholder -- one slot id suffices (the model never emits it; it is masked).
+// only the injected-result placeholder. Slots INCREMENT per annotation within the document (S0, S1, ...),
+// matching gen_stage.cpp's own collapse callback (which binds `SCRATCH_SLOT_BASE + bindings.size()` each
+// time it resolves an op) -- reusing S0 for every annotation would give doc_bindings (op_curriculum.hpp) no
+// way to record more than one result per document, since a slot can only hold ONE binding per document (the
+// same invariant scratchspike::Dataset::doc_bindings relies on). A document with more annotations than the
+// slot pool falls back to literal digits for the overflow (mirrors gen's "pool full -> digits").
 inline Example build_stream(std::string_view sol,
                             const std::function<std::vector<int>(std::string_view)>& encode,
                             bool collapse = false) {
@@ -112,10 +122,13 @@ inline Example build_stream(std::string_view sol,
         if (!s.is_op)           { emit_text(s.text, 1); continue; }
         if (!verify(s.op))      { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
         for (int t : op_frame())   emit(t, 1);                     // GRADED: `[op math]` (route; expr is in the prose)
-        // TODO(content-embed-op-mix): s.op.result IS available here (unlike op_curriculum.hpp's synthetic
-        // curriculum, which discards nodes::eval's result) but still isn't recorded into a doc_bindings-
-        // shaped side table -- see op_curriculum.hpp's emit_single TODO for the full gap this blocks.
-        if (collapse) emit(SCRATCH_SLOT_BASE, 0);                  // MASKED: collapsed-result slot
+        const int slot_i = static_cast<int>(ex.bindings.size());
+        if (collapse && slot_i < SCRATCH_SLOT_COUNT) {
+            emit(SCRATCH_SLOT_BASE + slot_i, 0);                   // MASKED: collapsed-result slot (incrementing)
+            std::vector<int> frags;
+            for (char c : s.op.result) frags.push_back(static_cast<unsigned char>(c));
+            ex.bindings.push_back(std::move(frags));
+        }
         else for (char c : s.op.result) emit(static_cast<unsigned char>(c), 0);   // MASKED: the node's digits
         ++ex.ops;
         // Strip the redundant result GSM8K repeats right after the annotation (leading ws + R + word

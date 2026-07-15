@@ -131,6 +131,48 @@ TEST_CASE("gsm8k: build_stream on the real solution masks exactly the two result
     REQUIRE(frames == 2);
 }
 
+TEST_CASE("gsm8k: build_stream(collapse=true) records incrementing per-annotation slot bindings", "[gsm8k]") {
+    const std::string sol =
+        "Natalia sold 48/2 = <<48/2=24>> 24 clips in May.\n"
+        "Natalia sold 48+24 = <<48+24=72>> 72 clips altogether.\n#### 72";
+    const gs::Example ex = gs::build_stream(sol, byte_encode, /*collapse=*/true);
+
+    REQUIRE(ex.ops == 2);
+    REQUIRE(ex.bindings.size() == 2);
+    auto as_str = [](const std::vector<int>& frag) {
+        std::string s; for (int t : frag) s.push_back(static_cast<char>(t)); return s;
+    };
+    REQUIRE(as_str(ex.bindings[0]) == "24");
+    REQUIRE(as_str(ex.bindings[1]) == "72");
+
+    // The stream carries INCREMENTING slot ids (S0 then S1), not S0 reused -- otherwise a per-document
+    // doc_bindings table (op_curriculum.hpp) could only ever record the LAST annotation's result.
+    std::vector<int> slots_seen;
+    for (std::size_t i = 0; i < ex.tokens.size(); ++i)
+        if (ex.mask[i] == 0 && sub0::is_scratch_slot(ex.tokens[i])) slots_seen.push_back(ex.tokens[i]);
+    REQUIRE(slots_seen == std::vector<int>{ sub0::SCRATCH_SLOT_BASE, sub0::SCRATCH_SLOT_BASE + 1 });
+}
+
+TEST_CASE("gsm8k: build_stream(collapse=true) falls back to literal digits once the slot pool is exhausted", "[gsm8k]") {
+    std::string sol;
+    for (int i = 1; i <= sub0::SCRATCH_SLOT_COUNT + 1; ++i) {
+        const std::string e = std::to_string(i) + "+0", r = std::to_string(i);
+        sol += e + "=<<" + e + "=" + r + ">>" + r + " ";
+    }
+    const gs::Example ex = gs::build_stream(sol, byte_encode, /*collapse=*/true);
+
+    REQUIRE(ex.ops == sub0::SCRATCH_SLOT_COUNT + 1);        // every annotation still verified + delegated
+    REQUIRE(ex.bindings.size() == static_cast<std::size_t>(sub0::SCRATCH_SLOT_COUNT));   // pool caps the bindings
+
+    int slot_masked = 0, digit_masked = 0;
+    for (std::size_t i = 0; i < ex.tokens.size(); ++i) {
+        if (ex.mask[i] != 0) continue;
+        if (sub0::is_scratch_slot(ex.tokens[i])) ++slot_masked; else ++digit_masked;
+    }
+    REQUIRE(slot_masked == sub0::SCRATCH_SLOT_COUNT);   // the first SCRATCH_SLOT_COUNT annotations collapse
+    REQUIRE(digit_masked > 0);                          // the overflow annotation falls back to digits
+}
+
 // Close the train<->gen loop: the EXACT op-frame the builder emits dispatches through the PRODUCTION compute
 // callback (node_frame.hpp) to the right result -- a model trained on these frames, run through gen's wired
 // callback, gets the node's exact answer.

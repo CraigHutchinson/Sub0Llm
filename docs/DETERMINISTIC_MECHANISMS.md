@@ -610,10 +610,13 @@ is the named-region case specifically, not a general replacement for the ephemer
    emits `[op add]` for `A + B =` → the node injects the exact sum → held-out **1.000**. Non-op regions inert.
    *Remaining (updated 2026-07-16):* the compute-delegation curriculum landed as its OWN `--op-mix` flag,
    not folded into `--scratch-mix` as this line originally proposed — see `op_curriculum.hpp`/`gsm8k.hpp`
-   and the GSM8K capstone above. Still open: a decode-to-text step for a full Unigram deployment (the byte
-   parse suffices for this project's byte-heavy tokenizer); real library nodes; recording `--op-mix`'s
-   collapsed results into a `doc_bindings`-shaped table so it can share `--content-embed` with
-   `--scratch-mix` (`grep -rn "TODO(content-embed-op-mix)"`).
+   and the GSM8K capstone above. `--op-mix` now records its collapsed results into a `doc_bindings`-shaped
+   table too (mirroring `scratchspike::Dataset`; `gsm8k.hpp`'s collapse slots increment per annotation
+   within a document — S0, S1, ... — instead of always reusing S0, so each slot holds exactly one binding
+   per document, matching `--content-embed`'s invariant), so `--content-embed` now works from `--op-mix`
+   alone, `--scratch-mix` alone, or both blended together (`train_stage.cpp`'s `content_embed_active`,
+   `gen_stage.cpp`'s matching `content_embed_on` gate). Still open: a decode-to-text step for a full Unigram
+   deployment (the byte parse suffices for this project's byte-heavy tokenizer); real library nodes.
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
 whether a *small* model wins with near-zero training. That is the homogenised bet: **teach the model to use

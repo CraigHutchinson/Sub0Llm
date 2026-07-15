@@ -82,12 +82,12 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     std::function<std::vector<int>(const std::vector<int>&)>   compute;
     bool op_collapse = false;   // an --op-mix model: op results COLLAPSE to slots (expanded for display below)
     // content_embed: scratch slots embed as a live function of their bound fragments (mean-pool) instead
-    // of a plain learned row -- ONLY meaningful for a --scratch-mix model (train_stage.cpp requires
-    // scratch_mix>0 and op_mix<=0 to ever persist content_embed=on, so op_on is guaranteed false whenever
-    // this fires; see docs/DETERMINISTIC_MECHANISMS.md / smooth-noodling-kurzweil). `binds` lives for the
-    // whole function so set_scratch_bindings' thread-local pointer stays valid through decode; refreshed
-    // after `combine` mutates `scratch.bindings` (the only mutator reachable here) since ScratchBindings'
-    // span is a snapshot, not a live view.
+    // of a plain learned row -- meaningful for a --scratch-mix model AND/OR an --op-mix model (both now
+    // record doc_bindings; train_stage.cpp requires scratch_mix>0 || op_mix>0 to ever persist
+    // content_embed=on; see docs/DETERMINISTIC_MECHANISMS.md / smooth-noodling-kurzweil). `binds` lives
+    // for the whole function so set_scratch_bindings' thread-local pointer stays valid through decode;
+    // refreshed after `combine` (sp_on) or the op-collapse callback (op_on) mutates scratch.bindings --
+    // the only two mutators reachable here -- since ScratchBindings' span is a snapshot, not a live view.
     bool content_embed_on = false;
     sub0::ScratchBindings binds{};
     if (model_in && *model_in) {
@@ -101,14 +101,12 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
-                content_embed_on = sp_on && cfg.content_embed > 0;
+                content_embed_on = (sp_on || op_on) && cfg.content_embed > 0;
                 if (sp_on) {
                     scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
                     expand  = [&scratch](int token) { return scratch.expand(token); };
                     combine = [&scratch, &binds, content_embed_on](const std::vector<int>& frags) {
                         std::vector<int> r = scratch.combine(frags);
-                        // combine() is the only mutator of scratch.bindings reachable when content_embed_on
-                        // (op_collapse's scratch.bind() can't coexist -- see the field comment above), so
                         // refreshing the snapshot here keeps it current for every subsequent forward_one.
                         if (content_embed_on) binds = scratch.to_bindings();
                         return r;
@@ -120,7 +118,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                     // COLLAPSE: resolve the op, bind the exact result to the next free scratch slot, inject
                     // that single slot token (not the digits) -- so a chained step references it as a symbol.
                     auto inner = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
-                    compute = [&scratch, inner](const std::vector<int>& c) -> std::vector<int> {
+                    compute = [&scratch, &binds, content_embed_on, inner](const std::vector<int>& c) -> std::vector<int> {
                         const std::vector<int> r = inner(c);
                         if (r.empty()) return r;
                         std::string val;
@@ -130,6 +128,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                         if (val.empty() || idx >= sub0::SCRATCH_SLOT_COUNT) return r;   // pool full -> digits
                         std::vector<int> frags; for (char ch : val) frags.push_back(static_cast<unsigned char>(ch));
                         scratch.bind(sub0::SCRATCH_SLOT_BASE + idx, std::move(frags));
+                        if (content_embed_on) binds = scratch.to_bindings();   // refresh the live snapshot
                         return { sub0::SCRATCH_SLOT_BASE + idx };
                     };
                     op_collapse = true;
