@@ -552,6 +552,18 @@ Recommendation: migrate scratch slots to named regions (unifying with the op fra
 form only where a binding must occupy one position. This uncaps the pool and opens the long-term-memory path.
 **Backlog** (a real refactor of the binding table + curricula).
 
+**Superseded in practice by a different uncapping strategy (2026-07-16) — reconciling the two.** When the
+pool actually needed uncapping (for a persistent compound-word cache, not a format-bump concern), the path
+taken was NOT named regions — it was single-token ids `>= VOCAB` (`PersistentBindings`, see the PROVEN
+section above and project memory `persistent-slot-range-engine-substrate`). Named regions (multi-token,
+persists as plain text) and the unbounded id range (single-token, compact, but ids aren't human-readable
+text) solve different problems: named regions win when a binding must **survive as text** (round-trip
+through re-tokenization, a real corpus, an external store) — genuinely the long-term-memory case this
+section was written for. The unbounded id range wins when the binding is **process-local and compactness
+matters** (a compound-cache entry doesn't need to survive as text; it's rebuilt from a DB keyed by the word
+itself, not by the id). Both remain valid, for different jobs — this section's "long-term memory" framing
+is the named-region case specifically, not a general replacement for the ephemeral pool.
+
 ---
 
 ## Open questions / risks
@@ -596,8 +608,12 @@ form only where a binding must occupy one position. This uncaps the pool and ope
    through `kv_decode_generate`'s compute seam on the EXISTING `TOK_TURN_START/END` markers (zero new ids; an
    OP region is `TOK_TURN_START op <name> <operands> TOK_TURN_END`, a chat tool-call). End-to-end: a d128 model
    emits `[op add]` for `A + B =` → the node injects the exact sum → held-out **1.000**. Non-op regions inert.
-   *Remaining:* fold a compute-delegation **curriculum** into `--scratch-mix`; a decode-to-text step for a full
-   Unigram deployment (the byte parse suffices for this project's byte-heavy tokenizer); real library nodes.
+   *Remaining (updated 2026-07-16):* the compute-delegation curriculum landed as its OWN `--op-mix` flag,
+   not folded into `--scratch-mix` as this line originally proposed — see `op_curriculum.hpp`/`gsm8k.hpp`
+   and the GSM8K capstone above. Still open: a decode-to-text step for a full Unigram deployment (the byte
+   parse suffices for this project's byte-heavy tokenizer); real library nodes; recording `--op-mix`'s
+   collapsed results into a `doc_bindings`-shaped table so it can share `--content-embed` with
+   `--scratch-mix` (`grep -rn "TODO(content-embed-op-mix)"`).
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
 whether a *small* model wins with near-zero training. That is the homogenised bet: **teach the model to use
