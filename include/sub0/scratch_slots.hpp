@@ -36,8 +36,18 @@ constexpr bool is_scratch_slot(int token) {
 // (order-aware pooling without new params) is a RESERVED extension point -- adding one is a new
 // encode_slot/encode_slot_bwd arm below, with no change to any caller. (Until it exists, it falls through
 // to MeanPool.)
-//   MeanPool    - mean of the fragments' tok_emb rows (no params).
-//   CharEncoder - a learned per-fragment [C,C] projection + relu, sum-pooled (order-sensitive, adds params).
+// TODO(order-sensitive-slot-encoding): neither MeanPool nor CharEncoder can carry fragment ORDER -- both
+// are `sum/mean of a per-fragment function`, the Deep Sets canonical form (Zaheer et al. 2017) for any
+// PERMUTATION-INVARIANT set function, so this is a representational ceiling, not a training gap (confirmed:
+// b7896ab's own CharEncoder finding was on the order-AGNOSTIC "contains X" probe, not "starts with X"; see
+// project memory scratch-content-embedding-meanpool-vs-charencoder). A RoPE-style positional rotation
+// applied to each fragment (by its position within the slot) before pooling is the leading candidate to
+// realize the Hash arm below with real order-sensitivity, at zero new params -- see project memory
+// meanpool-alternatives-prior-art-and-math for the full prior-art survey + ranked candidates.
+//   MeanPool    - mean of the fragments' tok_emb rows (no params). Permutation-invariant (order-blind).
+//   CharEncoder - a learned per-fragment [C,C] projection + relu, sum-pooled, adds params. Also
+//                 permutation-invariant (same canonical form as MeanPool) -- helps PRESENCE/contains
+//                 discrimination, not position.
 //   Scalar      - a fixed "scientific" encoding of the NUMERIC VALUE the fragments spell (sign, base-10
 //                 magnitude, leading digits). No params, no grad -- the classical-compute result re-entering
 //                 the model as ONE vector (the "brain-swap" scalar re-entry). Bounded regardless of
