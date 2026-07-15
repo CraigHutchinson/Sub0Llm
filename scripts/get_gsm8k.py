@@ -14,6 +14,24 @@ Each example is written as one `<|endoftext|>`-separated document:
     <answer, with <<expr=result>> annotations and the final `#### N`>
     <|endoftext|>
 
+ELI5 -- what is `<<expr=result>>`? It's GSM8K's OWN format, written by the dataset's original authors
+(OpenAI), not something this project adds. A solution reads like:
+
+    There are 80/100 * 10 = <<80/100*10=8>>8 more purple flowers than yellow flowers.
+
+`<<80/100*10=8>>` is a "calculator annotation": a parenthetical aside meaning "here's the arithmetic that
+was calculated, and the answer". The `8` right after `>>` is unrelated to the annotation -- it's just the
+sentence continuing normally, spelling out the number in prose, which is why it reads as if doubled
+(`=8>>8`). GSM8K ships these so a grader/tool can find and verify every intermediate calculation. For us
+they're a ready-made, already-labelled op-frame: sub0/gsm8k.hpp's build_stream re-verifies each one via the
+exact `math` node, then converts it into our own delegated `[op math ...]` frame and masks the result from
+the loss (docs/DETERMINISTIC_MECHANISMS.md).
+
+Note: `<<` / `>>` here are just this dataset's chosen delimiter TEXT inside a plain-text corpus file -- they
+are not C++ shift/stream/template-bracket operators, and nothing in this repo's C++ source is parsed this
+way. The parser (gsm8k.hpp's `segment()`) finds them by literal substring search over corpus bytes, same as
+finding any other punctuation in text.
+
 Two ways it feeds training:
   * As a plain base corpus (reasoning-density fluency), blended with the synthetic op-delegation curriculum
     (`sub0llm-train --op-mix`), which is what teaches the model to emit `[op math]`.

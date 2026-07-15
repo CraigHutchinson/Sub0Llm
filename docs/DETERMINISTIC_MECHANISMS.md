@@ -82,6 +82,40 @@ lets the node read the expression already posed in the prose (`… 12+34 = [op m
 well-formed-math task affords. (Overtraining degrades this toy task past the early peak; a recipe-tuning item,
 not a mechanism one.)
 
+**Worked example — from raw GSM8K text to a training frame.** Concretely, for a corpus fragment
+`get_gsm8k.py` writes verbatim from the dataset (GSM8K's own calculator-annotation format; see that script's
+docstring for the ELI5 of `<<expr=result>>` itself):
+
+```
+There are 80/100 * 10 = <<80/100*10=8>>8 more purple flowers than yellow flowers.
+```
+
+`gsm8k::segment()` (`gsm8k.hpp`) splits this into alternating literal-text and annotation segments by a
+plain `<<...>>` substring scan, turning the annotation `80/100*10=8` into one `Op{expr="80/100*10",
+result="8"}`. `verify()` re-runs the SAME exact `math` node on `expr` and keeps the annotation only if it
+reproduces `result` bit-for-bit — this IS the FILTER pillar's guard: a malformed or non-integer annotation
+is left as plain (graded) prose instead of being turned into a delegation.
+
+`build_stream()` then emits, in order:
+
+1. the literal prose up to the annotation, tokenized and **GRADED** (mask=1) — `"There are 80/100 * 10 = "`;
+2. the op-frame `TOK_TURN_START op math TOK_TURN_END`, **GRADED** (mask=1) — the ROUTING decision the model
+   must learn: at this point, delegate. The expression is NOT copied into the frame — it's already sitting
+   in the prose the model just emitted, and the node re-reads it from there (`node_frame::preceding_expr`,
+   the same "prefer contextual over self-contained" lesson above);
+3. the result, **MASKED** (mask=0) — either the collapsed scratch-slot token `SCRATCH_SLOT_BASE` (production
+   / `--gsm8k` training) or the literal digits `8` (test-only, `collapse=false`). Predicting this token earns
+   no loss signal either way — the only way to "know" it is to have delegated;
+4. the redundant `8` GSM8K repeats right after `>>` is stripped from the following prose segment (else it
+   would duplicate the masked result as graded, un-masked text — reintroducing the exact fuzzy-copy
+   incentive FILTER exists to remove) before the remaining prose (`" more purple flowers..."`) resumes graded.
+
+So the model's actual training signal for this fragment is: predict the prose, predict `[op math]` right
+after `= `, predict nothing for the answer (the node supplies it). A whole GSM8K solution typically carries
+several such annotations, so the training example is a natural mix of graded reasoning prose and masked
+delegated arithmetic — with zero hand-authored curriculum needed, because GSM8K's own worked solutions
+already have the shape the FILTER pillar wants.
+
 **Multi-step chaining — COLLAPSE decisively beats digit-copy (`[.chaincapstone]`, 1.000 vs 0.095).** Chaining
 `R2 = 7 + (A+B)` forces step 2 to *reference* the intermediate. If the intermediate stays as **digits** the
 model must copy into `7+R1`, a tiny model fails (best exact **0.095** — the copy wall again). If instead the
@@ -90,6 +124,49 @@ inject that one token; the next op derefs it), the model references `7+S0` — o
 **1.000, rock-stable every round, no overtraining**. This is the reusable principle, now proven twice:
 **never make the model copy a value — let it route over *symbols/context* and let the node/binding hold the
 value.** It is also the mechanism the "collapse a result to a scratch token" note (§1b) anticipated.
+
+**Repeated mentions — HARNESS-driven collapse (no model request) beats fuzzy repeat-copy, and a MID-STREAM
+binding works as well as a pre-arranged one (`[.repeatspike]`, held-out: 0.95 vs 0.13 by step 3000).** A third
+proof of the same principle, this time for *entity tracking* rather than arithmetic: an OOV word appears three
+times in a passage; a query asks for its Nth character. **FUZZY** (all three mentions spelled out in full,
+answer via plain in-context lookup — no scratch mechanism at all) stays low and noisy on held-out OOVs (0.02 →
+peaks near 0.32 → ends **0.13**) — the copy/localization wall bites even though the answer is plainly visible
+in the fed context, the same wall arithmetic copying hits. **COLLAPSE** (mention 1 spelled out normally — no
+request, no marker, exactly as a live harness would observe it and bind a slot — mentions 2 and 3 replaced by
+the bound slot token, masked; the query references the slot, resolved via `UNCOMBINE`) climbs steadily to
+**0.95**. Two things this specifically adds beyond the chaining result above: (1) it's the harness — not the
+model — that decides to bind, mirroring `nodes::make_collapse_callback`'s pattern (the model never asks,
+op-collapse already does this for computed results) but applied to a *recognised repeat* instead of a *computed
+value*; (2) the binding forms **mid-stream**, from the passage's own first mention, rather than being
+pre-arranged before the episode starts the way `scratchspike::nth_char_task` already tests — closing the gap
+toward "the model just writes the word normally, the system silently compacts recurrence #2, #3." This proves
+the *mechanism* (spike-style, over baked training traces — the full-forward path every other spike here uses)
+independently of the harder, unbuilt engineering question: doing this live, mid-*generation*, inside a running
+KV-cache needs a splice capability that does not exist today (see `include/sub0/repeatspike.hpp`'s header
+comment and project memory `persistent-slot-range-engine-substrate` for the concrete gap). Also: this
+directly confirms scratchspike's own prior finding from the *other* direction —
+`define_task` (#1, model-driven: the model must ask via `combine`) is documented there as "copy-bottlenecked",
+excluded from the production curriculum — harness-driven binding isn't just *an* option, it's the one that
+actually works at this scale, now proven for a second trigger condition (repeat-recognition, not just
+pre-arrangement).
+
+**The unbounded (persistent) slot-range ENGINE SUBSTRATE is now real (2026-07-16), tested, not just
+designed.** The scratch-slot mechanism above lives entirely inside the fixed, bounded reserved-marker
+range (`SCRATCH_SLOT_BASE..+COUNT`, 6 ids). A structurally different, *unbounded* range — ids `>= VOCAB`,
+for a future persistent compound-word cache (a recurring multi-token OOV gets ONE stable id forever,
+composed live from its fragments, no per-mention token cost) — is now wired into the engine and proven
+correct: `include/sub0/scratch_slots.hpp`'s `PersistentBindings`/`is_persistent_slot`/`persistent_fragments`,
+`backend_cpu.cpp`'s `op_embed`/`Op::Embed` backward/`forward_one` all route any id `>= VOCAB` through the
+SAME `encode_slot`/`encode_slot_bwd` composition the bounded pool uses (id-agnostic already, needed zero
+changes) — never the raw embedding-table lookup, closing a real latent OOB-read risk (`VOCAB` sizes the
+table; nothing previously stopped an id past it from indexing past the table's bounds if one ever
+arrived). `tests/persistent_slots_engine_tests.cpp` (5 cases) proves: compose correctness against a
+manual reference, real gradient flow through a full forward/backward cycle, safety when unbound/no table
+is installed (finite output, no crash), and byte-identical invariance when the feature is untouched. This
+is the SUBSTRATE only — no compound-word DB, no encode-time substitution, no live decode-time collapse
+yet (repeatspike proved that mechanism using the *bounded* pool, not this range) — see project memory
+`persistent-slot-range-engine-substrate` for the full design reasoning (why unbounded ids need no
+tokenizer-format bump, unlike growing the bounded pool) and what's still open.
 
 ---
 
@@ -114,17 +191,63 @@ the role ("system"/"user"/"assistant") flows through as **ordinary text** the Un
 "tool-call structure"). Apply the identical trick to compute: one delimiter pair, and the *op* is a word.
 
 ```
-<|op|> add A B <|end|>          ▶ node("add", [A,B]) → exact result injected, masked
-<|op|> solve "x^2 = A" <|end|>  ▶ node("solve", …)   → the CAS's answer injected
-<|op|> uncombine <tok> <|end|>  ▶ expand (today's UNCOMBINE, re-expressed in the frame)
+TOK_TURN_START op add A B TOK_TURN_END          ▶ node("add", [A,B]) → exact result injected, masked
+TOK_TURN_START op solve "x^2 = A" TOK_TURN_END  ▶ node("solve", …)   → the CAS's answer injected
+TOK_TURN_START op uncombine <tok> TOK_TURN_END  ▶ expand (today's UNCOMBINE, re-expressed in the frame)
 ```
 
-The op selector and operands are ordinary tokens the vocab already has, so **a new node costs ZERO tokenizer
+**The word `op` is load-bearing, not decorative — it's the role discriminator.** `TOK_TURN_START`/`TOK_TURN_END`
+are reused from ordinary chat turns, so the dispatcher needs a way to tell "this is a tool-call region" apart
+from a normal system/user/assistant turn sharing the same two markers; `op` is that tell, exactly the way a
+chat turn's first word is its role. The parser checks it literally
+(`node_frame.hpp`: `if (toks.size() < 2 || toks[0] != "op") return {};`) — a region that opens with anything
+else is inert (no dispatch, no injection). Drop the word and every plain chat turn beginning with a word that
+happens to match a registered op name (e.g. a turn starting "add …") would misfire as a tool-call.
+
+The op selector and operands are ordinary tokens the vocab already has, so **a new NODE costs ZERO tokenizer
 budget** — no reserved-id per op, no format bump. (Contrast: the scratch pool maxed at K=6 precisely because
 each slot is a reserved id; a region frame sidesteps that ceiling.) The registry keys on the op *word* after
-the frame-open, not on a dedicated token. `expand`/`combine`/`compute` all collapse into this one shape;
-today's per-op reserved markers (`TOK_UNCOMBINE`, …) and the arithspike's ASCII sentinels (`$`/`#`) are the
-*spike* encoding — the region-frame is the production one, and it's the natural home for the whole registry.
+the frame-open, not on a dedicated token — no new marker was minted; the op frame is `TOK_TURN_START`/`TOK_TURN_END`
+itself, reused (this superseded an earlier sketch of a dedicated `<|op|>`/`<|end|>` pair, which was never built).
+`expand`/`combine`/`compute` all collapse into this one shape; today's per-op reserved markers (`TOK_UNCOMBINE`, …)
+and the arithspike's ASCII sentinels (`$`/`#`, its literal `COMPUTE`/`COMPUTE_END` constants) were that *spike's*
+own encoding, superseded by the region-frame — the production one, and the natural home for the whole registry.
+
+**Prior-art check (2026-07) — how Qwen and Gemma actually do it, and a revision to the claim above.** Checked
+against real production tool-calling schemes:
+
+- **Qwen (Hermes-style, Qwen2.5/Qwen3)** reuses `<|im_start|>`/`<|im_end|>` for the outer turn — the same move
+  as our `TOK_TURN_START`/`TOK_TURN_END` reuse — but the CALL ITSELF is wrapped in its own dedicated marker
+  pair added to the tokenizer, `<tool_call>...</tool_call>`, with results fed back as `<tool_response>
+  ...</tool_response>` on a `tool`-role turn.
+- **Gemma 4 / FunctionGemma** goes further: `<|tool_call>...` / `...<tool_call|>` and `<|tool_response>...` /
+  `...<tool_response|>` are dedicated special tokens **explicitly distinct from** `<start_of_turn>`/
+  `<end_of_turn>`, not nested inside the generic turn markers at all.
+
+Neither reuses the generic turn pair *plus a magic first word* the way our `TOK_TURN_START op <name> …
+TOK_TURN_END` does today. This **revises the "zero tokenizer budget" framing above**: true in the narrow
+sense (no new reserved id), but the trade was a RECURRING per-call cost — the literal `op ` text, ~2-3 tokens
+on this byte-level tokenizer since "op" is very unlikely to be a learned Unigram piece — to save a ONE-TIME
+cost (0 reserved ids). Prior art makes the opposite trade: pay a small FIXED reserved-id cost once, save the
+recurring per-call bytes forever. At any real op-call volume (arithmetic, dates, lookups — potentially many
+per generation) that is the better trade, and matches the load-bearing-word finding just above: `op` is
+already functioning as a de facto marker, just an expensive text-encoded one instead of a cheap reserved id.
+
+**Backlog — mint dedicated `TOK_OP_START`/`TOK_OP_END`** (or `TOK_TOOL_START`/`TOK_TOOL_END`, generalising
+straight to the unified tool-calling §1c anticipates), retiring the literal `"op"` discriminator. Concrete
+blocker: there is currently **zero free reserved-id headroom** — all 6 `TOK_RESERVED_4..9` ids are already
+claimed by the scratch-slot pool (`scratch_slots.hpp`: `SCRATCH_SLOT_COUNT = TOK_MARKER_COUNT -
+TOK_RESERVED_4` = 6, no slack). Minting 2 new ids means either (a) shrinking the scratch pool 6→4, or (b)
+bumping `TOK_MARKER_COUNT` 32→34. Either is a tokenizer-FORMAT bump (§C below) — `n_base`/VOCAB shift, every
+learned piece id shifts, and it invalidates every currently-trained model (fineweb d448, the `--gsm8k`
+model, …), the same cost §C already flags for growing the scratch pool past 6. Worth doing, but as one
+deliberate, batched format bump — ideally the SAME bump that ever grows the scratch pool, so the retrain
+cost is paid once for both, not twice.
+
+**Notation used throughout the rest of this doc:** `[op <name> <args>]` is prose shorthand for one
+`TOK_TURN_START op <name> <args> TOK_TURN_END` region (what actually gets rendered/decoded); `COMPUTE` /
+`<|op|>...<|end|>` appearing anywhere below are spike-era names for encodings that were tried and superseded,
+kept only where the text is describing that specific historical spike.
 
 ### Solver nodes — what to embed (for "more complex maths")
 
@@ -221,7 +344,7 @@ embeddings are worst at:
         │                │
      bind A            bind B          (each collapses to ONE scratch token)
 "A + B = X"  ──▶  the model reasons algebraically; it never has to hold 13 digits in its activations
-"COMPUTE add A B"  ──▶  node returns the exact value, bound to a fresh slot C
+"A + B = [op add]"  ──▶  node dereferences A, B from the binding table, returns the exact value, bound to a fresh slot C
 "X = C"
 ```
 
@@ -455,8 +578,8 @@ form only where a binding must occupy one position. This uncaps the pool and ope
 0. ~~Prove the thesis.~~ **DONE** — arithspike: delegation 1.000 vs fuzzy 0.000 held-out.
 1. ~~Region frame + registry (spike).~~ **DONE** — nodespike: one `{ … }` frame + a word-keyed `ComputeNode`
    registry over 4 ops; WORD op-names route as well as dedicated tokens (1.000 == 1.000), so new nodes cost
-   zero tokenizer budget. *Production form still to land:* adopt the real `<|op|> … <|end|>` delimiter
-   (reuse/mirror `TOK_TURN_START/END`; one reserved slot at most) and move expand/combine/compute onto it.
+   zero tokenizer budget. *Production form landed differently than first sketched here* — see stage 5: no new
+   delimiter was minted, `TOK_TURN_START/END` were reused directly (zero new ids, not "one reserved slot").
 2. **Exact + symbolic nodes.** Extend the add node to exact decimals/rationals (Boost.Multiprecision), then
    add an **exprtk** numeric-expression node and a **SymEngine** symbolic node (solve/simplify/diff) — the
    "more complex maths". Each pure + sandboxed.

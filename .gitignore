@@ -26,4 +26,6 @@ data/cfg_test.txt
 # untracked-in-spirit 133-byte stub in git history that grew to a real multi-GB corpus without ever
 # being added here
 data/tinystories.txt
+# fetched via scripts/get_gsm8k.py, same category as the corpora above
+data/gsm8k.txt
 runs/

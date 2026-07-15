@@ -1,6 +1,10 @@
 // sub0/gsm8k.hpp -- convert GSM8K-style worked solutions into the op-curriculum (docs/ROADMAP.md §D, the
 // deterministic-mechanisms connection). GSM8K's solutions carry inline calculator annotations `<<48/2=24>>`
 // -- a ready-made op-frame marking exactly the arithmetic spans to DELEGATE (PROVIDE) and MASK (FILTER).
+// `<<EXPR=RESULT>>` is GSM8K's OWN dataset format (see scripts/get_gsm8k.py's docstring for the ELI5 --
+// short version: OpenAI's original solution text writes it as a "here's the calculator step" aside right
+// before the number, e.g. "...= <<80/100*10=8>>8 more..."; the `<<`/`>>` are just this corpus's plain-text
+// delimiter bytes, unrelated to C++ operators -- `segment()` below finds them by literal substring scan).
 // Each annotation becomes `[op math EXPR]`: the model copies the expression verbatim and the general `math`
 // node (nodes.hpp) evaluates it exactly -- so it never learns the fuzzy arithmetic (which arithspike showed
 // never generalises). One general op, not a per-op frame per operator.
