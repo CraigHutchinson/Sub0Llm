@@ -168,6 +168,40 @@ yet (repeatspike proved that mechanism using the *bounded* pool, not this range)
 `persistent-slot-range-engine-substrate` for the full design reasoning (why unbounded ids need no
 tokenizer-format bump, unlike growing the bounded pool) and what's still open.
 
+**Order-sensitive slot encoding (2026-07-16): why a compound-word cache needs more than MeanPool.**
+`encode_slot`'s pluggable `SlotEncoding` composes a bound slot's fragment sequence into one vector.
+`MeanPool` and `CharEncoder` (a learned per-fragment `[C,C]` projection + relu, sum-pooled) are BOTH
+*provably* permutation-invariant -- `sum` of a per-fragment function is the Deep Sets canonical form
+(Zaheer et al. 2017) for any function invariant to reordering its inputs, so neither can represent
+fragment ORDER no matter how much training. This is not an abstract concern: **`overtake`/`takeover`,
+`feedback`/`backfeed`, `lighthouse`/`houselight`** are the same constituent pieces, reordered, meaning
+something different each way -- real English proof that a permutation-invariant composer would silently
+CONFLATE them, a genuine correctness risk for any future compound-word cache built on this substrate (see
+the persistent-slot paragraph above), not just a missed opportunity on a synthetic probe. Three
+order-sensitive alternatives are implemented and spike-tested against `scratchspike.hpp`'s `#4`
+"starts with X" task (excluded from the production curriculum because nothing beat chance at it before
+these): `Hash` (RoPE-style rotation of each fragment by its position, then sum -- modest, noisy: mean
+held-out 0.403 vs chance 0.333), `ConvPool` (Kim et al. 2016-style learned width-2 convolution + relu +
+maxpool -- stronger, consistent across seeds: mean held-out 0.458 vs plain 0.344, wins every seed tried),
+and `HRR` (Holographic Reduced Representations, Plate 1995 -- circular-convolution binding of a fixed
+role vector per position with each fragment, then sum). None are wired into production yet (blocked on
+checkpoint persistence for the two with learned params -- see project memory
+`slot-encoder-checkpoint-persistence-design`); see project memory `meanpool-alternatives-prior-art-and-math`
+for the full prior-art survey, math, and per-seed results.
+
+**Hybrid CPU/GPU execution is the necessary next unlock, not an optional nicety.** `--content-embed`
+forces the ENTIRE training step onto CPU today (`gpu_train = !content_embed_active && ...` in
+`train_stage.cpp`), because a bound scratch slot's meaning is per-WINDOW (different windows in the same
+batch can bind the same slot id to different content), which the device's id-indexed, batch-shared
+embedding table cannot represent without a real per-window device-side lookup kernel -- the still-unbuilt
+`SUB0_COMPUTE=HYBRID` ("Phase 3", `cmake/Backends.cmake`). The tractable near-term path is narrower and
+already buildable on existing infrastructure: SOURCE-ROUTED splitting, where windows drawn from a
+content-embed-active blend source (`--scratch-mix`/`--op-mix`) run on CPU while every other window in the
+SAME batch (base corpus, etc. -- already tagged per-window via `src_idx`) runs on GPU concurrently,
+gradients merged before the shared optimizer step. This is what actually unblocks verifying any of the
+three encoders above at production scale in reasonable time, not just a throughput nicety -- see project
+memory `hybrid-cpu-gpu-execution-design` for the full design (not yet implemented).
+
 ---
 
 ## The three pillars
