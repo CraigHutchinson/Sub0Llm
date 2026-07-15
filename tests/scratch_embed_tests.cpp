@@ -151,6 +151,81 @@ TEST_CASE("scratch encoder: Hash is order-sensitive, unlike MeanPool/CharEncoder
     for (int j = 0; j < C; ++j) REQUIRE(out_solo[j] == Catch::Approx(tab[1 * C + j]).margin(1e-5));
 }
 
+// --- 1b-iv. ConvPool (Kim et al. char-CNN style: width-2 conv + relu + maxpool): forward + backward vs FD ---
+// enc_w is packed as [2,C,C] (w0, then w1) -- reuses CharEncoder's own enc_w/enc_w_grad pointers, no new
+// fields. Maxpool is differentiable almost everywhere (not AT a tie between window positions); the test
+// data below is chosen with enough separation between per-channel window activations that finite
+// differences (which can only see one side of an argmax flip near a tie) don't spuriously fail.
+TEST_CASE("scratch encoder: ConvPool forward + backward match finite differences", "[scratch][embed]") {
+    constexpr int C = 3;
+    // Three fragments -> two width-2 windows: (0,1) and (1,2). Rows chosen with enough separation that
+    // each channel's argmax window has a clear margin at the tested weights.
+    std::vector<float> tab = {
+        0.6f, -0.2f, 0.3f,     // row 0
+       -0.4f,  0.5f, -0.1f,    // row 1
+        0.2f,  0.1f,  0.7f,    // row 2
+    };
+    std::vector<float> W(static_cast<std::size_t>(2) * C * C);
+    std::mt19937 rng(13);
+    std::normal_distribution<float> nd(0.f, 0.5f);
+    for (float& x : W) x = nd(rng);
+    const std::vector<int> frags = {0, 1, 2};
+    const float dout[C] = {0.8f, -0.6f, 1.1f};
+
+    auto loss = [&](const std::vector<float>& tabv, const std::vector<float>& Wv) {
+        float out[C];
+        sub0::encode_slot(tabv.data(), C, frags, SlotEncoding::ConvPool, out, Wv.data());
+        float L = 0.f; for (int c = 0; c < C; ++c) L += dout[c] * out[c]; return L;
+    };
+
+    std::vector<float> Wg(W.size(), 0.f), Tg(tab.size(), 0.f);
+    sub0::encode_slot_bwd(dout, C, frags, SlotEncoding::ConvPool, Tg.data(), tab.data(), W.data(), Wg.data());
+
+    const float eps = 1e-3f;
+    for (std::size_t i = 0; i < W.size(); ++i) {
+        auto wp = W, wm = W; wp[i] += eps; wm[i] -= eps;
+        REQUIRE(Wg[i] == Catch::Approx((loss(tab, wp) - loss(tab, wm)) / (2 * eps)).margin(2e-2));
+    }
+    for (int f : frags) for (int k = 0; k < C; ++k) {
+        auto tp = tab, tm = tab;
+        tp[static_cast<std::size_t>(f) * C + k] += eps;
+        tm[static_cast<std::size_t>(f) * C + k] -= eps;
+        REQUIRE(Tg[static_cast<std::size_t>(f) * C + k] ==
+                Catch::Approx((loss(tp, W) - loss(tm, W)) / (2 * eps)).margin(2e-2));
+    }
+}
+
+// --- 1b-v. ConvPool is order-sensitive (unlike MeanPool/CharEncoder), and a lone fragment (no window)
+// passes through unchanged -- same shape as the Hash order-sensitivity test above.
+TEST_CASE("scratch encoder: ConvPool is order-sensitive, unlike MeanPool/CharEncoder", "[scratch][embed]") {
+    constexpr int C = 4;
+    std::vector<float> W(static_cast<std::size_t>(2) * C * C);
+    std::mt19937 wr(21);
+    std::normal_distribution<float> wnd(0.f, 0.5f);
+    for (float& x : W) x = wnd(wr);
+
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> tab(static_cast<std::size_t>(4) * C);
+    for (float& x : tab) x = nd(rng);
+
+    const std::vector<int> fwd = {0, 1, 2};
+    const std::vector<int> rev = {2, 1, 0};
+
+    float out_fwd[C], out_rev[C];
+    sub0::encode_slot(tab.data(), C, fwd, SlotEncoding::ConvPool, out_fwd, W.data());
+    sub0::encode_slot(tab.data(), C, rev, SlotEncoding::ConvPool, out_rev, W.data());
+    bool differs = false;
+    for (int j = 0; j < C; ++j) if (out_fwd[j] != Catch::Approx(out_rev[j]).margin(1e-5)) differs = true;
+    REQUIRE(differs);
+
+    // A lone fragment (no width-2 window) passes through as its own raw row, unmodified.
+    const std::vector<int> solo = {1};
+    float out_solo[C];
+    sub0::encode_slot(tab.data(), C, solo, SlotEncoding::ConvPool, out_solo, W.data());
+    for (int j = 0; j < C; ++j) REQUIRE(out_solo[j] == Catch::Approx(tab[1 * C + j]).margin(1e-5));
+}
+
 // --- 1c. Scalar: fixed scientific encoding of the value the fragments spell (the brain-swap re-entry) ---
 namespace {
 std::vector<int> frags_of(const std::string& s) {   // digit/sign/point/exp chars -> byte token ids

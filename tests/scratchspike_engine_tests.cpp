@@ -198,7 +198,7 @@ ReasonAcc eval_contains_reason(const Tokenizer& tk, ScratchOps& ops, const std::
 struct EncAdam { std::vector<float> m, v; long t = 0; };
 void train_ce_steps(const ss::Dataset& ds, sub0::AdamW& opt, std::vector<float>& enc_w,
                     std::vector<float>& enc_w_grad, EncAdam& ea, float enc_lr, int steps,
-                    std::mt19937& rng, bool use_ce) {
+                    std::mt19937& rng, bool use_ce, sub0::SlotEncoding enc = sub0::SlotEncoding::CharEncoder) {
     std::vector<int> masked_tgt(kWindowT);
     for (int s = 0; s < steps; ++s) {
         std::fill(enc_w_grad.begin(), enc_w_grad.end(), 0.f);
@@ -217,7 +217,7 @@ void train_ce_steps(const ss::Dataset& ds, sub0::AdamW& opt, std::vector<float>&
                     std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
                                      static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
                 binds = sub0::ScratchBindings{ std::span<const std::vector<int>>(ds.doc_bindings[doc]),
-                                               sub0::SlotEncoding::CharEncoder, enc_w.data(), enc_w_grad.data() };
+                                               enc, enc_w.data(), enc_w_grad.data() };
                 sub0::set_scratch_bindings(&binds);
             }
             sub0::graph_reset();
@@ -561,6 +561,79 @@ TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- Hash/RoPE positional
     WARN(report);
     REQUIRE(std::isfinite(mean_mp));
     REQUIRE(std::isfinite(mean_hash));
+}
+
+// A/B on the ORDER-SENSITIVE content task (#4, "starts with X") via ConvPool (Candidate 3: Kim et al.
+// char-CNN style width-2 conv + relu + maxpool, see scratch_slots.hpp and project memory
+// meanpool-alternatives-prior-art-and-math). Unlike Hash, ConvPool has LEARNED params (enc_w, packed
+// [2,C,C]) with no per-thread grad reduction, so this reuses train_ce_steps' single-threaded harness
+// (same shape as CharEncoder's own A/B) instead of train_steps' normal multi-threaded path. Multi-seeded
+// from the start this time (the Hash spike's own first single run was later shown to be on the favorable
+// end of a noisy spread -- see that finding above).
+TEST_CASE("scratchspike: CONTENT (starts-with) reasoning -- ConvPool (char-CNN) A/B", "[.scratchspike]") {
+    constexpr int kK = 3;
+    constexpr unsigned kSeeds[] = {1, 2, 3};
+    constexpr int kNumSeeds = 3;
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        REQUIRE(is.good());
+        REQUIRE(sub0::tok::deserialize(tk, is));
+    }
+    REQUIRE(tk.vocab == VOCAB);
+    ScratchOps ops{&tk, true, {}};
+
+    const ss::OovSplit split = ss::make_oov_split(tk, kOovPool, kDrilledFrac, /*seed=*/2024);
+    ss::DatasetOptions dopt; dopt.tasks_per_oov = 12; dopt.seed = 99;
+    const ss::Dataset ds = ss::build_dataset_content(tk, split, kK, dopt);
+    REQUIRE(ds.doc_bindings.size() + 1 == ds.doc_starts.size());
+
+    const int C = D_MODEL;
+    std::vector<float> enc_w(static_cast<std::size_t>(2) * C * C), enc_w_grad(enc_w.size());
+
+    auto run = [&](bool ce, unsigned seed, double& drilled) {
+        sub0::build_model();
+        reset_opt_state();
+        std::mt19937 wr(seed * 1000u + 7u);
+        std::normal_distribution<float> wnd(0.f, 1.f / std::sqrt(static_cast<float>(C)));
+        for (float& x : enc_w) x = wnd(wr);
+        EncAdam ea; ea.m.assign(enc_w.size(), 0.f); ea.v.assign(enc_w.size(), 0.f);
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(seed);
+        double held = 0.0;
+        for (int r = 0; r < kEvalRounds; ++r) {
+            train_ce_steps(ds, opt, enc_w, enc_w_grad, ea, /*enc_lr=*/kLr, kStepsPerEval, rng, ce,
+                           sub0::SlotEncoding::ConvPool);
+            drilled = eval_content(tk, ops, split.drilled,  kK, /*seed=*/7,  ce, sub0::SlotEncoding::ConvPool,
+                                   ce ? enc_w.data() : nullptr).rate();
+            held    = eval_content(tk, ops, split.held_out, kK, /*seed=*/11, ce, sub0::SlotEncoding::ConvPool,
+                                   ce ? enc_w.data() : nullptr).rate();
+        }
+        return held;
+    };
+
+    std::string report = "\n=== scratchspike #4 CONTENT (starts-with) via ConvPool (char-CNN) "
+                         "(K=3) @3000, multi-seed ===\n";
+    char line[224];
+    double sum_plain = 0.0, sum_cp = 0.0;
+    for (unsigned seed : kSeeds) {
+        double d_plain = 0.0, d_cp = 0.0;
+        const double h_plain = run(false, seed, d_plain);
+        const double h_cp    = run(true,  seed, d_cp);
+        sum_plain += h_plain; sum_cp += h_cp;
+        std::snprintf(line, sizeof line,
+            "  seed %u | plain: drilled %.3f held-out %.3f | ConvPool: drilled %.3f held-out %.3f\n",
+            seed, d_plain, h_plain, d_cp, h_cp);
+        report += line;
+    }
+    const double mean_plain = sum_plain / static_cast<double>(kNumSeeds);
+    const double mean_cp = sum_cp / static_cast<double>(kNumSeeds);
+    std::snprintf(line, sizeof line, "  MEAN held-out (chance = 0.333): plain %.3f | ConvPool %.3f\n",
+                 mean_plain, mean_cp);
+    report += line;
+    WARN(report);
+    REQUIRE(std::isfinite(mean_plain));
+    REQUIRE(std::isfinite(mean_cp));
 }
 
 // A/B on an ORDER-AGNOSTIC content task (which slot CONTAINS char X): same task/everything, trained+eval'd

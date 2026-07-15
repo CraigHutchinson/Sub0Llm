@@ -53,13 +53,21 @@ constexpr bool is_scratch_slot(int token) {
 //   Hash        - RoPE-style positional binding: rotate fragment p's row by a p-dependent angle (position
 //                 0 = identity, so it passes through unrotated), then SUM across fragments. No learned
 //                 params. NOT permutation-invariant (a rotate-then-sum is order-sensitive by construction)
-//                 -- see TODO(order-sensitive-slot-encoding) below; not yet A/B-verified against a real
-//                 positional probe.
+//                 -- spike-verified real-but-modest/noisy edge, see TODO(order-sensitive-slot-encoding).
+//   ConvPool    - Kim et al. 2016 ("Character-Aware Neural Language Models") style: a learned width-2
+//                 convolution (two [C,C] projections, one per window offset -- packed into `enc_w` as
+//                 [2,C,C], reusing CharEncoder's own params/grad pointers rather than adding new fields)
+//                 over consecutive fragment pairs, relu, then MAX-POOLED across window positions (a
+//                 single-fragment slot falls back to its raw row -- no width-2 window exists). NOT
+//                 permutation-invariant: the two offset projections are DIFFERENT matrices, so swapping a
+//                 pair's order changes the window's activation, and maxpool's hard per-channel selection
+//                 depends on WHICH adjacent pair fired hardest. Candidate 3 from
+//                 meanpool-alternatives-prior-art-and-math; not yet A/B-verified.
 //   Scalar      - a fixed "scientific" encoding of the NUMERIC VALUE the fragments spell (sign, base-10
 //                 magnitude, leading digits). No params, no grad -- the classical-compute result re-entering
 //                 the model as ONE vector (the "brain-swap" scalar re-entry). Bounded regardless of
 //                 magnitude, so powers/exponents (2^100, 1.23e45) map in by construction; see below.
-enum class SlotEncoding { MeanPool, CharEncoder, Hash, Scalar };
+enum class SlotEncoding { MeanPool, CharEncoder, Hash, ConvPool, Scalar };
 
 // FINDING (2026-07-16, spike scale d196, tests/scratchspike_engine_tests.cpp "CONTENT (starts-with)
 // reasoning -- Hash/RoPE positional-binding A/B"): on content_select_task (#4, "which slot's OOV starts
@@ -76,10 +84,17 @@ enum class SlotEncoding { MeanPool, CharEncoder, Hash, Scalar };
 // NOTE (motivation, not a correctness caveat): positional queries are NOT otherwise unanswerable -- the
 // existing combine/uncombine mechanism already gives a resolve-then-attend route (reveal a slot's real
 // fragment bytes into the stream, then plain attention handles "starts with"/"ends with"/Nth-char over
-// literal tokens), exactly what #4b's CoT variant already validates. What Hash would buy, if the A/B
-// confirms it works, is answering in ONE attention hop over the slot token instead of a multi-step resolve
-// trace -- an efficiency win, not the only path to correctness. See project memory
+// literal tokens), exactly what #4b's CoT variant already validates. What a working one-hop encoder would
+// buy is answering in ONE attention hop over the slot token instead of a multi-step resolve trace -- an
+// efficiency win, not the only path to correctness. See project memory
 // meanpool-alternatives-prior-art-and-math for the full reframing.
+//
+// FINDING (2026-07-16, same day, ConvPool -- ConvPool below): multi-seeded from the start this time,
+// baseline = fully plain (no content-embed), matching CharEncoder's own methodology. Mean held-out: plain
+// 0.344 (at chance 0.333, as expected), ConvPool 0.458 (gap +0.114 -- ~2.4x Hash's own gap). ConvPool won
+// EVERY seed, no ties or degenerate collapse (unlike Hash's seed 2). ConvPool is now the LEADING candidate
+// -- likely because it has learned, task-adaptive params where Hash's rotation is fixed, mirroring
+// CharEncoder's own "learned beats parameter-free" edge over MeanPool on the presence axis.
 constexpr float HASH_ROPE_THETA = 10000.f;   // matches the engine's own ROPE_THETA (backend_cpu.cpp) --
                                              // this header can't see that constant (no core.hpp dep), so
                                              // it's a local copy; the value is conventional, not coupled.
@@ -241,6 +256,10 @@ inline std::span<const int> persistent_fragments(const PersistentBindings* pb, i
 //                 summed. No params (`enc_w` unused). Interleaved-pair rotation, same convention as
 //                 op_rope (backend_cpu.cpp) but full-width (no head split) and over fragment position
 //                 instead of token position -- see HASH_ROPE_THETA above.
+//   ConvPool    = max over adjacent-pair window positions p of relu(enc_w[0] . row_p + enc_w[1] . row_{p+1}):
+//                 a learned width-2 convolution (TWO [C,C] projections packed into `enc_w` as [2,C,C] --
+//                 enc_w[0..C*C) and enc_w[C*C..2*C*C)) then max-pooled over window position. A single
+//                 fragment (no width-2 window exists) falls through as its own raw row.
 inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags, SlotEncoding enc, float* out,
                         const float* enc_w = nullptr) {
     for (int j = 0; j < C; ++j) out[j] = 0.f;
@@ -284,6 +303,30 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
             }
             break;
         }
+        case SlotEncoding::ConvPool: {
+            const int n = static_cast<int>(frags.size());
+            if (n == 1) {   // no width-2 window -- pass the lone fragment through as-is
+                const float* row = tok_emb + static_cast<std::size_t>(frags[0]) * C;
+                for (int c = 0; c < C; ++c) out[c] = row[c];
+                break;
+            }
+            const float* w0 = enc_w;              // [C,C]
+            const float* w1 = enc_w + static_cast<std::size_t>(C) * C;   // [C,C]
+            for (int c = 0; c < C; ++c) {
+                float best = 0.f;                 // relu floor: a channel with no positive window stays 0
+                const float* wr0 = w0 + static_cast<std::size_t>(c) * C;
+                const float* wr1 = w1 + static_cast<std::size_t>(c) * C;
+                for (int p = 0; p + 1 < n; ++p) {
+                    const float* e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
+                    const float* e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
+                    float z = 0.f;
+                    for (int k = 0; k < C; ++k) z += wr0[k] * e0[k] + wr1[k] * e1[k];
+                    if (z > best) best = z;        // relu + max-pool over window positions, fused
+                }
+                out[c] = best;
+            }
+            break;
+        }
         case SlotEncoding::MeanPool:
         default: {
             const float inv = 1.f / static_cast<float>(frags.size());
@@ -302,6 +345,8 @@ inline void encode_slot(const float* tok_emb, int C, std::span<const int> frags,
 // CharEncoder: recompute z per (fragment,channel), gate by relu, accumulate dW and the fragment-row grad.
 // Hash: rotation is orthogonal, so its adjoint is the INVERSE rotation (transpose = rotate by -position)
 // applied to dout -- no params, no tok_emb read (the angle depends only on position, not the row's value).
+// ConvPool: standard maxpool adjoint -- only the ARGMAX window position (recomputed, not cached) gets
+// gradient per channel, gated by the same relu-vs-zero-floor condition the forward used.
 inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags, SlotEncoding enc,
                             float* tok_emb_grad, const float* tok_emb = nullptr,
                             const float* enc_w = nullptr, float* enc_w_grad = nullptr) {
@@ -336,6 +381,43 @@ inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags
                     g[2 * m + 1] += -d0 * sn + d1 * cs;
                 }
                 if (2 * half < C) g[C - 1] += dout[C - 1];
+            }
+            break;
+        }
+        case SlotEncoding::ConvPool: {
+            const int n = static_cast<int>(frags.size());
+            if (n == 1) {
+                float* g = tok_emb_grad + static_cast<std::size_t>(frags[0]) * C;
+                for (int c = 0; c < C; ++c) g[c] += dout[c];
+                break;
+            }
+            const float* w0  = enc_w;
+            const float* w1  = enc_w + static_cast<std::size_t>(C) * C;
+            float*       wg0 = enc_w_grad;
+            float*       wg1 = enc_w_grad + static_cast<std::size_t>(C) * C;
+            for (int c = 0; c < C; ++c) {
+                const float* wr0 = w0 + static_cast<std::size_t>(c) * C;
+                const float* wr1 = w1 + static_cast<std::size_t>(c) * C;
+                float best = 0.f; int best_p = -1;   // -1: no window beat the relu floor -> no gradient
+                for (int p = 0; p + 1 < n; ++p) {
+                    const float* e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p)]) * C;
+                    const float* e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(p + 1)]) * C;
+                    float z = 0.f;
+                    for (int k = 0; k < C; ++k) z += wr0[k] * e0[k] + wr1[k] * e1[k];
+                    if (z > best) { best = z; best_p = p; }
+                }
+                if (best_p < 0) continue;
+                const float dz = dout[c];
+                const float* e0 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(best_p)]) * C;
+                const float* e1 = tok_emb + static_cast<std::size_t>(frags[static_cast<std::size_t>(best_p + 1)]) * C;
+                float* g0 = tok_emb_grad + static_cast<std::size_t>(frags[static_cast<std::size_t>(best_p)]) * C;
+                float* g1 = tok_emb_grad + static_cast<std::size_t>(frags[static_cast<std::size_t>(best_p + 1)]) * C;
+                float* wgr0 = wg0 + static_cast<std::size_t>(c) * C;
+                float* wgr1 = wg1 + static_cast<std::size_t>(c) * C;
+                for (int k = 0; k < C; ++k) {
+                    wgr0[k] += dz * e0[k]; g0[k] += dz * wr0[k];
+                    wgr1[k] += dz * e1[k]; g1[k] += dz * wr1[k];
+                }
             }
             break;
         }
