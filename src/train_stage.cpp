@@ -1134,6 +1134,15 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // Same reasoning as tokens_seen_est above: declared here (not where it's validated, after resume
     // reconciliation below) so build_run_config's [&] capture can see it.
     bool content_embed_active = false;
+    // Which SlotEncoding a content-embed-active run actually uses -- sub0::ContentEmbedKind (scratch_slots.hpp),
+    // stored as its underlying int since that's the RunConfig field's persisted type. Defaults to HRR for a
+    // FRESH run (the spike-proven leading candidate -- see project memory meanpool-alternatives-prior-art-and-math);
+    // a RESUMED run's reconciliation block below overrides this from config.json so a model already
+    // trained with the OLD hardcoded MeanPool (content_embed_kind absent -> struct default MeanPool) keeps
+    // using MeanPool, never silently drifting to HRR mid-training (the exact class of train/gen mismatch
+    // this field exists to prevent). Not exposed as a CLI flag -- no scenario yet needs choosing
+    // MeanPool/Hash explicitly over the proven-stronger HRR default.
+    int content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
 
     // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
     // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
@@ -1156,6 +1165,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.scratch_mix = scratch_mix;
         cfg.op_mix = op_mix;
         cfg.content_embed = content_embed_active ? 1 : 0;   // the VALIDATED state, not the raw request
+        cfg.content_embed_kind = content_embed_kind;
         return cfg;
     };
 
@@ -1260,6 +1270,16 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                 "(the persisted blend recipe wins on resume)",
                                 content_embed ? "on" : "off", persisted.content_embed ? "on" : "off");
                 content_embed = persisted.content_embed;
+            }
+            // The ENCODING a content-embed run uses must not drift on resume either -- a model already
+            // trained with MeanPool (or Hash) must keep using that exact encoding, never silently pick up
+            // a newer default (HRR) mid-training, the same class of mismatch the field above guards.
+            if (persisted.content_embed_kind != content_embed_kind) {
+                sub0::log::info("  config.json overrides this invocation's content-embed encoding: {} -> {} "
+                                "(the persisted choice wins on resume)",
+                                sub0::content_embed_kind_name(content_embed_kind),
+                                sub0::content_embed_kind_name(persisted.content_embed_kind));
+                content_embed_kind = persisted.content_embed_kind;
             }
         }
     }
@@ -1483,7 +1503,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (spell_mix > 0.f || scratch_mix > 0.f || op_mix > 0.f)
         sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
     if (content_embed_active)
-        sub0::log::line("blend: content-derived scratch embeddings ON (mean-pool, CPU-forced)");
+        sub0::log::line("blend: content-derived scratch embeddings ON ({}, CPU-forced)",
+                        sub0::content_embed_kind_name(content_embed_kind));
     // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
     // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward
     // kernel's ignore-index path (targets < 0 inert + per-window active[] normalization). Both are
@@ -1524,6 +1545,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
     //TODO: Remove getenv calls
     const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr);
+    // content_embed_kind is fixed for the whole run by this point (resume-reconciliation above already
+    // settled it) -- resolve it to a SlotEncoding ONCE here rather than re-deriving it every window.
+    const sub0::SlotEncoding content_embed_enc = sub0::content_embed_encoding_of(content_embed_kind);
 
     for (long step = rs.step + 1; step <= max_steps && !stop; ++step) {
         // On-demand: refill the rotating shuffle buffer once per eval interval from new
@@ -1599,12 +1623,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
                     const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
                     step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
-                        std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                        std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), content_embed_enc };
                     win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
                 } else if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == op_source_idx) {
                     const std::size_t doc = sub0::doc_of(op_ds.doc_starts, starts[b]);
                     step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
-                        std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                        std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), content_embed_enc };
                     win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
                 } else if (content_embed_active) {
                     win_binds[static_cast<std::size_t>(b)] = nullptr;

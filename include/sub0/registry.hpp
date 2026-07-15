@@ -121,7 +121,8 @@ struct ModelMeta {
     X(double,      spell_mix,       0.0)  \
     X(double,      scratch_mix,     0.0)  \
     X(double,      op_mix,          0.0)  \
-    X(int,         content_embed,   0)
+    X(int,         content_embed,   0)    \
+    X(int,         content_embed_kind, 0)
 
 struct RunConfig {
 #define SUB0_RUN_CONFIG_DECL(type, name, def) type name = def;
@@ -158,6 +159,12 @@ inline const char* enum_name(std::string_view field, int v) {
     if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary"
         || field == "content_embed")
         return nth({"off", "on"});
+    // Index (not sub0::SlotEncoding's own enum values) into the PARAMETER-FREE arms only -- see
+    // sub0/scratch_slots.hpp's content_embed_encoding_of. Default (0/"meanpool") preserves old
+    // content_embed=on config.json files (predating this field) at the MeanPool behavior they were
+    // actually trained with -- a NEW run persists its real choice explicitly, never relies on this
+    // default meaning "use the new default encoding".
+    if (field == "content_embed_kind") return nth({"meanpool", "hash", "hrr"});
     return nullptr;
 }
 inline bool enum_parse(std::string_view field, std::string_view s, int& out) {

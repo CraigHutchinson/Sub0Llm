@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/registry.hpp"
+#include "sub0/scratch_slots.hpp"   // sub0::ContentEmbedKind -- names content_embed_kind's persisted ints
 
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,7 @@ TEST_CASE("RunConfig: write_config_json/read_config_json round-trips every field
     c.lr = 0.00693722;
     c.seed = 42;
     c.content_embed = 1;
+    c.content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
 
     sub0::registry::write_config_json(c, scratch.path);
     REQUIRE(std::filesystem::exists(scratch.path / "config.json"));
@@ -60,6 +62,7 @@ TEST_CASE("RunConfig: write_config_json/read_config_json round-trips every field
     CHECK(r.lr == c.lr);
     CHECK(r.seed == c.seed);
     CHECK(r.content_embed == c.content_embed);
+    CHECK(r.content_embed_kind == c.content_embed_kind);
 }
 
 TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still reads (back-compat)", "[registry][run_config]") {
@@ -67,6 +70,7 @@ TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still read
     RunConfig c;
     c.d_model = 512; c.pos_encoding = 1; c.optimizer = 1; c.gated_ffn = 1; c.tied_embeddings = 0; c.qk_norm = 1; c.ternary = 0;
     c.content_embed = 1;
+    c.content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
     sub0::registry::write_config_json(c, scratch.path);
 
     // The written file uses readable names for the enum fields, plain numbers for the rest.
@@ -78,23 +82,29 @@ TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still read
     CHECK(text.find("\"tied_embeddings\": \"off\"")  != std::string::npos);
     CHECK(text.find("\"qk_norm\": \"on\"")           != std::string::npos);
     CHECK(text.find("\"content_embed\": \"on\"")     != std::string::npos);
+    CHECK(text.find("\"content_embed_kind\": \"hrr\"") != std::string::npos);
     CHECK(text.find("\"d_model\": 512")              != std::string::npos);   // numeric field unchanged
 
     // A hand-written OLD-STYLE numeric config.json still loads (the reader accepts either form).
-    // Deliberately OMITS content_embed entirely, matching a config.json from before this field existed --
-    // must load with content_embed left at its struct default (0/off), not fail or crash.
+    // Deliberately OMITS content_embed/content_embed_kind entirely, matching a config.json from before
+    // these fields existed -- must load with both left at their struct defaults (0/off, 0/meanpool), not
+    // fail or crash. content_embed_kind's default MUST be meanpool (0), not the current build's HRR
+    // default (2): an old content_embed=on model was actually trained with the old hardcoded MeanPool, and
+    // must keep decoding that way, never silently pick up whatever the new default happens to be.
     { std::ofstream os(scratch.path / "config.json");
       os << "{\n  \"pos_encoding\": 1,\n  \"optimizer\": 1,\n  \"gated_ffn\": 0,\n  \"qk_norm\": 1,\n  \"d_model\": 448\n}\n"; }
     RunConfig r;
     REQUIRE(sub0::registry::read_config_json(r, scratch.path));
     CHECK(r.pos_encoding == 1); CHECK(r.optimizer == 1); CHECK(r.gated_ffn == 0); CHECK(r.qk_norm == 1); CHECK(r.d_model == 448);
     CHECK(r.content_embed == 0);   // absent key -> struct default, old config.json still loads cleanly
+    CHECK(r.content_embed_kind == static_cast<int>(sub0::ContentEmbedKind::MeanPool));   // MUST be meanpool, not the new HRR default
 
     // A named "on"/"off" content_embed also round-trips (not just the numeric back-compat path above).
-    { std::ofstream os(scratch.path / "config.json"); os << "{\n  \"content_embed\": \"on\"\n}\n"; }
+    { std::ofstream os(scratch.path / "config.json"); os << "{\n  \"content_embed\": \"on\",\n  \"content_embed_kind\": \"hrr\"\n}\n"; }
     RunConfig r2;
     REQUIRE(sub0::registry::read_config_json(r2, scratch.path));
     CHECK(r2.content_embed == 1);
+    CHECK(r2.content_embed_kind == static_cast<int>(sub0::ContentEmbedKind::HRR));
 }
 
 TEST_CASE("RunConfig: read_config_json returns false for a missing file, doesn't crash", "[registry][run_config]") {

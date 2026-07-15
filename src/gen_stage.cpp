@@ -89,6 +89,13 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // refreshed after `combine` (sp_on) or the op-collapse callback (op_on) mutates scratch.bindings --
     // the only two mutators reachable here -- since ScratchBindings' span is a snapshot, not a live view.
     bool content_embed_on = false;
+    // Which SlotEncoding a content-embed model was actually TRAINED with (sub0::content_embed_encoding_of's
+    // index space, persisted as cfg.content_embed_kind -- see train_stage.cpp's own comment on why the
+    // struct default (0/MeanPool) must never silently become the new HRR default: a model saved before
+    // this field existed must keep decoding with the plain reserved-id-free encoding it actually trained
+    // with, not whatever the current build's default happens to be). Captured BY VALUE in the lambdas
+    // below (never reassigned after this point, unlike `binds`), set once `cfg` is loaded.
+    sub0::SlotEncoding content_embed_enc = sub0::SlotEncoding::MeanPool;
     sub0::ScratchBindings binds{};
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
@@ -102,13 +109,14 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
                 content_embed_on = (sp_on || op_on) && cfg.content_embed > 0;
+                content_embed_enc = sub0::content_embed_encoding_of(cfg.content_embed_kind);
                 if (sp_on) {
                     scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
                     expand  = [&scratch](int token) { return scratch.expand(token); };
-                    combine = [&scratch, &binds, content_embed_on](const std::vector<int>& frags) {
+                    combine = [&scratch, &binds, content_embed_on, content_embed_enc](const std::vector<int>& frags) {
                         std::vector<int> r = scratch.combine(frags);
                         // refreshing the snapshot here keeps it current for every subsequent forward_one.
-                        if (content_embed_on) binds = scratch.to_bindings();
+                        if (content_embed_on) binds = scratch.to_bindings(content_embed_enc);
                         return r;
                     };
                 }
@@ -118,7 +126,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                     // COLLAPSE: resolve the op, bind the exact result to the next free scratch slot, inject
                     // that single slot token (not the digits) -- so a chained step references it as a symbol.
                     auto inner = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
-                    compute = [&scratch, &binds, content_embed_on, inner](const std::vector<int>& c) -> std::vector<int> {
+                    compute = [&scratch, &binds, content_embed_on, content_embed_enc, inner](const std::vector<int>& c) -> std::vector<int> {
                         const std::vector<int> r = inner(c);
                         if (r.empty()) return r;
                         std::string val;
@@ -128,7 +136,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                         if (val.empty() || idx >= sub0::SCRATCH_SLOT_COUNT) return r;   // pool full -> digits
                         std::vector<int> frags; for (char ch : val) frags.push_back(static_cast<unsigned char>(ch));
                         scratch.bind(sub0::SCRATCH_SLOT_BASE + idx, std::move(frags));
-                        if (content_embed_on) binds = scratch.to_bindings();   // refresh the live snapshot
+                        if (content_embed_on) binds = scratch.to_bindings(content_embed_enc);   // refresh the live snapshot
                         return { sub0::SCRATCH_SLOT_BASE + idx };
                     };
                     op_collapse = true;
@@ -137,7 +145,10 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                 }
                 std::println(stderr, "gen: interceptor enabled (spell-mix {:.2f}, scratch-mix {:.2f}, "
                                      "op-mix {:.2f}{}{})", cfg.spell_mix, cfg.scratch_mix, cfg.op_mix,
-                             op_collapse ? ", collapse" : "", content_embed_on ? ", content-embed" : "");
+                             op_collapse ? ", collapse" : "",
+                             content_embed_on
+                                 ? (std::string(", content-embed ") + sub0::content_embed_kind_name(cfg.content_embed_kind))
+                                 : std::string());
             }
         }
     }
@@ -169,7 +180,7 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             std::println(stderr, "gen: decode backend {}{}",
                         gpu ? "GPU (device KV-cache)" : "CPU (KV-cache)",
                         intercept ? " + uncombine/op interceptor" : "");
-            if (content_embed_on) { binds = scratch.to_bindings(); sub0::set_scratch_bindings(&binds); }
+            if (content_embed_on) { binds = scratch.to_bindings(content_embed_enc); sub0::set_scratch_bindings(&binds); }
             sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine,
                                      compute, sub0::nodes::FRAME_CLOSE);
             if (content_embed_on) sub0::set_scratch_bindings(nullptr);

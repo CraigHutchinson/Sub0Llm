@@ -82,6 +82,39 @@ constexpr bool is_scratch_slot(int token) {
 //                 magnitude, so powers/exponents (2^100, 1.23e45) map in by construction; see below.
 enum class SlotEncoding { MeanPool, CharEncoder, Hash, ConvPool, HRR, Scalar };
 
+// The PARAMETER-FREE SlotEncoding arms a content-embed run may select, as a STABLE persisted index --
+// CharEncoder/ConvPool are deliberately excluded (they need enc_w, which needs
+// TODO(charencoder-production)/[[slot-encoder-checkpoint-persistence-design]]'s param-layout work before
+// they can be selected safely). A named enum, not a bare int, specifically so callers (train_stage.cpp,
+// gen_stage.cpp, tests) never spell out 0/1/2 directly -- the underlying values ARE part of the on-disk
+// config.json contract (registry.hpp's RunConfig::content_embed_kind persists this exact int), so they
+// must stay stable, but nothing outside this enum's own definition should need to know that; use
+// `sub0::ContentEmbedKind::HRR` etc., cast to `int` only at the RunConfig boundary. Registry-agnostic on
+// purpose (this header stays dependency-light -- no registry.hpp include); registry.hpp's own
+// `enum_name("content_embed_kind", ...)` list ({"meanpool","hash","hrr"}) must stay in the SAME order as
+// this enum -- cross-referenced in both places since the two headers deliberately don't share code.
+enum class ContentEmbedKind : int { MeanPool = 0, Hash = 1, HRR = 2 };
+
+constexpr SlotEncoding content_embed_encoding_of(int idx) {
+    switch (static_cast<ContentEmbedKind>(idx)) {
+        case ContentEmbedKind::Hash: return SlotEncoding::Hash;
+        case ContentEmbedKind::HRR:  return SlotEncoding::HRR;
+        case ContentEmbedKind::MeanPool: default: return SlotEncoding::MeanPool;
+    }
+}
+
+// The one canonical index -> display-name mapping (log lines, error messages) -- every call site
+// (train_stage.cpp, gen_stage.cpp) uses THIS instead of spelling out its own ternary chain, so the
+// names can never drift out of sync between them. Derives from content_embed_encoding_of (not a second
+// switch over the raw int) so there is exactly ONE place that interprets the persisted index.
+constexpr const char* content_embed_kind_name(int idx) {
+    switch (content_embed_encoding_of(idx)) {
+        case SlotEncoding::Hash: return "hash";
+        case SlotEncoding::HRR:  return "hrr";
+        default: return "meanpool";
+    }
+}
+
 // HRR's fixed "role" vectors: one per fragment POSITION (0-indexed, capped at HRR_MAX_POS -- generous
 // headroom over SCRATCH_SLOT_COUNT=6 for any future longer-fragment use, e.g. multi-token pattern spans),
 // pseudo-random with a FIXED seed (deterministic across runs/processes -- no state to persist, unlike a
