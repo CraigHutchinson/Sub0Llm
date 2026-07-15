@@ -112,6 +112,9 @@ inline Example build_stream(std::string_view sol,
         if (!s.is_op)           { emit_text(s.text, 1); continue; }
         if (!verify(s.op))      { ++ex.dropped; emit_text(s.text, 1); continue; }   // unverified -> plain prose
         for (int t : op_frame())   emit(t, 1);                     // GRADED: `[op math]` (route; expr is in the prose)
+        // TODO(content-embed-op-mix): s.op.result IS available here (unlike op_curriculum.hpp's synthetic
+        // curriculum, which discards nodes::eval's result) but still isn't recorded into a doc_bindings-
+        // shaped side table -- see op_curriculum.hpp's emit_single TODO for the full gap this blocks.
         if (collapse) emit(SCRATCH_SLOT_BASE, 0);                  // MASKED: collapsed-result slot
         else for (char c : s.op.result) emit(static_cast<unsigned char>(c), 0);   // MASKED: the node's digits
         ++ex.ops;

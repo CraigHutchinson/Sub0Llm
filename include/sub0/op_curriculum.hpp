@@ -88,6 +88,11 @@ inline void emit_single(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& 
     auto gtext = [&](const std::string& s) { for (int t : tok::encode(tk, s)) g(t); };
     gtext(std::string(detail::gen_prose(rng)) + expr + "=");
     for (int t : nodes::op_header("math")) g(t);   // route
+    // TODO(content-embed-op-mix): nodes::eval(expr) above computes the exact result but it's discarded --
+    // no doc_bindings-shaped side table like scratchspike::Dataset's (slot -> fragment ids) exists for
+    // this curriculum. That's why --content-embed currently requires --op-mix == 0 (train_stage.cpp) and
+    // why repeatspike's proven harness-collapse mechanism hasn't been connected to real GSM8K yet -- see
+    // project memory persistent-slot-range-engine-substrate and the smooth-noodling-kurzweil plan history.
     m(SCRATCH_SLOT_BASE);                          // result collapsed to slot S0 (masked)
     gtext(".");
     ds.doc_starts.push_back(ds.tokens.size());
@@ -114,6 +119,7 @@ inline void emit_chain(Dataset& ds, const tok::Tokenizer& tk, std::mt19937_64& r
 
     gtext(A + "+" + B + "=");
     for (int t : nodes::op_header("math")) g(t);   // step-1 route
+    // TODO(content-embed-op-mix): r1/r2 above are discarded, same gap emit_single's TODO documents.
     m(S0);                                          // step-1 result COLLAPSED to slot S0 (masked)
     gtext(". ");                                    // separator
     g(S0);                                          // step-2 REFERENCE (the slot symbol, one token)

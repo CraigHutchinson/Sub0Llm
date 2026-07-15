@@ -125,6 +125,10 @@ struct ScratchBindings {
     // model's param arena) so the encoder can be spiked with no layout/checkpoint change -- the owner
     // trains enc_w against enc_w_grad. null for MeanPool. (Single-threaded training: enc_w_grad has no
     // per-thread reduction; a multi-threaded train_batch would race on it -- promote to a model param first.)
+    // TODO(charencoder-production): enc_w has no checkpoint persistence -- promoting it to a real
+    // PARAM_LAYOUT entry (surviving save_model/load_model) is the prerequisite before --content-embed can
+    // select CharEncoder instead of hardcoded MeanPool (see the smooth-noodling-kurzweil plan's
+    // "explicitly out of scope" list and project memory scratch-content-embedding-meanpool-vs-charencoder).
     const float*                      enc_w = nullptr;
     float*                            enc_w_grad = nullptr;
 

@@ -1269,6 +1269,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // op-collapsed slot is never trained with a content-derived embedding, since op-mix windows always
     // pass null bindings below -- turning it on anyway would feed gen a vector the model never saw
     // during training). Validated AFTER resume reconciliation so it reflects the FINAL scratch_mix/op_mix.
+    // TODO(content-embed-op-mix): the op_mix<=0.f restriction goes away once op_curriculum.hpp/gsm8k.hpp
+    // record doc_bindings for their collapsed results -- see their own TODO(content-embed-op-mix) markers.
     content_embed_active = content_embed != 0 && scratch_mix > 0.f && op_mix <= 0.f;
     if (content_embed && !content_embed_active) {
         sub0::log::warn("--content-embed requested but disabled: {}",
