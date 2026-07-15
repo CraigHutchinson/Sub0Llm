@@ -114,9 +114,10 @@ inline int run_train(int argc, char** argv) {
                    "instead of the synthetic generator. Omit for the synthetic curriculum.")
        ->check(CLI::ExistingFile);
     app.add_flag("--content-embed", train_content_embed,
-                "Scratch-mix slots embed as a live function of their bound fragments (mean-pool) instead of "
-                "a plain learned row (requires --scratch-mix > 0 and --op-mix == 0; a no-op with a warning "
-                "otherwise). Default off -- every existing model is unaffected.");
+                "Scratch/op-mix slots embed as a live function of their bound fragments (HRR "
+                "circular-convolution binding by default) instead of a plain learned row (requires "
+                "--scratch-mix > 0 or --op-mix > 0; a no-op with a warning otherwise). Default off -- "
+                "every existing model is unaffected.");
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width

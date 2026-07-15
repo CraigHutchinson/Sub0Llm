@@ -49,6 +49,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,9 +58,12 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <print>
 #include <random>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -91,6 +95,12 @@ extern "C" [[nodiscard]] int  sub0_cuda_download_opt(float* host_m, float* host_
 extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                      float lr, long t, double* out_loss, const int* lengths,
                                      float muon_lr);
+// Forward+backward ONLY (no optimizer step) -- the primitive the source-routed hybrid CPU/GPU path
+// (below, GpuTrainer::backward_only) needs: the GPU sub-batch's gradient must be readable on the host so
+// it can be weighted-combined with the CPU sub-batch's gradient into ONE update, instead of each backend
+// silently applying its own independent optimizer step to its own resident parameter copy.
+extern "C" [[nodiscard]] int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
+                                     float* out_grad, double* out_loss, const int* lengths);
 // Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
 // pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
 extern "C" [[nodiscard]] int  sub0_cuda_train_reserve(int batch);
@@ -694,6 +704,15 @@ std::string preview(const std::string& prompt, int n, std::mt19937& rng) {
 namespace {
 struct GpuTrainer {
     bool active = false;
+    // Set by the caller once enable() succeeds under content_embed_active (source-routed hybrid
+    // CPU/GPU training -- see the hybrid_train branch in sub0_train_stage). In hybrid mode the HOST
+    // arenas are the only ones an optimizer step ever advances (opt.step() runs on host; the device
+    // only ever gets a one-way re-upload of the resulting params before its next forward pass, via
+    // sub0_cuda_upload_params) -- device optimizer state is never touched past enable()'s initial
+    // upload, so sync_to_host() downloading it would clobber the host's real Adam moments with stale
+    // frozen values. Never set by GpuTrainer itself; the caller is the only one who knows which mode
+    // this run is in.
+    bool hybrid = false;
     long t = 0;                       // AdamW step counter driving the device bias correction
     std::vector<int> ids, targets;    // per-step [batch*SEQ_LEN] window buffers
     // Set by step()/sync_to_host() on their most recent call. A device fault (illegal memory access
@@ -767,9 +786,9 @@ struct GpuTrainer {
     // with the trailing positions loss-masked on the device via the same `lengths` array -- so no
     // document is dropped and the padding contributes no gradient (causal attention keeps it out of the
     // real tokens). A masked source additionally writes LOSS_IGNORE_INDEX into the masked target rows
-    // (the interior mask); this needs the device ignore-index cross-entropy, so the caller currently
-    // gates masked sources off the GPU path until that kernel lands (see the train loop's any_masked
-    // guard) -- the mask branch here is inert until then.
+    // (the interior mask), read by the device's ignore-index cross-entropy -- parity-gated against the
+    // CPU loss-masked path (tests/cuda_tests.cpp "CUDA masked (ignore-index) backward..."), so masked
+    // sources run on GPU exactly like unmasked ones; no separate gating needed here.
     float step([[maybe_unused]] const std::vector<sub0::BlendSource>& sources,
                [[maybe_unused]] const int* src_idx, [[maybe_unused]] const std::size_t* starts,
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
@@ -804,12 +823,54 @@ struct GpuTrainer {
 #endif
     }
 
+    // Forward+backward ONLY -- no optimizer step applied (unlike step()). Fills out_grad[PARAM_FLOATS]
+    // with the reduced device gradient so the caller can weighted-combine it with a CPU sub-batch's
+    // gradient into ONE update instead of each backend independently updating its own resident parameter
+    // copy -- the source-routed hybrid CPU/GPU training path (project memory
+    // hybrid-cpu-gpu-execution-design; algorithm proven in tests/cuda_tests.cpp "CUDA+CPU hybrid split:
+    // weighted-merged gradient matches an undivided CPU batch"). Same window-materialization as step()
+    // (this call's OWN `batch`/`src_idx`/`starts`/`lengths` describe just the caller's chosen SUBSET of
+    // a step's windows -- step() already treats its own `batch` this way, not necessarily a full step's);
+    // reuses the same `ids`/`targets` scratch step() uses (the two are never called in the same step, so
+    // no aliasing risk). Returns the sub-batch's own mean loss (informational -- the caller's real
+    // combined loss uses the same weighting the gradient merge does).
+    float backward_only([[maybe_unused]] const std::vector<sub0::BlendSource>& sources,
+                        [[maybe_unused]] const int* src_idx, [[maybe_unused]] const std::size_t* starts,
+                        [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
+                        [[maybe_unused]] int T, [[maybe_unused]] float* out_grad) {
+#if defined(SUB0_BUILD_CUDA)
+        for (int b = 0; b < batch; ++b) {
+            const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
+            const std::size_t w = starts[b];
+            const int  len = lengths ? lengths[b] : T;
+            int s = 0;
+            for (; s < len; ++s) {
+                const std::size_t tp = w + static_cast<std::size_t>(s) + 1;
+                ids[static_cast<std::size_t>(b) * T + s]     = src.view[w + static_cast<std::size_t>(s)];
+                targets[static_cast<std::size_t>(b) * T + s] =
+                    (src.masked() && !src.mask[tp]) ? sub0::LOSS_IGNORE_INDEX : src.view[tp];
+            }
+            for (; s < T; ++s) {
+                ids[static_cast<std::size_t>(b) * T + s]     = 0;
+                targets[static_cast<std::size_t>(b) * T + s] = 0;
+            }
+        }
+        double loss = 0.0;
+        ok = (sub0_cuda_backward(ids.data(), targets.data(), batch, T, out_grad, &loss, lengths) == 0);
+        return static_cast<float>(loss);
+#else
+        return 0.0f;
+#endif
+    }
+
     // Refresh the host param + optimizer arenas from the device (before eval / checkpoint / save).
     // Returns false on a device failure -- the caller must NOT trust the host arenas (or proceed to
     // save/eval from them) when this happens; see `ok`'s own comment above.
     [[nodiscard]] bool sync_to_host() {
 #if defined(SUB0_BUILD_CUDA)
-        if (!active) return true;
+        // hybrid: host is ALWAYS already canonical (see `hybrid`'s own comment) -- a download here
+        // would overwrite correct host state with a stale/frozen device mirror, not refresh it.
+        if (!active || hybrid) return true;
         ok = sub0_cuda_download_params(sub0::params_ptr()) == 0 &&
              sub0_cuda_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) == 0;
         return ok;
@@ -824,6 +885,57 @@ struct GpuTrainer {
 #endif
         active = false;
     }
+};
+
+// A persistent worker for the hybrid_train branch's CPU sub-batch, so the per-step split doesn't pay
+// std::thread's OS-level construction cost (stack + control block) every training step -- AGENTS.md
+// #1 treats that class of per-step cost the same as a per-step heap allocation. Runs ONLY
+// sub0::train_batch over the CPU-routed window subset the caller fills into the referenced buffers
+// before each run(); the referenced vectors are never resized concurrently with a pending job (the
+// caller always wait()s before touching them again -- see the hybrid_train branch below). Not
+// thread-safe against multiple concurrent run() callers; this run's step loop is the only caller.
+struct CpuSubBatchWorker {
+    std::vector<int>& win; std::vector<std::size_t>& starts; std::vector<int>& lens;
+    std::vector<std::uint8_t>& mask; std::vector<const sub0::ScratchBindings*>& binds;
+    int n = 0, T = 0; bool masked = false;
+    float loss = 0.f;   // valid once wait() returns
+
+    std::mutex m;
+    std::condition_variable_any cv_go, cv_done;
+    bool has_job = false, done = true;
+    std::jthread thread;
+
+    CpuSubBatchWorker(std::vector<int>& win_, std::vector<std::size_t>& starts_, std::vector<int>& lens_,
+                      std::vector<std::uint8_t>& mask_, std::vector<const sub0::ScratchBindings*>& binds_)
+        : win(win_), starts(starts_), lens(lens_), mask(mask_), binds(binds_) {
+        thread = std::jthread([this](std::stop_token st) {
+            std::unique_lock lock(m);
+            for (;;) {
+                const bool got_job = cv_go.wait(lock, st, [this] { return has_job; });
+                if (!got_job) return;   // stop requested, no pending job -- exit
+                has_job = false;
+                lock.unlock();
+                loss = sub0::train_batch(win.data(), starts.data(), n, T, lens.data(),
+                                         masked ? mask.data() : nullptr, binds.data());
+                lock.lock();
+                done = true;
+                cv_done.notify_one();
+            }
+        });
+    }
+    // Submit this step's CPU sub-batch (n windows, already materialized into win/starts/lens/mask/binds
+    // by the caller); returns immediately, result is ready once wait() returns.
+    void run(int n_, int T_, bool masked_) {
+        n = n_; T = T_; masked = masked_;
+        { std::lock_guard lock(m); has_job = true; done = false; }
+        cv_go.notify_one();
+    }
+    void wait() {
+        std::unique_lock lock(m);
+        cv_done.wait(lock, [this] { return done; });
+    }
+    // ~CpuSubBatchWorker(): std::jthread's destructor requests stop then joins; the stop_token-aware
+    // cv_go.wait() above wakes on that request even with no job pending, so the worker exits cleanly.
 };
 }  // namespace
 
@@ -888,7 +1000,7 @@ struct SingleInstanceGuard {
 #endif
 
 // Shared run-context banner (model/compute/training-backend), defined below; train and tune share it.
-static void report_run_context(bool gpu_train);
+static void report_run_context(bool gpu_train, bool hybrid_train = false);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
@@ -1305,10 +1417,17 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // muon_lr computation. (Previously this silently fell back to pure AdamW on GPU with a warning;
     // GPU Muon support removed the need for that fallback entirely.)
     GpuTrainer gpu;
-    // content_embed has no CUDA implementation (content-derived slot embeddings are CPU-only, matching
-    // gen_stage.cpp's own "interception is CPU-only for now" precedent) -- skip the GPU init/upload
-    // entirely when active rather than pay for it and then discard it.
-    const bool gpu_train = !content_embed_active && gpu.enable(batch, opt.step_count());
+    // content_embed's binding lookup (encode_slot) is CPU-only (matching gen_stage.cpp's own
+    // "interception is CPU-only for now" precedent), but that only forces the WINDOWS that actually
+    // draw from a content-embed source (scratch-mix/op-mix) onto the CPU -- every other window in the
+    // same blend (base corpus, spell-mix) has no such need. gpu_available still enables the device
+    // session so those windows can route to it: see hybrid_train below (the source-routed split; algorithm
+    // proven in tests/cuda_tests.cpp "CUDA+CPU hybrid split..."), which activates whenever a GPU is
+    // available AND content_embed forces a CPU-side subset -- the two are not mutually exclusive.
+    const bool gpu_available = gpu.enable(batch, opt.step_count());
+    const bool gpu_train      = !content_embed_active && gpu_available;   // pure GPU: no CPU-only source active
+    const bool hybrid_train   =  content_embed_active && gpu_available;   // source-routed split (see above)
+    gpu.hybrid = hybrid_train;
 
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
@@ -1327,7 +1446,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const float peak_lr = lr;   // `lr` is the peak; lr_schedule(step) warms up to it then decays
 
     std::print("corpus: {} | ", src_desc);
-    report_run_context(gpu_train);
+    report_run_context(gpu_train, hybrid_train);
     sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}",
          epoch_steps, warmup_steps, eval_every, max_steps,
          (max_steps + epoch_steps - 1) / epoch_steps,
@@ -1364,6 +1483,29 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // valid for exactly as long as train_batch needs them); win_binds is what's actually passed through.
     std::vector<sub0::ScratchBindings> step_binds(static_cast<std::size_t>(max_batch_t));
     std::vector<const sub0::ScratchBindings*> win_binds(static_cast<std::size_t>(max_batch_t), nullptr);
+    // hybrid_train (see gpu_available/gpu_train/hybrid_train above): each step partitions this step's
+    // batch_t window indices into hyb_cpu_idx (content-embed sources -- CPU-only) and hyb_gpu_idx
+    // (everything else -- GPU-eligible). All sized/reserved to max_batch_t up front so the per-step
+    // .clear()+push_back() in the loop below never grow-reallocates once steady state is reached.
+    std::vector<int> hyb_cpu_idx, hyb_gpu_idx;
+    hyb_cpu_idx.reserve(static_cast<std::size_t>(max_batch_t));
+    hyb_gpu_idx.reserve(static_cast<std::size_t>(max_batch_t));
+    // Compacted (dense, 0-indexed) GPU sub-batch descriptors -- GpuTrainer::backward_only needs its OWN
+    // batch's src_idx/starts/lengths dense from [0, gpu_n), the same shape gpu.step() already requires.
+    std::vector<int> hyb_gpu_src(static_cast<std::size_t>(max_batch_t));
+    std::vector<std::size_t> hyb_gpu_starts(static_cast<std::size_t>(max_batch_t));
+    std::vector<int> hyb_gpu_len(static_cast<std::size_t>(max_batch_t));
+    // Compacted CPU sub-batch trained-length array (win_len[b] at the CPU sub-batch's own positions --
+    // cpu_win/cpu_starts/win_binds are already reused for this from the plain-CPU branch above).
+    std::vector<int> hyb_cpu_len(static_cast<std::size_t>(max_batch_t));
+    // GPU sub-batch's gradient, read back host-side by backward_only(); the CPU sub-batch's gradient
+    // lands in sub0::grad_ptr() directly (train_batch's own destination) so only ONE extra buffer is
+    // needed here, not two.
+    std::vector<float> hyb_gpu_grad(hybrid_train ? sub0::trainable_floats() : std::size_t{0});
+    // Spawned once (not per-step -- see CpuSubBatchWorker's own comment) only when actually needed;
+    // every other run leaves this empty and pays no worker-thread cost at all.
+    std::optional<CpuSubBatchWorker> cpu_worker;
+    if (hybrid_train) cpu_worker.emplace(cpu_win, cpu_starts, hyb_cpu_len, cpu_mask, win_binds);
     long steps_since_refresh = 0;
 
     // The blend: the weighted sources this run draws windows from. Source 0 is always the base
@@ -1503,8 +1645,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (spell_mix > 0.f || scratch_mix > 0.f || op_mix > 0.f)
         sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
     if (content_embed_active)
-        sub0::log::line("blend: content-derived scratch embeddings ON ({}, CPU-forced)",
-                        sub0::content_embed_kind_name(content_embed_kind));
+        sub0::log::line("blend: content-derived scratch embeddings ON ({}, {})",
+                        sub0::content_embed_kind_name(content_embed_kind),
+                        hybrid_train ? "CPU for content-embed windows, GPU for the rest"
+                                     : "CPU-forced");
     // Masked-source blending normalizes the loss/grad over the ACTIVE (non-ignored) positions on
     // whichever backend runs it: the CPU via train_batch's loss_mask, the GPU via the ce_backward
     // kernel's ignore-index path (targets < 0 inert + per-window active[] normalization). Both are
@@ -1581,6 +1725,44 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             win_len[b] = d.win.len;
         }
         const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
+        // Materializes window b (from this step's src_idx/starts/win_len draw) into cpu_win/cpu_starts/
+        // cpu_mask/win_binds at destination slot `dst` -- shared by the plain-CPU branch (dst==b, every
+        // window) and hybrid_train's CPU sub-batch (dst is a compacted index, b is the source window
+        // hyb_cpu_idx[dst] names). The content-embed branch below is a no-op for windows the caller
+        // already knows aren't content-embed-sourced (hybrid_train's CPU sub-batch is ALL such windows
+        // by construction), so one shared body covers both shapes.
+        const auto materialize_cpu_window = [&](int dst, int b) {
+            const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
+            const std::size_t base = static_cast<std::size_t>(dst) * (seq_t + 1);
+            const std::size_t n = static_cast<std::size_t>(win_len[b]) + 1;   // inputs + the last shifted target
+            src.view.copy_to(starts[b], n, &cpu_win[base]);
+            if (any_masked) {
+                // Aligned to cpu_win: 1 = trained, 0 = masked. An unmasked source trains every position;
+                // a masked source copies its per-token mask for this window. train_batch reads the mask
+                // at the TARGET index (base+i+1), so this parallel copy suffices.
+                for (std::size_t k = 0; k < n; ++k)
+                    cpu_mask[base + k] = src.masked() ? src.mask[starts[b] + k] : std::uint8_t{1};
+            }
+            cpu_starts[static_cast<std::size_t>(dst)] = base;
+            // content_embed: a window drawn from the scratch-mix or op-mix source gets its document's
+            // real slot->fragment bindings (scratch_ds/op_ds.doc_bindings); every other window (base
+            // corpus, spell-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
+            // matching what content_embed_active's validation guarantees those windows were (and still
+            // are) trained with.
+            if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
+                const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
+                step_binds[static_cast<std::size_t>(dst)] = sub0::ScratchBindings{
+                    std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), content_embed_enc };
+                win_binds[static_cast<std::size_t>(dst)] = &step_binds[static_cast<std::size_t>(dst)];
+            } else if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == op_source_idx) {
+                const std::size_t doc = sub0::doc_of(op_ds.doc_starts, starts[b]);
+                step_binds[static_cast<std::size_t>(dst)] = sub0::ScratchBindings{
+                    std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), content_embed_enc };
+                win_binds[static_cast<std::size_t>(dst)] = &step_binds[static_cast<std::size_t>(dst)];
+            } else if (content_embed_active) {
+                win_binds[static_cast<std::size_t>(dst)] = nullptr;
+            }
+        };
         float step_loss;
         if (gpu_train) {
             // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
@@ -1595,6 +1777,107 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 device_failed = true;
                 break;   // don't touch the device again this run -- not even the bookkeeping below
             }
+        } else if (hybrid_train) {
+            // Source-routed split: windows drawn from a content-embed source (scratch-mix/op-mix --
+            // encode_slot is CPU-only) route to the CPU path; every other window in this same blend
+            // (base corpus, spell-mix) has no such need and routes to the GPU, so the device session
+            // opened above isn't wasted just because content-embed forces a CPU-only subset. The CPU
+            // sub-batch's train_batch() runs on the persistent cpu_worker thread while the GPU sub-batch's
+            // backward_only() runs on the main thread (mostly blocked on the device, not the CPU, so
+            // the two don't meaningfully contend for cores); their gradients are weighted-combined by
+            // sub-batch size into ONE update -- the algorithm tests/cuda_tests.cpp "CUDA+CPU hybrid
+            // split: weighted-merged gradient matches an undivided CPU batch" proved on real hardware
+            // (rel-L2 0.0087, cos 0.999963). See project memory hybrid-cpu-gpu-execution-design.
+            opt.set_lr(lr_t);
+            if (opt.use_muon())
+                opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
+            const auto t_prep0 = clock::now();
+            hyb_cpu_idx.clear(); hyb_gpu_idx.clear();
+            for (int b = 0; b < batch_t; ++b) {
+                const bool needs_cpu = static_cast<std::size_t>(src_idx[b]) == scratch_source_idx ||
+                                       static_cast<std::size_t>(src_idx[b]) == op_source_idx;
+                (needs_cpu ? hyb_cpu_idx : hyb_gpu_idx).push_back(b);
+            }
+            const int cpu_n = static_cast<int>(hyb_cpu_idx.size());
+            const int gpu_n = static_cast<int>(hyb_gpu_idx.size());
+
+            if (cpu_n > 0) {   // materialize the CPU sub-batch at COMPACTED positions [0, cpu_n)
+                cpu_win.resize(static_cast<std::size_t>(cpu_n) * (seq_t + 1));
+                if (any_masked) cpu_mask.resize(cpu_win.size());
+                for (int i = 0; i < cpu_n; ++i) {
+                    const int b = hyb_cpu_idx[static_cast<std::size_t>(i)];
+                    materialize_cpu_window(i, b);
+                    hyb_cpu_len[static_cast<std::size_t>(i)] = win_len[b];
+                }
+            }
+            if (gpu_n > 0) {   // compacted GPU sub-batch descriptors at [0, gpu_n)
+                for (int i = 0; i < gpu_n; ++i) {
+                    const int b = hyb_gpu_idx[static_cast<std::size_t>(i)];
+                    hyb_gpu_src[static_cast<std::size_t>(i)]    = src_idx[b];
+                    hyb_gpu_starts[static_cast<std::size_t>(i)] = starts[b];
+                    hyb_gpu_len[static_cast<std::size_t>(i)]    = win_len[b];
+                }
+            }
+            prep_secs += std::chrono::duration<double>(clock::now() - t_prep0).count();
+
+            const auto t_train0 = clock::now();
+            float cpu_loss = 0.f, gpu_loss = 0.f;
+            if (cpu_n > 0 && gpu_n > 0) {
+                cpu_worker->run(cpu_n, seq_t, any_masked);      // dispatch to the persistent worker thread
+                gpu_loss = gpu.backward_only(sources, hyb_gpu_src.data(), hyb_gpu_starts.data(),
+                                             hyb_gpu_len.data(), gpu_n, seq_t, hyb_gpu_grad.data());
+                cpu_worker->wait();
+                cpu_loss = cpu_worker->loss;
+            } else if (cpu_n > 0) {
+                cpu_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), cpu_n, seq_t,
+                                             hyb_cpu_len.data(), any_masked ? cpu_mask.data() : nullptr,
+                                             win_binds.data());
+            } else {   // gpu_n > 0 -- batch_t >= 1 guarantees at least one of the two is nonempty
+                gpu_loss = gpu.backward_only(sources, hyb_gpu_src.data(), hyb_gpu_starts.data(),
+                                             hyb_gpu_len.data(), gpu_n, seq_t, hyb_gpu_grad.data());
+            }
+            train_secs += std::chrono::duration<double>(clock::now() - t_train0).count();
+            if (!gpu.ok) {
+                sub0::log::error("training: GPU sub-batch failed (device fault) at step {} -- stopping "
+                                 "immediately without a final save; the last periodic checkpoint on "
+                                 "disk is untouched and resumable.", step);
+                device_failed = true;
+                break;
+            }
+
+            const auto t_opt0 = clock::now();
+            // Weighted-merge into grad_ptr(): train_batch already left the CPU sub-batch's own
+            // mean-normalized gradient there when cpu_n>0; when cpu_n==0 the GPU gradient replaces it
+            // wholesale instead (there is nothing to weight against).
+            if (gpu_n > 0) {
+                float* g = sub0::grad_ptr();
+                const std::size_t n = sub0::trainable_floats();
+                if (cpu_n > 0) {
+                    const float w_cpu = static_cast<float>(cpu_n) / static_cast<float>(batch_t);
+                    const float w_gpu = static_cast<float>(gpu_n) / static_cast<float>(batch_t);
+                    for (std::size_t i = 0; i < n; ++i) g[i] = w_cpu * g[i] + w_gpu * hyb_gpu_grad[i];
+                } else {
+                    std::copy_n(hyb_gpu_grad.data(), n, g);
+                }
+            }
+            opt.step();
+            step_loss = (static_cast<float>(cpu_n) * cpu_loss + static_cast<float>(gpu_n) * gpu_loss)
+                       / static_cast<float>(batch_t);
+            // Device params just went stale (host advanced via opt.step() above) -- re-upload UNCONDITIONALLY,
+            // even on a step with gpu_n==0. A step that happens to draw an all-CPU batch_t still advances
+            // the host params via opt.step(); skipping the re-upload here would leave the device holding
+            // an EARLIER step's weights, so the next step that DOES have gpu_n>0 would compute its gradient
+            // against stale params -- a real (if rare, P ~= (scratch_mix+op_mix)^batch_t per step)
+            // correctness bug, not just a wasted upload. A failed re-upload is exactly as fatal as a failed
+            // backward_only above (the device can no longer be trusted for the next step).
+            if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) {
+                sub0::log::error("training: GPU param re-upload failed at step {} -- stopping "
+                                 "immediately without a final save; the last periodic checkpoint on "
+                                 "disk is untouched and resumable.", step);
+                device_failed = true;
+                break;
+            }
+            opt_secs += std::chrono::duration<double>(clock::now() - t_opt0).count();
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update
             if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
@@ -1602,38 +1885,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const auto t_prep0 = clock::now();
             cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
             if (any_masked) cpu_mask.resize(cpu_win.size());   // parallel loss mask (only when a source carries one)
-            for (int b = 0; b < batch_t; ++b) {
-                const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
-                const std::size_t base = static_cast<std::size_t>(b) * (seq_t + 1);
-                const std::size_t n = static_cast<std::size_t>(win_len[b]) + 1;   // inputs + the last shifted target
-                src.view.copy_to(starts[b], n, &cpu_win[base]);
-                if (any_masked) {
-                    // Aligned to cpu_win: 1 = trained, 0 = masked. An unmasked source trains every
-                    // position; a masked source copies its per-token mask for this window. train_batch
-                    // reads the mask at the TARGET index (base+i+1), so this parallel copy suffices.
-                    for (std::size_t i = 0; i < n; ++i)
-                        cpu_mask[base + i] = src.masked() ? src.mask[starts[b] + i] : std::uint8_t{1};
-                }
-                cpu_starts[b] = base;
-                // content_embed: a window drawn from the scratch-mix or op-mix source gets its document's
-                // real slot->fragment bindings (scratch_ds/op_ds.doc_bindings); every other window (base
-                // corpus, spell-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
-                // matching what content_embed_active's validation guarantees those windows were (and
-                // still are) trained with.
-                if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
-                    const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
-                    step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
-                        std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), content_embed_enc };
-                    win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
-                } else if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == op_source_idx) {
-                    const std::size_t doc = sub0::doc_of(op_ds.doc_starts, starts[b]);
-                    step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
-                        std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), content_embed_enc };
-                    win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
-                } else if (content_embed_active) {
-                    win_binds[static_cast<std::size_t>(b)] = nullptr;
-                }
-            }
+            for (int b = 0; b < batch_t; ++b) materialize_cpu_window(b, b);
             prep_secs += std::chrono::duration<double>(clock::now() - t_prep0).count();
             const auto t_train0 = clock::now();
             step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data(),
@@ -1871,10 +2123,13 @@ static void report_threading() {
 // front. Lines 1-2 (model dims + static memory + compute mode + CUDA availability) come from the
 // backend's print_config(); the third names the training path that will actually execute, so the
 // throughput numbers that follow are read against the right backend.
-static void report_run_context(bool gpu_train) {
+static void report_run_context(bool gpu_train, bool hybrid_train) {
     sub0::print_config();   // engine config line (console only; the same dims are in the model's meta.txt)
-    sub0::log::line("training backend: {}", gpu_train ? "GPU (resident device step: fwd+bwd+AdamW)"
-                                           : "CPU (data-parallel minibatch)");
+    const char* backend = hybrid_train ? "hybrid CPU+GPU (source-routed split: content-embed windows on "
+                                          "CPU, the rest on GPU; host-canonical AdamW)"
+                        : gpu_train    ? "GPU (resident device step: fwd+bwd+AdamW)"
+                                       : "CPU (data-parallel minibatch)";
+    sub0::log::line("training backend: {}", backend);
     std::fflush(stdout);
 }
 
