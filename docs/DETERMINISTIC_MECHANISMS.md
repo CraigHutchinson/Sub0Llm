@@ -194,20 +194,23 @@ keeps decoding with the MeanPool it actually trained on, never silently drifting
 ConvPool remain implemented but unwired. See project memory `meanpool-alternatives-prior-art-and-math`
 for the full prior-art survey, math, and per-seed results.
 
-**Hybrid CPU/GPU execution is the necessary next unlock, not an optional nicety.** `--content-embed`
-forces the ENTIRE training step onto CPU today (`gpu_train = !content_embed_active && ...` in
-`train_stage.cpp`), because a bound scratch slot's meaning is per-WINDOW (different windows in the same
-batch can bind the same slot id to different content), which the device's id-indexed, batch-shared
-embedding table cannot represent without a real per-window device-side lookup kernel -- the still-unbuilt
-`SUB0_COMPUTE=HYBRID` ("Phase 3", `cmake/Backends.cmake`). The tractable near-term path is narrower and
-already buildable on existing infrastructure: SOURCE-ROUTED splitting, where windows drawn from a
-content-embed-active blend source (`--scratch-mix`/`--op-mix`) run on CPU while every other window in the
-SAME batch (base corpus, etc. -- already tagged per-window via `src_idx`) runs on GPU, gradients merged
-before the shared optimizer step. `GpuTrainer::step()`'s CUDA call is synchronous today (it reads the
-step's loss back to the host before returning), so real overlap needs either a separate host thread for
-the CPU sub-batch or splitting the device call into launch/finish -- not "free" async overlap, see project
-memory `hybrid-cpu-gpu-execution-design` for the corrected design. Still what actually unblocks verifying
-any of the three encoders above at production scale in reasonable time, not just a throughput nicety.
+**Hybrid CPU/GPU execution is DONE (2026-07-16).** `--content-embed` used to force the ENTIRE training
+step onto CPU (`gpu_train = !content_embed_active && ...`), because a bound scratch slot's meaning is
+per-WINDOW (different windows in the same batch can bind the same slot id to different content), which
+the device's id-indexed, batch-shared embedding table cannot represent without a real per-window
+device-side lookup kernel -- the still-unbuilt `SUB0_COMPUTE=HYBRID` ("Phase 3", `cmake/Backends.cmake`).
+The tractable, now-shipped path is narrower: SOURCE-ROUTED splitting. Each step partitions its windows by
+blend source -- those drawn from a content-embed-active source (`--scratch-mix`/`--op-mix`) run on a
+persistent CPU worker thread (`train_stage.cpp`'s `CpuSubBatchWorker`), every other window in the SAME
+batch (base corpus, etc.) runs on GPU via `GpuTrainer::backward_only()` -- and the two gradients are
+weighted-merged (by sub-batch size) into one host-side `AdamW::step()`, with params re-uploaded to the
+device every step. Proven correct on real hardware (`tests/cuda_tests.cpp`, rel-L2 0.0087, cos 0.999963)
+before wiring into the live loop; a self-run `/cpp-review` pass then caught and fixed two real bugs
+(a per-step `std::thread` violating the no-per-step-allocation rule, and a device re-upload incorrectly
+skipped on an all-CPU step that left stale params on the device for the next GPU-touching step). A
+300-step real run tracks the pure-CPU baseline's loss curve almost exactly while running ~2.3-2.6x
+faster. See project memory `hybrid-cpu-gpu-execution-design` for the full history and verification detail.
+This is what unblocks verifying any of the three encoders above at production scale in reasonable time.
 
 ---
 
