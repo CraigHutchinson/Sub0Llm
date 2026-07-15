@@ -21,7 +21,7 @@
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, float spell_mix, float scratch_mix,
-                                float op_mix, const char* gsm8k_path);
+                                float op_mix, const char* gsm8k_path, int content_embed);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -60,6 +60,12 @@ inline int run_train(int argc, char** argv) {
     float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
     float train_op_mix = 0.f;      // 0 = off; >0 blends in the op-delegation (math node routing) curriculum
     std::string train_gsm8k;       // if set (with --op-mix>0): draw the op curriculum from THIS real GSM8K file
+    bool train_content_embed = false;   // scratch-mix slots embed as a live function of their bound fragments
+                                        // (mean-pool) instead of a plain learned row -- see
+                                        // docs/DETERMINISTIC_MECHANISMS.md / the scratch-token content-reasoning
+                                        // work. Requires --scratch-mix > 0 and --op-mix == 0 (train_stage warns
+                                        // and disables it otherwise -- op-collapsed slots aren't trained this
+                                        // way yet, so combining would mismatch gen against training).
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -107,6 +113,10 @@ inline int run_train(int argc, char** argv) {
                    "to delegated [op math] frames (masked results) -- so GSM8K's OWN arithmetic delegates, "
                    "instead of the synthetic generator. Omit for the synthetic curriculum.")
        ->check(CLI::ExistingFile);
+    app.add_flag("--content-embed", train_content_embed,
+                "Scratch-mix slots embed as a live function of their bound fragments (mean-pool) instead of "
+                "a plain learned row (requires --scratch-mix > 0 and --op-mix == 0; a no-op with a warning "
+                "otherwise). Default off -- every existing model is unaffected.");
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -120,7 +130,7 @@ inline int run_train(int argc, char** argv) {
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
                             resume_mode, train_spell_mix, train_scratch_mix, train_op_mix,
-                            train_gsm8k.c_str());
+                            train_gsm8k.c_str(), train_content_embed ? 1 : 0);
 }
 
 // --- gen -------------------------------------------------------------------

@@ -81,6 +81,15 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // inline digits (`A + B =`). Like the interceptor, it forces the CPU KV-cache decode.
     std::function<std::vector<int>(const std::vector<int>&)>   compute;
     bool op_collapse = false;   // an --op-mix model: op results COLLAPSE to slots (expanded for display below)
+    // content_embed: scratch slots embed as a live function of their bound fragments (mean-pool) instead
+    // of a plain learned row -- ONLY meaningful for a --scratch-mix model (train_stage.cpp requires
+    // scratch_mix>0 and op_mix<=0 to ever persist content_embed=on, so op_on is guaranteed false whenever
+    // this fires; see docs/DETERMINISTIC_MECHANISMS.md / smooth-noodling-kurzweil). `binds` lives for the
+    // whole function so set_scratch_bindings' thread-local pointer stays valid through decode; refreshed
+    // after `combine` mutates `scratch.bindings` (the only mutator reachable here) since ScratchBindings'
+    // span is a snapshot, not a live view.
+    bool content_embed_on = false;
+    sub0::ScratchBindings binds{};
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
@@ -92,10 +101,18 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
+                content_embed_on = sp_on && cfg.content_embed > 0;
                 if (sp_on) {
                     scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
                     expand  = [&scratch](int token) { return scratch.expand(token); };
-                    combine = [&scratch](const std::vector<int>& frags) { return scratch.combine(frags); };
+                    combine = [&scratch, &binds, content_embed_on](const std::vector<int>& frags) {
+                        std::vector<int> r = scratch.combine(frags);
+                        // combine() is the only mutator of scratch.bindings reachable when content_embed_on
+                        // (op_collapse's scratch.bind() can't coexist -- see the field comment above), so
+                        // refreshing the snapshot here keeps it current for every subsequent forward_one.
+                        if (content_embed_on) binds = scratch.to_bindings();
+                        return r;
+                    };
                 }
                 // The op deref reads bound slots from the ScratchTable (numeric BIND + collapse-chain refs).
                 auto op_deref = [&scratch](int slot) { return scratch.value(slot); };
@@ -120,8 +137,8 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                     compute = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
                 }
                 std::println(stderr, "gen: interceptor enabled (spell-mix {:.2f}, scratch-mix {:.2f}, "
-                                     "op-mix {:.2f}{})", cfg.spell_mix, cfg.scratch_mix, cfg.op_mix,
-                             op_collapse ? ", collapse" : "");
+                                     "op-mix {:.2f}{}{})", cfg.spell_mix, cfg.scratch_mix, cfg.op_mix,
+                             op_collapse ? ", collapse" : "", content_embed_on ? ", content-embed" : "");
             }
         }
     }
@@ -153,8 +170,10 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
             std::println(stderr, "gen: decode backend {}{}",
                         gpu ? "GPU (device KV-cache)" : "CPU (KV-cache)",
                         intercept ? " + uncombine/op interceptor" : "");
+            if (content_embed_on) { binds = scratch.to_bindings(); sub0::set_scratch_bindings(&binds); }
             sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine,
                                      compute, sub0::nodes::FRAME_CLOSE);
+            if (content_embed_on) sub0::set_scratch_bindings(nullptr);
             expand_op_slots(ctx);   // collapsed op results -> their value digits for display
             std::println("{}", sub0::detokenize(ctx));
             return 0;

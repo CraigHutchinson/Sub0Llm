@@ -34,6 +34,17 @@
   docs/DETERMINISTIC_MECHANISMS.md. (The proven arch stack -- gated FFN / tied embeddings / QK-norm / Muon --
   is now configure/train default-ON, so no extra flag is needed for it.)
 
+.PARAMETER ScratchMix
+  0 (default) = off. >0 blends the scratch-token (context-translation) curriculum (teach the model to
+  RESOLVE a dynamically-bound scratch slot for an OOV, so an OOV costs 1 token per mention).
+
+.PARAMETER ContentEmbed
+  Off by default. Requires -ScratchMix > 0 and -OpMix == 0 (a no-op with a warning otherwise -- see
+  src/train_stage.cpp). Scratch slots embed as a live function of their bound fragments (mean-pool)
+  instead of a plain learned row, in BOTH training and generation (forces CPU for both -- no CUDA path
+  yet). Every model trained WITHOUT this flag is unaffected; it cannot be turned on later for an existing
+  model without retraining (train/inference mismatch -- see docs/DETERMINISTIC_MECHANISMS.md).
+
 .PARAMETER Tune
   Run sub0llm-tune before training and rebuild so the baked DEFAULT_THREADS picks up its result.
   Off by default: training runs fine on the un-tuned defaults, and tuning adds its own search time.
@@ -75,6 +86,8 @@ param(
     [int]$Batch        = 0,
     [double]$OpMix     = 0,
     [string]$Gsm8k     = "",
+    [double]$ScratchMix = 0,
+    [switch]$ContentEmbed,
     [switch]$Tune,
     [switch]$Clean,
     [switch]$SkipConfigure,
@@ -160,6 +173,8 @@ if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
 if ($Batch -gt 0) { $trainArgs += @("--batch", "$Batch") }   # pin the batch (the GPU auto-batch over-shoots VRAM on small models)
 if ($OpMix -gt 0) { $trainArgs += @("--op-mix", "$OpMix") }   # blend the op-delegation (math routing) curriculum
 if ($Gsm8k)       { $trainArgs += @("--gsm8k", (Resolve-Path (Join-Path $RepoRoot $Gsm8k)).Path) }  # real GSM8K as the op source
+if ($ScratchMix -gt 0) { $trainArgs += @("--scratch-mix", "$ScratchMix") }   # blend the scratch-token curriculum
+if ($ContentEmbed)     { $trainArgs += @("--content-embed") }   # scratch slots embed as a live function of their bound fragments (requires -ScratchMix, no -OpMix)
 $trainArgs += @($ModelPath, $CorpusPath)
 Invoke-Checked (Join-Path $Bin "sub0llm-train.exe") $trainArgs
 

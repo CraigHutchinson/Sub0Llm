@@ -75,9 +75,7 @@ TEST_CASE("blend: sample_blend keeps each window inside the chosen source and on
         REQUIRE(d.win.len >= 1);
         REQUIRE(end < src.view.size());                          // window (incl. shifted target) in bounds
         // The whole window [start, start+len] stays within one document of the chosen source.
-        const auto k = static_cast<std::size_t>(
-            std::upper_bound(src.docs.begin(), src.docs.end(),
-                             static_cast<std::uint64_t>(d.win.start)) - src.docs.begin()) - 1;
+        const std::size_t k = sub0::doc_of(src.docs, d.win.start);
         const std::uint64_t doc_end = (k + 1 < src.docs.size()) ? src.docs[k + 1] : src.view.size();
         REQUIRE(end < doc_end);
     }
@@ -89,4 +87,20 @@ TEST_CASE("blend: masked() reflects whether a source carries a loss mask", "[ble
     std::vector<std::uint8_t> m(10, 1);
     REQUIRE_FALSE(make_source(a, da, 1.0).masked());
     REQUIRE(make_source(a, da, 1.0, m).masked());
+}
+
+TEST_CASE("blend: doc_of finds the document owning a corpus position", "[blend]") {
+    // Three docs: [0,20), [20,40), [40,60).
+    const std::vector<std::uint64_t> docs{0, 20, 40};
+    CHECK(sub0::doc_of(docs, 0)  == 0);   // first position of doc 0
+    CHECK(sub0::doc_of(docs, 19) == 0);   // last position of doc 0
+    CHECK(sub0::doc_of(docs, 20) == 1);   // exactly on a boundary -> the NEXT doc, not the previous
+    CHECK(sub0::doc_of(docs, 39) == 1);
+    CHECK(sub0::doc_of(docs, 40) == 2);
+    CHECK(sub0::doc_of(docs, 59) == 2);   // last position of the last doc
+
+    // Single document: every position resolves to doc 0.
+    const std::vector<std::uint64_t> one_doc{0};
+    CHECK(sub0::doc_of(one_doc, 0)   == 0);
+    CHECK(sub0::doc_of(one_doc, 999) == 0);
 }

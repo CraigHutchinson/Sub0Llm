@@ -23,6 +23,7 @@
 #include "sub0/tokmap.hpp"   // TokView (a width-agnostic read view over a token stream)
 #include "sub0/window.hpp"   // Window + sample_window (document-boundary-respecting sampler)
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -45,6 +46,17 @@ struct BlendSource {
 
     bool masked() const { return !mask.empty(); }
 };
+
+// The index of the document owning corpus position `pos`, given its ascending `doc_starts` (doc i spans
+// [doc_starts[i], doc_starts[i+1])). Used to recover a training window's source document from a source's
+// `docs` span + a sampled window start -- e.g. to look up per-document side data (like a scratch-mix
+// window's slot->fragment bindings) that a plain token+mask stream doesn't itself carry. Precondition:
+// `doc_starts` is non-empty and ascending (guaranteed by every Dataset builder in this codebase) and
+// `pos < doc_starts.back()`.
+inline std::size_t doc_of(std::span<const std::uint64_t> doc_starts, std::size_t pos) {
+    return static_cast<std::size_t>(
+        std::upper_bound(doc_starts.begin(), doc_starts.end(), pos) - doc_starts.begin() - 1);
+}
 
 // Pick a source index in proportion to the weights. A single source returns 0 WITHOUT drawing from
 // `rng` -- so the common one-source run's window-sampling rng stream (hence its resume point) is

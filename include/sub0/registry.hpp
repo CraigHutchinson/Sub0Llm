@@ -120,7 +120,8 @@ struct ModelMeta {
     X(unsigned,    seed,            0u)   \
     X(double,      spell_mix,       0.0)  \
     X(double,      scratch_mix,     0.0)  \
-    X(double,      op_mix,          0.0)
+    X(double,      op_mix,          0.0)  \
+    X(int,         content_embed,   0)
 
 struct RunConfig {
 #define SUB0_RUN_CONFIG_DECL(type, name, def) type name = def;
@@ -154,7 +155,8 @@ inline const char* enum_name(std::string_view field, int v) {
         int i = 0; for (const char* n : names) if (i++ == v) return n; return nullptr; };
     if (field == "pos_encoding") return nth({"learned", "rope"});
     if (field == "optimizer")    return nth({"adamw", "muon"});
-    if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary")
+    if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary"
+        || field == "content_embed")
         return nth({"off", "on"});
     return nullptr;
 }

@@ -31,6 +31,7 @@
 #include "sub0/blend.hpp"    // weighted per-window multi-source blending (base corpus + curriculum)
 #include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a --spell-mix blend source)
 #include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a --scratch-mix blend source)
+#include "sub0/scratch_slots.hpp" // ScratchBindings / SlotEncoding -- content-derived scratch-slot embeddings
 #include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (a --op-mix blend source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
@@ -274,15 +275,28 @@ double evaluate(sub0::TokView data, std::size_t val_start) {
     const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
     const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
     double total = 0.0;
-    int win[SEQ_LEN + 1];                                   // materialize the window (token view may be uint16-packed)
-    for (int w = 0; w < nw; ++w) {
-        std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
-        if (s > last) s = last;
-        data.copy_to(s, SEQ_LEN + 1, win);
-        sub0::graph_reset();
-        sub0::Node* logits = sub0::forward(win, SEQ_LEN);
-        sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
-        total += loss->data[0];
+    // Data-parallel over the nw fixed windows, same shape as train_batch's parallel region
+    // (backend_cpu.cpp) -- forward()/graph_reset()/cross_entropy all operate on a thread_local model
+    // arena, so this is forward-only train_batch minus the backward/grad-reduction half. `win` is
+    // declared INSIDE the parallel region (not hoisted, unlike the old single-threaded loop) so each
+    // thread gets its own buffer -- a shared one would race between data.copy_to's write and forward's
+    // read. Static schedule keeps the SET of windows evaluated identical to the sequential version
+    // (still every w in [0,nw), still the "fixed, evenly-spaced" windows the comment above promises);
+    // only their evaluation and summation ORDER changes, which floating-point addition isn't strictly
+    // invariant to (same caveat train_batch's own cross-thread grad reduction already carries).
+    #pragma omp parallel num_threads(DEFAULT_THREADS)
+    {
+        int win[SEQ_LEN + 1];   // materialize the window (token view may be uint16-packed)
+        #pragma omp for reduction(+ : total) schedule(static)
+        for (int w = 0; w < nw; ++w) {
+            std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
+            if (s > last) s = last;
+            data.copy_to(s, SEQ_LEN + 1, win);
+            sub0::graph_reset();
+            sub0::Node* logits = sub0::forward(win, SEQ_LEN);
+            sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
+            total += loss->data[0];
+        }
     }
     sub0::graph_reset();
     return total / nw;
@@ -879,7 +893,7 @@ static void report_run_context(bool gpu_train);
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
                                           int optimizer, int resume_mode, float spell_mix, float scratch_mix,
-                                          float op_mix, const char* gsm8k_path) {
+                                          float op_mix, const char* gsm8k_path, int content_embed) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1117,6 +1131,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // real per-step batch_t*seq_t for the rest of this invocation. Declared here (not where it's
     // seeded) so write_meta's [&] capture below can see it.
     long long tokens_seen_est = 0;
+    // Same reasoning as tokens_seen_est above: declared here (not where it's validated, after resume
+    // reconciliation below) so build_run_config's [&] capture can see it.
+    bool content_embed_active = false;
 
     // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
     // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
@@ -1138,6 +1155,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.spell_mix = spell_mix;     // the blend recipe: re-enforced on resume like optimizer (below)
         cfg.scratch_mix = scratch_mix;
         cfg.op_mix = op_mix;
+        cfg.content_embed = content_embed_active ? 1 : 0;   // the VALIDATED state, not the raw request
         return cfg;
     };
 
@@ -1237,7 +1255,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                 static_cast<double>(op_mix), persisted.op_mix);
                 op_mix = static_cast<float>(persisted.op_mix);
             }
+            if (persisted.content_embed != content_embed) {
+                sub0::log::info("  config.json overrides this invocation's --content-embed: {} -> {} "
+                                "(the persisted blend recipe wins on resume)",
+                                content_embed ? "on" : "off", persisted.content_embed ? "on" : "off");
+                content_embed = persisted.content_embed;
+            }
         }
+    }
+
+    // content_embed needs --scratch-mix (the only curriculum that records structured slot->fragment
+    // binding data today -- scratchspike::Dataset::doc_bindings) and is incompatible with --op-mix (an
+    // op-collapsed slot is never trained with a content-derived embedding, since op-mix windows always
+    // pass null bindings below -- turning it on anyway would feed gen a vector the model never saw
+    // during training). Validated AFTER resume reconciliation so it reflects the FINAL scratch_mix/op_mix.
+    content_embed_active = content_embed != 0 && scratch_mix > 0.f && op_mix <= 0.f;
+    if (content_embed && !content_embed_active) {
+        sub0::log::warn("--content-embed requested but disabled: {}",
+                        scratch_mix <= 0.f
+                            ? "no --scratch-mix source to bind from"
+                            : "incompatible with --op-mix > 0 (op-collapsed slots aren't trained this way yet)");
     }
 
     sub0::AdamW opt(lr, optimizer == 1);
@@ -1252,7 +1289,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // muon_lr computation. (Previously this silently fell back to pure AdamW on GPU with a warning;
     // GPU Muon support removed the need for that fallback entirely.)
     GpuTrainer gpu;
-    const bool gpu_train = gpu.enable(batch, opt.step_count());
+    // content_embed has no CUDA implementation (content-derived slot embeddings are CPU-only, matching
+    // gen_stage.cpp's own "interception is CPU-only for now" precedent) -- skip the GPU init/upload
+    // entirely when active rather than pay for it and then discard it.
+    const bool gpu_train = !content_embed_active && gpu.enable(batch, opt.step_count());
 
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
@@ -1302,6 +1342,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<int>    cpu_win;          // CPU path: materialized window tokens (view may be uint16-packed)
     std::vector<size_t> cpu_starts(max_batch_t);
     std::vector<std::uint8_t> cpu_mask;   // CPU path: per-window loss mask parallel to cpu_win (only when a source is masked)
+    // content_embed: per-window content-derived scratch-slot bindings (scratch-mix windows only -- see
+    // content_embed_active's guard above). step_binds owns each window's ScratchBindings VALUE (rebuilt
+    // fresh every step from scratch_ds's already-resident doc_bindings, so the pointers in win_binds stay
+    // valid for exactly as long as train_batch needs them); win_binds is what's actually passed through.
+    std::vector<sub0::ScratchBindings> step_binds(static_cast<std::size_t>(max_batch_t));
+    std::vector<const sub0::ScratchBindings*> win_binds(static_cast<std::size_t>(max_batch_t), nullptr);
     long steps_since_refresh = 0;
 
     // The blend: the weighted sources this run draws windows from. Source 0 is always the base
@@ -1354,6 +1400,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // (index its chars via uncombine, generalizes to held-out OOVs) + associative REASON-over-slots
     // (select a slot by its in-context tag). `scratch_ds` must outlive the loop (the source borrows it).
     sub0::scratchspike::Dataset scratch_ds;
+    std::size_t scratch_source_idx = static_cast<std::size_t>(-1);   // sentinel: no scratch source this run
     if (scratch_mix > 0.f) {
         sub0::tok::Tokenizer tk;
         std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
@@ -1379,6 +1426,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const int contains_k = std::min({kScratchK, 4, std::max(0, (SEQ_LEN - 8) / 11)});
         scratch_ds = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt,
                                                                contains_k >= 2 ? contains_k : 0);
+        scratch_source_idx = sources.size();
         sources.push_back(sub0::BlendSource{
             sub0::TokView::over_int32(scratch_ds.tokens.data(), scratch_ds.tokens.size()),
             std::span<const std::uint64_t>(scratch_ds.doc_starts),
@@ -1387,6 +1435,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, content-K={}, {} OOVs, {} traces, {} tokens)",
                         static_cast<double>(scratch_mix) * 100.0, kScratchK, contains_k >= 2 ? contains_k : 0,
                         split.drilled.size(), scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
+        if (content_embed_active)
+            sub0::log::line("blend: content-derived scratch embeddings ON (mean-pool, CPU-forced)");
     }
     // --op-mix: blend in the op-delegation curriculum (op_curriculum.hpp). Teaches the model to ROUTE
     // arithmetic to the `math` node (emit a bare [op math]; the node reads the posed expression and supplies
@@ -1456,6 +1506,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     long last_log_step = win_steps0;
     auto last_ckpt = win_t0;   // wall-clock timer for the crash-resistance checkpoint tick (CKPT_SECONDS)
     double run_loss = 0.0; int run_n = 0;
+    // Section timers (CPU path only, cumulative since the last eval, same reset points as run_loss/
+    // run_n above) -- diagnostic-only, to see WHERE step wall-clock actually goes (window prep vs.
+    // train_batch vs. the optimizer step) without needing an external profiler. See project memory
+    // cpu-profiling-tooling-backlog for the real-profiler follow-up this is a stopgap for.
+    double prep_secs = 0.0, train_secs = 0.0, opt_secs = 0.0;
     // Windows/sec used to key off (step - win_steps0)*batch, correct only when every step processed
     // exactly `batch` windows. The token-budget scheduler below varies batch_t per step, so
     // throughput is tracked directly as a running window count instead, snapshotted at each reset
@@ -1522,6 +1577,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update
             if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
                 opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
+            const auto t_prep0 = clock::now();
             cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
             if (any_masked) cpu_mask.resize(cpu_win.size());   // parallel loss mask (only when a source carries one)
             for (int b = 0; b < batch_t; ++b) {
@@ -1537,10 +1593,29 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                         cpu_mask[base + i] = src.masked() ? src.mask[starts[b] + i] : std::uint8_t{1};
                 }
                 cpu_starts[b] = base;
+                // content_embed: a window drawn from the scratch-mix source gets its document's real
+                // slot->fragment bindings (scratch_ds.doc_bindings); every other window (base corpus,
+                // spell-mix, op-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
+                // matching what content_embed_active's validation guarantees those windows were (and
+                // still are) trained with.
+                if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
+                    const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
+                    step_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+                        std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+                    win_binds[static_cast<std::size_t>(b)] = &step_binds[static_cast<std::size_t>(b)];
+                } else if (content_embed_active) {
+                    win_binds[static_cast<std::size_t>(b)] = nullptr;
+                }
             }
+            prep_secs += std::chrono::duration<double>(clock::now() - t_prep0).count();
+            const auto t_train0 = clock::now();
             step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data(),
-                                          any_masked ? cpu_mask.data() : nullptr);
+                                          any_masked ? cpu_mask.data() : nullptr,
+                                          content_embed_active ? win_binds.data() : nullptr);
+            train_secs += std::chrono::duration<double>(clock::now() - t_train0).count();
+            const auto t_opt0 = clock::now();
             opt.step();
+            opt_secs += std::chrono::duration<double>(clock::now() - t_opt0).count();
         }
         run_loss += step_loss; ++run_n;
         total_windows += batch_t;                          // for wps: batch_t varies per step now
@@ -1609,6 +1684,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             write_meta("training");          // refresh best_val_nelbo as it improves
 
             run_loss = 0.0; run_n = 0;
+            prep_secs = 0.0; train_secs = 0.0; opt_secs = 0.0;
             win_t0 = clock::now(); win_steps0 = step; windows_at_win_t0 = total_windows;
             last_log = win_t0; last_log_step = step; windows_at_last_log = total_windows;  // an eval counts as a log: reset the tick timer
             last_ckpt = win_t0;                               // ...and it checkpointed: reset the ckpt tick
@@ -1630,8 +1706,19 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const long   eta_steps_completed = step - win_steps0;
             const double eta_next_epoch = (eta_secs > 0 && eta_steps_completed > 0)
                 ? static_cast<double>(steps_to_next_epoch) * eta_secs / eta_steps_completed : -1.0;
-            sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)",
-                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN);
+            // Section breakdown (CPU path only; all three stay 0 on GPU, so the suffix is empty there):
+            // fraction of the cumulative since-last-eval wall-clock spent in window prep vs. train_batch
+            // (forward+backward) vs. the optimizer step -- see prep_secs/train_secs/opt_secs above.
+            std::string breakdown;
+            const double section_total = prep_secs + train_secs + opt_secs;
+            if (section_total > 0.0) {
+                breakdown = std::format("  [prep {:.0f}% train {:.0f}% opt {:.0f}%]",
+                    100.0 * prep_secs / section_total, 100.0 * train_secs / section_total,
+                    100.0 * opt_secs / section_total);
+            }
+            sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s){}",
+                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN,
+                 breakdown);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step; windows_at_last_log = total_windows;
         }
