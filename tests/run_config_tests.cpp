@@ -12,15 +12,25 @@
 
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <string>
 
 using sub0::registry::RunConfig;
 
 namespace {
-// A scratch directory unique to this test binary run, cleaned up on scope exit -- config.json
+// A scratch directory unique to this ScratchDir INSTANCE, cleaned up on scope exit -- config.json
 // writes are real file I/O (deliberately: this is exactly the path train_stage.cpp uses).
+// `catch_discover_tests` registers each TEST_CASE as its own ctest entry, invoked as a SEPARATE
+// `sub0_tests.exe --test-case=...` process -- `ctest -j` runs several of those concurrently. A fixed
+// literal path here (the original form) let two concurrently-running RunConfig test PROCESSES race on
+// the same file, an observed flake (a test fails only under -j, passes in isolation or serially). A
+// random suffix per instance closes it without needing a platform-specific process-id API.
 struct ScratchDir {
     std::filesystem::path path;
-    ScratchDir() : path(std::filesystem::temp_directory_path() / "sub0_run_config_test") {
+    ScratchDir() {
+        std::random_device rd;
+        path = std::filesystem::temp_directory_path()
+             / ("sub0_run_config_test_" + std::to_string(rd()) + "_" + std::to_string(rd()));
         std::error_code ec;
         std::filesystem::remove_all(path, ec);
     }

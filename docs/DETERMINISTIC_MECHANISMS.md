@@ -188,9 +188,11 @@ pseudo-random role vector per position with each fragment, then sum). **`HRR` wi
 held-out 0.744 -- more than double chance, ~3.4x ConvPool's margin and ~8x Hash's, consistent across every
 seed tried.** Needs NO learned parameters (unlike CharEncoder/ConvPool), so unlike them it does not depend
 on checkpoint persistence to reach production (see project memory `slot-encoder-checkpoint-persistence-design`
-for that separate, still-needed CharEncoder/ConvPool work). None of the three are wired into production yet;
-see project memory `meanpool-alternatives-prior-art-and-math` for the full prior-art survey, math, and
-per-seed results.
+for that separate, still-needed CharEncoder/ConvPool work). **`HRR` is now the `--content-embed` default**
+(`RunConfig::content_embed_kind`, persisted and resume-safe -- an old config.json predating this field
+keeps decoding with the MeanPool it actually trained on, never silently drifting to HRR); Hash and
+ConvPool remain implemented but unwired. See project memory `meanpool-alternatives-prior-art-and-math`
+for the full prior-art survey, math, and per-seed results.
 
 **Hybrid CPU/GPU execution is the necessary next unlock, not an optional nicety.** `--content-embed`
 forces the ENTIRE training step onto CPU today (`gpu_train = !content_embed_active && ...` in
