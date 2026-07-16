@@ -169,6 +169,44 @@ yet (repeatspike proved that mechanism using the *bounded* pool, not this range)
 `persistent-slot-range-engine-substrate` for the full design reasoning (why unbounded ids need no
 tokenizer-format bump, unlike growing the bounded pool) and what's still open.
 
+**First trained result on the persistent range (2026-07-16): real generalization signal, slower/less
+saturated than the bounded pool, not yet a clean win.** `include/sub0/persistent_scratchspike.hpp` +
+`tests/persistent_scratchspike_engine_tests.cpp` (`[.persistent_scratchspike]`) ask a narrower question
+than the full scratchspike curriculum: does the ATTEND-ONLY "resolve a named reference"
+skill (`multi_nth_char_task` — the query already names which slot to resolve; the model only ever emits
+ordinary in-vocab bytes as its graded answer) generalize when bound to the persistent range at K well past
+the bounded pool's hard 6-slot ceiling? This is deliberately narrower than scratchspike's full task
+family: a persistent id has no logit column (`sample_token`/cross-entropy targets are hard-bounded to
+`[0,VOCAB)`), so it can never be a model's *predicted* answer — the SELECTION tasks
+(`select_task`/`content_select_task`/`content_contains_task`/...), where the graded answer IS the chosen
+slot id, do not transfer here. That "choose which entity to reference" capability is tracked separately as
+an open, unattempted research question (project memory `persistent-slot-selection-problem-backlog`) — this
+spike does not attempt it. `sub0::train_batch` also does not accept `PersistentBindings` (a single global,
+not a per-window array), so training drives the low-level forward/backward API in a manual per-window loop
+(the same shape `train_ce_steps` already established for CharEncoder's own un-batchable gradient), not the
+batched GPU path the bounded-pool spike uses — a real methodological difference worth remembering when
+comparing magnitudes below.
+
+Measured (d128, VOCAB=2257, 3000 steps, drilled=280/held-out=120 OOVs, identical LR-scaling rule to the
+bounded-pool spike):
+
+| K | step 300 held-out | step 3000 held-out | step 3000 drilled |
+|---|---|---|---|
+| 6  | 0.058 | 0.125 | 0.146 |
+| 30 | 0.042 | 0.225 | 0.457 |
+
+Both K points show genuine held-out generalization (climbing steadily from near-zero, not stuck at a
+memorized-drilled-only plateau) — the core PersistentBindings dispatch + attend-only resolve mechanism IS
+learnable, including at K=30, well past what the bounded pool can even represent. But neither point had
+converged by step 3000 (both still rising at the end), held-out accuracy is well below the bounded pool's
+own saturated results at comparable scale, and K=30 shows a real drilled/held-out gap (0.457 vs 0.225) the
+K=6 point didn't (0.146 vs 0.125, tracking closely) — some memorization is creeping in at higher K, not
+pure generalization. Open question, not yet investigated: is this a step-budget ceiling (would more steps
+close the gap to the bounded pool, given both curves were still climbing) or a genuine harder-disambiguation
+wall at higher concurrent-slot counts? Do not read this as either "persistent ids work great" or "persistent
+ids don't work" — it's a real, positive, but unsaturated signal that needs more training budget before
+either conclusion is warranted.
+
 **Order-sensitive slot encoding (2026-07-16): why a compound-word cache needs more than MeanPool.**
 `encode_slot`'s pluggable `SlotEncoding` composes a bound slot's fragment sequence into one vector.
 `MeanPool` and `CharEncoder` (a learned per-fragment `[C,C]` projection + relu, sum-pooled) are BOTH
