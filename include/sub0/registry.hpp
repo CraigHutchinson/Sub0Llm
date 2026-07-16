@@ -102,6 +102,16 @@ struct ModelMeta {
 //     (`steps`/`keep`/`resume_mode` -- see train_stage.cpp's own comment on why `steps` specifically
 //     is never persisted) and per-STEP state that already lives in the checkpoint (RNG state, Adam
 //     moment buffers, eval history) -- config.json is not a second copy of the checkpoint.
+// `config_schema` guards the blend-schedule redesign (project memory: the blend scheduler used to be 5
+// flat fields here -- spell_mix/scratch_mix/op_mix/content_embed/content_embed_kind -- replaced by a
+// separately-pinned blend_schedule.json, since a staged multi-source schedule can't be expressed as flat
+// scalars). Struct default 1 = "pre-redesign / unversioned": every config.json written before this field
+// existed never wrote this key, so it decodes to 1 automatically (the SAME forward-compatible defaulting
+// this file already relies on elsewhere -- an absent key just uses the struct default). New code always
+// writes 2. `train`/`gen`/`eval` must refuse to operate on a `config_schema<2` model dir rather than
+// silently reinterpreting the now-removed fields as absent/off -- a model actually trained with
+// content-embed active would otherwise decode WITHOUT its interceptor, a confidently-wrong result, not a
+// safe fallback.
 #define SUB0_RUN_CONFIG_FIELDS(X)         \
     X(std::string, corpus,          "")   \
     X(int,         d_model,         0)    \
@@ -118,11 +128,7 @@ struct ModelMeta {
     X(int,         batch,           0)    \
     X(double,      lr,              0.0)  \
     X(unsigned,    seed,            0u)   \
-    X(double,      spell_mix,       0.0)  \
-    X(double,      scratch_mix,     0.0)  \
-    X(double,      op_mix,          0.0)  \
-    X(int,         content_embed,   0)    \
-    X(int,         content_embed_kind, 0)
+    X(int,         config_schema,   1)
 
 struct RunConfig {
 #define SUB0_RUN_CONFIG_DECL(type, name, def) type name = def;
@@ -156,15 +162,8 @@ inline const char* enum_name(std::string_view field, int v) {
         int i = 0; for (const char* n : names) if (i++ == v) return n; return nullptr; };
     if (field == "pos_encoding") return nth({"learned", "rope"});
     if (field == "optimizer")    return nth({"adamw", "muon"});
-    if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary"
-        || field == "content_embed")
+    if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary")
         return nth({"off", "on"});
-    // Index (not sub0::SlotEncoding's own enum values) into the PARAMETER-FREE arms only -- see
-    // sub0/scratch_slots.hpp's content_embed_encoding_of. Default (0/"meanpool") preserves old
-    // content_embed=on config.json files (predating this field) at the MeanPool behavior they were
-    // actually trained with -- a NEW run persists its real choice explicitly, never relies on this
-    // default meaning "use the new default encoding".
-    if (field == "content_embed_kind") return nth({"meanpool", "hash", "hrr"});
     return nullptr;
 }
 inline bool enum_parse(std::string_view field, std::string_view s, int& out) {

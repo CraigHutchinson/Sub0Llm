@@ -8,7 +8,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/registry.hpp"
-#include "sub0/scratch_slots.hpp"   // sub0::ContentEmbedKind -- names content_embed_kind's persisted ints
 
 #include <filesystem>
 #include <fstream>
@@ -48,8 +47,7 @@ TEST_CASE("RunConfig: write_config_json/read_config_json round-trips every field
     c.batch = 385;
     c.lr = 0.00693722;
     c.seed = 42;
-    c.content_embed = 1;
-    c.content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
+    c.config_schema = 2;
 
     sub0::registry::write_config_json(c, scratch.path);
     REQUIRE(std::filesystem::exists(scratch.path / "config.json"));
@@ -71,16 +69,14 @@ TEST_CASE("RunConfig: write_config_json/read_config_json round-trips every field
     CHECK(r.batch == c.batch);
     CHECK(r.lr == c.lr);
     CHECK(r.seed == c.seed);
-    CHECK(r.content_embed == c.content_embed);
-    CHECK(r.content_embed_kind == c.content_embed_kind);
+    CHECK(r.config_schema == c.config_schema);
 }
 
 TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still reads (back-compat)", "[registry][run_config]") {
     ScratchDir scratch;
     RunConfig c;
     c.d_model = 512; c.pos_encoding = 1; c.optimizer = 1; c.gated_ffn = 1; c.tied_embeddings = 0; c.qk_norm = 1; c.ternary = 0;
-    c.content_embed = 1;
-    c.content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
+    c.config_schema = 2;
     sub0::registry::write_config_json(c, scratch.path);
 
     // The written file uses readable names for the enum fields, plain numbers for the rest.
@@ -91,30 +87,23 @@ TEST_CASE("RunConfig: enum fields write as NAMES; numeric config.json still read
     CHECK(text.find("\"gated_ffn\": \"on\"")         != std::string::npos);
     CHECK(text.find("\"tied_embeddings\": \"off\"")  != std::string::npos);
     CHECK(text.find("\"qk_norm\": \"on\"")           != std::string::npos);
-    CHECK(text.find("\"content_embed\": \"on\"")     != std::string::npos);
-    CHECK(text.find("\"content_embed_kind\": \"hrr\"") != std::string::npos);
     CHECK(text.find("\"d_model\": 512")              != std::string::npos);   // numeric field unchanged
+    CHECK(text.find("\"config_schema\": 2")          != std::string::npos);
 
-    // A hand-written OLD-STYLE numeric config.json still loads (the reader accepts either form).
-    // Deliberately OMITS content_embed/content_embed_kind entirely, matching a config.json from before
-    // these fields existed -- must load with both left at their struct defaults (0/off, 0/meanpool), not
-    // fail or crash. content_embed_kind's default MUST be meanpool (0), not the current build's HRR
-    // default (2): an old content_embed=on model was actually trained with the old hardcoded MeanPool, and
-    // must keep decoding that way, never silently pick up whatever the new default happens to be.
+    // A hand-written OLD-STYLE config.json (predating the blend-schedule redesign, so it still carries
+    // the now-removed spell_mix/scratch_mix/op_mix/content_embed/content_embed_kind keys and never wrote
+    // config_schema at all) still loads without failing -- the unrecognized keys are silently ignored
+    // (the same forward-compatible tolerance proven generically below), and config_schema lands on its
+    // struct default (1), the load-bearing signal train_stage.cpp/gen_stage.cpp use to refuse operating
+    // on a model this old rather than silently reinterpreting its removed fields as absent/off.
     { std::ofstream os(scratch.path / "config.json");
-      os << "{\n  \"pos_encoding\": 1,\n  \"optimizer\": 1,\n  \"gated_ffn\": 0,\n  \"qk_norm\": 1,\n  \"d_model\": 448\n}\n"; }
+      os << "{\n  \"pos_encoding\": 1,\n  \"optimizer\": 1,\n  \"gated_ffn\": 0,\n  \"qk_norm\": 1,\n"
+            "  \"d_model\": 448,\n  \"scratch_mix\": 0.3,\n  \"content_embed\": \"on\",\n"
+            "  \"content_embed_kind\": \"hrr\"\n}\n"; }
     RunConfig r;
     REQUIRE(sub0::registry::read_config_json(r, scratch.path));
     CHECK(r.pos_encoding == 1); CHECK(r.optimizer == 1); CHECK(r.gated_ffn == 0); CHECK(r.qk_norm == 1); CHECK(r.d_model == 448);
-    CHECK(r.content_embed == 0);   // absent key -> struct default, old config.json still loads cleanly
-    CHECK(r.content_embed_kind == static_cast<int>(sub0::ContentEmbedKind::MeanPool));   // MUST be meanpool, not the new HRR default
-
-    // A named "on"/"off" content_embed also round-trips (not just the numeric back-compat path above).
-    { std::ofstream os(scratch.path / "config.json"); os << "{\n  \"content_embed\": \"on\",\n  \"content_embed_kind\": \"hrr\"\n}\n"; }
-    RunConfig r2;
-    REQUIRE(sub0::registry::read_config_json(r2, scratch.path));
-    CHECK(r2.content_embed == 1);
-    CHECK(r2.content_embed_kind == static_cast<int>(sub0::ContentEmbedKind::HRR));
+    CHECK(r.config_schema == 1);   // absent key -> struct default -- "this model predates the redesign"
 }
 
 TEST_CASE("RunConfig: read_config_json returns false for a missing file, doesn't crash", "[registry][run_config]") {

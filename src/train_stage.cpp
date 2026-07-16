@@ -28,11 +28,12 @@
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
 #include "sub0/window.hpp"   // sample_window_start: keep each training window inside one document
-#include "sub0/blend.hpp"    // weighted per-window multi-source blending (base corpus + curriculum)
-#include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a --spell-mix blend source)
-#include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a --scratch-mix blend source)
+#include "sub0/blend.hpp"    // BlendSource -- per-source data a corpus blend draws windows from
+#include "sub0/blend_schedule.hpp" // ScheduleSpec/parse_blend_schedule_json + the staged epoch-fair scheduler
+#include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a "spellspike" schedule source)
+#include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a "scratchspike" schedule source)
 #include "sub0/scratch_slots.hpp" // ScratchBindings / SlotEncoding -- content-derived scratch-slot embeddings
-#include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (a --op-mix blend source)
+#include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (an "op_curriculum" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -141,6 +142,24 @@ constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop ove
                                               // (~0.8%/epoch). 2% was too loose: it stopped on slow-
                                               // but-real tails (d96 @1.985 and d128 @2.68 both still
                                               // improving ~1.5%/window) well before the true floor.
+// A hard floor before plateau-stop is even CONSIDERED, independent of any expected_plateau_epoch hint.
+// Blending in any secondary schedule source at all dilutes the base corpus's own per-step gradient
+// budget (fewer of each step's windows are base-corpus windows than an unblended run would draw),
+// which can slow the base corpus's OWN val-NELBO improvement rate especially early in a run -- a real
+// mechanism that could read as a premature plateau on a noisy early trend fit. This guard is bigger
+// than EVAL_WARMUP_EPOCHS (which only gates whether eval RUNS at all, not whether a plateau-stop trusts
+// its result) specifically to cover that early, blend-diluted stretch.
+constexpr double PLATEAU_MIN_EPOCH   = 0.75;
+// expected_plateau_epoch hint scaling (blend_schedule.hpp's ScheduleSpec::expected_plateau_epoch,
+// optional): `trend_plateaued` declares victory when the fitted relative drop is BELOW min_rel, so a
+// SMALLER min_rel is STRICTER (needs a flatter trend, more evidence) and a LARGER min_rel is LOOSER
+// (confirms plateau sooner). The effective threshold is PLATEAU_MIN_REL_FAR (stricter) when the current
+// epoch position is far from the hint, and PLATEAU_MIN_REL_AT_HINT (looser) once at or past it. Bounded,
+// named constants -- not an open-ended "linear scale", which could otherwise blow up (immediate
+// false-stop on any noisy read far past the hint) or shrink to zero (never stops far before it). See
+// plateaued()'s own comment for the interpolation.
+constexpr double PLATEAU_MIN_REL_FAR     = 0.002;  // >= 1 full epoch away from the hint: need a flatter trend
+constexpr double PLATEAU_MIN_REL_AT_HINT = 0.02;   // at/past the hint: a looser trend already counts as done
 constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
 // Muon's own reference peak lr (github.com/KellerJordan/Muon) -- unrelated in scale to AdamW's
 // batch-derived peak_lr below (Muon's orthogonalized updates have a very different magnitude/
@@ -159,7 +178,11 @@ constexpr float  MUON_LR_BASE        = 0.02f;
 constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? std::max(8, SEQ_LEN / 8) : SEQ_LEN;
 
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
-constexpr std::uint32_t CKPT_VERSION = 2u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption)
+constexpr std::uint32_t CKPT_VERSION = 4u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption);
+                                            // v3 adds drawn_tokens (the blend scheduler's fairness state);
+                                            // v4 adds drawn_names (index-aligned with drawn_tokens, so a
+                                            // --blend-config-replace resume can reattribute progress BY
+                                            // NAME -- see RunState::drawn_names' own comment)
 
 // --- corpus.tok access ------------------------------------------------------
 // The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
@@ -353,11 +376,29 @@ using sub0::coherence::ngram_repeat;   // pure n-gram repeat metric (see coheren
 
 // Plateau via the pure least-squares trend test (coherence::trend_plateaued): fit a line to the last
 // PLATEAU_WINDOW+1 evals and stop only when that best-fit gradient implies the series is still
-// shedding less than PLATEAU_MIN_REL of the current level across the window. The fitted gradient is
-// representative of the real downward trend and shrugs off the per-eval noise that tripped the old
-// sign test (which false-stopped a strongly-but-noisily descending run -- see coherence_tests).
-bool plateaued(const std::vector<double>& evals) {
-    return sub0::coherence::trend_plateaued(evals, PLATEAU_WINDOW, PLATEAU_MIN_REL);
+// shedding less than an effective min_rel threshold of the current level across the window. The fitted
+// gradient is representative of the real downward trend and shrugs off the per-eval noise that tripped
+// the old sign test (which false-stopped a strongly-but-noisily descending run -- see coherence_tests).
+//
+// `frac_epoch` gates two epoch-aware additions on top of the trend test itself: (1) a hard floor
+// (PLATEAU_MIN_EPOCH) below which plateau-stop is never considered at all, regardless of hint presence
+// -- see that constant's own comment for why an early blended run's val-NELBO trend can look falsely
+// flat; (2) when `expected_plateau_epoch` is given (from the schedule JSON, e.g. informed by a prior
+// size-sweep calibration on the same corpus), the effective min_rel threshold interpolates LINEARLY
+// between PLATEAU_MIN_REL_FAR (>= 1 epoch away, stricter) and PLATEAU_MIN_REL_AT_HINT (at or past the
+// hint, looser) over exactly that 1-epoch window -- bounded on both ends, never extrapolated past them.
+// Without a hint, the threshold is PLATEAU_MIN_REL unchanged (today's behavior), still gated by the new
+// minimum-epoch floor.
+bool plateaued(const std::vector<double>& evals, double frac_epoch,
+               std::optional<double> expected_plateau_epoch = std::nullopt) {
+    if (frac_epoch < PLATEAU_MIN_EPOCH) return false;
+    double min_rel = PLATEAU_MIN_REL;
+    if (expected_plateau_epoch) {
+        const double dist = std::abs(frac_epoch - *expected_plateau_epoch);   // epochs from the hint
+        const double t = std::clamp(1.0 - dist, 0.0, 1.0);   // 0 at/beyond 1 epoch away, 1 AT the hint
+        min_rel = PLATEAU_MIN_REL_FAR + t * (PLATEAU_MIN_REL_AT_HINT - PLATEAU_MIN_REL_FAR);
+    }
+    return sub0::coherence::trend_plateaued(evals, PLATEAU_WINDOW, min_rel);
 }
 
 // Per-step learning rate: a LINEAR WARMUP to the peak over `warmup` steps, then a horizon-free
@@ -389,6 +430,17 @@ struct RunState {
     double best_loss = std::numeric_limits<double>::infinity();
     long best_step = -1;          // step of the best eval so far -- prune_ckpts() exempts it
     std::vector<double> evals;
+    // Per-source cumulative tokens drawn (sub0::BlendFairness::drawn_tokens) + the NAME each entry
+    // belongs to (index-aligned with each other, not necessarily with the CURRENT run's `sources[]` --
+    // see sub0::carry_forward_by_name). Persisting names, not just a bare index-aligned array, matters
+    // concretely for --blend-config-replace: without them, a schedule swap that happens to keep the same
+    // NUMBER of sources but changes what an index means (reordered, or one swapped for a differently-
+    // named one at the same slot) would silently hand a new, unrelated source the old one's progress --
+    // exactly the class of silent fairness-state corruption this whole redesign exists to prevent. Both
+    // empty on a v1/v2 checkpoint (predates this field) -- the caller treats that as "no data", not a
+    // resume failure.
+    std::vector<double> drawn_tokens;
+    std::vector<std::string> drawn_names;
 };
 
 template <class T> void wr(std::ostream& os, const T& v) {
@@ -493,6 +545,16 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     wr(os, static_cast<std::uint32_t>(rs.evals.size()));
     for (double e : rs.evals) wr(os, e);
 
+    wr(os, static_cast<std::uint32_t>(rs.drawn_tokens.size()));
+    for (double d : rs.drawn_tokens) wr(os, d);
+    // drawn_names: index-aligned with drawn_tokens above, so a --blend-config-replace resume can
+    // reattribute progress BY NAME (sub0::carry_forward_by_name) instead of blindly trusting position.
+    wr(os, static_cast<std::uint32_t>(rs.drawn_names.size()));
+    for (const std::string& nm : rs.drawn_names) {
+        wr(os, static_cast<std::uint32_t>(nm.size()));
+        os.write(nm.data(), static_cast<std::streamsize>(nm.size()));
+    }
+
     const auto bytes = static_cast<std::streamsize>(nfloat * sizeof(float));
     sub0::sync_params_to_host();   // device backends: stage live params/moments into the *_ptr() buffers
     os.write(reinterpret_cast<const char*>(sub0::params_ptr()), bytes);
@@ -534,14 +596,16 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     if (!is) return false;
     const std::uint32_t magic = rd<std::uint32_t>(is);
     const std::uint32_t version = rd<std::uint32_t>(is);
-    // v1->v2 only ADDED a field (best_step) -- the weights/optimizer/RNG bytes underneath are
-    // byte-identical, unlike e.g. the RoPE convention bump (a genuine math change, where reading an
-    // old checkpoint with new code would silently mean something different). Reading v1 here too
-    // (defaulting best_step to "unknown") matters in practice, not just in principle: a live training
-    // run keeps writing v1 checkpoints with its own already-running (pre-bump) binary until it is
-    // actually restarted, and this is also the resume path -- rejecting v1 outright would force a
-    // fresh restart the next time that run is resumed after a rebuild, discarding real GPU-hours.
-    if (magic != CKPT_MAGIC || (version != 1u && version != CKPT_VERSION)) {
+    // v1->v2->v3->v4 each only ADDED a field (best_step, then drawn_tokens, then drawn_names) -- the
+    // weights/optimizer/RNG bytes underneath are byte-identical at every step, unlike e.g. the RoPE
+    // convention bump (a genuine math change, where reading an old checkpoint with new code would
+    // silently mean something different). Reading every prior version here (defaulting best_step to
+    // "unknown", drawn_tokens/drawn_names to empty) matters in practice, not just in principle: a live
+    // training run keeps writing checkpoints
+    // with its own already-running (pre-bump) binary until it is actually restarted, and this is also
+    // the resume path -- rejecting an older version outright would force a fresh restart the next time
+    // that run is resumed after a rebuild, discarding real GPU-hours.
+    if (magic != CKPT_MAGIC || version < 1u || version > CKPT_VERSION) {
         sub0::log::warn("ignoring checkpoint '{}' (bad magic/version)", path);
         return false;
     }
@@ -570,6 +634,23 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     const std::uint32_t nev = rd<std::uint32_t>(is);
     rs.evals.resize(nev);
     for (auto& e : rs.evals) e = rd<double>(is);
+
+    rs.drawn_tokens.clear();
+    rs.drawn_names.clear();
+    if (version >= 3u) {
+        const std::uint32_t ndrawn = rd<std::uint32_t>(is);
+        rs.drawn_tokens.resize(ndrawn);
+        for (auto& d : rs.drawn_tokens) d = rd<double>(is);
+    }   // v1/v2: no such data -- caller resizes-to-zero as a one-time migration, not a resume failure.
+    if (version >= 4u) {
+        const std::uint32_t nnames = rd<std::uint32_t>(is);
+        rs.drawn_names.resize(nnames);
+        for (auto& nm : rs.drawn_names) {
+            const std::uint32_t len = rd<std::uint32_t>(is);
+            nm.resize(len);
+            is.read(nm.data(), len);
+        }
+    }   // v1/v2/v3: no names recorded -- caller falls back to "no data" (start fresh), not a resume failure.
 
     const auto bytes = static_cast<std::streamsize>(nfloat * sizeof(float));
     is.read(reinterpret_cast<char*>(sub0::params_ptr()), bytes);
@@ -1004,8 +1085,8 @@ static void report_run_context(bool gpu_train, bool hybrid_train = false);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
-                                          int optimizer, int resume_mode, float spell_mix, float scratch_mix,
-                                          float op_mix, const char* gsm8k_path, int content_embed) {
+                                          int optimizer, int resume_mode, const char* blend_config_path,
+                                          int replace_schedule) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1243,18 +1324,6 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // real per-step batch_t*seq_t for the rest of this invocation. Declared here (not where it's
     // seeded) so write_meta's [&] capture below can see it.
     long long tokens_seen_est = 0;
-    // Same reasoning as tokens_seen_est above: declared here (not where it's validated, after resume
-    // reconciliation below) so build_run_config's [&] capture can see it.
-    bool content_embed_active = false;
-    // Which SlotEncoding a content-embed-active run actually uses -- sub0::ContentEmbedKind (scratch_slots.hpp),
-    // stored as its underlying int since that's the RunConfig field's persisted type. Defaults to HRR for a
-    // FRESH run (the spike-proven leading candidate -- see project memory meanpool-alternatives-prior-art-and-math);
-    // a RESUMED run's reconciliation block below overrides this from config.json so a model already
-    // trained with the OLD hardcoded MeanPool (content_embed_kind absent -> struct default MeanPool) keeps
-    // using MeanPool, never silently drifting to HRR mid-training (the exact class of train/gen mismatch
-    // this field exists to prevent). Not exposed as a CLI flag -- no scenario yet needs choosing
-    // MeanPool/Hash explicitly over the proven-stronger HRR default.
-    int content_embed_kind = static_cast<int>(sub0::ContentEmbedKind::HRR);
 
     // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
     // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
@@ -1273,11 +1342,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.qk_norm = static_cast<int>(USE_QK_NORM);
         cfg.optimizer = (optimizer == 1) ? 1 : 0;   // matches AdamW opt(lr, optimizer==1) below verbatim
         cfg.batch = batch; cfg.lr = lr; cfg.seed = seed;
-        cfg.spell_mix = spell_mix;     // the blend recipe: re-enforced on resume like optimizer (below)
-        cfg.scratch_mix = scratch_mix;
-        cfg.op_mix = op_mix;
-        cfg.content_embed = content_embed_active ? 1 : 0;   // the VALIDATED state, not the raw request
-        cfg.content_embed_kind = content_embed_kind;
+        // The blend recipe itself lives in the separately-pinned blend_schedule.json (see
+        // sub0/blend_schedule.hpp), not here -- config_schema=2 is the signal that this model dir uses
+        // that scheme (a config_schema<2 dir predates it and is refused on resume, not silently
+        // reinterpreted -- see the resume-reconciliation block below).
+        cfg.config_schema = 2;
         return cfg;
     };
 
@@ -1350,60 +1419,103 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (resumed && !meta_dir.empty()) {
         sub0::registry::RunConfig persisted;
         if (sub0::registry::read_config_json(persisted, meta_dir)) {
+            // config_schema<2 means this model dir predates the blend-schedule redesign: its
+            // config.json still carries the now-removed spell_mix/scratch_mix/op_mix/content_embed/
+            // content_embed_kind fields (silently ignored by this build's RunConfig, per registry.hpp's
+            // own forward-compatible-unrecognized-key tolerance), which is exactly the danger -- a
+            // model genuinely trained with content-embed active would otherwise resume and decode
+            // WITHOUT its interceptor, a confidently wrong result. Refuse loudly instead of guessing.
+            if (persisted.config_schema < 2) {
+                sub0::log::error("train: '{}' predates the blend-schedule redesign (config_schema {}) -- "
+                                 "refusing to resume it with this build. Re-train from scratch with this "
+                                 "binary, or use an older build to continue this specific model.",
+                                 meta_dir.string(), persisted.config_schema);
+                return 1;
+            }
             if (persisted.optimizer != optimizer) {
                 sub0::log::info("  config.json overrides this invocation's optimizer: {} -> {} "
                                 "(the persisted recipe wins on resume, same as batch/lr/seed above)",
                                 optimizer == 1 ? "muon" : "adamw", persisted.optimizer == 1 ? "muon" : "adamw");
                 optimizer = persisted.optimizer;
             }
-            // The blend recipe must not silently change across a resume either -- a run that mixed in
-            // the uncombine curriculum must keep mixing it (and at the same fraction) when it resumes,
-            // exactly the class of drift the optimizer field above guards against.
-            if (persisted.spell_mix != static_cast<double>(spell_mix)) {
-                sub0::log::info("  config.json overrides this invocation's --spell-mix: {:.3f} -> {:.3f} "
-                                "(the persisted blend recipe wins on resume)",
-                                static_cast<double>(spell_mix), persisted.spell_mix);
-                spell_mix = static_cast<float>(persisted.spell_mix);
-            }
-            if (persisted.scratch_mix != static_cast<double>(scratch_mix)) {
-                sub0::log::info("  config.json overrides this invocation's --scratch-mix: {:.3f} -> {:.3f} "
-                                "(the persisted blend recipe wins on resume)",
-                                static_cast<double>(scratch_mix), persisted.scratch_mix);
-                scratch_mix = static_cast<float>(persisted.scratch_mix);
-            }
-            if (persisted.op_mix != static_cast<double>(op_mix)) {
-                sub0::log::info("  config.json overrides this invocation's --op-mix: {:.3f} -> {:.3f} "
-                                "(the persisted blend recipe wins on resume)",
-                                static_cast<double>(op_mix), persisted.op_mix);
-                op_mix = static_cast<float>(persisted.op_mix);
-            }
-            if (persisted.content_embed != content_embed) {
-                sub0::log::info("  config.json overrides this invocation's --content-embed: {} -> {} "
-                                "(the persisted blend recipe wins on resume)",
-                                content_embed ? "on" : "off", persisted.content_embed ? "on" : "off");
-                content_embed = persisted.content_embed;
-            }
-            // The ENCODING a content-embed run uses must not drift on resume either -- a model already
-            // trained with MeanPool (or Hash) must keep using that exact encoding, never silently pick up
-            // a newer default (HRR) mid-training, the same class of mismatch the field above guards.
-            if (persisted.content_embed_kind != content_embed_kind) {
-                sub0::log::info("  config.json overrides this invocation's content-embed encoding: {} -> {} "
-                                "(the persisted choice wins on resume)",
-                                sub0::content_embed_kind_name(content_embed_kind),
-                                sub0::content_embed_kind_name(persisted.content_embed_kind));
-                content_embed_kind = persisted.content_embed_kind;
-            }
         }
     }
 
-    // content_embed needs at least one curriculum that records structured slot->fragment binding data
-    // (scratchspike::Dataset::doc_bindings / op_curriculum::Dataset::doc_bindings) -- plain base-corpus or
-    // --spell-mix windows carry no such table, so they always pass null bindings below (unchanged, plain
-    // reserved-id embedding). Validated AFTER resume reconciliation so it reflects the FINAL scratch_mix/op_mix.
-    content_embed_active = content_embed != 0 && (scratch_mix > 0.f || op_mix > 0.f);
-    if (content_embed && !content_embed_active)
-        sub0::log::warn("--content-embed requested but disabled: no --scratch-mix or --op-mix source to "
-                        "bind from");
+    // --- Blend schedule: parse (or synthesize the trivial single-source case) then pin into the model
+    // dir. See sub0/blend_schedule.hpp's header comment for why this replaced --spell-mix/--scratch-mix/
+    // --op-mix/--content-embed/--gsm8k: those meant "this fraction of every step's windows," with no
+    // tracking of how much of a source had actually been covered -- a small curriculum blended against
+    // a huge corpus got re-covered dozens of times before the corpus finished one epoch, producing a
+    // real, observed loss cliff-then-plateau (project memory: the incident that motivated this file).
+    //
+    // Resume semantics are STRICTER than bundle_into_model_dir's tokenizer.tok/corpus.tok pinning above
+    // (which re-syncs from the live path on every invocation): a schedule identity change mid-run
+    // literally changes what data trains the model, so the default here is to read ONLY the existing
+    // pin and ignore a live --blend-config path entirely, warning (never silently switching) if one was
+    // given anyway. --blend-config-replace is the separate, explicitly-named override for the real but
+    // deliberate workflow of continuing a run under a genuinely different schedule.
+    sub0::ScheduleSpec schedule;
+    const bool have_blend_config = blend_config_path && *blend_config_path;
+    {
+        std::filesystem::path schedule_path;   // what we actually parse below; empty => synthesize sugar
+        if (!meta_dir.empty()) {
+            const std::filesystem::path pin = meta_dir / "blend_schedule.json";
+            const bool pin_exists = std::filesystem::exists(pin);
+            if (have_blend_config && (!pin_exists || replace_schedule)) {
+                if (replace_schedule && pin_exists)
+                    sub0::log::info("  SCHEDULE CHANGED (--blend-config-replace): re-pinning '{}' over "
+                                    "the previous schedule -- per-source progress carries forward BY "
+                                    "NAME, a new source starts at 0, a removed source is dropped",
+                                    blend_config_path);
+                schedule_path = bundle_into_model_dir(std::filesystem::path(blend_config_path), pin,
+                                                      1ull << 20);   // schedules are tiny: always copy-able
+            } else if (pin_exists) {
+                if (have_blend_config)
+                    sub0::log::warn("train: --blend-config given but '{}' already has a pinned schedule "
+                                    "-- using the PINNED one unchanged (pass --blend-config-replace to "
+                                    "deliberately switch schedules on this resume)", meta_dir.string());
+                schedule_path = pin;
+            }
+        } else if (have_blend_config) {
+            schedule_path = blend_config_path;   // no model dir to pin into -- read the live path directly
+        }
+
+        if (!schedule_path.empty()) {
+            std::string error; std::vector<std::string> warnings;
+            if (!sub0::parse_blend_schedule_json(schedule_path, schedule, error, warnings)) {
+                sub0::log::error("train: blend schedule '{}' is unreadable: {}", schedule_path.string(), error);
+                return 1;
+            }
+            for (const std::string& w : warnings) sub0::log::warn("train: blend schedule: {}", w);
+        } else {
+            // Sugar for the common case: no --blend-config at all -- a single-source schedule wrapping
+            // the base corpus, equivalent to "just train on this corpus." Fully reproducible from
+            // corpus_path alone (no separate identity to protect), so nothing needs pinning here.
+            sub0::SourceSpec base_spec;
+            base_spec.name = "base";
+            base_spec.corpus = corpus_path ? corpus_path : sub0::default_corpus_tok();
+            schedule.sources.push_back(std::move(base_spec));
+            sub0::ScheduleStage only_stage;
+            only_stage.until_epoch = std::numeric_limits<double>::infinity();
+            only_stage.weights.emplace_back("base", 1.0);
+            schedule.stages.push_back(std::move(only_stage));
+        }
+    }
+    // content_embed needs at least one schedule source backed by a generator that records structured
+    // slot->fragment binding data (scratchspike/op_curriculum -- spellspike and the base corpus carry
+    // no such table, so their windows always pass null bindings, unchanged plain reserved-id embedding).
+    // "Ever" (any stage, not just the currently-active one): a schedule can legitimately bootstrap a
+    // generator hard in an early stage then taper it to zero later (curriculum-learning-style), and the
+    // model still needs its content-embed interceptor at gen time for what it learned in that stage --
+    // see gen_stage.cpp's own union-across-stages rewiring for the matching gen-time concern.
+    const bool have_binding_source = std::any_of(schedule.sources.begin(), schedule.sources.end(),
+        [](const sub0::SourceSpec& s) { return s.generator == "scratchspike" || s.generator == "op_curriculum"; });
+    bool content_embed_active = schedule.content_embed.has_value() && have_binding_source;
+    if (schedule.content_embed && !have_binding_source)
+        sub0::log::warn("train: blend schedule sets content_embed but declares no scratchspike/"
+                        "op_curriculum source to bind from -- disabled");
+    const int content_embed_kind = content_embed_active
+        ? static_cast<int>(*schedule.content_embed) : static_cast<int>(sub0::ContentEmbedKind::MeanPool);
 
     sub0::AdamW opt(lr, optimizer == 1);
     if (resumed) opt.set_step_count(adam_t);
@@ -1477,10 +1589,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<int>    cpu_win;          // CPU path: materialized window tokens (view may be uint16-packed)
     std::vector<size_t> cpu_starts(max_batch_t);
     std::vector<std::uint8_t> cpu_mask;   // CPU path: per-window loss mask parallel to cpu_win (only when a source is masked)
-    // content_embed: per-window content-derived scratch-slot bindings (scratch-mix windows only -- see
-    // content_embed_active's guard above). step_binds owns each window's ScratchBindings VALUE (rebuilt
-    // fresh every step from scratch_ds's already-resident doc_bindings, so the pointers in win_binds stay
-    // valid for exactly as long as train_batch needs them); win_binds is what's actually passed through.
+    // content_embed: per-window content-derived scratch-slot bindings (windows from a binding-capable
+    // schedule source only -- see content_embed_active's guard above). step_binds owns each window's
+    // ScratchBindings VALUE (rebuilt fresh every step from its source's already-resident doc_bindings, so
+    // the pointers in win_binds stay valid for exactly as long as train_batch needs them); win_binds is
+    // what's actually passed through.
     std::vector<sub0::ScratchBindings> step_binds(static_cast<std::size_t>(max_batch_t));
     std::vector<const sub0::ScratchBindings*> win_binds(static_cast<std::size_t>(max_batch_t), nullptr);
     // hybrid_train (see gpu_available/gpu_train/hybrid_train above): each step partitions this step's
@@ -1508,142 +1621,113 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     if (hybrid_train) cpu_worker.emplace(cpu_win, cpu_starts, hyb_cpu_len, cpu_mask, win_binds);
     long steps_since_refresh = 0;
 
-    // The blend: the weighted sources this run draws windows from. Source 0 is always the base
-    // corpus; a run's blend spec appends further sources (the uncombine curriculum, and later
-    // conversational/reasoning corpora). A single unmasked source makes the loop below bit-identical
-    // to the pre-blend single-corpus path (sample_blend draws no extra rng, loss_mask stays null).
+    // The blend: realize each schedule source into a real BlendSource. Generalizes the OLD --spell-mix/
+    // --scratch-mix/--op-mix blocks (three near-identical blocks collapse into one generic loop) but
+    // changes NOTHING about how a generator's own Dataset is built -- same tokenizer, same seed
+    // derivation, same hardcoded defaults unless a schedule `params` override is given. Datasets must
+    // outlive the training loop (the BlendSource objects only borrow spans into them); kept in parallel
+    // vectors index-aligned with `sources`/`schedule.sources` so each survives regardless of which
+    // sources are actually declared (the two unused-generator-kind vectors for any given index just
+    // stay default-constructed/empty).
     std::vector<sub0::BlendSource> sources;
-    sources.push_back(sub0::BlendSource{ train_span, doc_index, {}, 1.0 });
-    constexpr std::size_t kBaseSource = 0;
-    // --spell-mix: blend in the synthetic uncombine/combine curriculum as a second, MASKED source.
-    // Generated once from the production tokenizer (deserialized here) over every eligible word
-    // piece, so the model learns to REQUEST character-level ops on any word (the mask grades only the
-    // op-invocation + answer, never the harness-injected content -- see spellspike.hpp). `spell_ds`
-    // must outlive the training loop: the source below borrows spans into it.
-    sub0::spellspike::Dataset spell_ds;
-    if (spell_mix > 0.f) {
-        sub0::tok::Tokenizer tk;
-        std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
-        if (!tis.good() || !sub0::tok::deserialize(tk, tis)) {
-            sub0::log::error("train: --spell-mix set but the tokenizer '{}' could not be loaded",
-                             sub0::default_tokenizer());
-            return 1;
+    sources.reserve(schedule.sources.size());
+    std::vector<sub0::spellspike::Dataset>    spell_dss(schedule.sources.size());
+    std::vector<sub0::scratchspike::Dataset>  scratch_dss(schedule.sources.size());
+    std::vector<sub0::op_curriculum::Dataset> op_dss(schedule.sources.size());
+    std::size_t kBaseSource = static_cast<std::size_t>(-1);   // sentinel: no corpus-typed source this run
+
+    for (std::size_t i = 0; i < schedule.sources.size(); ++i) {
+        const sub0::SourceSpec& spec = schedule.sources[i];
+        if (!spec.corpus.empty()) {
+            kBaseSource = i;
+            sources.push_back(sub0::BlendSource{ spec.name, train_span, doc_index, {}, {} });
+            sub0::log::line("blend: '{}' base corpus ({} tokens)", spec.name, train_span.size());
+            continue;
         }
-        if (tk.vocab != VOCAB) {
-            sub0::log::error("train: --spell-mix tokenizer vocab {} != engine VOCAB {} (rebuild against "
-                             "this corpus)", tk.vocab, VOCAB);
-            return 1;
-        }
-        // Drill EVERY eligible word (drilled_frac 1.0): production wants full vocab coverage, and the
-        // spike proved the mechanism generalizes, so there is no need to hold words out here. Seeded
-        // off the run seed so the curriculum is deterministic and reproduced identically on resume.
-        const sub0::spellspike::WordSplit split =
-            sub0::spellspike::split_task_words(tk, /*drilled_frac=*/1.0, /*seed=*/seed);
-        sub0::spellspike::DatasetOptions dopt;
-        dopt.tasks_per_word = 12;
-        dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C0113B1EULL;   // distinct stream from window sampling
-        spell_ds = sub0::spellspike::build_dataset(tk, split, dopt);
-        sources.push_back(sub0::BlendSource{
-            sub0::TokView::over_int32(spell_ds.tokens.data(), spell_ds.tokens.size()),
-            std::span<const std::uint64_t>(spell_ds.doc_starts),
-            std::span<const std::uint8_t>(spell_ds.mask),
-            static_cast<double>(spell_mix) });
-        sub0::log::line("blend: uncombine curriculum {:.0f}% ({} task words, {} traces, {} tokens)",
-                        static_cast<double>(spell_mix) * 100.0,
-                        split.drilled.size(), spell_ds.doc_starts.size() - 1, spell_ds.tokens.size());
-    }
-    // --scratch-mix: blend in the scratch-token (context-translation) curriculum -- the two WORKING
-    // model-side capabilities the spike validated (scratchspike.hpp; project memory
-    // scratch-tokens-context-translation-layer): RESOLVE a dynamically-bound scratch slot for an OOV
-    // (index its chars via uncombine, generalizes to held-out OOVs) + associative REASON-over-slots
-    // (select a slot by its in-context tag). `scratch_ds` must outlive the loop (the source borrows it).
-    sub0::scratchspike::Dataset scratch_ds;
-    std::size_t scratch_source_idx = static_cast<std::size_t>(-1);   // sentinel: no scratch source this run
-    if (scratch_mix > 0.f) {
         sub0::tok::Tokenizer tk;
         std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
         if (!tis.good() || !sub0::tok::deserialize(tk, tis) || tk.vocab != VOCAB) {
-            sub0::log::error("train: --scratch-mix set but the tokenizer '{}' could not be loaded (or vocab "
-                             "!= engine VOCAB {})", sub0::default_tokenizer(), VOCAB);
+            sub0::log::error("train: blend source '{}' (generator {}) needs the tokenizer '{}' but it "
+                             "could not be loaded (or vocab != engine VOCAB {})", spec.name,
+                             spec.generator, sub0::default_tokenizer(), VOCAB);
             return 1;
         }
-        constexpr int kScratchK = sub0::scratchspike::SCRATCH_POOL;   // slots/context the curriculum exercises
-        const sub0::scratchspike::OovSplit split =
-            sub0::scratchspike::make_oov_split(tk, /*n_total=*/400, /*drilled_frac=*/1.0, /*seed=*/seed);
-        sub0::scratchspike::DatasetOptions dopt;
-        dopt.tasks_per_oov = 12;
-        dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C2A7C40ULL;   // distinct stream
-        // The combined curriculum: the THREE WORKING model-side capabilities -- multi-slot RESOLUTION +
-        // associative REASON-over-slots + CONTENT reasoning (which slot's OOV contains a char, via
-        // local-grounded CoT: resolve, restate the query beside each slot, verdict, answer -- validated to
-        // generalize to held-out OOVs, project memory scratch-tokens-context-translation-layer). Model-driven
-        // define (#1) stays excluded (copy-bottlenecked at this scale). The content trace is LONG (~5+11*K),
-        // so contains_k is sized to SEQ_LEN; a too-short context omits it. Capped at 4: the maximal-K sweep
-        // found localization holds above random up to the pool's K=6 but the margin degrades/gets noisy past
-        // K~4 (K=3 robustly ~0.9-1.0), so 4 is the reliable production ceiling.
-        const int contains_k = std::min({kScratchK, 4, std::max(0, (SEQ_LEN - 8) / 11)});
-        scratch_ds = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt,
-                                                               contains_k >= 2 ? contains_k : 0);
-        scratch_source_idx = sources.size();
-        sources.push_back(sub0::BlendSource{
-            sub0::TokView::over_int32(scratch_ds.tokens.data(), scratch_ds.tokens.size()),
-            std::span<const std::uint64_t>(scratch_ds.doc_starts),
-            std::span<const std::uint8_t>(scratch_ds.mask),
-            static_cast<double>(scratch_mix) });
-        sub0::log::line("blend: scratch curriculum {:.0f}% (K={} slots, content-K={}, {} OOVs, {} traces, {} tokens)",
-                        static_cast<double>(scratch_mix) * 100.0, kScratchK, contains_k >= 2 ? contains_k : 0,
-                        split.drilled.size(), scratch_ds.doc_starts.size() - 1, scratch_ds.tokens.size());
-    }
-    // --op-mix: blend in the op-delegation curriculum (op_curriculum.hpp). Teaches the model to ROUTE
-    // arithmetic to the `math` node (emit a bare [op math]; the node reads the posed expression and supplies
-    // the exact answer, MASKED so the model never learns the arithmetic) -- including multi-step chains where
-    // an intermediate result is COLLAPSED to a scratch slot the next step references (the GSM8K chapter's
-    // proven mechanisms; docs/DETERMINISTIC_MECHANISMS.md). `op_ds` must outlive the loop (borrowed).
-    sub0::op_curriculum::Dataset op_ds;
-    std::size_t op_source_idx = static_cast<std::size_t>(-1);   // sentinel: no op source this run
-    if (op_mix > 0.f) {
-        sub0::tok::Tokenizer tk;
-        std::ifstream tis(sub0::default_tokenizer(), std::ios::binary);
-        if (!tis.good() || !sub0::tok::deserialize(tk, tis) || tk.vocab != VOCAB) {
-            sub0::log::error("train: --op-mix set but the tokenizer '{}' could not be loaded (or vocab != "
-                             "engine VOCAB {})", sub0::default_tokenizer(), VOCAB);
-            return 1;
-        }
-        if (gsm8k_path && *gsm8k_path) {
-            // Real GSM8K: convert its <<expr=result>> annotations to delegated [op math] frames.
-            op_ds = sub0::op_curriculum::gsm8k_file_dataset(gsm8k_path, tk);
-            if (op_ds.doc_starts.size() <= 1) {
-                sub0::log::error("train: --gsm8k '{}' yielded no verifiable op problems (empty/ wrong format?)",
-                                 gsm8k_path);
-                return 1;
+        if (spec.generator == "spellspike") {
+            // Drill EVERY eligible word (drilled_frac 1.0): production wants full vocab coverage, and
+            // the spike proved the mechanism generalizes, so there is no need to hold words out here.
+            const sub0::spellspike::WordSplit split =
+                sub0::spellspike::split_task_words(tk, /*drilled_frac=*/1.0, /*seed=*/seed);
+            sub0::spellspike::DatasetOptions dopt;
+            dopt.tasks_per_word = spec.tasks_per_word > 0 ? spec.tasks_per_word : 12;
+            dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C0113B1EULL;   // distinct stream from window sampling
+            spell_dss[i] = sub0::spellspike::build_dataset(tk, split, dopt);
+            const sub0::spellspike::Dataset& ds = spell_dss[i];
+            sources.push_back(sub0::BlendSource{ spec.name,
+                sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
+                std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask), {} });
+            sub0::log::line("blend: '{}' uncombine curriculum ({} task words, {} traces, {} tokens)",
+                            spec.name, split.drilled.size(), ds.doc_starts.size() - 1, ds.tokens.size());
+        } else if (spec.generator == "scratchspike") {
+            constexpr int kScratchK = sub0::scratchspike::SCRATCH_POOL;   // slots/context the curriculum exercises
+            const sub0::scratchspike::OovSplit split = sub0::scratchspike::make_oov_split(
+                tk, /*n_total=*/spec.n_oov > 0 ? spec.n_oov : 400, /*drilled_frac=*/1.0, /*seed=*/seed);
+            sub0::scratchspike::DatasetOptions dopt;
+            dopt.tasks_per_oov = spec.tasks_per_oov > 0 ? spec.tasks_per_oov : 12;
+            dopt.seed = static_cast<std::uint64_t>(seed) ^ 0x5C2A7C40ULL;   // distinct stream
+            // The content trace is LONG (~5+11*K), so contains_k is sized to SEQ_LEN; a too-short
+            // context omits it. Capped at 4: the maximal-K sweep found localization holds above random
+            // up to the pool's K=6 but the margin degrades/gets noisy past K~4. A schedule override
+            // still can't exceed this derived ceiling -- see blend_schedule.hpp's own SourceSpec comment
+            // on why safety clamps must survive exposing a knob.
+            const int derived_contains_k = std::min({kScratchK, 4, std::max(0, (SEQ_LEN - 8) / 11)});
+            const int contains_k = spec.contains_k >= 0
+                ? std::min(spec.contains_k, derived_contains_k) : derived_contains_k;
+            scratch_dss[i] = sub0::scratchspike::build_dataset_scratch(tk, split, kScratchK, dopt,
+                                                                       contains_k >= 2 ? contains_k : 0);
+            const sub0::scratchspike::Dataset& ds = scratch_dss[i];
+            sources.push_back(sub0::BlendSource{ spec.name,
+                sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
+                std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask),
+                std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
+            sub0::log::line("blend: '{}' scratch curriculum (K={} slots, content-K={}, {} OOVs, {} "
+                            "traces, {} tokens)", spec.name, kScratchK, contains_k >= 2 ? contains_k : 0,
+                            split.drilled.size(), ds.doc_starts.size() - 1, ds.tokens.size());
+        } else if (spec.generator == "op_curriculum") {
+            if (!spec.gsm8k_path.empty()) {
+                // Real GSM8K: convert its <<expr=result>> annotations to delegated [op math] frames.
+                op_dss[i] = sub0::op_curriculum::gsm8k_file_dataset(spec.gsm8k_path, tk);
+                if (op_dss[i].doc_starts.size() <= 1) {
+                    sub0::log::error("train: blend source '{}': gsm8k '{}' yielded no verifiable op "
+                                     "problems (empty/wrong format?)", spec.name, spec.gsm8k_path);
+                    return 1;
+                }
+                sub0::log::line("blend: '{}' GSM8K op-delegation ({} problems, {} tokens) <- {}",
+                                spec.name, op_dss[i].doc_starts.size() - 1, op_dss[i].tokens.size(),
+                                spec.gsm8k_path);
+            } else {
+                sub0::op_curriculum::Options oopt;
+                oopt.seed = static_cast<std::uint64_t>(seed) ^ 0x0B5C11ED0FF1CEULL;   // distinct stream
+                oopt.n_examples = spec.n_examples > 0 ? spec.n_examples : 6000;
+                oopt.chain_frac = spec.chain_frac >= 0.0 ? spec.chain_frac : 0.4;   // fraction of multi-step collapse chains
+                const int derived_max_digits = std::max(2, std::min(4, (SEQ_LEN - 12) / 8));
+                oopt.max_digits = spec.max_digits > 0
+                    ? std::min(spec.max_digits, derived_max_digits) : derived_max_digits;
+                op_dss[i] = sub0::op_curriculum::build_dataset(tk, oopt);
+                sub0::log::line("blend: '{}' op-delegation curriculum ({} examples, {} tokens, "
+                                "chain-frac {:.2f})", spec.name, op_dss[i].doc_starts.size() - 1,
+                                op_dss[i].tokens.size(), oopt.chain_frac);
             }
-            sub0::log::line("blend: GSM8K op-delegation {:.0f}% ({} problems, {} tokens) <- {}",
-                            static_cast<double>(op_mix) * 100.0, op_ds.doc_starts.size() - 1,
-                            op_ds.tokens.size(), gsm8k_path);
+            const sub0::op_curriculum::Dataset& ds = op_dss[i];
+            sources.push_back(sub0::BlendSource{ spec.name,
+                sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
+                std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask),
+                std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
         } else {
-            sub0::op_curriculum::Options oopt;
-            oopt.seed = static_cast<std::uint64_t>(seed) ^ 0x0B5C11ED0FF1CEULL;   // distinct stream
-            oopt.n_examples = 6000;
-            oopt.chain_frac = 0.4;                                                 // 40% multi-step collapse chains
-            oopt.max_digits = std::max(2, std::min(4, (SEQ_LEN - 12) / 8));        // as many digits as the window fits
-            op_ds = sub0::op_curriculum::build_dataset(tk, oopt);
-            sub0::log::line("blend: op-delegation curriculum {:.0f}% ({} examples, {} tokens, chain-frac {:.2f})",
-                            static_cast<double>(op_mix) * 100.0, op_ds.doc_starts.size() - 1,
-                            op_ds.tokens.size(), oopt.chain_frac);
+            sub0::log::error("train: blend source '{}' has unrecognized generator '{}'",
+                             spec.name, spec.generator);
+            return 1;
         }
-        op_source_idx = sources.size();
-        sources.push_back(sub0::BlendSource{
-            sub0::TokView::over_int32(op_ds.tokens.data(), op_ds.tokens.size()),
-            std::span<const std::uint64_t>(op_ds.doc_starts),
-            std::span<const std::uint8_t>(op_ds.mask),
-            static_cast<double>(op_mix) });
     }
-    // The base corpus gets whatever fraction the curricula don't claim.
-    sources[kBaseSource].weight =
-        std::max(0.0, 1.0 - static_cast<double>(spell_mix) - static_cast<double>(scratch_mix)
-                          - static_cast<double>(op_mix));
-    if (spell_mix > 0.f || scratch_mix > 0.f || op_mix > 0.f)
-        sub0::log::line("blend: base corpus {:.0f}%", sources[kBaseSource].weight * 100.0);
     if (content_embed_active)
         sub0::log::line("blend: content-derived scratch embeddings ON ({}, {})",
                         sub0::content_embed_kind_name(content_embed_kind),
@@ -1656,6 +1740,42 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // runs on either backend.
     const bool any_masked = std::any_of(sources.begin(), sources.end(),
                                         [](const sub0::BlendSource& s) { return s.masked(); });
+
+    // Resolve each stage's per-source target rate against the ACTUAL sources[] order built above (name
+    // -> index lookups happen ONCE here, not in the per-window hot path), then track per-source
+    // cumulative progress across the run -- the deficit scheduler's fairness state (see
+    // sub0/blend_schedule.hpp's header comment for the algorithm). Seeded from the checkpoint BY NAME
+    // (sub0::carry_forward_by_name, CKPT_VERSION 4): correct even across --blend-config-replace, where
+    // the source COUNT can coincidentally match the old run's while what each index MEANS has changed
+    // (reordered, or one source swapped for a differently-named one at the same slot) -- a positional
+    // copy there would silently hand a new, unrelated source the old one's progress.
+    std::vector<std::string> source_names;
+    source_names.reserve(sources.size());
+    for (const sub0::BlendSource& s : sources) source_names.push_back(s.name);
+    const sub0::ResolvedSchedule resolved_schedule = sub0::resolve_schedule(schedule, source_names);
+    sub0::BlendFairness blend_fair(sources.size());
+    if (!rs.drawn_names.empty() && rs.drawn_tokens.size() == rs.drawn_names.size()) {
+        blend_fair.drawn_tokens = sub0::carry_forward_by_name(rs.drawn_names, rs.drawn_tokens, source_names);
+        const auto dropped = std::count_if(rs.drawn_names.begin(), rs.drawn_names.end(),
+            [&](const std::string& nm) {
+                return std::find(source_names.begin(), source_names.end(), nm) == source_names.end();
+            });
+        if (dropped > 0)
+            sub0::log::info("  blend scheduler: {} source(s) from the checkpoint's fairness state are no "
+                            "longer in this run's schedule -- their progress is dropped", dropped);
+    } else if (rs.drawn_names.empty() && rs.drawn_tokens.size() == sources.size()) {
+        // A v3-without-names checkpoint (predates CKPT_VERSION 4). Positional copy is only safe here
+        // because reaching this branch requires the exact source count AND order a routine (non-replace)
+        // resume always reconstructs deterministically from the same pinned schedule.
+        blend_fair.drawn_tokens = rs.drawn_tokens;
+    } else if (!rs.drawn_tokens.empty()) {
+        sub0::log::info("  blend scheduler fairness state does not match this run's sources -- starting "
+                        "fresh ({} recorded vs {} now)", rs.drawn_tokens.size(), sources.size());
+    }
+    rs.drawn_names = source_names;   // now safe to overwrite: the reconciliation above already consumed
+                                     // whatever names the checkpoint carried in. Constant for the rest of
+                                     // the run (source identity never changes mid-run), so this is set
+                                     // once here rather than every step alongside drawn_tokens below.
 
     using clock = std::chrono::steady_clock;
     auto win_t0 = clock::now();
@@ -1702,7 +1822,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             buf_rng.seed(static_cast<std::uint32_t>(seed) ^ (0x9E3779B9u * static_cast<std::uint32_t>(++refresh_n)));
             text.fill_random(train_byte_lo, train_byte_hi, OD_TRAIN_BUF_TOK, buf_rng, train_buf);
             train_span = sub0::TokView::over_int32(train_buf.data(), train_buf.size());
-            sources[kBaseSource].view = train_span;   // the refill reallocates the base buffer -- rebind its source
+            if (kBaseSource != static_cast<std::size_t>(-1))
+                sources[kBaseSource].view = train_span;   // the refill reallocates the base buffer -- rebind its source
             steps_since_refresh = 0;
         }
         ++steps_since_refresh;
@@ -1718,8 +1839,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // and this reduces to batch_t == batch exactly (tokens_per_step / SEQ_LEN == batch, no
         // rounding loss) -- bit-for-bit the pre-scheduler behavior.
         const int batch_t = static_cast<int>(tokens_per_step / static_cast<std::size_t>(seq_t));
+        // frac_epoch: which schedule stage is active right now, and each active source's target rate --
+        // computed once per step (constant across all of this step's windows), not once per window.
+        const double frac_epoch = static_cast<double>(step) / static_cast<double>(epoch_steps);
         for (int b = 0; b < batch_t; ++b) {
-            const sub0::BlendDraw d = sub0::sample_blend(rng, seq_t, sources);   // pick a source, window inside it
+            const sub0::BlendDraw d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
+                                                                seq_t, frac_epoch);   // pick a source, window inside it
             src_idx[b] = d.src;
             starts[b]  = d.win.start;
             win_len[b] = d.win.len;
@@ -1744,20 +1869,15 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                     cpu_mask[base + k] = src.masked() ? src.mask[starts[b] + k] : std::uint8_t{1};
             }
             cpu_starts[static_cast<std::size_t>(dst)] = base;
-            // content_embed: a window drawn from the scratch-mix or op-mix source gets its document's
-            // real slot->fragment bindings (scratch_ds/op_ds.doc_bindings); every other window (base
-            // corpus, spell-mix) stays nullptr -- unchanged, plain reserved-id embedding, exactly
-            // matching what content_embed_active's validation guarantees those windows were (and still
-            // are) trained with.
-            if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == scratch_source_idx) {
-                const std::size_t doc = sub0::doc_of(scratch_ds.doc_starts, starts[b]);
+            // content_embed: a window drawn from a source that carries structured doc_bindings (any
+            // generator-backed schedule source -- scratchspike/op_curriculum) gets its document's real
+            // slot->fragment bindings; every other window (base corpus, spellspike) stays nullptr --
+            // unchanged, plain reserved-id embedding. Generic over WHICH source, unlike the old
+            // scratch_source_idx/op_source_idx-hardcoded branches this replaced.
+            if (content_embed_active && !src.doc_bindings.empty()) {
+                const std::size_t doc = sub0::doc_of(src.docs, starts[b]);
                 step_binds[static_cast<std::size_t>(dst)] = sub0::ScratchBindings{
-                    std::span<const std::vector<int>>(scratch_ds.doc_bindings[doc]), content_embed_enc };
-                win_binds[static_cast<std::size_t>(dst)] = &step_binds[static_cast<std::size_t>(dst)];
-            } else if (content_embed_active && static_cast<std::size_t>(src_idx[b]) == op_source_idx) {
-                const std::size_t doc = sub0::doc_of(op_ds.doc_starts, starts[b]);
-                step_binds[static_cast<std::size_t>(dst)] = sub0::ScratchBindings{
-                    std::span<const std::vector<int>>(op_ds.doc_bindings[doc]), content_embed_enc };
+                    std::span<const std::vector<int>>(src.doc_bindings[doc]), content_embed_enc };
                 win_binds[static_cast<std::size_t>(dst)] = &step_binds[static_cast<std::size_t>(dst)];
             } else if (content_embed_active) {
                 win_binds[static_cast<std::size_t>(dst)] = nullptr;
@@ -1794,8 +1914,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const auto t_prep0 = clock::now();
             hyb_cpu_idx.clear(); hyb_gpu_idx.clear();
             for (int b = 0; b < batch_t; ++b) {
-                const bool needs_cpu = static_cast<std::size_t>(src_idx[b]) == scratch_source_idx ||
-                                       static_cast<std::size_t>(src_idx[b]) == op_source_idx;
+                // Generic over WHICH source: any source carrying structured doc_bindings needs the
+                // CPU-only slot-binding lookup, regardless of which generator produced it.
+                const bool needs_cpu = !sources[static_cast<std::size_t>(src_idx[b])].doc_bindings.empty();
                 (needs_cpu ? hyb_cpu_idx : hyb_gpu_idx).push_back(b);
             }
             const int cpu_n = static_cast<int>(hyb_cpu_idx.size());
@@ -1867,9 +1988,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // even on a step with gpu_n==0. A step that happens to draw an all-CPU batch_t still advances
             // the host params via opt.step(); skipping the re-upload here would leave the device holding
             // an EARLIER step's weights, so the next step that DOES have gpu_n>0 would compute its gradient
-            // against stale params -- a real (if rare, P ~= (scratch_mix+op_mix)^batch_t per step)
-            // correctness bug, not just a wasted upload. A failed re-upload is exactly as fatal as a failed
-            // backward_only above (the device can no longer be trusted for the next step).
+            // against stale params -- a real correctness bug (rare under the deficit scheduler, which
+            // deliberately spreads a binding-capable source's draws out rather than clustering them, but
+            // not impossible), not just a wasted upload. A failed re-upload is exactly as fatal as a
+            // failed backward_only above (the device can no longer be trusted for the next step).
             if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) {
                 sub0::log::error("training: GPU param re-upload failed at step {} -- stopping "
                                  "immediately without a final save; the last periodic checkpoint on "
@@ -1900,6 +2022,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         total_windows += batch_t;                          // for wps: batch_t varies per step now
         tokens_seen_est += static_cast<long long>(batch_t) * seq_t;
         rs.step = step;
+        rs.drawn_tokens = blend_fair.drawn_tokens;   // keep the checkpoint's fairness snapshot current --
+                                                     // any save_checkpoint call below reads it from `rs`
 
         if (g_graceful_stop.load()) {
             sub0::log::line("  [graceful stop requested @ step {} -- saving before exit]", step);
@@ -1923,7 +2047,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
             const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
-            const double frac_epoch = static_cast<double>(step) / epoch_steps;
+            // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
 
             // Validation NELBO only once enough of the corpus has been seen.
             std::string eval_str = "(warmup)";
@@ -1934,8 +2058,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 eval_str = std::format("val_nelbo {:.4f} (best {:.4f})", nelbo, rs.best_loss);
                 // Plateau-stop only in AUTO mode (--steps 0). An explicit --steps N is a request to run
                 // exactly N steps (matching the flag's help), so a curriculum whose signal isn't in the base
-                // val split -- e.g. --op-mix -- is not cut short by the base corpus plateauing.
-                if (steps == 0 && plateaued(rs.evals)) stop = true;
+                // val split -- e.g. an op_curriculum blend source -- is not cut short by the base corpus
+                // plateauing. frac_epoch (this step's schedule-clock position) gates plateaued()'s own
+                // minimum-epoch floor + optional expected_plateau_epoch hint scaling -- see its own comment.
+                if (steps == 0 && plateaued(rs.evals, frac_epoch, schedule.expected_plateau_epoch)) stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // Step-rate directly (not via wps/batch): batch_t now varies per step, so a fixed
@@ -1973,7 +2099,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // cadence (it is the expensive, plateau-driving measurement).
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>(total_windows - windows_at_last_log) / since : 0.0;
-            const double frac_epoch = static_cast<double>(step) / epoch_steps;
+            // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // ETA uses the rate over the CUMULATIVE window since the last eval (win_t0/win_steps0,
             // TICK_SECONDS * many ticks wide), not just the last TICK_SECONDS tick: a single 3-minute

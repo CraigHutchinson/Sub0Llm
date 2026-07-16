@@ -27,24 +27,14 @@
   Training steps; 0 (default) lets sub0llm-train auto-size to the corpus and stop on plateau.
   (An explicit -Steps N always runs the full N -- plateau-stop is auto-mode only.)
 
-.PARAMETER OpMix
-  0 (default) = off. >0 blends the op-delegation curriculum (teach the model to ROUTE arithmetic to the
-  exact `math` node -- `[op math]`, which gen dispatches -- instead of computing it, including multi-step
-  collapse chains). Combine with -Corpus data/gsm8k.txt for the GSM8K math workflow. See
-  docs/DETERMINISTIC_MECHANISMS.md. (The proven arch stack -- gated FFN / tied embeddings / QK-norm / Muon --
-  is now configure/train default-ON, so no extra flag is needed for it.)
-
-.PARAMETER ScratchMix
-  0 (default) = off. >0 blends the scratch-token (context-translation) curriculum (teach the model to
-  RESOLVE a dynamically-bound scratch slot for an OOV, so an OOV costs 1 token per mention).
-
-.PARAMETER ContentEmbed
-  Off by default. Requires -ScratchMix > 0 and/or -OpMix > 0 (a no-op with a warning otherwise -- see
-  src/train_stage.cpp); both curricula record the doc_bindings a bound slot needs. Scratch slots embed as
-  a live function of their bound fragments (mean-pool) instead of a plain learned row, in BOTH training
-  and generation (forces CPU for both -- no CUDA path yet). Every model trained WITHOUT this flag is
-  unaffected; it cannot be turned on later for an existing model without retraining (train/inference
-  mismatch -- see docs/DETERMINISTIC_MECHANISMS.md).
+.PARAMETER BlendConfig
+  Path to a blend-schedule JSON file (see docs/DETERMINISTIC_MECHANISMS.md / sub0/blend_schedule.hpp),
+  passed straight through to sub0llm-train's --blend-config. Declares one or more sources (the base
+  corpus, plus scratchspike/op_curriculum/spellspike curricula) and a staged mix schedule between them --
+  every active source targets EQUAL epoch coverage by default regardless of its size (a deficit/
+  weighted-fair scheduler, not a fixed per-draw fraction). Can also enable content-embed (scratch/op slots
+  embedding as a live function of their bound fragments) via a top-level "content_embed" field. Omit
+  entirely for a plain single-corpus run.
 
 .PARAMETER Tune
   Run sub0llm-tune before training and rebuild so the baked DEFAULT_THREADS picks up its result.
@@ -66,12 +56,16 @@
 
 .EXAMPLE
   python scripts/get_gsm8k.py                       # -> data/gsm8k.txt
-  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -Gsm8k data/gsm8k.txt -OpMix 0.8 -Batch 256 -Steps 2000
-  GSM8K math workflow. -Gsm8k converts GSM8K's OWN <<expr=result>> annotations to delegated [op math] frames
-  (the model routes GSM8K's arithmetic to the exact node instead of learning it). Notes from a real run:
-    * -OpMix HIGH (0.8): the base corpus (plain GSM8K) still shows the raw arithmetic as text, which FIGHTS
-      delegation -- a high op-mix makes the delegated version dominate. (Cleaner still: a NON-math base +
-      -Gsm8k, so nothing teaches inline arithmetic.)
+  # blend.json: { "sources": [ { "name": "base", "corpus": "data/gsm8k.txt" },
+  #                             { "name": "op", "generator": "op_curriculum", "gsm8k": "data/gsm8k.txt" } ],
+  #               "schedule": [ { "until_epoch": "end", "weights": { "base": 0.2, "op": 0.8 } } ] }
+  scripts/workflow.ps1 -BuildDir gsm8k -Corpus data/gsm8k.txt -BlendConfig blend.json -Batch 256 -Steps 2000
+  GSM8K math workflow. The "op" source's "gsm8k" field converts GSM8K's OWN <<expr=result>> annotations to
+  delegated [op math] frames (the model routes GSM8K's arithmetic to the exact node instead of learning
+  it). Notes from a real run:
+    * "op" weighted HIGH relative to "base" (0.8 vs 0.2): the base corpus (plain GSM8K) still shows the raw
+      arithmetic as text, which FIGHTS delegation -- weighting the delegated version higher makes it
+      dominate. (Cleaner still: a NON-math base + the gsm8k op source, so nothing teaches inline arithmetic.)
     * -Batch pinned: the GPU auto-batch over-shoots VRAM on small auto-sized models (crashes) -- pin it.
   Verify by GENERATING on a GSM8K-style prompt (the training format), e.g.
   `sub0llm-gen.exe <model> "Natalia sold 48/2 = "` -> emits [op math], node injects 24. (`sub0llm eval`
@@ -85,10 +79,7 @@ param(
     [string]$Compute   = "AUTO",
     [int]$Steps        = 0,
     [int]$Batch        = 0,
-    [double]$OpMix     = 0,
-    [string]$Gsm8k     = "",
-    [double]$ScratchMix = 0,
-    [switch]$ContentEmbed,
+    [string]$BlendConfig = "",
     [switch]$Tune,
     [switch]$Clean,
     [switch]$SkipConfigure,
@@ -172,10 +163,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $ModelPath) | Out-Null
 $trainArgs = @()
 if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
 if ($Batch -gt 0) { $trainArgs += @("--batch", "$Batch") }   # pin the batch (the GPU auto-batch over-shoots VRAM on small models)
-if ($OpMix -gt 0) { $trainArgs += @("--op-mix", "$OpMix") }   # blend the op-delegation (math routing) curriculum
-if ($Gsm8k)       { $trainArgs += @("--gsm8k", (Resolve-Path (Join-Path $RepoRoot $Gsm8k)).Path) }  # real GSM8K as the op source
-if ($ScratchMix -gt 0) { $trainArgs += @("--scratch-mix", "$ScratchMix") }   # blend the scratch-token curriculum
-if ($ContentEmbed)     { $trainArgs += @("--content-embed") }   # scratch slots embed as a live function of their bound fragments (requires -ScratchMix and/or -OpMix)
+if ($BlendConfig) { $trainArgs += @("--blend-config", (Resolve-Path (Join-Path $RepoRoot $BlendConfig)).Path) }
 $trainArgs += @($ModelPath, $CorpusPath)
 Invoke-Checked (Join-Path $Bin "sub0llm-train.exe") $trainArgs
 

@@ -1,74 +1,228 @@
-// blend_tests.cpp -- engine-free tests for the weighted per-window corpus blender
-// (include/sub0/blend.hpp). No model: validates the source-selection statistics, the
-// single-source rng-neutrality invariant (the resume-determinism guarantee), and that a blended
-// draw's window stays inside the CHOSEN source's bounds + documents.
+// blend_tests.cpp -- engine-free tests for BlendSource (include/sub0/blend.hpp) and the staged,
+// epoch-fair deficit scheduler (include/sub0/blend_schedule.hpp). No model: validates the scheduler's
+// fairness convergence (the whole reason it replaced the old flat-weight picker), the stage-transition
+// starvation fix, the rng-neutrality invariant (now unconditional -- source selection is fully
+// deterministic, not just for a single source), and that a blended draw's window stays inside the
+// CHOSEN source's bounds + documents.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/blend.hpp"
+#include "sub0/blend_schedule.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <span>
+#include <string>
 #include <vector>
 
 using sub0::BlendSource;
+using sub0::BlendFairness;
+using sub0::ResolvedSchedule;
 
 namespace {
 
 // A source backed by a caller-owned int32 token buffer + doc index. Returned by value; the buffers
 // live in the fixture so the borrowed spans stay valid for the test's lifetime.
-BlendSource make_source(const std::vector<int>& toks, const std::vector<std::uint64_t>& docs,
-                        double weight, const std::vector<std::uint8_t>& mask = {}) {
+BlendSource make_source(std::string name, const std::vector<int>& toks,
+                        const std::vector<std::uint64_t>& docs,
+                        const std::vector<std::uint8_t>& mask = {}) {
     BlendSource s;
-    s.view   = sub0::TokView::over_int32(toks.data(), toks.size());
-    s.docs   = std::span<const std::uint64_t>(docs);
-    s.mask   = std::span<const std::uint8_t>(mask);
-    s.weight = weight;
+    s.name = std::move(name);
+    s.view = sub0::TokView::over_int32(toks.data(), toks.size());
+    s.docs = std::span<const std::uint64_t>(docs);
+    s.mask = std::span<const std::uint8_t>(mask);
     return s;
+}
+
+// A ResolvedSchedule with ONE stage covering [0, +inf), rates given in `sources` order.
+ResolvedSchedule single_stage(std::initializer_list<double> rates) {
+    ResolvedSchedule sched;
+    sched.until_epoch = { std::numeric_limits<double>::infinity() };
+    sched.rate = { std::vector<double>(rates) };
+    return sched;
 }
 
 }  // namespace
 
-TEST_CASE("blend: pick_source converges to the configured weight ratio", "[blend]") {
+TEST_CASE("blend: pick_source_staged converges each source's own epoch progress toward equal, "
+         "regardless of size", "[blend]") {
+    // A 1000x size ratio, mirroring (at a tractable scale) the real incident this scheduler fixes: a
+    // small curriculum blended against a huge base corpus. Equal target rates (the default schema).
+    std::vector<int> small(100, 1), big(100000, 2);
+    std::vector<std::uint64_t> d_small{0}, d_big{0};
+    std::vector<BlendSource> sources{ make_source("small", small, d_small),
+                                      make_source("big",   big,   d_big) };
+    const ResolvedSchedule sched = single_stage({1.0, 1.0});
+
+    BlendFairness fair(sources.size());
+    std::mt19937 rng(1);
+    for (int i = 0; i < 20000; ++i)
+        sub0::sample_blend_staged(rng, fair, sources, sched, /*T=*/4, /*frac_epoch=*/0.0);
+
+    const double progress_small = fair.drawn_tokens[0] / static_cast<double>(sources[0].view.size());
+    const double progress_big   = fair.drawn_tokens[1] / static_cast<double>(sources[1].view.size());
+    // Under the OLD flat-weight scheme, "small" would be many hundreds of epochs deep while "big" was
+    // still at a small fraction of one -- here both must track each other closely.
+    REQUIRE(progress_small > 0.0);
+    REQUIRE(progress_big > 0.0);
+    REQUIRE(std::abs(progress_small - progress_big) < 0.05);
+}
+
+TEST_CASE("blend: pick_source_staged with unequal target rates converges to THAT ratio, not 1:1",
+         "[blend]") {
     std::vector<int> a(1000, 1), b(1000, 2);
     std::vector<std::uint64_t> da{0}, db{0};
-    std::vector<BlendSource> sources{ make_source(a, da, 0.8), make_source(b, db, 0.2) };
+    std::vector<BlendSource> sources{ make_source("a", a, da), make_source("b", b, db) };
+    const ResolvedSchedule sched = single_stage({3.0, 1.0});   // a should epoch 3x faster than b
 
-    std::mt19937 rng(12345);
-    int c0 = 0;
-    const int N = 200000;
-    for (int i = 0; i < N; ++i) c0 += (sub0::pick_source(rng, sources) == 0);
-    const double frac0 = static_cast<double>(c0) / N;
-    REQUIRE(frac0 > 0.79);
-    REQUIRE(frac0 < 0.81);
+    BlendFairness fair(sources.size());
+    std::mt19937 rng(2);
+    for (int i = 0; i < 20000; ++i)
+        sub0::sample_blend_staged(rng, fair, sources, sched, /*T=*/4, /*frac_epoch=*/0.0);
+
+    const double progress_a = fair.drawn_tokens[0] / static_cast<double>(sources[0].view.size());
+    const double progress_b = fair.drawn_tokens[1] / static_cast<double>(sources[1].view.size());
+    REQUIRE(progress_b > 0.0);
+    const double ratio = progress_a / progress_b;
+    REQUIRE(ratio > 2.7);
+    REQUIRE(ratio < 3.3);
 }
 
-TEST_CASE("blend: a single source consumes NO rng draw (resume determinism)", "[blend]") {
-    std::vector<int> a(100, 7);
-    std::vector<std::uint64_t> da{0};
-    std::vector<BlendSource> one{ make_source(a, da, 1.0) };
+TEST_CASE("blend: pick_source_staged never picks a source with rate<=0 in the current stage",
+         "[blend]") {
+    std::vector<int> a(1000, 1), b(1000, 2);
+    std::vector<std::uint64_t> da{0}, db{0};
+    std::vector<BlendSource> sources{ make_source("a", a, da), make_source("b", b, db) };
+    const ResolvedSchedule sched = single_stage({1.0, 0.0});   // "b" is declared but inactive
 
-    // The rng state after pick_source must equal the untouched state: a single-source blend must not
-    // perturb the window-sampling stream the resume point depends on.
-    std::mt19937 rng(999), ref(999);
-    for (int i = 0; i < 50; ++i) REQUIRE(sub0::pick_source(rng, one) == 0);
-    REQUIRE(rng == ref);   // identical engine state -> zero draws consumed
+    BlendFairness fair(sources.size());
+    std::mt19937 rng(3);
+    for (int i = 0; i < 500; ++i) {
+        const int s = sub0::pick_source_staged(fair, sources, sched, 0.0);
+        REQUIRE(s == 0);
+    }
+    REQUIRE(fair.drawn_tokens[1] == 0.0);
 }
 
-TEST_CASE("blend: sample_blend keeps each window inside the chosen source and one document", "[blend]") {
+TEST_CASE("blend: sample_blend_staged consumes NO extra rng beyond window sampling, for any source "
+         "count (resume determinism)", "[blend]") {
+    // Source selection is now fully deterministic (argmin over accumulated state), not a weighted-random
+    // draw -- a real, intentional change from the old pick_source, which drew one rng sample per call for
+    // >=2 sources. Verify the new invariant: sample_blend_staged's rng consumption exactly matches
+    // sample_window's own, whether there is 1 source or several.
+    std::vector<int> a(1000, 1), b(1000, 2), c(1000, 3);
+    std::vector<std::uint64_t> da{0}, db{0}, dc{0};
+
+    for (int n_sources : {1, 2, 3}) {
+        std::vector<BlendSource> sources{ make_source("a", a, da) };
+        std::vector<double> rates{1.0};
+        if (n_sources >= 2) { sources.push_back(make_source("b", b, db)); rates.push_back(1.0); }
+        if (n_sources >= 3) { sources.push_back(make_source("c", c, dc)); rates.push_back(1.0); }
+        ResolvedSchedule sched;
+        sched.until_epoch = { std::numeric_limits<double>::infinity() };
+        sched.rate = { rates };
+
+        BlendFairness fair(sources.size());
+        std::mt19937 rng(42), ref(42);
+        for (int i = 0; i < 50; ++i) {
+            sub0::sample_blend_staged(rng, fair, sources, sched, /*T=*/4, /*frac_epoch=*/0.0);
+            sub0::sample_window(ref, /*T=*/4, sources[0].view.size(), sources[0].docs);
+        }
+        // Not a claim the two engines are on the same DRAW (different sources may have been chosen for
+        // the staged call) -- only that the NUMBER of draws consumed matches exactly, i.e. picking added
+        // zero rng cost regardless of source count.
+        REQUIRE(rng == ref);
+    }
+}
+
+TEST_CASE("blend: a stage transition with a rate DECREASE bounds starvation instead of leaving it "
+         "unbounded", "[blend]") {
+    // Reproduces the design-review regression: a source's rate tapers from 0.5 to 0.05 at a stage
+    // boundary. Without the transition clamp, the source's normalized progress (progress/rate) jumps
+    // ~10x at the boundary and it would not be redrawn for thousands of windows. With the clamp, it
+    // must be redrawn again "soon" (bounded, not unbounded).
+    std::vector<int> a(100000, 1), b(100000, 2);
+    std::vector<std::uint64_t> da{0}, db{0};
+    std::vector<BlendSource> sources{ make_source("a", a, da), make_source("b", b, db) };
+
+    ResolvedSchedule sched;
+    sched.until_epoch = { 0.5, std::numeric_limits<double>::infinity() };
+    sched.rate = { {0.5, 0.5}, {0.95, 0.05} };   // stage 2 tapers "b" from equal to 5%
+
+    BlendFairness fair(sources.size());
+    std::mt19937 rng(4);
+    // Run stage 1 to a comparable progress on both sources.
+    for (int i = 0; i < 4000; ++i)
+        sub0::sample_blend_staged(rng, fair, sources, sched, /*T=*/8, /*frac_epoch=*/0.3);
+    REQUIRE(fair.drawn_tokens[1] > 0.0);   // "b" got real draws in stage 1
+
+    // Cross into stage 2 (frac_epoch >= 0.5) and confirm "b" is drawn again within a bounded window,
+    // not starved for thousands of draws the way the un-clamped math would produce.
+    bool b_drawn_again = false;
+    for (int i = 0; i < 200 && !b_drawn_again; ++i) {
+        const int s = sub0::pick_source_staged(fair, sources, sched, 0.5);
+        if (s == 1) b_drawn_again = true;
+        sub0::sample_window(rng, 8, sources[static_cast<std::size_t>(s)].view.size(),
+                            sources[static_cast<std::size_t>(s)].docs);
+        fair.drawn_tokens[static_cast<std::size_t>(s)] += 8;
+    }
+    REQUIRE(b_drawn_again);
+}
+
+TEST_CASE("blend: a source newly activated mid-schedule starts at progress 0 and gets an initial "
+         "catch-up burst", "[blend]") {
+    std::vector<int> a(100000, 1), b(100000, 2);
+    std::vector<std::uint64_t> da{0}, db{0};
+    std::vector<BlendSource> sources{ make_source("a", a, da), make_source("b", b, db) };
+
+    ResolvedSchedule sched;
+    sched.until_epoch = { 0.5, std::numeric_limits<double>::infinity() };
+    sched.rate = { {1.0, 0.0}, {1.0, 1.0} };   // "b" only activates in stage 2
+
+    BlendFairness fair(sources.size());
+    std::mt19937 rng(5);
+    for (int i = 0; i < 2000; ++i)
+        sub0::sample_blend_staged(rng, fair, sources, sched, /*T=*/8, /*frac_epoch=*/0.3);
+    REQUIRE(fair.drawn_tokens[1] == 0.0);   // never drawn in stage 1
+
+    // Stage 2: "b" starts at progress 0 while "a" is already well ahead -- it should win argmin
+    // immediately (the intended burst), not wait.
+    const int s = sub0::pick_source_staged(fair, sources, sched, 0.5);
+    REQUIRE(s == 1);
+}
+
+TEST_CASE("blend: resolve_stage picks the stage covering frac_epoch, boundaries and end handled",
+         "[blend]") {
+    ResolvedSchedule sched;
+    sched.until_epoch = { 0.5, 0.9, std::numeric_limits<double>::infinity() };
+    sched.rate = { {1.0}, {1.0}, {1.0} };
+
+    CHECK(sub0::resolve_stage(sched, 0.0)  == 0);
+    CHECK(sub0::resolve_stage(sched, 0.49) == 0);
+    CHECK(sub0::resolve_stage(sched, 0.5)  == 1);   // exactly on a boundary -> the NEXT stage
+    CHECK(sub0::resolve_stage(sched, 0.89) == 1);
+    CHECK(sub0::resolve_stage(sched, 0.9)  == 2);
+    CHECK(sub0::resolve_stage(sched, 1000.0) == 2);  // "end" sentinel covers everything past it
+}
+
+TEST_CASE("blend: sample_blend_staged keeps each window inside the chosen source and one document",
+         "[blend]") {
     // Source 0: three 20-token documents. Source 1: one 50-token document.
     std::vector<int> a(60), b(50);
     std::iota(a.begin(), a.end(), 0);
     std::iota(b.begin(), b.end(), 1000);
     std::vector<std::uint64_t> da{0, 20, 40}, db{0};
-    std::vector<BlendSource> sources{ make_source(a, da, 0.5), make_source(b, db, 0.5) };
+    std::vector<BlendSource> sources{ make_source("a", a, da), make_source("b", b, db) };
+    const ResolvedSchedule sched = single_stage({0.5, 0.5});
 
+    BlendFairness fair(sources.size());
     std::mt19937 rng(7);
     for (int it = 0; it < 5000; ++it) {
-        const sub0::BlendDraw d = sub0::sample_blend(rng, 8, sources);
+        const sub0::BlendDraw d = sub0::sample_blend_staged(rng, fair, sources, sched, 8, 0.0);
         REQUIRE((d.src == 0 || d.src == 1));
         const BlendSource& src = sources[static_cast<std::size_t>(d.src)];
         const std::size_t end = d.win.start + static_cast<std::size_t>(d.win.len);
@@ -85,8 +239,29 @@ TEST_CASE("blend: masked() reflects whether a source carries a loss mask", "[ble
     std::vector<int> a(10, 1);
     std::vector<std::uint64_t> da{0};
     std::vector<std::uint8_t> m(10, 1);
-    REQUIRE_FALSE(make_source(a, da, 1.0).masked());
-    REQUIRE(make_source(a, da, 1.0, m).masked());
+    REQUIRE_FALSE(make_source("a", a, da).masked());
+    REQUIRE(make_source("a", a, da, m).masked());
+}
+
+TEST_CASE("blend: carry_forward_by_name matches progress by NAME, not position", "[blend]") {
+    // The --blend-config-replace scenario this exists for: a schedule swap that keeps the same NUMBER of
+    // sources but changes what an index means. "base" keeps its progress even though it moved from index
+    // 0 to index 1; "scratch" is dropped (no longer declared); "op" is new and starts at 0.
+    const std::vector<std::string> old_names{"base", "scratch"};
+    const std::vector<double>      old_tokens{1000.0, 250.0};
+    const std::vector<std::string> new_names{"op", "base"};   // reordered, "scratch"->"op"
+
+    const std::vector<double> out = sub0::carry_forward_by_name(old_names, old_tokens, new_names);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0] == 0.0);       // "op" is new
+    CHECK(out[1] == 1000.0);    // "base" carried forward despite moving index 0 -> 1
+}
+
+TEST_CASE("blend: carry_forward_by_name is a no-op when names and order are unchanged", "[blend]") {
+    const std::vector<std::string> names{"base", "scratch"};
+    const std::vector<double> tokens{500.0, 42.0};
+    const std::vector<double> out = sub0::carry_forward_by_name(names, tokens, names);
+    CHECK(out == tokens);
 }
 
 TEST_CASE("blend: doc_of finds the document owning a corpus position", "[blend]") {

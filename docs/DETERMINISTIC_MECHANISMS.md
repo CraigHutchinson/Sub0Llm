@@ -104,7 +104,8 @@ is left as plain (graded) prose instead of being turned into a delegation.
    in the prose the model just emitted, and the node re-reads it from there (`node_frame::preceding_expr`,
    the same "prefer contextual over self-contained" lesson above);
 3. the result, **MASKED** (mask=0) — either the collapsed scratch-slot token `SCRATCH_SLOT_BASE` (production
-   / `--gsm8k` training) or the literal digits `8` (test-only, `collapse=false`). Predicting this token earns
+   / real-GSM8K-file training, via an `op_curriculum` schedule source's `"gsm8k"` field) or the literal
+   digits `8` (test-only, `collapse=false`). Predicting this token earns
    no loss signal either way — the only way to "know" it is to have delegated;
 4. the redundant `8` GSM8K repeats right after `>>` is stripped from the following prose segment (else it
    would duplicate the masked result as graded, un-masked text — reintroducing the exact fuzzy-copy
@@ -188,21 +189,23 @@ pseudo-random role vector per position with each fragment, then sum). **`HRR` wi
 held-out 0.744 -- more than double chance, ~3.4x ConvPool's margin and ~8x Hash's, consistent across every
 seed tried.** Needs NO learned parameters (unlike CharEncoder/ConvPool), so unlike them it does not depend
 on checkpoint persistence to reach production (see project memory `slot-encoder-checkpoint-persistence-design`
-for that separate, still-needed CharEncoder/ConvPool work). **`HRR` is now the `--content-embed` default**
-(`RunConfig::content_embed_kind`, persisted and resume-safe -- an old config.json predating this field
-keeps decoding with the MeanPool it actually trained on, never silently drifting to HRR); Hash and
+for that separate, still-needed CharEncoder/ConvPool work). **`HRR` is now the default `content_embed`
+encoding** (set via a blend-schedule JSON's top-level `"content_embed": "hrr"` field -- see the "Corpus
+blend scheduling" section below; the standalone `--content-embed` CLI flag and its `RunConfig`-persisted
+`content_embed_kind` field were replaced entirely by the blend-schedule redesign, 2026-07-16); Hash and
 ConvPool remain implemented but unwired. See project memory `meanpool-alternatives-prior-art-and-math`
 for the full prior-art survey, math, and per-seed results.
 
-**Hybrid CPU/GPU execution is DONE (2026-07-16).** `--content-embed` used to force the ENTIRE training
+**Hybrid CPU/GPU execution is DONE (2026-07-16).** Content-embed used to force the ENTIRE training
 step onto CPU (`gpu_train = !content_embed_active && ...`), because a bound scratch slot's meaning is
 per-WINDOW (different windows in the same batch can bind the same slot id to different content), which
 the device's id-indexed, batch-shared embedding table cannot represent without a real per-window
 device-side lookup kernel -- the still-unbuilt `SUB0_COMPUTE=HYBRID` ("Phase 3", `cmake/Backends.cmake`).
 The tractable, now-shipped path is narrower: SOURCE-ROUTED splitting. Each step partitions its windows by
-blend source -- those drawn from a content-embed-active source (`--scratch-mix`/`--op-mix`) run on a
-persistent CPU worker thread (`train_stage.cpp`'s `CpuSubBatchWorker`), every other window in the SAME
-batch (base corpus, etc.) runs on GPU via `GpuTrainer::backward_only()` -- and the two gradients are
+blend source -- those drawn from a content-embed-active source (any schedule source using the
+`scratchspike`/`op_curriculum` generator) run on a persistent CPU worker thread (`train_stage.cpp`'s
+`CpuSubBatchWorker`), every other window in the SAME batch (base corpus, etc.) runs on GPU via
+`GpuTrainer::backward_only()` -- and the two gradients are
 weighted-merged (by sub-batch size) into one host-side `AdamW::step()`, with params re-uploaded to the
 device every step. Proven correct on real hardware (`tests/cuda_tests.cpp`, rel-L2 0.0087, cos 0.999963)
 before wiring into the live loop; a self-run `/cpp-review` pass then caught and fixed two real bugs
@@ -211,6 +214,36 @@ skipped on an all-CPU step that left stale params on the device for the next GPU
 300-step real run tracks the pure-CPU baseline's loss curve almost exactly while running ~2.3-2.6x
 faster. See project memory `hybrid-cpu-gpu-execution-design` for the full history and verification detail.
 This is what unblocks verifying any of the three encoders above at production scale in reasonable time.
+
+### Corpus blend scheduling (clean-room redesign, DONE 2026-07-16)
+
+A real training run surfaced a genuine bug: `--scratch-mix`'s old flat-fraction blending (a fixed % of
+every step's windows drawn from a source, forever) let a small curriculum (141K tokens) blended against a
+huge base corpus (633M tokens) get statistically re-covered dozens of times before the base corpus
+finished even one epoch -- the curriculum memorized within ~500 steps and its cratering loss contribution
+produced a visible cliff-then-plateau in the blended training loss. Fixed with a clean-room rebuild, not a
+patch: a **staged, epoch-fair deficit scheduler** (same family as Linux CFS's `argmin(vruntime)` task
+scheduling and network WFQ -- `include/sub0/blend_schedule.hpp`) that tracks each source's own cumulative
+epoch progress and always draws from whichever active source is furthest behind, so every source targets
+EQUAL epoch coverage by default regardless of size (matching a real precedent: GPT-3's own per-dataset
+epoch table, Brown et al. 2020, deliberately ran small high-quality corpora multiple epochs while a huge
+one stayed under one). Generalizes to curriculum-learning-style STAGED schedules ("corpus A alone until
+epoch 0.5, then curriculum B ramps to 25% until epoch 0.9").
+
+This **fully replaced** (not layered alongside) `--scratch-mix`/`--op-mix`/`--spell-mix`/`--content-embed`/
+`--gsm8k` with a single `--blend-config <path.json>` pointing at a schedule file declaring named sources
+(the base corpus, plus `scratchspike`/`op_curriculum`/`spellspike` generator sources) and a staged mix
+schedule between them, plus a top-level `"content_embed"` field. Pinned into the model directory on first
+run (`blend_schedule.json`, read-only on ordinary resume; `--blend-config-replace` is the explicit,
+separately-named override for deliberately switching schedules mid-run). `RunConfig` gained a
+`config_schema` version guard (2 = this scheme; a model dir written before it refuses to resume for
+training, degrades to no-interceptor generation with a loud warning rather than silently guessing).
+Checkpoint format bumped to v3 to persist the scheduler's own per-source fairness state across resume.
+Also added epoch-aware plateau-detection confidence (a hard minimum-epoch floor before a plateau-stop is
+even considered, plus an optional per-schedule `expected_plateau_epoch` hint). See project memory
+`blend-schedule-clean-room-redesign` for the full design history, the two real bugs a self-review caught
+(a stage-transition rate-decrease starvation bug, and a second bug in that very fix), and real-hardware
+verification detail.
 
 ---
 
@@ -657,10 +690,14 @@ is the named-region case specifically, not a general replacement for the ephemer
    and the GSM8K capstone above. `--op-mix` now records its collapsed results into a `doc_bindings`-shaped
    table too (mirroring `scratchspike::Dataset`; `gsm8k.hpp`'s collapse slots increment per annotation
    within a document — S0, S1, ... — instead of always reusing S0, so each slot holds exactly one binding
-   per document, matching `--content-embed`'s invariant), so `--content-embed` now works from `--op-mix`
-   alone, `--scratch-mix` alone, or both blended together (`train_stage.cpp`'s `content_embed_active`,
-   `gen_stage.cpp`'s matching `content_embed_on` gate). Still open: a decode-to-text step for a full Unigram
-   deployment (the byte parse suffices for this project's byte-heavy tokenizer); real library nodes.
+   per document, matching content-embed's invariant), so content-embed now works from an `op_curriculum`
+   source alone, a `scratchspike` source alone, or both blended together (`train_stage.cpp`'s
+   `content_embed_active`, `gen_stage.cpp`'s matching `content_embed_on` gate). Still open: a decode-to-text
+   step for a full Unigram deployment (the byte parse suffices for this project's byte-heavy tokenizer);
+   real library nodes. *Further superseded (2026-07-16):* `--op-mix`/`--scratch-mix`/`--spell-mix`/
+   `--content-embed`/`--gsm8k` were themselves replaced by the blend-schedule JSON system (see "Corpus
+   blend scheduling" below) -- `op_curriculum`/`scratchspike` are now schedule source `"generator"` values,
+   not standalone CLI flags.
 
 Each stage is a cheap, falsifiable experiment in the spike style — set the mechanism up to win, then check
 whether a *small* model wins with near-zero training. That is the homogenised bet: **teach the model to use

@@ -34,7 +34,8 @@ finding any other punctuation in text.
 
 Two ways it feeds training:
   * As a plain base corpus (reasoning-density fluency), blended with the synthetic op-delegation curriculum
-    (`sub0llm-train --op-mix`), which is what teaches the model to emit `[op math]`.
+    (a blend-schedule source with `"generator": "op_curriculum"`, `sub0llm-train --blend-config <path>`),
+    which is what teaches the model to emit `[op math]`.
   * (Follow-on) a train-time pass that runs each solution's <<..>> annotations through build_stream to
     delegate + mask GSM8K's OWN arithmetic -- the piece that makes GSM8K itself fully delegating.
 

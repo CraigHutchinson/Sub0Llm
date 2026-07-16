@@ -20,8 +20,8 @@
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
-                                int optimizer, int resume_mode, float spell_mix, float scratch_mix,
-                                float op_mix, const char* gsm8k_path, int content_embed);
+                                int optimizer, int resume_mode, const char* blend_config_path,
+                                int replace_schedule);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -56,16 +56,14 @@ inline int run_train(int argc, char** argv) {
     std::string train_keep = "3";
     int train_optimizer = 1;   // 1=muon (hidden 2D matrices on Muon) + adamw (everything else) -- the proven
                                // default (project memory arch-features-off-by-default); --optimizer adamw opts out
-    float train_spell_mix = 0.f;   // 0 = base corpus only; >0 blends in the uncombine curriculum
-    float train_scratch_mix = 0.f; // 0 = off; >0 blends in the scratch-token (context-translation) curriculum
-    float train_op_mix = 0.f;      // 0 = off; >0 blends in the op-delegation (math node routing) curriculum
-    std::string train_gsm8k;       // if set (with --op-mix>0): draw the op curriculum from THIS real GSM8K file
-    bool train_content_embed = false;   // scratch-mix slots embed as a live function of their bound fragments
-                                        // (mean-pool) instead of a plain learned row -- see
-                                        // docs/DETERMINISTIC_MECHANISMS.md / the scratch-token content-reasoning
-                                        // work. Requires --scratch-mix > 0 and --op-mix == 0 (train_stage warns
-                                        // and disables it otherwise -- op-collapsed slots aren't trained this
-                                        // way yet, so combining would mismatch gen against training).
+    std::string train_blend_config;        // a blend-schedule JSON path (see sub0/blend_schedule.hpp) -- the
+                                           // sole way to draw from more than the base corpus, or to enable
+                                           // content-embed. Omit entirely for a plain single-corpus run.
+    bool train_blend_replace = false;      // deliberately switch to a DIFFERENT schedule on this resume
+                                           // (see train_stage.cpp's own comment on why this is a separate,
+                                           // explicitly-named flag rather than reusing --blend-config's mere
+                                           // presence: a schedule identity change mid-run is a big enough
+                                           // deal that it must never happen silently on a routine resume)
     bool train_resume = false, train_fresh = false;
     app.add_option("model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
@@ -91,33 +89,23 @@ inline int run_train(int argc, char** argv) {
     app.add_flag("--fresh", train_fresh,
                 "No explicit model path: force a brand-new dated model dir, even if a resumable one exists")
        ->excludes(resume_flag);
-    app.add_option("--spell-mix", train_spell_mix,
-                   "Fraction of training windows drawn from the synthetic uncombine/combine curriculum "
-                   "(0 = base corpus only; e.g. 0.1 = ~10% curriculum). Teaches the model to REQUEST "
-                   "character-level tokenizer ops (spell/count) that gen fulfils.")
-       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
-    app.add_option("--scratch-mix", train_scratch_mix,
-                   "Fraction of training windows drawn from the scratch-token (context-translation) "
-                   "curriculum (0 = off). Teaches the model to RESOLVE a dynamically-bound scratch slot "
-                   "for an OOV, so an OOV costs 1 token per mention (gen resolves via a binding table).")
-       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
-    app.add_option("--op-mix", train_op_mix,
-                   "Fraction of training windows drawn from the op-delegation curriculum (0 = off). Teaches "
-                   "the model to ROUTE arithmetic to the deterministic `math` node (emit [op math]; the node "
-                   "supplies the exact answer, which gen dispatches) rather than computing it -- including "
-                   "multi-step chains via collapsed scratch slots. See docs/DETERMINISTIC_MECHANISMS.md.")
-       ->capture_default_str()->check(CLI::Range(0.0f, 0.9f));
-    app.add_option("--gsm8k", train_gsm8k,
-                   "Path to a real GSM8K corpus (scripts/get_gsm8k.py's output). With --op-mix > 0, the op "
-                   "curriculum is drawn from THIS file -- its <<expr=result>> calc-annotations are converted "
-                   "to delegated [op math] frames (masked results) -- so GSM8K's OWN arithmetic delegates, "
-                   "instead of the synthetic generator. Omit for the synthetic curriculum.")
+    app.add_option("--blend-config", train_blend_config,
+                   "Path to a blend-schedule JSON file (see docs/DETERMINISTIC_MECHANISMS.md / "
+                   "sub0/blend_schedule.hpp) declaring one or more sources (the base corpus, plus "
+                   "scratchspike/op_curriculum/spellspike curricula) and a staged mix schedule between "
+                   "them -- e.g. \"corpus A alone until epoch 0.5, then curriculum B ramps in to 25% "
+                   "until epoch 0.9\". Every active source targets EQUAL epoch coverage by default "
+                   "regardless of its size (a deficit/weighted-fair scheduler, not a fixed per-draw "
+                   "fraction), can also enable content-embed (a top-level \"content_embed\" field). "
+                   "Omit entirely for a plain single-corpus run. Pinned into the model directory on "
+                   "first run; a later invocation without this flag keeps using the PINNED schedule "
+                   "unchanged (see --blend-config-replace to deliberately switch it).")
        ->check(CLI::ExistingFile);
-    app.add_flag("--content-embed", train_content_embed,
-                "Scratch/op-mix slots embed as a live function of their bound fragments (HRR "
-                "circular-convolution binding by default) instead of a plain learned row (requires "
-                "--scratch-mix > 0 or --op-mix > 0; a no-op with a warning otherwise). Default off -- "
-                "every existing model is unaffected.");
+    app.add_flag("--blend-config-replace", train_blend_replace,
+                "With --blend-config, on a resume: deliberately REPLACE the model dir's already-pinned "
+                "schedule with this one instead of the default (silently ignoring --blend-config and "
+                "continuing under the original pinned schedule). Per-source progress carries forward BY "
+                "NAME; a newly-introduced source starts at 0, a removed one is dropped.");
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -130,8 +118,7 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode, train_spell_mix, train_scratch_mix, train_op_mix,
-                            train_gsm8k.c_str(), train_content_embed ? 1 : 0);
+                            resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0);
 }
 
 // --- gen -------------------------------------------------------------------

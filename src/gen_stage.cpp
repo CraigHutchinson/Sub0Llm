@@ -7,6 +7,10 @@
 #include "sub0/core.hpp"
 #include "sub0/decode.hpp"  // shared KV-cache decode loop (GPU-first, CPU-fallback, EOS-stop)
 #include "sub0/registry.hpp"    // read_config_json: is this model trained with the uncombine curriculum?
+#include "sub0/blend_schedule.hpp" // ScheduleSpec/parse_blend_schedule_json -- the pinned recipe records
+                                   // which curricula (hence which gen-time capabilities) a model was
+                                   // actually trained with, replacing the old flat spell_mix/scratch_mix/
+                                   // op_mix/content_embed RunConfig fields
 #include "sub0/tokenizer.hpp"   // raw sub0::tok::Tokenizer for the uncombine/combine interceptor callbacks
 #include "sub0/scratch.hpp"     // ScratchTable: binding table backing both spell + scratch resolution
 #include "sub0/node_frame.hpp"  // op frame: dispatch deterministic compute nodes through the TOK_TURN region
@@ -30,6 +34,24 @@
 // diverges under random weights (a benign flash-vs-two-pass softmax amplification, not a kernel bug --
 // see the memory notes on the d448 random-weight investigation). Device forward_one is FP32-only
 // (matches the CPU path's dense assumption), so this mirrors USE_TERNARY gating below.
+
+namespace {
+// Is a source using generator `gen` given a positive weight in AT LEAST ONE schedule stage? Not just
+// "declared" (a source the schedule never actually draws from needs no gen-time capability, per the
+// parser's own unreferenced-source warning) and not just "active in the FINAL stage" (a schedule can
+// legitimately bootstrap a generator hard early then taper it to zero later, curriculum-learning-style,
+// and the model still needs the matching gen-time capability for what it learned during that stage).
+// Shared by sub0_gen_stage and sub0_eval_stage below.
+bool generator_ever_active(const sub0::ScheduleSpec& schedule, std::string_view gen) {
+    for (const sub0::SourceSpec& s : schedule.sources) {
+        if (s.generator != gen) continue;
+        for (const sub0::ScheduleStage& stage : schedule.stages)
+            for (const auto& [name, rate] : stage.weights)
+                if (name == s.name && rate > 0.0) return true;
+    }
+    return false;
+}
+}  // namespace
 
 extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                         int n, float temp, int topk, unsigned seed, int attn_sinks) {
@@ -102,16 +124,46 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
         sub0::registry::RunConfig cfg;
         const bool have = !dir.empty() && sub0::registry::read_config_json(cfg, dir);
-        const bool sp_on = have && (cfg.spell_mix > 0.0 || cfg.scratch_mix > 0.0);
-        const bool op_on = have && cfg.op_mix > 0.0;
+        if (have && cfg.config_schema < 2) {
+            // Predates the blend-schedule redesign: its config.json still carries the now-removed
+            // spell_mix/scratch_mix/op_mix/content_embed/content_embed_kind fields, silently ignored by
+            // this build's RunConfig. Unlike train's resume path (which refuses outright -- continuing
+            // to TRAIN under a guessed recipe risks real, silent corruption), gen degrades instead: the
+            // model.bin itself is still valid, so generate WITHOUT any interceptor rather than refuse
+            // useful output entirely -- just say so loudly, since a model that actually needs the
+            // interceptor will visibly misbehave without it.
+            std::println(stderr, "gen: '{}' predates the blend-schedule redesign (config_schema {}) -- "
+                                 "cannot determine which curricula it needs; generating WITHOUT any "
+                                 "interceptor (spell/scratch/op/content-embed). Re-train with this build "
+                                 "to regain them, or use an older build to generate from this model "
+                                 "exactly as trained.", dir.string(), cfg.config_schema);
+        }
+        sub0::ScheduleSpec schedule;
+        std::string schedule_error;
+        std::vector<std::string> schedule_warnings;   // unused here -- gen only needs the parsed shape
+        bool have_schedule = false;
+        if (have && cfg.config_schema >= 2) {
+            have_schedule = sub0::parse_blend_schedule_json(dir / "blend_schedule.json", schedule,
+                                                             schedule_error, schedule_warnings);
+            if (!have_schedule)
+                std::println(stderr, "gen: '{}' blend_schedule.json is unreadable ({}) -- generating "
+                                     "WITHOUT any interceptor (spell/scratch/op/content-embed)",
+                             dir.string(), schedule_error);
+        }
+        const bool sp_on = have_schedule && (generator_ever_active(schedule, "spellspike")
+                                             || generator_ever_active(schedule, "scratchspike"));
+        const bool scratch_on = have_schedule && generator_ever_active(schedule, "scratchspike");
+        const bool op_on = have_schedule && generator_ever_active(schedule, "op_curriculum");
         if (sp_on || op_on) {
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
-                content_embed_on = (sp_on || op_on) && cfg.content_embed > 0;
-                content_embed_enc = sub0::content_embed_encoding_of(cfg.content_embed_kind);
+                content_embed_on = (scratch_on || op_on) && schedule.content_embed.has_value();
+                content_embed_enc = content_embed_on
+                    ? sub0::content_embed_encoding_of(static_cast<int>(*schedule.content_embed))
+                    : sub0::SlotEncoding::MeanPool;
                 if (sp_on) {
-                    scratch.allow_bind = (cfg.scratch_mix > 0.0);   // only a scratch model mints slots on OOVs
+                    scratch.allow_bind = scratch_on;   // only a scratch model mints slots on OOVs
                     expand  = [&scratch](int token) { return scratch.expand(token); };
                     combine = [&scratch, &binds, content_embed_on, content_embed_enc](const std::vector<int>& frags) {
                         std::vector<int> r = scratch.combine(frags);
@@ -143,12 +195,13 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                 } else {
                     compute = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
                 }
-                std::println(stderr, "gen: interceptor enabled (spell-mix {:.2f}, scratch-mix {:.2f}, "
-                                     "op-mix {:.2f}{}{})", cfg.spell_mix, cfg.scratch_mix, cfg.op_mix,
-                             op_collapse ? ", collapse" : "",
-                             content_embed_on
-                                 ? (std::string(", content-embed ") + sub0::content_embed_kind_name(cfg.content_embed_kind))
-                                 : std::string());
+                std::println(stderr, "gen: interceptor enabled ({}{}{}{})",
+                             sp_on ? "spell/scratch" : "", (sp_on && op_on) ? " + " : "",
+                             op_on ? "op-dispatch" : "",
+                             op_collapse ? ", collapse" : "");
+                if (content_embed_on)
+                    std::println(stderr, "gen: content-embed {}",
+                                sub0::content_embed_kind_name(static_cast<int>(*schedule.content_embed)));
             }
         }
     }
@@ -243,16 +296,26 @@ extern "C" SUB0_API int sub0_eval_stage(const char* model_in, unsigned seed, int
     if (!sub0::load_tokenizer(tok_path.c_str())) { std::println(stderr, "eval: cannot load tokenizer '{}'", tok_path); return 1; }
     const int eos_id = sub0::eos_token_id();
 
-    double op_mix = 0.0;
+    bool op_on = false;
     if (model_in && *model_in) {
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
         sub0::registry::RunConfig cfg;
-        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir)) op_mix = cfg.op_mix;
+        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) && cfg.config_schema >= 2) {
+            sub0::ScheduleSpec schedule;
+            std::string schedule_error;
+            std::vector<std::string> schedule_warnings;
+            if (sub0::parse_blend_schedule_json(dir / "blend_schedule.json", schedule, schedule_error,
+                                                schedule_warnings))
+                op_on = generator_ever_active(schedule, "op_curriculum");
+            else
+                std::println(stderr, "eval: '{}' blend_schedule.json is unreadable ({})", dir.string(),
+                             schedule_error);
+        }
     }
-    if (op_mix <= 0.0)
-        std::println(stderr, "eval: warning -- model config.json op-mix {:.2f} (not an op-delegation model; "
-                             "expect delegation ~0)", op_mix);
+    if (!op_on)
+        std::println(stderr, "eval: warning -- model's blend schedule has no active op_curriculum source "
+                             "(not an op-delegation model; expect delegation ~0)");
 
     // The production collapse callback (mirrors gen_stage): resolve the op, bind the result to the next
     // scratch slot, inject that token. The last bound slot's value is the model's answer.

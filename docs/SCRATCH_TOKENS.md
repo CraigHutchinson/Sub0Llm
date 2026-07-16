@@ -343,10 +343,11 @@ Next steps, in order:
 1. ~~Crack localization~~ **— done.** Local query restatement solves it (held-out 1.000 at K=3, d128; the
    confound control rules out context-length). The takeaway generalizes: **ground the reasoning locally** —
    put the query next to the data. Follow-ups: confirm at higher K (4–6 candidates), and fold the local-CoT
-   trace shape into the production `--scratch-mix` curriculum so real models learn to answer content queries
-   over scratch slots by resolving + locally checking. (No engine changes — all masked-training curriculum.)
+   trace shape into the production `scratchspike` blend-schedule curriculum so real models learn to answer
+   content queries over scratch slots by resolving + locally checking. (No engine changes — all
+   masked-training curriculum.)
 2. **Promote `enc_w` to a model param** (`PARAM_LAYOUT` bump + per-thread grad reduction) — ends both the
-   single-thread limit and the race, unlocking multi-threaded training + real `--scratch-mix` integration
+   single-thread limit and the race, unlocking multi-threaded training + real `scratchspike` integration
    for Route B, and lets Route B ride the same scale run.
 3. CUDA embed branch (parity-gated), gen wiring (`ScratchTable::to_bindings`), reserved-range growth, and
    an **order-aware** encoder (the first-letter task is missed by both mean-pool and the order-agnostic

@@ -192,14 +192,15 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
-add_library(sub0_core SHARED src/engine_core.cpp src/run_config.cpp ${SUB0_BACKEND_SOURCES})
+add_library(sub0_core SHARED src/engine_core.cpp src/run_config.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
 target_link_libraries(sub0_core PRIVATE sub0_frontend)
-# run_config.cpp's read_config_json (registry.hpp's RunConfig) uses simdjson to parse config.json.
-# PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain std::-typed function declared
-# in registry.hpp -- simdjson's own types never leak across that boundary.
+# run_config.cpp's read_config_json (registry.hpp's RunConfig) and blend_schedule.cpp's
+# parse_blend_schedule_json (blend_schedule.hpp's ScheduleSpec) both use simdjson to parse their
+# respective JSON files. PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain
+# std::-typed functions declared in their headers -- simdjson's own types never leak across that boundary.
 target_link_libraries(sub0_core PRIVATE simdjson::simdjson)
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
 # the errno side-effect of the math libcalls is dead weight that stops the optimizer
