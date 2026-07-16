@@ -1103,6 +1103,22 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         if (std::filesystem::is_directory(model_path))
             model_path = (std::filesystem::path(model_path) / "model.bin").string();
         meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
+        // A BARE filename (no directory component, e.g. "myrun" instead of "myrun/model") resolves
+        // meta_dir to empty -- every meta_dir-gated side effect below (train.log's own set_file tee,
+        // config.json/meta.txt/blend_schedule.json writes) then silently no-ops. The run itself is
+        // unaffected (model.bin + checkpoints still save fine), but the result is invisible to `models`,
+        // loses its recorded recipe, and -- for a content-embed/scratch run specifically -- can't be
+        // regenerated with the right interceptor later without hand-reconstructing config.json from
+        // memory (hit for real: see project history around 2026-07-16's ce256_prod_fixed relaunch,
+        // which needed exactly that manual reconstruction afterward). Warn loudly instead of letting it
+        // pass silently -- this is a one-line, easy-to-miss CLI mistake, not a design choice to protect.
+        if (meta_dir.empty())
+            sub0::log::warn("train: '{}' has no directory component -- config.json/meta.txt/"
+                            "blend_schedule.json will NOT be written (only model.bin + checkpoints save). "
+                            "This model won't show up in `models`, won't carry its recipe on resume, and "
+                            "can't auto-enable content-embed/scratch on `gen` later. Use a directory-style "
+                            "path instead (e.g. '{}/model') to get the full model-directory layout.",
+                            model_path, model_path);
     } else {
         // No explicit path: find the most recent model dir with the SAME corpus + architecture
         // (registry::compatible() -- dims/flags, deliberately NOT the git SHA, see registry.hpp's
