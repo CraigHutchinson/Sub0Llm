@@ -435,10 +435,18 @@ Why the pair beats both existing ranges at what they can't do:
   (DIGIT control at its known wall: 0.055/0.000/0.000 finals). The one-stable-symbol property is what
   matters, not the reserved id — the association skill fully survives the 2-token pair cost, with zero
   seed variance. `[.chaincapstone]`'s 3-arm × 3-seed A/B/C is the pinned record.
-- **Phase 2 — sentinel-pair spike (TOK_RESERVED_9, no format bump).** Embedding-override engine change +
-  a bind-K-entities/select-and-resolve-via-pairs curriculum; A/B against dedicated-id `select_task` at
-  K<=5, then scale K well past it. This is the novel step — pairs give BOTH unbounded addressing AND
-  model-driven selection, which neither existing range has.
+- **Phase 2 — sentinel-pair spike. ✅ DONE (2026-07-17), verdict decisive and different than designed**:
+  ONE-HOP selection through the pair embedding is a wall (chance at K=3 AND K=12, override or not —
+  the handle letters' static lm_head rows are the bottleneck; the dispatch itself is proven correct by
+  4 engine differentials, `[sentinel_pair]`, default suite). **Route-A — first-letter queries tracking
+  through the UNCOMBINE (resolve each pair live, restate query locally, verdict, copy the match) hits
+  0.903 held-out at K=12 with NO override** (seeds 0.850/0.950/0.908); adding the HRR override HURTS
+  (0.775) — once content arrives via injected bytes, content-carrying pair embeddings add interference.
+  Selection over unbounded pair-addressed entities is therefore SOLVED with plain 2-token pairs + the
+  proven local-CoT scaffold — no logit columns, no embedding override. The SentinelBindings engine
+  mechanism stays (tested, inert by default) re-scoped as a candidate for one-hop compaction contexts
+  only. Full numbers: project memory `persistent-slot-selection-problem-backlog`;
+  `[.pairspike]`/`[.pairspike_k3]`/`[.pairspike_cot]` are the pinned records.
 - **Phase 3 — deprecate the 6-slot pool; reclaim the ids.** Gated on phases 0-2 proving out. Frees
   `TOK_RESERVED_4..9`: the sentinel gets a permanent id, and the remaining ids unblock the op-marker
   dedicated-token backlog (`TOK_OP_START`/`END`) that has been waiting on this exact headroom.
