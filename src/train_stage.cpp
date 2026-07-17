@@ -160,6 +160,15 @@ constexpr double PLATEAU_MIN_EPOCH   = 0.75;
 // plateaued()'s own comment for the interpolation.
 constexpr double PLATEAU_MIN_REL_FAR     = 0.002;  // >= 1 full epoch away from the hint: need a flatter trend
 constexpr double PLATEAU_MIN_REL_AT_HINT = 0.02;   // at/past the hint: a looser trend already counts as done
+// The DEFAULT expected_plateau_epoch when the blend schedule doesn't specify one (a schedule's own value
+// always wins). Evidence, not a guess -- the full Muon main-corpus plateau ledger as of 2026-07-17:
+// d128 2.00ep, d192 1.70, d256 2.00, d320 1.80, d448 1.90, d512 2.50, d768 2.30, ce256_prod_fixed
+// (blend+content-embed) 2.80 -- every run confirmed in [1.7, 2.8], centered on ~2. Deliberately a HINT
+// default, not a hard epoch cap: a hard stop at 2.0 would have cut d512/d768/ce256_prod_fixed short
+// while val-NELBO was still improving (their best evals landed at 2.3-2.5+). The hint instead makes a
+// genuinely flat trend CONFIRM FASTER near epoch 2 (d192's 1.7ep plateau would have confirmed earlier,
+// saving tail compute) while staying strict far from it (a slow learner at 3+ epochs keeps training).
+constexpr double DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0;
 constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
 // Muon's own reference peak lr (github.com/KellerJordan/Muon) -- unrelated in scale to AdamW's
 // batch-derived peak_lr below (Muon's orthogonalized updates have a very different magnitude/
@@ -2076,8 +2085,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 // exactly N steps (matching the flag's help), so a curriculum whose signal isn't in the base
                 // val split -- e.g. an op_curriculum blend source -- is not cut short by the base corpus
                 // plateauing. frac_epoch (this step's schedule-clock position) gates plateaued()'s own
-                // minimum-epoch floor + optional expected_plateau_epoch hint scaling -- see its own comment.
-                if (steps == 0 && plateaued(rs.evals, frac_epoch, schedule.expected_plateau_epoch)) stop = true;
+                // minimum-epoch floor + expected_plateau_epoch hint scaling -- the schedule's own value
+                // when it sets one, else DEFAULT_EXPECTED_PLATEAU_EPOCH (the evidence-based ~2-epoch
+                // Muon ledger center; see that constant's own comment for why a hint, not a hard cap).
+                if (steps == 0 && plateaued(rs.evals, frac_epoch,
+                        schedule.expected_plateau_epoch.value_or(DEFAULT_EXPECTED_PLATEAU_EPOCH))) stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // Step-rate directly (not via wps/batch): batch_t now varies per step, so a fixed
