@@ -11,9 +11,12 @@
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
 #include "sub0/muon.hpp"     // sub0::muon::newton_schulz5 -- the CPU reference the GPU Muon tests check against
+#include "sub0/scratch_slots.hpp"  // ScratchBindings/SlotEncoding + SCRATCH_SLOT_BASE -- the binding-compose
+                                   // parity tests build CPU-side bindings and the GPU-side override table
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -56,6 +59,13 @@ extern "C" int  sub0_cuda_attn_regcheck(int* stats_regs, int* stats_spill, int* 
 extern "C" int  sub0_cuda_train_reserve(int batch);
 extern "C" int  sub0_cuda_scratch_stats(long long* fwd_rows, long long* tr_rows,
                                         long long* fwd_grows, long long* tr_grows);
+extern "C" int  sub0_cuda_set_window_bindings(const int* override_idx, int n_positions,
+                                              const int* entries, int n_entries,
+                                              const int* frags, int n_frags);
+extern "C" int  sub0_cuda_binding_compose_check(int enc_sel, unsigned seed,
+                                                double* out_fwd_maxabs, double* out_fwd_maxrel,
+                                                double* out_fwd_act_maxrel,
+                                                double* out_bwd_maxabs, double* out_bwd_maxrel);
 
 namespace {
 // RAII: guarantees sub0_cuda_shutdown() runs even when a REQUIRE above throws mid-test (Catch2's
@@ -1520,6 +1530,195 @@ TEST_CASE("CUDA+CPU hybrid split: weighted-merged gradient matches an undivided 
     INFO("hybrid-merge grad rel-L2 = " << rel << "  cos = " << cos << "  gpu_loss = " << gpu_loss);
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
     else                                    REQUIRE(rel < 1e-2);
+}
+
+// ============================================================================
+//  Binding-compose parity suite (docs/BACKENDS.md "Design: binding-compose on CUDA")
+// ============================================================================
+// The first caps flip: the device composes overridden embed rows from fragment tok_emb rows
+// (param-free MeanPool/Hash/HRR arms of sub0::encode_slot). Four gates, per the design doc:
+// per-arm forward differential, per-arm backward-scatter differential (both via
+// sub0_cuda_binding_compose_check, which drives the PRODUCTION kernels through the real install
+// path against the in-process encode_slot/encode_slot_bwd reference), inertness (no table
+// installed = bit-identical logits), and an end-to-end train-step differential on a
+// binding-heavy batch. supports_binding_compose flips to 1 only with all four green on hardware.
+
+TEST_CASE("CUDA binding-compose kernels match encode_slot/encode_slot_bwd per encoder arm", "[cuda]") {
+    CudaGuard _cuda_guard;
+    if constexpr (POS_ENCODING != PosEncoding::Rope) {
+        SUCCEED("binding-compose install is RoPE-path only; Absolute build skips (install rejects)");
+        return;
+    }
+    struct Arm { int enc; const char* name; };
+    for (const Arm arm : { Arm{ static_cast<int>(sub0::SlotEncoding::MeanPool), "MeanPool" },
+                           Arm{ static_cast<int>(sub0::SlotEncoding::Hash),     "Hash" },
+                           Arm{ static_cast<int>(sub0::SlotEncoding::HRR),      "HRR" } }) {
+        double fa = 0, fr = 0, ar = 0, ba = 0, br = 0;
+        REQUIRE(sub0_cuda_binding_compose_check(arm.enc, 1234u, &fa, &fr, &ar, &ba, &br) == 0);
+        INFO(arm.name << ": fwd maxabs=" << fa << " maxrel=" << fr
+             << "  fwd(act) maxrel=" << ar << "  bwd maxabs=" << ba << " maxrel=" << br);
+        // FP32 compose math on both sides (same per-fragment accumulation order); differences are
+        // powf/cosf/sinf ulps + FMA contraction, so the FP32-store paths gate tight. The act-store
+        // path only differs by the final rounding: BF16 storage adds ~2^-8 relative, F32 nothing.
+        CHECK(fr < 5e-4);
+        CHECK(br < 5e-4);
+        if constexpr (ACT_DTYPE == Dtype::BF16) CHECK(ar < 1e-2);
+        else                                    CHECK(ar < 5e-4);
+        // Not vacuous: the composed rows genuinely differ from the plain rows they replace, so a
+        // kernel that ignored the override table entirely would fail the fwd gate by ~O(1), not ulps.
+    }
+    // Unsupported encodings must be REJECTED at install (return nonzero), never silently
+    // mis-composed -- the learned-enc_w arms and Scalar have no device kernels.
+    const int ovr[1] = { 0 };
+    for (const int bad_enc : { static_cast<int>(sub0::SlotEncoding::CharEncoder),
+                               static_cast<int>(sub0::SlotEncoding::ConvPool),
+                               static_cast<int>(sub0::SlotEncoding::Scalar) }) {
+        const int entry[3] = { 0, 1, bad_enc };
+        const int frag[1]  = { 65 };
+        CHECK(sub0_cuda_set_window_bindings(ovr, 1, entry, 1, frag, 1) != 0);
+    }
+    REQUIRE(sub0_cuda_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0) == 0);  // leave cleared
+}
+
+TEST_CASE("CUDA binding-compose is inert when no table is installed (bit-identical logits)", "[cuda]") {
+    CudaGuard _cuda_guard;
+    if constexpr (POS_ENCODING != PosEncoding::Rope) {
+        SUCCEED("binding-compose install is RoPE-path only; Absolute build skips");
+        return;
+    }
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int T = 16;
+    std::vector<int> ids(static_cast<std::size_t>(T));
+    std::mt19937 rng(58);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    for (int& x : ids) x = tok(rng);
+
+    const std::size_t n = static_cast<std::size_t>(T) * VOCAB;
+    std::vector<float> before(n), during(n), after(n);
+    REQUIRE(sub0_cuda_forward(ids.data(), 1, T, before.data()) == 0);   // never-installed baseline
+
+    // Install: position 3 composes as the MEAN of two other tokens' rows (differs from its own row
+    // under random weights), through the SAME captured graph -- proving the override branch fires
+    // inside a replay, not only on fresh launches.
+    std::vector<int> ovr(static_cast<std::size_t>(T), -1);
+    ovr[3] = 0;
+    const int entry[3] = { 0, 2, static_cast<int>(sub0::SlotEncoding::MeanPool) };
+    const int frag[2]  = { ids[5], ids[9] };
+    REQUIRE(sub0_cuda_set_window_bindings(ovr.data(), T, entry, 1, frag, 2) == 0);
+    REQUIRE(sub0_cuda_forward(ids.data(), 1, T, during.data()) == 0);
+    REQUIRE(std::memcmp(before.data(), during.data(), n * sizeof(float)) != 0);   // it DID compose
+
+    // Clear: the per-step default state must reproduce the never-installed logits BIT-identically
+    // (the kernels' no-table path is the plain lookup, untouched math -- the inertness contract).
+    REQUIRE(sub0_cuda_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0) == 0);
+    REQUIRE(sub0_cuda_forward(ids.data(), 1, T, after.data()) == 0);
+    REQUIRE(std::memcmp(before.data(), after.data(), n * sizeof(float)) == 0);
+}
+
+// End-to-end: a binding-heavy batch (scratch-slot tokens bound to per-window fragment lists,
+// ~1/4 of positions composed) trained through the DEVICE step must produce the same reduced
+// gradient as the CPU train_batch content-embed path (win_binds) -- the exact differential shape
+// of "CUDA backward matches the CPU reduced gradient" above, with the override table computed
+// host-side the way the hybrid router's follow-up will (walk ids, consult the binding views).
+TEST_CASE("CUDA binding-compose train step matches the CPU content-embed gradient", "[cuda]") {
+    CudaGuard _cuda_guard;
+    if constexpr (POS_ENCODING != PosEncoding::Rope) {
+        SUCCEED("binding-compose install is RoPE-path only; Absolute build skips");
+        return;
+    }
+    static_assert(sub0::SCRATCH_SLOT_BASE + 3 <= VOCAB, "slot ids must be in-vocab");
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 16, M = batch * T;
+    const int nslots = 3;                                   // slots 0..2 bound per window
+    for (const sub0::SlotEncoding enc : { sub0::SlotEncoding::MeanPool, sub0::SlotEncoding::Hash,
+                                          sub0::SlotEncoding::HRR }) {
+        const int enc_sel = static_cast<int>(enc);
+        std::vector<int> data, ids, targets;
+        std::vector<std::size_t> starts;
+        make_windows(batch, T, 137u + static_cast<unsigned>(enc_sel), data, starts, ids, targets);
+
+        // Per-window fragment tables (window-specific contents, lens 1..6 across (b, slot)) and
+        // slot tokens at 4 of every window's 16 positions -> binding-heavy, multiple slots reused.
+        std::mt19937 rng(211u + static_cast<unsigned>(enc_sel));
+        std::uniform_int_distribution<int> byte_tok(0, 255);       // byte-range ids, always in-vocab
+        std::vector<std::vector<std::vector<int>>> slots(static_cast<std::size_t>(batch));
+        for (int b = 0; b < batch; ++b) {
+            slots[static_cast<std::size_t>(b)].resize(sub0::SCRATCH_SLOT_COUNT);
+            for (int s = 0; s < nslots; ++s) {
+                const int len = 1 + (b + s) % 6;                   // covers len 1 .. 6
+                auto& fr = slots[static_cast<std::size_t>(b)][static_cast<std::size_t>(s)];
+                for (int p = 0; p < len; ++p) fr.push_back(byte_tok(rng));
+            }
+            for (int t = 1; t < T; t += 4)                          // positions 1,5,9,13
+                data[static_cast<std::size_t>(b) * T + t] = sub0::scratch_slot_id((t / 4) % nslots);
+        }
+        ids.assign(data.begin(), data.begin() + M);                 // refresh views over mutated data
+        targets.assign(data.begin() + 1, data.begin() + M + 1);
+
+        // CPU reference: train_batch's per-window content-embed path.
+        std::vector<sub0::ScratchBindings> binds(static_cast<std::size_t>(batch));
+        std::vector<const sub0::ScratchBindings*> winb(static_cast<std::size_t>(batch));
+        for (int b = 0; b < batch; ++b) {
+            binds[static_cast<std::size_t>(b)].slots    = slots[static_cast<std::size_t>(b)];
+            binds[static_cast<std::size_t>(b)].encoding = enc;
+            winb[static_cast<std::size_t>(b)] = &binds[static_cast<std::size_t>(b)];
+        }
+        const float cpu_loss = sub0::train_batch(data.data(), starts.data(), batch, T,
+                                                 nullptr, nullptr, winb.data());
+        const std::size_t n = sub0::trainable_floats();
+        const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+        // GPU: host-computed override table mirroring op_embed's dispatch (bound slot ids compose,
+        // everything else -- including an unbound slot id -- stays a plain lookup), then the device
+        // backward with the table installed.
+        std::vector<int> ovr(static_cast<std::size_t>(M), -1), entries, frags;
+        int ne = 0;
+        for (int m = 0; m < M; ++m) {
+            const int tokid = ids[static_cast<std::size_t>(m)];
+            if (!sub0::is_scratch_slot(tokid)) continue;
+            const auto& fr = slots[static_cast<std::size_t>(m / T)]
+                                  [static_cast<std::size_t>(tokid - sub0::SCRATCH_SLOT_BASE)];
+            if (fr.empty()) continue;
+            entries.push_back(static_cast<int>(frags.size()));
+            entries.push_back(static_cast<int>(fr.size()));
+            entries.push_back(enc_sel);
+            frags.insert(frags.end(), fr.begin(), fr.end());
+            ovr[static_cast<std::size_t>(m)] = ne++;
+        }
+        REQUIRE(ne == batch * 4);                                   // every slot position overrides
+        REQUIRE(sub0_cuda_set_window_bindings(ovr.data(), M, entries.data(), ne,
+                                              frags.data(), static_cast<int>(frags.size())) == 0);
+        std::vector<float> gpu_grad(n, 0.0f);
+        double gpu_loss = 0.0;
+        REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &gpu_loss) == 0);
+        REQUIRE(sub0_cuda_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0) == 0);  // per-step clear
+
+        double num = 0.0, den = 0.0, dot = 0.0, gn = 0.0, maxabs = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+            num += d * d; den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+            dot += static_cast<double>(gpu_grad[i]) * cpu_grad[i];
+            gn  += static_cast<double>(gpu_grad[i]) * gpu_grad[i];
+            maxabs = std::max(maxabs, std::fabs(d));
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        const double cos = dot / std::max(std::sqrt(gn * den), 1e-30);
+        INFO("enc=" << static_cast<int>(enc) << "  grad rel-L2 = " << rel << "  cos = " << cos
+             << "  max abs = " << maxabs << "  cpu_loss = " << cpu_loss << "  gpu_loss = " << gpu_loss);
+        REQUIRE(std::isfinite(gpu_loss));
+        CHECK(std::fabs(gpu_loss - static_cast<double>(cpu_loss)) < 1e-2);
+        // Same convention as the reduced-gradient test above: F32 storage gates tight; BF16 storage
+        // asserts direction (a wrong/missing compose adjoint would send the tok_emb slice sideways,
+        // far below these bands -- the per-arm scatter differential above is the tight bwd gate).
+        if constexpr (ACT_DTYPE == Dtype::BF16) CHECK(cos > 0.7);
+        else                                    CHECK(rel < 1e-2);
+    }
 }
 
 // Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
