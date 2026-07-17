@@ -108,6 +108,30 @@ implementation TU + a CMake branch, not a plugin system.
    is deliberately CUDA-like; the port is mostly mechanical) or an OpenVINO inference-only TU; add the
    `SUB0_DEVICE` CMake branch; ship its parity-test suite alongside.
 
+### Design: binding-compose on CUDA (the first caps flip -- in progress 2026-07-17)
+
+Goal: `supports_binding_compose=1` for the CUDA backend, so the hybrid router stops forcing binding
+windows (content-embed / sentinel-pair / persistent) onto the CPU. Param-free encoders only
+(MeanPool/Hash/HRR -- the learned-`enc_w` encoders keep their documented CPU/single-thread limit).
+
+- **Host-computed override table, device-composed rows.** The host already walks every window's ids and
+  owns the binding tables, so it computes, per step: `override_idx[b*T+t]` (-1 = plain lookup, else an
+  index into a flat entry array) + `entries[] = {frag_offset, frag_len, encoding}` + `frags[]`
+  (concatenated fragment token ids). One upload alongside ids/targets; a new
+  `sub0_dev_set_window_bindings(...)` seam call before `train_step`/`backward`, cleared per step.
+  Device never parses binding SEMANTICS (which token follows which sigil, which table) -- that stays
+  host-side where it already exists; the device only composes rows it is told to compose.
+- **Kernels**: `embed_kernel`/`embed_act_kernel` gain an override branch (compose fragment rows via the
+  encoder arm: mean / RoPE-rotate-sum / HRR circular-conv against a device-resident copy of
+  `hrr_role_table`); `embed_backward_token_kernel` gains the adjoint (scatter-add into fragment rows --
+  atomicAdd, same as the existing id scatter). `embed_one_body` (decode) reads the same table when
+  installed. Naive O(C^2) HRR first (parity before performance, per project rule).
+- **Parity tests** (`cuda_tests.cpp` precedent): forward differential vs CPU `encode_slot` per encoder
+  arm; backward gradient-scatter differential vs CPU `encode_slot_bwd`; inertness (no table installed =
+  bit-identical to today); then a full train-step differential on a binding-heavy synthetic batch.
+- **Flip**: `sub0_dev_caps().supports_binding_compose = 1`, and `train_stage.cpp`'s hybrid `needs_cpu`
+  becomes `!src.doc_bindings.empty() && !sub0_dev_caps().supports_binding_compose`.
+
 ### How to add a backend (checklist for the future)
 
 1. New TU implementing every `sub0_dev_*` symbol (stub + honest caps for anything unsupported).
