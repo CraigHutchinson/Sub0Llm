@@ -22,7 +22,8 @@
 
 #pragma once
 
-#include "sub0/tokenizer.hpp"   // sub0::tok::Tokenizer (pulls in casing.hpp -> the TOK_* markers)
+#include "sub0/tokenizer.hpp"     // sub0::tok::Tokenizer (pulls in casing.hpp -> the TOK_* markers)
+#include "sub0/scratch_slots.hpp" // SCRATCH_SLOT_BASE/COUNT -- the ONE canonical slot-range definition
 
 #include <algorithm>
 #include <cstdint>
@@ -60,8 +61,12 @@ constexpr int VERD_NO  = '-';   // it does not
 // a production context-translation layer would carve a much larger reserved range (a tokenizer-budget
 // follow-up). Slots are assigned in BINDING ORDER within a context (first OOV bound -> slot 0), so the
 // baked training traces and the live interceptor agree deterministically.
-constexpr int SCRATCH_BASE = casing::TOK_RESERVED_4;   // slot i == SCRATCH_BASE + i
-constexpr int SCRATCH_POOL = 6;                        // TOK_RESERVED_4..9 (the full reserved range -> max K=6)
+// Aliases of scratch_slots.hpp's canonical range constants -- NOT independent definitions. This file
+// previously hardcoded POOL=6 beside scratch_slots.hpp's derived TOK_MARKER_COUNT-based count; the two
+// agreed only by coincidence of the current marker block, and growing the reserved range would have
+// silently diverged them (this curriculum still generating 6-slot traces while the engine accepted more).
+constexpr int SCRATCH_BASE = SCRATCH_SLOT_BASE;        // slot i == SCRATCH_BASE + i
+constexpr int SCRATCH_POOL = SCRATCH_SLOT_COUNT;       // TOK_RESERVED_4..9 (the full reserved range -> max K=6)
 constexpr int scratch_slot(int i) { return SCRATCH_BASE + i; }
 
 // An OOV "word": a random lowercase byte string of length 3..6 that is NOT a single vocab piece (so it

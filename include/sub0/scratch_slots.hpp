@@ -122,15 +122,22 @@ constexpr const char* content_embed_kind_name(int idx) {
 // conditioning-embedding-amplitude, so a single binding's magnitude lands near an ordinary embedding row's).
 // Built ONCE, lazily, on first use -- C is effectively a compile-time constant (D_MODEL) for the life of a
 // process, so this is the same "cache once, reuse" shape as cpu_affinity.hpp's detect_core_order().
+// THREAD-SAFETY (the lambda-init form is load-bearing, not style): train_batch embeds windows on multiple
+// OMP worker threads, each of which reaches encode_slot(HRR) -> here on the FIRST content-embed training
+// step -- with HRR as the production content-embed default, several threads genuinely arrive concurrently.
+// A magic static's INITIALIZATION is guaranteed exactly-once/blocking by the language; a lazy
+// `if (empty()) resize+fill` after it is NOT (two threads both resizing the same vector is UB -- a real
+// latent race found in review 2026-07-16, never bitten only by first-arrival timing luck). So the whole
+// build runs inside the initializer.
 constexpr int HRR_MAX_POS = 16;
 inline const std::vector<float>& hrr_role_table(int C) {
-    static std::vector<float> table;
-    if (table.empty()) {
-        table.resize(static_cast<std::size_t>(HRR_MAX_POS) * static_cast<std::size_t>(C));
+    static const std::vector<float> table = [C] {
+        std::vector<float> t(static_cast<std::size_t>(HRR_MAX_POS) * static_cast<std::size_t>(C));
         std::mt19937 rng(0xC0FFEEu);
         std::normal_distribution<float> nd(0.f, 1.f / std::sqrt(static_cast<float>(C)));
-        for (float& x : table) x = nd(rng);
-    }
+        for (float& x : t) x = nd(rng);
+        return t;
+    }();
     return table;
 }
 
@@ -295,6 +302,17 @@ struct PersistentBindings {
     std::span<const std::vector<int>> slots;                 // slots[i] = fragments of base+i
     int                                base = 0;              // typically VOCAB; NOT compile-time (see above)
     SlotEncoding                       encoding = SlotEncoding::MeanPool;
+    // Learned-encoder weights (ConvPool [2,C,C] / CharEncoder [C,C]) + grad accumulator, mirroring
+    // ScratchBindings' own enc_w/enc_w_grad exactly -- null for the parameter-free encodings
+    // (MeanPool/Hash/HRR), REQUIRED non-null before selecting a learned one (encode_slot dereferences
+    // enc_w unconditionally for those arms; before these fields existed, the backend hardcoded nullptr
+    // at every persistent call site, so merely SETTING encoding=ConvPool here was undefined behaviour --
+    // a real hazard closed by this plumbing, found during the 2026-07-16 encoder-shootout review). Same
+    // caveat as the ephemeral pool's: enc_w_grad has no per-thread reduction, so only a single-threaded
+    // training loop may drive a learned encoder (the multi-threaded train_batch path doesn't accept
+    // PersistentBindings anyway -- see persistent_scratchspike_engine_tests.cpp).
+    const float*                       enc_w = nullptr;
+    float*                             enc_w_grad = nullptr;
 
     bool bound(int token) const {
         const int i = token - base;

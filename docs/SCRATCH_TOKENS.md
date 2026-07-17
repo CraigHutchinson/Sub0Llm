@@ -352,3 +352,98 @@ Next steps, in order:
 3. CUDA embed branch (parity-gated), gen wiring (`ScratchTable::to_bindings`), reserved-range growth, and
    an **order-aware** encoder (the first-letter task is missed by both mean-pool and the order-agnostic
    CharEncoder).
+
+## Status update (2026-07-16) — what the list above got right, and what has since shipped
+
+The next-steps list above is left as written (it was the honest plan at the time); here is what actually
+happened, so a reader doesn't chase items that are already done or superseded:
+
+- **The order-aware encoder (item 3's last clause) is DONE and is now the production default.** Three
+  order-sensitive candidates were spiked the same day (`Hash` RoPE-style positional rotation, `ConvPool`
+  char-CNN, `HRR` circular-convolution role binding — all in `scratch_slots.hpp`'s `SlotEncoding`); **HRR
+  won decisively** (mean held-out 0.744 vs MeanPool's 0.356 on the content-select probe, chance 0.333,
+  consistent across seeds) and — because it needs **no learned params** — it skipped item 2's `enc_w`
+  promotion prerequisite entirely and went straight into production: it is the `content_embed` default a
+  blend-schedule config selects (`"content_embed": "hrr"`). Route B is live, without the param-layout work
+  item 2 anticipated (that work is still real, but only for the learned encoders, CharEncoder/ConvPool,
+  which remain spike-only). Gen wiring (item 3) also shipped: `gen_stage` reads the pinned
+  `blend_schedule.json`, drives `ScratchTable::to_bindings`, and composes bound slots at decode time.
+- **"Reserved-range growth" (item 3) took a different shape than a marker-block bump: an unbounded
+  PERSISTENT range at ids `>= VOCAB`** (`PersistentBindings`, `scratch_slots.hpp`) — no tokenizer-format
+  change, engine-dispatch-tested, plus a first trained attend-only resolve spike at K=6/30 concurrent
+  slots (`persistent_scratchspike.hpp` / `[.persistent_scratchspike]`) showing real but unsaturated
+  held-out generalization well past the ephemeral pool's 6-slot cap. One hard constraint discovered and
+  worth internalizing: a persistent id has **no logit column**, so the model can *consume* one (attend to
+  it, resolve it) but can never *emit/choose* one — the associative SELECTION half of this doc's task
+  family does not transfer to that range (open research question, tracked in project memory as
+  `persistent-slot-selection-problem-backlog`). Full record + measured numbers:
+  `docs/DETERMINISTIC_MECHANISMS.md`'s persistent-slot entries.
+- The CUDA embed branch (item 3) remains NOT done — the scratch/content-embed path is still CPU-only, now
+  bridged in production by the hybrid CPU/GPU source-routed training split rather than a device kernel.
+
+## The end-state: word-level context via sentinel-pair addressing (design, 2026-07-16)
+
+**The goal, stated plainly**: a system that works on *words* (whole semantic units) instead of multi-token
+fragments. The motivating domain is **code**, where identifiers are long compounds
+(`getUserAccountBalanceById`, `parse_scan_state`) that (a) cost many tokens per mention, (b) repeat
+heavily within a file, and (c) are exactly the order-sensitive compounds a permutation-invariant composer
+would confuse (`overtake`/`takeover` — see the order-sensitive encoding section of
+DETERMINISTIC_MECHANISMS.md). Everything above (the 6-slot pool, content-derived embeddings, the
+persistent range) is infrastructure toward this; this section is the coherent end-to-end shape.
+
+**The mechanism: a `<|scratch>` sentinel PAIR.** A single reserved, in-vocab sentinel token followed by an
+ordinary index token: `<|scratch> a`. In context, the sentinel changes how the NEXT token embeds — instead
+of letter-a's static embedding row, position t gets the **composed content vector** (HRR over fragments,
+`encode_slot` — the machinery already in production) of whatever entity handle `a` is bound to in this
+context's binding table. This is not a new kind of trick for this codebase: `casing.hpp`'s own markers
+already carry documented **after-effects** (`TOK_ODQUOTE`/`TOK_SPELL_START`: the content immediately
+afterward is interpreted differently) — the pair applies the established pattern at the embedding layer.
+See also `docs/TOKENIZER_REVIEW.md` §5 (the prior-art-grounded special-token extension design this
+revives).
+
+Why the pair beats both existing ranges at what they can't do:
+- vs the **6-slot in-vocab pool**: one reserved id + the whole index-token space = unbounded addressable
+  entities (26 letters alone beat 6 slots; any-token indexing scales to thousands), and `a`-after-sentinel
+  never collides with literal `a`.
+- vs the **persistent (`>= VOCAB`) range**: the pair is EMITTABLE — both tokens have logit columns, so the
+  model can *choose* to reference entity `a` by ordinary next-token prediction. The persistent range stays
+  as the harness-side store; the pair's index dereferences INTO it (handle -> persistent binding), making
+  the pair the model-facing addressing mode over the same unbounded table. Harness-injected,
+  consumption-only references can keep using bare persistent ids (1 token instead of 2).
+- The engine change is small and local: the 3 embedding-dispatch sites (`op_embed` forward/backward,
+  `forward_one`) already substitute composed vectors per position; the pair adds an `ids[t-1] ==
+  TOK_SCRATCH` condition alongside the existing `is_scratch_slot`/`is_persistent_slot` checks.
+
+**Two honest unknowns, and the plan gates on both:**
+1. *Output-side selection is an association skill, not free pointer semantics.* Choosing a handle scores
+   against static lm_head rows (tied embeddings: literal letter rows) — the input-side override doesn't
+   help the output side. `select_task` proved the association skill at K<=6 with dedicated ids; pairs at
+   larger K need their own spike. Fallback if association walls: a pointer-style head (score handle
+   logits against the bound entities' composed vectors) — real engine work, held in reserve, not assumed.
+2. *Reserved-id headroom is currently ZERO* (`TOK_RESERVED_4..9` == the 6-slot pool; a marker-count bump
+   invalidates every checkpoint). The pool's deprecation (below) reclaims exactly what's needed — and a
+   SPIKE needs no format change at all: commandeer `TOK_RESERVED_9` as the sentinel, leaving a K<=5 pool
+   for the comparison arm.
+
+**The phased plan (each phase gated on the previous one's evidence):**
+- **Phase 0 — complete the compaction capability (in flight).** The 4-encoder shootout + a longer-budget
+  saturation run on the persistent attend-only resolve spike. The current approach compacts context and
+  needs finishing regardless of what follows.
+- **Phase 1 — handle-reference A/B on op chains (no vocab change).** Reimplement `op_curriculum`'s chain
+  references as plain-vocab ordinal handles (the graded raw-`S0` emission is a synthetic-template
+  artifact — see DETERMINISTIC_MECHANISMS.md's "interface revision slated" note) and A/B against the
+  S0-emission form. This proves the handle-association skill in the cheapest possible setting.
+- **Phase 2 — sentinel-pair spike (TOK_RESERVED_9, no format bump).** Embedding-override engine change +
+  a bind-K-entities/select-and-resolve-via-pairs curriculum; A/B against dedicated-id `select_task` at
+  K<=5, then scale K well past it. This is the novel step — pairs give BOTH unbounded addressing AND
+  model-driven selection, which neither existing range has.
+- **Phase 3 — deprecate the 6-slot pool; reclaim the ids.** Gated on phases 0-2 proving out. Frees
+  `TOK_RESERVED_4..9`: the sentinel gets a permanent id, and the remaining ids unblock the op-marker
+  dedicated-token backlog (`TOK_OP_START`/`END`) that has been waiting on this exact headroom.
+- **Phase 4 — word-level code context.** Apply to a code corpus: harness binds identifiers at first
+  mention (repeatspike proved harness-driven mid-stream binding wins decisively), later mentions become
+  pairs; ties into the multi-token pattern-compression backlog (code idioms as bound spans, not just
+  single identifiers). This is where "the model works on words" pays off: common vocabulary stays
+  ordinary tokens (the JOIN tokenizer already compresses the static half), per-context compounds become
+  single semantic units with content-derived, order-sensitive vectors, and `uncombine` remains the exact
+  bridge down to characters when spelling matters.

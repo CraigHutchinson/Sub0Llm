@@ -126,6 +126,19 @@ inject that one token; the next op derefs it), the model references `7+S0` — o
 **never make the model copy a value — let it route over *symbols/context* and let the node/binding hold the
 value.** It is also the mechanism the "collapse a result to a scratch token" note (§1b) anticipated.
 
+*Interface revision slated (2026-07-16, design review):* the COLLAPSE **principle** above stands, but the
+**reference interface** — the model literally *sampling the raw slot token* `S0` as its step-2 reference
+(the graded `g(S0)` in `op_curriculum.hpp`'s `emit_chain`) — is a synthetic-template artifact, not a
+requirement: the op executes in the scalar node *outside* the model, so the reference convention is a
+harness-side choice, and raw-id emission was picked only because the in-vocab pool made it trivially
+available. Slated reimplementation: plain-vocab **handles** (ordinal bytes, or an implicit
+"previous result" default for linear chains) that the node dereferences — same one-stable-token property,
+no slot logit column needed, which unlocks the same chaining over the *persistent* (`>= VOCAB`) range and
+feeds the conditional deprecation of the 6-in-vocab pool (project memory
+`persistent-slot-range-engine-substrate`, deprecation-plan section). The current S0-emission curriculum
+keeps running in production until the handle form is built and A/B'd against it — the mechanism is not
+being ripped out ahead of its replacement.
+
 **Repeated mentions — HARNESS-driven collapse (no model request) beats fuzzy repeat-copy, and a MID-STREAM
 binding works as well as a pre-arranged one (`[.repeatspike]`, held-out: 0.95 vs 0.13 by step 3000).** A third
 proof of the same principle, this time for *entity tracking* rather than arithmetic: an OOV word appears three
@@ -187,25 +200,37 @@ not a per-window array), so training drives the low-level forward/backward API i
 batched GPU path the bounded-pool spike uses — a real methodological difference worth remembering when
 comparing magnitudes below.
 
-Measured (d128, VOCAB=2257, 3000 steps, drilled=280/held-out=120 OOVs, identical LR-scaling rule to the
-bounded-pool spike):
+**ENCODER SHOOTOUT (2026-07-16/17, supersedes the first MeanPool-only reading):** all four viable
+encoders (MeanPool / Hash / HRR / ConvPool — CharEncoder excluded: permutation-invariant AND strictly
+dominated by ConvPool in every prior measurement at the same param cost), K=6 single-seed sanity tier +
+K=30 decision tier at **3 training seeds each** (multi-seeding was user-directed and decisively
+vindicated — see the K=30 variance below; a single-seed read would have crowned a different winner
+depending on which seed ran). ConvPool required real plumbing first: `PersistentBindings` had no
+`enc_w`/`enc_w_grad` fields and every persistent call site hardcoded `nullptr` — selecting ConvPool was
+undefined behaviour until 2026-07-16's fix (fields added, threaded through all 3 `backend_cpu.cpp`
+dispatch sites). d128, VOCAB=2257, 3000 steps/arm, drilled=280/held-out=120:
 
-| K | step 300 held-out | step 3000 held-out | step 3000 drilled |
+| encoder | K=6 held-out @3000 (1 seed) | K=30 held-out @3000, per seed | K=30 mean |
 |---|---|---|---|
-| 6  | 0.058 | 0.125 | 0.146 |
-| 30 | 0.042 | 0.225 | 0.457 |
+| MeanPool | 0.125 | 0.225 / 0.158 / 0.500 | 0.294 |
+| Hash     | 0.125 | 0.583 / 0.117 / 0.183 | 0.294 |
+| HRR      | 0.542 (still climbing) | 0.258 / 0.175 / 0.150 | 0.194 |
+| ConvPool | **0.917** (drilled 0.943 — tracking, solved) | 0.408 / 0.175 / 0.125 | 0.236 |
 
-Both K points show genuine held-out generalization (climbing steadily from near-zero, not stuck at a
-memorized-drilled-only plateau) — the core PersistentBindings dispatch + attend-only resolve mechanism IS
-learnable, including at K=30, well past what the bounded pool can even represent. But neither point had
-converged by step 3000 (both still rising at the end), held-out accuracy is well below the bounded pool's
-own saturated results at comparable scale, and K=30 shows a real drilled/held-out gap (0.457 vs 0.225) the
-K=6 point didn't (0.146 vs 0.125, tracking closely) — some memorization is creeping in at higher K, not
-pure generalization. Open question, not yet investigated: is this a step-budget ceiling (would more steps
-close the gap to the bounded pool, given both curves were still climbing) or a genuine harder-disambiguation
-wall at higher concurrent-slot counts? Do not read this as either "persistent ids work great" or "persistent
-ids don't work" — it's a real, positive, but unsaturated signal that needs more training budget before
-either conclusion is warranted.
+Three real findings. **(1) Content-carrying encoders matter enormously for RESOLVE at K=6, and the
+ranking is TASK-DEPENDENT**: ConvPool shows a clean phase transition (~step 1800) then effectively solves
+the task (0.917 held-out, drilled tracking — genuine generalization); HRR was still climbing steeply at
+cutoff (0.542); MeanPool/Hash sat at 0.125 all run. This INVERTS the content-select ranking (where HRR
+0.744 decisively beat ConvPool 0.458) — the winning encoder depends on what the composed vector is used
+FOR (one-hop content extraction vs referential matching), so per-task shootouts are the method, not a
+one-time crowning. **(2) K=30 at this budget is variance-dominated and unsaturated** — per-seed spreads
+(Hash 0.117-0.583, MeanPool 0.158-0.500) exceed every between-encoder gap; no encoder separates reliably;
+all arms still climbing. The longer-budget saturation run (already planned) is the real K=30 decision
+point. **(3) Selected default for the persistent range: ConvPool** (spike/Phase-2 default — its learned
+`enc_w` trains in-process there, no persistence needed), **HRR as the parameter-free fallback** wherever
+checkpoint persistence of `enc_w` (the still-open TODO(charencoder-production)-class work) is not yet
+built. MeanPool reproduction across the plumbing change was verified exactly (seed-1 K=6 0.125 / K=30
+0.225 pre- and post-plumbing — the enc_w threading is provably inert for parameter-free encoders).
 
 **Order-sensitive slot encoding (2026-07-16): why a compound-word cache needs more than MeanPool.**
 `encode_slot`'s pluggable `SlotEncoding` composes a bound slot's fragment sequence into one vector.

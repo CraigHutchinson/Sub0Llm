@@ -296,7 +296,8 @@ static Node* op_embed(Node* table, const int* ids, int T) {
             // persistent table is installed yet. See PersistentBindings' own comment, scratch_slots.hpp.
             const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
             encode_slot(table->data.data(), C, persistent_fragments(g_persistent_binds, ids[t]), enc,
-                        out->data.data() + static_cast<std::size_t>(t) * C, nullptr);
+                        out->data.data() + static_cast<std::size_t>(t) * C,
+                        g_persistent_binds ? g_persistent_binds->enc_w : nullptr);
         } else {
             for (int j = 0; j < C; ++j) o[t, j] = tab[ids[t], j];
         }
@@ -613,7 +614,9 @@ static void backward_node(Node& n) {
                 const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
                 encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
                                 persistent_fragments(g_persistent_binds, n.ids[t]), enc,
-                                n.w->grad.data(), n.w->data.data(), nullptr, nullptr);
+                                n.w->grad.data(), n.w->data.data(),
+                                g_persistent_binds ? g_persistent_binds->enc_w : nullptr,
+                                g_persistent_binds ? g_persistent_binds->enc_w_grad : nullptr);
             } else {
                 for (int j = 0; j < C; ++j) wg[n.ids[t], j] += ng[t, j];
             }
@@ -1085,9 +1088,11 @@ struct Model {
                         g_scratch_binds->enc_w);
         } else if (is_persistent_slot(id, VOCAB)) {
             // Same unconditional guard as op_embed's forward branch (backend_cpu.cpp) -- see its
-            // comment. Decode never runs backward, so this path only needs the forward compose.
+            // comment. Decode never runs backward, so this path only needs the forward compose (enc_w,
+            // never enc_w_grad).
             const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
-            encode_slot(tok_emb->data.data(), C, persistent_fragments(g_persistent_binds, id), enc, h, nullptr);
+            encode_slot(tok_emb->data.data(), C, persistent_fragments(g_persistent_binds, id), enc, h,
+                        g_persistent_binds ? g_persistent_binds->enc_w : nullptr);
         } else {
             const float* emb = tok_emb->data.data() + static_cast<size_t>(id) * C;
             for (int j = 0; j < C; ++j) h[j] = emb[j];
