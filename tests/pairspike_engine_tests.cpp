@@ -29,6 +29,7 @@
 #include "sub0/window.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -96,15 +97,20 @@ bool run_task(const ps::Task& k, bool use_override, sub0::SlotEncoding enc, cons
     return sig == kSigil && handle == k.answer_handle;
 }
 
+// Eval task GENERATION stays serial (rng consumption order defines the eval set -- must stay identical
+// across runs/threads); SCORING parallelizes over tasks (g_kv, the binding installs, and run_task's
+// state are all per-thread -- the pragma degrades to serial if OpenMP is off for this TU).
 Acc eval_select(int K, const std::vector<std::string>& oovs, bool use_override, sub0::SlotEncoding enc,
                 const float* enc_w, unsigned seed) {
-    Acc a;
+    std::vector<ps::Task> tasks;
     std::mt19937_64 rng(seed);
-    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
-        const ps::Task k = ps::pick_select_pair_task(kSigil, oovs, qi, K, rng);
-        a.ok += run_task(k, use_override, enc, enc_w); ++a.n;
-    }
-    return a;
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi)
+        tasks.push_back(ps::pick_select_pair_task(kSigil, oovs, qi, K, rng));
+    int ok = 0;
+    #pragma omp parallel for reduction(+ : ok) schedule(dynamic)
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i)
+        ok += run_task(tasks[static_cast<std::size_t>(i)], use_override, enc, enc_w);
+    return { ok, static_cast<int>(tasks.size()) };
 }
 
 void reset_opt_state() {
@@ -113,15 +119,40 @@ void reset_opt_state() {
     std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.f);
 }
 
-// Single-threaded per-window loop (set_sentinel_bindings is per-window thread state; ConvPool's
-// enc_w_grad has no per-thread reduction), EpochWalk sampling, same shape as the persistent spike's.
+// Training loop. PARAM-FREE encoders (all Route-A arms + the one-hop MeanPool/Hash/HRR arms) take the
+// MULTI-THREADED path: train_batch's win_sentinel per-window binding arrays (2026-07-17 -- see
+// core.hpp's train_batch comment), all cores instead of one, ~10-15x faster iteration. LEARNED-encoder
+// arms (ConvPool: enc_w_grad has no per-thread reduction) keep the single-threaded manual loop -- the
+// documented CharEncoder-class limit. EpochWalk drives window selection identically in both paths.
 void train_steps(const ps::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng, int window,
                  bool use_override, sub0::SlotEncoding enc, DocWalk& walk,
                  std::vector<float>* enc_w, std::vector<float>* enc_w_grad, EncAdam* ea) {
+    const bool learned = (enc_w != nullptr);
     std::vector<int> masked_tgt(static_cast<std::size_t>(window));
+    std::vector<std::size_t> starts(static_cast<std::size_t>(kBatch));
+    std::vector<int>         lens(static_cast<std::size_t>(kBatch));
+    std::vector<sub0::SentinelBindings>        sbs(static_cast<std::size_t>(kBatch));
+    std::vector<const sub0::SentinelBindings*> sb_ptrs(static_cast<std::size_t>(kBatch));
     for (int s = 0; s < steps; ++s) {
         opt.zero_grad();
         if (enc_w_grad) std::fill(enc_w_grad->begin(), enc_w_grad->end(), 0.f);
+        if (!learned) {   // multi-threaded: prepare the whole batch, hand it to train_batch
+            for (int b = 0; b < kBatch; ++b) {
+                const std::size_t d   = walk.next(rng);
+                const std::size_t ds_ = ds.doc_starts[d], de = ds.doc_starts[d + 1];
+                starts[static_cast<std::size_t>(b)] = ds_;
+                lens[static_cast<std::size_t>(b)]   = static_cast<int>(std::min<std::size_t>(
+                                                          static_cast<std::size_t>(window), de - ds_ - 1));
+                sbs[static_cast<std::size_t>(b)] = sub0::SentinelBindings{
+                    std::span<const std::vector<int>>(ds.doc_bindings[d]), kSigil, ps::HANDLE_BASE, enc };
+                sb_ptrs[static_cast<std::size_t>(b)] = &sbs[static_cast<std::size_t>(b)];
+            }
+            (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, window, lens.data(),
+                                    ds.mask.data(), nullptr, use_override ? sb_ptrs.data() : nullptr,
+                                    nullptr);
+            opt.step();
+            continue;
+        }
         for (int b = 0; b < kBatch; ++b) {
             const std::size_t d   = walk.next(rng);
             const std::size_t ds_ = ds.doc_starts[d], de = ds.doc_starts[d + 1];
@@ -301,13 +332,15 @@ bool run_task_cot(const ps::Task& k, bool use_override, sub0::SlotEncoding enc) 
 
 Acc eval_select_cot(int K, const std::vector<std::string>& oovs, bool use_override, sub0::SlotEncoding enc,
                     unsigned seed) {
-    Acc a;
+    std::vector<ps::Task> tasks;   // serial generation, parallel scoring -- see eval_select's comment
     std::mt19937_64 rng(seed);
-    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
-        const ps::Task k = ps::pick_select_pair_cot_task(kSigil, oovs, qi, K, rng);
-        a.ok += run_task_cot(k, use_override, enc); ++a.n;
-    }
-    return a;
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi)
+        tasks.push_back(ps::pick_select_pair_cot_task(kSigil, oovs, qi, K, rng));
+    int ok = 0;
+    #pragma omp parallel for reduction(+ : ok) schedule(dynamic)
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i)
+        ok += run_task_cot(tasks[static_cast<std::size_t>(i)], use_override, enc);
+    return { ok, static_cast<int>(tasks.size()) };
 }
 
 void run_pair_cot_experiment(const char* arm_name, int kK, bool use_override, sub0::SlotEncoding enc,
@@ -342,7 +375,11 @@ void run_pair_cot_experiment(const char* arm_name, int kK, bool use_override, su
                          "  (resolve every pair via live UNCOMBINE, restate the query locally, verdict,\n"
                          "   then COPY the matching pair -- the proven local-CoT scaffold; chance ~= 1/K)\n";
 
-    double sum_final_held = 0.0;
+    // THREE-PILLAR reporting (correctness / performance / memory -- standing shootout policy,
+    // 2026-07-17): accuracy alone can crown an arm that pays a hidden step-cost or memory tax, so every
+    // arm reports wall-clock alongside accuracy; memory is a static per-encoder fact (param-free arms
+    // add 0 bytes; a learned encoder adds enc_w + grads + moments) stated in the summary.
+    double sum_final_held = 0.0, sum_train_s = 0.0, sum_eval_s = 0.0;
     for (unsigned seed : seeds) {
         sub0::build_model();
         reset_opt_state();
@@ -352,10 +389,15 @@ void run_pair_cot_experiment(const char* arm_name, int kK, bool use_override, su
         DocWalk walk(ds.doc_starts.size() - 1);
         double last_held = 0.0;
         for (int r = 0; r < kEvalRounds; ++r) {
+            const auto t0 = std::chrono::steady_clock::now();
             train_steps(ds, opt, kStepsPerEval, rng, window, use_override, enc, walk,
                         nullptr, nullptr, nullptr);
+            const auto t1 = std::chrono::steady_clock::now();
             const Acc d = eval_select_cot(kK, split.drilled,  use_override, enc, /*seed=*/7);
             const Acc h = eval_select_cot(kK, split.held_out, use_override, enc, /*seed=*/11);
+            const auto t2 = std::chrono::steady_clock::now();
+            sum_train_s += std::chrono::duration<double>(t1 - t0).count();
+            sum_eval_s  += std::chrono::duration<double>(t2 - t1).count();
             last_held = h.rate();
             char line[192];
             std::snprintf(line, sizeof line, "  step %5d | DRILLED sel=%.3f | HELD-OUT sel=%.3f\n",
@@ -365,9 +407,12 @@ void run_pair_cot_experiment(const char* arm_name, int kK, bool use_override, su
         REQUIRE(std::isfinite(last_held));
         sum_final_held += last_held;
     }
-    char mean_line[128];
-    std::snprintf(mean_line, sizeof mean_line, "  MEAN final held-out over %zu seed(s): %.3f\n",
-                  seeds.size(), sum_final_held / static_cast<double>(seeds.size()));
+    const double n_seeds = static_cast<double>(seeds.size());
+    char mean_line[256];
+    std::snprintf(mean_line, sizeof mean_line,
+                  "  MEAN final held-out over %zu seed(s): %.3f | train %.0fs/seed, eval %.0fs/seed | "
+                  "encoder mem: +0 B (param-free)\n",
+                  seeds.size(), sum_final_held / n_seeds, sum_train_s / n_seeds, sum_eval_s / n_seeds);
     report += mean_line;
     WARN(report);
 }
