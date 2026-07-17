@@ -85,6 +85,12 @@
 // param/optimizer arenas only at eval/checkpoint boundaries (where the CPU eval/save/preview code
 // runs unchanged). The device path is gradient/AdamW parity-tested against this CPU backend.
 #if defined(SUB0_BUILD_CUDA)
+// The canonical, backend-neutral seam declarations (docs/BACKENDS.md). Included here FIRST so the
+// legacy sub0_cuda_* declarations below are cross-checked by the compiler against the canonical ones --
+// any signature drift between this file's copies and the seam header is a compile error, not a silent
+// link hazard. The declarations below become redundant (and go away) as this file migrates its calls to
+// the sub0_dev_* neutral names; until then they document exactly which entry points this stage uses.
+#include "sub0/device_backend.hpp"
 // init/shutdown/upload_params/set_tf32 come from sub0/decode.hpp (shared with the decode fast path);
 // only the training-specific device entry points are declared here.
 // [[nodiscard]] on every status-code return here: a discarded return is exactly the class of bug
