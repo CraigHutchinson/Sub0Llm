@@ -271,22 +271,46 @@ static inline float dsilu_fast(float v) {
 // re-consults it (same thread, same step), so no per-node storage is needed.
 thread_local const ScratchBindings* g_scratch_binds = nullptr;
 
-// Persistent (unbounded) slot range -- SPIKE, see scratch_slots.hpp's PersistentBindings comment. Plain
-// global (NOT thread_local): read-only, immutable for the process once set via set_persistent_bindings
-// (its implementation lives near set_scratch_bindings below), so every thread safely reads the same
-// pointer with no synchronization. null (the default) => no id is ever persistent-slot-bound.
-const PersistentBindings* g_persistent_binds = nullptr;
+// Persistent (unbounded) slot range -- SPIKE, see scratch_slots.hpp's PersistentBindings comment.
+// thread_local since 2026-07-17 (originally a plain process-global under a "set once, immutable" design):
+// real spike usage swaps a DIFFERENT per-document table per training window, and train_batch's
+// win_persist path installs per-window tables on every worker thread -- the same per-thread lifetime
+// g_scratch_binds always had. A caller wanting the original whole-process behavior just sets it once on
+// each thread that forwards (or once on the only thread, the common case).
+thread_local const PersistentBindings* g_persistent_binds = nullptr;
+
+// Sentinel-PAIR bindings -- SPIKE, see scratch_slots.hpp's SentinelBindings comment: the token AFTER the
+// sentinel embeds from the binding table keyed by that token. Same per-window thread_local lifetime as
+// g_scratch_binds above.
+thread_local const SentinelBindings* g_sentinel_binds = nullptr;
+
+// The CALLING THREAD's token-embedding table node, registered by Model::build_layout (each worker thread
+// lays out its own Node arena, so this must be thread_local, not a single global). The binding dispatches
+// in op_embed/backward gate on it: a scratch-slot id (~282-287, just above the byte range) IS a valid
+// POSITION id once SEQ_LEN >= 283 (e.g. the production d448 fineweb config's SEQ_LEN=512), so without
+// this gate an Absolute-positional-encoding model training with content-embed would silently compose
+// position rows 282-287 from POS-TABLE "fragments" -- a latent bug found in the Phase-2 review
+// (2026-07-17; latent only because every production config uses RoPE, which never embeds positions
+// through op_embed). The old comment here claimed positions "never satisfy is_scratch_slot" -- false
+// past SEQ_LEN 282.
+thread_local const Node* g_tok_emb_node = nullptr;
 
 static Node* op_embed(Node* table, const int* ids, int T) {
     const int C = table->cols;
     Node* out = mk_node(Op::Embed, T, C);
     out->w = table; out->ids = ids;
     Mat o = mat(out->data, T, C), tab = mat(table->data, table->rows, C);
-    const ScratchBindings* binds = g_scratch_binds;   // null (the common case) => plain lookup, unchanged
+    const ScratchBindings*  binds = g_scratch_binds;    // null (the common case) => plain lookup, unchanged
+    const SentinelBindings* sb    = g_sentinel_binds;
+    const bool tok_table = (table == g_tok_emb_node);   // binding dispatches are TOKEN-table-only (above)
     for (int t = 0; t < T; ++t) {
-        // A bound scratch slot embeds from its fragments; pos_emb ids (small positions) never satisfy
-        // is_scratch_slot, so this branch is naturally inert for the position table.
-        if (binds && is_scratch_slot(ids[t]) && binds->bound(ids[t])) {
+        // Sentinel PAIR first (most specific): the token AFTER the sigil embeds from its handle's
+        // binding. t==0 can't be a pair tail (a pair split across a window boundary degrades to the
+        // plain rows -- benign: the reference simply isn't content-composed in that window).
+        if (sb && tok_table && t > 0 && ids[t - 1] == sb->sigil && sb->bound(ids[t])) {
+            encode_slot(table->data.data(), C, sb->fragments(ids[t]), sb->encoding,
+                        out->data.data() + static_cast<std::size_t>(t) * C, sb->enc_w);
+        } else if (binds && tok_table && is_scratch_slot(ids[t]) && binds->bound(ids[t])) {
             encode_slot(table->data.data(), C, binds->fragments(ids[t]), binds->encoding,
                         out->data.data() + static_cast<std::size_t>(t) * C, binds->enc_w);
         } else if (is_persistent_slot(ids[t], VOCAB)) {
@@ -599,11 +623,18 @@ static void backward_node(Node& n) {
     case Op::Embed: {
         const int T = n.rows, C = n.cols;
         Mat wg = mat(n.w->grad, n.w->rows, C), ng = mat(n.grad, T, C);
-        const ScratchBindings* binds = g_scratch_binds;
+        const ScratchBindings*  binds = g_scratch_binds;
+        const SentinelBindings* sb    = g_sentinel_binds;
+        const bool tok_table = (n.w == g_tok_emb_node);   // same token-table-only gate as the forward
         for (int t = 0; t < T; ++t) {
-            // Adjoint of op_embed's content-derived branch: a bound scratch slot's row grad flows to its
-            // fragment rows (encode_slot_bwd); else the plain scatter into the token's own row.
-            if (binds && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t])) {
+            // Adjoint of op_embed's content-derived branches: a composed position's row grad flows to its
+            // fragment rows (encode_slot_bwd); else the plain scatter into the token's own row. The
+            // dispatch conditions mirror the forward EXACTLY (same pair/slot/persistent precedence).
+            if (sb && tok_table && t > 0 && n.ids[t - 1] == sb->sigil && sb->bound(n.ids[t])) {
+                encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
+                                sb->fragments(n.ids[t]), sb->encoding, n.w->grad.data(),
+                                n.w->data.data(), sb->enc_w, sb->enc_w_grad);
+            } else if (binds && tok_table && is_scratch_slot(n.ids[t]) && binds->bound(n.ids[t])) {
                 encode_slot_bwd(n.grad.data() + static_cast<std::size_t>(t) * C, C,
                                 binds->fragments(n.ids[t]), binds->encoding, n.w->grad.data(),
                                 n.w->data.data(), binds->enc_w, binds->enc_w_grad);
@@ -972,6 +1003,7 @@ struct Model {
     void build_layout() {
         W->pused = 0; W->pcount = 0;
         tok_emb = mk_param(VOCAB, D_MODEL, false);
+        g_tok_emb_node = tok_emb;   // register THIS thread's token table for op_embed's binding gate
         pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
         for (auto& L : layers) {
             L.ln1 = mk_param(1, D_MODEL, false);
@@ -1078,12 +1110,23 @@ struct Model {
     // [0, SEQ_LEN). Dense weights only -- callers gate on !USE_TERNARY.
     const float* forward_one(int id, int pos) {
         static thread_local std::array<float, VOCAB> logits;
+        // Sentinel-pair detection needs the PREVIOUS fed token: decode feeds positions strictly
+        // sequentially (prefill 0..n-1, then one per generated token), so "previous" is simply the last
+        // (id,pos) this thread fed -- valid only when pos follows it directly. No explicit reset needed:
+        // a NEW generation starts at pos 0, and 0 == prev_pos+1 is unsatisfiable for any real prev_pos
+        // (>= 0), so a previous generation's tail can never leak in as this one's sigil.
+        static thread_local int prev_id = -1, prev_pos = -2;
+        const int prev = (pos == prev_pos + 1) ? prev_id : -1;
+        prev_id = id; prev_pos = pos;
         constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
         float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
 
-        if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
+        if (g_sentinel_binds && prev == g_sentinel_binds->sigil && g_sentinel_binds->bound(id)) {
+            encode_slot(tok_emb->data.data(), C, g_sentinel_binds->fragments(id), g_sentinel_binds->encoding,
+                        h, g_sentinel_binds->enc_w);
+        } else if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
             encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
                         g_scratch_binds->enc_w);
         } else if (is_persistent_slot(id, VOCAB)) {
@@ -1211,6 +1254,10 @@ void set_scratch_bindings(const ScratchBindings* b) { g_scratch_binds = b; }
 // set. The pointee must outlive every subsequent forward/forward_one/backward until cleared or replaced.
 void set_persistent_bindings(const PersistentBindings* b) { g_persistent_binds = b; }
 
+// Install (or clear) the sentinel-pair table for THIS thread (declared near g_scratch_binds above --
+// same per-context/per-window lifetime as set_scratch_bindings, unlike the process-global persistent one).
+void set_sentinel_bindings(const SentinelBindings* b) { g_sentinel_binds = b; }
+
 // save_model / load_model live in engine_core.cpp: serialization is backend-agnostic
 // and goes through params_ptr() + the host/device sync hooks.
 
@@ -1284,7 +1331,9 @@ void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.get()); }
 // op_cross_entropy skips (no loss, no grad) and normalizes around. null = today's behavior.
 float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                   const int* lengths, const std::uint8_t* loss_mask,
-                  const ScratchBindings* const* win_binds) {
+                  const ScratchBindings* const* win_binds,
+                  const SentinelBindings* const* win_sentinel,
+                  const PersistentBindings* const* win_persist) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
@@ -1305,16 +1354,21 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                 }
                 tgt = masked_tgt.data();
             }
-            // Install this window's scratch-slot bindings (content-derived slot embeddings) for its
-            // forward+backward on this worker thread; cleared right after so it never leaks to the next
-            // window or beyond this call. null when unused -> plain tok_emb lookup.
-            if (win_binds) set_scratch_bindings(win_binds[b]);
+            // Install this window's binding views (any combination of the three) for its
+            // forward+backward on this worker thread; cleared right after so nothing leaks to the next
+            // window or beyond this call. All three setters write thread_local state, so per-window
+            // per-worker installation is race-free by construction.
+            if (win_binds)    set_scratch_bindings(win_binds[b]);
+            if (win_sentinel) set_sentinel_bindings(win_sentinel[b]);
+            if (win_persist)  set_persistent_bindings(win_persist[b]);
             graph_reset();
             Node* logits = g_model.forward(data + starts[b], Tb);
             Node* loss   = op_cross_entropy(logits, tgt);
             total += loss->data[0];
             backward(loss, 1.f / static_cast<float>(batch));
-            if (win_binds) set_scratch_bindings(nullptr);
+            if (win_binds)    set_scratch_bindings(nullptr);
+            if (win_sentinel) set_sentinel_bindings(nullptr);
+            if (win_persist)  set_persistent_bindings(nullptr);
         }
         // (implicit barrier above: every thread's grad slot is complete)
         const int nthreads = omp_get_num_threads();

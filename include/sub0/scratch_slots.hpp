@@ -327,6 +327,40 @@ struct PersistentBindings {
 
 constexpr bool is_persistent_slot(int token, int base) { return token >= base; }
 
+// --- Sentinel-PAIR bindings -- SPIKE (Phase 2 of docs/SCRATCH_TOKENS.md's word-level plan) -----------
+// A THIRD addressing mode, complementing the bounded pool (dedicated ids, model-emittable, capped) and
+// the persistent range (unbounded, consumption-only): a reserved SENTINEL token followed by an ordinary
+// in-vocab index token -- `<sigil> h` -- where the sentinel changes how the NEXT position embeds. The
+// index token's position gets the entity's composed content vector (encode_slot over slots[h-index_base])
+// instead of its own static row; the sentinel position embeds normally (its own reserved-id row). Both
+// tokens have logit columns, so the model can EMIT a pair -- selection over an unbounded entity space
+// becomes ordinary next-token prediction, which neither other range offers (the pool is emittable but
+// capped; the persistent range is unbounded but can never be predicted). Precedent: casing.hpp's own
+// markers already carry documented after-effects (TOK_ODQUOTE/TOK_SPELL_START change how following
+// content is interpreted) -- this applies that established pattern at the embedding layer.
+// `sigil` is caller-supplied (the SPIKE commandeers casing::TOK_RESERVED_9; a permanent id comes from the
+// bounded pool's deprecation reclaiming the reserved block -- see the plan doc), same reasoning as
+// PersistentBindings' runtime `base`. Same lifetime/threading as ScratchBindings (per-context, swapped
+// per window, thread_local global in the backend) and the same enc_w contract as the other two views.
+struct SentinelBindings {
+    std::span<const std::vector<int>> slots;                 // slots[i] = fragments of handle index_base+i
+    int                                sigil = 0;             // the sentinel token id (spike: TOK_RESERVED_9)
+    int                                index_base = 'a';      // handle token for slot 0 ('a','b',... = 0,1,...)
+    SlotEncoding                       encoding = SlotEncoding::MeanPool;
+    const float*                       enc_w = nullptr;       // learned encoders only (ConvPool/CharEncoder)
+    float*                             enc_w_grad = nullptr;
+
+    bool bound(int handle_tok) const {
+        const int i = handle_tok - index_base;
+        return i >= 0 && i < static_cast<int>(slots.size()) && !slots[static_cast<std::size_t>(i)].empty();
+    }
+    std::span<const int> fragments(int handle_tok) const {
+        const int i = handle_tok - index_base;
+        if (i < 0 || i >= static_cast<int>(slots.size())) return {};
+        return std::span<const int>(slots[static_cast<std::size_t>(i)]);
+    }
+};
+
 // Null-safe fragment lookup: no table set, or `token` not bound in it, -> an EMPTY span (encode_slot's
 // documented empty-fragments contract is a zero row) rather than requiring every call site to branch on
 // `pb` being null. This is what lets engine call sites route EVERY id >= base through the same compose

@@ -112,13 +112,21 @@ SUB0_API const float* forward_one(int id, int pos);
 struct ScratchBindings;
 SUB0_API void set_scratch_bindings(const ScratchBindings* bindings);
 // Persistent (unbounded) slot range -- SPIKE, see scratch_slots.hpp's own comment on PersistentBindings
-// for the full design. Unlike set_scratch_bindings above, this is GLOBAL (not per-thread/per-window):
-// the table is read-only and immutable for the process once set, so every thread reads the same pointer
-// with no synchronization needed. null clears it -> no id is ever treated as persistent-slot-bound
-// (id >= VOCAB then composes an all-zero row rather than falling through to a raw table lookup -- see
-// is_persistent_slot's own comment for why that fallthrough must never happen).
+// for the full design. Per-THREAD state like set_scratch_bindings (2026-07-17; originally a process
+// global under a "set once, immutable" design -- real spike usage swaps per-document tables per training
+// window, and train_batch's win_persist path installs them per worker thread). A caller wanting
+// whole-process behavior sets it once on each thread that forwards (or once, on the only thread). null
+// clears it -> no id is ever treated as persistent-slot-bound (id >= VOCAB then composes an all-zero row
+// rather than falling through to a raw table lookup -- see is_persistent_slot's own comment for why that
+// fallthrough must never happen).
 struct PersistentBindings;
 SUB0_API void set_persistent_bindings(const PersistentBindings* bindings);
+// Sentinel-PAIR bindings -- SPIKE (Phase 2 of docs/SCRATCH_TOKENS.md's word-level plan): `<sigil> h`
+// pairs where the token AFTER the sentinel embeds from the binding table keyed by that token. Same
+// per-context/per-window thread_local lifetime as set_scratch_bindings (swapped per window on the
+// installing thread), null clears. See scratch_slots.hpp's SentinelBindings for the full design.
+struct SentinelBindings;
+SUB0_API void set_sentinel_bindings(const SentinelBindings* bindings);
 // A target of LOSS_IGNORE_INDEX means "do not train on this position": cross_entropy adds no loss and
 // no gradient for it, and normalizes by the count of ACTIVE (non-ignored) positions (PyTorch's
 // `ignore_index` + reduction='mean'). Valid token ids are [0,VOCAB), so a negative is unambiguous.
@@ -141,9 +149,18 @@ SUB0_API void  reduce_gradients();                              // publish singl
 // `win_binds`, if non-null, is a per-window array of `batch` pointers: win_binds[b] installs window b's
 // scratch-slot bindings (content-derived slot embeddings) for its forward+backward, null for none. Each
 // pointee must outlive this call. null (the default) => no content embeddings, today's behavior exactly.
+// `win_sentinel`/`win_persist` extend the same per-window pattern to the OTHER two binding views
+// (sentinel pairs / the persistent id>=VOCAB range) so their spikes can use this multi-threaded path
+// instead of a single-core manual loop (a ~#cores speedup, 2026-07-17). Same contract as win_binds:
+// per-window pointers, pointees outlive the call, null entries/arrays = that view uninstalled.
+// LEARNED-encoder caveat carries over unchanged: a bindings entry carrying a non-null enc_w_grad must
+// NOT be trained through this multi-threaded path (no per-thread reduction on encoder grads -- the
+// documented CharEncoder/ConvPool single-thread limit); parameter-free encodings only.
 SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                            const int* lengths = nullptr, const std::uint8_t* loss_mask = nullptr,
-                           const ScratchBindings* const* win_binds = nullptr);
+                           const ScratchBindings* const* win_binds = nullptr,
+                           const SentinelBindings* const* win_sentinel = nullptr,
+                           const PersistentBindings* const* win_persist = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 // AdamW by default; optionally a HYBRID Muon+AdamW split when `use_muon` is set: the hidden 2D GEMM
