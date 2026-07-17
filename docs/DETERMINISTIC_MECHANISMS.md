@@ -232,6 +232,16 @@ checkpoint persistence of `enc_w` (the still-open TODO(charencoder-production)-c
 built. MeanPool reproduction across the plumbing change was verified exactly (seed-1 K=6 0.125 / K=30
 0.225 pre- and post-plumbing — the enc_w threading is provably inert for parameter-free encoders).
 
+*Epoch-walk follow-up (2026-07-17)*: re-running the two wildest-variance K=30 arms under an
+exactly-once-per-epoch shuffled document walk (`SampleMode::EpochWalk`,
+`[.persistent_scratchspike_walk]`) split the sampling hypothesis: seed spread did NOT shrink (variance is
+optimization-basin entry, not coverage luck — the chain A/B's zero variance at 1.000×3 corroborates), but
+the walk consistently lifted MeanPool (mean 0.294→0.583; worst walk seed beats random's median) and its
+seed 3 hit **0.875 held-out at K=30 with plain MeanPool** — a clean phase transition and the best K=30
+result from any configuration. So: EpochWalk is the spike-training default going forward (confound
+removed, never worse), and **K=30 resolve is demonstrably solvable — the remaining problem is basin-entry
+probability within budget, not encoder choice or model capability**.
+
 **Order-sensitive slot encoding (2026-07-16): why a compound-word cache needs more than MeanPool.**
 `encode_slot`'s pluggable `SlotEncoding` composes a bound slot's fragment sequence into one vector.
 `MeanPool` and `CharEncoder` (a learned per-fragment `[C,C]` projection + relu, sum-pooled) are BOTH

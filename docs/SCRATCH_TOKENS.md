@@ -429,10 +429,12 @@ Why the pair beats both existing ranges at what they can't do:
 - **Phase 0 — complete the compaction capability (in flight).** The 4-encoder shootout + a longer-budget
   saturation run on the persistent attend-only resolve spike. The current approach compacts context and
   needs finishing regardless of what follows.
-- **Phase 1 — handle-reference A/B on op chains (no vocab change).** Reimplement `op_curriculum`'s chain
-  references as plain-vocab ordinal handles (the graded raw-`S0` emission is a synthetic-template
-  artifact — see DETERMINISTIC_MECHANISMS.md's "interface revision slated" note) and A/B against the
-  S0-emission form. This proves the handle-association skill in the cheapest possible setting.
+- **Phase 1 — handle-reference A/B on op chains (no vocab change). ✅ DONE (2026-07-17), gate PASSED
+  decisively**: a plain-byte `$k` pair reference (`bind::make_handle_collapse_callback`, pre-substitution
+  deref — production parser untouched) scores **1.000 on every seed, identical to the reserved-slot arm**
+  (DIGIT control at its known wall: 0.055/0.000/0.000 finals). The one-stable-symbol property is what
+  matters, not the reserved id — the association skill fully survives the 2-token pair cost, with zero
+  seed variance. `[.chaincapstone]`'s 3-arm × 3-seed A/B/C is the pinned record.
 - **Phase 2 — sentinel-pair spike (TOK_RESERVED_9, no format bump).** Embedding-override engine change +
   a bind-K-entities/select-and-resolve-via-pairs curriculum; A/B against dedicated-id `select_task` at
   K<=5, then scale K well past it. This is the novel step — pairs give BOTH unbounded addressing AND

@@ -154,6 +154,34 @@ void reset_opt_state() {
 // model's param arena, so the model's own optimizer never sees them).
 struct EncAdam { std::vector<float> m, v; long t = 0; };
 
+// How training windows are drawn from the dataset:
+//   RandomWindows -- sample_window's i.i.d. uniform-position draws (with replacement): per-doc training
+//                    counts over a finite budget are Poisson-distributed (some traces drilled ~2x more
+//                    than others), a coverage confound that inflates seed-to-seed spread on
+//                    capability-edge tasks.
+//   EpochWalk     -- a shuffled exactly-once-per-epoch walk over documents (reshuffled each epoch): every
+//                    trace is trained the same number of times per epoch, removing the coverage confound
+//                    so any REMAINING seed variance isolates optimization-path effects (which basin the
+//                    model falls into). User-hypothesized (2026-07-17) as the K=30 shootout's variance
+//                    source -- the walk arms exist to test that hypothesis, not as a presumed fix.
+enum class SampleMode { RandomWindows, EpochWalk };
+
+// The shuffled epoch walk: doc indices in a permutation, re-shuffled every full pass. Consumes the SAME
+// rng the random-window path uses, so seeds stay comparable across modes.
+struct DocWalk {
+    std::vector<std::size_t> perm;
+    std::size_t pos = 0;
+    explicit DocWalk(std::size_t n_docs) : perm(n_docs) {
+        for (std::size_t i = 0; i < n_docs; ++i) perm[i] = i;
+    }
+    std::size_t next(std::mt19937& rng) {
+        if (pos == 0) std::shuffle(perm.begin(), perm.end(), rng);
+        const std::size_t d = perm[pos];
+        pos = (pos + 1) % perm.size();
+        return d;
+    }
+};
+
 // Manual per-window forward/backward training loop -- train_batch does not accept PersistentBindings (a
 // single global, not a per-window array), so this drives the low-level API directly, one window at a
 // time, accumulating gradient across the batch before opt.step() -- the exact shape
@@ -166,14 +194,26 @@ struct EncAdam { std::vector<float> m, v; long t = 0; };
 // (matching train_ce_steps' encoder block) applies after each model step.
 void train_steps(const pss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng, int window,
                  sub0::SlotEncoding enc, std::vector<float>* enc_w = nullptr,
-                 std::vector<float>* enc_w_grad = nullptr, EncAdam* ea = nullptr) {
+                 std::vector<float>* enc_w_grad = nullptr, EncAdam* ea = nullptr,
+                 SampleMode mode = SampleMode::RandomWindows, DocWalk* walk = nullptr) {
     std::vector<int> masked_tgt(static_cast<std::size_t>(window));
     for (int s = 0; s < steps; ++s) {
         opt.zero_grad();
         if (enc_w_grad) std::fill(enc_w_grad->begin(), enc_w_grad->end(), 0.f);
         for (int b = 0; b < kBatch; ++b) {
-            const sub0::Window w = sub0::sample_window(rng, window, ds.tokens.size(),
-                                                       std::span<const std::uint64_t>(ds.doc_starts));
+            sub0::Window w;
+            if (mode == SampleMode::EpochWalk) {
+                // Every task trace fits the window by construction (see the window sizing in
+                // run_persistent_multi_experiment), so a walked "window" is simply the whole doc: start
+                // at its first token, train its len-1 (input,target) pairs.
+                const std::size_t d  = walk->next(rng);
+                const std::size_t ds_ = ds.doc_starts[d], de = ds.doc_starts[d + 1];
+                w = sub0::Window{ ds_, static_cast<int>(std::min<std::size_t>(
+                                            static_cast<std::size_t>(window), de - ds_ - 1)) };
+            } else {
+                w = sub0::sample_window(rng, window, ds.tokens.size(),
+                                        std::span<const std::uint64_t>(ds.doc_starts));
+            }
             const int Tb = w.len;
             for (int i = 0; i < Tb; ++i) {
                 const std::size_t p = w.start + static_cast<std::size_t>(i) + 1;
@@ -229,7 +269,8 @@ const char* enc_name(sub0::SlotEncoding enc) {
 // looked strong and a 3-seed follow-up that tempered it. K=30 (the decision point) runs 3 seeds; K=6
 // stays single-seed (a sanity tier -- every encoder is expected to be roughly equivalent there).
 void run_persistent_multi_experiment(int K, sub0::SlotEncoding enc,
-                                     std::initializer_list<unsigned> seeds) {
+                                     std::initializer_list<unsigned> seeds,
+                                     SampleMode mode = SampleMode::RandomWindows) {
     // Worst-case trace length for this K: K preamble refs + 3 query tokens + up to 8 resolve tokens
     // (TOK_UNCOMBINE + up to 6 fragment bytes + TOK_UNCOMBINE_END) + 3 answer tokens (SEP + byte + EOS).
     // Generous margin over that, capped at SEQ_LEN (train_steps' own `window` contract).
@@ -258,6 +299,7 @@ void run_persistent_multi_experiment(int K, sub0::SlotEncoding enc,
 
     std::string report = "\n=== persistent_scratchspike MULTI-binding (K=" + std::to_string(K) +
                          " slots/context, enc=" + enc_name(enc) +
+                         ", sampling=" + (mode == SampleMode::EpochWalk ? "epoch-walk" : "random-windows") +
                          ", PERSISTENT range [VOCAB.." + std::to_string(VOCAB + K - 1) +
                          "], VOCAB=" + std::to_string(VOCAB) + " D_MODEL=" + std::to_string(D_MODEL) +
                          " window=" + std::to_string(window) +
@@ -292,11 +334,12 @@ void run_persistent_multi_experiment(int K, sub0::SlotEncoding enc,
         report += "  -- seed " + std::to_string(seed) + " --\n";
         sub0::AdamW opt(kLr);
         std::mt19937 rng(seed);
+        DocWalk walk(ds.doc_starts.size() - 1);   // doc i spans [doc_starts[i], doc_starts[i+1])
         double last_held = 0.0;
         for (int r = 0; r < kEvalRounds; ++r) {
             train_steps(ds, opt, kStepsPerEval, rng, window, enc,
                         learned ? &enc_w : nullptr, learned ? &enc_w_grad : nullptr,
-                        learned ? &ea : nullptr);
+                        learned ? &ea : nullptr, mode, &walk);
             const Acc d = eval_multi(ops, split.drilled, K, /*seed=*/7);
             const Acc h = eval_multi(ops, split.held_out, K, /*seed=*/11);
             last_held = h.rate();
@@ -362,4 +405,21 @@ TEST_CASE("persistent_scratchspike: multi-binding resolve at K=30, ConvPool (enc
          "enc_w via the single-threaded encoder-AdamW loop)",
          "[.persistent_scratchspike][.persistent_scratchspike_convpool]") {
     run_persistent_multi_experiment(30, sub0::SlotEncoding::ConvPool, {1, 2, 3});
+}
+
+// EPOCH-WALK variance experiment (own tag, not part of the encoder shootout): the K=30 random-windows
+// arms showed seed spreads (MeanPool 0.158-0.500, Hash 0.117-0.583) larger than every between-encoder
+// gap. Hypothesis (user, 2026-07-17): i.i.d. window sampling's Poisson-uneven per-doc coverage is the
+// variance source, and an exactly-once-per-epoch shuffled walk removes it. These two arms re-run the two
+// WILDEST-variance configurations under the walk, same seeds/budget -- spread collapsing vs persisting
+// tells us whether the culprit is coverage (fix: walk everywhere in spike training) or optimization-basin
+// sensitivity (fix: LR/curriculum work, sampling was innocent).
+TEST_CASE("persistent_scratchspike: K=30 MeanPool, EPOCH-WALK sampling (variance-source experiment)",
+         "[.persistent_scratchspike_walk]") {
+    run_persistent_multi_experiment(30, sub0::SlotEncoding::MeanPool, {1, 2, 3}, SampleMode::EpochWalk);
+}
+
+TEST_CASE("persistent_scratchspike: K=30 Hash, EPOCH-WALK sampling (variance-source experiment)",
+         "[.persistent_scratchspike_walk]") {
+    run_persistent_multi_experiment(30, sub0::SlotEncoding::Hash, {1, 2, 3}, SampleMode::EpochWalk);
 }
