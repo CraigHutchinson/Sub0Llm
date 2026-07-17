@@ -193,41 +193,64 @@ Prob2 gen_prob2(std::mt19937_64& rng, int maxdig) {
     return q;
 }
 
+// The three REFERENCE-INTERFACE arms (see docs/DETERMINISTIC_MECHANISMS.md "interface revision slated"
+// and docs/SCRATCH_TOKENS.md's sentinel-pair plan, Phase 1):
+//   Digit  -- the intermediate stays as digits the model must copy (the known wall, ~0.095).
+//   Slot   -- COLLAPSE to a reserved slot token the model re-emits (the known win, ~1.000) -- requires a
+//             dedicated in-vocab id per intermediate, which is exactly what the deprecation plan removes.
+//   Handle -- COLLAPSE to a plain-byte `$k` pair (bind::HANDLE_SIGIL + ordinal digit; no reserved ids at
+//             all). Same one-stable-symbol property as Slot but 2 tokens per reference, association-only
+//             (no content-carrying embedding -- that upgrade is Phase 2's sentinel). THE Phase-1 question:
+//             does the chaining win survive the reserved-id-free interface?
+enum class ChainArm { Digit, Slot, Handle };
+
 // `A+B = [op math] <r1> . 7+<r1> = [op math] <r2> .`  -- the injected result is separated from the step-2
-// expression by `. `, so `7+<r1>` is what the node reads; `<r1>` there is the reference the model reproduces.
-void emit_chain(Pool& p, const Prob2& q, bool collapse) {
+// expression by `. `, so `7+<r1>` is what the node reads; `<r1>` there is the reference the model
+// reproduces: digits / the slot token / the `$k` handle pair, per arm.
+void emit_chain(Pool& p, const Prob2& q, ChainArm arm) {
     const std::size_t s0 = p.tok.size();
     auto g = [&](int t) { p.tok.push_back(t); p.mask.push_back(1); };
     auto m = [&](int t) { p.tok.push_back(t); p.mask.push_back(0); };
+    auto result_ref = [&](auto& put, int ordinal, int slot_tok, const std::string& digits) {
+        switch (arm) {
+            case ChainArm::Slot:   put(slot_tok); break;
+            case ChainArm::Handle: put(sub0::bind::HANDLE_SIGIL); put('0' + ordinal); break;
+            case ChainArm::Digit:  for (char c : digits) put(static_cast<unsigned char>(c)); break;
+        }
+    };
     for (char c : q.A) g(static_cast<unsigned char>(c)); g('+'); for (char c : q.B) g(static_cast<unsigned char>(c)); g('=');
-    for (int t : nd::op_header("math")) g(t);                                    // step-1 route
-    if (collapse) m(SLOTA); else for (char c : q.r1) m(static_cast<unsigned char>(c));   // step-1 result (masked)
-    g('.'); g(' '); g('7'); g('+');                                             // separator + step-2 expr start
-    if (collapse) g(SLOTA); else for (char c : q.r1) g(static_cast<unsigned char>(c));   // step-2 REFERENCE (variable)
+    for (int t : nd::op_header("math")) g(t);                 // step-1 route
+    result_ref(m, 0, SLOTA, q.r1);                            // step-1 result (masked -- harness-injected)
+    g('.'); g(' '); g('7'); g('+');                           // separator + step-2 expr start
+    result_ref(g, 0, SLOTA, q.r1);                            // step-2 REFERENCE (graded -- the model's copy)
     g('=');
-    for (int t : nd::op_header("math")) g(t);                                    // step-2 route
-    if (collapse) m(SLOTB); else for (char c : q.r2) m(static_cast<unsigned char>(c));   // step-2 result (masked)
+    for (int t : nd::op_header("math")) g(t);                 // step-2 route
+    result_ref(m, 1, SLOTB, q.r2);                            // step-2 result (masked)
     g('.');
     p.start.push_back(s0); p.len.push_back(static_cast<int>(p.tok.size() - s0));
 }
 
-Pool build_pool2(std::mt19937_64& rng, int n, int maxdig, bool collapse) {
+Pool build_pool2(std::mt19937_64& rng, int n, int maxdig, ChainArm arm) {
     Pool p;
-    for (int i = 0; i < n; ++i) emit_chain(p, gen_prob2(rng, maxdig), collapse);
+    for (int i = 0; i < n; ++i) emit_chain(p, gen_prob2(rng, maxdig), arm);
     return p;
 }
 
-double run_chain_arm(std::string& report, const char* name, bool collapse) {
-    std::mt19937_64 dsrng(collapse ? 5150ULL : 6160ULL);
-    const Pool pool = build_pool2(dsrng, 6000, 2, collapse);
+// One arm x one training seed: dataset + train rng derive from `seed` identically across arms (unlike the
+// original 2-arm form's per-arm magic seeds), so arms differ ONLY in the reference interface -- and seeds
+// give the spread the shootout's own K=30 variance finding showed is essential before trusting any gap.
+double run_chain_arm(std::string& report, const char* name, ChainArm arm, unsigned seed) {
+    std::mt19937_64 dsrng(seed * 1000ULL + static_cast<unsigned>(arm));
+    const Pool pool = build_pool2(dsrng, 6000, 2, arm);
     sub0::build_model();
     reset_opt_state();
     sub0::AdamW opt(0.0015f * (128.0f / static_cast<float>(D_MODEL)));
-    std::mt19937 rng(collapse ? 21 : 22);
+    std::mt19937 rng(seed);
 
     std::vector<std::string> slots;
-    const auto compute     = nd::make_compute_callback(nd::builtin());
-    const auto collapse_cb = sub0::bind::make_collapse_callback(nd::builtin(), &slots);
+    const auto compute   = nd::make_compute_callback(nd::builtin());
+    const auto slot_cb   = sub0::bind::make_collapse_callback(nd::builtin(), &slots);
+    const auto handle_cb = sub0::bind::make_handle_collapse_callback(nd::builtin(), &slots);
 
     double best = 0.0;
     for (int r = 0; r < 14; ++r) {
@@ -240,19 +263,21 @@ double run_chain_arm(std::string& report, const char* name, bool collapse) {
             for (char c : q.A) ctx.push_back(static_cast<unsigned char>(c));
             ctx.push_back('+'); for (char c : q.B) ctx.push_back(static_cast<unsigned char>(c)); ctx.push_back('=');
             std::string got;
-            if (collapse) {
-                slots.clear();
-                sub0::kv_decode_generate(ctx, 30, 1.f, 1, grng, cas::TOK_EOS, false, {}, {}, {}, collapse_cb, nd::FRAME_CLOSE);
-                got = slots.empty() ? std::string{} : slots.back();
-            } else {
+            if (arm == ChainArm::Digit) {
                 sub0::kv_decode_generate(ctx, 30, 1.f, 1, grng, cas::TOK_EOS, false, {}, {}, {}, compute, nd::FRAME_CLOSE);
                 got = extract_last(ctx);
+            } else {
+                slots.clear();
+                const auto& cb = (arm == ChainArm::Slot) ? slot_cb : handle_cb;
+                sub0::kv_decode_generate(ctx, 30, 1.f, 1, grng, cas::TOK_EOS, false, {}, {}, {}, cb, nd::FRAME_CLOSE);
+                got = slots.empty() ? std::string{} : slots.back();
             }
             ok += (got == q.r2); ++n;
         }
         best = std::max(best, ok / double(n));
         char line[96];
-        std::snprintf(line, sizeof line, "  %-8s step %5d | final-answer exact=%.3f\n", name, (r + 1) * 300, ok / double(n));
+        std::snprintf(line, sizeof line, "  %-8s seed %u step %5d | final-answer exact=%.3f\n",
+                      name, seed, (r + 1) * 300, ok / double(n));
         report += line;
     }
     return best;
@@ -260,16 +285,27 @@ double run_chain_arm(std::string& report, const char* name, bool collapse) {
 
 }  // namespace
 
-TEST_CASE("gsm8k chaining A/B: collapse (slot ref) vs digit-copy for a 2-step chain", "[.chaincapstone]") {
-    std::string report = "\n=== gsm8k chaining A/B (d" + std::to_string(D_MODEL) +
-        "): 2-step  R2 = 7 + (A+B), step 2 must REFERENCE the intermediate ===\n";
-    const double digit    = run_chain_arm(report, "DIGIT", /*collapse=*/false);
-    const double collapse = run_chain_arm(report, "COLLAPSE", /*collapse=*/true);
-    char tail[160];
+TEST_CASE("gsm8k chaining A/B/C: slot-token vs $-handle vs digit-copy references for a 2-step chain",
+         "[.chaincapstone]") {
+    std::string report = "\n=== gsm8k chaining A/B/C (d" + std::to_string(D_MODEL) +
+        "): 2-step  R2 = 7 + (A+B), step 2 must REFERENCE the intermediate ===\n"
+        "  (Phase 1 of the sentinel-pair plan: does the collapse win survive a reserved-id-free\n"
+        "   `$k` handle-pair reference? -- see docs/SCRATCH_TOKENS.md)\n";
+    constexpr unsigned kSeeds[] = {1, 2, 3};
+    double sum_digit = 0.0, sum_slot = 0.0, sum_handle = 0.0;
+    for (unsigned seed : kSeeds) {
+        sum_digit  += run_chain_arm(report, "DIGIT",  ChainArm::Digit,  seed);
+        sum_slot   += run_chain_arm(report, "SLOT",   ChainArm::Slot,   seed);
+        sum_handle += run_chain_arm(report, "HANDLE", ChainArm::Handle, seed);
+    }
+    const double n = static_cast<double>(std::size(kSeeds));
+    char tail[224];
     std::snprintf(tail, sizeof tail,
-        "  => DIGIT (copy multi-digit R1) best=%.3f  vs  COLLAPSE (one-token slot ref) best=%.3f\n", digit, collapse);
+        "  => MEAN best over %zu seeds: DIGIT (copy digits) %.3f | SLOT (reserved-id ref) %.3f | "
+        "HANDLE ($k pair ref) %.3f\n", std::size(kSeeds), sum_digit / n, sum_slot / n, sum_handle / n);
     report += tail;
     WARN(report);
-    REQUIRE(std::isfinite(digit));
-    REQUIRE(std::isfinite(collapse));
+    REQUIRE(std::isfinite(sum_digit));
+    REQUIRE(std::isfinite(sum_slot));
+    REQUIRE(std::isfinite(sum_handle));
 }

@@ -68,4 +68,50 @@ make_collapse_callback(nodes::Registry reg, std::vector<std::string>* slots) {
     };
 }
 
+// --- HANDLE collapse (Phase 1 of the sentinel-pair plan, docs/SCRATCH_TOKENS.md "end-state" section) ---
+// Same collapse semantics as make_collapse_callback above, but the in-stream reference is a PLAIN-BYTE
+// PAIR `$k` (HANDLE_SIGIL + ordinal digit -- both ordinary, already-in-vocab byte tokens) instead of a
+// reserved slot token. Motivation (see DETERMINISTIC_MECHANISMS.md "interface revision slated"): the
+// model emitting a RAW reserved slot id was a synthetic-template artifact; a handle pair needs no
+// reserved id at all, so the same chaining works over ANY binding store (including the persistent
+// id>=VOCAB range, where raw ids can never be emitted) and frees the reserved-marker headroom the
+// sentinel-pair plan reclaims. The pair costs 2 tokens per reference vs 1 -- the A/B this exists for
+// measures whether the association skill survives that trade ([.chaincapstone]'s HANDLE arm).
+//
+// Dereference is a PRE-SUBSTITUTION over the context copy handed to the node (every `$k` pair whose k is
+// bound becomes its value's digit tokens) -- the production expression parser is untouched; the harness
+// resolves references before the node ever sees the expression, exactly the "deterministic node reads
+// what the harness resolved" division of labour. Phase 2 upgrades the sigil to a reserved <|scratch>
+// sentinel whose FOLLOWING token embeds from the binding (content-carrying) -- this plain-byte form is
+// deliberately the association-only control arm for that upgrade.
+constexpr int HANDLE_SIGIL = '$';   // never appears in the synthetic arithmetic traces otherwise
+
+inline std::function<std::vector<int>(const std::vector<int>&)>
+make_handle_collapse_callback(nodes::Registry reg, std::vector<std::string>* slots) {
+    auto inner = nodes::make_compute_callback(std::move(reg), {});   // no slot-token deref: handles only
+    return [inner = std::move(inner), slots](const std::vector<int>& ctx) -> std::vector<int> {
+        std::vector<int> sub;                                  // ctx with every bound `$k` pair substituted
+        sub.reserve(ctx.size());
+        for (std::size_t i = 0; i < ctx.size(); ++i) {
+            if (ctx[i] == HANDLE_SIGIL && i + 1 < ctx.size() && ctx[i + 1] >= '0' && ctx[i + 1] <= '9') {
+                const int k = ctx[i + 1] - '0';
+                if (slots && k < static_cast<int>(slots->size())) {
+                    for (char c : (*slots)[static_cast<std::size_t>(k)]) sub.push_back(static_cast<unsigned char>(c));
+                    ++i;                                       // consumed the ordinal too
+                    continue;
+                }
+            }
+            sub.push_back(ctx[i]);
+        }
+        const std::vector<int> r = inner(sub);                 // [FRAME_OPEN <result> FRAME_CLOSE] or {}
+        if (r.empty()) return r;
+        std::string val;
+        for (int t : r) if (t != nodes::FRAME_OPEN && t != nodes::FRAME_CLOSE) val.push_back(static_cast<char>(t));
+        const int idx = static_cast<int>(slots->size());
+        if (val.empty() || idx > 9) return r;                  // ordinal digits only -> 10 handles; plenty for a spike
+        slots->push_back(val);
+        return { HANDLE_SIGIL, '0' + idx };                    // COLLAPSE: inject the two-byte handle pair
+    };
+}
+
 }  // namespace sub0::bind
