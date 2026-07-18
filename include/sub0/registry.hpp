@@ -267,20 +267,30 @@ inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
     std::error_code ec; std::filesystem::create_directories(dir, ec);
     std::ofstream os(dir / "meta.txt", std::ios::trunc);
     if (!os) return;
+    // Enum-valued fields print as NAMES (gated_ffn=on, optimizer=muon, pos_encoding=rope, ...) for
+    // readability, reusing config.json's OWN int<->name mapping (detail::enum_name) rather than a
+    // second, hand-rolled one -- the two files can never disagree about what a value means. Falls
+    // back to the raw int for a field/value enum_name doesn't recognize, matching json_write_field's
+    // own fallback exactly.
+    auto field = [&os](const char* name, int v) {
+        os << name << '=';
+        if (const char* nm = detail::enum_name(name, v)) os << nm; else os << v;
+        os << '\n';
+    };
     os << "model=sub0llm\n"
        << "corpus="          << m.corpus    << "\n"
        << "d_model="         << m.d_model   << "\n"
        << "n_layers="        << m.n_layers  << "\n"
        << "n_heads="         << m.n_heads   << "\n"
        << "seq_len="         << m.seq_len   << "\n"
-       << "vocab="           << m.vocab     << "\n"
-       << "ternary="         << m.ternary   << "\n"
-       << "pos_encoding="    << m.pos_encoding << "\n"
-       << "gated_ffn="       << m.gated_ffn << "\n"
-       << "tied_embeddings=" << m.tied_embeddings << "\n"
-       << "qk_norm="         << m.qk_norm << "\n"
-       << "optimizer="       << m.optimizer << "\n"
-       << "git_sha="         << m.git_sha   << "\n"
+       << "vocab="           << m.vocab     << "\n";
+    field("ternary",         m.ternary);
+    field("pos_encoding",    m.pos_encoding);
+    field("gated_ffn",       m.gated_ffn);
+    field("tied_embeddings", m.tied_embeddings);
+    field("qk_norm",         m.qk_norm);
+    field("optimizer",       m.optimizer);
+    os << "git_sha="         << m.git_sha   << "\n"
        << "created="         << m.created   << "\n"
        << "updated="         << m.updated   << "\n"
        << "steps="           << m.steps     << "\n"
@@ -297,6 +307,12 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
     std::ifstream is(dir / "meta.txt");
     if (!is) return false;
     auto as_int = [](const std::string& s) { int v = 0; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
+    // Enum-valued fields accept EITHER form: a name (written by this build) or a raw int (an older
+    // meta.txt written before this fix) -- same dual-acceptance contract config.json's reader already
+    // has, via the SAME detail::enum_parse mapping so the two files never drift apart.
+    auto as_enum = [&](const char* field, const std::string& s) {
+        int v = 0; return detail::enum_parse(field, s, v) ? v : as_int(s);
+    };
     for (std::string line; std::getline(is, line);) {
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -311,12 +327,12 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
         else if (k == "n_heads")        m.n_heads = as_int(v);
         else if (k == "seq_len")        m.seq_len = as_int(v);
         else if (k == "vocab")          m.vocab = as_int(v);
-        else if (k == "ternary")        m.ternary = as_int(v);
-        else if (k == "pos_encoding")   m.pos_encoding = as_int(v);
-        else if (k == "gated_ffn")      m.gated_ffn = as_int(v);
-        else if (k == "tied_embeddings") m.tied_embeddings = as_int(v);
-        else if (k == "qk_norm")        m.qk_norm = as_int(v);
-        else if (k == "optimizer")      m.optimizer = as_int(v);
+        else if (k == "ternary")        m.ternary = as_enum("ternary", v);
+        else if (k == "pos_encoding")   m.pos_encoding = as_enum("pos_encoding", v);
+        else if (k == "gated_ffn")      m.gated_ffn = as_enum("gated_ffn", v);
+        else if (k == "tied_embeddings") m.tied_embeddings = as_enum("tied_embeddings", v);
+        else if (k == "qk_norm")        m.qk_norm = as_enum("qk_norm", v);
+        else if (k == "optimizer")      m.optimizer = as_enum("optimizer", v);
         else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
         else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
         else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);
