@@ -1113,6 +1113,56 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                             "can't auto-enable content-embed/scratch on `gen` later. Use a directory-style "
                             "path instead (e.g. '{}/model') to get the full model-directory layout.",
                             model_path, model_path);
+        // Two more explicit-path footguns, both hit for real this session (project memory
+        // blended-scratch-op-capstone-validated): an explicit path whose directory component
+        // resolves to the shared models ROOT itself, or to a directory another model already
+        // occupies. Either way config.json/meta.txt/blend_schedule.json/corpus.tok/tokenizer.tok --
+        // all written per-DIRECTORY, not per-basename -- get silently shared/overwritten between
+        // unrelated model names: launch model A here, then model B here too (different basename,
+        // same directory), and B's run reads/writes A's config.json and pinned blend_schedule.json.
+        // The real incident this closes: a 3-source --blend-config silently trained only 2 sources
+        // because an earlier smoke test's 2-source schedule was still pinned in a directory a second,
+        // differently-named run also pointed at -- no error, no warning, just quietly wrong training
+        // data until someone reads the log closely enough to notice a missing "blend: '...'" line.
+        // Unlike the bare-filename case above (an unusual but legitimate choice to skip the directory
+        // layout entirely), there is no legitimate reason for two different model names to share a
+        // directory -- refuse outright rather than warn, matching SingleInstanceGuard's own precedent
+        // of refusing an unambiguous conflict rather than merely logging it.
+        if (!meta_dir.empty()) {
+            std::error_code ec;
+            const std::filesystem::path canon_meta = std::filesystem::weakly_canonical(meta_dir, ec);
+            const std::filesystem::path canon_root =
+                ec ? std::filesystem::path() : std::filesystem::weakly_canonical(
+                                                    std::filesystem::path(SUB0_MODELS_ROOT), ec);
+            if (!ec && canon_meta == canon_root) {
+                sub0::log::error(
+                    "train: '{}' resolves to the shared models root itself ('{}'), not a dedicated "
+                    "model directory -- every model needs its OWN subdirectory (e.g. '{}/{}/model') "
+                    "so its config.json/blend_schedule.json/corpus.tok aren't silently shared with "
+                    "every other model. Refusing to start.",
+                    model_path, SUB0_MODELS_ROOT, SUB0_MODELS_ROOT,
+                    std::filesystem::path(model_path).stem().string());
+                return 1;
+            }
+            const std::string our_stem = std::filesystem::path(model_path).filename().string();
+            std::string foreign;
+            for (const auto& de : std::filesystem::directory_iterator(meta_dir, ec)) {
+                if (ec) break;
+                const std::string name = de.path().filename().string();
+                if (name.compare(0, our_stem.size(), our_stem) == 0) continue;   // ours (weights/.stepN.ckpt)
+                if (name == "config.json" || name == "meta.txt" || name == "blend_schedule.json" ||
+                    name == "train.log" || name == "corpus.tok" || name == "tokenizer.tok") continue;
+                if (name.find(".ckpt") != std::string::npos) { foreign = name; break; }   // unambiguous
+            }
+            if (!foreign.empty()) {
+                sub0::log::error(
+                    "train: '{}' already holds a DIFFERENT model's checkpoint ('{}' in '{}') -- "
+                    "starting here would silently share/overwrite that model's config.json/"
+                    "blend_schedule.json/corpus.tok. Point at a dedicated subdirectory instead.",
+                    model_path, foreign, meta_dir.string());
+                return 1;
+            }
+        }
     } else {
         // No explicit path: find the most recent model dir with the SAME corpus + architecture
         // (registry::compatible() -- dims/flags, deliberately NOT the git SHA, see registry.hpp's
