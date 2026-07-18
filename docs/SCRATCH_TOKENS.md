@@ -495,11 +495,15 @@ mentions collapse to the bound slot, composed in the SAME document with `op_curr
 arithmetic-result collapse (both mechanisms share the one 6-slot pool, proven collision-free at the
 engine level by `tests/blended_capstone_engine_tests.cpp`'s `[blended]` case). `[.wordspike]`
 (`tests/wordspike_engine_tests.cpp`) is the matched FUZZY-vs-COLLAPSE A/B, mirroring `[.repeatspike]`'s
-own methodology, extended to score op-delegation and name-carry together.
+own methodology -- scoring op-delegation accuracy with the collapse resolved by the harness before
+generation starts (matching training's own teacher-forced shape; an earlier version of this eval asked
+free generation to produce the collapse point itself, which `emit_doc`'s masking makes an unsupported
+claim -- see `wordspike.hpp`'s `EvalProblem` comment). Op accuracy reaches 1.00 in both arms.
 
-**A bigger, deliberately-deferred idea this surfaces**: apply the same repeat-collapse to the REAL base
-corpus at `configure` time (`tools/configurator.cpp`'s tokenize pass), not just the small synthetic
-`wordspike` curriculum -- teaching the pattern at full corpus scale. Real, separate scope (touches the
-configurator, not gen/decode), gated on `wordspike` first proving the mechanism generalizes at all on the
-cheap synthetic curriculum -- the same "prove the mechanism before the engineering" sequencing this
-whole document follows throughout.
+**The deliberately-deferred idea above has since been picked up**: `include/sub0/corpus_collapse.hpp` (a
+`"corpus_collapse"` blend-schedule source) applies the SAME mechanism to a sampled subset of REAL corpus
+documents at TRAIN time, not a `configure`-time, `corpus.tok`-format-changing pass as originally sketched
+here -- `corpus.tok` carries no mask array, so baking collapse directly into it would force either a
+breaking format change or an unproven "predict the slot from real exposure" capability claim wordspike's
+own capstone never tested. See `docs/CORPUS_COLLAPSE.md` for the full design record, including that
+configure-time/format-changing version, now recorded there as the further, still-deferred promotion.

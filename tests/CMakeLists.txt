@@ -18,6 +18,7 @@ add_executable(sub0_tests
   scratchspike_engine_tests.cpp
   repeatspike_engine_tests.cpp
   wordspike_engine_tests.cpp
+  corpus_collapse_engine_tests.cpp
   persistent_slots_engine_tests.cpp
   persistent_scratchspike_engine_tests.cpp
   pairspike_engine_tests.cpp

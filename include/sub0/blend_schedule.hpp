@@ -73,6 +73,7 @@ struct SourceSpec {
     // engine resolves or validates.
     std::string corpus;
     std::string generator;   // non-empty => "scratchspike" | "op_curriculum" | "spellspike" | "wordspike"
+                              //              | "corpus_collapse"
     std::string gsm8k_path;  // op_curriculum only: a real GSM8K file instead of the synthetic generator
     // Generator knobs, defaulting to today's train_stage.cpp-hardcoded values when unset (-1 sentinel).
     // Safety clamps (SCRATCH_POOL, the SEQ_LEN-derived contains_k/max_digits ceilings) are enforced by the
@@ -80,7 +81,8 @@ struct SourceSpec {
     int    n_oov         = -1;   // scratchspike: OOV pool size (default 400)
     int    tasks_per_oov = -1;   // scratchspike (default 12)
     int    contains_k    = -1;   // scratchspike: content-reasoning sub-curriculum size (default derived)
-    int    n_examples    = -1;   // op_curriculum synthetic (default 6000)
+    int    n_examples    = -1;   // op_curriculum synthetic (default 6000); also corpus_collapse's
+                                  // sampled-document count (n_docs, default 3000)
     double chain_frac    = -1.0; // op_curriculum synthetic (default 0.4)
     int    max_digits    = -1;   // op_curriculum synthetic (default derived)
     int    tasks_per_word = -1;  // spellspike (default 12)

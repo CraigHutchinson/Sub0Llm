@@ -35,6 +35,7 @@
 #include "sub0/scratch_slots.hpp" // ScratchBindings / SlotEncoding -- content-derived scratch-slot embeddings
 #include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (an "op_curriculum" schedule source)
 #include "sub0/wordspike.hpp"    // natural-prose word-collapse + op-delegation curriculum (a "wordspike" schedule source)
+#include "sub0/corpus_collapse.hpp" // wordspike's mechanism over sampled REAL corpus docs (a "corpus_collapse" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -1571,11 +1572,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // see gen_stage.cpp's own union-across-stages rewiring for the matching gen-time concern.
     const bool have_binding_source = std::any_of(schedule.sources.begin(), schedule.sources.end(),
         [](const sub0::SourceSpec& s) { return s.generator == "scratchspike" || s.generator == "op_curriculum"
-                                             || s.generator == "wordspike"; });
+                                             || s.generator == "wordspike" || s.generator == "corpus_collapse"; });
     bool content_embed_active = schedule.content_embed.has_value() && have_binding_source;
     if (schedule.content_embed && !have_binding_source)
         sub0::log::warn("train: blend schedule sets content_embed but declares no scratchspike/"
-                        "op_curriculum/wordspike source to bind from -- disabled");
+                        "op_curriculum/wordspike/corpus_collapse source to bind from -- disabled");
     const int content_embed_kind = content_embed_active
         ? static_cast<int>(*schedule.content_embed) : static_cast<int>(sub0::ContentEmbedKind::MeanPool);
 
@@ -1717,6 +1718,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<sub0::scratchspike::Dataset>  scratch_dss(schedule.sources.size());
     std::vector<sub0::op_curriculum::Dataset> op_dss(schedule.sources.size());
     std::vector<sub0::wordspike::Dataset>     word_dss(schedule.sources.size());
+    std::vector<sub0::corpus_collapse::Dataset> corpus_collapse_dss(schedule.sources.size());
     std::size_t kBaseSource = static_cast<std::size_t>(-1);   // sentinel: no corpus-typed source this run
 
     for (std::size_t i = 0; i < schedule.sources.size(); ++i) {
@@ -1820,6 +1822,32 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
             sub0::log::line("blend: '{}' natural-prose word-collapse + op-delegation curriculum "
                             "({} examples, {} tokens)", spec.name, ds.doc_starts.size() - 1, ds.tokens.size());
+        } else if (spec.generator == "corpus_collapse") {
+            // Scales wordspike's proven mechanism to a sampled subset of REAL corpus documents (see
+            // docs/CORPUS_COLLAPSE.md). Document boundaries are load-bearing (a fresh ScratchTable resets
+            // per document) -- the on-demand/no-corpus.tok path (--corpus-pretok 0) never populates
+            // `doc_index`, so this generator cannot degrade gracefully the way flat sampling does
+            // elsewhere; fail loudly rather than silently build a source whose windows could sample past
+            // an empty/zero-length view (a real crash risk in sample_window, not just a quality concern).
+            if (doc_index.empty()) {
+                sub0::log::error("train: blend source '{}' (corpus_collapse) needs a real corpus.tok with "
+                                 "document boundaries -- rebuild with --corpus-pretok 1, or drop this "
+                                 "source from the schedule", spec.name);
+                return 1;
+            }
+            sub0::corpus_collapse::Options copt;
+            copt.seed = static_cast<std::uint64_t>(seed) ^ 0xC0125C011A95EULL;   // distinct stream
+            copt.n_docs = spec.n_examples > 0 ? spec.n_examples : 3000;
+            copt.max_doc_tokens = SEQ_LEN - 2;   // whole document must fit one training window
+            corpus_collapse_dss[i] = sub0::corpus_collapse::build_dataset(tk, train_span, doc_index,
+                                                                           est_train_tokens, copt);
+            const sub0::corpus_collapse::Dataset& ds = corpus_collapse_dss[i];
+            sources.push_back(sub0::BlendSource{ spec.name,
+                sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
+                std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask),
+                std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
+            sub0::log::line("blend: '{}' corpus-scale word-collapse curriculum ({} real documents "
+                            "sampled, {} tokens)", spec.name, ds.doc_starts.size() - 1, ds.tokens.size());
         } else {
             sub0::log::error("train: blend source '{}' has unrecognized generator '{}'",
                              spec.name, spec.generator);

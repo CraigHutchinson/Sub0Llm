@@ -158,7 +158,8 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                              || generator_ever_active(schedule, "scratchspike"));
         const bool scratch_on = have_schedule && generator_ever_active(schedule, "scratchspike");
         const bool op_on = have_schedule && generator_ever_active(schedule, "op_curriculum");
-        const bool word_on = have_schedule && generator_ever_active(schedule, "wordspike");
+        const bool word_on = have_schedule && (generator_ever_active(schedule, "wordspike")
+                                             || generator_ever_active(schedule, "corpus_collapse"));
         if (sp_on || op_on || word_on) {
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
