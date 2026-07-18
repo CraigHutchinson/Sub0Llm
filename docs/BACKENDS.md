@@ -98,9 +98,19 @@ implementation TU + a CMake branch, not a plugin system.
    are stubs (fail-fast returns + a `"none"` caps struct), so consumers can drop their own `#if`
    scaffolding as they migrate. `sub0_dev_caps()` for CUDA reports today's truthful capability set
    (train+decode+opt+tf32, no interception, no binding-compose).
-2. **Consumer migration** (mechanical, per-file): replace scattered `extern "C" sub0_cuda_*`
-   declarations + calls with the header + `sub0_dev_*`; replace assumption-branches with caps queries.
-   Order: `memplan.hpp` → `decode.hpp` → `train_stage.cpp`/`tune` → tools.
+2. **Consumer migration — DONE (2026-07-18)**: replaced scattered `extern "C" sub0_cuda_*` declarations
+   + calls with the header + `sub0_dev_*` in `decode.hpp` and `train_stage.cpp`/`tune`.
+   `memplan.hpp` and `tools/` needed no changes (no direct `sub0_cuda_*` usage outside the deliberately-
+   exempt per-backend diagnostic files, `cuda_selftest.cpp`/`cuda_tests.cpp`). Found and fixed a real
+   pre-existing bug along the way: `train_stage.cpp`'s `hybrid_train` branch called the raw
+   `sub0_cuda_upload_params` unconditionally, but that name was only ever declared under
+   `SUB0_BUILD_CUDA` -- a genuine `-DSUB0_COMPUTE=CPU` build of `sub0_train` failed to compile
+   ("undeclared identifier"), reproduced via `git stash` on the original code before fixing. Verified on
+   real hardware in both configurations after: CPU-only default suite green (117 cases, 9,192,142
+   assertions), CUDA `[cuda]`-tagged suite green (41 cases, 2,029,105 assertions). What's left in
+   `sub0_cuda_*` now is only `backend_cuda.cu` itself plus the two permanently-exempt diagnostic files --
+   assumption-branches -> caps queries (the hybrid router's `needs_cpu` flip, still open below) is
+   separate follow-up work, not blocked on this.
 3. **Symbol flip**: once no production consumer names `sub0_cuda_*`, rename the exports in
    `backend_cuda.cu` to `sub0_dev_*` natively and delete the bridge forwards (the per-backend test
    suite keeps whatever backend-private symbols it needs).
