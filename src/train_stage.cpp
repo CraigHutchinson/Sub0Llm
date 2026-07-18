@@ -79,44 +79,23 @@
 #include <windows.h>
 #endif
 
-// GPU training fast-path (Phase 2e). When the CUDA backend is compiled in (SUB0_BUILD_CUDA) and a
-// device initializes, the training loop keeps the parameters resident on the GPU and runs each
-// step (forward + backward + AdamW) there via sub0_cuda_train_step, syncing back to the host
+// GPU training fast-path (Phase 2e). When a device backend is compiled in (SUB0_BUILD_CUDA today) and
+// a device initializes, the training loop keeps the parameters resident on the GPU and runs each
+// step (forward + backward + AdamW) there via sub0_dev_train_step, syncing back to the host
 // param/optimizer arenas only at eval/checkpoint boundaries (where the CPU eval/save/preview code
 // runs unchanged). The device path is gradient/AdamW parity-tested against this CPU backend.
-#if defined(SUB0_BUILD_CUDA)
-// The canonical, backend-neutral seam declarations (docs/BACKENDS.md). Included here FIRST so the
-// legacy sub0_cuda_* declarations below are cross-checked by the compiler against the canonical ones --
-// any signature drift between this file's copies and the seam header is a compile error, not a silent
-// link hazard. The declarations below become redundant (and go away) as this file migrates its calls to
-// the sub0_dev_* neutral names; until then they document exactly which entry points this stage uses.
+//
+// The canonical, backend-neutral seam declarations (docs/BACKENDS.md) -- also pulled in transitively
+// via sub0/decode.hpp, included explicitly here too (IWYU: this file's own device calls shouldn't rely
+// on a transitive include). Every device call in this stage goes through the neutral sub0_dev_* names
+// (no local sub0_cuda_* extern declarations -- device_backend.hpp is the one place those live now);
+// without a device backend linked, sub0_dev_* are fail-fast stubs, so the GpuTrainer methods below keep
+// their own #if defined(SUB0_BUILD_CUDA) guards only where the CPU-only body would otherwise pointlessly
+// touch never-used parameters ([[maybe_unused]] scaffolding), not because the neutral calls need it.
+// [[nodiscard]] on every status-code return: a discarded return is exactly the class of bug that let
+// the training loop keep "training" on a corrupted device context for thousands of steps after a real
+// hardware fault -- see [[gpu-failure-detection-hardening]].
 #include "sub0/device_backend.hpp"
-// init/shutdown/upload_params/set_tf32 come from sub0/decode.hpp (shared with the decode fast path);
-// only the training-specific device entry points are declared here.
-// [[nodiscard]] on every status-code return here: a discarded return is exactly the class of bug
-// that let the training loop keep "training" on a corrupted device context for thousands of steps
-// after a real hardware fault -- see [[gpu-failure-detection-hardening]].
-extern "C" [[nodiscard]] int  sub0_cuda_download_params(float* host);
-extern "C" [[nodiscard]] int  sub0_cuda_upload_opt(const float* host_m, const float* host_v);
-extern "C" [[nodiscard]] int  sub0_cuda_download_opt(float* host_m, float* host_v);
-extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
-                                     float lr, long t, double* out_loss, const int* lengths,
-                                     float muon_lr);
-// Forward+backward ONLY (no optimizer step) -- the primitive the source-routed hybrid CPU/GPU path
-// (below, GpuTrainer::backward_only) needs: the GPU sub-batch's gradient must be readable on the host so
-// it can be weighted-combined with the CPU sub-batch's gradient into ONE update, instead of each backend
-// silently applying its own independent optimizer step to its own resident parameter copy.
-extern "C" [[nodiscard]] int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
-                                     float* out_grad, double* out_loss, const int* lengths);
-// Reserve the training row budget (batch * SEQ_LEN rows) up front, so the per-step (batch_t, seq_t)
-// pairs the token-budget scheduler produces (see vary_seq below) never grow-realloc mid-run.
-extern "C" [[nodiscard]] int  sub0_cuda_train_reserve(int batch);
-extern "C" [[nodiscard]] int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
-// Footprint validation: predicted (pure model) vs actual (measured cudaMemGetInfo delta) device MiB.
-extern "C" [[nodiscard]] int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
-// Free dedicated VRAM (MiB) after the CUDA/cuBLAS context exists -- the usable budget for the ladder.
-extern "C" int  sub0_cuda_free_vram_mb();
-#endif
 
 namespace {
 
@@ -804,7 +783,7 @@ struct GpuTrainer {
     // CPU/GPU training -- see the hybrid_train branch in sub0_train_stage). In hybrid mode the HOST
     // arenas are the only ones an optimizer step ever advances (opt.step() runs on host; the device
     // only ever gets a one-way re-upload of the resulting params before its next forward pass, via
-    // sub0_cuda_upload_params) -- device optimizer state is never touched past enable()'s initial
+    // sub0_dev_upload_params) -- device optimizer state is never touched past enable()'s initial
     // upload, so sync_to_host() downloading it would clobber the host's real Adam moments with stale
     // frozen values. Never set by GpuTrainer itself; the caller is the only one who knows which mode
     // this run is in.
@@ -843,25 +822,25 @@ struct GpuTrainer {
         //TODO: Remove getenv calls - these are tmeporary and we should use commandline/compiletime
         if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
         if (!HAS_CUDA || batch > kCap) return false;
-        if (sub0_cuda_init() != 0) return false;
-        if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) return false;
-        if (sub0_cuda_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) != 0) return false;
+        if (sub0_dev_init() != 0) return false;
+        if (sub0_dev_upload_params(sub0::params_ptr()) != 0) return false;
+        if (sub0_dev_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) != 0) return false;
         // Pin the row budget up front (batch*SEQ_LEN rows) so no per-step (batch_t, seq_t) pair
-        // ever triggers a grow-realloc mid-run. A failed sub0_cuda_train_reserve leaves the backend's
+        // ever triggers a grow-realloc mid-run. A failed sub0_dev_train_reserve leaves the backend's
         // scratch in a consistent (if partial) state -- the retry below's OWN reserve call correctly
         // frees and rebuilds from scratch, no special cleanup needed here.
-        if (sub0_cuda_train_reserve(batch) != 0) {
+        if (sub0_dev_train_reserve(batch) != 0) {
             // tied/qk_norm/gated must match USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see
             // memplan.hpp's Dims comments.
             const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                                              USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
-            const int free_mb = sub0_cuda_free_vram_mb();
+            const int free_mb = sub0_dev_free_mem_mb();
             const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
                                     - kVramHeadroomMB;
             const int floor = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
-            if (floor < 1 || sub0_cuda_train_reserve(floor) != 0) return false;   // even the floor doesn't fit
+            if (floor < 1 || sub0_dev_train_reserve(floor) != 0) return false;   // even the floor doesn't fit
             sub0::log::warn("batch {} did not fit VRAM -- falling back to {} ({} MiB usable of {} free)",
                             batch, floor, vram_budget, free_mb);
             batch = floor;
@@ -909,10 +888,10 @@ struct GpuTrainer {
         }
         double loss = 0.0;
         // muon_lr <= 0 is pure AdamW on the GPU path (bit-identical to before this feature existed);
-        // > 0 hybridizes with Muon on the Muon-eligible matrices -- see sub0_cuda_train_step's own
+        // > 0 hybridizes with Muon on the Muon-eligible matrices -- see sub0_dev_train_step's own
         // comment (backend_cuda.cu) and the call site below (mirrors the CPU branch's own
         // opt.use_muon() ? lr_schedule(..., MUON_LR_BASE, ...) : implicit-AdamW-only computation).
-        ok = (sub0_cuda_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr) == 0);
+        ok = (sub0_dev_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr) == 0);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -952,7 +931,7 @@ struct GpuTrainer {
             }
         }
         double loss = 0.0;
-        ok = (sub0_cuda_backward(ids.data(), targets.data(), batch, T, out_grad, &loss, lengths) == 0);
+        ok = (sub0_dev_backward(ids.data(), targets.data(), batch, T, out_grad, &loss, lengths) == 0);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -967,8 +946,8 @@ struct GpuTrainer {
         // hybrid: host is ALWAYS already canonical (see `hybrid`'s own comment) -- a download here
         // would overwrite correct host state with a stale/frozen device mirror, not refresh it.
         if (!active || hybrid) return true;
-        ok = sub0_cuda_download_params(sub0::params_ptr()) == 0 &&
-             sub0_cuda_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) == 0;
+        ok = sub0_dev_download_params(sub0::params_ptr()) == 0 &&
+             sub0_dev_download_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) == 0;
         return ok;
 #else
         return true;
@@ -977,7 +956,7 @@ struct GpuTrainer {
 
     void shutdown() {
 #if defined(SUB0_BUILD_CUDA)
-        if (active) sub0_cuda_shutdown();
+        if (active) sub0_dev_shutdown();
 #endif
         active = false;
     }
@@ -1610,7 +1589,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // seq_t (MIN_TRAIN_SEQ). Using the exact same integer-division formula as the per-step
     // computation (tokens_per_step / seq_t) rather than an approximation keeps this bound exact, not
     // just "probably enough". Capped at MAX_DEVICE_BATCH, the same hard ceiling
-    // sub0_cuda_train_reserve/fwd_alloc/train_alloc enforce on the device side.
+    // sub0_dev_train_reserve/fwd_alloc/train_alloc enforce on the device side.
     const int max_batch_t = static_cast<int>(std::min<std::size_t>(
         tokens_per_step / static_cast<std::size_t>(MIN_TRAIN_SEQ),
         static_cast<std::size_t>(sub0::memplan::MAX_DEVICE_BATCH)));
@@ -1917,7 +1896,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         float step_loss;
         if (gpu_train) {
             // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
-            // 0.f when Muon isn't selected, which sub0_cuda_train_step treats as pure AdamW.
+            // 0.f when Muon isn't selected, which sub0_dev_train_step treats as pure AdamW.
             const float muon_lr_t = opt.use_muon() ? lr_schedule(step, MUON_LR_BASE, lr_warmup_steps) : 0.f;
             step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
@@ -2023,7 +2002,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // deliberately spreads a binding-capable source's draws out rather than clustering them, but
             // not impossible), not just a wasted upload. A failed re-upload is exactly as fatal as a
             // failed backward_only above (the device can no longer be trusted for the next step).
-            if (sub0_cuda_upload_params(sub0::params_ptr()) != 0) {
+            if (sub0_dev_upload_params(sub0::params_ptr()) != 0) {
                 sub0::log::error("training: GPU param re-upload failed at step {} -- stopping "
                                  "immediately without a final save; the last periodic checkpoint on "
                                  "disk is untouched and resumable.", step);
@@ -2649,7 +2628,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         read_tune_cache_value("cuda_tf32", &gpu_tf32);
     }
 #if defined(SUB0_BUILD_CUDA)
-    if (run_gpu && HAS_CUDA && sub0_cuda_init() == 0) {
+    if (run_gpu && HAS_CUDA && sub0_dev_init() == 0) {
         std::println("");
 #if defined(SUB0_TUNING)
         std::println("--- GPU device-step tuning (knobs: batch, TF32, attn-backward) ---");
@@ -2665,7 +2644,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // below, which trusts the prediction, is never silently steering on a stale formula.
         {
             double pred_mb = 0.0, act_mb = 0.0;
-            if (sub0_cuda_train_footprint(64, &pred_mb, &act_mb) == 0 && act_mb > 0.0) {
+            if (sub0_dev_train_footprint(64, &pred_mb, &act_mb) == 0 && act_mb > 0.0) {
                 // Asymmetric (see memplan.hpp): under-prediction beyond the tight tolerance is the
                 // OOM-risk "stale" case; over-prediction is safe up to the wider band (tolerates the
                 // known steady d768 over-estimate without crying wolf every run).
@@ -2682,7 +2661,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // measuring free VRAM below, else the budget -- and the VRAM-fit batch ceiling derived from
         // it -- is under-counted by that set (the conservative 293 we saw). The CUDA context survives
         // shutdown, so the sweep's first measurement re-allocs from a clean, accurately-budgeted slate.
-        sub0_cuda_shutdown();
+        sub0_dev_shutdown();
 
         // The SAME robust search the CPU sweep uses (sub0::tune::maximize): a joint coarse grid +
         // top-basin refinement + median-of-samples confirmation. This replaces the old single-pass
@@ -2692,7 +2671,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // the worse of two peaks). Objective = measured tok/s; the device timer is budget-sized so
         // each sample costs ~the same wall time. (The attention backward is now the flash tiled path
         // unconditionally, so batch and TF32 are the only device knobs left to sweep.)
-        sub0_cuda_set_tf32(CUDA_TF32 ? 1 : 0);      // baseline for batch-only builds
+        sub0_dev_set_tf32(CUDA_TF32 ? 1 : 0);      // baseline for batch-only builds
         // Runtime VRAM-fit batch ladder instead of a baked list: compute the largest batch whose
         // resident footprint fits dedicated VRAM (memplan::max_batch_for_vram), then double 64..ceiling.
         // bf16's halved footprint lifts that ceiling well past the old static 1024, so larger batches
@@ -2705,7 +2684,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
         // ~8.3 GB on an 8 GB card). Reserve a further headroom for the cuBLAS GEMM workspace (allocated
         // lazily on the first matmul, AFTER this measurement) plus allocator fragmentation.
         constexpr int kVramHeadroomMB = 512;        // cuBLAS workspace + fragmentation slack
-        const int free_mb = sub0_cuda_free_vram_mb();
+        const int free_mb = sub0_dev_free_mem_mb();
         const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
                                 - kVramHeadroomMB;
         const int cap   = sub0::memplan::max_batch_for_vram(kGpuDims, vram_budget, kTuneMaxBatch, act_b);
@@ -2744,10 +2723,10 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                     return 0.0;
                 }
             }
-            if (a.size() > 1) sub0_cuda_set_tf32(static_cast<int>(std::lround(a[1])));
+            if (a.size() > 1) sub0_dev_set_tf32(static_cast<int>(std::lround(a[1])));
             double ms = 0.0;
             const auto t0 = std::chrono::steady_clock::now();
-            const int rc = sub0_cuda_time_train_step(batch, SEQ_LEN, gbudget_ms, &ms);
+            const int rc = sub0_dev_time_train_step(batch, SEQ_LEN, gbudget_ms, &ms);
             const double profile_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             // VRAM cap / timing failure -> worst score so the search steers away (and keeps probing
             // the smaller batches) instead of aborting the whole sweep on one allocation failure.
@@ -2780,8 +2759,8 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
             const int warm_batch = batch_ladder[batch_ladder.size() / 2];
             double warm_ms = 0.0;
             const auto wt0 = std::chrono::steady_clock::now();
-            const bool warm_ok = sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) == 0;  // primes context + cuBLAS
-            if (warm_ok && sub0_cuda_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) != 0)         // steady-state read
+            const bool warm_ok = sub0_dev_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) == 0;  // primes context + cuBLAS
+            if (warm_ok && sub0_dev_time_train_step(warm_batch, SEQ_LEN, 100.0, &warm_ms) != 0)         // steady-state read
                 sub0::log::warn("device warmup's steady-state read failed -- the tune sweep below will "
                                 "likely surface the same problem, but timings up to that point may be off");
             if (!warm_ok)
@@ -2825,7 +2804,7 @@ extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backen
                      gr.evaluations, gr.best_samples);
         std::println("best GPU: batch={}  tf32={}  ->  {:.0f} tok/s (median)",
                      gpu_batch, gpu_tf32, gr.best_score);
-        sub0_cuda_shutdown();
+        sub0_dev_shutdown();
     }
 #endif
 

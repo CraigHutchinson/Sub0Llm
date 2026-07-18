@@ -108,10 +108,23 @@ implementation TU + a CMake branch, not a plugin system.
    is deliberately CUDA-like; the port is mostly mechanical) or an OpenVINO inference-only TU; add the
    `SUB0_DEVICE` CMake branch; ship its parity-test suite alongside.
 
-### Design: binding-compose on CUDA (the first caps flip -- in progress 2026-07-17)
+### Binding-compose on CUDA (the first caps flip -- DONE + merged 2026-07-17)
 
-Goal: `supports_binding_compose=1` for the CUDA backend, so the hybrid router stops forcing binding
-windows (content-embed / sentinel-pair / persistent) onto the CPU. Param-free encoders only
+`supports_binding_compose=1` for the CUDA backend: the device now composes overridden embed rows
+(param-free MeanPool/Hash/HRR arms) itself, so the hybrid router's follow-up (below) can stop
+forcing binding windows (content-embed / sentinel-pair / persistent) onto the CPU. Implemented by a
+delegated Fable agent, reviewed line-by-line against the CPU `encode_slot`/`encode_slot_bwd`
+reference (adjoint math, bounds validation, CUDA-graph-capture lifetime), and independently
+re-verified on hardware: the 3 new parity test cases (46 assertions) plus the full `[cuda]`-tagged
+suite (41 cases, 2,029,105 assertions) all green from a from-scratch rebuild. Two minor
+non-blocking findings on file (a test-coverage gap on some validation-reject branches; a wire-
+constant duplication between `device_backend.hpp` and `backend_cuda.cu` that only the CUDA TU's
+`static_assert` currently guards) -- tracked as follow-up, not merge blockers. Design retained below
+for reference; the **consuming flip** (`train_stage.cpp`'s hybrid `needs_cpu`) is still open, see
+its own bullet.
+
+Goal (met): `supports_binding_compose=1` for the CUDA backend, so the hybrid router stops forcing
+binding windows (content-embed / sentinel-pair / persistent) onto the CPU. Param-free encoders only
 (MeanPool/Hash/HRR -- the learned-`enc_w` encoders keep their documented CPU/single-thread limit).
 
 - **Host-computed override table, device-composed rows.** The host already walks every window's ids and

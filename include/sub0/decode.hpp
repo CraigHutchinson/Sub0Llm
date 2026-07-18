@@ -12,58 +12,46 @@
 // CUDA link edge into sub0_core would break its "ALWAYS the CPU backend" invariant (see sub0_core's
 // own CMakeLists.txt comment), so this header instead declares the (small, decode-only) seam ONCE and
 // drops into whichever TU includes it, compiled against that TU's own SUB0_BUILD_CUDA setting.
+//
+// Uses the neutral sub0_dev_* seam (device_backend.hpp, docs/BACKENDS.md) instead of its own
+// sub0_cuda_* externs: the fail-fast stubs it provides without a device backend linked mean this file
+// needs no #if scaffolding of its own -- gpu_decode_try_enable's HAS_CUDA check below still short-
+// circuits the (harmless but pointless) stub call on a CPU-only build.
 #pragma once
 
 #include "sub0/core.hpp"
 #include "sub0/casing.hpp"   // TOK_UNCOMBINE / TOK_COMBINE marker ids (kv_decode_generate interception)
+#include "sub0/device_backend.hpp"   // sub0_dev_init/shutdown/upload_params/set_tf32/kv_reset/forward_one
 
 #include <cstdio>
 #include <functional>
 #include <random>
 #include <vector>
 
-#if defined(SUB0_BUILD_CUDA)
-// [[nodiscard]] on every status-code return: a discarded failure here is exactly the class of bug
-// that let kv_decode_generate sample from stale/garbage logits with no indication anything failed --
-// see this file's own kv_decode_generate comment and [[gpu-failure-detection-hardening]].
-extern "C" [[nodiscard]] int  sub0_cuda_init();
-extern "C" void sub0_cuda_shutdown();
-extern "C" [[nodiscard]] int  sub0_cuda_upload_params(const float* host);
-extern "C" void sub0_cuda_set_tf32(int on);
-extern "C" [[nodiscard]] int  sub0_cuda_kv_reset();
-extern "C" [[nodiscard]] int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
-#endif
-
 namespace sub0 {
 
-// Bring up the GPU KV-cache decode path: requires the CUDA backend compiled in and a device to
+// Bring up the GPU KV-cache decode path: requires a device backend compiled in and a device to
 // initialize, then uploads the CURRENT host params. Safe to call when a device context is already
-// active elsewhere (sub0_cuda_init is idempotent; re-uploading identical params is harmless) -- a live
+// active elsewhere (sub0_dev_init is idempotent; re-uploading identical params is harmless) -- a live
 // GPU training session's own final teardown (GpuTrainer::shutdown) still runs afterwards and is itself
 // a no-op on an already-torn-down context. Returns false (caller uses the CPU path) on any failure: no
-// CUDA build, no device, or an upload error -- generation still completes either way.
+// device backend, no device, or an upload error -- generation still completes either way.
 //
 // Callers that intend to run MANY generations under one session (report's sample battery, autotemp's
 // temperature grid) must call this ONCE and reuse the result across every kv_decode_generate call --
 // re-enabling per generation would re-upload params and force a CUDA-graph recapture every time,
 // undoing most of the speedup (see DecodeSession below, the RAII form of exactly that pattern).
 inline bool gpu_decode_try_enable() {
-#if defined(SUB0_BUILD_CUDA)
-    if (!HAS_CUDA) return false;
-    if (sub0_cuda_init() != 0) return false;
-    sub0_cuda_set_tf32(0);   // tight FP32 inference math, matching the CUDA parity test's gate
-    return sub0_cuda_upload_params(sub0::params_ptr()) == 0;
-#else
-    return false;
-#endif
+    if (!HAS_CUDA) return false;   // short-circuits the (harmless but pointless) stub call otherwise
+    if (sub0_dev_init() != 0) return false;
+    sub0_dev_set_tf32(0);   // tight FP32 inference math, matching the CUDA parity test's gate
+    return sub0_dev_upload_params(sub0::params_ptr()) == 0;
 }
 
-// Tear down a GPU decode session brought up by gpu_decode_try_enable(). A no-op when built without
-// CUDA, so callers can call it unconditionally (gated on their own success flag) with no #if.
+// Tear down a GPU decode session brought up by gpu_decode_try_enable(). A no-op without a device
+// backend linked (the stub), so callers can call it unconditionally (gated on their own success flag).
 inline void gpu_decode_shutdown() {
-#if defined(SUB0_BUILD_CUDA)
-    sub0_cuda_shutdown();
-#endif
+    sub0_dev_shutdown();
 }
 
 // Autoregressively sample up to `n` more tokens onto `ctx` (already primed with a prompt/prefix) via
@@ -105,7 +93,10 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
     if (n <= 0) return;
     const bool intercept = static_cast<bool>(expand) && static_cast<bool>(combine);
     const bool do_compute = static_cast<bool>(compute) && compute_marker >= 0;
-#if defined(SUB0_BUILD_CUDA)
+    // No #if here (device_backend.hpp's stubs make it unnecessary): use_gpu is only ever true after a
+    // caller's own gpu_decode_try_enable() succeeded, which is already false-by-construction on a
+    // build with no device backend linked (sub0_dev_init's stub returns -1) -- so this branch is
+    // simply unreachable there, not compiled out.
     if (use_gpu && !intercept && !do_compute) {   // interception is CPU-only for now -> fall through to CPU
         // A device fault here (illegal memory access or similar) leaves the CUDA context permanently
         // corrupted for the rest of the process (CUDA errors are sticky) -- every subsequent
@@ -116,12 +107,12 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         // corrupted state -- same principle as GpuTrainer's step()/sync_to_host() failure handling in
         // train_stage.cpp, see [[gpu-illegal-access-hardware-fault-not-code-bug]].
         std::vector<float> logits(VOCAB);
-        if (sub0_cuda_kv_reset() != 0) {
+        if (sub0_dev_kv_reset() != 0) {
             std::fprintf(stderr, "decode: GPU KV-cache reset failed -- stopping generation early\n");
             return;
         }
         for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos) {  // prefill the primed context
-            if (sub0_cuda_forward_one(ctx[pos], pos, logits.data()) != 0) {
+            if (sub0_dev_forward_one(ctx[pos], pos, logits.data()) != 0) {
                 std::fprintf(stderr, "decode: GPU forward_one failed during prefill -- stopping "
                                      "generation early\n");
                 return;
@@ -132,7 +123,7 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
             if (next == eos_id) break;         // learned stop signal -- never push the marker token
             if (on_token) on_token(logits.data(), next);
             ctx.push_back(next);
-            if (sub0_cuda_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, logits.data()) != 0) {
+            if (sub0_dev_forward_one(ctx.back(), static_cast<int>(ctx.size()) - 1, logits.data()) != 0) {
                 std::fprintf(stderr, "decode: GPU forward_one failed at generated token %d -- "
                                      "stopping generation early\n", s);
                 return;
@@ -140,9 +131,6 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         }
         return;
     }
-#else
-    (void)use_gpu;
-#endif
     sub0::kv_reset();
     const float* logits = nullptr;
     for (int pos = 0; pos < static_cast<int>(ctx.size()); ++pos)       // prefill the primed context
