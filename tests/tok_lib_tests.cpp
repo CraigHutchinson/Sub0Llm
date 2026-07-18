@@ -345,6 +345,33 @@ TEST_CASE("JOIN scheme: complete base encodes out-of-corpus bytes", "[tok][join]
     REQUIRE(round_trips(t, "{code}[index]"));
 }
 
+// schemeV3 (casing.hpp's kSchemeVersion): a word that Viterbi-segments into exactly 2 known pieces
+// used to get a bare JOIN between them (no wrapping markers) -- indistinguishable downstream from an
+// ordinary single-piece word glued to trailing punctuation via the SAME general-glue JOIN (measured on
+// real corpus text while validating sub0/corpus_collapse.hpp: 93.9% of that old shape's real occurrences
+// were exactly that false positive). Fixed by unifying: every multi-piece word (N>=2) now gets
+// SPELL_START..END wrapping, matching N>=3's existing treatment -- see docs/TOKENIZER_DESIGN.md §4 and
+// docs/CORPUS_COLLAPSE.md. A dedicated small corpus where "sun" and "day" are heavily-attested whole
+// words (so both become single learned pieces) but "sunday" never appears as a whole word forces
+// Viterbi to segment the NEW standalone word "sunday" out of those two known pieces.
+TEST_CASE("JOIN scheme (schemeV3+): a genuine 2-piece word gets SPELL_START..END wrapping, not a bare "
+         "JOIN, and round-trips including UP-casing carry", "[tok][join]") {
+    std::string c;
+    for (int i = 0; i < 80; ++i)
+        c += "sun sun sun day day day the cat sat on the mat and the dog ran away .\n";
+    const Tokenizer t = sub0::tok::learn(c);
+
+    const std::vector<int> ids = sub0::tok::encode(t, "sunday");
+    REQUIRE(ids.size() >= 4);   // SPELL_START + >=2 pieces + SPELL_END
+    CHECK(ids.front() == sub0::casing::TOK_SPELL_START);
+    CHECK(ids.back()  == sub0::casing::TOK_SPELL_END);
+    // No bare JOIN between the wrapped pieces -- the OLD (schemeV2) N==2 shape is gone.
+    CHECK(std::none_of(ids.begin() + 1, ids.end() - 1,
+                       [](int id) { return id == sub0::casing::TOK_JOIN; }));
+    CHECK(round_trips(t, "sunday"));
+    CHECK(round_trips(t, "SUNDAY"));   // UP-casing must carry across the SPELL group correctly
+}
+
 TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip", "[tok][join]") {
     const Tokenizer t = sub0::tok::learn(kCorpus);
     std::ostringstream os(std::ios::binary);

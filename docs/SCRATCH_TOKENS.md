@@ -480,12 +480,19 @@ COLLAPSE arm (0.95 vs 0.13 held-out for fuzzy re-spelling) -- generalized from t
   need a KV-cache-aware splice; backlog" gap this doc's earlier text (and `decode.hpp`'s own former
   comment) flagged as unbuilt engineering.
 
-Both trigger points key off `encode_join`'s OWN existing markers (`TOK_SPELL_START..END` for a 3+-piece
-word, a bare `TOK_JOIN` for a 2-piece word -- `tokenizer.cpp`) rather than re-deriving word boundaries: a
-model trained on any real text already learns to emit these as an ordinary side effect of language
-modeling. (The 2-piece `TOK_JOIN` shape is handled at prefill time but is a known, documented gap for the
-LIVE generation splice -- it has no closing marker to key a retroactive collapse off; see `decode.hpp`'s
-own comment.)
+Both trigger points key off `encode_join`'s OWN existing markers (`TOK_SPELL_START..END` for every
+multi-piece word, N>=2, `tokenizer.cpp`) rather than re-deriving word boundaries: a model trained on any
+real text already learns to emit these as an ordinary side effect of language modeling.
+
+**UPDATE (schemeV3, `kSchemeVersion` in `casing.hpp`)**: a 2-piece word originally got a bare `TOK_JOIN`
+between its two piece ids instead of `SPELL_START..END` wrapping -- that shape turned out to be
+indistinguishable from an ordinary single-piece word immediately followed by punctuation via the SAME
+general-glue `TOK_JOIN` (measured on real corpus text while validating `corpus_collapse`: 93.9% of that
+shape's real occurrences were exactly that false positive, not a genuine 2-piece split -- see
+`docs/CORPUS_COLLAPSE.md`). Fixed by unifying: every multi-piece word (N>=2) now gets `SPELL_START..END`
+wrapping, and `TOK_JOIN` means general glue only, never a word boundary. This also closed the live
+generation splice's own former gap (a 2-piece word previously had no closing marker to key a retroactive
+collapse off) for free -- see `decode.hpp`'s comment.
 
 **Training curriculum**: `include/sub0/wordspike.hpp` (a `"wordspike"` blend-schedule source, alongside
 `spellspike`/`scratchspike`/`op_curriculum`) -- natural GSM8K-style word problems built via real

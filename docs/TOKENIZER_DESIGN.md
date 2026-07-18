@@ -77,18 +77,30 @@ A word-unit is BPE-encoded to N sub-tokens; the encoding of the *region* depends
 | N sub-tokens | Encoding | Rationale |
 |---|---|---|
 | 1 (common word) | bare token | nothing needed |
-| 2 (`sun`+`day`) | **JOIN** between | 1 token < 2 delimiters |
-| ≥3 (OOV / misspelled / `DoThisFooBar`) | **`SPELL_START` … `SPELL_END`** | 2 delimiters ≤ N−1 JOINs, and signals a spelled-out region |
+| ≥2 (`sun`+`day`, OOV / misspelled / `DoThisFooBar`) | **`SPELL_START` … `SPELL_END`** | 2 delimiters ≤ N−1 JOINs, and signals a spelled-out region unambiguously |
 
-Within a multi-token word, implicit-space would wrongly insert spaces between sub-tokens, so
-we suppress with JOINs (N=2) or **encapsulate** (N≥3). The SPELL region is a *spaceless
-group* — implicit space applies before `SPELL_START` and after `SPELL_END`, never inside.
-One encapsulation mechanism therefore covers **OOV/rare words, misspellings, acronyms, and
+Within a multi-token word, implicit-space would wrongly insert spaces between sub-tokens, so we
+**encapsulate** (N≥2). The SPELL region is a *spaceless group* — implicit space applies before
+`SPELL_START` and after `SPELL_END`, never inside. One encapsulation mechanism therefore covers
+**every multi-piece word: `sun`+`day` splits, OOV/rare words, misspellings, acronyms, and
 CamelCase / function-like names** (`DoThisFooBar`) as compound spaceless groups, with internal
-case markers as usual. The delimiters are a matched pair the model can attend (start↔end),
-the same pattern as the directional quotes; whether that attention earns the extra token is
-an open empirical question (§8). The `sun+day` case deliberately uses JOIN, not
-encapsulation — encapsulating two known tokens is strictly worse.
+case markers as usual. The delimiters are a matched pair the model can attend (start↔end), the
+same pattern as the directional quotes; whether that attention earns the extra token is an open
+empirical question (§8).
+
+**Revision history (schemeV3, `kSchemeVersion` in `casing.hpp`)**: the `N=2` case originally used
+a bare `JOIN` between the two sub-tokens instead of encapsulation, on a pure token-count argument
+("1 token < 2 delimiters — encapsulating two known tokens is strictly worse"). That argument
+didn't account for a downstream consumer that didn't exist yet: `sub0::detail::word_span`
+(`include/sub0/scratch.hpp`), which needs to detect "this is a multi-piece word" unambiguously for
+the scratch-slot compound-word collapse mechanism (`docs/SCRATCH_TOKENS.md`). `JOIN` is *also*
+encode_join's general "no space between adjacent content" glue (punctuation immediately after a
+word, closing quotes, bracket adjacency, ...), so a bare 2-piece `JOIN` shape is byte-identical to
+an ordinary single-piece word glued to trailing punctuation. Measured on a 5M-token real corpus
+sample while validating `corpus_collapse` (`docs/CORPUS_COLLAPSE.md`): 93.9% of the old N=2 shape's
+real occurrences were that false positive, not a genuine split. The one-token-per-word saving
+wasn't worth the ambiguity once a real consumer needed to tell the two apart — encapsulating N=2
+too closes the ambiguity for a small, fixed cost per 2-piece word.
 
 ## 5. Decode FSM & round-trip
 

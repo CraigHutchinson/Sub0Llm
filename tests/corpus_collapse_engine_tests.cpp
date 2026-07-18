@@ -175,6 +175,36 @@ sub0::ScheduleStage equal_weight_stage(std::initializer_list<std::pair<std::stri
                                std::vector<std::pair<std::string, double>>(w) };
 }
 
+// Renders document `doc_idx` of a corpus_collapse Dataset with each collapsed slot marked inline as
+// "<~original bytes~>" (using that document's own doc_bindings to resolve the slot back to what it
+// stands for) -- a qualitative, human-readable check that a real recurring word in real corpus prose is
+// actually what got collapsed, not just that the token counts/masks line up. Not needed for correctness
+// (the unit tests above already pin the mechanics); this is for a human to eyeball real examples, per
+// the three-pillar policy's "not accuracy alone" spirit and this doc's own "Gaps" section.
+std::string render_marked(const sub0::corpus_collapse::Dataset& ds, std::size_t doc_idx) {
+    const std::size_t b = static_cast<std::size_t>(ds.doc_starts[doc_idx]);
+    const std::size_t e = static_cast<std::size_t>(ds.doc_starts[doc_idx + 1]);
+    const std::vector<std::vector<int>>& bindings = ds.doc_bindings[doc_idx];
+    std::vector<int> disp;
+    for (std::size_t i = b; i < e; ++i) {
+        const int t = ds.tokens[i];
+        if (!sub0::is_scratch_slot(t)) { disp.push_back(t); continue; }
+        const int s = t - sub0::SCRATCH_SLOT_BASE;
+        auto lit = [&](char c) { disp.push_back(static_cast<int>(static_cast<unsigned char>(c))); };
+        lit('<'); disp.push_back(cas::TOK_JOIN); lit('~'); disp.push_back(cas::TOK_JOIN);
+        if (s >= 0 && s < static_cast<int>(bindings.size())) {
+            bool first = true;
+            for (int frag : bindings[static_cast<std::size_t>(s)]) {
+                if (!first) disp.push_back(cas::TOK_JOIN);
+                disp.push_back(frag);
+                first = false;
+            }
+        }
+        disp.push_back(cas::TOK_JOIN); lit('~'); disp.push_back(cas::TOK_JOIN); lit('>');
+    }
+    return sub0::detokenize(disp);
+}
+
 void train_steps(std::vector<sub0::BlendSource>& sources, sub0::ResolvedSchedule& sched,
                  sub0::BlendFairness& fair, sub0::AdamW& opt, int steps, std::mt19937& rng) {
     std::vector<int> data(static_cast<std::size_t>(kBatch) * (kWindowT + 1));
@@ -240,6 +270,11 @@ TEST_CASE("corpus_collapse capstone: does blending a real-corpus collapse curric
     Tokenizer tk;
     { std::ifstream is(sub0::default_tokenizer(), std::ios::binary); REQUIRE(sub0::tok::deserialize(tk, is)); }
     REQUIRE(tk.vocab == VOCAB);
+    // render_marked() below calls sub0::detokenize(), which reads the GLOBAL tokenizer state, not the
+    // LOCAL `tk` above (that's a separate copy this file's own build_dataset call consumes directly) --
+    // without this, the qualitative sample dump silently renders blank/garbage text (a real bug this
+    // comment now documents, found by actually reading the WARN output, not assumed correct).
+    REQUIRE(sub0::load_tokenizer(sub0::default_tokenizer()));
 
     const sub0::TokView data = tok.tokens();
     const std::span<const std::uint64_t> doc_index = tok.doc_starts();
@@ -260,6 +295,31 @@ TEST_CASE("corpus_collapse capstone: does blending a real-corpus collapse curric
     const auto t1 = std::chrono::steady_clock::now();
     const double build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     REQUIRE(cc_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    // Qualitative sample: show a handful of real collapsed documents (see render_marked's own comment).
+    // Also reports what FRACTION of the sampled real documents exhibited a recurring compound word at
+    // all -- a useful statistic independent of the shown examples.
+    {
+        const std::size_t n_docs = cc_ds.doc_bindings.size();
+        std::size_t n_with_collapse = 0;
+        std::string samples;
+        int shown = 0;
+        for (std::size_t d = 0; d < n_docs; ++d) {
+            const bool has_collapse = !cc_ds.doc_bindings[d].empty();
+            if (has_collapse) {
+                ++n_with_collapse;
+                if (shown < 5) {
+                    samples += "  [" + std::to_string(shown + 1) + "] " + render_marked(cc_ds, d) + "\n";
+                    ++shown;
+                }
+            }
+        }
+        std::string qual = "\n=== corpus_collapse: real TinyStories examples (<~word~> = collapsed slot, "
+            "showing what it resolves to) ===\n" + samples +
+            "  (" + std::to_string(n_with_collapse) + "/" + std::to_string(n_docs) +
+            " sampled documents had >=1 recurring compound word to collapse)\n";
+        WARN(qual);
+    }
 
     sub0::BlendSource base_src{ "base", train_span, doc_index, {}, {} };
     sub0::BlendSource cc_src{ "collapse",

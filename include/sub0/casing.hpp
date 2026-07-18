@@ -159,13 +159,19 @@ static_assert(TOK_MARKER_COUNT - TOK_EOS == 32,
 // SPELL threshold, ...), independent of the base-alphabet layout above. Written into serialize()'s
 // existing output, so it rides the same fingerprint() hash -- no second, parallel reject mechanism
 // alongside the magic number.
-//   1 -> 2 (this bump): two transition-rule-only changes that do NOT touch n_base/base_symbol/
-//   TOK_MARKER_COUNT (so the magic number alone wouldn't catch them): the line-initial opening-quote
-//   fix (a quote right after a bare '\n' now fires TOK_ODQUOTE instead of falling back to a bare
-//   byte) and the WS5b bracket-glue markers (TOK_GLUE_OPAREN etc., renamed from previously-reserved,
-//   previously-inert slots into ones with real encode/decode effects -- see docs/TOKENIZER_REVIEW.md
-//   §5.8/§5.9). Bundled into one bump since both landed in the same pre-release Stage 2 diff.
-constexpr std::uint32_t kSchemeVersion = 2;
+//   1 -> 2: two transition-rule-only changes that do NOT touch n_base/base_symbol/TOK_MARKER_COUNT (so
+//   the magic number alone wouldn't catch them): the line-initial opening-quote fix (a quote right after
+//   a bare '\n' now fires TOK_ODQUOTE instead of falling back to a bare byte) and the WS5b bracket-glue
+//   markers (TOK_GLUE_OPAREN etc., renamed from previously-reserved, previously-inert slots into ones
+//   with real encode/decode effects -- see docs/TOKENIZER_REVIEW.md §5.8/§5.9). Bundled into one bump
+//   since both landed in the same pre-release Stage 2 diff.
+//   2 -> 3 (this bump): a 2-piece word now gets TOK_SPELL_START..END wrapping (previously a bare
+//   TOK_JOIN between the two piece ids) -- that bare shape was indistinguishable from an ordinary
+//   single-piece word glued to trailing punctuation via the SAME general-glue TOK_JOIN elsewhere in
+//   encode_join; measured on real corpus text, 93.9% of the old shape was that false positive, not a
+//   genuine split (see docs/TOKENIZER_DESIGN.md, docs/CORPUS_COLLAPSE.md). TOK_JOIN now means general
+//   glue only, never a word-boundary signal -- sub0::detail::word_span (scratch.hpp) simplifies to match.
+constexpr std::uint32_t kSchemeVersion = 3;
 
 constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }

@@ -118,10 +118,14 @@ struct ScratchTable {
 };
 
 namespace detail {
-// {stream span length (slots consumed, INCLUDING any TOK_SPELL_START/END/TOK_JOIN markers), piece ids
-// (markers excluded)} for the word/token starting at ctx[i] -- matches exactly what encode_join
-// (tokenizer.cpp) emits for a 3+-piece word (TOK_SPELL_START..END wrapped), a 2-piece word (a bare
-// TOK_JOIN between the two pieces, no wrapping markers), or an ordinary single-piece token. An
+// {stream span length (slots consumed, INCLUDING any TOK_SPELL_START/END markers), piece ids (markers
+// excluded)} for the word/token starting at ctx[i] -- matches exactly what encode_join (tokenizer.cpp)
+// emits for a multi-piece word (N>=2, TOK_SPELL_START..END wrapped, schemeV3+) or an ordinary
+// single-piece token. TOK_JOIN is deliberately NOT treated as a word-boundary signal here (schemeV3+):
+// it is encode_join's general "no space between adjacent content" glue (punctuation immediately after a
+// word, closing quotes, bracket adjacency, ...), indistinguishable from a genuine multi-piece word split
+// under the OLD (schemeV2 and earlier) bare-JOIN encoding -- measured on real corpus text, 93.9% of that
+// old shape was exactly that false positive (see docs/CORPUS_COLLAPSE.md, docs/TOKENIZER_DESIGN.md). An
 // unterminated SPELL span (a prompt truncated mid-word) returns an empty piece list -- the caller must
 // treat that as "not a word," passing the lone marker through opaquely rather than misreading past it.
 inline std::pair<std::size_t, std::vector<int>> word_span(const std::vector<int>& ctx, std::size_t i) {
@@ -133,7 +137,6 @@ inline std::pair<std::size_t, std::vector<int>> word_span(const std::vector<int>
                                                   ctx.begin() + static_cast<std::ptrdiff_t>(j)) };
         return { 1, {} };
     }
-    if (i + 2 < ctx.size() && ctx[i + 1] == casing::TOK_JOIN) return { 3, { ctx[i], ctx[i + 2] } };
     return { 1, { ctx[i] } };
 }
 }  // namespace detail

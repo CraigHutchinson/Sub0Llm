@@ -345,16 +345,20 @@ bool load_scan_state(const std::string& path, const std::string& corpus, sub0::t
 // --- Tokenizer/corpus.tok reuse stamp -------------------------------------------------------
 // The scan cache above (.words) only skips passes 1-2; the vocab LEARN (EM/prune) and the full
 // corpus.tok tokenize pass (Pass 3) are far more expensive for a large corpus, and both are pure
-// functions of exactly three things beyond the corpus bytes themselves: vocab_target, min_merge,
-// and whether corpus.tok was requested at all (the tokenizer scheme is always JOIN, so it is not
-// a variable). When those and the corpus are unchanged since the last configure run, and
-// tokenizer.tok/corpus.tok already exist and parse, re-deriving the SAME tokenizer and
-// re-encoding the SAME corpus into the SAME bytes is pure waste -- for a FineWeb-scale corpus
-// that waste dominates a `sub0llm-configure` re-run made only to change an unrelated knob
-// (precision, dims, tune-cache). Stamped next to tokenizer.tok, validated the same way as the
-// scan cache (corpus size+mtime+version) plus the learn parameters.
+// functions of exactly four things beyond the corpus bytes themselves: vocab_target, min_merge,
+// whether corpus.tok was requested at all, and casing::kSchemeVersion (the encode_join/
+// detokenize_join TRANSITION RULES -- e.g. schemeV3's 2-piece-word SPELL-wrap change actually
+// changes corpus.tok's bytes for the SAME vocab; an earlier version of this stamp assumed "the
+// tokenizer scheme is always JOIN, so it is not a variable", which was only ever true of the
+// MARKER FAMILY, not its transition rules, and would have silently kept serving a stale
+// wrong-scheme corpus.tok across a scheme bump with no warning). When those and the corpus are
+// unchanged since the last configure run, and tokenizer.tok/corpus.tok already exist and parse,
+// re-deriving the SAME tokenizer and re-encoding the SAME corpus into the SAME bytes is pure
+// waste -- for a FineWeb-scale corpus that waste dominates a `sub0llm-configure` re-run made only
+// to change an unrelated knob (precision, dims, tune-cache). Stamped next to tokenizer.tok,
+// validated the same way as the scan cache (corpus size+mtime+version) plus the learn parameters.
 constexpr std::uint32_t TOKSTAMP_MAGIC   = 0x53543053u;  // "S0TS"
-constexpr std::uint32_t TOKSTAMP_VERSION = 1u;
+constexpr std::uint32_t TOKSTAMP_VERSION = 2u;   // 1->2: added casing::kSchemeVersion (see above)
 
 void save_tok_stamp(const std::string& path, const std::string& corpus,
                      int vocab_target, int min_merge, int emit_tok) {
@@ -367,10 +371,14 @@ void save_tok_stamp(const std::string& path, const std::string& corpus,
     wr(os, static_cast<std::int32_t>(vocab_target));
     wr(os, static_cast<std::int32_t>(min_merge));
     wr(os, static_cast<std::int32_t>(emit_tok));
+    wr(os, sub0::casing::kSchemeVersion);
 }
 
 // True iff the stamp at `path` was written for this exact (corpus size+mtime, vocab_target,
-// min_merge, emit_tok) combination. Absent, stale or malformed -> false (fall back to a full run).
+// min_merge, emit_tok, kSchemeVersion) combination. Absent, stale or malformed -> false (fall back
+// to a full run). TOKSTAMP_VERSION itself bumped alongside adding the kSchemeVersion field, so a
+// stamp written by an older configurator binary (which never wrote that field) fails the very
+// first check here rather than being misread.
 bool tok_stamp_matches(const std::string& path, const std::string& corpus,
                         int vocab_target, int min_merge, int emit_tok) {
     std::ifstream is(path, std::ios::binary);
@@ -384,6 +392,7 @@ bool tok_stamp_matches(const std::string& path, const std::string& corpus,
     if (rd<std::int32_t>(is) != static_cast<std::int32_t>(vocab_target)) return false;
     if (rd<std::int32_t>(is) != static_cast<std::int32_t>(min_merge)) return false;
     if (rd<std::int32_t>(is) != static_cast<std::int32_t>(emit_tok)) return false;
+    if (rd<std::uint32_t>(is) != sub0::casing::kSchemeVersion) return false;
     return static_cast<bool>(is);
 }
 
@@ -1251,9 +1260,13 @@ int main(int argc, char** argv) {
         std::println(stderr, "  kept verbatim (names/mixed):   {}", st.names);
         std::println(stderr, "  names withheld (mid-sent cap): {}", names_withheld);
         std::println(stderr, "base symbols / word pieces / vocab: {} / {} / {}", n_base, vocab - n_base, vocab);
-        // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme this is the
-        // word-encoding lever: N=1 bare, N=2 one JOIN, N>=3 SPELL-encapsulated -- so N>=3 is the SPELL
-        // rate. Frequency-weighted, so it reflects the real token stream (common words dominate).
+        // Word sub-token count distribution (N = BPE pieces per word). In the JOIN scheme (schemeV3+,
+        // casing.hpp's kSchemeVersion) this is the word-encoding lever: N=1 bare, N>=2 SPELL-encapsulated
+        // -- so N2+N>=3 together is the real SPELL rate (a bare JOIN between two piece ids used to mark
+        // N==2 instead, but that shape is indistinguishable from an ordinary word glued to trailing
+        // punctuation via the SAME general-glue JOIN -- see docs/TOKENIZER_DESIGN.md §4). Frequency-
+        // weighted, so it reflects the real token stream (common words dominate); the N2 vs N>=3 split is
+        // kept separate purely as informational detail, not because they encode differently anymore.
         {
             long long occ[4] = {0, 0, 0, 0};   // by occurrence: N==1, ==2, ==3, >=4
             long long tot = 0;
@@ -1264,7 +1277,7 @@ int main(int argc, char** argv) {
                 tot += f;
             }
             const double d = static_cast<double>(std::max<long long>(1, tot));
-            std::println(stderr, "word sub-token N (by occ):       N1 {:.1f}% / N2 {:.1f}% / N>=3 {:.1f}% (SPELL in join mode)",
+            std::println(stderr, "word sub-token N (by occ):       N1 {:.1f}% / N2 {:.1f}% / N>=3 {:.1f}% (N2+N>=3 = SPELL rate)",
                          100.0 * static_cast<double>(occ[0]) / d, 100.0 * static_cast<double>(occ[1]) / d,
                          100.0 * static_cast<double>(occ[2] + occ[3]) / d);
         }

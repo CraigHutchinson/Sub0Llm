@@ -86,7 +86,7 @@ inline void gpu_decode_shutdown() {
 //
 // `word_collapse`: HARNESS-DRIVEN (not model-requested) natural-word compaction (docs/SCRATCH_TOKENS.md,
 // sub0::wordspike -- the mechanism repeatspike.hpp proved beats fuzzy re-spelling, applied live). Fires
-// when the model finishes generating a 3+-piece compound word (encode_join's own TOK_SPELL_START..END
+// when the model finishes generating a multi-piece compound word (encode_join's own TOK_SPELL_START..END
 // wrapping, tokenizer.cpp -- the SAME marker a model trained on any real text already learns to emit
 // around a multi-piece word, no new signal invented). `word_collapse(span)` returns EITHER an empty
 // vector ("not a recurrence, leave the just-generated span exactly as it is") or a non-empty replacement
@@ -96,10 +96,13 @@ inline void gpu_decode_shutdown() {
 // primitive: the CPU KVCache (backend_cpu.cpp) is a flat, position-indexed buffer with no separate
 // length counter -- attention at any future forward_one call only ever reads `[0, pos]` for the `pos`
 // it is given, so a smaller re-fed position is a plain overwrite, and RoPE (driven by that same explicit
-// `pos` argument, not persistent state) is automatically correct afterward. Deliberately only the
-// TOK_SPELL_START/END (3+-piece) shape is handled live -- a 2-piece word's bare TOK_JOIN (no closing
-// marker to key a retroactive splice off) is a known, documented gap for the GENERATION side; PREFILL
-// time (sub0::prefill_collapse, scratch.hpp) handles both shapes, since it has no such asymmetry.
+// `pos` argument, not persistent state) is automatically correct afterward. Every multi-piece word
+// (N>=2, schemeV3+, casing.hpp) is TOK_SPELL_START/END-wrapped, so this handles all of them live --
+// an OLDER (schemeV2 and earlier) 2-piece word's bare TOK_JOIN had no closing marker to key a
+// retroactive splice off; that gap closed when N==2 moved to SPELL-wrapping (see
+// sub0::detail::word_span, scratch.hpp, and docs/CORPUS_COLLAPSE.md for the false-positive finding
+// that motivated the change). PREFILL time (sub0::prefill_collapse, scratch.hpp) always handled every
+// shape uniformly, since it has no live-splice asymmetry to begin with.
 inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int topk, std::mt19937& rng,
                                int eos_id, bool use_gpu,
                                const std::function<void(const float*, int)>& on_token = {},

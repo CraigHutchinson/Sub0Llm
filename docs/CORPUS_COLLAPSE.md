@@ -257,3 +257,40 @@ Reviewed before implementation, not discovered after:
   Full regression suite green on both CPU-only (`tok_cpu`, 123 cases) and CUDA (`gsm8k`, 162 cases) build
   configs after wiring. **Not yet run against the production `fineweb_edu_workflow` schedule** -- per this
   doc's own gate, that step is still pending a deliberate decision, not something to do by default.
+
+- **2026-07-19: root-caused and fixed a real mistargeting bug the qualitative check above should have
+  caught immediately.** Asked to show real examples, a standalone diagnostic against real TinyStories text
+  revealed the mechanism was NOT targeting rare/OOV entities: 1548/1693 sampled documents (91%) hit a
+  collapse candidate, and the actual examples were ordinary common words with trailing punctuation
+  (`<~room.~>`, `<~stream.~>`, `<~said,~>`), not names. Root cause, confirmed by measuring a 5M-token real
+  sample: `encode_join`'s old 2-piece-word encoding (a bare `TOK_JOIN` between the two piece ids, no
+  wrapping markers) was byte-identical to an ordinary single-piece word glued to trailing punctuation via
+  the SAME general-glue `TOK_JOIN` used everywhere else in the tokenizer. Measured split of that shape:
+  853 unambiguous `TOK_SPELL_START..END` words (N≥3) vs 576,013 occurrences of the ambiguous 2-piece shape,
+  of which only 6.1% (35,339) were genuine word splits and 93.9% (540,674) were the false positive.
+
+  **Fix** (`casing.hpp`'s `kSchemeVersion` 2→3, a foundational tokenizer change, not scoped to this file):
+  every multi-piece word (N≥2, not just N≥3) now gets `TOK_SPELL_START..END` wrapping; `TOK_JOIN` narrows
+  to general glue only, never a word-boundary signal. `sub0::detail::word_span` (`scratch.hpp`) simplified
+  to match (the ambiguous 2-piece branch is gone). Re-tokenizing TinyStories confirmed no vocab/relearn
+  impact (same 16535-token vocab, 21s to re-tokenize 671M tokens) and the fix measured exactly as
+  predicted: `TOK_SPELL_START..END` occurrences jumped 853 → 35,342 (absorbing the 35,339 genuine 2-piece
+  words), and the residual `TOK_JOIN` shape dropped to 99.9% pure glue.
+
+  **Re-run `[.corpus_collapse]` capstone result** (same TinyStories build, re-tokenized, same seed/budget):
+  documents hitting a collapse candidate dropped from 1548/1693 (91%) to 401/1693 (24%); real examples now
+  show genuinely recurring nouns (`<~dive~>`, `<~clay~>`, `<~oak~>`, `<~reef~>`) and, notably, actual proper
+  names collapsing correctly on their second mention (`<~Beth~>`, `<~Jase~>`, `<~Mae~>` twice). Three-pillar
+  re-measurement: correctness — held-out NELBO delta flipped from +0.0139 (collapse slightly hurt) to
+  **-0.0075** (collapse slightly helped, both plausibly noise-level for a single-seed run, but no longer
+  clearly negative); performance — `build_dataset` dropped from 235.2ms to **25.4ms** for the same 2000
+  sampled documents (far less spurious binding work with the false positives gone); memory — unchanged,
+  ~0.47MB. A design-review subagent separately caught that the TOKSTAMP reuse-cache assumption "the
+  tokenizer scheme is always JOIN, so it is not a variable" (`configurator.cpp`) was now false and would
+  have silently kept serving stale wrong-scheme `corpus.tok` files with no warning -- fixed alongside (see
+  `tools/configurator.cpp`'s `TOKSTAMP_VERSION` 1→2).
+
+  Full regression suite re-confirmed green on `tok_cpu`, `gsm8k`, and `d196check`/TinyStories after the
+  tokenizer fix. **Lesson worth keeping**: asking to see real examples, not just trusting an aggregate
+  metric, is what surfaced this -- the original +0.014 NELBO delta alone looked like a mundane "no harm"
+  result and gave no hint the mechanism was mistargeting by this much.

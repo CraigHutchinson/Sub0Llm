@@ -440,7 +440,10 @@ constexpr bool is_close_bracket(int byte) { return byte == ')' || byte == ']' ||
 //  - a single inter-content space is implicit (no token); JOIN cancels a pending space (glue);
 //  - a lone '\n' -> NEWLINE, "\n\n" -> PARA, any other whitespace -> verbatim byte tokens;
 //  - a double quote with ` "x` spacing -> OPEN_DQUOTE, `x" ` -> CLOSE_DQUOTE (bundles the space);
-//  - a word of N word-piece sub-tokens: N=1 bare, N=2 sub JOIN sub, N>=3 SPELL_START sub.. SPELL_END.
+//  - a word of N word-piece sub-tokens: N=1 bare, N>=2 SPELL_START sub.. SPELL_END (schemeV3+ -- a
+//    bare JOIN between exactly two ids used to mark a 2-piece word, but that shape is indistinguishable
+//    from an ordinary word glued to trailing punctuation via the SAME general-glue JOIN below; measured
+//    93.9% of real occurrences were that false positive, not a genuine split -- see docs/TOKENIZER_DESIGN.md).
 // See docs/TOKENIZER_DESIGN.md §2-§5.
 void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<int>& out) {
     const std::size_t n = stream.size();
@@ -566,12 +569,15 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             sub.clear();
             viterbi_encode_word(t, stream, i, end, sub);   // the runtime tokenizer's only word encoder
             const std::size_t N = sub.size();
-            if (N >= 3) {                               // SPELL-encapsulate: 2 delimiters <= N-1 JOINs
+            // SPELL-encapsulate any multi-piece word (N>=2), not just N>=3 (schemeV3+): a bare JOIN
+            // between two ids is indistinguishable from an ordinary single-piece word glued to trailing
+            // punctuation (measured on real corpus text: 93.9% of the old N==2 bare-JOIN shape was
+            // exactly that false positive, not a genuine 2-piece split -- see docs/TOKENIZER_DESIGN.md).
+            // TOK_JOIN now means general glue ONLY, never a word boundary.
+            if (N >= 2) {
                 out.push_back(TOK_SPELL_START);
                 for (int id : sub) out.push_back(id);
                 out.push_back(TOK_SPELL_END);
-            } else if (N == 2) {                        // sun+day: a single JOIN between the two
-                out.push_back(sub[0]); out.push_back(TOK_JOIN); out.push_back(sub[1]);
             } else {                                    // common single-token word
                 for (int id : sub) out.push_back(id);
             }
