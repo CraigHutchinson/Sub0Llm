@@ -309,8 +309,9 @@ struct PersistentBindings {
     // at every persistent call site, so merely SETTING encoding=ConvPool here was undefined behaviour --
     // a real hazard closed by this plumbing, found during the 2026-07-16 encoder-shootout review). Same
     // caveat as the ephemeral pool's: enc_w_grad has no per-thread reduction, so only a single-threaded
-    // training loop may drive a learned encoder (the multi-threaded train_batch path doesn't accept
-    // PersistentBindings anyway -- see persistent_scratchspike_engine_tests.cpp).
+    // training loop may drive a learned encoder -- train_batch's win_persist array (2026-07-18) DOES
+    // accept PersistentBindings for the parameter-free arms (see persistent_scratchspike_engine_tests.cpp's
+    // train_steps), it is specifically a learned enc_w that must stay off the multi-threaded path.
     const float*                       enc_w = nullptr;
     float*                             enc_w_grad = nullptr;
 

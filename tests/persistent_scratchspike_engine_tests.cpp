@@ -2,13 +2,13 @@
 // (persistent_scratchspike::multi_nth_char_task) generalize to held-out OOVs when bound to the PERSISTENT
 // (id >= VOCAB) slot range at K well beyond the ephemeral pool's hard 6-slot ceiling? Mirrors
 // scratchspike_engine_tests.cpp's own methodology (drilled-vs-held-out split, live kv_decode_generate
-// eval) as closely as possible for a direct, comparable result -- the only structural differences are the
-// id range (base+i, not SCRATCH_BASE+i) and how training is driven: sub0::train_batch does NOT accept
-// PersistentBindings (a single global, not a per-window array like train_batch's own win_binds -- see
-// persistent_slots_engine_tests.cpp's own comment on this), so training here manually loops over the
-// batch's windows via the low-level forward/backward API. This is the exact same "an unbatchable binding
-// mechanism needs its own driving loop" shape scratchspike_engine_tests.cpp's own train_ce_steps already
-// established for CharEncoder's un-batchable enc_w gradient -- reused here for the analogous reason.
+// eval) as closely as possible for a direct, comparable result -- the only structural difference is the
+// id range (base+i, not SCRATCH_BASE+i). Training drives sub0::train_batch's win_persist per-window
+// PersistentBindings array (multi-threaded, see train_steps' own comment below) for the parameter-free
+// encoders; the learned ConvPool arm still drives the low-level forward/backward API manually, single-
+// threaded, the same "an unbatchable binding mechanism needs its own driving loop" shape
+// scratchspike_engine_tests.cpp's own train_ce_steps established for CharEncoder's un-batchable enc_w
+// gradient.
 //
 // Tagged "[.persistent_scratchspike]" (hidden, like "[.scratchspike]"): trains hundreds of steps per
 // TEST_CASE, not in the default ctest sweep. Invoke explicitly: `sub0_tests "[persistent_scratchspike]"`
@@ -18,12 +18,16 @@
 // first; ConvPool joined the same day once PersistentBindings gained enc_w/enc_w_grad plumbing (until
 // then, every persistent-slot encode_slot call site in backend_cpu.cpp hardcoded enc_w=nullptr, so merely
 // SETTING encoding=ConvPool was undefined behaviour -- a real hazard found and closed during this
-// shootout's review, not just a missing feature). ConvPool's learned enc_w trains via the same
-// single-threaded AdamW-on-the-encoder loop scratchspike_engine_tests.cpp's train_ce_steps established
-// (enc_w_grad has no per-thread reduction -- fine here, this file's whole training loop is already
-// single-threaded for the train_batch-doesn't-accept-PersistentBindings reason above). CharEncoder stays
-// excluded deliberately: permutation-invariant (cannot beat MeanPool on anything order-dependent) and
-// strictly dominated by ConvPool in every prior measurement, with the same param shape/cost.
+// shootout's review, not just a missing feature). CharEncoder stays excluded deliberately:
+// permutation-invariant (cannot beat MeanPool on anything order-dependent) and strictly dominated by
+// ConvPool in every prior measurement, with the same param shape/cost.
+//
+// MULTI-THREADED path (2026-07-18, mirrors pairspike_engine_tests.cpp's own conversion): train_batch
+// gained a win_persist per-window PersistentBindings array the same day as win_sentinel (core.hpp's
+// train_batch comment) -- the three PARAMETER-FREE arms (MeanPool/Hash/HRR) now train through it, all
+// cores instead of one. ConvPool (learned enc_w -- no per-thread grad reduction) keeps the single-threaded
+// manual forward/backward loop scratchspike_engine_tests.cpp's train_ce_steps established for the
+// analogous CharEncoder reason.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -59,54 +63,31 @@ constexpr double kDrilledFrac  = 0.7;
 // transfers across model scale -- see that file's own comment + docs/SCRATCH_TOKENS.md).
 constexpr float  kLr           = 0.003f * (128.0f / static_cast<float>(D_MODEL));
 
-// Test-only stateful binding table for the PERSISTENT range -- analogous to sub0::ScratchTable
-// (scratch.hpp) but for id >= base. NOT a production component (unlike scratchspike_engine_tests.cpp's
-// own ScratchOps, which reuses the REAL ScratchTable gen_stage drives): a real production persistent-slot
-// table needs an actual compound-word cache/DB, explicitly out of scope for this spike (see project
-// memory persistent-slot-selection-problem-backlog and docs/DETERMINISTIC_MECHANISMS.md's "persistent
-// compound-word cache" note). This is deliberately the minimal thing needed to drive
-// kv_decode_generate's expand/combine + sub0::set_persistent_bindings() for one eval task.
+// Eval-time config for the PERSISTENT range -- analogous to sub0::ScratchTable (scratch.hpp) but for
+// id >= base. NOT a production component (unlike scratchspike_engine_tests.cpp's own ScratchOps, which
+// reuses the REAL ScratchTable gen_stage drives): a real production persistent-slot table needs an actual
+// compound-word cache/DB, explicitly out of scope for this spike (see project memory
+// persistent-slot-selection-problem-backlog and docs/DETERMINISTIC_MECHANISMS.md's "persistent
+// compound-word cache" note). Deliberately READ-ONLY (base/enc/enc_w are fixed for the whole eval_multi
+// call, safe to share across threads) -- the actual per-task binding table is built LOCAL to each
+// run_task call (see its own comment) so scoring can parallelize.
 struct PersistentTable {
     int                            base = 0;   // VOCAB
     sub0::SlotEncoding             enc  = sub0::SlotEncoding::MeanPool;
     const float*                   enc_w = nullptr;   // ConvPool only (eval needs no grad); null otherwise
-    std::vector<std::vector<int>> bindings;   // bindings[i] = fragments of base+i
-
-    void reset() { bindings.clear(); }
-    void bind(int slot, std::vector<int> frags) {
-        const int i = slot - base;
-        if (i < 0) return;
-        if (static_cast<int>(bindings.size()) <= i) bindings.resize(static_cast<std::size_t>(i) + 1);
-        bindings[static_cast<std::size_t>(i)] = std::move(frags);
-    }
-    sub0::PersistentBindings to_bindings() const {
-        sub0::PersistentBindings pb{ std::span<const std::vector<int>>(bindings), base, enc };
-        pb.enc_w = enc_w;
-        return pb;
-    }
-    // Fulfil a TOK_UNCOMBINE on a persistent id -> its bound fragments; anything else -> identity.
-    std::vector<int> expand(int token) const {
-        const int s = token - base;
-        if (s >= 0 && s < static_cast<int>(bindings.size()) && !bindings[static_cast<std::size_t>(s)].empty())
-            return bindings[static_cast<std::size_t>(s)];
-        return {token};
-    }
-    // Never actually invoked by this attend-only curriculum (no task asks the model to BIND anything) --
-    // supplied only because kv_decode_generate requires BOTH expand and combine truthy to enable
-    // interception at all. Identity fallback (no compression), matching ScratchTable::combine's own
-    // "can't mint" case.
-    std::vector<int> combine(const std::vector<int>& frags) const { return frags; }
 };
 
-// Run one task via the LIVE interceptor + persistent-binding dispatch: pre-bind slots 0..K-1 from
-// k.binds, install the table via set_persistent_bindings (read by backend_cpu.cpp's forward_one for
-// EVERY token fed through kv_decode_generate, including the persistent ids in the primed prompt), greedy
-// decode, uninstall. Mirrors scratchspike_engine_tests.cpp's own run_task exactly.
-std::vector<int> run_task(PersistentTable& ops, const pss::Task& k) {
-    ops.reset();
-    for (int i = 0; i < static_cast<int>(k.binds.size()); ++i)
-        ops.bind(ops.base + i, ss::oov_bytes(k.binds[static_cast<std::size_t>(i)]));
-    const sub0::PersistentBindings pb = ops.to_bindings();
+// Run one task via the LIVE interceptor + persistent-binding dispatch: bind slots base..base+K-1 from
+// k.binds into a table LOCAL to this call (no shared mutable state -- mirrors pairspike_engine_tests.cpp's
+// own run_task, letting eval_multi below invoke this from multiple OMP threads concurrently), install it
+// via set_persistent_bindings (read by backend_cpu.cpp's forward_one for EVERY token fed through
+// kv_decode_generate, including the persistent ids in the primed prompt), greedy decode, uninstall.
+std::vector<int> run_task(const PersistentTable& cfg, const pss::Task& k) {
+    std::vector<std::vector<int>> bindings;   // bindings[i] = fragments of cfg.base+i
+    bindings.reserve(k.binds.size());
+    for (const std::string& oov : k.binds) bindings.push_back(ss::oov_bytes(oov));
+    sub0::PersistentBindings pb{ std::span<const std::vector<int>>(bindings), cfg.base, cfg.enc };
+    pb.enc_w = cfg.enc_w;
     sub0::set_persistent_bindings(&pb);
     std::vector<int> ctx = k.prompt;
     std::mt19937 rng(0);
@@ -117,8 +98,21 @@ std::vector<int> run_task(PersistentTable& ops, const pss::Task& k) {
     const int n = std::min(64, SEQ_LEN - static_cast<int>(ctx.size()) - 1);
     sub0::kv_decode_generate(ctx, n, /*temp=*/1.f, /*topk=*/1, rng, cas::TOK_EOS,
                              /*use_gpu=*/false, /*on_token=*/{},
-                             [&](int t) { return ops.expand(t); },
-                             [&](const std::vector<int>& f) { return ops.combine(f); });
+                             // Fulfil a TOK_UNCOMBINE on a persistent id -> its bound fragments; anything
+                             // else -> identity.
+                             [&](int t) -> std::vector<int> {
+                                 const int s = t - cfg.base;
+                                 if (s >= 0 && s < static_cast<int>(bindings.size()) &&
+                                     !bindings[static_cast<std::size_t>(s)].empty())
+                                     return bindings[static_cast<std::size_t>(s)];
+                                 return {t};
+                             },
+                             // Never actually invoked by this attend-only curriculum (no task asks the
+                             // model to BIND anything) -- supplied only because kv_decode_generate
+                             // requires BOTH expand and combine truthy to enable interception at all.
+                             // Identity fallback (no compression), matching ScratchTable::combine's own
+                             // "can't mint" case.
+                             [](const std::vector<int>& f) { return f; });
     sub0::set_persistent_bindings(nullptr);
     return ctx;
 }
@@ -130,13 +124,25 @@ int answer_after_sep(const std::vector<int>& out) {
 
 struct Acc { int ok = 0, n = 0; double rate() const { return n ? static_cast<double>(ok) / n : 0.0; } };
 
-Acc eval_multi(PersistentTable& ops, const std::vector<std::string>& oovs, int K, unsigned seed) {
-    Acc a;
+// Eval task GENERATION stays serial (rng consumption order defines the eval set -- must stay identical
+// across runs/threads, same rationale as pairspike_engine_tests.cpp's own eval_select); SCORING
+// parallelizes over tasks (g_kv, the binding installs, and run_task's own local state are all per-thread
+// -- the pragma degrades to serial if OpenMP is off for this TU). This is the actual throughput win of the
+// 2026-07-18 MT conversion: training was already the minority of wall-clock time here (kBatch=16 windows
+// vs (|drilled|+|held_out|) x kEvalRounds live greedy-decode tasks per seed).
+Acc eval_multi(const PersistentTable& cfg, const std::vector<std::string>& oovs, int K, unsigned seed) {
+    std::vector<pss::Task> tasks;
     std::mt19937_64 rng(seed);
-    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi) {
-        const pss::Task k = pss::pick_multi_task(ops.base, oovs, qi, K, rng);
-        a.ok += (answer_after_sep(run_task(ops, k)) == k.answer_byte); ++a.n;
+    for (int qi = 0; qi < static_cast<int>(oovs.size()); ++qi)
+        tasks.push_back(pss::pick_multi_task(cfg.base, oovs, qi, K, rng));
+    Acc a; a.n = static_cast<int>(tasks.size());
+    int ok = 0;
+    #pragma omp parallel for reduction(+ : ok) schedule(dynamic)
+    for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+        const pss::Task& k = tasks[static_cast<std::size_t>(i)];
+        ok += (answer_after_sep(run_task(cfg, k)) == k.answer_byte);
     }
+    a.ok = ok;
     return a;
 }
 
@@ -182,47 +188,73 @@ struct DocWalk {
     }
 };
 
-// Manual per-window forward/backward training loop -- train_batch does not accept PersistentBindings (a
-// single global, not a per-window array), so this drives the low-level API directly, one window at a
-// time, accumulating gradient across the batch before opt.step() -- the exact shape
-// scratchspike_engine_tests.cpp's own train_ce_steps already established for the analogous reason
-// (CharEncoder's un-batchable enc_w gradient), reused here. `window` must be >= the longest task trace in
-// `ds` (the K-sweep needs a wider window than a fixed small K would -- same caveat train_steps' own
-// `window` parameter documents in scratchspike_engine_tests.cpp). `enc_w`/`enc_w_grad`/`ea` are non-null
-// together for a LEARNED encoder (ConvPool): enc_w rides into each window's PersistentBindings, its grad
-// accumulates across the batch (single-threaded loop -- no reduction race), and an AdamW-style update
-// (matching train_ce_steps' encoder block) applies after each model step.
+// Draw one training window per `mode` -- shared by both branches of train_steps below. EpochWalk: every
+// task trace fits the window by construction (see the window sizing in run_persistent_multi_experiment),
+// so a walked "window" is simply the whole doc: start at its first token, train its len-1 (input,target)
+// pairs. RandomWindows: sample_window's i.i.d. uniform-position draw.
+sub0::Window draw_window(const pss::Dataset& ds, std::mt19937& rng, int window, SampleMode mode, DocWalk* walk) {
+    if (mode == SampleMode::EpochWalk) {
+        const std::size_t d   = walk->next(rng);
+        const std::size_t ds_ = ds.doc_starts[d], de = ds.doc_starts[d + 1];
+        return sub0::Window{ ds_, static_cast<int>(std::min<std::size_t>(
+                                       static_cast<std::size_t>(window), de - ds_ - 1)) };
+    }
+    return sub0::sample_window(rng, window, ds.tokens.size(), std::span<const std::uint64_t>(ds.doc_starts));
+}
+
+// The doc a window belongs to (its persistent bindings source).
+std::size_t doc_of_window(const pss::Dataset& ds, const sub0::Window& w) {
+    return static_cast<std::size_t>(
+        std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
+                         static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
+}
+
+// PARAMETER-FREE encoders (MeanPool/Hash/HRR) take the MULTI-THREADED path: train_batch's win_persist
+// per-window PersistentBindings array (2026-07-18 -- see core.hpp's train_batch comment), all cores
+// instead of one. The LEARNED encoder (ConvPool: enc_w_grad has no per-thread reduction) keeps the
+// single-threaded manual forward/backward loop -- the same "an unbatchable binding mechanism needs its
+// own driving loop" shape scratchspike_engine_tests.cpp's own train_ce_steps established for CharEncoder's
+// un-batchable enc_w gradient. `window` must be >= the longest task trace in `ds` (the K-sweep needs a
+// wider window than a fixed small K would -- same caveat train_steps' own `window` parameter documents in
+// scratchspike_engine_tests.cpp). `enc_w`/`enc_w_grad`/`ea` are non-null together for ConvPool: enc_w rides
+// into each window's PersistentBindings, its grad accumulates across the batch (single-threaded loop -- no
+// reduction race), and an AdamW-style update (matching train_ce_steps' encoder block) applies after each
+// model step.
 void train_steps(const pss::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng, int window,
                  sub0::SlotEncoding enc, std::vector<float>* enc_w = nullptr,
                  std::vector<float>* enc_w_grad = nullptr, EncAdam* ea = nullptr,
                  SampleMode mode = SampleMode::RandomWindows, DocWalk* walk = nullptr) {
+    const bool learned = (enc_w != nullptr);
     std::vector<int> masked_tgt(static_cast<std::size_t>(window));
+    std::vector<std::size_t> starts(static_cast<std::size_t>(kBatch));
+    std::vector<int>         lens(static_cast<std::size_t>(kBatch));
+    std::vector<sub0::PersistentBindings>        pbs(static_cast<std::size_t>(kBatch));
+    std::vector<const sub0::PersistentBindings*> pb_ptrs(static_cast<std::size_t>(kBatch));
     for (int s = 0; s < steps; ++s) {
         opt.zero_grad();
         if (enc_w_grad) std::fill(enc_w_grad->begin(), enc_w_grad->end(), 0.f);
-        for (int b = 0; b < kBatch; ++b) {
-            sub0::Window w;
-            if (mode == SampleMode::EpochWalk) {
-                // Every task trace fits the window by construction (see the window sizing in
-                // run_persistent_multi_experiment), so a walked "window" is simply the whole doc: start
-                // at its first token, train its len-1 (input,target) pairs.
-                const std::size_t d  = walk->next(rng);
-                const std::size_t ds_ = ds.doc_starts[d], de = ds.doc_starts[d + 1];
-                w = sub0::Window{ ds_, static_cast<int>(std::min<std::size_t>(
-                                            static_cast<std::size_t>(window), de - ds_ - 1)) };
-            } else {
-                w = sub0::sample_window(rng, window, ds.tokens.size(),
-                                        std::span<const std::uint64_t>(ds.doc_starts));
+        if (!learned) {   // multi-threaded: prepare the whole batch, hand it to train_batch
+            for (int b = 0; b < kBatch; ++b) {
+                const sub0::Window w = draw_window(ds, rng, window, mode, walk);
+                starts[static_cast<std::size_t>(b)] = w.start;
+                lens[static_cast<std::size_t>(b)]   = w.len;
+                pbs[static_cast<std::size_t>(b)] = sub0::PersistentBindings{
+                    std::span<const std::vector<int>>(ds.doc_bindings[doc_of_window(ds, w)]), VOCAB, enc };
+                pb_ptrs[static_cast<std::size_t>(b)] = &pbs[static_cast<std::size_t>(b)];
             }
+            (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, window, lens.data(),
+                                    ds.mask.data(), nullptr, nullptr, pb_ptrs.data());
+            opt.step();
+            continue;
+        }
+        for (int b = 0; b < kBatch; ++b) {
+            const sub0::Window w = draw_window(ds, rng, window, mode, walk);
             const int Tb = w.len;
             for (int i = 0; i < Tb; ++i) {
                 const std::size_t p = w.start + static_cast<std::size_t>(i) + 1;
                 masked_tgt[static_cast<std::size_t>(i)] = ds.mask[p] ? ds.tokens[p] : sub0::LOSS_IGNORE_INDEX;
             }
-            const std::size_t doc = static_cast<std::size_t>(
-                std::upper_bound(ds.doc_starts.begin(), ds.doc_starts.end(),
-                                 static_cast<std::uint64_t>(w.start)) - ds.doc_starts.begin()) - 1;
-            sub0::PersistentBindings pb{ std::span<const std::vector<int>>(ds.doc_bindings[doc]),
+            sub0::PersistentBindings pb{ std::span<const std::vector<int>>(ds.doc_bindings[doc_of_window(ds, w)]),
                                          VOCAB, enc };
             if (enc_w)      pb.enc_w      = enc_w->data();
             if (enc_w_grad) pb.enc_w_grad = enc_w_grad->data();
