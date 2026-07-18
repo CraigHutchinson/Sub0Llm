@@ -83,21 +83,40 @@ inline void gpu_decode_shutdown() {
 // Interception runs on the CPU KV-cache path (the device-decode interceptor is a pending follow-on),
 // so a caller that supplies the callbacks gets CPU decode regardless of `use_gpu`. With no callbacks
 // (the default) this is byte-for-byte the original generate loop -- every existing caller is unchanged.
+//
+// `word_collapse`: HARNESS-DRIVEN (not model-requested) natural-word compaction (docs/SCRATCH_TOKENS.md,
+// sub0::wordspike -- the mechanism repeatspike.hpp proved beats fuzzy re-spelling, applied live). Fires
+// when the model finishes generating a 3+-piece compound word (encode_join's own TOK_SPELL_START..END
+// wrapping, tokenizer.cpp -- the SAME marker a model trained on any real text already learns to emit
+// around a multi-piece word, no new signal invented). `word_collapse(span)` returns EITHER an empty
+// vector ("not a recurrence, leave the just-generated span exactly as it is") or a non-empty replacement
+// ("this recurred -- substitute this instead", typically one bound scratch slot). On a replacement, this
+// retroactively SPLICES the KV-cache: `ctx.resize(open)` back to just before the word started, then
+// `feed()`s the replacement at that (now-current) position. This needs no new low-level engine
+// primitive: the CPU KVCache (backend_cpu.cpp) is a flat, position-indexed buffer with no separate
+// length counter -- attention at any future forward_one call only ever reads `[0, pos]` for the `pos`
+// it is given, so a smaller re-fed position is a plain overwrite, and RoPE (driven by that same explicit
+// `pos` argument, not persistent state) is automatically correct afterward. Deliberately only the
+// TOK_SPELL_START/END (3+-piece) shape is handled live -- a 2-piece word's bare TOK_JOIN (no closing
+// marker to key a retroactive splice off) is a known, documented gap for the GENERATION side; PREFILL
+// time (sub0::prefill_collapse, scratch.hpp) handles both shapes, since it has no such asymmetry.
 inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int topk, std::mt19937& rng,
                                int eos_id, bool use_gpu,
                                const std::function<void(const float*, int)>& on_token = {},
                                const std::function<std::vector<int>(int)>& expand = {},
                                const std::function<std::vector<int>(const std::vector<int>&)>& combine = {},
                                const std::function<std::vector<int>(const std::vector<int>&)>& compute = {},
-                               int compute_marker = -1) {
+                               int compute_marker = -1,
+                               const std::function<std::vector<int>(const std::vector<int>&)>& word_collapse = {}) {
     if (n <= 0) return;
     const bool intercept = static_cast<bool>(expand) && static_cast<bool>(combine);
     const bool do_compute = static_cast<bool>(compute) && compute_marker >= 0;
+    const bool do_word_collapse = static_cast<bool>(word_collapse);
     // No #if here (device_backend.hpp's stubs make it unnecessary): use_gpu is only ever true after a
     // caller's own gpu_decode_try_enable() succeeded, which is already false-by-construction on a
     // build with no device backend linked (sub0_dev_init's stub returns -1) -- so this branch is
     // simply unreachable there, not compiled out.
-    if (use_gpu && !intercept && !do_compute) {   // interception is CPU-only for now -> fall through to CPU
+    if (use_gpu && !intercept && !do_compute && !do_word_collapse) {   // interception is CPU-only for now -> fall through to CPU
         // A device fault here (illegal memory access or similar) leaves the CUDA context permanently
         // corrupted for the rest of the process (CUDA errors are sticky) -- every subsequent
         // forward_one call would return stale/garbage logits, which sample_token would then happily
@@ -146,6 +165,18 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
         if (do_compute && next == compute_marker) {   // deterministic node: inject its exact result
             for (int r : compute(ctx)) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(r); }
         }
+        if (do_word_collapse && next == casing::TOK_SPELL_END) {   // a compound word just finished
+            std::size_t open = ctx.size();
+            for (std::size_t i = ctx.size(); i-- > 0;) if (ctx[i] == casing::TOK_SPELL_START) { open = i; break; }
+            if (open < ctx.size()) {
+                const std::vector<int> span(ctx.begin() + static_cast<std::ptrdiff_t>(open) + 1, ctx.end() - 1);
+                const std::vector<int> repl = word_collapse(span);
+                if (!repl.empty()) {   // a recurrence -- retroactively splice (see this function's own header comment)
+                    ctx.resize(open);
+                    for (int r : repl) { if (static_cast<int>(ctx.size()) >= SEQ_LEN - 1) break; feed(r); }
+                }
+            }
+        }
         if (!intercept) return;
         if (next == casing::TOK_UNCOMBINE) {
             const int tgt = ctx.size() >= 2 ? ctx[ctx.size() - 2] : -1;   // expand the PRECEDING token
@@ -164,8 +195,12 @@ inline void kv_decode_generate(std::vector<int>& ctx, int n, float temp, int top
     };
     // FORWARD-PASS resolution of a prompt that ENDS in a completed op/marker: resolve it before generating, so
     // a prompt that merely POSES a computation is answered in the forward pass, not an iterative reasoning
-    // loop. (Only the final marker -- a mid-prompt op would need a KV-cache-aware splice; backlog.)
-    if ((do_compute || intercept) && !ctx.empty() && static_cast<int>(ctx.size()) < SEQ_LEN) resolve(ctx.back());
+    // loop. (Only the final marker -- a mid-prompt op would need a KV-cache-aware splice; backlog.) Also
+    // covers word_collapse: a prompt happening to end exactly at a just-completed compound word gets the
+    // same live-splice treatment here as a caller that pre-ran sub0::prefill_collapse over the WHOLE
+    // prompt already gets for every earlier word -- defense in depth for a caller that doesn't.
+    if ((do_compute || intercept || do_word_collapse) && !ctx.empty() && static_cast<int>(ctx.size()) < SEQ_LEN)
+        resolve(ctx.back());
     // The extra `ctx.size() < SEQ_LEN` guard only matters in interception mode, where injected spans
     // can grow ctx past the n-token budget the non-intercept precondition (ctx.size()+n <= SEQ_LEN)
     // otherwise guarantees; it never fires without interception, so that path is byte-identical.

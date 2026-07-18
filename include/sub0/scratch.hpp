@@ -87,6 +87,82 @@ struct ScratchTable {
         }
         return frags;
     }
+
+    // HARNESS-DRIVEN (not model-requested) recurrence check -- the mechanism repeatspike.hpp/
+    // wordspike.hpp proved beats fuzzy re-spelling (0.95 vs 0.13 held-out): an exact vocab piece is
+    // never a repeat (ordinary word, nothing to bind); an already-bound OOV IS a repeat -- the caller
+    // should substitute `tokens` (its existing slot) for THIS occurrence; a genuinely new OOV (room
+    // permitting) MINTS a slot for FUTURE occurrences but is NOT itself a repeat -- `tokens` stays the
+    // original fragments, so the first sighting stays spelled out (mirrors repeatspike's own COLLAPSE
+    // arm: mention 1 full spelling binds the slot, mentions 2+ collapse to it). Pool full -> identity,
+    // not a repeat (same fallback as combine()).
+    //
+    // Deliberately a DIFFERENT contract from combine(): combine() collapses to the slot immediately on
+    // mint (correct for a model-REQUESTED TOK_COMBINE region -- the model asked to compress THIS
+    // span right now); combine_recurrence never collapses on first sighting, only on a genuine
+    // recurrence, because the trigger here is the HARNESS silently observing running text (prefill or
+    // live generation), not a model request.
+    struct Recurrence { std::vector<int> tokens; bool is_repeat = false; };
+    Recurrence combine_recurrence(const std::vector<int>& frags) {
+        std::string key;
+        for (int f : frags) key.push_back(static_cast<char>(f & 0xFF));
+        if (tk) {
+            const auto it = tk->piece_index.find(key);
+            if (it != tk->piece_index.end()) return { {it->second}, false };
+        }
+        for (std::size_t i = 0; i < bindings.size(); ++i)
+            if (bindings[i] == frags) return { {SCRATCH_SLOT_BASE + static_cast<int>(i)}, true };
+        if (allow_bind && static_cast<int>(bindings.size()) < SCRATCH_SLOT_COUNT) bindings.push_back(frags);
+        return { frags, false };
+    }
 };
+
+namespace detail {
+// {stream span length (slots consumed, INCLUDING any TOK_SPELL_START/END/TOK_JOIN markers), piece ids
+// (markers excluded)} for the word/token starting at ctx[i] -- matches exactly what encode_join
+// (tokenizer.cpp) emits for a 3+-piece word (TOK_SPELL_START..END wrapped), a 2-piece word (a bare
+// TOK_JOIN between the two pieces, no wrapping markers), or an ordinary single-piece token. An
+// unterminated SPELL span (a prompt truncated mid-word) returns an empty piece list -- the caller must
+// treat that as "not a word," passing the lone marker through opaquely rather than misreading past it.
+inline std::pair<std::size_t, std::vector<int>> word_span(const std::vector<int>& ctx, std::size_t i) {
+    if (ctx[i] == casing::TOK_SPELL_START) {
+        std::size_t j = i + 1;
+        while (j < ctx.size() && ctx[j] != casing::TOK_SPELL_END) ++j;
+        if (j < ctx.size())
+            return { j - i + 1, std::vector<int>(ctx.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                                                  ctx.begin() + static_cast<std::ptrdiff_t>(j)) };
+        return { 1, {} };
+    }
+    if (i + 2 < ctx.size() && ctx[i + 1] == casing::TOK_JOIN) return { 3, { ctx[i], ctx[i + 2] } };
+    return { 1, { ctx[i] } };
+}
+}  // namespace detail
+
+// Harness-driven, PREFILL-time compound-word collapse: no engine change, no live decode-loop
+// involvement -- walks an already-encoded token stream (typically sub0::encode(prompt)) and collapses a
+// RECURRING multi-piece word's later mentions to its bound scratch slot, leaving the first mention
+// spelled out exactly as given. Reuses encode_join's own TOK_SPELL_START/END/TOK_JOIN markers as the
+// compound-word signal (see detail::word_span) rather than re-deriving word boundaries. Returns a
+// stream that is the same length or SHORTER than `ctx`, never longer. Call once, right after encoding a
+// prompt and before generation starts -- see docs/SCRATCH_TOKENS.md.
+inline std::vector<int> prefill_collapse(ScratchTable& table, const std::vector<int>& ctx) {
+    std::vector<int> out;
+    out.reserve(ctx.size());
+    for (std::size_t i = 0; i < ctx.size(); ) {
+        const auto [span_len, pieces] = detail::word_span(ctx, i);
+        if (pieces.empty()) { out.push_back(ctx[i]); i += span_len; continue; }   // unterminated SPELL span
+        std::vector<int> bytes;
+        for (int p : pieces) { const std::vector<int> e = table.expand(p); bytes.insert(bytes.end(), e.begin(), e.end()); }
+        const ScratchTable::Recurrence r = table.combine_recurrence(bytes);
+        if (r.is_repeat) {
+            out.insert(out.end(), r.tokens.begin(), r.tokens.end());
+        } else {
+            out.insert(out.end(), ctx.begin() + static_cast<std::ptrdiff_t>(i),
+                                  ctx.begin() + static_cast<std::ptrdiff_t>(i) + static_cast<std::ptrdiff_t>(span_len));
+        }
+        i += span_len;
+    }
+    return out;
+}
 
 }  // namespace sub0

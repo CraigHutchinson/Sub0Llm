@@ -102,6 +102,10 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     // ScratchTable bindings (numeric BIND: `[op add S0 S1]` resolves the bound slots), and falls back to
     // inline digits (`A + B =`). Like the interceptor, it forces the CPU KV-cache decode.
     std::function<std::vector<int>(const std::vector<int>&)>   compute;
+    // HARNESS-DRIVEN (not model-requested) natural-word collapse (docs/SCRATCH_TOKENS.md, sub0::wordspike):
+    // fires live when the model finishes a 3+-piece compound word (encode_join's TOK_SPELL_START..END).
+    // Prompt-side recurrences are handled once, up front, by sub0::prefill_collapse -- see below.
+    std::function<std::vector<int>(const std::vector<int>&)>   word_collapse;
     bool op_collapse = false;   // an --op-mix model: op results COLLAPSE to slots (expanded for display below)
     // content_embed: scratch slots embed as a live function of their bound fragments (mean-pool) instead
     // of a plain learned row -- meaningful for a --scratch-mix model AND/OR an --op-mix model (both now
@@ -154,11 +158,12 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                                              || generator_ever_active(schedule, "scratchspike"));
         const bool scratch_on = have_schedule && generator_ever_active(schedule, "scratchspike");
         const bool op_on = have_schedule && generator_ever_active(schedule, "op_curriculum");
-        if (sp_on || op_on) {
+        const bool word_on = have_schedule && generator_ever_active(schedule, "wordspike");
+        if (sp_on || op_on || word_on) {
             std::ifstream tis(tok_path, std::ios::binary);
             if (tis.good() && sub0::tok::deserialize(raw_tok, tis) && raw_tok.vocab == VOCAB) {
                 scratch.tk = &raw_tok;
-                content_embed_on = (scratch_on || op_on) && schedule.content_embed.has_value();
+                content_embed_on = (scratch_on || op_on || word_on) && schedule.content_embed.has_value();
                 content_embed_enc = content_embed_on
                     ? sub0::content_embed_encoding_of(static_cast<int>(*schedule.content_embed))
                     : sub0::SlotEncoding::MeanPool;
@@ -195,10 +200,38 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
                 } else {
                     compute = sub0::nodes::make_compute_callback(sub0::nodes::builtin(), op_deref);
                 }
-                std::println(stderr, "gen: interceptor enabled ({}{}{}{})",
-                             sp_on ? "spell/scratch" : "", (sp_on && op_on) ? " + " : "",
-                             op_on ? "op-dispatch" : "",
-                             op_collapse ? ", collapse" : "");
+                if (word_on) {
+                    // Live (generation-side) collapse: reuses the SAME combine_recurrence + expand
+                    // machinery prefill_collapse (below) uses for the prompt's own text, wrapped for
+                    // kv_decode_generate's simpler "empty = not a recurrence" contract.
+                    word_collapse = [&scratch, &binds, content_embed_on, content_embed_enc]
+                                    (const std::vector<int>& piece_span) -> std::vector<int> {
+                        std::vector<int> bytes;
+                        for (int p : piece_span) {
+                            const std::vector<int> e = scratch.expand(p);
+                            bytes.insert(bytes.end(), e.begin(), e.end());
+                        }
+                        const sub0::ScratchTable::Recurrence r = scratch.combine_recurrence(bytes);
+                        if (content_embed_on) binds = scratch.to_bindings(content_embed_enc);
+                        return r.is_repeat ? r.tokens : std::vector<int>{};
+                    };
+                    // PREFILL-time collapse: the prompt's own text may already contain a recurring
+                    // compound word (e.g. a name mentioned twice) -- collapse it once, up front,
+                    // before generation starts (same mechanism as the live callback above, just
+                    // applied to known text instead of a growing KV-cache).
+                    ctx = sub0::prefill_collapse(scratch, ctx);
+                    if (content_embed_on) binds = scratch.to_bindings(content_embed_enc);
+                }
+                {
+                    std::vector<std::string> parts;
+                    if (sp_on)   parts.push_back("spell/scratch");
+                    if (op_on)   parts.push_back("op-dispatch");
+                    if (word_on) parts.push_back("word-collapse");
+                    std::string joined;
+                    for (std::size_t i = 0; i < parts.size(); ++i) { if (i) joined += " + "; joined += parts[i]; }
+                    std::println(stderr, "gen: interceptor enabled ({}{})", joined,
+                                op_collapse ? ", collapse" : "");
+                }
                 if (content_embed_on)
                     std::println(stderr, "gen: content-embed {}",
                                 sub0::content_embed_kind_name(static_cast<int>(*schedule.content_embed)));
@@ -206,14 +239,32 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         }
     }
     const bool spell_enabled = static_cast<bool>(expand);
-    // An --op-mix model's op results are collapsed to scratch slots -- expand each bound slot back to its
-    // value digits for display (the model reasoned over the symbol; the reader wants the number).
-    auto expand_op_slots = [&scratch, op_collapse](std::vector<int>& c) {
-        if (!op_collapse) return;
+    // An --op-mix model's op results, and a wordspike model's collapsed name references, both COLLAPSE
+    // to scratch slots -- expand each bound slot back to its value bytes for display (the model reasoned
+    // over the symbol; the reader wants the number/name). is_scratch_slot + scratch.value() are generic
+    // over WHO bound the slot, so one pass handles both.
+    const bool expand_slots_for_display = op_collapse || static_cast<bool>(word_collapse);
+    auto expand_op_slots = [&scratch, expand_slots_for_display](std::vector<int>& c) {
+        if (!expand_slots_for_display) return;
         std::vector<int> out; out.reserve(c.size());
         for (int t : c) {
             if (sub0::is_scratch_slot(t)) { const std::string v = scratch.value(t);
-                if (!v.empty()) { for (char ch : v) out.push_back(static_cast<unsigned char>(ch)); continue; } }
+                // TOK_JOIN between each expanded byte: detokenize_join (tokenizer.cpp) inserts an
+                // implicit space before every "content" token unless the previous one was TOK_JOIN or
+                // it's inside a TOK_SPELL group -- a bound value's bytes are pushed raw here (no
+                // encode-time grouping happened for them), so without an explicit JOIN a multi-char
+                // name renders as space-separated letters ("R u m p l e...") instead of one word. A
+                // single-char value (most op-collapse digit results) needs no JOIN at all.
+                if (!v.empty()) {
+                    bool first = true;
+                    for (char ch : v) {
+                        if (!first) out.push_back(sub0::casing::TOK_JOIN);
+                        out.push_back(static_cast<unsigned char>(ch));
+                        first = false;
+                    }
+                    continue;
+                }
+            }
             out.push_back(t);
         }
         c.swap(out);
@@ -228,16 +279,16 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
     if constexpr (!USE_TERNARY) {
         if (static_cast<int>(ctx.size()) + n <= SEQ_LEN) {
             sub0::DecodeSession sess;
-            const bool intercept = spell_enabled || static_cast<bool>(compute);
+            const bool intercept = spell_enabled || static_cast<bool>(compute) || static_cast<bool>(word_collapse);
             const bool gpu = sess.use_gpu && !intercept;   // interceptor + op dispatch are CPU-only for now
             std::println(stderr, "gen: decode backend {}{}",
                         gpu ? "GPU (device KV-cache)" : "CPU (KV-cache)",
                         intercept ? " + uncombine/op interceptor" : "");
             if (content_embed_on) { binds = scratch.to_bindings(content_embed_enc); sub0::set_scratch_bindings(&binds); }
             sub0::kv_decode_generate(ctx, n, temp, topk, rng, eos_id, gpu, {}, expand, combine,
-                                     compute, sub0::nodes::FRAME_CLOSE);
+                                     compute, sub0::nodes::FRAME_CLOSE, word_collapse);
             if (content_embed_on) sub0::set_scratch_bindings(nullptr);
-            expand_op_slots(ctx);   // collapsed op results -> their value digits for display
+            expand_op_slots(ctx);   // collapsed op results / word-collapsed names -> their bytes for display
             std::println("{}", sub0::detokenize(ctx));
             return 0;
         }

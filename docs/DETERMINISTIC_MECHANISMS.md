@@ -157,8 +157,20 @@ toward "the model just writes the word normally, the system silently compacts re
 the *mechanism* (spike-style, over baked training traces — the full-forward path every other spike here uses)
 independently of the harder, unbuilt engineering question: doing this live, mid-*generation*, inside a running
 KV-cache needs a splice capability that does not exist today (see `include/sub0/repeatspike.hpp`'s header
-comment and project memory `persistent-slot-range-engine-substrate` for the concrete gap). Also: this
-directly confirms scratchspike's own prior finding from the *other* direction —
+comment and project memory `persistent-slot-range-engine-substrate` for the concrete gap).
+
+**UPDATE (2026-07-18): the live splice is built, for natural prose, and needed no new low-level engine
+primitive.** The gap above assumed a KV-cache truncate/splice capability had to be invented; investigating
+it directly against `backend_cpu.cpp`'s `KVCache` found the cache is already a flat, position-indexed
+buffer with no separate length counter, so a retroactive `ctx.resize()` back to before a compound word
+started, then re-`feed()`ing a replacement token, is just a normal overwrite — nothing needs "undoing."
+`decode.hpp`'s `kv_decode_generate` gained a `word_collapse` parameter that does exactly this, keyed off
+`encode_join`'s own `TOK_SPELL_START/END`/`TOK_JOIN` markers (no boundary re-derivation needed — a model
+trained on any real text already emits these). `sub0::prefill_collapse` (`scratch.hpp`) handles the
+prompt-side case the same way, with no decode-loop involvement at all. New curriculum:
+`include/sub0/wordspike.hpp` / `[.wordspike]`. Full design + status: `docs/SCRATCH_TOKENS.md`'s
+"Natural-prose word collapse" section. Also: this directly confirms scratchspike's own prior finding from
+the *other* direction —
 `define_task` (#1, model-driven: the model must ask via `combine`) is documented there as "copy-bottlenecked",
 excluded from the production curriculum — harness-driven binding isn't just *an* option, it's the one that
 actually works at this scale, now proven for a second trigger condition (repeat-recognition, not just

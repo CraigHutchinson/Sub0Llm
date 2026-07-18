@@ -457,3 +457,49 @@ Why the pair beats both existing ranges at what they can't do:
   ordinary tokens (the JOIN tokenizer already compresses the static half), per-context compounds become
   single semantic units with content-derived, order-sensitive vectors, and `uncombine` remains the exact
   bridge down to characters when spelling matters.
+
+## Natural-prose word collapse — the SAME mechanism, no Phase-3 dependency (2026-07-18)
+
+Phase 4's motivating domain was always code (long compound identifiers). The identical mechanism applies
+directly to NATURAL prose too -- a recurring invented proper noun in a word problem is structurally the
+same "multi-piece compound that recurs within one context" as a code identifier -- and, unlike Phase 4,
+does not need the sentinel-pair's reserved-id headroom: it reuses the EXISTING bounded 6-slot pool (a
+natural document rarely names more than a handful of distinct entities), so it shipped as its own track
+rather than waiting on Phase 3's pool deprecation.
+
+**The mechanism**: harness-driven (not model-requested) collapse, exactly `[.repeatspike]`'s proven
+COLLAPSE arm (0.95 vs 0.13 held-out for fuzzy re-spelling) -- generalized from that spike's synthetic
+`W , <slot> , <slot> # n <slot>` control-symbol passage to REAL text. Two trigger points:
+- **Prefill** (`sub0::prefill_collapse`, `scratch.hpp`): scans an already-encoded prompt once, before
+  generation starts -- no engine change, a pure preprocessing pass.
+- **Generation** (`kv_decode_generate`'s new `word_collapse` parameter, `decode.hpp`): fires when the
+  model finishes generating a compound word live, retroactively splicing the KV-cache (`ctx.resize` back
+  to before the word started, then re-`feed()`s the replacement). This needed no new low-level engine
+  primitive: the CPU `KVCache` (`backend_cpu.cpp`) is a flat, position-indexed buffer with no separate
+  length counter, so a smaller re-fed position is a plain overwrite -- closing the "a mid-prompt op would
+  need a KV-cache-aware splice; backlog" gap this doc's earlier text (and `decode.hpp`'s own former
+  comment) flagged as unbuilt engineering.
+
+Both trigger points key off `encode_join`'s OWN existing markers (`TOK_SPELL_START..END` for a 3+-piece
+word, a bare `TOK_JOIN` for a 2-piece word -- `tokenizer.cpp`) rather than re-deriving word boundaries: a
+model trained on any real text already learns to emit these as an ordinary side effect of language
+modeling. (The 2-piece `TOK_JOIN` shape is handled at prefill time but is a known, documented gap for the
+LIVE generation splice -- it has no closing marker to key a retroactive collapse off; see `decode.hpp`'s
+own comment.)
+
+**Training curriculum**: `include/sub0/wordspike.hpp` (a `"wordspike"` blend-schedule source, alongside
+`spellspike`/`scratchspike`/`op_curriculum`) -- natural GSM8K-style word problems built via real
+`tok::encode` (so genuine TOK_CAP/TOK_SPELL_START/END/TOK_JOIN markers appear exactly as real
+tokenization produces them), where an invented character name's first mention is spelled out and later
+mentions collapse to the bound slot, composed in the SAME document with `op_curriculum`'s own
+arithmetic-result collapse (both mechanisms share the one 6-slot pool, proven collision-free at the
+engine level by `tests/blended_capstone_engine_tests.cpp`'s `[blended]` case). `[.wordspike]`
+(`tests/wordspike_engine_tests.cpp`) is the matched FUZZY-vs-COLLAPSE A/B, mirroring `[.repeatspike]`'s
+own methodology, extended to score op-delegation and name-carry together.
+
+**A bigger, deliberately-deferred idea this surfaces**: apply the same repeat-collapse to the REAL base
+corpus at `configure` time (`tools/configurator.cpp`'s tokenize pass), not just the small synthetic
+`wordspike` curriculum -- teaching the pattern at full corpus scale. Real, separate scope (touches the
+configurator, not gen/decode), gated on `wordspike` first proving the mechanism generalizes at all on the
+cheap synthetic curriculum -- the same "prove the mechanism before the engineering" sequencing this
+whole document follows throughout.

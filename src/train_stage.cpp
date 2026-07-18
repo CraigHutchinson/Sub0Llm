@@ -34,6 +34,7 @@
 #include "sub0/scratchspike.hpp" // scratch-token (context-translation) curriculum (a "scratchspike" schedule source)
 #include "sub0/scratch_slots.hpp" // ScratchBindings / SlotEncoding -- content-derived scratch-slot embeddings
 #include "sub0/op_curriculum.hpp" // op-delegation (math node routing) curriculum (an "op_curriculum" schedule source)
+#include "sub0/wordspike.hpp"    // natural-prose word-collapse + op-delegation curriculum (a "wordspike" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
 
@@ -1569,11 +1570,12 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // model still needs its content-embed interceptor at gen time for what it learned in that stage --
     // see gen_stage.cpp's own union-across-stages rewiring for the matching gen-time concern.
     const bool have_binding_source = std::any_of(schedule.sources.begin(), schedule.sources.end(),
-        [](const sub0::SourceSpec& s) { return s.generator == "scratchspike" || s.generator == "op_curriculum"; });
+        [](const sub0::SourceSpec& s) { return s.generator == "scratchspike" || s.generator == "op_curriculum"
+                                             || s.generator == "wordspike"; });
     bool content_embed_active = schedule.content_embed.has_value() && have_binding_source;
     if (schedule.content_embed && !have_binding_source)
         sub0::log::warn("train: blend schedule sets content_embed but declares no scratchspike/"
-                        "op_curriculum source to bind from -- disabled");
+                        "op_curriculum/wordspike source to bind from -- disabled");
     const int content_embed_kind = content_embed_active
         ? static_cast<int>(*schedule.content_embed) : static_cast<int>(sub0::ContentEmbedKind::MeanPool);
 
@@ -1714,6 +1716,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<sub0::spellspike::Dataset>    spell_dss(schedule.sources.size());
     std::vector<sub0::scratchspike::Dataset>  scratch_dss(schedule.sources.size());
     std::vector<sub0::op_curriculum::Dataset> op_dss(schedule.sources.size());
+    std::vector<sub0::wordspike::Dataset>     word_dss(schedule.sources.size());
     std::size_t kBaseSource = static_cast<std::size_t>(-1);   // sentinel: no corpus-typed source this run
 
     for (std::size_t i = 0; i < schedule.sources.size(); ++i) {
@@ -1802,6 +1805,21 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
                 std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask),
                 std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
+        } else if (spec.generator == "wordspike") {
+            sub0::wordspike::Options wopt;
+            wopt.seed = static_cast<std::uint64_t>(seed) ^ 0x0740D5B11CEULL;   // distinct stream
+            wopt.n_examples = spec.n_examples > 0 ? spec.n_examples : 3000;
+            const int derived_max_digits = std::max(2, std::min(4, (SEQ_LEN - 12) / 8));   // same derivation as op_curriculum
+            wopt.max_digits = spec.max_digits > 0
+                ? std::min(spec.max_digits, derived_max_digits) : derived_max_digits;
+            word_dss[i] = sub0::wordspike::build_dataset(tk, wopt, sub0::wordspike::Arm::Collapse);
+            const sub0::wordspike::Dataset& ds = word_dss[i];
+            sources.push_back(sub0::BlendSource{ spec.name,
+                sub0::TokView::over_int32(ds.tokens.data(), ds.tokens.size()),
+                std::span<const std::uint64_t>(ds.doc_starts), std::span<const std::uint8_t>(ds.mask),
+                std::span<const std::vector<std::vector<int>>>(ds.doc_bindings) });
+            sub0::log::line("blend: '{}' natural-prose word-collapse + op-delegation curriculum "
+                            "({} examples, {} tokens)", spec.name, ds.doc_starts.size() - 1, ds.tokens.size());
         } else {
             sub0::log::error("train: blend source '{}' has unrecognized generator '{}'",
                              spec.name, spec.generator);

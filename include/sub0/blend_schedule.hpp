@@ -72,7 +72,7 @@ struct SourceSpec {
     // schedule author's own label/reminder of which corpus the schedule was written for, not a path the
     // engine resolves or validates.
     std::string corpus;
-    std::string generator;   // non-empty => "scratchspike" | "op_curriculum" | "spellspike"
+    std::string generator;   // non-empty => "scratchspike" | "op_curriculum" | "spellspike" | "wordspike"
     std::string gsm8k_path;  // op_curriculum only: a real GSM8K file instead of the synthetic generator
     // Generator knobs, defaulting to today's train_stage.cpp-hardcoded values when unset (-1 sentinel).
     // Safety clamps (SCRATCH_POOL, the SEQ_LEN-derived contains_k/max_digits ceilings) are enforced by the
