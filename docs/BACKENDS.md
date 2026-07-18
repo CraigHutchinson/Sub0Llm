@@ -71,11 +71,12 @@ Consumers branch on **caps**, not on `#if defined(SUB0_BUILD_CUDA)` + folklore. 
 - `decode.hpp` currently falls back to CPU whenever interception callbacks are supplied — that rule
   becomes `caps.supports_interception == 0`, and a future backend that CAN intercept gets used
   automatically with zero consumer changes.
-- The hybrid CPU/GPU router's `needs_cpu = !src.doc_bindings.empty()` becomes
-  `needs_cpu = !src.doc_bindings.empty() && !caps.supports_binding_compose` — the day a backend ships
-  `encode_slot` kernels, binding windows start routing to the device by flipping one caps bit in that
-  backend, not by editing the training loop. **This is the designed landing zone for GPU-accelerating
-  the scratch/sentinel/persistent mechanisms** (today's spikes run them CPU-only).
+- The hybrid CPU/GPU router's `needs_cpu = !src.doc_bindings.empty()` became
+  `needs_cpu = !src.doc_bindings.empty() && !caps.supports_binding_compose` (2026-07-18, DONE) — the
+  day a backend ships `encode_slot` kernels, binding windows start routing to the device by flipping
+  one caps bit in that backend, not by editing the training loop. **This was the designed landing zone
+  for GPU-accelerating the scratch/sentinel/persistent mechanisms** (today's spikes still run
+  sentinel/persistent CPU-only; production content-embed now routes through the device).
 - An **inference-only backend (OpenVINO's natural shape)** advertises
   `supports_train=0, supports_decode=1`: generation/eval offload works, and the train stage keeps the
   CPU (or another device) without any consumer special-casing per backend name.
@@ -109,8 +110,8 @@ implementation TU + a CMake branch, not a plugin system.
    real hardware in both configurations after: CPU-only default suite green (117 cases, 9,192,142
    assertions), CUDA `[cuda]`-tagged suite green (41 cases, 2,029,105 assertions). What's left in
    `sub0_cuda_*` now is only `backend_cuda.cu` itself plus the two permanently-exempt diagnostic files --
-   assumption-branches -> caps queries (the hybrid router's `needs_cpu` flip, still open below) is
-   separate follow-up work, not blocked on this.
+   assumption-branches -> caps queries (the hybrid router's `needs_cpu` flip, see below -- DONE
+   2026-07-18) was separate follow-up work, not blocked on this.
 3. **Symbol flip**: once no production consumer names `sub0_cuda_*`, rename the exports in
    `backend_cuda.cu` to `sub0_dev_*` natively and delete the bridge forwards (the per-backend test
    suite keeps whatever backend-private symbols it needs).
@@ -130,8 +131,8 @@ suite (41 cases, 2,029,105 assertions) all green from a from-scratch rebuild. Tw
 non-blocking findings on file (a test-coverage gap on some validation-reject branches; a wire-
 constant duplication between `device_backend.hpp` and `backend_cuda.cu` that only the CUDA TU's
 `static_assert` currently guards) -- tracked as follow-up, not merge blockers. Design retained below
-for reference; the **consuming flip** (`train_stage.cpp`'s hybrid `needs_cpu`) is still open, see
-its own bullet.
+for reference; the **consuming flip** (`train_stage.cpp`'s hybrid `needs_cpu`) is also DONE now, see
+its own bullet below.
 
 Goal (met): `supports_binding_compose=1` for the CUDA backend, so the hybrid router stops forcing
 binding windows (content-embed / sentinel-pair / persistent) onto the CPU. Param-free encoders only
@@ -152,8 +153,33 @@ binding windows (content-embed / sentinel-pair / persistent) onto the CPU. Param
 - **Parity tests** (`cuda_tests.cpp` precedent): forward differential vs CPU `encode_slot` per encoder
   arm; backward gradient-scatter differential vs CPU `encode_slot_bwd`; inertness (no table installed =
   bit-identical to today); then a full train-step differential on a binding-heavy synthetic batch.
-- **Flip**: `sub0_dev_caps().supports_binding_compose = 1`, and `train_stage.cpp`'s hybrid `needs_cpu`
-  becomes `!src.doc_bindings.empty() && !sub0_dev_caps().supports_binding_compose`.
+- **Flip (DONE 2026-07-18)**: `sub0_dev_caps().supports_binding_compose = 1`, and `train_stage.cpp`'s
+  hybrid `needs_cpu` became `!src.doc_bindings.empty() && !dev_binding_compose` (`dev_binding_compose`
+  cached once from `sub0_dev_caps()`, not re-queried per window). The routing boolean alone isn't
+  enough -- `GpuTrainer::backward_only`'s materialization was already internal to the class, so the
+  caller (`sub0_train_stage`'s `hybrid_train` branch) independently re-derives each GPU sub-batch
+  window's binding state the same way `materialize_cpu_window` already did for the CPU sub-batch: for
+  every row `i` in the compacted GPU sub-batch, resolve its owning document via `doc_of(src.docs,
+  starts[b])`, build a `ScratchBindings` view over that document's `doc_bindings`, and walk the
+  window's tokens (`sb.bound`/`sb.fragments`) to flatten bound positions into the
+  `override_idx`/`entries`/`frags` wire format -- installed via `sub0_dev_set_window_bindings` right
+  before `gpu.backward_only`, cleared right after (its own documented per-step contract). No
+  per-encoding gate is needed in that loop: `ContentEmbedKind`'s persisted enum only ever selects
+  MeanPool/Hash/HRR, so every bound position a production run can produce already has a device kernel.
+  Because production `content_embed` never selects a learned encoder, `needs_cpu` is unconditionally
+  false whenever `dev_binding_compose` is true -- the CPU sub-batch side of `hybrid_train` goes idle in
+  that case (kept, not deleted: the capability check stays per-window so a future *partial*-capability
+  backend degrades correctly instead of needing a second code path). Verified: a new differential test
+  (`cuda_tests.cpp`, "doc_of-resolved bindings across multiple windows per document match CPU") proves
+  the doc_of-based multi-window-per-document resolution this adds (the existing end-to-end binding-
+  compose test only ever used one distinct table per window, never a shared per-document one) against
+  the CPU `train_batch` content-embed path; full `[cuda]` suite green (42 cases, 2,029,113 assertions)
+  and CPU-only default suite green (117 cases, 9,192,142 assertions) from a from-scratch rebuild of
+  both configs. Real hardware A/B on a live `--blend-config` (base + scratchspike, `content_embed:
+  hrr`) training run, same corpus/schedule/seed, code toggled via `git stash`: steady-state throughput
+  ~40-57% higher with the flip (e.g. 517K vs 365K tok/s, 441K vs 309K tok/s) with both runs' loss/
+  val_nelbo curves equally clean (no divergence) -- direct confirmation the GPU sub-batch is actually
+  absorbing content-embed windows now, not a no-op flip.
 
 ### How to add a backend (checklist for the future)
 

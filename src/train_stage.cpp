@@ -1539,17 +1539,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // muon_lr computation. (Previously this silently fell back to pure AdamW on GPU with a warning;
     // GPU Muon support removed the need for that fallback entirely.)
     GpuTrainer gpu;
-    // content_embed's binding lookup (encode_slot) is CPU-only (matching gen_stage.cpp's own
-    // "interception is CPU-only for now" precedent), but that only forces the WINDOWS that actually
-    // draw from a content-embed source (scratch-mix/op-mix) onto the CPU -- every other window in the
-    // same blend (base corpus, spell-mix) has no such need. gpu_available still enables the device
-    // session so those windows can route to it: see hybrid_train below (the source-routed split; algorithm
-    // proven in tests/cuda_tests.cpp "CUDA+CPU hybrid split..."), which activates whenever a GPU is
-    // available AND content_embed forces a CPU-side subset -- the two are not mutually exclusive.
+    // content_embed's binding lookup (encode_slot) forces the WINDOWS that actually draw from a
+    // content-embed source (scratch-mix/op-mix) onto the CPU UNLESS the device backend can compose
+    // bound embedding rows itself (sub0_dev_caps().supports_binding_compose -- docs/BACKENDS.md
+    // "Design: binding-compose on CUDA"; dev_binding_compose below) -- every other window in the same
+    // blend (base corpus, spell-mix) has no such need regardless. gpu_available still enables the
+    // device session so those windows can route to it: see hybrid_train below (the source-routed
+    // split; algorithm proven in tests/cuda_tests.cpp "CUDA+CPU hybrid split..."), which activates
+    // whenever a GPU is available AND content_embed forces a CPU-side subset -- the two are not
+    // mutually exclusive. When dev_binding_compose is true, that CPU-side subset is empty in practice
+    // (content_embed_kind's persisted enum only ever selects a device-composable encoding -- see
+    // ContentEmbedKind in scratch_slots.hpp), so hybrid_train's CPU sub-batch simply goes unused; the
+    // capability check stays per-window (needs_cpu below) rather than collapsing hybrid_train back to
+    // gpu_train so a future partial-capability backend degrades gracefully instead of miscomposing.
     const bool gpu_available = gpu.enable(batch, opt.step_count());
     const bool gpu_train      = !content_embed_active && gpu_available;   // pure GPU: no CPU-only source active
     const bool hybrid_train   =  content_embed_active && gpu_available;   // source-routed split (see above)
     gpu.hybrid = hybrid_train;
+    // Cached once (a static per-backend fact, not a hot-loop query) -- see needs_cpu and
+    // install_gpu_bindings below.
+    const bool dev_binding_compose = sub0_dev_caps().supports_binding_compose != 0;
 
     // Corpus-relative schedule (max_steps is a per-invocation budget, never restored). For
     // on-demand the token count is estimated from tokens/byte (the schedule is heuristic and
@@ -1625,6 +1634,17 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // lands in sub0::grad_ptr() directly (train_batch's own destination) so only ONE extra buffer is
     // needed here, not two.
     std::vector<float> hyb_gpu_grad(hybrid_train ? sub0::trainable_floats() : std::size_t{0});
+    // Binding-compose override table for the GPU sub-batch (see install_gpu_bindings below) --
+    // populated only when dev_binding_compose is true; wire layout is device_backend.hpp's
+    // sub0_dev_set_window_bindings contract (flat override_idx[gpu_n*seq_t], entries triples, a
+    // concatenated frags array). Sized once so the per-step assign()/clear()+push_back() below never
+    // grow-reallocates once steady state is reached, same reasoning as hyb_cpu_idx/hyb_gpu_idx above.
+    std::vector<int> gpu_bind_idx, gpu_bind_entries, gpu_bind_frags;
+    if (hybrid_train && dev_binding_compose) {
+        gpu_bind_idx.reserve(static_cast<std::size_t>(max_batch_t) * SEQ_LEN);
+        gpu_bind_entries.reserve(static_cast<std::size_t>(max_batch_t) * SEQ_LEN * SUB0_DEV_BIND_ENTRY_INTS);
+        gpu_bind_frags.reserve(static_cast<std::size_t>(max_batch_t) * SEQ_LEN * 4);   // ~contains_k frags/slot
+    }
     // Spawned once (not per-step -- see CpuSubBatchWorker's own comment) only when actually needed;
     // every other run leaves this empty and pays no worker-thread cost at all.
     std::optional<CpuSubBatchWorker> cpu_worker;
@@ -1925,8 +1945,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             hyb_cpu_idx.clear(); hyb_gpu_idx.clear();
             for (int b = 0; b < batch_t; ++b) {
                 // Generic over WHICH source: any source carrying structured doc_bindings needs the
-                // CPU-only slot-binding lookup, regardless of which generator produced it.
-                const bool needs_cpu = !sources[static_cast<std::size_t>(src_idx[b])].doc_bindings.empty();
+                // CPU-only slot-binding lookup, UNLESS this backend composes bound rows itself
+                // (dev_binding_compose -- install_gpu_bindings below covers the GPU sub-batch's own
+                // bound positions in that case).
+                const bool needs_cpu = !sources[static_cast<std::size_t>(src_idx[b])].doc_bindings.empty()
+                                      && !dev_binding_compose;
                 (needs_cpu ? hyb_cpu_idx : hyb_gpu_idx).push_back(b);
             }
             const int cpu_n = static_cast<int>(hyb_cpu_idx.size());
@@ -1949,9 +1972,55 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                     hyb_gpu_len[static_cast<std::size_t>(i)]    = win_len[b];
                 }
             }
+            // Build the binding-compose override table covering the GPU sub-batch's flat rows
+            // [0,gpu_n)x[0,seq_t) -- mirrors materialize_cpu_window's ScratchBindings construction
+            // (same doc_of + doc_bindings lookup) but flattened into device_backend.hpp's wire format
+            // (docs/BACKENDS.md "Design: binding-compose on CUDA"). Every bound position here is
+            // guaranteed a device-supported encoding: content_embed_kind's persisted enum never
+            // selects anything else (see gpu_available's comment above), so no per-encoding gate is
+            // needed. CPU-side construction only -- counted under prep_secs like the CPU sub-batch's
+            // own materialize_cpu_window loop above; the actual host->device upload happens under
+            // train_secs below, alongside the other device round-trips.
+            const bool gpu_has_bindings = gpu_n > 0 && dev_binding_compose;
+            if (gpu_has_bindings) {
+                gpu_bind_idx.assign(static_cast<std::size_t>(gpu_n) * static_cast<std::size_t>(seq_t), -1);
+                gpu_bind_entries.clear();
+                gpu_bind_frags.clear();
+                for (int i = 0; i < gpu_n; ++i) {
+                    const int b = hyb_gpu_idx[static_cast<std::size_t>(i)];
+                    const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
+                    if (src.doc_bindings.empty()) continue;
+                    const std::size_t doc = sub0::doc_of(src.docs, starts[b]);
+                    const sub0::ScratchBindings sb{
+                        std::span<const std::vector<int>>(src.doc_bindings[doc]), content_embed_enc };
+                    for (int t = 0; t < win_len[b]; ++t) {
+                        const int tok = src.view[starts[b] + static_cast<std::size_t>(t)];
+                        if (!sb.bound(tok)) continue;
+                        const auto frags = sb.fragments(tok);
+                        gpu_bind_idx[static_cast<std::size_t>(i) * static_cast<std::size_t>(seq_t)
+                                    + static_cast<std::size_t>(t)] =
+                            static_cast<int>(gpu_bind_entries.size() / SUB0_DEV_BIND_ENTRY_INTS);
+                        gpu_bind_entries.push_back(static_cast<int>(gpu_bind_frags.size()));
+                        gpu_bind_entries.push_back(static_cast<int>(frags.size()));
+                        gpu_bind_entries.push_back(static_cast<int>(content_embed_enc));
+                        gpu_bind_frags.insert(gpu_bind_frags.end(), frags.begin(), frags.end());
+                    }
+                }
+            }
             prep_secs += std::chrono::duration<double>(clock::now() - t_prep0).count();
 
             const auto t_train0 = clock::now();
+            if (gpu_has_bindings &&
+                sub0_dev_set_window_bindings(gpu_bind_idx.data(), static_cast<int>(gpu_bind_idx.size()),
+                                             gpu_bind_entries.data(),
+                                             static_cast<int>(gpu_bind_entries.size() / SUB0_DEV_BIND_ENTRY_INTS),
+                                             gpu_bind_frags.data(), static_cast<int>(gpu_bind_frags.size())) != 0) {
+                sub0::log::error("training: GPU binding-compose table install failed at step {} -- "
+                                 "stopping immediately without a final save; the last periodic "
+                                 "checkpoint on disk is untouched and resumable.", step);
+                device_failed = true;
+                break;
+            }
             float cpu_loss = 0.f, gpu_loss = 0.f;
             if (cpu_n > 0 && gpu_n > 0) {
                 cpu_worker->run(cpu_n, seq_t, any_masked);      // dispatch to the persistent worker thread
@@ -1966,6 +2035,17 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             } else {   // gpu_n > 0 -- batch_t >= 1 guarantees at least one of the two is nonempty
                 gpu_loss = gpu.backward_only(sources, hyb_gpu_src.data(), hyb_gpu_starts.data(),
                                              hyb_gpu_len.data(), gpu_n, seq_t, hyb_gpu_grad.data());
+            }
+            // Clear immediately after use -- sub0_dev_set_window_bindings's own contract ("the trainer
+            // clears after each step") -- so a later step with gpu_has_bindings==false (an all-unbound
+            // draw) doesn't leave a stale table composing rows that should now be plain lookups.
+            if (gpu_has_bindings &&
+                sub0_dev_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0) != 0) {
+                sub0::log::error("training: GPU binding-compose table clear failed at step {} -- "
+                                 "stopping immediately without a final save; the last periodic "
+                                 "checkpoint on disk is untouched and resumable.", step);
+                device_failed = true;
+                break;
             }
             train_secs += std::chrono::duration<double>(clock::now() - t_train0).count();
             if (!gpu.ok) {

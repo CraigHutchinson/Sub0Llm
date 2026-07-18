@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include "sub0/blend.hpp"     // doc_of -- the hybrid router's own per-window document resolution
 #include "sub0/core.hpp"     // trainable_floats()
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
@@ -1719,6 +1720,121 @@ TEST_CASE("CUDA binding-compose train step matches the CPU content-embed gradien
         if constexpr (ACT_DTYPE == Dtype::BF16) CHECK(cos > 0.7);
         else                                    CHECK(rel < 1e-2);
     }
+}
+
+// train_stage.cpp's hybrid router (needs_cpu &= !supports_binding_compose, docs/BACKENDS.md's
+// documented follow-up) now routes content-embed windows to the GPU sub-batch too, building its
+// override table from doc_of(src.docs, starts[b]) + doc_bindings[doc] -- i.e. several windows drawn
+// from the SAME document share one binding table, resolved by document rather than by window. The
+// end-to-end test above never exercises that: each of its windows carries its own distinct,
+// directly-assigned slot table with no doc_of lookup in the loop at all. This closes that specific
+// gap: two documents, two windows per document, the SAME slot index bound to DIFFERENT content in
+// each document, so a doc_of mix-up (e.g. resolving every window against document 0) would fail
+// this test even though the per-window-only test above would stay green.
+TEST_CASE("CUDA binding-compose: doc_of-resolved bindings across multiple windows per document match CPU",
+          "[cuda]") {
+    CudaGuard _cuda_guard;
+    if constexpr (POS_ENCODING != PosEncoding::Rope) {
+        SUCCEED("binding-compose install is RoPE-path only; Absolute build skips (install rejects)");
+        return;
+    }
+    static_assert(sub0::SCRATCH_SLOT_BASE + 2 <= VOCAB, "slot ids must be in-vocab");
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int T = 12, batch = 4, M = batch * T;
+    const std::vector<std::uint64_t> docs = { 0, 60, 120 };       // 2 documents, 60 tokens each
+    const std::vector<std::size_t> starts = { 5, 25, 65, 90 };    // windows 0,1 -> doc0; 2,3 -> doc1
+
+    std::mt19937 rng(4242u);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    std::vector<int> data(121);
+    for (int& x : data) x = tok(rng);
+    // One bound position per window (t=3); the SAME slot index (b%2) alternates within each doc, so
+    // a correct doc_of resolution must pull DIFFERENT fragment content for window 0 vs window 2 even
+    // though both bind slot 0.
+    for (int b = 0; b < batch; ++b)
+        data[starts[static_cast<std::size_t>(b)] + 3] = sub0::scratch_slot_id(b % 2);
+
+    std::uniform_int_distribution<int> byte_tok(0, 255);
+    std::vector<std::vector<std::vector<int>>> doc_bindings(2);
+    for (auto& doc : doc_bindings) {
+        doc.resize(sub0::SCRATCH_SLOT_COUNT);
+        for (int s = 0; s < 2; ++s) {
+            const int len = 1 + s;
+            for (int p = 0; p < len; ++p) doc[static_cast<std::size_t>(s)].push_back(byte_tok(rng));
+        }
+    }
+
+    std::vector<int> ids(static_cast<std::size_t>(M)), targets(static_cast<std::size_t>(M));
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < T; ++t) {
+            const std::size_t src = starts[static_cast<std::size_t>(b)] + static_cast<std::size_t>(t);
+            ids[static_cast<std::size_t>(b) * T + t]     = data[src];
+            targets[static_cast<std::size_t>(b) * T + t] = data[src + 1];
+        }
+
+    // CPU reference: train_batch's per-window content-embed path, bindings resolved via doc_of --
+    // exactly materialize_cpu_window's own construction (train_stage.cpp).
+    std::vector<sub0::ScratchBindings> cpu_binds(static_cast<std::size_t>(batch));
+    std::vector<const sub0::ScratchBindings*> winb(static_cast<std::size_t>(batch));
+    for (int b = 0; b < batch; ++b) {
+        const std::size_t doc = sub0::doc_of(std::span<const std::uint64_t>(docs),
+                                             starts[static_cast<std::size_t>(b)]);
+        cpu_binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+            std::span<const std::vector<int>>(doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+        winb[static_cast<std::size_t>(b)] = &cpu_binds[static_cast<std::size_t>(b)];
+    }
+    const float cpu_loss = sub0::train_batch(data.data(), starts.data(), batch, T,
+                                             nullptr, nullptr, winb.data());
+    const std::size_t n = sub0::trainable_floats();
+    const std::vector<float> cpu_grad(sub0::grad_ptr(), sub0::grad_ptr() + n);
+
+    // GPU: host-computed override table via the SAME doc_of + ScratchBindings::bound/fragments calls
+    // install_gpu_bindings (train_stage.cpp) makes, flattened into the device wire format.
+    std::vector<int> ovr(static_cast<std::size_t>(M), -1), entries, frags;
+    for (int b = 0; b < batch; ++b) {
+        const std::size_t doc = sub0::doc_of(std::span<const std::uint64_t>(docs),
+                                             starts[static_cast<std::size_t>(b)]);
+        const sub0::ScratchBindings sb{
+            std::span<const std::vector<int>>(doc_bindings[doc]), sub0::SlotEncoding::MeanPool };
+        for (int t = 0; t < T; ++t) {
+            const int tokid = ids[static_cast<std::size_t>(b) * T + t];
+            if (!sb.bound(tokid)) continue;
+            const auto fr = sb.fragments(tokid);
+            ovr[static_cast<std::size_t>(b) * T + t] = static_cast<int>(entries.size() / 3);
+            entries.push_back(static_cast<int>(frags.size()));
+            entries.push_back(static_cast<int>(fr.size()));
+            entries.push_back(static_cast<int>(sub0::SlotEncoding::MeanPool));
+            frags.insert(frags.end(), fr.begin(), fr.end());
+        }
+    }
+    REQUIRE(static_cast<int>(entries.size() / 3) == batch);   // exactly one bound position per window
+    REQUIRE(sub0_cuda_set_window_bindings(ovr.data(), M, entries.data(),
+                                          static_cast<int>(entries.size() / 3),
+                                          frags.data(), static_cast<int>(frags.size())) == 0);
+    std::vector<float> gpu_grad(n, 0.0f);
+    double gpu_loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, gpu_grad.data(), &gpu_loss) == 0);
+    REQUIRE(sub0_cuda_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0) == 0);   // per-step clear
+
+    double num = 0.0, den = 0.0, dot = 0.0, gn = 0.0, maxabs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(gpu_grad[i]) - cpu_grad[i];
+        num += d * d; den += static_cast<double>(cpu_grad[i]) * cpu_grad[i];
+        dot += static_cast<double>(gpu_grad[i]) * cpu_grad[i];
+        gn  += static_cast<double>(gpu_grad[i]) * gpu_grad[i];
+        maxabs = std::max(maxabs, std::fabs(d));
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    const double cos = dot / std::max(std::sqrt(gn * den), 1e-30);
+    INFO("doc_of hybrid-router grad rel-L2 = " << rel << "  cos = " << cos << "  max abs = " << maxabs
+         << "  cpu_loss = " << cpu_loss << "  gpu_loss = " << gpu_loss);
+    REQUIRE(std::isfinite(gpu_loss));
+    CHECK(std::fabs(gpu_loss - static_cast<double>(cpu_loss)) < 1e-2);
+    if constexpr (ACT_DTYPE == Dtype::BF16) CHECK(cos > 0.7);
+    else                                    CHECK(rel < 1e-2);
 }
 
 // Per-phase profile: attribute the step time to forward / backward / adam. The backward RECOMPUTES
