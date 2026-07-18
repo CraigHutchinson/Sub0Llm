@@ -18,6 +18,12 @@
 #include "sub0/muon.hpp"     // sub0::muon::scale_factor -- the GPU Newton-Schulz math itself is
                               // reimplemented below via cuBLAS (see muon_newton_schulz_device);
                               // only the tiny host-side post-orthogonalization scale is shared
+#include "sub0/scratch_slots.hpp"  // binding-compose (docs/BACKENDS.md "first caps flip"): SlotEncoding's
+                              // wire values, HASH_ROPE_THETA/HRR_MAX_POS, the HOST-built hrr_role_table
+                              // the device copy is uploaded from, and encode_slot/encode_slot_bwd as the
+                              // in-process CPU reference for sub0_cuda_binding_compose_check. The header
+                              // is deliberately dependency-light so the backend may include it (its own
+                              // top comment documents exactly this consumer).
 
 #include <algorithm>
 #include <cstdio>
@@ -319,6 +325,155 @@ __device__ inline float dev_dsilu(float v) {
     return s * (1.f + v * (1.f - s));
 }
 
+// ============================================================================
+//  Binding-compose (docs/BACKENDS.md "Design: binding-compose on CUDA") -- device side
+// ============================================================================
+// The HOST owns every binding table and its semantics (which token follows which sigil, which of the
+// three views wins -- see op_embed's dispatch in backend_cpu.cpp); per step it precomputes WHICH flat
+// positions embed as a composed row and uploads that as a POD "override table" via
+// sub0_cuda_set_window_bindings below. The device never parses bindings: the embed kernels just check
+// "is row m overridden?" and, if so, compose the row from fragment tok_emb rows with the entry's
+// encoder arm -- the exact math of sub0::encode_slot (scratch_slots.hpp), param-free arms only
+// (MeanPool / Hash / HRR; the learned-enc_w arms keep their documented CPU-only limit and are
+// REJECTED at install). Naive per-thread compose first (HRR is O(C) per channel = O(C^2) per row):
+// parity before performance, per the design doc.
+//
+// Wire layout across the extern "C" seam (POD ints only -- cross-referenced with the constants block
+// in include/sub0/device_backend.hpp, which deliberately doesn't share code with this TU):
+//   override_idx[n_positions] : row m composes entry override_idx[m]; -1 = plain tok_emb lookup.
+//                               For a training step the row index is m = b*T + t (the flat batch
+//                               row); for decode (forward_one) it is the token's POSITION `pos`.
+//   entries[3 * n_entries]    : {frag_offset, frag_len, encoding} int triples; frag_offset indexes
+//                               into frags[], encoding carries sub0::SlotEncoding's underlying value.
+//   frags[n_frags]            : the concatenated fragment token ids (each in [0, VOCAB)).
+constexpr int kBindEntryInts   = 3;  // ints per entry triple
+constexpr int kBindEncMeanPool = static_cast<int>(sub0::SlotEncoding::MeanPool);
+constexpr int kBindEncHash     = static_cast<int>(sub0::SlotEncoding::Hash);
+constexpr int kBindEncHRR      = static_cast<int>(sub0::SlotEncoding::HRR);
+static_assert(kBindEncMeanPool == 0 && kBindEncHash == 2 && kBindEncHRR == 4,
+    "SlotEncoding's underlying values are the seam's wire encoding (documented in "
+    "device_backend.hpp's SUB0_DEV_BIND_ENC_* constants) -- if this trips, the enum was reordered "
+    "and BOTH sides must move together.");
+
+// The device-resident override-table header. Kernels take a pointer to ONE fixed device-memory
+// instance (g_dev_bind below, allocated once and never moved) rather than the four buffers as
+// individual kernel arguments: the batched-inference forward and the decode step are CUDA-graph
+// captured, and a captured kernel's ARGUMENTS are baked at capture time -- reading the (mutable)
+// header CONTENTS through a fixed pointer is the same fixed-buffer/changing-contents pattern as
+// g_decode_state, so installing/clearing/growing a table never invalidates a captured graph.
+// n_positions == 0 (the cleared state, also the freshly-allocated state) => every row is a plain
+// lookup, and the kernels' extra work is one cached 4-byte header read per thread -- the compose
+// math itself is bit-for-bit untouched (the inertness parity test pins this).
+struct DevBindings {
+    const int*   override_idx;   // [n_positions]
+    const int*   entries;        // [kBindEntryInts * n_entries]
+    const int*   frags;          // [n_frags]
+    const float* roles;          // [HRR_MAX_POS, D_MODEL] device copy of sub0::hrr_role_table
+    int          n_positions;    // 0 = no table installed
+    int          pad_;           // keep the struct 8-byte-aligned end-to-end (POD across H2D memcpy)
+};
+
+// Row m's entry index, or -1 for a plain lookup. Null-safe (the diagnostic checks may probe before
+// any header exists); production kernels always receive the fixed g_dev_bind instance.
+__device__ inline int binding_override_at(const DevBindings* __restrict__ bind, int m) {
+    return (bind && m < bind->n_positions) ? bind->override_idx[m] : -1;
+}
+
+// Forward compose for ONE channel j of an overridden row -- the device transliteration of
+// sub0::encode_slot's MeanPool/Hash/HRR arms (scratch_slots.hpp has the math + provenance comments;
+// keep the two in lockstep). Per-fragment accumulation runs in the same p-order as the CPU loop so
+// the FP32 sums agree to rounding; cosf/sinf/powf are CUDA's accurate (few-ulp) versions, not the
+// fast intrinsics, for the tightest parity with std::cos/sin/pow float.
+__device__ inline float compose_bound_channel(const float* __restrict__ tok_emb,
+                                              const int* __restrict__ frag_ids, int len, int enc,
+                                              const float* __restrict__ roles, int j) {
+    constexpr int C = D_MODEL;
+    float out = 0.f;
+    if (enc == kBindEncMeanPool) {
+        // mean of the fragment rows (encode_slot: sum then one multiply by 1/n)
+        for (int p = 0; p < len; ++p) out += tok_emb[static_cast<size_t>(frag_ids[p]) * C + j];
+        out *= 1.f / static_cast<float>(len);
+    } else if (enc == kBindEncHash) {
+        // RoPE-style positional binding: rotate fragment p's row pair (2m,2m+1) by a p-dependent
+        // angle, then sum -- interleaved-pair convention + HASH_ROPE_THETA exactly as encode_slot.
+        constexpr int half = C / 2;
+        if (j >= 2 * half) {                       // odd-C tail channel: identity, still summed
+            for (int p = 0; p < len; ++p) out += tok_emb[static_cast<size_t>(frag_ids[p]) * C + j];
+        } else {
+            const int mp = j / 2;                   // this channel's rotation pair index
+            for (int p = 0; p < len; ++p) {
+                const float* row = tok_emb + static_cast<size_t>(frag_ids[p]) * C;
+                const float  ang = static_cast<float>(p) * powf(sub0::HASH_ROPE_THETA, -2.f * mp / C);
+                const float  cs = cosf(ang), sn = sinf(ang);
+                const float  x0 = row[2 * mp], x1 = row[2 * mp + 1];
+                out += ((j & 1) == 0) ? (x0 * cs - x1 * sn) : (x0 * sn + x1 * cs);
+            }
+        }
+    } else {  // kBindEncHRR (install rejects everything else before it can reach a kernel)
+        // circular convolution against the fixed role vector: out[j] += sum_k role[k]*filler[(j-k) mod C]
+        for (int p = 0; p < len; ++p) {
+            const float* filler = tok_emb + static_cast<size_t>(frag_ids[p]) * C;
+            const int    pi     = p < sub0::HRR_MAX_POS ? p : sub0::HRR_MAX_POS - 1;   // same clamp as encode_slot
+            const float* role   = roles + static_cast<size_t>(pi) * C;
+            float s = 0.f;
+            for (int k = 0; k < C; ++k) {
+                int idx = j - k; if (idx < 0) idx += C;
+                s += role[k] * filler[idx];
+            }
+            out += s;
+        }
+    }
+    return out;
+}
+
+// Backward scatter for ONE channel j of an overridden row -- the device transliteration of
+// sub0::encode_slot_bwd's MeanPool/Hash/HRR arms: the composed position's row grad dout[C] flows
+// into the FRAGMENT rows of dtok (never into the slot id's own row). atomicAdd like the plain
+// embedding scatter above it: several positions (or repeated fragment ids within one slot) may
+// target the same row.
+__device__ inline void compose_bound_scatter(const float* __restrict__ dout,
+                                             const int* __restrict__ frag_ids, int len, int enc,
+                                             const float* __restrict__ roles,
+                                             float* __restrict__ dtok, int j) {
+    constexpr int C = D_MODEL;
+    if (enc == kBindEncMeanPool) {
+        const float inv = 1.f / static_cast<float>(len);
+        const float val = inv * dout[j];                       // dout/n into every fragment row
+        for (int p = 0; p < len; ++p)
+            atomicAdd(&dtok[static_cast<size_t>(frag_ids[p]) * C + j], val);
+    } else if (enc == kBindEncHash) {
+        // rotation is orthogonal -> adjoint is the INVERSE rotation of dout (no tok_emb read)
+        constexpr int half = C / 2;
+        if (j >= 2 * half) {                                   // odd-C tail: identity
+            const float val = dout[j];
+            for (int p = 0; p < len; ++p)
+                atomicAdd(&dtok[static_cast<size_t>(frag_ids[p]) * C + j], val);
+        } else {
+            const int   mp = j / 2;
+            const float d0 = dout[2 * mp], d1 = dout[2 * mp + 1];
+            for (int p = 0; p < len; ++p) {
+                const float ang = static_cast<float>(p) * powf(sub0::HASH_ROPE_THETA, -2.f * mp / C);
+                const float cs = cosf(ang), sn = sinf(ang);
+                const float val = ((j & 1) == 0) ? (d0 * cs + d1 * sn) : (-d0 * sn + d1 * cs);
+                atomicAdd(&dtok[static_cast<size_t>(frag_ids[p]) * C + j], val);
+            }
+        }
+    } else {  // kBindEncHRR
+        // adjoint of circular convolution by a fixed role is circular CORRELATION by that role:
+        // d(filler)[j] = sum_n dout[n] * role[(n-j) mod C] (no tok_emb read)
+        for (int p = 0; p < len; ++p) {
+            const int    pi   = p < sub0::HRR_MAX_POS ? p : sub0::HRR_MAX_POS - 1;
+            const float* role = roles + static_cast<size_t>(pi) * C;
+            float s = 0.f;
+            for (int n = 0; n < C; ++n) {
+                int idx = n - j; if (idx < 0) idx += C;
+                s += dout[n] * role[idx];
+            }
+            atomicAdd(&dtok[static_cast<size_t>(frag_ids[p]) * C + j], s);
+        }
+    }
+}
+
 // h[m,j] = tok_emb[ids[m], j] + pos_emb[t, j], where m is the global row over batch*T and
 // t = m % T is the position WITHIN the window (op_embed + op_add: first forward step). C is D_MODEL
 // at every call site below -- constexpr-folded (no loop to unroll here, pure elementwise; the win is
@@ -335,24 +490,42 @@ __global__ void embed_add_kernel(const float* __restrict__ tok_emb, const float*
 }
 
 // Token-only embedding (RoPE path): h[m,j] = tok_emb[ids[m], j]. Position is injected later by
-// the RoPE rotation inside attention, so there is no pos_emb add here.
+// the RoPE rotation inside attention, so there is no pos_emb add here. `bind` is the fixed
+// device-resident override-table header (see DevBindings above): a row the host marked overridden
+// composes from its bound fragments' rows instead of the plain lookup; with no table installed
+// (n_positions == 0, the default) the output is bit-identical to the plain lookup.
 __global__ void embed_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
-                             float* __restrict__ h, int M) {
+                             float* __restrict__ h, int M, const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m < M && j < C) h[m * C + j] = tok_emb[ids[m] * C + j];
+    if (m >= M || j >= C) return;
+    const int ov = binding_override_at(bind, m);
+    if (ov >= 0) {
+        const int* e = bind->entries + ov * kBindEntryInts;   // {frag_offset, frag_len, encoding}
+        h[m * C + j] = compose_bound_channel(tok_emb, bind->frags + e[0], e[1], e[2], bind->roles, j);
+    } else {
+        h[m * C + j] = tok_emb[ids[m] * C + j];
+    }
 }
 
 // Activation-typed variants: write into the saved-activation store type (act_t). F32 build keeps
-// these identical to the float kernels above; BF16 stores half-width with FP32 source.
+// these identical to the float kernels above; BF16 stores half-width with FP32 source. Same
+// override branch as embed_kernel (compose math stays FP32; only the store rounds).
 template <class A>
 __global__ void embed_act_kernel(const float* __restrict__ tok_emb, const int* __restrict__ ids,
-                                 A* __restrict__ h, int M) {
+                                 A* __restrict__ h, int M, const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m < M && j < C) st_act(&h[m * C + j], tok_emb[ids[m] * C + j]);
+    if (m >= M || j >= C) return;
+    const int ov = binding_override_at(bind, m);
+    if (ov >= 0) {
+        const int* e = bind->entries + ov * kBindEntryInts;
+        st_act(&h[m * C + j], compose_bound_channel(tok_emb, bind->frags + e[0], e[1], e[2], bind->roles, j));
+    } else {
+        st_act(&h[m * C + j], tok_emb[ids[m] * C + j]);
+    }
 }
 template <class A>
 __global__ void embed_add_act_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
@@ -1416,13 +1589,24 @@ __global__ void embed_backward_kernel(const float* __restrict__ dh, const int* _
 // Token-only embedding backward (RoPE path): scatter the residual-stream grad into tok_emb only
 // (no pos_emb, which carries no gradient under RoPE).
 // C is D_MODEL at this kernel's one call site -- constexpr-folded.
+// `bind`: an overridden row's grad flows into its FRAGMENT rows (compose_bound_scatter, the exact
+// adjoint of the forward's compose -- mirrors encode_slot_bwd's dispatch in backend_cpu.cpp's
+// Op::Embed backward), never into the slot id's own row; plain rows scatter exactly as before.
 __global__ void embed_backward_token_kernel(const float* __restrict__ dh, const int* __restrict__ ids,
-                                            float* __restrict__ dtok, int M) {
+                                            float* __restrict__ dtok, int M,
+                                            const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m < M && j < C)
+    if (m >= M || j >= C) return;
+    const int ov = binding_override_at(bind, m);
+    if (ov >= 0) {
+        const int* e = bind->entries + ov * kBindEntryInts;
+        compose_bound_scatter(dh + static_cast<size_t>(m) * C, bind->frags + e[0], e[1], e[2],
+                              bind->roles, dtok, j);
+    } else {
         atomicAdd(&dtok[static_cast<size_t>(ids[m]) * C + j], dh[static_cast<size_t>(m) * C + j]);
+    }
 }
 
 // Split the fused QKV weight gradient dWqkv[C,3C] back into the per-projection grads dWq/dWk/dWv
@@ -1995,6 +2179,66 @@ template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A*
     attn_bwd_dk_kernel<A, HD, TQ><<<grid_dk, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
 }
 
+// ============================================================================
+//  Binding-compose (docs/BACKENDS.md) -- host-side override-table residency
+// ============================================================================
+// One fixed header (g_dev_bind, what every embed kernel dereferences -- see DevBindings' comment for
+// why it must never move) + three grow-on-demand data buffers (the fwd_alloc/train_alloc pattern:
+// capacity in ELEMENTS, grown by free+malloc, monotonic grow counter for observability) + the HRR
+// role table, uploaded ONCE from the host-built sub0::hrr_role_table (same mt19937/normal_distribution
+// sequence as the CPU -- the design doc forbids reproducing the RNG in device code, so the bits are
+// identical by construction). Freed by sub0_cuda_shutdown.
+DevBindings  g_bind_host = {};          // host mirror of the device header (uploaded on install/clear)
+DevBindings* g_dev_bind  = nullptr;     // the fixed device-resident header instance
+int*      g_bind_idx         = nullptr; size_t g_bind_idx_cap     = 0;
+int*      g_bind_entries     = nullptr; size_t g_bind_entries_cap = 0;   // capacity in INTS (3/entry)
+int*      g_bind_frags       = nullptr; size_t g_bind_frags_cap   = 0;
+float*    g_bind_roles       = nullptr;
+long long g_bind_grows       = 0;       // monotonic (re)allocation count -- test observability
+
+// Allocate the fixed header (+ the role table) once; upload the cleared state so kernels captured
+// into a graph before any install read a valid, empty table. Idempotent and cheap after the first
+// call -- fwd_alloc runs it on every path that can lead to a kernel launch or a graph capture.
+int ensure_bind_hdr() {
+    if (g_dev_bind) return 0;
+    ensure_stream();
+    SUB0_CUDA_CHECK(cudaMalloc(&g_dev_bind, sizeof(DevBindings)));
+    const size_t role_n = static_cast<size_t>(sub0::HRR_MAX_POS) * D_MODEL;
+    SUB0_CUDA_CHECK(cudaMalloc(&g_bind_roles, role_n * sizeof(float)));
+    const std::vector<float>& roles = sub0::hrr_role_table(D_MODEL);   // host-built, program-lifetime
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_bind_roles, roles.data(), role_n * sizeof(float),
+                                    cudaMemcpyHostToDevice, g_stream));
+    g_bind_host = DevBindings{ nullptr, nullptr, nullptr, g_bind_roles, 0, 0 };
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_bind, &g_bind_host, sizeof(DevBindings),
+                                    cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    return 0;
+}
+
+// Grow one binding data buffer to >= need elements (never shrinks -- same policy as fwd/train
+// scratch). The header is re-uploaded by the caller after ANY reserve, so a moved buffer pointer
+// can never be observed stale by a kernel.
+int bind_reserve_one(int** buf, size_t* cap, size_t need) {
+    if (need <= *cap) return 0;
+    if (*buf) cudaFree(*buf);
+    *buf = nullptr; *cap = 0;
+    SUB0_CUDA_CHECK(cudaMalloc(buf, need * sizeof(int)));
+    *cap = need;
+    ++g_bind_grows;
+    return 0;
+}
+
+void bind_free() {
+    if (g_dev_bind)     cudaFree(g_dev_bind);
+    if (g_bind_idx)     cudaFree(g_bind_idx);
+    if (g_bind_entries) cudaFree(g_bind_entries);
+    if (g_bind_frags)   cudaFree(g_bind_frags);
+    if (g_bind_roles)   cudaFree(g_bind_roles);
+    g_dev_bind = nullptr; g_bind_idx = g_bind_entries = g_bind_frags = nullptr; g_bind_roles = nullptr;
+    g_bind_idx_cap = g_bind_entries_cap = g_bind_frags_cap = 0;
+    g_bind_host = DevBindings{};
+}
+
 // Hard cap on the minibatch the resident device scratch will size to. Decoupled from the CPU's
 // data-parallel width: the GPU wants a larger batch (bigger GEMM M = better utilization). The
 // scratch is sized to the ACTUAL batch requested (grow-on-demand, see fwd_alloc/train_alloc), so a
@@ -2078,6 +2322,8 @@ void fwd_free_batch() {
 // hundreds of MiB during training.
 int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
     if (wqkv_alloc()) return 1;
+    if (ensure_bind_hdr()) return 1;   // the embed kernels dereference g_dev_bind unconditionally --
+                                       // it must exist (cleared) before any launch or graph capture
     const size_t need = static_cast<size_t>(batch) * static_cast<size_t>(T);
     if (g_fwd_rows >= need && g_fwd.dids && (!full || g_fwd_full)) return 0;   // already big enough
     fwd_free_batch();                                      // grow: drop the old (smaller) buffers
@@ -2286,29 +2532,43 @@ inline void kv_free() {
 // Body factored out so the plain (id/pos by VALUE, used by the eager eager forward_one_device path
 // below) and the _g graphed variant (id/pos read from a device pointer -- see g_decode_state's own
 // comment for why) share one implementation instead of two copies of the same math.
+// `bind`: decode reads the SAME installed override table as the batched paths, indexed by the token's
+// POSITION `pos` (the decode counterpart of the batched kernels' flat row m) -- so a full forward and
+// a token-by-token decode over the same ids compose identically. The header pointer is fixed
+// (g_dev_bind), so the graphed variant below stays capture-safe exactly like id_pos.
 __device__ inline void embed_one_body(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                      int id, int pos, float* __restrict__ h, int j) {
+                                      int id, int pos, float* __restrict__ h, int j,
+                                      const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
-    float v = tok_emb[static_cast<size_t>(id) * C + j];
+    const int ov = binding_override_at(bind, pos);
+    float v;
+    if (ov >= 0) {
+        const int* e = bind->entries + ov * kBindEntryInts;
+        v = compose_bound_channel(tok_emb, bind->frags + e[0], e[1], e[2], bind->roles, j);
+    } else {
+        v = tok_emb[static_cast<size_t>(id) * C + j];
+    }
     if (pos_emb) v += pos_emb[static_cast<size_t>(pos) * C + j];
     h[j] = v;
 }
 __global__ void embed_one_kernel(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                 int id, int pos, float* __restrict__ h) {
+                                 int id, int pos, float* __restrict__ h,
+                                 const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= C) return;
-    embed_one_body(tok_emb, pos_emb, id, pos, h, j);
+    embed_one_body(tok_emb, pos_emb, id, pos, h, j, bind);
 }
 // Graphed-decode variant: id/pos come from g_decode_state[0]/[1] instead of by-value kernel arguments,
 // so this node's captured arguments never change between tokens (only the buffer's CONTENTS do) -- see
 // g_decode_state's own comment and capture_decode_graph() below.
 __global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const float* __restrict__ pos_emb,
-                                   const int* __restrict__ id_pos, float* __restrict__ h) {
+                                   const int* __restrict__ id_pos, float* __restrict__ h,
+                                   const DevBindings* __restrict__ bind) {
     constexpr int C = D_MODEL;
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= C) return;
-    embed_one_body(tok_emb, pos_emb, id_pos[0], id_pos[1], h, j);
+    embed_one_body(tok_emb, pos_emb, id_pos[0], id_pos[1], h, j, bind);
 }
 // RoPE one row: rotate q (cols [0,C)) and k (cols [C,2C)) of a fused [3C] qkv row at position pos
 // (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched. C/H constexpr-folded (D_MODEL/
@@ -2488,7 +2748,7 @@ void forward_one_device(int id, int pos) {
     float* proj = g_fwd.proj; float* fbuf = g_fwd.fbuf; float* ff1 = g_fwd.ff1; float* gact = g_fwd.gact; float* ff2 = g_fwd.ff2;
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
-      embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h); }
+      embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h, g_dev_bind); }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
@@ -2560,7 +2820,7 @@ void forward_one_device_graphed() {
     const int* pos_ptr = g_decode_state + 1;
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
-      embed_one_kernel_g<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id_ptr, h); }
+      embed_one_kernel_g<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id_ptr, h, g_dev_bind); }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
@@ -2640,7 +2900,7 @@ void forward_device(int batch, int T) {
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
             embed_add_kernel<<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, h, M, T);
         else
-            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M);
+            embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M, g_dev_bind);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
@@ -2874,7 +3134,7 @@ void forward_train(int batch, int T) {
         if constexpr (POS_ENCODING == PosEncoding::Absolute)
             embed_add_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, pos_emb, g_fwd.dids, g_tr.h_in[0], M, T);
         else
-            embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M);
+            embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, g_dev_bind);
     }
     for (int l = 0; l < N_LAYERS; ++l) {
         const int    b0  = layer_base(l);
@@ -3100,7 +3360,7 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
                 g_tr.dh, g_fwd.dids, gb + L[0].off, gb + L[1].off, M, T);
         else
             embed_backward_token_kernel<<<grid, block, 0, g_stream>>>(
-                g_tr.dh, g_fwd.dids, gb + L[0].off, M);
+                g_tr.dh, g_fwd.dids, gb + L[0].off, M, g_dev_bind);
     }
 }
 
@@ -3385,6 +3645,7 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
     kv_free();                                   // and the decode KV-cache
     train_free();                                // and the training scratch (Phase 2d)
     opt_free();                                  // and the optimizer state
+    bind_free();                                 // and the binding-compose override table
     if (g_cublas) { cublasDestroy(g_cublas); g_cublas = nullptr; }
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = nullptr; }
 }
@@ -3719,6 +3980,89 @@ SUB0_CUDA_API int sub0_cuda_scratch_stats(long long* fwd_rows, long long* tr_row
     if (tr_rows)   *tr_rows   = static_cast<long long>(g_tr_rows);
     if (fwd_grows) *fwd_grows = g_fwd_grows;
     if (tr_grows)  *tr_grows  = g_tr_grows;
+    return 0;
+}
+
+// Install (or clear) the binding-compose override table the embed kernels read -- the device half of
+// docs/BACKENDS.md's "Design: binding-compose on CUDA". The HOST precomputes which flat positions of
+// the NEXT step (or decode session) embed as composed rows; the device only composes what it is told
+// to. Wire layout: see the kBindEntryInts block above (and the cross-referenced SUB0_DEV_BIND_*
+// constants in include/sub0/device_backend.hpp). Semantics:
+//   * override_idx == nullptr or n_positions <= 0  =>  CLEAR the installed table (the per-step
+//     default -- the trainer clears after each step). Always succeeds, even before init.
+//   * A table stays installed across calls until cleared/replaced, and is read by EVERY embed path
+//     (train forward/backward, batched inference forward, decode) -- callers that only want it for
+//     one step must clear it afterward.
+//   * Entries are VALIDATED here, host-side, and the whole install is REJECTED (nonzero, nothing
+//     changes) on: an unsupported encoding (only the param-free MeanPool/Hash/HRR arms have device
+//     kernels -- the learned-enc_w arms and Scalar keep their documented CPU-only limit), an
+//     out-of-range override/frag index, a frag id outside [0, VOCAB), or an Absolute-positional
+//     build (only the RoPE-path embed kernels carry the override branch; production is RoPE, and
+//     silently ignoring a table would mis-train).
+//   * Host contract for PERSISTENT-range ids: a position whose token id is >= VOCAB MUST be marked
+//     overridden (an overridden row never reads ids[m], so any id is safe there) -- the plain-lookup
+//     branch indexes tok_emb[id] directly, the same OOB the CPU's unconditional is_persistent_slot
+//     guard exists to close (see op_embed's comment, backend_cpu.cpp). The device deliberately does
+//     NOT re-guard per row: the host walks every window's ids anyway to build this table, and the
+//     no-table fast path must stay bit-identical to the pre-binding kernels.
+// Returns 0 ok; 1 = CUDA/alloc failure; 2 = rejected input. Synchronizes before returning, so the
+// caller's host arrays may be freed/reused immediately (same contract shape as upload_params).
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_set_window_bindings(const int* override_idx, int n_positions,
+                                                              const int* entries, int n_entries,
+                                                              const int* frags, int n_frags) {
+    if (ensure_bind_hdr()) return 1;
+    if (!override_idx || n_positions <= 0) {                   // clear
+        g_bind_host.n_positions = 0;
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_bind, &g_bind_host, sizeof(DevBindings),
+                                        cudaMemcpyHostToDevice, g_stream));
+        SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+        return 0;
+    }
+    if constexpr (POS_ENCODING != PosEncoding::Rope) {
+        std::fprintf(stderr, "sub0_cuda_set_window_bindings: rejected -- only the RoPE-path embed "
+                             "kernels carry the override branch (Absolute-positional build)\n");
+        return 2;
+    }
+    // --- host-side validation (reject the whole install rather than silently mis-composing) -------
+    if (n_positions > MAX_FWD_BATCH * SEQ_LEN) return 2;       // beyond any admissible step's rows
+    if (n_entries < 0 || n_frags < 0) return 2;
+    if ((n_entries > 0 && !entries) || (n_frags > 0 && !frags)) return 2;
+    for (int m = 0; m < n_positions; ++m)
+        if (override_idx[m] < -1 || override_idx[m] >= n_entries) return 2;
+    for (int e = 0; e < n_entries; ++e) {
+        const int off = entries[e * kBindEntryInts + 0];
+        const int len = entries[e * kBindEntryInts + 1];
+        const int enc = entries[e * kBindEntryInts + 2];
+        if (len < 1 || off < 0 || off > n_frags - len) return 2;
+        if (enc != kBindEncMeanPool && enc != kBindEncHash && enc != kBindEncHRR) {
+            std::fprintf(stderr, "sub0_cuda_set_window_bindings: rejected -- entry %d encoding %d has "
+                                 "no device kernel (param-free MeanPool/Hash/HRR only)\n", e, enc);
+            return 2;
+        }
+    }
+    for (int f = 0; f < n_frags; ++f)
+        if (frags[f] < 0 || frags[f] >= VOCAB) return 2;       // fragment rows index tok_emb [VOCAB,C]
+    // --- upload (grow-on-demand buffers; the header re-upload publishes any moved pointer) --------
+    if (bind_reserve_one(&g_bind_idx, &g_bind_idx_cap, static_cast<size_t>(n_positions)) ||
+        bind_reserve_one(&g_bind_entries, &g_bind_entries_cap,
+                         static_cast<size_t>(n_entries) * kBindEntryInts) ||
+        bind_reserve_one(&g_bind_frags, &g_bind_frags_cap, static_cast<size_t>(n_frags)))
+        return 1;
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_bind_idx, override_idx,
+                                    static_cast<size_t>(n_positions) * sizeof(int),
+                                    cudaMemcpyHostToDevice, g_stream));
+    if (n_entries > 0)
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_bind_entries, entries,
+                                        static_cast<size_t>(n_entries) * kBindEntryInts * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+    if (n_frags > 0)
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_bind_frags, frags,
+                                        static_cast<size_t>(n_frags) * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+    g_bind_host = DevBindings{ g_bind_idx, g_bind_entries, g_bind_frags, g_bind_roles, n_positions, 0 };
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_bind, &g_bind_host, sizeof(DevBindings),
+                                    cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     return 0;
 }
 
@@ -4400,6 +4744,135 @@ SUB0_CUDA_API int sub0_cuda_qknorm_check(int shape_sel, int rows, double* out_re
         case 1: return qknorm_check_impl<7, 64>(rows, out_relL2_fwd, out_relL2_bwd);
         default: return 2;
     }
+}
+
+// Binding-compose parity hook (docs/BACKENDS.md "first caps flip"): drives the PRODUCTION embed
+// kernels (embed_kernel, embed_act_kernel<act_t>, embed_backward_token_kernel -- the exact
+// launches forward_device/forward_train/backward_device make, same launch geometry) over a
+// synthetic token table with a mix of overridden and plain rows, through the REAL install path
+// (sub0_cuda_set_window_bindings), and compares against sub0::encode_slot / encode_slot_bwd -- the
+// in-process CPU reference (scratch_slots.hpp), computed on the identical host data. Fragment
+// lengths cover 1 (degenerate single-fragment), mid lengths, and 20 (> HRR_MAX_POS=16, so the
+// role-table position clamp is exercised, and > any production slot's span).
+//
+// `enc_sel` is the wire encoding (sub0::SlotEncoding underlying value; MeanPool/Hash/HRR only).
+// out_fwd_maxabs/out_fwd_maxrel: embed_kernel (FP32 store) max |gpu-ref| and that scaled by the
+// reference's own max magnitude. out_fwd_act_maxrel: embed_act_kernel<act_t> vs the same FP32
+// reference, scaled the same way (a BF16 build rounds only at the store, so this is the
+// storage-rounding envelope -- ~2^-8; an F32 build matches the plain kernel).
+// out_bwd_maxabs/out_bwd_maxrel: the backward scatter into a zeroed grad table. Returns 0 ok,
+// 1 = CUDA failure, 2 = bad enc_sel. Clears the installed table before returning.
+SUB0_CUDA_API int sub0_cuda_binding_compose_check(int enc_sel, unsigned seed,
+                                                  double* out_fwd_maxabs, double* out_fwd_maxrel,
+                                                  double* out_fwd_act_maxrel,
+                                                  double* out_bwd_maxabs, double* out_bwd_maxrel) {
+    if (enc_sel != kBindEncMeanPool && enc_sel != kBindEncHash && enc_sel != kBindEncHRR) return 2;
+    const sub0::SlotEncoding enc = static_cast<sub0::SlotEncoding>(enc_sel);
+    constexpr int C = D_MODEL;
+    constexpr int R = 96;                        // synthetic tok-table rows (< VOCAB, always)
+    static_assert(R < VOCAB, "frag ids must index real tok_emb rows");
+    constexpr int M = 24;                        // positions (every other one overridden)
+    ensure_stream();
+
+    // Host data: a random table + ids + upstream grad, and an override set with frag lens
+    // {1,2,3,4,6,9,12,20} cycling across the overridden positions.
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> tab(static_cast<size_t>(R) * C);
+    std::vector<float> dh(static_cast<size_t>(M) * C);
+    for (float& v : tab) v = nd(rng);
+    for (float& v : dh)  v = nd(rng);
+    std::uniform_int_distribution<int> tok(0, R - 1);
+    std::vector<int> ids(M);
+    for (int& v : ids) v = tok(rng);
+    constexpr int kLens[] = { 1, 2, 3, 4, 6, 9, 12, 20 };
+    std::vector<int> ovr(M, -1), entries, frags;
+    int ne = 0;
+    for (int m = 0; m < M; m += 2) {
+        const int len = kLens[(m / 2) % (sizeof(kLens) / sizeof(kLens[0]))];
+        entries.push_back(static_cast<int>(frags.size()));
+        entries.push_back(len);
+        entries.push_back(enc_sel);
+        for (int p = 0; p < len; ++p) frags.push_back(tok(rng));
+        ovr[m] = ne++;
+    }
+    if (sub0_cuda_set_window_bindings(ovr.data(), M, entries.data(), ne,
+                                      frags.data(), static_cast<int>(frags.size())) != 0) return 1;
+
+    // Device buffers (per-call allocations are fine in a test hook -- see sub0_cuda_linear's note).
+    float* dtab = nullptr; int* dids = nullptr; float* dfwd = nullptr; float* dactf = nullptr;
+    act_t* dact = nullptr; float* ddh = nullptr; float* dgrad = nullptr;
+    SUB0_CUDA_CHECK(cudaMalloc(&dtab, tab.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dids, ids.size() * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dfwd, static_cast<size_t>(M) * C * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dact, static_cast<size_t>(M) * C * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dactf, static_cast<size_t>(M) * C * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ddh, dh.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dgrad, tab.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(dtab, tab.data(), tab.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(dids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(ddh, dh.data(), dh.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaMemsetAsync(dgrad, 0, tab.size() * sizeof(float), g_stream));
+
+    // The REAL kernels, at the production launch geometry (dim3(16,16) over (C, M)).
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((C + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+        embed_kernel<<<grid, block, 0, g_stream>>>(dtab, dids, dfwd, M, g_dev_bind);
+        embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(dtab, dids, dact, M, g_dev_bind);
+        embed_backward_token_kernel<<<grid, block, 0, g_stream>>>(ddh, dids, dgrad, M, g_dev_bind);
+    }
+    { const int n = M * C, bk = 256;
+      act_to_f32_kernel<<<(n + bk - 1) / bk, bk, 0, g_stream>>>(dact, dactf, n); }
+    std::vector<float> gfwd(static_cast<size_t>(M) * C), gact(static_cast<size_t>(M) * C);
+    std::vector<float> ggrad(tab.size());
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(gfwd.data(), dfwd, gfwd.size() * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(gact.data(), dactf, gact.size() * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(ggrad.data(), dgrad, ggrad.size() * sizeof(float), cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+    cudaFree(dtab); cudaFree(dids); cudaFree(dfwd); cudaFree(dact); cudaFree(dactf);
+    cudaFree(ddh); cudaFree(dgrad);
+
+    // CPU reference: encode_slot / encode_slot_bwd for overridden rows, the plain lookup/scatter
+    // for the rest -- mirroring op_embed / backward_node's Op::Embed dispatch exactly.
+    std::vector<float> ref(static_cast<size_t>(M) * C, 0.f), refg(tab.size(), 0.f);
+    for (int m = 0; m < M; ++m) {
+        float* rrow = ref.data() + static_cast<size_t>(m) * C;
+        const float* drow = dh.data() + static_cast<size_t>(m) * C;
+        if (ovr[m] >= 0) {
+            const int off = entries[static_cast<size_t>(ovr[m]) * kBindEntryInts + 0];
+            const int len = entries[static_cast<size_t>(ovr[m]) * kBindEntryInts + 1];
+            const std::span<const int> fr(frags.data() + off, static_cast<size_t>(len));
+            sub0::encode_slot(tab.data(), C, fr, enc, rrow);
+            sub0::encode_slot_bwd(drow, C, fr, enc, refg.data(), tab.data());
+        } else {
+            for (int j = 0; j < C; ++j) rrow[j] = tab[static_cast<size_t>(ids[m]) * C + j];
+            for (int j = 0; j < C; ++j) refg[static_cast<size_t>(ids[m]) * C + j] += drow[j];
+        }
+    }
+    auto max_diff = [](const std::vector<float>& got, const std::vector<float>& want,
+                       double& maxabs, double& maxrel) {
+        double ma = 0.0, mag = 1e-30;
+        for (size_t i = 0; i < want.size(); ++i) {
+            ma  = std::fmax(ma, std::fabs(static_cast<double>(got[i]) - want[i]));
+            mag = std::fmax(mag, std::fabs(static_cast<double>(want[i])));
+        }
+        maxabs = ma; maxrel = ma / mag;
+    };
+    double fa = 0, fr_ = 0, aa = 0, ar = 0, ba = 0, br = 0;
+    max_diff(gfwd, ref, fa, fr_);
+    max_diff(gact, ref, aa, ar);
+    max_diff(ggrad, refg, ba, br);
+    (void)aa;   // the act path's absolute diff scales with the (arbitrary) synthetic magnitudes;
+                // the scaled value below is the meaningful storage-rounding gate
+    if (out_fwd_maxabs)     *out_fwd_maxabs     = fa;
+    if (out_fwd_maxrel)     *out_fwd_maxrel     = fr_;
+    if (out_fwd_act_maxrel) *out_fwd_act_maxrel = ar;
+    if (out_bwd_maxabs)     *out_bwd_maxabs     = ba;
+    if (out_bwd_maxrel)     *out_bwd_maxrel     = br;
+    // Leave no table installed for whatever runs next in this process.
+    return sub0_cuda_set_window_bindings(nullptr, 0, nullptr, 0, nullptr, 0);
 }
 
 // GPU Newton-Schulz self-test hook: runs muon_newton_schulz_device (the EXACT device pipeline

@@ -41,6 +41,25 @@ struct Sub0DeviceCaps {
     int supports_tf32;              // the set_tf32 precision hint is meaningful on this hardware
 };
 
+// --- Binding-compose override-table wire layout (sub0_dev_set_window_bindings) -----------------
+// The host precomputes, per step (or per decode session), WHICH flat positions embed as composed
+// rows -- the device never parses binding semantics (docs/BACKENDS.md "Design: binding-compose on
+// CUDA"). POD ints only across the seam:
+//   override_idx[n_positions] : position m composes entries[override_idx[m]]; -1 = plain lookup.
+//                               Training: m = b*T + t (flat batch row). Decode: m = the token's pos.
+//   entries                   : n_entries consecutive {frag_offset, frag_len, encoding} int triples
+//                               (SUB0_DEV_BIND_ENTRY_INTS per entry).
+//   frags[n_frags]            : concatenated fragment token ids, each in [0, VOCAB).
+// `encoding` carries sub0::SlotEncoding's underlying value; only the param-free arms below have
+// device kernels -- anything else is REJECTED at install (nonzero return, nothing changes), never
+// silently mis-composed. Cross-referenced with the kBindEntryInts/kBindEnc* block in
+// src/backend_cuda.cu (a static_assert there pins the values; the two headers deliberately don't
+// share code -- same convention as scratch_slots.hpp vs registry.hpp's enum-name list).
+constexpr int SUB0_DEV_BIND_ENTRY_INTS   = 3;
+constexpr int SUB0_DEV_BIND_ENC_MEANPOOL = 0;   // == (int)sub0::SlotEncoding::MeanPool
+constexpr int SUB0_DEV_BIND_ENC_HASH     = 2;   // == (int)sub0::SlotEncoding::Hash
+constexpr int SUB0_DEV_BIND_ENC_HRR      = 4;   // == (int)sub0::SlotEncoding::HRR
+
 #if defined(SUB0_BUILD_CUDA)
 
 // --- The current CUDA backend's exports (canonical declarations; consumers: prefer sub0_dev_*) -------
@@ -62,14 +81,22 @@ extern "C" [[nodiscard]] int  sub0_cuda_train_footprint(int batch, double* predi
 extern "C" int                sub0_cuda_free_vram_mb();
 extern "C" [[nodiscard]] int  sub0_cuda_kv_reset();
 extern "C" [[nodiscard]] int  sub0_cuda_forward_one(int id, int pos, float* out_logits);
+extern "C" [[nodiscard]] int  sub0_cuda_set_window_bindings(const int* override_idx, int n_positions,
+                                                            const int* entries, int n_entries,
+                                                            const int* frags, int n_frags);
 
 // --- The neutral seam: zero-cost forwards over the CUDA exports (the bridge, docs/BACKENDS.md) -------
 inline Sub0DeviceCaps sub0_dev_caps() {
     // The TRUTHFUL current capability set: CUDA trains + decodes with device-resident opt state and
-    // TF32 control, but has no interception path and no binding-compose kernels (those windows route to
-    // CPU under the hybrid split until kernels exist and this flips -- the designed landing zone for
-    // GPU-side scratch/sentinel work).
-    return { "cuda", 1, 1, 0, 0, 1, 1 };
+    // TF32 control, and (2026-07-17, the first caps flip -- docs/BACKENDS.md "Design: binding-compose
+    // on CUDA") composes binding-override embed rows on device for the param-free encoder arms
+    // (MeanPool/Hash/HRR; sub0_dev_set_window_bindings REJECTS anything else at install). Flipped
+    // only after the four-gate parity suite (per-arm forward + backward differentials vs
+    // encode_slot/encode_slot_bwd, inertness, end-to-end binding-heavy train-step differential) ran
+    // green on real hardware -- see cuda_tests.cpp's "binding-compose" cases. No interception path
+    // yet. The hybrid router's consuming flip (needs_cpu &= !supports_binding_compose) is the
+    // documented follow-up; nothing routes differently until train_stage.cpp adopts it.
+    return { "cuda", 1, 1, 0, 1, 1, 1 };
 }
 [[nodiscard]] inline int  sub0_dev_init()                       { return sub0_cuda_init(); }
 inline void               sub0_dev_shutdown()                   { sub0_cuda_shutdown(); }
@@ -99,6 +126,14 @@ inline int                sub0_dev_free_mem_mb()                { return sub0_cu
 [[nodiscard]] inline int  sub0_dev_forward_one(int id, int pos, float* out_logits) {
     return sub0_cuda_forward_one(id, pos, out_logits);
 }
+// Install (or clear: null/0) the binding-compose override table -- see the wire-layout block above.
+// Rejects (nonzero) any entry whose encoding has no device kernel; clear always succeeds. The table
+// stays installed until cleared/replaced (the trainer clears after each step).
+[[nodiscard]] inline int  sub0_dev_set_window_bindings(const int* override_idx, int n_positions,
+                                                       const int* entries, int n_entries,
+                                                       const int* frags, int n_frags) {
+    return sub0_cuda_set_window_bindings(override_idx, n_positions, entries, n_entries, frags, n_frags);
+}
 
 #else  // no device backend in this build ------------------------------------------------------------
 
@@ -122,5 +157,7 @@ inline void               sub0_dev_set_tf32(int)                 {}
 inline int                sub0_dev_free_mem_mb()                 { return 0; }
 [[nodiscard]] inline int  sub0_dev_kv_reset()                    { return -1; }
 [[nodiscard]] inline int  sub0_dev_forward_one(int, int, float*) { return -1; }
+[[nodiscard]] inline int  sub0_dev_set_window_bindings(const int*, int, const int*, int,
+                                                       const int*, int)          { return -1; }
 
 #endif
