@@ -30,6 +30,7 @@ add_executable(sub0_tests
   numeric_bind_engine_tests.cpp
   gsm8k_engine_tests.cpp
   blend_schedule_tests.cpp
+  blended_capstone_engine_tests.cpp
 )
 
 # Tests compile against the engine API and the generated config header.
