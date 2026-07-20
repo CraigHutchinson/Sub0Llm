@@ -196,4 +196,45 @@ inline SlotDataset build_slot_exposure_dataset(const tok::Tokenizer& tk,
     return ds;
 }
 
+// Phase D ("Pack-Aware Training", docs/FACTSPIKE.md): slot-RETRIEVAL documents -- unlike
+// build_slot_exposure_dataset above (which grades generic filler text after the slot, so gradient
+// reaching the packed vector is only weakly, indirectly informative), these documents grade the FACT
+// ITSELF immediately after the slot. The fact is NOT restated via full text anywhere in THIS document --
+// a separate build_dataset() call over the same subjects supplies that (mirroring how the eval only
+// ever sees the subject via the packed slot) -- so predicting the correct color has no source in this
+// document's own context other than the packed vector. This makes the gradient through encode_slot_bwd
+// (HRR: correlation-by-role, hrr_unbind's structural counterpart) directly task-contingent, the same way
+// QAT computes its real task loss through the dequantized forward pass rather than a decoupled auxiliary
+// objective. Token shape after the slot exactly matches eval_scratch's own prompt ("<slot> loves the
+// color <fact>"), minimizing train/eval distribution shift.
+inline SlotDataset build_slot_retrieval_dataset(const tok::Tokenizer& tk,
+                                                const std::vector<FactPair>& exposure_subjects,
+                                                int docs_per_fact, std::uint64_t seed) {
+    SlotDataset ds;
+    ds.doc_starts.push_back(0);
+    std::mt19937_64 rng(seed);
+    (void)rng;   // reserved for future template variation; single fixed shape for now (matches eval)
+    for (const FactPair& fp : exposure_subjects) {
+        const std::vector<int> subj_ctx = tok::encode(tk, fp.subject);
+        std::vector<int> pieces;
+        for (std::size_t k = 0; k < subj_ctx.size(); ) {
+            const auto [span_len, ids] = detail::word_span(subj_ctx, k);
+            pieces.insert(pieces.end(), ids.begin(), ids.end());
+            k += span_len;
+        }
+        for (int i = 0; i < docs_per_fact; ++i) {
+            auto g     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(1); };
+            auto m     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(0); };
+            auto gtext = [&](const std::string& s) { for (int t : tok::encode(tk, s)) g(t); };
+
+            m(SCRATCH_SLOT_BASE);
+            gtext(" loves the color " + fp.fact + ".");   // graded target IS the fact -- task-contingent
+
+            ds.doc_starts.push_back(ds.tokens.size());
+            ds.doc_bindings.push_back({ pieces });
+        }
+    }
+    return ds;
+}
+
 }  // namespace sub0::factspike

@@ -15,6 +15,19 @@
 //     SEPARATE subjects from the ones under test) blended with fact-teaching, then the real 3-arm A/B:
 //     baseline (subject spelled out), scratch (subject's own piece ids bound to a slot, no textual
 //     restatement), held-out (same slot mechanism, subject never fact-taught -- negative control).
+//     RESULT (docs/FACTSPIKE.md): peak baseline=1.00, scratch=0.56 (above chance, real signal), held-
+//     out=0.33 (consistent with n=3 noise). A reconstruction-fidelity diagnostic added afterward found NO
+//     positive correlation between packed-vector fidelity and scratch accuracy (r=-0.23) -- because
+//     Phase C's exposure documents only grade generic filler text after the slot, never the fact itself,
+//     so nothing trains packed-vector fidelity for the actual eval subjects at all.
+//   * [.factspikepat] -- Phase D ("Pack-Aware Training"): same budget/seeds as Phase C, but the slot-
+//     exposure documents are replaced with build_slot_retrieval_dataset()'s task-contingent design -- the
+//     graded text after the slot IS the fact color itself (no full-text restatement in that document),
+//     so gradient into the packed vector is directly informative, the structural match to how QAT
+//     computes its real task loss through the dequantized forward pass. Exposure subjects additionally
+//     get ordinary full-text fact teaching via a WIDENED build_dataset() pool (drilled + exposure
+//     subjects together) -- a separate document, so no in-document shortcut. Matched-budget A/B against
+//     Phase C's own recorded numbers.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -391,6 +404,91 @@ TEST_CASE("factspike Phase C: does a factual association survive PIECE-EMBEDDING
     WARN(report);
 
     // Report all three, real numbers, whatever they are -- this is an open experiment (docs/FACTSPIKE.md).
+    CHECK(std::isfinite(peak_baseline));
+    CHECK(std::isfinite(peak_scratch));
+    CHECK(std::isfinite(peak_held_out));
+    CHECK(std::isfinite(r_scratch));
+    CHECK(std::isfinite(r_held_out));
+}
+
+TEST_CASE("factspike Phase D: Pack-Aware Training -- task-contingent slot-retrieval gradient, matched "
+         "budget A/B against Phase C", "[.factspikepat]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase D: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+    REQUIRE_FALSE(split.held_out.empty());
+
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+
+    // WIDENED plain-text pool: drilled + exposure subjects both get ordinary full-text fact teaching
+    // (exposure subjects lost their "mention 1" full text when build_slot_retrieval_dataset dropped it --
+    // this is where they get it instead, as a genuinely separate document). held-out is NEVER added here.
+    std::vector<fs::FactPair> fact_subjects = split.drilled;
+    fact_subjects.insert(fact_subjects.end(), exposure_split.drilled.begin(), exposure_split.drilled.end());
+    const fs::Dataset ds = fs::build_dataset(tk, fact_subjects, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_retrieval_dataset(tk, exposure_split.drilled,
+                                                                     kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+
+    std::string report = "\n=== factspike Phase D PAT (d" + std::to_string(D_MODEL) + ", " +
+        std::to_string(split.drilled.size()) + " drilled / " + std::to_string(split.held_out.size()) +
+        " held-out, " + std::to_string(exposure_split.drilled.size()) + " slot-retrieval subjects) ===\n";
+    double peak_baseline = 0.0, peak_scratch = 0.0, peak_held_out = 0.0;
+    double last_baseline = 0.0, last_scratch = 0.0, last_held_out = 0.0;
+    std::vector<double> scratch_traj, held_out_traj, fid_drilled_traj, fid_held_out_traj;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+        const Score sb = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score ss = eval_scratch(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score sh = eval_scratch(tk, split.held_out, 4242u + static_cast<unsigned>(r));
+        last_baseline = sb.rate(); last_scratch = ss.rate(); last_held_out = sh.rate();
+        peak_baseline = std::max(peak_baseline, last_baseline);
+        peak_scratch  = std::max(peak_scratch,  last_scratch);
+        peak_held_out = std::max(peak_held_out, last_held_out);
+        const double fid_drilled  = mean_reconstruction_fidelity(tk, split.drilled);
+        const double fid_held_out = mean_reconstruction_fidelity(tk, split.held_out);
+        scratch_traj.push_back(last_scratch);
+        held_out_traj.push_back(last_held_out);
+        fid_drilled_traj.push_back(fid_drilled);
+        fid_held_out_traj.push_back(fid_held_out);
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                     "  s%d: baseline=%.2f scratch=%.2f held_out=%.2f  fid_drilled=%.3f fid_held_out=%.3f\n",
+                     (r + 1) * kStepsPerEval, last_baseline, last_scratch, last_held_out, fid_drilled, fid_held_out);
+        report += buf;
+    }
+    const double r_scratch  = pearson_r(scratch_traj, fid_drilled_traj);
+    const double r_held_out = pearson_r(held_out_traj, fid_held_out_traj);
+    report += "  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
+             std::to_string(fs::fact_vocab().size()) + " colors)\n" +
+             "  peak: baseline=" + std::to_string(peak_baseline) + " scratch=" + std::to_string(peak_scratch) +
+             " held_out=" + std::to_string(peak_held_out) + "\n" +
+             "  last: baseline=" + std::to_string(last_baseline) + " scratch=" + std::to_string(last_scratch) +
+             " held_out=" + std::to_string(last_held_out) + "\n" +
+             "  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=" + std::to_string(r_scratch) +
+             " held_out=" + std::to_string(r_held_out) + "\n" +
+             "  (Phase C comparison: peak baseline=1.00 scratch=0.56 held_out=0.33, r_scratch=-0.23)\n";
+    WARN(report);
+
+    // Report all three, real numbers, whatever they are -- matched-budget A/B against Phase C's own
+    // recorded result (docs/FACTSPIKE.md), not a guaranteed-positive validation.
     CHECK(std::isfinite(peak_baseline));
     CHECK(std::isfinite(peak_scratch));
     CHECK(std::isfinite(peak_held_out));

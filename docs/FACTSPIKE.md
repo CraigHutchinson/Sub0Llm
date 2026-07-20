@@ -227,4 +227,45 @@ a failed experiment.
   task-relevant SUBSPACE of that row preserved, not the whole vector, so a low/flat score here doesn't
   rule out task-relevant information being preserved; it just isn't informative either way. The actual
   next test is whether task accuracy (and this fidelity metric) starts moving once the exposure-document
-  fix is in place — not yet run.
+  fix is in place — see Phase D below.
+
+- **2026-07-20**: Phase D ("Pack-Aware Training") — the exposure-document fix, run for real. Same
+  budget/seeds as Phase C. `build_slot_retrieval_dataset()` replaces `build_slot_exposure_dataset()`:
+  slot-retrieval documents are now `[SLOT] loves the color {fact}.` with NO full-text restatement in that
+  document (mask=1 graded on the fact color itself, task-contingent gradient into the packed vector).
+  Exposure subjects' full-text fact teaching moved to a separate document via a WIDENED `build_dataset()`
+  pool (drilled + exposure subjects together, held-out still never included).
+
+  ```
+  peak: baseline=0.222222 scratch=0.000000 held_out=0.000000
+  last: baseline=0.000000 scratch=0.000000 held_out=0.000000
+  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=0.000000 held_out=0.000000
+  (Phase C comparison: peak baseline=1.00 scratch=0.56 held_out=0.33, r_scratch=-0.23)
+  ```
+
+  **Reading: this made everything WORSE, not better** — including baseline (subject spelled out in full,
+  no slot involved at all), which collapsed from peak 1.00 down to peak 0.22. Scratch collapsed to 0.00
+  (r=0.0 is degenerate here, not "no correlation" — scratch accuracy was constant zero, so there was no
+  variance to correlate against). `fid_drilled` stayed in roughly the same flat band as Phase C
+  (0.385–0.393), so packed-vector fidelity still barely moved — the harder objective didn't even
+  meaningfully shape fidelity, let alone accuracy.
+
+  That baseline collapsed too, not just scratch, is the important tell: this isn't cleanly "the harder
+  slot-retrieval task hurt scratch specifically," it's "the combined training regime got substantially
+  worse at teaching the fact AT ALL," including through plain text. Two candidate explanations, not yet
+  disambiguated: (1) widening the plain-text pool from 9 to 15 subjects under the same fixed 50%-of-budget
+  share dilutes each drilled subject's own repetition by ~40%, and this model is already known to be
+  highly repetition/budget-sensitive at this scale; (2) mixing a much harder, noisier, information-dense
+  objective (predict the fact color from a packed vector with almost no other context) 50/50 from a
+  RANDOMLY-INITIALIZED model, flat from step 1, destabilizes shared weights before either objective can
+  settle — exactly the failure mode the QAT literature's progressive-schedule work (Bit-by-Bit) warns
+  about: don't apply the harder transform-aware objective cold and flat; ramp it in, ideally from a
+  checkpoint already trained on the easier objective. This second explanation was flagged as a design risk
+  in the original PAT proposal, before this result existed, and this result is consistent with it having
+  mattered — though not proof of it over the dilution explanation.
+
+  Next candidate experiment (not yet run): warm-start from a Phase-B-trained checkpoint (or an initial
+  baseline-only phase within the same run) before introducing slot-retrieval training at all, ramping
+  slot_frac up from ~0 rather than starting flat at 0.5. Full engine regression suite confirmed green
+  throughout (`hrr_unbind` and the new dataset builder don't affect anything outside factspike's own
+  files).
