@@ -104,6 +104,12 @@ SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T,
 // positions < SEQ_LEN. See src/backend_cpu.cpp.
 SUB0_API void        kv_reset();
 SUB0_API const float* forward_one(int id, int pos);
+// Diagnostic-only: forward_one's residual-stream hidden state at its last call's position, right before
+// ln_f/the head projection -- D_MODEL floats, thread-local, CPU backend only (see backend_cpu.cpp's
+// Model::last_hidden). Lets a caller compare the fully-processed representation the model actually reads
+// for its next-token prediction, not just the raw input embedding -- see docs/FACTSPIKE.md's "Pack-Aware
+// Training" discussion on why raw-embedding-level fidelity (hrr_unbind) isn't the same question.
+SUB0_API const float* last_hidden_ptr();
 
 // Content-derived scratch-slot embeddings: install the per-context bindings the next forward/forward_one
 // on this thread uses (a BOUND scratch slot then embeds from its fragments instead of a fixed reserved-id

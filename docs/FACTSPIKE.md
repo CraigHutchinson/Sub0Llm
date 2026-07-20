@@ -269,3 +269,79 @@ a failed experiment.
   slot_frac up from ~0 rather than starting flat at 0.5. Full engine regression suite confirmed green
   throughout (`hrr_unbind` and the new dataset builder don't affect anything outside factspike's own
   files).
+
+- **2026-07-20**: Phase E — the warm-start/ramp follow-up, run for real. Same matched budget/seeds/
+  datasets as Phase D (same widened 15-subject pool, same slot-retrieval documents), but rounds 0-4
+  (steps 1-500) train on plain text ONLY (`slot_frac=0`), rounds 5-14 ramp `slot_frac` linearly 0→0.5,
+  and the final 5 rounds hold at 0.5 (Phase D's own steady-state mix).
+
+  ```
+  peak: baseline=0.333333 scratch=0.111111 held_out=0.000000
+  last: baseline=0.222222 scratch=0.000000 held_out=0.000000
+  (Phase C: peak baseline=1.00 scratch=0.56 | Phase D flat-mix: peak baseline=0.22 scratch=0.00)
+  ```
+
+  **Reading — this disambiguates Phase D's two candidate causes, and dilution wins.** Warm-start+ramp
+  did help some (baseline 0.22→0.33, scratch 0.00→0.11 vs. Phase D), so cold-mixing interference was a
+  real, non-zero contributor. But it recovered almost none of the gap to Phase C (baseline 1.00, scratch
+  0.56) — nowhere close. The decisive tell is in the WARM-UP-ONLY rounds themselves (s100-s500,
+  `slot_frac=0` throughout, so cold-mixing literally cannot be a factor yet — zero slot-retrieval training
+  has happened): baseline only reached peak 0.33 by s400 on the widened 15-subject pool, whereas Phase B
+  (9 subjects only, same step budget) was already hitting 0.44-0.78 by the equivalent step range. Since
+  the ONLY difference between that warm-up window and Phase B is the widened subject pool, and cold-mixing
+  can't be involved yet, this isolates **dilution of per-subject repetition as the dominant cause**, with
+  cold-mixing as a real but secondary contributor. The actual fix isn't a training schedule — it's not
+  diluting drilled-subject exposure when the pool widens (e.g. oversample drilled subjects specifically,
+  or scale total budget/repetition with pool size instead of holding both fixed). Not yet built; the
+  training-schedule line of investigation (Phase D/E) is shelved in favor of the representational question
+  below, which is orthogonal to it.
+
+- **2026-07-20**: Hidden-state diagnostic — a different question entirely, raised directly by re-examining
+  what "packing" computes. Normal multi-piece processing composes a word's meaning INSIDE the transformer:
+  N_LAYERS of self-attention + FFN over several real positions, and the model's decision is read from the
+  LAST layer's output (a deeply processed representation). The scratch mechanism instead composes OUTSIDE
+  the transformer: `encode_slot()` (MeanPool/HRR) is a fixed, parameter-free formula applied directly to
+  the RAW pre-transformer embedding rows, injected as a single position's INPUT, which then still has to
+  go through all N_LAYERS from scratch with no other positions to attend to. These are not obviously
+  comparable objects — the reconstruction-fidelity diagnostic (Phase C follow-up) only checked whether the
+  packed vector resembles the RAW piece embeddings (an input-level question); this checks whether the
+  model's own fully-processed, decision-relevant representation ends up comparable between the two paths.
+
+  Added `sub0::last_hidden_ptr()` (`backend_cpu.cpp`/`core.hpp`): `forward_one` now unconditionally copies
+  its residual-stream hidden state (right before `ln_f`/the head projection) into a thread-local buffer,
+  exposed read-only. Deliberately NOT a signature change to `forward_one` itself (shared with the CUDA
+  backend's interface) — an always-on side-channel copy instead, zero call sites affected, CPU-only.
+
+  For each drilled subject, under Phase C's own (best-validated) regime: `hidden_state_cosine()` runs the
+  exact same prompt shape as `eval_baseline`/`eval_scratch` ("`{subject} loves the color `" vs. "`<slot>
+  loves the color `"), captures the final hidden state right before the color would be generated for both,
+  and reports cosine similarity — the literal vector the model uses to pick the next token, not an
+  arbitrary intermediate point.
+
+  ```
+  Crofw        cos_sim=0.889  scratch_correct=no       Elgux        cos_sim=0.974  scratch_correct=no
+  Yelfan       cos_sim=0.551  scratch_correct=no        Woqsmb       cos_sim=0.747  scratch_correct=yes
+  Hpfds        cos_sim=0.935  scratch_correct=yes       Zlumwkrpx    cos_sim=0.881  scratch_correct=no
+  Ceaiaenze    cos_sim=0.605  scratch_correct=no        Nozke        cos_sim=0.932  scratch_correct=no
+  Xtora        cos_sim=0.965  scratch_correct=yes       mean=0.831 (3/9 correct this round)
+  ```
+
+  **Reading**: mean similarity 0.831 is high — NOT near-orthogonal, which is what a dominant "wrong region
+  of representation space entirely" failure would look like. That partly weakens the primitive-mismatch
+  hypothesis as the DOMINANT explanation: the transformer's own N_LAYERS generally do bring a packed
+  representation into a broadly similar neighborhood to the normally-read one. But this number is inflated
+  by a confound worth separating out: **3 of these 9 drilled subjects (Hpfds, Xtora, Elgux) turned out
+  single-piece** in Phase A's own vocab build (docs/FACTSPIKE.md's Phase A note), so `encode_slot()` isn't
+  doing real multi-item composition for them — MeanPool of one item is that item; HRR-binding one item is
+  a fixed per-position rotation of it, still close to the original row. Restricting to the 6 GENUINELY
+  multi-piece subjects (Crofw, Yelfan, Ceaiaenze, Woqsmb, Zlumwkrpx, Nozke): mean similarity drops to
+  0.768, and correctness shows no clean pattern at all (Woqsmb — the LOWEST similarity of the six — is the
+  ONLY one correct this round). Computed Pearson r between similarity and correctness across all 9:
+  r≈0.24 (weak positive, not reliable at n=9, and n=6 for the multi-piece-only subset is too small to
+  read anything into beyond "no obvious clean relationship"). Net: real but partial representational
+  degradation specific to genuine multi-piece composition, not the dominant driver, alongside the
+  already-identified weak-training-signal issue (Phase C's exposure documents) — this looks like several
+  contributing factors of similar order, not one single root cause.
+
+- **2026-07-20**: full engine regression suite (both MSVC and Clang toolchains) confirmed green after
+  `last_hidden_ptr()` (touches the shared `backend_cpu.cpp`/`core.hpp`) — no regressions.

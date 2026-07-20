@@ -997,6 +997,14 @@ struct Model {
     Node* lm_head;   // nullptr when USE_TIED_EMBEDDINGS -- the head reads tok_emb directly instead
     Node* lm_bias;   // nullptr when USE_TIED_EMBEDDINGS -- tied models drop the head bias too
 
+    // Diagnostic-only: forward_one's residual-stream hidden state at its last call's position, right
+    // before ln_f/the head projection -- i.e. the fully-processed, pre-readout representation. Written
+    // unconditionally (one D_MODEL-length copy, negligible next to forward_one's own cost) rather than
+    // behind an optional out-param, to avoid touching forward_one's signature (shared with the CUDA
+    // backend's device_backend.hpp interface -- see last_hidden_ptr() in core.hpp for why this stays
+    // CPU-only and out-of-band instead).
+    std::array<float, D_MODEL> last_hidden{};
+
     // Lay out the parameter nodes for the CALLING thread: data spans into the shared
     // weights, grad spans into this thread's accumulator. Deterministic offsets, so
     // every thread agrees on the layout. No weight initialization here.
@@ -1186,6 +1194,7 @@ struct Model {
             }
             for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
         }
+        for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
         rmsnorm_row(h, ln_f, a, C);
         if constexpr (USE_TIED_EMBEDDINGS) tied_head_row(a, tok_emb, logits.data(), C, VOCAB);
         else                               linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
@@ -1311,6 +1320,7 @@ Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(
 // generation; forward_one(id, pos) returns the logits [VOCAB] for the next token. See KVCache above.
 void kv_reset() { g_kv.reset(); }
 const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
+const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see Model::last_hidden's comment
 
 void backward(Node* loss, float seed) {
     loss->grad[0] = seed;

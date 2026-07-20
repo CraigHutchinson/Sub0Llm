@@ -28,6 +28,25 @@
 //     get ordinary full-text fact teaching via a WIDENED build_dataset() pool (drilled + exposure
 //     subjects together) -- a separate document, so no in-document shortcut. Matched-budget A/B against
 //     Phase C's own recorded numbers.
+//     RESULT (docs/FACTSPIKE.md): WORSE across the board, not better -- baseline collapsed 1.00 -> 0.22,
+//     scratch 0.56 -> 0.00, even though fidelity stayed in roughly the same flat band as Phase C. Baseline
+//     collapsing too (no slot involved at all) means this isn't "the harder task hurt scratch
+//     specifically" -- the combined regime got worse at teaching the fact at all. Two undisambiguated
+//     candidates: diluted per-subject repetition (widened pool, same fixed budget), or a harder objective
+//     mixed flat/cold from a random-init model destabilizing shared weights (matches what progressive-QAT
+//     literature warns against) -- Phase E below tests the second directly.
+//   * [.factspikepatramp] -- Phase E: same matched budget/seeds/datasets as Phase D, but WARM-STARTED
+//     (first 5 rounds slot_frac=0, pure plain-text) then RAMPED (slot_frac linearly 0->0.5 over the next
+//     10 rounds, holding at 0.5 for the final 5) instead of flat 0.5 from step 1. Isolates cold-mixing
+//     interference from pool dilution: dilution persists through warm-start (same widened ds throughout),
+//     so if warm-start alone recovers baseline toward Phase C's level, cold-mixing was the dominant cause
+//     in Phase D, not dilution.
+//   * [.factspikehidden] -- hidden-state diagnostic: after Phase C's own (validated, non-degenerate)
+//     training regime, does the packed slot's FULLY-PROCESSED hidden state (post all N_LAYERS, right
+//     before the color would be generated -- sub0::last_hidden_ptr()) resemble the SAME subject's hidden
+//     state when read normally? A different question from the reconstruction-fidelity diagnostic (which
+//     compared the packed vector against RAW pre-transformer piece embeddings): this compares the model's
+//     own decision-relevant, output-level representation instead.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -39,6 +58,7 @@
 #include "sub0/window.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <random>
@@ -171,6 +191,72 @@ Score eval_scratch(const Tokenizer& tk, const std::vector<fs::FactPair>& subject
         sc.ok += match;
     }
     return sc;
+}
+
+// Standalone per-subject scratch-arm check, seed fixed (kv_decode_generate's own topk=1 makes this
+// deterministic regardless of seed value) -- a SEPARATE function rather than a refactor of eval_scratch
+// above, to avoid any risk of changing eval_scratch's own already-validated/documented RNG-threading
+// behavior (Phase C/D/E's recorded results depend on it staying exactly as it is).
+bool eval_scratch_one(const Tokenizer& tk, const fs::FactPair& fp) {
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return false;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+    std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+    const std::size_t prompt_len = ctx.size();
+    if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) return false;
+    const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+    if (gold.empty()) return false;
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    std::mt19937 rng(1234u);
+    sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng, cas::TOK_EOS, false);
+    sub0::set_scratch_bindings(nullptr);
+    bool match = ctx.size() >= prompt_len + gold.size();
+    for (std::size_t k = 0; match && k < gold.size(); ++k)
+        if (ctx[prompt_len + k] != gold[k]) match = false;
+    return match;
+}
+
+// Diagnostic: does the packed slot's FULLY-PROCESSED hidden state (post all N_LAYERS, right before the
+// color would be generated) resemble the SAME subject's hidden state when read normally (full text)? A
+// DIFFERENT question from mean_reconstruction_fidelity below, which compares the packed vector against
+// RAW pre-transformer piece embeddings -- this compares the model's own decision-relevant, output-level
+// representation instead, using sub0::last_hidden_ptr() (the residual stream right before ln_f/the head,
+// captured by forward_one -- see backend_cpu.cpp's Model::last_hidden). Both prompts mirror eval_baseline/
+// eval_scratch's own construction exactly, so the captured vector is the literal input to the color
+// prediction, not an arbitrary intermediate point.
+double hidden_state_cosine(const Tokenizer& tk, const fs::FactPair& fp) {
+    sub0::kv_reset();
+    const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> base_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return 0.0;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    sub0::kv_reset();
+    std::vector<int> scr_ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) scr_ctx.push_back(t);
+    for (std::size_t i = 0; i < scr_ctx.size(); ++i) (void)sub0::forward_one(scr_ctx[i], static_cast<int>(i));
+    sub0::set_scratch_bindings(nullptr);
+    std::array<float, D_MODEL> scr_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, scr_hidden.data());
+
+    double dot = 0.0, nb = 0.0, ns = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * scr_hidden[static_cast<std::size_t>(c)];
+        nb  += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+        ns  += static_cast<double>(scr_hidden[static_cast<std::size_t>(c)])  * scr_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nb > 0.0 && ns > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(ns)) : 0.0;
 }
 
 // Diagnostic (docs/FACTSPIKE.md "Pack-Aware Training" discussion): does the packed vector's per-fragment
@@ -494,4 +580,161 @@ TEST_CASE("factspike Phase D: Pack-Aware Training -- task-contingent slot-retrie
     CHECK(std::isfinite(peak_held_out));
     CHECK(std::isfinite(r_scratch));
     CHECK(std::isfinite(r_held_out));
+}
+
+// Warm-start + ramp schedule for Phase E: rounds [0, kWarmupRounds) train on plain text only
+// (slot_frac=0), rounds [kWarmupRounds, kWarmupRounds+kRampRounds) ramp slot_frac linearly up to
+// kTargetSlotFrac, and the remainder hold at kTargetSlotFrac -- matching Phase D's own steady-state mix
+// so the two are comparable once ramped in. Isolates cold-mixing interference from pool dilution: the
+// widened fact_ds pool (same dilution as Phase D) is used throughout, including the warm-start rounds.
+double phase_e_slot_frac(int round) {
+    constexpr int    kWarmupRounds   = 5;
+    constexpr int    kRampRounds     = 10;
+    constexpr double kTargetSlotFrac = 0.5;
+    if (round < kWarmupRounds) return 0.0;
+    if (round < kWarmupRounds + kRampRounds) {
+        const double t = static_cast<double>(round - kWarmupRounds + 1) / kRampRounds;
+        return t * kTargetSlotFrac;
+    }
+    return kTargetSlotFrac;
+}
+
+TEST_CASE("factspike Phase E: Pack-Aware Training, warm-started + ramped -- isolates cold-mixing "
+         "interference from pool dilution", "[.factspikepatramp]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase E: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+    REQUIRE_FALSE(split.held_out.empty());
+
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+
+    std::vector<fs::FactPair> fact_subjects = split.drilled;
+    fact_subjects.insert(fact_subjects.end(), exposure_split.drilled.begin(), exposure_split.drilled.end());
+    const fs::Dataset ds = fs::build_dataset(tk, fact_subjects, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_retrieval_dataset(tk, exposure_split.drilled,
+                                                                     kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+
+    std::string report = "\n=== factspike Phase E PAT warm-start+ramp (d" + std::to_string(D_MODEL) + ", " +
+        std::to_string(split.drilled.size()) + " drilled / " + std::to_string(split.held_out.size()) +
+        " held-out, " + std::to_string(exposure_split.drilled.size()) + " slot-retrieval subjects) ===\n";
+    double peak_baseline = 0.0, peak_scratch = 0.0, peak_held_out = 0.0;
+    double last_baseline = 0.0, last_scratch = 0.0, last_held_out = 0.0;
+    std::vector<double> scratch_traj, held_out_traj, fid_drilled_traj, fid_held_out_traj;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        const double slot_frac = phase_e_slot_frac(r);
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, slot_frac);
+        const Score sb = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score ss = eval_scratch(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score sh = eval_scratch(tk, split.held_out, 4242u + static_cast<unsigned>(r));
+        last_baseline = sb.rate(); last_scratch = ss.rate(); last_held_out = sh.rate();
+        peak_baseline = std::max(peak_baseline, last_baseline);
+        peak_scratch  = std::max(peak_scratch,  last_scratch);
+        peak_held_out = std::max(peak_held_out, last_held_out);
+        const double fid_drilled  = mean_reconstruction_fidelity(tk, split.drilled);
+        const double fid_held_out = mean_reconstruction_fidelity(tk, split.held_out);
+        scratch_traj.push_back(last_scratch);
+        held_out_traj.push_back(last_held_out);
+        fid_drilled_traj.push_back(fid_drilled);
+        fid_held_out_traj.push_back(fid_held_out);
+        char buf[190];
+        std::snprintf(buf, sizeof buf,
+                     "  s%d(sf=%.2f): baseline=%.2f scratch=%.2f held_out=%.2f  fid_drilled=%.3f fid_held_out=%.3f\n",
+                     (r + 1) * kStepsPerEval, slot_frac, last_baseline, last_scratch, last_held_out,
+                     fid_drilled, fid_held_out);
+        report += buf;
+    }
+    const double r_scratch  = pearson_r(scratch_traj, fid_drilled_traj);
+    const double r_held_out = pearson_r(held_out_traj, fid_held_out_traj);
+    report += "  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
+             std::to_string(fs::fact_vocab().size()) + " colors)\n" +
+             "  peak: baseline=" + std::to_string(peak_baseline) + " scratch=" + std::to_string(peak_scratch) +
+             " held_out=" + std::to_string(peak_held_out) + "\n" +
+             "  last: baseline=" + std::to_string(last_baseline) + " scratch=" + std::to_string(last_scratch) +
+             " held_out=" + std::to_string(last_held_out) + "\n" +
+             "  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=" + std::to_string(r_scratch) +
+             " held_out=" + std::to_string(r_held_out) + "\n" +
+             "  (Phase C: peak baseline=1.00 scratch=0.56 held_out=0.33 | "
+             "Phase D flat-mix: peak baseline=0.22 scratch=0.00 held_out=0.00)\n";
+    WARN(report);
+
+    // Report all three, real numbers, whatever they are -- matched-budget A/B against Phase C/D's own
+    // recorded results (docs/FACTSPIKE.md), not a guaranteed-positive validation.
+    CHECK(std::isfinite(peak_baseline));
+    CHECK(std::isfinite(peak_scratch));
+    CHECK(std::isfinite(peak_held_out));
+    CHECK(std::isfinite(r_scratch));
+    CHECK(std::isfinite(r_held_out));
+}
+
+TEST_CASE("factspike hidden-state diagnostic: does the packed slot's fully-processed representation "
+         "resemble the same subject read normally, under Phase C's own validated regime",
+         "[.factspikehidden]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike hidden-state diagnostic: tokenizer isn't usable/doesn't match VOCAB -- "
+                "skipping. Build against out/build/factspike96 for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+
+    // SAME regime as Phase C (not D/E's widened/diluted pool) -- this asks a representational question
+    // that's orthogonal to the training-schedule question Phase D/E investigated, so it should run on the
+    // cleanest, best-validated result (Phase C: peak scratch=0.56), not a degraded one.
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_exposure_dataset(tk, exposure_split.drilled,
+                                                                    kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+    for (int r = 0; r < kEvalRounds; ++r)
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+
+    std::string report = "\n=== factspike hidden-state diagnostic (post Phase-C-regime training) ===\n";
+    double sim_sum = 0.0; int n_correct = 0, n_total = 0;
+    for (const fs::FactPair& fp : split.drilled) {
+        const double sim = hidden_state_cosine(tk, fp);
+        const bool   ok  = eval_scratch_one(tk, fp);
+        sim_sum += sim; ++n_total; n_correct += ok ? 1 : 0;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "  %-12s cos_sim=%.3f  scratch_correct=%s\n",
+                     fp.subject.c_str(), sim, ok ? "yes" : "no");
+        report += buf;
+    }
+    const double mean_sim = n_total ? sim_sum / n_total : 0.0;
+    report += "  mean cosine similarity (baseline vs scratch final hidden state) = " +
+             std::to_string(mean_sim) + "  (" + std::to_string(n_correct) + "/" +
+             std::to_string(n_total) + " correct this round)\n";
+    WARN(report);
+
+    CHECK(std::isfinite(mean_sim));
 }
