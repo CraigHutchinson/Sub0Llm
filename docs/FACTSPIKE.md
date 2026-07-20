@@ -192,3 +192,39 @@ a failed experiment.
 
   All engine-side regression tests remained green throughout (the `backend_cpu.cpp` OpenMP loop-variable
   fix, made to unblock this build, is exercised extensively by these runs with no regressions observed).
+
+- **2026-07-19**: reconstruction-fidelity diagnostic — does per-round HRR-unbind fidelity correlate with
+  scratch-arm accuracy? Motivated by a "Pack-Aware Training" (PAT) discussion drawing on the QAT
+  literature (StableQAT, Bit-by-Bit progressive QAT, and a sub-100M-scale schedule study — see PR/commit
+  discussion for citations): QAT's dequantize step is inline forward-pass reconstruction feeding the same
+  task loss, and HRR's `encode_slot_bwd` already performs the structural equivalent (its backward pass is
+  literally circular correlation by the role vector — the canonical HRR unbind operation, applied to the
+  gradient instead of the packed value). Added `hrr_unbind()` (`scratch_slots.hpp`, applies that same
+  correlation to the packed *value* instead of a gradient) and measured, each of the 20 training rounds,
+  the mean cosine similarity between `hrr_unbind(packed_vector, position_p)` and the TRUE `tok_emb` row for
+  piece p, across every (subject, piece) pair — for both drilled and held-out subjects — then correlated
+  that trajectory against the matching accuracy trajectory (Pearson r).
+
+  ```
+  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=-0.233  held_out=-0.229
+  ```
+
+  **Reading**: no positive correlation — if anything, weakly negative for both arms. This diagnostic does
+  NOT support "raw packed-vector fidelity to its constituent piece rows is the direct lever" as a strong,
+  standalone hypothesis. More strikingly: `fid_drilled` barely moves across all 20 rounds (0.378–0.387,
+  a ~2% band) despite scratch accuracy swinging from 0.00 to 0.56 in the SAME window — the fidelity metric
+  is essentially static while accuracy is highly volatile, so no correlation is really available to find
+  either way. That flatness is itself informative: nothing in the current Phase C curriculum meaningfully
+  shapes drilled-subjects' own packed-vector fidelity, because (as identified in the same PAT discussion)
+  the only downstream-graded text after a slot-exposure document's packed slot is generic filler ("plays
+  outside every day") — unrelated to the fact, weak task-contingent gradient, and moreover only ever
+  applied to a DISJOINT exposure-subject pool, never to the drilled subjects the eval actually queries.
+  A near-static fidelity trajectory is exactly what that predicts. This diagnostic doesn't contradict the
+  proposed fix (restructure exposure documents so the graded continuation after the slot is the fact
+  color itself, giving real task-contingent gradient into the packed vector) — it's consistent with "there
+  currently is no real training pressure on packed-vector fidelity to have shaped it in either direction."
+  Caveat: raw cosine similarity to a piece's own full row is a coarse proxy — the model may only need a
+  task-relevant SUBSPACE of that row preserved, not the whole vector, so a low/flat score here doesn't
+  rule out task-relevant information being preserved; it just isn't informative either way. The actual
+  next test is whether task accuracy (and this fidelity metric) starts moving once the exposure-document
+  fix is in place — not yet run.

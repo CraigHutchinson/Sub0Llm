@@ -26,6 +26,7 @@
 #include "sub0/window.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <random>
 #include <string>
@@ -157,6 +158,52 @@ Score eval_scratch(const Tokenizer& tk, const std::vector<fs::FactPair>& subject
         sc.ok += match;
     }
     return sc;
+}
+
+// Diagnostic (docs/FACTSPIKE.md "Pack-Aware Training" discussion): does the packed vector's per-fragment
+// HRR-unbind fidelity correlate with scratch-arm task accuracy? Mean cosine similarity between
+// hrr_unbind(packed_vector, position p) and the TRUE tok_emb row for piece p, averaged over every
+// (subject, piece) pair in `subjects`, computed against the CURRENT (mid-training) model weights -- so a
+// per-round trajectory can be compared directly against that same round's accuracy. Cosine similarity
+// (not raw error) is deliberate: HRR's role vectors aren't necessarily unit-scaled, so only DIRECTION,
+// not magnitude, is a meaningful fidelity signal here.
+double mean_reconstruction_fidelity(const Tokenizer& tk, const std::vector<fs::FactPair>& subjects) {
+    const float* tok_emb = sub0::params_ptr();   // [VOCAB, D_MODEL] -- tok_emb is param offset 0 (layout.hpp)
+    std::vector<float> packed(D_MODEL), recon(D_MODEL);
+    double sum = 0.0; int n = 0;
+    for (const fs::FactPair& fp : subjects) {
+        const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+        if (pieces.empty()) continue;
+        sub0::encode_slot(tok_emb, D_MODEL, pieces, sub0::SlotEncoding::HRR, packed.data());
+        for (std::size_t p = 0; p < pieces.size(); ++p) {
+            sub0::hrr_unbind(packed.data(), D_MODEL, p, recon.data());
+            const float* truth = tok_emb + static_cast<std::size_t>(pieces[p]) * D_MODEL;
+            double dot = 0.0, nr = 0.0, nt = 0.0;
+            for (int c = 0; c < D_MODEL; ++c) {
+                dot += static_cast<double>(recon[static_cast<std::size_t>(c)]) * truth[c];
+                nr  += static_cast<double>(recon[static_cast<std::size_t>(c)]) * recon[static_cast<std::size_t>(c)];
+                nt  += static_cast<double>(truth[c]) * truth[c];
+            }
+            if (nr > 0.0 && nt > 0.0) { sum += dot / (std::sqrt(nr) * std::sqrt(nt)); ++n; }
+        }
+    }
+    return n ? sum / n : 0.0;
+}
+
+// Pearson correlation coefficient between two equal-length series -- hand-rolled (n=kEvalRounds is small,
+// not worth a dependency) to quantify whether reconstruction fidelity tracks task accuracy round-by-round.
+double pearson_r(const std::vector<double>& a, const std::vector<double>& b) {
+    const std::size_t n = a.size();
+    if (n < 2 || b.size() != n) return 0.0;
+    double ma = 0.0, mb = 0.0;
+    for (std::size_t i = 0; i < n; ++i) { ma += a[i]; mb += b[i]; }
+    ma /= static_cast<double>(n); mb /= static_cast<double>(n);
+    double cov = 0.0, va = 0.0, vb = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double da = a[i] - ma, db = b[i] - mb;
+        cov += da * db; va += da * da; vb += db * db;
+    }
+    return (va > 0.0 && vb > 0.0) ? cov / (std::sqrt(va) * std::sqrt(vb)) : 0.0;
 }
 
 // Blends fact-teaching windows (fs::Dataset, no bindings) with slot-reading-exposure windows
@@ -309,6 +356,7 @@ TEST_CASE("factspike Phase C: does a factual association survive PIECE-EMBEDDING
         " held-out, " + std::to_string(exposure_split.drilled.size()) + " slot-exposure subjects) ===\n";
     double peak_baseline = 0.0, peak_scratch = 0.0, peak_held_out = 0.0;
     double last_baseline = 0.0, last_scratch = 0.0, last_held_out = 0.0;
+    std::vector<double> scratch_traj, held_out_traj, fid_drilled_traj, fid_held_out_traj;
     for (int r = 0; r < kEvalRounds; ++r) {
         train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
         const Score sb = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
@@ -318,21 +366,34 @@ TEST_CASE("factspike Phase C: does a factual association survive PIECE-EMBEDDING
         peak_baseline = std::max(peak_baseline, last_baseline);
         peak_scratch  = std::max(peak_scratch,  last_scratch);
         peak_held_out = std::max(peak_held_out, last_held_out);
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "  s%d: baseline=%.2f scratch=%.2f held_out=%.2f\n",
-                     (r + 1) * kStepsPerEval, last_baseline, last_scratch, last_held_out);
+        const double fid_drilled  = mean_reconstruction_fidelity(tk, split.drilled);
+        const double fid_held_out = mean_reconstruction_fidelity(tk, split.held_out);
+        scratch_traj.push_back(last_scratch);
+        held_out_traj.push_back(last_held_out);
+        fid_drilled_traj.push_back(fid_drilled);
+        fid_held_out_traj.push_back(fid_held_out);
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                     "  s%d: baseline=%.2f scratch=%.2f held_out=%.2f  fid_drilled=%.3f fid_held_out=%.3f\n",
+                     (r + 1) * kStepsPerEval, last_baseline, last_scratch, last_held_out, fid_drilled, fid_held_out);
         report += buf;
     }
+    const double r_scratch   = pearson_r(scratch_traj, fid_drilled_traj);
+    const double r_held_out  = pearson_r(held_out_traj, fid_held_out_traj);
     report += "  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
              std::to_string(fs::fact_vocab().size()) + " colors)\n" +
              "  peak: baseline=" + std::to_string(peak_baseline) + " scratch=" + std::to_string(peak_scratch) +
              " held_out=" + std::to_string(peak_held_out) + "\n" +
              "  last: baseline=" + std::to_string(last_baseline) + " scratch=" + std::to_string(last_scratch) +
-             " held_out=" + std::to_string(last_held_out) + "\n";
+             " held_out=" + std::to_string(last_held_out) + "\n" +
+             "  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=" + std::to_string(r_scratch) +
+             " held_out=" + std::to_string(r_held_out) + "\n";
     WARN(report);
 
     // Report all three, real numbers, whatever they are -- this is an open experiment (docs/FACTSPIKE.md).
     CHECK(std::isfinite(peak_baseline));
     CHECK(std::isfinite(peak_scratch));
     CHECK(std::isfinite(peak_held_out));
+    CHECK(std::isfinite(r_scratch));
+    CHECK(std::isfinite(r_held_out));
 }

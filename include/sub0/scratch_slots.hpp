@@ -597,4 +597,28 @@ inline void encode_slot_bwd(const float* dout, int C, std::span<const int> frags
     }
 }
 
+// Approximate UNBIND: reconstruct the fragment that was bound at POSITION `position` from a packed HRR
+// vector, via circular correlation with that position's role vector -- the SAME operation
+// encode_slot_bwd's HRR case already performs on an incoming GRADIENT (see its comment: "adjoint of
+// circular convolution by a fixed role vector is circular correlation by that same role vector"), applied
+// here directly to the packed VALUE instead. Only meaningful for SlotEncoding::HRR -- MeanPool has no
+// analogous unbind (you cannot recover N vectors from their mean without side information). Reconstruction
+// fidelity degrades as more fragments get bound into the same vector (crosstalk from the OTHER bound
+// pairs), a known HRR property -- see docs/FACTSPIKE.md for its use as a diagnostic correlating packed-
+// vector fidelity against task accuracy.
+inline void hrr_unbind(const float* packed, int C, std::size_t position, float* out) {
+    const std::vector<float>& roles = hrr_role_table(C);
+    const std::size_t pi = position < static_cast<std::size_t>(HRR_MAX_POS)
+                              ? position : static_cast<std::size_t>(HRR_MAX_POS - 1);
+    const float* role = roles.data() + pi * static_cast<std::size_t>(C);
+    for (int j = 0; j < C; ++j) {
+        float s = 0.f;
+        for (int n = 0; n < C; ++n) {
+            int idx = n - j; if (idx < 0) idx += C;
+            s += packed[n] * role[idx];
+        }
+        out[j] = s;
+    }
+}
+
 }  // namespace sub0
