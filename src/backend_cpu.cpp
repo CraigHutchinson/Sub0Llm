@@ -1372,12 +1372,15 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
         }
         // (implicit barrier above: every thread's grad slot is complete)
         const int nthreads = omp_get_num_threads();
+        // OpenMP's `for` worksharing construct requires a SIGNED loop variable (unlike `simd`, which
+        // MSVC accepts size_t for, just ignoring reduction clauses on it) -- ptrdiff_t matches size_t's
+        // width so PARAM_FLOATS (a size_t) still fits, just signed to satisfy the spec.
         #pragma omp for schedule(static)
-        for (std::size_t i = 0; i < PARAM_FLOATS; ++i) {
+        for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(PARAM_FLOATS); ++i) {
             float s = 0.f;
             for (int t = 0; t < nthreads; ++t)
-                s += g_workers[t]->grad[i];
-            g_param_grad[i] = s;
+                s += g_workers[t]->grad[static_cast<std::size_t>(i)];
+            g_param_grad[static_cast<std::size_t>(i)] = s;
         }
     }
     return static_cast<float>(total / batch);

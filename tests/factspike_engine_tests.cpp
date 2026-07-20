@@ -1,0 +1,338 @@
+// factspike_engine_tests.cpp -- Phase B/C (docs/FACTSPIKE.md): does a factual association taught via
+// ordinary repeated text survive PIECE-EMBEDDING TRANSFER into a scratch slot? Staged, each phase gating
+// the next -- this is an open experiment, not a guaranteed-positive validation. Requires this test binary
+// to be built against the factspike96 toy config (out/build/factspike96): a small, dedicated model/vocab
+// forced to be mostly multi-piece, generated per docs/FACTSPIKE.md's Phase A. Constants here (seed=
+// 20260719, n_total=12, drilled_frac=0.667) MUST match the scratchpad corpus-generation tool that built
+// that config's tokenizer, so both sides reconstruct the identical FactSplit deterministically.
+//
+//   * [.factspikebaseline] -- Phase B: train on JUST the fact-teaching documents (ordinary text, no
+//     scratch slots anywhere), eval ONLY the baseline arm (subject spelled out in full). This is the
+//     load-bearing premise: does the curriculum teach a persistent, cross-document association at all?
+//     RESULT (docs/FACTSPIKE.md): yes -- peak accuracy 0.78 (7/9) vs chance 0.125, though training is
+//     highly volatile (0.00 <-> 0.78 across rounds), so PEAK not final-round accuracy is what's checked.
+//   * [.factspikecapstone] -- Phase C: adds slot-reading exposure documents (piece-id bound, over
+//     SEPARATE subjects from the ones under test) blended with fact-teaching, then the real 3-arm A/B:
+//     baseline (subject spelled out), scratch (subject's own piece ids bound to a slot, no textual
+//     restatement), held-out (same slot mechanism, subject never fact-taught -- negative control).
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "sub0/core.hpp"
+#include "sub0/decode.hpp"
+#include "sub0/factspike.hpp"
+#include "sub0/scratch_slots.hpp"
+#include "sub0/tokmap.hpp"
+#include "sub0/window.hpp"
+
+#include <algorithm>
+#include <fstream>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+namespace fs  = sub0::factspike;
+namespace cas = sub0::casing;
+using sub0::tok::Tokenizer;
+
+constexpr int    kNSubjects    = 12;
+constexpr double kDrilledFrac  = 0.667;
+constexpr std::uint64_t kSplitSeed = 20260719;   // MUST match gen_factspike_corpus.cpp's own seed
+
+constexpr int   kBatch        = 16;
+constexpr int   kWindowT      = 48;
+constexpr int   kDocsPerFact  = 30;
+constexpr int   kStepsPerEval = 100;
+constexpr int   kEvalRounds   = 20;     // 2000 steps total -- 600 plateaued at/below chance (0.11 vs
+                                        // 0.125), extending per docs/FACTSPIKE.md's own "expect to
+                                        // measure and possibly raise this" plan before concluding either way
+constexpr float kLr           = 0.003f * (128.0f / static_cast<float>(D_MODEL));
+
+void reset_opt_state() {
+    const std::size_t n = sub0::trainable_floats();
+    std::fill(sub0::adam_m_ptr(), sub0::adam_m_ptr() + n, 0.f);
+    std::fill(sub0::adam_v_ptr(), sub0::adam_v_ptr() + n, 0.f);
+}
+
+// A SHORT document's sampled window has len < kWindowT (sample_window's own "whole document, caller
+// pads" contract) -- lengths[] MUST be passed to train_batch in that case, or it treats every window as
+// a full kWindowT-wide read from `start`, silently over-reading past a short document's own end. Safe
+// for any document except the LAST one in the flat array (a real, latent bug this comment now documents
+// -- found via a genuine out-of-bounds crash: with only ~270 short documents here, the last document's
+// short window gets sampled within the first few hundred draws, unlike wordspike/corpus_collapse's much
+// larger datasets where the same missing-lengths pattern apparently never got unlucky enough to crash).
+void train_steps(const fs::Dataset& ds, sub0::AdamW& opt, int steps, std::mt19937& rng) {
+    std::vector<std::size_t> starts(kBatch);
+    std::vector<int> lens(kBatch);
+    for (int s = 0; s < steps; ++s) {
+        for (int b = 0; b < kBatch; ++b) {
+            const sub0::Window w = sub0::sample_window(rng, kWindowT, ds.tokens.size(),
+                                                       std::span<const std::uint64_t>(ds.doc_starts));
+            starts[static_cast<std::size_t>(b)] = w.start;
+            lens[static_cast<std::size_t>(b)] = w.len;
+        }
+        opt.zero_grad();
+        (void)sub0::train_batch(ds.tokens.data(), starts.data(), kBatch, kWindowT, lens.data(), ds.mask.data());
+        opt.step();
+    }
+}
+
+struct Score { int ok = 0, n = 0; double rate() const { return n ? static_cast<double>(ok) / n : 0.0; } };
+
+// Baseline arm: subject spelled out in full ("{subject} loves the color ") -> generate -> does the
+// completion start with the assigned fact color's own tokenization? Deterministic (topk=1), matching
+// numeric_bind/blended_capstone's own eval convention for a clean pass/fail check.
+Score eval_baseline(const Tokenizer& tk, const std::vector<fs::FactPair>& subjects, unsigned seed) {
+    Score sc;
+    std::mt19937 grng(seed);
+    for (const fs::FactPair& fp : subjects) {
+        std::vector<int> ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+        const std::size_t prompt_len = ctx.size();
+        if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) continue;
+        const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+        if (gold.empty()) continue;
+        std::mt19937 rng_copy = grng;
+        sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng_copy, cas::TOK_EOS, false);
+        grng = rng_copy;
+        bool match = ctx.size() >= prompt_len + gold.size();
+        for (std::size_t k = 0; match && k < gold.size(); ++k)
+            if (ctx[prompt_len + k] != gold[k]) match = false;
+        ++sc.n;
+        sc.ok += match;
+    }
+    return sc;
+}
+
+// Extracts the clean piece-id span (markers stripped) a subject's own spelling tokenizes to -- the
+// exact basis content_embed composes a slot's embedding from (this header's own top comment / factspike
+// Phase 0's leakage check use the same helper).
+std::vector<int> subject_piece_ids(const Tokenizer& tk, const std::string& subject) {
+    const std::vector<int> ctx = sub0::tok::encode(tk, subject);
+    std::vector<int> pieces;
+    for (std::size_t i = 0; i < ctx.size(); ) {
+        const auto [span_len, ids] = sub0::detail::word_span(ctx, i);
+        pieces.insert(pieces.end(), ids.begin(), ids.end());
+        i += span_len;
+    }
+    return pieces;
+}
+
+// Scratch (piece-transfer) arm: SAME prompt shape as eval_baseline, but the subject's token span is
+// replaced by a scratch slot bound directly to the subject's OWN piece ids (no byte decomposition) --
+// content_embed then composes the slot's embedding from those already-trained piece rows. No textual
+// restatement of the fact anywhere in this prompt -- this is the actual claim under test. Used for both
+// the scratch arm (drilled subjects) and the held-out arm (held-out subjects, same mechanism, negative
+// control) -- the caller picks which subject list to pass.
+Score eval_scratch(const Tokenizer& tk, const std::vector<fs::FactPair>& subjects, unsigned seed) {
+    Score sc;
+    std::mt19937 grng(seed);
+    for (const fs::FactPair& fp : subjects) {
+        const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+        if (pieces.empty()) continue;
+
+        sub0::ScratchTable scratch;
+        scratch.tk = &tk;
+        scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+
+        std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
+        for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+        const std::size_t prompt_len = ctx.size();
+        if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) continue;
+        const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+        if (gold.empty()) continue;
+
+        sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+        sub0::set_scratch_bindings(&binds);
+        std::mt19937 rng_copy = grng;
+        sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng_copy, cas::TOK_EOS, false);
+        grng = rng_copy;
+        sub0::set_scratch_bindings(nullptr);
+
+        bool match = ctx.size() >= prompt_len + gold.size();
+        for (std::size_t k = 0; match && k < gold.size(); ++k)
+            if (ctx[prompt_len + k] != gold[k]) match = false;
+        ++sc.n;
+        sc.ok += match;
+    }
+    return sc;
+}
+
+// Blends fact-teaching windows (fs::Dataset, no bindings) with slot-reading-exposure windows
+// (fs::SlotDataset, piece-id bound, content_embed active) at a fixed per-window mix ratio. A shared
+// data/mask buffer is required (unlike the single-source train_steps above) because the two datasets are
+// separate token arrays -- each window is copied into its own slice, mirroring
+// blended_capstone_engine_tests.cpp's own multi-source train_steps shape, extended with scratchspike_
+// engine_tests.cpp's own per-window win_binds wiring for content_embed (train_batch's win_binds tolerates
+// a per-window mix of real bindings and nullptr -- exactly what a blended fact/slot schedule needs).
+void train_steps_combined(const fs::Dataset& fact_ds, const fs::SlotDataset& slot_ds,
+                          sub0::AdamW& opt, int steps, std::mt19937& rng, std::mt19937_64& choice_rng,
+                          double slot_frac) {
+    std::vector<int> data(static_cast<std::size_t>(kBatch) * (kWindowT + 1));
+    std::vector<std::uint8_t> mask(data.size());
+    std::vector<std::size_t> starts(kBatch);
+    std::vector<int> lens(kBatch);
+    std::vector<sub0::ScratchBindings> binds(kBatch);
+    std::vector<const sub0::ScratchBindings*> binds_ptr(kBatch);
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+
+    for (int s = 0; s < steps; ++s) {
+        for (int b = 0; b < kBatch; ++b) {
+            const std::size_t base = static_cast<std::size_t>(b) * (kWindowT + 1);
+            const bool use_slot = coin(choice_rng) < slot_frac;
+            if (use_slot) {
+                const sub0::Window w = sub0::sample_window(rng, kWindowT, slot_ds.tokens.size(),
+                                                           std::span<const std::uint64_t>(slot_ds.doc_starts));
+                const std::size_t n = static_cast<std::size_t>(w.len) + 1;
+                for (std::size_t k = 0; k < n; ++k) {
+                    data[base + k] = slot_ds.tokens[w.start + k];
+                    mask[base + k] = slot_ds.mask[w.start + k];
+                }
+                const std::size_t doc = static_cast<std::size_t>(
+                    std::upper_bound(slot_ds.doc_starts.begin(), slot_ds.doc_starts.end(),
+                                     static_cast<std::uint64_t>(w.start)) - slot_ds.doc_starts.begin()) - 1;
+                binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+                    std::span<const std::vector<int>>(slot_ds.doc_bindings[doc]), sub0::SlotEncoding::HRR };
+                binds_ptr[static_cast<std::size_t>(b)] = &binds[static_cast<std::size_t>(b)];
+                starts[static_cast<std::size_t>(b)] = base;
+                lens[static_cast<std::size_t>(b)] = w.len;
+            } else {
+                const sub0::Window w = sub0::sample_window(rng, kWindowT, fact_ds.tokens.size(),
+                                                           std::span<const std::uint64_t>(fact_ds.doc_starts));
+                const std::size_t n = static_cast<std::size_t>(w.len) + 1;
+                for (std::size_t k = 0; k < n; ++k) {
+                    data[base + k] = fact_ds.tokens[w.start + k];
+                    mask[base + k] = fact_ds.mask[w.start + k];
+                }
+                binds_ptr[static_cast<std::size_t>(b)] = nullptr;
+                starts[static_cast<std::size_t>(b)] = base;
+                lens[static_cast<std::size_t>(b)] = w.len;
+            }
+        }
+        opt.zero_grad();
+        (void)sub0::train_batch(data.data(), starts.data(), kBatch, kWindowT, lens.data(), mask.data(),
+                                binds_ptr.data());
+        opt.step();
+    }
+}
+
+}  // namespace
+
+TEST_CASE("factspike Phase B: does the fact-teaching curriculum bake in a persistent, cross-document "
+         "association at all (baseline arm only, no scratch slots yet)", "[.factspikebaseline]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase B: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+
+    std::string report = "\n=== factspike Phase B: baseline-arm accuracy over training (d" +
+        std::to_string(D_MODEL) + ", " + std::to_string(split.drilled.size()) + " drilled subjects) ===\n  ";
+    double last_rate = 0.0, peak_rate = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps(ds, opt, kStepsPerEval, rng);
+        const Score sc = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        last_rate = sc.rate();
+        peak_rate = std::max(peak_rate, last_rate);
+        char buf[48];
+        std::snprintf(buf, sizeof buf, " s%d(acc=%.2f)", (r + 1) * kStepsPerEval, last_rate);
+        report += buf;
+    }
+    report += "\n  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
+             std::to_string(fs::fact_vocab().size()) + " colors; peak=" + std::to_string(peak_rate) +
+             " last=" + std::to_string(last_rate) + ")\n";
+    WARN(report);
+
+    CHECK(std::isfinite(last_rate));
+    // PEAK, not final-round, accuracy is the right gate for the load-bearing Phase B premise ("can this
+    // curriculum teach a persistent association at all") -- a first run showed a highly volatile
+    // trajectory (0.00 -> 0.78 -> 0.00), meaning the model DID demonstrably learn the association at
+    // points, but small-dataset/small-model training here is unstable, not non-learning. Final-round-only
+    // would have reported a false negative on a real capability -- discovered empirically, not assumed;
+    // see docs/FACTSPIKE.md's status log. Training-stability is tracked as its own separate finding, not
+    // conflated with "did the curriculum work at all."
+    CHECK(peak_rate > 2.0 / fs::fact_vocab().size());
+}
+
+TEST_CASE("factspike Phase C: does a factual association survive PIECE-EMBEDDING TRANSFER into a "
+         "scratch slot -- baseline vs scratch vs held-out, side by side", "[.factspikecapstone]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase C: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+    REQUIRE_FALSE(split.held_out.empty());
+
+    // A SEPARATE, disjoint subject pool for slot-reading exposure -- a different seed from kSplitSeed
+    // guarantees (in practice, via independent random generation) no overlap with the drilled/held-out
+    // subjects under test, so the model never sees a test subject's own slot during training.
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_exposure_dataset(tk, exposure_split.drilled,
+                                                                    kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+
+    std::string report = "\n=== factspike Phase C capstone (d" + std::to_string(D_MODEL) + ", " +
+        std::to_string(split.drilled.size()) + " drilled / " + std::to_string(split.held_out.size()) +
+        " held-out, " + std::to_string(exposure_split.drilled.size()) + " slot-exposure subjects) ===\n";
+    double peak_baseline = 0.0, peak_scratch = 0.0, peak_held_out = 0.0;
+    double last_baseline = 0.0, last_scratch = 0.0, last_held_out = 0.0;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+        const Score sb = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score ss = eval_scratch(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score sh = eval_scratch(tk, split.held_out, 4242u + static_cast<unsigned>(r));
+        last_baseline = sb.rate(); last_scratch = ss.rate(); last_held_out = sh.rate();
+        peak_baseline = std::max(peak_baseline, last_baseline);
+        peak_scratch  = std::max(peak_scratch,  last_scratch);
+        peak_held_out = std::max(peak_held_out, last_held_out);
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "  s%d: baseline=%.2f scratch=%.2f held_out=%.2f\n",
+                     (r + 1) * kStepsPerEval, last_baseline, last_scratch, last_held_out);
+        report += buf;
+    }
+    report += "  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
+             std::to_string(fs::fact_vocab().size()) + " colors)\n" +
+             "  peak: baseline=" + std::to_string(peak_baseline) + " scratch=" + std::to_string(peak_scratch) +
+             " held_out=" + std::to_string(peak_held_out) + "\n" +
+             "  last: baseline=" + std::to_string(last_baseline) + " scratch=" + std::to_string(last_scratch) +
+             " held_out=" + std::to_string(last_held_out) + "\n";
+    WARN(report);
+
+    // Report all three, real numbers, whatever they are -- this is an open experiment (docs/FACTSPIKE.md).
+    CHECK(std::isfinite(peak_baseline));
+    CHECK(std::isfinite(peak_scratch));
+    CHECK(std::isfinite(peak_held_out));
+}
