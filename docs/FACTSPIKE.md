@@ -345,3 +345,40 @@ a failed experiment.
 
 - **2026-07-20**: full engine regression suite (both MSVC and Clang toolchains) confirmed green after
   `last_hidden_ptr()` (touches the shared `backend_cpu.cpp`/`core.hpp`) — no regressions.
+
+- **2026-07-20**: Phase F — re-tests Phase D's task-contingent gradient fix WITHOUT the dilution confound
+  Phase E isolated. `train_steps_3way` keeps drilled subjects on their OWN separate plain-text Dataset
+  (identical construction to Phase C's own `ds`) instead of merging them with exposure subjects into one
+  pool, at a controlled split: `slot_frac=0.5` (Phase D's own steady-state), and of the remaining windows,
+  only 20% go to exposure subjects — drilled subjects keep ~40% of ALL training windows (vs. Phase C's
+  50%, vs. Phase D/E's diluted ~30%). Flat mixing from step 1 (not Phase E's ramp), to isolate "does
+  fixing dilution alone recover Phase C" as its own clean data point.
+
+  ```
+  peak: baseline=0.111111 scratch=0.222222 held_out=0.000000
+  last: baseline=0.000000 scratch=0.000000 held_out=0.000000
+  (Phase C: peak baseline=1.00 scratch=0.56 | Phase D: peak baseline=0.22 scratch=0.00 |
+   Phase E: peak baseline=0.33 scratch=0.11)
+  ```
+
+  **Reading — genuinely puzzling, and worth being honest about rather than force-fitting a clean story.**
+  Scratch continued a monotonic improvement across the de-diluting sequence (D: 0.00 → E: 0.11 → F: 0.22)
+  — consistent with dilution-fixing helping the scratch arm specifically. But baseline dropped to its
+  LOWEST point across all four regimes (0.11), even though drilled subjects had MORE plain-text exposure
+  in Phase F (~40%) than in Phase D (~30%) — the opposite of what the dilution hypothesis predicts for
+  baseline. This is not something a coherent single-cause story explains cleanly.
+
+  The honest read: this is very likely evidence of hitting the limits of SINGLE-SEED experimentation at
+  this model/dataset scale. Every phase in this investigation (B through F) has shown extreme round-to-
+  round volatility within a single run (e.g. Phase B's own 0.00→0.78→0.00 trajectory) — it would be
+  unsurprising if the *choice of design* (dilution fixed or not, schedule flat or ramped) matters less
+  than *which chaotic trajectory a given seed happens to land in*, at this small a scale. This exact
+  lesson already exists elsewhere in this codebase: `scratch_slots.hpp`'s own HRR-vs-MeanPool history
+  notes "a single run looked strong... a 3-training-seed follow-up... tempered that" — single-seed
+  comparisons at small scale have misled before in this project, specifically. Phases C through F have
+  all been single-seed. None of the peak/last comparisons across them should be treated as settled causal
+  claims without multi-seed replication — the *qualitative* findings (dilution matters some, cold-mixing
+  matters some, representational fidelity is imperfect but not dominant) are likely still directionally
+  right, since they're each grounded in more than just a peak-number comparison (Phase E's warm-up-only
+  isolation argument, the hidden-state cosine numbers), but the exact magnitudes and the specific
+  Phase F baseline anomaly should not be over-interpreted from n=1.

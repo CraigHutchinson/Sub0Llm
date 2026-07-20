@@ -47,6 +47,15 @@
 //     state when read normally? A different question from the reconstruction-fidelity diagnostic (which
 //     compared the packed vector against RAW pre-transformer piece embeddings): this compares the model's
 //     own decision-relevant, output-level representation instead.
+//     RESULT (docs/FACTSPIKE.md): mean cos_sim=0.83 (inflated by 3 accidentally-single-piece subjects);
+//     0.77 for the 6 genuinely multi-piece ones, no clean link to correctness at this sample size (r=0.24,
+//     not reliable). Real but partial representational degradation, not the dominant driver alone.
+//   * [.factspikepatfair] -- Phase F: re-tests Phase D's task-contingent gradient fix WITHOUT the dilution
+//     confound Phase E isolated. train_steps_3way keeps drilled subjects' own plain-text sampling rate
+//     close to Phase C's (a SEPARATE drilled-only Dataset, not merged with exposure subjects), while
+//     exposure subjects get their own separate plain-text pool at a smaller, independently-controlled
+//     rate. Flat slot_frac=0.5 from step 1 (matching Phase D, not Phase E's ramp) -- isolates "does fixing
+//     dilution alone recover Phase C" as its own clean data point.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -354,6 +363,74 @@ void train_steps_combined(const fs::Dataset& fact_ds, const fs::SlotDataset& slo
                 binds_ptr[static_cast<std::size_t>(b)] = nullptr;
                 starts[static_cast<std::size_t>(b)] = base;
                 lens[static_cast<std::size_t>(b)] = w.len;
+            }
+        }
+        opt.zero_grad();
+        (void)sub0::train_batch(data.data(), starts.data(), kBatch, kWindowT, lens.data(), mask.data(),
+                                binds_ptr.data());
+        opt.step();
+    }
+}
+
+// 3-way weighted trainer for Phase F: mixes slot-retrieval windows (fs::SlotDataset, task-contingent, per
+// Phase D's design) with PLAIN TEXT drawn from TWO SEPARATE pools -- drilled subjects and exposure
+// subjects -- at independently controlled rates, instead of Phase D/E's single merged pool. Phase D/E
+// widened one shared plain-text Dataset to include both populations, which diluted drilled subjects' own
+// sampling rate by pool-size ratio (9/15) regardless of per-subject repetition count; Phase E proved that
+// dilution, not cold-mixing, was the dominant cause of Phase D's collapse (docs/FACTSPIKE.md). This keeps
+// drilled subjects' sampling rate close to Phase C's own (100% of the plain-text budget) while still
+// giving exposure subjects real full-text teaching: of the (1-slot_frac) windows NOT going to slot_ds,
+// `exposure_frac_of_plain` of them go to exposure_ds, the rest to drilled_ds.
+void train_steps_3way(const fs::Dataset& drilled_ds, const fs::Dataset& exposure_ds,
+                      const fs::SlotDataset& slot_ds, sub0::AdamW& opt, int steps,
+                      std::mt19937& rng, std::mt19937_64& choice_rng,
+                      double slot_frac, double exposure_frac_of_plain) {
+    std::vector<int> data(static_cast<std::size_t>(kBatch) * (kWindowT + 1));
+    std::vector<std::uint8_t> mask(data.size());
+    std::vector<std::size_t> starts(kBatch);
+    std::vector<int> lens(kBatch);
+    std::vector<sub0::ScratchBindings> binds(kBatch);
+    std::vector<const sub0::ScratchBindings*> binds_ptr(kBatch);
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+
+    auto copy_plain = [&](const fs::Dataset& ds, int b) {
+        const std::size_t base = static_cast<std::size_t>(b) * (kWindowT + 1);
+        const sub0::Window w = sub0::sample_window(rng, kWindowT, ds.tokens.size(),
+                                                   std::span<const std::uint64_t>(ds.doc_starts));
+        const std::size_t n = static_cast<std::size_t>(w.len) + 1;
+        for (std::size_t k = 0; k < n; ++k) {
+            data[base + k] = ds.tokens[w.start + k];
+            mask[base + k] = ds.mask[w.start + k];
+        }
+        binds_ptr[static_cast<std::size_t>(b)] = nullptr;
+        starts[static_cast<std::size_t>(b)] = base;
+        lens[static_cast<std::size_t>(b)] = w.len;
+    };
+
+    for (int s = 0; s < steps; ++s) {
+        for (int b = 0; b < kBatch; ++b) {
+            const double r = coin(choice_rng);
+            if (r < slot_frac) {
+                const std::size_t base = static_cast<std::size_t>(b) * (kWindowT + 1);
+                const sub0::Window w = sub0::sample_window(rng, kWindowT, slot_ds.tokens.size(),
+                                                           std::span<const std::uint64_t>(slot_ds.doc_starts));
+                const std::size_t n = static_cast<std::size_t>(w.len) + 1;
+                for (std::size_t k = 0; k < n; ++k) {
+                    data[base + k] = slot_ds.tokens[w.start + k];
+                    mask[base + k] = slot_ds.mask[w.start + k];
+                }
+                const std::size_t doc = static_cast<std::size_t>(
+                    std::upper_bound(slot_ds.doc_starts.begin(), slot_ds.doc_starts.end(),
+                                     static_cast<std::uint64_t>(w.start)) - slot_ds.doc_starts.begin()) - 1;
+                binds[static_cast<std::size_t>(b)] = sub0::ScratchBindings{
+                    std::span<const std::vector<int>>(slot_ds.doc_bindings[doc]), sub0::SlotEncoding::HRR };
+                binds_ptr[static_cast<std::size_t>(b)] = &binds[static_cast<std::size_t>(b)];
+                starts[static_cast<std::size_t>(b)] = base;
+                lens[static_cast<std::size_t>(b)] = w.len;
+            } else {
+                const double plain_r = (r - slot_frac) / (1.0 - slot_frac);
+                if (plain_r < exposure_frac_of_plain) copy_plain(exposure_ds, b);
+                else                                  copy_plain(drilled_ds, b);
             }
         }
         opt.zero_grad();
@@ -737,4 +814,94 @@ TEST_CASE("factspike hidden-state diagnostic: does the packed slot's fully-proce
     WARN(report);
 
     CHECK(std::isfinite(mean_sim));
+}
+
+TEST_CASE("factspike Phase F: Pack-Aware Training re-tested WITHOUT the dilution confound Phase E "
+         "isolated -- does the task-contingent fix actually beat Phase C?", "[.factspikepatfair]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase F: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+    REQUIRE_FALSE(split.held_out.empty());
+
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+
+    // SEPARATE drilled/exposure plain-text pools (not merged like Phase D/E) -- drilled_ds is IDENTICAL
+    // to Phase C's own ds (same subjects, same seed), so its own sampling rate can stay close to Phase
+    // C's 100%-of-plain-text-budget instead of being diluted by pool-size ratio.
+    const fs::Dataset drilled_ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(drilled_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::Dataset exposure_ds = fs::build_dataset(tk, exposure_split.drilled, kDocsPerFact, /*seed=*/44);
+    REQUIRE(exposure_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_retrieval_dataset(tk, exposure_split.drilled,
+                                                                     kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+    constexpr double kSlotFrac = 0.5;                // matches Phase D's own steady-state mix
+    constexpr double kExposureFracOfPlain = 0.2;     // drilled subjects keep ~40% of ALL windows (vs
+                                                      // Phase C's 50%, vs Phase D/E's diluted ~30%)
+
+    std::string report = "\n=== factspike Phase F PAT, dilution-fixed (d" + std::to_string(D_MODEL) + ", " +
+        std::to_string(split.drilled.size()) + " drilled / " + std::to_string(split.held_out.size()) +
+        " held-out, " + std::to_string(exposure_split.drilled.size()) + " slot-retrieval subjects) ===\n";
+    double peak_baseline = 0.0, peak_scratch = 0.0, peak_held_out = 0.0;
+    double last_baseline = 0.0, last_scratch = 0.0, last_held_out = 0.0;
+    std::vector<double> scratch_traj, held_out_traj, fid_drilled_traj, fid_held_out_traj;
+    for (int r = 0; r < kEvalRounds; ++r) {
+        train_steps_3way(drilled_ds, exposure_ds, slot_ds, opt, kStepsPerEval, rng, choice_rng,
+                         kSlotFrac, kExposureFracOfPlain);
+        const Score sb = eval_baseline(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score ss = eval_scratch(tk, split.drilled, 4242u + static_cast<unsigned>(r));
+        const Score sh = eval_scratch(tk, split.held_out, 4242u + static_cast<unsigned>(r));
+        last_baseline = sb.rate(); last_scratch = ss.rate(); last_held_out = sh.rate();
+        peak_baseline = std::max(peak_baseline, last_baseline);
+        peak_scratch  = std::max(peak_scratch,  last_scratch);
+        peak_held_out = std::max(peak_held_out, last_held_out);
+        const double fid_drilled  = mean_reconstruction_fidelity(tk, split.drilled);
+        const double fid_held_out = mean_reconstruction_fidelity(tk, split.held_out);
+        scratch_traj.push_back(last_scratch);
+        held_out_traj.push_back(last_held_out);
+        fid_drilled_traj.push_back(fid_drilled);
+        fid_held_out_traj.push_back(fid_held_out);
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                     "  s%d: baseline=%.2f scratch=%.2f held_out=%.2f  fid_drilled=%.3f fid_held_out=%.3f\n",
+                     (r + 1) * kStepsPerEval, last_baseline, last_scratch, last_held_out, fid_drilled, fid_held_out);
+        report += buf;
+    }
+    const double r_scratch  = pearson_r(scratch_traj, fid_drilled_traj);
+    const double r_held_out = pearson_r(held_out_traj, fid_held_out_traj);
+    report += "  (chance level ~" + std::to_string(1.0 / fs::fact_vocab().size()) + " for " +
+             std::to_string(fs::fact_vocab().size()) + " colors)\n" +
+             "  peak: baseline=" + std::to_string(peak_baseline) + " scratch=" + std::to_string(peak_scratch) +
+             " held_out=" + std::to_string(peak_held_out) + "\n" +
+             "  last: baseline=" + std::to_string(last_baseline) + " scratch=" + std::to_string(last_scratch) +
+             " held_out=" + std::to_string(last_held_out) + "\n" +
+             "  reconstruction-fidelity vs accuracy Pearson r: drilled(scratch)=" + std::to_string(r_scratch) +
+             " held_out=" + std::to_string(r_held_out) + "\n" +
+             "  (Phase C: peak baseline=1.00 scratch=0.56 | Phase D flat-mix diluted: peak baseline=0.22 "
+             "scratch=0.00 | Phase E warm+ramp diluted: peak baseline=0.33 scratch=0.11)\n";
+    WARN(report);
+
+    // Report all three, real numbers, whatever they are -- matched-budget A/B against Phase C/D/E's own
+    // recorded results (docs/FACTSPIKE.md), not a guaranteed-positive validation.
+    CHECK(std::isfinite(peak_baseline));
+    CHECK(std::isfinite(peak_scratch));
+    CHECK(std::isfinite(peak_held_out));
+    CHECK(std::isfinite(r_scratch));
+    CHECK(std::isfinite(r_held_out));
 }
