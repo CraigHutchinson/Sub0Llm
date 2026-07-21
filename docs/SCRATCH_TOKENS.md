@@ -2,8 +2,10 @@
 
 Scope note: this is a **feature explainer + status** for the scratch-token capability — the mechanism,
 what works and what doesn't as worked examples, and the two distinct routes to "reasoning about a
-slot's content." It complements [ROADMAP.md](ROADMAP.md) (where the corpus/architecture is headed) and
-the project memory `scratch-tokens-context-translation-layer`. The spike code lives in
+slot's content." It complements [ROADMAP.md](ROADMAP.md) (where the corpus/architecture is headed),
+[SCRATCH_TOKEN_FRAMING.md](SCRATCH_TOKEN_FRAMING.md) (the requirements/criteria this mechanism needs to
+satisfy, and the open mathematics of packing/unpacking — read that one for the forward-looking picture),
+and the project memory `scratch-tokens-context-translation-layer`. The spike code lives in
 `include/sub0/scratchspike.hpp` (curriculum), `include/sub0/scratch.hpp` (the production binding table),
 `include/sub0/scratch_slots.hpp` (the engine-facing foundation), and the content-embedding scaffold in
 `src/backend_cpu.cpp`.

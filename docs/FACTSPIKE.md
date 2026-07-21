@@ -5,8 +5,11 @@ already-trained embedding for a word's real vocab piece(s) — literally the wei
 context if the word were spelled out normally — still carries a learned factual association when
 repositioned into a scratch-slot token instead of the byte-decomposed spelling every other scratch
 mechanism uses. It complements [SCRATCH_TOKENS.md](SCRATCH_TOKENS.md) (the scratch-slot mechanism this
-reuses unmodified) and [CORPUS_COLLAPSE.md](CORPUS_COLLAPSE.md) (the "ask to see real examples, don't
-trust an aggregate metric alone" discipline this follows). Written first, before any code.
+reuses unmodified), [CORPUS_COLLAPSE.md](CORPUS_COLLAPSE.md) (the "ask to see real examples, don't
+trust an aggregate metric alone" discipline this follows), and
+[SCRATCH_TOKEN_FRAMING.md](SCRATCH_TOKEN_FRAMING.md) (the requirements/criteria framing and open
+mathematics this experiment's attention-capacity finding, below, feeds directly into). Written first,
+before any code.
 
 ## Status: DONE — Phase 0/A/B/C all run on real hardware; positive result (2026-07-19)
 
