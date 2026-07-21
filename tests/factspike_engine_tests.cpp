@@ -796,24 +796,38 @@ TEST_CASE("factspike hidden-state diagnostic: does the packed slot's fully-proce
     for (int r = 0; r < kEvalRounds; ++r)
         train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
 
+    // Attention-capacity hypothesis: a genuine n-piece word gets ~N_LAYERS*(n-1) sibling-attention hops
+    // (each layer, the word's later positions re-integrate over every earlier piece's current, once-
+    // already-refined state) that a packed single position structurally cannot have (no same-word
+    // siblings to attend back over at all). Prediction: the packed-vs-normal gap should SCALE WITH n, not
+    // be a flat, uniform effect -- n=1 subjects (no multi-hop to lose in the first place) should show
+    // near-zero gap. Piece count recorded alongside cos_sim/correctness to test this directly.
     std::string report = "\n=== factspike hidden-state diagnostic (post Phase-C-regime training) ===\n";
     double sim_sum = 0.0; int n_correct = 0, n_total = 0;
+    std::vector<double> piece_count_traj, sim_traj;
     for (const fs::FactPair& fp : split.drilled) {
         const double sim = hidden_state_cosine(tk, fp);
         const bool   ok  = eval_scratch_one(tk, fp);
+        const std::size_t n_pieces = subject_piece_ids(tk, fp.subject).size();
         sim_sum += sim; ++n_total; n_correct += ok ? 1 : 0;
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "  %-12s cos_sim=%.3f  scratch_correct=%s\n",
-                     fp.subject.c_str(), sim, ok ? "yes" : "no");
+        piece_count_traj.push_back(static_cast<double>(n_pieces));
+        sim_traj.push_back(sim);
+        char buf[112];
+        std::snprintf(buf, sizeof buf, "  %-12s n_pieces=%d  cos_sim=%.3f  scratch_correct=%s\n",
+                     fp.subject.c_str(), static_cast<int>(n_pieces), sim, ok ? "yes" : "no");
         report += buf;
     }
     const double mean_sim = n_total ? sim_sum / n_total : 0.0;
+    const double r_pieces_sim = pearson_r(piece_count_traj, sim_traj);
     report += "  mean cosine similarity (baseline vs scratch final hidden state) = " +
              std::to_string(mean_sim) + "  (" + std::to_string(n_correct) + "/" +
-             std::to_string(n_total) + " correct this round)\n";
+             std::to_string(n_total) + " correct this round)\n" +
+             "  Pearson r(piece_count, cos_sim) = " + std::to_string(r_pieces_sim) +
+             "  (attention-capacity hypothesis predicts NEGATIVE: more pieces -> lower similarity)\n";
     WARN(report);
 
     CHECK(std::isfinite(mean_sim));
+    CHECK(std::isfinite(r_pieces_sim));
 }
 
 TEST_CASE("factspike Phase F: Pack-Aware Training re-tested WITHOUT the dilution confound Phase E "

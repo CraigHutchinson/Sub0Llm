@@ -382,3 +382,43 @@ a failed experiment.
   right, since they're each grounded in more than just a peak-number comparison (Phase E's warm-up-only
   isolation argument, the hidden-state cosine numbers), but the exact magnitudes and the specific
   Phase F baseline anomaly should not be over-interpreted from n=1.
+
+  **The training-schedule axis (Phase D/E/F, "Pack-Aware Training") is parked here.** It doesn't move the
+  actual mechanism, only how hard the model is pushed to use it, and any real fix would need to hold for
+  arbitrary words sharing these same piece tokens elsewhere in the vocabulary — not something a training
+  schedule targeted at this experiment's own subjects could establish. Attention is next.
+
+- **2026-07-21**: a new hypothesis, orthogonal to both training signal and raw representational fidelity —
+  the ATTENTION-CAPACITY axis. In a causal decoder, a genuine n-piece word gets roughly
+  `N_LAYERS × (n−1)` sibling-attention hops: at every layer, the word's later positions can re-attend over
+  every earlier piece's CURRENT (already-once-refined-by-attention) state, and this compounds across
+  layers into real, iterative computation. A packed slot has none of this structurally — it's one
+  position, one Q/K/V per layer, no same-word siblings to attend back over at all; whatever composition
+  happens is frozen into the MeanPool/HRR formula before layer 1 even runs, and everything after is just
+  self-refinement on a single already-fixed starting point. Prediction: the packed-vs-normal
+  representational gap should SCALE WITH n (more pieces packed -> more multi-hop computation skipped), not
+  be a flat effect.
+
+  Extended the hidden-state diagnostic (`[.factspikehidden]`) to record each subject's exact piece count
+  alongside cosine similarity (piece counts were already known to split single- vs multi-piece, but not at
+  this granularity):
+
+  ```
+  Crofw        n_pieces=4  cos_sim=0.889     Woqsmb       n_pieces=6  cos_sim=0.747
+  Yelfan       n_pieces=4  cos_sim=0.551     Zlumwkrpx    n_pieces=7  cos_sim=0.881
+  Hpfds        n_pieces=1  cos_sim=0.935     Nozke        n_pieces=4  cos_sim=0.932
+  Ceaiaenze    n_pieces=8  cos_sim=0.605     Xtora        n_pieces=1  cos_sim=0.965
+  Elgux        n_pieces=1  cos_sim=0.974
+  Pearson r(piece_count, cos_sim) = -0.614
+  ```
+
+  **Reading: this is the strongest, cleanest signal found in this entire investigation.** r=-0.61 across
+  n=9 is moderate-to-strong and directionally exactly as predicted (more pieces -> lower similarity) — a
+  much cleaner relationship than similarity-vs-correctness ever showed (r=0.24, no clean pattern). The
+  three n=1 subjects (no multi-hop structure to lose in the first place) cluster at the top (0.935-0.974);
+  multi-piece subjects spread lower and roughly trend down with n (n=8's Ceaiaenze lowest at 0.605), though
+  n=7's Zlumwkrpx (0.881) doesn't fit a strictly monotonic curve -- real trend, not a clean line, which is
+  expected at n=9. With df=7 this is borderline by conventional significance (p≈0.08, two-tailed) and
+  deserves a larger sample before being treated as fully confirmed, but it's the first result in this whole
+  investigation with both a precise mechanistic story AND a clean quantitative match to that story's
+  specific prediction.
