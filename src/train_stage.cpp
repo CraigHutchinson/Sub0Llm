@@ -38,6 +38,8 @@
 #include "sub0/corpus_collapse.hpp" // wordspike's mechanism over sampled REAL corpus docs (a "corpus_collapse" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
+#include "sub0/layout.hpp"   // HAS_POS_EMB / N_KV_HEADS-derived shape constants. NOT implied by
+                             // memplan.hpp above -- layout.hpp includes memplan, not the reverse.
 
 // Code version + models root, baked in by CMake (configure-time) so a model records what
 // produced it and lands in a structured directory. Fallbacks keep the file compilable alone.
@@ -614,7 +616,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     for (int ref : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) {
         const bool is_seq_len = (field++ == 4);
         const int got = rd<int>(is);
-        if (got != ref && !(is_seq_len && !HAS_POS_EMB)) ok = false;
+        if (got != ref && !(is_seq_len && !sub0::HAS_POS_EMB)) ok = false;
     }
     const std::uint64_t nfloat = rd<std::uint64_t>(is);
     if (!ok || nfloat != sub0::trainable_floats()) {
