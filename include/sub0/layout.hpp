@@ -22,6 +22,16 @@
 
 namespace sub0 {
 
+// Grouped-query attention: N_KV_HEADS key/value heads shared across N_HEADS query heads, so each KV
+// head serves a group of GQA_GROUP queries. N_KV_HEADS == N_HEADS is plain MHA (GQA_GROUP == 1), the
+// default -- at that setting every expression below collapses to the pre-GQA form exactly.
+// D_KV is the width of the K and V projections, i.e. what replaces D_MODEL in Wk/Wv and in the KV cache.
+static_assert(N_KV_HEADS >= 1, "N_KV_HEADS must be at least 1");
+static_assert(N_HEADS % N_KV_HEADS == 0, "N_HEADS must be divisible by N_KV_HEADS (equal query groups)");
+inline constexpr int GQA_GROUP = N_HEADS / N_KV_HEADS;
+inline constexpr int D_KV      = N_KV_HEADS * D_HEAD;
+static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
+
 // Parameter tensor count: tok_emb + pos_emb (2), then per transformer block either 10
 // (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9 (gated: ln1, ln2, Wq, Wk, Wv, Wo,
 // Wg, W1, W2 -- SwiGLU, no FFN biases, matching the GGUF/Llama convention this variant
@@ -80,8 +90,12 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
         add(1,       D_MODEL, PKind::Ln1, false, false);
         add(1,       D_MODEL, PKind::Ln2, false, false);
         add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
-        add(D_MODEL, D_MODEL, PKind::Wk,  true,  true);
-        add(D_MODEL, D_MODEL, PKind::Wv,  true,  true);
+        // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
+        // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
+        // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
+        // not assume they match).
+        add(D_MODEL, D_KV,    PKind::Wk,  true,  true);
+        add(D_MODEL, D_KV,    PKind::Wv,  true,  true);
         add(D_MODEL, D_MODEL, PKind::Wo,  true,  true);
         if constexpr (USE_QK_NORM) {
             add(1, D_HEAD, PKind::QNorm, false, false);

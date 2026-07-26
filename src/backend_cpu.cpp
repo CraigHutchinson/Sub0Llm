@@ -545,8 +545,12 @@ static Node* op_rope(Node* x, int H) {
     return y;
 }
 
+// Under GQA the K/V rows are D_KV wide (N_KV_HEADS heads) while Q/out stay D_MODEL wide (N_HEADS
+// heads): query head h reads KV head h / GQA_GROUP. With N_KV_HEADS == N_HEADS this is GQA_GROUP == 1,
+// off_kv == off and Ckv == C -- byte-identical to the pre-GQA path.
 static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     const int T = q->rows, C = q->cols, d = C / H;
+    const int Ckv = k->cols;                       // D_KV; == C when not using GQA
     const float scale = 1.f / std::sqrt((float)d);
     Node* out = mk_node(Op::Attn, T, C);
     out->a = q; out->b = k; out->bias = v; out->heads = H;
@@ -554,14 +558,15 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     out->scratch = P;
     auto Pidx = [T](int h, int i, int j) { return ((size_t)h * T + i) * T + j; };
     for (int h = 0; h < H; ++h) {
-        int off = h * d;
+        int off    = h * d;                        // query/output head offset (stride C)
+        int off_kv = (h / GQA_GROUP) * d;          // shared KV head offset (stride Ckv)
         for (int i = 0; i < T; ++i) {
             const float* __restrict qi = q->data.data() + (size_t)i * C + off;
             float* __restrict oi       = out->data.data() + (size_t)i * C + off;
             float mx = -1e30f;
             std::array<float, SEQ_LEN> sc{};
             for (int j = 0; j <= i; ++j) {
-                const float* __restrict kj = k->data.data() + (size_t)j * C + off;
+                const float* __restrict kj = k->data.data() + (size_t)j * Ckv + off_kv;
                 float s = 0.f;
                 #pragma omp simd reduction(+ : s)
                 for (int a = 0; a < d; ++a) s += qi[a] * kj[a];
@@ -573,7 +578,7 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
             for (int j = 0; j <= i; ++j) {
                 float p = sc[j] / Z;
                 P[Pidx(h, i, j)] = p;
-                const float* __restrict vj = v->data.data() + (size_t)j * C + off;
+                const float* __restrict vj = v->data.data() + (size_t)j * Ckv + off_kv;
                 for (int a = 0; a < d; ++a) oi[a] += p * vj[a];      // contiguous axpy
             }
         }
@@ -846,14 +851,21 @@ static void backward_node(Node& n) {
     case Op::Attn: {
         Node* q = n.a; Node* k = n.b; Node* v = n.bias;
         const int T = q->rows, C = q->cols, H = n.heads, d = C / H;
+        const int Ckv = k->cols;                   // D_KV; == C when not using GQA
         const float scale = 1.f / std::sqrt((float)d);
         std::span<float> P = n.scratch;
         auto Pidx = [T](int h, int i, int j) { return ((size_t)h * T + i) * T + j; };
-        Mat ng = mat(n.grad, T, C), vg = mat(v->grad, T, C), vd = mat(v->data, T, C);
-        Mat qg = mat(q->grad, T, C), kg = mat(k->grad, T, C);
-        Mat qd = mat(q->data, T, C), kd = mat(k->data, T, C);
+        // K/V (and their grads) are Ckv-wide, Q/out are C-wide -- distinct mdspan shapes under GQA.
+        Mat ng = mat(n.grad, T, C), vg = mat(v->grad, T, Ckv), vd = mat(v->data, T, Ckv);
+        Mat qg = mat(q->grad, T, C), kg = mat(k->grad, T, Ckv);
+        Mat qd = mat(q->data, T, C), kd = mat(k->data, T, Ckv);
         for (int h = 0; h < H; ++h) {
-            int off = h * d;
+            int off    = h * d;
+            int off_kv = (h / GQA_GROUP) * d;
+            // Under GQA the GQA_GROUP query heads sharing this KV head all accumulate into the SAME
+            // kg/vg columns. That is already correct here because every write below is `+=` and the
+            // h loop is serial -- no structural change was needed, but it IS the load-bearing reason
+            // this backward stays correct (the CUDA path has the opposite default; see its own note).
             for (int i = 0; i < T; ++i) {
                 std::array<float, SEQ_LEN> dP{};
                 for (int j = 0; j <= i; ++j) {
@@ -861,8 +873,8 @@ static void backward_node(Node& n) {
                     #pragma omp simd reduction(+ : dp)
                     for (int a = 0; a < d; ++a) {
                         float dout = ng[i, off + a];
-                        vg[j, off + a] += p * dout;
-                        dp += dout * vd[j, off + a];
+                        vg[j, off_kv + a] += p * dout;
+                        dp += dout * vd[j, off_kv + a];
                     }
                     dP[j] = dp;
                 }
@@ -872,8 +884,8 @@ static void backward_node(Node& n) {
                 for (int j = 0; j <= i; ++j) {
                     float ds = P[Pidx(h, i, j)] * (dP[j] - dot) * scale;
                     for (int a = 0; a < d; ++a) {
-                        qg[i, off + a] += ds * kd[j, off + a];
-                        kg[j, off + a] += ds * qd[i, off + a];
+                        qg[i, off + a]     += ds * kd[j, off_kv + a];
+                        kg[j, off_kv + a]  += ds * qd[i, off + a];
                     }
                 }
             }
@@ -916,13 +928,15 @@ namespace {
 // Dense weights only (the sparse-ternary linear path is not mirrored here); a ternary build keeps
 // the full-forward gen path. Positions must stay < SEQ_LEN (gen falls back past the window).
 struct KVCache {
-    std::vector<float> k, v;                                    // [N_LAYERS][SEQ_LEN][D_MODEL], flat
+    std::vector<float> k, v;                                    // [N_LAYERS][SEQ_LEN][D_KV], flat
     void reset() {
-        const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_MODEL;
+        const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_KV;
         if (k.size() != n) { k.assign(n, 0.f); v.assign(n, 0.f); }
     }
-    float* krow(int l, int pos) { return k.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_MODEL; }
-    float* vrow(int l, int pos) { return v.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_MODEL; }
+    // Rows are D_KV wide, not D_MODEL: under GQA the cache holds N_KV_HEADS heads, which is the whole
+    // point (the cache shrinks by N_HEADS/N_KV_HEADS). Identical to D_MODEL when not using GQA.
+    float* krow(int l, int pos) { return k.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_KV; }
+    float* vrow(int l, int pos) { return v.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_KV; }
 };
 thread_local KVCache g_kv;                                      // gen is single-threaded; lazily sized
 
@@ -1024,8 +1038,8 @@ struct Model {
             L.ln1 = mk_param(1, D_MODEL, false);
             L.ln2 = mk_param(1, D_MODEL, false);
             L.Wq = mk_param(D_MODEL, D_MODEL, true);
-            L.Wk = mk_param(D_MODEL, D_MODEL, true);
-            L.Wv = mk_param(D_MODEL, D_MODEL, true);
+            L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
+            L.Wv = mk_param(D_MODEL, D_KV, true);
             L.Wo = mk_param(D_MODEL, D_MODEL, true);
             // Order here MUST match layout.hpp's make_param_layout() exactly -- it IS the
             // serialization order (see that file's header comment).
@@ -1094,13 +1108,17 @@ struct Model {
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
             Node* vn = op_linear(a, L.Wv, nullptr, q);
+            // K carries N_KV_HEADS heads over a D_KV-wide row, Q carries N_HEADS over D_MODEL. Both
+            // ops derive their per-head width as (cols / heads), so each still sees D_HEAD -- but the
+            // HEAD COUNT must match the tensor, or the per-head split silently straddles head
+            // boundaries (caught by the forward_one-vs-forward parity test, not by the gradient check).
             if constexpr (USE_QK_NORM) {
                 qn = op_qknorm(qn, L.q_norm, N_HEADS);
-                kn = op_qknorm(kn, L.k_norm, N_HEADS);
+                kn = op_qknorm(kn, L.k_norm, N_KV_HEADS);
             }
             if constexpr (POS_ENCODING == PosEncoding::Rope) {
                 qn = op_rope(qn, N_HEADS);
-                kn = op_rope(kn, N_HEADS);
+                kn = op_rope(kn, N_KV_HEADS);
             }
             Node* att = op_attn(qn, kn, vn, N_HEADS);
             h = op_add(h, op_linear(att, L.Wo, nullptr, q));
@@ -1169,18 +1187,22 @@ struct Model {
             Layer& L = layers[l];
             rmsnorm_row(h, L.ln1, a, C);
             linear_row(a, L.Wq, nullptr, qn, C, C);
-            linear_row(a, L.Wk, nullptr, kn, C, C);
-            linear_row(a, L.Wv, nullptr, vn, C, C);
-            if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, H, C); }
-            if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, H, C); }
+            // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row both
+            // derive their per-head width as (width / heads), so passing the KV pair yields the same
+            // D_HEAD they always did -- the rotation and norm are per-head, so nothing else changes.
+            linear_row(a, L.Wk, nullptr, kn, C, D_KV);
+            linear_row(a, L.Wv, nullptr, vn, C, D_KV);
+            if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
+            if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
             float* kc = g_kv.krow(l, pos); float* vc = g_kv.vrow(l, pos);        // append this token's K/V
-            for (int j = 0; j < C; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
+            for (int j = 0; j < D_KV; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
             for (int hd = 0; hd < H; ++hd) {                                     // attend query pos over j<=pos
-                const int off = hd * d;
+                const int off    = hd * d;
+                const int off_kv = (hd / GQA_GROUP) * d;    // shared KV head for this query group
                 std::array<float, SEQ_LEN> sc{};
                 float mx = -1e30f;
                 for (int j = 0; j <= pos; ++j) {
-                    const float* kj = g_kv.krow(l, j) + off;
+                    const float* kj = g_kv.krow(l, j) + off_kv;
                     float s = 0.f; for (int aa = 0; aa < d; ++aa) s += qn[off + aa] * kj[aa];
                     s *= scale; sc[j] = s; mx = std::max(mx, s);
                 }
@@ -1188,7 +1210,7 @@ struct Model {
                 for (int j = 0; j <= pos; ++j) { sc[j] = FAST_MATH ? fast_exp(sc[j] - mx) : std::exp(sc[j] - mx); Z += sc[j]; }
                 for (int aa = 0; aa < d; ++aa) att[off + aa] = 0.f;
                 for (int j = 0; j <= pos; ++j) {
-                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(l, j) + off;
+                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(l, j) + off_kv;
                     for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
                 }
             }
@@ -1358,14 +1380,16 @@ const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see M
 // on this thread (no redundant guard here, same discipline as g_kv's other two entry points above).
 const float* kv_krow_ptr(int layer, int pos) { return g_kv.krow(layer, pos); }
 const float* kv_vrow_ptr(int layer, int pos) { return g_kv.vrow(layer, pos); }
-void kv_rope_rotate(float* row, int pos) { rope_row(row, pos, N_HEADS, D_MODEL); }
+// KV-cache rows are D_KV wide with N_KV_HEADS heads (== D_MODEL/N_HEADS when not using GQA); the
+// per-head rotation width is D_HEAD either way.
+void kv_rope_rotate(float* row, int pos) { rope_row(row, pos, N_KV_HEADS, D_KV); }
 void kv_splice_row(int layer, int pos, const float* k_canonical, const float* v) {
-    float k[D_MODEL];
-    for (int j = 0; j < D_MODEL; ++j) k[j] = k_canonical[j];
-    rope_row(k, pos, N_HEADS, D_MODEL);          // rotate the de-rotated canonical row to its splice position
+    float k[D_KV];
+    for (int j = 0; j < D_KV; ++j) k[j] = k_canonical[j];
+    rope_row(k, pos, N_KV_HEADS, D_KV);          // rotate the de-rotated canonical row to its splice position
     float* kc = g_kv.krow(layer, pos);
     float* vc = g_kv.vrow(layer, pos);
-    for (int j = 0; j < D_MODEL; ++j) { kc[j] = k[j]; vc[j] = v[j]; }   // V is position-invariant, no rotation
+    for (int j = 0; j < D_KV; ++j) { kc[j] = k[j]; vc[j] = v[j]; }      // V is position-invariant, no rotation
 }
 
 void backward(Node* loss, float seed) {

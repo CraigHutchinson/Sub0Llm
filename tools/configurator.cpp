@@ -570,6 +570,7 @@ int main(int argc, char** argv) {
     int d_model      = 0;       // 0 = auto-size from corpus scale (autosize_dims); any nonzero pins it
     int n_layers     = 0;
     int n_heads      = 0;
+    int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
     int seq_len      = 0;
     int ternary      = 0;
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
@@ -608,6 +609,9 @@ int main(int argc, char** argv) {
     app.add_option("--dmodel", d_model, "Embedding / residual width (0 = auto-size from corpus)")->capture_default_str();
     app.add_option("--layers", n_layers,"Transformer block count (0 = auto)")->capture_default_str();
     app.add_option("--heads",  n_heads, "Attention head count (0 = auto)")->capture_default_str();
+    app.add_option("--kv-heads", n_kv_heads,
+                   "Key/value head count for grouped-query attention (0 = same as --heads, i.e. plain MHA)")
+       ->capture_default_str();
     app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
        ->capture_default_str()->check(CLI::Range(0, 1));
@@ -739,6 +743,14 @@ int main(int argc, char** argv) {
     if (d_model % n_heads != 0) {
         std::println(stderr, "configure error: dmodel ({}) not divisible by heads ({})",
                      d_model, n_heads);
+        return 1;
+    }
+    // GQA: n_kv_heads must divide n_heads so every KV head serves an equal-sized query group.
+    // 0 means "not requested" -> plain MHA, the default that leaves every existing build unchanged.
+    if (n_kv_heads == 0) n_kv_heads = n_heads;
+    if (n_kv_heads < 1 || n_heads % n_kv_heads != 0) {
+        std::println(stderr, "configure error: kv-heads ({}) must be >= 1 and divide heads ({}) evenly",
+                     n_kv_heads, n_heads);
         return 1;
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
@@ -1171,6 +1183,10 @@ int main(int argc, char** argv) {
     cos << "constexpr int  D_MODEL     = " << d_model  << ";\n";
     cos << "constexpr int  N_LAYERS    = " << n_layers << ";\n";
     cos << "constexpr int  N_HEADS     = " << n_heads  << ";\n";
+    // Grouped-query attention: N_KV_HEADS key/value heads shared across N_HEADS query heads
+    // (N_KV_HEADS == N_HEADS is plain MHA, the default). Shrinks Wk/Wv and the KV cache by
+    // N_HEADS/N_KV_HEADS -- see op_attn in backend_cpu.cpp and layout.hpp's Wk/Wv entries.
+    cos << "constexpr int  N_KV_HEADS  = " << n_kv_heads << ";\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
     // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
     // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.

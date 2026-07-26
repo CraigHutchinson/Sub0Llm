@@ -117,6 +117,7 @@ struct ModelMeta {
     X(int,         d_model,         0)    \
     X(int,         n_layers,        0)    \
     X(int,         n_heads,         0)    \
+    X(int,         n_kv_heads,      0)    \
     X(int,         seq_len,         0)    \
     X(int,         vocab,           0)    \
     X(int,         ternary,         0)    \
