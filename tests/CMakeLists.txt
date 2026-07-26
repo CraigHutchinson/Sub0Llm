@@ -9,6 +9,7 @@ include(Catch)
 add_executable(sub0_tests
   tokenizer_tests.cpp
   engine_tests.cpp
+  arch_identity_tests.cpp
   layout_tests.cpp
   tune_tests.cpp
   coherence_tests.cpp
