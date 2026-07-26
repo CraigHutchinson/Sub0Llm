@@ -4,10 +4,15 @@
 //      per-document ScratchTable reset, the val-split clamp, long-document prefix truncation, and the
 //      masking discipline (mask=1 except at a substituted slot) are all correct, using hand-built
 //      TokView/doc_starts fixtures -- no model, no tokenizer file, no training.
-//   2. A hidden capstone ("[.corpus_collapse]") training two real models to test whether blending a
+//   2. A hidden capstone ("[.corpus_collapse]") training THREE real models to test whether blending a
 //      corpus_collapse source alongside "base" measurably helps or hurts held-out NELBO on ordinary real
-//      corpus text, via the REAL production scheduler (sample_blend_staged) -- matched-budget A/B,
-//      mirroring blended_capstone_engine_tests.cpp's own methodology.
+//      corpus text, via the REAL production scheduler (sample_blend_staged) -- matched-budget A/B/C,
+//      mirroring blended_capstone_engine_tests.cpp's own methodology. The third arm (2026-07-21,
+//      build_dataset_markers) tests docs/FACTSPIKE.md's "SPELL marker finding" at real-corpus scale: does
+//      binding a collapsed slot to the marker-INCLUSIVE span (SPELL_START/pieces/SPELL_END, what a real
+//      forward pass over the word actually processes) instead of word_span's marker-stripped pieces
+//      change held-out NELBO, the way it decisively closed a reconstruction-fidelity gap in factspike's
+//      toy model.
 //
 // See docs/CORPUS_COLLAPSE.md for the full design record and the capstone's real result.
 
@@ -321,13 +326,24 @@ TEST_CASE("corpus_collapse capstone: does blending a real-corpus collapse curric
         WARN(qual);
     }
 
+    // Marker-inclusive dataset (docs/FACTSPIKE.md's "SPELL marker finding") -- SAME sampled documents/seed
+    // as cc_ds above (build_dataset_markers takes identical Options), differing only in whether a
+    // collapsed slot's bound content includes SPELL_START/SPELL_END or not.
+    const sub0::corpus_collapse::Dataset cc_ds_markers =
+        sub0::corpus_collapse::build_dataset_markers(tk, train_span, doc_index, val_start, copt);
+    REQUIRE(cc_ds_markers.tokens.size() > static_cast<std::size_t>(kWindowT));
+
     sub0::BlendSource base_src{ "base", train_span, doc_index, {}, {} };
     sub0::BlendSource cc_src{ "collapse",
         sub0::TokView::over_int32(cc_ds.tokens.data(), cc_ds.tokens.size()),
         std::span<const std::uint64_t>(cc_ds.doc_starts), std::span<const std::uint8_t>(cc_ds.mask),
         std::span<const std::vector<std::vector<int>>>(cc_ds.doc_bindings) };
+    sub0::BlendSource cc_src_markers{ "collapse_markers",
+        sub0::TokView::over_int32(cc_ds_markers.tokens.data(), cc_ds_markers.tokens.size()),
+        std::span<const std::uint64_t>(cc_ds_markers.doc_starts), std::span<const std::uint8_t>(cc_ds_markers.mask),
+        std::span<const std::vector<std::vector<int>>>(cc_ds_markers.doc_bindings) };
 
-    double base_only_nelbo = 0.0, blended_nelbo = 0.0;
+    double base_only_nelbo = 0.0, blended_nelbo = 0.0, blended_markers_nelbo = 0.0;
 
     sub0::build_model(); reset_opt_state();
     {
@@ -357,22 +373,41 @@ TEST_CASE("corpus_collapse capstone: does blending a real-corpus collapse curric
         blended_nelbo = eval_val_nelbo(val_span, vrng);
     }
 
+    sub0::build_model(); reset_opt_state();
+    {
+        sub0::AdamW opt(kLr);
+        std::mt19937 rng(1);
+        std::vector<sub0::BlendSource> srcs{ base_src, cc_src_markers };
+        std::vector<std::string> names{ "base", "collapse_markers" };
+        sub0::ScheduleSpec spec;
+        spec.stages.push_back(equal_weight_stage({ {"base", 1.0}, {"collapse_markers", 1.0} }));
+        sub0::ResolvedSchedule sched = sub0::resolve_schedule(spec, std::span<const std::string>(names));
+        sub0::BlendFairness fair(srcs.size());
+        for (int r = 0; r < kEvalRounds; ++r) train_steps(srcs, sched, fair, opt, kStepsPerEval, rng);
+        std::mt19937 vrng(2);
+        blended_markers_nelbo = eval_val_nelbo(val_span, vrng);
+    }
+
     const std::size_t cc_bytes = cc_ds.tokens.size() * sizeof(int) + cc_ds.mask.size();
-    char buf[640];
+    char buf[800];
     std::snprintf(buf, sizeof buf,
         "\n=== corpus_collapse capstone (d%d, corpus '%s') ===\n"
         "  build_dataset: %d docs sampled -> %zu tokens, %.1f ms\n"
         "  memory: collapse Dataset ~%.2f MB  vs  base corpus %.1f MB (token count only, mmap'd not resident)\n"
         "  held-out NELBO (%d val batches, %d windows/batch): base-only=%.4f  base+collapse=%.4f  "
-        "(delta=%.4f, +ve = collapse hurt)\n",
+        "base+collapse_markers=%.4f\n"
+        "  delta vs base-only: collapse=%.4f  collapse_markers=%.4f  (+ve = hurt; docs/FACTSPIKE.md's "
+        "SPELL marker finding predicts collapse_markers should do LESS harm / more good than collapse)\n",
         D_MODEL, sub0::default_corpus_tok(), copt.n_docs, cc_ds.tokens.size(), build_ms,
         static_cast<double>(cc_bytes) / (1024.0 * 1024.0),
         static_cast<double>(train_span.size() * sizeof(int)) / (1024.0 * 1024.0),
-        kValBatches, kBatch, base_only_nelbo, blended_nelbo, blended_nelbo - base_only_nelbo);
+        kValBatches, kBatch, base_only_nelbo, blended_nelbo, blended_markers_nelbo,
+        blended_nelbo - base_only_nelbo, blended_markers_nelbo - base_only_nelbo);
     WARN(std::string(buf));
 
     CHECK(std::isfinite(base_only_nelbo));
     CHECK(std::isfinite(blended_nelbo));
+    CHECK(std::isfinite(blended_markers_nelbo));
     // Equal-weight blending is a deliberately AGGRESSIVE exposure (a production schedule would likely
     // weight this source much lower) -- this is a "not badly broken" gate, not a tight regression pin;
     // the WARN report above carries the real numbers for a human to judge (three-pillar policy: not

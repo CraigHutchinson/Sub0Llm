@@ -142,4 +142,86 @@ inline Dataset build_dataset(const tok::Tokenizer& tk, TokView base_tokens,
     return ds;
 }
 
+// Marker-inclusive variant of build_dataset (docs/FACTSPIKE.md's "SPELL marker finding", 2026-07-21):
+// binds a collapsed slot to the FULL wrapped span (SPELL_START/pieces/SPELL_END) instead of word_span's
+// marker-stripped `pieces` -- a controlled, matched-budget test of whether the same fidelity gap
+// factspike's toy model showed (real, decisive: replaying the marker-inclusive span closed a 0.87-0.96 ->
+// exact-1.000 reconstruction gap with zero exceptions, docs/FACTSPIKE.md Phase G) shows up as a
+// measurable held-out NELBO difference at real-corpus scale. Structurally identical to build_dataset
+// above except ONE line: the bound content is doc_buf's own [i, i+span_len) slice (markers included when
+// word_span detected a SPELL wrapper) instead of word_span's own stripped `pieces` return value --
+// `table.expand()` passes SPELL_START/SPELL_END through unchanged (they're marker ids, below the learned-
+// piece range, so expand()'s identity fallback handles them with no special-casing needed). A SEPARATE
+// function, not a parameter on build_dataset, matching this project's own "new function per experimental
+// variant" convention (see factspike.hpp's own per-phase functions) and so as not to risk perturbing
+// build_dataset's own already-shipped, production behavior.
+inline Dataset build_dataset_markers(const tok::Tokenizer& tk, TokView base_tokens,
+                                     std::span<const std::uint64_t> doc_starts, std::size_t train_tok,
+                                     const Options& opt) {
+    Dataset ds;
+    ds.doc_starts.push_back(0);
+    if (doc_starts.empty()) return ds;
+
+    const std::size_t n_total_docs = doc_starts.size();
+    const std::size_t want = std::min(static_cast<std::size_t>(std::max(opt.n_docs, 0)), n_total_docs);
+    std::mt19937_64 rng(opt.seed);
+    std::vector<std::size_t> chosen;
+    chosen.reserve(want);
+    for (std::size_t d = 0; d < n_total_docs; ++d) {
+        if (chosen.size() < want) {
+            chosen.push_back(d);
+        } else {
+            std::uniform_int_distribution<std::size_t> pick(0, d);
+            const std::size_t j = pick(rng);
+            if (j < want) chosen[j] = d;
+        }
+    }
+    std::sort(chosen.begin(), chosen.end());
+
+    const std::size_t max_doc = opt.max_doc_tokens > 0 ? static_cast<std::size_t>(opt.max_doc_tokens)
+                                                        : std::numeric_limits<std::size_t>::max();
+    std::vector<int> doc_buf;
+    for (std::size_t d : chosen) {
+        const std::size_t ds_pos = static_cast<std::size_t>(doc_starts[d]);
+        std::size_t de = (d + 1 < doc_starts.size()) ? static_cast<std::size_t>(doc_starts[d + 1]) : train_tok;
+        if (de > train_tok) de = train_tok;
+        if (ds_pos >= de) continue;
+        std::size_t len = de - ds_pos;
+        if (len > max_doc) len = max_doc;
+        if (len < 2) continue;
+
+        doc_buf.resize(len);
+        base_tokens.copy_to(ds_pos, len, doc_buf.data());
+
+        ScratchTable table;
+        table.tk = &tk;
+        for (std::size_t i = 0; i < doc_buf.size(); ) {
+            const auto [span_len, pieces] = detail::word_span(doc_buf, i);
+            if (pieces.empty()) {   // unterminated SPELL span (truncation cut mid-word) -- pass through
+                ds.tokens.push_back(doc_buf[i]); ds.mask.push_back(1);
+                i += span_len; continue;
+            }
+            const std::vector<int> full_span(doc_buf.begin() + static_cast<std::ptrdiff_t>(i),
+                                             doc_buf.begin() + static_cast<std::ptrdiff_t>(i + span_len));
+            std::vector<int> bytes;
+            for (int p : full_span) {
+                const std::vector<int> e = table.expand(p);
+                bytes.insert(bytes.end(), e.begin(), e.end());
+            }
+            const ScratchTable::Recurrence r = table.combine_recurrence(bytes);
+            if (r.is_repeat) {
+                for (int t : r.tokens) { ds.tokens.push_back(t); ds.mask.push_back(0); }
+            } else {
+                for (std::size_t k = i; k < i + span_len; ++k) {
+                    ds.tokens.push_back(doc_buf[k]); ds.mask.push_back(1);
+                }
+            }
+            i += span_len;
+        }
+        ds.doc_starts.push_back(ds.tokens.size());
+        ds.doc_bindings.push_back(std::move(table.bindings));
+    }
+    return ds;
+}
+
 }  // namespace sub0::corpus_collapse

@@ -294,3 +294,27 @@ Reviewed before implementation, not discovered after:
   tokenizer fix. **Lesson worth keeping**: asking to see real examples, not just trusting an aggregate
   metric, is what surfaced this -- the original +0.014 NELBO delta alone looked like a mundane "no harm"
   result and gave no hint the mechanism was mistargeting by this much.
+
+- **2026-07-21, SPELL-marker cross-check (docs/FACTSPIKE.md's own investigation)**: a toy-model spike
+  (factspike, d96) found that `word_span` -- the SAME extraction this file's own `build_dataset` calls
+  (line ~119) -- unconditionally strips `TOK_SPELL_START`/`TOK_SPELL_END` from what gets bound to a
+  collapsed slot, and that these markers are fully load-bearing for exact representational reconstruction
+  (a controlled swap-and-remeasure closed a 0.87-0.96 cosine-similarity gap to exact 1.000, zero
+  exceptions, once markers were included). Since this file is a direct, first-class caller of that same
+  extraction, added `build_dataset_markers` (marker-inclusive, structurally identical to `build_dataset`
+  except the bound span includes the wrapper markers) and re-ran the `[.corpus_collapse]` capstone as a
+  3-arm A/B/C (base-only / base+collapse / base+collapse_markers), same TinyStories build/budget as above.
+
+  **Result: no detectable difference.** Held-out NELBO identical to 4 decimal places between
+  marker-stripped and marker-inclusive arms (both -0.0075 vs. base-only). This is a real, honest negative
+  for THIS metric at THIS budget -- not evidence the SPELL-marker finding is wrong, but evidence that its
+  effect (measured, in the toy model, via a surgical single-position cosine-similarity probe) doesn't
+  show up in an aggregate NELBO averaged across a whole validation set, where only 401/1693 documents even
+  contain a collapse-eligible word. Read alongside factspike's own follow-up (Phase H): compression-based
+  mechanisms (this file's own `combine_recurrence`+byte-fragment binding, structurally the same
+  fixed-capacity-bundle shape as factspike's mechanism A) getting WORSE, not better, when given the same
+  markers to compress suggests the relevant bottleneck for THIS kind of mechanism was never "which tokens
+  get bound" -- it's the fixed-size compression step itself. Not a reason to revert this file's own
+  marker-stripped convention (no evidence it's currently harming production NELBO), but a flag that a
+  future compression-mechanism change should account for this rather than re-litigate it from scratch.
+  Full detail: `docs/FACTSPIKE.md`'s own entry, `docs/SCRATCH_TOKEN_FRAMING.md` axis 9.
