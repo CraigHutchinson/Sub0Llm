@@ -49,7 +49,7 @@ Each row: what it means, current status, where it was tested. Status current as 
 | 6 | **Factual/world-knowledge retrieval through the packed form** | A fact learned via ordinary text about a subject must still be retrievable when that subject is introduced *only* via a packed slot | ◻ partial, real gap to baseline | `FACTSPIKE.md` Phase C: peak 0.56 vs 0.125 chance (real signal) vs. baseline's 1.00 (real gap) |
 | 7 | **Zero-shot generalization** | Works for a subject/word never itself seen packed during training | ◻ ambiguous at small n | `FACTSPIKE.md` held-out arm — peak 0.33 (n=3), statistically indistinguishable from noise at this sample size |
 | 8 | **No shortcut / leakage** | The above isn't secretly memorization or an in-document/in-training tell | checked, ongoing discipline | `FACTSPIKE.md` Phase 0 piece-balance check; each new curriculum re-applies this discipline |
-| 9 | **Attention-capacity preservation** | The packed form preserves enough of the multi-hop computation a real multi-piece span gets | 🔴 **ACTIVE, the current live question** | `FACTSPIKE.md` hidden-state diagnostic: Pearson r(piece_count, cos_sim) = **-0.614** |
+| 9 | **Attention-capacity preservation** | The packed form preserves enough of the multi-hop computation a real multi-piece span gets | 🟡 **first real O(1) positive found** — periodic re-injection, eval-only, not yet trained-for | `FACTSPIKE.md` Phase G: no-compression splice + markers hits cos_sim=**1.000**; Phase H: markers made compression-based A/candidate-1 WORSE; **Phase I**: scale-adaptive periodic re-injection (Nanbeige-inspired, zero learned params) lifts accuracy 3/9→**5/9** and cos_sim 0.83→0.86 at O(1) cost, eval-only on an untrained-for signal — training-graph wiring is the well-motivated next step |
 | 10 | **Cost efficiency** | O(1) token / O(1) KV-cache slot per mention, not O(n) | THE reason this mechanism exists — must not be silently given up by any fix | `SCRATCH_TOKENS.md`'s own framing: 20 mentions of a 5-piece OOV = 100 tokens without packing |
 | 11 | **Model-emittable addressing** | The model itself can *choose* to reference a packed handle, not just consume harness-injected ones | open, gated | `SCRATCH_TOKENS.md` sentinel-pair Phase 2 — selection through the pair embedding is a wall; solved instead via Route A (resolve + local-CoT), not embedding override |
 | 12 | **Training-exposure requirements** | The model needs *some* exposure to reading packed forms to use them at all — how much, shaped how | investigated, one sub-question now parked | `FACTSPIKE.md` Phase B (no exposure = no packed retrieval) through Phase F (PAT axis, parked — see below) |
@@ -140,9 +140,9 @@ but is instead mathematically motivated by *where* the trace's information actua
 
 ---
 
-## Two candidate directions, in order of how soon they're buildable
+## Candidate directions, in order of how soon they're buildable
 
-### 1. Post-hoc per-layer KV pooling (nearer-term)
+### 1. Post-hoc per-layer KV pooling (nearer-term) — SPIKED 2026-07-21, NOT an improvement as specified
 
 Let the real forward pass over the `n` pieces happen once — however triggered (first mention, harness
 pre-encode) — and capture the **actual** per-layer `(K_l, V_l)` pairs, not the raw input embeddings. *Then*
@@ -157,7 +157,21 @@ concrete hypothesis: does this compress-after-computing approach show a **weaker
 correlation between piece count and fidelity than mechanism A's r=-0.614, since the thing being lost is
 narrower?
 
-### 2. Landmark-style transparent expansion (more ambitious, most faithful)
+**Built and spiked** (`tests/factspike_engine_tests.cpp`'s `[.factspikekvtrace]`, three new engine
+primitives in `core.hpp`/`backend_cpu.cpp` — see `docs/FACTSPIKE.md`'s Phase G entry for the full
+writeup and per-subject numbers). Real result, same run/weights as mechanism A: mean cos_sim A=0.83 vs
+B=0.77 (worse), r(piece_count,cos_sim) A=-0.614 vs B=-0.624 (very slightly stronger, not weaker as
+predicted), accuracy tied 3/9 on different subjects. The mean-similarity gap is mostly a single n=8
+outlier (nearly vanishes excluding it), but the correlation gap survives outlier exclusion. **The
+concrete hypothesis above was falsified as stated** — richer pooling INPUT (real per-layer K/V vs. raw
+embeddings) did not narrow the degradation curve. Mechanistic reframe: this points toward HRR's own
+fixed-`D_MODEL`-capacity `n→1` bundle as the bottleneck, independent of what's being bundled — directly
+testable against the still-open "HRR crosstalk theory" question below (Plate's `1/sqrt(n)` result), a
+pure analytical check against the already-collected data, no new training needed. Candidate 1 as specified
+(swap the pooling INPUT, keep HRR bundling) is not the lever; candidate 2 (no pooling at all) or a
+different pooling OPERATOR remain open.
+
+### 2. Landmark-style transparent expansion (more ambitious, most faithful) — SPIKED 2026-07-21
 
 Keep the full `n`-way per-layer trace cached out-of-band entirely — don't compress it at all. The visible
 "scratch token" in the sequence is a **pointer**: when any layer's attention actually needs to read this
@@ -172,19 +186,130 @@ token triggers expanded attention into a cached block) already do in the wider l
 part here is that the cache entry is *per-word*, addressed by the scratch-slot binding table rather than
 by document position — closer to a content-addressable memory than a positional one.
 
+**Built and spiked with ZERO new engine code** — reused all three of candidate 1's own primitives, calling
+the splice writer `n` times per layer instead of once (exactly the extension point flagged when those
+primitives were first built). Trivial case (isolated capture, position-0 splice — should be exact,
+capture/splice contexts coincide): landed at mean cos_sim 0.947, not the predicted ~1.0. Root-caused to
+TWO separable confounds, not left conflated: (1) a suffix-tokenization boundary mismatch (fixed — see
+`docs/FACTSPIKE.md`'s Phase G entry), after which the three single-piece subjects (no `SPELL_START`/
+`SPELL_END` wrapper needed) hit **exactly 1.000** each, proving the splice/rotation math itself is
+correct; (2) every multi-piece subject stayed at 0.87–0.96 regardless — the `SPELL_START`/`SPELL_END`
+finding below.
+
+**The SPELL marker finding — user's own hypothesis, now founded by a controlled test, not a correlation.**
+`subject_piece_ids` (the basis EVERY mechanism in this document — A, candidate 1, and candidate 2 as
+specified above — captures/composes from) strips the `SPELL_START`/`SPELL_END` wrapper tokens that a real
+forward pass over a multi-piece subject actually processes. A direct swap-and-remeasure — replay the
+marker-INCLUSIVE span instead of `subject_piece_ids`, same subjects, same trained weights, everything else
+identical — closed the ENTIRE remaining gap to floating-point-exact 1.000 for every single drilled
+subject, multi-piece included, zero exceptions. **This means every packing mechanism in this document has
+been operating on an incomplete basis by construction, not by design intent** — axis 9's degradation may
+be partly (or, per this evidence, substantially) attributable to omitted markers rather than an inherent
+limit of composing from pieces at all.
+
+**Phase H (2026-07-21), run**: does composing mechanism A's `encode_slot` (and candidate 1's pooling) from
+the marker-inclusive span instead of `subject_piece_ids` narrow the baseline-vs-scratch accuracy gap or
+axis 9's own r=-0.614 correlation? A genuinely separate, matched-budget training run (the model must be
+TAUGHT to read a marker-inclusive-bound slot, not just evaluated with one). **Result: WORSE, not
+better** — mean cos_sim A=0.695 (vs. 0.83), candidate-1 B=0.630 (vs. 0.77), 0/9 accuracy this snapshot.
+This does NOT contradict candidate 2's own result — it completes the mechanistic picture. Candidate 2
+(full splice) has no capacity limit, so more real content only helps, reaching exact 1.000. Mechanism A
+and candidate 1 still have to COMPRESS everything into one fixed-`D_MODEL` vector via HRR bind — giving
+that already-bottlenecked compressor (candidate 1's own earlier finding) two MORE genuine items to
+squeeze in makes its job harder, not easier. **Three independently-designed experiments now converge on
+the same direction**: candidate 1 (swap the compression input for richer content — no improvement),
+Phase H (add more real signal to the same compression step — measurably worse), candidate 2 (remove the
+compression step entirely — exact reconstruction). None conclusive alone at single-seed scale, but the
+agreement across three separate methodologies is the real signal: **the bottleneck was never which
+tokens get composed — it's the fixed-size compression step itself.** A fix needs a different compression
+operator (not HRR's fixed bundle) or no compression at all (candidate 2's own direction), not a better
+basis for the current one.
+
+**Production-scale cross-check, same day**: a codebase-wide survey found `corpus_collapse.hpp` (the
+production, "COMMITTED" real-corpus word-collapse mechanism, plus its live-generation counterpart in
+`decode.hpp`) is a direct caller of the SAME `word_span` marker-stripping extraction. Added a
+marker-inclusive `build_dataset_markers` and extended `corpus_collapse`'s own capstone test
+(`[.corpus_collapse]`) to a 3-arm A/B/C, run against real TinyStories (`out/build/d196check`, d196/11
+layers). **Result: no detectable difference** — held-out NELBO identical to 4 decimal places between the
+marker-stripped and marker-inclusive arms (2.9176 both). This is a real, honest negative, not explained
+away — but it answers a coarser question (does this move AGGREGATE next-token-prediction quality across
+a whole validation set) than factspike's surgical, single-position cosine-similarity probe did; a real,
+localized effect on exact representational fidelity doesn't have to be large enough to move an averaged
+NELBO measured over mostly-unaffected tokens at this budget. Read together, not as a contradiction: the
+SPELL-marker effect on exact reconstruction is decisive (factspike); a measurable effect on general
+language-modeling quality at production scale, at this budget, is not yet demonstrated (corpus_collapse).
+
+**Survey of who else is exposed to this gap** (full detail in `docs/FACTSPIKE.md`'s own entry): `word_span`
+unconditionally strips the markers for ANY multi-piece word (`N>=2`, schemeV3's deliberate design, no
+narrower condition). `ScratchTable::expand()` is not an independent second leak — every real caller feeds
+it already-stripped pieces. **`wordspike.hpp`'s own spike training data is NOT exposed** (builds bindings
+from raw ASCII bytes, bypassing tokenization entirely — the spike tested a narrower question than the
+mechanism it validated for). **The live, deployed word-collapse path IS exposed**, both in
+`corpus_collapse.hpp` (cross-checked above) and `decode.hpp`'s live-generation `resolve` lambda. No prior
+design doc ever previously considered whether markers belong in composed content — this was genuinely new
+as of this session, not an accepted, previously-known trade-off.
+
+### 3. Periodic packed-content re-injection (Nanbeige-inspired) — SPIKED 2026-07-21, first real O(1) positive
+
+Candidates 1 and 2 both accepted the SAME framing: the packed slot's embedding is composed ONCE, before
+layer 1 runs, and everything after that is either (a) ordinary computation hoping the signal survives
+(mechanism A, candidate 1), or (b) not really "packed" at all (candidate 2's full splice, which just
+avoids the compression question by paying the same cost as not packing). Project memory
+`nanbeige-architecture-reference` (real, verified `modeling_nanbeige.py`) documents a genuinely different
+framing: `NanbeigeNgramLayerFusion` doesn't try to make the ONE injection better — it RE-INJECTS the same
+side-channel signal as a gated residual addition at multiple depths, so the signal doesn't have to survive
+the whole stack unaided in the first place.
+
+**Built and spiked**: `set_scratch_reinject(stride, scale)` (`core.hpp`/`backend_cpu.cpp`) — zero new
+learned parameters, re-adds the layer-0 packed vector back into a bound scratch slot's hidden state every
+`stride` layers. EVAL-ONLY (wired into `forward_one`, not into the training graph) on the ALREADY-trained
+Phase-C model — a directional probe on an untrained-for signal, not the full test.
+
+A first, fixed-embedding-scale version was a near no-op (0.831→0.831 even at full strength every layer) —
+diagnosed, not accepted at face value: the residual stream's own norm grows across depth (why `ln_f`
+exists before the head at all), dwarfing a fixed small addition by mid-stack. Rescaling the injection to a
+FRACTION OF `h`'s OWN CURRENT NORM at each layer (still zero learned parameters) produced a real, clean,
+monotonic dose-response: mean cos_sim 0.831→0.833→0.840→**0.860** (5%/15%/40% of `h`'s norm), and — the
+headline result — **task accuracy jumped from 3/9 to 5/9 correct at the highest dose**, on a model that
+was never trained to expect this signal at all. This is the first mechanism in the whole investigation to
+show a genuine positive effect while keeping O(1) visible cost. That it shows up even without training
+exposure suggests the model's existing weights already have latent capacity to use a stronger signal when
+presented — training a proper LEARNED gate (matching Nanbeige's own design, rather than a flat
+fraction-of-norm heuristic) is the natural, now well-motivated next step. Full numbers, per-subject detail,
+and honest caveats (single seed, only 3 doses swept, no sense yet of a ceiling): `docs/FACTSPIKE.md`'s
+Phase I entry.
+
 ---
 
-## Open mathematical questions, not yet answered
+## Open mathematical questions
 
-- **How context-sensitive is a word's own internal `(K, V)` trace, really?** `K_l`/`V_l` at position `p`
-  are computed from that position's own residual-stream state, which itself depends on everything before
-  `p` *in that specific context* via earlier-layer attention. If a word's own internal piece-to-piece
-  composition is largely context-*insensitive* (plausible — a name's own spelling-composition process
-  probably doesn't depend much on the surrounding sentence), precomputing its trace once and splicing it
-  into arbitrary later contexts is a good approximation. If it's meaningfully context-sensitive, naive
-  reuse introduces a real, currently-unmeasured error term. This is directly testable with the existing
-  `hidden_state_cosine()`/`last_hidden_ptr()` infrastructure, extended to intermediate layers: compute the
-  same word's trace under two or three *different* surrounding contexts and measure how much it moves.
+- **RESOLVED, 2026-07-21: do the `SPELL_START`/`SPELL_END` wrapper markers carry real weight?** Yes,
+  fully — see the SPELL marker finding above. Every packing mechanism in this document has been composing
+  from an incomplete basis (`subject_piece_ids`, markers stripped); a controlled swap-and-remeasure
+  restoring the markers hit exact 1.000 reconstruction with zero exceptions. **Applied to mechanisms A and
+  candidate 1 (Phase H)**: made both WORSE (0.83→0.695, 0.77→0.630), not better — not a contradiction, it
+  completes the picture (see "Phase H" below): those mechanisms still have to COMPRESS everything into one
+  fixed-size vector, and an already-bottlenecked compressor doesn't benefit from more genuine signal to
+  squeeze in. The bottleneck is the compression step itself, not the basis it compresses from.
+- **RESOLVED, 2026-07-21 (F/G): how context-sensitive is a word's own internal `(K, V)` trace, really?**
+  `K_l`/`V_l` at position `p` are computed from that position's own residual-stream state, which itself
+  depends on everything before `p` *in that specific context* via earlier-layer attention — so precomputing
+  a trace in isolation and splicing it into a DIFFERENT real context is only a good approximation if that
+  dependence is small. Candidate 2's context-sensitivity probe (D) was built to test this but carried an
+  unfixed tokenization-boundary confound identical in kind to the one C needed fixing for; a clean re-run
+  (`context_sensitivity_cosine2`, boundary detection redone by SEARCHING for the subject's own tokenization
+  as a contiguous match in the combined sentence rather than assuming any separately-tokenized piece's
+  length lines up — a THIRD instance of the same context-dependent-tokenization class of bug, caught by a
+  diagnostic when a first attempt suspiciously bailed on 0/9 subjects) gives a real answer: **F (pieces
+  only) mean 0.919, G (marker-inclusive) mean 0.983** — spliced into a genuinely different real prefix
+  (`"Everyone knows that "`), not the same empty context capture used. Markers matter MORE than
+  context-sensitivity does: the E→G same-context-vs-real-context gap (~0.017) is far smaller than the F→G
+  gap from including markers at all (~0.064) — most of what looked like "context-sensitivity cost" in the
+  original confounded D was still the marker-omission problem. **A word's trace, captured once in
+  isolation with markers included, reproduces ~98% of the true recomputed representation when reused in a
+  different real sentence** — a genuinely encouraging first data point for reusing one precomputed trace
+  across many real mentions (the load-bearing assumption behind any prefill-compute-amortization scheme),
+  though only n=9/one prefix/one toy model, the same scale caveat as everywhere else here.
 - **What's the right canonical context to precompute a trace in** — isolation, a fixed carrier sentence, or
   the specific document it's about to be spliced into? Each has a different cost/fidelity trade.
 - **Does the trace's information concentrate in particular layers?** If later layers matter far more than

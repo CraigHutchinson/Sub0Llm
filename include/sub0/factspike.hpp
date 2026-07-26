@@ -196,6 +196,41 @@ inline SlotDataset build_slot_exposure_dataset(const tok::Tokenizer& tk,
     return ds;
 }
 
+// Phase H (docs/FACTSPIKE.md's "SPELL marker finding"): the SAME slot-exposure shape as
+// build_slot_exposure_dataset above, but `doc_bindings` binds the slot to the FULL, marker-INCLUSIVE
+// tokenization (`tok::encode(tk, subject)` directly -- SPELL_START/pieces/SPELL_END for a multi-piece
+// subject) instead of running it through detail::word_span's piece extraction. Direct test of whether
+// composing from the marker-inclusive span (what a real forward pass over the subject actually processes)
+// instead of the marker-stripped one narrows the baseline-vs-scratch gap -- see FACTSPIKE.md's Phase G
+// entry for the controlled KV-trace-splice experiment that founded this hypothesis. Training exposure
+// MUST match what eval binds to (a train/eval mismatch on the binding convention itself would test
+// generalization to a novel convention, not "does marker-inclusive composition help") -- so this is a
+// genuinely separate dataset/training run, not just an eval-time swap.
+inline SlotDataset build_slot_exposure_dataset_markers(const tok::Tokenizer& tk,
+                                                       const std::vector<FactPair>& exposure_subjects,
+                                                       int docs_per_fact, std::uint64_t seed) {
+    SlotDataset ds;
+    ds.doc_starts.push_back(0);
+    std::mt19937_64 rng(seed);
+    (void)rng;   // reserved for future template variation; single fixed shape for now
+    for (const FactPair& fp : exposure_subjects) {
+        const std::vector<int> full_span = tok::encode(tk, fp.subject);   // marker-INCLUSIVE, no word_span
+        for (int i = 0; i < docs_per_fact; ++i) {
+            auto g     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(1); };
+            auto m     = [&](int t) { ds.tokens.push_back(t); ds.mask.push_back(0); };
+            auto gtext = [&](const std::string& s) { for (int t : tok::encode(tk, s)) g(t); };
+
+            gtext(fp.subject + " loves the color " + fp.fact + ". ");
+            m(SCRATCH_SLOT_BASE);
+            gtext(" plays outside every day.");
+
+            ds.doc_starts.push_back(ds.tokens.size());
+            ds.doc_bindings.push_back({ full_span });
+        }
+    }
+    return ds;
+}
+
 // Phase D ("Pack-Aware Training", docs/FACTSPIKE.md): slot-RETRIEVAL documents -- unlike
 // build_slot_exposure_dataset above (which grades generic filler text after the slot, so gradient
 // reaching the packed vector is only weakly, indirectly informative), these documents grade the FACT

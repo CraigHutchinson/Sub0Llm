@@ -56,7 +56,71 @@
 //     exposure subjects get their own separate plain-text pool at a smaller, independently-controlled
 //     rate. Flat slot_frac=0.5 from step 1 (matching Phase D, not Phase E's ramp) -- isolates "does fixing
 //     dilution alone recover Phase C" as its own clean data point.
+//   * [.factspikekvtrace] -- Phase G: KV-trace memoization, docs/SCRATCH_TOKEN_FRAMING.md's two
+//     candidates. Parks the training-schedule (PAT) axis Phase D/E/F investigated and instead attacks
+//     axis 9 (attention-capacity preservation) directly: instead of composing a slot's embedding from RAW
+//     pre-transformer piece rows, capture the word's REAL per-layer (K,V) trace from an isolated forward
+//     pass and splice it into a live KV-cache -- reusing real computation instead of approximating it.
+//     Candidate 1 (B): pool n->1 per layer (reusing encode_slot's own HRR math one layer deeper) before
+//     splicing -- keeps O(1) cost like mechanism A. Candidate 2 (C/D): no pooling at all, splice the FULL
+//     n-position trace (n real KV-cache rows per layer) -- exact reconstruction, O(n) cost like not
+//     packing. C is the trivial same-context shape (a correctness gate: should reproduce baseline almost
+//     exactly); D is the harder context-sensitivity probe (the isolated-captured trace spliced into a
+//     REAL non-empty preceding context, testing the framing doc's own open "how context-sensitive is a
+//     word's own trace" question). All measured in the SAME run, same trained weights, alongside mechanism
+//     A (embed-compose baseline).
+//     RESULT (docs/FACTSPIKE.md) -- candidate 1 (B): NOT an improvement -- mean cos_sim A=0.83 vs B=0.77
+//     (worse, not better), r(piece_count,cos_sim) A=-0.614 vs B=-0.624 (slightly MORE negative than
+//     predicted-weaker), accuracy tied 3/9 each on DIFFERENT subjects. Mean-gap is mostly one n=8 outlier
+//     (excluding it: A=0.859 vs B=0.850, nearly tied); the correlation gap survives outlier exclusion.
+//     Reframes the open question: HRR's fixed-capacity n->1 bundle itself, not the pooled input's
+//     richness, looks like the dominant bottleneck -- an open, cheap-to-test link to the framing doc's own
+//     HRR-crosstalk question. Candidate 2 (C, trivial case): landed at mean 0.947, not the predicted ~1.0
+//     -- root-caused to a suffix-tokenization confound (fixed) plus, decisively, SPELL_START/SPELL_END
+//     wrapper-marker omission: subject_piece_ids (what A/B/C ALL capture from) strips markers a real
+//     forward pass actually processes. A direct swap-and-remeasure (E: replay the marker-INCLUSIVE span)
+//     closed the ENTIRE gap to exact 1.000 for every drilled subject, multi-piece included, zero
+//     exceptions -- not a correlation, a controlled proof. Every mechanism here has been operating on an
+//     incomplete basis by construction. D (context-sensitivity probe): superseded by F/G below (D's own
+//     confound was never fixed). F/G (context_sensitivity_cosine2, boundary detection redone via search
+//     after a bug caught by a diagnostic -- see docs/FACTSPIKE.md): F(pieces)=0.919, G(markers)=0.983,
+//     spliced into a REAL different prefix. Markers matter more than context-sensitivity does -- a trace
+//     captured once in isolation WITH markers reproduces ~98% of the true recomputed representation when
+//     reused elsewhere, a genuinely encouraging result for prefill-compute-amortization schemes.
+//   * [.factspikemarkers] -- Phase H: does marker-inclusive composition (SPELL_START/pieces/SPELL_END
+//     instead of subject_piece_ids) help mechanism A and candidate 1, now that candidate 2 PROVED the
+//     markers are load-bearing? A genuinely SEPARATE matched-budget training run (build_slot_exposure_
+//     dataset_markers) -- the model must be TAUGHT to read a marker-inclusive-bound slot, not just
+//     evaluated with one, or this would test generalization to a novel convention instead of the actual
+//     hypothesis. Measures mechanism A (embed-compose) and candidate 1 (pooled KV-trace splice), both
+//     marker-inclusive, on this newly-trained model -- compare against the piece-only regime's own
+//     recorded numbers ([.factspikehidden] mean_sim=0.83 r=-0.614; Phase G's candidate-1 mean_sim=0.77
+//     r=-0.624).
+//     RESULT (docs/FACTSPIKE.md): WORSE, not better -- mean cos_sim A_markers=0.695 (vs 0.83) B_markers=
+//     0.630 (vs 0.77), accuracy A_markers=0/9 this snapshot. Doesn't contradict candidate 2 -- COMPLETES
+//     the picture: splice (no compression) benefits from more real signal freely; encode_slot/candidate-1
+//     STILL have to compress into one fixed-D_MODEL vector, and cramming 2 more genuine items into an
+//     ALREADY-bottlenecked HRR bundle (candidate 1's own finding) makes that bundle's job harder, not
+//     easier. Three separate experiments (candidate 1's input swap, this marker-add, candidate 2's no-
+//     compression splice) now converge on the same direction: the fixed-size compression STEP is the
+//     bottleneck, not which tokens feed it. Single-seed caveat applies, as always -- the DIRECTION across
+//     three independent designs is what's being leaned on, not any one number.
+//   * [.factspikereinject] -- Phase I: periodic packed-content re-injection, Nanbeige-inspired (project
+//     memory nanbeige-architecture-reference's NanbeigeNgramLayerFusion writeup). Mechanism A injects a
+//     packed vector ONCE at layer 0 and lets it survive N_LAYERS of ordinary computation alone; this
+//     re-adds the SAME vector back into the scratch slot's own hidden state every `stride` layers (no new
+//     learned parameters -- core.hpp's set_scratch_reinject, a plain opt-in elementwise add). EVAL-ONLY on
+//     top of the ALREADY-trained Phase-C model (not wired into the training graph) -- a directional probe,
+//     not the full test; a real positive would justify wiring this into training properly.
+//     RESULT (docs/FACTSPIKE.md): first version (fixed embedding-scale) was a near no-op -- diagnosed as
+//     the residual stream's own growing norm across depth dwarfing a fixed small addition, not a real
+//     negative. Corrected to scale-adaptive (fraction of h's OWN current norm, still zero learned params):
+//     REAL, monotonic, positive dose-response -- mean cos_sim 0.831->0.860, accuracy 3/9->5/9 correct at
+//     the highest dose (40%), EVAL-ONLY on a model never trained for this signal. First mechanism in the
+//     whole investigation with a genuine O(1)-cost positive. Justifies wiring this into the training graph
+//     next (not yet started) -- see docs/SCRATCH_TOKEN_FRAMING.md's new candidate 3.
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/core.hpp"
@@ -202,6 +266,45 @@ Score eval_scratch(const Tokenizer& tk, const std::vector<fs::FactPair>& subject
     return sc;
 }
 
+// Phase H (docs/FACTSPIKE.md's "SPELL marker finding"): SAME shape as eval_scratch, but binds the slot to
+// the marker-INCLUSIVE span (tok::encode(subject) directly) instead of subject_piece_ids -- a SEPARATE
+// function rather than a refactor of eval_scratch above, for the same reason eval_scratch_one below is
+// separate: avoid any risk of changing eval_scratch's own already-validated/documented behavior (Phase
+// C/D/E/F's recorded results depend on it staying exactly as it is).
+Score eval_scratch_markers(const Tokenizer& tk, const std::vector<fs::FactPair>& subjects, unsigned seed) {
+    Score sc;
+    std::mt19937 grng(seed);
+    for (const fs::FactPair& fp : subjects) {
+        const std::vector<int> full_span = sub0::tok::encode(tk, fp.subject);
+        if (full_span.empty()) continue;
+
+        sub0::ScratchTable scratch;
+        scratch.tk = &tk;
+        scratch.bind(sub0::SCRATCH_SLOT_BASE, full_span);
+
+        std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
+        for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+        const std::size_t prompt_len = ctx.size();
+        if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) continue;
+        const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+        if (gold.empty()) continue;
+
+        sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+        sub0::set_scratch_bindings(&binds);
+        std::mt19937 rng_copy = grng;
+        sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng_copy, cas::TOK_EOS, false);
+        grng = rng_copy;
+        sub0::set_scratch_bindings(nullptr);
+
+        bool match = ctx.size() >= prompt_len + gold.size();
+        for (std::size_t k = 0; match && k < gold.size(); ++k)
+            if (ctx[prompt_len + k] != gold[k]) match = false;
+        ++sc.n;
+        sc.ok += match;
+    }
+    return sc;
+}
+
 // Standalone per-subject scratch-arm check, seed fixed (kv_decode_generate's own topk=1 makes this
 // deterministic regardless of seed value) -- a SEPARATE function rather than a refactor of eval_scratch
 // above, to avoid any risk of changing eval_scratch's own already-validated/documented RNG-threading
@@ -212,6 +315,30 @@ bool eval_scratch_one(const Tokenizer& tk, const fs::FactPair& fp) {
     sub0::ScratchTable scratch;
     scratch.tk = &tk;
     scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+    std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+    const std::size_t prompt_len = ctx.size();
+    if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) return false;
+    const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+    if (gold.empty()) return false;
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    std::mt19937 rng(1234u);
+    sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng, cas::TOK_EOS, false);
+    sub0::set_scratch_bindings(nullptr);
+    bool match = ctx.size() >= prompt_len + gold.size();
+    for (std::size_t k = 0; match && k < gold.size(); ++k)
+        if (ctx[prompt_len + k] != gold[k]) match = false;
+    return match;
+}
+
+// Phase H marker-inclusive analog of eval_scratch_one -- same reasoning as eval_scratch_markers above.
+bool eval_scratch_one_markers(const Tokenizer& tk, const fs::FactPair& fp) {
+    const std::vector<int> full_span = sub0::tok::encode(tk, fp.subject);
+    if (full_span.empty()) return false;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, full_span);
     std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
     for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
     const std::size_t prompt_len = ctx.size();
@@ -268,6 +395,105 @@ double hidden_state_cosine(const Tokenizer& tk, const fs::FactPair& fp) {
     return (nb > 0.0 && ns > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(ns)) : 0.0;
 }
 
+// Phase H (docs/FACTSPIKE.md's "SPELL marker finding"): SAME shape as hidden_state_cosine, but binds the
+// slot to the marker-INCLUSIVE span instead of subject_piece_ids -- a separate function, same reasoning
+// as eval_scratch_markers above (don't risk perturbing hidden_state_cosine's own recorded behavior).
+double hidden_state_cosine_markers(const Tokenizer& tk, const fs::FactPair& fp) {
+    sub0::kv_reset();
+    const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> base_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+
+    const std::vector<int> full_span = sub0::tok::encode(tk, fp.subject);
+    if (full_span.empty()) return 0.0;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, full_span);
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    sub0::kv_reset();
+    std::vector<int> scr_ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) scr_ctx.push_back(t);
+    for (std::size_t i = 0; i < scr_ctx.size(); ++i) (void)sub0::forward_one(scr_ctx[i], static_cast<int>(i));
+    sub0::set_scratch_bindings(nullptr);
+    std::array<float, D_MODEL> scr_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, scr_hidden.data());
+
+    double dot = 0.0, nb = 0.0, ns = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * scr_hidden[static_cast<std::size_t>(c)];
+        nb  += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+        ns  += static_cast<double>(scr_hidden[static_cast<std::size_t>(c)])  * scr_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nb > 0.0 && ns > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(ns)) : 0.0;
+}
+
+// Phase I (docs/FACTSPIKE.md, Nanbeige-inspired periodic re-injection spike): SAME shape as
+// hidden_state_cosine (piece-only bind, mechanism A), but wraps the scratch-arm forward pass with
+// set_scratch_reinject(stride, scale) -- tests whether reinforcing the packed vector partway through the
+// layer stack (instead of betting everything on the single layer-0 injection) narrows the fidelity gap.
+// EVAL-ONLY on top of the ALREADY-trained Phase-C/G model (core.hpp's own doc comment on why this is a
+// directional probe, not the full test -- the model was never trained to expect the extra signal).
+double hidden_state_cosine_reinject(const Tokenizer& tk, const fs::FactPair& fp, int stride, float scale) {
+    sub0::kv_reset();
+    const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> base_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return 0.0;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    sub0::set_scratch_reinject(stride, scale);
+    sub0::kv_reset();
+    std::vector<int> scr_ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) scr_ctx.push_back(t);
+    for (std::size_t i = 0; i < scr_ctx.size(); ++i) (void)sub0::forward_one(scr_ctx[i], static_cast<int>(i));
+    sub0::set_scratch_reinject(0, 1.0f);
+    sub0::set_scratch_bindings(nullptr);
+    std::array<float, D_MODEL> scr_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, scr_hidden.data());
+
+    double dot = 0.0, nb = 0.0, ns = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * scr_hidden[static_cast<std::size_t>(c)];
+        nb  += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+        ns  += static_cast<double>(scr_hidden[static_cast<std::size_t>(c)])  * scr_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nb > 0.0 && ns > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(ns)) : 0.0;
+}
+
+// Phase I analog of eval_scratch_one -- same reinject wrapping as hidden_state_cosine_reinject above.
+bool eval_scratch_one_reinject(const Tokenizer& tk, const fs::FactPair& fp, int stride, float scale) {
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return false;
+    sub0::ScratchTable scratch;
+    scratch.tk = &tk;
+    scratch.bind(sub0::SCRATCH_SLOT_BASE, pieces);
+    std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };
+    for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+    const std::size_t prompt_len = ctx.size();
+    if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) return false;
+    const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+    if (gold.empty()) return false;
+    sub0::ScratchBindings binds = scratch.to_bindings(sub0::SlotEncoding::HRR);
+    sub0::set_scratch_bindings(&binds);
+    sub0::set_scratch_reinject(stride, scale);
+    std::mt19937 rng(1234u);
+    sub0::kv_decode_generate(ctx, static_cast<int>(gold.size()) + 2, 1.f, 1, rng, cas::TOK_EOS, false);
+    sub0::set_scratch_reinject(0, 1.0f);
+    sub0::set_scratch_bindings(nullptr);
+    bool match = ctx.size() >= prompt_len + gold.size();
+    for (std::size_t k = 0; match && k < gold.size(); ++k)
+        if (ctx[prompt_len + k] != gold[k]) match = false;
+    return match;
+}
+
 // Diagnostic (docs/FACTSPIKE.md "Pack-Aware Training" discussion): does the packed vector's per-fragment
 // HRR-unbind fidelity correlate with scratch-arm task accuracy? Mean cosine similarity between
 // hrr_unbind(packed_vector, position p) and the TRUE tok_emb row for piece p, averaged over every
@@ -312,6 +538,399 @@ double pearson_r(const std::vector<double>& a, const std::vector<double>& b) {
         cov += da * db; va += da * da; vb += db * db;
     }
     return (va > 0.0 && vb > 0.0) ? cov / (std::sqrt(va) * std::sqrt(vb)) : 0.0;
+}
+
+// --- Phase G: KV-trace memoization (docs/SCRATCH_TOKEN_FRAMING.md "candidate 1: post-hoc per-layer KV
+// pooling") -- instead of composing a slot's embedding from RAW pre-transformer piece rows (encode_slot,
+// what every eval above uses), capture the word's REAL per-layer (K,V) trace from an isolated forward
+// pass, pool it (reusing encode_slot's own HRR math one layer deeper), and splice the pooled trace
+// directly into a live KV-cache. See core.hpp's kv_krow_ptr/kv_vrow_ptr/kv_rope_rotate/kv_splice_row doc
+// comments for the full mechanism. Tests both axes the framing doc asked about: representational fidelity
+// (does r(piece_count, cos_sim) get weaker than mechanism A's -0.614?) and task accuracy (does it beat
+// Phase C's 0.56 peak?).
+struct KvTrace {
+    std::vector<float> k;   // [N_LAYERS, D_MODEL] flat -- DE-ROTATED ("canonical", position-0-equivalent)
+    std::vector<float> v;   // [N_LAYERS, D_MODEL] flat -- position-invariant (RoPE never touches V)
+};
+
+// Captures a word's own per-layer (K,V) trace by running its pieces through an ISOLATED forward pass
+// (local positions 0..n-1, no prefix -- the cheapest canonical precompute context, matching this file's
+// own existing scratch-arm contexts), then pools n rows -> 1 per layer via encode_slot's existing HRR
+// math, treating the captured rows as a synthetic [n, D_MODEL] "embedding table" indexed 0..n-1 (idx[p]
+// selects role p, exactly mirroring mechanism A's own per-piece role assignment -- same operator, one
+// layer deeper). K rows are DE-ROTATED first (kv_rope_rotate with the row's own NEGATED local capture
+// position) so pooling operates in a position-independent frame -- only the geometric RoPE component is
+// removed; the content-derived, causal-attention-refined part of each row (the actual multi-hop signal)
+// is never touched. V needs no de-rotation (RoPE never touches V).
+KvTrace capture_kv_trace(const std::vector<int>& pieces) {
+    KvTrace trace;
+    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * D_MODEL, 0.f);
+    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * D_MODEL, 0.f);
+    const int n = static_cast<int>(pieces.size());
+    if (n == 0) return trace;
+
+    sub0::kv_reset();
+    for (int i = 0; i < n; ++i) (void)sub0::forward_one(pieces[static_cast<std::size_t>(i)], i);
+
+    std::vector<float> kbuf(static_cast<std::size_t>(n) * D_MODEL);
+    std::vector<float> vbuf(static_cast<std::size_t>(n) * D_MODEL);
+    std::vector<int> idx(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) idx[static_cast<std::size_t>(i)] = i;
+
+    for (int l = 0; l < N_LAYERS; ++l) {
+        for (int i = 0; i < n; ++i) {
+            float* krow = kbuf.data() + static_cast<std::size_t>(i) * D_MODEL;
+            std::copy_n(sub0::kv_krow_ptr(l, i), D_MODEL, krow);
+            sub0::kv_rope_rotate(krow, -i);   // strip this row's own local capture-position RoPE angle
+            std::copy_n(sub0::kv_vrow_ptr(l, i), D_MODEL, vbuf.data() + static_cast<std::size_t>(i) * D_MODEL);
+        }
+        sub0::encode_slot(kbuf.data(), D_MODEL, idx, sub0::SlotEncoding::HRR,
+                          trace.k.data() + static_cast<std::size_t>(l) * D_MODEL);
+        sub0::encode_slot(vbuf.data(), D_MODEL, idx, sub0::SlotEncoding::HRR,
+                          trace.v.data() + static_cast<std::size_t>(l) * D_MODEL);
+    }
+    return trace;
+}
+
+// Splices a captured/pooled trace into the CURRENT thread's live KV-cache at `pos` -- one call per layer,
+// bypassing forward_one's normal per-position computation for that position entirely (nothing downstream
+// needs this position's own query/attention-output/FFN, only later positions' attention over its K/V).
+void splice_kv_trace(const KvTrace& trace, int pos) {
+    for (int l = 0; l < N_LAYERS; ++l) {
+        sub0::kv_splice_row(l, pos, trace.k.data() + static_cast<std::size_t>(l) * D_MODEL,
+                            trace.v.data() + static_cast<std::size_t>(l) * D_MODEL);
+    }
+}
+
+// KV-trace analog of hidden_state_cosine: same baseline arm, but the scratch position's contribution
+// comes from a spliced trace instead of encode_slot's pre-transformer composition.
+double hidden_state_cosine_kvtrace(const Tokenizer& tk, const fs::FactPair& fp) {
+    sub0::kv_reset();
+    const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> base_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return 0.0;
+    const KvTrace trace = capture_kv_trace(pieces);   // captured under the CURRENT (mid-training) weights
+
+    sub0::kv_reset();
+    splice_kv_trace(trace, 0);
+    const std::vector<int> suffix = sub0::tok::encode(tk, " loves the color ");
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+        (void)sub0::forward_one(suffix[i], static_cast<int>(1 + i));
+    std::array<float, D_MODEL> kvt_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, kvt_hidden.data());
+
+    double dot = 0.0, nb = 0.0, nk = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * kvt_hidden[static_cast<std::size_t>(c)];
+        nb  += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+        nk  += static_cast<double>(kvt_hidden[static_cast<std::size_t>(c)])  * kvt_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nb > 0.0 && nk > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(nk)) : 0.0;
+}
+
+// KV-trace analog of eval_scratch_one: same prompt shape/eval convention, but the slot position's
+// contribution comes from a spliced trace. kv_decode_generate (decode.hpp) can't be reused here -- it
+// always drives its own internal forward_one prefill loop with no hook to redirect one position
+// (decode.hpp:158-159) -- so the prefill + greedy-decode tail are hand-rolled, mirroring that function's
+// own tail (decode.hpp:210-216) exactly.
+bool eval_kvtrace_one(const Tokenizer& tk, const fs::FactPair& fp) {
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return false;
+    const KvTrace trace = capture_kv_trace(pieces);
+
+    std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };   // visible id only -- its own forward_one never runs
+    for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+    const std::size_t prompt_len = ctx.size();
+    if (static_cast<int>(prompt_len) + 8 >= SEQ_LEN) return false;
+    const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+    if (gold.empty()) return false;
+
+    sub0::kv_reset();
+    splice_kv_trace(trace, 0);
+    const float* logits = nullptr;
+    for (std::size_t i = 1; i < prompt_len; ++i) logits = sub0::forward_one(ctx[i], static_cast<int>(i));
+
+    std::mt19937 rng(1234u);
+    const int n = static_cast<int>(gold.size()) + 2;
+    for (int s = 0; s < n && static_cast<int>(ctx.size()) < SEQ_LEN; ++s) {
+        const int next = sub0::sample_token(logits, 1.f, 1, rng);
+        if (next == cas::TOK_EOS) break;
+        ctx.push_back(next);
+        logits = sub0::forward_one(next, static_cast<int>(ctx.size()) - 1);
+    }
+
+    bool match = ctx.size() >= prompt_len + gold.size();
+    for (std::size_t k = 0; match && k < gold.size(); ++k)
+        if (ctx[prompt_len + k] != gold[k]) match = false;
+    return match;
+}
+
+// --- Candidate 2: landmark-style transparent expansion (docs/SCRATCH_TOKEN_FRAMING.md) -- no pooling AT
+// ALL: splice the FULL n-position per-layer trace, one real KV-cache row per piece per layer, instead of
+// candidate 1's n->1 compression. Genuinely costs n KV-cache positions for what the VISIBLE token stream
+// still shows as one slot token -- axis 10 (cost efficiency) is knowingly given up here, the opposite
+// trade from candidate 1. Reuses the SAME three primitives with ZERO new engine code: capture is
+// capture_kv_trace's own per-piece de-rotated rows WITHOUT the pooling step, and splice is kv_splice_row
+// called n times instead of once (exactly the "extension point" the framing doc's DRY review anticipated
+// when these primitives were first built).
+struct KvFullTrace {
+    int n = 0;
+    std::vector<float> k;   // [N_LAYERS, n, D_MODEL] flat -- DE-ROTATED per-piece (canonical, position-0-equivalent)
+    std::vector<float> v;   // [N_LAYERS, n, D_MODEL] flat -- position-invariant
+};
+
+KvFullTrace capture_kv_trace_full(const std::vector<int>& pieces) {
+    KvFullTrace trace;
+    const int n = static_cast<int>(pieces.size());
+    trace.n = n;
+    if (n == 0) return trace;
+    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * D_MODEL, 0.f);
+    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * D_MODEL, 0.f);
+
+    sub0::kv_reset();
+    for (int i = 0; i < n; ++i) (void)sub0::forward_one(pieces[static_cast<std::size_t>(i)], i);
+
+    for (int l = 0; l < N_LAYERS; ++l) {
+        for (int i = 0; i < n; ++i) {
+            float* krow = trace.k.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(n) +
+                                            static_cast<std::size_t>(i)) * D_MODEL;
+            std::copy_n(sub0::kv_krow_ptr(l, i), D_MODEL, krow);
+            sub0::kv_rope_rotate(krow, -i);   // de-rotate to canonical (position-0-equivalent) form
+            float* vrow = trace.v.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(n) +
+                                            static_cast<std::size_t>(i)) * D_MODEL;
+            std::copy_n(sub0::kv_vrow_ptr(l, i), D_MODEL, vrow);
+        }
+    }
+    return trace;
+}
+
+// Splices piece i's canonical row at KV-cache position `pos + i`, for every layer -- mathematically EXACT
+// (up to floating point) when the splice context's own preceding content matches capture's (both
+// isolated/empty here), an approximation otherwise (the framing doc's open "how context-sensitive is a
+// word's own trace" question -- see context_sensitivity_cosine below, which tests exactly that).
+void splice_kv_trace_full(const KvFullTrace& trace, int pos) {
+    for (int l = 0; l < N_LAYERS; ++l) {
+        for (int i = 0; i < trace.n; ++i) {
+            const float* krow = trace.k.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(trace.n) +
+                                                  static_cast<std::size_t>(i)) * D_MODEL;
+            const float* vrow = trace.v.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(trace.n) +
+                                                  static_cast<std::size_t>(i)) * D_MODEL;
+            sub0::kv_splice_row(l, pos + i, krow, vrow);
+        }
+    }
+}
+
+// Candidate-2 analog of hidden_state_cosine: same trivial (position-0, isolated-context) shape as A/B, so
+// capture and splice contexts coincide exactly -- this should reproduce the baseline hidden state almost
+// PERFECTLY (cos_sim ~1.0) for every subject regardless of piece count, since nothing is compressed. This
+// is as much a correctness gate on the splice implementation as it is a "does candidate 2 help" measure:
+// anything meaningfully below 1.0 here would point at a bug, not an inherent mechanism limitation.
+//
+// `replay_tokens` is the token list that gets captured+spliced -- `subject_piece_ids` (marker-stripped,
+// what mechanisms A/B/C/D normally use) or `tok::encode(subject)` (marker-INCLUSIVE, `alone` below --
+// see the SPELL_START/SPELL_END finding this parameterization exists to test directly, not just infer).
+// `alone` (always the RAW, unstripped tokenization, regardless of which list is being replayed) locates
+// exactly where the subject's own span ends within base_ctx, letting the suffix be SLICED OUT of
+// base_ctx itself rather than re-tokenized separately as `tok::encode(" loves the color ")` -- a
+// tokenization-boundary regression test (`[factspike][kvtrace]`, non-hidden) found the two differ (BPE
+// merges the leading space differently depending on what precedes it), which would otherwise inject a
+// confound unrelated to the splice mechanism into what's supposed to be an exact-reconstruction gate.
+double hidden_state_cosine_kvtrace_full_impl(const Tokenizer& tk, const fs::FactPair& fp,
+                                             const std::vector<int>& replay_tokens) {
+    sub0::kv_reset();
+    const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> base_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+
+    if (replay_tokens.empty()) return 0.0;
+    const KvFullTrace trace = capture_kv_trace_full(replay_tokens);
+
+    const std::vector<int> alone = sub0::tok::encode(tk, fp.subject);
+    if (alone.size() > base_ctx.size()) return 0.0;
+    const std::vector<int> suffix(base_ctx.begin() + static_cast<std::ptrdiff_t>(alone.size()), base_ctx.end());
+
+    sub0::kv_reset();
+    splice_kv_trace_full(trace, 0);
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+        (void)sub0::forward_one(suffix[i], trace.n + static_cast<int>(i));   // continue AFTER the n spliced rows
+    std::array<float, D_MODEL> full_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, full_hidden.data());
+
+    double dot = 0.0, nb = 0.0, nf = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * full_hidden[static_cast<std::size_t>(c)];
+        nb  += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+        nf  += static_cast<double>(full_hidden[static_cast<std::size_t>(c)])  * full_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nb > 0.0 && nf > 0.0) ? dot / (std::sqrt(nb) * std::sqrt(nf)) : 0.0;
+}
+
+double hidden_state_cosine_kvtrace_full(const Tokenizer& tk, const fs::FactPair& fp) {
+    return hidden_state_cosine_kvtrace_full_impl(tk, fp, subject_piece_ids(tk, fp.subject));
+}
+
+// Direct test of the SPELL_START/SPELL_END finding: replay the FULL wrapped span (`tok::encode(subject)`,
+// markers included) instead of the marker-stripped `pieces`. If this closes candidate 2's remaining
+// multi-piece gap (Crofw/Yelfan/etc. sitting at 0.87-0.96 instead of the single-piece group's exact
+// 1.000), that's a controlled confirmation the markers carry real weight -- not a correlation, a causal
+// swap-and-remeasure on the SAME subjects/weights.
+double hidden_state_cosine_kvtrace_full_markers(const Tokenizer& tk, const fs::FactPair& fp) {
+    return hidden_state_cosine_kvtrace_full_impl(tk, fp, sub0::tok::encode(tk, fp.subject));
+}
+
+// Candidate-2 analog of eval_scratch_one/eval_kvtrace_one. `ctx` (the VISIBLE token stream, one slot
+// token) stays the same shape as the other eval_*_one functions -- candidate 2's whole point is a compact
+// visible sequence -- but the underlying KV-CACHE position counter (kv_pos) advances by trace.n for the
+// spliced word instead of by 1, since n real rows were written per layer, and every subsequent real token
+// must continue from there.
+bool eval_kvtrace_full_one(const Tokenizer& tk, const fs::FactPair& fp) {
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return false;
+    const KvFullTrace trace = capture_kv_trace_full(pieces);
+
+    std::vector<int> ctx{ sub0::SCRATCH_SLOT_BASE };   // visible id only -- its own forward_one never runs
+    for (int t : sub0::tok::encode(tk, " loves the color ")) ctx.push_back(t);
+    const std::size_t prompt_len = ctx.size();
+    if (trace.n + static_cast<int>(prompt_len) - 1 + 8 >= SEQ_LEN) return false;   // n spliced + suffix + budget
+    const std::vector<int> gold = sub0::tok::encode(tk, fp.fact);
+    if (gold.empty()) return false;
+
+    sub0::kv_reset();
+    splice_kv_trace_full(trace, 0);
+    const float* logits = nullptr;
+    int kv_pos = trace.n;
+    for (std::size_t i = 1; i < prompt_len; ++i, ++kv_pos) logits = sub0::forward_one(ctx[i], kv_pos);
+
+    std::mt19937 rng(1234u);
+    const int steps = static_cast<int>(gold.size()) + 2;
+    for (int s = 0; s < steps && kv_pos < SEQ_LEN; ++s, ++kv_pos) {
+        const int next = sub0::sample_token(logits, 1.f, 1, rng);
+        if (next == cas::TOK_EOS) break;
+        ctx.push_back(next);
+        logits = sub0::forward_one(next, kv_pos);
+    }
+
+    bool match = ctx.size() >= prompt_len + gold.size();
+    for (std::size_t k = 0; match && k < gold.size(); ++k)
+        if (ctx[prompt_len + k] != gold[k]) match = false;
+    return match;
+}
+
+// Context-sensitivity probe (docs/SCRATCH_TOKEN_FRAMING.md's own open question: "how context-sensitive is
+// a word's own internal (K,V) trace, really?"). capture_kv_trace_full captures a word's trace in
+// ISOLATION (no preceding context) -- candidate 2's splice is mathematically exact only when the splice
+// context's own preceding content matches capture's. This measures the gap when it doesn't: a REAL prefix
+// (an actual fact_templates() lead-in, "Everyone knows that ", not an arbitrary/OOD string) precedes the
+// word in the splice context, but the trace was captured with no prefix at all -- so any degradation here
+// is attributable specifically to the isolated-capture assumption, not to compression (there isn't any).
+double context_sensitivity_cosine(const Tokenizer& tk, const fs::FactPair& fp, const std::string& prefix) {
+    sub0::kv_reset();
+    const std::vector<int> real_ctx = sub0::tok::encode(tk, prefix + fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < real_ctx.size(); ++i) (void)sub0::forward_one(real_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> real_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, real_hidden.data());
+
+    const std::vector<int> pieces = subject_piece_ids(tk, fp.subject);
+    if (pieces.empty()) return 0.0;
+    const KvFullTrace trace = capture_kv_trace_full(pieces);   // captured in ISOLATION, no prefix
+
+    sub0::kv_reset();
+    const std::vector<int> prefix_ctx = sub0::tok::encode(tk, prefix);
+    for (std::size_t i = 0; i < prefix_ctx.size(); ++i) (void)sub0::forward_one(prefix_ctx[i], static_cast<int>(i));
+    splice_kv_trace_full(trace, static_cast<int>(prefix_ctx.size()));
+    const std::vector<int> suffix = sub0::tok::encode(tk, " loves the color ");
+    int kv_pos = static_cast<int>(prefix_ctx.size()) + trace.n;
+    for (std::size_t i = 0; i < suffix.size(); ++i, ++kv_pos) (void)sub0::forward_one(suffix[i], kv_pos);
+    std::array<float, D_MODEL> spliced_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, spliced_hidden.data());
+
+    double dot = 0.0, nr = 0.0, ns = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(real_hidden[static_cast<std::size_t>(c)]) * spliced_hidden[static_cast<std::size_t>(c)];
+        nr  += static_cast<double>(real_hidden[static_cast<std::size_t>(c)]) * real_hidden[static_cast<std::size_t>(c)];
+        ns  += static_cast<double>(spliced_hidden[static_cast<std::size_t>(c)]) * spliced_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nr > 0.0 && ns > 0.0) ? dot / (std::sqrt(nr) * std::sqrt(ns)) : 0.0;
+}
+
+// context_sensitivity_cosine ABOVE re-tokenizes " loves the color " separately from the combined
+// real_ctx -- the SAME suffix-tokenization-boundary confound the trivial case (C) needed a fix for
+// (hidden_state_cosine_kvtrace_full's own comment), never applied here. Its own recorded D=0.948
+// (docs/FACTSPIKE.md Phase G) is therefore noisier than it needs to be -- NOT reused/modified in place
+// (avoid perturbing an already-recorded number), but superseded by this clean pair for any FRESH
+// context-sensitivity measurement.
+//
+// The FIRST version of this function assumed `prefix`'s own tokenize-alone length was the correct offset
+// into `real_ctx` -- WRONG, caught by a diagnostic ([.factspikediag2], since removed): the fixed prefix
+// "Everyone knows that " ends in a trailing space whose token gets ABSORBED/merged away when immediately
+// followed by a real subject, so `prefix_ctx.size()` alone vs. in-context differ (a THIRD instance of the
+// same "context-dependent tokenization at a word boundary" class of confound this whole investigation has
+// been chasing -- after the subject|suffix boundary and the marker-omission finding). The subject's OWN
+// tokenization-alone (`alone`), however, DOES still appear as an exact contiguous match somewhere in
+// `real_ctx` (the same property already validated with no prefix present, `[factspike][kvtrace]`) --  so
+// rather than assume ANY separately-tokenized piece's length is a reliable offset, SEARCH for `alone` as a
+// contiguous subsequence and derive prefix/suffix by slicing `real_ctx` itself around that match. This is
+// the more robust pattern: trust only the ONE assumption that's been directly verified twice, derive
+// everything else from the single authoritative one-shot tokenization.
+double context_sensitivity_cosine2_impl(const Tokenizer& tk, const fs::FactPair& fp, const std::string& prefix,
+                                        const std::vector<int>& replay_tokens) {
+    sub0::kv_reset();
+    const std::vector<int> real_ctx = sub0::tok::encode(tk, prefix + fp.subject + " loves the color ");
+    for (std::size_t i = 0; i < real_ctx.size(); ++i) (void)sub0::forward_one(real_ctx[i], static_cast<int>(i));
+    std::array<float, D_MODEL> real_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, real_hidden.data());
+
+    if (replay_tokens.empty()) return 0.0;
+    const KvFullTrace trace = capture_kv_trace_full(replay_tokens);   // captured in ISOLATION, no prefix
+
+    const std::vector<int> alone = sub0::tok::encode(tk, fp.subject);
+    if (alone.empty() || alone.size() > real_ctx.size()) return 0.0;
+    std::size_t subj_off = real_ctx.size();
+    for (std::size_t start = 0; start + alone.size() <= real_ctx.size(); ++start) {
+        bool match = true;
+        for (std::size_t i = 0; i < alone.size(); ++i)
+            if (real_ctx[start + i] != alone[i]) { match = false; break; }
+        if (match) { subj_off = start; break; }
+    }
+    if (subj_off == real_ctx.size()) return 0.0;   // subject's own span not found in real_ctx -- bail
+
+    const std::vector<int> prefix_ctx(real_ctx.begin(), real_ctx.begin() + static_cast<std::ptrdiff_t>(subj_off));
+    const std::vector<int> suffix(real_ctx.begin() + static_cast<std::ptrdiff_t>(subj_off + alone.size()),
+                                  real_ctx.end());   // the REAL suffix, sliced -- not re-tokenized
+
+    sub0::kv_reset();
+    for (std::size_t i = 0; i < prefix_ctx.size(); ++i) (void)sub0::forward_one(prefix_ctx[i], static_cast<int>(i));
+    splice_kv_trace_full(trace, static_cast<int>(prefix_ctx.size()));
+    int kv_pos = static_cast<int>(prefix_ctx.size()) + trace.n;
+    for (std::size_t i = 0; i < suffix.size(); ++i, ++kv_pos) (void)sub0::forward_one(suffix[i], kv_pos);
+    std::array<float, D_MODEL> spliced_hidden{};
+    std::copy_n(sub0::last_hidden_ptr(), D_MODEL, spliced_hidden.data());
+
+    double dot = 0.0, nr = 0.0, ns = 0.0;
+    for (int c = 0; c < D_MODEL; ++c) {
+        dot += static_cast<double>(real_hidden[static_cast<std::size_t>(c)]) * spliced_hidden[static_cast<std::size_t>(c)];
+        nr  += static_cast<double>(real_hidden[static_cast<std::size_t>(c)]) * real_hidden[static_cast<std::size_t>(c)];
+        ns  += static_cast<double>(spliced_hidden[static_cast<std::size_t>(c)]) * spliced_hidden[static_cast<std::size_t>(c)];
+    }
+    return (nr > 0.0 && ns > 0.0) ? dot / (std::sqrt(nr) * std::sqrt(ns)) : 0.0;
+}
+
+double context_sensitivity_cosine2(const Tokenizer& tk, const fs::FactPair& fp, const std::string& prefix) {
+    return context_sensitivity_cosine2_impl(tk, fp, prefix, subject_piece_ids(tk, fp.subject));
+}
+
+// Direct test: does marker-inclusive replay close the (now confound-free) context-sensitivity gap? If
+// context_sensitivity_cosine2's own number is already close to hidden_state_cosine_kvtrace_full's trivial
+// (same-context) case, the isolated-capture assumption costs little; if THIS marker-inclusive version
+// closes a real remaining gap the way E closed C's, that's a second, independent confirmation the markers
+// carry weight -- this time under a genuinely different (non-empty, real) preceding context.
+double context_sensitivity_cosine2_markers(const Tokenizer& tk, const fs::FactPair& fp, const std::string& prefix) {
+    return context_sensitivity_cosine2_impl(tk, fp, prefix, sub0::tok::encode(tk, fp.subject));
 }
 
 // Blends fact-teaching windows (fs::Dataset, no bindings) with slot-reading-exposure windows
@@ -761,6 +1380,41 @@ TEST_CASE("factspike Phase E: Pack-Aware Training, warm-started + ramped -- isol
     CHECK(std::isfinite(r_held_out));
 }
 
+// Tokenization-boundary regression check, found while validating candidate 2's "trivial case should
+// reconstruct baseline almost exactly" prediction (docs/FACTSPIKE.md Phase G): a subject's OWN
+// tokenization (`tok::encode(subject)` alone) always matches its own span at the START of the combined
+// baseline sentence (`tok::encode(subject + " loves the color ")`) -- this is what lets
+// hidden_state_cosine_kvtrace_full slice the REAL suffix out of `base_ctx` rather than re-tokenizing
+// " loves the color " separately (which does NOT match: BPE merges the leading space differently
+// depending on what precedes it -- a real, if minor, confound this test pins down so it can't silently
+// resurface). ALSO surfaces a deeper, structural finding: `subject_piece_ids` (what every packing
+// mechanism -- A/B/C/D -- captures from) strips SPELL_START/SPELL_END wrapper markers that a real forward
+// pass over a multi-piece subject actually processes; single-piece subjects (no wrapper needed) have
+// `pieces == alone` exactly, multi-piece ones don't. This is why candidate 2's multi-piece subjects don't
+// reach the near-1.0 reconstruction fidelity its single-piece ones do (see Phase G's per-subject numbers).
+TEST_CASE("factspike: a subject's own tokenization matches its span at the start of the combined "
+         "baseline sentence (the assumption hidden_state_cosine_kvtrace_full relies on)",
+         "[factspike][kvtrace]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("this build's tokenizer isn't usable/doesn't match VOCAB -- skipping.");
+            return;
+        }
+    }
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    for (const fs::FactPair& fp : split.drilled) {
+        const std::vector<int> alone = sub0::tok::encode(tk, fp.subject);
+        const std::vector<int> combined = sub0::tok::encode(tk, fp.subject + " loves the color ");
+        REQUIRE(combined.size() >= alone.size());
+        bool prefix_match = true;
+        for (std::size_t i = 0; i < alone.size(); ++i) if (combined[i] != alone[i]) prefix_match = false;
+        CHECK(prefix_match);
+    }
+}
+
 TEST_CASE("factspike hidden-state diagnostic: does the packed slot's fully-processed representation "
          "resemble the same subject read normally, under Phase C's own validated regime",
          "[.factspikehidden]") {
@@ -918,4 +1572,387 @@ TEST_CASE("factspike Phase F: Pack-Aware Training re-tested WITHOUT the dilution
     CHECK(std::isfinite(peak_held_out));
     CHECK(std::isfinite(r_scratch));
     CHECK(std::isfinite(r_held_out));
+}
+
+// Fast, model-free algebraic sanity check for the KV-trace primitives' rotation math (core.hpp's
+// kv_rope_rotate) -- pure math on a caller-owned buffer, no tokenizer/model/config dependency, so this
+// runs in the normal always-on suite regardless of which config sub0_tests happens to be built against.
+// Confirms de-rotate/re-rotate is wired correctly (R(-pos)*R(pos) = I) BEFORE any training-run time is
+// spent trusting Phase G's results below -- see docs/SCRATCH_TOKEN_FRAMING.md candidate 1.
+TEST_CASE("factspike kv_rope_rotate round-trips: rotate then inverse-rotate is the identity",
+         "[factspike][kvtrace]") {
+    std::array<float, D_MODEL> row{};
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    for (float& x : row) x = dist(rng);
+    const std::array<float, D_MODEL> original = row;
+
+    sub0::kv_rope_rotate(row.data(), 5);
+    CHECK_FALSE(row == original);   // sanity: the forward rotation actually did something at pos=5
+    sub0::kv_rope_rotate(row.data(), -5);
+    for (int c = 0; c < D_MODEL; ++c)
+        CHECK(row[static_cast<std::size_t>(c)] ==
+             Catch::Approx(original[static_cast<std::size_t>(c)]).margin(1e-4f));
+}
+
+TEST_CASE("factspike Phase G: KV-trace memoization -- candidates 1 (post-hoc pooled splice) and 2 "
+         "(full n-position splice, trivial + context-sensitivity probe) vs mechanism A, same "
+         "Phase-C-regime training", "[.factspikekvtrace]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase G: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+
+    // SAME regime as Phase C / [.factspikehidden] -- this asks a mechanism question orthogonal to the
+    // training-schedule question, so it runs on the cleanest, best-validated result, not a degraded one.
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_exposure_dataset(tk, exposure_split.drilled,
+                                                                    kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+    for (int r = 0; r < kEvalRounds; ++r)
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+
+    // All mechanisms measured in the SAME run, same trained weights -- a fairer matched comparison than
+    // comparing against a previous session's recorded numbers, given this project's own repeated lesson
+    // about single-seed training volatility (see project memory factspike-piece-transfer-validated).
+    // A = mechanism A (embed-compose); B = candidate 1 (post-hoc pooled splice); C = candidate 2 at the
+    // trivial position-0/isolated-context shape (should be ~exact, a correctness gate on the splice
+    // implementation, not really a "does it help" measure); D = candidate 2's context-sensitivity probe
+    // (same isolated-captured trace, spliced into a REAL non-empty preceding context this time); E =
+    // candidate 2 trivial-case AGAIN, but replaying the marker-INCLUSIVE span (tok::encode(subject), not
+    // subject_piece_ids) -- a direct, controlled test of whether SPELL_START/SPELL_END are what's holding
+    // C below 1.000 for multi-piece subjects (single-piece ones already hit exact 1.000 with C, since
+    // they have no wrapper to omit in the first place).
+    // F/G (2026-07-21 continuation, user: "does this mean prefill can leverage pre-learnt corpus words
+    // without per-token reprocessing?"): D's own context-sensitivity probe was never fixed for the
+    // suffix-tokenization confound C needed fixing for, so its recorded 0.948 is noisier than necessary.
+    // F = context_sensitivity_cosine2 (same isolated-capture-into-real-prefix shape as D, confound fixed,
+    // pieces-only); G = the marker-inclusive version -- directly answers whether a word's trace, captured
+    // ONCE in isolation, stays valid when reused in a genuinely DIFFERENT real context (the load-bearing
+    // assumption behind any "reuse a precomputed trace across many mentions/documents" prefill-compute-
+    // amortization idea). No new training needed for F/G -- candidate 2's splice never depended on
+    // set_scratch_bindings/training exposure (it writes real K/V rows directly), so this reuses the SAME
+    // already-trained model as A-E above, just two more measurements per subject.
+    constexpr const char* kPrefix = "Everyone knows that ";   // an actual fact_templates() lead-in phrase
+    std::string report = "\n=== factspike Phase G: KV-trace memoization vs mechanism A "
+                         "(post Phase-C-regime training) ===\n";
+    double sim_sum_a = 0.0, sim_sum_b = 0.0, sim_sum_c = 0.0, sim_sum_d = 0.0, sim_sum_e = 0.0;
+    double sim_sum_f = 0.0, sim_sum_g = 0.0;
+    int n_correct_a = 0, n_correct_b = 0, n_correct_c = 0, n_total = 0, n_valid_fg = 0;
+    std::vector<double> piece_count_traj, sim_traj_a, sim_traj_b, single_piece_sim_c;
+    for (const fs::FactPair& fp : split.drilled) {
+        const double sim_a = hidden_state_cosine(tk, fp);
+        const double sim_b = hidden_state_cosine_kvtrace(tk, fp);
+        const double sim_c = hidden_state_cosine_kvtrace_full(tk, fp);
+        const double sim_d = context_sensitivity_cosine(tk, fp, kPrefix);
+        const double sim_e = hidden_state_cosine_kvtrace_full_markers(tk, fp);
+        const double sim_f = context_sensitivity_cosine2(tk, fp, kPrefix);
+        const double sim_g = context_sensitivity_cosine2_markers(tk, fp, kPrefix);
+        const bool   ok_a  = eval_scratch_one(tk, fp);
+        const bool   ok_b  = eval_kvtrace_one(tk, fp);
+        const bool   ok_c  = eval_kvtrace_full_one(tk, fp);
+        const std::size_t n_pieces = subject_piece_ids(tk, fp.subject).size();
+        sim_sum_a += sim_a; sim_sum_b += sim_b; sim_sum_c += sim_c; sim_sum_d += sim_d; sim_sum_e += sim_e; ++n_total;
+        if (sim_f > 0.0 && sim_g > 0.0) { sim_sum_f += sim_f; sim_sum_g += sim_g; ++n_valid_fg; }
+        n_correct_a += ok_a ? 1 : 0; n_correct_b += ok_b ? 1 : 0; n_correct_c += ok_c ? 1 : 0;
+        piece_count_traj.push_back(static_cast<double>(n_pieces));
+        sim_traj_a.push_back(sim_a);
+        sim_traj_b.push_back(sim_b);
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                     "  %-12s n_pieces=%d  cos_sim: A=%.3f B=%.3f C=%.3f D=%.3f E=%.3f F=%.3f G=%.3f  "
+                     "correct: A=%s B=%s C=%s\n",
+                     fp.subject.c_str(), static_cast<int>(n_pieces), sim_a, sim_b, sim_c, sim_d, sim_e,
+                     sim_f, sim_g, ok_a ? "yes" : "no", ok_b ? "yes" : "no", ok_c ? "yes" : "no");
+        report += buf;
+        if (n_pieces == 1) single_piece_sim_c.push_back(sim_c);   // zero-confound correctness pin (see below)
+    }
+    const double mean_sim_a = n_total ? sim_sum_a / n_total : 0.0;
+    const double mean_sim_b = n_total ? sim_sum_b / n_total : 0.0;
+    const double mean_sim_c = n_total ? sim_sum_c / n_total : 0.0;
+    const double mean_sim_d = n_total ? sim_sum_d / n_total : 0.0;
+    const double mean_sim_e = n_total ? sim_sum_e / n_total : 0.0;
+    const double mean_sim_f = n_valid_fg ? sim_sum_f / n_valid_fg : 0.0;
+    const double mean_sim_g = n_valid_fg ? sim_sum_g / n_valid_fg : 0.0;
+    const double r_a = pearson_r(piece_count_traj, sim_traj_a);
+    const double r_b = pearson_r(piece_count_traj, sim_traj_b);
+    report += "  mean cos_sim: A(embed-compose)=" + std::to_string(mean_sim_a) +
+             " B(cand1-pooled)=" + std::to_string(mean_sim_b) +
+             " C(cand2-trivial)=" + std::to_string(mean_sim_c) +
+             " D(cand2-ctx-sensitivity)=" + std::to_string(mean_sim_d) +
+             " E(cand2-marker-inclusive)=" + std::to_string(mean_sim_e) +
+             " F(ctx-sensitivity-v2)=" + std::to_string(mean_sim_f) +
+             " G(ctx-sensitivity-v2-markers)=" + std::to_string(mean_sim_g) +
+             " (" + std::to_string(n_valid_fg) + "/" + std::to_string(n_total) + " subjects had a valid "
+             "F/G boundary-match)\n" +
+             "  accuracy: A=" + std::to_string(static_cast<double>(n_correct_a) / n_total) +
+             " B=" + std::to_string(static_cast<double>(n_correct_b) / n_total) +
+             " C=" + std::to_string(static_cast<double>(n_correct_c) / n_total) +
+             " (" + std::to_string(n_total) + " drilled subjects, single post-training snapshot)\n" +
+             "  Pearson r(piece_count, cos_sim): A=" + std::to_string(r_a) + " B=" + std::to_string(r_b) + "\n" +
+             "  (C: multi-piece subjects sit below 1.0 -- NOT a splice bug (single-piece subjects, no "
+             "SPELL wrapper to omit, hit EXACT 1.000); E tests directly whether replaying the "
+             "marker-INCLUSIVE span instead of subject_piece_ids closes that gap -- if E >> C for "
+             "multi-piece subjects, SPELL_START/SPELL_END genuinely carry weight every packing mechanism "
+             "in this investigation (A/B/C/D) has been omitting by construction.\n"
+             "   D prediction: C's own gap from 1.0, if any, isolates compression; D's ADDITIONAL gap below "
+             "C isolates the isolated-capture assumption's own cost under a REAL non-empty prefix (\"" +
+             std::string(kPrefix) + "\").\n"
+             "   F/G (D's own confound fixed -- see context_sensitivity_cosine2's doc comment): does a "
+             "trace captured in ISOLATION stay valid when spliced into a DIFFERENT real context, and does "
+             "marker-inclusion (G) help there too? This is the load-bearing assumption behind reusing one "
+             "precomputed trace across many real mentions/documents (prefill compute amortization) -- if "
+             "F/G sit meaningfully below C/E's own same-context numbers, isolated capture is a real, "
+             "measurable approximation, not a free lunch.)\n";
+    WARN(report);
+
+    // Report real numbers, whatever they are -- this is a spike, not a guaranteed-positive validation.
+    CHECK(std::isfinite(mean_sim_a));
+    CHECK(std::isfinite(mean_sim_b));
+    CHECK(std::isfinite(mean_sim_c));
+    CHECK(std::isfinite(mean_sim_d));
+    CHECK(std::isfinite(mean_sim_e));
+    CHECK(std::isfinite(mean_sim_f));
+    CHECK(std::isfinite(mean_sim_g));
+    CHECK(std::isfinite(r_a));
+    CHECK(std::isfinite(r_b));
+    // Zero-confound correctness pin: single-piece subjects have NO SPELL wrapper to omit (pieces == alone
+    // exactly), so C's splice/rotation math should reproduce baseline EXACTLY for them regardless of the
+    // marker question -- this is the real gate on implementation correctness, not the aggregate mean_sim_c
+    // (which mixes in the now-understood, expected multi-piece marker-omission gap).
+    for (double s : single_piece_sim_c) CHECK(s > 0.99);
+}
+
+TEST_CASE("factspike Phase H: does marker-INCLUSIVE composition (SPELL_START/pieces/SPELL_END) close "
+         "mechanism A's baseline-vs-scratch gap, now that candidate 2 proved the markers carry real "
+         "weight?", "[.factspikemarkers]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase H: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+
+    // A GENUINELY SEPARATE training run, not just an eval-time swap: the model must be TAUGHT to read a
+    // marker-inclusive-bound slot (Phase G's own KV-trace splice bypassed set_scratch_bindings entirely,
+    // so it never needed this; mechanism A's real embedding-bind DOES need matching training exposure, or
+    // this would test generalization to a novel binding convention, not "does marker-inclusive help").
+    // Matched budget/seeds against Phase C / [.factspikehidden] -- only the slot-exposure dataset's own
+    // binding convention differs (build_slot_exposure_dataset_markers instead of build_slot_exposure_dataset).
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_exposure_dataset_markers(tk, exposure_split.drilled,
+                                                                            kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+    for (int r = 0; r < kEvalRounds; ++r)
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+
+    // Mechanism A retest (marker-inclusive bind, on a model actually TRAINED to read it) + a bonus
+    // candidate-1 retest (KV-trace pooled splice, marker-inclusive capture -- capture_kv_trace is already
+    // generic over its input token list, so this needed zero new engine/capture code, just passing
+    // tok::encode(subject) instead of subject_piece_ids). Both measured on this SAME newly-trained model.
+    std::string report = "\n=== factspike Phase H: marker-inclusive composition retest "
+                         "(post marker-inclusive-regime training) ===\n";
+    double sim_sum_a = 0.0, sim_sum_b = 0.0;
+    int n_correct_a = 0, n_total = 0;
+    std::vector<double> piece_count_traj, sim_traj_a, sim_traj_b;
+    for (const fs::FactPair& fp : split.drilled) {
+        const double sim_a = hidden_state_cosine_markers(tk, fp);
+        const bool   ok_a  = eval_scratch_one_markers(tk, fp);
+        const std::vector<int> full_span = sub0::tok::encode(tk, fp.subject);
+        const KvTrace trace_b = capture_kv_trace(full_span);   // candidate 1, marker-inclusive capture
+        const std::size_t n_pieces = subject_piece_ids(tk, fp.subject).size();
+
+        // candidate-1 fidelity, same hidden_state_cosine shape as hidden_state_cosine_kvtrace but with a
+        // caller-supplied trace instead of computing its own from subject_piece_ids -- inlined here rather
+        // than adding a fourth near-duplicate top-level function for a single bonus measurement.
+        sub0::kv_reset();
+        const std::vector<int> base_ctx = sub0::tok::encode(tk, fp.subject + " loves the color ");
+        for (std::size_t i = 0; i < base_ctx.size(); ++i) (void)sub0::forward_one(base_ctx[i], static_cast<int>(i));
+        std::array<float, D_MODEL> base_hidden{};
+        std::copy_n(sub0::last_hidden_ptr(), D_MODEL, base_hidden.data());
+        sub0::kv_reset();
+        splice_kv_trace(trace_b, 0);
+        const std::vector<int> suffix_b = sub0::tok::encode(tk, " loves the color ");
+        for (std::size_t i = 0; i < suffix_b.size(); ++i) (void)sub0::forward_one(suffix_b[i], 1 + static_cast<int>(i));
+        std::array<float, D_MODEL> b_hidden{};
+        std::copy_n(sub0::last_hidden_ptr(), D_MODEL, b_hidden.data());
+        double dot = 0.0, nb2 = 0.0, nk = 0.0;
+        for (int c = 0; c < D_MODEL; ++c) {
+            dot += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * b_hidden[static_cast<std::size_t>(c)];
+            nb2 += static_cast<double>(base_hidden[static_cast<std::size_t>(c)]) * base_hidden[static_cast<std::size_t>(c)];
+            nk  += static_cast<double>(b_hidden[static_cast<std::size_t>(c)])    * b_hidden[static_cast<std::size_t>(c)];
+        }
+        const double sim_b = (nb2 > 0.0 && nk > 0.0) ? dot / (std::sqrt(nb2) * std::sqrt(nk)) : 0.0;
+
+        sim_sum_a += sim_a; sim_sum_b += sim_b; ++n_total;
+        n_correct_a += ok_a ? 1 : 0;
+        piece_count_traj.push_back(static_cast<double>(n_pieces));
+        sim_traj_a.push_back(sim_a);
+        sim_traj_b.push_back(sim_b);
+        char buf[176];
+        std::snprintf(buf, sizeof buf, "  %-12s n_pieces=%d  cos_sim: A_markers=%.3f B_markers=%.3f  "
+                     "A_markers_correct=%s\n", fp.subject.c_str(), static_cast<int>(n_pieces), sim_a, sim_b,
+                     ok_a ? "yes" : "no");
+        report += buf;
+    }
+    const double mean_sim_a = n_total ? sim_sum_a / n_total : 0.0;
+    const double mean_sim_b = n_total ? sim_sum_b / n_total : 0.0;
+    const double r_a = pearson_r(piece_count_traj, sim_traj_a);
+    const double r_b = pearson_r(piece_count_traj, sim_traj_b);
+    report += "  mean cos_sim: A_markers=" + std::to_string(mean_sim_a) +
+             " B_markers=" + std::to_string(mean_sim_b) + "\n" +
+             "  accuracy: A_markers=" + std::to_string(static_cast<double>(n_correct_a) / n_total) +
+             " (" + std::to_string(n_total) + " drilled subjects, single post-training snapshot)\n" +
+             "  Pearson r(piece_count, cos_sim): A_markers=" + std::to_string(r_a) +
+             " B_markers=" + std::to_string(r_b) + "\n" +
+             "  (compare against the piece-only regime's own recorded numbers: [.factspikehidden] "
+             "mean_sim=0.83 r=-0.614; Phase G's candidate-1 B mean_sim=0.77 r=-0.624. This is a genuinely "
+             "SEPARATE training run -- not a like-for-like same-weights comparison the way Phase G's A/B/C/"
+             "D/E were, since the model itself had to be retrained to read marker-inclusive bindings.)\n";
+    WARN(report);
+
+    // Report real numbers, whatever they are -- a genuine re-test, not a guaranteed-positive validation.
+    CHECK(std::isfinite(mean_sim_a));
+    CHECK(std::isfinite(mean_sim_b));
+    CHECK(std::isfinite(r_a));
+    CHECK(std::isfinite(r_b));
+}
+
+TEST_CASE("factspike Phase I: periodic packed-content re-injection (Nanbeige-inspired) -- does "
+         "reinforcing the packed vector partway through the layer stack narrow the fidelity gap a "
+         "single upfront injection leaves?", "[.factspikereinject]") {
+    Tokenizer tk;
+    {
+        std::ifstream is(sub0::default_tokenizer(), std::ios::binary);
+        if (!is.good() || !sub0::tok::deserialize(tk, is) || tk.vocab != VOCAB) {
+            WARN("factspike Phase I: this build's tokenizer isn't usable/doesn't match VOCAB -- skipping. "
+                "Build against out/build/factspike96 (docs/FACTSPIKE.md Phase A) for a real result.");
+            return;
+        }
+    }
+
+    std::mt19937_64 split_rng(kSplitSeed);
+    const fs::FactSplit split = fs::make_fact_split(split_rng, kNSubjects, kDrilledFrac);
+    REQUIRE_FALSE(split.drilled.empty());
+
+    // SAME Phase-C-regime training as [.factspikehidden]/[.factspikekvtrace] -- this is EVAL-ONLY on top
+    // of an ordinarily-trained model (core.hpp's set_scratch_reinject doc comment: the model was never
+    // trained to expect the extra signal, so this is a directional probe, not the full test). Reusing the
+    // identical training regime keeps this a fair like-for-like comparison against mechanism A's own
+    // already-recorded numbers on this exact setup.
+    std::mt19937_64 exposure_rng(kSplitSeed ^ 0xE4C0517E5EEDULL);
+    const fs::FactSplit exposure_split = fs::make_fact_split(exposure_rng, 6, 1.0);
+    const fs::Dataset ds = fs::build_dataset(tk, split.drilled, kDocsPerFact, /*seed=*/42);
+    REQUIRE(ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+    const fs::SlotDataset slot_ds = fs::build_slot_exposure_dataset(tk, exposure_split.drilled,
+                                                                    kDocsPerFact, /*seed=*/43);
+    REQUIRE(slot_ds.tokens.size() > static_cast<std::size_t>(kWindowT));
+
+    sub0::build_model(); reset_opt_state();
+    sub0::AdamW opt(kLr);
+    std::mt19937 rng(1);
+    std::mt19937_64 choice_rng(2);
+    for (int r = 0; r < kEvalRounds; ++r)
+        train_steps_combined(ds, slot_ds, opt, kStepsPerEval, rng, choice_rng, /*slot_frac=*/0.5);
+
+    // Dose-response sweep against the SAME trained weights as baseline (mechanism A, no reinject): SAME
+    // stride (every layer) with `scale` varying as a FRACTION OF h's OWN CURRENT NORM at each layer (see
+    // core.hpp's set_scratch_reinject doc comment -- a first, fixed-embedding-scale version of this was
+    // measurably a near no-op, dwarfed by the residual stream's own growing norm across depth; this
+    // corrected version rescales the injection to match h's current magnitude before applying `scale`).
+    // gentle=5%, medium=15%, aggressive=40% of h's own norm re-added every single layer.
+    constexpr float kGentleScale = 0.05f, kMediumScale = 0.15f, kAggressiveScale = 0.40f;
+    std::string report = "\n=== factspike Phase I: periodic re-injection vs mechanism A baseline "
+                         "(post Phase-C-regime training, SAME model for every config, scale-adaptive v2) "
+                         "===\n";
+    double sim_sum_0 = 0.0, sim_sum_1 = 0.0, sim_sum_2 = 0.0, sim_sum_3 = 0.0;
+    int n_correct_0 = 0, n_correct_1 = 0, n_correct_2 = 0, n_correct_3 = 0, n_total = 0;
+    std::vector<double> piece_count_traj, sim_traj_0, sim_traj_1, sim_traj_2, sim_traj_3;
+    for (const fs::FactPair& fp : split.drilled) {
+        const double sim_0 = hidden_state_cosine(tk, fp);                                  // baseline, no reinject
+        const double sim_1 = hidden_state_cosine_reinject(tk, fp, 1, kGentleScale);
+        const double sim_2 = hidden_state_cosine_reinject(tk, fp, 1, kMediumScale);
+        const double sim_3 = hidden_state_cosine_reinject(tk, fp, 1, kAggressiveScale);
+        const bool   ok_0  = eval_scratch_one(tk, fp);
+        const bool   ok_1  = eval_scratch_one_reinject(tk, fp, 1, kGentleScale);
+        const bool   ok_2  = eval_scratch_one_reinject(tk, fp, 1, kMediumScale);
+        const bool   ok_3  = eval_scratch_one_reinject(tk, fp, 1, kAggressiveScale);
+        const std::size_t n_pieces = subject_piece_ids(tk, fp.subject).size();
+        sim_sum_0 += sim_0; sim_sum_1 += sim_1; sim_sum_2 += sim_2; sim_sum_3 += sim_3; ++n_total;
+        n_correct_0 += ok_0 ? 1 : 0; n_correct_1 += ok_1 ? 1 : 0;
+        n_correct_2 += ok_2 ? 1 : 0; n_correct_3 += ok_3 ? 1 : 0;
+        piece_count_traj.push_back(static_cast<double>(n_pieces));
+        sim_traj_0.push_back(sim_0); sim_traj_1.push_back(sim_1);
+        sim_traj_2.push_back(sim_2); sim_traj_3.push_back(sim_3);
+        char buf[240];
+        std::snprintf(buf, sizeof buf,
+                     "  %-12s n_pieces=%d  cos_sim: base=%.3f gentle5%%=%.3f medium15%%=%.3f "
+                     "aggressive40%%=%.3f  correct: base=%s gentle=%s medium=%s aggressive=%s\n",
+                     fp.subject.c_str(), static_cast<int>(n_pieces), sim_0, sim_1, sim_2, sim_3,
+                     ok_0 ? "yes" : "no", ok_1 ? "yes" : "no", ok_2 ? "yes" : "no", ok_3 ? "yes" : "no");
+        report += buf;
+    }
+    const double mean_0 = n_total ? sim_sum_0 / n_total : 0.0;
+    const double mean_1 = n_total ? sim_sum_1 / n_total : 0.0;
+    const double mean_2 = n_total ? sim_sum_2 / n_total : 0.0;
+    const double mean_3 = n_total ? sim_sum_3 / n_total : 0.0;
+    const double r_0 = pearson_r(piece_count_traj, sim_traj_0);
+    const double r_1 = pearson_r(piece_count_traj, sim_traj_1);
+    const double r_2 = pearson_r(piece_count_traj, sim_traj_2);
+    const double r_3 = pearson_r(piece_count_traj, sim_traj_3);
+    report += "  mean cos_sim: base=" + std::to_string(mean_0) + " gentle5%=" + std::to_string(mean_1) +
+             " medium15%=" + std::to_string(mean_2) + " aggressive40%=" + std::to_string(mean_3) + "\n" +
+             "  accuracy: base=" + std::to_string(static_cast<double>(n_correct_0) / n_total) +
+             " gentle=" + std::to_string(static_cast<double>(n_correct_1) / n_total) +
+             " medium=" + std::to_string(static_cast<double>(n_correct_2) / n_total) +
+             " aggressive=" + std::to_string(static_cast<double>(n_correct_3) / n_total) +
+             " (" + std::to_string(n_total) + " drilled subjects)\n" +
+             "  Pearson r(piece_count, cos_sim): base=" + std::to_string(r_0) + " gentle=" + std::to_string(r_1) +
+             " medium=" + std::to_string(r_2) + " aggressive=" + std::to_string(r_3) + "\n" +
+             "  (EVAL-ONLY probe on an ordinarily-trained model -- core.hpp's set_scratch_reinject doc "
+             "comment: a real positive here justifies wiring this into the training graph so the model can "
+             "learn to use it; a null/negative result is still useful before making that investment.)\n";
+    WARN(report);
+
+    // Report real numbers, whatever they are -- a directional probe, not a guaranteed-positive validation.
+    CHECK(std::isfinite(mean_0));
+    CHECK(std::isfinite(mean_1));
+    CHECK(std::isfinite(mean_2));
+    CHECK(std::isfinite(mean_3));
+    CHECK(std::isfinite(r_0));
+    CHECK(std::isfinite(r_1));
+    CHECK(std::isfinite(r_2));
+    CHECK(std::isfinite(r_3));
 }

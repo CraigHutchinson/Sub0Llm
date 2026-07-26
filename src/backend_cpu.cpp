@@ -284,6 +284,13 @@ thread_local const PersistentBindings* g_persistent_binds = nullptr;
 // g_scratch_binds above.
 thread_local const SentinelBindings* g_sentinel_binds = nullptr;
 
+// Periodic packed-content re-injection -- SPIKE, see core.hpp's set_scratch_reinject doc comment for the
+// full design. stride=0 (default) leaves forward_one byte-for-byte unchanged; stride>0 re-adds a bound
+// scratch slot's own packed vector (computed once at layer 0) into its hidden state every `stride`
+// layers. EVAL-ONLY (forward_one), never consulted by the training graph.
+thread_local int   g_scratch_reinject_stride = 0;
+thread_local float g_scratch_reinject_scale  = 1.0f;
+
 // The CALLING THREAD's token-embedding table node, registered by Model::build_layout (each worker thread
 // lays out its own Node arena, so this must be thread_local, not a single global). The binding dispatches
 // in op_embed/backward gate on it: a scratch-slot id (~282-287, just above the byte range) IS a valid
@@ -1130,6 +1137,8 @@ struct Model {
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
         float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
+        [[maybe_unused]] float packed_copy[C];             // periodic-reinject spike, see below
+        bool do_reinject = false;
 
         if (g_sentinel_binds && prev == g_sentinel_binds->sigil && g_sentinel_binds->bound(id)) {
             encode_slot(tok_emb->data.data(), C, g_sentinel_binds->fragments(id), g_sentinel_binds->encoding,
@@ -1137,6 +1146,10 @@ struct Model {
         } else if (g_scratch_binds && is_scratch_slot(id) && g_scratch_binds->bound(id)) {
             encode_slot(tok_emb->data.data(), C, g_scratch_binds->fragments(id), g_scratch_binds->encoding, h,
                         g_scratch_binds->enc_w);
+            if (g_scratch_reinject_stride > 0) {   // save the layer-0 packed vector for periodic re-injection
+                for (int j = 0; j < C; ++j) packed_copy[j] = h[j];
+                do_reinject = true;
+            }
         } else if (is_persistent_slot(id, VOCAB)) {
             // Same unconditional guard as op_embed's forward branch (backend_cpu.cpp) -- see its
             // comment. Decode never runs backward, so this path only needs the forward compose (enc_w,
@@ -1193,6 +1206,23 @@ struct Model {
                 linear_row(f1, L.W2, L.b2, proj, D_FF, C);
             }
             for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
+            // Periodic packed-content re-injection spike (Nanbeige-inspired, see core.hpp's
+            // set_scratch_reinject doc comment): every `stride` layers, add the SAME layer-0 packed
+            // vector back into this position's hidden state -- tests whether reinforcing the signal
+            // partway through the stack counters the dilution a single upfront injection leaves (axis 9).
+            // SCALE-ADAPTIVE: the residual stream's own RMS norm grows across depth (standard pre-norm
+            // behavior -- it's why ln_f exists before the head at all), while `packed_copy` sits at fixed
+            // ordinary-embedding-row scale (scratch_slots.hpp's own amplitude convention) -- a first,
+            // fixed-scale version of this spike was measurably a near no-op even at full strength every
+            // layer, because the addition was dwarfed by h's already-larger accumulated norm by mid-stack.
+            // Rescaling packed_copy to match h's CURRENT norm before applying `scale` (now a fraction of
+            // h's own magnitude, not an absolute embedding-scale constant) is what makes this a real test.
+            if (do_reinject && ((l + 1) % g_scratch_reinject_stride == 0)) {
+                float h_ms = 0.f; for (int j = 0; j < C; ++j) h_ms += h[j] * h[j]; h_ms /= C;
+                float pk_ms = 0.f; for (int j = 0; j < C; ++j) pk_ms += packed_copy[j] * packed_copy[j]; pk_ms /= C;
+                const float norm_scale = g_scratch_reinject_scale * std::sqrt((h_ms + 1e-8f) / (pk_ms + 1e-8f));
+                for (int j = 0; j < C; ++j) h[j] += norm_scale * packed_copy[j];
+            }
         }
         for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
         rmsnorm_row(h, ln_f, a, C);
@@ -1257,6 +1287,7 @@ void build_model() {
 // THIS thread will use for content-derived slot embeddings. The pointee must outlive the forward+backward
 // it drives. Null restores the plain tok_emb lookup exactly. See g_scratch_binds above.
 void set_scratch_bindings(const ScratchBindings* b) { g_scratch_binds = b; }
+void set_scratch_reinject(int stride, float scale) { g_scratch_reinject_stride = stride; g_scratch_reinject_scale = scale; }
 
 // Install (or clear) the persistent-slot table (declared near g_scratch_binds above). Unlike the
 // ephemeral table (rebound per window/context), this is read-only and immutable for the process once
@@ -1321,6 +1352,21 @@ Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(
 void kv_reset() { g_kv.reset(); }
 const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
 const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see Model::last_hidden's comment
+
+// KV-trace memoization primitives (spike, see core.hpp's declarations for the full design comment).
+// Caller-responsibility contract matches forward_one's own: valid only after kv_reset() has sized g_kv
+// on this thread (no redundant guard here, same discipline as g_kv's other two entry points above).
+const float* kv_krow_ptr(int layer, int pos) { return g_kv.krow(layer, pos); }
+const float* kv_vrow_ptr(int layer, int pos) { return g_kv.vrow(layer, pos); }
+void kv_rope_rotate(float* row, int pos) { rope_row(row, pos, N_HEADS, D_MODEL); }
+void kv_splice_row(int layer, int pos, const float* k_canonical, const float* v) {
+    float k[D_MODEL];
+    for (int j = 0; j < D_MODEL; ++j) k[j] = k_canonical[j];
+    rope_row(k, pos, N_HEADS, D_MODEL);          // rotate the de-rotated canonical row to its splice position
+    float* kc = g_kv.krow(layer, pos);
+    float* vc = g_kv.vrow(layer, pos);
+    for (int j = 0; j < D_MODEL; ++j) { kc[j] = k[j]; vc[j] = v[j]; }   // V is position-invariant, no rotation
+}
 
 void backward(Node* loss, float seed) {
     loss->grad[0] = seed;

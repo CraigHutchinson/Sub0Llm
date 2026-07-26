@@ -425,3 +425,318 @@ a failed experiment.
   deserves a larger sample before being treated as fully confirmed, but it's the first result in this whole
   investigation with both a precise mechanistic story AND a clean quantitative match to that story's
   specific prediction.
+
+  **PAT axis parked here.** User's own call: it doesn't move the mechanism, only how hard training
+  pushes the model to use it, and any fix would need to generalize to arbitrary words sharing these piece
+  tokens elsewhere in the vocabulary, not just this experiment's own drilled subjects. See
+  `docs/SCRATCH_TOKEN_FRAMING.md` for the full requirements/criteria writeup this finding motivated.
+
+- **2026-07-21, Phase G ([.factspikekvtrace]): KV-trace memoization, "candidate 1" from
+  `docs/SCRATCH_TOKEN_FRAMING.md`.** Instead of composing a slot's embedding from RAW pre-transformer
+  piece rows (mechanism A, `encode_slot`), capture the word's REAL per-layer `(K,V)` trace from an
+  isolated forward pass over its own pieces, pool `n → 1` per layer (reusing `encode_slot`'s own HRR
+  math, one layer deeper — the captured rows stand in for a synthetic `[n, D_MODEL]` "embedding table"),
+  and splice the pooled trace directly into a live KV-cache at inference time, bypassing that position's
+  own forward_one computation entirely. Three new engine primitives (`kv_krow_ptr`/`kv_vrow_ptr`,
+  `kv_rope_rotate`, `kv_splice_row`, `core.hpp`/`backend_cpu.cpp`) — deliberately NOT wired into any
+  bindings struct or `forward_one` dispatch branch; orchestrated directly by the test harness
+  (`capture_kv_trace`/`splice_kv_trace`, `factspike_engine_tests.cpp`), matching this project's "don't
+  build production abstractions before they're validated" discipline. A fast, model-free sanity check
+  (`kv_rope_rotate` round-trips: rotate then inverse-rotate is the identity, `[factspike][kvtrace]`) gates
+  the mechanism's core rotation math before trusting any training-time result.
+
+  Both mechanisms measured in the SAME run, on the SAME trained weights, same Phase-C-regime training —
+  a fairer matched comparison than re-quoting a previous session's mechanism-A-only numbers, given this
+  project's repeated lesson about single-seed volatility. Real result:
+
+  ```
+  Crofw      n=4  A=0.889 B=0.828     Woqsmb     n=6  A=0.747 B=0.884
+  Yelfan     n=4  A=0.551 B=0.795     Zlumwkrpx  n=7  A=0.881 B=0.813
+  Hpfds      n=1  A=0.935 B=0.895     Nozke      n=4  A=0.932 B=0.836
+  Ceaiaenze  n=8  A=0.605 B=0.133     Xtora      n=1  A=0.965 B=0.868
+  Elgux      n=1  A=0.974 B=0.879
+
+  mean cos_sim:  A=0.831  B=0.770
+  accuracy:      A=3/9    B=3/9   (single post-training snapshot, not peak-across-rounds)
+  Pearson r(piece_count, cos_sim):  A=-0.614  B=-0.624
+  ```
+
+  **Mechanism A's numbers reproduce the 2026-07-21 hidden-state-diagnostic run almost exactly**
+  (r=-0.6139 vs the previously recorded -0.614, same per-subject values) — confirms this harness is a
+  faithful re-run under the identical regime, not a different setup producing a coincidentally similar
+  number.
+
+  **Honest reading: candidate 1 does NOT show the predicted improvement.** The prediction was that B's
+  correlation should be WEAKER (closer to zero) than A's, since compression now only has to lose
+  genuinely-redundant-across-pieces information at each layer instead of approximating the whole
+  multi-hop process from nothing. Instead B's r is very slightly MORE negative (-0.624 vs -0.614) and its
+  mean similarity is lower (0.770 vs 0.831) — the opposite direction from the hypothesis, though small
+  enough at n=9 to not be a strong claim either way. Accuracy tied exactly at 3/9 for both, but on
+  DIFFERENT subjects (Woqsmb: A right/B wrong; Zlumwkrpx: A wrong/B right) — some real per-subject signal
+  difference, no net aggregate gain.
+
+  **Outlier-sensitivity check, done honestly rather than left implicit**: Ceaiaenze (n=8, the largest
+  piece count in the drilled set) is doing a lot of work — B collapses to 0.133 there while A only drops
+  to 0.605. Excluding that single subject: mean cos_sim A(n=8)=0.859 vs B(n=8)=0.850 (the MEAN gap nearly
+  vanishes), but r(n=8) A≈-0.448 vs B≈-0.535 (B's correlation stays somewhat stronger/more negative even
+  with the outlier removed). So the aggregate mean-similarity gap is mostly outlier-driven, but the
+  correlation comparison is not — under this small a sample (n=9, or n=8 excluding one point), that's as
+  far as this data can honestly be pushed.
+
+  **What this result actually says, mechanistically**: candidate 1's hypothesis assumed the INPUT to the
+  pooling step (raw embeddings vs. real per-layer K/V) was the limiting factor. Swapping in richer,
+  already-computed input and seeing no improvement — if anything a same-or-slightly-worse degradation
+  curve — points instead toward the POOLING OPERATOR ITSELF (HRR's fixed-`D_MODEL`-capacity n→1 bundle)
+  as the dominant bottleneck, independent of what's being bundled. This is a testable link to
+  `docs/SCRATCH_TOKEN_FRAMING.md`'s own still-open "HRR crosstalk theory cross-check" question (Plate's
+  `1/sqrt(n)` bundling-fidelity result) — not yet done, a clean next analytical step against this same
+  9-point dataset, no new training required. It also reframes what's worth trying next: variations on
+  WHAT gets pooled (this experiment) look less promising than either changing the pooling operator itself,
+  or abandoning pooling altogether (candidate 2's literal multi-position splice, accepting its O(n) cost).
+
+  Not a success for candidate 1 as specified — reported here in full rather than reframed into a
+  qualified positive, per this project's own "peak, not last-round, but never spin a negative into
+  something it isn't" standing discipline (see Phase D/E/F's own honest negative/ambiguous entries above).
+
+- **2026-07-21, Phase G continued: candidate 2 ("landmark-style transparent expansion") + the
+  SPELL_START/SPELL_END finding.** User: "spike candidate 2." No pooling at all — the FULL n-position
+  per-layer trace is spliced directly into the KV-cache (`n` real rows per layer instead of 1), accepting
+  O(n) cost. Reused the SAME three primitives with ZERO new engine code: capture is `capture_kv_trace`'s
+  own per-piece de-rotated rows without the pooling step, and splice is `kv_splice_row` called `n` times
+  instead of once — exactly the extension point the original DRY review anticipated. Measured alongside A
+  and B, same run/weights: **C** = the trivial case (position-0, isolated capture context — should be
+  ~exact, a correctness gate on the splice math, not really a "does it help" measure) and **D** = a
+  context-sensitivity probe (the same isolated-captured trace spliced into a REAL non-empty preceding
+  context, `"Everyone knows that " + subject + " loves the color "`, against a REAL baseline for that same
+  sentence — tests the framing doc's own open "how context-sensitive is a word's own trace" question).
+
+  **First run: C landed at 0.947 mean, not the predicted ~1.0** — a real gap on a claim that should have
+  been exact. Two distinct confounds found and separated, not conflated:
+  1. **Suffix-tokenization boundary mismatch** (cheap, fixable): `tok::encode(" loves the color ")` in
+     isolation does NOT byte-match the same phrase's tail inside `tok::encode(subject + " loves the
+     color ")` — BPE merges the leading space differently depending on what precedes it (confirmed via a
+     dedicated regression test, `[factspike][kvtrace]`, non-hidden, checking a subject's own tokenization
+     always matches its span at the START of the combined sentence — true for every drilled subject).
+     Fixed by slicing the real suffix out of the combined tokenization instead of re-tokenizing it. After
+     the fix, mean C rose only slightly (0.947), but the THREE single-piece subjects (Hpfds, Xtora, Elgux —
+     no `SPELL_START`/`SPELL_END` wrapper needed, so nothing for `subject_piece_ids` to strip) jumped to
+     **exactly C=1.000 each** — floating-point-exact reconstruction, the correctness gate finally passing
+     cleanly for the cases where it should. Every multi-piece subject stayed meaningfully below 1.0
+     (0.87–0.96), now cleanly separated from the single-piece group with the suffix confound and any
+     implementation bug both ruled out.
+  2. **SPELL marker omission** (the deeper, structural finding, user's own hypothesis): `subject_piece_ids`
+     (via `detail::word_span`) strips the `SPELL_START`/`SPELL_END` wrapper tokens that a real forward
+     pass over a multi-piece subject actually processes — direct token-id inspection confirmed
+     `tok::encode(subject)` = `[SPELL_START, ...pieces..., SPELL_END]` for every multi-piece subject, and
+     exactly `pieces` (no wrapper) for every single-piece one. **This is the SAME basis every mechanism in
+     this investigation captures/composes from — A's `encode_slot`, candidate 1's pooling, and candidate
+     2's splice all operate on `pieces`, never on the wrapping markers.**
+
+  **Direct, controlled test (not inference from correlation)**: added `E` — candidate 2's trivial case
+  again, but replaying the marker-INCLUSIVE span (`tok::encode(subject)`) instead of `subject_piece_ids`,
+  same subjects, same trained weights, same everything else. Result: **E = 1.000000 for every single
+  drilled subject, including every multi-piece one that sat at 0.87–0.96 under C.** Not a trend, not a
+  correlation — a swap-and-remeasure that closes the entire remaining gap to floating-point-exact
+  precision, with zero exceptions across 9 subjects. **The SPELL marker hypothesis is now founded, not
+  speculative**: `SPELL_START`/`SPELL_END` are fully load-bearing for reconstructing a multi-piece word's
+  real computation, and every packing mechanism built so far (A, B, and candidate 2 as first specified)
+  has been omitting them by construction, not by any deliberate design reason.
+
+  **Context-sensitivity probe (D)**: mean 0.948, essentially indistinguishable from C's own 0.947 (not
+  the trivial case's confound-free ~1.0, since D still replays marker-stripped `pieces` under the SAME
+  isolated-capture assumption, now additionally spliced into a real non-empty prefix). Given the marker
+  finding, this probe should be re-run with marker-inclusive capture before drawing any conclusion about
+  context-sensitivity specifically — right now its own number is dominated by the marker-omission
+  confound, not yet isolating the context-sensitivity question it was designed to test.
+
+  **Context-sensitivity, redone cleanly (F/G), 2026-07-21 continuation.** D's own number turned out to
+  carry a SECOND, previously-unfixed confound identical in kind to the one C needed fixing for (re-
+  tokenizing the suffix separately from the combined sentence). Building the marker-inclusive re-test
+  (`context_sensitivity_cosine2_impl`) surfaced a THIRD, distinct instance of the same general class: the
+  fixed prefix `"Everyone knows that "` ends in a trailing space whose own token gets absorbed/merged away
+  when immediately followed by a real subject, so `prefix_ctx.size()` (computed by tokenizing the prefix
+  alone) is not a reliable offset into the combined tokenization either — caught by a throwaway diagnostic
+  when a first attempt at the fix bailed on 0/9 subjects (too clean a failure to be real per-subject
+  noise, correctly read as a bug signal). Fixed by trusting only the ONE assumption verified twice now (a
+  subject's own tokenize-alone form appears as an exact contiguous match somewhere in any longer combined
+  string it's part of) and deriving prefix/suffix by *searching* for that match and slicing the
+  authoritative one-shot tokenization around it, rather than assuming any separately-tokenized piece's own
+  length lines up.
+
+  **F** (pieces-only, isolated-capture spliced into the real prefix, both boundary confounds now fixed):
+  mean **0.919**. **G** (marker-inclusive, same real-context splice): mean **0.983**. Per-subject: the
+  three single-piece subjects (no markers to omit, minimal internal composition to be context-sensitive
+  about) sit at F≈G≈0.995-0.997, matching their own same-context C≈E≈1.000 almost exactly — real context
+  costs them essentially nothing. Every multi-piece subject shows F clearly below its own same-context C
+  (e.g. Crofw C=0.893→F=0.848, Ceaiaenze C=0.937→F=0.879, Zlumwkrpx C=0.960→F=0.871) — a real,
+  non-negligible cost from moving to a genuinely different real context, on top of the marker-omission
+  gap. But G recovers almost all of it: 0.95-0.997 across every multi-piece subject, tight and consistent,
+  a small (~0.02) but real remaining gap from E's own exact same-context 1.000, not the ~0.13 gap F showed.
+
+  **Reading**: markers matter MORE than context-sensitivity does. The E→G same-context-vs-real-context gap
+  (~0.017) is far smaller than the F→G gap from including markers at all (~0.064) — most of what looked
+  like "context-sensitivity cost" in the original, confounded D was actually still the marker-omission
+  problem bleeding through. Once markers are included, a trace captured ONCE in complete isolation and
+  spliced into a genuinely different real sentence reproduces ~98% of the true recomputed representation.
+  **This is a real, positive answer to whether a precomputed trace generalizes well enough to reuse across
+  different real mentions** — the load-bearing assumption behind any "cache a common word's trace once,
+  splice it into many later documents" prefill-compute-amortization scheme. Not proof it will hold at
+  larger scale or for less redundantly-structured real prose (n=9, one prefix, one toy model — the same
+  caveats as everywhere else in this investigation), but a genuinely encouraging, concrete first data point
+  where the investigation had none before.
+
+  **What this changes going forward**: this is now a well-founded, high-confidence next experiment, not
+  yet run — does composing mechanism A's `encode_slot` (and candidate 1's pooling) from the
+  marker-inclusive span instead of `pieces` narrow Phase C's baseline-vs-scratch accuracy gap or the
+  r=-0.614 fidelity correlation? Unlike candidate 2 (splice, provably exact once markers are included),
+  A/B still have to COMPRESS `n(+2)` rows into one embedding, so marker-inclusion wouldn't make them
+  exact — but it changes what they're compressing FROM, and that basis has now been shown, directly, to
+  be missing real, load-bearing signal. Not yet run as of this writing — a genuine re-test, not a
+  retroactive reinterpretation of Phase C–F's already-recorded numbers (those runs never captured the
+  markers, so there is nothing to re-analyze in the old data, only a new run to make).
+
+- **2026-07-21, Phase H ([.factspikemarkers]): does marker-inclusive composition help mechanism A —
+  a genuine re-test, run.** A SEPARATE matched-budget training run (`build_slot_exposure_dataset_markers`,
+  `factspike.hpp`): the model must be TAUGHT to read a marker-inclusive-bound slot, not just evaluated with
+  one, or this would test generalization to a novel binding convention instead of the actual hypothesis.
+  Same seeds/steps/regime as Phase C / `[.factspikehidden]`, only the slot-exposure dataset's binding
+  convention differs. Measured mechanism A (`encode_slot`, marker-inclusive bind) and a bonus candidate-1
+  retest (pooled KV-trace, marker-inclusive capture) on this newly-trained model.
+
+  **Result: WORSE across the board, not better.** mean cos_sim A_markers=0.695 (vs. the piece-only
+  regime's own recorded 0.83), accuracy A_markers=0/9 correct in this single post-training snapshot (the
+  piece-only `[.factspikehidden]` run, while not headline-accuracy-focused, tracked several correct
+  subjects at this same snapshot point), r(piece_count,cos_sim) A_markers=-0.272 (weaker than -0.614, but
+  not a positive sign here — a flatter curve on top of an overall WORSE, not better, fit is not the same
+  finding axis 9 was hoping for). Candidate-1-style pooling on this same model: mean cos_sim
+  B_markers=0.630, r=-0.255 — also not an improvement over Phase G's own piece-only candidate-1 numbers
+  (mean 0.77, r=-0.624).
+
+  **Why this doesn't contradict candidate 2's result — it completes the picture.** Candidate 2 (full
+  splice, no compression) improved to EXACT 1.000 when given the marker-inclusive span, because splicing
+  more real content costs nothing — there's no capacity limit to hit. Mechanism A and candidate 1 both
+  still have to COMPRESS everything into one fixed-`D_MODEL`-size vector via HRR bind-by-position. Adding
+  2 more real, load-bearing items (the markers) to compress does not help a compressor whose own capacity
+  was ALREADY the bottleneck (candidate 1's own finding, above: richer input didn't help there either) —
+  it gives the SAME fixed-size bundle MORE genuine signal to lose, which is consistent with things getting
+  worse, not better. **Three independently-designed experiments now point the same direction**: candidate
+  1 (swap the compression INPUT for something richer — no improvement), Phase H (add MORE real signal to
+  the same compression step — measurably worse), and candidate 2 (remove the compression step entirely —
+  exact reconstruction). None of them are individually conclusive at single-seed scale, but the CONVERGENT
+  direction across three separate designs is a stronger signal than any one result alone: **the bottleneck
+  has never been which tokens get composed — it's the fixed-size compression step itself.** A fix needs to
+  change the compression operator (different than HRR's fixed bundle) or abandon compression (candidate
+  2's own direction), not what gets fed into the current one.
+
+  **Honest caveat, same discipline as every prior phase**: this is ONE training run. This project has
+  hit the single-seed-volatility wall before (see the HRR-vs-MeanPool history, and Phase C–F's own
+  disagreement). The DIRECTION is what's being leaned on here — three separate methodologies agreeing,
+  not one number in isolation — not a claim that -0.272 or 0.695 are precise, reproducible constants.
+
+- **2026-07-21, production-scale cross-check: `corpus_collapse` capstone, 3-arm, real TinyStories corpus
+  (`out/build/d196check`, d196/11 layers).** The codebase-wide survey that motivated this (below) found
+  `corpus_collapse.hpp` — the production, "COMMITTED" real-corpus word-collapse mechanism — is a direct,
+  first-class caller of the SAME `detail::word_span` marker-stripping extraction factspike's whole
+  investigation has been about. Added `build_dataset_markers` (marker-inclusive, structurally identical to
+  the existing `build_dataset` except the bound span includes `SPELL_START`/`SPELL_END` instead of
+  excluding them) and extended the existing capstone (`[.corpus_collapse]`, matched-budget A/B, now A/B/C)
+  with a third arm.
+
+  **Result: no detectable difference.** Held-out NELBO (20 val batches × 16 windows, 2000 sampled docs,
+  401/1693 had a recurring compound word to collapse at all): base-only=2.9251, base+collapse=2.9176,
+  base+collapse_markers=2.9176 — **identical to 4 decimal places** between the marker-stripped and
+  marker-inclusive arms. Both collapse arms beat base-only equally (delta -0.0075 either way).
+
+  **This is a real, honest negative — reported as such, not explained away — but it does not contradict
+  the factspike finding; it answers a different question with a much coarser instrument.** Factspike's
+  cosine-similarity probe measures EXACT representational fidelity at ONE specific position, in a toy
+  model built so that "compose across a few piece embeddings" is the *normal* way it represents any word —
+  a maximally sensitive, surgical measurement. Held-out NELBO averages next-token prediction quality
+  across the WHOLE validation set, where only 401/1693 documents contain any collapse-eligible word at
+  all, and even fewer tokens within those are the actual substituted slot position — a real effect
+  localized to a tiny fraction of evaluated tokens would need to be large to move an aggregate NELBO
+  measured this way, at this budget (600 steps/arm, "a directional signal, not a production run" per this
+  test's own long-standing comment). A bigger, more capable model (d196/11-layer vs. factspike's toy
+  d96/8-layer) may also simply be more robust to composing from an incomplete basis. **Read together**:
+  the SPELL-marker effect on exact representational reconstruction is real and decisive (factspike); a
+  measurable effect on general language-modeling quality at production scale, at this budget, is not yet
+  demonstrated (corpus_collapse) — these are compatible findings about different things, not a
+  contradiction, and neither should be over-extended to answer the other's question.
+
+  **Codebase-wide survey of who else is exposed to this gap** (full detail:
+  `docs/SCRATCH_TOKEN_FRAMING.md`'s updated candidate-2 section): `detail::word_span` unconditionally
+  strips `SPELL_START`/`SPELL_END` for ANY multi-piece word (`N>=2`, no narrower qualifying condition,
+  schemeV3's own deliberate design — see `docs/TOKENIZER_DESIGN.md`). `ScratchTable::expand()` is NOT an
+  independent second leak — every real caller feeds it already-`word_span`-stripped pieces, so it's
+  downstream of the same gap, not a separate one. **`wordspike.hpp`'s own spike training data is NOT
+  exposed** — it builds `doc_bindings` from raw ASCII bytes of the subject string directly, bypassing
+  tokenization (and therefore `SPELL_START`/`SPELL_END`) entirely; the spike tested a narrower question
+  than the mechanism it was validating for. **The LIVE, deployed word-collapse path IS exposed** — both
+  `corpus_collapse.hpp`'s own dataset construction (now cross-checked above) and the live-generation
+  counterpart (`decode.hpp`'s `resolve` lambda, fired mid-generation on `TOK_SPELL_END`, feeding
+  `gen_stage.cpp`'s `word_collapse` callback a marker-stripped span via the same hand-rolled logic
+  `word_span` implements). No prior design doc (`SCRATCH_TOKENS.md`, `CORPUS_COLLAPSE.md`,
+  `TOKENIZER_DESIGN.md`) ever previously considered whether the markers should be included in or excluded
+  from composed slot content — every prior mention treats them purely as a boundary-detection trigger, not
+  as payload. This was a genuinely new question as of this session's Phase G entry, not a previously-known
+  and accepted trade-off.
+
+- **2026-07-21, Phase I ([.factspikereinject]): periodic packed-content re-injection, Nanbeige-inspired —
+  the first REAL positive signal on axis 9 from a mechanism that keeps O(1) cost.** Project memory
+  `nanbeige-architecture-reference` (a real, verified `modeling_nanbeige.py`) documents
+  `NanbeigeNgramLayerFusion`: instead of injecting a side-channel signal once at the input embedding and
+  letting it survive N_LAYERS of ordinary computation alone, Nanbeige re-injects the SAME signal as a
+  gated residual addition at multiple depths. Phase G/H's own finding — mechanism A's real weakness isn't
+  missing information, it's that the single upfront injection has to survive the whole stack unaided — is
+  exactly what this targets. Built `set_scratch_reinject(stride, scale)` (`core.hpp`/`backend_cpu.cpp`): a
+  minimal, PARAMETER-FREE opt-in probe that re-adds the SAME layer-0 packed vector back into a scratch
+  slot's own hidden state every `stride` layers, EVAL-ONLY (wired into `forward_one`, the incremental
+  decode path, NOT into the training graph — `Model::forward()`/`train_batch` is a structurally separate
+  autodiff implementation with no knowledge of this yet). Tested on the ALREADY-trained Phase-C model, no
+  retraining — a directional probe: a positive result here, on a model never taught to expect the extra
+  signal, would be a strong argument for the bigger investment of wiring this into training properly.
+
+  **First version (fixed embedding-scale injection): a near no-op.** `scale * packed_vector` added
+  directly, where `packed_vector` sits at ordinary embedding-row magnitude (`scratch_slots.hpp`'s own
+  amplitude convention). Even "aggressive" (scale=1.0, every layer, cumulative magnitude ~`N_LAYERS`×
+  the original injection) barely moved anything: mean cos_sim 0.830964→0.831134, accuracy unchanged at
+  3/9. Too clean/flat a null to trust at face value — diagnosed, not just accepted: the residual stream's
+  own RMS norm grows across depth (standard pre-norm behavior — it's exactly why `ln_f` exists before the
+  head at all), and by mid-stack `h`'s accumulated magnitude dwarfs a fixed, small, embedding-scale
+  addition regardless of how many times it's repeated.
+
+  **Corrected version (scale-adaptive re-injection): a real, monotonic, honest positive.** Rescaled the
+  injection to a FRACTION OF `h`'s OWN CURRENT NORM at each layer, not an absolute constant (`scale` now
+  means "inject a perturbation this-fraction-as-large-as h's current magnitude," still zero new learned
+  parameters — just a per-layer RMS computation and rescale). Swept gentle=5%, medium=15%, aggressive=40%
+  of `h`'s norm, re-added every layer, same trained weights as baseline for all four:
+
+  ```
+  mean cos_sim:  base=0.831  gentle(5%)=0.833  medium(15%)=0.840  aggressive(40%)=0.860
+  accuracy:      base=3/9    gentle=3/9         medium=3/9         aggressive=5/9
+  r(n_pieces,cos_sim): base=-0.614  gentle=-0.615  medium=-0.631  aggressive=-0.569
+  ```
+
+  A clean, monotonic dose-response curve — not noise. **Accuracy jumped from 3/9 to 5/9 correct at the
+  aggressive dose**, a real task-level improvement from an eval-only intervention the model was never
+  trained around. Ceaiaenze (n=8, the most-degraded subject throughout this whole investigation) went from
+  wrong at every lower dose to CORRECT at aggressive. Elgux flipped from wrong to correct too, despite its
+  OWN cos_sim actually *dropping* (0.974→0.900) — accuracy and representational similarity to baseline
+  aren't the same thing; what matters for the task is whether the color prediction comes out right, not
+  exact fidelity to how a real multi-piece computation would have looked. The correlation with piece count
+  weakens slightly at the highest dose (-0.614→-0.569), the first sign in this whole investigation of that
+  specific number moving in the hoped-for direction, though modestly.
+
+  **Reading, honestly**: this is the first mechanism in the entire axis-9 investigation to show a REAL
+  positive effect while keeping O(1) visible cost — unlike candidate 2 (exact, but O(n)) and unlike every
+  compression-operator variant tried (candidate 1, marker-inclusive mechanism A, both WORSE). That it shows
+  up even WITHOUT training exposure is a genuinely encouraging sign, not a limitation to explain away: it
+  suggests the model's existing weights already have some latent capacity to use a stronger signal when
+  it's presented, even via a crude, ungated, un-learned heuristic. Training the model to expect and
+  properly modulate this (a learned gate, matching Nanbeige's own `NanbeigeNgramLayerFusion` design, rather
+  than a flat fraction-of-norm heuristic) is the natural, well-motivated next step — genuinely justified by
+  this result, not started yet. **Caveats, same discipline as always**: single seed, n=9 subjects, only
+  three doses swept (no sense yet of where a ceiling or breaking point sits — a crude ungated heuristic
+  will eventually overwhelm the residual stream with noise if pushed far enough, this just hasn't found
+  that edge yet), and the eval-only setup means this is a lower bound on what a properly-trained version
+  could do, not a claim about the ceiling.

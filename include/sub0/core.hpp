@@ -111,6 +111,68 @@ SUB0_API const float* forward_one(int id, int pos);
 // Training" discussion on why raw-embedding-level fidelity (hrr_unbind) isn't the same question.
 SUB0_API const float* last_hidden_ptr();
 
+// --- KV-trace memoization primitives (spike, 2026-07-21) --------------------------------------------
+// See docs/SCRATCH_TOKEN_FRAMING.md's "candidate 1: post-hoc per-layer KV pooling" -- these three
+// functions are the minimal engine surface a caller needs to CAPTURE a word's real per-layer (K,V)
+// trace (via an ordinary kv_reset()+forward_one() loop, already exposed above -- nothing new needed for
+// that half), read it out, and SPLICE a (possibly pooled/compressed) trace into a different context's
+// KV-cache later, bypassing forward_one's normal per-position computation for that position entirely
+// (nothing downstream needs a packed word's own query/attention-output/FFN, only later positions'
+// attention over its K/V -- see the framing doc's mechanism-B discussion). Deliberately NOT wired into
+// any bindings struct or forward_one dispatch branch yet -- this is spike-scoped, orchestrated directly
+// by the caller (tests/factspike_engine_tests.cpp), matching this project's own "don't build production
+// abstractions before they're validated" discipline (project memory only-add-arguments-we-need).
+//
+// Read accessors: raw pointers into the calling thread's KV-cache row at (layer, pos) -- D_MODEL floats,
+// thread-local, CPU backend only, same "valid until the next kv_reset()/forward_one() on this thread"
+// contract as last_hidden_ptr() above. Two named functions (not one function + a bool selector) so a
+// call site never has to decode what `true`/`false` means at the call.
+SUB0_API const float* kv_krow_ptr(int layer, int pos);
+SUB0_API const float* kv_vrow_ptr(int layer, int pos);
+// Rotate `row` (D_MODEL floats, K-shaped) in place by RoPE's angle at `pos` -- a thin export of the
+// backend's existing rope_row (no new rotation math). `pos` may be negative: RoPE is a pure per-call
+// rotation with no other position-dependent state, so calling with -pos exactly inverts a prior call
+// with +pos (R(-pos)*R(pos) = I). Two uses this spike needs from the SAME primitive: de-rotating a
+// captured K row's local capture-position angle away before pooling (the local capture position is an
+// arbitrary artifact of the isolated precompute context, not signal -- must NOT be confused with the
+// content-derived, causal-attention-refined part of the row, which carries the real multi-hop signal and
+// must never be touched), and re-rotating a pooled trace to whatever position it's spliced into later.
+SUB0_API void kv_rope_rotate(float* row, int pos);
+// Write a word's (pooled) per-layer trace directly into this thread's KV-cache at (layer, pos), skipping
+// forward_one's normal per-position computation for that position entirely. `k_canonical` is expected
+// de-rotated (as produced by the capture+kv_rope_rotate(-pos) sequence above) -- this function rotates a
+// local copy by `pos` before writing it into the K row; `v` (position-invariant, RoPE never touches V)
+// is written unrotated. Call once per layer (N_LAYERS times) to splice one word into a target context.
+// Downstream forward_one calls at later positions need no changes: their attention loop already
+// iterates generically over whatever rows are populated in the KV-cache for j <= pos.
+SUB0_API void kv_splice_row(int layer, int pos, const float* k_canonical, const float* v);
+
+// --- Periodic packed-content re-injection (spike, 2026-07-21) ---------------------------------------
+// Phase G/H found mechanism A's real weakness isn't a missing-information problem, it's that a packed
+// slot's embedding is composed ONCE via encode_slot() at layer 0 and then has to survive N_LAYERS of
+// ordinary computation alone -- exactly the shape Nanbeige4.5's NanbeigeNgramLayerFusion targets (project
+// memory nanbeige-architecture-reference): re-inject the same side-channel signal as a residual addition
+// at multiple depths instead of betting everything on one upfront injection. `set_scratch_reinject(stride,
+// scale)` is the minimal opt-in probe of that idea: when `stride > 0`, forward_one adds a re-scaled copy
+// of the packed vector back into a bound scratch slot's own hidden state every `stride` layers, reusing
+// the SAME vector `encode_slot()` already computed at layer 0 (no new learned parameters). `scale` is a
+// FRACTION OF THE RESIDUAL STREAM'S OWN CURRENT RMS NORM at that layer, not an absolute embedding-scale
+// constant -- a first version used the packed vector's own fixed (small, ordinary-embedding-row-scale)
+// magnitude directly and was measurably a near no-op even at full strength every layer, because the
+// residual stream's norm grows across depth (standard pre-norm behavior) and dwarfed the fixed-scale
+// addition by mid-stack; rescaling to match h's current norm before applying `scale` is what makes this a
+// real perturbation regardless of depth. `set_scratch_reinject(0, 1.0f)` restores the default (unchanged)
+// behavior.
+//
+// EVAL-ONLY: this is wired into forward_one (the incremental decode path) only, NOT into the training
+// graph (Model::forward()/train_batch, a structurally separate autodiff implementation) -- so a model
+// evaluated with this enabled was never trained to expect the extra signal. That makes any result here a
+// directional, out-of-distribution probe on top of an ALREADY-trained model, not the full test; a real
+// positive would justify the bigger investment of wiring this into training so the model can learn to use
+// it, a null/negative result is still informative before making that investment. See docs/FACTSPIKE.md's
+// Phase I entry.
+SUB0_API void set_scratch_reinject(int stride, float scale);
+
 // Content-derived scratch-slot embeddings: install the per-context bindings the next forward/forward_one
 // on this thread uses (a BOUND scratch slot then embeds from its fragments instead of a fixed reserved-id
 // row). null clears it -> plain tok_emb lookup, unchanged. See include/sub0/scratch_slots.hpp for the
