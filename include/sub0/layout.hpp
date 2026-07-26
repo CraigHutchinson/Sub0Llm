@@ -32,15 +32,24 @@ inline constexpr int GQA_GROUP = N_HEADS / N_KV_HEADS;
 inline constexpr int D_KV      = N_KV_HEADS * D_HEAD;
 static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 
-// Parameter tensor count: tok_emb + pos_emb (2), then per transformer block either 10
-// (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9 (gated: ln1, ln2, Wq, Wk, Wv, Wo,
-// Wg, W1, W2 -- SwiGLU, no FFN biases, matching the GGUF/Llama convention this variant
-// exists to import -- see gguf-import-feasibility-review), plus 2 more (q_norm, k_norm)
-// when USE_QK_NORM, then the tail: ln_f alone when USE_TIED_EMBEDDINGS (the head reuses
-// tok_emb, no separate lm_head/lm_bias slot -- the common tied-embedding convention also
-// drops the head bias, matching GPT-2/GGUF-style tied models), else ln_f + lm_head +
-// lm_bias (3).
-inline constexpr int NUM_PARAMS = 2 + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
+// Under RoPE there is no position table at all: RoPE injects position inside attention, so a
+// [SEQ_LEN, D_MODEL] pos_emb would be allocated, zeroed, serialized and never read. Omitting it is
+// not just a saving -- it DECOUPLES SEQ_LEN from the checkpoint. With no pos_emb, no parameter
+// tensor's shape depends on SEQ_LEN, so a model trained at one window loads into a binary built
+// with a larger one, which is what makes long-context inference possible at all here (the window is
+// otherwise compile-time everywhere: KV cache, attention score buffers, memplan). Same conditional
+// shape as USE_TIED_EMBEDDINGS' lm_head/lm_bias below.
+inline constexpr bool HAS_POS_EMB = (POS_ENCODING == PosEncoding::Absolute);
+
+// Parameter tensor count: tok_emb, plus pos_emb only under absolute positions (see HAS_POS_EMB),
+// then per transformer block either 10 (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9
+// (gated: ln1, ln2, Wq, Wk, Wv, Wo, Wg, W1, W2 -- SwiGLU, no FFN biases, matching the GGUF/Llama
+// convention this variant exists to import -- see gguf-import-feasibility-review), plus 2 more
+// (q_norm, k_norm) when USE_QK_NORM, then the tail: ln_f alone when USE_TIED_EMBEDDINGS (the head
+// reuses tok_emb, no separate lm_head/lm_bias slot -- the common tied-embedding convention also
+// drops the head bias, matching GPT-2/GGUF-style tied models), else ln_f + lm_head + lm_bias (3).
+inline constexpr int NUM_PARAMS = 1 + (HAS_POS_EMB ? 1 : 0)
+                                   + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
                                    + (USE_QK_NORM ? 2 * N_LAYERS : 0)
                                    + (USE_TIED_EMBEDDINGS ? 1 : 3);
 
@@ -85,7 +94,7 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
         ++i;
     };
     add(VOCAB,   D_MODEL, PKind::TokEmb, false, false);
-    add(SEQ_LEN, D_MODEL, PKind::PosEmb, false, false);
+    if constexpr (HAS_POS_EMB) add(SEQ_LEN, D_MODEL, PKind::PosEmb, false, false);
     for (int l = 0; l < N_LAYERS; ++l) {
         add(1,       D_MODEL, PKind::Ln1, false, false);
         add(1,       D_MODEL, PKind::Ln2, false, false);

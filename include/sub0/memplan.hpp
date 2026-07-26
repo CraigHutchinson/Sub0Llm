@@ -55,6 +55,16 @@ struct Dims {
     // own comment for the exact buffer-role sequence). Defaults false for the same reason `tied`/
     // `qk_norm` do: every pre-existing aggregate-init call site keeps modeling the plain-FFN shape.
     bool gated = false;
+    // Absolute learned positions (POS_ENCODING == Absolute, i.e. layout.hpp's HAS_POS_EMB): adds a
+    // pos_emb [T,C] table. RoPE omits it entirely -- and that omission is what removes the ONLY
+    // SEQ_LEN dependence from the parameter set, letting a checkpoint move between window sizes.
+    // Defaults TRUE (unlike the flags above) because every pre-existing aggregate-init call site was
+    // written when the table was unconditional, so true is what preserves their meaning.
+    bool pos_emb = true;
+    // Grouped-query attention (N_KV_HEADS): K/V project to n_kv_heads*D_HEAD instead of d_model, so
+    // Wk/Wv shrink and the KV cache shrinks with them. 0 means "same as n_heads" -- plain MHA, what
+    // every pre-existing aggregate-init call site means.
+    int n_kv_heads = 0;
 };
 
 using u64 = unsigned long long;
@@ -76,9 +86,12 @@ inline constexpr int MAX_DEVICE_BATCH = 4096;
 constexpr u64 param_floats(const Dims& d) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff), T = u64(d.seq_len), V = u64(d.vocab);
     const u64 H  = u64(d.n_heads), DH = H > 0 ? C / H : 0;   // D_HEAD = C/H
-    const u64 emb   = V * C + T * C;            // tok_emb [V,C] + pos_emb [T,C]
+    const u64 KVH = u64(d.n_kv_heads > 0 ? d.n_kv_heads : d.n_heads);
+    const u64 CKV = KVH * DH;                   // D_KV: K/V width (== C for plain MHA)
+    const u64 emb   = V * C + (d.pos_emb ? T * C : 0);   // tok_emb [V,C] + pos_emb [T,C] if present
     const u64 block = 2 * C                     // ln1 + ln2          [C] each
-                    + 4 * C * C                 // Wq Wk Wv Wo        [C,C]
+                    + 2 * C * C                 // Wq, Wo             [C,C]
+                    + 2 * C * CKV               // Wk, Wv             [C,D_KV] (== [C,C] under MHA)
                     + (d.qk_norm ? 2 * DH : 0)  // q_norm + k_norm [1,D_HEAD] each (USE_QK_NORM only)
                     // gated: Wg [C,F], W1 [C,F], W2 [F,C], no biases (3*C*F). plain: W1 [C,F], b1 [F],
                     // W2 [F,C], b2 [C] (2*C*F + F + C).

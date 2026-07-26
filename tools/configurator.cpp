@@ -1146,7 +1146,8 @@ int main(int argc, char** argv) {
         // with a third Wg weight matrix (and a third bf16 GEMM-weight mirror); must match
         // USE_GATED_FFN the same way.
         const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, d_ff, seq_len, vocab,
-                                         tie_embeddings != 0, qk_norm != 0, gated_ffn != 0 };
+                                         tie_embeddings != 0, qk_norm != 0, gated_ffn != 0,
+                                         pos_encoding == 0, n_kv_heads };
         // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
         // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
         // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc

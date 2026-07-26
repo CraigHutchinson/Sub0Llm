@@ -107,9 +107,16 @@ bool load_model(const char* path) {
     if (!is) return false;
     Header h, ref;
     is.read((char*)&h, sizeof(h));
+    // seq_len is deliberately NOT compared under RoPE. With no pos_emb table (layout.hpp's
+    // HAS_POS_EMB) no parameter tensor's shape depends on the window, so a model trained at one
+    // seq_len is bit-compatible with a binary built for a larger one -- which is the entire point of
+    // dropping the table, and what makes long-context inference from a short-context checkpoint
+    // possible. param_floats still guards every shape that DOES matter, so a genuinely incompatible
+    // file is still rejected; under Absolute the table is real and seq_len must match exactly.
+    const bool seq_ok = HAS_POS_EMB ? (h.seq_len == ref.seq_len) : true;
     if (std::memcmp(h.magic, ref.magic, 4) != 0 ||
         h.d_model != ref.d_model || h.n_layers != ref.n_layers || h.n_heads != ref.n_heads ||
-        h.d_ff != ref.d_ff || h.seq_len != ref.seq_len || h.vocab != ref.vocab ||
+        h.d_ff != ref.d_ff || !seq_ok || h.vocab != ref.vocab ||
         h.ternary != ref.ternary || h.pos_encoding != ref.pos_encoding ||
         h.param_floats != ref.param_floats) {
         std::println(stderr, "error: model was built with a different (constexpr) config");

@@ -1033,7 +1033,10 @@ struct Model {
         W->pused = 0; W->pcount = 0;
         tok_emb = mk_param(VOCAB, D_MODEL, false);
         g_tok_emb_node = tok_emb;   // register THIS thread's token table for op_embed's binding gate
-        pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
+        // No position table under RoPE -- see layout.hpp's HAS_POS_EMB. Must stay in lock-step with
+        // make_param_layout(): the order there IS the serialization order.
+        if constexpr (HAS_POS_EMB) pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
+        else                       pos_emb = nullptr;
         for (auto& L : layers) {
             L.ln1 = mk_param(1, D_MODEL, false);
             L.ln2 = mk_param(1, D_MODEL, false);
@@ -1076,10 +1079,7 @@ struct Model {
         };
         auto ones = [](Node* t) { std::fill(t->data.begin(), t->data.end(), 1.f); };
         randn(tok_emb, 0.02f);
-        // Under RoPE the position table is unused (kept in the layout for format stability);
-        // zero it so the checkpoint is deterministic and it never perturbs anything.
-        if constexpr (POS_ENCODING == PosEncoding::Absolute) randn(pos_emb, 0.02f);
-        else                                                 std::fill(pos_emb->data.begin(), pos_emb->data.end(), 0.f);
+        if constexpr (HAS_POS_EMB) randn(pos_emb, 0.02f);   // absent entirely under RoPE
         for (auto& L : layers) {
             ones(L.ln1); ones(L.ln2);
             randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);

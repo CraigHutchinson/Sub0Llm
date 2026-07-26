@@ -2698,8 +2698,12 @@ constexpr int kB1  = kW1 + 1, kB2 = kW1 + 3;                 // plain (non-gated
                                                               // `if constexpr (!USE_GATED_FFN)` -- see the b1/b2
                                                               // pointer inits below, none may run unconditionally.
 constexpr int kLPer = 2 + 4 + (USE_QK_NORM ? 2 : 0) + (USE_GATED_FFN ? 3 : 4);  // params per transformer block
-constexpr int layer_base(int l) { return 2 + kLPer * l; }
-constexpr int kFinalBase = 2 + kLPer * N_LAYERS;             // index of ln_f (tail block start)
+// Leading params before the first block: tok_emb always, pos_emb only under absolute positions
+// (layout.hpp's HAS_POS_EMB -- RoPE omits the table entirely, which is what decouples SEQ_LEN from
+// the checkpoint). check_layer_offsets()'s static_assert below is the guard against this drifting.
+constexpr int kHead = sub0::HAS_POS_EMB ? 2 : 1;
+constexpr int layer_base(int l) { return kHead + kLPer * l; }
+constexpr int kFinalBase = kHead + kLPer * N_LAYERS;         // index of ln_f (tail block start)
 constexpr int kLnF = 0, kLmHead = 1, kLmBias = 2;            // offsets within the tail block
 
 consteval bool check_layer_offsets() {
@@ -2749,7 +2753,7 @@ void forward_one_device(int id, int pos) {
     const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
     float* const base = g_dev_params;
     const float* tok_emb = base + L[0].off;
-    const float* pos_emb = base + L[1].off;
+    const float* pos_emb = sub0::HAS_POS_EMB ? base + L[1].off : nullptr;   // absent under RoPE
     const int    fi      = kFinalBase;
     const float* ln_f    = base + L[fi + kLnF].off;
     [[maybe_unused]] const float* lm_head = nullptr;
@@ -2819,7 +2823,7 @@ void forward_one_device_graphed() {
     const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
     float* const base = g_dev_params;
     const float* tok_emb = base + L[0].off;
-    const float* pos_emb = base + L[1].off;
+    const float* pos_emb = sub0::HAS_POS_EMB ? base + L[1].off : nullptr;   // absent under RoPE
     const int    fi      = kFinalBase;
     const float* ln_f    = base + L[fi + kLnF].off;
     [[maybe_unused]] const float* lm_head = nullptr;
@@ -2887,7 +2891,7 @@ void forward_device(int batch, int T) {
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
-    [[maybe_unused]] const float* pos_emb = base + L[1].off;
+    [[maybe_unused]] const float* pos_emb = sub0::HAS_POS_EMB ? base + L[1].off : nullptr;   // absent under RoPE
     const int    fi      = kFinalBase;          // index of ln_f
     const float* ln_f    = base + L[fi + kLnF].off;
     [[maybe_unused]] const float* lm_head = nullptr;
@@ -3135,7 +3139,7 @@ void forward_train(int batch, int T) {
     float* const base = g_dev_params;
 
     const float* tok_emb = base + L[0].off;
-    [[maybe_unused]] const float* pos_emb = base + L[1].off;
+    [[maybe_unused]] const float* pos_emb = sub0::HAS_POS_EMB ? base + L[1].off : nullptr;   // absent under RoPE
     const int    fi      = kFinalBase;
     const float* ln_f    = base + L[fi + kLnF].off;
 
@@ -5186,6 +5190,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
 // bf16 GEMM-weight mirror -- see memplan.hpp's Dims/param_floats/persistent_bytes comments).
 static constexpr sub0::memplan::Dims kFootprintDims{
     D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
+    sub0::HAS_POS_EMB, N_KV_HEADS,
 };
 
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device

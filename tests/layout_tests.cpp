@@ -15,7 +15,10 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // (..., Wg, W1, W2 -- no FFN bias, see layout.hpp). QK-norm adds 2 more per-layer slots
     // (q_norm, k_norm). Tied embeddings drops the tail from 3 (ln_f, lm_head, lm_bias) to 1
     // (ln_f alone -- the head reuses tok_emb, no separate slot).
-    STATIC_REQUIRE(sub0::NUM_PARAMS == 2 + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
+    // tok_emb is always present; pos_emb only under absolute positions (RoPE omits the table
+    // entirely -- see layout.hpp's HAS_POS_EMB, which is what decouples SEQ_LEN from the checkpoint).
+    STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
+                                        + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
                                         + (USE_QK_NORM ? 2 * N_LAYERS : 0)
                                         + (USE_TIED_EMBEDDINGS ? 1 : 3));
     REQUIRE(sub0::PARAM_LAYOUT.size() == static_cast<std::size_t>(sub0::NUM_PARAMS));
@@ -92,12 +95,22 @@ TEST_CASE("baked compute-backend facts are self-consistent", "[config]") {
 }
 
 TEST_CASE("positional encoding facts are consistent", "[config]") {
-    // RoPE (the default) injects RELATIVE position inside attention via a rotation of Q/K and
-    // carries no gradient in its layout slot; Absolute uses a learned pos_emb table added to the
-    // token embedding. Either way the scheme is one of the two enumerators, ROPE_THETA is a
-    // positive frequency base, and the position table KEEPS its layout slot across schemes (kept
-    // for checkpoint-format stability), so NUM_PARAMS is unchanged.
+    // RoPE (the default) injects RELATIVE position inside attention via a rotation of Q/K, and has
+    // NO position table at all; Absolute uses a learned pos_emb table added to the token embedding.
+    // The table used to keep its layout slot under RoPE "for format stability", allocated and zeroed
+    // and never read -- that cost SEQ_LEN*D_MODEL floats in every checkpoint AND, more importantly,
+    // made PARAM_FLOATS depend on SEQ_LEN, which pinned a model to the exact window it trained at.
     STATIC_REQUIRE((POS_ENCODING == PosEncoding::Rope || POS_ENCODING == PosEncoding::Absolute));
     STATIC_REQUIRE(ROPE_THETA > 0.0f);
-    STATIC_REQUIRE(sub0::PARAM_LAYOUT[1].kind == sub0::PKind::PosEmb);   // slot retained
+    STATIC_REQUIRE(sub0::HAS_POS_EMB == (POS_ENCODING == PosEncoding::Absolute));
+    // Written as an implication rather than an if constexpr branch: outside a template, if constexpr
+    // does NOT discard the untaken branch from semantic analysis, so a STATIC_REQUIRE inside it still
+    // fires. `||` short-circuits in a constant expression, so PARAM_LAYOUT[1] is only inspected when
+    // the table really does carry pos_emb there.
+    STATIC_REQUIRE(!sub0::HAS_POS_EMB || sub0::PARAM_LAYOUT[1].kind == sub0::PKind::PosEmb);
+    // The decoupling this buys: with no pos_emb, NO parameter tensor's shape depends on SEQ_LEN, so a
+    // checkpoint trained at one window is loadable by a binary built with a larger one. Absence of the
+    // slot IS that property, so absence is what gets asserted.
+    if constexpr (!sub0::HAS_POS_EMB)
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) REQUIRE(p.kind != sub0::PKind::PosEmb);
 }

@@ -605,9 +605,17 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
         sub0::log::warn("ignoring checkpoint '{}' (bad magic/version)", path);
         return false;
     }
+    // SEQ_LEN is skipped under RoPE for the same reason load_model skips it (engine_core.cpp): with
+    // no pos_emb table, no parameter shape depends on the window, so a checkpoint stays loadable
+    // across window sizes. The nfloat comparison below still rejects any real shape mismatch. The
+    // read must happen regardless -- the field is in the stream either way.
     bool ok = true;
-    for (int ref : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)})
-        if (rd<int>(is) != ref) ok = false;
+    int field = 0;
+    for (int ref : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) {
+        const bool is_seq_len = (field++ == 4);
+        const int got = rd<int>(is);
+        if (got != ref && !(is_seq_len && !HAS_POS_EMB)) ok = false;
+    }
     const std::uint64_t nfloat = rd<std::uint64_t>(is);
     if (!ok || nfloat != sub0::trainable_floats()) {
         sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
@@ -835,7 +843,8 @@ struct GpuTrainer {
             // tied/qk_norm/gated must match USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see
             // memplan.hpp's Dims comments.
             const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                             USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
+                                             USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
+                                             sub0::HAS_POS_EMB, N_KV_HEADS };
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
             const int free_mb = sub0_dev_free_mem_mb();
@@ -2656,7 +2665,8 @@ enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, 
 // cross-check that prediction against the device's actual usage. `tied`/`qk_norm`/`gated` must match
 // USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see memplan.hpp's Dims comments.
 static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                               USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN };
+                                               USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
+                                               sub0::HAS_POS_EMB, N_KV_HEADS };
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend,
                                         int thorough, int budget_s) {
