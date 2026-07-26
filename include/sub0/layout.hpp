@@ -32,6 +32,25 @@ inline constexpr int GQA_GROUP = N_HEADS / N_KV_HEADS;
 inline constexpr int D_KV      = N_KV_HEADS * D_HEAD;
 static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 
+// Column layout of the CUDA backend's FUSED QKV activation buffer [rows, QKV_STRIDE], which packs the
+// three projections side by side so they collapse into one GEMM. Under GQA the three sub-blocks are no
+// longer equal widths -- Q is D_MODEL, K and V are D_KV -- so the old "3*D_MODEL, sub-block s at s*C"
+// arithmetic no longer holds and is replaced by these named offsets. At N_KV_HEADS == N_HEADS they
+// evaluate to exactly the previous 3*D_MODEL / C / 2*C, so the MHA path is unchanged.
+//
+// Defined HERE rather than in backend_cuda.cu because memplan.hpp must size the same buffer and cannot
+// see the CUDA sources; memplan is included BY this header, so it takes the runtime `Dims`-based form
+// of these formulas instead (see its qkv/dqkv/dwqkv/qk_pre terms, which cite this comment). The CPU
+// backend does not fuse and so has no use for them.
+inline constexpr int QKV_STRIDE = D_MODEL + 2 * D_KV;   // total fused row width
+inline constexpr int QKV_K_OFF  = D_MODEL;              // column where the K sub-block starts
+inline constexpr int QKV_V_OFF  = D_MODEL + D_KV;       // column where the V sub-block starts
+
+// Companion stash for QK-norm's backward (the pre-norm Q/K values). Same Q|K packing as above, minus
+// the V sub-block: Q at 0 (D_MODEL wide), K at QK_PRE_K_OFF (D_KV wide).
+inline constexpr int QK_PRE_STRIDE = D_MODEL + D_KV;
+inline constexpr int QK_PRE_K_OFF  = D_MODEL;
+
 // Under RoPE there is no position table at all: RoPE injects position inside attention, so a
 // [SEQ_LEN, D_MODEL] pos_emb would be allocated, zeroed, serialized and never read. Omitting it is
 // not just a saving -- it DECOUPLES SEQ_LEN from the checkpoint. With no pos_emb, no parameter

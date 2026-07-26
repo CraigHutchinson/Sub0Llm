@@ -636,22 +636,24 @@ rmsnorm_train_act_kernel(const X* __restrict__ x, const float* __restrict__ gamm
 // one-thread-per-query variant survives only as attn_train_act_kernel, kept as the on-device parity
 // REFERENCE the self-test compares the tiled kernel against (sub0_cuda_attn_check).
 
-// Build the fused QKV weight Wqkv[C, 3C] (row-major) from Wq,Wk,Wv [C,C]: row p holds
-// [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
-// into one a . Wqkv -> [M, 3C] (better-shaped GEMM + fewer launches).
-// C is D_MODEL at its one call site -- constexpr-folded, so the p=idx/C, c=idx%C split (GPU integer
-// div/mod has no native instruction) resolves at compile time instead of once per thread per layer.
+// Build the fused QKV weight Wqkv[C, QKV_STRIDE] (row-major) from Wq [C,C] and Wk,Wv [C,D_KV]: row p
+// holds [Wq[p] | Wk[p] | Wv[p]]. Materialized ONCE at upload so the three projection GEMMs collapse
+// into one a . Wqkv -> [M, QKV_STRIDE] (better-shaped GEMM + fewer launches).
+// Under GQA the three sub-blocks have DIFFERENT widths (see layout.hpp's QKV_* constants), so the
+// thread mapping is one thread per FUSED-matrix element -- each thread resolving which source matrix
+// its column falls in -- rather than the old one-thread-does-all-three-writes over a shared [C,C]
+// index. Under MHA the two are the same set of writes. C/D_KV/QKV_STRIDE are constexpr at the one
+// call site, so the p=idx/W, c=idx%W split (GPU integer div/mod has no native instruction) still
+// resolves at compile time instead of once per thread per layer.
 __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __restrict__ Wk,
                                  const float* __restrict__ Wv, float* __restrict__ Wqkv) {
-    constexpr int C = D_MODEL;
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over C*C elements of one source matrix
-    if (idx < C * C) {
-        const int p = idx / C, c = idx % C;
-        const int row = p * 3 * C;
-        Wqkv[row + c]         = Wq[idx];
-        Wqkv[row + C + c]     = Wk[idx];
-        Wqkv[row + 2 * C + c] = Wv[idx];
-    }
+    constexpr int C = D_MODEL, KV = sub0::D_KV, W = sub0::QKV_STRIDE;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over the C*W elements of the FUSED matrix
+    if (idx >= C * W) return;
+    const int p = idx / W, c = idx - p * W;                  // fused row, fused column
+    if (c < C)            Wqkv[idx] = Wq[static_cast<size_t>(p) * C  + c];
+    else if (c < C + KV)  Wqkv[idx] = Wk[static_cast<size_t>(p) * KV + (c - C)];
+    else                  Wqkv[idx] = Wv[static_cast<size_t>(p) * KV + (c - C - KV)];
 }
 
 // Same fused layout, writing DIRECTLY to the activation (bf16) mirror instead of staging through an
@@ -661,44 +663,59 @@ __global__ void build_qkv_kernel(const float* __restrict__ Wq, const float* __re
 template <class A>
 __global__ void build_qkv_act_kernel(const float* __restrict__ Wq, const float* __restrict__ Wk,
                                      const float* __restrict__ Wv, A* __restrict__ Wqkv) {
-    constexpr int C = D_MODEL;
+    constexpr int C = D_MODEL, KV = sub0::D_KV, W = sub0::QKV_STRIDE;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < C * C) {
-        const int p = idx / C, c = idx % C;
-        const int row = p * 3 * C;
-        st_act(&Wqkv[row + c],         Wq[idx]);
-        st_act(&Wqkv[row + C + c],     Wk[idx]);
-        st_act(&Wqkv[row + 2 * C + c], Wv[idx]);
-    }
+    if (idx >= C * W) return;
+    const int p = idx / W, c = idx - p * W;
+    if (c < C)            st_act(&Wqkv[idx], Wq[static_cast<size_t>(p) * C  + c]);
+    else if (c < C + KV)  st_act(&Wqkv[idx], Wk[static_cast<size_t>(p) * KV + (c - C)]);
+    else                  st_act(&Wqkv[idx], Wv[static_cast<size_t>(p) * KV + (c - C - KV)]);
 }
 
-// RoPE forward: rotate the Q and K sub-blocks (columns [0,C) and [C,2C)) of the fused [*, 3C]
-// qkv buffer in place, in interleaved pairs per head; V (cols [2C,3C)) is left alone. One thread
-// per (row m, global pair pg over C/2). pos = m % T (position within the window). Mirrors the CPU
+// RoPE forward: rotate the Q and K sub-blocks (columns [0,D_MODEL) and [QKV_K_OFF, QKV_V_OFF)) of the
+// fused [*, QKV_STRIDE] qkv buffer in place, in interleaved pairs per head; V is left alone. One thread
+// per (row m, pair pg, sub-block z). pos = m % T (position within the window). Mirrors the CPU
 // op_rope; the math (CUDA __sincosf/powf vs CPU std::) agrees to fast-math tolerance.
+//
+// GQA note: this kernel used to have a SINGLE thread rotate the Q pair and the K pair at the same
+// (head, pair) index, which is only valid while Q and K have the same head count. They do not under
+// GQA, so the Q and K passes are now separate, selected by blockIdx.z -- the same idiom
+// qknorm_act_kernel below already uses for exactly this Q-vs-K split, rather than a new mechanism.
 //
 // C, H, in_stride are D_MODEL/N_HEADS/3*D_MODEL at every call site (confirmed by grep) -- baked
 // constexpr, so used directly instead of as parameters. This also folds `d = C/H` from a per-thread
 // runtime division into the already-baked D_HEAD constant (GPU integer div/mod has no native
 // instruction; this ran over M*D_MODEL/2 threads every layer, every forward AND backward pass under
 // RoPE). T/batch stay runtime (genuinely vary, same as ce_backward_kernel's T).
-__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta) {
-    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL;
+// Rotate ONE sub-block (blockIdx.z: 0 = Q, 1 = K) of the fused row, in interleaved pairs per head.
+// Shared by all three RoPE kernels so the forward, the act-typed forward and the backward cannot drift.
+// `sign` is +1 forward, -1 backward (the adjoint of a rotation is the rotation by -angle).
+template <class A>
+__device__ inline void rope_pair_body(A* __restrict__ row, int pos, float theta, int pg,
+                                      int which, float sign) {
     constexpr int d = D_HEAD, half = d / 2;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x;   // pair over C/2 (heads x d/2)
-    const int m  = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
-    if (m >= batch * T || pg >= C / 2) return;
-    const int h  = pg / half, mi = pg % half;
-    const int a0 = h * d + 2 * mi;
-    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
+    const int base = which == 0 ? 0 : sub0::QKV_K_OFF;
+    const int h    = pg / half, mi = pg % half;
+    const int a0   = base + h * d + 2 * mi;
+    const float ang = (static_cast<float>(pos) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
     float sn, cs; __sincosf(ang, &sn, &cs);
-    float* row = qkv + static_cast<size_t>(m) * in_stride;
-    const float q0 = row[a0],     q1 = row[a0 + 1];
-    row[a0]         = q0 * cs - q1 * sn;
-    row[a0 + 1]     = q0 * sn + q1 * cs;
-    const float k0 = row[C + a0], k1 = row[C + a0 + 1];
-    row[C + a0]     = k0 * cs - k1 * sn;
-    row[C + a0 + 1] = k0 * sn + k1 * cs;
+    sn *= sign;                                     // sign = -1 gives the rotation's transpose (backward)
+    const float x0 = to_f32(row[a0]), x1 = to_f32(row[a0 + 1]);
+    st_act(&row[a0],     x0 * cs - x1 * sn);
+    st_act(&row[a0 + 1], x0 * sn + x1 * cs);
+}
+// Pairs in the sub-block selected by blockIdx.z. Q is D_MODEL wide, K is D_KV wide -- equal only under
+// MHA -- so the grid is sized for the WIDER of the two and the narrower sub-block early-outs.
+__device__ inline int rope_sub_pairs(int which) {
+    return (which == 0 ? D_MODEL : sub0::D_KV) / 2;
+}
+__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta) {
+    constexpr int in_stride = sub0::QKV_STRIDE;
+    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;   // pair within this sub-block
+    const int m     = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
+    const int which = blockIdx.z;                              // 0 = Q, 1 = K (V is never rotated)
+    if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
+    rope_pair_body(qkv + static_cast<size_t>(m) * in_stride, m % T, theta, pg, which, +1.0f);
 }
 
 // QK-norm forward (USE_QK_NORM, op_qknorm/qknorm_row in backend_cpu.cpp): RMSNorm applied
@@ -713,14 +730,15 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float the
 // shuffle-reduce (block_reduce_sum's BLOCK<=32 path, no cross-warp shared-memory step needed) covers
 // it. H/DH are template params (not D_MODEL/N_HEADS/D_HEAD directly) so the dims-independent CUDA
 // self-test can instantiate a toy shape in the SAME binary as the baked production shape.
-template <class A, int H, int DH, int BLOCK>
+template <class A, int H, int KVH, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
-    constexpr int   C     = H * DH, in_stride = 3 * C;
+    constexpr int   C     = H * DH, CKV = KVH * DH, in_stride = C + 2 * CKV;
     constexpr float invDH = 1.0f / static_cast<float>(DH);
     constexpr float eps   = 1e-5f;
     const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;   // which: 0 = Q, 1 = K
-    const int off = which * C + h * DH;
+    if (which != 0 && h >= KVH) return;   // K has fewer heads than Q under GQA; whole block exits together
+    const int off = (which == 0) ? (h * DH) : (C + h * DH);
     A* xr = qkv + static_cast<size_t>(row) * in_stride + off;
     const float* g = (which == 0) ? qgamma : kgamma;
     float partial = 0.f;
@@ -739,15 +757,17 @@ qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const f
 // in this file's resident scratch still holds the pre-norm values by the time qknorm_backward_act_kernel
 // needs them (RoPE's own backward runs first, since RoPE sits AFTER qknorm in the forward graph) --
 // see the TrainScratch::qk_pre comment in memplan.hpp's train_scratch_bytes for the full reasoning.
-template <class A, int H, int DH, int BLOCK>
+template <class A, int H, int KVH, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 qknorm_save_act_kernel(A* __restrict__ qkv, A* __restrict__ qk_pre,
                        const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
-    constexpr int   C        = H * DH, in_stride = 3 * C, pre_stride = 2 * C;
+    constexpr int   C        = H * DH, CKV = KVH * DH;
+    constexpr int   in_stride = C + 2 * CKV, pre_stride = C + CKV;
     constexpr float invDH    = 1.0f / static_cast<float>(DH);
     constexpr float eps      = 1e-5f;
     const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;
-    const int off = which * C + h * DH;
+    if (which != 0 && h >= KVH) return;
+    const int off = (which == 0) ? (h * DH) : (C + h * DH);
     A* xr = qkv    + static_cast<size_t>(row) * in_stride  + off;
     A* pr = qk_pre + static_cast<size_t>(row) * pre_stride + off;
     const float* g = (which == 0) ? qgamma : kgamma;
@@ -772,19 +792,20 @@ qknorm_save_act_kernel(A* __restrict__ qkv, A* __restrict__ qk_pre,
 template <class A>
 __global__ void attn_train_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
                                        const A* __restrict__ v, A* __restrict__ out,
-                                       int batch, int T, int C, int H, int in_stride) {
+                                       int batch, int T, int C, int H, int in_stride, int kv_group) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x; const int per = H * T;
     const int b = idx / per; if (b >= batch) return;
     const int rem = idx - b * per, h = rem / T, i = rem % T, d = C / H, off = h * d;
+    const int kv_off = (h / kv_group) * d;      // GQA: this query head's shared KV head (== off at group 1)
     const float scale = 1.0f / sqrtf(static_cast<float>(d));
     const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
     const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
     float m = -1e30f, Z = 0.f, acc[128] = {};
     for (int j = 0; j <= i; ++j) {
-        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + kv_off;
         float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
         const float mn = fmaxf(m, s), c = __expf(m - mn), e = __expf(s - mn); Z = Z * c + e;
-        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
+        const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + kv_off;
         for (int a = 0; a < d; ++a) acc[a] = acc[a] * c + e * to_f32(vj[a]); m = mn;
     }
     A* oi = out + out_base + static_cast<size_t>(i) * C + off; const float invZ = 1.f / Z;
@@ -865,13 +886,14 @@ template <int HD> __host__ __device__ constexpr int attn_dk_lanes() { return (3 
 template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(attn_block_q<HD>())
 attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
-                      A* __restrict__ out, int T, int C, int in_stride) {
+                      A* __restrict__ out, int T, int C, int in_stride, int kv_group) {
     __shared__ float Ks[TILE_K * HD];
     __shared__ float Vs[TILE_K * HD];
     const int    b  = blockIdx.z, h = blockIdx.y;
     const int    q0 = blockIdx.x * blockDim.x;               // first query of this block
     const int    i  = q0 + threadIdx.x;                      // this thread's query (block owns one (b,h))
-    const int    off = h * HD;
+    const int    off = h * HD;                               // Q (and out) offset -- per QUERY head
+    const int    kv_off = (h / kv_group) * HD;               // K/V offset -- per KV head (== off at group 1)
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
@@ -892,7 +914,7 @@ attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
         __syncthreads();
         for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) { // cooperative K/V tile load (all threads)
             const int    jl  = e / HD, a = e - jl * HD;
-            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + kv_off;
             Ks[e] = to_f32(k[row + a]);
             Vs[e] = to_f32(v[row + a]);
         }
@@ -922,26 +944,21 @@ attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
     }
 }
 
-// C/H/in_stride constexpr-folded (D_MODEL/N_HEADS/3*D_MODEL, every call site) -- see rope_kernel above.
+// act-typed RoPE forward/backward -- both delegate to rope_pair_body above, which is the ONE place
+// the angle and the rotation live (the backward is the same rotation with sign = -1, i.e. its transpose).
 template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, float theta) {
-    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL, d = D_HEAD, half = d / 2;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m >= batch * T || pg >= C / 2) return;
-    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
-    A* row = qkv + static_cast<size_t>(m) * in_stride;
-    const float q0 = to_f32(row[a0]), q1 = to_f32(row[a0 + 1]); st_act(&row[a0], q0*cs-q1*sn); st_act(&row[a0+1], q0*sn+q1*cs);
-    const float k0 = to_f32(row[C+a0]), k1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], k0*cs-k1*sn); st_act(&row[C+a0+1], k0*sn+k1*cs);
+    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m     = blockIdx.y * blockDim.y + threadIdx.y;
+    const int which = blockIdx.z;
+    if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
+    rope_pair_body(qkv + static_cast<size_t>(m) * sub0::QKV_STRIDE, m % T, theta, pg, which, +1.0f);
 }
 template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, float theta) {
-    constexpr int C = D_MODEL, in_stride = 3 * D_MODEL, d = D_HEAD, half = d / 2;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m >= batch * T || pg >= C / 2) return;
-    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
-    A* row = dq + static_cast<size_t>(m) * in_stride;
-    const float g0 = to_f32(row[a0]), g1 = to_f32(row[a0+1]); st_act(&row[a0], g0*cs+g1*sn); st_act(&row[a0+1], -g0*sn+g1*cs);
-    const float h0 = to_f32(row[C+a0]), h1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], h0*cs+h1*sn); st_act(&row[C+a0+1], -h0*sn+h1*cs);
+    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m     = blockIdx.y * blockDim.y + threadIdx.y;
+    const int which = blockIdx.z;
+    if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
+    rope_pair_body(dq + static_cast<size_t>(m) * sub0::QKV_STRIDE, m % T, theta, pg, which, -1.0f);
 }
 
 // Cross-entropy backward (op_cross_entropy): one BLOCK per row m over [M,V], threads striding
@@ -1173,23 +1190,25 @@ rmsnorm_backward_act_kernel(const X* __restrict__ x, const float* __restrict__ g
 // is no reason to keep row and head on separate axes once the goal is cutting the address's total
 // writer count. `which` (Q vs K) stays a distinct grid.z, since Q and K write to DIFFERENT gamma buffers
 // (dqgamma/dkgamma) with no shared contention to fold together.
-template <class A, int H, int DH, int BLOCK>
+template <class A, int H, int KVH, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 qknorm_backward_act_kernel(const A* __restrict__ qk_pre, const float* __restrict__ qgamma,
                            const float* __restrict__ kgamma, A* __restrict__ dqkv,
                            float* __restrict__ dqgamma, float* __restrict__ dkgamma, int rows) {
-    constexpr int   C        = H * DH, in_stride = 3 * C, pre_stride = 2 * C;
+    constexpr int   C        = H * DH, CKV = KVH * DH;
+    constexpr int   in_stride = C + 2 * CKV, pre_stride = C + CKV;
     constexpr float invDH    = 1.0f / static_cast<float>(DH);
     constexpr float eps      = 1e-5f;
     constexpr int   NJ       = (DH + BLOCK - 1) / BLOCK;   // dgamma channels owned per thread (ceil)
     const int which = blockIdx.z;
     const float* g  = (which == 0) ? qgamma  : kgamma;
     float*       dg = (which == 0) ? dqgamma : dkgamma;
-    const int total = rows * H;                            // flattened (row,head) grid-stride extent
+    const int NH    = (which == 0) ? H : KVH;              // K covers fewer heads than Q under GQA
+    const int total = rows * NH;                           // flattened (row,head) grid-stride extent
     float dg_acc[NJ] = {};
     for (int rh = blockIdx.x; rh < total; rh += gridDim.x) {
-        const int row = rh / H, h = rh % H;
-        const int off = which * C + h * DH;
+        const int row = rh / NH, h = rh - row * NH;
+        const int off = (which == 0) ? (h * DH) : (C + h * DH);
         const A* xr  = qk_pre + static_cast<size_t>(row) * pre_stride + off;
         A*       dyr = dqkv   + static_cast<size_t>(row) * in_stride  + off;   // in: dy, out: dx (in place)
         float ms = 0.f, S = 0.f;
@@ -1230,11 +1249,11 @@ template <class X> inline int rmsnorm_bwd_blocks_per_sm() {
     }
     return cached;
 }
-template <class A, int H, int DH> inline int qknorm_bwd_blocks_per_sm() {
+template <class A, int H, int KVH, int DH> inline int qknorm_bwd_blocks_per_sm() {
     static int cached = 0;
     if (cached == 0) {
         int blocks = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, qknorm_backward_act_kernel<A, H, DH, 32>, 32, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, qknorm_backward_act_kernel<A, H, KVH, DH, 32>, 32, 0);
         cached = (blocks > 0) ? blocks : 1;
     }
     return cached;
@@ -1263,35 +1282,43 @@ template <class A>
 __global__ void attn_backward_head_act_kernel(const A* __restrict__ q, const A* __restrict__ k,
                                           const A* __restrict__ v, const A* __restrict__ dout,
                                           A* __restrict__ dq, A* __restrict__ dk, A* __restrict__ dv,
-                                          int batch, int T, int C, int H, int in_stride) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch * H) return;
-    const int b = idx / H, h = idx % H, d = C / H, off = h * d;
+                                          int batch, int T, int C, int H, int in_stride, int kv_group) {
+    const int HKV = H / kv_group;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch * HKV) return;
+    // One thread per (batch, KV head), looping over that head's query group. Under MHA kv_group == 1
+    // and this is exactly the old one-thread-per-(batch,head) reference. Under GQA the group MUST be
+    // serialized inside one thread: dk/dv rows are SHARED by the group and this kernel accumulates
+    // into them with +=, so splitting the group across threads would be a read-modify-write race.
+    const int b = idx / HKV, hk = idx % HKV, d = C / H;
+    const int kv_off = hk * d;
     const float scale = 1.0f / sqrtf(static_cast<float>(d));
     const size_t in_base = static_cast<size_t>(b) * T * in_stride, out_base = static_cast<size_t>(b) * T * C;
+    for (int g = 0; g < kv_group; ++g) {
+    const int off = (hk * kv_group + g) * d;                 // this query head's Q/dout/dq offset
     for (int i = 0; i < T; ++i) {
         const A* qi = q + in_base + static_cast<size_t>(i) * in_stride + off;
         const A* di = dout + out_base + static_cast<size_t>(i) * C + off;
         float m = -1e30f, Z = 0.f;
-        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + kv_off;
             float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]); s *= scale;
             const float mn = fmaxf(m, s); Z = Z * __expf(m - mn) + __expf(s - mn); m = mn; }
         const float invZ = 1.f / Z; float dot = 0.f;
-        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + kv_off;
             float s = 0.f; for (int a = 0; a < d; ++a) s += to_f32(qi[a]) * to_f32(kj[a]);
-            const float p = __expf(s * scale - m) * invZ; const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off;
-            A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off; float dp = 0.f;
+            const float p = __expf(s * scale - m) * invZ; const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + kv_off;
+            A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + kv_off; float dp = 0.f;
             for (int a = 0; a < d; ++a) { st_act(&dvj[a], to_f32(dvj[a]) + p * to_f32(di[a])); dp += to_f32(di[a]) * to_f32(vj[a]); }
             dot += p * dp; }
         A* dqi = dq + in_base + static_cast<size_t>(i) * in_stride + off;
-        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
-            const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + off; float s = 0.f, dp = 0.f;
+        for (int j = 0; j <= i; ++j) { const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + kv_off;
+            const A* vj = v + in_base + static_cast<size_t>(j) * in_stride + kv_off; float s = 0.f, dp = 0.f;
             for (int a = 0; a < d; ++a) { s += to_f32(qi[a]) * to_f32(kj[a]); dp += to_f32(di[a]) * to_f32(vj[a]); }
             const float p = __expf(s * scale - m) * invZ, ds = p * (dp - dot) * scale;
-            A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + off;
+            A* dkj = dk + in_base + static_cast<size_t>(j) * in_stride + kv_off;
             for (int a = 0; a < d; ++a) { st_act(&dqi[a], to_f32(dqi[a]) + ds * to_f32(kj[a])); st_act(&dkj[a], to_f32(dkj[a]) + ds * to_f32(qi[a])); } }
     }
+    }
 }
-
 // ---- Flash-style TILED attention BACKWARD (the hot-path replacement for the two naive kernels) ----
 // The naive kernels above are either low-parallelism (head-per-thread: only batch*H threads) or
 // atomic-heavy (query-per-thread: bf16 RMW races), and both re-stream K/V/Q from global O(T) times.
@@ -1311,12 +1338,13 @@ template <class A, int HD, int TILE_K>
 __global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                       const A* __restrict__ dout, float* __restrict__ stat_m, float* __restrict__ stat_invZ,
-                      float* __restrict__ stat_dot, int T, int C, int in_stride) {
+                      float* __restrict__ stat_dot, int T, int C, int in_stride, int kv_group) {
     __shared__ float Ks[TILE_K * HD];
     __shared__ float Vs[TILE_K * HD];
     const int    b = blockIdx.z, h = blockIdx.y;
     const int    q0 = blockIdx.x * blockDim.x, i = q0 + threadIdx.x;
-    const int    off = h * HD;
+    const int    off = h * HD;                               // Q / dout offset -- per QUERY head
+    const int    kv_off = (h / kv_group) * HD;               // K/V offset -- per KV head
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
@@ -1334,7 +1362,7 @@ attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
         __syncthreads();
         for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
             const int jl = e / HD, a = e - jl * HD;
-            Ks[e] = to_f32(k[in_base + static_cast<size_t>(j0 + jl) * in_stride + off + a]); }
+            Ks[e] = to_f32(k[in_base + static_cast<size_t>(j0 + jl) * in_stride + kv_off + a]); }
         __syncthreads();
         if (i < T) { const int jend = min(tk, i - j0 + 1);
             for (int jl = 0; jl < jend; ++jl) { const float* ks = Ks + jl * HD;
@@ -1351,7 +1379,7 @@ attn_bwd_stats_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
         __syncthreads();
         for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
             const int jl = e / HD, a = e - jl * HD;
-            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + off;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + kv_off;
             Ks[e] = to_f32(k[row + a]); Vs[e] = to_f32(v[row + a]); }
         __syncthreads();
         if (i < T) { const int jend = min(tk, i - j0 + 1);
@@ -1379,7 +1407,7 @@ __global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
-                   A* __restrict__ dq, int T, int C, int in_stride) {
+                   A* __restrict__ dq, int T, int C, int in_stride, int kv_group) {
     constexpr int LANES = attn_dq_lanes<HD>();
     constexpr int HALF  = HD / LANES;
     __shared__ float Ks[TILE_K * HD];
@@ -1388,8 +1416,8 @@ attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
     const int    lane     = threadIdx.x % LANES;              // which HALF-channel slice this thread owns
     const int    qi_local = threadIdx.x / LANES;               // this pair's query slot within the block
     const int    q0 = blockIdx.x * (static_cast<int>(blockDim.x) / LANES), i = q0 + qi_local;
-    const int    stage_off = h * HD;                           // unshifted: Ks/Vs staging covers the FULL HD
-    const int    off = stage_off + lane * HALF;                 // shifted: this thread's own channel half
+    const int    kv_stage_off = (h / kv_group) * HD;           // K/V staging -- per KV head, FULL HD
+    const int    off = h * HD + lane * HALF;                    // Q/dout/dq -- per QUERY head, own channel half
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
@@ -1409,7 +1437,7 @@ attn_bwd_dq_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
         __syncthreads();
         for (int e = threadIdx.x; e < tk * HD; e += blockDim.x) {
             const int jl = e / HD, a = e - jl * HD;
-            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + stage_off;
+            const size_t row = in_base + static_cast<size_t>(j0 + jl) * in_stride + kv_stage_off;
             Ks[e] = to_f32(k[row + a]); Vs[e] = to_f32(v[row + a]); }
         __syncthreads();
         if (i < T) { const int jend = min(tk, i - j0 + 1);
@@ -1453,47 +1481,54 @@ __global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dv_kernel(const A* __restrict__ q, const A* __restrict__ k,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ,
-                   A* __restrict__ dv, int T, int C, int in_stride) {
+                   A* __restrict__ dv, int T, int C, int in_stride, int kv_group, int H) {
     __shared__ float Qs[TILE_Q * HD];
     __shared__ float Ds[TILE_Q * HD];
     __shared__ float Sm[TILE_Q], Sz[TILE_Q];
-    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    b = blockIdx.z, hk = blockIdx.y;                         // blockIdx.y is the KV head
     const int    k0 = blockIdx.x * blockDim.x, j = k0 + threadIdx.x;      // this thread's KEY
-    const int    off = h * HD;
+    const int    kv_off = hk * HD;
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
     float kr[HD], dva[HD];
     if (j < T) {
-        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + off;
+        const A* kj = k + in_base + static_cast<size_t>(j) * in_stride + kv_off;
         #pragma unroll
         for (int a = 0; a < HD; ++a) { kr[a] = to_f32(kj[a]); dva[a] = 0.f; }
     }
-    for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
-        const int ti = min(TILE_Q, T - i0);
-        __syncthreads();
-        for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
-            const int il = e / HD, a = e - il * HD;
-            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + off + a]);
-            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + off + a]); }
-        for (int il = threadIdx.x; il < ti; il += blockDim.x) {
-            const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + (i0 + il);
-            Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; }
-        __syncthreads();
-        if (j < T) {
-            for (int il = 0; il < ti; ++il) { const int i = i0 + il;
-                if (i < j) continue;                                     // causal: key j only seen by i >= j
-                const float* qs = Qs + il * HD; const float* dsr = Ds + il * HD;
-                float s = 0.f;
-                #pragma unroll
-                for (int a = 0; a < HD; ++a) s += qs[a] * kr[a];
-                const float p = __expf(s * scale - Sm[il]) * Sz[il];
-                #pragma unroll
-                for (int a = 0; a < HD; ++a) dva[a] += p * dsr[a]; }
+    // Every query head sharing this KV head contributes to the SAME dv_j, so they are summed here in
+    // registers rather than written separately -- that is what keeps the write atomic-free (see the
+    // launcher's comment). kv_group is grid-uniform, so the __syncthreads() below stay collective.
+    for (int g = 0; g < kv_group; ++g) {
+        const int h = hk * kv_group + g;                                  // query head
+        const int q_off = h * HD;
+        for (int i0 = k0; i0 < T; i0 += TILE_Q) {                         // only queries i >= j = k0..
+            const int ti = min(TILE_Q, T - i0);
+            __syncthreads();
+            for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
+                const int il = e / HD, a = e - il * HD;
+                Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + q_off + a]);
+                Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + q_off + a]); }
+            for (int il = threadIdx.x; il < ti; il += blockDim.x) {
+                const size_t sidx = (static_cast<size_t>(b) * H + h) * T + (i0 + il);   // stats are per QUERY head
+                Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; }
+            __syncthreads();
+            if (j < T) {
+                for (int il = 0; il < ti; ++il) { const int i = i0 + il;
+                    if (i < j) continue;                                 // causal: key j only seen by i >= j
+                    const float* qs = Qs + il * HD; const float* dsr = Ds + il * HD;
+                    float s = 0.f;
+                    #pragma unroll
+                    for (int a = 0; a < HD; ++a) s += qs[a] * kr[a];
+                    const float p = __expf(s * scale - Sm[il]) * Sz[il];
+                    #pragma unroll
+                    for (int a = 0; a < HD; ++a) dva[a] += p * dsr[a]; }
+            }
         }
     }
     if (j < T) {
-        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + off;
+        A* dvj = dv + in_base + static_cast<size_t>(j) * in_stride + kv_off;
         #pragma unroll
         for (int a = 0; a < HD; ++a) st_act(&dvj[a], dva[a]);
     }
@@ -1510,18 +1545,17 @@ __global__ void __launch_bounds__(attn_block_q<HD>())
 attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __restrict__ v,
                    const A* __restrict__ dout, const float* __restrict__ stat_m,
                    const float* __restrict__ stat_invZ, const float* __restrict__ stat_dot,
-                   A* __restrict__ dk, int T, int C, int in_stride) {
+                   A* __restrict__ dk, int T, int C, int in_stride, int kv_group, int H) {
     constexpr int LANES = attn_dk_lanes<HD>();
     constexpr int HALF  = HD / LANES;
     __shared__ float Qs[TILE_Q * HD];
     __shared__ float Ds[TILE_Q * HD];
     __shared__ float Sm[TILE_Q], Sz[TILE_Q], Sd[TILE_Q];
-    const int    b = blockIdx.z, h = blockIdx.y;
+    const int    b = blockIdx.z, hk = blockIdx.y;             // blockIdx.y is the KV head
     const int    lane    = threadIdx.x % LANES;               // which HALF-channel slice this thread owns
     const int    j_local = threadIdx.x / LANES;                // this pair's key slot within the block
     const int    k0 = blockIdx.x * (static_cast<int>(blockDim.x) / LANES), j = k0 + j_local;  // this thread's KEY
-    const int    stage_off = h * HD;                           // unshifted: Qs/Ds staging covers the FULL HD
-    const int    off = stage_off + lane * HALF;                 // shifted: this thread's own channel half
+    const int    off = hk * HD + lane * HALF;                  // this thread's own channel half of the KV head
     const float  scale    = rsqrtf(static_cast<float>(HD));
     const size_t in_base  = static_cast<size_t>(b) * T * in_stride;
     const size_t out_base = static_cast<size_t>(b) * T * C;
@@ -1532,33 +1566,39 @@ attn_bwd_dk_kernel(const A* __restrict__ q, const A* __restrict__ k, const A* __
         #pragma unroll
         for (int a = 0; a < HALF; ++a) { kr[a] = to_f32(kj[a]); vr[a] = to_f32(vj[a]); dka[a] = 0.f; }
     }
-    for (int i0 = k0; i0 < T; i0 += TILE_Q) {                             // only queries i >= j = k0..
-        const int ti = min(TILE_Q, T - i0);
-        __syncthreads();
-        for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
-            const int il = e / HD, a = e - il * HD;
-            Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + stage_off + a]);
-            Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + stage_off + a]); }
-        for (int il = threadIdx.x; il < ti; il += blockDim.x) {
-            const size_t sidx = (static_cast<size_t>(b) * gridDim.y + h) * T + (i0 + il);
-            Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; Sd[il] = stat_dot[sidx]; }
-        __syncthreads();
-        if (j < T) {
-            for (int il = 0; il < ti; ++il) { const int i = i0 + il;
-                if (i < j) continue;                                     // causal: key j only seen by i >= j
-                const float* qs = Qs + il * HD + lane * HALF;    // this thread's channel half of query i
-                const float* dsr = Ds + il * HD + lane * HALF;
-                float s = 0.f, dp = 0.f;
-                #pragma unroll
-                for (int a = 0; a < HALF; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
-                if constexpr (LANES > 1) {                      // combine the two lanes' partial dot products
-                    const unsigned mask = __activemask();       // pair is always both-active or both-inactive
-                    s  += __shfl_xor_sync(mask, s,  1);          // (same key j -> same j<T / i<j branch outcome)
-                    dp += __shfl_xor_sync(mask, dp, 1);
-                }
-                const float p = __expf(s * scale - Sm[il]) * Sz[il], dsc = p * (dp - Sd[il]) * scale;
-                #pragma unroll
-                for (int a = 0; a < HALF; ++a) dka[a] += dsc * qs[a]; }
+    // Same grouping as attn_bwd_dv_kernel: every query head sharing this KV head folds into the SAME
+    // dk_j, summed in registers so the final write stays exclusively owned (atomic-free).
+    for (int g = 0; g < kv_group; ++g) {
+        const int h = hk * kv_group + g;                                  // query head
+        const int stage_off = h * HD;                          // unshifted: Qs/Ds staging covers the FULL HD
+        for (int i0 = k0; i0 < T; i0 += TILE_Q) {                         // only queries i >= j = k0..
+            const int ti = min(TILE_Q, T - i0);
+            __syncthreads();
+            for (int e = threadIdx.x; e < ti * HD; e += blockDim.x) {
+                const int il = e / HD, a = e - il * HD;
+                Qs[e] = to_f32(q[in_base + static_cast<size_t>(i0 + il) * in_stride + stage_off + a]);
+                Ds[e] = to_f32(dout[out_base + static_cast<size_t>(i0 + il) * C + stage_off + a]); }
+            for (int il = threadIdx.x; il < ti; il += blockDim.x) {
+                const size_t sidx = (static_cast<size_t>(b) * H + h) * T + (i0 + il);   // stats are per QUERY head
+                Sm[il] = stat_m[sidx]; Sz[il] = stat_invZ[sidx]; Sd[il] = stat_dot[sidx]; }
+            __syncthreads();
+            if (j < T) {
+                for (int il = 0; il < ti; ++il) { const int i = i0 + il;
+                    if (i < j) continue;                                 // causal: key j only seen by i >= j
+                    const float* qs = Qs + il * HD + lane * HALF;    // this thread's channel half of query i
+                    const float* dsr = Ds + il * HD + lane * HALF;
+                    float s = 0.f, dp = 0.f;
+                    #pragma unroll
+                    for (int a = 0; a < HALF; ++a) { s += qs[a] * kr[a]; dp += dsr[a] * vr[a]; }
+                    if constexpr (LANES > 1) {                  // combine the two lanes' partial dot products
+                        const unsigned mask = __activemask();   // pair is always both-active or both-inactive
+                        s  += __shfl_xor_sync(mask, s,  1);      // (same key j -> same j<T / i<j branch outcome)
+                        dp += __shfl_xor_sync(mask, dp, 1);
+                    }
+                    const float p = __expf(s * scale - Sm[il]) * Sz[il], dsc = p * (dp - Sd[il]) * scale;
+                    #pragma unroll
+                    for (int a = 0; a < HALF; ++a) dka[a] += dsc * qs[a]; }
+            }
         }
     }
     if (j < T) {
@@ -1609,20 +1649,19 @@ __global__ void embed_backward_token_kernel(const float* __restrict__ dh, const 
     }
 }
 
-// Split the fused QKV weight gradient dWqkv[C,3C] back into the per-projection grads dWq/dWk/dWv
-// [C,C] at their param-blob offsets (inverse of build_qkv_kernel). One thread per [C,C] element.
-// C is D_MODEL at its one call site -- constexpr-folded, same div/mod-fold reasoning as above.
+// Split the fused QKV weight gradient dWqkv[C,QKV_STRIDE] back into the per-projection grads dWq [C,C]
+// and dWk/dWv [C,D_KV] at their param-blob offsets (inverse of build_qkv_kernel). One thread per FUSED
+// element, matching build_qkv_kernel's mapping so the two stay obviously inverse under GQA's unequal
+// sub-block widths. Constexpr-folded at its one call site, same div/mod reasoning as above.
 __global__ void split_dqkv_kernel(const float* __restrict__ dWqkv, float* __restrict__ dWq,
                                   float* __restrict__ dWk, float* __restrict__ dWv) {
-    constexpr int C = D_MODEL;
+    constexpr int C = D_MODEL, KV = sub0::D_KV, W = sub0::QKV_STRIDE;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < C * C) {
-        const int p = idx / C, c = idx % C;
-        const int row = p * 3 * C;
-        dWq[idx] = dWqkv[row + c];
-        dWk[idx] = dWqkv[row + C + c];
-        dWv[idx] = dWqkv[row + 2 * C + c];
-    }
+    if (idx >= C * W) return;
+    const int p = idx / W, c = idx - p * W;
+    if (c < C)            dWq[static_cast<size_t>(p) * C  + c]             = dWqkv[idx];
+    else if (c < C + KV)  dWk[static_cast<size_t>(p) * KV + (c - C)]       = dWqkv[idx];
+    else                  dWv[static_cast<size_t>(p) * KV + (c - C - KV)]  = dWqkv[idx];
 }
 
 // AdamW: block-reduce sum of grad^2 into a double accumulator (matches the CPU double-precision
@@ -1971,30 +2010,33 @@ inline void launch_swiglu_bwd_t(const A* gate, const A* up, const A* dy, A* dgat
     swiglu_backward_act_kernel<A><<<(n + block - 1) / block, block, 0, g_stream>>>(gate, up, dy, dgate, dup, n);
 }
 inline void launch_attn(const float* dQ, const float* dK, const float* dV, float* dOut,
-                        int batch, int T, int C, int H, int in_stride) {
+                        int batch, int T, int C, int H, int in_stride, int kv_group) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
     constexpr int BQ = attn_block_q<HD>();
     const dim3 block(BQ);
     const dim3 grid((T + BQ - 1) / BQ, H, batch);
-    attn_fwd_tiled_kernel<float, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
+    attn_fwd_tiled_kernel<float, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride, kv_group);
 }
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
 // One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows. C/H/in_stride dropped
 // as parameters -- constexpr-folded inside the kernels themselves, see rope_kernel above.
+// grid.z = 2 selects the Q (z=0) then K (z=1) sub-block; grid.x is sized for the WIDER of the two
+// (Q, always >= K) and the K pass early-outs on its narrower half -- see rope_sub_pairs. Under MHA the
+// two sub-blocks are equal and nothing early-outs, so the launched thread count is unchanged.
+inline dim3 rope_grid(const dim3& block, int batch, int T) {
+    return dim3((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y, 2);
+}
 inline void launch_rope(float* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_kernel<<<grid, block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
+    rope_kernel<<<rope_grid(block, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
 }
 template <class A> inline void launch_rope_t(A* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_act_kernel<A><<<grid, block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
+    rope_act_kernel<A><<<rope_grid(block, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
 }
 template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
     const dim3 block(32, 8);
-    const dim3 grid((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
-    rope_bwd_act_kernel<A><<<grid, block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA);
+    rope_bwd_act_kernel<A><<<rope_grid(block, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA);
 }
 
 // QK-norm: per-head RMSNorm on the Q/K sub-blocks of the fused qkv buffer, in place, right after the
@@ -2008,7 +2050,7 @@ template <class A> inline void launch_qknorm_t(A* qkv, const float* qgamma, cons
                                     // magnitude under D_MODEL, so block_reduce_sum's BLOCK<=32 path
                                     // (no cross-warp shared-memory step) already covers the reduction.
     const dim3 grid(rows, N_HEADS, 2);
-    qknorm_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma);
+    qknorm_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma);
 }
 // Same, but also stashes the pre-norm Q/K into qk_pre[rows,2C] -- see qknorm_save_act_kernel above.
 // Used only by backward_device's checkpoint-recompute pass.
@@ -2016,7 +2058,7 @@ template <class A>
 inline void launch_qknorm_save_t(A* qkv, A* qk_pre, const float* qgamma, const float* kgamma, int rows) {
     constexpr int kQkBlock = 32;
     const dim3 grid(rows, N_HEADS, 2);
-    qknorm_save_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma);
+    qknorm_save_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma);
 }
 // QK-norm backward: converts dqkv's Q/K sub-blocks in place from "grad w.r.t. qknorm's output" to
 // "grad w.r.t. qknorm's input", reading the pre-norm x from qk_pre -- see qknorm_backward_act_kernel
@@ -2028,8 +2070,8 @@ inline void launch_qknorm_bwd_t(const A* qk_pre, const float* qgamma, const floa
                                 A* dqkv, float* dqgamma, float* dkgamma, int rows) {
     constexpr int kQkBlock = 32;
     const dim3 grid(dgamma_grid_blocks(static_cast<long long>(rows) * N_HEADS,
-                                       qknorm_bwd_blocks_per_sm<A, N_HEADS, D_HEAD>()), 1, 2);
-    qknorm_backward_act_kernel<A, N_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
+                                       qknorm_bwd_blocks_per_sm<A, N_HEADS, N_KV_HEADS, D_HEAD>()), 1, 2);
+    qknorm_backward_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(
         qk_pre, qgamma, kgamma, dqkv, dqgamma, dkgamma, rows);
 }
 
@@ -2121,12 +2163,12 @@ template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gam
 }
 // act-typed attention forward/backward (bf16 store): same launch shape, store-typed q/k/v/att.
 template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, const A* dV, A* dOut,
-                              int batch, int T, int C, int H, int in_stride) {
+                              int batch, int T, int C, int H, int in_stride, int kv_group) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>();       // head dim baked -> tiled kernel (see above)
     constexpr int BQ = attn_block_q<HD>();
     const dim3 block(BQ);
     const dim3 grid((T + BQ - 1) / BQ, H, batch);
-    attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride);
+    attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride, kv_group);
 }
 
 //TODO: We should be able to know the upper lilmit of the scratch size needed for backward, and allocate it once.
@@ -2158,25 +2200,33 @@ inline void free_bwd_stats() {
 // the comment above attn_bwd_dv_kernel), all atomic-free. dqkv need NOT be pre-zeroed (each dq_i /
 // dk_j / dv_j is written exactly once, in full).
 template <class A> inline void launch_attn_bwd_t(const A* qkv, const A* dout, A* dqkv,
-                            int batch, int T, int C, int H, int in_stride) {
+                            int batch, int T, int C, int H, int in_stride, int kv_group) {
     constexpr int HD = D_HEAD, TK = attn_tile_k<HD>(), TQ = attn_tile_q<HD>();
     constexpr int BQ = attn_block_q<HD>();
     constexpr int DQ_LANES = attn_dq_lanes<HD>();
     constexpr int DK_LANES = attn_dk_lanes<HD>();
     if (ensure_bwd_stats(static_cast<size_t>(batch) * H * T)) return;    // OOM -> next sync surfaces it
+    const int HKV = H / kv_group;                // KV heads; == H under MHA
+    const int KVW = C / kv_group;                // D_KV, the K and V sub-block width
     const dim3 block(BQ);
     const dim3 grid((T + BQ - 1) / BQ, H, batch);
     // dq's block covers BQ/DQ_LANES queries (LANES threads warp-cooperate per query at large HD; see
     // attn_dq_lanes), so its grid.x scales inversely -- more, smaller-coverage blocks. dk is the same
     // idea over keys instead of queries (attn_dk_lanes).
     const dim3 grid_dq((T + BQ / DQ_LANES - 1) / (BQ / DQ_LANES), H, batch);
-    const dim3 grid_dk((T + BQ / DK_LANES - 1) / (BQ / DK_LANES), H, batch);
-    const A* q = qkv; const A* k = qkv + C; const A* v = qkv + 2 * C;
-    A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + 2 * C;
-    attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride);
-    attn_bwd_dq_kernel<A, HD, TK><<<grid_dq, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride);
-    attn_bwd_dv_kernel<A, HD, TQ><<<grid, block, 0, g_stream>>>(q, k, dout, g_bwd_m, g_bwd_invZ, dv, T, C, in_stride);
-    attn_bwd_dk_kernel<A, HD, TQ><<<grid_dk, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride);
+    // dv/dk are KV-head-parallel, NOT query-head-parallel: under GQA one dk_j/dv_j is shared by
+    // kv_group query heads, so a query-head grid would have kv_group blocks racing on the same address.
+    // Regrouping to HKV (and summing the group inside the kernel) keeps each output exclusively owned
+    // by one block, preserving the atomic-free write. Total work is unchanged -- kv_group times fewer
+    // blocks each doing kv_group times the query passes. Under MHA HKV == H and this is the old grid.
+    const dim3 grid_dv((T + BQ - 1) / BQ, HKV, batch);
+    const dim3 grid_dk((T + BQ / DK_LANES - 1) / (BQ / DK_LANES), HKV, batch);
+    const A* q = qkv; const A* k = qkv + C; const A* v = qkv + C + KVW;
+    A* dq = dqkv; A* dk = dqkv + C; A* dv = dqkv + C + KVW;
+    attn_bwd_stats_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, T, C, in_stride, kv_group);
+    attn_bwd_dq_kernel<A, HD, TK><<<grid_dq, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dq, T, C, in_stride, kv_group);
+    attn_bwd_dv_kernel<A, HD, TQ><<<grid_dv, block, 0, g_stream>>>(q, k, dout, g_bwd_m, g_bwd_invZ, dv, T, C, in_stride, kv_group, H);
+    attn_bwd_dk_kernel<A, HD, TQ><<<grid_dk, block, 0, g_stream>>>(q, k, v, dout, g_bwd_m, g_bwd_invZ, g_bwd_dot, dk, T, C, in_stride, kv_group, H);
 }
 
 // ============================================================================
@@ -2293,7 +2343,7 @@ int wqkv_alloc() {
     if (g_fwd.wqkv[0]) return 0;
     ensure_stream();
     for (int l = 0; l < N_LAYERS; ++l)
-        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * sub0::QKV_STRIDE * sizeof(float)));
     return 0;
 }
 
@@ -2334,7 +2384,7 @@ int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
     if (full) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.h,      MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.a,      MC * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.qkv,    Mm * 3 * D_MODEL * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.qkv,    Mm * sub0::QKV_STRIDE * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.att,    MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.proj,   MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.fbuf,   MC * sizeof(float)));
@@ -2445,7 +2495,7 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf,   MC * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ff1,    MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.gact,   MF * sizeof(act_t)));  // single (checkpoint scratch, bf16)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * 3 * D_MODEL * sizeof(act_t)));  // single (checkpoint scratch, bf16)
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qkv,    Mm * sub0::QKV_STRIDE * sizeof(act_t)));  // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.att,    MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_final, MC * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv_f,  Mm * sizeof(float)));
@@ -2453,13 +2503,13 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.logits,  MV * sizeof(float)));  // [g_tr_logits_chunk,V], chunked
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh,      MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.da,      MC * sizeof(float)));
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * 3 * D_MODEL * sizeof(act_t)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dqkv,    Mm * sub0::QKV_STRIDE * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.datt,    MC * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dfbuf,   MC * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dff1,    MF * sizeof(act_t)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dgact,   MF * sizeof(act_t)));
     g_tr.dlogits = g_tr.logits;                 // CE backward is in-place: dlogits overwrites logits (chunked)
-    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dwqkv,   static_cast<size_t>(D_MODEL) * sub0::QKV_STRIDE * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dh16,    MC * sizeof(act_t)));   // bf16 cast of dh for FFN W2 bwd
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.loss,    sizeof(double)));
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.dtargets, Mm * sizeof(int)));
@@ -2470,7 +2520,7 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.active,   static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));  // CE mask normalizer
     // qk_pre [M,2C]: only when USE_QK_NORM (see the TrainScratch::qk_pre comment) -- zero bytes and
     // stays nullptr on the default (qk-norm off) build.
-    if constexpr (USE_QK_NORM) SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qk_pre, Mm * 2 * D_MODEL * sizeof(act_t)));
+    if constexpr (USE_QK_NORM) SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qk_pre, Mm * sub0::QK_PRE_STRIDE * sizeof(act_t)));
     g_tr_rows = Mm;
     return 0;
 }
@@ -2499,8 +2549,10 @@ void train_free() {
 // over a SINGLE row (reusing the M=1 rmsnorm/linear/gelu/add launches), so autoregressive gen runs on
 // the device at O(T) per token instead of re-forwarding the whole context. Positions must stay
 // < SEQ_LEN. Dense FP32 params (g_dev_params + the fused g_fwd.wqkv), same weights as sub0_cuda_forward.
-float* g_kv_k = nullptr;   // [N_LAYERS * SEQ_LEN * D_MODEL] -- roped K per (layer, position)
-float* g_kv_v = nullptr;   // [N_LAYERS * SEQ_LEN * D_MODEL] -- V per (layer, position)
+float* g_kv_k = nullptr;   // [N_LAYERS * SEQ_LEN * D_KV] -- roped K per (layer, position)
+float* g_kv_v = nullptr;   // [N_LAYERS * SEQ_LEN * D_KV] -- V per (layer, position). D_KV, not D_MODEL:
+                           // under GQA the cache holds only the SHARED KV heads, which is where GQA's
+                           // memory saving actually lands (it is the decode-time KV cache that shrinks).
 
 // [2] = {id, pos} for the current decode token, device-resident. Written by ONE small H2D memcpy
 // before each captured-graph replay (see replay_decode_graph below) instead of baking id/pos as
@@ -2513,7 +2565,7 @@ int* g_decode_state = nullptr;
 
 inline int kv_alloc() {
     if (g_kv_k) return 0;
-    const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_MODEL;
+    const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * sub0::D_KV;
     if (cudaMalloc(&g_kv_k, n * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&g_kv_v, n * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&g_decode_state, 2 * sizeof(int)) != cudaSuccess) return 1;
@@ -2574,26 +2626,21 @@ __global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const floa
 // (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched. C/H constexpr-folded (D_MODEL/
 // N_HEADS, its one call site) -- see rope_kernel above; pos stays runtime (the decode position). Body
 // factored out for the same reason as embed_one_body above.
-__device__ inline void rope_one_body(float* __restrict__ qkv, int pos, float theta, int pg) {
-    constexpr int C = D_MODEL, d = D_HEAD, half = d / 2;
-    const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = (static_cast<float>(pos) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
-    float sn, cs; __sincosf(ang, &sn, &cs);
-    const float q0 = qkv[a0],     q1 = qkv[a0 + 1];     qkv[a0]     = q0 * cs - q1 * sn; qkv[a0 + 1]     = q0 * sn + q1 * cs;
-    const float k0 = qkv[C + a0], k1 = qkv[C + a0 + 1]; qkv[C + a0] = k0 * cs - k1 * sn; qkv[C + a0 + 1] = k0 * sn + k1 * cs;
+// blockIdx.y selects the sub-block (0 = Q, 1 = K), exactly as rope_kernel's blockIdx.z does -- Q and K
+// no longer have the same head count under GQA, so one thread can no longer rotate both.
+__device__ inline void rope_one_body(float* __restrict__ qkv, int pos, float theta, int pg, int which) {
+    rope_pair_body(qkv, pos, theta, pg, which, +1.0f);
 }
 __global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta) {
-    constexpr int C = D_MODEL;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pg >= C / 2) return;
-    rope_one_body(qkv, pos, theta, pg);
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x, which = blockIdx.y;
+    if (pg >= rope_sub_pairs(which)) return;
+    rope_one_body(qkv, pos, theta, pg, which);
 }
 // Graphed-decode variant: pos read from g_decode_state[1] -- see embed_one_kernel_g's own comment.
 __global__ void rope_one_kernel_g(float* __restrict__ qkv, const int* __restrict__ pos_ptr, float theta) {
-    constexpr int C = D_MODEL;
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pg >= C / 2) return;
-    rope_one_body(qkv, *pos_ptr, theta, pg);
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x, which = blockIdx.y;
+    if (pg >= rope_sub_pairs(which)) return;
+    rope_one_body(qkv, *pos_ptr, theta, pg, which);
 }
 // Appends this token's K/V (from the just-computed qkv row) into the per-layer KV-cache at position
 // *pos_ptr -- the GRAPHED-decode counterpart of forward_one_device's two raw cudaMemcpyAsync D2D calls.
@@ -2601,16 +2648,16 @@ __global__ void rope_one_kernel_g(float* __restrict__ qkv, const int* __restrict
 // every token (a genuinely different device address per call, not just a different scalar value) needs
 // the offset computed INSIDE a kernel that reads pos from a device pointer, rather than a host-computed
 // destination pointer baked into the node at capture time. kcache_base/vcache_base are this LAYER's
-// cache base (g_kv_k/g_kv_v + l*SEQ_LEN*C) -- fixed per node, since a given layer's node is always that
+// cache base (g_kv_k/g_kv_v + l*SEQ_LEN*D_KV) -- fixed per node, since a given layer's node is always that
 // same layer across every replay; only `pos` (read from device memory) varies.
 __global__ void kv_append_kernel(const float* __restrict__ qkv, float* __restrict__ kcache_base,
                                  float* __restrict__ vcache_base, const int* __restrict__ pos_ptr) {
-    constexpr int C = D_MODEL;
+    constexpr int KV = sub0::D_KV;                       // cache rows are D_KV wide, not D_MODEL
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= C) return;
+    if (j >= KV) return;
     const int pos = *pos_ptr;
-    kcache_base[static_cast<size_t>(pos) * C + j] = qkv[C + j];
-    vcache_base[static_cast<size_t>(pos) * C + j] = qkv[2 * C + j];
+    kcache_base[static_cast<size_t>(pos) * KV + j] = qkv[sub0::QKV_K_OFF + j];
+    vcache_base[static_cast<size_t>(pos) * KV + j] = qkv[sub0::QKV_V_OFF + j];
 }
 // Decode attention: the single (roped) query q[C] attends the cached K/V (rows over [SEQ_LEN,C]) for
 // j=0..pos -> att[C]. One block per head; blockDim=128. Shared: the query head + scores[pos+1]. The
@@ -2621,17 +2668,17 @@ __global__ void kv_append_kernel(const float* __restrict__ qkv, float* __restric
 template <int HD>
 __device__ inline void attn_decode_body(const float* __restrict__ q, const float* __restrict__ kcache,
                                         const float* __restrict__ vcache, float* __restrict__ att, int pos) {
-    constexpr int C = D_MODEL;
     extern __shared__ float sh[];                 // qh[HD] then sc[pos+1]
     float* qh = sh;
     float* sc = sh + HD;
     __shared__ float red[128];
     const int hh = blockIdx.x, off = hh * HD, tid = threadIdx.x, nt = blockDim.x;
+    const int kv_off = (hh / sub0::GQA_GROUP) * HD;    // this query head's shared KV head in the cache
     const float scale = rsqrtf(static_cast<float>(HD));
     for (int a = tid; a < HD; a += nt) qh[a] = q[off + a];
     __syncthreads();
     for (int j = tid; j <= pos; j += nt) {         // scaled scores q.k_j
-        const float* kj = kcache + static_cast<size_t>(j) * C + off;
+        const float* kj = kcache + static_cast<size_t>(j) * sub0::D_KV + kv_off;
         float s = 0.f;
         #pragma unroll
         for (int a = 0; a < HD; ++a) s += qh[a] * kj[a];
@@ -2652,7 +2699,7 @@ __device__ inline void attn_decode_body(const float* __restrict__ q, const float
     __syncthreads();
     for (int a = tid; a < HD; a += nt) {           // att = sum_j p_j v_j
         float acc = 0.f;
-        for (int j = 0; j <= pos; ++j) acc += sc[j] * vcache[static_cast<size_t>(j) * C + off + a];
+        for (int j = 0; j <= pos; ++j) acc += sc[j] * vcache[static_cast<size_t>(j) * sub0::D_KV + kv_off + a];
         att[off + a] = acc;
     }
 }
@@ -2734,16 +2781,18 @@ static_assert(check_layer_offsets(),
     "layer_base()/kLn1../kFinalBase drifted from the real PARAM_LAYOUT table -- update the constants "
     "above to match make_param_layout() in layout.hpp.");
 
-// Grouped-query attention is CPU-only for now. This file fuses Q/K/V into one [M, 3*D_MODEL] buffer
-// with in_stride == 3*D_MODEL baked into the RoPE, QK-norm, attention and split kernels, and its
-// dk/dv backward kernels are atomic-free precisely BECAUSE each dk_j/dv_j is written exactly once --
-// an invariant GQA breaks, since a KV head is then shared by N_HEADS/N_KV_HEADS query heads. Compiling
-// a GQA config against this backend would produce silently wrong K/V strides and doubly-written
-// gradients, so fail the BUILD rather than let that reach a training run (AGENTS.md 3's "trace what
-// happens when old assumptions meet new code before deciding a change is safe").
-static_assert(N_KV_HEADS == N_HEADS,
-    "The CUDA backend does not support grouped-query attention yet (N_KV_HEADS < N_HEADS). Configure "
-    "with --kv-heads equal to --heads, or build with -DSUB0_COMPUTE=CPU.");
+// Grouped-query attention IS supported here (the guard that used to sit at this spot is gone). Two
+// things it required, both worth knowing before touching the attention kernels:
+//   1. The fused Q/K/V buffer is [M, QKV_STRIDE] with UNEQUAL sub-blocks (Q is D_MODEL, K and V are
+//      D_KV) -- see layout.hpp's QKV_* constants. Nothing may assume a 3*D_MODEL stride or a
+//      sub-block at s*D_MODEL any more.
+//   2. dk/dv are still atomic-free, but for a NEW reason. They used to be safe because each dk_j/dv_j
+//      was written by exactly one block when grid.y ran over query heads. Under GQA a KV head is
+//      shared by GQA_GROUP query heads, so those kernels are now KV-HEAD-parallel (grid.y = KV heads)
+//      and sum the group in registers before a single write -- ownership preserved without atomics.
+//      Note the consequence: in those two kernels gridDim.y is the KV head count, NOT the query head
+//      count, so the per-(b,h,i) softmax-stats index takes H as an explicit argument instead of
+//      reading gridDim.y (which is what it used to do, and which would now silently mis-index).
 
 // LoopSplit is CPU-only for the same class of reason, but a DIFFERENT specific one, and this is the
 // dangerous direction: re-executing a layer means its weights are used more than once per forward, so
@@ -2792,18 +2841,19 @@ void forward_one_device(int id, int pos) {
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
         launch_rmsnorm(h, ln1, a, 1);
-        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
+        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, sub0::QKV_STRIDE);      // fused q|k|v (one row)
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
-            const int blk = 128; rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
+            const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
+            rope_one_kernel<<<g, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
         }
-        float* kc = g_kv_k + (static_cast<size_t>(l) * SEQ_LEN + pos) * C;          // append this token's K/V
-        float* vc = g_kv_v + (static_cast<size_t>(l) * SEQ_LEN + pos) * C;
-        cudaMemcpyAsync(kc, qkv + C,     C * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
-        cudaMemcpyAsync(vc, qkv + 2 * C, C * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
+        float* kc = g_kv_k + (static_cast<size_t>(l) * SEQ_LEN + pos) * sub0::D_KV;  // append this token's K/V
+        float* vc = g_kv_v + (static_cast<size_t>(l) * SEQ_LEN + pos) * sub0::D_KV;
+        cudaMemcpyAsync(kc, qkv + sub0::QKV_K_OFF, sub0::D_KV * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
+        cudaMemcpyAsync(vc, qkv + sub0::QKV_V_OFF, sub0::D_KV * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
-          attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(l) * SEQ_LEN * C,
-                                                            g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C, att, pos); }
+          attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV,
+                                                            g_kv_v + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV, att, pos); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
@@ -2864,14 +2914,16 @@ void forward_one_device_graphed() {
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
         launch_rmsnorm(h, ln1, a, 1);
-        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, 3 * C);                 // fused q|k|v (one row)
+        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, sub0::QKV_STRIDE);      // fused q|k|v (one row)
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
-            const int blk = 128; rope_one_kernel_g<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA);
+            const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
+            rope_one_kernel_g<<<g, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA);
         }
-        float* kc_base = g_kv_k + static_cast<size_t>(l) * SEQ_LEN * C;   // this layer's cache base (fixed
-        float* vc_base = g_kv_v + static_cast<size_t>(l) * SEQ_LEN * C;  // per node -- pos read on-device)
-        { const int blk = 256; kv_append_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(qkv, kc_base, vc_base, pos_ptr); }
+        float* kc_base = g_kv_k + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV;   // this layer's cache base
+        float* vc_base = g_kv_v + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV;   // (fixed per node -- pos
+                                                                                   //  is read on-device)
+        { const int blk = 256; kv_append_kernel<<<(sub0::D_KV + blk - 1) / blk, blk, 0, g_stream>>>(qkv, kc_base, vc_base, pos_ptr); }
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
           attn_decode_kernel_g<HD><<<H, 128, shb, g_stream>>>(qkv, kc_base, vc_base, att, pos_ptr); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
@@ -2948,10 +3000,11 @@ void forward_device(int batch, int T) {
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
 
         launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1)
-        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, 3 * C);          // fused qkv = a . [Wq|Wk|Wv]
+        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, sub0::QKV_STRIDE);  // fused qkv = a . [Wq|Wk|Wv]
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, M);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
-        launch_attn(qkv, qkv + C, qkv + 2 * C, att, batch, T, C, H, 3 * C);  // q/k/v sub-blocks (stride 3C)
+        launch_attn(qkv, qkv + sub0::QKV_K_OFF, qkv + sub0::QKV_V_OFF, att, batch, T, C, H,
+                    sub0::QKV_STRIDE, sub0::GQA_GROUP);   // q/k/v sub-blocks of the fused row
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
         launch_add(h, proj, h, MC);                          // h = h + proj
         launch_rmsnorm(h, ln2, fbuf, M);                     // f = rmsnorm(h, ln2)
@@ -3055,7 +3108,10 @@ int capture_decode_graph() {
 void build_qkv_weights() {
     const auto& L = sub0::PARAM_LAYOUT;
     const int   C = D_MODEL;
-    const int   n = C * C, block = 256, grid = (n + block - 1) / block;
+    // One thread per FUSED [C, QKV_STRIDE] element -- build_qkv_kernel's mapping, NOT one thread per
+    // [C,C] source element doing three writes (which under GQA's unequal sub-block widths could not
+    // address all three matrices from a single index).
+    const int   n = C * sub0::QKV_STRIDE, block = 256, grid = (n + block - 1) / block;
     if constexpr (ACT_DTYPE == Dtype::BF16) {
         g_wqkv_f32_dirty = true;
         const int F = D_FF;
@@ -3068,7 +3124,7 @@ void build_qkv_weights() {
             if (!g_w1_16[l])   cudaMalloc(&g_w1_16[l],   static_cast<size_t>(C) * F * sizeof(act_t));
             if (!g_w2_16[l])   cudaMalloc(&g_w2_16[l],   static_cast<size_t>(F) * C * sizeof(act_t));
             if (!g_wo16[l])    cudaMalloc(&g_wo16[l],    static_cast<size_t>(C) * C * sizeof(act_t));
-            if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * 3 * C * sizeof(act_t));
+            if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * sub0::QKV_STRIDE * sizeof(act_t));
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW1].off, g_w1_16[l], nce);
             f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW2].off, g_w2_16[l], nce);
             if constexpr (USE_GATED_FFN) {   // gate matrix mirror -- same [C,F] shape as W1's
@@ -3104,12 +3160,12 @@ int ensure_wqkv_f32() {
     if (!g_fwd.wqkv[0]) {
         ensure_stream();
         for (int l = 0; l < N_LAYERS; ++l)
-            SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * 3 * D_MODEL * sizeof(float)));
+            SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.wqkv[l], static_cast<size_t>(D_MODEL) * sub0::QKV_STRIDE * sizeof(float)));
         g_wqkv_f32_dirty = true;         // freshly (re)allocated -- garbage until populated below
     }
     if (g_wqkv_f32_dirty) {
         const auto& L = sub0::PARAM_LAYOUT;
-        const int C = D_MODEL, n = C * C, block = 256, grid = (n + block - 1) / block;
+        const int C = D_MODEL, n = C * sub0::QKV_STRIDE, block = 256, grid = (n + block - 1) / block;
         for (int l = 0; l < N_LAYERS; ++l) {
             const int b0 = layer_base(l);
             build_qkv_kernel<<<grid, block, 0, g_stream>>>(g_dev_params + L[b0 + kWq].off,
@@ -3184,14 +3240,14 @@ void forward_train(int batch, int T) {
         act_t* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
 
         launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M);          // a = rmsnorm(hin,ln1) bf16
-        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);          // fused qkv bf16
+        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, sub0::QKV_STRIDE);  // fused qkv bf16
         // Plain (non-save) variant here: this qkv buffer is a CHECKPOINT (recomputed from scratch in
         // backward_device -- see that function's own qknorm call, which uses the SAVE variant because
         // its recompute is where the pre-norm x actually needs to survive for qknorm's own backward).
         if constexpr (USE_QK_NORM) launch_qknorm_t<act_t>(g_tr.qkv, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
-        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C,
-                          g_tr.att, batch, T, C, H, 3 * C);                          // attention (P-free)
+        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + sub0::QKV_K_OFF, g_tr.qkv + sub0::QKV_V_OFF,
+                          g_tr.att, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);  // attention (P-free)
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
         launch_add_t<act_t>(hin, hmid, hmid, MC);                                   // hmid = hin + proj
         launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M);      // fbuf bf16
@@ -3348,18 +3404,19 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+qknorm+rope), then attention
         launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + kLn1].off, g_tr.a, g_tr.rinv1[l], M);
-        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, 3 * C);
+        launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, sub0::QKV_STRIDE);
         // QK-norm recompute: the SAVE variant (unlike forward_train's plain launch_qknorm_t) because
         // this pre-norm x must survive until qknorm's own backward runs below, AFTER attention's and
         // RoPE's backward -- see qknorm_save_act_kernel's comment and the TrainScratch::qk_pre note in
         // memplan.hpp's train_scratch_bytes.
         if constexpr (USE_QK_NORM) launch_qknorm_save_t<act_t>(g_tr.qkv, g_tr.qk_pre, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
-        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + C, g_tr.qkv + 2 * C, g_tr.att, batch, T, C, H, 3 * C);
+        launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + sub0::QKV_K_OFF, g_tr.qkv + sub0::QKV_V_OFF,
+                                   g_tr.att, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
         launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + kWo].off, M, C, C);
         // flash backward writes each dq/dk/dv exactly once (no atomics), so no pre-zero is needed.
-        launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, 3 * C);
+        launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // qknorm output (or the projected q/k directly, without QK-norm) before qknorm's own backward
         // (if enabled) and the qkv-GEMM backward (inverse rotation). dV is untouched.
@@ -3371,9 +3428,9 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         if constexpr (USE_QK_NORM)
             launch_qknorm_bwd_t<act_t>(g_tr.qk_pre, qgamma, kgamma, g_tr.dqkv, dqgamma, dkgamma, M);
         // qkv backward (input a): da = grad into a (f32), dWqkv -> split into dWq/dWk/dWv
-        launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, 3 * C);
+        launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, sub0::QKV_STRIDE);
         {
-            const int n = C * C, block = 256;
+            const int n = C * sub0::QKV_STRIDE, block = 256;
             split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
                 g_tr.dwqkv, gb + L[b0 + kWq].off, gb + L[b0 + kWk].off, gb + L[b0 + kWv].off);
         }
@@ -4167,7 +4224,7 @@ SUB0_CUDA_API int sub0_cuda_attn_check(int batch, int T, int iters,
     if (iters < 1) iters = 50;
     if (sub0_cuda_init()) return 1;
     const int    C = D_MODEL, H = N_HEADS, M = batch * T;
-    const size_t nqkv = static_cast<size_t>(M) * 3 * C;                 // fused q|k|v, in_stride = 3C
+    const size_t nqkv = static_cast<size_t>(M) * sub0::QKV_STRIDE;      // fused q|k|v
     const size_t natt = static_cast<size_t>(M) * C;
 
     std::vector<float> h(nqkv);                                         // random q/k/v (host -> f32 -> act_t)
@@ -4188,13 +4245,15 @@ SUB0_CUDA_API int sub0_cuda_attn_check(int batch, int T, int iters,
     auto run_naive = [&] {
         const int blk = 64, total = batch * H * T;
         attn_train_act_kernel<act_t><<<(total + blk - 1) / blk, blk, 0, g_stream>>>(
-            dqkv, dqkv + C, dqkv + 2 * C, dref, batch, T, C, H, 3 * C);
+            dqkv, dqkv + sub0::QKV_K_OFF, dqkv + sub0::QKV_V_OFF, dref, batch, T, C, H,
+            sub0::QKV_STRIDE, sub0::GQA_GROUP);
     };
     auto run_tiled = [&] {
         constexpr int BQ = attn_block_q<HD>();
         const dim3 block(BQ), grid((T + BQ - 1) / BQ, H, batch);
         attn_fwd_tiled_kernel<act_t, HD, TK><<<grid, block, 0, g_stream>>>(
-            dqkv, dqkv + C, dqkv + 2 * C, dtes, T, C, 3 * C);
+            dqkv, dqkv + sub0::QKV_K_OFF, dqkv + sub0::QKV_V_OFF, dtes, T, C,
+            sub0::QKV_STRIDE, sub0::GQA_GROUP);
     };
     run_naive(); run_tiled();
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
@@ -4250,7 +4309,7 @@ SUB0_CUDA_API int sub0_cuda_attn_bwd_check(int batch, int T, int iters,
     if (iters < 1) iters = 30;
     if (sub0_cuda_init()) return 1;
     const int    C = D_MODEL, H = N_HEADS, M = batch * T;
-    const size_t nqkv = static_cast<size_t>(M) * 3 * C, natt = static_cast<size_t>(M) * C;
+    const size_t nqkv = static_cast<size_t>(M) * sub0::QKV_STRIDE, natt = static_cast<size_t>(M) * C;
     constexpr int HD = D_HEAD;
 
     std::vector<float> h(nqkv);                                         // random q/k/v
@@ -4277,11 +4336,14 @@ SUB0_CUDA_API int sub0_cuda_attn_bwd_check(int batch, int T, int iters,
 
     auto run_naive = [&] {                                             // atomic-free head-per-thread reference
         cudaMemsetAsync(dref, 0, nqkv * sizeof(act_t), g_stream);      // it accumulates with +=
-        const int blk = 64, total = batch * H;
+        const int blk = 64, total = batch * (H / sub0::GQA_GROUP);   // one thread per (batch, KV head)
         attn_backward_head_act_kernel<act_t><<<(total + blk - 1) / blk, blk, 0, g_stream>>>(
-            dqkv, dqkv + C, dqkv + 2 * C, ddout, dref, dref + C, dref + 2 * C, batch, T, C, H, 3 * C);
+            dqkv, dqkv + sub0::QKV_K_OFF, dqkv + sub0::QKV_V_OFF, ddout,
+            dref, dref + sub0::QKV_K_OFF, dref + sub0::QKV_V_OFF, batch, T, C, H,
+            sub0::QKV_STRIDE, sub0::GQA_GROUP);
     };
-    auto run_tiled = [&] { launch_attn_bwd_t<act_t>(dqkv, ddout, dtes, batch, T, C, H, 3 * C); };
+    auto run_tiled = [&] { launch_attn_bwd_t<act_t>(dqkv, ddout, dtes, batch, T, C, H,
+                                                    sub0::QKV_STRIDE, sub0::GQA_GROUP); };
     run_naive(); run_tiled();
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
@@ -4631,7 +4693,7 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     SUB0_CUDA_CHECK(cudaMemcpy(dKgamma, hKgamma.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
 
     const dim3 grid(rows, H, 2);
-    qknorm_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma);
+    qknorm_act_kernel<float, H, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
 
@@ -4679,7 +4741,7 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     SUB0_CUDA_CHECK(cudaMalloc(&dQkv2, hQkv.size() * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemcpy(dQkv2, hQkv.data(), hQkv.size() * sizeof(float), cudaMemcpyHostToDevice));
     SUB0_CUDA_CHECK(cudaMalloc(&dQkPre, static_cast<size_t>(rows) * 2 * C * sizeof(float)));
-    qknorm_save_act_kernel<float, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma);
+    qknorm_save_act_kernel<float, H, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma);
 
     std::vector<float> hDy(hQkv.size());
     for (auto& v : hDy) v = randf() * 0.3f;
@@ -4699,8 +4761,8 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     // Backward kernel's grid differs from the forward's `grid` above -- row*head folded into one
     // grid-stride axis, capped via dgamma_grid_blocks (see qknorm_backward_act_kernel's own comment).
     const dim3 bwd_grid(dgamma_grid_blocks(static_cast<long long>(rows) * H,
-                                           qknorm_bwd_blocks_per_sm<float, H, DH>()), 1, 2);
-    qknorm_backward_act_kernel<float, H, DH, kQkBlock><<<bwd_grid, kQkBlock, 0, g_stream>>>(
+                                           qknorm_bwd_blocks_per_sm<float, H, H, DH>()), 1, 2);
+    qknorm_backward_act_kernel<float, H, H, DH, kQkBlock><<<bwd_grid, kQkBlock, 0, g_stream>>>(
         dQkPre, dQgamma, dKgamma, dDqkv, dDqgamma, dDkgamma, rows);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());

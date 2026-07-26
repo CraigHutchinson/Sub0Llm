@@ -83,11 +83,23 @@ inline constexpr int MAX_DEVICE_BATCH = 4096;
 // Trainable float count -- the exact sum PARAM_LAYOUT produces in layout.hpp, re-derived here
 // from dims so the configurator (which cannot include layout.hpp) gets the same number. The CUDA
 // footprint test asserts param_floats(dims) == sub0::PARAM_FLOATS, catching any layout drift.
+// K/V projection width (sub0::D_KV) for these runtime Dims. n_kv_heads == 0 means "unset" and falls
+// back to n_heads, i.e. plain MHA, where this is exactly d_model.
+constexpr u64 d_kv(const Dims& d) {
+    const u64 C = u64(d.d_model), H = u64(d.n_heads);
+    const u64 DH = H > 0 ? C / H : 0;
+    return u64(d.n_kv_heads > 0 ? d.n_kv_heads : d.n_heads) * DH;
+}
+// Runtime mirrors of sub0::QKV_STRIDE / sub0::QK_PRE_STRIDE (see layout.hpp, which explains the fused
+// buffer's column layout and why these live in two places). memplan is included BY layout.hpp, so it
+// cannot use the constexpr forms and must re-derive them from Dims -- keep the two in lock-step.
+constexpr u64 qkv_stride(const Dims& d)    { return u64(d.d_model) + 2 * d_kv(d); }  // == 3*C under MHA
+constexpr u64 qk_pre_stride(const Dims& d) { return u64(d.d_model) + d_kv(d); }      // == 2*C under MHA
+
 constexpr u64 param_floats(const Dims& d) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff), T = u64(d.seq_len), V = u64(d.vocab);
+    const u64 CKV = d_kv(d);                    // D_KV: K/V width (== C for plain MHA)
     const u64 H  = u64(d.n_heads), DH = H > 0 ? C / H : 0;   // D_HEAD = C/H
-    const u64 KVH = u64(d.n_kv_heads > 0 ? d.n_kv_heads : d.n_heads);
-    const u64 CKV = KVH * DH;                   // D_KV: K/V width (== C for plain MHA)
     const u64 emb   = V * C + (d.pos_emb ? T * C : 0);   // tok_emb [V,C] + pos_emb [T,C] if present
     const u64 block = 2 * C                     // ln1 + ln2          [C] each
                     + 2 * C * C                 // Wq, Wo             [C,C]
@@ -120,12 +132,13 @@ constexpr u64 param_floats(const Dims& d) {
 // and MEASURED deltas stay comparable.
 constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
+    const u64 QKVW = qkv_stride(d);                      // C + 2*D_KV -- fused row width, == 3*C under MHA
     const u64 ffn_mirrors = (d.gated ? 3 : 2) * C * F;   // gated: g_wg16+g_w1_16+g_w2_16; plain: g_w1_16+g_w2_16
     return 4 * param_floats(d) * FLOAT          // g_dev_params + grad + m + vel
          + DBL                                  // g_dev_normsq [1] (double)
          + FLOAT                                // g_dev_gs [1] (on-device grad-clip scale, 2026-07)
-         + (A >= FLOAT ? L * (3 * C * C) * FLOAT : 0)          // g_fwd.wqkv[l] = [C,3C] F32 (F32 builds only)
-         + (A < FLOAT ? L * (ffn_mirrors + 4 * C * C) * A : 0); // BF16-only: g_w[g]1_16+g_w2_16+g_wo16+g_wqkv16
+         + (A >= FLOAT ? L * (C * QKVW) * FLOAT : 0)                     // g_fwd.wqkv[l] = [C,QKVW] F32 (F32 only)
+         + (A < FLOAT ? L * (ffn_mirrors + C * C + C * QKVW) * A : 0);   // BF16: g_w[g]1_16+g_w2_16+g_wo16+g_wqkv16
 }
 
 // Row-chunk count for the TRAINING [chunk_rows,V] logits/dlogits scratch buffer (train_alloc /
@@ -166,7 +179,7 @@ constexpr u64 fwd_scratch_bytes(const Dims& d, int batch) {
     const u64 Mm = u64(batch) * u64(d.seq_len);
     return Mm * INT                             // dids   [M]
          + 6 * Mm * C * FLOAT                   // h, a, att, proj, fbuf, ff2  [M,C]
-         + Mm * 3 * C * FLOAT                   // qkv    [M,3C]
+         + Mm * qkv_stride(d) * FLOAT           // qkv    [M,C+2*D_KV] (== [M,3C] under MHA)
          + 2 * Mm * F * FLOAT                   // ff1, gact  [M,F]
          + Mm * V * FLOAT;                      // logits [M,V]
 }
@@ -189,26 +202,26 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
                         + Mm * C * A            // a [M,C] single checkpoint scratch (bf16)
                         + Mm * C * A            // fbuf [M,C] bf16 FFN checkpoint scratch
                         + 2 * Mm * F * A        // ff1, gact  [M,F] bf16 FFN scratch
-                        + Mm * 3 * C * A        // qkv [M,3C] single checkpoint scratch (bf16, recomputed in bwd)
+                        + Mm * qkv_stride(d) * A // qkv [M,C+2*D_KV] single checkpoint scratch (bf16, recomputed in bwd)
                         + Mm * C * A;           // att [M,C] single checkpoint scratch (bf16, recomputed in bwd)
     const u64 grad      = 2 * Mm * C * FLOAT    // dh, da  [M,C] f32
                         + Mm * C * A            // datt [M,C] bf16
                         + Mm * C * (FLOAT + A)  // dfbuf [M,C] f32 + dh16 [M,C] bf16
-                        + Mm * 3 * C * A        // dqkv  [M,3C] bf16
+                        + Mm * qkv_stride(d) * A // dqkv  [M,C+2*D_KV] bf16
                         + 2 * Mm * F * A        // dff1, dgact  [M,F] bf16
-                        + 3 * C * C * FLOAT     // dwqkv [C,3C] (batch-independent temp)
+                        + C * qkv_stride(d) * FLOAT  // dwqkv [C,C+2*D_KV] (batch-independent temp)
                         + Mm * INT              // dtargets  [M]
                         + u64(MAX_DEVICE_BATCH) * INT   // lengths [MAX_DEVICE_BATCH] (constant: covers any
                                                         // effective batch the row budget admits, see train_alloc)
                         + u64(MAX_DEVICE_BATCH) * INT   // active [MAX_DEVICE_BATCH] (CE loss-mask normalizer,
                                                         // mirrors lengths -- see ce_backward_kernel)
                         + DBL;                  // loss [1] (double)
-    // qk_pre [M,2C] act_t: the pre-norm Q/K stash QK-norm's backward needs (USE_QK_NORM only). The
+    // qk_pre [M,C+D_KV] act_t: the pre-norm Q/K stash QK-norm's backward needs (USE_QK_NORM only). The
     // backward recompute overwrites g_tr.qkv in place with RoPE's output immediately after the QKV
     // GEMM, before qknorm's own backward (which sits BEFORE RoPE in the forward graph) ever runs --
     // by the time it would need the pre-norm values, they no longer survive anywhere else. Zero bytes
     // when qk_norm is off (the common case).
-    const u64 qk_pre    = d.qk_norm ? Mm * 2 * C * A : 0;
+    const u64 qk_pre    = d.qk_norm ? Mm * qk_pre_stride(d) * A : 0;
     return L * per_layer + final_blk + grad + qk_pre;
 }
 
