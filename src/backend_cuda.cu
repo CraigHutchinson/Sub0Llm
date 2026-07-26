@@ -2730,6 +2730,17 @@ static_assert(check_layer_offsets(),
     "layer_base()/kLn1../kFinalBase drifted from the real PARAM_LAYOUT table -- update the constants "
     "above to match make_param_layout() in layout.hpp.");
 
+// Grouped-query attention is CPU-only for now. This file fuses Q/K/V into one [M, 3*D_MODEL] buffer
+// with in_stride == 3*D_MODEL baked into the RoPE, QK-norm, attention and split kernels, and its
+// dk/dv backward kernels are atomic-free precisely BECAUSE each dk_j/dv_j is written exactly once --
+// an invariant GQA breaks, since a KV head is then shared by N_HEADS/N_KV_HEADS query heads. Compiling
+// a GQA config against this backend would produce silently wrong K/V strides and doubly-written
+// gradients, so fail the BUILD rather than let that reach a training run (AGENTS.md 3's "trace what
+// happens when old assumptions meet new code before deciding a change is safe").
+static_assert(N_KV_HEADS == N_HEADS,
+    "The CUDA backend does not support grouped-query attention yet (N_KV_HEADS < N_HEADS). Configure "
+    "with --kv-heads equal to --heads, or build with -DSUB0_COMPUTE=CPU.");
+
 // One decode step on the device: token `id` at window position `pos`, reusing the M=1 dense launches
 // and the K/V cache. Writes logits into g_fwd.logits[0..VOCAB). Requires uploaded params + wqkv +
 // fwd_alloc(1) + kv_alloc(); the caller resets pos to 0 at the start of a sequence.
