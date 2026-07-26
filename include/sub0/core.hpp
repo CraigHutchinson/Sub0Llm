@@ -123,10 +123,15 @@ SUB0_API const float* last_hidden_ptr();
 // by the caller (tests/factspike_engine_tests.cpp), matching this project's own "don't build production
 // abstractions before they're validated" discipline (project memory only-add-arguments-we-need).
 //
-// Read accessors: raw pointers into the calling thread's KV-cache row at (layer, pos) -- D_MODEL floats,
-// thread-local, CPU backend only, same "valid until the next kv_reset()/forward_one() on this thread"
-// contract as last_hidden_ptr() above. Two named functions (not one function + a bool selector) so a
-// call site never has to decode what `true`/`false` means at the call.
+// Read accessors: raw pointers into the calling thread's KV-cache row at (layer, pos) -- D_KV floats
+// (== D_MODEL unless grouped-query attention narrows K/V), thread-local, CPU backend only, same "valid
+// until the next kv_reset()/forward_one() on this thread" contract as last_hidden_ptr() above. Two
+// named functions (not one function + a bool selector) so a call site never has to decode what
+// `true`/`false` means at the call.
+//
+// `layer` is an EXECUTION index in [0, LOOP_EXEC_COUNT), not a layer index. The two coincide unless
+// LoopSplit is enabled, where a repeated middle layer runs several times per token and each execution
+// keeps its own K/V history -- see layout.hpp's LAYER_EXEC_ORDER.
 SUB0_API const float* kv_krow_ptr(int layer, int pos);
 SUB0_API const float* kv_vrow_ptr(int layer, int pos);
 // Rotate `row` (D_MODEL floats, K-shaped) in place by RoPE's angle at `pos` -- a thin export of the

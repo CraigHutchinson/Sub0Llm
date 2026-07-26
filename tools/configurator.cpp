@@ -571,6 +571,8 @@ int main(int argc, char** argv) {
     int n_layers     = 0;
     int n_heads      = 0;
     int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
+    int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
+    int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
     int seq_len      = 0;
     int ternary      = 0;
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
@@ -611,6 +613,12 @@ int main(int argc, char** argv) {
     app.add_option("--heads",  n_heads, "Attention head count (0 = auto)")->capture_default_str();
     app.add_option("--kv-heads", n_kv_heads,
                    "Key/value head count for grouped-query attention (0 = same as --heads, i.e. plain MHA)")
+       ->capture_default_str();
+    app.add_option("--loop-middle-layers", loop_middle,
+                   "LoopSplit: size of the weight-shared middle block re-executed each pass (0 = off)")
+       ->capture_default_str();
+    app.add_option("--loop-repeats", loop_repeats,
+                   "LoopSplit: how many times the middle block runs (1 = off)")
        ->capture_default_str();
     app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
@@ -751,6 +759,25 @@ int main(int argc, char** argv) {
     if (n_kv_heads < 1 || n_heads % n_kv_heads != 0) {
         std::println(stderr, "configure error: kv-heads ({}) must be >= 1 and divide heads ({}) evenly",
                      n_kv_heads, n_heads);
+        return 1;
+    }
+    // LoopSplit: the head and tail blocks split what's left of the stack evenly around the middle,
+    // so (n_layers - loop_middle) must be even. Mirrors layout.hpp's own static_asserts, but as a
+    // configure-time diagnostic naming the flags rather than a compile error in the engine.
+    if (loop_middle < 0 || loop_middle > n_layers) {
+        std::println(stderr, "configure error: loop-middle-layers ({}) must be within [0, layers ({})]",
+                     loop_middle, n_layers);
+        return 1;
+    }
+    if (loop_repeats < 1) {
+        std::println(stderr, "configure error: loop-repeats ({}) must be at least 1", loop_repeats);
+        return 1;
+    }
+    // Only when looping is actually requested -- an odd-layer model with the feature OFF is fine.
+    if (loop_middle > 0 && loop_repeats > 1 && (n_layers - loop_middle) % 2 != 0) {
+        std::println(stderr,
+                     "configure error: layers ({}) - loop-middle-layers ({}) must be even so the "
+                     "head and tail blocks are symmetric", n_layers, loop_middle);
         return 1;
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
@@ -1188,6 +1215,11 @@ int main(int argc, char** argv) {
     // (N_KV_HEADS == N_HEADS is plain MHA, the default). Shrinks Wk/Wv and the KV cache by
     // N_HEADS/N_KV_HEADS -- see op_attn in backend_cpu.cpp and layout.hpp's Wk/Wv entries.
     cos << "constexpr int  N_KV_HEADS  = " << n_kv_heads << ";\n";
+    // LoopSplit: an un-looped head block, a middle block of LOOP_MIDDLE_LAYERS re-executed
+    // LOOP_REPEATS times reusing the SAME weights, then an un-looped tail -- effective depth at a
+    // fixed parameter count. 0/1 is off. See layout.hpp's make_layer_execution_order().
+    cos << "constexpr int  LOOP_MIDDLE_LAYERS = " << loop_middle  << ";\n";
+    cos << "constexpr int  LOOP_REPEATS       = " << loop_repeats << ";\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
     // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
     // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.

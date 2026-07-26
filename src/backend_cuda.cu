@@ -2745,6 +2745,20 @@ static_assert(N_KV_HEADS == N_HEADS,
     "The CUDA backend does not support grouped-query attention yet (N_KV_HEADS < N_HEADS). Configure "
     "with --kv-heads equal to --heads, or build with -DSUB0_COMPUTE=CPU.");
 
+// LoopSplit is CPU-only for the same class of reason, but a DIFFERENT specific one, and this is the
+// dangerous direction: re-executing a layer means its weights are used more than once per forward, so
+// every parameter gradient must ACCUMULATE. The CPU backend already does (`+=` throughout
+// backward_node). This backend deliberately OVERWRITES -- launch_linear_bwd_t's dW GEMM runs with
+// beta=0, split_dqkv_kernel assigns with `=`, bias_grad_act_kernel assigns with `=` -- all justified
+// by "each weight is used once per forward", which LoopSplit falsifies. The failure mode is not a
+// crash or a wrong shape: it is a quietly wrong gradient (only the LAST execution's contribution
+// surviving), which would look like a training run that simply learns worse. Fail the build instead.
+// Per-execution TrainScratch buffers and KV slots would also be needed. See roadmap 2a.
+static_assert(LOOP_MIDDLE_LAYERS == 0 || LOOP_REPEATS == 1,
+    "The CUDA backend does not support LoopSplit yet (weight-shared repeated layers need accumulating "
+    "dW writes; this backend overwrites them). Configure with --loop-repeats 1, or build with "
+    "-DSUB0_COMPUTE=CPU.");
+
 // One decode step on the device: token `id` at window position `pos`, reusing the M=1 dense launches
 // and the K/V cache. Writes logits into g_fwd.logits[0..VOCAB). Requires uploaded params + wqkv +
 // fwd_alloc(1) + kv_alloc(); the caller resets pos to 0 at the start of a sequence.

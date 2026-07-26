@@ -91,14 +91,16 @@ consteval size_t calc_act_cap() {
                 + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0)   // op_rope(q), op_rope(k)
                 + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0);  // op_qknorm(q), op_qknorm(k) + rinv scratch
     size_t fin  = T * C + 2 * T * V + 64;
-    return base + (size_t)N_LAYERS * per + fin;
+    // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
+    // activation nodes R times (the weights are shared; the activations are not).
+    return base + (size_t)LOOP_EXEC_COUNT * per + fin;
 }
 constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
 // The gated FFN adds one extra per-layer node (gate-linear + up-linear + swiglu vs. W1-linear +
 // gelu) -- a generous flat per-layer headroom either way, not a tight count. QK-norm adds 2 more
 // per-layer nodes (op_qknorm(q), op_qknorm(k)).
-constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)N_LAYERS
-                                + (USE_QK_NORM ? 2 * (size_t)N_LAYERS : 0);
+constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_COUNT
+                                + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0);
 
 // ============================================================================
 //  Static storage
@@ -928,9 +930,12 @@ namespace {
 // Dense weights only (the sparse-ternary linear path is not mirrored here); a ternary build keeps
 // the full-forward gen path. Positions must stay < SEQ_LEN (gen falls back past the window).
 struct KVCache {
-    std::vector<float> k, v;                                    // [N_LAYERS][SEQ_LEN][D_KV], flat
+    // Indexed by EXECUTION, not layer: under LoopSplit a repeated middle layer runs several times per
+    // token and each execution attends over its own K/V history, so it needs its own slot. Equal to
+    // N_LAYERS when looping is off.
+    std::vector<float> k, v;                                    // [LOOP_EXEC_COUNT][SEQ_LEN][D_KV], flat
     void reset() {
-        const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * D_KV;
+        const size_t n = static_cast<size_t>(LOOP_EXEC_COUNT) * SEQ_LEN * D_KV;
         if (k.size() != n) { k.assign(n, 0.f); v.assign(n, 0.f); }
     }
     // Rows are D_KV wide, not D_MODEL: under GQA the cache holds N_KV_HEADS heads, which is the whole
@@ -1103,7 +1108,12 @@ struct Model {
         } else {
             h = op_embed(tok_emb, ids, T);   // RoPE injects position inside attention instead
         }
-        for (auto& L : layers) {
+        // LAYER_EXEC_ORDER, not `layers` directly: under LoopSplit the middle block's indices repeat,
+        // re-running the SAME Layer (same parameter Nodes) several times. The backward needs no change
+        // for that -- every CPU parameter-gradient write is `+=` (see backward_node's Op::Linear dW
+        // block), which the codebase already relies on for tied embeddings. Off, this is 0..N_LAYERS-1.
+        for (const int li : LAYER_EXEC_ORDER) {
+            Layer& L = layers[static_cast<std::size_t>(li)];
             Node* a = op_rmsnorm(h, L.ln1);
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
@@ -1183,8 +1193,11 @@ struct Model {
             const float* pe = pos_emb->data.data() + static_cast<size_t>(pos) * C;
             for (int j = 0; j < C; ++j) h[j] += pe[j];
         }
-        for (int l = 0; l < N_LAYERS; ++l) {
-            Layer& L = layers[l];
+        // `e` is the EXECUTION index (the KV-cache slot); `li` is which layer's weights run there.
+        // They differ only under LoopSplit -- see LAYER_EXEC_ORDER and KVCache's own comments.
+        for (int e = 0; e < LOOP_EXEC_COUNT; ++e) {
+            const int l = LAYER_EXEC_ORDER[static_cast<std::size_t>(e)];
+            Layer& L = layers[static_cast<std::size_t>(l)];
             rmsnorm_row(h, L.ln1, a, C);
             linear_row(a, L.Wq, nullptr, qn, C, C);
             // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row both
@@ -1194,7 +1207,7 @@ struct Model {
             linear_row(a, L.Wv, nullptr, vn, C, D_KV);
             if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
             if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
-            float* kc = g_kv.krow(l, pos); float* vc = g_kv.vrow(l, pos);        // append this token's K/V
+            float* kc = g_kv.krow(e, pos); float* vc = g_kv.vrow(e, pos);        // append this token's K/V
             for (int j = 0; j < D_KV; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
             for (int hd = 0; hd < H; ++hd) {                                     // attend query pos over j<=pos
                 const int off    = hd * d;
@@ -1202,7 +1215,7 @@ struct Model {
                 std::array<float, SEQ_LEN> sc{};
                 float mx = -1e30f;
                 for (int j = 0; j <= pos; ++j) {
-                    const float* kj = g_kv.krow(l, j) + off_kv;
+                    const float* kj = g_kv.krow(e, j) + off_kv;
                     float s = 0.f; for (int aa = 0; aa < d; ++aa) s += qn[off + aa] * kj[aa];
                     s *= scale; sc[j] = s; mx = std::max(mx, s);
                 }
@@ -1210,7 +1223,7 @@ struct Model {
                 for (int j = 0; j <= pos; ++j) { sc[j] = FAST_MATH ? fast_exp(sc[j] - mx) : std::exp(sc[j] - mx); Z += sc[j]; }
                 for (int aa = 0; aa < d; ++aa) att[off + aa] = 0.f;
                 for (int j = 0; j <= pos; ++j) {
-                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(l, j) + off_kv;
+                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(e, j) + off_kv;
                     for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
                 }
             }

@@ -118,6 +118,8 @@ struct ModelMeta {
     X(int,         n_layers,        0)    \
     X(int,         n_heads,         0)    \
     X(int,         n_kv_heads,      0)    \
+    X(int,         loop_middle,     0)    \
+    X(int,         loop_repeats,    1)    \
     X(int,         seq_len,         0)    \
     X(int,         vocab,           0)    \
     X(int,         ternary,         0)    \

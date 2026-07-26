@@ -1406,6 +1406,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::registry::RunConfig cfg;
         cfg.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
         cfg.d_model = D_MODEL; cfg.n_layers = N_LAYERS; cfg.n_heads = N_HEADS; cfg.n_kv_heads = N_KV_HEADS;
+        cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
         cfg.seq_len = SEQ_LEN; cfg.vocab = VOCAB; cfg.ternary = static_cast<int>(USE_TERNARY);
         cfg.pos_encoding = static_cast<int>(POS_ENCODING);
         cfg.gated_ffn = static_cast<int>(USE_GATED_FFN);

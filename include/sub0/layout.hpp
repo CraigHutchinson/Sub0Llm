@@ -41,6 +41,46 @@ static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 // shape as USE_TIED_EMBEDDINGS' lm_head/lm_bias below.
 inline constexpr bool HAS_POS_EMB = (POS_ENCODING == PosEncoding::Absolute);
 
+// --- LoopSplit: a weight-shared repeated middle block -------------------------------------------
+// An un-looped head block, a MIDDLE block executed LOOP_REPEATS times reusing the SAME weights, then
+// an un-looped tail block -- a refinement of "Looped Transformers" that loops only the reasoning core
+// rather than the whole stack, so early feature extraction and late output layers stay single-pass.
+// Buys effective depth at a fixed parameter count. LOOP_MIDDLE_LAYERS == 0 (or LOOP_REPEATS == 1) is
+// OFF, and at that setting every expression below collapses to the plain 0..N_LAYERS-1 sequence.
+//
+// Deliberately NOT a parameter-layout change: the loop re-executes EXISTING layer indices, and
+// make_param_layout() is keyed on layer index, so no new tensors and no checkpoint change. What DOES
+// grow is per-EXECUTION state -- activation arena, node pool and KV-cache slots (see LOOP_EXEC_COUNT's
+// use in backend_cpu.cpp).
+inline constexpr bool LOOP_SPLIT_ON   = (LOOP_MIDDLE_LAYERS > 0 && LOOP_REPEATS > 1);
+
+static_assert(LOOP_MIDDLE_LAYERS >= 0 && LOOP_MIDDLE_LAYERS <= N_LAYERS,
+              "LOOP_MIDDLE_LAYERS must be within [0, N_LAYERS]");
+static_assert(LOOP_REPEATS >= 1, "LOOP_REPEATS must be at least 1");
+// Only meaningful when looping is actually ON: with no middle block there is no head/tail split to
+// keep symmetric, and requiring it unconditionally would reject every ODD-layer model (N_LAYERS - 0
+// is odd) even with the feature disabled -- which would break the "zero effect when off" contract.
+static_assert(!LOOP_SPLIT_ON || (N_LAYERS - LOOP_MIDDLE_LAYERS) % 2 == 0,
+              "N_LAYERS - LOOP_MIDDLE_LAYERS must be even so the head and tail blocks are symmetric");
+inline constexpr int  LOOP_MID_START  = (N_LAYERS - LOOP_MIDDLE_LAYERS) / 2;
+inline constexpr int  LOOP_MID_END    = LOOP_MID_START + LOOP_MIDDLE_LAYERS;
+// Total layer EXECUTIONS per forward pass (== N_LAYERS when off).
+inline constexpr int  LOOP_EXEC_COUNT = N_LAYERS + LOOP_MIDDLE_LAYERS * (LOOP_REPEATS - 1);
+
+// The execution order, resolved at compile time. consteval + std::array rather than building a
+// std::vector per forward() call: this is the engine's hottest path and AGENTS.md 1 forbids heap
+// allocation there. Same shape as make_param_layout() below.
+consteval std::array<int, LOOP_EXEC_COUNT> make_layer_execution_order() {
+    std::array<int, LOOP_EXEC_COUNT> order{};
+    int i = 0;
+    for (int l = 0; l < LOOP_MID_START; ++l) order[i++] = l;                    // head, once
+    for (int r = 0; r < LOOP_REPEATS; ++r)                                      // middle, repeated
+        for (int l = LOOP_MID_START; l < LOOP_MID_END; ++l) order[i++] = l;
+    for (int l = LOOP_MID_END; l < N_LAYERS; ++l) order[i++] = l;               // tail, once
+    return order;
+}
+inline constexpr std::array<int, LOOP_EXEC_COUNT> LAYER_EXEC_ORDER = make_layer_execution_order();
+
 // Parameter tensor count: tok_emb, plus pos_emb only under absolute positions (see HAS_POS_EMB),
 // then per transformer block either 10 (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9
 // (gated: ln1, ln2, Wq, Wk, Wv, Wo, Wg, W1, W2 -- SwiGLU, no FFN biases, matching the GGUF/Llama
