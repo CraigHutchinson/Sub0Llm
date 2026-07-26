@@ -535,7 +535,7 @@ static Node* op_rope(Node* x, int H) {
         for (int h = 0; h < H; ++h) {
             const int off = h * d;
             for (int m = 0; m < half; ++m) {
-                const float ang = t * std::pow(ROPE_THETA, -2.f * m / d);
+                const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
                 const float cs = std::cos(ang), sn = std::sin(ang);
                 const float x0 = xr[off + 2 * m], x1 = xr[off + 2 * m + 1];
                 yr[off + 2 * m]     = x0 * cs - x1 * sn;
@@ -839,7 +839,7 @@ static void backward_node(Node& n) {
             for (int h = 0; h < H; ++h) {
                 const int off = h * d;
                 for (int m = 0; m < half; ++m) {
-                    const float ang = t * std::pow(ROPE_THETA, -2.f * m / d);
+                    const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
                     const float cs = std::cos(ang), sn = std::sin(ang);
                     const float g0 = gyr[off + 2 * m], g1 = gyr[off + 2 * m + 1];
                     gxr[off + 2 * m]     +=  g0 * cs + g1 * sn;
@@ -992,7 +992,7 @@ static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // r
     for (int h = 0; h < H; ++h) {
         const int off = h * d;
         for (int m = 0; m < half; ++m) {
-            const float ang = pos * std::pow(ROPE_THETA, -2.f * m / d);
+            const float ang = (static_cast<float>(pos) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
             const float cs = std::cos(ang), sn = std::sin(ang);
             const float x0 = x[off + 2 * m], x1 = x[off + 2 * m + 1];
             x[off + 2 * m]     = x0 * cs - x1 * sn;

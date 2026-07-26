@@ -690,7 +690,7 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float the
     if (m >= batch * T || pg >= C / 2) return;
     const int h  = pg / half, mi = pg % half;
     const int a0 = h * d + 2 * mi;
-    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d);
+    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
     float sn, cs; __sincosf(ang, &sn, &cs);
     float* row = qkv + static_cast<size_t>(m) * in_stride;
     const float q0 = row[a0],     q1 = row[a0 + 1];
@@ -928,7 +928,7 @@ template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batc
     const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= C / 2) return;
     const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
+    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
     A* row = qkv + static_cast<size_t>(m) * in_stride;
     const float q0 = to_f32(row[a0]), q1 = to_f32(row[a0 + 1]); st_act(&row[a0], q0*cs-q1*sn); st_act(&row[a0+1], q0*sn+q1*cs);
     const float k0 = to_f32(row[C+a0]), k1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], k0*cs-k1*sn); st_act(&row[C+a0+1], k0*sn+k1*cs);
@@ -938,7 +938,7 @@ template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int b
     const int pg = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= C / 2) return;
     const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = static_cast<float>(m % T) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
+    const float ang = (static_cast<float>(m % T) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d); float sn, cs; __sincosf(ang, &sn, &cs);
     A* row = dq + static_cast<size_t>(m) * in_stride;
     const float g0 = to_f32(row[a0]), g1 = to_f32(row[a0+1]); st_act(&row[a0], g0*cs+g1*sn); st_act(&row[a0+1], -g0*sn+g1*cs);
     const float h0 = to_f32(row[C+a0]), h1 = to_f32(row[C+a0+1]); st_act(&row[C+a0], h0*cs+h1*sn); st_act(&row[C+a0+1], -h0*sn+h1*cs);
@@ -2577,7 +2577,7 @@ __global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const floa
 __device__ inline void rope_one_body(float* __restrict__ qkv, int pos, float theta, int pg) {
     constexpr int C = D_MODEL, d = D_HEAD, half = d / 2;
     const int h = pg / half, mi = pg % half, a0 = h * d + 2 * mi;
-    const float ang = static_cast<float>(pos) * powf(theta, -2.0f * mi / d);
+    const float ang = (static_cast<float>(pos) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
     float sn, cs; __sincosf(ang, &sn, &cs);
     const float q0 = qkv[a0],     q1 = qkv[a0 + 1];     qkv[a0]     = q0 * cs - q1 * sn; qkv[a0 + 1]     = q0 * sn + q1 * cs;
     const float k0 = qkv[C + a0], k1 = qkv[C + a0 + 1]; qkv[C + a0] = k0 * cs - k1 * sn; qkv[C + a0 + 1] = k0 * sn + k1 * cs;

@@ -573,6 +573,8 @@ int main(int argc, char** argv) {
     int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
+    int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
+    double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
     int ternary      = 0;
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
@@ -619,6 +621,12 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--loop-repeats", loop_repeats,
                    "LoopSplit: how many times the middle block runs (1 = off)")
+       ->capture_default_str();
+    app.add_option("--rope-scaling", rope_scaling,
+                   "RoPE position scaling for context extension: 0 = none, 1 = linear")
+       ->capture_default_str()->check(CLI::Range(0, 1));
+    app.add_option("--rope-scale-factor", rope_scale_factor,
+                   "Linear RoPE scaling divisor, e.g. 4 to run a 4x longer window")
        ->capture_default_str();
     app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
@@ -1220,6 +1228,10 @@ int main(int argc, char** argv) {
     // fixed parameter count. 0/1 is off. See layout.hpp's make_layer_execution_order().
     cos << "constexpr int  LOOP_MIDDLE_LAYERS = " << loop_middle  << ";\n";
     cos << "constexpr int  LOOP_REPEATS       = " << loop_repeats << ";\n";
+    // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
+    // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
+    cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
+    cos << "constexpr float ROPE_SCALE_FACTOR = " << std::format("{:.4f}", rope_scale_factor) << "f;\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
     // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
     // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.

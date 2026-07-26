@@ -41,6 +41,30 @@ static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 // shape as USE_TIED_EMBEDDINGS' lm_head/lm_bias below.
 inline constexpr bool HAS_POS_EMB = (POS_ENCODING == PosEncoding::Absolute);
 
+// --- RoPE position scaling (context extension) --------------------------------------------------
+// Linear scaling divides the POSITION before the angle is formed, stretching the same rotation over a
+// longer window so positions beyond the trained one stay in-distribution. Taken verbatim from the
+// reference implementation rather than from recall (AGENTS.md 5) -- Nanbeige's own
+// NanbeigeLinearScalingRotaryEmbedding, whose entire body is:
+//     position_ids = position_ids.float() / self.scaling_factor
+// Convention re-derivation against THIS engine (also AGENTS.md 5, which requires it explicitly):
+//   * The reference's `dim` is the head dimension; ours is D_HEAD. Its inv_freq exponent
+//     `arange(0,dim,2)/dim` equals our `-2*m/d` for m in [0, d/2). Same frequencies.
+//   * The reference rotates HALF-SPLIT pairs, ours rotates INTERLEAVED pairs. That difference is real
+//     but ORTHOGONAL here: scaling changes only the angle's position term, never which components
+//     pair up, so it transfers unchanged.
+//   * Our position variable is `t` in op_rope, `pos` in rope_row, and `m % T` in the CUDA kernels --
+//     all the same quantity, so all of them scale identically.
+// ROPE_POS_SCALE is the single multiplier every angle site applies. At RopeScaling::None it is
+// exactly 1.0f, and IEEE-754 multiplication by 1.0 is exact, so the disabled path stays bit-identical.
+enum class RopeScaling { None = 0, Linear = 1 };
+inline constexpr RopeScaling ROPE_SCALING_MODE = static_cast<RopeScaling>(ROPE_SCALING);
+static_assert(ROPE_SCALE_FACTOR > 0.0f, "ROPE_SCALE_FACTOR must be positive");
+static_assert(ROPE_SCALING_MODE == RopeScaling::None || ROPE_SCALE_FACTOR >= 1.0f,
+              "linear RoPE scaling expects a factor >= 1 (it stretches positions over a longer window)");
+inline constexpr float ROPE_POS_SCALE =
+    (ROPE_SCALING_MODE == RopeScaling::Linear) ? (1.0f / ROPE_SCALE_FACTOR) : 1.0f;
+
 // --- LoopSplit: a weight-shared repeated middle block -------------------------------------------
 // An un-looped head block, a MIDDLE block executed LOOP_REPEATS times reusing the SAME weights, then
 // an un-looped tail block -- a refinement of "Looped Transformers" that loops only the reasoning core

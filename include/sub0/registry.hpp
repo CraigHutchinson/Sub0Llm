@@ -120,6 +120,8 @@ struct ModelMeta {
     X(int,         n_kv_heads,      0)    \
     X(int,         loop_middle,     0)    \
     X(int,         loop_repeats,    1)    \
+    X(int,         rope_scaling,    0)    \
+    X(double,      rope_scale_fac,  1.0)  \
     X(int,         seq_len,         0)    \
     X(int,         vocab,           0)    \
     X(int,         ternary,         0)    \
@@ -164,6 +166,7 @@ inline const char* enum_name(std::string_view field, int v) {
     auto nth = [v](std::initializer_list<const char*> names) -> const char* {
         int i = 0; for (const char* n : names) if (i++ == v) return n; return nullptr; };
     if (field == "pos_encoding") return nth({"learned", "rope"});
+    if (field == "rope_scaling") return nth({"none", "linear"});
     if (field == "optimizer")    return nth({"adamw", "muon"});
     if (field == "gated_ffn" || field == "tied_embeddings" || field == "qk_norm" || field == "ternary")
         return nth({"off", "on"});
