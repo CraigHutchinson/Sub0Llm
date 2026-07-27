@@ -110,14 +110,22 @@ considered correct — passing compilation and "the loss goes down" are not suff
 
 ## 7. Test at more than one scale — bugs and behavior can be dims-dependent
 
-`engine_tests.cpp`'s gradient-check test fails deterministically at production dims (d448 L11 H7) but
-passes cleanly at tiny dims (d32 L2 H4) — same test, same code, different scale, different outcome (see
-memory: `engine-tests-gradient-check-dims-dependent`). A correctness check that only ever runs at one
-scale can miss a real, scale-dependent problem entirely.
+LoopSplit's head/tail symmetry `static_assert` rejected every ODD-layer model even with the feature
+switched OFF (`N_LAYERS - 0` is odd). It was invisible on the 8-layer toy config and failed instantly on
+the 11-layer one — same code, different scale, different outcome. A correctness check that only ever
+runs at one scale can miss a real, scale-dependent problem entirely.
 
 **Rule**: when verifying new engine-level math, run the check at more than one model scale where
 practical — at minimum a tiny fast-iteration config AND something closer to a real production config,
 not just whichever is most convenient to compile.
+
+**The tiny config must still be REALISTIC in every axis you are not deliberately varying — vocabulary
+especially.** `engine_tests.cpp`'s gradient check reads ~3.8% low on a 493-token toy vocabulary and is
+exact (0.9999+) at vocab 16535, at *every* size from d96 L8 H2 up to d448 L11 H7. That artefact was
+misread for three weeks as "the gradient check fails at production dims", which sent a real investigation
+in exactly the wrong direction and nearly triggered a needless redesign of the test. Prefer d96 L8 H2 at
+a real vocabulary as the fast scale over a spike config; `factspike96` (vocab 493) must not gate
+numerical gradient work. See memory `engine-tests-gradient-check-dims-dependent` for the measurements.
 
 ## 8. Only add the surface area actually consumed
 
