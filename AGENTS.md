@@ -174,6 +174,30 @@ Prefer removing the class over fixing the instance: `current_build_dims()` exist
 `Dims` initialisations produced three bugs, and `registry::describe_config()` exists because three
 hand-listed config banners each omitted a different axis.
 
+## 11. Spikes are temporary — retire them from the build once their finding has merged
+
+A spike exists to answer a question. Once answered, the ANSWER belongs in the mainline and the spike's
+scaffolding does not: it keeps costing build time on every configuration, keeps having to compile
+through unrelated refactors, and keeps inviting the mistake of treating an exploratory toy config as a
+correctness gate. A spike that is PARKED rather than successful does not need to keep being verified
+at all.
+
+**Objective membership test — so this is not re-litigated per spike**: a spike's tests may be gated once
+NOTHING in `src/` or `tools/` includes its header. That is the mechanical signal that the finding was
+merged and only scaffolding remains.
+
+- `factspike` qualified: its finding (marker-inclusive span replay) had merged into `corpus_collapse.hpp`,
+  which cites it, and nothing in `src/`/`tools/` includes `factspike.hpp`. Retired behind
+  `SUB0_BUILD_SPIKE_TESTS` (OFF by default).
+- `scratchspike` and `corpus_collapse` did NOT qualify: `train_stage.cpp` consumes both as blend sources,
+  so their tests cover a production path and stay in the default build.
+
+**Gate, don't delete.** Reviving parked work should be one flag, not archaeology. Verify the gate is a
+true round trip — turning it back ON must restore the exact prior assertion counts, proving it changed
+nothing but inclusion. And handle the fallout rather than leaving it dangling: any engine API whose only
+consumer was the gated spike should say so at its declaration (keep it if it is the substrate that work
+would resume from), and any recorded baseline that cited the spike's config must be re-recorded.
+
 ## Before you ship — quick checklist
 
 - [ ] Any new per-step/per-call code path: zero heap allocation, scratch reused not reallocated (§1)
@@ -191,3 +215,5 @@ hand-listed config banners each omitted a different axis.
 - [ ] Import/interop features validated against a real external file/corpus, not fixtures alone (§9)
 - [ ] Any changed shared width/semantic/format/config axis: consumers enumerated repo-wide, full suite
       run unfiltered with the feature ON, new compile-time axis classified against `ARCH_FINGERPRINT` (§10)
+- [ ] Spike whose finding has merged (no `src/`/`tools/` include of its header): gated out of the default
+      build, gate verified as a round trip, orphaned API + baselines updated (§11)
