@@ -133,6 +133,39 @@ and statistically sane weight distributions. Synthetic fixtures prove the parser
 prove real-world byte-format fidelity. The same principle applied to the Muon A/B: a real corpus
 (`data/tinystories.txt`), not just a toy file, before trusting the throughput/convergence numbers.
 
+## 10. Changing a shared surface? Enumerate its CONSUMERS — the diff does not show you them
+
+Three defects in the GQA/LoopSplit cycle were invisible in the diff and invisible to green test suites,
+and all three were found the same way: by grepping for *consumers* of a surface the diff changed, not by
+re-reading the diff.
+
+- KV-cache rows narrowed from `D_MODEL` to `D_KV`. The engine side was updated; `tests/factspike_engine_tests.cpp`
+  still copied `D_MODEL` floats out of them — an out-of-bounds read on every row, in the default test target.
+  The `core.hpp` doc comment had already been updated to say `D_KV`; the callers of that doc were not.
+- `memplan::Dims` gained two fields. Five sites aggregate-initialised it positionally; three were missed
+  across two separate commits, silently mis-predicting VRAM and the *recommended* batch size.
+- `LOOP_MIDDLE_LAYERS`/`LOOP_REPEATS`, and later `ROPE_THETA`, changed what the model computes without
+  changing any tensor shape — so no `Header` field and not `PARAM_FLOATS` could discriminate them, and a
+  checkpoint loaded silently into the wrong architecture.
+
+**Rule**: when a change alters a shared *width*, *semantic*, *serialized format*, or *config axis*, list
+every consumer repo-wide (`grep -rn <symbol> --include=*.cpp --include=*.hpp --include=*.cu`) and check
+each one, including tests and tools. Then:
+
+1. **Run the full suite with the feature ON at least once, unfiltered.** The GQA runs were CUDA-only and
+   tag-filtered (`[cuda]`), so the file carrying the out-of-bounds read never executed under GQA at all.
+   A filtered run is not evidence about the files it filtered out.
+2. **Prove variants actually differ by a DERIVED quantity, not a banner.** All three arms of a `--kv-heads`
+   A/B printed byte-identical config lines; only the parameter counts showed they were different builds.
+3. **For a new compile-time axis, classify it**: shape-changing (`PARAM_FLOATS` discriminates it),
+   computation-changing but shape-neutral (must join `ARCH_FINGERPRINT` in `layout.hpp`, or it loads
+   silently and computes the wrong thing), or deliberately variable between train and inference (exclude,
+   and record why). See `ARCH_FINGERPRINT`'s own comment.
+
+Prefer removing the class over fixing the instance: `current_build_dims()` exists because five hand-listed
+`Dims` initialisations produced three bugs, and `registry::describe_config()` exists because three
+hand-listed config banners each omitted a different axis.
+
 ## Before you ship — quick checklist
 
 - [ ] Any new per-step/per-call code path: zero heap allocation, scratch reused not reallocated (§1)
@@ -148,3 +181,5 @@ prove real-world byte-format fidelity. The same principle applied to the Muon A/
 - [ ] Correctness/perf claims checked at more than one model scale (§7)
 - [ ] No speculative, unconsumed CLI/config surface added (§8)
 - [ ] Import/interop features validated against a real external file/corpus, not fixtures alone (§9)
+- [ ] Any changed shared width/semantic/format/config axis: consumers enumerated repo-wide, full suite
+      run unfiltered with the feature ON, new compile-time axis classified against `ARCH_FINGERPRINT` (§10)
