@@ -6,6 +6,30 @@ CPMAddPackage("gh:catchorg/Catch2@3.7.1")
 list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
 include(Catch)
 
+# Spikes are exploratory and NOT meant to persist: a spike that succeeds has its finding merged into the
+# mainline, after which the spike's own scaffolding is dead weight that still costs build time on every
+# configuration and still has to be kept compiling through unrelated refactors. A spike that is parked
+# does not need to keep being verified at all.
+#
+# OFF by default. Turn on to revive one:  cmake -DSUB0_BUILD_SPIKE_TESTS=ON ...
+#
+# Membership rule: a spike belongs here ONLY once nothing in src/ or tools/ includes its header. That is
+# the objective test for "the finding was merged and the scaffolding is what is left". scratchspike and
+# corpus_collapse deliberately do NOT qualify -- train_stage.cpp consumes both as blend sources, so their
+# tests cover a production path and stay in the default build.
+option(SUB0_BUILD_SPIKE_TESTS "Build tests for PARKED spikes whose findings are already merged" OFF)
+
+# factspike: KV-trace memoization / piece-embedding transfer. Findings merged -- the marker-inclusive
+# span replay it validated lives in corpus_collapse.hpp, which cites it. Nothing in src/ or tools/
+# includes factspike.hpp. Parked 2026-07-26; see memory scratch-spikes-parked-2026-07-26 and
+# docs/FACTSPIKE.md for what it established and how to resume it.
+set(SUB0_SPIKE_TEST_SOURCES factspike_engine_tests.cpp)
+set(SUB0_SPIKE_FRONTEND_TEST_SOURCES factspike_dataset_tests.cpp)
+if(NOT SUB0_BUILD_SPIKE_TESTS)
+  set(SUB0_SPIKE_TEST_SOURCES "")
+  set(SUB0_SPIKE_FRONTEND_TEST_SOURCES "")
+endif()
+
 add_executable(sub0_tests
   tokenizer_tests.cpp
   engine_tests.cpp
@@ -20,7 +44,7 @@ add_executable(sub0_tests
   repeatspike_engine_tests.cpp
   wordspike_engine_tests.cpp
   corpus_collapse_engine_tests.cpp
-  factspike_engine_tests.cpp
+  ${SUB0_SPIKE_TEST_SOURCES}
   persistent_slots_engine_tests.cpp
   persistent_scratchspike_engine_tests.cpp
   pairspike_engine_tests.cpp
@@ -59,7 +83,7 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #   frontend_tests.cpp       — memplan VRAM math (clamp + tuner cap) + registry identity/compat (prune)
 #   gguf_tests.cpp           — GGUF header/KV/tensor-table parsing + Llama-MHA import-compat report
 #   muon_tests.cpp           — Newton-Schulz orthogonalization math (the Muon optimizer's core primitive)
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp factspike_dataset_tests.cpp)
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)

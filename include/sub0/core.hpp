@@ -127,8 +127,11 @@ SUB0_API const float* last_hidden_ptr();
 // (nothing downstream needs a packed word's own query/attention-output/FFN, only later positions'
 // attention over its K/V -- see the framing doc's mechanism-B discussion). Deliberately NOT wired into
 // any bindings struct or forward_one dispatch branch yet -- this is spike-scoped, orchestrated directly
-// by the caller (tests/factspike_engine_tests.cpp), matching this project's own "don't build production
-// abstractions before they're validated" discipline (project memory only-add-arguments-we-need).
+// by the caller. NOTE its only consumer, tests/factspike_engine_tests.cpp, is a PARKED spike and is no
+// longer in the default build (tests/CMakeLists.txt, -DSUB0_BUILD_SPIKE_TESTS=ON revives it). This
+// surface is deliberately kept rather than deleted: it is the substrate the parked KV-trace work
+// would resume from, and it is small, stable and inert when unused. Matches this project's own "don't
+// build production abstractions before they're validated" discipline (memory only-add-arguments-we-need).
 //
 // Read accessors: raw pointers into the calling thread's KV-cache row at (layer, pos) -- D_KV floats
 // (== D_MODEL unless grouped-query attention narrows K/V), thread-local, CPU backend only, same "valid

@@ -32,11 +32,15 @@
 //   assertion loops over the table) and the GRAD hash moved. forward and decode were unaffected:
 //   the table was allocated, zeroed and never read, so it never influenced a forward value.
 //
-// Current, at LOOP/GQA/RoPE-scaling defaults (post-aa64107):
+// Current, at LOOP/GQA/RoPE-scaling defaults, with parked-spike tests OFF (the default):
 //
-//   factspike96  (d96  L8  H2 seq256 vocab493)   suite: 4795446 assertions / 126 cases
-//   d196check    (d196 L11 H7 seq256 vocab16535) suite: 44010206 assertions / 127 cases
+//   d196check    (d196 L11 H7 seq256 vocab16535) suite: 44009991 assertions / 125 cases
 //   hd96_check   (d384 L2  H4 seq256, CUDA)      suite: 4126369 assertions / 42 cases
+//
+// factspike96 (d96 L8 H2 vocab493) is NO LONGER a gate and is deliberately not listed. Its 493-token
+// toy vocabulary makes engine_tests' finite-difference check read ~3.8% low while every realistic-vocab
+// config reads 0.9999+ (see AGENTS.md 7), and its spike is parked with its tests off by default. For a
+// fast second scale use d96 L8 H2 at vocab 16535 -- d196check's corpus with dims overridden.
 //
 // Pre-aa64107 values, kept only to explain the delta above (do NOT compare against these):
 //
