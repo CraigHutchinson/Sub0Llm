@@ -11,6 +11,13 @@
 #pragma once
 
 #include "sub0_config.hpp"  // generated: D_MODEL, N_LAYERS, ..., VOCAB, VOCAB_CHARS, ...
+#include "layout.hpp"       // DERIVED shape constants (sub0::D_KV, GQA_GROUP, LOOP_EXEC_COUNT, ...).
+                            // Pulled in here deliberately: the generated header supplies the RAW config
+                            // at global scope, but anything derived from it lives in namespace sub0, and
+                            // consumers of this API routinely need both. Leaving it out cost three build
+                            // breaks in one session -- each a consumer that reached for a derived
+                            // constant (HAS_POS_EMB, D_KV) and got "no member named ... in namespace
+                            // sub0" or an undeclared identifier. One include here, not N at the callers.
 
 #include <cstdint>
 #include <random>

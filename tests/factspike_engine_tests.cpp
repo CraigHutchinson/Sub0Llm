@@ -124,7 +124,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/core.hpp"
-#include "sub0/layout.hpp"   // sub0::D_KV -- KV-cache row width (narrower than D_MODEL under GQA)
 #include "sub0/decode.hpp"
 #include "sub0/factspike.hpp"
 #include "sub0/scratch_slots.hpp"

@@ -100,11 +100,11 @@ bool save_model(const char* path) {
     const std::uint64_t fp = g_tok.loaded ? tok::fingerprint(g_tok) : 0;
     os.write((const char*)&fp, sizeof(fp));
     // Second trailing record, same additive discipline: the EXECUTION SCHEDULE id (layout.hpp's
-    // ARCH_SCHEDULE_ID). LoopSplit shares weights, so PARAM_FLOATS and every Header field are identical
-    // between a looped and un-looped build -- nothing else in this file can tell them apart, and the
-    // weights are meaningless under the wrong schedule. Appended after the fingerprint so a reader of
-    // either older vintage is unaffected.
-    const std::uint64_t arch = ARCH_SCHEDULE_ID;
+    // ARCH_FINGERPRINT): every axis that changes what the model COMPUTES while leaving PARAM_FLOATS and
+    // the Header alone -- LoopSplit's schedule and ROPE_THETA today. Nothing else in this file can tell
+    // those apart, and the weights are meaningless under the wrong one. Appended after the tokenizer
+    // fingerprint so a reader of either older vintage is unaffected.
+    const std::uint64_t arch = ARCH_FINGERPRINT;
     os.write((const char*)&arch, sizeof(arch));
     return os.good();
 }
@@ -154,15 +154,16 @@ bool load_model(const char* path) {
     std::uint64_t arch = 0;
     is.read((char*)&arch, sizeof(arch));
     const bool arch_present = (is.gcount() == static_cast<std::streamsize>(sizeof(arch)));
-    const std::uint64_t arch_got = arch_present ? arch : ARCH_SCHEDULE_UNLOOPED;
-    if (arch_got != ARCH_SCHEDULE_ID) {
-        std::println(stderr,
-            "error: model was trained under a different layer execution schedule "
-            "(file: {} middle layers x{} repeats; this build: {} x{}). The parameter blob is the same "
-            "SIZE either way -- weights are shared across repeats -- so this cannot be detected from "
-            "shapes alone. Rebuild with matching --loop-middle-layers/--loop-repeats.",
-            static_cast<unsigned>(arch_got >> 32), static_cast<unsigned>(arch_got & 0xffffffffu),
-            LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
+    const std::uint64_t arch_got = arch_present ? arch : ARCH_FINGERPRINT_LEGACY;
+    if (arch_got != ARCH_FINGERPRINT) {
+        const ArchAxes got = arch_axes_of(arch_got);
+        std::println(stderr, "error: model was built with a different architecture than this binary, "
+                             "in a way shapes cannot show (the parameter blob is the same SIZE either way):");
+        std::println(stderr, "  loop schedule : file {} middle layers x{} repeats | this build {} x{}",
+                     got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
+        std::println(stderr, "  rope theta    : file {:g} | this build {:g}",
+                     got.rope_theta, static_cast<double>(ROPE_THETA));
+        std::println(stderr, "Rebuild with matching --loop-middle-layers/--loop-repeats/--rope-theta.");
         return false;
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }

@@ -15,9 +15,12 @@
 #pragma once
 
 #include "sub0_config.hpp"  // D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, D_FF, VOCAB, D_HEAD, USE_TERNARY, USE_GATED_FFN, USE_TIED_EMBEDDINGS, USE_QK_NORM
+#include "memplan.hpp"      // memplan::Dims for current_build_dims() below. memplan is
+                            // dependency-free (no sub0_config.hpp, no layout.hpp), so this is one-way.
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -40,9 +43,10 @@ static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 // evaluate to exactly the previous 3*D_MODEL / C / 2*C, so the MHA path is unchanged.
 //
 // Defined HERE rather than in backend_cuda.cu because memplan.hpp must size the same buffer and cannot
-// see the CUDA sources; memplan is included BY this header, so it takes the runtime `Dims`-based form
-// of these formulas instead (see its qkv/dqkv/dwqkv/qk_pre terms, which cite this comment). The CPU
-// backend does not fuse and so has no use for them.
+// see the CUDA sources. memplan is deliberately dependency-free -- it takes EXPLICIT dims so the tuner
+// and configurator can call it before a device exists -- so it cannot use these constants and carries
+// runtime `Dims`-based mirrors instead (its qkv/dqkv/dwqkv/qk_pre terms). Keep the two in lock-step.
+// The CPU backend does not fuse and so has no use for them.
 inline constexpr int QKV_STRIDE = D_MODEL + 2 * D_KV;   // total fused row width
 inline constexpr int QKV_K_OFF  = D_MODEL;              // column where the K sub-block starts
 inline constexpr int QKV_V_OFF  = D_MODEL + D_KV;       // column where the V sub-block starts
@@ -126,26 +130,76 @@ consteval std::array<int, LOOP_EXEC_COUNT> make_layer_execution_order() {
 }
 inline constexpr std::array<int, LOOP_EXEC_COUNT> LAYER_EXEC_ORDER = make_layer_execution_order();
 
-// Identity of the EXECUTION SCHEDULE, for checkpoint compatibility. PARAM_FLOATS cannot discriminate
-// LoopSplit -- the loop re-executes existing layer indices, so a looped and an un-looped build at the
-// same dims have byte-identical parameter blobs -- and no Header field varies with it either. Weights
-// trained under one schedule are meaningless under another, so without this a LoopSplit checkpoint
-// would load silently into a plain build and compute a different function (AGENTS.md 3 rule 1: check
-// whether an existing field already discriminates -- here, none does).
+// ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //
-// Deliberately covers ONLY the schedule. RoPE scaling is excluded on purpose: training short and
-// running long WITH scaling on is the intended workflow, so a scaling difference must stay loadable.
-// GQA needs no entry either -- D_KV narrows Wk/Wv, so PARAM_FLOATS already discriminates it (strictly
-// monotonic in N_KV_HEADS, so no collision is possible).
-inline constexpr std::uint64_t arch_schedule_id(int middle_layers, int repeats) {
-    return (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers)) << 32)
-         |  static_cast<std::uint64_t>(static_cast<unsigned>(repeats));
+// The Header and PARAM_FLOATS between them discriminate every axis that changes a tensor SHAPE. They
+// discriminate nothing that changes what the model COMPUTES while leaving shapes alone, and weights are
+// meaningless under the wrong computation. Two such axes exist today and both were silently loadable
+// before this fingerprint:
+//   * LoopSplit (LOOP_MIDDLE_LAYERS / LOOP_REPEATS) -- re-executes EXISTING layer indices, so a looped
+//     and un-looped build have byte-identical parameter blobs.
+//   * ROPE_THETA -- changes every rotation angle, adds no parameter. A model trained at 10000 loaded
+//     into a 500000 build produced garbage with no diagnostic.
+//
+// RULE FOR ANY NEW COMPILE-TIME AXIS -- classify it into exactly one of three, and say which:
+//   1. Changes a tensor shape        -> PARAM_FLOATS already discriminates it. Nothing to do. (GQA is
+//      here: D_KV narrows Wk/Wv, strictly monotonically in N_KV_HEADS, so no collision is possible.)
+//   2. Changes computation, not shape -> ADD IT HERE, or it loads silently and computes the wrong thing.
+//   3. Deliberately variable between train and inference -> EXCLUDE, and record why. ROPE_SCALING /
+//      ROPE_SCALE_FACTOR are the only members: training short and running long WITH scaling on is the
+//      intended workflow, so guarding them would break the feature that motivated them.
+//
+// Packed rather than hashed so a mismatch can name the actual values -- a fingerprint you cannot decode
+// makes for a diagnostic that says only "different", which is what sent the LoopSplit case unnoticed in
+// the first place. float is bit_cast, so the comparison is exact and no tolerance question arises.
+static_assert(LOOP_MIDDLE_LAYERS >= 0 && LOOP_MIDDLE_LAYERS <= 0xffff, "LOOP_MIDDLE_LAYERS must fit 16 bits");
+static_assert(LOOP_REPEATS       >= 0 && LOOP_REPEATS       <= 0xffff, "LOOP_REPEATS must fit 16 bits");
+inline constexpr std::uint64_t arch_fingerprint(int middle_layers, int repeats, float rope_theta) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers) & 0xffffu) << 48)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(repeats)       & 0xffffu) << 32)
+         |  static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(rope_theta));
 }
-inline constexpr std::uint64_t ARCH_SCHEDULE_ID       = arch_schedule_id(LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
-// What a file with no schedule record must be assumed to have been trained under: any such file was
-// written by a binary that predates LoopSplit, so it is necessarily un-looped. That inference makes the
-// legacy path a real guard rather than "unknown, no check".
-inline constexpr std::uint64_t ARCH_SCHEDULE_UNLOOPED = arch_schedule_id(0, 1);
+struct ArchAxes { int middle_layers; int repeats; float rope_theta; };
+inline constexpr ArchAxes arch_axes_of(std::uint64_t fp) {
+    return ArchAxes{ static_cast<int>((fp >> 48) & 0xffffu),
+                     static_cast<int>((fp >> 32) & 0xffffu),
+                     std::bit_cast<float>(static_cast<std::uint32_t>(fp & 0xffffffffu)) };
+}
+inline constexpr std::uint64_t ARCH_FINGERPRINT = arch_fingerprint(LOOP_MIDDLE_LAYERS, LOOP_REPEATS, ROPE_THETA);
+// What a file carrying NO fingerprint must be assumed to have been built with. Such a file predates the
+// record, so it is necessarily un-looped -- that part is a sound inference. ROPE_THETA is NOT inferable
+// the same way (it was settable long before the record existed), so the legacy default is this build's
+// own theta: it cannot catch a pre-record theta mismatch, and pretending otherwise would reject every
+// legacy model on a non-default-theta build. Guarding theta starts from files written from here on.
+inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, ROPE_THETA);
+
+// THE build's memplan::Dims. Every consumer that wants "this binary's shape" must call this rather than
+// aggregate-initialise Dims itself.
+//
+// Why this exists: Dims is a 12-field aggregate and five sites were initialising it positionally by
+// hand. That produced three separate real bugs in one feature cycle -- kFootprintDims silently
+// under-predicted VRAM by 189-381 MiB after n_kv_heads was added; the configurator omitted exec_layers
+// and under-predicted activation memory 1.43x (feeding gpu_batch_estimate, i.e. the batch we
+// RECOMMEND); and sub0_memplan_stage passed six of twelve fields, costing a gated+tied+qk-norm build as
+// an untied non-gated MHA one. Positional init also means a future field REORDER compiles silently with
+// values shuffled. Adding a field now updates one place, and a site that needs a variant copies this and
+// overrides the one field it varies.
+inline constexpr memplan::Dims current_build_dims() {
+    return memplan::Dims{
+        .d_model     = D_MODEL,
+        .n_layers    = N_LAYERS,
+        .n_heads     = N_HEADS,
+        .d_ff        = D_FF,
+        .seq_len     = SEQ_LEN,
+        .vocab       = VOCAB,
+        .tied        = USE_TIED_EMBEDDINGS,
+        .qk_norm     = USE_QK_NORM,
+        .gated       = USE_GATED_FFN,
+        .pos_emb     = HAS_POS_EMB,
+        .n_kv_heads  = N_KV_HEADS,
+        .exec_layers = LOOP_EXEC_COUNT,
+    };
+}
 
 // Parameter tensor count: tok_emb, plus pos_emb only under absolute positions (see HAS_POS_EMB),
 // then per transformer block either 10 (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9

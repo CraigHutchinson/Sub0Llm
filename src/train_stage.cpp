@@ -38,8 +38,6 @@
 #include "sub0/corpus_collapse.hpp" // wordspike's mechanism over sampled REAL corpus docs (a "corpus_collapse" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
-#include "sub0/layout.hpp"   // HAS_POS_EMB / N_KV_HEADS-derived shape constants. NOT implied by
-                             // memplan.hpp above -- layout.hpp includes memplan, not the reverse.
 
 // Code version + models root, baked in by CMake (configure-time) so a model records what
 // produced it and lands in a structured directory. Fallbacks keep the file compilable alone.
@@ -181,10 +179,10 @@ constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 adds best_step (prune_ckpts be
                                             // v4 adds drawn_names (index-aligned with drawn_tokens, so a
                                             // --blend-config-replace resume can reattribute progress BY
                                             // NAME -- see RunState::drawn_names' own comment);
-                                            // v5 adds the execution-schedule id -- LoopSplit shares
-                                            // weights, so nfloat and every dim field are identical
-                                            // between a looped and un-looped build and cannot
-                                            // discriminate them (layout.hpp ARCH_SCHEDULE_ID)
+                                            // v5 adds the architecture fingerprint -- axes that change
+                                            // COMPUTATION but not shape (LoopSplit's schedule,
+                                            // ROPE_THETA), which nfloat and every dim field are blind
+                                            // to (layout.hpp ARCH_FINGERPRINT)
 
 // --- corpus.tok access ------------------------------------------------------
 // The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
@@ -530,7 +528,7 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     for (int c : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) wr(os, c);
     const std::uint64_t nfloat = sub0::trainable_floats();
     wr(os, nfloat);
-    wr(os, sub0::ARCH_SCHEDULE_ID);   // v5+; see CKPT_VERSION
+    wr(os, sub0::ARCH_FINGERPRINT);   // v5+; see CKPT_VERSION
 
     wr(os, static_cast<std::int64_t>(rs.step));
     wr(os, static_cast<std::int64_t>(adam_t));
@@ -627,17 +625,17 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     // v5+ carries the execution-schedule id. A pre-v5 checkpoint predates LoopSplit and was therefore
     // trained un-looped, so that is the correct assumption rather than "unknown, skip the check" --
     // resuming un-looped weights into a looped build would silently train a different architecture.
-    const std::uint64_t arch = (version >= 5u) ? rd<std::uint64_t>(is) : sub0::ARCH_SCHEDULE_UNLOOPED;
+    const std::uint64_t arch = (version >= 5u) ? rd<std::uint64_t>(is) : sub0::ARCH_FINGERPRINT_LEGACY;
     if (!ok || nfloat != sub0::trainable_floats()) {
         sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
         return false;
     }
-    if (arch != sub0::ARCH_SCHEDULE_ID) {
-        sub0::log::warn("ignoring checkpoint '{}': trained under a different layer execution schedule "
-                        "({} middle layers x{} repeats vs this build's {} x{}). Weight-shared repeats "
-                        "leave the parameter COUNT unchanged, so this cannot be caught by nfloat.",
-                        path, static_cast<unsigned>(arch >> 32),
-                        static_cast<unsigned>(arch & 0xffffffffu), LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
+    if (arch != sub0::ARCH_FINGERPRINT) {
+        const sub0::ArchAxes got = sub0::arch_axes_of(arch);
+        sub0::log::warn("ignoring checkpoint '{}': built with a different architecture in a way nfloat "
+                        "cannot catch -- loop schedule {}x{} vs {}x{}, rope theta {:g} vs {:g}.",
+                        path, got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS,
+                        got.rope_theta, ROPE_THETA);
         return false;
     }
 
@@ -861,9 +859,7 @@ struct GpuTrainer {
         if (sub0_dev_train_reserve(batch) != 0) {
             // tied/qk_norm/gated must match USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see
             // memplan.hpp's Dims comments.
-            const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                             USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                                             sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
+            const sub0::memplan::Dims dims = sub0::current_build_dims();
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
             const int free_mb = sub0_dev_free_mem_mb();
@@ -2685,9 +2681,7 @@ enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, 
 // predict the resident VRAM a training batch needs BEFORE allocating it, and lets the run
 // cross-check that prediction against the device's actual usage. `tied`/`qk_norm`/`gated` must match
 // USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see memplan.hpp's Dims comments.
-static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                                               USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                                               sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
+static constexpr sub0::memplan::Dims kGpuDims = sub0::current_build_dims();
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend,
                                         int thorough, int budget_s) {
@@ -3310,9 +3304,7 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     // their defaults, so a gated+tied+qk-norm RoPE build (i.e. the production shape) was costed as an
     // untied, non-gated, absolute-position MHA one. The tail three are new, but the first three were
     // already wrong -- this is the aggregate-init hazard the roadmap tracks under current_build_dims().
-    const mp::Dims d{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
-                      USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                      sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
+    const mp::Dims d = sub0::current_build_dims();
     auto mib = [](unsigned long long b) { return static_cast<double>(b) / (1024.0 * 1024.0); };
     const int vram = GPU_VRAM_MB;
     std::println("memory plan: d{} L{} H{} ff{} seq{} v{} | params {:.1f}M | VRAM {} MiB (+{} shared)",
