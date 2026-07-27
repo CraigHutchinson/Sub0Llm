@@ -1423,6 +1423,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.d_model = D_MODEL; cfg.n_layers = N_LAYERS; cfg.n_heads = N_HEADS; cfg.n_kv_heads = N_KV_HEADS;
         cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;
+        cfg.rope_theta = ROPE_THETA;   // changes what the model computes -- layout.hpp ARCH_FINGERPRINT
         cfg.seq_len = SEQ_LEN; cfg.vocab = VOCAB; cfg.ternary = static_cast<int>(USE_TERNARY);
         cfg.pos_encoding = static_cast<int>(POS_ENCODING);
         cfg.gated_ffn = static_cast<int>(USE_GATED_FFN);

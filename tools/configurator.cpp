@@ -33,6 +33,7 @@
 #include <mutex>
 #include <print>
 #include <queue>
+#include <map>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -59,6 +60,8 @@
 #include "sub0/unigram.hpp"    // sub0::tok::learn_unigram — the Unigram LM vocabulariser (A/B vs BPE)
 #include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
 #include "sub0/config_util.hpp"// sub0::config — pure, unit-tested config decisions (autosize / tune-cache / precision)
+#include "sub0/registry.hpp"  // registry::describe_config — the X-macro-driven config summary shared
+                            // with config.json/meta.txt, so this banner cannot omit an axis
 #include "sub0_build_facts.hpp" // CMake-baked build facts (device caps + output paths) -> the CLI defaults
 
 namespace tok = sub0::tok;
@@ -623,8 +626,10 @@ int main(int argc, char** argv) {
                    "LoopSplit: how many times the middle block runs (1 = off)")
        ->capture_default_str();
     app.add_option("--rope-scaling", rope_scaling,
-                   "RoPE position scaling for context extension: 0 = none, 1 = linear")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "RoPE position scaling for context extension: none (default) | linear")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
+                                           CLI::ignore_case))
+       ->default_str("none");
     app.add_option("--rope-scale-factor", rope_scale_factor,
                    "Linear RoPE scaling divisor, e.g. 4 to run a 4x longer window")
        ->capture_default_str();
@@ -645,8 +650,10 @@ int main(int argc, char** argv) {
                    "(Gemma2-style) -- stabilizes attention-logit magnitude")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--pos-encoding", pos_encoding,
-                   "Positional encoding scheme: 0 = absolute learned, 1 = RoPE (rotary)")
-       ->capture_default_str()->check(CLI::Range(0, 1));
+                   "Positional encoding scheme: absolute (learned) | rope (rotary)")
+       ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"absolute", 0}, {"rope", 1}},
+                                           CLI::ignore_case))
+       ->default_str("rope");
     app.add_option("--rope-theta", rope_theta, "RoPE frequency base (theta)")
        ->capture_default_str();
     app.add_option("--bf16", bf16, "Float16 capability: 0=off, 1=on, 2=AUTO (on if GPU >= sm_80)")
@@ -1398,10 +1405,22 @@ int main(int argc, char** argv) {
         std::println(stderr, "-----------------------------------------------");
     }
 
-    std::println("sub0-configure: vocab={} (base {} + {} {}), d={} L={} H={} seq={}{}{}{}{} -> {}",
+    // Summary comes from the SAME X-macro that drives config.json (registry::describe_config), NOT a
+    // hand-listed subset: this banner used to omit every axis added after it was written, so three
+    // variants of a --kv-heads A/B printed identical text. A new SUB0_RUN_CONFIG_FIELDS row now shows
+    // up here automatically.
+    sub0::registry::RunConfig shown;
+    shown.d_model     = d_model;      shown.n_layers    = n_layers;
+    shown.n_heads     = n_heads;      shown.n_kv_heads  = n_kv_heads;
+    shown.loop_middle = loop_middle;  shown.loop_repeats = loop_repeats;
+    shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
+    shown.rope_theta  = rope_theta;
+    shown.seq_len     = seq_len;      shown.vocab       = vocab;
+    shown.ternary     = ternary;      shown.pos_encoding = pos_encoding;
+    shown.gated_ffn   = gated_ffn;    shown.tied_embeddings = tie_embeddings;
+    shown.qk_norm     = qk_norm;
+    std::println("sub0-configure: vocab={} (base {} + {} {}) | {} -> {}",
                  vocab, n_base, vocab - n_base, tkz.max_piece > 0 ? "unigram pieces" : "BPE merges",
-                 d_model, n_layers, n_heads, seq_len,
-                 ternary ? " (ternary)" : "", gated_ffn ? " (gated-ffn)" : "",
-                 tie_embeddings ? " (tied)" : "", qk_norm ? " (qk-norm)" : "", out);
+                 sub0::registry::describe_config(shown), out);
     return 0;
 }

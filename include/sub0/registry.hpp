@@ -36,7 +36,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Export macro for read_config_json's out-of-line definition (src/run_config.cpp, compiled once
@@ -122,6 +124,7 @@ struct ModelMeta {
     X(int,         loop_repeats,    1)    \
     X(int,         rope_scaling,    0)    \
     X(double,      rope_scale_fac,  1.0)  \
+    X(double,      rope_theta,  10000.0)  \
     X(int,         seq_len,         0)    \
     X(int,         vocab,           0)    \
     X(int,         ternary,         0)    \
@@ -197,6 +200,34 @@ inline void write_config_json(const RunConfig& c, const std::filesystem::path& d
     SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_WRITE)
 #undef SUB0_RUN_CONFIG_WRITE
     os << "\n}\n";
+}
+
+// One-line human summary of a RunConfig: every field that DIFFERS FROM ITS DEFAULT, enums rendered by
+// name. Driven by SUB0_RUN_CONFIG_FIELDS, exactly like write_config_json above, so a new row appears in
+// every banner automatically.
+//
+// Why this exists: three tools hand-rolled their own summary with three different, incomplete field
+// sets. The configure banner listed d/L/H/seq plus four flags and mentioned NONE of n_kv_heads,
+// loop_middle, loop_repeats, rope_scaling or rope_scale_fac -- so all three variants of a GQA A/B
+// printed a BYTE-IDENTICAL banner and "three variants" was indistinguishable from "the same build three
+// times" on screen. A banner whose job is reporting what you configured must not be able to omit the
+// axis under test; deriving it from the same X-macro that already drives config.json makes omission
+// structurally impossible rather than a thing to remember.
+//
+// Non-default rather than all-fields keeps the common case short: an unset axis is exactly the one the
+// reader does not need told about. `corpus` is skipped -- it is a long path every caller already prints
+// separately. Fields still at their default (loop_repeats=1, config_schema=1, an unset batch/lr/seed at
+// configure time) drop out on their own, no exclusion list needed.
+inline std::string describe_config(const RunConfig& c) {
+    std::string out;
+    auto add_field = [&out](std::string_view name, const std::string& rendered) {
+        if (!out.empty()) out += ' ';
+        out += name; out += '='; out += rendered;
+    };
+#define SUB0_RUN_CONFIG_DESCRIBE(type, name, def)                                           if constexpr (std::string_view(#name) != "corpus") {                                        if (!(c.name == static_cast<type>(def))) {                                                  std::ostringstream os_;                                                                 detail::json_write_field(os_, #name, c.name);                                           std::string v_ = os_.str();                                                             if (v_.size() >= 2 && v_.front() == '"') v_ = v_.substr(1, v_.size() - 2);              add_field(#name, v_);                                                               }                                                                                   }
+    SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_DESCRIBE)
+#undef SUB0_RUN_CONFIG_DESCRIBE
+    return out;
 }
 
 // Reads <dir>/config.json into `c`. Returns false if the file is missing or fails to parse -- an
