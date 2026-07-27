@@ -124,6 +124,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/core.hpp"
+#include "sub0/layout.hpp"   // sub0::D_KV -- KV-cache row width (narrower than D_MODEL under GQA)
 #include "sub0/decode.hpp"
 #include "sub0/factspike.hpp"
 #include "sub0/scratch_slots.hpp"
@@ -549,14 +550,14 @@ double pearson_r(const std::vector<double>& a, const std::vector<double>& b) {
 // (does r(piece_count, cos_sim) get weaker than mechanism A's -0.614?) and task accuracy (does it beat
 // Phase C's 0.56 peak?).
 struct KvTrace {
-    std::vector<float> k;   // [N_LAYERS, D_MODEL] flat -- DE-ROTATED ("canonical", position-0-equivalent)
-    std::vector<float> v;   // [N_LAYERS, D_MODEL] flat -- position-invariant (RoPE never touches V)
+    std::vector<float> k;   // [N_LAYERS, sub0::D_KV] flat -- DE-ROTATED ("canonical", position-0-equivalent)
+    std::vector<float> v;   // [N_LAYERS, sub0::D_KV] flat -- position-invariant (RoPE never touches V)
 };
 
 // Captures a word's own per-layer (K,V) trace by running its pieces through an ISOLATED forward pass
 // (local positions 0..n-1, no prefix -- the cheapest canonical precompute context, matching this file's
 // own existing scratch-arm contexts), then pools n rows -> 1 per layer via encode_slot's existing HRR
-// math, treating the captured rows as a synthetic [n, D_MODEL] "embedding table" indexed 0..n-1 (idx[p]
+// math, treating the captured rows as a synthetic [n, sub0::D_KV] "embedding table" indexed 0..n-1 (idx[p]
 // selects role p, exactly mirroring mechanism A's own per-piece role assignment -- same operator, one
 // layer deeper). K rows are DE-ROTATED first (kv_rope_rotate with the row's own NEGATED local capture
 // position) so pooling operates in a position-independent frame -- only the geometric RoPE component is
@@ -564,30 +565,30 @@ struct KvTrace {
 // is never touched. V needs no de-rotation (RoPE never touches V).
 KvTrace capture_kv_trace(const std::vector<int>& pieces) {
     KvTrace trace;
-    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * D_MODEL, 0.f);
-    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * D_MODEL, 0.f);
+    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * sub0::D_KV, 0.f);
+    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * sub0::D_KV, 0.f);
     const int n = static_cast<int>(pieces.size());
     if (n == 0) return trace;
 
     sub0::kv_reset();
     for (int i = 0; i < n; ++i) (void)sub0::forward_one(pieces[static_cast<std::size_t>(i)], i);
 
-    std::vector<float> kbuf(static_cast<std::size_t>(n) * D_MODEL);
-    std::vector<float> vbuf(static_cast<std::size_t>(n) * D_MODEL);
+    std::vector<float> kbuf(static_cast<std::size_t>(n) * sub0::D_KV);
+    std::vector<float> vbuf(static_cast<std::size_t>(n) * sub0::D_KV);
     std::vector<int> idx(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) idx[static_cast<std::size_t>(i)] = i;
 
     for (int l = 0; l < N_LAYERS; ++l) {
         for (int i = 0; i < n; ++i) {
-            float* krow = kbuf.data() + static_cast<std::size_t>(i) * D_MODEL;
-            std::copy_n(sub0::kv_krow_ptr(l, i), D_MODEL, krow);
+            float* krow = kbuf.data() + static_cast<std::size_t>(i) * sub0::D_KV;
+            std::copy_n(sub0::kv_krow_ptr(l, i), sub0::D_KV, krow);
             sub0::kv_rope_rotate(krow, -i);   // strip this row's own local capture-position RoPE angle
-            std::copy_n(sub0::kv_vrow_ptr(l, i), D_MODEL, vbuf.data() + static_cast<std::size_t>(i) * D_MODEL);
+            std::copy_n(sub0::kv_vrow_ptr(l, i), sub0::D_KV, vbuf.data() + static_cast<std::size_t>(i) * sub0::D_KV);
         }
-        sub0::encode_slot(kbuf.data(), D_MODEL, idx, sub0::SlotEncoding::HRR,
-                          trace.k.data() + static_cast<std::size_t>(l) * D_MODEL);
-        sub0::encode_slot(vbuf.data(), D_MODEL, idx, sub0::SlotEncoding::HRR,
-                          trace.v.data() + static_cast<std::size_t>(l) * D_MODEL);
+        sub0::encode_slot(kbuf.data(), sub0::D_KV, idx, sub0::SlotEncoding::HRR,
+                          trace.k.data() + static_cast<std::size_t>(l) * sub0::D_KV);
+        sub0::encode_slot(vbuf.data(), sub0::D_KV, idx, sub0::SlotEncoding::HRR,
+                          trace.v.data() + static_cast<std::size_t>(l) * sub0::D_KV);
     }
     return trace;
 }
@@ -597,8 +598,8 @@ KvTrace capture_kv_trace(const std::vector<int>& pieces) {
 // needs this position's own query/attention-output/FFN, only later positions' attention over its K/V).
 void splice_kv_trace(const KvTrace& trace, int pos) {
     for (int l = 0; l < N_LAYERS; ++l) {
-        sub0::kv_splice_row(l, pos, trace.k.data() + static_cast<std::size_t>(l) * D_MODEL,
-                            trace.v.data() + static_cast<std::size_t>(l) * D_MODEL);
+        sub0::kv_splice_row(l, pos, trace.k.data() + static_cast<std::size_t>(l) * sub0::D_KV,
+                            trace.v.data() + static_cast<std::size_t>(l) * sub0::D_KV);
     }
 }
 
@@ -679,8 +680,10 @@ bool eval_kvtrace_one(const Tokenizer& tk, const fs::FactPair& fp) {
 // when these primitives were first built).
 struct KvFullTrace {
     int n = 0;
-    std::vector<float> k;   // [N_LAYERS, n, D_MODEL] flat -- DE-ROTATED per-piece (canonical, position-0-equivalent)
-    std::vector<float> v;   // [N_LAYERS, n, D_MODEL] flat -- position-invariant
+    // sub0::D_KV, not D_MODEL: KV-cache rows hold N_KV_HEADS heads, which GQA narrows below the residual
+    // width. Equal under plain MHA, so this only diverges once --kv-heads < --heads.
+    std::vector<float> k;   // [N_LAYERS, n, sub0::D_KV] flat -- DE-ROTATED per-piece (canonical, position-0-equivalent)
+    std::vector<float> v;   // [N_LAYERS, n, sub0::D_KV] flat -- position-invariant
 };
 
 KvFullTrace capture_kv_trace_full(const std::vector<int>& pieces) {
@@ -688,8 +691,8 @@ KvFullTrace capture_kv_trace_full(const std::vector<int>& pieces) {
     const int n = static_cast<int>(pieces.size());
     trace.n = n;
     if (n == 0) return trace;
-    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * D_MODEL, 0.f);
-    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * D_MODEL, 0.f);
+    trace.k.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * sub0::D_KV, 0.f);
+    trace.v.assign(static_cast<std::size_t>(N_LAYERS) * static_cast<std::size_t>(n) * sub0::D_KV, 0.f);
 
     sub0::kv_reset();
     for (int i = 0; i < n; ++i) (void)sub0::forward_one(pieces[static_cast<std::size_t>(i)], i);
@@ -697,12 +700,12 @@ KvFullTrace capture_kv_trace_full(const std::vector<int>& pieces) {
     for (int l = 0; l < N_LAYERS; ++l) {
         for (int i = 0; i < n; ++i) {
             float* krow = trace.k.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(n) +
-                                            static_cast<std::size_t>(i)) * D_MODEL;
-            std::copy_n(sub0::kv_krow_ptr(l, i), D_MODEL, krow);
+                                            static_cast<std::size_t>(i)) * sub0::D_KV;
+            std::copy_n(sub0::kv_krow_ptr(l, i), sub0::D_KV, krow);
             sub0::kv_rope_rotate(krow, -i);   // de-rotate to canonical (position-0-equivalent) form
             float* vrow = trace.v.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(n) +
-                                            static_cast<std::size_t>(i)) * D_MODEL;
-            std::copy_n(sub0::kv_vrow_ptr(l, i), D_MODEL, vrow);
+                                            static_cast<std::size_t>(i)) * sub0::D_KV;
+            std::copy_n(sub0::kv_vrow_ptr(l, i), sub0::D_KV, vrow);
         }
     }
     return trace;
@@ -716,9 +719,9 @@ void splice_kv_trace_full(const KvFullTrace& trace, int pos) {
     for (int l = 0; l < N_LAYERS; ++l) {
         for (int i = 0; i < trace.n; ++i) {
             const float* krow = trace.k.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(trace.n) +
-                                                  static_cast<std::size_t>(i)) * D_MODEL;
+                                                  static_cast<std::size_t>(i)) * sub0::D_KV;
             const float* vrow = trace.v.data() + (static_cast<std::size_t>(l) * static_cast<std::size_t>(trace.n) +
-                                                  static_cast<std::size_t>(i)) * D_MODEL;
+                                                  static_cast<std::size_t>(i)) * sub0::D_KV;
             sub0::kv_splice_row(l, pos + i, krow, vrow);
         }
     }

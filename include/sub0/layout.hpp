@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 namespace sub0 {
 
@@ -47,9 +48,10 @@ inline constexpr int QKV_K_OFF  = D_MODEL;              // column where the K su
 inline constexpr int QKV_V_OFF  = D_MODEL + D_KV;       // column where the V sub-block starts
 
 // Companion stash for QK-norm's backward (the pre-norm Q/K values). Same Q|K packing as above, minus
-// the V sub-block: Q at 0 (D_MODEL wide), K at QK_PRE_K_OFF (D_KV wide).
+// the V sub-block: Q at 0 (D_MODEL wide), K at D_MODEL (D_KV wide). Only the STRIDE is named here --
+// the kernels that address the K sub-block are templated on their own head counts so the toy-shape
+// self-test can instantiate them, and derive the offset locally; a named K offset had no consumer.
 inline constexpr int QK_PRE_STRIDE = D_MODEL + D_KV;
-inline constexpr int QK_PRE_K_OFF  = D_MODEL;
 
 // Under RoPE there is no position table at all: RoPE injects position inside attention, so a
 // [SEQ_LEN, D_MODEL] pos_emb would be allocated, zeroed, serialized and never read. Omitting it is
@@ -123,6 +125,27 @@ consteval std::array<int, LOOP_EXEC_COUNT> make_layer_execution_order() {
     return order;
 }
 inline constexpr std::array<int, LOOP_EXEC_COUNT> LAYER_EXEC_ORDER = make_layer_execution_order();
+
+// Identity of the EXECUTION SCHEDULE, for checkpoint compatibility. PARAM_FLOATS cannot discriminate
+// LoopSplit -- the loop re-executes existing layer indices, so a looped and an un-looped build at the
+// same dims have byte-identical parameter blobs -- and no Header field varies with it either. Weights
+// trained under one schedule are meaningless under another, so without this a LoopSplit checkpoint
+// would load silently into a plain build and compute a different function (AGENTS.md 3 rule 1: check
+// whether an existing field already discriminates -- here, none does).
+//
+// Deliberately covers ONLY the schedule. RoPE scaling is excluded on purpose: training short and
+// running long WITH scaling on is the intended workflow, so a scaling difference must stay loadable.
+// GQA needs no entry either -- D_KV narrows Wk/Wv, so PARAM_FLOATS already discriminates it (strictly
+// monotonic in N_KV_HEADS, so no collision is possible).
+inline constexpr std::uint64_t arch_schedule_id(int middle_layers, int repeats) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers)) << 32)
+         |  static_cast<std::uint64_t>(static_cast<unsigned>(repeats));
+}
+inline constexpr std::uint64_t ARCH_SCHEDULE_ID       = arch_schedule_id(LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
+// What a file with no schedule record must be assumed to have been trained under: any such file was
+// written by a binary that predates LoopSplit, so it is necessarily un-looped. That inference makes the
+// legacy path a real guard rather than "unknown, no check".
+inline constexpr std::uint64_t ARCH_SCHEDULE_UNLOOPED = arch_schedule_id(0, 1);
 
 // Parameter tensor count: tok_emb, plus pos_emb only under absolute positions (see HAS_POS_EMB),
 // then per transformer block either 10 (plain: ln1, ln2, Wq, Wk, Wv, Wo, W1, b1, W2, b2) or 9

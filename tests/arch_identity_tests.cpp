@@ -21,18 +21,31 @@
 // finite-difference gradient check, which already live in engine_tests.cpp and are the primary guards
 // for decode drift and backward correctness respectively.
 //
-// --- RECORDED NEUTRAL BASELINES (2026-07-26, before any GQA/LoopSplit/RoPE-scaling work) -----------
-// Re-run with every axis at its default and compare. A drift here is a leak into the default path.
+// --- RECORDED NEUTRAL BASELINES ------------------------------------------------------------------
+// Re-run with every axis at its default and compare. A drift here is a leak into the default path --
+// UNLESS a commit legitimately changed the neutral configuration, in which case re-record and say so
+// here. Exactly that happened once already, and leaving the old numbers in place would have made the
+// next reader mistake a legitimate change for a leak:
 //
-//   factspike96  (d96  L8  H2 seq256 vocab493)   suite: 4918240 assertions / 126 cases
-//     forward: sum= 14.734279 absmax=1.019949 hash=71f6d1f4a6fb214f
-//     grad:    sum= -2.259584 absmax=0.997858 hash=74d8266eb0d3669e
-//     decode:  sum= -1.230074 absmax=0.532549 hash=b72b799a36231dca
+//   aa64107 dropped pos_emb under RoPE. That removes a real [SEQ_LEN, D_MODEL] parameter, so both
+//   suites' assertion counts fell (factspike96 by 122794 == ~5 per removed float, the per-float
+//   assertion loops over the table) and the GRAD hash moved. forward and decode were unaffected:
+//   the table was allocated, zeroed and never read, so it never influenced a forward value.
 //
-//   d196check    (d196 L11 H7 seq256 vocab16535) suite: 44260967 assertions / 127 cases
-//     forward: sum=-53.459923 absmax=1.349725 hash=95721163ea70891f
-//     grad:    sum=  0.980982 absmax=0.562644 hash=7b560d163d630c59
-//     decode:  sum=-15.142352 absmax=1.324115 hash=474dda2e70867d86
+// Current, at LOOP/GQA/RoPE-scaling defaults (post-aa64107):
+//
+//   factspike96  (d96  L8  H2 seq256 vocab493)   suite: 4795446 assertions / 126 cases
+//   d196check    (d196 L11 H7 seq256 vocab16535) suite: 44010206 assertions / 127 cases
+//   hd96_check   (d384 L2  H4 seq256, CUDA)      suite: 4126369 assertions / 42 cases
+//
+// Pre-aa64107 values, kept only to explain the delta above (do NOT compare against these):
+//
+//   factspike96  suite: 4918240 / 126   grad hash=74d8266eb0d3669e
+//   d196check    suite: 44260967 / 127  grad hash=7b560d163d630c59
+//
+// The per-tensor forward/grad/decode fingerprints are printed by the test itself -- record them from a
+// clean run at the config you are about to change, not from this comment, since they move with D_MODEL/
+// N_LAYERS/VOCAB and so cannot be stated once for every build dir.
 //
 // (factspike96's suite count excludes the pre-existing, unrelated "case markers stay atomic" tokenizer
 // failure -- it fails identically on a clean checkout of that toy config, verified by stash+rebuild.)

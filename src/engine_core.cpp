@@ -99,6 +99,13 @@ bool save_model(const char* path) {
     // reads back as fingerprint 0 (unknown), i.e. no guard. No format-magic bump needed.
     const std::uint64_t fp = g_tok.loaded ? tok::fingerprint(g_tok) : 0;
     os.write((const char*)&fp, sizeof(fp));
+    // Second trailing record, same additive discipline: the EXECUTION SCHEDULE id (layout.hpp's
+    // ARCH_SCHEDULE_ID). LoopSplit shares weights, so PARAM_FLOATS and every Header field are identical
+    // between a looped and un-looped build -- nothing else in this file can tell them apart, and the
+    // weights are meaningless under the wrong schedule. Appended after the fingerprint so a reader of
+    // either older vintage is unaffected.
+    const std::uint64_t arch = ARCH_SCHEDULE_ID;
+    os.write((const char*)&arch, sizeof(arch));
     return os.good();
 }
 
@@ -114,6 +121,15 @@ bool load_model(const char* path) {
     // possible. param_floats still guards every shape that DOES matter, so a genuinely incompatible
     // file is still rejected; under Absolute the table is real and seq_len must match exactly.
     const bool seq_ok = HAS_POS_EMB ? (h.seq_len == ref.seq_len) : true;
+    // Accepting a SHORTER trained window is the point of dropping pos_emb, but "accepted" is not
+    // "trained for": RoPE positions past h.seq_len were never seen, so quality degrades with no other
+    // signal. Say so once, and name the mitigation rather than leaving the reader to find it.
+    if (!HAS_POS_EMB && h.seq_len < ref.seq_len)
+        std::println(stderr,
+            "note: model was trained at seq_len {} but this build's window is {}; positions beyond {} "
+            "are extrapolated. --rope-scaling linear (currently {}) is the intended mitigation.",
+            h.seq_len, ref.seq_len, h.seq_len,
+            ROPE_SCALING_MODE == RopeScaling::None ? "off" : "on");
     if (std::memcmp(h.magic, ref.magic, 4) != 0 ||
         h.d_model != ref.d_model || h.n_layers != ref.n_layers || h.n_heads != ref.n_heads ||
         h.d_ff != ref.d_ff || !seq_ok || h.vocab != ref.vocab ||
@@ -131,6 +147,24 @@ bool load_model(const char* path) {
     std::uint64_t fp = 0;
     is.read((char*)&fp, sizeof(fp));
     g_model_tok_fp = (is.gcount() == static_cast<std::streamsize>(sizeof(fp))) ? fp : 0;
+    // Optional trailing execution-schedule id (see save_model). Absent means the file was written by a
+    // binary that predates LoopSplit, which therefore trained it UN-LOOPED -- a sound inference, so the
+    // legacy path is a real guard rather than "unknown, skip the check". (If the fingerprint read above
+    // already hit EOF this read fails too and reports absent, which is the correct answer.)
+    std::uint64_t arch = 0;
+    is.read((char*)&arch, sizeof(arch));
+    const bool arch_present = (is.gcount() == static_cast<std::streamsize>(sizeof(arch)));
+    const std::uint64_t arch_got = arch_present ? arch : ARCH_SCHEDULE_UNLOOPED;
+    if (arch_got != ARCH_SCHEDULE_ID) {
+        std::println(stderr,
+            "error: model was trained under a different layer execution schedule "
+            "(file: {} middle layers x{} repeats; this build: {} x{}). The parameter blob is the same "
+            "SIZE either way -- weights are shared across repeats -- so this cannot be detected from "
+            "shapes alone. Rebuild with matching --loop-middle-layers/--loop-repeats.",
+            static_cast<unsigned>(arch_got >> 32), static_cast<unsigned>(arch_got & 0xffffffffu),
+            LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
+        return false;
+    }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
     return true;
 }

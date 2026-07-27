@@ -1182,7 +1182,14 @@ int main(int argc, char** argv) {
         // USE_GATED_FFN the same way.
         const sub0::memplan::Dims dims{ d_model, n_layers, n_heads, d_ff, seq_len, vocab,
                                          tie_embeddings != 0, qk_norm != 0, gated_ffn != 0,
-                                         pos_encoding == 0, n_kv_heads };
+                                         pos_encoding == 0, n_kv_heads,
+                                         // LoopSplit: per-EXECUTION activation checkpoints, not
+                                         // per-layer. Omitting this under-predicts activation memory
+                                         // (measured 1.43x at 10 executions from 6 layers), and this
+                                         // estimate feeds gpu_batch_estimate() -- i.e. the batch we
+                                         // RECOMMEND. Under-predicting pushes the batch UP, which is
+                                         // the dangerous direction (see the open large-batch fault).
+                                         n_layers + loop_middle * (loop_repeats - 1) };
         // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
         // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
         // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc

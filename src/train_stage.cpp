@@ -176,11 +176,15 @@ constexpr float  MUON_LR_BASE        = 0.02f;
 constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? std::max(8, SEQ_LEN / 8) : SEQ_LEN;
 
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
-constexpr std::uint32_t CKPT_VERSION = 4u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption);
+constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption);
                                             // v3 adds drawn_tokens (the blend scheduler's fairness state);
                                             // v4 adds drawn_names (index-aligned with drawn_tokens, so a
                                             // --blend-config-replace resume can reattribute progress BY
-                                            // NAME -- see RunState::drawn_names' own comment)
+                                            // NAME -- see RunState::drawn_names' own comment);
+                                            // v5 adds the execution-schedule id -- LoopSplit shares
+                                            // weights, so nfloat and every dim field are identical
+                                            // between a looped and un-looped build and cannot
+                                            // discriminate them (layout.hpp ARCH_SCHEDULE_ID)
 
 // --- corpus.tok access ------------------------------------------------------
 // The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
@@ -526,6 +530,7 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     for (int c : {D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, int(USE_TERNARY)}) wr(os, c);
     const std::uint64_t nfloat = sub0::trainable_floats();
     wr(os, nfloat);
+    wr(os, sub0::ARCH_SCHEDULE_ID);   // v5+; see CKPT_VERSION
 
     wr(os, static_cast<std::int64_t>(rs.step));
     wr(os, static_cast<std::int64_t>(adam_t));
@@ -619,8 +624,20 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
         if (got != ref && !(is_seq_len && !sub0::HAS_POS_EMB)) ok = false;
     }
     const std::uint64_t nfloat = rd<std::uint64_t>(is);
+    // v5+ carries the execution-schedule id. A pre-v5 checkpoint predates LoopSplit and was therefore
+    // trained un-looped, so that is the correct assumption rather than "unknown, skip the check" --
+    // resuming un-looped weights into a looped build would silently train a different architecture.
+    const std::uint64_t arch = (version >= 5u) ? rd<std::uint64_t>(is) : sub0::ARCH_SCHEDULE_UNLOOPED;
     if (!ok || nfloat != sub0::trainable_floats()) {
         sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
+        return false;
+    }
+    if (arch != sub0::ARCH_SCHEDULE_ID) {
+        sub0::log::warn("ignoring checkpoint '{}': trained under a different layer execution schedule "
+                        "({} middle layers x{} repeats vs this build's {} x{}). Weight-shared repeats "
+                        "leave the parameter COUNT unchanged, so this cannot be caught by nfloat.",
+                        path, static_cast<unsigned>(arch >> 32),
+                        static_cast<unsigned>(arch & 0xffffffffu), LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
         return false;
     }
 
@@ -3288,7 +3305,14 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
 // configurator and tuner gate on, surfaced for planning a model/batch/context that fits.
 extern "C" SUB0_API int sub0_memplan_stage() {
     namespace mp = sub0::memplan;
-    const mp::Dims d{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB };
+    // Every field, not the first six. Left short, this reported a memory plan for a DIFFERENT
+    // architecture than the build: tied/qk_norm/gated/pos_emb/n_kv_heads/exec_layers all fell back to
+    // their defaults, so a gated+tied+qk-norm RoPE build (i.e. the production shape) was costed as an
+    // untied, non-gated, absolute-position MHA one. The tail three are new, but the first three were
+    // already wrong -- this is the aggregate-init hazard the roadmap tracks under current_build_dims().
+    const mp::Dims d{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
+                      USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
+                      sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
     auto mib = [](unsigned long long b) { return static_cast<double>(b) / (1024.0 * 1024.0); };
     const int vram = GPU_VRAM_MB;
     std::println("memory plan: d{} L{} H{} ff{} seq{} v{} | params {:.1f}M | VRAM {} MiB (+{} shared)",

@@ -2155,19 +2155,23 @@ inline void launch_tied_head_bwd(const float* dA_in, const float* dTok, const fl
 // than one contribution in the same backward pass (USE_GATED_FFN: dfbuf accumulates from both Wg's and
 // W1's dX GEMM, mirroring launch_linear_bwd's own FP32 accumulate parameter and its dedicated
 // sub0_cuda_test_accumulate_check coverage).
+// DwWrite: whether the dW GEMM adds into its destination or overwrites it. Named rather than a second
+// defaulted bool because the two modes are NOT interchangeable and the choice is invisible at a
+// positional call site -- see kDefaultDwWrite for why a plain default would have been worse still.
+enum class DwWrite { Overwrite, Accumulate };
+// LoopSplit runs a weight-shared layer more than once per forward, so each execution's dW must survive
+// the next. Accumulating is safe unconditionally (backward_device zeroes the grad blob at step start,
+// so beta=1 into zeroed memory equals beta=0 for a single write), but the non-looped build keeps
+// Overwrite to avoid paying for a read it does not need.
+inline constexpr DwWrite kDefaultDwWrite = sub0::LOOP_SPLIT_ON ? DwWrite::Accumulate : DwWrite::Overwrite;
 template <class IN, class DX>
-// accumulate_dw: add into dW instead of overwriting it. Needed by LoopSplit, where a weight-shared
-// layer runs more than once per forward and every execution's contribution must survive. Safe to set
-// unconditionally because backward_device zeroes the whole grad blob at step start -- beta=1 into a
-// zeroed buffer equals beta=0 for a single write -- but it is gated on LOOP_SPLIT_ON anyway so the
-// non-looped path keeps its cheaper write-without-read.
 inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
                                 DX* dX, float* dW, int M, int in, int out, bool accumulate_dx = false,
-                                bool accumulate_dw = sub0::LOOP_SPLIT_ON) {
+                                DwWrite dw = kDefaultDwWrite) {
     if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in,
                            accumulate_dx ? 1.0f : 0.0f);                                        // dX (+)= dY.W^T
     gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out,
-                      accumulate_dw ? 1.0f : 0.0f);                                             // dW (+)= X^T.dY
+                      dw == DwWrite::Accumulate ? 1.0f : 0.0f);                                 // dW (+)= X^T.dY
 }
 template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
                                const float* dy, float* dx, float* dgamma, int rows) {
@@ -2801,6 +2805,18 @@ consteval bool check_layer_offsets() {
 static_assert(check_layer_offsets(),
     "layer_base()/kLn1../kFinalBase drifted from the real PARAM_LAYOUT table -- update the constants "
     "above to match make_param_layout() in layout.hpp.");
+
+// The fused-buffer kernels above are templated on their OWN head counts (H/KVH/DH) so the dims-
+// independent self-test can instantiate toy shapes in this same binary, which means they re-derive
+// `in_stride = C + 2*CKV` and `pre_stride = C + CKV` locally instead of using layout.hpp's constants.
+// That is deliberate, but it leaves two independent derivations of one layout with nothing forcing
+// them to agree -- exactly the shape that already produced two real bugs in this feature set
+// (memplan::param_floats kept counting a removed pos_emb; kFootprintDims under-predicted VRAM). Pin
+// the PRODUCTION instantiation to the constants so a future divergence is a compile error.
+static_assert(N_HEADS * D_HEAD + 2 * (N_KV_HEADS * D_HEAD) == sub0::QKV_STRIDE,
+    "the attention kernels' locally-derived fused QKV row width disagrees with layout.hpp's QKV_STRIDE");
+static_assert(N_HEADS * D_HEAD + (N_KV_HEADS * D_HEAD) == sub0::QK_PRE_STRIDE,
+    "the qknorm kernels' locally-derived qk_pre row width disagrees with layout.hpp's QK_PRE_STRIDE");
 
 // Grouped-query attention IS supported here (the guard that used to sit at this spot is gone). Two
 // things it required, both worth knowing before touching the attention kernels:
@@ -3463,7 +3479,7 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         // split_dqkv_kernel below, double-counting every repeat. This is the one call site of the seven
         // whose dW is not `gb + ...`; the other six correctly take the accumulating default.
         launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C,
-                                          sub0::QKV_STRIDE, /*accumulate_dx=*/false, /*accumulate_dw=*/false);
+                                          sub0::QKV_STRIDE, /*accumulate_dx=*/false, DwWrite::Overwrite);
         {
             const int n = C * sub0::QKV_STRIDE, block = 256;
             split_dqkv_kernel<sub0::LOOP_SPLIT_ON><<<(n + block - 1) / block, block, 0, g_stream>>>(
