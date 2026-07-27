@@ -732,13 +732,13 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float the
 // self-test can instantiate a toy shape in the SAME binary as the baked production shape.
 template <class A, int H, int KVH, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
-qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
+qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const float* __restrict__ kgamma,
+                  int which) {
     constexpr int   C     = H * DH, CKV = KVH * DH, in_stride = C + 2 * CKV;
     constexpr float invDH = 1.0f / static_cast<float>(DH);
     constexpr float eps   = 1e-5f;
-    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;   // which: 0 = Q, 1 = K
-    if (which != 0 && h >= KVH) return;   // K has fewer heads than Q under GQA; whole block exits together
-    const int off = (which == 0) ? (h * DH) : (C + h * DH);
+    const int row = blockIdx.x, h = blockIdx.y;                       // which: 0 = Q, 1 = K (an ARGUMENT,
+    const int off = (which == 0) ? (h * DH) : (C + h * DH);           // so each pass gets its own grid)
     A* xr = qkv + static_cast<size_t>(row) * in_stride + off;
     const float* g = (which == 0) ? qgamma : kgamma;
     float partial = 0.f;
@@ -760,13 +760,12 @@ qknorm_act_kernel(A* __restrict__ qkv, const float* __restrict__ qgamma, const f
 template <class A, int H, int KVH, int DH, int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 qknorm_save_act_kernel(A* __restrict__ qkv, A* __restrict__ qk_pre,
-                       const float* __restrict__ qgamma, const float* __restrict__ kgamma) {
+                       const float* __restrict__ qgamma, const float* __restrict__ kgamma, int which) {
     constexpr int   C        = H * DH, CKV = KVH * DH;
     constexpr int   in_stride = C + 2 * CKV, pre_stride = C + CKV;
     constexpr float invDH    = 1.0f / static_cast<float>(DH);
     constexpr float eps      = 1e-5f;
-    const int row = blockIdx.x, h = blockIdx.y, which = blockIdx.z;
-    if (which != 0 && h >= KVH) return;
+    const int row = blockIdx.x, h = blockIdx.y;
     const int off = (which == 0) ? (h * DH) : (C + h * DH);
     A* xr = qkv    + static_cast<size_t>(row) * in_stride  + off;
     A* pr = qk_pre + static_cast<size_t>(row) * pre_stride + off;
@@ -2060,16 +2059,25 @@ template <class A> inline void launch_qknorm_t(A* qkv, const float* qgamma, cons
     constexpr int kQkBlock = 32;   // one warp: D_HEAD (32-96 at this project's scales) is an order of
                                     // magnitude under D_MODEL, so block_reduce_sum's BLOCK<=32 path
                                     // (no cross-warp shared-memory step) already covers the reduction.
-    const dim3 grid(rows, N_HEADS, 2);
-    qknorm_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma);
+    // TWO launches, each with grid.y = that pass's OWN head count, rather than one launch at
+    // grid.y = N_HEADS covering both and letting the K pass early-out. Under GQA the K pass needs only
+    // N_KV_HEADS blocks, so the fused shape launched (N_HEADS - N_KV_HEADS) * rows blocks that did
+    // nothing but return -- 37.5% of all blocks at H=8/KV=2, measured 130,000 launched vs 81,250 useful.
+    // One extra launch is far cheaper than that. Identical block count under MHA.
+    qknorm_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock>
+        <<<dim3(rows, N_HEADS),    kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma, 0);
+    qknorm_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock>
+        <<<dim3(rows, N_KV_HEADS), kQkBlock, 0, g_stream>>>(qkv, qgamma, kgamma, 1);
 }
 // Same, but also stashes the pre-norm Q/K into qk_pre[rows,2C] -- see qknorm_save_act_kernel above.
 // Used only by backward_device's checkpoint-recompute pass.
 template <class A>
 inline void launch_qknorm_save_t(A* qkv, A* qk_pre, const float* qgamma, const float* kgamma, int rows) {
     constexpr int kQkBlock = 32;
-    const dim3 grid(rows, N_HEADS, 2);
-    qknorm_save_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma);
+    qknorm_save_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock>
+        <<<dim3(rows, N_HEADS),    kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma, 0);
+    qknorm_save_act_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, kQkBlock>
+        <<<dim3(rows, N_KV_HEADS), kQkBlock, 0, g_stream>>>(qkv, qk_pre, qgamma, kgamma, 1);
 }
 // QK-norm backward: converts dqkv's Q/K sub-blocks in place from "grad w.r.t. qknorm's output" to
 // "grad w.r.t. qknorm's input", reading the pre-norm x from qk_pre -- see qknorm_backward_act_kernel
@@ -4744,7 +4752,8 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     SUB0_CUDA_CHECK(cudaMemcpy(dKgamma, hKgamma.data(), static_cast<size_t>(DH) * sizeof(float), cudaMemcpyHostToDevice));
 
     const dim3 grid(rows, H, 2);
-    qknorm_act_kernel<float, H, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma);
+    qknorm_act_kernel<float, H, H, DH, kQkBlock><<<dim3(rows, H), kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma, 0);
+    qknorm_act_kernel<float, H, H, DH, kQkBlock><<<dim3(rows, H), kQkBlock, 0, g_stream>>>(dQkv, dQgamma, dKgamma, 1);
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
     SUB0_CUDA_CHECK(cudaGetLastError());
 
@@ -4792,7 +4801,8 @@ static int qknorm_check_impl(int rows, double* out_relL2_fwd, double* out_relL2_
     SUB0_CUDA_CHECK(cudaMalloc(&dQkv2, hQkv.size() * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMemcpy(dQkv2, hQkv.data(), hQkv.size() * sizeof(float), cudaMemcpyHostToDevice));
     SUB0_CUDA_CHECK(cudaMalloc(&dQkPre, static_cast<size_t>(rows) * 2 * C * sizeof(float)));
-    qknorm_save_act_kernel<float, H, H, DH, kQkBlock><<<grid, kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma);
+    qknorm_save_act_kernel<float, H, H, DH, kQkBlock><<<dim3(rows, H), kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma, 0);
+    qknorm_save_act_kernel<float, H, H, DH, kQkBlock><<<dim3(rows, H), kQkBlock, 0, g_stream>>>(dQkv2, dQkPre, dQgamma, dKgamma, 1);
 
     std::vector<float> hDy(hQkv.size());
     for (auto& v : hDy) v = randf() * 0.3f;
