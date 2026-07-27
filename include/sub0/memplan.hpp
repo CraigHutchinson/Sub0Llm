@@ -65,6 +65,9 @@ struct Dims {
     // Wk/Wv shrink and the KV cache shrinks with them. 0 means "same as n_heads" -- plain MHA, what
     // every pre-existing aggregate-init call site means.
     int n_kv_heads = 0;
+    // LoopSplit: total layer EXECUTIONS per forward (sub0::LOOP_EXEC_COUNT). Per-execution activation
+    // checkpoints scale on this, not on n_layers; 0 means "unset" and falls back to n_layers.
+    int exec_layers = 0;
 };
 
 using u64 = unsigned long long;
@@ -193,6 +196,7 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);
     const u64 Mm = u64(batch) * T;
+    const u64 EL = u64(d.exec_layers > 0 ? d.exec_layers : d.n_layers);   // executions, not layers
     const u64 per_layer = 2 * Mm * C * A        // h_in, h_mid  [M,C] bf16 residual stream
                         + 2 * Mm * FLOAT;       // rinv1, rinv2  [M]  (a/qkv/att/ff1/gact checkpointed -> single, below)
     const u64 final_blk = Mm * C * A            // h_final [M,C] bf16 residual
@@ -222,7 +226,7 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     // by the time it would need the pre-norm values, they no longer survive anywhere else. Zero bytes
     // when qk_norm is off (the common case).
     const u64 qk_pre    = d.qk_norm ? Mm * qk_pre_stride(d) * A : 0;
-    return L * per_layer + final_blk + grad + qk_pre;
+    return EL * per_layer + final_blk + grad + qk_pre;   // per-EXECUTION checkpoints (LoopSplit)
 }
 
 // Forward scratch a training step keeps resident: only the token-id buffer. Training reads from the

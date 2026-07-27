@@ -719,7 +719,7 @@ __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float the
 }
 
 // QK-norm forward (USE_QK_NORM, op_qknorm/qknorm_row in backend_cpu.cpp): RMSNorm applied
-// INDEPENDENTLY to each head's D_HEAD-wide slice of the fused [rows,3C] qkv buffer's Q (or K)
+// INDEPENDENTLY to each head's D_HEAD-wide slice of the fused [rows,QKV_STRIDE] qkv buffer's Q (or K)
 // sub-block, IN PLACE, right after the QKV GEMM and before rope_kernel/rope_act_kernel touch the
 // same buffer -- a separate per-head statistic from op_rmsnorm's whole-row one, same reason as the
 // CPU op (see its comment): mixing every head into one norm statistic would defeat the point of a
@@ -1055,14 +1055,17 @@ __global__ void bias_grad_kernel(const float* __restrict__ dY, float* __restrict
 // to apply here. N is D_FF at this kernel's one call site (a baked constexpr, unlike bias_grad_kernel
 // below whose N genuinely varies across ITS call sites -- confirmed by checking every one), so it's
 // used directly rather than as a parameter; the M-loop stays runtime (M varies) with nothing to unroll.
-template <class A>
+// ACC: add instead of assign -- LoopSplit (see launch_linear_bwd_t's accumulate_dw). dbias lands in the
+// shared param blob, so a re-executed layer's later runs must not erase the earlier ones.
+template <class A, bool ACC = false>
 __global__ void bias_grad_act_kernel(const A* __restrict__ dY, float* __restrict__ dbias, int M) {
     constexpr int N = D_FF;
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= N) return;
     float s = 0.f;
     for (int m = 0; m < M; ++m) s += to_f32(dY[static_cast<size_t>(m) * N + o]);
-    dbias[o] = s;
+    if constexpr (ACC) dbias[o] += s;
+    else               dbias[o]  = s;
 }
 
 // RMSNorm backward: one BLOCK per row, threads striding coalesced over D_MODEL (was one thread per
@@ -1653,15 +1656,23 @@ __global__ void embed_backward_token_kernel(const float* __restrict__ dh, const 
 // and dWk/dWv [C,D_KV] at their param-blob offsets (inverse of build_qkv_kernel). One thread per FUSED
 // element, matching build_qkv_kernel's mapping so the two stay obviously inverse under GQA's unequal
 // sub-block widths. Constexpr-folded at its one call site, same div/mod reasoning as above.
+// ACC = accumulate into the destination instead of overwriting -- LoopSplit needs every execution of a
+// shared layer to contribute (see launch_linear_bwd_t's accumulate_dw). The fused dW GEMM upstream
+// still writes g_tr.dwqkv with beta=0: that is a per-execution TEMP, fully rewritten each time. It is
+// only this split, which lands in the shared param blob, that must add.
+template <bool ACC>
 __global__ void split_dqkv_kernel(const float* __restrict__ dWqkv, float* __restrict__ dWq,
                                   float* __restrict__ dWk, float* __restrict__ dWv) {
     constexpr int C = D_MODEL, KV = sub0::D_KV, W = sub0::QKV_STRIDE;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= C * W) return;
     const int p = idx / W, c = idx - p * W;
-    if (c < C)            dWq[static_cast<size_t>(p) * C  + c]             = dWqkv[idx];
-    else if (c < C + KV)  dWk[static_cast<size_t>(p) * KV + (c - C)]       = dWqkv[idx];
-    else                  dWv[static_cast<size_t>(p) * KV + (c - C - KV)]  = dWqkv[idx];
+    float* dst;
+    if (c < C)            dst = &dWq[static_cast<size_t>(p) * C  + c];
+    else if (c < C + KV)  dst = &dWk[static_cast<size_t>(p) * KV + (c - C)];
+    else                  dst = &dWv[static_cast<size_t>(p) * KV + (c - C - KV)];
+    if constexpr (ACC) *dst += dWqkv[idx];
+    else               *dst  = dWqkv[idx];
 }
 
 // AdamW: block-reduce sum of grad^2 into a double accumulator (matches the CPU double-precision
@@ -2145,11 +2156,18 @@ inline void launch_tied_head_bwd(const float* dA_in, const float* dTok, const fl
 // W1's dX GEMM, mirroring launch_linear_bwd's own FP32 accumulate parameter and its dedicated
 // sub0_cuda_test_accumulate_check coverage).
 template <class IN, class DX>
+// accumulate_dw: add into dW instead of overwriting it. Needed by LoopSplit, where a weight-shared
+// layer runs more than once per forward and every execution's contribution must survive. Safe to set
+// unconditionally because backward_device zeroes the whole grad blob at step start -- beta=1 into a
+// zeroed buffer equals beta=0 for a single write -- but it is gated on LOOP_SPLIT_ON anyway so the
+// non-looped path keeps its cheaper write-without-read.
 inline void launch_linear_bwd_t(const IN* dX_in, const IN* dW16, const IN* dY,
-                                DX* dX, float* dW, int M, int in, int out, bool accumulate_dx = false) {
+                                DX* dX, float* dW, int M, int in, int out, bool accumulate_dx = false,
+                                bool accumulate_dw = sub0::LOOP_SPLIT_ON) {
     if (dX) gemm_t<IN, DX>(CUBLAS_OP_T, CUBLAS_OP_N, in, M, out, dW16, out, dY, out, dX, in,
                            accumulate_dx ? 1.0f : 0.0f);                                        // dX (+)= dY.W^T
-    gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out);       // dW=X^T.dY
+    gemm_t<IN, float>(CUBLAS_OP_N, CUBLAS_OP_T, out, in, M, dY, out, dX_in, in, dW, out,
+                      accumulate_dw ? 1.0f : 0.0f);                                             // dW (+)= X^T.dY
 }
 template <class X> inline void launch_rmsnorm_bwd_t(const X* x, const float* gamma, const float* rinv,
                                const float* dy, float* dx, float* dgamma, int rows) {
@@ -2309,7 +2327,7 @@ struct FwdScratch {
     int*   dids   = nullptr;
     float* h      = nullptr;
     float* a      = nullptr;
-    float* qkv    = nullptr;            // fused [M, 3C] projections (q|k|v sub-blocks)
+    float* qkv    = nullptr;            // fused [M, QKV_STRIDE] projections (q|k|v sub-blocks)
     float* att    = nullptr;
     float* proj   = nullptr;
     float* fbuf   = nullptr;
@@ -2317,7 +2335,7 @@ struct FwdScratch {
     float* gact   = nullptr;
     float* ff2    = nullptr;
     float* logits = nullptr;
-    float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, 3C], built once at upload
+    float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, QKV_STRIDE], built once at upload
 };
 FwdScratch g_fwd;
 size_t     g_fwd_rows = 0;             // total [M] ROW capacity the batch-dependent buffers are sized for
@@ -2330,7 +2348,7 @@ long long  g_fwd_grows = 0;            // monotonic (re)allocation count -- test
 // every weight change, cleared once ensure_wqkv_f32() rebuilds it.
 bool g_wqkv_f32_dirty = true;
 
-// Batch-independent fused-QKV weight buffer (F32, [C,3C] per layer). BF16 builds no longer keep
+// Batch-independent fused-QKV weight buffer (F32, [C,QKV_STRIDE] per layer). BF16 builds no longer keep
 // this resident during training -- build_qkv_weights() below writes the bf16 mirror (g_wqkv16)
 // DIRECTLY from Wq/Wk/Wv instead of staging through this F32 buffer, so it's dead weight for a pure
 // training run (~108 MiB at production dims). The F32 CUDA inference paths (sub0_cuda_forward,
@@ -2409,13 +2427,16 @@ void fwd_free() {
 // (batch*T product, grown on demand -- see train_alloc). Freed by sub0_cuda_shutdown.
 struct TrainScratch {
     // per-layer saved forward activations (residual stream stored bf16; transient scratch is act_t)
-    act_t* h_in [N_LAYERS] = {};   // [M,C] layer input (= rmsnorm1 input)
-    float* rinv1[N_LAYERS] = {};   // [M]   rmsnorm1 reciprocal-rms
+    // Indexed by EXECUTION, not layer: under LoopSplit a layer's weights run more than once and each
+    // run has its OWN input/statistics that its own backward step needs. LOOP_EXEC_COUNT == N_LAYERS
+    // when LoopSplit is off, so the non-looped build allocates exactly what it always did.
+    act_t* h_in [sub0::LOOP_EXEC_COUNT] = {};   // [M,C] layer input (= rmsnorm1 input)
+    float* rinv1[sub0::LOOP_EXEC_COUNT] = {};   // [M]   rmsnorm1 reciprocal-rms
     act_t* a    = nullptr;         // [M,C] rmsnorm1 output scratch (bf16) -- recomputed from h_in in backward (not per-layer)
-    act_t* qkv  = nullptr;         // [M,3C] fused q|k|v scratch (bf16) -- recomputed from a in backward (not per-layer)
+    act_t* qkv  = nullptr;         // [M,QKV_STRIDE] fused q|k|v scratch (bf16) -- recomputed from a in backward (not per-layer)
     act_t* att  = nullptr;         // [M,C] attention output scratch (bf16) -- recomputed from qkv in backward (not per-layer)
-    act_t* h_mid[N_LAYERS] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
-    float* rinv2[N_LAYERS] = {};   // [M]   rmsnorm2 reciprocal-rms
+    act_t* h_mid[sub0::LOOP_EXEC_COUNT] = {};   // [M,C] after residual-1 (= rmsnorm2 input)
+    float* rinv2[sub0::LOOP_EXEC_COUNT] = {};   // [M]   rmsnorm2 reciprocal-rms
     act_t* fbuf = nullptr;         // [M,C] rmsnorm2 output scratch -- recomputed from h_mid in backward (= W1 input)
     act_t* ff1  = nullptr;         // [M,F] pre-GELU scratch -- recomputed from fbuf in backward (not per-layer)
     act_t* gact = nullptr;         // [M,F] GELU output scratch -- recomputed from fbuf in backward (not per-layer)
@@ -2427,13 +2448,13 @@ struct TrainScratch {
     // gradient temporaries (reused across layers); dh threads the residual stream in F32
     float* dh      = nullptr;      // [M,C] running residual-stream grad
     float* da      = nullptr;      // [M,C] f32 (feeds rmsnorm1 bwd dy)
-    act_t* dqkv    = nullptr;      // [M,3C] bf16
+    act_t* dqkv    = nullptr;      // [M,QKV_STRIDE] bf16
     act_t* datt    = nullptr;      // [M,C] bf16
     float* dfbuf   = nullptr;      // [M,C]
     act_t* dff1    = nullptr;      // [M,F]
     act_t* dgact   = nullptr;      // [M,F]
     float* dlogits = nullptr;      // [chunk_rows,V] (chunked -- see head_ce_chunked/g_tr_logits_chunk)
-    float* dwqkv   = nullptr;      // [C,3C] fused QKV weight-grad temp
+    float* dwqkv   = nullptr;      // [C,QKV_STRIDE] fused QKV weight-grad temp (per-EXECUTION, overwritten)
     act_t* dh16    = nullptr;      // [M,C] bf16 cast of dh (FFN W2 backward operand)
     double* loss   = nullptr;      // [1] accumulated cross-entropy (device)
     int*   dtargets = nullptr;     // [M] next-token targets for cross-entropy
@@ -2462,7 +2483,7 @@ act_t* g_w1_16[N_LAYERS] = {};     // [C,F]
 act_t* g_w2_16[N_LAYERS] = {};     // [F,C]
 act_t* g_wg16[N_LAYERS]  = {};     // [C,F] gate matrix mirror -- USE_GATED_FFN only (else stays all-null, unused)
 act_t* g_wo16[N_LAYERS]  = {};     // [C,C] attention output proj mirror
-act_t* g_wqkv16[N_LAYERS] = {};    // [C,3C] fused QKV mirror (bf16 acts) / alias under f32
+act_t* g_wqkv16[N_LAYERS] = {};    // [C,QKV_STRIDE] fused QKV mirror (bf16 acts) / alias under f32
 
 void train_free();                 // fwd: train_alloc frees the old buffers before a grow-realloc
 // Row-product capacity, exactly like fwd_alloc above: any (batch, T) with batch*T <= g_tr_rows is
@@ -2485,11 +2506,11 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     const size_t MV = g_tr_logits_chunk * VOCAB;
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
-    for (int l = 0; l < N_LAYERS; ++l) {
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[l],  MC * sizeof(act_t)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv1[l], Mm * sizeof(float)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[l], MC * sizeof(act_t)));
-        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[l], Mm * sizeof(float)));
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // per EXECUTION -- see TrainScratch::h_in
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_in[e],  MC * sizeof(act_t)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv1[e], Mm * sizeof(float)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.h_mid[e], MC * sizeof(act_t)));
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.rinv2[e], Mm * sizeof(float)));
     }
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.a,      MC * sizeof(act_t)));   // single (checkpoint scratch, bf16)
     SUB0_CUDA_CHECK(cudaMalloc(&g_tr.fbuf,   MC * sizeof(act_t)));  // single (checkpoint scratch, bf16)
@@ -2526,9 +2547,9 @@ int train_alloc(int batch, int T = SEQ_LEN) {
 }
 
 void train_free() {
-    for (int l = 0; l < N_LAYERS; ++l) {
-        cudaFree(g_tr.h_in[l]);  cudaFree(g_tr.rinv1[l]);
-        cudaFree(g_tr.h_mid[l]); cudaFree(g_tr.rinv2[l]);
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // per EXECUTION -- matches train_alloc above
+        cudaFree(g_tr.h_in[e]);  cudaFree(g_tr.rinv1[e]);
+        cudaFree(g_tr.h_mid[e]); cudaFree(g_tr.rinv2[e]);
     }
     cudaFree(g_tr.a); cudaFree(g_tr.fbuf); cudaFree(g_tr.ff1); cudaFree(g_tr.gact); cudaFree(g_tr.qkv); cudaFree(g_tr.att);
     cudaFree(g_tr.h_final); cudaFree(g_tr.rinv_f); cudaFree(g_tr.a_final); cudaFree(g_tr.logits);
@@ -2565,7 +2586,7 @@ int* g_decode_state = nullptr;
 
 inline int kv_alloc() {
     if (g_kv_k) return 0;
-    const size_t n = static_cast<size_t>(N_LAYERS) * SEQ_LEN * sub0::D_KV;
+    const size_t n = static_cast<size_t>(sub0::LOOP_EXEC_COUNT) * SEQ_LEN * sub0::D_KV;
     if (cudaMalloc(&g_kv_k, n * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&g_kv_v, n * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&g_decode_state, 2 * sizeof(int)) != cudaSuccess) return 1;
@@ -2622,7 +2643,7 @@ __global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const floa
     if (j >= C) return;
     embed_one_body(tok_emb, pos_emb, id_pos[0], id_pos[1], h, j, bind);
 }
-// RoPE one row: rotate q (cols [0,C)) and k (cols [C,2C)) of a fused [3C] qkv row at position pos
+// RoPE one row: rotate q (cols [0,D_MODEL)) then k (cols [QKV_K_OFF,QKV_V_OFF)) of a fused qkv row at pos
 // (mirrors rope_kernel with t = pos). V (cols [2C,3C)) untouched. C/H constexpr-folded (D_MODEL/
 // N_HEADS, its one call site) -- see rope_kernel above; pos stays runtime (the decode position). Body
 // factored out for the same reason as embed_one_body above.
@@ -2794,19 +2815,19 @@ static_assert(check_layer_offsets(),
 //      count, so the per-(b,h,i) softmax-stats index takes H as an explicit argument instead of
 //      reading gridDim.y (which is what it used to do, and which would now silently mis-index).
 
-// LoopSplit is CPU-only for the same class of reason, but a DIFFERENT specific one, and this is the
-// dangerous direction: re-executing a layer means its weights are used more than once per forward, so
-// every parameter gradient must ACCUMULATE. The CPU backend already does (`+=` throughout
-// backward_node). This backend deliberately OVERWRITES -- launch_linear_bwd_t's dW GEMM runs with
-// beta=0, split_dqkv_kernel assigns with `=`, bias_grad_act_kernel assigns with `=` -- all justified
-// by "each weight is used once per forward", which LoopSplit falsifies. The failure mode is not a
-// crash or a wrong shape: it is a quietly wrong gradient (only the LAST execution's contribution
-// surviving), which would look like a training run that simply learns worse. Fail the build instead.
-// Per-execution TrainScratch buffers and KV slots would also be needed. See roadmap 2a.
-static_assert(LOOP_MIDDLE_LAYERS == 0 || LOOP_REPEATS == 1,
-    "The CUDA backend does not support LoopSplit yet (weight-shared repeated layers need accumulating "
-    "dW writes; this backend overwrites them). Configure with --loop-repeats 1, or build with "
-    "-DSUB0_COMPUTE=CPU.");
+// LoopSplit IS supported here (the guard that used to sit at this spot is gone). What it required:
+//   1. Every PARAM-GRAD write accumulates instead of overwriting, because a weight-shared layer runs
+//      more than once per forward and each execution contributes. See launch_linear_bwd_t's
+//      accumulate_dw, split_dqkv_kernel's ACC and bias_grad_*_kernel's ACC -- all gated on
+//      LOOP_SPLIT_ON, so the non-looped path keeps its cheaper write-without-read. Grad writes that
+//      already went through atomicAdd (dgamma, embeddings) needed nothing: backward_device zeroes the
+//      whole grad blob at step start, so they were always accumulating into a clean buffer.
+//   2. Activation checkpoints and decode KV slots are indexed by EXECUTION, not layer (TrainScratch's
+//      h_in/rinv1/h_mid/rinv2 and g_kv_k/g_kv_v), since each run of a shared layer has its own input
+//      and its own statistics that its own backward step needs.
+//   3. All four forward paths plus the backward walk sub0::LAYER_EXEC_ORDER rather than 0..N_LAYERS.
+// The failure mode this replaced was NOT a crash: it was a quietly wrong gradient with only the last
+// execution's contribution surviving, which looks like a run that merely learns worse.
 
 // One decode step on the device: token `id` at window position `pos`, reusing the M=1 dense launches
 // and the K/V cache. Writes logits into g_fwd.logits[0..VOCAB). Requires uploaded params + wqkv +
@@ -2827,7 +2848,8 @@ void forward_one_device(int id, int pos) {
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
       embed_one_kernel<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id, pos, h, g_dev_bind); }
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // EXECUTIONS, not layers (LoopSplit)
+        const int    l   = sub0::LAYER_EXEC_ORDER[e];
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
         const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off;
@@ -2847,13 +2869,13 @@ void forward_one_device(int id, int pos) {
             const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
             rope_one_kernel<<<g, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
         }
-        float* kc = g_kv_k + (static_cast<size_t>(l) * SEQ_LEN + pos) * sub0::D_KV;  // append this token's K/V
-        float* vc = g_kv_v + (static_cast<size_t>(l) * SEQ_LEN + pos) * sub0::D_KV;
+        float* kc = g_kv_k + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;  // append this token's K/V
+        float* vc = g_kv_v + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;   // slot per EXECUTION
         cudaMemcpyAsync(kc, qkv + sub0::QKV_K_OFF, sub0::D_KV * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
         cudaMemcpyAsync(vc, qkv + sub0::QKV_V_OFF, sub0::D_KV * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
-          attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV,
-                                                            g_kv_v + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV, att, pos); }
+          attn_decode_kernel<HD><<<H, 128, shb, g_stream>>>(qkv, g_kv_k + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV,
+                                                            g_kv_v + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV, att, pos); }
         launch_linear(att, Wo, nullptr, proj, 1, C, C);
         launch_add(h, proj, h, C);
         launch_rmsnorm(h, ln2, fbuf, 1);
@@ -2900,7 +2922,8 @@ void forward_one_device_graphed() {
 
     { const int blk = 256; const float* pe = (POS_ENCODING == PosEncoding::Absolute) ? pos_emb : nullptr;
       embed_one_kernel_g<<<(C + blk - 1) / blk, blk, 0, g_stream>>>(tok_emb, pe, id_ptr, h, g_dev_bind); }
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // EXECUTIONS, not layers (LoopSplit)
+        const int    l   = sub0::LAYER_EXEC_ORDER[e];
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off, *ln2 = base + L[b0 + kLn2].off;
         const float* Wo  = base + L[b0 + kWo].off, *W1 = base + L[b0 + kW1].off;
@@ -2920,8 +2943,8 @@ void forward_one_device_graphed() {
             const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
             rope_one_kernel_g<<<g, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA);
         }
-        float* kc_base = g_kv_k + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV;   // this layer's cache base
-        float* vc_base = g_kv_v + static_cast<size_t>(l) * SEQ_LEN * sub0::D_KV;   // (fixed per node -- pos
+        float* kc_base = g_kv_k + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // this EXECUTION's cache
+        float* vc_base = g_kv_v + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // base (fixed per node -- pos
                                                                                    //  is read on-device)
         { const int blk = 256; kv_append_kernel<<<(sub0::D_KV + blk - 1) / blk, blk, 0, g_stream>>>(qkv, kc_base, vc_base, pos_ptr); }
         { constexpr int HD = D_HEAD; const size_t shb = (HD + SEQ_LEN) * sizeof(float);
@@ -2983,7 +3006,8 @@ void forward_device(int batch, int T) {
         else
             embed_kernel<<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, h, M, g_dev_bind);
     }
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // EXECUTIONS, not layers (LoopSplit)
+        const int    l   = sub0::LAYER_EXEC_ORDER[e];
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off;
         const float* ln2 = base + L[b0 + kLn2].off;
@@ -3221,7 +3245,8 @@ void forward_train(int batch, int T) {
         else
             embed_act_kernel<act_t><<<grid, block, 0, g_stream>>>(tok_emb, g_fwd.dids, g_tr.h_in[0], M, g_dev_bind);
     }
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {   // EXECUTIONS, not layers (LoopSplit)
+        const int    l   = sub0::LAYER_EXEC_ORDER[e];
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off;
         const float* ln2 = base + L[b0 + kLn2].off;
@@ -3235,11 +3260,11 @@ void forward_train(int batch, int T) {
         [[maybe_unused]] const float* qgamma = nullptr;
         [[maybe_unused]] const float* kgamma = nullptr;
         if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
-        act_t* const hin  = g_tr.h_in[l];
-        act_t* const hmid = g_tr.h_mid[l];
-        act_t* const next = (l + 1 < N_LAYERS) ? g_tr.h_in[l + 1] : g_tr.h_final;
+        act_t* const hin  = g_tr.h_in[e];
+        act_t* const hmid = g_tr.h_mid[e];
+        act_t* const next = (e + 1 < sub0::LOOP_EXEC_COUNT) ? g_tr.h_in[e + 1] : g_tr.h_final;
 
-        launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[l], M);          // a = rmsnorm(hin,ln1) bf16
+        launch_rmsnorm_train_t<act_t, act_t>(hin, ln1, g_tr.a, g_tr.rinv1[e], M);          // a = rmsnorm(hin,ln1) bf16
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, sub0::QKV_STRIDE);  // fused qkv bf16
         // Plain (non-save) variant here: this qkv buffer is a CHECKPOINT (recomputed from scratch in
         // backward_device -- see that function's own qknorm call, which uses the SAVE variant because
@@ -3250,7 +3275,7 @@ void forward_train(int batch, int T) {
                           g_tr.att, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);  // attention (P-free)
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
         launch_add_t<act_t>(hin, hmid, hmid, MC);                                   // hmid = hin + proj
-        launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[l], M);      // fbuf bf16
+        launch_rmsnorm_train_t<act_t, act_t>(hmid, ln2, g_tr.fbuf, g_tr.rinv2[e], M);      // fbuf bf16
         if constexpr (USE_GATED_FFN) {
             launch_linear_t<act_t, act_t>(g_tr.fbuf, g_wg16[l], g_tr.ff1, M, C, F);   // ff1 = gate_pre
             launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.gact, M, C, F); // gact = up_pre
@@ -3352,7 +3377,11 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
     launch_rmsnorm_bwd_t<act_t>(g_tr.h_final, pb + L[fi + kLnF].off, g_tr.rinv_f, g_tr.da, g_tr.dh,
                        gb + L[fi + kLnF].off, M);
 
-    for (int l = N_LAYERS - 1; l >= 0; --l) {
+    // Reverse EXECUTION order (mirrors forward_train): `e` indexes this run's saved activations, `l`
+    // says whose weights/grads they belong to. Under LoopSplit several `e` share one `l`, which is
+    // exactly why every param-grad write below accumulates -- see launch_linear_bwd_t's accumulate_dw.
+    for (int e = sub0::LOOP_EXEC_COUNT - 1; e >= 0; --e) {
+        const int l  = sub0::LAYER_EXEC_ORDER[e];
         const int b0 = layer_base(l);
         [[maybe_unused]] const float* b1 = nullptr;
         if constexpr (!USE_GATED_FFN) b1 = pb + L[b0 + kB1].off;
@@ -3370,7 +3399,7 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         // gact post-GELU) -- see the top-of-file "SwiGLU-gated FFN" comment for why. Buffer roles are
         // REMAPPED under gated (no new [M,F] buffers): ff1 <- gate_pre, gact <- up_pre, dff1 <- hswi
         // (the W2 GEMM's input) then, after W2's backward, dff1 <- dgate and dgact <- dup.
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.fbuf, g_tr.rinv2[l], M);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_mid[e], pb + L[b0 + kLn2].off, g_tr.fbuf, g_tr.rinv2[e], M);
         if constexpr (USE_GATED_FFN) {
             launch_linear_t<act_t, act_t>(g_tr.fbuf, g_wg16[l], g_tr.ff1,  M, C, F);   // ff1  = gate_pre
             launch_linear_t<act_t, act_t>(g_tr.fbuf, g_w1_16[l], g_tr.gact, M, C, F);  // gact = up_pre
@@ -3394,16 +3423,17 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
             // ff residual: dh = grad into layer output = d(ff2). W2 backward (input gact); dh->bf16
             { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
             launch_linear_bwd_t<act_t, act_t>(g_tr.gact, g_w2_16[l], g_tr.dh16, g_tr.dgact, gb + L[b0 + kW2].off, M, F, C);
-            { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + kB2].off, M, C); }
+            { const int bk = 128; bias_grad_kernel<<<(C + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, gb + L[b0 + kB2].off, M, C,
+                                                                          sub0::LOOP_SPLIT_ON); }
             launch_gelu_bwd_t(g_tr.ff1, g_tr.dgact, g_tr.dff1, MF);                     // dff1
             launch_linear_bwd_t<act_t, float>(g_tr.fbuf, g_w1_16[l], g_tr.dff1, g_tr.dfbuf, gb + L[b0 + kW1].off, M, C, F);
-            { const int bk = 128; bias_grad_act_kernel<act_t><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + kB1].off, M); }
+            { const int bk = 128; bias_grad_act_kernel<act_t, sub0::LOOP_SPLIT_ON><<<(F + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dff1, gb + L[b0 + kB1].off, M); }
         }
-        launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[l], pb + L[b0 + kLn2].off, g_tr.rinv2[l], g_tr.dfbuf,
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_mid[e], pb + L[b0 + kLn2].off, g_tr.rinv2[e], g_tr.dfbuf,
                            g_tr.dh, gb + L[b0 + kLn2].off, M);                          // dh += -> d(h_mid)
         // proj residual: dh = grad into h_mid = d(proj). Wo backward (input att, bf16)
         // checkpoint: a/qkv/att not saved -- recompute a from h_in, then qkv (+qknorm+rope), then attention
-        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[l], pb + L[b0 + kLn1].off, g_tr.a, g_tr.rinv1[l], M);
+        launch_rmsnorm_train_t<act_t, act_t>(g_tr.h_in[e], pb + L[b0 + kLn1].off, g_tr.a, g_tr.rinv1[e], M);
         launch_linear_t<act_t, act_t>(g_tr.a, g_wqkv16[l], g_tr.qkv, M, C, sub0::QKV_STRIDE);
         // QK-norm recompute: the SAVE variant (unlike forward_train's plain launch_qknorm_t) because
         // this pre-norm x must survive until qknorm's own backward runs below, AFTER attention's and
@@ -3428,13 +3458,18 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         if constexpr (USE_QK_NORM)
             launch_qknorm_bwd_t<act_t>(g_tr.qk_pre, qgamma, kgamma, g_tr.dqkv, dqgamma, dkgamma, M);
         // qkv backward (input a): da = grad into a (f32), dWqkv -> split into dWq/dWk/dWv
-        launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C, sub0::QKV_STRIDE);
+        // dW target here is g_tr.dwqkv, a per-execution TEMP -- NOT the shared param blob. It must be
+        // overwritten (accumulate_dw=false), or under LoopSplit it would accumulate here AND again in
+        // split_dqkv_kernel below, double-counting every repeat. This is the one call site of the seven
+        // whose dW is not `gb + ...`; the other six correctly take the accumulating default.
+        launch_linear_bwd_t<act_t, float>(g_tr.a, g_wqkv16[l], g_tr.dqkv, g_tr.da, g_tr.dwqkv, M, C,
+                                          sub0::QKV_STRIDE, /*accumulate_dx=*/false, /*accumulate_dw=*/false);
         {
             const int n = C * sub0::QKV_STRIDE, block = 256;
-            split_dqkv_kernel<<<(n + block - 1) / block, block, 0, g_stream>>>(
+            split_dqkv_kernel<sub0::LOOP_SPLIT_ON><<<(n + block - 1) / block, block, 0, g_stream>>>(
                 g_tr.dwqkv, gb + L[b0 + kWq].off, gb + L[b0 + kWk].off, gb + L[b0 + kWv].off);
         }
-        launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[l], pb + L[b0 + kLn1].off, g_tr.rinv1[l], g_tr.da,
+        launch_rmsnorm_bwd_t<act_t>(g_tr.h_in[e], pb + L[b0 + kLn1].off, g_tr.rinv1[e], g_tr.da,
                            g_tr.dh, gb + L[b0 + kLn1].off, M);                          // dh += -> d(h_in)
     }
     // embed backward: scatter dh into tok_emb (+ pos_emb under Absolute) grads
@@ -4660,7 +4695,7 @@ SUB0_CUDA_API int sub0_cuda_swiglu_check(int M, int F, double* out_relL2_fwd, do
 // is to prove the MATH, independent of whatever ACT_DTYPE the CURRENT build happens to bake, same
 // reasoning as sub0_cuda_tied_head_check's tf32-off/F32 convention for its own GEMM check.
 //
-// Forward: builds a random qkv[rows,3C] (C=H*DH, near-1 gamma so it exercises a realistic operating
+// Forward: builds a random qkv[rows,QKV_STRIDE] (C=H*DH, near-1 gamma so it exercises a realistic operating
 // point) on host, runs qknorm_act_kernel, and compares against a CPU reference that mirrors
 // backend_cpu.cpp's op_qknorm exactly (per-(row,head) mean-square over the DH-wide slice, r =
 // 1/sqrt(ms+eps), y = x*r*gamma) in double precision. The V sub-block (cols [2C,3C)) is checked
@@ -5266,7 +5301,7 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
 // bf16 GEMM-weight mirror -- see memplan.hpp's Dims/param_floats/persistent_bytes comments).
 static constexpr sub0::memplan::Dims kFootprintDims{
     D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB, USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-    sub0::HAS_POS_EMB, N_KV_HEADS,
+    sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT,
 };
 
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device

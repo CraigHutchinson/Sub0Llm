@@ -846,7 +846,7 @@ struct GpuTrainer {
             // memplan.hpp's Dims comments.
             const sub0::memplan::Dims dims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                                              USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                                             sub0::HAS_POS_EMB, N_KV_HEADS };
+                                             sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
             const int act_b = ACT_DTYPE == Dtype::BF16 ? 2 : 4;
             constexpr int kVramHeadroomMB = 512;   // cuBLAS workspace + allocator fragmentation slack
             const int free_mb = sub0_dev_free_mem_mb();
@@ -2670,7 +2670,7 @@ enum : int { TUNE_BACKEND_AUTO = 0, TUNE_BACKEND_ALL = 1, TUNE_BACKEND_CPU = 2, 
 // USE_TIED_EMBEDDINGS/USE_QK_NORM/USE_GATED_FFN -- see memplan.hpp's Dims comments.
 static constexpr sub0::memplan::Dims kGpuDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                                                USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                                               sub0::HAS_POS_EMB, N_KV_HEADS };
+                                               sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
 
 extern "C" SUB0_API int sub0_tune_stage(int max_threads, int verbose, int backend,
                                         int thorough, int budget_s) {

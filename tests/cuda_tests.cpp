@@ -1216,7 +1216,7 @@ TEST_CASE("CUDA forward stays finite under saturating GELU activations", "[cuda]
 // match USE_GATED_FFN the same way (Wg replaces the b1/b2 bias floats).
 static constexpr sub0::memplan::Dims kTestDims{ D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                                                 USE_TIED_EMBEDDINGS, USE_QK_NORM, USE_GATED_FFN,
-                                                sub0::HAS_POS_EMB, N_KV_HEADS };
+                                                sub0::HAS_POS_EMB, N_KV_HEADS, sub0::LOOP_EXEC_COUNT };
 
 // The footprint model must agree with the canonical parameter layout: param_floats() re-derives
 // PARAM_FLOATS from dims (so the configurator can call it without layout.hpp). If they diverge,
