@@ -709,11 +709,10 @@ __device__ inline void rope_pair_body(A* __restrict__ row, int pos, float theta,
 __device__ inline int rope_sub_pairs(int which) {
     return (which == 0 ? D_MODEL : sub0::D_KV) / 2;
 }
-__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta) {
+__global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta, int which) {
     constexpr int in_stride = sub0::QKV_STRIDE;
-    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;   // pair within this sub-block
-    const int m     = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
-    const int which = blockIdx.z;                              // 0 = Q, 1 = K (V is never rotated)
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;   // pair within this sub-block
+    const int m  = blockIdx.y * blockDim.y + threadIdx.y;   // row over M = batch*T
     if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
     rope_pair_body(qkv + static_cast<size_t>(m) * in_stride, m % T, theta, pg, which, +1.0f);
 }
@@ -945,17 +944,15 @@ attn_fwd_tiled_kernel(const A* __restrict__ q, const A* __restrict__ k, const A*
 
 // act-typed RoPE forward/backward -- both delegate to rope_pair_body above, which is the ONE place
 // the angle and the rotation live (the backward is the same rotation with sign = -1, i.e. its transpose).
-template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, float theta) {
-    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m     = blockIdx.y * blockDim.y + threadIdx.y;
-    const int which = blockIdx.z;
+template <class A> __global__ void rope_act_kernel(A* __restrict__ qkv, int batch, int T, float theta, int which) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m  = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
     rope_pair_body(qkv + static_cast<size_t>(m) * sub0::QKV_STRIDE, m % T, theta, pg, which, +1.0f);
 }
-template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, float theta) {
-    const int pg    = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m     = blockIdx.y * blockDim.y + threadIdx.y;
-    const int which = blockIdx.z;
+template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int batch, int T, float theta, int which) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m  = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= batch * T || pg >= rope_sub_pairs(which)) return;
     rope_pair_body(dq + static_cast<size_t>(m) * sub0::QKV_STRIDE, m % T, theta, pg, which, -1.0f);
 }
@@ -2030,23 +2027,29 @@ inline void launch_attn(const float* dQ, const float* dK, const float* dV, float
 // RoPE: rotate Q/K (forward) or dQ/dK (backward) in place over the fused [*, in_stride] buffer.
 // One thread per (row, pair); grid.x over C/2 pairs, grid.y over batch*T rows. C/H/in_stride dropped
 // as parameters -- constexpr-folded inside the kernels themselves, see rope_kernel above.
-// grid.z = 2 selects the Q (z=0) then K (z=1) sub-block; grid.x is sized for the WIDER of the two
-// (Q, always >= K) and the K pass early-outs on its narrower half -- see rope_sub_pairs. Under MHA the
-// two sub-blocks are equal and nothing early-outs, so the launched thread count is unchanged.
-inline dim3 rope_grid(const dim3& block, int batch, int T) {
-    return dim3((D_MODEL / 2 + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y, 2);
+// ONE LAUNCH PER SUB-BLOCK, each grid.x sized to that sub-block's own pair count -- `which` is a kernel
+// argument, not blockIdx.z. A single fused grid.z=2 launch has to size grid.x for the WIDER sub-block
+// (Q), so under GQA the K pass launches whole x-blocks that do nothing but return: at D_MODEL=384 with
+// D_KV=96 that is 4 of 6 x-blocks on the K pass, i.e. 33% of ALL rope blocks. Measured on qknorm's
+// identical shape, such blocks cost very nearly what real ones do (-37.5% blocks gave -36% time), so
+// this is not the free early-out it looks like. Identical shape under MHA, where the sub-blocks match.
+inline dim3 rope_grid(const dim3& block, int pairs, int batch, int T) {
+    return dim3((pairs + block.x - 1) / block.x, (batch * T + block.y - 1) / block.y);
 }
 inline void launch_rope(float* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_kernel<<<rope_grid(block, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
+    rope_kernel<<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
+    rope_kernel<<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
 }
 template <class A> inline void launch_rope_t(A* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_act_kernel<A><<<rope_grid(block, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA);
+    rope_act_kernel<A><<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
+    rope_act_kernel<A><<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
 }
 template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_bwd_act_kernel<A><<<rope_grid(block, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA);
+    rope_bwd_act_kernel<A><<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 0);
+    rope_bwd_act_kernel<A><<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 1);
 }
 
 // QK-norm: per-head RMSNorm on the Q/K sub-blocks of the fused qkv buffer, in place, right after the
@@ -2664,14 +2667,14 @@ __global__ void embed_one_kernel_g(const float* __restrict__ tok_emb, const floa
 __device__ inline void rope_one_body(float* __restrict__ qkv, int pos, float theta, int pg, int which) {
     rope_pair_body(qkv, pos, theta, pg, which, +1.0f);
 }
-__global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta) {
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x, which = blockIdx.y;
+__global__ void rope_one_kernel(float* __restrict__ qkv, int pos, float theta, int which) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
     if (pg >= rope_sub_pairs(which)) return;
     rope_one_body(qkv, pos, theta, pg, which);
 }
 // Graphed-decode variant: pos read from g_decode_state[1] -- see embed_one_kernel_g's own comment.
-__global__ void rope_one_kernel_g(float* __restrict__ qkv, const int* __restrict__ pos_ptr, float theta) {
-    const int pg = blockIdx.x * blockDim.x + threadIdx.x, which = blockIdx.y;
+__global__ void rope_one_kernel_g(float* __restrict__ qkv, const int* __restrict__ pos_ptr, float theta, int which) {
+    const int pg = blockIdx.x * blockDim.x + threadIdx.x;
     if (pg >= rope_sub_pairs(which)) return;
     rope_one_body(qkv, *pos_ptr, theta, pg, which);
 }
@@ -2890,8 +2893,9 @@ void forward_one_device(int id, int pos) {
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, sub0::QKV_STRIDE);      // fused q|k|v (one row)
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
-            const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
-            rope_one_kernel<<<g, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA);
+            const int blk = 128;
+            rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 0);
+            rope_one_kernel<<<(sub0::D_KV / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 1);
         }
         float* kc = g_kv_k + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;  // append this token's K/V
         float* vc = g_kv_v + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;   // slot per EXECUTION
@@ -2964,8 +2968,9 @@ void forward_one_device_graphed() {
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, 1, C, sub0::QKV_STRIDE);      // fused q|k|v (one row)
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
-            const int blk = 128; const dim3 g((C / 2 + blk - 1) / blk, 2);
-            rope_one_kernel_g<<<g, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA);
+            const int blk = 128;
+            rope_one_kernel_g<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 0);
+            rope_one_kernel_g<<<(sub0::D_KV / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 1);
         }
         float* kc_base = g_kv_k + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // this EXECUTION's cache
         float* vc_base = g_kv_v + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // base (fixed per node -- pos
