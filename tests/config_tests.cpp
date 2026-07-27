@@ -294,6 +294,18 @@ TEST_CASE("gpu_batch_estimate: VRAM-scaled default for an UNTUNED GPU build", "[
     // VRAM at or below the headroom reservation alone -> nothing left to fit, returns 0 (not negative
     // or a stale value), matching max_batch_for_vram's own "0 if even batch 1 cannot fit" contract.
     CHECK(gpu_batch_estimate(dims, 400, kCap, sub0::memplan::FLOAT) == 0);   // headroom alone is 512
+
+    // NEVER recommend a batch above SAFE_BATCH_CEILING, however much VRAM is present. The device step
+    // faults somewhere between 512 and 704 (project memory gpu-large-batch-access-violation), so an
+    // estimate past the ceiling is not merely aggressive -- it is a recommendation that CRASHES, and
+    // an unattended full-corpus run is exactly where that costs most. A very large card is the case
+    // that would otherwise sail past it, so pin that specifically.
+    for (int vram : {8151, 16000, 24000, 48000, 80000}) {
+        const int est = gpu_batch_estimate(dims, vram, kCap, 2);
+        CHECK(est <= sub0::config::SAFE_BATCH_CEILING);
+    }
+    // ...and the cap must bind on a card big enough to fit more, not just be vacuously true.
+    CHECK(gpu_batch_estimate(dims, 80000, kCap, 2) == sub0::config::SAFE_BATCH_CEILING);
 }
 
 TEST_CASE("vocab curve: the ideal-vocab knee + bytes/token", "[config][vocab]") {

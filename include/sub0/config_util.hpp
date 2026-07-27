@@ -338,12 +338,29 @@ inline TuneDefaults parse_tune_cache(std::istream& is, int hw_concurrency) {
 // NON-monotonic in batch on this hardware (a real dip at 512 that recovers by 768), so the true
 // optimum can land on either side of this estimate -- `sub0llm tune --backend gpu` is still how you
 // find it exactly.
+// SAFE_BATCH_CEILING caps what this function may RECOMMEND, independently of what fits in VRAM.
+// sub0_cuda_train_step faults (SIGSEGV, no step line printed) above a batch that measures between 512
+// and 704 on this project's hardware -- reproduced at d256 L6 H4 and again at d384 L6 H8, in both MHA
+// and GQA builds, so it is batch-driven rather than shape-specific. Root cause is still open (project
+// memory gpu-large-batch-access-violation).
+//
+// Until it is fixed, an unclamped estimate is not merely aggressive, it is WRONG: on an 8 GB card this
+// function returned 704 for a d384 config, which means plain `sub0llm-train` with no --batch flag
+// crashed on the first step. A recommendation that cannot run is worse than a conservative one, and a
+// long unattended full-corpus run is exactly where it hurts most.
+//
+// Deliberately a CEILING on the recommendation only -- an explicit `--batch 640` is still honoured, so
+// the cap cannot silently block investigating or fixing the fault. Remove it, with the A/B to show
+// throughput actually improves past 512, once the fault is root-caused.
+inline constexpr int SAFE_BATCH_CEILING = 512;
+
 inline int gpu_batch_estimate(const sub0::memplan::Dims& dims, int vram_mb, int hard_cap,
                               sub0::memplan::u64 act_bytes, int headroom_mb = 512, int align = 32) {
     if (vram_mb <= 0) return 0;             // unknown VRAM -> caller keeps its own (CPU-width) fallback
     const int budget = vram_mb - headroom_mb;
     if (budget <= 0) return 0;
-    const int fit = sub0::memplan::max_batch_for_vram(dims, budget, hard_cap, act_bytes);
+    const int fit_vram = sub0::memplan::max_batch_for_vram(dims, budget, hard_cap, act_bytes);
+    const int fit = (fit_vram < SAFE_BATCH_CEILING) ? fit_vram : SAFE_BATCH_CEILING;
     return (fit >= align) ? (fit / align) * align : fit;   // too small to round without hitting 0
 }
 
