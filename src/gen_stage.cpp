@@ -146,13 +146,16 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         std::string schedule_error;
         std::vector<std::string> schedule_warnings;   // unused here -- gen only needs the parsed shape
         bool have_schedule = false;
-        if (have && cfg.config_schema >= 2) {
+        // Only look for a schedule this model actually pinned. cfg.has_blend_schedule is 0 for a plain
+        // single-corpus run, where no schedule file was ever written -- reading one and warning that it
+        // is missing described normal operation as a fault on every such model.
+        if (have && cfg.config_schema >= 2 && cfg.has_blend_schedule) {
             have_schedule = sub0::parse_blend_schedule_json(dir / "blend_schedule.json", schedule,
                                                              schedule_error, schedule_warnings);
             if (!have_schedule)
-                std::println(stderr, "gen: '{}' blend_schedule.json is unreadable ({}) -- generating "
-                                     "WITHOUT any interceptor (spell/scratch/op/content-embed)",
-                             dir.string(), schedule_error);
+                std::println(stderr, "gen: '{}' pinned a blend_schedule.json but it is unreadable ({}) "
+                                     "-- generating WITHOUT any interceptor "
+                                     "(spell/scratch/op/content-embed)", dir.string(), schedule_error);
         }
         const bool sp_on = have_schedule && (generator_ever_active(schedule, "spellspike")
                                              || generator_ever_active(schedule, "scratchspike"));
@@ -353,7 +356,10 @@ extern "C" SUB0_API int sub0_eval_stage(const char* model_in, unsigned seed, int
         const std::filesystem::path mp(model_in);
         const std::filesystem::path dir = std::filesystem::is_directory(mp) ? mp : mp.parent_path();
         sub0::registry::RunConfig cfg;
-        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) && cfg.config_schema >= 2) {
+        // Same has_blend_schedule gate as gen above: a plain single-corpus model never pinned one, so
+        // its absence is expected and silent. Only a model that DID pin one can have a broken one.
+        if (!dir.empty() && sub0::registry::read_config_json(cfg, dir) && cfg.config_schema >= 2
+            && cfg.has_blend_schedule) {
             sub0::ScheduleSpec schedule;
             std::string schedule_error;
             std::vector<std::string> schedule_warnings;
@@ -361,8 +367,8 @@ extern "C" SUB0_API int sub0_eval_stage(const char* model_in, unsigned seed, int
                                                 schedule_warnings))
                 op_on = generator_ever_active(schedule, "op_curriculum");
             else
-                std::println(stderr, "eval: '{}' blend_schedule.json is unreadable ({})", dir.string(),
-                             schedule_error);
+                std::println(stderr, "eval: '{}' pinned a blend_schedule.json but it is unreadable ({})",
+                             dir.string(), schedule_error);
         }
     }
     if (!op_on)

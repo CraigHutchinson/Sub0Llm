@@ -1146,6 +1146,25 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const std::string created = sub0::registry::now_iso();
     long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
     if (model_out && *model_out) {
+        // Guard the positional-argument trap: usage is `[model] [corpus]`, so ONE positional binds to
+        // MODEL. Passing just a corpus -- the natural thing to type -- silently trains INTO the corpus's
+        // own directory, scattering model.bin/config.json/corpus.tok/*.ckpt beside the data. That
+        // happened twice while building this feature set, once nearly committing a 1.36 GB corpus.tok.
+        // A model path naming an EXISTING regular file that is not a model.bin is a corpus by any
+        // reasonable reading, so refuse rather than write there.
+        {
+            const std::filesystem::path mp(model_out);
+            std::error_code ec_;
+            if (std::filesystem::is_regular_file(mp, ec_) && mp.filename() != "model.bin"
+                && mp.extension() != ".bin") {
+                sub0::log::error(
+                    "train: '{}' is an existing file, so it looks like a CORPUS passed where the MODEL "
+                    "path goes -- training would scatter model artifacts beside your data. Usage is "
+                    "`sub0llm-train [model] [corpus]`; omit the model path to auto-name one under the "
+                    "models root, or give the corpus as the SECOND positional.", model_out);
+                return 1;
+            }
+        }
         model_path = model_out;
         // Accept a model DIRECTORY too (e.g. resuming `models/<name>`): use its model.bin, so a dir path
         // doesn't mis-resolve the checkpoint to "<dir>.ckpt", silently start fresh, and nest a new dir.
@@ -1480,6 +1499,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // sub0/blend_schedule.hpp), not here -- config_schema=2 is the signal that this model dir uses
         // that scheme (a config_schema<2 dir predates it and is refused on resume, not silently
         // reinterpreted -- see the resume-reconciliation block below).
+        // Whether this run pinned a blend_schedule.json at all. A plain single-corpus run does not,
+        // and its ABSENCE is then the expected state -- not something to warn about. Without this,
+        // gen/eval could not tell "never had one" from "had one, now unreadable" and warned on every
+        // plain model, training readers to ignore the message that matters.
+        cfg.has_blend_schedule = std::filesystem::exists(meta_dir / "blend_schedule.json") ? 1 : 0;
         cfg.config_schema = 2;
         return cfg;
     };
