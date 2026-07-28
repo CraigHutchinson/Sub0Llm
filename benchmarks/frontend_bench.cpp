@@ -22,6 +22,8 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"
 
+#include <cmath>
+#include <random>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -52,6 +54,38 @@ std::string make_corpus(std::size_t target_bytes) {
 // per prompt and the configurator does per corpus chunk.
 const std::string kText =
     "The quick brown fox jumps over the lazy dog, and they said \"hello\" once more outside.";
+
+// A DIVERSE, Zipf-distributed corpus -- the honest scale proxy the repeated-seed corpus is not. The
+// seed corpus has a tiny fixed vocabulary, so the per-word encode cache hits ~100% and never grows;
+// that flatters the cache and hides its map-growth/rehash cost. Here ~`vocab` distinct pseudo-words
+// are emitted with a head-heavy (cube-of-uniform) rank bias, reproducing a real corpus's long tail:
+// the cache grows to realistic size AND still has a dominant head, so the measured win is what a
+// 50 GB+ corpus would actually see, not a best case. Deterministic (fixed seed) for stable timing.
+std::string make_diverse_corpus(std::size_t target_bytes, unsigned vocab) {
+    std::mt19937 rng(12345u);
+    std::vector<std::string> words;
+    words.reserve(vocab);
+    for (unsigned i = 0; i < vocab; ++i) {
+        const int len = 3 + static_cast<int>(rng() % 10);
+        std::string w;
+        w.reserve(static_cast<std::size_t>(len));
+        for (int k = 0; k < len; ++k) w.push_back(static_cast<char>('a' + rng() % 26));
+        if (i % 7 == 0) w[0] = static_cast<char>('A' + rng() % 26);   // a realistic minority are capitalised
+        words.push_back(std::move(w));
+    }
+    const char punct[4] = {'.', ',', ';', '\n'};
+    std::string c;
+    c.reserve(target_bytes + 16);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    while (c.size() < target_bytes) {
+        const double x = u(rng);
+        const unsigned r = static_cast<unsigned>(static_cast<double>(vocab) * x * x * x);   // head-heavy rank
+        c += words[std::min(r, vocab - 1)];
+        if (rng() % 12 == 0) c.push_back(punct[rng() % 4]);
+        c.push_back(' ');
+    }
+    return c;
+}
 }  // namespace
 
 TEST_CASE("frontend tokenizer throughput", "[!benchmark]") {
@@ -133,5 +167,29 @@ TEST_CASE("frontend encode cache-hit locality", "[!benchmark]") {
     const std::string repeated = make_corpus(64u << 10);   // 64 KB of the repeated seed
     BENCHMARK("encode repeated-word stream (64 KB)") {
         return sub0::tok::encode(t, repeated);
+    };
+}
+
+// Realistic-scale throughput on a DIVERSE Zipfian corpus (see make_diverse_corpus): the honest test of
+// the memoisation win at 50 GB+. If the per-word cache's map growth/rehash on a large unique-word set
+// were a real cost, pass3 here would lag the repetitive-corpus pass3 by more than the extra unique-word
+// Viterbi accounts for -- this benchmark is what would expose that (and gate a fix such as reserving
+// the cache map). pass2's word-table build faces the same growth, so it is measured alongside.
+TEST_CASE("frontend diverse-corpus throughput (Zipfian)", "[!benchmark]") {
+    constexpr std::size_t kBytes = 4u << 20;      // ~4 MB, matches the repetitive pass benches
+    constexpr unsigned    kVocab = 20000;         // realistic distinct-word count for a few MB
+    const std::string corpus = make_diverse_corpus(kBytes, kVocab);
+    const sub0::tok::Tokenizer t = sub0::tok::learn(corpus);
+
+    sub0::tok::Scan names;
+    names.add_names(corpus);
+    const std::unordered_set<std::string> attested = sub0::tok::derive_attested(names);
+    BENCHMARK("pass2 add_words diverse (4 MB)") {
+        sub0::tok::Scan s;
+        s.add_words(corpus, attested);
+        return s.word_syms.size();
+    };
+    BENCHMARK("pass3 full encode diverse (4 MB)") {
+        return sub0::tok::encode(t, corpus);
     };
 }

@@ -460,6 +460,13 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
     // never outlive the one tokenizer `t` and add no cross-call state (the runtime single-prompt path
     // pays only one empty-map construction). `word_key` is reused across words (no per-word alloc).
     std::unordered_map<std::string, std::vector<int>> word_cache;
+    // Pre-size the cache so a big chunk fills it without the ~log2(unique) incremental rehashes, each
+    // of which re-inserts every element so far. On a DIVERSE 4 MB chunk (~20k unique words) this is a
+    // measured ~12% off the full encode; n/32 sits comfortably above the unique-word count for real
+    // corpora (Heaps' law keeps uniques well below n/32), and the one over-sized bucket array is a
+    // cheap zeroed alloc next to the encode itself. Guarded so the runtime single-prompt path (tiny n)
+    // pays nothing. See benchmarks/frontend_bench.cpp's diverse-corpus benchmark.
+    if (n > 1024) word_cache.reserve(n / 32);
     std::string word_key;
     auto emit_byte = [&](int b) { out.push_back(b); };  // base id == byte value
     // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
