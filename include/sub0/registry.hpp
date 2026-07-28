@@ -65,6 +65,10 @@ struct ModelMeta {
     int tied_embeddings = 0;                  // 0 = untied head (legacy default), 1 = head reuses tok_emb
     int qk_norm = 0;                          // 0 = no QK-norm (legacy default), 1 = per-head RMSNorm on Q/K
     int optimizer = 0;                        // 0 = AdamW (legacy default), 1 = Muon (hidden 2D matrices)
+    // Full architecture identity (sub0::MODEL_ARCH_ID). 0 = a legacy meta.txt written before this
+    // existed; compatible() falls back to comparing the individual fields for those, which is exactly
+    // as accurate as it ever was -- no worse, and correct for everything written from here on.
+    unsigned long long arch_id = 0;
     // Training state (provenance of the run that produced this snapshot).
     long long steps = 0;                      // optimizer iterations completed
     double epochs = 0.0;                      // fractional epochs of the corpus covered
@@ -258,16 +262,25 @@ inline std::string corpus_tag(const std::string& corpus_path) {
 // The identity-encoding directory for a model (no I/O). `datetime_tag` identifies this specific
 // training ATTEMPT (see `now_datetag()`) -- it is NOT a compatibility check; that's `compatible()`
 // below, driven by dims/flags alone.
+// `arch_id` (sub0::MODEL_ARCH_ID) is appended as a short hex tag. The readable part stays readable --
+// it is what a human scans an `ls` for -- but it is a hand-picked SUBSET and always will be, because a
+// name carrying every axis would be unreadable. The tag closes that gap: two builds differing in ANY
+// architecture axis get different directories even when the readable part collides, which is precisely
+// what a GQA-vs-MHA pair at identical dims used to do.
 inline std::filesystem::path model_dir(const std::filesystem::path& models_root,
                                        const std::string& corpus, int d, int l, int h,
                                        int seq, int vocab, int ternary, int pos_enc,
                                        const std::string& datetime_tag, int gated_ffn = 0,
-                                       int tied_embeddings = 0, int qk_norm = 0) {
+                                       int tied_embeddings = 0, int qk_norm = 0,
+                                       unsigned long long arch_id = 0) {
+    char tag[24] = {};
+    if (arch_id) std::snprintf(tag, sizeof(tag), "_a%08x",
+                               static_cast<unsigned>(arch_id & 0xffffffffull));
     std::string name = "sub0llm_" + corpus_tag(corpus) +
                        "_d" + std::to_string(d) + "l" + std::to_string(l) + "h" + std::to_string(h) +
                        "sq" + std::to_string(seq) + "v" + std::to_string(vocab) +
                        (ternary ? "t" : "") + pos_tag(pos_enc) + (gated_ffn ? "g" : "") +
-                       (tied_embeddings ? "w" : "") + (qk_norm ? "q" : "") +
+                       (tied_embeddings ? "w" : "") + (qk_norm ? "q" : "") + tag +
                        "_" + (datetime_tag.empty() ? "unknown" : datetime_tag);
     return models_root / name;
 }
@@ -327,6 +340,10 @@ inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
     field("tied_embeddings", m.tied_embeddings);
     field("qk_norm",         m.qk_norm);
     field("optimizer",       m.optimizer);
+    // arch_id: the FULL architecture identity, so a reader (and compatible()) can tell two models
+    // apart on axes the individual fields above do not carry. Hex for readability against the
+    // directory name's own _a<hex> tag, which is this value's low 32 bits.
+    os << "arch_id=" << std::hex << m.arch_id << std::dec << '\n';
     os << "git_sha="         << m.git_sha   << "\n"
        << "created="         << m.created   << "\n"
        << "updated="         << m.updated   << "\n"
@@ -370,6 +387,9 @@ inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
         else if (k == "tied_embeddings") m.tied_embeddings = as_enum("tied_embeddings", v);
         else if (k == "qk_norm")        m.qk_norm = as_enum("qk_norm", v);
         else if (k == "optimizer")      m.optimizer = as_enum("optimizer", v);
+        // base 16 to match the writer. A legacy meta.txt has no such key, so arch_id stays 0 and
+        // compatible() falls back to the per-field comparison -- see its own comment.
+        else if (k == "arch_id")        m.arch_id = std::strtoull(v.c_str(), nullptr, 16);
         else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
         else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
         else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);
@@ -401,8 +421,15 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
 // tokenizer's token ids mean different text). This is a DIAGNOSTIC check (`models`/`models --prune`);
 // the actual load-time gate is engine_core.cpp's binary Header comparison, which is authoritative
 // regardless of what this says.
+// When both sides carry an arch_id, that ALONE decides: it covers every axis, including the ones the
+// parameter list below cannot see (n_kv_heads, LoopSplit's schedule, rope theta/scaling). Answering
+// "compatible" for a model load_model then refuses is worse than answering "no" -- it sends `train`
+// into a resume that fails. A legacy meta (arch_id 0) falls back to the old field comparison, which is
+// exactly as accurate as it ever was.
 inline bool compatible(const ModelMeta& m, int d, int l, int h, int seq, int vocab, int ternary,
-                       int pos_enc, int gated_ffn = 0, int tied_embeddings = 0, int qk_norm = 0) {
+                       int pos_enc, int gated_ffn = 0, int tied_embeddings = 0, int qk_norm = 0,
+                       unsigned long long arch_id = 0) {
+    if (arch_id && m.arch_id) return m.arch_id == arch_id;
     return m.d_model == d && m.n_layers == l && m.n_heads == h &&
            m.seq_len == seq && m.vocab == vocab && m.ternary == ternary &&
            m.pos_encoding == pos_enc && m.gated_ffn == gated_ffn &&

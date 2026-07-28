@@ -173,6 +173,45 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT = arch_fingerprint(LOOP_MIDDLE_L
 // legacy model on a non-default-theta build. Guarding theta starts from files written from here on.
 inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, ROPE_THETA);
 
+// MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
+// shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
+// shape-NEUTRAL axes (PARAM_FLOATS discriminates the rest at load time); this one has a different job,
+// so it covers everything.
+//
+// It exists because the model REGISTRY had the same omission the config banner and the checkpoint each
+// had: registry::model_dir() built a directory name from a HAND-LISTED subset (d/l/h/seq/vocab plus
+// four flags) and registry::compatible() compared that same subset. Neither knew about n_kv_heads,
+// loop_middle, loop_repeats, rope_scaling or rope_theta. Two consequences, both real:
+//   * a GQA model and an MHA model at identical dims got the SAME directory name, so the naming scheme
+//     stopped encoding identity -- the one thing it exists to do;
+//   * compatible() answered YES for architectures load_model then REJECTS, so `train` would offer to
+//     resume a checkpoint the loader refuses.
+// Deriving both from one id means a new axis is added HERE, once, and naming plus compatibility follow.
+// That is the same lesson as AGENTS.md 10's consumer sweep, applied structurally instead of by habit.
+consteval std::uint64_t make_model_arch_id() {
+    std::uint64_t h = 1469598103934665603ull;                  // FNV-1a
+    auto mix = [&h](std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xffull; h *= 1099511628211ull; }
+    };
+    mix(static_cast<std::uint64_t>(D_MODEL));
+    mix(static_cast<std::uint64_t>(N_LAYERS));
+    mix(static_cast<std::uint64_t>(N_HEADS));
+    mix(static_cast<std::uint64_t>(N_KV_HEADS));
+    mix(static_cast<std::uint64_t>(D_FF));
+    mix(static_cast<std::uint64_t>(SEQ_LEN));
+    mix(static_cast<std::uint64_t>(VOCAB));
+    mix(static_cast<std::uint64_t>(USE_TERNARY));
+    mix(static_cast<std::uint64_t>(static_cast<int>(POS_ENCODING)));
+    mix(static_cast<std::uint64_t>(USE_GATED_FFN));
+    mix(static_cast<std::uint64_t>(USE_TIED_EMBEDDINGS));
+    mix(static_cast<std::uint64_t>(USE_QK_NORM));
+    mix(ARCH_FINGERPRINT);      // folds in LoopSplit's schedule and ROPE_THETA
+    mix(static_cast<std::uint64_t>(ROPE_SCALING));
+    mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(ROPE_SCALE_FACTOR)));
+    return h;
+}
+inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();
+
 // THE build's memplan::Dims. Every consumer that wants "this binary's shape" must call this rather than
 // aggregate-initialise Dims itself.
 //

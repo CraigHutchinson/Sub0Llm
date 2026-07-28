@@ -1226,7 +1226,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             if (!reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
                                  static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
                                  static_cast<int>(USE_GATED_FFN), static_cast<int>(USE_TIED_EMBEDDINGS),
-                                 static_cast<int>(USE_QK_NORM)))
+                                 static_cast<int>(USE_QK_NORM), sub0::MODEL_ARCH_ID))
                 continue;
             if (!best || m.updated > best->updated) best = &m;   // fixed-width ISO -> lexicographic = chronological
         }
@@ -1265,7 +1265,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                               static_cast<int>(POS_ENCODING), reg::now_datetag(),
                                               static_cast<int>(USE_GATED_FFN),
                                               static_cast<int>(USE_TIED_EMBEDDINGS),
-                                              static_cast<int>(USE_QK_NORM));
+                                              static_cast<int>(USE_QK_NORM), sub0::MODEL_ARCH_ID);
         model_path = (meta_dir / "model.bin").string();
     }
     // Both guards are taken before any directory/log/GPU work, so a rejected launch leaves no side
@@ -1488,6 +1488,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.pos_encoding = cfg.pos_encoding; m.gated_ffn = cfg.gated_ffn;
         m.tied_embeddings = cfg.tied_embeddings; m.qk_norm = cfg.qk_norm;
         m.optimizer = cfg.optimizer;
+        m.arch_id = sub0::MODEL_ARCH_ID;   // full architecture identity; see registry::compatible
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
@@ -3679,7 +3680,7 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* co
         return reg::compatible(m, D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, VOCAB,
                                static_cast<int>(USE_TERNARY), static_cast<int>(POS_ENCODING),
                                static_cast<int>(USE_GATED_FFN), static_cast<int>(USE_TIED_EMBEDDINGS),
-                               static_cast<int>(USE_QK_NORM));
+                               static_cast<int>(USE_QK_NORM), sub0::MODEL_ARCH_ID);
     };
 
     // Filter BEFORE anything else, so the plain listing, --prune, --metrics, and --refresh all agree

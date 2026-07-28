@@ -29,3 +29,15 @@ data/tinystories.txt
 # fetched via scripts/get_gsm8k.py, same category as the corpora above
 data/gsm8k.txt
 runs/
+
+# Model/training artifacts, wherever they land. /models is already ignored, but a mistyped model
+# path drops these anywhere -- a positional-arg slip once wrote a 1.36 GB corpus.tok into data/ and
+# it was very nearly committed. These names are only ever generated output, never sources, so
+# ignoring them globally costs nothing and closes the whole class.
+corpus.tok
+tokenizer.tok
+tokenizer.bin
+tokenizer.stamp
+meta.txt
+train.log
+*.ckpt
