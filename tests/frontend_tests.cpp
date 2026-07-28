@@ -76,19 +76,21 @@ TEST_CASE("log: level filtering + file tee (prefix on leveled, none on raw lines
     REQUIRE(log::set_file(tmp.string(), /*append=*/false));
 
     log::set_level(log::Level::Warn);          // threshold: drop info/debug, keep error/warn
-    log::error("err {}", 1);
-    log::warn("warn {}", 2);
-    log::info("info {}", 3);                    // below threshold -> dropped
-    log::line("raw {}", 4);                     // raw program output -> always tee'd, no level prefix
+    // Self-describing payloads: log::set_file tees to the console too, so a terse "err 1" here reads
+    // like a real failure in test output -- spell out that it's expected.
+    log::error("expected test log message (error) {}", 1);
+    log::warn("expected test log message (warn) {}", 2);
+    log::info("expected test log message (info) {}", 3);   // below threshold -> dropped
+    log::line("expected test log message (raw) {}", 4);    // raw program output -> always tee'd, no level prefix
     log::close_file();
 
     std::ifstream f(tmp);
     std::stringstream ss; ss << f.rdbuf();
     const std::string out = ss.str();
-    CHECK(out.find("[error] err 1") != std::string::npos);
-    CHECK(out.find("[warn] warn 2")  != std::string::npos);
-    CHECK(out.find("info 3")         == std::string::npos);   // filtered out by the threshold
-    CHECK(out.find("raw 4")          != std::string::npos);   // raw line present...
+    CHECK(out.find("[error] expected test log message (error) 1") != std::string::npos);
+    CHECK(out.find("[warn] expected test log message (warn) 2")   != std::string::npos);
+    CHECK(out.find("expected test log message (info) 3")          == std::string::npos);   // filtered out by the threshold
+    CHECK(out.find("expected test log message (raw) 4")           != std::string::npos);   // raw line present...
     CHECK(out.find("[info]")         == std::string::npos);   // ...with no prefix, and no info leaked
 
     log::set_level(log::Level::Info);          // restore the default for any later test
