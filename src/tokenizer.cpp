@@ -78,7 +78,8 @@ void viterbi_encode_word(const Tokenizer& t, std::span<const int> stream, std::s
 void Scan::add_names(std::string_view chunk) {
     raw_bytes += chunk.size();
     long qr = 0;
-    const std::string norm = normalize_text(std::string(chunk), qr);
+    static thread_local std::string norm;             // reused per worker thread -- no per-chunk temp/alloc
+    normalize_text(chunk, qr, norm);
     quote_repl += qr;
     norm_bytes += norm.size();
 
@@ -127,8 +128,10 @@ void Scan::merge_names(Scan& other) {
 
 void Scan::add_words(std::string_view chunk, const std::unordered_set<std::string>& attested) {
     long qr = 0;
-    const std::string      norm   = normalize_text(std::string(chunk), qr);
-    const std::vector<int> stream = truecase_tokenize(norm, attested, &st);
+    static thread_local std::string      norm;        // reused per worker thread (string_view in, no temp)
+    static thread_local std::vector<int> stream;      // reused id stream -- no per-chunk 4B/symbol alloc
+    normalize_text(chunk, qr, norm);
+    truecase_tokenize(norm, attested, &st, stream);
     for (std::size_t i = 0, n = stream.size(); i < n;) {
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                   // standalone symbol
@@ -448,7 +451,16 @@ constexpr bool is_close_bracket(int byte) { return byte == ')' || byte == ']' ||
 void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<int>& out) {
     const std::size_t n = stream.size();
     bool dps = false;                 // decoder's pending_space after the last emitted token
-    std::vector<int> sub;
+    // Word-encode cache (gigatoken's central lever): a 32 MB corpus chunk (configurator Pass 3)
+    // repeats its common words thousands of times, and per-word Viterbi is by far this pass's
+    // dominant per-occurrence cost -- so memoise each word's id sequence by its raw byte key and
+    // collapse the Zipf head to a hash lookup. Keying on word bytes ALONE is correct: a word unit
+    // carries no case/spacing markers (those are handled outside this branch) and viterbi_encode_word
+    // is a pure function of (t, bytes). Both the cache and `word_key` scratch are call-local, so they
+    // never outlive the one tokenizer `t` and add no cross-call state (the runtime single-prompt path
+    // pays only one empty-map construction). `word_key` is reused across words (no per-word alloc).
+    std::unordered_map<std::string, std::vector<int>> word_cache;
+    std::string word_key;
     auto emit_byte = [&](int b) { out.push_back(b); };  // base id == byte value
     // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
     // implicit (free) under a pending space; an empty inter-content gap glues with JOIN; any
@@ -566,8 +578,12 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
             emit_byte(stream[i]); dps = true; ++i;
         } else {
-            sub.clear();
-            viterbi_encode_word(t, stream, i, end, sub);   // the runtime tokenizer's only word encoder
+            // Look up (or Viterbi-encode + memoise) this word's piece-id sequence by its byte key.
+            word_key.assign(end - i, '\0');
+            for (std::size_t k = i; k < end; ++k) word_key[k - i] = static_cast<char>(stream[k] & 0xFF);
+            const auto [it, miss] = word_cache.try_emplace(word_key);
+            if (miss) viterbi_encode_word(t, stream, i, end, it->second);   // fills the fresh empty slot
+            const std::vector<int>& sub = it->second;
             const std::size_t N = sub.size();
             // SPELL-encapsulate any multi-piece word (N>=2), not just N>=3 (schemeV3+): a bare JOIN
             // between two ids is indistinguishable from an ordinary single-piece word glued to trailing
@@ -671,8 +687,10 @@ std::vector<int> encode(const Tokenizer& t, const std::string& text) {
     std::vector<int> out;
     if (!t.loaded) return out;
     long replaced = 0;
-    const std::string      norm   = normalize_text(text, replaced);
-    const std::vector<int> stream = truecase_tokenize(norm, t.attested, nullptr);
+    static thread_local std::string      norm;        // reused per calling thread (no per-call alloc)
+    static thread_local std::vector<int> stream;
+    normalize_text(text, replaced, norm);
+    truecase_tokenize(norm, t.attested, nullptr, stream);
 
     out.reserve(stream.size());
     encode_join(t, stream, out);               // the JOIN encoder (handles word -> Viterbi internally)

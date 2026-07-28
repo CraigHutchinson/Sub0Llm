@@ -209,8 +209,12 @@ struct TokStats {
 // the round-trip contract is decode(encode(x)) == normalize_text(x), not == x.
 //   U+2018/U+2019 ' '  -> '      U+201C/U+201D " "  -> "
 //   U+2013/U+2014 – —  -> -      U+2026 …            -> ...      ASCII ` -> '
-inline std::string normalize_text(const std::string& in, long& replaced) {
-    std::string out;
+// Fill-into overload (string_view input, reused output): the configurator's hot callers pass a
+// thread_local `out` plus a chunk view directly, avoiding BOTH a per-chunk temp `std::string(chunk)`
+// copy and a fresh output allocation on every one of the 3 full-corpus passes over a 50 GB+ corpus
+// (AGENTS.md §1). The returning overload below delegates, for tests / one-shot callers.
+inline void normalize_text(std::string_view in, long& replaced, std::string& out) {
+    out.clear();
     out.reserve(in.size());
     replaced = 0;
     const std::size_t n = in.size();
@@ -224,16 +228,25 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
     // flagged positions with the original scalar replacement logic. `flag` is a plain byte array,
     // not `std::vector<bool>` (bit-packed, defeats vectorization) -- it holds 0/1, not `bool`,
     // because `#pragma omp simd` needs a type the compiler can write in wide, uniform lanes.
-    std::vector<unsigned char> flag(n);
-    const unsigned char* ip = reinterpret_cast<const unsigned char*>(in.data());
+    // The classify buffer is reused thread_local scratch, not a per-call allocation: the configurator
+    // runs this over a 50 GB+ corpus in ~32 MB chunks across sequential per-thread calls, so a fresh
+    // n-byte vector every call is pure allocator traffic (AGENTS.md §1). One buffer per worker thread,
+    // grown to the largest chunk it ever sees and then reused.
+    static thread_local std::vector<unsigned char> flag;
+    if (flag.size() < n) flag.resize(n);
+    // __restrict: `fp` (the thread_local flag buffer) and `ip` (into the input) never alias, so the
+    // compiler can vectorise this classify loop unconditionally -- without it the aliasing is only
+    // "probably not" and the #pragma omp simd is the sole guarantee. Cheap belt-and-braces.
+    const unsigned char* __restrict ip = reinterpret_cast<const unsigned char*>(in.data());
+    unsigned char* __restrict       fp = flag.data();
     #pragma omp simd
     for (std::size_t i = 0; i < n; ++i)
-        flag[i] = static_cast<unsigned char>((ip[i] == 0xE2) | (ip[i] == '`'));
+        fp[i] = static_cast<unsigned char>((ip[i] == 0xE2) | (ip[i] == '`'));
 
     std::size_t i = 0, run_start = 0;
     while (i < n) {
         if (!flag[i]) { ++i; continue; }
-        if (i > run_start) out.append(in, run_start, i - run_start);   // bulk-copy the pass-through run
+        if (i > run_start) out.append(in.data() + run_start, i - run_start);   // bulk-copy the pass-through run
 
         const unsigned char c = ip[i];
         // General-punctuation block U+2013..U+2026 is encoded E2 80 xx.
@@ -257,7 +270,13 @@ inline std::string normalize_text(const std::string& in, long& replaced) {
         out.push_back(static_cast<char>(c));
         ++i; run_start = i;
     }
-    if (n > run_start) out.append(in, run_start, n - run_start);   // final pass-through run
+    if (n > run_start) out.append(in.data() + run_start, n - run_start);   // final pass-through run
+}
+
+// Returning overload (tests / one-shot callers): delegates to the fill-into version above.
+inline std::string normalize_text(const std::string& in, long& replaced) {
+    std::string out;
+    normalize_text(std::string_view(in), replaced, out);
     return out;
 }
 
@@ -293,8 +312,11 @@ inline std::size_t word_unit_end(std::span<const int> s, std::size_t i) {
 // and the last upper of an acronym run before a lowercase ("AAa", e.g. "HTMLParser" ->
 // HTML|Parser). Returns the per-segment lengths; a single element means the run is not
 // CamelCase-decomposable (a plain word/acronym handled by the normal path). See §8.
-inline std::vector<std::size_t> camel_segments(std::string_view w) {
-    std::vector<std::size_t> lens;
+// The fill-into overload lets the hot truecase loop pass reused thread_local scratch instead of
+// allocating a fresh vector for EVERY mixed/capitalised word over a 50 GB+ corpus (AGENTS.md §1);
+// the returning overload stays for tests and any non-hot caller.
+inline void camel_segments(std::string_view w, std::vector<std::size_t>& lens) {
+    lens.clear();
     const std::size_t n = w.size();
     std::size_t start = 0;
     for (std::size_t k = 0; k + 1 < n; ++k) {
@@ -305,6 +327,12 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
         if (hump || acro) { lens.push_back(k + 1 - start); start = k + 1; }
     }
     lens.push_back(n - start);
+}
+
+// Returning overload (tests / non-hot callers): delegates to the fill-into version above.
+inline std::vector<std::size_t> camel_segments(std::string_view w) {
+    std::vector<std::size_t> lens;
+    camel_segments(w, lens);
     return lens;
 }
 
@@ -338,10 +366,14 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
 // confounds on separate sequential process runs, see the project's own perf-testing notes) showed
 // the "improved" version within +-3% of the original, i.e. noise, not a real win. Not worth the
 // added complexity for a measured non-result. See docs/TOKENIZER_REVIEW.md's WS6 section.
-inline std::vector<int> truecase_tokenize(const std::string& text,
-                                          const std::unordered_set<std::string>& attested,
-                                          TokStats* st) {
-    std::vector<int> toks;
+// Fill-into overload (string_view input, reused output): the configurator's Pass 2/3 pass a
+// thread_local `toks` and the already-normalized chunk view directly, so the ~4-bytes-per-symbol id
+// stream isn't freshly allocated on every full-corpus pass over a 50 GB+ corpus (AGENTS.md §1). The
+// returning overload below delegates, for tests / one-shot callers.
+inline void truecase_tokenize(std::string_view text,
+                              const std::unordered_set<std::string>& attested,
+                              TokStats* st, std::vector<int>& toks) {
+    toks.clear();
     toks.reserve(text.size());
     const std::size_t n = text.size();
 
@@ -358,7 +390,8 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
             if (!is_upper(ch))         all_upper = false;
             if (k > 0 && !is_lower(ch)) rest_lower = false;
         }
-        std::string lw;
+        static thread_local std::string lw;   // reused across words (no per-word alloc over a huge corpus)
+        lw.clear();
         lw.reserve(seg.size());
         for (unsigned char ch : seg) lw.push_back(static_cast<char>(to_lower(ch)));
 
@@ -395,7 +428,7 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
 
         if (!any_upper) {                                       // all-lowercase fast path
             for (unsigned char ch : w) toks.push_back(ch);
-        } else if (const auto segs = camel_segments(w); segs.size() >= 2) {
+        } else if (static thread_local std::vector<std::size_t> segs; (camel_segments(w, segs), segs.size() >= 2)) {
             std::size_t off = 0;                                // CamelCase -> one collapsed word per segment
             for (std::size_t len : segs) { emit_word(w.substr(off, len), /*force_collapse=*/true); off += len; }
         } else {
@@ -403,6 +436,14 @@ inline std::vector<int> truecase_tokenize(const std::string& text,
         }
         i = j;
     }
+}
+
+// Returning overload (tests / one-shot callers): delegates to the fill-into version above.
+inline std::vector<int> truecase_tokenize(const std::string& text,
+                                          const std::unordered_set<std::string>& attested,
+                                          TokStats* st) {
+    std::vector<int> toks;
+    truecase_tokenize(std::string_view(text), attested, st, toks);
     return toks;
 }
 

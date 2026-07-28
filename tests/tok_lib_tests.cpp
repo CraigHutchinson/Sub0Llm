@@ -137,6 +137,48 @@ TEST_CASE("encode is deterministic", "[tok]") {
     REQUIRE(sub0::tok::encode(t, "the cat sat") == sub0::tok::encode(t, "the cat sat"));
 }
 
+// encode_join memoises each word's Viterbi id sequence by its byte key (the per-call word cache -- the
+// throughput lever). The guard is a fundamental JOIN-scheme property the cache must preserve: a single
+// inter-word space is implicit (emits no token), so encoding space-joined words equals concatenating
+// each word's STAND-ALONE encoding, regardless of memoisation. The one real cache hazard is the key
+// being built from the wrong byte range (it is assembled from stream[i,end)); that would make a repeated
+// or later word encode differently from its stand-alone form and break this equality. The word list
+// spans every word-unit path the key builder must handle -- plain, interior-connector (apostrophe /
+// hyphen / underscore keep the unit whole), UTF-8 multibyte, all-caps (the UP marker sits OUTSIDE the
+// cached unit), CamelCase / acronym (glued sub-units + case markers), plus repeats (the actual cache
+// hits) and shared-prefix words (collision bait for a truncated key).
+TEST_CASE("encode word cache: memoised words match their stand-alone encoding (all word paths)", "[tok]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::vector<std::string> ws = {
+        "the", "little", "quietly", "antidisestablishment",
+        "don't", "well-known", "save_scan_state", "caf\xC3\xA9",   // café (UTF-8 é)
+        "HELLO", "myFunc", "HTMLParser",
+        "cat", "cats", "scat", "cat", "the", "caf\xC3\xA9",        // repeats + shared prefixes
+    };
+    std::vector<int> want;
+    std::string      joined;
+    for (std::size_t k = 0; k < ws.size(); ++k) {
+        const std::vector<int> one = sub0::tok::encode(t, ws[k]);
+        want.insert(want.end(), one.begin(), one.end());
+        if (k) joined += ' ';
+        joined += ws[k];
+    }
+    const std::vector<int> got = sub0::tok::encode(t, joined);
+    REQUIRE(got == want);                    // every memoised occurrence == its stand-alone encoding
+    REQUIRE(round_trips(t, joined));         // and the whole thing still round-trips losslessly
+
+    // Scale stress: the same stream tiled 200x is almost entirely cache hits -- it must reproduce the
+    // single-pass ids exactly at every tile (no drift as the cache fills and is reused).
+    std::string big;
+    for (int r = 0; r < 200; ++r) { big += joined; big += ' '; }
+    big.pop_back();
+    const std::vector<int> big_got = sub0::tok::encode(t, big);
+    REQUIRE(big_got.size() == want.size() * 200);
+    for (int r = 0; r < 200; ++r)
+        REQUIRE(std::equal(want.begin(), want.end(),
+                           big_got.begin() + static_cast<std::ptrdiff_t>(r) * static_cast<std::ptrdiff_t>(want.size())));
+}
+
 // ---------------------------------------------------------------------------
 //  JOIN / implicit-space scheme
 // ---------------------------------------------------------------------------
