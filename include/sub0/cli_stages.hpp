@@ -21,7 +21,7 @@
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, const char* blend_config_path,
-                                int replace_schedule);
+                                int replace_schedule, int allow_concurrent);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -60,6 +60,7 @@ inline int run_train(int argc, char** argv) {
                                            // sole way to draw from more than the base corpus, or to enable
                                            // content-embed. Omit entirely for a plain single-corpus run.
     bool train_blend_replace = false;      // deliberately switch to a DIFFERENT schedule on this resume
+    bool train_allow_concurrent = false;   // opt out of the machine-wide single-trainer guard
                                            // (see train_stage.cpp's own comment on why this is a separate,
                                            // explicitly-named flag rather than reusing --blend-config's mere
                                            // presence: a schedule identity change mid-run is a big enough
@@ -101,6 +102,13 @@ inline int run_train(int argc, char** argv) {
                    "first run; a later invocation without this flag keeps using the PINNED schedule "
                    "unchanged (see --blend-config-replace to deliberately switch it).")
        ->check(CLI::ExistingFile);
+    app.add_flag("--allow-concurrent", train_allow_concurrent,
+                 "Permit a second sub0llm-train on this machine. OFF by default: concurrent trainers "
+                 "share one GPU and one page cache, so they halve each other's throughput and make any "
+                 "measurement taken while both run meaningless -- with nothing in either log to show it. "
+                 "Use only for deliberate, non-measuring concurrency (e.g. a CPU sample-train beside a "
+                 "GPU run). Never relaxes the per-model-directory guard: two writers on one checkpoint "
+                 "stay an error regardless.");
     app.add_flag("--blend-config-replace", train_blend_replace,
                 "With --blend-config, on a resume: deliberately REPLACE the model dir's already-pinned "
                 "schedule with this one instead of the default (silently ignoring --blend-config and "
@@ -118,7 +126,8 @@ inline int run_train(int argc, char** argv) {
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
-                            resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0);
+                            resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0,
+                            train_allow_concurrent ? 1 : 0);
 }
 
 // --- gen -------------------------------------------------------------------

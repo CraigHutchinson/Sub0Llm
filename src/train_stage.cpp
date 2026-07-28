@@ -1068,22 +1068,42 @@ struct ConsoleCtrlGuard {};   // no-op off Windows (this project builds Windows-
 #endif
 }  // namespace
 
-// Single-instance guard: refuses a SECOND sub0llm-train against the SAME model directory. Two
-// processes racing on one checkpoint is a real failure mode hit this session (a duplicate configurator
-// race, and a resumed run whose process outlived its own "trained" completion and kept the corpus.tok
-// mapping open) -- a named OS mutex, scoped to the model directory's canonicalized path (not global:
-// training two DIFFERENT models concurrently is legitimate and common), fails fast with a clear message
-// instead of letting two writers corrupt the same checkpoint. Scope is the directory, not model_path's
-// exact string, so `models/x` and `models/x/model.bin` (both accepted as --out) collide correctly.
+// Single-instance guards. A named OS mutex fails a duplicate launch fast, with a clear message, instead
+// of letting it do damage. TWO scopes, because the two failure modes are different:
+//
+//   PER-MODEL-DIRECTORY -- always enforced, never overridable. Two writers on one checkpoint corrupt it.
+//     Scope is the DIRECTORY, not model_path's exact string, so `models/x` and `models/x/model.bin`
+//     (both accepted as --out) collide correctly.
+//
+//   GLOBAL -- enforced by default, released by --allow-concurrent. Two trainers on DIFFERENT model dirs
+//     corrupt nothing, so this was previously allowed outright ("training two different models
+//     concurrently is legitimate and common"). That reasoning ignored the SHARED resources: one GPU and
+//     one page cache. Concurrent runs silently halve each other's throughput and inflate each other's
+//     memory pressure -- and, the reason this is now a hard default, they produce measurements that are
+//     wrong in a way no log line reveals. A leaked trainer and a genuine pipeline bottleneck look
+//     identical in a tok/s trace; three throughput measurements were published and retracted here before
+//     the second process was spotted. Correctness of MEASUREMENT is what this scope protects.
+//
+// --allow-concurrent exists because deliberate concurrency is legitimate: a small CPU sample-train
+// alongside a long GPU run, say. It relaxes ONLY the global scope -- the per-directory guard still
+// holds, because no flag makes two writers on one checkpoint safe.
 #if defined(_WIN32)
 struct SingleInstanceGuard {
     HANDLE mutex_ = nullptr;
     bool   held_  = false;
 
-    explicit SingleInstanceGuard(const std::filesystem::path& model_dir) {
+    // scope_key: a model-directory path for the per-directory guard, or an EMPTY path for the
+    // machine-wide (global) one.
+    explicit SingleInstanceGuard(const std::filesystem::path& scope_key) {
+        if (scope_key.empty()) {
+            const std::string gname = std::string("Local") + char(92) + "sub0llm-train-global";
+            mutex_ = CreateMutexA(nullptr, TRUE, gname.c_str());
+            held_  = mutex_ != nullptr && GetLastError() != ERROR_ALREADY_EXISTS;
+            return;
+        }
         std::error_code ec;
-        const std::string canon = std::filesystem::weakly_canonical(model_dir, ec).string();
-        const std::size_t h = std::hash<std::string>{}(canon.empty() ? model_dir.string() : canon);
+        const std::string canon = std::filesystem::weakly_canonical(scope_key, ec).string();
+        const std::size_t h = std::hash<std::string>{}(canon.empty() ? scope_key.string() : canon);
         // "Local\" (not "Global\"): scoped to this user session, matching every other artifact this
         // tool touches; mutex names must also avoid backslashes, which the hash sidesteps entirely.
         const std::string name = std::format("Local\\sub0llm-train-{:016x}", h);
@@ -1096,7 +1116,9 @@ struct SingleInstanceGuard {
 #else
 struct SingleInstanceGuard {
     explicit SingleInstanceGuard(const std::filesystem::path&) {}
-    bool held() const { return true; }   // no-op off Windows (see ConsoleCtrlGuard above)
+    bool held() const { return true; }   // no-op off Windows (see ConsoleCtrlGuard above). Both scopes
+                                         // degrade to "always permitted" here; a POSIX build wanting the
+                                         // guard would use an O_EXCL lockfile or flock on the same keys.
 };
 #endif
 
@@ -1106,7 +1128,7 @@ static void report_run_context(bool gpu_train, bool hybrid_train = false);
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
                                           int optimizer, int resume_mode, const char* blend_config_path,
-                                          int replace_schedule) {
+                                          int replace_schedule, int allow_concurrent) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1246,12 +1268,28 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                               static_cast<int>(USE_QK_NORM));
         model_path = (meta_dir / "model.bin").string();
     }
-    // Refuse a second concurrent run against this same model dir (see SingleInstanceGuard above) --
-    // checked before any directory/log/GPU work so a rejected launch leaves no side effects.
-    const SingleInstanceGuard _single_instance_guard(meta_dir);
-    if (!_single_instance_guard.held()) {
+    // Both guards are taken before any directory/log/GPU work, so a rejected launch leaves no side
+    // effects. Per-directory FIRST: "you are racing your own checkpoint" is the more specific and more
+    // actionable message when both would fire.
+    const SingleInstanceGuard _dir_guard(meta_dir);
+    if (!_dir_guard.held()) {
         sub0::log::error("train: another sub0llm-train is already running against '{}' -- refusing to "
                          "start a second one (they would race on the same checkpoint)", meta_dir.string());
+        return 1;
+    }
+    // Global guard: default-deny. A second trainer anywhere shares this machine's GPU and page cache --
+    // see SingleInstanceGuard's comment for why measurement correctness makes that a hard error rather
+    // than a warning. Under --allow-concurrent the guard is constructed on the model dir instead, so it
+    // is a no-op second acquire of a mutex this process already holds.
+    const SingleInstanceGuard _global_guard(allow_concurrent ? std::filesystem::path{meta_dir}
+                                                             : std::filesystem::path{});
+    if (!allow_concurrent && !_global_guard.held()) {
+        sub0::log::error("train: another sub0llm-train is already running on this machine -- refusing to "
+                         "start a second one. Concurrent trainers share one GPU and one page cache: they "
+                         "halve each other's throughput and make any measurement taken while both run "
+                         "meaningless, with nothing in either log to show it. Wait for it to finish, or "
+                         "pass --allow-concurrent if you deliberately want both (e.g. a CPU sample-train "
+                         "beside a GPU run) and are not measuring.");
         return 1;
     }
     // Create the model directory up front (an explicit --out path may name a directory that doesn't
