@@ -141,20 +141,27 @@ bool load_model(const char* path) {
     is.read((char*)params_ptr(), (std::streamsize)(PARAM_FLOATS * sizeof(float)));
     if (!is) return false;
     sync_params_to_device();                     // push the loaded weights to the live (device) copy
-    // Optional trailing tokenizer fingerprint (see save_model). A legacy model has none -> read fails
-    // and leaves the fingerprint unknown (0 = no guard). If a tokenizer is already loaded, catch a
-    // mismatch now (covers the load-tokenizer-then-load-model order; gen does the reverse).
+    // Trailing tokenizer fingerprint (see save_model) -- REQUIRED. The "absent means unknown, no
+    // guard" path is gone with the rest of the legacy-format support: every model this build can load
+    // was written by a build that emits it, so a short read means a truncated or foreign file, which is
+    // a hard error rather than a reason to silently disable a correctness check.
     std::uint64_t fp = 0;
     is.read((char*)&fp, sizeof(fp));
-    g_model_tok_fp = (is.gcount() == static_cast<std::streamsize>(sizeof(fp))) ? fp : 0;
-    // Optional trailing execution-schedule id (see save_model). Absent means the file was written by a
-    // binary that predates LoopSplit, which therefore trained it UN-LOOPED -- a sound inference, so the
-    // legacy path is a real guard rather than "unknown, skip the check". (If the fingerprint read above
-    // already hit EOF this read fails too and reports absent, which is the correct answer.)
+    if (is.gcount() != static_cast<std::streamsize>(sizeof(fp))) {
+        std::println(stderr, "error: model file is truncated (no tokenizer fingerprint trailer) -- retrain it");
+        return false;
+    }
+    g_model_tok_fp = fp;
+    // Trailing architecture fingerprint (see save_model) -- REQUIRED, same reasoning as the tokenizer
+    // fingerprint above. The "absent implies un-looped" inference existed only to keep pre-LoopSplit
+    // files loadable; nothing writes such files any more.
     std::uint64_t arch = 0;
     is.read((char*)&arch, sizeof(arch));
-    const bool arch_present = (is.gcount() == static_cast<std::streamsize>(sizeof(arch)));
-    const std::uint64_t arch_got = arch_present ? arch : ARCH_FINGERPRINT_LEGACY;
+    if (is.gcount() != static_cast<std::streamsize>(sizeof(arch))) {
+        std::println(stderr, "error: model file is truncated (no architecture trailer) -- retrain it");
+        return false;
+    }
+    const std::uint64_t arch_got = arch;
     if (arch_got != ARCH_FINGERPRINT) {
         const ArchAxes got = arch_axes_of(arch_got);
         std::println(stderr, "error: model was built with a different architecture than this binary, "

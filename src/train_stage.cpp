@@ -174,7 +174,14 @@ constexpr float  MUON_LR_BASE        = 0.02f;
 constexpr int    MIN_TRAIN_SEQ = SEQ_LEN > 16 ? std::max(8, SEQ_LEN / 8) : SEQ_LEN;
 
 constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
-constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 adds best_step (prune_ckpts best-checkpoint exemption);
+// EXACT-match only. Older readers (v1-v4) are gone: this project has no production models, every
+// checkpoint on disk is regenerable in minutes, and carrying migration branches for formats nothing
+// writes is bloat that has to stay correct through every future change. A mismatched version is
+// refused with a message saying to retrain -- which is the honest instruction anyway, since a resumed
+// run under a format we no longer test is not something to trust.
+// History, for the record: v2 added best_step, v3 drawn_tokens, v4 drawn_names, v5 the architecture
+// fingerprint. Bump this on any layout change and the guard below does the rest.
+constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 added best_step (prune_ckpts best-checkpoint exemption);
                                             // v3 adds drawn_tokens (the blend scheduler's fairness state);
                                             // v4 adds drawn_names (index-aligned with drawn_tokens, so a
                                             // --blend-config-replace resume can reattribute progress BY
@@ -606,7 +613,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     // with its own already-running (pre-bump) binary until it is actually restarted, and this is also
     // the resume path -- rejecting an older version outright would force a fresh restart the next time
     // that run is resumed after a rebuild, discarding real GPU-hours.
-    if (magic != CKPT_MAGIC || version < 1u || version > CKPT_VERSION) {
+    if (magic != CKPT_MAGIC || version != CKPT_VERSION) {
         sub0::log::warn("ignoring checkpoint '{}' (bad magic/version)", path);
         return false;
     }
@@ -625,7 +632,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     // v5+ carries the execution-schedule id. A pre-v5 checkpoint predates LoopSplit and was therefore
     // trained un-looped, so that is the correct assumption rather than "unknown, skip the check" --
     // resuming un-looped weights into a looped build would silently train a different architecture.
-    const std::uint64_t arch = (version >= 5u) ? rd<std::uint64_t>(is) : sub0::ARCH_FINGERPRINT_LEGACY;
+    const std::uint64_t arch = rd<std::uint64_t>(is);
     if (!ok || nfloat != sub0::trainable_floats()) {
         sub0::log::warn("ignoring checkpoint '{}' (built for a different config)", path);
         return false;
@@ -642,7 +649,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     rs.step      = static_cast<long>(rd<std::int64_t>(is));
     adam_t       = static_cast<long>(rd<std::int64_t>(is));
     rs.best_loss = rd<double>(is);
-    rs.best_step = (version >= 2u) ? static_cast<long>(rd<std::int64_t>(is)) : -1;
+    rs.best_step = static_cast<long>(rd<std::int64_t>(is));
     batch        = rd<std::int32_t>(is);
     seed         = rd<std::uint32_t>(is);
     lr           = rd<float>(is);
@@ -658,12 +665,12 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
 
     rs.drawn_tokens.clear();
     rs.drawn_names.clear();
-    if (version >= 3u) {
+    {
         const std::uint32_t ndrawn = rd<std::uint32_t>(is);
         rs.drawn_tokens.resize(ndrawn);
         for (auto& d : rs.drawn_tokens) d = rd<double>(is);
-    }   // v1/v2: no such data -- caller resizes-to-zero as a one-time migration, not a resume failure.
-    if (version >= 4u) {
+    }
+    {
         const std::uint32_t nnames = rd<std::uint32_t>(is);
         rs.drawn_names.resize(nnames);
         for (auto& nm : rs.drawn_names) {
@@ -671,7 +678,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
             nm.resize(len);
             is.read(nm.data(), len);
         }
-    }   // v1/v2/v3: no names recorded -- caller falls back to "no data" (start fresh), not a resume failure.
+    }
 
     const auto bytes = static_cast<std::streamsize>(nfloat * sizeof(float));
     is.read(reinterpret_cast<char*>(sub0::params_ptr()), bytes);

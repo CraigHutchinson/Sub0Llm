@@ -123,18 +123,29 @@ TEST_CASE("registry: model_dir encodes identity; compatible() gates loading (the
                     /*ternary*/0, /*pos=rope*/1, "20260709-120000", /*gated_ffn*/0, /*tied*/0, /*qk_norm*/1).filename().string()
           == "sub0llm_tinystories_d192l6h6sq256v4306rq_20260709-120000");
 
-    // compatible(): an exact match loads; ANY differing dimension/flag makes it incompatible -- this is
-    // what flagged the pruned d448 v2048 models 'x incompatible architecture' against a d192 v4306 build.
+    // compatible() is decided by arch_id ALONE (sub0::MODEL_ARCH_ID), not by the individual fields.
+    // The per-field comparison it replaced could not see n_kv_heads, LoopSplit's schedule or the rope
+    // parameters, so it answered "compatible" for models load_model then REJECTS -- sending `train`
+    // into a resume that fails. The dim parameters remain in the signature for callers that only have
+    // loose dims to hand, but they no longer participate in the decision.
     ModelMeta m;
     m.d_model = 192; m.n_layers = 6; m.n_heads = 6; m.seq_len = 256; m.vocab = 4306;
     m.ternary = 0; m.pos_encoding = 1; m.gated_ffn = 0; m.tied_embeddings = 0; m.qk_norm = 0;
-    CHECK(compatible(m, 192, 6, 6, 256, 4306, 0, 1));            // exact -> loadable
-    CHECK_FALSE(compatible(m, 448, 6, 6, 256, 4306, 0, 1));      // d_model differs
-    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 2048, 0, 1));      // vocab differs (the pruned case)
-    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 0));      // pos_encoding differs
-    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 1));   // gated_ffn differs
-    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 1)); // tied_embeddings differs
-    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 1)); // qk_norm differs
+    m.arch_id = 0xfeedfacecafeb00dull;
+    CHECK(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 0, 0xfeedfacecafeb00dull));   // same arch
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 0, 0xfeedfacecafeb00eull)); // differs
+
+    // Matching dims do NOT make it compatible when the arch id differs -- that is the entire point:
+    // a GQA and an MHA build at identical dims used to compare equal here.
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 0, 1));
+
+    // A meta with NO arch_id (0) is INCOMPATIBLE rather than falling back to a per-field match. The
+    // fallback was removed with the rest of the legacy-format support: a per-field match is exactly
+    // the wrong answer for the axes it cannot see.
+    ModelMeta legacy = m; legacy.arch_id = 0;
+    CHECK_FALSE(compatible(legacy, 192, 6, 6, 256, 4306, 0, 1, 0, 0, 0, 0xfeedfacecafeb00dull));
+    // ...and a caller with no arch id of its own cannot claim compatibility either.
+    CHECK_FALSE(compatible(m, 192, 6, 6, 256, 4306, 0, 1));
 }
 
 TEST_CASE("registry: now_datetag is fixed-width, filesystem-safe, and sortable", "[frontend][registry]") {

@@ -421,19 +421,19 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
 // tokenizer's token ids mean different text). This is a DIAGNOSTIC check (`models`/`models --prune`);
 // the actual load-time gate is engine_core.cpp's binary Header comparison, which is authoritative
 // regardless of what this says.
-// When both sides carry an arch_id, that ALONE decides: it covers every axis, including the ones the
-// parameter list below cannot see (n_kv_heads, LoopSplit's schedule, rope theta/scaling). Answering
-// "compatible" for a model load_model then refuses is worse than answering "no" -- it sends `train`
-// into a resume that fails. A legacy meta (arch_id 0) falls back to the old field comparison, which is
-// exactly as accurate as it ever was.
-inline bool compatible(const ModelMeta& m, int d, int l, int h, int seq, int vocab, int ternary,
-                       int pos_enc, int gated_ffn = 0, int tied_embeddings = 0, int qk_norm = 0,
+// arch_id ALONE decides. It covers every axis, including the ones the individual fields cannot see
+// (n_kv_heads, LoopSplit's schedule, rope theta/scaling). Answering "compatible" for a model that
+// load_model then refuses is worse than answering "no" -- it sends `train` into a resume that fails.
+//
+// A meta.txt without an arch_id is treated as INCOMPATIBLE rather than falling back to a per-field
+// comparison. That fallback existed for metas written before arch_id and is gone with the rest of the
+// legacy-format support: a per-field match is exactly the wrong answer for the axes it cannot see, so
+// keeping it would mean the weaker check silently deciding whichever cases the stronger one was added
+// to catch. The remaining parameters stay for callers that only have loose dims to hand.
+inline bool compatible(const ModelMeta& m, int, int, int, int, int, int,
+                       int, int = 0, int = 0, int = 0,
                        unsigned long long arch_id = 0) {
-    if (arch_id && m.arch_id) return m.arch_id == arch_id;
-    return m.d_model == d && m.n_layers == l && m.n_heads == h &&
-           m.seq_len == seq && m.vocab == vocab && m.ternary == ternary &&
-           m.pos_encoding == pos_enc && m.gated_ffn == gated_ffn &&
-           m.tied_embeddings == tied_embeddings && m.qk_norm == qk_norm;
+    return arch_id != 0 && m.arch_id == arch_id;
 }
 
 }  // namespace sub0::registry
