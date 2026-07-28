@@ -155,6 +155,11 @@ $proj = @()
 foreach ($a in $Arms) {
     $bin = "out/build/ls_$($a.Name)"
     Remove-Item -Recurse -Force "models/_probe_$($a.Name)" -ErrorAction SilentlyContinue
+    # Say what is happening. Each probe is minutes of silence otherwise -- CUDA init, mmap of a
+    # multi-GB corpus.tok, 60 steps, then a model save -- and a bare header with no output for ten
+    # minutes reads as a hang, not as work in progress.
+    Write-Host ("  probing {0} ({1} executions) -- CUDA init + corpus mmap + 60 steps, ~2-5 min..." -f `
+        $a.Name, $a.Exec) -ForegroundColor DarkGray
     & "$bin/sub0llm-train.exe" --steps 60 --fresh --model "models/_probe_$($a.Name)/model.bin" `
         --corpus-fraction $CorpusFraction --subset-seed 1 2>&1 | Out-Null
     # Take the ENGINE's own steady-state numbers, never (60 / wall-clock). A 60-step probe is
@@ -172,6 +177,7 @@ foreach ($a in $Arms) {
         $m = [regex]::Matches($txt, 'next ep in ([0-9.]+)h');  if ($m.Count) { $eph  = [double]$m[$m.Count-1].Groups[1].Value }
     }
     $proj += [pscustomobject]@{ Arm = $a.Name; StepsPerEpoch = $sched; TokensPerSec = $toks; HoursPerEpoch = [math]::Round($eph,2) }
+    Write-Host ("    -> {0:N0} tok/s, {1} steps/epoch, {2}h/epoch" -f $toks, $sched, [math]::Round($eph,2)) -ForegroundColor DarkGray
     Remove-Item -Recurse -Force "models/_probe_$($a.Name)" -ErrorAction SilentlyContinue
 }
 $proj | Format-Table -AutoSize
