@@ -166,6 +166,16 @@ struct BpeAnalysisVocab {
 // it), so this is a clean dual-mode fallback, not a heuristic needing per-corpus tuning. Caller
 // seeds `doc_starts` with {0} before the first chunk (document 0 starts at token 0); this function
 // only ever appends.
+// Document boundaries from the EXPLICIT `<|endoftext|>` marker (TOK_EOS) only. A blank-line ("\n\n")
+// fallback used to be OR'd in for corpora extracted before the marker existed; it is gone. It was
+// unsound as a boundary signal -- a blank line also occurs mid-document as an ordinary paragraph break,
+// so on any corpus that HAS paragraphs it manufactured spurious documents -- and every corpus this
+// project ships now carries the marker (verified 2026-07-28: fineweb_edu, fineweb_smoke, tinystories,
+// gsm8k all do; fineweb_edu contains zero blank lines at all). A corpus without markers now yields ONE
+// document, which the configurator refuses rather than training on -- see its doc_count check.
+//
+// `nl_run` is retained in the signature (unused) so the streaming caller's per-chunk state threading
+// does not have to change; it costs nothing and keeps the call sites identical.
 void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_index,
                          const Tokenizer& t, int& nl_run, std::vector<std::uint64_t>& doc_starts);
 

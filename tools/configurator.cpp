@@ -984,14 +984,12 @@ int main(int argc, char** argv) {
         sub0::TokWriter tw(ts, tkz.vocab);
         std::vector<std::uint8_t> pack_scratch;
         std::println(stderr, "corpus.tok: {} bits/token (vocab {})", tw.bytes_per_token() * 8, tkz.vocab);
-        // Document boundaries: PREFERRED signal is the explicit eos_id token (the literal
-        // `<|endoftext|>` marker the extraction scripts insert between documents, see casing.hpp's
-        // TOK_EOS comment) -- unambiguous, unlike a blank line which also occurs mid-document as an
-        // ordinary paragraph break. FALLBACK for corpora extracted before this (or without the
-        // marker): a run of >=2 newline tokens ("\n\n") still marks a break. Both conditions are
-        // just OR'd -- a corpus with explicit EOS markers never produces a "\n\n" false-positive
-        // (get_fineweb.py's new format uses single newlines around the marker), so this is a clean,
-        // automatic dual-mode fallback, not a heuristic that needs tuning per corpus.
+        // Document boundaries come from the explicit eos_id token ONLY -- the literal `<|endoftext|>`
+        // marker the extraction scripts insert between documents (see casing.hpp's TOK_EOS comment).
+        // The old blank-line fallback is gone: a blank line also occurs mid-document as an ordinary
+        // paragraph break, so it manufactures spurious boundaries on any corpus with paragraphs, and
+        // every corpus this project ships now carries the marker. A corpus without markers is now a
+        // hard error below rather than silently becoming one giant document.
         // Record each document's start token index so training keeps windows inside one document
         // (the scan logic itself -- eos_id-preferred, \n\n-fallback -- lives in sub0::tok::
         // scan_doc_boundaries so tests/engine_tests.cpp can exercise it without duplicating it).
@@ -1358,7 +1356,20 @@ int main(int argc, char** argv) {
         }
         if (emit_tok) {
             std::println(stderr, "total tokens:                    {}", token_count);
-            std::println(stderr, "documents (\\n\\n-separated):       {}", doc_count);
+            std::println(stderr, "documents (<|endoftext|>-marked): {}", doc_count);
+            // A corpus with no EOS markers scans to a single document, and training would then draw
+            // windows spanning unrelated documents with nothing to show for it. The blank-line fallback
+            // used to mask that; with the fallback gone it must fail loudly instead. doc_count counts
+            // document STARTS and is seeded with 1 for "document 0 begins at token 0", so <= 1 means
+            // not one marker was seen in the entire corpus.
+            if (doc_count <= 1 && token_count > 0) {
+                std::println(stderr,
+                    "error: no <|endoftext|> markers found in '{}' -- the whole corpus scans as ONE "
+                    "document, so training windows would span unrelated documents. Re-extract it with "
+                    "the marker between documents (see the extraction scripts); the blank-line fallback "
+                    "that used to paper over this has been removed as unsound.", corpus);
+                return 1;
+            }
             std::println(stderr, "compression (bytes/token):       {:.3f}", bytes_per_tok);
             // Feed this REAL measurement back into the cross-corpus calibration (config_util.hpp's
             // TokenCalibration) so the NEXT corpus's auto-sizing starts from a slightly better prior.

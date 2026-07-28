@@ -684,25 +684,15 @@ std::string detokenize(const Tokenizer& t, std::span<const int> ids) {
 }
 
 void scan_doc_boundaries(std::span<const std::int32_t> toks, std::uint64_t base_index,
-                         const Tokenizer&, int& nl_run, std::vector<std::uint64_t>& doc_starts) {
-    constexpr std::int32_t nl_id      = static_cast<std::int32_t>('\n');  // base id == byte value
-    constexpr std::int32_t para_id    = static_cast<std::int32_t>(TOK_PARA);
-    constexpr std::int32_t newline_id = static_cast<std::int32_t>(TOK_NEWLINE);
-    constexpr std::int32_t eos_id     = static_cast<std::int32_t>(TOK_EOS);
+                         const Tokenizer&, int&, std::vector<std::uint64_t>& doc_starts) {
+    constexpr std::int32_t eos_id = static_cast<std::int32_t>(TOK_EOS);
     for (std::size_t li = 0; li < toks.size(); ++li) {
-        const std::int32_t tk = toks[li];
-        if (tk == eos_id) {   // explicit marker: the NEXT token starts a new document
+        if (toks[li] == eos_id) {   // explicit marker: the NEXT token starts a new document
             // A trailing EOS as the corpus's very last token pushes a boundary equal to the final
             // token count -- harmless: sample_window's uniform draw never reaches that exact
             // position, so it only ever resolves back to the preceding (real) document's own end.
             doc_starts.push_back(base_index + li + 1);
-            nl_run = 0;
-            continue;
         }
-        const int w = (tk == para_id) ? 2 : (tk == newline_id || tk == nl_id ? 1 : 0);
-        if (w > 0) { nl_run += w; continue; }
-        if (nl_run >= 2) doc_starts.push_back(base_index + li);
-        nl_run = 0;
     }
 }
 
