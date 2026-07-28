@@ -16,7 +16,7 @@ cmake --build --preset native                                    #    -> header 
 ./out/build/native/sub0llm-tune       # 3. measure + persist the tuned runtime knobs
 cmake --build --preset native         #    -> bakes the tuned knobs (state 3)
 ./out/build/native/sub0llm-train      # 4. train (uses tuned knobs, else the configure estimates)
-./out/build/native/sub0llm-gen "Once there was a dog"           # 5. generate
+./out/build/native/sub0llm-gen --model <m> "Once there was a dog"   # 5. generate
 ```
 
 `scripts/workflow.ps1` wraps steps 1-2 (and optionally 3-5) into one command. There is no CMake

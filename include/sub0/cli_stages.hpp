@@ -66,9 +66,15 @@ inline int run_train(int argc, char** argv) {
                                            // presence: a schedule identity change mid-run is a big enough
                                            // deal that it must never happen silently on a routine resume)
     bool train_resume = false, train_fresh = false;
-    app.add_option("model", train_model,
+    // NAMED, not positional -- and this is the whole point. The old form was `train [model] [corpus]`,
+    // so a single positional bound to MODEL, and `save_model` then wrote a model.bin straight over the
+    // path. Typing the corpus alone -- the obvious reading of `train <corpus>` -- destroyed the corpus.
+    // That happened TWICE (data/fineweb_smoke.txt, then data/tinystories.txt) before the shape itself
+    // was fixed rather than guarded. No positional here can now be silently reinterpreted as a write
+    // target, because there are no positionals at all.
+    app.add_option("--model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
-    app.add_option("corpus", train_corpus, "Training corpus")->capture_default_str();
+    app.add_option("--corpus", train_corpus, "Training corpus")->capture_default_str();
     app.add_option("--steps", train_steps,
                    "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
     app.add_option("--batch", train_batch,
@@ -138,7 +144,9 @@ inline int run_gen(int argc, char** argv) {
     float gen_temp = 0.8f;
     unsigned gen_seed = 0;
     int   gen_attn_sinks = 0;   // 0 = off (today's plain sliding-window fallback past SEQ_LEN)
-    app.add_option("model",  gen_model,  "Trained model path")->required();
+    app.add_option("--model", gen_model, "Trained model path")->required();
+    // The one positional left in this CLI, deliberately: a prompt is free text, not a path, so it can
+    // neither be mistaken for a file nor be written to. Every PATH argument, everywhere, is named.
     app.add_option("prompt", gen_prompt, "Prompt text")->required();
     app.add_option("--n",    gen_n,    "Tokens to generate")->capture_default_str();
     app.add_option("--temp", gen_temp, "Sampling temperature")->capture_default_str();
@@ -165,7 +173,7 @@ inline int run_eval(int argc, char** argv) {
     std::string eval_model;
     unsigned    eval_seed = 4242;
     int         eval_n    = 300;
-    app.add_option("model", eval_model, "Trained model path (a model trained with --op-mix)")->required();
+    app.add_option("--model", eval_model, "Trained model path (a model trained with --op-mix)")->required();
     app.add_option("--seed", eval_seed, "RNG seed for the synthetic problems")->capture_default_str();
     app.add_option("--problems", eval_n, "Number of synthetic problems to score")->capture_default_str();
     CLI11_PARSE(app, argc, argv);
@@ -204,7 +212,7 @@ inline int run_vocab(int argc, char** argv) {
     CLI::App app{"sub0llm vocab — print the build's vocabulary table"};
     std::string vocab_tok;
     int vocab_limit = 0;
-    app.add_option("tokenizer", vocab_tok, "Tokenizer path (defaults to the baked-in tokenizer)");
+    app.add_option("--tokenizer", vocab_tok, "Tokenizer path (defaults to the baked-in tokenizer)");
     app.add_option("--limit", vocab_limit, "Max entries to print (0 = all)")->capture_default_str();
     CLI11_PARSE(app, argc, argv);
     return sub0_vocab_stage(vocab_tok.empty() ? nullptr : vocab_tok.c_str(), vocab_limit);
@@ -230,7 +238,7 @@ inline int run_autotemp(int argc, char** argv) {
     std::string at_model;
     unsigned at_seed = 42;
     bool at_quiet = false;
-    app.add_option("model", at_model, "Trained model path")->required();
+    app.add_option("--model", at_model, "Trained model path")->required();
     app.add_option("--seed", at_seed, "RNG seed for the generation sweep")->capture_default_str();
     app.add_flag("--quiet", at_quiet, "Print only the recommendation, not the temperature sweep");
     CLI11_PARSE(app, argc, argv);
@@ -266,7 +274,7 @@ inline int run_models(int argc, char** argv) {
 inline int run_report(int argc, char** argv) {
     CLI::App app{"sub0llm report — diagnose model sizing vs its corpus; suggest dimension knobs"};
     std::string report_model;
-    app.add_option("model", report_model,
+    app.add_option("--model", report_model,
                    "Trained model to include train/val loss diagnosis (optional; omit for structural-only)");
     CLI11_PARSE(app, argc, argv);
     return sub0_report_stage(report_model.empty() ? nullptr : report_model.c_str());
@@ -286,7 +294,7 @@ inline int run_bundle(int argc, char** argv) {
                  "Opt-in: not part of a normal train/gen workflow, meant for cross-model-size "
                  "comparisons where several incompatible builds need to stay runnable side by side."};
     std::string bundle_model;
-    app.add_option("model", bundle_model, "Trained model path (dims must match THIS build)")->required();
+    app.add_option("--model", bundle_model, "Trained model path (dims must match THIS build)")->required();
     CLI11_PARSE(app, argc, argv);
     return sub0_bundle_stage(bundle_model.c_str());
 }
@@ -298,8 +306,8 @@ inline int run_ckpt2model(int argc, char** argv) {
                  "an OLDER checkpoint (e.g. the best-val_nelbo one, kept by prune_ckpts alongside the "
                  "newest N) without resuming a full training run."};
     std::string ck_in, ck_out;
-    app.add_option("checkpoint", ck_in, "Input .ckpt path")->required();
-    app.add_option("model_out", ck_out, "Output model.bin path")->required();
+    app.add_option("--checkpoint", ck_in, "Input .ckpt path")->required()->check(CLI::ExistingFile);
+    app.add_option("--out", ck_out, "Output model.bin path")->required();
     CLI11_PARSE(app, argc, argv);
     return sub0_ckpt2model_stage(ck_in.c_str(), ck_out.c_str());
 }

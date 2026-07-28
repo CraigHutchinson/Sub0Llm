@@ -50,12 +50,37 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     log(f"copying to {args.out}")
+
+    # The VALIDATION splits begin mid-story; the TRAIN splits do not.
+    #
+    # Both valid files are slices of a larger file and the cut lands inside a story:
+    # TinyStoriesV2-GPT4-valid.txt opens on "u don't have to be scared of the loud dog", and
+    # TinyStories-valid.txt on " Spot. Spot saw the shiny car". Copying verbatim would hand the
+    # tokenizer a first "document" that is a sentence fragment -- exactly the document-boundary
+    # unsoundness the <|endoftext|>-only scan was introduced to eliminate, so importing one
+    # deliberately would be perverse. Costs one story.
+    #
+    # This keys off the SPLIT, not off inspecting the text, because there is no reliable structural
+    # signal: v1-valid's fragment begins " Spot." which reads exactly like a legitimate sentence
+    # start. Whether the file is a slice is known a priori; guessing it from the bytes is not.
+    # (Learned the hard way -- a content heuristic here silently ate the train split's real first
+    # story, the "little boy named Ben" one.)
+    drop_partial_head = args.split == "valid"
+    marker = b"<|endoftext|>"
     with open(path, "rb") as src, open(args.out, "wb") as dst:
+        head = src.read(1 << 20)
+        if marker not in head:
+            raise SystemExit(f"no {marker.decode()} in the first 1MB of {filename} -- wrong file?")
+        if drop_partial_head:
+            cut = head.find(marker)
+            log(f"{args.split} split is a slice: dropping {cut} leading bytes (partial first story)")
+            head = head[cut + len(marker):].lstrip(b"\r\n")
+        dst.write(head)
         while chunk := src.read(1 << 20):
             dst.write(chunk)
 
     n_docs = 0
-    with open(path, "r", encoding="utf-8") as f:
+    with open(args.out, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip() == "<|endoftext|>":
                 n_docs += 1

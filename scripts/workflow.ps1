@@ -68,7 +68,7 @@
       dominate. (Cleaner still: a NON-math base + the gsm8k op source, so nothing teaches inline arithmetic.)
     * -Batch pinned: the GPU auto-batch over-shoots VRAM on small auto-sized models (crashes) -- pin it.
   Verify by GENERATING on a GSM8K-style prompt (the training format), e.g.
-  `sub0llm-gen.exe <model> "Natalia sold 48/2 = "` -> emits [op math], node injects 24. (`sub0llm eval`
+  `sub0llm-gen.exe --model <model> "Natalia sold 48/2 = "` -> emits [op math], node injects 24. (`sub0llm eval`
   scores the SYNTHETIC format, which won't match a GSM8K-trained model.)
 #>
 [CmdletBinding()]
@@ -164,10 +164,10 @@ $trainArgs = @()
 if ($Steps -gt 0) { $trainArgs += @("--steps", "$Steps") }
 if ($Batch -gt 0) { $trainArgs += @("--batch", "$Batch") }   # pin the batch (the GPU auto-batch over-shoots VRAM on small models)
 if ($BlendConfig) { $trainArgs += @("--blend-config", (Resolve-Path (Join-Path $RepoRoot $BlendConfig)).Path) }
-$trainArgs += @($ModelPath, $CorpusPath)
+$trainArgs += @("--model", $ModelPath, "--corpus", $CorpusPath)
 Invoke-Checked (Join-Path $Bin "sub0llm-train.exe") $trainArgs
 
 Write-Host "=== gen sanity check ===" -ForegroundColor Yellow
-Invoke-Checked (Join-Path $Bin "sub0llm-gen.exe") @($ModelPath, $Prompt, "--n", "$GenTokens", "--temp", "$Temp", "--topk", "$TopK")
+Invoke-Checked (Join-Path $Bin "sub0llm-gen.exe") @("--model", $ModelPath, $Prompt, "--n", "$GenTokens", "--temp", "$Temp", "--topk", "$TopK")
 
 Write-Host "workflow complete: $ModelPath" -ForegroundColor Green

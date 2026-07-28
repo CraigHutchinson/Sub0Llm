@@ -1,6 +1,16 @@
 # Git LFS tracking for large corpus/data files in data/
 # All text corpus files - these can grow to hundreds of MB
 data/*.txt    filter=lfs diff=lfs merge=lfs -text
+
+# ...EXCEPT the small committed test fixtures. These are checked in as ordinary files on purpose:
+# they are a few KB, and a fixture that needs an LFS fetch before it can be read is a fixture that
+# goes missing. That is not hypothetical -- data/english.txt disappeared during a corpus cleanup and
+# the CUDA verification build (out/build/hd96_check), whose generated config had it baked in as a
+# constexpr path, silently kept a stale toy tokenizer and failed 8 of its own tests for weeks.
+# A test resource must be present the moment the repo is cloned, with no extra step.
+# Exempt only files that have NEVER been through the filter: for one already stored in LFS, dropping
+# the filter checks out the raw pointer text in place of its content.
+data/english.txt    -filter -diff -merge text
 data/*.json   filter=lfs diff=lfs merge=lfs -text
 data/*.jsonl  filter=lfs diff=lfs merge=lfs -text
 data/*.csv    filter=lfs diff=lfs merge=lfs -text

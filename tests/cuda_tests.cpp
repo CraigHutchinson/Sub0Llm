@@ -1747,7 +1747,13 @@ TEST_CASE("CUDA binding-compose: doc_of-resolved bindings across multiple window
     const std::vector<std::size_t> starts = { 5, 25, 65, 90 };    // windows 0,1 -> doc0; 2,3 -> doc1
 
     std::mt19937 rng(4242u);
-    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    // Filler must exclude the scratch-slot ids. They are LOW ids (SCRATCH_SLOT_BASE is
+    // casing::TOK_RESERVED_4, a marker id), so a plain uniform draw over the whole vocab lands on one
+    // roughly SCRATCH_SLOT_COUNT/VOCAB of the time -- about a 20-30% chance of at least one collision
+    // across these 48 positions. A collision creates an unintended binding and breaks the
+    // "exactly one bound position per window" invariant the test asserts below, so the test's
+    // correctness silently depended on the seed and on VOCAB. It surfaced when a rebuild moved VOCAB.
+    std::uniform_int_distribution<int> tok(0, sub0::SCRATCH_SLOT_BASE - 1);
     std::vector<int> data(121);
     for (int& x : data) x = tok(rng);
     // One bound position per window (t=3); the SAME slot index (b%2) alternates within each doc, so

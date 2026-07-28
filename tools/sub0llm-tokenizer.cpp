@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
 
     CLI::App* exp = app.add_subcommand("export", "Export the full vocabulary as JSON or TSV");
     std::string tok_path, out_path, format = "json";
-    exp->add_option("tokenizer", tok_path, "Path to a built tokenizer.tok")->required()->check(CLI::ExistingFile);
+    exp->add_option("--tokenizer", tok_path, "Path to a built tokenizer.tok")->required()->check(CLI::ExistingFile);
     exp->add_option("-o,--out", out_path, "Output path (default: stdout)");
     exp->add_option("--format", format, "json (default) | tsv")
        ->check(CLI::IsMember({"json", "tsv"}));

@@ -1146,22 +1146,27 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const std::string created = sub0::registry::now_iso();
     long epoch_steps = 1;   // real value set with the schedule below; meta writes read it live
     if (model_out && *model_out) {
-        // Guard the positional-argument trap: usage is `[model] [corpus]`, so ONE positional binds to
-        // MODEL. Passing just a corpus -- the natural thing to type -- silently trains INTO the corpus's
-        // own directory, scattering model.bin/config.json/corpus.tok/*.ckpt beside the data. That
-        // happened twice while building this feature set, once nearly committing a 1.36 GB corpus.tok.
-        // A model path naming an EXISTING regular file that is not a model.bin is a corpus by any
-        // reasonable reading, so refuse rather than write there.
+        // Second line of defence for --model naming something that is already a file.
+        //
+        // The FIRST line is the CLI shape itself: --model and --corpus are both named options now (see
+        // cli_stages.hpp), so nothing can bind to the write target by position any more. That shape is
+        // what actually closed this hole; the old usage was `train [model] [corpus]`, so typing just a
+        // corpus -- the obvious reading -- made it the MODEL, and save_model wrote a model.bin straight
+        // over it. It destroyed data/fineweb_smoke.txt and then data/tinystories.txt.
+        //
+        // This check stays anyway, because `--model <a corpus>` is still typeable, and the cost of a
+        // false negative is a destroyed corpus. An existing regular file that is not a model.bin is a
+        // corpus by any reasonable reading: refuse rather than write there.
         {
             const std::filesystem::path mp(model_out);
             std::error_code ec_;
             if (std::filesystem::is_regular_file(mp, ec_) && mp.filename() != "model.bin"
                 && mp.extension() != ".bin") {
                 sub0::log::error(
-                    "train: '{}' is an existing file, so it looks like a CORPUS passed where the MODEL "
-                    "path goes -- training would scatter model artifacts beside your data. Usage is "
-                    "`sub0llm-train [model] [corpus]`; omit the model path to auto-name one under the "
-                    "models root, or give the corpus as the SECOND positional.", model_out);
+                    "train: --model '{}' is an existing file that is not a model.bin, so it looks like a "
+                    "CORPUS -- training would OVERWRITE it with model weights. Did you mean --corpus "
+                    "'{}'? Omit --model entirely to auto-name one under the models root.",
+                    model_out, model_out);
                 return 1;
             }
         }
