@@ -1094,6 +1094,26 @@ struct ConsoleCtrlGuard {};   // no-op off Windows (this project builds Windows-
 // --allow-concurrent exists because deliberate concurrency is legitimate: a small CPU sample-train
 // alongside a long GPU run, say. It relaxes ONLY the global scope -- the per-directory guard still
 // holds, because no flag makes two writers on one checkpoint safe.
+// Is a sub0llm-train holding the machine-wide guard right now? A NON-INVASIVE probe: OpenMutex only
+// tests for existence, it never acquires, so it cannot perturb or block the trainer.
+//
+// The read-only tools (report, autotemp) are deliberately NOT subject to SingleInstanceGuard --
+// refusing to inspect a model while it trains would be obnoxious, and they write nothing a trainer
+// owns. They are not free, though: both run generation grids that contend for the same CPU and GPU,
+// so an innocuous-looking `report` quietly steals throughput from a multi-hour sweep and, worse,
+// makes the sweep's own tok/s numbers wrong for that window. Detect it and do LESS, rather than
+// refuse or silently compete.
+#if defined(_WIN32)
+inline bool trainer_active() {
+    const std::string gname = std::string("Local") + char(92) + "sub0llm-train-global";
+    HANDLE h = OpenMutexA(SYNCHRONIZE, FALSE, gname.c_str());
+    if (h) { CloseHandle(h); return true; }
+    return false;
+}
+#else
+inline bool trainer_active() { return false; }   // no probe wired up off Windows; Windows-first build
+#endif
+
 #if defined(_WIN32)
 struct SingleInstanceGuard {
     HANDLE mutex_ = nullptr;
@@ -3338,6 +3358,11 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
         static_cast<std::size_t>(VAL_FRACTION * static_cast<double>(data.size())));
     const std::size_t val_start = data.size() - val_tokens;
 
+    // autotemp is the EXPENSIVE one: an 11-temperature x 10-seed generation grid, far heavier than
+    // report's bounded NELBO eval. Running it against a live trainer distorts both measurements.
+    if (trainer_active())
+        sub0::log::warn("autotemp: a sub0llm-train is running -- the temperature grid is a heavy "
+                        "generation sweep and will contend with it. Prefer running this when idle.");
     const sub0::evalcache::EvalMetrics raw = compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, seed);
     const double ce_ppl     = std::exp(raw.val_nelbo);   // headline (inflated by model error) -- exp(val_nelbo), not a separate measurement
     const double target_ppl = raw.target_ppl;
@@ -3540,6 +3565,13 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
     double rel_gap = 0.0;
     bool   model_loaded = false;
     if (model_in && *model_in) {
+        // A running trainer owns the machine's throughput budget; say so BEFORE doing the work, so a
+        // slow report reads as "deliberately sharing" rather than "hung". `report` already skips the
+        // autotemp grid (the expensive generation sweep) -- what remains is the bounded fixed-window
+        // NELBO eval, which is cheap but not free.
+        if (trainer_active())
+            sub0::log::warn("report: a sub0llm-train is running -- this shares its CPU/GPU and will "
+                            "depress the numbers in BOTH. Re-run when idle for a clean measurement.");
         if (sub0::load_model(model_in)) {
             model_loaded = true;
             const sub0::evalcache::EvalMetrics raw =
