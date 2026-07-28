@@ -167,7 +167,8 @@ TEST_CASE("gguf: rejects a truncated file at every cut point", "[gguf]") {
     // Cutting anywhere strictly before the end must fail cleanly (Truncated), never read out of bounds
     // (ASan/UBSan-clean is the real assertion here; the explicit CHECKs are a coarse cross-check).
     for (std::size_t cut : {std::size_t{0}, std::size_t{4}, std::size_t{8}, full.size() / 3, full.size() / 2, full.size() - 1}) {
-        Reader r(GgufBuilder::truncate(full, cut));
+        const std::vector<std::uint8_t> gguf_buf = GgufBuilder::truncate(full, cut);
+        Reader r(gguf_buf);
         CHECK_FALSE(r.ok());
     }
     Reader whole(full);
@@ -179,7 +180,8 @@ TEST_CASE("gguf: parses scalar and string KV metadata", "[gguf]") {
     b.add_string_kv("general.architecture", "llama");
     b.add_u32_kv("llama.block_count", 12);
     b.add_f32_kv("llama.rope.freq_base", 10000.0f);
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
 
     const Value* arch = r.find("general.architecture");
@@ -203,7 +205,8 @@ TEST_CASE("gguf: parses scalar and string KV metadata", "[gguf]") {
 TEST_CASE("gguf: parses a string-array KV (the tokenizer vocab shape)", "[gguf]") {
     GgufBuilder b;
     b.add_string_array_kv("tokenizer.ggml.tokens", {"<unk>", "hello", "world"});
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const Value* toks = r.find("tokenizer.ggml.tokens");
     REQUIRE(toks != nullptr);
@@ -219,7 +222,8 @@ TEST_CASE("gguf: parses a non-string array KV without materializing it", "[gguf]
     // A KV after the array must still parse correctly -- proves the array payload was skipped by
     // the right byte count, not under/over-consumed.
     b.add_string_kv("general.architecture", "llama");
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const Value* tt = r.find("tokenizer.ggml.token_type");
     REQUIRE(tt != nullptr);
@@ -232,7 +236,8 @@ TEST_CASE("gguf: parses the tensor table (name, dims, type, offset)", "[gguf]") 
     GgufBuilder b;
     b.add_tensor("token_embd.weight", {8, 16}, /*type=*/0, /*offset=*/0);
     b.add_tensor("blk.0.attn_q.weight", {8, 8}, /*type=*/1, /*offset=*/512);
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     REQUIRE(r.tensors().size() == 2);
 
@@ -251,7 +256,8 @@ TEST_CASE("gguf: parses the tensor table (name, dims, type, offset)", "[gguf]") 
 }
 
 TEST_CASE("gguf compat: a plain 2-layer MHA Llama-style fixture matches cleanly", "[gguf]") {
-    Reader r(build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/false, /*quantized=*/false));
+    const std::vector<std::uint8_t> gguf_buf = build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/false, /*quantized=*/false);
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r);
     CHECK(rep.embedding_present);
@@ -266,21 +272,24 @@ TEST_CASE("gguf compat: a plain 2-layer MHA Llama-style fixture matches cleanly"
 }
 
 TEST_CASE("gguf compat: GQA (fewer KV rows than Q rows) is detected", "[gguf]") {
-    Reader r(build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/true, /*quantized=*/false));
+    const std::vector<std::uint8_t> gguf_buf = build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/true, /*quantized=*/false);
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r);
     CHECK_FALSE(rep.matches_plain_mha);
 }
 
 TEST_CASE("gguf compat: gated (SwiGLU) FFN tensors are detected", "[gguf]") {
-    Reader r(build_llama_fixture(/*gated=*/true, /*biased=*/false, /*gqa=*/false, /*quantized=*/false));
+    const std::vector<std::uint8_t> gguf_buf = build_llama_fixture(/*gated=*/true, /*biased=*/false, /*gqa=*/false, /*quantized=*/false);
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r);
     CHECK(rep.has_gated_ffn);
 }
 
 TEST_CASE("gguf compat: attention/FFN biases are detected", "[gguf]") {
-    Reader r(build_llama_fixture(/*gated=*/false, /*biased=*/true, /*gqa=*/false, /*quantized=*/false));
+    const std::vector<std::uint8_t> gguf_buf = build_llama_fixture(/*gated=*/false, /*biased=*/true, /*gqa=*/false, /*quantized=*/false);
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r);
     CHECK(rep.has_attn_bias);
@@ -288,7 +297,8 @@ TEST_CASE("gguf compat: attention/FFN biases are detected", "[gguf]") {
 }
 
 TEST_CASE("gguf compat: quantized tensor types are flagged, not silently accepted", "[gguf]") {
-    Reader r(build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/false, /*quantized=*/true));
+    const std::vector<std::uint8_t> gguf_buf = build_llama_fixture(/*gated=*/false, /*biased=*/false, /*gqa=*/false, /*quantized=*/true);
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r);
     CHECK(rep.any_quantized);
@@ -305,7 +315,8 @@ TEST_CASE("gguf compat: a missing layer is reported, not silently ignored", "[gg
     b.add_tensor("blk.0.ffn_norm.weight", {8});
     b.add_tensor("blk.0.ffn_down.weight", {32, 8});
     // Layer 1 deliberately absent -- ask for 2 layers explicitly so the checker doesn't just stop early.
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     auto rep = check_llama_mha_compat(r, /*expect_layers=*/2);
     CHECK_FALSE(rep.missing.empty());
@@ -346,7 +357,8 @@ TEST_CASE("gguf: tensor_bytes round-trips exact F32 data through to_f32", "[gguf
     std::span<const std::uint8_t> raw_src(reinterpret_cast<const std::uint8_t*>(src.data()), src.size() * sizeof(float));
     b.add_data(raw_src);
 
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const TensorInfo* t = r.find_tensor("w");
     REQUIRE(t != nullptr);
@@ -406,7 +418,8 @@ TEST_CASE("gguf: a real Q8_0 tensor round-trips through Reader::tensor_bytes + t
     for (int i = 0; i < 32; ++i) data[36 + static_cast<std::size_t>(i)]     = static_cast<std::uint8_t>(i);
     b.add_data(data);
 
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const TensorInfo* t = r.find_tensor("w");
     REQUIRE(t != nullptr);
@@ -423,7 +436,8 @@ TEST_CASE("gguf: a real Q8_0 tensor round-trips through Reader::tensor_bytes + t
 TEST_CASE("gguf: tensor_bytes returns empty on a truncated/out-of-bounds data section", "[gguf]") {
     GgufBuilder b;
     b.add_tensor("w", {64}, /*type=F32*/ 0, /*offset=*/0);   // needs 256 bytes, none appended
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const TensorInfo* t = r.find_tensor("w");
     REQUIRE(t != nullptr);
@@ -436,7 +450,8 @@ TEST_CASE("gguf: to_f32 refuses an unsupported quantized type rather than misrea
     b.pad_to_data_section();
     std::vector<std::uint8_t> junk(64, 0xAB);
     b.add_data(junk);
-    Reader r(b.finish());
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
     REQUIRE(r.ok());
     const TensorInfo* t = r.find_tensor("w");
     REQUIRE(t != nullptr);

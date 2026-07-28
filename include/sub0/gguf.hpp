@@ -88,6 +88,19 @@ public:
     // error() before using tensors()/metadata().
     explicit Reader(std::span<const std::uint8_t> data) { parse(data); }
 
+    // Refuse to bind to a TEMPORARY owning buffer. Reader holds spans into `data` and copies nothing,
+    // so `Reader r(make_buffer());` leaves every one of them dangling the moment the full-expression
+    // ends -- and because the freed pages usually still hold the old bytes, it reads correctly for
+    // years and then stops. It did: 14 test sites were written this way, passed throughout C++23, and
+    // only broke when a C++26 build changed stack reuse enough to clobber the buffer before it was
+    // read (tensor_bytes returned the right SIZE from the wrong memory, so the size assertions still
+    // passed and only the decoded values were garbage).
+    //
+    // Deleting the rvalue overload turns that entire class of mistake into a compile error: an rvalue
+    // vector matches this exactly, which beats the user-defined conversion to span, so it is chosen
+    // and then rejected. Callers must name the buffer, which is precisely the lifetime they need.
+    Reader(std::vector<std::uint8_t>&&) = delete;
+
     Err  error() const { return err_; }
     bool ok()    const { return err_ == Err::Ok; }
     std::uint32_t version() const { return version_; }
