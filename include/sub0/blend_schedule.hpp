@@ -251,7 +251,8 @@ inline sub0::BlendDraw sample_blend_staged(std::mt19937& rng, BlendFairness& fai
     assert(s >= 0 && "sample_blend_staged: no active source in the current schedule stage -- every stage "
                      "must have at least one source with rate > 0 (see parse_blend_schedule_json)");
     const sub0::BlendSource& src = sources[static_cast<std::size_t>(s)];
-    const sub0::Window win = sub0::sample_window(rng, T, src.view.size(), src.docs);
+    const sub0::Window win = sub0::sample_window(rng, T, src.view.size(), src.docs,
+                                                 src.subset_fraction, src.subset_seed);
     fair.drawn_tokens[static_cast<std::size_t>(s)] += static_cast<double>(win.len);
     return { s, win };
 }

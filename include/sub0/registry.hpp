@@ -163,6 +163,8 @@ struct ModelMeta {
     X(int,         batch,           0)    \
     X(double,      lr,              0.0)  \
     X(unsigned,    seed,            0u)   \
+    X(double,      corpus_fraction, 1.0)  \
+    X(unsigned,    subset_seed,     0u)   \
     X(int,         has_blend_schedule, 0)  \
     X(int,         config_schema,   1)
 

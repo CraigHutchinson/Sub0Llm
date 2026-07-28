@@ -50,6 +50,14 @@ struct BlendSource {
     std::span<const std::uint8_t>                  mask;          // empty => every position trained
     std::span<const std::vector<std::vector<int>>> doc_bindings;  // empty => no content-embed binding
 
+    // Corpus subsetting (window.hpp's doc_in_subset): draw only from a deterministic, distributed
+    // fraction of THIS source's documents. Per-source rather than global because it is the huge base
+    // corpus you want to cut, never the generated curricula -- those are already small, and thinning
+    // one would just delete coverage of the mechanism it exists to teach. 1.0 = the whole source,
+    // and that path is bit-for-bit the unsubsetted sampler.
+    double        subset_fraction = 1.0;
+    std::uint64_t subset_seed     = 0;
+
     bool masked() const { return !mask.empty(); }
 };
 

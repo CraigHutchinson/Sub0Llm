@@ -1135,7 +1135,8 @@ static void report_run_context(bool gpu_train, bool hybrid_train = false);
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
                                           int steps, int batch, float lr, unsigned seed, int keep,
                                           int optimizer, int resume_mode, const char* blend_config_path,
-                                          int replace_schedule, int allow_concurrent) {
+                                          int replace_schedule, int allow_concurrent,
+                                          double corpus_fraction, unsigned subset_seed) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -1489,6 +1490,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     auto build_run_config = [&] {
         sub0::registry::RunConfig cfg;
         cfg.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
+        cfg.corpus_fraction = corpus_fraction;   // which SUBSET of the corpus this model actually saw
+        cfg.subset_seed     = subset_seed;
         cfg.d_model = D_MODEL; cfg.n_layers = N_LAYERS; cfg.n_heads = N_HEADS; cfg.n_kv_heads = N_KV_HEADS;
         cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;
@@ -1821,8 +1824,31 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const sub0::SourceSpec& spec = schedule.sources[i];
         if (!spec.corpus.empty()) {
             kBaseSource = i;
-            sources.push_back(sub0::BlendSource{ spec.name, train_span, doc_index, {}, {} });
-            sub0::log::line("blend: '{}' base corpus ({} tokens)", spec.name, train_span.size());
+            // --corpus-fraction applies to the BASE corpus only -- the generated curricula below are
+            // already small, and thinning one would delete coverage of the very mechanism it teaches.
+            sub0::BlendSource base{ spec.name, train_span, doc_index, {}, {} };
+            base.subset_fraction = corpus_fraction;
+            base.subset_seed     = subset_seed;
+            sources.push_back(base);
+            if (corpus_fraction < 1.0) {
+                // Documents, not tokens: selection is per-document, so the token count only lands on
+                // the fraction in expectation. Report both so the log says what was actually chosen.
+                const std::size_t ndocs = doc_index.empty() ? 0 : doc_index.size() - 1;
+                std::size_t sel = 0;
+                for (std::size_t d = 0; d < ndocs; ++d)
+                    if (sub0::doc_in_subset(d, subset_seed, corpus_fraction)) ++sel;
+                sub0::log::line("blend: '{}' base corpus ({} tokens) | SUBSET {:.1f}% of documents "
+                                "(seed {}): {} of {} selected, distributed across the corpus",
+                                spec.name, train_span.size(), corpus_fraction * 100.0,
+                                subset_seed, sel, ndocs);
+                if (sel == 0) {
+                    sub0::log::error("train: --corpus-fraction {} selected NO documents from {} -- "
+                                     "nothing to train on. Raise the fraction.", corpus_fraction, ndocs);
+                    return 1;
+                }
+            } else {
+                sub0::log::line("blend: '{}' base corpus ({} tokens)", spec.name, train_span.size());
+            }
             continue;
         }
         sub0::tok::Tokenizer tk;

@@ -6,8 +6,10 @@
 // CHOSEN source's bounds + documents.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "sub0/blend.hpp"
+#include "sub0/window.hpp"
 #include "sub0/blend_schedule.hpp"
 
 #include <algorithm>
@@ -278,4 +280,85 @@ TEST_CASE("blend: doc_of finds the document owning a corpus position", "[blend]"
     const std::vector<std::uint64_t> one_doc{0};
     CHECK(sub0::doc_of(one_doc, 0)   == 0);
     CHECK(sub0::doc_of(one_doc, 999) == 0);
+}
+
+// --- corpus subsetting: train on a distributed FRACTION of the documents ------------------------
+// Replaces the deleted fineweb_smoke.txt prefix file. The properties that make a subset usable are
+// not "it is smaller" -- they are distribution, determinism, and boundary safety. Each is pinned.
+
+TEST_CASE("corpus subset: selects ~the requested fraction, spread across the whole corpus",
+          "[frontend][window][subset]") {
+    constexpr std::size_t NDOCS = 20000;
+    for (double f : {0.05, 0.25, 0.5, 0.9}) {
+        std::size_t n = 0, first_half = 0;
+        for (std::size_t d = 0; d < NDOCS; ++d)
+            if (sub0::doc_in_subset(d, 1234u, f)) { ++n; if (d < NDOCS / 2) ++first_half; }
+        const double got = static_cast<double>(n) / static_cast<double>(NDOCS);
+        CHECK(got == Catch::Approx(f).margin(0.02));            // right size
+        // ...and SPREAD, which is the whole point: a prefix file would put 100% in the first half.
+        // Each half should hold about half the selected documents.
+        CHECK(static_cast<double>(first_half) / static_cast<double>(n) == Catch::Approx(0.5).margin(0.05));
+    }
+}
+
+TEST_CASE("corpus subset: deterministic in (seed, fraction), and different seeds differ",
+          "[frontend][window][subset]") {
+    // Reproducing a run must need only the seed and the fraction -- no subset file to ship or drift.
+    for (std::size_t d = 0; d < 500; ++d)
+        CHECK(sub0::doc_in_subset(d, 7u, 0.3) == sub0::doc_in_subset(d, 7u, 0.3));
+    int differ = 0;
+    for (std::size_t d = 0; d < 2000; ++d)
+        if (sub0::doc_in_subset(d, 7u, 0.3) != sub0::doc_in_subset(d, 8u, 0.3)) ++differ;
+    CHECK(differ > 100);                                        // a different seed is a different subset
+}
+
+TEST_CASE("corpus subset: fraction is monotone, so subsets nest", "[frontend][window][subset]") {
+    // A document selected at 25% must still be selected at 50%: the threshold is a comparison against
+    // one hash per document, not a re-draw. That makes 10/25/50/100% a genuine nested sweep rather
+    // than four unrelated samples -- which is what a learning-curve study needs.
+    for (std::size_t d = 0; d < 5000; ++d)
+        if (sub0::doc_in_subset(d, 42u, 0.25)) CHECK(sub0::doc_in_subset(d, 42u, 0.5));
+}
+
+TEST_CASE("corpus subset: the complement is the exact held-out set", "[frontend][window][subset]") {
+    // Every document is in exactly one of the two, so "the 75% not trained on" is unseen BY
+    // CONSTRUCTION -- a stronger guarantee than the positional train/val tail split.
+    std::size_t in = 0, out = 0;
+    for (std::size_t d = 0; d < 3000; ++d)
+        (sub0::doc_in_subset(d, 99u, 0.25) ? in : out)++;
+    CHECK(in + out == 3000);
+    CHECK(in > 600);
+    CHECK(in < 900);
+}
+
+TEST_CASE("corpus subset: fraction 1.0 is bit-for-bit the unsubsetted sampler",
+          "[frontend][window][subset]") {
+    // The default path must not shift by even one draw, or every existing result moves under it.
+    std::vector<std::uint64_t> docs;
+    for (std::uint64_t d = 0; d < 400; ++d) docs.push_back(d * 50);
+    std::mt19937 a(2024u), b(2024u);
+    for (int i = 0; i < 500; ++i) {
+        const sub0::Window wa = sub0::sample_window(a, 8, 20000, docs);
+        const sub0::Window wb = sub0::sample_window(b, 8, 20000, docs, 1.0, 12345u);
+        REQUIRE(wa.start == wb.start);
+        REQUIRE(wa.len   == wb.len);
+    }
+}
+
+TEST_CASE("corpus subset: sampled windows come ONLY from selected documents, and stay in-document",
+          "[frontend][window][subset]") {
+    // The safety property. A subset must never be a reason a window straddles a document boundary --
+    // that is the unsoundness the <|endoftext|>-only scan was introduced to remove.
+    constexpr std::size_t NDOC = 600, DOCLEN = 50, TRAIN = NDOC * DOCLEN;
+    std::vector<std::uint64_t> docs;
+    for (std::uint64_t d = 0; d < NDOC; ++d) docs.push_back(d * DOCLEN);
+    const double f = 0.1;
+    const std::uint64_t seed = 555u;
+    std::mt19937 rng(31337u);
+    for (int i = 0; i < 4000; ++i) {
+        const sub0::Window w = sub0::sample_window(rng, 8, TRAIN, docs, f, seed);
+        const std::size_t k = sub0::doc_of(docs, w.start);
+        CHECK(sub0::doc_in_subset(k, seed, f));                       // from a selected document
+        CHECK(w.start + static_cast<std::size_t>(w.len) <= docs[k] + DOCLEN);   // and inside it
+    }
 }

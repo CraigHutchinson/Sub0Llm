@@ -21,7 +21,8 @@
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int steps, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, const char* blend_config_path,
-                                int replace_schedule, int allow_concurrent);
+                                int replace_schedule, int allow_concurrent,
+                                double corpus_fraction, unsigned subset_seed);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -53,6 +54,8 @@ inline int run_train(int argc, char** argv) {
     int   train_steps = 0, train_batch = 0;
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
+    double   train_corpus_fraction = 1.0;   // 1 = the whole corpus (see --corpus-fraction)
+    unsigned train_subset_seed = 0;
     std::string train_keep = "3";
     int train_optimizer = 1;   // 1=muon (hidden 2D matrices on Muon) + adamw (everything else) -- the proven
                                // default (project memory arch-features-off-by-default); --optimizer adamw opts out
@@ -83,6 +86,18 @@ inline int run_train(int argc, char** argv) {
         app.add_option("--lr", train_lr, "Learning rate (default: 0.001 scaled by sqrt(batch/8))")
            ->capture_default_str();
     app.add_option("--seed", train_seed, "RNG seed")->capture_default_str();
+    app.add_option("--corpus-fraction", train_corpus_fraction,
+                   "Train on a distributed FRACTION of the base corpus's documents (0<f<=1; 1 = all). "
+                   "Documents are selected by a hash of their index, so the subset is spread across the "
+                   "whole corpus rather than being a prefix -- an unshuffled corpus's first 25% is not "
+                   "25% of its distribution. Deterministic in (--subset-seed, f), so a run reproduces "
+                   "from those two numbers with no subset file; nested, so 10/25/50/100% is a real "
+                   "learning curve; and the UNSELECTED documents are a held-out set by construction.")
+       ->check(CLI::Range(0.0, 1.0))->capture_default_str();
+    app.add_option("--subset-seed", train_subset_seed,
+                   "Which subset --corpus-fraction selects. Separate from --seed on purpose: it keeps "
+                   "the DATA fixed while the init/shuffle seed varies, which is what a fair A/B needs.")
+       ->capture_default_str();
     app.add_option("--keep", train_keep,
                    "Progress-named checkpoints to retain (N, or ALL to keep every stage)")->capture_default_str();
     app.add_option("--optimizer", train_optimizer,
@@ -133,7 +148,8 @@ inline int run_train(int argc, char** argv) {
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
                             train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
                             resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0,
-                            train_allow_concurrent ? 1 : 0);
+                            train_allow_concurrent ? 1 : 0,
+                            train_corpus_fraction, train_subset_seed);
 }
 
 // --- gen -------------------------------------------------------------------
