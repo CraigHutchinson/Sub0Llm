@@ -1720,8 +1720,24 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // (LLP64 Windows) -- casting it to long wrapped NEGATIVE, collapsing epoch_steps to 1 (so the run
     // stopped after MAX_EPOCHS_BACKSTOP *steps* and evaluated every step). Compute in size_t, then
     // narrow the (bounded, < 2^31) step count.
+    // An EPOCH is one pass over the data actually being TRAINED ON, so --corpus-fraction has to scale
+    // it. Without this the clock stayed keyed to the whole corpus: at --corpus-fraction 0.8 the run
+    // reported "1 epoch" after drawing enough windows for the FULL corpus, i.e. after ~1.25 real
+    // passes over the selected 80%. Everything downstream keys off epoch_steps -- eval warmup, eval
+    // interval, LR warmup, the MAX_EPOCHS_BACKSTOP budget and the plateau logic -- so all of them were
+    // stretched by 1/fraction, and the wall-clock-per-epoch a run is planned around was simply wrong.
+    //
+    // Scaling by the fraction rather than counting the selected tokens exactly is deliberate and
+    // unbiased: doc_in_subset() selects on a hash of the document INDEX, independently of that
+    // document's length, so the expected selected-token share is exactly `fraction`. Counting exactly
+    // would need the document index here, which is not built until the sources are constructed below,
+    // and the comment above already establishes this schedule as heuristic and plateau-stopped.
+    const std::size_t epoch_tokens =
+        (corpus_fraction >= 1.0)
+            ? est_train_tokens
+            : static_cast<std::size_t>(static_cast<double>(est_train_tokens) * corpus_fraction);
     epoch_steps  = static_cast<long>(std::max<std::size_t>(
-        1, (est_train_tokens + tokens_per_step - 1) / tokens_per_step));
+        1, (epoch_tokens + tokens_per_step - 1) / tokens_per_step));
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
     const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
