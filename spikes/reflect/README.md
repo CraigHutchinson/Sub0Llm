@@ -1,6 +1,9 @@
 # Reflection spike — can P2996 delete registry.hpp's serialization boilerplate?
 
-**Status: written, NOT YET COMPILED.** Read the "Honest status" section before trusting any of it.
+**Status: COMPILED AND RUN, clean, first attempt.** Validated 2026-07-28 on Compiler Explorer's
+`clang_bb_p2996` ("x86-64 clang (reflection - C++26)", the Bloomberg fork) with
+`-std=c++26 -freflection-latest`: compile exit 0, zero diagnostics, program exit 0, both
+`static_assert`s on field count satisfied, and the expected JSON on stdout for BOTH structs.
 
 Throwaway, per `AGENTS.md` §11. Not built by CMake, not on any include path, nothing in `src/` or
 `include/` depends on it. It either gets merged into the mainline or deleted.
@@ -49,18 +52,34 @@ Cheapest first.
 2. **Build the fork** — clone `bloomberg/clang-p2996`, branch `p2996`, build clang only. Hours and
    several GB. Only worth it if step 1 shows the design is right and a larger port is planned.
 
-## Honest status of the code
+## Validated status
 
-Written against the P2996R13 paper's API — `nonstatic_data_members_of(^^T, access_context::current())`,
-`identifier_of`, the `obj.[:mem:]` splice, `template for`. **It has never been through a compiler.**
-Expect the first pass to need fixes; treat the *shape* as the deliverable, not the syntax.
+Compiled and executed on `clang_bb_p2996` via the Compiler Explorer API. **No fixes were needed** --
+all three things this section previously flagged as uncertain turned out fine:
 
-Specifically uncertain, flag on first compile:
-- Whether `define_static_array` is needed to make the member range usable in `template for`, or
-  whether the fork accepts `nonstatic_data_members_of(...)` directly.
-- Whether `access_context::current()` at namespace scope in a template gives the access needed for
-  a caller-supplied `T`.
-- `identifier_of` returns `string_view`; whether it streams and compares as written.
+- `define_static_array` around `nonstatic_data_members_of(...)` works and is what makes the range
+  usable in `template for`.
+- `access_context::current()` at namespace scope inside a template gives the access needed for a
+  caller-supplied `T`.
+- `identifier_of`'s `string_view` streams and compares as written.
+
+So all three questions are answered:
+
+- **Q1 (does it keep single-source-of-truth?)** Yes. The struct is the only declaration; writer and
+  reader derive from it. Strictly stronger than the X-macro, which needs a macro row per field.
+- **Q2 (more readable, or just different?)** More readable. `to_json` is ~12 lines and reads as a
+  loop over fields; the X-macro version is a 24-row list plus three expansion macros.
+- **Q3 (does it subsume the OTHER field list?)** Yes, and this was the prize. `RunState` gets the
+  same two functions at **zero marginal cost** -- no new code at all, which the run output shows.
+
+### An accidental confirmation of a real design decision
+
+The spike prints `arch_id` as `13804672438013794288` because it deliberately omits the name-keyed
+hex special case the production writer has. That value is `0xbf940c712c7017f0` -- **larger than
+2^53**. It is exactly the case `write_state`'s comment warns about: a JSON reader that lands integers
+in a double would silently corrupt it, and `arch_id` is the ONE thing `compatible()` consults. The
+spike demonstrating the failure mode by omission is a good argument for keeping the hex-string
+encoding when this is eventually ported.
 
 ## What it would replace, measured
 
