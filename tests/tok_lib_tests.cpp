@@ -179,6 +179,24 @@ TEST_CASE("encode word cache: memoised words match their stand-alone encoding (a
                            big_got.begin() + static_cast<std::ptrdiff_t>(r) * static_cast<std::ptrdiff_t>(want.size())));
 }
 
+// The decode/encode marker contract is a single kMarkerSpecs table; reserved-headroom ids are INERT
+// rows. That path is NOT reachable through the round-trip fuzz (encode never EMITS a reserved marker),
+// so pin it directly: a model can sample a reserved id, and detokenize must treat it as a pure no-op --
+// emit no byte, and leave the surrounding reconstruction (pending space, casing) untouched -- never a
+// wrapped-around byte. Splicing one into a real id stream must not change the decoded text at all.
+TEST_CASE("JOIN scheme: a reserved-headroom marker decodes inertly", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::vector<int> ids = sub0::tok::encode(t, "The cat sat quietly.");
+    const std::string      ref = sub0::tok::detokenize(t, ids);
+    for (const int rid : {sub0::casing::TOK_RESERVED_4, sub0::casing::TOK_UNCOMBINE, sub0::casing::TOK_COMBINE_END}) {
+        for (std::size_t at : {std::size_t{0}, ids.size() / 2, ids.size()}) {   // start / middle / end
+            std::vector<int> spliced = ids;
+            spliced.insert(spliced.begin() + static_cast<std::ptrdiff_t>(at), rid);
+            REQUIRE(sub0::tok::detokenize(t, spliced) == ref);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  JOIN / implicit-space scheme
 // ---------------------------------------------------------------------------

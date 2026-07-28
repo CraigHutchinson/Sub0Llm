@@ -436,7 +436,60 @@ constexpr int glue_marker_for(int byte) {
         default:  return -1;
     }
 }
-constexpr bool is_close_bracket(int byte) { return byte == ')' || byte == ']' || byte == '}'; }
+
+// Single source of truth for what each JOIN-scheme marker DOES: the exact bytes it decodes to and its
+// effect on the decoder's three state flags. detokenize_join walks this table instead of a per-marker
+// switch, and encode_join derives each marker's pending-space effect from the SAME row (emit_marker),
+// so the two halves of the round-trip can no longer silently disagree about a marker -- the exact bug
+// class the fuzz net exists to catch (e.g. the WS5b open/close `dps` inversion, §5.9). Adding a special
+// becomes one row here plus its encode-side selection, not mirrored edits in two switch statements.
+// See docs/TOKENIZER_REVIEW.md §2.
+//
+// Indexed by `id - TOK_EOS` over the whole marker range [TOK_EOS, TOK_MARKER_COUNT). Reserved-headroom
+// ids (no assigned meaning yet) stay default-constructed = INERT: no bytes, no state change -- exactly
+// the old reserved-headroom no-op, so a model that samples one can't emit a wrapped-around byte.
+// State sentinels: dps / in_spell are -1 = "leave unchanged", else 0/1 to set; recase is -1 =
+// unchanged, else a Recase value. `lead_space` emits one pending space before the literal iff `dps`.
+struct MarkerSpec {
+    std::string_view literal;              // bytes emitted on decode ("" for pure state markers / inert)
+    bool             lead_space = false;   // emit ' ' before `literal` if a space is pending
+    signed char      dps        = -1;      // pending-space AFTER (-1 keep, 0 false, 1 true)
+    signed char      recase     = -1;      // -1 keep, else static_cast<Recase>(recase)
+    signed char      in_spell   = -1;      // spell-group state AFTER (-1 keep, 0 false, 1 true)
+};
+
+constexpr auto kMarkerSpecs = [] {
+    constexpr signed char keep = -1, off = 0, on = 1;
+    constexpr signed char none = static_cast<signed char>(Recase::None);
+    constexpr signed char capf = static_cast<signed char>(Recase::CapFirst);
+    constexpr signed char upw  = static_cast<signed char>(Recase::UpWord);
+    std::array<MarkerSpec, static_cast<std::size_t>(TOK_MARKER_COUNT - TOK_EOS)> a{};
+    auto row = [&](int id, MarkerSpec s) { a[static_cast<std::size_t>(id - TOK_EOS)] = s; };
+    //          marker            literal          lead   dps   recase in_spell
+    row(TOK_JOIN,         {"",              false, off,  keep, keep});   // cancel a pending space (glue)
+    row(TOK_NEWLINE,      {"\n",            false, off,  none, keep});
+    row(TOK_PARA,         {"\n\n",          false, off,  none, keep});
+    row(TOK_EOS,          {"<|endoftext|>", true,  off,  none, keep});
+    row(TOK_TURN_START,   {"<|im_start|>",  true,  off,  none, keep});
+    row(TOK_TURN_END,     {"<|im_end|>",    true,  off,  none, keep});
+    row(TOK_SPACE2,       {"  ",            false, off,  none, keep});
+    row(TOK_SPACE4,       {"    ",          false, off,  none, keep});
+    row(TOK_TAB2,         {"\t\t",          false, off,  none, keep});
+    row(TOK_TAB4,         {"\t\t\t\t",      false, off,  none, keep});
+    row(TOK_CAP,          {"",              false, keep, capf, keep});   // recase only; no bytes, dps untouched
+    row(TOK_UP,           {"",              false, keep, upw,  keep});
+    row(TOK_ODQUOTE,      {"\"",            true,  off,  none, keep});
+    row(TOK_CDQUOTE,      {"\"",            false, on,   none, keep});
+    row(TOK_SPELL_START,  {"",              true,  off,  keep, on});     // recase carries INTO the group
+    row(TOK_SPELL_END,    {"",              false, on,   none, off});
+    row(TOK_GLUE_OPAREN,  {"(",             false, off,  keep, keep});   // recase deliberately untouched (§5.9)
+    row(TOK_GLUE_CPAREN,  {")",             false, on,   keep, keep});
+    row(TOK_GLUE_OBRACKET,{"[",             false, off,  keep, keep});
+    row(TOK_GLUE_CBRACKET,{"]",             false, on,   keep, keep});
+    row(TOK_GLUE_OBRACE,  {"{",             false, off,  keep, keep});
+    row(TOK_GLUE_CBRACE,  {"}",             false, on,   keep, keep});
+    return a;
+}();
 
 // JOIN-scheme encode. `stream` is the truecased byte+marker stream. The encoder mirrors the
 // decoder's pending-space state `dps` so it emits exactly the tokens that reconstruct the text:
@@ -469,6 +522,13 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
     if (n > 1024) word_cache.reserve(n / 32);
     std::string word_key;
     auto emit_byte = [&](int b) { out.push_back(b); };  // base id == byte value
+    // Emit a marker and apply its pending-space effect from the SAME kMarkerSpecs row the decoder
+    // walks -- so the encoder can never assume a `dps` outcome the decoder won't reproduce (e.g. the
+    // open/close bracket direction, which used to be a hand-written is_close_bracket() on this side).
+    auto emit_marker = [&](int id) {
+        out.push_back(id);
+        if (const signed char d = kMarkerSpecs[static_cast<std::size_t>(id - TOK_EOS)].dps; d >= 0) dps = (d != 0);
+    };
     // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
     // implicit (free) under a pending space; an empty inter-content gap glues with JOIN; any
     // other run is tiled into NEWLINE/PARA + run-length SPACE2/4 / TAB2/4 tokens, with a verbatim
@@ -521,8 +581,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
                 if (g + lm.text.size() <= n &&
                     std::equal(lm.text.begin(), lm.text.end(), stream.begin() + static_cast<std::ptrdiff_t>(g))) {
                     tile_ws(i, g, /*inter_content=*/true);
-                    out.push_back(lm.id);
-                    dps = false;
+                    emit_marker(lm.id);
                     i = g + lm.text.size();
                     matched = true;
                     break;
@@ -535,7 +594,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             const std::size_t gap = g - i;
             const bool after_glue = (g + 1 < n && !is_ws_byte(stream[g + 1]));
             if (gap == 1 && stream[i] == ' ' && dps && after_glue) {  // ` "x` -> OPEN
-                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
+                emit_marker(TOK_ODQUOTE); i = g + 1; continue;
             }
             // Line-initial opening quote (measured on real TinyStories dialogue: 55389/576762 = 9.6%
             // of ALL quote occurrences -- 87.8% of the fallback total, by far the dominant miss, see
@@ -549,11 +608,11 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             // own NEWLINE case sets it), so this is a pure win with NO decode-side change needed --
             // it just recognizes a case the generic OPEN check couldn't reach.
             if (gap == 1 && stream[i] == '\n' && after_glue) {  // "\n\"x" -> NEWLINE, then OPEN
-                out.push_back(TOK_NEWLINE);
-                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
+                emit_marker(TOK_NEWLINE);
+                emit_marker(TOK_ODQUOTE); i = g + 1; continue;
             }
             if (gap == 0 && dps && !after_glue) {                     // `x" ` -> CLOSE
-                out.push_back(TOK_CDQUOTE); dps = true; i = g + 1; continue;
+                emit_marker(TOK_CDQUOTE); i = g + 1; continue;
             }
             // else: fall through to the bare-quote path
         }
@@ -568,8 +627,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         // marker leaves `dps` true (closing brackets are typically followed by a space in real
         // prose/code, ") the" / ") {"). See docs/TOKENIZER_REVIEW.md §5.9.
         if (const int gm = glue_marker_for(stream[g]); gm >= 0 && g == i && dps) {
-            out.push_back(gm);
-            dps = is_close_bracket(stream[g]);   // open -> false (glue-after too); close -> true
+            emit_marker(gm);   // spec row carries the open/close pending-space direction
             i = g + 1;
             continue;
         }
@@ -598,9 +656,9 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             // exactly that false positive, not a genuine 2-piece split -- see docs/TOKENIZER_DESIGN.md).
             // TOK_JOIN now means general glue ONLY, never a word boundary.
             if (N >= 2) {
-                out.push_back(TOK_SPELL_START);
+                emit_marker(TOK_SPELL_START);
                 for (int id : sub) out.push_back(id);
-                out.push_back(TOK_SPELL_END);
+                emit_marker(TOK_SPELL_END);
             } else {                                    // common single-token word
                 for (int id : sub) out.push_back(id);
             }
@@ -623,50 +681,21 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
     const std::size_t m = ids.size();
     for (std::size_t k = 0; k < m; ++k) {
         const int id = ids[k];
-        // Markers occupy a small, dense, compile-time-constant range (TOK_EOS..TOK_MARKER_COUNT-1)
-        // -- a switch here is a jump table the compiler can verify at compile time, unlike an
-        // if-chain against runtime fields. Ordinary content (piece ids >= n_base, or a raw byte
-        // < 256) is the overwhelmingly common case and falls straight to `default`.
-        switch (id) {
-            case TOK_JOIN:        dps = false; continue;
-            case TOK_NEWLINE:     out += '\n';   dps = false; recase = Recase::None; continue;
-            case TOK_PARA:        out += "\n\n"; dps = false; recase = Recase::None; continue;
-            case TOK_EOS:         if (dps) out += ' '; out += "<|endoftext|>"; dps = false; recase = Recase::None; continue;
-            case TOK_TURN_START:  if (dps) out += ' '; out += "<|im_start|>";  dps = false; recase = Recase::None; continue;
-            case TOK_TURN_END:    if (dps) out += ' '; out += "<|im_end|>";    dps = false; recase = Recase::None; continue;
-            case TOK_SPACE2:      out += "  ";       dps = false; recase = Recase::None; continue;
-            case TOK_SPACE4:      out += "    ";     dps = false; recase = Recase::None; continue;
-            case TOK_TAB2:        out += "\t\t";     dps = false; recase = Recase::None; continue;
-            case TOK_TAB4:        out += "\t\t\t\t"; dps = false; recase = Recase::None; continue;
-            case TOK_CAP:         recase = Recase::CapFirst; continue;
-            case TOK_UP:          recase = Recase::UpWord;   continue;
-            case TOK_ODQUOTE:     if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue;
-            case TOK_CDQUOTE:     out += '"'; dps = true; recase = Recase::None; continue;
-            case TOK_SPELL_START: if (dps) out += ' '; in_spell = true; dps = false; continue;
-            case TOK_SPELL_END:   in_spell = false; dps = true; recase = Recase::None; continue;
-            // WS5b bracket glue: unlike the quote/EOS markers above, these never check `dps` for a
-            // leading space -- encode only ever emits one when the bracket was ALREADY glued (gap==0
-            // && dps), so a leading space would be wrong by construction, not just unnecessary. Open
-            // markers clear dps (content right inside typically glues too); close markers leave it
-            // true (typically followed by a space). recase is deliberately left untouched (brackets
-            // don't interact with case markers in this encoder's own output).
-            case TOK_GLUE_OPAREN:   out += '('; dps = false; continue;
-            case TOK_GLUE_CPAREN:   out += ')'; dps = true;  continue;
-            case TOK_GLUE_OBRACKET: out += '['; dps = false; continue;
-            case TOK_GLUE_CBRACKET: out += ']'; dps = true;  continue;
-            case TOK_GLUE_OBRACE:   out += '{'; dps = false; continue;
-            case TOK_GLUE_CBRACE:   out += '}'; dps = true;  continue;
-            default: break;
+        // Every id in the fixed marker range [TOK_EOS, TOK_MARKER_COUNT) is fully described by
+        // kMarkerSpecs: decode is a walk of {leading space?, literal bytes, dps/recase/in_spell
+        // effect} -- the SAME table encode_join reads via emit_marker, so the two halves can't drift.
+        // Reserved-headroom ids are INERT rows (no bytes, no state change) = the old reserved-headroom
+        // no-op, so a model that samples one emits nothing, never a wrapped-around byte. Ordinary
+        // content (piece ids >= n_base, or a raw byte < 256) falls straight past this to the tail.
+        if (id >= TOK_EOS && id < TOK_MARKER_COUNT) {
+            const MarkerSpec& s = kMarkerSpecs[static_cast<std::size_t>(id - TOK_EOS)];
+            if (s.lead_space && dps) out += ' ';
+            out += s.literal;
+            if (s.dps      >= 0) dps      = (s.dps != 0);
+            if (s.recase   >= 0) recase   = static_cast<Recase>(s.recase);
+            if (s.in_spell >= 0) in_spell = (s.in_spell != 0);
+            continue;
         }
-        // A marker id inside the fixed scheme range with no case above: reserved headroom the
-        // format has a base_symbol/expansion row for but no assigned effect yet (see casing.hpp's
-        // TOK_RESERVED_* comment). Its expansion is a single "byte" whose code is its own id
-        // (>255) -- falling through to the generic content path below would truncate that to
-        // `static_cast<unsigned char>`, emitting a wrong, wrapped-around byte instead of nothing.
-        // A trained model CAN sample one of these (they're real embedding/output rows), so this
-        // guard is reachable at gen time, not just a paranoia check. No-op until a future
-        // workstream assigns the id a real case above.
-        if (id >= TOK_EOS && id < TOK_MARKER_COUNT) continue;
         if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
             out += static_cast<char>(id); dps = false; recase = Recase::None; continue;
         }
