@@ -23,8 +23,9 @@ So this is **not** a correctness fix. Three narrower questions:
 (3) is the real prize. `config.json` is already safe. `state.json` is not, and it is the same shape
 of bug this repo already ate once.
 
-## Why it cannot be compiled here
+## Why it cannot be compiled LOCALLY
 
+It compiles fine on the fork (above) — just not with the toolchain this project builds with.
 Measured on this machine, not recalled:
 
 | | Result |
@@ -85,18 +86,25 @@ encoding when this is eventually ported.
 
 - 24-row X-macro list + 3 expansion macros (`_DECL`, `_WRITE`, `_READ`)
 - `enum_name`/`enum_parse` string-keyed tables (P3394 annotations are the reflection-native answer)
-- `write_state`/`read_state`'s two hand-written 9-field lists — **not covered by the X-macro today**
+- ~~`write_state`/`read_state`'s two hand-written 9-field lists~~ — **already fixed** in `0c4776b`
+  by giving `RunState` its own X-macro. This was Q3, and it did not wait for reflection.
 
 Net: two generic functions (`to_json`, `from_json_field`) plus one `emit`/`parse_scalar` overload per
 *type* rather than per *field*, serving both structs and any future one at zero marginal cost.
 
-## Recommendation before spending real time
+## Recommendation
 
-The X-macro already delivers the correctness property for `config.json`. The strongest near-term
-argument for reflection is **(3)** — and that can be had *today, without any toolchain change*, by
-folding `RunState` into its own X-macro the way `RunConfig` already is. If the goal is to stop
-`state.json` drifting, that is a same-day change on the current compiler.
+The design is validated; the blocker is production-readiness, not correctness.
 
-Reflection is then a readability and queryability win (`field_count` as a `static_assert`,
-annotations replacing name-keyed enum tables) rather than a correctness one — worth doing when
-upstream Clang ships P2996, not worth building an experimental LLVM fork for.
+**Q3 was acted on immediately and did NOT wait for reflection**: `RunState` now has its own X-macro
+(`0c4776b`), capturing the entire correctness win on the current compiler. That was the right call —
+it removed a real drift risk the same day instead of parking it behind a toolchain migration.
+
+What remains for reflection is readability and queryability — `field_count()` as a `static_assert`,
+P3394 annotations replacing the name-keyed `enum_name`/`enum_parse` tables, and one fewer macro to
+understand. Real, but not urgent. Take it when upstream Clang ships P2996; do **not** build the
+experimental fork to get there early, since its own README forbids production artifacts.
+
+**Retirement condition** (`AGENTS.md` §11): delete this directory once upstream Clang supports P2996
+and the port lands, or if the approach is abandoned. It has already served its purpose — it answered
+all three of its questions, and one of the answers has shipped.
