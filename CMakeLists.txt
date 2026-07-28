@@ -16,7 +16,30 @@ project(sub0llm VERSION 0.1.0 LANGUAGES CXX)
 #                           --->  libsub0_gen   (shared)   >--> sub0llm (driver)
 # ---------------------------------------------------------------------------
 
-set(CMAKE_CXX_STANDARD 23)
+# C++26, adopted deliberately ahead of full compiler support: this project tracks the newer standard
+# and refactors toward it, rather than settling on C++23 and migrating later under pressure. The
+# whole tree builds and both suites pass at -std=c++26 on clang today (verified at the bump: engine
+# 1774719/125, frontend 113132/155). Reflection (P2996) is the eventual prize -- see
+# spikes/reflect/ -- but upstream clang has not shipped it yet, so nothing here depends on it.
+#
+# IMPORTANT, and the one real constraint this creates: the CUDA translation unit cannot follow.
+# nvcc forces its own `--std` onto the HOST compiler for the unit it drives, and on THIS platform
+# that dialect tops out at c++20 -- measured, not assumed:
+#
+#     nvcc 13.2.78 -std=c++23  ->  nvcc fatal: Value 'c++23' is not defined for option 'std'
+#
+# and identically with `-ccbin clang++`, so it is nvcc's own baked-in list, not the host compiler's
+# capability. NVIDIA's C++ language-support appendix does document `--std=c++23`, but its own
+# requirements table qualifies it: GCC >= 14 / Clang >= 18 / nvc++ >= 24.3, and "Microsoft Visual
+# Studio is not supported for C++23". That is a Linux-host statement; Windows nvcc does not offer it.
+# Re-test the two lines above after a CUDA upgrade rather than trusting either this comment or the
+# docs -- when it starts compiling, raise CUDA_STANDARD and delete this paragraph.
+#
+# So every header reachable from src/backend_cuda.cu -- layout.hpp, core.hpp, memplan.hpp and what
+# they pull in -- must stay C++20-compatible. Put C++23/26-only constructs in .cpp files, or in
+# headers the .cu never sees. A violation surfaces as a confusing nvcc host-compilation error deep
+# in a header, not a clean "unsupported feature" message, so it is worth knowing the rule up front.
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
