@@ -71,13 +71,44 @@
 
 namespace sub0::registry {
 
-// One model's metadata, as `read_state` assembles it from BOTH files in the directory. The [state]
-// and [config] tags mark which file writes each field -- no field is written by both, which is the
-// whole point of the split. To add an architecture or recipe field, add a SUB0_RUN_CONFIG_FIELDS row
-// and a merge line in read_state; do NOT add a second writer here.
-struct ModelMeta {
-    // [state.json] provenance + progress of the run that produced this snapshot.
-    std::string git_sha, created, updated, status;
+// --- RunState: the single source of truth for state.json, exactly as RunConfig is for config.json --
+//
+// One row per field, expanded three ways below (members, writer, reader) -- so the writer and the
+// reader cannot disagree, and adding a field is one edit.
+//
+// This list used to be hand-written in BOTH write_state and read_state, which is the same shape of
+// bug as the meta.txt/config.json duplication those two replaced: a second copy of a field list is
+// the copy that goes stale. config.json was already safe (this X-macro pattern is why it learned
+// n_kv_heads / LoopSplit / rope automatically); state.json was not, until now.
+//
+// `arch_id` is serialized as a hex STRING rather than a JSON number -- see write_state -- so it is
+// special-cased by NAME in the field helpers, exactly as the enum-valued RunConfig fields already
+// are. Same precedent, no new mechanism.
+#define SUB0_RUN_STATE_FIELDS(X)                   \
+    X(std::string,        git_sha,        "")      \
+    X(std::string,        created,        "")      \
+    X(std::string,        updated,        "")      \
+    X(std::string,        status,         "")      \
+    X(unsigned long long, arch_id,        0ull)    \
+    X(long long,          steps,          0)       \
+    X(double,             epochs,         0.0)     \
+    X(long long,          tokens_seen,    0)       \
+    X(double,             best_val_nelbo, -1.0)
+
+struct RunState {
+#define SUB0_RUN_STATE_DECL(type, name, def) type name = def;
+    SUB0_RUN_STATE_FIELDS(SUB0_RUN_STATE_DECL)
+#undef SUB0_RUN_STATE_DECL
+};
+
+// One model's metadata, as `read_state` assembles it from BOTH files in the directory. It INHERITS
+// the state.json fields rather than restating them, so `m.steps` still reads exactly as before at
+// every call site while there remains exactly one declaration of what state.json contains.
+//
+// The fields declared here are the [config.json] half: merged in by read_state for display and
+// filtering, never written back. To add an architecture or recipe field, add a
+// SUB0_RUN_CONFIG_FIELDS row and a merge line in read_state; do NOT add a second writer.
+struct ModelMeta : RunState {
     // [config.json] architecture + recipe, merged in for display and filtering only.
     std::string corpus;
     int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0, ternary = 0;
@@ -86,20 +117,16 @@ struct ModelMeta {
     int tied_embeddings = 0;                  // 0 = untied head (legacy default), 1 = head reuses tok_emb
     int qk_norm = 0;                          // 0 = no QK-norm (legacy default), 1 = per-head RMSNorm on Q/K
     int optimizer = 0;                        // 0 = AdamW (legacy default), 1 = Muon (hidden 2D matrices)
-    // Full architecture identity (sub0::MODEL_ARCH_ID) -- the ONLY thing compatible() consults, and
-    // the only architecture value state.json carries in its own right. 0 means "no state.json field",
-    // which compatible() treats as incompatible rather than guessing from the merged fields below.
-    unsigned long long arch_id = 0;
-    // [state.json] how far this run got.
-    long long steps = 0;                      // optimizer iterations completed
-    double epochs = 0.0;                      // fractional epochs of the corpus covered
-    long long tokens_seen = 0;                // approximate tokens consumed (steps * batch * seq)
-    double best_val_nelbo = -1.0;             // -1 = not yet evaluated
     // [config.json] what it was asked to do.
     int batch = 0;                            // minibatch size
     double lr = 0.0;                          // learning rate
     unsigned seed = 0;                        // RNG seed (for reproducibility)
-    std::filesystem::path dir;                // the model's directory (set by scan)
+    // Not from either file: filled in by scan()/read_state from the path it just read.
+    std::filesystem::path dir;
+    // NOTE: git_sha/created/updated/status/arch_id/steps/epochs/tokens_seen/best_val_nelbo are
+    // inherited from RunState above -- declared once, in SUB0_RUN_STATE_FIELDS. `arch_id` in
+    // particular is the ONLY thing compatible() consults; 0 means "no such field in state.json",
+    // which it treats as incompatible rather than guessing from the merged config fields.
 };
 
 // --- RunConfig: the single source of truth for a model directory's TRAINING RECIPE -------------
@@ -187,9 +214,31 @@ inline void json_write(std::ostream& os, const std::string& v) {
     }
     os << '"';
 }
-inline void json_write(std::ostream& os, int v)      { os << v; }
-inline void json_write(std::ostream& os, unsigned v) { os << v; }
-inline void json_write(std::ostream& os, double v)   { os << v; }
+inline void json_write(std::ostream& os, int v)                { os << v; }
+inline void json_write(std::ostream& os, unsigned v)           { os << v; }
+inline void json_write(std::ostream& os, double v)             { os << v; }
+inline void json_write(std::ostream& os, long long v)          { os << v; }
+inline void json_write(std::ostream& os, unsigned long long v) { os << v; }
+
+// One RunState field, dispatched by NAME so the writer macro stays uniform -- the same shape
+// json_write_field already uses to print the enum-valued RunConfig fields as names.
+//
+// `arch_id` is the only special case: it is emitted as a hex STRING rather than a JSON number,
+// because it is a 64-bit IDENTITY rather than a quantity and a great many JSON readers land integers
+// in a double, where exactness stops at 2^53 -- a silently truncated arch_id would make two different
+// architectures compare equal. Hex also reads directly against the model directory's own _a<hex> tag,
+// which is this value's low 32 bits.
+template <class T>
+void json_write_state_field(std::ostream& os, std::string_view, const T& v) { json_write(os, v); }
+inline void json_write_state_field(std::ostream& os, std::string_view field, unsigned long long v) {
+    if (field == "arch_id") {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%016llx", v);
+        json_write(os, std::string(buf));
+    } else {
+        json_write(os, v);
+    }
+}
 
 // The enum-valued RunConfig fields print as NAMES (pos_encoding=rope, optimizer=muon, gated_ffn=on, ...)
 // for readability; every other field stays numeric. The int<->name mapping lives HERE only; the reader
@@ -353,21 +402,19 @@ inline void write_state(const std::filesystem::path& dir, const ModelMeta& m) {
     std::error_code ec; std::filesystem::create_directories(dir, ec);
     std::ofstream os(dir / "state.json", std::ios::trunc);
     if (!os) return;
+    // Generated from SUB0_RUN_STATE_FIELDS -- the same list read_state reads, so the two cannot
+    // disagree about what state.json contains. `first` handles the comma so field ORDER can change
+    // (or a field be added anywhere in the list) without anyone having to move a trailing comma.
     os << "{\n";
-    os << "  \"git_sha\": ";  detail::json_write(os, m.git_sha); os << ",\n";
-    os << "  \"created\": ";  detail::json_write(os, m.created); os << ",\n";
-    os << "  \"updated\": ";  detail::json_write(os, m.updated); os << ",\n";
-    os << "  \"status\": ";   detail::json_write(os, m.status);  os << ",\n";
-    // arch_id as a hex STRING, not a JSON number: it is a 64-bit identity rather than a quantity, and
-    // a great many JSON readers land integers in a double, where exactness stops at 2^53. Hex also
-    // reads directly against the directory name's own _a<hex> tag, which is this value's low 32 bits.
-    { char buf[24]; std::snprintf(buf, sizeof(buf), "%016llx", m.arch_id);
-      os << "  \"arch_id\": "; detail::json_write(os, std::string(buf)); os << ",\n"; }
-    os << "  \"steps\": "          << m.steps          << ",\n";
-    os << "  \"epochs\": "         << m.epochs         << ",\n";
-    os << "  \"tokens_seen\": "    << m.tokens_seen    << ",\n";
-    os << "  \"best_val_nelbo\": " << m.best_val_nelbo << "\n";
-    os << "}\n";
+    bool first = true;
+#define SUB0_RUN_STATE_WRITE(type, name, def)                       \
+    if (!first) os << ",\n";                                        \
+    first = false;                                                  \
+    os << "  \"" #name "\": ";                                      \
+    detail::json_write_state_field(os, #name, m.name);
+    SUB0_RUN_STATE_FIELDS(SUB0_RUN_STATE_WRITE)
+#undef SUB0_RUN_STATE_WRITE
+    os << "\n}\n";
 }
 
 // Reads <dir>/state.json (provenance + progress) AND <dir>/config.json (the architecture and the

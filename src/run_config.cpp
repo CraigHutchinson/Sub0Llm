@@ -38,6 +38,35 @@ bool json_read(simdjson::ondemand::value v, double& out) {
     out = d;
     return true;
 }
+bool json_read(simdjson::ondemand::value v, long long& out) {
+    int64_t i;
+    if (v.get_int64().get(i)) return false;
+    out = i;
+    return true;
+}
+bool json_read(simdjson::ondemand::value v, unsigned long long& out) {
+    uint64_t u;
+    if (v.get_uint64().get(u)) return false;
+    out = u;
+    return true;
+}
+
+// One RunState field, dispatched by NAME, mirroring registry.hpp's json_write_state_field so the two
+// halves special-case the same field for the same reason. `arch_id` is a hex STRING on disk (a 64-bit
+// identity, not a quantity -- see the writer), so it is parsed from text rather than read as a number.
+template <class T>
+bool json_read_state_field(simdjson::ondemand::value v, std::string_view, T& out) {
+    return json_read(v, out);
+}
+inline bool json_read_state_field(simdjson::ondemand::value v, std::string_view field,
+                                  unsigned long long& out) {
+    if (field != "arch_id") return json_read(v, out);
+    std::string hex;
+    if (!json_read(v, hex)) return false;
+    out = std::strtoull(hex.c_str(), nullptr, 16);
+    return true;
+}
+
 // Field-aware read: a non-int field defers to the type-dispatched json_read above; an INT field accepts
 // EITHER a number OR a named enum string (pos_encoding="rope", optimizer="muon", gated_ffn="on", ...), so a
 // named config.json AND an old numeric one both load. Peek the JSON type first (ondemand values are
@@ -101,19 +130,13 @@ bool read_state(const std::filesystem::path& dir, ModelMeta& m) {
         if (field.unescaped_key().get(key)) continue;
         simdjson::ondemand::value v;
         if (field.value().get(v)) continue;
-        if      (key == "git_sha") json_read(v, m.git_sha);
-        else if (key == "created") json_read(v, m.created);
-        else if (key == "updated") json_read(v, m.updated);
-        else if (key == "status")  json_read(v, m.status);
-        // Hex string, matching the writer -- see its comment on why this is not a JSON number.
-        else if (key == "arch_id") {
-            std::string hex;
-            if (json_read(v, hex)) m.arch_id = std::strtoull(hex.c_str(), nullptr, 16);
-        }
-        else if (key == "steps")          { std::int64_t x{}; if (!v.get_int64().get(x)) m.steps = x; }
-        else if (key == "tokens_seen")    { std::int64_t x{}; if (!v.get_int64().get(x)) m.tokens_seen = x; }
-        else if (key == "epochs")         { double x{}; if (!v.get_double().get(x)) m.epochs = x; }
-        else if (key == "best_val_nelbo") { double x{}; if (!v.get_double().get(x)) m.best_val_nelbo = x; }
+        // Generated from the SAME SUB0_RUN_STATE_FIELDS list write_state emits, so a field cannot be
+        // written and then not read back (or vice versa) -- which is exactly what a second,
+        // hand-maintained list eventually gets wrong.
+#define SUB0_RUN_STATE_READ(type, name, def) \
+        if (key == #name) { json_read_state_field(v, #name, m.name); continue; }
+        SUB0_RUN_STATE_FIELDS(SUB0_RUN_STATE_READ)
+#undef SUB0_RUN_STATE_READ
         // Unrecognized keys ignored, same forward tolerance read_config_json has.
     }
 
