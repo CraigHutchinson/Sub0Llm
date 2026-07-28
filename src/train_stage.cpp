@@ -1990,6 +1990,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // throughput is tracked directly as a running window count instead, snapshotted at each reset
     // point exactly like win_steps0/last_log_step are for steps.
     long long total_windows = 0, windows_at_win_t0 = 0, windows_at_last_log = 0;
+    // Tokens are snapshotted alongside windows because tok/s CANNOT be derived from win/s. The
+    // token-budget scheduler admits batch_t windows of seq_t tokens under batch_t*seq_t <= batch*SEQ_LEN,
+    // so a corpus of SHORT documents yields more, shorter windows per step: win/s rises while tok/s does
+    // not. Printing wps*SEQ_LEN assumed every window was a full SEQ_LEN and overstated throughput by
+    // SEQ_LEN/mean(seq_t) -- measured 2.35x on FineWeb-Edu (257,675 reported vs ~109,000 real), which is
+    // the number a run gets planned around. tokens_seen_est already accumulates batch_t*seq_t exactly;
+    // it just was not being differenced here.
+    long long tokens_at_win_t0 = 0, tokens_at_last_log = 0;
     bool stop = false, graceful_stop = false;
     // A device fault mid-run (a real hardware fault hit this exact codebase once already -- see
     // [[gpu-illegal-access-hardware-fault-not-code-bug]]): stops the loop WITHOUT touching the device
@@ -2298,6 +2306,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
             const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
+            const double tps   = secs > 0 ? static_cast<double>(tokens_seen_est - tokens_at_win_t0) / secs : 0.0;
             // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
 
             // Validation NELBO only once enough of the corpus has been seen.
@@ -2326,7 +2335,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 ? static_cast<double>(steps_to_next_epoch) * secs / steps_completed : -1.0;
             sub0::log::line("step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s)  {}",
                  step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n),
-                 wps, wps * SEQ_LEN, eval_str);
+                 wps, tps, eval_str);
             std::fflush(stdout);
 
             // Progress-named checkpoint + latest model every interval (covers warmup too); prune to
@@ -2345,7 +2354,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             run_loss = 0.0; run_n = 0;
             prep_secs = 0.0; train_secs = 0.0; opt_secs = 0.0;
             win_t0 = clock::now(); win_steps0 = step; windows_at_win_t0 = total_windows;
+            tokens_at_win_t0 = tokens_seen_est;
             last_log = win_t0; last_log_step = step; windows_at_last_log = total_windows;  // an eval counts as a log: reset the tick timer
+            tokens_at_last_log = tokens_seen_est;
             last_ckpt = win_t0;                               // ...and it checkpointed: reset the ckpt tick
         } else if (std::chrono::duration<double>(clock::now() - last_log).count() >= TICK_SECONDS) {
             // Interim heartbeat between evals: train loss (running avg since the last eval) +
@@ -2353,6 +2364,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // cadence (it is the expensive, plateau-driving measurement).
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>(total_windows - windows_at_last_log) / since : 0.0;
+            const double tps   = since > 0 ? static_cast<double>(tokens_seen_est - tokens_at_last_log) / since : 0.0;
             // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // ETA uses the rate over the CUMULATIVE window since the last eval (win_t0/win_steps0,
@@ -2376,10 +2388,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                     100.0 * opt_secs / section_total);
             }
             sub0::log::line("  ~ step {:>7}/{} [{:.2f} ep, next ep in {}]  train {:.4f}  {:.0f} win/s ({:.0f} tok/s){}",
-                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, wps * SEQ_LEN,
+                 step, max_steps, frac_epoch, format_eta(eta_next_epoch), run_loss / std::max(1, run_n), wps, tps,
                  breakdown);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step; windows_at_last_log = total_windows;
+            tokens_at_last_log = tokens_seen_est;
         }
 
         // Crash-resistance checkpoint on a wall-clock tick, independent of the (far rarer) eval
