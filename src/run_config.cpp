@@ -7,6 +7,8 @@
 
 #include <simdjson.h>
 
+#include <cstdlib>
+
 namespace sub0::registry {
 
 namespace {
@@ -72,9 +74,71 @@ bool read_config_json(RunConfig& c, const std::filesystem::path& dir) {
         SUB0_RUN_CONFIG_FIELDS(SUB0_RUN_CONFIG_READ)
 #undef SUB0_RUN_CONFIG_READ
         // An unrecognized key (a field from a future version of this schema, or a stray edit) is
-        // silently ignored -- same forward-compatible tolerance registry.hpp's read_meta already
-        // has for meta.txt.
+        // silently ignored, so a newer writer's file still loads here.
     }
+    return true;
+}
+
+// Reads state.json + config.json into one ModelMeta -- see the declaration in registry.hpp.
+//
+// The architecture and recipe fields come from config.json ALONE. The meta.txt this replaced carried
+// its own copies of fifteen of them, and that copy was the one that rotted: it never learned
+// n_kv_heads, LoopSplit's schedule or the rope parameters, because those were added to the
+// SUB0_RUN_CONFIG_FIELDS X-macro (which generates config.json) and nothing updated the hand-written
+// second writer. One writer per field is the fix; a more careful second writer is not.
+bool read_state(const std::filesystem::path& dir, ModelMeta& m) {
+    simdjson::padded_string json;
+    if (simdjson::padded_string::load((dir / "state.json").string()).get(json)) return false;
+
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(json).get(doc)) return false;
+    simdjson::ondemand::object obj;
+    if (doc.get_object().get(obj)) return false;
+
+    for (auto field : obj) {
+        std::string_view key;
+        if (field.unescaped_key().get(key)) continue;
+        simdjson::ondemand::value v;
+        if (field.value().get(v)) continue;
+        if      (key == "git_sha") json_read(v, m.git_sha);
+        else if (key == "created") json_read(v, m.created);
+        else if (key == "updated") json_read(v, m.updated);
+        else if (key == "status")  json_read(v, m.status);
+        // Hex string, matching the writer -- see its comment on why this is not a JSON number.
+        else if (key == "arch_id") {
+            std::string hex;
+            if (json_read(v, hex)) m.arch_id = std::strtoull(hex.c_str(), nullptr, 16);
+        }
+        else if (key == "steps")          { std::int64_t x{}; if (!v.get_int64().get(x)) m.steps = x; }
+        else if (key == "tokens_seen")    { std::int64_t x{}; if (!v.get_int64().get(x)) m.tokens_seen = x; }
+        else if (key == "epochs")         { double x{}; if (!v.get_double().get(x)) m.epochs = x; }
+        else if (key == "best_val_nelbo") { double x{}; if (!v.get_double().get(x)) m.best_val_nelbo = x; }
+        // Unrecognized keys ignored, same forward tolerance read_config_json has.
+    }
+
+    // Architecture + recipe: config.json is the only source. A directory without one is incomplete
+    // (an interrupted first run) rather than invalid -- the state above is still worth listing, so
+    // the fields below just stay at their ModelMeta defaults.
+    RunConfig c;
+    if (read_config_json(c, dir)) {
+        m.corpus          = c.corpus;
+        m.d_model         = c.d_model;
+        m.n_layers        = c.n_layers;
+        m.n_heads         = c.n_heads;
+        m.seq_len         = c.seq_len;
+        m.vocab           = c.vocab;
+        m.ternary         = c.ternary;
+        m.pos_encoding    = c.pos_encoding;
+        m.gated_ffn       = c.gated_ffn;
+        m.tied_embeddings = c.tied_embeddings;
+        m.qk_norm         = c.qk_norm;
+        m.optimizer       = c.optimizer;
+        m.batch           = c.batch;
+        m.lr              = c.lr;
+        m.seed            = c.seed;
+    }
+    m.dir = dir;
     return true;
 }
 

@@ -1139,7 +1139,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
-    // with a meta.txt, so `models` can discover it and prune incompatible ones. Resolved FIRST
+    // with a state.json, so `models` can discover it and prune incompatible ones. Resolved FIRST
     // (before touching the tokenizer/corpus) so the pinning below has somewhere to pin into.
     std::string model_path;
     std::filesystem::path meta_dir;
@@ -1170,10 +1170,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // doesn't mis-resolve the checkpoint to "<dir>.ckpt", silently start fresh, and nest a new dir.
         if (std::filesystem::is_directory(model_path))
             model_path = (std::filesystem::path(model_path) / "model.bin").string();
-        meta_dir = std::filesystem::path(model_path).parent_path();   // meta.txt/train.log beside the model
+        meta_dir = std::filesystem::path(model_path).parent_path();   // state.json/train.log beside the model
         // A BARE filename (no directory component, e.g. "myrun" instead of "myrun/model") resolves
         // meta_dir to empty -- every meta_dir-gated side effect below (train.log's own set_file tee,
-        // config.json/meta.txt/blend_schedule.json writes) then silently no-ops. The run itself is
+        // config.json/state.json/blend_schedule.json writes) then silently no-ops. The run itself is
         // unaffected (model.bin + checkpoints still save fine), but the result is invisible to `models`,
         // loses its recorded recipe, and -- for a content-embed/scratch run specifically -- can't be
         // regenerated with the right interceptor later without hand-reconstructing config.json from
@@ -1181,7 +1181,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // which needed exactly that manual reconstruction afterward). Warn loudly instead of letting it
         // pass silently -- this is a one-line, easy-to-miss CLI mistake, not a design choice to protect.
         if (meta_dir.empty())
-            sub0::log::warn("train: '{}' has no directory component -- config.json/meta.txt/"
+            sub0::log::warn("train: '{}' has no directory component -- config.json/state.json/"
                             "blend_schedule.json will NOT be written (only model.bin + checkpoints save). "
                             "This model won't show up in `models`, won't carry its recipe on resume, and "
                             "can't auto-enable content-embed/scratch on `gen` later. Use a directory-style "
@@ -1190,7 +1190,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // Two more explicit-path footguns, both hit for real this session (project memory
         // blended-scratch-op-capstone-validated): an explicit path whose directory component
         // resolves to the shared models ROOT itself, or to a directory another model already
-        // occupies. Either way config.json/meta.txt/blend_schedule.json/corpus.tok/tokenizer.tok --
+        // occupies. Either way config.json/state.json/blend_schedule.json/corpus.tok/tokenizer.tok --
         // all written per-DIRECTORY, not per-basename -- get silently shared/overwritten between
         // unrelated model names: launch model A here, then model B here too (different basename,
         // same directory), and B's run reads/writes A's config.json and pinned blend_schedule.json.
@@ -1224,7 +1224,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (ec) break;
                 const std::string name = de.path().filename().string();
                 if (name.compare(0, our_stem.size(), our_stem) == 0) continue;   // ours (weights/.stepN.ckpt)
-                if (name == "config.json" || name == "meta.txt" || name == "blend_schedule.json" ||
+                if (name == "config.json" || name == "state.json" || name == "blend_schedule.json" ||
                     name == "train.log" || name == "corpus.tok" || name == "tokenizer.tok") continue;
                 if (name.find(".ckpt") != std::string::npos) { foreign = name; break; }   // unambiguous
             }
@@ -1323,7 +1323,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // silently failed to open for a fresh explicit path; the pinning below has the same requirement).
     if (!meta_dir.empty()) { std::error_code ec; std::filesystem::create_directories(meta_dir, ec); }
     // Tee this run's progress into <model_dir>/train.log (append: a resume continues the same log),
-    // so a long/background run keeps its own trajectory next to the weights + meta.txt -- set up
+    // so a long/background run keeps its own trajectory next to the weights + state.json -- set up
     // before the tokenizer/corpus loading below so a startup failure there is captured too.
     if (!meta_dir.empty()) sub0::log::set_file((meta_dir / "train.log").string());
     sub0::log::line("model dir: {}", model_path);
@@ -1467,20 +1467,20 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::mt19937 rng(seed);
     RunState rs;
-    // tokens_seen (meta.txt, informational): seeded below once the resume block below settles
+    // tokens_seen (state.json, informational): seeded below once the resume block below settles
     // rs.step/batch to their final values (rs.step*batch*SEQ_LEN -- the same approximation used
     // before the token-budget scheduler existed, a reasonable carry-forward estimate on resume since
     // the exact historical per-step seq_t isn't in the checkpoint), then accumulated EXACTLY from
     // real per-step batch_t*seq_t for the rest of this invocation. Declared here (not where it's
-    // seeded) so write_meta's [&] capture below can see it.
+    // seeded) so write_state's [&] capture below can see it.
     long long tokens_seen_est = 0;
 
     // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
     // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
     // `batch`/`lr`/`seed` currently ARE (which the resume-reconciliation block below may have just
-    // adjusted), never a stale snapshot. `write_meta` below derives meta.txt's overlapping fields
-    // FROM this, instead of setting them a second, independent time -- one source, two artifacts,
-    // so they cannot drift apart from each other.
+    // adjusted), never a stale snapshot. It is the sole writer of the architecture and the recipe:
+    // `write_state` below records PROVENANCE and PROGRESS only, and `read_state` merges the recipe
+    // back in from config.json -- so there is exactly one writer per field and nothing to drift.
     auto build_run_config = [&] {
         sub0::registry::RunConfig cfg;
         cfg.corpus = sub0::registry::corpus_tag(sub0::default_corpus());
@@ -1508,27 +1508,21 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         return cfg;
     };
 
-    auto write_meta = [&](const char* status) {
+    auto write_state = [&](const char* status) {
         if (meta_dir.empty()) return;
-        const sub0::registry::RunConfig cfg = build_run_config();
-        sub0::registry::write_config_json(cfg, meta_dir);
+        // config.json first: it is the architecture + recipe, and state.json's arch_id below is only
+        // meaningful alongside it. Nothing here re-states a config field -- read_state merges them.
+        sub0::registry::write_config_json(build_run_config(), meta_dir);
         sub0::registry::ModelMeta m;
-        m.corpus = cfg.corpus;
-        m.d_model = cfg.d_model; m.n_layers = cfg.n_layers; m.n_heads = cfg.n_heads;
-        m.seq_len = cfg.seq_len; m.vocab = cfg.vocab; m.ternary = cfg.ternary;
-        m.pos_encoding = cfg.pos_encoding; m.gated_ffn = cfg.gated_ffn;
-        m.tied_embeddings = cfg.tied_embeddings; m.qk_norm = cfg.qk_norm;
-        m.optimizer = cfg.optimizer;
         m.arch_id = sub0::MODEL_ARCH_ID;   // full architecture identity; see registry::compatible
         m.git_sha = SUB0_GIT_SHA; m.created = created;
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
         m.epochs = static_cast<double>(rs.step) / static_cast<double>(epoch_steps);
         m.tokens_seen = tokens_seen_est;
-        m.batch = cfg.batch; m.lr = cfg.lr; m.seed = cfg.seed;
         m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
         m.status = status;
-        sub0::registry::write_meta(meta_dir, m);
+        sub0::registry::write_state(meta_dir, m);
     };
     // Resume from the newest checkpoint for this output (progress-named, or a legacy single file):
     // overwrites the fresh model and restores batch/lr/seed, so the schedule below is computed from
@@ -1738,9 +1732,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         sub0::log::line("optimizer: Muon (hidden 2D weight matrices) + AdamW (embeddings, head, norms, "
                         "biases) | muon lr peak {:.2e}", MUON_LR_BASE);
     std::fflush(stdout);
-    // Register/refresh the model now that epoch_steps is known -- so meta.txt shows the correct step +
+    // Register/refresh the model now that epoch_steps is known -- so state.json shows the correct step +
     // epoch immediately (a resume no longer looks like steps=0), and an interrupted run stays discoverable.
-    write_meta("training");
+    write_state("training");
 
     // Token-budget scheduling (see `batch_t` in the loop below): a short-T step trades batch UP to
     // hold batch_t*seq_t roughly constant at tokens_per_step, so the window-indexed arrays here need
@@ -2034,7 +2028,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // A device fault mid-run (a real hardware fault hit this exact codebase once already -- see
     // [[gpu-illegal-access-hardware-fault-not-code-bug]]): stops the loop WITHOUT touching the device
     // again (no sync/eval/save on corrupted or stale host state), leaving the last periodic checkpoint
-    // on disk untouched and its meta.txt status still "training" -- a plain `sub0llm train` with no
+    // on disk untouched and its state.json status still "training" -- a plain `sub0llm train` with no
     // path will detect that unfinished run and offer to resume it (see registry.hpp's auto-resume).
     bool device_failed = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
@@ -2381,7 +2375,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             prune_ckpts(model_path, keep, rs.best_step);
             if (!sub0::save_model(model_path.c_str()))
                 sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
-            write_meta("training");          // refresh best_val_nelbo as it improves
+            write_state("training");          // refresh best_val_nelbo as it improves
 
             run_loss = 0.0; run_n = 0;
             prep_secs = 0.0; train_secs = 0.0; opt_secs = 0.0;
@@ -2444,7 +2438,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             prune_ckpts(model_path, keep, rs.best_step);
             if (!sub0::save_model(model_path.c_str()))
                 sub0::log::warn("model.bin save failed at step {} -- not fatal, retried at the next interval", step);
-            write_meta("training");
+            write_state("training");
             last_ckpt = clock::now();
             sub0::log::line("  [checkpoint @ step {} ({:.0f}m crash-resistance tick)]", step, CKPT_SECONDS / 60.0);
             std::fflush(stdout);
@@ -2483,7 +2477,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             sub0::log::error("checkpoint save failed during graceful stop at step {} -- training "
                              "progress may not be on disk", rs.step);
         prune_ckpts(model_path, keep, rs.best_step);
-        write_meta("stopped");
+        write_state("stopped");
         // The checkpoint above is already (best-effort) on disk -- skip the sample generation (a full
         // SEQ_LEN-token decode can take real time at a large model) so the exit stays prompt.
         sub0::log::line("stopped (graceful) at step {} (best val_nelbo {:.4f}) -> {}",
@@ -2511,7 +2505,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             sub0::log::error("fallback checkpoint save ALSO failed -- training progress may be lost");
     }
     prune_ckpts(model_path, keep, rs.best_step);
-    write_meta(stop ? "plateaued" : "trained");
+    write_state(stop ? "plateaued" : "trained");
     // Generate a full SEQ_LEN-token sample so the preview actually fills and slides the extended
     // context window (preview_at caps the model input at SEQ_LEN; a short 120-token run never
     // reaches it). This exercises the real long-context behaviour the trained window supports.
@@ -2549,7 +2543,7 @@ static void report_threading() {
 // backend's print_config(); the third names the training path that will actually execute, so the
 // throughput numbers that follow are read against the right backend.
 static void report_run_context(bool gpu_train, bool hybrid_train) {
-    sub0::print_config();   // engine config line (console only; the same dims are in the model's meta.txt)
+    sub0::print_config();   // engine config line (console only; the same dims are in the model's config.json)
     const char* backend = hybrid_train ? "hybrid CPU+GPU (source-routed split: content-embed windows on "
                                           "CPU, the rest on GPU; host-canonical AdamW)"
                         : gpu_train    ? "GPU (resident device step: fwd+bwd+AdamW)"
@@ -3327,7 +3321,7 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
     if (model_in && *model_in) {
         const std::filesystem::path metrics_dir = std::filesystem::path(model_in).parent_path();
         sub0::registry::ModelMeta meta;
-        sub0::registry::read_meta(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
+        sub0::registry::read_state(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
         sub0::evalcache::EvalMetrics cached;
         sub0::evalcache::read_metrics(metrics_dir, cached);   // ok if this returns false (nothing cached yet)
         cached.steps = meta.steps;
@@ -3486,9 +3480,9 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
                  POS_ENCODING == PosEncoding::Rope ? "RoPE" : "absolute");
     emit("parameters:   {:.2f}M trainable floats", params / 1e6);
 
-    if (model_in && *model_in) {   // training provenance from the meta.txt next to the model
+    if (model_in && *model_in) {   // training provenance from the state.json next to the model
         sub0::registry::ModelMeta m;
-        if (sub0::registry::read_meta(std::filesystem::path(model_in).parent_path(), m) && m.steps > 0)
+        if (sub0::registry::read_state(std::filesystem::path(model_in).parent_path(), m) && m.steps > 0)
             emit("training:     steps {} | epochs {:.2f} | tokens_seen {} | seed {}",
                          m.steps, m.epochs, m.tokens_seen, m.seed);
     }
@@ -3529,7 +3523,7 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
             {
                 const std::filesystem::path metrics_dir = std::filesystem::path(model_in).parent_path();
                 sub0::registry::ModelMeta meta;
-                sub0::registry::read_meta(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
+                sub0::registry::read_state(metrics_dir, meta);   // for the steps stamp; ok if this fails (stays 0)
                 sub0::evalcache::EvalMetrics cached;
                 sub0::evalcache::read_metrics(metrics_dir, cached);   // ok if this returns false (nothing cached yet)
                 cached.steps = meta.steps;
@@ -3679,7 +3673,7 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
 }
 
 // --- Model registry ----------------------------------------------------------
-// `sub0llm models` discovers every trained model (scans the meta.txt under the models root --
+// `sub0llm models` discovers every trained model (scans the state.json under the models root --
 // the registry is the set of those files, so it never drifts out of sync) and flags which load
 // into THIS build (matching architecture dims). `--prune` reclaims the incompatible ones, whose
 // checkpoints this engine could never load anyway. Destructive, so it is opt-in via the flag.
@@ -3717,7 +3711,7 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* co
     // Filter BEFORE anything else, so the plain listing, --prune, --metrics, and --refresh all agree
     // on the same selected set (an empty filter arg -> no restriction on that axis). --sha is a
     // prefix match (short shas are the norm); --since/--until compare against just the DATE portion
-    // of meta.txt's fixed-width ISO `created` string (its first 10 chars, "YYYY-MM-DD") -- comparing
+    // of state.json's fixed-width ISO `created` string (its first 10 chars, "YYYY-MM-DD") -- comparing
     // the full "YYYY-MM-DDTHH:MM:SSZ" timestamp against a bare date would make --until wrongly
     // exclude every model created ON that date (any same-day timestamp sorts lexicographically AFTER
     // the bare date string), while --since's lower-bound direction happens to work either way.

@@ -5,7 +5,16 @@
 //   models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t][r]_<YYYYMMDD-HHMMSS>/
 //     model.bin        the parameters
 //     model.bin.ckpt   the resumable optimizer/loop state
-//     meta.txt         key=value provenance (below)
+//     config.json      the architecture + the training recipe (RunConfig, below)
+//     state.json       the run's provenance + progress (ModelMeta, below)
+//
+// config.json and state.json partition the metadata; they do not overlap. Every architecture and
+// recipe value has exactly one writer (config.json, generated from SUB0_RUN_CONFIG_FIELDS) and every
+// provenance/progress value has exactly one writer (state.json). `read_state` merges the two into one
+// ModelMeta for display. The meta.txt these replaced duplicated FIFTEEN of config.json's fields, and
+// the duplicate is the copy that went stale -- it never learned n_kv_heads, LoopSplit's schedule or
+// the rope parameters, because those arrived through the X-macro and nothing updated the second,
+// hand-written writer.
 //
 // The optional suffix letters encode build variants that change the weights' meaning without
 // changing their shape: 't' = ternary block weights, 'r' = RoPE positional encoding (absolute
@@ -19,10 +28,10 @@
 // actually determines whether a checkpoint can resume -- see `compatible()` below, which already
 // checks dims/flags and deliberately ignores the SHA. Keying the directory name to the SHA meant a
 // trivial commit between stopping and resuming a multi-day run would silently start a fresh model
-// instead of resuming it. The SHA is still recorded in meta.txt as a provenance/audit field (see
+// instead of resuming it. The SHA is still recorded in state.json as a provenance/audit field (see
 // ModelMeta::git_sha) -- just no longer part of directory identity or resume-matching.
 //
-// The "registry" is just the set of meta.txt files: discovery scans them (no separate
+// The "registry" is just the set of state.json files: discovery scans them (no separate
 // index to drift out of sync), and a model is COMPATIBLE with the current build iff its
 // architecture dims match -- the checkpoint can only load into a matching engine, so
 // dim-mismatched models are dead weight a `prune` can reclaim. Pure std + <filesystem>; the
@@ -41,12 +50,17 @@
 #include <string_view>
 #include <vector>
 
-// Export macro for read_config_json's out-of-line definition (src/run_config.cpp, compiled once
-// into sub0_core): every other function in this header is `inline` and compiled directly into
-// each consumer's own translation unit, so this is the one symbol here that actually crosses the
-// sub0_core.dll boundary and needs it. A self-contained copy of core.hpp's own SUB0_API (not an
-// include of core.hpp itself) -- this header is deliberately pure std + <filesystem>, no engine
-// dependency, matching its own doc comment above.
+// Export macro for this header's out-of-line half -- `read_config_json` and `read_state`, both
+// defined in src/run_config.cpp, which is compiled into sub0_FRONTEND, not the engine. Everything
+// else here is `inline` and lands in each consumer's own translation unit; these two are the symbols
+// that cross a library boundary (they use simdjson, which this header must not pull in).
+//
+// The frontend is the right home precisely because registry is frontend surface: sub0_frontend_tests
+// links it WITHOUT the engine, so a reader living in sub0_core would be unreachable from the very
+// tests meant to cover it -- which is what forced the readers to stay inline in this header before.
+//
+// A self-contained copy of core.hpp's own SUB0_API (not an include of core.hpp itself) -- this
+// header is deliberately pure std + <filesystem>, no engine dependency, matching its doc comment.
 #ifndef SUB0_API
   #if defined(_WIN32)
     #define SUB0_API __declspec(dllexport)
@@ -57,26 +71,34 @@
 
 namespace sub0::registry {
 
+// One model's metadata, as `read_state` assembles it from BOTH files in the directory. The [state]
+// and [config] tags mark which file writes each field -- no field is written by both, which is the
+// whole point of the split. To add an architecture or recipe field, add a SUB0_RUN_CONFIG_FIELDS row
+// and a merge line in read_state; do NOT add a second writer here.
 struct ModelMeta {
-    std::string corpus, git_sha, created, updated, status;
+    // [state.json] provenance + progress of the run that produced this snapshot.
+    std::string git_sha, created, updated, status;
+    // [config.json] architecture + recipe, merged in for display and filtering only.
+    std::string corpus;
     int d_model = 0, n_layers = 0, n_heads = 0, seq_len = 0, vocab = 0, ternary = 0;
     int pos_encoding = 0;                     // 0 = absolute learned (legacy default), 1 = RoPE
     int gated_ffn = 0;                        // 0 = plain GELU+bias FFN (legacy default), 1 = SwiGLU-gated
     int tied_embeddings = 0;                  // 0 = untied head (legacy default), 1 = head reuses tok_emb
     int qk_norm = 0;                          // 0 = no QK-norm (legacy default), 1 = per-head RMSNorm on Q/K
     int optimizer = 0;                        // 0 = AdamW (legacy default), 1 = Muon (hidden 2D matrices)
-    // Full architecture identity (sub0::MODEL_ARCH_ID). 0 = a legacy meta.txt written before this
-    // existed; compatible() falls back to comparing the individual fields for those, which is exactly
-    // as accurate as it ever was -- no worse, and correct for everything written from here on.
+    // Full architecture identity (sub0::MODEL_ARCH_ID) -- the ONLY thing compatible() consults, and
+    // the only architecture value state.json carries in its own right. 0 means "no state.json field",
+    // which compatible() treats as incompatible rather than guessing from the merged fields below.
     unsigned long long arch_id = 0;
-    // Training state (provenance of the run that produced this snapshot).
+    // [state.json] how far this run got.
     long long steps = 0;                      // optimizer iterations completed
     double epochs = 0.0;                      // fractional epochs of the corpus covered
     long long tokens_seen = 0;                // approximate tokens consumed (steps * batch * seq)
+    double best_val_nelbo = -1.0;             // -1 = not yet evaluated
+    // [config.json] what it was asked to do.
     int batch = 0;                            // minibatch size
     double lr = 0.0;                          // learning rate
     unsigned seed = 0;                        // RNG seed (for reproducibility)
-    double best_val_nelbo = -1.0;             // -1 = not yet evaluated
     std::filesystem::path dir;                // the model's directory (set by scan)
 };
 
@@ -85,8 +107,8 @@ struct ModelMeta {
 // Born from a real incident: a GPU-fault auto-resume once silently continued training under plain
 // AdamW instead of the Muon it had used for its first 7728 steps, because the optimizer choice was
 // derived purely from the CURRENT invocation's CLI flag with no cross-check against what the model
-// had actually been trained with -- `ModelMeta::optimizer` above was written to meta.txt every run
-// but never read back. `RunConfig` fixes the CLASS of bug, not just that one field: it is the one
+// had actually been trained with -- `ModelMeta::optimizer` above was written to the old meta.txt on
+// every run but never read back. `RunConfig` fixes the CLASS of bug, not just that one field: it is the one
 // place a new training-recipe option is declared, and by construction that declaration is *also*
 // its serialization -- add a row to SUB0_RUN_CONFIG_FIELDS below and the field is written to and
 // read from every model directory's config.json automatically (write_config_json/read_config_json
@@ -95,13 +117,14 @@ struct ModelMeta {
 //
 // Scope, deliberately not "every setting in the program": holds CHOICES that must not silently
 // drift across a resume and have no other authoritative home.
-//   - Architecture dims/flags ARE included, even though they're also `constexpr` at compile time
-//     and also duplicated in `ModelMeta` -- see `compatible()`'s doc comment above for why that
-//     redundancy is load-bearing (cross-build-config filtering before any model.bin is opened).
+//   - Architecture dims/flags ARE included, even though they're also `constexpr` at compile time:
+//     `compatible()` filters across build configs before any model.bin is opened, and this file is
+//     where the values it reports come from. They are NOT duplicated elsewhere on disk -- ModelMeta
+//     holds them only as a read-side merge target, populated by `read_state` FROM here.
 //   - `batch`/`lr`/`seed` ARE included for completeness/comparison, but are NOT re-enforced on
 //     resume here -- they already have a correct, tightly-coupled authoritative home in the
 //     `.ckpt` binary (see train_stage.cpp's `load_checkpoint`), which wins on resume with its own
-//     log line. config.json's copy is informational, same role as meta.txt's copy.
+//     log line. config.json's copy is informational.
 //   - `optimizer` IS re-enforced on resume (see train_stage.cpp) -- it has no checkpoint-binary
 //     home and no other read-back path, which is precisely the gap that caused the incident above.
 //   - Deliberately EXCLUDED: per-invocation POLICY that has no "correct" persisted value to protect
@@ -314,96 +337,51 @@ inline std::string now_datetag() {
     return buf;
 }
 
-inline void write_meta(const std::filesystem::path& dir, const ModelMeta& m) {
+// Writes <dir>/state.json: the run's PROVENANCE and PROGRESS, and nothing else.
+//
+// It deliberately does NOT repeat the architecture or the training recipe. Those live in config.json,
+// which is generated from SUB0_RUN_CONFIG_FIELDS and is therefore complete by construction. The two
+// files used to overlap on FIFTEEN fields (corpus, every dim, all five arch enums, optimizer, batch,
+// lr, seed) -- and this was the copy that went stale: it never learned n_kv_heads, LoopSplit's
+// schedule or the rope parameters, because adding a field to the X-macro updated config.json alone.
+// A second writer of the same fact does not stay in sync; it picks a moment to disagree.
+//
+// JSON, like config.json and blend_schedule.json, so every file in a model directory reads the same way.
+inline void write_state(const std::filesystem::path& dir, const ModelMeta& m) {
     std::error_code ec; std::filesystem::create_directories(dir, ec);
-    std::ofstream os(dir / "meta.txt", std::ios::trunc);
+    std::ofstream os(dir / "state.json", std::ios::trunc);
     if (!os) return;
-    // Enum-valued fields print as NAMES (gated_ffn=on, optimizer=muon, pos_encoding=rope, ...) for
-    // readability, reusing config.json's OWN int<->name mapping (detail::enum_name) rather than a
-    // second, hand-rolled one -- the two files can never disagree about what a value means. Falls
-    // back to the raw int for a field/value enum_name doesn't recognize, matching json_write_field's
-    // own fallback exactly.
-    auto field = [&os](const char* name, int v) {
-        os << name << '=';
-        if (const char* nm = detail::enum_name(name, v)) os << nm; else os << v;
-        os << '\n';
-    };
-    os << "model=sub0llm\n"
-       << "corpus="          << m.corpus    << "\n"
-       << "d_model="         << m.d_model   << "\n"
-       << "n_layers="        << m.n_layers  << "\n"
-       << "n_heads="         << m.n_heads   << "\n"
-       << "seq_len="         << m.seq_len   << "\n"
-       << "vocab="           << m.vocab     << "\n";
-    field("ternary",         m.ternary);
-    field("pos_encoding",    m.pos_encoding);
-    field("gated_ffn",       m.gated_ffn);
-    field("tied_embeddings", m.tied_embeddings);
-    field("qk_norm",         m.qk_norm);
-    field("optimizer",       m.optimizer);
-    // arch_id: the FULL architecture identity, so a reader (and compatible()) can tell two models
-    // apart on axes the individual fields above do not carry. Hex for readability against the
-    // directory name's own _a<hex> tag, which is this value's low 32 bits.
-    os << "arch_id=" << std::hex << m.arch_id << std::dec << '\n';
-    os << "git_sha="         << m.git_sha   << "\n"
-       << "created="         << m.created   << "\n"
-       << "updated="         << m.updated   << "\n"
-       << "steps="           << m.steps     << "\n"
-       << "epochs="          << m.epochs    << "\n"
-       << "tokens_seen="     << m.tokens_seen << "\n"
-       << "batch="           << m.batch     << "\n"
-       << "lr="              << m.lr        << "\n"
-       << "seed="            << m.seed      << "\n"
-       << "best_val_nelbo="  << m.best_val_nelbo << "\n"
-       << "status="          << m.status    << "\n";
+    os << "{\n";
+    os << "  \"git_sha\": ";  detail::json_write(os, m.git_sha); os << ",\n";
+    os << "  \"created\": ";  detail::json_write(os, m.created); os << ",\n";
+    os << "  \"updated\": ";  detail::json_write(os, m.updated); os << ",\n";
+    os << "  \"status\": ";   detail::json_write(os, m.status);  os << ",\n";
+    // arch_id as a hex STRING, not a JSON number: it is a 64-bit identity rather than a quantity, and
+    // a great many JSON readers land integers in a double, where exactness stops at 2^53. Hex also
+    // reads directly against the directory name's own _a<hex> tag, which is this value's low 32 bits.
+    { char buf[24]; std::snprintf(buf, sizeof(buf), "%016llx", m.arch_id);
+      os << "  \"arch_id\": "; detail::json_write(os, std::string(buf)); os << ",\n"; }
+    os << "  \"steps\": "          << m.steps          << ",\n";
+    os << "  \"epochs\": "         << m.epochs         << ",\n";
+    os << "  \"tokens_seen\": "    << m.tokens_seen    << ",\n";
+    os << "  \"best_val_nelbo\": " << m.best_val_nelbo << "\n";
+    os << "}\n";
 }
 
-inline bool read_meta(const std::filesystem::path& dir, ModelMeta& m) {
-    std::ifstream is(dir / "meta.txt");
-    if (!is) return false;
-    auto as_int = [](const std::string& s) { int v = 0; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
-    // Enum-valued fields accept EITHER form: a name (written by this build) or a raw int (an older
-    // meta.txt written before this fix) -- same dual-acceptance contract config.json's reader already
-    // has, via the SAME detail::enum_parse mapping so the two files never drift apart.
-    auto as_enum = [&](const char* field, const std::string& s) {
-        int v = 0; return detail::enum_parse(field, s, v) ? v : as_int(s);
-    };
-    for (std::string line; std::getline(is, line);) {
-        const auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-        if      (k == "corpus")         m.corpus = v;
-        else if (k == "git_sha")        m.git_sha = v;
-        else if (k == "created")        m.created = v;
-        else if (k == "updated")        m.updated = v;
-        else if (k == "status")         m.status = v;
-        else if (k == "d_model")        m.d_model = as_int(v);
-        else if (k == "n_layers")       m.n_layers = as_int(v);
-        else if (k == "n_heads")        m.n_heads = as_int(v);
-        else if (k == "seq_len")        m.seq_len = as_int(v);
-        else if (k == "vocab")          m.vocab = as_int(v);
-        else if (k == "ternary")        m.ternary = as_enum("ternary", v);
-        else if (k == "pos_encoding")   m.pos_encoding = as_enum("pos_encoding", v);
-        else if (k == "gated_ffn")      m.gated_ffn = as_enum("gated_ffn", v);
-        else if (k == "tied_embeddings") m.tied_embeddings = as_enum("tied_embeddings", v);
-        else if (k == "qk_norm")        m.qk_norm = as_enum("qk_norm", v);
-        else if (k == "optimizer")      m.optimizer = as_enum("optimizer", v);
-        // base 16 to match the writer. A legacy meta.txt has no such key, so arch_id stays 0 and
-        // compatible() falls back to the per-field comparison -- see its own comment.
-        else if (k == "arch_id")        m.arch_id = std::strtoull(v.c_str(), nullptr, 16);
-        else if (k == "steps")          m.steps = std::strtoll(v.c_str(), nullptr, 10);
-        else if (k == "epochs")         m.epochs = std::strtod(v.c_str(), nullptr);
-        else if (k == "tokens_seen")    m.tokens_seen = std::strtoll(v.c_str(), nullptr, 10);
-        else if (k == "batch")          m.batch = as_int(v);
-        else if (k == "lr")             m.lr = std::strtod(v.c_str(), nullptr);
-        else if (k == "seed")           m.seed = static_cast<unsigned>(std::strtoul(v.c_str(), nullptr, 10));
-        else if (k == "best_val_nelbo") m.best_val_nelbo = std::strtod(v.c_str(), nullptr);
-    }
-    m.dir = dir;
-    return true;
-}
+// Reads <dir>/state.json (provenance + progress) AND <dir>/config.json (the architecture and the
+// recipe) into one ModelMeta, for display, filtering and compatibility. Two files, but exactly ONE
+// writer per field -- so unlike the meta.txt this replaced, the two cannot disagree.
+//
+// Out-of-line in run_config.cpp for the same reason read_config_json is: simdjson lives there, and
+// this header stays pure std + <filesystem>. Returns false when state.json is missing or unparsable
+// -- a directory without one is not a model directory. A missing config.json is NOT a failure: an
+// interrupted first run leaves real provenance worth listing, so the architecture fields simply stay
+// at their defaults rather than being invented.
+SUB0_API bool read_state(const std::filesystem::path& dir, ModelMeta& m);
 
-// All models discovered under the root (each subdirectory holding a meta.txt).
+// All models discovered under the root: every subdirectory holding a state.json. Keying on
+// state.json (not config.json) is what keeps a merely CONFIGURED directory out of the listing --
+// `sub0llm configure` writes config.json before anything has been trained.
 inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
     std::vector<ModelMeta> out;
     std::error_code ec;
@@ -411,7 +389,7 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
     for (const auto& e : std::filesystem::directory_iterator(models_root, ec)) {
         if (!e.is_directory()) continue;
         ModelMeta m;
-        if (read_meta(e.path(), m)) out.push_back(std::move(m));
+        if (read_state(e.path(), m)) out.push_back(std::move(m));
     }
     return out;
 }
@@ -426,8 +404,8 @@ inline std::vector<ModelMeta> scan(const std::filesystem::path& models_root) {
 // (n_kv_heads, LoopSplit's schedule, rope theta/scaling). Answering "compatible" for a model that
 // load_model then refuses is worse than answering "no" -- it sends `train` into a resume that fails.
 //
-// A meta.txt without an arch_id is treated as INCOMPATIBLE rather than falling back to a per-field
-// comparison. That fallback existed for metas written before arch_id and is gone with the rest of the
+// A state.json without an arch_id is treated as INCOMPATIBLE rather than falling back to a per-field
+// comparison. That fallback existed for files written before arch_id and is gone with the rest of the
 // legacy-format support: a per-field match is exactly the wrong answer for the axes it cannot see, so
 // keeping it would mean the weaker check silently deciding whichever cases the stronger one was added
 // to catch. The remaining parameters stay for callers that only have loose dims to hand.

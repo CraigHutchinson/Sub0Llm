@@ -139,8 +139,14 @@ endif()
 # registry (model identity/compat), casing. Factored out so BOTH the configurator and the runtime engine
 # share ONE definition, and so the engine-free tests cover it without building the engine. Depends only
 # on the standard library (no generated config), so the configurator links it without the engine.
-add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp)
+add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp src/run_config.cpp)
 target_include_directories(sub0_frontend PUBLIC "${CMAKE_SOURCE_DIR}/include")
+# run_config.cpp is registry.hpp's out-of-line half (read_config_json / read_state, both simdjson).
+# It belongs HERE, not in sub0_core: it includes only registry.hpp + simdjson -- no engine, no
+# generated config -- and registry is named above as frontend surface precisely so "the engine-free
+# tests cover it without building the engine". While it sat in sub0_core, sub0_frontend_tests could
+# only reach registry's *header-only* half, which is why the readers had to stay inline in the header.
+target_link_libraries(sub0_frontend PRIVATE simdjson::simdjson)
 set_target_properties(sub0_frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # WS6: casing.hpp's normalize_text/truecase_tokenize use `#pragma omp simd` (this project's
 # existing auto-vectorization convention, see src/backend_cpu.cpp) over their hot per-byte classify
@@ -192,15 +198,15 @@ target_include_directories(sub0llm-configure PRIVATE "${GEN_DIR}")
 # part (tokenizer, serialization, sampler, config paths) and backend_cpu.cpp is the
 # CPU compute backend (ops, autograd, train_batch, AdamW). A future GPU backend
 # replaces backend_cpu.cpp behind the same include/sub0/core.hpp API.
-add_library(sub0_core SHARED src/engine_core.cpp src/run_config.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
+add_library(sub0_core SHARED src/engine_core.cpp src/blend_schedule.cpp ${SUB0_BACKEND_SOURCES})
 target_include_directories(sub0_core PUBLIC "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
 # The runtime tokenizer (encode/detokenize/load) is the same sub0_frontend used by the
 # configurator, linked PRIVATE so its symbols stay internal to the engine DLL.
 target_link_libraries(sub0_core PRIVATE sub0_frontend)
-# run_config.cpp's read_config_json (registry.hpp's RunConfig) and blend_schedule.cpp's
-# parse_blend_schedule_json (blend_schedule.hpp's ScheduleSpec) both use simdjson to parse their
-# respective JSON files. PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain
+# blend_schedule.cpp's parse_blend_schedule_json (blend_schedule.hpp's ScheduleSpec) uses simdjson to
+# parse blend_schedule.json. PRIVATE: consumers (train_stage.cpp etc.) only ever call the plain
 # std::-typed functions declared in their headers -- simdjson's own types never leak across that boundary.
+# (registry.hpp's own readers moved to sub0_frontend with run_config.cpp -- see above.)
 target_link_libraries(sub0_core PRIVATE simdjson::simdjson)
 # The AdamW hot loop only ever sqrt()s non-negative values and never reads errno, so
 # the errno side-effect of the math libcalls is dead weight that stops the optimizer

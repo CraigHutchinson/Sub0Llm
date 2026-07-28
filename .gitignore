@@ -38,6 +38,6 @@ corpus.tok
 tokenizer.tok
 tokenizer.bin
 tokenizer.stamp
-meta.txt
+state.json
 train.log
 *.ckpt

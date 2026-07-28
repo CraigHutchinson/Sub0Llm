@@ -1,7 +1,7 @@
 // evalcache.hpp -- per-model cache of RAW evaluation measurements (metrics.txt, a sibling of
-// meta.txt/report.txt in each model directory).
+// state.json/report.txt in each model directory).
 //
-// Split deliberately from registry.hpp's meta.txt: that file is repeatedly read-modify-written by
+// Split deliberately from registry.hpp's state.json: that file is repeatedly read-modify-written by
 // the ACTIVE TRAINING LOOP on every checkpoint tick, so folding eval-tool output into the same
 // struct/file risks it being silently clobbered by a later training resume.
 //
@@ -18,7 +18,7 @@
 // Callers own the "preserve fields the other tool wrote" merge: `report` and `autotemp` each
 // populate only their own subset of an `EvalMetrics` read from any existing cache before writing it
 // back (see `compute_raw_metrics()` in train_stage.cpp) -- this header is a plain, unconditional
-// serialize/deserialize, mirroring registry.hpp's own read_meta/write_meta split.
+// serialize/deserialize, mirroring registry.hpp's own read_state/write_state split.
 #pragma once
 
 #include <cstdlib>
@@ -36,7 +36,7 @@ struct AutotempGrid {
 };
 
 struct EvalMetrics {
-    long long   steps = -1;      // the model's step count when measured (vs meta.txt's -> staleness)
+    long long   steps = -1;      // the model's step count when measured (vs state.json's -> staleness)
     std::string measured_at;     // ISO timestamp (registry::now_iso())
     // report-owned raw numbers.
     double train_nelbo = -1, val_nelbo = -1, bytes_per_tok = 0;
@@ -64,7 +64,7 @@ inline void write_metrics(const std::filesystem::path& dir, const EvalMetrics& m
 inline bool read_metrics(const std::filesystem::path& dir, EvalMetrics& m) {
     std::ifstream is(dir / "metrics.txt");
     if (!is) return false;
-    m = EvalMetrics{};   // start from field defaults, matching registry::read_meta's convention
+    m = EvalMetrics{};   // start from field defaults, matching registry::read_state's convention
     for (std::string line; std::getline(is, line);) {
         if (line.rfind("grid\t", 0) == 0) {
             const auto t1 = line.find('\t', 5);

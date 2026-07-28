@@ -173,10 +173,12 @@ Each trained model is its own directory under `models/`, named for its identity:
 
 ```
 models/sub0llm_<corpus>_d<D>l<L>h<H>sq<SEQ>v<VOCAB>[t][r]_<gitSHA>/
-  model.bin  model.bin.ckpt  meta.txt
+  model.bin  model.bin.ckpt  config.json  state.json
 ```
 
-The "registry" is the set of `meta.txt` files (no separate index to drift out of sync).
+The "registry" is the set of `state.json` files (no separate index to drift out of sync).
+`config.json` holds the architecture + recipe, `state.json` the provenance + progress; the two
+partition the metadata and never restate each other.
 
 ```sh
 $exe models            # list models; '*' = loadable by this build, 'x' = incompatible architecture

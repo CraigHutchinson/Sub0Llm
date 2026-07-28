@@ -136,7 +136,7 @@ TEST_CASE("RunConfig: read_config_json is forward-compatible with an unrecognize
     {
         // A hand-written file with a field this build's RunConfig doesn't know about (simulating a
         // FUTURE build having added a new SUB0_RUN_CONFIG_FIELDS row) mixed in with known ones --
-        // must not fail the whole parse, matching read_meta's existing forward-compatible tolerance.
+        // must not fail the whole parse, matching read_state's existing forward-compatible tolerance.
         std::ofstream os(scratch.path / "config.json");
         os << "{\n  \"optimizer\": 1,\n  \"some_future_field\": \"unknown to this build\",\n  \"batch\": 96\n}\n";
     }

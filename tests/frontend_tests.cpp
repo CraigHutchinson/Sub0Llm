@@ -159,53 +159,103 @@ TEST_CASE("registry: now_datetag is fixed-width, filesystem-safe, and sortable",
         if (i != 8) CHECK(std::isdigit(static_cast<unsigned char>(tag[i])));
 }
 
-TEST_CASE("registry: write_meta/read_meta round-trips every field, including optimizer", "[frontend][registry]") {
+TEST_CASE("registry: state.json carries provenance, config.json carries architecture, read_state merges both",
+          "[frontend][registry]") {
     using namespace sub0::registry;
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "sub0_registry_meta_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "sub0_registry_state_test";
     std::error_code ec; std::filesystem::remove_all(dir, ec);
 
+    // The point of the split: NEITHER writer states a field the other one states. state.json's nine
+    // fields are the run's provenance and progress; every architecture and recipe value comes from
+    // config.json, which is generated from the X-macro and so cannot fall behind a new axis.
     ModelMeta m;
-    m.corpus = "tinystories"; m.git_sha = "a016d17"; m.created = now_iso(); m.updated = now_iso();
-    m.status = "plateaued";
-    m.d_model = 448; m.n_layers = 11; m.n_heads = 7; m.seq_len = 256; m.vocab = 16517; m.ternary = 0;
-    m.pos_encoding = 1; m.gated_ffn = 1; m.tied_embeddings = 1; m.qk_norm = 1; m.optimizer = 1;
-    m.steps = 12236; m.epochs = 1.90118; m.tokens_seen = 1205216838; m.batch = 385;
-    m.lr = 0.00693722; m.seed = 42; m.best_val_nelbo = 1.19023;
-    write_meta(dir, m);
+    m.git_sha = "a016d17"; m.created = now_iso(); m.updated = now_iso(); m.status = "plateaued";
+    m.arch_id = 0xfeedfacecafeb00dULL;
+    m.steps = 12236; m.epochs = 1.90118; m.tokens_seen = 1205216838; m.best_val_nelbo = 1.19023;
+    write_state(dir, m);
+
+    RunConfig c;
+    c.corpus = "tinystories";
+    c.d_model = 448; c.n_layers = 11; c.n_heads = 7; c.n_kv_heads = 4;
+    c.seq_len = 256; c.vocab = 16517; c.ternary = 0; c.pos_encoding = 1;
+    c.gated_ffn = 1; c.tied_embeddings = 1; c.qk_norm = 1; c.optimizer = 1;
+    c.batch = 385; c.lr = 0.00693722; c.seed = 42u;
+    write_config_json(c, dir);
 
     ModelMeta r;
-    REQUIRE(read_meta(dir, r));
-    CHECK(r.corpus == m.corpus);
+    REQUIRE(read_state(dir, r));
+    // ...from state.json. arch_id specifically: it round-trips through a hex STRING, and it is the
+    // only thing compatible() consults, so a lossy round-trip here would silently mis-match models.
     CHECK(r.git_sha == m.git_sha);
+    CHECK(r.created == m.created);
+    CHECK(r.updated == m.updated);
     CHECK(r.status == m.status);
-    CHECK(r.d_model == m.d_model);
-    CHECK(r.n_layers == m.n_layers);
-    CHECK(r.n_heads == m.n_heads);
-    CHECK(r.seq_len == m.seq_len);
-    CHECK(r.vocab == m.vocab);
-    CHECK(r.gated_ffn == m.gated_ffn);
-    CHECK(r.tied_embeddings == m.tied_embeddings);
-    CHECK(r.qk_norm == m.qk_norm);
-    CHECK(r.optimizer == 1);
+    CHECK(r.arch_id == m.arch_id);
     CHECK(r.steps == m.steps);
+    CHECK(r.epochs == Catch::Approx(m.epochs));
+    CHECK(r.tokens_seen == m.tokens_seen);
     CHECK(r.best_val_nelbo == Catch::Approx(m.best_val_nelbo));
+    // ...and from config.json, merged in by read_state.
+    CHECK(r.corpus == c.corpus);
+    CHECK(r.d_model == c.d_model);
+    CHECK(r.n_layers == c.n_layers);
+    CHECK(r.n_heads == c.n_heads);
+    CHECK(r.seq_len == c.seq_len);
+    CHECK(r.vocab == c.vocab);
+    CHECK(r.ternary == c.ternary);
+    CHECK(r.pos_encoding == c.pos_encoding);
+    CHECK(r.gated_ffn == c.gated_ffn);
+    CHECK(r.tied_embeddings == c.tied_embeddings);
+    CHECK(r.qk_norm == c.qk_norm);
+    CHECK(r.optimizer == c.optimizer);
+    CHECK(r.batch == c.batch);
+    CHECK(r.lr == Catch::Approx(c.lr));
+    CHECK(r.seed == c.seed);
+    CHECK(r.dir == dir);
+
+    // compatible() consults arch_id alone, so the merge above must not disturb it.
+    CHECK(compatible(r, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, m.arch_id));
+    CHECK_FALSE(compatible(r, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, m.arch_id + 1));
 
     std::filesystem::remove_all(dir, ec);
 }
 
-TEST_CASE("registry: optimizer defaults to 0 (AdamW) when reading a pre-existing meta.txt without the field", "[frontend][registry]") {
+TEST_CASE("registry: a directory with no state.json is not a model directory", "[frontend][registry]") {
     using namespace sub0::registry;
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "sub0_registry_legacy_meta_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "sub0_registry_nostate_test";
     std::error_code ec; std::filesystem::remove_all(dir, ec);
     std::filesystem::create_directories(dir, ec);
-    {
-        std::ofstream os(dir / "meta.txt");
-        os << "model=sub0llm\ncorpus=tinystories\nd_model=448\nn_layers=11\nn_heads=7\n"
-              "seq_len=256\nvocab=16517\nstatus=trained\n";   // no optimizer= line, matching an old file
-    }
+
+    // A config.json alone is not a model: `sub0llm configure` writes one before anything is trained.
+    // scan() keys on state.json so a configured-but-never-trained directory does not list as a model.
+    RunConfig c; c.corpus = "tinystories"; c.d_model = 448;
+    write_config_json(c, dir);
+
     ModelMeta m;
-    REQUIRE(read_meta(dir, m));
-    CHECK(m.optimizer == 0);
+    CHECK_FALSE(read_state(dir, m));
+
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("registry: state.json without a config.json still lists, architecture left at defaults",
+          "[frontend][registry]") {
+    using namespace sub0::registry;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "sub0_registry_noconfig_test";
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+
+    // An interrupted first run leaves real provenance, which a user needs to SEE in order to prune
+    // it -- so a missing config.json is not a failure. The architecture fields stay at their
+    // defaults rather than being invented from whatever the current build happens to be.
+    ModelMeta m;
+    m.git_sha = "deadbee"; m.status = "training"; m.steps = 7;
+    write_state(dir, m);
+
+    ModelMeta r;
+    REQUIRE(read_state(dir, r));
+    CHECK(r.status == "training");
+    CHECK(r.steps == 7);
+    CHECK(r.d_model == 0);
+    CHECK(r.corpus.empty());
 
     std::filesystem::remove_all(dir, ec);
 }

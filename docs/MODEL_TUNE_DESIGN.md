@@ -2,7 +2,7 @@
 
 Status: **proposal** (not yet implemented). Author note: grounded in the existing
 `sub0::tune` search core, `sub0::memplan` footprint model, the model registry
-(`meta.txt`), and the `report` stage. Validated assumptions come from the
+(`state.json`), and the `report` stage. Validated assumptions come from the
 tinystories dimension sweep recorded at the end of this doc.
 
 ---
@@ -63,13 +63,13 @@ and allow a true in-process `sub0llm model-tune`. This design targets the
  │       cmake --build --preset native        # rebuild                 │
  │       sub0llm tune --backend gpu           # INNER compute-tune       │
  │       cmake --build --preset native        # bake tuned batch        │
- │       sub0llm train --steps <probe budget> # PROBE-train → meta.txt   │
+ │       sub0llm train --steps <probe budget> # PROBE-train → state.json   │
  │       sub0llm report <model>               # record metrics+samples   │
  └──────────────────────────────────────────────────────────────────────┘
                  │ reads/writes
                  ▼
  ┌──────────────────────────────────────────────────────────────────────┐
- │  model registry (models/*/meta.txt, report.txt)                       │
+ │  model registry (models/*/state.json, report.txt)                       │
  │  + models/model_tune_history.tsv  (append-only, one row per probe)    │
  └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -215,7 +215,7 @@ Behaviour:
    per-knob verdicts) and append a row to `models/model_tune_history.tsv`.
 2. Load the **comparable history**: every registered model with the *same*
    `corpus / seq_len / vocab`, varying `d_model / n_layers / n_heads / d_ff`, with its
-   `best_val_nelbo`, `bits_per_byte`, `tokens_seen`, `status` (from `meta.txt` /
+   `best_val_nelbo`, `bits_per_byte`, `tokens_seen`, `status` (from `state.json` /
    `report.txt`).
 3. Build `Space` + `Budget` (VRAM from `sub0_cuda_free_vram_mb()` − headroom; param band
    from `train_tokens`), call `model_search::propose_next(...)`.
@@ -339,7 +339,7 @@ foreach(i RANGE ${MAX_CANDIDATES})
   execute_process(COMMAND ${EXE} tune --backend gpu --delta)
   execute_process(COMMAND ${CMAKE_COMMAND} --build --preset native)
 
-  # 4. TELL: probe-train to the budget (meta.txt records best val + tokens_seen).
+  # 4. TELL: probe-train to the budget (state.json records best val + tokens_seen).
   execute_process(COMMAND ${EXE} train --steps 0 --probe-epochs ${PROBE_EPOCHS})
 
   # 5. RECORD: report writes metrics + samples into the model dir and history.tsv.
@@ -412,7 +412,7 @@ a dumb, reliable loop.
 
 ## 8. Data model / retrospective history
 
-- **Source of truth**: the registry. `meta.txt` already carries
+- **Source of truth**: the registry. `state.json` already carries
   `d_model/n_layers/n_heads/seq_len/vocab/steps/epochs/tokens_seen/best_val_nelbo/status`.
   Add `bits_per_byte` and `probe_epochs` (small additions to `ModelMeta`).
 - **`report.txt`** (already saved per model this session) keeps the human metrics +

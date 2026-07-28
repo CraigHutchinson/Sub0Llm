@@ -61,7 +61,7 @@
 #include "sub0/tokmap.hpp"     // sub0::TokWriter — v2 corpus.tok (u64 counts + byte-aligned token width)
 #include "sub0/config_util.hpp"// sub0::config — pure, unit-tested config decisions (autosize / tune-cache / precision)
 #include "sub0/registry.hpp"  // registry::describe_config — the X-macro-driven config summary shared
-                            // with config.json/meta.txt, so this banner cannot omit an axis
+                            // with config.json/state.json, so this banner cannot omit an axis
 #include "sub0_build_facts.hpp" // CMake-baked build facts (device caps + output paths) -> the CLI defaults
 
 namespace tok = sub0::tok;
