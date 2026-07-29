@@ -114,3 +114,44 @@ TEST_CASE("positional encoding facts are consistent", "[config]") {
     if constexpr (!sub0::HAS_POS_EMB)
         for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) REQUIRE(p.kind != sub0::PKind::PosEmb);
 }
+
+// --- ARCH_FINGERPRINT: adding an axis must not invalidate existing checkpoints ------------------
+// depth_attn_stride was added to the packed fingerprint (2026-07-29) in the byte middle_layers can
+// never reach. The claim that made that safe -- "with the stride at its default 0 every fingerprint
+// this function has ever produced is reproduced BIT-IDENTICALLY" -- is exactly the kind of claim that
+// is easy to assert in a comment and expensive to be wrong about: every .ckpt and .bin on disk is
+// rejected the moment it stops holding. So it is pinned here against a literal transcription of the
+// PREVIOUS packing rather than against the function itself.
+namespace {
+constexpr std::uint64_t arch_fingerprint_v1(int middle_layers, int repeats, float rope_theta) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers) & 0xffffu) << 48)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(repeats)       & 0xffffu) << 32)
+         |  static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(rope_theta));
+}
+}  // namespace
+
+TEST_CASE("arch fingerprint stays bit-identical when depth attention is off", "[config]") {
+    // The three real shapes on disk right now: the LoopSplit arms (deep16 / loop10x6 / shallow10).
+    for (auto [mid, rep] : {std::pair{0, 1}, std::pair{6, 2}, std::pair{0, 1}}) {
+        for (float theta : {10000.0f, 500000.0f}) {
+            REQUIRE(sub0::arch_fingerprint(mid, rep, theta, /*depth_attn_stride=*/0)
+                    == arch_fingerprint_v1(mid, rep, theta));
+        }
+    }
+    // ...and a non-zero stride MUST differ, or a depth-attention model would load into a plain build
+    // and silently compute something else -- there is no shape difference to catch it (depth
+    // attention adds no parameters at all, so PARAM_FLOATS is identical).
+    REQUIRE(sub0::arch_fingerprint(0, 1, 10000.0f, 4) != sub0::arch_fingerprint(0, 1, 10000.0f, 0));
+    REQUIRE(sub0::arch_fingerprint(0, 1, 10000.0f, 4) != sub0::arch_fingerprint(0, 1, 10000.0f, 2));
+
+    // Round-trips through the decoder, so the diagnostic can name the mismatched value.
+    const sub0::ArchAxes got = sub0::arch_axes_of(sub0::arch_fingerprint(6, 2, 10000.0f, 4));
+    REQUIRE(got.middle_layers == 6);
+    REQUIRE(got.repeats == 2);
+    REQUIRE(got.depth_attn_stride == 4);
+    REQUIRE(got.rope_theta == 10000.0f);
+
+    // This build's own fingerprint agrees with its own axes (the invariant the loaders compare).
+    REQUIRE(sub0::ARCH_FINGERPRINT
+            == sub0::arch_fingerprint(LOOP_MIDDLE_LAYERS, LOOP_REPEATS, ROPE_THETA, DEPTH_ATTN_STRIDE));
+}

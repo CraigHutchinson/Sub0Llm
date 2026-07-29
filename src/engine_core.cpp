@@ -170,7 +170,10 @@ bool load_model(const char* path) {
                      got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS);
         std::println(stderr, "  rope theta    : file {:g} | this build {:g}",
                      got.rope_theta, static_cast<double>(ROPE_THETA));
-        std::println(stderr, "Rebuild with matching --loop-middle-layers/--loop-repeats/--rope-theta.");
+        std::println(stderr, "  depth attn    : file stride {} | this build stride {} (0 = off)",
+                     got.depth_attn_stride, DEPTH_ATTN_STRIDE);
+        std::println(stderr, "Rebuild with matching --loop-middle-layers/--loop-repeats/--rope-theta/"
+                             "--depth-attn-stride.");
         return false;
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }

@@ -575,6 +575,7 @@ int main(int argc, char** argv) {
     int n_heads      = 0;
     int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
+    int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
@@ -626,6 +627,12 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--loop-repeats", loop_repeats,
                    "LoopSplit: how many times the middle block runs (1 = off)")
+       ->capture_default_str();
+    app.add_option("--depth-attn-stride", depth_attn_stride,
+                   "Depth attention: every Nth EXECUTION contributes its K/V to a depth cache that "
+                   "later executions mix their value vector over (0 = off). Adds no parameters. "
+                   "Memory scales as executions/N, so this is the knob that makes it fit -- see "
+                   "docs/DEPTH_ATTENTION.md")
        ->capture_default_str();
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
@@ -1257,6 +1264,13 @@ int main(int argc, char** argv) {
     // fixed parameter count. 0/1 is off. See layout.hpp's make_layer_execution_order().
     cos << "constexpr int  LOOP_MIDDLE_LAYERS = " << loop_middle  << ";\n";
     cos << "constexpr int  LOOP_REPEATS       = " << loop_repeats << ";\n";
+    // Depth attention: every DEPTH_ATTN_STRIDE-th execution appends its (K, V) to a per-window depth
+    // cache, and every execution replaces its value vector with a softmax-weighted mixture over that
+    // cache plus its own -- a distribution across DEPTH, per (batch, kv-head, position). K is passed
+    // through unchanged; only V is rewritten. Adds NO parameters, so PARAM_FLOATS and the checkpoint
+    // shape are untouched -- which is exactly why it must enter ARCH_FINGERPRINT instead (it changes
+    // computation invisibly to nfloat). 0 = off. See docs/DEPTH_ATTENTION.md for the derivation.
+    cos << "constexpr int  DEPTH_ATTN_STRIDE  = " << depth_attn_stride << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";

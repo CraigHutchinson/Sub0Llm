@@ -60,6 +60,12 @@ param(
     [int]    $DModel = 192,
     [int]    $Heads = 6,
     [int]    $SeqLen = 512,
+    # Pinned identically across every arm and seed -- see the call site for why leaving these to the
+    # per-arm auto tuner silently broke the first sweep's token matching. The defaults are what the
+    # most expensive arm (16 executions) fits on an 8 GB card.
+    [int]    $Batch = 448,
+    [double] $Lr = 0.00748332,
+    [int]    $Steps = 8586,
     [string] $Clang = "C:/Program Files/LLVM/bin/clang++.exe",
     [string] $ClangC = "C:/Program Files/LLVM/bin/clang.exe"
 )
@@ -201,7 +207,14 @@ foreach ($seed in 1..$Seeds) {
         Write-Host "`n--- $($a.Name) seed $seed ---" -ForegroundColor Cyan
         # --seed varies init/shuffle; --subset-seed is PINNED so every arm and seed sees the SAME
         # documents. Varying both would confound architecture with data.
+        # --batch/--lr/--steps are PINNED and identical across arms. Leaving them to the per-arm auto
+        # tuner is what confounded the first sweep: it sizes batch from free VRAM, so the cheapest arm
+        # (fewest executions) got batch 512 where the others got 448 -- and since tokens_per_step is
+        # batch*SEQ_LEN, "matched steps" silently meant 14.3% MORE TOKENS for that arm, plus a
+        # different lr. The batch must be what the MOST EXPENSIVE arm fits; the headroom the cheaper
+        # arms give up is the price of a controlled comparison. See loopsplit-3arm-batch-confound.
         & "$bin/sub0llm-train.exe" --fresh --model "$tag/model.bin" `
+            --batch $Batch --lr $Lr --steps $Steps `
             --seed $seed --subset-seed 1 --corpus-fraction $CorpusFraction
         if ($LASTEXITCODE -ne 0) { Write-Warning "$($a.Name) seed $seed exited $LASTEXITCODE" }
     }

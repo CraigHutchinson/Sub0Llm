@@ -712,9 +712,10 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     if (arch != sub0::ARCH_FINGERPRINT) {
         const sub0::ArchAxes got = sub0::arch_axes_of(arch);
         sub0::log::warn("ignoring checkpoint '{}': built with a different architecture in a way nfloat "
-                        "cannot catch -- loop schedule {}x{} vs {}x{}, rope theta {:g} vs {:g}.",
+                        "cannot catch -- loop schedule {}x{} vs {}x{}, rope theta {:g} vs {:g}, "
+                        "depth-attn stride {} vs {}.",
                         path, got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS,
-                        got.rope_theta, ROPE_THETA);
+                        got.rope_theta, ROPE_THETA, got.depth_attn_stride, DEPTH_ATTN_STRIDE);
         return false;
     }
 
@@ -1577,6 +1578,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.subset_seed     = subset_seed;
         cfg.d_model = D_MODEL; cfg.n_layers = N_LAYERS; cfg.n_heads = N_HEADS; cfg.n_kv_heads = N_KV_HEADS;
         cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
+        cfg.depth_attn_stride = DEPTH_ATTN_STRIDE;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;
         cfg.rope_theta = ROPE_THETA;   // changes what the model computes -- layout.hpp ARCH_FINGERPRINT
         cfg.seq_len = SEQ_LEN; cfg.vocab = VOCAB; cfg.ternary = static_cast<int>(USE_TERNARY);

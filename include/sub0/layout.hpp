@@ -152,20 +152,33 @@ inline constexpr std::array<int, LOOP_EXEC_COUNT> LAYER_EXEC_ORDER = make_layer_
 // Packed rather than hashed so a mismatch can name the actual values -- a fingerprint you cannot decode
 // makes for a diagnostic that says only "different", which is what sent the LoopSplit case unnoticed in
 // the first place. float is bit_cast, so the comparison is exact and no tolerance question arises.
-static_assert(LOOP_MIDDLE_LAYERS >= 0 && LOOP_MIDDLE_LAYERS <= 0xffff, "LOOP_MIDDLE_LAYERS must fit 16 bits");
+// Field layout, high to low:  [63:56] depth_attn_stride | [55:48] middle_layers | [47:32] repeats |
+// [31:0] rope_theta. depth_attn_stride was added (2026-07-29) into the byte middle_layers was never
+// able to reach: it occupies [55:48] in practice because a model with 256+ layers does not exist and
+// is now asserted against. That placement is deliberate -- with the stride at its default 0, every
+// fingerprint this function has ever produced is reproduced BIT-IDENTICALLY, so no existing checkpoint
+// is invalidated by gaining the new axis. Any non-zero stride yields a distinct fingerprint, which is
+// the point: depth attention changes computation while leaving PARAM_FLOATS untouched (it adds no
+// parameters at all), so nfloat cannot catch a cross-load and this is the only thing that can.
+static_assert(LOOP_MIDDLE_LAYERS >= 0 && LOOP_MIDDLE_LAYERS <= 0xff, "LOOP_MIDDLE_LAYERS must fit 8 bits");
 static_assert(LOOP_REPEATS       >= 0 && LOOP_REPEATS       <= 0xffff, "LOOP_REPEATS must fit 16 bits");
-inline constexpr std::uint64_t arch_fingerprint(int middle_layers, int repeats, float rope_theta) {
-    return (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers) & 0xffffu) << 48)
-         | (static_cast<std::uint64_t>(static_cast<unsigned>(repeats)       & 0xffffu) << 32)
+static_assert(DEPTH_ATTN_STRIDE  >= 0 && DEPTH_ATTN_STRIDE  <= 0xff, "DEPTH_ATTN_STRIDE must fit 8 bits");
+inline constexpr std::uint64_t arch_fingerprint(int middle_layers, int repeats, float rope_theta,
+                                                int depth_attn_stride = 0) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(depth_attn_stride) & 0xffu)   << 56)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(middle_layers)     & 0xffu)   << 48)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(repeats)           & 0xffffu) << 32)
          |  static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(rope_theta));
 }
-struct ArchAxes { int middle_layers; int repeats; float rope_theta; };
+struct ArchAxes { int middle_layers; int repeats; float rope_theta; int depth_attn_stride; };
 inline constexpr ArchAxes arch_axes_of(std::uint64_t fp) {
-    return ArchAxes{ static_cast<int>((fp >> 48) & 0xffffu),
+    return ArchAxes{ static_cast<int>((fp >> 48) & 0xffu),
                      static_cast<int>((fp >> 32) & 0xffffu),
-                     std::bit_cast<float>(static_cast<std::uint32_t>(fp & 0xffffffffu)) };
+                     std::bit_cast<float>(static_cast<std::uint32_t>(fp & 0xffffffffu)),
+                     static_cast<int>((fp >> 56) & 0xffu) };
 }
-inline constexpr std::uint64_t ARCH_FINGERPRINT = arch_fingerprint(LOOP_MIDDLE_LAYERS, LOOP_REPEATS, ROPE_THETA);
+inline constexpr std::uint64_t ARCH_FINGERPRINT =
+    arch_fingerprint(LOOP_MIDDLE_LAYERS, LOOP_REPEATS, ROPE_THETA, DEPTH_ATTN_STRIDE);
 // What a file carrying NO fingerprint must be assumed to have been built with. Such a file predates the
 // record, so it is necessarily un-looped -- that part is a sound inference. ROPE_THETA is NOT inferable
 // the same way (it was settable long before the record existed), so the legacy default is this build's
@@ -206,6 +219,7 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(USE_TIED_EMBEDDINGS));
     mix(static_cast<std::uint64_t>(USE_QK_NORM));
     mix(ARCH_FINGERPRINT);      // folds in LoopSplit's schedule and ROPE_THETA
+    mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));
     mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(ROPE_SCALE_FACTOR)));
     return h;
