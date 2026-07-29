@@ -119,6 +119,47 @@ measured VRAM alongside quality per the standing three-pillar policy. Note the C
 currently treats `qkv` as a CHECKPOINT (recomputed in backward), so the depth cache cannot simply
 borrow those buffers — it needs its own retained storage or its own recompute.
 
+## 5a. BLOCKER found before coding Stage 1: `Node` cannot express the depth cache
+
+`sub0::Node` (core.hpp) has a FIXED fanout — `a`, `b`, `w`, `bias`. Depth attention consumes `S+1`
+(K, V) pairs, where `S` grows with the execution index. **There is no way to hang a variable-length
+input list off a Node**, and the backward pass needs those exact nodes to accumulate `∂L/∂k_d` and
+`∂L/∂v_d` into (§4's CROSS-EXECUTION terms). This is the first thing Stage 1 must solve, and it is not
+visible from the reference (PyTorch just holds a Python list and autograd tracks it).
+
+Options considered:
+
+1. **Widen `Node`** — add a pointer array or a span of inputs. Rejected: `Node` is the hot arena
+   object, `MAX_NODES`/`ACT_CAP` are sized from it (`backend_cpu.cpp:84-102`), and every op pays for a
+   field only one op uses.
+2. **Decompose into pairwise ops** — rejected as WRONG, not just costly: the depth softmax is jointly
+   normalised over all `S+1` entries, so it does not factor into a chain of pairwise mixes.
+3. **RECOMMENDED — a per-execution side table on the (thread_local) Model.** The exec count is a
+   compile-time constant, so add to `Model`:
+   ```cpp
+   Node* depth_k[sub0::LOOP_EXEC_COUNT] = {};   // K contributed by execution e (nullptr = not cached)
+   Node* depth_v[sub0::LOOP_EXEC_COUNT] = {};
+   int   depth_n = 0;                            // how many are live in THIS forward
+   ```
+   `forward()` appends when `e % DEPTH_ATTN_STRIDE == 0`; the `Op::DepthAttn` node records its own
+   execution index (reuse the spare `heads` field, or add one `int`), and `backward_node` reads the
+   table to find the nodes whose `grad` spans it must accumulate into.
+
+   This is sound because the table is `thread_local` alongside the Model, backward runs on the same
+   thread before `graph_reset()`, and the arena keeps those nodes alive for exactly that window — the
+   same lifetime assumption `op_embed` already relies on for its `ids` pointer (see `forward()`'s
+   `static thread_local pos_ids` comment). **Reset `depth_n = 0` at the top of every `forward()`**, or a
+   second forward in the same graph would mix the first one's cache into it.
+
+Two further Stage-1 requirements this exposes:
+
+- **`MAX_NODES` / `ACT_CAP` must grow**: one extra node per execution, each holding a `[T, D_KV]`
+  output. Under-sizing the arena is a silent overwrite, not an allocation failure.
+- **The gradient check must use `DEPTH_ATTN_STRIDE = 1` and `LOOP_REPEATS >= 2`**, so at least one
+  execution really does read a cache entry from an earlier execution. At stride 0 (off) or repeats 1
+  the cross-execution path is never taken and the check would pass while proving nothing — the same
+  trap the CUDA parity test has to avoid (§6, Stage 2).
+
 ## 6. Staging
 
 Each stage lands green on its own; the identity gate (`AGENTS.md` §4 — assertion AND test-case counts
