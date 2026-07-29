@@ -125,6 +125,44 @@ TEST_CASE("trend_plateaued: an early fast-descending run does NOT stop", "[coher
     REQUIRE_FALSE(trend_plateaued(early, 6, 0.005));
 }
 
+// --- improved_recently: the patience guard, pinned on the run it was written for -----------------
+using sub0::coherence::improved_recently;
+
+TEST_CASE("improved_recently: a monotonically improving run is never plateaued", "[coherence]") {
+    // The ACTUAL failure, 2026-07-28: LoopSplit arm A_deep16's val-NELBO over the evals leading to
+    // the stop. Every one of the last three is a new global best, yet the run was marked "plateaued"
+    // because the fitted drop (~1.4%/window) sat just under the hint-loosened threshold (~1.64%).
+    const std::vector<double> arm_a = {2.1602, 2.1548, 2.1490, 2.1435, 2.1385, 2.1332};
+    REQUIRE(improved_recently(arm_a, 3));
+
+    // Arm B_loop10x6, same evals, a much shallower slope -- still a new best every time.
+    const std::vector<double> arm_b = {2.2260, 2.2231, 2.2205, 2.2191, 2.2179, 2.2140};
+    REQUIRE(improved_recently(arm_b, 3));
+
+    // The trend test on its own would have stopped BOTH at a threshold in that range -- which is
+    // exactly why the patience guard is a separate, threshold-free condition rather than a retune.
+    REQUIRE(trend_plateaued(arm_a, 5, 0.0164));
+    REQUIRE(trend_plateaued(arm_b, 5, 0.0164));
+}
+
+TEST_CASE("improved_recently: a genuine floor reports no recent improvement", "[coherence]") {
+    // Bouncing around a floor with the best value reached early: the last three evals beat nothing.
+    const std::vector<double> floored = {1.9004, 1.9006, 1.9009, 1.9007, 1.9010, 1.9008};
+    REQUIRE_FALSE(improved_recently(floored, 3));
+
+    // Strictly worsening (overfitting tail) -- likewise no new best.
+    const std::vector<double> rising = {1.90, 1.91, 1.92, 1.93, 1.94, 1.95};
+    REQUIRE_FALSE(improved_recently(rising, 3));
+}
+
+TEST_CASE("improved_recently: too little history means keep training", "[coherence]") {
+    // Never claim "no improvement" from evidence that cannot show one -- the safe direction for a
+    // guard whose false negative wastes compute and whose false positive truncates a run.
+    REQUIRE(improved_recently({}, 3));
+    REQUIRE(improved_recently({2.0, 1.9, 1.8}, 3));
+    REQUIRE(improved_recently({2.0, 1.9, 1.8, 1.85}, 5));
+}
+
 TEST_CASE("trend_plateaued: a genuine floor stops; a real slope does not", "[coherence]") {
     const std::vector<double> flat = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
     REQUIRE(trend_plateaued(flat, 6, 0.005));

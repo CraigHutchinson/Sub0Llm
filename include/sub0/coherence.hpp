@@ -92,4 +92,29 @@ inline bool trend_plateaued(const std::vector<double>& series, int window, doubl
     return rel_trend < min_rel;
 }
 
+// Did the series reach a NEW GLOBAL MINIMUM within its last `patience` entries?
+//
+// The classic early-stopping patience criterion, and the guard trend_plateaued alone cannot provide.
+// A trend fit answers "how fast is this falling", which a threshold then judges -- and any threshold
+// can be too strict for a run whose real improvement rate is simply slower than the threshold assumes.
+// This answers a different, THRESHOLD-FREE question: is the run still producing the best model it has
+// ever produced? A series doing that is not plateaued, whatever its slope looks like.
+//
+// The failure that motivated it (2026-07-28): two LoopSplit arms stopped at the same eval marked
+// "plateaued" while val_nelbo was setting a new best at EVERY eval -- 2.1435, 2.1385, 2.1332,
+// monotonically down. The fitted drop (~1.4% per window) merely sat under the effective threshold
+// (~1.64%, loosened because the run was near its expected-plateau hint). Nothing had plateaued; the
+// runs were truncated, and the results are matched-budget rather than converged.
+//
+// Returns true when there is not yet enough history to judge -- too little evidence must mean
+// "keep training", never "stop".
+inline bool improved_recently(const std::vector<double>& series, int patience) {
+    const int n = static_cast<int>(series.size());
+    if (patience < 1 || n <= patience) return true;   // not enough history to say otherwise
+    double best_before = series[0];
+    for (int i = 1; i < n - patience; ++i) best_before = std::min(best_before, series[i]);
+    for (int i = n - patience; i < n; ++i) if (series[i] < best_before) return true;
+    return false;
+}
+
 }  // namespace sub0::coherence

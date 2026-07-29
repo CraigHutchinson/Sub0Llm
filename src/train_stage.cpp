@@ -23,6 +23,7 @@
                              // set_tf32 seam GpuTrainer below reuses, so those aren't re-declared here
 #include "sub0/config_util.hpp"  // sub0::config::kTokensPerParam — the SAME target ratio autosize() uses
 #include "sub0/log.hpp"      // sub0::log — leveled diagnostics + the <model_dir>/train.log tee
+#include "sub0/eval.hpp"     // held-out NELBO: window planning + the CPU/device dispatch (shared with tests)
 #include "sub0/evalcache.hpp"
 #include "sub0/registry.hpp"
 #include "sub0/tokmap.hpp"
@@ -122,9 +123,18 @@ constexpr double TICK_SECONDS        = 180.0;  // heartbeat: interim progress li
 constexpr double CKPT_SECONDS        = 3600.0; // crash-resistance checkpoint on a wall-clock tick,
                                                // independent of the (far rarer) eval cadence -- so an
                                                // unattended run never loses more than ~1h of progress
-constexpr int    EVAL_WINDOWS_MAX    = 128;   // bounded cost per eval
+constexpr int    EVAL_WINDOWS_MAX    = sub0::eval::WINDOWS_MAX;   // bounded cost per eval (one source
+                                              // of truth: tests plan the same window set from it)
 constexpr int    MAX_EPOCHS_BACKSTOP = 30;    // ceiling if no plateau is detected
 constexpr int    PLATEAU_WINDOW      = 6;     // evals fitted by the least-squares trend test
+constexpr int    PLATEAU_PATIENCE    = 3;     // ...and a plateau ALSO requires no new best val-NELBO in
+                                              // the last this-many evals (~0.3 epochs at the 0.10-epoch
+                                              // eval cadence). Threshold-free, and the guard the trend
+                                              // test structurally cannot provide: a run still producing
+                                              // its best-ever model has not plateaued no matter how
+                                              // shallow its fitted slope looks. Added after two arms
+                                              // stopped "plateaued" while hitting a new best at EVERY
+                                              // eval -- see coherence::improved_recently.
 constexpr double PLATEAU_MIN_REL     = 0.005; // stop when the best-fit drop over the window < 0.5%
                                               // (~0.8%/epoch). 2% was too loose: it stopped on slow-
                                               // but-real tails (d96 @1.985 and d128 @2.68 both still
@@ -189,7 +199,12 @@ constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 added best_step (prune_ckpts b
                                             // v5 adds the architecture fingerprint -- axes that change
                                             // COMPUTATION but not shape (LoopSplit's schedule,
                                             // ROPE_THETA), which nfloat and every dim field are blind
-                                            // to (layout.hpp ARCH_FINGERPRINT)
+                                            // to (layout.hpp ARCH_FINGERPRINT).
+// NOT bumped for tokens_seen (2026-07-29): the resumed token count is now carried by state.json, which
+// already records it, rather than by a new checkpoint field. A bump would have invalidated every
+// existing .ckpt -- including the LoopSplit arms' checkpoints, which exist precisely so those runs can
+// be continued past the false plateau this same change set fixes. Breaking them to improve the
+// bookkeeping about them would have been a poor trade.
 
 // --- corpus.tok access ------------------------------------------------------
 // The tokenized corpus is consumed via a read-only memory map (sub0::TokMap): the OS
@@ -307,39 +322,19 @@ sub0::TokView load_corpus_tokens(sub0::TokMap& tok, std::vector<int>& od_buf, co
 // Mean cross-entropy per token over a fixed, evenly-spaced set of windows in the
 // held-out tail. Fixed windows make the metric comparable across evals (so the
 // plateau sign test sees signal, not resampling noise) and bound the cost.
+// `session` selects the compute path: a Session brought up with the device gives the GPU forward-loss
+// entry, a default-constructed one (or any build without a device backend) transparently uses the CPU.
+double evaluate(sub0::TokView data, std::size_t val_start, const sub0::eval::Session& session) {
+    const sub0::eval::WindowSet ws = sub0::eval::plan(data, val_start, EVAL_WINDOWS_MAX);
+    if (ws.empty()) return std::numeric_limits<double>::quiet_NaN();
+    return sub0::eval::nelbo(data, ws, SEQ_LEN, session, DEFAULT_THREADS);
+}
+
+// CPU-only overload for the callers that have no session to hand (the training loop's own periodic
+// eval -- see sub0::eval::Session's note on why the trainer deliberately stays on the CPU).
 double evaluate(sub0::TokView data, std::size_t val_start) {
-    const std::size_t last = data.size() - SEQ_LEN - 1;
-    if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
-    const std::size_t span = last - val_start;
-    const int avail  = static_cast<int>(span / SEQ_LEN) + 1;
-    const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
-    const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
-    double total = 0.0;
-    // Data-parallel over the nw fixed windows, same shape as train_batch's parallel region
-    // (backend_cpu.cpp) -- forward()/graph_reset()/cross_entropy all operate on a thread_local model
-    // arena, so this is forward-only train_batch minus the backward/grad-reduction half. `win` is
-    // declared INSIDE the parallel region (not hoisted, unlike the old single-threaded loop) so each
-    // thread gets its own buffer -- a shared one would race between data.copy_to's write and forward's
-    // read. Static schedule keeps the SET of windows evaluated identical to the sequential version
-    // (still every w in [0,nw), still the "fixed, evenly-spaced" windows the comment above promises);
-    // only their evaluation and summation ORDER changes, which floating-point addition isn't strictly
-    // invariant to (same caveat train_batch's own cross-thread grad reduction already carries).
-    #pragma omp parallel num_threads(DEFAULT_THREADS)
-    {
-        int win[SEQ_LEN + 1];   // materialize the window (token view may be uint16-packed)
-        #pragma omp for reduction(+ : total) schedule(static)
-        for (int w = 0; w < nw; ++w) {
-            std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
-            if (s > last) s = last;
-            data.copy_to(s, SEQ_LEN + 1, win);
-            sub0::graph_reset();
-            sub0::Node* logits = sub0::forward(win, SEQ_LEN);
-            sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
-            total += loss->data[0];
-        }
-    }
-    sub0::graph_reset();
-    return total / nw;
+    const sub0::eval::Session cpu_only(/*allow=*/false);
+    return evaluate(data, val_start, cpu_only);
 }
 
 // Is a sub0llm-train holding the machine-wide guard right now? A NON-INVASIVE probe: OpenMutex only
@@ -381,18 +376,18 @@ struct ContextCurve {
     std::vector<int>    width;   // context width in tokens
     std::vector<double> nelbo;   // mean cross-entropy at that width
 };
-ContextCurve evaluate_context_curve(sub0::TokView data, std::size_t val_start) {
+ContextCurve evaluate_context_curve(sub0::TokView data, std::size_t val_start,
+                                    const sub0::eval::Session& session) {
     ContextCurve c;
-    // This eval runs on the CPU backend -- sub0::forward(), not the device. The device seam has no
-    // batched forward-only entry point (sub0_dev_backward computes a full backward it would throw
-    // away; sub0_dev_forward_one is single-token decode), so there is nothing to dispatch to yet.
-    // Each extra width is therefore another full CPU pass over every eval window.
+    // SHORTEN when this eval has to run on the CPU: every extra width is another full CPU pass over
+    // every eval window. Endpoints only (shortest and SEQ_LEN) still gives the gain figure -- which is
+    // the number an A/B actually compares -- at half the cost, instead of the intermediate shape.
     //
-    // So SHORTEN when the machine is not ours: a running trainer owns the CPU, and stealing it both
-    // slows the trainer and distorts its throughput numbers. Endpoints only (shortest and SEQ_LEN)
-    // still gives the gain figure -- which is the number an A/B actually compares -- at half the
-    // cost of the full curve, instead of the intermediate shape.
-    const bool shorten = trainer_active();
+    // With a device session the whole curve is cheap, so measure all of it. Note the two conditions
+    // coincide by construction rather than by accident: report builds its Session with
+    // `allow = !trainer_active()`, so "no device" and "a trainer owns this machine" are the same
+    // state, and the shortening still triggers exactly when stealing CPU from a trainer would.
+    const bool shorten = !session.use_device;
     if (shorten) {
         c.width.push_back(64);
         c.width.push_back(SEQ_LEN);
@@ -404,32 +399,12 @@ ContextCurve evaluate_context_curve(sub0::TokView data, std::size_t val_start) {
         if (c.width.empty() || c.width.back() != SEQ_LEN) c.width.push_back(SEQ_LEN);
     }
 
-    const std::size_t last = data.size() - SEQ_LEN - 1;
-    if (val_start > last) return c;
-    const std::size_t span   = last - val_start;
-    const int         avail  = static_cast<int>(span / SEQ_LEN) + 1;
-    const int         nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
-    const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
-
-    for (int cw : c.width) {
-        double total = 0.0;
-        #pragma omp parallel num_threads(DEFAULT_THREADS)
-        {
-            int win[SEQ_LEN + 1];
-            #pragma omp for reduction(+ : total) schedule(static)
-            for (int w = 0; w < nw; ++w) {
-                std::size_t st = val_start + static_cast<std::size_t>(w) * stride;
-                if (st > last) st = last;
-                data.copy_to(st, static_cast<std::size_t>(cw) + 1, win);
-                sub0::graph_reset();
-                sub0::Node* logits = sub0::forward(win, cw);
-                sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
-                total += loss->data[0];
-            }
-        }
-        c.nelbo.push_back(total / nw);
-    }
-    sub0::graph_reset();
+    // ONE window plan shared by every width -- that is what makes the widths comparable: they score
+    // identical text and differ only in how much of it the model may attend to.
+    const sub0::eval::WindowSet ws = sub0::eval::plan(data, val_start, EVAL_WINDOWS_MAX);
+    if (ws.empty()) { c.width.clear(); return c; }
+    for (int cw : c.width)
+        c.nelbo.push_back(sub0::eval::nelbo(data, ws, cw, session, DEFAULT_THREADS));
     return c;
 }
 
@@ -440,18 +415,13 @@ ContextCurve evaluate_context_curve(sub0::TokView data, std::size_t val_start) {
 // model error -> perplexity 5.17 here), entropy compares the model to ITSELF, so the
 // matched temperature is not biased upward by an imperfect fit and centers near 1.
 double mean_entropy(sub0::TokView data, std::size_t val_start) {
-    const std::size_t last = data.size() - SEQ_LEN - 1;
-    if (val_start > last) return std::numeric_limits<double>::quiet_NaN();
-    const std::size_t span = last - val_start;
-    const int avail  = static_cast<int>(span / SEQ_LEN) + 1;
-    const int nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
-    const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
+    const sub0::eval::WindowSet ws = sub0::eval::plan(data, val_start, EVAL_WINDOWS_MAX);
+    if (ws.empty()) return std::numeric_limits<double>::quiet_NaN();
+    const int nw = ws.count;
     double total = 0.0; long n = 0;
     int win[SEQ_LEN + 1];                                   // materialize the window (token view may be uint16-packed)
     for (int w = 0; w < nw; ++w) {
-        std::size_t s = val_start + static_cast<std::size_t>(w) * stride;
-        if (s > last) s = last;
-        data.copy_to(s, SEQ_LEN, win);
+        data.copy_to(ws.start_of(w), SEQ_LEN, win);
         sub0::graph_reset();
         sub0::Node* logits = sub0::forward(win, SEQ_LEN);
         for (int r = 0; r < logits->rows; ++r) {
@@ -490,6 +460,12 @@ using sub0::coherence::ngram_repeat;   // pure n-gram repeat metric (see coheren
 bool plateaued(const std::vector<double>& evals, double frac_epoch,
                std::optional<double> expected_plateau_epoch = std::nullopt) {
     if (frac_epoch < PLATEAU_MIN_EPOCH) return false;
+    // PATIENCE, checked before the trend test and independent of every threshold below: a run that is
+    // still setting new best val-NELBOs is not plateaued, whatever a fitted slope says. This is the
+    // direct fix for the 2026-07-28 false stop, where two arms were cut at the same eval while
+    // improving monotonically -- their fitted drop was real, just slightly under a threshold that the
+    // expected_plateau_epoch hint had loosened. See coherence::improved_recently.
+    if (sub0::coherence::improved_recently(evals, PLATEAU_PATIENCE)) return false;
     double min_rel = PLATEAU_MIN_REL;
     if (expected_plateau_epoch) {
         const double dist = std::abs(frac_epoch - *expected_plateau_epoch);   // epochs from the hint
@@ -527,6 +503,11 @@ struct RunState {
     long step = 0;
     double best_loss = std::numeric_limits<double>::infinity();
     long best_step = -1;          // step of the best eval so far -- prune_ckpts() exempts it
+    // Cumulative tokens actually trained on (sum of batch_t*seq_t over every step), CARRIED across
+    // resumes rather than re-derived. See CKPT_VERSION v6: the old step*batch*SEQ_LEN reconstruction
+    // silently over-counted a resumed run, which made "same steps" and "same tokens" disagree between
+    // two arms of the same A/B.
+    long long tokens_seen = 0;
     std::vector<double> evals;
     // Per-source cumulative tokens drawn (sub0::BlendFairness::drawn_tokens) + the NAME each entry
     // belongs to (index-aligned with each other, not necessarily with the CURRENT run's `sources[]` --
@@ -847,15 +828,28 @@ void prune_ckpts(const std::string& model_path, int keep, long best_step) {
 // generation fits the trained window and the weights are dense -- `use_gpu` selects a GPU session an
 // earlier sub0::DecodeSession already brought up (pass sess.use_gpu; callers making several preview_at
 // calls in a row -- report's sample battery, autotemp's final sample -- should share ONE session
-// rather than re-paying CUDA init/upload per call). Callers may ask for up to a full SEQ_LEN-token
-// sample (the end-of-training print exercises the long-context path deliberately), which together
-// with a non-empty prompt CAN exceed SEQ_LEN -- that falls through to the slower full-forward
-// sliding-window loop below (a plain last-SEQ_LEN slice; preview_at never needs attention sinks, a
-// gen-only --attn-sinks feature).
+// rather than re-paying CUDA init/upload per call).
+//
+// `n` is "up to n more tokens, BOUNDED BY THE TRAINED WINDOW" -- it is clamped to SEQ_LEN - ctx.size()
+// below. That clamp is what keeps every caller on the KV-cache path, and it fixes a severe, long-
+// mystifying performance cliff: the fast path's precondition is `ctx.size() + n <= SEQ_LEN`, so asking
+// for a full SEQ_LEN-token sample after ANY non-empty prompt missed it by exactly the prompt's length
+// and silently fell into the loop below -- a FULL FORWARD PER TOKEN, ~100x slower. report's sample
+// battery asks for exactly that, so every sample in every report took the slow path.
+//
+// It is also the root cause of the "sub0llm-gen freezes at --n >= SEQ_LEN while --n 500 is fine"
+// report: nothing was hung: --n 500 after a 4-token prompt fits the window and decodes in a second,
+// --n 512 does not fit and grinds through 512 full forwards.
+//
+// The loop below is NOT dead -- it is the only path under USE_TERNARY, where KV-cache decode is
+// unavailable. It is a plain last-SEQ_LEN slice; preview_at never needs attention sinks (a gen-only
+// --attn-sinks feature).
 std::string preview_at(const std::string& prompt, int n, float temp, int topk, std::mt19937& rng,
                        bool use_gpu) {
     std::vector<int> ctx = sub0::encode(prompt);
     if (ctx.empty()) ctx.push_back(0);
+    n = std::min(n, SEQ_LEN - static_cast<int>(ctx.size()));
+    if (n <= 0) return sub0::detokenize(ctx);   // the prompt already fills the window
     // Same learned stop signal gen_stage.cpp's decode loops check (see core.hpp's eos_token_id()
     // doc comment): stop BEFORE pushing so the marker is never printed, instead of always running
     // to the fixed token budget `n`. Without this, previews/report.txt samples ran straight through
@@ -1564,13 +1558,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
 
     std::mt19937 rng(seed);
     RunState rs;
-    // tokens_seen (state.json, informational): seeded below once the resume block below settles
-    // rs.step/batch to their final values (rs.step*batch*SEQ_LEN -- the same approximation used
-    // before the token-budget scheduler existed, a reasonable carry-forward estimate on resume since
-    // the exact historical per-step seq_t isn't in the checkpoint), then accumulated EXACTLY from
-    // real per-step batch_t*seq_t for the rest of this invocation. Declared here (not where it's
-    // seeded) so write_state's [&] capture below can see it.
-    long long tokens_seen_est = 0;
+    // tokens_seen lives in RunState (rs.tokens_seen) so the checkpoint carries the MEASURED count
+    // across resumes. It accumulates exactly batch_t*seq_t per step -- never reconstructed from
+    // step*batch*SEQ_LEN, which assumed every historical step ran a full-length window at the current
+    // batch and inflated a resumed run's reported tokens and epochs against an unresumed one at the
+    // same step count. See CKPT_VERSION v6.
 
     // The single source of truth for this run's training recipe (see registry.hpp's RunConfig doc
     // comment) -- built fresh from live state each time so it always reflects whatever `optimizer`/
@@ -1618,7 +1610,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         m.updated = sub0::registry::now_iso();
         m.steps = rs.step;
         m.epochs = static_cast<double>(rs.step) / static_cast<double>(epoch_steps);
-        m.tokens_seen = tokens_seen_est;
+        m.tokens_seen = rs.tokens_seen;
         m.best_val_nelbo = (rs.best_loss < std::numeric_limits<double>::infinity()) ? rs.best_loss : -1.0;
         m.status = status;
         sub0::registry::write_state(meta_dir, m);
@@ -1656,7 +1648,22 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // here as a pre-emptive prediction, which risked clamping a batch that would have actually
         // fit fine (the same "wasted capacity" question a live VRAM measurement can over-trigger on).
     }
-    tokens_seen_est = static_cast<long long>(rs.step) * batch * SEQ_LEN;   // batch/rs.step now resume-final
+    // Carry the MEASURED cumulative token count across the resume, from the state.json this model
+    // directory already writes at every save. It used to be reconstructed here as
+    // rs.step * batch * SEQ_LEN, which silently assumed every historical step ran a full-length window
+    // at the batch THIS invocation settled on -- false whenever seq length varies (the token-budget
+    // scheduler's normal mode) or the batch differs, and it made a resumed run's reported tokens and
+    // epochs incomparable with an unresumed one at the same step count. Reading the recorded value
+    // needs no checkpoint format change, so existing .ckpt files stay resumable.
+    //
+    // Best-effort by design: state.json tracks the LATEST save, so resuming from a deliberately older
+    // checkpoint carries a count from slightly further along. That is bounded by one save interval and
+    // still far closer than the old reconstruction; a fresh run has no state.json and starts at 0.
+    if (rs.step > 0) {
+        sub0::registry::ModelMeta prev;
+        if (sub0::registry::read_state(meta_dir, prev) && prev.tokens_seen > 0)
+            rs.tokens_seen = prev.tokens_seen;
+    }
 
     // Config-recipe reconciliation: unlike batch/lr/seed above, `optimizer` has no home in the
     // `.ckpt` binary and was previously derived PURELY from this invocation's CLI flag on every
@@ -2159,7 +2166,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // so a corpus of SHORT documents yields more, shorter windows per step: win/s rises while tok/s does
     // not. Printing wps*SEQ_LEN assumed every window was a full SEQ_LEN and overstated throughput by
     // SEQ_LEN/mean(seq_t) -- measured 2.35x on FineWeb-Edu (257,675 reported vs ~109,000 real), which is
-    // the number a run gets planned around. tokens_seen_est already accumulates batch_t*seq_t exactly;
+    // the number a run gets planned around. rs.tokens_seen already accumulates batch_t*seq_t exactly;
     // it just was not being differenced here.
     long long tokens_at_win_t0 = 0, tokens_at_last_log = 0;
     bool stop = false, graceful_stop = false;
@@ -2443,7 +2450,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         }
         run_loss += step_loss; ++run_n;
         total_windows += batch_t;                          // for wps: batch_t varies per step now
-        tokens_seen_est += static_cast<long long>(batch_t) * seq_t;
+        rs.tokens_seen += static_cast<long long>(batch_t) * seq_t;
         rs.step = step;
         rs.drawn_tokens = blend_fair.drawn_tokens;   // keep the checkpoint's fairness snapshot current --
                                                      // any save_checkpoint call below reads it from `rs`
@@ -2470,7 +2477,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Throughput over the interval just completed (training only).
             const double secs = std::chrono::duration<double>(clock::now() - win_t0).count();
             const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
-            const double tps   = secs > 0 ? static_cast<double>(tokens_seen_est - tokens_at_win_t0) / secs : 0.0;
+            const double tps   = secs > 0 ? static_cast<double>(rs.tokens_seen - tokens_at_win_t0) / secs : 0.0;
             // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
 
             // Validation NELBO only once enough of the corpus has been seen.
@@ -2518,9 +2525,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             run_loss = 0.0; run_n = 0;
             prep_secs = 0.0; train_secs = 0.0; opt_secs = 0.0;
             win_t0 = clock::now(); win_steps0 = step; windows_at_win_t0 = total_windows;
-            tokens_at_win_t0 = tokens_seen_est;
+            tokens_at_win_t0 = rs.tokens_seen;
             last_log = win_t0; last_log_step = step; windows_at_last_log = total_windows;  // an eval counts as a log: reset the tick timer
-            tokens_at_last_log = tokens_seen_est;
+            tokens_at_last_log = rs.tokens_seen;
             last_ckpt = win_t0;                               // ...and it checkpointed: reset the ckpt tick
         } else if (std::chrono::duration<double>(clock::now() - last_log).count() >= TICK_SECONDS) {
             // Interim heartbeat between evals: train loss (running avg since the last eval) +
@@ -2528,7 +2535,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // cadence (it is the expensive, plateau-driving measurement).
             const double since = std::chrono::duration<double>(clock::now() - last_log).count();
             const double wps   = since > 0 ? static_cast<double>(total_windows - windows_at_last_log) / since : 0.0;
-            const double tps   = since > 0 ? static_cast<double>(tokens_seen_est - tokens_at_last_log) / since : 0.0;
+            const double tps   = since > 0 ? static_cast<double>(rs.tokens_seen - tokens_at_last_log) / since : 0.0;
             // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // ETA uses the rate over the CUMULATIVE window since the last eval (win_t0/win_steps0,
@@ -2556,7 +2563,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                  breakdown);
             std::fflush(stdout);
             last_log = clock::now(); last_log_step = step; windows_at_last_log = total_windows;
-            tokens_at_last_log = tokens_seen_est;
+            tokens_at_last_log = rs.tokens_seen;
         }
 
         // Crash-resistance checkpoint on a wall-clock tick, independent of the (far rarer) eval
@@ -3368,13 +3375,17 @@ using sub0::coherence::interp_cross;
 // loads `model_in` itself. `EvalMetrics.steps` stays at its default -1 if the load fails -- callers
 // check `sub0::load_model`'s own return directly rather than relying on that as the failure signal,
 // since -1 is also a perfectly valid "never measured" value elsewhere in this cache.
+// `session` routes the two NELBO evals (device when it has one, CPU otherwise). The autotemp grid
+// below brings up its OWN DecodeSession and tears it down again, so `session` must not be used after
+// this returns -- see sub0::eval::Session's note on overlapping bring-ups.
 static sub0::evalcache::EvalMetrics compute_raw_metrics(sub0::TokView data, std::size_t val_start,
-                                                         bool want_autotemp_grid, unsigned seed) {
+                                                         bool want_autotemp_grid, unsigned seed,
+                                                         const sub0::eval::Session& session) {
     sub0::evalcache::EvalMetrics m;
     const sub0::TokView train_span = data.first(val_start);
     const sub0::TokView val_span   = data.subspan(val_start);
-    m.train_nelbo = evaluate(train_span, 0);
-    m.val_nelbo   = evaluate(val_span, 0);
+    m.train_nelbo = evaluate(train_span, 0, session);
+    m.val_nelbo   = evaluate(val_span, 0, session);
     {
         std::error_code ec;
         const auto sz = std::filesystem::file_size(sub0::default_corpus(), ec);
@@ -3434,7 +3445,9 @@ extern "C" SUB0_API int sub0_autotemp_stage(const char* model_in, unsigned seed,
     if (trainer_active())
         sub0::log::warn("autotemp: a sub0llm-train is running -- the temperature grid is a heavy "
                         "generation sweep and will contend with it. Prefer running this when idle.");
-    const sub0::evalcache::EvalMetrics raw = compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, seed);
+    const sub0::eval::Session eval_sess(/*allow=*/!trainer_active());
+    const sub0::evalcache::EvalMetrics raw =
+        compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, seed, eval_sess);
     const double ce_ppl     = std::exp(raw.val_nelbo);   // headline (inflated by model error) -- exp(val_nelbo), not a separate measurement
     const double target_ppl = raw.target_ppl;
     const double target_rep = raw.target_rep;
@@ -3645,8 +3658,22 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
                             "depress the numbers in BOTH. Re-run when idle for a clean measurement.");
         if (sub0::load_model(model_in)) {
             model_loaded = true;
+            // ONE device session for every NELBO number below (both splits + every context width).
+            // Declined outright while a trainer holds the machine -- see sub0::eval::Session. Scoped
+            // to this block so it is torn down before the sample battery brings up its own
+            // DecodeSession further down: the two are independent bring-ups of the same context, and
+            // the later one's teardown would leave this one pointing at a dead device.
+            const sub0::eval::Session eval_sess(/*allow=*/!trainer_active());
+            // Through emit(), not the log: WHICH backend produced these numbers is provenance, so it
+            // belongs in the saved report.txt beside them, not only on the console of the run that
+            // happened to produce it.
+            if (eval_sess.use_device)
+                emit("scoring:      {} device backend", sub0_dev_caps().name);
+            else
+                emit("scoring:      CPU ({}) -- same numbers, but slow enough that the "
+                     "context-length curve is shortened to its endpoints", eval_sess.declined);
             const sub0::evalcache::EvalMetrics raw =
-                compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/false, 0);
+                compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/false, 0, eval_sess);
             const double train_nelbo = raw.train_nelbo;
             const double val_nelbo   = raw.val_nelbo;
             const double gap = val_nelbo - train_nelbo;
@@ -3665,10 +3692,10 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
             // long-range structure improves markedly from the shortest width to SEQ_LEN; one that has
             // effectively learned an n-gram barely moves.
             {
-                const ContextCurve cc = evaluate_context_curve(data, val_start);
+                const ContextCurve cc = evaluate_context_curve(data, val_start, eval_sess);
                 if (cc.nelbo.size() == cc.width.size() && !cc.nelbo.empty()) {
                     emit("  context-length curve (val nelbo by how much context the model may attend to){}:",
-                         cc.width.size() <= 2 ? " [SHORTENED: a trainer is running; endpoints only]" : "");
+                         cc.width.size() <= 2 ? " [SHORTENED: CPU-only eval; endpoints only]" : "");
                     for (std::size_t i = 0; i < cc.width.size(); ++i)
                         emit("    ctx {:>4}: nelbo {:.4f}  (ppl {:.2f})",
                              cc.width[i], cc.nelbo[i], std::exp(cc.nelbo[i]));
@@ -3938,7 +3965,12 @@ extern "C" SUB0_API int sub0_models_stage(int prune, int verbose, const char* co
                     sub0::log::warn("models --refresh: '{}' did not load (skipped)", m.dir.filename().string());
                     continue;
                 }
-                const ec::EvalMetrics raw = compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, 42);
+                // Per-model session: each iteration loads DIFFERENT weights, so the device upload has
+                // to happen again anyway -- one long-lived session across the loop would score every
+                // model after the first against the first one's uploaded params.
+                const sub0::eval::Session eval_sess(/*allow=*/!trainer_active());
+                const ec::EvalMetrics raw =
+                    compute_raw_metrics(data, val_start, /*want_autotemp_grid=*/true, 42, eval_sess);
                 ec::EvalMetrics out;
                 out.steps = m.steps; out.measured_at = reg::now_iso();
                 out.train_nelbo = raw.train_nelbo; out.val_nelbo = raw.val_nelbo; out.bytes_per_tok = raw.bytes_per_tok;

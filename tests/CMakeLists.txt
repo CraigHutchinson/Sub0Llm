@@ -89,12 +89,43 @@ target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
 catch_discover_tests(sub0_frontend_tests)
 
+# Eval-seam integration tests: the held-out NELBO evaluation driven end-to-end through a MOCK device
+# backend, so the device dispatch (window batching, ids/targets pairing, group recombination) is
+# covered on EVERY machine rather than only where a GPU happens to be present.
+#
+# Its own executable, and deliberately NOT part of sub0_tests: SUB0_BUILD_MOCK_DEVICE reroutes the
+# inline sub0_dev_* seam to the mock, and sub0_tests both links sub0_backend_cuda and contains
+# cuda_tests.cpp, which needs the real one. Two definitions of the same inline functions in one binary
+# is an ODR violation, so they must stay separate binaries. For the same reason this target links
+# sub0_core only -- never sub0_train, which is compiled against the real seam.
+add_executable(sub0_eval_seam_tests eval_seam_tests.cpp mock_device_backend.cpp)
+target_include_directories(sub0_eval_seam_tests PRIVATE
+  "${CMAKE_SOURCE_DIR}/include"
+  "${GEN_DIR}")
+target_compile_definitions(sub0_eval_seam_tests PRIVATE SUB0_BUILD_MOCK_DEVICE=1)
+target_link_libraries(sub0_eval_seam_tests PRIVATE sub0_core Catch2::Catch2WithMain)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(sub0_eval_seam_tests PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(sub0_eval_seam_tests PROPERTIES
+  BUILD_RPATH "$ORIGIN"
+  INSTALL_RPATH "$ORIGIN")
+catch_discover_tests(sub0_eval_seam_tests
+  DL_PATHS "$<TARGET_FILE_DIR:sub0_core>"
+  DISCOVERY_MODE PRE_TEST)
+
 # GPU backend smoke test: compiled + linked only when the CUDA backend is built. The
 # nvcc-built sub0_backend_cuda.dll sits next to sub0_core.dll; its CUDA runtime deps are
 # covered by the toolkit bin added to DL_PATHS below.
 if(SUB0_BUILD_CUDA)
   target_sources(sub0_tests PRIVATE cuda_tests.cpp)
   target_link_libraries(sub0_tests PRIVATE sub0_backend_cuda)
+  # ...and compile the NEUTRAL seam (include/sub0/device_backend.hpp) in its device configuration.
+  # Without this the target linked the CUDA backend while every sub0_dev_* in the header still
+  # resolved to the no-device fail-fast stub, so anything driving a device through the seam rather
+  # than through a hand-written extern "C" silently took the CPU fallback and "passed". Every other
+  # test here already passes use_gpu=false explicitly, so nothing else changes behaviour.
+  target_compile_definitions(sub0_tests PRIVATE SUB0_BUILD_CUDA)
 endif()
 
 # Find the sub0_core shared lib next to the test binary at runtime.

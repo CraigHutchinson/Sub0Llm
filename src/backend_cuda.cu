@@ -984,6 +984,14 @@ template <class A> __global__ void rope_bwd_act_kernel(A* __restrict__ dq, int b
 // supplies. Every row's cross-entropy math is otherwise fully independent of every other row (no
 // cross-row reduction inside this kernel), and `loss_acc`'s atomicAdd is already safe across however
 // many separate kernel launches touch it, so chunking needs nothing else here.
+//
+// `dlogits == nullptr` runs the kernel LOSS-ONLY: no gradient is written and no dlogits buffer is
+// needed at all. This is the eval path (sub0_cuda_forward_loss). It is deliberately the SAME kernel
+// rather than a sibling, because the number it must produce is the same number: the masking rules
+// (padding, LOSS_IGNORE_INDEX), the per-window active-count denominator, and the 1/(batch*denom)
+// weight all live here exactly once, so a forward-only eval cannot drift from the loss the trainer
+// reports. `dlogits` is uniform across the whole launch, so every branch on it below is
+// block-uniform -- no warp divergence, and the block-wide reductions stay fully populated.
 template <int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ targets,
@@ -1004,7 +1012,7 @@ ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ tar
     // uncombine curriculum's harness-injected spans). Both zero their dlogits and return, matching the
     // CPU op_cross_entropy's skip.
     if (t >= len || tgt < 0) {
-        for (int j = threadIdx.x; j < V; j += BLOCK) dl[j] = 0.f;
+        if (dlogits) for (int j = threadIdx.x; j < V; j += BLOCK) dl[j] = 0.f;
         return;
     }
     const float* lr = logits + static_cast<size_t>(m) * V;
@@ -1022,13 +1030,22 @@ ce_backward_kernel(const float* __restrict__ logits, const int* __restrict__ tar
     // above, so the divide never actually runs, but it keeps the weight finite regardless.
     const int   denom = active ? active[b] : len;
     const float w     = 1.0f / (static_cast<float>(batch) * static_cast<float>(denom < 1 ? 1 : denom));
-    float ptgt_partial = 0.f;                        // capture before any write (dlogits may alias logits)
-    for (int j = threadIdx.x; j < V; j += BLOCK) {
-        const float p = __expf(lr[j] - mx) * invZ;
-        if (j == tgt) ptgt_partial = p;               // exactly one thread across the block owns j==tgt
-        dl[j] = w * (p - (j == tgt ? 1.f : 0.f));    // safe in-place: reads lr[j] then writes dl[j]
+    float ptgt;
+    if (dlogits) {
+        float ptgt_partial = 0.f;                    // capture before any write (dlogits may alias logits)
+        for (int j = threadIdx.x; j < V; j += BLOCK) {
+            const float p = __expf(lr[j] - mx) * invZ;
+            if (j == tgt) ptgt_partial = p;           // exactly one thread across the block owns j==tgt
+            dl[j] = w * (p - (j == tgt ? 1.f : 0.f));// safe in-place: reads lr[j] then writes dl[j]
+        }
+        ptgt = block_reduce_sum<BLOCK>(ptgt_partial); // sum isolates the one nonzero contributor
+    } else {
+        // Loss-only: the target's probability is a SINGLE element, so the third O(V) pass (which
+        // exists solely to write dlogits) is skipped entirely -- the reduction above would have
+        // isolated exactly this value. Every thread computes it redundantly; only thread 0 reads it,
+        // and no block-wide collective runs here, which is why the branch must stay block-uniform.
+        ptgt = __expf(lr[tgt] - mx) * invZ;
     }
-    const float ptgt = block_reduce_sum<BLOCK>(ptgt_partial);   // sum isolates the one nonzero contributor
     if (threadIdx.x == 0)
         atomicAdd(loss_acc, static_cast<double>(w * -__logf(fmaxf(1e-9f, ptgt))));
 }
@@ -1831,9 +1848,23 @@ void invalidate_decode_graph();
 
 // Set the cuBLAS handle's math mode directly -- used to compare modes in the benchmark and to
 // force a mode in the parity tests, independent of the baked knob. The mode is baked into a
-// captured graph's algo, so changing it invalidates both captured graphs.
+// captured graph's algo, so CHANGING it invalidates both captured graphs.
+//
+// Re-requesting the mode the handle is ALREADY in is a no-op, graphs included. This is not just an
+// optimization: sub0_cuda_forward_loss (the eval path) asks for FP32 math on every call and then
+// replays a captured graph, so an unconditional invalidate would force a full recapture per eval
+// call and make graph capture pointless there. It is also why run_fwd_bwd's per-step
+// set_handle_tf32(CudaTf32::get()) no longer drops the decode graph on every training step.
+// g_handle_tf32 tracks what was last successfully pushed to the handle; -1 means "unknown", which
+// is the state before the handle exists and after it is destroyed, so the next call always applies.
+int g_handle_tf32 = -1;
 inline void set_handle_tf32(bool on) {
-    if (g_cublas) cublasSetMathMode(g_cublas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+    const int want = on ? 1 : 0;
+    if (g_cublas && g_handle_tf32 == want) return;
+    if (g_cublas) {
+        cublasSetMathMode(g_cublas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+        g_handle_tf32 = want;
+    }
     invalidate_graph();
     invalidate_decode_graph();
 }
@@ -2575,6 +2606,40 @@ void train_free() {
     free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
     g_tr_rows = 0;
+}
+
+// Resident EVAL scratch (sub0_cuda_forward_loss). Deliberately its OWN small allocation rather than a
+// reuse of TrainScratch's dtargets/lengths/active/loss: eval is a forward-only path that must be
+// usable without ever calling train_alloc, whose per-execution saved-activation buffers are the
+// single largest device allocation this backend makes and are pure waste when no backward will run.
+// Everything here is O(rows) ints plus one double -- ~64 KiB at a typical eval shape.
+struct EvalScratch {
+    int*    targets = nullptr;   // [rows]           next-token ids (LOSS_IGNORE_INDEX-aware, like training)
+    int*    lengths = nullptr;   // [MAX_FWD_BATCH]  per-window trained length (padding mask)
+    int*    active  = nullptr;   // [MAX_FWD_BATCH]  per-window non-ignored target count (CE normalizer)
+    double* loss    = nullptr;   // scalar accumulator
+};
+EvalScratch g_ev;
+size_t      g_ev_rows = 0;
+
+void eval_free() {
+    cudaFree(g_ev.targets); cudaFree(g_ev.lengths); cudaFree(g_ev.active); cudaFree(g_ev.loss);
+    g_ev = EvalScratch{};
+    g_ev_rows = 0;
+}
+
+// Grow-on-demand to cover `rows` (= batch*T) target ids. lengths/active are constant-sized to the
+// batch ceiling for the same reason train_alloc does it: a short-T call runs MORE windows, so sizing
+// them to any single call's batch would let a later, wider call overrun them.
+int eval_alloc(size_t rows) {
+    if (g_ev.targets && g_ev_rows >= rows) return 0;
+    eval_free();
+    SUB0_CUDA_CHECK(cudaMalloc(&g_ev.targets, rows * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_ev.lengths, static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_ev.active,  static_cast<size_t>(MAX_FWD_BATCH) * sizeof(int)));
+    SUB0_CUDA_CHECK(cudaMalloc(&g_ev.loss,    sizeof(double)));
+    g_ev_rows = rows;
+    return 0;
 }
 
 
@@ -3794,9 +3859,10 @@ SUB0_CUDA_API void sub0_cuda_shutdown() {
     fwd_free();                                  // release the resident forward scratch too
     kv_free();                                   // and the decode KV-cache
     train_free();                                // and the training scratch (Phase 2d)
+    eval_free();                                 // and the forward-only eval scratch
     opt_free();                                  // and the optimizer state
     bind_free();                                 // and the binding-compose override table
-    if (g_cublas) { cublasDestroy(g_cublas); g_cublas = nullptr; }
+    if (g_cublas) { cublasDestroy(g_cublas); g_cublas = nullptr; g_handle_tf32 = -1; }
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = nullptr; }
 }
 
@@ -3902,6 +3968,87 @@ SUB0_CUDA_API int sub0_cuda_forward(const int* ids, int batch, int T, float* out
     SUB0_CUDA_CHECK(cudaMemcpyAsync(out_logits, g_fwd.logits, static_cast<size_t>(M) * VOCAB * sizeof(float),
                                     cudaMemcpyDeviceToHost, g_stream));
     SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    return 0;
+}
+
+// ============================================================================
+//  Batched forward-only cross-entropy: the EVAL path (val_nelbo, report)
+// ============================================================================
+// Returns the mean cross-entropy over `batch` windows of `T` tokens -- the same reduction
+// sub0_cuda_train_step reports as its loss, with no backward pass, no gradient buffer, and no saved
+// activations. This is what makes evaluating a model on device cheap: the training entry point would
+// compute and immediately discard a full backward and needs the whole TrainScratch allocation to do it.
+//
+// Built on the INFERENCE forward (forward_device via the captured graph -- the identical path
+// sub0_cuda_forward drives), NOT on forward_train. That choice is deliberate and load-bearing:
+//   * it is FP32 end to end, matching the CPU sub0::forward() this number is compared against, where
+//     forward_train stores its residual stream in bf16;
+//   * it is the path already gated against the CPU forward by sub0_cuda_forward_check, so eval
+//     inherits an existing, tested parity claim instead of asserting a new one;
+//   * it allocates no per-execution activation buffers, which is the whole point.
+// The cost is that it materializes the full [batch*T, VOCAB] logits buffer (fwd_alloc's `full` half)
+// rather than chunking it the way training's head_ce_chunked does, so the CALLER picks a batch whose
+// logits fit -- see evaluate()'s eval_device_batch() in train_stage.cpp, which derives it from a
+// buffer budget and splits its window set accordingly.
+//
+// `lengths` (optional) masks short-window padding exactly as the training step does; targets < 0
+// (LOSS_IGNORE_INDEX) are excluded from both the loss and the per-window normalizer, same as training.
+// Requires sub0_cuda_upload_params() first. FP32 math mode is forced (parity with the CPU eval); the
+// tracked set_handle_tf32 makes that free on every call after the first.
+SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_loss(const int* ids, const int* targets, int batch, int T,
+                                                       double* out_loss, const int* lengths) {
+    if (!g_dev_params || !ids || !targets || !out_loss) return 1;
+    if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
+    const int    M  = batch * T;
+    const size_t Mz = static_cast<size_t>(M);
+    if (fwd_alloc(batch, true, T)) return 1;
+    if (ensure_wqkv_f32()) return 1;             // BF16 builds: (re)build the F32 mirror this path reads
+    if (eval_alloc(Mz)) return 1;
+    ensure_cublas();
+    set_handle_tf32(false);                      // tight FP32 inference math -- parity with the CPU eval
+    if (capture_graph(batch, T)) return 1;       // capture once per shape (replay thereafter)
+
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_fwd.dids, ids, Mz * sizeof(int),
+                                    cudaMemcpyHostToDevice, g_stream));
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(g_ev.targets, targets, Mz * sizeof(int),
+                                    cudaMemcpyHostToDevice, g_stream));
+    const int* d_lengths = nullptr;              // null => every window is full T (dense path)
+    if (lengths) {
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_ev.lengths, lengths, static_cast<size_t>(batch) * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+        d_lengths = g_ev.lengths;
+    }
+    // Per-window count of non-ignored targets, computed host-side from the targets we already hold --
+    // the same derivation run_fwd_bwd does, and for the same reason: with a loss mask in play the
+    // per-window mean must normalize over ACTIVE positions, not raw length. Stays nullptr (and the CE
+    // kernel uses `lengths` verbatim) when nothing is masked, which is the ordinary eval case.
+    const int* d_active = nullptr;
+    bool any_masked = false;
+    for (int i = 0; i < M; ++i) if (targets[i] < 0) { any_masked = true; break; }
+    if (any_masked) {
+        std::vector<int> active(static_cast<size_t>(batch), 0);
+        for (int b = 0; b < batch; ++b) {
+            const int len = lengths ? lengths[b] : T;
+            int a = 0;
+            for (int tt = 0; tt < len; ++tt) if (targets[static_cast<size_t>(b) * T + tt] >= 0) ++a;
+            active[static_cast<size_t>(b)] = a;
+        }
+        SUB0_CUDA_CHECK(cudaMemcpyAsync(g_ev.active, active.data(), static_cast<size_t>(batch) * sizeof(int),
+                                        cudaMemcpyHostToDevice, g_stream));
+        d_active = g_ev.active;
+    }
+
+    SUB0_CUDA_CHECK(cudaMemsetAsync(g_ev.loss, 0, sizeof(double), g_stream));
+    SUB0_CUDA_CHECK(cudaGraphLaunch(g_graph_exec, g_stream));      // logits -> g_fwd.logits [M,V]
+    constexpr int kCeBlock = 256;                                  // one block per row, as in training
+    ce_backward_kernel<kCeBlock><<<M, kCeBlock, 0, g_stream>>>(
+        g_fwd.logits, g_ev.targets, /*dlogits=*/nullptr, g_ev.loss, M, T, batch, d_lengths, d_active,
+        /*row_offset=*/0);
+    double loss = 0.0;
+    SUB0_CUDA_CHECK(cudaMemcpyAsync(&loss, g_ev.loss, sizeof(double), cudaMemcpyDeviceToHost, g_stream));
+    SUB0_CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    SUB0_CUDA_CHECK(cudaGetLastError());
+    *out_loss = loss;
     return 0;
 }
 
@@ -5053,7 +5200,11 @@ SUB0_CUDA_API int sub0_cuda_muon_ns_check(const float* in, int rows, int cols, i
     if (n > sub0::MUON_MAX_MN || m * m > sub0::MUON_MAX_MM) return 1;   // scratch too small for this shape
     if (sub0_cuda_init()) return 1;
     ensure_cublas();
-    if (force_tf32) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+    // Through set_handle_tf32, NOT a raw cublasSetMathMode: the handle's mode is tracked
+    // (g_handle_tf32) so that re-requesting the current mode can skip a graph invalidate. A raw
+    // push here would desync that tracker and make the apply_math_mode() restore below a silent
+    // no-op, leaving the handle in TF32 for whatever ran next.
+    if (force_tf32) set_handle_tf32(true);
     if (ensure_muon_scratch()) return 1;
 
     SUB0_CUDA_CHECK(cudaMemcpyAsync(g_dev_muon_upd, in, n * sizeof(float), cudaMemcpyHostToDevice, g_stream));

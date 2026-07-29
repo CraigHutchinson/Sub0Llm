@@ -23,7 +23,7 @@
 // Compile-time "is any device backend linked" gate, backend-neutral. Aliases today's CUDA-specific
 // macro so existing build plumbing keeps working; a future SUB0_DEVICE=ROCM branch defines
 // SUB0_BUILD_DEVICE via its own path.
-#if defined(SUB0_BUILD_CUDA) && !defined(SUB0_BUILD_DEVICE)
+#if (defined(SUB0_BUILD_CUDA) || defined(SUB0_BUILD_MOCK_DEVICE)) && !defined(SUB0_BUILD_DEVICE)
   #define SUB0_BUILD_DEVICE 1
 #endif
 
@@ -33,6 +33,9 @@
 struct Sub0DeviceCaps {
     const char* name;
     int supports_train;             // train_reserve/train_step/backward + device-resident step
+    int supports_eval;              // batched forward-only cross-entropy (forward_loss) -- STRICTLY
+                                    // weaker than supports_train, and its own bit because a backend
+                                    // may serve evaluation without ever implementing a backward
     int supports_decode;            // kv_reset/forward_one
     int supports_interception;      // decode-time expand/combine/compute injection mid-generation
     int supports_binding_compose;   // encode_slot-class composed embeddings (scratch/persistent/sentinel)
@@ -60,7 +63,63 @@ constexpr int SUB0_DEV_BIND_ENC_MEANPOOL = 0;   // == (int)sub0::SlotEncoding::M
 constexpr int SUB0_DEV_BIND_ENC_HASH     = 2;   // == (int)sub0::SlotEncoding::Hash
 constexpr int SUB0_DEV_BIND_ENC_HRR      = 4;   // == (int)sub0::SlotEncoding::HRR
 
-#if defined(SUB0_BUILD_CUDA)
+#if defined(SUB0_BUILD_MOCK_DEVICE)
+
+// --- TEST-ONLY backend: an in-process device that is really the CPU engine -------------------------
+// Defined ONLY by the sub0_eval_seam_tests target (tests/CMakeLists.txt) and deliberately checked
+// BEFORE SUB0_BUILD_CUDA, so a CUDA-enabled tree still builds this target against the mock. It exists
+// because the interesting failures in a device consumer are not in the kernels: they are in the
+// PLUMBING around the seam -- how windows are batched, how ids and targets are paired (an off-by-one
+// there shifts the whole prediction task by one token and still returns a plausible number), how a
+// ragged final group is weighted back together. None of that needs a GPU to get wrong, and none of it
+// was reachable by a test while the only implementation of the seam required one.
+//
+// The mock answers sub0_dev_forward_loss by running the real CPU engine over the ids/targets it was
+// handed, so "device" and "CPU" must agree EXACTLY when the plumbing is right, and disagree the moment
+// it is not. See tests/mock_device_backend.cpp for the implementation and the contract it pins.
+extern "C" [[nodiscard]] int  sub0_mock_init();
+extern "C" void               sub0_mock_shutdown();
+extern "C" [[nodiscard]] int  sub0_mock_upload_params(const float* host);
+extern "C" [[nodiscard]] int  sub0_mock_forward_loss(const int* ids, const int* targets, int batch, int T,
+                                                     double* out_loss, const int* lengths);
+// How many forward_loss calls the mock has served, and the batch sizes it saw -- the test asserts on
+// the GROUPING, which is invisible in the returned mean.
+extern "C" int                sub0_mock_call_count();
+extern "C" int                sub0_mock_batch_at(int i);
+extern "C" void               sub0_mock_reset_log();
+
+inline Sub0DeviceCaps sub0_dev_caps() {
+    // Honest: this backend evaluates and nothing else. A consumer that branches correctly on caps
+    // therefore exercises exactly the eval path here and takes its own fallback for everything else.
+    return { "mock", /*train=*/0, /*eval=*/1, /*decode=*/0, /*interception=*/0,
+             /*binding_compose=*/0, /*opt_state=*/0, /*tf32=*/0 };
+}
+[[nodiscard]] inline int  sub0_dev_init()                        { return sub0_mock_init(); }
+inline void               sub0_dev_shutdown()                    { sub0_mock_shutdown(); }
+[[nodiscard]] inline int  sub0_dev_upload_params(const float* h) { return sub0_mock_upload_params(h); }
+[[nodiscard]] inline int  sub0_dev_forward_loss(const int* ids, const int* targets, int batch, int T,
+                                                double* out_loss, const int* lengths) {
+    return sub0_mock_forward_loss(ids, targets, batch, T, out_loss, lengths);
+}
+// Everything this backend does not claim in caps: same fail-fast contract as the no-device stubs.
+[[nodiscard]] inline int  sub0_dev_download_params(float*)       { return -1; }
+[[nodiscard]] inline int  sub0_dev_upload_opt(const float*, const float*) { return -1; }
+[[nodiscard]] inline int  sub0_dev_download_opt(float*, float*)  { return -1; }
+inline void               sub0_dev_set_tf32(int)                 {}
+[[nodiscard]] inline int  sub0_dev_train_reserve(int)            { return -1; }
+[[nodiscard]] inline int  sub0_dev_train_step(const int*, const int*, int, int, float, long, double*,
+                                              const int*, float)                 { return -1; }
+[[nodiscard]] inline int  sub0_dev_backward(const int*, const int*, int, int, float*, double*,
+                                            const int*)                          { return -1; }
+[[nodiscard]] inline int  sub0_dev_time_train_step(int, int, double, double*)    { return -1; }
+[[nodiscard]] inline int  sub0_dev_train_footprint(int, double*, double*)        { return -1; }
+inline int                sub0_dev_free_mem_mb()                 { return 0; }
+[[nodiscard]] inline int  sub0_dev_kv_reset()                    { return -1; }
+[[nodiscard]] inline int  sub0_dev_forward_one(int, int, float*) { return -1; }
+[[nodiscard]] inline int  sub0_dev_set_window_bindings(const int*, int, const int*, int,
+                                                       const int*, int)          { return -1; }
+
+#elif defined(SUB0_BUILD_CUDA)
 
 // --- The current CUDA backend's exports (canonical declarations; consumers: prefer sub0_dev_*) -------
 extern "C" [[nodiscard]] int  sub0_cuda_init();
@@ -76,6 +135,8 @@ extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* ta
                                                    float muon_lr);
 extern "C" [[nodiscard]] int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
                                                  float* out_grad, double* out_loss, const int* lengths);
+extern "C" [[nodiscard]] int  sub0_cuda_forward_loss(const int* ids, const int* targets, int batch, int T,
+                                                     double* out_loss, const int* lengths);
 extern "C" [[nodiscard]] int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 extern "C" [[nodiscard]] int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 extern "C" int                sub0_cuda_free_vram_mb();
@@ -96,7 +157,14 @@ inline Sub0DeviceCaps sub0_dev_caps() {
     // green on real hardware -- see cuda_tests.cpp's "binding-compose" cases. No interception path
     // yet. The hybrid router's consuming flip (needs_cpu &= !supports_binding_compose) is the
     // documented follow-up; nothing routes differently until train_stage.cpp adopts it.
-    return { "cuda", 1, 1, 0, 1, 1, 1 };
+    //
+    // supports_eval (2026-07-29): sub0_cuda_forward_loss runs the batched forward-only cross-entropy
+    // on device. Set only after the CPU/GPU nelbo parity gate in cuda_tests.cpp ("forward_loss ==
+    // CPU evaluate") ran green -- an eval that silently disagreed with the CPU number would corrupt
+    // every A/B comparison scored with it, and a mean nelbo is exactly where a small systematic
+    // difference hides.
+    return { "cuda", /*train=*/1, /*eval=*/1, /*decode=*/1, /*interception=*/0,
+             /*binding_compose=*/1, /*opt_state=*/1, /*tf32=*/1 };
 }
 [[nodiscard]] inline int  sub0_dev_init()                       { return sub0_cuda_init(); }
 inline void               sub0_dev_shutdown()                   { sub0_cuda_shutdown(); }
@@ -114,6 +182,15 @@ inline void               sub0_dev_set_tf32(int on)             { sub0_cuda_set_
 [[nodiscard]] inline int  sub0_dev_backward(const int* ids, const int* targets, int batch, int T,
                                             float* out_grad, double* out_loss, const int* lengths) {
     return sub0_cuda_backward(ids, targets, batch, T, out_grad, out_loss, lengths);
+}
+// Mean cross-entropy over `batch` windows of `T` tokens, forward only -- the evaluation counterpart
+// of sub0_dev_backward, computing the SAME loss without the backward half or its gradient buffers.
+// `lengths` (optional, [batch]) marks each window's real length so padded tails are not graded;
+// targets < 0 are excluded from both the loss and its per-window normalizer. Gated by
+// sub0_dev_caps().supports_eval.
+[[nodiscard]] inline int  sub0_dev_forward_loss(const int* ids, const int* targets, int batch, int T,
+                                                double* out_loss, const int* lengths) {
+    return sub0_cuda_forward_loss(ids, targets, batch, T, out_loss, lengths);
 }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
     return sub0_cuda_time_train_step(batch, T, budget_ms, out_ms);
@@ -139,7 +216,7 @@ inline int                sub0_dev_free_mem_mb()                { return sub0_cu
 
 // Fail-fast stubs: a migrated consumer needs no #if of its own -- init reports failure, caps report
 // "none"/zeros, and everything else is unreachable-by-contract (callers gate on init/caps first).
-inline Sub0DeviceCaps sub0_dev_caps()                            { return { "none", 0, 0, 0, 0, 0, 0 }; }
+inline Sub0DeviceCaps sub0_dev_caps()                            { return { "none", 0, 0, 0, 0, 0, 0, 0 }; }
 [[nodiscard]] inline int  sub0_dev_init()                        { return -1; }
 inline void               sub0_dev_shutdown()                    {}
 [[nodiscard]] inline int  sub0_dev_upload_params(const float*)   { return -1; }
@@ -152,6 +229,8 @@ inline void               sub0_dev_set_tf32(int)                 {}
                                               const int*, float)                 { return -1; }
 [[nodiscard]] inline int  sub0_dev_backward(const int*, const int*, int, int, float*, double*,
                                             const int*)                          { return -1; }
+[[nodiscard]] inline int  sub0_dev_forward_loss(const int*, const int*, int, int, double*,
+                                                const int*)                      { return -1; }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int, int, double, double*)    { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_footprint(int, double*, double*)        { return -1; }
 inline int                sub0_dev_free_mem_mb()                 { return 0; }

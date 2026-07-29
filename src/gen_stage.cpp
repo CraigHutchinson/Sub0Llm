@@ -298,6 +298,21 @@ extern "C" SUB0_API int sub0_gen_stage(const char* model_in, const char* prompt,
         }
     }
 
+    // SAY that we left the fast path, and why. This loop runs a FULL FORWARD PER TOKEN -- orders of
+    // magnitude slower than the KV-cache decode above -- and the transition is invisible from the
+    // command line: `--n 500` after a short prompt fits the window and returns in about a second,
+    // `--n 512` misses it by the prompt's length and grinds, which is exactly the "gen freezes at
+    // --n >= SEQ_LEN" report. Nothing is hung; it is doing ~100x the work per token. Sliding past the
+    // trained window is a real capability (it is what --attn-sinks exists for), so this warns rather
+    // than clamping -- unlike preview_at, whose callers only ever want a sample that fits.
+    if constexpr (!USE_TERNARY)
+        std::println(stderr,
+                     "gen: prompt ({} tok) + --n {} exceeds the {}-token window -- using the "
+                     "sliding-window full-forward path, which is MUCH slower per token (a KV-cache "
+                     "decode needs prompt + n <= {}; try --n {}).",
+                     ctx.size(), n, SEQ_LEN, SEQ_LEN,
+                     std::max(0, SEQ_LEN - static_cast<int>(ctx.size())));
+
     // Sink tokens: clamped so the "recent" half of the window never shrinks below SEQ_LEN/2 even if
     // the caller asks for an unreasonably large --attn-sinks.
     const int n_sink = attn_sinks > 0 ? std::min(attn_sinks, SEQ_LEN / 2) : 0;

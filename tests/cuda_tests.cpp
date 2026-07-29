@@ -9,6 +9,7 @@
 
 #include "sub0/blend.hpp"     // doc_of -- the hybrid router's own per-window document resolution
 #include "sub0/core.hpp"     // trainable_floats()
+#include "sub0/eval.hpp"     // sub0::eval -- the consumer under test for the device eval seam
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
 #include "sub0/muon.hpp"     // sub0::muon::newton_schulz5 -- the CPU reference the GPU Muon tests check against
@@ -34,6 +35,8 @@ extern "C" int  sub0_cuda_forward(const int* ids, int batch, int T, float* out_l
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
                                    float* out_grad, double* out_loss, const int* lengths = nullptr);
+// sub0_cuda_forward_loss is declared canonically by sub0/device_backend.hpp (included above), which
+// this target now compiles in its device configuration -- no local extern needed.
 extern "C" int  sub0_cuda_adam_step(float lr, long t, float muon_lr);
 extern "C" int  sub0_cuda_muon_ns_check(const float* in, int rows, int cols, int force_tf32, float* out);
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
@@ -275,6 +278,98 @@ TEST_CASE("CUDA backward matches the CPU reduced gradient", "[cuda]") {
     REQUIRE(std::isfinite(loss));
     if constexpr (ACT_DTYPE == Dtype::BF16) REQUIRE(cos > 0.7);
     else                                    REQUIRE(rel < 1e-2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The EVAL seam (sub0_cuda_forward_loss): the number `report` and every A/B comparison are scored
+// with. This is the gate the whole device-eval path rests on -- an eval that silently disagreed with
+// the CPU would not fail loudly, it would just quietly shift every model's val_nelbo by some amount
+// and corrupt comparisons between a device-scored model and a CPU-scored one.
+//
+// Two independent checks, because they can fail separately:
+//   1. against sub0_cuda_backward's loss on the SAME input -- both go through ce_backward_kernel, so a
+//      disagreement means the loss-only branch (dlogits == nullptr) diverged from the gradient branch;
+//   2. against the CPU engine end to end through sub0::eval -- which additionally covers the forward
+//      itself (forward_device vs sub0::forward) and all the consumer-side window/batch plumbing.
+// The gate is TIGHT (not the loose cosine the gradient tests use) because this path is FP32
+// throughout: it runs the inference forward, not the bf16 training forward.
+TEST_CASE("CUDA forward_loss matches the backward path's loss", "[cuda][eval]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 77, data, starts, ids, targets);
+
+    std::vector<float> grad(sub0::trainable_floats(), 0.0f);
+    double bwd_loss = 0.0, fwd_loss = 0.0;
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, grad.data(), &bwd_loss) == 0);
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), targets.data(), batch, T, &fwd_loss, nullptr) == 0);
+    INFO("forward_loss = " << fwd_loss << "  backward loss = " << bwd_loss);
+    REQUIRE(std::isfinite(fwd_loss));
+    // The two forwards are not bit-identical (bf16 training activations vs FP32 inference), so this
+    // is a behavioural gate, not an exact one -- but a real defect in the loss-only branch (a wrong
+    // normalizer, a skipped mask, the ptgt shortcut picking the wrong element) moves it far more.
+    REQUIRE(fwd_loss == Catch::Approx(bwd_loss).epsilon(0.05));
+
+    // Masked (LOSS_IGNORE_INDEX) targets must be excluded from BOTH the loss and its per-window
+    // denominator. Masking rows without renormalizing would shift the mean by ~len/active.
+    std::vector<int> masked = targets;
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < T; t += 3) masked[static_cast<std::size_t>(b) * T + t] = sub0::LOSS_IGNORE_INDEX;
+    double masked_fwd = 0.0, masked_bwd = 0.0;
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), masked.data(), batch, T, &masked_fwd, nullptr) == 0);
+    REQUIRE(sub0_cuda_backward(ids.data(), masked.data(), batch, T, grad.data(), &masked_bwd) == 0);
+    INFO("masked forward_loss = " << masked_fwd << "  masked backward loss = " << masked_bwd);
+    REQUIRE(std::isfinite(masked_fwd));
+    REQUIRE(masked_fwd == Catch::Approx(masked_bwd).epsilon(0.05));
+
+    // Short-window padding: `lengths` marks the real extent, and positions past it must contribute
+    // nothing. A window trained on only its first half must not score the same as the full one.
+    std::vector<int> lengths(static_cast<std::size_t>(batch), T / 2);
+    double short_loss = 0.0;
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), targets.data(), batch, T, &short_loss, lengths.data()) == 0);
+    REQUIRE(std::isfinite(short_loss));
+    REQUIRE(short_loss != Catch::Approx(fwd_loss).epsilon(1e-9));
+}
+
+TEST_CASE("CUDA device eval reproduces the CPU eval end to end", "[cuda][eval]") {
+    // The consumer-level property, on real hardware: sub0::eval routed through the device must give
+    // the same NELBO as the CPU route over the identical window set. tests/eval_seam_tests.cpp pins
+    // the same property against a mock backend (so it runs everywhere); this one additionally proves
+    // the CUDA kernels agree, which the mock by construction cannot.
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+
+    std::mt19937 rng(97);
+    std::uniform_int_distribution<int> tok(0, VOCAB - 1);
+    std::vector<int> corpus(static_cast<std::size_t>(SEQ_LEN) * 12);
+    for (int& x : corpus) x = tok(rng);
+    const sub0::TokView data = sub0::TokView::over_int32(corpus.data(), corpus.size());
+    const sub0::eval::WindowSet ws = sub0::eval::plan(data, 0, 8);
+    REQUIRE(ws.count > 1);
+
+    const sub0::eval::Session s(/*allow=*/true);
+    REQUIRE(s.use_device);
+
+    const double cpu = sub0::eval::nelbo_cpu(data, ws, SEQ_LEN, 2);
+    const double dev = sub0::eval::nelbo_device(data, ws, SEQ_LEN);
+    INFO("cpu nelbo = " << cpu << "  device nelbo = " << dev);
+    REQUIRE(std::isfinite(cpu));
+    REQUIRE(std::isfinite(dev));
+    // 1% -- comfortably inside FP32 forward drift, and far tighter than any difference an A/B is
+    // asked to resolve (the LoopSplit arms sit ~4% apart, seed noise ~1%).
+    REQUIRE(dev == Catch::Approx(cpu).epsilon(0.01));
+
+    // The same must hold at a short context width, which is what the context-length curve scores.
+    const double cpu64 = sub0::eval::nelbo_cpu(data, ws, 64, 2);
+    const double dev64 = sub0::eval::nelbo_device(data, ws, 64);
+    INFO("cpu nelbo@64 = " << cpu64 << "  device nelbo@64 = " << dev64);
+    REQUIRE(dev64 == Catch::Approx(cpu64).epsilon(0.01));
 }
 
 // The ignore-index CE path (loss-masked training -- e.g. the uncombine curriculum's harness-injected
