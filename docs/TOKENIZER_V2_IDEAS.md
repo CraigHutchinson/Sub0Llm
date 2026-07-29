@@ -30,14 +30,30 @@ with no identity fork** — the single biggest lever, and it *preserves unity* (
 Deviations still cost a generic modifier (`JOIN` to drop a default space; an explicit space to add
 one), but become rare.
 
-> **IMPLEMENTED (schemeV4, this branch).** `lead_glue_default(byte)` = `. , ; : ! ?`; `encode_join`
-> skips the `JOIN` when such a byte is glued (its default) and emits a literal space byte for the rare
-> space-before deviation; `detokenize_join` suppresses the pending space before them. No id/marker
-> change — only the transition rule. **Measured (4 MB held-out, learn 4k-piece vocab in-domain):**
-> tinystories **1,285,466 → 1,147,084 tokens (−10.8%)**, JOIN 10.80% → 0.04%; **fineweb 1,672,762 →
-> 1,585,807 (−5.2%)**, JOIN 8.98% → 3.95% (the residue is code/URL/bracket glue, D3/D2 territory).
-> Lossless (round-trip fuzz green); encode throughput neutral (base 32.2 ms vs v2 32.8 ms/4 MB, within
-> noise). Currently a hardcoded set; **D2** makes it corpus-derived.
+> **IMPLEMENTED (schemeV4, this branch).** A unified per-byte `(lead, trail)` glue table
+> (`glue_default(byte)` in casing.hpp): the boundary between two tokens defaults to glue iff
+> `prev.trail_glue || cur.lead_glue`, deviations lossless via `TOK_JOIN` (force glue) or a literal
+> space byte (force a space). `. , ; : ! ? %` are `lead=glue`; `$` is `trail=glue`; everything else is
+> space-both. Mechanically tiny: `encode_join`/`detokenize_join` set `dps = !trail_glue` after a
+> content byte and suppress the pending space before a `lead_glue` byte — one `glue_default()` read on
+> both sides (DRY, cannot drift). No id/marker change — only the transition rule.
+> **Measured (4 MB held-out, in-domain 4k vocab):** tinystories **1,285,466 → 1,147,084 tokens
+> (−10.8%)**, JOIN 10.80% → 0.04%; **fineweb 1,672,762 → 1,585,273 (−5.2%)**, JOIN 8.98% → 3.92% (the
+> residue is code/URL/bracket glue — D3 / point-3 territory). Lossless (round-trip fuzz + full frontend
+> suite green); encode throughput neutral (base 32.2 vs v2 32.8 ms/4 MB, within noise). Hardcoded set
+> for now; **D2** makes it corpus-derived, and the `glue_default()` accessor is the single point a
+> per-piece default (point-3 learned symbol tokens) would extend.
+
+**Point 3 — gluing corpus-specific (learned) tokens, not just inbuilt bytes.** Today the learner mints
+only WORD pieces (from word units, which exclude punctuation), so learned pieces are always word
+material and default space-both — correctly handled. The open opportunity: extend the Unigram learner
+to also mint *symbol/punctuation* pieces from the corpus (`://`, `->`, `==`, `()`, `**`, ``` ``` ```),
+each carrying its own **corpus-derived glue modality** in the same unified table (keyed by piece id,
+not byte). This is where fineweb's residual ~3.9% JOIN budget lives (code/URL/operator glue). Verdict:
+**valid and valuable, but a learner-scope change** (Scan must collect symbol runs; the glue table keys
+by token id) — a distinct increment after D2. The v2 architecture is built for it: `glue_default()` is
+already the one lookup both encode and decode consult, so per-piece defaults slot in without touching
+the FSM.
 
 **D2 — The default table is CORPUS-DERIVED, not a scheme constant.** `.`/`:`/`?` are unimodal closers
 in clean prose but **bimodal in web/code** (decimals, URLs, `a.b`). A single baked default is wrong for

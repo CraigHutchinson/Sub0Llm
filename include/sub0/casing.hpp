@@ -197,15 +197,29 @@ constexpr bool is_word_byte(int s) {
            (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
 }
 
-// v2 (schemeV4): bytes whose DEFAULT inter-token boundary BEFORE them is GLUE, not a space -- so
-// `word,` reconstructs with no space and costs no TOK_JOIN. The set is the glue-before-dominant
-// sentence punctuation measured across fineweb/cosmopedia/minipile/tinystories/gsm8k (each 84-99%
-// glue-before; ~10% of a prose token stream was JOINs gluing exactly these). Deviations stay lossless:
-// a space before one of these emits a literal space byte, a glue AFTER one still emits TOK_JOIN. This
-// is a hardcoded scheme constant for now; docs/TOKENIZER_V2_IDEAS.md D2 makes it corpus-derived.
-constexpr bool lead_glue_default(int s) {
-    return s == '.' || s == ',' || s == ';' || s == ':' || s == '!' || s == '?';
+// v2 (schemeV4): the per-character DEFAULT inter-token spacing, as a unified (lead, trail) glue table.
+// `lead` = this byte glues to what PRECEDES it by default (no space before); `trail` = it glues to
+// what FOLLOWS (no space after). The boundary between two tokens defaults to GLUE iff
+// (prev.trail_glue || cur.lead_glue); a deviation stays lossless via a generic modifier -- TOK_JOIN to
+// force glue where the default is a space, or a literal space byte to force a space where the default
+// is glue. Populated from the measured dominant modality per char (docs/TOKENIZER_V2_IDEAS.md §4b):
+//   `. , ; : ! ? %`  -> lead=glue  (glue-before dominant: `word,`, `50%` glue free -- ~10% of a prose
+//                                   stream was JOINs doing exactly this)
+//   `$`              -> trail=glue (glue-after dominant: `$5` glues free)
+//   everything else  -> space both (words/letters, and bimodal punctuation left to markers/JOIN)
+// A hardcoded scheme constant for now; docs/TOKENIZER_V2_IDEAS.md D2 makes it corpus-derived. Keyed by
+// byte here, but the accessors are the single point a future per-piece default (learned symbol tokens,
+// point 3) would extend. encode_join and detokenize_join BOTH read this -- one source, no drift.
+struct GlueDefault { bool lead = false, trail = false; };
+constexpr GlueDefault glue_default(int s) {
+    switch (s) {
+        case '.': case ',': case ';': case ':': case '!': case '?': case '%': return {true,  false};
+        case '$':                                                             return {false, true};
+        default:                                                             return {false, false};
+    }
 }
+constexpr bool lead_glue_default(int s)  { return glue_default(s).lead; }
+constexpr bool trail_glue_default(int s) { return glue_default(s).trail; }
 
 // Per-corpus truecasing statistics (configurator reporting only).
 struct TokStats {

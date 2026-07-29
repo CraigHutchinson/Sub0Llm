@@ -645,7 +645,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         if (i >= n) break;
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
-            emit_byte(stream[i]); dps = true; ++i;
+            emit_byte(stream[i]); dps = !trail_glue_default(stream[i]); ++i;   // trail=glue -> next glues free ($5)
         } else {
             // Look up (or Viterbi-encode + memoise) this word's piece-id sequence by its byte key.
             word_key.assign(end - i, '\0');
@@ -716,7 +716,7 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
             else                                                { out += static_cast<char>(c); }
         }
         if (!in_spell) {
-            dps = true;
+            dps = !(id < 256 && trail_glue_default(id));   // trail-glue byte ($) leaves no pending space
             // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
             if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == TOK_JOIN)) recase = Recase::None;
         }
