@@ -534,13 +534,17 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
     // other run is tiled into NEWLINE/PARA + run-length SPACE2/4 / TAB2/4 tokens, with a verbatim
     // byte for an odd remainder ('\r', a lone space/tab, ...). `inter_content` is false for the
     // trailing run (no following content), where a single space must stay literal, not implicit.
-    auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content) {
+    auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content, bool target_lead_glue = false) {
         const std::size_t gap = hi - lo;
         if (gap == 0) {
+            if (target_lead_glue) return;                           // v2: glue is this byte's default -- no JOIN
             if (dps) { out.push_back(TOK_JOIN); dps = false; }       // glue: cancel the pending space
             return;
         }
-        if (inter_content && gap == 1 && stream[lo] == ' ' && dps) return;  // implicit single space
+        if (inter_content && gap == 1 && stream[lo] == ' ' && dps) {
+            if (target_lead_glue) { emit_byte(' '); dps = false; }   // v2 deviation: force the space the default omits
+            return;                                                  // else: implicit single space (free)
+        }
         for (std::size_t k = lo; k < hi;) {
             const int c = stream[k];
             if (c == '\n' && k + 1 < hi && stream[k + 1] == '\n') { out.push_back(TOK_PARA);    k += 2; }
@@ -631,7 +635,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             i = g + 1;
             continue;
         }
-        tile_ws(i, g, /*inter_content=*/true);
+        tile_ws(i, g, /*inter_content=*/true, lead_glue_default(stream[g]));
         i = g;
         // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
@@ -700,7 +704,10 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
             out += static_cast<char>(id); dps = false; recase = Recase::None; continue;
         }
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
-        if (!in_spell && dps) out += ' ';               // leading implicit space (never inside a SPELL group)
+        // v2 (schemeV4): a lead-glue-default byte (sentence punctuation) glues to what precedes by
+        // default, so it suppresses the pending space -- `word,` reconstructs with no space.
+        const bool lead_glue = id < 256 && lead_glue_default(id);
+        if (!in_spell && dps && !lead_glue) out += ' ';               // leading implicit space (never inside a SPELL group)
         for (int code : t.expansion[static_cast<std::size_t>(id)]) {
             const unsigned char c = static_cast<unsigned char>(code);
             if      (recase == Recase::CapFirst && is_alpha(c)) { out += static_cast<char>(to_upper(c)); recase = Recase::None; }

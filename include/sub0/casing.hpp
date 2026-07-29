@@ -171,7 +171,12 @@ static_assert(TOK_MARKER_COUNT - TOK_EOS == 32,
 //   encode_join; measured on real corpus text, 93.9% of the old shape was that false positive, not a
 //   genuine split (see docs/TOKENIZER_DESIGN.md, docs/CORPUS_COLLAPSE.md). TOK_JOIN now means general
 //   glue only, never a word-boundary signal -- sub0::detail::word_span (scratch.hpp) simplifies to match.
-constexpr std::uint32_t kSchemeVersion = 3;
+//   3 -> 4 (v2, this bump): per-character DEFAULT spacing. Sentence punctuation (`. , ; : ! ?`) now
+//   glues to what precedes it by DEFAULT -- `word,` costs no TOK_JOIN (measured 84-99% glue-before across
+//   corpora; ~10% of a prose stream was JOINs before this). A space-before deviation (` ,`) emits a
+//   literal space byte; a glue-after deviation still emits TOK_JOIN. No marker/id change (n_base fixed),
+//   only the encode/decode transition rule -- see lead_glue_default() and docs/TOKENIZER_V2_IDEAS.md D1.
+constexpr std::uint32_t kSchemeVersion = 4;
 
 constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
@@ -190,6 +195,16 @@ constexpr unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_
 constexpr bool is_word_byte(int s) {
     return s >= 0 && s <= 0xFF &&
            (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
+}
+
+// v2 (schemeV4): bytes whose DEFAULT inter-token boundary BEFORE them is GLUE, not a space -- so
+// `word,` reconstructs with no space and costs no TOK_JOIN. The set is the glue-before-dominant
+// sentence punctuation measured across fineweb/cosmopedia/minipile/tinystories/gsm8k (each 84-99%
+// glue-before; ~10% of a prose token stream was JOINs gluing exactly these). Deviations stay lossless:
+// a space before one of these emits a literal space byte, a glue AFTER one still emits TOK_JOIN. This
+// is a hardcoded scheme constant for now; docs/TOKENIZER_V2_IDEAS.md D2 makes it corpus-derived.
+constexpr bool lead_glue_default(int s) {
+    return s == '.' || s == ',' || s == ';' || s == ':' || s == '!' || s == '?';
 }
 
 // Per-corpus truecasing statistics (configurator reporting only).

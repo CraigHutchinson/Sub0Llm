@@ -197,6 +197,21 @@ TEST_CASE("JOIN scheme: a reserved-headroom marker decodes inertly", "[tok][join
     }
 }
 
+// v2 (schemeV4): sentence punctuation `. , ; : ! ?` glues to the previous token by DEFAULT, so `word,`
+// emits NO TOK_JOIN -- the ~10% prose token saving (docs/TOKENIZER_V2_IDEAS.md D1). Losslessness is the
+// round-trip fuzz's job; this pins the SAVING (no glue token) and that both deviation directions still
+// round-trip (space-before via a literal space byte, glue-after via TOK_JOIN).
+TEST_CASE("v2 lead-glue default: punctuation glues free; deviations round-trip", "[tok][join][v2]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    for (const char* s : {"cat, dog.", "yes; no: maybe!", "really?", "the cat, the dog, and a fox."}) {
+        const std::vector<int> ids = sub0::tok::encode(t, s);
+        REQUIRE(std::find(ids.begin(), ids.end(), sub0::casing::TOK_JOIN) == ids.end());   // no glue token
+        REQUIRE(round_trips(t, s));
+    }
+    REQUIRE(round_trips(t, "cat , dog ."));       // space-before deviation (literal space byte)
+    REQUIRE(round_trips(t, "1,000 and 2,500"));   // glue-after deviation (JOIN before the trailing digits)
+}
+
 // ---------------------------------------------------------------------------
 //  JOIN / implicit-space scheme
 // ---------------------------------------------------------------------------
