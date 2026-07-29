@@ -55,7 +55,38 @@ by token id) — a distinct increment after D2. The v2 architecture is built for
 already the one lookup both encode and decode consult, so per-piece defaults slot in without touching
 the FSM.
 
-**D2 — The default table is CORPUS-DERIVED, not a scheme constant.** `.`/`:`/`?` are unimodal closers
+**Point 4 — compound & numeric expressions (measured on fineweb, real learned vocab).**
+- **Hyphenated ALPHA compounds are already optimal — no action.** `well-known` (4 tok), `state-of-the-art`
+  (9), `non-commercial` (4) each encode as a **single word unit with 0 JOIN**: `is_interior_connector`
+  (`'` `_` `-`) already binds them when flanked by word bytes on both sides, so BPE merges across the
+  separator instead of paying a JOIN per gap. This is settled; the cost is elsewhere.
+- **The real cost is NUMBERS / DATES / ALPHANUMERICS.** `is_word_byte` excludes digits, so a digit run
+  never forms a unit and glues byte-by-byte with **one JOIN per gap**: `2026` → `[2][J][0][J][2][J][6]`
+  (7 tok), `2026-07-29` → 19 tok / **9 JOIN**, `covid-19`/`H2O`/`mp3` split at the digit boundary,
+  `1,000,000` → 15 tok / 6 JOIN. On a 4 MB fineweb held-out this is most of the residual JOIN budget.
+- **Prototype (digits as word bytes → digit runs become units):** held-out `1,585,273 → 1,547,205 tok
+  (−2.4%)`, **JOIN 3.92% → 1.47%** (≈⅔ of the residual eliminated), all round-trips lossless.
+  `2026-07-29` → 8 tok / 0 JOIN, `the year 2026` → 6 tok / 0 JOIN.
+- **BUT digit tokenization is LOAD-BEARING for the arithmetic op-curriculum.** `op_curriculum` +
+  `node_frame`'s compute callback **parse numbers out of the token stream digit-by-digit** and assert
+  every result token is a single digit byte (`t >= '0' && t <= '9'`). Merging digits into pieces broke
+  both the dataset assertions AND the operand parser (a recomputed operand came back `"1"` instead of
+  `"89"`). So digits-as-bytes is a **deliberate choice for digit-level arithmetic supervision**, not an
+  oversight (AGENTS.md §10: enumerate consumers before changing a shared semantic).
+- **Refinement that keeps both wins:** make digit runs *units* (kills inter-digit JOINs) but bar the
+  Unigram from minting **all-digit pieces** (single digit bytes stay mandatory → digits always
+  Viterbi-segment to individual bytes → arithmetic intact). Measured: **same JOIN win (3.92% → 1.45%)**,
+  token −0.66% (forgoes digit-piece compression, correctly). Round-trip lossless. It still fails
+  `op_curriculum` because the `node_frame` number-parser also depends on the *spacing/JOIN framing* of
+  the operands, not just piece-vs-byte — so this is a **multi-consumer change** (tokenizer + node_frame
+  operand parser + op_curriculum dataset), a distinct increment that must update the arithmetic parser
+  in lockstep, not a localized tokenizer tweak.
+- **Verdict:** the JOIN win is real and large, but gated on reworking the arithmetic-frame number parser
+  to the new digit-unit framing. Alpha compounds need nothing. `/` compounds (`and/or`) and thousands
+  separators (`1,000,000`'s commas) are smaller and locale/domain-dependent → defer to Point 3
+  (corpus-derived symbol pieces), not a hard-coded rule.
+
+ `.`/`:`/`?` are unimodal closers
 in clean prose but **bimodal in web/code** (decimals, URLs, `a.b`). A single baked default is wrong for
 one domain. The configurator measures each codepoint's dominant modality and bakes a per-target default
 table into `tokenizer.tok` — the mechanism already exists: `sub0llm-tokenizer calibrate` /
