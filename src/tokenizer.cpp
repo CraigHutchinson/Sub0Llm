@@ -136,9 +136,30 @@ void Scan::add_words(std::string_view chunk, const std::unordered_set<std::strin
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                   // standalone symbol
             const int s = stream[i];
-            if (s == TOK_CAP)      used_cap = true;
-            else if (s == TOK_UP)  used_up = true;
-            else                   byte_used[static_cast<std::size_t>(s)] = 1;
+            if (s == TOK_CAP)      { used_cap = true; ++i; continue; }
+            if (s == TOK_UP)       { used_up = true; ++i; continue; }
+            if (is_symbol_piece_byte(s)) {                // collect a plain-symbol RUN as a learnable unit
+                std::size_t se = i + 1;
+                while (se < n && is_symbol_piece_byte(stream[se])) ++se;
+                if (se - i >= 2) {                        // a run the Unigram can mint as a symbol piece
+                    std::string skey(se - i, '\0');
+                    for (std::size_t k = i; k < se; ++k) skey[k - i] = static_cast<char>(stream[k] & 0xFF);
+                    const auto sit = index.find(skey);
+                    if (sit == index.end()) {
+                        std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                             stream.begin() + static_cast<std::ptrdiff_t>(se));
+                        for (int bb : seq) byte_used[static_cast<std::size_t>(bb)] = 1;
+                        index.emplace(std::move(skey), static_cast<int>(word_syms.size()));
+                        word_syms.push_back(std::move(seq));
+                        word_freq.push_back(1);
+                    } else {
+                        word_freq[static_cast<std::size_t>(sit->second)] += 1;
+                    }
+                    i = se;
+                    continue;
+                }
+            }
+            byte_used[static_cast<std::size_t>(s)] = 1;
             ++i;
             continue;
         }
@@ -645,6 +666,25 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         if (i >= n) break;
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
+            // v2 (schemeV4, point 3): a run of plain symbols whose WHOLE maximal extent is a single
+            // learned piece (`://`, `->`, `==`) collapses to one token -- its internal JOINs vanish and
+            // it glues by its boundary bytes (piece_lead/trail_glue). A partial run (no whole-run piece)
+            // stays byte-by-byte via the fall-through below -- still lossless, just not collapsed.
+            if (is_symbol_piece_byte(stream[i])) {
+                std::size_t se = i + 1;
+                while (se < n && is_symbol_piece_byte(stream[se])) ++se;
+                if (se - i >= 2) {
+                    word_key.assign(se - i, '\0');
+                    for (std::size_t k = i; k < se; ++k) word_key[k - i] = static_cast<char>(stream[k] & 0xFF);
+                    const auto pit = t.piece_index.find(word_key);
+                    if (pit != t.piece_index.end() && pit->second >= t.n_base) {
+                        out.push_back(pit->second);
+                        dps = !trail_glue_default(stream[se - 1]);
+                        i = se;
+                        continue;
+                    }
+                }
+            }
             emit_byte(stream[i]); dps = !trail_glue_default(stream[i]); ++i;   // trail=glue -> next glues free ($5)
         } else {
             // Look up (or Viterbi-encode + memoise) this word's piece-id sequence by its byte key.
@@ -670,6 +710,21 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             i = end;
         }
     }
+}
+
+// Per-piece glue: a learned piece inherits the lead-glue of its FIRST expansion byte and the
+// trail-glue of its LAST -- so a symbol piece (`://`, `->`) glues exactly as its boundary bytes
+// would, and decode (keyed by piece id) agrees with encode (keyed by the unit's boundary bytes).
+// A no-op for word pieces (letters default space-both) and identical to the byte rule for id < 256.
+inline bool piece_lead_glue(const Tokenizer& t, int id) {
+    if (id < 256) return lead_glue_default(id);
+    const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+    return !e.empty() && lead_glue_default(e.front());
+}
+inline bool piece_trail_glue(const Tokenizer& t, int id) {
+    if (id < 256) return trail_glue_default(id);
+    const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+    return !e.empty() && trail_glue_default(e.back());
 }
 
 // JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space between
@@ -705,8 +760,9 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
         }
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
         // v2 (schemeV4): a lead-glue-default byte (sentence punctuation) glues to what precedes by
-        // default, so it suppresses the pending space -- `word,` reconstructs with no space.
-        const bool lead_glue = id < 256 && lead_glue_default(id);
+        // default, so it suppresses the pending space -- `word,` reconstructs with no space. A learned
+        // symbol piece glues by its first byte's default via piece_lead_glue.
+        const bool lead_glue = piece_lead_glue(t, id);
         if (!in_spell && dps && !lead_glue) out += ' ';               // leading implicit space (never inside a SPELL group)
         for (int code : t.expansion[static_cast<std::size_t>(id)]) {
             const unsigned char c = static_cast<unsigned char>(code);
@@ -716,7 +772,7 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
             else                                                { out += static_cast<char>(c); }
         }
         if (!in_spell) {
-            dps = !(id < 256 && trail_glue_default(id));   // trail-glue byte ($) leaves no pending space
+            dps = !piece_trail_glue(t, id);   // trail-glue byte ($) / piece leaves no pending space
             // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
             if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == TOK_JOIN)) recase = Recase::None;
         }

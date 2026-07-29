@@ -676,6 +676,24 @@ TEST_CASE("JOIN scheme (v2): numbers are clean typed units; letter-fusion pays a
         REQUIRE(round_trips(t, s));
 }
 
+// v2 (schemeV4, point 3): a recurring plain-symbol run is minted as ONE learned piece so its internal
+// JOINs collapse (the code-operator win: `://` `->` `==` `!=` `&&`), corpus-adaptively -- prose learns
+// few, code learns many. Quotes/brackets are excluded (they keep their own markers). Always lossless.
+TEST_CASE("JOIN scheme (v2): a recurring symbol run is minted as one piece (point 3)", "[tok][join][v2]") {
+    std::string corpus;
+    for (int k = 0; k < 300; ++k) corpus += "read http://example.com then a->b and c->d and e==f done .\n";
+    const Tokenizer t = sub0::tok::learn(corpus);
+    // The whole run is ONE learned piece (id >= n_base), not glued bytes.
+    REQUIRE(t.piece_index.count("://") == 1);
+    REQUIRE(t.piece_index.at("://") >= t.n_base);
+    REQUIRE(t.piece_index.count("->") == 1);
+    // Using that piece: `://` encodes with no internal JOIN (one token spans the run).
+    const std::vector<int> u = sub0::tok::encode(t, "http://x");
+    REQUIRE(std::find(u.begin(), u.end(), t.piece_index.at("://")) != u.end());
+    for (const char* s : {"http://x", "a->b->c", "e==f", "x-> y :// z", "no->space", "mix a->b :// c==d"})
+        REQUIRE(round_trips(t, s));
+}
+
 // WS5b: bracket-glue markers collapse the JOIN tax on a bracket glued directly to what precedes it.
 // Unlike quotes, `(`/`)`/`[`/`]`/`{`/`}` are already unambiguous distinct bytes, so these markers
 // exist purely to save tokens, not to disambiguate direction -- verify the SAVINGS directly (not

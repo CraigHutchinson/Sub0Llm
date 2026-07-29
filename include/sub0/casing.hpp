@@ -349,6 +349,17 @@ inline std::size_t word_unit_end(std::span<const int> s, std::size_t i) {
     return j;
 }
 
+// A byte eligible to join a learned SYMBOL piece (schemeV4, point 3): a non-word, non-whitespace
+// ASCII symbol WITHOUT a dedicated marker path. Quotes and brackets are excluded -- they keep their
+// own open/close markers (TOK_ODQUOTE, TOK_GLUE_OPAREN, ...), so lumping them into a symbol piece
+// would let learn and encode disagree. This leaves the code operators that actually recur as runs
+// (`://` `->` `=>` `==` `!=` `<=` `>=` `&&` `||` `::` `//` `--` `...`) to be minted as pieces.
+constexpr bool is_symbol_piece_byte(int b) {
+    if (b < 0 || b > 0xFF || is_word_byte(b) || is_space(static_cast<unsigned char>(b))) return false;
+    switch (b) { case '"': case '(': case ')': case '[': case ']': case '{': case '}': return false; }
+    return true;
+}
+
 // Split a mixed-case alpha run into CamelCase / PascalCase segments at case transitions, so
 // each piece reuses the lowercase BPE merges + a CAP/UP marker instead of shattering into
 // near-character SPELL tokens (interior capitals are distinct bytes that never match the
