@@ -1352,7 +1352,7 @@ struct Model {
             // the cross-pass channel arm D exists to measure (docs/DEPTH_ATTENTION.md 2).
             if constexpr (USE_DEPTH_ATTN) {
                 vn = op_depth_attn(qn, kn, vn, N_KV_HEADS);
-                if (exec_i % DEPTH_ATTN_STRIDE == 0) g_depth.push(kn, vn);
+                if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(exec_i)] >= 0) g_depth.push(kn, vn);
             }
             Node* att = op_attn(qn, kn, vn, N_HEADS);
             h = op_add(h, op_linear(att, L.Wo, nullptr, q));
@@ -1452,7 +1452,7 @@ struct Model {
             // because that is what op_attn receives in the batched forward. Mirrors forward()'s block.
             if constexpr (USE_DEPTH_ATTN) {
                 depth_mix_row(qn, kn, vn, dep_k, dep_v, dep_n);
-                if (e % DEPTH_ATTN_STRIDE == 0) {
+                if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(e)] >= 0) {
                     for (int j = 0; j < D_KV; ++j) {
                         dep_k[(size_t)dep_n * D_KV + j] = kn[j];
                         dep_v[(size_t)dep_n * D_KV + j] = vn[j];

@@ -149,6 +149,37 @@ inline constexpr int DEPTH_CACHE_MAX = USE_DEPTH_ATTN
     ? (LOOP_EXEC_COUNT + DEPTH_ATTN_STRIDE - 1) / DEPTH_ATTN_STRIDE : 0;
 static_assert(DEPTH_CACHE_MAX <= LOOP_EXEC_COUNT, "depth cache cannot outnumber the executions");
 
+// Per-execution depth-cache bookkeeping, resolved at compile time so the CPU tape, the CUDA forward and
+// the CUDA backward cannot disagree about it -- they each need the SAME two numbers per execution, and
+// deriving them independently at three sites is how a cross-execution index bug would get in.
+//   live[e] = how many cache entries were already present when execution e ran; its mix reads exactly
+//             those, plus its own (K,V) as entry live[e].
+//   own[e]  = the slot execution e appends to, or -1 if it does not participate.
+// Note own[e] == live[e] whenever e participates: an execution appends AFTER mixing, so it never reads
+// its own slot. The backward relies on that -- see docs/DEPTH_ATTENTION.md 5b.
+struct DepthSchedule {
+    std::array<int, LOOP_EXEC_COUNT> live{};
+    std::array<int, LOOP_EXEC_COUNT> own{};
+};
+consteval DepthSchedule make_depth_schedule() {
+    DepthSchedule d{};
+    int n = 0;
+    for (int e = 0; e < LOOP_EXEC_COUNT; ++e) {
+        d.live[static_cast<std::size_t>(e)] = n;
+        // `&&` short-circuits during constant evaluation, so the modulo never runs at stride 0.
+        if (USE_DEPTH_ATTN && e % DEPTH_ATTN_STRIDE == 0) { d.own[static_cast<std::size_t>(e)] = n; ++n; }
+        else                                              { d.own[static_cast<std::size_t>(e)] = -1; }
+    }
+    return d;
+}
+inline constexpr DepthSchedule DEPTH_SCHEDULE = make_depth_schedule();
+// The schedule and the sizing constant must agree, or a buffer is short by one slot -- which on the
+// device is a silent out-of-bounds write, not an allocation failure.
+static_assert(!USE_DEPTH_ATTN ||
+              DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1]
+                  + (DEPTH_SCHEDULE.own[LOOP_EXEC_COUNT - 1] >= 0 ? 1 : 0) == DEPTH_CACHE_MAX,
+              "DEPTH_CACHE_MAX must equal the number of slots make_depth_schedule() fills");
+
 // ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //
 // The Header and PARAM_FLOATS between them discriminate every axis that changes a tensor SHAPE. They
@@ -270,6 +301,7 @@ inline constexpr memplan::Dims current_build_dims() {
         .pos_emb     = HAS_POS_EMB,
         .n_kv_heads  = N_KV_HEADS,
         .exec_layers = LOOP_EXEC_COUNT,
+        .depth_slots = DEPTH_CACHE_MAX,
     };
 }
 

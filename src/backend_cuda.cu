@@ -52,16 +52,14 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
-// Depth attention (DEPTH_ATTN_STRIDE > 0) is CPU-only as of Stage 1 -- see docs/DEPTH_ATTENTION.md 6.
-// This is a HARD STOP rather than a silent no-op on purpose: the op adds no parameters and rewrites only
-// V, so a GPU build that skipped it would train and score a DIFFERENT architecture while every shape
-// check, every checkpoint field and PARAM_FLOATS all still agreed. That is precisely the class of
-// silent-divergence bug ARCH_FINGERPRINT was extended to catch at load time; refusing to compile catches
-// it one step earlier. Lift this when Stage 2 lands the cross-execution dK/dV accumulation.
-// TODO(depth-attn-gpu): implement op_depth_attn's forward + backward on device, then remove this guard.
-static_assert(!sub0::USE_DEPTH_ATTN,
-    "depth attention is CPU-only until docs/DEPTH_ATTENTION.md Stage 2 lands the CUDA cross-execution "
-    "dK/dV accumulation; configure with -DSUB0_COMPUTE=CPU or --depth-attn-stride 0.");
+// Depth attention (DEPTH_ATTN_STRIDE > 0): training (forward_train + backward_device) and batched
+// inference (forward_device) are implemented below -- see docs/DEPTH_ATTENTION.md 5b. The one path NOT
+// covered is the single-token KV-cache decode (forward_one_device), which needs its own rows=1 cache
+// inside a captured graph; it hard-fails at RUNTIME rather than silently skipping the mix (see that
+// function). Runtime rather than compile-time because the covered paths must stay buildable, and a
+// no-op there would generate from a DIFFERENT architecture while every shape check, checkpoint field
+// and PARAM_FLOATS still agreed -- exactly the silent divergence ARCH_FINGERPRINT exists to catch.
+// TODO(depth-attn-decode): give forward_one_device a per-token depth cache, then drop that refusal.
 
 // SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights): GPU support landed.
 // swiglu_kernel/swiglu_act_kernel/swiglu_backward_act_kernel below implement op_swiglu's forward/
@@ -2246,6 +2244,196 @@ template <class A> inline void launch_attn_train_t(const A* dQ, const A* dK, con
     attn_fwd_tiled_kernel<A, HD, TK><<<grid, block, 0, g_stream>>>(dQ, dK, dV, dOut, T, C, in_stride, kv_group);
 }
 
+// ============================================================================
+//  Depth attention (docs/DEPTH_ATTENTION.md) -- rewrites V only, adds no parameters
+// ============================================================================
+// A softmax over the DEPTH axis, per (row, kv-head), mixing this execution's value vector with the
+// values cached by earlier participating executions. K is passed through untouched, so the sequence
+// attention that follows is unchanged. See op_depth_attn / depth_mix_row in backend_cpu.cpp -- these
+// kernels must agree with them numerically (the CPU/CUDA forward-logits and gradient-parity gates).
+//
+// Cache pointers travel BY VALUE (a few hundred bytes, far inside the 4 KB kernel-parameter limit), so
+// there is no device-side pointer table to build or keep in sync. Arrays are DEPTH_CACHE_MAX + 1 long
+// so they are never zero-length when depth attention is off.
+constexpr int kDepthMax = sub0::DEPTH_CACHE_MAX + 1;
+template <class A> struct DepthCacheA {          // retained forward K/V, one [rows, D_KV] per slot
+    const A* k[kDepthMax] = {};
+    const A* v[kDepthMax] = {};
+};
+struct DepthCacheG {                             // f32 gradient accumulators, same shape
+    float* k[kDepthMax] = {};
+    float* v[kDepthMax] = {};
+};
+
+// Forward. One block per (row, kv-head); BLOCK=32 threads stride over D_HEAD, exactly like
+// qknorm_act_kernel and for the same reason (D_HEAD is 32-96 here, so one warp's shuffle-reduce covers
+// the per-entry dot product without the cross-warp shared-memory step).
+//
+// Three optional outputs, all nullable, all writing the SAME [rows, D_KV] shape:
+//   v_own_out -- this execution's PRE-mix V. The mix overwrites V in place (it must: the attention
+//                kernel takes one in_stride for Q/K/V and cannot read a mixed V from elsewhere), and
+//                the backward needs the pre-mix value for dL/dp_S. Free here, since this kernel is
+//                already reading it. Only backward_device's recompute asks for it.
+//   k_store /  -- this execution's cache slot. Emitted as an output instead of a separate copy kernel,
+//   v_store      again because the values are already in registers. The stored V is the MIXED one --
+//                the reference reassigns value_states before appending, which is what makes the
+//                mixture recursive across participating executions.
+template <class A, int H, int KVH, int DH, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+depth_attn_fwd_kernel(A* __restrict__ qkv, DepthCacheA<A> cache, int S,
+                      A* __restrict__ v_own_out, A* __restrict__ k_store, A* __restrict__ v_store) {
+    constexpr int C = H * DH, CKV = KVH * DH, in_stride = C + 2 * CKV, G = H / KVH;
+    const float scale = rsqrtf(static_cast<float>(DH));
+    const int row = blockIdx.x, hd = blockIdx.y, off = hd * DH;
+    const size_t kvbase = static_cast<size_t>(row) * CKV + off;
+    A* const qr = qkv + static_cast<size_t>(row) * in_stride;
+    A* const kr = qr + C + off;                          // this execution's K (post-QK-norm, post-RoPE)
+    A* const vr = qr + C + CKV + off;                    // this execution's own V, overwritten below
+
+    __shared__ float sh_qb[DH];                          // q-bar: GQA mean over this group's query heads
+    __shared__ float sh_p[kDepthMax];
+    for (int a = threadIdx.x; a < DH; a += BLOCK) {
+        float s = 0.f;
+        #pragma unroll
+        for (int g = 0; g < G; ++g) s += to_f32(qr[static_cast<size_t>(hd * G + g) * DH + a]);
+        sh_qb[a] = s * (1.0f / static_cast<float>(G));
+    }
+    __syncthreads();
+
+    for (int d = 0; d <= S; ++d) {                       // depth logits (entry S is this execution's own)
+        const A* kd = (d < S) ? (cache.k[d] + kvbase) : kr;
+        float partial = 0.f;
+        for (int a = threadIdx.x; a < DH; a += BLOCK) partial += sh_qb[a] * to_f32(kd[a]);
+        const float l = block_reduce_sum<BLOCK>(partial) * scale;
+        if (threadIdx.x == 0) sh_p[d] = l;                // valid in lane 0 only, which is the writer
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {                              // softmax over depth; S+1 <= 29 here, so serial
+        float mx = sh_p[0];
+        for (int d = 1; d <= S; ++d) mx = fmaxf(mx, sh_p[d]);
+        float Z = 0.f;
+        for (int d = 0; d <= S; ++d) { const float e = __expf(sh_p[d] - mx); sh_p[d] = e; Z += e; }
+        const float invZ = 1.0f / Z;
+        for (int d = 0; d <= S; ++d) sh_p[d] *= invZ;
+    }
+    __syncthreads();
+
+    for (int a = threadIdx.x; a < DH; a += BLOCK) {
+        const float vown = to_f32(vr[a]);                // read BEFORE the in-place overwrite below
+        float acc = sh_p[S] * vown;
+        for (int d = 0; d < S; ++d) acc += sh_p[d] * to_f32(cache.v[d][kvbase + a]);
+        if (v_own_out) st_act(&v_own_out[kvbase + a], vown);
+        st_act(&vr[a], acc);
+        if (v_store) st_act(&v_store[kvbase + a], acc);
+        if (k_store) st_act(&k_store[kvbase + a], to_f32(kr[a]));
+    }
+}
+
+// Backward. Same geometry. Consumes dV_mixed from dqkv's V sub-block and produces, per docs 4:
+//   dV_own -> OVERWRITES the V sub-block      dK_own, dQ_own -> ACCUMULATE (attention wrote them first)
+//   dV_d, dK_d for every d < S                -> accumulate into the persistent dcache slots
+// `own_slot >= 0` means this execution appended to the cache, so LATER executions have accumulated
+// gradients w.r.t. its K and its MIXED V into that slot. Those must be folded in FIRST -- into g before
+// dV_mixed is consumed, and into dK alongside attention's own contribution. Sound because
+// backward_device walks executions in reverse and every reader of a slot has a higher execution index
+// than its owner, so the slot is complete by the time the owner runs (docs 5b, finding 1); that is also
+// why the read-modify-writes below need no atomics -- one block owns one (row, kv-head), and separate
+// launches are ordered by the stream.
+template <class A, int H, int KVH, int DH, int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+depth_attn_bwd_kernel(const A* __restrict__ qkv, const A* __restrict__ v_own, A* __restrict__ dqkv,
+                      DepthCacheA<A> cache, DepthCacheG dcache, int S, int own_slot) {
+    constexpr int C = H * DH, CKV = KVH * DH, in_stride = C + 2 * CKV, G = H / KVH;
+    constexpr float invG = 1.0f / static_cast<float>(G);
+    const float scale = rsqrtf(static_cast<float>(DH));
+    const int row = blockIdx.x, hd = blockIdx.y, off = hd * DH;
+    const size_t kvbase = static_cast<size_t>(row) * CKV + off;
+    const A* const qr = qkv + static_cast<size_t>(row) * in_stride;
+    const A* const kr = qr + C + off;
+    A* const dqr = dqkv + static_cast<size_t>(row) * in_stride;
+    A* const dkr = dqr + C + off;
+    A* const dvr = dqr + C + CKV + off;
+
+    __shared__ float sh_qb[DH], sh_g[DH], sh_p[kDepthMax], sh_dl[kDepthMax];
+    for (int a = threadIdx.x; a < DH; a += BLOCK) {
+        float g = to_f32(dvr[a]);
+        if (own_slot >= 0) g += dcache.v[own_slot][kvbase + a];   // contributions from LATER executions
+        sh_g[a] = g;
+        float s = 0.f;
+        #pragma unroll
+        for (int gg = 0; gg < G; ++gg) s += to_f32(qr[static_cast<size_t>(hd * G + gg) * DH + a]);
+        sh_qb[a] = s * invG;
+    }
+    __syncthreads();
+
+    for (int d = 0; d <= S; ++d) {                       // recompute the forward's depth softmax
+        const A* kd = (d < S) ? (cache.k[d] + kvbase) : kr;
+        float partial = 0.f;
+        for (int a = threadIdx.x; a < DH; a += BLOCK) partial += sh_qb[a] * to_f32(kd[a]);
+        const float l = block_reduce_sum<BLOCK>(partial) * scale;
+        if (threadIdx.x == 0) sh_p[d] = l;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mx = sh_p[0];
+        for (int d = 1; d <= S; ++d) mx = fmaxf(mx, sh_p[d]);
+        float Z = 0.f;
+        for (int d = 0; d <= S; ++d) { const float e = __expf(sh_p[d] - mx); sh_p[d] = e; Z += e; }
+        const float invZ = 1.0f / Z;
+        for (int d = 0; d <= S; ++d) sh_p[d] *= invZ;
+    }
+    __syncthreads();
+
+    for (int d = 0; d <= S; ++d) {                       // dL/dp_d = <g, v_d>
+        const A* vd = (d < S) ? (cache.v[d] + kvbase) : (v_own + kvbase);
+        float partial = 0.f;
+        for (int a = threadIdx.x; a < DH; a += BLOCK) partial += sh_g[a] * to_f32(vd[a]);
+        const float dp = block_reduce_sum<BLOCK>(partial);
+        if (threadIdx.x == 0) sh_dl[d] = dp;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {                              // softmax Jacobian, with `scale` folded in once
+        float dot = 0.f;
+        for (int d = 0; d <= S; ++d) dot += sh_p[d] * sh_dl[d];
+        for (int d = 0; d <= S; ++d) sh_dl[d] = sh_p[d] * (sh_dl[d] - dot) * scale;
+    }
+    __syncthreads();
+
+    for (int a = threadIdx.x; a < DH; a += BLOCK) {
+        float dqb = sh_dl[S] * to_f32(kr[a]);
+        for (int d = 0; d < S; ++d) {
+            dcache.v[d][kvbase + a] += sh_p[d]  * sh_g[a];
+            dcache.k[d][kvbase + a] += sh_dl[d] * sh_qb[a];
+            dqb                     += sh_dl[d] * to_f32(cache.k[d][kvbase + a]);
+        }
+        st_act(&dvr[a], sh_p[S] * sh_g[a]);              // OVERWRITE: dV_mixed is fully consumed
+        float dk = to_f32(dkr[a]) + sh_dl[S] * sh_qb[a];
+        if (own_slot >= 0) dk += dcache.k[own_slot][kvbase + a];
+        st_act(&dkr[a], dk);
+        for (int gg = 0; gg < G; ++gg) {                 // scatter dq-bar back over the query group
+            A* p = dqr + static_cast<size_t>(hd * G + gg) * DH + a;
+            st_act(p, to_f32(*p) + dqb * invG);
+        }
+    }
+}
+
+template <class A>
+inline void launch_depth_attn_t(A* qkv, const DepthCacheA<A>& cache, int S, int rows,
+                                A* v_own_out, A* k_store, A* v_store) {
+    constexpr int BLOCK = 32;
+    const dim3 grid(rows, N_KV_HEADS);
+    depth_attn_fwd_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, BLOCK><<<grid, BLOCK, 0, g_stream>>>(
+        qkv, cache, S, v_own_out, k_store, v_store);
+}
+template <class A>
+inline void launch_depth_attn_bwd_t(const A* qkv, const A* v_own, A* dqkv, const DepthCacheA<A>& cache,
+                                    const DepthCacheG& dcache, int S, int own_slot, int rows) {
+    constexpr int BLOCK = 32;
+    const dim3 grid(rows, N_KV_HEADS);
+    depth_attn_bwd_kernel<A, N_HEADS, N_KV_HEADS, D_HEAD, BLOCK><<<grid, BLOCK, 0, g_stream>>>(
+        qkv, v_own, dqkv, cache, dcache, S, own_slot);
+}
+
 //TODO: We should be able to know the upper lilmit of the scratch size needed for backward, and allocate it once.
 // this risks OOM during flight and overhead of alloc/fragmentation.
 // Per-query softmax-stats scratch for the flash backward (m_i, 1/Z_i, dot_i), each batch*H*T floats.
@@ -2393,6 +2581,10 @@ struct FwdScratch {
     float* ff2    = nullptr;
     float* logits = nullptr;
     float* wqkv[N_LAYERS] = {};         // per-layer fused QKV weight [C, QKV_STRIDE], built once at upload
+    // Depth attention: retained forward K / MIXED V per cache slot, [M, D_KV] each. Forward-only, so no
+    // gradient accumulators and no pre-mix V -- see TrainScratch's own depth block for those.
+    float* depth_k[sub0::DEPTH_CACHE_MAX + 1] = {};
+    float* depth_v[sub0::DEPTH_CACHE_MAX + 1] = {};
 };
 FwdScratch g_fwd;
 size_t     g_fwd_rows = 0;             // total [M] ROW capacity the batch-dependent buffers are sized for
@@ -2431,6 +2623,11 @@ void fwd_free_batch() {
     cudaFree(g_fwd.dids); cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
     cudaFree(g_fwd.att);  cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
     cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
+    if constexpr (sub0::USE_DEPTH_ATTN)         // matches fwd_alloc's depth block
+        for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) {
+            cudaFree(g_fwd.depth_k[s]); g_fwd.depth_k[s] = nullptr;
+            cudaFree(g_fwd.depth_v[s]); g_fwd.depth_v[s] = nullptr;
+        }
     g_fwd.dids = nullptr; g_fwd.h = g_fwd.a = g_fwd.qkv = g_fwd.att = g_fwd.proj = g_fwd.fbuf =
         g_fwd.ff1 = g_fwd.gact = g_fwd.ff2 = g_fwd.logits = nullptr;
     g_fwd_rows = 0;
@@ -2467,6 +2664,13 @@ int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.gact,   MF * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.ff2,    MC * sizeof(float)));
         SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.logits, MV * sizeof(float)));
+        // Depth attention: forward-only cache, one [M, D_KV] K and V per slot. Inside `full` because the
+        // training path reads its own act_t cache out of g_tr and never touches these.
+        if constexpr (sub0::USE_DEPTH_ATTN)
+            for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) {
+                SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.depth_k[s], Mm * sub0::D_KV * sizeof(float)));
+                SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.depth_v[s], Mm * sub0::D_KV * sizeof(float)));
+            }
     }
     g_fwd_rows = Mm;
     g_fwd_full = full ? 1 : 0;
@@ -2529,6 +2733,21 @@ struct TrainScratch {
                                    // forward graph, so nothing else survives to hold the pre-norm value
                                    // by the time qknorm's own backward (which runs AFTER RoPE's
                                    // backward, since RoPE sits after qknorm going forward) needs it.
+    // Depth attention (all null and zero bytes at stride 0). Indexed by CACHE SLOT, not execution:
+    // DEPTH_CACHE_MAX slots, one per participating execution (sub0::DEPTH_SCHEDULE maps between them).
+    //   depth_k / depth_v -- the RETAINED forward K and MIXED V, act_t like qkv. Retained rather than
+    //     recomputed because backward_device's per-execution recompute of execution e needs the K/V of
+    //     executions BEFORE it, which its own recompute cannot produce.
+    //   ddepth_k / ddepth_v -- f32 gradient accumulators, live across the WHOLE backward: execution e
+    //     writes into the slots owned by earlier executions, which the reverse walk reaches later.
+    //   v_own -- ONE buffer, not one per execution. The in-place mix destroys the pre-mix V that
+    //     dL/dp_S needs, but the backward recomputes and processes one execution at a time, so a single
+    //     reusable [M,D_KV] suffices. See docs/DEPTH_ATTENTION.md 5b finding 2.
+    act_t* depth_k [sub0::DEPTH_CACHE_MAX + 1] = {};   // [M, D_KV] per slot
+    act_t* depth_v [sub0::DEPTH_CACHE_MAX + 1] = {};
+    float* ddepth_k[sub0::DEPTH_CACHE_MAX + 1] = {};
+    float* ddepth_v[sub0::DEPTH_CACHE_MAX + 1] = {};
+    act_t* v_own = nullptr;                            // [M, D_KV] this execution's pre-mix V
 };
 TrainScratch g_tr;
 size_t       g_tr_rows = 0;        // total [M] ROW capacity (batch*T product) the buffers are sized for
@@ -2599,6 +2818,20 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     // qk_pre [M,2C]: only when USE_QK_NORM (see the TrainScratch::qk_pre comment) -- zero bytes and
     // stays nullptr on the default (qk-norm off) build.
     if constexpr (USE_QK_NORM) SUB0_CUDA_CHECK(cudaMalloc(&g_tr.qk_pre, Mm * sub0::QK_PRE_STRIDE * sizeof(act_t)));
+    // Depth attention: DEPTH_CACHE_MAX slots of [M, D_KV] retained K/V plus their f32 gradient
+    // accumulators, and ONE reusable pre-mix V. All zero bytes at stride 0. This is the largest single
+    // term depth attention adds and it is what picks the affordable stride -- see docs 5b finding 4 and
+    // memplan.hpp's depth_bytes, which must stay in lock-step with the arithmetic here.
+    if constexpr (sub0::USE_DEPTH_ATTN) {
+        const size_t MKV = Mm * sub0::D_KV;
+        for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) {
+            SUB0_CUDA_CHECK(cudaMalloc(&g_tr.depth_k[s],  MKV * sizeof(act_t)));
+            SUB0_CUDA_CHECK(cudaMalloc(&g_tr.depth_v[s],  MKV * sizeof(act_t)));
+            SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ddepth_k[s], MKV * sizeof(float)));
+            SUB0_CUDA_CHECK(cudaMalloc(&g_tr.ddepth_v[s], MKV * sizeof(float)));
+        }
+        SUB0_CUDA_CHECK(cudaMalloc(&g_tr.v_own, MKV * sizeof(act_t)));
+    }
     g_tr_rows = Mm;
     return 0;
 }
@@ -2614,6 +2847,13 @@ void train_free() {
     cudaFree(g_tr.dfbuf); cudaFree(g_tr.dff1); cudaFree(g_tr.dgact); // dlogits aliases logits (freed above)
     cudaFree(g_tr.dwqkv); cudaFree(g_tr.dh16); cudaFree(g_tr.loss); cudaFree(g_tr.dtargets); cudaFree(g_tr.lengths); cudaFree(g_tr.active);
     if constexpr (USE_QK_NORM) cudaFree(g_tr.qk_pre);   // no-op (cudaFree(nullptr) is well-defined) when off
+    if constexpr (sub0::USE_DEPTH_ATTN) {               // matches train_alloc's depth block above
+        for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) {
+            cudaFree(g_tr.depth_k[s]);  cudaFree(g_tr.depth_v[s]);
+            cudaFree(g_tr.ddepth_k[s]); cudaFree(g_tr.ddepth_v[s]);
+        }
+        cudaFree(g_tr.v_own);
+    }
     free_bwd_stats();                                   // flash-backward per-query stats scratch
     g_tr = TrainScratch{};
     g_tr_rows = 0;
@@ -2936,6 +3176,16 @@ static_assert(N_HEADS * D_HEAD + (N_KV_HEADS * D_HEAD) == sub0::QK_PRE_STRIDE,
 // and the K/V cache. Writes logits into g_fwd.logits[0..VOCAB). Requires uploaded params + wqkv +
 // fwd_alloc(1) + kv_alloc(); the caller resets pos to 0 at the start of a sequence.
 void forward_one_device(int id, int pos) {
+    // Depth attention is not implemented on the single-token decode path (see the TODO at the top of
+    // this file). Refusing loudly is the whole point: silently skipping the mix would decode from a
+    // different architecture than the one that trained, and nothing else in the stack could tell.
+    // Training and batched inference/eval DO support it, which is what arm D needs.
+    if constexpr (sub0::USE_DEPTH_ATTN) {
+        std::fprintf(stderr, "fatal: CUDA single-token decode does not implement depth attention "
+                             "(DEPTH_ATTN_STRIDE=%d); use the CPU backend for gen, or extend "
+                             "forward_one_device (TODO(depth-attn-decode)).\n", DEPTH_ATTN_STRIDE);
+        std::abort();
+    }
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, V = VOCAB, H = N_HEADS;
     float* const base = g_dev_params;
@@ -3075,6 +3325,28 @@ void forward_one_device_graphed() {
 }
 
 // Device-side forward chain (no host transfers): assumes g_fwd.dids is populated and the
+// Depth-attention cache views over the resident buffers. These carry EVERY allocated slot, not just the
+// first S: what a kernel may read is bounded by its own `S` (entries 0..S-1) and `own_slot` (== S when
+// this execution appends), and the owner slot therefore sits exactly one PAST the readable range.
+// Handing out a truncated view was an off-by-one waiting to happen; the bound belongs in one place.
+// Two forward variants because the training and inference forwards store activations in different types
+// (act_t vs float), the same split launch_qknorm_t<act_t> / launch_qknorm_t<float> already has.
+[[maybe_unused]] DepthCacheA<act_t> depth_cache_train() {
+    DepthCacheA<act_t> c{};
+    for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) { c.k[s] = g_tr.depth_k[s]; c.v[s] = g_tr.depth_v[s]; }
+    return c;
+}
+[[maybe_unused]] DepthCacheA<float> depth_cache_fwd() {
+    DepthCacheA<float> c{};
+    for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) { c.k[s] = g_fwd.depth_k[s]; c.v[s] = g_fwd.depth_v[s]; }
+    return c;
+}
+[[maybe_unused]] DepthCacheG depth_dcache() {
+    DepthCacheG c{};
+    for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) { c.k[s] = g_tr.ddepth_k[s]; c.v[s] = g_tr.ddepth_v[s]; }
+    return c;
+}
+
 // params uploaded; writes logits into g_fwd.logits over M = batch*T rows. Shared by
 // sub0_cuda_forward and the benchmark so both run the IDENTICAL kernel sequence.
 void forward_device(int batch, int T) {
@@ -3132,6 +3404,13 @@ void forward_device(int batch, int T) {
         launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, sub0::QKV_STRIDE);  // fused qkv = a . [Wq|Wk|Wv]
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, M);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
+        if constexpr (sub0::USE_DEPTH_ATTN) {   // mirrors forward_train's block; no backward here, so no v_own
+            const int S   = sub0::DEPTH_SCHEDULE.live[static_cast<std::size_t>(e)];
+            const int own = sub0::DEPTH_SCHEDULE.own [static_cast<std::size_t>(e)];
+            launch_depth_attn_t<float>(qkv, depth_cache_fwd(), S, M, /*v_own_out=*/nullptr,
+                                       own >= 0 ? g_fwd.depth_k[own] : nullptr,
+                                       own >= 0 ? g_fwd.depth_v[own] : nullptr);
+        }
         launch_attn(qkv, qkv + sub0::QKV_K_OFF, qkv + sub0::QKV_V_OFF, att, batch, T, C, H,
                     sub0::QKV_STRIDE, sub0::GQA_GROUP);   // q/k/v sub-blocks of the fused row
         launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
@@ -3376,6 +3655,17 @@ void forward_train(int batch, int T) {
         // its recompute is where the pre-norm x actually needs to survive for qknorm's own backward).
         if constexpr (USE_QK_NORM) launch_qknorm_t<act_t>(g_tr.qkv, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
+        // Depth attention rewrites qkv's V sub-block in place and, on a participating execution, stores
+        // this execution's K and its ALREADY-MIXED V into its cache slot -- both as outputs of the same
+        // kernel, no copies. The pre-mix V is not needed here (only the backward's recompute asks for
+        // it), hence the null v_own_out.
+        if constexpr (sub0::USE_DEPTH_ATTN) {
+            const int S   = sub0::DEPTH_SCHEDULE.live[static_cast<std::size_t>(e)];
+            const int own = sub0::DEPTH_SCHEDULE.own [static_cast<std::size_t>(e)];
+            launch_depth_attn_t<act_t>(g_tr.qkv, depth_cache_train(), S, M, /*v_own_out=*/nullptr,
+                                       own >= 0 ? g_tr.depth_k[own] : nullptr,
+                                       own >= 0 ? g_tr.depth_v[own] : nullptr);
+        }
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + sub0::QKV_K_OFF, g_tr.qkv + sub0::QKV_V_OFF,
                           g_tr.att, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);  // attention (P-free)
         launch_linear_t<act_t, act_t>(g_tr.att, g_wo16[l], hmid, M, C, C);           // hmid = proj (bf16)
@@ -3474,6 +3764,15 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
 
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(gb, 0, sub0::PARAM_FLOATS * sizeof(float), g_stream));
     SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.loss, 0, sizeof(double), g_stream));
+    // Depth-attention accumulators are written by LATER executions and read by their owner, so they must
+    // start at zero for THIS window -- they are the one set of gradient buffers here that is not
+    // overwritten before first use. (The param grads above and dqkv are; these accumulate.)
+    if constexpr (sub0::USE_DEPTH_ATTN)
+        for (int s = 0; s < sub0::DEPTH_CACHE_MAX; ++s) {
+            const size_t nb = static_cast<size_t>(M) * sub0::D_KV * sizeof(float);
+            SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.ddepth_k[s], 0, nb, g_stream));
+            SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(g_tr.ddepth_v[s], 0, nb, g_stream));
+        }
 
     // chunked cross-entropy + lm_head/tied-head fwd+bwd -- see head_ce_chunked's own comment.
     head_ce_chunked(batch, T, d_lengths, d_active);
@@ -3546,12 +3845,33 @@ void backward_device(int batch, int T, const int* d_lengths, const int* d_active
         // memplan.hpp's train_scratch_bytes.
         if constexpr (USE_QK_NORM) launch_qknorm_save_t<act_t>(g_tr.qkv, g_tr.qk_pre, qgamma, kgamma, M);
         if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope_t<act_t>(g_tr.qkv, batch, T);
+        // Depth attention must be part of the RECOMPUTE too, or the attention recompute below would run
+        // on an unmixed V and disagree with the forward. The cache slots it reads (0..S-1) still hold the
+        // FORWARD's values -- nothing in the backward overwrites them, which is why this pass passes null
+        // k_store/v_store. Unlike the forward it DOES ask for v_own: the in-place mix destroys the
+        // pre-mix V that dL/dp_S needs, and one reusable buffer covers it because this loop handles one
+        // execution at a time (docs/DEPTH_ATTENTION.md 5b finding 2).
+        [[maybe_unused]] const int dS   = sub0::USE_DEPTH_ATTN ? sub0::DEPTH_SCHEDULE.live[static_cast<std::size_t>(e)] : 0;
+        [[maybe_unused]] const int dOwn = sub0::USE_DEPTH_ATTN ? sub0::DEPTH_SCHEDULE.own [static_cast<std::size_t>(e)] : -1;
+        if constexpr (sub0::USE_DEPTH_ATTN)
+            launch_depth_attn_t<act_t>(g_tr.qkv, depth_cache_train(), dS, M, g_tr.v_own,
+                                       /*k_store=*/nullptr, /*v_store=*/nullptr);
         launch_attn_train_t<act_t>(g_tr.qkv, g_tr.qkv + sub0::QKV_K_OFF, g_tr.qkv + sub0::QKV_V_OFF,
                                    g_tr.att, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);
         { const int n2 = M * C, bk = 256; f32_to_act_kernel<<<(n2 + bk - 1) / bk, bk, 0, g_stream>>>(g_tr.dh, g_tr.dh16, n2); }
         launch_linear_bwd_t<act_t, act_t>(g_tr.att, g_wo16[l], g_tr.dh16, g_tr.datt, gb + L[b0 + kWo].off, M, C, C);
         // flash backward writes each dq/dk/dv exactly once (no atomics), so no pre-zero is needed.
         launch_attn_bwd_t<act_t>(g_tr.qkv, g_tr.datt, g_tr.dqkv, batch, T, C, H, sub0::QKV_STRIDE, sub0::GQA_GROUP);
+        // Depth-attention backward, strictly between attention's and RoPE's: it CONSUMES dqkv's
+        // dV (turning grad-w.r.t.-mixed-V into grad-w.r.t.-own-V), ACCUMULATES into dK/dQ alongside
+        // attention's own contributions, and scatters into every earlier slot's accumulator. It also
+        // folds in this execution's own slot first, if it owns one -- by now every later execution has
+        // finished writing there, because the walk is in reverse. Its dK/dQ contributions are w.r.t. the
+        // post-QK-norm, post-RoPE q/k -- the same tensors attention differentiates -- so RoPE's and
+        // QK-norm's backwards below correctly apply to the SUM.
+        if constexpr (sub0::USE_DEPTH_ATTN)
+            launch_depth_attn_bwd_t<act_t>(g_tr.qkv, g_tr.v_own, g_tr.dqkv, depth_cache_train(),
+                                           depth_dcache(), dS, dOwn, M);
         // RoPE: convert dQ/dK (w.r.t. the rotated q/k attention used) back to grad w.r.t. the
         // qknorm output (or the projected q/k directly, without QK-norm) before qknorm's own backward
         // (if enabled) and the qkv-GEMM backward (inverse rotation). dV is untouched.

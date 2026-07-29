@@ -68,6 +68,12 @@ struct Dims {
     // LoopSplit: total layer EXECUTIONS per forward (sub0::LOOP_EXEC_COUNT). Per-execution activation
     // checkpoints scale on this, not on n_layers; 0 means "unset" and falls back to n_layers.
     int exec_layers = 0;
+    // Depth attention: cache SLOTS (sub0::DEPTH_CACHE_MAX), one per participating execution. 0 = off,
+    // which is what every pre-existing aggregate-init call site means. This is the term that decides
+    // which stride fits: unlike the checkpoints above, each slot is RETAINED for the whole step AND
+    // carries a f32 gradient accumulator, so it is ~1.5x the cost a forward-only reading suggests --
+    // see train_scratch_bytes' `depth` term and docs/DEPTH_ATTENTION.md 5b.
+    int depth_slots = 0;
 };
 
 using u64 = unsigned long long;
@@ -226,7 +232,15 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     // by the time it would need the pre-norm values, they no longer survive anywhere else. Zero bytes
     // when qk_norm is off (the common case).
     const u64 qk_pre    = d.qk_norm ? Mm * qk_pre_stride(d) * A : 0;
-    return EL * per_layer + final_blk + grad + qk_pre;   // per-EXECUTION checkpoints (LoopSplit)
+    // Depth attention: per cache SLOT, a retained [M,D_KV] K and mixed V (act_t) plus their two f32
+    // gradient accumulators -- the accumulators are what make this ~1.5x a forward-only estimate, and
+    // they cannot be folded into the per-execution checkpoints because a slot is written by executions
+    // AFTER its owner and so must stay live across the whole backward. Plus ONE shared pre-mix V (not
+    // one per execution: the backward handles one execution at a time). Zero bytes at stride 0.
+    const u64 depth = d.depth_slots > 0
+        ? u64(d.depth_slots) * Mm * d_kv(d) * (2 * A + 2 * FLOAT) + Mm * d_kv(d) * A
+        : 0;
+    return EL * per_layer + final_blk + grad + qk_pre + depth;   // per-EXECUTION checkpoints (LoopSplit)
 }
 
 // Forward scratch a training step keeps resident: only the token-id buffer. Training reads from the
