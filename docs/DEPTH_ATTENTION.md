@@ -180,6 +180,70 @@ Two further Stage-1 requirements this exposes:
   the cross-execution path is never taken and the check would pass while proving nothing — the same
   trap the CUDA parity test has to avoid (§6, Stage 2).
 
+## 5b. Stage 2 (CUDA) design, derived from tracing the real backend
+
+Four findings from reading `forward_train` / `backward_device` (not from the CPU port, which they do not
+resemble). Each one changes the plan.
+
+**1. The cross-execution accumulation needs NO atomics, and the reason is an ordering argument.**
+Cache slot `s` is owned by exactly one execution, `e_own(s) = s * DEPTH_ATTN_STRIDE`. Every execution
+that READS slot `s` has `e > e_own(s)`. `backward_device` walks executions in REVERSE, so every reader
+is processed BEFORE the owner. Therefore, by the time the walk reaches `e_own(s)`, the accumulators
+`ddepth_k[s]` / `ddepth_v[s]` are complete and can simply be added into that execution's `dqkv` K/V
+sub-blocks. Within one kernel launch, one block owns one `(row, kv-head)` exclusively; across launches,
+same-stream ordering serialises them. So plain `+=`, no atomics, and the write-once invariant the
+attention backward protects is untouched.
+
+**2. The in-place mix DESTROYS the own V that the backward needs — and the fix is free.**
+`v_out = Σ_d p_d·v_d` must land in `qkv`'s V sub-block, because `launch_attn_train_t` takes ONE
+`in_stride` for Q/K/V and so cannot read a mixed V from a separate buffer. But §4's `∂L/∂p_S = ⟨ḡ, v_S⟩`
+needs the execution's OWN pre-mix V, which the overwrite has just destroyed. Recovering it by algebra
+(`(v_out − Σ_{d<S} p_d v_d) / p_S`) is unstable for small `p_S`. Saving it per execution costs
+`LOOP_EXEC_COUNT` buffers (~704 MB at the arm shape) — unaffordable.
+The fix: `backward_device` already RECOMPUTES `qkv` per execution and processes ONE execution at a time,
+so a **single reusable `[M, D_KV]` temp** suffices, and the mix kernel gets it for free as a second
+output — it is already reading the own V. ~44 MB at the arm shape, once.
+
+**3. No softmax-probability storage.** The depth `p` can be recomputed in the backward from the
+recomputed `q`/`k` plus the retained cache, exactly as `launch_attn_train_t` is already P-free. This
+removes an `[M, N_KV_HEADS, S+1]` per-execution buffer from the plan entirely.
+
+**4. Buffer inventory, and it is what picks arm D's stride.**
+Per cache slot, at `[M, D_KV]`: K and V retained as `act_t` (2 B, matching how `qkv` is stored) plus
+their two f32 accumulators (4 B) = 12 B per element. At the arm shape (M = 448·512, D_KV = 96):
+```
+  M · D_KV                     = 22.0 M elements
+  per slot (2·2 B + 2·4 B)     = 264 MB
+  stride 1 -> 16 slots         = 4.2 GB   <- does not fit
+  stride 4 ->  4 slots         = 1.06 GB  <- tight but plausible on 8 GB
+```
+This supersedes §5's forward-only estimate: including the gradient accumulators is ~1.5x that figure.
+`memplan.hpp`'s `train_scratch_bytes` must gain the term, or the VRAM-fit batch estimate silently
+over-commits.
+
+**Kernel shape** (both directions): grid `(rows, N_KV_HEADS)`, block 32, each thread striding over
+`a < D_HEAD`; `q̄` and the `S+1` probabilities in shared memory; one `block_reduce_sum` per depth entry
+for the logit and (in the backward) for `∂L/∂p_d`. The cache pointers travel as a by-value struct of
+`DEPTH_CACHE_MAX` pointers, so no device-side pointer table is needed.
+
+**Ordering inside one execution's backward**, which is the part most likely to be silently wrong:
+```
+  attn_bwd                      -> dqkv (dQ, dK, dV_mixed)
+  depth_attn_bwd:
+      if owner: dV_mixed += ddepth_v[s];  dK += ddepth_k[s]   (contributions from LATER executions)
+      consume dV_mixed -> dV_own (OVERWRITE V), dK += , dQ += (1/G scatter)
+      scatter into ddepth_k[d], ddepth_v[d] for every d < S
+  rope_bwd  ->  qknorm_bwd  ->  qkv GEMM bwd
+```
+The `if owner` step must happen before `dV_mixed` is consumed, and both K contributions are additions
+into the same sub-block RoPE's backward later rotates — which is consistent, because the depth logits
+are formed from the SAME post-RoPE, post-QK-norm q/k that attention uses.
+
+**Still open, and deliberately so**: `forward_one_device` (decode). Its rows=1 cache is trivial in size,
+but it lives inside a captured decode graph. Training and eval/report go through `forward_train` /
+`forward_device`, so arm D does not need decode — but it must not silently skip the mix either, so the
+compile-time refusal stays until decode is covered too.
+
 ## 6. Staging
 
 Each stage lands green on its own; the identity gate (`AGENTS.md` §4 — assertion AND test-case counts
