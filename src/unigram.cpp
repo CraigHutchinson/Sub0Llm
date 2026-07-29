@@ -120,11 +120,15 @@ Unigram learn_unigram(const std::vector<std::pair<std::string, long long>>& word
     }
 
     // 2. Seed: all single bytes (MANDATORY -> every word stays encodable) + the most frequent
-    //    multi-byte pieces (count >= min_count) up to ~target*seed_mult candidates.
+    //    multi-byte pieces (count >= min_count) up to ~target*seed_mult candidates. All-digit
+    //    multi-byte candidates are barred: numbers stay single-digit tokens (single bytes remain
+    //    mandatory) so numeric spans generalise and the op-curriculum reads them byte-by-byte.
     std::vector<std::pair<long long, std::string>> singles, multi;
     for (const auto& [s, c] : sub) {
         if (s.size() == 1)              singles.push_back({c, s});
-        else if (c >= opt.min_count)    multi.push_back({c, s});
+        else if (c >= opt.min_count &&
+                 !std::all_of(s.begin(), s.end(), [](char ch) { return ch >= '0' && ch <= '9'; }))
+            multi.push_back({c, s});
     }
     std::sort(multi.begin(), multi.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     const std::size_t seed_n = static_cast<std::size_t>(std::max(opt.target, 1)) * static_cast<std::size_t>(std::max(1, opt.seed_mult));

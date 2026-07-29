@@ -181,20 +181,26 @@ constexpr std::uint32_t kSchemeVersion = 4;
 constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
 constexpr bool          is_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }
+constexpr bool          is_digit(unsigned char c) { return c >= '0' && c <= '9'; }
 constexpr bool          is_space(unsigned char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
 constexpr unsigned char to_lower(unsigned char c) { return is_upper(c) ? static_cast<unsigned char>(c + 32) : c; }
 constexpr unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cast<unsigned char>(c - 32) : c; }
 
-// A "word byte" for pre-tokenization: ASCII letters plus any UTF-8 multibyte byte
-// (>= 0x80). Treating the continuation/lead bytes of accented letters as word
-// material keeps loanwords like "piñata" or "café" as one BPE unit instead of
+// A "word byte" for pre-tokenization: ASCII letters, ASCII digits, plus any UTF-8
+// multibyte byte (>= 0x80). Treating the continuation/lead bytes of accented letters
+// as word material keeps loanwords like "piñata" or "café" as one BPE unit instead of
 // shattering them at the accent. (Typographic punctuation -- curly quotes, dashes
 // -- is folded to ASCII by normalize_text first, so the only multibyte sequences
-// left in the stream are genuine letters and a few rare symbols.) Markers (>= 256)
-// are deliberately excluded so they stay atomic case operators.
+// left in the stream are genuine letters and a few rare symbols.) Digits are word
+// bytes so a number forms a unit and its internal gaps cost no JOIN; but word_unit_end
+// SPLITS a digit<->letter transition, so a number stays a clean numeric span (a fused
+// "Foo123"/"mp3" is the ~10% deviation that pays a JOIN, not the default). Digits also
+// never merge INTO a piece -- the Unigram bars all-digit pieces (unigram.cpp), keeping
+// single-digit tokenization for numeric generalization. Markers (>= 256) are
+// deliberately excluded so they stay atomic case operators.
 constexpr bool is_word_byte(int s) {
     return s >= 0 && s <= 0xFF &&
-           (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
+           (is_alpha(static_cast<unsigned char>(s)) || (s >= '0' && s <= '9') || s >= 0x80);
 }
 
 // v2 (schemeV4): the per-character DEFAULT inter-token spacing, as a unified (lead, trail) glue table.
@@ -319,14 +325,23 @@ constexpr bool is_interior_connector(int c) { return c == '\'' || c == '_' || c 
 
 // End (exclusive) of the word unit beginning at `s[i]`, or `i` itself if `s[i]`
 // does not start one. A unit is a maximal run of word bytes (see is_word_byte)
-// with interior connectors kept (see is_interior_connector). Read-only view -- `s` is
-// never mutated or resized here, so a span accepts a vector, a subrange, or any other
-// contiguous int buffer without a copy.
+// with interior connectors kept (see is_interior_connector), but it SPLITS at a
+// direct digit<->letter transition so a number stays a clean, self-contained numeric
+// span: "Foo123"/"mp3" -> "Foo"|"123", "mp"|"3" (the fusion is a measured ~10%
+// deviation that pays a JOIN), while "123 + 456" spaces by default (0 JOIN). A
+// connector still binds across the class boundary, so hyphenated compounds
+// ("covid-19", "2026-07-29") stay whole. Read-only view -- `s` is never mutated or
+// resized here, so a span accepts a vector, a subrange, or any other contiguous buffer.
 inline std::size_t word_unit_end(std::span<const int> s, std::size_t i) {
     if (i >= s.size() || !is_word_byte(s[i])) return i;
     std::size_t j = i + 1;
     while (j < s.size()) {
-        if (is_word_byte(s[j])) { ++j; continue; }
+        if (is_word_byte(s[j])) {
+            if (is_word_byte(s[j - 1]) &&
+                is_digit(static_cast<unsigned char>(s[j])) != is_digit(static_cast<unsigned char>(s[j - 1])))
+                break;                                  // direct digit<->letter transition ends the unit
+            ++j; continue;
+        }
         if (is_interior_connector(s[j]) && j + 1 < s.size() &&
             is_word_byte(s[j - 1]) && is_word_byte(s[j + 1])) { ++j; continue; }
         break;

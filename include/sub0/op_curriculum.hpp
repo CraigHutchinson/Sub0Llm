@@ -14,9 +14,11 @@
 // collapse callback binds the live result and the node dereferences it (gen_stage).
 //
 // Every arithmetic span is MASKED (the node supplies it -- the FILTER pillar), so the model NEVER learns the
-// fuzzy arithmetic. Digits + operators are byte tokens: the Unigram word-encoder's Viterbi runs only over
-// word-byte runs (casing::is_word_byte = alpha/high-byte, which EXCLUDES digits + punctuation), so it never
-// absorbs them into a piece -- the node reads numbers at byte granularity, consistent train<->infer.
+// fuzzy arithmetic. Digits + operators are byte tokens: the Unigram bars all-digit pieces (unigram.cpp), so a
+// number is never absorbed into a piece -- the node reads it at byte granularity, consistent train<->infer.
+// NOTE (v2 schemeV4): digits are now word bytes (casing::is_word_byte), so a number forms one UNIT with no
+// per-digit JOIN -- the byte-granularity guarantee holds, but the operand parser's dependence on the old
+// digit spacing/JOIN framing still needs a rework (deferred; this curriculum is a spike/POC).
 //
 // Engine-free (tokenizer + nodes + std). One Dataset per run; borrowed by the blend source, so it must
 // outlive the training loop.

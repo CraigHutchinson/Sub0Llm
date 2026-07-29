@@ -655,6 +655,27 @@ TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]"
     REQUIRE(round_trips(t, "--flag -x _leading trailing_"));
 }
 
+// v2 (schemeV4): a digit run is its own typed unit -- glued internally (no per-digit JOIN) but
+// spaced-by-default from non-digits, so a number stays a clean, self-contained numeric span. A
+// DIRECT digit<->letter fusion is the measured ~10% deviation and pays a JOIN; hyphen compounds
+// stay whole via the connector rule.
+TEST_CASE("JOIN scheme (v2): numbers are clean typed units; letter-fusion pays a JOIN", "[tok][join][v2]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    auto joins = [&](const std::string& s) {
+        const std::vector<int> ids = sub0::tok::encode(t, s);
+        return std::count(ids.begin(), ids.end(), sub0::casing::TOK_JOIN);
+    };
+    REQUIRE(joins("2026") == 0);                 // one number span, no per-digit JOIN
+    REQUIRE(joins("123 + 456") == 0);            // digit<->operator spaced by default
+    REQUIRE(joins("page 42") == 0);              // word<->number spaced by default
+    REQUIRE(joins("covid-19") == 0);             // hyphen compound stays whole
+    REQUIRE(joins("Foo123") == 1);               // direct letter->digit fusion is the deviation
+    REQUIRE(joins("3rd") == 1);                  // direct digit->letter fusion is the deviation
+    for (const char* s : {"2026", "123 + 456", "page 42", "covid-19", "Foo123", "3rd",
+                          "2026-07-29", "1,000,000", "The iPhone12 costs $999 ."})
+        REQUIRE(round_trips(t, s));
+}
+
 // WS5b: bracket-glue markers collapse the JOIN tax on a bracket glued directly to what precedes it.
 // Unlike quotes, `(`/`)`/`[`/`]`/`{`/`}` are already unambiguous distinct bytes, so these markers
 // exist purely to save tokens, not to disambiguate direction -- verify the SAVINGS directly (not

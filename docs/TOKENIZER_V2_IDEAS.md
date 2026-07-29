@@ -76,15 +76,26 @@ the FSM.
 - **Refinement that keeps both wins:** make digit runs *units* (kills inter-digit JOINs) but bar the
   Unigram from minting **all-digit pieces** (single digit bytes stay mandatory → digits always
   Viterbi-segment to individual bytes → arithmetic intact). Measured: **same JOIN win (3.92% → 1.45%)**,
-  token −0.66% (forgoes digit-piece compression, correctly). Round-trip lossless. It still fails
-  `op_curriculum` because the `node_frame` number-parser also depends on the *spacing/JOIN framing* of
-  the operands, not just piece-vs-byte — so this is a **multi-consumer change** (tokenizer + node_frame
-  operand parser + op_curriculum dataset), a distinct increment that must update the arithmetic parser
-  in lockstep, not a localized tokenizer tweak.
-- **Verdict:** the JOIN win is real and large, but gated on reworking the arithmetic-frame number parser
-  to the new digit-unit framing. Alpha compounds need nothing. `/` compounds (`and/or`) and thousands
-  separators (`1,000,000`'s commas) are smaller and locale/domain-dependent → defer to Point 3
-  (corpus-derived symbol pieces), not a hard-coded rule.
+  token −0.66% (forgoes digit-piece compression, correctly). Round-trip lossless.
+- **Spacing modality (measured, per the D1/D2 method): a number is its own TYPED unit.** A digit run's
+  boundary with a non-digit is space/punct-bounded in **90.06%** of fineweb occurrences; only **9.94%**
+  are letter-fused (`mp3`, `covid19`, `3rd`, `Foo123`). So the dominant modality is *implicit space*, with
+  letter-fusion the ~10% deviation. `word_unit_end` therefore **splits at a direct digit↔letter
+  transition** so a number stays a clean, self-contained span: `123 + 456` → 0 JOIN (spaced by default),
+  `Foo123`/`3rd` → 1 JOIN (fusion is the deviation), while a connector still binds across the class
+  boundary so `covid-19`/`2026-07-29` stay whole. This complements the digit-piece bar (a number is
+  always a pure, consistent digit span) and is what the model *should* see for numeric generalisation.
+- **IMPLEMENTED (v2 schemeV4):** `is_word_byte` += digits, `word_unit_end` class-transition split,
+  Unigram bars all-digit pieces. Held-out **1,585,273 → 1,575,871 tok (−0.59%)**, **JOIN 3.92% → 1.58%**
+  (the +0.13% vs the merge-everything variant is exactly the letter-fusion cost — trivial, buys clean
+  numbers). Round-trip fuzz + full frontend suite green EXCEPT the 2 `op_curriculum` assertions.
+- **Deferred (spike):** `op_curriculum` + `node_frame` parse operands out of the stream and depend on the
+  old digit spacing/JOIN framing. Per the owner, that curriculum is a spike/POC, so the tokenizer-level
+  improvement lands now and the arithmetic-frame number parser is reworked to the typed-unit framing as a
+  later, separate increment (AGENTS.md §10: consumer enumerated, comment in `op_curriculum.hpp` updated).
+- **Still deferred:** alpha compounds need nothing; `/` compounds (`and/or`) and thousands separators
+  (`1,000,000`'s commas) are smaller and locale/domain-dependent → Point 3 (corpus-derived symbol
+  pieces), not a hard-coded rule.
 
  `.`/`:`/`?` are unimodal closers
 in clean prose but **bimodal in web/code** (decimals, URLs, `a.b`). A single baked default is wrong for
