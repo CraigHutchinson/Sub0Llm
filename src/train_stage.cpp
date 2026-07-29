@@ -3733,6 +3733,50 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
                          cc.nelbo.front() > 0 ? 100.0 * gain / cc.nelbo.front() : 0.0);
                 }
             }
+            // LoopSplit diagnostic: does each repeated pass still DO anything? A looped block applies
+            // the same function repeatedly, so its passes differ only by their input; repeated
+            // application of a contractive map converges to a fixed point, at which point the extra
+            // executions cost throughput and buy no quality. That is the leading explanation for
+            // looping under-delivering, and it is directly measurable rather than inferred: compare
+            // what pass 2 adds to the residual stream against what pass 1 added, for the SAME layers.
+            if constexpr (sub0::LOOP_EXEC_COUNT > N_LAYERS) {
+                std::vector<float> dlt(sub0::LOOP_EXEC_COUNT, 0.0f), hn(sub0::LOOP_EXEC_COUNT, 0.0f);
+                std::vector<int>   win(static_cast<std::size_t>(SEQ_LEN) + 1);
+                const sub0::eval::WindowSet ws = sub0::eval::plan(data, val_start, EVAL_WINDOWS_MAX);
+                // Averaged over several held-out windows: a single window's norms are noisy enough to
+                // read a trend into that is not there.
+                const int nprobe = std::min(8, std::max(1, ws.count));
+                for (int w = 0; w < nprobe; ++w) {
+                    data.copy_to(ws.start_of(w), static_cast<std::size_t>(SEQ_LEN) + 1, win.data());
+                    std::vector<float> d1(sub0::LOOP_EXEC_COUNT), h1(sub0::LOOP_EXEC_COUNT);
+                    sub0::graph_reset();
+                    sub0::loop_pass_stats(win.data(), SEQ_LEN, d1.data(), h1.data());
+                    for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) { dlt[e] += d1[e]; hn[e] += h1[e]; }
+                }
+                sub0::graph_reset();
+                emit("");
+                emit("loop diagnostic (is each repeated pass still doing work?):");
+                emit("    {:>4}  {:>5}  {:>10}  {:>10}", "exec", "layer", "|dh|", "|dh|/|h|");
+                for (int e = 0; e < sub0::LOOP_EXEC_COUNT; ++e) {
+                    const double d = dlt[e] / nprobe, hh = hn[e] / nprobe;
+                    emit("    {:>4}  {:>5}  {:>10.3f}  {:>10.4f}", e, sub0::LAYER_EXEC_ORDER[e], d,
+                         hh > 0.0 ? d / hh : 0.0);
+                }
+                // Head/tail run once, so only the MIDDLE block's repeats are comparable. Ratio of the
+                // last pass's total contribution to the first's: ~1.0 = every pass still contributing,
+                // well under 1.0 = converging toward a fixed point (what depth attention targets).
+                constexpr int kHead = (N_LAYERS - LOOP_MIDDLE_LAYERS) / 2;
+                double first = 0.0, last = 0.0;
+                for (int i = 0; i < LOOP_MIDDLE_LAYERS; ++i) {
+                    first += dlt[kHead + i];
+                    last  += dlt[kHead + (LOOP_REPEATS - 1) * LOOP_MIDDLE_LAYERS + i];
+                }
+                const double ratio = first > 0.0 ? last / first : 0.0;
+                emit("    middle-block contribution, pass {} / pass 1: {:.3f}  -> {}", LOOP_REPEATS, ratio,
+                     ratio > 0.85 ? "every pass still contributes (NOT a fixed point)"
+                     : ratio > 0.5 ? "later passes contribute less -- partial convergence"
+                                   : "STRONG convergence: the repeats are nearly inert");
+            }
             emit("  train/val gap {:.4f}  ({:.1f}%)  -> {}", gap, 100.0 * rel_gap,
                          overfit ? "OVERFITTING (model too large / too little data)"
                                  : rel_gap < 0.03 ? "not overfitting (capacity / optimization bound)"

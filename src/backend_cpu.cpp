@@ -1096,6 +1096,19 @@ struct Model {
         if constexpr (!USE_TIED_EMBEDDINGS) randn(lm_head, 0.02f);
     }
 
+    // Per-execution residual-stream diagnostic (nullptr = off, the production path). When armed by
+    // sub0::loop_pass_stats, forward() records for each EXECUTION e: the norm of the residual stream
+    // entering the block, and the norm of what the block ADDED to it. Under LoopSplit the same layer
+    // runs several times, so comparing pass 1's contribution against pass 2's for the SAME layers is a
+    // direct test of the fixed-point prediction -- if repeated passes perturb the stream less and less,
+    // the extra compute is buying nothing and no amount of tuning will change that.
+    //
+    // Deliberately a hook on the REAL forward rather than a reimplementation: a separate diagnostic
+    // copy of the layer loop would drift from the one that actually trains, and then measure the wrong
+    // thing convincingly.
+    float* pass_delta = nullptr;   // [LOOP_EXEC_COUNT] ||h_out - h_in||
+    float* pass_hnorm = nullptr;   // [LOOP_EXEC_COUNT] ||h_in||
+
     Node* forward(const int* ids, int T) {
         // Persistent per-thread: op_embed stores this pointer and backward reads it
         // after forward returns, so it must outlive the call (a local would dangle).
@@ -1112,8 +1125,10 @@ struct Model {
         // re-running the SAME Layer (same parameter Nodes) several times. The backward needs no change
         // for that -- every CPU parameter-gradient write is `+=` (see backward_node's Op::Linear dW
         // block), which the codebase already relies on for tied embeddings. Off, this is 0..N_LAYERS-1.
+        int exec_i = 0;
         for (const int li : LAYER_EXEC_ORDER) {
             Layer& L = layers[static_cast<std::size_t>(li)];
+            const Node* const h_in = h;   // diagnostic only; arena nodes outlive the iteration
             Node* a = op_rmsnorm(h, L.ln1);
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
@@ -1141,6 +1156,18 @@ struct Model {
                 f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
             }
             h = op_add(h, f);
+            if (pass_delta || pass_hnorm) {
+                const std::size_t n = static_cast<std::size_t>(h->rows) * h->cols;
+                double d2 = 0.0, i2 = 0.0;
+                for (std::size_t j = 0; j < n; ++j) {
+                    const double before = h_in->data[j], after = h->data[j];
+                    d2 += (after - before) * (after - before);
+                    i2 += before * before;
+                }
+                if (pass_delta) pass_delta[exec_i] = static_cast<float>(std::sqrt(d2));
+                if (pass_hnorm) pass_hnorm[exec_i] = static_cast<float>(std::sqrt(i2));
+            }
+            ++exec_i;
         }
         h = op_rmsnorm(h, ln_f);
         if constexpr (USE_TIED_EMBEDDINGS) return op_tied_head(h, tok_emb);
@@ -1380,6 +1407,17 @@ void sync_params_to_device() {}
 void graph_reset() { ensure_thread_built(); W->pool_used = 0; W->act_used = 0; }
 
 Node* forward(const int* ids, int T) { ensure_thread_built(); return g_model.forward(ids, T); }
+// Per-execution residual-stream diagnostic -- see Model::pass_delta. Both outputs are
+// [LOOP_EXEC_COUNT] and either may be null. Runs ONE forward over the given window; the caller owns
+// graph_reset() around it, exactly like a plain forward().
+void loop_pass_stats(const int* ids, int T, float* out_delta, float* out_hnorm) {
+    ensure_thread_built();
+    g_model.pass_delta = out_delta;
+    g_model.pass_hnorm = out_hnorm;
+    (void)g_model.forward(ids, T);
+    g_model.pass_delta = nullptr;   // disarm: every other forward() must stay on the untouched path
+    g_model.pass_hnorm = nullptr;
+}
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
 
 // Incremental single-token inference (KV-cache). kv_reset() clears/sizes the cache at the start of a

@@ -106,6 +106,11 @@ SUB0_API std::vector<TokenEntry> vocab_entries();  // requires load_tokenizer() 
 // --- Forward / loss / backward ---------------------------------------------
 SUB0_API void  graph_reset();                                   // reset arena + node pool
 SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB]
+// Per-execution residual-stream diagnostic: for each of LOOP_EXEC_COUNT executions, ||h_in|| and
+// ||h_out - h_in||. Under LoopSplit the same layer runs several times, so pass 1's contribution vs
+// pass 2's for the SAME layers directly tests whether repeated passes are converging to a fixed point
+// (the predicted reason looping under-delivers). Either output may be null; both are [LOOP_EXEC_COUNT].
+SUB0_API void  loop_pass_stats(const int* ids, int T, float* out_delta, float* out_hnorm);
 // Incremental single-token inference (KV-cache): kv_reset() before a generation, then forward_one()
 // per token -> logits [VOCAB]. O(T) per token instead of forward()'s O(T^2). Dense (non-ternary),
 // positions < SEQ_LEN. See src/backend_cpu.cpp.
