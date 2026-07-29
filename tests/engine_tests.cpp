@@ -180,6 +180,65 @@ TEST_CASE("forward_one (KV-cache) matches the full forward per position", "[engi
     }
 }
 
+// GUARD-THE-GUARD for depth attention. The finite-difference gradient check CANNOT catch a dead depth
+// mix: a no-op has a perfectly correct backward, so `return v;` passes it (verified by mutation, not
+// assumed). The two live guards divide the work, and it takes both:
+//
+//   * forward_one-vs-forward parity above catches a no-op in EITHER implementation while the other is
+//     live, because the two then disagree (the mutant measured a 1.5 relative divergence).
+//   * THIS test catches both being dead at once, which parity cannot see. It pins the one thing only a
+//     live depth mix produces: **V becomes a function of Q.**
+//
+// Without depth attention, execution e's value row depends solely on that execution's input `a`
+// (a = rmsnorm(h) of everything before e) through Wv. It cannot depend on Wq of the layer running AT e,
+// because that Wq is applied after `a` is formed and feeds only the query. With the depth mix live, the
+// mixture weights come from <q-bar, k_d> -- so perturbing exactly that Wq must move the cached V.
+//
+// Observed through the DECODE path (the sequence KV cache holds the MIXED value -- see forward_one), so
+// kv_vrow_ptr is the observation point and no test-only API is needed. That makes this directly a guard
+// on depth_mix_row and, via parity, on op_depth_attn. Runs only in a depth-attention build.
+TEST_CASE("depth attention is live: the mixed V depends on the query", "[engine][depth]") {
+    if constexpr (sub0::USE_DEPTH_ATTN) {
+        // Execution 1 is the first that mixes over a cached entry (execution 0 always appends, and its
+        // own mix is over one element, i.e. the identity). It must also be the FIRST appearance of its
+        // layer index, or perturbing that layer's Wq would change `a` at execution 1 too and the test
+        // would no longer isolate the query path.
+        constexpr int e = 1;
+        static_assert(sub0::LOOP_EXEC_COUNT > e, "need at least two executions to observe a depth mix");
+        constexpr int li = sub0::LAYER_EXEC_ORDER[e];
+        REQUIRE(li != sub0::LAYER_EXEC_ORDER[0]);
+
+        // Offset of layer li's Wq in the flat blob: the (li+1)-th Wq in the canonical layout order.
+        std::size_t wq_off = 0;
+        int seen = 0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT)
+            if (p.kind == sub0::PKind::Wq && seen++ == li) { wq_off = p.off; break; }
+        REQUIRE(seen > li);
+
+        sub0::build_model();
+        const int id = 3 % VOCAB;
+        sub0::kv_reset();
+        (void)sub0::forward_one(id, 0);
+        const std::vector<float> v_before(sub0::kv_vrow_ptr(e, 0), sub0::kv_vrow_ptr(e, 0) + sub0::D_KV);
+
+        // A perturbation big enough to move a softmax off its current point, applied to one column.
+        const float orig = sub0::params_ptr()[wq_off];
+        sub0::params_ptr()[wq_off] = orig + 0.5f;
+        sub0::kv_reset();
+        (void)sub0::forward_one(id, 0);
+        const std::vector<float> v_after(sub0::kv_vrow_ptr(e, 0), sub0::kv_vrow_ptr(e, 0) + sub0::D_KV);
+        sub0::params_ptr()[wq_off] = orig;
+
+        double moved = 0.0, mag = 1e-30;
+        for (int j = 0; j < sub0::D_KV; ++j) {
+            moved = std::max(moved, std::fabs(static_cast<double>(v_after[j]) - v_before[j]));
+            mag   = std::max(mag,   std::fabs(static_cast<double>(v_before[j])));
+        }
+        INFO("relative movement in the mixed V = " << (moved / mag));
+        REQUIRE(moved / mag > 1e-6);   // a no-op depth mix would give exactly 0
+    }
+}
+
 TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
     sub0::build_model();
     std::vector<int> ids, tgt;

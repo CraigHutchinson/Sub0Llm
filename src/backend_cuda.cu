@@ -52,6 +52,17 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
+// Depth attention (DEPTH_ATTN_STRIDE > 0) is CPU-only as of Stage 1 -- see docs/DEPTH_ATTENTION.md 6.
+// This is a HARD STOP rather than a silent no-op on purpose: the op adds no parameters and rewrites only
+// V, so a GPU build that skipped it would train and score a DIFFERENT architecture while every shape
+// check, every checkpoint field and PARAM_FLOATS all still agreed. That is precisely the class of
+// silent-divergence bug ARCH_FINGERPRINT was extended to catch at load time; refusing to compile catches
+// it one step earlier. Lift this when Stage 2 lands the cross-execution dK/dV accumulation.
+// TODO(depth-attn-gpu): implement op_depth_attn's forward + backward on device, then remove this guard.
+static_assert(!USE_DEPTH_ATTN,
+    "depth attention is CPU-only until docs/DEPTH_ATTENTION.md Stage 2 lands the CUDA cross-execution "
+    "dK/dV accumulation; configure with -DSUB0_COMPUTE=CPU or --depth-attn-stride 0.");
+
 // SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights): GPU support landed.
 // swiglu_kernel/swiglu_act_kernel/swiglu_backward_act_kernel below implement op_swiglu's forward/
 // backward exactly (see backend_cpu.cpp), `if constexpr (USE_GATED_FFN)`-gated at each forward/

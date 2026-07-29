@@ -97,7 +97,10 @@ Given `ḡ = ∂L/∂v_out` (a `D_HEAD` vector), for each `d = 0..S`:
 
 **The structural cost is in the two lines marked CROSS-EXECUTION.** The reverse pass is no longer a
 clean per-execution walk: execution `e`'s depth-attention backward must ACCUMULATE into the dK/dV of
-every earlier participating execution. On CPU the tape handles this for free once the op exists. On
+every earlier participating execution. On CPU this needed no scheduling work, but not because "the tape
+handles it" — it is specifically because `backward()` walks the node pool in REVERSE and every gradient
+write on that backend is `+=`. A depth node sits after every node it read, so an earlier execution's K/V
+node has received every contribution by the time the walk reaches it and propagates onward. On
 CUDA the reverse pass is hand-written and strictly per-execution today, so it needs per-execution dK/dV
 accumulation buffers that stay live across the whole backward — this is the single largest piece of
 work in the port, and the one most likely to be silently wrong (compare the accumulate-vs-overwrite
@@ -119,7 +122,20 @@ measured VRAM alongside quality per the standing three-pillar policy. Note the C
 currently treats `qkv` as a CHECKPOINT (recomputed in backward), so the depth cache cannot simply
 borrow those buffers — it needs its own retained storage or its own recompute.
 
-## 5a. BLOCKER found before coding Stage 1: `Node` cannot express the depth cache
+## 3a. One deliberate divergence: the stride gates on the EXECUTION, not the layer
+
+The reference gates the cache append on `layer_idx % stride == 0`. This engine gates on the EXECUTION
+index instead (`op_depth_attn`'s call site in `Model::forward`). Two reasons, and one check:
+
+- The live entry count becomes exactly `ceil(LOOP_EXEC_COUNT / stride)` (`DEPTH_CACHE_MAX`), which is
+  what the arena and node-pool sizing need as a compile-time constant. Gating on layer index makes the
+  count depend on how the loop schedule happens to interleave, for no benefit.
+- The entries spread evenly across passes rather than clustering wherever the participating layer
+  indices land in the schedule.
+- **At stride 1 the two are identical** — every execution participates either way — and stride 1 is what
+  the arm-D measurement runs. So this cannot affect the result being measured.
+
+## 5a. RESOLVED in Stage 1 — `Node` could not express the depth cache
 
 `sub0::Node` (core.hpp) has a FIXED fanout — `a`, `b`, `w`, `bias`. Depth attention consumes `S+1`
 (K, V) pairs, where `S` grows with the execution index. **There is no way to hang a variable-length
@@ -134,8 +150,12 @@ Options considered:
    field only one op uses.
 2. **Decompose into pairwise ops** — rejected as WRONG, not just costly: the depth softmax is jointly
    normalised over all `S+1` entries, so it does not factor into a chain of pairwise mixes.
-3. **RECOMMENDED — a per-execution side table on the (thread_local) Model.** The exec count is a
-   compile-time constant, so add to `Model`:
+3. **CHOSEN, and implemented — a per-execution side table.** It landed as a file-scope
+   `thread_local DepthCache` in `backend_cpu.cpp` rather than a `Model` member (the free `op_*` functions
+   are defined above `Model` and cannot see it), sized `LOOP_EXEC_COUNT` so the array is never
+   zero-length. `Node` gained one `int depth_s` — the recorded cache depth, which cannot be recovered at
+   backward time because the cache keeps growing after the node runs. The exec count is a compile-time
+   constant, so the sketch was:
    ```cpp
    Node* depth_k[sub0::LOOP_EXEC_COUNT] = {};   // K contributed by execution e (nullptr = not cached)
    Node* depth_v[sub0::LOOP_EXEC_COUNT] = {};
@@ -170,8 +190,22 @@ unchanged on an unmodified default build) runs after every one.
   `RunConfig`'s X-macro and to `ARCH_FINGERPRINT` — it changes COMPUTATION without changing
   `PARAM_FLOATS`, which is exactly the case the fingerprint exists to catch (`nfloat` is blind to it,
   so without this a depth-attention checkpoint would silently load into a plain build).
-- **Stage 1 — CPU forward + backward** as a new tape op, gated by the finite-difference gradient check
-  at BOTH a toy and a production-shaped config (`engine-tests-gradient-check-dims-dependent`).
+- **Stage 1 — CPU forward + backward — DONE.** `Op::DepthAttn` + `op_depth_attn` (batched) and
+  `depth_mix_row` (decode), option 3's side table, arena/pool sizing, and a CUDA `static_assert` that
+  refuses to build a depth-attention GPU binary until Stage 2 exists (a silent no-op there would train a
+  different architecture while every shape check still agreed). Verified at two shapes, both green:
+  | shape | executions | stride | GQA_GROUP | directional FD vs ‖g‖ |
+  |---|---|---|---|---|
+  | d196 L11 H7, middle 3 ×2 | 14 | 1 | 1 | (green, full suite) |
+  | d128 L6 H4 kv2, middle 2 ×3 | 10 | 2 | 2 | 1.45116 vs 1.45148 |
+  The second shape is the one that matters for coverage: it is the only one exercising `GQA_GROUP > 1`
+  (the q̄ mean-reduce and the `1/G` scatter of §4's last line) and `stride > 1`.
+  **Mutation-tested, because the gradient check alone proves nothing here**: a no-op `return v;` has a
+  perfectly correct backward and passes the finite-difference check. Stubbing each implementation in turn
+  showed the guards are `forward_one`-vs-`forward` parity (catches one side dead: 1.5 relative divergence)
+  plus the new "mixed V depends on Q" test (catches BOTH dead: movement exactly 0). Neither alone suffices.
+  Identity gate: at the default stride 0 the suite is assertion-identical (44,153,269) with +1 test case,
+  the new presence test, which runs zero assertions when depth attention is off.
 - **Stage 2 — CUDA forward + backward**, with the cross-execution dK/dV accumulation of §4, gated by
   the existing CPU/CUDA gradient-parity harness plus a LOOPED parity case (a non-looped test cannot
   exercise the cross-execution path at all).

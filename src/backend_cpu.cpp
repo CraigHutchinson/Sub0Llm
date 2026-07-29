@@ -89,7 +89,12 @@ consteval size_t calc_act_cap() {
     size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
                 + (USE_TERNARY ? (size_t)4 * C * C + (USE_GATED_FFN ? 3 : 2) * C * F : 0)
                 + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0)   // op_rope(q), op_rope(k)
-                + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0);  // op_qknorm(q), op_qknorm(k) + rinv scratch
+                + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0)   // op_qknorm(q), op_qknorm(k) + rinv scratch
+                // op_depth_attn: one [T, D_KV] mixed-V node, plus its depth-softmax scratch. The
+                // scratch is [N_KV_HEADS, T, S+1] where S is the cache depth THIS execution saw, so
+                // DEPTH_CACHE_MAX + 1 is the worst case (the last execution, which sees every entry).
+                + (USE_DEPTH_ATTN ? (size_t)T * D_KV
+                                  + (size_t)N_KV_HEADS * T * (DEPTH_CACHE_MAX + 1) : 0);
     size_t fin  = T * C + 2 * T * V + 64;
     // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
     // activation nodes R times (the weights are shared; the activations are not).
@@ -99,8 +104,12 @@ constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
 // The gated FFN adds one extra per-layer node (gate-linear + up-linear + swiglu vs. W1-linear +
 // gelu) -- a generous flat per-layer headroom either way, not a tight count. QK-norm adds 2 more
 // per-layer nodes (op_qknorm(q), op_qknorm(k)).
+// Depth attention adds exactly one node per EXECUTION (the mixed-V node) -- every execution runs the
+// op, whether or not it also appends to the cache. Under-sizing this array is a silent overwrite of a
+// live node, not an allocation failure, so it has to be counted rather than absorbed by the headroom.
 constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_COUNT
-                                + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0);
+                                + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0)
+                                + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0);
 
 // ============================================================================
 //  Static storage
@@ -547,6 +556,92 @@ static Node* op_rope(Node* x, int H) {
     return y;
 }
 
+// --- Depth attention (see layout.hpp's USE_DEPTH_ATTN, docs/DEPTH_ATTENTION.md) ---------------------
+//
+// Op::DepthAttn consumes S+1 (K, V) pairs, where S grows with the execution index. A `Node` has a FIXED
+// fanout (a/b/w/bias) and cannot express that, and the backward needs those exact nodes to accumulate
+// its cross-execution dK/dV into -- so the variable-length part lives in a side table keyed by cache
+// slot, and each node records how many slots existed when it ran (Node::depth_s).
+//
+// thread_local for the same reason the arena is: every worker thread owns its own graph. Storing NODES
+// (not copies of their data) is what makes the backward possible at all. The lifetime this relies on is
+// exactly the one op_embed's `ids` pointer already relies on -- backward runs on the same thread before
+// the next graph_reset(), so these arena nodes are still live when it reads them. Model::forward()
+// clears `n` at its top, so a second forward never mixes the first one's cache into itself.
+//
+// Sized LOOP_EXEC_COUNT rather than DEPTH_CACHE_MAX (which is <= it, and is 0 when depth attention is
+// off) so the array is never zero-length and the indices below need no separate bound.
+struct DepthCache {
+    std::array<Node*, LOOP_EXEC_COUNT> k{}, v{};
+    int n = 0;
+    void push(Node* kn, Node* vn) { k[(size_t)n] = kn; v[(size_t)n] = vn; ++n; }
+};
+thread_local DepthCache g_depth;
+
+// Per (position t, KV head hd): build a softmax over the DEPTH axis from the query's affinity to each
+// depth entry's key, and return that convex mixture of the entries' VALUES. K is untouched -- sequence
+// attention then runs normally on (unchanged K, mixed V).
+//
+// Entries are the S cached ones plus this execution's own (k, v) as entry S, so S == 0 makes the
+// softmax a single 1.0 and the op the exact identity on v (the first participating execution is a
+// numeric no-op, by construction). The cached V is itself already MIXED -- the reference reassigns
+// value_states before appending -- so the mixture is recursive across participating executions.
+//
+// Under GQA the query is reduced to KV groups by the MEAN over the GQA_GROUP query heads of the group
+// (the reference's own reduction); at GQA_GROUP == 1 that is the identity. The scale is D_HEAD^(-1/2),
+// as in sequence attention.
+//
+// NOTE on RoPE: the depth logit <q_t, k_d,t> compares vectors at the SAME position t, and RoPE applies
+// the same rotation R_t to both, so <R_t q, R_t k> == <q, k>. The logits are therefore invariant to
+// whether this runs before or after op_rope, and passing the post-RoPE tensors (as forward() does)
+// costs nothing and keeps the op adjacent to op_attn. QK-norm is NOT position-common, so its effect
+// does carry through -- deliberately, since it is a per-head rescaling of exactly these vectors.
+static Node* op_depth_attn(Node* q, Node* k, Node* v, int H) {
+    const int T = v->rows, Ckv = v->cols, d = Ckv / H;   // H == N_KV_HEADS, d == D_HEAD
+    const int C = q->cols;                               // query rows are H * GQA_GROUP * d wide
+    const int S = g_depth.n;
+    const float scale = 1.f / std::sqrt((float)d);
+    Node* out = mk_node(Op::DepthAttn, T, Ckv);
+    out->a = q; out->b = k; out->bias = v; out->heads = H; out->depth_s = S;
+    auto [P, Pg] = arena_alloc((size_t)H * T * (S + 1));
+    out->scratch = P;
+    auto Pidx = [T, S](int hd, int t, int dd) { return ((size_t)hd * T + t) * (S + 1) + dd; };
+    for (int hd = 0; hd < H; ++hd) {
+        const int off = hd * d;
+        for (int t = 0; t < T; ++t) {
+            std::array<float, D_HEAD> qb{};              // q-bar: the GQA mean-reduced query
+            const float* __restrict qr = q->data.data() + (size_t)t * C;
+            for (int g = 0; g < GQA_GROUP; ++g) {
+                const float* __restrict qh = qr + (size_t)(hd * GQA_GROUP + g) * d;
+                for (int a = 0; a < d; ++a) qb[a] += qh[a];
+            }
+            for (int a = 0; a < d; ++a) qb[a] *= 1.f / GQA_GROUP;
+            std::array<float, LOOP_EXEC_COUNT + 1> lg{};
+            float mx = -1e30f;
+            for (int dd = 0; dd <= S; ++dd) {
+                const Node* src = (dd < S) ? g_depth.k[(size_t)dd] : k;
+                const float* __restrict kd = src->data.data() + (size_t)t * Ckv + off;
+                float s = 0.f;
+                #pragma omp simd reduction(+ : s)
+                for (int a = 0; a < d; ++a) s += qb[a] * kd[a];
+                s *= scale; lg[(size_t)dd] = s; mx = std::max(mx, s);
+            }
+            float Z = 0.f;
+            if constexpr (FAST_MATH) for (int dd = 0; dd <= S; ++dd) { lg[(size_t)dd] = fast_exp(lg[(size_t)dd] - mx); Z += lg[(size_t)dd]; }
+            else                     for (int dd = 0; dd <= S; ++dd) { lg[(size_t)dd] = std::exp(lg[(size_t)dd] - mx);  Z += lg[(size_t)dd]; }
+            float* __restrict o = out->data.data() + (size_t)t * Ckv + off;
+            for (int dd = 0; dd <= S; ++dd) {
+                const float p = lg[(size_t)dd] / Z;
+                P[Pidx(hd, t, dd)] = p;
+                const Node* src = (dd < S) ? g_depth.v[(size_t)dd] : v;
+                const float* __restrict vd = src->data.data() + (size_t)t * Ckv + off;
+                for (int a = 0; a < d; ++a) o[a] += p * vd[a];
+            }
+        }
+    }
+    return out;
+}
+
 // Under GQA the K/V rows are D_KV wide (N_KV_HEADS heads) while Q/out stay D_MODEL wide (N_HEADS
 // heads): query head h reads KV head h / GQA_GROUP. With N_KV_HEADS == N_HEADS this is GQA_GROUP == 1,
 // off_kv == off and Ckv == C -- byte-identical to the pre-GQA path.
@@ -894,6 +989,73 @@ static void backward_node(Node& n) {
         }
         break;
     }
+    case Op::DepthAttn: {
+        // Adjoint of op_depth_attn. Derived in docs/DEPTH_ATTENTION.md 4; with g = dL/dv_out,
+        //   dL/dv_d = p_d . g                                   <- CROSS-EXECUTION for d < S
+        //   dL/dp_d = <g, v_d>
+        //   dL/dl_d = p_d . (dL/dp_d - sum_e p_e . dL/dp_e)     softmax Jacobian, same shape as Op::Attn
+        //   dL/dk_d = scale . dL/dl_d . q-bar                   <- CROSS-EXECUTION for d < S
+        //   dL/dq-bar = scale . sum_d dL/dl_d . k_d, scattered back over the group as 1/G each
+        //
+        // The two CROSS-EXECUTION terms write into nodes from EARLIER executions. That is safe here
+        // purely because backward() walks the pool in REVERSE: this node sits after every node it
+        // reads, so an earlier execution's K/V node has already received every contribution by the
+        // time the walk reaches it and propagates onward. Every write is `+=`, as everywhere on this
+        // backend -- an earlier V node is read by several later depth mixes and must accumulate.
+        if constexpr (USE_DEPTH_ATTN) {
+            Node* q = n.a; Node* k = n.b; Node* v = n.bias;
+            const int T = n.rows, Ckv = n.cols, H = n.heads, d = Ckv / H, S = n.depth_s;
+            const int C = q->cols;
+            const float scale = 1.f / std::sqrt((float)d);
+            const float inv_g = 1.f / GQA_GROUP;
+            std::span<float> P = n.scratch;
+            auto Pidx = [T, S](int hd, int t, int dd) { return ((size_t)hd * T + t) * (S + 1) + dd; };
+            for (int hd = 0; hd < H; ++hd) {
+                const int off = hd * d;
+                for (int t = 0; t < T; ++t) {
+                    // q-bar is recomputed rather than kept in scratch: it is GQA_GROUP * D_HEAD adds
+                    // against a [T, D_KV] node's worth of arena, and the forward's own expression is
+                    // right here to compare against.
+                    std::array<float, D_HEAD> qb{};
+                    const float* __restrict qr = q->data.data() + (size_t)t * C;
+                    for (int g = 0; g < GQA_GROUP; ++g) {
+                        const float* __restrict qh = qr + (size_t)(hd * GQA_GROUP + g) * d;
+                        for (int a = 0; a < d; ++a) qb[a] += qh[a];
+                    }
+                    for (int a = 0; a < d; ++a) qb[a] *= inv_g;
+
+                    const float* __restrict go = n.grad.data() + (size_t)t * Ckv + off;
+                    std::array<float, LOOP_EXEC_COUNT + 1> dP{};
+                    for (int dd = 0; dd <= S; ++dd) {
+                        Node* src = (dd < S) ? g_depth.v[(size_t)dd] : v;
+                        const float p = P[Pidx(hd, t, dd)];
+                        float* __restrict vg       = src->grad.data() + (size_t)t * Ckv + off;
+                        const float* __restrict vd = src->data.data() + (size_t)t * Ckv + off;
+                        float dp = 0.f;
+                        #pragma omp simd reduction(+ : dp)
+                        for (int a = 0; a < d; ++a) { vg[a] += p * go[a]; dp += go[a] * vd[a]; }
+                        dP[(size_t)dd] = dp;
+                    }
+                    float dot = 0.f;
+                    for (int dd = 0; dd <= S; ++dd) dot += P[Pidx(hd, t, dd)] * dP[(size_t)dd];
+                    std::array<float, D_HEAD> dqb{};
+                    for (int dd = 0; dd <= S; ++dd) {
+                        const float dl = P[Pidx(hd, t, dd)] * (dP[(size_t)dd] - dot) * scale;
+                        Node* src = (dd < S) ? g_depth.k[(size_t)dd] : k;
+                        float* __restrict kg       = src->grad.data() + (size_t)t * Ckv + off;
+                        const float* __restrict kd = src->data.data() + (size_t)t * Ckv + off;
+                        for (int a = 0; a < d; ++a) { kg[a] += dl * qb[a]; dqb[a] += dl * kd[a]; }
+                    }
+                    float* __restrict qg = q->grad.data() + (size_t)t * C;
+                    for (int g = 0; g < GQA_GROUP; ++g) {
+                        float* __restrict qh = qg + (size_t)(hd * GQA_GROUP + g) * d;
+                        for (int a = 0; a < d; ++a) qh[a] += inv_g * dqb[a];
+                    }
+                }
+            }
+        }
+        break;
+    }
     case Op::CrossEnt: {
         Node* logits = n.a;
         const int T = logits->rows, V = logits->cols;
@@ -999,6 +1161,43 @@ static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // r
             x[off + 2 * m + 1] = x0 * sn + x1 * cs;
         }
     }
+}
+// Depth attention for ONE position: forward_one's counterpart to op_depth_attn, which it must agree
+// with numerically (the forward_one-vs-forward parity test is the gate). `dk`/`dv` are this token's
+// depth cache, `n` its live entry count, and `v` is REWRITTEN IN PLACE with the mixture -- via a temp,
+// since v is also entry `n` of the mix. Cheap because the softmax is over depth alone: a single
+// position needs no sequence history, so decode needs no extra cache beyond the current token's rows.
+static inline void depth_mix_row(const float* __restrict q, const float* __restrict k,
+                                 float* __restrict v, const float* dk, const float* dv, int n) {
+    constexpr int d = D_HEAD;
+    const float scale = 1.f / std::sqrt((float)d);
+    float mixed[D_KV];
+    for (int hd = 0; hd < N_KV_HEADS; ++hd) {
+        const int off = hd * d;
+        float qb[D_HEAD] = {};
+        for (int g = 0; g < GQA_GROUP; ++g) {
+            const float* __restrict qh = q + (size_t)(hd * GQA_GROUP + g) * d;
+            for (int a = 0; a < d; ++a) qb[a] += qh[a];
+        }
+        for (int a = 0; a < d; ++a) qb[a] *= 1.f / GQA_GROUP;
+        float lg[DEPTH_CACHE_MAX + 1];
+        float mx = -1e30f;
+        for (int dd = 0; dd <= n; ++dd) {
+            const float* __restrict kd = (dd < n) ? dk + (size_t)dd * D_KV + off : k + off;
+            float s = 0.f;
+            for (int a = 0; a < d; ++a) s += qb[a] * kd[a];
+            s *= scale; lg[dd] = s; mx = std::max(mx, s);
+        }
+        float Z = 0.f;
+        for (int dd = 0; dd <= n; ++dd) { lg[dd] = FAST_MATH ? fast_exp(lg[dd] - mx) : std::exp(lg[dd] - mx); Z += lg[dd]; }
+        for (int a = 0; a < d; ++a) mixed[off + a] = 0.f;
+        for (int dd = 0; dd <= n; ++dd) {
+            const float p = lg[dd] / Z;
+            const float* __restrict vd = (dd < n) ? dv + (size_t)dd * D_KV + off : v + off;
+            for (int a = 0; a < d; ++a) mixed[off + a] += p * vd[a];
+        }
+    }
+    for (int j = 0; j < D_KV; ++j) v[j] = mixed[j];
 }
 static inline float gelu_row(float v) {
     if constexpr (FAST_MATH) return gelu_fast(v);
@@ -1126,6 +1325,7 @@ struct Model {
         // for that -- every CPU parameter-gradient write is `+=` (see backward_node's Op::Linear dW
         // block), which the codebase already relies on for tied embeddings. Off, this is 0..N_LAYERS-1.
         int exec_i = 0;
+        g_depth.n = 0;   // see DepthCache: a second forward must not mix the first one's entries in
         for (const int li : LAYER_EXEC_ORDER) {
             Layer& L = layers[static_cast<std::size_t>(li)];
             const Node* const h_in = h;   // diagnostic only; arena nodes outlive the iteration
@@ -1144,6 +1344,15 @@ struct Model {
             if constexpr (POS_ENCODING == PosEncoding::Rope) {
                 qn = op_rope(qn, N_HEADS);
                 kn = op_rope(kn, N_KV_HEADS);
+            }
+            // Depth attention rewrites V only, then (on a participating execution) appends this
+            // execution's key and its ALREADY-MIXED value to the depth cache -- the append order is
+            // load-bearing, see op_depth_attn. The gate is on the EXECUTION index, so a looped middle
+            // layer appends once per PASS and later passes attend over earlier ones: that is exactly
+            // the cross-pass channel arm D exists to measure (docs/DEPTH_ATTENTION.md 2).
+            if constexpr (USE_DEPTH_ATTN) {
+                vn = op_depth_attn(qn, kn, vn, N_KV_HEADS);
+                if (exec_i % DEPTH_ATTN_STRIDE == 0) g_depth.push(kn, vn);
             }
             Node* att = op_attn(qn, kn, vn, N_HEADS);
             h = op_add(h, op_linear(att, L.Wo, nullptr, q));
@@ -1193,6 +1402,11 @@ struct Model {
         float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
         [[maybe_unused]] float packed_copy[C];             // periodic-reinject spike, see below
+        // This token's depth cache: rows only, since the depth softmax never crosses positions (see
+        // depth_mix_row). Scoped to one forward_one call -- unlike g_kv, nothing here spans tokens.
+        [[maybe_unused]] float dep_k[(DEPTH_CACHE_MAX ? DEPTH_CACHE_MAX : 1) * D_KV];
+        [[maybe_unused]] float dep_v[(DEPTH_CACHE_MAX ? DEPTH_CACHE_MAX : 1) * D_KV];
+        [[maybe_unused]] int   dep_n = 0;
         bool do_reinject = false;
 
         if (g_sentinel_binds && prev == g_sentinel_binds->sigil && g_sentinel_binds->bound(id)) {
@@ -1234,6 +1448,18 @@ struct Model {
             linear_row(a, L.Wv, nullptr, vn, C, D_KV);
             if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
             if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
+            // Depth attention, before the KV-cache append: the sequence cache must hold the MIXED V,
+            // because that is what op_attn receives in the batched forward. Mirrors forward()'s block.
+            if constexpr (USE_DEPTH_ATTN) {
+                depth_mix_row(qn, kn, vn, dep_k, dep_v, dep_n);
+                if (e % DEPTH_ATTN_STRIDE == 0) {
+                    for (int j = 0; j < D_KV; ++j) {
+                        dep_k[(size_t)dep_n * D_KV + j] = kn[j];
+                        dep_v[(size_t)dep_n * D_KV + j] = vn[j];
+                    }
+                    ++dep_n;
+                }
+            }
             float* kc = g_kv.krow(e, pos); float* vc = g_kv.vrow(e, pos);        // append this token's K/V
             for (int j = 0; j < D_KV; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
             for (int hd = 0; hd < H; ++hd) {                                     // attend query pos over j<=pos

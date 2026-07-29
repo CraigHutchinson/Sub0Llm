@@ -43,7 +43,8 @@ namespace sub0 {
 // matching gradient view and the bookkeeping needed for reverse-mode autodiff.
 // Stages treat Node pointers as opaque handles (forward -> loss -> backward),
 // except for reading logits via the `data` span.
-enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt, SwiGLU, TiedHead, QKNorm };
+enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt, SwiGLU, TiedHead, QKNorm,
+                          DepthAttn };
 
 struct Node {
     Op op = Op::Leaf;
@@ -53,6 +54,13 @@ struct Node {
     std::span<float> scratch;
     const int* ids = nullptr;
     int heads = 0;
+    // Op::DepthAttn only: how many CACHED depth entries this node mixed over, i.e. the entry count in
+    // the per-execution depth cache at the moment this node's forward ran (its OWN key/value is entry
+    // `depth_s`, so it always mixes depth_s + 1 of them). The cache keeps growing as later executions
+    // append to it, so the count cannot be recovered at backward time -- it has to be recorded here.
+    // See op_depth_attn in backend_cpu.cpp and docs/DEPTH_ATTENTION.md 5a for why a variable-length
+    // input list cannot live on the Node itself.
+    int depth_s = 0;
     bool ternary = false;
 };
 

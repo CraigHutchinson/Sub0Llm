@@ -130,6 +130,25 @@ consteval std::array<int, LOOP_EXEC_COUNT> make_layer_execution_order() {
 }
 inline constexpr std::array<int, LOOP_EXEC_COUNT> LAYER_EXEC_ORDER = make_layer_execution_order();
 
+// DEPTH ATTENTION -- a per-position convex re-mixing of the VALUE vector across depth, adding no
+// parameters at all. Every DEPTH_ATTN_STRIDE-th execution appends its (K, V) to a per-window depth
+// cache; EVERY execution then replaces its own V with a softmax-weighted mixture over the cached
+// entries plus its own, the softmax running over the DEPTH axis (per batch item, KV head and position).
+// K is passed through untouched, so sequence attention afterwards is unchanged. Stride 0 is off, and at
+// stride 0 every expression below is inert.
+//
+// Because it adds no parameters, PARAM_FLOATS cannot discriminate it -- which is exactly why
+// DEPTH_ATTN_STRIDE is folded into ARCH_FINGERPRINT below. See docs/DEPTH_ATTENTION.md.
+inline constexpr bool USE_DEPTH_ATTN = (DEPTH_ATTN_STRIDE > 0);
+// Live cache entries at the END of a forward: one per PARTICIPATING execution. The gate is on the
+// EXECUTION index, not the layer index as the reference's is -- a deliberate, documented divergence
+// (docs/DEPTH_ATTENTION.md 3): it makes the entry count exactly this expression and spreads the entries
+// evenly across passes, and at stride 1 -- the setting the arm-D measurement runs -- the two are
+// identical anyway, since then every execution participates either way.
+inline constexpr int DEPTH_CACHE_MAX = USE_DEPTH_ATTN
+    ? (LOOP_EXEC_COUNT + DEPTH_ATTN_STRIDE - 1) / DEPTH_ATTN_STRIDE : 0;
+static_assert(DEPTH_CACHE_MAX <= LOOP_EXEC_COUNT, "depth cache cannot outnumber the executions");
+
 // ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //
 // The Header and PARAM_FLOATS between them discriminate every axis that changes a tensor SHAPE. They
