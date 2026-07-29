@@ -342,6 +342,97 @@ double evaluate(sub0::TokView data, std::size_t val_start) {
     return total / nw;
 }
 
+// Is a sub0llm-train holding the machine-wide guard right now? A NON-INVASIVE probe: OpenMutex only
+// tests for existence, it never acquires, so it cannot perturb or block the trainer.
+//
+// The read-only tools (report, autotemp) are deliberately NOT subject to SingleInstanceGuard --
+// refusing to inspect a model while it trains would be obnoxious, and they write nothing a trainer
+// owns. They are not free, though: both run generation grids that contend for the same CPU and GPU,
+// so an innocuous-looking `report` quietly steals throughput from a multi-hour sweep and, worse,
+// makes the sweep's own tok/s numbers wrong for that window. Detect it and do LESS, rather than
+// refuse or silently compete.
+#if defined(_WIN32)
+inline bool trainer_active() {
+    const std::string gname = std::string("Local") + char(92) + "sub0llm-train-global";
+    HANDLE h = OpenMutexA(SYNCHRONIZE, FALSE, gname.c_str());
+    if (h) { CloseHandle(h); return true; }
+    return false;
+}
+#else
+inline bool trainer_active() { return false; }   // no probe wired up off Windows; Windows-first build
+#endif
+
+// --- Context-length curve: NELBO as a function of how much context the model is given ----------
+//
+// Mean val_nelbo is a single number averaged over every position, and it is dominated by the easy
+// early ones. That makes it nearly blind to the thing depth mechanisms (LoopSplit, depth attention)
+// actually claim to improve: using LONG-RANGE context. Two arms can sit within seed noise on mean
+// NELBO while differing sharply in how much they gain from a longer window.
+//
+// This scores the SAME fixed, evenly-spaced held-out windows at several context widths. The
+// interesting quantity is not any single value but the DELTA from short to long: a model that
+// genuinely exploits distant context improves a lot from 64 -> 512, one that has effectively learned
+// an n-gram improves very little. Reported as an absolute nelbo per width plus the gain, so an A/B
+// can compare the SHAPE of the curve rather than one averaged scalar.
+//
+// Reuses evaluate()'s window selection exactly (same val_start, same stride) so the widths are
+// scored on identical text and differ only in how much of it the model may attend to.
+struct ContextCurve {
+    std::vector<int>    width;   // context width in tokens
+    std::vector<double> nelbo;   // mean cross-entropy at that width
+};
+ContextCurve evaluate_context_curve(sub0::TokView data, std::size_t val_start) {
+    ContextCurve c;
+    // This eval runs on the CPU backend -- sub0::forward(), not the device. The device seam has no
+    // batched forward-only entry point (sub0_dev_backward computes a full backward it would throw
+    // away; sub0_dev_forward_one is single-token decode), so there is nothing to dispatch to yet.
+    // Each extra width is therefore another full CPU pass over every eval window.
+    //
+    // So SHORTEN when the machine is not ours: a running trainer owns the CPU, and stealing it both
+    // slows the trainer and distorts its throughput numbers. Endpoints only (shortest and SEQ_LEN)
+    // still gives the gain figure -- which is the number an A/B actually compares -- at half the
+    // cost of the full curve, instead of the intermediate shape.
+    const bool shorten = trainer_active();
+    if (shorten) {
+        c.width.push_back(64);
+        c.width.push_back(SEQ_LEN);
+    } else {
+        // Powers of two up to SEQ_LEN. A width needs at least 2 tokens (one input/target pair) and
+        // the full window must fit, so anything larger than SEQ_LEN is skipped rather than clamped --
+        // a silently clamped width would report a duplicate of SEQ_LEN and read as a flat curve.
+        for (int w = 64; w <= SEQ_LEN; w *= 2) c.width.push_back(w);
+        if (c.width.empty() || c.width.back() != SEQ_LEN) c.width.push_back(SEQ_LEN);
+    }
+
+    const std::size_t last = data.size() - SEQ_LEN - 1;
+    if (val_start > last) return c;
+    const std::size_t span   = last - val_start;
+    const int         avail  = static_cast<int>(span / SEQ_LEN) + 1;
+    const int         nw     = std::min(EVAL_WINDOWS_MAX, std::max(1, avail));
+    const std::size_t stride = (nw > 1) ? span / static_cast<std::size_t>(nw - 1) : 1;
+
+    for (int cw : c.width) {
+        double total = 0.0;
+        #pragma omp parallel num_threads(DEFAULT_THREADS)
+        {
+            int win[SEQ_LEN + 1];
+            #pragma omp for reduction(+ : total) schedule(static)
+            for (int w = 0; w < nw; ++w) {
+                std::size_t st = val_start + static_cast<std::size_t>(w) * stride;
+                if (st > last) st = last;
+                data.copy_to(st, static_cast<std::size_t>(cw) + 1, win);
+                sub0::graph_reset();
+                sub0::Node* logits = sub0::forward(win, cw);
+                sub0::Node* loss   = sub0::cross_entropy(logits, win + 1);
+                total += loss->data[0];
+            }
+        }
+        c.nelbo.push_back(total / nw);
+    }
+    sub0::graph_reset();
+    return c;
+}
+
 // Mean per-token predictive entropy (nats) of the model on the held-out tail: its
 // average uncertainty when *reading* real text it never trained on, over the same fixed
 // windows as evaluate(). exp() of this is the natural target for generation -- we match
@@ -1094,26 +1185,6 @@ struct ConsoleCtrlGuard {};   // no-op off Windows (this project builds Windows-
 // --allow-concurrent exists because deliberate concurrency is legitimate: a small CPU sample-train
 // alongside a long GPU run, say. It relaxes ONLY the global scope -- the per-directory guard still
 // holds, because no flag makes two writers on one checkpoint safe.
-// Is a sub0llm-train holding the machine-wide guard right now? A NON-INVASIVE probe: OpenMutex only
-// tests for existence, it never acquires, so it cannot perturb or block the trainer.
-//
-// The read-only tools (report, autotemp) are deliberately NOT subject to SingleInstanceGuard --
-// refusing to inspect a model while it trains would be obnoxious, and they write nothing a trainer
-// owns. They are not free, though: both run generation grids that contend for the same CPU and GPU,
-// so an innocuous-looking `report` quietly steals throughput from a multi-hour sweep and, worse,
-// makes the sweep's own tok/s numbers wrong for that window. Detect it and do LESS, rather than
-// refuse or silently compete.
-#if defined(_WIN32)
-inline bool trainer_active() {
-    const std::string gname = std::string("Local") + char(92) + "sub0llm-train-global";
-    HANDLE h = OpenMutexA(SYNCHRONIZE, FALSE, gname.c_str());
-    if (h) { CloseHandle(h); return true; }
-    return false;
-}
-#else
-inline bool trainer_active() { return false; }   // no probe wired up off Windows; Windows-first build
-#endif
-
 #if defined(_WIN32)
 struct SingleInstanceGuard {
     HANDLE mutex_ = nullptr;
@@ -3588,6 +3659,25 @@ extern "C" SUB0_API int sub0_report_stage(const char* model_in) {
             emit("quality:");
             emit("  train nelbo {:.4f}  (ppl {:.2f})", train_nelbo, std::exp(train_nelbo));
             emit("  val   nelbo {:.4f}  (ppl {:.2f})", val_nelbo, std::exp(val_nelbo));
+            // Context-length curve: how much the model actually GAINS from longer context. Mean
+            // nelbo above cannot show this -- it averages every position together. For comparing two
+            // architectures the shape here is the more informative number: a model exploiting
+            // long-range structure improves markedly from the shortest width to SEQ_LEN; one that has
+            // effectively learned an n-gram barely moves.
+            {
+                const ContextCurve cc = evaluate_context_curve(data, val_start);
+                if (cc.nelbo.size() == cc.width.size() && !cc.nelbo.empty()) {
+                    emit("  context-length curve (val nelbo by how much context the model may attend to){}:",
+                         cc.width.size() <= 2 ? " [SHORTENED: a trainer is running; endpoints only]" : "");
+                    for (std::size_t i = 0; i < cc.width.size(); ++i)
+                        emit("    ctx {:>4}: nelbo {:.4f}  (ppl {:.2f})",
+                             cc.width[i], cc.nelbo[i], std::exp(cc.nelbo[i]));
+                    const double gain = cc.nelbo.front() - cc.nelbo.back();
+                    emit("    gain {:>4} -> {:<4}: {:.4f} nelbo ({:.1f}%) -- higher = better use of long context",
+                         cc.width.front(), cc.width.back(), gain,
+                         cc.nelbo.front() > 0 ? 100.0 * gain / cc.nelbo.front() : 0.0);
+                }
+            }
             emit("  train/val gap {:.4f}  ({:.1f}%)  -> {}", gap, 100.0 * rel_gap,
                          overfit ? "OVERFITTING (model too large / too little data)"
                                  : rel_gap < 0.03 ? "not overfitting (capacity / optimization bound)"
