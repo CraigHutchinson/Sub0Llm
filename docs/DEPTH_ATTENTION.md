@@ -270,11 +270,26 @@ unchanged on an unmodified default build) runs after every one.
   plus the new "mixed V depends on Q" test (catches BOTH dead: movement exactly 0). Neither alone suffices.
   Identity gate: at the default stride 0 the suite is assertion-identical (44,153,269) with +1 test case,
   the new presence test, which runs zero assertions when depth attention is off.
-- **Stage 2 — CUDA forward + backward**, with the cross-execution dK/dV accumulation of §4, gated by
-  the existing CPU/CUDA gradient-parity harness plus a LOOPED parity case (a non-looped test cannot
-  exercise the cross-execution path at all).
+- **Stage 2 — CUDA forward + backward — DONE.** Training (`forward_train` + `backward_device`) and
+  batched inference (`forward_device`); §5b's design held up in full. Gated on CPU/CUDA reduced-gradient
+  parity in a build that is looped AND GQA AND depth-attention (d128/L6/H4/kv2, middle 2 ×3, stride 2,
+  5 slots), so the cross-execution path is genuinely exercised — **with the depth-off control at the
+  same shape**, without which the ON number says nothing:
+  | | grad rel-L2 | cos |
+  |---|---|---|
+  | depth ON | 0.0127474 | 0.999919 |
+  | depth OFF (control) | 0.0102665 | 0.999948 |
+  The delta is one extra bf16 round-trip (the cache is `act_t`; dK/dQ accumulate through a bf16
+  read-modify-write), not a correctness gap. `sub0::DEPTH_SCHEDULE` was added so the four sites needing
+  per-execution slot bookkeeping share one compile-time source of truth.
+  **Not covered**: single-token CUDA decode (`forward_one_device`) aborts loudly rather than skipping the
+  mix. `gen` from a depth-attention model on the CPU backend; train and report are fine.
 - **Stage 3 — arm D**, run at the SAME pinned batch/lr as arms A/B/C and matched on TOKENS. See
-  `loopsplit-3arm-batch-confound` for why that is not optional.
+  `loopsplit-3arm-batch-confound` for why that is not optional. **In flight** at stride 4: it fits at
+  batch 448 (stride 1 would not — §5b finding 4 was right), costs ~14% throughput against arm B
+  (95,398 vs 111,415 tok/s, and arm D's is a warmup figure so the real gap is smaller), and the appends
+  land at executions 0/4/8/12 so pass 2 does read slots contributed by the head and by pass 1 — the
+  channel under test is exercised rather than accidentally null.
 
 ## 7. What arm D is expected to show
 
