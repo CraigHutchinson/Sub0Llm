@@ -164,6 +164,34 @@ bool load_model(const char* path) {
     const std::uint64_t arch_got = arch;
     if (arch_got != ARCH_FINGERPRINT) {
         const ArchAxes got = arch_axes_of(arch_got);
+        // A LOOP_REPEATS-ONLY difference is the single mismatch this path deliberately admits, and only
+        // on this path. LoopSplit adds no parameters -- the middle block reuses the same weights and
+        // PARAM_LAYOUT is keyed by layer INDEX, not execution -- so the blob is genuinely
+        // interchangeable across repeat counts, and running a model at more (or fewer) passes than it
+        // trained at is a real measurement rather than an accident: it is the standard evaluation for a
+        // recurrent-depth architecture, and the direct test of whether a looped block learned an
+        // ITERATIVE operator or a depth-specific pipeline. repeats=1 additionally runs a looped model
+        // with the loop removed entirely.
+        //
+        // This mirrors the exemption layout.hpp's own axis rule already grants ROPE_SCALING
+        // ("deliberately variable between train and inference"). It is scoped hard:
+        //   * detected by substituting THIS build's repeats into the FILE's axes and requiring the
+        //     result to reconstruct this build's fingerprint exactly -- so any second difference
+        //     (middle_layers, rope_theta, depth-attn stride) still falls through to the refusal below;
+        //   * TRAINING RESUME does not come through here. load_checkpoint (train_stage.cpp) keeps its
+        //     hard refusal, because there a repeats mismatch is always a bug, never a measurement.
+        const bool repeats_only =
+            arch_fingerprint(got.middle_layers, LOOP_REPEATS, got.rope_theta, got.depth_attn_stride)
+                == ARCH_FINGERPRINT;
+        if (repeats_only) {
+            std::println(stderr, "warning: model trained with LOOP_REPEATS {} is being run at {} "
+                                 "({} executions here vs {} as trained). Weights are interchangeable "
+                                 "(looping adds no parameters); this is a DIFFERENT COMPUTATION than "
+                                 "the one that was trained, so treat the output as a loop-scaling "
+                                 "measurement, not as this model's own quality.",
+                         got.repeats, LOOP_REPEATS, sub0::LOOP_EXEC_COUNT,
+                         N_LAYERS + LOOP_MIDDLE_LAYERS * (got.repeats - 1));
+        } else {
         std::println(stderr, "error: model was built with a different architecture than this binary, "
                              "in a way shapes cannot show (the parameter blob is the same SIZE either way):");
         std::println(stderr, "  loop schedule : file {} middle layers x{} repeats | this build {} x{}",
@@ -175,6 +203,7 @@ bool load_model(const char* path) {
         std::println(stderr, "Rebuild with matching --loop-middle-layers/--loop-repeats/--rope-theta/"
                              "--depth-attn-stride.");
         return false;
+        }
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
     return true;
