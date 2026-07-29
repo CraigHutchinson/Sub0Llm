@@ -44,16 +44,16 @@ one), but become rare.
 > for now; **D2** makes it corpus-derived, and the `glue_default()` accessor is the single point a
 > per-piece default (point-3 learned symbol tokens) would extend.
 
-**Point 3 — gluing corpus-specific (learned) tokens, not just inbuilt bytes.** Today the learner mints
-only WORD pieces (from word units, which exclude punctuation), so learned pieces are always word
-material and default space-both — correctly handled. The open opportunity: extend the Unigram learner
-to also mint *symbol/punctuation* pieces from the corpus (`://`, `->`, `==`, `()`, `**`, ``` ``` ```),
-each carrying its own **corpus-derived glue modality** in the same unified table (keyed by piece id,
-not byte). This is where fineweb's residual ~3.9% JOIN budget lives (code/URL/operator glue). Verdict:
-**valid and valuable, but a learner-scope change** (Scan must collect symbol runs; the glue table keys
-by token id) — a distinct increment after D2. The v2 architecture is built for it: `glue_default()` is
-already the one lookup both encode and decode consult, so per-piece defaults slot in without touching
-the FSM.
+**Point 3 — gluing corpus-specific (learned) tokens, not just inbuilt bytes. IMPLEMENTED (schemeV4).**
+The Unigram learner now also mints *symbol* pieces: `Scan::add_words` collects a maximal plain-symbol
+run (`is_symbol_piece_byte` — non-word, non-ws, excluding quotes/brackets which keep their own markers)
+as a learnable unit, so `://` `->` `==` `!=` `&&` `::` `//` `--` become single pieces where they recur.
+`encode_join` emits a symbol piece when the WHOLE maximal run matches one learned piece (a partial run
+stays byte-by-byte — still lossless). Each piece carries **per-piece glue** (`piece_lead_glue`/
+`piece_trail_glue` inherit the lead-glue of the first byte and trail-glue of the last), so decode (keyed
+by piece id) agrees with encode (keyed by boundary bytes) — a no-op for word pieces. Corpus-adaptive:
+prose (fineweb) learns few (`://` `--` `...` `||`), code (minipile) learns many (`==` `//` `**` `</` `++`
+`::` `->`). Measured code win: `x == y` 5→3 tokens, `i != 0 && j <= n` 14→10, `a::b::c` 9→7. Lossless.
 
 **Point 4 — compound & numeric expressions (measured on fineweb, real learned vocab).**
 - **Hyphenated ALPHA compounds are already optimal — no action.** `well-known` (4 tok), `state-of-the-art`
@@ -97,21 +97,30 @@ the FSM.
   (`1,000,000`'s commas) are smaller and locale/domain-dependent → Point 3 (corpus-derived symbol
   pieces), not a hard-coded rule.
 
- `.`/`:`/`?` are unimodal closers
+**D2 — The per-byte default table is CORPUS-DERIVED, not a scheme constant. IMPLEMENTED (schemeV4).**
+`.`/`:`/`?` are unimodal closers
 in clean prose but **bimodal in web/code** (decimals, URLs, `a.b`). A single baked default is wrong for
 one domain. The configurator measures each codepoint's dominant modality and bakes a per-target default
 table into `tokenizer.tok` — the mechanism already exists: `sub0llm-tokenizer calibrate` /
 `sub0::modality` (mergeable ledger + contradiction flagging), so a disagreeing corpus is surfaced, not
-averaged away.
+averaged away. **As built:** `sub0::modality` rides the `Scan` (accumulated in `add_words`, folded in
+`merge_words`, cached with the scan — `WCACHE_VERSION` 2); `learn()` derives a `std::array<GlueDefault,
+256>` where the hardcoded `casing::glue_default` is the FLOOR and a byte with decisive, unimodal evidence
+(≥500 samples, second combo <25%) overrides to its dominant `(lead, trail)`. `Tokenizer::glue_lead/
+glue_trail` is the single lookup both encode and decode consult; the table is a gracefully-degrading
+trailing section of `tokenizer.tok`. Verified end-to-end: a code corpus bakes `= / > : -` glue-both
+(prose leaves them spaced), byte-identical across a scan-cache hit.
 
-**D3 — Keep a dual open/close token ONLY for a measured-BIMODAL character.** The keep/drop criterion is
-spacing modality, per char, from the ledger:
+**D3 — Keep a dual open/close token ONLY for a measured-BIMODAL character. RESOLVED for a code-capable
+scheme.** The prose-only plan below (drop `{}`, gate `()[]`) was premised on a prose target. Since v2 is
+**code-capable** (owner's call), `{}`/`()`/`[]` all fire on code and STAY — no marker-enum/format change.
+`"` stays a dual regardless. The keep/drop criterion, for the record:
 - **`"` → KEEP the dual** (`ODQUOTE`/`CDQUOTE`): universally bimodal (~50/50 open/close in every
   corpus). The one clear survivor of the glue-marker family.
-- **`{}` → DROP** the glue markers: unimodal (mostly spaced) — a default captures them; the markers
-  fork two ids for ~0.19% even on code.
-- **`()` `[]` → CODE-TARGET OPT-IN**, not always-on: **0 fires on prose**, ~4.4% on code, bimodal
-  there. Mint them only when the calibration ledger says the corpus is code-bearing.
+- **`{}` → KEPT** (code-capable; the prose-only plan would have dropped them, ~0.19% even on code).
+- **`()` `[]` → KEPT** (code-capable). Measured firing on fineweb prose is NOT zero (CPAREN ~5.6k/4 MB),
+  so the design's "0 fires on prose, gate for code" was corrected by measurement — they earn keep on
+  prose too.
 
 **D4 — The tokenizer NEVER matches pairs.** Local glue only; the model learns closure from the true
 distribution (asymmetric `[5,6)`, nested, isolated included). No balance checking, ever (§2a). "Pair"

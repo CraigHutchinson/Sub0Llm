@@ -112,8 +112,11 @@ includes digits so a digit run forms a unit (no per-digit `JOIN`), but `word_uni
 direct digit↔letter transition so a number stays a self-contained numeric span (`Foo123`→`Foo`|`123`,
 the measured ~10% letter-fusion paying a `JOIN`; `123 + 456` spaced for free), while a connector still
 binds across the class boundary (`covid-19`, `2026-07-29` whole). The Unigram bars all-digit pieces, so
-numbers keep single-digit tokenization. Pending: corpus-derived defaults (D2), the reduced glue/quote
-marker set (D3), and learned symbol pieces (Point 3). Per-char glue defaults are §4b; numbers are Point 4.
+numbers keep single-digit tokenization. The per-byte glue table is **corpus-derived** (`sub0::modality`
+rides the scan; the hardcoded set is the floor) so a code corpus makes `= / > :` glue-both, and the
+Unigram also mints **symbol pieces** (`://` `->` `==` `!=` `&&` `::`), each gluing by its boundary bytes.
+The reduced-marker plan (D3) does not apply: v2 is code-capable, so `"`/`()`/`[]`/`{}` markers all stay.
+Per-char glue defaults are §4b; numbers are Point 4; symbol pieces + corpus-derived glue are Point 3 / D2.
 
 ## 5. Decode FSM & round-trip
 
