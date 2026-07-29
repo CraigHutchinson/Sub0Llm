@@ -59,7 +59,7 @@ static_assert(!USE_TERNARY,
 // silent-divergence bug ARCH_FINGERPRINT was extended to catch at load time; refusing to compile catches
 // it one step earlier. Lift this when Stage 2 lands the cross-execution dK/dV accumulation.
 // TODO(depth-attn-gpu): implement op_depth_attn's forward + backward on device, then remove this guard.
-static_assert(!USE_DEPTH_ATTN,
+static_assert(!sub0::USE_DEPTH_ATTN,
     "depth attention is CPU-only until docs/DEPTH_ATTENTION.md Stage 2 lands the CUDA cross-execution "
     "dK/dV accumulation; configure with -DSUB0_COMPUTE=CPU or --depth-attn-stride 0.");
 
