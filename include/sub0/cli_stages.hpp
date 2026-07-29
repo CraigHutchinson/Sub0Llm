@@ -19,7 +19,7 @@
 
 // Entry points provided by the stage libraries (libsub0_train, libsub0_gen).
 extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
-                                int steps, int batch, float lr, unsigned seed, int keep,
+                                int steps, double epochs, int batch, float lr, unsigned seed, int keep,
                                 int optimizer, int resume_mode, const char* blend_config_path,
                                 int replace_schedule, int allow_concurrent,
                                 double corpus_fraction, unsigned subset_seed);
@@ -51,7 +51,8 @@ inline int run_train(int argc, char** argv) {
     CLI::App app{"sub0llm-train — train a model (resumes from its .ckpt); auto-names a registered "
                  "model dir when no path is given"};
     std::string train_model, train_corpus{DEFAULT_CORPUS};
-    int   train_steps = 0, train_batch = 0;
+    int    train_steps = 0, train_batch = 0;
+    double train_epochs = 0.0;   // 0 = unset; --steps and --epochs are mutually exclusive
     float train_lr    = LR_BASE;
     unsigned train_seed = 42;
     double   train_corpus_fraction = 1.0;   // 1 = the whole corpus (see --corpus-fraction)
@@ -78,8 +79,18 @@ inline int run_train(int argc, char** argv) {
     app.add_option("--model", train_model,
                    "Output model path (optional; omit to auto-name by corpus+dims -- see --resume/--fresh)");
     app.add_option("--corpus", train_corpus, "Training corpus")->capture_default_str();
-    app.add_option("--steps", train_steps,
-                   "Training steps (0 = auto-size to corpus, stop on validation plateau)")->capture_default_str();
+    auto* train_steps_opt = app.add_option("--steps", train_steps,
+                   "Training budget in STEPS (0 = auto-size to corpus, stop on validation plateau). "
+                   "Prefer --epochs: a step is batch*SEQ_LEN tokens, so equal steps is NOT equal data "
+                   "once the batch differs -- which is exactly how an A/B sweep silently stops being "
+                   "matched")->capture_default_str();
+    app.add_option("--epochs", train_epochs,
+                   "Training budget in EPOCHS over the data actually trained on (honours "
+                   "--corpus-fraction). Batch-invariant, so two runs at the same --epochs see the same "
+                   "number of tokens whatever batch each one fits -- the unit to match an A/B on. "
+                   "Fractional values are fine (e.g. 1.8). Mutually exclusive with --steps")
+       ->excludes(train_steps_opt)
+       ->check(CLI::Range(0.0, 1000.0));
     app.add_option("--batch", train_batch,
                    "Minibatch size (0 = auto: tuned GPU batch on a CUDA build, else CPU data-parallel width)");
     auto* train_lr_opt =
@@ -146,7 +157,7 @@ inline int run_train(int argc, char** argv) {
     else { try { keep = std::max(1, std::stoi(train_keep)); } catch (...) { keep = 3; } }
     const int resume_mode = train_resume ? 1 : train_fresh ? 2 : 0;   // 0=auto, 1=force resume, 2=force fresh
     return sub0_train_stage(train_corpus.c_str(), train_model.c_str(),
-                            train_steps, train_batch, train_lr, train_seed, keep, train_optimizer,
+                            train_steps, train_epochs, train_batch, train_lr, train_seed, keep, train_optimizer,
                             resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0,
                             train_allow_concurrent ? 1 : 0,
                             train_corpus_fraction, train_subset_seed);

@@ -1219,7 +1219,7 @@ struct SingleInstanceGuard {
 static void report_run_context(bool gpu_train, bool hybrid_train = false);
 
 extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* model_out,
-                                          int steps, int batch, float lr, unsigned seed, int keep,
+                                          int steps, double epochs, int batch, float lr, unsigned seed, int keep,
                                           int optimizer, int resume_mode, const char* blend_config_path,
                                           int replace_schedule, int allow_concurrent,
                                           double corpus_fraction, unsigned subset_seed) {
@@ -1840,15 +1840,41 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         1, (epoch_tokens + tokens_per_step - 1) / tokens_per_step));
     const long warmup_steps = std::max<long>(1, std::lround(EVAL_WARMUP_EPOCHS  * epoch_steps));
     const long eval_every   = std::max<long>(1, std::lround(EVAL_INTERVAL_EPOCHS * epoch_steps));
-    const long max_steps = (steps > 0) ? steps : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
+    // Budget resolution, in priority order: an explicit --steps, then an explicit --epochs, then the
+    // plateau detector with MAX_EPOCHS_BACKSTOP as its ceiling.
+    //
+    // --epochs is the better unit for a controlled comparison and is resolved HERE, the first point
+    // where it can be exact: epoch_steps already accounts for the batch (tokens_per_step) and for
+    // --corpus-fraction, so `epochs * epoch_steps` is a TOKEN budget expressed in whatever steps this
+    // arm's batch happens to make of it. Two arms at the same --epochs therefore see the same number
+    // of tokens even when they fit different batches -- which is precisely the property matched
+    // --steps does NOT have, and how the first LoopSplit sweep silently ran one arm on 14.3% more data
+    // (see loopsplit-3arm-batch-confound). Fractional is meaningful and expected: --epochs 1.8 is a
+    // legitimate budget, not a rounding artifact.
+    const long epoch_budget_steps =
+        (epochs > 0.0) ? std::max<long>(1, std::lround(epochs * static_cast<double>(epoch_steps))) : 0;
+    const long max_steps = (steps > 0)              ? static_cast<long>(steps)
+                         : (epoch_budget_steps > 0) ? epoch_budget_steps
+                                                    : static_cast<long>(MAX_EPOCHS_BACKSTOP) * epoch_steps;
+    // An EXPLICIT budget (either unit) is a deliberate choice, so the plateau detector must not cut it
+    // short -- that is what makes a matched-budget A/B matched. Only an unspecified budget is
+    // plateau-stopped. `steps` alone used to carry this meaning; `--epochs` has to join it or an
+    // epoch-budgeted arm would stop early and silently stop being comparable.
+    const bool fixed_budget = (steps > 0) || (epoch_budget_steps > 0);
     const long lr_warmup_steps = std::max<long>(10, std::lround(LR_WARMUP_EPOCHS * epoch_steps));
     const float peak_lr = lr;   // `lr` is the peak; lr_schedule(step) warms up to it then decays
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train, hybrid_train);
-    sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps ({} epochs){}",
+    // Say which unit the budget came from AND what it costs in the other one, plus the token count --
+    // the quantity two arms actually have to match. A reader comparing two runs should not have to
+    // multiply batch by SEQ_LEN by steps in their head to find out whether the comparison was fair.
+    sub0::log::line("schedule: {} steps/epoch | eval warmup {} | eval every {} | max {} steps "
+                    "({:.2f} epochs, {:.2f}B tokens; budget from {}){}",
          epoch_steps, warmup_steps, eval_every, max_steps,
-         (max_steps + epoch_steps - 1) / epoch_steps,
+         static_cast<double>(max_steps) / static_cast<double>(epoch_steps),
+         static_cast<double>(max_steps) * static_cast<double>(tokens_per_step) / 1e9,
+         (steps > 0) ? "--steps" : (epoch_budget_steps > 0) ? "--epochs" : "plateau detection",
          on_demand ? " | on-demand" : "");   // the resume is announced prominently above, not buried here
     sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
          peak_lr, batch, lr_warmup_steps);
@@ -2496,7 +2522,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 // minimum-epoch floor + expected_plateau_epoch hint scaling -- the schedule's own value
                 // when it sets one, else DEFAULT_EXPECTED_PLATEAU_EPOCH (the evidence-based ~2-epoch
                 // Muon ledger center; see that constant's own comment for why a hint, not a hard cap).
-                if (steps == 0 && plateaued(rs.evals, frac_epoch,
+                if (!fixed_budget && plateaued(rs.evals, frac_epoch,
                         schedule.expected_plateau_epoch.value_or(DEFAULT_EXPECTED_PLATEAU_EPOCH))) stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
