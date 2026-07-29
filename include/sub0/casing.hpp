@@ -200,7 +200,7 @@ constexpr unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_
 // deliberately excluded so they stay atomic case operators.
 constexpr bool is_word_byte(int s) {
     return s >= 0 && s <= 0xFF &&
-           (is_alpha(static_cast<unsigned char>(s)) || (s >= '0' && s <= '9') || s >= 0x80);
+           (is_alpha(static_cast<unsigned char>(s)) || is_digit(static_cast<unsigned char>(s)) || s >= 0x80);
 }
 
 // v2 (schemeV4): the per-character DEFAULT inter-token spacing, as a unified (lead, trail) glue table.
