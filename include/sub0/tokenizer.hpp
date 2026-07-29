@@ -17,6 +17,7 @@
 #pragma once
 
 #include "sub0/casing.hpp"
+#include "sub0/modality.hpp"
 
 #include <array>
 #include <cstdint>
@@ -69,6 +70,10 @@ struct Scan {
     std::size_t raw_bytes = 0, norm_bytes = 0;
     long long   quote_repl = 0;
 
+    // Per-codepoint spacing modality, accumulated over pass 2 (rides the same mergeable/cacheable
+    // passes). learn() derives the corpus-adaptive per-byte glue-default table (D2) from it.
+    modality::ModalityStats modality;
+
     // Pass 1 over one in-memory chunk.
     void add_names(std::string_view chunk);
     // Fold another Scan's pass-1 state into this one, clearing the source's tables.
@@ -107,6 +112,13 @@ struct Tokenizer {
     std::vector<float>                     piece_logp;   // id -> log prob (Viterbi cost = -logp); -inf for non-pieces
     std::unordered_map<std::string, int>   piece_index;  // byte sequence -> id
     int                                    max_piece = 0;// longest piece
+
+    // v2 (schemeV4, D2): per-byte DEFAULT spacing, corpus-derived from the scan's modality (with the
+    // hardcoded casing::glue_default as the floor). encode + decode BOTH read this via glue_lead/
+    // glue_trail -- one source, no drift -- so a code corpus makes `=`/`.` glue where prose spaces.
+    std::array<casing::GlueDefault, 256>   glue{};
+    bool glue_lead(int b)  const { return b >= 0 && b < 256 && glue[static_cast<std::size_t>(b)].lead; }
+    bool glue_trail(int b) const { return b >= 0 && b < 256 && glue[static_cast<std::size_t>(b)].trail; }
 };
 
 struct LearnOptions {

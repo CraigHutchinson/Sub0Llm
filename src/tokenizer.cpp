@@ -131,6 +131,7 @@ void Scan::add_words(std::string_view chunk, const std::unordered_set<std::strin
     static thread_local std::string      norm;        // reused per worker thread (string_view in, no temp)
     static thread_local std::vector<int> stream;      // reused id stream -- no per-chunk 4B/symbol alloc
     normalize_text(chunk, qr, norm);
+    modality::add_modality(modality, norm);   // D2: per-byte spacing modality, over the SAME normalized view
     truecase_tokenize(norm, attested, &st, stream);
     for (std::size_t i = 0, n = stream.size(); i < n;) {
         const std::size_t end = word_unit_end(stream, i);
@@ -187,6 +188,7 @@ void Scan::merge_words(Scan& other) {
     used_cap = used_cap || other.used_cap;
     used_up  = used_up  || other.used_up;
     st.words += other.st.words; st.cap += other.st.cap; st.up += other.st.up; st.names += other.st.names;
+    modality::merge(modality, other.modality);   // D2: fold the per-byte modality (order-free)
     for (std::size_t i = 0; i < other.word_syms.size(); ++i) {
         const std::string k = seq_key(other.word_syms[i]);
         const auto it = index.find(k);
@@ -229,9 +231,34 @@ std::unordered_set<std::string> derive_attested(const Scan& s, long long* withhe
 //  learn — base alphabet + Unigram LM word-piece vocabulary (the runtime tokenizer)
 // ============================================================================
 
+// The hardcoded per-byte glue FLOOR (casing::glue_default): a prose-derived default that every
+// tokenizer starts from and a corpus can only refine.
+std::array<casing::GlueDefault, 256> default_glue_table() {
+    std::array<casing::GlueDefault, 256> g{};
+    for (int b = 0; b < 256; ++b) g[static_cast<std::size_t>(b)] = casing::glue_default(b);
+    return g;
+}
+
+// v2 (schemeV4, D2): corpus-derived per-byte glue. The hardcoded table is the floor; a byte with
+// DECISIVE, unimodal modality evidence (>= 500 samples, second combo < 25%) is overridden to its
+// dominant (glued-before -> lead, glued-after -> trail). So a code corpus makes `=`/`.`/`/` glue
+// where prose leaves them spaced, while bimodal or sparse bytes keep the floor (their ambiguity is
+// for markers/JOIN, not a single default). encode + decode both read the baked result -- lossless
+// for any table, since a deviation still pays a JOIN or a literal space.
+std::array<casing::GlueDefault, 256> derive_glue(const modality::ModalityStats& ms) {
+    std::array<casing::GlueDefault, 256> g = default_glue_table();
+    for (const auto& [cp, cm] : ms.chars) {
+        if (cp >= 256 || cm.total() < 500 || cm.bimodal()) continue;
+        const int d = cm.dominant();                      // Combo bit1=glued-before, bit0=glued-after
+        g[static_cast<std::size_t>(cp)] = { (d & 2) != 0, (d & 1) != 0 };
+    }
+    return g;
+}
+
 Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
                 const LearnOptions& opts) {
     Tokenizer t;
+    t.glue = derive_glue(scan.modality);   // D2: corpus-adaptive per-byte spacing (hardcoded floor + evidence)
 
     // Fix the base alphabet.
     //
@@ -656,7 +683,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             i = g + 1;
             continue;
         }
-        tile_ws(i, g, /*inter_content=*/true, lead_glue_default(stream[g]));
+        tile_ws(i, g, /*inter_content=*/true, t.glue_lead(stream[g]));
         i = g;
         // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
@@ -679,13 +706,13 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
                     const auto pit = t.piece_index.find(word_key);
                     if (pit != t.piece_index.end() && pit->second >= t.n_base) {
                         out.push_back(pit->second);
-                        dps = !trail_glue_default(stream[se - 1]);
+                        dps = !t.glue_trail(stream[se - 1]);
                         i = se;
                         continue;
                     }
                 }
             }
-            emit_byte(stream[i]); dps = !trail_glue_default(stream[i]); ++i;   // trail=glue -> next glues free ($5)
+            emit_byte(stream[i]); dps = !t.glue_trail(stream[i]); ++i;   // trail=glue -> next glues free ($5)
         } else {
             // Look up (or Viterbi-encode + memoise) this word's piece-id sequence by its byte key.
             word_key.assign(end - i, '\0');
@@ -717,14 +744,14 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
 // would, and decode (keyed by piece id) agrees with encode (keyed by the unit's boundary bytes).
 // A no-op for word pieces (letters default space-both) and identical to the byte rule for id < 256.
 inline bool piece_lead_glue(const Tokenizer& t, int id) {
-    if (id < 256) return lead_glue_default(id);
+    if (id < 256) return t.glue_lead(id);
     const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
-    return !e.empty() && lead_glue_default(e.front());
+    return !e.empty() && t.glue_lead(e.front());
 }
 inline bool piece_trail_glue(const Tokenizer& t, int id) {
-    if (id < 256) return trail_glue_default(id);
+    if (id < 256) return t.glue_trail(id);
     const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
-    return !e.empty() && trail_glue_default(e.back());
+    return !e.empty() && t.glue_trail(e.back());
 }
 
 // JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space between
@@ -855,6 +882,12 @@ void serialize(const Tokenizer& t, std::ostream& os) {
         wu16(static_cast<std::uint16_t>(w.size()));
         os.write(w.data(), static_cast<std::streamsize>(w.size()));
     }
+    // v2 (schemeV4, D2): the corpus-derived per-byte glue table, appended last. A gracefully-
+    // degrading trailing section (AGENTS.md §3.2): an older file without it loads with the hardcoded
+    // floor, so the magic need not bump. 1 byte/entry: bit1 = lead-glue, bit0 = trail-glue.
+    for (int b = 0; b < 256; ++b)
+        os.put(static_cast<char>((t.glue[static_cast<std::size_t>(b)].lead ? 2 : 0) |
+                                 (t.glue[static_cast<std::size_t>(b)].trail ? 1 : 0)));
 }
 
 std::uint64_t fingerprint(const Tokenizer& t) {
@@ -923,6 +956,16 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         t.attested.insert(std::move(w));
     }
     if (!is) return false;
+    // v2 (schemeV4, D2): optional trailing per-byte glue table (see serialize). Absent in a legacy
+    // file -> the hardcoded floor, so an older tokenizer.tok still loads and encodes identically.
+    t.glue = default_glue_table();
+    char gt[256];
+    if (is.read(gt, 256).gcount() == 256)
+        for (int b = 0; b < 256; ++b) {
+            const unsigned v = static_cast<unsigned char>(gt[b]);
+            t.glue[static_cast<std::size_t>(b)] = { (v & 2) != 0, (v & 1) != 0 };
+        }
+    is.clear();   // a short/absent table leaves EOF/fail bits set on `is` -- expected, not an error
     t.loaded = true;
     out = std::move(t);
     return true;

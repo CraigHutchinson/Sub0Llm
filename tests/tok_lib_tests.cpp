@@ -694,6 +694,30 @@ TEST_CASE("JOIN scheme (v2): a recurring symbol run is minted as one piece (poin
         REQUIRE(round_trips(t, s));
 }
 
+// v2 (schemeV4, D2): the per-byte glue default is CORPUS-DERIVED from the scan's spacing modality
+// (hardcoded prose set is the floor). A corpus where `=` is consistently glued both sides makes `=`
+// glue-both by default, so `x=y` costs no JOIN where the prose default would pay -- and both encode
+// and decode read the baked table, so it stays lossless.
+TEST_CASE("JOIN scheme (v2): per-byte glue is corpus-derived (D2)", "[tok][join][v2]") {
+    std::string code;
+    for (int k = 0; k < 400; ++k) code += "a=b c=d e=f g=h i=j k=l m=n\n";   // `=` always glued both sides
+    const Tokenizer t = sub0::tok::learn(code);
+    REQUIRE(t.glue_lead('='));                 // derived: `=` glues to what precedes
+    REQUIRE(t.glue_trail('='));                // and to what follows
+    const std::vector<int> ids = sub0::tok::encode(t, "x=y");
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_JOIN) == 0);   // glued free, no JOIN
+    for (const char* s : {"x=y", "a=b=c", "x = y", "k=v a=b"}) REQUIRE(round_trips(t, s));
+    // serialize round-trip carries the derived table: a reloaded tokenizer encodes identically.
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::istringstream is(os.str(), std::ios::binary);
+    Tokenizer t2;
+    REQUIRE(sub0::tok::deserialize(t2, is));
+    REQUIRE(t2.glue_lead('=') );
+    REQUIRE(t2.glue_trail('='));
+    REQUIRE(sub0::tok::encode(t2, "x=y") == ids);
+}
+
 // WS5b: bracket-glue markers collapse the JOIN tax on a bracket glued directly to what precedes it.
 // Unlike quotes, `(`/`)`/`[`/`]`/`{`/`}` are already unambiguous distinct bytes, so these markers
 // exist purely to save tokens, not to disambiguate direction -- verify the SAVINGS directly (not
