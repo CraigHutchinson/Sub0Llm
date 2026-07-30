@@ -53,6 +53,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include "sub0/lr_schedule.hpp"   // the WSD schedule (warmup -> stable -> cosine cooldown)
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -166,7 +167,11 @@ constexpr double PLATEAU_MIN_REL_AT_HINT = 0.02;   // at/past the hint: a looser
 // genuinely flat trend CONFIRM FASTER near epoch 2 (d192's 1.7ep plateau would have confirmed earlier,
 // saving tail compute) while staying strict far from it (a slow learner at 3+ epochs keeps training).
 constexpr double DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0;
-constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then inverse-sqrt decay (lr_schedule)
+constexpr double LR_WARMUP_EPOCHS    = 0.25;  // linear LR warmup, then a CONSTANT stable phase (sub0::lr)
+
+// The WSD learning-rate schedule (warmup -> stable -> cosine cooldown) and its constants live in
+// sub0/lr_schedule.hpp -- header-only and engine-free so its boundary conditions can actually be
+// tested (tests/lr_schedule_tests.cpp). See that header for the full rationale.
 // Muon's own reference peak lr (github.com/KellerJordan/Muon) -- unrelated in scale to AdamW's
 // batch-derived peak_lr below (Muon's orthogonalized updates have a very different magnitude/
 // geometry from AdamW's per-element-normalized ones), shares the SAME warmup/decay shape via
@@ -191,7 +196,10 @@ constexpr std::uint32_t CKPT_MAGIC   = 0x4B433053u;  // "S0CK"
 // run under a format we no longer test is not something to trust.
 // History, for the record: v2 added best_step, v3 drawn_tokens, v4 drawn_names, v5 the architecture
 // fingerprint. Bump this on any layout change and the guard below does the rest.
-constexpr std::uint32_t CKPT_VERSION = 5u;  // v2 added best_step (prune_ckpts best-checkpoint exemption);
+constexpr std::uint32_t CKPT_VERSION = 6u;  // v6 adds RunState::cooldown_start (the WSD cooldown's start
+                                            // step -- the only LR state not derivable from `step`; losing
+                                            // it across a resume would finish a run un-annealed);
+                                            // v2 added best_step (prune_ckpts best-checkpoint exemption);
                                             // v3 adds drawn_tokens (the blend scheduler's fairness state);
                                             // v4 adds drawn_names (index-aligned with drawn_tokens, so a
                                             // --blend-config-replace resume can reattribute progress BY
@@ -475,18 +483,6 @@ bool plateaued(const std::vector<double>& evals, double frac_epoch,
     return sub0::coherence::trend_plateaued(evals, PLATEAU_WINDOW, min_rel);
 }
 
-// Per-step learning rate: a LINEAR WARMUP to the peak over `warmup` steps, then a horizon-free
-// INVERSE-SQRT DECAY (lr proportional to 1/sqrt(step)). We previously trained at a CONSTANT lr
-// (no warmup, no decay), which makes a model oscillate around a high floor instead of settling
-// into the minimum -- the exact stall we saw (train+val flat ~3.28 with the lr bouncing the loss).
-// Warmup avoids the early high-lr instability; the decay lets it descend past that floor. The
-// inverse-sqrt form needs NO total-step horizon, so it fits the plateau-stopped, never-a-fixed-
-// step-count schedule, and is recomputed from the global step so resume is exact.
-inline float lr_schedule(long step, float peak, long warmup) {
-    if (warmup < 1) warmup = 1;
-    const float s = static_cast<float>(step), w = static_cast<float>(warmup);
-    return step < warmup ? peak * (s / w) : peak * std::sqrt(w / s);
-}
 
 // Human-scaled duration for an ETA figure -- a raw 40000-second estimate is harder to parse at a
 // glance than "11.1h". Negative/non-finite (wps not yet measurable, e.g. the very first interval)
@@ -508,6 +504,14 @@ struct RunState {
     // silently over-counted a resumed run, which made "same steps" and "same tokens" disagree between
     // two arms of the same A/B.
     long long tokens_seen = 0;
+    // WSD: the step at which the cosine cooldown began; -1 = still in the stable phase. The one piece of
+    // LR state NOT derivable from `step`, so a resume that lost it would drop back to constant LR
+    // mid-anneal and finish the run un-annealed -- exactly the under-finishing WSD exists to fix.
+    // Persisted here (CKPT_VERSION 6) rather than in state.json: it is exact-resume state, alongside
+    // `step`. See sub0/lr_schedule.hpp on why that version bump was taken deliberately rather than
+    // because it was free. Only meaningful for a PLATEAU-triggered cooldown -- a fixed-budget run
+    // recomputes its own schedule from max_steps every time and ignores what was stored here.
+    long cooldown_start = -1;
     std::vector<double> evals;
     // Per-source cumulative tokens drawn (sub0::BlendFairness::drawn_tokens) + the NAME each entry
     // belongs to (index-aligned with each other, not necessarily with the CURRENT run's `sources[]` --
@@ -613,6 +617,7 @@ bool save_checkpoint(const std::string& path, long adam_t, const std::mt19937& r
     wr(os, static_cast<std::int64_t>(adam_t));
     wr(os, rs.best_loss);
     wr(os, static_cast<std::int64_t>(rs.best_step));
+    wr(os, static_cast<std::int64_t>(rs.cooldown_start));   // v6: WSD cooldown start (-1 = stable phase)
     wr(os, static_cast<std::int32_t>(batch));
     wr(os, static_cast<std::uint32_t>(seed));
     wr(os, lr);
@@ -723,6 +728,7 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
     adam_t       = static_cast<long>(rd<std::int64_t>(is));
     rs.best_loss = rd<double>(is);
     rs.best_step = static_cast<long>(rd<std::int64_t>(is));
+    rs.cooldown_start = static_cast<long>(rd<std::int64_t>(is));   // v6; see RunState::cooldown_start
     batch        = rd<std::int32_t>(is);
     seed         = rd<std::uint32_t>(is);
     lr           = rd<float>(is);
@@ -771,6 +777,20 @@ std::string ckpt_step_path(const std::string& model_path, long step) {
     return std::format("{}.step{:09d}.ckpt", model_path, step);
 }
 std::string legacy_ckpt_path(const std::string& model_path) { return model_path + ".ckpt"; }
+
+// The state captured at the INSTANT the WSD cooldown was triggered, i.e. the end of the stable phase.
+// Deliberately NOT ".step"-named: list_step_ckpts() matches only that prefix, so this file is invisible
+// to prune_ckpts() (never deleted, however long the run goes) and to latest_ckpt_path() (never silently
+// auto-resumed). It is a rollback point you opt into by name.
+//
+// It exists because entering the cooldown is otherwise a ONE-WAY DOOR, and it is triggered by a
+// detector this project's own notes describe as miscalibrated -- window/patience are eval-count
+// denominated and were tuned on ~2-epoch TinyStories runs, and one recent run hit 2-of-3 patience SIX
+// times, rescued each time only by the patience guard. With this file, a plateau that turns out to be
+// false costs one anneal instead of the whole run, and the anneal itself becomes re-runnable: a
+// different cooldown length or floor can be tried from the identical stable-phase state, which also
+// makes those an A/B-able axis rather than a guess baked into a single trajectory.
+std::string preanneal_ckpt_path(const std::string& model_path) { return model_path + ".preanneal.ckpt"; }
 
 // (step, path) for every progress-named checkpoint of this model, ascending by step.
 std::vector<std::pair<long, std::filesystem::path>> list_step_ckpts(const std::string& model_path) {
@@ -1917,7 +1937,53 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // epoch-budgeted arm would stop early and silently stop being comparable.
     const bool fixed_budget = (steps > 0) || (epoch_budget_steps > 0);
     const long lr_warmup_steps = std::max<long>(10, std::lround(LR_WARMUP_EPOCHS * epoch_steps));
-    const float peak_lr = lr;   // `lr` is the peak; lr_schedule(step) warms up to it then decays
+    const float peak_lr = lr;   // `lr` is the peak; lr_schedule() warms up to it, HOLDS, then anneals
+    // WSD cooldown, resolved two DIFFERENT ways depending on whether the run has a known horizon.
+    //
+    // FIXED BUDGET (--steps / --epochs): the horizon IS known, so the anneal is scheduled up front --
+    // the last COOLDOWN_FRACTION of the budget. This is the textbook WSD case and the EASY one, and
+    // getting it wrong is not a small matter: gating cooldown entry on the plateau detector alone left
+    // every fixed-budget run training at constant peak LR and then stopping dead with NO anneal at all,
+    // which is strictly worse than the inverse-sqrt schedule this replaced (that at least decayed
+    // continuously). It also silently broke the validation this change depends on -- docs/LR_SCHEDULE.md
+    // prescribes comparing schedules "at matched tokens", i.e. via --epochs, which is exactly this path.
+    // Deterministic from max_steps, so it needs no persistence and a resume recomputes it identically.
+    //
+    // PLATEAU-STOPPED (no budget): the horizon is unknown by construction, so the detector picks the
+    // moment and `cooldown_start` is persisted (it is the one piece of LR state not derivable from step).
+    long cooldown_steps = 0;
+    if (fixed_budget) {
+        cooldown_steps = sub0::lr::cooldown_steps_for(max_steps);
+        if (cooldown_steps >= max_steps) cooldown_steps = max_steps / 2;   // tiny budgets: still anneal, but keep a stable phase
+        rs.cooldown_start = max_steps - cooldown_steps;
+        sub0::log::info("lr: WSD -- warmup {} steps, stable at {:.2e}, cosine cooldown from step {} to "
+                        "{:.2e} over the last {} of {} steps",
+                        lr_warmup_steps, static_cast<double>(peak_lr), rs.cooldown_start,
+                        static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION, cooldown_steps, max_steps);
+    } else if (rs.cooldown_start >= 0) {
+        // Resuming a plateau-triggered cooldown: reconstruct its length from the single persisted field
+        // via the same pure function the trigger used -- one source of truth, nothing to drift.
+        cooldown_steps = sub0::lr::cooldown_steps_for(rs.cooldown_start);
+        if (rs.step >= rs.cooldown_start + cooldown_steps) {
+            // The cooldown already COMPLETED before this resume. Without this, the stop check below
+            // fires at the first eval and the run ends immediately at the LR floor -- closing off the
+            // "resume a stopped run and keep training" workflow that arm A actually used to gain 5.6
+            // further epochs. An explicit resume is a deliberate instruction to train MORE, so honour it:
+            // clear the cooldown and return to the stable phase, which will re-anneal if it re-plateaus.
+            sub0::log::info("resuming PAST a completed cooldown (started {}, {} steps, ended {}) -- "
+                            "clearing it and returning to the stable phase at lr {:.2e}. It will anneal "
+                            "again if the detector fires again.",
+                            rs.cooldown_start, cooldown_steps, rs.cooldown_start + cooldown_steps,
+                            static_cast<double>(peak_lr));
+            rs.cooldown_start = -1;
+            cooldown_steps = 0;
+        } else {
+            sub0::log::info("RESUMING MID-COOLDOWN: cosine anneal started at step {}, {} steps long, ends "
+                            "at {} (lr floor {:.2e})", rs.cooldown_start, cooldown_steps,
+                            rs.cooldown_start + cooldown_steps,
+                            static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION);
+        }
+    }
 
     std::print("corpus: {} | ", src_desc);
     report_run_context(gpu_train, hybrid_train);
@@ -1931,7 +1997,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
          static_cast<double>(max_steps) * static_cast<double>(tokens_per_step) / 1e9,
          (steps > 0) ? "--steps" : (epoch_budget_steps > 0) ? "--epochs" : "plateau detection",
          on_demand ? " | on-demand" : "");   // the resume is announced prominently above, not buried here
-    sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> inverse-sqrt decay",
+    sub0::log::line("lr: peak {:.2e} (batch {}) | warmup {} steps -> stable -> cosine cooldown",
          peak_lr, batch, lr_warmup_steps);
     if (opt.use_muon())
         sub0::log::line("optimizer: Muon (hidden 2D weight matrices) + AdamW (embeddings, head, norms, "
@@ -2309,7 +2375,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             starts[b]  = d.win.start;
             win_len[b] = d.win.len;
         }
-        const float lr_t = lr_schedule(step, peak_lr, lr_warmup_steps);   // warmup -> inverse-sqrt decay
+        const float lr_t = sub0::lr::lr_at(step, peak_lr, lr_warmup_steps,
+                                       rs.cooldown_start, cooldown_steps);   // warmup -> stable -> cosine cooldown
         // Materializes window b (from this step's src_idx/starts/win_len draw) into cpu_win/cpu_starts/
         // cpu_mask/win_binds at destination slot `dst` -- shared by the plain-CPU branch (dst==b, every
         // window) and hybrid_train's CPU sub-batch (dst is a compacted index, b is the source window
@@ -2347,7 +2414,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         if (gpu_train) {
             // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
             // 0.f when Muon isn't selected, which sub0_dev_train_step treats as pure AdamW.
-            const float muon_lr_t = opt.use_muon() ? lr_schedule(step, MUON_LR_BASE, lr_warmup_steps) : 0.f;
+            const float muon_lr_t = opt.use_muon() ? sub0::lr::lr_at(step, MUON_LR_BASE, lr_warmup_steps, rs.cooldown_start, cooldown_steps) : 0.f;
             step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
             if (!gpu.ok) {
@@ -2370,7 +2437,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // (rel-L2 0.0087, cos 0.999963). See project memory hybrid-cpu-gpu-execution-design.
             opt.set_lr(lr_t);
             if (opt.use_muon())
-                opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
+                opt.set_muon_lr(sub0::lr::lr_at(step, MUON_LR_BASE, lr_warmup_steps, rs.cooldown_start, cooldown_steps));
             const auto t_prep0 = clock::now();
             hyb_cpu_idx.clear(); hyb_gpu_idx.clear();
             for (int b = 0; b < batch_t; ++b) {
@@ -2523,7 +2590,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         } else {
             opt.set_lr(lr_t);                   // apply the scheduled lr to the CPU AdamW-routed update
             if (opt.use_muon())                 // same warmup/decay SHAPE, Muon's own (much larger) peak
-                opt.set_muon_lr(lr_schedule(step, MUON_LR_BASE, lr_warmup_steps));
+                opt.set_muon_lr(sub0::lr::lr_at(step, MUON_LR_BASE, lr_warmup_steps, rs.cooldown_start, cooldown_steps));
             const auto t_prep0 = clock::now();
             cpu_win.resize(static_cast<std::size_t>(batch_t) * (seq_t + 1));   // materialize windows for the CPU engine
             if (any_masked) cpu_mask.resize(cpu_win.size());   // parallel loss mask (only when a source carries one)
@@ -2584,8 +2651,39 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 // minimum-epoch floor + expected_plateau_epoch hint scaling -- the schedule's own value
                 // when it sets one, else DEFAULT_EXPECTED_PLATEAU_EPOCH (the evidence-based ~2-epoch
                 // Muon ledger center; see that constant's own comment for why a hint, not a hard cap).
-                if (!fixed_budget && plateaued(rs.evals, frac_epoch,
-                        schedule.expected_plateau_epoch.value_or(DEFAULT_EXPECTED_PLATEAU_EPOCH))) stop = true;
+                // WSD: a plateau now TRIGGERS THE COOLDOWN rather than stopping outright. The run ends
+                // when the cosine anneal completes, so the model actually gets its decay phase -- the
+                // thing every previous run in this project omitted entirely (see the LR_* constants).
+                // Detecting at constant LR and annealing afterwards is also what makes the detection
+                // meaningful: under the old decaying schedule, flattening was confounded with the decay.
+                if (!fixed_budget && rs.cooldown_start < 0 && plateaued(rs.evals, frac_epoch,
+                        schedule.expected_plateau_epoch.value_or(DEFAULT_EXPECTED_PLATEAU_EPOCH))) {
+                    // Snapshot the END OF THE STABLE PHASE before the anneal touches the weights, so
+                    // entering the cooldown stops being a one-way door -- see preanneal_ckpt_path().
+                    // Written with cooldown_start still -1 so restoring it resumes IN the stable phase,
+                    // not at the head of an anneal it would then repeat.
+                    if (!save_checkpoint(preanneal_ckpt_path(model_path), opt.step_count(), rng, rs,
+                                         batch, lr, seed))
+                        sub0::log::warn("could not save the pre-anneal checkpoint '{}' -- the cooldown "
+                                        "below will NOT be reversible", preanneal_ckpt_path(model_path));
+
+                    rs.cooldown_start = step;
+                    cooldown_steps = sub0::lr::cooldown_steps_for(step);
+                    sub0::log::info("plateau at step {} ({:.2f} ep) -- entering WSD cooldown: cosine from "
+                                    "lr {:.2e} to {:.2e} over {} steps (then stop)",
+                                    step, frac_epoch, static_cast<double>(peak_lr),
+                                    static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION, cooldown_steps);
+                    sub0::log::info("  pre-anneal state saved to '{}' -- restore it over the newest "
+                                    ".step checkpoint to reject this plateau and keep training at peak, "
+                                    "or to re-anneal from the same state with different settings",
+                                    preanneal_ckpt_path(model_path));
+                }
+                // Cooldown complete -> the real end of training, at the LR floor. Only for a
+                // PLATEAU-triggered cooldown: a fixed-budget run's anneal is scheduled to land exactly on
+                // max_steps, so the loop's own budget check ends it and this must not pre-empt that (nor
+                // fire on a resume whose budget was extended past the previously-scheduled anneal).
+                if (!fixed_budget && rs.cooldown_start >= 0 && step >= rs.cooldown_start + cooldown_steps)
+                    stop = true;
             }
             const long steps_to_next_epoch = (static_cast<long>(frac_epoch) + 1) * epoch_steps - step;
             // Step-rate directly (not via wps/batch): batch_t now varies per step, so a fixed

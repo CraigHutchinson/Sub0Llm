@@ -95,7 +95,7 @@ Notably **not** per-epoch restarts or a sawtooth. Cyclical schedules are not whe
 0.25 epoch is already ~6% of a 4-epoch run, on the long side. Extending it to a full epoch would move
 against practice, not toward it.
 
-## Proposed change, and why it must wait
+## The change, as LANDED 2026-07-30
 
 Replace inverse-sqrt with a **DeepSeek-V4-shaped schedule**: warmup (unchanged) → constant at peak →
 **cosine cooldown to 10% of peak**, triggered by the plateau detector instead of by a step count. This
@@ -110,10 +110,30 @@ sensitivity and this project already runs Muon on the matrices. That is a reason
 to skip it: the cooldown claim is about a phase this project never runs at all, which is a different thing
 from being less sensitive to the shape of a decay you are already doing.
 
-**Do not land this mid-sweep.** It changes every arm's optimization trajectory, so it would invalidate the
-LoopSplit comparison outright. It is also a good candidate for its own A/B afterwards — inverse-sqrt vs
-WSD at matched tokens on one arm — since the cooldown claim predicts a measurable final-loss gain, and
-this project's standing policy is to measure rather than adopt on authority.
+### Status: LANDED, superseding the "do not land mid-sweep" hold below
+
+This section previously read **"Do not land this mid-sweep"** -- correct while the LoopSplit sweep was
+the thing being measured. That hold is DISCHARGED, not ignored: the user parked arms A-E for a full
+retrain after the backlog window and explicitly waived backward compatibility, so there is no live
+comparison left to invalidate. Implementation is `include/sub0/lr_schedule.hpp` (pure, tested in
+`tests/lr_schedule_tests.cpp`), wired in `src/train_stage.cpp`.
+
+Two things the design above did NOT say, both found in review before landing:
+
+* **A fixed-budget run has a known horizon, so it must schedule its own anneal.** Triggering the
+  cooldown solely from the plateau detector left every `--steps`/`--epochs` run at constant peak LR with
+  NO anneal at all -- strictly worse than the inverse-sqrt it replaced, and it silently broke the very
+  A/B this doc prescribes ("at matched tokens", i.e. `--epochs`). Fixed-budget runs now anneal over the
+  last `COOLDOWN_FRACTION` of their budget, landing on the floor at the final step.
+* **Entering the cooldown must not be a one-way door.** It is triggered by a detector this project's own
+  notes call miscalibrated, so the state at the moment of triggering is saved to
+  `<model>.preanneal.ckpt` -- deliberately not `.step`-named, so it is never pruned and never silently
+  auto-resumed. A false plateau now costs one anneal instead of the run, and the cooldown length/floor
+  become an A/B-able axis from an identical stable-phase state.
+
+It remains a good candidate for its own A/B -- inverse-sqrt vs WSD at matched tokens on one arm -- since
+the cooldown claim predicts a measurable final-loss gain, and this project's standing policy is to
+measure rather than adopt on authority. That A/B has NOT been run.
 
 ## Sources
 
