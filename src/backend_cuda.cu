@@ -54,12 +54,18 @@ static_assert(!USE_TERNARY,
 
 // Depth attention (DEPTH_ATTN_STRIDE > 0): training (forward_train + backward_device) and batched
 // inference (forward_device) are implemented below -- see docs/DEPTH_ATTENTION.md 5b. The one path NOT
-// covered is the single-token KV-cache decode (forward_one_device), which needs its own rows=1 cache
-// inside a captured graph; it hard-fails at RUNTIME rather than silently skipping the mix (see that
-// function). Runtime rather than compile-time because the covered paths must stay buildable, and a
-// no-op there would generate from a DIFFERENT architecture while every shape check, checkpoint field
-// and PARAM_FLOATS still agreed -- exactly the silent divergence ARCH_FINGERPRINT exists to catch.
-// TODO(depth-attn-decode): give forward_one_device a per-token depth cache, then drop that refusal.
+// covered is the single-token KV-cache decode, which needs its own rows=1 cache inside a captured
+// graph. It refuses at RUNTIME rather than silently skipping the mix: a no-op there would generate from
+// a DIFFERENT architecture while every shape check, checkpoint field and PARAM_FLOATS still agreed --
+// exactly the silent divergence ARCH_FINGERPRINT exists to catch.
+//
+// The refusal lives in sub0_cuda_kv_reset + sub0_cuda_forward_one, i.e. at the extern seam itself.
+// An earlier version of this comment described the guard in terms of a `forward_one_device` that does
+// not exist under that name, and no check had in fact been written: the caps bit
+// (sub0_dev_caps().supports_decode) plus gpu_decode_try_enable() were the only thing stopping a
+// depth-attention build from decoding without the mix, and anything calling the extern DIRECTLY -- as
+// the decode-parity test does -- bypassed them entirely. Corrected 2026-07-30.
+// TODO(depth-attn-decode): give the decode graph a per-token depth cache, then drop that refusal.
 
 // SwiGLU-gated FFN (USE_GATED_FFN, for importing GGUF/Llama-family weights): GPU support landed.
 // swiglu_kernel/swiglu_act_kernel/swiglu_backward_act_kernel below implement op_swiglu's forward/
@@ -4403,6 +4409,7 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_loss(const int* ids, const int
 // hot path (see the Phase-1 decode-loop audit: GPU busy only ~31% of decode wall-time, dominated by
 // per-token kernel-launch dispatch, not by this kind of redundant call -- still, free to remove).
 SUB0_CUDA_API [[nodiscard]] int sub0_cuda_kv_reset() {
+    if constexpr (sub0::USE_DEPTH_ATTN) return 1;   // decode does not implement the depth mix -- see forward_one
     if (!g_dev_params) return 1;
     if (fwd_alloc(1) || kv_alloc()) return 1;
     ensure_cublas();
@@ -4418,6 +4425,18 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_kv_reset() {
 // -- see that function's comment). Captures the graph lazily on first use per session (or after any
 // invalidate_decode_graph() trigger); every call after that is just the {id,pos} memcpy + graph replay.
 SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_one(int id, int pos, float* out_logits) {
+    // Depth attention is NOT in the captured decode graph: forward_one_device_graphed() contains no
+    // depth_attn launch, because the mix needs its own rows=1 per-token cache. Refuse rather than decode
+    // a DIFFERENT architecture than training and batched inference ran.
+    //
+    // This guard was DOCUMENTED (see this file's header comment) but never actually written, and the gap
+    // was invisible: the only thing holding the line was gpu_decode_try_enable() consulting
+    // supports_decode, one layer ABOVE this extern. The [.slow] decode-parity test calls this extern
+    // directly, so on a depth-attention build it compared a depth-mixed full forward against a
+    // non-mixed decode -- and still passed at 98% top-1, because top-1 agreement is far too coarse to
+    // notice the mix. Exactly the "a gradient check cannot validate this op, a PRESENCE test is
+    // required" failure mode from the depth-attention notes.
+    if constexpr (sub0::USE_DEPTH_ATTN) return 1;
     if (!g_dev_params || !g_kv_k) return 1;
     if (id < 0 || id >= VOCAB || pos < 0 || pos >= SEQ_LEN) return 1;
     if (ensure_wqkv_f32()) return 1;               // BF16: (re)build the F32 mirror this path reads
@@ -5833,6 +5852,16 @@ static sub0::memplan::Dims live_footprint_dims() {
     d.logits_chunks = g_logits_chunks_override;   // 0 = memplan's own derivation
     return d;
 }
+
+// The context length this backend was BUILT for -- the upper bound every measurement entry point here
+// enforces via its `T > SEQ_LEN` guard. Exists for sub0-cuda-selftest, which is deliberately compiled
+// without the generated config (it is a thin clang driver whose job is to exercise the clang<->nvcc
+// seam) and so cannot read SEQ_LEN directly. Without it that tool hardcoded the fineweb T=256 and every
+// call silently returned 1 on a shorter build -- 6 of its 8 checks no-oped while it still exited 0.
+//
+// Deliberately NOT a general "build dims" struct: SEQ_LEN is the one fact a caller needs to size a
+// legal request, and the rest would be speculative surface.
+SUB0_CUDA_API int sub0_cuda_seq_len() { return SEQ_LEN; }
 
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device
 // work -- callers that only need the prediction (the runtime guard, the configurator) use this.

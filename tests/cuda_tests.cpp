@@ -46,6 +46,7 @@ extern "C" int  sub0_cuda_muon_ns_check(const float* in, int rows, int cols, int
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 extern "C" int  sub0_cuda_free_vram_mb();
+extern "C" int  sub0_cuda_seq_len();
 extern "C" int  sub0_cuda_train_benchmark(int batch, int T, int iters, double* out_ms);
 extern "C" int  sub0_cuda_train_profile(int batch, int T, int iters,
                                         double* fwd_ms, double* bwd_ms, double* adam_ms);
@@ -819,6 +820,20 @@ TEST_CASE("CUDA forward_one decode matches full forward once the model is traine
          "[cuda][.slow]") {
     CudaGuard _cuda_guard;
     sub0::build_model();
+
+    // On a depth-attention build the decode graph does not implement the depth mix, so the ONLY correct
+    // behaviour is refusal -- and that is what this case must check. Previously it ran the parity loop
+    // regardless and PASSED at 98% top-1 while comparing a depth-mixed full forward against a non-mixed
+    // decode: top-1 agreement is far too coarse an instrument to detect a missing V-rewrite. Asserting
+    // the refusal is a real presence test; the old comparison was not.
+    if constexpr (sub0::USE_DEPTH_ATTN) {
+        REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+        CHECK(sub0_cuda_kv_reset() != 0);
+        std::vector<float> sink(static_cast<std::size_t>(VOCAB));
+        CHECK(sub0_cuda_forward_one(0, 0, sink.data()) != 0);
+        CHECK(sub0_dev_caps().supports_decode == 0);      // the bit and the seam must agree
+        return;
+    }
 
     // ids cycle 0..K-1 repeating: given the causal prefix, next-token is uniquely determined at every
     // position (zero label noise), so the loss has real signal to descend from step 1.
@@ -2127,10 +2142,36 @@ TEST_CASE("CUDA caps: supports_decode is honest, and the decode consumer honours
     REQUIRE(sub0_dev_caps().supports_eval  == 1);
 }
 
+// The measurement entry points REJECT an over-long T rather than clamping it, because silently
+// profiling a different shape than the caller asked for would make every number they report
+// untrustworthy. That puts the burden on callers to size their request to the build -- and both
+// callers got it wrong: the [.bench] cases below hardcoded T=128/64, and tools/cuda_selftest.cpp
+// hardcoded the fineweb T=256 while DISCARDING every return code, so on a SEQ_LEN=64 build six of
+// its eight checks no-oped and it still exited 0.
+//
+// This pins both halves of the contract: the bound is queryable, and exceeding it is refused. If a
+// future change makes these clamp instead, the second REQUIRE fails and the callers' std::min goes
+// from necessary to merely harmless -- a deliberate decision rather than a silent drift.
+TEST_CASE("CUDA measurement entry points refuse T > SEQ_LEN, and the bound is queryable", "[cuda]") {
+    CudaGuard _cuda_guard;                       // the accepted call below allocates fwd/train/opt state
+    REQUIRE(sub0_cuda_seq_len() == SEQ_LEN);
+    double f = 0.0, b = 0.0, a = 0.0;
+    CHECK(sub0_cuda_train_profile(4, SEQ_LEN + 1, 1, &f, &b, &a) != 0);
+    CHECK(sub0_cuda_train_benchmark(4, SEQ_LEN + 1, 1, nullptr) != 0);
+    CHECK(sub0_cuda_attn_check(4, SEQ_LEN + 1, 1, nullptr, nullptr) != 0);
+    // ...and the very same call at the queried bound is accepted, so the guard rejects only what it
+    // must. Cheap at these dims; this is the shape a correctly-written caller produces.
+    CHECK(sub0_cuda_train_profile(4, sub0_cuda_seq_len(), 1, &f, &b, &a) == 0);
+}
+
 TEST_CASE("CUDA per-phase profile attributes the step (forward/backward/adam)", "[cuda][.bench]") {
     CudaGuard _cuda_guard;
     double f = 0.0, b = 0.0, a = 0.0;
-    REQUIRE(sub0_cuda_train_profile(32, 128, 10, &f, &b, &a) == 0);
+    // T clamped to the build: train_profile REJECTS T > SEQ_LEN rather than clamping, so a hardcoded
+    // 128 made this REQUIRE fail on any shorter build. It went unnoticed because [.bench] is hidden
+    // unless selected by name.
+    const int T = std::min(128, SEQ_LEN);
+    REQUIRE(sub0_cuda_train_profile(32, T, 10, &f, &b, &a) == 0);
     const double tot = f + b + a;
     WARN("step phases (ms): forward=" << f << "  backward=" << b << "  adam=" << a << "  | total=" << tot
          << "  (backward recomputes checkpointed activations; grad-clip scale is on-device, no host "
@@ -2144,7 +2185,7 @@ TEST_CASE("CUDA per-phase profile attributes the step (forward/backward/adam)", 
 // samples over-report step time vs sustained training; a small config keeps the test fast.
 TEST_CASE("CUDA train step warms up (sustained < cold)", "[cuda][.bench]") {
     CudaGuard _cuda_guard;
-    const int batch = 16, T = 64;                               // small -> fast, but enough to clock-ramp
+    const int batch = 16, T = std::min(64, SEQ_LEN);            // small -> fast, but enough to clock-ramp
     double cold = 0.0, warm = 0.0;
     REQUIRE(sub0_cuda_train_benchmark(batch, T, 2,  &cold) == 0);
     REQUIRE(sub0_cuda_train_benchmark(batch, T, 40, &warm) == 0);

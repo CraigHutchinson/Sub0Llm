@@ -994,7 +994,12 @@ struct GpuTrainer {
                              "sqrt rule, so a shrunk run would differ from the requested one in BOTH batch "
                              "and effective lr. Re-run with --batch {} (lr will re-derive), or free VRAM.",
                              batch, fits >= 1 ? fits : 1);
-            if constexpr (sub0::USE_DEPTH_ATTN) {
+            {
+                // Gated ONLY on the clamp actually binding. This used to sit behind
+                // `if constexpr (USE_DEPTH_ATTN)`, which has nothing to do with logits chunking and
+                // suppressed the hint on precisely the builds that need it most: the LoopSplit arms are
+                // DEPTH_ATTN_STRIDE=0 with VOCAB 16508 / D_FF 512, so they want 33 chunks, get 8, and lose
+                // ~1354 MiB to the truncation -- the very shape memplan.hpp's own comment works through.
                 const int desired = (VOCAB + D_FF - 1) / D_FF;
                 if (desired > sub0::memplan::LOGITS_MAX_CHUNKS)
                     sub0::log::error("  This build's logits chunk count is clamped {}x (wants {}, capped at "
