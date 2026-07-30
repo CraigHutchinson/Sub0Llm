@@ -942,8 +942,19 @@ struct GpuTrainer {
         //TODO: Remove getenv calls - these are tmeporary and we should use commandline/compiletime
         if (std::getenv("SUB0_TRAIN_CPU")) return false;   // measurement / fallback override
         if (!HAS_CUDA || batch > kCap) return false;
+        // Honour the capability bits rather than discovering the gap at the first call. docs/BACKENDS.md
+        // promises an inference-only backend ("supports_train=0, supports_decode=1") makes "the train
+        // stage keep the CPU without any consumer special-casing" -- that was documentation only, since
+        // nothing read supports_train. Same class of gap as the supports_decode one fixed in ec1d8cf: a
+        // caps bit no consumer branches on is not a guard. No behaviour change on the CUDA backend, which
+        // reports 1 for both.
+        if (!sub0_dev_caps().supports_train) return false;
         if (sub0_dev_init() != 0) return false;
         if (sub0_dev_upload_params(sub0::params_ptr()) != 0) return false;
+        // Device-resident optimizer moments. A backend without them cannot run this device-resident step
+        // shape at all (opt.step() would advance host state the device never sees), so decline rather
+        // than half-configure -- the hybrid path is a deliberate, caller-selected mode, not a fallback.
+        if (!sub0_dev_caps().supports_opt_state) return false;
         if (sub0_dev_upload_opt(sub0::adam_m_ptr(), sub0::adam_v_ptr()) != 0) return false;
         // Pin the row budget up front (batch*SEQ_LEN rows) so no per-step (batch_t, seq_t) pair
         // ever triggers a grow-realloc mid-run. A failed sub0_dev_train_reserve leaves the backend's

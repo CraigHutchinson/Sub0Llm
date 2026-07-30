@@ -81,6 +81,23 @@ Consumers branch on **caps**, not on `#if defined(SUB0_BUILD_CUDA)` + folklore. 
   `supports_train=0, supports_decode=1`: generation/eval offload works, and the train stage keeps the
   CPU (or another device) without any consumer special-casing per backend name.
 
+**A bit nothing reads is not a guard.** Audited 2026-07-30 after `supports_decode` was found advertised
+for a path the CUDA backend did not implement *and* unread by its consumer — either half alone would have
+made the promise above false. Current readers:
+
+| bit | production consumer |
+|---|---|
+| `supports_train` | `GpuTrainer::enable` (train_stage.cpp) |
+| `supports_eval` | `sub0::eval::Session` (eval.hpp) |
+| `supports_decode` | `gpu_decode_try_enable` (decode.hpp) |
+| `supports_binding_compose` | the hybrid router's `needs_cpu` (train_stage.cpp) |
+| `supports_opt_state` | `GpuTrainer::enable` (train_stage.cpp) |
+| `supports_interception` | none — and it needs none: `kv_decode_generate` routes ANY interception to the CPU unconditionally, so the zero is enforced structurally rather than by reading the bit. Give it a reader the moment a backend implements interception. |
+| `supports_tf32` | none by design — `sub0_dev_set_tf32` is a *hint* a backend without the concept ignores. |
+
+So: when adding a bit, land its consumer's branch in the same change and pin both with a test. When
+*removing* a capability from a build flavour, grep every reader before assuming the degradation works.
+
 The compile-time gate `SUB0_BUILD_DEVICE` (aliasing today's `SUB0_BUILD_CUDA`) still answers the one
 question that must be compile-time: "is any device backend linked into this build at all?" Everything
 finer-grained is a caps query (cheap, called at setup, never in a hot loop).
