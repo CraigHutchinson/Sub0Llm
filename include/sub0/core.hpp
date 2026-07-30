@@ -69,6 +69,9 @@ SUB0_API void build_model();                       // allocate param layout + ra
 [[nodiscard]] SUB0_API bool load_model(const char* path);        // overwrite params from disk
 [[nodiscard]] SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
 SUB0_API void print_config();                      // human-readable config + memory line
+// Host-side memory plan (shared params + one Worker per compute thread), for `sub0llm memplan`. Defined in
+// the CPU backend because the per-thread cost is sizeof(Worker), a type private to that TU.
+SUB0_API void print_host_memplan();
 
 // Fast transcendental math (vectorized exp / tanh-form GELU) for the forward and
 // backward passes. Selected at compile time: configure with SUB0_EXACT_MATH=ON (or

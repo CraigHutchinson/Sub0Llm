@@ -1589,12 +1589,50 @@ void set_sentinel_bindings(const SentinelBindings* b) { g_sentinel_binds = b; }
 // save_model / load_model live in engine_core.cpp: serialization is backend-agnostic
 // and goes through params_ptr() + the host/device sync hooks.
 
+// The HOST half of the memory plan, reported by `sub0llm memplan` alongside the device half. It lives
+// here, in the backend that owns the allocations, because the per-thread cost is sizeof(Worker) -- a type
+// private to this translation unit, and deliberately so: a member added to Worker must not be able to
+// escape this figure. Until this existed, `sub0llm memplan` reported a DEVICE plan unconditionally, which
+// on a CPU-only build described memory that is never allocated (see docs/MEMORY_AUDIT.md 5).
+void print_host_memplan() {
+    constexpr double kMiB = 1024.0 * 1024.0;
+    constexpr double shared_mb = 4 * PARAM_FLOATS * sizeof(float) / kMiB;   // data + grad + m + vel
+    constexpr double worker_mb = sizeof(Worker) / kMiB;
+    constexpr double wgrad_mb  = PARAM_FLOATS * sizeof(float) / kMiB;       // the per-worker gradient
+    constexpr double arena_mb  = 2 * ACT_CAP * sizeof(float) / kMiB;        // act_data + act_grad
+    constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
+    std::println("host (CPU) plan: shared {:.0f} MiB + {} x worker {:.0f} MiB = {:.0f} MiB",
+                 shared_mb, workers, worker_mb, shared_mb + workers * worker_mb);
+    std::println("  shared: params + grad + m + vel ({} floats x 4)", PARAM_FLOATS);
+    std::println("  worker: gradient {:.0f} MiB + activation arenas {:.0f} MiB + graph nodes {:.0f} MiB",
+                 wgrad_mb, arena_mb, worker_mb - wgrad_mb - arena_mb);
+    if constexpr (COMPUTE_MODE == ComputeBackend::Gpu)
+        std::println("  (GPU build: one worker slot is touched -- CPU/Hybrid fans out to {})", DEFAULT_THREADS);
+    else
+        std::println("  scales with DEFAULT_THREADS={}; the arenas are sized by SEQ_LEN, NOT by batch --"
+                     " CPU parallelises over WINDOWS, so batch costs worker slots, not arena bytes", DEFAULT_THREADS);
+}
+
 void print_config() {
+    // Host footprint, reported as it is actually paid: a SHARED parameter set plus one whole Worker per
+    // compute thread. This used to print `2 * ACT_CAP * sizeof(float)` as "acts", which was wrong twice
+    // over -- it counted ONE worker's two activation arenas (real cost scales with DEFAULT_THREADS) and it
+    // omitted the per-worker PARAM_FLOATS gradient accumulator entirely, which at production dims EXCEEDS
+    // the arenas it was standing in for. sizeof(Worker) is used rather than a term-by-term sum so a member
+    // added to Worker cannot silently escape the figure -- the CPU analogue of the device side's
+    // measured-vs-predicted footprint check (see docs/MEMORY_AUDIT.md 5).
+    // Workers are lazily heap-allocated, so only the slots a run actually TOUCHES cost anything: a GPU
+    // run drives the engine from one thread (slot 0) while CPU and Hybrid fan out to DEFAULT_THREADS.
+    // Reporting the full count unconditionally would replace an under-report with an over-report.
+    constexpr double kMB = 1e6;
+    constexpr double shared_mb = 4 * PARAM_FLOATS * sizeof(float) / kMB;   // data + grad + m + vel
+    constexpr double worker_mb = sizeof(Worker) / kMB;                     // grad + arenas + nodes + views
+    constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
     std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
-                 "heap mem: params {:.1f}MB acts {:.1f}MB | math: {}",
+                 "heap mem: shared {:.1f}MB + {}x worker {:.1f}MB = {:.1f}MB | math: {}",
                  D_MODEL, N_LAYERS, N_HEADS, D_FF, SEQ_LEN, VOCAB,
                  USE_TERNARY ? " (ternary)" : "", PARAM_FLOATS / 1e6,
-                 4 * PARAM_FLOATS * sizeof(float) / 1e6, 2 * ACT_CAP * sizeof(float) / 1e6,
+                 shared_mb, workers, worker_mb, shared_mb + workers * worker_mb,
                  FAST_MATH ? "fast" : "exact");
     // Compute backend + the host GPU detected at configure time (constexpr facts from
     // sub0_config.hpp). COMPUTE_MODE is the backend actually compiled in; HAS_CUDA flags

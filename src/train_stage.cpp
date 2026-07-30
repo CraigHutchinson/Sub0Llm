@@ -3593,6 +3593,18 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     std::println("precision: GEMM {} | activations {} | master FP32  (BF16_OK={}; FFN scratch BF16-stored, parity gated by direction)",
                  GEMM_DTYPE == Dtype::BF16 ? "BF16" : "F32", ACT_DTYPE == Dtype::BF16 ? "BF16" : "F32", BF16_OK);
 
+    // The HOST half first, because it is the half that always applies: every build allocates the shared
+    // parameter set and at least one Worker, whereas the device terms below describe memory a CPU-only
+    // build never touches. Reporting only the device plan made `memplan` actively misleading on a CPU
+    // build -- see docs/MEMORY_AUDIT.md 5.
+    std::println("");
+    sub0::print_host_memplan();
+
+    if constexpr (COMPUTE_MODE == ComputeBackend::Cpu) {
+        std::println("");
+        std::println("device (GPU) plan: not applicable -- COMPUTE_MODE is CPU. The terms below are what a"
+                     " GPU build WOULD allocate, shown for planning a --compute 1 rebuild.");
+    }
     const double persist = mib(mp::persistent_bytes(d, ACT_DTYPE == Dtype::BF16 ? 2 : 4));
     std::println("");
     std::println("persistent (resident, batch-independent): {:.0f} MiB", persist);
@@ -3611,9 +3623,41 @@ extern "C" SUB0_API int sub0_memplan_stage() {
     }
     const int db = DEFAULT_GPU_BATCH;
     std::println("");
+    const auto aB = static_cast<sub0::memplan::u64>(ACT_DTYPE == Dtype::BF16 ? 2 : 4);
     std::println("breakdown @ DEFAULT_GPU_BATCH={}: persistent {:.0f} | dids {:.0f} | train-scratch {:.0f} = {:.0f} MiB",
-                 db, persist, mib(mp::fwd_dids_bytes(d, db)), mib(mp::train_scratch_bytes(d, db, ACT_DTYPE == Dtype::BF16 ? 2 : 4)),
-                 mib(mp::train_resident_bytes(d, db, ACT_DTYPE == Dtype::BF16 ? 2 : 4)));
+                 db, persist, mib(mp::fwd_dids_bytes(d, db)), mib(mp::train_scratch_bytes(d, db, aB)),
+                 mib(mp::train_resident_bytes(d, db, aB)));
+
+    // Itemized train scratch, straight from memplan::train_scratch_terms. This exists so the allocation
+    // census in docs/MEMORY_AUDIT.md is GENERATED rather than transcribed: the census used to be
+    // hand-recomputed from the formula, and a recomputation that silently ignored logits_n_chunks' clamp
+    // put the largest single term out by 4x while the total still looked plausible.
+    const mp::ScratchTerms st = mp::train_scratch_terms(d, db, aB);
+    const double tot = static_cast<double>(st.total());
+    auto pct = [tot](sub0::memplan::u64 b) { return tot > 0 ? 100.0 * static_cast<double>(b) / tot : 0.0; };
+    std::println("  train-scratch by term:");
+    std::println("    per-execution checkpoints {:>7.0f} MiB ({:>4.1f}%)  x{} executions",
+                 mib(st.per_exec), pct(st.per_exec), sub0::LOOP_EXEC_COUNT);
+    std::println("    final block + singles     {:>7.0f} MiB ({:>4.1f}%)", mib(st.final_blk), pct(st.final_blk));
+    std::println("    logits [chunk_rows,V]     {:>7.0f} MiB ({:>4.1f}%)  {} chunks",
+                 mib(st.logits), pct(st.logits), mp::logits_n_chunks(VOCAB, D_FF));
+    std::println("    backward gradients        {:>7.0f} MiB ({:>4.1f}%)", mib(st.grad), pct(st.grad));
+    if (st.qk_pre) std::println("    qk-norm pre-stash         {:>7.0f} MiB ({:>4.1f}%)", mib(st.qk_pre), pct(st.qk_pre));
+    if (st.depth)  std::println("    depth-attention cache     {:>7.0f} MiB ({:>4.1f}%)  {} slots",
+                               mib(st.depth), pct(st.depth), sub0::DEPTH_CACHE_MAX);
+
+    // The chunk lever, surfaced where someone planning a run will see it. The clamp is calibrated for a
+    // particular d_ff and truncates badly away from it -- at the LoopSplit arms' shape it truncates 4x and
+    // logits became 22% of scratch, which cost ~12 GPU-hours to a spill before anyone looked.
+    const int desired = (VOCAB + D_FF - 1) / D_FF;
+    if (desired > mp::logits_n_chunks(VOCAB, D_FF)) {
+        mp::Dims tuned = d;
+        tuned.logits_chunks = desired;
+        std::println("  NOTE: the logits chunk count is CLAMPED {}x (wants {}, capped at {} by"
+                     " LOGITS_MAX_CHUNKS). Rebuilding with -DSUB0_LOGITS_MAX_CHUNKS={} saves {:.0f} MiB.",
+                     desired / mp::logits_n_chunks(VOCAB, D_FF), desired, mp::LOGITS_MAX_CHUNKS, desired,
+                     mib(st.total() - mp::train_scratch_bytes(tuned, db, aB)));
+    }
     std::println("");
     std::println("knobs: train scratch ~ batch * seq (acts) ; attention is O(seq^2); params ~ d^2*layers.");
     std::println("  - halve seq -> ~halve activations + 4x less attention; raise/lower batch scales linearly;");
