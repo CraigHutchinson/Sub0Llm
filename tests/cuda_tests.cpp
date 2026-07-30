@@ -1380,6 +1380,67 @@ TEST_CASE("memplan prediction matches measured device usage", "[cuda][memplan]")
     }
 }
 
+// Regression test for a real predictor/allocator divergence. train_alloc used to branch on its own
+// runtime chunk override while sub0_cuda_train_footprint always re-derived the count from memplan, so
+// forcing a chunk count moved the ALLOCATION without moving the PREDICTION -- up to 1.35 GiB apart at the
+// LoopSplit arms' shape, four times FOOTPRINT_OVERPREDICT_TOLERANCE_MB. It never fired because the only
+// test that set the override was declared after the footprint test in this file, so the ordering hid it;
+// under --order rand, sharding, or the first production use of the lever it would have surfaced as a
+// mis-sized batch. Both now read Dims::logits_chunks, and this pins that they agree.
+TEST_CASE("memplan tracks a FORCED logits chunk count (predictor/allocator agree)", "[cuda][memplan]") {
+    CudaGuard _cuda_guard;
+    constexpr int kBatch = 64;
+    double base_pred = 0.0, base_act = 0.0;
+    REQUIRE(sub0_cuda_train_footprint(kBatch, &base_pred, &base_act) == 0);
+    REQUIRE(base_act > 0.0);
+
+    // Force MORE chunks than the derivation would pick, so the logits buffer genuinely shrinks. Anything
+    // above the derived count exercises the path where the old code diverged (the override was also not
+    // clamped to LOGITS_MAX_CHUNKS, which is the case that diverged furthest).
+    const int forced = sub0::memplan::logits_n_chunks(VOCAB, D_FF) * 4;
+    sub0_cuda_set_logits_chunks(forced);
+    double pred = 0.0, act = 0.0;
+    const int rc = sub0_cuda_train_footprint(kBatch, &pred, &act);
+    sub0_cuda_set_logits_chunks(0);        // restore BEFORE any assertion can abort the test
+    REQUIRE(rc == 0);
+    REQUIRE(act > 0.0);
+    WARN("forced " << forced << " chunks: predicted " << pred << " MiB, measured " << act
+         << " MiB (unforced: " << base_pred << " / " << base_act << ")");
+
+    // The PREDICTION must follow the override down -- this is the assertion that fails on the old code,
+    // where pred would have equalled base_pred exactly while act dropped.
+    CHECK(pred < base_pred);
+    CHECK(act <= base_act);
+    // ...and it must still match reality, to the same asymmetric band the unforced prediction is held to.
+    const double gap = pred - act;
+    CHECK(gap > -sub0::memplan::FOOTPRINT_TOLERANCE_MB);
+    CHECK(gap <  sub0::memplan::FOOTPRINT_OVERPREDICT_TOLERANCE_MB);
+}
+
+// memplan.hpp justifies a FIXED absolute footprint tolerance (rather than a percentage) by asserting in
+// prose that the predicted-vs-measured gap is "bounded and near-batch-independent" -- per-cudaMalloc
+// rounding over a fixed number of allocations plus WDDM noise. That claim is load-bearing: if the gap
+// actually scaled with the batch, a tolerance calibrated at batch 64 would be meaningless at the 448 the
+// production arms run, which is exactly the regime where an under-prediction turns into a failed reserve.
+// Measure it instead of trusting the comment.
+TEST_CASE("memplan: the prediction gap does not scale with batch", "[cuda][memplan]") {
+    CudaGuard _cuda_guard;
+    double p_lo = 0.0, a_lo = 0.0, p_hi = 0.0, a_hi = 0.0;
+    REQUIRE(sub0_cuda_train_footprint(64, &p_lo, &a_lo) == 0);
+    REQUIRE(sub0_cuda_train_footprint(256, &p_hi, &a_hi) == 0);
+    REQUIRE(a_lo > 0.0);
+    REQUIRE(a_hi > 0.0);
+    if (GPU_VRAM_MB > 0 && p_hi > 0.8 * static_cast<double>(GPU_VRAM_MB)) {
+        WARN("batch 256 predicted " << p_hi << " MiB is near the VRAM budget; skipping the scaling check");
+        return;
+    }
+    const double gap_lo = p_lo - a_lo, gap_hi = p_hi - a_hi;
+    WARN("gap at batch 64: " << gap_lo << " MiB | at batch 256: " << gap_hi << " MiB (4x the rows)");
+    // The footprint itself grew ~4x; the gap must NOT. Allowing it to move by one whole tolerance band is
+    // generous -- the point is to catch a gap that tracks the batch, which would land near 4x gap_lo.
+    CHECK(std::fabs(gap_hi - gap_lo) < sub0::memplan::FOOTPRINT_TOLERANCE_MB);
+}
+
 // VRAM leak / smoke trace: allocate the full resident TRAINING set for a batch, then shut down and
 // confirm the device buffers are released. Catches a buffer that sub0_cuda_shutdown forgets to free
 // (the "2.7 GB during the run -> 0 idle" question -- proves the footprint is the process's own and is

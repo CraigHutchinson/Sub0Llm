@@ -74,6 +74,15 @@ struct Dims {
     // carries a f32 gradient accumulator, so it is ~1.5x the cost a forward-only reading suggests --
     // see train_scratch_bytes' `depth` term and docs/DEPTH_ATTENTION.md 5b.
     int depth_slots = 0;
+    // Forced logits row-chunk COUNT, overriding logits_n_chunks' derivation (0 = derive, what every
+    // pre-existing aggregate-init call site means). This field exists so the chunk lever has exactly ONE
+    // source of truth: the CUDA allocator used to branch on its own runtime override while the predictor
+    // always re-derived, so setting the override made the prediction disagree with the allocation by up
+    // to 1.35 GiB at the LoopSplit arms' shape -- over 4x FOOTPRINT_OVERPREDICT_TOLERANCE_MB. Nothing
+    // caught it because the only caller that set the override happened to be declared AFTER the footprint
+    // test. Routing the override through Dims means train_scratch_bytes models whatever the allocator
+    // will actually do, so the lever can be raised in production without silently under-sizing the batch.
+    int logits_chunks = 0;
 };
 
 using u64 = unsigned long long;
@@ -187,7 +196,13 @@ constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
 inline constexpr int LOGITS_MAX_CHUNKS = SUB0_LOGITS_MAX_CHUNKS;
 static_assert(LOGITS_MAX_CHUNKS >= 1, "LOGITS_MAX_CHUNKS must be at least 1 (1 = no chunking)");
 
-constexpr int logits_n_chunks(int vocab, int d_ff) {
+// `forced` > 0 bypasses the derivation entirely and uses that chunk count verbatim (Dims::logits_chunks
+// / the CUDA backend's sub0_cuda_set_logits_chunks). It is NOT clamped to LOGITS_MAX_CHUNKS: the clamp
+// exists to stop the *automatic* derivation from trading unbounded kernel launches for VRAM, whereas a
+// forced count is an explicit caller decision that must be modelled exactly as given -- clamping it here
+// would reintroduce the predictor/allocator disagreement this parameter was added to remove.
+constexpr int logits_n_chunks(int vocab, int d_ff, int forced = 0) {
+    if (forced > 0) return forced;
     int k = (vocab + d_ff - 1) / d_ff;   // ceil(vocab/d_ff)
     if (k < 1) k = 1;
     if (k > LOGITS_MAX_CHUNKS) k = LOGITS_MAX_CHUNKS;
@@ -196,8 +211,8 @@ constexpr int logits_n_chunks(int vocab, int d_ff) {
 // Row-chunk CAPACITY: the [chunk_rows,V] training logits/dlogits buffer is allocated ONCE at this
 // size (train_alloc) and reused across every chunk iteration and every training step within the same
 // row budget; `total_rows` is that reserved row budget (train_alloc's Mm, i.e. batch*seq_len).
-constexpr u64 logits_chunk_rows(int vocab, int d_ff, u64 total_rows) {
-    const u64 n = u64(logits_n_chunks(vocab, d_ff));
+constexpr u64 logits_chunk_rows(int vocab, int d_ff, u64 total_rows, int forced = 0) {
+    const u64 n = u64(logits_n_chunks(vocab, d_ff, forced));
     return (total_rows + n - 1) / n;
 }
 
@@ -212,13 +227,29 @@ constexpr u64 fwd_scratch_bytes(const Dims& d, int batch) {
          + Mm * V * FLOAT;                      // logits [M,V]
 }
 
-// Resident training scratch (train_alloc), grown to `batch`. One term per cudaMalloc in train_alloc.
+// Itemized training scratch: one field per GROUP of cudaMallocs in train_alloc, so a predicted-vs-measured
+// gap can be ATTRIBUTED to a term instead of only observed on the total. This exists because the total was
+// the only thing memplan exposed, which meant the allocation census in docs/MEMORY_AUDIT.md had to be
+// hand-recomputed from the formula -- and a hand recomputation that silently ignored logits_n_chunks'
+// [1,LOGITS_MAX_CHUNKS] clamp put the largest single term out by 4x (438 MiB claimed vs 1806 MiB real)
+// while the total still looked plausible. Terms are the unit of review; the total is a derived quantity.
+struct ScratchTerms {
+    u64 per_exec  = 0;   // EL x (h_in, h_mid, rinv1, rinv2) -- scales with EXECUTIONS (LoopSplit)
+    u64 final_blk = 0;   // h_final, a_final, rinv_f + the single checkpoint scratches (a, fbuf, ff1, gact, qkv, att)
+    u64 logits    = 0;   // [chunk_rows,V] logits/dlogits -- the chunk lever's target, and the largest single term
+    u64 grad      = 0;   // the backward's dh/da/datt/dfbuf/dqkv/dff1/dgact + dwqkv, dtargets, lengths, active, loss
+    u64 qk_pre    = 0;   // pre-norm Q/K stash (USE_QK_NORM only)
+    u64 depth     = 0;   // depth-attention cache slots + their f32 grad accumulators (USE_DEPTH_ATTN only)
+    constexpr u64 total() const { return per_exec + final_blk + logits + grad + qk_pre + depth; }
+};
+
+// Resident training scratch (train_alloc), grown to `batch`, itemized. One term per cudaMalloc group.
 // USE_GATED_FFN needs NO extra terms here: backward_device's checkpoint-recompute reuses the plain
 // path's existing ff1/gact/dff1/dgact [M,F] buffers under role-remapping (ff1<-gate_pre, gact<-up_pre,
 // dff1<-hswi then dgate, dgact<-d_hswi then dup) instead of allocating a dedicated SwiGLU-output
 // buffer -- see backward_device's own comment for the exact per-step sequence this relies on.
-constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
-    const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff);
+constexpr ScratchTerms train_scratch_terms(const Dims& d, int batch, u64 A = FLOAT) {
+    const u64 C = u64(d.d_model), F = u64(d.d_ff);
     const u64 T = u64(d.seq_len), V = u64(d.vocab);
     const u64 Mm = u64(batch) * T;
     const u64 EL = u64(d.exec_layers > 0 ? d.exec_layers : d.n_layers);   // executions, not layers
@@ -227,12 +258,14 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 final_blk = Mm * C * A            // h_final [M,C] bf16 residual
                         + Mm * C * FLOAT        // a_final [M,C] f32 (lm_head input stays f32)
                         + Mm * FLOAT            // rinv_f  [M]
-                        + logits_chunk_rows(int(V), int(F), Mm) * V * FLOAT  // logits [chunk_rows,V] (chunked)
                         + Mm * C * A            // a [M,C] single checkpoint scratch (bf16)
                         + Mm * C * A            // fbuf [M,C] bf16 FFN checkpoint scratch
                         + 2 * Mm * F * A        // ff1, gact  [M,F] bf16 FFN scratch
                         + Mm * qkv_stride(d) * A // qkv [M,C+2*D_KV] single checkpoint scratch (bf16, recomputed in bwd)
                         + Mm * C * A;           // att [M,C] single checkpoint scratch (bf16, recomputed in bwd)
+    // logits [chunk_rows,V]: honours a forced chunk count (Dims::logits_chunks) so the prediction tracks
+    // what train_alloc will really allocate -- see that field's comment for the divergence this closes.
+    const u64 logits    = logits_chunk_rows(int(V), int(F), Mm, d.logits_chunks) * V * FLOAT;
     const u64 grad      = 2 * Mm * C * FLOAT    // dh, da  [M,C] f32
                         + Mm * C * A            // datt [M,C] bf16
                         + Mm * C * (FLOAT + A)  // dfbuf [M,C] f32 + dh16 [M,C] bf16
@@ -259,7 +292,13 @@ constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
     const u64 depth = d.depth_slots > 0
         ? u64(d.depth_slots) * Mm * d_kv(d) * (2 * A + 2 * FLOAT) + Mm * d_kv(d) * A
         : 0;
-    return EL * per_layer + final_blk + grad + qk_pre + depth;   // per-EXECUTION checkpoints (LoopSplit)
+    return ScratchTerms{ .per_exec = EL * per_layer, .final_blk = final_blk, .logits = logits,
+                         .grad = grad, .qk_pre = qk_pre, .depth = depth };
+}
+
+// Total resident training scratch (train_alloc), grown to `batch` -- the sum of train_scratch_terms above.
+constexpr u64 train_scratch_bytes(const Dims& d, int batch, u64 A = FLOAT) {
+    return train_scratch_terms(d, batch, A).total();
 }
 
 // Forward scratch a training step keeps resident: only the token-id buffer. Training reads from the

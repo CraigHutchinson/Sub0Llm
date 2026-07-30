@@ -13,6 +13,7 @@
 #include "sub0/registry.hpp"
 #include "sub0/log.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <format>
@@ -65,6 +66,199 @@ TEST_CASE("memplan: max_batch_for_vram inverts the footprint (clamp + tuner cap)
 
     // A budget too small for even batch 1 -> 0 (the configurator's hard-error path).
     CHECK(max_batch_for_vram(d448, 1, cap) == 0);
+}
+
+// The LoopSplit/depth-attention arm shape, spelled out ONCE for the term-level tests below. This is the
+// shape the memory audit was performed at, and the shape where the logits chunk cap truncates badly --
+// d_ff 512 against vocab 16508 wants 33 chunks, four times the default cap. Batch 448 x seq 512 = the
+// 229,376-row budget every MiB figure in docs/MEMORY_AUDIT.md is quoted at.
+namespace {
+constexpr sub0::memplan::Dims kArmShape{
+    /*d_model=*/192, /*n_layers=*/10, /*n_heads=*/6, /*d_ff=*/512, /*seq_len=*/512, /*vocab=*/16508,
+    /*tied=*/true, /*qk_norm=*/true, /*gated=*/true, /*pos_emb=*/false,
+    /*n_kv_heads=*/3,        // GQA-2 -> D_KV = 3 * (192/6) = 96
+    /*exec_layers=*/16,      // LoopSplit: 10 layers, 16 executions (arms B/D)
+    /*depth_slots=*/4,       // depth attention at stride 4 (arm D)
+};
+constexpr int kArmBatch = 448;
+constexpr sub0::memplan::u64 kBf16 = 2;
+constexpr double kMiB = 1024.0 * 1024.0;
+}  // namespace
+
+// The itemization contract. train_scratch_bytes used to be a single opaque scalar, which is how a
+// hand-recomputed census in docs/MEMORY_AUDIT.md could put the LARGEST term out by 4x while the total
+// still looked plausible. Terms are now the reviewable unit, so pin two things a refactor could break:
+// the total is exactly the sum (no term dropped from total(), no term double-counted), and no term that
+// this shape genuinely uses silently collapses to zero.
+TEST_CASE("memplan: scratch terms sum to the total and none silently vanishes", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+    const ScratchTerms t = train_scratch_terms(kArmShape, kArmBatch, kBf16);
+
+    // Sum integrity: total() must account for every field. Written as an explicit re-sum rather than
+    // calling total() twice so that a field ADDED to the struct but forgotten in total() fails here.
+    CHECK(t.per_exec + t.final_blk + t.logits + t.grad + t.qk_pre + t.depth == t.total());
+    CHECK(train_scratch_bytes(kArmShape, kArmBatch, kBf16) == t.total());
+
+    // Every term this shape uses is non-zero. The arm shape deliberately enables qk_norm AND depth
+    // attention precisely so those two conditional terms are covered here rather than only in a build
+    // that happens to have them on.
+    CHECK(t.per_exec > 0);
+    CHECK(t.final_blk > 0);
+    CHECK(t.logits > 0);
+    CHECK(t.grad > 0);
+    CHECK(t.qk_pre > 0);
+    CHECK(t.depth > 0);
+
+    // The conditional terms really are conditional -- otherwise the two CHECKs above would pass for a
+    // build that ignores the flags entirely.
+    Dims off = kArmShape;
+    off.qk_norm = false;
+    off.depth_slots = 0;
+    const ScratchTerms t_off = train_scratch_terms(off, kArmBatch, kBf16);
+    CHECK(t_off.qk_pre == 0);
+    CHECK(t_off.depth == 0);
+    CHECK(t_off.total() < t.total());
+}
+
+// Regression test for a REAL divergence, not a hypothetical: the CUDA allocator branched on its own
+// runtime chunk override while the predictor always re-derived the count, so forcing 32 chunks shrank the
+// allocation by ~1.35 GiB while the prediction did not move -- a 4x-tolerance over-prediction that would
+// make max_batch_for_vram under-size the very batch the lever exists to raise. Nothing caught it because
+// the only caller that set the override was declared AFTER the footprint test in the same file.
+TEST_CASE("memplan: a forced logits chunk count flows into the prediction", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+
+    // The forced count is used verbatim -- NOT re-clamped to LOGITS_MAX_CHUNKS, which would silently
+    // restore the disagreement for any override above the cap (32 > 8 is exactly the arm-D case).
+    CHECK(logits_n_chunks(16508, 512, /*forced=*/32) == 32);
+    CHECK(logits_n_chunks(16508, 512, /*forced=*/1) == 1);
+    CHECK(logits_n_chunks(16508, 512) == std::min(33, LOGITS_MAX_CHUNKS));   // derivation still clamps
+
+    Dims forced = kArmShape;
+    forced.logits_chunks = 32;
+    const ScratchTerms base = train_scratch_terms(kArmShape, kArmBatch, kBf16);
+    const ScratchTerms with = train_scratch_terms(forced,    kArmBatch, kBf16);
+
+    // Only the logits term moves, and it moves by the chunk-count ratio (32 vs the clamped derivation).
+    CHECK(with.per_exec  == base.per_exec);
+    CHECK(with.final_blk == base.final_blk);
+    CHECK(with.grad      == base.grad);
+    CHECK(with.depth     == base.depth);
+    CHECK(with.logits < base.logits);
+    const double ratio = static_cast<double>(base.logits) / static_cast<double>(with.logits);
+    const double expect = 32.0 / static_cast<double>(logits_n_chunks(16508, 512));
+    CHECK(ratio == Catch::Approx(expect).epsilon(0.01));
+
+    // And the saving reaches the TOTAL -- the quantity max_batch_for_vram actually inverts. ~1.35 GiB at
+    // this shape is the whole reason arm D fits an 8 GiB card at batch 448.
+    const double saved_mib = static_cast<double>(base.total() - with.total()) / kMiB;
+    CHECK(saved_mib > 1000.0);
+    CHECK(max_batch_for_vram(forced, 7891, 4096, kBf16) > max_batch_for_vram(kArmShape, 7891, 4096, kBf16));
+}
+
+// The chunk lever's DESIGN INTENT, tested rather than asserted in a comment: the chunked logits buffer is
+// supposed to land at roughly the same byte-scale as this model's other wide per-row activations, all of
+// which scale with d_ff. The [1,LOGITS_MAX_CHUNKS] clamp is calibrated for a particular d_ff and truncates
+// badly away from it -- at the arm shape it truncates 4x, which is how the logits term became 22% of the
+// whole training footprint. This test makes that breach VISIBLE per shape instead of only discoverable as
+// an out-of-VRAM run, and pins that some setting of the lever always brings the term back under budget.
+TEST_CASE("memplan: the logits chunk cap's truncation is bounded per shape", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+    struct Shape { const char* name; Dims d; int batch; };
+    const Shape shapes[] = {
+        {"production d448", Dims{448, 11, 7, 1792, 256, 16517, true, true, true, false}, 256},
+        {"arm d192/ff512",  kArmShape, kArmBatch},
+    };
+    for (const auto& [name, d, batch] : shapes) {
+        const int desired = (d.vocab + d.d_ff - 1) / d.d_ff;    // the UNclamped d_ff-matched ratio
+        const int actual  = logits_n_chunks(d.vocab, d.d_ff);
+        REQUIRE(actual >= 1);
+        REQUIRE(actual <= desired);                             // the clamp only ever truncates
+        const ScratchTerms t = train_scratch_terms(d, batch, kBf16);
+        const double share = static_cast<double>(t.logits) / static_cast<double>(t.total());
+        INFO(name << ": desired " << desired << " chunks, clamped to " << actual
+             << " (truncation " << (double(desired) / actual) << "x) -> logits "
+             << (static_cast<double>(t.logits) / kMiB) << " MiB = " << (100.0 * share) << "% of scratch");
+
+        // With the lever set to the shape's OWN desired ratio, the term returns to the d_ff scale it was
+        // designed to match: no more than ~12% of scratch. If this ever fails, the derivation itself is
+        // wrong for that shape -- not merely capped -- and no override can rescue it.
+        Dims tuned = d;
+        tuned.logits_chunks = desired;
+        const ScratchTerms tt = train_scratch_terms(tuned, batch, kBf16);
+        const double tuned_share = static_cast<double>(tt.logits) / static_cast<double>(tt.total());
+        INFO(name << ": at the desired " << desired << " chunks, logits share is " << (100.0 * tuned_share) << "%");
+        CHECK(tuned_share < 0.12);
+
+        // A shape whose clamp truncates by more than 2x needs -DSUB0_LOGITS_MAX_CHUNKS raised for it. That
+        // is a build decision, so this is a WARN, not a failure -- but it must be LOUD, because the cost is
+        // GPU-hours (arm D's first attempt spilled to shared memory and ran 2.7x slower for ~12 hours).
+        if (double(desired) / actual > 2.0) {
+            WARN(name << ": logits chunk cap truncates " << (double(desired) / actual)
+                 << "x -- logits is " << (100.0 * share) << "% of scratch ("
+                 << (static_cast<double>(t.logits) / kMiB) << " MiB at batch " << batch
+                 << "). Build with -DSUB0_LOGITS_MAX_CHUNKS=" << desired << " for this shape.");
+        }
+    }
+}
+
+// Per-term scaling laws. The total's monotonicity in batch is already covered above (max_batch_for_vram
+// inverts it), but a scaling regression inside ONE term is invisible on the total until it is large --
+// these pin each term to the axis it is supposed to track, which is what makes a measured-vs-predicted
+// gap attributable to a specific buffer group.
+TEST_CASE("memplan: each scratch term scales on the axis it is supposed to", "[frontend][memplan]") {
+    using namespace sub0::memplan;
+
+    // per_exec tracks EXECUTIONS, not layers -- the whole point of the LoopSplit accounting. Same layer
+    // count, double the executions, double the per-execution checkpoints and nothing else.
+    Dims flat = kArmShape;
+    flat.exec_layers = 8;
+    Dims looped = kArmShape;
+    looped.exec_layers = 16;
+    const ScratchTerms tf = train_scratch_terms(flat, kArmBatch, kBf16);
+    const ScratchTerms tl = train_scratch_terms(looped, kArmBatch, kBf16);
+    CHECK(tl.per_exec == 2 * tf.per_exec);
+    CHECK(tl.final_blk == tf.final_blk);
+    CHECK(tl.grad == tf.grad);
+    CHECK(tl.logits == tf.logits);
+
+    // exec_layers == 0 means "unset -> fall back to n_layers", the meaning every pre-GQA call site relies on.
+    Dims unset = kArmShape;
+    unset.exec_layers = 0;
+    Dims explicit_l = kArmShape;
+    explicit_l.exec_layers = kArmShape.n_layers;
+    CHECK(train_scratch_terms(unset, kArmBatch, kBf16).per_exec
+          == train_scratch_terms(explicit_l, kArmBatch, kBf16).per_exec);
+
+    // depth scales linearly in SLOTS, and each slot costs 3x a forward-only reading at bf16 -- two act_t
+    // buffers (retained K + mixed V) PLUS two f32 gradient accumulators, i.e. (2*2 + 2*4) / (2*2). The
+    // header used to claim "~1.5x" in prose; the real multiplier is dtype-dependent and 3x here, so pin
+    // it as arithmetic instead of trusting the comment. This term is what decides which stride fits.
+    Dims s1 = kArmShape, s8 = kArmShape;
+    s1.depth_slots = 1;
+    s8.depth_slots = 8;
+    const auto d1 = train_scratch_terms(s1, kArmBatch, kBf16).depth;
+    const auto d8 = train_scratch_terms(s8, kArmBatch, kBf16).depth;
+    const auto Mm = static_cast<u64>(kArmBatch) * static_cast<u64>(kArmShape.seq_len);
+    const auto per_slot = Mm * d_kv(kArmShape) * (2 * kBf16 + 2 * FLOAT);
+    const auto shared_v = Mm * d_kv(kArmShape) * kBf16;             // the one shared pre-mix V
+    CHECK(d1 == per_slot + shared_v);
+    CHECK(d8 == 8 * per_slot + shared_v);
+    CHECK(per_slot == 3 * (Mm * d_kv(kArmShape) * 2 * kBf16));      // 3x forward-only, NOT 1.5x
+
+    // Every term is linear in the row budget (batch * seq): doubling the batch doubles each of them. This
+    // is the property that makes a FIXED absolute footprint tolerance defensible -- if a term were
+    // super-linear, a tolerance calibrated at batch 64 would not hold at 448.
+    const ScratchTerms b1 = train_scratch_terms(kArmShape, 64, kBf16);
+    const ScratchTerms b2 = train_scratch_terms(kArmShape, 128, kBf16);
+    CHECK(b2.per_exec == 2 * b1.per_exec);
+    CHECK(b2.final_blk == 2 * b1.final_blk);
+    CHECK(b2.depth == 2 * b1.depth);
+    CHECK(b2.qk_pre == 2 * b1.qk_pre);
+    // logits and grad carry batch-INDEPENDENT pieces (a chunk-rounding remainder; dwqkv/lengths/active/
+    // loss), so they only need to be bounded by linear growth, not exactly double.
+    CHECK(b2.logits <= 2 * b1.logits);
+    CHECK(b2.grad < 2 * b1.grad);
 }
 
 // --- log: leveled diagnostics + the file tee that backs <model_dir>/train.log --------------------

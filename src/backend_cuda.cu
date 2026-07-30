@@ -2785,9 +2785,10 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     // chunk loop is mathematically identical to the unchunked path, not to tune: a test drives the same
     // backward at several chunk counts and compares gradients (the claim was previously only asserted in
     // a comment). 0 = memplan's own derivation, which is what every production path uses.
-    g_tr_logits_chunk = g_logits_chunks_override > 0
-        ? (Mm + static_cast<size_t>(g_logits_chunks_override) - 1) / static_cast<size_t>(g_logits_chunks_override)
-        : sub0::memplan::logits_chunk_rows(VOCAB, D_FF, Mm);
+    // ONE call, no local branch: memplan owns the derivation AND the override (its `forced` parameter), so
+    // the predictor cannot disagree with this allocation. It used to branch here while the predictor always
+    // re-derived -- see memplan.hpp's Dims::logits_chunks for the 1.35 GiB divergence that created.
+    g_tr_logits_chunk = sub0::memplan::logits_chunk_rows(VOCAB, D_FF, Mm, g_logits_chunks_override);
     const size_t MV = g_tr_logits_chunk * VOCAB;
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
@@ -5823,12 +5824,22 @@ SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
 // bf16 GEMM-weight mirror -- see memplan.hpp's Dims/param_floats/persistent_bytes comments).
 static constexpr sub0::memplan::Dims kFootprintDims = sub0::current_build_dims();
 
+// kFootprintDims with the LIVE logits chunk override folded in. Every prediction must go through this
+// rather than kFootprintDims directly: the override changes what train_alloc really allocates (by up to
+// 1.35 GiB at the LoopSplit arms' shape), so a prediction that ignored it would both fail its own
+// measured-vs-predicted parity check and make max_batch_for_vram under-size the batch it is meant to raise.
+static sub0::memplan::Dims live_footprint_dims() {
+    sub0::memplan::Dims d = kFootprintDims;
+    d.logits_chunks = g_logits_chunks_override;   // 0 = memplan's own derivation
+    return d;
+}
+
 // Predicted resident training footprint (MiB) for `batch`, straight from the pure model. No device
 // work -- callers that only need the prediction (the runtime guard, the configurator) use this.
 SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
-    return sub0::memplan::train_resident_mb(kFootprintDims, batch, sizeof(act_t));
+    return sub0::memplan::train_resident_mb(live_footprint_dims(), batch, sizeof(act_t));
 }
 
 // Force the logits row-chunk COUNT (0 restores memplan's own derivation). Exists so a test can drive the
@@ -5887,7 +5898,8 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_train_footprint(int batch, double* pre
     std::size_t free_after = 0;
     if (cudaMemGetInfo(&free_after, &total) != cudaSuccess) return 1;
     const double actual = free_before > free_after ? static_cast<double>(free_before - free_after) : 0.0;
-    const double predicted = static_cast<double>(sub0::memplan::train_resident_bytes(kFootprintDims, batch, sizeof(act_t)));
+    const double predicted = static_cast<double>(
+        sub0::memplan::train_resident_bytes(live_footprint_dims(), batch, sizeof(act_t)));
     constexpr double MiB = 1024.0 * 1024.0;
     if (predicted_mb) *predicted_mb = predicted / MiB;
     if (actual_mb)    *actual_mb    = actual / MiB;
