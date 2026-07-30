@@ -39,6 +39,9 @@ extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch
 // sub0_cuda_forward_loss is declared canonically by sub0/device_backend.hpp (included above), which
 // this target now compiles in its device configuration -- no local extern needed.
 extern "C" int  sub0_cuda_adam_step(float lr, long t, float muon_lr);
+// Forces the logits row-chunk COUNT (0 = memplan's derivation). Test-only lever -- see the
+// chunk-invariance cases below and docs/MEMORY_AUDIT.md 4a.
+extern "C" void sub0_cuda_set_logits_chunks(int n);
 extern "C" int  sub0_cuda_muon_ns_check(const float* in, int rows, int cols, int force_tf32, float* out);
 extern "C" int  sub0_cuda_train_predicted_mb(int batch);
 extern "C" int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
@@ -1944,6 +1947,106 @@ TEST_CASE("CUDA binding-compose: doc_of-resolved bindings across multiple window
 // grad-clip scale is computed on-device (grad_clip_scale_kernel, 2026-07) instead of a host
 // round-trip, so "adam" no longer carries that bubble -- this profile is how the ~10% drop in the
 // adam phase's elapsed time was confirmed.
+// LOGITS ROW-CHUNKING IS RESULT-NEUTRAL. head_ce_chunked processes the lm_head -> cross-entropy ->
+// head-backward chain in row-chunks and its comment claims the result is "mathematically IDENTICAL to the
+// old unchunked path". That was asserted, never tested -- and it is load-bearing: the chunk count is the
+// largest single VRAM lever available (at the LoopSplit arms' shape the logits buffer is 1806 MiB at the
+// default 8 chunks, 452 MiB at 32), so it will be varied per build. A chunking bug would surface as a
+// slightly wrong gradient, which no loss curve would reveal.
+//
+// Drives the SAME backward at several chunk counts and compares the reduced gradient against the
+// unchunked (1-chunk) reference. Exact equality is not the bar -- chunking changes float SUMMATION ORDER
+// for the dW/dtok_emb accumulations, so the tolerance is reduction noise, not algorithmic slack.
+TEST_CASE("logits row-chunking does not change the gradient", "[cuda][chunk]") {
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    const int batch = 4, T = std::min(64, SEQ_LEN);
+    std::mt19937 rng(4242);
+    std::vector<int> ids(static_cast<size_t>(batch) * T), tgt(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = static_cast<int>(rng() % VOCAB);
+        tgt[i] = static_cast<int>(rng() % VOCAB);
+    }
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const std::size_t n = sub0::trainable_floats();
+    auto grad_at = [&](int chunks, double* out_loss) {
+        sub0_cuda_set_logits_chunks(chunks);
+        REQUIRE(sub0_cuda_train_reserve(batch) == 0);
+        std::vector<float> g(n, 0.f);
+        REQUIRE(sub0_cuda_backward(ids.data(), tgt.data(), batch, T, g.data(), out_loss) == 0);
+        return g;
+    };
+
+    double loss_ref = 0.0;
+    const std::vector<float> ref = grad_at(1, &loss_ref);   // unchunked reference
+    REQUIRE(std::isfinite(loss_ref));
+
+    // 7 and 13 do NOT divide M (= batch*T), so they exercise head_ce_chunked's RAGGED last chunk
+    // (rows = min(chunk_cap, M - m0)) and its row_offset arithmetic -- the path where an off-by-one
+    // would corrupt only the final partial chunk and stay invisible in an evenly-dividing test.
+    for (int chunks : {2, 4, 7, 8, 13, 32}) {
+        double loss = 0.0;
+        const std::vector<float> g = grad_at(chunks, &loss);
+        // The loss is a plain sum over rows, so it should agree very tightly.
+        INFO("chunks=" << chunks << " loss=" << loss << " ref=" << loss_ref);
+        REQUIRE(loss == Catch::Approx(loss_ref).epsilon(1e-6));
+        double dot = 0.0, na = 0.0, nb = 0.0, worst = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            dot += static_cast<double>(ref[i]) * g[i];
+            na  += static_cast<double>(ref[i]) * ref[i];
+            nb  += static_cast<double>(g[i])   * g[i];
+            worst = std::max(worst, std::fabs(static_cast<double>(g[i]) - ref[i]));
+        }
+        const double cos = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-30);
+        INFO("chunks=" << chunks << " cos=" << cos << " worst abs delta=" << worst);
+        REQUIRE(cos > 0.9999);
+    }
+    sub0_cuda_set_logits_chunks(0);   // restore memplan's derivation for every later test
+}
+
+// Properties the CHUNKING DERIVATION must hold regardless of shape. Pure memplan, no device work.
+//
+// These exist because the current derivation is a CHUNK COUNT (ceil(vocab/d_ff), clamped), and a count
+// makes the resulting buffer scale with total_rows -- i.e. with BATCH. That is the wrong invariant for a
+// memory cap: doubling the batch doubles the logits buffer at the same chunk count, which is exactly what
+// the lever is supposed to prevent. The generalized target is a chunk SIZE (equivalently, a byte budget:
+// chunk_rows * vocab * 4 <= target), which is batch-invariant. Until that lands, these tests pin what the
+// count-based form does and does not guarantee, so the gap is visible rather than assumed away.
+TEST_CASE("logits chunk derivation: coverage, bounds, and the batch-scaling gap", "[cuda][chunk]") {
+    using sub0::memplan::logits_n_chunks;
+    using sub0::memplan::logits_chunk_rows;
+
+    // COVERAGE: the chunks must span every row, including when the count does not divide them. A
+    // shortfall here would silently drop the tail rows from the loss and its gradient.
+    for (unsigned long long rows : {1ull, 7ull, 255ull, 256ull, 229376ull}) {
+        for (int vocab : {512, 16508, 49152}) {
+            for (int dff : {512, 1792}) {
+                const int k = logits_n_chunks(vocab, dff);
+                const auto cr = logits_chunk_rows(vocab, dff, rows);
+                REQUIRE(k >= 1);
+                REQUIRE(cr >= 1);                              // never a zero-row chunk
+                REQUIRE(static_cast<unsigned long long>(k) * cr >= rows);   // spans every row
+                REQUIRE(cr <= rows);                           // never over-allocates past the budget
+            }
+        }
+    }
+
+    // BOUNDS: honours the configured cap, and degenerates to a single chunk when vocab is small
+    // relative to d_ff (zero overhead, exactly the unchunked path).
+    REQUIRE(logits_n_chunks(16508, 512) == std::min(33, sub0::memplan::LOGITS_MAX_CHUNKS));
+    REQUIRE(logits_n_chunks(256, 1792) == 1);
+    REQUIRE(logits_chunk_rows(256, 1792, 1000) == 1000);       // one chunk covers everything
+
+    // THE GAP, pinned rather than hidden: the buffer scales with batch at a fixed chunk count, so the
+    // count-based form does NOT bound the buffer's size. Doubling the rows doubles the chunk. When the
+    // derivation moves to a chunk SIZE / byte budget this assertion should INVERT -- which is the point
+    // of writing it down.
+    const auto at_1x = logits_chunk_rows(16508, 512, 229376);
+    const auto at_2x = logits_chunk_rows(16508, 512, 2 * 229376ull);
+    REQUIRE(at_2x == 2 * at_1x);
+}
+
 // The caps struct exists so consumers degrade around a MISSING capability instead of being driven into
 // an unimplemented path. supports_decode became conditional when depth attention landed: training and
 // batched inference/eval support it, the single-token decode path does not. This pins both halves --

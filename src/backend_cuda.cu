@@ -2751,6 +2751,9 @@ struct TrainScratch {
 };
 TrainScratch g_tr;
 size_t       g_tr_rows = 0;        // total [M] ROW capacity (batch*T product) the buffers are sized for
+int          g_logits_chunks_override = 0;  // 0 = memplan's derivation; >0 = force this chunk COUNT
+                                            // (test-only; see train_alloc's use and the chunk-invariance
+                                            // test in cuda_tests.cpp)
 size_t       g_tr_logits_chunk = 0; // row CAPACITY of g_tr.logits/dlogits (<= g_tr_rows) -- see
                                     // sub0::memplan::logits_chunk_rows / head_ce_chunked below
 long long    g_tr_grows = 0;       // monotonic (re)allocation count -- test observability
@@ -2778,7 +2781,13 @@ int train_alloc(int batch, int T = SEQ_LEN) {
     // instead of one [M,V] shot -- V dwarfs every other per-row scratch term at this project's typical
     // vocab scale, see sub0::memplan::logits_n_chunks' comment for the derivation) -- allocate only
     // [g_tr_logits_chunk, V], not [Mm, V].
-    g_tr_logits_chunk = sub0::memplan::logits_chunk_rows(VOCAB, D_FF, Mm);
+    // Row-chunking for the [chunk_rows,V] logits/dlogits buffer. The override exists to PROVE the
+    // chunk loop is mathematically identical to the unchunked path, not to tune: a test drives the same
+    // backward at several chunk counts and compares gradients (the claim was previously only asserted in
+    // a comment). 0 = memplan's own derivation, which is what every production path uses.
+    g_tr_logits_chunk = g_logits_chunks_override > 0
+        ? (Mm + static_cast<size_t>(g_logits_chunks_override) - 1) / static_cast<size_t>(g_logits_chunks_override)
+        : sub0::memplan::logits_chunk_rows(VOCAB, D_FF, Mm);
     const size_t MV = g_tr_logits_chunk * VOCAB;
     // TODO(mem): BF16 activation storage (sm>=80) would roughly halve the per-layer/final scratch -- the
     // biggest remaining lever for larger batches now that qkv/att/ff1/gact are checkpointed to singles.
@@ -5820,6 +5829,15 @@ SUB0_CUDA_API int sub0_cuda_train_predicted_mb(int batch) {
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
     return sub0::memplan::train_resident_mb(kFootprintDims, batch, sizeof(act_t));
+}
+
+// Force the logits row-chunk COUNT (0 restores memplan's own derivation). Exists so a test can drive the
+// same backward at several chunk counts and prove the gradients agree -- head_ce_chunked's "mathematically
+// identical to the unchunked path" claim was previously only a comment. Takes effect at the next
+// (re)allocation, so callers must re-reserve afterwards; sub0_cuda_train_reserve does that.
+SUB0_CUDA_API void sub0_cuda_set_logits_chunks(int n) {
+    g_logits_chunks_override = n > 0 ? n : 0;
+    train_free();      // force train_alloc to re-derive g_tr_logits_chunk on the next reserve
 }
 
 // Currently-free dedicated VRAM in MiB. The GPU tuner budgets its batch ladder against THIS rather

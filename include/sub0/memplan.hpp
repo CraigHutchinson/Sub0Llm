@@ -168,10 +168,29 @@ constexpr u64 persistent_bytes(const Dims& d, u64 A = FLOAT) {
 // training step -- a real production-dims calculation (D_MODEL=448, D_FF=1792, VOCAB=16517) shows
 // K=8 already captures ~87% of the theoretical maximum reduction this lever can offer (48.9% of
 // 55.9%), while K=16 only adds another ~3.5 percentage points for double the launches.
+// The [1,8] clamp's upper bound is CALIBRATED FOR A PARTICULAR d_ff and truncates badly away from it.
+// The 87%-of-maximum figure above was computed at production dims (D_MODEL 448, D_FF 1792, VOCAB 16517),
+// where ceil(vocab/d_ff) is 10 and the cap costs almost nothing. At the LoopSplit arms' shape (D_FF 512,
+// VOCAB 16508) the desired ratio is 33, so a cap of 8 truncates it FOUR-FOLD and the logits buffer stops
+// tracking the d_ff scale it is supposed to match: measured 1806 MiB at batch 448, which is 22% of the
+// whole training footprint and the largest single scratch term after the per-execution checkpoints.
+// Raising the cap to 32 there takes it to 452 MiB.
+//
+// Overridable per build rather than raised globally: more chunks means more kernel launches, so the
+// value belongs to whoever is trading launches for VRAM. Changing it CANNOT change results -- the chunk
+// loop is mathematically identical to the unchunked path (see head_ce_chunked) -- and that invariant is
+// pinned by a test that runs the same backward at several chunk counts and compares gradients, rather
+// than being asserted in a comment as it was before.
+#if !defined(SUB0_LOGITS_MAX_CHUNKS)
+  #define SUB0_LOGITS_MAX_CHUNKS 8
+#endif
+inline constexpr int LOGITS_MAX_CHUNKS = SUB0_LOGITS_MAX_CHUNKS;
+static_assert(LOGITS_MAX_CHUNKS >= 1, "LOGITS_MAX_CHUNKS must be at least 1 (1 = no chunking)");
+
 constexpr int logits_n_chunks(int vocab, int d_ff) {
     int k = (vocab + d_ff - 1) / d_ff;   // ceil(vocab/d_ff)
     if (k < 1) k = 1;
-    if (k > 8) k = 8;
+    if (k > LOGITS_MAX_CHUNKS) k = LOGITS_MAX_CHUNKS;
     return k;
 }
 // Row-chunk CAPACITY: the [chunk_rows,V] training logits/dlogits buffer is allocated ONCE at this

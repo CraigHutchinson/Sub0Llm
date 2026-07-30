@@ -221,6 +221,32 @@ clamp path already handles. Requires driver 536+; this host is on 596.36.
 
 ## 4. Ranked levers, once the picture is honest
 
+### 4a. The chunking lever, and why a chunk COUNT is the wrong generalization
+
+`logits_n_chunks` returns a COUNT (`ceil(vocab/d_ff)`, clamped), so `chunk_rows = total_rows / count`
+scales with `total_rows` — i.e. **with batch**. Doubling the batch doubles the logits buffer at the same
+count, which is precisely what a memory lever is supposed to prevent. The count-based form therefore does
+not bound the buffer at all; it only bounds its *ratio* to the other per-row activations, and only at the
+`d_ff` the clamp was calibrated for.
+
+**The generalized target is a chunk SIZE, equivalently a byte budget:**
+
+```
+  chunks = ceil(total_rows * vocab * 4 / LOGITS_TARGET_BYTES)     // batch-invariant
+```
+
+That expresses the actual intent ("keep the logits buffer under X MiB") and needs no per-shape clamp
+calibration. Not yet implemented — the immediate need was arm D, and changing the derivation changes every
+build's memory profile — but `tests/cuda_tests.cpp` now pins the current form's coverage and bounds AND
+records the batch-scaling gap as an assertion that should INVERT when the byte-budget form lands, so the
+gap is visible rather than assumed away.
+
+Smoke coverage added alongside (the chunk loop's "mathematically identical" claim had never been tested):
+same backward at chunk counts 1/2/4/7/8/13/32 with gradient cosine > 0.9999 against the unchunked
+reference, where 7 and 13 deliberately do NOT divide the row count so the RAGGED last chunk and its
+`row_offset` arithmetic are exercised — the path where an off-by-one corrupts only the final partial chunk
+and stays invisible to an evenly-dividing test.
+
 | lever | saving at arm D's shape | note |
 |---|---|---|
 | **`logits_chunk_rows`: 33 → 132 chunks** | **~328 MiB** | **the clean one.** The chunk loop already exists and is documented as mathematically identical to the unchunked path, so results do not move — only launch count rises, and each chunk still does a large GEMM so it amortises. Needs the derived ratio to become a knob. |
