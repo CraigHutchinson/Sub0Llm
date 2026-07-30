@@ -95,6 +95,46 @@ a matching model term is caught mechanically rather than by someone remembering.
 fix: today the correspondence is maintained by comment discipline alone, and the census above shows six
 places where it has already drifted.
 
+### 3a-bis. MEASURED: the runtime overhead is a FIXED ~1650 MiB
+
+Two independent shapes, measured on real runs, give the same delta between `memplan train_resident` and
+what the process actually holds (dedicated + shared):
+
+| arm | shape | memplan predicted | measured total | delta |
+|---|---|---|---|---|
+| A | 16 exec, no depth, 9.66M | 5851 MiB | 7502 MiB | **+1651** |
+| D | 16 exec, depth stride 4, 7.23M | 6859 MiB | 8507 MiB | **+1648** |
+
+`memplan + 1650 MiB` predicts the real footprint to within ~3 MiB on both. That the delta is CONSTANT
+across a 1 GiB difference in modelled scratch is the important part: it is fixed overhead, not something
+that scales with the model, which is consistent with its being CUDA context + cuBLAS workspace + the
+eval-path forward scratch (itself fixed, since `DEVICE_LOGITS_BUDGET_BYTES` caps it at 512 MiB
+regardless of model size) + allocator granularity.
+
+So `kVramHeadroomMB = 512` is not merely "too small" — it is wrong by a factor of ~3.2, and the right
+value is measurable rather than guessable. Until 3b lands, **1650 MiB is the empirical constant**, and
+the fit-check should be `memplan(batch) + 1650 <= free_vram`.
+
+Consequence for the arms, on this 8151 MiB card (~7891 MiB usable):
+
+```
+  C shallow10        4790 + 1650 = 6440   comfortable
+  B loop10x6         5809 + 1650 = 7459   ~430 MiB spare
+  A deep16           5851 + 1650 = 7501   ~390 MiB spare -- CONFIRMED FINE (full speed, 464 MiB free)
+  D loop+depth4      6859 + 1650 = 8509   OVER by ~620 MiB -- REAL spill of ~644 MiB, 2.7x slowdown
+  E flat+depth4      5625 + 1650 = 7275   comfortable
+```
+
+Only arm D exceeds the card, and the model's ~620 MiB over-commit matches the ~644 MiB actually migrated
+(718 measured minus the ~74 MiB baseline of 3d). Arm A, at ~390 MiB spare, runs at full speed — so the
+model is usable for planning once the constant is applied, and the marginal-looking arms are genuinely
+fine rather than merely lucky.
+
+Caveat on the constant's derivation: 1650 was taken from arm D and then checked against arm A, and both
+"predicted" figures are hand-computed from memplan's terms rather than read from
+`sub0_cuda_train_predicted_mb`. The agreement to ~3 MiB is better than that method deserves, so treat
+1650 as a good working number pending 3b's checkpointed measurement — not as a validated constant.
+
 ### 3b. Measure the runtime overhead precisely, don't guess a constant
 
 `cudaMemGetInfo` sampled at defined checkpoints attributes the non-ours bytes exactly:
@@ -129,11 +169,28 @@ Check this BEFORE `train_reserve`, because on WDDM the allocation will succeed r
 (A/B arm comparability) must warn rather than clamp — silently changing the batch would invalidate the
 comparison, which is a worse failure than a slow run.
 
-### 3d. Detect the spill itself
+### 3d. Detect the spill itself — and the baseline that makes "shared > 0" the WRONG test
 
-`\GPU Adapter Memory(*)\Shared Usage` (Windows perf counter) reports migrated bytes directly. Sampling it
-once at startup and at each eval turns "mysteriously slow" into a named diagnosis. Complementary driver-
-side control: **NVIDIA Control Panel → Manage 3D settings → Program Settings → CUDA – Sysmem Fallback
+`\GPU Adapter Memory(*)\Shared Usage` (and its per-process sibling `\GPU Process Memory(*)`) reports
+shared-memory bytes, but **non-zero shared usage is NORMAL and is not a spill**. Measured: arm A runs with
+74 MiB shared while holding 464 MiB of dedicated FREE, at 111,642-111,693 tok/s against its own clean
+baseline of 111,948-111,976 — **within 0.3%, i.e. no spill at all**. That ~74 MiB is pinned/staging and
+WDDM command buffers, present as soon as any CUDA process runs.
+
+Using `shared > 0` as the alarm therefore fires on every healthy run. The signal is:
+
+```
+  spill  <=>  dedicated_free ~= 0  AND  shared >> ~74 MiB baseline
+```
+
+Arm D fits: 7793 MiB dedicated of ~7891 usable (free ~0) with 718 MiB shared, i.e. ~644 MiB of REAL
+migration once the baseline is subtracted — and a 2.7x throughput collapse to confirm it. Arm A fits
+neither clause.
+
+**Throughput against a known-clean baseline is the ground truth**; the counters are supporting evidence.
+An alarm should require the memory condition AND corroborate with a rate drop before naming it a spill.
+
+Complementary driver-side control: **NVIDIA Control Panel → Manage 3D settings → Program Settings → CUDA – Sysmem Fallback
 Policy → "Prefer No Sysmem Fallback"** makes the allocation FAIL instead of migrating, which the existing
 clamp path already handles. Requires driver 536+; this host is on 596.36.
 
