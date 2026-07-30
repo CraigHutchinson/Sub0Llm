@@ -17,6 +17,35 @@ unit" smell does **not** bite here — but note that the general concern is real
 paper, the **Power Scheduler**, whose title is literally "A Batch Size and Token Number Agnostic Learning
 Rate Scheduler". The smell is well-founded even though this instance is safe.
 
+## Reference point: DeepSeek-V4 (the current de facto)
+
+`DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence` (arXiv 2606.19348), V4-Pro and
+V4-Flash pretrained on 33T / 32T tokens. Three details matter here, and two of them temper the
+recommendation below rather than reinforcing it.
+
+**Schedule.** Peak LR 2.7e-4 (Flash) / 2.0e-4 (Pro), held, then **decayed by a COSINE schedule in the
+final stretch** to 2.7e-5 / 2.0e-5. Two corrections to the naive WSD reading:
+
+* the cooldown is **cosine, not linear**;
+* it decays to **10% of peak, not to ~0** — the same 10% floor Chinchilla used. A decay-to-zero proposal
+  is *not* what the de facto reference does.
+
+The shape is still stable-then-cooldown, i.e. WSD-family, so Finding 1 stands; but if this project adopts
+it, copy V4's form (cosine, floor at 10%) rather than the textbook linear-to-zero.
+
+**Optimizer — and this project is already aligned.** V4 uses **Muon for the majority of parameters and
+AdamW for the embedding module, the prediction head, and all RMSNorm weights**. That is essentially
+Sub0Llm's existing hybrid Muon(matrices) + AdamW(everything else) split. Worth knowing the arrangement
+arrived at here independently matches the current reference implementation.
+
+**The caveat that most affects the plan below.** V4 reports Muon gives *"reduced sensitivity to learning
+rate schedule hyperparameters"*. Since Sub0Llm already runs Muon on the matrices, the inverse-sqrt-vs-WSD
+gap should matter **less here than for an AdamW-only run** — which lowers the expected payoff of the
+change and strengthens the case for A/B-ing it rather than adopting it on authority.
+
+**Not applicable at this scale**, but noted: V4 extends sequence length progressively (4K → 16K → 64K →
+1M) and warms up with dense attention for the first 1T tokens before switching on sparse attention.
+
 ## Finding 1: inverse-sqrt is not current practice — WSD is
 
 **Warmup-Stable-Decay** (warmup, then a long *constant* phase, then a short sharp decay) is the 2025-26
@@ -68,10 +97,18 @@ against practice, not toward it.
 
 ## Proposed change, and why it must wait
 
-Replace inverse-sqrt with **WSD**: warmup (unchanged) → constant at peak → short linear decay to ~0
-triggered by the plateau detector instead of by a step count. This addresses Findings 1 and 2 together:
-the constant phase is the "moderate decay" remedy for epoch down-weighting, and the cooldown supplies the
-anneal the models currently never get.
+Replace inverse-sqrt with a **DeepSeek-V4-shaped schedule**: warmup (unchanged) → constant at peak →
+**cosine cooldown to 10% of peak**, triggered by the plateau detector instead of by a step count. This
+addresses Findings 1 and 2 together: the constant phase is the "moderate decay" remedy for epoch
+down-weighting, and the cooldown supplies the anneal the models currently never get.
+
+Follow V4's form specifically — cosine, floored at 10% of peak — not the textbook linear-to-zero. The
+floor is what the de facto reference actually ships.
+
+Expected payoff is **lower here than the literature headline**, because V4 reports Muon reduces LR-schedule
+sensitivity and this project already runs Muon on the matrices. That is a reason to A/B it, not a reason
+to skip it: the cooldown claim is about a phase this project never runs at all, which is a different thing
+from being less sensitive to the shape of a decay you are already doing.
 
 **Do not land this mid-sweep.** It changes every arm's optimization trajectory, so it would invalidate the
 LoopSplit comparison outright. It is also a good candidate for its own A/B afterwards — inverse-sqrt vs
@@ -80,6 +117,7 @@ this project's standing policy is to measure rather than adopt on authority.
 
 ## Sources
 
+* [DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence](https://arxiv.org/pdf/2606.19348)
 * [Power Scheduler: A Batch Size and Token Number Agnostic LR Scheduler](https://arxiv.org/pdf/2408.13359)
 * [How Learning Rate Decay Wastes Your Best Data in Curriculum-Based LLM Pretraining (ICLR 2026)](https://arxiv.org/abs/2511.18903)
 * [Understanding Warmup-Stable-Decay: A River Valley Loss Landscape Perspective](https://arxiv.org/pdf/2410.05192)
