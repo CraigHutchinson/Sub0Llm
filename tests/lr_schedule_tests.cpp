@@ -124,3 +124,19 @@ TEST_CASE("lr: a fixed-budget run's anneal lands exactly on its final step", "[l
     REQUIRE(near(lr_at(start, kPeak, kWarm, start, len), kPeak));
     REQUIRE(near(lr_at(max_steps, kPeak, kWarm, start, len), static_cast<float>(FLOOR_FRACTION)));
 }
+
+TEST_CASE("lr: a budget that ends inside warmup never anneals -- warmup wins", "[lr]") {
+    // Found by the TinyStories smoke run: a 200-step budget against a 1129-step warmup announced a
+    // "cosine cooldown from step 150" that could never fire, because lr_at() checks `step < warmup`
+    // first and warmup correctly takes precedence. The MATH was right; the caller's announcement was
+    // not. This pins the math so the caller's fix has something to be consistent with.
+    const long warmup = 1129, budget = 200;
+    const long len = cooldown_steps_for(budget);          // what the naive scheduling would have picked
+    const long start = budget - len;
+    REQUIRE(start < warmup);                              // the premise: the "cooldown" sits inside warmup
+    for (long s = start; s <= budget; ++s) {
+        // Still on the warmup ramp at every step, rising -- never annealing.
+        REQUIRE(near(lr_at(s, kPeak, warmup, start, len),
+                     kPeak * (static_cast<float>(s) / static_cast<float>(warmup))));
+    }
+}

@@ -1968,10 +1968,33 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cooldown_steps = sub0::lr::cooldown_steps_for(max_steps);
         if (cooldown_steps >= max_steps) cooldown_steps = max_steps / 2;   // tiny budgets: still anneal, but keep a stable phase
         rs.cooldown_start = max_steps - cooldown_steps;
-        sub0::log::info("lr: WSD -- warmup {} steps, stable at {:.2e}, cosine cooldown from step {} to "
-                        "{:.2e} over the last {} of {} steps",
-                        lr_warmup_steps, static_cast<double>(peak_lr), rs.cooldown_start,
-                        static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION, cooldown_steps, max_steps);
+        // A budget that ends at or before the end of warmup never reaches the stable phase, so it never
+        // anneals: lr_at() checks `step < warmup` FIRST and warmup correctly wins. Announcing a cooldown
+        // in that case describes a schedule the run will not follow -- caught by the TinyStories smoke
+        // run, where a 200-step budget against a 1129-step warmup printed "cosine cooldown from step
+        // 150" that could never fire. Say what will actually happen instead.
+        if (max_steps <= lr_warmup_steps) {
+            sub0::log::warn("lr: the {}-step budget ENDS DURING WARMUP ({} steps), so this run stays on "
+                            "the warmup ramp -- no stable phase and NO cooldown. lr rises to {:.2e} and "
+                            "stops there. Fine for a smoke test; for a real run raise the budget past "
+                            "warmup.", max_steps, lr_warmup_steps,
+                            static_cast<double>(peak_lr) * static_cast<double>(max_steps) /
+                                static_cast<double>(lr_warmup_steps));
+            rs.cooldown_start = -1;                    // nothing to schedule; keep the state honest
+            cooldown_steps = 0;
+        } else {
+            // Never let the anneal start before warmup ends -- otherwise a budget only slightly longer
+            // than warmup would schedule a cooldown that warmup silently overrides for part of its span.
+            if (rs.cooldown_start < lr_warmup_steps) {
+                rs.cooldown_start = lr_warmup_steps;
+                cooldown_steps = max_steps - rs.cooldown_start;
+            }
+            sub0::log::info("lr: WSD -- warmup {} steps, stable at {:.2e}, cosine cooldown from step {} "
+                            "to {:.2e} over the last {} of {} steps",
+                            lr_warmup_steps, static_cast<double>(peak_lr), rs.cooldown_start,
+                            static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION, cooldown_steps,
+                            max_steps);
+        }
     } else if (rs.cooldown_start >= 0) {
         // Resuming a plateau-triggered cooldown: reconstruct its length from the single persisted field
         // via the same pure function the trigger used -- one source of truth, nothing to drift.
