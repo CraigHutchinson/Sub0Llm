@@ -328,12 +328,44 @@ Marginal gain per epoch roughly halves late in the run (~0.019/ep at 3-4 ep, ~0.
 is therefore well-conditioned here, and X is a compute-vs-quality decision that can be stated honestly
 rather than a threshold pretending to detect a physical plateau.
 
-### What this does NOT establish
+### What this does NOT establish — READ BEFORE USING ANY NUMBER ABOVE
 
-Every number above comes from ONE corpus (cosmopedia) at ONE model scale, and three of the four series
-are only 14 evals long because the detector truncated them. The unbounded TinyStories control in §4b is
-still required — it tests whether the `DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0` ledger is observation or
-detector artifact, which nothing here can answer.
+**Every one of these trajectories was produced under the INVERSE-SQRT SCHEDULE, which has now been
+deleted.** That is not a footnote, it is the dominant limitation, and it undercuts precisely the
+quantities a criterion would be calibrated on:
+
+* The LR was **falling monotonically** throughout every series. So the curves flatten for two reasons at
+  once — genuine saturation and a shrinking step size — and nothing here separates them. Measured on arm
+  A earlier: improvement fell to 0.35x while LR fell to 0.66x, so a material part of the observed
+  flattening is schedule, not learning.
+* That makes Finding 4's diminishing-returns table (0.0537 / 0.0351 / 0.0159 / 0.0039) an artifact of a
+  decaying LR as much as of the model saturating. Under WSD's **constant** stable phase the late-run
+  slope should be *shallower-decaying* — the curve keeps a fixed step size instead of shrinking into the
+  floor — so those forgone-gain figures are a LOWER bound on what a constant-LR run would still have had
+  to give.
+* Finding 1 (noise ~0.002–0.004) is the one result that carries over cleanly: eval-to-eval scatter is a
+  property of the eval set and batch, not of the schedule.
+* Finding 2 (W=6 too short) carries over in DIRECTION but not in exact numbers — the signal-to-noise
+  argument holds for any schedule, but the specific epochs at which W=6 misfired are shape-dependent.
+
+The honest reading: §4c establishes that the CURRENT detector is broken (Findings 2 and 3 are about
+runs it truncated, which is schedule-independent evidence of the failure), and it establishes the noise
+floor. It does **not** provide calibration data for the replacement.
+
+**Therefore the criterion redesign is PARKED until a WSD-era trajectory exists.** The sequence:
+
+1. **TinyStories unbounded control (§4b)** — fast smoke check, and it still answers whether
+   `DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0` is an observation or a detector artifact.
+2. **Arm A rerun under the full breaking-change set** (schemeV5 tokenizer + WSD + no detector stop),
+   **manually monitored** rather than auto-stopped, to capture a real constant-LR trajectory to and past
+   its true plateau. That run is the calibration dataset.
+3. **Synthetic trajectories with a KNOWN ground-truth plateau** for the unit tests — a real trace tells
+   you what the curve looks like, but only a synthetic one lets a test assert "the detector fired within
+   N evals of the true knee", because only there is the true knee known. Both are needed: real data to
+   choose the criterion, synthetic data to pin it.
+
+Also still true, and independent of the above: one corpus (cosmopedia), one model scale, and three of
+the four series are only 14 evals long *because the detector truncated them*.
 
 ## 5. Candidate mechanisms, to be narrowed
 
