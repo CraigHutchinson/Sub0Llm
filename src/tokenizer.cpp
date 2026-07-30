@@ -904,8 +904,23 @@ bool deserialize(Tokenizer& out, std::istream& is) {
     auto ru16 = [&] { std::uint16_t v{}; is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     auto rf32 = [&] { float v{};         is.read(reinterpret_cast<char*>(&v), sizeof v); return v; };
     if (ru32() != 0x46543053u) return false;  // "S0TF" (a pre-Stage-2 "S0TE" file is rejected, not misread)
-    (void)ru32();  // kSchemeVersion: nothing to branch on yet (this build understands exactly one
-                    // version); read to keep the stream cursor aligned for the fields that follow.
+    // EXACT scheme match, no cross-version loading. This used to discard the version ("nothing to branch
+    // on yet -- this build understands exactly one version"), which was true when only one existed. It
+    // stopped being true at schemeV4, and the failure is SILENT rather than loud: V4 kept the marker set
+    // and n_base unchanged, so a V3 file passes the magic check, the n_base check and the base_symbol
+    // identity check below, and loads.
+    //
+    // What it then does is the problem. The trailing glue table is absent from a V3 file, so the loader
+    // falls back to the hardcoded floor -- but that floor IS casing::glue_default, i.e. the V4 D1 rule
+    // where `. , ; : ! ? %` glue to what precedes them. The ENCODER is V4 regardless. So a V3 vocab,
+    // learned when `word,` cost a TOK_JOIN, gets driven by an encoder that no longer emits one: the
+    // learned merges stop matching the token stream they were derived from. Nothing crashes; the model
+    // just trains on a worse tokenization. (An older comment here claimed such a file "still loads and
+    // encodes identically" -- it does not, and that is precisely the trap.)
+    //
+    // Rejecting is also what the clean break wants: schemeV4 invalidates every tokenizer.tok and every
+    // model by design, and every build dir still holds a stale V3 file that would otherwise load quietly.
+    if (ru32() != casing::kSchemeVersion) return false;
 
     Tokenizer t;
     t.vocab  = static_cast<int>(ru32());
@@ -956,8 +971,10 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         t.attested.insert(std::move(w));
     }
     if (!is) return false;
-    // v2 (schemeV4, D2): optional trailing per-byte glue table (see serialize). Absent in a legacy
-    // file -> the hardcoded floor, so an older tokenizer.tok still loads and encodes identically.
+    // v2 (schemeV4, D2): trailing per-byte glue table (see serialize). serialize() always writes it, and
+    // the version gate above now rejects any file from a scheme that did not, so a short/absent table
+    // here means a TRUNCATED file rather than an older one. The floor fallback is kept as defensive
+    // tolerance for that case -- it is no longer a cross-version compatibility path.
     t.glue = default_glue_table();
     char gt[256];
     if (is.read(gt, 256).gcount() == 256)

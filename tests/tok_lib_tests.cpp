@@ -494,6 +494,47 @@ TEST_CASE("deserialize rejects a stale pre-Stage-2 (S0TE) magic", "[tok][join]")
     REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
 }
 
+// A file from an OLDER SCHEME must be rejected on its version field, even though its magic still
+// matches. This is the schemeV3 -> V4 case specifically, and it is the dangerous one: V4 kept the magic
+// ("S0TF"), the marker set and n_base all unchanged, so a V3 file clears every OTHER guard -- magic,
+// n_base >= TOK_MARKER_COUNT, and the base_symbol[i]==i identity check. It loads.
+//
+// It then encodes WRONGLY rather than failing: a V3 file has no trailing glue table, so the loader falls
+// back to the hardcoded floor -- which is casing::glue_default, the V4 D1 rule. The encoder is V4 either
+// way. A V3 vocab learned when `word,` cost a TOK_JOIN would be driven by an encoder that emits none, so
+// the learned merges silently stop matching the stream they came from. Nothing crashes; the model just
+// trains on a worse tokenization, which is invisible until quality is compared.
+//
+// Constructed by rewriting the version field of a REAL serialized file rather than by hand-rolling a V3
+// blob: that keeps the test honest about which single field is doing the rejecting.
+TEST_CASE("deserialize rejects an older scheme version (V3 file, unchanged magic)", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::string blob = os.str();
+    REQUIRE(blob.size() >= 8);
+
+    // Sanity: the file really does carry the CURRENT scheme, so the rejection below is about the
+    // version and not about some unrelated malformation.
+    std::uint32_t ver = 0;
+    std::memcpy(&ver, blob.data() + 4, sizeof ver);
+    REQUIRE(ver == sub0::casing::kSchemeVersion);
+
+    const std::uint32_t prev = ver - 1;                       // the immediately-previous scheme
+    std::memcpy(blob.data() + 4, &prev, sizeof prev);
+    std::istringstream is(blob, std::ios::binary);
+    Tokenizer t2;
+    REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
+
+    // ...and a FUTURE version is rejected too: this build understands exactly one scheme, in both
+    // directions. Without this, a forward file would fall through to the floor the same way.
+    const std::uint32_t next = ver + 1;
+    std::memcpy(blob.data() + 4, &next, sizeof next);
+    std::istringstream is2(blob, std::ios::binary);
+    Tokenizer t3;
+    REQUIRE_FALSE(sub0::tok::deserialize(t3, is2));
+}
+
 // learn_bpe_analysis() is analysis-only (--dump-vocab's A/B + vocab-curve tool, never the runtime
 // word encoder -- see its own doc comment in tokenizer.hpp) but was previously untested in either
 // direction. Sanity-check it still produces a coherent BpeAnalysisVocab: some merges learned, the
