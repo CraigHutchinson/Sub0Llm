@@ -12,9 +12,14 @@ Arm D (d192, 16 executions, depth stride 4, batch 448) on an 8151 MiB card:
 ```
   measured, dGPU, mid-run:   7793 MiB dedicated  +  718 MiB SHARED (system RAM over PCIe)
   per-process:               sub0llm-train holds 7789 of the 7793 -- NOTHING else is on the dGPU
-  memplan train_resident:    6859 MiB
-  unexplained:              ~1650 MiB
+  memplan train_resident:    8227 MiB
+  unexplained:               ~280 MiB
 ```
+
+(The `memplan` figure read `6859` and the gap `~1650` in earlier revisions of this document. That was a
+hand-arithmetic error — it evaluated the logits chunk count as 33 where `logits_n_chunks` clamps it to 8,
+under-counting the largest single term by ~1354 MiB. See §3a-bis. The *spill* was real either way: 8227
+MiB does not fit an 8151 MiB card.)
 
 Two things were NOT the cause, both checked rather than assumed: other applications (the desktop is on
 the iGPU; `Display Active: Disabled` on the dGPU, and per-process counters show only the trainer), and
@@ -62,12 +67,16 @@ and the training loop's own periodic eval deliberately runs on the CPU
 training run. The remaining unmodelled owners are real but small (`ensure_bwd_stats` ~16 MiB — reserved up
 front by `train_reserve` — plus Muon, bindings, eval and decode buffers).
 
-That leaves the ~1650 MiB gap UNATTRIBUTED. It has now been mis-attributed twice (first to other
-processes' graphics allocations, then to eval scratch), so the remaining candidates are stated as
+That leaves a **~280 MiB** gap (not the ~1650 MiB an earlier revision claimed — see §3a-bis for why that
+figure was wrong and how it survived two checks). It has already been mis-attributed twice, first to other
+processes' graphics allocations and then to eval scratch, so the remaining candidates are stated as
 candidates, not conclusions: the CUDA primary context, the loaded module/fatbin (this `.cu` is ~5.8K lines
 of heavily templated kernels, so it is not small), the cuBLAS workspace, two captured CUDA graphs, and
-allocator granularity across ~80 allocations. **Do not guess a third time — run 3b's checkpointed
-`cudaMemGetInfo` sampling**, which attributes each of those exactly and costs one short run.
+allocator granularity across ~80 allocations. ~280 MiB is the right order of magnitude for that set, which
+is corroboration but not attribution. **Do not guess a third time — run 3b's checkpointed
+`cudaMemGetInfo` sampling**, which attributes each of those exactly and costs one short run. The urgency is
+lower than it looked, though: at 280 MiB the gap sits comfortably inside `kVramHeadroomMB = 512`, so this
+is now an accounting task rather than a correctness one.
 
 ### Host offload: why it does not help here
 
@@ -120,45 +129,71 @@ a matching model term is caught mechanically rather than by someone remembering.
 fix: today the correspondence is maintained by comment discipline alone, and the census above shows six
 places where it has already drifted.
 
-### 3a-bis. MEASURED: the runtime overhead is a FIXED ~1650 MiB
+### 3a-bis. MEASURED: the runtime overhead is ~280 MiB, and `kVramHeadroomMB = 512` is ADEQUATE
 
-Two independent shapes, measured on real runs, give the same delta between `memplan train_resident` and
-what the process actually holds (dedicated + shared):
+> **This section previously claimed the overhead was a fixed ~1650 MiB and that `kVramHeadroomMB` was
+> "wrong by a factor of ~3.2". Both claims were false, and acting on them would have crippled the batch
+> for no reason.** The retraction is kept in place rather than deleted because the *way* it was wrong is
+> the most transferable thing in this document — see the post-mortem at the end of this section.
+
+Two independent shapes, measured on real runs, against `memplan train_resident` computed correctly:
 
 | arm | shape | memplan predicted | measured total | delta |
 |---|---|---|---|---|
-| A | 16 exec, no depth, 9.66M | 5851 MiB | 7502 MiB | **+1651** |
-| D | 16 exec, depth stride 4, 7.23M | 6859 MiB | 8507 MiB | **+1648** |
+| A | 16 exec, no depth, 9.66M | 7219 MiB | 7502 MiB | **+283** |
+| D | 16 exec, depth stride 4, 7.23M | 8227 MiB | 8507 MiB | **+280** |
 
-`memplan + 1650 MiB` predicts the real footprint to within ~3 MiB on both. That the delta is CONSTANT
-across a 1 GiB difference in modelled scratch is the important part: it is fixed overhead, not something
-that scales with the model, which is consistent with its being CUDA context + cuBLAS workspace + the
-eval-path forward scratch (itself fixed, since `DEVICE_LOGITS_BUDGET_BYTES` caps it at 512 MiB
-regardless of model size) + allocator granularity.
+The delta is genuinely near-constant across a 1 GiB difference in modelled scratch — that finding
+survives. What changes is its magnitude: **~280 MiB, not ~1650**. That is the right scale for CUDA
+context + cuBLAS workspace + allocator granularity, and it no longer needs the eval-path forward scratch
+to explain it (which is just as well, since that scratch is not resident during training at all — the
+training step passes `full=false` and the periodic eval is CPU-side; see *Host offload* above).
 
-So `kVramHeadroomMB = 512` is not merely "too small" — it is wrong by a factor of ~3.2, and the right
-value is measurable rather than guessable. Until 3b lands, **1650 MiB is the empirical constant**, and
-the fit-check should be `memplan(batch) + 1650 <= free_vram`.
+So `kVramHeadroomMB = 512` comfortably covers the measured overhead with ~230 MiB of genuine slack. **It
+needed no change.** The fit check `memplan(batch) <= free_vram - 512` is sound, and `free_vram` is
+already measured post-context-creation (`sub0_cuda_free_vram_mb` forces the context with
+`cudaFree(nullptr)` before sampling), so the context cost is subtracted twice-over conservatively rather
+than being missed.
 
 Consequence for the arms, on this 8151 MiB card (~7891 MiB usable):
 
 ```
-  C shallow10        4790 + 1650 = 6440   comfortable
-  B loop10x6         5809 + 1650 = 7459   ~430 MiB spare
-  A deep16           5851 + 1650 = 7501   ~390 MiB spare -- CONFIRMED FINE (full speed, 464 MiB free)
-  D loop+depth4      6859 + 1650 = 8509   OVER by ~620 MiB -- REAL spill of ~644 MiB, 2.7x slowdown
-  E flat+depth4      5625 + 1650 = 7275   comfortable
+  A deep16           7219 + 283 = 7502   ~390 MiB spare -- CONFIRMED FINE (full speed, 464 MiB free)
+  D loop+depth4      8227 + 280 = 8507   OVER by ~620 MiB -- REAL spill of ~644 MiB, 2.7x slowdown
+  B / C / E                             REGENERATE -- see the note below; do not hand-adjust
 ```
 
-Only arm D exceeds the card, and the model's ~620 MiB over-commit matches the ~644 MiB actually migrated
-(718 measured minus the ~74 MiB baseline of 3d). Arm A, at ~390 MiB spare, runs at full speed — so the
-model is usable for planning once the constant is applied, and the marginal-looking arms are genuinely
-fine rather than merely lucky.
+Arm D's ~620 MiB over-commit matches the ~644 MiB actually migrated (718 measured minus the ~74 MiB
+baseline of 3d), so the model is trustworthy for planning. With `-DSUB0_LOGITS_MAX_CHUNKS=32` arm D's
+logits term drops 1806 → 452 MiB, putting it at ~7153 MiB — ~740 MiB inside the card.
 
-Caveat on the constant's derivation: 1650 was taken from arm D and then checked against arm A, and both
-"predicted" figures are hand-computed from memplan's terms rather than read from
-`sub0_cuda_train_predicted_mb`. The agreement to ~3 MiB is better than that method deserves, so treat
-1650 as a good working number pending 3b's checkpointed measurement — not as a validated constant.
+The B/C/E rows are deliberately blank. Their old values came from the same hand-arithmetic that produced
+the retracted table, and "correct them by adding the delta" would repeat the mistake in the other
+direction. Regenerate them with `sub0llm memplan` in each arm's build dir, which reads the itemized terms
+from `memplan::train_scratch_terms` directly.
+
+#### Post-mortem: how a 4x error survived two independent checks
+
+The old table's "predicted" column was hand-computed from memplan's terms, and the hand computation
+evaluated `ceil(vocab/d_ff)` as 33 while `logits_n_chunks` clamps it to `[1, LOGITS_MAX_CHUNKS]` = 8. That
+under-counted the largest single scratch term by ~1354 MiB. Applying the *same* error to both shapes
+inflated both deltas by the *same* amount — which is exactly why they agreed to 3 MiB and why that
+agreement read as corroboration. Two checks with one shared error are one check.
+
+The tell was recorded at the time and not chased: the original section closed with "the agreement to
+~3 MiB is better than that method deserves." A suspiciously good result from a method you have just
+described as unreliable is evidence about the method, not about the result.
+
+Three things changed so this class of error cannot recur silently:
+
+1. **`train_scratch_bytes` is itemized** (`memplan::ScratchTerms`). The total was previously all memplan
+   exposed, which is *why* the census had to be recomputed by hand. Terms are now the reviewable unit.
+2. **The census is generated, not transcribed.** Any figure in this document that a formula can produce
+   should be produced by the formula. The clamp truncation, the logits MiB, and its share of scratch are
+   now computed by `[frontend][memplan]` tests, which print `4.125x truncation, 1805.56 MiB, 22.27% of
+   scratch` and name the `-DSUB0_LOGITS_MAX_CHUNKS` value the shape needs.
+3. **The clamp is loud when it binds.** A shape whose derived chunk count is truncated more than 2x now
+   raises a test WARN naming the remedy, rather than being discoverable only as a spilled run.
 
 ### 3b. Measure the runtime overhead precisely, don't guess a constant
 
@@ -259,3 +294,89 @@ to comfortably inside it — and the larger half of that costs no precision.
 
 The per-execution checkpoints (2716 MiB, 40%) are inherent to a 16-execution arm and are not a lever
 without changing the experiment.
+
+## 5. Architecture: memplan is a DEVICE census wearing a backend-agnostic name
+
+`memplan.hpp` opens by describing itself as a "pure, backend-agnostic device-memory footprint model". The
+*purity* claim is true and valuable — it includes no CUDA headers and takes explicit `Dims`, which is what
+lets the configurator reason about memory before a device exists. The *backend-agnostic* claim is not:
+every term in `persistent_bytes` / `train_scratch_terms` / `fwd_scratch_bytes` mirrors one specific
+allocator, `backend_cuda.cu`'s. Under `ComputeBackend::Cpu` the numbers it produces describe memory that
+is never allocated; under `Hybrid` they describe one half of the picture.
+
+This is not a hypothetical gap, because **a second footprint model already exists** — `calc_act_cap()` at
+`backend_cpu.cpp:84`. It does structurally the same job (enumerate per-execution activation terms from the
+config) and the two share no vocabulary at all:
+
+| | GPU — `memplan.hpp` | CPU — `backend_cpu.cpp:84-112` |
+|---|---|---|
+| form | `constexpr` of a **`Dims` parameter** | `consteval` of the **baked** constants |
+| can answer "what if?" | yes — this is why the configurator can clamp a batch | **no** — it only ever describes this build |
+| unit | bytes, itemized by buffer group | floats, one scalar (`ACT_CAP`) |
+| scope | whole training step at a given batch | one window (`T`), one worker |
+| unmodelled slack | `kVramHeadroomMB = 512`, external and named | `* 3 / 2 + 8192`, baked into the constant |
+| validated against reality | yes — `sub0_cuda_train_footprint`, tolerance-gated in CI | **no** |
+| concurrency | N/A (one device arena) | **absent** — `ACT_CAP` is *per worker thread* |
+
+Three consequences worth acting on, in descending order of how wrong the current answer is:
+
+1. **The CPU footprint report is thread-blind.** `print_config()` (`backend_cpu.cpp:1597`) prints
+   `2 * ACT_CAP * sizeof(float)` as "acts", which is *one* worker's value and grad arenas. Real host
+   activation memory is `threads × that` — an 8× under-report on this host's 8 P-cores. The params figure
+   (`4 * PARAM_FLOATS`) is correct and shared, so the two halves of one line disagree about what they
+   are counting.
+2. **The CPU side has no host-RAM budget check.** `apply_autosize` takes a `vram_budget` and there is no
+   host equivalent, so a CPU or Hybrid run has nothing analogous to `max_batch_for_vram` — no clamp, no
+   configure-time hard failure. The GPU path's guard exists because that path OOMs loudly; the CPU path
+   is protected only by the `act_used + n > ACT_CAP` abort at `backend_cpu.cpp:167`, which fires at
+   *runtime*, after the shape is already baked.
+3. **Hybrid is modelled nowhere.** Hybrid source-routes windows between backends, so host and device each
+   hold a working set sized by their *share* of the batch. Neither model takes a split fraction, so
+   neither total is right in Hybrid mode, and the fit question — two simultaneous constraints — is not
+   asked at all.
+
+### 5a. The proposed shape
+
+The seam that already exists is correct and should be made explicit rather than replaced: `Dims`,
+`param_floats`, `d_kv`, `qkv_stride` are genuinely backend-independent *shape* math. What needs separating
+is shape math from a per-backend allocation census:
+
+```
+sub0::memplan
+  Dims, param_floats, d_kv, qkv_stride, qk_pre_stride    // shape -- shared, unchanged
+  struct Terms { ... total(); }                           // ONE itemized shape, every backend
+  namespace device {  persistent_bytes, train_scratch_terms, fwd_scratch_bytes, max_batch_for_vram  }
+  namespace host   {  param_bytes, worker_bytes, train_resident_bytes(dims, batch, threads)         }
+```
+
+Two properties make this worth doing rather than just tidier:
+
+* **Consumers become backend-agnostic.** `sub0llm memplan` currently reports a GPU plan on a CPU-only
+  build; with a common `Terms` shape it reports whichever census matches `COMPUTE_MODE`, and Hybrid
+  reports both plus the split.
+* **The CPU census inherits the GPU census's honesty mechanism.** `train_scratch_terms` is trustworthy
+  because `sub0_cuda_train_footprint` measures the real delta and CI fails on drift. A `Dims`-parameterized
+  host model can be checked the same way against the arena high-water mark, which would replace
+  `ACT_CAP`'s `* 3 / 2` fudge with counted terms — the same move that made `kVramHeadroomMB` defensible.
+
+### 5b. What is justified now, and what is not
+
+Deliberately staged, because the rename touches `configurator.cpp`, `train_stage.cpp`, `config_util.hpp`,
+`backend_cuda.cu` and four test files, and the LoopSplit sweep currently depends on those build directories
+reproducing bit-for-bit:
+
+* **Now, and independently landable:** make the host activation figure thread-aware. It is a wrong number
+  being printed today, the fix needs no new abstraction, and it does not touch the GPU path.
+* **Next, once the sweep's build dirs are free:** the `device::` / `host::` split. Pure namespacing plus a
+  `Terms`-shaped host census; no formula changes on the GPU side, so the footprint parity test is the
+  regression gate for the whole move.
+* **Not yet — no consumer:** a host-RAM `max_batch_for_host` clamp, and the Hybrid split model. Both are
+  real gaps, but adding either before something reads it would be a knob nothing consumes (`AGENTS.md`
+  §8). The trigger for the host clamp is a CPU/Hybrid training run that actually hits the `ACT_CAP` abort
+  or the d768-class host limit; the trigger for the Hybrid model is a Hybrid run at a batch large enough
+  for the split to matter.
+
+The honest summary: the GPU half of this is well modelled and now itemized and tested; the CPU half is a
+build-fixed scalar with a fudge factor and no validation; the Hybrid half does not exist. That ordering
+matches where the GPU-hours have gone, so it is a reasonable place to have arrived — but the naming should
+stop implying otherwise, and it now does not.
