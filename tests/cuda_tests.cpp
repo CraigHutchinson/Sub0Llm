@@ -9,6 +9,7 @@
 
 #include "sub0/blend.hpp"     // doc_of -- the hybrid router's own per-window document resolution
 #include "sub0/core.hpp"     // trainable_floats()
+#include "sub0/decode.hpp"   // gpu_decode_try_enable -- must honour the supports_decode cap
 #include "sub0/eval.hpp"     // sub0::eval -- the consumer under test for the device eval seam
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
@@ -1943,6 +1944,25 @@ TEST_CASE("CUDA binding-compose: doc_of-resolved bindings across multiple window
 // grad-clip scale is computed on-device (grad_clip_scale_kernel, 2026-07) instead of a host
 // round-trip, so "adam" no longer carries that bubble -- this profile is how the ~10% drop in the
 // adam phase's elapsed time was confirmed.
+// The caps struct exists so consumers degrade around a MISSING capability instead of being driven into
+// an unimplemented path. supports_decode became conditional when depth attention landed: training and
+// batched inference/eval support it, the single-token decode path does not. This pins both halves --
+// that the bit tells the truth, and that the decode consumer actually reads it.
+//
+// Regression test for a real defect, not a hypothetical: gpu_decode_try_enable() gated only on HAS_CUDA
+// plus init success, so on a depth-attention build `sub0llm report` would have driven its sample battery
+// straight into forward_one_device's refusal -- mid-run, at the first eval, not at an explicit `gen`.
+TEST_CASE("CUDA caps: supports_decode is honest, and the decode consumer honours it", "[cuda]") {
+    REQUIRE(sub0_dev_caps().supports_decode == (DEPTH_ATTN_STRIDE == 0 ? 1 : 0));
+    if constexpr (sub0::USE_DEPTH_ATTN) {
+        // Must return false WITHOUT touching the device -- the point is that no decode call is made.
+        REQUIRE(sub0::gpu_decode_try_enable() == false);
+    }
+    // Whatever decode reports, the paths depth attention DOES implement stay advertised.
+    REQUIRE(sub0_dev_caps().supports_train == 1);
+    REQUIRE(sub0_dev_caps().supports_eval  == 1);
+}
+
 TEST_CASE("CUDA per-phase profile attributes the step (forward/backward/adam)", "[cuda][.bench]") {
     CudaGuard _cuda_guard;
     double f = 0.0, b = 0.0, a = 0.0;

@@ -163,7 +163,12 @@ inline Sub0DeviceCaps sub0_dev_caps() {
     // CPU evaluate") ran green -- an eval that silently disagreed with the CPU number would corrupt
     // every A/B comparison scored with it, and a mean nelbo is exactly where a small systematic
     // difference hides.
-    return { "cuda", /*train=*/1, /*eval=*/1, /*decode=*/1, /*interception=*/0,
+    // supports_decode is CONDITIONAL (2026-07-30): the single-token decode path does not implement
+    // depth attention (backend_cuda.cu's forward_one_device -- training and batched inference do), so a
+    // depth-attention build must report 0 and let every decode consumer degrade to the CPU. Reporting a
+    // capability the backend does not have is the one thing this struct exists to prevent; it is also
+    // what `report`'s sample battery would otherwise trip over mid-run, not just an explicit `gen`.
+    return { "cuda", /*train=*/1, /*eval=*/1, /*decode=*/!sub0::USE_DEPTH_ATTN, /*interception=*/0,
              /*binding_compose=*/1, /*opt_state=*/1, /*tf32=*/1 };
 }
 [[nodiscard]] inline int  sub0_dev_init()                       { return sub0_cuda_init(); }

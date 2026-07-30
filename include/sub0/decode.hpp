@@ -43,6 +43,12 @@ namespace sub0 {
 // undoing most of the speedup (see DecodeSession below, the RAII form of exactly that pattern).
 inline bool gpu_decode_try_enable() {
     if (!HAS_CUDA) return false;   // short-circuits the (harmless but pointless) stub call otherwise
+    // Honour the caps bit rather than assuming a linked backend decodes. docs/BACKENDS.md states
+    // consumers "are DESIGNED to degrade around zeros", but this one did not read supports_decode at
+    // all -- so a backend with train+eval but no decode (which the CUDA backend became once depth
+    // attention landed) would have been driven straight into its unimplemented path. Cheap here, and it
+    // is what makes `report` work on such a build: its sample battery silently uses the CPU instead.
+    if (!sub0_dev_caps().supports_decode) return false;
     if (sub0_dev_init() != 0) return false;
     sub0_dev_set_tf32(0);   // tight FP32 inference math, matching the CUDA parity test's gate
     return sub0_dev_upload_params(sub0::params_ptr()) == 0;
