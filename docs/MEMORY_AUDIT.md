@@ -16,10 +16,9 @@ Arm D (d192, 16 executions, depth stride 4, batch 448) on an 8151 MiB card:
   unexplained:               ~280 MiB
 ```
 
-(The `memplan` figure read `6859` and the gap `~1650` in earlier revisions of this document. That was a
-hand-arithmetic error — it evaluated the logits chunk count as 33 where `logits_n_chunks` clamps it to 8,
-under-counting the largest single term by ~1354 MiB. See §3a-bis. The *spill* was real either way: 8227
-MiB does not fit an 8151 MiB card.)
+(Earlier revisions reported a much smaller `memplan` figure and a correspondingly larger gap, from a
+hand-arithmetic error since removed — see §3a-bis. The *spill* was real either way: 8227 MiB does not fit
+an 8151 MiB card.)
 
 Two things were NOT the cause, both checked rather than assumed: other applications (the desktop is on
 the iGPU; `Display Active: Disabled` on the dGPU, and per-process counters show only the trainer), and
@@ -67,8 +66,7 @@ and the training loop's own periodic eval deliberately runs on the CPU
 training run. The remaining unmodelled owners are real but small (`ensure_bwd_stats` ~16 MiB — reserved up
 front by `train_reserve` — plus Muon, bindings, eval and decode buffers).
 
-That leaves a **~280 MiB** gap (not the ~1650 MiB an earlier revision claimed — see §3a-bis for why that
-figure was wrong and how it survived two checks). It has already been mis-attributed twice, first to other
+That leaves a **~280 MiB** gap. It has already been mis-attributed twice, first to other
 processes' graphics allocations and then to eval scratch, so the remaining candidates are stated as
 candidates, not conclusions: the CUDA primary context, the loaded module/fatbin (this `.cu` is ~5.8K lines
 of heavily templated kernels, so it is not small), the cuBLAS workspace, two captured CUDA graphs, and
@@ -131,10 +129,11 @@ places where it has already drifted.
 
 ### 3a-bis. MEASURED: the runtime overhead is ~280 MiB, and `kVramHeadroomMB = 512` is ADEQUATE
 
-> **This section previously claimed the overhead was a fixed ~1650 MiB and that `kVramHeadroomMB` was
-> "wrong by a factor of ~3.2". Both claims were false, and acting on them would have crippled the batch
-> for no reason.** The retraction is kept in place rather than deleted because the *way* it was wrong is
-> the most transferable thing in this document — see the post-mortem at the end of this section.
+> An earlier revision of this section reported a much larger overhead and concluded `kVramHeadroomMB`
+> needed raising. That was an arithmetic error, and the wrong figures have been **removed** rather than
+> retracted in place, so they cannot be quoted out of context. The method failure that produced them is
+> worth keeping and is written up as a post-mortem at the end of this section — without restating the
+> numbers.
 
 Two independent shapes, measured on real runs, against `memplan train_resident` computed correctly:
 
@@ -143,9 +142,8 @@ Two independent shapes, measured on real runs, against `memplan train_resident` 
 | A | 16 exec, no depth, 9.66M | 7219 MiB | 7502 MiB | **+283** |
 | D | 16 exec, depth stride 4, 7.23M | 8227 MiB | 8507 MiB | **+280** |
 
-The delta is genuinely near-constant across a 1 GiB difference in modelled scratch — that finding
-survives. What changes is its magnitude: **~280 MiB, not ~1650**. That is the right scale for CUDA
-context + cuBLAS workspace + allocator granularity, and it no longer needs the eval-path forward scratch
+The delta is near-constant across a 1 GiB difference in modelled scratch, and **~280 MiB** is the right
+scale for CUDA context + cuBLAS workspace + allocator granularity — it no longer needs the eval-path scratch
 to explain it (which is just as well, since that scratch is not resident during training at all — the
 training step passes `full=false` and the periodic eval is CPU-side; see *Host offload* above).
 
@@ -190,29 +188,33 @@ original audit term by term** — every term the hand census got right, it got r
 one was wrong:
 
 ```
-  per-execution checkpoints    2716 MiB (38.5%)  x16 executions     audit said 2716  ✓
-  final block + singles        1121 MiB (15.9%)                     audit said 1121  ✓
-  logits [chunk_rows,V]        1806 MiB (25.6%)  8 chunks            audit said  438  ✗ (4.1x low)
-  backward gradients           1289 MiB (18.3%)                     audit said 1289  ✓
-  qk-norm pre-stash             126 MiB ( 1.8%)                     audit said  126  ✓
+  per-execution checkpoints    2716 MiB (38.5%)  x16 executions     hand census agreed
+  final block + singles        1121 MiB (15.9%)                     hand census agreed
+  logits [chunk_rows,V]        1806 MiB (25.6%)  8 chunks           hand census WRONG (the clamped term)
+  backward gradients           1289 MiB (18.3%)                     hand census agreed
+  qk-norm pre-stash             126 MiB ( 1.8%)                     hand census agreed
   NOTE: chunk count CLAMPED 4x (wants 33, capped at 8). -DSUB0_LOGITS_MAX_CHUNKS=33 saves 1368 MiB.
 ```
 
-`5809 + 1368 = 7177` exactly — the whole discrepancy was the one clamped term, which is why the old
-delta looked like a clean constant. The `NOTE` line is emitted by the tool, so the next shape whose cap
-truncates says so before any GPU time is spent on it.
+Four of five terms agreed exactly; the entire discrepancy was the one term with a hidden clamp. That is
+why the old delta looked like a clean fixed constant — a single term short by the same amount in every
+shape is indistinguishable from constant overhead until you itemize. The `NOTE` line is emitted by the
+tool, so the next shape whose cap truncates says so before any GPU time is spent on it.
 
-#### Post-mortem: how a 4x error survived two independent checks
+#### Post-mortem: how the error survived two independent checks
 
-The old table's "predicted" column was hand-computed from memplan's terms, and the hand computation
-evaluated `ceil(vocab/d_ff)` as 33 while `logits_n_chunks` clamps it to `[1, LOGITS_MAX_CHUNKS]` = 8. That
-under-counted the largest single scratch term by ~1354 MiB. Applying the *same* error to both shapes
-inflated both deltas by the *same* amount — which is exactly why they agreed to 3 MiB and why that
-agreement read as corroboration. Two checks with one shared error are one check.
+The old figures were hand-computed from memplan's terms, and the hand computation evaluated
+`ceil(vocab/d_ff)` directly while `logits_n_chunks` clamps that ratio to `[1, LOGITS_MAX_CHUNKS]`. The
+clamp was invisible in the formula as written, so the largest single scratch term was under-counted.
 
-The tell was recorded at the time and not chased: the original section closed with "the agreement to
-~3 MiB is better than that method deserves." A suspiciously good result from a method you have just
-described as unreliable is evidence about the method, not about the result.
+**Two checks with one shared error are one check.** The same mistake applied to two different shapes
+shifted both results by the same amount, so they agreed closely — and that agreement read as independent
+corroboration when it was nothing of the kind. Cross-checking a method against itself proves consistency,
+not correctness.
+
+The tell was recorded at the time and not chased: the original text closed with *"the agreement is better
+than that method deserves."* A suspiciously good result from a method you have just called unreliable is
+evidence about the method, not about the result.
 
 Three things changed so this class of error cannot recur silently:
 
