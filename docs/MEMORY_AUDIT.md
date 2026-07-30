@@ -1,0 +1,150 @@
+# Device memory: a full allocation census, and how to keep it honest
+
+**Principle: no unexplained byte.** The device footprint should be predictable from the config alone, and
+any gap between "what memplan says" and "what the process holds" is a defect until explained — the same
+discipline `AGENTS.md` §4 applies to test counts, applied to VRAM. This document exists because a real
+run silently lost 2.7× throughput to a spill that no guard noticed.
+
+## 0. The incident that motivated this
+
+Arm D (d192, 16 executions, depth stride 4, batch 448) on an 8151 MiB card:
+
+```
+  measured, dGPU, mid-run:   7793 MiB dedicated  +  718 MiB SHARED (system RAM over PCIe)
+  per-process:               sub0llm-train holds 7789 of the 7793 -- NOTHING else is on the dGPU
+  memplan train_resident:    6859 MiB
+  unexplained:              ~1650 MiB
+```
+
+Two things were NOT the cause, both checked rather than assumed: other applications (the desktop is on
+the iGPU; `Display Active: Disabled` on the dGPU, and per-process counters show only the trainer), and
+power/thermal (60 °C; 35 W at 2370/3090 MHz is the signature of memory-stalled SMs, not a power cap).
+
+The failure was silent because **`cudaMalloc` succeeds on WDDM by migrating to shared system memory
+instead of failing**. `GpuTrainer::enable` only clamps the batch when `train_reserve` returns nonzero, so
+the guard never fired. On Linux this would have OOM'd and self-corrected.
+
+## 1. Allocation census
+
+Every `cudaMalloc` in `backend_cuda.cu`, by owner, with whether `memplan` models it. Test/self-test
+harness allocations are excluded (they free immediately and never coexist with training).
+
+| owner | buffers | modelled by |
+|---|---|---|
+| `upload_params` | `g_dev_params`, `g_dev_grad`, `g_dev_m`, `g_dev_vel`, `g_dev_normsq`, `g_dev_gs` | `persistent_bytes` ✅ |
+| `build_qkv_weights` | `g_w1_16`, `g_w2_16`, `g_wg16`, `g_wo16`, `g_wqkv16` (per layer) | `persistent_bytes` ✅ |
+| `wqkv_alloc` / `ensure_wqkv_f32` | `g_fwd.wqkv[l]` | `persistent_bytes` ✅ (F32 builds) |
+| `train_alloc` | the `g_tr.*` set, incl. depth cache + `v_own` | `train_scratch_bytes` ✅ |
+| `fwd_alloc(full=false)` | `g_fwd.dids` | `fwd_dids_bytes` ✅ |
+| **`fwd_alloc(full=true)`** | `g_fwd.h/a/qkv/att/proj/fbuf/ff1/gact/ff2/logits` **+ `depth_k/v`** | `fwd_scratch_bytes` — **and it does NOT include the depth cache** ❌ |
+| **`ensure_bwd_stats`** | `g_bwd_m`, `g_bwd_invZ`, `g_bwd_dot` — 3 × `batch·H·T` f32 | **unmodelled** ❌ |
+| **Muon** | `g_dev_muon_upd/bx/a/aa/ss` | **unmodelled** ❌ |
+| **`eval_alloc`** | `g_ev.targets/lengths/active/loss` | **unmodelled** ❌ (small, ~64 KiB) |
+| **`ensure_bind_hdr`** | `g_dev_bind`, `g_bind_roles` | **unmodelled** ❌ (small) |
+| **decode KV** | `g_kv_k`, `g_kv_v`, `g_decode_state` | **unmodelled** ❌ |
+| CUDA runtime | primary context, cuBLAS workspace, graph exec | out of scope for memplan, but **in scope for the budget** |
+
+Sizes at arm D's shape (M = 229,376 training rows):
+
+```
+  ensure_bwd_stats : 3 * 448*6*512 * 4 B                       ~=   16 MiB
+  decode KV        : 2 * 16*512*96 * 4 B                       ~=    6 MiB   (only once decode runs)
+  eval fwd scratch : device_batch caps logits at 512 MiB, so
+                     M_eval ~= 7758 rows -> ~578 MiB, of which
+                     logits alone is ~488 MiB                  ~=  578 MiB   <-- the big one
+```
+
+**The single largest unmodelled item is the eval-path forward scratch.** `train_resident_bytes` models a
+training step in isolation, but every real run also evaluates in-process, and `fwd_alloc(full=true)`
+allocates and RETAINS ~578 MiB alongside the training arenas from the first eval onward. A footprint
+model used to answer "does batch B fit?" must include it.
+
+## 2. Why cuBLAS is not the explanation
+
+Checked against the cuBLAS documentation rather than assumed
+(<https://docs.nvidia.com/cuda/cublas/index.html>):
+
+- Recommended workspace is **"NVIDIA Hopper Architecture (sm90): 32 MiB … Other: 4 MiB"**. This host is
+  sm_120, i.e. the 4 MiB bucket — tens of MiB at most, not hundreds.
+- `cublasStatus_t cublasSetWorkspace(cublasHandle_t handle, void *workspace, size_t workspaceSizeInBytes)`
+  lets us own and account for it. The pointer must be **256-byte aligned**.
+- **Gotcha that would silently undo it**: "Calling `cublasSetStream()` resets the workspace back to the
+  default pool." Any `cublasSetWorkspace` must therefore run AFTER the stream is bound, and again after
+  any later `cublasSetStream`.
+- `CUBLAS_WORKSPACE_CONFIG` accepts `:16:8` (documented as possibly limiting performance) or `:4096:8`.
+- `cublasLtMatmul` does not require a user workspace.
+
+Conclusion: **do not write our own GEMM** — the user's instinct is right that it is too costly, and the
+audit shows cuBLAS is not where the memory went. Owning the workspace via `cublasSetWorkspace` is still
+worth doing, but for *accounting* (a known, fixed, ledgered number) rather than for savings.
+
+## 3. Design: make the picture measurable, then keep it honest
+
+### 3a. An allocation ledger
+
+Route every device allocation through one accounted wrapper instead of raw `cudaMalloc`:
+
+```cpp
+  void* dev_alloc(const char* name, MemClass cls, size_t bytes);   // records (name, cls, bytes)
+  void  dev_free (void* p);                                        // removes it
+```
+
+`MemClass` = `Persistent | TrainScratch | FwdScratch | EvalScratch | DecodeKV | Diagnostic`. That gives a
+dump-on-demand ledger which can be **diffed against memplan term by term**, so a new buffer added without
+a matching model term is caught mechanically rather than by someone remembering. This is the structural
+fix: today the correspondence is maintained by comment discipline alone, and the census above shows six
+places where it has already drifted.
+
+### 3b. Measure the runtime overhead precisely, don't guess a constant
+
+`cudaMemGetInfo` sampled at defined checkpoints attributes the non-ours bytes exactly:
+
+```
+  t0 before any CUDA call        -> baseline
+  t1 after context creation      -> CUDA context cost
+  t2 after cublasCreate          -> handle cost
+  t3 after the first GEMM        -> workspace materialization
+  t4 after each alloc phase      -> should equal the ledger delta EXACTLY
+  t5 after graph capture         -> graph exec cost
+```
+
+Any t4 step where `free-memory delta != ledger delta` is allocator granularity/fragmentation, and it is
+then a measured number rather than a mystery. `kVramHeadroomMB = 512` should become **this measurement**,
+taken once at init, not a hardcoded guess — it is currently ~3× too small.
+
+Note the existing `sub0_cuda_train_footprint` measures the free-memory delta around `train_alloc` ONLY,
+which by construction excludes the context, cuBLAS and the eval scratch. That is why it can look accurate
+while the process total is ~1.65 GiB higher: **a scope gap, not a modelling error**. It also explains why
+`memplan-vram-prediction-gap-at-scale` recorded an OVER-estimate at d768 while this run shows an
+under-estimate — different measurement boundaries.
+
+### 3c. Budget against the right number, before reserving
+
+```
+  needed  = memplan train_resident + eval fwd scratch + measured runtime overhead
+  if (needed > free_vram) -> warn loudly (and clamp when the batch is not pinned)
+```
+
+Check this BEFORE `train_reserve`, because on WDDM the allocation will succeed regardless. A pinned batch
+(A/B arm comparability) must warn rather than clamp — silently changing the batch would invalidate the
+comparison, which is a worse failure than a slow run.
+
+### 3d. Detect the spill itself
+
+`\GPU Adapter Memory(*)\Shared Usage` (Windows perf counter) reports migrated bytes directly. Sampling it
+once at startup and at each eval turns "mysteriously slow" into a named diagnosis. Complementary driver-
+side control: **NVIDIA Control Panel → Manage 3D settings → Program Settings → CUDA – Sysmem Fallback
+Policy → "Prefer No Sysmem Fallback"** makes the allocation FAIL instead of migrating, which the existing
+clamp path already handles. Requires driver 536+; this host is on 596.36.
+
+## 4. Ranked levers, once the picture is honest
+
+| lever | saving at arm D's shape | note |
+|---|---|---|
+| eval scratch not resident during training | ~578 MiB | free it between evals, or size it from a smaller budget |
+| depth f32 gradient accumulators → bf16 | ~352 MiB | slot 0 takes contributions from up to 15 executions; parity is cos 0.99992 today, so measure before spending it |
+| depth stride 4 → 8 | ~525 MiB | changes the mechanism under test — not a free lever |
+| logits chunk (already 33×) | tunable | `logits_chunk_rows` is the knob |
+
+The per-execution checkpoints (2716 MiB, 40%) are inherent to a 16-execution arm and are not a lever
+without changing the experiment.
