@@ -257,6 +257,12 @@ std::string render_expansion(const std::vector<int>& codes) {
         // FIRST when chasing a suspected tokenizer bug. Marker ids auto-increment from TOK_EOS, so a
         // future marker added without a case here degrades to a visible `<|?NNN|>` instead of aliasing
         // onto some unrelated byte.
+        //
+        // NOTE for the schemeV4 tokenizer merge (feature/tokenizer-v2, queued): V4 changes the marker
+        // SET, so every marker it adds inherits exactly this trap. Keep this guard whatever ids V4
+        // picks, give each new marker its own case + TokenEntry::Kind, and expect the regression test
+        // "vocab: the EOS marker renders as itself..." (tests/engine_tests.cpp) to fail on the merge --
+        // that failure is the checkpoint forcing a conscious decision per marker, not breakage.
         if (code < 0 || code > 0xFF) {
             char b[16];
             std::snprintf(b, sizeof b, "<|?%d|>", code);
