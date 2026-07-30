@@ -87,7 +87,7 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #   lr_schedule_tests.cpp    — the WSD learning-rate schedule's boundary conditions (sub0/lr_schedule.hpp)
 #   casing_policy_tests.cpp  — HIDDEN [.casing]: measures the truecasing NAME policy against a real
 #                              corpus slice from data/. Not run by default (slow, needs the corpus).
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
+add_executable(sub0_frontend_tests tutorspike_tests.cpp tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)

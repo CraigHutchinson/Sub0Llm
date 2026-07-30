@@ -138,6 +138,140 @@ Three consequences for the ledger, all of which it should be built to answer rat
   (high level, velocity → 0 while the others are still moving), so it is the first thing that can
   confirm or falsify the surface, and it does not need the run to approach convergence to do it.
 
+## Repeated visits: one instrument, two curriculum arms
+
+Proposed in review: instead of one training visit per document, visit each document N times — either a
+warmup sweep of several cycles over the whole corpus, or a per-entry repeat count that varies through
+training. The stated motivation is the sharp part: **with two consecutive visits, the second reading is
+taken with no other document's training in between**, so it measures that entry's own learning rather
+than the drift that contaminates a reading taken many steps after the last visit.
+
+That is three separable ideas with very different risk, so they are recorded separately.
+
+### A. The back-to-back reading, as an instrument — adopt
+
+This is the right attack on the interference problem above, with one correction that makes it stronger
+rather than weaker.
+
+**It is not fully clean.** The update between the two readings is driven by the whole batch — ~448
+windows — so the model still moves under the entry because of its batch-mates. What changes is the
+*size* of the contamination: from "an unknown number of steps since this entry was last drawn" (at 36000
+documents, hundreds of steps) to **exactly one step**. And one step of drift is precisely what the
+never-trained probe set measures. So the decomposition becomes well-posed:
+
+```
+Δ_measured (own gradient + 1 step of drift)  −  Δ_probe (1 step of drift alone)  =  own learning
+```
+
+Two unknowns became one measurement and one control, which is what the raw revisit delta never was.
+
+**And it does not require repeating the training.** A forward-only re-score of the same batch
+immediately after the step yields the identical measurement without changing what training does — which
+keeps the whole of stage 2 read-only, the property TUTOR.md leads with. Cost: a forward is ~1/3 of a
+forward+backward, so ~+33% on the steps where it runs, and at a cadence of every 20th step ~1.7%
+overall. That is affordable in a way TUTOR.md's own cost risk ("if it needs extra forward passes it
+probably dies") suggested it would not be — because the pass is amortised over a cadence, not paid every
+step.
+
+Caveat to carry: a reading taken immediately after training on those exact tokens is **maximally**
+optimistically biased. TUTOR.md already notes the training loss is optimistic; back-to-back is the worst
+case of it. The probe set is held out and therefore unbiased, which is a second reason to have one.
+
+### B. A systematic coverage sweep instead of random draws — stage 4 arm
+
+Random window sampling gives Poisson coverage: after one epoch's worth of steps, roughly 1/e ≈ **37% of
+documents have never been drawn at all**. For a surface whose first job is to say where the model has
+and has not learned, "never visited" is a confound that is indistinguishable from "no velocity" unless
+the visit count is read alongside. A deterministic sweep removes it outright.
+
+Cheap and appealing, but it changes training order, so it is not stage 2. Stage 2 keeps random sampling
+and records `visits` per entry, which makes the confound *visible* — and quantifying how much of the
+early surface is zero-visit is itself the evidence for or against doing the sweep.
+
+### C. Multi-cycle per-document blocking, as a curriculum — defer, with a specific warning
+
+"Teach one topic, then the next" is the risky one, and **this repository has already been burned by the
+same shape**. `blend_schedule.hpp`'s header records it: a small source blended against a huge one got
+statistically re-covered every few steps, "hit a memorization phase-transition almost immediately, and
+its cratering loss contribution produced a visible cliff-then-plateau in the blended training loss while
+the base corpus was still a tiny fraction into its own first epoch — a real incident". Repeating a
+*single document* N times consecutively is a sharper version of that, not a milder one, and the
+tell-tale is identical: a collapsing training loss on the repeated entry that means memorization, not
+learning. Whatever else happens, this arm must be judged on held-out probes, never on its own training
+loss.
+
+**A finding worth recording separately, because it breaks an equivalence TUTOR.md relies on:** repeat
+count is *not* interchangeable with loss weight. TUTOR.md's implementation insight — that a per-entry
+learning rate is a per-entry loss weight, since gradient contribution scales linearly — holds for
+weighting, but N sequential steps at `lr` is not one step at `N·lr` under Adam: the optimizer's moment
+normalisation makes the two differ, and they diverge further the larger N gets. So repeats are a
+genuinely separate actuator with its own dynamics, not a reparameterisation of the one already planned.
+That is a reason to keep them out of the first weighting experiment rather than to skip them forever.
+
+## The reframe: transfer is a product, not an error term
+
+Raised in review after the drift-floor design above, and it changes what the ledger is *for*.
+
+The between-visit change was being treated as contamination to subtract. But an entry is not trained
+between its own visits, by definition — so whatever moved it came from **everything else**. Read on its
+own, that is a direct measurement of how the rest of the corpus acts on this document:
+
+* **moved down more than the corpus-wide floor** → other documents taught this one. Reinforcement,
+  redundancy, shared structure. It is being learned for free and may deserve *less* training.
+* **moved up** → conflict. Something else is competing for the same capacity and displacing it. That is
+  where more training is actually indicated, and no level-based rule and no velocity reading can see it —
+  velocity only observes what happens across an entry's own visits.
+
+Same measurement, two readings: the corpus-wide **mean magnitude** is the noise floor that bounds
+velocity, and each entry's **deviation from it** is that entry's relationship to the training set. The
+second may be the more valuable output of the whole exercise, because nothing in this project can
+currently see corpus structure at all — and unlike the weighting scheme, it is a pure diagnostic that
+needs no controller to be useful.
+
+Splitting the two needs exactly the reading already planned in **A** above, because the loss recorded at
+a visit is the training forward's, taken *before* that step's update:
+
+```
+own learning  =  nelbo_post(visit k)  −  nelbo(visit k)        its own gradient
+transfer      =  nelbo(visit k+1)     −  nelbo_post(visit k)   everything else's
+```
+
+Without the post reading the two terms stay summed and neither is recoverable — so `Surface::record`
+deliberately records **no** transfer at all when a post reading is absent, rather than attributing an
+interval that still contains the entry's own learning. That is pinned by a test, because silently
+attributing it is the failure that would look most plausible.
+
+`Entry` therefore carries `nelbo_post`, a running-mean `transfer`, and `global_mark`; transfer is
+normalised by **global** applied learning, not the entry's own, because the thing being attributed is
+everything else's training. 44 bytes/entry.
+
+## Stage 2 — the ledger
+
+`include/sub0/tutorspike.hpp` (surface, drift probe, manifest) + `src/tutorspike.cpp` (simdjson manifest
+parse, versioned sidecar persistence, snapshot writer). Engine-free, so all of its arithmetic is
+testable with no model — which matters because every way it can be wrong (a velocity normalised by the
+wrong denominator, a transfer term that quietly includes own learning, a dropped sign turning forgetting
+into mastery) still produces a plausible-looking heat map.
+
+Nine tests, all passing; frontend suite 181 → 190 cases, 114495 → 114523 assertions, no failures.
+
+Decisions worth recording:
+
+* **Persistence is a sidecar, not a `.ckpt` field.** TUTOR.md requires the surface to be restored
+  exactly or matched-arm A/Bs stop being matched — but adding a variable-length section to the
+  fixed-size checkpoint struct is the highest-blast-radius change in this codebase (AGENTS.md §3), and a
+  spike has no business stranding in-progress production runs to store state the mainline never reads.
+  Versioned, and a mismatch refuses to load rather than resuming against mismatched feedback state.
+* **The velocity mark threshold is scale-derived**, a multiple of what one typical visit applies, not a
+  constant. Recomputing velocity every visit divides a float-limited numerator by a near-zero
+  denominator, which yields a large number made entirely of rounding — it would read as a spectacular
+  learning rate rather than as an absent measurement.
+* **The drift floor is a mean ABSOLUTE delta.** A signed mean cancels: half the probes drifting up and
+  half down would report "no drift" while the model was moving under every one of them.
+* **Probes are excluded by construction**, not merely unlikely to be sampled — PLATEAU_DESIGN.md §4a's
+  **[Q10]**, answered the strict way. A probe trained even occasionally contributes an own-gradient term
+  and stops being a drift reading.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M
