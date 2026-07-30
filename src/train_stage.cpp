@@ -29,6 +29,7 @@
 #include "sub0/tokmap.hpp"
 #include "sub0/tune.hpp"
 #include "sub0/window.hpp"   // sample_window_start: keep each training window inside one document
+#include "sub0/tutorspike.hpp"  // SPIKE (docs/TUTOR.md): the read-only per-document mastery surface
 #include "sub0/blend.hpp"    // BlendSource -- per-source data a corpus blend draws windows from
 #include "sub0/blend_schedule.hpp" // ScheduleSpec/parse_blend_schedule_json + the staged epoch-fair scheduler
 #include "sub0/spellspike.hpp"  // uncombine/combine curriculum generator (a "spellspike" schedule source)
@@ -1071,7 +1072,8 @@ struct GpuTrainer {
                [[maybe_unused]] const int* src_idx, [[maybe_unused]] const std::size_t* starts,
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
                [[maybe_unused]] int T, [[maybe_unused]] float lr,
-               [[maybe_unused]] float muon_lr = 0.f) {
+               [[maybe_unused]] float muon_lr = 0.f,
+               [[maybe_unused]] double* out_win_loss = nullptr) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
             const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
@@ -1094,10 +1096,30 @@ struct GpuTrainer {
         // > 0 hybridizes with Muon on the Muon-eligible matrices -- see sub0_dev_train_step's own
         // comment (backend_cuda.cu) and the call site below (mirrors the CPU branch's own
         // opt.use_muon() ? lr_schedule(..., MUON_LR_BASE, ...) : implicit-AdamW-only computation).
-        ok = (sub0_dev_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr) == 0);
+        ok = (sub0_dev_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr,
+                                  out_win_loss) == 0);
         return static_cast<float>(loss);
 #else
         return 0.0f;
+#endif
+    }
+
+    // Re-score the windows step() just trained, AFTER its optimizer update -- the "back-to-back reading"
+    // (docs/TUTOR_SPIKE.md). Forward-only, and it deliberately reuses the ids/targets step() already
+    // built rather than rebuilding them, so the two readings are guaranteed to be of the same windows.
+    //
+    // This is what makes an entry's own learning separable from the transfer it receives from the rest
+    // of the corpus: the loss step() reports is the training forward's, taken BEFORE the update, so
+    //     own learning = rescore - step's own reading,   transfer = next visit's reading - rescore.
+    // Runs at a cadence, not every step: a forward is ~1/3 of a forward+backward.
+    bool rescore([[maybe_unused]] int batch, [[maybe_unused]] int T,
+                 [[maybe_unused]] const int* lengths, [[maybe_unused]] double* out_win_loss) {
+#if defined(SUB0_BUILD_CUDA)
+        double loss = 0.0;
+        return sub0_dev_forward_loss(ids.data(), targets.data(), batch, T, &loss, lengths,
+                                     out_win_loss) == 0;
+#else
+        return false;
 #endif
     }
 
@@ -1306,7 +1328,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                           int steps, double epochs, int batch, float lr, unsigned seed, int keep,
                                           int optimizer, int resume_mode, const char* blend_config_path,
                                           int replace_schedule, int allow_concurrent,
-                                          double corpus_fraction, unsigned subset_seed) {
+                                          double corpus_fraction, unsigned subset_seed,
+                                          const char* tutor_manifest_path) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -2287,6 +2310,90 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     const bool any_masked = std::any_of(sources.begin(), sources.end(),
                                         [](const sub0::BlendSource& s) { return s.masked(); });
 
+    // --- SPIKE: the mastery surface (docs/TUTOR.md, docs/TUTOR_SPIKE.md) ------------------------
+    // READ-ONLY with one deliberate exception, stated up front: the drift probe's documents are
+    // EXCLUDED from training. That exclusion is the whole point of them -- a probe trained even
+    // occasionally contributes an own-gradient term and stops measuring drift -- but it does mean a
+    // --tutor-manifest run is not token-identical to one without, so the two are not a matched pair.
+    sub0::tutor::Manifest   tutor_man;
+    sub0::tutor::Surface    tutor_surface;
+    sub0::tutor::DriftProbe tutor_probe;
+    int                     tutor_src = -1;      // blend source the manifest labels; -1 = surface off
+    double                  tutor_drift_floor = 0.0;
+    long                    tutor_redraws = 0;   // probe windows redrawn (see the sampling loop)
+    double                  tutor_applied_at_last_probe = 0.0;
+    // Per-step readout buffers, sized ONCE here to the batch ceiling and reused every step -- the
+    // per-step path allocates nothing (AGENTS.md 1).
+    std::vector<double>     tutor_win_loss, tutor_post_loss;
+    std::vector<std::size_t> probe_starts;   // the fixed probe window plan, resolved once at setup
+    std::vector<int>         probe_lens;
+    std::vector<float>       probe_nelbo;
+    const std::filesystem::path tutor_snapshot = meta_dir / "tutor_surface.json";
+    const std::filesystem::path tutor_sidecar  = meta_dir / "tutor_surface.bin";
+    if (tutor_manifest_path && *tutor_manifest_path) {
+        if (!sub0::tutor::read_manifest(tutor_manifest_path, tutor_man)) return 1;
+        // Identify WHICH source the manifest labels by its document count rather than by position or
+        // name: the manifest's join is on document ordinal, so the only honest test that it belongs to a
+        // source is that their document counts agree. That also catches the case the manifest exists to
+        // guard -- a corpus retokenized since the splice, where every label would attach to the wrong
+        // document. See Manifest::doc_count_matches for the trailing-phantom-boundary arithmetic.
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+            if (tutor_man.doc_count_matches(sources[i].docs.size())) { tutor_src = static_cast<int>(i); break; }
+        }
+        if (tutor_src < 0) {
+            sub0::log::error("train: --tutor-manifest declares {} documents but no source matches "
+                             "(source doc-start counts: {}). The manifest and corpus.tok disagree -- "
+                             "re-run sub0llm-configure on the corpus the manifest was built from.",
+                             tutor_man.total_docs(),
+                             [&]{ std::string t; for (const auto& sc : sources)
+                                      t += (t.empty() ? "" : ", ") + std::to_string(sc.docs.size());
+                                  return t; }());
+            return 1;
+        }
+        // One visit's worth of applied learning, used to scale the velocity mark threshold -- derived
+        // from this run's own lr and window width rather than being a fixed constant (the project's
+        // "derive bounds from scale" rule), so it tracks whatever schedule the run is on.
+        const float typical_visit = lr * static_cast<float>(SEQ_LEN);
+        tutor_surface.reset(tutor_man.total_docs(), typical_visit);
+        tutor_win_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
+        tutor_post_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
+        tutor_probe.reset(tutor_man.total_docs(), sub0::tutor::TUTOR_PROBE_STRIDE);
+        // The probe WINDOW PLAN, resolved once: one window at each probe document's start, capped at
+        // that document's own length. Fixed for the whole run because a probe's value across evals is
+        // only a measure of the model if the text is identical every time -- a resampled window would
+        // fold sampling variance into the drift floor and inflate it.
+        {
+            const sub0::BlendSource& tsrc = sources[static_cast<std::size_t>(tutor_src)];
+            for (std::size_t d : tutor_probe.docs()) {
+                if (d + 1 >= tsrc.docs.size()) continue;
+                const std::size_t beg = tsrc.docs[d], end = tsrc.docs[d + 1];
+                if (end <= beg + 2) continue;                       // nothing gradeable
+                const int len = static_cast<int>(std::min<std::size_t>(end - beg - 1,
+                                                                       static_cast<std::size_t>(SEQ_LEN)));
+                if (len < 2) continue;
+                probe_starts.push_back(beg);
+                probe_lens.push_back(len);
+            }
+            probe_nelbo.assign(probe_starts.size(), 0.f);
+            tutor_probe.trim_to(probe_starts.size());
+        }
+        if (std::filesystem::exists(tutor_sidecar) && tutor_surface.load(tutor_sidecar.string()))
+            sub0::log::info("  tutor: resumed the mastery surface from {}", tutor_sidecar.string());
+        // Probe balance across populations, logged rather than assumed: a stride sharing a factor with
+        // the manifest's interleave period would silently sample one population far more than another,
+        // and the drift floor would then be that population's, not the corpus's.
+        std::vector<int> probe_by_pop(tutor_man.populations.size(), 0);
+        for (std::size_t d : tutor_probe.docs())
+            if (d < tutor_man.doc_pop.size()) ++probe_by_pop[tutor_man.doc_pop[d]];
+        std::string bal;
+        for (std::size_t i = 0; i < probe_by_pop.size(); ++i)
+            bal += std::format("{}{}={}", bal.empty() ? "" : " ", tutor_man.populations[i], probe_by_pop[i]);
+        sub0::log::line("tutor: mastery surface ON -- {} documents in source '{}', {} never-trained "
+                        "probes ({}), snapshot -> {}",
+                        tutor_man.total_docs(), sources[static_cast<std::size_t>(tutor_src)].name,
+                        tutor_probe.docs().size(), bal, tutor_snapshot.string());
+    }
+
     // Resolve each stage's per-source target rate against the ACTUAL sources[] order built above (name
     // -> index lookups happen ONCE here, not in the per-window hot path), then track per-source
     // cumulative progress across the run -- the deficit scheduler's fairness state (see
@@ -2404,8 +2511,23 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         // computed once per step (constant across all of this step's windows), not once per window.
         const double frac_epoch = static_cast<double>(step) / static_cast<double>(epoch_steps);
         for (int b = 0; b < batch_t; ++b) {
-            const sub0::BlendDraw d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
+            sub0::BlendDraw d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
                                                                 seq_t, frac_epoch);   // pick a source, window inside it
+            // Drift-probe exclusion (SPIKE, --tutor-manifest only): redraw when the window landed in a
+            // probe document. Rejection rather than a filtered sampler because the probe set is ~1.6% of
+            // the corpus, so the expected number of redraws is negligible -- and a bounded retry keeps a
+            // pathological draw from spinning, at the cost of very rarely training one probe window,
+            // which the log below reports rather than hides.
+            if (tutor_src >= 0) {
+                for (int retry = 0; retry < 8 && d.src == tutor_src; ++retry) {
+                    const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(d.src)].docs,
+                                                         d.win.start);
+                    if (!tutor_probe.is_probe(doc)) break;
+                    d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
+                                                  seq_t, frac_epoch);
+                    ++tutor_redraws;
+                }
+            }
             src_idx[b] = d.src;
             starts[b]  = d.win.start;
             win_len[b] = d.win.len;
@@ -2450,7 +2572,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Same warmup/decay SHAPE as the CPU branch below, Muon's own (much larger) peak --
             // 0.f when Muon isn't selected, which sub0_dev_train_step treats as pure AdamW.
             const float muon_lr_t = opt.use_muon() ? sub0::lr::lr_at(step, MUON_LR_BASE, lr_warmup_steps, rs.cooldown_start, cooldown_steps) : 0.f;
-            step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t, lr_t, muon_lr_t);
+            step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t,
+                                 lr_t, muon_lr_t,
+                                 tutor_win_loss.empty() ? nullptr : tutor_win_loss.data());
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
             if (!gpu.ok) {
                 sub0::log::error("training: GPU step failed (device fault) at step {} -- stopping "
@@ -2640,6 +2764,37 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             opt.step();
             opt_secs += std::chrono::duration<double>(clock::now() - t_opt0).count();
         }
+        // --- SPIKE: fold this step's windows into the mastery surface (read-only) ---------------
+        if (tutor_src >= 0 && !tutor_win_loss.empty()) {
+            // Global applied learning FIRST: the transfer term each entry computes below is normalised
+            // by how much learning the corpus as a whole received since that entry was last visited, so
+            // this step's contribution has to be in the total before any entry reads it.
+            double step_applied = 0.0;
+            for (int b = 0; b < batch_t; ++b) step_applied += static_cast<double>(lr_t) * win_len[b];
+            tutor_surface.add_global_applied(step_applied);
+            for (int b = 0; b < batch_t; ++b) {
+                if (src_idx[b] != tutor_src) continue;      // a window from an unlabelled source
+                const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
+                                                     starts[b]);
+                tutor_surface.record(doc, static_cast<float>(tutor_win_loss[static_cast<std::size_t>(b)]),
+                                     lr_t, win_len[b]);
+            }
+            // The back-to-back reading, at a cadence: re-score the SAME windows after this step's
+            // update, so the next visit can separate this entry's own learning from the transfer it
+            // receives from everything else. GPU path only -- it reuses the device ids/targets the step
+            // already uploaded, so there is nothing to rebuild and no second window materialization to
+            // get subtly wrong.
+            if (gpu_train && (step % sub0::tutor::TUTOR_RESCORE_EVERY) == 0 &&
+                gpu.rescore(batch_t, seq_t, win_len.data(), tutor_post_loss.data())) {
+                for (int b = 0; b < batch_t; ++b) {
+                    if (src_idx[b] != tutor_src) continue;
+                    const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
+                                                         starts[b]);
+                    tutor_surface.record_post(doc,
+                        static_cast<float>(tutor_post_loss[static_cast<std::size_t>(b)]));
+                }
+            }
+        }
         run_loss += step_loss; ++run_n;
         total_windows += batch_t;                          // for wps: batch_t varies per step now
         rs.tokens_seen += static_cast<long long>(batch_t) * seq_t;
@@ -2671,6 +2826,31 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const double wps   = secs > 0 ? static_cast<double>(total_windows - windows_at_win_t0) / secs : 0.0;
             const double tps   = secs > 0 ? static_cast<double>(rs.tokens_seen - tokens_at_win_t0) / secs : 0.0;
             // frac_epoch: computed once per step, above the gpu_train/hybrid_train/CPU branch dispatch.
+
+            // --- SPIKE: score the never-trained drift probes, then publish the surface -----------
+            // The probes are scored through the SAME eval seam validation uses, so their numbers are
+            // directly comparable with val_nelbo, and at the eval cadence rather than a cadence of their
+            // own -- the drift being measured is a property of how far the model moved, and eval is
+            // already where "how far has it moved" is asked.
+            if (tutor_src >= 0) {
+                const sub0::BlendSource& tsrc = sources[static_cast<std::size_t>(tutor_src)];
+                sub0::eval::nelbo_cpu_each(tsrc.view, probe_starts, probe_lens, DEFAULT_THREADS,
+                                           probe_nelbo);
+                const double applied_since = tutor_surface.global_applied() - tutor_applied_at_last_probe;
+                const double floor_now = tutor_probe.observe(probe_nelbo, applied_since);
+                if (floor_now > 0.0) tutor_drift_floor = floor_now;
+                tutor_applied_at_last_probe = tutor_surface.global_applied();
+                if (!tutor_surface.write_snapshot(tutor_snapshot.string(), tutor_man, step, tutor_drift_floor))
+                    sub0::log::info("  tutor: snapshot write failed ({})", tutor_snapshot.string());
+                // The surface is FEEDBACK STATE: TUTOR.md is explicit that if it is not restored exactly
+                // a matched-arm A/B quietly stops being matched, so it is persisted on the same cadence
+                // as everything else the run would need to resume.
+                if (!tutor_surface.save(tutor_sidecar.string()))
+                    sub0::log::info("  tutor: sidecar write failed ({})", tutor_sidecar.string());
+                sub0::log::line("  tutor: coverage {:.1f}% | drift floor {:.3e} /applied | {} probes{}",
+                                100.0 * tutor_surface.coverage(), tutor_drift_floor, probe_nelbo.size(),
+                                tutor_redraws ? std::format(" | {} probe redraws", tutor_redraws) : "");
+            }
 
             // Validation NELBO only once enough of the corpus has been seen.
             std::string eval_str = "(warmup)";

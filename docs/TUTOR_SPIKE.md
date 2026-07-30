@@ -272,6 +272,57 @@ Decisions worth recording:
   **[Q10]**, answered the strict way. A probe trained even occasionally contributes an own-gradient term
   and stops being a drift reading.
 
+## Stage 2b/3 — wired in, and the first reading
+
+`--tutor-manifest` turns the surface on. Per window it records into the ledger; every 20th step it
+re-scores that step's windows through the eval seam for the post-update reading; at the eval cadence it
+scores the never-trained probes, updates the drift floor, writes the sidecar and rewrites
+`<model_dir>/tutor_surface.json`. `tools/tutor_heatmap.html` polls that snapshot — self-contained, no
+CDN, no build step; serve the model dir over http and open it.
+
+**One bug worth recording**, because it produced a confident, entirely wrong log line: the probe window
+plan was built *before* `DriftProbe::reset()` populated the probe set, so it planned over an empty list.
+The startup banner still reported "282 never-trained probes" (it reads the probe set, which was
+populated a moment later) while the eval line reported "0 probes" and a drift floor of exactly zero. A
+floor of zero is not obviously wrong — it reads as "the model is not drifting" — which is precisely the
+kind of quiet failure the read-only stage exists to catch before a controller is consuming the number.
+
+### First reading — 400 steps, 0.26 epochs, still in warmup
+
+Smoke run (`--batch 32 --allow-concurrent`, alongside another trainer, so throughput here means nothing).
+
+| population | docs | seen | nelbo | velocity | transfer | n |
+|---|---|---|---|---|---|---|
+| tinystories | 24000 | 8591 | 3.956 | 0.0000 | **−3.76e-03** | 145 |
+| cosmopedia | 8000 | 6677 | 5.122 | 0.0000 | **−2.78e-03** | 470 |
+| shuffled | 4000 | 1638 | 5.458 | 0.0000 | **+1.93e-03** | 32 |
+
+Coverage 47.0%, drift floor 1.65e-04 per unit applied.
+
+**The level ordering is as registered** — tinystories < cosmopedia < shuffled — but that is the weak
+prediction, and at 400 steps it mostly reflects entropy rather than learning.
+
+**The transfer term splits by sign on the first run, and that is the interesting result.** Both real
+populations are *negative* — they improve while not being trained, i.e. the rest of the corpus teaches
+them — and the shuffled slice is *positive*: it is actively displaced by everything else. That is
+exactly the reinforcement/conflict distinction the review proposed, appearing before the model has
+learned much of anything, and it is a distinction no level-based or velocity-based reading can make.
+
+Read it cautiously for now:
+
+* **velocity is still identically zero everywhere**, because the mark threshold (4 typical visits) has
+  not been reached at ~1.5 visits/document. Velocity needs a much longer run; nothing here speaks to it.
+* **n is small and very unevenly distributed** (145 / 470 / 32), so the shuffled figure in particular
+  rests on 32 intervals.
+* **A confound, now visible in the numbers**: coverage is 36% for tinystories but 83% for cosmopedia.
+  Windows are drawn by token position, so a document's draw probability is proportional to its LENGTH,
+  and cosmopedia's documents are much longer. Per-document visit rates therefore differ by population
+  for a reason with nothing to do with learning. This affects visits, coverage and how many transfer
+  intervals each population accumulates — it does not explain a sign flip, but any per-population
+  average must be read with it in mind. It is also a direct argument for the coverage sweep (arm **B**).
+* The run is inside warmup, so the learning rate — and hence applied learning per visit — is still
+  rising.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M

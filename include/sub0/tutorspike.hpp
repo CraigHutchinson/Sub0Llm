@@ -141,6 +141,23 @@ struct Entry {
 // the learning rate and the window width instead of being calibrated for one corpus.
 inline constexpr float VELOCITY_MARK_MULTIPLE = 4.0f;
 
+// --- cadences, as constants rather than CLI knobs ---------------------------------------------
+// None of these is a decision a user makes per run (this project's "only add the surface actually
+// consumed" rule), and each has a derivation rather than a preference behind it.
+
+// Reserve every Nth document as a never-trained drift probe. At the spike's 36000 documents this is
+// ~280 probes: enough that the mean absolute delta is a stable floor, few enough that excluding them
+// costs ~0.8% of the corpus, and few enough that scoring them on the CPU at every eval stays close to
+// the cost of the existing 128-window validation eval. The manifest interleaves
+// populations in runs of 64, and the trainer LOGS the resulting per-population probe counts so a stride
+// that accidentally samples one population is visible rather than silently biasing the floor.
+inline constexpr std::size_t TUTOR_PROBE_STRIDE = 128;
+
+// How often the post-update re-score runs. A forward is roughly a third of a forward+backward, so every
+// step would cost ~33%; at every 20th step it is ~1.7%, and the transfer term only needs SOME visits to
+// carry a post reading, not all of them.
+inline constexpr long TUTOR_RESCORE_EVERY = 20;
+
 // The per-document ledger. Flat and pre-sized: every update runs inside the training step, so there is
 // no allocation on the hot path (AGENTS.md 1). At corpus scale this is the structure that has to become
 // sparse or aggregated; at spike scale a flat array is right and honest.
@@ -276,6 +293,22 @@ public:
 
     bool active() const { return !docs_.empty(); }
     std::span<const std::size_t> docs() const { return docs_; }
+
+    // Shrink the tracked set to `n` readings. The caller resolves a window plan over the probe documents
+    // and some are not gradeable (a document too short to host even a 2-token window), so the number of
+    // SCORES is <= the number of probe documents. observe() requires the two to agree exactly -- a
+    // mismatched length there would silently pair each probe with the wrong document's previous value,
+    // producing a drift floor made entirely of between-document differences.
+    //
+    // is_probe() is deliberately NOT narrowed to match: a document dropped from the readings is still
+    // excluded from training, which keeps the exclusion rule a pure function of the stride and therefore
+    // identical across resumes.
+    void trim_to(std::size_t n) {
+        if (n >= docs_.size()) return;
+        docs_.resize(n);
+        last_.assign(n, 0.f);
+        primed_ = false;
+    }
 
     // True when document `doc` is a probe and must therefore be EXCLUDED from training. The exclusion is
     // what makes the measurement mean anything: a probe that is trained even occasionally contributes an

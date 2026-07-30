@@ -1,0 +1,230 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tutorspike — mastery surface</title>
+<!--
+  Live viewer for the mastery surface (docs/TUTOR.md, docs/TUTOR_SPIKE.md).
+
+  Self-contained on purpose: no CDN, no build step, no framework. It polls the snapshot the trainer
+  rewrites at its eval cadence, so it works offline and keeps working if the trainer is restarted.
+
+  Usage -- serve the model directory (fetch() cannot read file:// URLs):
+      cd <model_dir> && python -m http.server 8080
+      then open this file's URL, or pass ?src=<path-to-tutor_surface.json>
+
+  Reading it: the corpus is drawn as one cell per document in ordinal order, so the manifest's
+  interleaved population runs appear as vertical banding. If the populations separate the way TUTOR.md
+  predicts, VELOCITY shows the banding early and NELBO keeps it late for the shuffled slice only.
+-->
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --line: #d8d8d8; --panel: #f6f6f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14161a; --fg: #e8e8e8; --muted: #9aa0a6; --line: #2c3036; --panel: #1c1f24; }
+  }
+  html { color-scheme: light dark; }
+  body { margin: 0; padding: 18px; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); margin-bottom: 14px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+          padding: 7px 11px; min-width: 108px; }
+  .stat b { display: block; font-size: 17px; font-weight: 600; }
+  .stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+  button { font: inherit; padding: 5px 11px; border: 1px solid var(--line); border-radius: 5px;
+           background: var(--panel); color: var(--fg); cursor: pointer; }
+  button[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  canvas { display: block; image-rendering: pixelated; }
+  table { border-collapse: collapse; margin-top: 14px; }
+  th, td { text-align: right; padding: 3px 12px 3px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.name { text-align: left; }
+  .legend { display: flex; gap: 12px; align-items: center; margin-top: 8px; color: var(--muted); font-size: 12px; }
+  .ramp { width: 150px; height: 10px; border: 1px solid var(--line); border-radius: 2px; }
+  .err { color: #c0392b; }
+</style>
+
+<h1>tutorspike — mastery surface</h1>
+<div class="sub" id="status">connecting…</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="controls" id="metrics"></div>
+<div class="wrap"><canvas id="cv"></canvas></div>
+<div class="legend">
+  <span id="lo">–</span><canvas class="ramp" id="ramp" width="150" height="10"></canvas><span id="hi">–</span>
+  <span id="note"></span>
+</div>
+
+<table id="pops"><thead><tr>
+  <th class="name">population</th><th>docs</th><th>coverage</th><th>nelbo</th>
+  <th>velocity</th><th>transfer</th>
+</tr></thead><tbody></tbody></table>
+
+<script>
+const params = new URLSearchParams(location.search);
+const SRC = params.get('src') || 'tutor_surface.json';
+const POLL_MS = 3000;
+
+// Metrics. `diverging` picks the colour ramp: transfer is signed (negative = reinforcement, positive =
+// conflict) and must be read around zero, so it gets a two-sided ramp where zero is neutral. The others
+// are magnitudes and get a sequential ramp.
+const METRICS = [
+  { key: 'nelbo',    label: 'NELBO (level)',  diverging: false,
+    note: 'high + flat velocity = unlearnable; low + flat = mastered' },
+  { key: 'velocity', label: 'velocity',       diverging: false,
+    note: 'falling loss is positive; below the drift floor it is not a reading' },
+  { key: 'transfer', label: 'transfer',       diverging: true,
+    note: 'negative = reinforced by the rest of the corpus, positive = in conflict with it' },
+  { key: 'visits',   label: 'visits',         diverging: false,
+    note: 'zero visits means "never asked", not "nothing to learn"' },
+  { key: 'applied',  label: 'applied learning', diverging: false,
+    note: 'the velocity denominator: sum of effective_lr x tokens' },
+];
+let metric = METRICS[1];
+let snap = null;
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const rampCv = document.getElementById('ramp'), rampCtx = rampCv.getContext('2d');
+
+function seq(t) {                       // sequential: dark blue -> yellow, perceptually monotone enough
+  t = Math.max(0, Math.min(1, t));
+  return [ Math.round(255 * Math.min(1, 0.15 + 1.4 * t * t)),
+           Math.round(255 * Math.min(1, 0.10 + 1.15 * t)),
+           Math.round(255 * Math.max(0, 0.45 - 0.40 * t) + 40 * (1 - t)) ];
+}
+function div(t) {                       // diverging: teal (negative) -> neutral -> red (positive)
+  const x = Math.max(-1, Math.min(1, t));
+  if (x < 0) { const a = -x; return [ Math.round(235 - 200 * a), Math.round(235 - 60 * a), Math.round(235 - 70 * a) ]; }
+  return [ Math.round(235 - 10 * x), Math.round(235 - 175 * x), Math.round(235 - 165 * x) ];
+}
+
+// Robust bounds: the 2nd/98th percentile rather than min/max. A single outlier document -- and the
+// unlearnable slice guarantees a few -- otherwise compresses every other cell into one colour, which is
+// precisely the structure the map exists to show.
+function bounds(vals, signed) {
+  const f = vals.filter(v => Number.isFinite(v));
+  if (!f.length) return [0, 1];
+  const s = Float64Array.from(f).sort();
+  const q = p => s[Math.min(s.length - 1, Math.max(0, Math.floor(p * (s.length - 1))))];
+  if (signed) { const m = Math.max(Math.abs(q(0.02)), Math.abs(q(0.98))) || 1; return [-m, m]; }
+  const lo = q(0.02), hi = q(0.98);
+  return hi > lo ? [lo, hi] : [lo, lo + 1];
+}
+
+function draw() {
+  if (!snap) return;
+  const vals = snap[metric.key];
+  if (!vals) return;
+  const n = vals.length;
+  const cols = Math.max(1, Math.min(300, Math.ceil(Math.sqrt(n * 2.2))));
+  const rows = Math.ceil(n / cols);
+  const cell = Math.max(3, Math.min(9, Math.floor(1100 / cols)));
+  cv.width = cols * cell; cv.height = rows * cell;
+
+  const [lo, hi] = bounds(vals, metric.diverging);
+  const img = ctx.createImageData(cv.width, cv.height);
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    let rgb;
+    if (!Number.isFinite(v)) rgb = [90, 90, 90];
+    else if (metric.diverging) rgb = div(v / hi);
+    else rgb = seq((v - lo) / (hi - lo));
+    // A never-visited document is drawn dim regardless of metric: its zero is an absence of measurement,
+    // not a measurement of zero, and colouring it like a real reading is the single most misleading
+    // thing this map could do.
+    if (snap.visits && snap.visits[i] === 0) rgb = [58, 62, 68];
+    const cx = (i % cols) * cell, cy = Math.floor(i / cols) * cell;
+    for (let y = 0; y < cell; y++) {
+      let o = ((cy + y) * cv.width + cx) * 4;
+      for (let x = 0; x < cell; x++) {
+        img.data[o++] = rgb[0]; img.data[o++] = rgb[1]; img.data[o++] = rgb[2]; img.data[o++] = 255;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const rimg = rampCtx.createImageData(150, 10);
+  for (let x = 0; x < 150; x++) {
+    const t = x / 149, rgb = metric.diverging ? div(2 * t - 1) : seq(t);
+    for (let y = 0; y < 10; y++) {
+      let o = (y * 150 + x) * 4;
+      rimg.data[o] = rgb[0]; rimg.data[o + 1] = rgb[1]; rimg.data[o + 2] = rgb[2]; rimg.data[o + 3] = 255;
+    }
+  }
+  rampCtx.putImageData(rimg, 0, 0);
+  const fmt = v => Math.abs(v) < 0.01 && v !== 0 ? v.toExponential(1) : v.toFixed(3);
+  document.getElementById('lo').textContent = fmt(lo);
+  document.getElementById('hi').textContent = fmt(hi);
+  document.getElementById('note').textContent = metric.note;
+}
+
+function renderPops() {
+  const tb = document.querySelector('#pops tbody');
+  tb.innerHTML = '';
+  if (!snap || !snap.populations) return;
+  snap.populations.forEach((name, p) => {
+    let n = 0, seen = 0, sNel = 0, sVel = 0, sTr = 0, nTr = 0;
+    for (let i = 0; i < snap.doc_pop.length; i++) {
+      if (snap.doc_pop[i] !== p) continue;
+      n++;
+      if (snap.visits[i] > 0) { seen++; sNel += snap.nelbo[i]; sVel += snap.velocity[i]; }
+      if (snap.transfer[i] !== 0) { sTr += snap.transfer[i]; nTr++; }
+    }
+    const tr = document.createElement('tr');
+    const f = (v, d = 3) => (Number.isFinite(v) ? v.toFixed(d) : '–');
+    tr.innerHTML = `<td class="name">${name}</td><td>${n}</td>` +
+      `<td>${(100 * seen / n).toFixed(1)}%</td><td>${seen ? f(sNel / seen) : '–'}</td>` +
+      `<td>${seen ? f(sVel / seen) : '–'}</td>` +
+      `<td>${nTr ? (sTr / nTr).toExponential(2) : '–'}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function renderStats() {
+  const el = document.getElementById('stats');
+  const cards = [
+    ['step', snap.step],
+    ['coverage', (100 * snap.coverage).toFixed(1) + '%'],
+    ['drift floor', Number(snap.drift_floor).toExponential(2)],
+    ['applied', Number(snap.global_applied).toExponential(2)],
+    ['documents', snap.doc_pop.length],
+  ];
+  el.innerHTML = cards.map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join('');
+}
+
+async function poll() {
+  try {
+    const r = await fetch(SRC + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    snap = await r.json();
+    document.getElementById('status').textContent =
+      `${SRC} — step ${snap.step}, updated ${new Date().toLocaleTimeString()}`;
+    document.getElementById('status').className = 'sub';
+    renderStats(); renderPops(); draw();
+  } catch (e) {
+    document.getElementById('status').textContent =
+      `cannot read ${SRC}: ${e.message}. Serve the model dir over http (python -m http.server).`;
+    document.getElementById('status').className = 'sub err';
+  }
+}
+
+const mdiv = document.getElementById('metrics');
+METRICS.forEach(m => {
+  const b = document.createElement('button');
+  b.textContent = m.label;
+  b.setAttribute('aria-pressed', m === metric);
+  b.onclick = () => {
+    metric = m;
+    [...mdiv.children].forEach((c, i) => c.setAttribute('aria-pressed', METRICS[i] === metric));
+    draw();
+  };
+  mdiv.appendChild(b);
+});
+
+poll();
+setInterval(poll, POLL_MS);
+</script>

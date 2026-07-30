@@ -95,6 +95,46 @@ struct WindowSet {
     return total / nw;
 }
 
+// Per-window scores over an EXPLICIT list of window starts, rather than the mean over a planned,
+// evenly-spaced set. Two things differ from nelbo_cpu and both are the point:
+//
+//   * the starts are arbitrary, because the caller's windows are document-aligned (docs/TUTOR.md's
+//     drift probes are whole documents, not offsets on a grid), and WindowSet cannot express that;
+//   * every window's own score is returned, because the caller is comparing each window against ITS
+//     OWN previous value over time -- a mean would cancel exactly the per-document differences it
+//     exists to observe.
+//
+// CPU only, deliberately: a trainer's periodic evals already stay on the CPU (see Session's note on why
+// the device path would add a full inference scratch on top of a training allocation sized to fill
+// VRAM), and probe scoring runs at that same cadence, in that same process.
+//
+// `out` must be sized to starts.size(); windows too short to grade are written as NaN so the caller can
+// skip them without silently averaging in a zero. Deterministic: the same starts always produce the same
+// windows, which is what makes a delta across evals a property of the model rather than of the sampler.
+inline void nelbo_cpu_each(TokView data, std::span<const std::size_t> starts,
+                           std::span<const int> lens, int threads, std::span<float> out) {
+    const int n = static_cast<int>(starts.size());
+    if (n <= 0 || out.size() < starts.size() || lens.size() < starts.size()) return;
+    #pragma omp parallel num_threads(threads)
+    {
+        std::vector<int> win(static_cast<std::size_t>(SEQ_LEN) + 1);
+        #pragma omp for schedule(static)
+        for (int w = 0; w < n; ++w) {
+            const int ctx = lens[static_cast<std::size_t>(w)];
+            if (ctx < 2 || ctx > SEQ_LEN) {
+                out[static_cast<std::size_t>(w)] = std::numeric_limits<float>::quiet_NaN();
+                continue;
+            }
+            data.copy_to(starts[static_cast<std::size_t>(w)], static_cast<std::size_t>(ctx) + 1, win.data());
+            sub0::graph_reset();
+            sub0::Node* logits = sub0::forward(win.data(), ctx);
+            sub0::Node* loss   = sub0::cross_entropy(logits, win.data() + 1);
+            out[static_cast<std::size_t>(w)] = loss->data[0];
+        }
+    }
+    sub0::graph_reset();
+}
+
 // --- Device path ------------------------------------------------------------------------------
 // How many windows to submit per sub0_dev_forward_loss call. The device forward materializes the full
 // [batch*ctx, VOCAB] logits buffer (it runs the graph-captured INFERENCE forward, which does not chunk
