@@ -265,6 +265,76 @@ sampler never draws? They must be genuinely unseen for the overfit-detection hal
 confirming the window sampler can be told to skip them, rather than assuming the held-out split already
 does.
 
+## 4c. MEASURED 2026-07-30 — the existing trends, before choosing anything
+
+This section is the "capture the data before redesigning on argument" step of §4, now done. Source: the
+four LoopSplit arms' own `train.log` eval series (arm A 52 evals to 5.6 ep; arms B/C/D 14 evals each to
+1.8 ep, where the current detector stopped them). Analysis was a rolling OLS fit of val_nelbo against
+eval index, reporting slope, its standard error, and residual sigma.
+
+### Finding 1 — eval noise is ~0.002-0.004 nelbo, and it is stable
+
+| arm | median residual sigma (W=6) |
+|---|---|
+| A (d192 deep16, 0.5-5.6 ep) | 0.00206 |
+| B (loop 10x6) | 0.00394 |
+| C (shallow10) | 0.00344 |
+| D (depth4) | 0.00271 |
+
+Arm A's sigma barely moves with window width (0.00188 at W=4 to 0.00215 at W=12), so this is genuine
+measurement noise, not curvature being mistaken for scatter. **Any magnitude threshold has to sit well
+clear of ~0.002, and `PLATEAU_MIN_REL_FAR = 0.002` does not.**
+
+### Finding 2 — the current WINDOW of 6 is too short, quantified
+
+Applying a slope-significance test (stop when the fitted slope is no longer significantly negative,
+t > -2) to arm A:
+
+* **W=6 fires five times** — at epochs 4.2, 5.0, 5.1, 5.3 and 5.6 — while the run was still descending.
+* **W=8 never fires.** W=12 never fires.
+
+So the twitchiness is a signal-to-noise property of the window, not of the test. Six evals is simply too
+few to resolve a ~0.0007/eval drift against ~0.002 noise. This is the first hard number behind
+[[plateau-detector-calibrated-for-tinystories-era]]'s claim that the window is the real miscalibration.
+
+### Finding 3 — the arms the detector DID stop were unambiguously still descending
+
+Arms B, C and D were all stopped at 1.8 epochs. A slope-significance test **never fires on any of them,
+at any window width** — their slopes stay significantly negative right through the stop point. The
+detector stopped three of four arms while the trend test had no basis to.
+
+That is not a marginal calibration issue. Combined with arm A gaining a further **-0.0593** by being
+allowed to continue, it means the step-8586 four-arm comparison was taken from three prematurely
+truncated runs and one that was not.
+
+### Finding 4 — a significance test alone would NEVER stop anything here
+
+The flip side of Findings 2-3: at W>=8 the slope stays significantly negative for every arm, including
+arm A at 5.6 epochs. A pure "is the slope distinguishable from zero" criterion does not terminate in
+this regime. It is a good FALSE-POSITIVE SUPPRESSOR and a bad stopping rule.
+
+**So the practical-gain bound is the primary mechanism, not the safety net** — the reverse of how §5
+frames it. Arm A's own diminishing returns are the calibration data:
+
+| stop at | best val_nelbo | forgone vs 5.6 ep |
+|---|---|---|
+| 2.0 ep | 2.1276 | +0.0537 |
+| 3.0 ep | 2.1090 | +0.0351 |
+| 4.0 ep | 2.0898 | +0.0159 |
+| 5.0 ep | 2.0778 | +0.0039 |
+
+Marginal gain per epoch roughly halves late in the run (~0.019/ep at 3-4 ep, ~0.012/ep at 4-5 ep,
+~0.0065/ep at 5-5.6 ep). A bound of the form "stop when the fitted slope projects less than X per epoch"
+is therefore well-conditioned here, and X is a compute-vs-quality decision that can be stated honestly
+rather than a threshold pretending to detect a physical plateau.
+
+### What this does NOT establish
+
+Every number above comes from ONE corpus (cosmopedia) at ONE model scale, and three of the four series
+are only 14 evals long because the detector truncated them. The unbounded TinyStories control in §4b is
+still required — it tests whether the `DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0` ledger is observation or
+detector artifact, which nothing here can answer.
+
 ## 5. Candidate mechanisms, to be narrowed
 
 Not a menu to implement — a list to argue down to one.
