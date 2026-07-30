@@ -63,18 +63,25 @@ struct Bucket {
     long long occurrences = 0;  // capitalised occurrences they account for
 };
 
+// The corpora a production tokenizer is actually learned over. minipile carries the CODE, and code is
+// where this policy could plausibly behave differently from prose: ALL_CAPS constants (MAX_SIZE),
+// CamelCase identifiers (HttpClient), and identifiers that recur often enough that a verbatim merge
+// would pay for itself. Measuring only prose would average that away -- hence a per-corpus breakdown
+// AND a combined run, since the combined stream is what the vocabulary is really fitted to.
+struct Source { const char* label; const char* file; };
+constexpr Source kSources[] = {
+    {"cosmopedia (prose)", "cosmopedia.txt"},
+    {"minipile (code+web)", "minipile.txt"},
+    {"fineweb_edu (web)", "fineweb_edu.txt"},
+};
+
 }  // namespace
 
-TEST_CASE("casing policy: how much of the withheld-name population is even reachable by a threshold",
-          "[.casing]") {
-    const std::filesystem::path corpus = std::filesystem::path(SUB0_SOURCE_DIR) / "data" / "cosmopedia.txt";
-    if (!std::filesystem::exists(corpus)) {
-        WARN("skipped: " << corpus.string() << " not present");
-        return;
-    }
-    const std::string text = read_slice(corpus, 256);
-    REQUIRE(text.size() > 1024u * 1024u);
+namespace {
 
+// Measurement 1 for one text: partition every form that ever appears capitalised mid-sentence, and
+// report how much of the withheld population a `mid > lc*K` threshold could possibly reach.
+std::string reachability_report(const char* label, const std::string& text) {
     sub0::tok::Scan s;
     s.add_names(text);                       // pass 1 only: fills lower_count / midcap_count
 
@@ -91,13 +98,13 @@ TEST_CASE("casing policy: how much of the withheld-name population is even reach
 
     const long long withheld_forms = ambiguous.forms + pure.forms;
     const long long withheld_occ   = ambiguous.occurrences + pure.occurrences;
-    REQUIRE(withheld_occ > 0);
+    if (withheld_occ == 0) return std::string("\n=== ") + label + ": no capitalised population ===\n";
 
     const double pure_form_share = 100.0 * static_cast<double>(pure.forms) / static_cast<double>(withheld_forms);
     const double pure_occ_share  = 100.0 * static_cast<double>(pure.occurrences) / static_cast<double>(withheld_occ);
 
     std::ostringstream r;
-    r << "\n=== truecasing name policy, " << (text.size() / (1024 * 1024)) << " MB of cosmopedia ===\n";
+    r << "\n=== " << label << ", " << (text.size() / (1024 * 1024)) << " MB ===\n";
     auto row = [&](const char* name, const Bucket& b) {
         r << "  " << name << "  forms=" << b.forms << "  capitalised-occurrences=" << b.occurrences << "\n";
     };
@@ -126,12 +133,30 @@ TEST_CASE("casing policy: how much of the withheld-name population is even reach
         r << "    K=" << K << "  collapses " << moved_forms << " more forms, "
           << moved_occ << " occurrences (" << occ_recovered << "% of all withheld)\n";
     }
-    WARN(r.str());
+    return r.str();
+}
 
-    // Not an assertion about which policy is right -- only that the harness measured a real, non-empty
-    // population, so the numbers above are worth reading.
-    CHECK(collapsed.forms > 0);
-    CHECK(withheld_forms > 0);
+}  // namespace
+
+TEST_CASE("casing policy: how much of the withheld-name population is even reachable by a threshold",
+          "[.casing]") {
+    std::string all, report;
+    int found = 0;
+    for (const Source& src : kSources) {
+        const std::filesystem::path p = std::filesystem::path(SUB0_SOURCE_DIR) / "data" / src.file;
+        if (!std::filesystem::exists(p)) { report += std::string("\n(missing: ") + src.file + ")\n"; continue; }
+        const std::string text = read_slice(p, 128);
+        if (text.size() < 1024u * 1024u) continue;
+        ++found;
+        report += reachability_report(src.label, text);
+        all += text;
+    }
+    REQUIRE(found > 0);
+    // The combined stream is the one the production vocabulary is actually fitted to; the per-corpus
+    // rows above only exist to show whether code behaves differently from prose.
+    if (found > 1) report += reachability_report("COMBINED (what the tokenizer learns on)", all);
+    WARN(report);
+    CHECK(!all.empty());
 }
 
 // Having established that a threshold cannot reach 92.4% of the withheld forms, this is the A/B for
@@ -145,27 +170,31 @@ TEST_CASE("casing policy: how much of the withheld-name population is even reach
 //
 // Three pillars, per standing policy -- the win must show up as vocabulary AND token count, not as one
 // number in isolation. A rule that halves cased pieces but inflates the stream is not a win.
+// Learned over the BLEND, not one corpus: a production tokenizer sees prose and code together, and the
+// interesting risk is code-specific -- ALL_CAPS constants, CamelCase identifiers, and identifiers that
+// recur often enough that a verbatim cased merge might pay for itself. Held-out text is drawn from each
+// source in the same proportion so the token-cost number is not silently a prose-only measurement.
 TEST_CASE("casing policy A/B: verbatim names vs always-collapse (vocab composition + token cost)",
           "[.casing]") {
-    const std::filesystem::path corpus = std::filesystem::path(SUB0_SOURCE_DIR) / "data" / "cosmopedia.txt";
-    if (!std::filesystem::exists(corpus)) {
-        WARN("skipped: " << corpus.string() << " not present");
-        return;
-    }
-    const std::string text = read_slice(corpus, 64);
-    REQUIRE(text.size() > 1024u * 1024u);
-    // Held-out tail of the SAME slice is not held out at all; take a later, disjoint region instead so
-    // the token-cost comparison is not measured on the learn set.
-    std::string heldout;
-    {
-        std::ifstream in(corpus, std::ios::binary);
-        in.seekg(static_cast<std::streamoff>(128) * 1024 * 1024);
-        std::string buf(8u * 1024u * 1024u, '\0');
+    std::string text, heldout;
+    std::vector<std::string> present;
+    for (const Source& src : kSources) {
+        const std::filesystem::path p = std::filesystem::path(SUB0_SOURCE_DIR) / "data" / src.file;
+        if (!std::filesystem::exists(p)) continue;
+        const std::string s = read_slice(p, 32);            // learn slice, per source
+        if (s.size() < 1024u * 1024u) continue;
+        text += s;
+        present.emplace_back(src.label);
+        // Held out from a disjoint region of the SAME source (the tail of a learn slice is not held out).
+        std::ifstream in(p, std::ios::binary);
+        in.seekg(static_cast<std::streamoff>(96) * 1024 * 1024);
+        std::string buf(4u * 1024u * 1024u, '\0');
         in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
         buf.resize(static_cast<std::size_t>(in.gcount()));
         const std::size_t lo = buf.find('\n'), hi = buf.rfind('\n');
-        if (lo != std::string::npos && hi != std::string::npos && hi > lo) heldout = buf.substr(lo + 1, hi - lo);
+        if (lo != std::string::npos && hi != std::string::npos && hi > lo) heldout += buf.substr(lo + 1, hi - lo);
     }
+    REQUIRE(text.size() > 1024u * 1024u);
     REQUIRE(heldout.size() > 1024u * 1024u);
 
     sub0::tok::LearnOptions opts;
@@ -211,6 +240,9 @@ TEST_CASE("casing policy A/B: verbatim names vs always-collapse (vocab compositi
     std::ostringstream r;
     r << "\n=== name policy A/B, " << (text.size() / (1024 * 1024)) << " MB learn / "
       << (heldout.size() / (1024 * 1024)) << " MB held out, vocab_target " << opts.vocab_target << " ===\n"
+      << "  sources:";
+    for (const std::string& p : present) r << " [" << p << "]";
+    r << "\n"
       << "  verbatim names (today) : pieces=" << a.pieces << "  cased=" << a.cased_pieces
       << " (" << pct(a.cased_pieces, a.pieces) << "%)  held-out tokens=" << a.tokens << "\n"
       << "  always-collapse        : pieces=" << b.pieces << "  cased=" << b.cased_pieces
@@ -221,6 +253,24 @@ TEST_CASE("casing policy A/B: verbatim names vs always-collapse (vocab compositi
 
     CHECK(a.pieces > 0);
     CHECK(b.pieces > 0);
+
+    // THE ARMS MUST DIFFER, or this harness is measuring nothing.
+    //
+    // It simulates the old policy by handing emit_word a different `attested` set. That only works
+    // while emit_word still CONSULTS attested. Once schemeV5 made collapse unconditional, both arms
+    // silently became the same policy and this case reported cased=0 vs cased=0, delta 0% -- a
+    // confident-looking null result that was pure artifact.
+    //
+    // So: to re-run the A/B, the `collapse` line in casing.hpp emit_word must be temporarily restored
+    // to `force_collapse || attested.contains(lw)`. This assertion is what tells you that, instead of
+    // letting a vacuous zero pass for a measurement.
+    const bool arms_identical = (a.cased_pieces == b.cased_pieces) && (a.tokens == b.tokens);
+    INFO("Both arms produced an IDENTICAL tokenizer, so this A/B measured nothing. Expected under the "
+         "shipped schemeV5 policy: emit_word no longer consults `attested`, which is the only lever "
+         "this harness has. To re-measure, temporarily restore casing.hpp's emit_word to "
+         "`collapse = force_collapse || attested.contains(lw)`, run, then put it back. Failing here "
+         "deliberately -- a vacuous 0-vs-0 delta once passed for a result.");
+    REQUIRE_FALSE(arms_identical);
 }
 
 #endif  // SUB0_SOURCE_DIR

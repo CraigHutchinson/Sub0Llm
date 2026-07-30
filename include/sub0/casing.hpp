@@ -462,13 +462,19 @@ inline void truecase_tokenize(std::string_view text,
     //     it. The old rule bought no information, it only changed where the SPELLING came from.
     //   * The spelling it bought was expensive. Verbatim names forced BPE to learn a second, duplicate
     //     piece inventory that only capitalized words ever use -- short cased fragments (`Al` `Ma` `Ch`
-    //     `Am` `Sa`) assembled per name. Measured at production scale (64 MB cosmopedia, vocab 16384):
-    //     1578 of 16198 learned pieces (9.7%) were cased. Unconditional collapse takes that to 257
-    //     (1.6%), returning 1321 slots -- 8.2% of the vocabulary -- to shared content pieces, for
-    //     +1.17% tokens on held-out text. The 257 that remain are the genuinely mixed-case forms above.
-    //   * A threshold could not have fixed it. 92.4% of withheld forms never appear lowercase AT ALL,
-    //     so they are absent from `lower_count` and no `mid > lc*K` rule ever reaches them (measured
-    //     over 255 MB: 39612 pure-name forms vs 3258 ambiguous). See tests/casing_policy_tests.cpp.
+    //     `Am` `Sa`) assembled per name. Measured on the PRODUCTION BLEND (95 MB of cosmopedia +
+    //     minipile + fineweb_edu, vocab 16384): 1952 of 16196 learned pieces (12.1%) were cased.
+    //     Unconditional collapse takes that to 319 (2.0%), returning 1633 slots -- 10.1% of the
+    //     vocabulary -- to shared content pieces, for +1.36% tokens on held-out text. The 319 that
+    //     remain are the genuinely mixed-case forms above.
+    //   * Code makes this WORSE, not better, so the blend is the case that matters. Prose alone
+    //     (cosmopedia, 64 MB) gives 9.7% -> 1.6% for +1.17%; adding minipile's code raises the cased
+    //     share to 12.1% (ALL_CAPS constants, CamelCase identifiers), so the saving grows faster than
+    //     the token cost. A prose-only measurement would have UNDERSTATED the win.
+    //   * A threshold could not have fixed it, on any corpus. Pure names -- forms that never appear
+    //     lowercase at all -- are absent from `lower_count`, so no `mid > lc*K` rule ever reaches them.
+    //     They are 92.9% of withheld forms in prose, 91.0% in code, 91.5% on the blend.
+    //     See tests/casing_policy_tests.cpp for all of the above.
     //
     // This is the representational half of the proper-noun repetition defect (docs/REPETITION.md):
     // each name needed several independent predictions from rarely-trained cased embeddings, and the
