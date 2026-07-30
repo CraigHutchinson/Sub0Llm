@@ -291,6 +291,49 @@ unchanged on an unmodified default build) runs after every one.
   land at executions 0/4/8/12 so pass 2 does read slots contributed by the head and by pass 1 — the
   channel under test is exercised rather than accidentally null.
 
+## 6a. The arm matrix — why D alone cannot answer the question
+
+Arm D vs arm B conflates two different claims: that depth attention helps **looping specifically** (the
+symmetry-breaking hypothesis this was scoped for) and that it helps **anything**. Depth attention is not
+loop-specific — it mixes V across whatever depth axis exists. So the arms form a 2×2 and the quantity the
+hypothesis actually predicts is the INTERACTION term, not a single difference:
+
+|                     | no depth attention | depth attention |
+|---------------------|--------------------|-----------------|
+| **shallow**, 10 exec, 7.23M | C (`ls_C_shallow10_s1b`) | **E** (`ls_E_depth4_flat`) |
+| **looped**, 16 exec, 7.23M  | B (`ls_B_loop10x6_s1`)   | **D** (`ls_D_depth4_s1`) |
+
+with arm A (`ls_A_deep16_s1`, 16 real layers, 9.66M) as the real-depth reference.
+
+```
+  hypothesis holds      ->  (D - B) - (E - C)  >  0    depth attention pays off MORE under looping
+  helps everything      ->  (D - B) - (E - C) ~=  0    a generic gain, unrelated to the loop
+```
+
+Without E, a positive D−B is unattributable — the same hole arm C was added to close one level down,
+where B-vs-A could not separate "the loop did it" from "10 layers was already enough".
+
+**Arm E matches D's STRIDE, not its slot count** (E: 10 executions → 3 slots; D: 16 → 4). The mechanism
+is "every 4th execution contributes to the cache", so equal stride means equal append DENSITY. Matching
+slot count instead would need stride 3 for E, giving it a denser mechanism than D and confounding the
+interaction term with how often the cache is written.
+
+## 6b. Fixed tokens vs plateau — two different questions
+
+The arms were first compared at a pinned 8586 steps (1,969,422,336 tokens). That answers "which is better
+per token", and it is NOT the same as "which is better". Arm D reached arm B's FINAL value about 11%
+early in tokens, which is exactly the signature of faster early convergence that washes out — and a
+fixed-token comparison structurally cannot separate that from a genuinely better model.
+
+Running each arm to its natural plateau answers the second question, and costs almost nothing extra to
+read: **evals land every 477 steps and 8586 = 477 × 18 is itself an eval point**, so a plateau run
+CONTAINS the token-matched comparison as one row of its own log. One set of runs, both answers.
+
+Resuming is sound rather than merely convenient: `lr_schedule(step, peak, warmup)` (train_stage.cpp) is a
+pure function of the global step — linear warmup then horizon-free inverse-sqrt — so continuing an arm
+under a larger step cap follows the identical trajectory it would have had. Plateau-stopping is the
+native mode here; the fixed `--steps` was the token-matching override.
+
 ## 7. What arm D is expected to show
 
 If the fixed-point hypothesis is right, depth attention should help the LOOPED arm specifically and
