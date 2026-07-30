@@ -916,6 +916,11 @@ struct GpuTrainer {
     // (CUDA errors are sticky); the caller must stop touching the device entirely once this is false,
     // not just log and keep training on stale/garbage state.
     bool ok = true;
+    // Set by enable() when the requested batch cannot fit VRAM. Distinguishes "this run is
+    // MISCONFIGURED, stop" from enable()'s ordinary false, which means "no device path available, use the
+    // CPU loop". Falling back to CPU here would be as invalidating as clamping the batch and far slower:
+    // the caller turns this into a nonzero exit so the misconfiguration is fixed rather than absorbed.
+    bool fatal = false;
 
     // Enable the device path: requires the CUDA backend, a device, and a batch within the
     // resident scratch width. Uploads the current host params (+ optimizer moments, zero on a
@@ -969,11 +974,42 @@ struct GpuTrainer {
             const int free_mb = sub0_dev_free_mem_mb();
             const int vram_budget = (free_mb > 0 ? std::min(free_mb, static_cast<int>(GPU_VRAM_MB)) : GPU_VRAM_MB)
                                     - kVramHeadroomMB;
-            const int floor = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
-            if (floor < 1 || sub0_dev_train_reserve(floor) != 0) return false;   // even the floor doesn't fit
-            sub0::log::warn("batch {} did not fit VRAM -- falling back to {} ({} MiB usable of {} free)",
-                            batch, floor, vram_budget, free_mb);
-            batch = floor;
+            const int fits = sub0::memplan::max_batch_for_vram(dims, vram_budget, batch, act_b);
+            // REFUSE rather than silently shrink. This used to clamp `batch = fits` behind a log::warn,
+            // which is a worse failure than stopping: `lr` was already derived from the REQUESTED batch by
+            // the sqrt rule (cli_stages.hpp), and tokens_per_step is sized from it, so a clamped run is not
+            // a degraded version of the requested run -- it is a DIFFERENT one, with a mismatched lr/batch
+            // pairing and a different tokens-per-step, announced by one warn line in a multi-hour log. That
+            // silently invalidates any A/B whose arms are supposed to be batch-matched. The remedy is a
+            // rerun at a batch that fits, which is a one-line change, so name it exactly and stop.
+            //
+            // Note this became far more reachable once the driver was set to "prefer no Sysmem Fallback":
+            // an over-budget cudaMalloc now FAILS instead of migrating to shared memory, so this path fires
+            // where it previously would have spilled and merely run slowly.
+            sub0::log::error("batch {} does not fit VRAM: memplan predicts {} MiB, {} MiB usable "
+                             "({} MiB free, {} MiB headroom reserved). Largest batch that fits: {}.",
+                             batch, sub0::memplan::train_resident_mb(dims, batch, act_b), vram_budget,
+                             free_mb, kVramHeadroomMB, fits);
+            sub0::log::error("  NOT shrinking the batch automatically -- lr was derived from batch {} by the "
+                             "sqrt rule, so a shrunk run would differ from the requested one in BOTH batch "
+                             "and effective lr. Re-run with --batch {} (lr will re-derive), or free VRAM.",
+                             batch, fits >= 1 ? fits : 1);
+            if constexpr (sub0::USE_DEPTH_ATTN) {
+                const int desired = (VOCAB + D_FF - 1) / D_FF;
+                if (desired > sub0::memplan::LOGITS_MAX_CHUNKS)
+                    sub0::log::error("  This build's logits chunk count is clamped {}x (wants {}, capped at "
+                                     "{}); rebuilding with -DSUB0_LOGITS_MAX_CHUNKS={} frees {} MiB and may "
+                                     "let batch {} fit as-is.",
+                                     desired / sub0::memplan::LOGITS_MAX_CHUNKS, desired,
+                                     sub0::memplan::LOGITS_MAX_CHUNKS, desired,
+                                     sub0::memplan::train_resident_mb(dims, batch, act_b)
+                                         - sub0::memplan::train_resident_mb(
+                                               [&] { auto t2 = dims; t2.logits_chunks = desired; return t2; }(),
+                                               batch, act_b),
+                                     batch);
+            }
+            fatal = true;    // caller turns this into a nonzero exit rather than a CPU fallback
+            return false;
         }
         t = resume_t;
         active = true;
@@ -1816,6 +1852,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // capability check stays per-window (needs_cpu below) rather than collapsing hybrid_train back to
     // gpu_train so a future partial-capability backend degrades gracefully instead of miscomposing.
     const bool gpu_available = gpu.enable(batch, opt.step_count());
+    // A batch that cannot fit VRAM is a MISCONFIGURATION, not a reason to quietly train on the CPU: see
+    // GpuTrainer::fatal. enable() has already logged the shortfall and the exact --batch that would fit.
+    if (gpu.fatal) return 1;
     const bool gpu_train      = !content_embed_active && gpu_available;   // pure GPU: no CPU-only source active
     const bool hybrid_train   =  content_embed_active && gpu_available;   // source-routed split (see above)
     gpu.hybrid = hybrid_train;
