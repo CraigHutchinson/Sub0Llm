@@ -91,6 +91,53 @@ a decode-time penalty would paper over while leaving the cause untouched. It wou
 Immediate `X X` repeats are real but rarer (~1 per 700 words) than `X and X`, so the dramatic
 `Dear Dear Dear` case is the tail of the distribution rather than the typical failure.
 
+## MEASURED: the repeats are 6.7x enriched for CAPITALISED words
+
+12 seeds x 500 tokens, counting immediate `X X` and `X and X` while preserving case:
+
+```
+words   3028    capitalised 418  (13.8% base rate)
+repeats   41    of which capitalised 38  (92.7%)
+enrichment                          6.7x
+```
+
+Under the null that repeats are a random sample of words, ~5.7 of 41 would be capitalised. Observed 38 —
+roughly **14 sigma**. This is not a generic repetition defect; it is a **capitalised-word** defect, and it
+is the strongest signal in any of these probes.
+
+### Why: proper nouns shatter into short rare cased fragments
+
+`casing.hpp` implements **corpus-aware truecasing** (see the `names` counter, "capitalized/upper words
+left verbatim"). Incidental capitalisation — sentence-initial — collapses to `<|cap|>` + lowercase, but
+words habitually capitalised in the corpus keep their capital verbatim. So capitalised text in generation
+is overwhelmingly **proper nouns**, and those take the verbatim path.
+
+The vocab confirms what that path costs: **1469 of 16220 merges (9.1%) contain an uppercase letter**, and
+they are short — `Al`, `Ma`, `Ch`, `Am`, `Sa`. Proper nouns are therefore *not* single tokens; they are
+assembled from two-character cased fragments. Consequences:
+
+* more tokens per name, so more independent predictions to get right;
+* each fragment carries little information and is individually rare, so its embedding is poorly trained;
+* the model must hold a name together across several steps, and the cheapest way to emit a *valid* one is
+  to copy a name already in context.
+
+That is exactly the observed failure — `Chief of the Chief of Musher Officer Officer`. The proper-noun
+slot is where the model has the least usable signal and the strongest incentive to copy, which is why 93%
+of repeats land there.
+
+This is a representation/capacity problem, not a decoding one — consistent with the top-k probe finding no
+sampler-width effect. It also sharpens why a repetition penalty is the wrong instrument here: forbidding
+the repeat in a proper-noun slot yields a *different arbitrary name*, not a correct one. `Officer Officer`
+becomes `Officer Bronx`. The sample looks better and the model is no better.
+
+### The tokenizer-design question this raises
+
+9.1% of vocab is spent on short cased fragments. Worth asking, and cheap to measure, whether the
+corpus-aware truecasing threshold is well calibrated: if too many words are classified as "names" and kept
+verbatim, vocab is spent fragmenting a long tail that the model cannot learn anyway, while the same
+budget as lowercase merges would serve the body text. This is a real input to the **schemeV4** work rather
+than a separate task — see the marker carry-forward note in that backlog.
+
 ## Still worth doing: the distributional measurement
 
 The three causes above predict **different, measurable things** at the moment the loop starts, and the
