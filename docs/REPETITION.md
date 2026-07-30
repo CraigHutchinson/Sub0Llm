@@ -58,7 +58,40 @@ worth auditing. But the observed loops do not look like corpus boilerplate, and 
 so the strongest signal available — *what did I just emit* — dominates. Arm A is also still improving at
 3.8 epochs, so it is undertrained on top of being small.
 
-## Decide with a measurement, not an argument
+## MEASURED: widening top-k does not reduce repetition
+
+Before the distributional measurement below, a cheap behavioural probe — 10 seeds x 500 tokens per
+condition, same prompt, counting immediate `X X` repeats and the `X and X` coordination pattern:
+
+| `--topk` | words | immediate `X X` | `X and X` | rate |
+|---|---|---|---|---|
+| 20 | 2507 | 3 | 5 | 1 per 501 words |
+| 100 | 2463 | 5 | 6 | 1 per 410 words |
+
+**A 5x wider candidate set produced no reduction.** That is the opposite of what mechanism 1 predicts:
+if top-20 renormalization were inflating a mid-probability repeat, admitting 100 candidates would spread
+the mass and the rate would fall visibly. It did not move.
+
+Statistical honesty: at counts of 5-6 the Poisson 95% interval is roughly [1.6, 11.7], so this does NOT
+show top-k 100 is *worse* — the two conditions are statistically indistinguishable. What it does rule out
+is the large reduction the sampler hypothesis requires. Absence of the predicted effect is the finding.
+
+So the weight of evidence points at the **model's own distribution**, not the decoder: the repeat is
+probably not an artifact of the cutoff, it is what the model actually wants. That moves mechanism 2 (the
+objective) ahead of mechanism 1 and, notably, agrees with the original instinct that a decode-time
+penalty would be a plaster.
+
+The `X and X` pattern is the informative one, and it is more specific than a generic loop: the model has
+learned the coordination frame `N and N` but cannot retrieve a *distinct* related noun for the second
+slot, so it re-emits the most salient candidate in context — the one it just produced. That is a capacity
+failure in content retrieval wearing the costume of a repetition bug, which is exactly the kind of thing
+a decode-time penalty would paper over while leaving the cause untouched. It would suppress the visible
+`science and science` and replace it with a *different* wrong noun, not a right one.
+
+Immediate `X X` repeats are real but rarer (~1 per 700 words) than `X and X`, so the dramatic
+`Dear Dear Dear` case is the tail of the distribution rather than the typical failure.
+
+## Still worth doing: the distributional measurement
 
 The three causes above predict **different, measurable things** at the moment the loop starts, and the
 experiment is cheap. Take the exact generated prefix up to the second `Dear`, run it through batched
@@ -74,17 +107,23 @@ position:
 Do this before investing in either fix. It costs one scoring run and it converts "penalty vs deeper fix"
 from a judgement call into a reading. Guessing here has a poor track record in this project.
 
-## Ordering
+## Ordering (revised after the top-k probe)
 
-1. **Measure** (above). One run, decides everything downstream.
-2. **min-p sampling** to replace/augment top-k — justified on its own merits regardless of what the
-   measurement says, since top-k's fixed cutoff is wrong in both entropy regimes.
-3. **Repetition penalty** only if the measurement says the sampler is not the binding cause and the
-   objective work is not yet affordable — explicitly as a stopgap, documented as one.
-4. **Unlikelihood or contrastive term** in the training objective if the measurement shows the model
-   genuinely assigns high probability to the repeat. This is the fix that removes the need for item 3.
-5. **Corpus near-duplicate audit** — cheap to run, and it bounds how much of item 4 is really a data
-   problem.
+1. **Confirm with the distributional measurement** (above) once a build dir is free. The behavioural
+   probe already points away from the sampler; this reads `p(repeat)` directly and settles it.
+2. **Unlikelihood or contrastive term** in the training objective — promoted ahead of the sampler work,
+   because the top-k probe found no sampler-width effect. This is the fix that addresses the cause.
+3. **Corpus near-duplicate audit** — cheap, and it bounds how much of item 2 is really a data problem
+   rather than a capacity one. Worth doing before investing in an objective change.
+4. **min-p sampling** to replace/augment top-k — still worth doing on its own merits, since top-k's fixed
+   cutoff is wrong in both entropy regimes, but it should **no longer be expected to fix this** and must
+   not be reported as having done so.
+5. **Repetition penalty** — last, and only as an explicitly documented stopgap. Given the `X and X`
+   finding it would suppress a visible wrong noun in favour of a different wrong noun, which flatters the
+   samples without improving the model.
+
+Note the reordering is itself the point: the original list led with the sampler on a plausible-sounding
+argument, and one cheap measurement inverted it.
 
 ## Do not land any of this mid-sweep
 
