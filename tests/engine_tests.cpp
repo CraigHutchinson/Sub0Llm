@@ -472,3 +472,41 @@ TEST_CASE("kv_decode_generate stops before pushing EOS (never emits <|endoftext|
         REQUIRE(sub0::detokenize(ctx).find("<|endoftext|>") == std::string::npos);
     }
 }
+
+// Regression test for a silent integer-truncation bug in render_expansion (engine_core.cpp), the
+// renderer behind vocab_entries() and therefore behind `sub0llm vocab`.
+//
+// It special-cased TOK_CAP and TOK_UP, then cast every remaining code to unsigned char. TOK_EOS is 256,
+// so the cast WRAPPED IT TO 0 and the end-of-text marker rendered as `\x00` -- byte-for-byte identical to
+// the real NUL byte at id 0, which casing.hpp:39 documents as being deliberately distinct from it. The
+// vocab table is the first thing anyone reads when chasing a suspected tokenizer bug, and it was quietly
+// aliasing the one structurally important token in that region onto an unrelated byte.
+//
+// Pins BOTH halves: that EOS renders as itself, and that it does not collide with id 0. The collision
+// check is the one that actually failed before the fix -- asserting only the text would have passed on any
+// renderer that happened to print something, while the ids stayed indistinguishable.
+TEST_CASE("vocab: the EOS marker renders as itself, not as a wrapped NUL byte", "[engine][tokenizer]") {
+    REQUIRE(sub0::load_tokenizer(sub0::default_tokenizer()));
+    const std::vector<sub0::TokenEntry> rows = sub0::vocab_entries();
+    REQUIRE(rows.size() > static_cast<std::size_t>(sub0::casing::TOK_EOS));
+
+    const sub0::TokenEntry& eos = rows[static_cast<std::size_t>(sub0::casing::TOK_EOS)];
+    CHECK(eos.id == sub0::casing::TOK_EOS);
+    CHECK(eos.kind == sub0::TokenEntry::Kind::Eos);      // not Byte, which is what the fallthrough gave
+    CHECK(eos.text == "<|endoftext|>");
+
+    // THE regression: id 0 (a real NUL) and id 256 (EOS) used to render identically.
+    CHECK(rows[0].text != eos.text);
+    CHECK(rows[0].kind == sub0::TokenEntry::Kind::Byte);
+
+    // The other two markers keep their existing rendering -- this fix must not disturb them.
+    CHECK(rows[static_cast<std::size_t>(sub0::casing::TOK_CAP)].text == "<|cap|>");
+    CHECK(rows[static_cast<std::size_t>(sub0::casing::TOK_UP)].text  == "<|up|>");
+
+    // No in-range byte may claim a marker's rendering, and nothing may render empty -- an empty cell in
+    // the vocab table is indistinguishable from a missing entry.
+    for (std::size_t id = 0; id < rows.size(); ++id) {
+        INFO("id " << id << " kind " << static_cast<int>(rows[id].kind));
+        CHECK(!rows[id].text.empty());
+    }
+}

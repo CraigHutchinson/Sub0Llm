@@ -454,6 +454,7 @@ extern "C" SUB0_API int sub0_vocab_stage(const char* tokenizer_path, int limit) 
         const char* kind = e.kind == sub0::TokenEntry::Kind::Byte      ? "byte"
                          : e.kind == sub0::TokenEntry::Kind::CapMarker ? "cap"
                          : e.kind == sub0::TokenEntry::Kind::UpMarker  ? "up"
+                         : e.kind == sub0::TokenEntry::Kind::Eos       ? "eos"
                                                                        : "merge";
         std::println("{:>6}  {:<6}  {:>3}  {}", e.id, kind, e.expansion_len, e.text);
     }

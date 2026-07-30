@@ -106,7 +106,7 @@ SUB0_API int sample_token(const float* logits, float temp, int topk, std::mt1993
 // rendering of the token's expansion (control/high bytes escaped, case markers
 // shown as <|cap|>/<|up|>); `expansion_len` is how many base symbols it covers.
 struct TokenEntry {
-    enum class Kind : std::uint8_t { Byte, CapMarker, UpMarker, Merge };
+    enum class Kind : std::uint8_t { Byte, CapMarker, UpMarker, Eos, Merge };
     int         id   = 0;
     Kind        kind = Kind::Byte;
     std::string text;

@@ -249,6 +249,20 @@ std::string render_expansion(const std::vector<int>& codes) {
     for (int code : codes) {
         if (code == casing::TOK_CAP)      { s += "<|cap|>"; continue; }
         if (code == casing::TOK_UP)       { s += "<|up|>";  continue; }
+        if (code == casing::TOK_EOS)      { s += "<|endoftext|>"; continue; }
+        // Any OTHER out-of-byte-range code is rendered explicitly rather than cast. Without this the
+        // cast below silently wraps: TOK_EOS (256) became `\x00`, aliasing it onto the real NUL byte at
+        // id 0 -- the exact distinction casing.hpp documents these two as having. `sub0llm vocab` showed
+        // the end-of-text marker as an indistinguishable `byte \x00`, which is the table someone reads
+        // FIRST when chasing a suspected tokenizer bug. Marker ids auto-increment from TOK_EOS, so a
+        // future marker added without a case here degrades to a visible `<|?NNN|>` instead of aliasing
+        // onto some unrelated byte.
+        if (code < 0 || code > 0xFF) {
+            char b[16];
+            std::snprintf(b, sizeof b, "<|?%d|>", code);
+            s += b;
+            continue;
+        }
         const unsigned char c = static_cast<unsigned char>(code);
         switch (c) {
             case '\n': s += "\\n"; break;
@@ -274,6 +288,7 @@ std::vector<TokenEntry> vocab_entries() {
         if (static_cast<int>(id) >= g_tok.n_base)        e.kind = TokenEntry::Kind::Merge;
         else if (!exp.empty() && exp[0] == casing::TOK_CAP) e.kind = TokenEntry::Kind::CapMarker;
         else if (!exp.empty() && exp[0] == casing::TOK_UP)  e.kind = TokenEntry::Kind::UpMarker;
+        else if (!exp.empty() && exp[0] == casing::TOK_EOS) e.kind = TokenEntry::Kind::Eos;
         else                                                e.kind = TokenEntry::Kind::Byte;
         e.expansion_len = static_cast<int>(exp.size());
         e.text = render_expansion(exp);
