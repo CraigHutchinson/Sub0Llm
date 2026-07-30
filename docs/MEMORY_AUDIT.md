@@ -54,10 +54,35 @@ Sizes at arm D's shape (M = 229,376 training rows):
                      logits alone is ~488 MiB                  ~=  578 MiB   <-- the big one
 ```
 
-**The single largest unmodelled item is the eval-path forward scratch.** `train_resident_bytes` models a
-training step in isolation, but every real run also evaluates in-process, and `fwd_alloc(full=true)`
-allocates and RETAINS ~578 MiB alongside the training arenas from the first eval onward. A footprint
-model used to answer "does batch B fit?" must include it.
+**CORRECTION (the eval scratch is NOT resident during training).** An earlier revision of this document
+claimed the eval-path forward scratch (~578 MiB) was the largest unmodelled item. It is not resident at
+all: `sub0_cuda_train_step` and `sub0_cuda_train_reserve` both call `fwd_alloc(batch, /*full=*/false, T)`,
+and the training loop's own periodic eval deliberately runs on the CPU
+(`sub0::eval::Session cpu_only(/*allow=*/false)` in train_stage.cpp). So `full=true` never fires during a
+training run. The remaining unmodelled owners are real but small (`ensure_bwd_stats` ~16 MiB — reserved up
+front by `train_reserve` — plus Muon, bindings, eval and decode buffers).
+
+That leaves the ~1650 MiB gap UNATTRIBUTED. It has now been mis-attributed twice (first to other
+processes' graphics allocations, then to eval scratch), so the remaining candidates are stated as
+candidates, not conclusions: the CUDA primary context, the loaded module/fatbin (this `.cu` is ~5.8K lines
+of heavily templated kernels, so it is not small), the cuBLAS workspace, two captured CUDA graphs, and
+allocator granularity across ~80 allocations. **Do not guess a third time — run 3b's checkpointed
+`cudaMemGetInfo` sampling**, which attributes each of those exactly and costs one short run.
+
+### Host offload: why it does not help here
+
+Asked directly: can non-training allocations move to the CPU? Almost none, because **everything resident
+is touched every step**, so offloading buys VRAM at the cost of a PCIe round-trip per step:
+
+| candidate | size at arm D | verdict |
+|---|---|---|
+| `h_in`/`h_mid` per-execution checkpoints | 2716 MiB | read in every backward; streaming 2.7 GiB per step is seconds |
+| optimizer moments `m`/`vel` | 55 MiB | AdamW runs on-device |
+| bf16 weight mirrors | 8 MiB | GEMM operands |
+| eval forward scratch | — | ALREADY CPU-side |
+
+Offload pays for data touched RARELY, and the only thing that qualified is already there. The productive
+direction is therefore to make the resident set smaller (§4), not to relocate it.
 
 ## 2. Why cuBLAS is not the explanation
 
@@ -198,10 +223,13 @@ clamp path already handles. Requires driver 536+; this host is on 596.36.
 
 | lever | saving at arm D's shape | note |
 |---|---|---|
-| eval scratch not resident during training | ~578 MiB | free it between evals, or size it from a smaller budget |
+| **`logits_chunk_rows`: 33 → 132 chunks** | **~328 MiB** | **the clean one.** The chunk loop already exists and is documented as mathematically identical to the unchunked path, so results do not move — only launch count rises, and each chunk still does a large GEMM so it amortises. Needs the derived ratio to become a knob. |
 | depth f32 gradient accumulators → bf16 | ~352 MiB | slot 0 takes contributions from up to 15 executions; parity is cos 0.99992 today, so measure before spending it |
 | depth stride 4 → 8 | ~525 MiB | changes the mechanism under test — not a free lever |
-| logits chunk (already 33×) | tunable | `logits_chunk_rows` is the knob |
+| eval scratch | 0 | already not resident (see the correction above) |
+
+`logits_chunk_rows` + bf16 accumulators together (~680 MiB) would take arm D from ~620 MiB over the card
+to comfortably inside it — and the larger half of that costs no precision.
 
 The per-execution checkpoints (2716 MiB, 40%) are inherent to a 16-execution arm and are not a lever
 without changing the experiment.
