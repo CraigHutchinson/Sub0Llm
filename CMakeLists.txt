@@ -196,6 +196,13 @@ add_executable(sub0llm-tokenizer tools/sub0llm-tokenizer.cpp)
 target_include_directories(sub0llm-tokenizer PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0_frontend)
 
+# SPIKE tool (docs/TUTOR.md): splices the 3-population corpus the mastery-surface experiment is defined
+# against. Config-independent like the tools above -- it only reads and writes text, so it needs neither
+# the generated header nor the engine. Retires with the spike (AGENTS.md 11).
+add_executable(sub0llm-tutorspike tools/sub0llm-tutorspike.cpp)
+target_include_directories(sub0llm-tutorspike PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-tutorspike PRIVATE CLI11::CLI11 sub0_frontend)
+
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
 set(GEN_HEADER "${GEN_DIR}/sub0_config.hpp")
