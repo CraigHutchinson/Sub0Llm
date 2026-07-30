@@ -223,6 +223,48 @@ Per the same review, build these as extension points rather than a closed design
 * the per-item ledger is independently useful for **data selection and curriculum** later, not only for
   stopping — which is a reason to build it even if the stopping criterion ends up simple.
 
+## 4b. FIRST EXPERIMENT: TinyStories smoke collection
+
+Agreed in review as the entry point, and it is well chosen — it does **three jobs in one run**.
+
+TinyStories suits this better than the production corpus for reasons that matter here:
+
+* **stories are coherent self-contained blocks**, so a document *is* the semantic unit. That answers
+  **[Q7]** for the first experiment with no clustering machinery — probe = story;
+* it **trains fast at small scale**, so a genuinely converged curve is hours not days;
+* it is the corpus family the `DEFAULT_EXPECTED_PLATEAU_EPOCH = 2.0` ledger was largely built from, so
+  whatever it shows bears directly on whether that ledger is artifact.
+
+### What one run yields
+
+1. **A true-plateau positive control.** Run unbounded (no early stop, generous cap). If the global curve
+   keeps improving past ~1.9 epochs, the ledger entries are stopping-rule artifacts. If it genuinely
+   flattens, we finally own **one converged curve** — the thing §4's validation gap says we cannot
+   manufacture.
+2. **A direct test of the novelty framing.** With per-probe losses logged, check whether global step-downs
+   coincide with groups of probes crossing their knee. This is the prediction that distinguishes §4a from
+   §5, and it is much easier to read on short self-contained stories than on web text.
+3. **A first look at coverage as a signal** — does *fraction of probes converged* move smoothly enough to
+   drive a decision (**[Q8]**), and where does it stall (**[Q9]**)?
+
+### Instrumentation needed
+
+Deliberately minimal, and additive — nothing on the training path changes:
+
+* a **fixed held-out probe set** sampled once and stored as data (not code), so stratification can change
+  without a rebuild;
+* **per-probe loss logged at eval cadence** to a series file alongside `train.log`. Scoring goes through
+  batched `forward()`, matching the standing policy for scoring, and reuses the existing eval seam.
+
+Cost is the thing to watch: a few thousand probes at every eval is not free. Start with a **small probe
+set and a coarser probe cadence than the main eval** (e.g. once per epoch), since the S-curve knees we are
+looking for are epoch-scale, not eval-scale. Raise it only if the signal is too sparse to read.
+
+**[Q10]** Should probes be excluded from training, or is it enough that they are held-out documents the
+sampler never draws? They must be genuinely unseen for the overfit-detection half of §4a to work — worth
+confirming the window sampler can be told to skip them, rather than assuming the held-out split already
+does.
+
 ## 5. Candidate mechanisms, to be narrowed
 
 Not a menu to implement — a list to argue down to one.
