@@ -779,9 +779,19 @@ std::string ckpt_step_path(const std::string& model_path, long step) {
 std::string legacy_ckpt_path(const std::string& model_path) { return model_path + ".ckpt"; }
 
 // The state captured at the INSTANT the WSD cooldown was triggered, i.e. the end of the stable phase.
-// Deliberately NOT ".step"-named: list_step_ckpts() matches only that prefix, so this file is invisible
-// to prune_ckpts() (never deleted, however long the run goes) and to latest_ckpt_path() (never silently
-// auto-resumed). It is a rollback point you opt into by name.
+//
+// CARRIES ITS OWN STEP, for two reasons. A fixed name would make each anneal OVERWRITE the previous
+// one, which is precisely wrong for the rollback case: reject a plateau, keep training, re-plateau
+// later, and the earlier rollback point -- the one you might still want -- is gone. And a rollback
+// point is only interpretable if you know when it was taken: after a resume the step counter continues
+// from the restored checkpoint, so "which stable phase was this?" is not answerable from the file's
+// mtime or its position in the directory. The step is the context that makes several of these
+// comparable, and it matches ckpt_step_path()'s existing {:09d} convention so they sort correctly.
+//
+// Deliberately NOT ".step"-named though: list_step_ckpts() prefix-matches "<model>.step" at offset 0,
+// which "<model>.preanneal.step..." does not satisfy, so this file stays invisible to prune_ckpts()
+// (never deleted, however long the run goes) and to latest_ckpt_path() (never silently auto-resumed).
+// It is a rollback point you opt into by name.
 //
 // It exists because entering the cooldown is otherwise a ONE-WAY DOOR, and it is triggered by a
 // detector this project's own notes describe as miscalibrated -- window/patience are eval-count
@@ -790,7 +800,9 @@ std::string legacy_ckpt_path(const std::string& model_path) { return model_path 
 // false costs one anneal instead of the whole run, and the anneal itself becomes re-runnable: a
 // different cooldown length or floor can be tried from the identical stable-phase state, which also
 // makes those an A/B-able axis rather than a guess baked into a single trajectory.
-std::string preanneal_ckpt_path(const std::string& model_path) { return model_path + ".preanneal.ckpt"; }
+std::string preanneal_ckpt_path(const std::string& model_path, long step) {
+    return std::format("{}.preanneal.step{:09d}.ckpt", model_path, step);
+}
 
 // (step, path) for every progress-named checkpoint of this model, ascending by step.
 std::vector<std::pair<long, std::filesystem::path>> list_step_ckpts(const std::string& model_path) {
@@ -2662,10 +2674,27 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                     // entering the cooldown stops being a one-way door -- see preanneal_ckpt_path().
                     // Written with cooldown_start still -1 so restoring it resumes IN the stable phase,
                     // not at the head of an anneal it would then repeat.
-                    if (!save_checkpoint(preanneal_ckpt_path(model_path), opt.step_count(), rng, rs,
-                                         batch, lr, seed))
+                    const std::string preanneal = preanneal_ckpt_path(model_path, step);
+                    if (!save_checkpoint(preanneal, opt.step_count(), rng, rs, batch, lr, seed)) {
                         sub0::log::warn("could not save the pre-anneal checkpoint '{}' -- the cooldown "
-                                        "below will NOT be reversible", preanneal_ckpt_path(model_path));
+                                        "below will NOT be reversible", preanneal);
+                    } else {
+                        // The rollback point's whole value rests on prune_ckpts() not being able to see
+                        // it, which rests on its NAME not matching list_step_ckpts()'s prefix. That is a
+                        // relationship between two separate format strings in this file, enforced by
+                        // nothing -- and a comment is not a guard (this session has already found three
+                        // of those). Verify it against the real scanner, on the real file just written.
+                        // One directory scan, at most once per run.
+                        const auto listed = list_step_ckpts(model_path);
+                        const bool visible = std::any_of(listed.begin(), listed.end(), [&](const auto& e) {
+                            return e.second == std::filesystem::path(preanneal);
+                        });
+                        if (visible)
+                            sub0::log::error("pre-anneal checkpoint '{}' IS matched by the progress-file "
+                                             "scanner, so prune_ckpts will delete it and the cooldown is "
+                                             "NOT reversible -- preanneal_ckpt_path/ckpt_step_path have "
+                                             "drifted into the same shape; fix the naming.", preanneal);
+                    }
 
                     rs.cooldown_start = step;
                     cooldown_steps = sub0::lr::cooldown_steps_for(step);
@@ -2675,8 +2704,10 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                     static_cast<double>(peak_lr) * sub0::lr::FLOOR_FRACTION, cooldown_steps);
                     sub0::log::info("  pre-anneal state saved to '{}' -- restore it over the newest "
                                     ".step checkpoint to reject this plateau and keep training at peak, "
-                                    "or to re-anneal from the same state with different settings",
-                                    preanneal_ckpt_path(model_path));
+                                    "or to re-anneal from the same state with different settings. It is "
+                                    "never pruned and never auto-resumed; the step in the name is which "
+                                    "stable phase it ended, so repeated anneals do not overwrite it.",
+                                    preanneal);
                 }
                 // Cooldown complete -> the real end of training, at the LR floor. Only for a
                 // PLATEAU-triggered cooldown: a fixed-budget run's anneal is scheduled to land exactly on
