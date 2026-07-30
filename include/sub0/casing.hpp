@@ -176,7 +176,14 @@ static_assert(TOK_MARKER_COUNT - TOK_EOS == 32,
 //   corpora; ~10% of a prose stream was JOINs before this). A space-before deviation (` ,`) emits a
 //   literal space byte; a glue-after deviation still emits TOK_JOIN. No marker/id change (n_base fixed),
 //   only the encode/decode transition rule -- see lead_glue_default() and docs/TOKENIZER_V2_IDEAS.md D1.
-constexpr std::uint32_t kSchemeVersion = 4;
+//   4 -> 5 (this bump): case collapse is UNCONDITIONAL. A Capitalized/ALL-UPPER word always becomes a
+//   CAP/UP marker plus its lowercase form; the `attested` precondition ("a name-dominated form stays a
+//   distinct verbatim token") is gone. Another transition-rule-only change with n_base fixed, so the
+//   magic number alone would not catch it -- and this bump is load-bearing for a second reason: the
+//   configurator's reuse stamp keys on kSchemeVersion, so WITHOUT it a corpus.tok tokenized under the
+//   old rule would be silently reused. Measured: cased pieces 9.7% -> 1.6% of the vocabulary (1321
+//   slots returned) for +1.17% tokens; see emit_word and tests/casing_policy_tests.cpp.
+constexpr std::uint32_t kSchemeVersion = 5;
 
 constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
@@ -428,15 +435,48 @@ inline std::vector<std::size_t> camel_segments(std::string_view w) {
 inline void truecase_tokenize(std::string_view text,
                               const std::unordered_set<std::string>& attested,
                               TokStats* st, std::vector<int>& toks) {
+    // UNUSED as of schemeV4's unconditional collapse (see emit_word). Deliberately still in the
+    // signature: `attested` is threaded through Scan::add_words, Tokenizer, serialize/deserialize and
+    // the configurator's scan cache, and corpus PASS 1 (Scan::add_names -> lower_count/midcap_count ->
+    // derive_attested) exists for no other purpose. Removing it is a real simplification -- it deletes
+    // a whole pass over a 44 GB corpus and a set from the on-disk format -- but it spans ~8 files, so
+    // it is a separate change rather than a drive-by on top of a behaviour change.
+    // TODO(drop-attested): remove pass 1 and this parameter; see tests/casing_policy_tests.cpp for
+    // the measurement that made the parameter dead.
+    (void)attested;
     toks.clear();
     toks.reserve(text.size());
     const std::size_t n = text.size();
 
-    // Emit ONE (sub-)word: classify its case and either collapse to a CAP/UP marker + the
-    // lowercase form, or keep it verbatim. `force_collapse` is set for CamelCase segments
-    // (the capital is structural word-boundary signal, not a name), so they always collapse
-    // and reuse the lowercase merges; a top-level word collapses only if its lowercase form
-    // is `attested` (a name-dominated form like "Spot" stays a distinct verbatim token).
+    // Emit ONE (sub-)word: a Capitalized or ALL-UPPER word collapses to a CAP/UP marker plus its
+    // lowercase form; anything else (all-lower, or genuinely mixed case like "iPhone"/"McDonald")
+    // is emitted verbatim.
+    //
+    // schemeV4 (2026-07-30): collapse is now UNCONDITIONAL. It used to require the lowercase form be
+    // `attested` -- appearing all-lowercase at least as often as it appeared capitalized mid-sentence
+    // -- so that "a name-dominated form like Spot stays a distinct verbatim token". That reasoning does
+    // not survive measurement:
+    //
+    //   * It does NOT preserve a distinction that collapsing loses. `<|cap|>spot` and `spot` are
+    //     different token sequences either way; the marker factors the case out rather than discarding
+    //     it. The old rule bought no information, it only changed where the SPELLING came from.
+    //   * The spelling it bought was expensive. Verbatim names forced BPE to learn a second, duplicate
+    //     piece inventory that only capitalized words ever use -- short cased fragments (`Al` `Ma` `Ch`
+    //     `Am` `Sa`) assembled per name. Measured at production scale (64 MB cosmopedia, vocab 16384):
+    //     1578 of 16198 learned pieces (9.7%) were cased. Unconditional collapse takes that to 257
+    //     (1.6%), returning 1321 slots -- 8.2% of the vocabulary -- to shared content pieces, for
+    //     +1.17% tokens on held-out text. The 257 that remain are the genuinely mixed-case forms above.
+    //   * A threshold could not have fixed it. 92.4% of withheld forms never appear lowercase AT ALL,
+    //     so they are absent from `lower_count` and no `mid > lc*K` rule ever reaches them (measured
+    //     over 255 MB: 39612 pure-name forms vs 3258 ambiguous). See tests/casing_policy_tests.cpp.
+    //
+    // This is the representational half of the proper-noun repetition defect (docs/REPETITION.md):
+    // each name needed several independent predictions from rarely-trained cased embeddings, and the
+    // cheapest way to emit a VALID name was to copy one already in context.
+    //
+    // `force_collapse` (CamelCase segments) is therefore now redundant with the default, but is kept as
+    // the explicit statement of intent at its call site rather than silently relying on the new default.
+    // `attested` is no longer consulted here -- see truecase_tokenize's own note.
     auto emit_word = [&](std::string_view seg, bool force_collapse) {
         const bool first_upper = is_upper(static_cast<unsigned char>(seg[0]));
         bool rest_lower = true, all_upper = true;
@@ -452,7 +492,8 @@ inline void truecase_tokenize(std::string_view text,
 
         const bool capitalized = first_upper && rest_lower;     // "The", single "I", "Non"
         const bool upper       = all_upper && seg.size() >= 2;  // "HELLO", "HTML"
-        const bool collapse    = force_collapse || attested.contains(lw);
+        const bool collapse    = true;                          // see the note above; force_collapse
+        (void)force_collapse;                                   // is now subsumed by this default
 
         int marker = -1;
         if (upper && collapse)            marker = TOK_UP;

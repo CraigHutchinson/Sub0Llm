@@ -97,13 +97,22 @@ TEST_CASE("typographic input round-trips through the build tokenizer", "[tokeniz
     REQUIRE(sub0::detokenize(sub0::encode(in)) == sub0::casing::normalize_text(in, r));
 }
 
-TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokenizer]") {
-    // The inverse of the "They"/"they" sharing contract above. When a capitalized
-    // word dominates its lowercase form in the corpus, derive_attested withholds that
-    // form from case collapse, so the name stays a distinct *verbatim* token (e.g. the
-    // dog "Spot") rather than folding onto <|cap|>spot. Whether a word qualifies is a
-    // property of the corpus, so this builds a tiny deterministic in-memory corpus and
-    // learns a tokenizer on it directly -- no dependency on the baked production vocab.
+TEST_CASE("a name that shadows a noun still case-collapses, and stays distinguishable", "[tokenizer]") {
+    // schemeV5 INVERTED this case. It used to assert that a name dominating its lowercase form
+    // ("Spot" the dog) was WITHHELD from case collapse and kept as a distinct verbatim token. That
+    // policy is gone; collapse is now unconditional (casing.hpp emit_word).
+    //
+    // The test is kept, not deleted, because the claim that justified the change is exactly what it
+    // can pin: collapsing does NOT merge the name into the noun. `<|cap|>spot` and `spot` remain
+    // different token sequences, so the distinction the old rule was protecting survives -- it is
+    // FACTORED into the marker rather than carried by a duplicate cased spelling. What the old rule
+    // actually bought was a second, sparsely-trained cased piece inventory: measured at production
+    // scale, 9.7% of the vocabulary, cut to 1.6% by this change (tests/casing_policy_tests.cpp).
+    //
+    // derive_attested still computes `attested` and this test still pins its classification, because
+    // that machinery is still live (and its removal is the TODO(drop-attested) follow-up) -- it simply
+    // no longer gates collapse. Whether a word qualifies is a property of the corpus, so this builds a
+    // tiny deterministic in-memory corpus and learns on it directly -- no baked production vocab.
     //
     // "Spot" appears only capitalized mid-sentence (always preceded by a lowercase
     // word, the name-use signal) with a single lowercase "spot"; "they" appears only
@@ -118,21 +127,28 @@ TEST_CASE("a name that shadows a noun is withheld from case collapse", "[tokeniz
 
     const sub0::tok::Tokenizer t = sub0::tok::learn(corpus);
 
-    // The mechanism under test: "spot" (name-dominated) is withheld; "they" is attested.
+    // derive_attested still classifies as before -- "spot" is name-dominated and withheld, "they" is
+    // attested. Pinned so the classifier's behaviour is still covered while it exists.
     REQUIRE(t.attested.count("spot") == 0);
     REQUIRE(t.attested.count("they") == 1);
 
-    // The withheld name stays a verbatim capitalized token: NOT <|cap|> + the noun.
+    // ...but that classification NO LONGER gates collapse: the name folds onto <|cap|> + the noun,
+    // reusing the lowercase pieces instead of demanding its own cased ones.
     const std::vector<int> name = sub0::tok::encode(t, "Spot");
     const std::vector<int> noun = sub0::tok::encode(t, "spot");
     REQUIRE_FALSE(name.empty());
-    REQUIRE(name != noun);
     const bool encoded_as_cap_plus_noun =
         name.size() == noun.size() + 1 &&
         name.front() == sub0::casing::TOK_CAP &&
         std::vector<int>(name.begin() + 1, name.end()) == noun;
-    REQUIRE_FALSE(encoded_as_cap_plus_noun);
-    REQUIRE(sub0::tok::detokenize(t, name) == "Spot");  // capital preserved on the round-trip
+    REQUIRE(encoded_as_cap_plus_noun);
+
+    // The load-bearing pair, and the whole justification for collapsing: the name and the noun are
+    // still DIFFERENT token sequences, and the capital still survives the round-trip. If either of
+    // these ever fails, unconditional collapse really would be destroying information.
+    REQUIRE(name != noun);
+    REQUIRE(sub0::tok::detokenize(t, name) == "Spot");
+    REQUIRE(sub0::tok::detokenize(t, noun) == "spot");
 
     // Control: the attested word DOES case-share -- "They" = <|cap|> + "they".
     const std::vector<int> they_low = sub0::tok::encode(t, "they");

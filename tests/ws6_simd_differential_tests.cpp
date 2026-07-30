@@ -73,7 +73,14 @@ std::vector<int> truecase_tokenize(const std::string& text,
 
         const bool capitalized = first_upper && rest_lower;
         const bool upper       = all_upper && seg.size() >= 2;
-        const bool collapse    = force_collapse || attested.contains(lw);
+        // schemeV5: unconditional collapse, tracking casing.hpp's emit_word. This reference is a
+        // differential partner for the WS6 SIMD REWRITE -- its job is to prove the rewrite changed no
+        // bytes, not to freeze the casing POLICY. So a deliberate policy change is mirrored here rather
+        // than left to fail: leaving the old rule would mean this file guards a policy the production
+        // encoder no longer has, and every future WS6 assertion would compare against a fiction.
+        const bool collapse    = true;
+        (void)force_collapse;
+        (void)attested;
 
         int marker = -1;
         if (upper && collapse)            marker = TOK_UP;
