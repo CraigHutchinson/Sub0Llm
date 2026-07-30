@@ -1,4 +1,9 @@
-# Tutor — per-entry adaptive LR from a corpus mastery surface
+# Teacher / Tutor — per-entry adaptive LR from a corpus mastery surface
+
+> **Naming:** the spike is being run as **TeacherSpike**. "Tutor" was this doc's provisional working
+> name; both refer to the same scheme, and this file is the design record for it under either. Rename
+> the file to `TEACHER.md` once the split-session work settles on one — kept as-is for now because a
+> live handoff points at this path.
 
 **Status: BACKLOG, spike-shaped. Nothing here is agreed.** Proposed 2026-07-30, refined the same day.
 The interesting question is not "can this be built" — it can — but **"does the feedback pay for its own
