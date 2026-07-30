@@ -157,28 +157,39 @@ static_assert(DEPTH_CACHE_MAX <= LOOP_EXEC_COUNT, "depth cache cannot outnumber 
 //   own[e]  = the slot execution e appends to, or -1 if it does not participate.
 // Note own[e] == live[e] whenever e participates: an execution appends AFTER mixing, so it never reads
 // its own slot. The backward relies on that -- see docs/DEPTH_ATTENTION.md 5b.
-struct DepthSchedule {
-    std::array<int, LOOP_EXEC_COUNT> live{};
-    std::array<int, LOOP_EXEC_COUNT> own{};
+// Parameterised on (executions, stride) rather than reading the build's constants directly, so the
+// schedule for ANY configuration -- including one this binary was not built for -- can be computed and
+// asserted in a test. Without that, the only exercisable schedule is the current build's, and the shape
+// a long training run actually uses goes unverified. `stride <= 0` means depth attention is off.
+template <int EXECS>
+struct DepthScheduleT {
+    std::array<int, EXECS> live{};
+    std::array<int, EXECS> own{};
+    int slots = 0;               // how many cache entries exist at the END of a forward
 };
-consteval DepthSchedule make_depth_schedule() {
-    DepthSchedule d{};
+template <int EXECS>
+consteval DepthScheduleT<EXECS> depth_schedule_for(int stride) {
+    DepthScheduleT<EXECS> d{};
     int n = 0;
-    for (int e = 0; e < LOOP_EXEC_COUNT; ++e) {
+    for (int e = 0; e < EXECS; ++e) {
         d.live[static_cast<std::size_t>(e)] = n;
         // `&&` short-circuits during constant evaluation, so the modulo never runs at stride 0.
-        if (USE_DEPTH_ATTN && e % DEPTH_ATTN_STRIDE == 0) { d.own[static_cast<std::size_t>(e)] = n; ++n; }
-        else                                              { d.own[static_cast<std::size_t>(e)] = -1; }
+        if (stride > 0 && e % stride == 0) { d.own[static_cast<std::size_t>(e)] = n; ++n; }
+        else                               { d.own[static_cast<std::size_t>(e)] = -1; }
     }
+    d.slots = n;
     return d;
 }
-inline constexpr DepthSchedule DEPTH_SCHEDULE = make_depth_schedule();
+using DepthSchedule = DepthScheduleT<LOOP_EXEC_COUNT>;
+inline constexpr DepthSchedule DEPTH_SCHEDULE = depth_schedule_for<LOOP_EXEC_COUNT>(DEPTH_ATTN_STRIDE);
 // The schedule and the sizing constant must agree, or a buffer is short by one slot -- which on the
 // device is a silent out-of-bounds write, not an allocation failure.
-static_assert(!USE_DEPTH_ATTN ||
-              DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1]
-                  + (DEPTH_SCHEDULE.own[LOOP_EXEC_COUNT - 1] >= 0 ? 1 : 0) == DEPTH_CACHE_MAX,
-              "DEPTH_CACHE_MAX must equal the number of slots make_depth_schedule() fills");
+static_assert(DEPTH_SCHEDULE.slots == DEPTH_CACHE_MAX,
+              "DEPTH_CACHE_MAX must equal the number of slots depth_schedule_for() fills");
+// The device kernels size their per-depth shared arrays DEPTH_CACHE_MAX + 1, and index them [0, live[e]].
+// This is the invariant that makes that exactly sufficient rather than merely usually sufficient.
+static_assert(DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1] <= DEPTH_SCHEDULE.slots,
+              "a depth mix can never read more entries than the cache holds");
 
 // ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //

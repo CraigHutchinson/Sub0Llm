@@ -155,3 +155,62 @@ TEST_CASE("arch fingerprint stays bit-identical when depth attention is off", "[
     REQUIRE(sub0::ARCH_FINGERPRINT
             == sub0::arch_fingerprint(LOOP_MIDDLE_LAYERS, LOOP_REPEATS, ROPE_THETA, DEPTH_ATTN_STRIDE));
 }
+
+// sub0::DEPTH_SCHEDULE is the single source of truth for depth-cache slot bookkeeping across four sites
+// (CPU forward, CPU decode, CUDA forward, CUDA backward). An off-by-one in it is a silent device
+// out-of-bounds write and a silently wrong cross-execution gradient -- neither of which a loss curve
+// would reveal. depth_schedule_for<EXECS>(stride) is parameterised precisely so the shapes that MATTER
+// can be asserted here rather than only in whichever build happens to be configured.
+TEST_CASE("depth-attention schedule is correct at the shapes that matter", "[layout][depth]") {
+    // ARM D's actual configuration: 16 executions (L10, middle 6 x2), stride 4. Verified here because
+    // this is the shape a multi-hour training run uses, and no build in the test matrix is configured
+    // for it. Appends land at 0/4/8/12; the middle block is executions 2-7 (pass 1) and 8-13 (pass 2).
+    constexpr auto armd = sub0::depth_schedule_for<16>(4);
+    static_assert(armd.slots == 4);
+    static_assert(armd.own[0] == 0 && armd.own[4] == 1 && armd.own[8] == 2 && armd.own[12] == 3);
+    static_assert(armd.own[1] == -1 && armd.own[7] == -1 && armd.own[15] == -1);
+    static_assert(armd.live[0] == 0 && armd.live[4] == 1 && armd.live[8] == 2 && armd.live[12] == 3);
+    static_assert(armd.live[13] == 4 && armd.live[15] == 4);
+    // The mechanism arm D exists to test: pass 2 (executions 8-13) must read slots contributed EARLIER.
+    // live[8] == 2 means execution 8 mixes over the head's slot 0 and pass 1's slot 1. A stride that
+    // happened to append nothing before execution 8 would have made the whole experiment null.
+    static_assert(armd.live[8] >= 2, "arm D's pass 2 must see cross-pass depth entries");
+    REQUIRE(armd.live[8] == 2);
+
+    // Stride 1 (every execution participates) and stride 2, the shapes the parity gates ran at.
+    constexpr auto s1 = sub0::depth_schedule_for<16>(1);
+    static_assert(s1.slots == 16);
+    static_assert(s1.live[0] == 0 && s1.live[15] == 15);
+    constexpr auto s2 = sub0::depth_schedule_for<10>(2);
+    static_assert(s2.slots == 5);
+    static_assert(s2.own[0] == 0 && s2.own[2] == 1 && s2.own[8] == 4 && s2.own[9] == -1);
+    static_assert(s2.live[9] == 5);
+    REQUIRE(s2.slots == 5);
+
+    // Stride 0 is OFF: no slot is ever claimed, so nothing allocates and every kernel is bypassed.
+    constexpr auto off = sub0::depth_schedule_for<16>(0);
+    static_assert(off.slots == 0);
+    static_assert(off.own[0] == -1 && off.live[15] == 0);
+
+    // Two invariants the kernels depend on, checked across a sweep rather than at one point.
+    //  1. own[e] == live[e] whenever e participates -- an execution appends AFTER mixing, so it never
+    //     reads its own slot. The backward's `own_slot` sits exactly one PAST the readable range, which
+    //     is why the cache views hand out every slot instead of the first live[e].
+    //  2. live[e] <= slots -- what makes the kernels' DEPTH_CACHE_MAX+1 shared arrays exactly sufficient.
+    auto check = [](auto sched) {
+        for (std::size_t e = 0; e < sched.live.size(); ++e) {
+            if (sched.own[e] >= 0) REQUIRE(sched.own[e] == sched.live[e]);
+            REQUIRE(sched.live[e] <= sched.slots);
+        }
+    };
+    check(sub0::depth_schedule_for<16>(1));
+    check(sub0::depth_schedule_for<16>(3));   // does NOT divide 16 -- the ragged case
+    check(sub0::depth_schedule_for<16>(4));
+    check(sub0::depth_schedule_for<10>(2));
+    check(sub0::depth_schedule_for<7>(5));    // stride larger than half the executions
+    check(sub0::depth_schedule_for<1>(1));    // single execution: mixes over itself alone (identity)
+
+    // ...and this build's own schedule obeys them too.
+    check(sub0::DEPTH_SCHEDULE);
+    REQUIRE(sub0::DEPTH_SCHEDULE.slots == sub0::DEPTH_CACHE_MAX);
+}
