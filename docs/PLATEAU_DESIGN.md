@@ -134,6 +134,95 @@ Two consequences:
 **[Q5]** Is one converged curve enough to validate against? Almost certainly not — but it is infinitely
 more than zero, and each additional one is a full training run. What is the minimum viable positive set?
 
+## 4a. The reframe that may replace all of §5: novelty, not progress-through-training
+
+Contributed in review, and it is better motivated than the global-slope family below.
+
+**The current framing asks "how far through training am I?".** Every mechanism in §5 watches one scalar —
+corpus-average val_nelbo — and tries to infer saturation from its shape. But that scalar is an **average
+over a heterogeneous corpus**, and averages hide exactly what we need: different parts of the corpus are
+learned at different times, so a flat average can mean "everything is done" or "some parts are still
+improving while others plateaued long ago". Those need different decisions and the average cannot
+distinguish them.
+
+**The proposed framing asks "is what I am seeing novel?".** A concept that does not fit existing knowledge
+embeds slowly at first (foundations must form), then learning accelerates, then it saturates — an S-curve
+*per concept*. Weight belongs on **each window/sample**, giving feedback at every step, rather than on a
+global stage counter. Under this view:
+
+> **A plateau is not a flat loss curve. It is the point at which the corpus has consistent coverage** —
+> every part has been learned as well as it is going to be.
+
+### Why this is likely right: it explains the staircase
+
+Arm A's series is not smooth decay. It is flat stretches (jitter ~0.001) punctuated by step-downs ~0.005,
+five times over. The global-slope family has no explanation for that shape and has to be defended against
+it (§P3). The novelty framing predicts it directly: **a step-down is a cluster of related documents
+crossing the knee of its S-curve together.** Different clusters knee at different times; between knees the
+average is flat.
+
+**That is a testable prediction on data we already hold**, and it should be tested before committing to
+any design: instrument per-document or per-cluster loss, replay arm A, and check whether the step-downs
+coincide with groups of items converging. If they do, the novelty framing is the correct model of this
+process and §5's mechanisms are curve-fitting a symptom.
+
+### Prior art to ground it
+
+* **RHO-LOSS** (reducible holdout loss) — select on loss *reducibility* rather than raw loss, separating
+  "not yet learned" from "unlearnable".
+* **Automated curriculum learning** (Graves et al.) — learning-progress signals as the driver.
+* **Example forgetting** (Toneva et al.) — per-example learning/forgetting dynamics over training.
+
+A useful simplification for *our* purpose: RHO-LOSS separates unlearnable from unlearned because it is
+doing **data selection**. For **stopping**, both mean the same thing — no more to gain here — so we can
+skip the irreducible-loss model that makes RHO-LOSS expensive.
+
+### The cheap implementable version
+
+Full per-document tracking is millions of items of state and needs held-out evaluation to mean anything
+(training loss on seen data measures memorization). Proposal instead:
+
+* a **fixed stratified probe set** — a few thousand held-out documents sampled across the corpus's
+  clusters, scored periodically at the existing eval cadence;
+* per-probe loss curves, each reduced to a **converged / still-improving** verdict by the same
+  noise-adaptive test §5 needs anyway;
+* **coverage = fraction of probes converged**, and *that* is the stop signal.
+
+This reuses the eval machinery, costs a bounded amount per eval, and yields a directly interpretable
+number. It also degrades gracefully: with one probe cluster it reduces to today's global criterion.
+
+### It also answers the overfit requirement
+
+Raised in the same review: the corpus is iterated many times rather than streamed, so **the stop must
+double as an overfit guard**. A probe set is held out by construction, so a probe whose loss starts
+*rising* is a direct per-cluster overfit signal — detectable long before the corpus-average train/val gap
+widens enough to notice. On arm A that gap is currently *closing*, so there is no overfit pressure yet;
+this gives us the instrument to see it when there is.
+
+**[Q7]** Probe granularity: how are clusters defined — by source (fineweb/cosmopedia/minipile), by
+document length, by embedding cluster, or simply at random? Random is the honest default and needs no
+extra machinery; source-stratified is nearly free and probably more informative.
+
+**[Q8]** Per-probe noise is far higher than the corpus average, so per-probe convergence verdicts will be
+weak individually. Does the **fraction converged** aggregate cleanly enough to be a stable stop signal, or
+does it need its own smoothing? Simulation should answer this before implementation.
+
+**[Q9]** What happens when coverage stalls below 100% — some probes never converge because they are
+unlearnable at this capacity? The stop condition cannot be "all probes converged". Likely it is
+"coverage fraction itself has plateaued", which reintroduces a curve-shape test on a *better-conditioned*
+series (bounded [0,1], monotone-ish) rather than eliminating it.
+
+### Extensibility seams to preserve
+
+Per the same review, build these as extension points rather than a closed design:
+
+* the **per-item verdict** (converged?) should be a pluggable predicate, so §5's mechanisms can be swapped
+  underneath without touching the aggregation;
+* the **aggregation** (coverage) should be separable from the **decision** (stop / trigger cooldown);
+* the **probe set definition** should be data, not code, so stratification can change without a rebuild;
+* the per-item ledger is independently useful for **data selection and curriculum** later, not only for
+  stopping — which is a reason to build it even if the stopping criterion ends up simple.
+
 ## 5. Candidate mechanisms, to be narrowed
 
 Not a menu to implement — a list to argue down to one.
