@@ -35,7 +35,8 @@ extern "C" int  sub0_cuda_linear(const float* X, int T, int in, int out,
 extern "C" int  sub0_cuda_forward(const int* ids, int batch, int T, float* out_logits);
 extern "C" void sub0_cuda_set_tf32(int on);
 extern "C" int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
-                                   float* out_grad, double* out_loss, const int* lengths = nullptr);
+                                   float* out_grad, double* out_loss, const int* lengths = nullptr,
+                                   double* out_win_loss = nullptr);
 // sub0_cuda_forward_loss is declared canonically by sub0/device_backend.hpp (included above), which
 // this target now compiles in its device configuration -- no local extern needed.
 extern "C" int  sub0_cuda_adam_step(float lr, long t, float muon_lr);
@@ -339,6 +340,81 @@ TEST_CASE("CUDA forward_loss matches the backward path's loss", "[cuda][eval]") 
     REQUIRE(sub0_cuda_forward_loss(ids.data(), targets.data(), batch, T, &short_loss, lengths.data()) == 0);
     REQUIRE(std::isfinite(short_loss));
     REQUIRE(short_loss != Catch::Approx(fwd_loss).epsilon(1e-9));
+}
+
+// The PER-WINDOW loss readout on real hardware -- the device half of tests/win_loss_tests.cpp, which
+// pins the same identity on the CPU engine. This is the measurement docs/TUTOR.md's mastery surface is
+// built from, and it is only affordable because it is a readout of a value ce_backward_kernel already
+// computes; the identity below is what proves the readout and the reported scalar are the SAME quantity:
+//
+//     mean over b of win[b]  ==  the batch mean the same call returned
+//
+// Unlike the cross-backend comparisons above, this one is INTERNAL to the device: both numbers come out
+// of ONE kernel launch over ONE set of logits, so nothing but arithmetic separates them.
+//
+// The tolerance is 1e-6 relative rather than exact, and the reason is worth stating because it also
+// bounds what the mastery surface can resolve. The scalar accumulator forms `w * nll` in FLOAT (w =
+// 1/(batch*denom), the pre-existing expression, deliberately left alone so the reported loss stays
+// bit-identical), while the per-window readout divides in double. Measured divergence at a masked batch
+// is ~6e-9 relative -- fp32 rounding of the summands, not a defect. A real defect in this readout is
+// nowhere near that small: a wrong denominator moves a window by the ratio len/active (~1.5x here), and
+// a chunk-local row index corrupts whole windows.
+TEST_CASE("CUDA per-window loss readout averages to the batch mean", "[cuda][eval][winloss]") {
+    // Relative agreement floor between the float-accumulated scalar and the double-accumulated readout.
+    constexpr double kReadoutEps = 1e-6;
+    CudaGuard _cuda_guard;
+    sub0::build_model();
+    sub0_cuda_set_tf32(0);
+    REQUIRE(sub0_cuda_upload_params(sub0::params_ptr()) == 0);
+
+    const int batch = 4, T = 8;
+    std::vector<int> data, ids, targets;
+    std::vector<std::size_t> starts;
+    make_windows(batch, T, 78, data, starts, ids, targets);
+
+    // 1. the loss-only (eval) branch.
+    double fwd_loss = 0.0;
+    std::vector<double> win(static_cast<std::size_t>(batch), -1.0);
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), targets.data(), batch, T, &fwd_loss, nullptr,
+                                   win.data()) == 0);
+    double sum = 0.0;
+    for (double w : win) { REQUIRE(std::isfinite(w)); REQUIRE(w > 0.0); sum += w; }
+    INFO("mean of per-window = " << sum / batch << "  batch mean = " << fwd_loss);
+    REQUIRE(sum / batch == Catch::Approx(fwd_loss).epsilon(kReadoutEps));
+
+    // 2. the gradient branch (dlogits != nullptr), which reaches the same kernel down the CHUNKED
+    //    head_ce_chunked path -- where a per-window accumulator indexed by a chunk-local row instead of
+    //    an absolute one would corrupt every window past the first chunk boundary and still return a
+    //    plausible batch mean.
+    std::vector<float> grad(sub0::trainable_floats(), 0.0f);
+    double bwd_loss = 0.0;
+    std::vector<double> bwin(static_cast<std::size_t>(batch), -1.0);
+    REQUIRE(sub0_cuda_backward(ids.data(), targets.data(), batch, T, grad.data(), &bwd_loss, nullptr,
+                               bwin.data()) == 0);
+    double bsum = 0.0;
+    for (double w : bwin) { REQUIRE(std::isfinite(w)); REQUIRE(w > 0.0); bsum += w; }
+    REQUIRE(bsum / batch == Catch::Approx(bwd_loss).epsilon(kReadoutEps));
+
+    // 3. masked + ragged: the per-window figure must use the ACTIVE-count denominator, not the raw
+    //    length. Masking two thirds of window 0 only, so a wrong denominator shows up as ONE window
+    //    disagreeing while the others stay right -- invisible in any batch-level number.
+    std::vector<int> masked = targets;
+    for (int t = 0; t < T; t += 3) masked[static_cast<std::size_t>(t)] = sub0::LOSS_IGNORE_INDEX;
+    double masked_loss = 0.0;
+    std::vector<double> mwin(static_cast<std::size_t>(batch), -1.0);
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), masked.data(), batch, T, &masked_loss, nullptr,
+                                   mwin.data()) == 0);
+    double msum = 0.0;
+    for (double w : mwin) { REQUIRE(std::isfinite(w)); msum += w; }
+    REQUIRE(msum / batch == Catch::Approx(masked_loss).epsilon(kReadoutEps));
+    // Only window 0 was masked, so only window 0 may have moved.
+    for (int b = 1; b < batch; ++b)
+        REQUIRE(mwin[static_cast<std::size_t>(b)] == Catch::Approx(win[static_cast<std::size_t>(b)]).epsilon(kReadoutEps));
+
+    // 4. the readout must not perturb what it reads: same call without it, same scalar.
+    double again = 0.0;
+    REQUIRE(sub0_cuda_forward_loss(ids.data(), targets.data(), batch, T, &again, nullptr) == 0);
+    REQUIRE(again == Catch::Approx(fwd_loss).epsilon(1e-12));
 }
 
 TEST_CASE("CUDA device eval reproduces the CPU eval end to end", "[cuda][eval]") {

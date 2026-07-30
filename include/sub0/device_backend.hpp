@@ -81,7 +81,8 @@ extern "C" [[nodiscard]] int  sub0_mock_init();
 extern "C" void               sub0_mock_shutdown();
 extern "C" [[nodiscard]] int  sub0_mock_upload_params(const float* host);
 extern "C" [[nodiscard]] int  sub0_mock_forward_loss(const int* ids, const int* targets, int batch, int T,
-                                                     double* out_loss, const int* lengths);
+                                                     double* out_loss, const int* lengths,
+                                                     double* out_win_loss);
 // How many forward_loss calls the mock has served, and the batch sizes it saw -- the test asserts on
 // the GROUPING, which is invisible in the returned mean.
 extern "C" int                sub0_mock_call_count();
@@ -98,8 +99,9 @@ inline Sub0DeviceCaps sub0_dev_caps() {
 inline void               sub0_dev_shutdown()                    { sub0_mock_shutdown(); }
 [[nodiscard]] inline int  sub0_dev_upload_params(const float* h) { return sub0_mock_upload_params(h); }
 [[nodiscard]] inline int  sub0_dev_forward_loss(const int* ids, const int* targets, int batch, int T,
-                                                double* out_loss, const int* lengths) {
-    return sub0_mock_forward_loss(ids, targets, batch, T, out_loss, lengths);
+                                                double* out_loss, const int* lengths,
+                                                double* out_win_loss = nullptr) {
+    return sub0_mock_forward_loss(ids, targets, batch, T, out_loss, lengths, out_win_loss);
 }
 // Everything this backend does not claim in caps: same fail-fast contract as the no-device stubs.
 [[nodiscard]] inline int  sub0_dev_download_params(float*)       { return -1; }
@@ -108,9 +110,9 @@ inline void               sub0_dev_shutdown()                    { sub0_mock_shu
 inline void               sub0_dev_set_tf32(int)                 {}
 [[nodiscard]] inline int  sub0_dev_train_reserve(int)            { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_step(const int*, const int*, int, int, float, long, double*,
-                                              const int*, float)                 { return -1; }
+                                              const int*, float, double* = nullptr) { return -1; }
 [[nodiscard]] inline int  sub0_dev_backward(const int*, const int*, int, int, float*, double*,
-                                            const int*)                          { return -1; }
+                                            const int*, double* = nullptr)       { return -1; }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int, int, double, double*)    { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_footprint(int, double*, double*)        { return -1; }
 inline int                sub0_dev_free_mem_mb()                 { return 0; }
@@ -132,11 +134,16 @@ extern "C" void               sub0_cuda_set_tf32(int on);
 extern "C" [[nodiscard]] int  sub0_cuda_train_reserve(int batch);
 extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                                    float lr, long t, double* out_loss, const int* lengths,
-                                                   float muon_lr);
+                                                   float muon_lr, double* out_win_loss);
+// No default argument on out_win_loss here (unlike sub0_cuda_forward_loss below): tests/cuda_tests.cpp
+// carries its own extern declaration of this one WITH defaults, and a default given in two visible
+// declarations of the same function is an error. Every consumer reaches it through sub0_dev_backward.
 extern "C" [[nodiscard]] int  sub0_cuda_backward(const int* ids, const int* targets, int batch, int T,
-                                                 float* out_grad, double* out_loss, const int* lengths);
+                                                 float* out_grad, double* out_loss, const int* lengths,
+                                                 double* out_win_loss);
 extern "C" [[nodiscard]] int  sub0_cuda_forward_loss(const int* ids, const int* targets, int batch, int T,
-                                                     double* out_loss, const int* lengths);
+                                                     double* out_loss, const int* lengths,
+                                                     double* out_win_loss = nullptr);
 extern "C" [[nodiscard]] int  sub0_cuda_time_train_step(int batch, int T, double budget_ms, double* out_ms);
 extern "C" [[nodiscard]] int  sub0_cuda_train_footprint(int batch, double* predicted_mb, double* actual_mb);
 extern "C" int                sub0_cuda_free_vram_mb();
@@ -179,14 +186,20 @@ inline void               sub0_dev_shutdown()                   { sub0_cuda_shut
 [[nodiscard]] inline int  sub0_dev_download_opt(float* m, float* v)           { return sub0_cuda_download_opt(m, v); }
 inline void               sub0_dev_set_tf32(int on)             { sub0_cuda_set_tf32(on); }
 [[nodiscard]] inline int  sub0_dev_train_reserve(int batch)     { return sub0_cuda_train_reserve(batch); }
+// `out_win_loss` (optional, [batch]) is the PER-WINDOW mean cross-entropy alongside the batch mean --
+// the per-entry signal docs/TUTOR.md's mastery surface is built from. It is a pure readout of a value
+// the loss kernel already computes (no extra forward pass, no behaviour change), and the identity
+// `mean over b of out_win_loss[b] == *out_loss` is parity-gated in tests/win_loss_tests.cpp. nullptr,
+// the default and what every pre-existing caller passes, leaves these paths bit-identical.
 [[nodiscard]] inline int  sub0_dev_train_step(const int* ids, const int* targets, int batch, int T,
                                               float lr, long t, double* out_loss, const int* lengths,
-                                              float muon_lr) {
-    return sub0_cuda_train_step(ids, targets, batch, T, lr, t, out_loss, lengths, muon_lr);
+                                              float muon_lr, double* out_win_loss = nullptr) {
+    return sub0_cuda_train_step(ids, targets, batch, T, lr, t, out_loss, lengths, muon_lr, out_win_loss);
 }
 [[nodiscard]] inline int  sub0_dev_backward(const int* ids, const int* targets, int batch, int T,
-                                            float* out_grad, double* out_loss, const int* lengths) {
-    return sub0_cuda_backward(ids, targets, batch, T, out_grad, out_loss, lengths);
+                                            float* out_grad, double* out_loss, const int* lengths,
+                                            double* out_win_loss = nullptr) {
+    return sub0_cuda_backward(ids, targets, batch, T, out_grad, out_loss, lengths, out_win_loss);
 }
 // Mean cross-entropy over `batch` windows of `T` tokens, forward only -- the evaluation counterpart
 // of sub0_dev_backward, computing the SAME loss without the backward half or its gradient buffers.
@@ -194,8 +207,9 @@ inline void               sub0_dev_set_tf32(int on)             { sub0_cuda_set_
 // targets < 0 are excluded from both the loss and its per-window normalizer. Gated by
 // sub0_dev_caps().supports_eval.
 [[nodiscard]] inline int  sub0_dev_forward_loss(const int* ids, const int* targets, int batch, int T,
-                                                double* out_loss, const int* lengths) {
-    return sub0_cuda_forward_loss(ids, targets, batch, T, out_loss, lengths);
+                                                double* out_loss, const int* lengths,
+                                                double* out_win_loss = nullptr) {
+    return sub0_cuda_forward_loss(ids, targets, batch, T, out_loss, lengths, out_win_loss);
 }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int batch, int T, double budget_ms, double* out_ms) {
     return sub0_cuda_time_train_step(batch, T, budget_ms, out_ms);
@@ -231,11 +245,11 @@ inline void               sub0_dev_shutdown()                    {}
 inline void               sub0_dev_set_tf32(int)                 {}
 [[nodiscard]] inline int  sub0_dev_train_reserve(int)            { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_step(const int*, const int*, int, int, float, long, double*,
-                                              const int*, float)                 { return -1; }
+                                              const int*, float, double* = nullptr) { return -1; }
 [[nodiscard]] inline int  sub0_dev_backward(const int*, const int*, int, int, float*, double*,
-                                            const int*)                          { return -1; }
+                                            const int*, double* = nullptr)       { return -1; }
 [[nodiscard]] inline int  sub0_dev_forward_loss(const int*, const int*, int, int, double*,
-                                                const int*)                      { return -1; }
+                                                const int*, double* = nullptr)   { return -1; }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int, int, double, double*)    { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_footprint(int, double*, double*)        { return -1; }
 inline int                sub0_dev_free_mem_mb()                 { return 0; }

@@ -56,14 +56,21 @@ extern "C" int sub0_mock_upload_params(const float* host) {
 // `T` tokens, where window b occupies rows [b*T, (b+1)*T) of ids/targets. `lengths` (optional) gives
 // each window's real length; positions at or past it are padding and are not graded. Targets < 0
 // (LOSS_IGNORE_INDEX) are excluded from both the loss and the per-window normalizer.
+//
+// `out_win_loss` (optional, [batch]) returns each window's own mean before the 1/batch reduction -- the
+// quantity this function already forms internally, which is exactly the point: the CUDA kernel likewise
+// derives it from a value it already has, so the mock can pin the same `mean(win) == batch mean`
+// identity without a GPU. A window with nothing gradeable reports 0.0, matching its contribution here.
 extern "C" int sub0_mock_forward_loss(const int* ids, const int* targets, int batch, int T,
-                                      double* out_loss, const int* lengths) {
+                                      double* out_loss, const int* lengths, double* out_win_loss) {
     if (!g_up || !ids || !targets || !out_loss) return 1;
     if (batch < 1 || T < 2 || T > SEQ_LEN) return 1;
     g_batches.push_back(batch);
 
     double total = 0.0;
     std::vector<int> win(static_cast<std::size_t>(T));
+    if (out_win_loss)
+        for (int b = 0; b < batch; ++b) out_win_loss[b] = 0.0;
     for (int b = 0; b < batch; ++b) {
         const int* id_row = ids     + static_cast<std::size_t>(b) * T;
         const int* tg_row = targets + static_cast<std::size_t>(b) * T;
@@ -89,7 +96,10 @@ extern "C" int sub0_mock_forward_loss(const int* ids, const int* targets, int ba
             wsum += -(static_cast<double>(row[tgt] - mx) - std::log(Z));
             ++act;
         }
-        if (act > 0) total += wsum / act;
+        if (act > 0) {
+            total += wsum / act;
+            if (out_win_loss) out_win_loss[b] = wsum / act;
+        }
     }
     sub0::graph_reset();
     *out_loss = total / batch;

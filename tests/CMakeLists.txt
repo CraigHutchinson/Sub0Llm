@@ -39,6 +39,7 @@ add_executable(sub0_tests
   coherence_tests.cpp
   run_config_tests.cpp
   loss_mask_tests.cpp
+  win_loss_tests.cpp
   spellspike_engine_tests.cpp
   scratchspike_engine_tests.cpp
   repeatspike_engine_tests.cpp

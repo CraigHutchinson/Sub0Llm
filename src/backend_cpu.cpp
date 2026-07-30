@@ -1728,7 +1728,8 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                   const int* lengths, const std::uint8_t* loss_mask,
                   const ScratchBindings* const* win_binds,
                   const SentinelBindings* const* win_sentinel,
-                  const PersistentBindings* const* win_persist) {
+                  const PersistentBindings* const* win_persist,
+                  double* out_win_loss) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
@@ -1760,6 +1761,11 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
             Node* logits = g_model.forward(data + starts[b], Tb);
             Node* loss   = op_cross_entropy(logits, tgt);
             total += loss->data[0];
+            // Per-window readout: op_cross_entropy ALREADY normalizes over this window's active
+            // positions, so loss->data[0] is window b's own mean and `total/batch` below is its mean
+            // over b by construction. Each iteration owns a distinct b, so this write is race-free
+            // inside the worksharing loop without any reduction of its own.
+            if (out_win_loss) out_win_loss[b] = static_cast<double>(loss->data[0]);
             backward(loss, 1.f / static_cast<float>(batch));
             if (win_binds)    set_scratch_bindings(nullptr);
             if (win_sentinel) set_sentinel_bindings(nullptr);
