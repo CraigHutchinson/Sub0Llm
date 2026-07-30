@@ -102,6 +102,22 @@ real occurrences were that false positive, not a genuine split. The one-token-pe
 wasn't worth the ambiguity once a real consumer needed to tell the two apart — encapsulating N=2
 too closes the ambiguity for a small, fixed cost per 2-piece word.
 
+**Revision history (schemeV4, in progress on `feature/tokenizer-v2` — full design in
+[TOKENIZER_V2_IDEAS.md](TOKENIZER_V2_IDEAS.md)):** implicit-space stops being a uniform "one space
+patched by glue tokens" and becomes a **per-character `(lead, trail)` glue default** measured from the
+corpus (`casing::glue_default`, read by both encode and decode). Landed so far: sentence punctuation
+`. , ; : ! ? %` defaults lead-glue and `$` trail-glue, so `word,` / `50%` / `$5` glue for free instead
+of paying a `JOIN` (fineweb JOIN 8.98%→3.92%); and **numbers are now clean typed units** — `is_word_byte`
+includes digits so a digit run forms a unit (no per-digit `JOIN`), but `word_unit_end` splits at a
+direct digit↔letter transition so a number stays a self-contained numeric span (`Foo123`→`Foo`|`123`,
+the measured ~10% letter-fusion paying a `JOIN`; `123 + 456` spaced for free), while a connector still
+binds across the class boundary (`covid-19`, `2026-07-29` whole). The Unigram bars all-digit pieces, so
+numbers keep single-digit tokenization. The per-byte glue table is **corpus-derived** (`sub0::modality`
+rides the scan; the hardcoded set is the floor) so a code corpus makes `= / > :` glue-both, and the
+Unigram also mints **symbol pieces** (`://` `->` `==` `!=` `&&` `::`), each gluing by its boundary bytes.
+The reduced-marker plan (D3) does not apply: v2 is code-capable, so `"`/`()`/`[]`/`{}` markers all stay.
+Per-char glue defaults are §4b; numbers are Point 4; symbol pieces + corpus-derived glue are Point 3 / D2.
+
 ## 5. Decode FSM & round-trip
 
 Reconstruct left-to-right with two state bits: `pending_space` (emit a space before the next
@@ -177,7 +193,9 @@ one or two mechanisms, the system becomes elegant: `OPEN_DQUOTE`/`CLOSE_DQUOTE` 
   plain frequency-greedy BPE can pick mid-word fragments). Measure with the word-`N` histogram.
 * **Attention-based pairing** — open/close quote and SPELL_START/END as matched pairs the model learns to bind; net benefit is empirical.
 * **Cross-JOIN BPE merges** — optionally let BPE absorb very frequent compounds into one token (a knob), trading composition for compactness.
-* **Digit-runs as word-units** — numbers BPE-merge like words (today digits are standalone, which implicit-space would mis-split).
+* **Digit-runs as word-units** — **DONE (schemeV4)**: numbers are clean typed units (glued internally,
+  spaced from non-digits, split at a direct digit↔letter transition). See §4 revision history and
+  [TOKENIZER_V2_IDEAS.md](TOKENIZER_V2_IDEAS.md) Point 4.
 * **Factored morphology** — lemma + separable case/number/possession/tense axes (a small morphological analyser) layered above BPE.
 * **Verbosity/latency slider** — meaning-preserving terseness dial once a gist/coarsening generator exists.
 * **Mergeable vocabularies** — sum two corpora's scan-states (counts kept) for a joint or incremental tokenizer across sessions.

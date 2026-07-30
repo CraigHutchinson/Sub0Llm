@@ -179,6 +179,39 @@ TEST_CASE("encode word cache: memoised words match their stand-alone encoding (a
                            big_got.begin() + static_cast<std::ptrdiff_t>(r) * static_cast<std::ptrdiff_t>(want.size())));
 }
 
+// The decode/encode marker contract is a single kMarkerSpecs table; reserved-headroom ids are INERT
+// rows. That path is NOT reachable through the round-trip fuzz (encode never EMITS a reserved marker),
+// so pin it directly: a model can sample a reserved id, and detokenize must treat it as a pure no-op --
+// emit no byte, and leave the surrounding reconstruction (pending space, casing) untouched -- never a
+// wrapped-around byte. Splicing one into a real id stream must not change the decoded text at all.
+TEST_CASE("JOIN scheme: a reserved-headroom marker decodes inertly", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    const std::vector<int> ids = sub0::tok::encode(t, "The cat sat quietly.");
+    const std::string      ref = sub0::tok::detokenize(t, ids);
+    for (const int rid : {sub0::casing::TOK_RESERVED_4, sub0::casing::TOK_UNCOMBINE, sub0::casing::TOK_COMBINE_END}) {
+        for (std::size_t at : {std::size_t{0}, ids.size() / 2, ids.size()}) {   // start / middle / end
+            std::vector<int> spliced = ids;
+            spliced.insert(spliced.begin() + static_cast<std::ptrdiff_t>(at), rid);
+            REQUIRE(sub0::tok::detokenize(t, spliced) == ref);
+        }
+    }
+}
+
+// v2 (schemeV4): sentence punctuation `. , ; : ! ?` glues to the previous token by DEFAULT, so `word,`
+// emits NO TOK_JOIN -- the ~10% prose token saving (docs/TOKENIZER_V2_IDEAS.md D1). Losslessness is the
+// round-trip fuzz's job; this pins the SAVING (no glue token) and that both deviation directions still
+// round-trip (space-before via a literal space byte, glue-after via TOK_JOIN).
+TEST_CASE("v2 lead-glue default: punctuation glues free; deviations round-trip", "[tok][join][v2]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    for (const char* s : {"cat, dog.", "yes; no: maybe!", "really?", "the cat, the dog, and a fox."}) {
+        const std::vector<int> ids = sub0::tok::encode(t, s);
+        REQUIRE(std::find(ids.begin(), ids.end(), sub0::casing::TOK_JOIN) == ids.end());   // no glue token
+        REQUIRE(round_trips(t, s));
+    }
+    REQUIRE(round_trips(t, "cat , dog ."));       // space-before deviation (literal space byte)
+    REQUIRE(round_trips(t, "1,000 and 2,500"));   // glue-after deviation (JOIN before the trailing digits)
+}
+
 // ---------------------------------------------------------------------------
 //  JOIN / implicit-space scheme
 // ---------------------------------------------------------------------------
@@ -620,6 +653,69 @@ TEST_CASE("JOIN scheme: snake_case and hyphen bind into one unit", "[tok][join]"
     REQUIRE(round_trips(t, "well-known and non-commercial"));
     // A leading/trailing separator is NOT interior -> still splits off (round-trip holds).
     REQUIRE(round_trips(t, "--flag -x _leading trailing_"));
+}
+
+// v2 (schemeV4): a digit run is its own typed unit -- glued internally (no per-digit JOIN) but
+// spaced-by-default from non-digits, so a number stays a clean, self-contained numeric span. A
+// DIRECT digit<->letter fusion is the measured ~10% deviation and pays a JOIN; hyphen compounds
+// stay whole via the connector rule.
+TEST_CASE("JOIN scheme (v2): numbers are clean typed units; letter-fusion pays a JOIN", "[tok][join][v2]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    auto joins = [&](const std::string& s) {
+        const std::vector<int> ids = sub0::tok::encode(t, s);
+        return std::count(ids.begin(), ids.end(), sub0::casing::TOK_JOIN);
+    };
+    REQUIRE(joins("2026") == 0);                 // one number span, no per-digit JOIN
+    REQUIRE(joins("123 + 456") == 0);            // digit<->operator spaced by default
+    REQUIRE(joins("page 42") == 0);              // word<->number spaced by default
+    REQUIRE(joins("covid-19") == 0);             // hyphen compound stays whole
+    REQUIRE(joins("Foo123") == 1);               // direct letter->digit fusion is the deviation
+    REQUIRE(joins("3rd") == 1);                  // direct digit->letter fusion is the deviation
+    for (const char* s : {"2026", "123 + 456", "page 42", "covid-19", "Foo123", "3rd",
+                          "2026-07-29", "1,000,000", "The iPhone12 costs $999 ."})
+        REQUIRE(round_trips(t, s));
+}
+
+// v2 (schemeV4, point 3): a recurring plain-symbol run is minted as ONE learned piece so its internal
+// JOINs collapse (the code-operator win: `://` `->` `==` `!=` `&&`), corpus-adaptively -- prose learns
+// few, code learns many. Quotes/brackets are excluded (they keep their own markers). Always lossless.
+TEST_CASE("JOIN scheme (v2): a recurring symbol run is minted as one piece (point 3)", "[tok][join][v2]") {
+    std::string corpus;
+    for (int k = 0; k < 300; ++k) corpus += "read http://example.com then a->b and c->d and e==f done .\n";
+    const Tokenizer t = sub0::tok::learn(corpus);
+    // The whole run is ONE learned piece (id >= n_base), not glued bytes.
+    REQUIRE(t.piece_index.count("://") == 1);
+    REQUIRE(t.piece_index.at("://") >= t.n_base);
+    REQUIRE(t.piece_index.count("->") == 1);
+    // Using that piece: `://` encodes with no internal JOIN (one token spans the run).
+    const std::vector<int> u = sub0::tok::encode(t, "http://x");
+    REQUIRE(std::find(u.begin(), u.end(), t.piece_index.at("://")) != u.end());
+    for (const char* s : {"http://x", "a->b->c", "e==f", "x-> y :// z", "no->space", "mix a->b :// c==d"})
+        REQUIRE(round_trips(t, s));
+}
+
+// v2 (schemeV4, D2): the per-byte glue default is CORPUS-DERIVED from the scan's spacing modality
+// (hardcoded prose set is the floor). A corpus where `=` is consistently glued both sides makes `=`
+// glue-both by default, so `x=y` costs no JOIN where the prose default would pay -- and both encode
+// and decode read the baked table, so it stays lossless.
+TEST_CASE("JOIN scheme (v2): per-byte glue is corpus-derived (D2)", "[tok][join][v2]") {
+    std::string code;
+    for (int k = 0; k < 400; ++k) code += "a=b c=d e=f g=h i=j k=l m=n\n";   // `=` always glued both sides
+    const Tokenizer t = sub0::tok::learn(code);
+    REQUIRE(t.glue_lead('='));                 // derived: `=` glues to what precedes
+    REQUIRE(t.glue_trail('='));                // and to what follows
+    const std::vector<int> ids = sub0::tok::encode(t, "x=y");
+    REQUIRE(std::count(ids.begin(), ids.end(), sub0::casing::TOK_JOIN) == 0);   // glued free, no JOIN
+    for (const char* s : {"x=y", "a=b=c", "x = y", "k=v a=b"}) REQUIRE(round_trips(t, s));
+    // serialize round-trip carries the derived table: a reloaded tokenizer encodes identically.
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    std::istringstream is(os.str(), std::ios::binary);
+    Tokenizer t2;
+    REQUIRE(sub0::tok::deserialize(t2, is));
+    REQUIRE(t2.glue_lead('=') );
+    REQUIRE(t2.glue_trail('='));
+    REQUIRE(sub0::tok::encode(t2, "x=y") == ids);
 }
 
 // WS5b: bracket-glue markers collapse the JOIN tax on a bracket glued directly to what precedes it.

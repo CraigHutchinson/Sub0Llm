@@ -253,7 +253,7 @@ void atomic_replace(const std::filesystem::path& tmp, const std::filesystem::pat
 // stable. Revisit only if the state must cross tools/languages.) Bump WCACHE_VERSION whenever
 // casing.hpp's normalization/truecasing changes, since the cached tables encode that logic.
 constexpr std::uint32_t WCACHE_MAGIC   = 0x43573053u;  // "S0WC"
-constexpr std::uint32_t WCACHE_VERSION = 1u;
+constexpr std::uint32_t WCACHE_VERSION = 2u;
 
 // The cacheable scan state is sub0::tok::Scan (the same struct the parallel passes
 // accumulate into); these helpers persist its fields next to the corpus. The derived
@@ -308,6 +308,14 @@ void save_scan_state(const std::string& path, const std::string& corpus, const s
         bb.assign(seq.begin(), seq.end());                 // ints 0..255 -> bytes
         os.write(reinterpret_cast<const char*>(bb.data()), static_cast<std::streamsize>(bb.size()));
     }
+    // modality ledger (schemeV4, D2): per-codepoint SS/SG/GS/GG -> the corpus-derived glue table. Cached
+    // WITH the scan so a cache HIT bakes the SAME tokenizer.tok as a full scan (deterministic).
+    wr(os, static_cast<std::uint64_t>(S.modality.scanned_bytes));
+    wr(os, static_cast<std::uint64_t>(S.modality.chars.size()));
+    for (const auto& [cp, cm] : S.modality.chars) {
+        wr(os, static_cast<std::uint32_t>(cp));
+        for (int k = 0; k < 4; ++k) wr(os, static_cast<std::uint64_t>(cm.n[static_cast<std::size_t>(k)]));
+    }
 }
 
 // Load + validate against the corpus (size+mtime+version). Returns false (leaving S untouched-
@@ -341,6 +349,16 @@ bool load_scan_state(const std::string& path, const std::string& corpus, sub0::t
         bb.resize(len); is.read(reinterpret_cast<char*>(bb.data()), len);
         S.word_syms.emplace_back(bb.begin(), bb.end());
         S.word_freq.push_back(f);
+    }
+    // modality ledger (schemeV4, D2), cached with the scan (see save_scan_state).
+    S.modality = sub0::modality::ModalityStats{};
+    S.modality.scanned_bytes = rd<std::uint64_t>(is);
+    const std::uint64_t nch = rd<std::uint64_t>(is);
+    for (std::uint64_t i = 0; i < nch; ++i) {
+        const std::uint32_t cp = rd<std::uint32_t>(is);
+        sub0::modality::CharModality cm{};
+        for (int k = 0; k < 4; ++k) cm.n[static_cast<std::size_t>(k)] = rd<std::uint64_t>(is);
+        S.modality.chars[cp] = cm;
     }
     return static_cast<bool>(is);
 }

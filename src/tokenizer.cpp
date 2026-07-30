@@ -131,14 +131,36 @@ void Scan::add_words(std::string_view chunk, const std::unordered_set<std::strin
     static thread_local std::string      norm;        // reused per worker thread (string_view in, no temp)
     static thread_local std::vector<int> stream;      // reused id stream -- no per-chunk 4B/symbol alloc
     normalize_text(chunk, qr, norm);
+    modality::add_modality(modality, norm);   // D2: per-byte spacing modality, over the SAME normalized view
     truecase_tokenize(norm, attested, &st, stream);
     for (std::size_t i = 0, n = stream.size(); i < n;) {
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                   // standalone symbol
             const int s = stream[i];
-            if (s == TOK_CAP)      used_cap = true;
-            else if (s == TOK_UP)  used_up = true;
-            else                   byte_used[static_cast<std::size_t>(s)] = 1;
+            if (s == TOK_CAP)      { used_cap = true; ++i; continue; }
+            if (s == TOK_UP)       { used_up = true; ++i; continue; }
+            if (is_symbol_piece_byte(s)) {                // collect a plain-symbol RUN as a learnable unit
+                std::size_t se = i + 1;
+                while (se < n && is_symbol_piece_byte(stream[se])) ++se;
+                if (se - i >= 2) {                        // a run the Unigram can mint as a symbol piece
+                    std::string skey(se - i, '\0');
+                    for (std::size_t k = i; k < se; ++k) skey[k - i] = static_cast<char>(stream[k] & 0xFF);
+                    const auto sit = index.find(skey);
+                    if (sit == index.end()) {
+                        std::vector<int> seq(stream.begin() + static_cast<std::ptrdiff_t>(i),
+                                             stream.begin() + static_cast<std::ptrdiff_t>(se));
+                        for (int bb : seq) byte_used[static_cast<std::size_t>(bb)] = 1;
+                        index.emplace(std::move(skey), static_cast<int>(word_syms.size()));
+                        word_syms.push_back(std::move(seq));
+                        word_freq.push_back(1);
+                    } else {
+                        word_freq[static_cast<std::size_t>(sit->second)] += 1;
+                    }
+                    i = se;
+                    continue;
+                }
+            }
+            byte_used[static_cast<std::size_t>(s)] = 1;
             ++i;
             continue;
         }
@@ -166,6 +188,7 @@ void Scan::merge_words(Scan& other) {
     used_cap = used_cap || other.used_cap;
     used_up  = used_up  || other.used_up;
     st.words += other.st.words; st.cap += other.st.cap; st.up += other.st.up; st.names += other.st.names;
+    modality::merge(modality, other.modality);   // D2: fold the per-byte modality (order-free)
     for (std::size_t i = 0; i < other.word_syms.size(); ++i) {
         const std::string k = seq_key(other.word_syms[i]);
         const auto it = index.find(k);
@@ -208,9 +231,34 @@ std::unordered_set<std::string> derive_attested(const Scan& s, long long* withhe
 //  learn — base alphabet + Unigram LM word-piece vocabulary (the runtime tokenizer)
 // ============================================================================
 
+// The hardcoded per-byte glue FLOOR (casing::glue_default): a prose-derived default that every
+// tokenizer starts from and a corpus can only refine.
+std::array<casing::GlueDefault, 256> default_glue_table() {
+    std::array<casing::GlueDefault, 256> g{};
+    for (int b = 0; b < 256; ++b) g[static_cast<std::size_t>(b)] = casing::glue_default(b);
+    return g;
+}
+
+// v2 (schemeV4, D2): corpus-derived per-byte glue. The hardcoded table is the floor; a byte with
+// DECISIVE, unimodal modality evidence (>= 500 samples, second combo < 25%) is overridden to its
+// dominant (glued-before -> lead, glued-after -> trail). So a code corpus makes `=`/`.`/`/` glue
+// where prose leaves them spaced, while bimodal or sparse bytes keep the floor (their ambiguity is
+// for markers/JOIN, not a single default). encode + decode both read the baked result -- lossless
+// for any table, since a deviation still pays a JOIN or a literal space.
+std::array<casing::GlueDefault, 256> derive_glue(const modality::ModalityStats& ms) {
+    std::array<casing::GlueDefault, 256> g = default_glue_table();
+    for (const auto& [cp, cm] : ms.chars) {
+        if (cp >= 256 || cm.total() < 500 || cm.bimodal()) continue;
+        const int d = cm.dominant();                      // Combo bit1=glued-before, bit0=glued-after
+        g[static_cast<std::size_t>(cp)] = { (d & 2) != 0, (d & 1) != 0 };
+    }
+    return g;
+}
+
 Tokenizer learn(Scan& scan, const std::unordered_set<std::string>& attested,
                 const LearnOptions& opts) {
     Tokenizer t;
+    t.glue = derive_glue(scan.modality);   // D2: corpus-adaptive per-byte spacing (hardcoded floor + evidence)
 
     // Fix the base alphabet.
     //
@@ -436,7 +484,60 @@ constexpr int glue_marker_for(int byte) {
         default:  return -1;
     }
 }
-constexpr bool is_close_bracket(int byte) { return byte == ')' || byte == ']' || byte == '}'; }
+
+// Single source of truth for what each JOIN-scheme marker DOES: the exact bytes it decodes to and its
+// effect on the decoder's three state flags. detokenize_join walks this table instead of a per-marker
+// switch, and encode_join derives each marker's pending-space effect from the SAME row (emit_marker),
+// so the two halves of the round-trip can no longer silently disagree about a marker -- the exact bug
+// class the fuzz net exists to catch (e.g. the WS5b open/close `dps` inversion, §5.9). Adding a special
+// becomes one row here plus its encode-side selection, not mirrored edits in two switch statements.
+// See docs/TOKENIZER_REVIEW.md §2.
+//
+// Indexed by `id - TOK_EOS` over the whole marker range [TOK_EOS, TOK_MARKER_COUNT). Reserved-headroom
+// ids (no assigned meaning yet) stay default-constructed = INERT: no bytes, no state change -- exactly
+// the old reserved-headroom no-op, so a model that samples one can't emit a wrapped-around byte.
+// State sentinels: dps / in_spell are -1 = "leave unchanged", else 0/1 to set; recase is -1 =
+// unchanged, else a Recase value. `lead_space` emits one pending space before the literal iff `dps`.
+struct MarkerSpec {
+    std::string_view literal;              // bytes emitted on decode ("" for pure state markers / inert)
+    bool             lead_space = false;   // emit ' ' before `literal` if a space is pending
+    signed char      dps        = -1;      // pending-space AFTER (-1 keep, 0 false, 1 true)
+    signed char      recase     = -1;      // -1 keep, else static_cast<Recase>(recase)
+    signed char      in_spell   = -1;      // spell-group state AFTER (-1 keep, 0 false, 1 true)
+};
+
+constexpr auto kMarkerSpecs = [] {
+    constexpr signed char keep = -1, off = 0, on = 1;
+    constexpr signed char none = static_cast<signed char>(Recase::None);
+    constexpr signed char capf = static_cast<signed char>(Recase::CapFirst);
+    constexpr signed char upw  = static_cast<signed char>(Recase::UpWord);
+    std::array<MarkerSpec, static_cast<std::size_t>(TOK_MARKER_COUNT - TOK_EOS)> a{};
+    auto row = [&](int id, MarkerSpec s) { a[static_cast<std::size_t>(id - TOK_EOS)] = s; };
+    //          marker            literal          lead   dps   recase in_spell
+    row(TOK_JOIN,         {"",              false, off,  keep, keep});   // cancel a pending space (glue)
+    row(TOK_NEWLINE,      {"\n",            false, off,  none, keep});
+    row(TOK_PARA,         {"\n\n",          false, off,  none, keep});
+    row(TOK_EOS,          {"<|endoftext|>", true,  off,  none, keep});
+    row(TOK_TURN_START,   {"<|im_start|>",  true,  off,  none, keep});
+    row(TOK_TURN_END,     {"<|im_end|>",    true,  off,  none, keep});
+    row(TOK_SPACE2,       {"  ",            false, off,  none, keep});
+    row(TOK_SPACE4,       {"    ",          false, off,  none, keep});
+    row(TOK_TAB2,         {"\t\t",          false, off,  none, keep});
+    row(TOK_TAB4,         {"\t\t\t\t",      false, off,  none, keep});
+    row(TOK_CAP,          {"",              false, keep, capf, keep});   // recase only; no bytes, dps untouched
+    row(TOK_UP,           {"",              false, keep, upw,  keep});
+    row(TOK_ODQUOTE,      {"\"",            true,  off,  none, keep});
+    row(TOK_CDQUOTE,      {"\"",            false, on,   none, keep});
+    row(TOK_SPELL_START,  {"",              true,  off,  keep, on});     // recase carries INTO the group
+    row(TOK_SPELL_END,    {"",              false, on,   none, off});
+    row(TOK_GLUE_OPAREN,  {"(",             false, off,  keep, keep});   // recase deliberately untouched (§5.9)
+    row(TOK_GLUE_CPAREN,  {")",             false, on,   keep, keep});
+    row(TOK_GLUE_OBRACKET,{"[",             false, off,  keep, keep});
+    row(TOK_GLUE_CBRACKET,{"]",             false, on,   keep, keep});
+    row(TOK_GLUE_OBRACE,  {"{",             false, off,  keep, keep});
+    row(TOK_GLUE_CBRACE,  {"}",             false, on,   keep, keep});
+    return a;
+}();
 
 // JOIN-scheme encode. `stream` is the truecased byte+marker stream. The encoder mirrors the
 // decoder's pending-space state `dps` so it emits exactly the tokens that reconstruct the text:
@@ -460,20 +561,38 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
     // never outlive the one tokenizer `t` and add no cross-call state (the runtime single-prompt path
     // pays only one empty-map construction). `word_key` is reused across words (no per-word alloc).
     std::unordered_map<std::string, std::vector<int>> word_cache;
+    // Pre-size the cache so a big chunk fills it without the ~log2(unique) incremental rehashes, each
+    // of which re-inserts every element so far. On a DIVERSE 4 MB chunk (~20k unique words) this is a
+    // measured ~12% off the full encode; n/32 sits comfortably above the unique-word count for real
+    // corpora (Heaps' law keeps uniques well below n/32), and the one over-sized bucket array is a
+    // cheap zeroed alloc next to the encode itself. Guarded so the runtime single-prompt path (tiny n)
+    // pays nothing. See benchmarks/frontend_bench.cpp's diverse-corpus benchmark.
+    if (n > 1024) word_cache.reserve(n / 32);
     std::string word_key;
     auto emit_byte = [&](int b) { out.push_back(b); };  // base id == byte value
+    // Emit a marker and apply its pending-space effect from the SAME kMarkerSpecs row the decoder
+    // walks -- so the encoder can never assume a `dps` outcome the decoder won't reproduce (e.g. the
+    // open/close bracket direction, which used to be a hand-written is_close_bracket() on this side).
+    auto emit_marker = [&](int id) {
+        out.push_back(id);
+        if (const signed char d = kMarkerSpecs[static_cast<std::size_t>(id - TOK_EOS)].dps; d >= 0) dps = (d != 0);
+    };
     // Realize the whitespace run [lo,hi) (mirrors the decoder). A single inter-word space is
     // implicit (free) under a pending space; an empty inter-content gap glues with JOIN; any
     // other run is tiled into NEWLINE/PARA + run-length SPACE2/4 / TAB2/4 tokens, with a verbatim
     // byte for an odd remainder ('\r', a lone space/tab, ...). `inter_content` is false for the
     // trailing run (no following content), where a single space must stay literal, not implicit.
-    auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content) {
+    auto tile_ws = [&](std::size_t lo, std::size_t hi, bool inter_content, bool target_lead_glue = false) {
         const std::size_t gap = hi - lo;
         if (gap == 0) {
+            if (target_lead_glue) return;                           // v2: glue is this byte's default -- no JOIN
             if (dps) { out.push_back(TOK_JOIN); dps = false; }       // glue: cancel the pending space
             return;
         }
-        if (inter_content && gap == 1 && stream[lo] == ' ' && dps) return;  // implicit single space
+        if (inter_content && gap == 1 && stream[lo] == ' ' && dps) {
+            if (target_lead_glue) { emit_byte(' '); dps = false; }   // v2 deviation: force the space the default omits
+            return;                                                  // else: implicit single space (free)
+        }
         for (std::size_t k = lo; k < hi;) {
             const int c = stream[k];
             if (c == '\n' && k + 1 < hi && stream[k + 1] == '\n') { out.push_back(TOK_PARA);    k += 2; }
@@ -514,8 +633,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
                 if (g + lm.text.size() <= n &&
                     std::equal(lm.text.begin(), lm.text.end(), stream.begin() + static_cast<std::ptrdiff_t>(g))) {
                     tile_ws(i, g, /*inter_content=*/true);
-                    out.push_back(lm.id);
-                    dps = false;
+                    emit_marker(lm.id);
                     i = g + lm.text.size();
                     matched = true;
                     break;
@@ -528,7 +646,7 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             const std::size_t gap = g - i;
             const bool after_glue = (g + 1 < n && !is_ws_byte(stream[g + 1]));
             if (gap == 1 && stream[i] == ' ' && dps && after_glue) {  // ` "x` -> OPEN
-                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
+                emit_marker(TOK_ODQUOTE); i = g + 1; continue;
             }
             // Line-initial opening quote (measured on real TinyStories dialogue: 55389/576762 = 9.6%
             // of ALL quote occurrences -- 87.8% of the fallback total, by far the dominant miss, see
@@ -542,11 +660,11 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             // own NEWLINE case sets it), so this is a pure win with NO decode-side change needed --
             // it just recognizes a case the generic OPEN check couldn't reach.
             if (gap == 1 && stream[i] == '\n' && after_glue) {  // "\n\"x" -> NEWLINE, then OPEN
-                out.push_back(TOK_NEWLINE);
-                out.push_back(TOK_ODQUOTE); dps = false; i = g + 1; continue;
+                emit_marker(TOK_NEWLINE);
+                emit_marker(TOK_ODQUOTE); i = g + 1; continue;
             }
             if (gap == 0 && dps && !after_glue) {                     // `x" ` -> CLOSE
-                out.push_back(TOK_CDQUOTE); dps = true; i = g + 1; continue;
+                emit_marker(TOK_CDQUOTE); i = g + 1; continue;
             }
             // else: fall through to the bare-quote path
         }
@@ -561,12 +679,11 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         // marker leaves `dps` true (closing brackets are typically followed by a space in real
         // prose/code, ") the" / ") {"). See docs/TOKENIZER_REVIEW.md §5.9.
         if (const int gm = glue_marker_for(stream[g]); gm >= 0 && g == i && dps) {
-            out.push_back(gm);
-            dps = is_close_bracket(stream[g]);   // open -> false (glue-after too); close -> true
+            emit_marker(gm);   // spec row carries the open/close pending-space direction
             i = g + 1;
             continue;
         }
-        tile_ws(i, g, /*inter_content=*/true);
+        tile_ws(i, g, /*inter_content=*/true, t.glue_lead(stream[g]));
         i = g;
         // Case markers prefix the word and do not affect spacing.
         while (i < n && (stream[i] == TOK_CAP || stream[i] == TOK_UP)) {
@@ -576,7 +693,26 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
         if (i >= n) break;
         const std::size_t end = word_unit_end(stream, i);
         if (end == i) {                                 // a standalone byte (punctuation, digit, bare quote, ...)
-            emit_byte(stream[i]); dps = true; ++i;
+            // v2 (schemeV4, point 3): a run of plain symbols whose WHOLE maximal extent is a single
+            // learned piece (`://`, `->`, `==`) collapses to one token -- its internal JOINs vanish and
+            // it glues by its boundary bytes (piece_lead/trail_glue). A partial run (no whole-run piece)
+            // stays byte-by-byte via the fall-through below -- still lossless, just not collapsed.
+            if (is_symbol_piece_byte(stream[i])) {
+                std::size_t se = i + 1;
+                while (se < n && is_symbol_piece_byte(stream[se])) ++se;
+                if (se - i >= 2) {
+                    word_key.assign(se - i, '\0');
+                    for (std::size_t k = i; k < se; ++k) word_key[k - i] = static_cast<char>(stream[k] & 0xFF);
+                    const auto pit = t.piece_index.find(word_key);
+                    if (pit != t.piece_index.end() && pit->second >= t.n_base) {
+                        out.push_back(pit->second);
+                        dps = !t.glue_trail(stream[se - 1]);
+                        i = se;
+                        continue;
+                    }
+                }
+            }
+            emit_byte(stream[i]); dps = !t.glue_trail(stream[i]); ++i;   // trail=glue -> next glues free ($5)
         } else {
             // Look up (or Viterbi-encode + memoise) this word's piece-id sequence by its byte key.
             word_key.assign(end - i, '\0');
@@ -591,9 +727,9 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             // exactly that false positive, not a genuine 2-piece split -- see docs/TOKENIZER_DESIGN.md).
             // TOK_JOIN now means general glue ONLY, never a word boundary.
             if (N >= 2) {
-                out.push_back(TOK_SPELL_START);
+                emit_marker(TOK_SPELL_START);
                 for (int id : sub) out.push_back(id);
-                out.push_back(TOK_SPELL_END);
+                emit_marker(TOK_SPELL_END);
             } else {                                    // common single-token word
                 for (int id : sub) out.push_back(id);
             }
@@ -601,6 +737,21 @@ void encode_join(const Tokenizer& t, std::span<const int> stream, std::vector<in
             i = end;
         }
     }
+}
+
+// Per-piece glue: a learned piece inherits the lead-glue of its FIRST expansion byte and the
+// trail-glue of its LAST -- so a symbol piece (`://`, `->`) glues exactly as its boundary bytes
+// would, and decode (keyed by piece id) agrees with encode (keyed by the unit's boundary bytes).
+// A no-op for word pieces (letters default space-both) and identical to the byte rule for id < 256.
+inline bool piece_lead_glue(const Tokenizer& t, int id) {
+    if (id < 256) return t.glue_lead(id);
+    const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+    return !e.empty() && t.glue_lead(e.front());
+}
+inline bool piece_trail_glue(const Tokenizer& t, int id) {
+    if (id < 256) return t.glue_trail(id);
+    const std::vector<int>& e = t.expansion[static_cast<std::size_t>(id)];
+    return !e.empty() && t.glue_trail(e.back());
 }
 
 // JOIN-scheme decode FSM (token level): reconstruct bytes with a single implicit space between
@@ -616,55 +767,30 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
     const std::size_t m = ids.size();
     for (std::size_t k = 0; k < m; ++k) {
         const int id = ids[k];
-        // Markers occupy a small, dense, compile-time-constant range (TOK_EOS..TOK_MARKER_COUNT-1)
-        // -- a switch here is a jump table the compiler can verify at compile time, unlike an
-        // if-chain against runtime fields. Ordinary content (piece ids >= n_base, or a raw byte
-        // < 256) is the overwhelmingly common case and falls straight to `default`.
-        switch (id) {
-            case TOK_JOIN:        dps = false; continue;
-            case TOK_NEWLINE:     out += '\n';   dps = false; recase = Recase::None; continue;
-            case TOK_PARA:        out += "\n\n"; dps = false; recase = Recase::None; continue;
-            case TOK_EOS:         if (dps) out += ' '; out += "<|endoftext|>"; dps = false; recase = Recase::None; continue;
-            case TOK_TURN_START:  if (dps) out += ' '; out += "<|im_start|>";  dps = false; recase = Recase::None; continue;
-            case TOK_TURN_END:    if (dps) out += ' '; out += "<|im_end|>";    dps = false; recase = Recase::None; continue;
-            case TOK_SPACE2:      out += "  ";       dps = false; recase = Recase::None; continue;
-            case TOK_SPACE4:      out += "    ";     dps = false; recase = Recase::None; continue;
-            case TOK_TAB2:        out += "\t\t";     dps = false; recase = Recase::None; continue;
-            case TOK_TAB4:        out += "\t\t\t\t"; dps = false; recase = Recase::None; continue;
-            case TOK_CAP:         recase = Recase::CapFirst; continue;
-            case TOK_UP:          recase = Recase::UpWord;   continue;
-            case TOK_ODQUOTE:     if (dps) out += ' '; out += '"'; dps = false; recase = Recase::None; continue;
-            case TOK_CDQUOTE:     out += '"'; dps = true; recase = Recase::None; continue;
-            case TOK_SPELL_START: if (dps) out += ' '; in_spell = true; dps = false; continue;
-            case TOK_SPELL_END:   in_spell = false; dps = true; recase = Recase::None; continue;
-            // WS5b bracket glue: unlike the quote/EOS markers above, these never check `dps` for a
-            // leading space -- encode only ever emits one when the bracket was ALREADY glued (gap==0
-            // && dps), so a leading space would be wrong by construction, not just unnecessary. Open
-            // markers clear dps (content right inside typically glues too); close markers leave it
-            // true (typically followed by a space). recase is deliberately left untouched (brackets
-            // don't interact with case markers in this encoder's own output).
-            case TOK_GLUE_OPAREN:   out += '('; dps = false; continue;
-            case TOK_GLUE_CPAREN:   out += ')'; dps = true;  continue;
-            case TOK_GLUE_OBRACKET: out += '['; dps = false; continue;
-            case TOK_GLUE_CBRACKET: out += ']'; dps = true;  continue;
-            case TOK_GLUE_OBRACE:   out += '{'; dps = false; continue;
-            case TOK_GLUE_CBRACE:   out += '}'; dps = true;  continue;
-            default: break;
+        // Every id in the fixed marker range [TOK_EOS, TOK_MARKER_COUNT) is fully described by
+        // kMarkerSpecs: decode is a walk of {leading space?, literal bytes, dps/recase/in_spell
+        // effect} -- the SAME table encode_join reads via emit_marker, so the two halves can't drift.
+        // Reserved-headroom ids are INERT rows (no bytes, no state change) = the old reserved-headroom
+        // no-op, so a model that samples one emits nothing, never a wrapped-around byte. Ordinary
+        // content (piece ids >= n_base, or a raw byte < 256) falls straight past this to the tail.
+        if (id >= TOK_EOS && id < TOK_MARKER_COUNT) {
+            const MarkerSpec& s = kMarkerSpecs[static_cast<std::size_t>(id - TOK_EOS)];
+            if (s.lead_space && dps) out += ' ';
+            out += s.literal;
+            if (s.dps      >= 0) dps      = (s.dps != 0);
+            if (s.recase   >= 0) recase   = static_cast<Recase>(s.recase);
+            if (s.in_spell >= 0) in_spell = (s.in_spell != 0);
+            continue;
         }
-        // A marker id inside the fixed scheme range with no case above: reserved headroom the
-        // format has a base_symbol/expansion row for but no assigned effect yet (see casing.hpp's
-        // TOK_RESERVED_* comment). Its expansion is a single "byte" whose code is its own id
-        // (>255) -- falling through to the generic content path below would truncate that to
-        // `static_cast<unsigned char>`, emitting a wrong, wrapped-around byte instead of nothing.
-        // A trained model CAN sample one of these (they're real embedding/output rows), so this
-        // guard is reachable at gen time, not just a paranoia check. No-op until a future
-        // workstream assigns the id a real case above.
-        if (id >= TOK_EOS && id < TOK_MARKER_COUNT) continue;
         if (id >= 0 && id < 256 && is_ws_byte(id)) {    // verbatim whitespace byte
             out += static_cast<char>(id); dps = false; recase = Recase::None; continue;
         }
         if (id < 0 || id >= static_cast<int>(t.expansion.size())) continue;   // out-of-range guard
-        if (!in_spell && dps) out += ' ';               // leading implicit space (never inside a SPELL group)
+        // v2 (schemeV4): a lead-glue-default byte (sentence punctuation) glues to what precedes by
+        // default, so it suppresses the pending space -- `word,` reconstructs with no space. A learned
+        // symbol piece glues by its first byte's default via piece_lead_glue.
+        const bool lead_glue = piece_lead_glue(t, id);
+        if (!in_spell && dps && !lead_glue) out += ' ';               // leading implicit space (never inside a SPELL group)
         for (int code : t.expansion[static_cast<std::size_t>(id)]) {
             const unsigned char c = static_cast<unsigned char>(code);
             if      (recase == Recase::CapFirst && is_alpha(c)) { out += static_cast<char>(to_upper(c)); recase = Recase::None; }
@@ -673,7 +799,7 @@ std::string detokenize_join(const Tokenizer& t, std::span<const int> ids) {
             else                                                { out += static_cast<char>(c); }
         }
         if (!in_spell) {
-            dps = true;
+            dps = !piece_trail_glue(t, id);   // trail-glue byte ($) / piece leaves no pending space
             // UP spans the whole word: keep it across JOINed sub-tokens, reset at the word's end.
             if (recase == Recase::UpWord && !(k + 1 < m && ids[k + 1] == TOK_JOIN)) recase = Recase::None;
         }
@@ -756,6 +882,12 @@ void serialize(const Tokenizer& t, std::ostream& os) {
         wu16(static_cast<std::uint16_t>(w.size()));
         os.write(w.data(), static_cast<std::streamsize>(w.size()));
     }
+    // v2 (schemeV4, D2): the corpus-derived per-byte glue table, appended last. A gracefully-
+    // degrading trailing section (AGENTS.md §3.2): an older file without it loads with the hardcoded
+    // floor, so the magic need not bump. 1 byte/entry: bit1 = lead-glue, bit0 = trail-glue.
+    for (int b = 0; b < 256; ++b)
+        os.put(static_cast<char>((t.glue[static_cast<std::size_t>(b)].lead ? 2 : 0) |
+                                 (t.glue[static_cast<std::size_t>(b)].trail ? 1 : 0)));
 }
 
 std::uint64_t fingerprint(const Tokenizer& t) {
@@ -824,6 +956,16 @@ bool deserialize(Tokenizer& out, std::istream& is) {
         t.attested.insert(std::move(w));
     }
     if (!is) return false;
+    // v2 (schemeV4, D2): optional trailing per-byte glue table (see serialize). Absent in a legacy
+    // file -> the hardcoded floor, so an older tokenizer.tok still loads and encodes identically.
+    t.glue = default_glue_table();
+    char gt[256];
+    if (is.read(gt, 256).gcount() == 256)
+        for (int b = 0; b < 256; ++b) {
+            const unsigned v = static_cast<unsigned char>(gt[b]);
+            t.glue[static_cast<std::size_t>(b)] = { (v & 2) != 0, (v & 1) != 0 };
+        }
+    is.clear();   // a short/absent table leaves EOF/fail bits set on `is` -- expected, not an error
     t.loaded = true;
     out = std::move(t);
     return true;

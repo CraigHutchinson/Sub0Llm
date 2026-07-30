@@ -84,6 +84,7 @@ inline std::vector<std::string> preceding_expr(const std::vector<int>& ctx, int 
         return (t >= '0' && t <= '9') || t == '+' || t == '-' || t == '*' || t == '/' || t == '^'
             || t == '(' || t == ')' || t == '=' || t == ' ' || t == '\t' || is_scratch_slot(t)
             || t == casing::TOK_JOIN                                    // glue between adjacent expr byte tokens
+            || t == casing::TOK_SPELL_START || t == casing::TOK_SPELL_END   // multi-digit number = SPELL-wrapped unit (schemeV4)
             || (t >= casing::TOK_GLUE_OPAREN && t <= casing::TOK_GLUE_CBRACE);   // glued brackets
     };
     int lo = open;

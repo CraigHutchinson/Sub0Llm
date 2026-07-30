@@ -171,26 +171,61 @@ static_assert(TOK_MARKER_COUNT - TOK_EOS == 32,
 //   encode_join; measured on real corpus text, 93.9% of the old shape was that false positive, not a
 //   genuine split (see docs/TOKENIZER_DESIGN.md, docs/CORPUS_COLLAPSE.md). TOK_JOIN now means general
 //   glue only, never a word-boundary signal -- sub0::detail::word_span (scratch.hpp) simplifies to match.
-constexpr std::uint32_t kSchemeVersion = 3;
+//   3 -> 4 (v2, this bump): per-character DEFAULT spacing. Sentence punctuation (`. , ; : ! ?`) now
+//   glues to what precedes it by DEFAULT -- `word,` costs no TOK_JOIN (measured 84-99% glue-before across
+//   corpora; ~10% of a prose stream was JOINs before this). A space-before deviation (` ,`) emits a
+//   literal space byte; a glue-after deviation still emits TOK_JOIN. No marker/id change (n_base fixed),
+//   only the encode/decode transition rule -- see lead_glue_default() and docs/TOKENIZER_V2_IDEAS.md D1.
+constexpr std::uint32_t kSchemeVersion = 4;
 
 constexpr bool          is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool          is_lower(unsigned char c) { return c >= 'a' && c <= 'z'; }
 constexpr bool          is_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }
+constexpr bool          is_digit(unsigned char c) { return c >= '0' && c <= '9'; }
 constexpr bool          is_space(unsigned char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
 constexpr unsigned char to_lower(unsigned char c) { return is_upper(c) ? static_cast<unsigned char>(c + 32) : c; }
 constexpr unsigned char to_upper(unsigned char c) { return is_lower(c) ? static_cast<unsigned char>(c - 32) : c; }
 
-// A "word byte" for pre-tokenization: ASCII letters plus any UTF-8 multibyte byte
-// (>= 0x80). Treating the continuation/lead bytes of accented letters as word
-// material keeps loanwords like "piñata" or "café" as one BPE unit instead of
+// A "word byte" for pre-tokenization: ASCII letters, ASCII digits, plus any UTF-8
+// multibyte byte (>= 0x80). Treating the continuation/lead bytes of accented letters
+// as word material keeps loanwords like "piñata" or "café" as one BPE unit instead of
 // shattering them at the accent. (Typographic punctuation -- curly quotes, dashes
 // -- is folded to ASCII by normalize_text first, so the only multibyte sequences
-// left in the stream are genuine letters and a few rare symbols.) Markers (>= 256)
-// are deliberately excluded so they stay atomic case operators.
+// left in the stream are genuine letters and a few rare symbols.) Digits are word
+// bytes so a number forms a unit and its internal gaps cost no JOIN; but word_unit_end
+// SPLITS a digit<->letter transition, so a number stays a clean numeric span (a fused
+// "Foo123"/"mp3" is the ~10% deviation that pays a JOIN, not the default). Digits also
+// never merge INTO a piece -- the Unigram bars all-digit pieces (unigram.cpp), keeping
+// single-digit tokenization for numeric generalization. Markers (>= 256) are
+// deliberately excluded so they stay atomic case operators.
 constexpr bool is_word_byte(int s) {
     return s >= 0 && s <= 0xFF &&
-           (is_alpha(static_cast<unsigned char>(s)) || s >= 0x80);
+           (is_alpha(static_cast<unsigned char>(s)) || is_digit(static_cast<unsigned char>(s)) || s >= 0x80);
 }
+
+// v2 (schemeV4): the per-character DEFAULT inter-token spacing, as a unified (lead, trail) glue table.
+// `lead` = this byte glues to what PRECEDES it by default (no space before); `trail` = it glues to
+// what FOLLOWS (no space after). The boundary between two tokens defaults to GLUE iff
+// (prev.trail_glue || cur.lead_glue); a deviation stays lossless via a generic modifier -- TOK_JOIN to
+// force glue where the default is a space, or a literal space byte to force a space where the default
+// is glue. Populated from the measured dominant modality per char (docs/TOKENIZER_V2_IDEAS.md §4b):
+//   `. , ; : ! ? %`  -> lead=glue  (glue-before dominant: `word,`, `50%` glue free -- ~10% of a prose
+//                                   stream was JOINs doing exactly this)
+//   `$`              -> trail=glue (glue-after dominant: `$5` glues free)
+//   everything else  -> space both (words/letters, and bimodal punctuation left to markers/JOIN)
+// A hardcoded scheme constant for now; docs/TOKENIZER_V2_IDEAS.md D2 makes it corpus-derived. Keyed by
+// byte here, but the accessors are the single point a future per-piece default (learned symbol tokens,
+// point 3) would extend. encode_join and detokenize_join BOTH read this -- one source, no drift.
+struct GlueDefault { bool lead = false, trail = false; };
+constexpr GlueDefault glue_default(int s) {
+    switch (s) {
+        case '.': case ',': case ';': case ':': case '!': case '?': case '%': return {true,  false};
+        case '$':                                                             return {false, true};
+        default:                                                             return {false, false};
+    }
+}
+constexpr bool lead_glue_default(int s)  { return glue_default(s).lead; }
+constexpr bool trail_glue_default(int s) { return glue_default(s).trail; }
 
 // Per-corpus truecasing statistics (configurator reporting only).
 struct TokStats {
@@ -290,19 +325,39 @@ constexpr bool is_interior_connector(int c) { return c == '\'' || c == '_' || c 
 
 // End (exclusive) of the word unit beginning at `s[i]`, or `i` itself if `s[i]`
 // does not start one. A unit is a maximal run of word bytes (see is_word_byte)
-// with interior connectors kept (see is_interior_connector). Read-only view -- `s` is
-// never mutated or resized here, so a span accepts a vector, a subrange, or any other
-// contiguous int buffer without a copy.
+// with interior connectors kept (see is_interior_connector), but it SPLITS at a
+// direct digit<->letter transition so a number stays a clean, self-contained numeric
+// span: "Foo123"/"mp3" -> "Foo"|"123", "mp"|"3" (the fusion is a measured ~10%
+// deviation that pays a JOIN), while "123 + 456" spaces by default (0 JOIN). A
+// connector still binds across the class boundary, so hyphenated compounds
+// ("covid-19", "2026-07-29") stay whole. Read-only view -- `s` is never mutated or
+// resized here, so a span accepts a vector, a subrange, or any other contiguous buffer.
 inline std::size_t word_unit_end(std::span<const int> s, std::size_t i) {
     if (i >= s.size() || !is_word_byte(s[i])) return i;
     std::size_t j = i + 1;
     while (j < s.size()) {
-        if (is_word_byte(s[j])) { ++j; continue; }
+        if (is_word_byte(s[j])) {
+            if (is_word_byte(s[j - 1]) &&
+                is_digit(static_cast<unsigned char>(s[j])) != is_digit(static_cast<unsigned char>(s[j - 1])))
+                break;                                  // direct digit<->letter transition ends the unit
+            ++j; continue;
+        }
         if (is_interior_connector(s[j]) && j + 1 < s.size() &&
             is_word_byte(s[j - 1]) && is_word_byte(s[j + 1])) { ++j; continue; }
         break;
     }
     return j;
+}
+
+// A byte eligible to join a learned SYMBOL piece (schemeV4, point 3): a non-word, non-whitespace
+// ASCII symbol WITHOUT a dedicated marker path. Quotes and brackets are excluded -- they keep their
+// own open/close markers (TOK_ODQUOTE, TOK_GLUE_OPAREN, ...), so lumping them into a symbol piece
+// would let learn and encode disagree. This leaves the code operators that actually recur as runs
+// (`://` `->` `=>` `==` `!=` `<=` `>=` `&&` `||` `::` `//` `--` `...`) to be minted as pieces.
+constexpr bool is_symbol_piece_byte(int b) {
+    if (b < 0 || b > 0xFF || is_word_byte(b) || is_space(static_cast<unsigned char>(b))) return false;
+    switch (b) { case '"': case '(': case ')': case '[': case ']': case '{': case '}': return false; }
+    return true;
 }
 
 // Split a mixed-case alpha run into CamelCase / PascalCase segments at case transitions, so

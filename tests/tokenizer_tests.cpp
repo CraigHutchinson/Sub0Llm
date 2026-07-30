@@ -81,6 +81,13 @@ TEST_CASE("word_unit_end keeps contractions and accented words whole", "[casing]
     // A trailing apostrophe is not interior -> it splits off ("dogs" + "'").
     const std::vector<int> dogs = truecase_tokenize("dogs'", {}, nullptr);
     REQUIRE(word_unit_end(dogs, 0) == 4);
+    // v2: a digit run is its own unit -> a direct digit<->letter transition splits ("foo123" -> "foo"|"123").
+    const std::vector<int> foo = truecase_tokenize("foo123", {}, nullptr);
+    REQUIRE(word_unit_end(foo, 0) == 3);                 // "foo" ends before the digit run
+    REQUIRE(word_unit_end(foo, 3) == foo.size());        // "123" is one whole digit unit
+    // A connector still binds ACROSS the class boundary -> "covid-19" stays one unit.
+    const std::vector<int> cov = truecase_tokenize("covid-19", {}, nullptr);
+    REQUIRE(word_unit_end(cov, 0) == cov.size());
 }
 
 TEST_CASE("typographic input round-trips through the build tokenizer", "[tokenizer]") {
