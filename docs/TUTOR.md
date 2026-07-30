@@ -147,6 +147,22 @@ because a feedback controller whose state you cannot visualise is very hard to d
 
 ## Explicitly out of scope for the spike
 
-Per-token weighting, learned/meta-learned policies, a second reference model in the training loop, and
-any change to the mainline training path. A negative result is a successful spike; this doc is the record
-of why.
+Learned/meta-learned policies, a second reference model in the training loop, and any change to the
+mainline training path.
+
+**"Per-token" is deliberately excluded AND deliberately disambiguated**, because the phrase names two
+unrelated mechanisms and conflating them would waste a spike:
+
+* **per CORPUS-token** — granularity finer than a window: weight/track individual positions in the corpus
+  stream. This is the natural extension of the mastery surface (document → window → position) and the
+  finest heat map the idea admits. Plausible later; the cost is ledger size (one entry per corpus
+  position is ~10^11 entries at fineweb scale, so it needs aggregation or sampling, not a flat array).
+* **per VOCAB-token** — weighting by *which token id* is being predicted, i.e. a property of the
+  vocabulary rather than of the corpus. A completely different mechanism, closer to class-balanced loss
+  or the rare-token problem, and NOT what Tutor is about. It would interact with the truecasing/vocab
+  work ([[truecasing-collapse-unconditional]]) rather than with coverage.
+
+Both are out of scope here. The distinction is recorded because "add per-token weighting" is otherwise an
+instruction that could reasonably be executed in either direction.
+
+A negative result is a successful spike; this doc is the record of why.
