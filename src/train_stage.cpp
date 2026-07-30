@@ -2207,7 +2207,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     // SEQ_LEN/mean(seq_t) -- measured 2.35x on FineWeb-Edu (257,675 reported vs ~109,000 real), which is
     // the number a run gets planned around. rs.tokens_seen already accumulates batch_t*seq_t exactly;
     // it just was not being differenced here.
-    long long tokens_at_win_t0 = 0, tokens_at_last_log = 0;
+    // Seeded from rs.tokens_seen, NOT from 0: on a resume that count is already the checkpoint's
+    // carried total (1.97e9 at the LoopSplit arms' 8586 steps), so a zero baseline makes the first
+    // interval's numerator the CUMULATIVE tokens instead of the interval's own. Measured on arm A's
+    // resume: the first heartbeat printed 11,009,242 tok/s and the first eval 2,121,884 against a real
+    // 111,660 -- both self-correct once the tracker resets, so it is exactly two wrong lines per
+    // resume. Two too many: win/s and tok/s silently disagreeing by 19x is how a bad throughput number
+    // gets planned around, and this codebase has already published and retracted three of those.
+    long long tokens_at_win_t0 = rs.tokens_seen, tokens_at_last_log = rs.tokens_seen;
     bool stop = false, graceful_stop = false;
     // A device fault mid-run (a real hardware fault hit this exact codebase once already -- see
     // [[gpu-illegal-access-hardware-fault-not-code-bug]]): stops the loop WITHOUT touching the device
