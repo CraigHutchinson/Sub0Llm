@@ -626,6 +626,70 @@ The principle behind the split: identity is written once and never changes, stat
 history only ever appends. A reader six months from now needs all three, and the most common way to lose
 a diagnostic is to have kept only the middle one.
 
+## THE SEED-CONTROLLED RESULT
+
+Two runs, identical but for the seed (1 and 2), 10 counted epochs each (8 real plan epochs), epoch
+permutation, re-score every step, 100% coverage, zero failures, zero dropped events. This is the control
+ranked first, and it settles both of the spike's claims — in opposite directions.
+
+### The central claim SURVIVES
+
+> At matched applied learning, the unlearnable slice has the lowest learning velocity — while carrying
+> the highest loss.
+
+| applied | seed 1 | seed 2 | verdict |
+|---|---|---|---|
+| 5–10 | 0.1532 (n=678) | 0.1516 (n=668) | **holds in both** |
+| 10–20 | 0.0971 (n=2624) | 0.1000 (n=2633) | **holds in both** |
+| 20–50 | 0.0074 (n=285) | 0.0071 (n=281) | **holds in both** |
+| 50–100 | 0.0117 (n=14) | −0.0120 (n=12) | split — n≈13 |
+
+Shuffled is the lowest of the three populations in every bucket with a usable sample, in both seeds,
+while its NELBO (4.16) is the highest by a wide margin (tinystories 1.29, cosmopedia 2.45). **A
+level-based rule weights this population hardest of all three; the velocity reading ranks it last
+everywhere.** That is TUTOR.md's core proposition, and it is now replicated rather than observed once.
+
+Reproducibility is tight where it matters: NELBO agrees to 0.0–0.5% across seeds, velocity to 0.1–5.2%.
+
+### The transfer term FAILS its control
+
+| population | seed 1 | seed 2 | |
+|---|---|---|---|
+| tinystories | −2.18e-06 | −9.46e-07 | 57% apart |
+| cosmopedia | +3.51e-06 | +1.04e-05 | 196% apart |
+| shuffled | −3.26e-06 | **+4.06e-06** | **sign flip** |
+
+With ~1,350–7,300 readings per population — twenty times the previous run — the transfer term still does
+not replicate. The shuffled population changes sign between seeds. **Every per-population transfer
+number reported earlier in this document is withdrawn**: the reinforcement/conflict split at 0.26
+epochs, the "cosmopedia is most conflicted" reading, all of it. They were seed noise.
+
+That is a negative result about the *measurement*, not about the idea. Transfer as a concept is
+untouched; what is refuted is the claim that this estimator resolves it at per-population granularity.
+
+### Why it fails, from an independent direction
+
+`docs/TUTOR_SWEEP.md` reached the same conclusion structurally, before these numbers existed. The
+transfer interval is one **full epoch** long: at 60,948 windows per epoch over 32,810 documents the
+median document is visited once per epoch, so its measurement row spans essentially the entire corpus.
+Row density ≈ 100%, therefore `rank(A) ≈ 1`, and a matrix of that rank can estimate exactly one thing —
+a global drift scalar. Per-population differences at 1e-6 are below what it can resolve, so what we were
+reading as structure was the residual of a single number.
+
+A structural prediction and an empirical replication failure agreeing is much stronger evidence than
+either alone, and it points at the fix: **shorten the interval, do not restructure the sweep.** Nothing
+about ordering changes row density, because one update happens per step; only re-scoring a held-out
+panel *between consecutive steps* does (0.735% density at batch 448).
+
+### Registered predictions, scored
+
+| prediction | outcome |
+|---|---|
+| shuffled: high level, lowest velocity | **confirmed**, both seeds |
+| tinystories masters fast | confirmed (lowest NELBO, 1.285) |
+| cosmopedia retains velocity longer than tinystories | **not supported** — and the seed *disagreements* fall exactly here, tinystories vs cosmopedia swapping at 5–10 |
+| transfer separates reinforcement from conflict per population | **falsified at this resolution** |
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M
