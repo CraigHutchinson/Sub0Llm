@@ -323,6 +323,183 @@ Read it cautiously for now:
 * The run is inside warmup, so the learning rate — and hence applied learning per visit — is still
   rising.
 
+### The back-to-back reading is bounded by MEMORY, not by time
+
+Found on the first full-scale run, and it corrects the cost argument in **A** above.
+
+The re-score was costed in *time* — a forward is ~1/3 of a forward+backward, so ~1.7% at a cadence of 20
+— and that part holds. The part that was missed is the **footprint**. `sub0_dev_forward_loss` goes
+through `fwd_alloc(full=true)`, which materialises an **unchunked** `[batch*T, VOCAB]` logits buffer.
+Training never pays that because it chunks its head (`head_ce_chunked`); the inference forward does not.
+At this run's effective batch that buffer is tens of GB, on top of a training allocation already sized
+to fill VRAM:
+
+```
+cuda error: cudaMalloc(&g_fwd.logits, MV * sizeof(float)) ... -> out of memory
+```
+
+This is precisely the hazard `eval.hpp`'s `Session` comment already warns about — the note explaining
+why a trainer's own evals stay on the CPU. The warning was read and its *time* implication acted on; its
+memory implication was not.
+
+**Fix:** re-score only the first `n` windows, where `n` comes from `eval::device_batch` — the existing
+derivation that bounds this same buffer to `DEVICE_LOGITS_BUDGET_BYTES` — capped at 64. Sampling a
+subset is not a compromise: the transfer term needs *some* visits to carry a post reading, not all of
+them, which is what the cadence constant already said.
+
+**And it failed silently**, which matters more than the bug. `rescore` returned false, training carried
+on, the surface kept updating, and the transfer column simply stopped filling — presenting as "no
+conflict or reinforcement found" rather than "the measurement never ran". Same shape as the probe-plan
+ordering bug earlier: a broken instrument that reads as a benign result. Both now log once, loudly. Two
+such failures in one stage is the strongest evidence yet for TUTOR.md's instinct to make the surface
+read-only and visualised *before* anything consumes it.
+
+## THE RESULT — 10 epochs, 1110 steps, exclusive GPU
+
+`--epochs 10 --batch 448`, d256 L8, vocab 16517, 13.3M-token spliced corpus. 1110 steps, zero device
+failures, zero re-score failures. `val_nelbo` best **1.8858**, still improving at the end — no plateau
+and no overfit within 10 epochs, so nothing here is read off a saturated model.
+
+Coverage 91.1%: **8.9% of documents were never sampled at all in ten epochs**, which is the
+length-proportional draw combined with Poisson coverage, and is itself an argument for arm 4 below.
+
+| population | docs | visits/doc | nelbo | velocity (raw) | transfer |
+|---|---|---|---|---|---|
+| tinystories | 24000 | 19.1 | 1.550 | 0.2254 | +5.30e-06 |
+| cosmopedia | 8000 | 82.6 | 2.535 | 0.0132 | +3.63e-05 |
+| shuffled | 4000 | 21.4 | 4.392 | 0.1218 | −8.91e-07 |
+
+Drift floor 8.50e-06 per unit applied.
+
+### Velocity at matched applied learning — the claim, and it holds
+
+| applied | tinystories | cosmopedia | shuffled |
+|---|---|---|---|
+| 5–10 | 0.3590 (n=2133) | — | **0.2001** (n=422) |
+| 10–20 | 0.2690 (n=12569) | 0.2144 (n=73) | **0.1413** (n=2403) |
+| 20–50 | 0.0181 (n=3778) | 0.0150 (n=2759) | **0.0104** (n=677) |
+| 50–100 | 0.0078 (n=230) | 0.0094 (n=4403) | **−0.0048** (n=34) |
+| 100+ | — | 0.0074 (n=660) | — |
+
+**The unlearnable slice carries the HIGHEST level (4.392) and the LOWEST velocity in every bucket where
+it has data.** A level-based rule would weight it hardest of all three; the velocity reading ranks it
+last everywhere. That is the spike's central claim and it survived the test.
+
+It goes further at 50–100, where shuffled velocity is **negative** — the slice is actively regressing
+under continued training while both real populations still creep forward. That is the "forgetting comes
+free with velocity" property, observed rather than argued. Caveat: n=34 in that bucket.
+
+### What did NOT replicate
+
+**TUTOR.md's prediction that cosmopedia retains velocity longer than tinystories is unsupported.** At
+matched applied learning tinystories is *ahead* at 10–20 and 20–50; cosmopedia edges it only at 50–100.
+And in raw terms cosmopedia has the LOWEST velocity of all three (0.0132) — the opposite of the
+prediction — because its documents are far further along their own curves (82.6 visits vs 19.1). What
+actually distinguishes cosmopedia is that it keeps *receiving* learning, not that it retains velocity
+per unit of it. That is a sampling property, not a learnability one, and it would have been reported as
+a confirmed prediction by anyone reading the raw column.
+
+**The transfer sign is not stable across training**, and this is the weakest part of the result:
+
+| read | tinystories | cosmopedia | shuffled |
+|---|---|---|---|
+| 0.26 ep | −3.76e-03 | −2.78e-03 | +1.93e-03 |
+| 3.8 ep | −1.98e-06 | +1.82e-05 | +5.77e-06 |
+| 10 ep | +5.30e-06 | +3.63e-05 | −8.91e-07 |
+
+Only "cosmopedia is the most conflicted" holds across the last two. Every other ordering flips. Two
+things are likely responsible, and one is a design defect:
+
+* **`Entry::transfer` is a running mean over every interval since step 0**, so a late reading is a
+  lifetime average dominated by accumulated history rather than a statement about the model's current
+  state. It cannot show what it is being read as showing. It should be an EMA with a horizon, or —
+  better, and already proposed below — an event stream normalised post-hoc.
+* n is small and uneven (869 / 1204 / 162), single seed, no error bar. Which is exactly what the
+  duplicate-content control exists to supply.
+
+### Three pillars
+
+* **Correctness** — engine suite unchanged at the same 2 pre-existing failures; frontend 190 cases /
+  114523 assertions green; the surface's own 9 arithmetic tests green. Zero device or re-score failures
+  across 1110 steps.
+* **Performance** — 113,747 tok/s mean over 101 evals on an exclusive GPU, with the surface on. The
+  re-score at cadence 20 and the 282-probe CPU scoring at eval cadence are inside that figure. No
+  clean surface-off baseline was taken at this config, so the *overhead* is not yet quantified — that
+  is an honest gap, not a claim of "free".
+* **Memory** — the ledger is 1.58 MB for 36000 documents (44 B/entry), and the snapshot JSON 1.11 MB.
+  Extrapolated to fineweb's ~40M documents the flat array is ~1.76 GB, which is where aggregation or
+  sampling stops being optional.
+
+## What to control against next — the axes, then the arms
+
+Raised in review while the 10-epoch run was in flight. The interim reading already showed why it
+matters: the raw per-population velocity ordering was *wrong* (shuffled appeared to out-learn
+cosmopedia) and only came right after binning on applied learning. A correction that large, found by
+accident, means the normalisation is doing more work than the measurement.
+
+### The axis problem: velocity has two, and we normalise by one
+
+`velocity = -dNELBO / d(own applied learning)` treats an entry's own progress as the only thing that
+moves its loss. But an entry's reading also depends on **how mature the model was when the reading was
+taken**. Two documents both at `applied = 10` are not comparable if one arrived there in epoch 1 (long
+document, sampled constantly, learning from a young model) and the other in epoch 7. Binning on applied
+learning collapses exactly that second axis, so the corrected table above is still confounded — less
+than the raw one, but not cleanly.
+
+So the control axis worth adding is **global progress** (global applied learning, or step), giving a 2D
+surface `velocity(own_applied, global_applied)` rather than a single number per entry.
+
+**The correction that follows, and it reuses a trick already in the design.** Fit the corpus-wide
+expectation `E[velocity | own_applied, global_applied]` and report each entry's **residual** against it.
+That makes velocity comparable across populations by construction, with no binning and no hand-chosen
+buckets — and it is precisely what the transfer term already does by reading each entry's deviation from
+the corpus-wide drift floor. One idea, applied to both halves of the surface.
+
+**What that needs from the ledger:** `Entry` keeps only the LATEST velocity, which cannot support the
+2D fit. The cheap fix is not a bigger `Entry` but an append-only **velocity event stream** — one line per
+velocity update (`doc, population, global_applied, own_applied, nelbo, velocity`). A few million lines
+over a run, written at the same cadence as everything else, and it makes every normalisation choice a
+post-hoc analysis decision rather than something baked into the ledger and impossible to revisit.
+
+### Control arms, ranked by what they would actually settle
+
+1. **A second seed. Do this one first.** Everything above is a single run, and this project has been
+   here before: the GQA A/B was left unresolvable because seed noise ran 1.73x the signal, and the
+   LoopSplit 3-arm result is flagged SINGLE SEED in the notes for the same reason. Nothing in the table
+   deserves interpretation until a replicate says the ordering is stable. Cheapest arm, largest effect
+   on what may be claimed.
+
+2. **A duplicate-content control — the missing error bar.** Splice each of ~500 documents in TWICE, at
+   different ordinals. The two copies are identical text, so any divergence in their measured velocity
+   or transfer is pure noise: sampling variance, window placement, ordering, arithmetic. That yields the
+   per-document error bar the surface currently lacks entirely, and it answers a question the drift
+   probe cannot — the probe measures interference on *untrained* documents, whereas this measures
+   reproducibility on *trained* ones, which is what every per-entry claim actually rests on. Nearly
+   free: a splice-tool flag.
+
+3. **Complete the 2x2: shuffled COSMOPEDIA.** Today the garbage slice is shuffled tinystories, so
+   "shuffled" differs from "cosmopedia" in two ways at once — structure *and* source. Adding a
+   shuffled-cosmopedia population makes it factorial ({tinystories, cosmopedia} x {intact, shuffled}),
+   and the unlearnability claim becomes the **interaction term** rather than a difference of differences
+   between non-comparable groups. This repo already learned this lesson structurally — the depth-axis
+   plan records arm E as REQUIRED because it was the 2x2's missing cell, with an explicit instruction to
+   read the interaction, not the raw arm difference.
+
+4. **A length-matched corpus — fix the sampling confound at source.** Windows are drawn by token
+   position, so draw probability scales with document length; that single fact produced the 7.3 vs 31.5
+   visits-per-document gap and hence the wrong raw ordering. Truncating every spliced document to a
+   common token length equalises visit rates by construction, and removes the need for the post-hoc
+   binning that is currently load-bearing. Cheaper and more honest than correcting for it forever.
+
+5. **A frozen-model null.** Score the same probe set twice with no training in between. The delta should
+   be exactly zero; whatever it is instead is the measurement's own nondeterminism (bf16 accumulation,
+   atomics ordering), and it is a floor underneath *every* reading including the drift floor itself.
+   Minutes to run, and it is the only one of these that can invalidate the instrument rather than
+   refine it.
+
+Arms 1 and 5 are cheap enough to run regardless. Arms 2-4 are all splice-tool changes plus a rerun, and
+2 is the one that turns every number in this document from a point estimate into a claim.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M

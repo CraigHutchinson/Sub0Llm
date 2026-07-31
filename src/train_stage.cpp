@@ -1104,24 +1104,39 @@ struct GpuTrainer {
 #endif
     }
 
-    // Re-score the windows step() just trained, AFTER its optimizer update -- the "back-to-back reading"
+    // Re-score windows step() just trained, AFTER its optimizer update -- the "back-to-back reading"
     // (docs/TUTOR_SPIKE.md). Forward-only, and it deliberately reuses the ids/targets step() already
     // built rather than rebuilding them, so the two readings are guaranteed to be of the same windows.
     //
     // This is what makes an entry's own learning separable from the transfer it receives from the rest
     // of the corpus: the loss step() reports is the training forward's, taken BEFORE the update, so
     //     own learning = rescore - step's own reading,   transfer = next visit's reading - rescore.
-    // Runs at a cadence, not every step: a forward is ~1/3 of a forward+backward.
-    bool rescore([[maybe_unused]] int batch, [[maybe_unused]] int T,
+    //
+    // ONLY THE FIRST `n` WINDOWS, and n is bounded by MEMORY, not by time. This path is
+    // sub0_dev_forward_loss -> fwd_alloc(full=true), which materializes an UNCHUNKED [n*T, VOCAB]
+    // logits buffer -- training avoids that by chunking its head (head_ce_chunked), inference does not.
+    // At a full training batch that buffer is tens of GB and the allocation fails outright; the first
+    // version of this call did exactly that, on top of a training allocation already sized to fill VRAM,
+    // which is the hazard eval.hpp's Session comment warns about. n comes from eval::device_batch, the
+    // existing derivation that bounds this same buffer to DEVICE_LOGITS_BUDGET_BYTES, rather than from a
+    // new constant. Sampling a subset is not a compromise: the transfer term needs SOME visits to carry
+    // a post reading, not all of them.
+    int rescore_capacity(int T) const { return sub0::eval::device_batch(T, MAX_RESCORE_WINDOWS); }
+
+    bool rescore([[maybe_unused]] int n, [[maybe_unused]] int T,
                  [[maybe_unused]] const int* lengths, [[maybe_unused]] double* out_win_loss) {
 #if defined(SUB0_BUILD_CUDA)
         double loss = 0.0;
-        return sub0_dev_forward_loss(ids.data(), targets.data(), batch, T, &loss, lengths,
+        return sub0_dev_forward_loss(ids.data(), targets.data(), n, T, &loss, lengths,
                                      out_win_loss) == 0;
 #else
         return false;
 #endif
     }
+    // Ceiling on how many windows a re-score ever asks for, before device_batch trims it to the logits
+    // budget for this T. Keeps the cost bounded at small T too, where the budget alone would allow far
+    // more windows than the reading needs.
+    static constexpr int MAX_RESCORE_WINDOWS = 64;
 
     // Forward+backward ONLY -- no optimizer step applied (unlike step()). Fills out_grad[PARAM_FLOATS]
     // with the reduced device gradient so the caller can weighted-combine it with a CPU sub-batch's
@@ -2321,6 +2336,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     int                     tutor_src = -1;      // blend source the manifest labels; -1 = surface off
     double                  tutor_drift_floor = 0.0;
     long                    tutor_redraws = 0;   // probe windows redrawn (see the sampling loop)
+    bool                    tutor_rescore_warned = false;   // report a failing re-score once, not per step
     double                  tutor_applied_at_last_probe = 0.0;
     // Per-step readout buffers, sized ONCE here to the batch ceiling and reused every step -- the
     // per-step path allocates nothing (AGENTS.md 1).
@@ -2784,14 +2800,26 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // receives from everything else. GPU path only -- it reuses the device ids/targets the step
             // already uploaded, so there is nothing to rebuild and no second window materialization to
             // get subtly wrong.
-            if (gpu_train && (step % sub0::tutor::TUTOR_RESCORE_EVERY) == 0 &&
-                gpu.rescore(batch_t, seq_t, win_len.data(), tutor_post_loss.data())) {
-                for (int b = 0; b < batch_t; ++b) {
-                    if (src_idx[b] != tutor_src) continue;
-                    const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
-                                                         starts[b]);
-                    tutor_surface.record_post(doc,
-                        static_cast<float>(tutor_post_loss[static_cast<std::size_t>(b)]));
+            if (gpu_train && (step % sub0::tutor::TUTOR_RESCORE_EVERY) == 0) {
+                const int n_post = std::min(batch_t, gpu.rescore_capacity(seq_t));
+                if (gpu.rescore(n_post, seq_t, win_len.data(), tutor_post_loss.data())) {
+                    for (int b = 0; b < n_post; ++b) {
+                        if (src_idx[b] != tutor_src) continue;
+                        const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
+                                                             starts[b]);
+                        tutor_surface.record_post(doc,
+                            static_cast<float>(tutor_post_loss[static_cast<std::size_t>(b)]));
+                    }
+                } else if (!tutor_rescore_warned) {
+                    // LOUD once, then quiet. A silently failing re-score is the worst outcome available
+                    // here: training carries on, the surface keeps updating, and the transfer column
+                    // just stops filling -- which reads as "no conflict or reinforcement found" rather
+                    // than as "the measurement never ran". Same class of quiet failure as the probe-plan
+                    // ordering bug; both argue for the read-only stage existing at all.
+                    tutor_rescore_warned = true;
+                    sub0::log::error("  tutor: the post-update re-score FAILED at step {} (device). "
+                                     "Transfer will not be measured for the rest of this run -- velocity "
+                                     "and level are unaffected.", step);
                 }
             }
         }
