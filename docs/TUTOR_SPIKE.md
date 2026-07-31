@@ -568,6 +568,64 @@ tiling rather than of the seeds:
 The seed pair below is internally valid because both arms share all of this; comparisons against the
 earlier random-sampling run's `val_nelbo` are not, and are not made.
 
+## Review of the counters and the recording capture
+
+A deliberate audit of every counter and statistic the spike maintains, rather than continuing to find
+defects reactively. Three of the four bugs found so far — the probe-plan ordering, the silent re-score
+OOM, the `win_len > T` corruption — shared one property: **the instrument failed in a way that read as a
+benign result.** That is the failure mode this section is organised around.
+
+### Defects found and fixed
+
+| # | Defect | Why it was dangerous |
+|---|---|---|
+| 1 | `nelbo_post == 0.f` used as "no reading" | 0.0 is a *legitimate* loss — `cross_entropy` returns exactly 0 for a fully loss-masked window and the readout reports it faithfully. A real reading would be classified absent, and transfer would silently never record for those entries. |
+| 2 | Event buffer dropped silently when full | A diagnostic stream with an unrecorded hole is worse than no stream: downstream it is invisible and reads as an absence of *events* rather than an absence of *recording*. Now counted, reported every eval, and carried in the snapshot. |
+| 3 | Sidecar wrote raw `Entry` with no layout stamp | Adding a field without bumping the version would reinterpret every entry at the wrong stride and load **silently**. The version alone cannot protect against this, because forgetting to bump it *is* the mistake. `sizeof(Entry)` now rides the header. |
+| 4 | Magic checked *after* `entry_size` | On a foreign or truncated file every later field is garbage; reporting "wrong entry size" for what is actually "not a surface file" sends the reader after the wrong problem. |
+| 5 | CSV header written per *process*, not per *file* | A resumed run injected a second header row partway down the stream, which every CSV reader parses as a data row of garbage. |
+| 6 | `DriftProbe::observe` folded in non-finite scores | `nelbo_cpu_each` writes NaN for an ungradeable window; one NaN makes the whole floor NaN, which then compares false against every velocity — silently disabling the guard that says which readings are real. |
+| 7 | `d_applied = applied - applied_mark` | Catastrophic cancellation at scale: `applied` grows without bound (~1e6 here) while the threshold stays a few units, so the velocity denominator degrades in proportion to run length — worst exactly where readings matter most. Now accumulated forward and reset at each mark. |
+| 8 | Coverage divided by total documents | Covered above: made 100% unattainable and hid a regression behind a coincidence. |
+
+### Known limitations, recorded rather than fixed
+
+* **`Entry::transfer` is a lifetime running mean** since step 0, so a late read is an average over the
+  whole run, not current state. Deliberately left as-is now that the event stream carries per-interval
+  values — the events are the source of truth and any horizon can be applied post-hoc. The ledger field
+  is a summary, and the docs say so.
+* **`Entry::tokens` is `uint32`.** ~2.6e7 at fineweb-scale visit counts, so ~160x of headroom. Recorded,
+  not defended.
+* **`visits` in a transfer event is the count *before* that visit**, since transfer is computed before
+  the visit is folded in; a velocity event's is *after*. Documented rather than forced into agreement,
+  because both are the natural value at their respective moment.
+* **A re-score covers the first `n` windows of a batch**, which is an unbiased sample only because the
+  batch order *is* the shuffled permutation. That is now load-bearing on the sampler and is stated here
+  so a future change to draw order does not quietly bias the transfer readings.
+
+### A methodology error in my own reporting
+
+The "113,747 tok/s mean over 101 evals" figure was extracted with `grep -oE "\(1[0-9]{5} tok/s\)"` —
+which silently **excludes any eval below 100,000 or above 999,999 tok/s**. It is a mean over the
+qualifying subset, biased upward by construction, and it was presented as a run-wide mean. Recomputed
+without the filter below. Numbers taken by ad-hoc log-scraping deserve the same scepticism as numbers
+taken by the instrument.
+
+### The recording design
+
+Four artefacts per run, each self-describing, in the model directory:
+
+| file | shape | purpose |
+|---|---|---|
+| `tutor_run.json` | one object, `schema` versioned | **Identity.** Label, seed, batch, peak lr, seq len, manifest + its seed, windows/epoch, reachable documents, and every cadence constant. Written once at startup so it survives a run that dies before its first eval. |
+| `tutor_surface.json` | column-major arrays | **Current state**, for the live viewer. Now also carries `reachable`, so the viewer distinguishes "training never reaches this" from "not visited yet" — both are `visits == 0`. |
+| `tutor_events.csv` | flat table | **History.** One row per velocity/transfer update with both normalising axes (`own_applied`, `global_applied`) plus `win_len`, `visits`, `step`, `pop`. This is the retrospective record; the ledger is only its summary. |
+| `tutor_surface.bin` | versioned binary | **Exact resume state**, layout-stamped. |
+
+The principle behind the split: identity is written once and never changes, state is overwritten, and
+history only ever appends. A reader six months from now needs all three, and the most common way to lose
+a diagnostic is to have kept only the middle one.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M

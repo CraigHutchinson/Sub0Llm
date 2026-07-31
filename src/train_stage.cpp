@@ -2336,12 +2336,18 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     int                     tutor_src = -1;      // blend source the manifest labels; -1 = surface off
     double                  tutor_drift_floor = 0.0;
     sub0::tutor::EpochPlan  tutor_plan;      // the without-replacement epoch permutation
-    bool                    tutor_events_header = true;
+    sub0::tutor::Surface::RunInfo tutor_run;      // identity stamped into every recording
+    std::vector<std::uint8_t> tutor_reachable;    // per document: can training reach it at all?
+    std::size_t             tutor_reachable_docs = 0;
     bool                    tutor_rescore_warned = false;   // report a failing re-score once, not per step
     double                  tutor_applied_at_last_probe = 0.0;
     // Per-step readout buffers, sized ONCE here to the batch ceiling and reused every step -- the
     // per-step path allocates nothing (AGENTS.md 1).
     std::vector<double>     tutor_win_loss, tutor_post_loss;
+    // The document each window came from. EpochPlan already resolved it when it built the tiling, so
+    // carrying it costs one store and removes a doc_of() binary search per window per step -- and, more
+    // importantly, removes a SECOND derivation of the same fact that could disagree with the first.
+    std::vector<std::uint32_t> win_doc;
     std::vector<std::size_t> probe_starts;   // the fixed probe window plan, resolved once at setup
     std::vector<int>         probe_lens;
     std::vector<float>       probe_nelbo;
@@ -2368,11 +2374,23 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                   return t; }());
             return 1;
         }
+        // HYBRID is refused rather than half-supported. Its CPU sub-batch is COMPACTED (hyb_cpu_idx
+        // remaps window b to a different slot), so a per-window readout indexed by b would attribute
+        // every reading to the wrong document -- and the result would look entirely plausible, since
+        // every number would still be a real loss of a real window. Refusing costs nothing here: hybrid
+        // exists for content-embed sources, which a mastery-surface run does not use.
+        if (hybrid_train) {
+            sub0::log::error("train: --tutor-manifest does not support the hybrid CPU/GPU split -- its "
+                             "CPU sub-batch is compacted, so per-window readings would be attributed to "
+                             "the wrong documents. Run without a content-embed blend source.");
+            return 1;
+        }
         // One visit's worth of applied learning, used to scale the velocity mark threshold -- derived
         // from this run's own lr and window width rather than being a fixed constant (the project's
         // "derive bounds from scale" rule), so it tracks whatever schedule the run is on.
         const float typical_visit = lr * static_cast<float>(SEQ_LEN);
         tutor_surface.reset(tutor_man.total_docs(), typical_visit);
+        win_doc.assign(static_cast<std::size_t>(max_batch_t), 0u);
         tutor_win_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
         tutor_post_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
         tutor_probe.reset(tutor_man.total_docs(), sub0::tutor::TUTOR_PROBE_STRIDE);
@@ -2400,17 +2418,40 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const sub0::BlendSource& tsrc = sources[static_cast<std::size_t>(tutor_src)];
             tutor_plan.build(tsrc.docs, tsrc.view.size(), SEQ_LEN,
                              [&](std::size_t d) { return tutor_probe.is_probe(d); });
-            tutor_surface.set_eligible(tutor_plan.documents());
+            tutor_reachable_docs = tutor_plan.documents();   // one full sort, not four
+            tutor_surface.set_eligible(tutor_reachable_docs);
+            // Reachability mask, derived from the plan itself rather than re-deriving the val-split and
+            // probe rules a second time -- two hand-maintained copies of "which documents count" is how
+            // the coverage denominator came to disagree with reality in the first place.
+            tutor_reachable.assign(tutor_man.total_docs(), 0u);
+            tutor_plan.for_each_document([&](std::uint32_t d) {
+                if (d < tutor_reachable.size()) tutor_reachable[d] = 1u;
+            });
             sub0::log::line("tutor: epoch permutation -- {} windows over {} reachable documents "
                             "(every token trained once per epoch, shuffled without replacement; "
                             "{} of {} documents are val-split or probe and unreachable by design)",
-                            tutor_plan.size(), tutor_plan.documents(),
-                            tutor_man.total_docs() - tutor_plan.documents(), tutor_man.total_docs());
+                            tutor_plan.size(), tutor_reachable_docs,
+                            tutor_man.total_docs() - tutor_reachable_docs, tutor_man.total_docs());
         }
         // Event buffer: reserved once, drained at every eval. Sized to comfortably hold one eval
         // interval's updates -- record() drops silently rather than growing, so the per-step path
         // cannot allocate.
-        tutor_surface.reserve_events(1u << 20);
+        // Sized from the DRAIN CADENCE, not a round number. The buffer is emptied at every eval, so it
+        // only has to hold one interval: at most two events per window (a velocity and a transfer
+        // update) across eval_every steps, doubled for headroom. The previous 1<<20 was ~37 MB and
+        // ~200x oversized -- a reserve that large is not caution, it is an unexamined constant.
+        const std::size_t ev_cap = 4u * static_cast<std::size_t>(eval_every)
+                                      * static_cast<std::size_t>(max_batch_t);
+        tutor_surface.reserve_events(ev_cap);
+        sub0::log::info("  tutor: event buffer {} records ({:.1f} MB), drained every {} steps",
+                        ev_cap, static_cast<double>(ev_cap * sizeof(sub0::tutor::Event)) / 1048576.0,
+                        eval_every);
+        tutor_run = sub0::tutor::Surface::RunInfo{
+            .label = model_path, .manifest = tutor_manifest_path, .manifest_seed = tutor_man.seed,
+            .seed = seed, .batch = batch, .peak_lr = lr, .seq_len = SEQ_LEN,
+            .windows_per_epoch = tutor_plan.size(), .eligible_docs = tutor_reachable_docs };
+        if (!tutor_surface.write_run_info((meta_dir / "tutor_run.json").string(), tutor_run))
+            sub0::log::info("  tutor: run-info write failed");
         if (std::filesystem::exists(tutor_sidecar) && tutor_surface.load(tutor_sidecar.string()))
             sub0::log::info("  tutor: resumed the mastery surface from {}", tutor_sidecar.string());
         // Probe balance across populations, logged rather than assumed: a stride sharing a factor with
@@ -2568,6 +2609,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 const sub0::tutor::EpochPlan::Slot& sl = tutor_plan.next(rng);
                 d.src         = tutor_src;
                 d.win.start   = sl.start;
+                win_doc[b]    = sl.doc;   // the plan already knows it -- see win_doc's declaration
                 // A window can never be longer than the step's own T: every window-fill loop indexes
                 // row b as `b*T + s` while iterating `s < len`, so len > T writes into row b+1. vary_seq
                 // is pinned off while the surface is active precisely so this clamp is a no-op, but the
@@ -2804,7 +2846,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const auto t_train0 = clock::now();
             step_loss = sub0::train_batch(cpu_win.data(), cpu_starts.data(), batch_t, seq_t, win_len.data(),
                                           any_masked ? cpu_mask.data() : nullptr,
-                                          content_embed_active ? win_binds.data() : nullptr);
+                                          content_embed_active ? win_binds.data() : nullptr,
+                                          /*win_sentinel=*/nullptr, /*win_persist=*/nullptr,
+                                          tutor_win_loss.empty() ? nullptr : tutor_win_loss.data());
             train_secs += std::chrono::duration<double>(clock::now() - t_train0).count();
             const auto t_opt0 = clock::now();
             opt.step();
@@ -2821,9 +2865,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             tutor_surface.add_global_applied(step_applied);
             for (int b = 0; b < batch_t; ++b) {
                 if (src_idx[b] != tutor_src) continue;      // a window from an unlabelled source
-                const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
-                                                     starts[b]);
-                tutor_surface.record(doc, static_cast<float>(tutor_win_loss[static_cast<std::size_t>(b)]),
+                tutor_surface.record(win_doc[static_cast<std::size_t>(b)],
+                                     static_cast<float>(tutor_win_loss[static_cast<std::size_t>(b)]),
                                      lr_t, win_len[b]);
             }
             // The back-to-back reading, at a cadence: re-score the SAME windows after this step's
@@ -2836,9 +2879,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (gpu.rescore(n_post, seq_t, win_len.data(), tutor_post_loss.data())) {
                     for (int b = 0; b < n_post; ++b) {
                         if (src_idx[b] != tutor_src) continue;
-                        const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(tutor_src)].docs,
-                                                             starts[b]);
-                        tutor_surface.record_post(doc,
+                        tutor_surface.record_post(win_doc[static_cast<std::size_t>(b)],
                             static_cast<float>(tutor_post_loss[static_cast<std::size_t>(b)]));
                     }
                 } else if (!tutor_rescore_warned) {
@@ -2899,7 +2940,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 const double floor_now = tutor_probe.observe(probe_nelbo, applied_since);
                 if (floor_now > 0.0) tutor_drift_floor = floor_now;
                 tutor_applied_at_last_probe = tutor_surface.global_applied();
-                if (!tutor_surface.write_snapshot(tutor_snapshot.string(), tutor_man, step, tutor_drift_floor))
+                if (!tutor_surface.write_snapshot(tutor_snapshot.string(), tutor_man, tutor_run, step,
+                                                  tutor_drift_floor, tutor_reachable))
                     sub0::log::info("  tutor: snapshot write failed ({})", tutor_snapshot.string());
                 // The surface is FEEDBACK STATE: TUTOR.md is explicit that if it is not restored exactly
                 // a matched-arm A/B quietly stops being matched, so it is persisted on the same cadence
@@ -2907,13 +2949,15 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (!tutor_surface.save(tutor_sidecar.string()))
                     sub0::log::info("  tutor: sidecar write failed ({})", tutor_sidecar.string());
                 const std::size_t n_ev = tutor_surface.events().size();
-                if (!tutor_surface.append_events(tutor_events.string(), tutor_man, tutor_events_header))
+                if (!tutor_surface.append_events(tutor_events.string(), tutor_man))
                     sub0::log::info("  tutor: event append failed ({})", tutor_events.string());
-                tutor_events_header = false;
+                // dropped_events is reported unconditionally, not only when nonzero: a diagnostic
+                // stream's completeness is itself a datum, and "0 dropped" in the log is what lets a
+                // later reader trust the CSV rather than wonder.
                 sub0::log::line("  tutor: coverage {:.1f}% | drift floor {:.3e} /applied | {} probes "
-                                "| epoch {} | {} events",
+                                "| epoch {} | {} events ({} dropped)",
                                 100.0 * tutor_surface.coverage(), tutor_drift_floor, probe_nelbo.size(),
-                                tutor_plan.epoch(), n_ev);
+                                tutor_plan.epoch(), n_ev, tutor_surface.dropped_events());
             }
 
             // Validation NELBO only once enough of the corpus has been seen.

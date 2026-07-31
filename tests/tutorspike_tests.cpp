@@ -13,6 +13,10 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 
@@ -158,6 +162,82 @@ TEST_CASE("drift probe: excluded documents are identified and the floor is a MAG
     REQUIRE(floor_ == Catch::Approx(0.2 / 2.0).epsilon(1e-4));   // mean |delta| per unit applied
 }
 
+TEST_CASE("surface: a post reading of exactly 0.0 is still a reading", "[tutor]") {
+    // A 0-sentinel would classify this as absent. 0.0 is a LEGITIMATE loss here: cross_entropy returns
+    // exactly 0 for a fully loss-masked window and the per-window readout reports that faithfully, so a
+    // masked-source window can produce one. The failure would be silent and one-directional -- transfer
+    // simply never recorded for those entries, reading as "no conflict found".
+    Surface s;
+    s.reset(1, 0.f);
+    s.record(0, 3.0f, 0.001f, 100);
+    s.record_post(0, 0.0f);                            // a real reading whose value happens to be zero
+    REQUIRE(s.at(0).has_post());
+    s.add_global_applied(4.0);
+    s.record(0, 1.0f, 0.001f, 100);
+    REQUIRE(s.at(0).has_transfer());
+    REQUIRE(s.at(0).transfer == Catch::Approx((1.0f - 0.0f) / 4.0));
+}
+
+TEST_CASE("surface: a consumed post reading does not leak into the NEXT interval", "[tutor]") {
+    // record() clears the flag after use. Without that, an entry re-scored once would keep attributing
+    // every later interval against that same stale post value, and the transfer term would drift
+    // further from meaning anything the longer the run went on.
+    Surface s;
+    s.reset(1, 0.f);
+    s.record(0, 5.0f, 0.001f, 100);
+    s.record_post(0, 4.0f);
+    s.add_global_applied(2.0);
+    s.record(0, 4.5f, 0.001f, 100);                    // consumes the post reading
+    REQUIRE(s.at(0).transfer_n == 1);
+    REQUIRE_FALSE(s.at(0).has_post());
+    s.add_global_applied(2.0);
+    s.record(0, 6.0f, 0.001f, 100);                    // no post this time -> no new claim
+    REQUIRE(s.at(0).transfer_n == 1);
+}
+
+TEST_CASE("surface: event overflow is COUNTED, never silently dropped", "[tutor]") {
+    // The buffer is fixed so the per-step path cannot allocate, which means it can fill. A diagnostic
+    // stream with an unrecorded hole is worse than no stream: the hole is invisible downstream and reads
+    // as an absence of events rather than an absence of recording.
+    Surface s;
+    s.reset(1, 0.f);
+    s.reserve_events(2);
+    for (int i = 0; i < 10; ++i) s.record(0, 5.0f - 0.1f * static_cast<float>(i), 0.001f, 100);
+    REQUIRE(s.events().size() == 2);
+    REQUIRE(s.dropped_events() > 0);
+}
+
+TEST_CASE("surface: coverage divides by REACHABLE documents", "[tutor]") {
+    // The validation split and the drift probes are permanently out of training's reach, so dividing by
+    // the total document count makes 100% unattainable and prints a fixed shortfall that looks like a
+    // coverage failure. On the real corpus that shortfall (8.9%) coincidentally matched the old
+    // sampler's genuine Poisson gap almost exactly.
+    Surface s;
+    s.reset(10, 0.f);
+    s.set_eligible(4);                                  // 6 of 10 documents are unreachable by design
+    s.record(0, 1.f, 0.001f, 10);
+    s.record(1, 1.f, 0.001f, 10);
+    s.record(2, 1.f, 0.001f, 10);
+    s.record(3, 1.f, 0.001f, 10);
+    REQUIRE(s.coverage() == Catch::Approx(1.0));        // every reachable document visited
+}
+
+TEST_CASE("drift probe: a non-finite score cannot poison the floor", "[tutor]") {
+    // nelbo_cpu_each writes NaN for a window it cannot grade. A single NaN propagates through the sum,
+    // making the whole floor NaN -- which then compares false against every velocity and silently
+    // disables the guard that says which readings are real.
+    DriftProbe p;
+    p.reset(30, 10);
+    REQUIRE(p.docs().size() == 3);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::vector<float> a{ 5.0f, nan, 5.0f };
+    REQUIRE(p.observe(a, 1.0) == Catch::Approx(0.0));   // baseline
+    const std::vector<float> b{ 5.4f, nan, 5.2f };
+    const double f = p.observe(b, 1.0);
+    REQUIRE(std::isfinite(f));
+    REQUIRE(f == Catch::Approx(0.3).epsilon(1e-6));     // mean of |0.4| and |0.2|, the NaN skipped
+}
+
 TEST_CASE("epoch plan: every token is covered exactly once per epoch", "[tutor]") {
     // The defining property, and the whole reason for replacing independent sampling. Under sampling
     // WITH replacement a token's per-epoch visit count is Poisson -- some tokens are trained several
@@ -227,6 +307,94 @@ TEST_CASE("epoch plan: the permutation reshuffles and repeats at the epoch bound
     std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
     REQUIRE(a == b);
     REQUIRE(first != second);
+}
+
+TEST_CASE("surface: the sidecar round-trips EXACTLY", "[tutor]") {
+    // TUTOR.md is explicit that the surface is feedback state and must be restored exactly, or a
+    // matched-arm A/B quietly stops being matched. Nothing tested that until now -- the format was
+    // written, read back by a live run, and assumed. Every field is compared, not a summary of them,
+    // because a partial restore (say, everything but the velocity marks) would resume and look fine.
+    Surface a;
+    a.reset(64, 0.5f);
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> u(0.5f, 8.0f);
+    for (int pass = 0; pass < 6; ++pass)
+        for (std::size_t d = 0; d < 64; ++d) {
+            a.add_global_applied(0.75);
+            a.record(d, u(rng), 0.01f, 100);
+            if (d % 3 == 0) a.record_post(d, u(rng));
+        }
+
+    const std::string path = "tutor_roundtrip.bin";
+    REQUIRE(a.save(path));
+    Surface b;
+    REQUIRE(b.load(path));
+    REQUIRE(b.size() == a.size());
+    REQUIRE(b.global_applied() == a.global_applied());
+    for (std::size_t d = 0; d < a.size(); ++d) {
+        const auto& x = a.at(d);
+        const auto& y = b.at(d);
+        REQUIRE(y.visits == x.visits);
+        REQUIRE(y.tokens == x.tokens);
+        REQUIRE(y.applied == x.applied);
+        REQUIRE(y.applied_since == x.applied_since);
+        REQUIRE(y.nelbo == x.nelbo);
+        REQUIRE(y.nelbo_mark == x.nelbo_mark);
+        REQUIRE(y.velocity == x.velocity);
+        REQUIRE(y.nelbo_post == x.nelbo_post);
+        REQUIRE(y.flags == x.flags);
+        REQUIRE(y.transfer == x.transfer);
+        REQUIRE(y.transfer_n == x.transfer_n);
+        REQUIRE(y.global_mark == x.global_mark);
+    }
+    std::remove(path.c_str());
+}
+
+TEST_CASE("surface: a foreign or truncated file is REFUSED, not misread", "[tutor]") {
+    // Refusing beats resuming against mismatched state, which is the whole reason the header carries a
+    // magic, a version AND sizeof(Entry): the version cannot catch a layout change made by someone who
+    // forgot to bump the version, which is exactly the person the check exists for.
+    const std::string path = "tutor_foreign.bin";
+    {
+        std::ofstream os(path, std::ios::binary);
+        const char junk[64] = { 'n', 'o', 't', 'a', 's', 'u', 'r', 'f' };
+        os.write(junk, sizeof(junk));
+    }
+    Surface s;
+    REQUIRE_FALSE(s.load(path));
+    std::remove(path.c_str());
+
+    // A truncated real file: header intact, payload short. Must also fail rather than leave half the
+    // entries at their defaults, which would read as "these documents were never visited".
+    Surface a;
+    a.reset(32, 0.f);
+    for (std::size_t d = 0; d < 32; ++d) a.record(d, 3.f, 0.01f, 50);
+    const std::string tpath = "tutor_trunc.bin";
+    REQUIRE(a.save(tpath));
+    {
+        const auto full = std::filesystem::file_size(tpath);
+        std::filesystem::resize_file(tpath, full / 2);
+    }
+    // And the failed load must not have MUTATED the target: "false means start fresh" is the caller's
+    // contract, so a surface left resized to the stale file's shape would be indexed wrongly forever.
+    Surface c;
+    c.reset(99, 0.f);
+    REQUIRE_FALSE(c.load(tpath));
+    REQUIRE(c.size() == 99);
+    std::remove(tpath.c_str());
+}
+
+TEST_CASE("epoch plan: documents() agrees with for_each_document", "[tutor]") {
+    // One implementation of "which documents does the plan reach", not two. The coverage denominator bug
+    // came from a second, independently-maintained answer to that question.
+    sub0::tutor::EpochPlan plan;
+    const std::vector<std::uint64_t> docs{ 0, 40, 90, 140, 200 };
+    plan.build(docs, 200, 16, [](std::size_t d) { return d == 2; });
+    std::vector<std::uint32_t> seen;
+    plan.for_each_document([&](std::uint32_t d) { seen.push_back(d); });
+    REQUIRE(seen.size() == plan.documents());
+    REQUIRE(std::is_sorted(seen.begin(), seen.end()));
+    REQUIRE(std::find(seen.begin(), seen.end(), 2u) == seen.end());   // the skipped one
 }
 
 TEST_CASE("manifest: doc_count_matches expects the trailing phantom boundary", "[tutor]") {

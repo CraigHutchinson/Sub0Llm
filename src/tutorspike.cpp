@@ -27,7 +27,7 @@ namespace {
 // mis-parsed feedback state is worse than a refused one, because a matched-arm A/B would keep running
 // and quietly stop being matched (TUTOR.md's reproducibility risk).
 constexpr std::uint32_t kSurfaceMagic   = 0x53555230u;   // "0RUS" little-endian
-constexpr std::uint32_t kSurfaceVersion = 1u;
+constexpr std::uint32_t kSurfaceVersion = 2u;   // v2 records sizeof(Entry); see load()
 
 template <typename T>
 void wr(std::ostream& os, const T& v) {
@@ -126,6 +126,12 @@ bool Surface::save(const std::string& path) const {
     if (!os) return false;
     wr(os, kSurfaceMagic);
     wr(os, kSurfaceVersion);
+    // sizeof(Entry) rides the header because the payload is the raw struct array. A field added to Entry
+    // without a version bump would otherwise reinterpret every entry at the wrong stride and load
+    // SILENTLY -- producing a plausible surface built from misaligned bytes. The version alone does not
+    // protect against this, because the mistake that causes it is precisely forgetting to bump it.
+    const std::uint32_t entry_size = static_cast<std::uint32_t>(sizeof(Entry));
+    wr(os, entry_size);
     const std::uint64_t n = entries_.size();
     wr(os, n);
     wr(os, mark_threshold_);
@@ -138,27 +144,54 @@ bool Surface::save(const std::string& path) const {
 bool Surface::load(const std::string& path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) return false;
-    std::uint32_t magic = 0, version = 0;
+    std::uint32_t magic = 0, version = 0, entry_size = 0;
     std::uint64_t n = 0;
-    if (!rd(is, magic) || !rd(is, version) || !rd(is, n)) return false;
+    if (!rd(is, magic) || !rd(is, version) || !rd(is, entry_size) || !rd(is, n)) return false;
+    // Magic/version FIRST: on a foreign or truncated file every later field is garbage, and reporting a
+    // confident "wrong entry size" for what is actually "not a surface file" sends the reader after the
+    // wrong problem.
     if (magic != kSurfaceMagic || version != kSurfaceVersion) {
         sub0::log::error("tutor: surface '{}' has magic/version {:#x}/{} (expected {:#x}/{}) -- refusing "
                          "to load rather than resume a matched arm against mismatched feedback state",
                          path, magic, version, kSurfaceMagic, kSurfaceVersion);
         return false;
     }
-    if (!rd(is, mark_threshold_) || !rd(is, global_applied_)) return false;
-    entries_.assign(static_cast<std::size_t>(n), Entry{});
-    is.read(reinterpret_cast<char*>(entries_.data()),
-            static_cast<std::streamsize>(entries_.size() * sizeof(Entry)));
-    return static_cast<bool>(is);
+    if (entry_size != sizeof(Entry)) {
+        sub0::log::error("tutor: surface '{}' has {}-byte entries, this build has {} -- refusing to "
+                         "load. Entry's layout changed without a version bump; the data is not lost, "
+                         "but it cannot be read at this stride.",
+                         path, entry_size, sizeof(Entry));
+        return false;
+    }
+    // TRANSACTIONAL: read into scratch and commit only on success. Assigning into entries_ first would
+    // leave a failed load having already RESIZED the surface -- and the caller's contract is "false means
+    // start fresh", so it would carry on with a ledger sized to the stale file rather than to the corpus.
+    // Every subsequent record() would then index a differently-shaped array.
+    float  mark = 0.f;
+    double global = 0.0;
+    if (!rd(is, mark) || !rd(is, global)) return false;
+    std::vector<Entry> scratch(static_cast<std::size_t>(n));
+    is.read(reinterpret_cast<char*>(scratch.data()),
+            static_cast<std::streamsize>(scratch.size() * sizeof(Entry)));
+    if (!is) return false;
+    entries_        = std::move(scratch);
+    mark_threshold_ = mark;
+    global_applied_ = global;
+    return true;
 }
 
-bool Surface::append_events(const std::string& path, const Manifest& man, bool write_header) {
+bool Surface::append_events(const std::string& path, const Manifest& man) {
     if (events_.empty()) return true;
+    // The header is decided from the FILE alone -- no caller-held "first write" flag. A flag gets this
+    // wrong in both directions and did: the caller cleared it after the first eval, but the first eval
+    // had no events yet, so this returned early and the flag was consumed without a header ever being
+    // written (the whole 70621-row stream from the first run has none). The mirror failure is a resumed
+    // run injecting a SECOND header partway down. The file's own emptiness answers both.
+    std::error_code ec;
+    const bool empty_file = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
     std::ofstream os(path, std::ios::app);
     if (!os) return false;
-    if (write_header)
+    if (empty_file)
         os << "kind,step,doc,pop,visits,win_len,own_applied,global_applied,nelbo,value\n";
     for (Event& e : events_) {
         // Population is stamped here rather than at emit time: record() runs per window in the training
@@ -172,8 +205,33 @@ bool Surface::append_events(const std::string& path, const Manifest& man, bool w
     return static_cast<bool>(os);
 }
 
-bool Surface::write_snapshot(const std::string& path, const Manifest& man, long step,
-                             double drift_floor) const {
+bool Surface::write_run_info(const std::string& path, const RunInfo& r) const {
+    std::ofstream os(path);
+    if (!os) return false;
+    // The cadence constants are written out alongside the run's own axes deliberately: they are
+    // compile-time in this build, so a recording made under different ones is not comparable, and
+    // nothing else in the directory would say which were in force.
+    os << "{\n"
+       << "  \"schema\": 1,\n"
+       << "  \"label\": \"" << r.label << "\",\n"
+       << "  \"manifest\": \"" << r.manifest << "\",\n"
+       << "  \"manifest_seed\": " << r.manifest_seed << ",\n"
+       << "  \"seed\": " << r.seed << ",\n"
+       << "  \"batch\": " << r.batch << ",\n"
+       << "  \"peak_lr\": " << r.peak_lr << ",\n"
+       << "  \"seq_len\": " << r.seq_len << ",\n"
+       << "  \"windows_per_epoch\": " << r.windows_per_epoch << ",\n"
+       << "  \"eligible_docs\": " << r.eligible_docs << ",\n"
+       << "  \"probe_stride\": " << TUTOR_PROBE_STRIDE << ",\n"
+       << "  \"rescore_every\": " << TUTOR_RESCORE_EVERY << ",\n"
+       << "  \"velocity_mark_multiple\": " << VELOCITY_MARK_MULTIPLE << ",\n"
+       << "  \"entry_bytes\": " << sizeof(Entry) << "\n"
+       << "}\n";
+    return static_cast<bool>(os);
+}
+
+bool Surface::write_snapshot(const std::string& path, const Manifest& man, const RunInfo& run, long step,
+                             double drift_floor, std::span<const std::uint8_t> reachable) const {
     // Write whole, then rename into place. The heat map polls this file on a timer, so a reader must
     // never observe a partial document -- rename is atomic on both platforms this project targets.
     const std::string tmp = path + ".tmp";
@@ -209,6 +267,12 @@ bool Surface::write_snapshot(const std::string& path, const Manifest& man, long 
         os << "],\n  \"applied\": [";
         for (std::size_t i = 0; i < entries_.size(); ++i)
             os << (i ? "," : "") << entries_[i].applied;
+        // Reachability is exported so the viewer can distinguish "training never reaches this document"
+        // (validation split, drift probe) from "not visited yet". Both are visits==0, and rendering them
+        // identically is how a permanently-unreachable 9% of the corpus reads as a coverage failure.
+        os << "],\n  \"reachable\": [";
+        for (std::size_t i = 0; i < entries_.size(); ++i)
+            os << (i ? "," : "") << (i < reachable.size() ? static_cast<int>(reachable[i]) : 1);
         os << "]\n}\n";
         if (!os) return false;
     }

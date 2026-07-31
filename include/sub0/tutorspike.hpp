@@ -138,13 +138,22 @@ struct Entry {
     float         applied      = 0.f;   // sum of effective_lr * tokens -- the velocity DENOMINATOR
     float         nelbo        = 0.f;   // most recent per-window loss (the training forward, PRE-update)
     float         nelbo_mark   = 0.f;   // nelbo at the last velocity update
-    float         applied_mark = 0.f;   // applied at the last velocity update
+    // Applied learning accumulated SINCE the last velocity update, accumulated forward and reset at each
+    // mark -- deliberately not "applied at the last mark" with a subtraction at use. The subtraction is
+    // a catastrophic cancellation waiting to happen: `applied` grows without bound (~1e6 by the end of
+    // this run) while the threshold stays a few units, so the difference of two large nearly-equal
+    // floats loses precision in proportion to how long the run has been going. The velocity denominator
+    // would quietly degrade over a long run -- worst exactly where the readings matter most.
+    float         applied_since = 0.f;
     float         velocity     = 0.f;   // -d(nelbo) / d(applied), 0 until two marks exist
 
-    // Post-update reading from the back-to-back re-score, and 0 when this entry has not been re-scored
-    // (the re-score runs at a cadence, so most visits do not have one). Its presence is what makes the
-    // own-learning / transfer split recoverable at the NEXT visit.
+    // Post-update reading from the back-to-back re-score (the re-score runs at a cadence, so most
+    // visits do not have one). Its presence is what makes the own-learning / transfer split recoverable
+    // at the NEXT visit -- so "is there one" must be a FLAG, not a magic value. 0.0 is a legitimate
+    // loss: cross_entropy returns exactly 0 for a fully loss-masked window, which the per-window readout
+    // faithfully reports, so a 0-sentinel would silently classify a real reading as an absent one.
     float         nelbo_post   = 0.f;
+    std::uint8_t  flags        = 0;     // bit 0: nelbo_post is valid
     // Signed between-visit change per unit of GLOBAL applied learning, averaged over this entry's
     // measured intervals. NEGATIVE means the entry improved while it was not being trained
     // (reinforcement from the rest of the corpus); POSITIVE means it degraded (conflict). Normalised by
@@ -154,7 +163,9 @@ struct Entry {
     std::uint32_t transfer_n   = 0;     // intervals folded into `transfer` (0 = no reading yet)
     float         global_mark  = 0.f;   // global applied learning as of this entry's last visit
 
+    static constexpr std::uint8_t kHasPost = 1u;
     bool seen() const { return visits > 0; }
+    bool has_post() const { return (flags & kHasPost) != 0; }
     bool has_transfer() const { return transfer_n > 0; }
 };
 
@@ -178,10 +189,20 @@ inline constexpr float VELOCITY_MARK_MULTIPLE = 4.0f;
 // that accidentally samples one population is visible rather than silently biasing the floor.
 inline constexpr std::size_t TUTOR_PROBE_STRIDE = 128;
 
-// How often the post-update re-score runs. A forward is roughly a third of a forward+backward, so every
-// step would cost ~33%; at every 20th step it is ~1.7%, and the transfer term only needs SOME visits to
-// carry a post reading, not all of them.
-inline constexpr long TUTOR_RESCORE_EVERY = 20;
+// How often the post-update re-score runs. EVERY step -- and the original reasoning for 20 was wrong in
+// a way only the recorded data revealed.
+//
+// The cadence was chosen against a cost of "a forward is ~1/3 of a forward+backward, so every step is
+// ~33%". That would be true if the re-score covered the whole batch. It cannot: it is bounded by the
+// unchunked [n*T, VOCAB] logits buffer to ~22 windows out of a ~448-window step (see
+// GpuTrainer::rescore), so the real cost is 22/448 * 1/3 ~= 1.6% per step, not 33%.
+//
+// Paying 20x less than budgeted bought 20x less data, and it was the binding constraint on the ONE
+// measurement the spike added: the first run produced 69471 velocity events but only 1149 transfer
+// events -- against a theoretical ceiling of (1110/20) * 22 = 1210. Transfer was not sparse because
+// documents rarely revisit; it was sparse because almost no visit carried a post reading. At every step
+// the ceiling rises ~20x, which is the difference between a signal with error bars and one without.
+inline constexpr long TUTOR_RESCORE_EVERY = 1;
 
 // The per-document ledger. Flat and pre-sized: every update runs inside the training step, so there is
 // no allocation on the hot path (AGENTS.md 1). At corpus scale this is the structure that has to become
@@ -210,12 +231,14 @@ public:
     // batch into a per-window parameter.
     void   set_step(long s) { step_ = static_cast<std::uint32_t>(s); }
 
-    // Event capture (see Event). Reserved once; record() only ever push_backs into reserved space and
-    // drops silently once full, so the per-step path cannot allocate. take_events() hands the batch to
-    // the writer and clears it.
-    void reserve_events(std::size_t n) { events_.clear(); events_.reserve(n); cap_ = n; }
+    // Event capture (see Event). Reserved once and never grown, so the per-step path cannot allocate --
+    // which means the buffer CAN fill. Overflow is COUNTED, never silently discarded: a diagnostic
+    // stream with an unrecorded hole is worse than no stream, because the hole is invisible in the
+    // analysis and looks like an absence of events rather than an absence of recording. The trainer
+    // reports dropped_events() and the count rides the snapshot.
+    void reserve_events(std::size_t n) { events_.clear(); events_.reserve(n); cap_ = n; dropped_ = 0; }
     std::vector<Event>& events() { return events_; }
-    void clear_events() { events_.clear(); }
+    std::uint64_t dropped_events() const { return dropped_; }
 
     // Record one trained window. `lr` is the EFFECTIVE learning rate this step ran at and `tokens` the
     // window's trained length, so their product is the applied learning this visit delivered -- the
@@ -230,7 +253,7 @@ public:
         // not trained between its last visit and now, so any change since its post-update reading came
         // from the rest of the corpus. Requires a post reading to subtract from -- without one, the
         // interval's change still contains the previous visit's own learning and is not attributable.
-        if (e.visits > 0 && e.nelbo_post != 0.f) {
+        if (e.visits > 0 && e.has_post()) {
             const double d_global = global_applied_ - static_cast<double>(e.global_mark);
             if (d_global > 0.0) {
                 const float per_unit = static_cast<float>(
@@ -246,24 +269,25 @@ public:
         }
 
         ++e.visits;
-        e.tokens  += static_cast<std::uint32_t>(tokens);
-        e.applied += lr * static_cast<float>(tokens);
+        e.tokens        += static_cast<std::uint32_t>(tokens);
+        e.applied       += lr * static_cast<float>(tokens);
+        e.applied_since += lr * static_cast<float>(tokens);
         e.nelbo    = nelbo;
-        e.nelbo_post = 0.f;                             // consumed; set again only if a re-score runs
+        e.flags &= static_cast<std::uint8_t>(~Entry::kHasPost);   // consumed; set again by a re-score
         e.global_mark = static_cast<float>(global_applied_);
         if (e.visits == 1) {                            // first sighting: establish the baseline only
-            e.nelbo_mark   = nelbo;
-            e.applied_mark = e.applied;
+            e.nelbo_mark    = nelbo;
+            e.applied_since = 0.f;
             return;
         }
-        const float d_applied = e.applied - e.applied_mark;
+        const float d_applied = e.applied_since;
         if (d_applied <= 0.f || d_applied < mark_threshold_) return;   // too small to divide by yet
         // Sign convention: FALLING nelbo is POSITIVE velocity (learning is happening). A negative
         // velocity therefore means the entry is regressing -- being forgotten -- which TUTOR.md's table
         // wants weighted UP, and which a level-based rule only ever catches by accident.
-        e.velocity     = -(e.nelbo - e.nelbo_mark) / d_applied;
-        e.nelbo_mark   = e.nelbo;
-        e.applied_mark = e.applied;
+        e.velocity      = -(e.nelbo - e.nelbo_mark) / d_applied;
+        e.nelbo_mark    = e.nelbo;
+        e.applied_since = 0.f;
         emit(Event{ static_cast<std::uint32_t>(doc), step_, e.visits, /*kind=*/0, /*pop=*/0,
                     tokens, e.applied, static_cast<float>(global_applied_), e.nelbo, e.velocity });
     }
@@ -277,6 +301,7 @@ public:
         Entry& e = entries_[doc];
         if (e.visits == 0) return;                      // never trained: nothing to be "post" of
         e.nelbo_post = nelbo_post;
+        e.flags |= Entry::kHasPost;
     }
 
     // Coverage: the fraction of documents visited at least once. Poisson sampling leaves ~1/e of the
@@ -309,20 +334,46 @@ public:
 
     // Snapshot for the live heat map: a self-contained JSON document the viewer polls. Written whole and
     // renamed into place by the implementation, so a reader never observes a half-written file.
-    [[nodiscard]] bool write_snapshot(const std::string& path, const Manifest& man,
-                                      long step, double drift_floor) const;
+    // Identity of the run that produced a recording. Written into every artefact, because a directory
+    // of numbers with no record of what produced them is not a diagnostic -- it is a puzzle. Six months
+    // on, "which seed / batch / corpus / code was this?" is unanswerable from the numbers themselves,
+    // and answering it wrongly is worse than not having them. Deliberately a small POD of the axes that
+    // change between arms, not a config dump.
+    struct RunInfo {
+        std::string  label;          // model directory, the human handle for the run
+        std::string  manifest;       // which splice these ordinals refer to
+        std::uint64_t manifest_seed = 0;
+        unsigned     seed = 0;       // the arm axis a replicate varies
+        int          batch = 0;
+        float        peak_lr = 0.f;
+        int          seq_len = 0;
+        std::size_t  windows_per_epoch = 0;
+        std::size_t  eligible_docs = 0;
+    };
+
+    [[nodiscard]] bool write_snapshot(const std::string& path, const Manifest& man, const RunInfo& run,
+                                      long step, double drift_floor,
+                                      std::span<const std::uint8_t> reachable) const;
 
     // Append the buffered events to a CSV, stamping each with its document's population. CSV rather
     // than JSON because this is the one output that is genuinely large and is read by analysis tools,
     // not by the viewer.
-    [[nodiscard]] bool append_events(const std::string& path, const Manifest& man, bool write_header);
+    [[nodiscard]] bool append_events(const std::string& path, const Manifest& man);
+    // The run's identity as a sidecar JSON, written once. Kept separate from the event CSV so the CSV
+    // stays a clean flat table, and separate from the snapshot so it survives even if a run dies before
+    // its first eval.
+    [[nodiscard]] bool write_run_info(const std::string& path, const RunInfo& run) const;
 
 private:
-    void emit(const Event& ev) { if (events_.size() < cap_) events_.push_back(ev); }
+    void emit(const Event& ev) {
+        if (events_.size() < cap_) events_.push_back(ev);
+        else ++dropped_;
+    }
 
     std::vector<Entry> entries_;
     std::vector<Event> events_;
     std::size_t        cap_ = 0;
+    std::uint64_t      dropped_ = 0;
     std::size_t        eligible_ = 0;
     std::uint32_t      step_ = 0;
     float              mark_threshold_ = 0.f;
@@ -397,13 +448,25 @@ public:
     std::size_t size() const { return slots_.size(); }
     // Distinct documents the plan reaches -- the honest denominator for coverage (see
     // Surface::set_eligible). Documents in the validation tail or reserved as probes appear in no slot.
-    std::size_t documents() const {
-        std::size_t n = 0; std::uint32_t last = 0xFFFFFFFFu;
+    // Visit each distinct document the plan reaches. Exists so consumers derive reachability FROM the
+    // plan rather than re-implementing "val split or probe" independently -- the coverage denominator
+    // bug came from exactly that kind of second, hand-maintained copy.
+    template <typename Fn>
+    void for_each_document(Fn fn) const {
         std::vector<std::uint32_t> seen;
         seen.reserve(slots_.size());
         for (const Slot& s : slots_) seen.push_back(s.doc);
         std::sort(seen.begin(), seen.end());
-        for (std::uint32_t d : seen) { if (d != last) { ++n; last = d; } }
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        for (std::uint32_t d : seen) fn(d);
+    }
+
+    // Delegates, so there is exactly ONE implementation of "which documents does the plan reach". Two
+    // copies of that question is how the coverage denominator came to disagree with reality. Not cheap
+    // (it sorts the slot list) -- call it once and cache, which the trainer does.
+    std::size_t documents() const {
+        std::size_t n = 0;
+        for_each_document([&](std::uint32_t) { ++n; });
         return n;
     }
 
@@ -492,12 +555,20 @@ public:
             primed_ = true;
             return 0.0;
         }
+        // Non-finite scores are SKIPPED rather than folded in. nelbo_cpu_each writes NaN for a window
+        // it cannot grade, and a single NaN propagates through the sum to make the whole floor NaN --
+        // which then compares false against every velocity, silently disabling the one guard that says
+        // which readings are real.
         double total = 0.0;
+        std::size_t n = 0;
         for (std::size_t i = 0; i < nelbos.size(); ++i) {
-            total += std::fabs(static_cast<double>(nelbos[i]) - static_cast<double>(last_[i]));
+            if (!std::isfinite(nelbos[i])) continue;
+            if (std::isfinite(last_[i])) { total += std::fabs(static_cast<double>(nelbos[i]) -
+                                                              static_cast<double>(last_[i])); ++n; }
             last_[i] = nelbos[i];
         }
-        const double mean_abs = total / static_cast<double>(nelbos.size());
+        if (n == 0) return 0.0;
+        const double mean_abs = total / static_cast<double>(n);
         // Per unit of applied learning, to be directly comparable with Entry::velocity, which is
         // normalised the same way. Absolute value because drift has no preferred sign -- what is wanted
         // is its MAGNITUDE as a noise floor, not a mean that would cancel to nothing.
