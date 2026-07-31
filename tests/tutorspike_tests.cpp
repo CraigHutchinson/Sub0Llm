@@ -12,6 +12,8 @@
 #include "sub0/tutorspike.hpp"
 
 #include <cmath>
+#include <algorithm>
+#include <random>
 #include <string>
 
 using sub0::tutor::Surface;
@@ -154,6 +156,77 @@ TEST_CASE("drift probe: excluded documents are identified and the floor is a MAG
     const std::vector<float> b{ 5.2f, 4.8f, 5.2f, 4.8f, 5.2f, 4.8f, 5.2f, 4.8f, 5.2f, 4.8f };
     const double floor_ = p.observe(b, 2.0);
     REQUIRE(floor_ == Catch::Approx(0.2 / 2.0).epsilon(1e-4));   // mean |delta| per unit applied
+}
+
+TEST_CASE("epoch plan: every token is covered exactly once per epoch", "[tutor]") {
+    // The defining property, and the whole reason for replacing independent sampling. Under sampling
+    // WITH replacement a token's per-epoch visit count is Poisson -- some tokens are trained several
+    // times and ~1/e of documents not at all, which the surface reports as zero velocity and which is
+    // indistinguishable from "nothing left to learn". A permutation makes the count exactly one.
+    sub0::tutor::EpochPlan plan;
+    // Three documents of 10, 25 and 7 tokens; the trailing phantom boundary mirrors corpus.tok.
+    const std::vector<std::uint64_t> docs{ 0, 10, 35, 42 };
+    plan.build(docs, /*train_tok=*/42, /*T=*/8, [](std::size_t) { return false; });
+    REQUIRE_FALSE(plan.empty());
+
+    std::vector<int> covered(42, 0);
+    std::mt19937 rng(5);
+    const std::size_t n = plan.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& s = plan.next(rng);
+        for (int t = 0; t < s.len; ++t) ++covered[static_cast<std::size_t>(s.start) + static_cast<std::size_t>(t)];
+    }
+    // Every position that can be an INPUT with a target inside its own document is covered EXACTLY
+    // once -- never twice (which would silently double that token's weight in an epoch) and never more.
+    // The documented exception: a document whose input count leaves a remainder of exactly one token
+    // drops that token, since a 1-token window has no context. Doc 0 here has 10 tokens => 9 inputs =>
+    // 8 + remainder 1, so position 8 is the dropped case and is asserted as such rather than waved past.
+    for (std::size_t d = 0; d + 1 < docs.size(); ++d) {
+        const std::size_t inputs = docs[d + 1] - docs[d] - 1;
+        const std::size_t rem    = inputs % 8;
+        for (std::size_t p = docs[d]; p + 1 < docs[d + 1]; ++p) {
+            const bool dropped = (rem == 1) && (p == docs[d + 1] - 2);
+            REQUIRE(covered[p] == (dropped ? 0 : 1));
+        }
+    }
+    // And no window straddles a document boundary -- the property window.hpp exists to guarantee and
+    // which a naive tiling of the whole corpus would silently break.
+    for (std::size_t d = 0; d + 1 < docs.size(); ++d)
+        REQUIRE(covered[docs[d + 1] - 1] == 0);
+}
+
+TEST_CASE("epoch plan: skipped documents contribute no windows at all", "[tutor]") {
+    // Probe exclusion is built into the plan rather than done by rejection sampling. Exactness matters:
+    // a probe trained even occasionally stops being a pure drift reading, and under the old rejection
+    // loop a bounded retry could let one through.
+    sub0::tutor::EpochPlan plan;
+    const std::vector<std::uint64_t> docs{ 0, 10, 20, 30 };
+    plan.build(docs, 30, 8, [](std::size_t d) { return d == 1; });
+    std::mt19937 rng(6);
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        const auto& s = plan.next(rng);
+        REQUIRE(s.doc != 1u);
+        REQUIRE((s.start < 10 || s.start >= 20));
+    }
+}
+
+TEST_CASE("epoch plan: the permutation reshuffles and repeats at the epoch boundary", "[tutor]") {
+    sub0::tutor::EpochPlan plan;
+    const std::vector<std::uint64_t> docs{ 0, 64 };
+    plan.build(docs, 64, 8, [](std::size_t) { return false; });
+    const std::size_t n = plan.size();
+    REQUIRE(n > 4);
+    std::mt19937 rng(7);
+    std::vector<std::uint64_t> first, second;
+    for (std::size_t i = 0; i < n; ++i) first.push_back(plan.next(rng).start);
+    REQUIRE(plan.epoch() == 1);
+    for (std::size_t i = 0; i < n; ++i) second.push_back(plan.next(rng).start);
+    REQUIRE(plan.epoch() == 2);
+    // Same SET both epochs (coverage is exact every epoch), different ORDER (it really reshuffles).
+    auto a = first, b = second;
+    std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+    REQUIRE(a == b);
+    REQUIRE(first != second);
 }
 
 TEST_CASE("manifest: doc_count_matches expects the trailing phantom boundary", "[tutor]") {

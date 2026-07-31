@@ -2335,7 +2335,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     sub0::tutor::DriftProbe tutor_probe;
     int                     tutor_src = -1;      // blend source the manifest labels; -1 = surface off
     double                  tutor_drift_floor = 0.0;
-    long                    tutor_redraws = 0;   // probe windows redrawn (see the sampling loop)
+    sub0::tutor::EpochPlan  tutor_plan;      // the without-replacement epoch permutation
+    bool                    tutor_events_header = true;
     bool                    tutor_rescore_warned = false;   // report a failing re-score once, not per step
     double                  tutor_applied_at_last_probe = 0.0;
     // Per-step readout buffers, sized ONCE here to the batch ceiling and reused every step -- the
@@ -2346,6 +2347,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<float>       probe_nelbo;
     const std::filesystem::path tutor_snapshot = meta_dir / "tutor_surface.json";
     const std::filesystem::path tutor_sidecar  = meta_dir / "tutor_surface.bin";
+    const std::filesystem::path tutor_events   = meta_dir / "tutor_events.csv";
     if (tutor_manifest_path && *tutor_manifest_path) {
         if (!sub0::tutor::read_manifest(tutor_manifest_path, tutor_man)) return 1;
         // Identify WHICH source the manifest labels by its document count rather than by position or
@@ -2393,6 +2395,22 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             probe_nelbo.assign(probe_starts.size(), 0.f);
             tutor_probe.trim_to(probe_starts.size());
         }
+        {
+            // The epoch permutation, built once over the labelled source with probe documents omitted.
+            const sub0::BlendSource& tsrc = sources[static_cast<std::size_t>(tutor_src)];
+            tutor_plan.build(tsrc.docs, tsrc.view.size(), SEQ_LEN,
+                             [&](std::size_t d) { return tutor_probe.is_probe(d); });
+            tutor_surface.set_eligible(tutor_plan.documents());
+            sub0::log::line("tutor: epoch permutation -- {} windows over {} reachable documents "
+                            "(every token trained once per epoch, shuffled without replacement; "
+                            "{} of {} documents are val-split or probe and unreachable by design)",
+                            tutor_plan.size(), tutor_plan.documents(),
+                            tutor_man.total_docs() - tutor_plan.documents(), tutor_man.total_docs());
+        }
+        // Event buffer: reserved once, drained at every eval. Sized to comfortably hold one eval
+        // interval's updates -- record() drops silently rather than growing, so the per-step path
+        // cannot allocate.
+        tutor_surface.reserve_events(1u << 20);
         if (std::filesystem::exists(tutor_sidecar) && tutor_surface.load(tutor_sidecar.string()))
             sub0::log::info("  tutor: resumed the mastery surface from {}", tutor_sidecar.string());
         // Probe balance across populations, logged rather than assumed: a stride sharing a factor with
@@ -2492,7 +2510,18 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     bool device_failed = false;
     // Variable-length training is on by default; SUB0_FIXED_SEQ=1 forces full-length windows.
     //TODO: Remove getenv calls
-    const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr);
+    // The mastery surface PINS the sequence length. Two independent reasons, and the first is a
+    // correctness constraint, not a preference:
+    //   1. EpochPlan tiles the corpus at a FIXED width, so its windows can be up to SEQ_LEN long. A step
+    //      running at a shorter seq_t would then be handed win_len > T, and the window-fill loops index
+    //      row b as `b*T + s` while looping `s < len` -- writing straight into row b+1. Silent data
+    //      corruption, which is exactly how it presented: training ran to completion and only val_nelbo
+    //      (2.13 vs 1.89) said anything was wrong.
+    //   2. Even correct, a per-step random width would be an uncontrolled axis in the measurement: a
+    //      window's loss depends on how much context it had, so velocity would carry that variance for
+    //      reasons unrelated to learning.
+    const bool vary_seq = (MIN_TRAIN_SEQ < SEQ_LEN) && (std::getenv("SUB0_FIXED_SEQ") == nullptr)
+                          && (tutor_src < 0);
     // content_embed_kind is fixed for the whole run by this point (resume-reconciliation above already
     // settled it) -- resolve it to a SlotEncoding ONCE here rather than re-deriving it every window.
     const sub0::SlotEncoding content_embed_enc = sub0::content_embed_encoding_of(content_embed_kind);
@@ -2529,20 +2558,21 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         for (int b = 0; b < batch_t; ++b) {
             sub0::BlendDraw d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
                                                                 seq_t, frac_epoch);   // pick a source, window inside it
-            // Drift-probe exclusion (SPIKE, --tutor-manifest only): redraw when the window landed in a
-            // probe document. Rejection rather than a filtered sampler because the probe set is ~1.6% of
-            // the corpus, so the expected number of redraws is negligible -- and a bounded retry keeps a
-            // pathological draw from spinning, at the cost of very rarely training one probe window,
-            // which the log below reports rather than hides.
-            if (tutor_src >= 0) {
-                for (int retry = 0; retry < 8 && d.src == tutor_src; ++retry) {
-                    const std::size_t doc = sub0::doc_of(sources[static_cast<std::size_t>(d.src)].docs,
-                                                         d.win.start);
-                    if (!tutor_probe.is_probe(doc)) break;
-                    d = sub0::sample_blend_staged(rng, blend_fair, sources, resolved_schedule,
-                                                  seq_t, frac_epoch);
-                    ++tutor_redraws;
-                }
+            // SPIKE: draw from the EPOCH PERMUTATION rather than by independent sampling. Every window
+            // tiling the corpus is visited exactly once per epoch, in shuffled order -- see EpochPlan
+            // for why (100% coverage instead of Poisson's ~91%, exact rather than Poisson-distributed
+            // visit counts, and probe exclusion built into the plan instead of a rejection loop). The
+            // blend draw above still runs, so the scheduler's own fairness state stays consistent; its
+            // window is then replaced for the labelled source.
+            if (!tutor_plan.empty()) {
+                const sub0::tutor::EpochPlan::Slot& sl = tutor_plan.next(rng);
+                d.src         = tutor_src;
+                d.win.start   = sl.start;
+                // A window can never be longer than the step's own T: every window-fill loop indexes
+                // row b as `b*T + s` while iterating `s < len`, so len > T writes into row b+1. vary_seq
+                // is pinned off while the surface is active precisely so this clamp is a no-op, but the
+                // invariant is stated here rather than left implicit in a distant flag.
+                d.win.len     = std::min<int>(sl.len, seq_t);
             }
             src_idx[b] = d.src;
             starts[b]  = d.win.start;
@@ -2785,6 +2815,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             // Global applied learning FIRST: the transfer term each entry computes below is normalised
             // by how much learning the corpus as a whole received since that entry was last visited, so
             // this step's contribution has to be in the total before any entry reads it.
+            tutor_surface.set_step(step);
             double step_applied = 0.0;
             for (int b = 0; b < batch_t; ++b) step_applied += static_cast<double>(lr_t) * win_len[b];
             tutor_surface.add_global_applied(step_applied);
@@ -2875,9 +2906,14 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 // as everything else the run would need to resume.
                 if (!tutor_surface.save(tutor_sidecar.string()))
                     sub0::log::info("  tutor: sidecar write failed ({})", tutor_sidecar.string());
-                sub0::log::line("  tutor: coverage {:.1f}% | drift floor {:.3e} /applied | {} probes{}",
+                const std::size_t n_ev = tutor_surface.events().size();
+                if (!tutor_surface.append_events(tutor_events.string(), tutor_man, tutor_events_header))
+                    sub0::log::info("  tutor: event append failed ({})", tutor_events.string());
+                tutor_events_header = false;
+                sub0::log::line("  tutor: coverage {:.1f}% | drift floor {:.3e} /applied | {} probes "
+                                "| epoch {} | {} events",
                                 100.0 * tutor_surface.coverage(), tutor_drift_floor, probe_nelbo.size(),
-                                tutor_redraws ? std::format(" | {} probe redraws", tutor_redraws) : "");
+                                tutor_plan.epoch(), n_ev);
             }
 
             // Validation NELBO only once enough of the corpus has been seen.

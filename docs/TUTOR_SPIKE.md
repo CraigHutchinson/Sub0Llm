@@ -500,6 +500,74 @@ post-hoc analysis decision rather than something baked into the ledger and impos
 Arms 1 and 5 are cheap enough to run regardless. Arms 2-4 are all splice-tool changes plus a rerun, and
 2 is the one that turns every number in this document from a point estimate into a claim.
 
+## The sampler: an epoch permutation, not independent sampling
+
+Raised in review after the 10-epoch run, and it is the right primitive. Independent sampling was
+producing three separate defects at once, all of them properties of drawing *with replacement*:
+
+* **Coverage.** Poisson coverage left 8.9% of documents never sampled after ten epochs, reading as zero
+  velocity — indistinguishable, in the surface, from "nothing left to learn".
+* **Variance.** A document's visit count was Poisson-distributed around its expectation, so two
+  *identical* documents accumulate materially different applied learning by luck alone, and that
+  variance lands in every per-document reading.
+* **The probe rejection loop** (11386 redraws) disappears entirely: probe documents are omitted when the
+  plan is built, so exclusion is exact rather than statistical.
+
+`EpochPlan` shuffles every window tiling the corpus and draws without replacement. The unit is the
+**window**, not the document — a long document contributes proportionally more windows, which is correct
+rather than a confound, and velocity's applied-learning denominator already handles length by design.
+
+### Three defects found while building it
+
+**The first epoch was not shuffled at all.** Reshuffling only on wrap left epoch 0 running in corpus
+order — and since the splice interleaves populations in runs of 64, that would have trained them in
+near-blocks for a whole epoch. Caught by a test asserting the permutation differs between epochs.
+
+**`epoch()` read one too low at the boundary.** Counting wraps means that after consuming exactly
+`size()` slots — one complete epoch — no wrap has yet occurred. Now derived from the draw count.
+
+**A window longer than the step's own T corrupted the next window.** `seq_t` is randomised per step
+(`vary_seq`), while `EpochPlan` tiles at a fixed `SEQ_LEN`, so a step running at T=110 could be handed a
+256-token window. Every window-fill loop indexes row `b` as `b*T + s` while iterating `s < len`, so
+`len > T` writes straight into row `b+1`. Training ran to completion with no error and the only symptom
+was `val_nelbo` 2.1284 against 1.8858 — which was very nearly attributed to the permutation being worse
+for the model. This is AGENTS.md §10 exactly: `win_len` is a shared surface, and its consumers'
+constraint on it was not enumerated before changing what fills it. Fixed at two levels — `vary_seq` is
+pinned off whenever the surface is active (independently right: a random per-step width is an
+uncontrolled axis in the measurement, since a window's loss depends on how much context it had), and the
+invariant is stated at the assignment rather than left implicit in a distant flag.
+
+### The coverage metric had the wrong denominator
+
+Under the permutation, coverage still read 91.1% — *identical* to the random sampler, which looked like
+the permutation had failed. It had not: of 3189 unvisited documents, 281 are probes and 2908 form a
+**contiguous tail from index 33069**, which is the validation split. Every reachable document was
+visited.
+
+`coverage()` was dividing by the total document count, including documents training can never reach, so
+100% was unattainable and the permanent shortfall read as a coverage failure. Worse, it coincidentally
+matched the old sampler's *genuine* Poisson shortfall almost exactly — a metric with the wrong
+denominator concealing the regression it exists to detect. It now divides by the documents the plan
+actually reaches (32810 of 36000) and reports 100.0%, with the unreachable count stated at startup.
+
+### What the permutation costs — do not read val_nelbo across samplers
+
+Two things make the sampler arms **not** comparable at equal step counts, and both are properties of
+tiling rather than of the seeds:
+
+* **Token accounting over-counts.** The trainer adds `batch_t * seq_t` per step, but tiled windows
+  average ~208 tokens rather than 256 (short documents make partial windows), so ten *counted* epochs
+  are ~8.16 real passes — roughly 23% fewer tokens actually trained. `EpochPlan::epoch()` is the true
+  count and is logged alongside.
+* **Fixed cut points remove an augmentation.** Independent sampling drew windows at random offsets
+  inside long documents, so the model saw many distinct views of the same text; tiling always cuts at
+  the same boundaries, so it sees 60948 fixed windows repeatedly. That is a real loss of diversity, and
+  a candidate refinement is a per-epoch offset jitter — though jitter and exact-once coverage cannot
+  both hold at the document edges, so it is a trade rather than a free win.
+
+The seed pair below is internally valid because both arms share all of this; comparisons against the
+earlier random-sampling run's `val_nelbo` are not, and are not made.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M

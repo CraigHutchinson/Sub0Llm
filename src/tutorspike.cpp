@@ -154,6 +154,24 @@ bool Surface::load(const std::string& path) {
     return static_cast<bool>(is);
 }
 
+bool Surface::append_events(const std::string& path, const Manifest& man, bool write_header) {
+    if (events_.empty()) return true;
+    std::ofstream os(path, std::ios::app);
+    if (!os) return false;
+    if (write_header)
+        os << "kind,step,doc,pop,visits,win_len,own_applied,global_applied,nelbo,value\n";
+    for (Event& e : events_) {
+        // Population is stamped here rather than at emit time: record() runs per window in the training
+        // step and has no business reaching into the manifest, and the join is a pure array lookup.
+        e.pop = (e.doc < man.doc_pop.size()) ? man.doc_pop[e.doc] : 0u;
+        os << static_cast<int>(e.kind) << ',' << e.step << ',' << e.doc << ','
+           << static_cast<int>(e.pop) << ',' << e.visits << ',' << e.win_len << ','
+           << e.own_applied << ',' << e.global_applied << ',' << e.nelbo << ',' << e.value << '\n';
+    }
+    events_.clear();
+    return static_cast<bool>(os);
+}
+
 bool Surface::write_snapshot(const std::string& path, const Manifest& man, long step,
                              double drift_floor) const {
     // Write whole, then rename into place. The heat map polls this file on a timer, so a reader must
