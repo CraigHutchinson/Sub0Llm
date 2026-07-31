@@ -1729,7 +1729,7 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
                   const ScratchBindings* const* win_binds,
                   const SentinelBindings* const* win_sentinel,
                   const PersistentBindings* const* win_persist,
-                  double* out_win_loss) {
+                  double* out_win_loss, const float* win_weight) {
     double total = 0.0;
     #pragma omp parallel num_threads(DEFAULT_THREADS)   // tuned worker count (<= MAX_WORKERS)
     {
@@ -1766,7 +1766,15 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
             // over b by construction. Each iteration owns a distinct b, so this write is race-free
             // inside the worksharing loop without any reduction of its own.
             if (out_win_loss) out_win_loss[b] = static_cast<double>(loss->data[0]);
-            backward(loss, 1.f / static_cast<float>(batch));
+            // Per-window GRADIENT weight (docs/TUTOR.md): scaling window b's gradient contribution by
+            // w_b is exactly training it at w_b * lr, because the contribution is linear in the loss.
+            // Applied to the BACKWARD SEED only -- loss->data[0] above, and therefore out_win_loss, stay
+            // the true unweighted loss. That separation is essential, not cosmetic: the surface measures
+            // velocity FROM that loss, so a weighted reading would let the controller's own actuator
+            // move its measurement, which is the exact confound the applied-learning denominator exists
+            // to prevent.
+            const float wb = win_weight ? win_weight[b] : 1.f;
+            backward(loss, wb / static_cast<float>(batch));
             if (win_binds)    set_scratch_bindings(nullptr);
             if (win_sentinel) set_sentinel_bindings(nullptr);
             if (win_persist)  set_persistent_bindings(nullptr);

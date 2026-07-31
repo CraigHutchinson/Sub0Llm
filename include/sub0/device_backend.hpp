@@ -110,7 +110,8 @@ inline void               sub0_dev_shutdown()                    { sub0_mock_shu
 inline void               sub0_dev_set_tf32(int)                 {}
 [[nodiscard]] inline int  sub0_dev_train_reserve(int)            { return -1; }
 [[nodiscard]] inline int  sub0_dev_train_step(const int*, const int*, int, int, float, long, double*,
-                                              const int*, float, double* = nullptr) { return -1; }
+                                              const int*, float, double* = nullptr,
+                                              const float* = nullptr) { return -1; }
 [[nodiscard]] inline int  sub0_dev_backward(const int*, const int*, int, int, float*, double*,
                                             const int*, double* = nullptr)       { return -1; }
 [[nodiscard]] inline int  sub0_dev_time_train_step(int, int, double, double*)    { return -1; }
@@ -134,7 +135,8 @@ extern "C" void               sub0_cuda_set_tf32(int on);
 extern "C" [[nodiscard]] int  sub0_cuda_train_reserve(int batch);
 extern "C" [[nodiscard]] int  sub0_cuda_train_step(const int* ids, const int* targets, int batch, int T,
                                                    float lr, long t, double* out_loss, const int* lengths,
-                                                   float muon_lr, double* out_win_loss);
+                                                   float muon_lr, double* out_win_loss,
+                                                   const float* win_weight);
 // No default argument on out_win_loss here (unlike sub0_cuda_forward_loss below): tests/cuda_tests.cpp
 // carries its own extern declaration of this one WITH defaults, and a default given in two visible
 // declarations of the same function is an error. Every consumer reaches it through sub0_dev_backward.
@@ -193,8 +195,10 @@ inline void               sub0_dev_set_tf32(int on)             { sub0_cuda_set_
 // the default and what every pre-existing caller passes, leaves these paths bit-identical.
 [[nodiscard]] inline int  sub0_dev_train_step(const int* ids, const int* targets, int batch, int T,
                                               float lr, long t, double* out_loss, const int* lengths,
-                                              float muon_lr, double* out_win_loss = nullptr) {
-    return sub0_cuda_train_step(ids, targets, batch, T, lr, t, out_loss, lengths, muon_lr, out_win_loss);
+                                              float muon_lr, double* out_win_loss = nullptr,
+                                              const float* win_weight = nullptr) {
+    return sub0_cuda_train_step(ids, targets, batch, T, lr, t, out_loss, lengths, muon_lr, out_win_loss,
+                                win_weight);
 }
 [[nodiscard]] inline int  sub0_dev_backward(const int* ids, const int* targets, int batch, int T,
                                             float* out_grad, double* out_loss, const int* lengths,

@@ -1073,7 +1073,8 @@ struct GpuTrainer {
                [[maybe_unused]] const int* lengths, [[maybe_unused]] int batch,
                [[maybe_unused]] int T, [[maybe_unused]] float lr,
                [[maybe_unused]] float muon_lr = 0.f,
-               [[maybe_unused]] double* out_win_loss = nullptr) {
+               [[maybe_unused]] double* out_win_loss = nullptr,
+               [[maybe_unused]] const float* win_weight = nullptr) {
 #if defined(SUB0_BUILD_CUDA)
         for (int b = 0; b < batch; ++b) {
             const sub0::BlendSource& src = sources[static_cast<std::size_t>(src_idx[b])];
@@ -1097,7 +1098,7 @@ struct GpuTrainer {
         // comment (backend_cuda.cu) and the call site below (mirrors the CPU branch's own
         // opt.use_muon() ? lr_schedule(..., MUON_LR_BASE, ...) : implicit-AdamW-only computation).
         ok = (sub0_dev_train_step(ids.data(), targets.data(), batch, T, lr, ++t, &loss, lengths, muon_lr,
-                                  out_win_loss) == 0);
+                                  out_win_loss, win_weight) == 0);
         return static_cast<float>(loss);
 #else
         return 0.0f;
@@ -1344,7 +1345,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                           int optimizer, int resume_mode, const char* blend_config_path,
                                           int replace_schedule, int allow_concurrent,
                                           double corpus_fraction, unsigned subset_seed,
-                                          const char* tutor_manifest_path) {
+                                          const char* tutor_manifest_path, int tutor_weight_on) {
     const ConsoleCtrlGuard _console_ctrl_guard;   // Ctrl+C / window close -> save before exit, see above
     // Model storage: an explicit path is honoured as-is; otherwise lay the model out in a
     // structured, identity-named directory (corpus + dims) under the models root and register it
@@ -2336,6 +2337,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     int                     tutor_src = -1;      // blend source the manifest labels; -1 = surface off
     double                  tutor_drift_floor = 0.0;
     sub0::tutor::EpochPlan  tutor_plan;      // the without-replacement epoch permutation
+    sub0::tutor::Weighter   tutor_weighter;  // stage 4: velocity -> per-entry gradient weight
+    std::vector<float>      tutor_win_w;     // this step's per-window weights (mean-1 normalised)
+    bool                    tutor_weighting = (tutor_weight_on != 0);
     sub0::tutor::Surface::RunInfo tutor_run;      // identity stamped into every recording
     std::vector<std::uint8_t> tutor_reachable;    // per document: can training reach it at all?
     std::size_t             tutor_reachable_docs = 0;
@@ -2351,6 +2355,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
     std::vector<std::size_t> probe_starts;   // the fixed probe window plan, resolved once at setup
     std::vector<int>         probe_lens;
     std::vector<float>       probe_nelbo;
+    std::vector<std::uint8_t> probe_docs_pop;   // population label per probe, parallel to probe_nelbo
     const std::filesystem::path tutor_snapshot = meta_dir / "tutor_surface.json";
     const std::filesystem::path tutor_sidecar  = meta_dir / "tutor_surface.bin";
     const std::filesystem::path tutor_events   = meta_dir / "tutor_events.csv";
@@ -2391,6 +2396,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         const float typical_visit = lr * static_cast<float>(SEQ_LEN);
         tutor_surface.reset(tutor_man.total_docs(), typical_visit);
         win_doc.assign(static_cast<std::size_t>(max_batch_t), 0u);
+        if (tutor_weighting) tutor_win_w.assign(static_cast<std::size_t>(max_batch_t), 1.f);
         tutor_win_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
         tutor_post_loss.assign(static_cast<std::size_t>(max_batch_t), 0.0);
         tutor_probe.reset(tutor_man.total_docs(), sub0::tutor::TUTOR_PROBE_STRIDE);
@@ -2409,6 +2415,11 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 if (len < 2) continue;
                 probe_starts.push_back(beg);
                 probe_lens.push_back(len);
+                // The population label is pushed HERE, inside the same loop and under the same skip
+                // conditions, so it cannot desynchronise from probe_starts. Building it by iterating the
+                // probe document list separately would silently mislabel every probe after the first
+                // skipped document -- the same shape of bug as the coverage denominator.
+                probe_docs_pop.push_back(d < tutor_man.doc_pop.size() ? tutor_man.doc_pop[d] : 0u);
             }
             probe_nelbo.assign(probe_starts.size(), 0.f);
             tutor_probe.trim_to(probe_starts.size());
@@ -2620,6 +2631,18 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             starts[b]  = d.win.start;
             win_len[b] = d.win.len;
         }
+        // Stage 4: per-window gradient weights from the mastery surface. Computed AFTER the draw (which
+        // fills win_doc) and BEFORE the step that consumes them. Normalised to mean 1 so this arm
+        // applies the same total learning per step as the control and differs only in its DISTRIBUTION.
+        if (tutor_weighting && !tutor_win_w.empty()) {
+            for (int b = 0; b < batch_t; ++b)
+                tutor_win_w[static_cast<std::size_t>(b)] =
+                    (src_idx[b] == tutor_src)
+                        ? tutor_weighter.raw_weight(tutor_surface.at(win_doc[static_cast<std::size_t>(b)]))
+                        : 1.f;
+            sub0::tutor::Weighter::normalise(
+                std::span<float>(tutor_win_w.data(), static_cast<std::size_t>(batch_t)));
+        }
         const float lr_t = sub0::lr::lr_at(step, peak_lr, lr_warmup_steps,
                                        rs.cooldown_start, cooldown_steps);   // warmup -> stable -> cosine cooldown
         // Materializes window b (from this step's src_idx/starts/win_len draw) into cpu_win/cpu_starts/
@@ -2662,7 +2685,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
             const float muon_lr_t = opt.use_muon() ? sub0::lr::lr_at(step, MUON_LR_BASE, lr_warmup_steps, rs.cooldown_start, cooldown_steps) : 0.f;
             step_loss = gpu.step(sources, src_idx.data(), starts.data(), win_len.data(), batch_t, seq_t,
                                  lr_t, muon_lr_t,
-                                 tutor_win_loss.empty() ? nullptr : tutor_win_loss.data());
+                                 tutor_win_loss.empty() ? nullptr : tutor_win_loss.data(),
+                                 tutor_win_w.empty() ? nullptr : tutor_win_w.data());
             opt.set_step_count(gpu.t);          // keep the checkpoint's step counter in lockstep
             if (!gpu.ok) {
                 sub0::log::error("training: GPU step failed (device fault) at step {} -- stopping "
@@ -2848,7 +2872,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                                           any_masked ? cpu_mask.data() : nullptr,
                                           content_embed_active ? win_binds.data() : nullptr,
                                           /*win_sentinel=*/nullptr, /*win_persist=*/nullptr,
-                                          tutor_win_loss.empty() ? nullptr : tutor_win_loss.data());
+                                          tutor_win_loss.empty() ? nullptr : tutor_win_loss.data(),
+                                          tutor_win_w.empty() ? nullptr : tutor_win_w.data());
             train_secs += std::chrono::duration<double>(clock::now() - t_train0).count();
             const auto t_opt0 = clock::now();
             opt.step();
@@ -2936,6 +2961,27 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 const sub0::BlendSource& tsrc = sources[static_cast<std::size_t>(tutor_src)];
                 sub0::eval::nelbo_cpu_each(tsrc.view, probe_starts, probe_lens, DEFAULT_THREADS,
                                            probe_nelbo);
+                // PER-POPULATION HELD-OUT loss, free: the drift probes are never trained, are labelled
+                // by the manifest, and are already scored here. This is the number the A/B actually
+                // turns on -- "does the tutor make MIXED-corpus training better" is a question about
+                // per-population held-out loss, and a single corpus-average val_nelbo cannot answer it
+                // (an average over a heterogeneous corpus hides exactly the redistribution under test,
+                // which is docs/PLATEAU_DESIGN.md 4a's whole complaint).
+                {
+                    std::vector<double> psum(tutor_man.populations.size(), 0.0);
+                    std::vector<int>    pn(tutor_man.populations.size(), 0);
+                    for (std::size_t i = 0; i < probe_nelbo.size() && i < probe_docs_pop.size(); ++i) {
+                        if (!std::isfinite(probe_nelbo[i])) continue;
+                        psum[probe_docs_pop[i]] += probe_nelbo[i];
+                        ++pn[probe_docs_pop[i]];
+                    }
+                    std::string line;
+                    for (std::size_t p = 0; p < psum.size(); ++p)
+                        if (pn[p] > 0)
+                            line += std::format("{}{}={:.4f}(n={})", line.empty() ? "" : " ",
+                                                tutor_man.populations[p], psum[p] / pn[p], pn[p]);
+                    sub0::log::line("  tutor: held-out by population -- {}", line);
+                }
                 const double applied_since = tutor_surface.global_applied() - tutor_applied_at_last_probe;
                 const double floor_now = tutor_probe.observe(probe_nelbo, applied_since);
                 if (floor_now > 0.0) tutor_drift_floor = floor_now;
@@ -2948,6 +2994,13 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
                 // as everything else the run would need to resume.
                 if (!tutor_surface.save(tutor_sidecar.string()))
                     sub0::log::info("  tutor: sidecar write failed ({})", tutor_sidecar.string());
+                if (tutor_weighting) {
+                    tutor_weighter.refresh(tutor_surface.entries());
+                    sub0::log::line("  tutor: WEIGHTING {} | |velocity| scale {:.4g} | w in [{:.2f},{:.2f}]",
+                                    tutor_weighter.active() ? "on" : "neutral (too few readings)",
+                                    tutor_weighter.scale(), sub0::tutor::Weighter::W_MIN,
+                                    sub0::tutor::Weighter::W_MAX);
+                }
                 const std::size_t n_ev = tutor_surface.events().size();
                 if (!tutor_surface.append_events(tutor_events.string(), tutor_man))
                     sub0::log::info("  tutor: event append failed ({})", tutor_events.string());

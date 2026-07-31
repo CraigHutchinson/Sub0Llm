@@ -255,6 +255,13 @@ SUB0_API void  reduce_gradients();                              // publish singl
 // LEARNED-encoder caveat carries over unchanged: a bindings entry carrying a non-null enc_w_grad must
 // NOT be trained through this multi-threaded path (no per-thread reduction on encoder grads -- the
 // documented CharEncoder/ConvPool single-thread limit); parameter-free encodings only.
+// `win_weight`, if non-null, is a [batch] array of per-window GRADIENT weights: window b contributes
+// w_b times its normal share, which is identical to training that window at w_b * lr (the contribution
+// is linear in the loss -- docs/TUTOR.md's "a per-entry learning rate is a per-entry loss weight").
+// null = every window weighted 1, today's behavior exactly. The weight scales the BACKWARD only; the
+// returned loss and `out_win_loss` remain the true unweighted losses, so a controller reading them
+// cannot see its own actuator.
+//
 // `out_win_loss`, if non-null, is a caller-owned [batch] array receiving each window's OWN mean loss
 // alongside the returned batch mean -- the per-entry signal docs/TUTOR.md's mastery surface is built
 // from. Free: op_cross_entropy already computes exactly this value per window, so nothing extra runs
@@ -265,7 +272,8 @@ SUB0_API float train_batch(const int* data, const std::size_t* starts, int batch
                            const ScratchBindings* const* win_binds = nullptr,
                            const SentinelBindings* const* win_sentinel = nullptr,
                            const PersistentBindings* const* win_persist = nullptr,
-                           double* out_win_loss = nullptr);
+                           double* out_win_loss = nullptr,
+                           const float* win_weight = nullptr);
 
 // --- Optimizer (used by the train stage) -----------------------------------
 // AdamW by default; optionally a HYBRID Muon+AdamW split when `use_muon` is set: the hidden 2D GEMM

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <numeric>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -408,4 +409,66 @@ TEST_CASE("manifest: doc_count_matches expects the trailing phantom boundary", "
     REQUIRE(m.doc_count_matches(5));
     REQUIRE_FALSE(m.doc_count_matches(4));
     REQUIRE_FALSE(m.doc_count_matches(6));
+}
+
+TEST_CASE("weighter: neutral until it has readings, then shaped by |velocity|", "[tutor][weight]") {
+    using sub0::tutor::Weighter;
+    Weighter w;
+    sub0::tutor::Entry e{};
+
+    // No scale yet -> exactly neutral. Early training must not be steered by a measurement that does
+    // not exist; a controller that guesses before it can measure is the thing the read-only stage was
+    // built to avoid ever shipping.
+    REQUIRE_FALSE(w.active());
+    REQUIRE(w.raw_weight(e) == 1.f);
+
+    // Build a population of readings so the median scale is well defined.
+    std::vector<sub0::tutor::Entry> pop(200);
+    for (std::size_t i = 0; i < pop.size(); ++i) {
+        pop[i].visits = 3;
+        pop[i].velocity = 0.10f + 0.001f * static_cast<float>(i);   // median ~0.20
+    }
+    w.refresh(pop);
+    REQUIRE(w.active());
+    REQUIRE(w.scale() == Catch::Approx(0.20f).epsilon(0.05));
+
+    sub0::tutor::Entry fast{}; fast.visits = 3; fast.velocity =  2.00f;   // still learning fast
+    sub0::tutor::Entry flat{}; flat.visits = 3; flat.velocity =  0.001f;  // mastered OR unlearnable
+    sub0::tutor::Entry back{}; back.visits = 3; back.velocity = -1.00f;   // being FORGOTTEN
+
+    REQUIRE(w.raw_weight(fast) > w.raw_weight(flat));
+    // Forgetting must weight UP, not down. Using the magnitude is what buys this: a signed rule would
+    // drive a regressing entry toward zero weight, which is the opposite of rehearsal and exactly the
+    // failure TUTOR.md's table calls out.
+    REQUIRE(w.raw_weight(back) > w.raw_weight(flat));
+    // Bounded at both ends. The floor is the safety property: a maximally down-weighted entry still
+    // receives a quarter of normal learning, so it can always recover. Without it, an entry driven to
+    // zero freezes its own NELBO, which confirms the low weight forever.
+    REQUIRE(w.raw_weight(fast) <= Weighter::W_MAX);
+    REQUIRE(w.raw_weight(flat) >= Weighter::W_MIN);
+
+    // An entry with no reading stays neutral even once a scale exists.
+    sub0::tutor::Entry unseen{}; unseen.visits = 1; unseen.velocity = 0.f;
+    REQUIRE(w.raw_weight(unseen) == 1.f);
+}
+
+TEST_CASE("weighter: batch weights normalise to mean 1", "[tutor][weight]") {
+    // The property that makes the A/B interpretable at all. Weighting redistributes gradient; if the
+    // total also changed, the Tutor arm would be training at a different EFFECTIVE learning rate than
+    // the control and no difference in final loss could be attributed to the redistribution -- which is
+    // the hypothesis under test. TUTOR.md names this drift as a risk with "nothing logging it".
+    std::vector<float> w{ 4.0f, 0.25f, 1.0f, 2.0f, 0.5f };
+    sub0::tutor::Weighter::normalise(w);
+    const double mean = std::accumulate(w.begin(), w.end(), 0.0) / static_cast<double>(w.size());
+    REQUIRE(mean == Catch::Approx(1.0).epsilon(1e-6));
+    // Relative ordering is preserved -- normalisation rescales, it does not reshape.
+    REQUIRE(w[0] > w[3]);
+    REQUIRE(w[3] > w[2]);
+    REQUIRE(w[2] > w[4]);
+    REQUIRE(w[4] > w[1]);
+
+    // Degenerate input must not produce NaN weights that would poison a whole step's gradient.
+    std::vector<float> z{ 0.f, 0.f, 0.f };
+    sub0::tutor::Weighter::normalise(z);
+    for (float x : z) REQUIRE(x == 1.f);
 }

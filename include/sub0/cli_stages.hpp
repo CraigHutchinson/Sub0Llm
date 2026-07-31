@@ -23,7 +23,7 @@ extern "C" int sub0_train_stage(const char* corpus, const char* model_out,
                                 int optimizer, int resume_mode, const char* blend_config_path,
                                 int replace_schedule, int allow_concurrent,
                                 double corpus_fraction, unsigned subset_seed,
-                                const char* tutor_manifest_path);
+                                const char* tutor_manifest_path, int tutor_weight);
 extern "C" int sub0_gen_stage(const char* model_in, const char* prompt,
                               int n, float temp, int topk, unsigned seed, int attn_sinks);
 extern "C" int sub0_eval_stage(const char* model_in, unsigned seed, int n_problems);
@@ -53,6 +53,7 @@ inline int run_train(int argc, char** argv) {
                  "model dir when no path is given"};
     std::string train_model, train_corpus{DEFAULT_CORPUS};
     std::string train_tutor_manifest;      // SPIKE: docs/TUTOR.md mastery surface; empty = off
+    bool        train_tutor_weight = false;  // SPIKE stage 4: close the loop (needs --tutor-manifest)
     int    train_steps = 0, train_batch = 0;
     double train_epochs = 0.0;   // 0 = unset; --steps and --epochs are mutually exclusive
     float train_lr    = LR_BASE;
@@ -157,6 +158,12 @@ inline int run_train(int argc, char** argv) {
                    "flag here that DOES change what is trained -- the probe documents are excluded, "
                    "which is what makes them a drift measurement rather than a training signal.")
        ->check(CLI::ExistingFile);
+    app.add_flag("--tutor-weight", train_tutor_weight,
+                 "SPIKE stage 4 (needs --tutor-manifest): CLOSE THE LOOP -- weight each window's "
+                 "gradient by its document's learning velocity, bounded to [0.25,4] and normalised to "
+                 "mean 1 per batch so the effective learning rate is unchanged and only its "
+                 "DISTRIBUTION differs from the global schedule. This is the A/B arm; without the flag "
+                 "the surface is recorded read-only and training is untouched.");
     CLI11_PARSE(app, argc, argv);
 
     if (train_batch <= 0)   // auto: the GPU-tuned batch on a CUDA build, else the CPU width
@@ -172,7 +179,7 @@ inline int run_train(int argc, char** argv) {
                             resume_mode, train_blend_config.c_str(), train_blend_replace ? 1 : 0,
                             train_allow_concurrent ? 1 : 0,
                             train_corpus_fraction, train_subset_seed,
-                            train_tutor_manifest.c_str());
+                            train_tutor_manifest.c_str(), train_tutor_weight ? 1 : 0);
 }
 
 // --- gen -------------------------------------------------------------------

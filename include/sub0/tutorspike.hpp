@@ -380,6 +380,89 @@ private:
     double             global_applied_ = 0.0;   // double: this one accumulates over the WHOLE run
 };
 
+// --- the controller: velocity -> per-entry weight ---------------------------------------------
+// Stage 4 of docs/TUTOR.md. Closes the loop the read-only surface was built to de-risk.
+//
+// WHAT IT USES, AND WHAT IT DELIBERATELY DOES NOT
+//
+// VELOCITY only. The transfer term is excluded on evidence, not preference: it failed its seed control
+// (57% and 196% apart between seeds, sign-flipping on one population) while velocity replicated to
+// 0.1-5.2%. Building feedback on transfer would be closing a loop around noise. See docs/TUTOR_SPIKE.md.
+//
+// The Adam superposition failure (docs/TUTOR_SWEEP.md, tests/superposition_tests.cpp) does NOT block
+// this, and the distinction matters: that result kills IDENTIFICATION of pairwise interference, which
+// needs effects to decompose additively. Weighting needs only that scaling a window's gradient by w is
+// equivalent to training it at w*lr -- linear in the loss, true under any optimizer.
+//
+// THE SHAPE, AND WHY
+//
+//   |velocity| large  -> HIGH weight. Learning is happening here, in either direction: a large positive
+//                        velocity is an entry still being learnt, a NEGATIVE one is an entry being
+//                        forgotten and overdue for rehearsal. TUTOR.md's table wants both weighted up,
+//                        and using the magnitude gets the second case for free.
+//   |velocity| ~ 0    -> LOW weight. This is both "mastered" and "unlearnable", and they SHOULD collapse
+//                        together here: neither returns anything for more compute. The surface keeps
+//                        them distinguishable by LEVEL for diagnosis; the controller does not need to.
+//   no reading yet    -> weight 1, exactly neutral. Early training, and any entry below the velocity
+//                        mark threshold, must not be steered by a measurement that does not exist.
+//
+// The scale is the running MEDIAN of |velocity| over entries that have a reading -- not a constant.
+// Velocity's units are nelbo per unit applied learning, which depends on the learning rate, the window
+// width and how far into the run it is; a fixed divisor would be a different policy at every scale.
+class Weighter {
+public:
+    // Bounds. Bounded is the whole safety argument: an unbounded w compounds with itself run over run,
+    // and the failure mode TUTOR.md warns about (an entry driven to zero weight, its NELBO then frozen,
+    // confirming the low weight forever) needs only that w can reach ~0. A floor of 0.25 means a
+    // maximally down-weighted entry still receives a quarter of normal learning and can still recover.
+    static constexpr float W_MIN = 0.25f;
+    static constexpr float W_MAX = 4.0f;
+
+    void reset() { scale_ = 0.f; }
+
+    // Refresh the |velocity| scale from the surface. Called at the eval cadence, not per step: a scale
+    // that moved every step would make the weight a function of when it was computed as much as of the
+    // entry.
+    void refresh(std::span<const Entry> entries) {
+        std::vector<float> mags;
+        mags.reserve(entries.size() / 4 + 1);
+        for (const Entry& e : entries)
+            if (e.velocity != 0.f) mags.push_back(std::fabs(e.velocity));
+        if (mags.size() < 32) { scale_ = 0.f; return; }   // too few readings to define a scale
+        const std::size_t mid = mags.size() / 2;
+        std::nth_element(mags.begin(), mags.begin() + static_cast<std::ptrdiff_t>(mid), mags.end());
+        scale_ = mags[mid];
+    }
+
+    bool active() const { return scale_ > 0.f; }
+    float scale() const { return scale_; }
+
+    // Weight for one entry, BEFORE batch normalisation. Neutral (1.0) whenever there is no reading or no
+    // scale yet -- the controller stays out of the way until it has something to say.
+    float raw_weight(const Entry& e) const {
+        if (scale_ <= 0.f || e.velocity == 0.f) return 1.f;
+        return std::clamp(std::fabs(e.velocity) / scale_, W_MIN, W_MAX);
+    }
+
+    // Normalise a batch's weights to mean 1, IN PLACE. This is not tidiness -- it is what makes the A/B
+    // interpretable. Weighting changes how much gradient a step delivers, so without renormalisation the
+    // Tutor arm would train at a different EFFECTIVE learning rate than the control and any difference
+    // in final loss would be unattributable: TUTOR.md lists exactly this ("effective LR could drift with
+    // nothing logging it") as a named risk. With mean 1, both arms apply the same total learning per
+    // step and differ only in its DISTRIBUTION, which is the hypothesis under test.
+    static void normalise(std::span<float> w) {
+        if (w.empty()) return;
+        double sum = 0.0;
+        for (float x : w) sum += x;
+        if (sum <= 0.0) { std::fill(w.begin(), w.end(), 1.f); return; }
+        const float k = static_cast<float>(static_cast<double>(w.size()) / sum);
+        for (float& x : w) x *= k;
+    }
+
+private:
+    float scale_ = 0.f;
+};
+
 // --- epoch permutation ------------------------------------------------------------------------
 // An epoch is a SHUFFLED PERMUTATION of every window tiling the corpus, drawn without replacement --
 // not independent random sampling. The distinction is not cosmetic; it removes three separate defects
