@@ -472,3 +472,46 @@ TEST_CASE("weighter: batch weights normalise to mean 1", "[tutor][weight]") {
     sub0::tutor::Weighter::normalise(z);
     for (float x : z) REQUIRE(x == 1.f);
 }
+
+TEST_CASE("weighter: the scale is BUCKETED by applied learning, not global", "[tutor][weight]") {
+    // The correction that the first A/B proved necessary. Raw velocity is not comparable across entries:
+    // it depends on how far along its own curve an entry has travelled, which is set by how often it is
+    // drawn, which is set by document LENGTH. In the spike corpus cosmopedia averages 31.3 visits/doc
+    // against tinystories' 8.7, so cosmopedia sits furthest along, has the LOWEST raw velocity, and a
+    // globally-scaled policy DOWN-WEIGHTS the population with the most left to learn. Measured: -0.124
+    // nelbo on cosmopedia held-out, its worst population.
+    using sub0::tutor::Weighter;
+    using sub0::tutor::Entry;
+
+    // Two cohorts: "early" entries with little applied learning and fast velocity, and "late" entries
+    // far along their curve and therefore slow. Both are behaving NORMALLY for their stage.
+    std::vector<Entry> pop;
+    for (int i = 0; i < 200; ++i) {
+        Entry e{}; e.visits = 4; e.applied = 4.0f; e.velocity = 0.40f + 0.001f * static_cast<float>(i);
+        pop.push_back(e);
+    }
+    for (int i = 0; i < 200; ++i) {
+        Entry e{}; e.visits = 40; e.applied = 64.0f; e.velocity = 0.02f + 0.00005f * static_cast<float>(i);
+        pop.push_back(e);
+    }
+    Weighter w;
+    w.refresh(pop);
+    REQUIRE(w.active());
+    // Each stage gets its own scale, and they differ by roughly the ratio of the cohorts' velocities.
+    REQUIRE(w.scale_at(4.0f) > 5.0f * w.scale_at(64.0f));
+
+    // A typical member of EITHER cohort now weights ~1: neither is penalised merely for being late.
+    Entry early{}; early.visits = 4;  early.applied = 4.0f;  early.velocity = 0.50f;
+    Entry late{};  late.visits  = 40; late.applied  = 64.0f; late.velocity  = 0.025f;
+    REQUIRE(w.raw_weight(early) == Catch::Approx(1.0).epsilon(0.25));
+    REQUIRE(w.raw_weight(late)  == Catch::Approx(1.0).epsilon(0.25));
+
+    // Under a GLOBAL scale the late cohort would be crushed -- this is the defect, stated as a number.
+    const float global_med = 0.10f;                    // roughly the median across both cohorts
+    REQUIRE(late.velocity / global_med < 0.5f);        // would have been heavily down-weighted
+    REQUIRE(w.raw_weight(late) > 0.75f);               // bucketed, it is not
+
+    // And within a stage the signal still works: unusually slow FOR THIS STAGE weights down.
+    Entry stalled{}; stalled.visits = 40; stalled.applied = 64.0f; stalled.velocity = 0.001f;
+    REQUIRE(w.raw_weight(stalled) < w.raw_weight(late));
+}

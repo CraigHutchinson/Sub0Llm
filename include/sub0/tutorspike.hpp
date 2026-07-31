@@ -67,6 +67,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -418,30 +419,72 @@ public:
     static constexpr float W_MIN = 0.25f;
     static constexpr float W_MAX = 4.0f;
 
-    void reset() { scale_ = 0.f; }
+    void reset() { std::fill(scale_.begin(), scale_.end(), 0.f); global_scale_ = 0.f; }
 
-    // Refresh the |velocity| scale from the surface. Called at the eval cadence, not per step: a scale
-    // that moved every step would make the weight a function of when it was computed as much as of the
-    // entry.
-    void refresh(std::span<const Entry> entries) {
-        std::vector<float> mags;
-        mags.reserve(entries.size() / 4 + 1);
-        for (const Entry& e : entries)
-            if (e.velocity != 0.f) mags.push_back(std::fabs(e.velocity));
-        if (mags.size() < 32) { scale_ = 0.f; return; }   // too few readings to define a scale
-        const std::size_t mid = mags.size() / 2;
-        std::nth_element(mags.begin(), mags.begin() + static_cast<std::ptrdiff_t>(mid), mags.end());
-        scale_ = mags[mid];
+    // Buckets on the entry's OWN APPLIED LEARNING, in powers of two. This is the correction that makes
+    // the policy work at all, and its absence is what made the first A/B lose on every population.
+    //
+    // Raw velocity is not comparable across entries, because it depends on how far along its own
+    // saturation curve an entry has travelled -- and that is set by how often it is drawn, which is set
+    // by document LENGTH (windows are drawn per token, so a long document accrues visits faster). In
+    // the spike corpus cosmopedia averages 31.3 visits/document against tinystories' 8.7, so cosmopedia
+    // sits furthest along, has the LOWEST raw velocity of the three populations, and a policy keyed on
+    // raw velocity therefore DOWN-WEIGHTS the population with the most left to learn. Measured: the
+    // naive controller lost -0.124 nelbo on cosmopedia held-out, its worst population.
+    //
+    // Bucketing by applied learning compares an entry against entries at the same point on their curve,
+    // so what drives the weight is "unusually fast/slow FOR THIS STAGE" rather than "early or late".
+    // Powers of two rather than fixed edges: applied learning spans orders of magnitude and its absolute
+    // range moves with lr, window width and run length, so any fixed edge is a different policy at every
+    // scale.
+    static constexpr int   N_BUCKETS   = 14;              // covers applied in [2^-2, 2^11]
+    static constexpr float BUCKET_BASE = 0.25f;           // applied below this shares bucket 0
+    static constexpr std::size_t MIN_PER_BUCKET = 24;     // else fall back to the global scale
+
+    static int bucket_of(float applied) {
+        if (!(applied > BUCKET_BASE)) return 0;
+        const int b = static_cast<int>(std::log2(applied / BUCKET_BASE));
+        return std::clamp(b, 0, N_BUCKETS - 1);
     }
 
-    bool active() const { return scale_ > 0.f; }
-    float scale() const { return scale_; }
+    // Refresh the per-bucket |velocity| medians. At the eval cadence, not per step: a scale that moved
+    // every step would make the weight a function of when it was computed as much as of the entry.
+    void refresh(std::span<const Entry> entries) {
+        std::array<std::vector<float>, N_BUCKETS> mags;
+        std::vector<float> all;
+        all.reserve(entries.size() / 4 + 1);
+        for (const Entry& e : entries) {
+            if (e.velocity == 0.f) continue;
+            const float m = std::fabs(e.velocity);
+            mags[static_cast<std::size_t>(bucket_of(e.applied))].push_back(m);
+            all.push_back(m);
+        }
+        auto med = [](std::vector<float>& v) {
+            const std::size_t mid = v.size() / 2;
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(mid), v.end());
+            return v[mid];
+        };
+        global_scale_ = all.size() >= 32 ? med(all) : 0.f;
+        for (int b = 0; b < N_BUCKETS; ++b) {
+            auto& v = mags[static_cast<std::size_t>(b)];
+            // A thin bucket falls back to the global median rather than trusting a median of six
+            // samples -- a noisy per-bucket scale would inject weight swings that have nothing to do
+            // with the entries in it.
+            scale_[static_cast<std::size_t>(b)] = v.size() >= MIN_PER_BUCKET ? med(v) : global_scale_;
+        }
+    }
+
+    bool active() const { return global_scale_ > 0.f; }
+    float scale() const { return global_scale_; }
+    float scale_at(float applied) const { return scale_[static_cast<std::size_t>(bucket_of(applied))]; }
 
     // Weight for one entry, BEFORE batch normalisation. Neutral (1.0) whenever there is no reading or no
     // scale yet -- the controller stays out of the way until it has something to say.
     float raw_weight(const Entry& e) const {
-        if (scale_ <= 0.f || e.velocity == 0.f) return 1.f;
-        return std::clamp(std::fabs(e.velocity) / scale_, W_MIN, W_MAX);
+        if (e.velocity == 0.f) return 1.f;
+        const float sc = scale_at(e.applied);
+        if (sc <= 0.f) return 1.f;
+        return std::clamp(std::fabs(e.velocity) / sc, W_MIN, W_MAX);
     }
 
     // Normalise a batch's weights to mean 1, IN PLACE. This is not tidiness -- it is what makes the A/B
@@ -460,7 +503,8 @@ public:
     }
 
 private:
-    float scale_ = 0.f;
+    std::array<float, N_BUCKETS> scale_{};
+    float global_scale_ = 0.f;
 };
 
 // --- epoch permutation ------------------------------------------------------------------------
