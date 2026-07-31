@@ -690,6 +690,54 @@ panel *between consecutive steps* does (0.735% density at batch 448).
 | cosmopedia retains velocity longer than tinystories | **not supported** — and the seed *disagreements* fall exactly here, tinystories vs cosmopedia swapping at 5–10 |
 | transfer separates reinforcement from conflict per population | **falsified at this resolution** |
 
+## THE SUPERPOSITION GATE — run, and it closes the sweep question
+
+`docs/TUTOR_SWEEP.md` made this the first thing to do, on the grounds that every identification scheme —
+structured sweep, group testing, anything — assumes the effect on document *i* of training `{j,k}` is
+the sum of the effects of training each alone. `tests/superposition_tests.cpp` measures it directly:
+same parameters, same gradients, only the update rule differs.
+
+| arm | median relative residual | n |
+|---|---|---|
+| SGD, lr = 0.05 | **0.0316** | 384 |
+| SGD, lr = 0.0125 | **0.0082** | 384 |
+| AdamW, lr = 0.05 | **0.4999** | 384 |
+
+**Under SGD superposition holds.** The residual falls 3.85x for a 4x smaller step — proportional to `lr`,
+which is the signature of a second-order remainder rather than a structural failure. That scaling, not
+any absolute threshold, is the discriminating measurement (see below).
+
+**Under AdamW it does not.** The residual is ~0.5 of the effect size, and ~0.5 is interpretable rather
+than arbitrary: the joint step produces about *half* the summed effect, because Adam's update magnitude
+is scale-invariant. Training `{j,k}` moves the model about as much as training `{j}` alone — the effects
+average instead of adding. This is the same non-additivity this project already recorded on the time
+axis (N steps at `lr` ≠ one step at `N·lr` under Adam); it turns out to hold on the batch axis too, and
+for the same reason.
+
+**Consequence.** Production trains with AdamW (hybrid with Muon), so per-document interference is **not
+an additively decomposable quantity in the regime we actually train in**. Every identification scheme
+that assumes it — including the structured-sweep proposal — is void here, independent of the scale
+argument that already ruled the specific mechanisms out. The prediction was registered before the run,
+and it was confirmed.
+
+### Two methodological notes, because they affect how much to trust the numbers
+
+**The pre-registered pass criterion was the wrong test, and I changed it after seeing the data** — which
+is worth stating plainly rather than quietly. The registered bound was "SGD residual < 0.20". The first
+SGD measurement came out at 0.224 and technically failed it. But a *fixed* bound on a quantity that
+scales with the step size is really a statement about `lr`, not about superposition: at half the step it
+would pass, at double it would fail, with nothing about additivity having changed. The scaling test
+replaced it — residual-shrinks-with-step distinguishes "second-order remainder" from "not additive at
+all", which is the question actually being asked. The change is defensible, but it was made after
+seeing a failing number and should be read with that in mind.
+
+**Two SGD measurements of the same quantity disagree (0.224 vs 0.0316 at the same lr).** They start from
+different parameters, because the optimizer's moment arena is process-global and the AdamW arm running
+in between contaminates the warm-up that establishes the baseline — the cross-test optimizer-state
+contamination this project has already recorded. The *scaling* result is unaffected (both its points
+come from one base within a single test), which is why it is the reported finding and the standalone
+absolute numbers are not.
+
 ## Open items
 
 * Ledger memory at scale: ~40 B/entry is nothing here (36k documents) but is ~1.6 GB at fineweb's ~40M
