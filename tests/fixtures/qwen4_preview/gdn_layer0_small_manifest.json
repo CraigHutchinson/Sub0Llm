@@ -1,0 +1,81 @@
+{
+  "description": "Gated DeltaNet (Qwen4ExpTextGatedDeltaNet) layer-0 reference fixture. Weight VALUES are a real, contiguous slice of the real Qwen/Qwen3.8-Flash-Next checkpoint's model.language_model.layers.0.linear_attn.* tensors (shard model-00001-of-00131.safetensors), truncated from hidden_size=2560/16 key heads/48 value heads down to this tiny shape. head_k_dim/head_v_dim (128) are UNCHANGED -- only the hidden_size and head COUNTS were sliced, preserving the real 3x value:key head ratio. The forward pass itself is the real transformers 5.16.1 Qwen4ExpTextGatedDeltaNet.forward(), run on CPU with cache_params=None, attention_mask=None.",
+  "source": {
+    "repo": "Qwen/Qwen3.8-Flash-Next",
+    "shard": "model-00001-of-00131.safetensors",
+    "tensor_prefix": "model.language_model.layers.0.linear_attn.",
+    "transformers_version": "5.16.1",
+    "module": "transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextGatedDeltaNet"
+  },
+  "config_small": {
+    "hidden_size": 32,
+    "linear_num_key_heads": 1,
+    "linear_num_value_heads": 3,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "hidden_act": "silu",
+    "rms_norm_eps": 1e-06,
+    "output_gate_type": "sigmoid"
+  },
+  "config_real_full_scale_for_reference": {
+    "hidden_size": 2560,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128
+  },
+  "dtype": "float32 little-endian, raw flat binary, row-major (C order)",
+  "shapes": {
+    "input_hidden_states": [
+      1,
+      6,
+      32
+    ],
+    "weight_in_proj_qkv": [
+      640,
+      32
+    ],
+    "weight_in_proj_z": [
+      384,
+      32
+    ],
+    "weight_in_proj_b": [
+      3,
+      32
+    ],
+    "weight_in_proj_a": [
+      3,
+      32
+    ],
+    "weight_conv1d": [
+      640,
+      1,
+      4
+    ],
+    "weight_dt_bias": [
+      3
+    ],
+    "weight_A_log": [
+      3
+    ],
+    "weight_norm": [
+      128
+    ],
+    "weight_out_proj": [
+      32,
+      384
+    ],
+    "output": [
+      1,
+      6,
+      32
+    ]
+  },
+  "input_construction": "torch.Generator().manual_seed(20260830); hidden_states = randn(1,6,32)*0.02",
+  "notes": [
+    "in_proj_qkv/conv1d row layout is [query_rows(key_dim_small) | key_rows(key_dim_small) | value_rows(value_dim_small)], sliced from the SAME row offsets as the real checkpoint's [query(2048)|key(2048)|value(6144)] layout.",
+    "norm.weight is NOT sliced: RMSNormGated operates per head_v_dim (128), which is unchanged.",
+    "GatedDeltaNet forward internally L2-normalizes q/k, applies sigmoid(beta) update gate and -softplus(a+dt_bias)*exp(A_log) decay gate, then the chunked delta-rule recurrence (torch_chunk_gated_delta_rule in modeling_qwen4_exp.py)."
+  ]
+}
