@@ -191,6 +191,60 @@ static_assert(DEPTH_SCHEDULE.slots == DEPTH_CACHE_MAX,
 static_assert(DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1] <= DEPTH_SCHEDULE.slots,
               "a depth mix can never read more entries than the cache holds");
 
+// GATED DELTANET -- Stage 0 ONLY: config axis + fingerprint plumbing, no forward/backward exists yet.
+// See docs/GATED_DELTANET.md for the full design (verified reference math, checkpoint/arena analysis,
+// the Node-fanout question, and why the chunked-parallel-scan form is the Stage 1 target). This section
+// is the skeleton half of that doc: it must have ZERO effect on any build until Stage 1 lands.
+//
+// GDN_FULL_ATTN_STRIDE mirrors DEPTH_ATTN_STRIDE's shape exactly: every Nth LAYER (0-indexed, N =
+// stride) keeps ordinary softmax attention; every other layer would become a Gated DeltaNet (linear
+// attention, O(1) per token via a fixed-size recurrent state) layer once Stage 1 exists. 0 = off, i.e.
+// every layer is softmax attention -- today's only buildable configuration, and the ONLY one this bool
+// and the static_assert below currently allow.
+inline constexpr bool USE_GATED_DELTANET = (GDN_FULL_ATTN_STRIDE > 0);
+static_assert(GDN_FULL_ATTN_STRIDE == 0,
+              "Gated DeltaNet is DESIGN + Stage 0 skeleton ONLY right now (docs/GATED_DELTANET.md) -- "
+              "no forward/backward op exists for it yet on CPU or CUDA. A nonzero --gdn-full-attn-stride "
+              "would silently train/run an architecture this engine cannot compute (the depth-attention "
+              "precedent's lesson: never let an unimplemented axis compile as a quiet no-op). Do not "
+              "relax this assert until Stage 1 lands the CPU op and its correctness check.");
+
+// Per-LAYER (not per-execution) classification: a layer's weight IDENTITY decides whether it is softmax
+// attention or GDN, so under LoopSplit every repeated execution of a given layer index inherits that
+// layer's type automatically via LAYER_EXEC_ORDER's existing layer-index indirection -- no separate
+// per-execution bookkeeping needed here, unlike DEPTH_SCHEDULE (which genuinely is per-execution because
+// the depth cache is cross-EXECUTION state, not a per-layer weight property). Rule, matching the
+// Qwen3-Next/Qwen3.5 hybrid pattern this is modeled on ("3x GDN -> 1x full attention", stride 4): layer
+// `l` is full attention iff `l % stride == stride - 1`; every other layer is GDN. Stride 0 (off) makes
+// every layer full attention, reproducing today's only architecture exactly.
+// Parameterised on (layers, stride) rather than reading this build's own constants, so the schedule for
+// ANY configuration -- not just the one this binary happens to be built for -- can be asserted in a test
+// (the same reasoning depth_schedule_for<EXECS> above was given, and the same two-scale lesson AGENTS.md
+// S7 exists to enforce: a single compiled shape cannot show whether the modulo rule behaves at an odd
+// layer count or a stride that does not divide it evenly).
+template <int LAYERS>
+struct GdnScheduleT {
+    std::array<bool, LAYERS> full_attn{};   // true = ordinary softmax attention, false = GDN
+    int gdn_layers = 0;                      // how many layers are GDN (0 when stride <= 0)
+};
+template <int LAYERS>
+consteval GdnScheduleT<LAYERS> gdn_schedule_for(int stride) {
+    GdnScheduleT<LAYERS> s{};
+    for (int l = 0; l < LAYERS; ++l) {
+        // `&&` short-circuits during constant evaluation, so the modulo never runs at stride <= 0.
+        const bool is_gdn = stride > 0 && (l % stride != stride - 1);
+        s.full_attn[static_cast<std::size_t>(l)] = !is_gdn;
+        if (is_gdn) ++s.gdn_layers;
+    }
+    return s;
+}
+using GdnSchedule = GdnScheduleT<N_LAYERS>;
+// Unused until Stage 1's Model::forward dispatches on it (IS_GDN_LAYER[LAYER_EXEC_ORDER[e]]) -- inert
+// compile-time bookkeeping only, exactly like DEPTH_SCHEDULE was before Stage 1 consumed it. At the only
+// buildable stride (0) every entry is `full_attn = true`, i.e. this evaluates to nothing changing.
+inline constexpr GdnSchedule GDN_SCHEDULE = gdn_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE);
+static_assert(GDN_SCHEDULE.gdn_layers == 0, "GDN_FULL_ATTN_STRIDE == 0 must yield zero GDN layers");
+
 // ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //
 // The Header and PARAM_FLOATS between them discriminate every axis that changes a tensor SHAPE. They
@@ -247,6 +301,36 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT =
 // legacy model on a non-default-theta build. Guarding theta starts from files written from here on.
 inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, ROPE_THETA);
 
+// ARCH_FINGERPRINT2 -- a SECOND fingerprint word, because ARCH_FINGERPRINT above has ZERO spare bits
+// left (8 + 8 + 16 + 32 = 64, worked through explicitly here rather than assumed, per AGENTS.md S3
+// rule 1): depth_attn_stride already took the one byte middle_layers could never reach, and no further
+// axis fits without shrinking an existing field, which would either lose ROPE_THETA's exact bit_cast
+// recovery (needs all 32 bits) or cap LOOP_REPEATS below a real future value (16 bits already tight).
+// Per AGENTS.md S3 rule 2 ("prefer an ADDITIVE... format... over reshuffling existing fields"), this is
+// a NEW additive word, not a repack of the first one -- and it is deliberately given 56 SPARE bits from
+// day one (only byte 0 is assigned) so the next computation-changing, shape-neutral axis after this one
+// does not repeat the exact scramble that produced ARCH_FINGERPRINT's own comment about a byte
+// "middle_layers was never able to reach".
+//   Field layout, high to low: [63:8] reserved (always 0 today) | [7:0] gdn_full_attn_stride.
+// At GDN_FULL_ATTN_STRIDE == 0 (the only value this build can currently take -- see the static_assert
+// above) this is always 0, which is also what every checkpoint that predates this field must be
+// ASSUMED to have been built with (Gated DeltaNet does not exist as a computable option anywhere yet,
+// so "no GDN" is not a guess the way ARCH_FINGERPRINT_LEGACY's "un-looped" inference was -- it is the
+// only architecture that has ever existed). See docs/GATED_DELTANET.md and engine_core.cpp/
+// train_stage.cpp's third trailing checkpoint record for the on-disk (additive, gracefully-degrading)
+// side of this.
+static_assert(GDN_FULL_ATTN_STRIDE >= 0 && GDN_FULL_ATTN_STRIDE <= 0xff,
+              "GDN_FULL_ATTN_STRIDE must fit 8 bits");
+inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride) {
+    return static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride) & 0xffu);
+}
+struct ArchAxes2 { int gdn_full_attn_stride; };
+inline constexpr ArchAxes2 arch_axes2_of(std::uint64_t fp2) {
+    return ArchAxes2{ static_cast<int>(fp2 & 0xffu) };
+}
+inline constexpr std::uint64_t ARCH_FINGERPRINT2 = arch_fingerprint2(GDN_FULL_ATTN_STRIDE);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0);
+
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
 // shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
 // shape-NEUTRAL axes (PARAM_FLOATS discriminates the rest at load time); this one has a different job,
@@ -283,6 +367,9 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));
     mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(ROPE_SCALE_FACTOR)));
+    mix(ARCH_FINGERPRINT2);                               // folds in Gated DeltaNet's layer schedule
+    mix(static_cast<std::uint64_t>(GDN_FULL_ATTN_STRIDE)); // (currently always 0 -- see the static_assert
+                                                            //  in the GATED DELTANET section above)
     return h;
 }
 inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();

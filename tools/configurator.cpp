@@ -595,6 +595,11 @@ int main(int argc, char** argv) {
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
+    // Gated DeltaNet: DESIGN + Stage 0 skeleton only (docs/GATED_DELTANET.md) -- no forward/backward op
+    // exists yet, so this must stay 0 (layout.hpp's static_assert refuses any other value at compile
+    // time). Kept as a real CLI flag now, off by default, so the config axis/fingerprint plumbing exists
+    // ahead of Stage 1 rather than needing a second pass through every consumer this touches.
+    int gdn_full_attn_stride = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -652,6 +657,11 @@ int main(int argc, char** argv) {
                    "Memory scales as executions/N, so this is the knob that makes it fit -- see "
                    "docs/DEPTH_ATTENTION.md")
        ->capture_default_str();
+    app.add_option("--gdn-full-attn-stride", gdn_full_attn_stride,
+                   "Gated DeltaNet: DESIGN + Stage 0 ONLY, must stay 0 (docs/GATED_DELTANET.md). Once "
+                   "Stage 1 lands: every Nth layer keeps softmax attention, the rest become Gated "
+                   "DeltaNet linear-attention layers (0 = off, all layers softmax attention)")
+       ->capture_default_str()->check(CLI::Range(0, 0));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -1289,6 +1299,11 @@ int main(int argc, char** argv) {
     // shape are untouched -- which is exactly why it must enter ARCH_FINGERPRINT instead (it changes
     // computation invisibly to nfloat). 0 = off. See docs/DEPTH_ATTENTION.md for the derivation.
     cos << "constexpr int  DEPTH_ATTN_STRIDE  = " << depth_attn_stride << ";\n";
+    // Gated DeltaNet: DESIGN + Stage 0 skeleton only -- see docs/GATED_DELTANET.md and layout.hpp's
+    // static_assert(GDN_FULL_ATTN_STRIDE == 0, ...). The CLI flag above is already clamped to 0; this
+    // constant exists so ARCH_FINGERPRINT2/GDN_SCHEDULE compile and the config axis is plumbed through
+    // RunConfig ahead of Stage 1, without any op existing to actually use it.
+    cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
