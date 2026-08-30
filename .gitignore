@@ -28,6 +28,13 @@ data/cfg_test.txt
 data/tinystories.txt
 # fetched via scripts/get_gsm8k.py, same category as the corpora above
 data/gsm8k.txt
+# blend corpora used for tokenizer measurement ([[measure-tokenizer-on-the-full-corpus-blend]]) and the
+# TeacherSpike/tutorspike corpus + its manifest sidecar -- same "large, fetched/generated, never a
+# source" category as the corpora above
+data/cosmopedia.txt
+data/minipile.txt
+data/tutorspike_corpus.txt
+data/tutorspike_manifest.json
 runs/
 
 # Model/training artifacts, wherever they land. /models is already ignored, but a mistyped model

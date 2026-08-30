@@ -16,6 +16,8 @@
             "approve": true,
             "matchCommandLine": true
         },
-        "git -C d:\\Craig\\GitHub\\Sub0Llm": true
+        "git -C d:\\Craig\\GitHub\\Sub0Llm": true,
+        "0_COMPUTE=CPU": true,
+        "0_BUILD_BENCHMARKS=ON": true
     }
 }
