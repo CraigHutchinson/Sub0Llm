@@ -7,6 +7,46 @@ compiled model), which stay as-is. Nothing here is committed engineering work; i
 the corpus/data-sourcing and architecture decisions are headed, so each near-term step can be judged
 against a destination instead of picked in isolation.
 
+## STATUS 2026-08-30 — from-scratch training work CLOSED OUT; pivoting to supporting existing models
+
+Everything below this line documents where the from-scratch training line of work (corpus sourcing,
+tokenizer design, architecture mechanisms, LR scheduling) actually landed. It is kept as the historical
+record and because several mechanisms it produced (GQA, depth attention, LoopSplit, the tokenizer
+pipeline) remain live, load-bearing engine code — but **no further from-scratch pretraining research is
+planned**. The project's effort is moving to **supporting existing released models** (weight import,
+inference, distillation) rather than growing this engine's own corpus/architecture sweep further.
+
+**Why now, and what this project actually proved at its own scale**, so the pivot reads as a decision
+made from evidence rather than an abandonment:
+- The [[deterministic-mechanisms-thesis]] — delegate the fuzzy/structural part to the model and the
+  scalar-solvable part to a deterministic node, masked from the loss — held up every time it was tested
+  (arithspike, factspike, the GSM8K calc-annotation plan above). This is the one result worth carrying
+  forward into the new phase: it argues for *architecture-level* mechanisms (routing, delegation,
+  lookup) over raw parameter/data scale, which is exactly the lens the Qwen4-preview work below applies.
+- The GQA / LoopSplit / depth-attention / RoPE-scaling family ([[nanbeige-features-progress]]) is
+  **implemented and verified correct on both backends, but never validated with an actual accuracy or
+  throughput number** — three-pillar policy unmet for all four. That gap is not being closed by further
+  from-scratch runs; it stays exactly as documented, an honest "correct but unmeasured" status.
+- Tokenizer schemeV5 ([[truecasing-collapse-unconditional]]) and the WSD cooldown schedule
+  ([[wsd-cooldown-validated-tinystories-smoke]]) are the two pieces of this line of work with a real,
+  measured, positive result behind them, and both stay in active use for anything the engine still
+  trains going forward (distillation students included).
+- Everything under "Sub0Llm — scratch / persistent slots" and "training / generation backlog" in memory
+  is now background reading, not a queue to keep pulling from — see [[scratch-spikes-parked-2026-07-26]].
+
+**What "supporting existing models" means concretely, starting now**: [Qwen3.8-Flash-Next](https://qwen.ai/blog?id=qwen3.8-flash-next)
+(released 2026-08-26, Alibaba's own framing: an early, open-weight preview of the Qwen4 architecture —
+see [QWEN4_PREVIEW_REFERENCE.md](QWEN4_PREVIEW_REFERENCE.md) for verified facts and sourcing) is the
+first concrete target. It is a 125B-total/6B-active MoE with a 51B-parameter n-gram embedding table and
+a Gated-DeltaNet/Qwen-Sparse-Attention hybrid — far outside anything this engine can train, so the
+engagement is **read its real released weights as a correctness oracle for mechanisms this engine
+implements at its own scale**, not attempt to train or fully run the model. Concretely: extract real
+tensors for one Gated DeltaNet layer and the n-gram embedding table, compute reference activations from
+the real published module logic, and gate Sub0Llm's own from-scratch implementations of those mechanisms
+on numeric agreement with that real reference — a strictly stronger correctness check than the
+synthetic-only gradient checks the engine has relied on so far (see AGENTS.md §6 and the depth-attention
+precedent, [[depth-attention-stage0-done]], for why a gradient check alone cannot validate a new op).
+
 ## Thesis
 
 A dense model's parameters pay for two different things that scale very differently: **world
