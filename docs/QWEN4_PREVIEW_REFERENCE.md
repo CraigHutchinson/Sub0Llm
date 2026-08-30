@@ -368,7 +368,13 @@ Stage-1 fixtures from real Qwen weights are the actual correctness gate here.
   checkpoint fields (additive, per AGENTS.md §3) if the recurrent state is meant to persist across
   generation steps like the KV cache does. Scope Stage 2's CPU forward (no training, no cache) first, gate
   against `tests/fixtures/qwen4_preview/gdn_layer0_small_*`, before committing to a backward-pass or
-  cache design.
+  cache design. **Design + in-engine config skeleton landed** (branch `feature/gated-deltanet-design`,
+  2026-08-31) — see `docs/GATED_DELTANET.md` for the verified recurrence (re-sourced from the real
+  `Qwen4ExpTextGatedDeltaNet` once this doc's own Stage 0/1 landed, superseding that design doc's
+  Qwen3-Next-proxy first draft), the checkpoint/arena-sizing design (a second, additive
+  `ARCH_FINGERPRINT2` word — the first one had zero spare bits left), and why the `Node`-fanout wall depth
+  attention hit does NOT reappear here. That doc's own "Stage 1" (CPU forward, no backward) is next,
+  gated on the `gdn_layer0_small_*` fixture above.
 - **QSA** — real code and config now in hand (see above), but no fixture yet; not scheduled ahead of the
   other two per the original scope decision (block-sparse attention's benefit is long-context latency,
   not this engine's current focus).

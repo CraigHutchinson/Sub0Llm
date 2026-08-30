@@ -106,6 +106,15 @@ bool save_model(const char* path) {
     // fingerprint so a reader of either older vintage is unaffected.
     const std::uint64_t arch = ARCH_FINGERPRINT;
     os.write((const char*)&arch, sizeof(arch));
+    // Third trailing record, same additive discipline: the SECOND architecture fingerprint word
+    // (layout.hpp's ARCH_FINGERPRINT2 -- currently only Gated DeltaNet's stride, always 0 today; see
+    // docs/GATED_DELTANET.md). Appended after ARCH_FINGERPRINT so a reader built before this field
+    // existed simply stops reading one record earlier, unaffected -- and a file written before this
+    // field existed reads back below as "no trailer", which load_model treats as 0 (no GDN), the only
+    // architecture that has ever actually existed, not a guess the way ARCH_FINGERPRINT_LEGACY's
+    // "un-looped" inference had to be.
+    const std::uint64_t arch2 = ARCH_FINGERPRINT2;
+    os.write((const char*)&arch2, sizeof(arch2));
     return os.good();
 }
 
@@ -204,6 +213,27 @@ bool load_model(const char* path) {
                              "--depth-attn-stride.");
         return false;
         }
+    }
+    // Third trailing record (see save_model): the second architecture fingerprint word. UNLIKE the two
+    // trailers above (both hard-required now, per their own comments), this one IS still tolerant of a
+    // short/missing read -- it is brand new, so every file on disk today predates it, and "no trailer"
+    // correctly means arch2 == 0 (no Gated DeltaNet), not "unknown, no guard" the way a genuinely
+    // ambiguous legacy field would. A short-but-nonzero read (some bytes, not all 8) is real corruption,
+    // not a legacy file, and is still rejected.
+    std::uint64_t arch2 = 0;
+    is.read((char*)&arch2, sizeof(arch2));
+    const auto arch2_got = static_cast<std::streamsize>(is.gcount());
+    if (arch2_got != 0 && arch2_got != static_cast<std::streamsize>(sizeof(arch2))) {
+        std::println(stderr, "error: model file is truncated (partial architecture-v2 trailer) -- retrain it");
+        return false;
+    }
+    if (arch2 != ARCH_FINGERPRINT2) {
+        const ArchAxes2 got2 = arch_axes2_of(arch2);
+        std::println(stderr, "error: model was built with a different Gated DeltaNet layer schedule than "
+                             "this binary: file gdn full-attn stride {} | this build stride {} (0 = off, "
+                             "the only value either side can currently take -- docs/GATED_DELTANET.md).",
+                     got2.gdn_full_attn_stride, GDN_FULL_ATTN_STRIDE);
+        return false;
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
     return true;

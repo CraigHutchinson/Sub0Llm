@@ -214,3 +214,72 @@ TEST_CASE("depth-attention schedule is correct at the shapes that matter", "[lay
     check(sub0::DEPTH_SCHEDULE);
     REQUIRE(sub0::DEPTH_SCHEDULE.slots == sub0::DEPTH_CACHE_MAX);
 }
+
+// --- Gated DeltaNet -- DESIGN + Stage 0 skeleton only (docs/GATED_DELTANET.md) ------------------
+// No forward/backward op exists yet (layout.hpp's static_assert refuses any nonzero
+// GDN_FULL_ATTN_STRIDE at compile time), so there is nothing here to gradient-check or run at
+// production dims. What Stage 0 DOES add -- the per-layer classification schedule and the second
+// fingerprint word -- is pure compile-time bookkeeping, and per AGENTS.md S7 it is pinned at TWO
+// shapes, not one: an 8-layer count divisible by the stride and an 11-layer (ODD) count that is not,
+// mirroring the exact lesson that caught LoopSplit's head/tail static_assert only at odd N_LAYERS.
+TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them odd/ragged", "[layout][gdn]") {
+    // Shape 1: 8 layers, stride 4 -- the Qwen3-Next/Qwen3.5 hybrid ratio (3x GDN -> 1x full attention),
+    // divides evenly into two groups. Full attention lands at layers 3 and 7.
+    constexpr auto s8 = sub0::gdn_schedule_for<8>(4);
+    static_assert(s8.gdn_layers == 6);
+    static_assert(!s8.full_attn[0] && !s8.full_attn[1] && !s8.full_attn[2] && s8.full_attn[3]);
+    static_assert(!s8.full_attn[4] && !s8.full_attn[5] && !s8.full_attn[6] && s8.full_attn[7]);
+    REQUIRE(s8.gdn_layers == 6);
+
+    // Shape 2: 11 layers (ODD, does NOT divide by stride 3) -- the ragged case. Full attention lands at
+    // layers 2, 5, 8; the trailing partial group (layers 9, 10) never reaches stride-1, so both stay GDN.
+    constexpr auto s11 = sub0::gdn_schedule_for<11>(3);
+    static_assert(s11.gdn_layers == 8);
+    static_assert(s11.full_attn[2] && s11.full_attn[5] && s11.full_attn[8]);
+    static_assert(!s11.full_attn[9] && !s11.full_attn[10]);
+    REQUIRE(s11.gdn_layers == 8);
+
+    // Stride 0 is OFF at any layer count: every layer stays full (ordinary softmax) attention -- today's
+    // only architecture, and the only one either shape above can actually be built with right now.
+    constexpr auto off8  = sub0::gdn_schedule_for<8>(0);
+    constexpr auto off11 = sub0::gdn_schedule_for<11>(0);
+    static_assert(off8.gdn_layers == 0 && off11.gdn_layers == 0);
+    for (bool b : off8.full_attn)  REQUIRE(b);
+    for (bool b : off11.full_attn) REQUIRE(b);
+
+    // ...and this build's own schedule (necessarily stride 0 today) agrees.
+    static_assert(sub0::GDN_SCHEDULE.gdn_layers == 0);
+    for (bool b : sub0::GDN_SCHEDULE.full_attn) REQUIRE(b);
+}
+
+// ARCH_FINGERPRINT2 must reproduce 0 at the only value GDN_FULL_ATTN_STRIDE can currently take, and
+// must differ once a nonzero stride is EVER passed to the free function -- the exact same "neutral is
+// bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
+// pins above. Calling arch_fingerprint2() directly (rather than requiring an actual GDN build) is what
+// makes this testable at all while the static_assert in layout.hpp forbids ever compiling one.
+TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[layout][gdn]") {
+    REQUIRE(sub0::arch_fingerprint2(0) == 0);
+    REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);              // this build's own word: always 0 today
+    REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
+
+    // A nonzero stride MUST differ, or a (future) GDN checkpoint would load into a plain build and
+    // silently compute something else -- there is no shape difference to catch it in general (a GDN
+    // layer's parameter count is a different SHAPE from a softmax layer's, but nothing here proves that
+    // holds at every possible dims/stride combination the way GQA's monotonic D_KV substitution does --
+    // see docs/GATED_DELTANET.md's checkpoint-design section for the worked argument).
+    REQUIRE(sub0::arch_fingerprint2(4) != sub0::arch_fingerprint2(0));
+    REQUIRE(sub0::arch_fingerprint2(4) != sub0::arch_fingerprint2(3));
+
+    // Round-trips through the decoder, so the diagnostic can name the mismatched value.
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4)).gdn_full_attn_stride == 4);
+
+    // The reserved high 56 bits stay zero regardless of the low byte's value -- headroom for the NEXT
+    // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
+    REQUIRE((sub0::arch_fingerprint2(0xff) >> 8) == 0);
+
+    // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
+    // a hypothetical GDN stride must not collide, matching how it already handles DEPTH_ATTN_STRIDE.
+    // Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build --
+    // the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is a real,
+    // distinguishing quantity, established above.
+}

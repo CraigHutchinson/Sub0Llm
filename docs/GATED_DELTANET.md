@@ -1,0 +1,574 @@
+# Gated DeltaNet — design, derived from the reference
+
+Status: **DESIGN + Stage 0 skeleton only.** No forward, no backward, no CPU op, no CUDA op. Follows
+`docs/DEPTH_ATTENTION.md`'s structure (that document is the precedent for how a genuinely new op type
+gets threaded through this engine) and `docs/QWEN4_PREVIEW_REFERENCE.md`'s staged plan, which flags this
+as the higher-risk of the two Qwen4-preview mechanisms because this engine's attention today is
+softmax-only with no recurrent-state precedent at all. Per `AGENTS.md` §5, everything mathematical below
+is quoted or worked from the real, verified reference source fetched for this doc — not from recall.
+
+## 0. Sources, and their confidence
+
+**This section was rewritten after the parallel real-weight-extraction work landed on `main`
+(`docs/QWEN4_PREVIEW_REFERENCE.md`, commit `802a3d0`) partway through this pass — its findings supersede
+this doc's first draft, which had sourced the equations from `modeling_qwen3_next.py` (Qwen3-Next) as a
+proxy for the actual Qwen4-preview model. That proxy was reasonable at the time (no better source was in
+hand) but is now known to differ in real, verifiable ways from the actual model (§1's structure below);
+every equation in this section is now sourced from the real thing.**
+
+**Primary, highest-confidence source — the real model's own code, already fetched and verified by that
+parallel work**: `transformers==5.16.1` (mainline PyPI, Apache-2.0, no `trust_remote_code` needed —
+confirmed installed and importable), `transformers/models/qwen4_exp/modeling_qwen4_exp.py`, class
+`Qwen4ExpTextGatedDeltaNet`. This is the actual module `Qwen/Qwen3.8-Flash-Next` ships (`model_type:
+qwen4_exp`, `architectures: Qwen4ExpForConditionalGeneration` — `transformers` itself already calls this
+"Qwen4-Exp", not merely "an architecture Qwen4 will resemble"). Quoted directly below, not paraphrased.
+
+**Real extracted weights and CPU-verified fixtures, already landed at
+`tests/fixtures/qwen4_preview/gdn_layer0_small_*`**: the complete, real weight tensors for
+`model.language_model.layers.0.linear_attn.*` (a full Gated-DeltaNet layer, ~110.6MB, bf16→float32,
+extracted via HTTP Range requests against the real `Qwen/Qwen3.8-Flash-Next` safetensors shards — see
+`gdn_layer0_small_manifest.json`), sliced from `hidden_size=2560 / 16 key heads / 48 value heads` down to
+a commit-sized `hidden_size=32 / 1 key head / 3 value heads` (the real 3× value:key head ratio preserved;
+`head_k_dim = head_v_dim = 128` UNCHANGED — only `hidden_size` and head COUNTS were sliced), then run
+through the real, unmodified `Qwen4ExpTextGatedDeltaNet.forward()` on a reproducible-seed synthetic input.
+**This is now the actual Stage 1 (this doc's numbering — see the staging-terminology note below)
+correctness gate, not a "once it lands" placeholder** — it has landed.
+
+**Secondary sources, corroborating but superseded where they conflict with the above**: Sebastian
+Raschka's Gated DeltaNet writeup and vLLM's/Maxime Labonne's Qwen3-Next/Qwen3.5 write-ups (conceptual
+framing, no exact equations); `modeling_qwen3_next.py` (Qwen3-Next's own module, fetched directly from
+`huggingface/transformers` — a real, close relative, but NOT the model this project targets, and it
+differs from `Qwen4ExpTextGatedDeltaNet` in real, structural ways — see §1c); a `gist.github.com` analysis
+of Qwen3.5's GDN, used only to cross-check.
+
+**Staging-terminology note, to avoid a real collision**: `docs/QWEN4_PREVIEW_REFERENCE.md` uses "Stage 0"
+/"Stage 1" for *reference verification* / *real-weight-fixture extraction* (both DONE, as of that doc's
+own 2026-08-30 update). This doc, following `docs/DEPTH_ATTENTION.md`'s staging convention instead (per
+this pass's own task scope), uses "Stage 0" for the *in-engine config-skeleton* landed this pass, "Stage
+1" for the *future CPU forward implementation*, etc. Both numbering schemes are legitimate for what they
+each track; they are simply two different axes, so a reader should not assume "Stage 1" means the same
+thing in both docs.
+
+## 1. What the reference actually does
+
+### 1a. Construction — `Qwen4ExpTextGatedDeltaNet.__init__`, quoted verbatim
+
+```python
+class Qwen4ExpTextGatedDeltaNet(nn.Module):
+    def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False,
+            kernel_size=self.conv_kernel_size, groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.norm = Qwen4ExpTextRMSNormGated(
+            self.head_v_dim, eps=self.layer_norm_epsilon,
+            activation=config.output_gate_type or config.hidden_act,
+        )
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+```
+
+**The one structural correction from the earlier (Qwen3-Next-sourced) draft of this doc**: projections are
+**FOUR separate linear layers** — `in_proj_qkv` (Q+K+V fused, width `2·key_dim + value_dim`), `in_proj_z`
+(the output gate, alone), `in_proj_b`, `in_proj_a` (the two gate-input scalars, each alone) — not
+Qwen3-Next's `in_proj_qkvz` (Q+K+V+Z all fused) plus `in_proj_ba` (both gate inputs fused). The TOTAL
+parameter count is unaffected (same floats, different grouping — see §3b), but the op-graph shape this
+implies is 4 `Linear` nodes feeding the recurrence, not 2 (§4).
+
+**Real config values** (`gdn_layer0_small_manifest.json`, both the real full-scale config and the
+commit-sized slice used for the fixture):
+
+| Quantity | Full scale (real checkpoint) | Small fixture |
+|---|---|---|
+| `hidden_size` | 2560 | 32 |
+| `linear_num_key_heads` | 16 | 1 |
+| `linear_num_value_heads` | 48 | 3 |
+| `linear_key_head_dim` / `linear_value_head_dim` | 128 / 128 (**equal**) | 128 / 128 (unchanged) |
+| `linear_conv_kernel_dim` | 4 | 4 (unchanged) |
+| `hidden_act` / `output_gate_type` | `silu` / `sigmoid` | same |
+
+Two facts this resolves that the earlier draft had flagged as open:
+- **`head_k_dim == head_v_dim` in the real model** (both 128) — confirming this project's simplifying
+  reuse of a single `D_HEAD` for both (§3a) holds for the real architecture too, not just as a
+  convenience.
+- **`num_v_heads / num_k_heads == 3` exactly**, matching the "3×" ratio `docs/QWEN4_PREVIEW_REFERENCE.md`
+  independently verified from `config.json`.
+
+### 1b. Gates and the delta-rule recurrence — `forward`, quoted verbatim (no-cache/prefill path)
+
+```python
+beta = b.sigmoid()
+g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+if self.num_v_heads // self.num_k_heads > 1:
+    query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+    key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+...
+core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+    query, key, value, g=g, beta=beta, initial_state=recurrent_state,
+    output_final_state=cache_params is not None, use_qk_l2norm_in_kernel=True, ...
+)
+...
+core_attn_out = self.norm(core_attn_out, z)   # RMSNormGated: norm(x) * act(gate)
+output = self.out_proj(core_attn_out)
+```
+
+`α_t = -exp(A_log) · softplus(a_t + dt_bias)` (always ≤ 0), `g_t = exp(α_t) ∈ (0, 1]` — a genuine decay,
+never growth; `β_t = σ(b_t) ∈ (0, 1)`. `A_log`/`dt_bias` are learned, **one scalar per V-head**
+(`nn.Parameter(torch.ones(num_v_heads))`); `a_t`/`b_t` are per-token, per-V-head activations from
+`in_proj_a`/`in_proj_b`.
+
+**This resolves the earlier draft's flagged uncertainty about state head-grouping, with real code, not
+inference**: `query.repeat_interleave(num_v_heads // num_k_heads, dim=2)` — Q and K are explicitly
+broadcast UP from `num_k_heads` to `num_v_heads` (repeating each K/Q head across its group of V-heads,
+GQA-style but inverted relative to this project's own softmax-attention convention — see §3a's table)
+**before** the recurrence runs. So internally, the recurrence itself operates uniformly at
+`num_v_heads` head-granularity — the recurrent state genuinely is `[num_v_heads, head_k_dim,
+head_v_dim]` per batch item, with repeated (not distinct) K/Q values across a group. This confirms §2/§3's
+existing `N_HEADS`-per-state-head design was the right call, now on real evidence rather than inference
+from a proxy model's tensor-shape comments.
+
+The exact per-chunk recurrence (`torch_chunk_gated_delta_rule`'s inner loop, quoted verbatim — this
+IS the delta rule: `v_new` is the error-correction term, "how wrong the state's current prediction is"):
+
+```python
+for i in range(0, total_sequence_length // chunk_size):
+    q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+    attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+    v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+    v_new = v_i - v_prime
+    attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+    core_attn_out[:, :, i] = attn_inter + attn @ v_new
+    last_recurrent_state = (
+        last_recurrent_state * g[:, :, i, -1, None, None].exp()
+        + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+    )
+```
+
+`v_new = v_i − v_prime` is EXACTLY the delta-rule error correction this mechanism is named for, done for
+a whole chunk of positions at once via `k_cumdecay` (a cumulative-decay-weighted `k`) instead of one
+token's `kv_mem` at a time; `attn`/`decay_mask` form the intra-chunk (within this chunk, causal,
+decay-weighted) contribution and `attn_inter` the inter-chunk (this chunk's queries reading the state
+carried in from all *previous* chunks) contribution — a genuinely chunk-parallel (dense matmul) form of
+the same recurrence,
+now backed by the real code rather than a secondary analysis. **No explicit `1/√d_k` scale appears
+anywhere in this recurrence** — confirming (not just conjecturing, as the earlier draft had to) that Q/K
+enter already L2-normalized (`use_qk_l2norm_in_kernel=True` above) and need no further rescaling.
+
+### 1c. Short causal conv and output gating, quoted verbatim
+
+The real conv is depthwise (`groups=conv_dim`), applied to the concatenated Q|K|V (never Z), with
+**causal padding baked into the conv itself** (`padding=conv_kernel_size - 1`, left-padding effectively,
+since the output is later truncated to the input length) rather than a separate masking step:
+```python
+self.conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False,
+                         kernel_size=self.conv_kernel_size, groups=self.conv_dim,
+                         padding=self.conv_kernel_size - 1)
+```
+Output gating: `core_attn_out = self.norm(core_attn_out, z)` where `norm` is `Qwen4ExpTextRMSNormGated(
+self.head_v_dim, ...)` — **RMSNorm's learned weight is `[head_v_dim]` (128 at full scale), shared across
+all `num_v_heads` heads, not one weight per output channel across the full `value_dim`.** This is a real
+correction from the earlier draft (which had assumed a `D_MODEL`-wide norm weight by analogy with a
+plain post-attention LayerNorm) and matters directly for §3b's PARAM_FLOATS arithmetic. It is also, by
+direct structural analogy, the SAME convention this project's own `QNorm`/`KNorm` already use
+(`layout.hpp`: `add(1, D_HEAD, PKind::QNorm, ...)` — one `[1, D_HEAD]` weight, shared across heads, not
+one weight per full-width channel) — a real, load-bearing precedent already in this codebase for exactly
+this shape of parameter.
+
+### 1d. Cached (decode) convolution state
+
+Not directly re-verified against `modeling_qwen4_exp.py` this pass (the fixture work above targeted the
+no-cache/prefill path only), but the general Mamba2-lineage convention — a `[batch, conv_dim,
+conv_kernel_size - 1]` fixed-size ring buffer for the short causal conv's state, alongside the
+`[batch, num_v_heads, head_k_dim, head_v_dim]` recurrent state itself — is architecturally required for
+single-token decode regardless of the exact class name, and is the shape §2 designs the arena/memplan
+interaction around.
+
+### 1e. What is genuinely NOT re-verified this pass
+
+The real `Qwen4ExpTextGatedDeltaNet.forward()`'s *cached* (single-token decode) branch and its exact
+`torch_recurrent_gated_delta_rule`-equivalent were not re-quoted from `modeling_qwen4_exp.py` directly —
+only the no-cache/prefill path the fixture actually exercises (§1b) was. Given `torch_chunk_gated_delta_rule`
+above is confirmed to reduce to exactly the delta-rule/decay/error-correction shape this doc always
+described, and Qwen3-Next's own decode-time `torch_recurrent_gated_delta_rule` (quoted in this doc's first
+draft, §1a there) is definitionally the token-at-a-time unrolling of the identical recurrence, treating it
+as representative of `modeling_qwen4_exp.py`'s own decode path is a reasonable working assumption for
+design purposes — but Stage 1 (this doc's numbering) should re-fetch and re-quote
+`modeling_qwen4_exp.py`'s actual decode branch directly before relying on it byte-for-byte, per AGENTS.md
+§5's standing rule.
+
+## 2. Interaction with this engine's KV-cache / arena model
+
+This engine's only existing "carries information across positions" primitive is the softmax-attention KV
+cache: `kv_krow_ptr(layer, pos)` / `kv_vrow_ptr(layer, pos)` (`core.hpp`) return pointers into a per-
+(layer-or-execution, position) row store that **grows with T** — `[B, N_KV_HEADS, T, D_HEAD]`, sized by
+`SEQ_LEN` at compile time (`memplan.hpp`'s persistent-buffer terms). Gated DeltaNet's "cache" is
+structurally a different SHAPE of thing, not a bigger or smaller version of the same shape:
+
+| | softmax-attention KV cache | Gated DeltaNet recurrent state |
+|---|---|---|
+| grows with T? | yes — one row per position, up to `SEQ_LEN` | **no** — one `[d_k, d_v]` matrix per (batch, head), full stop |
+| read pattern | every later position reads every earlier row | only ever read/written by the NEXT position; nothing before it is retained after the update |
+| memory at decode | `O(B · N_KV_HEADS · T · D_HEAD)` | `O(B · N_HEADS · D_HEAD²)` (using this project's mapping — see §3) — **independent of T** |
+| memplan today | `Dims.exec_layers`-scaled persistent term already exists | no equivalent term exists yet |
+
+This is exactly `docs/QWEN4_PREVIEW_REFERENCE.md`'s summary ("O(1) per token... replacing the O(n) KV
+cache") made concrete against this codebase: the *conv_state* (§1d, `[B, conv_dim, K_conv-1]`) and the
+*recurrent state* (`[B, N_HEADS, D_HEAD, D_HEAD]`, see §3's mapping) are BOTH fixed-size, and neither one
+is expressible as a `kv_krow_ptr`/`kv_vrow_ptr`-style per-position row store. They need their own arena
+slot, sized once at configure time exactly like the existing KV cache is, but keyed by `(batch, head)`
+only — never by position.
+
+**Per AGENTS.md §1 (no heap allocation in hot paths), the state buffer must be a pre-sized arena slot
+that the recurrence *overwrites in place* every position, not something that grows.** Concretely, for a
+future Stage 1:
+- **Training** (batched forward over `[batch, seq]`, this engine's existing convention per `op_attn`
+  above): the state buffer is transient PER FORWARD CALL, sized `[batch, N_HEADS, D_HEAD, D_HEAD]` (or
+  `[max_rows_per_window, ...]` under this engine's row-major batched-window convention), and is fully
+  consumed within one `op_gdn`-style call the same way `op_attn`'s `[H,T,T]` softmax-probability scratch
+  (`out->scratch`, §4) is — allocated once from the arena, written and read entirely inside the op, never
+  retained across calls. This is a `train_scratch_bytes`-style term (`memplan.hpp`), not a
+  `persistent_bytes` one.
+- **Decode** (`forward_one`/`kv_reset`, this engine's existing incremental-inference convention): THIS is
+  where the state genuinely persists across calls, the same way the KV cache does — `kv_reset()` would
+  need to zero the GDN state (its correct "start of a fresh generation" value, since a freshly-reset state
+  encodes no history, exactly like an empty KV cache) alongside whatever it already resets, and each
+  `forward_one` call would update it in place. This is a `persistent_bytes`-style term, and unlike the KV
+  cache it does **not** grow with `SEQ_LEN` — a genuinely new, small, constant addition to the resident
+  footprint regardless of context length, which is the entire architectural point of this mechanism.
+- **LoopSplit interaction, resolved by an existing precedent**: `core.hpp`'s own doc comment on
+  `kv_krow_ptr` already establishes that a looped middle layer's KV history is kept **per EXECUTION, not
+  per LAYER** ("`layer` is an EXECUTION index... a repeated middle layer runs several times per token and
+  EACH EXECUTION keeps its own K/V history"). The natural, consistent choice for a GDN state buffer under
+  LoopSplit is the same: `LOOP_EXEC_COUNT` independent state slots (one per execution of a GDN layer),
+  not one slot shared and mutated across passes. Nothing in the real Qwen reference informs this choice —
+  Qwen3-Next has no LoopSplit — so this is this engine's own design decision, made for consistency with
+  the KV-cache precedent it already lives next to, not derived from the reference.
+
+**A quantified comparison at a representative shape** (d448 L11 H7, using this project's own
+`kv_krow_ptr` doc's D_KV convention and this section's `N_HEADS`/`D_HEAD` mapping, batch 1, fp32, one
+GDN layer): the KV cache for ONE softmax layer at `SEQ_LEN=512` is `512 · D_KV · 4 B` per tensor (K and V)
+≈ `512 · 448 · 4 ≈ 917 KB` (at `N_KV_HEADS == N_HEADS`, i.e. `D_KV == D_MODEL`), growing linearly with
+context; the GDN recurrent state for the SAME layer is `N_HEADS · D_HEAD · D_HEAD · 4 B = 7 · 64 · 64 · 4
+≈ 115 KB`, **flat regardless of context length** — already smaller at 512 tokens, and the gap widens
+without bound as context grows. This is the concrete shape of the "O(1) vs O(n)" claim at this project's
+own dims, not just the abstract complexity statement.
+
+## 3. Checkpoint / PARAM_FLOATS design
+
+### 3a. Which of this project's existing axes to reuse, and which are genuinely new
+
+Per AGENTS.md §8 ("only add the surface area actually consumed"), the design below reuses every
+dimension this engine already has rather than inventing a parallel set:
+
+| Reference quantity | This project's mapping | Reused from |
+|---|---|---|
+| `head_k_dim` (Q, K width per head) | `D_HEAD` | existing |
+| `num_k_heads` (Q, K head count) | `N_KV_HEADS` | existing (GQA axis) |
+| `head_v_dim` (V, Z width per head) | `D_HEAD` | existing |
+| `num_v_heads` (V, Z head count) | `N_HEADS` | existing |
+| Q, K total width (`key_dim`) | `D_KV` (`= N_KV_HEADS · D_HEAD`) | existing, **already named** |
+| V, Z total width (`value_dim`) | `D_MODEL` (`= N_HEADS · D_HEAD`) | existing, **already true by construction** |
+| conv kernel size | `GDN_CONV_KERNEL` (new, but a fixed `constexpr int`, not a CLI flag — see below) | new, minimal |
+| which layers are GDN | `GDN_FULL_ATTN_STRIDE` (Stage 0, already landed) | new |
+
+`GDN_CONV_KERNEL` is deliberately **not** exposed as a CLI flag yet, per AGENTS.md §8 — Stage 0 has no op
+to consume it, and the real model's own verified value (`linear_conv_kernel_dim = 4`, §1a's table, both at
+full scale and in the fixture — not a placeholder) is the obvious fixed starting point once Stage 1 needs
+an actual number; making it sweepable is a later decision to make WITH a working op to measure, not before
+one exists. Note the head-count mapping is the **inverse** of this engine's existing GQA convention: GQA
+narrows K/V relative to a wider Q (`N_HEADS ≥ N_KV_HEADS` heads for Q, fewer for K/V); GDN narrows Q/K
+relative to a wider V/Z (`N_HEADS` heads for V/Z, `N_KV_HEADS` — potentially fewer — for Q/K). Reusing the
+SAME two integers for both is intentional (no third head-count axis needed) but the direction of the
+inequality one would sanity-check against does not carry over between the two mechanisms — worth flagging
+explicitly so Stage 1 does not transplant a GQA-shaped assumption (e.g. "Q is always the wide one") into
+GDN code.
+
+### 3b. Per-layer PARAM_FLOATS delta, worked from `layout.hpp`'s actual existing terms
+
+A softmax-attention layer's mixer parameters today (`layout.hpp`'s `make_param_layout`, ignoring the
+shared `Ln1`/`Ln2`/FFN terms which do not change under this proposal):
+```
+  Wq + Wo  = 2 · D_MODEL²
+  Wk + Wv  = 2 · D_MODEL · D_KV
+  [+ QNorm + KNorm = 2 · D_HEAD, only if USE_QK_NORM]
+```
+A GDN layer's mixer parameters, using §3a's mapping and the REAL 4-way projection split verified in §1a
+(`in_proj_qkv` = Q+K+V fused, at `D_KV` width for Q/K and `D_MODEL` width for V; `in_proj_z` = the output
+gate, `D_MODEL` wide; `in_proj_b`/`in_proj_a` = the two gate-input scalars, `N_HEADS` wide each — one
+scalar per V-head, same TOTAL floats as a fused `in_proj_ba` would cost, just two separate tensors rather
+than one):
+```
+  in_proj_qkv  = D_MODEL · (2·D_KV + D_MODEL)
+  in_proj_z    = D_MODEL · D_MODEL
+  in_proj_b + in_proj_a = 2 · D_MODEL · N_HEADS
+  conv1d       = (2·D_KV + D_MODEL) · (GDN_CONV_KERNEL + 1)     [+1 for the per-channel bias]
+  A_log + dt_bias = 2 · N_HEADS
+  norm (RMSNormGated) weight = D_HEAD          [per §1c: shared across heads, NOT D_MODEL-wide --
+                                                 corrected from this doc's first draft using the real
+                                                 fixture's weight_norm shape [128] == head_v_dim]
+  out_proj     = D_MODEL²
+```
+(`in_proj_qkv + in_proj_z` together total `D_MODEL·(2·D_KV + 2·D_MODEL)`, the same combined width
+Qwen3-Next's single fused `in_proj_qkvz` would have — confirming the real model's 4-way split changes the
+OP-GRAPH shape (§4) but not the total parameter count relative to what this doc's first draft assumed.)
+
+Net delta (GDN minus softmax-attention, `Wq/Wo` vs `out_proj`/`in_proj_z`, `Wk/Wv` vs the `D_KV` term in
+`in_proj_qkv` both cancelling algebraically):
+```
+  Δ = 2·D_MODEL·N_HEADS + (2·D_KV + D_MODEL)·(GDN_CONV_KERNEL + 1) + 2·N_HEADS + D_HEAD
+      [− 2·D_HEAD, if USE_QK_NORM was on — GDN's own Q/K L2-norm has no learned γ at all, §1c,
+       netting the D_HEAD terms to ZERO in that case rather than a further reduction]
+```
+At this project's d448 L11 H7 shape (`D_MODEL=448, N_HEADS=7, D_HEAD=64, D_KV=448` at `N_KV_HEADS==
+N_HEADS`, `GDN_CONV_KERNEL=4`, confirmed as the real model's own value in §1a's table, not a placeholder),
+`Δ ≈ 2·448·7 + (2·448+448)·5 + 14 + 64 − 128 ≈ 6272 + 6720 + 14 + 64 − 128 = 12,942` floats per converted
+layer. Regardless of the exact number, `Δ` is small but real and strictly positive at every dimension
+combination this project would actually configure (`D_MODEL, N_HEADS, D_KV, GDN_CONV_KERNEL` all
+positive), so **PARAM_FLOATS will differ between a GDN build and a non-GDN build at matching dims in
+every practically reachable case.**
+
+**A genuine, unresolved dimensional-convention mismatch worth flagging for Stage 1, found by trying to
+apply this same arithmetic to the real fixture's own shape rather than a synthetic one**: the real
+fixture's `hidden_size=32` with `head_v_dim=128, num_v_heads=3` does NOT satisfy `hidden_size ==
+num_v_heads · head_v_dim` (`3 · 128 = 384 ≠ 32`) — the real GDN module never assumes `hidden_size ==
+num_heads · head_dim` the way this project's `D_MODEL == N_HEADS · D_HEAD` always does; `key_dim`/
+`value_dim` are independent PROJECTIONS from `hidden_size`, not a reshape OF it. §3a's mapping (reusing
+`D_HEAD`/`N_HEADS`/`N_KV_HEADS` directly, which implicitly assumes `D_MODEL == N_HEADS · D_HEAD`) is true
+for every dims combination this project's own softmax attention currently configures — that equality is
+an invariant of THIS project's attention layout, not a general truth about GDN — but Stage 1 should treat
+it as an assumption this project's mapping carries in, not a property GDN itself requires, especially once
+real-weight parity testing tries to reproduce the small fixture's own (non-conforming) shape exactly.
+
+### 3c. Why that is not enough on its own — the design decision already landed in Stage 0
+
+AGENTS.md §3's rule 1 asks: does an EXISTING field already discriminate this axis, "confirmed by working
+through the actual arithmetic, not assumed"? §3b's arithmetic says PARAM_FLOATS differs in every
+*practically reachable* configuration — but unlike GQA's `D_KV` substitution (which the existing
+`ARCH_FINGERPRINT` comment calls out as "strictly monotonically in N_KV_HEADS, so no collision is
+possible" — a proof, not an observation), §3b's `Δ` is a sum of several independent terms with different
+signs and no monotonicity argument tying it to a single knob. Nothing rules out some `(D_MODEL, N_HEADS,
+D_KV, GDN_CONV_KERNEL, N_LAYERS, GDN_FULL_ATTN_STRIDE)` combination where a GDN-converted model happens to
+land on the exact same total float count as some *other* build's plain-attention model — the classic
+"same SIZE, different COMPUTATION" case `ARCH_FINGERPRINT` exists specifically to catch (its own doc
+comment's ROPE_THETA example is exactly this shape of risk).
+
+So per AGENTS.md §3 rule 2, GDN's layer schedule joins the fingerprint mechanism **in addition to**
+relying on PARAM_FLOATS, as belt-and-braces rather than either alone. This is already implemented
+(Stage 0, this pass): `include/sub0/layout.hpp`'s `ARCH_FINGERPRINT2`/`GDN_FULL_ATTN_STRIDE`/
+`GDN_SCHEDULE`.
+
+**The concrete discovery that shaped the implementation**: `ARCH_FINGERPRINT` (the existing word) has
+**zero spare bits** — `8 (depth_attn_stride) + 8 (middle_layers) + 16 (repeats) + 32 (rope_theta) = 64`,
+worked through explicitly rather than assumed, exactly as AGENTS.md §3 requires. Shrinking any existing
+field to make room would either break `ROPE_THETA`'s exact `bit_cast` round-trip (needs all 32 bits) or
+cap `LOOP_REPEATS` below a value some future run might actually want (16 bits is already tight). Per
+AGENTS.md §3's stated preference for an "ADDITIVE, gracefully-degrading format... over reshuffling
+existing fields," the design is a **second, wholly new fingerprint word** (`ARCH_FINGERPRINT2`) rather
+than a repack of the first — and, having been burned once by a word with no headroom, this one is
+deliberately built with 56 *reserved* spare bits from day one (only the low byte is assigned, to
+`gdn_full_attn_stride`), so the *next* shape-neutral, computation-changing axis after this one does not
+repeat the exact scramble that produced `ARCH_FINGERPRINT`'s own "the byte middle_layers was never able
+to reach" situation.
+
+**On-disk plumbing, additive at every point that already existed, per AGENTS.md §3 rule 2's own
+precedent**:
+- `engine_core.cpp`'s `model.bin`: a **third** trailing 8-byte record, after the existing tokenizer
+  fingerprint and `ARCH_FINGERPRINT` trailers. Tolerant of a short/missing read (every file on disk today
+  predates this field, and "no trailer" correctly decodes to `0` — no GDN — because that is the only
+  architecture that has ever existed, not a guess the way `ARCH_FINGERPRINT_LEGACY`'s "assume un-looped"
+  inference had to be for pre-LoopSplit files).
+- `train_stage.cpp`'s `.ckpt`: `CKPT_VERSION` bumped 6→7 to add the same word. Safe by this format's own
+  existing contract — `load_checkpoint` refuses on ANY version mismatch and starts a fresh run rather than
+  attempting a partial/misaligned read, exactly the trade every prior version bump (2 through 6) already
+  made; an in-flight v6 checkpoint is not corrupted by rebuilding to v7, only not resumed.
+- `registry.hpp`'s `RunConfig`: one new `SUB0_RUN_CONFIG_FIELDS` row (`gdn_full_attn_stride`), which
+  self-propagates to `config.json` read/write/describe and to `MODEL_ARCH_ID` (via `ArchAxes2`/
+  `arch_fingerprint2`) with no hand-written second copy, per that file's own stated design intent.
+
+**One honestly-reported side effect**: `MODEL_ARCH_ID` (the model-registry identity hash, `layout.hpp`)
+now mixes in `ARCH_FINGERPRINT2`/`GDN_FULL_ATTN_STRIDE`, and because its FNV-1a `mix()` helper perturbs
+the hash on every call regardless of the value passed (XOR-with-zero is a no-op, but the subsequent
+`h *= prime` is not), `MODEL_ARCH_ID`'s numeric value has shifted for every pre-existing build even
+though GDN is off. This is not new behavior introduced by this change — the exact same thing happened
+when `DEPTH_ATTN_STRIDE` was added to `MODEL_ARCH_ID`'s mix — and `MODEL_ARCH_ID`'s own doc comment
+already establishes why it is safe: it is "a DIAGNOSTIC check... the actual load-time gate is
+engine_core.cpp's binary Header comparison, which is authoritative regardless of what this says." The
+real, checkpoint-critical fingerprints (`ARCH_FINGERPRINT`, `ARCH_FINGERPRINT2`) are the ones proven
+bit-identical at neutral in `layout_tests.cpp`; `MODEL_ARCH_ID` shifting is a cosmetic registry-naming
+consequence, not a correctness regression.
+
+## 4. The `Node`-fanout question — resolved, and differently than depth attention's
+
+`docs/DEPTH_ATTENTION.md` §5a hit a real wall here: `Node`'s fixed `a`/`b`/`w`/`bias` fanout could not
+express a variable-length, cross-EXECUTION list of (K, V) pairs, and the fix was a `thread_local` side
+table outside `Node` entirely. **Gated DeltaNet does not hit the same wall**, and the reason is
+structural, not incidental: DepthAttn's extra inputs come from OTHER executions' completed nodes (a
+graph-level, cross-node dependency); GDN's "history" is entirely INTRA-node — a sequential dependency
+across POSITIONS within the SAME forward call, which this engine already has a working, verified pattern
+for.
+
+The load-bearing precedent is `op_attn` itself (`backend_cpu.cpp`):
+```cpp
+static Node* op_attn(Node* q, Node* k, Node* v, int H) {
+    ...
+    Node* out = mk_node(Op::Attn, T, C);
+    out->a = q; out->b = k; out->bias = v; out->heads = H;
+    auto [P, Pg] = arena_alloc((size_t)H * T * T);
+    out->scratch = P;
+    for (int h = 0; h < H; ++h)
+        for (int i = 0; i < T; ++i)          // <-- the causal loop over ALL T positions lives HERE,
+            for (int j = 0; j <= i; ++j)     //     entirely inside this one op, invisible to the
+                ...                          //     Node graph at position granularity
+```
+Attention's O(T²) causal double-loop over positions is entirely internal to one `Op::Attn` node; the
+graph never sees per-position nodes. GDN's O(T) recurrence loop (§1b) is the exact same shape of thing,
+just cheaper (one pass over T, not T²) and with a running scalar/matrix accumulator instead of a growing
+softmax normalizer. Concretely, a future `op_gdn` would take:
+- `a` = the `in_proj_qkv` projection's activation (Q+K+V fused, per §1a's real 4-way split — itself an
+  ordinary `Op::Linear` node upstream, exactly how today's separate `Wq`/`Wk`/`Wv` feed `op_attn`'s three
+  arguments) — or, if a short causal conv (§1c) becomes its own op, the POST-conv activation;
+- `b` = a SECOND node combining `in_proj_b`/`in_proj_a`'s activations (§1a: the real model keeps these as
+  two separate `Linear` layers rather than Qwen3-Next's single fused `in_proj_ba`; this engine could
+  either keep them as two upstream `Op::Linear` nodes and concatenate their outputs into one `b`-sized
+  activation before `op_gdn`, or run `op_gdn` with a genuinely separate fifth conceptual input — `Node`
+  has no fifth slot, so the concatenation-before-the-op route reuses the existing `a`/`b`/`w`/`bias` shape
+  without needing one; Stage 1 should decide this once an actual `op_gdn` signature is being written, not
+  here);
+- `w`/`bias` = available for `in_proj_z` (the output-gate projection, needed by the gated-RMSNorm step,
+  §1c) and/or the recurrence's per-head `A_log`/`dt_bias` leaf parameters — `Node`'s four pointer slots
+  (`a`, `b`, `w`, `bias`) comfortably cover GDN's four/five real inputs where `op_attn`'s three already
+  fit in three of them;
+- `heads` = `N_HEADS` (reusing the field `op_attn` already uses for exactly this purpose);
+- `scratch` = the transient per-forward-call recurrent-state working buffer (§2's training-time
+  scratch term), sized `[batch-rows, N_HEADS, D_HEAD, D_HEAD]`, allocated once from the arena and fully
+  consumed inside the op — the direct analogue of `op_attn`'s own `[H,T,T]` softmax-probability
+  `scratch`.
+
+No new pointer field, no widened `Node`, no side table. **The multi-op pipeline this implies** (mirroring
+how softmax attention itself is `Linear(Wq) + Linear(Wk) + Linear(Wv) + Op::Attn + Linear(Wo)`, a mix of
+generic ops plus one irreducible specialized kernel): `Linear(in_proj_qkv) + Linear(in_proj_z) +
+Linear(in_proj_b) + Linear(in_proj_a) + [a new short-causal-conv op, if it doesn't fit an existing
+primitive] + Op::GatedDeltaNet (the irreducible recurrence) + [a new gated-RMSNorm op, likely a small
+extension of the existing RMSNorm op rather than wholly new] + Linear(out_proj)` — FOUR upstream
+projections now, per §1a's real structure, not the two this doc's first draft assumed from the
+Qwen3-Next proxy. Working out exactly which of the conv/gated-norm steps reuse an existing op vs. need a
+new `Op::` enum value is Stage 1 scope, not this pass's — the point established here is narrower and
+load-bearing: **the one part of this pipeline that is genuinely novel (the recurrence itself) fits
+`Node`'s existing shape without modification**, unlike DepthAttn.
+
+**One real difference from `op_attn` worth flagging for Stage 1's backward design**: `op_attn` retains
+its full `[H,T,T]` probability tensor in `scratch` specifically so backward does not need to recompute
+the forward softmax. A naive GDN backward would want the analogous thing — every intermediate state `S_t`
+for `t = 0..T-1` — which is `O(T · d_k · d_v)` per head, i.e. the SAME order of memory `op_attn`'s own
+`[H,T,T]` scratch already costs (swap which factor is `T`). That is a real cost, not a free lunch, and it
+means GDN's *training-time* memory advantage over softmax attention is smaller than its *inference-time*
+advantage (§2) — the O(1) state is only O(1) once you no longer need yesterday's value for a gradient.
+The established alternative, already this engine's own convention on the CUDA side
+(`docs/DEPTH_ATTENTION.md` §5b's finding 2, `backward_device` "already RECOMPUTES `qkv` per execution"):
+**recompute the state trajectory during backward from the retained inputs, rather than retaining it from
+forward.** This is the natural target for GDN's own backward design once Stage 1 gets there, not
+resolved further in this pass.
+
+## 5. Training-time algorithm: which form Stage 1 should target, and why
+
+The real model itself only ever runs the chunked form (§1b) for anything longer than one cached token —
+§1e already flags that `modeling_qwen4_exp.py`'s own decode-time sequential loop was not directly
+re-quoted this pass, but Qwen3-Next's analogous `torch_recurrent_gated_delta_rule` (this doc's first
+draft, now superseded as the PRIMARY source but still a faithful illustration of the sequential form) pays
+real Python-level per-iteration interpreter overhead, independent of how cheap the underlying tensor op
+is — that is specifically why the reference reserves it for single-token decode and always chunks for
+training/prefill.
+
+**That reason does not transfer to this engine as-is, and the distinction matters.** This project's
+`op_attn` is already a *compiled, tight C++ loop* over `T` positions with no interpreter in the loop body
+— the softmax-attention analogue of "the slow Python path" here is not slow at all; it is the only
+forward this engine has ever shipped. The sequential GDN recurrence (§1b's per-token reading, before
+chunking) is the same shape of thing: `O(T)` total work (one rank-1 state update and one read-out per
+position, each `O(d_k · d_v)`), executed as a compiled loop, with **no algorithmic penalty from being
+"sequential"** — it is not a nested loop the way attention's own causal double-loop is (`O(T²)`, §4's
+quoted code). A naive, faithful, compiled sequential implementation of GDN is therefore not "the toy
+version to get right before the real one" the way it would be in eager PyTorch; it is a plausible
+**production-adequate CPU implementation on its own terms**, at this project's current CPU-only training
+scale.
+
+**Stage 1's recommended target, and the reasoning in order:**
+1. Implement the sequential, token-at-a-time unrolling of §1b's recurrence (`S = g_t·S`,
+   `kv_mem = Sᵀk_t`, `delta = β_t·(v_t − kv_mem)`, `S += k_t ⊗ delta`, `o_t = Sᵀq_t`) as `op_gdn`'s CPU
+   forward. This is a direct token-by-token unrolling of the SAME closed-form update the real chunked
+   code computes (§1b's `v_new`/`attn_inter`/state-update lines reduce to exactly this at chunk size 1) —
+   not a simplification invented for this port — so "verify against the real reference" (AGENTS.md §5)
+   and "get the fast path working first" are the SAME step here, which is not usually true.
+2. **Verify it against the real extracted weights + activations already landed at
+   `tests/fixtures/qwen4_preview/gdn_layer0_small_*`** (§0/§1a) — no longer a future dependency, this is
+   available now. This is the correctness gate, not a numerical-gradient check alone
+   (`docs/QWEN4_PREVIEW_REFERENCE.md`'s own "remember the depth-attention lesson" note applies here too: a
+   no-op recurrence would still pass a naive gradient check). **One thing to verify explicitly when this
+   happens**: the fixture's own output was produced via the CHUNKED path (§1b), not the sequential one —
+   so a Stage 1 CPU forward built on the sequential form and matched against this fixture proves BOTH
+   correctness against the real model AND numerical equivalence between the sequential and chunked forms
+   on a real case, which is a stronger result than either check alone.
+3. The chunked-parallel form (§1b) becomes the real question once a CUDA backend is targeted (a later
+   stage, out of scope here) — its actual benefit is parallelizing across the `C` positions in a chunk
+   using dense matmuls/tensor cores, which matters for GPU throughput and for vectorizing across a large
+   training batch, not for CPU correctness or even CPU throughput at this project's current scale.
+   Adopting it then must be gated on exact numerical agreement with the sequential form from step 1 as
+   the reference implementation to diff against — a re-association of the same recurrence is exactly the
+   kind of change where a subtle reordering bug produces a plausible-looking but wrong result.
+
+This mirrors an existing project precedent directly: `backend_cpu.cpp`'s own softmax attention is a plain
+O(T²) loop today, not FlashAttention-tiled (project memory `attention-kernel-throughput-bottleneck` — the
+tiled form is a documented, *not-yet-done* performance follow-up). Building GDN's simple form first and
+its tiled/chunked form later, gated on numerical parity with the simple one, is the same order of
+operations this project already chose for attention itself.
+
+## 6. Staging
+
+- **Stage 0 — config axes, off by default. DONE, this pass.** `GDN_FULL_ATTN_STRIDE` (int CLI flag,
+  hard-clamped to `{0}` by both the CLI `CLI::Range(0,0)` and a `layout.hpp` `static_assert` — two
+  independent refusals of the one dangerous case, per the project's "guard at the lowest callable seam"
+  standing preference), `USE_GATED_DELTANET` (derived bool, always false today), `GDN_SCHEDULE` (a
+  `gdn_schedule_for<N_LAYERS>(stride)` consteval per-layer classification, unused until Stage 1's
+  `Model::forward` dispatch consumes it — inert compile-time bookkeeping only, the same status
+  `DEPTH_SCHEDULE` had before its own Stage 1), and `ARCH_FINGERPRINT2`/`GDN_FULL_ATTN_STRIDE` folded
+  into `RunConfig` and `MODEL_ARCH_ID` (§3c). Pinned in `tests/layout_tests.cpp` at TWO shapes — 8 layers/
+  stride 4 (divides evenly, the Qwen3-Next ratio) and 11 layers/stride 3 (odd, ragged, does not divide
+  evenly) — per AGENTS.md §7's explicit lesson that a single compiled shape previously hid a real
+  LoopSplit bug at odd layer counts. **Identity gate**: the full default-build test suite went from
+  4,380,812 assertions / 132 test cases to 4,380,848 / 134 — a difference of exactly the 36 assertions in
+  the 2 new GDN test cases added this pass, and not one assertion anywhere else, confirmed by running the
+  suite before and after via `git stash` at the same build. Also re-verified at a second, production-
+  shaped, ODD-layer-count real build (d448 L11 H7 seq512) — the full suite is slow to re-run at that scale
+  end-to-end, but the `[layout][config][gdn][depth]`-tagged subset (10 test cases) passes identically
+  there too, including both new GDN schedule/fingerprint tests.
+- **Stage 1 (not started)** — CPU forward only, per §5's sequential-form target, gated on the real-weight
+  fixtures **already landed** at `tests/fixtures/qwen4_preview/gdn_layer0_small_*`
+  (`docs/QWEN4_PREVIEW_REFERENCE.md`'s own Stage 0/1, DONE 2026-08-30 — see §0's staging-terminology
+  note). In addition to that fixture match, an explicit interim numerical-property check per AGENTS.md §6
+  is still worth adding independently — e.g. that the recurrence genuinely degenerates to plain
+  cumulative summation when `g_t ≡ 1, β_t ≡ 1`, and that a zero-`β` build is provably a no-op update, the
+  same kind of "mutation-tested" property check `docs/DEPTH_ATTENTION.md` §6 used, since a real-weight
+  fixture match alone does not by itself rule out a subtly-wrong implementation that happens to agree on
+  one input (the mutation-testing lesson: a no-op `return v;` can still pass a naive check). No backward
+  pass yet — this doc's own scope boundary, and the natural next boundary after that given §4's finding
+  that backward wants a recompute-based design, not a naive full-trajectory retention.
+- **Stage 2 (not started)** — backward pass (CPU), per §4's recompute-during-backward direction.
+- **Stage 3 (not started)** — CUDA, gated on §5 step 3's chunked-parallel form, itself gated on exact
+  parity with Stage 1's sequential CPU reference.
