@@ -1,6 +1,9 @@
 build/
 out/
 *.bin
+# ...EXCEPT committed test fixtures: small, hand-picked reference (input/weight/output) binaries
+# checked in as ordinary files on purpose, same rationale as .gitattributes' fixture carve-out.
+!tests/fixtures/**/*.bin
 *.log
 *.o
 *.so

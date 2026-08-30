@@ -1,0 +1,100 @@
+{
+  "description": "N-gram (PLE) embedding lookup reference fixture for Qwen4ExpTextNGramEmbedding.forward(input_ids, past_key_values=None), the module injected at decoder layer index 1 (config.ple_layer_ids=[2], one-indexed) via Qwen4ExpTextPLELayer. These are REAL embedding row VALUES read directly (via HTTP range requests against the safetensors shard files, never downloading the full ~102GB table) from the real Qwen/Qwen3.8-Flash-Next checkpoint at the exact row indices the real hashing formula produces for the six hand-chosen test_token_ids below -- not a synthetic/random table.",
+  "source": {
+    "repo": "Qwen/Qwen3.8-Flash-Next",
+    "tensor_name_template": "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{N}.weight",
+    "num_on_disk_shards": 128,
+    "transformers_version": "5.16.1",
+    "module": "transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextNGramEmbedding",
+    "note": "On disk the table is split into 128 row-contiguous shard_N.weight tensors (config.split_ngram_parts=128); transformers concatenates them into one nn.Embedding(320001536, 160) at load time. row_indices below are absolute row numbers into that concatenated table."
+  },
+  "config_real": {
+    "unigram_vocab_size": 248320,
+    "ngram_size": 3,
+    "heads_per_ngram": 8,
+    "ngram_vocab_size_base": 20000000,
+    "ple_embed_dim": 2560,
+    "make_ngram_vocab_size_divisible_by": 128,
+    "seed": 1234,
+    "eos_token_id": 248044,
+    "ngram_heads": 16,
+    "head_dim_per_ngram": 160,
+    "head_vocab_sizes": [
+      20000003,
+      20000023,
+      20000033,
+      20000047,
+      20000059,
+      20000063,
+      20000069,
+      20000077,
+      20000081,
+      20000093,
+      20000107,
+      20000147,
+      20000153,
+      20000159,
+      20000161,
+      20000171
+    ],
+    "head_offsets": [
+      0,
+      20000003,
+      40000026,
+      60000059,
+      80000106,
+      100000165,
+      120000228,
+      140000297,
+      160000374,
+      180000455,
+      200000548,
+      220000655,
+      240000802,
+      260000955,
+      280001114,
+      300001275
+    ],
+    "padded_vocab_size": 320001536,
+    "layer_multipliers": [
+      23703573157769,
+      20109073645365,
+      8052911324071
+    ],
+    "test_tokens": [
+      1543,
+      88123,
+      245000,
+      7,
+      99999,
+      156789
+    ],
+    "context_len": 2
+  },
+  "dtype": "float32 (values) / int64 (ids and indices), little-endian, raw flat binary, row-major (C order)",
+  "shapes": {
+    "token_ids": [
+      6
+    ],
+    "row_indices": [
+      6,
+      16
+    ],
+    "per_head_embed": [
+      6,
+      16,
+      160
+    ],
+    "flattened_embed": [
+      6,
+      2560
+    ]
+  },
+  "notes": [
+    "token_ids: the 6 hand-chosen test tokens (no EOS among them).",
+    "row_indices[pos][head]: absolute row into the flat padded [320001536,160] table used for that (position, head) pair -- 16 heads total (8 bigram heads + 8 trigram heads, ngram_size=3).",
+    "per_head_embed[pos][head][:] == real_table[row_indices[pos][head]] (the raw 160-dim row).",
+    "flattened_embed[pos][:] == per_head_embed[pos].flatten() -- this is exactly the tensor Qwen4ExpTextNGramEmbedding.forward() returns for this input (its final `.flatten(-2)`), BEFORE it is added into the hyper-connection stream by Qwen4ExpTextPLELayer.",
+    "Verified against the REAL module: the row-index hashing formula (splitmix64 layer multipliers, XOR-mixed shifted-token-history, prime-sized per-head vocab, offset) was cross-checked row-for-row against a live Qwen4ExpTextNGramEmbedding instance at small scale (see docs/QWEN4_PREVIEW_REFERENCE.md) since the real vocab (320M rows) cannot be instantiated in RAM here; the row VALUES themselves are the real checkpoint bytes."
+  ]
+}
