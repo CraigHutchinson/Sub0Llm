@@ -191,6 +191,91 @@ static_assert(DEPTH_SCHEDULE.slots == DEPTH_CACHE_MAX,
 static_assert(DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1] <= DEPTH_SCHEDULE.slots,
               "a depth mix can never read more entries than the cache holds");
 
+// --- N-GRAM EMBEDDINGS -- additional per-position features from rolling polynomial-hash token n-grams,
+// added into the input embedding (Nanbeige's `NanbeigeNgramEmbedding`, "concat" fusion mode -- see
+// docs/NGRAM_EMBEDDING.md). NGRAM_MAX_N is the highest n-gram order used (bigrams..NGRAM_MAX_N-grams);
+// 0 (or < 2) is off, and at that setting every expression below is inert and contributes ZERO new
+// parameters. Unlike depth attention, this axis DOES change PARAM_FLOATS (it adds real embedding-table
+// and projection weights) -- classified under layout.hpp's own ARCH_FINGERPRINT rule #1 ("changes a
+// tensor shape -> PARAM_FLOATS already discriminates it, nothing to do"), the same precedent as GQA's
+// D_KV narrowing. So NGRAM_MAX_N/NGRAM_TABLES_PER_ORDER/NGRAM_TABLE_SIZE do NOT join ARCH_FINGERPRINT --
+// but they DO join MODEL_ARCH_ID below, which (per its own doc) covers every axis, shape-changing and
+// computation-changing alike, unconditionally (the same way DEPTH_ATTN_STRIDE's mix there already
+// changes MODEL_ARCH_ID for every build regardless of its value -- an accepted, precedented cost:
+// MODEL_ARCH_ID is a diagnostic/directory-naming identity, not the checkpoint-format gate).
+inline constexpr bool NGRAM_EMBED = (NGRAM_MAX_N >= 2);
+static_assert(NGRAM_MAX_N == 0 || NGRAM_MAX_N >= 2,
+              "NGRAM_MAX_N must be 0 (off) or a real highest order >= 2 (bigrams)");
+static_assert(NGRAM_TABLES_PER_ORDER >= 1, "NGRAM_TABLES_PER_ORDER must be at least 1");
+
+// num_embedders = k tables x (n-1) orders (bigram..n-gram) -- the reference's `k * (n - 1)`. A free
+// function of explicit parameters (not folded straight into a consteval array-builder closed over this
+// build's own constants) so a test can exercise arbitrary hypothetical (max_n, tables_per_order) pairs
+// regardless of what THIS build was configured with -- the same reason DepthScheduleT's
+// depth_schedule_for() above takes its parameters explicitly instead of reading the build's constants.
+inline constexpr int ngram_num_embedders(int max_n, int tables_per_order) {
+    return max_n >= 2 ? tables_per_order * (max_n - 1) : 0;
+}
+inline constexpr int NGRAM_NUM_EMBEDDERS = ngram_num_embedders(NGRAM_MAX_N, NGRAM_TABLES_PER_ORDER);
+static_assert(!NGRAM_EMBED || D_MODEL % NGRAM_NUM_EMBEDDERS == 0,
+              "D_MODEL must be divisible by NGRAM_TABLES_PER_ORDER * (NGRAM_MAX_N - 1) so each "
+              "table's embedding slice (D_MODEL / num_embedders) is an integer width -- the concat-mode "
+              "invariant emb_dim * num_embedders == ngram_hidden_size (here pinned to D_MODEL)");
+inline constexpr int NGRAM_EMB_DIM = NGRAM_EMBED ? D_MODEL / NGRAM_NUM_EMBEDDERS : 0;
+// Never zero-length: a 0-sized std::array is invalid, and both buffer this even when the feature is off
+// (same idiom as DEPTH_CACHE_MAX / forward_one's dep_k/dep_v arrays above).
+inline constexpr int NGRAM_TABLES_BUF    = NGRAM_NUM_EMBEDDERS ? NGRAM_NUM_EMBEDDERS : 1;
+inline constexpr int NGRAM_MAX_SHIFT_BUF = NGRAM_EMBED ? NGRAM_MAX_N - 1 : 1;   // shifts the HIGHEST order needs
+
+// Per-table vocab size: `m + index*2 + 1` -- the reference's `_ngram_embedding_vocab_sizes` NON-prime-
+// forced branch (config default `ngram_mod_force_prime=False`; the prime-forcing branch is not
+// implemented here -- deferred, see docs/NGRAM_EMBEDDING.md's scope note).
+inline constexpr int ngram_vocab_dim(int table_size, int index) { return table_size + index * 2 + 1; }
+// Which highest n-gram order (2..max_n) embedder `index` belongs to -- the reference's
+// `index = (i - 2) * k + j`, inverted.
+inline constexpr int ngram_order_of(int index, int tables_per_order) { return 2 + index / tables_per_order; }
+// The polynomial-hash base -- the reference's `_ngram_hash_base(vocab_size, force_prime=False)`, whose
+// non-force-prime branch is simply the token vocabulary size.
+inline constexpr int NGRAM_HASH_BASE = VOCAB;
+// The multiplier for a context token `shift` positions back (shift = 1..order-1): `power_mod =
+// (power_mod * hash_base) % vocab_dim`, accumulated -- the reference's `_precompute_vocab_mods`.
+// int64_t: hash_base * vocab_dim can briefly exceed int32 range before the mod reduces it.
+inline constexpr std::int64_t ngram_vocab_mod(int table_size, int index, int hash_base, int shift) {
+    const int vocab_dim = ngram_vocab_dim(table_size, index);
+    std::int64_t power = 1;
+    for (int s = 0; s < shift; ++s) power = (power * hash_base) % vocab_dim;
+    return power;
+}
+
+consteval std::array<int, NGRAM_TABLES_BUF> make_ngram_vocab_dims() {
+    std::array<int, NGRAM_TABLES_BUF> out{};
+    for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) out[e] = ngram_vocab_dim(NGRAM_TABLE_SIZE, e);
+    return out;
+}
+inline constexpr std::array<int, NGRAM_TABLES_BUF> NGRAM_VOCAB_DIMS = make_ngram_vocab_dims();
+
+consteval std::array<int, NGRAM_TABLES_BUF> make_ngram_orders() {
+    std::array<int, NGRAM_TABLES_BUF> out{};
+    for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) out[e] = ngram_order_of(e, NGRAM_TABLES_PER_ORDER);
+    return out;
+}
+inline constexpr std::array<int, NGRAM_TABLES_BUF> NGRAM_ORDERS = make_ngram_orders();
+
+// vocab_mods[e][s], s = 0..(order(e)-2): the multiplier for the context token `s+1` positions back.
+// Precomputed once at compile time (order/vocab_dim/hash_base are all constexpr for this build) rather
+// than recomputed every forward() call.
+consteval std::array<std::array<std::int64_t, NGRAM_MAX_SHIFT_BUF>, NGRAM_TABLES_BUF> make_ngram_vocab_mods() {
+    std::array<std::array<std::int64_t, NGRAM_MAX_SHIFT_BUF>, NGRAM_TABLES_BUF> out{};
+    for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) {
+        const int order = NGRAM_ORDERS[static_cast<std::size_t>(e)];
+        for (int s = 0; s < order - 1; ++s)
+            out[e][s] = ngram_vocab_mod(NGRAM_TABLE_SIZE, e, NGRAM_HASH_BASE, s + 1);
+    }
+    return out;
+}
+inline constexpr std::array<std::array<std::int64_t, NGRAM_MAX_SHIFT_BUF>, NGRAM_TABLES_BUF>
+    NGRAM_VOCAB_MODS = make_ngram_vocab_mods();
+
 // ARCHITECTURE FINGERPRINT -- checkpoint identity for axes that PARAM_FLOATS cannot see.
 //
 // The Header and PARAM_FLOATS between them discriminate every axis that changes a tensor SHAPE. They
@@ -283,6 +368,13 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));
     mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(ROPE_SCALE_FACTOR)));
+    // N-gram embeddings: a SHAPE-changing axis (see its own section above), so PARAM_FLOATS already
+    // discriminates it for the checkpoint-load gate and it does NOT join ARCH_FINGERPRINT -- but
+    // MODEL_ARCH_ID covers every axis unconditionally, the same way DEPTH_ATTN_STRIDE's mix above
+    // already changes this value for every build regardless of its setting.
+    mix(static_cast<std::uint64_t>(NGRAM_MAX_N));
+    mix(static_cast<std::uint64_t>(NGRAM_TABLES_PER_ORDER));
+    mix(static_cast<std::uint64_t>(NGRAM_TABLE_SIZE));
     return h;
 }
 inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();
@@ -323,10 +415,12 @@ inline constexpr memplan::Dims current_build_dims() {
 // (q_norm, k_norm) when USE_QK_NORM, then the tail: ln_f alone when USE_TIED_EMBEDDINGS (the head
 // reuses tok_emb, no separate lm_head/lm_bias slot -- the common tied-embedding convention also
 // drops the head bias, matching GPT-2/GGUF-style tied models), else ln_f + lm_head + lm_bias (3).
+// N-gram embeddings add NGRAM_NUM_EMBEDDERS table tensors plus one concat_proj tensor (0 when off).
 inline constexpr int NUM_PARAMS = 1 + (HAS_POS_EMB ? 1 : 0)
                                    + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
                                    + (USE_QK_NORM ? 2 * N_LAYERS : 0)
-                                   + (USE_TIED_EMBEDDINGS ? 1 : 3);
+                                   + (USE_TIED_EMBEDDINGS ? 1 : 3)
+                                   + (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
 
 // Role of each parameter tensor. Lets a backend special-case kinds (e.g. concat the
 // Q/K/V projections into one GEMM, or keep the lm_head full precision) without
@@ -338,8 +432,13 @@ inline constexpr int NUM_PARAMS = 1 + (HAS_POS_EMB ? 1 : 0)
 // QNorm/KNorm only appear when USE_QK_NORM: a [1,D_HEAD] learned gamma applied per-head
 // (shared across heads, same idea as ln1/ln2 but over one head's slice instead of the
 // whole row) to Q/K right after their projection, before RoPE.
+// NgramEmb: one of NGRAM_NUM_EMBEDDERS small hashed-n-gram embedding tables (role like TokEmb, but
+// narrower and NOT the primary embedding). NgramProj: the single learned "concat_proj" linear that
+// projects the concatenated table outputs down to D_MODEL (role like LmHead: a full-precision,
+// AdamW-only GEMM weight -- see is_muon_kind below). Both ABSENT entirely when !NGRAM_EMBED.
 enum class PKind : unsigned char {
-    TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm
+    TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
+    NgramEmb, NgramProj
 };
 
 // One weight tensor: where it lives in the flat blob, its logical [rows x cols]
@@ -400,6 +499,15 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
     if constexpr (!USE_TIED_EMBEDDINGS) {
         add(D_MODEL, VOCAB,   PKind::LmHead, true,  false);  // head stays full precision
         add(1,       VOCAB,   PKind::LmBias, false, false);
+    }
+    // N-gram embeddings: appended at the very end, additively (AGENTS.md 3 rule 2's "trailing
+    // optional" pattern) -- NGRAM_NUM_EMBEDDERS small hashed tables (decay=false, like TokEmb: an
+    // embedding row lookup, not a GEMM) followed by ONE concat_proj GEMM weight (decay=true, ternary=
+    // false -- it stays full precision like LmHead, see is_muon_kind below).
+    if constexpr (NGRAM_EMBED) {
+        for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e)
+            add(NGRAM_VOCAB_DIMS[static_cast<std::size_t>(e)], NGRAM_EMB_DIM, PKind::NgramEmb, false, false);
+        add(D_MODEL, D_MODEL, PKind::NgramProj, true, false);
     }
     return t;
 }

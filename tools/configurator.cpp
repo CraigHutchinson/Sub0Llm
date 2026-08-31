@@ -595,6 +595,9 @@ int main(int argc, char** argv) {
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
+    int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
+    int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
+    int ngram_table_size   = 0;  // N-gram embeddings: per-table vocab size m (0 = auto: VOCAB)
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -651,6 +654,16 @@ int main(int argc, char** argv) {
                    "later executions mix their value vector over (0 = off). Adds no parameters. "
                    "Memory scales as executions/N, so this is the knob that makes it fit -- see "
                    "docs/DEPTH_ATTENTION.md")
+       ->capture_default_str();
+    app.add_option("--ngram-max-n", ngram_max_n,
+                   "N-gram embeddings: highest n-gram order to hash (bigrams..N-grams added into the "
+                   "input embedding); 0 = off, else must be >= 2. See docs/NGRAM_EMBEDDING.md")
+       ->capture_default_str();
+    app.add_option("--ngram-tables", ngram_tables,
+                   "N-gram embeddings: independent hash tables per n-gram order (k)")
+       ->capture_default_str()->check(CLI::Range(1, 64));
+    app.add_option("--ngram-table-size", ngram_table_size,
+                   "N-gram embeddings: per-table small hashed vocab size (0 = auto: same as --vocab)")
        ->capture_default_str();
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
@@ -836,6 +849,27 @@ int main(int argc, char** argv) {
                      "configure error: layers ({}) - loop-middle-layers ({}) must be even so the "
                      "head and tail blocks are symmetric", n_layers, loop_middle);
         return 1;
+    }
+    // N-gram embeddings: mirrors layout.hpp's own static_asserts, as a configure-time diagnostic naming
+    // the flags rather than a compile error in the engine. D_MODEL must already be resolved here (the
+    // autosize/CLI-pin above finalizes it) since the divisibility check needs the real width.
+    if (ngram_max_n != 0 && ngram_max_n < 2) {
+        std::println(stderr, "configure error: ngram-max-n ({}) must be 0 (off) or >= 2 (bigrams)", ngram_max_n);
+        return 1;
+    }
+    if (ngram_max_n >= 2) {
+        // Inlined rather than calling layout.hpp's ngram_num_embedders(): this tool deliberately does
+        // not include layout.hpp/sub0_config.hpp (it is GENERATING the next config, see memplan.hpp's
+        // own "dependency-free" doc comment for the same reasoning) -- so the formula is duplicated
+        // here, exactly like the LoopSplit symmetry check just above.
+        const int num_embedders = ngram_tables * (ngram_max_n - 1);
+        if (d_model % num_embedders != 0) {
+            std::println(stderr,
+                         "configure error: d-model ({}) must be divisible by ngram-tables*({}-1)={} "
+                         "so each n-gram table's embedding slice is an integer width",
+                         d_model, ngram_max_n, num_embedders);
+            return 1;
+        }
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
     // so the two styles land at roughly the same total FFN param count -- see d_ff_for's doc comment.
@@ -1158,6 +1192,12 @@ int main(int argc, char** argv) {
 
     const int n_base = tkz.n_base, vocab = tkz.vocab;
 
+    // N-gram embeddings: table-size 0 means "auto", resolved now that the real vocab is known (the
+    // tokenizer learning above is what finalizes it) -- same auto-then-resolve shape as d_model/vocab_target.
+    // Only when the feature is actually on -- otherwise a resolved nonzero table-size would show up in
+    // describe_config()'s "differs from default" banner for a build that never enabled n-gram at all.
+    if (ngram_max_n >= 2 && ngram_table_size <= 0) ngram_table_size = vocab;
+
     // 10. Emit the generated headers, SPLIT so the corpus and the machine vary independently:
     //   sub0_corpus.hpp  -- model dims + vocab + tokenizer scheme + artifact paths (frozen per corpus)
     //   sub0_system.hpp  -- precision + cached hardware facts + tuned runtime defaults (per machine)
@@ -1289,6 +1329,13 @@ int main(int argc, char** argv) {
     // shape are untouched -- which is exactly why it must enter ARCH_FINGERPRINT instead (it changes
     // computation invisibly to nfloat). 0 = off. See docs/DEPTH_ATTENTION.md for the derivation.
     cos << "constexpr int  DEPTH_ATTN_STRIDE  = " << depth_attn_stride << ";\n";
+    // N-gram embeddings: additional per-position features from rolling polynomial-hash token n-grams,
+    // added into the input embedding ("concat" fusion mode, Nanbeige's NanbeigeNgramEmbedding). 0 = off.
+    // Unlike depth attention this DOES add parameters (see layout.hpp's NGRAM_EMBED section), so it is
+    // discriminated by PARAM_FLOATS rather than ARCH_FINGERPRINT. See docs/NGRAM_EMBEDDING.md.
+    cos << "constexpr int  NGRAM_MAX_N         = " << ngram_max_n << ";\n";
+    cos << "constexpr int  NGRAM_TABLES_PER_ORDER = " << ngram_tables << ";\n";
+    cos << "constexpr int  NGRAM_TABLE_SIZE    = " << ngram_table_size << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
@@ -1473,6 +1520,12 @@ int main(int argc, char** argv) {
     shown.d_model     = d_model;      shown.n_layers    = n_layers;
     shown.n_heads     = n_heads;      shown.n_kv_heads  = n_kv_heads;
     shown.loop_middle = loop_middle;  shown.loop_repeats = loop_repeats;
+    // depth_attn_stride was missing here (pre-existing omission predating this change -- fixed while
+    // touching this exact block, per the boy-scout rule: the banner is meant to show every axis a run
+    // can differ on, and this one silently never did).
+    shown.depth_attn_stride = depth_attn_stride;
+    shown.ngram_max_n = ngram_max_n; shown.ngram_tables = ngram_tables;
+    shown.ngram_table_size = ngram_table_size;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;

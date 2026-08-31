@@ -239,6 +239,78 @@ TEST_CASE("depth attention is live: the mixed V depends on the query", "[engine]
     }
 }
 
+// GUARD-THE-GUARD for n-gram embeddings (docs/NGRAM_EMBEDDING.md), mirroring the depth-attention
+// pattern just above. The finite-difference gradient check treats a CONTEXT-BLIND mutant -- one that
+// hashes only the CURRENT token (e.g. an off-by-one reading ids[t] instead of ids[t-shift]) -- exactly
+// like a correct one: it is still a perfectly differentiable function of SOME token id, so the
+// gradient check passes either way. This test isolates the one thing only a genuinely
+// context-sensitive hash produces: the ngram contribution AT t_obs must MOVE when the token at
+// t_obs-1 changes, even though the token AT t_obs itself (and every weight except ngram_proj) is held
+// fixed.
+//
+// Isolation strategy: attention causally couples every earlier position into every later one, so
+// "does forward()'s output at t_obs change when an earlier token changes" is true REGARDLESS of
+// n-gram -- attention alone already guarantees it (this test file's own "attention is causal" case
+// above is the positive form of that fact). The discriminator is a DOUBLE DIFFERENCE: compare that
+// change with ngram_proj at its live (random-init) value against the SAME change with ngram_proj
+// zeroed. Zeroing concat_proj makes the whole ngram contribution IDENTICALLY zero for any context (an
+// op_linear with a zero weight is exactly zero regardless of what its input looked up -- see
+// backend_cpu.cpp's ngram_wblock doc comment for why zeroing the one real parameter, concat_proj, is
+// sufficient to silence every table without touching tok_emb/attention at all). The attention-mediated
+// confound is IDENTICAL in both conditions (same weights, same token ids), so it cancels in the
+// difference; what remains is purely the ngram pathway's own context sensitivity. A context-blind
+// mutant contributes the SAME constant regardless of which context id was used (since it never reads
+// it), so the discriminator would be exactly 0 up to float noise; a live, context-sensitive hash moves it.
+TEST_CASE("n-gram embeddings are live: the contribution depends on CONTEXT, not just the current token",
+          "[engine][ngram]") {
+    if constexpr (sub0::NGRAM_EMBED) {
+        sub0::build_model();
+        constexpr int T = 6, t_ctx = 2, t_obs = 3;   // shift 1 -- present for every embedder (order >= 2)
+        static_assert(t_obs - t_ctx == 1);
+        std::vector<int> ids_a(T), ids_b(T);
+        for (int t = 0; t < T; ++t) ids_a[t] = ids_b[t] = (7 * t + 3) % VOCAB;
+        ids_a[t_ctx] = 1;
+        ids_b[t_ctx] = 2;
+        REQUIRE(ids_a[t_ctx] != ids_b[t_ctx]);
+        REQUIRE(ids_a[t_obs] == ids_b[t_obs]);   // the CURRENT token at t_obs is held fixed
+
+        // Locate ngram_proj's PARAM_LAYOUT range (the last tensor when NGRAM_EMBED is on).
+        std::size_t proj_off = 0, proj_n = 0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT)
+            if (p.kind == sub0::PKind::NgramProj) { proj_off = p.off; proj_n = p.n(); }
+        REQUIRE(proj_n > 0);
+
+        auto logits_row = [&](const std::vector<int>& ids) {
+            sub0::graph_reset();
+            sub0::Node* lg = sub0::forward(ids.data(), T);
+            return std::vector<float>(lg->data.begin() + static_cast<std::size_t>(t_obs) * VOCAB,
+                                      lg->data.begin() + static_cast<std::size_t>(t_obs + 1) * VOCAB);
+        };
+
+        const std::vector<float> a_live = logits_row(ids_a);
+        const std::vector<float> b_live = logits_row(ids_b);
+
+        const std::vector<float> saved(sub0::params_ptr() + proj_off, sub0::params_ptr() + proj_off + proj_n);
+        std::fill(sub0::params_ptr() + proj_off, sub0::params_ptr() + proj_off + proj_n, 0.f);
+        const std::vector<float> a_zero = logits_row(ids_a);
+        const std::vector<float> b_zero = logits_row(ids_b);
+        std::copy(saved.begin(), saved.end(), sub0::params_ptr() + proj_off);
+
+        double diff_with = 0.0, diff_without = 0.0, discriminator = 0.0;
+        for (int j = 0; j < VOCAB; ++j) {
+            const double dw  = static_cast<double>(a_live[j]) - b_live[j];
+            const double dwo = static_cast<double>(a_zero[j]) - b_zero[j];
+            diff_with     += dw * dw;
+            diff_without  += dwo * dwo;
+            discriminator += (dw - dwo) * (dw - dwo);
+        }
+        INFO("||delta with ngram||=" << std::sqrt(diff_with)
+             << " ||delta without||=" << std::sqrt(diff_without)
+             << " ||discriminator||=" << std::sqrt(discriminator));
+        REQUIRE(std::sqrt(discriminator) > 1e-5);   // a context-blind mutant would give exactly 0
+    }
+}
+
 TEST_CASE("analytic gradients match finite differences", "[engine][grad]") {
     sub0::build_model();
     std::vector<int> ids, tgt;

@@ -52,6 +52,15 @@
 static_assert(!USE_TERNARY,
     "the CUDA backend is dense-FP only; ternary/BitNet is CPU-only for now (TODO(ternary-gpu)).");
 
+// N-gram embeddings (NGRAM_MAX_N >= 2, see docs/NGRAM_EMBEDDING.md): CPU-only for now. A GPU build
+// with this on would either fail to find the ngram param/activation wiring (a hard link/runtime error)
+// or, worse, silently train a smaller effective architecture if some path happened to compile anyway --
+// hard-stop the BUILD instead, mirroring the ternary guard just above and the earlier GQA/depth-attention
+// CUDA guards (project memory: nanbeige-features-progress). Delete when a CUDA Stage 2 lands.
+// TODO(ngram-gpu): port the CPU op_embed/op_linear/op_add composition (backend_cpu.cpp) to device kernels.
+static_assert(!sub0::NGRAM_EMBED,
+    "the CUDA backend does not implement n-gram embeddings yet; CPU-only for now (TODO(ngram-gpu)).");
+
 // Depth attention (DEPTH_ATTN_STRIDE > 0): training (forward_train + backward_device) and batched
 // inference (forward_device) are implemented below -- see docs/DEPTH_ATTENTION.md 5b. The one path NOT
 // covered is the single-token KV-cache decode, which needs its own rows=1 cache inside a captured
