@@ -171,6 +171,22 @@ other position-dependent mechanism in this engine already uses. This is document
 depth-attention precedent of naming deliberate divergences) rather than silently narrower than the
 reference.
 
+**A second, real interaction bug this exposed and fixed**: this engine's persistent/scratch-slot content
+embeddings (`scratch_slots.hpp`) hand `op_embed` ids **outside** `[0, VOCAB)` — a persistent-slot id is
+`>= VOCAB`, dynamically composed per context rather than a real recurring vocabulary token, and its raw
+integer value is unbounded. The n-gram hash originally read `ids[t]` unconditionally, so a persistent-
+slot id produced an essentially arbitrary hash bucket, and — because it also poisons every LATER
+position that reads it as context — made a persistent-slot sequence's ngram contribution diverge from an
+equivalent plain-token reference sequence. `persistent_slots_engine_tests.cpp`'s forward differential
+test (a persistent-slot sequence must match a plain-token reference bit-for-bit outside the composed
+column) caught this immediately once n-gram embeddings were enabled in that test build. Fix: any id
+`>= VOCAB` hashes as "no signal" (id 0) — the exact same convention `_shift_right_ignore_eos` already
+uses for "no real token here" — applied in both `forward()` (`ngram_tok`) and `forward_one()`
+(`id_tok`/the history buffer, which stores the GUARDED value so it stays consistent on later steps too).
+This is exactly the class of bug `AGENTS.md` §10 exists to catch: a new consumer of the shared `ids`
+array (op_embed's existing raw-id argument) that didn't check how OTHER existing consumers of that same
+array (op_embed's own persistent/scratch-slot dispatch) already handle ids outside the ordinary range.
+
 ## 6. Cost accounting
 
 **Parameters** (the axis this feature actually changes, unlike depth attention): `E` tables of

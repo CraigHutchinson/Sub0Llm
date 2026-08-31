@@ -1535,10 +1535,15 @@ struct Model {
             static thread_local int hist[NGRAM_MAX_SHIFT_BUF];
             static thread_local int hist_len = 0;
             if (prev < 0) hist_len = 0;
+            // Same guard as forward()'s ngram_tok: a persistent-slot id (>= VOCAB) is not a real
+            // recurring vocabulary token and its raw integer value is unbounded, so it hashes as "no
+            // signal" (id 0) -- see forward()'s comment for the full reasoning and the differential
+            // test (persistent_slots_engine_tests.cpp) that caught this without the guard.
+            const int id_tok = (id < VOCAB) ? id : 0;
             for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) {
                 const int order     = NGRAM_ORDERS[static_cast<std::size_t>(e)];
                 const int vocab_dim = NGRAM_VOCAB_DIMS[static_cast<std::size_t>(e)];
-                std::int64_t acc = id;
+                std::int64_t acc = id_tok;
                 for (int k = 2; k <= order; ++k) {
                     const int shift = k - 1;
                     const int ptok  = (shift - 1 < hist_len) ? hist[shift - 1] : 0;
@@ -1555,7 +1560,7 @@ struct Model {
                 }
             }
             for (int s = NGRAM_MAX_SHIFT_BUF - 1; s > 0; --s) hist[s] = hist[s - 1];
-            hist[0] = id;
+            hist[0] = id_tok;   // history stores the GUARDED value, so it stays consistent later too
             if (hist_len < NGRAM_MAX_SHIFT_BUF) ++hist_len;
         }
         // `e` is the EXECUTION index (the KV-cache slot); `li` is which layer's weights run there.
