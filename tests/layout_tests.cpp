@@ -17,10 +17,13 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // (ln_f alone -- the head reuses tok_emb, no separate slot).
     // tok_emb is always present; pos_emb only under absolute positions (RoPE omits the table
     // entirely -- see layout.hpp's HAS_POS_EMB, which is what decouples SEQ_LEN from the checkpoint).
+    // N-gram embeddings add NGRAM_NUM_EMBEDDERS tables + one concat_proj tensor, 0 at the neutral
+    // (NGRAM_MAX_N == 0) setting -- see layout.hpp's own NGRAM_EMBED section.
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
                                         + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
                                         + (USE_QK_NORM ? 2 * N_LAYERS : 0)
-                                        + (USE_TIED_EMBEDDINGS ? 1 : 3));
+                                        + (USE_TIED_EMBEDDINGS ? 1 : 3)
+                                        + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0));
     REQUIRE(sub0::PARAM_LAYOUT.size() == static_cast<std::size_t>(sub0::NUM_PARAMS));
 
     std::size_t off = 0;
@@ -37,18 +40,26 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
 TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout]") {
     using sub0::PKind;
     REQUIRE(sub0::PARAM_LAYOUT.front().kind == PKind::TokEmb);   // first tensor
-    // Last tensor: ln_f when tied (no separate head slot -- see op_tied_head), else lm_bias.
-    REQUIRE(sub0::PARAM_LAYOUT.back().kind == (USE_TIED_EMBEDDINGS ? PKind::LnF : PKind::LmBias));
+    // Last tensor: n-gram's concat_proj when the feature is on (appended at the very end -- see
+    // layout.hpp's make_param_layout()); else ln_f when tied (no separate head slot -- see
+    // op_tied_head), else lm_bias.
+    const PKind expected_last = sub0::NGRAM_EMBED ? PKind::NgramProj
+                              : (USE_TIED_EMBEDDINGS ? PKind::LnF : PKind::LmBias);
+    REQUIRE(sub0::PARAM_LAYOUT.back().kind == expected_last);
 
     for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+        // NgramProj is a GEMM weight like LmHead: full precision (not ternary-eligible), AdamW-only
+        // (not Muon-eligible -- see is_muon_kind). NgramEmb is an embedding-row lookup like TokEmb:
+        // no decay, not ternary -- it already satisfies the `!is_matrix` branch below with no special
+        // case needed.
         const bool is_matrix =
             p.kind == PKind::Wq || p.kind == PKind::Wk || p.kind == PKind::Wv ||
             p.kind == PKind::Wo || p.kind == PKind::W1 || p.kind == PKind::W2 ||
-            p.kind == PKind::Wg || p.kind == PKind::LmHead;
+            p.kind == PKind::Wg || p.kind == PKind::LmHead || p.kind == PKind::NgramProj;
         // AdamW weight decay applies only to the GEMM weight matrices.
         REQUIRE(p.decay == is_matrix);
-        // Ternary quantization covers the block matrices but NOT the full-precision head.
-        const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead;
+        // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj.
+        const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj;
         REQUIRE(p.ternary == ternary_eligible);
     }
 }
@@ -282,4 +293,71 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[
     // Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build --
     // the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is a real,
     // distinguishing quantity, established above.
+}
+
+// --- N-gram embeddings (docs/NGRAM_EMBEDDING.md) -------------------------------------------------
+// The hashing math (ngram_num_embedders / ngram_vocab_dim / ngram_order_of / ngram_vocab_mod) is
+// exposed as free functions of EXPLICIT parameters -- not folded into consteval array-builders closed
+// over this build's own NGRAM_MAX_N/NGRAM_TABLES_PER_ORDER/NGRAM_TABLE_SIZE -- for the same reason
+// DepthScheduleT's depth_schedule_for() above takes its parameters explicitly: it lets this test pin
+// hand-verified values at hypothetical configs regardless of what THIS build was configured with.
+TEST_CASE("n-gram hashing math matches hand-computed values at hypothetical configs", "[layout][ngram]") {
+    // num_embedders = k * (max_n - 1): reference's `k * (n - 1)`.
+    static_assert(sub0::ngram_num_embedders(0, 1) == 0);     // off
+    static_assert(sub0::ngram_num_embedders(1, 4) == 0);     // max_n < 2 is also off
+    static_assert(sub0::ngram_num_embedders(2, 1) == 1);     // bigrams only, 1 table
+    static_assert(sub0::ngram_num_embedders(3, 2) == 4);     // bigrams+trigrams, 2 tables each
+    static_assert(sub0::ngram_num_embedders(4, 3) == 9);     // bi/tri/4-grams, 3 tables each
+
+    // Per-table vocab size: `m + index*2 + 1` (the reference's non-force-prime branch).
+    static_assert(sub0::ngram_vocab_dim(1000, 0) == 1001);
+    static_assert(sub0::ngram_vocab_dim(1000, 1) == 1003);
+    static_assert(sub0::ngram_vocab_dim(1000, 3) == 1007);
+
+    // Which highest order embedder `index` belongs to: index = (order-2)*k + j, inverted.
+    // k=2 tables/order: indices 0,1 -> order 2 (bigram); 2,3 -> order 3 (trigram).
+    static_assert(sub0::ngram_order_of(0, 2) == 2);
+    static_assert(sub0::ngram_order_of(1, 2) == 2);
+    static_assert(sub0::ngram_order_of(2, 2) == 3);
+    static_assert(sub0::ngram_order_of(3, 2) == 3);
+
+    // vocab_mod: power_mod = (power_mod * hash_base) % vocab_dim, accumulated `shift` times. Hand-
+    // computed with small numbers so the modular arithmetic is checkable by inspection: hash_base=7,
+    // table_size=4, index=0 -> vocab_dim = ngram_vocab_dim(4,0) = 5.
+    //   shift=1: power = (1*7) % 5 = 2
+    //   shift=2: power = (2*7) % 5 = 4
+    //   shift=3: power = (4*7) % 5 = 3
+    static_assert(sub0::ngram_vocab_dim(4, 0) == 5);
+    static_assert(sub0::ngram_vocab_mod(4, 0, 7, 1) == 2);
+    static_assert(sub0::ngram_vocab_mod(4, 0, 7, 2) == 4);
+    static_assert(sub0::ngram_vocab_mod(4, 0, 7, 3) == 3);
+    // A different table (index=1 -> vocab_dim=7) with the same hash_base gives a DIFFERENT sequence --
+    // the whole point of k independent tables per order (independent hash functions via the modulus).
+    static_assert(sub0::ngram_vocab_dim(4, 1) == 7);
+    static_assert(sub0::ngram_vocab_mod(4, 1, 7, 1) == 0);   // (1*7) % 7 == 0
+    static_assert(sub0::ngram_vocab_mod(4, 1, 7, 2) == 0);   // stays 0 once it hits 0 -- a real, if
+                                                              // degenerate, property of this table choice
+    REQUIRE(sub0::ngram_vocab_mod(4, 1, 7, 2) == 0);
+}
+
+// Stage 0: at the neutral setting (NGRAM_MAX_N == 0) the feature contributes ZERO new parameters and
+// touches no PARAM_LAYOUT entry -- the same "bit-identical when off" contract depth attention's own
+// Stage 0 test pins for ARCH_FINGERPRINT, applied here to the SHAPE axis instead (n-gram embeddings add
+// real parameters, so PARAM_FLOATS/NUM_PARAMS -- not ARCH_FINGERPRINT -- is what discriminates a
+// mismatched checkpoint; see layout.hpp's own NGRAM_EMBED section for why that classification is
+// correct rather than an oversight).
+TEST_CASE("n-gram embeddings are off by default and inert at the neutral setting", "[layout][ngram]") {
+    // Written as an implication, NOT gated behind `if constexpr` -- a STATIC_REQUIRE inside an
+    // untaken `if constexpr` branch at namespace/function scope still fires (see the positional-
+    // encoding test above's own comment on exactly this trap), so these must hold regardless of the
+    // build under test, collapsing to "true given false" when NGRAM_EMBED happens to be on.
+    STATIC_REQUIRE((!sub0::NGRAM_EMBED) || sub0::NGRAM_NUM_EMBEDDERS > 0);
+    STATIC_REQUIRE(sub0::NGRAM_EMBED || sub0::NGRAM_NUM_EMBEDDERS == 0);
+    STATIC_REQUIRE(sub0::NGRAM_EMBED || sub0::NGRAM_EMB_DIM == 0);
+    if constexpr (!sub0::NGRAM_EMBED) {
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            REQUIRE(p.kind != sub0::PKind::NgramEmb);
+            REQUIRE(p.kind != sub0::PKind::NgramProj);
+        }
+    }
 }

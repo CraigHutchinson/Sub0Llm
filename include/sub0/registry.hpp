@@ -178,6 +178,9 @@ struct ModelMeta : RunState {
     X(int,         loop_repeats,    1)    \
     X(int,         depth_attn_stride, 0)  \
     X(int,         gdn_full_attn_stride, 0)  \
+    X(int,         ngram_max_n,     0)    \
+    X(int,         ngram_tables,    1)    \
+    X(int,         ngram_table_size, 0)   \
     X(int,         rope_scaling,    0)    \
     X(double,      rope_scale_fac,  1.0)  \
     X(double,      rope_theta,  10000.0)  \

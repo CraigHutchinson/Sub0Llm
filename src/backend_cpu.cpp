@@ -83,7 +83,11 @@ namespace sub0 {
 
 consteval size_t calc_act_cap() {
     const size_t T = SEQ_LEN, C = D_MODEL, F = D_FF, H = N_HEADS, V = VOCAB;
-    size_t base = 3 * T * C;
+    // N-gram embeddings run ONCE per forward (input-embedding injection only, not per execution):
+    // NGRAM_NUM_EMBEDDERS op_embed nodes ([T, NGRAM_EMB_DIM] each, summing to [T, D_MODEL]) + that many
+    // op_linear nodes ([T, D_MODEL] each) + that many op_add nodes (the accumulator chain plus the
+    // final residual add) -- see forward()'s ngram block in backend_cpu.cpp.
+    size_t base = 3 * T * C + (NGRAM_EMBED ? (size_t)(1 + 2 * NGRAM_NUM_EMBEDDERS) * T * C : 0);
     // FFN activation nodes: plain (W1-out, gelu-out) = 2*T*F; gated (gate-out, up-out, swiglu-out)
     // = 3*T*F (one extra T*F node -- see op_swiglu in the forward pass).
     size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
@@ -107,9 +111,12 @@ constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
 // Depth attention adds exactly one node per EXECUTION (the mixed-V node) -- every execution runs the
 // op, whether or not it also appends to the cache. Under-sizing this array is a silent overwrite of a
 // live node, not an allocation failure, so it has to be counted rather than absorbed by the headroom.
+// N-gram embeddings add 3 nodes per embedder ONCE (op_embed + op_linear + op_add each), not per
+// execution -- see calc_act_cap()'s matching comment.
 constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_COUNT
                                 + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0)
-                                + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0);
+                                + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0)
+                                + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0);
 
 // ============================================================================
 //  Static storage
@@ -1222,6 +1229,22 @@ struct Model {
     Node* lm_head;   // nullptr when USE_TIED_EMBEDDINGS -- the head reads tok_emb directly instead
     Node* lm_bias;   // nullptr when USE_TIED_EMBEDDINGS -- tied models drop the head bias too
 
+    // N-gram embeddings (see docs/NGRAM_EMBEDDING.md). ngram_tab[e]: the e-th hashed n-gram embedding
+    // table (a real PARAM_LAYOUT leaf, like tok_emb). ngram_proj: the single learned concat_proj GEMM
+    // weight, [D_MODEL, D_MODEL]. ngram_wblock[e]: a NON-owning VIEW into ngram_proj's own data/grad --
+    // rows [e*NGRAM_EMB_DIM, (e+1)*NGRAM_EMB_DIM), i.e. the row-block that table e's slice of the
+    // concatenated vector would multiply against. This is the block-matmul identity
+    // ([x0|x1|..|xk] @ W == sum_e x_e @ W[e*d:(e+1)*d, :]) applied so "concat then one linear" needs no
+    // separate Concat op or Node-fanout widening (contrast docs/DEPTH_ATTENTION.md 5a, which genuinely
+    // needed a side table because ITS fanout was variable and cross-execution; here it is a FIXED,
+    // compile-time partition of one static parameter, so a plain array of aliasing Leaf-shaped Nodes
+    // suffices). AdamW steps ngram_proj exactly ONCE, over its whole PARAM_LAYOUT range, as normal --
+    // the views are read-only aliases used only to route Linear's backward into the right row-range of
+    // that ONE grad buffer; the partition is disjoint, so backward's per-view `+=` writes never collide.
+    std::array<Node*, NGRAM_TABLES_BUF> ngram_tab{};
+    Node*                               ngram_proj = nullptr;
+    std::array<Node, NGRAM_TABLES_BUF>  ngram_wblock{};
+
     // Diagnostic-only: forward_one's residual-stream hidden state at its last call's position, right
     // before ln_f/the head projection -- i.e. the fully-processed, pre-readout representation. Written
     // unconditionally (one D_MODEL-length copy, negligible next to forward_one's own cost) rather than
@@ -1270,6 +1293,23 @@ struct Model {
             lm_head = mk_param(D_MODEL, VOCAB, true);
             lm_bias = mk_param(1, VOCAB, false);
         }
+        // N-gram embeddings: appended at the very end -- MUST match layout.hpp's make_param_layout()
+        // append order exactly (that file's header comment: "the order here IS the serialization order").
+        if constexpr (NGRAM_EMBED) {
+            for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e)
+                ngram_tab[static_cast<std::size_t>(e)] =
+                    mk_param(NGRAM_VOCAB_DIMS[static_cast<std::size_t>(e)], NGRAM_EMB_DIM, false);
+            ngram_proj = mk_param(D_MODEL, D_MODEL, true);
+            for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) {
+                Node& v = ngram_wblock[static_cast<std::size_t>(e)];
+                v = Node{};
+                v.op = Op::Leaf; v.rows = NGRAM_EMB_DIM; v.cols = D_MODEL;
+                const std::size_t off = static_cast<std::size_t>(e) * NGRAM_EMB_DIM * D_MODEL;
+                const std::size_t n   = static_cast<std::size_t>(NGRAM_EMB_DIM) * D_MODEL;
+                v.data = ngram_proj->data.subspan(off, n);   // ALIASES ngram_proj -- not a separate param
+                v.grad = ngram_proj->grad.subspan(off, n);
+            }
+        }
     }
 
     // Randomly initialize the SHARED weights through this thread's node layout, from a fixed seed
@@ -1293,6 +1333,10 @@ struct Model {
         }
         ones(ln_f);
         if constexpr (!USE_TIED_EMBEDDINGS) randn(lm_head, 0.02f);
+        if constexpr (NGRAM_EMBED) {
+            for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) randn(ngram_tab[static_cast<std::size_t>(e)], 0.02f);
+            randn(ngram_proj, 0.02f);   // also initializes every ngram_wblock[e] view (same underlying data)
+        }
     }
 
     // Per-execution residual-stream diagnostic (nullptr = off, the production path). When armed by
@@ -1319,6 +1363,52 @@ struct Model {
             h = op_add(op_embed(tok_emb, ids, T), op_embed(pos_emb, pos_ids, T));
         } else {
             h = op_embed(tok_emb, ids, T);   // RoPE injects position inside attention instead
+        }
+        // N-gram embeddings: input-embedding injection only (Stage 1 scope -- see
+        // docs/NGRAM_EMBEDDING.md's "deferred" section for the multi-layer NanbeigeNgramLayerFusion
+        // this does NOT implement yet). ids_e[t] is looked up in table e; each embed output is
+        // projected by that table's ROW-BLOCK of concat_proj and the results summed -- the block-matmul
+        // identity for "concatenate then one linear" (see ngram_wblock's own comment above). Persistent
+        // per-thread for the same reason pos_ids is: op_embed stores the pointer for backward.
+        if constexpr (NGRAM_EMBED) {
+            static thread_local int ngram_ids[NGRAM_TABLES_BUF][SEQ_LEN];
+            // A persistent-slot id (>= VOCAB -- op_embed's `is_persistent_slot` gate) is not a real,
+            // recurring vocabulary token: its embedding is dynamically COMPOSED per context, so it has
+            // no fixed hash identity to be consistent with across occurrences, and its raw integer
+            // value is UNBOUNDED (unlike an ordinary token id, already < VOCAB and so already
+            // "in-distribution" for this hash). Feeding it through the polynomial hash unchanged would
+            // make the ngram contribution at this position, AND at every later position that reads it
+            // as context, depend on an essentially arbitrary large integer -- caught by
+            // `persistent_slots_engine_tests.cpp`'s forward differential (a persistent-slot sequence
+            // must match a plain-token reference sequence bit-for-bit outside the composed column,
+            // which a raw-id hash breaks). Treat it as "no signal" (id 0), the same convention
+            // `_shift_right_ignore_eos` already uses for "no real token here".
+            const auto ngram_tok = [&](int t) { return ids[t] < VOCAB ? ids[t] : 0; };
+            for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) {
+                const int order      = NGRAM_ORDERS[static_cast<std::size_t>(e)];
+                const int vocab_dim  = NGRAM_VOCAB_DIMS[static_cast<std::size_t>(e)];
+                for (int t = 0; t < T; ++t) {
+                    // The reference's `_shift_right_ignore_eos`: a context token before the start of
+                    // the current document is ZERO (not "no term" -- literally token id 0). Every
+                    // training window lives inside exactly one document (window.hpp), so "before the
+                    // window's own start" IS "before this document's start" here -- a deliberate
+                    // simplification of the reference's mid-corpus doc-boundary scan (see
+                    // docs/NGRAM_EMBEDDING.md).
+                    std::int64_t acc = ngram_tok(t);
+                    for (int k = 2; k <= order; ++k) {
+                        const int shift = k - 1;
+                        const int tpos  = t - shift;
+                        const int prev  = (tpos >= 0) ? ngram_tok(tpos) : 0;
+                        acc += static_cast<std::int64_t>(prev) * NGRAM_VOCAB_MODS[static_cast<std::size_t>(e)][static_cast<std::size_t>(k - 2)];
+                    }
+                    ngram_ids[e][t] = static_cast<int>(((acc % vocab_dim) + vocab_dim) % vocab_dim);
+                }
+            }
+            Node* ng = op_linear(op_embed(ngram_tab[0], ngram_ids[0], T), &ngram_wblock[0], nullptr, false);
+            for (int e = 1; e < NGRAM_NUM_EMBEDDERS; ++e)
+                ng = op_add(ng, op_linear(op_embed(ngram_tab[static_cast<std::size_t>(e)], ngram_ids[e], T),
+                                           &ngram_wblock[static_cast<std::size_t>(e)], nullptr, false));
+            h = op_add(h, ng);
         }
         // LAYER_EXEC_ORDER, not `layers` directly: under LoopSplit the middle block's indices repeat,
         // re-running the SAME Layer (same parameter Nodes) several times. The backward needs no change
@@ -1433,6 +1523,40 @@ struct Model {
         if constexpr (POS_ENCODING == PosEncoding::Absolute) {
             const float* pe = pos_emb->data.data() + static_cast<size_t>(pos) * C;
             for (int j = 0; j < C; ++j) h[j] += pe[j];
+        }
+        // N-gram embeddings, decode path: mirrors forward()'s block exactly (same hashing, same
+        // block-matmul-via-row-slice composition), but the context comes from a small rolling history
+        // of the last NGRAM_MAX_N-1 FED ids instead of indexing back into a batched window -- this
+        // engine's analogue of the reference's `NgramCache.update_ngram_context`. `prev < 0` (computed
+        // above, BEFORE it was overwritten) is the same "fresh generation or non-sequential jump"
+        // signal forward_one's sentinel-pair detection already relies on, so history resets exactly
+        // when that context would otherwise be wrong.
+        if constexpr (NGRAM_EMBED) {
+            static thread_local int hist[NGRAM_MAX_SHIFT_BUF];
+            static thread_local int hist_len = 0;
+            if (prev < 0) hist_len = 0;
+            for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) {
+                const int order     = NGRAM_ORDERS[static_cast<std::size_t>(e)];
+                const int vocab_dim = NGRAM_VOCAB_DIMS[static_cast<std::size_t>(e)];
+                std::int64_t acc = id;
+                for (int k = 2; k <= order; ++k) {
+                    const int shift = k - 1;
+                    const int ptok  = (shift - 1 < hist_len) ? hist[shift - 1] : 0;
+                    acc += static_cast<std::int64_t>(ptok) * NGRAM_VOCAB_MODS[static_cast<std::size_t>(e)][static_cast<std::size_t>(k - 2)];
+                }
+                const int tid = static_cast<int>(((acc % vocab_dim) + vocab_dim) % vocab_dim);
+                const float* row = ngram_tab[static_cast<std::size_t>(e)]->data.data()
+                                 + static_cast<std::size_t>(tid) * NGRAM_EMB_DIM;
+                const float* Wb = ngram_wblock[static_cast<std::size_t>(e)].data.data();
+                for (int p = 0; p < NGRAM_EMB_DIM; ++p) {
+                    const float xp = row[p];
+                    const float* __restrict Wr = Wb + static_cast<std::size_t>(p) * C;
+                    for (int o = 0; o < C; ++o) h[o] += xp * Wr[o];
+                }
+            }
+            for (int s = NGRAM_MAX_SHIFT_BUF - 1; s > 0; --s) hist[s] = hist[s - 1];
+            hist[0] = id;
+            if (hist_len < NGRAM_MAX_SHIFT_BUF) ++hist_len;
         }
         // `e` is the EXECUTION index (the KV-cache slot); `li` is which layer's weights run there.
         // They differ only under LoopSplit -- see LAYER_EXEC_ORDER and KVCache's own comments.
