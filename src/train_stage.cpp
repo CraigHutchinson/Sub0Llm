@@ -1682,6 +1682,8 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
         cfg.depth_attn_stride = DEPTH_ATTN_STRIDE;
         cfg.gdn_full_attn_stride = GDN_FULL_ATTN_STRIDE;   // always 0 today -- docs/GATED_DELTANET.md
+        cfg.ngram_max_n = NGRAM_MAX_N; cfg.ngram_tables = NGRAM_TABLES_PER_ORDER;
+        cfg.ngram_table_size = NGRAM_TABLE_SIZE;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;
         cfg.rope_theta = ROPE_THETA;   // changes what the model computes -- layout.hpp ARCH_FINGERPRINT
         cfg.seq_len = SEQ_LEN; cfg.vocab = VOCAB; cfg.ternary = static_cast<int>(USE_TERNARY);
