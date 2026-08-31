@@ -89,15 +89,41 @@ TEST_CASE("persistent slots: a bound slot embeds as its fragment mean in forward
 
     REQUIRE(logits_persist.size() == logits_ref.size());
     const int T = static_cast<int>(seq_persist.size());
-    bool any_checked = false;
-    for (int t = 0; t < T; ++t)
+    // N-gram embeddings (docs/NGRAM_EMBEDDING.md) hash the RAW TOKEN ID, deliberately: `persistent_id(0)`
+    // and `stand_in` ('~') are, BY DESIGN, two ids the n-gram mechanism must be able to tell apart --
+    // that is exactly what routes a persistent slot to "no n-gram signal, id 0" (backend_cpu.cpp's
+    // `ngram_tok`/`id_tok` guard) instead of hashing an essentially arbitrary unbounded integer, which
+    // is what this very test caught before that guard existed (see docs/NGRAM_EMBEDDING.md sec 5 for the
+    // incident). So the moment n-gram embeddings are enabled, this differential's whole premise --
+    // that the engine cannot tell arm A's id from arm B's -- necessarily stops holding for every
+    // position within n-gram-shift reach of positions 1 ('x') or the middle slot itself: it is not a
+    // regression to fix, it is the guard doing its job. Every OTHER op (tok_emb, attention, FFN) still
+    // cannot tell the two arms apart, so the exact-match technique below stays the correctness gate for
+    // everything n-gram embeddings do not touch.
+    if constexpr (!sub0::NGRAM_EMBED) {
+        bool any_checked = false;
+        for (int t = 0; t < T; ++t)
+            for (int v = 0; v < VOCAB; ++v) {
+                if (v == stand_in) continue;   // the reference arm's tied-head reads stand_in's own (overwritten) row
+                const std::size_t i = static_cast<std::size_t>(t) * VOCAB + v;
+                REQUIRE(logits_persist[i] == Catch::Approx(logits_ref[i]).margin(1e-4));
+                any_checked = true;
+            }
+        REQUIRE(any_checked);
+    } else {
+        // Compensating check, so this branch still asserts something real rather than silently doing
+        // nothing: position 2 ('y') is one n-gram shift away from the middle slot, so its logits MUST
+        // differ between the two arms (arm A's 'y' hashes context id 0 for the middle slot, arm B's
+        // hashes stand_in's real id) -- proving the guard is actually live, not accidentally a no-op
+        // that would make this test pass again for the wrong reason.
+        double diff2 = 0.0;
         for (int v = 0; v < VOCAB; ++v) {
-            if (v == stand_in) continue;   // the reference arm's tied-head reads stand_in's own (overwritten) row
-            const std::size_t i = static_cast<std::size_t>(t) * VOCAB + v;
-            REQUIRE(logits_persist[i] == Catch::Approx(logits_ref[i]).margin(1e-4));
-            any_checked = true;
+            const std::size_t i = static_cast<std::size_t>(2) * VOCAB + v;
+            const double d = static_cast<double>(logits_persist[i]) - logits_ref[i];
+            diff2 += d * d;
         }
-    REQUIRE(any_checked);
+        REQUIRE(diff2 > 1e-8);
+    }
 }
 
 // Gradient flow: a persistent slot's row grad must scatter into its fragment rows via encode_slot_bwd,
