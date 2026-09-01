@@ -61,6 +61,15 @@ struct Node {
     // See op_depth_attn in backend_cpu.cpp and docs/DEPTH_ATTENTION.md 5a for why a variable-length
     // input list cannot live on the Node itself.
     int depth_s = 0;
+    // Op::GDN only: index into the CPU backend's thread_local GdnLinkCache (backend_cpu.cpp), which
+    // holds the 9 GDN parameter Nodes (GdnInProjQkv/Z/B/A, GdnConv, GdnALog, GdnDtBias, GdnNorm,
+    // GdnOutProj) this node's Layer owns. Node's fixed a/b/w/bias fanout (4 slots) cannot hold 9
+    // parameter pointers plus the input -- the same wall docs/DEPTH_ATTENTION.md S5a hit for a
+    // variable-length cross-execution list, resolved the same way here (a thread_local side table keyed
+    // by a small int on the Node) even though GDN's own fanout is fixed-size, not variable-length; see
+    // docs/GATED_DELTANET.md S6's Stage 2 entry for why this differs from Stage 1's "no linkage needed"
+    // finding now that a backward exists. -1 on any non-GDN node.
+    int gdn_link = -1;
     bool ternary = false;
 };
 
