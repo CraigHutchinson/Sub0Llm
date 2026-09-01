@@ -278,3 +278,13 @@ diagnostic/directory-naming identity, not the checkpoint-format gate (`ARCH_FING
   real hashing is a different splitmix64-style scheme, and it injects via a hyper-connection stream with
   no `concat_proj`-equivalent stage to compare against). Skips gracefully (WARN, not fail) if the
   fixtures are ever absent from a given checkout.
+- **Stage 3 — huge external tables (e.g. importing Qwen's real 51.2B-param n-gram table), not started,
+  design lives elsewhere.** Today's `ngram_tab[e]` is a fully-resident `PARAM_LAYOUT` leaf, correct only
+  for the small, from-scratch-trained tables this stage targets. Growing this to a huge, externally
+  sourced, effectively-frozen table (too big for RAM/VRAM) is a distinct backing-store problem, not a
+  variant of Stage 1/2 — see `docs/NGRAM_TABLE_TIERED_STORAGE.md` for the design and
+  [github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn) (spec + prior art +
+  a concrete, code-grounded trace of exactly what this file's `forward()`/`forward_one()` would need from
+  such a backing store — its README §7) for where the actual implementation is scoped to land. Nothing
+  in `Model`'s current structure needs to change to make room for this later: `ngram_tab[e]` would become
+  a thin client issuing `resolve_into` calls instead of a raw parameter pointer, per that design.
