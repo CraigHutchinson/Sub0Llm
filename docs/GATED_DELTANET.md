@@ -1,8 +1,8 @@
 # Gated DeltaNet — design, derived from the reference
 
-Status: **Stage 1 DONE — real CPU forward, fixture-verified, no backward, no CUDA.** See §6 for the
-staging status, the fixture-comparison numbers, and the one real correction to this doc's own §1b found
-while implementing it. Follows
+Status: **Stage 1 + Stage 2 DONE — real CPU forward AND backward, both fixture-verified against the real
+PyTorch reference's own autograd, no CUDA.** See §6 for the staging status, the fixture-comparison
+numbers, and the one real correction to this doc's own §1b found while implementing Stage 1. Follows
 `docs/DEPTH_ATTENTION.md`'s structure (that document is the precedent for how a genuinely new op type
 gets threaded through this engine) and `docs/QWEN4_PREVIEW_REFERENCE.md`'s staged plan, which flags this
 as the higher-risk of the two Qwen4-preview mechanisms because this engine's attention today is
@@ -659,6 +659,87 @@ operations this project already chose for attention itself.
   guard (added this stage — Stage 0 had not needed one, since the axis was compile-clamped to 0
   everywhere before now) at the next callable seam down, since a GDN CPU binary compiles and runs fine
   for forward-only uses (gen/eval/report) regardless.
-- **Stage 2 (not started)** — backward pass (CPU), per §4's recompute-during-backward direction.
+- **Stage 2 — CPU backward — DONE.** `include/sub0/gdn_math.hpp` gains `sub0::gdn::backward` (the full
+  adjoint of `forward`'s in_proj*, causal conv, L2-norm+scale, sequential recurrence, RMSNormGated and
+  out_proj) and its `recurrence_step_backward` primitive, plus `bwd_scratch_floats`. Per §4's own closing
+  paragraph, this is RECOMPUTE-based: it reruns `forward`'s math from `x` and the 9 weight tensors
+  (already retained by the engine's Node/arena machinery) rather than retaining the state trajectory
+  `S_0..S_{T-1}` from `forward` itself — the trajectory is materialized only inside `backward`'s own
+  scratch buffer, and only for the one GDN node currently being backpropagated.
+
+  **Node-linkage, resolved (§4's own deferred question, now answered under real load)**: Stage 1's
+  `op_gdn` took `Layer&` directly with no generic `a`/`b`/`w`/`bias` routing, since it had no backward to
+  preserve linkage for. Stage 2 needs `backward_node`'s `Op::GDN` case to reach all 9 of a GDN layer's
+  parameter Nodes (to write their gradients) plus the input node — 10 pointers, more than `Node`'s fixed
+  4-slot fanout can hold. This is the identical wall `docs/DEPTH_ATTENTION.md` §5a already hit and fixed
+  once (a Node cannot express more inputs than its fixed pointer fanout), so it gets the same fix:
+  `backend_cpu.cpp`'s `GdnLinkCache`, a `thread_local` side table of the 9 parameter-Node bundles, keyed
+  by a new `Node::gdn_link` int field (mirroring `Node::depth_s`'s own pattern) that `op_gdn` populates
+  and `backward_node`'s `Op::GDN` case reads. `Node::a` (the input) needed no change — it was already
+  generically threaded and is unaffected by the 9-weight-tensor problem. Backward's own transient
+  recompute scratch (dominated by the `T·N_HEADS·D_HEAD²` state-trajectory buffer) is a separate,
+  lazily-sized `thread_local` `std::vector` (`GdnBwdScratch`) reused across every GDN node's backward
+  call one at a time, deliberately NOT routed through `arena_alloc` (which never reclaims within one
+  graph's lifetime and would otherwise need headroom for as many simultaneous copies as there are GDN
+  layers).
+
+  **Correctness — real PyTorch-autograd oracle, the primary gate (AGENTS.md §5/§6)**: the real, installed
+  `transformers==5.16.1` `Qwen4ExpTextGatedDeltaNet`'s own chunked-path `.backward()`, run on the SAME
+  real extracted layer-0 weights Stage 1's forward fixture uses, with `loss = dot(output, a fixed
+  reproducible random vector)` (not plain `sum()`, so every output element carries a distinct nonzero
+  upstream gradient — `tests/fixtures/qwen4_preview/gdn_layer0_small_{dout,grad_*}.bin`). Every one of
+  the 9 parameter-tensor gradients plus the input gradient matches to ≈3e-7 relative (double-precision
+  NumPy re-derivation vs. the real oracle's float32 autograd; the ported C++ float32 version matches the
+  same real numbers to the same order, e.g. `d(in_proj_qkv)`: max|diff|=4.07e-10 vs max|real|=1.05e-3,
+  `d(A_log)`: max|diff|=1.02e-10 vs max|real|=5.55e-5). A real bug was caught by this cross-check BEFORE
+  the C++ port: the first hand-derivation conflated `d(delta_t)` with `d(k_t)`'s contribution from
+  `B_t = k_t⊗delta_t` (used `beta_t·v_t` instead of the outer-product adjoint `G_t@delta_t`) and dropped
+  the `-kv_mem_t` term from `d(beta_t)` — found by bisecting against saved PyTorch-autograd intermediate
+  gradients at the exact stage the two hand-derived quantities first diverged. A SECOND, independent
+  cross-check (a synthetic `num_k_heads=2` shape — the real fixture's own `num_k_heads=1` never exercises
+  the repeat_interleave group-sum fold — against `torch.autograd` on a from-scratch PyTorch
+  reimplementation of the identical math) matched to ~1e-15 relative, double-precision machine noise.
+
+  **Finite-difference check, independent of the real oracle (AGENTS.md §6's "standard check" — mirrors
+  `tests/engine_tests.cpp`'s own FD-check style)**: `tests/gdn_qwen4_fixture_tests.cpp` adds a per-element
+  central-difference probe over every one of the 9 weight tensors plus the input, at the same synthetic
+  `num_k_heads=2` shape — e.g. `w_qkv`: max|analytic−numeric|=3.96e-5 vs max|numeric|=0.72,
+  `a_log`: max|analytic−numeric|=7.57e-6 vs max|numeric|=0.0415.
+
+  **Presence/mutation-style check (the depth-attention lesson)**: both the real-oracle test and the FD
+  test explicitly assert `d(A_log)`/`d(dt_bias)` are genuinely nonzero (and, via the FD/real-oracle match
+  itself, genuinely gate-value-dependent, not a structurally-present stub) — a mutant that silently zeroed
+  either gate scalar's backward path would fail both checks, not just a naive "field populated" test.
+
+  **Two-scale identity check (AGENTS.md §4/§7), at neutral (`GDN_FULL_ATTN_STRIDE == 0`)**: this branch
+  and `main` (`9f42e38`), built at the SAME two shapes Stage 1 established (same corpus, same generated
+  vocab 332 both times) — assertion counts AND the forward/grad/decode fingerprints are byte-identical
+  between the two:
+  | shape | assertions | test cases | forward hash | grad hash | decode hash |
+  |---|---|---|---|---|---|
+  | d96 L8 H2 kv2 seq128 | 4,712,955 | 137 | `1cbfe9df31ac89ae` | `85bed0fd41277fd0` | `15cd828a539ffaca` |
+  | d132 L11 H4 kv2 seq96 | 11,594,607 | 137 | `f2a2141a1b8a466b` | `58877ebaf797c204` | `b186d0caf7f48649` |
+
+  (These absolute numbers differ from Stage 1's own recorded table because this pass used a small,
+  reproducible synthetic corpus rather than Stage 1's original one, which was not available in this
+  session — the gate that matters, and the one actually checked, is THIS branch vs. `main` at matching
+  corpus/dims, not reproducing Stage 1's historical constants.) Expected structurally, not just
+  empirically: `op_gdn`'s entire body sits behind `if constexpr (USE_GATED_DELTANET)`, compile-time false
+  at stride 0, so none of Stage 2's runtime code — `GdnLinkCache`, `GdnBwdScratch`, `gdn::backward` —
+  is ever reached there; the two builds' object code differs only in genuinely dead paths.
+
+  **Real GDN-on build, unfiltered full suite (AGENTS.md §10)**: d96 L8 H2 kv2, stride 3 (6 GDN + 2
+  attention layers) — 136/137 test cases pass (5,034,333 assertions); the one failure is the SAME
+  pre-existing, expected one Stage 1 already documented (`arch fingerprint2 stays bit-identical when
+  Gated DeltaNet is off` — testing the OFF premise, deliberately false in this build). The load-bearing
+  new result: `tests/engine_tests.cpp`'s whole-model `analytic gradients match finite differences` test
+  — which exercises `train_batch`'s REAL forward→loss→backward→AdamW path on this real mixed GDN+
+  attention model — now PASSES (previously this would have hit the Stage 1 `std::abort()`): directional
+  numeric=2.19188 vs. ‖g‖=2.19971, all 6 per-parameter spot checks within tolerance. `forward_one
+  (KV-cache) matches the full forward per position` still passes too (worst per-position relative diff
+  `3.43571e-07`), confirming the decode path — untouched by this stage — stayed correct.
+
 - **Stage 3 (not started)** — CUDA, gated on §5 step 3's chunked-parallel form, itself gated on exact
-  parity with Stage 1's sequential CPU reference.
+  parity with Stage 1's sequential CPU reference. `backend_cuda.cu`'s
+  `static_assert(!sub0::USE_GATED_DELTANET, ...)` guard is untouched by Stage 2 (CPU-only scope, per this
+  stage's own boundary) and remains the next callable seam down for a CUDA build.
