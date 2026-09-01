@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <utility>
 
 namespace sub0::gdn {
 
@@ -282,6 +283,510 @@ inline void forward(const Dims& d, int T,
             const float gi = gated[i];
             const float* Wo = w_out + static_cast<std::size_t>(i) * hs;
             for (int o = 0; o < hs; ++o) ot[o] += gi * Wo[o];
+        }
+    }
+}
+
+// =============================================================================================
+// Stage 2 -- CPU backward. RECOMPUTE-based (docs/GATED_DELTANET.md S4's closing paragraph, and its
+// own precedent -- docs/DEPTH_ATTENTION.md S5b's "backward_device already recomputes qkv per
+// execution"): forward() above never retains the state trajectory S_0..S_{T-1} (each S_t is
+// overwritten in place by the next step, and V's raw pre-recurrence value is overwritten by o_t) --
+// backward() below reruns the SAME forward math from the retained inputs (x + every weight tensor,
+// both already retained by the engine's own Node/arena machinery) into `scratch`, this time keeping
+// everything the backward sweep needs, rather than retaining an equivalent amount of state from
+// forward itself. This costs the same ORDER of memory forward's in-place trick avoided (S4), but only
+// as a single, reused, backward-time buffer -- see backend_cpu.cpp's GdnBwdScratch for why that buffer
+// is a lazily-sized thread_local std::vector, not a raw thread_local array (Worker's own comment on
+// why multi-MB thread_local statics are unsafe on Windows applies here too).
+//
+// Every equation below was hand-derived from forward()'s exact recurrence (S3b algebra: S_t =
+// g_t*(I - beta_t k_t k_t^T) S_{t-1} + beta_t k_t (x) v_t, a per-step affine map in S with transition
+// A_t and additive term B_t = k_t (x) delta_t), then verified -- BEFORE this port -- against two
+// independent oracles at TWO shapes: (1) the real transformers==5.16.1 Qwen4ExpTextGatedDeltaNet's own
+// chunked-path autograd gradients on the real extracted layer-0 weights
+// (tests/fixtures/qwen4_preview/gdn_layer0_small_grad_*.bin, loss = dot(out, a fixed random vector) so
+// every output element carries a distinct nonzero upstream gradient) -- max relative diff ~3e-7 for
+// every one of the 9 parameter tensors plus the input, double-precision NumPy vs the real oracle's
+// float32 autograd; and (2) a from-scratch synthetic Hk=2/Hv=4 (multi-group repeat_interleave, unlike
+// the real fixture's Hk=1) shape against torch.autograd on an independent from-scratch PyTorch
+// reimplementation of this exact math, matching to machine precision (~1e-15 relative). See
+// tests/gdn_qwen4_fixture_tests.cpp for the C++-level port of oracle (1).
+
+// Floats of caller-provided scratch backward() needs for T positions -- the recompute-and-retain
+// buffer described above. Dominated by the state trajectory (S_t for every t, not just the current
+// one, unlike forward()'s O(1)-in-T `state` buffer) -- see this file's header comment on why that is
+// the deliberate, bounded cost of the recompute approach, not an oversight.
+inline constexpr std::size_t bwd_scratch_floats(const Dims& d, int T) {
+    const std::size_t T_ = static_cast<std::size_t>(T);
+    const std::size_t Hv_ = static_cast<std::size_t>(d.num_v_heads);
+    const std::size_t dk_ = static_cast<std::size_t>(d.head_k_dim), dv_ = static_cast<std::size_t>(d.head_v_dim);
+    return T_ * static_cast<std::size_t>(d.conv_dim()) * 3          // qkv_pre, conv_pre_silu, qkv_post
+         + T_ * static_cast<std::size_t>(d.num_k_heads) * 2         // qinv, kinv
+         + T_ * Hv_ * dk_ * 2                                       // qn, kn (post-repeat_interleave)
+         + T_ * Hv_ * 3                                             // beta, g_exp, a_logit
+         + T_ * static_cast<std::size_t>(d.value_dim()) * 2         // z_proj, gated_flat
+         + T_ * Hv_ * dk_ * dv_                                     // S_traj (S_t, t=0..T-1)
+         + T_ * Hv_ * dv_ * 2                                       // delta_traj, core
+         + T_ * Hv_                                                 // rinv
+         + Hv_ * dk_ * dv_ * 2                                      // G_a, G_b (backward-recurrence ping-pong)
+         + dk_ * dv_;                                                // zero_state (shared, all-zero S_{-1})
+}
+
+namespace detail {
+inline float dsilu(float x) {   // silu(x) = x*sigmoid(x); dsilu/dx = s*(1+x*(1-s)), s=sigmoid(x)
+    const float s = sigmoid(x);
+    return s * (1.f + x * (1.f - s));
+}
+}  // namespace detail
+
+// Backward of ONE (t, v-head) step of the sequential delta-rule recurrence -- the adjoint of
+// recurrence_step's forward math, factored out the same way (AGENTS.md S6: independently testable).
+// `S_prev` = S_{t-1} ([dk,dv], the state BEFORE this step, zero at t=0), `S_cur` = S_t (AFTER this
+// step, as produced by recurrence_step at the time it ran), `delta_t` = this step's forward delta
+// ([dv], retained from the recompute sweep) -- all READ-ONLY, all recomputed/retained by the caller's
+// forward-recompute pass, never by this function. `do_t` ([dv]) is the EXTERNAL gradient on o_t (from
+// downstream, e.g. RMSNormGated's backward). `G_next` ([dk,dv]) is dS_{t+1} carried back from the
+// FUTURE step (the caller passes an all-zero buffer for the last position, T-1). `G_t` ([dk,dv]) is
+// SCRATCH the caller owns: this function fills it with dS_t (needed internally) and then OVERWRITES it
+// IN PLACE with g_t * d(S~_t) -- exactly the value the caller should pass as `G_next` for step t-1 (the
+// backward-recurrence's own "dS_{t-1} contribution from this step"), so a caller can walk t = T-1..0
+// reusing two ping-ponged [dk,dv] buffers with no further bookkeeping.
+//
+// `dq_t`/`dk_t` ([dk]) and `dv_t` ([dv]) are ACCUMULATED (+=) into by the caller across every v-head
+// this (t, physical k-head) group participates in (the repeat_interleave fold, done by the caller after
+// this loop, per S1b's Q/K broadcast). `d_beta_t`/`d_g_t` (scalars, +=) are this head's contribution to
+// d(loss)/d(beta_t) and d(loss)/d(g_t) -- g_t is the GATE VALUE exp(alpha_t), not alpha_t itself; the
+// caller chains d(alpha_t) = d_g_t * g_t afterward (g_t = exp(alpha_t)).
+inline void recurrence_step_backward(int dk, int dv, float g_t, float beta_t,
+                                      const float* k_t, const float* q_t, const float* v_t,
+                                      const float* S_prev, const float* S_cur, const float* delta_t,
+                                      const float* do_t, const float* G_next,
+                                      float* dq_t, float* dk_t, float* dv_t,
+                                      float* d_beta_t, float* d_g_t, float* G_t) {
+    // G_t = dS_t = G_next + q_t (x) do_t  (o_t = S_t^T q_t contributes q_t (x) do_t to dS_t directly).
+    for (int i = 0; i < dk; ++i) {
+        const float qi = q_t[i];
+        const float* Gn = G_next + static_cast<std::size_t>(i) * dv;
+        float* Gr = G_t + static_cast<std::size_t>(i) * dv;
+        for (int j = 0; j < dv; ++j) Gr[j] = Gn[j] + qi * do_t[j];
+    }
+    // dq_t += S_t @ do_t  (o_t[j] = sum_i q_t[i]*S_t[i,j]  ->  dq_t[i] = sum_j S_t[i,j]*do_t[j]).
+    for (int i = 0; i < dk; ++i) {
+        const float* Sr = S_cur + static_cast<std::size_t>(i) * dv;
+        float s = 0.f;
+        for (int j = 0; j < dv; ++j) s += Sr[j] * do_t[j];
+        dq_t[i] += s;
+    }
+    // u = k_t^T G_t == d(delta_t), from S_t = S~_t + k_t (x) delta_t's b-slot (outer-product adjoint).
+    float u[256];   // dv bound, matches this file's other generous head-dim bounds (real model: 128)
+    for (int j = 0; j < dv; ++j) u[j] = 0.f;
+    for (int i = 0; i < dk; ++i) {
+        const float ki = k_t[i];
+        const float* Gr = G_t + static_cast<std::size_t>(i) * dv;
+        for (int j = 0; j < dv; ++j) u[j] += ki * Gr[j];
+    }
+    // dk_t += G_t @ delta_t, from the SAME outer product's a-slot.
+    for (int i = 0; i < dk; ++i) {
+        const float* Gr = G_t + static_cast<std::size_t>(i) * dv;
+        float s = 0.f;
+        for (int j = 0; j < dv; ++j) s += Gr[j] * delta_t[j];
+        dk_t[i] += s;
+    }
+    // kv_mem_t = k_t^T S~_t, S~_t = g_t*S_prev (recomputed here, cheap -- one extra O(dk*dv) pass).
+    float kv_mem[256];
+    for (int j = 0; j < dv; ++j) kv_mem[j] = 0.f;
+    for (int i = 0; i < dk; ++i) {
+        const float kgd = k_t[i] * g_t;
+        const float* Sr = S_prev + static_cast<std::size_t>(i) * dv;
+        for (int j = 0; j < dv; ++j) kv_mem[j] += kgd * Sr[j];
+    }
+    // delta_t = beta_t*(v_t - kv_mem_t)  ->  d(beta_t) = dot(u, v_t - kv_mem_t);
+    // dv_t += beta_t*u ; d(kv_mem_t) = -beta_t*u.
+    float db = 0.f;
+    for (int j = 0; j < dv; ++j) db += u[j] * (v_t[j] - kv_mem[j]);
+    *d_beta_t += db;
+    for (int j = 0; j < dv; ++j) dv_t[j] += beta_t * u[j];
+    // kv_mem_t = k_t^T S~_t  ->  dk_t += S~_t @ d(kv_mem_t) = -beta_t * (S~_t @ u);
+    // d(S~_t) (direct, from S_t=S~_t+B_t) + (via kv_mem_t) = G_t[i,j] + k_t[i]*(-beta_t*u[j]).
+    for (int i = 0; i < dk; ++i) {
+        const float sd_row_scale = g_t;   // S~_t[i,j] = g_t*S_prev[i,j]
+        const float* Sr = S_prev + static_cast<std::size_t>(i) * dv;
+        float s = 0.f;
+        for (int j = 0; j < dv; ++j) s += (sd_row_scale * Sr[j]) * (-beta_t * u[j]);
+        dk_t[i] += s;
+    }
+    // d(g_t) = sum_ij d(S~_t)[i,j] * S_prev[i,j]  (S~_t = g_t*S_prev); also overwrite G_t IN PLACE with
+    // g_t * d(S~_t) -- the value the caller threads to the PREVIOUS step as its `G_next`.
+    float dgt = 0.f;
+    for (int i = 0; i < dk; ++i) {
+        const float ki = k_t[i];
+        float* Gr = G_t + static_cast<std::size_t>(i) * dv;
+        const float* Sr = S_prev + static_cast<std::size_t>(i) * dv;
+        for (int j = 0; j < dv; ++j) {
+            const float dSd_ij = Gr[j] + ki * (-beta_t * u[j]);
+            dgt += dSd_ij * Sr[j];
+            Gr[j] = g_t * dSd_ij;
+        }
+    }
+    *d_g_t += dgt;
+}
+
+// The full Stage 2 backward: recompute forward()'s math from x + every weight (retaining everything
+// this needs, per this section's header comment), then walk the chain in reverse to produce
+// d(loss)/d(x) and d(loss)/d(every one of the 9 weight tensors). Every output pointer is ACCUMULATED
+// (+=), matching this engine's own backward_node convention (param grads sum across the whole backward
+// walk) -- callers must zero them first (the engine's arena already does, via graph_reset()).
+//
+// `dOut` ([T,hidden_size]) is the upstream gradient on forward()'s `out`. `scratch` must be
+// >= bwd_scratch_floats(d,T) floats. Weight layout: this project's own [rows=in,cols=out] convention
+// throughout (same as forward(), see this file's header comment) -- NOT the raw fixture files'
+// PyTorch [out,in] convention (transpose first, as gdn_qwen4_fixture_tests.cpp's own transpose()
+// helper already does for forward()).
+inline void backward(const Dims& d, int T,
+                      const float* x,
+                      const float* w_qkv, const float* w_z, const float* w_b, const float* w_a,
+                      const float* conv_w, const float* dt_bias, const float* a_log, const float* norm_w,
+                      const float* w_out,
+                      const float* dOut,
+                      float* dx,
+                      float* dw_qkv, float* dw_z, float* dw_b, float* dw_a,
+                      float* dconv_w, float* ddt_bias, float* da_log, float* dnorm_w, float* dw_out,
+                      float* scratch) {
+    const int hs = d.hidden_size;
+    const int key_dim = d.key_dim(), value_dim = d.value_dim(), conv_dim = d.conv_dim();
+    const int K = d.conv_kernel;
+    const int Hk = d.num_k_heads, Hv = d.num_v_heads, rep = d.rep();
+    const int dk = d.head_k_dim, dv = d.head_v_dim;
+    constexpr float RMS_EPS = 1e-6f;
+    constexpr float L2_EPS  = 1e-6f;
+    const std::size_t T_ = static_cast<std::size_t>(T);
+
+    // --- Partition `scratch` (mirrors forward()'s own partitioning style) --------------------------
+    float* qkv_pre       = scratch; scratch += T_ * conv_dim;
+    float* conv_pre_silu = scratch; scratch += T_ * conv_dim;
+    float* qkv_post      = scratch; scratch += T_ * conv_dim;
+    float* qinv_buf      = scratch; scratch += T_ * Hk;
+    float* kinv_buf      = scratch; scratch += T_ * Hk;
+    float* qn            = scratch; scratch += T_ * Hv * dk;
+    float* kn            = scratch; scratch += T_ * Hv * dk;
+    float* beta          = scratch; scratch += T_ * Hv;
+    float* g_exp         = scratch; scratch += T_ * Hv;
+    float* a_logit       = scratch; scratch += T_ * Hv;
+    float* z_proj        = scratch; scratch += T_ * value_dim;
+    float* gated_flat    = scratch; scratch += T_ * value_dim;
+    float* S_traj        = scratch; scratch += T_ * Hv * dk * dv;
+    float* delta_traj    = scratch; scratch += T_ * Hv * dv;
+    float* core          = scratch; scratch += T_ * Hv * dv;          // later overwritten IN PLACE: d(core)
+    float* rinv_buf      = scratch; scratch += T_ * Hv;
+    float* G_a           = scratch; scratch += static_cast<std::size_t>(Hv) * dk * dv;
+    float* G_b           = scratch; scratch += static_cast<std::size_t>(Hv) * dk * dv;
+    float* zero_state    = scratch; /* scratch += dk*dv, unused after */
+
+    // --- Recompute forward, retaining everything (S4's recompute-during-backward direction) --------
+    for (int t = 0; t < T; ++t) {
+        const float* xt = x + static_cast<std::size_t>(t) * hs;
+        float* qkvr = qkv_pre + static_cast<std::size_t>(t) * conv_dim;
+        std::fill(qkvr, qkvr + conv_dim, 0.f);
+        float* zr = z_proj + static_cast<std::size_t>(t) * value_dim;
+        std::fill(zr, zr + value_dim, 0.f);
+        for (int i = 0; i < hs; ++i) {
+            const float xi = xt[i];
+            const float* Wq = w_qkv + static_cast<std::size_t>(i) * conv_dim;
+            for (int o = 0; o < conv_dim; ++o) qkvr[o] += xi * Wq[o];
+            const float* Wz = w_z + static_cast<std::size_t>(i) * value_dim;
+            for (int o = 0; o < value_dim; ++o) zr[o] += xi * Wz[o];
+        }
+        for (int hh = 0; hh < Hv; ++hh) {
+            float bs = 0.f, as_ = 0.f;
+            for (int i = 0; i < hs; ++i) {
+                bs  += xt[i] * w_b[static_cast<std::size_t>(i) * Hv + hh];
+                as_ += xt[i] * w_a[static_cast<std::size_t>(i) * Hv + hh];
+            }
+            beta[static_cast<std::size_t>(t) * Hv + hh] = detail::sigmoid(bs);
+            a_logit[static_cast<std::size_t>(t) * Hv + hh] = as_;
+            g_exp[static_cast<std::size_t>(t) * Hv + hh] =
+                std::exp(-std::exp(a_log[hh]) * detail::softplus(as_ + dt_bias[hh]));
+        }
+    }
+    for (int c = 0; c < conv_dim; ++c) {
+        for (int t = 0; t < T; ++t) {
+            float s = 0.f;
+            for (int k = 0; k < K; ++k) {
+                const int v = t + k;
+                const float val = (v < K - 1) ? 0.f   // training path: always-zero initial conv history
+                                               : qkv_pre[static_cast<std::size_t>(v - (K - 1)) * conv_dim + c];
+                s += conv_w[static_cast<std::size_t>(c) * K + k] * val;
+            }
+            conv_pre_silu[static_cast<std::size_t>(t) * conv_dim + c] = s;
+            qkv_post[static_cast<std::size_t>(t) * conv_dim + c] = detail::silu(s);
+        }
+    }
+    const int q_off = 0, k_off = key_dim, v_off = 2 * key_dim;
+    for (int t = 0; t < T; ++t) {
+        for (int hk = 0; hk < Hk; ++hk) {
+            const float* qraw = qkv_post + static_cast<std::size_t>(t) * conv_dim + q_off + hk * dk;
+            const float* kraw = qkv_post + static_cast<std::size_t>(t) * conv_dim + k_off + hk * dk;
+            float qss = 0.f, kss = 0.f;
+            for (int a = 0; a < dk; ++a) { qss += qraw[a] * qraw[a]; kss += kraw[a] * kraw[a]; }
+            const float qinv = 1.f / std::sqrt(qss + L2_EPS);
+            const float kinv = 1.f / std::sqrt(kss + L2_EPS);
+            qinv_buf[static_cast<std::size_t>(t) * Hk + hk] = qinv;
+            kinv_buf[static_cast<std::size_t>(t) * Hk + hk] = kinv;
+            const float qscale = qinv / std::sqrt(static_cast<float>(dk));
+            for (int r = 0; r < rep; ++r) {
+                const int hv = hk * rep + r;
+                float* qnr = qn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+                float* knr = kn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+                for (int a = 0; a < dk; ++a) { qnr[a] = qraw[a] * qscale; knr[a] = kraw[a] * kinv; }
+            }
+        }
+    }
+    // Recurrence forward, retaining the FULL trajectory S_traj[t] = S_t for every t (unlike forward()'s
+    // O(1)-in-T `state` buffer, which overwrites in place) -- S_{t-1} is read directly as S_traj[t-1]
+    // (an all-zero virtual S_traj[-1] at t==0, per the training path's fresh-window invariant), so no
+    // separate running accumulator is needed and nothing here heap-allocates (AGENTS.md S1).
+    for (int hv = 0; hv < Hv; ++hv) {
+        for (int t = 0; t < T; ++t) {
+            const float g_t = g_exp[static_cast<std::size_t>(t) * Hv + hv];
+            const float beta_t = beta[static_cast<std::size_t>(t) * Hv + hv];
+            const float* kt = kn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+            const float* qt = qn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+            const float* vt = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off + hv * dv;
+            const float* Sprev = (t == 0) ? nullptr
+                                           : S_traj + (static_cast<std::size_t>(t - 1) * Hv + hv) * dk * dv;
+            float* Sdst = S_traj + (static_cast<std::size_t>(t) * Hv + hv) * dk * dv;
+            float* deltad = delta_traj + (static_cast<std::size_t>(t) * Hv + hv) * dv;
+            float* cored = core + (static_cast<std::size_t>(t) * Hv + hv) * dv;
+            // S~_t = g_t*S_{t-1}; kv_mem = S~_t^T k_t; delta = beta_t*(v_t-kv_mem); S_t = S~_t + k(x)delta.
+            for (int i = 0; i < dk; ++i) {
+                float* Sr = Sdst + static_cast<std::size_t>(i) * dv;
+                if (Sprev) { const float* Pr = Sprev + static_cast<std::size_t>(i) * dv;
+                             for (int j = 0; j < dv; ++j) Sr[j] = g_t * Pr[j]; }
+                else       { for (int j = 0; j < dv; ++j) Sr[j] = 0.f; }
+            }
+            float kv_mem[256];
+            for (int j = 0; j < dv; ++j) kv_mem[j] = 0.f;
+            for (int i = 0; i < dk; ++i) {
+                const float ki = kt[i];
+                const float* Sr = Sdst + static_cast<std::size_t>(i) * dv;   // == S~_t so far
+                for (int j = 0; j < dv; ++j) kv_mem[j] += ki * Sr[j];
+            }
+            for (int j = 0; j < dv; ++j) deltad[j] = beta_t * (vt[j] - kv_mem[j]);
+            for (int i = 0; i < dk; ++i) {
+                const float ki = kt[i];
+                float* Sr = Sdst + static_cast<std::size_t>(i) * dv;
+                for (int j = 0; j < dv; ++j) Sr[j] += ki * deltad[j];   // S~_t -> S_t, in place
+            }
+            for (int j = 0; j < dv; ++j) cored[j] = 0.f;
+            for (int i = 0; i < dk; ++i) {
+                const float qi = qt[i];
+                const float* Sr = Sdst + static_cast<std::size_t>(i) * dv;
+                for (int j = 0; j < dv; ++j) cored[j] += qi * Sr[j];
+            }
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        const float* core_row = core + static_cast<std::size_t>(t) * Hv * dv;
+        const float* z_row = z_proj + static_cast<std::size_t>(t) * value_dim;
+        float* gated_row = gated_flat + static_cast<std::size_t>(t) * value_dim;
+        for (int hh = 0; hh < Hv; ++hh) {
+            const float* cv = core_row + hh * dv;
+            const float* zv = z_row + hh * dv;
+            float ms = 0.f;
+            for (int j = 0; j < dv; ++j) ms += cv[j] * cv[j];
+            ms /= dv;
+            const float rinv = 1.f / std::sqrt(ms + RMS_EPS);
+            rinv_buf[static_cast<std::size_t>(t) * Hv + hh] = rinv;
+            for (int j = 0; j < dv; ++j)
+                gated_row[hh * dv + j] = norm_w[j] * (cv[j] * rinv) * detail::sigmoid(zv[j]);
+        }
+    }
+
+    // --- Backward: out_proj, then RMSNormGated, per position --------------------------------------
+    // out = gated_flat @ w_out ([in=value_dim,out=hs], same convention as forward()'s own out_proj loop
+    // and backend_cpu.cpp's Op::Linear backward): d(gated_flat) = dOut @ w_out^T, d(w_out) accumulates
+    // gated_flat^T @ dOut. RMSNormGated's backward then overwrites `core` and `z_proj` IN PLACE with
+    // d(core) / d(z_logit) respectively -- safe because every read of a given (t,head)'s core/z values
+    // happens-before that same (t,head)'s first overwrite (see the two-pass structure below).
+    float d_gated_row[/*value_dim, generous*/ 4096];
+    float gate_cache[256], d_normed_cache[256];   // dv bound, matches this file's other head-dim bounds
+    for (int t = 0; t < T; ++t) {
+        const float* dYr = dOut + static_cast<std::size_t>(t) * hs;
+        for (int i = 0; i < value_dim; ++i) {
+            const float* Wr = w_out + static_cast<std::size_t>(i) * hs;
+            float s = 0.f;
+            for (int o = 0; o < hs; ++o) s += dYr[o] * Wr[o];
+            d_gated_row[i] = s;
+        }
+        const float* Xr = gated_flat + static_cast<std::size_t>(t) * value_dim;
+        for (int i = 0; i < value_dim; ++i) {
+            float* Wg = dw_out + static_cast<std::size_t>(i) * hs;
+            const float xip = Xr[i];
+            for (int o = 0; o < hs; ++o) Wg[o] += xip * dYr[o];
+        }
+
+        float* core_row = core + static_cast<std::size_t>(t) * Hv * dv;      // -> becomes d(core)
+        float* z_row = z_proj + static_cast<std::size_t>(t) * value_dim;     // -> becomes d(z_logit)
+        for (int hh = 0; hh < Hv; ++hh) {
+            float* cv = core_row + hh * dv;
+            float* zv = z_row + hh * dv;
+            const float rinv = rinv_buf[static_cast<std::size_t>(t) * Hv + hh];
+            const float r3_over_dv = (rinv * rinv * rinv) / static_cast<float>(dv);
+            float Ssum = 0.f;
+            for (int j = 0; j < dv; ++j) {
+                const float gate = detail::sigmoid(zv[j]);
+                gate_cache[j] = gate;
+                const float normed = cv[j] * rinv;
+                const float dg = d_gated_row[hh * dv + j];
+                const float d_normed = dg * norm_w[j] * gate;
+                d_normed_cache[j] = d_normed;
+                dnorm_w[j] += dg * normed * gate;
+                const float d_gate = dg * norm_w[j] * normed;
+                zv[j] = d_gate * gate * (1.f - gate);          // overwrite z_proj IN PLACE: d(z_logit)
+                Ssum += d_normed * cv[j];
+            }
+            for (int j = 0; j < dv; ++j)
+                cv[j] = d_normed_cache[j] * rinv - cv[j] * r3_over_dv * Ssum;   // overwrite core IN PLACE
+        }
+    }
+
+    // --- Backward: the sequential recurrence, walking t = T-1 .. 0 --------------------------------
+    // G_cur/G_next: [Hv,dk,dv] ping-pong of dS_t / dS_{t+1} (no future beyond T-1, so G_next starts
+    // all-zero). `core` (now holding d(core), i.e. do_t) and `qn`/`kn` (still the FORWARD Q/K, read-only
+    // here) feed recurrence_step_backward; `qkv_post`'s Q/K/V columns are overwritten IN PLACE, per
+    // head/position, with d(q_raw)/d(k_raw)/d(v_raw) as each is computed -- by the time this whole
+    // reverse walk finishes, `qkv_post` holds the FULL d(qkv_post) (SiLU's own backward input) rather
+    // than the original post-conv activations, and `beta`/`a_logit` hold d(b_logit)/d(a_logit).
+    std::fill(zero_state, zero_state + static_cast<std::size_t>(dk) * dv, 0.f);
+    std::fill(G_b, G_b + static_cast<std::size_t>(Hv) * dk * dv, 0.f);   // G_next for t=T-1: no future
+    float* G_cur = G_a;
+    float* G_next = G_b;
+    float d_qn_hk_t[/*Hk*dk, generous*/ 4096], d_kn_hk_t[4096];
+    const float inv_sqrt_dk = 1.f / std::sqrt(static_cast<float>(dk));
+
+    for (int t = T - 1; t >= 0; --t) {
+        std::fill(d_qn_hk_t, d_qn_hk_t + Hk * dk, 0.f);
+        std::fill(d_kn_hk_t, d_kn_hk_t + Hk * dk, 0.f);
+        const float* do_row = core + static_cast<std::size_t>(t) * Hv * dv;   // d(core) at this t
+        float* qkv_row_w = qkv_post + static_cast<std::size_t>(t) * conv_dim;
+
+        for (int hv = 0; hv < Hv; ++hv) {
+            const int hk = hv / rep;
+            const float g_t = g_exp[static_cast<std::size_t>(t) * Hv + hv];
+            const float beta_t = beta[static_cast<std::size_t>(t) * Hv + hv];
+            const float* kt = kn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+            const float* qt = qn + (static_cast<std::size_t>(t) * Hv + hv) * dk;
+            const float* vt = qkv_row_w + v_off + hv * dv;
+            const float* Sprev = (t == 0) ? zero_state
+                                           : S_traj + (static_cast<std::size_t>(t - 1) * Hv + hv) * dk * dv;
+            const float* Scur = S_traj + (static_cast<std::size_t>(t) * Hv + hv) * dk * dv;
+            const float* deltat = delta_traj + (static_cast<std::size_t>(t) * Hv + hv) * dv;
+            const float* do_t = do_row + hv * dv;
+            float* Gn = G_next + static_cast<std::size_t>(hv) * dk * dv;
+            float* Gc = G_cur + static_cast<std::size_t>(hv) * dk * dv;
+
+            float dq_head[256] = {}, dk_head[256] = {}, dv_head[256] = {};
+            float d_beta_t = 0.f, d_g_t = 0.f;
+            recurrence_step_backward(dk, dv, g_t, beta_t, kt, qt, vt, Sprev, Scur, deltat, do_t, Gn,
+                                      dq_head, dk_head, dv_head, &d_beta_t, &d_g_t, Gc);
+
+            for (int a = 0; a < dk; ++a) { d_qn_hk_t[hk * dk + a] += dq_head[a]; d_kn_hk_t[hk * dk + a] += dk_head[a]; }
+            float* vw = qkv_row_w + v_off + hv * dv;
+            for (int j = 0; j < dv; ++j) vw[j] = dv_head[j];   // overwrite qkv_post's V slot: d(v_raw)
+
+            const float bt = beta_t;
+            beta[static_cast<std::size_t>(t) * Hv + hv] = d_beta_t * bt * (1.f - bt);   // -> d(b_logit)
+
+            const float d_alpha = d_g_t * g_t;                 // g_t = exp(alpha_t)
+            const float expA = std::exp(a_log[hv]);
+            const float sp_arg = a_logit[static_cast<std::size_t>(t) * Hv + hv] + dt_bias[hv];
+            const float d_sp_arg = (d_alpha * -expA) * detail::sigmoid(sp_arg);   // softplus' = sigmoid
+            a_logit[static_cast<std::size_t>(t) * Hv + hv] = d_sp_arg;             // -> d(a_logit)
+            ddt_bias[hv] += d_sp_arg;
+            da_log[hv] += d_alpha * (-expA * detail::softplus(sp_arg));           // d(exp(A_log))/d(A_log)=exp(A_log)
+        }
+        std::swap(G_cur, G_next);
+
+        // L2-norm(+scale) backward for Q/K at this t, folding the repeat_interleave sum computed above.
+        // Overwrites qkv_post's Q/K slots IN PLACE with d(q_raw)/d(k_raw) -- V was already overwritten
+        // above and does not alias these column ranges.
+        for (int hk = 0; hk < Hk; ++hk) {
+            const float* qraw = qkv_row_w + q_off + hk * dk;
+            const float* kraw = qkv_row_w + k_off + hk * dk;
+            const float qinv = qinv_buf[static_cast<std::size_t>(t) * Hk + hk];
+            const float kinv = kinv_buf[static_cast<std::size_t>(t) * Hk + hk];
+            const float* dqhk = d_qn_hk_t + hk * dk;
+            const float* dkhk = d_kn_hk_t + hk * dk;
+            float dotq = 0.f, dotk = 0.f;
+            for (int a = 0; a < dk; ++a) { dotq += qraw[a] * dqhk[a]; dotk += kraw[a] * dkhk[a]; }
+            float* qw = qkv_row_w + q_off + hk * dk;
+            float* kw = qkv_row_w + k_off + hk * dk;
+            const float qinv3 = qinv * qinv * qinv, kinv3 = kinv * kinv * kinv;
+            for (int a = 0; a < dk; ++a) {
+                qw[a] = inv_sqrt_dk * (qinv * dqhk[a] - qraw[a] * qinv3 * dotq);
+                kw[a] = kinv * dkhk[a] - kraw[a] * kinv3 * dotk;
+            }
+        }
+    }
+
+    // --- Backward: SiLU, then the causal depthwise conv (a GATHER over output positions, so the
+    // original qkv_pre value at each input position is read exactly once and can be overwritten in
+    // place with d(qkv_pre) immediately after) ------------------------------------------------------
+    for (std::size_t i = 0; i < T_ * static_cast<std::size_t>(conv_dim); ++i)
+        qkv_post[i] *= detail::dsilu(conv_pre_silu[i]);   // qkv_post now holds d(conv_pre_silu)
+
+    for (int c = 0; c < conv_dim; ++c) {
+        for (int src_t = 0; src_t < T; ++src_t) {
+            float acc = 0.f;
+            for (int k = 0; k < K; ++k) {
+                const int t = src_t + (K - 1) - k;   // v_idx = t+k = src_t+(K-1)  ->  t = src_t+(K-1)-k
+                if (t < 0 || t >= T) continue;
+                const float dg = qkv_post[static_cast<std::size_t>(t) * conv_dim + c];
+                acc += conv_w[static_cast<std::size_t>(c) * K + k] * dg;
+                dconv_w[static_cast<std::size_t>(c) * K + k] += qkv_pre[static_cast<std::size_t>(src_t) * conv_dim + c] * dg;
+            }
+            qkv_pre[static_cast<std::size_t>(src_t) * conv_dim + c] = acc;   // overwrite IN PLACE: d(qkv_pre)
+        }
+    }
+
+    // --- Backward: the four input projections (in_proj_qkv/z/b/a), Op::Linear's own dX/dW shapes ----
+    // dx[t,p] += sum_o dY[t,o]*W[p,o] ; dW[p,o] += sum_t x[t,p]*dY[t,o]. qkv_pre/z_proj/beta/a_logit now
+    // hold d(qkv_pre)/d(z_logit)/d(b_logit)/d(a_logit) respectively, per the in-place overwrites above.
+    for (int t = 0; t < T; ++t) {
+        const float* dqkvr = qkv_pre + static_cast<std::size_t>(t) * conv_dim;
+        const float* dzr   = z_proj  + static_cast<std::size_t>(t) * value_dim;
+        const float* dbr   = beta    + static_cast<std::size_t>(t) * Hv;
+        const float* dar   = a_logit + static_cast<std::size_t>(t) * Hv;
+        float* dxr = dx + static_cast<std::size_t>(t) * hs;
+        for (int p = 0; p < hs; ++p) {
+            float s = 0.f;
+            const float* Wq = w_qkv + static_cast<std::size_t>(p) * conv_dim;
+            for (int o = 0; o < conv_dim; ++o) s += dqkvr[o] * Wq[o];
+            const float* Wz = w_z + static_cast<std::size_t>(p) * value_dim;
+            for (int o = 0; o < value_dim; ++o) s += dzr[o] * Wz[o];
+            const float* Wb = w_b + static_cast<std::size_t>(p) * Hv;
+            for (int o = 0; o < Hv; ++o) s += dbr[o] * Wb[o];
+            const float* Wa = w_a + static_cast<std::size_t>(p) * Hv;
+            for (int o = 0; o < Hv; ++o) s += dar[o] * Wa[o];
+            dxr[p] += s;
+        }
+    }
+    for (int p = 0; p < hs; ++p) {
+        float* Wg_qkv = dw_qkv + static_cast<std::size_t>(p) * conv_dim;
+        float* Wg_z   = dw_z   + static_cast<std::size_t>(p) * value_dim;
+        float* Wg_b   = dw_b   + static_cast<std::size_t>(p) * Hv;
+        float* Wg_a   = dw_a   + static_cast<std::size_t>(p) * Hv;
+        for (int t = 0; t < T; ++t) {
+            const float xtp = x[static_cast<std::size_t>(t) * hs + p];
+            const float* dqkvr = qkv_pre + static_cast<std::size_t>(t) * conv_dim;
+            for (int o = 0; o < conv_dim; ++o) Wg_qkv[o] += xtp * dqkvr[o];
+            const float* dzr = z_proj + static_cast<std::size_t>(t) * value_dim;
+            for (int o = 0; o < value_dim; ++o) Wg_z[o] += xtp * dzr[o];
+            const float* dbr = beta + static_cast<std::size_t>(t) * Hv;
+            for (int o = 0; o < Hv; ++o) Wg_b[o] += xtp * dbr[o];
+            const float* dar = a_logit + static_cast<std::size_t>(t) * Hv;
+            for (int o = 0; o < Hv; ++o) Wg_a[o] += xtp * dar[o];
         }
     }
 }
