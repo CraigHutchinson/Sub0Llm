@@ -1,6 +1,8 @@
 # Gated DeltaNet — design, derived from the reference
 
-Status: **DESIGN + Stage 0 skeleton only.** No forward, no backward, no CPU op, no CUDA op. Follows
+Status: **Stage 1 DONE — real CPU forward, fixture-verified, no backward, no CUDA.** See §6 for the
+staging status, the fixture-comparison numbers, and the one real correction to this doc's own §1b found
+while implementing it. Follows
 `docs/DEPTH_ATTENTION.md`'s structure (that document is the precedent for how a genuinely new op type
 gets threaded through this engine) and `docs/QWEN4_PREVIEW_REFERENCE.md`'s staged plan, which flags this
 as the higher-risk of the two Qwen4-preview mechanisms because this engine's attention today is
@@ -201,18 +203,28 @@ conv_kernel_size - 1]` fixed-size ring buffer for the short causal conv's state,
 single-token decode regardless of the exact class name, and is the shape §2 designs the arena/memplan
 interaction around.
 
-### 1e. What is genuinely NOT re-verified this pass
+### 1e. RESOLVED in Stage 1 — the decode branch was re-fetched and re-quoted directly
 
-The real `Qwen4ExpTextGatedDeltaNet.forward()`'s *cached* (single-token decode) branch and its exact
-`torch_recurrent_gated_delta_rule`-equivalent were not re-quoted from `modeling_qwen4_exp.py` directly —
-only the no-cache/prefill path the fixture actually exercises (§1b) was. Given `torch_chunk_gated_delta_rule`
-above is confirmed to reduce to exactly the delta-rule/decay/error-correction shape this doc always
-described, and Qwen3-Next's own decode-time `torch_recurrent_gated_delta_rule` (quoted in this doc's first
-draft, §1a there) is definitionally the token-at-a-time unrolling of the identical recurrence, treating it
-as representative of `modeling_qwen4_exp.py`'s own decode path is a reasonable working assumption for
-design purposes — but Stage 1 (this doc's numbering) should re-fetch and re-quote
-`modeling_qwen4_exp.py`'s actual decode branch directly before relying on it byte-for-byte, per AGENTS.md
-§5's standing rule.
+This section originally flagged that the real `Qwen4ExpTextGatedDeltaNet.forward()`'s *cached*
+(single-token decode) branch and its exact `torch_recurrent_gated_delta_rule` had not been re-quoted
+from `modeling_qwen4_exp.py` directly, and that Stage 1 should do so before relying on it byte-for-byte
+(AGENTS.md §5). Stage 1 did: this machine has `transformers==5.16.1` installed, so
+`python3 -c "import inspect, transformers.models.qwen4_exp.modeling_qwen4_exp as m; print(inspect.
+getsource(m.torch_recurrent_gated_delta_rule))"` (and the same for `Qwen4ExpTextGatedDeltaNet.forward`,
+`torch_chunk_gated_delta_rule`, `causal_conv1d_fn`/`causal_conv1d_update`, `Qwen4ExpTextRMSNormGated`,
+`l2norm`) fetched the REAL, exact, installed source directly — not a proxy, not Qwen3-Next's analogue.
+
+Two things this resolved:
+1. `torch_recurrent_gated_delta_rule` IS exactly the token-at-a-time unrolling this doc always predicted
+   — `S = g_t·S; kv_mem = Sᵀk_t; delta = β_t·(v_t−kv_mem); S += k_t⊗delta; o_t = Sᵀq_t`, confirmed
+   line-for-line, not merely "reasonable to assume by analogy" any more.
+2. **A real correction the assumption-based version would have missed**: both `torch_recurrent_
+   gated_delta_rule` and `torch_chunk_gated_delta_rule` scale query by `1/sqrt(head_k_dim)`
+   immediately after L2-normalizing it, ONE LINE before §1b's already-quoted loop even begins — so §1b's
+   own claim "No explicit `1/√d_k` scale appears anywhere in this recurrence" is true only of the lines
+   it quotes. `include/sub0/gdn_math.hpp` implements the scale; see that file's header comment and §6's
+   Stage 1 entry for the fixture-match numbers that confirm it (a large mismatch without the scale, an
+   exact match with it).
 
 ## 2. Interaction with this engine's KV-cache / arena model
 
@@ -558,17 +570,95 @@ operations this project already chose for attention itself.
   shaped, ODD-layer-count real build (d448 L11 H7 seq512) — the full suite is slow to re-run at that scale
   end-to-end, but the `[layout][config][gdn][depth]`-tagged subset (10 test cases) passes identically
   there too, including both new GDN schedule/fingerprint tests.
-- **Stage 1 (not started)** — CPU forward only, per §5's sequential-form target, gated on the real-weight
-  fixtures **already landed** at `tests/fixtures/qwen4_preview/gdn_layer0_small_*`
-  (`docs/QWEN4_PREVIEW_REFERENCE.md`'s own Stage 0/1, DONE 2026-08-30 — see §0's staging-terminology
-  note). In addition to that fixture match, an explicit interim numerical-property check per AGENTS.md §6
-  is still worth adding independently — e.g. that the recurrence genuinely degenerates to plain
-  cumulative summation when `g_t ≡ 1, β_t ≡ 1`, and that a zero-`β` build is provably a no-op update, the
-  same kind of "mutation-tested" property check `docs/DEPTH_ATTENTION.md` §6 used, since a real-weight
-  fixture match alone does not by itself rule out a subtly-wrong implementation that happens to agree on
-  one input (the mutation-testing lesson: a no-op `return v;` can still pass a naive check). No backward
-  pass yet — this doc's own scope boundary, and the natural next boundary after that given §4's finding
-  that backward wants a recompute-based design, not a naive full-trajectory retention.
+- **Stage 1 — CPU forward only — DONE.** `GDN_FULL_ATTN_STRIDE`'s Stage 0 hard clamp lifted (CLI
+  `CLI::Range` now `(0, 1024)`; `layout.hpp`'s `static_assert` now just `>= 0`), per-layer `make_param_
+  layout()`/`NUM_PARAMS` (nine new `PKind`s: `GdnInProjQkv/Z/B/A`, `GdnConv`, `GdnALog`, `GdnDtBias`,
+  `GdnNorm`, `GdnOutProj`), and `op_gdn` (`backend_cpu.cpp`) wired into `Model::forward`'s per-execution
+  dispatch (`GDN_SCHEDULE.full_attn[l]`) plus the mirror decode path in `forward_one` via a new `GdnCache`
+  (persistent per-execution recurrent-state/conv-history slots, reset — unconditionally, unlike KVCache —
+  by `kv_reset()`, exactly §2's design). The shared math (§5 step 1's sequential recurrence, the S1c
+  short causal conv + SiLU, the S1c RMSNormGated gate) lives engine-free in `include/sub0/gdn_math.hpp`
+  so it is directly unit-testable at the real fixture's own (non-conforming) shape — see §3b's flagged
+  mismatch, confirmed exactly as predicted: the fixture cannot be run through this project's own `Model`
+  at all (`hidden_size=32 ≠ num_v_heads·head_v_dim=384`), so `tests/gdn_qwen4_fixture_tests.cpp` calls
+  `sub0::gdn::forward` directly, engine-free, the same pattern `ngram_qwen4_fixture_tests.cpp` already
+  established.
+
+  **One real correction to this doc, found only by re-fetching `transformers==5.16.1`'s installed source
+  directly (AGENTS.md §5) rather than trusting §1b's already-quoted snippet**: both
+  `torch_recurrent_gated_delta_rule` and `torch_chunk_gated_delta_rule` scale **query** by
+  `1/sqrt(head_k_dim)` immediately after L2-normalizing it, one line before §1b's quoted loop even
+  starts. §1b's claim "No explicit `1/√d_k` scale appears anywhere in this recurrence" is true only of
+  the lines it quotes — the earlier line was missed. Omitting this scale reproduces a plausible-looking
+  but numerically wrong output (confirmed directly: a large fixture mismatch without it, an exact match
+  with it). See `gdn_math.hpp`'s own header comment for the full account — this is exactly the kind of
+  thing AGENTS.md §5 exists to catch, and it would not have been caught without actually re-fetching the
+  real, installed module source (this machine has `transformers==5.16.1` installed, so this was a direct
+  `python3 -c "import inspect, ..."` fetch, not a web lookup).
+
+  **Fixture-comparison numbers** (`tests/gdn_qwen4_fixture_tests.cpp`, real weights, `T=6` real
+  fixture input, sequential CPU forward vs. the real reference's CHUNKED-path output): max
+  `|out − expected| = 4.36557e-11`, max relative diff `1.85136e-05`, `sum|expected| = 0.00170643` over
+  192 output values — essentially float32-rounding-level agreement, not an approximate match. This
+  directly confirms §5 step 2's prediction: the sequential and chunked forms agree exactly at the token
+  level on a real case, at the SAME time as confirming correctness against the real model. (A pre-port
+  double-precision NumPy re-derivation of the identical math, checked directly against the fixture
+  before any C++ was written, measured `4.4e-11` — the C++ float32 port lands at the same order of
+  magnitude, as expected.)
+
+  **Mutation-style numerical-property checks** (same file, no fixture needed — call
+  `sub0::gdn::recurrence_step` directly, factored out of `forward()` as its own tested primitive):
+  at `g_t ≡ 1, β_t ≡ 1` with mutually orthonormal keys, the state is verified EXACTLY equal (to `< 1e-6`
+  float32 noise) to the closed-form running sum of `k_t ⊗ v_t` outer products after every one of 5 steps
+  — the recurrence genuinely degenerates to plain cumulative summation, not merely "doesn't obviously
+  break". At `β_t ≡ 0, g_t ≡ 1`, the state is proven a BIT-FOR-BIT no-op (exact IEEE-754 equality) and
+  the output is invariant across 4 unrelated, nonzero `(k_t, v_t)` trial inputs — the kind of check a
+  "forgot to gate the write on beta" mutant would fail even though it might still pass a single fixed
+  fixture comparison. All 3 GDN test cases (fixture match + 2 mutation checks): 87 assertions, green.
+
+  **Two-scale identity check** (AGENTS.md §7, reusing this project's own precedent of an odd/
+  non-dividing layer count as the second shape): at `GDN_FULL_ATTN_STRIDE == 0` (neutral), the full
+  default engine test suite (`sub0_tests`) is assertion- AND hash-identical to `main` at BOTH shapes —
+  not just the same count, the same computed forward/gradient/decode content hash:
+  | shape | assertions | test cases | forward hash | grad hash | decode hash |
+  |---|---|---|---|---|---|
+  | d96 L8 H2 kv2 seq128 (even stride-4-shaped) | 4,978,665 | 137 | `ec1d6e05e417d129` | `fa6094a1748ccead` | `7178bbf9b452aa0d` |
+  | d132 L11 H4 kv2 seq96 (odd/ragged) | 11,952,837 | 137 | `11510f553cc233d9` | `1b4bbb318f886909` | `278d7ccd2c6e3ab3` |
+
+  identical on `main` and on this Stage-1 commit at both shapes (verified by building each side of the
+  diff at the same generated config header and diffing `sub0_tests`' own `arch_identity_tests.cpp`
+  output, not just "still green"). Two PRE-EXISTING `layout_tests.cpp` cases hard-coded the pre-Stage-1
+  assumption that every layer has an identical tensor set (the `NUM_PARAMS` formula, and the decay/
+  ternary-flag consistency loop) — both updated to be `GDN_SCHEDULE`-aware, verified as no-ops at stride
+  0 (the two-scale numbers above already reflect the fix) and verified to actually catch/pass correctly
+  at a real GDN-on build (d96 L8 H2 kv2, stride 3): the layout-consistency test now passes there; the
+  OTHER pre-existing failure at that shape (`arch fingerprint2 stays bit-identical when Gated DeltaNet
+  is off`) is not a regression — it is testing the OFF premise, which is deliberately false in that build.
+
+  **Forward-only correctness inside the real engine, at both shapes**: this project's own pre-existing
+  `forward_one (KV-cache) matches the full forward per position` test (`tests/engine_tests.cpp`, no
+  GDN-specific code — it runs unconditionally) passed at a GDN-ON build with NO changes needed, at both
+  shapes: worst per-position relative diff `3.88717e-07` (d96 L8 H2 kv2, stride 3, 6 GDN + 2 attention
+  layers) and `5.81367e-07` (d132 L11 H4 kv2, stride 4, 9 GDN + 2 attention layers) — both far inside the
+  `1e-3` fast-math tolerance and consistent with ordinary floating-point noise, not an algorithmic
+  mismatch. This is the batched `op_gdn` and the decode-path `GdnCache`/`forward_one` branch agreeing
+  with EACH OTHER on a real mixed attention+GDN, GQA, LoopSplit-free forward pass — independent evidence
+  from the fixture match above, which never exercises `forward_one` or a mixed-layer schedule at all.
+
+  **No design revision needed beyond §1b's scale correction above.** §2's arena/decode-state design,
+  §3's checkpoint/fingerprint plumbing, and §4's "no Node-fanout problem" finding all held up exactly as
+  written once actually implemented — `op_gdn` takes `Layer&` directly (no generic `a`/`b`/`w`/`bias`
+  routing needed, since Stage 1 has no backward to preserve node-graph linkage for) and `GdnCache` is a
+  direct structural mirror of `KVCache`, with the one documented divergence already anticipated by §2:
+  it must re-zero UNCONDITIONALLY on `kv_reset()` (an accumulator, not a self-healing per-position row
+  store the way `KVCache` is).
+
+  **No backward pass, no CUDA** — this stage's own explicit scope boundary. `backend_cpu.cpp`'s
+  `backward_node` has an `Op::GDN` case that aborts loudly (not a silent no-op) if `train_batch` ever
+  reaches a GDN node, mirroring `backend_cuda.cu`'s new `static_assert(!sub0::USE_GATED_DELTANET, ...)`
+  guard (added this stage — Stage 0 had not needed one, since the axis was compile-clamped to 0
+  everywhere before now) at the next callable seam down, since a GDN CPU binary compiles and runs fine
+  for forward-only uses (gen/eval/report) regardless.
 - **Stage 2 (not started)** — backward pass (CPU), per §4's recompute-during-backward direction.
 - **Stage 3 (not started)** — CUDA, gated on §5 step 3's chunked-parallel form, itself gated on exact
   parity with Stage 1's sequential CPU reference.
