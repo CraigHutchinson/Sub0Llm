@@ -21,6 +21,8 @@
 
 #include "sub0/gdn_math.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
@@ -135,3 +137,86 @@ TEST_CASE("Gated DeltaNet sequential CPU forward matches the real Qwen4-preview 
 }
 
 #endif  // SUB0_SOURCE_DIR
+
+// --- Mutation-style numerical property checks (docs/GATED_DELTANET.md sec 6 / AGENTS.md S6) ----------
+// A real-weight fixture match alone does not rule out a subtly wrong implementation that happens to
+// agree on ONE input (the depth-attention lesson, docs/DEPTH_ATTENTION.md sec 6: a stubbed "return v;"
+// can still pass a naive check). These call sub0::gdn::recurrence_step DIRECTLY with hand-picked
+// g_t/beta_t/k_t/q_t/v_t -- no fixture files needed, so they always run.
+
+// With g_t == 1 (no decay) and beta_t == 1 (full write, no forgetting) and MUTUALLY ORTHONORMAL keys
+// across time, the correction term `S^T k_t` is exactly zero every step (S only ever holds components
+// along PREVIOUS keys, orthogonal to the current one) -- so `delta = beta_t*(v_t - 0) = v_t` and the
+// recurrence degenerates to the state being EXACTLY the running (cumulative) sum of the outer products
+// k_t (x) v_t, with no decay ever discounting an earlier term and no interference ever cancelling one.
+// A mutant that (say) always overwrites S instead of accumulating into it, or applies decay/beta in the
+// wrong order, would fail this even though it might still pass a single fixed-input fixture match.
+TEST_CASE("Gated DeltaNet recurrence degenerates to plain cumulative summation at g=1, beta=1, "
+          "orthonormal keys", "[gdn][mutation]") {
+    constexpr int T = 5, dk = T, dv = 3;   // dk == T so T orthonormal keys (the standard basis) fit exactly
+    std::vector<float> S(static_cast<std::size_t>(dk) * dv, 0.f);
+    std::vector<float> expected(static_cast<std::size_t>(dk) * dv, 0.f);   // closed-form running sum
+
+    // A small deterministic "random" v_t sequence -- any nonzero values exercise the property, no need
+    // for a real RNG dependency in a frontend-test target.
+    auto vval = [](int t, int j) { return static_cast<float>((t + 1) * 3 - j * 2) * 0.1f; };
+
+    for (int t = 0; t < T; ++t) {
+        std::vector<float> k_t(dk, 0.f);
+        k_t[static_cast<std::size_t>(t)] = 1.f;   // standard basis vector e_t -- orthonormal across t
+        std::vector<float> v_t(dv);
+        for (int j = 0; j < dv; ++j) v_t[static_cast<std::size_t>(j)] = vval(t, j);
+        std::vector<float> q_t(dk, 0.f);   // unused by this property (only S is checked), q=0 is fine
+        std::vector<float> out_o(dv, 0.f);
+
+        sub0::gdn::recurrence_step(dk, dv, /*g_t=*/1.f, /*beta_t=*/1.f, k_t.data(), q_t.data(),
+                                    v_t.data(), S.data(), out_o.data());
+
+        // Closed form: S should now equal sum_{s<=t} e_s (x) v_s, i.e. row t of S is exactly v_t (the
+        // outer product of e_t against v_t only touches row t) and every other row is untouched by this
+        // step -- so accumulate the expectation the same way, independently of the function under test.
+        for (int j = 0; j < dv; ++j) expected[static_cast<std::size_t>(t) * dv + j] = v_t[static_cast<std::size_t>(j)];
+
+        double max_diff = 0.0;
+        for (std::size_t i = 0; i < S.size(); ++i)
+            max_diff = std::max(max_diff, static_cast<double>(std::abs(S[i] - expected[i])));
+        INFO("after step t=" << t << ", max|S - cumulative-sum closed form| = " << max_diff);
+        REQUIRE(max_diff < 1e-6);
+    }
+}
+
+// With beta_t == 0 (no write) AND g_t == 1 (no decay), the state must be an EXACT, bit-identical no-op:
+// completely independent of k_t/v_t (which is what makes this a genuine mutation-style check -- a
+// broken implementation that ignores beta and always writes would produce different output as k_t/v_t
+// vary, even though the state trivially "matches" for any single fixed input).
+TEST_CASE("Gated DeltaNet recurrence at beta=0, g=1 never updates the state (provable no-op)",
+          "[gdn][mutation]") {
+    constexpr int dk = 4, dv = 3;
+    std::vector<float> S0 = {1.f, -2.f, 0.5f, 3.f, -1.f, 0.25f, 2.f, -0.75f, 1.5f, 0.1f, -0.2f, 4.f};
+    REQUIRE(S0.size() == static_cast<std::size_t>(dk) * dv);
+
+    std::vector<float> q_t = {0.3f, -0.7f, 1.1f, 0.2f};
+    float o_ref[dv];
+    {
+        std::vector<float> S = S0;
+        std::vector<float> k_t(dk, 0.f), v_t(dv, 0.f);   // the "control": k=v=0 (an actual no-write anyway)
+        sub0::gdn::recurrence_step(dk, dv, 1.f, 0.f, k_t.data(), q_t.data(), v_t.data(), S.data(), o_ref);
+        for (std::size_t i = 0; i < S.size(); ++i) REQUIRE(S[i] == S0[i]);   // exact IEEE754 no-op
+    }
+
+    // Now vary k_t/v_t across several unrelated, nonzero, non-trivial inputs -- output must be
+    // BIT-FOR-BIT identical every time (o_t = S0^T q_t, a fixed function of q_t and the untouched S0
+    // alone), which a "beta forgot to gate the write" mutant would not reproduce.
+    const std::vector<std::array<float, 4>> ks = {
+        {1.f, 0.f, 0.f, 0.f}, {0.f, 5.f, -3.f, 2.f}, {-1.f, -1.f, -1.f, -1.f}, {9.f, 9.f, 9.f, 9.f}};
+    const std::vector<std::array<float, 3>> vs = {
+        {2.f, 2.f, 2.f}, {0.f, -4.f, 6.f}, {1.f, 1.f, 1.f}, {-7.f, 3.f, 0.5f}};
+    for (std::size_t trial = 0; trial < ks.size(); ++trial) {
+        std::vector<float> S = S0;
+        float o[dv];
+        sub0::gdn::recurrence_step(dk, dv, 1.f, 0.f, ks[trial].data(), q_t.data(), vs[trial].data(),
+                                    S.data(), o);
+        for (std::size_t i = 0; i < S.size(); ++i) REQUIRE(S[i] == S0[i]);
+        for (int j = 0; j < dv; ++j) REQUIRE(o[j] == o_ref[j]);
+    }
+}
