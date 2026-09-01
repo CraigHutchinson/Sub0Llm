@@ -100,7 +100,8 @@ inline float softplus(float x) { return std::log1p(std::exp(-std::fabs(x))) + st
 //
 // `S` ([dk,dv], row-major) is READ AND WRITTEN IN PLACE. `k_t`/`q_t` ([dk]) and `v_t` ([dv]) are
 // read-only. `out_o` ([dv]) is written (not accumulated). No heap allocation; `dk`/`dv` bounded by the
-// same generous 256 this file uses elsewhere (real model: 128).
+// same generous 256 this file uses elsewhere (real model: 128). `out_o` MAY safely alias `v_t`: every
+// read of `v_t` (into the local `delta` buffer) happens before `out_o`'s first write.
 inline void recurrence_step(int dk, int dv, float g_t, float beta_t,
                              const float* k_t, const float* q_t, const float* v_t,
                              float* S, float* out_o) {
@@ -250,32 +251,11 @@ inline void forward(const Dims& d, int T,
                 const float g_t = std::exp(gg[static_cast<std::size_t>(t) * Hv + hv]);
                 const float beta_t = beta[static_cast<std::size_t>(t) * Hv + hv];
                 float* S = state + static_cast<std::size_t>(hv) * dk * dv;
-                // S = g_t * S
-                for (int i = 0; i < dk * dv; ++i) S[i] *= g_t;
-                // kv_mem = S^T k  (size dv), delta = beta_t*(v - kv_mem), S += k (x) delta
-                float kv_mem[256];
-                for (int j = 0; j < dv; ++j) kv_mem[j] = 0.f;
-                for (int i = 0; i < dk; ++i) {
-                    const float ki = kn[i];
-                    const float* Srow = S + static_cast<std::size_t>(i) * dv;
-                    for (int j = 0; j < dv; ++j) kv_mem[j] += ki * Srow[j];
-                }
-                float delta[256];
-                for (int j = 0; j < dv; ++j) delta[j] = (vraw[j] - kv_mem[j]) * beta_t;
-                for (int i = 0; i < dk; ++i) {
-                    const float ki = kn[i];
-                    float* Srow = S + static_cast<std::size_t>(i) * dv;
-                    for (int j = 0; j < dv; ++j) Srow[j] += ki * delta[j];
-                }
-                // o_t[hv] = S^T q  -- write straight into qkv_post's own V slot (no longer needed raw),
+                // o_t[hv] = S^T q, written straight back into qkv_post's own V slot (no longer needed
+                // raw -- vraw and out_o safely alias, see recurrence_step's own aliasing note) --
                 // reused as the pre-gated-norm "core_attn_out" scratch for this head.
                 float* core = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off + hv * dv;
-                for (int j = 0; j < dv; ++j) core[j] = 0.f;
-                for (int i = 0; i < dk; ++i) {
-                    const float qi = qn[i];
-                    const float* Srow = S + static_cast<std::size_t>(i) * dv;
-                    for (int j = 0; j < dv; ++j) core[j] += qi * Srow[j];
-                }
+                recurrence_step(dk, dv, g_t, beta_t, kn, qn, vraw, S, core);
             }
         }
     }
