@@ -595,10 +595,11 @@ int main(int argc, char** argv) {
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
-    // Gated DeltaNet: DESIGN + Stage 0 skeleton only (docs/GATED_DELTANET.md) -- no forward/backward op
-    // exists yet, so this must stay 0 (layout.hpp's static_assert refuses any other value at compile
-    // time). Kept as a real CLI flag now, off by default, so the config axis/fingerprint plumbing exists
-    // ahead of Stage 1 rather than needing a second pass through every consumer this touches.
+    // Gated DeltaNet: Stage 1 -- CPU forward exists (op_gdn / gdn_forward_one, backend_cpu.cpp),
+    // correctness-gated against the real Qwen4-preview fixtures (tests/gdn_qwen4_fixture_tests.cpp).
+    // No backward pass yet (backward_node aborts loudly on an Op::GDN node -- see its comment) and no
+    // CUDA (backend_cuda.cu keeps its own static_assert) -- so a GDN build works for gen/eval/report but
+    // NOT for train/tune. See docs/GATED_DELTANET.md.
     int gdn_full_attn_stride = 0;
     int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
     int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
@@ -661,10 +662,11 @@ int main(int argc, char** argv) {
                    "docs/DEPTH_ATTENTION.md")
        ->capture_default_str();
     app.add_option("--gdn-full-attn-stride", gdn_full_attn_stride,
-                   "Gated DeltaNet: DESIGN + Stage 0 ONLY, must stay 0 (docs/GATED_DELTANET.md). Once "
-                   "Stage 1 lands: every Nth layer keeps softmax attention, the rest become Gated "
-                   "DeltaNet linear-attention layers (0 = off, all layers softmax attention)")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "Gated DeltaNet (docs/GATED_DELTANET.md): every Nth layer keeps softmax attention, "
+                   "the rest become Gated DeltaNet linear-attention layers (0 = off, all layers softmax "
+                   "attention). Stage 1: CPU forward only -- gen/eval/report work, train/tune do not "
+                   "(no backward pass yet, and no CUDA build)")
+       ->capture_default_str()->check(CLI::Range(0, 1024));
     app.add_option("--ngram-max-n", ngram_max_n,
                    "N-gram embeddings: highest n-gram order to hash (bigrams..N-grams added into the "
                    "input embedding); 0 = off, else must be >= 2. See docs/NGRAM_EMBEDDING.md")
@@ -1339,10 +1341,9 @@ int main(int argc, char** argv) {
     // shape are untouched -- which is exactly why it must enter ARCH_FINGERPRINT instead (it changes
     // computation invisibly to nfloat). 0 = off. See docs/DEPTH_ATTENTION.md for the derivation.
     cos << "constexpr int  DEPTH_ATTN_STRIDE  = " << depth_attn_stride << ";\n";
-    // Gated DeltaNet: DESIGN + Stage 0 skeleton only -- see docs/GATED_DELTANET.md and layout.hpp's
-    // static_assert(GDN_FULL_ATTN_STRIDE == 0, ...). The CLI flag above is already clamped to 0; this
-    // constant exists so ARCH_FINGERPRINT2/GDN_SCHEDULE compile and the config axis is plumbed through
-    // RunConfig ahead of Stage 1, without any op existing to actually use it.
+    // Gated DeltaNet Stage 1: every Nth layer (0-indexed, N = stride) stays softmax attention; the rest
+    // become GDN layers (layout.hpp's GDN_SCHEDULE, op_gdn/gdn_math.hpp's CPU forward). 0 = off, every
+    // layer softmax attention. See docs/GATED_DELTANET.md.
     cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
     // N-gram embeddings: additional per-position features from rolling polynomial-hash token n-grams,
     // added into the input embedding ("concat" fusion mode, Nanbeige's NanbeigeNgramEmbedding). 0 = off.

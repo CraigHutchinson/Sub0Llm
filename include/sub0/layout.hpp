@@ -17,6 +17,10 @@
 #include "sub0_config.hpp"  // D_MODEL, N_LAYERS, N_HEADS, SEQ_LEN, D_FF, VOCAB, D_HEAD, USE_TERNARY, USE_GATED_FFN, USE_TIED_EMBEDDINGS, USE_QK_NORM
 #include "memplan.hpp"      // memplan::Dims for current_build_dims() below. memplan is
                             // dependency-free (no sub0_config.hpp, no layout.hpp), so this is one-way.
+#include "gdn_math.hpp"     // sub0::gdn::Dims for GDN_DIMS below. Also dependency-free (see its own
+                            // header comment) -- included here purely so GDN_DIMS can be a derived
+                            // constant like GQA_GROUP/D_KV, not because gdn_math.hpp itself needs
+                            // anything from this file.
 
 #include <algorithm>
 #include <array>
@@ -191,23 +195,43 @@ static_assert(DEPTH_SCHEDULE.slots == DEPTH_CACHE_MAX,
 static_assert(DEPTH_SCHEDULE.live[LOOP_EXEC_COUNT - 1] <= DEPTH_SCHEDULE.slots,
               "a depth mix can never read more entries than the cache holds");
 
-// GATED DELTANET -- Stage 0 ONLY: config axis + fingerprint plumbing, no forward/backward exists yet.
-// See docs/GATED_DELTANET.md for the full design (verified reference math, checkpoint/arena analysis,
-// the Node-fanout question, and why the chunked-parallel-scan form is the Stage 1 target). This section
-// is the skeleton half of that doc: it must have ZERO effect on any build until Stage 1 lands.
+// GATED DELTANET -- Stage 1: CPU forward exists (op_gdn / gdn_forward_one, backend_cpu.cpp; the shared
+// math core is include/sub0/gdn_math.hpp, correctness-gated against the real Qwen4-preview fixtures at
+// tests/fixtures/qwen4_preview/gdn_layer0_small_* -- see tests/gdn_qwen4_fixture_tests.cpp). No backward
+// pass and no CUDA implementation yet -- that is this stage's own, deliberate scope boundary (S5/S6 of
+// docs/GATED_DELTANET.md), not an oversight; backend_cuda.cu keeps its own static_assert refusing to
+// build a GDN CUDA binary until Stage 3 lands.
 //
 // GDN_FULL_ATTN_STRIDE mirrors DEPTH_ATTN_STRIDE's shape exactly: every Nth LAYER (0-indexed, N =
-// stride) keeps ordinary softmax attention; every other layer would become a Gated DeltaNet (linear
-// attention, O(1) per token via a fixed-size recurrent state) layer once Stage 1 exists. 0 = off, i.e.
-// every layer is softmax attention -- today's only buildable configuration, and the ONLY one this bool
-// and the static_assert below currently allow.
+// stride) keeps ordinary softmax attention; every other layer is a Gated DeltaNet (linear attention,
+// O(1) per token via a fixed-size recurrent state) layer. 0 = off, i.e. every layer is softmax
+// attention -- the ONLY value every build before this stage could take, and still the default.
 inline constexpr bool USE_GATED_DELTANET = (GDN_FULL_ATTN_STRIDE > 0);
-static_assert(GDN_FULL_ATTN_STRIDE == 0,
-              "Gated DeltaNet is DESIGN + Stage 0 skeleton ONLY right now (docs/GATED_DELTANET.md) -- "
-              "no forward/backward op exists for it yet on CPU or CUDA. A nonzero --gdn-full-attn-stride "
-              "would silently train/run an architecture this engine cannot compute (the depth-attention "
-              "precedent's lesson: never let an unimplemented axis compile as a quiet no-op). Do not "
-              "relax this assert until Stage 1 lands the CPU op and its correctness check.");
+static_assert(GDN_FULL_ATTN_STRIDE >= 0, "GDN_FULL_ATTN_STRIDE must be non-negative (0 = off)");
+
+// The real model's own verified conv kernel size (S1a's table: linear_conv_kernel_dim = 4, both at
+// full scale and in the small fixture -- not a placeholder). Deliberately NOT a CLI flag yet, per
+// AGENTS.md S8 and docs/GATED_DELTANET.md S3a's own reasoning: making it sweepable is a decision to
+// make WITH a working op to measure against, not before one exists -- and Stage 1 is that working op,
+// but has not yet run the sweep that would justify exposing this. GDN_CONV_DIM is the depthwise conv's
+// channel count -- key_dim (Q) + key_dim (K) + value_dim (V), this project's D_KV/D_KV/D_MODEL mapping
+// (layout.hpp S3a's table) -- computed even when GDN is off so it stays a valid array bound (never
+// zero-length -- same idiom as DEPTH_CACHE_MAX/NGRAM_TABLES_BUF above), though its VALUE is unused then.
+inline constexpr int GDN_CONV_KERNEL = 4;
+inline constexpr int GDN_CONV_DIM    = 2 * D_KV + D_MODEL;
+static_assert(GDN_CONV_KERNEL >= 2, "a causal depthwise conv needs at least a 2-tap kernel");
+
+// This build's GDN dims, per S3a's mapping: hidden_size=D_MODEL (in AND out -- see gdn_math.hpp's own
+// note on hidden_size playing double duty), key/query heads=N_KV_HEADS, value/gate heads=N_HEADS,
+// head_k_dim==head_v_dim==D_HEAD (true of the real model too, S1a's table). Valid (never divides by
+// zero, etc.) even when USE_GATED_DELTANET is false -- it just describes a shape nothing builds.
+inline constexpr gdn::Dims GDN_DIMS{D_MODEL, N_KV_HEADS, N_HEADS, D_HEAD, D_HEAD, GDN_CONV_KERNEL};
+
+// Per-EXECUTION single-token scratch sizes for forward_one's decode path (T == 1 always there, unlike
+// op_gdn's batched, per-call arena allocation). Precomputed here (not re-derived at every forward_one
+// call) so the decode row helper can size a fixed local array the same way forward_one already does for
+// its other per-layer temporaries (e.g. `f1[D_FF]`) -- no heap allocation in this hot path (AGENTS.md S1).
+inline constexpr std::size_t GDN_SCRATCH1 = gdn::scratch_floats(GDN_DIMS, 1);
 
 // Per-LAYER (not per-execution) classification: a layer's weight IDENTITY decides whether it is softmax
 // attention or GDN, so under LoopSplit every repeated execution of a given layer index inherits that
@@ -239,11 +263,13 @@ consteval GdnScheduleT<LAYERS> gdn_schedule_for(int stride) {
     return s;
 }
 using GdnSchedule = GdnScheduleT<N_LAYERS>;
-// Unused until Stage 1's Model::forward dispatches on it (IS_GDN_LAYER[LAYER_EXEC_ORDER[e]]) -- inert
-// compile-time bookkeeping only, exactly like DEPTH_SCHEDULE was before Stage 1 consumed it. At the only
-// buildable stride (0) every entry is `full_attn = true`, i.e. this evaluates to nothing changing.
+// Consumed by Model::forward/forward_one's per-execution dispatch (backend_cpu.cpp:
+// GDN_SCHEDULE.full_attn[LAYER_EXEC_ORDER[e]]) and by make_param_layout() below (which weight tensors a
+// given layer gets). At stride 0 every entry is `full_attn = true`, i.e. this evaluates to nothing
+// changing -- asserted below so the default build's identity is a proven invariant, not an observation.
 inline constexpr GdnSchedule GDN_SCHEDULE = gdn_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE);
-static_assert(GDN_SCHEDULE.gdn_layers == 0, "GDN_FULL_ATTN_STRIDE == 0 must yield zero GDN layers");
+static_assert(GDN_FULL_ATTN_STRIDE > 0 || GDN_SCHEDULE.gdn_layers == 0,
+              "GDN_FULL_ATTN_STRIDE == 0 must yield zero GDN layers");
 
 // --- N-GRAM EMBEDDINGS -- additional per-position features from rolling polynomial-hash token n-grams,
 // added into the input embedding (Nanbeige's `NanbeigeNgramEmbedding`, "concat" fusion mode -- see
@@ -503,11 +529,31 @@ inline constexpr memplan::Dims current_build_dims() {
 // reuses tok_emb, no separate lm_head/lm_bias slot -- the common tied-embedding convention also
 // drops the head bias, matching GPT-2/GGUF-style tied models), else ln_f + lm_head + lm_bias (3).
 // N-gram embeddings add NGRAM_NUM_EMBEDDERS table tensors plus one concat_proj tensor (0 when off).
-inline constexpr int NUM_PARAMS = 1 + (HAS_POS_EMB ? 1 : 0)
-                                   + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
-                                   + (USE_QK_NORM ? 2 * N_LAYERS : 0)
-                                   + (USE_TIED_EMBEDDINGS ? 1 : 3)
-                                   + (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
+//
+// Per-LAYER aware (Stage 1): a layer is EITHER a softmax-attention layer (ln1,ln2 + Wq,Wk,Wv,Wo [+
+// QNorm,KNorm] + FFN) OR a GDN layer (ln1,ln2 + the nine GDN tensors + FFN -- GDN never uses QNorm/
+// KNorm, S1c), decided per layer by GDN_SCHEDULE.full_attn[l] (all true at GDN_FULL_ATTN_STRIDE == 0,
+// reproducing the pre-Stage-1 count exactly -- see the identity check in tests/layout_tests.cpp). A
+// plain runtime `if` on a compile-time-known array value inside a consteval function is the same
+// pattern DEPTH_SCHEDULE.own[e] already uses at call sites -- this just does it during layout counting
+// too, rather than only at dispatch time.
+consteval int count_num_params() {
+    int n = 1 + (HAS_POS_EMB ? 1 : 0);
+    for (int l = 0; l < N_LAYERS; ++l) {
+        n += 2;   // ln1, ln2
+        if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+            n += 4;   // Wq, Wk, Wv, Wo
+            if constexpr (USE_QK_NORM) n += 2;   // QNorm, KNorm
+        } else {
+            n += 9;   // GdnInProjQkv/Z/B/A, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
+        }
+        n += (USE_GATED_FFN ? 3 : 4);
+    }
+    n += (USE_TIED_EMBEDDINGS ? 1 : 3);
+    n += (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
+    return n;
+}
+inline constexpr int NUM_PARAMS = count_num_params();
 
 // Role of each parameter tensor. Lets a backend special-case kinds (e.g. concat the
 // Q/K/V projections into one GEMM, or keep the lm_head full precision) without
@@ -523,9 +569,19 @@ inline constexpr int NUM_PARAMS = 1 + (HAS_POS_EMB ? 1 : 0)
 // narrower and NOT the primary embedding). NgramProj: the single learned "concat_proj" linear that
 // projects the concatenated table outputs down to D_MODEL (role like LmHead: a full-precision,
 // AdamW-only GEMM weight -- see is_muon_kind below). Both ABSENT entirely when !NGRAM_EMBED.
+// GDN kinds (Stage 1): a GDN layer replaces Wq/Wk/Wv/Wo (and QNorm/KNorm, which GDN never uses -- it
+// does its own internal, ungained L2-norm, S1b) with these nine tensors -- see
+// docs/GATED_DELTANET.md S1a/S3b for the real module this mirrors and S1c for GdnNorm's shape (shared
+// across heads, [1,D_HEAD] like QNorm/KNorm, NOT D_MODEL-wide). GdnInProjQkv is the fused Q+K+V
+// projection (S1a's real 4-way split, `in_proj_qkv`); GdnInProjZ is the output-gate projection
+// (`in_proj_z`); GdnInProjB/GdnInProjA are the two per-V-head gate-input scalars (`in_proj_b`/
+// `in_proj_a`); GdnConv is the depthwise causal conv weight (no in/out axis -- one row per channel);
+// GdnALog/GdnDtBias are the two learned per-V-head recurrence-gate parameters; GdnOutProj restores
+// D_MODEL width (role like LmHead: a full-precision, AdamW-only GEMM weight -- see is_muon_kind below).
 enum class PKind : unsigned char {
     TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
-    NgramEmb, NgramProj
+    NgramEmb, NgramProj,
+    GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
 };
 
 // One weight tensor: where it lives in the flat blob, its logical [rows x cols]
@@ -559,17 +615,36 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
     for (int l = 0; l < N_LAYERS; ++l) {
         add(1,       D_MODEL, PKind::Ln1, false, false);
         add(1,       D_MODEL, PKind::Ln2, false, false);
-        add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
-        // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
-        // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
-        // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
-        // not assume they match).
-        add(D_MODEL, D_KV,    PKind::Wk,  true,  true);
-        add(D_MODEL, D_KV,    PKind::Wv,  true,  true);
-        add(D_MODEL, D_MODEL, PKind::Wo,  true,  true);
-        if constexpr (USE_QK_NORM) {
-            add(1, D_HEAD, PKind::QNorm, false, false);
-            add(1, D_HEAD, PKind::KNorm, false, false);
+        if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+            add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
+            // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
+            // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
+            // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
+            // not assume they match).
+            add(D_MODEL, D_KV,    PKind::Wk,  true,  true);
+            add(D_MODEL, D_KV,    PKind::Wv,  true,  true);
+            add(D_MODEL, D_MODEL, PKind::Wo,  true,  true);
+            if constexpr (USE_QK_NORM) {
+                add(1, D_HEAD, PKind::QNorm, false, false);
+                add(1, D_HEAD, PKind::KNorm, false, false);
+            }
+        } else {
+            // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b), using this project's own
+            // D_MODEL==N_HEADS*D_HEAD mapping: hidden_size=D_MODEL, key_dim=D_KV (N_KV_HEADS*D_HEAD),
+            // value_dim=D_MODEL (N_HEADS*D_HEAD). Weight axis order is this project's own [in,out]
+            // convention throughout (see gdn_math.hpp's header comment for the explicit re-derivation
+            // from the real model's PyTorch nn.Linear [out,in] convention).
+            add(D_MODEL, 2 * D_KV + D_MODEL, PKind::GdnInProjQkv, true,  false);
+            add(D_MODEL, D_MODEL,            PKind::GdnInProjZ,  true,  false);
+            add(D_MODEL, N_HEADS,            PKind::GdnInProjB,  true,  false);
+            add(D_MODEL, N_HEADS,            PKind::GdnInProjA,  true,  false);
+            // Depthwise conv weight: [GDN_CONV_DIM, GDN_CONV_KERNEL], no in/out axis (one row per
+            // channel) -- decay=false (not a GEMM weight in the AdamW weight-decay sense), ternary=false.
+            add(GDN_CONV_DIM, GDN_CONV_KERNEL, PKind::GdnConv,    false, false);
+            add(1, N_HEADS, PKind::GdnALog,   false, false);
+            add(1, N_HEADS, PKind::GdnDtBias, false, false);
+            add(1, D_HEAD,  PKind::GdnNorm,   false, false);   // RMSNormGated gamma, shared across heads (S1c)
+            add(D_MODEL, D_MODEL, PKind::GdnOutProj, true, false);   // stays full precision, like LmHead
         }
         if constexpr (USE_GATED_FFN) {
             add(D_MODEL, D_FF,    PKind::Wg, true, true);   // gate

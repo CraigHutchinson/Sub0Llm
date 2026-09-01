@@ -21,6 +21,7 @@
 
 #include "sub0/core.hpp"
 #include "sub0/cpu_affinity.hpp"    // P-core-first thread pinning (hybrid Intel CPUs) -- see its own header comment
+#include "sub0/gdn_math.hpp"        // Gated DeltaNet Stage 1 forward math (sub0::gdn::forward/recurrence_step)
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
@@ -98,7 +99,18 @@ consteval size_t calc_act_cap() {
                 // scratch is [N_KV_HEADS, T, S+1] where S is the cache depth THIS execution saw, so
                 // DEPTH_CACHE_MAX + 1 is the worst case (the last execution, which sees every entry).
                 + (USE_DEPTH_ATTN ? (size_t)T * D_KV
-                                  + (size_t)N_KV_HEADS * T * (DEPTH_CACHE_MAX + 1) : 0);
+                                  + (size_t)N_KV_HEADS * T * (DEPTH_CACHE_MAX + 1) : 0)
+                // op_gdn (Stage 1): a GDN layer does not ALSO pay rope/qknorm/depth-attn/op_attn's own
+                // scratch above, but this formula sums a flat "per" cost assuming every execution could
+                // be EITHER kind -- a safe, simple over-provision (this stays exact rather than tracking
+                // GDN_SCHEDULE's per-execution mix here) -- so this adds GDN's OWN scratch on top: the
+                // op's [T,D_MODEL] output node plus its recurrent state / conv history / gdn_math
+                // internal scratch (state/conv_hist are technically call-scoped training-scratch here,
+                // not persistent, but still arena-allocated once per op_gdn call -- see that op's
+                // comment). Zero when GDN is off.
+                + (USE_GATED_DELTANET ? (size_t)T * C + gdn::state_floats(GDN_DIMS)
+                                        + gdn::conv_hist_floats(GDN_DIMS) + gdn::scratch_floats(GDN_DIMS, T)
+                                      : 0);
     size_t fin  = T * C + 2 * T * V + 64;
     // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
     // activation nodes R times (the weights are shared; the activations are not).
@@ -113,9 +125,13 @@ constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
 // live node, not an allocation failure, so it has to be counted rather than absorbed by the headroom.
 // N-gram embeddings add 3 nodes per embedder ONCE (op_embed + op_linear + op_add each), not per
 // execution -- see calc_act_cap()'s matching comment.
+// Gated DeltaNet adds exactly one node per EXECUTION too (op_gdn's single output node), same
+// over-provisioning reasoning as calc_act_cap()'s own GDN term above -- every execution is budgeted as
+// if it could be GDN, rather than tracking GDN_SCHEDULE's actual per-execution mix here.
 constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_COUNT
                                 + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0)
                                 + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0)
+                                + (USE_GATED_DELTANET ? (size_t)LOOP_EXEC_COUNT : 0)
                                 + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0);
 
 // ============================================================================
@@ -690,6 +706,10 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     return out;
 }
 
+// op_gdn (Gated DeltaNet, Stage 1) is defined further below, right after the `Layer` struct it needs --
+// see that definition for the full comment. It cannot live here: it takes a `Layer&`, and `Layer` is
+// not declared until the "Model (internal)" section, unlike op_attn/op_depth_attn's plain Node* args.
+
 // Count of ACTIVE (non-ignored) target positions -- the normalizer both the forward loss and the
 // CrossEnt backward divide by, so they must agree. A target < 0 (LOSS_IGNORE_INDEX) is masked out.
 // With no masking this is just T (identical to the pre-masking behavior).
@@ -1081,6 +1101,23 @@ static void backward_node(Node& n) {
         }
         break;
     }
+    case Op::GDN: {
+        // Stage 1's own, deliberate scope boundary (docs/GATED_DELTANET.md S5/S6): no backward exists
+        // for this op yet. A GDN CPU forward binary compiles and runs fine (train/gen's forward-only
+        // uses, and this correctness-gate suite, all work) -- but reaching backward() on a graph that
+        // contains one would otherwise silently leave this node's upstream gradient at the arena's zero
+        // (graph_reset zeroes grads), which train_batch would then silently treat as "this layer
+        // contributed nothing," training a DIFFERENT, wrong architecture with no diagnostic at all.
+        // That is exactly the hazard AGENTS.md's own thesis and the CUDA build-time static_assert both
+        // exist to prevent -- this is the same refusal, moved to the next callable seam down (a CPU
+        // binary compiles regardless of GDN, unlike CUDA's compile-time guard), per this project's
+        // "guard at the lowest callable seam" standing preference. Do not relax this until Stage 2 lands
+        // a real backward (the recompute-based design docs/GATED_DELTANET.md S4 already points at).
+        std::println(stderr, "fatal: Gated DeltaNet has no backward pass yet (Stage 1 is CPU forward "
+                              "only, see docs/GATED_DELTANET.md) -- refusing to silently train a "
+                              "different architecture than the one requested.");
+        std::abort();
+    }
     }
 }
 
@@ -1113,6 +1150,25 @@ struct KVCache {
     float* vrow(int l, int pos) { return v.data() + ((static_cast<size_t>(l) * SEQ_LEN) + pos) * D_KV; }
 };
 thread_local KVCache g_kv;                                      // gen is single-threaded; lazily sized
+
+// Gated DeltaNet's decode-persistent state (Stage 1; docs/GATED_DELTANET.md S2's "decode" bullet) --
+// structurally NOT a bigger/smaller KVCache: it does not grow with position, it is READ AND WRITTEN IN
+// PLACE by every forward_one call (an accumulator, not a per-position row store), and per-execution
+// (LOOP_EXEC_COUNT slots) for the identical LoopSplit reason KVCache is. Because it is an accumulator,
+// reset() must UNCONDITIONALLY re-zero it every time (unlike KVCache's reset(), which only assigns on a
+// SIZE change -- safe there because every row it will ever READ was already WRITTEN earlier in the SAME
+// generation; a GDN state left over from a PREVIOUS generation would otherwise silently leak into a new
+// one, since nothing about starting a new generation naturally overwrites an accumulator's stale value).
+struct GdnCache {
+    std::vector<float> state, conv_hist;   // [LOOP_EXEC_COUNT][state/conv_hist floats-per-exec], flat
+    void reset() {
+        state.assign(static_cast<size_t>(LOOP_EXEC_COUNT) * gdn::state_floats(GDN_DIMS), 0.f);
+        conv_hist.assign(static_cast<size_t>(LOOP_EXEC_COUNT) * gdn::conv_hist_floats(GDN_DIMS), 0.f);
+    }
+    float* state_of(int e) { return state.data() + static_cast<size_t>(e) * gdn::state_floats(GDN_DIMS); }
+    float* conv_of(int e)  { return conv_hist.data() + static_cast<size_t>(e) * gdn::conv_hist_floats(GDN_DIMS); }
+};
+thread_local GdnCache g_gdn_cache;   // only ever populated/consulted when USE_GATED_DELTANET
 
 // y[out] = x[in] . W[in,out]  (+ bias); dense, same order as op_linear's non-ternary path.
 static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
@@ -1219,7 +1275,48 @@ static inline float silu_row(float v) {
 // q_norm/k_norm only when USE_QK_NORM -- the always-present fields keep this struct's shape
 // independent of the compile-time choice, cheaper than conditionally compiling the struct itself,
 // and unused pointers just stay nullptr.
-struct Layer { Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm; };
+//
+// gdn_* (Stage 1): present only on a layer GDN_SCHEDULE.full_attn[l] marks GDN (nullptr on an
+// attention layer, and vice versa for Wq/Wk/Wv/Wo/q_norm/k_norm) -- see layout.hpp's PKind comment for
+// what each one is. A layer is one or the other, never both, at every GDN_FULL_ATTN_STRIDE value.
+struct Layer {
+    Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
+    Node *gdn_in_qkv = nullptr, *gdn_in_z = nullptr, *gdn_in_b = nullptr, *gdn_in_a = nullptr,
+         *gdn_conv = nullptr, *gdn_a_log = nullptr, *gdn_dt_bias = nullptr, *gdn_norm = nullptr,
+         *gdn_out_proj = nullptr;
+};
+
+// --- Gated DeltaNet (Stage 1: CPU forward only; docs/GATED_DELTANET.md, include/sub0/gdn_math.hpp) ---
+//
+// One call spans the WHOLE window (all T positions) for one GDN layer's one execution -- the recurrent
+// state and the causal conv's history are TRAINING SCRATCH (docs/GATED_DELTANET.md S2): allocated fresh
+// (zeroed by arena_alloc, matching every other scratch allocation in this file) at the top of this call
+// and fully consumed within it, the direct analogue of op_attn's own `[H,T,T]` probability scratch. This
+// is NOT the decode-persistent form (forward_one's GDN branch + GdnCache thread state ACROSS calls the
+// way the KV-cache does) -- a batched forward() call always represents a fresh window starting at
+// position 0, so a zero initial state is the correct value here, not a simplification of one.
+//
+// No backward: Stage 1's own, deliberate scope boundary (docs/GATED_DELTANET.md S5/S6 -- backward wants
+// a recompute-based design, per S4's finding, not naive full-trajectory retention). backward_node's
+// Op::GDN case aborts loudly rather than silently produce absent/wrong gradients if this is ever reached
+// from train_batch -- see that case's own comment for why a loud abort is the correct Stage-1 behavior,
+// not a quiet no-op (the exact hazard AGENTS.md's own thesis and the CUDA build guard both exist to
+// prevent, just at the next callable seam down since a GDN CPU binary compiles fine).
+static Node* op_gdn(Node* a, Layer& L) {
+    const int T = a->rows;
+    Node* out = mk_node(Op::GDN, T, D_MODEL);
+    out->a = a;   // bookkeeping only -- never consumed by backward, see backward_node's Op::GDN case
+    auto [state, state_g]     = arena_alloc(gdn::state_floats(GDN_DIMS));
+    auto [convh, convh_g]     = arena_alloc(gdn::conv_hist_floats(GDN_DIMS));
+    auto [scratch, scratch_g] = arena_alloc(gdn::scratch_floats(GDN_DIMS, T));
+    gdn::forward(GDN_DIMS, T, a->data.data(),
+                 L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
+                 L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
+                 L.gdn_conv->data.data(), L.gdn_a_log->data.data(), L.gdn_dt_bias->data.data(),
+                 L.gdn_norm->data.data(), L.gdn_out_proj->data.data(),
+                 state.data(), convh.data(), out->data.data(), scratch.data());
+    return out;
+}
 
 struct Model {
     Node* tok_emb;
@@ -1264,18 +1361,35 @@ struct Model {
         // make_param_layout(): the order there IS the serialization order.
         if constexpr (HAS_POS_EMB) pos_emb = mk_param(SEQ_LEN, D_MODEL, false);
         else                       pos_emb = nullptr;
-        for (auto& L : layers) {
+        for (int li = 0; li < N_LAYERS; ++li) {
+            Layer& L = layers[static_cast<std::size_t>(li)];
             L.ln1 = mk_param(1, D_MODEL, false);
             L.ln2 = mk_param(1, D_MODEL, false);
-            L.Wq = mk_param(D_MODEL, D_MODEL, true);
-            L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
-            L.Wv = mk_param(D_MODEL, D_KV, true);
-            L.Wo = mk_param(D_MODEL, D_MODEL, true);
             // Order here MUST match layout.hpp's make_param_layout() exactly -- it IS the
-            // serialization order (see that file's header comment).
-            if constexpr (USE_QK_NORM) {
-                L.q_norm = mk_param(1, D_HEAD, false);
-                L.k_norm = mk_param(1, D_HEAD, false);
+            // serialization order (see that file's header comment), INCLUDING which of the two
+            // branches below a given layer takes (GDN_SCHEDULE.full_attn[li] must agree with
+            // make_param_layout()'s own read of it -- both read the same compile-time array).
+            if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
+                L.Wq = mk_param(D_MODEL, D_MODEL, true);
+                L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
+                L.Wv = mk_param(D_MODEL, D_KV, true);
+                L.Wo = mk_param(D_MODEL, D_MODEL, true);
+                if constexpr (USE_QK_NORM) {
+                    L.q_norm = mk_param(1, D_HEAD, false);
+                    L.k_norm = mk_param(1, D_HEAD, false);
+                }
+            } else {
+                // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b) -- see layout.hpp's
+                // make_param_layout() for the same shapes with the reasoning attached.
+                L.gdn_in_qkv   = mk_param(D_MODEL, 2 * D_KV + D_MODEL, true);
+                L.gdn_in_z     = mk_param(D_MODEL, D_MODEL, true);
+                L.gdn_in_b     = mk_param(D_MODEL, N_HEADS, true);
+                L.gdn_in_a     = mk_param(D_MODEL, N_HEADS, true);
+                L.gdn_conv     = mk_param(GDN_CONV_DIM, GDN_CONV_KERNEL, false);
+                L.gdn_a_log    = mk_param(1, N_HEADS, false);
+                L.gdn_dt_bias  = mk_param(1, N_HEADS, false);
+                L.gdn_norm     = mk_param(1, D_HEAD, false);
+                L.gdn_out_proj = mk_param(D_MODEL, D_MODEL, true);
             }
             if constexpr (USE_GATED_FFN) {
                 L.Wg = mk_param(D_MODEL, D_FF, true);   // gate
@@ -1324,10 +1438,27 @@ struct Model {
         auto ones = [](Node* t) { std::fill(t->data.begin(), t->data.end(), 1.f); };
         randn(tok_emb, 0.02f);
         if constexpr (HAS_POS_EMB) randn(pos_emb, 0.02f);   // absent entirely under RoPE
-        for (auto& L : layers) {
+        std::uniform_real_distribution<float> gdn_a_init(0.01f, 16.f);   // real model's own A_log init range, S1a
+        for (int li = 0; li < N_LAYERS; ++li) {
+            Layer& L = layers[static_cast<std::size_t>(li)];
             ones(L.ln1); ones(L.ln2);
-            randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
-            if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
+            if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
+                randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
+                if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
+            } else {
+                // Gated DeltaNet init, matching the real model's own scheme (S1a's __init__, quoted in
+                // docs/GATED_DELTANET.md): dt_bias = ones(num_v_heads); A_log = log(uniform(0.01,16));
+                // norm (RMSNormGated) weight = ones(head_v_dim). The projections have no special
+                // reference init documented beyond "a Linear layer", so this project's own standard
+                // 0.02-std normal is used, matching every other GEMM weight here.
+                randn(L.gdn_in_qkv, 0.02f); randn(L.gdn_in_z, 0.02f);
+                randn(L.gdn_in_b, 0.02f);   randn(L.gdn_in_a, 0.02f);
+                randn(L.gdn_conv, 0.02f);
+                ones(L.gdn_dt_bias);
+                for (auto& x : L.gdn_a_log->data) x = std::log(gdn_a_init(rng));
+                ones(L.gdn_norm);
+                randn(L.gdn_out_proj, 0.02f);
+            }
             if constexpr (USE_GATED_FFN) randn(L.Wg, 0.02f);
             randn(L.W1, 0.02f); randn(L.W2, 0.02f);
         }
@@ -1420,6 +1551,48 @@ struct Model {
             Layer& L = layers[static_cast<std::size_t>(li)];
             const Node* const h_in = h;   // diagnostic only; arena nodes outlive the iteration
             Node* a = op_rmsnorm(h, L.ln1);
+            // GDN_SCHEDULE.full_attn[li] decides softmax attention vs. Gated DeltaNet for THIS layer
+            // (per-LAYER, not per-execution -- a layer's weight identity fixes its type, so every
+            // execution of a repeated LoopSplit middle layer inherits it automatically via LAYER_EXEC_
+            // ORDER's existing indirection; see layout.hpp's GDN_SCHEDULE comment). At the only
+            // buildable-before-Stage-1 setting (stride 0) full_attn is true for every layer, so this
+            // `if constexpr` wrapper is the ONLY new code default builds compile at all -- the runtime
+            // `if` inside it never has a false branch to take there.
+            if constexpr (USE_GATED_DELTANET) {
+                if (!GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
+                    // Gated DeltaNet: op_gdn is the WHOLE mixer sublayer (in_proj*, conv, recurrence,
+                    // gated-norm, out_proj all inside one op -- see its own comment) -- its output is
+                    // already D_MODEL-wide and ready to add straight into the residual stream, unlike
+                    // softmax attention's separate op_attn + Wo. No RoPE (GDN has none, S1b), no
+                    // QK-norm (GDN does its own internal, ungained L2-norm), no depth-attention (that
+                    // mechanism is defined in terms of softmax attention's own K/V, S1/S2 of
+                    // docs/DEPTH_ATTENTION.md -- out of scope for a GDN layer, and neither doc discusses
+                    // the combination, so this is a deliberate Stage-1 simplification, not an oversight).
+                    h = op_add(h, op_gdn(a, L));
+                    Node* f = op_rmsnorm(h, L.ln2);
+                    if constexpr (USE_GATED_FFN) {
+                        Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
+                        Node* up_pre   = op_linear(f, L.W1, nullptr, q);
+                        f = op_linear(op_swiglu(gate_pre, up_pre), L.W2, nullptr, q);
+                    } else {
+                        f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
+                    }
+                    h = op_add(h, f);
+                    if (pass_delta || pass_hnorm) {
+                        const std::size_t nn = static_cast<std::size_t>(h->rows) * h->cols;
+                        double d2 = 0.0, i2 = 0.0;
+                        for (std::size_t j = 0; j < nn; ++j) {
+                            const double before = h_in->data[j], after = h->data[j];
+                            d2 += (after - before) * (after - before);
+                            i2 += before * before;
+                        }
+                        if (pass_delta) pass_delta[exec_i] = static_cast<float>(std::sqrt(d2));
+                        if (pass_hnorm) pass_hnorm[exec_i] = static_cast<float>(std::sqrt(i2));
+                    }
+                    ++exec_i;
+                    continue;
+                }
+            }
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
             Node* vn = op_linear(a, L.Wv, nullptr, q);
@@ -1569,48 +1742,81 @@ struct Model {
             const int l = LAYER_EXEC_ORDER[static_cast<std::size_t>(e)];
             Layer& L = layers[static_cast<std::size_t>(l)];
             rmsnorm_row(h, L.ln1, a, C);
-            linear_row(a, L.Wq, nullptr, qn, C, C);
-            // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row both
-            // derive their per-head width as (width / heads), so passing the KV pair yields the same
-            // D_HEAD they always did -- the rotation and norm are per-head, so nothing else changes.
-            linear_row(a, L.Wk, nullptr, kn, C, D_KV);
-            linear_row(a, L.Wv, nullptr, vn, C, D_KV);
-            if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
-            if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
-            // Depth attention, before the KV-cache append: the sequence cache must hold the MIXED V,
-            // because that is what op_attn receives in the batched forward. Mirrors forward()'s block.
-            if constexpr (USE_DEPTH_ATTN) {
-                depth_mix_row(qn, kn, vn, dep_k, dep_v, dep_n);
-                if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(e)] >= 0) {
-                    for (int j = 0; j < D_KV; ++j) {
-                        dep_k[(size_t)dep_n * D_KV + j] = kn[j];
-                        dep_v[(size_t)dep_n * D_KV + j] = vn[j];
+            // The softmax-attention mixer sublayer, factored into a lambda (rather than duplicated
+            // verbatim in both branches below) so the GDN_SCHEDULE dispatch reads as a single small
+            // if/else rather than two copies of this block drifting apart over time.
+            auto do_attention_mixer = [&] {
+                linear_row(a, L.Wq, nullptr, qn, C, C);
+                // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row
+                // both derive their per-head width as (width / heads), so passing the KV pair yields
+                // the same D_HEAD they always did -- the rotation and norm are per-head, so nothing
+                // else changes.
+                linear_row(a, L.Wk, nullptr, kn, C, D_KV);
+                linear_row(a, L.Wv, nullptr, vn, C, D_KV);
+                if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
+                if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
+                // Depth attention, before the KV-cache append: the sequence cache must hold the MIXED
+                // V, because that is what op_attn receives in the batched forward. Mirrors forward()'s
+                // block.
+                if constexpr (USE_DEPTH_ATTN) {
+                    depth_mix_row(qn, kn, vn, dep_k, dep_v, dep_n);
+                    if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(e)] >= 0) {
+                        for (int j = 0; j < D_KV; ++j) {
+                            dep_k[(size_t)dep_n * D_KV + j] = kn[j];
+                            dep_v[(size_t)dep_n * D_KV + j] = vn[j];
+                        }
+                        ++dep_n;
                     }
-                    ++dep_n;
                 }
+                float* kc = g_kv.krow(e, pos); float* vc = g_kv.vrow(e, pos);    // append this token's K/V
+                for (int j = 0; j < D_KV; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
+                for (int hd = 0; hd < H; ++hd) {                                 // attend query pos over j<=pos
+                    const int off    = hd * d;
+                    const int off_kv = (hd / GQA_GROUP) * d;    // shared KV head for this query group
+                    std::array<float, SEQ_LEN> sc{};
+                    float mx = -1e30f;
+                    for (int j = 0; j <= pos; ++j) {
+                        const float* kj = g_kv.krow(e, j) + off_kv;
+                        float s = 0.f; for (int aa = 0; aa < d; ++aa) s += qn[off + aa] * kj[aa];
+                        s *= scale; sc[j] = s; mx = std::max(mx, s);
+                    }
+                    float Z = 0.f;
+                    for (int j = 0; j <= pos; ++j) { sc[j] = FAST_MATH ? fast_exp(sc[j] - mx) : std::exp(sc[j] - mx); Z += sc[j]; }
+                    for (int aa = 0; aa < d; ++aa) att[off + aa] = 0.f;
+                    for (int j = 0; j <= pos; ++j) {
+                        const float p = sc[j] / Z; const float* vj = g_kv.vrow(e, j) + off_kv;
+                        for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
+                    }
+                }
+                linear_row(att, L.Wo, nullptr, proj, C, C);
+                for (int j = 0; j < C; ++j) h[j] += proj[j];                     // residual
+            };
+            // GDN_SCHEDULE.full_attn[l] mirrors Model::forward()'s own dispatch exactly (per-LAYER, not
+            // per-execution) -- see that function's comment. `if constexpr` keeps a GDN-off build
+            // exactly the original single call, no branch at all.
+            if constexpr (USE_GATED_DELTANET) {
+                if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+                    do_attention_mixer();
+                } else {
+                    // Gated DeltaNet decode: T=1, persistent per-execution state/conv history
+                    // (GdnCache, reset by kv_reset() at the start of each generation). op_gdn's whole
+                    // output (in_proj*, conv, recurrence, gated-norm, out_proj) IS the mixer sublayer,
+                    // so it goes straight into the residual the same way `proj` does above -- no
+                    // separate Wo, no RoPE, no QK-norm, no depth-attention (see Model::forward()'s
+                    // matching comment for why those are out of scope for a GDN layer).
+                    float gdn_scratch[GDN_SCRATCH1];
+                    gdn::forward(GDN_DIMS, 1, a,
+                                 L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
+                                 L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
+                                 L.gdn_conv->data.data(), L.gdn_a_log->data.data(),
+                                 L.gdn_dt_bias->data.data(), L.gdn_norm->data.data(),
+                                 L.gdn_out_proj->data.data(),
+                                 g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch);
+                    for (int j = 0; j < C; ++j) h[j] += proj[j];                 // residual
+                }
+            } else {
+                do_attention_mixer();
             }
-            float* kc = g_kv.krow(e, pos); float* vc = g_kv.vrow(e, pos);        // append this token's K/V
-            for (int j = 0; j < D_KV; ++j) { kc[j] = kn[j]; vc[j] = vn[j]; }
-            for (int hd = 0; hd < H; ++hd) {                                     // attend query pos over j<=pos
-                const int off    = hd * d;
-                const int off_kv = (hd / GQA_GROUP) * d;    // shared KV head for this query group
-                std::array<float, SEQ_LEN> sc{};
-                float mx = -1e30f;
-                for (int j = 0; j <= pos; ++j) {
-                    const float* kj = g_kv.krow(e, j) + off_kv;
-                    float s = 0.f; for (int aa = 0; aa < d; ++aa) s += qn[off + aa] * kj[aa];
-                    s *= scale; sc[j] = s; mx = std::max(mx, s);
-                }
-                float Z = 0.f;
-                for (int j = 0; j <= pos; ++j) { sc[j] = FAST_MATH ? fast_exp(sc[j] - mx) : std::exp(sc[j] - mx); Z += sc[j]; }
-                for (int aa = 0; aa < d; ++aa) att[off + aa] = 0.f;
-                for (int j = 0; j <= pos; ++j) {
-                    const float p = sc[j] / Z; const float* vj = g_kv.vrow(e, j) + off_kv;
-                    for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
-                }
-            }
-            linear_row(att, L.Wo, nullptr, proj, C, C);
-            for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
             rmsnorm_row(h, L.ln2, a, C);
             if constexpr (USE_GATED_FFN) {
                 linear_row(a, L.Wg, nullptr, g1, C, D_FF);
@@ -1815,7 +2021,9 @@ Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(
 
 // Incremental single-token inference (KV-cache). kv_reset() clears/sizes the cache at the start of a
 // generation; forward_one(id, pos) returns the logits [VOCAB] for the next token. See KVCache above.
-void kv_reset() { g_kv.reset(); }
+// Also resets GdnCache's decode-persistent recurrent state -- `if constexpr` so this costs nothing
+// (not even the vector-emptiness check) on a build with GDN off, per AGENTS.md S4.
+void kv_reset() { g_kv.reset(); if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset(); }
 const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
 const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see Model::last_hidden's comment
 
