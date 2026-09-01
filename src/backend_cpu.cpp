@@ -601,6 +601,63 @@ struct DepthCache {
 };
 thread_local DepthCache g_depth;
 
+// --- GDN Node-linkage side table (Stage 2; docs/GATED_DELTANET.md S6, resolving S4's deferred question)
+//
+// op_gdn (defined later, once `Layer` exists) takes `Layer&` directly rather than routing its 9 weight
+// tensors through Node's generic a/b/w/bias fanout -- Stage 1 could get away with that because it had no
+// backward to preserve node-graph linkage for (see op_gdn's own comment). Stage 2 needs backward_node's
+// Op::GDN case to reach all 9 of a GDN layer's parameter Nodes (to write their gradients) plus the input
+// node `a` (already carried via Node::a, unchanged from Stage 1) -- 10 pointers total, and Node's
+// a/b/w/bias fanout only has 4 slots. This is the SAME wall docs/DEPTH_ATTENTION.md S5a hit (a Node
+// cannot express more inputs than its fixed pointer fanout), so it gets the SAME fix already established
+// here for exactly that situation (DepthCache, just above): a thread_local side table of full Node*
+// bundles, keyed by a small int stored on the Node (Node::gdn_link, mirroring Node::depth_s's own
+// pattern) -- populated once per op_gdn call (1:1 with GDN Node creation, unlike DepthCache's own
+// variable-length "how many entries so far" bookkeeping, which this doesn't need). Declared here, ahead
+// of backward_node (which needs it) and ahead of `Layer` (which op_gdn needs but this table does not --
+// push() takes 9 plain Node* so this struct has no dependency on Layer's definition).
+//
+// Sized LOOP_EXEC_COUNT for the same reason DepthCache is: every execution that runs op_gdn gets its own
+// slot, even though most entries alias the SAME underlying Layer (LoopSplit reruns the SAME middle
+// layer, i.e. the SAME 9 parameter Nodes, several times) -- storing the bundle redundantly per execution
+// is simpler than deduplicating, and correctness does not depend on deduplication since every
+// parameter-gradient write is `+=`.
+struct GdnLink {
+    Node *in_qkv, *in_z, *in_b, *in_a, *conv, *a_log, *dt_bias, *norm, *out_proj;
+};
+struct GdnLinkCache {
+    std::array<GdnLink, LOOP_EXEC_COUNT> links{};
+    int n = 0;
+    int push(Node* in_qkv, Node* in_z, Node* in_b, Node* in_a, Node* conv, Node* a_log, Node* dt_bias,
+              Node* norm, Node* out_proj) {
+        links[static_cast<std::size_t>(n)] = {in_qkv, in_z, in_b, in_a, conv, a_log, dt_bias, norm, out_proj};
+        return n++;
+    }
+};
+thread_local GdnLinkCache g_gdn_link;   // only ever populated/consulted when USE_GATED_DELTANET
+
+// Gated DeltaNet's Stage 2 backward-time recompute scratch (docs/GATED_DELTANET.md S4's closing
+// paragraph / gdn_math.hpp's own header comment on sub0::gdn::backward): a single, reused,
+// thread_local, heap-backed buffer -- NOT an arena_alloc allocation, deliberately. backward_node walks
+// the node pool in reverse ONE NODE AT A TIME, so at most one Op::GDN node's backward is ever in flight
+// per thread; routing this through arena_alloc instead would require ACT_CAP headroom for as many
+// simultaneous copies as there are GDN layers (arena_alloc never reclaims within one graph's lifetime),
+// which would badly inflate the activation arena for a buffer that is, by construction, never live more
+// than once at a time. Sized once, lazily, to gdn::bwd_scratch_floats(GDN_DIMS, SEQ_LEN) -- the worst
+// case over every T <= SEQ_LEN a real forward() call could have produced -- the same lazy-lifetime
+// pattern already established by KVCache/GdnCache below (a std::vector, not a raw thread_local array:
+// Worker's own comment on why multi-MB thread_local statics are unsafe on Windows applies here too, and
+// this buffer is comparably large at production dims).
+struct GdnBwdScratch {
+    std::vector<float> buf;
+    float* ensure() {
+        const std::size_t n = gdn::bwd_scratch_floats(GDN_DIMS, SEQ_LEN);
+        if (buf.size() != n) buf.assign(n, 0.f);
+        return buf.data();
+    }
+};
+thread_local GdnBwdScratch g_gdn_bwd;
+
 // Per (position t, KV head hd): build a softmax over the DEPTH axis from the query's affinity to each
 // depth entry's key, and return that convex mixture of the entries' VALUES. K is untouched -- sequence
 // attention then runs normally on (unchanged K, mixed V).
@@ -1102,21 +1159,28 @@ static void backward_node(Node& n) {
         break;
     }
     case Op::GDN: {
-        // Stage 1's own, deliberate scope boundary (docs/GATED_DELTANET.md S5/S6): no backward exists
-        // for this op yet. A GDN CPU forward binary compiles and runs fine (train/gen's forward-only
-        // uses, and this correctness-gate suite, all work) -- but reaching backward() on a graph that
-        // contains one would otherwise silently leave this node's upstream gradient at the arena's zero
-        // (graph_reset zeroes grads), which train_batch would then silently treat as "this layer
-        // contributed nothing," training a DIFFERENT, wrong architecture with no diagnostic at all.
-        // That is exactly the hazard AGENTS.md's own thesis and the CUDA build-time static_assert both
-        // exist to prevent -- this is the same refusal, moved to the next callable seam down (a CPU
-        // binary compiles regardless of GDN, unlike CUDA's compile-time guard), per this project's
-        // "guard at the lowest callable seam" standing preference. Do not relax this until Stage 2 lands
-        // a real backward (the recompute-based design docs/GATED_DELTANET.md S4 already points at).
-        std::println(stderr, "fatal: Gated DeltaNet has no backward pass yet (Stage 1 is CPU forward "
-                              "only, see docs/GATED_DELTANET.md) -- refusing to silently train a "
-                              "different architecture than the one requested.");
-        std::abort();
+        // Stage 2 (docs/GATED_DELTANET.md S4/S6): recompute-based backward, delegated to
+        // sub0::gdn::backward (include/sub0/gdn_math.hpp) -- see that function's own header comment for
+        // the full derivation and its two-oracle verification. `n.gdn_link` indexes the thread_local
+        // GdnLinkCache (this file, just above DepthCache) that op_gdn populated at forward time with
+        // this node's Layer's 9 parameter Nodes -- see that struct's own comment for why this side
+        // table exists (Node's a/b/w/bias fanout has only 4 slots; this op needs 10 pointers: the input
+        // `n.a`, already carried the normal way, plus 9 weight tensors). Every one of the 10 gradient
+        // writes below is `+=` into the SAME arena-owned grad spans every other op writes into, so this
+        // needs no special-casing for LoopSplit (a repeated middle layer's several GDN executions all
+        // point at the same 9 underlying parameter Nodes and correctly accumulate into them).
+        const GdnLink& L = g_gdn_link.links[static_cast<std::size_t>(n.gdn_link)];
+        gdn::backward(GDN_DIMS, n.rows, n.a->data.data(),
+                      L.in_qkv->data.data(), L.in_z->data.data(), L.in_b->data.data(), L.in_a->data.data(),
+                      L.conv->data.data(), L.dt_bias->data.data(), L.a_log->data.data(), L.norm->data.data(),
+                      L.out_proj->data.data(),
+                      n.grad.data(),
+                      n.a->grad.data(),
+                      L.in_qkv->grad.data(), L.in_z->grad.data(), L.in_b->grad.data(), L.in_a->grad.data(),
+                      L.conv->grad.data(), L.dt_bias->grad.data(), L.a_log->grad.data(), L.norm->grad.data(),
+                      L.out_proj->grad.data(),
+                      g_gdn_bwd.ensure());
+        break;
     }
     }
 }
@@ -1296,16 +1360,17 @@ struct Layer {
 // way the KV-cache does) -- a batched forward() call always represents a fresh window starting at
 // position 0, so a zero initial state is the correct value here, not a simplification of one.
 //
-// No backward: Stage 1's own, deliberate scope boundary (docs/GATED_DELTANET.md S5/S6 -- backward wants
-// a recompute-based design, per S4's finding, not naive full-trajectory retention). backward_node's
-// Op::GDN case aborts loudly rather than silently produce absent/wrong gradients if this is ever reached
-// from train_batch -- see that case's own comment for why a loud abort is the correct Stage-1 behavior,
-// not a quiet no-op (the exact hazard AGENTS.md's own thesis and the CUDA build guard both exist to
-// prevent, just at the next callable seam down since a GDN CPU binary compiles fine).
+// Backward (Stage 2, docs/GATED_DELTANET.md S6): backward_node's Op::GDN case delegates to
+// sub0::gdn::backward, a recompute-based design per S4's finding (recomputes the state trajectory
+// during backward from x + the retained weights, rather than retaining it from forward). See that
+// case's own comment for the Node-linkage mechanism (`out->gdn_link` below, GdnLinkCache just above
+// DepthCache) that makes this op's 9 weight tensors reachable from backward_node at all.
 static Node* op_gdn(Node* a, Layer& L) {
     const int T = a->rows;
     Node* out = mk_node(Op::GDN, T, D_MODEL);
-    out->a = a;   // bookkeeping only -- never consumed by backward, see backward_node's Op::GDN case
+    out->a = a;   // the input node -- Stage 2's backward writes its gradient via n.a->grad, as usual
+    out->gdn_link = g_gdn_link.push(L.gdn_in_qkv, L.gdn_in_z, L.gdn_in_b, L.gdn_in_a, L.gdn_conv,
+                                     L.gdn_a_log, L.gdn_dt_bias, L.gdn_norm, L.gdn_out_proj);
     auto [state, state_g]     = arena_alloc(gdn::state_floats(GDN_DIMS));
     auto [convh, convh_g]     = arena_alloc(gdn::conv_hist_floats(GDN_DIMS));
     auto [scratch, scratch_g] = arena_alloc(gdn::scratch_floats(GDN_DIMS, T));
@@ -1547,6 +1612,7 @@ struct Model {
         // block), which the codebase already relies on for tied embeddings. Off, this is 0..N_LAYERS-1.
         int exec_i = 0;
         g_depth.n = 0;   // see DepthCache: a second forward must not mix the first one's entries in
+        g_gdn_link.n = 0;   // see GdnLinkCache: ditto, for a second forward's GDN Node-linkage entries
         for (const int li : LAYER_EXEC_ORDER) {
             Layer& L = layers[static_cast<std::size_t>(li)];
             const Node* const h_in = h;   // diagnostic only; arena nodes outlive the iteration

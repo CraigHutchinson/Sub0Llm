@@ -373,11 +373,16 @@ Stage-1 fixtures from real Qwen weights are the actual correctness gate here.
   `Qwen4ExpTextGatedDeltaNet` once this doc's own Stage 0/1 landed, superseding that design doc's
   Qwen3-Next-proxy first draft), the checkpoint/arena-sizing design (a second, additive
   `ARCH_FINGERPRINT2` word — the first one had zero spare bits left), and why the `Node`-fanout wall depth
-  attention hit does NOT reappear here. That doc's own "Stage 1" (CPU forward, no backward) is now
-  **DONE** (branch `feature/gated-deltanet-stage1`), gated on the `gdn_layer0_small_*` fixture above:
-  max abs diff `4.37e-11` against the real reference's output, plus mutation-style property checks and
-  a two-scale identity confirmation — see `docs/GATED_DELTANET.md` §6 for the full numbers. Stage 2
-  (backward) and Stage 3 (CUDA) remain not started.
+  attention hit did NOT reappear for Stage 1's forward (no backward to preserve linkage for yet). That
+  doc's own "Stage 1" (CPU forward, no backward) is **DONE** (branch `feature/gated-deltanet-stage1`),
+  gated on the `gdn_layer0_small_*` fixture above: max abs diff `4.37e-11` against the real reference's
+  output, plus mutation-style property checks and a two-scale identity confirmation. **Stage 2 (CPU
+  backward) is now also DONE** (branch `feature/gated-deltanet-stage2`) — the `Node`-fanout wall DOES
+  reappear here (9 parameter tensors + the input, more than `Node`'s 4-slot fanout), resolved the same
+  way depth attention's own variable-length case was (a `thread_local` side table keyed by a small int on
+  the Node); backward is verified against the real reference's own `.backward()` gradients (not just its
+  forward), matching to ~3e-7 relative — see `docs/GATED_DELTANET.md` §6 for the full numbers. Stage 3
+  (CUDA) remains not started.
 - **QSA** — real code and config now in hand (see above), but no fixture yet; not scheduled ahead of the
   other two per the original scope decision (block-sparse attention's benefit is long-context latency,
   not this engine's current focus).
