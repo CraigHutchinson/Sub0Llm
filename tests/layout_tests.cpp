@@ -19,9 +19,20 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // entirely -- see layout.hpp's HAS_POS_EMB, which is what decouples SEQ_LEN from the checkpoint).
     // N-gram embeddings add NGRAM_NUM_EMBEDDERS tables + one concat_proj tensor, 0 at the neutral
     // (NGRAM_MAX_N == 0) setting -- see layout.hpp's own NGRAM_EMBED section.
+    //
+    // Per-layer mixer slot count now depends on GDN_SCHEDULE (Stage 1): an attention layer keeps the
+    // Wq/Wk/Wv/Wo (4) [+QNorm/KNorm (2)] shape; a GDN layer is a FIXED 9 slots regardless of QK-norm
+    // (GDN never uses it -- layout.hpp's PKind comment). At GDN_FULL_ATTN_STRIDE == 0, gdn_layers == 0
+    // and this collapses to exactly the pre-Stage-1 formula below, independently re-derived (not by
+    // calling count_num_params() itself, which would make this circular).
+    constexpr int kAttnLayers = N_LAYERS - sub0::GDN_SCHEDULE.gdn_layers;
+    constexpr int kAttnMixer  = 4 + (USE_QK_NORM ? 2 : 0);
+    constexpr int kGdnMixer   = 9;
+    constexpr int kFfnSlots   = USE_GATED_FFN ? 3 : 4;
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
-                                        + (USE_GATED_FFN ? 9 : 10) * N_LAYERS
-                                        + (USE_QK_NORM ? 2 * N_LAYERS : 0)
+                                        + N_LAYERS * (2 + kFfnSlots)
+                                        + kAttnLayers * kAttnMixer
+                                        + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
                                         + (USE_TIED_EMBEDDINGS ? 1 : 3)
                                         + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0));
     REQUIRE(sub0::PARAM_LAYOUT.size() == static_cast<std::size_t>(sub0::NUM_PARAMS));
@@ -52,14 +63,28 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
         // (not Muon-eligible -- see is_muon_kind). NgramEmb is an embedding-row lookup like TokEmb:
         // no decay, not ternary -- it already satisfies the `!is_matrix` branch below with no special
         // case needed.
+        //
+        // Gated DeltaNet (Stage 1): GdnInProjQkv/Z/B/A and GdnOutProj are real 2D GEMM projections
+        // (decay=true, same as Wq/Wk/Wv/Wo), but -- like LmHead/NgramProj -- deliberately kept FULL
+        // PRECISION (ternary=false): ternary quantization's interaction with GDN's recurrence is
+        // genuinely unexplored (AGENTS.md S8, don't add unvalidated surface), not merely an oversight.
+        // GdnConv/GdnALog/GdnDtBias/GdnNorm are bias/gain-shaped (decay=false, not GEMM weights),
+        // already satisfying `!is_matrix` with no special case, same as NgramEmb.
         const bool is_matrix =
             p.kind == PKind::Wq || p.kind == PKind::Wk || p.kind == PKind::Wv ||
             p.kind == PKind::Wo || p.kind == PKind::W1 || p.kind == PKind::W2 ||
-            p.kind == PKind::Wg || p.kind == PKind::LmHead || p.kind == PKind::NgramProj;
+            p.kind == PKind::Wg || p.kind == PKind::LmHead || p.kind == PKind::NgramProj ||
+            p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
+            p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj;
         // AdamW weight decay applies only to the GEMM weight matrices.
         REQUIRE(p.decay == is_matrix);
-        // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj.
-        const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj;
+        // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj/
+        // any GDN projection (see the comment above for why GDN stays full precision for now).
+        const bool is_gdn_matrix =
+            p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
+            p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj;
+        const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj
+                                      && !is_gdn_matrix;
         REQUIRE(p.ternary == ternary_eligible);
     }
 }
@@ -258,9 +283,15 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
     for (bool b : off8.full_attn)  REQUIRE(b);
     for (bool b : off11.full_attn) REQUIRE(b);
 
-    // ...and this build's own schedule (necessarily stride 0 today) agrees.
-    static_assert(sub0::GDN_SCHEDULE.gdn_layers == 0);
-    for (bool b : sub0::GDN_SCHEDULE.full_attn) REQUIRE(b);
+    // ...and this build's own schedule agrees with gdn_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE) --
+    // at the neutral setting (the only one every build before Stage 1 could take) that means every layer
+    // is full attention, exactly as before; a Stage-1 GDN build (this test binary may now be one) has a
+    // real, nonzero gdn_layers count instead, which this same check still verifies is self-consistent.
+    static_assert(GDN_FULL_ATTN_STRIDE > 0 || sub0::GDN_SCHEDULE.gdn_layers == 0);
+    constexpr auto this_build = sub0::gdn_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE);
+    static_assert(this_build.gdn_layers == sub0::GDN_SCHEDULE.gdn_layers);
+    for (int l = 0; l < N_LAYERS; ++l)
+        REQUIRE(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)] == this_build.full_attn[static_cast<std::size_t>(l)]);
 }
 
 // ARCH_FINGERPRINT2 must reproduce 0 at the only value GDN_FULL_ATTN_STRIDE can currently take, and

@@ -61,6 +61,22 @@ static_assert(!USE_TERNARY,
 static_assert(!sub0::NGRAM_EMBED,
     "the CUDA backend does not implement n-gram embeddings yet; CPU-only for now (TODO(ngram-gpu)).");
 
+// Gated DeltaNet (GDN_FULL_ATTN_STRIDE > 0, docs/GATED_DELTANET.md): Stage 1 landed the CPU-only
+// forward (op_gdn / gdn_forward_one, backend_cpu.cpp; shared math in include/sub0/gdn_math.hpp,
+// correctness-gated against real Qwen4-preview fixtures). No CUDA implementation exists yet -- that is
+// this stage's own, deliberate scope boundary (docs/GATED_DELTANET.md S5 step 3: the chunked-parallel
+// form is the real target for a device backend, gated on exact numerical parity with Stage 1's
+// sequential CPU reference, which is not yet established for anything but the CPU path). A GPU build
+// with this on would either fail to find the GDN param/activation wiring (a hard link/runtime error) or,
+// worse, silently compute a DIFFERENT architecture (plain softmax attention) while every shape check,
+// checkpoint field and PARAM_FLOATS still agreed -- hard-stop the BUILD instead, mirroring the ternary
+// and n-gram guards just above. Delete when a CUDA Stage 3 lands (this doc's own numbering).
+// TODO(gdn-gpu): port gdn_math.hpp's sequential recurrence (or the chunked form once it exists) to a
+// device kernel.
+static_assert(!sub0::USE_GATED_DELTANET,
+    "the CUDA backend does not implement Gated DeltaNet yet; CPU-only for now (TODO(gdn-gpu), "
+    "docs/GATED_DELTANET.md Stage 3).");
+
 // Depth attention (DEPTH_ATTN_STRIDE > 0): training (forward_train + backward_device) and batched
 // inference (forward_device) are implemented below -- see docs/DEPTH_ATTENTION.md 5b. The one path NOT
 // covered is the single-token KV-cache decode, which needs its own rows=1 cache inside a captured
