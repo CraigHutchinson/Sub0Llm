@@ -11,12 +11,16 @@ the standalone sideline project this design spins the tiered-storage engine out 
 covers the problem, the prior art, and how Sub0Llm's own engine reconciles with it; that doc covers what
 Sub0Firn itself promises as an independent, engine-agnostic library.
 
-**2026-09-01: the Sub0Firn repository now exists** —
-[github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn), seeded with
-`README.md` (this repo's `SUB0FIRN_SPEC.md`, ported verbatim) and `DESIGN_RATIONALE.md` (this doc,
-ported verbatim, with an origin note pointing back here). Both copies are kept: this doc stays as
-Sub0Llm's own historical record of how/why the spin-off happened; the Sub0Firn repo is now where any
-actual implementation work on the tiered-cache engine itself belongs, not here. No code has landed in
+**2026-09-01: the Sub0Firn repository now exists**, and has since grown past its initial seed —
+[github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn) now has its own
+`REQUIREMENTS.md` (a normative R1–R10 contract), `AGENTS.md`, `STYLE_GUIDE.md`, a `docs/` split into
+`prior-art.md`/`tiered-storage-design.md`/`reference-consumer-sub0llm.md`, and a buildable
+(header-only-skeleton) `CMakeLists.txt` — brought up to the same requirements rigor as the sibling
+`Sub0Log` project. This doc (originally seeded there as `DESIGN_RATIONALE.md`, now
+`docs/tiered-storage-design.md` in that repo) stays here as Sub0Llm's own historical record of how/why
+the spin-off happened, not kept in lockstep with every subsequent edit there; the Sub0Firn repo is now
+where any actual implementation work on the tiered-cache engine itself belongs, not here. No code has
+landed in
 either repo yet — both documents are still design-only.
 
 ## 0. The problem, stated at real scale
