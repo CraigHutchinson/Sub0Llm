@@ -11,6 +11,14 @@ the standalone sideline project this design spins the tiered-storage engine out 
 covers the problem, the prior art, and how Sub0Llm's own engine reconciles with it; that doc covers what
 Sub0Firn itself promises as an independent, engine-agnostic library.
 
+**2026-09-01: the Sub0Firn repository now exists** —
+[github.com/CraigHutchinson/Sub0Firn](https://github.com/CraigHutchinson/Sub0Firn), seeded with
+`README.md` (this repo's `SUB0FIRN_SPEC.md`, ported verbatim) and `DESIGN_RATIONALE.md` (this doc,
+ported verbatim, with an origin note pointing back here). Both copies are kept: this doc stays as
+Sub0Llm's own historical record of how/why the spin-off happened; the Sub0Firn repo is now where any
+actual implementation work on the tiered-cache engine itself belongs, not here. No code has landed in
+either repo yet — both documents are still design-only.
+
 ## 0. The problem, stated at real scale
 
 Two motivating cases, per the task brief — kept distinct throughout because they hit the resource wall
