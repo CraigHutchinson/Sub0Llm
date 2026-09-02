@@ -44,7 +44,7 @@ namespace sub0 {
 // Stages treat Node pointers as opaque handles (forward -> loss -> backward),
 // except for reading logits via the `data` span.
 enum class Op : uint8_t { Leaf, Embed, Add, Linear, RMSNorm, GELU, Rope, Attn, CrossEnt, SwiGLU, TiedHead, QKNorm,
-                          DepthAttn, GDN };
+                          DepthAttn, GDN, GrTile, GrMix, GrGate, GrCombine };
 
 struct Node {
     Op op = Op::Leaf;

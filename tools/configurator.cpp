@@ -604,6 +604,10 @@ int main(int argc, char** argv) {
     int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
     int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
     int ngram_table_size   = 0;  // N-gram embeddings: per-table vocab size m (0 = auto: VOCAB)
+    // Gated Residual (hyper-connections): Stage 1 -- CPU forward only (docs/GATED_RESIDUAL.md).
+    // HC_COUNT parallel residual streams read/write-gated per sub-block. 0 = off, the default.
+    int hc_count           = 0;
+    int hc_lowrank         = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -677,6 +681,15 @@ int main(int argc, char** argv) {
     app.add_option("--ngram-table-size", ngram_table_size,
                    "N-gram embeddings: per-table small hashed vocab size (0 = auto: same as --vocab)")
        ->capture_default_str();
+    app.add_option("--hc-count", hc_count,
+                   "Gated Residual (docs/GATED_RESIDUAL.md): number of parallel hyper-connection "
+                   "residual streams (0 = off, else >= 2). Stage 1: CPU forward only -- gen/eval/report "
+                   "work, train/tune do not (no backward pass yet)")
+       ->capture_default_str()->check(CLI::Range(0, 64));
+    app.add_option("--hc-lowrank", hc_lowrank,
+                   "Gated Residual: low-rank bottleneck width of the input-mixer gate (0 = off, must "
+                   "match --hc-count's on/off state, i.e. >= 1 iff --hc-count >= 2)")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -882,6 +895,18 @@ int main(int argc, char** argv) {
                          d_model, ngram_max_n, num_embedders);
             return 1;
         }
+    }
+    // Gated Residual: mirrors layout.hpp's own static_asserts, as a configure-time diagnostic naming the
+    // flags rather than a compile error in the engine (same pattern as the ngram check just above).
+    if (hc_count != 0 && hc_count < 2) {
+        std::println(stderr, "configure error: hc-count ({}) must be 0 (off) or >= 2", hc_count);
+        return 1;
+    }
+    if ((hc_count >= 2) != (hc_lowrank >= 1)) {
+        std::println(stderr,
+                     "configure error: hc-count ({}) and hc-lowrank ({}) must be on or off together "
+                     "(hc-count >= 2 iff hc-lowrank >= 1)", hc_count, hc_lowrank);
+        return 1;
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
     // so the two styles land at roughly the same total FFN param count -- see d_ff_for's doc comment.
@@ -1352,6 +1377,11 @@ int main(int argc, char** argv) {
     cos << "constexpr int  NGRAM_MAX_N         = " << ngram_max_n << ";\n";
     cos << "constexpr int  NGRAM_TABLES_PER_ORDER = " << ngram_tables << ";\n";
     cos << "constexpr int  NGRAM_TABLE_SIZE    = " << ngram_table_size << ";\n";
+    // Gated Residual (hyper-connections) Stage 1: HC_COUNT parallel residual streams read/write-gated
+    // per sub-block (layout.hpp's USE_GATED_RESIDUAL/GR_DIMS). 0 = off, the default. See
+    // docs/GATED_RESIDUAL.md.
+    cos << "constexpr int  HC_COUNT   = " << hc_count << ";\n";
+    cos << "constexpr int  HC_LOWRANK = " << hc_lowrank << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
@@ -1546,6 +1576,7 @@ int main(int argc, char** argv) {
     shown.gdn_full_attn_stride = gdn_full_attn_stride;
     shown.ngram_max_n = ngram_max_n; shown.ngram_tables = ngram_tables;
     shown.ngram_table_size = ngram_table_size;
+    shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;

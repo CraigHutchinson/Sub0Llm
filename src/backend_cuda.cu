@@ -61,6 +61,17 @@ static_assert(!USE_TERNARY,
 static_assert(!sub0::NGRAM_EMBED,
     "the CUDA backend does not implement n-gram embeddings yet; CPU-only for now (TODO(ngram-gpu)).");
 
+// Gated Residual (HC_COUNT >= 2, docs/GATED_RESIDUAL.md): Stage 1 landed CPU-only forward (op_gr_tile/
+// op_gr_mix/op_gr_gate/op_gr_combine, backend_cpu.cpp; shared math in
+// include/sub0/gated_residual_math.hpp). This backend has NO knowledge of GR at all yet -- a GPU build
+// with it on would silently compute a DIFFERENT, WRONG architecture (the plain single-residual-stream
+// one) rather than failing to find some wiring, since GR changes the RESIDUAL STREAM WIDTH itself, not
+// an isolated op this backend could simply be missing a kernel for -- hard-stop the BUILD, mirroring the
+// n-gram/ternary guards just above. TODO(gr-gpu): port op_gr_tile/op_gr_mix/op_gr_gate/op_gr_combine
+// (backend_cpu.cpp) to device kernels, then lift this guard.
+static_assert(!sub0::USE_GATED_RESIDUAL,
+    "the CUDA backend does not implement Gated Residual yet; CPU-only for now (TODO(gr-gpu)).");
+
 // Gated DeltaNet (GDN_FULL_ATTN_STRIDE > 0, docs/GATED_DELTANET.md): Stage 1/2 landed the CPU-only
 // forward+backward (op_gdn / gdn_forward_one, backend_cpu.cpp; shared math in include/sub0/gdn_math.hpp,
 // correctness-gated against real Qwen4-preview fixtures). Stage 3 (this pass) adds CUDA FORWARD ONLY --
