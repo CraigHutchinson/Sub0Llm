@@ -23,6 +23,7 @@
                             // anything from this file.
 #include "gated_residual_math.hpp"  // sub0::gr::Dims for GR_DIMS below -- same reasoning as gdn_math.hpp
                             // just above; dependency-free (see its own header comment).
+#include "moe_math.hpp"     // sub0::moe::Dims for MOE_DIMS below -- same reasoning again; dependency-free.
 
 #include <algorithm>
 #include <array>
@@ -333,6 +334,56 @@ inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_coun
     return static_cast<long long>(n_layers) * 2 * per_instance_with_inject + top_instance;
 }
 
+// MIXTURE OF EXPERTS -- Stage 0: config skeleton, hard-gated off (docs/MOE.md). NUM_EXPERTS routed
+// experts + 1 always-on shared expert per layer, EXPERTS_PER_TOK selected per token (Qwen4-preview's own
+// Qwen4ExpTextSparseMoeBlock). Unlike Gated DeltaNet (a per-LAYER schedule, some layers softmax attention
+// some GDN) this mechanism replaces the FFN block for EVERY layer uniformly when on -- there is no
+// per-layer schedule to derive, only a single on/off gate. 0 = off, the only value every build before
+// this stage could take, and still the default.
+inline constexpr bool USE_MOE = (NUM_EXPERTS >= 2);
+static_assert(NUM_EXPERTS == 0, "MIXTURE OF EXPERTS Stage 0: NUM_EXPERTS is hard-clamped to 0 until "
+              "Stage 1's real op exists -- see docs/MOE.md S4a");
+static_assert(EXPERTS_PER_TOK == 0, "MIXTURE OF EXPERTS Stage 0: EXPERTS_PER_TOK is hard-clamped to 0 "
+              "until Stage 1's real op exists -- see docs/MOE.md S4a");
+
+// Never-zero array-bound forms (same idiom as HC_COUNT_BUF/NGRAM_TABLES_BUF above) -- valid, non-
+// degenerate shapes even when USE_MOE is false, so downstream code never needs a separate guard just to
+// declare an array of this width.
+inline constexpr int NUM_EXPERTS_BUF = USE_MOE ? NUM_EXPERTS : 1;
+// MoE's per-expert (and shared-expert) SwiGLU intermediate width. Reuses D_FF -- this project's own
+// existing FFN-width knob -- rather than introducing a separate CLI axis: the real model's own
+// moe_intermediate_size (640) and shared_expert_intermediate_size (640) are already equal
+// (docs/QWEN4_MEMORY_ORCHESTRATION.md S2a), so one shared width is real-model-faithful, not an
+// approximation, and AGENTS.md S8 disfavors a speculative extra knob nothing yet needs.
+inline constexpr moe::Dims MOE_DIMS{D_MODEL, D_FF, NUM_EXPERTS, EXPERTS_PER_TOK};
+
+// Exact PARAM_FLOATS delta a MoE-on build adds over an otherwise-identical MoE-off build, per
+// docs/MOE.md S3b -- a pure function of explicit parameters (not closed over this build's own constants),
+// same reasoning as gr_param_delta()/gdn_schedule_for<LAYERS>() above. UNLIKE Gated Residual's own
+// gr_param_delta (a pure ADDITION on top of an unchanged existing tensor set), MoE REPLACES the FFN
+// block's existing tensors -- so this is `moe_layer_floats - dense_ffn_floats`, not merely `+something`.
+// `d_ff` is the FFN width whichever variant is active at those dims (this project's own d_ff_for()); the
+// dense side must reflect whether the config being replaced was gated (3 tensors) or plain (4 tensors,
+// including 2 bias vectors) SO THE CALLER PASSES THE RIGHT ONE -- see layout_tests.cpp's own call site.
+// Strictly positive whenever num_experts >= 2 (this function's own "on" precondition): even the cheapest
+// possible replacement (num_experts=2) needs 2*3 expert tensors + 3 shared-expert tensors + 1 router +
+// 1 shared-gate tensor, each sized D_MODEL*d_ff or larger, which already exceeds the gated dense FFN's own
+// 3 D_MODEL*d_ff tensors -- worked through explicitly in the final report's own arithmetic, not assumed.
+inline constexpr long long moe_param_delta(int n_layers, int d_model, int d_ff, int num_experts,
+                                            int experts_per_tok, bool was_gated_ffn) {
+    if (num_experts < 2) return 0;
+    (void)experts_per_tok;   // EXPERTS_PER_TOK never changes a tensor SHAPE -- see ARCH_FINGERPRINT2 below
+    const long long router       = static_cast<long long>(d_model) * num_experts;
+    const long long per_expert   = 2LL * d_model * d_ff + static_cast<long long>(d_ff) * d_model;  // gate+up+down
+    const long long shared       = 2LL * d_model * d_ff + static_cast<long long>(d_ff) * d_model;  // shared FFN
+    const long long shared_gate  = d_model;                                                        // [d_model,1]
+    const long long moe_layer_floats = router + static_cast<long long>(num_experts) * per_expert + shared + shared_gate;
+    const long long dense_ffn_floats = was_gated_ffn
+        ? 3LL * d_model * d_ff                                    // Wg, W1, W2 (SwiGLU, no bias)
+        : 2LL * static_cast<long long>(d_model) * d_ff + d_ff + d_model;  // W1,B1,W2,B2 (plain GELU+bias)
+    return static_cast<long long>(n_layers) * (moe_layer_floats - dense_ffn_floats);
+}
+
 // --- N-GRAM EMBEDDINGS -- additional per-position features from rolling polynomial-hash token n-grams,
 // added into the input embedding (Nanbeige's `NanbeigeNgramEmbedding`, "concat" fusion mode -- see
 // docs/NGRAM_EMBEDDING.md). NGRAM_MAX_N is the highest n-gram order used (bigrams..NGRAM_MAX_N-grams);
@@ -484,7 +535,8 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, 
 // day one (only byte 0 is assigned) so the next computation-changing, shape-neutral axis after this one
 // does not repeat the exact scramble that produced ARCH_FINGERPRINT's own comment about a byte
 // "middle_layers was never able to reach".
-//   Field layout, high to low: [63:8] reserved (always 0 today) | [7:0] gdn_full_attn_stride.
+//   Field layout, high to low: [63:16] reserved (always 0 today) | [15:8] experts_per_tok |
+//   [7:0] gdn_full_attn_stride.
 // At GDN_FULL_ATTN_STRIDE == 0 (the only value this build can currently take -- see the static_assert
 // above) this is always 0, which is also what every checkpoint that predates this field must be
 // ASSUMED to have been built with (Gated DeltaNet does not exist as a computable option anywhere yet,
@@ -492,17 +544,31 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, 
 // only architecture that has ever existed). See docs/GATED_DELTANET.md and engine_core.cpp/
 // train_stage.cpp's third trailing checkpoint record for the on-disk (additive, gracefully-degrading)
 // side of this.
+//
+// EXPERTS_PER_TOK (docs/MOE.md S3c): a MoE-on build's routed-expert TENSORS (NUM_EXPERTS of them) are
+// already discriminated by PARAM_FLOATS (moe_param_delta() above) -- but EXPERTS_PER_TOK itself changes
+// nothing about their SHAPE, only how many of them a forward pass actually reads per token. Two builds at
+// identical NUM_EXPERTS/D_MODEL/D_FF but different EXPERTS_PER_TOK produce byte-identical checkpoints
+// that compute different things -- exactly ARCH_FINGERPRINT2's rule #2 ("changes computation, not shape
+// -> ADD IT HERE, or it loads silently and computes the wrong thing"), the same reasoning
+// GDN_FULL_ATTN_STRIDE's own byte here already establishes, not NUM_EXPERTS's (which stays a pure
+// PARAM_FLOATS/moe_param_delta concern and does NOT join this fingerprint, mirroring HC_COUNT/HC_LOWRANK's
+// own MODEL_ARCH_ID-only treatment). Placed in byte 1 -- the next of the 56 spare bits this word was
+// deliberately given from day one specifically so a future axis like this one would not need to repeat
+// ARCH_FINGERPRINT's own cramped-bit-budget scramble (see that struct's own comment).
 static_assert(GDN_FULL_ATTN_STRIDE >= 0 && GDN_FULL_ATTN_STRIDE <= 0xff,
               "GDN_FULL_ATTN_STRIDE must fit 8 bits");
-inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride) {
-    return static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride) & 0xffu);
+static_assert(EXPERTS_PER_TOK >= 0 && EXPERTS_PER_TOK <= 0xff, "EXPERTS_PER_TOK must fit 8 bits");
+inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride, int experts_per_tok = 0) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(experts_per_tok)   & 0xffu) << 8)
+         |  static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride) & 0xffu);
 }
-struct ArchAxes2 { int gdn_full_attn_stride; };
+struct ArchAxes2 { int gdn_full_attn_stride; int experts_per_tok; };
 inline constexpr ArchAxes2 arch_axes2_of(std::uint64_t fp2) {
-    return ArchAxes2{ static_cast<int>(fp2 & 0xffu) };
+    return ArchAxes2{ static_cast<int>(fp2 & 0xffu), static_cast<int>((fp2 >> 8) & 0xffu) };
 }
-inline constexpr std::uint64_t ARCH_FINGERPRINT2 = arch_fingerprint2(GDN_FULL_ATTN_STRIDE);
-inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2 = arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
 // shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
@@ -540,7 +606,8 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(DEPTH_ATTN_STRIDE));   // adds no parameters; changes computation
     mix(static_cast<std::uint64_t>(ROPE_SCALING));
     mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(ROPE_SCALE_FACTOR)));
-    mix(ARCH_FINGERPRINT2);                               // folds in Gated DeltaNet's layer schedule
+    mix(ARCH_FINGERPRINT2);                               // folds in Gated DeltaNet's layer schedule AND
+                                                            // MoE's experts_per_tok (docs/MOE.md S3c)
     mix(static_cast<std::uint64_t>(GDN_FULL_ATTN_STRIDE)); // (currently always 0 -- see the static_assert
                                                             //  in the GATED DELTANET section above)
     // N-gram embeddings: a SHAPE-changing axis (see its own section above), so PARAM_FLOATS already
@@ -556,6 +623,13 @@ consteval std::uint64_t make_model_arch_id() {
     // every other axis MODEL_ARCH_ID covers.
     mix(static_cast<std::uint64_t>(HC_COUNT));
     mix(static_cast<std::uint64_t>(HC_LOWRANK));
+    // Mixture of Experts: NUM_EXPERTS is a SHAPE-changing axis (docs/MOE.md S3c -- moe_param_delta() is
+    // strictly monotonic in the "on" direction), so PARAM_FLOATS alone already discriminates it and it
+    // does NOT join ARCH_FINGERPRINT -- mixed in here unconditionally like every other axis MODEL_ARCH_ID
+    // covers. EXPERTS_PER_TOK already joined ARCH_FINGERPRINT2 above (a shape-NEUTRAL, computation-
+    // changing axis, mixed in via the earlier `mix(ARCH_FINGERPRINT2)` call, which now covers both GDN's
+    // stride and MoE's experts_per_tok) and is not folded in a second time here.
+    mix(static_cast<std::uint64_t>(NUM_EXPERTS));
     return h;
 }
 inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();
@@ -617,7 +691,12 @@ consteval int count_num_params() {
             n += 9;   // GdnInProjQkv/Z/B/A, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
         }
         if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (mlp-wrapping)
-        n += (USE_GATED_FFN ? 3 : 4);
+        // Mixture of Experts (Stage 1, docs/MOE.md S3b): replaces the FFN's own 3 (gated)/4 (plain)
+        // tensors with MoeRouter (1) + NUM_EXPERTS*(MoeGate,MoeUp,MoeDown) + the shared expert's own
+        // SwiGLU triple (3) + MoeSharedGateProj (1), for EVERY layer uniformly (no per-layer schedule,
+        // unlike GDN -- MoE is on for the whole model or not at all, see USE_MOE's own comment).
+        if constexpr (USE_MOE) n += 1 + 3 * NUM_EXPERTS + 3 + 1;
+        else                   n += (USE_GATED_FFN ? 3 : 4);
     }
     n += (USE_TIED_EMBEDDINGS ? 1 : 3);
     n += (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
@@ -659,11 +738,17 @@ inline constexpr int NUM_PARAMS = count_num_params();
 // WITHOUT GrBlockInject -- see make_param_layout()'s own placement). GrHcNorm is [1, HC_COUNT*D_MODEL]
 // (one gain per (stream,channel) pair, NOT shared across streams like QNorm/KNorm -- a real divergence
 // from this project's existing per-head norm convention, verified in the real source, S1a).
+// MoE kinds (Stage 1, docs/MOE.md S3b/S4): a MoE-on layer replaces its FFN's Wg/W1/W2 (or W1/B1/W2/B2)
+// with MoeRouter (the D_MODEL->NUM_EXPERTS gate, no bias) followed by NUM_EXPERTS repeats of
+// (MoeGate, MoeUp, MoeDown) -- one routed expert's own SwiGLU triple -- then ONE shared-expert SwiGLU
+// triple (MoeSharedGate/MoeSharedUp/MoeSharedDown, same D_FF width per MOE_DIMS) plus MoeSharedGateProj
+// (the D_MODEL->1 sigmoid gate scaling the shared expert's own contribution).
 enum class PKind : unsigned char {
     TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
     NgramEmb, NgramProj,
     GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
-    GrHcNorm, GrMixDown, GrMixUp, GrBlockInject
+    GrHcNorm, GrMixDown, GrMixUp, GrBlockInject,
+    MoeRouter, MoeGate, MoeUp, MoeDown, MoeSharedGate, MoeSharedUp, MoeSharedDown, MoeSharedGateProj
 };
 
 // One weight tensor: where it lives in the flat blob, its logical [rows x cols]
@@ -747,7 +832,24 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             add(HC_LOWRANK, WIDE,       PKind::GrMixUp,       true,  false);
             add(WIDE,       HC_COUNT,   PKind::GrBlockInject, true,  false);
         }
-        if constexpr (USE_GATED_FFN) {
+        if constexpr (USE_MOE) {
+            // Mixture of Experts (docs/MOE.md S3b/S4): router (no bias) + NUM_EXPERTS routed-expert
+            // SwiGLU triples + the shared expert's own SwiGLU triple + its own sigmoid-gate projection.
+            // Router/shared-gate-proj stay full precision (ternary=false) -- routing decisions are the
+            // one place a ternarized weight would be most damaging, same reasoning LmHead/GdnOutProj stay
+            // full precision. Expert FFN matrices ARE ternary-eligible (ternary=true), matching Wg/W1/W2's
+            // own treatment -- they are ordinary GEMM weights, just NUM_EXPERTS independent copies of one.
+            add(D_MODEL, NUM_EXPERTS, PKind::MoeRouter, true, false);
+            for (int e = 0; e < NUM_EXPERTS; ++e) {
+                add(D_MODEL, D_FF, PKind::MoeGate, true, true);
+                add(D_MODEL, D_FF, PKind::MoeUp,   true, true);
+                add(D_FF, D_MODEL, PKind::MoeDown, true, true);
+            }
+            add(D_MODEL, D_FF, PKind::MoeSharedGate, true, true);
+            add(D_MODEL, D_FF, PKind::MoeSharedUp,   true, true);
+            add(D_FF, D_MODEL, PKind::MoeSharedDown, true, true);
+            add(D_MODEL, 1,    PKind::MoeSharedGateProj, true, false);
+        } else if constexpr (USE_GATED_FFN) {
             add(D_MODEL, D_FF,    PKind::Wg, true, true);   // gate
             add(D_MODEL, D_FF,    PKind::W1, true, true);   // up
             add(D_FF,    D_MODEL, PKind::W2, true, true);   // down (no biases -- GGUF/Llama convention)
@@ -795,7 +897,14 @@ inline constexpr std::array<ParamDesc, NUM_PARAMS> PARAM_LAYOUT = make_param_lay
 // kinds route through Muon -- backend_cpu.cpp used to inline this exact kind set locally.
 inline constexpr bool is_muon_kind(PKind k) {
     return k == PKind::Wq || k == PKind::Wk || k == PKind::Wv || k == PKind::Wo ||
-           k == PKind::W1 || k == PKind::W2 || k == PKind::Wg;
+           k == PKind::W1 || k == PKind::W2 || k == PKind::Wg ||
+           // MoE (Stage 1): the routed and shared experts' own SwiGLU matrices are ordinary hidden GEMM
+           // weights, NUM_EXPERTS independent copies of the same role Wg/W1/W2 already play -- Muon-
+           // eligible for the same reason. MoeRouter/MoeSharedGateProj stay on AdamW (see their own
+           // ternary=false comment in make_param_layout() -- routing precision, same reasoning LmHead
+           // stays off Muon/ternary both).
+           k == PKind::MoeGate || k == PKind::MoeUp || k == PKind::MoeDown ||
+           k == PKind::MoeSharedGate || k == PKind::MoeSharedUp || k == PKind::MoeSharedDown;
 }
 
 // A compact [start,end) float-offset range where AdamW weight decay applies, merging adjacent
