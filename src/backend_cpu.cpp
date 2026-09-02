@@ -1374,10 +1374,24 @@ static Node* op_gdn(Node* a, Layer& L) {
     auto [state, state_g]     = arena_alloc(gdn::state_floats(GDN_DIMS));
     auto [convh, convh_g]     = arena_alloc(gdn::conv_hist_floats(GDN_DIMS));
     auto [scratch, scratch_g] = arena_alloc(gdn::scratch_floats(GDN_DIMS, T));
+    // NOTE (found by Stage 3's independent CUDA re-derivation, not a Stage 3 change of its own): the
+    // real gdn::forward() signature order is `(..., conv_w, dt_bias, a_log, norm_w, ...)` -- dt_bias
+    // BEFORE a_log (see that function's own declaration, gdn_math.hpp). This call previously passed
+    // L.gdn_a_log into the dt_bias slot and L.gdn_dt_bias into the a_log slot (swapped), even though
+    // both g_gdn_link.push() just above and backward_node's Op::GDN case (gdn::backward's own call)
+    // already had the two in the CORRECT, name-matching order -- so forward computed a genuinely
+    // different function (dt_bias's real values exponentiated where A_log should be, and vice versa)
+    // than backward differentiated through its own recompute. Neither the fixture test (which calls
+    // gdn::forward directly, with its own correctly-ordered variables, never through op_gdn) nor the
+    // whole-model finite-difference check (which perturbs a NAMED tensor and compares against that
+    // SAME name's analytic grad, so a consistent relabeling of "which tensor plays which role" does
+    // not by itself fail it) could catch this from the CPU side alone -- Stage 3's CUDA port, built
+    // independently from the verified gdn_math.hpp reference rather than copied from this call site,
+    // disagreed with the CPU engine's real forward output at a real mixed-layer model and exposed it.
     gdn::forward(GDN_DIMS, T, a->data.data(),
                  L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
                  L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
-                 L.gdn_conv->data.data(), L.gdn_a_log->data.data(), L.gdn_dt_bias->data.data(),
+                 L.gdn_conv->data.data(), L.gdn_dt_bias->data.data(), L.gdn_a_log->data.data(),
                  L.gdn_norm->data.data(), L.gdn_out_proj->data.data(),
                  state.data(), convh.data(), out->data.data(), scratch.data());
     return out;
@@ -1870,12 +1884,14 @@ struct Model {
                     // so it goes straight into the residual the same way `proj` does above -- no
                     // separate Wo, no RoPE, no QK-norm, no depth-attention (see Model::forward()'s
                     // matching comment for why those are out of scope for a GDN layer).
+                    // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward above (this
+                    // decode path had the identical swap, independently) -- see that call site's comment.
                     float gdn_scratch[GDN_SCRATCH1];
                     gdn::forward(GDN_DIMS, 1, a,
                                  L.gdn_in_qkv->data.data(), L.gdn_in_z->data.data(),
                                  L.gdn_in_b->data.data(), L.gdn_in_a->data.data(),
-                                 L.gdn_conv->data.data(), L.gdn_a_log->data.data(),
-                                 L.gdn_dt_bias->data.data(), L.gdn_norm->data.data(),
+                                 L.gdn_conv->data.data(), L.gdn_dt_bias->data.data(),
+                                 L.gdn_a_log->data.data(), L.gdn_norm->data.data(),
                                  L.gdn_out_proj->data.data(),
                                  g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch);
                     for (int j = 0; j < C; ++j) h[j] += proj[j];                 // residual

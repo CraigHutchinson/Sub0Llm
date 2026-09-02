@@ -2273,14 +2273,22 @@ TEST_CASE("logits chunk derivation: coverage, bounds, and the batch-scaling gap"
 // Regression test for a real defect, not a hypothetical: gpu_decode_try_enable() gated only on HAS_CUDA
 // plus init success, so on a depth-attention build `sub0llm report` would have driven its sample battery
 // straight into forward_one_device's refusal -- mid-run, at the first eval, not at an explicit `gen`.
+//
+// Gated DeltaNet (docs/GATED_DELTANET.md Stage 3) added a SECOND, independent axis that can turn
+// supports_decode off (CUDA forward-only, no single-token GDN state cache) and, unlike depth attention,
+// also turns supports_train off (no CUDA backward at all) -- both expressed directly in terms of
+// USE_GATED_DELTANET so this test stays honest at a GDN-on build too, not just a depth-attention one.
 TEST_CASE("CUDA caps: supports_decode is honest, and the decode consumer honours it", "[cuda]") {
-    REQUIRE(sub0_dev_caps().supports_decode == (DEPTH_ATTN_STRIDE == 0 ? 1 : 0));
-    if constexpr (sub0::USE_DEPTH_ATTN) {
+    const bool decode_expected = (DEPTH_ATTN_STRIDE == 0) && !sub0::USE_GATED_DELTANET;
+    REQUIRE(sub0_dev_caps().supports_decode == (decode_expected ? 1 : 0));
+    if constexpr (sub0::USE_DEPTH_ATTN || sub0::USE_GATED_DELTANET) {
         // Must return false WITHOUT touching the device -- the point is that no decode call is made.
         REQUIRE(sub0::gpu_decode_try_enable() == false);
     }
-    // Whatever decode reports, the paths depth attention DOES implement stay advertised.
-    REQUIRE(sub0_dev_caps().supports_train == 1);
+    // supports_train is false ONLY for GDN (Stage 3 is forward-only); depth attention's own axis never
+    // touches it (its backward IS implemented) -- whatever ELSE is unsupported, the paths a build DOES
+    // implement stay advertised.
+    REQUIRE(sub0_dev_caps().supports_train == (sub0::USE_GATED_DELTANET ? 0 : 1));
     REQUIRE(sub0_dev_caps().supports_eval  == 1);
 }
 
