@@ -43,12 +43,11 @@ struct Dims {
 inline constexpr std::size_t normed_scratch_floats(const Dims& d, int T) {
     return static_cast<std::size_t>(T) * static_cast<std::size_t>(d.wide());
 }
+// mix()'s own scratch need, on top of the ALREADY-NORMALIZED `normed` buffer it takes as an input (see
+// mix()'s own comment) -- just the down-projection's pre-activation, [T, hc_lowrank]. A caller that has
+// not yet normalized its wide input separately needs normed_scratch_floats(d,T) MORE, for that step.
 inline constexpr std::size_t mix_scratch_floats(const Dims& d, int T) {
-    // normed (own copy) + the down-projection's pre-activation, [T, hc_lowrank].
-    return normed_scratch_floats(d, T) + static_cast<std::size_t>(T) * static_cast<std::size_t>(d.hc_lowrank);
-}
-inline constexpr std::size_t gate_scratch_floats(const Dims& d, int T) {
-    return normed_scratch_floats(d, T);   // normed (own copy) only
+    return static_cast<std::size_t>(T) * static_cast<std::size_t>(d.hc_lowrank);
 }
 
 namespace detail {

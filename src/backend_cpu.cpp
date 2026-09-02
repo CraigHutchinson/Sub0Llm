@@ -22,6 +22,7 @@
 #include "sub0/core.hpp"
 #include "sub0/cpu_affinity.hpp"    // P-core-first thread pinning (hybrid Intel CPUs) -- see its own header comment
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet Stage 1 forward math (sub0::gdn::forward/recurrence_step)
+#include "sub0/gated_residual_math.hpp"  // Gated Residual Stage 1 forward math (sub0::gr::hc_norm/mix/gate/combine/tile)
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
@@ -88,7 +89,14 @@ consteval size_t calc_act_cap() {
     // NGRAM_NUM_EMBEDDERS op_embed nodes ([T, NGRAM_EMB_DIM] each, summing to [T, D_MODEL]) + that many
     // op_linear nodes ([T, D_MODEL] each) + that many op_add nodes (the accumulator chain plus the
     // final residual add) -- see forward()'s ngram block in backend_cpu.cpp.
-    size_t base = 3 * T * C + (NGRAM_EMBED ? (size_t)(1 + 2 * NGRAM_NUM_EMBEDDERS) * T * C : 0);
+    // Gated Residual (Stage 1): the model-level entry tile ([T, HC_WIDE], once) and exit collapse
+    // (op_gr_mix only -- [T,D_MODEL] output + its [T,HC_WIDE]+[T,HC_LOWRANK] scratch, once). The two
+    // PER-SUB-BLOCK-WRAP instances (attn-wrapping, mlp-wrapping, once per EXECUTION) are costed in
+    // `per` below, not here. Zero when GR is off.
+    size_t base = 3 * T * C + (NGRAM_EMBED ? (size_t)(1 + 2 * NGRAM_NUM_EMBEDDERS) * T * C : 0)
+                + (USE_GATED_RESIDUAL ? (size_t)T * HC_WIDE
+                                        + T * C + T * HC_WIDE + T * HC_LOWRANK
+                                      : 0);
     // FFN activation nodes: plain (W1-out, gelu-out) = 2*T*F; gated (gate-out, up-out, swiglu-out)
     // = 3*T*F (one extra T*F node -- see op_swiglu in the forward pass).
     size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
@@ -110,7 +118,13 @@ consteval size_t calc_act_cap() {
                 // comment). Zero when GDN is off.
                 + (USE_GATED_DELTANET ? (size_t)T * C + gdn::state_floats(GDN_DIMS)
                                         + gdn::conv_hist_floats(GDN_DIMS) + gdn::scratch_floats(GDN_DIMS, T)
-                                      : 0);
+                                      : 0)
+                // Gated Residual (Stage 1): TWO per-execution sub-block wraps (attn-wrapping,
+                // mlp-wrapping), each costing op_gr_mix's [T,D_MODEL] output + its
+                // [T,HC_WIDE]+[T,HC_LOWRANK] scratch, op_gr_gate's [T,HC_COUNT] output + its
+                // [T,HC_WIDE] scratch, and op_gr_combine's [T,HC_WIDE] output -- see
+                // gated_residual_math.hpp's own *_scratch_floats(). Zero when GR is off.
+                + (USE_GATED_RESIDUAL ? (size_t)2 * T * (C + 3 * HC_WIDE + HC_LOWRANK + HC_COUNT) : 0);
     size_t fin  = T * C + 2 * T * V + 64;
     // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
     // activation nodes R times (the weights are shared; the activations are not).
@@ -128,10 +142,14 @@ constexpr size_t ACT_CAP   = calc_act_cap() * 3 / 2 + 8192;
 // Gated DeltaNet adds exactly one node per EXECUTION too (op_gdn's single output node), same
 // over-provisioning reasoning as calc_act_cap()'s own GDN term above -- every execution is budgeted as
 // if it could be GDN, rather than tracking GDN_SCHEDULE's actual per-execution mix here.
+// Gated Residual adds 6 nodes per EXECUTION (op_gr_mix+op_gr_gate+op_gr_combine, x2 sub-block wraps)
+// plus 2 more ONCE (the model-level entry op_gr_tile and exit op_gr_mix) -- see calc_act_cap()'s
+// matching comment for the per-instance shape.
 constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_COUNT
                                 + (USE_QK_NORM ? 2 * (size_t)LOOP_EXEC_COUNT : 0)
                                 + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0)
                                 + (USE_GATED_DELTANET ? (size_t)LOOP_EXEC_COUNT : 0)
+                                + (USE_GATED_RESIDUAL ? 6 * (size_t)LOOP_EXEC_COUNT + 2 : 0)
                                 + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0);
 
 // ============================================================================
@@ -1182,6 +1200,21 @@ static void backward_node(Node& n) {
                       g_gdn_bwd.ensure());
         break;
     }
+    case Op::GrTile: case Op::GrMix: case Op::GrGate: case Op::GrCombine: {
+        // Stage 1's own, deliberate scope boundary (docs/GATED_RESIDUAL.md S6): no backward exists for
+        // these ops yet. A GR CPU forward binary compiles and runs fine (gen/eval/report's forward-only
+        // uses, and this correctness-gate suite, all work) -- but reaching backward() on a graph that
+        // contains one would otherwise silently leave this node's upstream gradient at the arena's zero
+        // (graph_reset zeroes grads), which train_batch would then silently treat as "this layer
+        // contributed nothing," training a DIFFERENT, wrong architecture with no diagnostic at all. Same
+        // "guard at the lowest callable seam" refusal, moved to the exact same seam, as the Op::GDN
+        // Stage 1 placeholder this mirrors (see project history, commit bac8bfd, before GDN's own
+        // Stage 2 replaced it). Do not relax this until a future stage lands a real backward.
+        std::println(stderr, "fatal: Gated Residual has no backward pass yet (Stage 1 is CPU forward "
+                              "only, see docs/GATED_RESIDUAL.md) -- refusing to silently train a "
+                              "different architecture than the one requested.");
+        std::abort();
+    }
     }
 }
 
@@ -1348,6 +1381,11 @@ struct Layer {
     Node *gdn_in_qkv = nullptr, *gdn_in_z = nullptr, *gdn_in_b = nullptr, *gdn_in_a = nullptr,
          *gdn_conv = nullptr, *gdn_a_log = nullptr, *gdn_dt_bias = nullptr, *gdn_norm = nullptr,
          *gdn_out_proj = nullptr;
+    // Gated Residual (Stage 1, docs/GATED_RESIDUAL.md S3b/S4): two independent GatedResidual instances
+    // per layer -- gr_attn_* wraps the attention/GDN sub-block, gr_mlp_* wraps the FFN sub-block, each
+    // with its own hc_norm/down/up/block_inject tensors. nullptr on every layer when !USE_GATED_RESIDUAL.
+    Node *gr_attn_norm = nullptr, *gr_attn_down = nullptr, *gr_attn_up = nullptr, *gr_attn_inject = nullptr,
+         *gr_mlp_norm  = nullptr, *gr_mlp_down  = nullptr, *gr_mlp_up  = nullptr, *gr_mlp_inject  = nullptr;
 };
 
 // --- Gated DeltaNet (Stage 1: CPU forward only; docs/GATED_DELTANET.md, include/sub0/gdn_math.hpp) ---
@@ -1397,6 +1435,55 @@ static Node* op_gdn(Node* a, Layer& L) {
     return out;
 }
 
+// --- Gated Residual (Stage 1: CPU forward only; docs/GATED_RESIDUAL.md, include/sub0/
+// gated_residual_math.hpp) ---
+//
+// Four small ops, each fitting Node's native a/b/w/bias fanout with NO side table (docs/GATED_RESIDUAL.md
+// S5: Stage 1 has no backward walking the node pool yet, mirroring op_gdn's own Stage 1 form before its
+// Stage 2 needed GdnLinkCache). Each stores its wide-stream input on `out->a` (matching op_gdn's own
+// `out->a = a`) -- enough for backward_node's abort-placeholder case (below) to at least name it.
+//
+// op_gr_mix/op_gr_gate each call gr::hc_norm() independently on their OWN scratch rather than sharing one
+// precomputed buffer -- a deliberate Stage 1 simplification, docs/GATED_RESIDUAL.md S4c.
+static Node* op_gr_tile(Node* h) {
+    const int T = h->rows;
+    Node* out = mk_node(Op::GrTile, T, HC_WIDE);
+    out->a = h;
+    gr::tile(GR_DIMS, T, h->data.data(), out->data.data());
+    return out;
+}
+
+static Node* op_gr_mix(Node* wide, Node* norm_w, Node* down_w, Node* up_w) {
+    const int T = wide->rows;
+    Node* out = mk_node(Op::GrMix, T, D_MODEL);
+    out->a = wide; out->b = norm_w; out->w = down_w; out->bias = up_w;
+    auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
+    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->data.data(), normed.data());
+    auto [dscr, dscr_g] = arena_alloc(gr::mix_scratch_floats(GR_DIMS, T));
+    gr::mix(GR_DIMS, T, normed.data(), down_w->data.data(), up_w->data.data(), out->data.data(), dscr.data());
+    return out;
+}
+
+static Node* op_gr_gate(Node* wide, Node* norm_w, Node* block_inject_w) {
+    const int T = wide->rows;
+    Node* out = mk_node(Op::GrGate, T, HC_COUNT);
+    out->a = wide; out->b = norm_w; out->w = block_inject_w;
+    auto [normed, normed_g] = arena_alloc(gr::normed_scratch_floats(GR_DIMS, T));
+    gr::hc_norm(GR_DIMS, T, wide->data.data(), norm_w->data.data(), normed.data());
+    gr::gate(GR_DIMS, T, normed.data(), block_inject_w->data.data(), out->data.data());
+    return out;
+}
+
+// The WRITE step (docs/GATED_RESIDUAL.md S1b): no weight tensors at all, a plain 3-activation combine
+// (wide, mixer_out, injection weights) -- fits Node's native fanout trivially, no Layer& needed.
+static Node* op_gr_combine(Node* wide, Node* mixer_out, Node* inj) {
+    const int T = wide->rows;
+    Node* out = mk_node(Op::GrCombine, T, HC_WIDE);
+    out->a = wide; out->b = mixer_out; out->w = inj;
+    gr::combine(GR_DIMS, T, wide->data.data(), mixer_out->data.data(), inj->data.data(), out->data.data());
+    return out;
+}
+
 struct Model {
     Node* tok_emb;
     Node* pos_emb;
@@ -1404,6 +1491,12 @@ struct Model {
     Node* ln_f;
     Node* lm_head;   // nullptr when USE_TIED_EMBEDDINGS -- the head reads tok_emb directly instead
     Node* lm_bias;   // nullptr when USE_TIED_EMBEDDINGS -- tied models drop the head bias too
+
+    // Gated Residual (Stage 1, docs/GATED_RESIDUAL.md S1c/S3b): the model-level EXIT collapse, ONE
+    // instance shared across the whole stack (not per-layer, unlike Layer's own gr_attn_*/gr_mlp_*),
+    // WITHOUT a block_inject tensor (the real model's hyper_connection_mixer is use_combine=False).
+    // nullptr when !USE_GATED_RESIDUAL.
+    Node *gr_top_norm = nullptr, *gr_top_down = nullptr, *gr_top_up = nullptr;
 
     // N-gram embeddings (see docs/NGRAM_EMBEDDING.md). ngram_tab[e]: the e-th hashed n-gram embedding
     // table (a real PARAM_LAYOUT leaf, like tok_emb). ngram_proj: the single learned concat_proj GEMM
@@ -1444,6 +1537,14 @@ struct Model {
             Layer& L = layers[static_cast<std::size_t>(li)];
             L.ln1 = mk_param(1, D_MODEL, false);
             L.ln2 = mk_param(1, D_MODEL, false);
+            // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance,
+            // MUST match layout.hpp's own placement (right here, before the sub-block's own weights).
+            if constexpr (USE_GATED_RESIDUAL) {
+                L.gr_attn_norm   = mk_param(1, HC_WIDE, false);
+                L.gr_attn_down   = mk_param(HC_WIDE, HC_LOWRANK, true);
+                L.gr_attn_up     = mk_param(HC_LOWRANK, HC_WIDE, true);
+                L.gr_attn_inject = mk_param(HC_WIDE, HC_COUNT, true);
+            }
             // Order here MUST match layout.hpp's make_param_layout() exactly -- it IS the
             // serialization order (see that file's header comment), INCLUDING which of the two
             // branches below a given layer takes (GDN_SCHEDULE.full_attn[li] must agree with
@@ -1470,6 +1571,13 @@ struct Model {
                 L.gdn_norm     = mk_param(1, D_HEAD, false);
                 L.gdn_out_proj = mk_param(D_MODEL, D_MODEL, true);
             }
+            // Gated Residual: the mlp_hyper_connection instance, right before the FFN's own weights.
+            if constexpr (USE_GATED_RESIDUAL) {
+                L.gr_mlp_norm   = mk_param(1, HC_WIDE, false);
+                L.gr_mlp_down   = mk_param(HC_WIDE, HC_LOWRANK, true);
+                L.gr_mlp_up     = mk_param(HC_LOWRANK, HC_WIDE, true);
+                L.gr_mlp_inject = mk_param(HC_WIDE, HC_COUNT, true);
+            }
             if constexpr (USE_GATED_FFN) {
                 L.Wg = mk_param(D_MODEL, D_FF, true);   // gate
                 L.W1 = mk_param(D_MODEL, D_FF, true);   // up
@@ -1480,6 +1588,13 @@ struct Model {
                 L.W2 = mk_param(D_FF, D_MODEL, true);
                 L.b2 = mk_param(1, D_MODEL, false);
             }
+        }
+        // Gated Residual's model-level exit collapse, right after the per-layer loop, before ln_f --
+        // MUST match layout.hpp's own placement. No block_inject (use_combine=False, S1c).
+        if constexpr (USE_GATED_RESIDUAL) {
+            gr_top_norm = mk_param(1, HC_WIDE, false);
+            gr_top_down = mk_param(HC_WIDE, HC_LOWRANK, true);
+            gr_top_up   = mk_param(HC_LOWRANK, HC_WIDE, true);
         }
         ln_f = mk_param(1, D_MODEL, false);
         if constexpr (!USE_TIED_EMBEDDINGS) {
@@ -1521,6 +1636,15 @@ struct Model {
         for (int li = 0; li < N_LAYERS; ++li) {
             Layer& L = layers[static_cast<std::size_t>(li)];
             ones(L.ln1); ones(L.ln2);
+            // Gated Residual init: GrHcNorm is left at the arena's own zero -- the real model's own
+            // `torch.zeros(dim)` convention (gain = 1 + w, so w=0 is the identity RMS-norm, S1a), NOT
+            // this engine's usual ones()-initialized gain. down/up/block_inject are ordinary GEMM
+            // weights with no special reference init documented, so this project's standard 0.02-std
+            // normal is used, matching every other GEMM weight here.
+            if constexpr (USE_GATED_RESIDUAL) {
+                randn(L.gr_attn_down, 0.02f); randn(L.gr_attn_up, 0.02f); randn(L.gr_attn_inject, 0.02f);
+                randn(L.gr_mlp_down, 0.02f);  randn(L.gr_mlp_up, 0.02f);  randn(L.gr_mlp_inject, 0.02f);
+            }
             if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
                 randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
                 if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
@@ -1541,6 +1665,9 @@ struct Model {
             if constexpr (USE_GATED_FFN) randn(L.Wg, 0.02f);
             randn(L.W1, 0.02f); randn(L.W2, 0.02f);
         }
+        // Gated Residual's model-level exit collapse -- same init convention as the per-layer instances
+        // above (GrHcNorm left at the arena's own zero, down/up randn(0.02)).
+        if constexpr (USE_GATED_RESIDUAL) { randn(gr_top_down, 0.02f); randn(gr_top_up, 0.02f); }
         ones(ln_f);
         if constexpr (!USE_TIED_EMBEDDINGS) randn(lm_head, 0.02f);
         if constexpr (NGRAM_EMBED) {
@@ -1620,6 +1747,29 @@ struct Model {
                                            &ngram_wblock[static_cast<std::size_t>(e)], nullptr, false));
             h = op_add(h, ng);
         }
+        // Gated Residual's model-level ENTRY tile (docs/GATED_RESIDUAL.md S1c): seed all HC_COUNT
+        // streams identically by literal duplication, right before the per-layer loop -- everything
+        // above (embed, absolute pos, n-gram injection) stays D_MODEL-wide and completely untouched.
+        if constexpr (USE_GATED_RESIDUAL) h = op_gr_tile(h);
+        // Gated Residual READ/WRITE helpers (docs/GATED_RESIDUAL.md S2): wrap one sub-block's entry/exit
+        // without touching the sub-block's own code -- ln1/ln2/the mixer/the FFN below are ALL literally
+        // unchanged from the GR-off form. `wide` is the residual stream BEFORE this sub-block's read
+        // step (== `h`, passed explicitly rather than captured, since gr_write needs the SAME pre-read
+        // value and a caller passing it twice by name is clearer than relying on `h` not having moved).
+        auto gr_read = [&](Node* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w, Node* ln,
+                            Node** out_inj) -> Node* {
+            if constexpr (USE_GATED_RESIDUAL) {
+                Node* mixed = op_gr_mix(wide, norm_w, down_w, up_w);
+                *out_inj = op_gr_gate(wide, norm_w, inject_w);
+                return op_rmsnorm(mixed, ln);
+            } else {
+                return op_rmsnorm(wide, ln);
+            }
+        };
+        auto gr_write = [&](Node* wide, Node* mixer_out, Node* inj) -> Node* {
+            if constexpr (USE_GATED_RESIDUAL) return op_gr_combine(wide, mixer_out, inj);
+            else                              return op_add(wide, mixer_out);
+        };
         // LAYER_EXEC_ORDER, not `layers` directly: under LoopSplit the middle block's indices repeat,
         // re-running the SAME Layer (same parameter Nodes) several times. The backward needs no change
         // for that -- every CPU parameter-gradient write is `+=` (see backward_node's Op::Linear dW
@@ -1630,7 +1780,10 @@ struct Model {
         for (const int li : LAYER_EXEC_ORDER) {
             Layer& L = layers[static_cast<std::size_t>(li)];
             const Node* const h_in = h;   // diagnostic only; arena nodes outlive the iteration
-            Node* a = op_rmsnorm(h, L.ln1);
+            Node* h_before_attn = h;   // Gated Residual's write step needs the PRE-read wide stream
+            Node* gr_inj_attn = nullptr;
+            Node* a = gr_read(h, L.gr_attn_norm, L.gr_attn_down, L.gr_attn_up, L.gr_attn_inject, L.ln1,
+                               &gr_inj_attn);
             // GDN_SCHEDULE.full_attn[li] decides softmax attention vs. Gated DeltaNet for THIS layer
             // (per-LAYER, not per-execution -- a layer's weight identity fixes its type, so every
             // execution of a repeated LoopSplit middle layer inherits it automatically via LAYER_EXEC_
@@ -1648,8 +1801,11 @@ struct Model {
                     // mechanism is defined in terms of softmax attention's own K/V, S1/S2 of
                     // docs/DEPTH_ATTENTION.md -- out of scope for a GDN layer, and neither doc discusses
                     // the combination, so this is a deliberate Stage-1 simplification, not an oversight).
-                    h = op_add(h, op_gdn(a, L));
-                    Node* f = op_rmsnorm(h, L.ln2);
+                    h = gr_write(h_before_attn, op_gdn(a, L), gr_inj_attn);
+                    Node* h_before_mlp = h;
+                    Node* gr_inj_mlp = nullptr;
+                    Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject,
+                                       L.ln2, &gr_inj_mlp);
                     if constexpr (USE_GATED_FFN) {
                         Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                         Node* up_pre   = op_linear(f, L.W1, nullptr, q);
@@ -1657,7 +1813,7 @@ struct Model {
                     } else {
                         f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
                     }
-                    h = op_add(h, f);
+                    h = gr_write(h_before_mlp, f, gr_inj_mlp);
                     if (pass_delta || pass_hnorm) {
                         const std::size_t nn = static_cast<std::size_t>(h->rows) * h->cols;
                         double d2 = 0.0, i2 = 0.0;
@@ -1698,8 +1854,11 @@ struct Model {
                 if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(exec_i)] >= 0) g_depth.push(kn, vn);
             }
             Node* att = op_attn(qn, kn, vn, N_HEADS);
-            h = op_add(h, op_linear(att, L.Wo, nullptr, q));
-            Node* f = op_rmsnorm(h, L.ln2);
+            h = gr_write(h_before_attn, op_linear(att, L.Wo, nullptr, q), gr_inj_attn);
+            Node* h_before_mlp = h;
+            Node* gr_inj_mlp = nullptr;
+            Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2,
+                               &gr_inj_mlp);
             if constexpr (USE_GATED_FFN) {
                 Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                 Node* up_pre   = op_linear(f, L.W1, nullptr, q);
@@ -1707,7 +1866,7 @@ struct Model {
             } else {
                 f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
             }
-            h = op_add(h, f);
+            h = gr_write(h_before_mlp, f, gr_inj_mlp);
             if (pass_delta || pass_hnorm) {
                 const std::size_t n = static_cast<std::size_t>(h->rows) * h->cols;
                 double d2 = 0.0, i2 = 0.0;
@@ -1721,6 +1880,10 @@ struct Model {
             }
             ++exec_i;
         }
+        // Gated Residual's model-level EXIT collapse (docs/GATED_RESIDUAL.md S1c): use_combine=False,
+        // so just op_gr_mix -- no gate/combine call, mirroring the real model's own use_combine=False
+        // branch exactly (block_inject_weight genuinely does not exist for this instance).
+        if constexpr (USE_GATED_RESIDUAL) h = op_gr_mix(h, gr_top_norm, gr_top_down, gr_top_up);
         h = op_rmsnorm(h, ln_f);
         if constexpr (USE_TIED_EMBEDDINGS) return op_tied_head(h, tok_emb);
         else                               return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
@@ -1742,9 +1905,43 @@ struct Model {
         prev_id = id; prev_pos = pos;
         constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
-        float h[C], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
+        // Gated Residual (Stage 1): `h` is HC_WIDE wide when GR is on (== D_MODEL, i.e. today's exact
+        // size, when off -- layout.hpp's own collapse). Every OTHER per-layer temporary below (a, qn,
+        // kn, vn, att, proj, f1, g1) stays exactly D_MODEL/D_FF-wide -- GR only ever widens the
+        // persistent residual itself, never the sub-block's own internal working set (S2).
+        float h[HC_WIDE], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
         [[maybe_unused]] float packed_copy[C];             // periodic-reinject spike, see below
+        // Gated Residual scratch/output buffers -- sized 1 (never zero-length) when off, same idiom as
+        // every other never-degenerate buffer in this function. gr_normed is shared by gr_read_row's
+        // mix AND gate steps (both read-only consumers of the SAME hc_norm(wide) result) -- a cheaper,
+        // equally correct alternative to op_gr_mix/op_gr_gate's own independent-recompute form
+        // (docs/GATED_RESIDUAL.md S4c), available here because this is plain imperative code, not two
+        // separate Node-graph ops that would each need their own self-contained scratch.
+        [[maybe_unused]] float gr_normed[HC_WIDE];
+        [[maybe_unused]] float gr_mixscr[GR_MIX_SCRATCH1 ? GR_MIX_SCRATCH1 : 1];
+        [[maybe_unused]] float gr_mixed[C];
+        [[maybe_unused]] float gr_inj[HC_COUNT_BUF];
+        // GR READ (mix+gate, into `out_a`) / WRITE (combine, in place on `wide`) row-helpers, T==1 --
+        // the exact decode-path counterpart of forward()'s gr_read/gr_write lambdas (docs/GATED_RESIDUAL.md
+        // S2). Safe to write `wide` in place in gr_write_row: combine()'s per-(stream,channel) output
+        // depends only on that SAME index's own input (plus mixer_out, a disjoint buffer), never on any
+        // other index, so there is no read-after-write hazard.
+        auto gr_read_row = [&](const float* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w,
+                                Node* ln, float* out_a) {
+            if constexpr (USE_GATED_RESIDUAL) {
+                gr::hc_norm(GR_DIMS, 1, wide, norm_w->data.data(), gr_normed);
+                gr::mix(GR_DIMS, 1, gr_normed, down_w->data.data(), up_w->data.data(), gr_mixed, gr_mixscr);
+                gr::gate(GR_DIMS, 1, gr_normed, inject_w->data.data(), gr_inj);
+                rmsnorm_row(gr_mixed, ln, out_a, C);
+            } else {
+                rmsnorm_row(wide, ln, out_a, C);
+            }
+        };
+        auto gr_write_row = [&](float* wide, const float* mixer_out) {
+            if constexpr (USE_GATED_RESIDUAL) gr::combine(GR_DIMS, 1, wide, mixer_out, gr_inj, wide);
+            else                              for (int j = 0; j < C; ++j) wide[j] += mixer_out[j];
+        };
         // This token's depth cache: rows only, since the depth softmax never crosses positions (see
         // depth_mix_row). Scoped to one forward_one call -- unlike g_kv, nothing here spans tokens.
         [[maybe_unused]] float dep_k[(DEPTH_CACHE_MAX ? DEPTH_CACHE_MAX : 1) * D_KV];
@@ -1816,12 +2013,21 @@ struct Model {
             hist[0] = id_tok;   // history stores the GUARDED value, so it stays consistent later too
             if (hist_len < NGRAM_MAX_SHIFT_BUF) ++hist_len;
         }
+        // Gated Residual's model-level ENTRY tile (docs/GATED_RESIDUAL.md S1c): everything above (embed,
+        // absolute pos, n-gram injection) wrote into h's first D_MODEL elements exactly as before --
+        // this duplicates that across the other HC_COUNT-1 streams. Safe in place (out_wide aliases the
+        // same buffer tile() reads from): stream 0's write is `h[j] = h[j]` (a no-op), and every later
+        // stream's write target lies entirely outside the [0,D_MODEL) range tile() ever reads from.
+        if constexpr (USE_GATED_RESIDUAL) gr::tile(GR_DIMS, 1, h, h);
         // `e` is the EXECUTION index (the KV-cache slot); `li` is which layer's weights run there.
         // They differ only under LoopSplit -- see LAYER_EXEC_ORDER and KVCache's own comments.
         for (int e = 0; e < LOOP_EXEC_COUNT; ++e) {
             const int l = LAYER_EXEC_ORDER[static_cast<std::size_t>(e)];
             Layer& L = layers[static_cast<std::size_t>(l)];
-            rmsnorm_row(h, L.ln1, a, C);
+            // `h` is mutated IN PLACE by gr_write_row below (unlike forward()'s Node graph, where a new
+            // Node replaces `h`), so gr_read_row's read and gr_write_row's later write on the SAME `h`
+            // need no separate "before" snapshot -- nothing between them mutates it.
+            gr_read_row(h, L.gr_attn_norm, L.gr_attn_down, L.gr_attn_up, L.gr_attn_inject, L.ln1, a);
             // The softmax-attention mixer sublayer, factored into a lambda (rather than duplicated
             // verbatim in both branches below) so the GDN_SCHEDULE dispatch reads as a single small
             // if/else rather than two copies of this block drifting apart over time.
@@ -1869,7 +2075,7 @@ struct Model {
                     }
                 }
                 linear_row(att, L.Wo, nullptr, proj, C, C);
-                for (int j = 0; j < C; ++j) h[j] += proj[j];                     // residual
+                gr_write_row(h, proj);                                           // residual (write step)
             };
             // GDN_SCHEDULE.full_attn[l] mirrors Model::forward()'s own dispatch exactly (per-LAYER, not
             // per-execution) -- see that function's comment. `if constexpr` keeps a GDN-off build
@@ -1894,12 +2100,12 @@ struct Model {
                                  L.gdn_a_log->data.data(), L.gdn_norm->data.data(),
                                  L.gdn_out_proj->data.data(),
                                  g_gdn_cache.state_of(e), g_gdn_cache.conv_of(e), proj, gdn_scratch);
-                    for (int j = 0; j < C; ++j) h[j] += proj[j];                 // residual
+                    gr_write_row(h, proj);                                       // residual (write step)
                 }
             } else {
                 do_attention_mixer();
             }
-            rmsnorm_row(h, L.ln2, a, C);
+            gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
             if constexpr (USE_GATED_FFN) {
                 linear_row(a, L.Wg, nullptr, g1, C, D_FF);
                 linear_row(a, L.W1, nullptr, f1, C, D_FF);
@@ -1910,7 +2116,7 @@ struct Model {
                 for (int j = 0; j < D_FF; ++j) f1[j] = gelu_row(f1[j]);
                 linear_row(f1, L.W2, L.b2, proj, D_FF, C);
             }
-            for (int j = 0; j < C; ++j) h[j] += proj[j];                         // residual
+            gr_write_row(h, proj);                                              // residual (write step)
             // Periodic packed-content re-injection spike (Nanbeige-inspired, see core.hpp's
             // set_scratch_reinject doc comment): every `stride` layers, add the SAME layer-0 packed
             // vector back into this position's hidden state -- tests whether reinforcing the signal
@@ -1922,6 +2128,11 @@ struct Model {
             // layer, because the addition was dwarfed by h's already-larger accumulated norm by mid-stack.
             // Rescaling packed_copy to match h's CURRENT norm before applying `scale` (now a fraction of
             // h's own magnitude, not an absolute embedding-scale constant) is what makes this a real test.
+            //
+            // NOT Gated-Residual-aware: this spike only ever touches h's first D_MODEL elements (stream 0
+            // when GR is wide), same deliberate-scope-gap shape as GDN+depth-attention's own "neither doc
+            // discusses the combination" (docs/GATED_DELTANET.md) -- this spike and GR have not been
+            // designed to interact, and this pass does not attempt it.
             if (do_reinject && ((l + 1) % g_scratch_reinject_stride == 0)) {
                 float h_ms = 0.f; for (int j = 0; j < C; ++j) h_ms += h[j] * h[j]; h_ms /= C;
                 float pk_ms = 0.f; for (int j = 0; j < C; ++j) pk_ms += packed_copy[j] * packed_copy[j]; pk_ms /= C;
@@ -1929,8 +2140,18 @@ struct Model {
                 for (int j = 0; j < C; ++j) h[j] += norm_scale * packed_copy[j];
             }
         }
-        for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
-        rmsnorm_row(h, ln_f, a, C);
+        // Gated Residual's model-level EXIT collapse (docs/GATED_RESIDUAL.md S1c), mirroring forward()'s
+        // own exit-collapse placement: use_combine=False, so just the mix half (no gate/combine) --
+        // last_hidden captures the FULLY-COLLAPSED, D_MODEL-wide representation, same as the GR-off path.
+        if constexpr (USE_GATED_RESIDUAL) {
+            gr::hc_norm(GR_DIMS, 1, h, gr_top_norm->data.data(), gr_normed);
+            gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->data.data(), gr_top_up->data.data(), gr_mixed, gr_mixscr);
+            for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
+            rmsnorm_row(gr_mixed, ln_f, a, C);
+        } else {
+            for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
+            rmsnorm_row(h, ln_f, a, C);
+        }
         if constexpr (USE_TIED_EMBEDDINGS) tied_head_row(a, tok_emb, logits.data(), C, VOCAB);
         else                               linear_row(a, lm_head, lm_bias, logits.data(), C, VOCAB);
         return logits.data();

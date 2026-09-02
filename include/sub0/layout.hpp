@@ -273,16 +273,21 @@ inline constexpr GdnSchedule GDN_SCHEDULE = gdn_schedule_for<N_LAYERS>(GDN_FULL_
 static_assert(GDN_FULL_ATTN_STRIDE > 0 || GDN_SCHEDULE.gdn_layers == 0,
               "GDN_FULL_ATTN_STRIDE == 0 must yield zero GDN layers");
 
-// GATED RESIDUAL (hyper-connections) -- Stage 0: config skeleton, hard-gated off (docs/GATED_RESIDUAL.md).
+// GATED RESIDUAL (hyper-connections) -- Stage 1: CPU forward exists (op_gr_tile/op_gr_mix/op_gr_gate/
+// op_gr_combine, backend_cpu.cpp; the shared math core is include/sub0/gated_residual_math.hpp,
+// correctness-gated against the real Qwen4-preview fixtures at
+// tests/fixtures/qwen4_preview/gated_residual_layer0_small_* -- see
+// tests/gated_residual_qwen4_fixture_tests.cpp). No backward pass yet -- this stage's own, deliberate
+// scope boundary (docs/GATED_RESIDUAL.md S6), not an oversight.
 // HC_COUNT parallel residual streams read/write-gated per sub-block (Qwen4-preview's own
-// Qwen4ExpTextGatedResidual, "Gated Residual (GR)", tech_report.pdf S2.2). 0 = off, the ONLY value this
-// build can currently take -- both flags are hard-clamped to 0 by a CLI CLI::Range(0,0) check
-// (tools/configurator.cpp) AND the static_asserts below, mirroring GDN_FULL_ATTN_STRIDE's own Stage 0
-// two-refusal pattern exactly. Stage 1 relaxes both the CLI range and these asserts to the real "0 or
-// >= 2" form once op_gr_* exists to consume a nonzero value.
+// Qwen4ExpTextGatedResidual, "Gated Residual (GR)", tech_report.pdf S2.2). 0 = off, the only value every
+// build before this stage could take, and still the default.
 inline constexpr bool USE_GATED_RESIDUAL = (HC_COUNT >= 2);
-static_assert(HC_COUNT == 0, "Stage 0: HC_COUNT must be 0 (Gated Residual has no op yet) -- see docs/GATED_RESIDUAL.md");
-static_assert(HC_LOWRANK == 0, "Stage 0: HC_LOWRANK must be 0 (Gated Residual has no op yet) -- see docs/GATED_RESIDUAL.md");
+static_assert(HC_COUNT == 0 || HC_COUNT >= 2,
+              "HC_COUNT must be 0 (off) or a real hyper-connection stream count >= 2 -- see docs/GATED_RESIDUAL.md");
+static_assert((HC_COUNT >= 2) == (HC_LOWRANK >= 1),
+              "HC_COUNT and HC_LOWRANK must be on or off together (HC_COUNT >= 2 iff HC_LOWRANK >= 1) "
+              "-- see docs/GATED_RESIDUAL.md");
 
 // The width `h` (the residual stream) actually has. At the neutral setting this IS D_MODEL, so every
 // existing [T,D_MODEL]-shaped expression in Model::forward/forward_one that is not explicitly wrapped in
@@ -291,8 +296,23 @@ inline constexpr int HC_WIDE = USE_GATED_RESIDUAL ? HC_COUNT * D_MODEL : D_MODEL
 
 // This build's GR dims, per docs/GATED_RESIDUAL.md S4a's mapping. Valid (never divides by zero) even
 // when USE_GATED_RESIDUAL is false -- same "describes a shape nothing builds" idiom GDN_DIMS/
-// DEPTH_CACHE_MAX already use above.
+// DEPTH_CACHE_MAX already use above. HC_COUNT_BUF/HC_LOWRANK_BUF are the never-zero array-bound forms
+// (same idiom as NGRAM_TABLES_BUF) for scratch sizing below, since a zero-sized quantity would make
+// *_scratch_floats() degenerate even though nothing ever reads that scratch when GR is off.
+inline constexpr int HC_COUNT_BUF   = USE_GATED_RESIDUAL ? HC_COUNT   : 1;
+inline constexpr int HC_LOWRANK_BUF = USE_GATED_RESIDUAL ? HC_LOWRANK : 1;
 inline constexpr gr::Dims GR_DIMS{D_MODEL, HC_COUNT, HC_LOWRANK};
+// Same shape as GR_DIMS but never degenerate (hc_count/hc_lowrank >= 1) -- used only to size the
+// per-execution scratch arrays below, which must be valid array bounds even when GR is off.
+inline constexpr gr::Dims GR_DIMS_BUF{D_MODEL, HC_COUNT_BUF, HC_LOWRANK_BUF};
+
+// Per-call scratch sizes for forward_one's decode-path (T==1) op_gr_mix/op_gr_gate counterparts,
+// precomputed here rather than re-derived at every call -- same reasoning as GDN_SCRATCH1.
+// GR_NORMED_SCRATCH1: the hc_norm() output buffer both op_gr_mix and op_gr_gate need (each calls
+// hc_norm() independently on their own weights, docs/GATED_RESIDUAL.md S4c). GR_MIX_SCRATCH1: mix()'s
+// OWN scratch need on top of that (the down-projection's pre-activation) -- see gated_residual_math.hpp.
+inline constexpr std::size_t GR_NORMED_SCRATCH1 = gr::normed_scratch_floats(GR_DIMS_BUF, 1);
+inline constexpr std::size_t GR_MIX_SCRATCH1    = gr::mix_scratch_floats(GR_DIMS_BUF, 1);
 
 // Exact PARAM_FLOATS delta a GR-on build adds over an otherwise-identical GR-off build, per
 // docs/GATED_RESIDUAL.md S3b -- a pure function of explicit parameters (not closed over this build's own
@@ -589,16 +609,22 @@ consteval int count_num_params() {
     int n = 1 + (HAS_POS_EMB ? 1 : 0);
     for (int l = 0; l < N_LAYERS; ++l) {
         n += 2;   // ln1, ln2
+        if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (attn-wrapping)
         if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             n += 4;   // Wq, Wk, Wv, Wo
             if constexpr (USE_QK_NORM) n += 2;   // QNorm, KNorm
         } else {
             n += 9;   // GdnInProjQkv/Z/B/A, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
         }
+        if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (mlp-wrapping)
         n += (USE_GATED_FFN ? 3 : 4);
     }
     n += (USE_TIED_EMBEDDINGS ? 1 : 3);
     n += (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
+    // Gated Residual's model-level exit collapse (docs/GATED_RESIDUAL.md S1c/S3b): ONE more instance,
+    // WITHOUT GrBlockInject (use_combine=False in the real model -- see make_param_layout()'s own
+    // placement), appended once regardless of N_LAYERS.
+    if constexpr (USE_GATED_RESIDUAL) n += 3;   // GrHcNorm/MixDown/MixUp only
     return n;
 }
 inline constexpr int NUM_PARAMS = count_num_params();
@@ -626,10 +652,18 @@ inline constexpr int NUM_PARAMS = count_num_params();
 // `in_proj_a`); GdnConv is the depthwise causal conv weight (no in/out axis -- one row per channel);
 // GdnALog/GdnDtBias are the two learned per-V-head recurrence-gate parameters; GdnOutProj restores
 // D_MODEL width (role like LmHead: a full-precision, AdamW-only GEMM weight -- see is_muon_kind below).
+// GrHcNorm/GrMixDown/GrMixUp/GrBlockInject (Stage 1, docs/GATED_RESIDUAL.md S3b/S4): one GatedResidual
+// instance's four learned tensors. Reused for THREE independent instances per model when
+// USE_GATED_RESIDUAL: two per layer (wrapping the attention/GDN sub-block and the FFN sub-block, each
+// with its own GrBlockInject) plus one at the very end of the stack (the model-level exit collapse,
+// WITHOUT GrBlockInject -- see make_param_layout()'s own placement). GrHcNorm is [1, HC_COUNT*D_MODEL]
+// (one gain per (stream,channel) pair, NOT shared across streams like QNorm/KNorm -- a real divergence
+// from this project's existing per-head norm convention, verified in the real source, S1a).
 enum class PKind : unsigned char {
     TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
     NgramEmb, NgramProj,
-    GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj
+    GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
+    GrHcNorm, GrMixDown, GrMixUp, GrBlockInject
 };
 
 // One weight tensor: where it lives in the flat blob, its logical [rows x cols]
@@ -663,6 +697,16 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
     for (int l = 0; l < N_LAYERS; ++l) {
         add(1,       D_MODEL, PKind::Ln1, false, false);
         add(1,       D_MODEL, PKind::Ln2, false, false);
+        // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance wrapping
+        // this layer's attention/GDN sub-block. Placed here, before that sub-block's own weights, since
+        // it is what turns `h` (the wide residual) into the D_MODEL-wide input ln1 actually reads.
+        if constexpr (USE_GATED_RESIDUAL) {
+            constexpr int WIDE = HC_COUNT * D_MODEL;
+            add(1,          WIDE,       PKind::GrHcNorm,      false, false);
+            add(WIDE,       HC_LOWRANK, PKind::GrMixDown,     true,  false);
+            add(HC_LOWRANK, WIDE,       PKind::GrMixUp,       true,  false);
+            add(WIDE,       HC_COUNT,   PKind::GrBlockInject, true,  false);
+        }
         if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
             // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
@@ -694,6 +738,15 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             add(1, D_HEAD,  PKind::GdnNorm,   false, false);   // RMSNormGated gamma, shared across heads (S1c)
             add(D_MODEL, D_MODEL, PKind::GdnOutProj, true, false);   // stays full precision, like LmHead
         }
+        // Gated Residual: the mlp_hyper_connection instance wrapping this layer's FFN sub-block --
+        // same shape as the attn-wrapping instance just above, an independent set of tensors.
+        if constexpr (USE_GATED_RESIDUAL) {
+            constexpr int WIDE = HC_COUNT * D_MODEL;
+            add(1,          WIDE,       PKind::GrHcNorm,      false, false);
+            add(WIDE,       HC_LOWRANK, PKind::GrMixDown,     true,  false);
+            add(HC_LOWRANK, WIDE,       PKind::GrMixUp,       true,  false);
+            add(WIDE,       HC_COUNT,   PKind::GrBlockInject, true,  false);
+        }
         if constexpr (USE_GATED_FFN) {
             add(D_MODEL, D_FF,    PKind::Wg, true, true);   // gate
             add(D_MODEL, D_FF,    PKind::W1, true, true);   // up
@@ -704,6 +757,15 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             add(D_FF,    D_MODEL, PKind::W2,  true,  true);
             add(1,       D_MODEL, PKind::B2,  false, false);
         }
+    }
+    // Gated Residual's model-level exit collapse (docs/GATED_RESIDUAL.md S1c): ONE more instance,
+    // appended once after every layer, WITHOUT GrBlockInject (the real model's hyper_connection_mixer
+    // is built with use_combine=False -- block_inject_weight genuinely does not exist for this instance).
+    if constexpr (USE_GATED_RESIDUAL) {
+        constexpr int WIDE = HC_COUNT * D_MODEL;
+        add(1,          WIDE,       PKind::GrHcNorm,  false, false);
+        add(WIDE,       HC_LOWRANK, PKind::GrMixDown, true,  false);
+        add(HC_LOWRANK, WIDE,       PKind::GrMixUp,   true,  false);
     }
     add(1,       D_MODEL, PKind::LnF,    false, false);
     if constexpr (!USE_TIED_EMBEDDINGS) {
