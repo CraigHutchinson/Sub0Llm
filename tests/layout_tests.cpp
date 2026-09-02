@@ -29,12 +29,18 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     constexpr int kAttnMixer  = 4 + (USE_QK_NORM ? 2 : 0);
     constexpr int kGdnMixer   = 9;
     constexpr int kFfnSlots   = USE_GATED_FFN ? 3 : 4;
+    // Gated Residual (Stage 1, docs/GATED_RESIDUAL.md S3b): 4 slots per instance (GrHcNorm/MixDown/
+    // MixUp/BlockInject), TWO full instances per layer (attn-wrapping, mlp-wrapping) plus one top-level
+    // instance WITHOUT BlockInject (3 slots), appended once regardless of N_LAYERS. Zero at HC_COUNT==0.
+    constexpr int kGrPerLayer = sub0::USE_GATED_RESIDUAL ? 2 * 4 : 0;
+    constexpr int kGrTop      = sub0::USE_GATED_RESIDUAL ? 3 : 0;
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
-                                        + N_LAYERS * (2 + kFfnSlots)
+                                        + N_LAYERS * (2 + kFfnSlots + kGrPerLayer)
                                         + kAttnLayers * kAttnMixer
                                         + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
                                         + (USE_TIED_EMBEDDINGS ? 1 : 3)
-                                        + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0));
+                                        + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0)
+                                        + kGrTop);
     REQUIRE(sub0::PARAM_LAYOUT.size() == static_cast<std::size_t>(sub0::NUM_PARAMS));
 
     std::size_t off = 0;
@@ -70,21 +76,29 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
         // genuinely unexplored (AGENTS.md S8, don't add unvalidated surface), not merely an oversight.
         // GdnConv/GdnALog/GdnDtBias/GdnNorm are bias/gain-shaped (decay=false, not GEMM weights),
         // already satisfying `!is_matrix` with no special case, same as NgramEmb.
+        //
+        // Gated Residual (Stage 1): GrMixDown/GrMixUp/GrBlockInject are real 2D GEMM projections
+        // (decay=true), also kept FULL PRECISION (ternary=false) for the same "genuinely unexplored,
+        // don't add unvalidated surface" reason as GDN's own projections. GrHcNorm is gain-shaped
+        // (decay=false), already satisfying `!is_matrix`.
         const bool is_matrix =
             p.kind == PKind::Wq || p.kind == PKind::Wk || p.kind == PKind::Wv ||
             p.kind == PKind::Wo || p.kind == PKind::W1 || p.kind == PKind::W2 ||
             p.kind == PKind::Wg || p.kind == PKind::LmHead || p.kind == PKind::NgramProj ||
             p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
-            p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj;
+            p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj ||
+            p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject;
         // AdamW weight decay applies only to the GEMM weight matrices.
         REQUIRE(p.decay == is_matrix);
         // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj/
-        // any GDN projection (see the comment above for why GDN stays full precision for now).
+        // any GDN/GR projection (see the comment above for why both stay full precision for now).
         const bool is_gdn_matrix =
             p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
             p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj;
+        const bool is_gr_matrix =
+            p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject;
         const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj
-                                      && !is_gdn_matrix;
+                                      && !is_gdn_matrix && !is_gr_matrix;
         REQUIRE(p.ternary == ternary_eligible);
     }
 }
@@ -357,29 +371,44 @@ TEST_CASE("Gated Residual PARAM_FLOATS delta is zero when off and strictly posit
     // USE_GATED_RESIDUAL's own (HC_COUNT >= 2) gate, so the two can never disagree about what "off" means.
     static_assert(sub0::gr_param_delta(8, 96, 1, 5) == 0);
 
-    // ...and this build's own state agrees: at the ONLY value Stage 0 can currently take (HC_COUNT == 0),
-    // USE_GATED_RESIDUAL is false, HC_WIDE collapses to exactly D_MODEL (so every existing [T,D_MODEL]
-    // expression not explicitly wrapped in a GR branch stays byte-identical, docs/GATED_RESIDUAL.md S4a),
-    // and the closed-form delta for THIS build's own dims is exactly zero.
-    static_assert(!sub0::USE_GATED_RESIDUAL);
-    static_assert(sub0::HC_WIDE == D_MODEL);
-    static_assert(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
-    REQUIRE_FALSE(sub0::USE_GATED_RESIDUAL);
-    REQUIRE(sub0::HC_WIDE == D_MODEL);
-    REQUIRE(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
+    // ...and this build's own state agrees: written as an IMPLICATION (HC_COUNT == 0 -> ...), not an
+    // unconditional claim, the same shape as the GDN Stage 0 test just above
+    // (`GDN_FULL_ATTN_STRIDE > 0 || sub0::GDN_SCHEDULE.gdn_layers == 0`) -- this default-build test suite
+    // always compiles at HC_COUNT == 0 (the only value the standard configure path ever produces), but an
+    // ad-hoc GR-ON build (this thread's own two-scale/parity verification, docs/GATED_RESIDUAL.md S8)
+    // must not fail to COMPILE this file just because it deliberately set HC_COUNT >= 2.
+    static_assert(HC_COUNT != 0 || !sub0::USE_GATED_RESIDUAL);
+    static_assert(HC_COUNT != 0 || sub0::HC_WIDE == D_MODEL);
+    static_assert(HC_COUNT != 0 || sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
+    if constexpr (HC_COUNT == 0) {
+        REQUIRE_FALSE(sub0::USE_GATED_RESIDUAL);
+        REQUIRE(sub0::HC_WIDE == D_MODEL);
+        REQUIRE(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
+    } else {
+        REQUIRE(sub0::USE_GATED_RESIDUAL);
+        REQUIRE(sub0::HC_WIDE == HC_COUNT * D_MODEL);
+        REQUIRE(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) > 0);
+    }
 }
 
 // MODEL_ARCH_ID folds HC_COUNT/HC_LOWRANK in unconditionally (see layout.hpp make_model_arch_id), the
 // same "covers every axis" treatment NGRAM_MAX_N/NGRAM_TABLES_PER_ORDER/NGRAM_TABLE_SIZE already get --
 // verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build: the
 // direct, testable claim is that GR_DIMS/gr_param_delta -- the values that mix -- are real, well-defined
-// quantities (established above), not that this build differs from some OTHER build (Stage 0 can only
-// ever compile one HC_COUNT value: 0).
+// quantities (established above). `if constexpr` on HC_COUNT (not a hard-coded 0 assumption) so this
+// also compiles and asserts something meaningful under an ad-hoc GR-ON build (docs/GATED_RESIDUAL.md S8's
+// two-scale/parity verification), not just the default-suite's own neutral setting.
 TEST_CASE("Gated Residual dims are inert and well-defined at the Stage 0 neutral setting", "[layout][gr]") {
     REQUIRE(sub0::GR_DIMS.hidden_size == D_MODEL);
-    REQUIRE(sub0::GR_DIMS.hc_count == 0);
-    REQUIRE(sub0::GR_DIMS.hc_lowrank == 0);
-    REQUIRE(sub0::GR_DIMS.wide() == 0);   // "describes a shape nothing builds" -- see GR_DIMS's own comment
+    if constexpr (HC_COUNT == 0) {
+        REQUIRE(sub0::GR_DIMS.hc_count == 0);
+        REQUIRE(sub0::GR_DIMS.hc_lowrank == 0);
+        REQUIRE(sub0::GR_DIMS.wide() == 0);   // "describes a shape nothing builds" -- see GR_DIMS's own comment
+    } else {
+        REQUIRE(sub0::GR_DIMS.hc_count == HC_COUNT);
+        REQUIRE(sub0::GR_DIMS.hc_lowrank == HC_LOWRANK);
+        REQUIRE(sub0::GR_DIMS.wide() == HC_COUNT * D_MODEL);
+    }
 }
 
 // --- N-gram embeddings (docs/NGRAM_EMBEDDING.md) -------------------------------------------------

@@ -604,10 +604,8 @@ int main(int argc, char** argv) {
     int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
     int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
     int ngram_table_size   = 0;  // N-gram embeddings: per-table vocab size m (0 = auto: VOCAB)
-    // Gated Residual (hyper-connections): Stage 0 -- config skeleton, hard-gated off (docs/GATED_RESIDUAL.md).
-    // HC_COUNT parallel residual streams read/write-gated per sub-block. 0 = off, the ONLY value this
-    // Stage 0 build can currently take (both hard-clamped below, mirroring GDN_FULL_ATTN_STRIDE's own
-    // Stage 0 two-refusal pattern) -- no op exists yet to consume a nonzero value.
+    // Gated Residual (hyper-connections): Stage 1 -- CPU forward only (docs/GATED_RESIDUAL.md).
+    // HC_COUNT parallel residual streams read/write-gated per sub-block. 0 = off, the default.
     int hc_count           = 0;
     int hc_lowrank         = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
@@ -685,12 +683,13 @@ int main(int argc, char** argv) {
        ->capture_default_str();
     app.add_option("--hc-count", hc_count,
                    "Gated Residual (docs/GATED_RESIDUAL.md): number of parallel hyper-connection "
-                   "residual streams (0 = off). Stage 0: no op exists yet -- hard-clamped to 0.")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "residual streams (0 = off, else >= 2). Stage 1: CPU forward only -- gen/eval/report "
+                   "work, train/tune do not (no backward pass yet)")
+       ->capture_default_str()->check(CLI::Range(0, 64));
     app.add_option("--hc-lowrank", hc_lowrank,
                    "Gated Residual: low-rank bottleneck width of the input-mixer gate (0 = off, must "
-                   "match --hc-count's on/off state). Stage 0: hard-clamped to 0.")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "match --hc-count's on/off state, i.e. >= 1 iff --hc-count >= 2)")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -1378,9 +1377,9 @@ int main(int argc, char** argv) {
     cos << "constexpr int  NGRAM_MAX_N         = " << ngram_max_n << ";\n";
     cos << "constexpr int  NGRAM_TABLES_PER_ORDER = " << ngram_tables << ";\n";
     cos << "constexpr int  NGRAM_TABLE_SIZE    = " << ngram_table_size << ";\n";
-    // Gated Residual (hyper-connections) Stage 0: HC_COUNT parallel residual streams read/write-gated
-    // per sub-block (layout.hpp's USE_GATED_RESIDUAL/GR_DIMS). 0 = off -- the only value this Stage 0
-    // build can take. See docs/GATED_RESIDUAL.md.
+    // Gated Residual (hyper-connections) Stage 1: HC_COUNT parallel residual streams read/write-gated
+    // per sub-block (layout.hpp's USE_GATED_RESIDUAL/GR_DIMS). 0 = off, the default. See
+    // docs/GATED_RESIDUAL.md.
     cos << "constexpr int  HC_COUNT   = " << hc_count << ";\n";
     cos << "constexpr int  HC_LOWRANK = " << hc_lowrank << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
