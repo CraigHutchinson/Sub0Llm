@@ -23,6 +23,7 @@
 #include "sub0/cpu_affinity.hpp"    // P-core-first thread pinning (hybrid Intel CPUs) -- see its own header comment
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet Stage 1 forward math (sub0::gdn::forward/recurrence_step)
 #include "sub0/gated_residual_math.hpp"  // Gated Residual Stage 1 forward math (sub0::gr::hc_norm/mix/gate/combine/tile)
+#include "sub0/moe_math.hpp"         // Mixture of Experts Stage 1 forward math (sub0::moe::forward_row/forward)
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
@@ -124,7 +125,14 @@ consteval size_t calc_act_cap() {
                 // [T,HC_WIDE]+[T,HC_LOWRANK] scratch, op_gr_gate's [T,HC_COUNT] output + its
                 // [T,HC_WIDE] scratch, and op_gr_combine's [T,HC_WIDE] output -- see
                 // gated_residual_math.hpp's own *_scratch_floats(). Zero when GR is off.
-                + (USE_GATED_RESIDUAL ? (size_t)2 * T * (C + 3 * HC_WIDE + HC_LOWRANK + HC_COUNT) : 0);
+                + (USE_GATED_RESIDUAL ? (size_t)2 * T * (C + 3 * HC_WIDE + HC_LOWRANK + HC_COUNT) : 0)
+                // op_moe (Stage 1): same over-provisioning idiom as op_gdn's own term above -- every
+                // execution is budgeted as if it could be MoE, added ON TOP of the plain/gated FFN term
+                // already in `per` rather than replacing it (MoE genuinely does replace the FFN computed
+                // at runtime, but this stays a simple, safe upper bound rather than tracking that). The
+                // op's own [T,D_MODEL] output node plus moe_math.hpp's own scratch_floats() (NOT scaled
+                // by T -- see that file's own header comment on row-independence). Zero when MoE is off.
+                + (USE_MOE ? (size_t)T * C + moe::scratch_floats(MOE_DIMS) : 0);
     size_t fin  = T * C + 2 * T * V + 64;
     // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
     // activation nodes R times (the weights are shared; the activations are not).
@@ -150,7 +158,10 @@ constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_
                                 + (USE_DEPTH_ATTN ? (size_t)LOOP_EXEC_COUNT : 0)
                                 + (USE_GATED_DELTANET ? (size_t)LOOP_EXEC_COUNT : 0)
                                 + (USE_GATED_RESIDUAL ? 6 * (size_t)LOOP_EXEC_COUNT + 2 : 0)
-                                + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0);
+                                + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0)
+                                // op_moe adds exactly one node per EXECUTION (its single output node),
+                                // same over-provisioning reasoning as GDN's own term above.
+                                + (USE_MOE ? (size_t)LOOP_EXEC_COUNT : 0);
 
 // ============================================================================
 //  Static storage
@@ -1215,6 +1226,18 @@ static void backward_node(Node& n) {
                               "different architecture than the one requested.");
         std::abort();
     }
+    case Op::Moe: {
+        // Stage 1's own, deliberate scope boundary (docs/MOE.md S6): no backward exists for this op yet
+        // -- the exact same "guard at the lowest callable seam" refusal Op::GDN's own Stage 1 placeholder
+        // established (commit bac8bfd, before GDN's own Stage 2 replaced it) and Op::GrTile/GrMix/GrGate/
+        // GrCombine just above still use. docs/MOE.md S6 also names the real subtlety a future Stage 2
+        // backward needs to get right (the router's own softmax gradient is NOT sparse to the selected
+        // experts the way the expert FFN weights' gradient is) -- not implemented here, only documented.
+        std::println(stderr, "fatal: Mixture of Experts has no backward pass yet (Stage 1 is CPU forward "
+                              "only, see docs/MOE.md) -- refusing to silently train a different "
+                              "architecture than the one requested.");
+        std::abort();
+    }
     }
 }
 
@@ -1386,6 +1409,14 @@ struct Layer {
     // with its own hc_norm/down/up/block_inject tensors. nullptr on every layer when !USE_GATED_RESIDUAL.
     Node *gr_attn_norm = nullptr, *gr_attn_down = nullptr, *gr_attn_up = nullptr, *gr_attn_inject = nullptr,
          *gr_mlp_norm  = nullptr, *gr_mlp_down  = nullptr, *gr_mlp_up  = nullptr, *gr_mlp_inject  = nullptr;
+    // Mixture of Experts (Stage 1, docs/MOE.md S3b/S4): present only when USE_MOE (replaces Wg/W1/W2 or
+    // W1/b1/W2/b2 for THIS layer, per make_param_layout()'s own if constexpr branch -- every layer, no
+    // per-layer schedule, unlike GDN). moe_gate/moe_up/moe_down are NUM_EXPERTS_BUF-sized arrays, one
+    // slot per routed expert's own SwiGLU triple; only the first NUM_EXPERTS entries are ever populated.
+    Node *moe_router = nullptr;
+    std::array<Node*, NUM_EXPERTS_BUF> moe_gate{}, moe_up{}, moe_down{};
+    Node *moe_shared_gate = nullptr, *moe_shared_up = nullptr, *moe_shared_down = nullptr,
+         *moe_shared_gate_proj = nullptr;
 };
 
 // --- Gated DeltaNet (Stage 1: CPU forward only; docs/GATED_DELTANET.md, include/sub0/gdn_math.hpp) ---
@@ -1484,6 +1515,35 @@ static Node* op_gr_combine(Node* wide, Node* mixer_out, Node* inj) {
     return out;
 }
 
+// --- Mixture of Experts (Stage 1: CPU forward only; docs/MOE.md, include/sub0/moe_math.hpp) ---
+//
+// ONE op does routing + all NUM_EXPERTS-worth of per-token expert selection + the shared expert
+// internally, taking `Layer&` directly and reading its router/expert/shared-expert tensors off it --
+// the exact `op_gdn(Node* a, Layer& L)` precedent (docs/MOE.md S4c/S5: top-k selection is host-side
+// scalar code inside this op's own forward body, not a separate differentiable Node). `out->a = x`
+// mirrors op_gdn's own single-input-node bookkeeping -- enough for backward_node's abort-placeholder
+// case to at least name the right input node. No side table: Stage 1 has no backward walking the node
+// pool yet (docs/MOE.md S6), so nothing needs to recover the router/expert/shared-expert tensors from a
+// bare `Node*`.
+static Node* op_moe(Node* x, Layer& L) {
+    const int T = x->rows;
+    Node* out = mk_node(Op::Moe, T, D_MODEL);
+    out->a = x;
+    std::array<const float*, NUM_EXPERTS_BUF> gate_w{}, up_w{}, down_w{};
+    for (int e = 0; e < NUM_EXPERTS; ++e) {
+        gate_w[static_cast<std::size_t>(e)] = L.moe_gate[static_cast<std::size_t>(e)]->data.data();
+        up_w[static_cast<std::size_t>(e)]   = L.moe_up[static_cast<std::size_t>(e)]->data.data();
+        down_w[static_cast<std::size_t>(e)] = L.moe_down[static_cast<std::size_t>(e)]->data.data();
+    }
+    auto [scratch, scratch_g] = arena_alloc(moe::scratch_floats(MOE_DIMS));
+    moe::forward(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
+                 gate_w.data(), up_w.data(), down_w.data(),
+                 L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
+                 L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                 out->data.data(), scratch.data());
+    return out;
+}
+
 struct Model {
     Node* tok_emb;
     Node* pos_emb;
@@ -1578,7 +1638,21 @@ struct Model {
                 L.gr_mlp_up     = mk_param(HC_LOWRANK, HC_WIDE, true);
                 L.gr_mlp_inject = mk_param(HC_WIDE, HC_COUNT, true);
             }
-            if constexpr (USE_GATED_FFN) {
+            // Mixture of Experts (docs/MOE.md S3b/S4): REPLACES the FFN's own weights for EVERY layer
+            // when on -- MUST match layout.hpp's make_param_layout() exactly (router, then NUM_EXPERTS
+            // routed-expert SwiGLU triples, then the shared expert's own triple + gate projection).
+            if constexpr (USE_MOE) {
+                L.moe_router = mk_param(D_MODEL, NUM_EXPERTS, true);
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    L.moe_gate[static_cast<std::size_t>(e)] = mk_param(D_MODEL, D_FF, true);
+                    L.moe_up[static_cast<std::size_t>(e)]   = mk_param(D_MODEL, D_FF, true);
+                    L.moe_down[static_cast<std::size_t>(e)] = mk_param(D_FF, D_MODEL, true);
+                }
+                L.moe_shared_gate      = mk_param(D_MODEL, D_FF, true);
+                L.moe_shared_up        = mk_param(D_MODEL, D_FF, true);
+                L.moe_shared_down      = mk_param(D_FF, D_MODEL, true);
+                L.moe_shared_gate_proj = mk_param(D_MODEL, 1, true);
+            } else if constexpr (USE_GATED_FFN) {
                 L.Wg = mk_param(D_MODEL, D_FF, true);   // gate
                 L.W1 = mk_param(D_MODEL, D_FF, true);   // up
                 L.W2 = mk_param(D_FF, D_MODEL, true);   // down (no bias)
@@ -1662,8 +1736,24 @@ struct Model {
                 ones(L.gdn_norm);
                 randn(L.gdn_out_proj, 0.02f);
             }
-            if constexpr (USE_GATED_FFN) randn(L.Wg, 0.02f);
-            randn(L.W1, 0.02f); randn(L.W2, 0.02f);
+            // Mixture of Experts init: no special reference init beyond "a Linear layer" for the router/
+            // expert/shared-expert weights (S1a's __init__ shows only `nn.Parameter(torch.empty(...))`,
+            // i.e. PyTorch's own default uninitialized-then-caller-inits convention, not a documented
+            // scheme this project can port) -- this project's own standard 0.02-std normal is used,
+            // matching every other GEMM weight here, same reasoning GDN's/GR's own projections use.
+            if constexpr (USE_MOE) {
+                randn(L.moe_router, 0.02f);
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    randn(L.moe_gate[static_cast<std::size_t>(e)], 0.02f);
+                    randn(L.moe_up[static_cast<std::size_t>(e)], 0.02f);
+                    randn(L.moe_down[static_cast<std::size_t>(e)], 0.02f);
+                }
+                randn(L.moe_shared_gate, 0.02f); randn(L.moe_shared_up, 0.02f);
+                randn(L.moe_shared_down, 0.02f); randn(L.moe_shared_gate_proj, 0.02f);
+            } else {
+                if constexpr (USE_GATED_FFN) randn(L.Wg, 0.02f);
+                randn(L.W1, 0.02f); randn(L.W2, 0.02f);
+            }
         }
         // Gated Residual's model-level exit collapse -- same init convention as the per-layer instances
         // above (GrHcNorm left at the arena's own zero, down/up randn(0.02)).
@@ -1806,7 +1896,9 @@ struct Model {
                     Node* gr_inj_mlp = nullptr;
                     Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject,
                                        L.ln2, &gr_inj_mlp);
-                    if constexpr (USE_GATED_FFN) {
+                    if constexpr (USE_MOE) {
+                        f = op_moe(f, L);
+                    } else if constexpr (USE_GATED_FFN) {
                         Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                         Node* up_pre   = op_linear(f, L.W1, nullptr, q);
                         f = op_linear(op_swiglu(gate_pre, up_pre), L.W2, nullptr, q);
@@ -1922,6 +2014,10 @@ struct Model {
         [[maybe_unused]] float gr_mixscr[GR_MIX_SCRATCH1 ? GR_MIX_SCRATCH1 : 1];
         [[maybe_unused]] float gr_mixed[C];
         [[maybe_unused]] float gr_inj[HC_COUNT_BUF];
+        // Mixture of Experts (Stage 1, docs/MOE.md S4b) decode-path scratch -- MOE_SCRATCH1 is never
+        // zero (see its own comment), unlike GR_MIX_SCRATCH1 above, so no ternary-guard is needed here.
+        [[maybe_unused]] float moe_scratch[MOE_SCRATCH1];
+        [[maybe_unused]] std::array<const float*, NUM_EXPERTS_BUF> moe_gate_w{}, moe_up_w{}, moe_down_w{};
         // GR READ (mix+gate, into `out_a`) / WRITE (combine, in place on `wide`) row-helpers, T==1 --
         // the exact decode-path counterpart of forward()'s gr_read/gr_write lambdas (docs/GATED_RESIDUAL.md
         // S2). Safe to write `wide` in place in gr_write_row: combine()'s per-(stream,channel) output
@@ -2106,7 +2202,18 @@ struct Model {
                 do_attention_mixer();
             }
             gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
-            if constexpr (USE_GATED_FFN) {
+            if constexpr (USE_MOE) {
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    moe_gate_w[static_cast<std::size_t>(e)] = L.moe_gate[static_cast<std::size_t>(e)]->data.data();
+                    moe_up_w[static_cast<std::size_t>(e)]   = L.moe_up[static_cast<std::size_t>(e)]->data.data();
+                    moe_down_w[static_cast<std::size_t>(e)] = L.moe_down[static_cast<std::size_t>(e)]->data.data();
+                }
+                moe::forward_row(MOE_DIMS, a, L.moe_router->data.data(),
+                                  moe_gate_w.data(), moe_up_w.data(), moe_down_w.data(),
+                                  L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
+                                  L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                                  proj, moe_scratch);
+            } else if constexpr (USE_GATED_FFN) {
                 linear_row(a, L.Wg, nullptr, g1, C, D_FF);
                 linear_row(a, L.W1, nullptr, f1, C, D_FF);
                 for (int j = 0; j < D_FF; ++j) f1[j] = silu_row(g1[j]) * f1[j];

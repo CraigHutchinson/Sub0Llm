@@ -341,10 +341,15 @@ inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_coun
 // per-layer schedule to derive, only a single on/off gate. 0 = off, the only value every build before
 // this stage could take, and still the default.
 inline constexpr bool USE_MOE = (NUM_EXPERTS >= 2);
-static_assert(NUM_EXPERTS == 0, "MIXTURE OF EXPERTS Stage 0: NUM_EXPERTS is hard-clamped to 0 until "
-              "Stage 1's real op exists -- see docs/MOE.md S4a");
-static_assert(EXPERTS_PER_TOK == 0, "MIXTURE OF EXPERTS Stage 0: EXPERTS_PER_TOK is hard-clamped to 0 "
-              "until Stage 1's real op exists -- see docs/MOE.md S4a");
+static_assert(NUM_EXPERTS == 0 || NUM_EXPERTS >= 2,
+              "NUM_EXPERTS must be 0 (off) or a real routed-expert count >= 2 -- see docs/MOE.md");
+static_assert((NUM_EXPERTS >= 2) == (EXPERTS_PER_TOK >= 1),
+              "NUM_EXPERTS and EXPERTS_PER_TOK must be on or off together (NUM_EXPERTS >= 2 iff "
+              "EXPERTS_PER_TOK >= 1) -- see docs/MOE.md");
+static_assert(EXPERTS_PER_TOK <= (NUM_EXPERTS == 0 ? 0 : NUM_EXPERTS),
+              "EXPERTS_PER_TOK cannot exceed NUM_EXPERTS -- see docs/MOE.md");
+static_assert(EXPERTS_PER_TOK <= moe::TOPK_MAX,
+              "EXPERTS_PER_TOK exceeds moe_math.hpp's own TOPK_MAX stack-buffer cap -- see its header comment");
 
 // Never-zero array-bound forms (same idiom as HC_COUNT_BUF/NGRAM_TABLES_BUF above) -- valid, non-
 // degenerate shapes even when USE_MOE is false, so downstream code never needs a separate guard just to
@@ -356,6 +361,11 @@ inline constexpr int NUM_EXPERTS_BUF = USE_MOE ? NUM_EXPERTS : 1;
 // (docs/QWEN4_MEMORY_ORCHESTRATION.md S2a), so one shared width is real-model-faithful, not an
 // approximation, and AGENTS.md S8 disfavors a speculative extra knob nothing yet needs.
 inline constexpr moe::Dims MOE_DIMS{D_MODEL, D_FF, NUM_EXPERTS, EXPERTS_PER_TOK};
+// forward_one's decode-path scratch need, precomputed here (not re-derived at every call) -- same
+// reasoning as GDN_SCRATCH1/GR_NORMED_SCRATCH1. Not scaled by T (moe_math.hpp's own scratch_floats() is
+// row-independent, docs/MOE.md S2) and never zero even when USE_MOE is false (D_FF/D_MODEL are always
+// >= 1), so no separate "_BUF" never-degenerate form is needed the way HC_COUNT_BUF/NUM_EXPERTS_BUF are.
+inline constexpr std::size_t MOE_SCRATCH1 = moe::scratch_floats(MOE_DIMS);
 
 // Exact PARAM_FLOATS delta a MoE-on build adds over an otherwise-identical MoE-off build, per
 // docs/MOE.md S3b -- a pure function of explicit parameters (not closed over this build's own constants),

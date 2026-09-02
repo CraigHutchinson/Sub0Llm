@@ -697,13 +697,13 @@ int main(int argc, char** argv) {
        ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--num-experts", num_experts,
                    "Mixture of Experts (docs/MOE.md): number of routed experts per layer, replacing the "
-                   "FFN block for EVERY layer when on (0 = off, else >= 2). Stage 0: hard-clamped to 0 -- "
-                   "no CPU forward op exists yet")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "FFN block for EVERY layer when on (0 = off, else >= 2). Stage 1: CPU forward only -- "
+                   "gen/eval/report work, train/tune do not (no backward pass yet, and no CUDA build)")
+       ->capture_default_str()->check(CLI::Range(0, 512));
     app.add_option("--experts-per-tok", experts_per_tok,
                    "Mixture of Experts: top-k routed experts selected per token (0 = off, must match "
-                   "--num-experts' on/off state). Stage 0: hard-clamped to 0")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "--num-experts' on/off state, and must not exceed it)")
+       ->capture_default_str()->check(CLI::Range(0, 16));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
