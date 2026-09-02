@@ -504,3 +504,57 @@ production scale — explicitly out of scope per the task's own "do NOT attempt 
 scale" instruction) is built once to confirm `forward()`-vs-`forward_one()` parity holds with the
 mechanism actually active, not merely compiling. Exact assertion counts, hashes, and the parity numbers
 are in the final report (Stage 1 execution output), not fixed in this design doc ahead of running them.
+
+## 9. Results (Stage 1 execution)
+
+**Fixture correctness gate** (`tests/gated_residual_qwen4_fixture_tests.cpp`, real weights, `T=6` real
+fixture input): EXACT bit-for-bit match against the real `transformers==5.16.1` output --
+`max|out-expected| = 0.0` for both `mixed_input` (`sum|expected| = 10.3492` over 48 values) and
+`injection_weights` (`sum|expected| = 24.015` over 24 values). Stronger than GDN's own Stage 1 fixture
+result (which matched to `~4e-11`, a float32-rounding-level match against a chunked-vs-sequential
+algorithmic reformulation) -- GR's CPU port is a direct, unreformulated translation of the real forward
+math, so an exact match is the correct outcome, not merely a good one.
+
+**Presence/mutation checks** (same file, no fixture needed): (1) zeroing any ONE of the real fixture's
+`hc_count=4` streams in isolation (a synthetic orthogonal-signal input) changes both `mixed_input` and
+`injection_weights` by a real, nonzero amount for every one of the 4 streams -- a mutant reading only a
+subset would fail this even on inputs where a loose fixture-tolerance check might not catch it; (2) a
+degenerate identical-stream construction distinguishes the real MEAN reduction from a plausible SUM
+mutant by the resulting per-channel ratio's numeric range (mean landed at `0.504`, inside `(0,1)` as
+predicted; a sum mutant would land at `~2.0`, outside it, since `hc_count=4`). All 3 test cases: 73
+assertions, green.
+
+**Two-scale identity check** (AGENTS.md S7): at `HC_COUNT == 0` (neutral), the full default engine test
+suite (`sub0_tests`) is assertion- AND hash-identical to `main` at BOTH shapes:
+
+| shape | assertions | test cases | forward hash | grad hash | decode hash |
+|---|---|---|---|---|---|
+| d96 L8 H2 seq128 (even) | 4,504,583 | 139 | `f9c33312fa7cc1c3` | `088c3d9b8da37b62` | `9092eda27c35fea1` |
+| d132 L11 H4 kv2 seq96 (odd/ragged) | 11,810,675 | 139 | `544a0a50fa57782e` | `11a6c926c3840ae4` | `a3e4ad39c3088013` |
+
+identical before Stage 0's own two new test cases (137 cases, 4,504,571 / 11,810,663 assertions
+respectively -- exactly 12 fewer, matching the 2 new test cases' own 12 assertions and nothing else)
+through every subsequent commit in this pass, verified by rebuilding each side at the same generated
+config header and diffing `sub0_tests`' own summary line.
+
+**Real GR-ON build, forward/forward_one parity** (this doc's own scope: a small correctness-fixture-scale
+config, not production dims): `D_MODEL=16, N_LAYERS=2, N_HEADS=2, SEQ_LEN=32, HC_COUNT=4, HC_LOWRANK=6` --
+a genuinely GR-active build, PARAM_LAYOUT carrying the real 4-tensor-per-instance/3-instances-per-layer/
++1-top-level shape. `engine_tests.cpp`'s existing, GR-agnostic "`forward_one` (KV-cache) matches the full
+forward per position" test (no GR-specific code needed -- it exercises whatever the compiled `Model`
+actually computes) passes with worst per-position relative diff `1.93151e-07` -- float32-rounding-level
+agreement between the Node-graph training path (`op_gr_tile`/`op_gr_mix`/`op_gr_gate`/`op_gr_combine`)
+and the raw-pointer decode path (`gr::tile`/`gr::hc_norm`/`gr::mix`/`gr::gate`/`gr::combine` called
+directly), confirming both independently-written implementations of the same math agree on a real
+forward pass, not just compile. The `[layout][config][gr]`-tagged subset (13 test cases, 23,779
+assertions) also passes at this build, including a real fix this pass found by actually compiling a
+nonzero-`HC_COUNT` build rather than only reasoning about it: two pre-existing generic
+`layout_tests.cpp` checks (the `NUM_PARAMS` closed-form count and the per-`PKind` decay/ternary
+consistency check) had no GR term at all and failed a REAL assertion at `HC_COUNT=4`, not a hypothetical
+one -- fixed the same pass, per AGENTS.md S10's own lesson about a diff not showing you every consumer.
+
+**Scope confirmed, not merely assumed**: the full, untagged default `sub0_tests` suite at this same
+GR-ON build reaches `backward_node`'s loud `abort()` on the first GR node a training-path test tries to
+differentiate through (many of that suite's test cases call `train_batch`/`backward`) -- exactly Stage
+1's own declared scope boundary (S6), confirmed by actually hitting it rather than only documenting it.
+gen/eval/report-shaped tests (forward-only) all pass; train/tune-shaped tests correctly, loudly refuse.
