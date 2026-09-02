@@ -168,7 +168,15 @@ inline Sub0DeviceCaps sub0_dev_caps() {
     // depth-attention build must report 0 and let every decode consumer degrade to the CPU. Reporting a
     // capability the backend does not have is the one thing this struct exists to prevent; it is also
     // what `report`'s sample battery would otherwise trip over mid-run, not just an explicit `gen`.
-    return { "cuda", /*train=*/1, /*eval=*/1, /*decode=*/!sub0::USE_DEPTH_ATTN, /*interception=*/0,
+    //
+    // supports_train/supports_decode ALSO go false for Gated DeltaNet (docs/GATED_DELTANET.md Stage 3,
+    // this pass): CUDA implements GDN's FORWARD only (the batched/inference-shaped forward_device path,
+    // gated against Stage 1's CPU sequential reference AND the real Qwen4-preview fixtures) -- no CUDA
+    // backward, no single-token decode. supports_eval stays TRUE: sub0_cuda_forward_loss is built on
+    // forward_device (see that function's own comment), which DOES implement GDN, so evaluating a GDN
+    // model on the GPU works fine; only training (backward) and gen's decode path fall back to CPU.
+    return { "cuda", /*train=*/!sub0::USE_GATED_DELTANET, /*eval=*/1,
+             /*decode=*/!sub0::USE_DEPTH_ATTN && !sub0::USE_GATED_DELTANET, /*interception=*/0,
              /*binding_compose=*/1, /*opt_state=*/1, /*tf32=*/1 };
 }
 [[nodiscard]] inline int  sub0_dev_init()                       { return sub0_cuda_init(); }

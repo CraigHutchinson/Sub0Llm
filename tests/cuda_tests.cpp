@@ -11,6 +11,7 @@
 #include "sub0/core.hpp"     // trainable_floats()
 #include "sub0/decode.hpp"   // gpu_decode_try_enable -- must honour the supports_decode cap
 #include "sub0/eval.hpp"     // sub0::eval -- the consumer under test for the device eval seam
+#include "sub0/gdn_math.hpp" // sub0::gdn::Dims/state_floats/etc -- the Stage 3 GDN fixture test's dims/shapes
 #include "sub0/layout.hpp"   // PARAM_LAYOUT / PKind — attn-only grad slice for the bisection probe
 #include "sub0/memplan.hpp"  // the pure footprint model under test
 #include "sub0/muon.hpp"     // sub0::muon::newton_schulz5 -- the CPU reference the GPU Muon tests check against
@@ -20,6 +21,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>   // Gated DeltaNet fixture test: SUB0_SOURCE_DIR-relative fixture file paths
+#include <fstream>      // ...and reading them, same convention as gdn_qwen4_fixture_tests.cpp
 #include <random>
 #include <vector>
 
@@ -75,6 +78,17 @@ extern "C" int  sub0_cuda_binding_compose_check(int enc_sel, unsigned seed,
                                                 double* out_fwd_maxabs, double* out_fwd_maxrel,
                                                 double* out_fwd_act_maxrel,
                                                 double* out_bwd_maxabs, double* out_bwd_maxrel);
+// Gated DeltaNet CUDA-forward checks (docs/GATED_DELTANET.md Stage 3) -- see backend_cuda.cu's own
+// comments on sub0_cuda_gdn_check (primary gate: parity vs Stage 1's CPU sequential reference,
+// gdn_math.hpp) and sub0_cuda_gdn_forward_raw (secondary gate: the real Qwen4-preview fixture, driven
+// from here reusing gdn_qwen4_fixture_tests.cpp's own file-loading/transpose helpers).
+extern "C" int  sub0_cuda_gdn_check(int shape_sel, double* out_maxrel);
+extern "C" int  sub0_cuda_gdn_forward_raw(int hidden_size, int Hk, int Hv, int dk, int dv, int K,
+                                          int batch, int T,
+                                          const float* x, const float* w_qkv, const float* w_z,
+                                          const float* w_b, const float* w_a, const float* conv_w,
+                                          const float* dt_bias, const float* a_log, const float* norm_w,
+                                          const float* w_out, float* out);
 
 namespace {
 // RAII: guarantees sub0_cuda_shutdown() runs even when a REQUIRE above throws mid-test (Catch2's
@@ -772,6 +786,134 @@ TEST_CASE("CUDA QK-norm kernels forward+backward match a hand-computed reference
         REQUIRE(fwd_relL2 < 1e-5);   // includes the V-sub-block-untouched check (1e30 sentinel on failure)
         REQUIRE(bwd_relL2 < 1e-5);
     }
+}
+
+// Gated DeltaNet CUDA forward -- PRIMARY correctness gate (docs/GATED_DELTANET.md Stage 3 / S5 step 3's
+// own instruction): exact numerical parity between this stage's CHUNKED-parallel CUDA port
+// (gdn_forward_device) and Stage 1's SEQUENTIAL CPU reference (sub0::gdn::forward, gdn_math.hpp) --
+// NOT a fresh comparison against the Python fixtures (that is the fixture test below, a secondary,
+// stronger oracle). Meaningful in ANY CUDA build regardless of whether USE_GATED_DELTANET is on --
+// exercises the raw kernels directly, same reasoning as the QK-norm/SwiGLU checks above being
+// independent of their own axis's compile-time flag.
+//
+// Three shapes, chosen to exercise real risk (AGENTS.md S7): shape 0 matches the real Qwen4-preview
+// fixture's own head width (dk=dv=128) at T=6 -- single chunk (GDN_CHUNK=64), the same shape the
+// fixture test below re-checks against the REAL reference. Shape 1 is multi-chunk (T=130 -> 3 chunks
+// after padding) with GQA-style repeat_interleave (Hk=2, Hv=4) -- the ONLY shape here that exercises
+// Phase B's cross-chunk `last_state` carry at all; a check that only ever ran shape 0 (or any T <=
+// GDN_CHUNK) could not catch a state-carry bug and would still pass. Shape 2 is an exact chunk-size
+// boundary (T=64, zero padding).
+TEST_CASE("CUDA Gated DeltaNet forward (chunked) matches the CPU sequential reference "
+          "(gdn_math.hpp)", "[cuda][gdn]") {
+    CudaGuard _cuda_guard;
+    for (int shape_sel = 0; shape_sel < 3; ++shape_sel) {
+        double maxrel = 1.0;
+        const int rc = sub0_cuda_gdn_check(shape_sel, &maxrel);
+        WARN("gdn check: shape_sel=" << shape_sel << " | max rel diff = " << maxrel);
+        REQUIRE(rc == 0);
+        REQUIRE(maxrel < 1e-3);
+    }
+}
+
+// Gated DeltaNet CUDA forward -- SECONDARY correctness gate: the REAL Qwen4-preview fixture
+// (tests/fixtures/qwen4_preview/gdn_layer0_small_*), whose expected output was produced by the ACTUAL
+// reference model's own CHUNKED path -- a stronger oracle than the CPU-vs-CPU comparison above, since
+// this is the algorithm THIS port targets, run against ground truth rather than against another port of
+// the same math. Reuses gdn_qwen4_fixture_tests.cpp's own file-loading/transpose helpers (duplicated
+// here rather than shared, since that file is engine-free/CPU-only and this one is CUDA-only-compiled
+// -- same reasoning cuda_tests.cpp already applies to every other kernel-level check in this file).
+TEST_CASE("CUDA Gated DeltaNet forward (chunked) matches the real Qwen4-preview reference "
+          "at layer 0's small fixture", "[cuda][gdn][qwen4_fixture]") {
+#ifdef SUB0_SOURCE_DIR
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(SUB0_SOURCE_DIR) / "tests" / "fixtures" / "qwen4_preview";
+    const fs::path input_path  = dir / "gdn_layer0_small_input.bin";
+    const fs::path output_path = dir / "gdn_layer0_small_output.bin";
+    if (!fs::exists(input_path) || !fs::exists(output_path)) {
+        WARN("Qwen4 GDN fixtures not present at " << dir.string() << " -- skipping (optional)");
+        return;
+    }
+    CudaGuard _cuda_guard;
+    auto read_f32 = [](const fs::path& p, std::size_t expect_n) -> std::vector<float> {
+        std::ifstream f(p, std::ios::binary);
+        std::vector<float> out(expect_n);
+        if (!f) return {};
+        f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(expect_n * sizeof(float)));
+        if (static_cast<std::size_t>(f.gcount()) != expect_n * sizeof(float)) return {};
+        return out;
+    };
+    // PyTorch nn.Linear convention [out_features,in_features] -> this project's own [in,out] convention
+    // (gdn_forward_device's own weight-layout expectation, identical to gdn_math.hpp's forward()).
+    auto transpose = [](const std::vector<float>& w, int out_f, int in_f) -> std::vector<float> {
+        std::vector<float> t(static_cast<std::size_t>(out_f) * in_f);
+        for (int o = 0; o < out_f; ++o)
+            for (int i = 0; i < in_f; ++i)
+                t[static_cast<std::size_t>(i) * out_f + o] = w[static_cast<std::size_t>(o) * in_f + i];
+        return t;
+    };
+
+    constexpr int T = 6, hidden_size = 32;
+    constexpr int num_k_heads = 1, num_v_heads = 3, head_k_dim = 128, head_v_dim = 128, conv_kernel = 4;
+    const sub0::gdn::Dims dims{hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel};
+    const int key_dim = dims.key_dim(), value_dim = dims.value_dim(), conv_dim = dims.conv_dim();
+    REQUIRE(key_dim == 128);
+    REQUIRE(value_dim == 384);
+    REQUIRE(conv_dim == 640);
+
+    const std::vector<float> input   = read_f32(input_path, static_cast<std::size_t>(T) * hidden_size);
+    const std::vector<float> expected = read_f32(output_path, static_cast<std::size_t>(T) * hidden_size);
+    REQUIRE(input.size() == static_cast<std::size_t>(T) * hidden_size);
+    REQUIRE(expected.size() == static_cast<std::size_t>(T) * hidden_size);
+
+    const auto w_qkv_raw = read_f32(dir / "gdn_layer0_small_weight_in_proj_qkv.bin",
+                                     static_cast<std::size_t>(conv_dim) * hidden_size);
+    const auto w_z_raw   = read_f32(dir / "gdn_layer0_small_weight_in_proj_z.bin",
+                                     static_cast<std::size_t>(value_dim) * hidden_size);
+    const auto w_b_raw   = read_f32(dir / "gdn_layer0_small_weight_in_proj_b.bin",
+                                     static_cast<std::size_t>(num_v_heads) * hidden_size);
+    const auto w_a_raw   = read_f32(dir / "gdn_layer0_small_weight_in_proj_a.bin",
+                                     static_cast<std::size_t>(num_v_heads) * hidden_size);
+    const auto conv_w    = read_f32(dir / "gdn_layer0_small_weight_conv1d.bin",
+                                     static_cast<std::size_t>(conv_dim) * conv_kernel);
+    const auto dt_bias   = read_f32(dir / "gdn_layer0_small_weight_dt_bias.bin", num_v_heads);
+    const auto a_log     = read_f32(dir / "gdn_layer0_small_weight_A_log.bin", num_v_heads);
+    const auto norm_w    = read_f32(dir / "gdn_layer0_small_weight_norm.bin", head_v_dim);
+    const auto w_out_raw = read_f32(dir / "gdn_layer0_small_weight_out_proj.bin",
+                                     static_cast<std::size_t>(hidden_size) * value_dim);
+    REQUIRE(w_qkv_raw.size() == static_cast<std::size_t>(conv_dim) * hidden_size);
+    REQUIRE(w_out_raw.size() == static_cast<std::size_t>(hidden_size) * value_dim);
+
+    const auto w_qkv = transpose(w_qkv_raw, conv_dim, hidden_size);
+    const auto w_z   = transpose(w_z_raw,   value_dim, hidden_size);
+    const auto w_b   = transpose(w_b_raw,   num_v_heads, hidden_size);
+    const auto w_a   = transpose(w_a_raw,   num_v_heads, hidden_size);
+    const auto w_out = transpose(w_out_raw, hidden_size, value_dim);
+
+    std::vector<float> out(static_cast<std::size_t>(T) * hidden_size, 0.f);
+    const int rc = sub0_cuda_gdn_forward_raw(hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+                                             conv_kernel, /*batch=*/1, T,
+                                             input.data(), w_qkv.data(), w_z.data(), w_b.data(), w_a.data(),
+                                             conv_w.data(), dt_bias.data(), a_log.data(), norm_w.data(),
+                                             w_out.data(), out.data());
+    REQUIRE(rc == 0);
+
+    double max_abs_diff = 0.0, max_rel_diff = 0.0, sum_abs_expected = 0.0;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const double diff = static_cast<double>(out[i]) - static_cast<double>(expected[i]);
+        max_abs_diff = std::max(max_abs_diff, std::abs(diff));
+        const double denom = std::max(1e-8, std::abs(static_cast<double>(expected[i])));
+        max_rel_diff = std::max(max_rel_diff, std::abs(diff) / denom);
+        sum_abs_expected += std::abs(static_cast<double>(expected[i]));
+    }
+    INFO("CUDA max |out - expected| = " << max_abs_diff << ", max relative diff = " << max_rel_diff
+         << ", sum |expected| = " << sum_abs_expected << " over " << out.size() << " values");
+    // Same tolerance as the CPU fixture test (gdn_qwen4_fixture_tests.cpp): float32-rounding-level
+    // agreement is the bar, not an approximate match -- this is bit-for-bit the same recurrence, chunked.
+    REQUIRE(max_abs_diff < 5e-5);
+    REQUIRE(sum_abs_expected > 0.0);
+#else
+    WARN("SUB0_SOURCE_DIR not defined -- skipping GDN CUDA fixture test");
+#endif
 }
 
 // Register/local-memory-spill regression guard for the five flash-attention kernels (forward tile +
@@ -2131,14 +2273,22 @@ TEST_CASE("logits chunk derivation: coverage, bounds, and the batch-scaling gap"
 // Regression test for a real defect, not a hypothetical: gpu_decode_try_enable() gated only on HAS_CUDA
 // plus init success, so on a depth-attention build `sub0llm report` would have driven its sample battery
 // straight into forward_one_device's refusal -- mid-run, at the first eval, not at an explicit `gen`.
+//
+// Gated DeltaNet (docs/GATED_DELTANET.md Stage 3) added a SECOND, independent axis that can turn
+// supports_decode off (CUDA forward-only, no single-token GDN state cache) and, unlike depth attention,
+// also turns supports_train off (no CUDA backward at all) -- both expressed directly in terms of
+// USE_GATED_DELTANET so this test stays honest at a GDN-on build too, not just a depth-attention one.
 TEST_CASE("CUDA caps: supports_decode is honest, and the decode consumer honours it", "[cuda]") {
-    REQUIRE(sub0_dev_caps().supports_decode == (DEPTH_ATTN_STRIDE == 0 ? 1 : 0));
-    if constexpr (sub0::USE_DEPTH_ATTN) {
+    const bool decode_expected = (DEPTH_ATTN_STRIDE == 0) && !sub0::USE_GATED_DELTANET;
+    REQUIRE(sub0_dev_caps().supports_decode == (decode_expected ? 1 : 0));
+    if constexpr (sub0::USE_DEPTH_ATTN || sub0::USE_GATED_DELTANET) {
         // Must return false WITHOUT touching the device -- the point is that no decode call is made.
         REQUIRE(sub0::gpu_decode_try_enable() == false);
     }
-    // Whatever decode reports, the paths depth attention DOES implement stay advertised.
-    REQUIRE(sub0_dev_caps().supports_train == 1);
+    // supports_train is false ONLY for GDN (Stage 3 is forward-only); depth attention's own axis never
+    // touches it (its backward IS implemented) -- whatever ELSE is unsupported, the paths a build DOES
+    // implement stay advertised.
+    REQUIRE(sub0_dev_caps().supports_train == (sub0::USE_GATED_DELTANET ? 0 : 1));
     REQUIRE(sub0_dev_caps().supports_eval  == 1);
 }
 

@@ -61,21 +61,23 @@ static_assert(!USE_TERNARY,
 static_assert(!sub0::NGRAM_EMBED,
     "the CUDA backend does not implement n-gram embeddings yet; CPU-only for now (TODO(ngram-gpu)).");
 
-// Gated DeltaNet (GDN_FULL_ATTN_STRIDE > 0, docs/GATED_DELTANET.md): Stage 1 landed the CPU-only
-// forward (op_gdn / gdn_forward_one, backend_cpu.cpp; shared math in include/sub0/gdn_math.hpp,
-// correctness-gated against real Qwen4-preview fixtures). No CUDA implementation exists yet -- that is
-// this stage's own, deliberate scope boundary (docs/GATED_DELTANET.md S5 step 3: the chunked-parallel
-// form is the real target for a device backend, gated on exact numerical parity with Stage 1's
-// sequential CPU reference, which is not yet established for anything but the CPU path). A GPU build
-// with this on would either fail to find the GDN param/activation wiring (a hard link/runtime error) or,
-// worse, silently compute a DIFFERENT architecture (plain softmax attention) while every shape check,
-// checkpoint field and PARAM_FLOATS still agreed -- hard-stop the BUILD instead, mirroring the ternary
-// and n-gram guards just above. Delete when a CUDA Stage 3 lands (this doc's own numbering).
-// TODO(gdn-gpu): port gdn_math.hpp's sequential recurrence (or the chunked form once it exists) to a
-// device kernel.
-static_assert(!sub0::USE_GATED_DELTANET,
-    "the CUDA backend does not implement Gated DeltaNet yet; CPU-only for now (TODO(gdn-gpu), "
-    "docs/GATED_DELTANET.md Stage 3).");
+// Gated DeltaNet (GDN_FULL_ATTN_STRIDE > 0, docs/GATED_DELTANET.md): Stage 1/2 landed the CPU-only
+// forward+backward (op_gdn / gdn_forward_one, backend_cpu.cpp; shared math in include/sub0/gdn_math.hpp,
+// correctness-gated against real Qwen4-preview fixtures). Stage 3 (this pass) adds CUDA FORWARD ONLY --
+// the build-time guard that used to hard-block ANY GDN CUDA build is lifted (a GDN CUDA build now
+// compiles and correctly runs forward_device -- see gdn_forward_device / the "Gated DeltaNet -- CUDA
+// FORWARD" section below, and its two-level correctness gate: parity against Stage 1's own CPU
+// sequential forward AND against the real Qwen4-preview fixtures, sub0_cuda_gdn_check /
+// cuda_tests.cpp). CUDA training (backward) and single-token decode remain UNIMPLEMENTED and refuse at
+// their own runtime seams instead of a compile-time block, the same convention depth attention's own
+// CUDA port already established for its own unimplemented axis (single-token decode, see
+// forward_one_device's comment just below): forward_train/backward_device/forward_one_device abort
+// loudly (mirroring backend_cpu.cpp's Stage-1 backward_node Op::GDN abort, now applied to
+// backward_device per this stage's own task), and the training/decode extern seams
+// (sub0_cuda_kv_reset/sub0_cuda_forward_one/run_fwd_bwd) refuse gracefully one layer up -- see
+// device_backend.hpp's Sub0DeviceCaps flip (supports_train/supports_decode both false for a GDN build).
+// TODO(gdn-gpu-train): CUDA backward for the chunked form, gated on parity with Stage 2's CPU backward.
+// TODO(gdn-gpu-decode): a per-token GDN state cache inside the captured decode graph.
 
 // Depth attention (DEPTH_ATTN_STRIDE > 0): training (forward_train + backward_device) and batched
 // inference (forward_device) are implemented below -- see docs/DEPTH_ATTENTION.md 5b. The one path NOT
@@ -2648,9 +2650,14 @@ int wqkv_alloc() {
 // Free only the batch-dependent forward buffers (for a grow-realloc); leaves wqkv intact.
 void invalidate_graph();           // fwd: a grow-realloc frees buffers the captured graph references
 void invalidate_decode_graph();    // ...and the decode graph, which references the SAME g_fwd buffers
+void gdn_model_scratch_free();   // forward-declared: defined in the GDN section above this point in the
+                                 // file (fwd_free_batch/fwd_alloc predate it historically; the GDN
+                                 // scratch's own lifecycle is tied to theirs, not the reverse)
+int  gdn_model_scratch_alloc(int rows, int batch, int T);
 void fwd_free_batch() {
     invalidate_graph();            // the captured forward graph references these buffers -> drop it
     invalidate_decode_graph();     // so does the decode graph (forward_one_device_graphed uses g_fwd too)
+    gdn_model_scratch_free();      // GDN's own resident scratch shares this grow/free lifecycle
     cudaFree(g_fwd.dids); cudaFree(g_fwd.h);    cudaFree(g_fwd.a);    cudaFree(g_fwd.qkv);
     cudaFree(g_fwd.att);  cudaFree(g_fwd.proj); cudaFree(g_fwd.fbuf); cudaFree(g_fwd.ff1);
     cudaFree(g_fwd.gact); cudaFree(g_fwd.ff2);  cudaFree(g_fwd.logits);
@@ -2702,6 +2709,10 @@ int fwd_alloc(int batch, bool full = true, int T = SEQ_LEN) {
                 SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.depth_k[s], Mm * sub0::D_KV * sizeof(float)));
                 SUB0_CUDA_CHECK(cudaMalloc(&g_fwd.depth_v[s], Mm * sub0::D_KV * sizeof(float)));
             }
+        // GDN's own resident scratch (Stage 3, forward_device only) -- sized to this same (rows, batch)
+        // ceiling, freed+regrown alongside everything else above by fwd_free_batch(). No-op when
+        // USE_GATED_DELTANET is off.
+        if (gdn_model_scratch_alloc(static_cast<int>(Mm), batch, T)) return 1;
     }
     g_fwd_rows = Mm;
     g_fwd_full = full ? 1 : 0;
@@ -3127,6 +3138,21 @@ __global__ void attn_decode_kernel_g(const float* __restrict__ q, const float* _
 // compile error, not a silent wrong-tensor read.
 constexpr int kLn1 = 0, kLn2 = 1, kWq = 2, kWk = 3, kWv = 4, kWo = 5;
 constexpr int kQNorm = 6, kKNorm = 7;                        // present only when USE_QK_NORM (else unused)
+// Gated DeltaNet (docs/GATED_DELTANET.md, Stage 3): a GDN layer replaces the attn block's Wq/Wk/Wv/Wo
+// (+QNorm/KNorm) with layout.hpp's nine GDN tensors -- SAME local slots 0/1 (Ln1/Ln2), then 2..10.
+// GDN never uses QK-norm (S1c), so its own FFN base is fixed at 11 regardless of USE_QK_NORM.
+constexpr int kGdnQkv = 2, kGdnZ = 3, kGdnB = 4, kGdnA = 5, kGdnConv = 6;
+constexpr int kGdnALog = 7, kGdnDtBias = 8, kGdnNorm = 9, kGdnOutProj = 10;
+constexpr int kAttnSlots = 2 + 4 + (USE_QK_NORM ? 2 : 0);    // Ln1,Ln2,Wq,Wk,Wv,Wo[,QNorm,KNorm]
+constexpr int kGdnSlots  = 2 + 9;                            // Ln1,Ln2 + the nine GDN tensors
+// kFfnBase used to be one number shared by every layer (every layer had the SAME mixer-block width).
+// Once a build can mix GDN and softmax-attention layers (GDN_FULL_ATTN_STRIDE > 0), the mixer block's
+// width varies PER LAYER, so the FFN's own local offset must be looked up per layer too -- ffn_base_for
+// below. kWg/kW1/kW2/kB1/kB2 stay as globals (still exactly correct for every ATTENTION layer, and at
+// GDN_FULL_ATTN_STRIDE == 0 -- the only value forward_train/backward_device/decode ever actually reach,
+// see their own new hard-refusal guards -- every layer IS an attention layer, so nothing here changes
+// behavior for any function that does not explicitly go through ffn_base_for): only forward_device
+// (the one function Stage 3 actually teaches to run a GDN layer) uses ffn_base_for(l) instead of these.
 constexpr int kFfnBase = USE_QK_NORM ? 8 : 6;
 constexpr int kWg  = kFfnBase;                               // gate matrix -- USE_GATED_FFN only (else unused)
 constexpr int kW1  = kFfnBase + (USE_GATED_FFN ? 1 : 0);     // gated: "up" projection; plain: the only FFN-in weight
@@ -3137,13 +3163,41 @@ constexpr int kB1  = kW1 + 1, kB2 = kW1 + 3;                 // plain (non-gated
                                                               // reading L[.. + kB1/kB2] MUST be guarded
                                                               // `if constexpr (!USE_GATED_FFN)` -- see the b1/b2
                                                               // pointer inits below, none may run unconditionally.
+// Relative-to-ffn_base FFN slot offsets (0 = first FFN slot), shared by BOTH layer shapes since the FFN
+// block itself (Wg/W1/W2 or W1/b1/W2/b2) never depends on whether the layer above it was attn or GDN.
+constexpr int kWgRel = 0;
+constexpr int kW1Rel = USE_GATED_FFN ? 1 : 0;
+constexpr int kB1Rel = kW1Rel + 1, kB2Rel = kW1Rel + 3;      // plain-FFN-only, same OUT-OF-BOUNDS caveat as kB1/kB2
+constexpr int kW2Rel = kW1Rel + (USE_GATED_FFN ? 1 : 2);
 constexpr int kLPer = 2 + 4 + (USE_QK_NORM ? 2 : 0) + (USE_GATED_FFN ? 3 : 4);  // params per transformer block
+                                                                                 // (an ATTENTION layer's width --
+                                                                                 // no longer every layer's width)
 // Leading params before the first block: tok_emb always, pos_emb only under absolute positions
 // (layout.hpp's HAS_POS_EMB -- RoPE omits the table entirely, which is what decouples SEQ_LEN from
 // the checkpoint). check_layer_offsets()'s static_assert below is the guard against this drifting.
 constexpr int kHead = sub0::HAS_POS_EMB ? 2 : 1;
-constexpr int layer_base(int l) { return kHead + kLPer * l; }
-constexpr int kFinalBase = kHead + kLPer * N_LAYERS;         // index of ln_f (tail block start)
+// Per-layer mixer-block width: kAttnSlots for a softmax-attention layer, kGdnSlots for a GDN one
+// (GDN_SCHEDULE.full_attn[l], the SAME compile-time schedule layout.hpp's own make_param_layout() and
+// backend_cpu.cpp's op_gdn dispatch already key off) -- plus the FFN block, whose width does NOT depend
+// on the mixer kind. At GDN_FULL_ATTN_STRIDE == 0 (every layer full_attn) this is kAttnSlots for every
+// l, so layer_slots/layer_base below degenerate EXACTLY to the old fixed-stride kLPer*l formula --
+// verified by check_layer_offsets()'s static_assert, not just asserted here.
+constexpr int layer_slots(int l) {
+    return (sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)] ? kAttnSlots : kGdnSlots)
+         + (USE_GATED_FFN ? 3 : 4);
+}
+constexpr int layer_base(int l) {
+    int b = kHead;
+    for (int i = 0; i < l; ++i) b += layer_slots(i);
+    return b;
+}
+// Per-layer FFN local base (add to layer_base(l) to reach kWgRel/kW1Rel/kW2Rel/kB1Rel/kB2Rel) --
+// the ONE place a caller that must work for BOTH layer shapes (forward_device) resolves the FFN block,
+// instead of the single global kFfnBase (still valid, but only for an attention-shaped layer).
+constexpr int ffn_base_for(int l) {
+    return sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)] ? kAttnSlots : kGdnSlots;
+}
+constexpr int kFinalBase = layer_base(N_LAYERS);             // index of ln_f (tail block start)
 constexpr int kLnF = 0, kLmHead = 1, kLmBias = 2;            // offsets within the tail block
 
 consteval bool check_layer_offsets() {
@@ -3151,20 +3205,30 @@ consteval bool check_layer_offsets() {
     const auto& Lc = sub0::PARAM_LAYOUT;
     for (int l = 0; l < N_LAYERS; ++l) {
         const int b = layer_base(l);
-        if (Lc[b + kLn1].kind != PKind::Ln1 || Lc[b + kLn2].kind != PKind::Ln2 ||
-            Lc[b + kWq].kind  != PKind::Wq  || Lc[b + kWk].kind  != PKind::Wk  ||
-            Lc[b + kWv].kind  != PKind::Wv  || Lc[b + kWo].kind  != PKind::Wo)
-            return false;
-        if constexpr (USE_QK_NORM) {
-            if (Lc[b + kQNorm].kind != PKind::QNorm || Lc[b + kKNorm].kind != PKind::KNorm) return false;
+        if (Lc[b + kLn1].kind != PKind::Ln1 || Lc[b + kLn2].kind != PKind::Ln2) return false;
+        if (sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+            if (Lc[b + kWq].kind  != PKind::Wq  || Lc[b + kWk].kind  != PKind::Wk  ||
+                Lc[b + kWv].kind  != PKind::Wv  || Lc[b + kWo].kind  != PKind::Wo)
+                return false;
+            if constexpr (USE_QK_NORM) {
+                if (Lc[b + kQNorm].kind != PKind::QNorm || Lc[b + kKNorm].kind != PKind::KNorm) return false;
+            }
+        } else {
+            if (Lc[b + kGdnQkv].kind != PKind::GdnInProjQkv || Lc[b + kGdnZ].kind != PKind::GdnInProjZ ||
+                Lc[b + kGdnB].kind   != PKind::GdnInProjB   || Lc[b + kGdnA].kind != PKind::GdnInProjA ||
+                Lc[b + kGdnConv].kind   != PKind::GdnConv   || Lc[b + kGdnALog].kind != PKind::GdnALog ||
+                Lc[b + kGdnDtBias].kind != PKind::GdnDtBias || Lc[b + kGdnNorm].kind != PKind::GdnNorm ||
+                Lc[b + kGdnOutProj].kind != PKind::GdnOutProj)
+                return false;
         }
+        const int fb = ffn_base_for(l);
         if constexpr (USE_GATED_FFN) {
-            if (Lc[b + kWg].kind != PKind::Wg || Lc[b + kW1].kind != PKind::W1 ||
-                Lc[b + kW2].kind != PKind::W2)
+            if (Lc[b + fb + kWgRel].kind != PKind::Wg || Lc[b + fb + kW1Rel].kind != PKind::W1 ||
+                Lc[b + fb + kW2Rel].kind != PKind::W2)
                 return false;
         } else {
-            if (Lc[b + kW1].kind != PKind::W1 || Lc[b + kB1].kind != PKind::B1 ||
-                Lc[b + kW2].kind != PKind::W2 || Lc[b + kB2].kind != PKind::B2)
+            if (Lc[b + fb + kW1Rel].kind != PKind::W1 || Lc[b + fb + kB1Rel].kind != PKind::B1 ||
+                Lc[b + fb + kW2Rel].kind != PKind::W2 || Lc[b + fb + kB2Rel].kind != PKind::B2)
                 return false;
         }
     }
@@ -3173,6 +3237,481 @@ consteval bool check_layer_offsets() {
 static_assert(check_layer_offsets(),
     "layer_base()/kLn1../kFinalBase drifted from the real PARAM_LAYOUT table -- update the constants "
     "above to match make_param_layout() in layout.hpp.");
+// At GDN_FULL_ATTN_STRIDE == 0 layer_slots(l) == kLPer for every l (GDN_SCHEDULE.full_attn[l] is always
+// true there), so the new cumulative layer_base must reproduce the old fixed-stride formula exactly --
+// pinning this is what makes "every OTHER function's untouched kFfnBase/kWg/kW1/.. arithmetic is still
+// correct at neutral" a proven fact rather than an assumption.
+static_assert(GDN_FULL_ATTN_STRIDE != 0 || layer_base(N_LAYERS > 0 ? N_LAYERS - 1 : 0) ==
+                                            kHead + kLPer * (N_LAYERS > 0 ? N_LAYERS - 1 : 0),
+    "layer_base() must degenerate to the old fixed-stride formula when GDN is off");
+
+// ============================================================================
+//  Gated DeltaNet -- CUDA FORWARD (docs/GATED_DELTANET.md Stage 3). NO backward, NO decode: see the
+//  hard-refusal guards on forward_train/backward_device/forward_one_device/forward_one_device_graphed
+//  and the caps flip in device_backend.hpp. This section implements the CHUNKED-PARALLEL form
+//  (`torch_chunk_gated_delta_rule`, transformers==5.16.1, re-fetched and re-verified directly for this
+//  stage -- see the numpy/torch decomposition check this port was validated against before any CUDA was
+//  written), NOT a straight re-run of Stage 1's sequential CPU recurrence (include/sub0/gdn_math.hpp) --
+//  per docs/GATED_DELTANET.md S5 step 3, the sequential form's benefit does not transfer to a GPU: the
+//  chunked form's actual value is parallelizing across the C=64 positions of a chunk via dense
+//  matmul-shaped work, which is exactly what this port does (decoupled into the two phases below).
+//  Primary correctness gate (S5 step 3's own instruction): exact numerical parity against gdn_math.hpp's
+//  forward() (Stage 1's sequential CPU reference), NOT a fresh comparison against the Python fixtures --
+//  see sub0_cuda_gdn_check below and its cuda_tests.cpp caller. Secondary gate: the real Qwen4-preview
+//  fixtures (tests/fixtures/qwen4_preview/gdn_layer0_small_*), a stronger oracle since the ACTUAL
+//  reference model runs the chunked form Stage 1 could only reach transitively (T=6, one chunk).
+//
+//  ALGORITHM, decomposed into two phases at the reference's own natural boundary (verified against the
+//  REAL torch_chunk_gated_delta_rule, float64 host-side, before any CUDA was written -- see the
+//  decomposition check run for this stage): decay_mask / the WY-inverted intra-chunk `attn` / value' /
+//  k_cumdecay depend ONLY on their own chunk (never on another chunk, despite chunk_size=64 being fixed
+//  by the reference regardless of this project's own SEQ_LEN) -- Phase A below computes all of these,
+//  fully parallel across (batch, v-head, chunk). Only the SECOND loop in the reference (last_recurrent_
+//  state / attn_inter / core_attn_out) has a genuine chunk-to-chunk sequential dependency -- Phase B
+//  below, one kernel launch per chunk index from a host for-loop (parallel across batch/v-head within
+//  each launch; sequential ACROSS launches, which is the recurrence's own real structure, not an
+//  implementation compromise).
+//
+//  Precision/perf posture, explicit rather than assumed: this port is plain FP32 throughout (reads
+//  weights straight out of g_dev_params via ordinary launch_linear GEMMs, no bf16 mirror, no tensor-core
+//  path) and uses NO shared-memory tiling for the O(chunk*dim) matrices in Phase A/B (only the small
+//  [64,64] WY-inversion matrix and the [dk,dv] recurrent state are block-shared) -- a deliberate
+//  correctness-first simplification (AGENTS.md S5/S6: verify against reference before perf), not a
+//  claim this is fast. A follow-up perf pass (bf16 activations, shared-memory tiling for the per-chunk
+//  GEMMs) is real future work, not attempted this stage.
+//
+//  Runtime (not compile-time) dims throughout, exactly like gdn_math.hpp's own Dims-taking forward() --
+//  needed because the standalone fixture-parity test below must run at the REAL Qwen4-preview fixture's
+//  own shape (head_k_dim=head_v_dim=128, hidden_size=32, num_v_heads=3 -- NOT this project's own
+//  D_MODEL==N_HEADS*D_HEAD-conforming shape, see docs/GATED_DELTANET.md S3b's flagged mismatch), which a
+//  compile-time-dims kernel could never serve. The in-Model dispatch (gdn_forward_device's caller in
+//  forward_device) passes sub0::GDN_DIMS (this build's own compiled dims) through the exact same runtime
+//  path -- one kernel set, two callers, matching gdn_math.hpp's own "one function, many callers" shape.
+constexpr int GDN_CHUNK = 64;              // torch_chunk_gated_delta_rule's own default chunk_size,
+                                           // confirmed NOT overridden by Qwen4ExpTextGatedDeltaNet.forward
+                                           // (re-fetched directly, AGENTS.md S5) -- a real constant of the
+                                           // reference, not a knob this project introduces.
+constexpr int GDN_CUDA_MAX_HDIM = 160;     // generous per-thread local-array bound for dk/dv (real model:
+                                           // 128; matches gdn_math.hpp's own float[256]-style convention,
+                                           // scaled down since chunk-local buffers are index-heavy already)
+
+__device__ __forceinline__ float gdn_silu_dev(float x) { return x / (1.f + __expf(-x)); }
+__device__ __forceinline__ float gdn_sigmoid_dev(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ float gdn_softplus_dev(float x) {
+    return log1pf(__expf(-fabsf(x))) + fmaxf(x, 0.f);
+}
+
+// Causal depthwise conv1d (per (batch,channel), sequential over T -- O(T*K), K=GDN_CONV_KERNEL=4) + SiLU.
+// One thread per (b,c); `pre`/`post` are [batch*T, conv_dim]. Fresh-window convention (docs/GATED_
+// DELTANET.md S2, matching gdn_math.hpp's forward(): conv_hist is always zero here -- a batched forward
+// call, never decode) -- virtual[i] for i < K-1 is 0, matching F.conv1d(padding=K-1)'s left zero-pad.
+__global__ void gdn_conv_silu_kernel(const float* __restrict__ pre, float* __restrict__ post,
+                                     const float* __restrict__ conv_w,
+                                     int batch, int T, int conv_dim, int K) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * conv_dim) return;
+    const int b = idx / conv_dim, c = idx % conv_dim;
+    const float* w = conv_w + static_cast<size_t>(c) * K;
+    for (int t = 0; t < T; ++t) {
+        float s = 0.f;
+        for (int k = 0; k < K; ++k) {
+            const int vidx = t + k - (K - 1);
+            const float val = (vidx < 0) ? 0.f : pre[(static_cast<size_t>(b) * T + vidx) * conv_dim + c];
+            s += w[k] * val;
+        }
+        post[(static_cast<size_t>(b) * T + t) * conv_dim + c] = gdn_silu_dev(s);
+    }
+}
+
+// beta = sigmoid(b_proj); glog (log-decay alpha_t) = -exp(A_log)*softplus(a_proj + dt_bias). One thread
+// per (row, v-head). `bproj`/`aproj`/`beta`/`glog` are [M, Hv]; `a_log`/`dt_bias` are [Hv].
+__global__ void gdn_gates_kernel(const float* __restrict__ bproj, const float* __restrict__ aproj,
+                                 const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                 float* __restrict__ beta, float* __restrict__ glog, int M, int Hv) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * Hv) return;
+    const int hh = idx % Hv;
+    beta[idx] = gdn_sigmoid_dev(bproj[idx]);
+    glog[idx] = -__expf(a_log[hh]) * gdn_softplus_dev(aproj[idx] + dt_bias[hh]);
+}
+
+// L2-norm(+1/sqrt(dk) scale for Q) of the post-conv Q/K sub-blocks, with the num_v_heads/num_k_heads
+// repeat_interleave broadcast (S1b: Q/K normalized ONCE per physical k-head, then duplicated -- every
+// v-head in a k-head's `rep` group reads the SAME normalized vector, since normalizing before or after
+// duplication is identical). One thread per (row, physical k-head); writes `rep` copies into the
+// per-v-head qn/kn buffers, [M, Hv, dk]. `post` is [M, conv_dim] (q_off=0, k_off=key_dim).
+__global__ void gdn_qknorm_kernel(const float* __restrict__ post, float* __restrict__ qn, float* __restrict__ kn,
+                                  int M, int Hk, int rep, int dk, int conv_dim, int key_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * Hk) return;
+    const int row = idx / Hk, hk = idx % Hk;
+    const float* qraw = post + static_cast<size_t>(row) * conv_dim + hk * dk;
+    const float* kraw = post + static_cast<size_t>(row) * conv_dim + key_dim + hk * dk;
+    float qss = 0.f, kss = 0.f;
+    for (int a = 0; a < dk; ++a) { qss += qraw[a] * qraw[a]; kss += kraw[a] * kraw[a]; }
+    const float L2_EPS = 1e-6f;
+    const float qinv = rsqrtf(qss + L2_EPS), kinv = rsqrtf(kss + L2_EPS);
+    const float qscale = qinv * rsqrtf(static_cast<float>(dk));
+    const int Hv = Hk * rep;
+    for (int r = 0; r < rep; ++r) {
+        const int hv = hk * rep + r;
+        float* qo = qn + (static_cast<size_t>(row) * Hv + hv) * dk;
+        float* ko = kn + (static_cast<size_t>(row) * Hv + hv) * dk;
+        for (int a = 0; a < dk; ++a) { qo[a] = qraw[a] * qscale; ko[a] = kraw[a] * kinv; }
+    }
+}
+
+// Flat-index helpers into the [batch, Hv, nChunks, GDN_CHUNK, dim] scratch tensors -- one place so
+// Phase A's writes and Phase B's reads can never drift out of step with each other.
+__device__ __forceinline__ size_t gdn_chunk_idx(int b, int hv, int c, int i, int j, int Hv, int nC, int dim) {
+    return ((((static_cast<size_t>(b) * Hv + hv) * nC + c) * GDN_CHUNK + i) * dim) + j;
+}
+__device__ __forceinline__ size_t gdn_mask_idx(int b, int hv, int c, int i, int j, int Hv, int nC) {
+    return ((((static_cast<size_t>(b) * Hv + hv) * nC + c) * GDN_CHUNK + i) * GDN_CHUNK) + j;
+}
+__device__ __forceinline__ size_t gdn_gcum_idx(int b, int hv, int c, int i, int Hv, int nC) {
+    return (((static_cast<size_t>(b) * Hv + hv) * nC + c) * GDN_CHUNK) + i;
+}
+
+// PHASE A -- fully parallel across (batch, v-head, chunk): decay_mask, the WY-inverted intra-chunk
+// `attn` (Winv below, so as not to collide with Phase B's differently-defined `attn`), value' =
+// Winv @ v_beta, k_cumdecay = Winv @ (k_beta * exp(gcum)). One block per (b, hv, c); GDN_CHUNK=64
+// threads, one per intra-chunk position `i`. Positions past T (the last chunk's padding, since
+// chunk_size=64 is fixed regardless of T) are treated as the reference's own F.pad(...,value=0) would:
+// beta=glog=0 there (read as 0 below, `qn`/`kn`/`post` are never read out of THIS batch item's [0,T)
+// row range) -- worked through explicitly in this stage's design notes: a padded row's own raw attn0
+// row is identically zero (beta_i=0 zeroes k_beta_i), so its WY-updated row stays zero too, its
+// value'/k_cumdecay are zero, and it therefore contributes nothing to Phase B's state update either --
+// no separate padding special-case needed anywhere past this kernel.
+__global__ void gdn_phaseA_kernel(const float* __restrict__ kn, const float* __restrict__ post,
+                                  const float* __restrict__ beta, const float* __restrict__ glog,
+                                  float* __restrict__ decay_mask_out, float* __restrict__ gcum_out,
+                                  float* __restrict__ value_new_out, float* __restrict__ k_cumdecay_out,
+                                  int batch, int T, int Hv, int dk, int dv, int conv_dim, int v_off,
+                                  int nC) {
+    const int b = blockIdx.x, hv = blockIdx.y, c = blockIdx.z;
+    const int i = threadIdx.x;   // 0..GDN_CHUNK-1
+    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK];
+    __shared__ float s_gcum[GDN_CHUNK];
+    __shared__ float s_row_old[GDN_CHUNK];
+    const int t_i = c * GDN_CHUNK + i;
+    if (i == 0) {   // serial prefix-sum over 64 elements -- trivial cost, avoids a parallel-scan kernel
+        float acc = 0.f;
+        for (int j = 0; j < GDN_CHUNK; ++j) {
+            const int tj = c * GDN_CHUNK + j;
+            const float gj = (tj < T) ? glog[static_cast<size_t>(b) * T * Hv + static_cast<size_t>(tj) * Hv + hv] : 0.f;
+            acc += gj;
+            s_gcum[j] = acc;
+        }
+    }
+    __syncthreads();
+    const float gcum_i = s_gcum[i];
+    const float beta_i = (t_i < T) ? beta[static_cast<size_t>(b) * T * Hv + static_cast<size_t>(t_i) * Hv + hv] : 0.f;
+    // attn0 row i: strictly lower triangular, attn0[i][j] = -(beta_i * k_i . k_j) * exp(gcum_i - gcum_j)
+    // for j < i, else 0 (masked_fill(triu(diag=0), 0) in the reference).
+    for (int j = 0; j < GDN_CHUNK; ++j) {
+        if (j < i) {
+            const int tj = c * GDN_CHUNK + j;
+            float dot = 0.f;
+            if (t_i < T && tj < T) {
+                const float* ki = kn + (static_cast<size_t>(b) * T + t_i) * Hv * dk + static_cast<size_t>(hv) * dk;
+                const float* kj = kn + (static_cast<size_t>(b) * T + tj) * Hv * dk + static_cast<size_t>(hv) * dk;
+                for (int a = 0; a < dk; ++a) dot += ki[a] * kj[a];
+            }
+            s_attn[i][j] = -(dot * beta_i) * __expf(gcum_i - s_gcum[j]);
+        } else {
+            s_attn[i][j] = 0.f;
+        }
+    }
+    __syncthreads();
+    // WY (forward-substitution) inversion of the strictly-lower attn0, sequential over ii=1..63 --
+    // torch_chunk_gated_delta_rule's own `for i in range(1, chunk_size): attn[i,:i] = row + (row*sub).sum`
+    // loop, ported verbatim (this project's own numpy/torch decomposition check verified this exact
+    // per-step update against the real reference before any CUDA was written). Buffered through
+    // s_row_old so no thread reads a row entry another thread is concurrently overwriting this step.
+    for (int ii = 1; ii < GDN_CHUNK; ++ii) {
+        if (i < ii) s_row_old[i] = s_attn[ii][i];
+        __syncthreads();
+        if (i < ii) {
+            float sum = 0.f;
+            for (int m = 0; m < ii; ++m) sum += s_row_old[m] * s_attn[m][i];
+            s_attn[ii][i] = s_row_old[i] + sum;
+        }
+        __syncthreads();
+    }
+    s_attn[i][i] += 1.f;   // `attn = attn + eye`
+    __syncthreads();
+    // Write decay_mask (a DIFFERENT tensor from s_attn -- Phase B recomputes its own dense q@k^T*decay_mask,
+    // not this WY-inverted one) and gcum for Phase B's reuse.
+    for (int j = 0; j <= i; ++j)
+        decay_mask_out[gdn_mask_idx(b, hv, c, i, j, Hv, nC)] = __expf(gcum_i - s_gcum[j]);
+    for (int j = i + 1; j < GDN_CHUNK; ++j) decay_mask_out[gdn_mask_idx(b, hv, c, i, j, Hv, nC)] = 0.f;
+    gcum_out[gdn_gcum_idx(b, hv, c, i, Hv, nC)] = gcum_i;
+    // value_new[i,:] = sum_{j<=i} Winv[i][j] * v_beta[j,:] ; k_cumdecay[i,:] = sum_{j<=i} Winv[i][j] *
+    // k_beta[j,:] * exp(gcum_j). attn is lower-triangular (incl. diag) by construction, so j<=i suffices.
+    float vacc[GDN_CUDA_MAX_HDIM], kacc[GDN_CUDA_MAX_HDIM];
+    for (int j = 0; j < dv; ++j) vacc[j] = 0.f;
+    for (int j = 0; j < dk; ++j) kacc[j] = 0.f;
+    for (int j = 0; j <= i; ++j) {
+        const float wij = s_attn[i][j];
+        if (wij == 0.f) continue;
+        const int tj = c * GDN_CHUNK + j;
+        if (tj >= T) continue;   // beta_j==0 there anyway (v_beta/k_beta vanish) -- skip the dead read
+        const float betaj = beta[static_cast<size_t>(b) * T * Hv + static_cast<size_t>(tj) * Hv + hv];
+        const float gexpj = __expf(s_gcum[j]);
+        const float* vj = post + (static_cast<size_t>(b) * T + tj) * conv_dim + v_off + hv * dv;
+        const float* kj = kn + (static_cast<size_t>(b) * T + tj) * Hv * dk + static_cast<size_t>(hv) * dk;
+        for (int a = 0; a < dv; ++a) vacc[a] += wij * (vj[a] * betaj);
+        for (int a = 0; a < dk; ++a) kacc[a] += wij * (kj[a] * betaj * gexpj);
+    }
+    for (int a = 0; a < dv; ++a) value_new_out[gdn_chunk_idx(b, hv, c, i, a, Hv, nC, dv)] = vacc[a];
+    for (int a = 0; a < dk; ++a) k_cumdecay_out[gdn_chunk_idx(b, hv, c, i, a, Hv, nC, dk)] = kacc[a];
+}
+
+// PHASE B -- ONE chunk index `c` per launch (host for-loop over c=0..nC-1: genuinely sequential, this
+// IS the recurrence's real cross-chunk dependency, not an implementation artefact -- S5 step 3), grid
+// (batch, Hv), GDN_CHUNK threads. Reads Phase A's decay_mask/value_new/k_cumdecay for this chunk, updates
+// `last_state` [batch,Hv,dk,dv] in place, and writes core_out[M,Hv,dv] (the pre-RMSNormGated
+// `core_attn_out`).
+//
+// Deliberately NO shared-memory caching of `last_state`/`v_new` here (an earlier version cached both in
+// dynamic __shared__ memory -- at the real fixture's dk=dv=128 shape that needs ~96KB, ABOVE this
+// project's actual GPU's real per-block shared-memory ceiling; the raising cudaFuncSetAttribute call
+// failed, silently, because its return value went unchecked, and the kernel launch that followed then
+// itself failed silently too -- caught by this stage's own sub0_cuda_gdn_check test, which is exactly
+// why that test exists per AGENTS.md S6). Every thread instead reads `last_state`/`v_new_scratch`
+// straight from GLOBAL memory -- redundant bandwidth (every thread re-reads the same [dk,dv] state), not
+// a correctness compromise: this section's header comment on this file's overall precision/perf posture
+// already flags "no shared-memory tiling" as a deliberate correctness-first simplification, and this is
+// the same choice, just also sidestepping a real device-shared-memory-limit hazard rather than working
+// around it with a fragile size-dependent opt-in. `v_new_scratch` is `[batch,Hv,GDN_CHUNK,dv]`
+// (reused every chunk -- only the CURRENT chunk's values are ever live at once, since chunks are
+// processed strictly sequentially by this same host for-loop).
+__global__ void gdn_phaseB_kernel(const float* __restrict__ qn, const float* __restrict__ kn,
+                                  const float* __restrict__ decay_mask, const float* __restrict__ gcum,
+                                  const float* __restrict__ value_new, const float* __restrict__ k_cumdecay,
+                                  float* __restrict__ last_state, float* __restrict__ v_new_scratch,
+                                  float* __restrict__ core_out,
+                                  int batch, int T, int Hv, int dk, int dv, int nC, int c) {
+    const int b = blockIdx.x, hv = blockIdx.y;
+    const int i = threadIdx.x;
+    float* const S = last_state + (static_cast<size_t>(b) * Hv + hv) * dk * dv;               // [dk,dv]
+    float* const v_new = v_new_scratch + (static_cast<size_t>(b) * Hv + hv) * GDN_CHUNK * dv;  // [GDN_CHUNK,dv]
+
+    const int t_i = c * GDN_CHUNK + i;
+    // v_new[i,:] = value_new[i,:] - k_cumdecay[i,:] @ S  (v_prime)
+    {
+        float acc[GDN_CUDA_MAX_HDIM];
+        for (int j = 0; j < dv; ++j) acc[j] = 0.f;
+        for (int a = 0; a < dk; ++a) {
+            const float kc = k_cumdecay[gdn_chunk_idx(b, hv, c, i, a, Hv, nC, dk)];
+            const float* Sr = S + static_cast<size_t>(a) * dv;
+            for (int j = 0; j < dv; ++j) acc[j] += kc * Sr[j];
+        }
+        for (int j = 0; j < dv; ++j)
+            v_new[i * dv + j] = value_new[gdn_chunk_idx(b, hv, c, i, j, Hv, nC, dv)] - acc[j];
+    }
+    __syncthreads();   // every thread's v_new[i,:] write must land before any thread reads v_new[j,:], j!=i
+
+    // core_out[i,:] = exp(gcum_i) * (q_i @ S)  +  sum_{j<=i} (q_i . k_j) * decay_mask[i][j] * v_new[j,:]
+    if (t_i < T) {
+        const float gcum_i = gcum[gdn_gcum_idx(b, hv, c, i, Hv, nC)];
+        const float* qi = qn + (static_cast<size_t>(b) * T + t_i) * Hv * dk + static_cast<size_t>(hv) * dk;
+        float acc[GDN_CUDA_MAX_HDIM];
+        for (int j = 0; j < dv; ++j) acc[j] = 0.f;
+        const float gexp_i = __expf(gcum_i);
+        for (int a = 0; a < dk; ++a) {
+            const float qa = qi[a] * gexp_i;
+            const float* Sr = S + static_cast<size_t>(a) * dv;
+            for (int j = 0; j < dv; ++j) acc[j] += qa * Sr[j];
+        }
+        for (int j = 0; j <= i; ++j) {
+            const int tj = c * GDN_CHUNK + j;
+            float dot = 0.f;
+            if (tj < T) {   // else k_j == 0 (padding) -- contributes nothing, skip the dead read
+                const float* kj = kn + (static_cast<size_t>(b) * T + tj) * Hv * dk + static_cast<size_t>(hv) * dk;
+                for (int a = 0; a < dk; ++a) dot += qi[a] * kj[a];
+            }
+            const float w = dot * decay_mask[gdn_mask_idx(b, hv, c, i, j, Hv, nC)];
+            if (w == 0.f) continue;
+            for (int a = 0; a < dv; ++a) acc[a] += w * v_new[j * dv + a];
+        }
+        float* out = core_out + (static_cast<size_t>(b) * T + t_i) * Hv * dv + static_cast<size_t>(hv) * dv;
+        for (int a = 0; a < dv; ++a) out[a] = acc[a];
+    }
+    __syncthreads();   // every read of the OLD S above must land before the update below overwrites it
+
+    // State update: last_state = last_state*exp(g_last) + (k_i * exp(g_last - gcum_i))^T @ v_new, summed
+    // over ALL GDN_CHUNK positions (including this chunk's own padding tail, which -- per this kernel's
+    // header comment -- contributes exactly zero via v_new/k_i both vanishing there, matching the
+    // reference's own zero-padding semantics without a separate special case).
+    {
+        const float g_last = gcum[gdn_gcum_idx(b, hv, c, GDN_CHUNK - 1, Hv, nC)];
+        for (int idx = i; idx < dk * dv; idx += GDN_CHUNK) {
+            const int a = idx / dv, j = idx % dv;
+            float sum = 0.f;
+            for (int p = 0; p < GDN_CHUNK; ++p) {
+                const int tp = c * GDN_CHUNK + p;
+                if (tp >= T) continue;
+                const float gp = gcum[gdn_gcum_idx(b, hv, c, p, Hv, nC)];
+                const float kp = kn[(static_cast<size_t>(b) * T + tp) * Hv * dk + static_cast<size_t>(hv) * dk + a];
+                sum += kp * __expf(g_last - gp) * v_new[p * dv + j];
+            }
+            S[idx] = S[idx] * __expf(g_last) + sum;   // S aliases last_state directly -- no copy-back needed
+        }
+    }
+}
+
+// RMSNormGated (S1c): out[t,hh,:] = norm_w * (core/rms(core)) * sigmoid(z), per (row, v-head) group of
+// width dv, norm_w SHARED across heads ([dv], not [Hv*dv] -- see layout.hpp's GdnNorm comment). One
+// thread per (row, v-head). `core`/`z` are [M,Hv,dv]-shaped (z reshaped from [M,value_dim] by the same
+// hv*dv stride); `gated_out` is [M, value_dim] (== [M, Hv*dv]), ready for out_proj's launch_linear.
+__global__ void gdn_rmsnorm_gated_kernel(const float* __restrict__ core, const float* __restrict__ z,
+                                         const float* __restrict__ norm_w, float* __restrict__ gated_out,
+                                         int M, int Hv, int dv) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * Hv) return;
+    const int row = idx / Hv, hh = idx % Hv;
+    const float* cv = core + (static_cast<size_t>(row) * Hv + hh) * dv;
+    const float* zv = z    + (static_cast<size_t>(row) * Hv + hh) * dv;
+    float ms = 0.f;
+    for (int j = 0; j < dv; ++j) ms += cv[j] * cv[j];
+    ms /= static_cast<float>(dv);
+    const float rinv = rsqrtf(ms + 1e-6f);
+    float* out = gated_out + static_cast<size_t>(row) * (Hv * dv) + hh * dv;
+    for (int j = 0; j < dv; ++j) out[j] = norm_w[j] * (cv[j] * rinv) * gdn_sigmoid_dev(zv[j]);
+}
+
+// Device-side scratch a single gdn_forward_device() call needs, sized by the caller (gdn_alloc_scratch
+// below) for a given (max_rows, max_batch, dims) ceiling. Every pointer is plain FP32 device memory --
+// see this section's header comment on the deliberate no-bf16-mirror, no-shared-tiling posture.
+struct GdnDeviceScratch {
+    float* qkv_pre = nullptr, *qkv_post = nullptr;      // [rows, conv_dim]
+    float* bproj = nullptr, *aproj = nullptr;           // [rows, Hv]
+    float* zproj = nullptr;                             // [rows, value_dim]
+    float* beta = nullptr, *glog = nullptr;             // [rows, Hv]
+    float* qn = nullptr, *kn = nullptr;                 // [rows, Hv, dk]
+    float* decay_mask = nullptr;                        // [batch, Hv, nC, 64, 64]
+    float* gcum = nullptr;                              // [batch, Hv, nC, 64]
+    float* value_new = nullptr;                         // [batch, Hv, nC, 64, dv]
+    float* k_cumdecay = nullptr;                        // [batch, Hv, nC, 64, dk]
+    float* last_state = nullptr;                        // [batch, Hv, dk, dv]
+    float* v_new_scratch = nullptr;                     // [batch, Hv, GDN_CHUNK, dv] -- Phase B's own
+                                                         // scratch, reused every chunk (see that kernel's comment)
+    float* core_out = nullptr;                          // [rows, Hv, dv]
+    float* gated = nullptr;                             // [rows, value_dim]
+};
+
+// Batched Gated DeltaNet forward, chunked-parallel form, over `batch` independent windows of `T`
+// positions each (state resets to zero per window -- docs/GATED_DELTANET.md S2's training/batched-
+// forward convention, matching gdn_math.hpp's own transient-scratch forward()). `x` is [batch*T,
+// d.hidden_size]; `out` is [batch*T, d.hidden_size] (OVERWRITTEN, not accumulated -- caller adds the
+// residual, mirroring every other mixer block in forward_device). Weight layout: this project's own
+// [rows=in,cols=out] convention throughout, identical to gdn_math.hpp's forward() -- see that file's
+// header comment for the explicit re-derivation from the fixture's raw PyTorch [out,in] files.
+void gdn_forward_device(const sub0::gdn::Dims& d, int batch, int T,
+                        const float* x,
+                        const float* w_qkv, const float* w_z, const float* w_b, const float* w_a,
+                        const float* conv_w, const float* dt_bias, const float* a_log, const float* norm_w,
+                        const float* w_out,
+                        float* out, GdnDeviceScratch& s) {
+    const int hs = d.hidden_size, key_dim = d.key_dim(), value_dim = d.value_dim(), conv_dim = d.conv_dim();
+    const int K = d.conv_kernel, Hk = d.num_k_heads, Hv = d.num_v_heads, rep = d.rep();
+    const int dk = d.head_k_dim, dv = d.head_v_dim;
+    const int M = batch * T;
+    const int nC = (T + GDN_CHUNK - 1) / GDN_CHUNK;
+    const int v_off = 2 * key_dim;
+
+    launch_linear(x, w_qkv, nullptr, s.qkv_pre, M, hs, conv_dim);
+    launch_linear(x, w_z,   nullptr, s.zproj,   M, hs, value_dim);
+    launch_linear(x, w_b,   nullptr, s.bproj,   M, hs, Hv);
+    launch_linear(x, w_a,   nullptr, s.aproj,   M, hs, Hv);
+    {
+        const int n = batch * conv_dim, block = 128, grid = (n + block - 1) / block;
+        gdn_conv_silu_kernel<<<grid, block, 0, g_stream>>>(s.qkv_pre, s.qkv_post, conv_w, batch, T, conv_dim, K);
+    }
+    {
+        const int n = M * Hv, block = 128, grid = (n + block - 1) / block;
+        gdn_gates_kernel<<<grid, block, 0, g_stream>>>(s.bproj, s.aproj, a_log, dt_bias, s.beta, s.glog, M, Hv);
+    }
+    {
+        const int n = M * Hk, block = 128, grid = (n + block - 1) / block;
+        gdn_qknorm_kernel<<<grid, block, 0, g_stream>>>(s.qkv_post, s.qn, s.kn, M, Hk, rep, dk, conv_dim, key_dim);
+    }
+    SUB0_CUDA_CHECK_VOID(cudaMemsetAsync(s.last_state, 0, static_cast<size_t>(batch) * Hv * dk * dv * sizeof(float), g_stream));
+    {
+        const dim3 grid(batch, Hv, nC);
+        gdn_phaseA_kernel<<<grid, GDN_CHUNK, 0, g_stream>>>(
+            s.kn, s.qkv_post, s.beta, s.glog, s.decay_mask, s.gcum, s.value_new, s.k_cumdecay,
+            batch, T, Hv, dk, dv, conv_dim, v_off, nC);
+    }
+    {
+        const dim3 grid(batch, Hv);
+        for (int c = 0; c < nC; ++c)
+            gdn_phaseB_kernel<<<grid, GDN_CHUNK, 0, g_stream>>>(
+                s.qn, s.kn, s.decay_mask, s.gcum, s.value_new, s.k_cumdecay, s.last_state, s.v_new_scratch,
+                s.core_out, batch, T, Hv, dk, dv, nC, c);
+    }
+    {
+        const int n = M * Hv, block = 128, grid = (n + block - 1) / block;
+        gdn_rmsnorm_gated_kernel<<<grid, block, 0, g_stream>>>(s.core_out, s.zproj, norm_w, s.gated, M, Hv, dv);
+    }
+    launch_linear(s.gated, w_out, nullptr, out, M, value_dim, hs);
+}
+
+// Allocate a GdnDeviceScratch big enough for `max_rows` (== max batch*T this call will ever be asked to
+// serve), `max_batch`, and `max_T` (the LARGEST single window length any call will use -- needed
+// separately from max_rows/max_batch because the per-chunk buffers scale with ceil(max_T/GDN_CHUNK), not
+// with the row PRODUCT), at dims `d`. Returns 0 ok. Caller frees with gdn_free_scratch.
+int gdn_alloc_scratch(GdnDeviceScratch& s, const sub0::gdn::Dims& d, int max_rows, int max_batch, int max_T) {
+    const int conv_dim = d.conv_dim(), value_dim = d.value_dim(), Hv = d.num_v_heads;
+    const int dk = d.head_k_dim, dv = d.head_v_dim;
+    const int nC = (max_T + GDN_CHUNK - 1) / GDN_CHUNK;
+    const size_t R = static_cast<size_t>(max_rows), B = static_cast<size_t>(max_batch);
+    SUB0_CUDA_CHECK(cudaMalloc(&s.qkv_pre,  R * conv_dim * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.qkv_post, R * conv_dim * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.bproj,    R * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.aproj,    R * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.zproj,    R * value_dim * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.beta,     R * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.glog,     R * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.qn,       R * Hv * dk * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.kn,       R * Hv * dk * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.decay_mask,  B * Hv * nC * GDN_CHUNK * GDN_CHUNK * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.gcum,        B * Hv * nC * GDN_CHUNK * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.value_new,   B * Hv * nC * GDN_CHUNK * dv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.k_cumdecay,  B * Hv * nC * GDN_CHUNK * dk * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.last_state,  B * Hv * dk * dv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.v_new_scratch, B * Hv * GDN_CHUNK * dv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.core_out, R * Hv * dv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.gated,    R * value_dim * sizeof(float)));
+    return 0;
+}
+void gdn_free_scratch(GdnDeviceScratch& s) {
+    cudaFree(s.qkv_pre); cudaFree(s.qkv_post); cudaFree(s.bproj); cudaFree(s.aproj); cudaFree(s.zproj);
+    cudaFree(s.beta); cudaFree(s.glog); cudaFree(s.qn); cudaFree(s.kn); cudaFree(s.decay_mask);
+    cudaFree(s.gcum); cudaFree(s.value_new); cudaFree(s.k_cumdecay); cudaFree(s.last_state);
+    cudaFree(s.v_new_scratch); cudaFree(s.core_out); cudaFree(s.gated);
+    s = GdnDeviceScratch{};
+}
+
+// Resident scratch for the IN-MODEL GDN layers (forward_device only -- see this section's header
+// comment), sized to this build's own compiled sub0::GDN_DIMS and whatever (rows, batch) fwd_alloc's own
+// grow-on-demand just (re)sized to -- tied directly to fwd_alloc/fwd_free_batch's own lifecycle below
+// (freed-then-regrown alongside every other batch-dependent forward buffer, never independently). A
+// no-op when USE_GATED_DELTANET is off, matching the zero-cost-when-off convention every other opt-in
+// axis in this file follows.
+GdnDeviceScratch g_gdn;
+bool g_gdn_alloc = false;
+int gdn_model_scratch_alloc(int rows, int batch, int T) {
+    if constexpr (!sub0::USE_GATED_DELTANET) return 0;
+    if (gdn_alloc_scratch(g_gdn, sub0::GDN_DIMS, rows, batch, T)) return 1;
+    g_gdn_alloc = true;
+    return 0;
+}
+void gdn_model_scratch_free() {
+    if (g_gdn_alloc) { gdn_free_scratch(g_gdn); g_gdn_alloc = false; }
+}
 
 // The fused-buffer kernels above are templated on their OWN head counts (H/KVH/DH) so the dims-
 // independent self-test can instantiate toy shapes in this same binary, which means they re-derive
@@ -3225,6 +3764,19 @@ void forward_one_device(int id, int pos) {
         std::fprintf(stderr, "fatal: CUDA single-token decode does not implement depth attention "
                              "(DEPTH_ATTN_STRIDE=%d); use the CPU backend for gen, or extend "
                              "forward_one_device (TODO(depth-attn-decode)).\n", DEPTH_ATTN_STRIDE);
+        std::abort();
+    }
+    // Gated DeltaNet (docs/GATED_DELTANET.md Stage 3): CUDA implements the CHUNKED-parallel forward only
+    // (forward_device -- batched training-shaped/inference forward), which needs a whole chunk (64
+    // positions) of context per state update and has no single-token form here. Refusing loudly here is
+    // the same "should never be reached" defense the extern-level guards (sub0_cuda_kv_reset /
+    // sub0_cuda_forward_one) already provide one layer up -- this is the internal function those calls
+    // funnel into, reached only if that guard were ever bypassed.
+    if constexpr (sub0::USE_GATED_DELTANET) {
+        std::fprintf(stderr, "fatal: CUDA single-token decode does not implement Gated DeltaNet "
+                             "(GDN_FULL_ATTN_STRIDE=%d); use the CPU backend for gen "
+                             "(docs/GATED_DELTANET.md Stage 3 is CUDA forward-only, batched, no decode).\n",
+                             GDN_FULL_ATTN_STRIDE);
         std::abort();
     }
     const auto&  L  = sub0::PARAM_LAYOUT;
@@ -3429,34 +3981,52 @@ void forward_device(int batch, int T) {
         const int    b0  = layer_base(l);
         const float* ln1 = base + L[b0 + kLn1].off;
         const float* ln2 = base + L[b0 + kLn2].off;
-        const float* Wo  = base + L[b0 + kWo].off;
-        const float* W1  = base + L[b0 + kW1].off;
-        const float* W2  = base + L[b0 + kW2].off;
+
+        launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1) -- mixer input, either kind
+        // GDN_SCHEDULE.full_attn[l] dispatch (docs/GATED_DELTANET.md Stage 3): a softmax-attention layer
+        // runs the EXACT pre-existing path below; a GDN layer runs gdn_forward_device instead, writing
+        // its mixer output into the SAME `proj` buffer attention's own Wo-projection writes into -- the
+        // residual add right after this branch is byte-identical code for either kind. At
+        // GDN_FULL_ATTN_STRIDE == 0 GDN_SCHEDULE.full_attn[l] is true for every l, so this `if` always
+        // takes the attention arm and the `else`'s body (guarded `if constexpr (USE_GATED_DELTANET)`,
+        // always false there) generates no device code at all -- a strict no-op at neutral.
+        if (sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+            const float* Wo  = base + L[b0 + kWo].off;
+            [[maybe_unused]] const float* qgamma = nullptr;
+            [[maybe_unused]] const float* kgamma = nullptr;
+            if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
+            launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, sub0::QKV_STRIDE);  // fused qkv = a . [Wq|Wk|Wv]
+            if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, M);   // per-head RMSNorm, before RoPE
+            if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
+            if constexpr (sub0::USE_DEPTH_ATTN) {   // mirrors forward_train's block; no backward here, so no v_own
+                const int S   = sub0::DEPTH_SCHEDULE.live[static_cast<std::size_t>(e)];
+                const int own = sub0::DEPTH_SCHEDULE.own [static_cast<std::size_t>(e)];
+                launch_depth_attn_t<float>(qkv, depth_cache_fwd(), S, M, /*v_own_out=*/nullptr,
+                                           own >= 0 ? g_fwd.depth_k[own] : nullptr,
+                                           own >= 0 ? g_fwd.depth_v[own] : nullptr);
+            }
+            launch_attn(qkv, qkv + sub0::QKV_K_OFF, qkv + sub0::QKV_V_OFF, att, batch, T, C, H,
+                        sub0::QKV_STRIDE, sub0::GQA_GROUP);   // q/k/v sub-blocks of the fused row
+            launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
+        } else if constexpr (sub0::USE_GATED_DELTANET) {
+            gdn_forward_device(sub0::GDN_DIMS, batch, T, a,
+                base + L[b0 + kGdnQkv].off, base + L[b0 + kGdnZ].off,
+                base + L[b0 + kGdnB].off,   base + L[b0 + kGdnA].off,
+                base + L[b0 + kGdnConv].off, base + L[b0 + kGdnDtBias].off,
+                base + L[b0 + kGdnALog].off, base + L[b0 + kGdnNorm].off,
+                base + L[b0 + kGdnOutProj].off, proj, g_gdn);
+        }
+        launch_add(h, proj, h, MC);                          // h = h + proj (mixer residual, either kind)
+        launch_rmsnorm(h, ln2, fbuf, M);                     // f = rmsnorm(h, ln2)
+        const int fb = ffn_base_for(l);                      // FFN base differs per layer KIND (not per l
+                                                              // otherwise -- see ffn_base_for's own comment)
+        const float* W1  = base + L[b0 + fb + kW1Rel].off;
+        const float* W2  = base + L[b0 + fb + kW2Rel].off;
         [[maybe_unused]] const float* Wg = nullptr;
         [[maybe_unused]] const float* b1 = nullptr;
         [[maybe_unused]] const float* b2 = nullptr;
-        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + kWg].off;
-        else                         { b1 = base + L[b0 + kB1].off; b2 = base + L[b0 + kB2].off; }
-        [[maybe_unused]] const float* qgamma = nullptr;
-        [[maybe_unused]] const float* kgamma = nullptr;
-        if constexpr (USE_QK_NORM) { qgamma = base + L[b0 + kQNorm].off; kgamma = base + L[b0 + kKNorm].off; }
-
-        launch_rmsnorm(h, ln1, a, M);                         // a = rmsnorm(h, ln1)
-        launch_linear(a, g_fwd.wqkv[l], nullptr, qkv, M, C, sub0::QKV_STRIDE);  // fused qkv = a . [Wq|Wk|Wv]
-        if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, M);   // per-head RMSNorm, before RoPE
-        if constexpr (POS_ENCODING == PosEncoding::Rope) launch_rope(qkv, batch, T);
-        if constexpr (sub0::USE_DEPTH_ATTN) {   // mirrors forward_train's block; no backward here, so no v_own
-            const int S   = sub0::DEPTH_SCHEDULE.live[static_cast<std::size_t>(e)];
-            const int own = sub0::DEPTH_SCHEDULE.own [static_cast<std::size_t>(e)];
-            launch_depth_attn_t<float>(qkv, depth_cache_fwd(), S, M, /*v_own_out=*/nullptr,
-                                       own >= 0 ? g_fwd.depth_k[own] : nullptr,
-                                       own >= 0 ? g_fwd.depth_v[own] : nullptr);
-        }
-        launch_attn(qkv, qkv + sub0::QKV_K_OFF, qkv + sub0::QKV_V_OFF, att, batch, T, C, H,
-                    sub0::QKV_STRIDE, sub0::GQA_GROUP);   // q/k/v sub-blocks of the fused row
-        launch_linear(att, Wo, nullptr, proj, M, C, C);      // proj = att . Wo
-        launch_add(h, proj, h, MC);                          // h = h + proj
-        launch_rmsnorm(h, ln2, fbuf, M);                     // f = rmsnorm(h, ln2)
+        if constexpr (USE_GATED_FFN) Wg = base + L[b0 + fb + kWgRel].off;
+        else                         { b1 = base + L[b0 + fb + kB1Rel].off; b2 = base + L[b0 + fb + kB2Rel].off; }
         if constexpr (USE_GATED_FFN) {
             launch_linear(fbuf, Wg, nullptr, ff1, M, C, F);   // ff1 = gate_pre = f . Wg
             launch_linear(fbuf, W1, nullptr, gact, M, C, F);  // gact = up_pre   = f . W1
@@ -3566,36 +4136,53 @@ void build_qkv_weights() {
         const int F = D_FF;
         const int nce = C * F, gce = (nce + 255) / 256;
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int    b0 = layer_base(l);
-            const float* Wq = g_dev_params + L[b0 + kWq].off;
-            const float* Wk = g_dev_params + L[b0 + kWk].off;
-            const float* Wv = g_dev_params + L[b0 + kWv].off;
+            const int b0 = layer_base(l);
+            const bool is_attn = sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)];
+            // The fused-QKV bf16 mirror (and Wo's) is an ATTENTION-only concept -- a GDN layer's
+            // forward (Stage 3, forward_device only) reads its own nine weight tensors straight out of
+            // g_dev_params via plain FP32 launch_linear (see gdn_forward_device), no bf16 mirror at all.
+            // Building g_wqkv16[l]/g_wo16[l] from a GDN layer's Wq/Wk/Wv/Wo-shaped OFFSETS would read
+            // the WRONG tensors (this layer's actual GdnInProjB/GdnInProjA/... data, misinterpreted at
+            // attention's shapes) -- skip entirely rather than compute garbage nothing reads.
+            if (is_attn) {
+                const float* Wq = g_dev_params + L[b0 + kWq].off;
+                const float* Wk = g_dev_params + L[b0 + kWk].off;
+                const float* Wv = g_dev_params + L[b0 + kWv].off;
+                if (!g_wo16[l])    cudaMalloc(&g_wo16[l],    static_cast<size_t>(C) * C * sizeof(act_t));
+                if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * sub0::QKV_STRIDE * sizeof(act_t));
+                { const int ncc = C * C, gcc = (ncc + 255) / 256;
+                  f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWo].off, g_wo16[l], ncc); }
+                build_qkv_act_kernel<act_t><<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_wqkv16[l]);
+            }
+            // The FFN block (W1/W2[/Wg]) is shared by BOTH layer shapes (GDN's own mixer sits BEFORE the
+            // same FFN every attention layer has) -- its local offset is ffn_base_for(l), not the
+            // attention-only kW1/kW2/kWg globals (which assume kAttnSlots -- wrong base for a GDN layer).
+            const int fb = ffn_base_for(l);
             if (!g_w1_16[l])   cudaMalloc(&g_w1_16[l],   static_cast<size_t>(C) * F * sizeof(act_t));
             if (!g_w2_16[l])   cudaMalloc(&g_w2_16[l],   static_cast<size_t>(F) * C * sizeof(act_t));
-            if (!g_wo16[l])    cudaMalloc(&g_wo16[l],    static_cast<size_t>(C) * C * sizeof(act_t));
-            if (!g_wqkv16[l])  cudaMalloc(&g_wqkv16[l],  static_cast<size_t>(C) * sub0::QKV_STRIDE * sizeof(act_t));
-            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW1].off, g_w1_16[l], nce);
-            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kW2].off, g_w2_16[l], nce);
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + fb + kW1Rel].off, g_w1_16[l], nce);
+            f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + fb + kW2Rel].off, g_w2_16[l], nce);
             if constexpr (USE_GATED_FFN) {   // gate matrix mirror -- same [C,F] shape as W1's
                 if (!g_wg16[l]) cudaMalloc(&g_wg16[l], static_cast<size_t>(C) * F * sizeof(act_t));
-                f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWg].off, g_wg16[l], nce);
+                f32_to_act_kernel<<<gce, 256, 0, g_stream>>>(g_dev_params + L[b0 + fb + kWgRel].off, g_wg16[l], nce);
             }
-            { const int ncc = C * C, gcc = (ncc + 255) / 256;
-              f32_to_act_kernel<<<gcc, 256, 0, g_stream>>>(g_dev_params + L[b0 + kWo].off, g_wo16[l], ncc); }
-            build_qkv_act_kernel<act_t><<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_wqkv16[l]);
         }
     } else {                                             // F32: mirrors alias the master weights (no copy)
         for (int l = 0; l < N_LAYERS; ++l) {
-            const int    b0 = layer_base(l);
-            const float* Wq = g_dev_params + L[b0 + kWq].off;
-            const float* Wk = g_dev_params + L[b0 + kWk].off;
-            const float* Wv = g_dev_params + L[b0 + kWv].off;
-            build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
-            g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW1].off);
-            g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kW2].off);
-            if constexpr (USE_GATED_FFN) g_wg16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWg].off);
-            g_wo16[l]  = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWo].off);
-            g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
+            const int b0 = layer_base(l);
+            const bool is_attn = sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)];
+            if (is_attn) {                               // see the BF16 branch's comment above
+                const float* Wq = g_dev_params + L[b0 + kWq].off;
+                const float* Wk = g_dev_params + L[b0 + kWk].off;
+                const float* Wv = g_dev_params + L[b0 + kWv].off;
+                build_qkv_kernel<<<grid, block, 0, g_stream>>>(Wq, Wk, Wv, g_fwd.wqkv[l]);
+                g_wo16[l]   = reinterpret_cast<act_t*>(g_dev_params + L[b0 + kWo].off);
+                g_wqkv16[l] = reinterpret_cast<act_t*>(g_fwd.wqkv[l]);
+            }
+            const int fb = ffn_base_for(l);
+            g_w1_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + fb + kW1Rel].off);
+            g_w2_16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + fb + kW2Rel].off);
+            if constexpr (USE_GATED_FFN) g_wg16[l] = reinterpret_cast<act_t*>(g_dev_params + L[b0 + fb + kWgRel].off);
         }
     }
 }
@@ -3616,6 +4203,7 @@ int ensure_wqkv_f32() {
         const auto& L = sub0::PARAM_LAYOUT;
         const int C = D_MODEL, n = C * sub0::QKV_STRIDE, block = 256, grid = (n + block - 1) / block;
         for (int l = 0; l < N_LAYERS; ++l) {
+            if (!sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) continue;   // see build_qkv_weights()
             const int b0 = layer_base(l);
             build_qkv_kernel<<<grid, block, 0, g_stream>>>(g_dev_params + L[b0 + kWq].off,
                 g_dev_params + L[b0 + kWk].off, g_dev_params + L[b0 + kWv].off, g_fwd.wqkv[l]);
@@ -3651,6 +4239,22 @@ int ensure_wqkv_f32() {
 // call site (run_fwd_bwd, the training benchmarks/profiler below) already calls backward_device
 // unconditionally on the very next line, so this is a safe split, not a behavior change.
 void forward_train(int batch, int T) {
+    // Gated DeltaNet (docs/GATED_DELTANET.md Stage 3): CUDA forward-only, and even that is the BATCHED
+    // (forward_device) shape, not this training-shaped, activation-CHECKPOINTING forward -- this
+    // function's per-layer loop still assumes every layer is attention-shaped (kWq/kWv/kW1/kFfnBase),
+    // which is simply WRONG for a GDN layer's real offsets (see the "Per-layer parameter slot offsets"
+    // section's own comment on why that is still safe to compile: it is unreachable dead code here, not
+    // executed data). run_fwd_bwd (this function's only training-facing caller) already refuses first,
+    // gracefully; this is defense-in-depth for the OTHER callers below (the training benchmarks/profiler),
+    // mirroring backend_cpu.cpp's own backward_node Op::GDN abort (Stage 1) applied here to the CUDA
+    // training-forward seam instead.
+    if constexpr (sub0::USE_GATED_DELTANET) {
+        std::fprintf(stderr, "fatal: CUDA training-shaped forward does not implement Gated DeltaNet "
+                             "(GDN_FULL_ATTN_STRIDE=%d); CUDA forward is BATCHED/inference-only for GDN "
+                             "(forward_device) -- training stays on the CPU backend "
+                             "(docs/GATED_DELTANET.md Stage 3).\n", GDN_FULL_ATTN_STRIDE);
+        std::abort();
+    }
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, H = N_HEADS;
     const int    M  = batch * T;
@@ -3795,6 +4399,23 @@ void head_ce_chunked(int batch, int T, const int* d_lengths, const int* d_active
 // tape walk. Weight/bias grads are written straight to their PARAM_LAYOUT offsets (each weight is
 // used once per forward). Loss scaling invM = 1/M makes the result equal the CPU train_batch grad.
 void backward_device(int batch, int T, const int* d_lengths, const int* d_active) {
+    // Gated DeltaNet (docs/GATED_DELTANET.md Stage 3): NO CUDA backward exists -- this stage's own
+    // deliberate scope boundary (forward only). Reaching here with GDN on would backprop through
+    // attention math a GDN layer never ran (this function, like forward_train, still assumes every
+    // layer is attention-shaped), producing a plausible-looking but entirely wrong gradient -- exactly
+    // the silent-wrong-architecture failure mode ARCH_FINGERPRINT2 exists to catch elsewhere, so this
+    // aborts loudly instead. Mirrors backend_cpu.cpp's own backward_node Op::GDN abort (Stage 1),
+    // applied here to backward_device as this task's own instruction says. run_fwd_bwd (the shared body
+    // of sub0_cuda_backward/sub0_cuda_train_step) already refuses gracefully before ever calling this;
+    // this is defense-in-depth for forward_train's other direct callers (the benchmarks below), which
+    // call backward_device right after forward_train's own abort would already have fired -- unreachable
+    // in practice, kept for the same "should never get here, but if it does, abort" reasoning.
+    if constexpr (sub0::USE_GATED_DELTANET) {
+        std::fprintf(stderr, "fatal: CUDA backward does not implement Gated DeltaNet "
+                             "(GDN_FULL_ATTN_STRIDE=%d); training a GDN model stays on the CPU backend "
+                             "(docs/GATED_DELTANET.md Stage 3 is CUDA forward-only).\n", GDN_FULL_ATTN_STRIDE);
+        std::abort();
+    }
     const auto&  L  = sub0::PARAM_LAYOUT;
     const int    C  = D_MODEL, F = D_FF, H = N_HEADS;
     const int    M  = batch * T;
@@ -4435,6 +5056,9 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_loss(const int* ids, const int
 // per-token kernel-launch dispatch, not by this kind of redundant call -- still, free to remove).
 SUB0_CUDA_API [[nodiscard]] int sub0_cuda_kv_reset() {
     if constexpr (sub0::USE_DEPTH_ATTN) return 1;   // decode does not implement the depth mix -- see forward_one
+    // Gated DeltaNet (docs/GATED_DELTANET.md Stage 3): CUDA forward is batched-only, no single-token
+    // decode form -- see forward_one_device's own guard for why.
+    if constexpr (sub0::USE_GATED_DELTANET) return 1;
     if (!g_dev_params) return 1;
     if (fwd_alloc(1) || kv_alloc()) return 1;
     ensure_cublas();
@@ -4462,6 +5086,7 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_forward_one(int id, int pos, float* ou
     // notice the mix. Exactly the "a gradient check cannot validate this op, a PRESENCE test is
     // required" failure mode from the depth-attention notes.
     if constexpr (sub0::USE_DEPTH_ATTN) return 1;
+    if constexpr (sub0::USE_GATED_DELTANET) return 1;   // see sub0_cuda_kv_reset's own comment
     if (!g_dev_params || !g_kv_k) return 1;
     if (id < 0 || id >= VOCAB || pos < 0 || pos >= SEQ_LEN) return 1;
     if (ensure_wqkv_f32()) return 1;               // BF16: (re)build the F32 mirror this path reads
@@ -4538,6 +5163,12 @@ SUB0_CUDA_API int sub0_cuda_forward_one_check(int T, int iters, double* out_maxr
 // g_dev_grad, sync, and read back the mean cross-entropy. Requires upload_params() first.
 static int run_fwd_bwd(const int* ids, const int* targets, int batch, int T, double* out_loss,
                        const int* lengths = nullptr) {
+    // Gated DeltaNet (docs/GATED_DELTANET.md Stage 3): no CUDA backward. This is the shared body of
+    // BOTH sub0_cuda_backward and sub0_cuda_train_step, i.e. the real extern-facing "train on GPU" seam
+    // -- refuse HERE, gracefully (a plain error return, not the abort forward_train/backward_device fall
+    // back to if this guard were ever bypassed), so a caller (train_stage.cpp's GpuTrainer) gets a clean
+    // "unsupported, fall back to CPU" signal instead of a crashed process.
+    if constexpr (sub0::USE_GATED_DELTANET) return 1;
     if (!g_dev_params) return 1;
     if (batch < 1 || batch > MAX_FWD_BATCH || T < 1 || T > SEQ_LEN) return 1;
     // Row-product sizing: a step only needs batch*T rows, so a varied-T caller that keeps
@@ -5435,6 +6066,179 @@ SUB0_CUDA_API int sub0_cuda_qknorm_check(int shape_sel, int rows, double* out_re
     }
 }
 
+// Gated DeltaNet CUDA-forward correctness check (docs/GATED_DELTANET.md Stage 3's PRIMARY gate, per S5
+// step 3's own instruction): random weights + input at a chosen (small) shape, run through
+// gdn_forward_device (this stage's CHUNKED-parallel CUDA port), compared against sub0::gdn::forward()
+// (Stage 1's own SEQUENTIAL CPU reference, gdn_math.hpp) -- exact numerical agreement between the two
+// forms is the claim this stage exists to prove, not a fresh comparison against the Python fixtures
+// (that is sub0_cuda_gdn_fixture_check below, a SECONDARY/stronger oracle). Each batch item is an
+// independent window (state resets to zero per item, matching gdn_math.hpp's own transient-scratch
+// forward() and docs/GATED_DELTANET.md S2's training/batched-forward convention) -- the CPU reference is
+// therefore called once per batch item with its own zeroed state/conv_hist, exactly mirroring what
+// gdn_forward_device does internally for the whole batch in one shot.
+//
+// shape_sel picks shapes chosen to exercise real risk, not just "compiles": 0 matches the real Qwen4-
+// preview fixture's own (dk=dv=128) head width at T=6 (single chunk, GDN_CHUNK=64); 1 is multi-chunk
+// (T=130 -> 3 chunks of 64 after padding, the ONLY shape here that exercises Phase B's cross-chunk
+// `last_state` carry -- AGENTS.md S7's own lesson: a check that only ever runs single-chunk cannot catch
+// a state-carry bug) with GQA-style repeat_interleave (Hv=4, Hk=2); 2 is an exact chunk-size boundary
+// (T=64, zero padding). hidden_size is kept engine-conforming (Hv*dv) here -- the fixture's own
+// non-conforming shape is exercised by sub0_cuda_gdn_fixture_check instead.
+SUB0_CUDA_API int sub0_cuda_gdn_check(int shape_sel, double* out_maxrel) {
+    if (sub0_cuda_init()) return 1;
+    struct Shape { int batch, T, Hk, Hv, dk, dv, K; };
+    Shape sh;
+    switch (shape_sel) {
+        case 0: sh = { 2, 6,   1, 3, 128, 128, 4 }; break;
+        case 1: sh = { 2, 130, 2, 4, 16,  24,  4 }; break;
+        case 2: sh = { 1, 64,  1, 1, 8,   8,   4 }; break;
+        default: return 2;
+    }
+    const sub0::gdn::Dims d{ sh.Hv * sh.dv, sh.Hk, sh.Hv, sh.dk, sh.dv, sh.K };
+    const int hs = d.hidden_size, key_dim = d.key_dim(), value_dim = d.value_dim(), conv_dim = d.conv_dim();
+    const int batch = sh.batch, T = sh.T, M = batch * T;
+
+    std::mt19937 rng(0xC0FFEEu + static_cast<unsigned>(shape_sel));
+    std::normal_distribution<float> nd(0.f, 0.3f);
+    auto mk = [&](size_t n) { std::vector<float> v(n); for (auto& x : v) x = nd(rng); return v; };
+    std::vector<float> x       = mk(static_cast<size_t>(M) * hs);
+    std::vector<float> w_qkv   = mk(static_cast<size_t>(hs) * conv_dim);
+    std::vector<float> w_z     = mk(static_cast<size_t>(hs) * value_dim);
+    std::vector<float> w_b     = mk(static_cast<size_t>(hs) * d.num_v_heads);
+    std::vector<float> w_a     = mk(static_cast<size_t>(hs) * d.num_v_heads);
+    std::vector<float> conv_w  = mk(static_cast<size_t>(conv_dim) * d.conv_kernel);
+    std::vector<float> dt_bias = mk(static_cast<size_t>(d.num_v_heads));
+    std::vector<float> a_logv(d.num_v_heads);   // A_log: real init is log(uniform(0.01,16)) -- keep it in
+    for (auto& v : a_logv) v = std::log(0.01f + 15.99f * std::fabs(nd(rng)) / 3.f + 1e-3f);   // > -inf, bounded
+    std::vector<float> norm_w = mk(static_cast<size_t>(d.head_v_dim));
+    for (auto& v : norm_w) v = 1.f + 0.1f * v;   // near-identity gamma, matches the real init's spirit
+    std::vector<float> w_out  = mk(static_cast<size_t>(value_dim) * hs);
+
+    // --- CPU reference: Stage 1's sequential forward, one independent window per batch item ---
+    std::vector<float> out_cpu(static_cast<size_t>(M) * hs);
+    std::vector<float> scratch(sub0::gdn::scratch_floats(d, T));
+    std::vector<float> state(sub0::gdn::state_floats(d)), conv_hist(sub0::gdn::conv_hist_floats(d));
+    for (int b = 0; b < batch; ++b) {
+        std::fill(state.begin(), state.end(), 0.f);
+        std::fill(conv_hist.begin(), conv_hist.end(), 0.f);
+        sub0::gdn::forward(d, T, x.data() + static_cast<size_t>(b) * T * hs,
+                           w_qkv.data(), w_z.data(), w_b.data(), w_a.data(),
+                           conv_w.data(), dt_bias.data(), a_logv.data(), norm_w.data(), w_out.data(),
+                           state.data(), conv_hist.data(), out_cpu.data() + static_cast<size_t>(b) * T * hs,
+                           scratch.data());
+    }
+
+    // --- GPU: gdn_forward_device, this stage's chunked-parallel CUDA port ---
+    float *dx, *dwqkv, *dwz, *dwb, *dwa, *dconv, *ddt, *dalog, *dnorm, *dwout, *dout;
+    SUB0_CUDA_CHECK(cudaMalloc(&dx, x.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwqkv, w_qkv.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwz, w_z.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwb, w_b.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwa, w_a.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dconv, conv_w.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ddt, dt_bias.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dalog, a_logv.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dnorm, norm_w.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwout, w_out.size() * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dout, out_cpu.size() * sizeof(float)));
+    ensure_stream();
+    cudaMemcpyAsync(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwqkv, w_qkv.data(), w_qkv.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwz, w_z.data(), w_z.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwb, w_b.data(), w_b.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwa, w_a.data(), w_a.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dconv, conv_w.data(), conv_w.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(ddt, dt_bias.data(), dt_bias.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dalog, a_logv.data(), a_logv.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dnorm, norm_w.data(), norm_w.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwout, w_out.data(), w_out.size() * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+
+    GdnDeviceScratch gs{};
+    int rc = gdn_alloc_scratch(gs, d, M, batch, T);
+    if (rc == 0) {
+        gdn_forward_device(d, batch, T, dx, dwqkv, dwz, dwb, dwa, dconv, ddt, dalog, dnorm, dwout, dout, gs);
+        rc = static_cast<int>(cudaStreamSynchronize(g_stream));
+        if (rc == 0) rc = static_cast<int>(cudaGetLastError());
+    }
+    std::vector<float> out_gpu(out_cpu.size());
+    if (rc == 0) cudaMemcpy(out_gpu.data(), dout, out_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    gdn_free_scratch(gs);
+    cudaFree(dx); cudaFree(dwqkv); cudaFree(dwz); cudaFree(dwb); cudaFree(dwa); cudaFree(dconv);
+    cudaFree(ddt); cudaFree(dalog); cudaFree(dnorm); cudaFree(dwout); cudaFree(dout);
+    if (rc != 0) return 1;
+
+    double maxabs = 0.0, maxmag = 1e-30;
+    for (size_t i = 0; i < out_cpu.size(); ++i) {
+        maxabs = std::fmax(maxabs, std::fabs(static_cast<double>(out_gpu[i]) - out_cpu[i]));
+        maxmag = std::fmax(maxmag, std::fabs(static_cast<double>(out_cpu[i])));
+    }
+    const double maxrel = maxabs / maxmag;
+    std::printf("cuda gdn check: shape=%d batch=%d T=%d Hk=%d Hv=%d dk=%d dv=%d | max|diff|=%.3e "
+                "max|ref|=%.3e rel=%.3e\n", shape_sel, batch, T, sh.Hk, sh.Hv, sh.dk, sh.dv,
+                maxabs, maxmag, maxrel);
+    if (out_maxrel) *out_maxrel = maxrel;
+    return (maxrel < 1e-3) ? 0 : 2;
+}
+
+// Raw, dims-generic entry point onto gdn_forward_device -- lets a CALLER (the fixture-based test in
+// cuda_tests.cpp) drive the CUDA GDN forward at an ARBITRARY (host-supplied) shape and set of real
+// weights, without this .cu file needing to know anything about fixture files or manifests -- the test
+// reuses gdn_qwen4_fixture_tests.cpp's own file-loading/transpose helpers (SUB0_SOURCE_DIR-relative,
+// engine-free) and passes the already-transposed (this project's [in,out] convention), already-real
+// tensors straight through. This is docs/GATED_DELTANET.md Stage 3's SECONDARY correctness gate (S4
+// task item 4): the REAL Qwen4-preview fixture, run through the CHUNKED CUDA port -- a stronger oracle
+// than the CPU-vs-CPU comparison alone, since the fixture's own expected output was produced by the
+// ACTUAL reference model's chunked path, not a proxy. All host buffers are caller-owned; every device
+// buffer here is allocated/freed locally (weights are per-fixture-run sized, not resident model state).
+SUB0_CUDA_API int sub0_cuda_gdn_forward_raw(int hidden_size, int Hk, int Hv, int dk, int dv, int K,
+                                            int batch, int T,
+                                            const float* x, const float* w_qkv, const float* w_z,
+                                            const float* w_b, const float* w_a, const float* conv_w,
+                                            const float* dt_bias, const float* a_log, const float* norm_w,
+                                            const float* w_out, float* out) {
+    if (sub0_cuda_init()) return 1;
+    const sub0::gdn::Dims d{hidden_size, Hk, Hv, dk, dv, K};
+    const int conv_dim = d.conv_dim(), value_dim = d.value_dim();
+    const int M = batch * T;
+
+    float *dx, *dwqkv, *dwz, *dwb, *dwa, *dconv, *ddt, *dalog, *dnorm, *dwout, *dout;
+    SUB0_CUDA_CHECK(cudaMalloc(&dx, static_cast<size_t>(M) * hidden_size * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwqkv, static_cast<size_t>(hidden_size) * conv_dim * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwz, static_cast<size_t>(hidden_size) * value_dim * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwb, static_cast<size_t>(hidden_size) * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwa, static_cast<size_t>(hidden_size) * Hv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dconv, static_cast<size_t>(conv_dim) * K * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&ddt, static_cast<size_t>(Hv) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dalog, static_cast<size_t>(Hv) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dnorm, static_cast<size_t>(dv) * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dwout, static_cast<size_t>(value_dim) * hidden_size * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&dout, static_cast<size_t>(M) * hidden_size * sizeof(float)));
+    ensure_stream();
+    cudaMemcpyAsync(dx, x, static_cast<size_t>(M) * hidden_size * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwqkv, w_qkv, static_cast<size_t>(hidden_size) * conv_dim * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwz, w_z, static_cast<size_t>(hidden_size) * value_dim * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwb, w_b, static_cast<size_t>(hidden_size) * Hv * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwa, w_a, static_cast<size_t>(hidden_size) * Hv * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dconv, conv_w, static_cast<size_t>(conv_dim) * K * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(ddt, dt_bias, static_cast<size_t>(Hv) * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dalog, a_log, static_cast<size_t>(Hv) * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dnorm, norm_w, static_cast<size_t>(dv) * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(dwout, w_out, static_cast<size_t>(value_dim) * hidden_size * sizeof(float), cudaMemcpyHostToDevice, g_stream);
+
+    GdnDeviceScratch gs{};
+    int rc = gdn_alloc_scratch(gs, d, M, batch, T);
+    if (rc == 0) {
+        gdn_forward_device(d, batch, T, dx, dwqkv, dwz, dwb, dwa, dconv, ddt, dalog, dnorm, dwout, dout, gs);
+        rc = static_cast<int>(cudaStreamSynchronize(g_stream));
+        if (rc == 0) rc = static_cast<int>(cudaGetLastError());
+    }
+    if (rc == 0) cudaMemcpy(out, dout, static_cast<size_t>(M) * hidden_size * sizeof(float), cudaMemcpyDeviceToHost);
+    gdn_free_scratch(gs);
+    cudaFree(dx); cudaFree(dwqkv); cudaFree(dwz); cudaFree(dwb); cudaFree(dwa); cudaFree(dconv);
+    cudaFree(ddt); cudaFree(dalog); cudaFree(dnorm); cudaFree(dwout); cudaFree(dout);
+    return rc != 0 ? 1 : 0;
+}
+
 // Binding-compose parity hook (docs/BACKENDS.md "first caps flip"): drives the PRODUCTION embed
 // kernels (embed_kernel, embed_act_kernel<act_t>, embed_backward_token_kernel -- the exact
 // launches forward_device/forward_train/backward_device make, same launch geometry) over a
@@ -5734,6 +6538,7 @@ static constexpr sub0::bench::Budget TUNE_BUDGET{
 //                per-step cost, then run clamp(budget/est, MIN, MAX) steps. Keeps the profiling
 //                wall-time ~constant across batch sizes instead of growing with the workload.
 static int time_train_step(int batch, int T, int iters, double budget_ms, double* out_ms) {
+    if constexpr (sub0::USE_GATED_DELTANET) return 1;   // no CUDA training path for GDN -- see run_fwd_bwd
     if (T < 1 || T > SEQ_LEN) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;
@@ -5812,6 +6617,7 @@ SUB0_CUDA_API [[nodiscard]] int sub0_cuda_time_train_step(int batch, int T, doub
 // time_train_step; warms up (clock + cuBLAS) then averages `iters` timed steps. Any out ptr may be null.
 SUB0_CUDA_API int sub0_cuda_train_profile(int batch, int T, int iters,
                                           double* fwd_ms, double* bwd_ms, double* adam_ms) {
+    if constexpr (sub0::USE_GATED_DELTANET) return 1;   // no CUDA training path for GDN -- see run_fwd_bwd
     if (T < 1 || T > SEQ_LEN || iters < 1) return 1;
     if (batch < 1) batch = 1;
     if (batch > MAX_FWD_BATCH) batch = MAX_FWD_BATCH;

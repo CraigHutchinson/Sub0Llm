@@ -381,8 +381,15 @@ Stage-1 fixtures from real Qwen weights are the actual correctness gate here.
   reappear here (9 parameter tensors + the input, more than `Node`'s 4-slot fanout), resolved the same
   way depth attention's own variable-length case was (a `thread_local` side table keyed by a small int on
   the Node); backward is verified against the real reference's own `.backward()` gradients (not just its
-  forward), matching to ~3e-7 relative — see `docs/GATED_DELTANET.md` §6 for the full numbers. Stage 3
-  (CUDA) remains not started.
+  forward), matching to ~3e-7 relative — see `docs/GATED_DELTANET.md` §6 for the full numbers. **Stage 3
+  (CUDA, FORWARD ONLY) is now also DONE** (branch `feature/gated-deltanet-stage3`) — the chunked-parallel
+  form (`torch_chunk_gated_delta_rule`, not a re-run of the sequential CPU form), verified on real
+  hardware against both Stage 1's CPU sequential reference and the real fixture; no CUDA backward, no CUDA
+  decode (both refuse at runtime). Finding this bug along the way was the notable event: the CUDA port
+  disagreeing with the CPU engine at a real mixed-layer model exposed a genuine, independent, pre-existing
+  bug in `backend_cpu.cpp`'s `op_gdn` (dt_bias/a_log passed in swapped argument positions) that neither
+  the fixture test nor the finite-difference gradient check could have caught from the CPU side alone —
+  see `docs/GATED_DELTANET.md` §6 for the full account and numbers.
 - **QSA** — real code and config now in hand (see above), but no fixture yet; not scheduled ahead of the
   other two per the original scope decision (block-sparse attention's benefit is long-context latency,
   not this engine's current focus).
