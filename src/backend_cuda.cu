@@ -72,6 +72,15 @@ static_assert(!sub0::NGRAM_EMBED,
 static_assert(!sub0::USE_GATED_RESIDUAL,
     "the CUDA backend does not implement Gated Residual yet; CPU-only for now (TODO(gr-gpu)).");
 
+// Mixture of Experts (NUM_EXPERTS >= 2, docs/MOE.md): Stage 1 landed CPU-only forward (op_moe,
+// backend_cpu.cpp; shared math in include/sub0/moe_math.hpp). This backend has NO knowledge of MoE at
+// all yet -- a GPU build with it on would silently compute a DIFFERENT, WRONG architecture (the plain
+// dense-FFN one) rather than failing to find some wiring, the same reasoning the GR guard just above
+// gives -- hard-stop the BUILD. TODO(moe-gpu): port op_moe's router/top-k/per-expert-SwiGLU/shared-expert
+// math to device kernels, then lift this guard.
+static_assert(!sub0::USE_MOE,
+    "the CUDA backend does not implement Mixture of Experts yet; CPU-only for now (TODO(moe-gpu)).");
+
 // Gated DeltaNet (GDN_FULL_ATTN_STRIDE > 0, docs/GATED_DELTANET.md): Stage 1/2 landed the CPU-only
 // forward+backward (op_gdn / gdn_forward_one, backend_cpu.cpp; shared math in include/sub0/gdn_math.hpp,
 // correctness-gated against real Qwen4-preview fixtures). Stage 3 (this pass) adds CUDA FORWARD ONLY --
