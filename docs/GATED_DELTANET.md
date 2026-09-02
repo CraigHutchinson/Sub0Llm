@@ -1,8 +1,11 @@
 # Gated DeltaNet — design, derived from the reference
 
-Status: **Stage 1 + Stage 2 DONE — real CPU forward AND backward, both fixture-verified against the real
-PyTorch reference's own autograd, no CUDA.** See §6 for the staging status, the fixture-comparison
-numbers, and the one real correction to this doc's own §1b found while implementing Stage 1. Follows
+Status: **Stage 1 + Stage 2 + Stage 3 DONE — real CPU forward AND backward (fixture-verified against the
+real PyTorch reference's own autograd) plus a CUDA FORWARD-ONLY port of the chunked-parallel form
+(fixture- and CPU-reference-verified on real hardware; no CUDA backward, no CUDA decode).** See §6 for the
+staging status, the fixture-comparison numbers, and the one real correction to this doc's own §1b found
+while implementing Stage 1 (plus a real, independent pre-existing CPU bug Stage 3 found and fixed along
+the way). Follows
 `docs/DEPTH_ATTENTION.md`'s structure (that document is the precedent for how a genuinely new op type
 gets threaded through this engine) and `docs/QWEN4_PREVIEW_REFERENCE.md`'s staged plan, which flags this
 as the higher-risk of the two Qwen4-preview mechanisms because this engine's attention today is
@@ -739,7 +742,128 @@ operations this project already chose for attention itself.
   (KV-cache) matches the full forward per position` still passes too (worst per-position relative diff
   `3.43571e-07`), confirming the decode path — untouched by this stage — stayed correct.
 
-- **Stage 3 (not started)** — CUDA, gated on §5 step 3's chunked-parallel form, itself gated on exact
-  parity with Stage 1's sequential CPU reference. `backend_cuda.cu`'s
-  `static_assert(!sub0::USE_GATED_DELTANET, ...)` guard is untouched by Stage 2 (CPU-only scope, per this
-  stage's own boundary) and remains the next callable seam down for a CUDA build.
+- **Stage 3 — CUDA FORWARD ONLY — DONE.** Targets §5 step 3's chunked-parallel form
+  (`torch_chunk_gated_delta_rule`, re-fetched and re-verified directly against the installed
+  `transformers==5.16.1` source for this stage, not paraphrased from §1b) rather than a re-run of
+  Stage 1's sequential CPU recurrence — its real benefit is parallelizing across a chunk's `C=64`
+  positions via dense-matmul-shaped work, which only matters once a GPU is the target (§5 step 3's own
+  reasoning). The old build-time `static_assert(!sub0::USE_GATED_DELTANET, ...)` guard is lifted; a GDN
+  CUDA build now compiles and correctly runs `forward_device` (batched training-shaped/inference forward
+  — the path `sub0_cuda_forward`/`sub0_cuda_forward_loss` both use). **No CUDA backward, no single-token
+  decode** — this stage's own explicit, deliberate scope boundary, enforced at RUNTIME rather than a
+  build-time block (mirroring depth attention's own single-token-decode gap, §5b): `forward_train`/
+  `backward_device`/`forward_one_device` abort loudly if ever reached with GDN on (mirroring
+  `backend_cpu.cpp`'s Stage 1 `backward_node` Op::GDN abort, applied here to `backward_device` per this
+  stage's own task); the training extern seam (`run_fwd_bwd`, the shared body of `sub0_cuda_backward`/
+  `sub0_cuda_train_step`) and the decode extern seam (`sub0_cuda_kv_reset`/`sub0_cuda_forward_one`) both
+  refuse gracefully one layer up. `device_backend.hpp`'s `Sub0DeviceCaps` reports this honestly:
+  `supports_train`/`supports_decode` both go false for a GDN build; `supports_eval` stays true
+  (`sub0_cuda_forward_loss` is built on the now-GDN-aware `forward_device`, so evaluating a GDN model on
+  GPU works fine — only training and gen's decode path fall back to CPU).
+
+  **Algorithm decomposition, validated BEFORE any CUDA was written** (AGENTS.md S5/S6): the real
+  `torch_chunk_gated_delta_rule` splits cleanly at its own natural boundary — `decay_mask`, the
+  WY-inverted intra-chunk `attn` (a forward-substitution solve, `for i in range(1,chunk_size): attn[i,:i]
+  = row + (row*sub).sum`, genuinely sequential over the 64 intra-chunk positions but with NO cross-chunk
+  dependency), `value' = attn @ v_beta`, and `k_cumdecay = attn @ (k_beta·exp(g_cum))` depend ONLY on
+  their own chunk; only the SECOND loop (`last_recurrent_state`/`attn_inter`/`core_attn_out`) has a real
+  chunk-to-chunk sequential dependency. This became the CUDA port's two phases (below). A host-side
+  numpy/torch script re-implemented this exact decomposition in float64 and checked it directly against
+  the REAL installed `torch_chunk_gated_delta_rule` (not a re-derivation of gdn_math.hpp) at three shapes
+  — single-chunk (T=6, matching the real fixture), multi-chunk (T=130 → 3 chunks, GQA repeat_interleave),
+  and an exact chunk-size boundary (T=64, zero padding) — all matching to float32-rounding-level
+  agreement (rel diff ~1e-6 to ~2e-6) before a single CUDA kernel was written.
+
+  **CUDA kernels** (`backend_cuda.cu`'s "Gated DeltaNet — CUDA FORWARD" section): the four input
+  projections (`in_proj_qkv/z/b/a`) and `out_proj` reuse the existing `launch_linear` GEMM helper
+  directly (this project's own `[in,out]` weight convention needs no adaptation). New kernels:
+  `gdn_conv_silu_kernel` (causal depthwise conv+SiLU), `gdn_gates_kernel` (β/log-decay), `gdn_qknorm_kernel`
+  (L2-norm+scale with the `repeat_interleave` broadcast), `gdn_phaseA_kernel` (one block per
+  (batch, v-head, chunk), `GDN_CHUNK=64` threads — decay_mask + the WY-inverted `attn` + value′/k_cumdecay,
+  fully parallel across all three grid axes since no chunk depends on another here), `gdn_phaseB_kernel`
+  (one launch PER CHUNK INDEX from a host `for` loop — grid (batch, v-head), genuinely sequential across
+  launches, the recurrence's own real cross-chunk dependency, not an implementation compromise) and
+  `gdn_rmsnorm_gated_kernel`. Deliberately plain FP32 throughout (no bf16 mirror, no tensor-core path) and
+  — after a real hardware finding below — NO shared-memory caching of the O(chunk·dim) matrices either:
+  a correctness-first simplification per AGENTS.md S5/S6, not a performance claim; a follow-up perf pass
+  is real future work, not attempted this stage.
+
+  **A real hardware hazard, caught by this stage's own test, not assumed away** (per the task's own
+  flagged risk categories — register spills, VRAM limits, driver-level faults): an earlier version of
+  `gdn_phaseB_kernel` cached `last_state`/`v_new` in DYNAMIC shared memory (~96 KB at the real fixture's
+  `dk=dv=128` shape) and raised the per-block shared-memory limit via `cudaFuncSetAttribute` — whose
+  return value went unchecked. On this session's actual GPU that raise silently failed (the requested
+  ceiling exceeded this card's real per-block shared-memory maximum), the kernel launch that followed
+  then itself failed silently too, and `core_out` was left as zero-initialized fresh device memory —
+  caught immediately by `sub0_cuda_gdn_check` (relative diff exactly 1.0, GPU output identically zero),
+  not discovered by inspection. Fixed by moving `last_state`/`v_new` to caller-owned GLOBAL scratch
+  entirely (no shared memory in this kernel at all) — redundant bandwidth, not a correctness compromise,
+  and it sidesteps the device-dependent limit rather than working around it with a fragile size-dependent
+  opt-in. This is a real, hardware-specific failure mode distinct from a code bug in the ALGORITHM (the
+  math itself, once actually run, matched to float32 precision at every shape tested) — exactly the kind
+  of category this stage's own task flagged as a real risk to watch for, not assume away.
+
+  **Two-level correctness gate, both green** (`cuda_tests.cpp`'s `sub0_cuda_gdn_check` /
+  `sub0_cuda_gdn_forward_raw`, meaningful in ANY CUDA build regardless of `USE_GATED_DELTANET`, the same
+  convention the QK-norm/SwiGLU kernel checks already follow): **primary** (per S5 step 3's own
+  instruction — parity against Stage 1's CPU SEQUENTIAL reference, `gdn_math::forward()`, not a fresh
+  fixture comparison), at three shapes including the multi-chunk one (the only one exercising Phase B's
+  cross-chunk `last_state` carry — AGENTS.md S7's own lesson: a single-chunk-only check could not catch a
+  state-carry bug):
+  | shape | rel diff (CUDA vs CPU sequential) |
+  |---|---|
+  | dk=dv=128, Hk=1/Hv=3, T=6 (single chunk, matches real fixture) | 8.57e-7 |
+  | dk=16/dv=24, Hk=2/Hv=4, T=130 (3 chunks, GQA repeat_interleave) | 1.46e-6 |
+  | dk=dv=8, Hk=Hv=1, T=64 (exact chunk boundary, no padding) | 3.67e-6 |
+
+  **secondary** (the real Qwen4-preview fixture — a stronger oracle, since its expected output was
+  produced by the ACTUAL reference model's own chunked path): max |diff| = 3.64e-11, max relative diff =
+  7.52e-6, over 192 output values — matching Stage 1's own CPU-sequential fixture result (4.37e-11) to the
+  same order, confirming the chunked CUDA port reproduces the real reference as faithfully as the
+  sequential CPU port did.
+
+  **A real, independent pre-existing bug found (and fixed) along the way, not a Stage 3 change of its
+  own**: verifying against the compiled ENGINE (not just the standalone kernel checks above) at a real
+  mixed-layer build — d96 L8 H2 kv2 seq128, `GDN_FULL_ATTN_STRIDE=3` (6 GDN + 2 attention layers) —
+  exposed that `backend_cpu.cpp`'s `op_gdn` (Stage 1, already merged) passed `dt_bias`/`a_log` in SWAPPED
+  argument positions relative to `gdn::forward()`'s real signature, at BOTH its batched-forward and
+  T=1-decode call sites (`g_gdn_link.push()` and `backward_node`'s own `gdn::backward()` call already had
+  the correct order). Neither `gdn_qwen4_fixture_tests.cpp` (calls `gdn::forward` directly, never through
+  `op_gdn`) nor the whole-model finite-difference gradient check (perturbs a NAMED tensor and compares
+  against that same name's analytic gradient — a CONSISTENT relabeling does not by itself fail it) could
+  have caught this from the CPU side alone; Stage 3's CUDA port, built independently from the verified
+  `gdn_math.hpp` reference rather than copied from `op_gdn`'s call site, disagreed with the CPU engine's
+  real forward output and exposed it. Before the fix, `sub0_cuda_forward`-vs-CPU parity at the real
+  GDN-on build read a max abs logit diff of 0.096–0.13 (well outside the 1e-2 tolerance); after the fix,
+  0.00234. Fixed at both call sites; `engine_tests.cpp`'s own CPU-only whole-model gradient check (which
+  had also been failing on this session's build beforehand) passes too, post-fix.
+
+  **Real GDN-on build, unfiltered full suite** (AGENTS.md S10), same d96 L8 H2 kv2 seq128 stride-3 shape:
+  186 test cases, 166 passed, 20 failed — every remaining failure is either an EXPECTED consequence of
+  this stage's forward-only scope (`sub0_cuda_backward`/`sub0_cuda_train_step`/`sub0_cuda_train_profile`
+  correctly refusing, ~15 cases) or a pre-existing, unrelated artifact proven untouched by this branch's
+  diff against `main` (`ARCH_FINGERPRINT2`'s own documented "off premise" test; a `kTestDims`/
+  `trainable_floats()` mismatch in a pre-existing memplan test that does not model a mixed GDN/attention
+  layer schedule; one binding-compose scratch-slot count assertion, plausibly an artifact of this
+  session's atypically tiny 553-token synthetic test vocabulary). `cuda_tests.cpp`'s own
+  "`supports_decode` is honest" caps test was updated to account for GDN as a second, independent
+  unsupported-capability axis (unlike depth attention, GDN also turns off `supports_train`).
+
+  **Two-scale identity at neutral** (`GDN_FULL_ATTN_STRIDE == 0`): `layer_base()`/`ffn_base_for()` are
+  proven, by a dedicated `static_assert`, to reproduce the OLD fixed-stride offset formula exactly when
+  every layer is attention-shaped — a compile-time proof, not just an empirical one. Empirically, the
+  neutral CUDA build's full suite (186 test cases / 5,767,878 assertions at this session's small test
+  shape/corpus) has exactly the same 2 pre-existing, diff-proven-unrelated failures before and after every
+  commit in this stage, and the critical `sub0_cuda_forward`-vs-CPU parity test is untouched by inspection
+  (the new GDN branch in `forward_device`'s per-layer dispatch is `else if constexpr
+  (USE_GATED_DELTANET)`, generating no device code at all when off; the existing attention branch's code
+  is byte-for-byte unchanged, merely moved inside an `if` that is always true at neutral).
+
+  **Not build-verified at a second (odd-layer) shape or against a real training corpus** — this
+  session's verification used a small synthetic corpus (553-token vocab) at one even-layer-count shape;
+  a second shape and a real corpus are natural follow-ups, not blocking findings.
+
+  **Follow-up work, explicitly out of scope for this stage**: CUDA backward (TODO(gdn-gpu-train) at the
+  lifted guard's old location) and a per-token GDN state cache inside the captured decode graph
+  (TODO(gdn-gpu-decode)); a bf16/tensor-core forward pass and shared-memory tiling for the per-chunk GEMMs
+  (this stage's own deliberate correctness-first simplification, not yet revisited).
