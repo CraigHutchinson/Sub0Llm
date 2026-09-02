@@ -139,6 +139,10 @@ if(SUB0_BUILD_CUDA)
   # than through a hand-written extern "C" silently took the CPU fallback and "passed". Every other
   # test here already passes use_gpu=false explicitly, so nothing else changes behaviour.
   target_compile_definitions(sub0_tests PRIVATE SUB0_BUILD_CUDA)
+  # Gated DeltaNet Stage 3's CUDA fixture test (cuda_tests.cpp) needs the same SUB0_SOURCE_DIR-relative
+  # fixture path gdn_qwen4_fixture_tests.cpp (sub0_frontend_tests) already uses -- that target defines it
+  # for itself (line ~101 above); sub0_tests never needed it before this test existed.
+  target_compile_definitions(sub0_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endif()
 
 # Find the sub0_core shared lib next to the test binary at runtime.

@@ -3471,21 +3471,32 @@ __global__ void gdn_phaseA_kernel(const float* __restrict__ kn, const float* __r
 // PHASE B -- ONE chunk index `c` per launch (host for-loop over c=0..nC-1: genuinely sequential, this
 // IS the recurrence's real cross-chunk dependency, not an implementation artefact -- S5 step 3), grid
 // (batch, Hv), GDN_CHUNK threads. Reads Phase A's decay_mask/value_new/k_cumdecay for this chunk, updates
-// `last_state` [batch,Hv,dk,dv] in place (cached in dynamic shared memory across the block's own
-// lifetime), and writes core_out[M,Hv,dv] (the pre-RMSNormGated `core_attn_out`).
+// `last_state` [batch,Hv,dk,dv] in place, and writes core_out[M,Hv,dv] (the pre-RMSNormGated
+// `core_attn_out`).
+//
+// Deliberately NO shared-memory caching of `last_state`/`v_new` here (an earlier version cached both in
+// dynamic __shared__ memory -- at the real fixture's dk=dv=128 shape that needs ~96KB, ABOVE this
+// project's actual GPU's real per-block shared-memory ceiling; the raising cudaFuncSetAttribute call
+// failed, silently, because its return value went unchecked, and the kernel launch that followed then
+// itself failed silently too -- caught by this stage's own sub0_cuda_gdn_check test, which is exactly
+// why that test exists per AGENTS.md S6). Every thread instead reads `last_state`/`v_new_scratch`
+// straight from GLOBAL memory -- redundant bandwidth (every thread re-reads the same [dk,dv] state), not
+// a correctness compromise: this section's header comment on this file's overall precision/perf posture
+// already flags "no shared-memory tiling" as a deliberate correctness-first simplification, and this is
+// the same choice, just also sidestepping a real device-shared-memory-limit hazard rather than working
+// around it with a fragile size-dependent opt-in. `v_new_scratch` is `[batch,Hv,GDN_CHUNK,dv]`
+// (reused every chunk -- only the CURRENT chunk's values are ever live at once, since chunks are
+// processed strictly sequentially by this same host for-loop).
 __global__ void gdn_phaseB_kernel(const float* __restrict__ qn, const float* __restrict__ kn,
                                   const float* __restrict__ decay_mask, const float* __restrict__ gcum,
                                   const float* __restrict__ value_new, const float* __restrict__ k_cumdecay,
-                                  float* __restrict__ last_state, float* __restrict__ core_out,
+                                  float* __restrict__ last_state, float* __restrict__ v_new_scratch,
+                                  float* __restrict__ core_out,
                                   int batch, int T, int Hv, int dk, int dv, int nC, int c) {
     const int b = blockIdx.x, hv = blockIdx.y;
     const int i = threadIdx.x;
-    extern __shared__ float smem[];
-    float* S = smem;                    // [dk*dv]
-    float* v_new = S + dk * dv;         // [GDN_CHUNK * dv]
-    for (int idx = i; idx < dk * dv; idx += GDN_CHUNK)
-        S[idx] = last_state[(static_cast<size_t>(b) * Hv + hv) * dk * dv + idx];
-    __syncthreads();
+    float* const S = last_state + (static_cast<size_t>(b) * Hv + hv) * dk * dv;               // [dk,dv]
+    float* const v_new = v_new_scratch + (static_cast<size_t>(b) * Hv + hv) * GDN_CHUNK * dv;  // [GDN_CHUNK,dv]
 
     const int t_i = c * GDN_CHUNK + i;
     // v_new[i,:] = value_new[i,:] - k_cumdecay[i,:] @ S  (v_prime)
@@ -3500,7 +3511,7 @@ __global__ void gdn_phaseB_kernel(const float* __restrict__ qn, const float* __r
         for (int j = 0; j < dv; ++j)
             v_new[i * dv + j] = value_new[gdn_chunk_idx(b, hv, c, i, j, Hv, nC, dv)] - acc[j];
     }
-    __syncthreads();
+    __syncthreads();   // every thread's v_new[i,:] write must land before any thread reads v_new[j,:], j!=i
 
     // core_out[i,:] = exp(gcum_i) * (q_i @ S)  +  sum_{j<=i} (q_i . k_j) * decay_mask[i][j] * v_new[j,:]
     if (t_i < T) {
@@ -3528,7 +3539,7 @@ __global__ void gdn_phaseB_kernel(const float* __restrict__ qn, const float* __r
         float* out = core_out + (static_cast<size_t>(b) * T + t_i) * Hv * dv + static_cast<size_t>(hv) * dv;
         for (int a = 0; a < dv; ++a) out[a] = acc[a];
     }
-    __syncthreads();
+    __syncthreads();   // every read of the OLD S above must land before the update below overwrites it
 
     // State update: last_state = last_state*exp(g_last) + (k_i * exp(g_last - gcum_i))^T @ v_new, summed
     // over ALL GDN_CHUNK positions (including this chunk's own padding tail, which -- per this kernel's
@@ -3546,11 +3557,8 @@ __global__ void gdn_phaseB_kernel(const float* __restrict__ qn, const float* __r
                 const float kp = kn[(static_cast<size_t>(b) * T + tp) * Hv * dk + static_cast<size_t>(hv) * dk + a];
                 sum += kp * __expf(g_last - gp) * v_new[p * dv + j];
             }
-            S[idx] = S[idx] * __expf(g_last) + sum;
+            S[idx] = S[idx] * __expf(g_last) + sum;   // S aliases last_state directly -- no copy-back needed
         }
-        __syncthreads();
-        for (int idx = i; idx < dk * dv; idx += GDN_CHUNK)
-            last_state[(static_cast<size_t>(b) * Hv + hv) * dk * dv + idx] = S[idx];
     }
 }
 
@@ -3588,6 +3596,8 @@ struct GdnDeviceScratch {
     float* value_new = nullptr;                         // [batch, Hv, nC, 64, dv]
     float* k_cumdecay = nullptr;                        // [batch, Hv, nC, 64, dk]
     float* last_state = nullptr;                        // [batch, Hv, dk, dv]
+    float* v_new_scratch = nullptr;                     // [batch, Hv, GDN_CHUNK, dv] -- Phase B's own
+                                                         // scratch, reused every chunk (see that kernel's comment)
     float* core_out = nullptr;                          // [rows, Hv, dv]
     float* gated = nullptr;                             // [rows, value_dim]
 };
@@ -3637,16 +3647,10 @@ void gdn_forward_device(const sub0::gdn::Dims& d, int batch, int T,
     }
     {
         const dim3 grid(batch, Hv);
-        const size_t shmem = static_cast<size_t>(dk) * dv * sizeof(float) + static_cast<size_t>(GDN_CHUNK) * dv * sizeof(float);
-        static bool attr_set = false;
-        if (!attr_set) {   // opt in to >48KB dynamic shared mem once (the fixture's dk=dv=128 shape needs it)
-            cudaFuncSetAttribute(gdn_phaseB_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);
-            attr_set = true;
-        }
         for (int c = 0; c < nC; ++c)
-            gdn_phaseB_kernel<<<grid, GDN_CHUNK, shmem, g_stream>>>(
-                s.qn, s.kn, s.decay_mask, s.gcum, s.value_new, s.k_cumdecay, s.last_state, s.core_out,
-                batch, T, Hv, dk, dv, nC, c);
+            gdn_phaseB_kernel<<<grid, GDN_CHUNK, 0, g_stream>>>(
+                s.qn, s.kn, s.decay_mask, s.gcum, s.value_new, s.k_cumdecay, s.last_state, s.v_new_scratch,
+                s.core_out, batch, T, Hv, dk, dv, nC, c);
     }
     {
         const int n = M * Hv, block = 128, grid = (n + block - 1) / block;
@@ -3678,6 +3682,7 @@ int gdn_alloc_scratch(GdnDeviceScratch& s, const sub0::gdn::Dims& d, int max_row
     SUB0_CUDA_CHECK(cudaMalloc(&s.value_new,   B * Hv * nC * GDN_CHUNK * dv * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&s.k_cumdecay,  B * Hv * nC * GDN_CHUNK * dk * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&s.last_state,  B * Hv * dk * dv * sizeof(float)));
+    SUB0_CUDA_CHECK(cudaMalloc(&s.v_new_scratch, B * Hv * GDN_CHUNK * dv * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&s.core_out, R * Hv * dv * sizeof(float)));
     SUB0_CUDA_CHECK(cudaMalloc(&s.gated,    R * value_dim * sizeof(float)));
     return 0;
@@ -3686,7 +3691,7 @@ void gdn_free_scratch(GdnDeviceScratch& s) {
     cudaFree(s.qkv_pre); cudaFree(s.qkv_post); cudaFree(s.bproj); cudaFree(s.aproj); cudaFree(s.zproj);
     cudaFree(s.beta); cudaFree(s.glog); cudaFree(s.qn); cudaFree(s.kn); cudaFree(s.decay_mask);
     cudaFree(s.gcum); cudaFree(s.value_new); cudaFree(s.k_cumdecay); cudaFree(s.last_state);
-    cudaFree(s.core_out); cudaFree(s.gated);
+    cudaFree(s.v_new_scratch); cudaFree(s.core_out); cudaFree(s.gated);
     s = GdnDeviceScratch{};
 }
 
