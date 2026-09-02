@@ -326,6 +326,62 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[
     // distinguishing quantity, established above.
 }
 
+// --- Gated Residual -- DESIGN + Stage 0 skeleton only (docs/GATED_RESIDUAL.md) -------------------
+// No forward op exists yet (layout.hpp's static_asserts refuse any nonzero HC_COUNT/HC_LOWRANK at
+// compile time), so there is nothing here to run at production dims. What Stage 0 DOES add -- the
+// USE_GATED_RESIDUAL gate, HC_WIDE, and the gr_param_delta() closed form -- is pure compile-time
+// bookkeeping, pinned at TWO shapes per AGENTS.md S7, mirroring the GDN Stage 0 test just above.
+TEST_CASE("Gated Residual PARAM_FLOATS delta is zero when off and strictly positive when on, at two "
+          "shapes", "[layout][gr]") {
+    // Shape 1: 8 layers, d_model 96 (the fast-iteration toy scale this thread's own precedent prefers).
+    static_assert(sub0::gr_param_delta(8, 96, 0, 0) == 0);
+    static_assert(sub0::gr_param_delta(8, 96, 4, 16) > 0);
+    REQUIRE(sub0::gr_param_delta(8, 96, 0, 0) == 0);
+    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) > 0);
+    // Hand-computed at hc_count=4, hc_lowrank=16, d_model=96: wide=384.
+    //   per_instance_with_inject = 384 + 2*384*16 + 384*4 = 384 + 12288 + 1536 = 14208
+    //   top_instance             = 384 + 12288 = 12672
+    //   total = 8 * 2 * 14208 + 12672 = 227328 + 12672 = 240000
+    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
+    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
+
+    // Shape 2: 11 layers (ODD/ragged -- GR has no per-layer schedule to be ragged about, but this
+    // confirms the closed form has no hidden even-layer-count assumption either), a different d_model.
+    static_assert(sub0::gr_param_delta(11, 132, 0, 0) == 0);
+    static_assert(sub0::gr_param_delta(11, 132, 4, 16) > 0);
+    REQUIRE(sub0::gr_param_delta(11, 132, 0, 0) == 0);
+    REQUIRE(sub0::gr_param_delta(11, 132, 4, 16) > 0);
+
+    // hc_count == 1 is disallowed by layout.hpp's own static_assert once Stage 1 relaxes the Stage 0
+    // hard clamp -- gr_param_delta() itself treats anything < 2 as "off" (0 delta), consistent with
+    // USE_GATED_RESIDUAL's own (HC_COUNT >= 2) gate, so the two can never disagree about what "off" means.
+    static_assert(sub0::gr_param_delta(8, 96, 1, 5) == 0);
+
+    // ...and this build's own state agrees: at the ONLY value Stage 0 can currently take (HC_COUNT == 0),
+    // USE_GATED_RESIDUAL is false, HC_WIDE collapses to exactly D_MODEL (so every existing [T,D_MODEL]
+    // expression not explicitly wrapped in a GR branch stays byte-identical, docs/GATED_RESIDUAL.md S4a),
+    // and the closed-form delta for THIS build's own dims is exactly zero.
+    static_assert(!sub0::USE_GATED_RESIDUAL);
+    static_assert(sub0::HC_WIDE == D_MODEL);
+    static_assert(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
+    REQUIRE_FALSE(sub0::USE_GATED_RESIDUAL);
+    REQUIRE(sub0::HC_WIDE == D_MODEL);
+    REQUIRE(sub0::gr_param_delta(N_LAYERS, D_MODEL, HC_COUNT, HC_LOWRANK) == 0);
+}
+
+// MODEL_ARCH_ID folds HC_COUNT/HC_LOWRANK in unconditionally (see layout.hpp make_model_arch_id), the
+// same "covers every axis" treatment NGRAM_MAX_N/NGRAM_TABLES_PER_ORDER/NGRAM_TABLE_SIZE already get --
+// verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build: the
+// direct, testable claim is that GR_DIMS/gr_param_delta -- the values that mix -- are real, well-defined
+// quantities (established above), not that this build differs from some OTHER build (Stage 0 can only
+// ever compile one HC_COUNT value: 0).
+TEST_CASE("Gated Residual dims are inert and well-defined at the Stage 0 neutral setting", "[layout][gr]") {
+    REQUIRE(sub0::GR_DIMS.hidden_size == D_MODEL);
+    REQUIRE(sub0::GR_DIMS.hc_count == 0);
+    REQUIRE(sub0::GR_DIMS.hc_lowrank == 0);
+    REQUIRE(sub0::GR_DIMS.wide() == 0);   // "describes a shape nothing builds" -- see GR_DIMS's own comment
+}
+
 // --- N-gram embeddings (docs/NGRAM_EMBEDDING.md) -------------------------------------------------
 // The hashing math (ngram_num_embedders / ngram_vocab_dim / ngram_order_of / ngram_vocab_mod) is
 // exposed as free functions of EXPLICIT parameters -- not folded into consteval array-builders closed

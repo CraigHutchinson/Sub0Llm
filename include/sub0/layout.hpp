@@ -21,6 +21,8 @@
                             // header comment) -- included here purely so GDN_DIMS can be a derived
                             // constant like GQA_GROUP/D_KV, not because gdn_math.hpp itself needs
                             // anything from this file.
+#include "gated_residual_math.hpp"  // sub0::gr::Dims for GR_DIMS below -- same reasoning as gdn_math.hpp
+                            // just above; dependency-free (see its own header comment).
 
 #include <algorithm>
 #include <array>
@@ -271,6 +273,46 @@ inline constexpr GdnSchedule GDN_SCHEDULE = gdn_schedule_for<N_LAYERS>(GDN_FULL_
 static_assert(GDN_FULL_ATTN_STRIDE > 0 || GDN_SCHEDULE.gdn_layers == 0,
               "GDN_FULL_ATTN_STRIDE == 0 must yield zero GDN layers");
 
+// GATED RESIDUAL (hyper-connections) -- Stage 0: config skeleton, hard-gated off (docs/GATED_RESIDUAL.md).
+// HC_COUNT parallel residual streams read/write-gated per sub-block (Qwen4-preview's own
+// Qwen4ExpTextGatedResidual, "Gated Residual (GR)", tech_report.pdf S2.2). 0 = off, the ONLY value this
+// build can currently take -- both flags are hard-clamped to 0 by a CLI CLI::Range(0,0) check
+// (tools/configurator.cpp) AND the static_asserts below, mirroring GDN_FULL_ATTN_STRIDE's own Stage 0
+// two-refusal pattern exactly. Stage 1 relaxes both the CLI range and these asserts to the real "0 or
+// >= 2" form once op_gr_* exists to consume a nonzero value.
+inline constexpr bool USE_GATED_RESIDUAL = (HC_COUNT >= 2);
+static_assert(HC_COUNT == 0, "Stage 0: HC_COUNT must be 0 (Gated Residual has no op yet) -- see docs/GATED_RESIDUAL.md");
+static_assert(HC_LOWRANK == 0, "Stage 0: HC_LOWRANK must be 0 (Gated Residual has no op yet) -- see docs/GATED_RESIDUAL.md");
+
+// The width `h` (the residual stream) actually has. At the neutral setting this IS D_MODEL, so every
+// existing [T,D_MODEL]-shaped expression in Model::forward/forward_one that is not explicitly wrapped in
+// a GR branch continues to typecheck and compute identically -- see docs/GATED_RESIDUAL.md S2.
+inline constexpr int HC_WIDE = USE_GATED_RESIDUAL ? HC_COUNT * D_MODEL : D_MODEL;
+
+// This build's GR dims, per docs/GATED_RESIDUAL.md S4a's mapping. Valid (never divides by zero) even
+// when USE_GATED_RESIDUAL is false -- same "describes a shape nothing builds" idiom GDN_DIMS/
+// DEPTH_CACHE_MAX already use above.
+inline constexpr gr::Dims GR_DIMS{D_MODEL, HC_COUNT, HC_LOWRANK};
+
+// Exact PARAM_FLOATS delta a GR-on build adds over an otherwise-identical GR-off build, per
+// docs/GATED_RESIDUAL.md S3b -- a pure function of explicit parameters (not closed over this build's own
+// constants), same reasoning as ngram_num_embedders()/gdn_schedule_for<LAYERS>() above: lets a test
+// exercise hypothetical (n_layers, d_model, hc_count, hc_lowrank) combinations regardless of what this
+// binary happens to be compiled for, and (once Stage 1 wires PARAM_LAYOUT) lets make_param_layout()'s
+// own per-layer append logic be checked against this SAME closed form rather than trusting it by
+// construction. Two full per-layer GatedResidual instances (attn_hyper_connection, mlp_hyper_connection,
+// each WITH block_inject) plus one top-level instance (hyper_connection_mixer, WITHOUT block_inject).
+// Zero at hc_count < 2 (matching USE_GATED_RESIDUAL's own gate) and strictly positive at hc_count >= 2,
+// hc_lowrank >= 1, d_model >= 1, n_layers >= 1 -- every term is a PRODUCT of positive quantities, so no
+// cancellation with any other axis is possible (contrast GDN's own mixed-sign Delta, S3c).
+inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_count, int hc_lowrank) {
+    if (hc_count < 2) return 0;
+    const long long wide = static_cast<long long>(hc_count) * d_model;
+    const long long per_instance_with_inject = wide + 2 * wide * hc_lowrank + wide * hc_count;
+    const long long top_instance             = wide + 2 * wide * hc_lowrank;
+    return static_cast<long long>(n_layers) * 2 * per_instance_with_inject + top_instance;
+}
+
 // --- N-GRAM EMBEDDINGS -- additional per-position features from rolling polynomial-hash token n-grams,
 // added into the input embedding (Nanbeige's `NanbeigeNgramEmbedding`, "concat" fusion mode -- see
 // docs/NGRAM_EMBEDDING.md). NGRAM_MAX_N is the highest n-gram order used (bigrams..NGRAM_MAX_N-grams);
@@ -488,6 +530,12 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(NGRAM_MAX_N));
     mix(static_cast<std::uint64_t>(NGRAM_TABLES_PER_ORDER));
     mix(static_cast<std::uint64_t>(NGRAM_TABLE_SIZE));
+    // Gated Residual: also a SHAPE-changing axis (docs/GATED_RESIDUAL.md S3c -- Delta is a pure,
+    // unconditional addition of new tensors, strictly monotonic, so PARAM_FLOATS alone already
+    // discriminates it and it does NOT join ARCH_FINGERPRINT), mixed in here unconditionally like
+    // every other axis MODEL_ARCH_ID covers.
+    mix(static_cast<std::uint64_t>(HC_COUNT));
+    mix(static_cast<std::uint64_t>(HC_LOWRANK));
     return h;
 }
 inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();
