@@ -608,6 +608,11 @@ int main(int argc, char** argv) {
     // HC_COUNT parallel residual streams read/write-gated per sub-block. 0 = off, the default.
     int hc_count           = 0;
     int hc_lowrank         = 0;
+    // Mixture of Experts (docs/MOE.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1
+    // relaxes the range. NUM_EXPERTS routed experts + 1 always-on shared expert per layer,
+    // EXPERTS_PER_TOK selected per token, replacing the FFN block for EVERY layer when on.
+    int num_experts        = 0;
+    int experts_per_tok    = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -690,6 +695,15 @@ int main(int argc, char** argv) {
                    "Gated Residual: low-rank bottleneck width of the input-mixer gate (0 = off, must "
                    "match --hc-count's on/off state, i.e. >= 1 iff --hc-count >= 2)")
        ->capture_default_str()->check(CLI::Range(0, 4096));
+    app.add_option("--num-experts", num_experts,
+                   "Mixture of Experts (docs/MOE.md): number of routed experts per layer, replacing the "
+                   "FFN block for EVERY layer when on (0 = off, else >= 2). Stage 1: CPU forward only -- "
+                   "gen/eval/report work, train/tune do not (no backward pass yet, and no CUDA build)")
+       ->capture_default_str()->check(CLI::Range(0, 512));
+    app.add_option("--experts-per-tok", experts_per_tok,
+                   "Mixture of Experts: top-k routed experts selected per token (0 = off, must match "
+                   "--num-experts' on/off state, and must not exceed it)")
+       ->capture_default_str()->check(CLI::Range(0, 16));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -906,6 +920,24 @@ int main(int argc, char** argv) {
         std::println(stderr,
                      "configure error: hc-count ({}) and hc-lowrank ({}) must be on or off together "
                      "(hc-count >= 2 iff hc-lowrank >= 1)", hc_count, hc_lowrank);
+        return 1;
+    }
+    // Mixture of Experts: mirrors layout.hpp's own static_asserts, as a configure-time diagnostic naming
+    // the flags rather than a compile error in the engine (same pattern as the hc-count/hc-lowrank check
+    // just above).
+    if (num_experts != 0 && num_experts < 2) {
+        std::println(stderr, "configure error: num-experts ({}) must be 0 (off) or >= 2", num_experts);
+        return 1;
+    }
+    if ((num_experts >= 2) != (experts_per_tok >= 1)) {
+        std::println(stderr,
+                     "configure error: num-experts ({}) and experts-per-tok ({}) must be on or off "
+                     "together (num-experts >= 2 iff experts-per-tok >= 1)", num_experts, experts_per_tok);
+        return 1;
+    }
+    if (experts_per_tok > num_experts) {
+        std::println(stderr, "configure error: experts-per-tok ({}) cannot exceed num-experts ({})",
+                     experts_per_tok, num_experts);
         return 1;
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
@@ -1382,6 +1414,9 @@ int main(int argc, char** argv) {
     // docs/GATED_RESIDUAL.md.
     cos << "constexpr int  HC_COUNT   = " << hc_count << ";\n";
     cos << "constexpr int  HC_LOWRANK = " << hc_lowrank << ";\n";
+    // Mixture of Experts Stage 0/1 (layout.hpp's USE_MOE/MOE_DIMS). 0 = off, the default. See docs/MOE.md.
+    cos << "constexpr int  NUM_EXPERTS     = " << num_experts << ";\n";
+    cos << "constexpr int  EXPERTS_PER_TOK = " << experts_per_tok << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
@@ -1577,6 +1612,7 @@ int main(int argc, char** argv) {
     shown.ngram_max_n = ngram_max_n; shown.ngram_tables = ngram_tables;
     shown.ngram_table_size = ngram_table_size;
     shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;
+    shown.num_experts = num_experts; shown.experts_per_tok = experts_per_tok;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;

@@ -735,10 +735,12 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
         const sub0::ArchAxes2 got2 = sub0::arch_axes2_of(arch2);
         sub0::log::warn("ignoring checkpoint '{}': built with a different architecture in a way nfloat "
                         "cannot catch -- loop schedule {}x{} vs {}x{}, rope theta {:g} vs {:g}, "
-                        "depth-attn stride {} vs {}, gdn full-attn stride {} vs {}.",
+                        "depth-attn stride {} vs {}, gdn full-attn stride {} vs {}, moe experts-per-tok "
+                        "{} vs {}.",
                         path, got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS,
                         got.rope_theta, ROPE_THETA, got.depth_attn_stride, DEPTH_ATTN_STRIDE,
-                        got2.gdn_full_attn_stride, GDN_FULL_ATTN_STRIDE);
+                        got2.gdn_full_attn_stride, GDN_FULL_ATTN_STRIDE,
+                        got2.experts_per_tok, EXPERTS_PER_TOK);
         return false;
     }
 
@@ -1682,6 +1684,7 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.loop_middle = LOOP_MIDDLE_LAYERS; cfg.loop_repeats = LOOP_REPEATS;
         cfg.depth_attn_stride = DEPTH_ATTN_STRIDE;
         cfg.gdn_full_attn_stride = GDN_FULL_ATTN_STRIDE;   // always 0 today -- docs/GATED_DELTANET.md
+        cfg.num_experts = NUM_EXPERTS; cfg.experts_per_tok = EXPERTS_PER_TOK;   // always 0 today -- docs/MOE.md
         cfg.ngram_max_n = NGRAM_MAX_N; cfg.ngram_tables = NGRAM_TABLES_PER_ORDER;
         cfg.ngram_table_size = NGRAM_TABLE_SIZE;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;

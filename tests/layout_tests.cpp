@@ -28,7 +28,11 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     constexpr int kAttnLayers = N_LAYERS - sub0::GDN_SCHEDULE.gdn_layers;
     constexpr int kAttnMixer  = 4 + (USE_QK_NORM ? 2 : 0);
     constexpr int kGdnMixer   = 9;
-    constexpr int kFfnSlots   = USE_GATED_FFN ? 3 : 4;
+    // Mixture of Experts (Stage 1, docs/MOE.md S3b): REPLACES the FFN's own kFfnSlots with MoeRouter (1)
+    // + NUM_EXPERTS*(MoeGate,MoeUp,MoeDown) + the shared expert's own SwiGLU triple (3) + its gate
+    // projection (1), for EVERY layer (no per-layer schedule -- see USE_MOE's own comment). 0 at the
+    // neutral (NUM_EXPERTS < 2) setting, where kFfnSlots is used unchanged.
+    constexpr int kFfnSlots   = sub0::USE_MOE ? (1 + 3 * NUM_EXPERTS + 3 + 1) : (USE_GATED_FFN ? 3 : 4);
     // Gated Residual (Stage 1, docs/GATED_RESIDUAL.md S3b): 4 slots per instance (GrHcNorm/MixDown/
     // MixUp/BlockInject), TWO full instances per layer (attn-wrapping, mlp-wrapping) plus one top-level
     // instance WITHOUT BlockInject (3 slots), appended once regardless of N_LAYERS. Zero at HC_COUNT==0.
@@ -81,24 +85,35 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
         // (decay=true), also kept FULL PRECISION (ternary=false) for the same "genuinely unexplored,
         // don't add unvalidated surface" reason as GDN's own projections. GrHcNorm is gain-shaped
         // (decay=false), already satisfying `!is_matrix`.
+        // Mixture of Experts (Stage 1, docs/MOE.md S3b): MoeGate/MoeUp/MoeDown/MoeSharedGate/
+        // MoeSharedUp/MoeSharedDown are ordinary GEMM weights -- ternary-eligible, same treatment as
+        // Wg/W1/W2 (they route through Muon too, see is_muon_kind). MoeRouter/MoeSharedGateProj are
+        // real 2D GEMM projections (decay=true) kept FULL PRECISION (ternary=false), for the same
+        // "routing precision matters" reasoning LmHead stays full precision for its own different reason.
+        const bool is_moe_expert_matrix =
+            p.kind == PKind::MoeGate || p.kind == PKind::MoeUp || p.kind == PKind::MoeDown ||
+            p.kind == PKind::MoeSharedGate || p.kind == PKind::MoeSharedUp || p.kind == PKind::MoeSharedDown;
+        const bool is_moe_router_matrix =
+            p.kind == PKind::MoeRouter || p.kind == PKind::MoeSharedGateProj;
         const bool is_matrix =
             p.kind == PKind::Wq || p.kind == PKind::Wk || p.kind == PKind::Wv ||
             p.kind == PKind::Wo || p.kind == PKind::W1 || p.kind == PKind::W2 ||
             p.kind == PKind::Wg || p.kind == PKind::LmHead || p.kind == PKind::NgramProj ||
             p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
             p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj ||
-            p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject;
+            p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject ||
+            is_moe_expert_matrix || is_moe_router_matrix;
         // AdamW weight decay applies only to the GEMM weight matrices.
         REQUIRE(p.decay == is_matrix);
         // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj/
-        // any GDN/GR projection (see the comment above for why both stay full precision for now).
+        // any GDN/GR/MoE-router projection (see the comment above for why each stays full precision).
         const bool is_gdn_matrix =
             p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
             p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj;
         const bool is_gr_matrix =
             p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject;
         const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj
-                                      && !is_gdn_matrix && !is_gr_matrix;
+                                      && !is_gdn_matrix && !is_gr_matrix && !is_moe_router_matrix;
         REQUIRE(p.ternary == ternary_eligible);
     }
 }
@@ -313,10 +328,19 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
 // bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
 // pins above. Calling arch_fingerprint2() directly (rather than requiring an actual GDN build) is what
 // makes this testable at all while the static_assert in layout.hpp forbids ever compiling one.
-TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[layout][gdn]") {
-    REQUIRE(sub0::arch_fingerprint2(0) == 0);
-    REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);              // this build's own word: always 0 today
-    REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
+TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are both off", "[layout][gdn]") {
+    REQUIRE(sub0::arch_fingerprint2(0) == 0);              // default experts_per_tok=0 too
+    REQUIRE(sub0::arch_fingerprint2(0, 0) == 0);
+    // This build's own word is 0 only when BOTH axes are off -- docs/MOE.md S3c added EXPERTS_PER_TOK
+    // into byte 1 of this SAME word (this stage's own real build under test may have MoE genuinely ON,
+    // e.g. the two-scale/parity verification config, so this is an implication, not an unconditional 0).
+    if constexpr (EXPERTS_PER_TOK == 0) {
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
+    } else {
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK));
+        REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
+    }
 
     // A nonzero stride MUST differ, or a (future) GDN checkpoint would load into a plain build and
     // silently compute something else -- there is no shape difference to catch it in general (a GDN
@@ -329,15 +353,25 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[
     // Round-trips through the decoder, so the diagnostic can name the mismatched value.
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4)).gdn_full_attn_stride == 4);
 
-    // The reserved high 56 bits stay zero regardless of the low byte's value -- headroom for the NEXT
+    // Mixture of Experts (docs/MOE.md S3c): EXPERTS_PER_TOK occupies byte 1, independently of GDN's own
+    // byte 0 -- a nonzero experts-per-tok MUST differ from the all-zero word for the same "would silently
+    // compute something else" reason, and the two bytes must not collide with each other.
+    REQUIRE(sub0::arch_fingerprint2(0, 10) != sub0::arch_fingerprint2(0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 10) != sub0::arch_fingerprint2(4, 0));      // byte 0 vs byte 1 alone
+    REQUIRE(sub0::arch_fingerprint2(4, 10) != sub0::arch_fingerprint2(4, 0));      // same GDN stride, differ by top-k
+    REQUIRE(sub0::arch_fingerprint2(4, 10) != sub0::arch_fingerprint2(0, 10));     // same top-k, differ by GDN stride
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).gdn_full_attn_stride == 4);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).experts_per_tok == 10);
+
+    // The reserved high 48 bits stay zero regardless of either byte's value -- headroom for the NEXT
     // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    REQUIRE((sub0::arch_fingerprint2(0xff) >> 8) == 0);
+    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff) >> 16) == 0);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
-    // a hypothetical GDN stride must not collide, matching how it already handles DEPTH_ATTN_STRIDE.
-    // Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build --
-    // the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is a real,
-    // distinguishing quantity, established above.
+    // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles
+    // DEPTH_ATTN_STRIDE. Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants
+    // of THIS build -- the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is
+    // a real, distinguishing quantity, established above.
 }
 
 // --- Gated Residual -- DESIGN + Stage 0 skeleton only (docs/GATED_RESIDUAL.md) -------------------
@@ -474,6 +508,70 @@ TEST_CASE("n-gram embeddings are off by default and inert at the neutral setting
         for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
             REQUIRE(p.kind != sub0::PKind::NgramEmb);
             REQUIRE(p.kind != sub0::PKind::NgramProj);
+        }
+    }
+}
+
+// --- Mixture of Experts (docs/MOE.md) -------------------------------------------------------------
+// moe_param_delta() is exposed as a free function of EXPLICIT parameters (not closed over this build's
+// own NUM_EXPERTS/EXPERTS_PER_TOK) for the same reason ngram_num_embedders()/gr_param_delta() are: lets
+// this test pin hand-verified values at hypothetical configs regardless of what THIS build was
+// configured with. Hand-computed at n_layers=1, d_model=4, d_ff=8, num_experts=2 (the smallest "on"
+// value):
+//   router          = d_model*num_experts        = 4*2  = 8
+//   per_expert      = 3*d_model*d_ff              = 3*4*8 = 96
+//   experts total   = num_experts*per_expert      = 2*96 = 192
+//   shared          = 3*d_model*d_ff              = 96
+//   shared_gate     = d_model                     = 4
+//   moe_layer_floats = 8+192+96+4                 = 300
+//   dense (gated, 3 tensors)  = 3*d_model*d_ff     = 96   -> delta = 300-96  = 204
+//   dense (plain, 4 tensors)  = 2*d_model*d_ff+d_ff+d_model = 64+8+4 = 76 -> delta = 300-76 = 224
+TEST_CASE("Mixture of Experts param delta matches hand-computed values at hypothetical configs", "[layout][moe]") {
+    static_assert(sub0::moe_param_delta(1, 4, 8, 0, 0, true) == 0);      // off (num_experts < 2)
+    static_assert(sub0::moe_param_delta(1, 4, 8, 1, 1, true) == 0);      // 1 expert also off (< 2)
+    static_assert(sub0::moe_param_delta(1, 4, 8, 2, 1, true) == 204);    // replacing a gated dense FFN
+    static_assert(sub0::moe_param_delta(1, 4, 8, 2, 1, false) == 224);   // replacing a plain dense FFN
+    static_assert(sub0::moe_param_delta(3, 4, 8, 2, 1, true) == 3 * 204);  // scales linearly in n_layers
+    // Strictly positive for every num_experts >= 2 (docs/MOE.md S3b) -- checked at a larger, more
+    // "production-shaped" hypothetical too, not just the minimal case above.
+    static_assert(sub0::moe_param_delta(8, 96, 384, 8, 2, true) > 0);
+    REQUIRE(sub0::moe_param_delta(1, 4, 8, 2, 1, true) == 204);
+}
+
+// MODEL_ARCH_ID folds NUM_EXPERTS in unconditionally and ARCH_FINGERPRINT2 folds EXPERTS_PER_TOK in
+// (layout.hpp's make_model_arch_id/arch_fingerprint2) -- verified indirectly here since both are
+// compile-time constants of THIS build: the direct, testable claim is that MOE_DIMS/moe_param_delta --
+// the values that mix -- are real, well-defined quantities (established above).
+TEST_CASE("MoE dims are inert and well-defined at the Stage 0/1 neutral setting", "[layout][moe]") {
+    REQUIRE(sub0::MOE_DIMS.hidden_size == D_MODEL);
+    REQUIRE(sub0::MOE_DIMS.d_ff == D_FF);
+    if constexpr (NUM_EXPERTS == 0) {
+        REQUIRE(sub0::MOE_DIMS.num_experts == 0);
+        REQUIRE(sub0::MOE_DIMS.experts_per_tok == 0);
+    } else {
+        REQUIRE(sub0::MOE_DIMS.num_experts == NUM_EXPERTS);
+        REQUIRE(sub0::MOE_DIMS.experts_per_tok == EXPERTS_PER_TOK);
+    }
+}
+
+// Stage 0/1: at the neutral setting (NUM_EXPERTS == 0) the feature contributes ZERO new parameters and
+// touches no PARAM_LAYOUT entry -- the same "bit-identical when off" contract every other mechanism in
+// this thread pins. Written as an implication, not gated behind `if constexpr`, for the same
+// STATIC_REQUIRE-inside-an-untaken-branch reason the n-gram test above documents.
+TEST_CASE("Mixture of Experts is off by default and inert at the neutral setting", "[layout][moe]") {
+    STATIC_REQUIRE(sub0::USE_MOE == (NUM_EXPERTS >= 2));
+    STATIC_REQUIRE((!sub0::USE_MOE) || NUM_EXPERTS >= 2);
+    if constexpr (!sub0::USE_MOE) {
+        REQUIRE(sub0::moe_param_delta(N_LAYERS, D_MODEL, D_FF, NUM_EXPERTS, EXPERTS_PER_TOK, USE_GATED_FFN) == 0);
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            REQUIRE(p.kind != sub0::PKind::MoeRouter);
+            REQUIRE(p.kind != sub0::PKind::MoeGate);
+            REQUIRE(p.kind != sub0::PKind::MoeUp);
+            REQUIRE(p.kind != sub0::PKind::MoeDown);
+            REQUIRE(p.kind != sub0::PKind::MoeSharedGate);
+            REQUIRE(p.kind != sub0::PKind::MoeSharedUp);
+            REQUIRE(p.kind != sub0::PKind::MoeSharedDown);
+            REQUIRE(p.kind != sub0::PKind::MoeSharedGateProj);
         }
     }
 }
