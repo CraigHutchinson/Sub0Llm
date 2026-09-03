@@ -25,9 +25,15 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // (GDN never uses it -- layout.hpp's PKind comment). At GDN_FULL_ATTN_STRIDE == 0, gdn_layers == 0
     // and this collapses to exactly the pre-Stage-1 formula below, independently re-derived (not by
     // calling count_num_params() itself, which would make this circular).
-    constexpr int kAttnLayers = N_LAYERS - sub0::GDN_SCHEDULE.gdn_layers;
+    // QSA (Stage 1, docs/QSA.md S3b): a QSA layer is a FULL-ATTENTION layer whose mixer is replaced by a
+    // FIXED 10 slots (QsaQProj/GateProj/KProj/VProj/OProj/QNorm/KNorm + the indexer's QkProj/QNorm/KNorm),
+    // regardless of USE_QK_NORM (the real Qwen4ExpTextAttention always has its own q_norm/k_norm). At
+    // USE_QSA == false there are no QSA layers and this collapses to the pre-QSA formula exactly.
+    constexpr int kQsaLayers  = sub0::USE_QSA ? (N_LAYERS - sub0::GDN_SCHEDULE.gdn_layers) : 0;
+    constexpr int kAttnLayers = N_LAYERS - sub0::GDN_SCHEDULE.gdn_layers - kQsaLayers;
     constexpr int kAttnMixer  = 4 + (USE_QK_NORM ? 2 : 0);
     constexpr int kGdnMixer   = 9;
+    constexpr int kQsaMixer   = 10;
     // Mixture of Experts (Stage 1, docs/MOE.md S3b): REPLACES the FFN's own kFfnSlots with MoeRouter (1)
     // + NUM_EXPERTS*(MoeGate,MoeUp,MoeDown) + the shared expert's own SwiGLU triple (3) + its gate
     // projection (1), for EVERY layer (no per-layer schedule -- see USE_MOE's own comment). 0 at the
@@ -42,6 +48,7 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
                                         + N_LAYERS * (2 + kFfnSlots + kGrPerLayer)
                                         + kAttnLayers * kAttnMixer
                                         + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
+                                        + kQsaLayers * kQsaMixer
                                         + (USE_TIED_EMBEDDINGS ? 1 : 3)
                                         + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0)
                                         + kGrTop);
@@ -95,6 +102,16 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
             p.kind == PKind::MoeSharedGate || p.kind == PKind::MoeSharedUp || p.kind == PKind::MoeSharedDown;
         const bool is_moe_router_matrix =
             p.kind == PKind::MoeRouter || p.kind == PKind::MoeSharedGateProj;
+        // QSA (Stage 1, docs/QSA.md S3b): the five gated-attention projections are ordinary GEMM weights
+        // -- ternary-eligible, Muon-eligible, exactly Wq/Wk/Wv/Wo's own treatment. QsaIdxQkProj is a real
+        // 2D GEMM projection (decay=true) kept FULL PRECISION (ternary=false): it makes a SELECTION
+        // decision, the same "routing precision matters" reasoning MoeRouter stays full precision for.
+        // QsaQNorm/QsaKNorm/QsaIdxQNorm/QsaIdxKNorm are gain-shaped (decay=false), already satisfying
+        // `!is_matrix` with no special case, same as NgramEmb/GrHcNorm.
+        const bool is_qsa_attn_matrix =
+            p.kind == PKind::QsaQProj || p.kind == PKind::QsaGateProj || p.kind == PKind::QsaKProj ||
+            p.kind == PKind::QsaVProj || p.kind == PKind::QsaOProj;
+        const bool is_qsa_index_matrix = p.kind == PKind::QsaIdxQkProj;
         const bool is_matrix =
             p.kind == PKind::Wq || p.kind == PKind::Wk || p.kind == PKind::Wv ||
             p.kind == PKind::Wo || p.kind == PKind::W1 || p.kind == PKind::W2 ||
@@ -102,7 +119,8 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
             p.kind == PKind::GdnInProjQkv || p.kind == PKind::GdnInProjZ ||
             p.kind == PKind::GdnInProjB || p.kind == PKind::GdnInProjA || p.kind == PKind::GdnOutProj ||
             p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject ||
-            is_moe_expert_matrix || is_moe_router_matrix;
+            is_moe_expert_matrix || is_moe_router_matrix ||
+            is_qsa_attn_matrix || is_qsa_index_matrix;
         // AdamW weight decay applies only to the GEMM weight matrices.
         REQUIRE(p.decay == is_matrix);
         // Ternary quantization covers the block matrices but NOT the full-precision head/ngram-proj/
@@ -113,7 +131,8 @@ TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout
         const bool is_gr_matrix =
             p.kind == PKind::GrMixDown || p.kind == PKind::GrMixUp || p.kind == PKind::GrBlockInject;
         const bool ternary_eligible = is_matrix && p.kind != PKind::LmHead && p.kind != PKind::NgramProj
-                                      && !is_gdn_matrix && !is_gr_matrix && !is_moe_router_matrix;
+                                      && !is_gdn_matrix && !is_gr_matrix && !is_moe_router_matrix
+                                      && !is_qsa_index_matrix;
         REQUIRE(p.ternary == ternary_eligible);
     }
 }
@@ -334,11 +353,14 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     // This build's own word is 0 only when BOTH axes are off -- docs/MOE.md S3c added EXPERTS_PER_TOK
     // into byte 1 of this SAME word (this stage's own real build under test may have MoE genuinely ON,
     // e.g. the two-scale/parity verification config, so this is an implication, not an unconditional 0).
-    if constexpr (EXPERTS_PER_TOK == 0) {
+    // ... and, since docs/QSA.md S3a, only when QSA's own budget/compress-ratio (bytes 2-3, 4) are off too.
+    if constexpr (EXPERTS_PER_TOK == 0 && QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0) {
         REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);
         REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
     } else {
-        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK));
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK,
+                                                                    QSA_INDEXER_BUDGET,
+                                                                    QSA_INDEXER_COMPRESS_RATIO));
         REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
     }
 
@@ -363,9 +385,25 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).gdn_full_attn_stride == 4);
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).experts_per_tok == 10);
 
-    // The reserved high 48 bits stay zero regardless of either byte's value -- headroom for the NEXT
+    // QSA (docs/QSA.md S3a): indexer_budget occupies [31:16] (SIXTEEN bits -- the real value 2048 does
+    // not fit 8) and indexer_compress_ratio [39:32], both independent of GDN's byte 0 and MoE's byte 1.
+    // The same "would silently attend to a different token set" reason applies: neither changes any
+    // tensor shape, so nothing else can catch a cross-load.
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 2048, 4) != sub0::arch_fingerprint2(0, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 2048, 4) != sub0::arch_fingerprint2(0, 0, 2048, 8));  // ratio alone
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 2048, 4) != sub0::arch_fingerprint2(0, 0, 256, 4));   // budget alone
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 2048, 4) != sub0::arch_fingerprint2(4, 10, 0, 0));    // no collision
+    REQUIRE(sub0::arch_fingerprint2(4, 10, 2048, 4) != sub0::arch_fingerprint2(4, 10, 0, 0));
+    // A budget above 255 must survive intact -- the direct check that 16 bits, not 8, were allocated.
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).qsa_indexer_budget == 2048);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).qsa_indexer_compress_ratio == 4);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).gdn_full_attn_stride == 4);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).experts_per_tok == 10);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0xffff, 0xff)).qsa_indexer_budget == 0xffff);
+
+    // The reserved high 24 bits stay zero regardless of any field's value -- headroom for the NEXT
     // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff) >> 16) == 0);
+    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff) >> 40) == 0);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
     // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles
@@ -575,3 +613,158 @@ TEST_CASE("Mixture of Experts is off by default and inert at the neutral setting
         }
     }
 }
+
+// --- Qwen Sparse Attention (QSA) -- docs/QSA.md -------------------------------------------------
+//
+// qsa_param_delta() and qsa_schedule_for<LAYERS>() are both exposed as free functions of EXPLICIT
+// parameters (not closed over this build's own QSA_INDEXER_*/GDN_FULL_ATTN_STRIDE) for the same reason
+// gdn_schedule_for()/gr_param_delta()/moe_param_delta() are: AGENTS.md S7's own lesson (LoopSplit's
+// odd-layer-count static_assert was invisible at one scale and instant at another) is only enforceable
+// if hypothetical shapes -- including ones this binary was NOT built for -- can be asserted directly.
+
+TEST_CASE("QSA layer schedule is a three-way classification, correct at an odd/non-dividing layer count",
+          "[layout][qsa]") {
+    using sub0::LayerMixer;
+    // Even, dividing: 8 layers at stride 4 -> layers 3 and 7 are full attention (=> QSA when on),
+    // everything else GDN. This is exactly the real model's own rule (verified against the real
+    // config.json's layer_types array, docs/QSA.md S0), just at a smaller layer count.
+    {
+        constexpr auto s = sub0::qsa_schedule_for<8>(4, true);
+        STATIC_REQUIRE(s[0] == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[1] == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[2] == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[3] == LayerMixer::Qsa);
+        STATIC_REQUIRE(s[4] == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[7] == LayerMixer::Qsa);
+        int qsa_n = 0; for (const LayerMixer m : s) if (m == LayerMixer::Qsa) ++qsa_n;
+        REQUIRE(qsa_n == 2);
+    }
+    // ODD and NON-DIVIDING: 11 layers at stride 4. 4 does not divide 11, so the final partial group
+    // (layers 8,9,10) has NO full-attention layer at all -- exactly the class of ragged-tail bug a
+    // single-scale check cannot see. Layers 3 and 7 are QSA; layer 10 must NOT be.
+    {
+        constexpr auto s = sub0::qsa_schedule_for<11>(4, true);
+        STATIC_REQUIRE(s[3]  == LayerMixer::Qsa);
+        STATIC_REQUIRE(s[7]  == LayerMixer::Qsa);
+        STATIC_REQUIRE(s[8]  == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[9]  == LayerMixer::Gdn);
+        STATIC_REQUIRE(s[10] == LayerMixer::Gdn);
+        int qsa_n = 0, gdn_n = 0;
+        for (const LayerMixer m : s) { if (m == LayerMixer::Qsa) ++qsa_n; if (m == LayerMixer::Gdn) ++gdn_n; }
+        REQUIRE(qsa_n == 2);
+        REQUIRE(gdn_n == 9);
+    }
+    // ODD layer count with a stride that DOES divide it: 11 layers at stride 11 -> only the last layer.
+    {
+        constexpr auto s = sub0::qsa_schedule_for<11>(11, true);
+        int qsa_n = 0; for (const LayerMixer m : s) if (m == LayerMixer::Qsa) ++qsa_n;
+        REQUIRE(qsa_n == 1);
+        STATIC_REQUIRE(s[10] == LayerMixer::Qsa);
+    }
+    // Stride 0 (this project's default): NO GDN layers at all, so EVERY layer is full attention -- and
+    // therefore every layer is QSA when QSA is on, none when it is off.
+    {
+        constexpr auto on  = sub0::qsa_schedule_for<11>(0, true);
+        constexpr auto off = sub0::qsa_schedule_for<11>(0, false);
+        for (int l = 0; l < 11; ++l) {
+            REQUIRE(on[static_cast<std::size_t>(l)]  == LayerMixer::Qsa);
+            REQUIRE(off[static_cast<std::size_t>(l)] == LayerMixer::Attn);
+        }
+    }
+    // qsa_on=false must never produce a Qsa entry at ANY stride -- the "zero effect when off" contract,
+    // asserted rather than assumed.
+    {
+        constexpr auto s = sub0::qsa_schedule_for<11>(4, false);
+        for (const LayerMixer m : s) REQUIRE(m != LayerMixer::Qsa);
+    }
+    // This build's own MIXER_SCHEDULE must reproduce the free function exactly, and must agree with the
+    // pre-existing GDN_SCHEDULE on every layer (the invariant layout.hpp static_asserts).
+    constexpr auto this_build = sub0::qsa_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE, sub0::USE_QSA);
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const std::size_t i = static_cast<std::size_t>(l);
+        REQUIRE(sub0::MIXER_SCHEDULE[i] == this_build[i]);
+        REQUIRE((sub0::MIXER_SCHEDULE[i] != LayerMixer::Gdn) == sub0::GDN_SCHEDULE.full_attn[i]);
+    }
+}
+
+TEST_CASE("QSA param delta matches hand-computed values at hypothetical configs, at two shapes",
+          "[layout][qsa]") {
+    // Off is exactly zero at every shape -- the neutral-setting identity, not merely "small".
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 132, 66, 33, true, 4, 1, 8, false) == 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
+
+    // Hand-computed, tiny, fully checkable shape: n_layers=1, gdn_stride=0 (=> 1 full-attention layer),
+    // d_model=4, d_kv=4, d_head=2, qk_norm=true, idx_n=2, idx_kv=1, idx_hd=2.
+    //   idx_qk_out = (2+1)*2 = 6
+    //   attn_layer = 2*4*4 + 2*4*4 + 2*2         = 32 + 32 + 4  = 68
+    //   qsa_layer  = 3*4*4 + 2*4*4 + 2*2 + 4*6 + 2*2 = 48+32+4+24+4 = 112
+    //   delta      = 1 * (112 - 68) = 44
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    // Without QK-norm the attention baseline is 4 floats cheaper, so the delta is 4 LARGER (a QSA layer
+    // always carries its own q_norm/k_norm -- docs/QSA.md S3b).
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, false, 2, 1, 2, true) == 48);
+    // Scales linearly in the number of FULL-ATTENTION layers, not in n_layers: at stride 4, 8 layers
+    // have exactly 2 full-attention layers, so the delta is 2x the per-layer value, not 8x.
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 4, 4, 2, true, 2, 1, 2, true) == 8 * 44);
+    // ODD/non-dividing: 11 layers at stride 4 has exactly 2 full-attention layers (3 and 7), NOT 3 --
+    // the same ragged-tail case the schedule test above pins, re-checked through the delta.
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+
+    // Strictly positive and monotonic in the indexer width at both of this thread's standard shapes.
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true) > 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 0, 132, 66, 33, true, 4, 1, 8, true) > 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 8, 1, 8, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 16, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
+
+    // This build's own delta is 0 exactly when QSA is off -- the direct neutral-setting claim.
+    if constexpr (!sub0::USE_QSA) {
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+                                       USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
+                                       QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) == 0);
+    } else {
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+                                       USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
+                                       QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) > 0);
+    }
+}
+
+// At the neutral setting (every QSA_INDEXER_* == 0) the feature contributes ZERO new parameters and
+// touches no PARAM_LAYOUT entry -- the same "bit-identical when off" contract every other mechanism in
+// this thread pins. Written as an implication, not gated behind `if constexpr`, for the same
+// STATIC_REQUIRE-inside-an-untaken-branch reason the n-gram/MoE tests above document.
+TEST_CASE("QSA is off by default and inert at the neutral setting", "[layout][qsa]") {
+    STATIC_REQUIRE(sub0::USE_QSA == (QSA_INDEXER_N_HEADS >= 1 && QSA_INDEXER_BUDGET >= 1));
+    // QSA_DIMS is always a valid, never-divide-by-zero shape, even when nothing builds it.
+    REQUIRE(sub0::QSA_DIMS.hidden_size == D_MODEL);
+    REQUIRE(sub0::QSA_DIMS.n_heads == N_HEADS);
+    REQUIRE(sub0::QSA_DIMS.head_dim == D_HEAD);
+    REQUIRE(sub0::QSA_DIMS.n_kv_heads == N_KV_HEADS);
+    REQUIRE(sub0::QSA_DIMS.rotary_dim == D_HEAD);
+    // The _BUF forms are never degenerate, so decode-path scratch arrays are always valid bounds.
+    REQUIRE(sub0::QSA_DIMS_BUF.idx_n_heads >= 1);
+    REQUIRE(sub0::QSA_DIMS_BUF.idx_kv_heads >= 1);
+    REQUIRE(sub0::QSA_DIMS_BUF.idx_head_dim >= 1);
+    REQUIRE(sub0::QSA_DIMS_BUF.compress_ratio >= 1);
+    REQUIRE(sub0::QSA_DIMS_BUF.budget >= 1);
+    if constexpr (!sub0::USE_QSA) {
+        REQUIRE(sub0::QSA_IDX_QK_OUT == 0);
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
+            REQUIRE(p.kind != sub0::PKind::QsaQProj);
+            REQUIRE(p.kind != sub0::PKind::QsaGateProj);
+            REQUIRE(p.kind != sub0::PKind::QsaKProj);
+            REQUIRE(p.kind != sub0::PKind::QsaVProj);
+            REQUIRE(p.kind != sub0::PKind::QsaOProj);
+            REQUIRE(p.kind != sub0::PKind::QsaQNorm);
+            REQUIRE(p.kind != sub0::PKind::QsaKNorm);
+            REQUIRE(p.kind != sub0::PKind::QsaIdxQkProj);
+            REQUIRE(p.kind != sub0::PKind::QsaIdxQNorm);
+            REQUIRE(p.kind != sub0::PKind::QsaIdxKNorm);
+        }
+    }
+}
+

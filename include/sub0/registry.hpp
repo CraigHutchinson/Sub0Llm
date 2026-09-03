@@ -185,6 +185,11 @@ struct ModelMeta : RunState {
     X(int,         hc_lowrank,      0)    \
     X(int,         num_experts,     0)    \
     X(int,         experts_per_tok, 0)    \
+    X(int,         qsa_idx_n_heads, 0)    \
+    X(int,         qsa_idx_kv_heads, 0)   \
+    X(int,         qsa_idx_head_dim, 0)   \
+    X(int,         qsa_idx_budget,  0)    \
+    X(int,         qsa_idx_ratio,   0)    \
     X(int,         rope_scaling,    0)    \
     X(double,      rope_scale_fac,  1.0)  \
     X(double,      rope_theta,  10000.0)  \

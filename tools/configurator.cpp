@@ -613,6 +613,16 @@ int main(int argc, char** argv) {
     // EXPERTS_PER_TOK selected per token, replacing the FFN block for EVERY layer when on.
     int num_experts        = 0;
     int experts_per_tok    = 0;
+    // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
+    // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
+    // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
+    // NOTE deliberately absent: num_attention_heads / head_dim / num_key_value_heads are the EXISTING
+    // --heads / --kv-heads / derived D_HEAD (docs/QSA.md S4a; AGENTS.md S8).
+    int qsa_idx_n_heads    = 0;
+    int qsa_idx_kv_heads   = 0;
+    int qsa_idx_head_dim   = 0;
+    int qsa_idx_budget     = 0;
+    int qsa_idx_ratio      = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -704,6 +714,28 @@ int main(int argc, char** argv) {
                    "Mixture of Experts: top-k routed experts selected per token (0 = off, must match "
                    "--num-experts' on/off state, and must not exceed it)")
        ->capture_default_str()->check(CLI::Range(0, 16));
+    // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
+    // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
+    app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
+                   "QSA (docs/QSA.md): lightning-indexer query head count (0 = off, else >= 1). Stage 0: "
+                   "hard-clamped to 0 -- no CPU forward op exists yet")
+       ->capture_default_str()->check(CLI::Range(0, 0));
+    app.add_option("--qsa-indexer-kv-heads", qsa_idx_kv_heads,
+                   "QSA: lightning-indexer key head count (0 = off, else exactly 1 -- the reference's own "
+                   "squeeze requires it). Stage 0: hard-clamped to 0")
+       ->capture_default_str()->check(CLI::Range(0, 0));
+    app.add_option("--qsa-indexer-head-dim", qsa_idx_head_dim,
+                   "QSA: lightning-indexer per-head width (0 = off, else even and >= 2). Stage 0: "
+                   "hard-clamped to 0")
+       ->capture_default_str()->check(CLI::Range(0, 0));
+    app.add_option("--qsa-indexer-budget", qsa_idx_budget,
+                   "QSA: per-query token budget; block_topk = budget / compress-ratio (0 = off, else >= "
+                   "compress-ratio). Stage 0: hard-clamped to 0")
+       ->capture_default_str()->check(CLI::Range(0, 0));
+    app.add_option("--qsa-indexer-compress-ratio", qsa_idx_ratio,
+                   "QSA: how many consecutive keys are mean-pooled into one selectable block (0 = off, "
+                   "else >= 1). Stage 0: hard-clamped to 0")
+       ->capture_default_str()->check(CLI::Range(0, 0));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -939,6 +971,38 @@ int main(int argc, char** argv) {
         std::println(stderr, "configure error: experts-per-tok ({}) cannot exceed num-experts ({})",
                      experts_per_tok, num_experts);
         return 1;
+    }
+    // QSA: mirrors layout.hpp's own static_asserts as a configure-time diagnostic naming the flags,
+    // rather than a compile error in the engine (the same pattern as the checks just above).
+    {
+        const int qsa_on_count = (qsa_idx_n_heads != 0) + (qsa_idx_kv_heads != 0) +
+                                 (qsa_idx_head_dim != 0) + (qsa_idx_budget != 0) + (qsa_idx_ratio != 0);
+        if (qsa_on_count != 0 && qsa_on_count != 5) {
+            std::println(stderr, "configure error: all five qsa-indexer-* flags must be set together or "
+                                 "all left 0 (got n-heads {}, kv-heads {}, head-dim {}, budget {}, "
+                                 "compress-ratio {})", qsa_idx_n_heads, qsa_idx_kv_heads,
+                         qsa_idx_head_dim, qsa_idx_budget, qsa_idx_ratio);
+            return 1;
+        }
+        if (qsa_on_count == 5) {
+            if (qsa_idx_kv_heads != 1) {
+                std::println(stderr, "configure error: qsa-indexer-kv-heads must be exactly 1 when QSA is "
+                                     "on (the reference's own squeeze requires it) -- got {}",
+                             qsa_idx_kv_heads);
+                return 1;
+            }
+            if (qsa_idx_head_dim % 2 != 0) {
+                std::println(stderr, "configure error: qsa-indexer-head-dim ({}) must be even (the "
+                                     "half-split rotary needs an even rotary prefix)", qsa_idx_head_dim);
+                return 1;
+            }
+            if (qsa_idx_budget < qsa_idx_ratio) {
+                std::println(stderr, "configure error: qsa-indexer-budget ({}) must be >= "
+                                     "qsa-indexer-compress-ratio ({}), or block_topk would be 0",
+                             qsa_idx_budget, qsa_idx_ratio);
+                return 1;
+            }
+        }
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
     // so the two styles land at roughly the same total FFN param count -- see d_ff_for's doc comment.
@@ -1417,6 +1481,12 @@ int main(int argc, char** argv) {
     // Mixture of Experts Stage 0/1 (layout.hpp's USE_MOE/MOE_DIMS). 0 = off, the default. See docs/MOE.md.
     cos << "constexpr int  NUM_EXPERTS     = " << num_experts << ";\n";
     cos << "constexpr int  EXPERTS_PER_TOK = " << experts_per_tok << ";\n";
+    // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
+    cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
+    cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";
+    cos << "constexpr int  QSA_INDEXER_HEAD_DIM      = " << qsa_idx_head_dim << ";\n";
+    cos << "constexpr int  QSA_INDEXER_BUDGET        = " << qsa_idx_budget << ";\n";
+    cos << "constexpr int  QSA_INDEXER_COMPRESS_RATIO = " << qsa_idx_ratio << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
@@ -1613,6 +1683,9 @@ int main(int argc, char** argv) {
     shown.ngram_table_size = ngram_table_size;
     shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;
     shown.num_experts = num_experts; shown.experts_per_tok = experts_per_tok;
+    shown.qsa_idx_n_heads = qsa_idx_n_heads; shown.qsa_idx_kv_heads = qsa_idx_kv_heads;
+    shown.qsa_idx_head_dim = qsa_idx_head_dim; shown.qsa_idx_budget = qsa_idx_budget;
+    shown.qsa_idx_ratio = qsa_idx_ratio;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;
