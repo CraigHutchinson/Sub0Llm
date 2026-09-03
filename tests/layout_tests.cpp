@@ -328,10 +328,19 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
 // bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
 // pins above. Calling arch_fingerprint2() directly (rather than requiring an actual GDN build) is what
 // makes this testable at all while the static_assert in layout.hpp forbids ever compiling one.
-TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[layout][gdn]") {
-    REQUIRE(sub0::arch_fingerprint2(0) == 0);
-    REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);              // this build's own word: always 0 today
-    REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
+TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are both off", "[layout][gdn]") {
+    REQUIRE(sub0::arch_fingerprint2(0) == 0);              // default experts_per_tok=0 too
+    REQUIRE(sub0::arch_fingerprint2(0, 0) == 0);
+    // This build's own word is 0 only when BOTH axes are off -- docs/MOE.md S3c added EXPERTS_PER_TOK
+    // into byte 1 of this SAME word (this stage's own real build under test may have MoE genuinely ON,
+    // e.g. the two-scale/parity verification config, so this is an implication, not an unconditional 0).
+    if constexpr (EXPERTS_PER_TOK == 0) {
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
+    } else {
+        REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK));
+        REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
+    }
 
     // A nonzero stride MUST differ, or a (future) GDN checkpoint would load into a plain build and
     // silently compute something else -- there is no shape difference to catch it in general (a GDN
@@ -344,15 +353,25 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet is off", "[
     // Round-trips through the decoder, so the diagnostic can name the mismatched value.
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4)).gdn_full_attn_stride == 4);
 
-    // The reserved high 56 bits stay zero regardless of the low byte's value -- headroom for the NEXT
+    // Mixture of Experts (docs/MOE.md S3c): EXPERTS_PER_TOK occupies byte 1, independently of GDN's own
+    // byte 0 -- a nonzero experts-per-tok MUST differ from the all-zero word for the same "would silently
+    // compute something else" reason, and the two bytes must not collide with each other.
+    REQUIRE(sub0::arch_fingerprint2(0, 10) != sub0::arch_fingerprint2(0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 10) != sub0::arch_fingerprint2(4, 0));      // byte 0 vs byte 1 alone
+    REQUIRE(sub0::arch_fingerprint2(4, 10) != sub0::arch_fingerprint2(4, 0));      // same GDN stride, differ by top-k
+    REQUIRE(sub0::arch_fingerprint2(4, 10) != sub0::arch_fingerprint2(0, 10));     // same top-k, differ by GDN stride
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).gdn_full_attn_stride == 4);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10)).experts_per_tok == 10);
+
+    // The reserved high 48 bits stay zero regardless of either byte's value -- headroom for the NEXT
     // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    REQUIRE((sub0::arch_fingerprint2(0xff) >> 8) == 0);
+    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff) >> 16) == 0);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
-    // a hypothetical GDN stride must not collide, matching how it already handles DEPTH_ATTN_STRIDE.
-    // Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants of THIS build --
-    // the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is a real,
-    // distinguishing quantity, established above.
+    // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles
+    // DEPTH_ATTN_STRIDE. Verified indirectly here since MODEL_ARCH_ID's inputs are compile-time constants
+    // of THIS build -- the direct claim is just that ARCH_FINGERPRINT2 (which the id already mixes in) is
+    // a real, distinguishing quantity, established above.
 }
 
 // --- Gated Residual -- DESIGN + Stage 0 skeleton only (docs/GATED_RESIDUAL.md) -------------------

@@ -1951,7 +1951,9 @@ struct Model {
             Node* gr_inj_mlp = nullptr;
             Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2,
                                &gr_inj_mlp);
-            if constexpr (USE_GATED_FFN) {
+            if constexpr (USE_MOE) {
+                f = op_moe(f, L);
+            } else if constexpr (USE_GATED_FFN) {
                 Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                 Node* up_pre   = op_linear(f, L.W1, nullptr, q);
                 f = op_linear(op_swiglu(gate_pre, up_pre), L.W2, nullptr, q);
