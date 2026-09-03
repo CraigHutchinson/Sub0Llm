@@ -1,14 +1,11 @@
 # Qwen4-preview memory/data orchestration — cross-tier placement design
 
-Status: **v1 — LIVING DOCUMENT, RESEARCH + DESIGN ONLY.** No engine code lands this pass. Every number
+Status: **v2 — LIVING DOCUMENT, RESEARCH + DESIGN ONLY.** No engine code lands this pass. Every number
 below is tagged with how it was obtained (a real fetch/measurement this pass, a real fetch from a prior
 pass, an arithmetic derivation from a verified quantity, or an estimate) and how confident it is,
-following `docs/QWEN4_PREVIEW_REFERENCE.md`'s own facts-table discipline. **This document WILL be wrong
-in places** — it is written before GDN/QSA/Gated-Residual exist as engine code, so every byte-budget
-number for those mechanisms is a hand-derived estimate from the real reference architecture, not a
-measurement of this engine's own implementation. Section 6 names exactly what to re-measure once each
-mechanism lands, and this doc should be revised (not superseded by a new one) as those measurements come
-in — bump the revision log below each time.
+following `docs/QWEN4_PREVIEW_REFERENCE.md`'s own facts-table discipline. Section 6 names exactly what to
+re-measure once each mechanism lands, and this doc should be revised (not superseded by a new one) as
+those measurements come in — bump the revision log below each time.
 
 **Revision log**:
 - v1 (2026-09-02): initial version. No Sub0Llm mechanism code exists yet for GDN/QSA/Gated-Residual at
@@ -16,6 +13,22 @@ in — bump the revision log below each time.
   gated against small real-weight fixtures — see `docs/GATED_DELTANET.md` — but nothing has run at
   Qwen4's real 2560-wide, 512-expert scale). Every §2/§3 byte number for GDN/QSA/MoE is therefore a
   hand-derived estimate from the real, verified `config.json` fields, not a measured footprint.
+- **v2 (2026-09-03): §6c item 5 discharged.** Gated Residual (`docs/GATED_RESIDUAL.md`), MoE
+  (`docs/MOE.md`) and QSA (`docs/QSA.md`) have all landed real, fixture-gated CPU forward
+  implementations on `main` since v1, each with a real `*_param_delta()` closed form in `layout.hpp` and
+  real `*_math.hpp` scratch/state sizing functions. **Every §2 and §3d number for GR, MoE, QSA and GDN
+  has been replaced with a value computed by evaluating THIS PROJECT'S OWN `make_param_layout()` /
+  `PARAM_LAYOUT` / `gr_param_delta()` / `moe_param_delta()` / `qsa_param_delta()` / `gdn::state_floats()`
+  / `qsa::scratch_floats()` machinery at Qwen4's real dims** — not by re-doing v1's hand arithmetic. See
+  §6a for exactly what that measurement was and what it is (and is not) evidence of. Four v1 estimates
+  moved materially: **Gated Residual is 0.64B params, not "single-digit millions per layer, negligible"**
+  (§2d); **QSA is 46% larger per layer than v1 assumed** because v1 never knew about `q_proj`'s doubled
+  query|gate width (§2c); the **backbone total is 4.62B, above v1's whole 3.9-4.1B estimated range**
+  (§2f); and v1's claimed "two independent routes agree" reconciliation against the published 125B is
+  **retracted** — it was an artifact of those two undercounts (§2f). A new §2h records the single most
+  consequential finding for WP4: this engine's current `RunConfig` axes **cannot express** the real GDN
+  and QSA head geometry, and the resulting shape gap is 1.68B params. §6c items 1-4 and 6 are
+  **untouched and still open** — they need real hardware benchmarking this pass did not do.
 
 **Read first, not re-derived here**: `docs/QWEN4_PREVIEW_REFERENCE.md` (architecture facts),
 `docs/GATED_DELTANET.md` (GDN math + this project's own arena/checkpoint design for it),
@@ -148,6 +161,28 @@ shape (`shared_expert_intermediate_size` == `moe_intermediate_size` == 640), so 
 | **Activated MoE-FFN params per token per layer** (top-10 + 1 shared = 11 of 513 slots) | 54,067,200 (≈54.07M) | **High** |
 | **Activated MoE-FFN params per token, all 48 layers** | ≈2.595B | **High** |
 
+**v2 correction (2026-09-03) — measured against `layout.hpp`'s own `moe_param_delta()` + the real
+`PARAM_LAYOUT` `MoeRouter`/`MoeGate`/`MoeUp`/`MoeDown`/`MoeShared*` entries at `D_MODEL=2560, D_FF=640,
+NUM_EXPERTS=512, EXPERTS_PER_TOK=10`.** Every routed/shared-expert number above **reproduces exactly** —
+v1's arithmetic was right. Two terms v1 omitted entirely, both small in bytes but load-bearing for
+placement policy:
+
+| Quantity | v1 | v2 (measured, `PARAM_LAYOUT`) | What changed |
+|---|---:|---:|---|
+| MoE block params per layer | 2,521,497,600 (routed + shared only) | **2,522,810,880** | `+` `MoeRouter` [2560,512] = 1,310,720 and `MoeSharedGateProj` [2560,1] = 2,560 |
+| **All 48 layers, absolute** | ≈121.03B | **121,094,922,240 (≈121.095B)** | same two terms × 48 |
+| **Activated per token per layer** | 54,067,200 | **55,380,480** | the router is **not sparse** — see below |
+| **Activated per token, 48 layers** | ≈2.595B | **2,658,263,040 (≈2.658B)** | |
+
+**The qualitative finding v1 missed, and the reason this correction matters more than its 1.3M/layer
+size suggests**: the router is a full `[hidden_size, num_experts]` matrix whose **every column is read
+for every token**, because `Qwen4ExpTextTopKRouter` softmaxes over ALL 512 logits before taking the
+top-10 (`docs/MOE.md` §1a, verified verbatim). So `MoeRouter` is **always-resident backbone**, not part
+of the pageable expert pool — 1,310,720 params/layer × 48 = **62,914,560 params (240.0 MiB f32 /
+120.0 MiB bf16)** that a placement policy must keep hot regardless of how aggressively the 512 experts
+themselves are offloaded. §3b's static layer-range split must exempt it explicitly; v1's §3b did not
+distinguish it from the expert weights at all.
+
 **Per-expert byte size at plausible precisions** (bf16 is the real checkpoint's native dtype; the other
 rows reuse `docs/QWEN4_DEPLOYMENT_FEASIBILITY.md` §1c/§1d's already-verified GGUF byte-per-element
 formulas rather than re-deriving them):
@@ -197,7 +232,13 @@ exactly — the strongest form of cross-validation available without a second li
 |---|---:|---:|
 | Params per GDN layer | 57,958,624 | **High — matches a real fetched byte count exactly** |
 | Bytes per GDN layer, bf16 | 115,917,248 (110.56 MiB) | **High — this IS the real fetched value, not a derivation** |
-| Total, 36 GDN layers, bf16 | ≈3.98 GiB | **High** |
+| Total, 36 GDN layers, bf16 | 4,173,020,928 B = **3.886 GiB** (v1 said "≈3.98 GiB" — a GiB/GB slip, corrected) | **High** |
+| Total, 36 GDN layers, params | **2,086,510,464 (≈2.087B)** | **High** |
+
+**v2 note**: this section needed no substantive correction — v1's GDN arithmetic was already anchored to
+a real fetched byte count and stands. The only change is the GiB unit fix above. **But see §2h**: this
+2.087B figure is what the REAL model costs, and is *not* what this engine currently builds at these
+`RunConfig` axes, because GDN's real head geometry is not expressible today.
 
 ### 2c. QSA mixer — per-layer parameter count (attention projections; indexer weights not independently verified)
 
@@ -228,18 +269,98 @@ explicitly as an open item, tagged **Low** confidence, rather than fabricated to
 | Bytes per QSA layer, bf16 (attn-proj only) | ≈68.16 MiB | **High** for the attn-proj part |
 | Total, 12 QSA layers, bf16 (attn-proj only) | ≈0.80 GiB | **High** for the attn-proj part, an undercount by an unquantified small margin |
 
-### 2d. Gated Residual (hyper-connections) — NOT independently derived this pass
+**v2 correction (2026-09-03) — the largest single arithmetic correction in this revision.** Everything
+above is superseded. `docs/QSA.md` §1b fetched and quoted `Qwen4ExpTextAttention.__init__` in full (v1
+had only ever seen the *indexer*'s code, never the attention side) and found a fact v1 could not have
+known: **`q_proj` is DOUBLE width** — `Linear(hidden_size, num_attention_heads * head_dim * 2)`, chunked
+per head into a `head_dim` query and a `head_dim` **output gate** (`attn_output * sigmoid(gate)` before
+`o_proj`). v1's `q_proj = 2560 × 6144` is exactly half the real tensor.
 
-`hc_count=4, hc_lowrank=320` are real, verified fields (`docs/QWEN4_PREVIEW_REFERENCE.md`), but
-`Qwen4ExpTextGatedResidual`'s `__init__` was never fetched/quoted in any prior doc, so this document
-**does not fabricate a per-layer parameter count for it**. By structural analogy to other low-rank
-hyper-connection designs (a handful of `[hc_count, hc_lowrank]`- and `[hidden, hc_lowrank]`-scale
-matrices), a generous order-of-magnitude estimate is **single-digit millions of params per layer** —
-negligible (<0.1%) next to the 2.52B/layer MoE pool, and small (a few percent) next to the ~58M/34M GDN/
-QSA mixer terms. **Tagged Low confidence, named explicitly as a real gap for a future pass** (fetching
-`Qwen4ExpTextGatedResidual.__init__` from the installed `transformers==5.16.1` package, the same
-technique `docs/GATED_DELTANET.md` §1e already used for its own decode-branch correction, would resolve
-this in one command).
+Real per-layer shapes, now exact (each is a real `PARAM_LAYOUT` entry: `QsaQProj`, `QsaGateProj`,
+`QsaKProj`, `QsaVProj`, `QsaOProj`, `QsaQNorm`, `QsaKNorm`, `QsaIdxQkProj`, `QsaIdxQNorm`, `QsaIdxKNorm`):
+
+```
+q_proj query half   = 2560 × (24×256)      = 15,728,640
+q_proj GATE  half   = 2560 × (24×256)      = 15,728,640      <-- v1 missed this entirely
+k_proj              = 2560 × (2×256)       =  1,310,720
+v_proj              = 2560 × (2×256)       =  1,310,720
+o_proj              = (24×256) × 2560      = 15,728,640
+q_norm + k_norm     = 2 × 256              =        512
+                                             ----------
+        attention projections               = 49,807,872   (v1: 34,079,232 -- a 46% undercount)
+
+index_qk_proj       = 2560 × ((4+1)×128)   =  1,638,400
+q_layernorm + k_layernorm = 2 × 128        =        256
+                                             ----------
+        indexer                             =  1,638,656   (v1 estimated "~1-2M" -- CORRECT, vindicated)
+                                             ==========
+        TOTAL per QSA layer                 = 51,446,528
+```
+
+| Quantity | v1 | v2 (measured) |
+|---|---:|---:|
+| Params per QSA layer (attn + indexer) | 34,079,232 + "~1-2M" | **51,446,528** |
+| Bytes per QSA layer, bf16 | ≈68.16 MiB | **98.13 MiB** |
+| **Total, 12 QSA layers** | ≈0.409B / ≈0.80 GiB bf16 | **617,358,336 (≈0.617B) / 1.150 GiB bf16** |
+
+**Confidence is now High for the whole layer, including the indexer** — the indexer's `__init__` was the
+one "Low" item v1 flagged here, and `docs/QSA.md` §1a resolves it verbatim; its `Dims`-parameterised port
+in `include/sub0/qsa_math.hpp` is fixture-gated against the real `Qwen4ExpTextAttention.forward()` to
+`1.39e-09`, so the shapes are not merely read but exercised.
+
+### 2d. Gated Residual (hyper-connections) — RESOLVED in v2; v1's estimate was materially wrong
+
+**v1 said** (verbatim, kept here so the correction is auditable rather than silently overwritten): "a
+generous order-of-magnitude estimate is **single-digit millions of params per layer** — negligible
+(<0.1%) next to the 2.52B/layer MoE pool, and small (a few percent) next to the ~58M/34M GDN/QSA mixer
+terms", tagged **Low** confidence pending someone fetching `Qwen4ExpTextGatedResidual.__init__`.
+
+**v2**: `docs/GATED_RESIDUAL.md` §1a fetched and quoted that `__init__` verbatim, and `layout.hpp`'s
+`gr_param_delta(n_layers, d_model, hc_count, hc_lowrank)` is the resulting closed form (hand-verified in
+`tests/layout_tests.cpp` at two shapes, and realised as four real `PARAM_LAYOUT` entries — `GrHcNorm`,
+`GrMixDown`, `GrMixUp`, `GrBlockInject` — whose per-tensor sum was confirmed this pass to equal the
+closed form exactly at Qwen4's real axes). Evaluated at the real `hidden_size=2560, hc_count=4,
+hc_lowrank=320` ⇒ `WIDE = 4 × 2560 = 10,240`:
+
+```
+per GatedResidual instance (with block_inject):
+  hc_norm               = WIDE                  = 10,240      ([1, WIDE] -- one gain per (stream,channel))
+  input_mix_weight_down = WIDE × hc_lowrank     =  3,276,800
+  input_mix_weight_up   = hc_lowrank × WIDE     =  3,276,800
+  block_inject_weight   = WIDE × hc_count       =     40,960
+                                                  ---------
+                                                  6,604,800
+
+per DECODER LAYER: two such instances (attn_hyper_connection + mlp_hyper_connection) = 13,209,600
+once, MODEL-LEVEL:  one instance WITHOUT block_inject (use_combine=False)            =  6,563,840
+                                                                                      -----------
+TOTAL, 48 layers + top:  48 × 13,209,600 + 6,563,840                                 = 640,624,640
+```
+
+| Quantity | v1 estimate | v2 (measured, `gr_param_delta`) | Confidence |
+|---|---:|---:|---|
+| Params per GatedResidual instance | — | **6,604,800** | **High** |
+| Params per decoder layer (2 instances) | "single-digit millions" | **13,209,600** | **High** |
+| Model-level exit instance (once) | not modelled at all | **6,563,840** | **High** |
+| **Total, all 48 layers + exit** | not stated; implied ≈0.05-0.3B (§2f) | **640,624,640 (≈0.641B)** | **High** |
+| Bytes, bf16 | — | 1,281,249,280 B = **1.193 GiB** | **High** |
+
+**How wrong v1 was, and in which direction — stated plainly rather than buried**: 13.2M/layer is above
+the top of v1's "single-digit millions" band, and the model-level exit instance was not modelled at all.
+More importantly the *characterisation* was wrong: **Gated Residual is 13.9% of the backbone
+(0.641B of 4.616B, §2f), the third-largest backbone term after GDN and the embedding pair** — not the
+"negligible" rounding error v1 called it. It is, for instance, **larger than the entire 12-layer QSA
+mixer set (0.617B)**. v1's "<0.1% next to the MoE pool" was true and remains true; it was simply the
+wrong comparison, since nothing about the MoE pool's placement is decided by the backbone's size — §3a's
+GPU-residency question is, and that is the comparison where 0.64B matters.
+
+**Why it is this large, structurally** (worth stating so a future reader can sanity-check any variant):
+the two low-rank projections are `WIDE × hc_lowrank` each, and `WIDE` is `hc_count × hidden_size`. The
+`hc_count=4` multiplier applies to BOTH the width and (through `2 × WIDE × hc_lowrank`) the dominant
+term, so GR's cost scales as `4 × hidden_size × hc_lowrank × 2 × 2 instances` — at `hc_lowrank=320` that
+is `320/2560 = 1/8` of a full `[hidden, hidden]` projection per matrix, but there are 16 such
+matrix-equivalents per layer. A "low-rank bottleneck ⇒ cheap" intuition is exactly what produced v1's
+underestimate.
 
 ### 2e. Embeddings + LM head — untied, both real and separately resident
 
@@ -274,6 +395,53 @@ honestly make about the backbone total without fetching the one remaining unquan
 GPU-VRAM ceiling (~7.5-7.7 GiB usable) **before any activations, KV cache, GDN state, or a single MoE
 expert is added**. This is the load-bearing finding for §3's placement policy below.
 
+#### v2 (2026-09-03): the real backbone total, and the retraction of v1's reconciliation
+
+Every term above is now measured (§2b/§2c/§2d), so the range collapses to a number:
+
+```
+36 × 57,958,624  (GDN, §2b)                        = 2,086,510,464
+12 × 51,446,528  (QSA attn + indexer, §2c)         =   617,358,336
+     gr_param_delta(48, 2560, 4, 320)  (GR, §2d)   =   640,624,640
+     tok_emb  [248320, 2560]                       =   635,699,200
+     lm_head  [2560, 248320] + bias (UNTIED)       =   635,947,520
+     ln_f                                          =         2,560
+                                                     -------------
+     BACKBONE TOTAL                                 = 4,616,142,720   (≈4.616B)
+```
+
+| Quantity | v1 estimate | v2 (measured) |
+|---|---:|---:|
+| Backbone params | 3.9-4.1B | **4,616,142,720 (≈4.616B)** |
+| Backbone bytes, bf16 | ≈7.6-8.2 GiB | **8,804.59 MiB = 8.598 GiB** |
+| Backbone bytes, Q8_0-class (1.0625 B/param) | ≈4.1-4.4 GiB | **4,904,651,640 B = 4.568 GiB** |
+
+**The real total is 12.6% above the TOP of v1's estimated range**, driven almost entirely by the two
+corrections above (GR +0.64B where v1 budgeted 0.05-0.3B; QSA +0.21B from the missed gate half).
+
+**v1's "two independent routes agree" claim is RETRACTED.** The published/verified total is 125B; §2a's
+measured MoE total is 121.095B; this section's measured backbone is 4.616B. **4.616 + 121.095 = 125.711B**
+— the two routes now **disagree by ≈0.71B (0.57%)**, where v1 reported agreement. That apparent agreement
+was an *artifact of the two undercuts this revision fixes*: v1's 3.97B "remainder" route and its 3.9-4.1B
+"sum of parts" route agreed only because the sum-of-parts was ~0.7B too small in exactly the amount
+needed. This is a worked example of this project's own `[[independent-reimplementation-catches-identity-
+swap-bugs]]` lesson applied to arithmetic rather than code: two routes agreeing is not evidence when one
+route's inputs are estimates chosen for plausibility.
+
+**Candidate explanations for the residual 0.71B, named as hypotheses and NOT adopted**: (a) the tech
+report's "125B" may exclude the untied `lm_head` from its parameter count — `125.711 − 0.636 = 125.075B`,
+which lands on 125B suspiciously well, and excluding an output head from a "model size" figure is a
+common convention; (b) "125B" may simply be rounded to three significant figures, in which case anything
+in [124.5, 125.5] is consistent and 125.711 is marginally outside; (c) a real shape somewhere above is
+still wrong. **Resolving this needs the tensor-by-tensor summation across all 131 shard headers that
+`docs/QWEN4_PREVIEW_REFERENCE.md` explicitly declined to do** (~131 small header-only HTTP requests) —
+recorded in §6c as a NEW open item rather than guessed at here.
+
+**The load-bearing conclusion for §3 is unchanged in direction and stronger in magnitude**: at bf16 the
+backbone alone is **8.598 GiB**, which does not fit this GPU's ~7.5-7.7 GiB realistic ceiling by a margin
+of ~0.9-1.1 GiB — a clearer "no" than v1's 7.6-8.2 GiB straddle, which could still have been read as
+"maybe, at the low end."
+
 ### 2g. N-gram/PLE table and MTP head — cited, not re-derived, and MTP flagged for the same exclusion as n-gram
 
 - **N-gram/PLE table**: 51.2B params exactly, ~102.4GB bf16, per-tier byte totals already tabulated in
@@ -286,11 +454,67 @@ expert is added**. This is the load-bearing finding for §3's placement policy b
   to exercise — recommended, not mandated, to exclude it from the initial-run resident budget for the
   same reason, and named here explicitly rather than silently omitted.
 
+### 2h. The engine-realized shape vs. the real model's shape — a 1.68B gap, and the WP4 blocker it names
+
+**This is the finding with the largest consequence for WP4, and it exists only because a real
+implementation now exists to compare against.** v1 could not have found it: it compared the real model
+against itself.
+
+This pass evaluated `include/sub0/layout.hpp`'s real `make_param_layout()` — the same `consteval`
+function every build uses — against a `sub0_corpus.hpp` set to Qwen4's real `RunConfig` axes
+(`D_MODEL=2560, N_LAYERS=48, N_HEADS=24, N_KV_HEADS=2, D_FF=640, VOCAB=248320, GDN_FULL_ATTN_STRIDE=4,
+HC_COUNT=4, HC_LOWRANK=320, NUM_EXPERTS=512, EXPERTS_PER_TOK=10, QSA_INDEXER_*=4/1/128/2048/4,
+USE_GATED_FFN=true, USE_QK_NORM=true, USE_TIED_EMBEDDINGS=false, POS_ENCODING=Rope`). Result:
+
+| Quantity | Value |
+|---|---:|
+| `NUM_PARAMS` (tensor count `make_param_layout()` emits) | **74,899 tensors** |
+| `PARAM_FLOATS` | **124,027,786,776 floats** |
+| as f32 blob | **462.04 GiB** |
+| as bf16 | **231.02 GiB** |
+| Real model's own shape (§2f + §2a) | 125,711,064,960 |
+| **Shape gap** | **−1,683,278,184 (−1.34%)** |
+
+**The gap is entirely two mechanisms, and both have the same root cause** — `D_HEAD` is derived, not
+configurable:
+
+| Mechanism | Engine-realized | Real model | Gap | Why |
+|---|---:|---:|---:|---|
+| Gated Residual | 640,624,640 | 640,624,640 | **0 — exact** | `HC_COUNT`/`HC_LOWRANK` are real, independent axes |
+| MoE | 121,094,922,240 | 121,094,922,240 | **0 — exact** | `NUM_EXPERTS`/`EXPERTS_PER_TOK`/`D_FF` are real, independent axes |
+| QSA (12 layers) | 268,621,296 | 617,358,336 | **−348,737,040** | engine `head_dim = D_MODEL/N_HEADS = 106`, real is **256** (`docs/QSA.md` §2b.1) |
+| GDN (36 layers) | 751,723,560 | 2,086,510,464 | **−1,334,786,904** | engine `GDN_DIMS{2560, N_KV_HEADS=2, N_HEADS=24, D_HEAD=106, D_HEAD=106, 4}`; real is `k_heads=16, v_heads=48, head_k=head_v=128` |
+
+**Read this carefully, because it is easy to misread as "the mechanisms are wrong":** GR and MoE are
+shape-exact at the real config today. QSA's and GDN's *math cores* are ALSO correct at the real shape —
+both `qsa::Dims` and `gdn::Dims` take every geometry field explicitly, which is precisely why their
+fixture tests can and do run at the real `head_dim=256` / `head_k_dim=128` values. What cannot express
+the real shape is the **engine's `RunConfig`→`Layer` binding**: `sub0_config.hpp` bakes
+`D_HEAD = D_MODEL / N_HEADS` (an invariant `docs/QSA.md` §2b.1 already flagged as "WP4's problem"), and
+`layout.hpp` aliases GDN's key/value head counts and head dims onto `N_KV_HEADS`/`N_HEADS`/`D_HEAD`
+(`GDN_DIMS`, `layout.hpp` line ~232) rather than giving them their own axes.
+
+**Consequence for WP4, stated once**: a real weight transplant cannot succeed at these axes — the target
+tensors are literally the wrong shape (e.g. `GdnInProjQkv` is `[2560, 2984]` here vs `[2560, 10240]` in
+the checkpoint). **Breaking the `D_HEAD = D_MODEL / N_HEADS` invariant, and giving GDN its own head-count
+axes, is a hard prerequisite for WP4's transplant stage, not a refinement of it** — see
+`docs/WP4_SCOPE.md` §WP4b, which is scoped around exactly this.
+
 ---
 
 ## 3. Explicit placement policy per component, with justification
 
 ### 3a. Backbone: quantized, GPU-resident where it fits; CPU-resident remainder
+
+> **v2 (2026-09-03) update to this section's inputs**: §2f's measured backbone is **4.616B params /
+> 8.598 GiB bf16 / 4.568 GiB at Q8_0-class**, replacing the 3.9-4.1B / 7.6-8.2 GiB / 4.1-4.4 GiB
+> estimates this section was written against. **Both of this section's conclusions survive and are
+> strengthened**, so the prose below is left intact rather than rewritten: (a) "bf16 backbone does not fit
+> the ~7.5-7.7 GiB ceiling" goes from a straddle to a clear 0.9-1.1 GiB overshoot; (b) the Q8_0-class
+> recommendation still fits, at 4.568 GiB rather than 4.1-4.4 GiB, leaving **2.93-3.13 GiB** (not
+> 3.1-3.6) for runtime state and any expert cache. One term to ADD when this becomes implementation:
+> §2a(v2)'s **`MoeRouter`, 62.9M params / 120.0 MiB bf16 across 48 layers, is always-resident backbone**
+> and belongs on the GPU-resident side of this split, even though every other MoE tensor does not.
 
 §2f's finding is decisive: **backbone at bf16 (≈7.6-8.2 GiB) does not comfortably fit this GPU's own
 realistic ≈7.5-7.7 GiB ceiling even alone**, let alone alongside runtime state. Extending this project's
@@ -325,6 +549,17 @@ than inventing a parallel one:
   MoE/backbone work package should not conflate them.
 
 ### 3b. MoE expert pool: static layer-range CPU/GPU split (llama.cpp `-ot`/`--n-cpu-moe`-style), not an activation-aware cache — for v1
+
+> **v2 (2026-09-03) update to this section's inputs**: with §2f's measured backbone (4.568 GiB at
+> Q8_0-class, not 4.1-4.4), point 1's remaining GPU budget becomes `7.5-7.7 − 4.568 ≈ **2.93-3.13 GiB**`
+> before runtime state — inside the 2.5-3.2 GiB band this section already used, so **its conclusion (a
+> static layer-range split for v1, with plausibly zero GPU-resident expert slots) is unchanged**. Two
+> refinements this revision does add: (a) the expert-slot ceiling recomputes to **~1,135-1,215 IQ4_NL-class
+> slots across all 48 layers (2.93-3.13 GiB ÷ 2.64 MiB/expert), ~24-25 per layer of 513** — still far
+> short of a meaningful cache, so the
+> "budget, not algorithm, is the binding constraint" argument holds; (b) §2a(v2)'s `MoeRouter` must be
+> **exempted from this split** — it is dense-read per token and belongs with the backbone (§3a), so
+> "offload layer L's experts" must never be read as "offload layer L's MoE block".
 
 `docs/QWEN4_DEPLOYMENT_FEASIBILITY.md` §2 already surveyed the real options (llama.cpp's static
 `-ot`/`--n-cpu-moe`; MoE-Infinity/Fiddler's activation-aware caches; Eliseev & Mazur's router-lookahead
@@ -424,6 +659,50 @@ at real Qwen4 scale the same conclusion `docs/GATED_DELTANET.md` §2 already dre
 scale: GDN's O(1)-in-context state is a small, flat cost, and the dominant scaling risk in this whole
 system is the **QSA KV cache at long context**, not GDN state and not MoE routing scratch.
 
+#### v2 (2026-09-03): measured against each mechanism's OWN sizing functions
+
+Every row above was a hand-written formula. All four mechanisms now ship real, `Dims`-parameterised
+sizing functions (`gdn::state_floats`/`conv_hist_floats`/`scratch_floats`, `gr::normed_scratch_floats`/
+`mix_scratch_floats`, `moe::scratch_floats`, `qsa::scratch_floats`/`block_key_cache_floats`), so this
+pass called them directly at the real model's own `Dims` — `gdn::Dims{2560,16,48,128,128,4}` and
+`qsa::Dims{2560,24,256,2,4,1,128,2048,4,64}`, i.e. the real geometry, which those math cores CAN express
+even though the engine binding cannot (§2h):
+
+| Term | v1 estimate | v2 measured (f32) | Verdict |
+|---|---:|---:|---|
+| GDN recurrent state, 36 layers | ≈108.0 MiB | `36 × gdn::state_floats` = 28,311,552 floats = **108.0 MiB** | **exact — v1 confirmed** |
+| GDN conv state, 36 layers | ≈4.2 MiB | `36 × gdn::conv_hist_floats` = 1,105,920 floats = **4.219 MiB** | **exact — v1 confirmed** |
+| GDN state total (persistent, decode) | ≈112.2 MiB | **112.219 MiB** | **exact** |
+| QSA KV cache, 12 layers @T=4096 | "≈201.4 MiB" | 50,331,648 floats = **192.0 MiB** | **unit slip in v1** — 201.4 was the byte count in MB, labelled MiB. Formula was right. |
+| QSA KV cache, 12 layers @T=262,144 (native context) | "≈12.9 GiB" | 3,221,225,472 floats = **12.0 GiB** | same unit slip; **still the dominant T-scaling term, as v1 concluded** |
+| QSA indexer key caches, 12 layers @T=4096 | ≈50.3 MiB (modelled as ONE compressed `T/ratio` cache) | raw per-token keys 6,291,456 floats (**24.0 MiB**) + `qsa::block_key_cache_floats` 131,072 floats (**0.5 MiB**) = **24.5 MiB** | **v1's model of WHAT is cached was wrong, and the real answer is smaller.** The real implementation must keep the RAW per-token keys at full `T` (a block's pooled key is derived from them as blocks complete — `docs/QSA.md` §11) AND a small pooled block-key cache. v1 modelled only the compressed half. |
+| QSA indexer key caches @T=262,144 | not stated | 402,653,184 + 8,388,608 floats = **1.531 GiB** | new |
+| MoE routing scratch | "<1 KiB/token/layer" | `moe::scratch_floats(MOE_DIMS)` = 4,352 floats = **17.0 KiB, flat** (row-independent by construction — `docs/MOE.md` §2) | **v1's "negligible" confirmed, and it is even flatter than v1 assumed** |
+
+**A term v1 did not budget at all, and the largest single number in this section**: the **batched-prefill
+scratch** each math core needs. v1's last row waved at this ("reuses the existing formula's shape, scaled
+to real `D_MODEL`"), but these are the mechanisms' own new buffers, not `memplan.hpp`'s existing ones:
+
+| Term | Measured @ T=4096, f32 | Scaling |
+|---|---:|---|
+| `gdn::scratch_floats(REAL, T=4096)`, **per GDN layer** | 109,445,120 floats = **417.5 MiB** | linear in T |
+| `gr::normed_scratch_floats(T=4096)`, per GR instance call | 41,943,040 floats = **160.0 MiB** | linear in T (`T × HC_COUNT × D_MODEL`) |
+| `gr::mix_scratch_floats(T=4096)`, per GR instance call | 1,320,960 floats = **5.04 MiB** | linear in T (`T × HC_LOWRANK`) |
+| `qsa::scratch_floats(REAL, T=4096)`, per QSA layer | 4,877,825 floats = **18.6 MiB** | linear in T |
+
+These are **reused, not simultaneously live per layer** (one buffer serves whichever layer is executing),
+so the resident cost is the max, not the sum — but **417.5 MiB for a single GDN layer at T=4096** is a
+real number that nothing in v1 anticipated, and it is the term that sets the **maximum prefill chunk
+length a real run can afford**: at T=16,384 the same buffer is ≈1.63 GiB, at the model's native
+T=262,144 it is ≈26 GiB. **Prefill must be chunked**, and the chunk size is a first-class WP4 decision,
+not a detail — recorded in `docs/WP4_SCOPE.md` §WP4c as an explicit scoping input rather than left to be
+discovered at run time.
+
+**The v1 conclusion this revision does NOT overturn**: GDN's recurrent state really is O(1) in context
+and really is small (112 MiB flat), and the QSA KV cache really is the dominant *persistent* T-scaling
+term (12.0 GiB at native context). What changed is that the *transient* prefill scratch, not the
+persistent state, is what binds first at any realistic first-run context.
+
 ---
 
 ## 4. Handoff mechanics — resolve-pass-ahead-of-hot-loop vs. genuinely safe inline access
@@ -511,20 +790,59 @@ configuration surface; everything in §5b is what that fixed-size structure's ru
 - This machine's real total/free RAM, total/free disk, GPU total VRAM, and PCIe link width/generation
   (§1) — all measured this session via `nvidia-smi`/`Get-CimInstance`/`Get-Volume`/`Get-PhysicalDisk`.
 
+**Promoted to solid in v2 (2026-09-03) — and exactly what that promotion is and is not evidence of.**
+The measurement was: compile a throwaway translation unit against this repository's real
+`include/sub0/layout.hpp` (and, through it, `gated_residual_math.hpp`/`moe_math.hpp`/`qsa_math.hpp`/
+`gdn_math.hpp`) with a `sub0_corpus.hpp` set to Qwen4's real `RunConfig` axes, then read out the values
+the project's OWN `consteval make_param_layout()` and `*_param_delta()`/`*_scratch_floats()` functions
+produce. That is a **real evaluation of this engine's own shipped shape/sizing machinery at real dims** —
+the same code every build compiles, gated in the default suite by `tests/layout_tests.cpp` (which pins
+each closed form against hand-computed values at two shapes) and by each mechanism's real-weight fixture
+test. What it is **NOT**: a running process, an allocator measurement, or a `sub0_cuda_train_footprint`-
+style measured-vs-predicted check. **No model was loaded and no memory was actually allocated at these
+dims** (a 462 GiB f32 blob is not allocatable here), so these are exact *shape* facts, not *residency*
+facts. §6c items 1-4 and 6 are what would make them residency facts.
+
+- Every §2a MoE parameter count, now including the `MoeRouter`/`MoeSharedGateProj` terms v1 omitted, and
+  the corrected activated-per-token figures.
+- The full §2c QSA per-layer count **including the indexer and the previously-unknown `q_proj` gate half**.
+- The full §2d Gated Residual per-layer and total count.
+- §2f's backbone total (4,616,142,720) and its bf16/Q8_0-class byte figures.
+- §2h's engine-realized `NUM_PARAMS`/`PARAM_FLOATS` at the real axes, and the 1.68B shape gap.
+- Every §3d runtime-state and prefill-scratch number, each read from the owning mechanism's own
+  `Dims`-parameterised sizing function at the real geometry.
+
 ### 6b. Estimated (an arithmetic derivation from a real quantity, or a class-level figure — not a measurement)
 
-- The Gated Residual per-layer parameter count (§2d) — not independently fetched; a generous
-  order-of-magnitude estimate only.
-- The QSA indexer's own weight shapes (§2c) — same caveat.
+- ~~The Gated Residual per-layer parameter count (§2d)~~ — **RESOLVED in v2**, see §2d. v1's estimate was
+  wrong by enough to change a placement conclusion; kept in the list, struck through, so the correction
+  stays visible.
+- ~~The QSA indexer's own weight shapes (§2c)~~ — **RESOLVED in v2**, see §2c. v1's "~1-2M" estimate was
+  correct (real: 1,638,656); the *attention* side it sat next to was not.
 - PCIe **sustained** transfer bandwidth (§1a), NVMe sequential/random throughput (§1c), and HTTP-range
   **sustained** throughput (§1d) — all class-level or theoretical-spec numbers, none measured on this
-  exact hardware this pass.
+  exact hardware, in v1 or v2. **Still estimated.**
 - The realistic GPU-VRAM and RAM headroom figures (§1a/§1b) — real measurements of a specific point-in-time
-  snapshot, but not a controlled idle-vs-loaded comparison, and will shift run to run.
-- Every §3d runtime-state number — formulas derived from real config fields (solid), but the illustrative
-  T=4096 numeric instantiation is an arbitrary choice, not a measurement of an actual run.
+  snapshot, but not a controlled idle-vs-loaded comparison, and will shift run to run. **Still estimated.**
+- ~~Every §3d runtime-state number~~ — **the formulas are now the mechanisms' own shipped functions, not
+  hand transcriptions** (§3d v2). What remains estimated is only the *choice* of T=4096 as an
+  illustration point, and the assumption that a real run's per-layer scratch is reused rather than
+  simultaneously live (true of the current CPU implementations; unverified for any future device path).
+- **New in v2, and genuinely unresolved**: the 0.71B discrepancy between §2f's measured 125.711B total
+  and the published 125B (§2f names three candidate explanations and adopts none). Estimated, not solid.
 
 ### 6c. What should get re-measured once real mechanism implementations exist, named explicitly per this project's own repeated lesson that estimates and reality diverge at scale (`[[memplan-vram-prediction-gap-at-scale]]`, `[[gpu-tune-benchmark-vs-production-discrepancy]]`)
+
+> **v2 status board (2026-09-03) — read this before the list.** Item **5 is DONE** (§6a records what the
+> measurement was and its limits). Items **1, 2, 3, 4 and 6 are UNTOUCHED and still open**: every one of
+> them needs a real *running* artefact this pass did not have — a live inference CUDA context (1), a
+> `cudaMemcpy` benchmark on this GPU/driver (2), a disk benchmark on these NVMe drives (3), a wall-clock
+> HTTP-range transfer (4), and an actual MoE access trace from an actual run (6). **None of them is
+> unlocked by having CPU forward implementations**, which is all that landed since v1. No number for any
+> of them appears anywhere in this revision, and none should be invented from the shape facts §6a
+> promoted — a shape is not a bandwidth. Items 1, 2 and 4 are on `docs/WP4_SCOPE.md`'s critical path;
+> item 6 is explicitly downstream of a first working run; item 3 remains a Sub0Firn prerequisite,
+> unscheduled. **Item 7 is NEW in v2.**
 
 1. **A real `sub0_cuda_train_footprint`-style measured-vs-predicted check, extended to an inference-only
    CUDA context**, once any backbone-GPU-residency code exists — this document's §1a "~7.5-7.7 GiB usable"
@@ -546,10 +864,25 @@ configuration surface; everything in §5b is what that fixed-size structure's ru
    `config.json` arithmetic, not a measured allocation, and should be replaced with real numbers the
    moment they exist, the same way `memplan.hpp`'s own header describes itself as "a PREDICTION, and
    predictions rot," kept honest by a measured-footprint test.
+   **— DONE in v2 (2026-09-03).** §2a/§2c/§2d/§2f/§2h/§3d all now carry values produced by this project's
+   own `make_param_layout()`/`*_param_delta()`/`*_scratch_floats()` at real dims. §6a states precisely
+   what that measurement is evidence of (exact shapes) and what it is not (residency). **The "kept honest
+   by a measured-footprint test" half of this item is NOT done**: there is no analogue of
+   `sub0_cuda_train_footprint` for an inference-shaped load, which is item 1.
 6. **A real access trace from an actual run**, before any MoE-expert placement policy more sophisticated
    than §3b's static split is attempted — per `docs/NGRAM_TABLE_TIERED_STORAGE.md` §1's own Bandana
    citation ("measure-then-size the cache, don't guess it"), no such trace exists yet for this model on
    this engine.
+7. **NEW in v2 — a tensor-by-tensor summation across all 131 real shard headers**, to settle §2f's 0.71B
+   discrepancy between this document's measured 125.711B and the published 125B. `docs/QWEN4_PREVIEW_
+   REFERENCE.md` explicitly declined this ("~131 small header-only HTTP requests, not done this round, as
+   the report's own table is a stronger source than a hand re-derivation would be") — that judgement was
+   sound when the alternative was a hand re-derivation, and is no longer, now that the competing number
+   comes from real, fixture-gated shapes. It is also the cheapest of the seven items (header-only Range
+   requests, the technique this project has already validated three times) and it would independently
+   confirm or refute §2h's shape gap from the checkpoint side. **Do this before, not after, any real
+   weight transplant** — a transplant that silently mismatches on 0.7B of params is exactly the failure
+   this settles cheaply in advance.
 
 This document should be revised in place (a new revision-log entry, not a new file) as each of the above
 lands — per its own header, it is explicitly a living document, not a final specification.
