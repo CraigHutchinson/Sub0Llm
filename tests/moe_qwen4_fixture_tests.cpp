@@ -189,17 +189,18 @@ TEST_CASE("Mixture of Experts CPU forward matches the real Qwen4-preview referen
     mutant_idx[1] = decoys[1];
 
     std::vector<float> ffn_scratch(static_cast<std::size_t>(d_ff), 0.f);
+    std::vector<float> g_scratch(static_cast<std::size_t>(d_ff), 0.f);
     std::vector<float> expert_out(static_cast<std::size_t>(hidden_size), 0.f);
     std::vector<float> out_mutant(static_cast<std::size_t>(hidden_size), 0.f);
     for (int k = 0; k < experts_per_tok; ++k) {
         const int e = mutant_idx[k];
         sub0::moe::expert_ffn_row(dims, input.data(), gate_w[static_cast<std::size_t>(e)],
                                    up_w[static_cast<std::size_t>(e)], down_w[static_cast<std::size_t>(e)],
-                                   expert_out.data(), ffn_scratch.data());
+                                   expert_out.data(), ffn_scratch.data(), g_scratch.data());
         for (int j = 0; j < hidden_size; ++j) out_mutant[static_cast<std::size_t>(j)] += topk_w[k] * expert_out[static_cast<std::size_t>(j)];
     }
     sub0::moe::expert_ffn_row(dims, input.data(), shared_gate_w.data(), shared_up_w.data(), shared_down_w.data(),
-                               expert_out.data(), ffn_scratch.data());
+                               expert_out.data(), ffn_scratch.data(), g_scratch.data());
     float gate_logit = 0.f;
     for (int i = 0; i < hidden_size; ++i) gate_logit += input[static_cast<std::size_t>(i)] * shared_gate_proj_w[static_cast<std::size_t>(i)];
     const float sg = 1.f / (1.f + std::exp(-gate_logit));

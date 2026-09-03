@@ -51,12 +51,14 @@ struct Dims {
 inline constexpr int TOPK_MAX = 16;
 
 // scratch_floats(): num_experts (router logits/probs, reused as scratch, S4b) + d_ff (one expert's SwiGLU
-// pre-activation) + hidden_size (one expert's FFN output before its top-k/shared weighting is applied).
-// Deliberately NOT scaled by T (see this file's own header comment) -- one call's worth, reused across
-// forward()'s own T-row loop below.
+// pre-activation, "up" half then overwritten with silu(gate)*up) + d_ff again (the "gate" accumulator
+// expert_ffn_row needs alongside it, kept separate for a cache-friendly summation order -- see that
+// function's own comment) + hidden_size (one expert's FFN output before its top-k/shared weighting is
+// applied). Deliberately NOT scaled by T (see this file's own header comment) -- one call's worth, reused
+// across forward()'s own T-row loop below.
 inline constexpr std::size_t scratch_floats(const Dims& d) {
     return static_cast<std::size_t>(d.num_experts)
-         + static_cast<std::size_t>(d.d_ff)
+         + 2u * static_cast<std::size_t>(d.d_ff)
          + static_cast<std::size_t>(d.hidden_size);
 }
 
@@ -68,24 +70,35 @@ inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 // One expert's SwiGLU FFN for a single row: out = down(silu(gate(x)) * up(x)) -- Qwen4ExpTextMLP.forward
 // (also what Qwen4ExpTextExperts.forward computes per selected expert, chunked gate_up_proj split in
 // half). gate_w/up_w: [hidden_size, d_ff]; down_w: [d_ff, hidden_size], this project's own [in,out]
-// convention. `pre_scratch`: >= d_ff floats. Streams gate/up per output unit (no separate [d_ff] buffer
-// needed for each) so scratch stays a single d_ff-wide buffer.
+// convention. `pre_scratch`/`g_scratch`: >= d_ff floats each.
+//
+// Both GEMVs are INPUT-major (outer loop over the projection's input dimension, contiguous inner loop
+// over its output dimension) -- matching gate_w/up_w/down_w's own row-major [in,out] layout and this
+// project's `linear_row` convention everywhere else. An earlier form of this function was OUTPUT-major
+// (outer loop over d_ff/hidden_size, inner loop striding the weight by d_ff or hidden_size floats per
+// step) -- correct, but a real, measured cache-locality defect found in a post-merge performance review
+// (every inner-loop weight read a cache miss at production d_ff=640/hidden_size=2560). This form needs
+// TWO d_ff-wide accumulators (`g_scratch` for the gate projection, `pre_scratch` for the up projection,
+// combined into `pre_scratch` only once both are complete) where the old form needed one, since it can no
+// longer interleave the two projections' accumulation per output unit.
 inline void expert_ffn_row(const Dims& d, const float* x, const float* gate_w, const float* up_w,
-                            const float* down_w, float* out, float* pre_scratch) {
-    for (int o = 0; o < d.d_ff; ++o) {
-        float g = 0.f, u = 0.f;
-        for (int i = 0; i < d.hidden_size; ++i) {
-            const float xi = x[i];
-            g += xi * gate_w[static_cast<std::size_t>(i) * d.d_ff + o];
-            u += xi * up_w[static_cast<std::size_t>(i) * d.d_ff + o];
-        }
-        pre_scratch[o] = detail::silu(g) * u;
+                            const float* down_w, float* out, float* pre_scratch, float* g_scratch) {
+    for (int o = 0; o < d.d_ff; ++o) { pre_scratch[o] = 0.f; g_scratch[o] = 0.f; }
+    for (int i = 0; i < d.hidden_size; ++i) {
+        const float xi = x[i];
+        if (xi == 0.f) continue;
+        const float* gr = gate_w + static_cast<std::size_t>(i) * d.d_ff;
+        const float* ur = up_w   + static_cast<std::size_t>(i) * d.d_ff;
+        for (int o = 0; o < d.d_ff; ++o) { g_scratch[o] += xi * gr[o]; pre_scratch[o] += xi * ur[o]; }
     }
-    for (int j = 0; j < d.hidden_size; ++j) {
-        float acc = 0.f;
-        for (int o = 0; o < d.d_ff; ++o)
-            acc += pre_scratch[o] * down_w[static_cast<std::size_t>(o) * d.hidden_size + j];
-        out[j] = acc;
+    for (int o = 0; o < d.d_ff; ++o) pre_scratch[o] = detail::silu(g_scratch[o]) * pre_scratch[o];
+
+    for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
+    for (int o = 0; o < d.d_ff; ++o) {
+        const float po = pre_scratch[o];
+        if (po == 0.f) continue;
+        const float* dr = down_w + static_cast<std::size_t>(o) * d.hidden_size;
+        for (int j = 0; j < d.hidden_size; ++j) out[j] += po * dr[j];
     }
 }
 
@@ -145,7 +158,8 @@ inline void forward_row(const Dims& d, const float* x, const float* router_w,
                          float* out, float* scratch, bool norm_topk_prob = true) {
     float* probs      = scratch;                    // [num_experts]
     float* ffn_scratch = probs + d.num_experts;      // [d_ff]
-    float* expert_out = ffn_scratch + d.d_ff;        // [hidden_size]
+    float* g_scratch  = ffn_scratch + d.d_ff;        // [d_ff]
+    float* expert_out = g_scratch + d.d_ff;          // [hidden_size]
     float topk_w[TOPK_MAX];
     int   topk_idx[TOPK_MAX];
     router_topk_row(d, x, router_w, probs, topk_w, topk_idx, norm_topk_prob);
@@ -153,14 +167,15 @@ inline void forward_row(const Dims& d, const float* x, const float* router_w,
     for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
     for (int k = 0; k < d.experts_per_tok; ++k) {
         const int e = topk_idx[k];
-        expert_ffn_row(d, x, expert_gate_w[e], expert_up_w[e], expert_down_w[e], expert_out, ffn_scratch);
+        expert_ffn_row(d, x, expert_gate_w[e], expert_up_w[e], expert_down_w[e], expert_out, ffn_scratch,
+                        g_scratch);
         for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * expert_out[j];
     }
 
     // Shared expert: an ordinary (non-routed) SwiGLU FFN with its OWN weights, gated by
     // sigmoid(Linear(hidden_size, 1, bias=False)(x)) -- Qwen4ExpTextSparseMoeBlock.forward's own
     // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`.
-    expert_ffn_row(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch);
+    expert_ffn_row(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
     float gate_logit = 0.f;
     for (int i = 0; i < d.hidden_size; ++i) gate_logit += x[i] * shared_gate_proj_w[i];  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
