@@ -44,10 +44,14 @@ inline constexpr std::size_t normed_scratch_floats(const Dims& d, int T) {
     return static_cast<std::size_t>(T) * static_cast<std::size_t>(d.wide());
 }
 // mix()'s own scratch need, on top of the ALREADY-NORMALIZED `normed` buffer it takes as an input (see
-// mix()'s own comment) -- just the down-projection's pre-activation, [T, hc_lowrank]. A caller that has
-// not yet normalized its wide input separately needs normed_scratch_floats(d,T) MORE, for that step.
+// mix()'s own comment): the down-projection's pre-activation, [T, hc_lowrank], PLUS one row-reusable
+// [wide]-wide up-projection accumulator (NOT scaled by T -- fully consumed and overwritten within a
+// single row of the T-loop, the same "reused scratch, not T-scaled" idiom moe_math.hpp's own
+// scratch_floats() uses for its row-independent buffers). A caller that has not yet normalized its wide
+// input separately needs normed_scratch_floats(d,T) MORE, for that step.
 inline constexpr std::size_t mix_scratch_floats(const Dims& d, int T) {
-    return static_cast<std::size_t>(T) * static_cast<std::size_t>(d.hc_lowrank);
+    return static_cast<std::size_t>(T) * static_cast<std::size_t>(d.hc_lowrank)
+         + static_cast<std::size_t>(d.wide());
 }
 
 namespace detail {
@@ -95,7 +99,8 @@ inline void hc_norm(const Dims& d, int T, const float* wide_in, const float* nor
 inline void mix(const Dims& d, int T, const float* normed, const float* down_w, const float* up_w,
                  float* out_mixed, float* scratch) {
     const int hs = d.hidden_size, hc = d.hc_count, wide = d.wide(), lr = d.hc_lowrank;
-    float* down_pre = scratch;   // [T, hc_lowrank]
+    float* down_pre = scratch;                                    // [T, hc_lowrank]
+    float* up_val   = down_pre + static_cast<std::size_t>(T) * lr; // [wide], reused per row (below)
     for (int t = 0; t < T; ++t) {
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* dr = down_pre + static_cast<std::size_t>(t) * lr;
@@ -107,21 +112,34 @@ inline void mix(const Dims& d, int T, const float* normed, const float* down_w, 
         }
         for (int o = 0; o < lr; ++o) dr[o] = detail::silu(dr[o] / static_cast<float>(hc));
     }
+    const float inv_hc = 1.f / static_cast<float>(hc);
     for (int t = 0; t < T; ++t) {
         const float* dr = down_pre + static_cast<std::size_t>(t) * lr;
         const float* xr = normed + static_cast<std::size_t>(t) * wide;
         float* out = out_mixed + static_cast<std::size_t>(t) * hs;
+        // up_val = dr @ up_w over the whole `wide` output at once, INPUT-major (outer i, contiguous
+        // inner over `col`) -- matches up_w's own [hc_lowrank, wide] row-major layout, the same
+        // cache-friendly order this file's down-projection loop above (and this project's linear_row
+        // convention everywhere else) already uses. The ORIGINAL form here looped output-major (outer
+        // col, inner i), which strides `up_w` by `wide` floats per step -- a real, measured performance
+        // defect at production scale (wide = hc_count*hidden_size, e.g. 10240 -- a 40KB stride, far past
+        // any cache line) found in a post-merge performance review, not present at this stage's own
+        // small test scale. Purely a summation-ORDER change -- same terms, same result within float32
+        // rounding (gated by this test file's own 5e-5 tolerance, comfortably wider than reordering noise).
+        for (int col = 0; col < wide; ++col) up_val[col] = 0.f;
+        for (int i = 0; i < lr; ++i) {
+            const float di = dr[i];
+            const float* Wr = up_w + static_cast<std::size_t>(i) * wide;
+            for (int col = 0; col < wide; ++col) up_val[col] += di * Wr[col];
+        }
         for (int j = 0; j < hs; ++j) out[j] = 0.f;
         for (int s = 0; s < hc; ++s) {
             for (int j = 0; j < hs; ++j) {
                 const int col = s * hs + j;
-                float up_val = 0.f;
-                for (int i = 0; i < lr; ++i) up_val += dr[i] * up_w[static_cast<std::size_t>(i) * wide + col];
-                const float gate_v = detail::sigmoid(up_val);
+                const float gate_v = detail::sigmoid(up_val[col]);
                 out[j] += gate_v * xr[static_cast<std::size_t>(s) * hs + j];
             }
         }
-        const float inv_hc = 1.f / static_cast<float>(hc);
         for (int j = 0; j < hs; ++j) out[j] *= inv_hc;
     }
 }
