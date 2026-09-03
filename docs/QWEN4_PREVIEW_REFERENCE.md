@@ -330,10 +330,14 @@ and the 3 `layer_multipliers`, are recorded in full in the manifest.
 
 ### What remains uncertain / not done
 
-- **QSA (Qwen Sparse Attention)**: real code quoted above, real config numbers verified, but **no weight
-  extraction or fixture was built** for it this round — deprioritized per the original scope decision.
-  Doing so would follow the identical recipe (locate `model.language_model.layers.3.self_attn.*` in the
-  index, range-fetch, slice down, run `Qwen4ExpTextAttention.forward()` for real).
+- ~~**QSA (Qwen Sparse Attention)**: no weight extraction or fixture built.~~ **DONE** (2026-09-03,
+  `docs/QSA.md` Stage 0+1): the recipe named here was followed exactly —
+  `model.language_model.layers.3.self_attn.*` located in the index (layer 3 is the first
+  `full_attention` layer), 198,976 bytes range-fetched, sliced down, and `Qwen4ExpTextAttention.forward()`
+  run for real. Fixture at `tests/fixtures/qwen4_preview/qsa_layer3_small_*`; CPU forward matches to
+  `1.86e-09`. Note the code quoted in this doc covers only the INDEXER; `Qwen4ExpTextAttention`'s own
+  doubled `q_proj` (per-head `query|gate` chunk) and its `* sigmoid(gate)` output gate were never quoted
+  here and are load-bearing — see `docs/QSA.md` §1b.
 - **Exact total-parameter reconciliation**: the 125B figure is verified via the tech report's own table
   (strong) and roughly corroborated by hand (48 layers × ~4.9B raw MoE-expert-pool params ≈ 121-126B,
   before adding attention/GDN/embedding/lm_head weights) but a tensor-by-tensor summation across all 131
@@ -390,9 +394,13 @@ Stage-1 fixtures from real Qwen weights are the actual correctness gate here.
   bug in `backend_cpu.cpp`'s `op_gdn` (dt_bias/a_log passed in swapped argument positions) that neither
   the fixture test nor the finite-difference gradient check could have caught from the CPU side alone —
   see `docs/GATED_DELTANET.md` §6 for the full account and numbers.
-- **QSA** — real code and config now in hand (see above), but no fixture yet; not scheduled ahead of the
-  other two per the original scope decision (block-sparse attention's benefit is long-context latency,
-  not this engine's current focus).
+- **QSA** — **Stage 0 + Stage 1 DONE** (branch `feature/qsa-stage1`, `docs/QSA.md`): CPU forward only
+  (`op_qsa`, `include/sub0/qsa_math.hpp`), correctness-gated against a real extracted layer-3 fixture, with
+  a genuinely non-degenerate indexer (112 of 300 causally-visible entries dropped). No backward (loud
+  `abort()`), no CUDA (`static_assert` refuses the build). Resolved design question: QSA needs NO new
+  per-layer schedule axis — the real `layer_types` array IS `gdn_schedule_for(4)`, and every
+  `full_attention` layer in the real model IS a QSA layer, so the three-way Attn/Gdn/Qsa classification is
+  derived from the existing GDN stride plus a model-wide gate.
 - **Gated Residual (hyper-connections)** — not previously tracked as a distinct backlog item; worth noting
   next to [[nanbeige-features-progress]]'s "remaining: ... mHC" line, since this is a second real,
   independent hyper-connection-family implementation (`Qwen4ExpTextGatedResidual`) to potentially draw on

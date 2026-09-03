@@ -668,4 +668,93 @@ S10 (Stage 1 execution output), not fixed here.
 
 ## 10. Results (Stage 1 execution)
 
-See the commit series and the final report for this pass; recorded here on landing.
+**A real OUT-OF-BOUNDS WRITE found and fixed by actually building a QSA-ON config, not by reasoning
+alone.** `rope_apply_row()` rotated `rotary_dim` channels of whatever vector it was given, but the
+indexer's own per-head query and pooled block key are `indexer_head_dim` wide — so at any config with
+`indexer_head_dim < rotary_dim` it wrote `(rotary_dim - indexer_head_dim)` floats past the end of that
+head's slice, into whatever the caller's scratch layout happened to put next. It surfaced as a
+`forward()`-vs-`forward_one()` parity FAILURE (worst per-position relative diff **0.11375**, against a
+`1e-3` gate) at `D_MODEL=16, N_HEADS=2, indexer_head_dim=4, D_HEAD=8`. Root-caused with a standalone
+batched-vs-incremental harness that isolated it precisely: **PREFIX-only batched calls
+(`qsa::forward(d, t+1, ...)`) matched the incremental row-by-row composition EXACTLY at every row, while
+the full-`T` batched call diverged from both** — i.e. cross-row scratch contamination whose presence
+depended on the buffer layout, not a formula error, and not (as first suspected) discrete top-k
+selection amplifying float noise: the measured block-score margins were healthy (`0.08`-`0.28`, nowhere
+near a tie). Fixed by giving `rope_apply_row` the vector's own width and clamping the rotary prefix to
+it, AND by adding `static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= D_HEAD)` in `layout.hpp` — a
+precondition the real model satisfies for free (`rotary_dim 64 <= indexer_head_dim 128 <= head_dim 256`)
+but this engine, whose `rotary_dim` is `D_HEAD` and whose indexer width is an independent axis, does not.
+The batched-vs-incremental check is now a permanent regression test
+(`tests/qsa_qwen4_fixture_tests.cpp`, per `[[regression-test-on-reproducible-bug]]`) asserting BITWISE
+equality, which it now achieves (`max abs diff = 0.0`).
+
+**Fixture correctness gate** (`tests/qsa_qwen4_fixture_tests.cpp`, real weights extracted from
+`Qwen/Qwen3.8-Flash-Next` layer 3's real `model.language_model.layers.3.self_attn.*` tensors — **198,976
+bytes total fetched by HTTP Range**, never a bulk shard download): **`max|out - expected| = 1.86265e-09`**
+over 384 values (`sum|expected| = 0.511787`) against the real, unmodified `transformers==5.16.1`
+`Qwen4ExpTextAttention.forward()`. **The fixture is genuinely non-degenerate**: the real indexer drops
+**112 of the 300 causally-visible mask entries** — asserted by both the extraction script (before writing)
+and the test (before trusting any match), because at the real `budget=2048, ratio=4` on a 24-token
+sequence every block would be selected and this whole file would pass identically for an implementation
+that never ran the indexer at all.
+
+**Presence/mutation checks** (same file): (1) a SECOND real reference computed by re-running the real
+module with ONLY the indexer's key-half `index_qk_proj` rows negated and scaled — our port's own output
+under the same perturbation matches that second real reference to `1.39698e-09`, AND the two real outputs
+genuinely differ by `max|out(real) - out(mutant)| = 0.0079712` with **128 mask entries changed**, proving
+the output depends on WHICH tokens were selected; (2) fixture-free property checks that block selection
+tracks the score and FLIPS when the query flips, that the incomplete TAIL survives regardless of score,
+and that `min(block_topk, num_blocks)` keeps everything when there are fewer blocks than the budget;
+(3) the bitwise batched-vs-incremental check above, itself guarded by `REQUIRE(total_dropped > 0)` so it
+cannot pass vacuously on a dense mutant. `[qsa]` tag: **4 test cases / 349 assertions**, green. Full
+`sub0_frontend_tests`: **196 test cases / 115,097 assertions** (192 / 114,748 before — exactly +4 cases
+and +349 assertions, nothing else).
+
+**Two-scale identity check** (AGENTS.md §7): at the neutral setting the full default engine test suite
+(`sub0_tests`) is HASH-identical to pre-QSA `main` at BOTH shapes, through every commit in this pass:
+
+| shape | assertions (before → after) | test cases | forward hash | grad hash | decode hash |
+|---|---|---|---|---|---|
+| d96 L8 H2 seq128 vocab26260 (even) | 18,118,452 → 18,119,453 | 142 → 145 | `d782c2f22a8f8470` | `b9e6ef80b96c7987` | `da8778997d09402e` |
+| d132 L11 H4 kv2 seq96 vocab26260 (odd/ragged) | 29,667,408 → 29,668,745 | 142 → 145 | `44fcf318125286ff` | `b0299e22d5ea4df7` | `e136194ed6db704d` |
+
+All three hashes are UNCHANGED at both shapes. The assertion deltas (+1001 and +1337) are fully accounted
+for by the three new `[layout][qsa]` test cases and nothing else: both add the same fixed set, plus a
+per-`PARAM_LAYOUT`-entry loop (10 `REQUIRE`s per tensor: 90 tensors at d96 → 900, 123 at d132 → 1230,
+difference 330) and a per-layer loop (2 `REQUIRE`s per layer, difference 6) — 330 + 6 = 336, exactly the
+observed 1337 − 1001.
+
+**Real QSA-ON builds** (this doc's own scope: correctness-fixture-scale configs, not production dims):
+
+- `D_MODEL=16, N_LAYERS=2, N_HEADS=2, N_KV_HEADS=2, SEQ_LEN=32`, indexer `2` heads / `1` kv / `head_dim 8`,
+  `budget=8, ratio=4` (⇒ `block_topk = 2` of up to 6 complete blocks — genuinely sparse): the standard,
+  QSA-agnostic `forward_one`-vs-`forward` parity test passes the `1e-3` gate; `[layout]` 430,527
+  assertions / 16 test cases green.
+- **`N_LAYERS=4, GDN_FULL_ATTN_STRIDE=4` with QSA also on** — the real model's own layer arrangement in
+  miniature (layers 0-2 GDN, layer 3 QSA): `[layout]` 440,102 assertions / 16 cases and the same parity
+  test both green. This build exists specifically to exercise the OTHER dispatch branch, because "wired
+  into only one of two call sites" is exactly how MoE's own Stage 1 SIGSEGV happened (`docs/MOE.md` §9);
+  `forward_one`'s QSA path is deliberately reached through a single named `do_full_attn_mixer()` lambda
+  that both the GDN-on and GDN-off dispatch paths call, rather than duplicated in each.
+
+**Scope confirmed, not merely assumed**: the full, untagged `sub0_tests` suite at a QSA-ON build reaches
+`backward_node`'s loud `abort()` ("fatal: Qwen Sparse Attention has no backward pass yet...") on the first
+`Op::Qsa` node a training-path test tries to differentiate through — exactly Stage 1's declared scope
+boundary (§6), confirmed by hitting it rather than only documenting it.
+
+**CUDA guard**: `static_assert(!sub0::USE_QSA, ...)` added to `backend_cuda.cu`, mirroring the GR/MoE
+guards. It is unconditionally satisfied at the default (QSA off) so it cannot regress any existing CUDA
+build. The consumer sweep (AGENTS.md §10) found `backend_cuda.cu` does mirror `GDN_SCHEDULE.full_attn` in
+its own `layer_slots()`/`build_qkv_weights()` param-layout arithmetic, which a QSA layer would break —
+the guard is what makes that unreachable rather than silently wrong, and lifting it must update those
+sites too.
+
+**Divergence from the task brief, recorded explicitly**: the brief asked for "a QSA layer-schedule knob
+analogous to `GDN_SCHEDULE`" as a new `RunConfig` constant. §2 concluded against a new *knob* and
+delivered the *derived* three-way `MIXER_SCHEDULE` instead, because the real `config.json`'s `layer_types`
+array was verified element-by-element to be exactly `gdn_schedule_for(4)` and no `full_attention` layer in
+the real model lacks an indexer — so an independent QSA stride could only express layer sets the real
+model cannot have (AGENTS.md §8). The testable substance the brief wanted is preserved: `qsa_schedule_for
+<LAYERS>(gdn_stride, qsa_on)` is a free function of explicit parameters, asserted at an odd, non-dividing
+layer count (11 layers at stride 4, where the ragged tail 8/9/10 contains no full-attention layer at all)
+exactly as §9 required.
