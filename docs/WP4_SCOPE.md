@@ -401,6 +401,35 @@ outcome**, and is what this staging is designed to produce rather than a single 
 These are **not** rhetorical. Each one changes the plan materially, and this document deliberately does
 not pick for the user.
 
+**Q1-Q4 answered by the user (2026-09-03)**, recorded here verbatim rather than paraphrased:
+
+- **Q1 (fake-weights-first)**: NOT a strict either/or as posed. User's answer: *"Get the real weights
+  downloaded - doesn't block work as random weights can also be used while it downloads and for quick
+  validation of shape and plumbing. But getting real weights from disk will also drive the how/when/where
+  to effectively integrate sooner."* — i.e. **run both in parallel, not gated on each other**: WP4b/WP4d's
+  shape/plumbing validation proceeds now with synthetic weights (no download dependency), while the real
+  acquisition (already in progress, see below) happens concurrently — and once real bytes are on disk,
+  inspecting THEM (not a synthetic stand-in) should inform WP4c's transplant design, rather than treating
+  WP4c as a purely abstract design exercise ahead of having the actual file. Revises §6's staging: WP4b
+  and WP4a's acquisition do not block each other.
+- **Q2 (transplant format)**: **GGUF / `UD-IQ1_S`** — the tier already downloading to
+  `D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S\` (all three shards, ~72.55GB total, including the
+  n-gram/PLE table for completeness even though §5 keeps it out of the first run's compute). This
+  overrides §3a's safetensors/bf16 recommendation. **Consequence, stated plainly since the user chose
+  this with the cost already named**: `gguf.hpp` needs real `IQ4_NL` (and likely K-quant) dequantization,
+  not just the `BF16` size-rule this document proposed as the minimal safetensors-path addition — §3
+  should be read as superseded by this choice, not merely supplemented.
+- **Q3 (run scope)**: **4-layer real sub-stack (3 GDN + 1 QSA)** — the real model's own repeating unit, as
+  proposed.
+- **Q4 (Blocker A)**: **Full faithful fix** — `--head-dim` and its full consumer sweep (§2 Blocker A) are
+  in scope for WP4b, not deferred. Real attention weights must be transplantable, not just GDN/GR/MoE.
+
+**Still open, unresolved by the above**: Q5 (llama.cpp availability — partially answered: no built binary
+found on this machine, but an unbuilt source checkout exists at `D:\Craig\diffusiongemma\llama.cpp`, so
+WP4f is "build it" not "acquire it from scratch"), Q6 (M-RoPE degeneracy, unverified), Q7 (per-layer
+mismatch gate, proposed `1e-4` not yet confirmed), Q8 (the 0.71B parameter-total discrepancy — the cheap
+131-header-request census that would settle it has not been run).
+
 **Q1 — Real weights at all, or a "real shape, fake weights" harness run first?**
 A synthetic run (real 48-layer Qwen4 `RunConfig`, randomly-initialised weights) would validate WP4b's
 shape work, WP4d's engine path, WP4c's prefill chunking and WP4e's offload machinery **without any
