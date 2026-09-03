@@ -389,7 +389,77 @@ final report (Stage 1 execution output), not fixed in this design doc ahead of r
 
 ## 9. Results (Stage 1 execution)
 
-See the task's final report message for the executed numbers (fixture-comparison deltas, presence-check
-result, two-scale assertion/hash tables, MoE-ON parity result) -- filled in after Stage 1's own build/test
-pass, following `docs/GATED_RESIDUAL.md` S9's own precedent of recording execution output in the doc's own
-final section rather than predicting it here.
+**A real bug found and fixed by actually building at a real MoE-ON config, not by reasoning alone**: the
+first Stage 1 pass wired `op_moe` into the FFN block inside `Op::GDN`'s own branch (unreachable at the
+default `GDN_FULL_ATTN_STRIDE=0`) but NOT into the softmax-attention branch's own copy of that same FFN
+block -- the one every layer actually runs at the default stride. A real `NUM_EXPERTS=8, EXPERTS_PER_TOK=2`
+build (`D_MODEL=16, N_LAYERS=2, N_HEADS=2, SEQ_LEN=32`) reproduced this as a SIGSEGV in the standard
+`forward_one`-vs-`forward` parity test: `L.Wg`/`L.W1`/`L.W2` are never allocated when `USE_MOE` is on
+(`build_layout()`'s own `if constexpr` branch skips them), so the untouched branch dereferenced a null
+weight pointer. Root-caused by instrumenting `op_moe` with stderr prints and observing NONE fired before
+the crash -- proof the reachable code path never called it at all. Fixed by wiring the same
+`if constexpr (USE_MOE) { f = op_moe(f, L); } else if constexpr (USE_GATED_FFN) {...} else {...}` into
+BOTH branches. A second, smaller consumer gap (AGENTS.md S10's own lesson) surfaced the same way:
+`layout_tests.cpp`'s pre-existing "arch fingerprint2 stays bit-identical when Gated DeltaNet is off" test
+asserted `ARCH_FINGERPRINT2 == 0` unconditionally, which stopped holding once `EXPERTS_PER_TOK` also lives
+in that word (S3c) -- fixed by generalizing the assertion to an implication on `EXPERTS_PER_TOK`'s own
+value and adding MoE-specific byte-1 assertions mirroring the existing byte-0 (GDN) ones.
+
+**Fixture correctness gate** (`tests/moe_qwen4_fixture_tests.cpp`, real weights extracted from
+`Qwen/Qwen3.8-Flash-Next` layer 0's real `model.language_model.layers.0.mlp.*` tensors -- full real
+512-expert router sliced `hidden_size` 2560->16, the real router's own top-10 selection on a real
+hand-picked input, only those 10 (+2 decoy) experts' real weight slabs fetched, `moe_intermediate_size`
+640->8, one hand-picked real input): **`max|out - expected| = 1.45519e-11`** over `sum|expected| =
+0.000384256` across 16 values -- essentially an exact, float32-rounding-level match against the real,
+unmodified `transformers==5.16.1` `Qwen4ExpTextSparseMoeBlock.forward()`.
+
+**Presence/mutation checks** (same file): (1) a SECOND real reference (`output_mutant`) was computed by
+forcing the real router's own top-10 selection's first two slots to two different, also-real "decoy"
+experts and re-running the same real PyTorch module -- our CPU port's own forced-mutant recombination
+matches that second real reference to `max|out_mutant - expected_mutant| = 1.79974e-07`, AND the real vs.
+mutant outputs genuinely differ by `max|out(real) - out_mutant(forced decoys)| = 2.91125e-05` -- large and
+real, proving the output genuinely depends on WHICH experts were consulted, not merely that some plausible
+output comes out; (2) a second, fixture-free test confirms `router_topk_row`'s selected SET tracks the
+input (an input favoring low expert indices selects `{0,1}`; the same router favoring high indices selects
+`{2,3}`), and that `norm_topk_prob=true` renormalizes the selected weights to sum to exactly 1. All 2 test
+cases: 44 assertions, green. Full `sub0_frontend_tests` suite (which these fixture tests join, the same
+placement `gdn`/`gr` fixture tests use): 192 test cases / 114,748 assertions, all green (190 pre-existing +
+2 new).
+
+**Two-scale identity check** (AGENTS.md S7): at `NUM_EXPERTS == 0` (neutral), the full default engine test
+suite (`sub0_tests`) is assertion- AND hash-identical across every commit in this pass, at BOTH shapes:
+
+| shape | assertions | test cases | forward hash | grad hash | decode hash |
+|---|---|---|---|---|---|
+| d96 L8 H2 seq128 vocab26260 (even) | 18,118,452 | 142 | `5c89301ea110f2ce` | `40ec687c2de8cc1d` | `e77acd5f0e790c87` |
+| d132 L11 H4 kv2 seq96 vocab26260 (odd/ragged) | 29,667,408 | 142 | `865d6ce187efacff` | `ee590d25a4f2c865` | `95a33863710c3cc8` |
+
+Both shapes' hashes are unchanged from the very first Stage 0 commit through the softmax-attention-branch
+bug fix (S9's own finding above) -- confirming that fix, despite touching the reachable code path, remains
+byte-identical when `USE_MOE` is false (it only ever added a new `if constexpr` branch that the neutral
+build never takes). Assertion counts moved twice, both fully accounted for: Stage 0 added 3 new
+`[layout][moe]` test cases (728 assertions); the `ARCH_FINGERPRINT2` consumer-gap fix (S9) added 7 more
+assertions to one pre-existing test case (both deltas nothing else).
+
+**Real MoE-ON build, `forward`-vs-`forward_one` parity** (this doc's own scope: a small correctness-
+fixture-scale config, not production dims): `D_MODEL=16, N_LAYERS=2, N_HEADS=2, SEQ_LEN=32, NUM_EXPERTS=8,
+EXPERTS_PER_TOK=2` -- a genuinely MoE-active build, `PARAM_LAYOUT` carrying the real
+router+8-expert-triple+shared-expert-triple+shared-gate shape. `engine_tests.cpp`'s existing, MoE-agnostic
+"`forward_one` (KV-cache) matches the full forward per position" test (no MoE-specific code needed -- it
+exercises whatever the compiled `Model` actually computes) passes with worst per-position relative diff
+**`2.92655e-07`** -- float32-rounding-level agreement between the Node-graph training path (`op_moe`
+calling `sub0::moe::forward`) and the raw-pointer decode path (`sub0::moe::forward_row` called directly),
+confirming both call sites agree on a real forward pass. `[layout]` at this same MoE-ON build: 478,614
+assertions / 13 test cases, all green.
+
+**Scope confirmed, not merely assumed**: the full, untagged default `sub0_tests` suite at this same MoE-ON
+build reaches `backward_node`'s loud `abort()` ("fatal: Mixture of Experts has no backward pass yet...") on
+the first `Op::Moe` node a training-path test tries to differentiate through -- exactly Stage 1's own
+declared scope boundary (S6), confirmed by actually hitting it rather than only documenting it, the same
+outcome `docs/GATED_RESIDUAL.md` S9 recorded for its own mechanism. `[layout]`/`[moe]`-tagged and
+forward-only tests all pass; train/tune-shaped tests correctly, loudly refuse.
+
+**CUDA guard**: `static_assert(!sub0::USE_MOE, ...)` added to `backend_cuda.cu`, mirroring the Gated
+Residual guard exactly. Not build-verified in this environment (no `cl.exe` on `PATH` for `nvcc` in this
+sandbox), but the assertion is unconditionally false at the default `NUM_EXPERTS=0`, so it cannot regress
+any existing CUDA build.
