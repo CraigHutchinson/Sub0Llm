@@ -96,7 +96,14 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              (tests/fixtures/qwen4_preview/gdn_layer0_small_*), plus mutation-style
 #                              numerical property checks (docs/GATED_DELTANET.md sec 6). Skips gracefully
 #                              if the fixtures are absent.
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
+#   moe_qwen4_fixture_tests.cpp — Mixture of Experts Stage 1's primary correctness gate:
+#                              sub0::moe::forward_row (include/sub0/moe_math.hpp, engine-free) checked
+#                              against REAL extracted Qwen/Qwen3.8-Flash-Next layer-0 mlp router + the
+#                              real top-10-selected experts + shared expert weights + activations
+#                              (tests/fixtures/qwen4_preview/moe_layer0_small_*), plus a mutation-style
+#                              check that a forced different expert selection changes the output by a
+#                              real, matching amount (docs/MOE.md sec 7). Skips gracefully if absent.
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
