@@ -1320,15 +1320,34 @@ thread_local GdnCache g_gdn_cache;   // only ever populated/consulted when USE_G
 // indexer keys -- k_layernorm and RoPE happen later, on the POOLED block key, at the block's own start
 // position (docs/QSA.md S1a). reset() follows KVCache's own assign-on-size-change rule, safe for the same
 // reason: every row ever READ was WRITTEN earlier in the SAME generation.
+//
+// It ALSO carries the POOLED block-key cache (docs/QSA.md S11). A block's pooled+k_layernorm'd+RoPE'd
+// key is a function of the block alone -- its fixed start position and the compress_ratio raw keys in
+// it -- never of the querying position, so recomputing it on every decode step was O(T^2/ratio) work
+// across a generation for an O(T/ratio) quantity. `n_cached[e]` is how many leading blocks of slot e
+// are valid; qsa::indexer_select_row extends it by the (at most one) block that completed this step.
+// UNLIKE raw_k, `n_cached` MUST be zeroed on every reset, not only when the size changes: a stale
+// non-zero count would make a fresh generation trust the PREVIOUS generation's block keys. (raw_k keeps
+// the assign-on-size-change rule, which is still safe for the same reason as before -- every row read
+// was written earlier in the same generation -- and block_k needs no clearing at all, since only its
+// first n_cached[e] entries are ever read.)
 struct QsaCache {
     std::vector<float> raw_k;   // [LOOP_EXEC_COUNT][SEQ_LEN][QSA_IDX_HEAD_DIM_BUF], flat
+    std::vector<float> block_k; // [LOOP_EXEC_COUNT][block_key_cache_floats(QSA_DIMS_BUF, SEQ_LEN)], flat
+    std::vector<int>   n_cached;// [LOOP_EXEC_COUNT] -- valid leading block count per execution slot
+    static constexpr size_t BLOCK_K_PER_EXEC = qsa::block_key_cache_floats(QSA_DIMS_BUF, SEQ_LEN);
     void reset() {
         const size_t n = static_cast<size_t>(LOOP_EXEC_COUNT) * SEQ_LEN * QSA_IDX_HEAD_DIM_BUF;
         if (raw_k.size() != n) raw_k.assign(n, 0.f);
+        const size_t bn = static_cast<size_t>(LOOP_EXEC_COUNT) * BLOCK_K_PER_EXEC;
+        if (block_k.size() != bn) block_k.assign(bn, 0.f);
+        n_cached.assign(static_cast<size_t>(LOOP_EXEC_COUNT), 0);   // unconditional -- see above
     }
     float* base(int e) {
         return raw_k.data() + static_cast<size_t>(e) * SEQ_LEN * QSA_IDX_HEAD_DIM_BUF;
     }
+    float* block_base(int e) { return block_k.data() + static_cast<size_t>(e) * BLOCK_K_PER_EXEC; }
+    int*   n_cached_of(int e) { return n_cached.data() + e; }
 };
 thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_QSA
 
@@ -2341,9 +2360,14 @@ struct Model {
                                        L.qsa_qnorm->data.data(), L.qsa_knorm->data.data(),
                                        cos_pos, sin_pos, qsa::RMS_EPS,
                                        qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos));
+                // The pooled block keys persist across decode steps in this execution's own QsaCache
+                // slot, exactly as the raw keys above already do -- the decode counterpart of the
+                // batched path's in-scratch cache, filled by the SAME primitive (docs/QSA.md S11).
                 qsa::indexer_select_row(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
                                          L.qsa_idx_knorm->data.data(), g_qsa_rope.cos.data(),
-                                         g_qsa_rope.sin.data(), qsa::RMS_EPS, qsa_mask, qsa_sel_scr);
+                                         g_qsa_rope.sin.data(), qsa::RMS_EPS,
+                                         g_qsa_cache.block_base(e), g_qsa_cache.n_cached_of(e),
+                                         qsa_mask, qsa_sel_scr);
                 qsa::attn_row(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
                                qsa_mask, L.qsa_o->data.data(), proj, qsa_att_scr);
                 gr_write_row(h, proj);                                           // residual (write step)

@@ -77,12 +77,36 @@ namespace detail {
 inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 }  // namespace detail
 
+// --- instrumentation ----------------------------------------------------------------------------
+// How many times pool_block_key() has actually run on THIS thread. Exists to make the block-key
+// cache's COMPLEXITY assertable, not just its output: before the cache, the pooling+norm+rotate body
+// ran once per (query row, complete block) pair -- sum_t (t+1)/ratio ~ T^2/(2*ratio) over a T-row
+// prefill -- and it is impossible to tell that apart from the cached O(T/ratio) form by comparing
+// outputs, because both produce the SAME numbers. tests/qsa_qwen4_fixture_tests.cpp asserts the exact
+// count (docs/QSA.md S11). thread_local so a multi-threaded forward cannot race on it; the cost is one
+// TLS increment per block key genuinely computed, i.e. O(T/ratio) increments in total.
+namespace stats {
+inline thread_local unsigned long long pool_block_key_calls = 0;
+}  // namespace stats
+
 // --- scratch sizing -----------------------------------------------------------------------------
-// indexer_select_row: the per-block score array (kv_len/compress_ratio, +1 slack) plus one pooled-key
-// buffer (idx_head_dim). Destroyed by the call.
+// indexer_select_row: the per-block score array (kv_len/compress_ratio, +1 slack). The pooled-key
+// buffer that used to live here is gone -- pooled block keys are now written into the caller-owned
+// block-key CACHE (block_key_cache_floats below), which is what makes them reusable across queries.
 inline constexpr std::size_t select_scratch_floats(const Dims& d, int max_kv) {
-    return static_cast<std::size_t>(max_kv / (d.compress_ratio > 0 ? d.compress_ratio : 1) + 1)
-         + static_cast<std::size_t>(d.idx_head_dim);
+    return static_cast<std::size_t>(max_kv / (d.compress_ratio > 0 ? d.compress_ratio : 1) + 1);
+}
+// The number of blocks that can ever become COMPLETE within a `max_kv`-long window.
+inline constexpr int max_blocks(const Dims& d, int max_kv) {
+    return d.compress_ratio > 0 ? max_kv / d.compress_ratio : 0;
+}
+// The caller-owned pooled-block-key cache: one already-pooled + k_layernorm'd + RoPE'd key per block
+// that has become complete, `idx_head_dim` wide. Caller-owned and caller-sized (AGENTS.md S1) exactly
+// like every other buffer in this file -- the BATCHED path parks it in its own scratch (it lives for
+// one prefill call), while the DECODE path must keep it alive ACROSS calls, which is precisely why it
+// is a parameter here rather than a static inside this header.
+inline constexpr std::size_t block_key_cache_floats(const Dims& d, int max_kv) {
+    return static_cast<std::size_t>(max_blocks(d, max_kv)) * static_cast<std::size_t>(d.idx_head_dim);
 }
 // attn_row: the per-query score array over the kv window (max_kv) plus the pre-o_proj attention output
 // (q_width).
@@ -99,6 +123,7 @@ inline constexpr std::size_t scratch_floats(const Dims& d, int T) {
          + static_cast<std::size_t>(d.idx_q_width())                                    // indexer q (1 row)
          + 2u * static_cast<std::size_t>(d.q_width())                                   // q, gate (1 row)
          + static_cast<std::size_t>(T)                                                  // visibility mask
+         + block_key_cache_floats(d, T)                                                 // pooled block keys
          + select_scratch_floats(d, T) + attn_scratch_floats(d, T);
 }
 
@@ -191,33 +216,71 @@ inline void indexer_project_row(const Dims& d, const float* x, const float* qk_p
 //   selected            = topk(score, min(block_topk, num_complete_blocks))'s tokens
 //                         UNION the incomplete tail [nb*ratio, kv_len)         (ALWAYS visible)
 //
+// ONE block's pooled + k_layernorm'd + RoPE'd key, from that block's own `compress_ratio` raw token
+// keys -- the loop body that used to be inlined in indexer_select_row, extracted so it can be called
+// ONCE PER BLOCK for the whole run instead of once per (query, block) pair.
+//
+// The reason this split is valid, spelled out because it is the entire justification for the cache:
+// every input to this function is a function of the BLOCK alone -- its fixed start position
+// `block * compress_ratio`, the `compress_ratio` raw keys stored there (each written exactly once, when
+// its token was projected), the k_layernorm weights and the cos/sin tables. The querying position `q`
+// appears NOWHERE in it; the query enters only in the score dot-product afterwards. So a block's key is
+// the same value for every query that can see it, and recomputing it per query was pure repeated work.
+//
+// `out`: [idx_head_dim], this block's cache slot. Bumps stats::pool_block_key_calls.
+inline void pool_block_key(const Dims& d, const float* raw_keys, int block, const float* k_ln_w,
+                           const float* cos, const float* sin, float eps, float* out) {
+    ++stats::pool_block_key_calls;
+    const int ratio = d.compress_ratio;
+    const int start = block * ratio;
+    for (int j = 0; j < d.idx_head_dim; ++j) out[j] = 0.f;
+    for (int t = start; t < start + ratio; ++t) {
+        const float* kt = raw_keys + static_cast<std::size_t>(t) * d.idx_head_dim;
+        for (int j = 0; j < d.idx_head_dim; ++j) out[j] += kt[j];
+    }
+    const float inv_ratio = 1.f / static_cast<float>(ratio);
+    for (int j = 0; j < d.idx_head_dim; ++j) out[j] *= inv_ratio;
+    rms_norm_row(out, k_ln_w, d.idx_head_dim, eps, out);
+    // Rotated at the BLOCK's own first token position (`group_starts`), not at the query's -- which is
+    // the other half of why this is query-independent and therefore cacheable at all.
+    rope_apply_row(out, cos + static_cast<std::size_t>(start) * d.rotary_dim,
+                    sin + static_cast<std::size_t>(start) * d.rotary_dim, d.rotary_dim, d.idx_head_dim);
+}
+
 // `raw_keys`: [kv_len, idx_head_dim], the UNNORMED, UNROTATED per-token indexer keys.
 // `cos`/`sin`: [>= kv_len, rotary_dim] full-position tables.
 // `out_mask`: [kv_len] floats, written 1.0f for visible / 0.0f for masked-out.
 // `scratch`: >= select_scratch_floats(d, kv_len).
 // Returns the number of visible positions.
+//
+// `block_keys`: [>= max_blocks(d, kv_len) * idx_head_dim] caller-owned cache of already-pooled block
+// keys; `*n_cached` says how many leading blocks in it are already valid. This call pools ONLY the
+// blocks that have become complete since the last call ([*n_cached, nb)) -- at most ONE, since kv_len
+// grows by one row at a time on both the prefill and the decode path -- and then reads every block's
+// key straight out of the cache. `*n_cached` is updated in place.
+//
+// CACHE CONTRACT (identical to the raw-key store's own, deliberately): a cached block key stays valid
+// as long as the raw keys under it do, i.e. for one prefill call, or for one generation on the decode
+// path, where every row is written exactly once before it is ever read. Start a new run by zeroing
+// `*n_cached`; the buffer's contents need no clearing, since only its first `*n_cached` entries are
+// ever read. Never shrinks `*n_cached`: a shorter kv_len is a PREFIX of the same blocks, whose keys are
+// unchanged (that is what makes forward()'s row loop and forward_one()'s call sequence agree bitwise).
 inline int indexer_select_row(const Dims& d, const float* q, const float* raw_keys, int kv_len,
                                const float* k_ln_w, const float* cos, const float* sin, float eps,
-                               float* out_mask, float* scratch) {
+                               float* block_keys, int* n_cached, float* out_mask, float* scratch) {
     for (int j = 0; j < kv_len; ++j) out_mask[j] = 0.f;
     const int ratio = d.compress_ratio;
     const int nb    = kv_len / ratio;
     float* scores = scratch;                        // [nb]
-    float* pooled = scratch + nb + 1;               // [idx_head_dim]
     const float inv_sqrt_hd = 1.f / std::sqrt(static_cast<float>(d.idx_head_dim));
+    // Extend the cache over exactly the newly-completed blocks. This is the whole optimization: the
+    // pooling+norm+rotate work below is O(blocks completed since the last call), not O(all blocks).
+    for (int b = *n_cached; b < nb; ++b)
+        pool_block_key(d, raw_keys, b, k_ln_w, cos, sin, eps,
+                       block_keys + static_cast<std::size_t>(b) * d.idx_head_dim);
+    if (nb > *n_cached) *n_cached = nb;
     for (int b = 0; b < nb; ++b) {
-        const int start = b * ratio;
-        for (int j = 0; j < d.idx_head_dim; ++j) pooled[j] = 0.f;
-        for (int t = start; t < start + ratio; ++t) {
-            const float* kt = raw_keys + static_cast<std::size_t>(t) * d.idx_head_dim;
-            for (int j = 0; j < d.idx_head_dim; ++j) pooled[j] += kt[j];
-        }
-        const float inv_ratio = 1.f / static_cast<float>(ratio);
-        for (int j = 0; j < d.idx_head_dim; ++j) pooled[j] *= inv_ratio;
-        rms_norm_row(pooled, k_ln_w, d.idx_head_dim, eps, pooled);
-        // Rotated at the BLOCK's own first token position (`group_starts`), not at the query's.
-        rope_apply_row(pooled, cos + static_cast<std::size_t>(start) * d.rotary_dim,
-                        sin + static_cast<std::size_t>(start) * d.rotary_dim, d.rotary_dim, d.idx_head_dim);
+        const float* pooled = block_keys + static_cast<std::size_t>(b) * d.idx_head_dim;
         float s = 0.f;
         for (int h = 0; h < d.idx_n_heads; ++h) {
             const float* qh = q + static_cast<std::size_t>(h) * d.idx_head_dim;
@@ -333,8 +396,13 @@ inline void forward(const Dims& d, int T, const float* hidden,
     float* q_row    = idx_q + d.idx_q_width();
     float* gate_row = q_row + d.q_width();
     float* mask     = gate_row + d.q_width();
-    float* sel_scr  = mask + T;
+    float* blk_keys = mask + T;
+    float* sel_scr  = blk_keys + block_key_cache_floats(d, T);
     float* att_scr  = sel_scr + select_scratch_floats(d, T);
+    // The pooled-block-key cache for THIS prefill, empty at row 0 and grown by indexer_select_row as
+    // blocks complete -- the batched counterpart of the decode path's per-execution QsaCache slot, and
+    // populated through the very same primitive so the two cannot drift (docs/QSA.md S11).
+    int n_cached = 0;
 
     for (int t = 0; t < T; ++t) {
         const float* x = hidden + static_cast<std::size_t>(t) * d.hidden_size;
@@ -347,7 +415,8 @@ inline void forward(const Dims& d, int T, const float* hidden,
         attn_project_row(d, x, q_w, gate_w, k_w, v_w, q_norm_w, k_norm_w, cos_t, sin_t, eps,
                           q_row, gate_row, k_cache + static_cast<std::size_t>(t) * kvw,
                           v_cache + static_cast<std::size_t>(t) * kvw);
-        indexer_select_row(d, idx_q, raw_keys, t + 1, idx_k_ln_w, cos, sin, eps, mask, sel_scr);
+        indexer_select_row(d, idx_q, raw_keys, t + 1, idx_k_ln_w, cos, sin, eps, blk_keys, &n_cached,
+                            mask, sel_scr);
         attn_row(d, q_row, gate_row, k_cache, v_cache, t + 1, mask, o_proj_w,
                   out + static_cast<std::size_t>(t) * d.hidden_size, att_scr);
     }
