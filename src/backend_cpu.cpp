@@ -1755,15 +1755,15 @@ struct Model {
             } else {
                 // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b) -- see layout.hpp's
                 // make_param_layout() for the same shapes with the reasoning attached.
-                L.gdn_in_qkv   = mk_param(D_MODEL, 2 * D_KV + D_MODEL, true);
-                L.gdn_in_z     = mk_param(D_MODEL, D_MODEL, true);
-                L.gdn_in_b     = mk_param(D_MODEL, N_HEADS, true);
-                L.gdn_in_a     = mk_param(D_MODEL, N_HEADS, true);
+                L.gdn_in_qkv   = mk_param(D_MODEL, GDN_CONV_DIM, true);
+                L.gdn_in_z     = mk_param(D_MODEL, GDN_VALUE_DIM, true);
+                L.gdn_in_b     = mk_param(D_MODEL, GDN_V_HEADS, true);
+                L.gdn_in_a     = mk_param(D_MODEL, GDN_V_HEADS, true);
                 L.gdn_conv     = mk_param(GDN_CONV_DIM, GDN_CONV_KERNEL, false);
-                L.gdn_a_log    = mk_param(1, N_HEADS, false);
-                L.gdn_dt_bias  = mk_param(1, N_HEADS, false);
-                L.gdn_norm     = mk_param(1, D_HEAD, false);
-                L.gdn_out_proj = mk_param(D_MODEL, D_MODEL, true);
+                L.gdn_a_log    = mk_param(1, GDN_V_HEADS, false);
+                L.gdn_dt_bias  = mk_param(1, GDN_V_HEADS, false);
+                L.gdn_norm     = mk_param(1, GDN_V_HEAD_DIM, false);
+                L.gdn_out_proj = mk_param(GDN_VALUE_DIM, D_MODEL, true);
             }
             // Gated Residual: the mlp_hyper_connection instance, right before the FFN's own weights.
             if constexpr (USE_GATED_RESIDUAL) {

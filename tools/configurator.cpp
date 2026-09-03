@@ -601,6 +601,16 @@ int main(int argc, char** argv) {
     // CUDA (backend_cuda.cu keeps its own static_assert) -- so a GDN build works for gen/eval/report but
     // NOT for train/tune. See docs/GATED_DELTANET.md.
     int gdn_full_attn_stride = 0;
+    // Gated DeltaNet's OWN head geometry (WP4b blocker B, docs/WP4_SCOPE.md S2). Until this pass these
+    // four were ALIASED onto --kv-heads / --heads / D_HEAD / D_HEAD, which cannot express the real
+    // Qwen4-preview model (16 / 48 / 128 / 128 against attention's 2 / 24 / 256). Each is 0 = "alias to
+    // the corresponding attention axis", the same "0 means the old behaviour" idiom --kv-heads uses, so
+    // every existing build is byte-identical. Resolved below (once --heads/--kv-heads are final) and
+    // emitted RESOLVED, exactly as n_kv_heads already is.
+    int gdn_key_heads      = 0;
+    int gdn_value_heads    = 0;
+    int gdn_key_head_dim   = 0;
+    int gdn_value_head_dim = 0;
     int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
     int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
     int ngram_table_size   = 0;  // N-gram embeddings: per-table vocab size m (0 = auto: VOCAB)
@@ -686,6 +696,22 @@ int main(int argc, char** argv) {
                    "attention). Stage 1: CPU forward only -- gen/eval/report work, train/tune do not "
                    "(no backward pass yet, and no CUDA build)")
        ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-key-heads", gdn_key_heads,
+                   "Gated DeltaNet: linear-attention KEY/query head count, independent of --kv-heads "
+                   "(0 = alias to --kv-heads, the previous behaviour). Real Qwen4-preview: 16")
+       ->capture_default_str()->check(CLI::Range(0, 255));
+    app.add_option("--gdn-value-heads", gdn_value_heads,
+                   "Gated DeltaNet: linear-attention VALUE/gate head count, independent of --heads "
+                   "(0 = alias to --heads). Must be a multiple of the key head count. Real model: 48")
+       ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-key-head-dim", gdn_key_head_dim,
+                   "Gated DeltaNet: linear-attention key/query per-head width (0 = alias to the derived "
+                   "attention head dim). Real Qwen4-preview: 128")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
+    app.add_option("--gdn-value-head-dim", gdn_value_head_dim,
+                   "Gated DeltaNet: linear-attention value/gate per-head width (0 = alias to the derived "
+                   "attention head dim). Real Qwen4-preview: 128")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--ngram-max-n", ngram_max_n,
                    "N-gram embeddings: highest n-gram order to hash (bigrams..N-grams added into the "
                    "input embedding); 0 = off, else must be >= 2. See docs/NGRAM_EMBEDDING.md")
@@ -901,6 +927,26 @@ int main(int argc, char** argv) {
         std::println(stderr, "configure error: kv-heads ({}) must be >= 1 and divide heads ({}) evenly",
                      n_kv_heads, n_heads);
         return 1;
+    }
+    // Gated DeltaNet's own head geometry (WP4b blocker B): resolve 0 -> the aliased attention axis HERE,
+    // once --heads/--kv-heads are final, so the generated header always carries the RESOLVED value and
+    // two spellings of one architecture (0 vs the explicit alias value) cannot produce two different
+    // MODEL_ARCH_IDs. Same treatment n_kv_heads' own 0-means-derive already gets, just above.
+    {
+        const int d_head = d_model / n_heads;   // the divisibility check above already ran
+        if (gdn_key_heads      == 0) gdn_key_heads      = n_kv_heads;
+        if (gdn_value_heads    == 0) gdn_value_heads    = n_heads;
+        if (gdn_key_head_dim   == 0) gdn_key_head_dim   = d_head;
+        if (gdn_value_head_dim == 0) gdn_value_head_dim = d_head;
+        // Mirrors layout.hpp's own static_assert as a configure-time diagnostic naming the flags,
+        // rather than a compile error in the engine (the same pattern every check below uses).
+        if (gdn_value_heads % gdn_key_heads != 0) {
+            std::println(stderr,
+                         "configure error: gdn-value-heads ({}) must be a multiple of gdn-key-heads "
+                         "({}) -- it is the reference's repeat_interleave factor", gdn_value_heads,
+                         gdn_key_heads);
+            return 1;
+        }
     }
     // LoopSplit: the head and tail blocks split what's left of the stack evenly around the middle,
     // so (n_layers - loop_middle) must be even. Mirrors layout.hpp's own static_asserts, but as a
@@ -1466,6 +1512,15 @@ int main(int argc, char** argv) {
     // become GDN layers (layout.hpp's GDN_SCHEDULE, op_gdn/gdn_math.hpp's CPU forward). 0 = off, every
     // layer softmax attention. See docs/GATED_DELTANET.md.
     cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
+    // Gated DeltaNet's OWN four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2): the linear-attention
+    // key/value head counts and per-head widths, no longer aliased onto N_KV_HEADS/N_HEADS/D_HEAD.
+    // Emitted RESOLVED (the 0 = alias defaulting happened above), so layout.hpp's GDN_DIMS reads them
+    // directly. At the alias values every GDN tensor shape is exactly what it was before this axis
+    // existed. See layout.hpp's GDN_K_HEADS.. block for the three-way classification.
+    cos << "constexpr int  GDN_KEY_HEADS       = " << gdn_key_heads      << ";\n";
+    cos << "constexpr int  GDN_VALUE_HEADS     = " << gdn_value_heads    << ";\n";
+    cos << "constexpr int  GDN_KEY_HEAD_DIM    = " << gdn_key_head_dim   << ";\n";
+    cos << "constexpr int  GDN_VALUE_HEAD_DIM  = " << gdn_value_head_dim << ";\n";
     // N-gram embeddings: additional per-position features from rolling polynomial-hash token n-grams,
     // added into the input embedding ("concat" fusion mode, Nanbeige's NanbeigeNgramEmbedding). 0 = off.
     // Unlike depth attention this DOES add parameters (see layout.hpp's NGRAM_EMBED section), so it is
@@ -1679,6 +1734,8 @@ int main(int argc, char** argv) {
     // banner (it is always 0 today anyway -- see the static_assert -- so nothing has SHOWN it missing
     // yet, but the banner's whole job is to show every axis a run can differ on).
     shown.gdn_full_attn_stride = gdn_full_attn_stride;
+    shown.gdn_key_heads = gdn_key_heads;         shown.gdn_value_heads = gdn_value_heads;
+    shown.gdn_key_head_dim = gdn_key_head_dim;   shown.gdn_value_head_dim = gdn_value_head_dim;
     shown.ngram_max_n = ngram_max_n; shown.ngram_tables = ngram_tables;
     shown.ngram_table_size = ngram_table_size;
     shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;

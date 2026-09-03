@@ -342,6 +342,42 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
         REQUIRE(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)] == this_build.full_attn[static_cast<std::size_t>(l)]);
 }
 
+// GDN's own four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2). These used to be ALIASED onto the
+// ordinary attention axes, which is why a real weight transplant was impossible: the real model wants
+// 16 / 48 / 128 / 128 against attention's 2 / 24 / 256. What must be pinned is (a) the alias default
+// still reproduces the pre-blocker-B geometry EXACTLY -- the "zero effect when neutral" contract -- and
+// (b) the derived widths track GDN's own axes rather than D_KV/D_MODEL once they diverge.
+TEST_CASE("Gated DeltaNet head axes alias the attention axes at their neutral setting", "[layout][gdn]") {
+    // (a) The alias identity, for THIS build. GDN_KEY_HEADS.. are emitted RESOLVED by the configurator,
+    // so "neutral" is spelled as "the resolved value equals the attention axis it used to alias".
+    if constexpr (GDN_KEY_HEADS == N_KV_HEADS && GDN_VALUE_HEADS == N_HEADS &&
+                  GDN_KEY_HEAD_DIM == D_HEAD && GDN_VALUE_HEAD_DIM == D_HEAD) {
+        STATIC_REQUIRE(sub0::GDN_KEY_DIM   == sub0::D_KV);
+        STATIC_REQUIRE(sub0::GDN_VALUE_DIM == N_HEADS * D_HEAD);
+        // The exact expression layout.hpp carried before this axis existed.
+        STATIC_REQUIRE(sub0::GDN_CONV_DIM == 2 * sub0::D_KV + N_HEADS * D_HEAD);
+    }
+    // (b) GDN_DIMS is the single source of truth the math core consumes; the derived widths must agree
+    // with gdn::Dims' own accessors, so a future edit cannot move one without the other.
+    STATIC_REQUIRE(sub0::GDN_DIMS.key_dim()   == sub0::GDN_KEY_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.value_dim() == sub0::GDN_VALUE_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.conv_dim()  == sub0::GDN_CONV_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.num_k_heads == sub0::GDN_K_HEADS);
+    STATIC_REQUIRE(sub0::GDN_DIMS.num_v_heads == sub0::GDN_V_HEADS);
+    STATIC_REQUIRE(sub0::GDN_DIMS.head_k_dim  == sub0::GDN_K_HEAD_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.head_v_dim  == sub0::GDN_V_HEAD_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.rep() == sub0::GDN_V_HEADS / sub0::GDN_K_HEADS);
+
+    // (c) The nine GDN tensors in PARAM_LAYOUT must be shaped from GDN's OWN axes -- checked against the
+    // real model's ratios via a standalone gdn::Dims rather than this build's (which is GDN-off by
+    // default), so the claim is about the geometry, not about whatever shape this binary compiled.
+    constexpr sub0::gdn::Dims real{2560, 16, 48, 128, 128, 4};
+    STATIC_REQUIRE(real.key_dim()   == 2048);
+    STATIC_REQUIRE(real.value_dim() == 6144);
+    STATIC_REQUIRE(real.conv_dim()  == 2 * 2048 + 6144);
+    STATIC_REQUIRE(real.rep() == 3);   // the reference's repeat_interleave factor, 48 / 16
+}
+
 // ARCH_FINGERPRINT2 must reproduce 0 at the only value GDN_FULL_ATTN_STRIDE can currently take, and
 // must differ once a nonzero stride is EVER passed to the free function -- the exact same "neutral is
 // bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
@@ -360,7 +396,9 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     } else {
         REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK,
                                                                     QSA_INDEXER_BUDGET,
-                                                                    QSA_INDEXER_COMPRESS_RATIO));
+                                                                    QSA_INDEXER_COMPRESS_RATIO,
+                                                                    sub0::USE_GATED_DELTANET
+                                                                        ? sub0::GDN_K_HEADS : 0));
         REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
     }
 
@@ -401,9 +439,23 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).experts_per_tok == 10);
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0xffff, 0xff)).qsa_indexer_budget == 0xffff);
 
-    // The reserved high 24 bits stay zero regardless of any field's value -- headroom for the NEXT
+    // GDN's own KEY HEAD COUNT (WP4b blocker B) occupies byte 5, [47:40]. It is the one of GDN's four
+    // new head axes that PARAM_FLOATS cannot see: every GDN tensor shape depends on it only through
+    // key_dim = k_heads * k_head_dim, so 2x64 and 4x32 are byte-identical blobs computing a different
+    // recurrence (rep() = v_heads / k_heads). Independent of every other field, and zero-by-default so
+    // the neutral word is bit-identical to every value this function has ever produced.
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(0, 0, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(0, 0, 0, 0, 2));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(16, 0, 0, 0, 0));  // vs byte 0
+    REQUIRE(sub0::arch_fingerprint2(4, 10, 2048, 4, 16) != sub0::arch_fingerprint2(4, 10, 2048, 4, 0));
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16)).gdn_key_heads == 16);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16)).qsa_indexer_budget == 2048);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0xff)).gdn_key_heads == 0xff);
+
+    // The reserved high 16 bits stay zero regardless of any field's value -- headroom for the NEXT
     // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff) >> 40) == 0);
+    // (Was 24 bits before GDN's key-head count claimed byte 5.)
+    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff, 0xff) >> 48) == 0);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
     // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles
