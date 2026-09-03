@@ -196,9 +196,11 @@ TEST_CASE("QSA block selection keeps the highest-scoring blocks AND always keeps
     const std::vector<float> k_ln(4, 0.f);      // (1 + 0) == identity gain
     std::vector<float> cos(static_cast<std::size_t>(kv) * 4, 1.f), sin(static_cast<std::size_t>(kv) * 4, 0.f);
     std::vector<float> mask(kv), scr(sub0::qsa::select_scratch_floats(d, kv));
+    std::vector<float> blk(sub0::qsa::block_key_cache_floats(d, kv));
+    int n_cached = 0;
 
     sub0::qsa::indexer_select_row(d, q.data(), raw_keys.data(), kv, k_ln.data(), cos.data(), sin.data(),
-                                   sub0::qsa::RMS_EPS, mask.data(), scr.data());
+                                   sub0::qsa::RMS_EPS, blk.data(), &n_cached, mask.data(), scr.data());
     for (int t = 0; t < 3; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 0.f);   // block 0 dropped
     for (int t = 3; t < 6; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 1.f);   // block 1 selected
     for (int t = 6; t < 8; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 1.f);   // tail ALWAYS visible
@@ -206,16 +208,21 @@ TEST_CASE("QSA block selection keeps the highest-scoring blocks AND always keeps
     // Flip the query and the selected block must flip with it -- proving the selection tracks the score
     // rather than a fixed position (e.g. "always keep the most recent block").
     for (int h = 0; h < d.idx_n_heads; ++h) q[static_cast<std::size_t>(h) * 4 + 0] = -1.f;
+    // Deliberately REUSES the warm cache (n_cached == 2 by now): the block keys do not depend on the
+    // query, so a flipped query must re-score the very same cached keys -- and the selection must still
+    // flip. A cache that wrongly folded the query in would fail this.
+    REQUIRE(n_cached == 2);
     sub0::qsa::indexer_select_row(d, q.data(), raw_keys.data(), kv, k_ln.data(), cos.data(), sin.data(),
-                                   sub0::qsa::RMS_EPS, mask.data(), scr.data());
+                                   sub0::qsa::RMS_EPS, blk.data(), &n_cached, mask.data(), scr.data());
     for (int t = 0; t < 3; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 1.f);
     for (int t = 3; t < 6; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 0.f);
     for (int t = 6; t < 8; ++t) REQUIRE(mask[static_cast<std::size_t>(t)] == 1.f);
 
     // Fewer complete blocks than block_topk => every block visible (min(block_topk, nb), docs/QSA.md S1a).
     std::vector<float> mask2(3);
+    int n_cached2 = 0;                          // a fresh run => a fresh, empty cache
     sub0::qsa::indexer_select_row(d, q.data(), raw_keys.data(), 3, k_ln.data(), cos.data(), sin.data(),
-                                   sub0::qsa::RMS_EPS, mask2.data(), scr.data());
+                                   sub0::qsa::RMS_EPS, blk.data(), &n_cached2, mask2.data(), scr.data());
     for (int t = 0; t < 3; ++t) REQUIRE(mask2[static_cast<std::size_t>(t)] == 1.f);
 }
 
@@ -264,6 +271,12 @@ TEST_CASE("QSA's batched prefill and its incremental row composition agree bitwi
     std::vector<float> g(q.size()), mask(T);
     std::vector<float> ss(sub0::qsa::select_scratch_floats(d, T)), as(sub0::qsa::attn_scratch_floats(d, T));
     std::vector<float> out_dec(out_batch.size());
+    // The decode path's PERSISTENT pooled-block-key cache: one buffer + one count that live across all
+    // T calls, exactly as backend_cpu.cpp's QsaCache slot does for a generation. At ratio 4 and T 20
+    // five blocks complete during this run, so the cache is genuinely grown and re-read here (docs/QSA.md
+    // S11) -- the batched path must still agree with it BITWISE.
+    std::vector<float> blk(sub0::qsa::block_key_cache_floats(d, T));
+    int n_cached = 0;
     int total_dropped = 0;
     for (int p = 0; p < T; ++p) {
         const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
@@ -277,12 +290,112 @@ TEST_CASE("QSA's batched prefill and its incremental row composition agree bitwi
                                      vc.data() + static_cast<std::size_t>(p) * d.kv_width());
         const int visible = sub0::qsa::indexer_select_row(d, iq.data(), rk.data(), p + 1, kln.data(),
                                                            cos.data(), sin.data(), sub0::qsa::RMS_EPS,
-                                                           mask.data(), ss.data());
+                                                           blk.data(), &n_cached, mask.data(), ss.data());
         total_dropped += (p + 1) - visible;
         sub0::qsa::attn_row(d, q.data(), g.data(), kc.data(), vc.data(), p + 1, mask.data(), ow.data(),
                              out_dec.data() + static_cast<std::size_t>(p) * d.hidden_size, as.data());
     }
     // Guard the guard again: if nothing was dropped, this check would also pass for a dense mutant.
     REQUIRE(total_dropped > 0);
+    REQUIRE(n_cached == T / d.compress_ratio);      // 5 blocks completed and were cached, not 1
     for (std::size_t i = 0; i < out_dec.size(); ++i) REQUIRE(out_dec[i] == out_batch[i]);
+}
+
+// COMPLEXITY regression (docs/QSA.md S11). The pooled-block-key cache is invisible in the OUTPUT -- a
+// cached and an uncached implementation produce the same numbers by construction -- so output checks
+// alone cannot tell whether the O(T^2/ratio) recomputation is really gone. This pins the actual count of
+// pool_block_key() invocations, which is the thing that changed.
+TEST_CASE("QSA pools each block key exactly once per run, not once per query", "[qsa]") {
+    const sub0::qsa::Dims d{16, 2, 8, 2, 2, 1, 8, 8, 4, 8};
+    constexpr int T = 20;
+    const int ratio = d.compress_ratio;
+    auto fill = [](std::size_t n, unsigned seed) {
+        std::vector<float> v(n);
+        unsigned s = seed;
+        for (auto& x : v) { s = s * 1664525u + 1013904223u; x = static_cast<float>((s >> 8) % 2003) / 1000.f - 1.f; }
+        return v;
+    };
+    const auto hidden = fill(static_cast<std::size_t>(T) * d.hidden_size, 11);
+    const auto qk = fill(static_cast<std::size_t>(d.hidden_size) * d.idx_qk_out(), 12);
+    const auto qln = fill(static_cast<std::size_t>(d.idx_head_dim), 13);
+    const auto kln = fill(static_cast<std::size_t>(d.idx_head_dim), 14);
+    const auto qw = fill(static_cast<std::size_t>(d.hidden_size) * d.q_width(), 15);
+    const auto gw = fill(static_cast<std::size_t>(d.hidden_size) * d.q_width(), 16);
+    const auto kw = fill(static_cast<std::size_t>(d.hidden_size) * d.kv_width(), 17);
+    const auto vw = fill(static_cast<std::size_t>(d.hidden_size) * d.kv_width(), 18);
+    const auto qn = fill(static_cast<std::size_t>(d.head_dim), 19);
+    const auto kn = fill(static_cast<std::size_t>(d.head_dim), 20);
+    const auto ow = fill(static_cast<std::size_t>(d.q_width()) * d.hidden_size, 21);
+    std::vector<float> cos(static_cast<std::size_t>(T) * d.rotary_dim, 1.f), sin(cos.size(), 0.f);
+
+    // What the pre-cache implementation cost: every query row re-pooled every block it could see.
+    unsigned long long naive = 0;
+    for (int t = 0; t < T; ++t) naive += static_cast<unsigned long long>((t + 1) / ratio);
+
+    std::vector<float> out(static_cast<std::size_t>(T) * d.hidden_size);
+    std::vector<float> scr(sub0::qsa::scratch_floats(d, T));
+    sub0::qsa::stats::pool_block_key_calls = 0;
+    sub0::qsa::forward(d, T, hidden.data(), qk.data(), qln.data(), kln.data(), qw.data(), gw.data(),
+                       kw.data(), vw.data(), qn.data(), kn.data(), ow.data(), cos.data(), sin.data(),
+                       sub0::qsa::RMS_EPS, out.data(), scr.data());
+    const unsigned long long batched = sub0::qsa::stats::pool_block_key_calls;
+
+    // Exactly one pooling per block that completes over the whole prefill -- T/ratio, NOT sum_t (t+1)/ratio.
+    REQUIRE(batched == static_cast<unsigned long long>(T / ratio));
+    REQUIRE(batched < naive);
+    WARN("QSA pool_block_key(): " << batched << " calls (was " << naive << " before the cache) at T=" << T
+         << ", compress_ratio=" << ratio);
+
+    // The decode path must be the SAME count, not merely the same output: it walks the identical
+    // primitive with a cache that persists across its T single-row calls.
+    std::vector<float> kc(static_cast<std::size_t>(T) * d.kv_width()), vc(kc.size());
+    std::vector<float> rk(static_cast<std::size_t>(T) * d.idx_head_dim);
+    std::vector<float> iq(static_cast<std::size_t>(d.idx_q_width())), q(static_cast<std::size_t>(d.q_width()));
+    std::vector<float> g(q.size()), mask(T), out_dec(out.size());
+    std::vector<float> ss(sub0::qsa::select_scratch_floats(d, T)), as(sub0::qsa::attn_scratch_floats(d, T));
+    std::vector<float> blk(sub0::qsa::block_key_cache_floats(d, T));
+    int n_cached = 0;
+    sub0::qsa::stats::pool_block_key_calls = 0;
+    for (int p = 0; p < T; ++p) {
+        const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
+        sub0::qsa::indexer_project_row(d, x, qk.data(), qln.data(), cos.data(), sin.data(),
+                                        sub0::qsa::RMS_EPS, iq.data(),
+                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim);
+        sub0::qsa::attn_project_row(d, x, qw.data(), gw.data(), kw.data(), vw.data(), qn.data(), kn.data(),
+                                     cos.data(), sin.data(), sub0::qsa::RMS_EPS, q.data(), g.data(),
+                                     kc.data() + static_cast<std::size_t>(p) * d.kv_width(),
+                                     vc.data() + static_cast<std::size_t>(p) * d.kv_width());
+        sub0::qsa::indexer_select_row(d, iq.data(), rk.data(), p + 1, kln.data(), cos.data(), sin.data(),
+                                       sub0::qsa::RMS_EPS, blk.data(), &n_cached, mask.data(), ss.data());
+        sub0::qsa::attn_row(d, q.data(), g.data(), kc.data(), vc.data(), p + 1, mask.data(), ow.data(),
+                             out_dec.data() + static_cast<std::size_t>(p) * d.hidden_size, as.data());
+    }
+    REQUIRE(sub0::qsa::stats::pool_block_key_calls == batched);
+
+    // And the cache must not have CHANGED the numbers: recompute every row with a cold cache (exactly
+    // the pre-cache behaviour -- every block re-pooled for every query) and demand a bitwise match.
+    std::vector<float> out_cold(out.size());
+    int cold_dropped = 0;
+    sub0::qsa::stats::pool_block_key_calls = 0;
+    for (int p = 0; p < T; ++p) {
+        const float* x = hidden.data() + static_cast<std::size_t>(p) * d.hidden_size;
+        sub0::qsa::indexer_project_row(d, x, qk.data(), qln.data(), cos.data(), sin.data(),
+                                        sub0::qsa::RMS_EPS, iq.data(),
+                                        rk.data() + static_cast<std::size_t>(p) * d.idx_head_dim);
+        sub0::qsa::attn_project_row(d, x, qw.data(), gw.data(), kw.data(), vw.data(), qn.data(), kn.data(),
+                                     cos.data(), sin.data(), sub0::qsa::RMS_EPS, q.data(), g.data(),
+                                     kc.data() + static_cast<std::size_t>(p) * d.kv_width(),
+                                     vc.data() + static_cast<std::size_t>(p) * d.kv_width());
+        int cold = 0;                                  // reset per row => full recomputation
+        const int visible = sub0::qsa::indexer_select_row(d, iq.data(), rk.data(), p + 1, kln.data(),
+                                                           cos.data(), sin.data(), sub0::qsa::RMS_EPS,
+                                                           blk.data(), &cold, mask.data(), ss.data());
+        cold_dropped += (p + 1) - visible;
+        sub0::qsa::attn_row(d, q.data(), g.data(), kc.data(), vc.data(), p + 1, mask.data(), ow.data(),
+                             out_cold.data() + static_cast<std::size_t>(p) * d.hidden_size, as.data());
+    }
+    REQUIRE(cold_dropped > 0);                        // not vacuous: blocks really are being dropped
+    // The cold form pays exactly the pre-cache cost -- which is what `naive` above predicts.
+    REQUIRE(sub0::qsa::stats::pool_block_key_calls == naive);
+    for (std::size_t i = 0; i < out_cold.size(); ++i) REQUIRE(out_cold[i] == out[i]);
 }

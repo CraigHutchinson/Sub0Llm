@@ -163,17 +163,33 @@ TEST_CASE("forward_one (KV-cache) matches the full forward per position", "[engi
         sub0::Node* full = sub0::forward(ids.data(), L);
         const std::vector<float> ref(full->data.begin(), full->data.begin() + static_cast<size_t>(L) * VOCAB);
 
-        sub0::kv_reset();
+        // TWO passes, each after its own kv_reset(). Pass 0 decodes a DIFFERENT sequence and is not
+        // compared -- it exists purely to leave every decode-persistent cache full of the WRONG
+        // generation's state, so that pass 1 (the real comparison) fails unless kv_reset() genuinely
+        // clears them rather than merely resizing them. The decoy sequence is the load-bearing part: a
+        // second pass over the SAME ids re-derives identical cache contents and would pass even against
+        // a cache that was never reset (verified by mutation, not assumed -- a QsaCache::reset() that
+        // resized n_cached instead of zeroing it passes the same-ids form and fails this one). That is a
+        // live hazard for QSA's pooled block-key cache in particular (docs/QSA.md S11).
+        // Deliberately folded into the existing `worst` rather than added as a second REQUIRE, so the
+        // default build's assertion count is untouched (AGENTS.md S4).
+        std::vector<int> decoy(L);
+        for (int& x : decoy) x = static_cast<int>(rng() % VOCAB);
         double worst = 0.0;
-        for (int pos = 0; pos < L; ++pos) {
-            const float* one = sub0::forward_one(ids[pos], pos);
-            const float* rr  = ref.data() + static_cast<size_t>(pos) * VOCAB;
-            double maxabs = 0.0, maxmag = 1e-30;
-            for (int j = 0; j < VOCAB; ++j) {
-                maxabs = std::max(maxabs, std::fabs(static_cast<double>(one[j]) - rr[j]));
-                maxmag = std::max(maxmag, std::fabs(static_cast<double>(rr[j])));
+        for (int pass = 0; pass < 2; ++pass) {
+            sub0::kv_reset();
+            const std::vector<int>& seq = (pass == 0) ? decoy : ids;
+            for (int pos = 0; pos < L; ++pos) {
+                const float* one = sub0::forward_one(seq[pos], pos);
+                if (pass == 0) continue;                       // priming pass: run it, don't judge it
+                const float* rr  = ref.data() + static_cast<size_t>(pos) * VOCAB;
+                double maxabs = 0.0, maxmag = 1e-30;
+                for (int j = 0; j < VOCAB; ++j) {
+                    maxabs = std::max(maxabs, std::fabs(static_cast<double>(one[j]) - rr[j]));
+                    maxmag = std::max(maxmag, std::fabs(static_cast<double>(rr[j])));
+                }
+                worst = std::max(worst, maxabs / maxmag);
             }
-            worst = std::max(worst, maxabs / maxmag);
         }
         INFO("worst per-position rel diff = " << worst);
         REQUIRE(worst < 1e-3);

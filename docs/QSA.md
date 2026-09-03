@@ -758,6 +758,69 @@ its own `layer_slots()`/`build_qkv_weights()` param-layout arithmetic, which a Q
 the guard is what makes that unreachable rather than silently wrong, and lifting it must update those
 sites too.
 
+## 11. The pooled block-key cache (post-merge performance fix)
+
+Found by an independent performance review of the merged Stage 0+1 work, and fixed on
+`perf/qsa-block-key-cache`. **A pure complexity fix: no new flag, no shape change, no arithmetic change**
+-- `PARAM_LAYOUT`, `ARCH_FINGERPRINT2` and every checkpoint are completely unaffected, because the only
+thing that changed is how a scratch buffer is populated.
+
+**What was recomputed.** `indexer_select_row()` re-derived EVERY complete block's pooled +
+`k_layernorm`'d + RoPE'd key from the raw per-token keys on EVERY call. But a block's key is a function
+of the BLOCK alone -- its fixed start position `b * compress_ratio`, the `compress_ratio` raw keys stored
+there (each written exactly once, when its token was projected), the `k_layernorm` weights and the
+cos/sin tables. The querying position appears nowhere in it; the query enters only in the score
+dot-product afterwards, and the rotation is at the BLOCK's own start (S1a's `group_starts`), not the
+query's. Since `qsa::forward()`'s row loop calls it at `kv_len = t + 1`, the pooling work over a T-row
+prefill was `sum_t (t+1)/ratio ~ T^2/(2*ratio)` for an `O(T/ratio)` quantity. The decode path
+(`do_qsa_mixer`, once per generated token) had the identical shape across a whole generation.
+
+**What is cached now.** `qsa_math.hpp` gains a `pool_block_key()` primitive computing ONE block's key,
+and `indexer_select_row()` takes a caller-owned block-key cache (`block_keys` + `n_cached`) which it
+extends by only the blocks completed since the last call -- at most ONE, since `kv_len` grows a row at a
+time on both paths. Caller-owned, not a static, precisely because the two paths need different lifetimes:
+the batched path parks it in its own scratch (sized by the new `block_key_cache_floats()`, added to
+`scratch_floats()`; `select_scratch_floats()` correspondingly loses the pooled-key slot it no longer
+needs), while the decode path keeps it in `QsaCache`'s per-execution slot next to the raw keys already
+there. **Both call sites go through the SAME primitive** -- the seam that produced MoE's Stage-1 SIGSEGV
+and this stage's own RoPE bug -- and the forward-vs-forward_one parity test is what holds them together.
+
+`n_cached` is zeroed **unconditionally** in `QsaCache::reset()`, unlike `raw_k`'s assign-on-size-change:
+a surviving count would make a fresh generation trust the previous one's block keys.
+
+**The invocation-count test, and why output checks could not replace it.** A cached and an uncached
+implementation produce the SAME numbers by construction, so no output comparison can tell whether the
+`O(T^2/ratio)` recomputation is actually gone. `tests/qsa_qwen4_fixture_tests.cpp` therefore pins the
+thing that changed -- a `stats::pool_block_key_calls` counter (thread_local; one increment per key
+genuinely computed):
+
+| | pool_block_key() calls at T=20, compress_ratio=4 |
+|---|---|
+| before (recompute per query) | **45** (= `sum_t (t+1)/4`) |
+| after (cached) | **5** (= `T/ratio`) |
+
+The same test asserts the DECODE composition pays that identical count of 5, and that a deliberately
+cold-cache run (reset per row -- exactly the pre-cache behaviour) both costs the full 45 and matches the
+cached output **bitwise**, so the speedup is not being bought with a numerical change.
+
+**Cross-generation coverage.** `engine_tests.cpp`'s forward_one-vs-forward parity test now runs a priming
+decode over a DIFFERENT (decoy) sequence before the real comparison. The decoy is load-bearing and was
+chosen by mutation, not assumption: a `reset()` that resized `n_cached` instead of zeroing it PASSES a
+second pass over the same ids (identical inputs re-derive identical cache contents) and FAILS the decoy
+form -- measured at 0.164501 worst per-position relative diff against the `1e-3` gate. Folded into the
+existing `worst` accumulator, so the neutral build's assertion count is untouched.
+
+**Verification.** `[qsa]`: 5 test cases / 676 assertions green (was 4 / 349); the real-weight fixture
+still matches at `max|out - expected| = 1.39698e-09`, byte-identical to what pre-change `main` produces
+in the same build directory (the 1.86265e-09 in S10 was recorded under different build flags -- it was
+re-measured on `main` here rather than cited). Neutral d196 L11 H7 seq256 build: forward
+`cc328cff8ce732b3`, grad `7c892472dee9c262`, decode `63fe6a47d3e4f704`, 28,504,807 assertions / 145 test
+cases -- IDENTICAL before and after, both measured on this machine in the same build directory (that
+directory's vocab is 1270, not S10's 26260, which is why S10's own hashes are not the comparison point).
+QSA-ON build `d16 L2 H2 kv2 seq64`, indexer 2 heads / 1 kv / head_dim 8, `budget=8 ratio=4` (=> 16 blocks
+can complete, `block_topk = 2`): `[layout]` 29,119 assertions / 16 cases and `[qsa]` green, and the
+forward_one-vs-forward parity test green with the mechanism actually active.
+
 **Divergence from the task brief, recorded explicitly**: the brief asked for "a QSA layer-schedule knob
 analogous to `GDN_SCHEDULE`" as a new `RunConfig` constant. §2 concluded against a new *knob* and
 delivered the *derived* three-way `MIXER_SCHEDULE` instead, because the real `config.json`'s `layer_types`
