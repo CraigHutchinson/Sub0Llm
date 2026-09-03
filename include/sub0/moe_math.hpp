@@ -110,11 +110,19 @@ inline void expert_ffn_row(const Dims& d, const float* x, const float* gate_w, c
 // `out_weight`/`out_idx`: caller buffers of length >= experts_per_tok (TOPK_MAX-capped internally).
 inline void router_topk_row(const Dims& d, const float* x, const float* router_w, float* probs_scratch,
                              float* out_weight, int* out_idx, bool norm_topk_prob) {
-    for (int e = 0; e < d.num_experts; ++e) {
-        float s = 0.f;
-        for (int i = 0; i < d.hidden_size; ++i)
-            s += x[i] * router_w[static_cast<std::size_t>(i) * d.num_experts + e];
-        probs_scratch[e] = s;
+    // INPUT-major/contiguous (this project's own linear_row convention, matching router_w's own
+    // [hidden_size, num_experts] row-major layout): outer over the contraction dim (hidden_size), inner
+    // CONTIGUOUS over num_experts -- found by VTune (router_topk_row was 17.1% of CPU time in a
+    // realistic GR+MoE+QSA hotspot profile, second only to expert_ffn_row) after the original
+    // output-major form (outer e, inner i striding router_w by num_experts floats per step) survived
+    // the earlier code-reading-only perf review that fixed gr::mix()/expert_ffn_row() but never looked
+    // at this function. Pure summation reorder, same tolerance argument as that fix.
+    for (int e = 0; e < d.num_experts; ++e) probs_scratch[e] = 0.f;
+    for (int i = 0; i < d.hidden_size; ++i) {
+        const float xi = x[i];
+        if (xi == 0.f) continue;
+        const float* wr = router_w + static_cast<std::size_t>(i) * d.num_experts;
+        for (int e = 0; e < d.num_experts; ++e) probs_scratch[e] += xi * wr[e];
     }
     float mx = probs_scratch[0];
     for (int e = 1; e < d.num_experts; ++e) mx = std::max(mx, probs_scratch[e]);
