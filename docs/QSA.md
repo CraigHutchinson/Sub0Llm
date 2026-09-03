@@ -717,6 +717,15 @@ and +349 assertions, nothing else).
 |---|---|---|---|---|---|
 | d96 L8 H2 seq128 vocab26260 (even) | 18,118,452 → 18,119,453 | 142 → 145 | `d782c2f22a8f8470` | `b9e6ef80b96c7987` | `da8778997d09402e` |
 | d132 L11 H4 kv2 seq96 vocab26260 (odd/ragged) | 29,667,408 → 29,668,745 | 142 → 145 | `44fcf318125286ff` | `b0299e22d5ea4df7` | `e136194ed6db704d` |
+| d196 L11 H7 seq256 vocab26260 (production-shaped, `d196check`) | 53,918,298 → 53,919,635 | 142 → 145 | `acfb10b7d0fa03ad` | `5f16f677739cecc9` | `470870e4c0867de5` |
+
+Every "before" column above is a REAL measurement, not an assumed number: pre-QSA `main` (`b3ae26d`) was
+checked out and rebuilt at each shape in the same build directory with the same compiler and flags, then
+re-run, so the comparison is genuinely before/after on this machine. (The plan document's own recorded
+production baseline — 53,917,287 / 137 cases — predates the Gated Residual and MoE test cases that have
+landed since, which is exactly why it was re-derived rather than cited.) The d196 and d132 deltas are
+identical (+1337) because both have `N_LAYERS == 11` and therefore the same `NUM_PARAMS` (123), which is
+what the new per-`PARAM_LAYOUT`-entry loop scales with.
 
 All three hashes are UNCHANGED at both shapes. The assertion deltas (+1001 and +1337) are fully accounted
 for by the three new `[layout][qsa]` test cases and nothing else: both add the same fixed set, plus a
