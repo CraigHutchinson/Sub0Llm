@@ -113,11 +113,22 @@ inline void rms_norm_row(const float* x, const float* w, int n, float eps, float
     for (int i = 0; i < n; ++i) out[i] = x[i] * inv * (1.f + w[i]);
 }
 
-// apply_rotary_pos_emb for ONE head vector of width `head_dim`, rotating only its first `rotary_dim`
-// channels (half-split within that prefix); channels [rotary_dim, head_dim) pass through untouched.
-// cos/sin are this position's own `rotary_dim`-wide rows. In place.
-inline void rope_apply_row(float* x, const float* cos, const float* sin, int rotary_dim) {
-    const int half = rotary_dim / 2;
+// apply_rotary_pos_emb for ONE vector of width `width`, rotating only its first `rotary_dim` channels
+// (half-split within that prefix); channels [rotary_dim, width) pass through untouched. cos/sin are this
+// position's own `rotary_dim`-wide rows. In place.
+//
+// PRECONDITION: `rotary_dim <= width`. The reference relies on this too -- `q[..., :rotary_dim] * cos`
+// broadcasts a `rotary_dim`-wide cos against the slice, which only works when the vector is at least
+// that wide -- and it holds in the real model for BOTH consumers (rotary_dim = 64 from
+// partial_rotary_factor 0.25 x head_dim 256; the attention heads are 256 wide and the indexer heads
+// 128, both >= 64). It is NOT automatic in this project, where the engine passes rotary_dim = D_HEAD
+// and the indexer's own width is the independent QSA_INDEXER_HEAD_DIM -- so layout.hpp static_asserts
+// it, and this function ALSO clamps defensively. Getting this wrong is a silent OUT-OF-BOUNDS WRITE
+// past the end of a per-head slice, not a wrong number: it was found exactly that way this stage, as a
+// batched-vs-incremental mismatch that only appeared once the scratch layout put another live buffer
+// immediately after the indexer's query.
+inline void rope_apply_row(float* x, const float* cos, const float* sin, int rotary_dim, int width) {
+    const int half = std::min(rotary_dim, width) / 2;
     for (int i = 0; i < half; ++i) {
         const float a = x[i], b = x[i + half];
         // q_rope = q_rope*cos + rotate_half(q_rope)*sin, rotate_half = (-x2, x1)
@@ -164,7 +175,7 @@ inline void indexer_project_row(const Dims& d, const float* x, const float* qk_p
     for (int h = 0; h < d.idx_n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.idx_head_dim;
         rms_norm_row(qh, q_ln_w, d.idx_head_dim, eps, qh);
-        rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim);
+        rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim, d.idx_head_dim);
     }
 }
 
@@ -206,7 +217,7 @@ inline int indexer_select_row(const Dims& d, const float* q, const float* raw_ke
         rms_norm_row(pooled, k_ln_w, d.idx_head_dim, eps, pooled);
         // Rotated at the BLOCK's own first token position (`group_starts`), not at the query's.
         rope_apply_row(pooled, cos + static_cast<std::size_t>(start) * d.rotary_dim,
-                        sin + static_cast<std::size_t>(start) * d.rotary_dim, d.rotary_dim);
+                        sin + static_cast<std::size_t>(start) * d.rotary_dim, d.rotary_dim, d.idx_head_dim);
         float s = 0.f;
         for (int h = 0; h < d.idx_n_heads; ++h) {
             const float* qh = q + static_cast<std::size_t>(h) * d.idx_head_dim;
@@ -252,12 +263,12 @@ inline void attn_project_row(const Dims& d, const float* x, const float* q_w, co
     for (int h = 0; h < d.n_heads; ++h) {
         float* qh = out_q + static_cast<std::size_t>(h) * d.head_dim;
         rms_norm_row(qh, q_norm_w, d.head_dim, eps, qh);
-        rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim);
+        rope_apply_row(qh, cos_pos, sin_pos, d.rotary_dim, d.head_dim);
     }
     for (int h = 0; h < d.n_kv_heads; ++h) {
         float* kh = out_k + static_cast<std::size_t>(h) * d.head_dim;
         rms_norm_row(kh, k_norm_w, d.head_dim, eps, kh);
-        rope_apply_row(kh, cos_pos, sin_pos, d.rotary_dim);
+        rope_apply_row(kh, cos_pos, sin_pos, d.rotary_dim, d.head_dim);
     }
 }
 

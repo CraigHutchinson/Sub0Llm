@@ -717,25 +717,25 @@ int main(int argc, char** argv) {
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
     app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
-                   "QSA (docs/QSA.md): lightning-indexer query head count (0 = off, else >= 1). Stage 0: "
-                   "hard-clamped to 0 -- no CPU forward op exists yet")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "QSA (docs/QSA.md): lightning-indexer query head count (0 = off, else >= 1). Stage 1: "
+                   "CPU forward only -- gen/eval/report work, train/tune do not (no backward pass yet, "
+                   "and no CUDA build)")
+       ->capture_default_str()->check(CLI::Range(0, 64));
     app.add_option("--qsa-indexer-kv-heads", qsa_idx_kv_heads,
                    "QSA: lightning-indexer key head count (0 = off, else exactly 1 -- the reference's own "
-                   "squeeze requires it). Stage 0: hard-clamped to 0")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "squeeze requires it)")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--qsa-indexer-head-dim", qsa_idx_head_dim,
-                   "QSA: lightning-indexer per-head width (0 = off, else even and >= 2). Stage 0: "
-                   "hard-clamped to 0")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "QSA: lightning-indexer per-head width (0 = off, else even and >= 2)")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--qsa-indexer-budget", qsa_idx_budget,
                    "QSA: per-query token budget; block_topk = budget / compress-ratio (0 = off, else >= "
-                   "compress-ratio). Stage 0: hard-clamped to 0")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "compress-ratio). Capped at 65535 -- it rides 16 bits of ARCH_FINGERPRINT2")
+       ->capture_default_str()->check(CLI::Range(0, 65535));
     app.add_option("--qsa-indexer-compress-ratio", qsa_idx_ratio,
                    "QSA: how many consecutive keys are mean-pooled into one selectable block (0 = off, "
-                   "else >= 1). Stage 0: hard-clamped to 0")
-       ->capture_default_str()->check(CLI::Range(0, 0));
+                   "else >= 1). Capped at 255 -- it rides 8 bits of ARCH_FINGERPRINT2")
+       ->capture_default_str()->check(CLI::Range(0, 255));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},

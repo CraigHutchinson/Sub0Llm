@@ -24,6 +24,7 @@
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet Stage 1 forward math (sub0::gdn::forward/recurrence_step)
 #include "sub0/gated_residual_math.hpp"  // Gated Residual Stage 1 forward math (sub0::gr::hc_norm/mix/gate/combine/tile)
 #include "sub0/moe_math.hpp"         // Mixture of Experts Stage 1 forward math (sub0::moe::forward_row/forward)
+#include "sub0/qsa_math.hpp"         // QSA Stage 1 forward math (sub0::qsa::forward/indexer_*/attn_*)
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
 #include "sub0/scratch_slots.hpp"   // content-derived scratch-slot embeddings (range + ScratchBindings + encoders)
@@ -132,7 +133,13 @@ consteval size_t calc_act_cap() {
                 // at runtime, but this stays a simple, safe upper bound rather than tracking that). The
                 // op's own [T,D_MODEL] output node plus moe_math.hpp's own scratch_floats() (NOT scaled
                 // by T -- see that file's own header comment on row-independence). Zero when MoE is off.
-                + (USE_MOE ? (size_t)T * C + moe::scratch_floats(MOE_DIMS) : 0);
+                + (USE_MOE ? (size_t)T * C + moe::scratch_floats(MOE_DIMS) : 0)
+                // op_qsa (Stage 1): same over-provisioning idiom as op_gdn's own term above -- every
+                // execution is budgeted as if it could be QSA, ON TOP of the softmax-attention terms
+                // already in `per` rather than replacing them (QSA genuinely does replace them at
+                // runtime, but this stays a simple, safe upper bound). The op's own [T,D_MODEL] output
+                // node plus qsa_math.hpp's own scratch_floats(). Zero when QSA is off.
+                + (USE_QSA ? (size_t)T * C + qsa::scratch_floats(QSA_DIMS_BUF, T) : 0);
     size_t fin  = T * C + 2 * T * V + 64;
     // LOOP_EXEC_COUNT, not N_LAYERS: a LoopSplit middle block re-executed R times allocates its
     // activation nodes R times (the weights are shared; the activations are not).
@@ -161,7 +168,10 @@ constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_
                                 + (NGRAM_EMBED ? 3 * (size_t)NGRAM_NUM_EMBEDDERS : 0)
                                 // op_moe adds exactly one node per EXECUTION (its single output node),
                                 // same over-provisioning reasoning as GDN's own term above.
-                                + (USE_MOE ? (size_t)LOOP_EXEC_COUNT : 0);
+                                + (USE_MOE ? (size_t)LOOP_EXEC_COUNT : 0)
+                                // op_qsa adds exactly one node per EXECUTION (its single output node),
+                                // same over-provisioning reasoning as GDN's/MoE's own terms above.
+                                + (USE_QSA ? (size_t)LOOP_EXEC_COUNT : 0);
 
 // ============================================================================
 //  Static storage
@@ -1238,6 +1248,19 @@ static void backward_node(Node& n) {
                               "architecture than the one requested.");
         std::abort();
     }
+    case Op::Qsa: {
+        // Stage 1's own, deliberate scope boundary (docs/QSA.md S6): no backward exists for this op yet
+        // -- the exact same "guard at the lowest callable seam" refusal Op::GDN's Stage 1 placeholder
+        // established and Op::GrTile/GrMix/GrGate/GrCombine/Op::Moe still use. docs/QSA.md S6 also names
+        // the three real subtleties a future Stage 2 must not get wrong (no softmax couples the
+        // unselected blocks -- the OPPOSITE of MoE's router; gradient does not flow through a mask, so a
+        // naive implementation would train index_qk_proj not at all; and a block key's gradient must be
+        // split 1/compress_ratio across the tokens pooled into it).
+        std::println(stderr, "fatal: Qwen Sparse Attention has no backward pass yet (Stage 1 is CPU "
+                              "forward only, see docs/QSA.md) -- refusing to silently train a different "
+                              "architecture than the one requested.");
+        std::abort();
+    }
     }
 }
 
@@ -1289,6 +1312,54 @@ struct GdnCache {
     float* conv_of(int e)  { return conv_hist.data() + static_cast<size_t>(e) * gdn::conv_hist_floats(GDN_DIMS); }
 };
 thread_local GdnCache g_gdn_cache;   // only ever populated/consulted when USE_GATED_DELTANET
+
+// QSA's decode-persistent indexer key cache (Stage 1; docs/QSA.md S6's own note that this is QSA's ONLY
+// cross-call state). Structurally a KVCache, not a GdnCache: it IS a per-position row store that grows
+// with position (the indexer must be able to pool a block out of ANY earlier token's raw key), and it is
+// per-EXECUTION for the identical LoopSplit reason KVCache is. Rows are the RAW, unnormed, unrotated
+// indexer keys -- k_layernorm and RoPE happen later, on the POOLED block key, at the block's own start
+// position (docs/QSA.md S1a). reset() follows KVCache's own assign-on-size-change rule, safe for the same
+// reason: every row ever READ was WRITTEN earlier in the SAME generation.
+struct QsaCache {
+    std::vector<float> raw_k;   // [LOOP_EXEC_COUNT][SEQ_LEN][QSA_IDX_HEAD_DIM_BUF], flat
+    void reset() {
+        const size_t n = static_cast<size_t>(LOOP_EXEC_COUNT) * SEQ_LEN * QSA_IDX_HEAD_DIM_BUF;
+        if (raw_k.size() != n) raw_k.assign(n, 0.f);
+    }
+    float* base(int e) {
+        return raw_k.data() + static_cast<size_t>(e) * SEQ_LEN * QSA_IDX_HEAD_DIM_BUF;
+    }
+};
+thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_QSA
+
+// QSA's cos/sin tables. Built ONCE at static-init (never inside a forward -- AGENTS.md S1), because
+// qsa_math.hpp deliberately takes cos/sin as caller-supplied data rather than deriving them from
+// ROPE_THETA: the real model's convention is HALF-SPLIT over a rotary PREFIX, while this engine's own
+// op_rope is INTERLEAVED-pair and full-width (docs/QSA.md S1b/S2a). Feeding the real convention here is
+// what makes a QSA layer numerically the real model's layer, and taking the tables as data is what lets
+// the fixture test feed the real model's own PARTIAL-rotary cos/sin unchanged.
+// Layout matches HF's own `emb = cat(freqs, freqs)`: cos[pos][m] == cos[pos][m + rotary_dim/2].
+// rotary_dim is D_HEAD here (full-width) -- docs/QSA.md S2b.2's documented engine-side simplification.
+struct QsaRopeTables {
+    std::vector<float> cos, sin;   // [SEQ_LEN][D_HEAD]
+    QsaRopeTables() {
+        const size_t n = static_cast<size_t>(SEQ_LEN) * D_HEAD;
+        cos.assign(n, 1.f); sin.assign(n, 0.f);
+        if constexpr (USE_QSA) {
+            const int rd = D_HEAD, half = rd / 2;
+            for (int p = 0; p < SEQ_LEN; ++p) {
+                for (int m = 0; m < half; ++m) {
+                    const float ang = static_cast<float>(p) * ROPE_POS_SCALE *
+                                      std::pow(ROPE_THETA, -2.f * static_cast<float>(m) / static_cast<float>(rd));
+                    const size_t base = static_cast<size_t>(p) * rd;
+                    cos[base + m] = cos[base + m + half] = std::cos(ang);
+                    sin[base + m] = sin[base + m + half] = std::sin(ang);
+                }
+            }
+        }
+    }
+};
+static const QsaRopeTables g_qsa_rope;
 
 // y[out] = x[in] . W[in,out]  (+ bias); dense, same order as op_linear's non-ternary path.
 static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
@@ -1417,6 +1488,12 @@ struct Layer {
     std::array<Node*, NUM_EXPERTS_BUF> moe_gate{}, moe_up{}, moe_down{};
     Node *moe_shared_gate = nullptr, *moe_shared_up = nullptr, *moe_shared_down = nullptr,
          *moe_shared_gate_proj = nullptr;
+    // QSA (Stage 1, docs/QSA.md S3b/S4): present only on a layer MIXER_SCHEDULE marks Qsa (nullptr on
+    // every layer when !USE_QSA). REPLACES Wq/Wk/Wv/Wo (+q_norm/k_norm) for that layer, exactly as the
+    // gdn_* set does -- qsa_q/qsa_gate are the two halves of the real model's one DOUBLE-WIDTH q_proj.
+    Node *qsa_q = nullptr, *qsa_gate = nullptr, *qsa_k = nullptr, *qsa_v = nullptr, *qsa_o = nullptr,
+         *qsa_qnorm = nullptr, *qsa_knorm = nullptr,
+         *qsa_idx_qk = nullptr, *qsa_idx_qnorm = nullptr, *qsa_idx_knorm = nullptr;
 };
 
 // --- Gated DeltaNet (Stage 1: CPU forward only; docs/GATED_DELTANET.md, include/sub0/gdn_math.hpp) ---
@@ -1544,6 +1621,31 @@ static Node* op_moe(Node* x, Layer& L) {
     return out;
 }
 
+// --- Qwen Sparse Attention (Stage 1: CPU forward only; docs/QSA.md, include/sub0/qsa_math.hpp) ---
+//
+// ONE op is the WHOLE mixer sublayer for a QSA layer -- the lightning indexer, the q/gate/k/v
+// projections, the per-head (1+w) RMSNorms, the half-split partial RoPE, the per-query MASKED softmax
+// attention, the sigmoid output gate and o_proj -- taking `Layer&` directly and reading its ten tensors
+// off it, the exact `op_gdn(Node* a, Layer& L)` / `op_moe(Node* x, Layer& L)` precedent. It deliberately
+// does NOT reuse op_attn/op_rope/op_qknorm: op_attn has no mask input at all, and QSA's norm/rotary
+// conventions genuinely differ from this engine's (docs/QSA.md S2a). `out->a = a` mirrors op_gdn's own
+// single-input-node bookkeeping -- enough for backward_node's abort-placeholder case to name the right
+// input node. No side table: Stage 1 has no backward walking the node pool yet (docs/QSA.md S6).
+static Node* op_qsa(Node* a, Layer& L) {
+    const int T = a->rows;
+    Node* out = mk_node(Op::Qsa, T, D_MODEL);
+    out->a = a;
+    auto [scratch, scratch_g] = arena_alloc(qsa::scratch_floats(QSA_DIMS_BUF, T));
+    qsa::forward(QSA_DIMS, T, a->data.data(),
+                 L.qsa_idx_qk->data.data(), L.qsa_idx_qnorm->data.data(), L.qsa_idx_knorm->data.data(),
+                 L.qsa_q->data.data(), L.qsa_gate->data.data(), L.qsa_k->data.data(),
+                 L.qsa_v->data.data(), L.qsa_qnorm->data.data(), L.qsa_knorm->data.data(),
+                 L.qsa_o->data.data(),
+                 g_qsa_rope.cos.data(), g_qsa_rope.sin.data(), qsa::RMS_EPS,
+                 out->data.data(), scratch.data());
+    return out;
+}
+
 struct Model {
     Node* tok_emb;
     Node* pos_emb;
@@ -1609,7 +1711,20 @@ struct Model {
             // serialization order (see that file's header comment), INCLUDING which of the two
             // branches below a given layer takes (GDN_SCHEDULE.full_attn[li] must agree with
             // make_param_layout()'s own read of it -- both read the same compile-time array).
-            if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
+            if (MIXER_SCHEDULE[static_cast<std::size_t>(li)] == LayerMixer::Qsa) {
+                // QSA layer (docs/QSA.md S3b/S4) -- see layout.hpp's make_param_layout() for the same
+                // shapes with the reasoning attached. Order MUST match it exactly.
+                L.qsa_q     = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_gate  = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_k     = mk_param(D_MODEL, D_KV, true);
+                L.qsa_v     = mk_param(D_MODEL, D_KV, true);
+                L.qsa_o     = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_qnorm = mk_param(1, D_HEAD, false);
+                L.qsa_knorm = mk_param(1, D_HEAD, false);
+                L.qsa_idx_qk    = mk_param(D_MODEL, QSA_IDX_QK_OUT, true);
+                L.qsa_idx_qnorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
+                L.qsa_idx_knorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
+            } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
                 L.Wq = mk_param(D_MODEL, D_MODEL, true);
                 L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
                 L.Wv = mk_param(D_MODEL, D_KV, true);
@@ -1719,7 +1834,15 @@ struct Model {
                 randn(L.gr_attn_down, 0.02f); randn(L.gr_attn_up, 0.02f); randn(L.gr_attn_inject, 0.02f);
                 randn(L.gr_mlp_down, 0.02f);  randn(L.gr_mlp_up, 0.02f);  randn(L.gr_mlp_inject, 0.02f);
             }
-            if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
+            if (MIXER_SCHEDULE[static_cast<std::size_t>(li)] == LayerMixer::Qsa) {
+                // QSA init: the projections get this project's standard 0.02-std normal (the real
+                // module's __init__ documents no scheme beyond "a Linear layer"), same reasoning GDN's/
+                // GR's/MoE's own projections use. The four RMSNorm gains are left at the arena's own
+                // ZERO -- NOT ones() -- because Qwen4ExpTextRMSNorm's gain is (1 + w), so w == 0 IS the
+                // identity norm (docs/QSA.md S1b; the same divergence GrHcNorm's own init already has).
+                randn(L.qsa_q, 0.02f);  randn(L.qsa_gate, 0.02f); randn(L.qsa_k, 0.02f);
+                randn(L.qsa_v, 0.02f);  randn(L.qsa_o, 0.02f);    randn(L.qsa_idx_qk, 0.02f);
+            } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
                 randn(L.Wq, 0.02f); randn(L.Wk, 0.02f); randn(L.Wv, 0.02f); randn(L.Wo, 0.02f);
                 if constexpr (USE_QK_NORM) { ones(L.q_norm); ones(L.k_norm); }
             } else {
@@ -1921,6 +2044,18 @@ struct Model {
                     continue;
                 }
             }
+            // QSA (docs/QSA.md S2/S2a): a full-attention layer becomes a QSA layer when the mechanism is
+            // on -- op_qsa IS the whole mixer sublayer (indexer, projections, norms, rotary, masked
+            // attention, output gate and o_proj all inside one op), so its output goes straight into the
+            // residual write the same way op_gdn's does, with no separate Wo. The `else` branch below is
+            // the pre-QSA softmax-attention path, byte-for-byte unchanged; at USE_QSA == false it is the
+            // ONLY branch compiled at all (L.Wq/Wk/Wv/Wo are never allocated on a QSA layer, so reaching
+            // the else branch there would be a null dereference -- the exact bug the MoE stage hit by
+            // wiring its own replacement into only one of the two FFN sites, docs/MOE.md S9).
+            Node* mixer_out = nullptr;
+            if constexpr (USE_QSA) {
+            mixer_out = op_qsa(a, L);
+            } else {
             Node* qn = op_linear(a, L.Wq, nullptr, q);
             Node* kn = op_linear(a, L.Wk, nullptr, q);
             Node* vn = op_linear(a, L.Wv, nullptr, q);
@@ -1946,7 +2081,9 @@ struct Model {
                 if (DEPTH_SCHEDULE.own[static_cast<std::size_t>(exec_i)] >= 0) g_depth.push(kn, vn);
             }
             Node* att = op_attn(qn, kn, vn, N_HEADS);
-            h = gr_write(h_before_attn, op_linear(att, L.Wo, nullptr, q), gr_inj_attn);
+            mixer_out = op_linear(att, L.Wo, nullptr, q);
+            }
+            h = gr_write(h_before_attn, mixer_out, gr_inj_attn);
             Node* h_before_mlp = h;
             Node* gr_inj_mlp = nullptr;
             Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2,
@@ -2020,6 +2157,16 @@ struct Model {
         // zero (see its own comment), unlike GR_MIX_SCRATCH1 above, so no ternary-guard is needed here.
         [[maybe_unused]] float moe_scratch[MOE_SCRATCH1];
         [[maybe_unused]] std::array<const float*, NUM_EXPERTS_BUF> moe_gate_w{}, moe_up_w{}, moe_down_w{};
+        // QSA (Stage 1, docs/QSA.md S4b) decode-path scratch. Every bound uses QSA_DIMS_BUF, whose widths
+        // are never zero even when QSA is off, so these stay valid array bounds in a QSA-off build
+        // (where nothing ever reads them) -- the same never-degenerate idiom GR_MIX_SCRATCH1 needed.
+        // Sized for the WHOLE window (SEQ_LEN), not the current position: forward_one's kv window grows
+        // with `pos`, and AGENTS.md S1 forbids sizing per call.
+        [[maybe_unused]] float qsa_idx_q[QSA_DIMS_BUF.idx_q_width()];
+        [[maybe_unused]] float qsa_gate_row[QSA_DIMS_BUF.q_width()];
+        [[maybe_unused]] float qsa_mask[SEQ_LEN];
+        [[maybe_unused]] float qsa_sel_scr[qsa::select_scratch_floats(QSA_DIMS_BUF, SEQ_LEN)];
+        [[maybe_unused]] float qsa_att_scr[qsa::attn_scratch_floats(QSA_DIMS_BUF, SEQ_LEN)];
         // GR READ (mix+gate, into `out_a`) / WRITE (combine, in place on `wide`) row-helpers, T==1 --
         // the exact decode-path counterpart of forward()'s gr_read/gr_write lambdas (docs/GATED_RESIDUAL.md
         // S2). Safe to write `wide` in place in gr_write_row: combine()'s per-(stream,channel) output
@@ -2175,12 +2322,46 @@ struct Model {
                 linear_row(att, L.Wo, nullptr, proj, C, C);
                 gr_write_row(h, proj);                                           // residual (write step)
             };
+            // The QSA decode counterpart of the same sublayer -- the T==1 form of op_qsa's own batched
+            // call, built from the SAME qsa_math.hpp row helpers op_qsa's qsa::forward() loops over, so
+            // the two provably compute identical arithmetic (the forward-vs-forward_one parity test is
+            // what gates that -- docs/QSA.md S9). Reuses g_kv for K/V exactly as the softmax path does
+            // (kv_width() == D_KV), and g_qsa_cache for the indexer's own raw keys, which g_kv cannot
+            // hold (a different width and a different -- unnormed, unrotated -- content).
+            [[maybe_unused]] auto do_qsa_mixer = [&] {
+                float* raw_k_base = g_qsa_cache.base(e);
+                const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * D_HEAD;
+                const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * D_HEAD;
+                qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->data.data(),
+                                          L.qsa_idx_qnorm->data.data(), cos_pos, sin_pos, qsa::RMS_EPS,
+                                          qsa_idx_q,
+                                          raw_k_base + static_cast<size_t>(pos) * QSA_INDEXER_HEAD_DIM);
+                qsa::attn_project_row(QSA_DIMS, a, L.qsa_q->data.data(), L.qsa_gate->data.data(),
+                                       L.qsa_k->data.data(), L.qsa_v->data.data(),
+                                       L.qsa_qnorm->data.data(), L.qsa_knorm->data.data(),
+                                       cos_pos, sin_pos, qsa::RMS_EPS,
+                                       qn, qsa_gate_row, g_kv.krow(e, pos), g_kv.vrow(e, pos));
+                qsa::indexer_select_row(QSA_DIMS, qsa_idx_q, raw_k_base, pos + 1,
+                                         L.qsa_idx_knorm->data.data(), g_qsa_rope.cos.data(),
+                                         g_qsa_rope.sin.data(), qsa::RMS_EPS, qsa_mask, qsa_sel_scr);
+                qsa::attn_row(QSA_DIMS, qn, qsa_gate_row, g_kv.krow(e, 0), g_kv.vrow(e, 0), pos + 1,
+                               qsa_mask, L.qsa_o->data.data(), proj, qsa_att_scr);
+                gr_write_row(h, proj);                                           // residual (write step)
+            };
+            // Which of the two full-attention forms this build uses, decided ONCE at compile time. This
+            // is the seam the MoE stage's own SIGSEGV came through (docs/MOE.md S9: a replacement wired
+            // into only ONE of two call sites), so it is expressed as a single named lambda that BOTH
+            // the GDN-on and GDN-off dispatch paths below call, rather than duplicated in each.
+            auto do_full_attn_mixer = [&] {
+                if constexpr (USE_QSA) do_qsa_mixer();
+                else                   do_attention_mixer();
+            };
             // GDN_SCHEDULE.full_attn[l] mirrors Model::forward()'s own dispatch exactly (per-LAYER, not
             // per-execution) -- see that function's comment. `if constexpr` keeps a GDN-off build
             // exactly the original single call, no branch at all.
             if constexpr (USE_GATED_DELTANET) {
                 if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
-                    do_attention_mixer();
+                    do_full_attn_mixer();
                 } else {
                     // Gated DeltaNet decode: T=1, persistent per-execution state/conv history
                     // (GdnCache, reset by kv_reset() at the start of each generation). op_gdn's whole
@@ -2201,7 +2382,7 @@ struct Model {
                     gr_write_row(h, proj);                                       // residual (write step)
                 }
             } else {
-                do_attention_mixer();
+                do_full_attn_mixer();
             }
             gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
             if constexpr (USE_MOE) {
@@ -2435,7 +2616,11 @@ Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(
 // generation; forward_one(id, pos) returns the logits [VOCAB] for the next token. See KVCache above.
 // Also resets GdnCache's decode-persistent recurrent state -- `if constexpr` so this costs nothing
 // (not even the vector-emptiness check) on a build with GDN off, per AGENTS.md S4.
-void kv_reset() { g_kv.reset(); if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset(); }
+void kv_reset() {
+    g_kv.reset();
+    if constexpr (USE_GATED_DELTANET) g_gdn_cache.reset();
+    if constexpr (USE_QSA) g_qsa_cache.reset();   // the indexer's own raw-key store -- docs/QSA.md S6
+}
 const float* forward_one(int id, int pos) { ensure_thread_built(); return g_model.forward_one(id, pos); }
 const float* last_hidden_ptr() { return g_model.last_hidden.data(); }   // see Model::last_hidden's comment
 

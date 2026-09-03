@@ -408,13 +408,31 @@ inline constexpr long long moe_param_delta(int n_layers, int d_model, int d_ff, 
 // unconsumed surface (AGENTS.md S8) and a second source of truth for one axis, the exact hazard
 // current_build_dims() exists to prevent. Same call docs/MOE.md S3a made for D_FF.
 inline constexpr bool USE_QSA = (QSA_INDEXER_N_HEADS >= 1 && QSA_INDEXER_BUDGET >= 1);
-// Stage 0 hard clamp -- relaxed by Stage 1 once op_qsa exists to compute against (docs/QSA.md S4a). The
-// same two-refusal "guard at the lowest callable seam" staging GDN/GR/MoE each used: a config-skeleton
-// commit that compiles genuinely cannot express anything but the current (QSA-off) architecture.
-static_assert(QSA_INDEXER_N_HEADS == 0 && QSA_INDEXER_KV_HEADS == 0 && QSA_INDEXER_HEAD_DIM == 0 &&
-              QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0,
-              "QSA Stage 0: every QSA_INDEXER_* axis is hard-clamped to 0 until Stage 1's real op "
-              "exists -- see docs/QSA.md S4a");
+// All five axes are on or off TOGETHER -- a half-configured QSA build cannot compile (the same
+// "guard at the lowest callable seam" pattern HC_COUNT/HC_LOWRANK and NUM_EXPERTS/EXPERTS_PER_TOK
+// already use, generalized to five). Stage 1 relaxed Stage 0's hard clamp to these real ranges.
+static_assert(((QSA_INDEXER_N_HEADS != 0) + (QSA_INDEXER_KV_HEADS != 0) + (QSA_INDEXER_HEAD_DIM != 0) +
+               (QSA_INDEXER_BUDGET != 0) + (QSA_INDEXER_COMPRESS_RATIO != 0)) % 5 == 0,
+              "every QSA_INDEXER_* axis must be set together or all left 0 -- see docs/QSA.md S4a");
+static_assert(!USE_QSA || QSA_INDEXER_KV_HEADS == 1,
+              "QSA_INDEXER_KV_HEADS must be exactly 1 when QSA is on -- the reference's own "
+              "token_k.reshape(...).squeeze(2) requires it (docs/QSA.md S1a)");
+static_assert(!USE_QSA || (QSA_INDEXER_HEAD_DIM >= 2 && QSA_INDEXER_HEAD_DIM % 2 == 0),
+              "QSA_INDEXER_HEAD_DIM must be even and >= 2 (the half-split rotary needs an even prefix)");
+static_assert(!USE_QSA || QSA_INDEXER_BUDGET >= QSA_INDEXER_COMPRESS_RATIO,
+              "QSA_INDEXER_BUDGET must be >= QSA_INDEXER_COMPRESS_RATIO, or block_topk would be 0");
+static_assert(!USE_QSA || D_HEAD % 2 == 0,
+              "QSA needs an even D_HEAD (the half-split rotary rotates D_HEAD/2 channel pairs)");
+// The rotary prefix cannot be wider than the vector it rotates. The engine's own rotary_dim is D_HEAD
+// (docs/QSA.md S2b.2), and the SAME cos/sin also rotate the indexer's OWN idx_head_dim-wide query and
+// pooled block keys (the reference reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's
+// head width must be at least D_HEAD. This holds in the real model (rotary_dim 64 <= indexer_head_dim
+// 128 <= head_dim 256) but is NOT automatic here, and violating it is a silent OUT-OF-BOUNDS WRITE past
+// the end of a per-head slice -- found exactly that way this stage (see qsa_math.hpp's rope_apply_row
+// precondition comment and docs/QSA.md S10).
+static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= D_HEAD,
+              "QSA_INDEXER_HEAD_DIM must be >= D_HEAD: the engine's rotary prefix is D_HEAD wide and the "
+              "SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- see docs/QSA.md S2b.2");
 
 // Never-zero array-bound / never-divide-by-zero forms (same idiom as HC_COUNT_BUF/NUM_EXPERTS_BUF above).
 inline constexpr int QSA_IDX_N_HEADS_BUF = USE_QSA ? QSA_INDEXER_N_HEADS       : 1;
