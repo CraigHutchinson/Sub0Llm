@@ -1,0 +1,124 @@
+{
+ "description": "Qwen Sparse Attention (Qwen4ExpTextAttention + Qwen4ExpTextQSAIndexer) layer-3 reference fixture. Layer 3 is the FIRST full_attention (= QSA) layer in the real 48-layer stack (config.json layer_types is full_attention iff l %% 4 == 3), so it is the first layer that has an indexer at all. Every weight VALUE is real: extracted from Qwen/Qwen3.8-Flash-Next's model-00082-of-00131.safetensors by HTTP Range requests over exactly the row spans needed (never a bulk shard download), BF16 -> float32. The forward pass itself is the real, unmodified transformers==5.16.1 Qwen4ExpTextAttention.forward() (_attn_implementation='eager') run on those sliced values -- nothing here is a hand re-derivation.",
+ "source": {
+  "repo": "Qwen/Qwen3.8-Flash-Next",
+  "shard": "model-00082-of-00131.safetensors",
+  "tensor_prefix": "model.language_model.layers.3.self_attn.",
+  "transformers_version": "5.16.1",
+  "module": "transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextAttention",
+  "bytes_fetched_over_http_range": 198976
+ },
+ "config_small": {
+  "hidden_size": 16,
+  "num_attention_heads": 2,
+  "head_dim": 8,
+  "num_key_value_heads": 1,
+  "indexer_n_heads": 2,
+  "indexer_kv_heads": 1,
+  "indexer_head_dim": 8,
+  "indexer_budget": 8,
+  "indexer_compress_ratio": 4,
+  "partial_rotary_factor": 0.25,
+  "rotary_dim": 2,
+  "rms_norm_eps": 1e-06,
+  "seq_len": 24,
+  "block_topk": 2
+ },
+ "config_real_full_scale_for_reference": {
+  "hidden_size": 2560,
+  "num_attention_heads": 24,
+  "head_dim": 256,
+  "num_key_value_heads": 2,
+  "indexer_n_heads": 4,
+  "indexer_kv_heads": 1,
+  "indexer_head_dim": 128,
+  "indexer_budget": 2048,
+  "indexer_compress_ratio": 4,
+  "partial_rotary_factor": 0.25,
+  "rms_norm_eps": 1e-06
+ },
+ "dtype": "float32 little-endian, raw flat binary, row-major (C order)",
+ "weight_convention": "raw PyTorch nn.Linear [out_features, in_features] convention, UNTRANSPOSED -- the test file transposes into this project's own [rows=in, cols=out] convention before calling sub0::qsa::*, matching gdn_math.hpp's/gated_residual_math.hpp's/moe_math.hpp's own fixture-test precedent. weight_q_proj and weight_gate_proj are the two PER-HEAD halves of the real single double-width q_proj (head h owns real rows [h*2*head_dim, (h+1)*2*head_dim); its first head_dim rows are the query, the next head_dim the gate) -- see docs/QSA.md S1b/S2b.4: a flat-row split would be WRONG.",
+ "shapes": {
+  "input": [
+   24,
+   16
+  ],
+  "cos": [
+   24,
+   2
+  ],
+  "sin": [
+   24,
+   2
+  ],
+  "weight_q_proj": [
+   16,
+   16
+  ],
+  "weight_gate_proj": [
+   16,
+   16
+  ],
+  "weight_k_proj": [
+   8,
+   16
+  ],
+  "weight_v_proj": [
+   8,
+   16
+  ],
+  "weight_o_proj": [
+   16,
+   16
+  ],
+  "weight_q_norm": [
+   8
+  ],
+  "weight_k_norm": [
+   8
+  ],
+  "weight_idx_qk_proj": [
+   24,
+   16
+  ],
+  "weight_idx_qk_proj_mutant": [
+   24,
+   16
+  ],
+  "weight_idx_q_norm": [
+   8
+  ],
+  "weight_idx_k_norm": [
+   8
+  ],
+  "output": [
+   24,
+   16
+  ],
+  "output_mutant": [
+   24,
+   16
+  ],
+  "mask": [
+   24,
+   24
+  ],
+  "mask_mutant": [
+   24,
+   24
+  ]
+ },
+ "input_construction": "numpy.random.default_rng(20260903).normal(0,1,size=(1,24,16)).astype(float32)",
+ "indexer_drops": {
+  "causal_entries": 300,
+  "dropped_by_indexer": 112,
+  "mask_entries_changed_by_mutant": 128
+ },
+ "mutant_construction": "the real indexer's index_qk_proj KEY rows (the last indexer_kv_heads*indexer_head_dim rows, i.e. the token_k half of the fused projection) negated and scaled 3x -- everything else, including the whole attention side, stays real. output_mutant is the REAL Qwen4ExpTextAttention.forward() re-run with that one tensor replaced, so the mutant reference is a real reference too, not a hand recombination. It selects a genuinely DIFFERENT block set (mask_entries_changed_by_mutant above), which is what proves an implementation actually consults the indexer rather than attending densely.",
+ "notes": [
+  "hidden_size (2560->16), head_dim (256->8) and indexer_head_dim (128->8) are ordinary widths, freely sliced (first N rows/columns kept, this thread's standard convention).",
+  "num_attention_heads is kept at 2 (not 1) SPECIFICALLY so the real per-head query|gate chunk order is distinguishable from a flat-row split; indexer_n_heads is kept at 2 so the relu-then-sum-over-heads score is distinguishable from a single head; num_key_value_heads is 1 so GQA repeat_kv is exercised.",
+  "indexer_budget (2048->8) and indexer_compress_ratio (4, kept real) are set so block_topk (2) is SMALLER than the number of complete blocks at most query positions -- at the real 2048/4 with a 24-token sequence every block would be selected and the fixture would pass identically for an implementation that never ran the indexer at all. The extraction script asserts dropped > 0 before writing."
+ ]
+}

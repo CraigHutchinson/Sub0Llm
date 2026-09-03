@@ -736,11 +736,13 @@ bool load_checkpoint(const std::string& path, std::mt19937& rng, RunState& rs,
         sub0::log::warn("ignoring checkpoint '{}': built with a different architecture in a way nfloat "
                         "cannot catch -- loop schedule {}x{} vs {}x{}, rope theta {:g} vs {:g}, "
                         "depth-attn stride {} vs {}, gdn full-attn stride {} vs {}, moe experts-per-tok "
-                        "{} vs {}.",
+                        "{} vs {}, qsa indexer budget/compress-ratio {}/{} vs {}/{}.",
                         path, got.middle_layers, got.repeats, LOOP_MIDDLE_LAYERS, LOOP_REPEATS,
                         got.rope_theta, ROPE_THETA, got.depth_attn_stride, DEPTH_ATTN_STRIDE,
                         got2.gdn_full_attn_stride, GDN_FULL_ATTN_STRIDE,
-                        got2.experts_per_tok, EXPERTS_PER_TOK);
+                        got2.experts_per_tok, EXPERTS_PER_TOK,
+                        got2.qsa_indexer_budget, got2.qsa_indexer_compress_ratio,
+                        QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO);
         return false;
     }
 
@@ -1685,6 +1687,9 @@ extern "C" SUB0_API int sub0_train_stage(const char* corpus_path, const char* mo
         cfg.depth_attn_stride = DEPTH_ATTN_STRIDE;
         cfg.gdn_full_attn_stride = GDN_FULL_ATTN_STRIDE;   // always 0 today -- docs/GATED_DELTANET.md
         cfg.num_experts = NUM_EXPERTS; cfg.experts_per_tok = EXPERTS_PER_TOK;   // always 0 today -- docs/MOE.md
+        cfg.qsa_idx_n_heads = QSA_INDEXER_N_HEADS; cfg.qsa_idx_kv_heads = QSA_INDEXER_KV_HEADS;
+        cfg.qsa_idx_head_dim = QSA_INDEXER_HEAD_DIM; cfg.qsa_idx_budget = QSA_INDEXER_BUDGET;
+        cfg.qsa_idx_ratio = QSA_INDEXER_COMPRESS_RATIO;   // all 0 today -- docs/QSA.md
         cfg.ngram_max_n = NGRAM_MAX_N; cfg.ngram_tables = NGRAM_TABLES_PER_ORDER;
         cfg.ngram_table_size = NGRAM_TABLE_SIZE;
         cfg.rope_scaling = ROPE_SCALING; cfg.rope_scale_fac = ROPE_SCALE_FACTOR;

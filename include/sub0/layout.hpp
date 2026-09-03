@@ -24,6 +24,7 @@
 #include "gated_residual_math.hpp"  // sub0::gr::Dims for GR_DIMS below -- same reasoning as gdn_math.hpp
                             // just above; dependency-free (see its own header comment).
 #include "moe_math.hpp"     // sub0::moe::Dims for MOE_DIMS below -- same reasoning again; dependency-free.
+#include "qsa_math.hpp"     // sub0::qsa::Dims for QSA_DIMS below -- same reasoning again; dependency-free.
 
 #include <algorithm>
 #include <array>
@@ -394,6 +395,125 @@ inline constexpr long long moe_param_delta(int n_layers, int d_model, int d_ff, 
     return static_cast<long long>(n_layers) * (moe_layer_floats - dense_ffn_floats);
 }
 
+// QWEN SPARSE ATTENTION (QSA) + lightning indexer -- Stage 0: config skeleton, hard-gated off
+// (docs/QSA.md). A QSA layer is the real model's `full_attention` layer type: an ordinary gated softmax
+// attention sublayer whose visible-token set is first NARROWED, per query, by a small "lightning indexer"
+// that scores mean-pooled key BLOCKS and keeps only the top `indexer_budget / indexer_compress_ratio` of
+// them (plus the always-visible incomplete tail) -- Qwen4-preview's own Qwen4ExpTextQSAIndexer +
+// Qwen4ExpTextAttention.
+//
+// Five new axes, all on or off TOGETHER. USE_QSA is the single gate every `if constexpr` keys off.
+// NOTE what is deliberately NOT here: num_attention_heads / head_dim / num_key_value_heads are this
+// project's EXISTING N_HEADS / D_HEAD / N_KV_HEADS (docs/QSA.md S3a/S4a) -- adding duplicates would be
+// unconsumed surface (AGENTS.md S8) and a second source of truth for one axis, the exact hazard
+// current_build_dims() exists to prevent. Same call docs/MOE.md S3a made for D_FF.
+inline constexpr bool USE_QSA = (QSA_INDEXER_N_HEADS >= 1 && QSA_INDEXER_BUDGET >= 1);
+// All five axes are on or off TOGETHER -- a half-configured QSA build cannot compile (the same
+// "guard at the lowest callable seam" pattern HC_COUNT/HC_LOWRANK and NUM_EXPERTS/EXPERTS_PER_TOK
+// already use, generalized to five). Stage 1 relaxed Stage 0's hard clamp to these real ranges.
+static_assert(((QSA_INDEXER_N_HEADS != 0) + (QSA_INDEXER_KV_HEADS != 0) + (QSA_INDEXER_HEAD_DIM != 0) +
+               (QSA_INDEXER_BUDGET != 0) + (QSA_INDEXER_COMPRESS_RATIO != 0)) % 5 == 0,
+              "every QSA_INDEXER_* axis must be set together or all left 0 -- see docs/QSA.md S4a");
+static_assert(!USE_QSA || QSA_INDEXER_KV_HEADS == 1,
+              "QSA_INDEXER_KV_HEADS must be exactly 1 when QSA is on -- the reference's own "
+              "token_k.reshape(...).squeeze(2) requires it (docs/QSA.md S1a)");
+static_assert(!USE_QSA || (QSA_INDEXER_HEAD_DIM >= 2 && QSA_INDEXER_HEAD_DIM % 2 == 0),
+              "QSA_INDEXER_HEAD_DIM must be even and >= 2 (the half-split rotary needs an even prefix)");
+static_assert(!USE_QSA || QSA_INDEXER_BUDGET >= QSA_INDEXER_COMPRESS_RATIO,
+              "QSA_INDEXER_BUDGET must be >= QSA_INDEXER_COMPRESS_RATIO, or block_topk would be 0");
+static_assert(!USE_QSA || D_HEAD % 2 == 0,
+              "QSA needs an even D_HEAD (the half-split rotary rotates D_HEAD/2 channel pairs)");
+// The rotary prefix cannot be wider than the vector it rotates. The engine's own rotary_dim is D_HEAD
+// (docs/QSA.md S2b.2), and the SAME cos/sin also rotate the indexer's OWN idx_head_dim-wide query and
+// pooled block keys (the reference reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's
+// head width must be at least D_HEAD. This holds in the real model (rotary_dim 64 <= indexer_head_dim
+// 128 <= head_dim 256) but is NOT automatic here, and violating it is a silent OUT-OF-BOUNDS WRITE past
+// the end of a per-head slice -- found exactly that way this stage (see qsa_math.hpp's rope_apply_row
+// precondition comment and docs/QSA.md S10).
+static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= D_HEAD,
+              "QSA_INDEXER_HEAD_DIM must be >= D_HEAD: the engine's rotary prefix is D_HEAD wide and the "
+              "SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- see docs/QSA.md S2b.2");
+
+// Never-zero array-bound / never-divide-by-zero forms (same idiom as HC_COUNT_BUF/NUM_EXPERTS_BUF above).
+inline constexpr int QSA_IDX_N_HEADS_BUF = USE_QSA ? QSA_INDEXER_N_HEADS       : 1;
+inline constexpr int QSA_IDX_KV_HEADS_BUF = USE_QSA ? QSA_INDEXER_KV_HEADS     : 1;
+inline constexpr int QSA_IDX_HEAD_DIM_BUF = USE_QSA ? QSA_INDEXER_HEAD_DIM     : 1;
+inline constexpr int QSA_BUDGET_BUF       = USE_QSA ? QSA_INDEXER_BUDGET       : 1;
+inline constexpr int QSA_RATIO_BUF        = USE_QSA ? QSA_INDEXER_COMPRESS_RATIO : 1;
+// Total output width of the indexer's single fused index_qk_proj: (n_heads + kv_heads) * head_dim.
+inline constexpr int QSA_IDX_QK_OUT = (QSA_INDEXER_N_HEADS + QSA_INDEXER_KV_HEADS) * QSA_INDEXER_HEAD_DIM;
+
+// This build's QSA dims, per docs/QSA.md S2b/S4a's mapping. head_dim = D_HEAD and rotary_dim = D_HEAD
+// (full-width rotary) are this stage's two documented engine-side simplifications -- qsa_math.hpp itself
+// takes both as independent Dims fields so the fixture can exercise the real model's non-dividing
+// head_dim=256 and partial rotary_dim=64. Valid (never divides by zero) even when USE_QSA is false --
+// same "describes a shape nothing builds" idiom GDN_DIMS/GR_DIMS/MOE_DIMS already use.
+inline constexpr qsa::Dims QSA_DIMS{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
+                                    QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS, QSA_INDEXER_HEAD_DIM,
+                                    QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO, D_HEAD};
+// Same shape but never degenerate (every indexer width >= 1) -- used ONLY to size the fixed decode-path
+// scratch arrays below, which must be valid array bounds even when QSA is off.
+inline constexpr qsa::Dims QSA_DIMS_BUF{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
+                                        QSA_IDX_N_HEADS_BUF, QSA_IDX_KV_HEADS_BUF, QSA_IDX_HEAD_DIM_BUF,
+                                        QSA_BUDGET_BUF, QSA_RATIO_BUF, D_HEAD};
+
+// Per-LAYER three-way mixer classification (docs/QSA.md S2). QSA is NOT a new schedule axis: in the real
+// model every `full_attention` layer IS a QSA layer (Qwen4ExpTextAttention unconditionally constructs and
+// calls its own indexer -- there is no full-attention layer without one), and the real config.json's own
+// `layer_types` array is bit-for-bit gdn_schedule_for(4). So the three-way choice is DERIVED from the two
+// existing axes rather than given a redundant third one that could express layer sets the real model
+// cannot have. Parameterised on (layers, gdn_stride, qsa_on) rather than reading this build's constants,
+// for the same reason gdn_schedule_for<LAYERS>/depth_schedule_for<EXECS> are: AGENTS.md S7's odd-layer-
+// count/non-dividing-stride cases must be assertable without compiling those builds.
+enum class LayerMixer : unsigned char { Attn = 0, Gdn = 1, Qsa = 2 };
+template <int LAYERS>
+consteval std::array<LayerMixer, LAYERS> qsa_schedule_for(int gdn_stride, bool qsa_on) {
+    std::array<LayerMixer, LAYERS> s{};
+    for (int l = 0; l < LAYERS; ++l) {
+        const bool is_gdn = gdn_stride > 0 && (l % gdn_stride != gdn_stride - 1);
+        s[static_cast<std::size_t>(l)] = is_gdn ? LayerMixer::Gdn
+                                                : (qsa_on ? LayerMixer::Qsa : LayerMixer::Attn);
+    }
+    return s;
+}
+inline constexpr std::array<LayerMixer, N_LAYERS> MIXER_SCHEDULE =
+    qsa_schedule_for<N_LAYERS>(GDN_FULL_ATTN_STRIDE, USE_QSA);
+// The invariant that keeps MIXER_SCHEDULE and the pre-existing GDN_SCHEDULE from ever drifting apart:
+// Qsa is definitionally "full attention AND QSA on", Gdn is definitionally "not full attention".
+consteval bool mixer_schedule_agrees_with_gdn() {
+    for (int l = 0; l < N_LAYERS; ++l) {
+        const bool full = GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)];
+        const LayerMixer m = MIXER_SCHEDULE[static_cast<std::size_t>(l)];
+        if (full != (m != LayerMixer::Gdn)) return false;
+        if (full && (m == LayerMixer::Qsa) != USE_QSA) return false;
+    }
+    return true;
+}
+static_assert(mixer_schedule_agrees_with_gdn(),
+              "MIXER_SCHEDULE must agree with GDN_SCHEDULE.full_attn on every layer -- see docs/QSA.md S2");
+
+// Exact PARAM_FLOATS delta a QSA-on build adds over an otherwise-identical QSA-off build, per
+// docs/QSA.md S3b -- a pure function of explicit parameters (not closed over this build's own constants),
+// same reasoning as gr_param_delta()/moe_param_delta()/gdn_schedule_for<LAYERS>() above. UNLIKE Gated
+// Residual's own delta (a pure addition), this is a REPLACEMENT of the softmax-attention layer's own
+// Wq/Wk/Wv/Wo[+QNorm/KNorm] -- and it applies only to the FULL-ATTENTION layers, so the GDN stride is an
+// input. Strictly positive whenever qsa_on and n_layers >= 1: the D_MODEL*D_MODEL gate projection alone
+// (which plain attention does not have at all) already dominates, and no term can cancel.
+inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_model, int d_kv,
+                                            int d_head, bool qk_norm, int idx_n_heads, int idx_kv_heads,
+                                            int idx_head_dim, bool qsa_on) {
+    if (!qsa_on) return 0;
+    int full_attn_layers = 0;
+    for (int l = 0; l < n_layers; ++l)
+        if (!(gdn_stride > 0 && (l % gdn_stride != gdn_stride - 1))) ++full_attn_layers;
+    const long long idx_qk_out = static_cast<long long>(idx_n_heads + idx_kv_heads) * idx_head_dim;
+    const long long attn_layer = 2LL * d_model * d_model + 2LL * d_model * d_kv
+                               + (qk_norm ? 2LL * d_head : 0);
+    const long long qsa_layer  = 3LL * d_model * d_model + 2LL * d_model * d_kv + 2LL * d_head
+                               + static_cast<long long>(d_model) * idx_qk_out + 2LL * idx_head_dim;
+    return static_cast<long long>(full_attn_layers) * (qsa_layer - attn_layer);
+}
+
 // --- N-GRAM EMBEDDINGS -- additional per-position features from rolling polynomial-hash token n-grams,
 // added into the input embedding (Nanbeige's `NanbeigeNgramEmbedding`, "concat" fusion mode -- see
 // docs/NGRAM_EMBEDDING.md). NGRAM_MAX_N is the highest n-gram order used (bigrams..NGRAM_MAX_N-grams);
@@ -569,16 +689,43 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, 
 static_assert(GDN_FULL_ATTN_STRIDE >= 0 && GDN_FULL_ATTN_STRIDE <= 0xff,
               "GDN_FULL_ATTN_STRIDE must fit 8 bits");
 static_assert(EXPERTS_PER_TOK >= 0 && EXPERTS_PER_TOK <= 0xff, "EXPERTS_PER_TOK must fit 8 bits");
-inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride, int experts_per_tok = 0) {
-    return (static_cast<std::uint64_t>(static_cast<unsigned>(experts_per_tok)   & 0xffu) << 8)
-         |  static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride) & 0xffu);
+//
+// QSA (docs/QSA.md S3a): of QSA's five new axes, the three INDEXER SHAPE axes (n_heads/kv_heads/head_dim)
+// widen index_qk_proj and the two indexer norms strictly monotonically, so PARAM_FLOATS/qsa_param_delta()
+// already discriminate them (rule #1) and they do NOT belong here. The other two do:
+//   * QSA_INDEXER_BUDGET and QSA_INDEXER_COMPRESS_RATIO change NO tensor shape at all -- checked
+//     exhaustively against both real classes' __init__ (the indexer's only parameters are index_qk_proj,
+//     q_layernorm and k_layernorm, none of which mentions either) -- while changing which tokens every
+//     query may attend to, via block_topk = budget / compress_ratio and the pooling arity. Two builds
+//     identical but for them produce BYTE-IDENTICAL checkpoints that compute different attention:
+//     exactly rule #2, the same hazard GDN_FULL_ATTN_STRIDE and EXPERTS_PER_TOK already sit here for.
+// Placed in the next of the 56 spare bits this word was deliberately given from day one:
+//   budget gets 16 bits at [31:16] (the real value is 2048, which does not fit 8 -- worked through, not
+//   assumed), compress_ratio 8 bits at [39:32]. [63:40] stays reserved. At the neutral setting (both 0)
+//   this word is bit-identical to every value it has ever produced, so no existing checkpoint is
+//   invalidated -- the same additive, gracefully-degrading property AGENTS.md S3 rule 2 requires.
+static_assert(QSA_INDEXER_BUDGET >= 0 && QSA_INDEXER_BUDGET <= 0xffff,
+              "QSA_INDEXER_BUDGET must fit 16 bits");
+static_assert(QSA_INDEXER_COMPRESS_RATIO >= 0 && QSA_INDEXER_COMPRESS_RATIO <= 0xff,
+              "QSA_INDEXER_COMPRESS_RATIO must fit 8 bits");
+inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride, int experts_per_tok = 0,
+                                                  int qsa_indexer_budget = 0,
+                                                  int qsa_indexer_compress_ratio = 0) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_compress_ratio) & 0xffu)   << 32)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_budget)         & 0xffffu) << 16)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(experts_per_tok)            & 0xffu)   << 8)
+         |  static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride)       & 0xffu);
 }
-struct ArchAxes2 { int gdn_full_attn_stride; int experts_per_tok; };
+struct ArchAxes2 { int gdn_full_attn_stride; int experts_per_tok; int qsa_indexer_budget;
+                   int qsa_indexer_compress_ratio; };
 inline constexpr ArchAxes2 arch_axes2_of(std::uint64_t fp2) {
-    return ArchAxes2{ static_cast<int>(fp2 & 0xffu), static_cast<int>((fp2 >> 8) & 0xffu) };
+    return ArchAxes2{ static_cast<int>(fp2 & 0xffu), static_cast<int>((fp2 >> 8) & 0xffu),
+                      static_cast<int>((fp2 >> 16) & 0xffffu), static_cast<int>((fp2 >> 32) & 0xffu) };
 }
-inline constexpr std::uint64_t ARCH_FINGERPRINT2 = arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK);
-inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2 =
+    arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK, QSA_INDEXER_BUDGET,
+                      QSA_INDEXER_COMPRESS_RATIO);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
 // shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
@@ -640,6 +787,15 @@ consteval std::uint64_t make_model_arch_id() {
     // changing axis, mixed in via the earlier `mix(ARCH_FINGERPRINT2)` call, which now covers both GDN's
     // stride and MoE's experts_per_tok) and is not folded in a second time here.
     mix(static_cast<std::uint64_t>(NUM_EXPERTS));
+    // QSA: the three INDEXER SHAPE axes are shape-changing (docs/QSA.md S3a -- qsa_param_delta() is
+    // strictly positive and monotonic once on), so PARAM_FLOATS alone already discriminates them and they
+    // do NOT join ARCH_FINGERPRINT2 -- mixed in here unconditionally like every other axis MODEL_ARCH_ID
+    // covers. QSA_INDEXER_BUDGET/QSA_INDEXER_COMPRESS_RATIO already joined ARCH_FINGERPRINT2 above
+    // (shape-NEUTRAL, computation-changing) and ride the earlier mix(ARCH_FINGERPRINT2) call rather than
+    // being folded in a second time -- exactly EXPERTS_PER_TOK's own treatment.
+    mix(static_cast<std::uint64_t>(QSA_INDEXER_N_HEADS));
+    mix(static_cast<std::uint64_t>(QSA_INDEXER_KV_HEADS));
+    mix(static_cast<std::uint64_t>(QSA_INDEXER_HEAD_DIM));
     return h;
 }
 inline constexpr std::uint64_t MODEL_ARCH_ID = make_model_arch_id();
@@ -694,7 +850,14 @@ consteval int count_num_params() {
     for (int l = 0; l < N_LAYERS; ++l) {
         n += 2;   // ln1, ln2
         if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (attn-wrapping)
-        if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+        if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] == LayerMixer::Qsa) {
+            // QSA layer (docs/QSA.md S3b): REPLACES Wq/Wk/Wv/Wo[+QNorm/KNorm] with its own ten tensors --
+            // QsaQProj, QsaGateProj, QsaKProj, QsaVProj, QsaOProj, QsaQNorm, QsaKNorm (7) plus the
+            // indexer's QsaIdxQkProj, QsaIdxQNorm, QsaIdxKNorm (3). QNorm/KNorm are ALWAYS present on a
+            // QSA layer regardless of USE_QK_NORM -- the real Qwen4ExpTextAttention has them
+            // unconditionally, so they are part of this mixer's identity, not an optional engine feature.
+            n += 10;
+        } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             n += 4;   // Wq, Wk, Wv, Wo
             if constexpr (USE_QK_NORM) n += 2;   // QNorm, KNorm
         } else {
@@ -753,12 +916,22 @@ inline constexpr int NUM_PARAMS = count_num_params();
 // (MoeGate, MoeUp, MoeDown) -- one routed expert's own SwiGLU triple -- then ONE shared-expert SwiGLU
 // triple (MoeSharedGate/MoeSharedUp/MoeSharedDown, same D_FF width per MOE_DIMS) plus MoeSharedGateProj
 // (the D_MODEL->1 sigmoid gate scaling the shared expert's own contribution).
+// QSA kinds (Stage 1, docs/QSA.md S3b): a QSA layer replaces Wq/Wk/Wv/Wo (and QNorm/KNorm) with its own
+// seven attention tensors plus the indexer's three. QsaQProj/QsaGateProj are the two halves of the real
+// model's single DOUBLE-WIDTH q_proj, stored separately (docs/QSA.md S2b.4 -- exactly the same arithmetic,
+// since chunking a bias-free Linear's output axis partitions its weight rows; a future weight transplant
+// must respect the real PER-HEAD chunk order). QsaQNorm/QsaKNorm are [1,D_HEAD] per-head RMSNorm gains
+// with the real model's (1 + w) zero-centered convention -- NOT this project's QNorm/KNorm convention,
+// which is why they are separate kinds rather than a reuse. QsaIdxQkProj is the indexer's single fused
+// [D_MODEL, (idx_n+idx_kv)*idx_hd] projection; QsaIdxQNorm/QsaIdxKNorm are its two [1, idx_hd] norms.
 enum class PKind : unsigned char {
     TokEmb, PosEmb, Ln1, Ln2, Wq, Wk, Wv, Wo, W1, B1, W2, B2, LnF, LmHead, LmBias, Wg, QNorm, KNorm,
     NgramEmb, NgramProj,
     GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
     GrHcNorm, GrMixDown, GrMixUp, GrBlockInject,
-    MoeRouter, MoeGate, MoeUp, MoeDown, MoeSharedGate, MoeSharedUp, MoeSharedDown, MoeSharedGateProj
+    MoeRouter, MoeGate, MoeUp, MoeDown, MoeSharedGate, MoeSharedUp, MoeSharedDown, MoeSharedGateProj,
+    QsaQProj, QsaGateProj, QsaKProj, QsaVProj, QsaOProj, QsaQNorm, QsaKNorm,
+    QsaIdxQkProj, QsaIdxQNorm, QsaIdxKNorm
 };
 
 // One weight tensor: where it lives in the flat blob, its logical [rows x cols]
@@ -802,7 +975,25 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             add(HC_LOWRANK, WIDE,       PKind::GrMixUp,       true,  false);
             add(WIDE,       HC_COUNT,   PKind::GrBlockInject, true,  false);
         }
-        if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
+        if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] == LayerMixer::Qsa) {
+            // QSA layer (docs/QSA.md S3b/S4): the gated-attention tensors then the indexer's own three.
+            // Axis order is this project's [rows=in, cols=out] throughout (see qsa_math.hpp's header
+            // comment for the explicit re-derivation from the real PyTorch [out,in] convention). The
+            // projections are ternary-eligible like Wq/Wk/Wv/Wo; the two norms and the indexer's own
+            // three tensors stay full precision (decay=false for the 1D gains; the indexer's projection
+            // is a routing/SELECTION decision, the one place a ternarized weight is most damaging --
+            // the same reasoning MoeRouter and LmHead stay full precision).
+            add(D_MODEL, D_MODEL, PKind::QsaQProj,    true,  true);
+            add(D_MODEL, D_MODEL, PKind::QsaGateProj, true,  true);
+            add(D_MODEL, D_KV,    PKind::QsaKProj,    true,  true);
+            add(D_MODEL, D_KV,    PKind::QsaVProj,    true,  true);
+            add(D_MODEL, D_MODEL, PKind::QsaOProj,    true,  true);
+            add(1, D_HEAD,        PKind::QsaQNorm,    false, false);
+            add(1, D_HEAD,        PKind::QsaKNorm,    false, false);
+            add(D_MODEL, QSA_IDX_QK_OUT,      PKind::QsaIdxQkProj, true,  false);
+            add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxQNorm,  false, false);
+            add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxKNorm,  false, false);
+        } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
             add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
             // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
             // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
@@ -914,7 +1105,12 @@ inline constexpr bool is_muon_kind(PKind k) {
            // ternary=false comment in make_param_layout() -- routing precision, same reasoning LmHead
            // stays off Muon/ternary both).
            k == PKind::MoeGate || k == PKind::MoeUp || k == PKind::MoeDown ||
-           k == PKind::MoeSharedGate || k == PKind::MoeSharedUp || k == PKind::MoeSharedDown;
+           k == PKind::MoeSharedGate || k == PKind::MoeSharedUp || k == PKind::MoeSharedDown ||
+           // QSA (Stage 1): the five gated-attention projections are the exact same role Wq/Wk/Wv/Wo
+           // already play (ordinary hidden GEMM weights), so Muon-eligible for the same reason.
+           // QsaIdxQkProj stays on AdamW -- a selection weight, same reasoning MoeRouter/LmHead do.
+           k == PKind::QsaQProj || k == PKind::QsaGateProj || k == PKind::QsaKProj ||
+           k == PKind::QsaVProj || k == PKind::QsaOProj;
 }
 
 // A compact [start,end) float-offset range where AdamW weight decay applies, merging adjacent

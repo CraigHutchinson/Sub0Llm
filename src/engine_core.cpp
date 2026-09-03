@@ -229,13 +229,16 @@ bool load_model(const char* path) {
     }
     if (arch2 != ARCH_FINGERPRINT2) {
         const ArchAxes2 got2 = arch_axes2_of(arch2);
-        std::println(stderr, "error: model was built with a different Gated DeltaNet layer schedule and/or "
-                             "MoE top-k than this binary: file gdn full-attn stride {} | this build stride "
-                             "{} (0 = off, the only value either side can currently take -- "
-                             "docs/GATED_DELTANET.md); file experts-per-tok {} | this build {} (0 = off -- "
-                             "docs/MOE.md).",
+        std::println(stderr, "error: model was built with a different Gated DeltaNet layer schedule, MoE "
+                             "top-k and/or QSA indexer budget than this binary: file gdn full-attn stride "
+                             "{} | this build stride {} (0 = off, the only value either side can currently "
+                             "take -- docs/GATED_DELTANET.md); file experts-per-tok {} | this build {} "
+                             "(0 = off -- docs/MOE.md); file qsa indexer budget/compress-ratio {}/{} | this "
+                             "build {}/{} (0/0 = off -- docs/QSA.md).",
                      got2.gdn_full_attn_stride, GDN_FULL_ATTN_STRIDE,
-                     got2.experts_per_tok, EXPERTS_PER_TOK);
+                     got2.experts_per_tok, EXPERTS_PER_TOK,
+                     got2.qsa_indexer_budget, got2.qsa_indexer_compress_ratio,
+                     QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO);
         return false;
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
