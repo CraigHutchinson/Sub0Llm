@@ -110,7 +110,17 @@ target_link_libraries(sub0_tests PRIVATE sub0_core sub0_frontend Catch2::Catch2W
 #                              mutation-style check that a perturbed indexer selecting a different block
 #                              set changes the output by a real, matching amount, and two fixture-free
 #                              property checks (docs/QSA.md sec 7). Skips gracefully if absent.
-add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
+#   transplant_tests.cpp     — WP4c: sub0::transplant's GGUF-name/axis mapping table and its array ops
+#                              (transpose, per-head q|gate split, indexer concat, per-tensor stats),
+#                              each with the specific wrong-but-plausible implementation it rules out.
+#   transplant_fixture_tests.cpp — WP4c's PRIMARY gate (docs/WP4_SCOPE.md S4c levels 3+4): the real
+#                              fixtures re-encoded as GGUF under the REAL model's tensor names, pulled
+#                              back through the actual transplant recipes, and run into sub0::gdn /
+#                              sub0::qsa to match the real reference output -- plus mutation checks for
+#                              the three errors no shape or statistical check can see (an alpha/beta
+#                              identity swap, a down-the-middle q|gate split, a swapped indexer concat).
+#                              Skips gracefully if the fixtures are absent.
+add_executable(sub0_frontend_tests tok_lib_tests.cpp tok_roundtrip_fuzz.cpp tok_interchange_tests.cpp ws6_simd_differential_tests.cpp spellspike_tests.cpp blend_tests.cpp scratchspike_tests.cpp config_tests.cpp frontend_tests.cpp gguf_tests.cpp muon_tests.cpp lr_schedule_tests.cpp nodes_tests.cpp gsm8k_tests.cpp op_curriculum_tests.cpp modality_tests.cpp casing_policy_tests.cpp ngram_qwen4_fixture_tests.cpp gdn_qwen4_fixture_tests.cpp gated_residual_qwen4_fixture_tests.cpp moe_qwen4_fixture_tests.cpp qsa_qwen4_fixture_tests.cpp transplant_tests.cpp transplant_fixture_tests.cpp ${SUB0_SPIKE_FRONTEND_TEST_SOURCES})
 target_include_directories(sub0_frontend_tests PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)

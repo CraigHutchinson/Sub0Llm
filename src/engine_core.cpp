@@ -14,6 +14,7 @@
 #include "sub0/casing.hpp"
 #include "sub0/tokenizer.hpp"
 #include "sub0/layout.hpp"
+#include "sub0/model_file.hpp"
 
 #include <algorithm>
 #include <array>
@@ -42,19 +43,12 @@ namespace sub0 {
 // without changing the file format.
 
 namespace {
-// NOTE: adding a field here changes sizeof(Header) and breaks resuming EVERY existing checkpoint
-// (old bytes no longer line up) -- so USE_GATED_FFN deliberately does NOT get its own field. It does
-// not need one: param_floats already differs between a gated and a non-gated build at identical
-// d_model/n_layers/n_heads/seq_len/vocab (gated: 3*C*F per layer; plain: 2*C*F+F+C; these are never
-// equal for this project's fixed F=4*C convention), so the existing param_floats check below already
-// catches a gated/non-gated mismatch -- one less checkpoint-format break for an orthogonal feature.
-struct Header {
-    char magic[4] = {'S', '0', 'L', '5'};
-    int d_model = D_MODEL, n_layers = N_LAYERS, n_heads = N_HEADS;
-    int d_ff = D_FF, seq_len = SEQ_LEN, vocab = VOCAB, ternary = USE_TERNARY;
-    int pos_encoding = static_cast<int>(POS_ENCODING);   // 0 = absolute learned, 1 = RoPE
-    uint64_t param_floats = PARAM_FLOATS;
-};
+// The Header struct itself now lives in include/sub0/model_file.hpp as sub0::ModelHeader, because
+// WP4c's offline transplant tool is a SECOND writer of this format and is compiled against a
+// different config header, so it cannot link the engine (see that file's own comment, and AGENTS.md
+// S3 on why two definitions of a fixed-size binary format is the wrong shape). `Header` stays as a
+// local alias so every use site below reads exactly as it always did.
+using Header = ModelHeader;
 
 // The runtime tokenizer state (loaded from tokenizer.tok). Loading, encoding and detokenizing all
 // delegate to the shared sub0::tok library (src/tokenizer.cpp) -- the single definition the build-time

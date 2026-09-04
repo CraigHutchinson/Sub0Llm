@@ -196,6 +196,31 @@ add_executable(sub0llm-tokenizer tools/sub0llm-tokenizer.cpp)
 target_include_directories(sub0llm-tokenizer PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0llm-tokenizer PRIVATE CLI11::CLI11 sub0_frontend)
 
+# WP4c: the offline weight transplant (docs/WP4_SCOPE.md S4). Unusual in exactly one way, and the
+# reason is worth stating at the target rather than only in the source: it is compiled against
+# tests/qwen4_real_axes/sub0_config.hpp -- Qwen3.8-Flash-Next's REAL RunConfig axes, with N_LAYERS
+# forced to 4 for the real repeating sub-stack (S7 Q3) -- INSTEAD of ${GEN_DIR}'s generated config. So
+# it links no engine library: sub0_core is compiled against the build's own config, and two definitions
+# of sub0::PARAM_LAYOUT in one binary is an ODR violation. Same reasoning, and the same shape, as the
+# sub0_qwen4_shape_tests target in tests/CMakeLists.txt.
+#
+# The axes header is SHARED with that test rather than copied here: the real model's RunConfig has one
+# source of truth or it has none. sub4_prefix.hpp (same directory) carries the two literals both
+# targets assert against, which is what makes "this 4-layer layout IS the real model's first four
+# layers" a compile-time claim instead of an argument.
+add_executable(sub0llm-transplant tools/sub0llm-transplant.cpp)
+target_include_directories(sub0llm-transplant PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
+  "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0llm-transplant PRIVATE SUB0_QWEN4_LAYERS=4)
+target_link_libraries(sub0llm-transplant PRIVATE CLI11::CLI11)
+# 512 experts x 4 layers makes PARAM_LAYOUT a ~6,200-tensor consteval walk, done several times over
+# (make_param_layout, DECAY_RANGES, MUON_RANGES, MUON_MAX_MN/MM, total_param_floats) -- past clang's
+# default 1,048,576-step budget. Same flag, same reason, as sub0_qwen4_shape_tests.
+if(NOT MSVC)
+  target_compile_options(sub0llm-transplant PRIVATE -fconstexpr-steps=1000000000)
+endif()
+
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
 set(GEN_HEADER "${GEN_DIR}/sub0_config.hpp")
