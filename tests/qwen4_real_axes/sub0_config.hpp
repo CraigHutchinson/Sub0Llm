@@ -58,6 +58,17 @@ constexpr int  HC_COUNT   = 4;        // hc_count
 constexpr int  HC_LOWRANK = 320;      // hc_lowrank
 constexpr int  NUM_EXPERTS     = 512; // num_experts
 constexpr int  EXPERTS_PER_TOK = 10;  // num_experts_per_tok
+// WP4e: the SECOND axis a consumer may override here, via -DSUB0_MOE_QUANT_EXPERTS=1, and for exactly
+// the same reason N_LAYERS is overridable above -- the quantized-resident transplant target needs a
+// PARAM_LAYOUT at these axes with the routed experts REMOVED, and it must be THIS header rather than a
+// copy. It is not a different model: the sidecar holds the same 512 experts per layer, in the source's
+// own encoding, and the engine dequantizes them back to the identical floats on demand (which is what
+// WP4e's bitwise gate proves). Default false, so tests/qwen4_real_shape_tests.cpp's 48-layer census and
+// the original f32 transplant are untouched.
+#ifndef SUB0_MOE_QUANT_EXPERTS
+#define SUB0_MOE_QUANT_EXPERTS 0
+#endif
+constexpr bool MOE_QUANT_EXPERTS = (SUB0_MOE_QUANT_EXPERTS != 0);
 constexpr int  QSA_INDEXER_N_HEADS       = 4;     // indexer_n_heads
 constexpr int  QSA_INDEXER_KV_HEADS      = 1;     // indexer_kv_heads
 constexpr int  QSA_INDEXER_HEAD_DIM      = 128;   // indexer_head_dim

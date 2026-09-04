@@ -24,6 +24,7 @@
 #include "sub0/gdn_math.hpp"        // Gated DeltaNet Stage 1 forward math (sub0::gdn::forward/recurrence_step)
 #include "sub0/gated_residual_math.hpp"  // Gated Residual Stage 1 forward math (sub0::gr::hc_norm/mix/gate/combine/tile)
 #include "sub0/moe_math.hpp"         // Mixture of Experts Stage 1 forward math (sub0::moe::forward_row/forward)
+#include "sub0/moe_quant.hpp"        // WP4e: quantized-resident routed experts + the dequant-on-demand pool
 #include "sub0/qsa_math.hpp"         // QSA Stage 1 forward math (sub0::qsa::forward/indexer_*/attn_*)
 #include "sub0/layout.hpp"
 #include "sub0/muon.hpp"
@@ -243,6 +244,37 @@ static void ensure_shared_params() {
     std::abort();
 }
 
+// --- WP4e: the quantized-resident routed experts, and the pool they are resolved through ----------
+//
+// docs/WP4_SCOPE.md WP4e. Under MOE_QUANT_EXPERTS the 512 routed experts per layer are NOT in
+// g_param_data at all -- they sit in an S0Q1 sidecar in their own native GGUF encoding, and the ten
+// EXPERTS_PER_TOK a token actually selects are dequantized into this pool immediately before
+// moe::expert_ffn_row consumes them.
+//
+// WHY A POOL AND NOT A PER-CALL BUFFER (AGENTS.md S1). This runs per selected expert per token, so it
+// is as hot as anything in this file. One expert is 3 * D_MODEL * D_FF floats -- 18.75 MiB at the real
+// axes -- which is neither a stack array nor something that may live in the DLL's static image (see
+// g_param_data's own comment on SizeOfImage), so it is a lazily heap-allocated pool sized by a
+// COMPILE-TIME slot count, allocated once and reused for the life of the process.
+//
+// WHY 8 SLOTS. Correctness needs exactly ONE: expert_ffn_row consumes a resolved expert before the next
+// resolve happens, and nothing holds a pointer across calls. Every further slot is a pure cache, and it
+// is a cache with a real hit rate rather than a speculative one: op_moe runs all T rows of a window
+// through the SAME layer, each picking 10 of 512, so rows that agree on an expert pay for one dequant
+// instead of T. 8 is chosen against EXPERTS_PER_TOK's own real value (10) -- comfortably more than the
+// 1 correctness requires, and small enough (150 MiB at the real axes) to stay a rounding error against
+// the 5.9 GiB of f32 the same build no longer has to hold. It is a constant here, not a CLI knob,
+// because nothing consumes a knob (AGENTS.md S8) and it cannot change the answer.
+inline constexpr int    MOE_RESOLVE_SLOTS      = USE_MOE_QUANT ? 8 : 1;
+// gate/up are [D_MODEL, D_FF] and down is [D_FF, D_MODEL] -- the same element count either way, so one
+// slot width serves all three planes.
+inline constexpr size_t MOE_EXPERT_SLOT_FLOATS = static_cast<size_t>(D_MODEL) * D_FF;
+using MoeExpertCache = moeq::ExpertCache<MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
+// The sidecar itself: read once by load_model, immutable thereafter (this is a forward-only build by
+// construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
+// threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.
+static moeq::Store g_moe_quant;
+
 struct ParamView { size_t off, n; bool decay; };
 
 // All per-thread state for a data-parallel window lives in one Worker. Workers are a pool indexed
@@ -263,6 +295,11 @@ struct Worker {
     std::array<Node, NUM_PARAMS>    param_nodes{}; // parameter leaves (data->shared, grad->this)
     std::array<Node, MAX_NODES>     pool{};        // forward-graph node pool
     std::array<ParamView, NUM_PARAMS> views{};     // optimizer parameter spans
+    // WP4e: this thread's dequantize-on-demand expert pool. A member (not a global) because it is
+    // MUTABLE scratch and Workers are the per-thread scratch owner here; its own storage is lazily
+    // heap-allocated on first use, so a build with MOE_QUANT_EXPERTS off pays a few dozen bytes and
+    // never allocates. See MOE_RESOLVE_SLOTS above for the sizing argument.
+    MoeExpertCache                  moe_cache{};
     size_t act_used = 0, pool_used = 0, pcount = 0, pused = 0;
 };
 static std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers{};
@@ -1690,22 +1727,44 @@ static Node* op_gr_combine(Node* wide, Node* mixer_out, Node* inj) {
 // case to at least name the right input node. No side table: Stage 1 has no backward walking the node
 // pool yet (docs/MOE.md S6), so nothing needs to recover the router/expert/shared-expert tensors from a
 // bare `Node*`.
-static Node* op_moe(Node* x, Layer& L) {
+// WP4e: the one resolver both MoE call sites (this op and forward_one's decode path) share. Under
+// MOE_QUANT_EXPERTS it dequantizes expert `e` out of the sidecar into this Worker's pool; otherwise it
+// simply hands back the f32 parameter nodes' own pointers. Returning a moe::ExpertWeights either way is
+// what lets ONE moe::forward_row_via serve both residency strategies, which is what makes WP4e's
+// bitwise gate structural (see moe_math.hpp's own comment there).
+//
+// The refusal is at the lowest callable seam, per this project's own rule: a decode failure means an
+// unsupported GGML type or a corrupt payload, and continuing would compute with whatever the slot last
+// held -- a plausible answer from the wrong weights, which is the failure mode this whole work package
+// exists to avoid.
+static moe::ExpertWeights moe_resolve(Layer& L, int layer_index, int e) {
+    if constexpr (USE_MOE_QUANT) {
+        const auto r = W->moe_cache.resolve(g_moe_quant, layer_index, e);
+        if (r.gate == nullptr) {
+            std::println(stderr,
+                         "fatal: could not dequantize routed expert {} of layer {} from the S0Q1 "
+                         "sidecar (unsupported GGML type or corrupt payload)", e, layer_index);
+            std::abort();
+        }
+        return {r.gate, r.up, r.down};
+    } else {
+        return {L.moe_gate[static_cast<std::size_t>(e)]->data.data(),
+                L.moe_up[static_cast<std::size_t>(e)]->data.data(),
+                L.moe_down[static_cast<std::size_t>(e)]->data.data()};
+    }
+}
+
+static Node* op_moe(Node* x, Layer& L, int layer_index) {
     const int T = x->rows;
     Node* out = mk_node(Op::Moe, T, D_MODEL);
     out->a = x;
-    std::array<const float*, NUM_EXPERTS_BUF> gate_w{}, up_w{}, down_w{};
-    for (int e = 0; e < NUM_EXPERTS; ++e) {
-        gate_w[static_cast<std::size_t>(e)] = L.moe_gate[static_cast<std::size_t>(e)]->data.data();
-        up_w[static_cast<std::size_t>(e)]   = L.moe_up[static_cast<std::size_t>(e)]->data.data();
-        down_w[static_cast<std::size_t>(e)] = L.moe_down[static_cast<std::size_t>(e)]->data.data();
-    }
+    if constexpr (USE_MOE_QUANT) W->moe_cache.allocate();
     auto [scratch, scratch_g] = arena_alloc(moe::scratch_floats(MOE_DIMS));
-    moe::forward(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
-                 gate_w.data(), up_w.data(), down_w.data(),
-                 L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
-                 L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
-                 out->data.data(), scratch.data());
+    moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
+                     [&](int e) { return moe_resolve(L, layer_index, e); },
+                     L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
+                     L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                     out->data.data(), scratch.data());
     return out;
 }
 
@@ -1853,10 +1912,15 @@ struct Model {
             // routed-expert SwiGLU triples, then the shared expert's own triple + gate projection).
             if constexpr (USE_MOE) {
                 L.moe_router = mk_param(D_MODEL, NUM_EXPERTS, true);
-                for (int e = 0; e < NUM_EXPERTS; ++e) {
-                    L.moe_gate[static_cast<std::size_t>(e)] = mk_param(D_MODEL, D_FF, true);
-                    L.moe_up[static_cast<std::size_t>(e)]   = mk_param(D_MODEL, D_FF, true);
-                    L.moe_down[static_cast<std::size_t>(e)] = mk_param(D_FF, D_MODEL, true);
+                // WP4e: under MOE_QUANT_EXPERTS make_param_layout() emits no routed-expert tensors, so
+                // this mirror must not claim any either -- mk_param walks the same cursor PARAM_LAYOUT
+                // does, and one extra call here would silently shift every subsequent tensor's offset.
+                if constexpr (!USE_MOE_QUANT) {
+                    for (int e = 0; e < NUM_EXPERTS; ++e) {
+                        L.moe_gate[static_cast<std::size_t>(e)] = mk_param(D_MODEL, D_FF, true);
+                        L.moe_up[static_cast<std::size_t>(e)]   = mk_param(D_MODEL, D_FF, true);
+                        L.moe_down[static_cast<std::size_t>(e)] = mk_param(D_FF, D_MODEL, true);
+                    }
                 }
                 L.moe_shared_gate      = mk_param(D_MODEL, D_FF, true);
                 L.moe_shared_up        = mk_param(D_MODEL, D_FF, true);
@@ -1967,10 +2031,16 @@ struct Model {
             // matching every other GEMM weight here, same reasoning GDN's/GR's own projections use.
             if constexpr (USE_MOE) {
                 randn(L.moe_router, 0.02f);
-                for (int e = 0; e < NUM_EXPERTS; ++e) {
-                    randn(L.moe_gate[static_cast<std::size_t>(e)], 0.02f);
-                    randn(L.moe_up[static_cast<std::size_t>(e)], 0.02f);
-                    randn(L.moe_down[static_cast<std::size_t>(e)], 0.02f);
+                // WP4e: a quantized-resident build has no routed-expert parameter nodes to initialize.
+                // Its experts come from the S0Q1 sidecar or they do not exist at all -- there is no
+                // random-init path for them, and that is deliberate: a MOE_QUANT_EXPERTS build is a
+                // real-weight-import build by construction (docs/WP4_SCOPE.md WP4e), not a training one.
+                if constexpr (!USE_MOE_QUANT) {
+                    for (int e = 0; e < NUM_EXPERTS; ++e) {
+                        randn(L.moe_gate[static_cast<std::size_t>(e)], 0.02f);
+                        randn(L.moe_up[static_cast<std::size_t>(e)], 0.02f);
+                        randn(L.moe_down[static_cast<std::size_t>(e)], 0.02f);
+                    }
                 }
                 randn(L.moe_shared_gate, 0.02f); randn(L.moe_shared_up, 0.02f);
                 randn(L.moe_shared_down, 0.02f); randn(L.moe_shared_gate_proj, 0.02f);
@@ -2129,7 +2199,7 @@ struct Model {
                     Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject,
                                        L.ln2, &gr_inj_mlp);
                     if constexpr (USE_MOE) {
-                        f = op_moe(f, L);
+                        f = op_moe(f, L, li);
                     } else if constexpr (USE_GATED_FFN) {
                         Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                         Node* up_pre   = op_linear(f, L.W1, nullptr, q);
@@ -2198,7 +2268,7 @@ struct Model {
             Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2,
                                &gr_inj_mlp);
             if constexpr (USE_MOE) {
-                f = op_moe(f, L);
+                f = op_moe(f, L, li);
             } else if constexpr (USE_GATED_FFN) {
                 Node* gate_pre = op_linear(f, L.Wg, nullptr, q);
                 Node* up_pre   = op_linear(f, L.W1, nullptr, q);
@@ -2279,8 +2349,9 @@ struct Model {
         [[maybe_unused]] float gr_inj[HC_COUNT_BUF];
         // Mixture of Experts (Stage 1, docs/MOE.md S4b) decode-path scratch -- MOE_SCRATCH1 is never
         // zero (see its own comment), unlike GR_MIX_SCRATCH1 above, so no ternary-guard is needed here.
+        // (The NUM_EXPERTS-wide pointer arrays that used to sit here are gone: WP4e's moe_resolve()
+        // hands moe::forward_row_via one expert at a time, so nothing needs a table of all 512.)
         [[maybe_unused]] float moe_scratch[MOE_SCRATCH1];
-        [[maybe_unused]] std::array<const float*, NUM_EXPERTS_BUF> moe_gate_w{}, moe_up_w{}, moe_down_w{};
         // QSA (Stage 1, docs/QSA.md S4b) decode-path scratch. Every bound uses QSA_DIMS_BUF, whose widths
         // are never zero even when QSA is off, so these stay valid array bounds in a QSA-off build
         // (where nothing ever reads them) -- the same never-degenerate idiom GR_MIX_SCRATCH1 needed.
@@ -2524,16 +2595,16 @@ struct Model {
             }
             gr_read_row(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2, a);
             if constexpr (USE_MOE) {
-                for (int e = 0; e < NUM_EXPERTS; ++e) {
-                    moe_gate_w[static_cast<std::size_t>(e)] = L.moe_gate[static_cast<std::size_t>(e)]->data.data();
-                    moe_up_w[static_cast<std::size_t>(e)]   = L.moe_up[static_cast<std::size_t>(e)]->data.data();
-                    moe_down_w[static_cast<std::size_t>(e)] = L.moe_down[static_cast<std::size_t>(e)]->data.data();
-                }
-                moe::forward_row(MOE_DIMS, a, L.moe_router->data.data(),
-                                  moe_gate_w.data(), moe_up_w.data(), moe_down_w.data(),
-                                  L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
-                                  L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
-                                  proj, moe_scratch);
+                // WP4e: the same moe_resolve() op_moe uses, so the decode path and the batched path
+                // resolve experts identically -- which is what keeps forward/forward_one parity (the
+                // check docs/WP4_SCOPE.md S6 records as having caught a real bug in every one of WP1-3)
+                // a check of the MODEL rather than of two different residency strategies.
+                if constexpr (USE_MOE_QUANT) W->moe_cache.allocate();
+                moe::forward_row_via(MOE_DIMS, a, L.moe_router->data.data(),
+                                      [&](int e) { return moe_resolve(L, l, e); },
+                                      L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
+                                      L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                                      proj, moe_scratch);
             } else if constexpr (USE_GATED_FFN) {
                 linear_row(a, L.Wg, nullptr, g1, C, D_FF);
                 linear_row(a, L.W1, nullptr, f1, C, D_FF);
@@ -2728,6 +2799,50 @@ void print_config() {
 bool fast_math() { return FAST_MATH; }
 
 std::size_t trainable_floats() { return PARAM_FLOATS; }
+// WP4e (docs/WP4_SCOPE.md WP4e): open `<model>.moeq`, the quantized-resident routed-expert sidecar, and
+// check it belongs beside THIS blob. Declared in core.hpp; called only by load_model, right after the
+// blob's own header/fingerprint checks pass, so the two files are accepted or refused together.
+//
+// The pairing check is `model_param_floats`, which is the same job ModelHeader::param_floats already
+// does for the blob and for exactly the same reason: a sidecar written for a different build has the
+// right magic and the right shape fields and is still the wrong weights.
+bool load_moe_quant_sidecar(const char* model_path) {
+    if constexpr (!USE_MOE_QUANT) {
+        (void)model_path;
+        return true;    // no sidecar exists, and none is wanted -- every build today takes this branch
+    } else {
+        const std::string path = std::string(model_path) + ".moeq";
+        std::string err;
+        if (!g_moe_quant.open(path, err)) {
+            std::println(stderr,
+                         "error: this build keeps its routed experts quantized-resident "
+                         "(MOE_QUANT_EXPERTS), so it needs the S0Q1 sidecar beside the model: {}",
+                         err);
+            return false;
+        }
+        const moeq::Header& h = g_moe_quant.header();
+        if (h.n_layers != N_LAYERS || h.num_experts != NUM_EXPERTS || h.d_model != D_MODEL ||
+            h.d_ff != D_FF || h.model_param_floats != PARAM_FLOATS) {
+            std::println(stderr,
+                         "error: {} does not belong to this model: sidecar says layers {} experts {} "
+                         "d_model {} d_ff {} param_floats {}; this build is {} / {} / {} / {} / {}",
+                         path, h.n_layers, h.num_experts, h.d_model, h.d_ff, h.model_param_floats,
+                         N_LAYERS, NUM_EXPERTS, D_MODEL, D_FF, PARAM_FLOATS);
+            return false;
+        }
+        std::println("routed experts: {} tensors resident in their native GGUF encoding, {} bytes "
+                     "({:.2f} GiB) -- vs {:.2f} GiB the same experts would occupy as f32; resolve pool "
+                     "{} slots x {} floats ({:.1f} MiB)",
+                     h.n_tensors, h.data_bytes,
+                     static_cast<double>(h.data_bytes) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<double>(h.n_tensors) * MOE_EXPERT_SLOT_FLOATS * 4.0 /
+                         (1024.0 * 1024.0 * 1024.0),
+                     MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOATS,
+                     static_cast<double>(MoeExpertCache::pool_bytes()) / (1024.0 * 1024.0));
+        return true;
+    }
+}
+
 float*      params_ptr()       { ensure_shared_params(); return g_param_data.get(); }
 // reduced grad the optimizer reads / the two AdamW moments -- all three absent under FORWARD_ONLY.
 float*      grad_ptr()         { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the parameter-gradient arena"); else return g_param_grad.get(); }

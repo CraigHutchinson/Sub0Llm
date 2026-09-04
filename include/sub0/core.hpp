@@ -86,6 +86,13 @@ struct Node {
 SUB0_API void build_model();                       // allocate param layout + random init
 [[nodiscard]] SUB0_API bool load_model(const char* path);        // overwrite params from disk
 [[nodiscard]] SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
+// WP4e (docs/WP4_SCOPE.md WP4e): open the quantized-resident routed-expert sidecar that sits beside a
+// model file under MOE_QUANT_EXPERTS -- `<path>.moeq`, an S0Q1 file (include/sub0/moe_quant.hpp). Its
+// only caller is load_model, which is why the path is derived here rather than being a second CLI
+// argument (AGENTS.md S8); it lives on this seam only because the Store it fills is private to the CPU
+// backend's TU, the same reason print_host_memplan is declared here and defined there. A no-op
+// returning true in every build where MOE_QUANT_EXPERTS is off, i.e. every build that exists today.
+[[nodiscard]] SUB0_API bool load_moe_quant_sidecar(const char* model_path);
 SUB0_API void print_config();                      // human-readable config + memory line
 // Host-side memory plan (shared params + one Worker per compute thread), for `sub0llm memplan`. Defined in
 // the CPU backend because the per-thread cost is sizeof(Worker), a type private to that TU.

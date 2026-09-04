@@ -36,10 +36,12 @@
 #include "sub0/gated_residual_math.hpp"
 #include "sub0/gdn_math.hpp"
 #include "sub0/moe_math.hpp"
+#include "sub0/moe_quant.hpp"
 
 #include <CLI/CLI.hpp>
 
 #include <algorithm>
+#include <fstream>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -110,6 +112,14 @@ int main(int argc, char** argv) {
     app.add_option("--model", model_path, "the transplanted S0L5 artifact (qwen4_sub4.bin)")->required();
     app.add_option("--tokens", T, "how many of the six fixture tokens to run (1..6)")
        ->capture_default_str()->check(CLI::Range(1, kT));
+    // WP4e's gate (docs/WP4_SCOPE.md WP4e) is a BITWISE comparison of the logits an all-f32-resident
+    // build produces against a quantized-resident one's. The two are different builds -- MOE_QUANT_EXPERTS
+    // changes PARAM_LAYOUT, so they cannot be one binary -- so the comparison has to happen outside the
+    // process, on the raw [T x VOCAB] f32 array each writes here. Raw floats, no header: the only thing
+    // the gate asks of the file is that two of them be byte-identical.
+    std::string dump_path;
+    app.add_option("--dump-logits", dump_path,
+                   "write forward()'s raw [T x VOCAB] f32 logits to this path (WP4e's bitwise gate)");
     CLI11_PARSE(app, argc, argv);
     // Unbuffered: this run is minutes long and holds 43 GiB resident, so if it dies the partial output
     // IS the finding. A buffered stdout redirected to a file loses all of it.
@@ -177,6 +187,14 @@ int main(int argc, char** argv) {
     std::println("forward: [{} x {}] in {:.2f}s", out->rows, out->cols, fwd_s);
     report_memory("after forward");
     std::vector<float> batched(out->data.begin(), out->data.end());
+    if (!dump_path.empty()) {
+        std::ofstream os(dump_path, std::ios::binary | std::ios::trunc);
+        os.write(reinterpret_cast<const char*>(batched.data()),
+                 static_cast<std::streamsize>(batched.size() * sizeof(float)));
+        if (!os) { std::println(stderr, "FAIL: could not write {}", dump_path); return 5; }
+        std::println("wrote {} ({} floats = {} bytes) for WP4e's bitwise comparison", dump_path,
+                     batched.size(), batched.size() * sizeof(float));
+    }
     for (int t = 0; t < T; ++t) {
         const Stats s = stats_of(batched.data() + static_cast<std::size_t>(t) * VOCAB, VOCAB);
         const auto  am = std::max_element(batched.begin() + static_cast<std::ptrdiff_t>(t) * VOCAB,
@@ -241,6 +259,20 @@ int main(int argc, char** argv) {
             return P + PARAM_LAYOUT[pi++].off;
         };
         std::vector<const float*> eg(NUM_EXPERTS), eu(NUM_EXPERTS), ed(NUM_EXPERTS);
+        // WP4e: in a quantized-resident build the routed experts are not PARAM_LAYOUT tensors, so this
+        // replay opens the sidecar ITSELF rather than borrowing the engine's Store -- keeping it the
+        // independent second derivation it exists to be (it already walks PARAM_LAYOUT with its own
+        // cursor rather than trusting the engine's offsets, for the same reason).
+        moeq::Store replay_store;
+        moeq::ExpertCache<2, static_cast<std::size_t>(D_MODEL) * D_FF> replay_cache;
+        if constexpr (USE_MOE_QUANT) {
+            std::string err;
+            if (!replay_store.open(model_path + ".moeq", err)) {
+                std::println(stderr, "FAIL: replay cannot open the sidecar: {}", err);
+                return 6;
+            }
+            replay_cache.allocate();
+        }
         double worst_h = 0.0, worst_d = 0.0;
         for (int l = 0; l < N_LAYERS; ++l) {
             if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] != LayerMixer::Gdn) break;   // layer 3 (QSA)
@@ -263,10 +295,12 @@ int main(int argc, char** argv) {
             const float* fu = take(PKind::GrMixUp);
             const float* fi = take(PKind::GrBlockInject);
             const float* rt = take(PKind::MoeRouter);
-            for (int e = 0; e < NUM_EXPERTS; ++e) {
-                eg[static_cast<std::size_t>(e)] = take(PKind::MoeGate);
-                eu[static_cast<std::size_t>(e)] = take(PKind::MoeUp);
-                ed[static_cast<std::size_t>(e)] = take(PKind::MoeDown);
+            if constexpr (!USE_MOE_QUANT) {
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    eg[static_cast<std::size_t>(e)] = take(PKind::MoeGate);
+                    eu[static_cast<std::size_t>(e)] = take(PKind::MoeUp);
+                    ed[static_cast<std::size_t>(e)] = take(PKind::MoeDown);
+                }
             }
             const float* sg = take(PKind::MoeSharedGate);
             const float* su = take(PKind::MoeSharedUp);
@@ -287,8 +321,18 @@ int main(int argc, char** argv) {
             gr::hc_norm(GR_DIMS, T, wide.data(), fn, normed.data());
             gr::mix(GR_DIMS, T, normed.data(), fd, fu, mixed.data(), gr_scr.data());
             gr::gate(GR_DIMS, T, normed.data(), fi, inj.data());
-            moe::forward(MOE_DIMS, T, mixed.data(), rt, eg.data(), eu.data(), ed.data(), sg, su, sd, sp,
-                         mixer_out.data(), moe_scr.data());
+            moe::forward_via(MOE_DIMS, T, mixed.data(), rt,
+                             [&](int e) -> moe::ExpertWeights {
+                                 if constexpr (USE_MOE_QUANT) {
+                                     const auto r = replay_cache.resolve(replay_store, l, e);
+                                     return {r.gate, r.up, r.down};
+                                 } else {
+                                     return {eg[static_cast<std::size_t>(e)],
+                                             eu[static_cast<std::size_t>(e)],
+                                             ed[static_cast<std::size_t>(e)]};
+                                 }
+                             },
+                             sg, su, sd, sp, mixer_out.data(), moe_scr.data());
             gr::combine(GR_DIMS, T, wide.data(), mixer_out.data(), inj.data(), wide.data());
 
             double hn = 0.0, dl = 0.0;

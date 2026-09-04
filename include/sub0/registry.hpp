@@ -190,6 +190,7 @@ struct ModelMeta : RunState {
     X(int,         hc_lowrank,      0)    \
     X(int,         num_experts,     0)    \
     X(int,         experts_per_tok, 0)    \
+    X(int,         moe_quant_experts, 0)  \
     X(int,         qsa_idx_n_heads, 0)    \
     X(int,         qsa_idx_kv_heads, 0)   \
     X(int,         qsa_idx_head_dim, 0)   \

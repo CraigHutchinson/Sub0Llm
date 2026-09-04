@@ -59,4 +59,28 @@ inline constexpr std::size_t PARAM_FLOATS = PREFIX_FLOATS + 6'563'840ull + 635'9
 // which is this project's only parameter precision (core.hpp).
 inline constexpr std::size_t PARAM_BYTES = PARAM_FLOATS * 4;        // 46,590,459,520 == 43.4 GiB
 
+// --- WP4e: the same four layers with the routed experts kept quantized-resident -------------------
+//
+// Under MOE_QUANT_EXPERTS the 3*512 routed-expert tensors per layer leave PARAM_LAYOUT entirely (they
+// live in the S0Q1 sidecar in their native encoding -- include/sub0/moe_quant.hpp), so the totals drop
+// by exactly that much and by nothing else. Derived by hand here, like every number above, so the
+// quantized-resident build's own layout is a stated claim the tool asserts rather than whatever the
+// compiler happened to produce:
+//   per layer, removed  3 * 512 tensors                                    =          1,536
+//               floats  512 * (2*2560*640 + 640*2560) = 512 * 4,915,200    =  2,516,582,400
+// Note what does NOT change: the router (2560*512), the shared expert's own triple and gate projection,
+// and every GR/GDN/QSA/embedding tensor. That is the whole scope of WP4e.
+inline constexpr int         QUANT_EXPERT_TENSORS_PER_LAYER = 3 * 512;              // 1,536
+inline constexpr std::size_t QUANT_EXPERT_FLOATS_PER_LAYER  = 512ull * 4'915'200ull;  // 2,516,582,400
+inline constexpr int         QUANT_PREFIX_TENSORS = PREFIX_TENSORS - 4 * QUANT_EXPERT_TENSORS_PER_LAYER;
+                                                                                    // 90
+inline constexpr std::size_t QUANT_PREFIX_FLOATS  = PREFIX_FLOATS - 4 * QUANT_EXPERT_FLOATS_PER_LAYER;
+                                                                                    // 938,773,920
+inline constexpr int         QUANT_NUM_PARAMS   = QUANT_PREFIX_TENSORS + 5;         // 95
+inline constexpr std::size_t QUANT_PARAM_FLOATS =
+    QUANT_PREFIX_FLOATS + 6'563'840ull + 635'947'520ull;                            // 1,581,285,280
+inline constexpr std::size_t QUANT_PARAM_BYTES = QUANT_PARAM_FLOATS * 4;   // 6,325,141,120 == 5.89 GiB
+static_assert(QUANT_NUM_PARAMS == 95 && QUANT_PARAM_FLOATS == 1'581'285'280ull,
+              "the quantized-resident 4-layer totals are a stated claim, not a compiler observation");
+
 }  // namespace sub0::qwen4_sub4

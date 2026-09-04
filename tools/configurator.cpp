@@ -627,6 +627,11 @@ int main(int argc, char** argv) {
     // EXPERTS_PER_TOK selected per token, replacing the FFN block for EVERY layer when on.
     int num_experts        = 0;
     int experts_per_tok    = 0;
+    // WP4e (docs/WP4_SCOPE.md WP4e): keep the routed experts resident as native quantized GGUF bytes in
+    // an S0Q1 sidecar and dequantize only the selected ones per token, instead of transplanting all
+    // NUM_EXPERTS of them to f32 in the model blob. Off = today's behaviour, and the only value any
+    // existing build takes.
+    int moe_quant_experts  = 0;
     // QSA (docs/QSA.md): Stage 0 -- config skeleton, hard-clamped to 0 (off) until Stage 1 relaxes the
     // range. Five axes, all on or off together: the lightning indexer's head geometry plus the token
     // budget / block compression ratio that decide how many key BLOCKS a query may attend to.
@@ -763,6 +768,12 @@ int main(int argc, char** argv) {
                    "Mixture of Experts: top-k routed experts selected per token (0 = off, must match "
                    "--num-experts' on/off state, and must not exceed it)")
        ->capture_default_str()->check(CLI::Range(0, 16));
+    app.add_option("--moe-quant-experts", moe_quant_experts,
+                   "Mixture of Experts (docs/WP4_SCOPE.md WP4e): 1 = keep the routed experts resident in "
+                   "their NATIVE quantized GGUF bytes in an S0Q1 sidecar (<model>.bin.moeq) and "
+                   "dequantize only the --experts-per-tok selected per token; 0 (default) = every expert "
+                   "transplanted to f32 in the model blob. Requires --num-experts")
+       ->capture_default_str()->check(CLI::Range(0, 1));
     // Qwen Sparse Attention (docs/QSA.md): Stage 0 -- every axis hard-clamped to 0. All five must be
     // set together; a half-configured QSA build is refused both here and by layout.hpp's static_assert.
     app.add_option("--qsa-indexer-n-heads", qsa_idx_n_heads,
@@ -1083,6 +1094,13 @@ int main(int argc, char** argv) {
     if (experts_per_tok > num_experts) {
         std::println(stderr, "configure error: experts-per-tok ({}) cannot exceed num-experts ({})",
                      experts_per_tok, num_experts);
+        return 1;
+    }
+    // Mirrors layout.hpp's own USE_MOE_QUANT static_assert as a configure-time diagnostic naming the
+    // flag, the same pattern as every check above.
+    if (moe_quant_experts != 0 && num_experts < 2) {
+        std::println(stderr, "configure error: moe-quant-experts requires MoE to be on (--num-experts "
+                             ">= 2) -- there are no routed experts to keep quantized-resident");
         return 1;
     }
     // QSA: mirrors layout.hpp's own static_asserts as a configure-time diagnostic naming the flags,
@@ -1627,6 +1645,9 @@ int main(int argc, char** argv) {
     // Mixture of Experts Stage 0/1 (layout.hpp's USE_MOE/MOE_DIMS). 0 = off, the default. See docs/MOE.md.
     cos << "constexpr int  NUM_EXPERTS     = " << num_experts << ";\n";
     cos << "constexpr int  EXPERTS_PER_TOK = " << experts_per_tok << ";\n";
+    // WP4e (layout.hpp's USE_MOE_QUANT). 0 = off, the default: every routed expert is an f32
+    // PARAM_LAYOUT tensor, exactly as before. See docs/WP4_SCOPE.md WP4e.
+    cos << "constexpr bool MOE_QUANT_EXPERTS = " << (moe_quant_experts ? "true" : "false") << ";\n";
     // QSA Stage 0/1 (layout.hpp's USE_QSA/QSA_DIMS/MIXER_SCHEDULE). All 0 = off, the default. docs/QSA.md.
     cos << "constexpr int  QSA_INDEXER_N_HEADS       = " << qsa_idx_n_heads << ";\n";
     cos << "constexpr int  QSA_INDEXER_KV_HEADS      = " << qsa_idx_kv_heads << ";\n";
@@ -1840,6 +1861,7 @@ int main(int argc, char** argv) {
     shown.ngram_table_size = ngram_table_size;
     shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;
     shown.num_experts = num_experts; shown.experts_per_tok = experts_per_tok;
+    shown.moe_quant_experts = moe_quant_experts;
     shown.qsa_idx_n_heads = qsa_idx_n_heads; shown.qsa_idx_kv_heads = qsa_idx_kv_heads;
     shown.qsa_idx_head_dim = qsa_idx_head_dim; shown.qsa_idx_budget = qsa_idx_budget;
     shown.qsa_idx_ratio = qsa_idx_ratio;

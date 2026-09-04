@@ -456,6 +456,24 @@ static_assert(EXPERTS_PER_TOK <= moe::TOPK_MAX,
 // degenerate shapes even when USE_MOE is false, so downstream code never needs a separate guard just to
 // declare an array of this width.
 inline constexpr int NUM_EXPERTS_BUF = USE_MOE ? NUM_EXPERTS : 1;
+
+// WP4e (docs/WP4_SCOPE.md WP4e): keep the ROUTED experts resident in their native quantized GGUF bytes
+// in an `S0Q1` sidecar (include/sub0/moe_quant.hpp) instead of as f32 tensors in PARAM_LAYOUT, and
+// dequantize only the EXPERTS_PER_TOK actually selected per token, into a small reused pool.
+//
+// This is a SHAPE-changing axis and therefore needs no ARCH_FINGERPRINT2 bit (rule #1 -- which matters,
+// that word is full since WP4b): a MOE_QUANT_EXPERTS build's PARAM_LAYOUT is strictly missing
+// n_layers * 3 * num_experts tensors, so PARAM_FLOATS discriminates it from an otherwise-identical
+// f32-resident build, exactly the way it discriminates MoE-on from MoE-off. It changes NOTHING about
+// what the model COMPUTES -- the same weights reach moe::expert_ffn_row either way, which is WP4e's own
+// bitwise gate -- only where those weights live between load and use.
+//
+// Off by default and inert unless MoE is on at all (AGENTS.md S4): USE_MOE_QUANT is false in every build
+// that exists today, so make_param_layout() below is byte-identical for all of them.
+inline constexpr bool USE_MOE_QUANT = USE_MOE && MOE_QUANT_EXPERTS;
+static_assert(!MOE_QUANT_EXPERTS || USE_MOE,
+              "MOE_QUANT_EXPERTS is meaningless without MoE: there are no routed experts to keep "
+              "quantized-resident -- see docs/WP4_SCOPE.md WP4e");
 // MoE's per-expert (and shared-expert) SwiGLU intermediate width. Reuses D_FF -- this project's own
 // existing FFN-width knob -- rather than introducing a separate CLI axis: the real model's own
 // moe_intermediate_size (640) and shared_expert_intermediate_size (640) are already equal
@@ -480,15 +498,24 @@ inline constexpr std::size_t MOE_SCRATCH1 = moe::scratch_floats(MOE_DIMS);
 // possible replacement (num_experts=2) needs 2*3 expert tensors + 3 shared-expert tensors + 1 router +
 // 1 shared-gate tensor, each sized D_MODEL*d_ff or larger, which already exceeds the gated dense FFN's own
 // 3 D_MODEL*d_ff tensors -- worked through explicitly in the final report's own arithmetic, not assumed.
+//
+// `quant_experts` (WP4e) drops the routed experts' own floats from the total entirely: under
+// MOE_QUANT_EXPERTS they are not PARAM_LAYOUT tensors at all, they live in the S0Q1 sidecar in their
+// native encoding. Note the delta can then go NEGATIVE against a dense FFN (a MoE layer minus its
+// experts is a router + one shared FFN, which is smaller than a gated dense FFN's three matrices) --
+// so the "strictly positive" property above is a property of the f32-resident form only, and the
+// static_assert that relied on it is scoped accordingly.
 inline constexpr long long moe_param_delta(int n_layers, int d_model, int d_ff, int num_experts,
-                                            int experts_per_tok, bool was_gated_ffn) {
+                                            int experts_per_tok, bool was_gated_ffn,
+                                            bool quant_experts = false) {
     if (num_experts < 2) return 0;
     (void)experts_per_tok;   // EXPERTS_PER_TOK never changes a tensor SHAPE -- see ARCH_FINGERPRINT2 below
     const long long router       = static_cast<long long>(d_model) * num_experts;
     const long long per_expert   = 2LL * d_model * d_ff + static_cast<long long>(d_ff) * d_model;  // gate+up+down
     const long long shared       = 2LL * d_model * d_ff + static_cast<long long>(d_ff) * d_model;  // shared FFN
     const long long shared_gate  = d_model;                                                        // [d_model,1]
-    const long long moe_layer_floats = router + static_cast<long long>(num_experts) * per_expert + shared + shared_gate;
+    const long long routed       = quant_experts ? 0LL : static_cast<long long>(num_experts) * per_expert;
+    const long long moe_layer_floats = router + routed + shared + shared_gate;
     const long long dense_ffn_floats = was_gated_ffn
         ? 3LL * d_model * d_ff                                    // Wg, W1, W2 (SwiGLU, no bias)
         : 2LL * static_cast<long long>(d_model) * d_ff + d_ff + d_model;  // W1,B1,W2,B2 (plain GELU+bias)
@@ -1036,7 +1063,11 @@ consteval int count_num_params() {
         // tensors with MoeRouter (1) + NUM_EXPERTS*(MoeGate,MoeUp,MoeDown) + the shared expert's own
         // SwiGLU triple (3) + MoeSharedGateProj (1), for EVERY layer uniformly (no per-layer schedule,
         // unlike GDN -- MoE is on for the whole model or not at all, see USE_MOE's own comment).
-        if constexpr (USE_MOE) n += 1 + 3 * NUM_EXPERTS + 3 + 1;
+        // WP4e: under MOE_QUANT_EXPERTS the 3*NUM_EXPERTS routed-expert tensors are NOT layout entries
+        // at all -- they live in the S0Q1 sidecar in their native quantized bytes and are resolved on
+        // demand (include/sub0/moe_quant.hpp). The router, the shared expert and its gate projection
+        // stay exactly where they were.
+        if constexpr (USE_MOE) n += 1 + (USE_MOE_QUANT ? 0 : 3 * NUM_EXPERTS) + 3 + 1;
         else                   n += (USE_GATED_FFN ? 3 : 4);
     }
     // The tail: LnF + LmHead + LmBias (untied) or LnF alone (tied) -- MINUS LnF entirely under Gated
@@ -1230,10 +1261,16 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             // full precision. Expert FFN matrices ARE ternary-eligible (ternary=true), matching Wg/W1/W2's
             // own treatment -- they are ordinary GEMM weights, just NUM_EXPERTS independent copies of one.
             add(D_MODEL, NUM_EXPERTS, PKind::MoeRouter, true, false);
-            for (int e = 0; e < NUM_EXPERTS; ++e) {
-                add(D_MODEL, D_FF, PKind::MoeGate, true, true);
-                add(D_MODEL, D_FF, PKind::MoeUp,   true, true);
-                add(D_FF, D_MODEL, PKind::MoeDown, true, true);
+            // WP4e: emitted ONLY in the f32-resident form. Under MOE_QUANT_EXPERTS these 3*NUM_EXPERTS
+            // tensors are the S0Q1 sidecar's whole content and have no PARAM_LAYOUT slot -- the same
+            // "the layout stops emitting a tensor the run does not hold as f32" move WP4b blocker D made
+            // for Ln1/Ln2 and the LnF fix made for the final norm.
+            if constexpr (!USE_MOE_QUANT) {
+                for (int e = 0; e < NUM_EXPERTS; ++e) {
+                    add(D_MODEL, D_FF, PKind::MoeGate, true, true);
+                    add(D_MODEL, D_FF, PKind::MoeUp,   true, true);
+                    add(D_FF, D_MODEL, PKind::MoeDown, true, true);
+                }
             }
             add(D_MODEL, D_FF, PKind::MoeSharedGate, true, true);
             add(D_MODEL, D_FF, PKind::MoeSharedUp,   true, true);

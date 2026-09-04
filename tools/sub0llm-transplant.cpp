@@ -31,6 +31,7 @@
 #include "sub0/gguf.hpp"
 #include "sub0/layout.hpp"
 #include "sub0/model_file.hpp"
+#include "sub0/moe_quant.hpp"
 #include "sub0/transplant.hpp"
 #include "sub4_prefix.hpp"
 
@@ -60,9 +61,15 @@ namespace {
 // the two layouts cannot be compared directly in one translation unit (sub4_prefix.hpp's own comment).
 // The shape test owns the 48-layer half; this is the 4-layer half.
 static_assert(N_LAYERS == 4, "this tool targets the 4-layer real sub-stack -- see the header comment");
-static_assert(NUM_PARAMS == qwen4_sub4::NUM_PARAMS);
-static_assert(PARAM_FLOATS == qwen4_sub4::PARAM_FLOATS);
-static_assert(PARAM_LAYOUT[qwen4_sub4::PREFIX_TENSORS].off == qwen4_sub4::PREFIX_FLOATS,
+// WP4e: the same claim in both residency forms. The quantized-resident totals are NOT a weakening of
+// the "this is layers 0-3 of the real model" argument -- they are the same hand-derived prefix minus
+// exactly the routed-expert tensors that moved to the sidecar, which sub4_prefix.hpp states explicitly.
+static_assert(NUM_PARAMS == (USE_MOE_QUANT ? qwen4_sub4::QUANT_NUM_PARAMS : qwen4_sub4::NUM_PARAMS));
+static_assert(PARAM_FLOATS == (USE_MOE_QUANT ? qwen4_sub4::QUANT_PARAM_FLOATS
+                                              : qwen4_sub4::PARAM_FLOATS));
+static_assert(PARAM_LAYOUT[USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_TENSORS
+                                          : qwen4_sub4::PREFIX_TENSORS].off ==
+                  (USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_FLOATS : qwen4_sub4::PREFIX_FLOATS),
               "layers 0-3 must occupy exactly the float span the 48-layer real-shape test also "
               "asserts -- otherwise this artifact is not a sub-stack of the real model");
 static_assert(MIXER_SCHEDULE[0] == LayerMixer::Gdn && MIXER_SCHEDULE[3] == LayerMixer::Qsa,
@@ -141,10 +148,15 @@ std::vector<Slot> build_plan() {
         add(Dest::GrFfnUp,     PKind::GrMixUp,       l, HC_LOWRANK, WIDE);
         add(Dest::GrFfnInject, PKind::GrBlockInject, l, WIDE, HC_COUNT);
         add(Dest::MoeRouter, PKind::MoeRouter, l, D_MODEL, NUM_EXPERTS);
-        for (int e = 0; e < NUM_EXPERTS; ++e) {
-            add(Dest::MoeGate, PKind::MoeGate, l, D_MODEL, D_FF, e);
-            add(Dest::MoeUp,   PKind::MoeUp,   l, D_MODEL, D_FF, e);
-            add(Dest::MoeDown, PKind::MoeDown, l, D_FF, D_MODEL, e);
+        // WP4e: in a MOE_QUANT_EXPERTS build these are not f32 destinations at all -- they go to the
+        // S0Q1 sidecar in their native encoding (write_moe_sidecar below), and make_param_layout()
+        // emits no slot for them, so this mirror must not either.
+        if constexpr (!USE_MOE_QUANT) {
+            for (int e = 0; e < NUM_EXPERTS; ++e) {
+                add(Dest::MoeGate, PKind::MoeGate, l, D_MODEL, D_FF, e);
+                add(Dest::MoeUp,   PKind::MoeUp,   l, D_MODEL, D_FF, e);
+                add(Dest::MoeDown, PKind::MoeDown, l, D_FF, D_MODEL, e);
+            }
         }
         add(Dest::MoeSharedGate,     PKind::MoeSharedGate,     l, D_MODEL, D_FF);
         add(Dest::MoeSharedUp,       PKind::MoeSharedUp,       l, D_MODEL, D_FF);
@@ -230,6 +242,134 @@ struct Totals {
     std::uint64_t dest_tensors = 0, dest_floats = 0, src_bytes_read = 0;
     int synthesized = 0, stats_checked = 0, stats_failed = 0;
 };
+
+// --- WP4e: the quantized-resident routed-expert sidecar --------------------------------------------
+//
+// Writes `<out>.moeq` (include/sub0/moe_quant.hpp's S0Q1 format): every routed expert's own slice of
+// blk.N.ffn_{gate,up,down}_exps.weight, copied VERBATIM -- the source shard's own bytes, in the source's
+// own encoding, never re-quantized. The engine dequantizes them back on demand with the same
+// gguf::to_f32 + transpose_out_in this file's f32 path uses, which is what makes the two forms produce
+// bit-identical floats (see moe_quant.hpp's header comment).
+//
+// Only compiled into a MOE_QUANT_EXPERTS build; the ordinary transplant target never calls it.
+struct MoeSidecarTotals {
+    std::uint64_t tensors = 0, bytes = 0, f32_bytes_avoided = 0;
+    std::map<std::uint32_t, std::uint64_t> by_type;   // raw GGML type id -> tensors, for the report
+};
+
+// The three GGUF names an expert's planes come from, in moeq::Which order. Deliberately re-derived from
+// transplant.hpp's own recipe table rather than re-spelled here: one source of truth for the names.
+const char* expert_src_pattern(int which) {
+    switch (which) {
+        case moeq::Gate: return recipe_for(Dest::MoeGate).src;
+        case moeq::Up:   return recipe_for(Dest::MoeUp).src;
+        default:         return recipe_for(Dest::MoeDown).src;
+    }
+}
+
+bool write_moe_sidecar(const std::string& path, std::map<std::string, Source>& by_name,
+                        std::map<const Shard*, std::ifstream>& handles, MoeSidecarTotals& tot,
+                        bool dry_run) {
+    // Pass 1: build the descriptor table (and validate every source) before opening the output, so a
+    // missing/unslicable tensor fails loudly instead of leaving a half-written multi-GB file.
+    std::vector<moeq::Desc> descs(static_cast<std::size_t>(N_LAYERS) * NUM_EXPERTS * moeq::PerExpert);
+    std::vector<const gguf::TensorInfo*> srcs(descs.size(), nullptr);
+    std::vector<Source*> src_entries(descs.size(), nullptr);
+    for (int l = 0; l < N_LAYERS; ++l) {
+        for (int w = 0; w < moeq::PerExpert; ++w) {
+            const std::string name = gguf_name(expert_src_pattern(w), l);
+            auto it = by_name.find(name);
+            if (it == by_name.end()) {
+                std::println(stderr, "error: sidecar wants missing source tensor '{}'", name);
+                return false;
+            }
+            it->second.consumed = true;
+            const gguf::TensorInfo& t = it->second.info;
+            // A routed-expert stack is 3-D: ne = {in, out, n_experts}.
+            if (t.dims.size() != 3 || static_cast<int>(t.dims[2]) != NUM_EXPERTS) {
+                std::println(stderr, "error: '{}' is not a [{}-expert] 3-D stack (dims {})", name,
+                             NUM_EXPERTS, t.dims.size());
+                return false;
+            }
+            const std::uint64_t in_f = t.dims[0], out_f = t.dims[1], per = in_f * out_f;
+            for (int e = 0; e < NUM_EXPERTS; ++e) {
+                const moeq::ByteRange r = moeq::expert_byte_range(t.type_raw, per, e);
+                if (r.bytes == 0) {
+                    std::println(stderr,
+                                 "error: '{}' expert {}: {} elements per expert is not a whole number "
+                                 "of blocks for GGML type {} -- a misaligned slice would decode a "
+                                 "neighbouring expert's values",
+                                 name, e, per, t.type_raw);
+                    return false;
+                }
+                const std::size_t idx =
+                    static_cast<std::size_t>(moeq::desc_index(NUM_EXPERTS, l, e, w));
+                // NOTE: `off` is deliberately NOT assigned here. This loop walks (layer, plane, expert)
+                // while the payload is written in DESCRIPTOR-INDEX order (layer, expert, plane) below,
+                // and assigning a running cursor here made every descriptor point at the position it
+                // would have had in the OTHER order -- a real bug, caught by the bit-for-bit sample
+                // check further down (92 of 96 planes mismatched; the handful that agreed were the ones
+                // the two orders happen to place identically). Offsets are assigned in one pass over
+                // the finished table, in exactly the order the bytes are written.
+                descs[idx] = moeq::Desc{t.type_raw, static_cast<std::uint32_t>(in_f),
+                                        static_cast<std::uint32_t>(out_f), 0, 0, r.bytes};
+                srcs[idx] = &t;
+                src_entries[idx] = &it->second;
+                ++tot.tensors;
+                tot.bytes += r.bytes;
+                tot.f32_bytes_avoided += per * 4;
+                ++tot.by_type[t.type_raw];
+            }
+        }
+    }
+    std::uint64_t cursor = 0;
+    for (moeq::Desc& d : descs) { d.off = cursor; cursor += d.bytes; }
+
+    moeq::Header h;
+    h.n_layers = N_LAYERS;
+    h.num_experts = NUM_EXPERTS;
+    h.d_model = D_MODEL;
+    h.d_ff = D_FF;
+    h.n_tensors = descs.size();
+    h.data_off = sizeof(moeq::Header) + descs.size() * sizeof(moeq::Desc);
+    h.data_bytes = cursor;
+    h.model_param_floats = PARAM_FLOATS;
+    if (dry_run) return true;
+
+    std::ofstream os(path, std::ios::binary | std::ios::trunc);
+    if (!os) { std::println(stderr, "error: cannot create {}", path); return false; }
+    os.write(reinterpret_cast<const char*>(&h), sizeof h);
+    os.write(reinterpret_cast<const char*>(descs.data()),
+             static_cast<std::streamsize>(descs.size() * sizeof(moeq::Desc)));
+    // Pass 2: copy the bytes, in descriptor order (which is the order the offsets were assigned, so the
+    // writes are sequential). No decode, no re-encode -- this is the whole point.
+    std::vector<std::uint8_t> buf;
+    for (std::size_t i = 0; i < descs.size(); ++i) {
+        const moeq::Desc& d = descs[i];
+        Source& s = *src_entries[i];
+        // The expert's byte range starts at the tensor's own data offset plus its slice offset -- the
+        // same arithmetic read_range() does for the f32 path, and expert_byte_range() is the shared
+        // derivation of the slice part, so the two cannot disagree.
+        const moeq::ByteRange r = moeq::expert_byte_range(
+            d.type_raw, static_cast<std::uint64_t>(d.in_f) * d.out_f,
+            static_cast<int>((i / moeq::PerExpert) % NUM_EXPERTS));
+        const std::uint64_t off = s.shard->data_offset + srcs[i]->offset + r.off;
+        buf.assign(static_cast<std::size_t>(d.bytes), 0);
+        std::ifstream& f = handles[s.shard];
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(off));
+        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
+        if (static_cast<std::uint64_t>(f.gcount()) != d.bytes) {
+            std::println(stderr, "error: short read for sidecar tensor {} ({} of {} bytes at {})", i,
+                         static_cast<std::uint64_t>(f.gcount()), d.bytes, off);
+            return false;
+        }
+        os.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(d.bytes));
+        if (!os) { std::println(stderr, "error: sidecar write failed at tensor {}", i); return false; }
+    }
+    os.flush();
+    return static_cast<bool>(os);
+}
 
 }  // namespace
 
@@ -466,6 +606,72 @@ int main(int argc, char** argv) {
         if (!os) { std::println(stderr, "error: trailer write failed"); return 4; }
     }
 
+    // --- WP4e: the routed-expert sidecar ------------------------------------------------------------
+    // Written AFTER the blob, from the same indexed sources and the same open handles. In an f32
+    // (MOE_QUANT_EXPERTS-off) build this whole block compiles away and nothing changes.
+    MoeSidecarTotals moe_tot;
+    std::string moeq_path;
+    if constexpr (USE_MOE_QUANT) {
+        moeq_path = (dry_run ? (verify_path.empty() ? out_path : verify_path) : out_path) + ".moeq";
+        if (!write_moe_sidecar(moeq_path, by_name, handles, moe_tot, dry_run)) return 13;
+
+        // The claim this format rests on, checked rather than asserted: dequantizing an expert OUT of
+        // the sidecar reproduces, BIT FOR BIT, the f32 the ordinary transplant path would have written
+        // for the same expert (read_range + transpose_out_in, above). Both sides run here on the same
+        // machine from the same source bytes, so an exact comparison is the right one -- anything less
+        // would hide precisely the kind of slice/transpose/format slip this is for.
+        //
+        // A sample, not all 6,144: the first kSidecarCheckExperts experts of EVERY layer, all three
+        // planes. That spans every format the real file's per-layer mixed quantization actually uses at
+        // this scale (layers 0/3 IQ1_S gate/up, layers 1/2 IQ2_XXS, IQ4_NL down throughout -- see
+        // docs/WP4_SCOPE.md S3a-bis) while staying seconds rather than minutes. The END-TO-END bitwise
+        // gate is the real proof; this localizes a failure to one tensor if that gate ever fails.
+        constexpr int kSidecarCheckExperts = 8;
+        if (!dry_run) {
+            moeq::Store store;
+            std::string err;
+            if (!store.open(moeq_path, err)) {
+                std::println(stderr, "error: cannot re-open the sidecar just written: {}", err);
+                return 13;
+            }
+            std::vector<float> from_sidecar, sc_scratch, from_gguf;
+            std::uint64_t checked = 0, mismatched = 0;
+            for (int l = 0; l < N_LAYERS; ++l)
+                for (int e = 0; e < kSidecarCheckExperts && e < NUM_EXPERTS; ++e)
+                    for (int w = 0; w < moeq::PerExpert; ++w) {
+                        const moeq::Desc& d = store.desc(l, e, w);
+                        const std::size_t n = static_cast<std::size_t>(d.in_f) * d.out_f;
+                        from_sidecar.assign(n, 0.f);
+                        if (!moeq::dequantize_expert(d, store.raw(d), from_sidecar.data(), sc_scratch)) {
+                            std::println(stderr, "error: sidecar decode failed at layer {} expert {} "
+                                                 "plane {}", l, e, w);
+                            return 13;
+                        }
+                        const std::string name = gguf_name(expert_src_pattern(w), l);
+                        const gguf::TensorInfo& t = by_name.find(name)->second.info;
+                        const Source& s = by_name.find(name)->second;
+                        if (!read_range(handles[s.shard], *s.shard, t,
+                                        static_cast<std::uint64_t>(e) * n, n, raw, src))
+                            return 13;
+                        from_gguf.assign(n, 0.f);
+                        transpose_out_in(src.data(), static_cast<int>(d.out_f),
+                                          static_cast<int>(d.in_f), from_gguf.data());
+                        ++checked;
+                        if (std::memcmp(from_gguf.data(), from_sidecar.data(), n * sizeof(float)) != 0) {
+                            ++mismatched;
+                            if (mismatched <= 5)
+                                std::println(stderr, "SIDECAR MISMATCH layer {} expert {} plane {} "
+                                                     "(GGML type {})", l, e, w, d.type_raw);
+                        }
+                    }
+            std::println("");
+            std::println("--- WP4e: sidecar bit-for-bit sample check ------------------------------");
+            std::println("expert planes compared against the f32 path: {}", checked);
+            std::println("mismatches                                  : {}", mismatched);
+            if (mismatched != 0) return 13;
+        }
+    }
+
     // --- LEVEL 1: reconciliation --------------------------------------------------------------------
     // Every destination consumed exactly once (guaranteed by the single pass over PARAM_LAYOUT above),
     // and every source that is IN SCOPE consumed. The unmatched list is printed in full rather than
@@ -504,6 +710,23 @@ int main(int argc, char** argv) {
                      verify_mismatches, NUM_PARAMS, verify_path);
     if (!dry_run) std::println("wrote {} ({} bytes incl. header + trailers)", out_path,
                                sizeof(ModelHeader) + PARAM_FLOATS * 4 + 24);
+    if constexpr (USE_MOE_QUANT) {
+        std::println("--- WP4e: quantized-resident routed experts ------------------------------");
+        std::println("sidecar                  : {}", moeq_path);
+        std::println("expert tensors           : {}", moe_tot.tensors);
+        std::println("native encoded bytes     : {} ({:.3f} GiB)", moe_tot.bytes,
+                     static_cast<double>(moe_tot.bytes) / (1024.0 * 1024.0 * 1024.0));
+        std::println("the same experts as f32  : {} ({:.3f} GiB)  -- ratio {:.2f}x",
+                     moe_tot.f32_bytes_avoided,
+                     static_cast<double>(moe_tot.f32_bytes_avoided) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<double>(moe_tot.f32_bytes_avoided) /
+                         static_cast<double>(moe_tot.bytes ? moe_tot.bytes : 1));
+        // Per-format tensor counts, printed rather than assumed: unsloth's per-LAYER mixed quantization
+        // (docs/WP4_SCOPE.md S3a-bis) is the reason every Desc carries its own type_raw, and this line is
+        // the operator-visible evidence that more than one format really is present.
+        for (const auto& [type, n] : moe_tot.by_type)
+            std::println("  GGML type {:>2} : {:>6} expert planes", type, n);
+    }
 
     if (tot.dest_tensors != static_cast<std::uint64_t>(NUM_PARAMS)) return 9;
     if (tot.dest_floats != PARAM_FLOATS) return 9;
