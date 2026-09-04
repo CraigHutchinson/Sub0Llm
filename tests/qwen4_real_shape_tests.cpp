@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/layout.hpp"
+#include "sub4_prefix.hpp"
 
 #include <cstddef>
 
@@ -194,6 +195,31 @@ static_assert(sub0::NUM_PARAMS == kExpectedNumParams,
 static_assert(sub0::PARAM_FLOATS == kRealParamFloats,
               "make_param_layout() at Qwen3.8-Flash-Next's real axes must total the REAL model's own "
               "parameter count -- docs/WP4_SCOPE.md S0's 1,683,278,184-float shape gap, closed");
+
+// --- WP4c: the 4-layer sub-stack really is layers 0-3 of this model ------------------------------
+// The offline transplant tool (tools/sub0llm-transplant.cpp) compiles the SAME axes header with
+// N_LAYERS = 4 and fills a 4-layer PARAM_LAYOUT. That is only a faithful sub-stack of the real model
+// if its tensors are, entry for entry, the real model's first four layers -- and the two layouts
+// cannot be compared in one TU (see sub4_prefix.hpp's own header comment for why). This half of the
+// claim lives here; the tool asserts the matching half against the same two literals.
+//
+// PARAM_LAYOUT[PREFIX_TENSORS] is the FIRST tensor after layers 0-3: layer 4's leading GR tensor here,
+// the model-level GR exit's leading tensor in the tool's build. Its float offset is the total the four
+// layers occupy, so equality means both builds lay those four layers out identically.
+static_assert(sub0::PARAM_LAYOUT[sub0::qwen4_sub4::PREFIX_TENSORS].off == sub0::qwen4_sub4::PREFIX_FLOATS,
+              "the real 48-layer layout's first four layers must occupy exactly the float span the "
+              "4-layer transplant target claims -- if these disagree, the transplanted artifact is not "
+              "a sub-stack of this model");
+// ...and the boundary really is a layer boundary, not an accident of arithmetic: entry PREFIX_TENSORS
+// is a GR hc_norm (the first tensor of layer 4's attn_hyper_connection) and the entry before it is the
+// last of layer 3's MoE block.
+static_assert(sub0::PARAM_LAYOUT[sub0::qwen4_sub4::PREFIX_TENSORS].kind == sub0::PKind::GrHcNorm);
+static_assert(sub0::PARAM_LAYOUT[sub0::qwen4_sub4::PREFIX_TENSORS - 1].kind == sub0::PKind::MoeSharedGateProj);
+// Layer 3 is the QSA layer -- the reason a 4-layer sub-stack exercises every mechanism at all.
+static_assert(sub0::MIXER_SCHEDULE[0] == sub0::LayerMixer::Gdn);
+static_assert(sub0::MIXER_SCHEDULE[1] == sub0::LayerMixer::Gdn);
+static_assert(sub0::MIXER_SCHEDULE[2] == sub0::LayerMixer::Gdn);
+static_assert(sub0::MIXER_SCHEDULE[3] == sub0::LayerMixer::Qsa);
 
 // A single Catch2 case so a run REPORTS the numbers rather than only the build succeeding. Everything
 // above already failed the compile if it was wrong; this exists to print the census.

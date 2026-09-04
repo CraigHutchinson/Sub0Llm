@@ -23,8 +23,22 @@
 
 #pragma once
 
+// WP4c: N_LAYERS is the ONE axis a consumer may override, via -DSUB0_QWEN4_LAYERS=<n>. The offline
+// transplant tool (tools/sub0llm-transplant.cpp) targets the real model's 4-layer repeating sub-stack
+// (docs/WP4_SCOPE.md S7 Q3) and needs a PARAM_LAYOUT at exactly these axes with N_LAYERS = 4 -- and it
+// must be THIS header, not a copy: the real RunConfig has one source of truth or it has none, and a
+// tools/-local duplicate is precisely how two spellings of one architecture drift apart.
+//
+// Every other axis stays fixed, which is what makes a 4-layer build a genuine SUB-STACK rather than a
+// different model: GDN_FULL_ATTN_STRIDE = 4 means layers 0..3 are GDN,GDN,GDN,QSA -- the real 48-layer
+// stack's own repeating unit, layer-index-identical to its first four. sub4_prefix.hpp pins that
+// equality as a compile-time claim rather than an argument.
+#ifndef SUB0_QWEN4_LAYERS
+#define SUB0_QWEN4_LAYERS 48
+#endif
+
 constexpr int  D_MODEL     = 2560;    // hidden_size
-constexpr int  N_LAYERS    = 48;      // num_hidden_layers
+constexpr int  N_LAYERS    = SUB0_QWEN4_LAYERS;   // num_hidden_layers (48; see the override note above)
 constexpr int  N_HEADS     = 24;      // num_attention_heads
 constexpr int  N_KV_HEADS  = 2;       // num_key_value_heads
 constexpr int  LOOP_MIDDLE_LAYERS = 0;   // LoopSplit is this project's own axis; the real model has none

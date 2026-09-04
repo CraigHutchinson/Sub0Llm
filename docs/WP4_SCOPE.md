@@ -458,6 +458,130 @@ prefill scratch is **417.5 MiB**, growing linearly (≈1.63 GiB at T=16,384; ≈
 **Prefill must be chunked, and the chunk length is a first-class decision for this stage**, not something
 to discover at run time.
 
+#### WP4c — EXECUTED (branch `feature/wp4c-transplant`). Results, recorded rather than summarised
+
+**The artifact exists and verifies.** `tools/sub0llm-transplant.cpp`, compiled against
+`tests/qwen4_real_axes/sub0_config.hpp` with `-DSUB0_QWEN4_LAYERS=4`, produced
+`D:\ModelWeights\Sub0Llm-Qwen4-sub4\qwen4_sub4.bin`: **46,590,469,832 bytes** (48-byte `S0L5` header +
+**11,647,617,440 floats = 46,590,469,760 bytes** + the three 8-byte trailers), from **4,418,181,760
+bytes** of encoded GGUF read out of the real `UD-IQ1_S` shards. That is a **10.5x expansion**, which is
+the honest cost of this engine having no quantized inference path: `UD-IQ1_S`'s whole point is that the
+weights are 1-2 bits, and every one of them lands as an f32 here.
+
+| Destination region | Tensors | Floats | Bytes (f32) |
+|---|---:|---:|---:|
+| `tok_emb` | 1 | 635,699,200 | 2,542,796,800 |
+| layers 0-2 (GDN), each | 1,558 | 2,593,979,104 | 10,375,916,416 |
+| layer 3 (QSA) | 1,559 | 2,587,467,008 | 10,349,868,032 |
+| GR exit + `ln_f` + `lm_head` + `lm_bias` | 6 | 642,513,920 | 2,570,055,680 |
+| **total** | **6,240** | **11,647,617,440** | **46,590,469,760** |
+
+MoE dominates completely: 2,522,810,880 of each layer's 2,593,979,104 floats (**97.3%**) are the 512
+routed experts plus the shared expert. The four mechanisms' own weights are the remaining 2.7%.
+
+**The four-level gate, with the actual numbers:**
+
+| Level | Check | Result |
+|---|---|---|
+| 1 | total-count reconciliation | 6,240 / 6,240 destinations filled, 11,647,617,440 / 11,647,617,440 floats; **2 synthesized** (`LnF`, `LmBias` — see below); **7 unmatched in-scope sources**, every one a deliberately-excluded PLE tensor |
+| 2 | per-tensor statistics across the reshape | **6,238 tensors checked, 0 mismatches** (count and extrema compared EXACTLY, mean/std to 1e-6 relative) |
+| 3 | layer-0 (GDN) fixture replay through the transplant | max \|transplanted − real reference\| = **4.37e-11** |
+| 4 | layer-3 (QSA) fixture replay through the transplant | max \|transplanted − real reference\| = **1.86e-09** |
+
+Levels 3 and 4 match what `gdn_qwen4_fixture_tests.cpp` and `qsa_qwen4_fixture_tests.cpp` already
+record for the same fixtures, i.e. **the transplant path contributes nothing** — which is the claim.
+They are real replays, not shape checks: each re-encodes the fixture as a GGUF file under the REAL
+model's own tensor names and in GGUF's byte order, which forces the test to perform the INVERSE of
+each granularity change before the transplant undoes it.
+
+**Level 2 provably cannot see an identity swap**, so each replay carries a mutation check. Measured:
+an `ssm_alpha`/`ssm_beta` swap moves layer 0's output by **4.1e-8**; a down-the-middle `q|gate` split
+moves layer 3's by **8.5e-3**; a swapped indexer concat order moves it by **7.4e-3** while being
+*statistically identical* to the correct one. The first of those is worth flagging: 4.1e-8 is ~950x the
+reference agreement, so it IS detectable — but it is a weak signal, and A_log/dt_bias/alpha/beta all
+feed gates through `softplus`/`sigmoid`, which is exactly why the original dt_bias/A_log swap survived
+both a fixture test and a gradient check.
+
+**A fifth check, beyond §4c**: `--verify` re-runs the entire pipeline against the written file and
+compares every destination **bit-for-bit**. Result: **0 mismatches of 6,240**. Levels 1-4 validate what
+the tool computes; only this validates what landed on disk.
+
+**And the independent shape check** (this stage's item 4): the tool `static_assert`s `NUM_PARAMS`,
+`PARAM_FLOATS` and `PARAM_LAYOUT[6234].off` against `tests/qwen4_real_axes/sub4_prefix.hpp`, and
+`tests/qwen4_real_shape_tests.cpp` asserts the SAME three literals against the real **48-layer**
+layout. The two layouts cannot meet in one translation unit (ODR), so this is how "the 4-layer artifact
+is layers 0-3 of the real model" becomes a compile-time claim: both builds agree that those four layers
+occupy exactly **11,005,103,520** floats, and the 48-layer build additionally confirms the boundary
+tensor is layer 4's leading `GrHcNorm`.
+
+**What the real file said that this document had wrong.** Every item below is a correction to §3a-bis's
+own table, found by reading the file rather than trusting the table:
+
+1. **MoE needs no pair reconstruction at all.** §3a-bis called `ffn_gate_exps`/`ffn_up_exps` a split of
+   a fused `gate_up_proj` requiring concatenation. That fusion is the *HF/safetensors* granularity —
+   **this engine already stores `MoeGate` and `MoeUp` as separate `PARAM_LAYOUT` tensors**, so GGUF's
+   granularity and the destination's coincide exactly. What is actually needed is the 3-D **expert
+   slice**: one source tensor supplies 512 destinations.
+2. **QSA's `attn_q` is a SPLIT, not a concat — and per head.** §3a-bis listed only the indexer as a
+   granularity mismatch. `blk.N.attn_q.weight` is `[2560, 12288]`, the fused query+gate, and this
+   engine stores `QsaQProj`/`QsaGateProj` separately, so the transplant must *split* it — with head
+   *h*'s rows being `[query_h | gate_h]` adjacent, per `docs/QSA.md` §1b's `.view(..., head_dim*2)`
+   then `chunk`. A down-the-middle split is right for head 0 and wrong for all 23 others.
+3. **There is no final norm in the file.** `output_norm.weight` does not exist under that or any other
+   name — the only non-`blk.` tensors in the whole 1,224-tensor set are `output.weight`,
+   `output_hc_{down,norm,up}.weight`, `per_layer_token_embd.weight` and `token_embd.weight`. §2 blocker
+   D assumed a real `LnF` counterpart existed and merely had the wrong `eps`. It does not exist at all,
+   which is architecturally coherent (the same reason blocker D removed `Ln1`/`Ln2`: the Gated Residual
+   instance's own `hc_norm` IS the norm at that point). `LnF` is therefore **synthesized to 1.0**, the
+   RMSNorm identity gain, and `LmBias` to 0.0 — both reported by name in level 1, not defaulted
+   silently. **This is a real open question for WP4d**: an identity `LnF` is a no-op, but it is also not
+   what the real model does, because the real model has no such site at all.
+4. **§3a-bis did not list the Gated Residual EXIT instance.** `output_hc_norm/down/up.weight` are in the
+   file, exactly matching `docs/GATED_RESIDUAL.md` §1c's `use_combine=False` model-level instance (three
+   tensors, no inject). Its table only covered `blk.N.hc_*`.
+5. **The PLE is six MORE tensors, not just the big table.** Layer 1 (the real `ple_layer_ids=[2]`
+   site, 0-indexed) additionally carries `ple_conv1d`, `ple_key`, `ple_norm_conv`, `ple_norm_key`,
+   `ple_norm_query` and `ple_value`. §5 excludes "the n-gram/PLE table"; the mechanism is a whole
+   sub-block at that layer, and all seven show up in level 1's unmatched list.
+6. **Two 2-D tensors do NOT transpose**, against §4a's "every 2-D weight transposes":
+   `token_embd.weight` is an `nn.Embedding` table (`[num_embeddings, embedding_dim]`, which IS
+   `TokEmb`'s own `[VOCAB, D_MODEL]`), and `blk.N.ssm_conv1d.weight` is a depthwise `Conv1d`
+   (`ne = [kernel, channels]`, i.e. row-major `[C][K]`, which IS `GdnConv`). Note that
+   `token_embd.weight` and `output.weight` declare **identical** dims and get opposite treatment.
+7. **A naming trap worth stating once**: GGUF's `ne` is fastest-varying-first, so a `[out, in]`
+   row-major PyTorch weight is *declared* `[in, out]` — which reads like this project's own
+   `[rows=in, cols=out]` convention while the bytes are still its transpose. **No shape assertion can
+   catch a missed transpose here**, because the declared shape was never wrong.
+8. **`ssm_alpha` ← `in_proj_a` and `ssm_beta` ← `in_proj_b`** is taken from llama.cpp's own
+   `gguf-py/gguf/tensor_mapping.py` (`MODEL_TENSOR.SSM_ALPHA` → `linear_attn.in_proj_a`), not read off
+   the names. They are same-shaped `[hidden, 48]` vectors feeding different gates — the exact
+   identity-swap shape of `docs/GATED_DELTANET.md` §6's real bug.
+
+Everything else in §3a-bis's table held: all seven new formats are present and needed, the per-layer
+mixed quantization is real (`blk.0`/`blk.3` `ffn_gate_exps` are `IQ1_S`, `blk.1`/`blk.2` are
+`IQ2_XXS`), and every declared shape matched.
+
+**`gguf.hpp`'s seven new formats.** Each block-size rule was cross-checked against the real file by
+differencing consecutive tensors' data offsets — an oracle independent of the struct definitions the
+figures came from — and all seven matched exactly: `Q4_K` 144/256, `Q5_K` 176/256, `Q6_K` 210/256,
+`IQ2_XXS` 66/256, `IQ1_S` 50/256, `IQ4_NL` 18/32, `BF16` 2/1. Decoding real tensors of each gives
+zero-centred, finite, comparable-scale distributions (std 0.0075-0.042, no NaN), which is
+`AGENTS.md` §9's real-file validation rather than fixtures alone.
+
+**Deliberately still open, named here so WP4d does not rediscover them:**
+
+- **`LnF` is synthetic** (see finding 3). WP4d must decide whether an identity gain there reproduces
+  the real model or whether the site should be removed the way `Ln1`/`Ln2` were.
+- **The artifact is f32 and 43.4 GiB for FOUR layers.** Extrapolated, the full 48 would be ~500 GB.
+  The offload machinery of WP4e is not optional at full scale; it is the only way this format works.
+- **`op_rmsnorm`'s `eps` is still 1e-5** against the real model's 1e-6 (carried forward from WP4b).
+- **Nothing has loaded this file.** The engine cannot be built at these axes yet (`Model::forward` at
+  real dims is WP4d), so `load_model`'s own header/fingerprint path has never seen it. The header was
+  checked field by field by reading the written bytes back, and `--verify` confirms the blob, but
+  "the engine accepts it" is an untested claim.
+- **The transplant is single-threaded** and takes ~80s for the write, ~105s for a verify. Fine at this
+  scale; at 48 layers it would be ~20 minutes, which is still fine, so no work is proposed.
+
 ### WP4d — First real forward pass, reduced scope
 
 The smallest thing that is genuinely a real run. **Proposal: a single real decoder layer, then layers
