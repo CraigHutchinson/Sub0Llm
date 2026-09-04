@@ -444,6 +444,374 @@ TEST_CASE("gguf: tensor_bytes returns empty on a truncated/out-of-bounds data se
     CHECK(r.tensor_bytes(*t).empty());
 }
 
+// --- WP4c: the seven formats the REAL Qwen3.8-Flash-Next UD-IQ1_S file uses ------------------------
+//
+// Every case below hand-builds one block, then states the expected floats as an INDEPENDENT
+// derivation -- worked from the format's own bit layout in the test, not by calling the decoder's own
+// helpers. That is the point: a test that re-uses k_scale_min() to predict what k_scale_min() will do
+// proves only self-consistency (the same blind spot
+// [[independent-reimplementation-catches-identity-swap-bugs]] names).
+//
+// These synthetic blocks prove the BIT LAYOUT. They do not prove real-world fidelity -- that came from
+// decoding real tensors out of the actual 49.99GB shard (AGENTS.md S9: "synthetic fixtures prove the
+// parser logic; they don't prove real-world byte-format fidelity"). See docs/WP4_SCOPE.md S3a-ter for
+// those measured per-format distributions.
+
+namespace {
+
+// f16 bit patterns used repeatedly below, spelled out so no test depends on a helper to make its input.
+constexpr std::uint16_t kF16One  = 0x3C00;   // 1.0
+constexpr std::uint16_t kF16Half = 0x3800;   // 0.5
+constexpr std::uint16_t kF16Zero = 0x0000;   // 0.0
+
+void put_u16(std::vector<std::uint8_t>& v, std::size_t at, std::uint16_t x) {
+    v[at] = static_cast<std::uint8_t>(x & 0xFF);
+    v[at + 1] = static_cast<std::uint8_t>(x >> 8);
+}
+void put_u32(std::vector<std::uint8_t>& v, std::size_t at, std::uint32_t x) {
+    for (int i = 0; i < 4; ++i) v[at + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((x >> (8 * i)) & 0xFF);
+}
+
+}  // namespace
+
+TEST_CASE("gguf: block_spec sizes every real-file format, and tensor_byte_size follows it", "[gguf]") {
+    // The nine type ids actually present in the real UD-IQ1_S file. Each figure was cross-checked
+    // against that file by differencing consecutive tensors' data offsets (docs/WP4_SCOPE.md S3a-ter).
+    struct Case { std::uint32_t type; std::uint64_t elems, bytes; };
+    const Case cases[] = {
+        {0, 1, 4}, {1, 1, 2}, {30, 1, 2}, {8, 32, 34}, {12, 256, 144},
+        {13, 256, 176}, {14, 256, 210}, {16, 256, 66}, {19, 256, 50}, {20, 32, 18},
+    };
+    for (const Case& c : cases) {
+        const BlockSpec b = block_spec(c.type);
+        INFO("type " << c.type);
+        CHECK(b.elems == c.elems);
+        CHECK(b.bytes == c.bytes);
+    }
+    // Anything else still reports "unknown" -- Q4_0 (2) and Q2_K (10) are real ggml formats this
+    // reader deliberately does not implement, so they must stay refusals rather than mis-sized reads.
+    CHECK(block_spec(2).elems == 0);
+    CHECK(block_spec(10).elems == 0);
+
+    GgufBuilder b;
+    b.add_tensor("q4k", {512}, 12);      // 2 super-blocks
+    b.add_tensor("iq1s", {256}, 19);
+    b.add_tensor("bf16", {7}, 30);
+    b.add_tensor("iq4nl", {64}, 20);
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
+    REQUIRE(r.ok());
+    CHECK(r.tensor_byte_size(*r.find_tensor("q4k")) == 288);
+    CHECK(r.tensor_byte_size(*r.find_tensor("iq1s")) == 50);
+    CHECK(r.tensor_byte_size(*r.find_tensor("bf16")) == 14);
+    CHECK(r.tensor_byte_size(*r.find_tensor("iq4nl")) == 36);
+}
+
+TEST_CASE("gguf: bf16_to_f32 widens, and is NOT the f16 path", "[gguf]") {
+    CHECK(bf16_to_f32(0x3F80) == 1.0f);
+    CHECK(bf16_to_f32(0xC000) == -2.0f);
+    CHECK(bf16_to_f32(0x0000) == 0.0f);
+    CHECK(bf16_to_f32(0x4049) == Catch::Approx(3.140625f));   // pi, truncated to bf16
+    CHECK(bf16_to_f32(0x7F80) > 0);
+    CHECK(std::isinf(bf16_to_f32(0x7F80)));
+    // The two 16-bit formats share no bit pattern's meaning: 0x3C00 is 1.0 as an f16 and 0.0078125 as
+    // a bf16. A decoder that routed a bf16 tensor through f16_to_f32 would silently rescale by 128x.
+    CHECK(f16_to_f32(0x3C00) == 1.0f);
+    CHECK(bf16_to_f32(0x3C00) == 0.0078125f);
+}
+
+TEST_CASE("gguf: a BF16 tensor round-trips through Reader::tensor_bytes + to_f32", "[gguf]") {
+    GgufBuilder b;
+    b.add_tensor("w", {4}, /*type=BF16*/ 30, 0);
+    b.pad_to_data_section();
+    std::vector<std::uint8_t> data(8, 0);
+    put_u16(data, 0, 0x3F80); put_u16(data, 2, 0xC000);
+    put_u16(data, 4, 0x0000); put_u16(data, 6, 0x3F00);
+    b.add_data(data);
+    const std::vector<std::uint8_t> gguf_buf = b.finish();
+    Reader r(gguf_buf);
+    REQUIRE(r.ok());
+    const TensorInfo* t = r.find_tensor("w");
+    REQUIRE(t != nullptr);
+    CHECK(t->is_bf16());
+    CHECK(t->is_plain_float());   // bf16 is storage, not quantization
+    std::vector<float> out;
+    REQUIRE(to_f32(*t, r.tensor_bytes(*t), out));
+    REQUIRE(out.size() == 4);
+    CHECK(out[0] == 1.0f);
+    CHECK(out[1] == -2.0f);
+    CHECK(out[2] == 0.0f);
+    CHECK(out[3] == 0.5f);
+}
+
+TEST_CASE("gguf: dequantize_q4_k decodes a hand-built super-block exactly", "[gguf]") {
+    // d = 1.0, dmin = 0.5. The 12 packed scale bytes are chosen so BOTH branches of the 6-bit
+    // scale/min unpack are exercised and both give values readable straight off the bytes:
+    //   scales[0..3]  = 1,2,3,4    -> sub-blocks 0..3 scale = 1,2,3,4 (j < 4 branch: q[j] & 63)
+    //   scales[4..7]  = 8,9,10,11  -> sub-blocks 0..3 min   = 8,9,10,11 (j < 4: q[j+4] & 63)
+    //   scales[8..11] = 5,6,7,8    -> sub-blocks 4..7 scale = 5,6,7,8, min = 0,0,0,0
+    // The j >= 4 branch is (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4) for the scale and
+    // (q[j+4] >> 4) | ((q[j-0] >> 6) << 4) for the min; every byte above has its top two bits clear
+    // and a value below 16, so those reduce to scales[j+4] and 0 -- deliberately, so the EXPECTED
+    // values below are stated as plain numbers rather than re-derived by the same packing code.
+    std::vector<std::uint8_t> raw(144, 0);
+    put_u16(raw, 0, kF16One);    // d
+    put_u16(raw, 2, kF16Half);   // dmin
+    const std::uint8_t scale_bytes[12] = {1, 2, 3, 4, 8, 9, 10, 11, 5, 6, 7, 8};
+    for (int i = 0; i < 12; ++i) raw[4 + static_cast<std::size_t>(i)] = scale_bytes[i];
+    // qs[l] packs element l's low nibble and element l+32's high nibble (within each 64-group).
+    for (int i = 0; i < 128; ++i)
+        raw[16 + static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>((i % 16) | ((15 - (i % 16)) << 4));
+
+    std::vector<float> out;
+    REQUIRE(dequantize_q4_k(raw, 256, out));
+    REQUIRE(out.size() == 256);
+
+    const float sc[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const float mn[8] = {8, 9, 10, 11, 0, 0, 0, 0};
+    for (int group = 0; group < 4; ++group) {          // four 64-element groups
+        const int sub_lo = group * 2, sub_hi = sub_lo + 1;
+        for (int l = 0; l < 32; ++l) {
+            const int byte = group * 32 + l;
+            const float lo = static_cast<float>(byte % 16);
+            const float hi = static_cast<float>(15 - (byte % 16));
+            INFO("group " << group << " l " << l);
+            CHECK(out[static_cast<std::size_t>(group * 64 + l)] ==
+                  Catch::Approx(1.0f * sc[sub_lo] * lo - 0.5f * mn[sub_lo]));
+            CHECK(out[static_cast<std::size_t>(group * 64 + 32 + l)] ==
+                  Catch::Approx(1.0f * sc[sub_hi] * hi - 0.5f * mn[sub_hi]));
+        }
+    }
+    // Presence check: the min term must actually be subtracted. Sub-blocks 0..3 have nonzero mins, so
+    // element 0 (quant 0, scale 1, min 8) must be -4, NOT 0 -- a decoder that dropped `- m1` would
+    // give exactly 0 here and still pass every shape and range assertion.
+    CHECK(out[0] == Catch::Approx(-4.0f));
+}
+
+TEST_CASE("gguf: dequantize_q5_k adds the fifth (high) bit from qh", "[gguf]") {
+    // Same construction as Q4_K, but with all mins zero (dmin = 0) so the ONLY thing under test is the
+    // high-bit contribution: with qh all-ones every element gains +16 before scaling.
+    auto build = [](std::uint8_t qh_fill) {
+        std::vector<std::uint8_t> raw(176, 0);
+        put_u16(raw, 0, kF16One);
+        put_u16(raw, 2, kF16Zero);
+        const std::uint8_t scale_bytes[12] = {1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8};
+        for (int i = 0; i < 12; ++i) raw[4 + static_cast<std::size_t>(i)] = scale_bytes[i];
+        for (int i = 0; i < 32; ++i) raw[16 + static_cast<std::size_t>(i)] = qh_fill;
+        for (int i = 0; i < 128; ++i)
+            raw[48 + static_cast<std::size_t>(i)] =
+                static_cast<std::uint8_t>((i % 16) | ((15 - (i % 16)) << 4));
+        return raw;
+    };
+    const float sc[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    std::vector<float> lo_only, all_high;
+    REQUIRE(dequantize_q5_k(build(0x00), 256, lo_only));
+    REQUIRE(dequantize_q5_k(build(0xFF), 256, all_high));
+    REQUIRE(lo_only.size() == 256);
+
+    for (int group = 0; group < 4; ++group) {
+        for (int l = 0; l < 32; ++l) {
+            const int byte = group * 32 + l;
+            const float q_lo = static_cast<float>(byte % 16);
+            const float q_hi = static_cast<float>(15 - (byte % 16));
+            const std::size_t i_lo = static_cast<std::size_t>(group * 64 + l);
+            const std::size_t i_hi = static_cast<std::size_t>(group * 64 + 32 + l);
+            INFO("group " << group << " l " << l);
+            CHECK(lo_only[i_lo] == Catch::Approx(sc[group * 2] * q_lo));
+            CHECK(lo_only[i_hi] == Catch::Approx(sc[group * 2 + 1] * q_hi));
+            CHECK(all_high[i_lo] == Catch::Approx(sc[group * 2] * (q_lo + 16.f)));
+            CHECK(all_high[i_hi] == Catch::Approx(sc[group * 2 + 1] * (q_hi + 16.f)));
+        }
+    }
+    // The qh bit PAIR advances per 64-element group (u1 <<= 2 each iteration). Setting only bits 0/1
+    // must therefore light up group 0 alone -- a decoder that failed to advance the mask would apply
+    // the same +16 to every group, which the whole-tensor comparisons above cannot distinguish from
+    // correct when qh is uniform.
+    std::vector<float> group0_only;
+    REQUIRE(dequantize_q5_k(build(0x03), 256, group0_only));
+    CHECK(group0_only[0] == Catch::Approx(lo_only[0] + 1.f * 16.f));
+    CHECK(group0_only[64] == Catch::Approx(lo_only[64]));    // group 1 untouched
+    CHECK(group0_only[128] == Catch::Approx(lo_only[128]));  // group 2 untouched
+    CHECK(group0_only[192] == Catch::Approx(lo_only[192]));  // group 3 untouched
+}
+
+TEST_CASE("gguf: dequantize_q6_k is zero-centered (q - 32) with int8 scales", "[gguf]") {
+    // d = 1.0, every 16-element scale = 1, ql/qh all zero. Every quant is then 0, and (0 - 32) * 1
+    // means the WHOLE super-block must decode to exactly -32. Q6_K has no min term at all, so a
+    // decoder that copied Q4_K's affine form would produce zeros here instead.
+    std::vector<std::uint8_t> raw(210, 0);
+    for (int i = 0; i < 16; ++i) raw[192 + static_cast<std::size_t>(i)] = 1;
+    put_u16(raw, 208, kF16One);
+    std::vector<float> out;
+    REQUIRE(dequantize_q6_k(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (std::size_t i = 0; i < out.size(); ++i) { INFO("i " << i); CHECK(out[i] == -32.0f); }
+
+    // Now light up ql[0]'s low nibble to 5 and qh[0]'s bits [1:0] to 3 -> q = 5 | (3 << 4) = 53,
+    // so element 0 = (53 - 32) * 1 = 21. Element 32 reads ql[32]'s low nibble with qh[0] bits [3:2],
+    // element 64 reads ql[0]'s HIGH nibble with bits [5:4], element 96 ql[32]'s high with [7:6] --
+    // the interleaved strip order, which a linearized rewrite would scramble.
+    raw[0] = 0x05;
+    raw[128] = 0x03;
+    REQUIRE(dequantize_q6_k(raw, 256, out));
+    CHECK(out[0] == 21.0f);
+    CHECK(out[32] == -32.0f);
+    CHECK(out[64] == -32.0f);
+    CHECK(out[96] == -32.0f);
+    raw[128] = 0x30;                      // bits [5:4] = 3 -> feeds element 64 (ql[0] >> 4 == 0)
+    REQUIRE(dequantize_q6_k(raw, 256, out));
+    CHECK(out[0] == 5.0f - 32.0f);
+    CHECK(out[64] == 48.0f - 32.0f);
+    // The scale index also strides: sc[is + 0/2/4/6] with is = l/16, so element 16 uses scales[1].
+    raw[193] = 2;
+    REQUIRE(dequantize_q6_k(raw, 256, out));
+    CHECK(out[16] == -64.0f);             // 2 * (0 - 32)
+    CHECK(out[0] == 5.0f - 32.0f);        // still scales[0]
+}
+
+TEST_CASE("gguf: dequantize_iq4_nl indexes the 16-entry non-linear codebook", "[gguf]") {
+    // The codebook is DATA, so pin two of its entries literally here rather than only using the
+    // symbol -- a silently reordered table would otherwise be invisible to every test in this file.
+    CHECK(KVALUES_IQ4NL[0] == -127);
+    CHECK(KVALUES_IQ4NL[15] == 113);
+    CHECK(KVALUES_IQ4NL[8] == 1);
+
+    std::vector<std::uint8_t> raw(18, 0);
+    put_u16(raw, 0, kF16Half);   // d = 0.5
+    for (int j = 0; j < 16; ++j)
+        raw[2 + static_cast<std::size_t>(j)] = static_cast<std::uint8_t>(j | ((15 - j) << 4));
+    std::vector<float> out;
+    REQUIRE(dequantize_iq4_nl(raw, 32, out));
+    REQUIRE(out.size() == 32);
+    // Byte j holds element j (low nibble) and element j + 16 (high nibble) -- NOT elements 2j/2j+1.
+    for (int j = 0; j < 16; ++j) {
+        INFO("j " << j);
+        CHECK(out[static_cast<std::size_t>(j)] == 0.5f * static_cast<float>(KVALUES_IQ4NL[j]));
+        CHECK(out[static_cast<std::size_t>(j + 16)] == 0.5f * static_cast<float>(KVALUES_IQ4NL[15 - j]));
+    }
+    // Concretely, in plain numbers, so the split above is not asserted only against itself:
+    CHECK(out[0] == 0.5f * -127.0f);
+    CHECK(out[16] == 0.5f * 113.0f);
+}
+
+TEST_CASE("gguf: dequantize_iq2_xxs expands grid magnitudes with the sign codebook", "[gguf]") {
+    // The first grid entry is 0x0808080808080808 -- eight magnitudes of 8. Sign index 0 in
+    // ksigns_iq2xs is 0 (no negation). So with d = 1.0 and the scale nibble 0, the block's first 8
+    // elements must be db * 8 where db = 1.0 * (0.5 + 0) * 0.25 = 0.125, i.e. exactly 1.0.
+    CHECK(IQ2XXS_GRID[0] == 0x0808080808080808ull);
+    CHECK(KSIGNS_IQ2XS[0] == 0);
+    CHECK(KSIGNS_IQ2XS[1] == 129);   // 0b10000001: negate elements 0 and 7
+
+    std::vector<std::uint8_t> raw(66, 0);
+    put_u16(raw, 0, kF16One);
+    // Group 0 of 8: aux[0]'s four bytes are the four grid indices; aux[1] carries four 7-bit sign
+    // indices at [6:0], [13:7], [20:14], [27:21] and the 4-bit scale at [31:28].
+    put_u32(raw, 2, 0x00000000u);                       // grid indices 0,0,0,0
+    put_u32(raw, 6, 0x00000000u);                       // all sign index 0, scale nibble 0
+    std::vector<float> out;
+    REQUIRE(dequantize_iq2_xxs(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int j = 0; j < 32; ++j) { INFO("j " << j); CHECK(out[static_cast<std::size_t>(j)] == 1.0f); }
+
+    // Sign index 1 on the FIRST 8-element group only: elements 0 and 7 flip, 1..6 do not, and the
+    // second group (elements 8..15) is untouched -- which a decoder that applied one sign pattern to
+    // the whole 32-element sub-block would get wrong while still producing plausible values.
+    put_u32(raw, 6, 0x00000001u);
+    REQUIRE(dequantize_iq2_xxs(raw, 256, out));
+    CHECK(out[0] == -1.0f);
+    CHECK(out[1] == 1.0f);
+    CHECK(out[6] == 1.0f);
+    CHECK(out[7] == -1.0f);
+    CHECK(out[8] == 1.0f);
+
+    // The 4-bit scale nibble: db = d * (0.5 + s) * 0.25, so s = 3 gives db = 0.875 and every
+    // magnitude-8 element becomes 7.0.
+    put_u32(raw, 6, 0x30000000u);
+    REQUIRE(dequantize_iq2_xxs(raw, 256, out));
+    CHECK(out[0] == Catch::Approx(7.0f));
+}
+
+TEST_CASE("gguf: dequantize_iq1_s decodes the ternary grid with its per-block delta", "[gguf]") {
+    // Grid entry 0 is all-0xff == eight -1s; entry 1 is 0xffffffffffffff01, i.e. +1 in element 0 and
+    // -1 in elements 1..7 (little-endian byte order -- byte j IS element j).
+    CHECK(IQ1S_GRID[0] == 0xffffffffffffffffull);
+    CHECK(IQ1S_GRID[1] == 0xffffffffffffff01ull);
+    CHECK(IQ1S_DELTA == 0.125f);
+
+    std::vector<std::uint8_t> raw(50, 0);
+    put_u16(raw, 0, kF16One);              // d = 1.0
+    // qs: 32 low bytes of the grid index. Leave them 0 -> grid entry 0 (all -1) everywhere.
+    // qh[0]: scale field [14:12] = 0 -> dl = d * (2*0 + 1) = 1; sign bit 15 clear -> delta = +0.125.
+    put_u16(raw, 34, 0x0000);
+    std::vector<float> out;
+    REQUIRE(dequantize_iq1_s(raw, 256, out));
+    REQUIRE(out.size() == 256);
+    for (int j = 0; j < 32; ++j) { INFO("j " << j); CHECK(out[static_cast<std::size_t>(j)] == Catch::Approx(-0.875f)); }
+
+    // Flip the delta sign bit: -1 + (-0.125) = -1.125. A decoder that dropped the delta entirely
+    // would report exactly -1.0 in both cases and pass a range check.
+    put_u16(raw, 34, 0x8000);
+    REQUIRE(dequantize_iq1_s(raw, 256, out));
+    CHECK(out[0] == Catch::Approx(-1.125f));
+
+    // Scale field = 3 -> dl = 2*3 + 1 = 7, so -1 + 0.125 scaled by 7 = -6.125.
+    put_u16(raw, 34, 0x3000);
+    REQUIRE(dequantize_iq1_s(raw, 256, out));
+    CHECK(out[0] == Catch::Approx(-6.125f));
+
+    // The grid index's HIGH three bits come from qh[ib] >> (3*l) for the l-th group of 8. Setting
+    // qs[0] = 1 with those bits clear selects grid entry 1: +1 then seven -1s.
+    put_u16(raw, 34, 0x0000);
+    raw[2] = 1;
+    REQUIRE(dequantize_iq1_s(raw, 256, out));
+    CHECK(out[0] == Catch::Approx(1.125f));
+    CHECK(out[1] == Catch::Approx(-0.875f));
+    // ...and the high bits genuinely shift the index by 256 per unit: qh bits [2:0] = 1 with qs[0] = 1
+    // selects entry 257, which differs from entry 1. Compared over the whole 8-element group, not on
+    // element 0 alone -- entries 1 and 257 happen to share their first byte, so an element-0 check
+    // would pass for a decoder that ignored the high bits entirely.
+    const std::vector<float> low_index_group(out.begin(), out.begin() + 8);
+    put_u16(raw, 34, 0x0001);
+    REQUIRE(dequantize_iq1_s(raw, 256, out));
+    REQUIRE(IQ1S_GRID[257] != IQ1S_GRID[1]);
+    bool group_differs = false;
+    for (int j = 0; j < 8; ++j) group_differs |= (out[static_cast<std::size_t>(j)] != low_index_group[static_cast<std::size_t>(j)]);
+    CHECK(group_differs);
+}
+
+TEST_CASE("gguf: every new format refuses a short buffer instead of reading past it", "[gguf]") {
+    std::vector<float> out;
+    CHECK_FALSE(dequantize_q4_k(std::vector<std::uint8_t>(143, 0), 256, out));
+    CHECK_FALSE(dequantize_q5_k(std::vector<std::uint8_t>(175, 0), 256, out));
+    CHECK_FALSE(dequantize_q6_k(std::vector<std::uint8_t>(209, 0), 256, out));
+    CHECK_FALSE(dequantize_iq2_xxs(std::vector<std::uint8_t>(65, 0), 256, out));
+    CHECK_FALSE(dequantize_iq1_s(std::vector<std::uint8_t>(49, 0), 256, out));
+    CHECK_FALSE(dequantize_iq4_nl(std::vector<std::uint8_t>(17, 0), 32, out));
+}
+
+TEST_CASE("gguf: a partial final block decodes only the elements that exist", "[gguf]") {
+    // The real file's tensors are all whole multiples of their block size, but the reader must not
+    // depend on that (dequantize_q8_0 already did not) -- and, more importantly, must never write
+    // past `out`'s end when they are not.
+    std::vector<std::uint8_t> raw(50, 0);
+    put_u16(raw, 0, kF16One);
+    std::vector<float> out;
+    REQUIRE(dequantize_iq1_s(raw, 5, out));
+    CHECK(out.size() == 5);
+
+    std::vector<std::uint8_t> nl(18, 0);
+    put_u16(nl, 0, kF16One);
+    REQUIRE(dequantize_iq4_nl(nl, 20, out));
+    CHECK(out.size() == 20);
+
+    std::vector<std::uint8_t> q6(210, 0);
+    put_u16(q6, 208, kF16One);
+    REQUIRE(dequantize_q6_k(q6, 100, out));
+    CHECK(out.size() == 100);
+}
+
 TEST_CASE("gguf: to_f32 refuses an unsupported quantized type rather than misreading it", "[gguf]") {
     GgufBuilder b;
     b.add_tensor("w", {32}, /*type=*/2 /* Q4_0, not implemented */, /*offset=*/0);

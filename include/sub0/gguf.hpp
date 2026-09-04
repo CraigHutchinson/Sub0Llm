@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "sub0/gguf_quant_tables.hpp"   // the ggml IQ codebooks -- data only, see that file's header
+
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -35,13 +37,58 @@ enum class ValueType : std::uint32_t {
     Float32 = 6, Bool = 7, String = 8, Array = 9, UInt64 = 10, Int64 = 11, Float64 = 12,
 };
 
-// GGML tensor element type IDs this reader recognizes. F32/F16 are plain storage (read as-is); Q8_0
-// is the one block-quantized format this reader can DEQUANTIZE (see dequantize_q8_0 below) -- picked
-// first because it is what the validated real-file import candidate (llama-160m) ships as, and it is
-// the simplest ggml quant format (uniform per-block scale, no sub-block structure). Everything else
-// (Q4_*/Q5_*/K-quants/...) is reported by its raw id so a caller can say "quantized, not supported
-// yet" rather than silently misreading bytes.
-enum class TensorType : std::uint32_t { F32 = 0, F16 = 1, Q8_0 = 8 };
+// GGML tensor element type IDs this reader recognizes. F32/F16/BF16 are plain storage (read as-is or
+// widened); the rest are block-quantized formats this reader can DEQUANTIZE (see the decoders at the
+// bottom of this file). Anything NOT listed here is still reported by its raw id, so a caller says
+// "quantized, not supported yet" rather than silently misreading bytes.
+//
+// WHY THIS EXACT SET (docs/WP4_SCOPE.md S3a-bis): Q8_0 came first, as the simplest ggml quant format
+// and what the original validated import candidate (llama-160m) shipped. The other seven are the
+// formats the REAL Qwen3.8-Flash-Next UD-IQ1_S file actually uses -- read out of the downloaded file's
+// own tensor table, not guessed: every raw type id present across its two tensor-bearing shards is one
+// of {F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_S, IQ4_NL, BF16}. Note there is no F16 in that file at
+// all; F16 stays because it is the format's own baseline and Q8_0's block scale is an f16 regardless.
+//
+// A caller must dispatch on a tensor's OWN type_raw, never on its name/role: unsloth's "Dynamic" (UD)
+// mixed quantization gives the SAME logical tensor different formats at different layers (layers 0/3's
+// ffn_gate_exps is IQ1_S, layers 1/2's is IQ2_XXS -- observed directly in the real file). The
+// per-TensorInfo dispatch every function here uses already has that shape.
+enum class TensorType : std::uint32_t {
+    F32 = 0, F16 = 1, Q8_0 = 8,
+    Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ1_S = 19, IQ4_NL = 20, BF16 = 30,
+};
+
+// One quantization format's block geometry: `elems` elements encoded in `bytes` bytes. The plain
+// storage types are expressed as a degenerate 1-element "block" so ONE rule sizes every format and
+// tensor_byte_size() has no special cases. {0, 0} means "this reader does not know this type".
+//
+// Every byte figure below is derived from ggml-common.h's own struct definitions (transcribed, not
+// recalled -- AGENTS.md S5), and every one was then CHECKED against the real UD-IQ1_S file by
+// differencing consecutive tensors' data offsets, which is an independent oracle the struct
+// definitions cannot fake:
+//   Q4_K   2*f16 + 12 scale bytes + 128 quant bytes                    = 144 / 256
+//   Q5_K   2*f16 + 12 scale bytes + 32 high-bit bytes + 128 low bytes  = 176 / 256
+//   Q6_K   128 low + 64 high + 16 int8 scales + f16                    = 210 / 256
+//   Q8_0   f16 + 32 int8                                              =  34 /  32
+//   IQ1_S  f16 + 32 grid-index bytes + 8*u16 qh                       =  50 / 256
+//   IQ2_XXS f16 + 32*u16                                              =  66 / 256
+//   IQ4_NL f16 + 16 packed nibbles                                    =  18 /  32
+struct BlockSpec { std::uint64_t elems = 0, bytes = 0; };
+inline constexpr BlockSpec block_spec(std::uint32_t type_raw) {
+    switch (static_cast<TensorType>(type_raw)) {
+        case TensorType::F32:     return {1, 4};
+        case TensorType::F16:     return {1, 2};
+        case TensorType::BF16:    return {1, 2};
+        case TensorType::Q8_0:    return {32, 34};
+        case TensorType::Q4_K:    return {256, 144};
+        case TensorType::Q5_K:    return {256, 176};
+        case TensorType::Q6_K:    return {256, 210};
+        case TensorType::IQ2_XXS: return {256, 66};
+        case TensorType::IQ1_S:   return {256, 50};
+        case TensorType::IQ4_NL:  return {32, 18};
+        default:                  return {};
+    }
+}
 
 // --- parsed structures -------------------------------------------------------------------------
 
@@ -66,10 +113,15 @@ struct TensorInfo {
     std::uint32_t               type_raw = 0;   // raw GGML tensor-type id (see TensorType for the recognized subset)
     std::uint64_t                offset = 0;     // byte offset into the (alignment-padded) data section
 
-    bool is_f32() const { return type_raw == static_cast<std::uint32_t>(TensorType::F32); }
-    bool is_f16() const { return type_raw == static_cast<std::uint32_t>(TensorType::F16); }
-    bool is_q8_0() const { return type_raw == static_cast<std::uint32_t>(TensorType::Q8_0); }
-    bool is_plain_float() const { return is_f32() || is_f16(); }
+    bool is(TensorType t) const { return type_raw == static_cast<std::uint32_t>(t); }
+    bool is_f32() const { return is(TensorType::F32); }
+    bool is_f16() const { return is(TensorType::F16); }
+    bool is_bf16() const { return is(TensorType::BF16); }
+    bool is_q8_0() const { return is(TensorType::Q8_0); }
+    // "Plain" = stored one value per element, no block structure. BF16 joins F32/F16 here: it is a
+    // straight 16-bit truncation of an f32, not a quantization, so a caller checking "is this file
+    // quantized at all" must not be told yes by a bf16 tensor.
+    bool is_plain_float() const { return is_f32() || is_f16() || is_bf16(); }
     std::uint64_t element_count() const {
         std::uint64_t n = 1;
         for (auto d : dims) n *= d;
@@ -122,15 +174,15 @@ public:
     // per the GGUF spec) -- every TensorInfo::offset is relative to THIS, not to the file start.
     std::uint64_t data_offset() const { return data_offset_; }
 
-    // Byte length of one tensor's raw (still-encoded) data: n_elements * width for F32/F16, or
-    // block_count * 34 for Q8_0 (2-byte f16 scale + 32 int8 quants per 32-element block). 0 for a
-    // type this reader does not know the size rule for (an unsupported quant format).
+    // Byte length of one tensor's raw (still-encoded) data: ceil(n / block.elems) * block.bytes,
+    // which collapses to n*4 / n*2 for the plain storage types (their "block" is one element). 0 for
+    // a type this reader does not know the size rule for -- see block_spec() for the per-format table
+    // and for how each figure was cross-checked against the real file.
     std::uint64_t tensor_byte_size(const TensorInfo& t) const {
+        const BlockSpec b = block_spec(t.type_raw);
+        if (b.elems == 0) return 0;
         const std::uint64_t n = t.element_count();
-        if (t.is_f32()) return n * 4;
-        if (t.is_f16()) return n * 2;
-        if (t.is_q8_0()) return ((n + 31) / 32) * 34;
-        return 0;
+        return ((n + b.elems - 1) / b.elems) * b.bytes;
     }
 
     // The raw (still-encoded) bytes for one tensor, bounds-checked against the buffer -- empty if
@@ -319,9 +371,239 @@ inline bool dequantize_q8_0(std::span<const std::uint8_t> raw, std::uint64_t n_e
     return true;
 }
 
-// Convert one tensor's raw (still-encoded) bytes to F32, dispatching on its type: F32 is a straight
-// copy, F16 is widened elementwise, Q8_0 is dequantized. Returns false for any other (unsupported)
-// quantized type -- the caller should treat that as "cannot import this tensor yet", not guess.
+// bfloat16 -> f32. Strictly simpler than f16_to_f32 above and NOT a special case of it: bf16 is an
+// f32 with its low 16 mantissa bits dropped, so widening is a shift, with no exponent rebias and no
+// subnormal renormalization. (Getting these two confused -- reusing the f16 path for a bf16 tensor --
+// would decode plausible-magnitude garbage rather than failing, which is why they are separate
+// functions rather than one with a flag.)
+inline float bf16_to_f32(std::uint16_t h) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+// --- K-quant and IQ-quant decoders ----------------------------------------------------------------
+//
+// Every function below is a transcription of ggml's own `dequantize_row_*` (ggml/src/ggml-quants.c in
+// the llama.cpp checkout at D:\Craig\diffusiongemma\llama.cpp), fetched and read rather than recalled,
+// per AGENTS.md S5. There is no convention to re-map here the way a ported ALGORITHM needs (the Muon
+// axis-order trap): a decoder either reproduces the format's bit layout or it does not. What IS
+// re-derived is the buffer contract -- ggml decodes into a caller-sized `float*` and asserts
+// `k % QK_K == 0`; these take a bounds-checked span, size `out` themselves, and tolerate a partial
+// final block by writing only the elements that exist (exactly dequantize_q8_0's own behaviour above).
+//
+// The two K-quant families differ in a way worth stating once, since it is the most likely place for a
+// transcription slip: Q4_K/Q5_K carry a per-super-block scale AND MIN (`x = d*sc*q - dmin*m`, an affine
+// map with 8 sub-blocks of 32 whose 6-bit scale/min pairs are packed 12-bytes-for-16-values by
+// get_scale_min_k4), while Q6_K is scale-only and zero-centered (`x = d*sc*(q - 32)`, 16 sub-blocks of
+// 16 with plain int8 scales). Mixing those up produces output with a systematic offset, which a
+// statistical mean/std check catches and a shape check does not.
+
+// ggml's get_scale_min_k4: unpacks sub-block j's 6-bit scale and 6-bit min out of the 12 packed bytes
+// shared by all 8 sub-blocks of a Q4_K/Q5_K super-block.
+inline void k_scale_min(int j, const std::uint8_t* q, std::uint8_t& d, std::uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = static_cast<std::uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        m = static_cast<std::uint8_t>((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+// Shared preamble for every block decoder: validate the raw span against the format's own size rule,
+// size `out`, and hand back the block count. Returns 0 (and leaves `out` untouched) on a short buffer.
+inline std::uint64_t begin_blocks(TensorType type, std::span<const std::uint8_t> raw,
+                                   std::uint64_t n_elements, std::vector<float>& out) {
+    const BlockSpec b = block_spec(static_cast<std::uint32_t>(type));
+    if (b.elems == 0) return 0;
+    const std::uint64_t blocks = (n_elements + b.elems - 1) / b.elems;
+    if (raw.size() < blocks * b.bytes) return 0;
+    out.assign(static_cast<std::size_t>(n_elements), 0.f);
+    return blocks;
+}
+
+inline bool dequantize_q4_k(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::Q4_K, raw, n, out);
+    if (blocks == 0) return n == 0;
+    std::uint64_t w = 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 144;
+        std::uint16_t d_bits, dmin_bits;
+        std::memcpy(&d_bits, blk, 2);
+        std::memcpy(&dmin_bits, blk + 2, 2);
+        const float d = f16_to_f32(d_bits), dmin = f16_to_f32(dmin_bits);
+        const std::uint8_t* scales = blk + 4;
+        const std::uint8_t* q = blk + 16;
+        for (int is = 0; is < 8; is += 2) {
+            std::uint8_t sc, m;
+            k_scale_min(is, scales, sc, m);
+            const float d1 = d * sc, m1 = dmin * m;
+            k_scale_min(is + 1, scales, sc, m);
+            const float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32 && w < n; ++l, ++w) out[static_cast<std::size_t>(w)] = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32 && w < n; ++l, ++w) out[static_cast<std::size_t>(w)] = d2 * (q[l] >> 4) - m2;
+            q += 32;
+        }
+    }
+    return true;
+}
+
+inline bool dequantize_q5_k(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::Q5_K, raw, n, out);
+    if (blocks == 0) return n == 0;
+    std::uint64_t w = 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 176;
+        std::uint16_t d_bits, dmin_bits;
+        std::memcpy(&d_bits, blk, 2);
+        std::memcpy(&dmin_bits, blk + 2, 2);
+        const float d = f16_to_f32(d_bits), dmin = f16_to_f32(dmin_bits);
+        const std::uint8_t* scales = blk + 4;
+        const std::uint8_t* qh = blk + 16;         // 32 bytes: one high bit per element
+        const std::uint8_t* ql = blk + 48;         // 128 bytes: two 4-bit low halves per byte
+        std::uint8_t u1 = 1, u2 = 2;               // the qh bit pair advanced per 64-element group
+        for (int is = 0; is < 8; is += 2) {
+            std::uint8_t sc, m;
+            k_scale_min(is, scales, sc, m);
+            const float d1 = d * sc, m1 = dmin * m;
+            k_scale_min(is + 1, scales, sc, m);
+            const float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32 && w < n; ++l, ++w)
+                out[static_cast<std::size_t>(w)] = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32 && w < n; ++l, ++w)
+                out[static_cast<std::size_t>(w)] = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32;
+            u1 = static_cast<std::uint8_t>(u1 << 2);
+            u2 = static_cast<std::uint8_t>(u2 << 2);
+        }
+    }
+    return true;
+}
+
+inline bool dequantize_q6_k(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::Q6_K, raw, n, out);
+    if (blocks == 0) return n == 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 210;
+        const std::uint8_t* ql = blk;              // 128 bytes
+        const std::uint8_t* qh = blk + 128;        // 64 bytes
+        const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);   // 16 int8 scales
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, blk + 208, 2);
+        const float d = f16_to_f32(d_bits);
+        const std::uint64_t base = i * 256;
+        // ggml's loop shape kept verbatim: two 128-element halves, each writing four interleaved
+        // 32-element strips at +0/+32/+64/+96 rather than sequentially. Flattening it to a linear
+        // walk would reorder the elements, which is exactly the sort of "looks fine" change that
+        // produces a plausible tensor with the wrong values.
+        for (int half = 0; half < 2; ++half) {
+            const std::uint64_t y0 = base + static_cast<std::uint64_t>(half) * 128;
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = static_cast<int>(static_cast<std::int8_t>((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4))) - 32;
+                const int q2 = static_cast<int>(static_cast<std::int8_t>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4))) - 32;
+                const int q3 = static_cast<int>(static_cast<std::int8_t>((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4))) - 32;
+                const int q4 = static_cast<int>(static_cast<std::int8_t>((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4))) - 32;
+                const std::uint64_t idx[4] = {y0 + l, y0 + l + 32, y0 + l + 64, y0 + l + 96};
+                const float v[4] = {d * sc[is + 0] * q1, d * sc[is + 2] * q2,
+                                    d * sc[is + 4] * q3, d * sc[is + 6] * q4};
+                for (int k = 0; k < 4; ++k)
+                    if (idx[k] < n) out[static_cast<std::size_t>(idx[k])] = v[k];
+            }
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    return true;
+}
+
+inline bool dequantize_iq4_nl(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::IQ4_NL, raw, n, out);
+    if (blocks == 0) return n == 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 18;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, blk, 2);
+        const float d = f16_to_f32(d_bits);
+        const std::uint8_t* qs = blk + 2;
+        const std::uint64_t base = i * 32;
+        // NOTE the split, which is NOT the obvious "nibble pairs are adjacent elements": byte j holds
+        // element j in its low nibble and element j+16 in its high nibble.
+        for (int j = 0; j < 16; ++j) {
+            if (base + j      < n) out[static_cast<std::size_t>(base + j)]      = d * KVALUES_IQ4NL[qs[j] & 0xF];
+            if (base + j + 16 < n) out[static_cast<std::size_t>(base + j + 16)] = d * KVALUES_IQ4NL[qs[j] >> 4];
+        }
+    }
+    return true;
+}
+
+inline bool dequantize_iq2_xxs(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::IQ2_XXS, raw, n, out);
+    if (blocks == 0) return n == 0;
+    std::uint64_t w = 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 66;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, blk, 2);
+        const float d = f16_to_f32(d_bits);
+        const std::uint8_t* qs = blk + 2;          // 8 groups of 8 bytes == 2 u32 each
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            std::uint32_t aux[2];
+            std::memcpy(aux, qs + 8 * ib32, 8);
+            const auto* aux8 = reinterpret_cast<const std::uint8_t*>(aux);
+            // The scale's four high bits live in aux[1]'s top nibble; the remaining 28 bits are four
+            // 7-bit sign-pattern indices, one per 8-element group.
+            const float db = d * (0.5f + static_cast<float>(aux[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint64_t grid = IQ2XXS_GRID[aux8[l]];
+                const std::uint8_t signs = KSIGNS_IQ2XS[(aux[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8 && w < n; ++j, ++w) {
+                    const auto mag = static_cast<std::uint8_t>((grid >> (8 * j)) & 0xFFu);
+                    out[static_cast<std::size_t>(w)] =
+                        db * static_cast<float>(mag) * ((signs & KMASK_IQ2XS[j]) ? -1.f : 1.f);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+inline bool dequantize_iq1_s(std::span<const std::uint8_t> raw, std::uint64_t n, std::vector<float>& out) {
+    const std::uint64_t blocks = begin_blocks(TensorType::IQ1_S, raw, n, out);
+    if (blocks == 0) return n == 0;
+    std::uint64_t w = 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const std::uint8_t* blk = raw.data() + i * 50;
+        std::uint16_t d_bits;
+        std::memcpy(&d_bits, blk, 2);
+        const float d = f16_to_f32(d_bits);
+        const std::uint8_t* qs = blk + 2;          // 32 grid-index low bytes
+        for (int ib = 0; ib < 8; ++ib) {
+            std::uint16_t qh;
+            std::memcpy(&qh, blk + 34 + 2 * ib, 2);
+            // qh packs, per 32-element sub-block: three high grid-index bits per 8-element group at
+            // [3l+2 : 3l], a 3-bit scale at [14:12], and the delta's SIGN at bit 15.
+            const float dl = d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+            const float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint64_t grid = IQ1S_GRID[qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
+                for (int j = 0; j < 8 && w < n; ++j, ++w) {
+                    const auto q = static_cast<std::int8_t>((grid >> (8 * j)) & 0xFFu);
+                    out[static_cast<std::size_t>(w)] = dl * (static_cast<float>(q) + delta);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Convert one tensor's raw (still-encoded) bytes to F32, dispatching on its OWN type_raw (never on its
+// name -- see TensorType's comment on unsloth's per-layer mixed quantization). Returns false for any
+// type this reader does not know -- the caller should treat that as "cannot import this tensor yet",
+// not guess.
 inline bool to_f32(const TensorInfo& t, std::span<const std::uint8_t> raw, std::vector<float>& out) {
     const std::uint64_t n = t.element_count();
     if (t.is_f32()) {
@@ -330,18 +612,27 @@ inline bool to_f32(const TensorInfo& t, std::span<const std::uint8_t> raw, std::
         std::memcpy(out.data(), raw.data(), static_cast<std::size_t>(n) * 4);
         return true;
     }
-    if (t.is_f16()) {
+    if (t.is_f16() || t.is_bf16()) {
         if (raw.size() < n * 2) return false;
         out.resize(static_cast<std::size_t>(n));
+        const bool bf = t.is_bf16();
         for (std::uint64_t i = 0; i < n; ++i) {
             std::uint16_t h;
             std::memcpy(&h, raw.data() + i * 2, sizeof h);
-            out[static_cast<std::size_t>(i)] = f16_to_f32(h);
+            out[static_cast<std::size_t>(i)] = bf ? bf16_to_f32(h) : f16_to_f32(h);
         }
         return true;
     }
-    if (t.is_q8_0()) return dequantize_q8_0(raw, n, out);
-    return false;
+    switch (static_cast<TensorType>(t.type_raw)) {
+        case TensorType::Q8_0:    return dequantize_q8_0(raw, n, out);
+        case TensorType::Q4_K:    return dequantize_q4_k(raw, n, out);
+        case TensorType::Q5_K:    return dequantize_q5_k(raw, n, out);
+        case TensorType::Q6_K:    return dequantize_q6_k(raw, n, out);
+        case TensorType::IQ2_XXS: return dequantize_iq2_xxs(raw, n, out);
+        case TensorType::IQ1_S:   return dequantize_iq1_s(raw, n, out);
+        case TensorType::IQ4_NL:  return dequantize_iq4_nl(raw, n, out);
+        default:                  return false;
+    }
 }
 
 // --- import-compatibility report ------------------------------------------------------------------
