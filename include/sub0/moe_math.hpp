@@ -152,18 +152,34 @@ inline void router_topk_row(const Dims& d, const float* x, const float* router_w
     }
 }
 
+// One routed expert's three weight planes. `gate`/`up` are [hidden_size, d_ff] and `down` is
+// [d_ff, hidden_size], this project's own [in,out] convention -- exactly the three pointers
+// expert_ffn_row already takes.
+struct ExpertWeights { const float* gate; const float* up; const float* down; };
+
 // The full block for one row (Qwen4ExpTextSparseMoeBlock.forward, docs/MOE.md S1): route, run only the
 // experts_per_tok SELECTED experts' SwiGLU FFNs, weighted-sum them, then add the ALWAYS-ON shared
 // expert's own SwiGLU FFN output scaled by sigmoid(shared_gate_proj(x)) -- NOT re-weighted by the
 // router's own topk output, a real, verified divergence from a naive "shared expert is just expert #0"
-// reading (docs/MOE.md S1a). `expert_gate_w`/`expert_up_w`/`expert_down_w`: arrays of `num_experts`
-// pointers, one per routed expert's own weight tensors. `scratch`: >= scratch_floats(d) floats.
-inline void forward_row(const Dims& d, const float* x, const float* router_w,
-                         const float* const* expert_gate_w, const float* const* expert_up_w,
-                         const float* const* expert_down_w,
-                         const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
-                         const float* shared_gate_proj_w,
-                         float* out, float* scratch, bool norm_topk_prob = true) {
+// reading (docs/MOE.md S1a). `scratch`: >= scratch_floats(d) floats.
+//
+// WHERE THE EXPERT WEIGHTS COME FROM IS A PARAMETER (WP4e, docs/WP4_SCOPE.md). `resolve(e)` returns
+// expert e's three planes and is called ONLY for the experts_per_tok experts this row actually selects
+// -- which is what lets a caller hold the routed experts in their native quantized form and dequantize
+// on demand (backend_cpu.cpp under MOE_QUANT_EXPERTS) instead of keeping all num_experts resident as
+// f32. The f32-resident caller passes a resolver that indexes its own pointer arrays (forward_row just
+// below), so BOTH residency strategies run this one function, with the same arithmetic in the same
+// order. That is not a tidiness point: it is why WP4e's gate -- bitwise-identical output between the two
+// -- is a structural property of having one code path rather than an empirical hope about two.
+//
+// `resolve` must not allocate and must leave the returned planes valid until the next call (a caller
+// with a one-slot pool is fine: the planes are consumed by expert_ffn_row before resolve is called
+// again). AGENTS.md S1 -- this is a per-token, per-selected-expert path.
+template <class Resolve>
+inline void forward_row_via(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
+                             const float* shared_gate_w, const float* shared_up_w,
+                             const float* shared_down_w, const float* shared_gate_proj_w,
+                             float* out, float* scratch, bool norm_topk_prob = true) {
     float* probs      = scratch;                    // [num_experts]
     float* ffn_scratch = probs + d.num_experts;      // [d_ff]
     float* g_scratch  = ffn_scratch + d.d_ff;        // [d_ff]
@@ -174,20 +190,37 @@ inline void forward_row(const Dims& d, const float* x, const float* router_w,
 
     for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
     for (int k = 0; k < d.experts_per_tok; ++k) {
-        const int e = topk_idx[k];
-        expert_ffn_row(d, x, expert_gate_w[e], expert_up_w[e], expert_down_w[e], expert_out, ffn_scratch,
-                        g_scratch);
+        const ExpertWeights w = resolve(topk_idx[k]);
+        expert_ffn_row(d, x, w.gate, w.up, w.down, expert_out, ffn_scratch, g_scratch);
         for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * expert_out[j];
     }
 
     // Shared expert: an ordinary (non-routed) SwiGLU FFN with its OWN weights, gated by
     // sigmoid(Linear(hidden_size, 1, bias=False)(x)) -- Qwen4ExpTextSparseMoeBlock.forward's own
-    // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`.
+    // `F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output`. Always
+    // f32-resident: it runs for EVERY token, so there is nothing for a quantized-resident form to save
+    // (see include/sub0/moe_quant.hpp's own header comment).
     expert_ffn_row(d, x, shared_gate_w, shared_up_w, shared_down_w, expert_out, ffn_scratch, g_scratch);
     float gate_logit = 0.f;
     for (int i = 0; i < d.hidden_size; ++i) gate_logit += x[i] * shared_gate_proj_w[i];  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
     for (int j = 0; j < d.hidden_size; ++j) out[j] += sg * expert_out[j];
+}
+
+// The f32-resident form: `expert_gate_w`/`expert_up_w`/`expert_down_w` are arrays of `num_experts`
+// pointers, one per routed expert. A thin wrapper, deliberately -- see forward_row_via's comment.
+inline void forward_row(const Dims& d, const float* x, const float* router_w,
+                         const float* const* expert_gate_w, const float* const* expert_up_w,
+                         const float* const* expert_down_w,
+                         const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
+                         const float* shared_gate_proj_w,
+                         float* out, float* scratch, bool norm_topk_prob = true) {
+    forward_row_via(d, x, router_w,
+                    [&](int e) {
+                        return ExpertWeights{expert_gate_w[e], expert_up_w[e], expert_down_w[e]};
+                    },
+                    shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w, out, scratch,
+                    norm_topk_prob);
 }
 
 // Batched T-row wrapper. Rows are independent (this file's own header comment) so `scratch` is reused
@@ -203,6 +236,22 @@ inline void forward(const Dims& d, int T, const float* x, const float* router_w,
                     expert_gate_w, expert_up_w, expert_down_w,
                     shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w,
                     out + static_cast<std::size_t>(t) * d.hidden_size, scratch, norm_topk_prob);
+    }
+}
+
+// The same batched wrapper for a resolver-driven caller (WP4e). Separate from forward() rather than a
+// default argument because the two have genuinely different call sites, and because `resolve` must be
+// reused across the T-row loop -- resolving per row is what makes the small pool pay for itself when
+// several rows of one batch pick the same expert.
+template <class Resolve>
+inline void forward_via(const Dims& d, int T, const float* x, const float* router_w, Resolve&& resolve,
+                         const float* shared_gate_w, const float* shared_up_w, const float* shared_down_w,
+                         const float* shared_gate_proj_w,
+                         float* out, float* scratch, bool norm_topk_prob = true) {
+    for (int t = 0; t < T; ++t) {
+        forward_row_via(d, x + static_cast<std::size_t>(t) * d.hidden_size, router_w, resolve,
+                        shared_gate_w, shared_up_w, shared_down_w, shared_gate_proj_w,
+                        out + static_cast<std::size_t>(t) * d.hidden_size, scratch, norm_topk_prob);
     }
 }
 

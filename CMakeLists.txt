@@ -234,6 +234,23 @@ if(NOT MSVC)
   target_compile_options(sub0llm-transplant PRIVATE -fconstexpr-steps=1000000000)
 endif()
 
+# WP4e (docs/WP4_SCOPE.md WP4e): the SAME tool, compiled against the SAME real-axes header, with the
+# routed experts kept quantized-resident (-DSUB0_MOE_QUANT_EXPERTS=1). It has to be a second TARGET
+# rather than a runtime flag for exactly the reason the first one is compiled the way it is: the choice
+# changes make_param_layout(), so the two builds have different PARAM_LAYOUTs and cannot coexist in one
+# binary any more than the 4-layer and 48-layer layouts can. Producing BOTH artifacts is what makes
+# WP4e's gate -- bitwise-identical engine output from an all-f32 blob and from a blob+sidecar pair --
+# runnable at all.
+add_executable(sub0llm-transplant-q tools/sub0llm-transplant.cpp)
+target_include_directories(sub0llm-transplant-q PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
+  "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0llm-transplant-q PRIVATE SUB0_QWEN4_LAYERS=4 SUB0_MOE_QUANT_EXPERTS=1)
+target_link_libraries(sub0llm-transplant-q PRIVATE CLI11::CLI11)
+if(NOT MSVC)
+  target_compile_options(sub0llm-transplant-q PRIVATE -fconstexpr-steps=1000000000)
+endif()
+
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
 set(GEN_HEADER "${GEN_DIR}/sub0_config.hpp")

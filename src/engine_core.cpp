@@ -236,6 +236,13 @@ bool load_model(const char* path) {
         return false;
     }
     if (tok_model_conflict()) { warn_tok_model_mismatch(); return false; }
+    // WP4e: a MOE_QUANT_EXPERTS build's weights are TWO files -- this blob and `<path>.moeq`, which
+    // holds the routed experts in their native quantized bytes (include/sub0/moe_quant.hpp). The
+    // sidecar is REQUIRED, not optional, in such a build: without it there are no routed experts at
+    // all, and a forward pass would compute the shared expert alone and look plausible. Refusing here,
+    // at the same seam that already refuses a config mismatch, is the "lowest callable seam" rule --
+    // the alternative is discovering it inside op_moe, per token. A no-op returning true otherwise.
+    if (!load_moe_quant_sidecar(path)) return false;
     return true;
 }
 
