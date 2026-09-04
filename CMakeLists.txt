@@ -55,6 +55,19 @@ endif()
 # Debug info doesn't change the generated machine code, just link time and on-disk .pdb size.
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
+# WP4d: raise clang's constant-evaluation step budget for every C++ TU in the tree. layout.hpp's
+# make_param_layout() is consteval and is walked several times over (DECAY_RANGES, MUON_RANGES,
+# MUON_MAX_MN/MM, total_param_floats); at an ordinary config that is a few thousand steps, but at
+# Qwen3.8-Flash-Next's real axes PARAM_LAYOUT is ~6,200 tensors for a 4-layer sub-stack (~74,800 for the
+# full 48), which blows the default 1,048,576-step budget many times over. The failure is a "possible
+# infinite loop?" diagnostic, not a wrong answer, so the fix is a budget rather than a redesign -- and it
+# is a property of the MODEL's size, not of any one target, which is why sub0_qwen4_shape_tests and
+# sub0llm-transplant already each set it locally and why the ENGINE now needs it too. Changes no
+# generated code at any smaller config: an unused budget costs nothing.
+if(NOT MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fconstexpr-steps=1000000000>)
+endif()
+
 # Native tuning. This project is always built on the machine the model will run
 # on, so an exact-CPU build is the intended default for real runs (the `native`
 # preset). It is opt-in and probed for support so portable/cross builds and
@@ -390,6 +403,22 @@ endforeach()
 target_link_libraries(sub0llm-train PRIVATE sub0_train)
 target_link_libraries(sub0llm-tune  PRIVATE sub0_train)
 target_link_libraries(sub0llm-gen   PRIVATE sub0_gen)
+
+# --- WP4d: the real-axes forward harness ------------------------------------
+# The OPPOSITE of sub0llm-transplant/sub0_qwen4_shape_tests above: this one DOES link the engine, so it
+# is compiled against ${GEN_DIR}'s generated config like every other engine consumer -- which means the
+# build it belongs to must itself have been configured at the real Qwen4 axes (see
+# docs/WP4_SCOPE.md WP4d for the exact `sub0llm-configure` line). Built unconditionally because it costs
+# one small TU; it simply refuses to do anything useful in a build whose config is not the real one, and
+# the artifact it loads is a path argument, not a build dependency.
+add_executable(sub0llm-qwen4-forward tools/sub0llm-qwen4-forward.cpp)
+target_include_directories(sub0llm-qwen4-forward PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+target_link_libraries(sub0llm-qwen4-forward PRIVATE sub0_core CLI11::CLI11)
+if(WIN32)
+  # GetProcessMemoryInfo: the peak-working-set number docs/QWEN4_MEMORY_ORCHESTRATION.md wants measured.
+  target_link_libraries(sub0llm-qwen4-forward PRIVATE psapi)
+endif()
+set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
 # --- Tests ------------------------------------------------------------------
 option(SUB0_BUILD_TESTS "Build the unit test suite" ON)

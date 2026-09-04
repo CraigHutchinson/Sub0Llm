@@ -33,7 +33,16 @@
   #define SUB0_API __attribute__((visibility("default")))
 #endif
 
-static_assert(D_MODEL % N_HEADS == 0, "d_model must be divisible by n_heads");
+// WP4d: this used to read `D_MODEL % N_HEADS == 0`, which was the same statement while D_HEAD was
+// DERIVED as D_MODEL / N_HEADS. WP4b blocker A made the head width its own axis (--head-dim), and the
+// real Qwen4-preview model is exactly the case the old spelling refuses: 24 heads x head_dim 256 =
+// D_Q 6144 against hidden_size 2560, so 2560 % 24 == 16 and this assert FAILED at the real axes. The
+// quantity that must actually divide evenly is the query/attention-output width by the head count --
+// which layout.hpp's D_Q defines as N_HEADS * D_HEAD, so it holds by construction and the assert is
+// kept only as a tripwire against a future definition that breaks it. (tests/qwen4_real_shape_tests.cpp
+// never caught this: it includes layout.hpp, not core.hpp -- nothing had ever compiled the ENGINE at
+// the real axes before this stage, which is the whole point of WP4d.)
+static_assert(sub0::D_Q % N_HEADS == 0, "the query width (n_heads * head_dim) must split evenly per head");
 static_assert(SEQ_LEN >= 1 && N_LAYERS >= 1 && VOCAB >= 2, "degenerate config");
 
 namespace sub0 {

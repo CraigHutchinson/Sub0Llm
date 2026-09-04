@@ -75,7 +75,8 @@ inline constexpr std::size_t scratch_floats(const Dims& d, int T) {
     const std::size_t T_ = static_cast<std::size_t>(T);
     return T_ * static_cast<std::size_t>(d.conv_dim()) * 2      // qkv_pre, qkv_post
          + T_ * static_cast<std::size_t>(d.value_dim())         // z (output-gate projection)
-         + T_ * static_cast<std::size_t>(d.num_v_heads) * 2;    // beta, g
+         + T_ * static_cast<std::size_t>(d.num_v_heads) * 2     // beta, g
+         + static_cast<std::size_t>(d.value_dim());             // gated (ONE row, reused per t)
 }
 inline constexpr std::size_t state_floats(const Dims& d) {
     return static_cast<std::size_t>(d.num_v_heads) * static_cast<std::size_t>(d.head_k_dim)
@@ -164,7 +165,16 @@ inline void forward(const Dims& d, int T,
     float* qkv_post = scratch;                                    scratch += static_cast<std::size_t>(T) * conv_dim;
     float* zb       = scratch;                                    scratch += static_cast<std::size_t>(T) * value_dim;
     float* beta     = scratch;                                    scratch += static_cast<std::size_t>(T) * Hv;
-    float* gg       = scratch;                                    /* scratch += T*Hv, unused after */
+    float* gg       = scratch;                                    scratch += static_cast<std::size_t>(T) * Hv;
+    // WP4d: the gated/normed value row was a `float gated[4096]` STACK array with a comment calling 4096
+    // a "generous" bound on value_dim. It is not: the real Qwen4-preview model's value_dim is
+    // num_v_heads 48 x head_v_dim 128 = 6144, so the very first real GDN layer wrote 2048 floats past the
+    // end of a stack buffer -- a hard segfault, and the first thing that happened when this engine was
+    // finally built at the real axes (WP4d). Every existing check missed it for the same reason: the
+    // fixture is a SLICED layer (3 value heads, value_dim 384) and no build in this repo had ever run GDN
+    // at the real head counts. Sized from the Dims out of the caller's own scratch now, so the bound
+    // cannot be wrong -- scratch_floats() accounts for exactly this row.
+    float* gated    = scratch;                                    /* scratch += value_dim, unused after */
 
     // in_proj_qkv, in_proj_z, in_proj_b, in_proj_a -- this project's [in,out] weight convention.
     for (int t = 0; t < T; ++t) {
@@ -264,7 +274,6 @@ inline void forward(const Dims& d, int T,
     // RMSNormGated, per head_v_dim group (norm_w is [head_v_dim], shared across heads -- S1c), gated
     // by sigmoid(z) (this real config's output_gate_type), then out_proj back to hidden_size.
     for (int t = 0; t < T; ++t) {
-        float gated[/*value_dim, generous*/ 4096];
         const float* core_row = qkv_post + static_cast<std::size_t>(t) * conv_dim + v_off;
         const float* z_row = zb + static_cast<std::size_t>(t) * value_dim;
         for (int hh = 0; hh < Hv; ++hh) {
@@ -330,7 +339,8 @@ inline constexpr std::size_t bwd_scratch_floats(const Dims& d, int T) {
          + T_ * Hv_ * dv_ * 2                                       // delta_traj, core
          + T_ * Hv_                                                 // rinv
          + Hv_ * dk_ * dv_ * 2                                      // G_a, G_b (backward-recurrence ping-pong)
-         + dk_ * dv_;                                                // zero_state (shared, all-zero S_{-1})
+         + dk_ * dv_                                                 // zero_state (shared, all-zero S_{-1})
+         + static_cast<std::size_t>(d.value_dim());                  // d_gated_row (ONE row, reused per t)
 }
 
 namespace detail {
@@ -481,7 +491,14 @@ inline void backward(const Dims& d, int T,
     float* rinv_buf      = scratch; scratch += T_ * Hv;
     float* G_a           = scratch; scratch += static_cast<std::size_t>(Hv) * dk * dv;
     float* G_b           = scratch; scratch += static_cast<std::size_t>(Hv) * dk * dv;
-    float* zero_state    = scratch; /* scratch += dk*dv, unused after */
+    float* zero_state    = scratch; scratch += static_cast<std::size_t>(dk) * dv;
+    // WP4d: same fix, and the same latent segfault, as forward()'s own `gated` row -- this was a
+    // `float d_gated_row[4096]` stack array against a real value_dim of 6144. Carved from the caller's
+    // scratch so the size comes from the Dims. (Unreachable today in the build that FOUND the forward
+    // half -- Gated Residual/MoE/QSA all abort in backward_node -- but a GDN-only build at the real head
+    // counts trains, so leaving the twin defect in place would have been the "fix the instance, not the
+    // class" mistake AGENTS.md S10 names.)
+    float* d_gated_row   = scratch; /* scratch += value_dim, unused after */
 
     // --- Recompute forward, retaining everything (S4's recompute-during-backward direction) --------
     for (int t = 0; t < T; ++t) {
@@ -609,7 +626,6 @@ inline void backward(const Dims& d, int T,
     // gated_flat^T @ dOut. RMSNormGated's backward then overwrites `core` and `z_proj` IN PLACE with
     // d(core) / d(z_logit) respectively -- safe because every read of a given (t,head)'s core/z values
     // happens-before that same (t,head)'s first overwrite (see the two-pass structure below).
-    float d_gated_row[/*value_dim, generous*/ 4096];
     float gate_cache[256], d_normed_cache[256];   // dv bound, matches this file's other head-dim bounds
     for (int t = 0; t < T; ++t) {
         const float* dYr = dOut + static_cast<std::size_t>(t) * hs;

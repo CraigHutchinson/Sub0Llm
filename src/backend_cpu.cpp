@@ -191,6 +191,28 @@ constexpr size_t MAX_NODES = 16 + (USE_GATED_FFN ? 18 : 16) * (size_t)LOOP_EXEC_
 // will map, so the image fails to load with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This is the same
 // reason the per-thread Worker arrays below are heap-allocated. ensure_shared_params() allocates them
 // once (zeroed) before any parameter node references them; unique_ptr<float[]> keeps [] and .get().
+//
+// WP4d -- THE TRAINING ARENAS ARE NOT ALLOCATED IN A BUILD THAT PROVABLY CANNOT TRAIN. There are four
+// of these, each PARAM_FLOATS long, plus a FIFTH per Worker (its own gradient accumulator, below). At
+// this project's own training scales that is a few GB and nobody notices. At the real Qwen4-preview
+// axes PARAM_FLOATS is 11,647,617,440 -- 43.4 GiB apiece -- so the eager form asks for ~217 GiB before
+// a single token is embedded, on a 63 GiB machine. A forward pass at the real axes could not start.
+//
+// The saving grace is that they are DEAD, not merely large, in exactly those builds: Gated Residual,
+// Mixture of Experts and Qwen Sparse Attention each abort() in backward_node (Stage 1 is CPU-forward-
+// only, see those three sites), so a build with any of them on cannot reach one gradient write. This
+// is a DERIVED compile-time fact, not a new user knob (AGENTS.md S8): it reads the same three USE_*
+// constants the refusals themselves are written against, so it cannot drift out of agreement with them.
+//
+// Gated DeltaNet is deliberately NOT in this set. Its Stage 2 CPU backward is real and gradient-checked,
+// so a GDN-only build still trains and still allocates everything it always did -- which is also why
+// every existing build in this repo is bit-identical under this change: FORWARD_ONLY is false unless
+// one of the three forward-only mechanisms is on, and no default build turns any of them on.
+constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA;
+// Sized 1 (not 0 -- a zero-length std::array has no data()) when the gradient path is dead. Only the
+// Worker's array can be conditionally sized like this; the shared three are heap handles that simply
+// stay null, and every accessor that would hand one out refuses loudly instead (see grad_ptr below).
+constexpr size_t WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS;
 static std::unique_ptr<float[]> g_param_data;
 static std::unique_ptr<float[]> g_param_grad;
 static std::unique_ptr<float[]> g_param_m;
@@ -199,10 +221,26 @@ static std::once_flag           g_shared_params_once;
 static void ensure_shared_params() {
     std::call_once(g_shared_params_once, [] {
         g_param_data = std::make_unique<float[]>(PARAM_FLOATS);   // value-initialized -> zeroed
-        g_param_grad = std::make_unique<float[]>(PARAM_FLOATS);
-        g_param_m    = std::make_unique<float[]>(PARAM_FLOATS);
-        g_param_vel  = std::make_unique<float[]>(PARAM_FLOATS);
+        if constexpr (!FORWARD_ONLY) {
+            g_param_grad = std::make_unique<float[]>(PARAM_FLOATS);
+            g_param_m    = std::make_unique<float[]>(PARAM_FLOATS);
+            g_param_vel  = std::make_unique<float[]>(PARAM_FLOATS);
+        }
     });
+}
+// The one seam every training consumer of the three arenas comes through. Refusing HERE rather than
+// letting a null pointer reach memcpy is this project's "put the refusal at the lowest callable seam"
+// rule (memory: caps-bit-nothing-reads-is-not-a-guard): the backward pass already aborts, so reaching
+// this is a bug in a caller that skipped it, and a null deref would name the wrong thing.
+[[noreturn]] static void refuse_training_arena(const char* what) {
+    std::println(stderr,
+                 "fatal: {} does not exist in this build -- Gated Residual / MoE / QSA are CPU-forward-"
+                 "only (backward_node aborts), so the gradient and AdamW-moment arenas are not "
+                 "allocated at all ({} floats each would be {:.1f} GiB apiece here). Nothing but a "
+                 "training path can want this pointer.",
+                 what, PARAM_FLOATS,
+                 static_cast<double>(PARAM_FLOATS) * 4.0 / (1024.0 * 1024.0 * 1024.0));
+    std::abort();
 }
 
 struct ParamView { size_t off, n; bool decay; };
@@ -218,7 +256,8 @@ struct ParamView { size_t off, n; bool decay; };
 // The pool is sized to MAX_WORKERS, a hardware-scaled constant cached into the config; only the
 // MAX_WORKERS unique_ptr handles (not the Workers) live in BSS.
 struct Worker {
-    std::array<float, PARAM_FLOATS> grad{};        // gradient accumulator (this slot)
+    std::array<float, WORKER_GRAD_FLOATS> grad{};  // gradient accumulator (this slot); 1 float when
+                                                    // FORWARD_ONLY -- see that constant's comment
     std::array<float, ACT_CAP>      act_data{};    // activation arena: values
     std::array<float, ACT_CAP>      act_grad{};    // activation arena: grads
     std::array<Node, NUM_PARAMS>    param_nodes{}; // parameter leaves (data->shared, grad->this)
@@ -259,7 +298,11 @@ static Node* mk_param(int r, int c, bool decay) {
     nd = Node{};
     nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
     nd.data = std::span<float>(g_param_data.get() + off, n);    // shared weights
-    nd.grad = std::span<float>(W->grad.data() + off, n);        // this thread's grad accumulator
+    // FORWARD_ONLY: no per-thread gradient accumulator exists, so a parameter leaf carries an EMPTY
+    // grad span rather than a span into a buffer that was never allocated. Nothing in the forward path
+    // reads a parameter's grad, and the backward path aborts before it could.
+    if constexpr (FORWARD_ONLY) nd.grad = std::span<float>{};
+    else nd.grad = std::span<float>(W->grad.data() + off, n);   // this thread's grad accumulator
     W->views[W->pcount] = {off, n, decay};
     ++W->pcount;
     return &nd;
@@ -1856,7 +1899,9 @@ struct Model {
                 const std::size_t off = static_cast<std::size_t>(e) * NGRAM_EMB_DIM * D_MODEL;
                 const std::size_t n   = static_cast<std::size_t>(NGRAM_EMB_DIM) * D_MODEL;
                 v.data = ngram_proj->data.subspan(off, n);   // ALIASES ngram_proj -- not a separate param
-                v.grad = ngram_proj->grad.subspan(off, n);
+                // FORWARD_ONLY leaves every parameter leaf's grad span EMPTY (mk_param), so there is
+                // nothing to slice a row-block out of -- the alias stays empty too.
+                v.grad = ngram_proj->grad.empty() ? std::span<float>{} : ngram_proj->grad.subspan(off, n);
             }
         }
     }
@@ -2608,14 +2653,22 @@ void set_sentinel_bindings(const SentinelBindings* b) { g_sentinel_binds = b; }
 // on a CPU-only build described memory that is never allocated (see docs/MEMORY_AUDIT.md 5).
 void print_host_memplan() {
     constexpr double kMiB = 1024.0 * 1024.0;
-    constexpr double shared_mb = 4 * PARAM_FLOATS * sizeof(float) / kMiB;   // data + grad + m + vel
+    // FORWARD_ONLY builds allocate the weights and NOTHING else shared (see that constant), so the
+    // multiplier is 1, not 4 -- reporting 4 here would over-state the footprint by 3x PARAM_FLOATS,
+    // which at the real Qwen4-preview axes is 130 GiB of memory that is never asked for.
+    constexpr int    shared_copies = FORWARD_ONLY ? 1 : 4;                  // data (+ grad + m + vel)
+    constexpr double shared_mb = shared_copies * PARAM_FLOATS * sizeof(float) / kMiB;
     constexpr double worker_mb = sizeof(Worker) / kMiB;
-    constexpr double wgrad_mb  = PARAM_FLOATS * sizeof(float) / kMiB;       // the per-worker gradient
+    constexpr double wgrad_mb  = WORKER_GRAD_FLOATS * sizeof(float) / kMiB; // the per-worker gradient
     constexpr double arena_mb  = 2 * ACT_CAP * sizeof(float) / kMiB;        // act_data + act_grad
     constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
     std::println("host (CPU) plan: shared {:.0f} MiB + {} x worker {:.0f} MiB = {:.0f} MiB",
                  shared_mb, workers, worker_mb, shared_mb + workers * worker_mb);
-    std::println("  shared: params + grad + m + vel ({} floats x 4)", PARAM_FLOATS);
+    if constexpr (FORWARD_ONLY)
+        std::println("  shared: params only ({} floats x 1) -- no grad/m/vel: this build cannot train",
+                     PARAM_FLOATS);
+    else
+        std::println("  shared: params + grad + m + vel ({} floats x 4)", PARAM_FLOATS);
     std::println("  worker: gradient {:.0f} MiB + activation arenas {:.0f} MiB + graph nodes {:.0f} MiB",
                  wgrad_mb, arena_mb, worker_mb - wgrad_mb - arena_mb);
     if constexpr (COMPUTE_MODE == ComputeBackend::Gpu)
@@ -2637,7 +2690,8 @@ void print_config() {
     // run drives the engine from one thread (slot 0) while CPU and Hybrid fan out to DEFAULT_THREADS.
     // Reporting the full count unconditionally would replace an under-report with an over-report.
     constexpr double kMB = 1e6;
-    constexpr double shared_mb = 4 * PARAM_FLOATS * sizeof(float) / kMB;   // data + grad + m + vel
+    // x1, not x4, when this build cannot train -- see FORWARD_ONLY and print_host_memplan's own note.
+    constexpr double shared_mb = (FORWARD_ONLY ? 1 : 4) * PARAM_FLOATS * sizeof(float) / kMB;
     constexpr double worker_mb = sizeof(Worker) / kMB;                     // grad + arenas + nodes + views
     constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
     std::println("model: d={} L={} H={} ff={} seq={} vocab={}{} | params: {:.2f}M | "
@@ -2663,9 +2717,10 @@ bool fast_math() { return FAST_MATH; }
 
 std::size_t trainable_floats() { return PARAM_FLOATS; }
 float*      params_ptr()       { ensure_shared_params(); return g_param_data.get(); }
-float*      grad_ptr()         { ensure_shared_params(); return g_param_grad.get(); }  // reduced grad the optimizer reads
-float*      adam_m_ptr()       { ensure_shared_params(); return g_param_m.get(); }
-float*      adam_v_ptr()       { ensure_shared_params(); return g_param_vel.get(); }
+// reduced grad the optimizer reads / the two AdamW moments -- all three absent under FORWARD_ONLY.
+float*      grad_ptr()         { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the parameter-gradient arena"); else return g_param_grad.get(); }
+float*      adam_m_ptr()       { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the AdamW first-moment arena"); else return g_param_m.get(); }
+float*      adam_v_ptr()       { ensure_shared_params(); if constexpr (FORWARD_ONLY) refuse_training_arena("the AdamW second-moment arena"); else return g_param_vel.get(); }
 
 // CPU backend: parameters already live in host memory, so the host/device sync hooks
 // are no-ops. A device backend overrides these to copy the params_ptr()/adam_*_ptr()
@@ -2732,7 +2787,12 @@ void backward(Node* loss, float seed) {
 
 // Single-window reduction: publish this thread's accumulator as the shared gradient
 // the optimizer consumes. (train_batch does the parallel multi-thread reduction.)
-void reduce_gradients() { std::ranges::copy(W->grad, g_param_grad.get()); }
+void reduce_gradients() {
+    // FORWARD_ONLY: neither side of this copy exists (see that constant). Refuse at the seam rather
+    // than copying one float into a null pointer.
+    if constexpr (FORWARD_ONLY) refuse_training_arena("the parameter-gradient arena");
+    else std::ranges::copy(W->grad, g_param_grad.get());
+}
 
 // Data-parallel minibatch: each window's full forward+backward runs on its own
 // thread into a private gradient accumulator, then the accumulators are summed into
@@ -2830,6 +2890,8 @@ static void muon_step_one(std::size_t off, int rows, int cols, float lr, float b
 }
 
 void AdamW::step() {
+    // FORWARD_ONLY: the gradient and both moment arenas were never allocated (see that constant).
+    if constexpr (FORWARD_ONLY) refuse_training_arena("the AdamW optimizer state");
     double sq = 0.0;
     #pragma omp simd reduction(+ : sq)
     for (size_t i = 0; i < PARAM_FLOATS; ++i) { double g = g_param_grad[i]; sq += g * g; }

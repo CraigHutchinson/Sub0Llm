@@ -644,6 +644,15 @@ int main(int argc, char** argv) {
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
+    // WP4d blocker E (docs/WP4_SCOPE.md S6): the FFN / expert intermediate width. Until this pass it was
+    // ALWAYS derived from D_MODEL (sub0::config::d_ff_for -- 4x plain, ~8/3x gated), which cannot express
+    // the real Qwen4-preview model at all: its moe_intermediate_size is 640 against hidden_size 2560, i.e.
+    // a QUARTER of D_MODEL, where the derivation gives 6848. That is not a tuning preference -- under MoE
+    // this width is a per-expert weight shape, so no transplant of real expert weights is possible while it
+    // is derived. 0 = derive (every existing build byte-identical, the same idiom --head-dim/--kv-heads use).
+    // Shape-changing, so PARAM_FLOATS discriminates it and no ARCH_FINGERPRINT bit is needed
+    // (layout.hpp's own three-way axis rule).
+    int d_ff_pin     = 0;
     int ternary      = 0;
     // The proven architecture stack defaults ON (each is a measured win, verified at production d448 --
     // gated FFN, tied embeddings, QK-norm; project memory arch-features-off-by-default). Pass `--gated-ffn 0`
@@ -791,6 +800,12 @@ int main(int argc, char** argv) {
                    "Linear RoPE scaling divisor, e.g. 4 to run a 4x longer window")
        ->capture_default_str();
     app.add_option("--seq",    seq_len, "Context window length (0 = auto)")->capture_default_str();
+    app.add_option("--d-ff", d_ff_pin,
+                   "FFN / MoE-expert intermediate width (0 = derive from --dmodel: 4x plain, ~8/3x "
+                   "gated). Pin it to import a checkpoint whose FFN width is not a function of its "
+                   "hidden size -- the real Qwen4-preview's moe_intermediate_size is 640 at "
+                   "hidden_size 2560")
+       ->capture_default_str()->check(CLI::NonNegativeNumber);
     app.add_option("--ternary",ternary, "1 = BitNet-style ternary block weights")
        ->capture_default_str()->check(CLI::Range(0, 1));
     app.add_option("--gated-ffn", gated_ffn,
@@ -920,8 +935,17 @@ int main(int argc, char** argv) {
         emit_tok = pretok ? 1 : 0;
     }
 
-    if (d_model % n_heads != 0) {
-        std::println(stderr, "configure error: dmodel ({}) not divisible by heads ({})",
+    // Only when the head width is DERIVED. WP4b blocker A made D_HEAD its own axis and the resolution
+    // block below already says so in words ("an explicit --head-dim is free of it, which is the whole
+    // point -- the real model does not divide"), but this check ran unconditionally and BEFORE that
+    // resolution, so `--head-dim 256` at d_model 2560 / 24 heads -- the real Qwen4-preview shape, and the
+    // exact case the flag exists for -- was refused outright with a message naming a constraint that no
+    // longer applies. Found by WP4d being the first thing to run the real axes through the real
+    // configurator: WP4b's own gates were all compile-time checks against a HAND-WRITTEN config header,
+    // which never exercised this tool at all.
+    if (head_dim == 0 && d_model % n_heads != 0) {
+        std::println(stderr, "configure error: dmodel ({}) not divisible by heads ({}) -- pass an "
+                             "explicit --head-dim to decouple the head width from d_model/n_heads",
                      d_model, n_heads);
         return 1;
     }
@@ -1111,7 +1135,9 @@ int main(int argc, char** argv) {
     }
     // Plain FFN keeps the long-standing 4*D_MODEL width; gated (SwiGLU) uses a narrower width chosen
     // so the two styles land at roughly the same total FFN param count -- see d_ff_for's doc comment.
-    const int d_ff = sub0::config::d_ff_for(d_model, gated_ffn != 0);
+    // WP4d blocker E: --d-ff pins this width; 0 keeps the long-standing derivation, so every build that
+    // does not pass the flag emits the identical D_FF it always did.
+    const int d_ff = d_ff_pin > 0 ? d_ff_pin : sub0::config::d_ff_for(d_model, gated_ffn != 0);
 
     const std::string abspath = std::filesystem::absolute(corpus).string();
 
