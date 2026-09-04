@@ -170,7 +170,9 @@ So the minimum viable dequant tier is decided by which tier's *non-table* remain
 needs a byte-range-aware skip, not a whole-file skip — computable with zero new code from
 `TensorInfo::offset`, but only once `tensor_byte_size()` knows `IQ4_NL`'s length rule.
 
-**Minimum dequant work for a first real run, in dependency order:**
+**Minimum dequant work for a first real run, in dependency order (SUPERSEDED — see §3a-bis below for the
+real census, once the file existed locally to read directly instead of guessing from an HTTP header
+probe):**
 
 | Format | Needed for | Size rule | Decode |
 |---|---|---|---|
@@ -189,6 +191,66 @@ per-tensor selective acquisition is already solved. **The cost of this recommend
 2 bytes/param, so the backbone+MoE at bf16 is ≈231 GiB — far past RAM, meaning the safetensors path
 *requires* the expert-offload machinery of §4 to work before a full-model run is possible, whereas
 `UD-IQ1_S` would nearly fit. §7 Q2 puts this trade to the user rather than settling it here.
+
+### 3a-bis. The real census (2026-09-04) — read from the actual downloaded file, not a header probe
+
+**§7 Q2 is now decided: the user chose GGUF/`UD-IQ1_S`** (already fully downloaded, all three shards,
+72.55GB, to `D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S\`). With the real file locally available,
+a throwaway tool built against this project's own `gguf::Reader` (reading just the header — 4MiB was
+enough for every shard) gives the ACTUAL per-tensor type breakdown, which is materially different from
+what §3/§3a assumed from the earlier HTTP-header-probe summary:
+
+**Every raw GGML type id actually present, across shards 2+3** (shard 1, 10.9MB, is pure metadata/vocab,
+zero tensors): `F32`(0), `Q8_0`(8), `Q4_K`(12), `Q5_K`(13), `Q6_K`(14), `IQ2_XXS`(16), `IQ1_S`(19),
+`IQ4_NL`(20), `BF16`(30) — **seven formats beyond the three `gguf.hpp` already supports**, not the one or
+two either §3a's table or the earlier deployment-feasibility summary implied.
+
+**Per-tensor-role assignment** (from a full dump of `blk.0.*` and `blk.23.*`, a GDN and a QSA layer
+respectively, plus every non-`blk.*` tensor):
+
+| Real tensor role | GGUF name(s) | Type | Notes |
+|---|---|---|---|
+| Token/output embeddings | `token_embd.weight`, `output.weight` | `Q4_K` | both `[2560, 248320]`, untied confirmed |
+| GDN `in_proj_qkv` | `blk.N.attn_qkv.weight` | `Q5_K` | `[2560, 10240]` — GGUF's own naming calls GDN's fused QKV projection `attn_qkv`, not an SSM-prefixed name |
+| GDN `in_proj_z` (gate) | `blk.N.attn_gate.weight` | `Q5_K` | `[2560, 6144]` |
+| GDN `A_log`/`dt_bias`/conv/norm | `blk.N.ssm_a`, `ssm_dt.bias`, `ssm_alpha.weight`, `ssm_beta.weight`, `ssm_conv1d.weight`, `ssm_norm.weight` | `F32` (all) | full precision — these are small vectors, not a real cost |
+| GDN `out_proj` | `blk.N.ssm_out.weight` | `Q6_K` | `[6144, 2560]` |
+| QSA `q_proj` (query+gate, fused) | `blk.N.attn_q.weight` | `Q5_K` | `[2560, 12288]` — **confirms the real double-width q_proj** (`24×256×2`) directly from the checkpoint, independent of `docs/QSA.md`'s own HF-source derivation |
+| QSA `k_proj`/`v_proj` | `blk.N.attn_k.weight`, `attn_v.weight` | `Q5_K` | `[2560, 512]` each |
+| QSA `o_proj` | `blk.N.attn_output.weight` | `Q5_K` | `[6144, 2560]` |
+| QSA `q_norm`/`k_norm` | `blk.N.attn_q_norm.weight`/`attn_k_norm.weight` | `F32` | `[256]` |
+| **QSA indexer** | `blk.N.indexer.q_proj.weight` **and** `indexer.k_proj.weight` (SEPARATE tensors) | `BF16` | `[2560,512]` and `[2560,128]` — **GGUF stores the indexer's fused `index_qk_proj` as TWO tensors**, not one; a transplant into this engine's single `QsaIdxQkProj` slot must concatenate them, in the same n/kv head order `docs/QSA.md` §1a's asymmetric split already documents |
+| Gated Residual (all 4 tensors, both instances) | `blk.N.hc_{attn,ffn}_{norm,down,up,inject}.weight` | `F32` (norm/inject) or `Q8_0` (down/up) | matches `docs/GATED_RESIDUAL.md` §1a's tensor set exactly by name pattern |
+| MoE router | `blk.N.ffn_gate_inp.weight` | `F32` | `[2560, 512]` — full precision, consistent with §2a(v2)'s "dense-read, always-resident" finding |
+| MoE routed gate/up (SEPARATE, not fused `gate_up_proj`) | `blk.N.ffn_gate_exps.weight`, `ffn_up_exps.weight` | `IQ1_S` **or** `IQ2_XXS`, varying **PER LAYER** (e.g. layers 0/3/5 use `IQ1_S`, layers 1/2/4 use `IQ2_XXS`, observed directly, not inferred) | `[2560,640,512]` each — unsloth's own "Dynamic" (`UD`) per-layer importance-based mixed quantization; a transplant CANNOT assume one format per tensor role, it must read each tensor's own `type_raw` |
+| MoE routed down | `blk.N.ffn_down_exps.weight` | `IQ4_NL` | `[640,2560,512]` — consistently this format across every layer checked |
+| MoE shared expert gate/up | `blk.N.ffn_gate_shexp.weight`, `ffn_up_shexp.weight` | `Q5_K` | `[2560,640]` |
+| MoE shared expert down | `blk.N.ffn_down_shexp.weight` | `Q8_0` | `[640,2560]` |
+| MoE shared-expert gate scalar | `blk.N.ffn_gate_inp_shexp.weight` | `F32` | `[2560]` — matches `MoeSharedGateProj` |
+| N-gram/PLE table (excluded from the run, §5) | `per_layer_token_embd.weight` | `IQ4_NL` | `[160, 320001536]` — confirmed exactly where §1c/§3a said it would be |
+
+**Two structural findings that change the transplant design, not just the dequant checklist**:
+
+1. **GGUF's tensor granularity is NOT the HF/safetensors granularity `docs/*.md` §4b's subtlety table was
+   built against.** The indexer's fused `index_qk_proj` and MoE's fused `gate_up_proj` both arrive as TWO
+   separate GGUF tensors each. The transplant pipeline must concatenate (indexer: q-half then k-half,
+   matching the asymmetric split `docs/QSA.md` §1a already documents; MoE: gate-half then up-half, per
+   `docs/MOE.md` §1a's own chunking order) — a real per-tensor-pair reconstruction step, not just a
+   name-lookup + transpose.
+2. **Per-layer mixed quantization means the dequant dispatch must be driven by each tensor's own
+   `type_raw`, never assumed from its name/role.** `blk.0.ffn_gate_exps.weight` and
+   `blk.1.ffn_gate_exps.weight` are the same logical tensor at consecutive layers and are quantized
+   DIFFERENTLY. `gguf::Reader::tensor_bytes()`/`dequantize_tensor()`'s existing per-tensor (not
+   per-schema) dispatch already has the right shape for this — it just needs the new format cases added.
+
+**Revised minimum dequant work — seven formats, not one or two**: `Q4_K`(12), `Q5_K`(13), `Q6_K`(14),
+`IQ1_S`(19), `IQ2_XXS`(16), `IQ4_NL`(20), `BF16`(30). All are publicly documented ggml block formats
+(same reference this doc already cites for Q8_0's own block layout). This is a materially larger `gguf.hpp`
+extension than either this section or the deployment-feasibility doc's own earlier estimate implied even
+just for the 4-layer sub-stack (§7 Q3) — layers 0-3 alone already exercise both `IQ1_S` and `IQ2_XXS`
+(layers 0/3 vs layers 1/2), plus every other format via the always-present embeddings/attention/GDN/GR
+tensors. **User re-confirmed the GGUF path with this real cost made explicit** (2026-09-04, via
+`AskUserQuestion`) rather than the recommendation below being silently acted on.
 
 ### 3b. What a safetensors reader would need that `gguf.hpp` does not provide
 
