@@ -633,6 +633,10 @@ int main(int argc, char** argv) {
     int qsa_idx_head_dim   = 0;
     int qsa_idx_budget     = 0;
     int qsa_idx_ratio      = 0;
+    // Partial rotary (WP4b blocker C, docs/WP4_SCOPE.md S2): rotate only a head vector's first
+    // ROTARY_DIM channels. The real model's partial_rotary_factor = 0.25 x head_dim 256 = 64. 0 = the
+    // derived head width, i.e. the full-width rotation every build before this axis performed.
+    int rotary_dim           = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -762,6 +766,12 @@ int main(int argc, char** argv) {
                    "QSA: how many consecutive keys are mean-pooled into one selectable block (0 = off, "
                    "else >= 1). Capped at 255 -- it rides 8 bits of ARCH_FINGERPRINT2")
        ->capture_default_str()->check(CLI::Range(0, 255));
+    app.add_option("--rotary-dim", rotary_dim,
+                   "Rotary PREFIX width: rotate only each head's first N channels, passing the rest "
+                   "through untouched (the reference's partial_rotary_factor x head_dim). 0 = the full "
+                   "head width, what every build before this axis did. Must be even and <= the head dim. "
+                   "Real Qwen4-preview: 64 of 256")
+       ->capture_default_str()->check(CLI::Range(0, 65535));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -934,6 +944,25 @@ int main(int argc, char** argv) {
     // MODEL_ARCH_IDs. Same treatment n_kv_heads' own 0-means-derive already gets, just above.
     {
         const int d_head = d_model / n_heads;   // the divisibility check above already ran
+        // Partial rotary (WP4b blocker C): resolve 0 -> the full head width HERE, so the header always
+        // carries the RESOLVED prefix and layout.hpp needs no second derivation. Mirrors layout.hpp's
+        // own static_asserts as a configure-time diagnostic naming the flag.
+        if (rotary_dim == 0) rotary_dim = d_head;
+        // NOT required to be even in general: an ODD head width is a shape this engine has always
+        // supported (d132 H4 gives d_head 33), and op_rope rotates floor(rotary_dim/2) pairs there,
+        // passing the lone trailing component through -- see layout.hpp's ROTARY_HALF comment. QSA's
+        // half-split convention DOES need an even prefix; that is checked in the QSA block below.
+        if (rotary_dim < 2) {
+            std::println(stderr, "configure error: rotary-dim ({}) must be at least 2 (RoPE rotates "
+                                 "channel PAIRS)", rotary_dim);
+            return 1;
+        }
+        if (rotary_dim > d_head) {
+            std::println(stderr, "configure error: rotary-dim ({}) cannot exceed the head dim ({}) -- "
+                                 "the rotary prefix must fit inside the head vector it rotates",
+                         rotary_dim, d_head);
+            return 1;
+        }
         if (gdn_key_heads      == 0) gdn_key_heads      = n_kv_heads;
         if (gdn_value_heads    == 0) gdn_value_heads    = n_heads;
         if (gdn_key_head_dim   == 0) gdn_key_head_dim   = d_head;
@@ -1040,6 +1069,22 @@ int main(int argc, char** argv) {
             if (qsa_idx_head_dim % 2 != 0) {
                 std::println(stderr, "configure error: qsa-indexer-head-dim ({}) must be even (the "
                                      "half-split rotary needs an even rotary prefix)", qsa_idx_head_dim);
+                return 1;
+            }
+            // The indexer's own head vectors are rotated by the SAME cos/sin as the attention heads
+            // (docs/QSA.md S1b), so its head width must be at least the rotary prefix or rope_apply_row
+            // writes past the end of a per-head slice -- layout.hpp static_asserts this; here it is a
+            // diagnostic naming the flags. Real model: rotary 64 <= indexer_head_dim 128.
+            if (rotary_dim % 2 != 0) {
+                std::println(stderr, "configure error: rotary-dim ({}) must be EVEN when QSA is on -- "
+                                     "its half-split rotary pairs channel i with i + rotary-dim/2",
+                             rotary_dim);
+                return 1;
+            }
+            if (qsa_idx_head_dim < rotary_dim) {
+                std::println(stderr, "configure error: qsa-indexer-head-dim ({}) must be >= rotary-dim "
+                                     "({}) -- the same cos/sin rotate the indexer's own head vectors",
+                             qsa_idx_head_dim, rotary_dim);
                 return 1;
             }
             if (qsa_idx_budget < qsa_idx_ratio) {
@@ -1544,6 +1589,11 @@ int main(int argc, char** argv) {
     cos << "constexpr int  QSA_INDEXER_COMPRESS_RATIO = " << qsa_idx_ratio << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
+    // Partial rotary (WP4b blocker C): the rotary PREFIX width -- only each head's first ROTARY_DIM
+    // channels are rotated (the reference's partial_rotary_factor x head_dim; real model 64 of 256).
+    // Emitted RESOLVED (0 = the full head width, resolved above). Shape-NEUTRAL and computation-changing,
+    // so it rides ARCH_FINGERPRINT2's high 16 bits -- see layout.hpp's ROTARY_DIM comment.
+    cos << "constexpr int  ROTARY_DIM  = " << rotary_dim << ";\n";
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
     cos << "constexpr float ROPE_SCALE_FACTOR = " << std::format("{:.4f}", rope_scale_factor) << "f;\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
@@ -1743,6 +1793,7 @@ int main(int argc, char** argv) {
     shown.qsa_idx_n_heads = qsa_idx_n_heads; shown.qsa_idx_kv_heads = qsa_idx_kv_heads;
     shown.qsa_idx_head_dim = qsa_idx_head_dim; shown.qsa_idx_budget = qsa_idx_budget;
     shown.qsa_idx_ratio = qsa_idx_ratio;
+    shown.rotary_dim = rotary_dim;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;

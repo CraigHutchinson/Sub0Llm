@@ -194,6 +194,7 @@ struct ModelMeta : RunState {
     X(int,         qsa_idx_head_dim, 0)   \
     X(int,         qsa_idx_budget,  0)    \
     X(int,         qsa_idx_ratio,   0)    \
+    X(int,         rotary_dim,      0)    \
     X(int,         rope_scaling,    0)    \
     X(double,      rope_scale_fac,  1.0)  \
     X(double,      rope_theta,  10000.0)  \

@@ -378,6 +378,30 @@ TEST_CASE("Gated DeltaNet head axes alias the attention axes at their neutral se
     STATIC_REQUIRE(real.rep() == 3);   // the reference's repeat_interleave factor, 48 / 16
 }
 
+// Partial rotary (WP4b blocker C, docs/WP4_SCOPE.md S2). The engine's rotary prefix used to BE D_HEAD;
+// --rotary-dim makes it its own axis so the real model's partial_rotary_factor (0.25 x head_dim 256 =
+// 64 of 256) is expressible. What must be pinned: the neutral setting still means "rotate the whole
+// head", the prefix is a legal one, and it is the quantity QSA_DIMS actually carries.
+TEST_CASE("rotary prefix defaults to the full head width and stays a legal prefix", "[layout][rope]") {
+    STATIC_REQUIRE(ROTARY_DIM >= 2);
+    STATIC_REQUIRE(ROTARY_DIM <= D_HEAD);
+    // Even only under QSA (its half-split pairing needs it). An ODD prefix is legal for the interleaved
+    // op_rope convention and is a shape this project actually builds -- d132 H4 gives D_HEAD 33.
+    STATIC_REQUIRE(!sub0::USE_QSA || ROTARY_DIM % 2 == 0);
+    STATIC_REQUIRE(sub0::ROTARY_HALF == ROTARY_DIM / 2);
+    // QSA_DIMS.rotary_dim is the ONE value qsa_math.hpp's rope_apply_row indexes; it must be the axis,
+    // not a second derivation of it. (Its own precondition, rotary_dim <= the width being rotated, is
+    // what layout.hpp's QSA_INDEXER_HEAD_DIM >= ROTARY_DIM static_assert now enforces -- the old
+    // `>= D_HEAD` form would have REJECTED the real model, whose indexer heads are 128 < head_dim 256.)
+    STATIC_REQUIRE(sub0::QSA_DIMS.rotary_dim == ROTARY_DIM);
+    STATIC_REQUIRE(sub0::QSA_DIMS_BUF.rotary_dim == ROTARY_DIM);
+    // The real model's own relationship, checked on a standalone Dims rather than this build's (which is
+    // full-width by default): the prefix is narrower than the attention head AND than the indexer head.
+    constexpr sub0::qsa::Dims real{2560, 24, 256, 2, 4, 1, 128, 2048, 4, 64};
+    STATIC_REQUIRE(real.rotary_dim < real.head_dim);
+    STATIC_REQUIRE(real.rotary_dim <= real.idx_head_dim);
+}
+
 // ARCH_FINGERPRINT2 must reproduce 0 at the only value GDN_FULL_ATTN_STRIDE can currently take, and
 // must differ once a nonzero stride is EVER passed to the free function -- the exact same "neutral is
 // bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
@@ -398,7 +422,8 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
                                                                     QSA_INDEXER_BUDGET,
                                                                     QSA_INDEXER_COMPRESS_RATIO,
                                                                     sub0::USE_GATED_DELTANET
-                                                                        ? sub0::GDN_K_HEADS : 0));
+                                                                        ? sub0::GDN_K_HEADS : 0,
+                                                                    ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM));
         REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
     }
 
@@ -452,10 +477,24 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16)).qsa_indexer_budget == 2048);
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0xff)).gdn_key_heads == 0xff);
 
-    // The reserved high 16 bits stay zero regardless of any field's value -- headroom for the NEXT
-    // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    // (Was 24 bits before GDN's key-head count claimed byte 5.)
-    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff, 0xff) >> 48) == 0);
+    // The PARTIAL ROTARY prefix (WP4b blocker C) occupies the top 16 bits, [63:48]. Sixteen and not
+    // eight because it is bounded by D_HEAD, which is 256 in the real model. It changes NO tensor shape
+    // while rotating fewer channels of every head, so nothing but this word can catch a cross-load --
+    // the same reason ROPE_THETA sits in ARCH_FINGERPRINT. Canonicalized to 0 at full-width rotary.
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 0, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 0, 0, 0, 32));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 64, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64) != sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 0));
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64)).partial_rotary_dim == 64);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64)).gdn_key_heads == 16);
+    // A prefix above 255 must survive intact -- the direct check that 16 bits, not 8, were allocated
+    // (the real model's head_dim is 256, so an 8-bit field would silently alias 256 to 0).
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 256)).partial_rotary_dim == 256);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 0xffff)).partial_rotary_dim == 0xffff);
+    // Every field packed at once still round-trips -- the word is now FULL (64 bits assigned), so the
+    // next shape-neutral axis needs a third additive word rather than a repack.
+    REQUIRE(sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff, 0xff, 0xffff) ==
+            0xffff'ff'ff'ffff'ff'ffull);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
     // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles

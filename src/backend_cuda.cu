@@ -765,22 +765,32 @@ __global__ void build_qkv_act_kernel(const float* __restrict__ Wq, const float* 
 template <class A>
 __device__ inline void rope_pair_body(A* __restrict__ row, int pos, float theta, int pg,
                                       int which, float sign) {
-    constexpr int d = D_HEAD, half = d / 2;
+    // Partial rotary (WP4b blocker C): `pg` enumerates only the ROTARY_HALF pairs inside each head's
+    // rotary PREFIX, so channels [ROTARY_DIM, D_HEAD) of every head are never written -- in place, that
+    // is exactly "pass through untouched". At ROTARY_DIM == D_HEAD (the default) this is bit-identical
+    // to the previous full-width form. The inverse-frequency denominator is ROTARY_DIM, matching the
+    // CPU op_rope and the reference's own inv_freq (layout.hpp's ROTARY_DIM comment).
+    constexpr int d = D_HEAD, half = sub0::ROTARY_HALF, rd = ROTARY_DIM;
     const int base = which == 0 ? 0 : sub0::QKV_K_OFF;
     const int h    = pg / half, mi = pg % half;
     const int a0   = base + h * d + 2 * mi;
-    const float ang = (static_cast<float>(pos) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / d);
+    const float ang = (static_cast<float>(pos) * sub0::ROPE_POS_SCALE) * powf(theta, -2.0f * mi / rd);
     float sn, cs; __sincosf(ang, &sn, &cs);
     sn *= sign;                                     // sign = -1 gives the rotation's transpose (backward)
     const float x0 = to_f32(row[a0]), x1 = to_f32(row[a0 + 1]);
     st_act(&row[a0],     x0 * cs - x1 * sn);
     st_act(&row[a0 + 1], x0 * sn + x1 * cs);
 }
-// Pairs in the sub-block selected by blockIdx.z. Q is D_MODEL wide, K is D_KV wide -- equal only under
-// MHA -- so the grid is sized for the WIDER of the two and the narrower sub-block early-outs.
-__device__ inline int rope_sub_pairs(int which) {
-    return (which == 0 ? D_MODEL : sub0::D_KV) / 2;
+// Pairs in the sub-block selected by blockIdx.z. Q has N_HEADS heads, K has N_KV_HEADS -- equal only
+// under MHA -- and each contributes ROTARY_HALF rotated pairs, not D_HEAD/2, once --rotary-dim makes the
+// rotary prefix narrower than the head (WP4b blocker C). At ROTARY_DIM == D_HEAD this is exactly the
+// previous D_MODEL/2 and D_KV/2. Kept as ONE function so the kernels' early-out and the host-side grid
+// sizing below cannot disagree about the thread count -- the hazard that a locally re-derived width
+// already produced twice in this file (see the QKV_STRIDE static_asserts).
+constexpr int rope_sub_pairs_host(int which) {
+    return (which == 0 ? N_HEADS : N_KV_HEADS) * sub0::ROTARY_HALF;
 }
+__device__ inline int rope_sub_pairs(int which) { return rope_sub_pairs_host(which); }
 __global__ void rope_kernel(float* __restrict__ qkv, int batch, int T, float theta, int which) {
     constexpr int in_stride = sub0::QKV_STRIDE;
     const int pg = blockIdx.x * blockDim.x + threadIdx.x;   // pair within this sub-block
@@ -2141,18 +2151,18 @@ inline dim3 rope_grid(const dim3& block, int pairs, int batch, int T) {
 }
 inline void launch_rope(float* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_kernel<<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
-    rope_kernel<<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
+    rope_kernel<<<rope_grid(block, rope_sub_pairs_host(0), batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
+    rope_kernel<<<rope_grid(block, rope_sub_pairs_host(1), batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
 }
 template <class A> inline void launch_rope_t(A* qkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_act_kernel<A><<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
-    rope_act_kernel<A><<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
+    rope_act_kernel<A><<<rope_grid(block, rope_sub_pairs_host(0), batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 0);
+    rope_act_kernel<A><<<rope_grid(block, rope_sub_pairs_host(1), batch, T), block, 0, g_stream>>>(qkv, batch, T, ROPE_THETA, 1);
 }
 template <class A> inline void launch_rope_bwd_t(A* dqkv, int batch, int T) {
     const dim3 block(32, 8);
-    rope_bwd_act_kernel<A><<<rope_grid(block, D_MODEL / 2, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 0);
-    rope_bwd_act_kernel<A><<<rope_grid(block, sub0::D_KV / 2, batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 1);
+    rope_bwd_act_kernel<A><<<rope_grid(block, rope_sub_pairs_host(0), batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 0);
+    rope_bwd_act_kernel<A><<<rope_grid(block, rope_sub_pairs_host(1), batch, T), block, 0, g_stream>>>(dqkv, batch, T, ROPE_THETA, 1);
 }
 
 // QK-norm: per-head RMSNorm on the Q/K sub-blocks of the fused qkv buffer, in place, right after the
@@ -3843,8 +3853,8 @@ void forward_one_device(int id, int pos) {
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
             const int blk = 128;
-            rope_one_kernel<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 0);
-            rope_one_kernel<<<(sub0::D_KV / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 1);
+            rope_one_kernel<<<(rope_sub_pairs_host(0) + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 0);
+            rope_one_kernel<<<(rope_sub_pairs_host(1) + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos, ROPE_THETA, 1);
         }
         float* kc = g_kv_k + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;  // append this token's K/V
         float* vc = g_kv_v + (static_cast<size_t>(e) * SEQ_LEN + pos) * sub0::D_KV;   // slot per EXECUTION
@@ -3918,8 +3928,8 @@ void forward_one_device_graphed() {
         if constexpr (USE_QK_NORM) launch_qknorm_t<float>(qkv, qgamma, kgamma, 1);   // per-head RMSNorm, before RoPE
         if constexpr (POS_ENCODING == PosEncoding::Rope) {
             const int blk = 128;
-            rope_one_kernel_g<<<(C / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 0);
-            rope_one_kernel_g<<<(sub0::D_KV / 2 + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 1);
+            rope_one_kernel_g<<<(rope_sub_pairs_host(0) + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 0);
+            rope_one_kernel_g<<<(rope_sub_pairs_host(1) + blk - 1) / blk, blk, 0, g_stream>>>(qkv, pos_ptr, ROPE_THETA, 1);
         }
         float* kc_base = g_kv_k + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // this EXECUTION's cache
         float* vc_base = g_kv_v + static_cast<size_t>(e) * SEQ_LEN * sub0::D_KV;   // base (fixed per node -- pos

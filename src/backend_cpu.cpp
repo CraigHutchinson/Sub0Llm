@@ -592,10 +592,18 @@ static Node* op_tied_head(Node* x, Node* table) {
 // projections before attention, so the score q_i . k_j ends up depending only on the RELATIVE
 // offset (i - j) -- no learned position table, and the rotation is an orthogonal map whose
 // backward is the inverse rotation. The position of row t is t (position within the window).
-// inv_freq[m] = ROPE_THETA^(-2m/d); a head dimension d is assumed even (an odd tail is left
-// unrotated, which is the identity for that lone component).
+// inv_freq[m] = ROPE_THETA^(-2m/ROTARY_DIM).
+//
+// PARTIAL ROTARY (WP4b blocker C): only each head's first ROTARY_DIM channels are rotated; channels
+// [ROTARY_DIM, d) are copied through unchanged. ROTARY_DIM == D_HEAD (the default, --rotary-dim 0) is
+// the full-width rotation every build before this axis existed performed, and at that setting the
+// pass-through loop below has zero trips -- so the neutral path is bit-identical. Note the inverse
+// frequency's denominator is ROTARY_DIM, not the head width: that matches the reference's own
+// inv_freq, which is built over rotary_dim (see layout.hpp's ROTARY_DIM comment for the convention
+// re-derivation, and for why the interleaved-vs-half-split pairing difference is orthogonal to this).
 static Node* op_rope(Node* x, int H) {
-    const int T = x->rows, C = x->cols, d = C / H, half = d / 2;
+    const int T = x->rows, C = x->cols, d = C / H;
+    constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;
     Node* y = mk_node(Op::Rope, T, C);
     y->a = x; y->heads = H;
     const float* __restrict xd = x->data.data();
@@ -606,13 +614,15 @@ static Node* op_rope(Node* x, int H) {
         for (int h = 0; h < H; ++h) {
             const int off = h * d;
             for (int m = 0; m < half; ++m) {
-                const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+                const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
                 const float cs = std::cos(ang), sn = std::sin(ang);
                 const float x0 = xr[off + 2 * m], x1 = xr[off + 2 * m + 1];
                 yr[off + 2 * m]     = x0 * cs - x1 * sn;
                 yr[off + 2 * m + 1] = x0 * sn + x1 * cs;
             }
-            if (2 * half < d) yr[off + d - 1] = xr[off + d - 1];   // odd-d tail: identity
+            // Un-rotated remainder: the partial-rotary tail, plus (at rd == d) the odd-d lone component
+            // the previous full-width form already passed through as the identity.
+            for (int j = 2 * half; j < d; ++j) yr[off + j] = xr[off + j];
         }
     }
     return y;
@@ -1048,7 +1058,8 @@ static void backward_node(Node& n) {
         // Inverse rotation (R^T): grad of the un-rotated input from the grad of the rotated
         // output. Mirrors op_rope exactly; accumulates into x->grad.
         Node* x = n.a;
-        const int T = x->rows, C = x->cols, H = n.heads, d = C / H, half = d / 2;
+        const int T = x->rows, C = x->cols, H = n.heads, d = C / H;
+        constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;   // partial rotary -- mirrors op_rope exactly
         const float* __restrict gy = n.grad.data();
         float* __restrict gx       = x->grad.data();
         for (int t = 0; t < T; ++t) {
@@ -1057,13 +1068,14 @@ static void backward_node(Node& n) {
             for (int h = 0; h < H; ++h) {
                 const int off = h * d;
                 for (int m = 0; m < half; ++m) {
-                    const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+                    const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
                     const float cs = std::cos(ang), sn = std::sin(ang);
                     const float g0 = gyr[off + 2 * m], g1 = gyr[off + 2 * m + 1];
                     gxr[off + 2 * m]     +=  g0 * cs + g1 * sn;
                     gxr[off + 2 * m + 1] += -g0 * sn + g1 * cs;
                 }
-                if (2 * half < d) gxr[off + d - 1] += gyr[off + d - 1];
+                // The un-rotated remainder is the identity, so its gradient passes straight through.
+                for (int j = 2 * half; j < d; ++j) gxr[off + j] += gyr[off + j];
             }
         }
         break;
@@ -1358,14 +1370,15 @@ thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_Q
 // what makes a QSA layer numerically the real model's layer, and taking the tables as data is what lets
 // the fixture test feed the real model's own PARTIAL-rotary cos/sin unchanged.
 // Layout matches HF's own `emb = cat(freqs, freqs)`: cos[pos][m] == cos[pos][m + rotary_dim/2].
-// rotary_dim is D_HEAD here (full-width) -- docs/QSA.md S2b.2's documented engine-side simplification.
+// rotary_dim is ROTARY_DIM -- a real axis since WP4b blocker C (--rotary-dim, layout.hpp's own
+// ROTARY_DIM comment); it was pinned to D_HEAD before that, which is still what --rotary-dim 0 gives.
 struct QsaRopeTables {
-    std::vector<float> cos, sin;   // [SEQ_LEN][D_HEAD]
+    std::vector<float> cos, sin;   // [SEQ_LEN][ROTARY_DIM]
     QsaRopeTables() {
-        const size_t n = static_cast<size_t>(SEQ_LEN) * D_HEAD;
+        const size_t n = static_cast<size_t>(SEQ_LEN) * ROTARY_DIM;
         cos.assign(n, 1.f); sin.assign(n, 0.f);
         if constexpr (USE_QSA) {
-            const int rd = D_HEAD, half = rd / 2;
+            constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;
             for (int p = 0; p < SEQ_LEN; ++p) {
                 for (int m = 0; m < half; ++m) {
                     const float ang = static_cast<float>(p) * ROPE_POS_SCALE *
@@ -1423,11 +1436,13 @@ static inline void qknorm_row(float* __restrict x, const Node* gamma, int H, int
     }
 }
 static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // rotate Q/K in place (t = pos)
-    const int d = C / H, half = d / 2;
+    const int d = C / H;
+    constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;   // partial rotary -- mirrors op_rope; the
+                                                          // un-rotated remainder needs no work in place
     for (int h = 0; h < H; ++h) {
         const int off = h * d;
         for (int m = 0; m < half; ++m) {
-            const float ang = (static_cast<float>(pos) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+            const float ang = (static_cast<float>(pos) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
             const float cs = std::cos(ang), sn = std::sin(ang);
             const float x0 = x[off + 2 * m], x1 = x[off + 2 * m + 1];
             x[off + 2 * m]     = x0 * cs - x1 * sn;
@@ -2349,8 +2364,10 @@ struct Model {
             // hold (a different width and a different -- unnormed, unrotated -- content).
             [[maybe_unused]] auto do_qsa_mixer = [&] {
                 float* raw_k_base = g_qsa_cache.base(e);
-                const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * D_HEAD;
-                const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * D_HEAD;
+                // Row stride is ROTARY_DIM (the cos/sin tables are [SEQ_LEN][ROTARY_DIM]) -- see
+                // QsaRopeTables above; it was D_HEAD before --rotary-dim became an axis.
+                const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
+                const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
                 qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->data.data(),
                                           L.qsa_idx_qnorm->data.data(), cos_pos, sin_pos, qsa::RMS_EPS,
                                           qsa_idx_q,

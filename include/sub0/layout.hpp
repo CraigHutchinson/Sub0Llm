@@ -98,6 +98,40 @@ static_assert(ROPE_SCALING_MODE == RopeScaling::None || ROPE_SCALE_FACTOR >= 1.0
 inline constexpr float ROPE_POS_SCALE =
     (ROPE_SCALING_MODE == RopeScaling::Linear) ? (1.0f / ROPE_SCALE_FACTOR) : 1.0f;
 
+// --- PARTIAL ROTARY (WP4b blocker C, docs/WP4_SCOPE.md S2) ---------------------------------------
+// The rotary PREFIX width: only a head vector's first ROTARY_DIM channels are rotated, the rest pass
+// through untouched. The real Qwen4-preview model has partial_rotary_factor = 0.25 against head_dim
+// 256, i.e. it rotates 64 of 256 channels; every build this engine has produced rotated the FULL head
+// (ROTARY_DIM == D_HEAD), which is what --rotary-dim 0 still resolves to (the configurator emits the
+// RESOLVED value, exactly as it does for N_KV_HEADS and GDN's own head axes).
+//
+// Convention note, and it is a REAL divergence that is deliberately preserved: the reference rotates
+// HALF-SPLIT pairs (i, i + rotary_dim/2) while this engine's op_rope rotates INTERLEAVED pairs
+// (2m, 2m+1). Partial rotary is orthogonal to that difference -- it changes only WHICH CHANNELS are
+// rotated (the first ROTARY_DIM of each head, in both conventions) and the inverse-frequency
+// denominator (ROTARY_DIM, matching the reference's inv_freq over rotary_dim, not head_dim). qsa_math.hpp
+// takes rotary_dim as an explicit Dims field and uses the real half-split convention on the caller's
+// own cos/sin tables, so a QSA layer stays the real model's layer either way.
+//
+// CLASSIFICATION (layout.hpp's own three-way rule): rule #2 -- computation-changing, SHAPE-NEUTRAL. It
+// changes NO tensor shape at all, so PARAM_FLOATS cannot discriminate it and a checkpoint would load
+// silently and compute the wrong attention. It therefore joins ARCH_FINGERPRINT2 below, in the 16 bits
+// at [63:48] (D_HEAD can exceed 255 -- the real model's is 256 -- so 8 bits would not do). The field is
+// canonicalized to 0 at ROTARY_DIM == D_HEAD, which is what keeps every fingerprint this engine has
+// ever written bit-identical while still distinguishing every partial-rotary build.
+// ROTARY_HALF is the number of interleaved PAIRS actually rotated. The truncating division is load-
+// bearing and NOT a rounding accident: this engine has always supported an ODD head width (d132 H4 gives
+// D_HEAD = 33, one of this project's own standard test shapes), where op_rope rotated floor(d/2) pairs
+// and passed the lone trailing component through as the identity. floor(ROTARY_DIM/2) reproduces that
+// exactly at ROTARY_DIM == D_HEAD, which is why ROTARY_DIM is NOT required to be even in general --
+// only under QSA, whose half-split convention genuinely needs an even prefix (see USE_QSA's own
+// static_asserts, which already require an even D_HEAD for the same reason).
+inline constexpr int ROTARY_HALF = ROTARY_DIM / 2;
+static_assert(ROTARY_DIM >= 2, "ROTARY_DIM must be at least 2 (RoPE rotates channel PAIRS)");
+static_assert(ROTARY_DIM <= D_HEAD,
+              "ROTARY_DIM cannot exceed D_HEAD -- the rotary prefix must fit inside the head vector "
+              "it rotates (--rotary-dim 0 means the full head width)");
+
 // --- LoopSplit: a weight-shared repeated middle block -------------------------------------------
 // An un-looped head block, a MIDDLE block executed LOOP_REPEATS times reusing the SAME weights, then
 // an un-looped tail block -- a refinement of "Looped Transformers" that loops only the reasoning core
@@ -465,16 +499,24 @@ static_assert(!USE_QSA || QSA_INDEXER_BUDGET >= QSA_INDEXER_COMPRESS_RATIO,
               "QSA_INDEXER_BUDGET must be >= QSA_INDEXER_COMPRESS_RATIO, or block_topk would be 0");
 static_assert(!USE_QSA || D_HEAD % 2 == 0,
               "QSA needs an even D_HEAD (the half-split rotary rotates D_HEAD/2 channel pairs)");
-// The rotary prefix cannot be wider than the vector it rotates. The engine's own rotary_dim is D_HEAD
-// (docs/QSA.md S2b.2), and the SAME cos/sin also rotate the indexer's OWN idx_head_dim-wide query and
-// pooled block keys (the reference reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's
-// head width must be at least D_HEAD. This holds in the real model (rotary_dim 64 <= indexer_head_dim
-// 128 <= head_dim 256) but is NOT automatic here, and violating it is a silent OUT-OF-BOUNDS WRITE past
-// the end of a per-head slice -- found exactly that way this stage (see qsa_math.hpp's rope_apply_row
-// precondition comment and docs/QSA.md S10).
-static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= D_HEAD,
-              "QSA_INDEXER_HEAD_DIM must be >= D_HEAD: the engine's rotary prefix is D_HEAD wide and the "
-              "SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- see docs/QSA.md S2b.2");
+static_assert(!USE_QSA || ROTARY_DIM % 2 == 0,
+              "QSA needs an even ROTARY_DIM: the half-split rotary pairs channel i with i + rotary_dim/2, "
+              "so an odd prefix would leave one channel unpaired -- see qsa_math.hpp's rope_apply_row");
+// The rotary prefix cannot be wider than the vector it rotates. The SAME cos/sin rotate BOTH the
+// attention heads and the indexer's OWN idx_head_dim-wide query and pooled block keys (the reference
+// reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's head width must be at least the
+// rotary prefix. Violating it is a silent OUT-OF-BOUNDS WRITE past the end of a per-head slice -- found
+// exactly that way in WP3 (see qsa_math.hpp's rope_apply_row precondition comment and docs/QSA.md S10).
+//
+// This used to read `>= D_HEAD`, because the engine's rotary prefix WAS D_HEAD (docs/QSA.md S2b.2's
+// documented simplification). WP4b blocker C made the prefix its own axis, so the real relationship is
+// against ROTARY_DIM -- and the change is not cosmetic: the real model has rotary_dim 64 <=
+// indexer_head_dim 128 <= head_dim 256, so the OLD form would REJECT the real configuration outright
+// (128 >= 256 is false). Relaxing to ROTARY_DIM is exactly what makes the real axes expressible, and it
+// is still the tight bound -- ROTARY_DIM is what rope_apply_row actually indexes.
+static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= ROTARY_DIM,
+              "QSA_INDEXER_HEAD_DIM must be >= ROTARY_DIM: the engine's rotary prefix is ROTARY_DIM wide "
+              "and the SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- docs/QSA.md S2b.2");
 
 // Never-zero array-bound / never-divide-by-zero forms (same idiom as HC_COUNT_BUF/NUM_EXPERTS_BUF above).
 inline constexpr int QSA_IDX_N_HEADS_BUF = USE_QSA ? QSA_INDEXER_N_HEADS       : 1;
@@ -485,19 +527,20 @@ inline constexpr int QSA_RATIO_BUF        = USE_QSA ? QSA_INDEXER_COMPRESS_RATIO
 // Total output width of the indexer's single fused index_qk_proj: (n_heads + kv_heads) * head_dim.
 inline constexpr int QSA_IDX_QK_OUT = (QSA_INDEXER_N_HEADS + QSA_INDEXER_KV_HEADS) * QSA_INDEXER_HEAD_DIM;
 
-// This build's QSA dims, per docs/QSA.md S2b/S4a's mapping. head_dim = D_HEAD and rotary_dim = D_HEAD
-// (full-width rotary) are this stage's two documented engine-side simplifications -- qsa_math.hpp itself
-// takes both as independent Dims fields so the fixture can exercise the real model's non-dividing
+// This build's QSA dims, per docs/QSA.md S2b/S4a's mapping. head_dim = D_HEAD was WP3's one remaining
+// engine-side simplification and rotary_dim = D_HEAD was the other; blocker C above turns the second
+// into a real axis (ROTARY_DIM), and blocker A does the same for the first. qsa_math.hpp always took
+// both as independent Dims fields, which is why its fixture already ran at the real model's non-dividing
 // head_dim=256 and partial rotary_dim=64. Valid (never divides by zero) even when USE_QSA is false --
 // same "describes a shape nothing builds" idiom GDN_DIMS/GR_DIMS/MOE_DIMS already use.
 inline constexpr qsa::Dims QSA_DIMS{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
                                     QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS, QSA_INDEXER_HEAD_DIM,
-                                    QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO, D_HEAD};
+                                    QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO, ROTARY_DIM};
 // Same shape but never degenerate (every indexer width >= 1) -- used ONLY to size the fixed decode-path
 // scratch arrays below, which must be valid array bounds even when QSA is off.
 inline constexpr qsa::Dims QSA_DIMS_BUF{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
                                         QSA_IDX_N_HEADS_BUF, QSA_IDX_KV_HEADS_BUF, QSA_IDX_HEAD_DIM_BUF,
-                                        QSA_BUDGET_BUF, QSA_RATIO_BUF, D_HEAD};
+                                        QSA_BUDGET_BUF, QSA_RATIO_BUF, ROTARY_DIM};
 
 // Per-LAYER three-way mixer classification (docs/QSA.md S2). QSA is NOT a new schedule axis: in the real
 // model every `full_attention` layer IS a QSA layer (Qwen4ExpTextAttention unconditionally constructs and
@@ -707,7 +750,7 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, 
 // day one (only byte 0 is assigned) so the next computation-changing, shape-neutral axis after this one
 // does not repeat the exact scramble that produced ARCH_FINGERPRINT's own comment about a byte
 // "middle_layers was never able to reach".
-//   Field layout, high to low: [63:48] reserved | [47:40] gdn_key_heads | [39:32] qsa_compress_ratio |
+//   Field layout, high to low: [63:48] partial_rotary_dim | [47:40] gdn_key_heads | [39:32] qsa_compress_ratio |
 //   [31:16] qsa_indexer_budget | [15:8] experts_per_tok | [7:0] gdn_full_attn_stride.
 // At GDN_FULL_ATTN_STRIDE == 0 (the only value this build can currently take -- see the static_assert
 // above) this is always 0, which is also what every checkpoint that predates this field must be
@@ -763,27 +806,42 @@ static_assert(QSA_INDEXER_COMPRESS_RATIO >= 0 && QSA_INDEXER_COMPRESS_RATIO <= 0
 // resolved key-head count is non-zero even in a default build, so folding it in unconditionally would
 // have invalidated every existing checkpoint for an axis those checkpoints cannot possibly depend on.
 static_assert(GDN_K_HEADS >= 0 && GDN_K_HEADS <= 0xff, "GDN_K_HEADS must fit 8 bits");
+//
+// ROTARY_DIM (WP4b blocker C): the rotary PREFIX width. Rule #2 -- it rotates fewer channels of every
+// head while changing no tensor shape whatsoever, so PARAM_FLOATS cannot see it and a checkpoint would
+// load silently and compute different attention. Exactly the ROPE_THETA / LOOP_MIDDLE_LAYERS hazard
+// ARCH_FINGERPRINT exists for. It takes the LAST 16 bits, [63:48] -- 16 and not 8 because it is bounded
+// by D_HEAD, which is 256 in the real model and no longer bounded by D_MODEL/N_HEADS after blocker A.
+// The field is CANONICALIZED to 0 at ROTARY_DIM == D_HEAD (full-width rotary, the only behaviour this
+// engine has ever had), so every fingerprint ever written stays bit-identical, and the canonical form
+// also means an explicit `--rotary-dim <D_HEAD>` and the default `0` cannot disagree.
+// This exhausts ARCH_FINGERPRINT2: the next computation-changing, shape-neutral axis needs a THIRD
+// additive word, built the same way (see this word's own header comment for why additive, not repacked).
+static_assert(ROTARY_DIM >= 0 && ROTARY_DIM <= 0xffff, "ROTARY_DIM must fit 16 bits");
 inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride, int experts_per_tok = 0,
                                                   int qsa_indexer_budget = 0,
                                                   int qsa_indexer_compress_ratio = 0,
-                                                  int gdn_key_heads = 0) {
-    return (static_cast<std::uint64_t>(static_cast<unsigned>(gdn_key_heads)          & 0xffu)   << 40)
+                                                  int gdn_key_heads = 0,
+                                                  int partial_rotary_dim = 0) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(partial_rotary_dim)     & 0xffffu) << 48)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(gdn_key_heads)          & 0xffu)   << 40)
          | (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_compress_ratio) & 0xffu)   << 32)
          | (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_budget)         & 0xffffu) << 16)
          | (static_cast<std::uint64_t>(static_cast<unsigned>(experts_per_tok)            & 0xffu)   << 8)
          |  static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride)       & 0xffu);
 }
 struct ArchAxes2 { int gdn_full_attn_stride; int experts_per_tok; int qsa_indexer_budget;
-                   int qsa_indexer_compress_ratio; int gdn_key_heads; };
+                   int qsa_indexer_compress_ratio; int gdn_key_heads; int partial_rotary_dim; };
 inline constexpr ArchAxes2 arch_axes2_of(std::uint64_t fp2) {
     return ArchAxes2{ static_cast<int>(fp2 & 0xffu), static_cast<int>((fp2 >> 8) & 0xffu),
                       static_cast<int>((fp2 >> 16) & 0xffffu), static_cast<int>((fp2 >> 32) & 0xffu),
-                      static_cast<int>((fp2 >> 40) & 0xffu) };
+                      static_cast<int>((fp2 >> 40) & 0xffu), static_cast<int>((fp2 >> 48) & 0xffffu) };
 }
 inline constexpr std::uint64_t ARCH_FINGERPRINT2 =
     arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK, QSA_INDEXER_BUDGET,
-                      QSA_INDEXER_COMPRESS_RATIO, USE_GATED_DELTANET ? GDN_K_HEADS : 0);
-inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0, 0);
+                      QSA_INDEXER_COMPRESS_RATIO, USE_GATED_DELTANET ? GDN_K_HEADS : 0,
+                      ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0, 0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
 // shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
