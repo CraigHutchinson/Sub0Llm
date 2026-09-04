@@ -33,6 +33,9 @@
 
 #include "sub0/core.hpp"
 #include "sub0/layout.hpp"
+#include "sub0/gated_residual_math.hpp"
+#include "sub0/gdn_math.hpp"
+#include "sub0/moe_math.hpp"
 
 #include <CLI/CLI.hpp>
 
@@ -178,6 +181,131 @@ int main(int argc, char** argv) {
         std::println("  row {}: mean {:+.6f} rms {:.4f} [{:+.4f}, {:+.4f}] argmax {} nonfinite {}",
                      t, s.mean, s.rms, s.min, s.max,
                      std::distance(batched.begin() + static_cast<std::ptrdiff_t>(t) * VOCAB, am), s.nonfinite);
+    }
+
+    std::println("\n--- 3b. Model::forward vs an INDEPENDENT math-core replay ----------------");
+    // The gate docs/WP4_SCOPE.md S6 asks for is "layer 0's output matches the existing real fixture
+    // through the full engine path". That gate as written is not reachable, and the reason is worth
+    // stating precisely rather than working around: every qwen4_preview fixture is a SLICED layer
+    // (gdn_layer0_small is hidden_size 32 / 1 key head / 3 value heads; qsa_layer3_small is hidden_size
+    // 16 / 2 heads / head_dim 8), so its input and its reference output do not exist at hidden_size
+    // 2560 at all. WP4c's levels 3/4 replayed those fixtures at the FIXTURE's dims through the
+    // transplant's own mapping; nothing anywhere produces a reference for a real-dims layer.
+    //
+    // What IS both reachable and the actual thing WP4d adds over WP4c: does the ENGINE path -- the Node
+    // graph, GR's real wrapping, MIXER_SCHEDULE, the PARAM_LAYOUT offsets the weights landed at -- agree
+    // with the math cores WP4c already validated, driven from the SAME loaded weights? That is the
+    // divergence this stage could localize, and it is checked below by rebuilding the first three (GDN)
+    // layers straight out of params_ptr() with gr::/gdn::/moe:: calls and comparing against the engine's
+    // own per-execution residual-stream norms (loop_pass_stats). Layer 3 (QSA) is excluded only because
+    // its op needs the backend's internal precomputed rope table; the check still covers embed, the GR
+    // entry tile, 6 GR instances, 3 GDN mixers and 3 MoE blocks composed in the engine's own order.
+    {
+        std::vector<float> eng_delta(LOOP_EXEC_COUNT, 0.f), eng_hnorm(LOOP_EXEC_COUNT, 0.f);
+        loop_pass_stats(kTokens, T, eng_delta.data(), eng_hnorm.data());
+
+        constexpr int WIDE = HC_COUNT * D_MODEL;
+        const std::size_t tw = static_cast<std::size_t>(T) * WIDE;
+        std::vector<float> wide(tw), prev(tw), normed(tw), mixed(static_cast<std::size_t>(T) * D_MODEL),
+                            mixer_out(static_cast<std::size_t>(T) * D_MODEL),
+                            inj(static_cast<std::size_t>(T) * HC_COUNT),
+                            h0(static_cast<std::size_t>(T) * D_MODEL);
+        std::vector<float> gr_scr(gr::mix_scratch_floats(GR_DIMS, T));
+        std::vector<float> gdn_state(gdn::state_floats(GDN_DIMS)), gdn_conv(gdn::conv_hist_floats(GDN_DIMS));
+        std::vector<float> gdn_scr(gdn::scratch_floats(GDN_DIMS, T)), moe_scr(moe::scratch_floats(MOE_DIMS));
+
+        const ParamDesc* emb = find_kind(PKind::TokEmb);
+        for (int t = 0; t < T; ++t)
+            std::copy_n(P + emb->off + static_cast<std::size_t>(kTokens[t]) * D_MODEL, D_MODEL,
+                        h0.begin() + static_cast<std::ptrdiff_t>(t) * D_MODEL);
+        gr::tile(GR_DIMS, T, h0.data(), wide.data());
+
+        // Walk PARAM_LAYOUT with a cursor and CHECK each kind as it goes, rather than hard-coding
+        // offsets: a silent disagreement about the layout order is precisely one of the things this
+        // comparison exists to detect, so it must not be assumed by the checker itself.
+        std::size_t pi = 1;   // 0 == TokEmb
+        bool layout_ok = true;
+        const auto take = [&](PKind want) -> const float* {
+            if (pi >= static_cast<std::size_t>(NUM_PARAMS) || PARAM_LAYOUT[pi].kind != want) {
+                if (layout_ok)
+                    std::println(stderr, "LAYOUT MISMATCH at PARAM_LAYOUT[{}]: expected kind {}, found {}",
+                                 pi, static_cast<int>(want),
+                                 pi < static_cast<std::size_t>(NUM_PARAMS)
+                                     ? static_cast<int>(PARAM_LAYOUT[pi].kind) : -1);
+                layout_ok = false;
+                return P;
+            }
+            return P + PARAM_LAYOUT[pi++].off;
+        };
+        std::vector<const float*> eg(NUM_EXPERTS), eu(NUM_EXPERTS), ed(NUM_EXPERTS);
+        double worst_h = 0.0, worst_d = 0.0;
+        for (int l = 0; l < N_LAYERS; ++l) {
+            if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] != LayerMixer::Gdn) break;   // layer 3 (QSA)
+            std::copy(wide.begin(), wide.end(), prev.begin());
+            const float* an = take(PKind::GrHcNorm);
+            const float* ad = take(PKind::GrMixDown);
+            const float* au = take(PKind::GrMixUp);
+            const float* ai = take(PKind::GrBlockInject);
+            const float* qkv = take(PKind::GdnInProjQkv);
+            const float* wz  = take(PKind::GdnInProjZ);
+            const float* wb  = take(PKind::GdnInProjB);
+            const float* wa  = take(PKind::GdnInProjA);
+            const float* cw  = take(PKind::GdnConv);
+            const float* al  = take(PKind::GdnALog);
+            const float* dtb = take(PKind::GdnDtBias);
+            const float* nw  = take(PKind::GdnNorm);
+            const float* op  = take(PKind::GdnOutProj);
+            const float* fn = take(PKind::GrHcNorm);
+            const float* fd = take(PKind::GrMixDown);
+            const float* fu = take(PKind::GrMixUp);
+            const float* fi = take(PKind::GrBlockInject);
+            const float* rt = take(PKind::MoeRouter);
+            for (int e = 0; e < NUM_EXPERTS; ++e) {
+                eg[static_cast<std::size_t>(e)] = take(PKind::MoeGate);
+                eu[static_cast<std::size_t>(e)] = take(PKind::MoeUp);
+                ed[static_cast<std::size_t>(e)] = take(PKind::MoeDown);
+            }
+            const float* sg = take(PKind::MoeSharedGate);
+            const float* su = take(PKind::MoeSharedUp);
+            const float* sd = take(PKind::MoeSharedDown);
+            const float* sp = take(PKind::MoeSharedGateProj);
+            if (!layout_ok) break;
+
+            // attention half: GR read -> GDN -> GR write
+            gr::hc_norm(GR_DIMS, T, wide.data(), an, normed.data());
+            gr::mix(GR_DIMS, T, normed.data(), ad, au, mixed.data(), gr_scr.data());
+            gr::gate(GR_DIMS, T, normed.data(), ai, inj.data());
+            std::fill(gdn_state.begin(), gdn_state.end(), 0.f);
+            std::fill(gdn_conv.begin(), gdn_conv.end(), 0.f);
+            gdn::forward(GDN_DIMS, T, mixed.data(), qkv, wz, wb, wa, cw, dtb, al, nw, op,
+                         gdn_state.data(), gdn_conv.data(), mixer_out.data(), gdn_scr.data());
+            gr::combine(GR_DIMS, T, wide.data(), mixer_out.data(), inj.data(), wide.data());
+            // mlp half: GR read -> MoE -> GR write
+            gr::hc_norm(GR_DIMS, T, wide.data(), fn, normed.data());
+            gr::mix(GR_DIMS, T, normed.data(), fd, fu, mixed.data(), gr_scr.data());
+            gr::gate(GR_DIMS, T, normed.data(), fi, inj.data());
+            moe::forward(MOE_DIMS, T, mixed.data(), rt, eg.data(), eu.data(), ed.data(), sg, su, sd, sp,
+                         mixer_out.data(), moe_scr.data());
+            gr::combine(GR_DIMS, T, wide.data(), mixer_out.data(), inj.data(), wide.data());
+
+            double hn = 0.0, dl = 0.0;
+            for (std::size_t i = 0; i < tw; ++i) {
+                hn += static_cast<double>(prev[i]) * prev[i];
+                const double d = static_cast<double>(wide[i]) - prev[i];
+                dl += d * d;
+            }
+            hn = std::sqrt(hn); dl = std::sqrt(dl);
+            const double rh = std::abs(hn - eng_hnorm[static_cast<std::size_t>(l)]) / (hn + 1e-12);
+            const double rd = std::abs(dl - eng_delta[static_cast<std::size_t>(l)]) / (dl + 1e-12);
+            worst_h = std::max(worst_h, rh); worst_d = std::max(worst_d, rd);
+            std::println("  layer {} ({}): ||h_in|| engine {:.7g} vs replay {:.7g} (rel {:.3g}) | "
+                         "||delta|| engine {:.7g} vs replay {:.7g} (rel {:.3g})",
+                         l, "GDN", static_cast<double>(eng_hnorm[static_cast<std::size_t>(l)]), hn, rh,
+                         static_cast<double>(eng_delta[static_cast<std::size_t>(l)]), dl, rd);
+        }
+        if (layout_ok)
+            std::println("worst relative disagreement, engine path vs math-core replay: "
+                         "||h_in|| {:.3g}, ||delta|| {:.3g}", worst_h, worst_d);
     }
 
     std::println("\n--- 4. forward vs forward_one parity at the real dims --------------------");
