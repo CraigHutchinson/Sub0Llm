@@ -430,7 +430,14 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     // into byte 1 of this SAME word (this stage's own real build under test may have MoE genuinely ON,
     // e.g. the two-scale/parity verification config, so this is an implication, not an unconditional 0).
     // ... and, since docs/QSA.md S3a, only when QSA's own budget/compress-ratio (bytes 2-3, 4) are off too.
-    if constexpr (EXPERTS_PER_TOK == 0 && QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0) {
+    //
+    // GDN_FULL_ATTN_STRIDE and the two WP4b fields (gdn_key_heads at [47:40], partial_rotary_dim at
+    // [63:48]) belong in this condition too. Omitting the STRIDE was a pre-existing defect in this test,
+    // found by actually building a GDN-ON CUDA binary during WP4b: byte 0 has carried the stride since
+    // GDN Stage 0, so any --gdn-full-attn-stride build failed this REQUIRE with a correct fingerprint.
+    // Nothing had shown it because the branch's own comment reasoned only about MoE and QSA.
+    if constexpr (EXPERTS_PER_TOK == 0 && QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0 &&
+                  GDN_FULL_ATTN_STRIDE == 0 && ROTARY_DIM == D_HEAD) {
         REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);
         REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
     } else {
@@ -809,44 +816,63 @@ TEST_CASE("QSA layer schedule is a three-way classification, correct at an odd/n
 TEST_CASE("QSA param delta matches hand-computed values at hypothetical configs, at two shapes",
           "[layout][qsa]") {
     // Off is exactly zero at every shape -- the neutral-setting identity, not merely "small".
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 132, 66, 33, true, 4, 1, 8, false) == 0);
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 0, 0, 0, false) == 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 132, 132, 66, 33, true, 4, 1, 8, false) == 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 0, 0, 0, false) == 0);
 
     // Hand-computed, tiny, fully checkable shape: n_layers=1, gdn_stride=0 (=> 1 full-attention layer),
     // d_model=4, d_kv=4, d_head=2, qk_norm=true, idx_n=2, idx_kv=1, idx_hd=2.
+    // (d_q is passed EQUAL to d_model at every hypothetical config here, which is what the pre-blocker-A
+    // signature assumed implicitly -- so every hand-computed number below is unchanged. The independent
+    // d_q case gets its own check at the end of this test.)
     //   idx_qk_out = (2+1)*2 = 6
     //   attn_layer = 2*4*4 + 2*4*4 + 2*2         = 32 + 32 + 4  = 68
     //   qsa_layer  = 3*4*4 + 2*4*4 + 2*2 + 4*6 + 2*2 = 48+32+4+24+4 = 112
     //   delta      = 1 * (112 - 68) = 44
-    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
-    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 44);
     // Without QK-norm the attention baseline is 4 floats cheaper, so the delta is 4 LARGER (a QSA layer
     // always carries its own q_norm/k_norm -- docs/QSA.md S3b).
-    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, false, 2, 1, 2, true) == 48);
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, false, 2, 1, 2, true) == 48);
     // Scales linearly in the number of FULL-ATTENTION layers, not in n_layers: at stride 4, 8 layers
     // have exactly 2 full-attention layers, so the delta is 2x the per-layer value, not 8x.
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 4, 4, 2, true, 2, 1, 2, true) == 8 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 4, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 8 * 44);
     // ODD/non-dividing: 11 layers at stride 4 has exactly 2 full-attention layers (3 and 7), NOT 3 --
     // the same ragged-tail case the schedule test above pins, re-checked through the delta.
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
 
     // Strictly positive and monotonic in the indexer width at both of this thread's standard shapes.
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true) > 0);
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 0, 132, 66, 33, true, 4, 1, 8, true) > 0);
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 8, 1, 8, true) >
-            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 16, true) >
-            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true) > 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 0, 132, 132, 66, 33, true, 4, 1, 8, true) > 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 8, 1, 8, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true));
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 16, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true));
+
+    // WP4b blocker A: d_q is now an EXPLICIT parameter, because N_HEADS*D_HEAD stopped being D_MODEL.
+    // At the real model's own geometry (d_model 2560, d_q = 24*256 = 6144) the QSA layer's three
+    // d_q-sided projections (QsaQProj/QsaGateProj/QsaOProj) are 2.4x wider than the two-sided form the
+    // old signature computed, so this is a genuine arithmetic change, not a rename. Hand-computed at a
+    // tiny non-square shape: n_layers=1, stride=0, d_model=4, d_q=6, d_kv=6, d_head=2, qk_norm=true,
+    // idx 2/1/2 -> idx_qk_out=6.
+    //   attn_layer = 2*4*6 + 2*4*6 + 2*2                 = 48 + 48 + 4        = 100
+    //   qsa_layer  = 3*4*6 + 2*4*6 + 2*2 + 4*6 + 2*2     = 72 + 48 + 4 + 24 + 4 = 152
+    //   delta      = 1 * (152 - 100) = 52
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) == 52);
+    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) == 52);
+    // A wider d_q at the same d_model must change the answer -- the direct proof the axis is consumed
+    // rather than shadowed by d_model.
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) !=
+                   sub0::qsa_param_delta(1, 0, 4, 4, 6, 2, true, 2, 1, 2, true));
 
     // This build's own delta is 0 exactly when QSA is off -- the direct neutral-setting claim.
     if constexpr (!sub0::USE_QSA) {
-        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_Q, sub0::D_KV, D_HEAD,
                                        USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
                                        QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) == 0);
     } else {
-        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_Q, sub0::D_KV, D_HEAD,
                                        USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
                                        QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) > 0);
     }

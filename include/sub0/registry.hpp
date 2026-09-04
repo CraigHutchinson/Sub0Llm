@@ -174,6 +174,7 @@ struct ModelMeta : RunState {
     X(int,         n_layers,        0)    \
     X(int,         n_heads,         0)    \
     X(int,         n_kv_heads,      0)    \
+    X(int,         head_dim,        0)    \
     X(int,         loop_middle,     0)    \
     X(int,         loop_repeats,    1)    \
     X(int,         depth_attn_stride, 0)  \

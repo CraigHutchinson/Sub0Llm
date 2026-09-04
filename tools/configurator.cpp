@@ -592,6 +592,10 @@ int main(int argc, char** argv) {
     int n_layers     = 0;
     int n_heads      = 0;
     int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
+    // Independent attention head width (WP4b blocker A, docs/WP4_SCOPE.md S2). 0 = derive as
+    // d_model / n_heads, which is what D_HEAD has always been -- and which the real Qwen4-preview
+    // model does NOT satisfy (24 heads x head_dim 256 = 6144 against hidden_size 2560).
+    int head_dim     = 0;
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
@@ -682,6 +686,12 @@ int main(int argc, char** argv) {
                    "GQA-2 -- measured +8.4% throughput and -50% KV cache at no measurable quality cost. "
                    "Pass --kv-heads equal to --heads for plain MHA; must divide --heads exactly)")
        ->capture_default_str();
+    app.add_option("--head-dim", head_dim,
+                   "Attention head width, independent of --dmodel/--heads (0 = derive as dmodel/heads, "
+                   "what every build before this axis did). When set, heads*head-dim need NOT equal "
+                   "dmodel: Wq becomes [dmodel, heads*head-dim] and Wo [heads*head-dim, dmodel]. "
+                   "Real Qwen4-preview: 256, against dmodel 2560 and 24 heads")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--loop-middle-layers", loop_middle,
                    "LoopSplit: size of the weight-shared middle block re-executed each pass (0 = off)")
        ->capture_default_str();
@@ -943,7 +953,11 @@ int main(int argc, char** argv) {
     // two spellings of one architecture (0 vs the explicit alias value) cannot produce two different
     // MODEL_ARCH_IDs. Same treatment n_kv_heads' own 0-means-derive already gets, just above.
     {
-        const int d_head = d_model / n_heads;   // the divisibility check above already ran
+        // WP4b blocker A: --head-dim 0 derives the head width exactly as D_HEAD always did. The
+        // d_model % n_heads divisibility check above therefore still guards the DERIVED case; an
+        // explicit --head-dim is free of it, which is the whole point (the real model does not divide).
+        if (head_dim == 0) head_dim = d_model / n_heads;
+        const int d_head = head_dim;
         // Partial rotary (WP4b blocker C): resolve 0 -> the full head width HERE, so the header always
         // carries the RESOLVED prefix and layout.hpp needs no second derivation. Mirrors layout.hpp's
         // own static_asserts as a configure-time diagnostic naming the flag.
@@ -1500,7 +1514,13 @@ int main(int argc, char** argv) {
                                          // estimate feeds gpu_batch_estimate() -- i.e. the batch we
                                          // RECOMMEND. Under-predicting pushes the batch UP, which is
                                          // the dangerous direction (see the open large-batch fault).
-                                         n_layers + loop_middle * (loop_repeats - 1) };
+                                         n_layers + loop_middle * (loop_repeats - 1),
+                                         /*depth_slots=*/0, /*logits_chunks=*/0,
+                                         // WP4b blocker A: head_dim is the LAST Dims field (see
+                                         // memplan.hpp on why it was appended, not inserted), so it
+                                         // must be listed here or this positional init leaves it 0 --
+                                         // silently mis-predicting VRAM for a --head-dim build.
+                                         /*head_dim=*/head_dim };
         // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
         // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
         // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc
@@ -1600,7 +1620,11 @@ int main(int argc, char** argv) {
     // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
     // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.
     cos << "constexpr int  D_FF        = " << d_ff << ";\n";
-    cos << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
+    // D_HEAD is its own axis since WP4b blocker A (--head-dim), no longer forced to
+    // D_MODEL / N_HEADS. Emitted RESOLVED, so N_HEADS * D_HEAD (layout.hpp's D_Q -- the query and
+    // Wo width) may legitimately differ from D_MODEL: the real Qwen4-preview model's 6144 vs 2560.
+    // At --head-dim 0 this is literally the old D_MODEL / N_HEADS value.
+    cos << "constexpr int  D_HEAD      = " << head_dim << ";\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
@@ -1793,6 +1817,7 @@ int main(int argc, char** argv) {
     shown.qsa_idx_n_heads = qsa_idx_n_heads; shown.qsa_idx_kv_heads = qsa_idx_kv_heads;
     shown.qsa_idx_head_dim = qsa_idx_head_dim; shown.qsa_idx_budget = qsa_idx_budget;
     shown.qsa_idx_ratio = qsa_idx_ratio;
+    shown.head_dim = head_dim;
     shown.rotary_dim = rotary_dim;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;

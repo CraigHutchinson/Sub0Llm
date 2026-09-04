@@ -41,8 +41,17 @@ namespace sub0 {
 static_assert(N_KV_HEADS >= 1, "N_KV_HEADS must be at least 1");
 static_assert(N_HEADS % N_KV_HEADS == 0, "N_HEADS must be divisible by N_KV_HEADS (equal query groups)");
 inline constexpr int GQA_GROUP = N_HEADS / N_KV_HEADS;
+// D_Q -- the QUERY projection width, N_HEADS * D_HEAD.
+//
+// WP4b blocker A (docs/WP4_SCOPE.md S2): D_HEAD is its own configurator axis now (--head-dim), so
+// N_HEADS * D_HEAD is NO LONGER necessarily D_MODEL. The real Qwen4-preview model is exactly that case:
+// 24 heads x head_dim 256 = 6144 against hidden_size 2560. Every expression that used to spell the query
+// width as `D_MODEL` because the two happened to coincide must now say D_Q, and Wo stops being square
+// ([D_Q, D_MODEL], the real o_proj's own shape). At --head-dim 0 (derive, the default) D_Q == D_MODEL
+// exactly and every one of those expressions evaluates to what it always did.
+inline constexpr int D_Q       = N_HEADS * D_HEAD;
 inline constexpr int D_KV      = N_KV_HEADS * D_HEAD;
-static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
+static_assert(D_KV <= D_Q, "D_KV cannot exceed D_Q (N_KV_HEADS <= N_HEADS at the same head width)");
 
 // Column layout of the CUDA backend's FUSED QKV activation buffer [rows, QKV_STRIDE], which packs the
 // three projections side by side so they collapse into one GEMM. Under GQA the three sub-blocks are no
@@ -55,15 +64,16 @@ static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 // and configurator can call it before a device exists -- so it cannot use these constants and carries
 // runtime `Dims`-based mirrors instead (its qkv/dqkv/dwqkv/qk_pre terms). Keep the two in lock-step.
 // The CPU backend does not fuse and so has no use for them.
-inline constexpr int QKV_STRIDE = D_MODEL + 2 * D_KV;   // total fused row width
-inline constexpr int QKV_K_OFF  = D_MODEL;              // column where the K sub-block starts
-inline constexpr int QKV_V_OFF  = D_MODEL + D_KV;       // column where the V sub-block starts
+// (Q is D_Q wide, not D_MODEL, since WP4b blocker A made D_HEAD its own axis -- identical at --head-dim 0.)
+inline constexpr int QKV_STRIDE = D_Q + 2 * D_KV;       // total fused row width
+inline constexpr int QKV_K_OFF  = D_Q;                  // column where the K sub-block starts
+inline constexpr int QKV_V_OFF  = D_Q + D_KV;           // column where the V sub-block starts
 
 // Companion stash for QK-norm's backward (the pre-norm Q/K values). Same Q|K packing as above, minus
 // the V sub-block: Q at 0 (D_MODEL wide), K at D_MODEL (D_KV wide). Only the STRIDE is named here --
 // the kernels that address the K sub-block are templated on their own head counts so the toy-shape
 // self-test can instantiate them, and derive the offset locally; a named K offset had no consumer.
-inline constexpr int QK_PRE_STRIDE = D_MODEL + D_KV;
+inline constexpr int QK_PRE_STRIDE = D_Q + D_KV;
 
 // Under RoPE there is no position table at all: RoPE injects position inside attention, so a
 // [SEQ_LEN, D_MODEL] pos_emb would be allocated, zeroed, serialized and never read. Omitting it is
@@ -592,7 +602,10 @@ static_assert(mixer_schedule_agrees_with_gdn(),
 // Wq/Wk/Wv/Wo[+QNorm/KNorm] -- and it applies only to the FULL-ATTENTION layers, so the GDN stride is an
 // input. Strictly positive whenever qsa_on and n_layers >= 1: the D_MODEL*D_MODEL gate projection alone
 // (which plain attention does not have at all) already dominates, and no term can cancel.
-inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_model, int d_kv,
+// `d_q` (N_HEADS * D_HEAD, the query/gate/output width) is an EXPLICIT parameter since WP4b blocker A:
+// it used to be spelled `d_model` here because the two coincided, which stops being true the moment
+// --head-dim is set (real model: 6144 vs 2560). Wq/Wo, QsaQProj/QsaGateProj/QsaOProj are all d_q-sided.
+inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_model, int d_q, int d_kv,
                                             int d_head, bool qk_norm, int idx_n_heads, int idx_kv_heads,
                                             int idx_head_dim, bool qsa_on) {
     if (!qsa_on) return 0;
@@ -600,9 +613,9 @@ inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_m
     for (int l = 0; l < n_layers; ++l)
         if (!(gdn_stride > 0 && (l % gdn_stride != gdn_stride - 1))) ++full_attn_layers;
     const long long idx_qk_out = static_cast<long long>(idx_n_heads + idx_kv_heads) * idx_head_dim;
-    const long long attn_layer = 2LL * d_model * d_model + 2LL * d_model * d_kv
+    const long long attn_layer = 2LL * d_model * d_q + 2LL * d_model * d_kv          // Wq, Wo, Wk, Wv
                                + (qk_norm ? 2LL * d_head : 0);
-    const long long qsa_layer  = 3LL * d_model * d_model + 2LL * d_model * d_kv + 2LL * d_head
+    const long long qsa_layer  = 3LL * d_model * d_q + 2LL * d_model * d_kv + 2LL * d_head
                                + static_cast<long long>(d_model) * idx_qk_out + 2LL * idx_head_dim;
     return static_cast<long long>(full_attn_layers) * (qsa_layer - attn_layer);
 }
@@ -875,6 +888,11 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(N_LAYERS));
     mix(static_cast<std::uint64_t>(N_HEADS));
     mix(static_cast<std::uint64_t>(N_KV_HEADS));
+    // D_HEAD is an independent axis since WP4b blocker A (--head-dim), so D_MODEL + N_HEADS above no
+    // longer determine it. Mixed CANONICALLY: 0 whenever N_HEADS * D_HEAD == D_MODEL, i.e. whenever the
+    // geometry is the derived one every build before this axis had -- so a build that spells the derived
+    // width explicitly shares its identity, and only a genuinely independent head width gets a new one.
+    mix(static_cast<std::uint64_t>(N_HEADS * D_HEAD == D_MODEL ? 0 : D_HEAD));
     mix(static_cast<std::uint64_t>(D_FF));
     mix(static_cast<std::uint64_t>(SEQ_LEN));
     mix(static_cast<std::uint64_t>(VOCAB));
@@ -963,6 +981,7 @@ inline constexpr memplan::Dims current_build_dims() {
         .n_kv_heads  = N_KV_HEADS,
         .exec_layers = LOOP_EXEC_COUNT,
         .depth_slots = DEPTH_CACHE_MAX,
+        .head_dim    = D_HEAD,   // WP4b blocker A: no longer necessarily D_MODEL / N_HEADS
     };
 }
 
@@ -1131,25 +1150,31 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             // three tensors stay full precision (decay=false for the 1D gains; the indexer's projection
             // is a routing/SELECTION decision, the one place a ternarized weight is most damaging --
             // the same reasoning MoeRouter and LmHead stay full precision).
-            add(D_MODEL, D_MODEL, PKind::QsaQProj,    true,  true);
-            add(D_MODEL, D_MODEL, PKind::QsaGateProj, true,  true);
-            add(D_MODEL, D_KV,    PKind::QsaKProj,    true,  true);
-            add(D_MODEL, D_KV,    PKind::QsaVProj,    true,  true);
-            add(D_MODEL, D_MODEL, PKind::QsaOProj,    true,  true);
+            // Widths are D_Q = N_HEADS * D_HEAD on the query/gate/output side, NOT D_MODEL: since
+            // WP4b blocker A those differ (real model: 24*256 = 6144 vs hidden_size 2560), and
+            // QsaOProj is [D_Q, D_MODEL] -- no longer square, matching the real o_proj.
+            add(D_MODEL, D_Q,  PKind::QsaQProj,    true,  true);
+            add(D_MODEL, D_Q,  PKind::QsaGateProj, true,  true);
+            add(D_MODEL, D_KV, PKind::QsaKProj,    true,  true);
+            add(D_MODEL, D_KV, PKind::QsaVProj,    true,  true);
+            add(D_Q,     D_MODEL, PKind::QsaOProj, true,  true);
             add(1, D_HEAD,        PKind::QsaQNorm,    false, false);
             add(1, D_HEAD,        PKind::QsaKNorm,    false, false);
             add(D_MODEL, QSA_IDX_QK_OUT,      PKind::QsaIdxQkProj, true,  false);
             add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxQNorm,  false, false);
             add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxKNorm,  false, false);
         } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
-            add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
+            // Wq is [in=D_MODEL, out=D_Q] and Wo is [in=D_Q, out=D_MODEL] -- NOT square once
+            // --head-dim makes N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). Identical to
+            // the previous [D_MODEL,D_MODEL] pair at --head-dim 0.
+            add(D_MODEL, D_Q,     PKind::Wq,  true,  true);
             // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
             // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
             // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
             // not assume they match).
             add(D_MODEL, D_KV,    PKind::Wk,  true,  true);
             add(D_MODEL, D_KV,    PKind::Wv,  true,  true);
-            add(D_MODEL, D_MODEL, PKind::Wo,  true,  true);
+            add(D_Q,     D_MODEL, PKind::Wo,  true,  true);
             if constexpr (USE_QK_NORM) {
                 add(1, D_HEAD, PKind::QNorm, false, false);
                 add(1, D_HEAD, PKind::KNorm, false, false);
@@ -1363,5 +1388,21 @@ consteval std::size_t total_param_floats() {
     return n;
 }
 inline constexpr std::size_t PARAM_FLOATS = total_param_floats();
+
+// memplan::param_floats() re-derives PARAM_FLOATS from dims alone (so the configurator, which cannot
+// include layout.hpp, gets the same number). Its own header comment requires the two to stay in
+// lock-step; until now the only thing enforcing that was a CUDA-only unit test, so a CPU-only build
+// could drift silently. Pinned here as a compile-time gate on EVERY build instead.
+//
+// Scoped honestly: memplan models the DENSE softmax-attention architecture only -- it has no term for
+// GDN's nine tensors, GR's instances, MoE's experts, QSA's ten, or the n-gram tables, and giving it one
+// would duplicate make_param_layout() rather than cross-check it. So the identity is asserted exactly
+// where memplan claims to be a model of the architecture, and the mechanisms' own PARAM_FLOATS deltas
+// are cross-checked by their own closed forms (gr_param_delta / moe_param_delta / qsa_param_delta)
+// against the real table in layout_tests.cpp.
+static_assert(USE_GATED_DELTANET || USE_GATED_RESIDUAL || USE_MOE || USE_QSA || NGRAM_EMBED ||
+                  memplan::param_floats(current_build_dims()) == PARAM_FLOATS,
+              "memplan::param_floats() has drifted from make_param_layout()'s own total -- every VRAM "
+              "prediction would be wrong by a constant. Keep the two derivations in lock-step.");
 
 }  // namespace sub0

@@ -101,7 +101,14 @@ consteval size_t calc_act_cap() {
                                       : 0);
     // FFN activation nodes: plain (W1-out, gelu-out) = 2*T*F; gated (gate-out, up-out, swiglu-out)
     // = 3*T*F (one extra T*F node -- see op_swiglu in the forward pass).
-    size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
+    // WP4b blocker A: every attention-side node budgeted at T*C above (the Q projection, its QK-norm
+    // and RoPE copies, and op_attn's output) is really D_Q = N_HEADS*D_HEAD wide, which is no longer
+    // necessarily D_MODEL. Budget the EXCESS explicitly rather than re-spelling the terms, so the
+    // expression is exactly 0 -- hence ACT_CAP is bit-identical -- at the derived head width, and
+    // generously over-provisioned (12 nodes' worth, more than the ~5 that are really D_Q-sided) when a
+    // --head-dim build widens them. Under-sizing this arena is a silent overwrite of a live node.
+    const size_t DQ_EXCESS = sub0::D_Q > (int)C ? (size_t)(sub0::D_Q - (int)C) : 0;
+    size_t per  = 10 * T * C + 12 * T * DQ_EXCESS + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
                 + (USE_TERNARY ? (size_t)4 * C * C + (USE_GATED_FFN ? 3 : 2) * C * F : 0)
                 + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0)   // op_rope(q), op_rope(k)
                 + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0)   // op_qknorm(q), op_qknorm(k) + rinv scratch
@@ -1757,21 +1764,23 @@ struct Model {
             if (MIXER_SCHEDULE[static_cast<std::size_t>(li)] == LayerMixer::Qsa) {
                 // QSA layer (docs/QSA.md S3b/S4) -- see layout.hpp's make_param_layout() for the same
                 // shapes with the reasoning attached. Order MUST match it exactly.
-                L.qsa_q     = mk_param(D_MODEL, D_MODEL, true);
-                L.qsa_gate  = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_q     = mk_param(D_MODEL, sub0::D_Q, true);   // D_Q, not D_MODEL (blocker A)
+                L.qsa_gate  = mk_param(D_MODEL, sub0::D_Q, true);
                 L.qsa_k     = mk_param(D_MODEL, D_KV, true);
                 L.qsa_v     = mk_param(D_MODEL, D_KV, true);
-                L.qsa_o     = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_o     = mk_param(sub0::D_Q, D_MODEL, true);   // no longer square
                 L.qsa_qnorm = mk_param(1, D_HEAD, false);
                 L.qsa_knorm = mk_param(1, D_HEAD, false);
                 L.qsa_idx_qk    = mk_param(D_MODEL, QSA_IDX_QK_OUT, true);
                 L.qsa_idx_qnorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
                 L.qsa_idx_knorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
             } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
-                L.Wq = mk_param(D_MODEL, D_MODEL, true);
+                // Wq [D_MODEL, D_Q] and Wo [D_Q, D_MODEL] -- not square once --head-dim makes
+                // N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). MUST match make_param_layout().
+                L.Wq = mk_param(D_MODEL, sub0::D_Q, true);
                 L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
                 L.Wv = mk_param(D_MODEL, D_KV, true);
-                L.Wo = mk_param(D_MODEL, D_MODEL, true);
+                L.Wo = mk_param(sub0::D_Q, D_MODEL, true);
                 if constexpr (USE_QK_NORM) {
                     L.q_norm = mk_param(1, D_HEAD, false);
                     L.k_norm = mk_param(1, D_HEAD, false);
@@ -2185,13 +2194,23 @@ struct Model {
         static thread_local int prev_id = -1, prev_pos = -2;
         const int prev = (pos == prev_pos + 1) ? prev_id : -1;
         prev_id = id; prev_pos = pos;
-        constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
+        // `d` is D_HEAD, NOT C / H: WP4b blocker A made the head width its own axis, so the two differ
+        // the moment --head-dim is set (and the decode path's per-head strides are all in D_HEAD).
+        // Spelling it C / H here was a real bug -- the forward-vs-forward_one parity check caught it at
+        // 1.71 relative error on the first --head-dim build, exactly the AGENTS.md S10 class of defect
+        // (a derived width re-spelled locally instead of read from the one source of truth).
+        constexpr int C = D_MODEL, H = N_HEADS, d = D_HEAD;
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
         // Gated Residual (Stage 1): `h` is HC_WIDE wide when GR is on (== D_MODEL, i.e. today's exact
         // size, when off -- layout.hpp's own collapse). Every OTHER per-layer temporary below (a, qn,
         // kn, vn, att, proj, f1, g1) stays exactly D_MODEL/D_FF-wide -- GR only ever widens the
         // persistent residual itself, never the sub-block's own internal working set (S2).
-        float h[HC_WIDE], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
+        // qn/att are D_Q = N_HEADS*D_HEAD wide and kn/vn are D_KV wide -- NOT D_MODEL, since WP4b
+        // blocker A made D_HEAD its own axis. All four are sized to the widest of the three so one
+        // constant covers them (D_KV <= D_Q by construction, see layout.hpp's static_assert); at the
+        // derived head width this is exactly C, so these arrays are unchanged for every existing build.
+        constexpr int ATT_W = sub0::D_Q > C ? sub0::D_Q : C;
+        float h[HC_WIDE], a[C], qn[ATT_W], kn[ATT_W], vn[ATT_W], att[ATT_W], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
         [[maybe_unused]] float packed_copy[C];             // periodic-reinject spike, see below
         // Gated Residual scratch/output buffers -- sized 1 (never zero-length) when off, same idiom as
@@ -2333,15 +2352,17 @@ struct Model {
             // verbatim in both branches below) so the GDN_SCHEDULE dispatch reads as a single small
             // if/else rather than two copies of this block drifting apart over time.
             auto do_attention_mixer = [&] {
-                linear_row(a, L.Wq, nullptr, qn, C, C);
-                // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row
+                // Wq is [C, D_Q] -- the OUT width is D_Q = N_HEADS*D_HEAD, not D_MODEL, since WP4b
+                // blocker A. Identical at the derived head width.
+                linear_row(a, L.Wq, nullptr, qn, C, sub0::D_Q);
+                // K/V project to D_KV (N_KV_HEADS heads), Q to D_Q (N_HEADS heads). qknorm_row/rope_row
                 // both derive their per-head width as (width / heads), so passing the KV pair yields
                 // the same D_HEAD they always did -- the rotation and norm are per-head, so nothing
                 // else changes.
                 linear_row(a, L.Wk, nullptr, kn, C, D_KV);
                 linear_row(a, L.Wv, nullptr, vn, C, D_KV);
-                if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
-                if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
+                if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, sub0::D_Q); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
+                if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, sub0::D_Q); rope_row(kn, pos, N_KV_HEADS, D_KV); }
                 // Depth attention, before the KV-cache append: the sequence cache must hold the MIXED
                 // V, because that is what op_attn receives in the batched forward. Mirrors forward()'s
                 // block.
@@ -2375,7 +2396,7 @@ struct Model {
                         for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
                     }
                 }
-                linear_row(att, L.Wo, nullptr, proj, C, C);
+                linear_row(att, L.Wo, nullptr, proj, sub0::D_Q, C);   // Wo is [D_Q, D_MODEL] (blocker A)
                 gr_write_row(h, proj);                                           // residual (write step)
             };
             // The QSA decode counterpart of the same sublayer -- the T==1 form of op_qsa's own batched

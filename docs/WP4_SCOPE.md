@@ -319,6 +319,69 @@ under the new axes.
 and zero runtime memory — demonstrated this pass. **It is the cheapest possible high-value gate in the
 whole of WP4** and should be written before any of §2's changes, so it fails first and passes last.
 
+#### WP4b — EXECUTED (branch `feature/wp4b-shape-blockers`). Results, recorded rather than summarised
+
+All four blockers landed, one commit each, in the order §6 proposed (B, C, D, A).
+
+**The shape gap is closed exactly.** `tests/qwen4_real_shape_tests.cpp` compiles this engine's own
+`make_param_layout()` against `tests/qwen4_real_axes/sub0_config.hpp` (the real axes, hand-written) and
+`static_assert`s the result. Measured:
+
+| Quantity | Before WP4b (§0/§2h) | After WP4b | Real model |
+|---|---:|---:|---:|
+| `PARAM_FLOATS` | 124,027,786,776 | **125,711,064,960** | 125,711,064,960 |
+| `NUM_PARAMS` | 74,899 | **74,803** | 74,803 |
+| GDN subtotal (36 layers) | 751,723,560 | **2,086,510,464** | 2,086,510,464 |
+| QSA subtotal (12 layers) | 268,621,296 | **617,358,336** | 617,358,336 |
+
+**The tensor COUNT is 74,803, not §0's 74,899 — a 96-tensor drop that is blocker D working, not a
+regression.** 96 == `2 × 48`: the `Ln1`/`Ln2` pair per layer that the real `Qwen4ExpTextDecoderLayer`
+does not have. The pre-WP4b 74,899 was measured with them still present. The float total is unaffected
+by which way that is counted only because the removal (245,760 floats) is exactly offset elsewhere —
+it is not: `PARAM_FLOATS` now matches the real model *because* those norms are gone, and the census in
+that test derives the total independently, tensor by tensor, to prove the match is not coincidental.
+
+**Two things the work order did not anticipate, both real:**
+
+1. **`QSA_INDEXER_HEAD_DIM >= D_HEAD` would have rejected the real model.** `layout.hpp` asserted the
+   indexer's head width against `D_HEAD`, but the quantity `rope_apply_row` actually indexes is
+   `rotary_dim`. The real model has `rotary_dim 64 <= indexer_head_dim 128 < head_dim 256`, so the old
+   form was not merely loose — it refused the real configuration outright. Relaxing it to `ROTARY_DIM`
+   is a prerequisite, not a loosening.
+2. **`forward_one` spelled the head width as `C / H`.** Caught by the existing forward-vs-`forward_one`
+   parity check the first time a non-square `--head-dim` build was run (1.71 relative error, plus an
+   all-zero decode trace). Exactly `AGENTS.md` §10's class: a derived width re-spelled locally instead
+   of read from its one source of truth. The neutral suite could never have found it.
+
+**Gate results** — neutral (all new axes at their derived defaults) `sub0_tests` is hash-identical at all
+three standard shapes; `sub0_frontend_tests` (which carries all four real-weight fixture tests) is
+byte-identical at 115,424 / 197; a genuinely non-square build (`--head-dim 64` at d96 H2, i.e. `D_Q` 128
+vs `D_MODEL` 96) passes the **entire** suite including the finite-difference gradient check; a GR-ON
+build passes `[layout]` and runs real forward passes through `Model::forward`; a neutral CUDA build
+passes all 196 cases, and a GDN-ON CUDA build's failure set is byte-identical to its own pre-WP4b
+baseline (19 pre-existing "no CUDA training path for GDN" refusals).
+
+**Deliberately still open, named here so WP4c/WP4d do not rediscover them:**
+
+- **CUDA refuses an independent `--head-dim`** (`static_assert(N_HEADS * D_HEAD == D_MODEL)` in
+  `backend_cuda.cu`, alongside the existing GR/MoE/QSA refusals). That backend bakes `D_MODEL` as the
+  attention-output width in the `att`/`proj`/`datt` scratch, `dwqkv`, `build_qkv_act_kernel` and every
+  tiled attention kernel. WP4 is CPU-only (§5), so this is a refusal, not a silent wrong answer.
+- **`op_rmsnorm`/`op_qknorm` still use `eps = 1e-5`,** where every real `Qwen4ExpTextRMSNorm` uses
+  `1e-6`. Blocker D removed the GR path's exposure to it (`Ln1`/`Ln2` are gone), but `LnF` — the
+  model-level final norm, whose real counterpart is also `1e-6` — still routes through it. Changing a
+  shared, always-present op's eps is its own scoped change with its own neutral-identity gate.
+- **`ARCH_FINGERPRINT2` is now FULL** (all 64 bits assigned, after `gdn_key_heads` at [47:40] and
+  `partial_rotary_dim` at [63:48]). The next computation-changing, shape-neutral axis needs a third
+  additive word.
+- **`memplan::param_floats()` models only the dense softmax-attention architecture** — no GDN/GR/MoE/QSA
+  term. Its lock-step with `PARAM_FLOATS` is now a compile-time `static_assert` on every build (it was a
+  CUDA-only unit test before, so a CPU build could drift silently), guarded to the configurations it
+  actually models; at the real axes its `d_q`/`d_kv`/`qkv_stride`/`qk_pre_stride` are checked against
+  `layout.hpp`'s directly, which is the part blocker A moved.
+- **A real-axes build needs `-fconstexpr-steps` raised** (~74.8k tensors walked several times at compile
+  time). Set on the shape-test target; a real engine build at these axes will need the same.
+
 ### WP4c — Acquisition + transplant pipeline (§3, §4)
 
 A safetensors reader (§3b) or a `BF16`-extended `gguf.hpp` (§3a), plus a name-mapping + transpose pass

@@ -72,6 +72,19 @@ static_assert(!sub0::NGRAM_EMBED,
 static_assert(!sub0::USE_GATED_RESIDUAL,
     "the CUDA backend does not implement Gated Residual yet; CPU-only for now (TODO(gr-gpu)).");
 
+// Independent attention head width (--head-dim, WP4b blocker A, docs/WP4_SCOPE.md S2): the CPU backend
+// derives every attention buffer's width from its tensors, but THIS backend bakes D_MODEL as the query /
+// attention-output width in a great many places -- the [M,C] att/proj/datt scratch, the [C,QKV_STRIDE]
+// dwqkv temp, build_qkv_act_kernel's own column arithmetic, and every tiled attention kernel's
+// compile-time HD/C pairing. A build where N_HEADS * D_HEAD != D_MODEL would therefore compute a
+// DIFFERENT, WRONG thing rather than fail to link, which is precisely the failure mode the GR/MoE/QSA
+// guards above exist to prevent -- so hard-stop the BUILD by the same rule. WP4 is a CPU-only work
+// package (docs/WP4_SCOPE.md S5); GDN's own CUDA path is unaffected, since it takes runtime gdn::Dims.
+// TODO(head-dim-gpu): thread D_Q through the attention scratch/kernels, then lift this guard.
+static_assert(N_HEADS * D_HEAD == D_MODEL,
+    "the CUDA backend requires N_HEADS * D_HEAD == D_MODEL (--head-dim 0); an independent head width is "
+    "CPU-only for now (TODO(head-dim-gpu)).");
+
 // Mixture of Experts (NUM_EXPERTS >= 2, docs/MOE.md): Stage 1 landed CPU-only forward (op_moe,
 // backend_cpu.cpp; shared math in include/sub0/moe_math.hpp). This backend has NO knowledge of MoE at
 // all yet -- a GPU build with it on would silently compute a DIFFERENT, WRONG architecture (the plain
@@ -787,7 +800,10 @@ __device__ inline void rope_pair_body(A* __restrict__ row, int pos, float theta,
 // previous D_MODEL/2 and D_KV/2. Kept as ONE function so the kernels' early-out and the host-side grid
 // sizing below cannot disagree about the thread count -- the hazard that a locally re-derived width
 // already produced twice in this file (see the QKV_STRIDE static_asserts).
-constexpr int rope_sub_pairs_host(int which) {
+// __host__ __device__ so the kernels' early-out and the host-side grid sizing call literally the same
+// function -- a plain constexpr host function cannot be called from device code without
+// --expt-relaxed-constexpr, and duplicating it is the drift this consolidation exists to prevent.
+__host__ __device__ constexpr int rope_sub_pairs_host(int which) {
     return (which == 0 ? N_HEADS : N_KV_HEADS) * sub0::ROTARY_HALF;
 }
 __device__ inline int rope_sub_pairs(int which) { return rope_sub_pairs_host(which); }
