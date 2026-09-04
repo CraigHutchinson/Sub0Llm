@@ -476,6 +476,10 @@ weights are 1-2 bits, and every one of them lands as an f32 here.
 | GR exit + `ln_f` + `lm_head` + `lm_bias` | 6 | 642,513,920 | 2,570,055,680 |
 | **total** | **6,240** | **11,647,617,440** | **46,590,469,760** |
 
+**Superseded 2026-09-04**: this table records WP4c as executed. The `LnF` removal since dropped the
+totals to **6,239 tensors / 11,647,614,880 floats / 46,590,459,520 bytes** and the artifact was
+regenerated — see "WP4d's `LnF` item — CLOSED". Everything else here still holds.
+
 MoE dominates completely: 2,522,810,880 of each layer's 2,593,979,104 floats (**97.3%**) are the 512
 routed experts plus the shared expert. The four mechanisms' own weights are the remaining 2.7%.
 
@@ -530,7 +534,8 @@ own table, found by reading the file rather than trusting the table:
 3. **There is no final norm in the file.** `output_norm.weight` does not exist under that or any other
    name — the only non-`blk.` tensors in the whole 1,224-tensor set are `output.weight`,
    `output_hc_{down,norm,up}.weight`, `per_layer_token_embd.weight` and `token_embd.weight`. §2 blocker
-   D assumed a real `LnF` counterpart existed and merely had the wrong `eps`. It does not exist at all,
+   D assumed a real `LnF` counterpart existed and merely had the wrong `eps` (so did
+   `docs/GATED_RESIDUAL.md` §1c, explicitly — now corrected there). It does not exist at all,
    which is architecturally coherent (the same reason blocker D removed `Ln1`/`Ln2`: the Gated Residual
    instance's own `hc_norm` IS the norm at that point). `LnF` is therefore **synthesized to 1.0**, the
    RMSNorm identity gain, and `LmBias` to 0.0 — both reported by name in level 1, not defaulted
@@ -570,8 +575,10 @@ zero-centred, finite, comparable-scale distributions (std 0.0075-0.042, no NaN),
 
 **Deliberately still open, named here so WP4d does not rediscover them:**
 
-- **`LnF` is synthetic** (see finding 3). WP4d must decide whether an identity gain there reproduces
-  the real model or whether the site should be removed the way `Ln1`/`Ln2` were.
+- ~~**`LnF` is synthetic** (see finding 3). WP4d must decide whether an identity gain there reproduces
+  the real model or whether the site should be removed the way `Ln1`/`Ln2` were.~~ **RESOLVED: removed.**
+  WP4d measured the identity gain at ~27% of logit scale; the site is gone under `USE_GATED_RESIDUAL`
+  and `Dest::LnF` with it (one synthesized destination now, not two). See "WP4d's `LnF` item — CLOSED".
 - **The artifact is f32 and 43.4 GiB for FOUR layers.** Extrapolated, the full 48 would be ~500 GB.
   The offload machinery of WP4e is not optional at full scale; it is the only way this format works.
 - **`op_rmsnorm`'s `eps` is still 1e-5** against the real model's 1e-6 (carried forward from WP4b).
@@ -706,7 +713,10 @@ perturbation. (At the first position, whose pre-`ln_f` rms is 2.64 rather than 0
 happened to survive on this input; nothing guarantees that.
 
 **So the resolution is: `LnF` should be removed under `USE_GATED_RESIDUAL` the same way `Ln1`/`Ln2` were
-(blocker D), for the same reason and with the same evidence.** This is deliberately NOT done in WP4d:
+(blocker D), for the same reason and with the same evidence.** *(DONE 2026-09-04 on branch
+`fix/gr-remove-lnf` — see "WP4d's `LnF` item — CLOSED" below for the executed result, including a second
+independent confirmation from the real `model.safetensors.index.json` that no such tensor exists.)*
+This was deliberately NOT done in WP4d:
 it is shape-changing (`PARAM_FLOATS` drops by `D_MODEL` = 2,560 and `NUM_PARAMS` by 1), which
 **invalidates the 46,590,469,832-byte artifact** and requires a `sub0llm-transplant` re-run. That is a
 WP4c-shaped change with its own gate, not something to fold into the stage that discovered it. Until it
@@ -714,9 +724,104 @@ lands, **the logits this build produces are not the real model's logits**, and W
 be run against them — the per-layer hidden states (which `ln_f` is downstream of, and which §5 already
 names as the right comparison point) are unaffected.
 
+### WP4d's `LnF` item — CLOSED (branch `fix/gr-remove-lnf`, 2026-09-04)
+
+**The claim that a real final norm exists was checked and refuted from a SECOND, independent source.**
+WP4c found the GGUF has no `output_norm.weight` under any name. `docs/GATED_RESIDUAL.md` §1c had
+nevertheless asserted a real `Qwen4ExpTextModel.norm` at `rms_norm_eps = 1e-6` — an inference from what
+decoder stacks generally do, never checked. The real `model.safetensors.index.json` was then fetched
+directly (170,726 bytes) and every non-per-layer "norm" tensor name enumerated: the only model-level
+language-model norm in the whole checkpoint is
+`model.language_model.hyper_connection_mixer.hc_norm.weight` — **the GR model-level exit instance's own
+`hc_norm`**, which is already a real `PARAM_LAYOUT` entry (`GrHcNorm`), already transplanted by WP4c, and
+present in the GGUF too as `output_hc_norm.weight`. Two real sources, two granularities, one answer:
+**the GR exit's own `hc_norm` IS the model's final normalization, and `LnF` does not exist.**
+
+**What landed**, exactly blocker D's precedent one level up:
+
+- `make_param_layout()` emits no `LnF` under `USE_GATED_RESIDUAL`; `Model::forward` / `forward_one` feed
+  `lm_head` straight from the GR exit's `mixed_input`. Non-GR builds keep the `LnF`/`op_rmsnorm` path
+  untouched — this is a GR-specific correction, not a general one.
+- `gr_param_delta()` gains a further `- d_model` (once, model-level). Still strictly positive, so
+  `PARAM_FLOATS` still discriminates GR-on from GR-off; **no `ARCH_FINGERPRINT2` bit** (shape-changing,
+  rule #1 — which matters, since that word is full).
+- `Dest::LnF` is gone from `transplant.hpp` entirely rather than left synthesizing an identity gain
+  nothing consumes: synthesized destinations drop from 2 to 1 (`LmBias` alone).
+
+**The numbers, before → after:**
+
+| Quantity | Before | After |
+|---|---:|---:|
+| `PARAM_FLOATS` at the real 48-layer axes | 125,711,064,960 | **125,711,062,400** |
+| `NUM_PARAMS` at the real 48-layer axes | 74,803 | **74,802** |
+| `qwen4_sub4` (4-layer) tensors / floats | 6,240 / 11,647,617,440 | **6,239 / 11,647,614,880** |
+| artifact bytes | 46,590,469,832 | **46,590,459,592** |
+
+Exactly `D_MODEL` = 2,560 floats and one tensor less, and nothing else moved. **`kRealParamFloats` in
+`tests/qwen4_real_shape_tests.cpp` is corrected by the same 2,560**, with its own reason recorded:
+`docs/QWEN4_MEMORY_ORCHESTRATION.md` §2f(v2)'s backbone reconciliation carries an `ln_f = 2,560` line for
+a tensor the real checkpoint does not have. The test's independent hand-written census drops its `ln_f`
+term and still meets `make_param_layout()`'s total.
+
+**Gates re-run:**
+
+- **Neutral identity**: `sub0_tests` is **hash-identical at all three standard shapes** —
+  d96 L8 H2 seq128 `forward 4e00b8a7dadafff8 / grad 6909ae0b3afc2caa / decode ab31e5533547f73a`,
+  d132 L11 H4 kv2 seq96 `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`,
+  d196 L11 H7 seq256 `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`. Assertion counts are
+  **+1** at each shape (17,827,371→372 / 29,771,943→944 / 54,070,193→194), 147 cases unchanged — the one
+  new `REQUIRE` counting `LnF` entries in `layout_tests.cpp`, and nothing else.
+- **The four real-weight fixture tests**: `sub0_frontend_tests` green, 216 cases, 116,990 → **116,989**
+  assertions — exactly `-1`, from `Dest::Count` losing one enumerator in `transplant_tests.cpp`'s own
+  per-destination loop.
+- **Four-level transplant gate, re-run against the regenerated artifact**: level 1 — 6,239 / 6,239
+  destinations, 11,647,614,880 / 11,647,614,880 floats, **1 synthesized** (`LmBias`), 7 unmatched
+  in-scope sources (every one a deliberately-excluded PLE tensor, unchanged); level 2 — 6,238 tensors
+  checked, **0 mismatches**; level 3 (GDN layer-0 replay) **5.09e-11**; level 4 (QSA layer-3 replay)
+  **1.40e-09**; plus `--verify`: **0 bit-for-bit mismatches of 6,239**. Write 82.0s, verify 107.8s.
+  The previous artifact is kept as `qwen4_sub4.bin.pre-lnf-fix` for comparison.
+
+**WP4d's own harness re-run on the new artifact** (`sub0llm-qwen4-forward`), against its own prior run:
+
+| Check | Before (wrong) | After |
+|---|---|---|
+| `load_model` | accepted, 41.0s | accepted, **42.9s**, 43.39 GiB |
+| the synthesized tail | `LnF` min=max=1.0, `LmBias` 0.0 | **`LnF` ABSENT from `PARAM_LAYOUT`** (asserted, not merely omitted); `LmBias` 0.0 |
+| `Model::forward` | [6 x 248320] in 1.72s, per-row logit rms **0.60-0.83**, range ≈ ±4 | [6 x 248320] in **1.34s**, per-row rms **0.61-2.31**, range **-10.2 … +11.7**, zero non-finite |
+| engine vs math-core replay, layers 0-2 | 1.8e-08 / 2.8e-08 class | **unchanged**: ‖h_in‖ ≤ 2.84e-08, ‖delta‖ ≤ 1.7e-08 (`ln_f` was downstream of these, as §5 predicted) |
+| `forward` vs `forward_one` | max abs **5.96e-06**, max rel 0.135 | **0 exactly** — removing the site removed the one step where the two paths differed in accumulation order |
+| peak working set | 45.29 GiB | 45.29 GiB |
+
+**The dynamic-range change is the signature that this is the real fix, not just a smaller model.** The
+pre-fix build's six rows all landed in a narrow `rms 0.60-0.83` band because `ln_f` rescaled every
+position's hidden state to unit RMS before the head, flattening exactly the cross-position magnitude
+differences the residual stream had built up. Un-normed, the rows whose hidden RMS is furthest from 1
+(rows 0-3) now produce correspondingly larger logits (up to rms 2.31) while rows 4-5 — whose hidden RMS
+was already ≈1 — are essentially unchanged (0.61 / 0.60 against the old 0.60-0.83 band). That is what
+removing a normalization the real model does not have must look like.
+
+**Two direct confirmations, both in the harness's own check 5:**
+
+1. **The readout really is un-normed**: an independent double-precision `lm_head(hidden_last) + bias`
+   reproduces the engine's own logits row to **5.89e-06** (float32 GEMM noise over 2,560 terms). No
+   normalization can be sitting between them.
+2. **The size of what was removed, measured on the same run**: `max |with the removed ln_f - without it|`
+   = **0.174** against a logit rms of **0.605**, i.e. **28.8% of scale** — reproducing WP4d's own 0.174 /
+   ~27% figure exactly. The argmax happened to agree either way on this input (109782), which is what
+   made the bug survivable and not detectable by a top-1 check.
+
+**Confidence.** High that the LAYOUT and the plumbing are now right — two independent real sources agree
+the tensor does not exist, the change is exactly `-1` tensor and `-D_MODEL` floats with every other
+number unmoved, and `forward`/`forward_one` now agree bit-exactly. Moderate-to-high that the OUTPUT is
+now materially more correct: the removed perturbation was 28.8% of logit scale and its removal restores
+the cross-position dynamic range a norm-free readout must have. **Still not verified against the real
+model's own outputs** — WP4d's own standing caveat is unchanged: no real-dims reference output exists in
+this repo, so this is a structural-correctness argument plus a self-consistency check, not a numerical
+match. Settling it needs WP4f's llama.cpp oracle.
+
 ### WP4d — what is still open
 
-- **`LnF` removal** (above): shape-changing, invalidates the artifact, needs a transplant re-run.
+- ~~**`LnF` removal**~~ — **DONE**, see the section immediately above.
 - **No real-dims reference output exists.** Closing that needs either a real-dims fixture extracted the
   way the sliced ones were, or WP4f's llama.cpp oracle. WP4d's engine-vs-math-core agreement is a
   consistency check, **not** a check against the real model.
