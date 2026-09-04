@@ -154,7 +154,8 @@ std::vector<Slot> build_plan() {
     add(Dest::GrExitNorm, PKind::GrHcNorm,  -1, 1, WIDE);
     add(Dest::GrExitDown, PKind::GrMixDown, -1, WIDE, HC_LOWRANK);
     add(Dest::GrExitUp,   PKind::GrMixUp,   -1, HC_LOWRANK, WIDE);
-    add(Dest::LnF,    PKind::LnF,    -1, 1, D_MODEL);
+    // No LnF slot: the real model has no final norm, so make_param_layout() emits none under
+    // USE_GATED_RESIDUAL (see its own comment there and transplant.hpp's Synthetic note).
     add(Dest::LmHead, PKind::LmHead, -1, D_MODEL, VOCAB);
     add(Dest::LmBias, PKind::LmBias, -1, 1, VOCAB);
     return plan;

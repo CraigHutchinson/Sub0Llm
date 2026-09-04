@@ -142,9 +142,12 @@ TEST_CASE("transplant: every destination has a well-formed recipe", "[transplant
         if (r.op == Op::PerHeadHalf) ++per_head;
     }
     // Pinned counts, so a future edit that (say) turns a Transpose into a Copy is a test failure and
-    // not a silent behaviour change. Two synthetics = LnF and LmBias, the two destinations the real
-    // file has NO source for (see recipe_for's own comment -- this is the finding, not an oversight).
-    CHECK(synthetic == 2);
+    // not a silent behaviour change. ONE synthetic = LmBias, the only destination the real file has no
+    // source for (the real head is bias-free). It was two while an LnF destination still existed; the
+    // real model has no final norm at all, so make_param_layout() stopped emitting the slot under
+    // USE_GATED_RESIDUAL and Dest::LnF was removed rather than left synthesizing an unused identity
+    // gain (see recipe_for's own comment -- this is the finding, not an oversight).
+    CHECK(synthetic == 1);
     CHECK(concat == 1);        // the QSA indexer's q|k pair
     CHECK(expert_slice == 3);  // MoE gate/up/down
     CHECK(per_head == 2);      // QSA query and gate halves of the fused attn_q
