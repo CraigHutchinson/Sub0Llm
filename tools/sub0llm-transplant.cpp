@@ -275,7 +275,6 @@ bool write_moe_sidecar(const std::string& path, std::map<std::string, Source>& b
     std::vector<moeq::Desc> descs(static_cast<std::size_t>(N_LAYERS) * NUM_EXPERTS * moeq::PerExpert);
     std::vector<const gguf::TensorInfo*> srcs(descs.size(), nullptr);
     std::vector<Source*> src_entries(descs.size(), nullptr);
-    std::uint64_t cursor = 0;
     for (int l = 0; l < N_LAYERS; ++l) {
         for (int w = 0; w < moeq::PerExpert; ++w) {
             const std::string name = gguf_name(expert_src_pattern(w), l);
@@ -305,11 +304,17 @@ bool write_moe_sidecar(const std::string& path, std::map<std::string, Source>& b
                 }
                 const std::size_t idx =
                     static_cast<std::size_t>(moeq::desc_index(NUM_EXPERTS, l, e, w));
+                // NOTE: `off` is deliberately NOT assigned here. This loop walks (layer, plane, expert)
+                // while the payload is written in DESCRIPTOR-INDEX order (layer, expert, plane) below,
+                // and assigning a running cursor here made every descriptor point at the position it
+                // would have had in the OTHER order -- a real bug, caught by the bit-for-bit sample
+                // check further down (92 of 96 planes mismatched; the handful that agreed were the ones
+                // the two orders happen to place identically). Offsets are assigned in one pass over
+                // the finished table, in exactly the order the bytes are written.
                 descs[idx] = moeq::Desc{t.type_raw, static_cast<std::uint32_t>(in_f),
-                                        static_cast<std::uint32_t>(out_f), 0, cursor, r.bytes};
+                                        static_cast<std::uint32_t>(out_f), 0, 0, r.bytes};
                 srcs[idx] = &t;
                 src_entries[idx] = &it->second;
-                cursor += r.bytes;
                 ++tot.tensors;
                 tot.bytes += r.bytes;
                 tot.f32_bytes_avoided += per * 4;
@@ -317,6 +322,8 @@ bool write_moe_sidecar(const std::string& path, std::map<std::string, Source>& b
             }
         }
     }
+    std::uint64_t cursor = 0;
+    for (moeq::Desc& d : descs) { d.off = cursor; cursor += d.bytes; }
 
     moeq::Header h;
     h.n_layers = N_LAYERS;
