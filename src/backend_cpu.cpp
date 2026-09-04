@@ -101,7 +101,14 @@ consteval size_t calc_act_cap() {
                                       : 0);
     // FFN activation nodes: plain (W1-out, gelu-out) = 2*T*F; gated (gate-out, up-out, swiglu-out)
     // = 3*T*F (one extra T*F node -- see op_swiglu in the forward pass).
-    size_t per  = 10 * T * C + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
+    // WP4b blocker A: every attention-side node budgeted at T*C above (the Q projection, its QK-norm
+    // and RoPE copies, and op_attn's output) is really D_Q = N_HEADS*D_HEAD wide, which is no longer
+    // necessarily D_MODEL. Budget the EXCESS explicitly rather than re-spelling the terms, so the
+    // expression is exactly 0 -- hence ACT_CAP is bit-identical -- at the derived head width, and
+    // generously over-provisioned (12 nodes' worth, more than the ~5 that are really D_Q-sided) when a
+    // --head-dim build widens them. Under-sizing this arena is a silent overwrite of a live node.
+    const size_t DQ_EXCESS = sub0::D_Q > (int)C ? (size_t)(sub0::D_Q - (int)C) : 0;
+    size_t per  = 10 * T * C + 12 * T * DQ_EXCESS + (USE_GATED_FFN ? 3 : 2) * T * F + H * T * T + 2 * T
                 + (USE_TERNARY ? (size_t)4 * C * C + (USE_GATED_FFN ? 3 : 2) * C * F : 0)
                 + (POS_ENCODING == PosEncoding::Rope ? (size_t)2 * T * C : 0)   // op_rope(q), op_rope(k)
                 + (USE_QK_NORM ? (size_t)2 * T * C + 2 * T * H : 0)   // op_qknorm(q), op_qknorm(k) + rinv scratch
@@ -592,10 +599,18 @@ static Node* op_tied_head(Node* x, Node* table) {
 // projections before attention, so the score q_i . k_j ends up depending only on the RELATIVE
 // offset (i - j) -- no learned position table, and the rotation is an orthogonal map whose
 // backward is the inverse rotation. The position of row t is t (position within the window).
-// inv_freq[m] = ROPE_THETA^(-2m/d); a head dimension d is assumed even (an odd tail is left
-// unrotated, which is the identity for that lone component).
+// inv_freq[m] = ROPE_THETA^(-2m/ROTARY_DIM).
+//
+// PARTIAL ROTARY (WP4b blocker C): only each head's first ROTARY_DIM channels are rotated; channels
+// [ROTARY_DIM, d) are copied through unchanged. ROTARY_DIM == D_HEAD (the default, --rotary-dim 0) is
+// the full-width rotation every build before this axis existed performed, and at that setting the
+// pass-through loop below has zero trips -- so the neutral path is bit-identical. Note the inverse
+// frequency's denominator is ROTARY_DIM, not the head width: that matches the reference's own
+// inv_freq, which is built over rotary_dim (see layout.hpp's ROTARY_DIM comment for the convention
+// re-derivation, and for why the interleaved-vs-half-split pairing difference is orthogonal to this).
 static Node* op_rope(Node* x, int H) {
-    const int T = x->rows, C = x->cols, d = C / H, half = d / 2;
+    const int T = x->rows, C = x->cols, d = C / H;
+    constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;
     Node* y = mk_node(Op::Rope, T, C);
     y->a = x; y->heads = H;
     const float* __restrict xd = x->data.data();
@@ -606,13 +621,15 @@ static Node* op_rope(Node* x, int H) {
         for (int h = 0; h < H; ++h) {
             const int off = h * d;
             for (int m = 0; m < half; ++m) {
-                const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+                const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
                 const float cs = std::cos(ang), sn = std::sin(ang);
                 const float x0 = xr[off + 2 * m], x1 = xr[off + 2 * m + 1];
                 yr[off + 2 * m]     = x0 * cs - x1 * sn;
                 yr[off + 2 * m + 1] = x0 * sn + x1 * cs;
             }
-            if (2 * half < d) yr[off + d - 1] = xr[off + d - 1];   // odd-d tail: identity
+            // Un-rotated remainder: the partial-rotary tail, plus (at rd == d) the odd-d lone component
+            // the previous full-width form already passed through as the identity.
+            for (int j = 2 * half; j < d; ++j) yr[off + j] = xr[off + j];
         }
     }
     return y;
@@ -1048,7 +1065,8 @@ static void backward_node(Node& n) {
         // Inverse rotation (R^T): grad of the un-rotated input from the grad of the rotated
         // output. Mirrors op_rope exactly; accumulates into x->grad.
         Node* x = n.a;
-        const int T = x->rows, C = x->cols, H = n.heads, d = C / H, half = d / 2;
+        const int T = x->rows, C = x->cols, H = n.heads, d = C / H;
+        constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;   // partial rotary -- mirrors op_rope exactly
         const float* __restrict gy = n.grad.data();
         float* __restrict gx       = x->grad.data();
         for (int t = 0; t < T; ++t) {
@@ -1057,13 +1075,14 @@ static void backward_node(Node& n) {
             for (int h = 0; h < H; ++h) {
                 const int off = h * d;
                 for (int m = 0; m < half; ++m) {
-                    const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+                    const float ang = (static_cast<float>(t) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
                     const float cs = std::cos(ang), sn = std::sin(ang);
                     const float g0 = gyr[off + 2 * m], g1 = gyr[off + 2 * m + 1];
                     gxr[off + 2 * m]     +=  g0 * cs + g1 * sn;
                     gxr[off + 2 * m + 1] += -g0 * sn + g1 * cs;
                 }
-                if (2 * half < d) gxr[off + d - 1] += gyr[off + d - 1];
+                // The un-rotated remainder is the identity, so its gradient passes straight through.
+                for (int j = 2 * half; j < d; ++j) gxr[off + j] += gyr[off + j];
             }
         }
         break;
@@ -1358,14 +1377,15 @@ thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_Q
 // what makes a QSA layer numerically the real model's layer, and taking the tables as data is what lets
 // the fixture test feed the real model's own PARTIAL-rotary cos/sin unchanged.
 // Layout matches HF's own `emb = cat(freqs, freqs)`: cos[pos][m] == cos[pos][m + rotary_dim/2].
-// rotary_dim is D_HEAD here (full-width) -- docs/QSA.md S2b.2's documented engine-side simplification.
+// rotary_dim is ROTARY_DIM -- a real axis since WP4b blocker C (--rotary-dim, layout.hpp's own
+// ROTARY_DIM comment); it was pinned to D_HEAD before that, which is still what --rotary-dim 0 gives.
 struct QsaRopeTables {
-    std::vector<float> cos, sin;   // [SEQ_LEN][D_HEAD]
+    std::vector<float> cos, sin;   // [SEQ_LEN][ROTARY_DIM]
     QsaRopeTables() {
-        const size_t n = static_cast<size_t>(SEQ_LEN) * D_HEAD;
+        const size_t n = static_cast<size_t>(SEQ_LEN) * ROTARY_DIM;
         cos.assign(n, 1.f); sin.assign(n, 0.f);
         if constexpr (USE_QSA) {
-            const int rd = D_HEAD, half = rd / 2;
+            constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;
             for (int p = 0; p < SEQ_LEN; ++p) {
                 for (int m = 0; m < half; ++m) {
                     const float ang = static_cast<float>(p) * ROPE_POS_SCALE *
@@ -1423,11 +1443,13 @@ static inline void qknorm_row(float* __restrict x, const Node* gamma, int H, int
     }
 }
 static inline void rope_row(float* __restrict x, int pos, int H, int C) {   // rotate Q/K in place (t = pos)
-    const int d = C / H, half = d / 2;
+    const int d = C / H;
+    constexpr int rd = ROTARY_DIM, half = ROTARY_HALF;   // partial rotary -- mirrors op_rope; the
+                                                          // un-rotated remainder needs no work in place
     for (int h = 0; h < H; ++h) {
         const int off = h * d;
         for (int m = 0; m < half; ++m) {
-            const float ang = (static_cast<float>(pos) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / d);
+            const float ang = (static_cast<float>(pos) * ROPE_POS_SCALE) * std::pow(ROPE_THETA, -2.f * m / rd);
             const float cs = std::cos(ang), sn = std::sin(ang);
             const float x0 = x[off + 2 * m], x1 = x[off + 2 * m + 1];
             x[off + 2 * m]     = x0 * cs - x1 * sn;
@@ -1490,7 +1512,11 @@ static inline float silu_row(float v) {
 // attention layer, and vice versa for Wq/Wk/Wv/Wo/q_norm/k_norm) -- see layout.hpp's PKind comment for
 // what each one is. A layer is one or the other, never both, at every GDN_FULL_ATTN_STRIDE value.
 struct Layer {
-    Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
+    // ln1/ln2 are nullptr under USE_GATED_RESIDUAL (WP4b blocker D: the real decoder layer has neither,
+    // and GR's own hc_norm is the pre-block norm) -- the same "unused pointers just stay nullptr" idiom
+    // q_norm/k_norm and the gdn_* set already use, so the struct's shape stays config-independent.
+    Node *ln1 = nullptr, *ln2 = nullptr;
+    Node *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
     Node *gdn_in_qkv = nullptr, *gdn_in_z = nullptr, *gdn_in_b = nullptr, *gdn_in_a = nullptr,
          *gdn_conv = nullptr, *gdn_a_log = nullptr, *gdn_dt_bias = nullptr, *gdn_norm = nullptr,
          *gdn_out_proj = nullptr;
@@ -1716,8 +1742,13 @@ struct Model {
         else                       pos_emb = nullptr;
         for (int li = 0; li < N_LAYERS; ++li) {
             Layer& L = layers[static_cast<std::size_t>(li)];
-            L.ln1 = mk_param(1, D_MODEL, false);
-            L.ln2 = mk_param(1, D_MODEL, false);
+            // WP4b blocker D: no Ln1/Ln2 under Gated Residual -- the real Qwen4ExpTextDecoderLayer
+            // has no input_layernorm / post_attention_layernorm; GR's own grouped hc_norm is the
+            // pre-block norm and the mixer reads mixed_input directly. MUST match make_param_layout().
+            if constexpr (!USE_GATED_RESIDUAL) {
+                L.ln1 = mk_param(1, D_MODEL, false);
+                L.ln2 = mk_param(1, D_MODEL, false);
+            }
             // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance,
             // MUST match layout.hpp's own placement (right here, before the sub-block's own weights).
             if constexpr (USE_GATED_RESIDUAL) {
@@ -1733,21 +1764,23 @@ struct Model {
             if (MIXER_SCHEDULE[static_cast<std::size_t>(li)] == LayerMixer::Qsa) {
                 // QSA layer (docs/QSA.md S3b/S4) -- see layout.hpp's make_param_layout() for the same
                 // shapes with the reasoning attached. Order MUST match it exactly.
-                L.qsa_q     = mk_param(D_MODEL, D_MODEL, true);
-                L.qsa_gate  = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_q     = mk_param(D_MODEL, sub0::D_Q, true);   // D_Q, not D_MODEL (blocker A)
+                L.qsa_gate  = mk_param(D_MODEL, sub0::D_Q, true);
                 L.qsa_k     = mk_param(D_MODEL, D_KV, true);
                 L.qsa_v     = mk_param(D_MODEL, D_KV, true);
-                L.qsa_o     = mk_param(D_MODEL, D_MODEL, true);
+                L.qsa_o     = mk_param(sub0::D_Q, D_MODEL, true);   // no longer square
                 L.qsa_qnorm = mk_param(1, D_HEAD, false);
                 L.qsa_knorm = mk_param(1, D_HEAD, false);
                 L.qsa_idx_qk    = mk_param(D_MODEL, QSA_IDX_QK_OUT, true);
                 L.qsa_idx_qnorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
                 L.qsa_idx_knorm = mk_param(1, QSA_INDEXER_HEAD_DIM, false);
             } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(li)]) {
-                L.Wq = mk_param(D_MODEL, D_MODEL, true);
+                // Wq [D_MODEL, D_Q] and Wo [D_Q, D_MODEL] -- not square once --head-dim makes
+                // N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). MUST match make_param_layout().
+                L.Wq = mk_param(D_MODEL, sub0::D_Q, true);
                 L.Wk = mk_param(D_MODEL, D_KV, true);      // GQA: narrower than Wq when N_KV_HEADS < N_HEADS
                 L.Wv = mk_param(D_MODEL, D_KV, true);
-                L.Wo = mk_param(D_MODEL, D_MODEL, true);
+                L.Wo = mk_param(sub0::D_Q, D_MODEL, true);
                 if constexpr (USE_QK_NORM) {
                     L.q_norm = mk_param(1, D_HEAD, false);
                     L.k_norm = mk_param(1, D_HEAD, false);
@@ -1755,15 +1788,15 @@ struct Model {
             } else {
                 // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b) -- see layout.hpp's
                 // make_param_layout() for the same shapes with the reasoning attached.
-                L.gdn_in_qkv   = mk_param(D_MODEL, 2 * D_KV + D_MODEL, true);
-                L.gdn_in_z     = mk_param(D_MODEL, D_MODEL, true);
-                L.gdn_in_b     = mk_param(D_MODEL, N_HEADS, true);
-                L.gdn_in_a     = mk_param(D_MODEL, N_HEADS, true);
+                L.gdn_in_qkv   = mk_param(D_MODEL, GDN_CONV_DIM, true);
+                L.gdn_in_z     = mk_param(D_MODEL, GDN_VALUE_DIM, true);
+                L.gdn_in_b     = mk_param(D_MODEL, GDN_V_HEADS, true);
+                L.gdn_in_a     = mk_param(D_MODEL, GDN_V_HEADS, true);
                 L.gdn_conv     = mk_param(GDN_CONV_DIM, GDN_CONV_KERNEL, false);
-                L.gdn_a_log    = mk_param(1, N_HEADS, false);
-                L.gdn_dt_bias  = mk_param(1, N_HEADS, false);
-                L.gdn_norm     = mk_param(1, D_HEAD, false);
-                L.gdn_out_proj = mk_param(D_MODEL, D_MODEL, true);
+                L.gdn_a_log    = mk_param(1, GDN_V_HEADS, false);
+                L.gdn_dt_bias  = mk_param(1, GDN_V_HEADS, false);
+                L.gdn_norm     = mk_param(1, GDN_V_HEAD_DIM, false);
+                L.gdn_out_proj = mk_param(GDN_VALUE_DIM, D_MODEL, true);
             }
             // Gated Residual: the mlp_hyper_connection instance, right before the FFN's own weights.
             if constexpr (USE_GATED_RESIDUAL) {
@@ -1843,7 +1876,7 @@ struct Model {
         std::uniform_real_distribution<float> gdn_a_init(0.01f, 16.f);   // real model's own A_log init range, S1a
         for (int li = 0; li < N_LAYERS; ++li) {
             Layer& L = layers[static_cast<std::size_t>(li)];
-            ones(L.ln1); ones(L.ln2);
+            if constexpr (!USE_GATED_RESIDUAL) { ones(L.ln1); ones(L.ln2); }   // absent under GR (blocker D)
             // Gated Residual init: GrHcNorm is left at the arena's own zero -- the real model's own
             // `torch.zeros(dim)` convention (gain = 1 + w, so w=0 is the identity RMS-norm, S1a), NOT
             // this engine's usual ones()-initialized gain. down/up/block_inject are ordinary GEMM
@@ -1991,9 +2024,17 @@ struct Model {
         auto gr_read = [&](Node* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w, Node* ln,
                             Node** out_inj) -> Node* {
             if constexpr (USE_GATED_RESIDUAL) {
+                // WP4b blocker D: the mixer reads GR's mixed_input DIRECTLY, un-normed. The real
+                // Qwen4ExpTextDecoderLayer has no input_layernorm / post_attention_layernorm at all --
+                // GR's own grouped hc_norm (already applied inside op_gr_mix, at the real model's
+                // rms_norm_eps = 1e-6) IS the pre-block norm. Routing mixed_input through op_rmsnorm
+                // applied a norm the real model does not, at the WRONG eps (1e-5), so no amount of
+                // correct weight transplanting could have reproduced the real output.
+                // `ln` is nullptr here -- Ln1/Ln2 are not emitted under GR (make_param_layout).
+                (void)ln;
                 Node* mixed = op_gr_mix(wide, norm_w, down_w, up_w);
                 *out_inj = op_gr_gate(wide, norm_w, inject_w);
-                return op_rmsnorm(mixed, ln);
+                return mixed;
             } else {
                 return op_rmsnorm(wide, ln);
             }
@@ -2153,13 +2194,23 @@ struct Model {
         static thread_local int prev_id = -1, prev_pos = -2;
         const int prev = (pos == prev_pos + 1) ? prev_id : -1;
         prev_id = id; prev_pos = pos;
-        constexpr int C = D_MODEL, H = N_HEADS, d = C / H;
+        // `d` is D_HEAD, NOT C / H: WP4b blocker A made the head width its own axis, so the two differ
+        // the moment --head-dim is set (and the decode path's per-head strides are all in D_HEAD).
+        // Spelling it C / H here was a real bug -- the forward-vs-forward_one parity check caught it at
+        // 1.71 relative error on the first --head-dim build, exactly the AGENTS.md S10 class of defect
+        // (a derived width re-spelled locally instead of read from the one source of truth).
+        constexpr int C = D_MODEL, H = N_HEADS, d = D_HEAD;
         const float scale = 1.f / std::sqrt(static_cast<float>(d));
         // Gated Residual (Stage 1): `h` is HC_WIDE wide when GR is on (== D_MODEL, i.e. today's exact
         // size, when off -- layout.hpp's own collapse). Every OTHER per-layer temporary below (a, qn,
         // kn, vn, att, proj, f1, g1) stays exactly D_MODEL/D_FF-wide -- GR only ever widens the
         // persistent residual itself, never the sub-block's own internal working set (S2).
-        float h[HC_WIDE], a[C], qn[C], kn[C], vn[C], att[C], proj[C], f1[D_FF];
+        // qn/att are D_Q = N_HEADS*D_HEAD wide and kn/vn are D_KV wide -- NOT D_MODEL, since WP4b
+        // blocker A made D_HEAD its own axis. All four are sized to the widest of the three so one
+        // constant covers them (D_KV <= D_Q by construction, see layout.hpp's static_assert); at the
+        // derived head width this is exactly C, so these arrays are unchanged for every existing build.
+        constexpr int ATT_W = sub0::D_Q > C ? sub0::D_Q : C;
+        float h[HC_WIDE], a[C], qn[ATT_W], kn[ATT_W], vn[ATT_W], att[ATT_W], proj[C], f1[D_FF];
         [[maybe_unused]] float g1[D_FF];   // gate branch, gated FFN only
         [[maybe_unused]] float packed_copy[C];             // periodic-reinject spike, see below
         // Gated Residual scratch/output buffers -- sized 1 (never zero-length) when off, same idiom as
@@ -2197,7 +2248,12 @@ struct Model {
                 gr::hc_norm(GR_DIMS, 1, wide, norm_w->data.data(), gr_normed);
                 gr::mix(GR_DIMS, 1, gr_normed, down_w->data.data(), up_w->data.data(), gr_mixed, gr_mixscr);
                 gr::gate(GR_DIMS, 1, gr_normed, inject_w->data.data(), gr_inj);
-                rmsnorm_row(gr_mixed, ln, out_a, C);
+                // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
+                // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
+                // pre-block norm at its own 1e-6 eps. Mirrors forward()'s gr_read exactly; the
+                // forward-vs-forward_one parity test is what gates that they stay mirrored.
+                (void)ln;
+                std::copy_n(gr_mixed, C, out_a);
             } else {
                 rmsnorm_row(wide, ln, out_a, C);
             }
@@ -2296,15 +2352,17 @@ struct Model {
             // verbatim in both branches below) so the GDN_SCHEDULE dispatch reads as a single small
             // if/else rather than two copies of this block drifting apart over time.
             auto do_attention_mixer = [&] {
-                linear_row(a, L.Wq, nullptr, qn, C, C);
-                // K/V project to D_KV (N_KV_HEADS heads), Q to C (N_HEADS heads). qknorm_row/rope_row
+                // Wq is [C, D_Q] -- the OUT width is D_Q = N_HEADS*D_HEAD, not D_MODEL, since WP4b
+                // blocker A. Identical at the derived head width.
+                linear_row(a, L.Wq, nullptr, qn, C, sub0::D_Q);
+                // K/V project to D_KV (N_KV_HEADS heads), Q to D_Q (N_HEADS heads). qknorm_row/rope_row
                 // both derive their per-head width as (width / heads), so passing the KV pair yields
                 // the same D_HEAD they always did -- the rotation and norm are per-head, so nothing
                 // else changes.
                 linear_row(a, L.Wk, nullptr, kn, C, D_KV);
                 linear_row(a, L.Wv, nullptr, vn, C, D_KV);
-                if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, C); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
-                if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, C); rope_row(kn, pos, N_KV_HEADS, D_KV); }
+                if constexpr (USE_QK_NORM) { qknorm_row(qn, L.q_norm, H, sub0::D_Q); qknorm_row(kn, L.k_norm, N_KV_HEADS, D_KV); }
+                if constexpr (POS_ENCODING == PosEncoding::Rope) { rope_row(qn, pos, H, sub0::D_Q); rope_row(kn, pos, N_KV_HEADS, D_KV); }
                 // Depth attention, before the KV-cache append: the sequence cache must hold the MIXED
                 // V, because that is what op_attn receives in the batched forward. Mirrors forward()'s
                 // block.
@@ -2338,7 +2396,7 @@ struct Model {
                         for (int aa = 0; aa < d; ++aa) att[off + aa] += p * vj[aa];
                     }
                 }
-                linear_row(att, L.Wo, nullptr, proj, C, C);
+                linear_row(att, L.Wo, nullptr, proj, sub0::D_Q, C);   // Wo is [D_Q, D_MODEL] (blocker A)
                 gr_write_row(h, proj);                                           // residual (write step)
             };
             // The QSA decode counterpart of the same sublayer -- the T==1 form of op_qsa's own batched
@@ -2349,8 +2407,10 @@ struct Model {
             // hold (a different width and a different -- unnormed, unrotated -- content).
             [[maybe_unused]] auto do_qsa_mixer = [&] {
                 float* raw_k_base = g_qsa_cache.base(e);
-                const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * D_HEAD;
-                const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * D_HEAD;
+                // Row stride is ROTARY_DIM (the cos/sin tables are [SEQ_LEN][ROTARY_DIM]) -- see
+                // QsaRopeTables above; it was D_HEAD before --rotary-dim became an axis.
+                const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
+                const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
                 qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->data.data(),
                                           L.qsa_idx_qnorm->data.data(), cos_pos, sin_pos, qsa::RMS_EPS,
                                           qsa_idx_q,

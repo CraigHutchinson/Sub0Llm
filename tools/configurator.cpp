@@ -592,6 +592,10 @@ int main(int argc, char** argv) {
     int n_layers     = 0;
     int n_heads      = 0;
     int n_kv_heads   = 0;        // 0 = same as n_heads (plain MHA); < n_heads selects GQA
+    // Independent attention head width (WP4b blocker A, docs/WP4_SCOPE.md S2). 0 = derive as
+    // d_model / n_heads, which is what D_HEAD has always been -- and which the real Qwen4-preview
+    // model does NOT satisfy (24 heads x head_dim 256 = 6144 against hidden_size 2560).
+    int head_dim     = 0;
     int loop_middle  = 0;        // LoopSplit: middle-block size (0 = no looping)
     int depth_attn_stride = 0;   // Depth attention: cache-append stride (0 = off); see docs/DEPTH_ATTENTION.md
     int loop_repeats = 1;        // LoopSplit: how many times the middle block runs
@@ -601,6 +605,16 @@ int main(int argc, char** argv) {
     // CUDA (backend_cuda.cu keeps its own static_assert) -- so a GDN build works for gen/eval/report but
     // NOT for train/tune. See docs/GATED_DELTANET.md.
     int gdn_full_attn_stride = 0;
+    // Gated DeltaNet's OWN head geometry (WP4b blocker B, docs/WP4_SCOPE.md S2). Until this pass these
+    // four were ALIASED onto --kv-heads / --heads / D_HEAD / D_HEAD, which cannot express the real
+    // Qwen4-preview model (16 / 48 / 128 / 128 against attention's 2 / 24 / 256). Each is 0 = "alias to
+    // the corresponding attention axis", the same "0 means the old behaviour" idiom --kv-heads uses, so
+    // every existing build is byte-identical. Resolved below (once --heads/--kv-heads are final) and
+    // emitted RESOLVED, exactly as n_kv_heads already is.
+    int gdn_key_heads      = 0;
+    int gdn_value_heads    = 0;
+    int gdn_key_head_dim   = 0;
+    int gdn_value_head_dim = 0;
     int ngram_max_n        = 0;  // N-gram embeddings: highest n-gram order (0 = off, else >= 2); see docs/NGRAM_EMBEDDING.md
     int ngram_tables       = 1;  // N-gram embeddings: hash tables per order (k)
     int ngram_table_size   = 0;  // N-gram embeddings: per-table vocab size m (0 = auto: VOCAB)
@@ -623,6 +637,10 @@ int main(int argc, char** argv) {
     int qsa_idx_head_dim   = 0;
     int qsa_idx_budget     = 0;
     int qsa_idx_ratio      = 0;
+    // Partial rotary (WP4b blocker C, docs/WP4_SCOPE.md S2): rotate only a head vector's first
+    // ROTARY_DIM channels. The real model's partial_rotary_factor = 0.25 x head_dim 256 = 64. 0 = the
+    // derived head width, i.e. the full-width rotation every build before this axis performed.
+    int rotary_dim           = 0;
     int    rope_scaling      = 0;    // 0 = none, 1 = linear position scaling
     double rope_scale_factor = 1.0;  // linear scaling divisor (context-extension factor)
     int seq_len      = 0;
@@ -668,6 +686,12 @@ int main(int argc, char** argv) {
                    "GQA-2 -- measured +8.4% throughput and -50% KV cache at no measurable quality cost. "
                    "Pass --kv-heads equal to --heads for plain MHA; must divide --heads exactly)")
        ->capture_default_str();
+    app.add_option("--head-dim", head_dim,
+                   "Attention head width, independent of --dmodel/--heads (0 = derive as dmodel/heads, "
+                   "what every build before this axis did). When set, heads*head-dim need NOT equal "
+                   "dmodel: Wq becomes [dmodel, heads*head-dim] and Wo [heads*head-dim, dmodel]. "
+                   "Real Qwen4-preview: 256, against dmodel 2560 and 24 heads")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--loop-middle-layers", loop_middle,
                    "LoopSplit: size of the weight-shared middle block re-executed each pass (0 = off)")
        ->capture_default_str();
@@ -686,6 +710,22 @@ int main(int argc, char** argv) {
                    "attention). Stage 1: CPU forward only -- gen/eval/report work, train/tune do not "
                    "(no backward pass yet, and no CUDA build)")
        ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-key-heads", gdn_key_heads,
+                   "Gated DeltaNet: linear-attention KEY/query head count, independent of --kv-heads "
+                   "(0 = alias to --kv-heads, the previous behaviour). Real Qwen4-preview: 16")
+       ->capture_default_str()->check(CLI::Range(0, 255));
+    app.add_option("--gdn-value-heads", gdn_value_heads,
+                   "Gated DeltaNet: linear-attention VALUE/gate head count, independent of --heads "
+                   "(0 = alias to --heads). Must be a multiple of the key head count. Real model: 48")
+       ->capture_default_str()->check(CLI::Range(0, 1024));
+    app.add_option("--gdn-key-head-dim", gdn_key_head_dim,
+                   "Gated DeltaNet: linear-attention key/query per-head width (0 = alias to the derived "
+                   "attention head dim). Real Qwen4-preview: 128")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
+    app.add_option("--gdn-value-head-dim", gdn_value_head_dim,
+                   "Gated DeltaNet: linear-attention value/gate per-head width (0 = alias to the derived "
+                   "attention head dim). Real Qwen4-preview: 128")
+       ->capture_default_str()->check(CLI::Range(0, 4096));
     app.add_option("--ngram-max-n", ngram_max_n,
                    "N-gram embeddings: highest n-gram order to hash (bigrams..N-grams added into the "
                    "input embedding); 0 = off, else must be >= 2. See docs/NGRAM_EMBEDDING.md")
@@ -736,6 +776,12 @@ int main(int argc, char** argv) {
                    "QSA: how many consecutive keys are mean-pooled into one selectable block (0 = off, "
                    "else >= 1). Capped at 255 -- it rides 8 bits of ARCH_FINGERPRINT2")
        ->capture_default_str()->check(CLI::Range(0, 255));
+    app.add_option("--rotary-dim", rotary_dim,
+                   "Rotary PREFIX width: rotate only each head's first N channels, passing the rest "
+                   "through untouched (the reference's partial_rotary_factor x head_dim). 0 = the full "
+                   "head width, what every build before this axis did. Must be even and <= the head dim. "
+                   "Real Qwen4-preview: 64 of 256")
+       ->capture_default_str()->check(CLI::Range(0, 65535));
     app.add_option("--rope-scaling", rope_scaling,
                    "RoPE position scaling for context extension: none (default) | linear")
        ->transform(CLI::CheckedTransformer(std::map<std::string, int>{{"none", 0}, {"linear", 1}},
@@ -902,6 +948,49 @@ int main(int argc, char** argv) {
                      n_kv_heads, n_heads);
         return 1;
     }
+    // Gated DeltaNet's own head geometry (WP4b blocker B): resolve 0 -> the aliased attention axis HERE,
+    // once --heads/--kv-heads are final, so the generated header always carries the RESOLVED value and
+    // two spellings of one architecture (0 vs the explicit alias value) cannot produce two different
+    // MODEL_ARCH_IDs. Same treatment n_kv_heads' own 0-means-derive already gets, just above.
+    {
+        // WP4b blocker A: --head-dim 0 derives the head width exactly as D_HEAD always did. The
+        // d_model % n_heads divisibility check above therefore still guards the DERIVED case; an
+        // explicit --head-dim is free of it, which is the whole point (the real model does not divide).
+        if (head_dim == 0) head_dim = d_model / n_heads;
+        const int d_head = head_dim;
+        // Partial rotary (WP4b blocker C): resolve 0 -> the full head width HERE, so the header always
+        // carries the RESOLVED prefix and layout.hpp needs no second derivation. Mirrors layout.hpp's
+        // own static_asserts as a configure-time diagnostic naming the flag.
+        if (rotary_dim == 0) rotary_dim = d_head;
+        // NOT required to be even in general: an ODD head width is a shape this engine has always
+        // supported (d132 H4 gives d_head 33), and op_rope rotates floor(rotary_dim/2) pairs there,
+        // passing the lone trailing component through -- see layout.hpp's ROTARY_HALF comment. QSA's
+        // half-split convention DOES need an even prefix; that is checked in the QSA block below.
+        if (rotary_dim < 2) {
+            std::println(stderr, "configure error: rotary-dim ({}) must be at least 2 (RoPE rotates "
+                                 "channel PAIRS)", rotary_dim);
+            return 1;
+        }
+        if (rotary_dim > d_head) {
+            std::println(stderr, "configure error: rotary-dim ({}) cannot exceed the head dim ({}) -- "
+                                 "the rotary prefix must fit inside the head vector it rotates",
+                         rotary_dim, d_head);
+            return 1;
+        }
+        if (gdn_key_heads      == 0) gdn_key_heads      = n_kv_heads;
+        if (gdn_value_heads    == 0) gdn_value_heads    = n_heads;
+        if (gdn_key_head_dim   == 0) gdn_key_head_dim   = d_head;
+        if (gdn_value_head_dim == 0) gdn_value_head_dim = d_head;
+        // Mirrors layout.hpp's own static_assert as a configure-time diagnostic naming the flags,
+        // rather than a compile error in the engine (the same pattern every check below uses).
+        if (gdn_value_heads % gdn_key_heads != 0) {
+            std::println(stderr,
+                         "configure error: gdn-value-heads ({}) must be a multiple of gdn-key-heads "
+                         "({}) -- it is the reference's repeat_interleave factor", gdn_value_heads,
+                         gdn_key_heads);
+            return 1;
+        }
+    }
     // LoopSplit: the head and tail blocks split what's left of the stack evenly around the middle,
     // so (n_layers - loop_middle) must be even. Mirrors layout.hpp's own static_asserts, but as a
     // configure-time diagnostic naming the flags rather than a compile error in the engine.
@@ -994,6 +1083,22 @@ int main(int argc, char** argv) {
             if (qsa_idx_head_dim % 2 != 0) {
                 std::println(stderr, "configure error: qsa-indexer-head-dim ({}) must be even (the "
                                      "half-split rotary needs an even rotary prefix)", qsa_idx_head_dim);
+                return 1;
+            }
+            // The indexer's own head vectors are rotated by the SAME cos/sin as the attention heads
+            // (docs/QSA.md S1b), so its head width must be at least the rotary prefix or rope_apply_row
+            // writes past the end of a per-head slice -- layout.hpp static_asserts this; here it is a
+            // diagnostic naming the flags. Real model: rotary 64 <= indexer_head_dim 128.
+            if (rotary_dim % 2 != 0) {
+                std::println(stderr, "configure error: rotary-dim ({}) must be EVEN when QSA is on -- "
+                                     "its half-split rotary pairs channel i with i + rotary-dim/2",
+                             rotary_dim);
+                return 1;
+            }
+            if (qsa_idx_head_dim < rotary_dim) {
+                std::println(stderr, "configure error: qsa-indexer-head-dim ({}) must be >= rotary-dim "
+                                     "({}) -- the same cos/sin rotate the indexer's own head vectors",
+                             qsa_idx_head_dim, rotary_dim);
                 return 1;
             }
             if (qsa_idx_budget < qsa_idx_ratio) {
@@ -1409,7 +1514,13 @@ int main(int argc, char** argv) {
                                          // estimate feeds gpu_batch_estimate() -- i.e. the batch we
                                          // RECOMMEND. Under-predicting pushes the batch UP, which is
                                          // the dangerous direction (see the open large-batch fault).
-                                         n_layers + loop_middle * (loop_repeats - 1) };
+                                         n_layers + loop_middle * (loop_repeats - 1),
+                                         /*depth_slots=*/0, /*logits_chunks=*/0,
+                                         // WP4b blocker A: head_dim is the LAST Dims field (see
+                                         // memplan.hpp on why it was appended, not inserted), so it
+                                         // must be listed here or this positional init leaves it 0 --
+                                         // silently mis-predicting VRAM for a --head-dim build.
+                                         /*head_dim=*/head_dim };
         // No real `tune --backend gpu` result yet: the CPU-width fallback (threads*windows_per_thread)
         // has nothing to do with GPU VRAM, so start from a VRAM-scaled estimate instead of leaving a
         // big card mostly idle until someone remembers to tune (see gpu_batch_estimate()'s own doc
@@ -1466,6 +1577,15 @@ int main(int argc, char** argv) {
     // become GDN layers (layout.hpp's GDN_SCHEDULE, op_gdn/gdn_math.hpp's CPU forward). 0 = off, every
     // layer softmax attention. See docs/GATED_DELTANET.md.
     cos << "constexpr int  GDN_FULL_ATTN_STRIDE = " << gdn_full_attn_stride << ";\n";
+    // Gated DeltaNet's OWN four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2): the linear-attention
+    // key/value head counts and per-head widths, no longer aliased onto N_KV_HEADS/N_HEADS/D_HEAD.
+    // Emitted RESOLVED (the 0 = alias defaulting happened above), so layout.hpp's GDN_DIMS reads them
+    // directly. At the alias values every GDN tensor shape is exactly what it was before this axis
+    // existed. See layout.hpp's GDN_K_HEADS.. block for the three-way classification.
+    cos << "constexpr int  GDN_KEY_HEADS       = " << gdn_key_heads      << ";\n";
+    cos << "constexpr int  GDN_VALUE_HEADS     = " << gdn_value_heads    << ";\n";
+    cos << "constexpr int  GDN_KEY_HEAD_DIM    = " << gdn_key_head_dim   << ";\n";
+    cos << "constexpr int  GDN_VALUE_HEAD_DIM  = " << gdn_value_head_dim << ";\n";
     // N-gram embeddings: additional per-position features from rolling polynomial-hash token n-grams,
     // added into the input embedding ("concat" fusion mode, Nanbeige's NanbeigeNgramEmbedding). 0 = off.
     // Unlike depth attention this DOES add parameters (see layout.hpp's NGRAM_EMBED section), so it is
@@ -1489,13 +1609,22 @@ int main(int argc, char** argv) {
     cos << "constexpr int  QSA_INDEXER_COMPRESS_RATIO = " << qsa_idx_ratio << ";\n";
     // RoPE position scaling (context extension): 0 = none, 1 = linear (divide the position by
     // ROPE_SCALE_FACTOR before forming the angle). See layout.hpp's ROPE_POS_SCALE.
+    // Partial rotary (WP4b blocker C): the rotary PREFIX width -- only each head's first ROTARY_DIM
+    // channels are rotated (the reference's partial_rotary_factor x head_dim; real model 64 of 256).
+    // Emitted RESOLVED (0 = the full head width, resolved above). Shape-NEUTRAL and computation-changing,
+    // so it rides ARCH_FINGERPRINT2's high 16 bits -- see layout.hpp's ROTARY_DIM comment.
+    cos << "constexpr int  ROTARY_DIM  = " << rotary_dim << ";\n";
     cos << "constexpr int   ROPE_SCALING      = " << rope_scaling << ";\n";
     cos << "constexpr float ROPE_SCALE_FACTOR = " << std::format("{:.4f}", rope_scale_factor) << "f;\n";
     cos << "constexpr int  SEQ_LEN     = " << seq_len  << ";\n";
     // D_FF: 4*D_MODEL for the plain FFN; a narrower, param-matched width for the gated (SwiGLU) FFN
     // -- see sub0::config::d_ff_for's doc comment (config_util.hpp) for the derivation.
     cos << "constexpr int  D_FF        = " << d_ff << ";\n";
-    cos << "constexpr int  D_HEAD      = D_MODEL / N_HEADS;\n";
+    // D_HEAD is its own axis since WP4b blocker A (--head-dim), no longer forced to
+    // D_MODEL / N_HEADS. Emitted RESOLVED, so N_HEADS * D_HEAD (layout.hpp's D_Q -- the query and
+    // Wo width) may legitimately differ from D_MODEL: the real Qwen4-preview model's 6144 vs 2560.
+    // At --head-dim 0 this is literally the old D_MODEL / N_HEADS value.
+    cos << "constexpr int  D_HEAD      = " << head_dim << ";\n";
     cos << "constexpr bool USE_TERNARY = " << (ternary ? "true" : "false") << ";\n";
     // SwiGLU-gated FFN (Wgate/Wup/Wdown, no FFN bias) vs the plain 2-matrix GELU+bias FFN -- see
     // include/sub0/layout.hpp. Valid with any --compute backend (swiglu_kernel/swiglu_act_kernel/
@@ -1679,6 +1808,8 @@ int main(int argc, char** argv) {
     // banner (it is always 0 today anyway -- see the static_assert -- so nothing has SHOWN it missing
     // yet, but the banner's whole job is to show every axis a run can differ on).
     shown.gdn_full_attn_stride = gdn_full_attn_stride;
+    shown.gdn_key_heads = gdn_key_heads;         shown.gdn_value_heads = gdn_value_heads;
+    shown.gdn_key_head_dim = gdn_key_head_dim;   shown.gdn_value_head_dim = gdn_value_head_dim;
     shown.ngram_max_n = ngram_max_n; shown.ngram_tables = ngram_tables;
     shown.ngram_table_size = ngram_table_size;
     shown.hc_count = hc_count; shown.hc_lowrank = hc_lowrank;
@@ -1686,6 +1817,8 @@ int main(int argc, char** argv) {
     shown.qsa_idx_n_heads = qsa_idx_n_heads; shown.qsa_idx_kv_heads = qsa_idx_kv_heads;
     shown.qsa_idx_head_dim = qsa_idx_head_dim; shown.qsa_idx_budget = qsa_idx_budget;
     shown.qsa_idx_ratio = qsa_idx_ratio;
+    shown.head_dim = head_dim;
+    shown.rotary_dim = rotary_dim;
     shown.rope_scaling = rope_scaling; shown.rope_scale_fac = rope_scale_factor;
     shown.rope_theta  = rope_theta;
     shown.seq_len     = seq_len;      shown.vocab       = vocab;

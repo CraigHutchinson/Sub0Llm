@@ -174,10 +174,15 @@ struct ModelMeta : RunState {
     X(int,         n_layers,        0)    \
     X(int,         n_heads,         0)    \
     X(int,         n_kv_heads,      0)    \
+    X(int,         head_dim,        0)    \
     X(int,         loop_middle,     0)    \
     X(int,         loop_repeats,    1)    \
     X(int,         depth_attn_stride, 0)  \
     X(int,         gdn_full_attn_stride, 0)  \
+    X(int,         gdn_key_heads,   0)    \
+    X(int,         gdn_value_heads, 0)    \
+    X(int,         gdn_key_head_dim, 0)   \
+    X(int,         gdn_value_head_dim, 0) \
     X(int,         ngram_max_n,     0)    \
     X(int,         ngram_tables,    1)    \
     X(int,         ngram_table_size, 0)   \
@@ -190,6 +195,7 @@ struct ModelMeta : RunState {
     X(int,         qsa_idx_head_dim, 0)   \
     X(int,         qsa_idx_budget,  0)    \
     X(int,         qsa_idx_ratio,   0)    \
+    X(int,         rotary_dim,      0)    \
     X(int,         rope_scaling,    0)    \
     X(double,      rope_scale_fac,  1.0)  \
     X(double,      rope_theta,  10000.0)  \

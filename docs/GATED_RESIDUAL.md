@@ -245,6 +245,24 @@ merely equivalent — the exact same function calls, no new code compiled in at 
 §4's "zero effect on existing builds" requirement by construction rather than by a runtime branch that
 happens to be false.
 
+> **RESOLVED in WP4b (blocker D, `docs/WP4_SCOPE.md` §2)** — the simplification described in the next
+> paragraph no longer applies. `make_param_layout()` now emits **no `Ln1`/`Ln2` at all** when
+> `USE_GATED_RESIDUAL`, and `Model::forward`'s `gr_read` / `forward_one`'s `gr_read_row` return GR's
+> `mixed_input` **directly**, un-normed — matching the real `Qwen4ExpTextDecoderLayer`. The pipeline
+> sketch above therefore reads `attn_in = mixed` under GR, not `op_rmsnorm(mixed, ln1)`. Two consequences
+> worth naming: `gr_param_delta()` became an addition **minus** `2*d_model` per layer (still strictly
+> positive at every legal setting, so `PARAM_FLOATS` still discriminates GR-on from GR-off and no
+> fingerprint bit is needed), and the wrong-eps path this simplification carried is gone — GR's own
+> `hc_norm` uses the real `rms_norm_eps = 1e-6`, whereas the `op_rmsnorm` it used to route through
+> hardcodes `1e-5`.
+>
+> **Still open, deliberately out of blocker D's scope**: `op_rmsnorm`'s `1e-5` remains for `LnF` (the
+> model-level final norm, whose real counterpart `Qwen4ExpTextModel.norm` is also `1e-6`) and
+> `op_qknorm`/`qknorm_row` likewise. Those are shared, always-present ops serving non-GR builds too, so
+> changing their eps is its own scoped change with its own neutral-identity gate — not something to fold
+> silently into this one. It is recorded here so WP4d's real-run parity work does not rediscover it as a
+> surprise.
+
 **A deliberate, documented simplification vs. the real model, made for this stage's own scope reasons**:
 per §1a's finding that the real model has NO separate `ln1`/`ln2` (GR's own `hc_norm` replaces them
 entirely), a maximally faithful engine port would remove this project's existing `Ln1`/`Ln2` PKinds when

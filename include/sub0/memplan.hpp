@@ -83,6 +83,17 @@ struct Dims {
     // test. Routing the override through Dims means train_scratch_bytes models whatever the allocator
     // will actually do, so the lever can be raised in production without silently under-sizing the batch.
     int logits_chunks = 0;
+    // Independent attention head width (sub0::D_HEAD, the configurator's --head-dim). 0 means "derive
+    // as d_model / n_heads" -- what every pre-existing aggregate-init call site means, and what every
+    // build before WP4b could express at all. When set, n_heads * head_dim need NOT equal d_model (the
+    // real Qwen4-preview model has 24 * 256 = 6144 against hidden_size 2560), so Wq becomes
+    // [d_model, d_q] and Wo [d_q, d_model] -- no longer square. See layout.hpp's D_Q.
+    //
+    // Appended at the END of the struct, deliberately: five sites aggregate-initialise Dims
+    // POSITIONALLY (AGENTS.md S10 records that exact pattern producing three real bugs when a field was
+    // added mid-struct), so inserting this next to n_kv_heads -- where it belongs semantically -- would
+    // silently shift exec_layers/depth_slots at every one of them.
+    int head_dim = 0;
 };
 
 using u64 = unsigned long long;
@@ -103,24 +114,31 @@ inline constexpr int MAX_DEVICE_BATCH = 4096;
 // footprint test asserts param_floats(dims) == sub0::PARAM_FLOATS, catching any layout drift.
 // K/V projection width (sub0::D_KV) for these runtime Dims. n_kv_heads == 0 means "unset" and falls
 // back to n_heads, i.e. plain MHA, where this is exactly d_model.
+// Per-head width (sub0::D_HEAD): the explicit `head_dim` when set, else the derived d_model / n_heads.
+constexpr u64 head_dim(const Dims& d) {
+    if (d.head_dim > 0) return u64(d.head_dim);
+    return d.n_heads > 0 ? u64(d.d_model) / u64(d.n_heads) : 0;
+}
+// Query projection width (sub0::D_Q) -- n_heads * head_dim. Equal to d_model exactly when head_dim is
+// derived, which is every build before WP4b's --head-dim axis.
+constexpr u64 d_q(const Dims& d) { return u64(d.n_heads) * head_dim(d); }
 constexpr u64 d_kv(const Dims& d) {
-    const u64 C = u64(d.d_model), H = u64(d.n_heads);
-    const u64 DH = H > 0 ? C / H : 0;
-    return u64(d.n_kv_heads > 0 ? d.n_kv_heads : d.n_heads) * DH;
+    return u64(d.n_kv_heads > 0 ? d.n_kv_heads : d.n_heads) * head_dim(d);
 }
 // Runtime mirrors of sub0::QKV_STRIDE / sub0::QK_PRE_STRIDE (see layout.hpp, which explains the fused
 // buffer's column layout and why these live in two places). memplan is included BY layout.hpp, so it
 // cannot use the constexpr forms and must re-derive them from Dims -- keep the two in lock-step.
-constexpr u64 qkv_stride(const Dims& d)    { return u64(d.d_model) + 2 * d_kv(d); }  // == 3*C under MHA
-constexpr u64 qk_pre_stride(const Dims& d) { return u64(d.d_model) + d_kv(d); }      // == 2*C under MHA
+constexpr u64 qkv_stride(const Dims& d)    { return d_q(d) + 2 * d_kv(d); }  // == 3*C under MHA
+constexpr u64 qk_pre_stride(const Dims& d) { return d_q(d) + d_kv(d); }      // == 2*C under MHA
 
 constexpr u64 param_floats(const Dims& d) {
     const u64 C = u64(d.d_model), L = u64(d.n_layers), F = u64(d.d_ff), T = u64(d.seq_len), V = u64(d.vocab);
     const u64 CKV = d_kv(d);                    // D_KV: K/V width (== C for plain MHA)
-    const u64 H  = u64(d.n_heads), DH = H > 0 ? C / H : 0;   // D_HEAD = C/H
+    const u64 CQ  = d_q(d);                     // D_Q: query/out width (== C unless --head-dim is set)
+    const u64 DH  = head_dim(d);                // D_HEAD (explicit, or the derived C/H)
     const u64 emb   = V * C + (d.pos_emb ? T * C : 0);   // tok_emb [V,C] + pos_emb [T,C] if present
     const u64 block = 2 * C                     // ln1 + ln2          [C] each
-                    + 2 * C * C                 // Wq, Wo             [C,C]
+                    + 2 * C * CQ                // Wq [C,D_Q], Wo [D_Q,C] (both [C,C] at derived head_dim)
                     + 2 * C * CKV               // Wk, Wv             [C,D_KV] (== [C,C] under MHA)
                     + (d.qk_norm ? 2 * DH : 0)  // q_norm + k_norm [1,D_HEAD] each (USE_QK_NORM only)
                     // gated: Wg [C,F], W1 [C,F], W2 [F,C], no biases (3*C*F). plain: W1 [C,F], b1 [F],

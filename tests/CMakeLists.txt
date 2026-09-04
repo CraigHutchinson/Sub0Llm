@@ -116,6 +116,31 @@ target_compile_definitions(sub0_frontend_tests PRIVATE SUB0_SOURCE_DIR="${CMAKE_
 target_link_libraries(sub0_frontend_tests PRIVATE sub0_frontend Catch2::Catch2WithMain)
 catch_discover_tests(sub0_frontend_tests)
 
+# WP4b's headline gate (docs/WP4_SCOPE.md S6): this engine's own make_param_layout(), evaluated at
+# Qwen3.8-Flash-Next's REAL RunConfig axes, must produce the REAL model's tensor count and float total.
+# Entirely compile-time -- if it BUILDS, it passed; the Catch2 case exists only to print the census.
+#
+# Its own executable, deliberately: layout.hpp is closed over the build's generated sub0_config.hpp, so
+# evaluating a different config means compiling it again against a different one, and two definitions of
+# sub0::PARAM_LAYOUT in one binary is an ODR violation. Its include path therefore carries
+# tests/qwen4_real_axes/ INSTEAD of ${GEN_DIR} -- the same "separate binary because the seam is compiled
+# differently" reasoning sub0_eval_seam_tests already uses. Links no engine library: nothing here runs.
+add_executable(sub0_qwen4_shape_tests qwen4_real_shape_tests.cpp)
+target_include_directories(sub0_qwen4_shape_tests PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
+  "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0_qwen4_shape_tests PRIVATE Catch2::Catch2WithMain)
+# The real axes make PARAM_LAYOUT ~74.8k tensors (512 experts x 48 layers dominates), and layout.hpp
+# walks that table several times at compile time (make_param_layout, DECAY_RANGES, MUON_RANGES,
+# MUON_MAX_MN/MM, total_param_floats). That blows clang's default 1,048,576-step constant-evaluation
+# budget many times over -- the failure is a "possible infinite loop?" diagnostic, not a wrong answer,
+# so the fix is a budget, not a redesign. Recorded here because a REAL engine build at these axes will
+# need the same flag: it is a property of the model's size, not of this test.
+if(NOT MSVC)
+  target_compile_options(sub0_qwen4_shape_tests PRIVATE -fconstexpr-steps=1000000000)
+endif()
+catch_discover_tests(sub0_qwen4_shape_tests)
+
 # Eval-seam integration tests: the held-out NELBO evaluation driven end-to-end through a MOCK device
 # backend, so the device dispatch (window batching, ids/targets pairing, group recombination) is
 # covered on EVERY machine rather than only where a GPU happens to be present.

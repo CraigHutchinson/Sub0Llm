@@ -41,8 +41,17 @@ namespace sub0 {
 static_assert(N_KV_HEADS >= 1, "N_KV_HEADS must be at least 1");
 static_assert(N_HEADS % N_KV_HEADS == 0, "N_HEADS must be divisible by N_KV_HEADS (equal query groups)");
 inline constexpr int GQA_GROUP = N_HEADS / N_KV_HEADS;
+// D_Q -- the QUERY projection width, N_HEADS * D_HEAD.
+//
+// WP4b blocker A (docs/WP4_SCOPE.md S2): D_HEAD is its own configurator axis now (--head-dim), so
+// N_HEADS * D_HEAD is NO LONGER necessarily D_MODEL. The real Qwen4-preview model is exactly that case:
+// 24 heads x head_dim 256 = 6144 against hidden_size 2560. Every expression that used to spell the query
+// width as `D_MODEL` because the two happened to coincide must now say D_Q, and Wo stops being square
+// ([D_Q, D_MODEL], the real o_proj's own shape). At --head-dim 0 (derive, the default) D_Q == D_MODEL
+// exactly and every one of those expressions evaluates to what it always did.
+inline constexpr int D_Q       = N_HEADS * D_HEAD;
 inline constexpr int D_KV      = N_KV_HEADS * D_HEAD;
-static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
+static_assert(D_KV <= D_Q, "D_KV cannot exceed D_Q (N_KV_HEADS <= N_HEADS at the same head width)");
 
 // Column layout of the CUDA backend's FUSED QKV activation buffer [rows, QKV_STRIDE], which packs the
 // three projections side by side so they collapse into one GEMM. Under GQA the three sub-blocks are no
@@ -55,15 +64,16 @@ static_assert(D_KV <= D_MODEL, "D_KV cannot exceed D_MODEL");
 // and configurator can call it before a device exists -- so it cannot use these constants and carries
 // runtime `Dims`-based mirrors instead (its qkv/dqkv/dwqkv/qk_pre terms). Keep the two in lock-step.
 // The CPU backend does not fuse and so has no use for them.
-inline constexpr int QKV_STRIDE = D_MODEL + 2 * D_KV;   // total fused row width
-inline constexpr int QKV_K_OFF  = D_MODEL;              // column where the K sub-block starts
-inline constexpr int QKV_V_OFF  = D_MODEL + D_KV;       // column where the V sub-block starts
+// (Q is D_Q wide, not D_MODEL, since WP4b blocker A made D_HEAD its own axis -- identical at --head-dim 0.)
+inline constexpr int QKV_STRIDE = D_Q + 2 * D_KV;       // total fused row width
+inline constexpr int QKV_K_OFF  = D_Q;                  // column where the K sub-block starts
+inline constexpr int QKV_V_OFF  = D_Q + D_KV;           // column where the V sub-block starts
 
 // Companion stash for QK-norm's backward (the pre-norm Q/K values). Same Q|K packing as above, minus
 // the V sub-block: Q at 0 (D_MODEL wide), K at D_MODEL (D_KV wide). Only the STRIDE is named here --
 // the kernels that address the K sub-block are templated on their own head counts so the toy-shape
 // self-test can instantiate them, and derive the offset locally; a named K offset had no consumer.
-inline constexpr int QK_PRE_STRIDE = D_MODEL + D_KV;
+inline constexpr int QK_PRE_STRIDE = D_Q + D_KV;
 
 // Under RoPE there is no position table at all: RoPE injects position inside attention, so a
 // [SEQ_LEN, D_MODEL] pos_emb would be allocated, zeroed, serialized and never read. Omitting it is
@@ -97,6 +107,40 @@ static_assert(ROPE_SCALING_MODE == RopeScaling::None || ROPE_SCALE_FACTOR >= 1.0
               "linear RoPE scaling expects a factor >= 1 (it stretches positions over a longer window)");
 inline constexpr float ROPE_POS_SCALE =
     (ROPE_SCALING_MODE == RopeScaling::Linear) ? (1.0f / ROPE_SCALE_FACTOR) : 1.0f;
+
+// --- PARTIAL ROTARY (WP4b blocker C, docs/WP4_SCOPE.md S2) ---------------------------------------
+// The rotary PREFIX width: only a head vector's first ROTARY_DIM channels are rotated, the rest pass
+// through untouched. The real Qwen4-preview model has partial_rotary_factor = 0.25 against head_dim
+// 256, i.e. it rotates 64 of 256 channels; every build this engine has produced rotated the FULL head
+// (ROTARY_DIM == D_HEAD), which is what --rotary-dim 0 still resolves to (the configurator emits the
+// RESOLVED value, exactly as it does for N_KV_HEADS and GDN's own head axes).
+//
+// Convention note, and it is a REAL divergence that is deliberately preserved: the reference rotates
+// HALF-SPLIT pairs (i, i + rotary_dim/2) while this engine's op_rope rotates INTERLEAVED pairs
+// (2m, 2m+1). Partial rotary is orthogonal to that difference -- it changes only WHICH CHANNELS are
+// rotated (the first ROTARY_DIM of each head, in both conventions) and the inverse-frequency
+// denominator (ROTARY_DIM, matching the reference's inv_freq over rotary_dim, not head_dim). qsa_math.hpp
+// takes rotary_dim as an explicit Dims field and uses the real half-split convention on the caller's
+// own cos/sin tables, so a QSA layer stays the real model's layer either way.
+//
+// CLASSIFICATION (layout.hpp's own three-way rule): rule #2 -- computation-changing, SHAPE-NEUTRAL. It
+// changes NO tensor shape at all, so PARAM_FLOATS cannot discriminate it and a checkpoint would load
+// silently and compute the wrong attention. It therefore joins ARCH_FINGERPRINT2 below, in the 16 bits
+// at [63:48] (D_HEAD can exceed 255 -- the real model's is 256 -- so 8 bits would not do). The field is
+// canonicalized to 0 at ROTARY_DIM == D_HEAD, which is what keeps every fingerprint this engine has
+// ever written bit-identical while still distinguishing every partial-rotary build.
+// ROTARY_HALF is the number of interleaved PAIRS actually rotated. The truncating division is load-
+// bearing and NOT a rounding accident: this engine has always supported an ODD head width (d132 H4 gives
+// D_HEAD = 33, one of this project's own standard test shapes), where op_rope rotated floor(d/2) pairs
+// and passed the lone trailing component through as the identity. floor(ROTARY_DIM/2) reproduces that
+// exactly at ROTARY_DIM == D_HEAD, which is why ROTARY_DIM is NOT required to be even in general --
+// only under QSA, whose half-split convention genuinely needs an even prefix (see USE_QSA's own
+// static_asserts, which already require an even D_HEAD for the same reason).
+inline constexpr int ROTARY_HALF = ROTARY_DIM / 2;
+static_assert(ROTARY_DIM >= 2, "ROTARY_DIM must be at least 2 (RoPE rotates channel PAIRS)");
+static_assert(ROTARY_DIM <= D_HEAD,
+              "ROTARY_DIM cannot exceed D_HEAD -- the rotary prefix must fit inside the head vector "
+              "it rotates (--rotary-dim 0 means the full head width)");
 
 // --- LoopSplit: a weight-shared repeated middle block -------------------------------------------
 // An un-looped head block, a MIDDLE block executed LOOP_REPEATS times reusing the SAME weights, then
@@ -222,14 +266,56 @@ static_assert(GDN_FULL_ATTN_STRIDE >= 0, "GDN_FULL_ATTN_STRIDE must be non-negat
 // (layout.hpp S3a's table) -- computed even when GDN is off so it stays a valid array bound (never
 // zero-length -- same idiom as DEPTH_CACHE_MAX/NGRAM_TABLES_BUF above), though its VALUE is unused then.
 inline constexpr int GDN_CONV_KERNEL = 4;
-inline constexpr int GDN_CONV_DIM    = 2 * D_KV + D_MODEL;
 static_assert(GDN_CONV_KERNEL >= 2, "a causal depthwise conv needs at least a 2-tap kernel");
 
+// --- GDN's OWN head geometry (WP4b blocker B, docs/WP4_SCOPE.md S2) ------------------------------
+// Until this pass GDN_DIMS aliased GDN's linear-attention key/value head counts and head dims onto the
+// ORDINARY attention axes (N_KV_HEADS / N_HEADS / D_HEAD / D_HEAD). That is a real constraint, not a
+// notational one: the real Qwen4-preview model has linear_num_key_heads=16, linear_num_value_heads=48,
+// linear_key_head_dim=128, linear_value_head_dim=128 against attention's own num_key_value_heads=2,
+// num_attention_heads=24, head_dim=256 -- four genuinely independent axes the alias cannot express, so
+// a real GDN weight transplant was impossible (the destination tensors were literally the wrong shape).
+//
+// Each axis is 0 = "alias to the corresponding attention axis", the same "0 means the old behaviour"
+// idiom N_KV_HEADS / DEPTH_ATTN_STRIDE already use -- so every existing build resolves to exactly the
+// previous constants and stays byte-identical. gdn_math.hpp's `Dims` already takes all four fields
+// explicitly (its own header comment says so), so NO math changes: this is purely the binding.
+//
+// CLASSIFICATION (layout.hpp's own three-way rule, worked through rather than assumed):
+//   * GDN_V_HEADS / GDN_V_HEAD_DIM / GDN_K_HEAD_DIM are rule #1 (shape-changing). Value heads size
+//     GdnInProjB/GdnInProjA's cols and GdnALog/GdnDtBias; the value head dim sizes GdnNorm; the key
+//     head dim widens key_dim, hence GdnInProjQkv and GdnConv. PARAM_FLOATS discriminates all three.
+//   * GDN_K_HEADS is rule #2 (computation-changing, SHAPE-NEUTRAL) and is the one that would have been
+//     mis-classified by assumption: it enters the tensor shapes ONLY through key_dim = k_heads *
+//     k_head_dim, so two builds with the same PRODUCT (e.g. 2x64 and 4x32) have byte-identical
+//     parameter blobs while computing a different recurrence -- rep() = v_heads / k_heads changes which
+//     value heads share a key head. So it joins ARCH_FINGERPRINT2 below. (The value side does NOT need
+//     to: GdnInProjB's cols are v_heads alone, so no product collision exists there.)
+inline constexpr int GDN_K_HEADS    = GDN_KEY_HEADS       > 0 ? GDN_KEY_HEADS       : N_KV_HEADS;
+inline constexpr int GDN_V_HEADS    = GDN_VALUE_HEADS     > 0 ? GDN_VALUE_HEADS     : N_HEADS;
+inline constexpr int GDN_K_HEAD_DIM = GDN_KEY_HEAD_DIM    > 0 ? GDN_KEY_HEAD_DIM    : D_HEAD;
+inline constexpr int GDN_V_HEAD_DIM = GDN_VALUE_HEAD_DIM  > 0 ? GDN_VALUE_HEAD_DIM  : D_HEAD;
+static_assert(GDN_KEY_HEADS >= 0 && GDN_VALUE_HEADS >= 0 && GDN_KEY_HEAD_DIM >= 0 &&
+              GDN_VALUE_HEAD_DIM >= 0, "every GDN head axis must be non-negative (0 = alias)");
+static_assert(GDN_V_HEADS % GDN_K_HEADS == 0,
+              "GDN's value/gate head count must be a multiple of its key head count -- gdn_math.hpp's "
+              "rep() = num_v_heads / num_k_heads is the reference's repeat_interleave factor");
+// GDN's key/value projection widths and the depthwise conv's channel count, now derived from GDN's OWN
+// axes rather than from D_KV/D_MODEL. At the neutral (all-zero) setting GDN_KEY_DIM == D_KV and
+// GDN_VALUE_DIM == N_HEADS * D_HEAD, so GDN_CONV_DIM reproduces the previous `2 * D_KV + D_MODEL`
+// exactly for every build this engine has ever produced (N_HEADS * D_HEAD == D_MODEL held then).
+// Computed even when GDN is off so they stay valid array bounds (same idiom as DEPTH_CACHE_MAX).
+inline constexpr int GDN_KEY_DIM   = GDN_K_HEADS * GDN_K_HEAD_DIM;
+inline constexpr int GDN_VALUE_DIM = GDN_V_HEADS * GDN_V_HEAD_DIM;
+inline constexpr int GDN_CONV_DIM  = 2 * GDN_KEY_DIM + GDN_VALUE_DIM;
+
 // This build's GDN dims, per S3a's mapping: hidden_size=D_MODEL (in AND out -- see gdn_math.hpp's own
-// note on hidden_size playing double duty), key/query heads=N_KV_HEADS, value/gate heads=N_HEADS,
-// head_k_dim==head_v_dim==D_HEAD (true of the real model too, S1a's table). Valid (never divides by
-// zero, etc.) even when USE_GATED_DELTANET is false -- it just describes a shape nothing builds.
-inline constexpr gdn::Dims GDN_DIMS{D_MODEL, N_KV_HEADS, N_HEADS, D_HEAD, D_HEAD, GDN_CONV_KERNEL};
+// note on hidden_size playing double duty), with GDN's own four head axes above. Valid (never divides
+// by zero, etc.) even when USE_GATED_DELTANET is false -- it just describes a shape nothing builds.
+inline constexpr gdn::Dims GDN_DIMS{D_MODEL, GDN_K_HEADS, GDN_V_HEADS,
+                                    GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, GDN_CONV_KERNEL};
+static_assert(GDN_DIMS.conv_dim() == GDN_CONV_DIM,
+              "GDN_CONV_DIM must equal gdn::Dims::conv_dim() -- two derivations of one width");
 
 // Per-EXECUTION single-token scratch sizes for forward_one's decode path (T == 1 always there, unlike
 // op_gdn's batched, per-call arena allocation). Precomputed here (not re-derived at every forward_one
@@ -327,12 +413,20 @@ inline constexpr std::size_t GR_MIX_SCRATCH1    = gr::mix_scratch_floats(GR_DIMS
 // Zero at hc_count < 2 (matching USE_GATED_RESIDUAL's own gate) and strictly positive at hc_count >= 2,
 // hc_lowrank >= 1, d_model >= 1, n_layers >= 1 -- every term is a PRODUCT of positive quantities, so no
 // cancellation with any other axis is possible (contrast GDN's own mixed-sign Delta, S3c).
+// WP4b blocker D changed this from a pure ADDITION into an addition MINUS a removal: a GR-on build no
+// longer emits Ln1/Ln2 at all (the real decoder layer has neither -- see make_param_layout), so the
+// delta now also subtracts 2*d_model per layer. It stays strictly positive at any hc_count >= 2 /
+// hc_lowrank >= 1 -- the smallest added instance is already `wide + 2*wide*hc_lowrank + wide*hc_count`
+// with wide = hc_count*d_model >= 2*d_model, and there are 2 per layer against the 2*d_model removed --
+// so PARAM_FLOATS still discriminates GR-on from GR-off monotonically and no fingerprint bit is needed.
 inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_count, int hc_lowrank) {
     if (hc_count < 2) return 0;
     const long long wide = static_cast<long long>(hc_count) * d_model;
     const long long per_instance_with_inject = wide + 2 * wide * hc_lowrank + wide * hc_count;
     const long long top_instance             = wide + 2 * wide * hc_lowrank;
-    return static_cast<long long>(n_layers) * 2 * per_instance_with_inject + top_instance;
+    const long long ln1_ln2_removed          = 2LL * d_model;   // blocker D: per layer, no longer emitted
+    return static_cast<long long>(n_layers) * (2 * per_instance_with_inject - ln1_ln2_removed)
+         + top_instance;
 }
 
 // MIXTURE OF EXPERTS -- Stage 0: config skeleton, hard-gated off (docs/MOE.md). NUM_EXPERTS routed
@@ -423,16 +517,24 @@ static_assert(!USE_QSA || QSA_INDEXER_BUDGET >= QSA_INDEXER_COMPRESS_RATIO,
               "QSA_INDEXER_BUDGET must be >= QSA_INDEXER_COMPRESS_RATIO, or block_topk would be 0");
 static_assert(!USE_QSA || D_HEAD % 2 == 0,
               "QSA needs an even D_HEAD (the half-split rotary rotates D_HEAD/2 channel pairs)");
-// The rotary prefix cannot be wider than the vector it rotates. The engine's own rotary_dim is D_HEAD
-// (docs/QSA.md S2b.2), and the SAME cos/sin also rotate the indexer's OWN idx_head_dim-wide query and
-// pooled block keys (the reference reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's
-// head width must be at least D_HEAD. This holds in the real model (rotary_dim 64 <= indexer_head_dim
-// 128 <= head_dim 256) but is NOT automatic here, and violating it is a silent OUT-OF-BOUNDS WRITE past
-// the end of a per-head slice -- found exactly that way this stage (see qsa_math.hpp's rope_apply_row
-// precondition comment and docs/QSA.md S10).
-static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= D_HEAD,
-              "QSA_INDEXER_HEAD_DIM must be >= D_HEAD: the engine's rotary prefix is D_HEAD wide and the "
-              "SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- see docs/QSA.md S2b.2");
+static_assert(!USE_QSA || ROTARY_DIM % 2 == 0,
+              "QSA needs an even ROTARY_DIM: the half-split rotary pairs channel i with i + rotary_dim/2, "
+              "so an odd prefix would leave one channel unpaired -- see qsa_math.hpp's rope_apply_row");
+// The rotary prefix cannot be wider than the vector it rotates. The SAME cos/sin rotate BOTH the
+// attention heads and the indexer's OWN idx_head_dim-wide query and pooled block keys (the reference
+// reuses one cos/sin for both -- docs/QSA.md S1b), so the indexer's head width must be at least the
+// rotary prefix. Violating it is a silent OUT-OF-BOUNDS WRITE past the end of a per-head slice -- found
+// exactly that way in WP3 (see qsa_math.hpp's rope_apply_row precondition comment and docs/QSA.md S10).
+//
+// This used to read `>= D_HEAD`, because the engine's rotary prefix WAS D_HEAD (docs/QSA.md S2b.2's
+// documented simplification). WP4b blocker C made the prefix its own axis, so the real relationship is
+// against ROTARY_DIM -- and the change is not cosmetic: the real model has rotary_dim 64 <=
+// indexer_head_dim 128 <= head_dim 256, so the OLD form would REJECT the real configuration outright
+// (128 >= 256 is false). Relaxing to ROTARY_DIM is exactly what makes the real axes expressible, and it
+// is still the tight bound -- ROTARY_DIM is what rope_apply_row actually indexes.
+static_assert(!USE_QSA || QSA_INDEXER_HEAD_DIM >= ROTARY_DIM,
+              "QSA_INDEXER_HEAD_DIM must be >= ROTARY_DIM: the engine's rotary prefix is ROTARY_DIM wide "
+              "and the SAME cos/sin rotate the indexer's own idx_head_dim-wide vectors -- docs/QSA.md S2b.2");
 
 // Never-zero array-bound / never-divide-by-zero forms (same idiom as HC_COUNT_BUF/NUM_EXPERTS_BUF above).
 inline constexpr int QSA_IDX_N_HEADS_BUF = USE_QSA ? QSA_INDEXER_N_HEADS       : 1;
@@ -443,19 +545,20 @@ inline constexpr int QSA_RATIO_BUF        = USE_QSA ? QSA_INDEXER_COMPRESS_RATIO
 // Total output width of the indexer's single fused index_qk_proj: (n_heads + kv_heads) * head_dim.
 inline constexpr int QSA_IDX_QK_OUT = (QSA_INDEXER_N_HEADS + QSA_INDEXER_KV_HEADS) * QSA_INDEXER_HEAD_DIM;
 
-// This build's QSA dims, per docs/QSA.md S2b/S4a's mapping. head_dim = D_HEAD and rotary_dim = D_HEAD
-// (full-width rotary) are this stage's two documented engine-side simplifications -- qsa_math.hpp itself
-// takes both as independent Dims fields so the fixture can exercise the real model's non-dividing
+// This build's QSA dims, per docs/QSA.md S2b/S4a's mapping. head_dim = D_HEAD was WP3's one remaining
+// engine-side simplification and rotary_dim = D_HEAD was the other; blocker C above turns the second
+// into a real axis (ROTARY_DIM), and blocker A does the same for the first. qsa_math.hpp always took
+// both as independent Dims fields, which is why its fixture already ran at the real model's non-dividing
 // head_dim=256 and partial rotary_dim=64. Valid (never divides by zero) even when USE_QSA is false --
 // same "describes a shape nothing builds" idiom GDN_DIMS/GR_DIMS/MOE_DIMS already use.
 inline constexpr qsa::Dims QSA_DIMS{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
                                     QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS, QSA_INDEXER_HEAD_DIM,
-                                    QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO, D_HEAD};
+                                    QSA_INDEXER_BUDGET, QSA_INDEXER_COMPRESS_RATIO, ROTARY_DIM};
 // Same shape but never degenerate (every indexer width >= 1) -- used ONLY to size the fixed decode-path
 // scratch arrays below, which must be valid array bounds even when QSA is off.
 inline constexpr qsa::Dims QSA_DIMS_BUF{D_MODEL, N_HEADS, D_HEAD, N_KV_HEADS,
                                         QSA_IDX_N_HEADS_BUF, QSA_IDX_KV_HEADS_BUF, QSA_IDX_HEAD_DIM_BUF,
-                                        QSA_BUDGET_BUF, QSA_RATIO_BUF, D_HEAD};
+                                        QSA_BUDGET_BUF, QSA_RATIO_BUF, ROTARY_DIM};
 
 // Per-LAYER three-way mixer classification (docs/QSA.md S2). QSA is NOT a new schedule axis: in the real
 // model every `full_attention` layer IS a QSA layer (Qwen4ExpTextAttention unconditionally constructs and
@@ -499,7 +602,10 @@ static_assert(mixer_schedule_agrees_with_gdn(),
 // Wq/Wk/Wv/Wo[+QNorm/KNorm] -- and it applies only to the FULL-ATTENTION layers, so the GDN stride is an
 // input. Strictly positive whenever qsa_on and n_layers >= 1: the D_MODEL*D_MODEL gate projection alone
 // (which plain attention does not have at all) already dominates, and no term can cancel.
-inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_model, int d_kv,
+// `d_q` (N_HEADS * D_HEAD, the query/gate/output width) is an EXPLICIT parameter since WP4b blocker A:
+// it used to be spelled `d_model` here because the two coincided, which stops being true the moment
+// --head-dim is set (real model: 6144 vs 2560). Wq/Wo, QsaQProj/QsaGateProj/QsaOProj are all d_q-sided.
+inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_model, int d_q, int d_kv,
                                             int d_head, bool qk_norm, int idx_n_heads, int idx_kv_heads,
                                             int idx_head_dim, bool qsa_on) {
     if (!qsa_on) return 0;
@@ -507,9 +613,9 @@ inline constexpr long long qsa_param_delta(int n_layers, int gdn_stride, int d_m
     for (int l = 0; l < n_layers; ++l)
         if (!(gdn_stride > 0 && (l % gdn_stride != gdn_stride - 1))) ++full_attn_layers;
     const long long idx_qk_out = static_cast<long long>(idx_n_heads + idx_kv_heads) * idx_head_dim;
-    const long long attn_layer = 2LL * d_model * d_model + 2LL * d_model * d_kv
+    const long long attn_layer = 2LL * d_model * d_q + 2LL * d_model * d_kv          // Wq, Wo, Wk, Wv
                                + (qk_norm ? 2LL * d_head : 0);
-    const long long qsa_layer  = 3LL * d_model * d_model + 2LL * d_model * d_kv + 2LL * d_head
+    const long long qsa_layer  = 3LL * d_model * d_q + 2LL * d_model * d_kv + 2LL * d_head
                                + static_cast<long long>(d_model) * idx_qk_out + 2LL * idx_head_dim;
     return static_cast<long long>(full_attn_layers) * (qsa_layer - attn_layer);
 }
@@ -665,8 +771,8 @@ inline constexpr std::uint64_t ARCH_FINGERPRINT_LEGACY = arch_fingerprint(0, 1, 
 // day one (only byte 0 is assigned) so the next computation-changing, shape-neutral axis after this one
 // does not repeat the exact scramble that produced ARCH_FINGERPRINT's own comment about a byte
 // "middle_layers was never able to reach".
-//   Field layout, high to low: [63:16] reserved (always 0 today) | [15:8] experts_per_tok |
-//   [7:0] gdn_full_attn_stride.
+//   Field layout, high to low: [63:48] partial_rotary_dim | [47:40] gdn_key_heads | [39:32] qsa_compress_ratio |
+//   [31:16] qsa_indexer_budget | [15:8] experts_per_tok | [7:0] gdn_full_attn_stride.
 // At GDN_FULL_ATTN_STRIDE == 0 (the only value this build can currently take -- see the static_assert
 // above) this is always 0, which is also what every checkpoint that predates this field must be
 // ASSUMED to have been built with (Gated DeltaNet does not exist as a computable option anywhere yet,
@@ -701,31 +807,62 @@ static_assert(EXPERTS_PER_TOK >= 0 && EXPERTS_PER_TOK <= 0xff, "EXPERTS_PER_TOK 
 //     exactly rule #2, the same hazard GDN_FULL_ATTN_STRIDE and EXPERTS_PER_TOK already sit here for.
 // Placed in the next of the 56 spare bits this word was deliberately given from day one:
 //   budget gets 16 bits at [31:16] (the real value is 2048, which does not fit 8 -- worked through, not
-//   assumed), compress_ratio 8 bits at [39:32]. [63:40] stays reserved. At the neutral setting (both 0)
+//   assumed), compress_ratio 8 bits at [39:32]. ([63:40] was reserved then; byte 5 has since gone to
+//   GDN's key-head count, see just below.) At the neutral setting (both 0)
 //   this word is bit-identical to every value it has ever produced, so no existing checkpoint is
 //   invalidated -- the same additive, gracefully-degrading property AGENTS.md S3 rule 2 requires.
 static_assert(QSA_INDEXER_BUDGET >= 0 && QSA_INDEXER_BUDGET <= 0xffff,
               "QSA_INDEXER_BUDGET must fit 16 bits");
 static_assert(QSA_INDEXER_COMPRESS_RATIO >= 0 && QSA_INDEXER_COMPRESS_RATIO <= 0xff,
               "QSA_INDEXER_COMPRESS_RATIO must fit 8 bits");
+//
+// GDN_K_HEADS (WP4b blocker B, docs/WP4_SCOPE.md S2): GDN's key-head COUNT enters every GDN tensor
+// shape only through key_dim = k_heads * k_head_dim, so two builds with the same product (2x64 vs
+// 4x32) have byte-identical parameter blobs while computing a different recurrence -- rep() =
+// v_heads / k_heads decides which value heads share a key head. Rule #2, so it belongs here; the other
+// three GDN axes are rule #1 (see their own comment in the GATED DELTANET section above).
+// Placed in byte 5, [47:40] -- the next of the spare bits this word was given from day one.
+// The field carries 0 whenever GDN is OFF (GDN_FULL_ATTN_STRIDE == 0 ⇒ no GDN layer exists ⇒ the axis
+// is inert), which is what keeps every fingerprint this function has EVER produced bit-identical: the
+// resolved key-head count is non-zero even in a default build, so folding it in unconditionally would
+// have invalidated every existing checkpoint for an axis those checkpoints cannot possibly depend on.
+static_assert(GDN_K_HEADS >= 0 && GDN_K_HEADS <= 0xff, "GDN_K_HEADS must fit 8 bits");
+//
+// ROTARY_DIM (WP4b blocker C): the rotary PREFIX width. Rule #2 -- it rotates fewer channels of every
+// head while changing no tensor shape whatsoever, so PARAM_FLOATS cannot see it and a checkpoint would
+// load silently and compute different attention. Exactly the ROPE_THETA / LOOP_MIDDLE_LAYERS hazard
+// ARCH_FINGERPRINT exists for. It takes the LAST 16 bits, [63:48] -- 16 and not 8 because it is bounded
+// by D_HEAD, which is 256 in the real model and no longer bounded by D_MODEL/N_HEADS after blocker A.
+// The field is CANONICALIZED to 0 at ROTARY_DIM == D_HEAD (full-width rotary, the only behaviour this
+// engine has ever had), so every fingerprint ever written stays bit-identical, and the canonical form
+// also means an explicit `--rotary-dim <D_HEAD>` and the default `0` cannot disagree.
+// This exhausts ARCH_FINGERPRINT2: the next computation-changing, shape-neutral axis needs a THIRD
+// additive word, built the same way (see this word's own header comment for why additive, not repacked).
+static_assert(ROTARY_DIM >= 0 && ROTARY_DIM <= 0xffff, "ROTARY_DIM must fit 16 bits");
 inline constexpr std::uint64_t arch_fingerprint2(int gdn_full_attn_stride, int experts_per_tok = 0,
                                                   int qsa_indexer_budget = 0,
-                                                  int qsa_indexer_compress_ratio = 0) {
-    return (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_compress_ratio) & 0xffu)   << 32)
+                                                  int qsa_indexer_compress_ratio = 0,
+                                                  int gdn_key_heads = 0,
+                                                  int partial_rotary_dim = 0) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned>(partial_rotary_dim)     & 0xffffu) << 48)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(gdn_key_heads)          & 0xffu)   << 40)
+         | (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_compress_ratio) & 0xffu)   << 32)
          | (static_cast<std::uint64_t>(static_cast<unsigned>(qsa_indexer_budget)         & 0xffffu) << 16)
          | (static_cast<std::uint64_t>(static_cast<unsigned>(experts_per_tok)            & 0xffu)   << 8)
          |  static_cast<std::uint64_t>(static_cast<unsigned>(gdn_full_attn_stride)       & 0xffu);
 }
 struct ArchAxes2 { int gdn_full_attn_stride; int experts_per_tok; int qsa_indexer_budget;
-                   int qsa_indexer_compress_ratio; };
+                   int qsa_indexer_compress_ratio; int gdn_key_heads; int partial_rotary_dim; };
 inline constexpr ArchAxes2 arch_axes2_of(std::uint64_t fp2) {
     return ArchAxes2{ static_cast<int>(fp2 & 0xffu), static_cast<int>((fp2 >> 8) & 0xffu),
-                      static_cast<int>((fp2 >> 16) & 0xffffu), static_cast<int>((fp2 >> 32) & 0xffu) };
+                      static_cast<int>((fp2 >> 16) & 0xffffu), static_cast<int>((fp2 >> 32) & 0xffu),
+                      static_cast<int>((fp2 >> 40) & 0xffu), static_cast<int>((fp2 >> 48) & 0xffffu) };
 }
 inline constexpr std::uint64_t ARCH_FINGERPRINT2 =
     arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK, QSA_INDEXER_BUDGET,
-                      QSA_INDEXER_COMPRESS_RATIO);
-inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0);
+                      QSA_INDEXER_COMPRESS_RATIO, USE_GATED_DELTANET ? GDN_K_HEADS : 0,
+                      ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM);
+inline constexpr std::uint64_t ARCH_FINGERPRINT2_LEGACY = arch_fingerprint2(0, 0, 0, 0, 0, 0);
 
 // MODEL_ARCH_ID -- the FULL architecture identity: every axis that makes two models different things,
 // shape-changing and computation-changing alike. ARCH_FINGERPRINT above deliberately covers only the
@@ -751,6 +888,11 @@ consteval std::uint64_t make_model_arch_id() {
     mix(static_cast<std::uint64_t>(N_LAYERS));
     mix(static_cast<std::uint64_t>(N_HEADS));
     mix(static_cast<std::uint64_t>(N_KV_HEADS));
+    // D_HEAD is an independent axis since WP4b blocker A (--head-dim), so D_MODEL + N_HEADS above no
+    // longer determine it. Mixed CANONICALLY: 0 whenever N_HEADS * D_HEAD == D_MODEL, i.e. whenever the
+    // geometry is the derived one every build before this axis had -- so a build that spells the derived
+    // width explicitly shares its identity, and only a genuinely independent head width gets a new one.
+    mix(static_cast<std::uint64_t>(N_HEADS * D_HEAD == D_MODEL ? 0 : D_HEAD));
     mix(static_cast<std::uint64_t>(D_FF));
     mix(static_cast<std::uint64_t>(SEQ_LEN));
     mix(static_cast<std::uint64_t>(VOCAB));
@@ -767,6 +909,19 @@ consteval std::uint64_t make_model_arch_id() {
                                                             // MoE's experts_per_tok (docs/MOE.md S3c)
     mix(static_cast<std::uint64_t>(GDN_FULL_ATTN_STRIDE)); // (currently always 0 -- see the static_assert
                                                             //  in the GATED DELTANET section above)
+    // GDN's own four head axes (WP4b blocker B). Three of them are SHAPE-changing (PARAM_FLOATS
+    // discriminates them for the checkpoint-load gate, so they do NOT join ARCH_FINGERPRINT2) and the
+    // fourth, GDN_K_HEADS, already rides the mix(ARCH_FINGERPRINT2) call above -- but MODEL_ARCH_ID
+    // covers every axis unconditionally, exactly as DEPTH_ATTN_STRIDE's own mix above already does.
+    // Mixed as the RESOLVED values, not the raw 0-means-alias flags, so two spellings of one
+    // architecture (--gdn-value-heads 0 vs --gdn-value-heads <N_HEADS>) share one identity -- and
+    // gated on USE_GATED_DELTANET for the same reason ARCH_FINGERPRINT2's own gdn_key_heads field is:
+    // with GDN off there is no GDN layer, so the axes are inert and every pre-existing build must keep
+    // the MODEL_ARCH_ID it already had (AGENTS.md S4's "zero effect on existing builds").
+    mix(static_cast<std::uint64_t>(USE_GATED_DELTANET ? GDN_K_HEADS    : 0));
+    mix(static_cast<std::uint64_t>(USE_GATED_DELTANET ? GDN_V_HEADS    : 0));
+    mix(static_cast<std::uint64_t>(USE_GATED_DELTANET ? GDN_K_HEAD_DIM : 0));
+    mix(static_cast<std::uint64_t>(USE_GATED_DELTANET ? GDN_V_HEAD_DIM : 0));
     // N-gram embeddings: a SHAPE-changing axis (see its own section above), so PARAM_FLOATS already
     // discriminates it for the checkpoint-load gate and it does NOT join ARCH_FINGERPRINT -- but
     // MODEL_ARCH_ID covers every axis unconditionally, the same way DEPTH_ATTN_STRIDE's mix above
@@ -826,6 +981,7 @@ inline constexpr memplan::Dims current_build_dims() {
         .n_kv_heads  = N_KV_HEADS,
         .exec_layers = LOOP_EXEC_COUNT,
         .depth_slots = DEPTH_CACHE_MAX,
+        .head_dim    = D_HEAD,   // WP4b blocker A: no longer necessarily D_MODEL / N_HEADS
     };
 }
 
@@ -848,7 +1004,11 @@ inline constexpr memplan::Dims current_build_dims() {
 consteval int count_num_params() {
     int n = 1 + (HAS_POS_EMB ? 1 : 0);
     for (int l = 0; l < N_LAYERS; ++l) {
-        n += 2;   // ln1, ln2
+        // Ln1/Ln2 exist ONLY when Gated Residual is off (WP4b blocker D, docs/WP4_SCOPE.md S2 and
+        // docs/GATED_RESIDUAL.md S2's own deferred simplification): the real Qwen4ExpTextDecoderLayer
+        // has NO input_layernorm / post_attention_layernorm at all -- GR's own grouped hc_norm IS the
+        // pre-block norm, and each mixer reads GR's mixed_input directly, un-normed again.
+        if constexpr (!USE_GATED_RESIDUAL) n += 2;   // ln1, ln2
         if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (attn-wrapping)
         if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] == LayerMixer::Qsa) {
             // QSA layer (docs/QSA.md S3b): REPLACES Wq/Wk/Wv/Wo[+QNorm/KNorm] with its own ten tensors --
@@ -963,11 +1123,18 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
     add(VOCAB,   D_MODEL, PKind::TokEmb, false, false);
     if constexpr (HAS_POS_EMB) add(SEQ_LEN, D_MODEL, PKind::PosEmb, false, false);
     for (int l = 0; l < N_LAYERS; ++l) {
-        add(1,       D_MODEL, PKind::Ln1, false, false);
-        add(1,       D_MODEL, PKind::Ln2, false, false);
+        // WP4b blocker D: no Ln1/Ln2 under Gated Residual -- the real decoder layer has neither, and
+        // GR's own hc_norm is the pre-block norm (see count_num_params above and Model::forward's
+        // gr_read, which now returns GR's mixed_input directly instead of op_rmsnorm(mixed, ln)).
+        // Shape-changing, so PARAM_FLOATS discriminates it and no fingerprint bit is needed; it fires
+        // only when GR is on, which no existing build enables.
+        if constexpr (!USE_GATED_RESIDUAL) {
+            add(1,       D_MODEL, PKind::Ln1, false, false);
+            add(1,       D_MODEL, PKind::Ln2, false, false);
+        }
         // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance wrapping
         // this layer's attention/GDN sub-block. Placed here, before that sub-block's own weights, since
-        // it is what turns `h` (the wide residual) into the D_MODEL-wide input ln1 actually reads.
+        // it is what turns `h` (the wide residual) into the D_MODEL-wide input the mixer reads.
         if constexpr (USE_GATED_RESIDUAL) {
             constexpr int WIDE = HC_COUNT * D_MODEL;
             add(1,          WIDE,       PKind::GrHcNorm,      false, false);
@@ -983,46 +1150,54 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
             // three tensors stay full precision (decay=false for the 1D gains; the indexer's projection
             // is a routing/SELECTION decision, the one place a ternarized weight is most damaging --
             // the same reasoning MoeRouter and LmHead stay full precision).
-            add(D_MODEL, D_MODEL, PKind::QsaQProj,    true,  true);
-            add(D_MODEL, D_MODEL, PKind::QsaGateProj, true,  true);
-            add(D_MODEL, D_KV,    PKind::QsaKProj,    true,  true);
-            add(D_MODEL, D_KV,    PKind::QsaVProj,    true,  true);
-            add(D_MODEL, D_MODEL, PKind::QsaOProj,    true,  true);
+            // Widths are D_Q = N_HEADS * D_HEAD on the query/gate/output side, NOT D_MODEL: since
+            // WP4b blocker A those differ (real model: 24*256 = 6144 vs hidden_size 2560), and
+            // QsaOProj is [D_Q, D_MODEL] -- no longer square, matching the real o_proj.
+            add(D_MODEL, D_Q,  PKind::QsaQProj,    true,  true);
+            add(D_MODEL, D_Q,  PKind::QsaGateProj, true,  true);
+            add(D_MODEL, D_KV, PKind::QsaKProj,    true,  true);
+            add(D_MODEL, D_KV, PKind::QsaVProj,    true,  true);
+            add(D_Q,     D_MODEL, PKind::QsaOProj, true,  true);
             add(1, D_HEAD,        PKind::QsaQNorm,    false, false);
             add(1, D_HEAD,        PKind::QsaKNorm,    false, false);
             add(D_MODEL, QSA_IDX_QK_OUT,      PKind::QsaIdxQkProj, true,  false);
             add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxQNorm,  false, false);
             add(1, QSA_INDEXER_HEAD_DIM,      PKind::QsaIdxKNorm,  false, false);
         } else if (GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)]) {
-            add(D_MODEL, D_MODEL, PKind::Wq,  true,  true);
+            // Wq is [in=D_MODEL, out=D_Q] and Wo is [in=D_Q, out=D_MODEL] -- NOT square once
+            // --head-dim makes N_HEADS*D_HEAD independent of D_MODEL (WP4b blocker A). Identical to
+            // the previous [D_MODEL,D_MODEL] pair at --head-dim 0.
+            add(D_MODEL, D_Q,     PKind::Wq,  true,  true);
             // Wk/Wv are [in=D_MODEL, out=D_KV] -- narrower than Wq under GQA, identical when N_KV_HEADS
             // == N_HEADS. NOTE the axis order is this project's [rows=in, cols=out], the TRANSPOSE of the
             // PyTorch references this feature is modelled on (see AGENTS.md 5: re-derive conventions, do
             // not assume they match).
             add(D_MODEL, D_KV,    PKind::Wk,  true,  true);
             add(D_MODEL, D_KV,    PKind::Wv,  true,  true);
-            add(D_MODEL, D_MODEL, PKind::Wo,  true,  true);
+            add(D_Q,     D_MODEL, PKind::Wo,  true,  true);
             if constexpr (USE_QK_NORM) {
                 add(1, D_HEAD, PKind::QNorm, false, false);
                 add(1, D_HEAD, PKind::KNorm, false, false);
             }
         } else {
-            // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b), using this project's own
-            // D_MODEL==N_HEADS*D_HEAD mapping: hidden_size=D_MODEL, key_dim=D_KV (N_KV_HEADS*D_HEAD),
-            // value_dim=D_MODEL (N_HEADS*D_HEAD). Weight axis order is this project's own [in,out]
-            // convention throughout (see gdn_math.hpp's header comment for the explicit re-derivation
-            // from the real model's PyTorch nn.Linear [out,in] convention).
-            add(D_MODEL, 2 * D_KV + D_MODEL, PKind::GdnInProjQkv, true,  false);
-            add(D_MODEL, D_MODEL,            PKind::GdnInProjZ,  true,  false);
-            add(D_MODEL, N_HEADS,            PKind::GdnInProjB,  true,  false);
-            add(D_MODEL, N_HEADS,            PKind::GdnInProjA,  true,  false);
+            // Gated DeltaNet layer (docs/GATED_DELTANET.md S3a/S3b), using GDN's OWN four head axes
+            // (WP4b blocker B -- see GDN_K_HEADS/GDN_V_HEADS/GDN_K_HEAD_DIM/GDN_V_HEAD_DIM above):
+            // hidden_size=D_MODEL, key_dim=GDN_KEY_DIM, value_dim=GDN_VALUE_DIM. At the neutral setting
+            // those resolve to D_KV and N_HEADS*D_HEAD (== D_MODEL), i.e. exactly the previous shapes.
+            // Weight axis order is this project's own [in,out] convention throughout (see gdn_math.hpp's
+            // header comment for the explicit re-derivation from the real model's PyTorch nn.Linear
+            // [out,in] convention).
+            add(D_MODEL, GDN_CONV_DIM,       PKind::GdnInProjQkv, true,  false);  // [q|k|v], 2*KD+VD
+            add(D_MODEL, GDN_VALUE_DIM,      PKind::GdnInProjZ,  true,  false);
+            add(D_MODEL, GDN_V_HEADS,        PKind::GdnInProjB,  true,  false);
+            add(D_MODEL, GDN_V_HEADS,        PKind::GdnInProjA,  true,  false);
             // Depthwise conv weight: [GDN_CONV_DIM, GDN_CONV_KERNEL], no in/out axis (one row per
             // channel) -- decay=false (not a GEMM weight in the AdamW weight-decay sense), ternary=false.
             add(GDN_CONV_DIM, GDN_CONV_KERNEL, PKind::GdnConv,    false, false);
-            add(1, N_HEADS, PKind::GdnALog,   false, false);
-            add(1, N_HEADS, PKind::GdnDtBias, false, false);
-            add(1, D_HEAD,  PKind::GdnNorm,   false, false);   // RMSNormGated gamma, shared across heads (S1c)
-            add(D_MODEL, D_MODEL, PKind::GdnOutProj, true, false);   // stays full precision, like LmHead
+            add(1, GDN_V_HEADS, PKind::GdnALog,   false, false);
+            add(1, GDN_V_HEADS, PKind::GdnDtBias, false, false);
+            add(1, GDN_V_HEAD_DIM, PKind::GdnNorm, false, false);  // RMSNormGated gamma, shared across heads (S1c)
+            add(GDN_VALUE_DIM, D_MODEL, PKind::GdnOutProj, true, false);   // stays full precision, like LmHead
         }
         // Gated Residual: the mlp_hyper_connection instance wrapping this layer's FFN sub-block --
         // same shape as the attn-wrapping instance just above, an independent set of tensors.
@@ -1213,5 +1388,21 @@ consteval std::size_t total_param_floats() {
     return n;
 }
 inline constexpr std::size_t PARAM_FLOATS = total_param_floats();
+
+// memplan::param_floats() re-derives PARAM_FLOATS from dims alone (so the configurator, which cannot
+// include layout.hpp, gets the same number). Its own header comment requires the two to stay in
+// lock-step; until now the only thing enforcing that was a CUDA-only unit test, so a CPU-only build
+// could drift silently. Pinned here as a compile-time gate on EVERY build instead.
+//
+// Scoped honestly: memplan models the DENSE softmax-attention architecture only -- it has no term for
+// GDN's nine tensors, GR's instances, MoE's experts, QSA's ten, or the n-gram tables, and giving it one
+// would duplicate make_param_layout() rather than cross-check it. So the identity is asserted exactly
+// where memplan claims to be a model of the architecture, and the mechanisms' own PARAM_FLOATS deltas
+// are cross-checked by their own closed forms (gr_param_delta / moe_param_delta / qsa_param_delta)
+// against the real table in layout_tests.cpp.
+static_assert(USE_GATED_DELTANET || USE_GATED_RESIDUAL || USE_MOE || USE_QSA || NGRAM_EMBED ||
+                  memplan::param_floats(current_build_dims()) == PARAM_FLOATS,
+              "memplan::param_floats() has drifted from make_param_layout()'s own total -- every VRAM "
+              "prediction would be wrong by a constant. Keep the two derivations in lock-step.");
 
 }  // namespace sub0

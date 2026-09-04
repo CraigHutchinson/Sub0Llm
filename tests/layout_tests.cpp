@@ -44,8 +44,11 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // instance WITHOUT BlockInject (3 slots), appended once regardless of N_LAYERS. Zero at HC_COUNT==0.
     constexpr int kGrPerLayer = sub0::USE_GATED_RESIDUAL ? 2 * 4 : 0;
     constexpr int kGrTop      = sub0::USE_GATED_RESIDUAL ? 3 : 0;
+    // Ln1/Ln2 (2 slots) exist only when GR is OFF -- WP4b blocker D: the real Qwen4ExpTextDecoderLayer
+    // has no input_layernorm / post_attention_layernorm, GR's own hc_norm is the pre-block norm.
+    constexpr int kLnSlots    = sub0::USE_GATED_RESIDUAL ? 0 : 2;
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
-                                        + N_LAYERS * (2 + kFfnSlots + kGrPerLayer)
+                                        + N_LAYERS * (kLnSlots + kFfnSlots + kGrPerLayer)
                                         + kAttnLayers * kAttnMixer
                                         + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
                                         + kQsaLayers * kQsaMixer
@@ -63,6 +66,19 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     }
     REQUIRE(off == sub0::PARAM_FLOATS);                       // table totals the blob size
     REQUIRE(sub0::PARAM_FLOATS == sub0::trainable_floats());  // and the engine agrees
+
+    // WP4b blocker D: under Gated Residual there must be NO Ln1/Ln2 anywhere in the table, and exactly
+    // 2 per layer otherwise. The real Qwen4ExpTextDecoderLayer has no input_layernorm /
+    // post_attention_layernorm -- GR's own grouped hc_norm is the pre-block norm, and leaving Ln1 in
+    // place applied a norm the real model does not (at op_rmsnorm's 1e-5, not the real 1e-6), so no
+    // amount of correct weight transplanting could have reproduced the real output.
+    // Counted over the real table rather than inferred from count_num_params(), which would be circular.
+    {
+        int n_ln = 0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT)
+            if (p.kind == sub0::PKind::Ln1 || p.kind == sub0::PKind::Ln2) ++n_ln;
+        REQUIRE(n_ln == (sub0::USE_GATED_RESIDUAL ? 0 : 2 * N_LAYERS));
+    }
 }
 
 TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout]") {
@@ -342,6 +358,66 @@ TEST_CASE("Gated DeltaNet layer schedule is correct at two shapes, one of them o
         REQUIRE(sub0::GDN_SCHEDULE.full_attn[static_cast<std::size_t>(l)] == this_build.full_attn[static_cast<std::size_t>(l)]);
 }
 
+// GDN's own four head axes (WP4b blocker B, docs/WP4_SCOPE.md S2). These used to be ALIASED onto the
+// ordinary attention axes, which is why a real weight transplant was impossible: the real model wants
+// 16 / 48 / 128 / 128 against attention's 2 / 24 / 256. What must be pinned is (a) the alias default
+// still reproduces the pre-blocker-B geometry EXACTLY -- the "zero effect when neutral" contract -- and
+// (b) the derived widths track GDN's own axes rather than D_KV/D_MODEL once they diverge.
+TEST_CASE("Gated DeltaNet head axes alias the attention axes at their neutral setting", "[layout][gdn]") {
+    // (a) The alias identity, for THIS build. GDN_KEY_HEADS.. are emitted RESOLVED by the configurator,
+    // so "neutral" is spelled as "the resolved value equals the attention axis it used to alias".
+    if constexpr (GDN_KEY_HEADS == N_KV_HEADS && GDN_VALUE_HEADS == N_HEADS &&
+                  GDN_KEY_HEAD_DIM == D_HEAD && GDN_VALUE_HEAD_DIM == D_HEAD) {
+        STATIC_REQUIRE(sub0::GDN_KEY_DIM   == sub0::D_KV);
+        STATIC_REQUIRE(sub0::GDN_VALUE_DIM == N_HEADS * D_HEAD);
+        // The exact expression layout.hpp carried before this axis existed.
+        STATIC_REQUIRE(sub0::GDN_CONV_DIM == 2 * sub0::D_KV + N_HEADS * D_HEAD);
+    }
+    // (b) GDN_DIMS is the single source of truth the math core consumes; the derived widths must agree
+    // with gdn::Dims' own accessors, so a future edit cannot move one without the other.
+    STATIC_REQUIRE(sub0::GDN_DIMS.key_dim()   == sub0::GDN_KEY_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.value_dim() == sub0::GDN_VALUE_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.conv_dim()  == sub0::GDN_CONV_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.num_k_heads == sub0::GDN_K_HEADS);
+    STATIC_REQUIRE(sub0::GDN_DIMS.num_v_heads == sub0::GDN_V_HEADS);
+    STATIC_REQUIRE(sub0::GDN_DIMS.head_k_dim  == sub0::GDN_K_HEAD_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.head_v_dim  == sub0::GDN_V_HEAD_DIM);
+    STATIC_REQUIRE(sub0::GDN_DIMS.rep() == sub0::GDN_V_HEADS / sub0::GDN_K_HEADS);
+
+    // (c) The nine GDN tensors in PARAM_LAYOUT must be shaped from GDN's OWN axes -- checked against the
+    // real model's ratios via a standalone gdn::Dims rather than this build's (which is GDN-off by
+    // default), so the claim is about the geometry, not about whatever shape this binary compiled.
+    constexpr sub0::gdn::Dims real{2560, 16, 48, 128, 128, 4};
+    STATIC_REQUIRE(real.key_dim()   == 2048);
+    STATIC_REQUIRE(real.value_dim() == 6144);
+    STATIC_REQUIRE(real.conv_dim()  == 2 * 2048 + 6144);
+    STATIC_REQUIRE(real.rep() == 3);   // the reference's repeat_interleave factor, 48 / 16
+}
+
+// Partial rotary (WP4b blocker C, docs/WP4_SCOPE.md S2). The engine's rotary prefix used to BE D_HEAD;
+// --rotary-dim makes it its own axis so the real model's partial_rotary_factor (0.25 x head_dim 256 =
+// 64 of 256) is expressible. What must be pinned: the neutral setting still means "rotate the whole
+// head", the prefix is a legal one, and it is the quantity QSA_DIMS actually carries.
+TEST_CASE("rotary prefix defaults to the full head width and stays a legal prefix", "[layout][rope]") {
+    STATIC_REQUIRE(ROTARY_DIM >= 2);
+    STATIC_REQUIRE(ROTARY_DIM <= D_HEAD);
+    // Even only under QSA (its half-split pairing needs it). An ODD prefix is legal for the interleaved
+    // op_rope convention and is a shape this project actually builds -- d132 H4 gives D_HEAD 33.
+    STATIC_REQUIRE(!sub0::USE_QSA || ROTARY_DIM % 2 == 0);
+    STATIC_REQUIRE(sub0::ROTARY_HALF == ROTARY_DIM / 2);
+    // QSA_DIMS.rotary_dim is the ONE value qsa_math.hpp's rope_apply_row indexes; it must be the axis,
+    // not a second derivation of it. (Its own precondition, rotary_dim <= the width being rotated, is
+    // what layout.hpp's QSA_INDEXER_HEAD_DIM >= ROTARY_DIM static_assert now enforces -- the old
+    // `>= D_HEAD` form would have REJECTED the real model, whose indexer heads are 128 < head_dim 256.)
+    STATIC_REQUIRE(sub0::QSA_DIMS.rotary_dim == ROTARY_DIM);
+    STATIC_REQUIRE(sub0::QSA_DIMS_BUF.rotary_dim == ROTARY_DIM);
+    // The real model's own relationship, checked on a standalone Dims rather than this build's (which is
+    // full-width by default): the prefix is narrower than the attention head AND than the indexer head.
+    constexpr sub0::qsa::Dims real{2560, 24, 256, 2, 4, 1, 128, 2048, 4, 64};
+    STATIC_REQUIRE(real.rotary_dim < real.head_dim);
+    STATIC_REQUIRE(real.rotary_dim <= real.idx_head_dim);
+}
+
 // ARCH_FINGERPRINT2 must reproduce 0 at the only value GDN_FULL_ATTN_STRIDE can currently take, and
 // must differ once a nonzero stride is EVER passed to the free function -- the exact same "neutral is
 // bit-identical, non-neutral is distinguishable" property ARCH_FINGERPRINT's own DEPTH_ATTN_STRIDE test
@@ -354,13 +430,23 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     // into byte 1 of this SAME word (this stage's own real build under test may have MoE genuinely ON,
     // e.g. the two-scale/parity verification config, so this is an implication, not an unconditional 0).
     // ... and, since docs/QSA.md S3a, only when QSA's own budget/compress-ratio (bytes 2-3, 4) are off too.
-    if constexpr (EXPERTS_PER_TOK == 0 && QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0) {
+    //
+    // GDN_FULL_ATTN_STRIDE and the two WP4b fields (gdn_key_heads at [47:40], partial_rotary_dim at
+    // [63:48]) belong in this condition too. Omitting the STRIDE was a pre-existing defect in this test,
+    // found by actually building a GDN-ON CUDA binary during WP4b: byte 0 has carried the stride since
+    // GDN Stage 0, so any --gdn-full-attn-stride build failed this REQUIRE with a correct fingerprint.
+    // Nothing had shown it because the branch's own comment reasoned only about MoE and QSA.
+    if constexpr (EXPERTS_PER_TOK == 0 && QSA_INDEXER_BUDGET == 0 && QSA_INDEXER_COMPRESS_RATIO == 0 &&
+                  GDN_FULL_ATTN_STRIDE == 0 && ROTARY_DIM == D_HEAD) {
         REQUIRE(sub0::ARCH_FINGERPRINT2 == 0);
         REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::ARCH_FINGERPRINT2_LEGACY);
     } else {
         REQUIRE(sub0::ARCH_FINGERPRINT2 == sub0::arch_fingerprint2(GDN_FULL_ATTN_STRIDE, EXPERTS_PER_TOK,
                                                                     QSA_INDEXER_BUDGET,
-                                                                    QSA_INDEXER_COMPRESS_RATIO));
+                                                                    QSA_INDEXER_COMPRESS_RATIO,
+                                                                    sub0::USE_GATED_DELTANET
+                                                                        ? sub0::GDN_K_HEADS : 0,
+                                                                    ROTARY_DIM == D_HEAD ? 0 : ROTARY_DIM));
         REQUIRE(sub0::ARCH_FINGERPRINT2 != sub0::ARCH_FINGERPRINT2_LEGACY);
     }
 
@@ -401,9 +487,37 @@ TEST_CASE("arch fingerprint2 stays bit-identical when Gated DeltaNet and MoE are
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4)).experts_per_tok == 10);
     REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0xffff, 0xff)).qsa_indexer_budget == 0xffff);
 
-    // The reserved high 24 bits stay zero regardless of any field's value -- headroom for the NEXT
-    // computation-changing, shape-neutral axis, so it does not repeat ARCH_FINGERPRINT's own scramble.
-    REQUIRE((sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff) >> 40) == 0);
+    // GDN's own KEY HEAD COUNT (WP4b blocker B) occupies byte 5, [47:40]. It is the one of GDN's four
+    // new head axes that PARAM_FLOATS cannot see: every GDN tensor shape depends on it only through
+    // key_dim = k_heads * k_head_dim, so 2x64 and 4x32 are byte-identical blobs computing a different
+    // recurrence (rep() = v_heads / k_heads). Independent of every other field, and zero-by-default so
+    // the neutral word is bit-identical to every value this function has ever produced.
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(0, 0, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(0, 0, 0, 0, 2));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 16) != sub0::arch_fingerprint2(16, 0, 0, 0, 0));  // vs byte 0
+    REQUIRE(sub0::arch_fingerprint2(4, 10, 2048, 4, 16) != sub0::arch_fingerprint2(4, 10, 2048, 4, 0));
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16)).gdn_key_heads == 16);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16)).qsa_indexer_budget == 2048);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0xff)).gdn_key_heads == 0xff);
+
+    // The PARTIAL ROTARY prefix (WP4b blocker C) occupies the top 16 bits, [63:48]. Sixteen and not
+    // eight because it is bounded by D_HEAD, which is 256 in the real model. It changes NO tensor shape
+    // while rotating fewer channels of every head, so nothing but this word can catch a cross-load --
+    // the same reason ROPE_THETA sits in ARCH_FINGERPRINT. Canonicalized to 0 at full-width rotary.
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 0, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 0, 0, 0, 32));
+    REQUIRE(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 64) != sub0::arch_fingerprint2(0, 0, 64, 0, 0, 0));
+    REQUIRE(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64) != sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 0));
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64)).partial_rotary_dim == 64);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(4, 10, 2048, 4, 16, 64)).gdn_key_heads == 16);
+    // A prefix above 255 must survive intact -- the direct check that 16 bits, not 8, were allocated
+    // (the real model's head_dim is 256, so an 8-bit field would silently alias 256 to 0).
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 256)).partial_rotary_dim == 256);
+    REQUIRE(sub0::arch_axes2_of(sub0::arch_fingerprint2(0, 0, 0, 0, 0, 0xffff)).partial_rotary_dim == 0xffff);
+    // Every field packed at once still round-trips -- the word is now FULL (64 bits assigned), so the
+    // next shape-neutral axis needs a third additive word rather than a repack.
+    REQUIRE(sub0::arch_fingerprint2(0xff, 0xff, 0xffff, 0xff, 0xff, 0xffff) ==
+            0xffff'ff'ff'ffff'ff'ffull);
 
     // MODEL_ARCH_ID folds this word in (see layout.hpp make_model_arch_id): two builds differing only in
     // a hypothetical GDN stride or MoE top-k must not collide, matching how it already handles
@@ -427,9 +541,21 @@ TEST_CASE("Gated Residual PARAM_FLOATS delta is zero when off and strictly posit
     // Hand-computed at hc_count=4, hc_lowrank=16, d_model=96: wide=384.
     //   per_instance_with_inject = 384 + 2*384*16 + 384*4 = 384 + 12288 + 1536 = 14208
     //   top_instance             = 384 + 12288 = 12672
-    //   total = 8 * 2 * 14208 + 12672 = 227328 + 12672 = 240000
-    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
-    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
+    //   ln1+ln2 REMOVED per layer (WP4b blocker D)        = 2*96 = 192
+    //   total = 8 * (2*14208 - 192) + 12672 = 8 * 28224 + 12672 = 225792 + 12672 = 238464
+    // Was 240000 before blocker D, i.e. 8*192 = 1536 higher: a GR-on build no longer emits Ln1/Ln2 at
+    // all, because the real Qwen4ExpTextDecoderLayer has neither. Re-derived by hand here rather than
+    // pasted from the compiler, so the number still means something.
+    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
+    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
+    // The removal must never outrun the addition -- PARAM_FLOATS is the ONLY thing discriminating a
+    // GR-on build from a GR-off one at identical dims (no fingerprint bit), so a delta that could reach
+    // zero would make two different architectures load into each other silently. Checked at the
+    // CHEAPEST possible on-setting (hc_count 2, hc_lowrank 1), where the added terms are smallest
+    // relative to the 2*d_model removed, and at a large d_model where the removal is largest.
+    static_assert(sub0::gr_param_delta(8, 96, 2, 1) > 0);
+    static_assert(sub0::gr_param_delta(48, 2560, 2, 1) > 0);
+    static_assert(sub0::gr_param_delta(1, 4096, 2, 1) > 0);
 
     // Shape 2: 11 layers (ODD/ragged -- GR has no per-layer schedule to be ragged about, but this
     // confirms the closed form has no hidden even-layer-count assumption either), a different d_model.
@@ -690,44 +816,63 @@ TEST_CASE("QSA layer schedule is a three-way classification, correct at an odd/n
 TEST_CASE("QSA param delta matches hand-computed values at hypothetical configs, at two shapes",
           "[layout][qsa]") {
     // Off is exactly zero at every shape -- the neutral-setting identity, not merely "small".
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 132, 66, 33, true, 4, 1, 8, false) == 0);
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 0, 0, 0, false) == 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 0, 0, 0, false) == 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 132, 132, 66, 33, true, 4, 1, 8, false) == 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 0, 0, 0, false) == 0);
 
     // Hand-computed, tiny, fully checkable shape: n_layers=1, gdn_stride=0 (=> 1 full-attention layer),
     // d_model=4, d_kv=4, d_head=2, qk_norm=true, idx_n=2, idx_kv=1, idx_hd=2.
+    // (d_q is passed EQUAL to d_model at every hypothetical config here, which is what the pre-blocker-A
+    // signature assumed implicitly -- so every hand-computed number below is unchanged. The independent
+    // d_q case gets its own check at the end of this test.)
     //   idx_qk_out = (2+1)*2 = 6
     //   attn_layer = 2*4*4 + 2*4*4 + 2*2         = 32 + 32 + 4  = 68
     //   qsa_layer  = 3*4*4 + 2*4*4 + 2*2 + 4*6 + 2*2 = 48+32+4+24+4 = 112
     //   delta      = 1 * (112 - 68) = 44
-    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
-    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 44);
+    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 44);
     // Without QK-norm the attention baseline is 4 floats cheaper, so the delta is 4 LARGER (a QSA layer
     // always carries its own q_norm/k_norm -- docs/QSA.md S3b).
-    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 2, false, 2, 1, 2, true) == 48);
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 4, 4, 2, false, 2, 1, 2, true) == 48);
     // Scales linearly in the number of FULL-ATTENTION layers, not in n_layers: at stride 4, 8 layers
     // have exactly 2 full-attention layers, so the delta is 2x the per-layer value, not 8x.
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 4, 4, 2, true, 2, 1, 2, true) == 8 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 4, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 4, 4, 4, 2, true, 2, 1, 2, true) == 8 * 44);
     // ODD/non-dividing: 11 layers at stride 4 has exactly 2 full-attention layers (3 and 7), NOT 3 --
     // the same ragged-tail case the schedule test above pins, re-checked through the delta.
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 4, 4, 4, 4, 2, true, 2, 1, 2, true) == 2 * 44);
 
     // Strictly positive and monotonic in the indexer width at both of this thread's standard shapes.
-    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true) > 0);
-    STATIC_REQUIRE(sub0::qsa_param_delta(11, 0, 132, 66, 33, true, 4, 1, 8, true) > 0);
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 8, 1, 8, true) >
-            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
-    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 16, true) >
-            sub0::qsa_param_delta(8, 0, 96, 96, 48, true, 4, 1, 8, true));
+    STATIC_REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true) > 0);
+    STATIC_REQUIRE(sub0::qsa_param_delta(11, 0, 132, 132, 66, 33, true, 4, 1, 8, true) > 0);
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 8, 1, 8, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true));
+    REQUIRE(sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 16, true) >
+            sub0::qsa_param_delta(8, 0, 96, 96, 96, 48, true, 4, 1, 8, true));
+
+    // WP4b blocker A: d_q is now an EXPLICIT parameter, because N_HEADS*D_HEAD stopped being D_MODEL.
+    // At the real model's own geometry (d_model 2560, d_q = 24*256 = 6144) the QSA layer's three
+    // d_q-sided projections (QsaQProj/QsaGateProj/QsaOProj) are 2.4x wider than the two-sided form the
+    // old signature computed, so this is a genuine arithmetic change, not a rename. Hand-computed at a
+    // tiny non-square shape: n_layers=1, stride=0, d_model=4, d_q=6, d_kv=6, d_head=2, qk_norm=true,
+    // idx 2/1/2 -> idx_qk_out=6.
+    //   attn_layer = 2*4*6 + 2*4*6 + 2*2                 = 48 + 48 + 4        = 100
+    //   qsa_layer  = 3*4*6 + 2*4*6 + 2*2 + 4*6 + 2*2     = 72 + 48 + 4 + 24 + 4 = 152
+    //   delta      = 1 * (152 - 100) = 52
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) == 52);
+    REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) == 52);
+    // A wider d_q at the same d_model must change the answer -- the direct proof the axis is consumed
+    // rather than shadowed by d_model.
+    STATIC_REQUIRE(sub0::qsa_param_delta(1, 0, 4, 6, 6, 2, true, 2, 1, 2, true) !=
+                   sub0::qsa_param_delta(1, 0, 4, 4, 6, 2, true, 2, 1, 2, true));
 
     // This build's own delta is 0 exactly when QSA is off -- the direct neutral-setting claim.
     if constexpr (!sub0::USE_QSA) {
-        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_Q, sub0::D_KV, D_HEAD,
                                        USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
                                        QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) == 0);
     } else {
-        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_KV, D_HEAD,
+        REQUIRE(sub0::qsa_param_delta(N_LAYERS, GDN_FULL_ATTN_STRIDE, D_MODEL, sub0::D_Q, sub0::D_KV, D_HEAD,
                                        USE_QK_NORM, QSA_INDEXER_N_HEADS, QSA_INDEXER_KV_HEADS,
                                        QSA_INDEXER_HEAD_DIM, sub0::USE_QSA) > 0);
     }
