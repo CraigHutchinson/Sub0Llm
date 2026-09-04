@@ -44,8 +44,11 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // instance WITHOUT BlockInject (3 slots), appended once regardless of N_LAYERS. Zero at HC_COUNT==0.
     constexpr int kGrPerLayer = sub0::USE_GATED_RESIDUAL ? 2 * 4 : 0;
     constexpr int kGrTop      = sub0::USE_GATED_RESIDUAL ? 3 : 0;
+    // Ln1/Ln2 (2 slots) exist only when GR is OFF -- WP4b blocker D: the real Qwen4ExpTextDecoderLayer
+    // has no input_layernorm / post_attention_layernorm, GR's own hc_norm is the pre-block norm.
+    constexpr int kLnSlots    = sub0::USE_GATED_RESIDUAL ? 0 : 2;
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
-                                        + N_LAYERS * (2 + kFfnSlots + kGrPerLayer)
+                                        + N_LAYERS * (kLnSlots + kFfnSlots + kGrPerLayer)
                                         + kAttnLayers * kAttnMixer
                                         + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
                                         + kQsaLayers * kQsaMixer
@@ -63,6 +66,19 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     }
     REQUIRE(off == sub0::PARAM_FLOATS);                       // table totals the blob size
     REQUIRE(sub0::PARAM_FLOATS == sub0::trainable_floats());  // and the engine agrees
+
+    // WP4b blocker D: under Gated Residual there must be NO Ln1/Ln2 anywhere in the table, and exactly
+    // 2 per layer otherwise. The real Qwen4ExpTextDecoderLayer has no input_layernorm /
+    // post_attention_layernorm -- GR's own grouped hc_norm is the pre-block norm, and leaving Ln1 in
+    // place applied a norm the real model does not (at op_rmsnorm's 1e-5, not the real 1e-6), so no
+    // amount of correct weight transplanting could have reproduced the real output.
+    // Counted over the real table rather than inferred from count_num_params(), which would be circular.
+    {
+        int n_ln = 0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT)
+            if (p.kind == sub0::PKind::Ln1 || p.kind == sub0::PKind::Ln2) ++n_ln;
+        REQUIRE(n_ln == (sub0::USE_GATED_RESIDUAL ? 0 : 2 * N_LAYERS));
+    }
 }
 
 TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout]") {
@@ -518,9 +534,21 @@ TEST_CASE("Gated Residual PARAM_FLOATS delta is zero when off and strictly posit
     // Hand-computed at hc_count=4, hc_lowrank=16, d_model=96: wide=384.
     //   per_instance_with_inject = 384 + 2*384*16 + 384*4 = 384 + 12288 + 1536 = 14208
     //   top_instance             = 384 + 12288 = 12672
-    //   total = 8 * 2 * 14208 + 12672 = 227328 + 12672 = 240000
-    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
-    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 240000);
+    //   ln1+ln2 REMOVED per layer (WP4b blocker D)        = 2*96 = 192
+    //   total = 8 * (2*14208 - 192) + 12672 = 8 * 28224 + 12672 = 225792 + 12672 = 238464
+    // Was 240000 before blocker D, i.e. 8*192 = 1536 higher: a GR-on build no longer emits Ln1/Ln2 at
+    // all, because the real Qwen4ExpTextDecoderLayer has neither. Re-derived by hand here rather than
+    // pasted from the compiler, so the number still means something.
+    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
+    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
+    // The removal must never outrun the addition -- PARAM_FLOATS is the ONLY thing discriminating a
+    // GR-on build from a GR-off one at identical dims (no fingerprint bit), so a delta that could reach
+    // zero would make two different architectures load into each other silently. Checked at the
+    // CHEAPEST possible on-setting (hc_count 2, hc_lowrank 1), where the added terms are smallest
+    // relative to the 2*d_model removed, and at a large d_model where the removal is largest.
+    static_assert(sub0::gr_param_delta(8, 96, 2, 1) > 0);
+    static_assert(sub0::gr_param_delta(48, 2560, 2, 1) > 0);
+    static_assert(sub0::gr_param_delta(1, 4096, 2, 1) > 0);
 
     // Shape 2: 11 layers (ODD/ragged -- GR has no per-layer schedule to be ragged about, but this
     // confirms the closed form has no hidden even-layer-count assumption either), a different d_model.

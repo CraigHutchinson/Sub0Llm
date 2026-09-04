@@ -403,12 +403,20 @@ inline constexpr std::size_t GR_MIX_SCRATCH1    = gr::mix_scratch_floats(GR_DIMS
 // Zero at hc_count < 2 (matching USE_GATED_RESIDUAL's own gate) and strictly positive at hc_count >= 2,
 // hc_lowrank >= 1, d_model >= 1, n_layers >= 1 -- every term is a PRODUCT of positive quantities, so no
 // cancellation with any other axis is possible (contrast GDN's own mixed-sign Delta, S3c).
+// WP4b blocker D changed this from a pure ADDITION into an addition MINUS a removal: a GR-on build no
+// longer emits Ln1/Ln2 at all (the real decoder layer has neither -- see make_param_layout), so the
+// delta now also subtracts 2*d_model per layer. It stays strictly positive at any hc_count >= 2 /
+// hc_lowrank >= 1 -- the smallest added instance is already `wide + 2*wide*hc_lowrank + wide*hc_count`
+// with wide = hc_count*d_model >= 2*d_model, and there are 2 per layer against the 2*d_model removed --
+// so PARAM_FLOATS still discriminates GR-on from GR-off monotonically and no fingerprint bit is needed.
 inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_count, int hc_lowrank) {
     if (hc_count < 2) return 0;
     const long long wide = static_cast<long long>(hc_count) * d_model;
     const long long per_instance_with_inject = wide + 2 * wide * hc_lowrank + wide * hc_count;
     const long long top_instance             = wide + 2 * wide * hc_lowrank;
-    return static_cast<long long>(n_layers) * 2 * per_instance_with_inject + top_instance;
+    const long long ln1_ln2_removed          = 2LL * d_model;   // blocker D: per layer, no longer emitted
+    return static_cast<long long>(n_layers) * (2 * per_instance_with_inject - ln1_ln2_removed)
+         + top_instance;
 }
 
 // MIXTURE OF EXPERTS -- Stage 0: config skeleton, hard-gated off (docs/MOE.md). NUM_EXPERTS routed
@@ -977,7 +985,11 @@ inline constexpr memplan::Dims current_build_dims() {
 consteval int count_num_params() {
     int n = 1 + (HAS_POS_EMB ? 1 : 0);
     for (int l = 0; l < N_LAYERS; ++l) {
-        n += 2;   // ln1, ln2
+        // Ln1/Ln2 exist ONLY when Gated Residual is off (WP4b blocker D, docs/WP4_SCOPE.md S2 and
+        // docs/GATED_RESIDUAL.md S2's own deferred simplification): the real Qwen4ExpTextDecoderLayer
+        // has NO input_layernorm / post_attention_layernorm at all -- GR's own grouped hc_norm IS the
+        // pre-block norm, and each mixer reads GR's mixed_input directly, un-normed again.
+        if constexpr (!USE_GATED_RESIDUAL) n += 2;   // ln1, ln2
         if constexpr (USE_GATED_RESIDUAL) n += 4;   // GrHcNorm/MixDown/MixUp/BlockInject (attn-wrapping)
         if (MIXER_SCHEDULE[static_cast<std::size_t>(l)] == LayerMixer::Qsa) {
             // QSA layer (docs/QSA.md S3b): REPLACES Wq/Wk/Wv/Wo[+QNorm/KNorm] with its own ten tensors --
@@ -1092,11 +1104,18 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
     add(VOCAB,   D_MODEL, PKind::TokEmb, false, false);
     if constexpr (HAS_POS_EMB) add(SEQ_LEN, D_MODEL, PKind::PosEmb, false, false);
     for (int l = 0; l < N_LAYERS; ++l) {
-        add(1,       D_MODEL, PKind::Ln1, false, false);
-        add(1,       D_MODEL, PKind::Ln2, false, false);
+        // WP4b blocker D: no Ln1/Ln2 under Gated Residual -- the real decoder layer has neither, and
+        // GR's own hc_norm is the pre-block norm (see count_num_params above and Model::forward's
+        // gr_read, which now returns GR's mixed_input directly instead of op_rmsnorm(mixed, ln)).
+        // Shape-changing, so PARAM_FLOATS discriminates it and no fingerprint bit is needed; it fires
+        // only when GR is on, which no existing build enables.
+        if constexpr (!USE_GATED_RESIDUAL) {
+            add(1,       D_MODEL, PKind::Ln1, false, false);
+            add(1,       D_MODEL, PKind::Ln2, false, false);
+        }
         // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance wrapping
         // this layer's attention/GDN sub-block. Placed here, before that sub-block's own weights, since
-        // it is what turns `h` (the wide residual) into the D_MODEL-wide input ln1 actually reads.
+        // it is what turns `h` (the wide residual) into the D_MODEL-wide input the mixer reads.
         if constexpr (USE_GATED_RESIDUAL) {
             constexpr int WIDE = HC_COUNT * D_MODEL;
             add(1,          WIDE,       PKind::GrHcNorm,      false, false);

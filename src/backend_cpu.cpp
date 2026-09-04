@@ -1505,7 +1505,11 @@ static inline float silu_row(float v) {
 // attention layer, and vice versa for Wq/Wk/Wv/Wo/q_norm/k_norm) -- see layout.hpp's PKind comment for
 // what each one is. A layer is one or the other, never both, at every GDN_FULL_ATTN_STRIDE value.
 struct Layer {
-    Node *ln1, *ln2, *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
+    // ln1/ln2 are nullptr under USE_GATED_RESIDUAL (WP4b blocker D: the real decoder layer has neither,
+    // and GR's own hc_norm is the pre-block norm) -- the same "unused pointers just stay nullptr" idiom
+    // q_norm/k_norm and the gdn_* set already use, so the struct's shape stays config-independent.
+    Node *ln1 = nullptr, *ln2 = nullptr;
+    Node *Wq, *Wk, *Wv, *Wo, *W1, *b1, *W2, *b2, *Wg, *q_norm, *k_norm;
     Node *gdn_in_qkv = nullptr, *gdn_in_z = nullptr, *gdn_in_b = nullptr, *gdn_in_a = nullptr,
          *gdn_conv = nullptr, *gdn_a_log = nullptr, *gdn_dt_bias = nullptr, *gdn_norm = nullptr,
          *gdn_out_proj = nullptr;
@@ -1731,8 +1735,13 @@ struct Model {
         else                       pos_emb = nullptr;
         for (int li = 0; li < N_LAYERS; ++li) {
             Layer& L = layers[static_cast<std::size_t>(li)];
-            L.ln1 = mk_param(1, D_MODEL, false);
-            L.ln2 = mk_param(1, D_MODEL, false);
+            // WP4b blocker D: no Ln1/Ln2 under Gated Residual -- the real Qwen4ExpTextDecoderLayer
+            // has no input_layernorm / post_attention_layernorm; GR's own grouped hc_norm is the
+            // pre-block norm and the mixer reads mixed_input directly. MUST match make_param_layout().
+            if constexpr (!USE_GATED_RESIDUAL) {
+                L.ln1 = mk_param(1, D_MODEL, false);
+                L.ln2 = mk_param(1, D_MODEL, false);
+            }
             // Gated Residual (docs/GATED_RESIDUAL.md S3b/S4a): the attn_hyper_connection instance,
             // MUST match layout.hpp's own placement (right here, before the sub-block's own weights).
             if constexpr (USE_GATED_RESIDUAL) {
@@ -1858,7 +1867,7 @@ struct Model {
         std::uniform_real_distribution<float> gdn_a_init(0.01f, 16.f);   // real model's own A_log init range, S1a
         for (int li = 0; li < N_LAYERS; ++li) {
             Layer& L = layers[static_cast<std::size_t>(li)];
-            ones(L.ln1); ones(L.ln2);
+            if constexpr (!USE_GATED_RESIDUAL) { ones(L.ln1); ones(L.ln2); }   // absent under GR (blocker D)
             // Gated Residual init: GrHcNorm is left at the arena's own zero -- the real model's own
             // `torch.zeros(dim)` convention (gain = 1 + w, so w=0 is the identity RMS-norm, S1a), NOT
             // this engine's usual ones()-initialized gain. down/up/block_inject are ordinary GEMM
@@ -2006,9 +2015,17 @@ struct Model {
         auto gr_read = [&](Node* wide, Node* norm_w, Node* down_w, Node* up_w, Node* inject_w, Node* ln,
                             Node** out_inj) -> Node* {
             if constexpr (USE_GATED_RESIDUAL) {
+                // WP4b blocker D: the mixer reads GR's mixed_input DIRECTLY, un-normed. The real
+                // Qwen4ExpTextDecoderLayer has no input_layernorm / post_attention_layernorm at all --
+                // GR's own grouped hc_norm (already applied inside op_gr_mix, at the real model's
+                // rms_norm_eps = 1e-6) IS the pre-block norm. Routing mixed_input through op_rmsnorm
+                // applied a norm the real model does not, at the WRONG eps (1e-5), so no amount of
+                // correct weight transplanting could have reproduced the real output.
+                // `ln` is nullptr here -- Ln1/Ln2 are not emitted under GR (make_param_layout).
+                (void)ln;
                 Node* mixed = op_gr_mix(wide, norm_w, down_w, up_w);
                 *out_inj = op_gr_gate(wide, norm_w, inject_w);
-                return op_rmsnorm(mixed, ln);
+                return mixed;
             } else {
                 return op_rmsnorm(wide, ln);
             }
@@ -2212,7 +2229,12 @@ struct Model {
                 gr::hc_norm(GR_DIMS, 1, wide, norm_w->data.data(), gr_normed);
                 gr::mix(GR_DIMS, 1, gr_normed, down_w->data.data(), up_w->data.data(), gr_mixed, gr_mixscr);
                 gr::gate(GR_DIMS, 1, gr_normed, inject_w->data.data(), gr_inj);
-                rmsnorm_row(gr_mixed, ln, out_a, C);
+                // WP4b blocker D: the mixer reads mixed_input DIRECTLY -- no Ln1/Ln2 exists under GR
+                // (`ln` is nullptr), and gr::hc_norm above already applied the real model's own
+                // pre-block norm at its own 1e-6 eps. Mirrors forward()'s gr_read exactly; the
+                // forward-vs-forward_one parity test is what gates that they stay mirrored.
+                (void)ln;
+                std::copy_n(gr_mixed, C, out_a);
             } else {
                 rmsnorm_row(wide, ln, out_a, C);
             }
