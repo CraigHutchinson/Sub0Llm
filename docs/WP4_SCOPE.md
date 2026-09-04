@@ -594,6 +594,141 @@ this engine and llama.cpp are computing the same function anyway.
 at real dims. Then `forward` vs `forward_one` parity at real dims (the check that has caught a real bug
 in every one of WP1-3).
 
+#### WP4d — EXECUTED (branch `feature/wp4d-real-forward`). Results, recorded rather than summarised
+
+**The engine now builds, links and runs at the real axes, and the artifact loads.** The build goes
+through the REAL `sub0llm-configure`, and its generated `sub0_corpus.hpp` is field-for-field identical to
+`tests/qwen4_real_axes/sub0_config.hpp` with `N_LAYERS = 4`:
+
+```
+sub0llm-configure --corpus data/cosmopedia.txt --vocab 248202 --corpus-pretok 0 \
+  --dmodel 2560 --layers 4 --heads 24 --kv-heads 2 --head-dim 256 \
+  --gdn-full-attn-stride 4 --gdn-key-heads 16 --gdn-value-heads 48 \
+  --gdn-key-head-dim 128 --gdn-value-head-dim 128 --hc-count 4 --hc-lowrank 320 \
+  --num-experts 512 --experts-per-tok 10 --qsa-indexer-n-heads 4 --qsa-indexer-kv-heads 1 \
+  --qsa-indexer-head-dim 128 --qsa-indexer-budget 2048 --qsa-indexer-compress-ratio 4 \
+  --rotary-dim 64 --seq 128 --d-ff 640 --tie-embeddings 0 --rope-theta 10000000 --compute 0
+```
+
+**`--vocab 248202`, not 248320, and that is not a fudge.** The configurator emits the vocabulary the
+LEARNER produced, not the target: `tok::learn` maps the Unigram result onto a fixed 288-symbol base
+alphabet, and every single-BYTE piece reuses a base id instead of adding one, so
+`VOCAB = 288 + (target - S)` where `S` is the corpus's distinct-single-byte count. One cheap probe run
+(`--vocab 5000` → 4830 pieces) fixes `S = 170` for cosmopedia, and `248320 - 288 + 170 = 248202` then
+lands the real `vocab_size` **exactly**, first try. Learning it took **94s** (the `.words` scan cache hit,
+so passes 1-2 were skipped); a corpus large enough to support the vocabulary is the only requirement —
+its CONTENT is irrelevant to a forward-pass test that never uses the tokenizer.
+
+**Four blockers had to be fixed before any of this ran. Every one was invisible to WP4b/WP4c because
+their gates were compile-time checks against a HAND-WRITTEN config header with no engine linked** — the
+real configurator and `Model::forward` had never seen these axes:
+
+| # | Blocker | Why nothing caught it |
+|---|---|---|
+| E | **`tools/configurator.cpp` has no `--d-ff` at all** — the FFN/expert width was always derived from `D_MODEL` (`4x` plain, `~8/3x` gated), giving **6848** where the real `moe_intermediate_size` is **640**. Under MoE that width is a per-expert weight SHAPE, so no real-weight transplant was expressible through the real tool | `tests/qwen4_real_axes/sub0_config.hpp` simply *declares* `D_FF = 640`. §1's table never asked whether the configurator could PRODUCE it |
+| A′ | **The configurator refused `--head-dim 256` at d2560/24 heads.** The `d_model % n_heads` check ran unconditionally and BEFORE `--head-dim` was resolved — three lines above a comment that already says in words that an explicit head-dim is free of it. WP4b blocker A, half-landed | same: no test runs the tool |
+| — | **`core.hpp`'s `static_assert(D_MODEL % N_HEADS == 0)` fails at the real axes** (2560 % 24 == 16). Correct only while `D_HEAD` was derived; the quantity that must divide is `D_Q = N_HEADS * D_HEAD`. Now asserted as that | `qwen4_real_shape_tests.cpp` includes `layout.hpp`, **not** `core.hpp`. Nothing had ever compiled the ENGINE at these axes |
+| — | **`gdn_math.hpp`'s `forward()` wrote into `float gated[4096]`**, a stack array commented as a "generous" bound on `value_dim`. The real `value_dim` is `48 x 128 = 6144`: a **2048-float stack overrun and a hard segfault** on the very first real GDN layer | the GDN fixture is a SLICED layer (3 value heads, `value_dim` 384). No build in this repo had ever run GDN at the real head counts. `backward()`'s identical `d_gated_row[4096]` was fixed the same way rather than left as the twin defect |
+
+**A fifth, structural one, which is the real memory finding.** `ensure_shared_params()` eagerly allocated
+FOUR `PARAM_FLOATS` arenas (weights + gradient + both AdamW moments) and each `Worker` carried a FIFTH.
+At these axes that is **43.4 GiB apiece — ~217 GiB before a single token is embedded**, on a 63.4 GiB
+machine. They are also provably DEAD in exactly these builds: Gated Residual, MoE and QSA each `abort()`
+in `backward_node`. `backend_cpu.cpp` now derives `FORWARD_ONLY` from those same three `USE_*` flags
+(**GDN deliberately excluded** — its Stage 2 backward is real and gradient-checked), skips the three
+shared arenas, sizes `Worker::grad` to 1 float, and refuses at the lowest callable seam
+(`grad_ptr`/`adam_*_ptr`/`reduce_gradients`/`AdamW::step`) if a training path ever asks. `print_config` /
+`print_host_memplan` were reporting `4 x PARAM_FLOATS` unconditionally and now report what is actually
+paid — 130 GiB of over-statement removed here.
+
+**Results, with the actual numbers:**
+
+| Check | Result |
+|---|---|
+| `load_model()` accepts `qwen4_sub4.bin` | **YES**, first try, no mismatch to fix. Header (d_model/n_layers/n_heads/d_ff/vocab/ternary/pos_encoding/`param_floats` = 11,647,617,440), `ARCH_FINGERPRINT` and `ARCH_FINGERPRINT2` all matched a real configurator run's. **41.0s** to read 43.39 GiB |
+| the two SYNTHESIZED destinations, read back from what LOADED | `LnF` min = max = **1.0**; `LmBias` min = max = **0.0** — exactly what WP4c's finding 3 said it wrote |
+| `Model::forward` at real dims | **[6 x 248320] in 1.72s**, zero non-finite. Per-row logits rms 0.60-0.83, range ≈ ±4 |
+| **engine path vs independent math-core replay** (see below) | layer 0 `\|\|h_in\|\|` **1.82e-08**, `\|\|delta\|\|` **2.76e-08**; layer 1 **1.39e-08** / **9.91e-09**; layer 2 **1.84e-08** / **3.26e-08** |
+| `forward` vs `forward_one` | max abs **5.96e-06** over all 6 x 248,320 logits (worst at row 4); max relative 0.135, but that is a near-zero logit against a `+1e-6` denominator — against the row's own rms 0.74 the error is ~8e-06 relative. **No structural bug**, unlike WP4b's own `C / H` find |
+| peak working set | **45.29 GiB** (43.40 after load, +1.86 for the one Worker) against 49.0 GiB free |
+
+**§6's stated gate is not reachable, and the reason is a property of the fixtures, not of this stage.**
+Every `tests/fixtures/qwen4_preview/` fixture is a **sliced** layer — `gdn_layer0_small` is `hidden_size`
+**32** / 1 key head / 3 value heads, `qsa_layer3_small` is `hidden_size` **16** / 2 heads / `head_dim` 8
+(their own manifests say so, alongside a separate `config_real_full_scale_for_reference` block). Neither
+its input nor its reference output exists at `hidden_size` 2560, so "layer-0's output through
+`Model::forward` matches the existing real fixture" cannot be evaluated: **there is no real-dims
+reference anywhere in this repo, and WP4c's levels 3/4 were replays at the FIXTURE's dims through the
+transplant mapping, not runs of this artifact.** §4c item 3's own parenthesis ("these fixtures are
+sliced-down, so this requires the sliced config") already said this; §6 restated the gate without
+carrying the caveat forward.
+
+**What replaced it is the thing WP4d actually adds over WP4c**: does the ENGINE path — the Node graph,
+GR's real wrapping, `MIXER_SCHEDULE`, and the `PARAM_LAYOUT` offsets the weights physically landed at —
+agree with the math cores WP4c already validated, driven from the SAME loaded weights?
+`tools/sub0llm-qwen4-forward.cpp` rebuilds layers 0-2 straight out of `params_ptr()` with plain
+`gr::`/`gdn::`/`moe::` calls and compares against the engine's own per-execution residual-stream norms
+(`loop_pass_stats`), walking `PARAM_LAYOUT` with a cursor that **checks each `PKind`** rather than
+assuming offsets. The agreement above (≤3.3e-08 relative, float32 accumulation-order noise) is a real
+result: it covers the embedding, the GR entry tile, six GR instances, three GDN mixers and three MoE
+blocks composed in the engine's own order. Layer 3 (QSA) is excluded only because `op_qsa` needs the
+backend's internal precomputed rope table.
+
+### WP4d's two open items, resolved
+
+**1. `op_rmsnorm`'s `eps` is 1e-5 vs the real 1e-6 — is it even reachable? Yes, at EXACTLY ONE site, and
+it is a site the real model does not have.** Read from the actual `Model::forward` code path rather than
+inferred: under `USE_GATED_RESIDUAL`, `gr_read()` takes the GR branch and never calls `op_rmsnorm`
+(blocker D removed `Ln1`/`Ln2`); `op_qknorm` is only in the dense-attention `else` branch, which
+`USE_QSA` compiles out; GDN's internal norms are `gdn_math.hpp`'s own `RMS_EPS = 1e-6`; GR's are
+`gated_residual_math.hpp`'s `hc_norm` at `1e-6`; QSA's are `qsa::RMS_EPS = 1e-6`; MoE has none. **The
+only surviving `op_rmsnorm` call in the entire real-axes forward is `h = op_rmsnorm(h, ln_f)`** — the
+final norm before the head. So GR's own `hc_norm` does cover every norm a GDN/QSA layer needs, and the
+1e-5/1e-6 discrepancy touches nothing but `ln_f`.
+
+Measured there, on the real hidden state: mean-square **0.898**, so `1/sqrt(ms+eps)` differs by
+**5.01e-06** relative between the two eps values, moving the logits by **1.67e-05** with no argmax change.
+**The eps is not the problem at this site.**
+
+**2. `LnF` synthesized to 1.0 does NOT reproduce the real model — and the fix is to remove the site, not
+to change the gain.** WP4c's finding 3 established that `output_norm.weight` exists under no name in the
+real GGUF; the only non-`blk.` tensors are `output.weight`, `output_hc_{down,norm,up}.weight`,
+`per_layer_token_embd.weight`, `token_embd.weight`. That is architecturally coherent — `output_hc_*` IS
+the model-level Gated Residual exit instance, and `gr::mix` builds its output from `hc_norm`-ed streams
+(at 1e-6), so the representation reaching the head is already normalized. **But 1.0 is the identity GAIN,
+not an identity OPERATION**: RMSNorm still divides by the row's RMS. The engine therefore normalizes a
+second time, and the real model does not.
+
+Measured: same hidden state, same `lm_head`, three readouts differing only in that step —
+**max|with `ln_f` − without any final norm| = 0.174** against a logit rms of 0.64, i.e. a **~27%-of-scale**
+perturbation. (At the first position, whose pre-`ln_f` rms is 2.64 rather than 0.95, the gap is
+**4.90** — the effect scales with how far the stream's RMS is from 1, exactly as it must.) The argmax
+happened to survive on this input; nothing guarantees that.
+
+**So the resolution is: `LnF` should be removed under `USE_GATED_RESIDUAL` the same way `Ln1`/`Ln2` were
+(blocker D), for the same reason and with the same evidence.** This is deliberately NOT done in WP4d:
+it is shape-changing (`PARAM_FLOATS` drops by `D_MODEL` = 2,560 and `NUM_PARAMS` by 1), which
+**invalidates the 46,590,469,832-byte artifact** and requires a `sub0llm-transplant` re-run. That is a
+WP4c-shaped change with its own gate, not something to fold into the stage that discovered it. Until it
+lands, **the logits this build produces are not the real model's logits**, and WP4f's comparison must not
+be run against them — the per-layer hidden states (which `ln_f` is downstream of, and which §5 already
+names as the right comparison point) are unaffected.
+
+### WP4d — what is still open
+
+- **`LnF` removal** (above): shape-changing, invalidates the artifact, needs a transplant re-run.
+- **No real-dims reference output exists.** Closing that needs either a real-dims fixture extracted the
+  way the sliced ones were, or WP4f's llama.cpp oracle. WP4d's engine-vs-math-core agreement is a
+  consistency check, **not** a check against the real model.
+- **`op_qsa`'s rope table is backend-internal**, so layer 3 is outside the replay above.
+- **Memory has no headroom for growth.** 45.29 GiB peak against 49.0 GiB free is a 3.7 GiB margin at
+  `SEQ_LEN = 128` and `T = 6`. The activation arenas alone are **1,909 MiB per Worker** and scale with
+  `SEQ_LEN`; `DEFAULT_THREADS` is 24, so anything that touches a second Worker slot adds another 1.9 GiB.
+  A forward-only run is single-worker by construction, but this is the number WP4e's offload work has to
+  start from, and it confirms §3b's "plausible, still tight" framing with a measurement.
+- **A real engine build at these axes needs `-fconstexpr-steps` raised**, as WP4b predicted; it is now a
+  tree-wide `add_compile_options` rather than a per-target flag.
+
 ### WP4e — Expert residency / offload at real scale (§4 of the orchestration doc)
 
 Implements `docs/QWEN4_MEMORY_ORCHESTRATION.md` §3b's already-named policy: a **static layer-range
