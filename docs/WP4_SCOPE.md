@@ -596,28 +596,66 @@ in every one of WP1-3).
 
 ### WP4e — Expert residency / offload at real scale (§4 of the orchestration doc)
 
-Implements `docs/QWEN4_MEMORY_ORCHESTRATION.md` §3b's already-named policy: a **static layer-range
-CPU/GPU split**, per-build, `-ot`/`--n-cpu-moe`-shaped. **What does not exist yet and must be built:**
+**Rescoped 2026-09-04 — the previous framing below solved the wrong problem.** It described WHERE the
+f32 bytes for an expert live (arena vs. an mmap'd/staging region) — a placement question. But WP4c's own
+real transplant measurement makes the actual constraint plain: **every tensor this engine computes with
+is f32, at a 10.5x expansion over the GGUF file's own quantized bytes** (46.59GB f32 from 4.42GB encoded,
+for 4 layers). Extrapolated to 48 layers that is **~500GB of f32** — not "500GB that needs a clever
+placement policy," but 500GB that must never be MATERIALIZED at all, because the entire reason a
+quantized tier was downloaded in the first place was to keep the resident footprint small. A placement
+policy over an already-500GB f32 form has already lost the game before it starts (user's own observation,
+2026-09-04: *"that's why we need iq4"*).
 
-1. **A `PARAM_LAYOUT` leaf that is not arena-resident.** Every tensor today is a span into one flat
-   arena. An offloaded expert needs a leaf whose `data` span points at an mmap'd region or a staging
-   buffer. `docs/QWEN4_DEPLOYMENT_FEASIBILITY.md` §3b found the genuinely encouraging structural fact
-   that makes this cheap: `Node::data` is a **non-owning `std::span<float>`**, so `op_linear`/`op_moe`
-   cannot tell the difference. What is missing is the *construction* path, not the consumption path.
-2. **An explicit resolve pass ahead of the hot loop** (`AGENTS.md` §1 — no runtime-variable latency in a
-   hot path). `docs/QWEN4_MEMORY_ORCHESTRATION.md` §4 already classifies MoE expert weights as
-   *mandatory explicit resolve*, and names the real latency-hiding opportunity: layer *L*'s router is
-   computable as soon as layer *L−1*'s hidden state exists, so layer *L*'s resolve can be issued while
-   *L−1* still computes (Eliseev & Mazur's one-layer lookahead).
-3. **A compile-time-sized, fixed-capacity slot table** per §5c of that doc — capacity plausibly **0** on
-   this hardware for a first build, which that document already flags as a legitimate honest outcome.
-4. **The `MoeRouter` exemption** (§2a v2 of that doc): the router is dense-read per token and must stay
-   resident even when its layer's experts are offloaded.
+**What this actually requires, restated**: the ~512×48 routed experts must stay resident in their
+**native quantized byte form** (whichever of `IQ1_S`/`IQ2_XXS`/`IQ4_NL` each one actually is — §3a-bis's
+own per-layer-mixed-quantization finding applies here too), and dequantization must happen **per
+selected expert, per token, into a small reusable scratch buffer**, immediately consumed and discarded —
+never into a persistent f32 array for experts that were not selected. This is exactly what `llama.cpp`
+itself does (dequantize-on-the-fly inside its quantized matmul kernels, or dequantize into a small
+temporary): the quantized file format and the small in-memory footprint are the SAME design decision, not
+two separable ones. WP4c's f32 transplant was a deliberate, correct choice **for its own narrow purpose**
+(a byte-exact, quantization-noise-free correctness gate against the existing real-weight fixtures, at a
+scale — 4 layers — where 43GB of f32 happens to fit) — it is not, and was never meant to be, a preview of
+the full-scale storage design.
 
-**Gate**: bitwise-identical output between an all-resident small build and the same build with the
-offload path forced on — the offload must be a *placement* change, never a numerical one, and only a
-bitwise check proves that (the same argument `docs/QSA.md` §11 makes for its block-key cache, where an
-output check alone could not distinguish cached from uncached).
+**Consequence for the engine's own structure, stated plainly**: `op_linear`/`op_moe` today read a
+`Node::data` that is a plain `std::span<float>` — there is no quantized-tensor concept anywhere in
+`backend_cpu.cpp`. The non-owning-span structure `docs/QWEN4_DEPLOYMENT_FEASIBILITY.md` §3b found
+encouraging (the op cannot tell an owned arena slice from an mmap'd one) does NOT help here, because both
+of those are f32. **A real fix needs one of**: (a) a new op variant that takes a quantized `TensorInfo`-
+like descriptor plus a raw byte span, and dequantizes internally per call (the`gguf::` decoders WP4c just
+built are exactly the primitives this would call); or (b) a resolve-pass that dequantizes ONLY the
+`experts_per_tok` (10, real value) selected experts per layer per token into a small, compile-time-sized
+scratch pool, immediately before that layer's `op_moe` call, and never keeps more than a handful of
+experts' worth of f32 resident at once. (b) is closer to this project's existing "explicit resolve pass
+ahead of the hot loop" idiom (`AGENTS.md` §1) and is the recommended starting point — **not decided here,
+this is WP4e's own design question**, but the shape of the question has changed: it is "how do we
+dequantize just-in-time and reuse a small buffer," not "where do we put a 500GB array."
+
+**What survives from the original framing, still real work**:
+
+1. **An explicit resolve pass ahead of the hot loop**, now understood as a DEQUANTIZE step, not a copy/
+   move step. `docs/QWEN4_MEMORY_ORCHESTRATION.md` §4 already classifies MoE expert weights as
+   *mandatory explicit resolve*; the real latency-hiding opportunity it names (layer *L*'s router is
+   computable as soon as layer *L−1*'s hidden state exists, so layer *L*'s dequantize can be issued while
+   *L−1* still computes, Eliseev & Mazur's one-layer lookahead) applies identically to a dequantize-based
+   resolve.
+2. **The `MoeRouter` exemption** (§2a v2 of that doc) — the router is dense-read per token over all 512
+   experts and must stay resident (and, since it is `F32` in the real file per §3a-bis's own census,
+   resident in its ALREADY-native format — no dequantization gap here at all).
+3. A compile-time-sized, fixed-capacity scratch pool sized for at most a handful of concurrently-live
+   dequantized experts — a much smaller and more tractable sizing question than §5c of the orchestration
+   doc's own GPU-VRAM-slot-count framing, which was itself built on the f32-per-expert size (§3b's "2.64
+   MiB/expert IQ4_NL-class" figure was actually already right — it used the QUANTIZED size — the mismatch
+   was only ever in WP4c's own transplant choice, not in that document's own arithmetic).
+
+**Gate, revised**: bitwise-identical output between (a) WP4c/d's own existing all-f32-resident 4-layer
+path and (b) the same 4 layers run through a dequantize-on-demand path instead — proving the *representation*
+change (quantized-resident + per-use dequant vs. all-f32-resident) is numerically inert, the same argument
+`docs/QSA.md` §11 makes for its block-key cache (an output check alone cannot distinguish the two without
+this exact bitwise comparison). This is checkable at the SAME 4-layer scale WP4d already validates — the
+500GB number only bites at full 48-layer scale, so WP4e's own correctness gate does not need to attempt
+that scale to be meaningful.
 
 ### WP4f — The llama.cpp comparison harness
 
