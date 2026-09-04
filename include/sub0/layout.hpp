@@ -419,14 +419,20 @@ inline constexpr std::size_t GR_MIX_SCRATCH1    = gr::mix_scratch_floats(GR_DIMS
 // hc_lowrank >= 1 -- the smallest added instance is already `wide + 2*wide*hc_lowrank + wide*hc_count`
 // with wide = hc_count*d_model >= 2*d_model, and there are 2 per layer against the 2*d_model removed --
 // so PARAM_FLOATS still discriminates GR-on from GR-off monotonically and no fingerprint bit is needed.
+// LnF REMOVAL (2026-09-04, docs/WP4_SCOPE.md's LnF resolution): the same finding applied ONCE at the
+// model level. The real Qwen4ExpTextModel has no separate final RMSNorm at all -- the GR EXIT instance's
+// own hc_norm IS the final normalization -- so a GR-on build no longer emits LnF either. That is a
+// further `- d_model`, once, not per layer. The delta is still strictly positive: `top_instance` alone
+// is `wide + 2*wide*hc_lowrank >= 2*d_model + 4*d_model` against the single d_model removed here.
 inline constexpr long long gr_param_delta(int n_layers, int d_model, int hc_count, int hc_lowrank) {
     if (hc_count < 2) return 0;
     const long long wide = static_cast<long long>(hc_count) * d_model;
     const long long per_instance_with_inject = wide + 2 * wide * hc_lowrank + wide * hc_count;
     const long long top_instance             = wide + 2 * wide * hc_lowrank;
     const long long ln1_ln2_removed          = 2LL * d_model;   // blocker D: per layer, no longer emitted
+    const long long ln_f_removed             = d_model;         // LnF: once, model level
     return static_cast<long long>(n_layers) * (2 * per_instance_with_inject - ln1_ln2_removed)
-         + top_instance;
+         + top_instance - ln_f_removed;
 }
 
 // MIXTURE OF EXPERTS -- Stage 0: config skeleton, hard-gated off (docs/MOE.md). NUM_EXPERTS routed
@@ -992,6 +998,8 @@ inline constexpr memplan::Dims current_build_dims() {
 // (q_norm, k_norm) when USE_QK_NORM, then the tail: ln_f alone when USE_TIED_EMBEDDINGS (the head
 // reuses tok_emb, no separate lm_head/lm_bias slot -- the common tied-embedding convention also
 // drops the head bias, matching GPT-2/GGUF-style tied models), else ln_f + lm_head + lm_bias (3).
+// Under USE_GATED_RESIDUAL the tail loses ln_f entirely (the real model has no final norm -- the GR
+// exit instance's own hc_norm is it; see make_param_layout()).
 // N-gram embeddings add NGRAM_NUM_EMBEDDERS table tensors plus one concat_proj tensor (0 when off).
 //
 // Per-LAYER aware (Stage 1): a layer is EITHER a softmax-attention layer (ln1,ln2 + Wq,Wk,Wv,Wo [+
@@ -1031,7 +1039,13 @@ consteval int count_num_params() {
         if constexpr (USE_MOE) n += 1 + 3 * NUM_EXPERTS + 3 + 1;
         else                   n += (USE_GATED_FFN ? 3 : 4);
     }
-    n += (USE_TIED_EMBEDDINGS ? 1 : 3);
+    // The tail: LnF + LmHead + LmBias (untied) or LnF alone (tied) -- MINUS LnF entirely under Gated
+    // Residual. The real Qwen4ExpTextModel applies NO separate RMSNorm after the GR exit collapse: the
+    // exit instance's own grouped hc_norm (at the real rms_norm_eps 1e-6) IS the final normalization,
+    // and the collapsed mixed_input feeds lm_head directly. Same finding, same precedent and same
+    // reasoning as blocker D's Ln1/Ln2 removal just above -- see make_param_layout() and
+    // docs/GATED_RESIDUAL.md S1c.
+    n += (USE_TIED_EMBEDDINGS ? 1 : 3) - (USE_GATED_RESIDUAL ? 1 : 0);
     n += (NGRAM_EMBED ? NGRAM_NUM_EMBEDDERS + 1 : 0);
     // Gated Residual's model-level exit collapse (docs/GATED_RESIDUAL.md S1c/S3b): ONE more instance,
     // WITHOUT GrBlockInject (use_combine=False in the real model -- see make_param_layout()'s own
@@ -1245,7 +1259,21 @@ consteval std::array<ParamDesc, NUM_PARAMS> make_param_layout() {
         add(WIDE,       HC_LOWRANK, PKind::GrMixDown, true,  false);
         add(HC_LOWRANK, WIDE,       PKind::GrMixUp,   true,  false);
     }
-    add(1,       D_MODEL, PKind::LnF,    false, false);
+    // LnF exists ONLY when Gated Residual is off. The real Qwen4ExpTextModel has no `norm` module
+    // between the GR exit collapse and lm_head -- checked against the real checkpoint from BOTH sides
+    // and found absent in both: the GGUF file has no `output_norm.weight` under that or any other name
+    // (WP4c's own tensor census), and the real model.safetensors.index.json's only non-per-layer
+    // language-model norm is `model.language_model.hyper_connection_mixer.hc_norm.weight` -- which is
+    // the GR EXIT instance's own hc_norm, already a real PARAM_LAYOUT entry (GrHcNorm) emitted just
+    // above. So the exit collapse's grouped hc_norm IS this model's final normalization, and the
+    // collapsed mixed_input feeds lm_head un-normed again.
+    //
+    // Exactly blocker D's precedent, one level up: shape-changing (PARAM_FLOATS drops by D_MODEL and
+    // NUM_PARAMS by 1, so PARAM_FLOATS discriminates it -- no ARCH_FINGERPRINT2 bit needed), and it
+    // fires only under GR, which no non-Qwen4 build enables. It is a CORRECTNESS requirement, not
+    // tidiness: an identity GAIN is not an identity OPERATION -- RMSNorm still divides by the row's
+    // RMS, which WP4d measured as a ~27%-of-scale perturbation of the real model's own logits.
+    if constexpr (!USE_GATED_RESIDUAL) add(1, D_MODEL, PKind::LnF, false, false);
     if constexpr (!USE_TIED_EMBEDDINGS) {
         add(D_MODEL, VOCAB,   PKind::LmHead, true,  false);  // head stays full precision
         add(1,       VOCAB,   PKind::LmBias, false, false);

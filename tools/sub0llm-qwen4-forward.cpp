@@ -13,15 +13,15 @@
 // WHAT IT CHECKS, in order, each printed with its actual number rather than a pass/fail:
 //   1. load_model() accepts the artifact -- header fields, PARAM_FLOATS, and both architecture
 //      fingerprint trailers. Nothing had ever fed this file to the engine's own reader before.
-//   2. The two SYNTHESIZED destinations are what the transplant said they were: LnF all-1.0, LmBias
-//      all-0.0 (docs/WP4_SCOPE.md WP4c finding 3). Checked against the bytes that actually loaded.
+//   2. The tail is what the corrected layout says: NO LnF slot at all (the real model has no final
+//      norm), and one synthesized destination, LmBias all-0.0. Checked against the bytes that loaded.
 //   3. Model::forward on real tokens: finite, and its per-layer-free summary statistics.
 //   4. forward vs forward_one parity at the real dims -- the check docs/WP4_SCOPE.md S6 names as having
 //      caught a real bug in every one of WP1-3.
-//   5. The LnF question, answered with numbers rather than in the abstract: how much the final
-//      op_rmsnorm(ln_f) -- which the real model does NOT have, and which was synthesized to the RMSNorm
-//      identity GAIN even though RMSNorm itself is not an identity -- moves the logits, and how much
-//      op_rmsnorm's eps (1e-5 here, 1e-6 in every real Qwen4ExpTextRMSNorm) moves them.
+//   5. The LnF question, now RESOLVED rather than open: that lm_head really does read the GR exit
+//      collapse's output un-normed (an independent double-precision readout must reproduce the engine's
+//      own logits), plus the size of what the removed op_rmsnorm(ln_f) had been costing -- the same
+//      measurement WP4d made when the site still existed, kept so the fix has a before/after number.
 //   6. Peak working set, because docs/QWEN4_MEMORY_ORCHESTRATION.md's budget is a prediction until
 //      something measures it.
 //
@@ -135,16 +135,19 @@ int main(int argc, char** argv) {
 
     const float* P = params_ptr();
 
-    std::println("\n--- 2. the two synthesized destinations ---------------------------------");
+    std::println("\n--- 2. the tail: no LnF slot, one synthesized destination ----------------");
+    // LnF is GONE from the layout (the real model has no final norm -- the GR exit collapse's own
+    // hc_norm is it), so the only synthesized destination left is LmBias. Asserted as an ABSENCE here,
+    // not merely omitted, because "the slot quietly came back" is exactly what this check is for.
     const ParamDesc* lnf = find_kind(PKind::LnF);
     const ParamDesc* lmh = find_kind(PKind::LmHead);
     const ParamDesc* lmb = find_kind(PKind::LmBias);
-    if (!lnf || !lmh || !lmb) { std::println(stderr, "FAIL: LnF/LmHead/LmBias missing from PARAM_LAYOUT"); return 3; }
+    if (lnf) { std::println(stderr, "FAIL: PARAM_LAYOUT still carries an LnF tensor under GR"); return 3; }
+    if (!lmh || !lmb) { std::println(stderr, "FAIL: LmHead/LmBias missing from PARAM_LAYOUT"); return 3; }
     {
-        const Stats a = stats_of(P + lnf->off, lnf->n());
         const Stats b = stats_of(P + lmb->off, lmb->n());
-        std::println("LnF    [{}x{}]: min {:.9g} max {:.9g}  (transplant synthesized 1.0 -- the RMSNorm "
-                     "identity GAIN)", lnf->rows, lnf->cols, a.min, a.max);
+        std::println("LnF: ABSENT from PARAM_LAYOUT, as the real model is (no output_norm.weight in the "
+                     "GGUF, and the safetensors index's only model-level norm is the GR exit's hc_norm)");
         std::println("LmBias [{}x{}]: min {:.9g} max {:.9g}  (transplant synthesized 0.0)",
                      lmb->rows, lmb->cols, b.min, b.max);
     }
@@ -331,52 +334,56 @@ int main(int argc, char** argv) {
                  max_abs, worst_t, worst_v, max_rel);
     report_memory("after forward_one");
 
-    std::println("\n--- 5. the LnF / eps question, measured ---------------------------------");
-    // hidden_last is the GR EXIT-COLLAPSED, pre-ln_f representation at the final position (that is what
-    // last_hidden_ptr captures under USE_GATED_RESIDUAL -- backend_cpu.cpp's forward_one). The real
-    // model has NO tensor at this site at all (WP4c finding 3: no output_norm.weight under any name),
-    // so the question is not "is the gain right" but "does applying an RMSNorm here at all change the
-    // answer". Three readouts off the SAME hidden state, differing only in that step.
+    std::println("\n--- 5. the readout is un-normed, and what the removed LnF was costing ----");
+    // hidden_last is the GR EXIT-COLLAPSED representation at the final position -- and, since the LnF
+    // removal, it is EXACTLY what lm_head reads (backend_cpu.cpp's forward_one no longer calls
+    // rmsnorm_row under USE_GATED_RESIDUAL). Two claims are checked here with numbers:
+    //   (a) the engine really is un-normed now: recomputing lm_head(hidden_last) + bias in double
+    //       reproduces forward_one's own logits row to float-rounding, which it cannot do if any
+    //       normalization still sits between them;
+    //   (b) how much the removed op_rmsnorm(h, ln_f) WAS moving the answer -- computed against the
+    //       exact gain the old artifact carried (synthesized 1.0), so this is the size of the bug that
+    //       was fixed, not a hypothetical.
     const Stats hs = stats_of(hidden_last.data(), D_MODEL);
-    std::println("pre-ln_f hidden (last position): rms {:.6f} mean {:+.6f} [{:+.4f}, {:+.4f}]",
-                 hs.rms, hs.mean, hs.min, hs.max);
+    std::println("final hidden (last position, what lm_head reads): rms {:.6f} mean {:+.6f} "
+                 "[{:+.4f}, {:+.4f}]", hs.rms, hs.mean, hs.min, hs.max);
     {
         double ms = 0.0;
         for (int j = 0; j < D_MODEL; ++j) ms += static_cast<double>(hidden_last[j]) * hidden_last[j];
         ms /= D_MODEL;
         const double r5 = 1.0 / std::sqrt(ms + 1e-5), r6 = 1.0 / std::sqrt(ms + 1e-6);
-        std::println("mean-square {:.9g}; 1/sqrt(ms+eps): eps=1e-5 -> {:.9g}, eps=1e-6 -> {:.9g} "
-                     "(relative gap {:.3g})", ms, r5, r6, std::abs(r5 - r6) / r5);
-        // Readouts: y = h * r * G (the engine's ln_f), y = h * r6 * G (the real eps), and y = h (no norm
-        // at all -- the real model's actual structure). One lm_head GEMM each.
-        const float* G  = P + lnf->off;
+        std::println("mean-square {:.9g}; the RMSNorm this site no longer applies would have scaled by "
+                     "{:.9g} (eps 1e-5) / {:.9g} (eps 1e-6)", ms, r5, r6);
         const float* Wh = P + lmh->off;         // [D_MODEL, VOCAB], rows=in
         const float* B  = P + lmb->off;
-        std::vector<double> a5(D_MODEL), a6(D_MODEL), an(D_MODEL);
-        for (int j = 0; j < D_MODEL; ++j) {
-            a5[j] = hidden_last[j] * r5 * G[j];
-            a6[j] = hidden_last[j] * r6 * G[j];
-            an[j] = hidden_last[j];
-        }
+        // ln = the real structure (no final norm, gain-free); l5 = what the pre-fix build computed
+        // (RMSNorm at eps 1e-5 with the synthesized identity gain 1.0); l6 = same at the real eps.
         std::vector<double> l5(VOCAB, 0.0), l6(VOCAB, 0.0), ln(VOCAB, 0.0);
         for (int j = 0; j < D_MODEL; ++j) {
             const float* row = Wh + static_cast<std::size_t>(j) * VOCAB;
-            const double x5 = a5[j], x6 = a6[j], xn = an[j];
+            const double xn = hidden_last[j], x5 = xn * r5, x6 = xn * r6;
             for (int v = 0; v < VOCAB; ++v) { l5[v] += x5 * row[v]; l6[v] += x6 * row[v]; ln[v] += xn * row[v]; }
         }
         for (int v = 0; v < VOCAB; ++v) { l5[v] += B[v]; l6[v] += B[v]; ln[v] += B[v]; }
-        double d56 = 0.0, d5n = 0.0;
+        double d56 = 0.0, d5n = 0.0, dnn = 0.0, lrms = 0.0;
+        // forward()'s own logits for the SAME (last) position -- the engine's answer to compare against.
+        const float* eng = batched.data() + static_cast<std::size_t>(T - 1) * VOCAB;
         for (int v = 0; v < VOCAB; ++v) {
             d56 = std::max(d56, std::abs(l5[v] - l6[v]));
             d5n = std::max(d5n, std::abs(l5[v] - ln[v]));
+            dnn = std::max(dnn, std::abs(ln[v] - static_cast<double>(eng[v])));
+            lrms += ln[v] * ln[v];
         }
+        lrms = std::sqrt(lrms / VOCAB);
         const auto arg = [](const std::vector<double>& l) {
             return static_cast<int>(std::distance(l.begin(), std::max_element(l.begin(), l.end())));
         };
-        std::println("logits max|eps1e-5 - eps1e-6| = {:.6g}   (argmax {} vs {})", d56, arg(l5), arg(l6));
-        std::println("logits max|with ln_f - WITHOUT any final norm| = {:.6g}   (argmax {} vs {})",
-                     d5n, arg(l5), arg(ln));
-        std::println("cross-check: this row's forward_one argmax was {}", arg(l5));
+        std::println("(a) max |independent un-normed readout - engine logits| = {:.6g}  (argmax {} vs "
+                     "engine's own)", dnn, arg(ln));
+        std::println("(b) max |WITH the removed ln_f - without it| = {:.6g}  against a logit rms of "
+                     "{:.6g}  ({:.1f}% of scale; argmax {} vs {})",
+                     d5n, lrms, 100.0 * d5n / (lrms > 0 ? lrms : 1.0), arg(l5), arg(ln));
+        std::println("    and the eps question that removal made moot: max|1e-5 - 1e-6| = {:.6g}", d56);
     }
 
     std::println("\n--- peak resource use ---------------------------------------------------");

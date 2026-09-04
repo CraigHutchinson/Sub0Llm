@@ -13,8 +13,11 @@
 // qwen4_real_shape_tests.cpp's own census applies to the 48-layer totals.
 //
 // WHY THE PREFIX ENDS WHERE IT DOES. make_param_layout() emits, in order: tok_emb, then every layer,
-// then the model-level Gated Residual exit collapse (3 tensors, no block_inject), then ln_f + lm_head +
-// lm_bias. So the first SUB4_PREFIX_TENSORS entries of ANY build at these axes with N_LAYERS >= 4 are
+// then the model-level Gated Residual exit collapse (3 tensors, no block_inject), then lm_head +
+// lm_bias. (There is NO ln_f: the real Qwen4ExpTextModel has no final norm -- the exit collapse's own
+// hc_norm is it -- so the layout emits none under USE_GATED_RESIDUAL. That removal is what changed
+// PARAM_FLOATS/NUM_PARAMS below by exactly D_MODEL floats and one tensor.)
+// So the first SUB4_PREFIX_TENSORS entries of ANY build at these axes with N_LAYERS >= 4 are
 // exactly "tok_emb plus layers 0..3" -- the tail is what differs. Asserting that PARAM_LAYOUT[
 // SUB4_PREFIX_TENSORS].off is the same float offset in a 4-layer build and a 48-layer build is
 // therefore exactly the claim "the sub-stack is shape-identical to the real model's first four layers".
@@ -42,15 +45,18 @@ inline constexpr int PREFIX_TENSORS = 1 + 3 * 1558 + 1559;          // 6,234
 inline constexpr std::size_t PREFIX_FLOATS =
     635'699'200ull + 3ull * 2'593'979'104ull + 2'587'467'008ull;    // 11,005,103,520
 
-// What a 4-layer build's OWN totals must be: the prefix plus the tail (3 GR-exit tensors + ln_f +
-// lm_head + lm_bias), which does not depend on N_LAYERS at all.
+// What a 4-layer build's OWN totals must be: the prefix plus the tail (3 GR-exit tensors + lm_head +
+// lm_bias), which does not depend on N_LAYERS at all.
 //   gr_top  = 10240 + 2*10240*320                                          =      6,563,840
-//   ln_f + lm_head + lm_bias = 2560 + 2560*248320 + 248320                 =    635,950,080
-inline constexpr int         NUM_PARAMS   = PREFIX_TENSORS + 6;                   // 6,240
-inline constexpr std::size_t PARAM_FLOATS = PREFIX_FLOATS + 6'563'840ull + 635'950'080ull;
-                                                                                   // 11,647,617,440
+//   lm_head + lm_bias = 2560*248320 + 248320                               =    635,947,520
+// Was 6,240 tensors / 11,647,617,440 floats while an LnF slot still existed. Removing it drops both by
+// exactly one tensor and D_MODEL = 2,560 floats -- nothing else moved, which is the check that the
+// removal is the whole of the change.
+inline constexpr int         NUM_PARAMS   = PREFIX_TENSORS + 5;                   // 6,239
+inline constexpr std::size_t PARAM_FLOATS = PREFIX_FLOATS + 6'563'840ull + 635'947'520ull;
+                                                                                   // 11,647,614,880
 // The destination artifact's size, stated once so the tool and any reader agree on it: f32 throughout,
 // which is this project's only parameter precision (core.hpp).
-inline constexpr std::size_t PARAM_BYTES = PARAM_FLOATS * 4;        // 46,590,469,760 == 43.4 GiB
+inline constexpr std::size_t PARAM_BYTES = PARAM_FLOATS * 4;        // 46,590,459,520 == 43.4 GiB
 
 }  // namespace sub0::qwen4_sub4

@@ -196,11 +196,40 @@ literally duplicated, not zero-padded or independently initialized) to seed all 
 identically at layer 0. **Exit**: after every decoder layer, ONE MORE `GatedResidual` instance
 (`use_combine=False`, so `block_inject_weight` is `None` and `forward()` returns just `mixed_input`, per
 §1a's `if self.block_inject_weight is None: return mixed_input` branch) collapses the wide stream back
-down to `[hidden_size]` before the final norm/LM head (not shown above, but structurally the next step in
-any decoder stack).
+down to `[hidden_size]` before the LM head.
 
 Total real instances per model: `2 * num_hidden_layers + 1` (two per layer, one at the very end) — each an
 independent set of `hc_norm`/`down`/`up`[/`block_inject`] tensors.
+
+> **CORRECTION (2026-09-04) — there is NO final norm after the exit collapse, and this section used to
+> imply otherwise.** The paragraph above originally read "...back down to `[hidden_size]` before the
+> final norm/LM head (not shown above, but structurally the next step in any decoder stack)", and the
+> §2 note below stated outright that `LnF`'s "real counterpart `Qwen4ExpTextModel.norm` is also `1e-6`".
+> **That claim was never checked against the real model and is wrong.** What it actually was: an
+> inference from "structurally the next step in any decoder stack" — i.e. from what other decoder stacks
+> do — presented as if it were a fact read out of this one. Exactly the failure mode `AGENTS.md` §5
+> exists to prevent, and the same shape as the `Ln1`/`Ln2` assumption blocker D had to undo.
+>
+> Checked now, against the real checkpoint from two independent directions, both of which agree:
+>
+> - **GGUF** (`UD-IQ1_S`, WP4c's own full tensor census): there is no `output_norm.weight` under that or
+>   any other name. The ONLY non-`blk.` tensors in the whole 1,224-tensor set are `output.weight`,
+>   `output_hc_{down,norm,up}.weight`, `per_layer_token_embd.weight` and `token_embd.weight`.
+> - **safetensors** (`model.safetensors.index.json`, fetched directly from
+>   `huggingface.co/Qwen/Qwen3.8-Flash-Next`, 170,726 bytes, searched for every "norm"-bearing tensor
+>   name that is not per-layer): the only model-level language-model norm is
+>   `model.language_model.hyper_connection_mixer.hc_norm.weight`.
+>
+> That last name is the answer, not a near-miss: it is **this section's own exit instance's `hc_norm`** —
+> the `use_combine=False` `Qwen4ExpTextGatedResidual` built in `Qwen4ExpTextModel.__init__`, already a
+> real `PARAM_LAYOUT` entry here (`GrHcNorm`) and already correctly transplanted by WP4c. So **the GR
+> exit's own grouped `hc_norm` (at the real `rms_norm_eps = 1e-6`) IS this model's final normalization**,
+> applied to the wide stream on the way into the collapse, and the collapsed `mixed_input` feeds
+> `lm_head` un-normed again. A separate `LnF` tensor/op does not exist in the real model at all.
+>
+> `make_param_layout()` therefore emits no `LnF` under `USE_GATED_RESIDUAL`, and `Model::forward` /
+> `forward_one` feed `lm_head` straight from the exit instance's `mixed_input` — see the §2 note below
+> for the measured cost of having got this wrong.
 
 ## 2. How 4 parallel residual streams fit this engine's current single-residual `Node` graph
 
@@ -256,12 +285,32 @@ happens to be false.
 > `hc_norm` uses the real `rms_norm_eps = 1e-6`, whereas the `op_rmsnorm` it used to route through
 > hardcodes `1e-5`.
 >
-> **Still open, deliberately out of blocker D's scope**: `op_rmsnorm`'s `1e-5` remains for `LnF` (the
-> model-level final norm, whose real counterpart `Qwen4ExpTextModel.norm` is also `1e-6`) and
-> `op_qknorm`/`qknorm_row` likewise. Those are shared, always-present ops serving non-GR builds too, so
-> changing their eps is its own scoped change with its own neutral-identity gate — not something to fold
-> silently into this one. It is recorded here so WP4d's real-run parity work does not rediscover it as a
-> surprise.
+> ~~**Still open, deliberately out of blocker D's scope**: `op_rmsnorm`'s `1e-5` remains for `LnF` (the
+> model-level final norm, whose real counterpart `Qwen4ExpTextModel.norm` is also `1e-6`)...~~
+>
+> **RESOLVED 2026-09-04, and the parenthetical above was factually wrong — see §1c's correction.**
+> There is no `Qwen4ExpTextModel.norm` in the real checkpoint, at `1e-6` or at any eps: the model applies
+> no separate RMSNorm after the GR exit collapse at all. So `LnF` is now removed under
+> `USE_GATED_RESIDUAL` the same way `Ln1`/`Ln2` were, for the same reason, in the same file — and the
+> eps question at that site evaporates with it rather than being answered.
+>
+> **This was a correctness bug, not a tidiness one, and it is measured.** WP4c synthesized the missing
+> tensor to `1.0`, the RMSNorm identity GAIN — but an identity gain is not an identity OPERATION:
+> RMSNorm still divides by the row's own RMS. WP4d then measured, on the real weights, that the engine
+> was therefore normalizing a second time where the real model normalizes once, moving the final logits
+> by **0.174 against a logit rms of 0.605 — ~28.8% of scale** (and by 4.90 at the first position, whose
+> pre-collapse RMS is furthest from 1). Removing the site removes exactly that perturbation; the run
+> after the fix reproduces the same 0.174 as the size of what was removed.
+>
+> `gr_param_delta()` gains a further `- d_model`, once, at the model level (on top of blocker D's
+> `- 2*d_model` per layer). Still strictly positive at every legal setting, so `PARAM_FLOATS` alone
+> still discriminates GR-on from GR-off and no fingerprint bit is needed.
+>
+> **Genuinely still open, and narrowed by this**: `op_rmsnorm`/`op_qknorm`'s `1e-5` vs the real `1e-6`.
+> `LnF` was the LAST site a GR build could reach either op through (WP4d verified that by reading the
+> real-axes forward path), so under `USE_GATED_RESIDUAL` the discrepancy is now unreachable. It remains
+> a real, unaddressed difference for any non-GR build, where those are shared always-present ops and
+> changing their eps is its own scoped change with its own neutral-identity gate.
 
 **A deliberate, documented simplification vs. the real model, made for this stage's own scope reasons**:
 per §1a's finding that the real model has NO separate `ln1`/`ln2` (GR's own `hc_norm` replaces them

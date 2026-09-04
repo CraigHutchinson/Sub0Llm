@@ -67,8 +67,11 @@ namespace sub0::transplant {
 // instances with three different GGUF prefixes (`hc_attn_*` / `hc_ffn_*` / `output_hc_*`) -- and the
 // exit instance genuinely has no inject tensor (docs/GATED_RESIDUAL.md S1c: use_combine=False), which
 // is why GrExit* is three and not four.
+// There is deliberately NO LnF enumerator: the real model has no final norm, and since the engine's
+// own layout stopped emitting one under USE_GATED_RESIDUAL there is no destination to fill either.
+// See the Synthetic note below for the full finding.
 enum class Dest {
-    TokEmb, LnF, LmHead, LmBias,
+    TokEmb, LmHead, LmBias,
     GdnInProjQkv, GdnInProjZ, GdnInProjB, GdnInProjA, GdnConv, GdnALog, GdnDtBias, GdnNorm, GdnOutProj,
     GrAttnNorm, GrAttnDown, GrAttnUp, GrAttnInject,
     GrFfnNorm,  GrFfnDown,  GrFfnUp,  GrFfnInject,
@@ -104,22 +107,27 @@ struct Recipe {
 // granularity and the Gated Residual exit instance wrong, and did not know the real file has no final
 // norm at all; see this header's own notes and the two Synthetic entries below).
 //
-// The two Synthetic entries are a REAL finding, recorded rather than papered over:
+// The ONE Synthetic entry, and the one that USED to be here, are a REAL finding, recorded rather than
+// papered over:
 //   * `output_norm.weight` DOES NOT EXIST in the real file. Not under that name, not under any other:
 //     the only non-`blk.` tensors in the whole 1,224-tensor set are output.weight, output_hc_{down,
-//     norm,up}.weight, per_layer_token_embd.weight and token_embd.weight. That is architecturally
-//     coherent -- the same reason WP4b blocker D removed Ln1/Ln2, namely that the Gated Residual
-//     instance's own hc_norm IS the norm at that point -- but docs/WP4_SCOPE.md S2 blocker D assumed a
-//     real LnF counterpart existed, and it does not. LnF is filled with 1.0, the RMSNorm identity
-//     gain, so the tensor this engine's layout insists on is at least a no-op rather than a zero.
+//     norm,up}.weight, per_layer_token_embd.weight and token_embd.weight. The safetensors side agrees
+//     independently: `model.safetensors.index.json`'s only non-per-layer language-model norm is
+//     `model.language_model.hyper_connection_mixer.hc_norm.weight`, i.e. the Gated Residual EXIT
+//     instance's own hc_norm -- already a real destination here (GrExitNorm). That is architecturally
+//     coherent, and it is the same reason WP4b blocker D removed Ln1/Ln2.
+//     WP4c synthesized `LnF` to 1.0 because the engine's layout still insisted on the slot. WP4d then
+//     measured what that costs: an identity GAIN is not an identity OPERATION, and the extra RMS
+//     division moved the real logits by ~27% of their scale. The slot is now GONE from
+//     make_param_layout() under USE_GATED_RESIDUAL, so there is nothing left to synthesize -- hence no
+//     Dest::LnF at all, rather than a Synthetic recipe nothing consumes.
 //   * `LmBias` likewise has no source (the real head is bias-free, `attention_bias: false` and no
 //     `output.bias` in the file). Filled with 0.0, the additive identity.
-// Both are reported by name in the tool's own level-1 reconciliation, so "2 destinations synthesized"
-// is a number the operator sees, not a silent default.
+// It is reported by name in the tool's own level-1 reconciliation, so "1 destination synthesized" is a
+// number the operator sees, not a silent default.
 constexpr Recipe recipe_for(Dest d) {
     switch (d) {
         case Dest::TokEmb:      return {Op::Copy,      "token_embd.weight"};
-        case Dest::LnF:         return {Op::Synthetic, nullptr, nullptr, 0, 1.0f};
         case Dest::LmHead:      return {Op::Transpose, "output.weight"};
         case Dest::LmBias:      return {Op::Synthetic, nullptr, nullptr, 0, 0.0f};
 

@@ -1880,7 +1880,11 @@ struct Model {
             gr_top_down = mk_param(HC_WIDE, HC_LOWRANK, true);
             gr_top_up   = mk_param(HC_LOWRANK, HC_WIDE, true);
         }
-        ln_f = mk_param(1, D_MODEL, false);
+        // No LnF under Gated Residual: the real Qwen4ExpTextModel has no separate final RMSNorm -- the
+        // GR exit collapse's own grouped hc_norm IS it (docs/GATED_RESIDUAL.md S1c). MUST match
+        // make_param_layout(), which stops emitting the tensor under the same condition.
+        if constexpr (!USE_GATED_RESIDUAL) ln_f = mk_param(1, D_MODEL, false);
+        else                               ln_f = nullptr;
         if constexpr (!USE_TIED_EMBEDDINGS) {
             lm_head = mk_param(D_MODEL, VOCAB, true);
             lm_bias = mk_param(1, VOCAB, false);
@@ -1978,7 +1982,7 @@ struct Model {
         // Gated Residual's model-level exit collapse -- same init convention as the per-layer instances
         // above (GrHcNorm left at the arena's own zero, down/up randn(0.02)).
         if constexpr (USE_GATED_RESIDUAL) { randn(gr_top_down, 0.02f); randn(gr_top_up, 0.02f); }
-        ones(ln_f);
+        if constexpr (!USE_GATED_RESIDUAL) ones(ln_f);   // absent under GR (see build_layout)
         if constexpr (!USE_TIED_EMBEDDINGS) randn(lm_head, 0.02f);
         if constexpr (NGRAM_EMBED) {
             for (int e = 0; e < NGRAM_NUM_EMBEDDERS; ++e) randn(ngram_tab[static_cast<std::size_t>(e)], 0.02f);
@@ -2219,8 +2223,13 @@ struct Model {
         // Gated Residual's model-level EXIT collapse (docs/GATED_RESIDUAL.md S1c): use_combine=False,
         // so just op_gr_mix -- no gate/combine call, mirroring the real model's own use_combine=False
         // branch exactly (block_inject_weight genuinely does not exist for this instance).
+        // ...and that collapse's own output goes STRAIGHT to the head: the real model applies no final
+        // RMSNorm after it (no `Qwen4ExpTextModel.norm` exists -- confirmed absent from the real GGUF
+        // and from the real safetensors index, whose only model-level norm is the exit instance's own
+        // hc_norm). Feeding op_rmsnorm(h, ln_f) here normalized a second time, which WP4d measured as a
+        // ~27%-of-scale shift in the real model's logits -- the LnF counterpart of blocker D's Ln1/Ln2.
         if constexpr (USE_GATED_RESIDUAL) h = op_gr_mix(h, gr_top_norm, gr_top_down, gr_top_up);
-        h = op_rmsnorm(h, ln_f);
+        else                              h = op_rmsnorm(h, ln_f);
         if constexpr (USE_TIED_EMBEDDINGS) return op_tied_head(h, tok_emb);
         else                               return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
     }
@@ -2566,7 +2575,10 @@ struct Model {
             gr::hc_norm(GR_DIMS, 1, h, gr_top_norm->data.data(), gr_normed);
             gr::mix(GR_DIMS, 1, gr_normed, gr_top_down->data.data(), gr_top_up->data.data(), gr_mixed, gr_mixscr);
             for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = gr_mixed[j];
-            rmsnorm_row(gr_mixed, ln_f, a, C);
+            // No final norm under GR -- the exit collapse's own hc_norm is it, so mixed_input feeds the
+            // head directly. Mirrors forward()'s own branch exactly (the forward-vs-forward_one parity
+            // check is what gates that the two stay mirrored).
+            for (int j = 0; j < C; ++j) a[j] = gr_mixed[j];
         } else {
             for (int j = 0; j < C; ++j) last_hidden[static_cast<std::size_t>(j)] = h[j];   // diagnostic capture
             rmsnorm_row(h, ln_f, a, C);

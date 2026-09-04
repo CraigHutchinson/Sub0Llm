@@ -29,7 +29,14 @@ namespace {
 // The real model's own parameter total, from docs/QWEN4_MEMORY_ORCHESTRATION.md S2f/S2a (which derives
 // it from the real checkpoint's shard headers, not from the published "125B" round number). NOT the
 // 124,027,786,776 the engine produced BEFORE the blockers -- closing that gap is the point.
-constexpr std::size_t kRealParamFloats = 125'711'064'960ull;
+//
+// CORRECTED 2026-09-04, by exactly one tensor: S2f(v2)'s own reconciliation carries a `ln_f = 2,560`
+// line, and that tensor does not exist in the real checkpoint. Neither the GGUF file (no
+// `output_norm.weight` under any name -- WP4c's census) nor `model.safetensors.index.json` (whose only
+// non-per-layer language-model norm is `...hyper_connection_mixer.hc_norm.weight`, i.e. the GR EXIT
+// instance's own hc_norm, already counted as a GrHcNorm below) has a separate final norm. So the real
+// total is 125,711,064,960 - 2,560. The engine now emits no LnF under Gated Residual and lands on it.
+constexpr std::size_t kRealParamFloats = 125'711'064'960ull - 2'560ull;   // 125,711,062,400
 
 // The tensor count make_param_layout() emits at these axes. Derived here by hand from the real
 // architecture rather than pasted from the compiler, so a future change that moves it has to be
@@ -41,12 +48,14 @@ constexpr std::size_t kRealParamFloats = 125'711'064'960ull;
 //   MoE per layer = router + 512*(gate,up,down) + shared triple + shared gate = 1 + 1536 + 3 + 1 = 1541
 //   NO Ln1/Ln2 anywhere (WP4b blocker D -- the real decoder layer has neither)
 //   model-level GR exit collapse (no block_inject)                      3
-//   ln_f + lm_head + lm_bias (untied)                                   3
+//   NO ln_f either (the real Qwen4ExpTextModel has no final norm -- the exit collapse's own hc_norm,
+//     already counted in the 3 just above, IS it)
+//   lm_head + lm_bias (untied)                                          2
 constexpr int kMoePerLayer  = 1 + 3 * NUM_EXPERTS + 3 + 1;                    // 1541
 constexpr int kGdnLayer     = 4 + 9  + 4 + kMoePerLayer;                      // 1558
 constexpr int kQsaLayer     = 4 + 10 + 4 + kMoePerLayer;                      // 1559
 constexpr int kGdnLayers    = 36, kQsaLayers = 12;
-constexpr int kExpectedNumParams = 1 + kGdnLayers * kGdnLayer + kQsaLayers * kQsaLayer + 3 + 3;
+constexpr int kExpectedNumParams = 1 + kGdnLayers * kGdnLayer + kQsaLayers * kQsaLayer + 3 + 2;
 
 }  // namespace
 
@@ -91,6 +100,13 @@ consteval int count_kind(sub0::PKind k) {
 static_assert(count_kind(sub0::PKind::Ln1) == 0);
 static_assert(count_kind(sub0::PKind::Ln2) == 0);
 static_assert(sub0::USE_GATED_RESIDUAL);
+// ...and no LnF either, for the same reason one level up: the real Qwen4ExpTextModel applies no
+// separate RMSNorm after the GR exit collapse. Checked against the real checkpoint from both sides --
+// the GGUF has no `output_norm.weight` under any name, and the safetensors index's only non-per-layer
+// language-model norm is `...hyper_connection_mixer.hc_norm.weight`, which is the exit instance's OWN
+// hc_norm (one of the 2*N_LAYERS + 1 GrHcNorm entries asserted below), not a separate tensor.
+static_assert(count_kind(sub0::PKind::LnF) == 0,
+              "the real model has no final norm -- the GR exit instance's hc_norm is it");
 
 // --- Per-mechanism tensor census, so a total mismatch localizes ----------------------------------
 // 36 GDN layers x 9 tensors; 12 QSA layers x 10 (7 attention + 3 indexer); 512 routed experts x 3 per
@@ -146,7 +162,8 @@ constexpr long long total =
     + 48 * (2 * gr_with_inject + moe_layer) // two GR instances + the MoE block, every layer
     + 36 * gdn_layer + 12 * qsa_layer       // the 3-GDN-then-1-QSA repeating unit, 48 layers
     + gr_top                                // the model-level exit collapse (use_combine=False)
-    + 2560 + 2560LL * 248320 + 248320;      // ln_f + lm_head + lm_bias (untied)
+    + 2560LL * 248320 + 248320;             // lm_head + lm_bias (untied) -- NO ln_f term: the real
+                                            // model has no final norm at all (see count_kind above)
 
 // The per-mechanism subtotals, checked against S2h's own table before the grand total is trusted.
 static_assert(48 * 2 * gr_with_inject + gr_top == 640'624'640LL, "GR, per S2h's table");
