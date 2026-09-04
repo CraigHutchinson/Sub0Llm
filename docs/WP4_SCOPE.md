@@ -897,6 +897,124 @@ this exact bitwise comparison). This is checkable at the SAME 4-layer scale WP4d
 500GB number only bites at full 48-layer scale, so WP4e's own correctness gate does not need to attempt
 that scale to be meaningful.
 
+#### WP4e — EXECUTED (branch `feature/wp4e-dequant-on-demand`). Results, recorded rather than summarised
+
+**The gate passes exactly.** `forward()`'s full `[6 x 248320]` logits array, dumped raw from an
+all-f32-resident build and from a quantized-resident one and compared byte for byte:
+
+```
+ffa1f725e0b0fbf4f7ea6054d8d3a3d829816e8af946370be10299f0b98be8e6 *logits_f32.bin
+ffa1f725e0b0fbf4f7ea6054d8d3a3d829816e8af946370be10299f0b98be8e6 *logits_q.bin
+```
+
+1,489,920 float32 values, **0 differing bits**. Both builds also report identical `forward` vs
+`forward_one` parity (**0 exactly**), identical engine-vs-math-core replay (`||h_in||` 2.84e-08,
+`||delta||` 1.7e-08), and identical per-row logit statistics and argmaxes.
+
+**The design, and why it is this one.** The routed experts stay in their **native GGUF bytes**, in a
+separate `S0Q1` sidecar file (`include/sub0/moe_quant.hpp`), and are dequantized per selected expert
+into a small reused pool immediately before `moe::expert_ffn_row` consumes them.
+
+- **A second FILE, not a section of `S0L5`.** `S0L5` is `header + float[PARAM_FLOATS] + three u64
+  trailers`, read by `load_model` into one contiguous arena. A variable-length mixed-format section in
+  the middle of that changes how every existing checkpoint is read — `AGENTS.md` §3's highest-blast-
+  radius category, for no benefit. A separate file with its own magic changes nothing about `S0L5`, and
+  a build that does not use it never opens it. The two are paired by `model_param_floats`, which is the
+  same job `ModelHeader::param_floats` already does for the blob; the path is DERIVED
+  (`<model>.bin.moeq`) rather than a second CLI argument, and `load_model` refuses if it is missing.
+- **Per-tensor `type_raw`, never per-role.** Each `moeq::Desc` carries its own GGML type id, so §3a-bis's
+  per-layer mixed quantization is carried rather than flattened. The run confirms it directly: 2,048
+  `IQ1_S` planes (layers 0/3 gate+up), 2,048 `IQ2_XXS` (layers 1/2 gate+up), 2,048 `IQ4_NL` (down, every
+  layer) — printed by the tool, not assumed.
+- **Bytes copied, never re-encoded.** Re-quantizing would have been a second unvalidated quantizer AND
+  would have changed the values. Because the bytes are the source's, `moeq::dequantize_expert()` runs
+  literally the same `gguf::to_f32` + `transplant::transpose_out_in` the f32 transplant runs, on the
+  same bytes, in the same order — so the bitwise gate above is a *structural* property, not a
+  coincidence. `moe_math.hpp` was refactored so both residency strategies run ONE function
+  (`forward_row_via`, taking a resolver; `forward_row` is now a thin wrapper), for the same reason.
+- **A shape-changing config axis** (`--moe-quant-experts`, `constexpr bool MOE_QUANT_EXPERTS`), so
+  `PARAM_FLOATS` discriminates it and **no `ARCH_FINGERPRINT2` bit is needed** — which matters, since
+  WP4b left that word full. `make_param_layout()` emits no routed-expert tensors when it is on, exactly
+  the move blocker D made for `Ln1`/`Ln2` and the `LnF` fix made for the final norm.
+
+**The measured sizes, for the SAME four layers:**
+
+| | all-f32 (WP4c/d) | quantized-resident | ratio |
+|---|---:|---:|---:|
+| `NUM_PARAMS` | 6,239 | **95** | |
+| `PARAM_FLOATS` | 11,647,614,880 | **1,581,285,280** | |
+| model blob bytes | 46,590,459,592 (43.39 GiB) | **6,325,141,192 (5.89 GiB)** | 7.37x |
+| sidecar bytes | — | **3,408,068,664 (3.17 GiB)** | |
+| **total on disk** | **46,590,459,592 (43.39 GiB)** | **9,733,209,856 (9.06 GiB)** | **4.79x** |
+| the 6,144 routed experts alone | 40,265,318,400 (37.50 GiB) as f32 | **3,407,872,000 (3.17 GiB)** encoded | **11.82x** |
+| peak working set, real forward | 45.29 GiB | **14.32 GiB** | 3.16x |
+| `load_model` | 40.2s | **8.2s** | |
+| `Model::forward` [6 x 248320] | 1.43s | **5.27s** | **3.7x SLOWER** |
+
+**The throughput cost is real and is reported rather than buried** (this project's own three-pillar
+policy). 3.7x on `forward` and 3.5x on the 6-position `forward_one` walk is what dequantizing 10 experts
+per token per layer costs when the alternative is reading f32 that is already resident. It is the right
+trade only because the alternative does not exist at full scale: extrapolated to 48 layers the f32 form
+is ~500 GB, so there is no "faster" configuration to lose to. The resolve pool (8 slots, 150 MiB at
+these axes) exists to claw back the repeats — several of a window's rows routinely select the same
+expert — but its hit rate was NOT instrumented in this pass; see the open items.
+
+**A real defect, found the way every prior WP4 stage's was — by a check built for the purpose.** The
+sidecar writer builds its descriptor table walking `(layer, plane, expert)` but writes the payload in
+descriptor-INDEX order `(layer, expert, plane)`. Assigning a running byte cursor during the build made
+every `Desc::off` point at the position the tensor would have had **in the other order**. The
+consequence would have been every routed expert silently decoding some other expert's bytes — with no
+shape signal, no `NaN`, and a perfectly plausible magnitude, since every plane is the same size and the
+same handful of formats. It was caught immediately by the tool's own bit-for-bit sample check against
+the f32 path: **92 of 96 expert planes mismatched** (the four that agreed are the ones the two orders
+happen to place identically). Offsets are now assigned in one pass over the finished table, in exactly
+the order the bytes are written; **0 of 96** after the fix. `tests/moe_quant_tests.cpp` pins the ordering
+property (`desc_index` is `(layer, expert, plane)`-major and a bijection) as a regression test.
+
+**Gates run:**
+
+- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0_tests` is **hash-identical at all three standard
+  shapes**, with assertion counts unchanged from the recorded post-`LnF` baseline —
+  d96 L8 H2 seq128 `4e00b8a7dadafff8 / 6909ae0b3afc2caa / ab31e5533547f73a`, 17,827,372 assertions;
+  d132 L11 H4 kv2 seq96 `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`, 29,771,944;
+  d196 L11 H7 seq256 `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`, 54,070,194; 147 cases
+  each. So the `moe_math.hpp` refactor and the new layout axis are byte-neutral in every existing build.
+- **`sub0_frontend_tests`**: 116,989 → **117,358** assertions, 216 → **222** cases — exactly
+  `moe_quant_tests.cpp`'s own 369 assertions in 6 cases, and nothing else moved.
+- **The compile-time sub-stack claim, in BOTH residency forms.** `sub4_prefix.hpp` now carries
+  hand-derived quantized-resident totals (`QUANT_NUM_PARAMS` 95, `QUANT_PARAM_FLOATS` 1,581,285,280 —
+  the same prefix minus exactly `4 × 512 × 4,915,200` floats and `4 × 1,536` tensors), and both
+  transplant targets `static_assert` `NUM_PARAMS`/`PARAM_FLOATS`/the layer-3 boundary offset against
+  the form they were built for. Both compile, so the hand derivation and `make_param_layout()` agree.
+- **The four-level transplant gate, re-run for the quantized build**: level 1 — 95/95 destinations,
+  1,581,285,280/1,581,285,280 floats, **1 synthesized** (`LmBias`), **7 unmatched in-scope sources**
+  (every one a deliberately-excluded PLE tensor — unchanged); level 2 — 94 tensors checked, **0
+  mismatches**; plus the new **sidecar bit-for-bit sample check**, 96 expert planes across all 4 layers
+  and all 3 formats, **0 mismatches**. Write took 22.2s (vs 82.0s for the f32 blob — it moves 4.8x fewer
+  bytes and dequantizes 1.6% as many).
+- **Nothing was replaced.** `qwen4_sub4.bin` and `qwen4_sub4.bin.pre-lnf-fix` are both untouched; the
+  new artifacts are `qwen4_sub4_q.bin` + `qwen4_sub4_q.bin.moeq` beside them.
+
+**Deliberately still open, named here so WP4f does not rediscover them:**
+
+- **The sidecar payload is READ into memory, not `mmap`ed.** 3.17 GiB at 4 layers is fine and the file
+  is opened once outside any hot path. At the full 48 layers (~38 GiB encoded) an `mmap` becomes the
+  right call — and only `moeq::Store::open` changes; nothing above its `raw()` accessor can tell.
+- **`print_host_memplan` does not know about the sidecar.** It reports `PARAM_FLOATS` (5.89 GiB) and is
+  called before `load_model`, so the sidecar's 3.17 GiB shows only in `load_model`'s own line. It cannot
+  be a compile-time term — the encoded size depends on which formats the source file used — so closing
+  this means giving that report a runtime input, which is a bigger change than the gap warrants today.
+- **The resolve pool's hit rate is uninstrumented.** `ExpertCache` counts hits and misses; nothing
+  prints them. Worth wiring up before anyone tunes `MOE_RESOLVE_SLOTS` away from 8, which was chosen by
+  argument (correctness needs 1; the rest is cache) rather than by measurement.
+- **`gguf::to_f32` writes through a reused `std::vector`, whose `assign` re-zeroes 1.6M floats per
+  resolve** before the decoder overwrites them. Not an allocation (the vector is reused, so `AGENTS.md`
+  §1 is satisfied) but it is a redundant pass over 6.25 MiB per expert, and it is a plausible slice of
+  the 3.7x above.
+- **CUDA is untouched and still refuses** (`static_assert(!USE_MOE)`), so this axis cannot reach it.
+- **Still no real-dims reference output.** WP4e proves the two RESIDENCY forms agree; it says nothing
+  new about whether either agrees with the real model. That remains WP4f's job, unchanged.
+
 ### WP4f — The llama.cpp comparison harness
 
 **Simplest correctness-first version, and why it is this and not a generation-quality comparison:**
