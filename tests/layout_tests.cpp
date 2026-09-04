@@ -47,12 +47,15 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
     // Ln1/Ln2 (2 slots) exist only when GR is OFF -- WP4b blocker D: the real Qwen4ExpTextDecoderLayer
     // has no input_layernorm / post_attention_layernorm, GR's own hc_norm is the pre-block norm.
     constexpr int kLnSlots    = sub0::USE_GATED_RESIDUAL ? 0 : 2;
+    // ...and the model-level LnF slot likewise exists only when GR is OFF: the real Qwen4ExpTextModel
+    // has no final norm, the GR exit collapse's own hc_norm is it (counted in kGrTop above).
+    constexpr int kLnFSlot    = sub0::USE_GATED_RESIDUAL ? 0 : 1;
     STATIC_REQUIRE(sub0::NUM_PARAMS == 1 + (sub0::HAS_POS_EMB ? 1 : 0)
                                         + N_LAYERS * (kLnSlots + kFfnSlots + kGrPerLayer)
                                         + kAttnLayers * kAttnMixer
                                         + sub0::GDN_SCHEDULE.gdn_layers * kGdnMixer
                                         + kQsaLayers * kQsaMixer
-                                        + (USE_TIED_EMBEDDINGS ? 1 : 3)
+                                        + kLnFSlot + (USE_TIED_EMBEDDINGS ? 0 : 2)
                                         + (sub0::NGRAM_EMBED ? sub0::NGRAM_NUM_EMBEDDERS + 1 : 0)
                                         + kGrTop);
     REQUIRE(sub0::PARAM_LAYOUT.size() == static_cast<std::size_t>(sub0::NUM_PARAMS));
@@ -79,16 +82,33 @@ TEST_CASE("param layout is contiguous and totals PARAM_FLOATS", "[layout]") {
             if (p.kind == sub0::PKind::Ln1 || p.kind == sub0::PKind::Ln2) ++n_ln;
         REQUIRE(n_ln == (sub0::USE_GATED_RESIDUAL ? 0 : 2 * N_LAYERS));
     }
+
+    // The same finding one level up (2026-09-04): under Gated Residual there must be NO LnF either.
+    // The real Qwen4ExpTextModel applies no separate RMSNorm after the GR exit collapse -- confirmed
+    // absent from the real GGUF (no `output_norm.weight` under any name) and from the real safetensors
+    // index (whose only non-per-layer language-model norm is the exit instance's own hc_norm). An
+    // identity GAIN there is not an identity OPERATION: RMSNorm still divides by the row's RMS, which
+    // WP4d measured as a ~27%-of-scale perturbation of the real model's logits.
+    {
+        int n_lnf = 0;
+        for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT)
+            if (p.kind == sub0::PKind::LnF) ++n_lnf;
+        REQUIRE(n_lnf == (sub0::USE_GATED_RESIDUAL ? 0 : 1));
+    }
 }
 
 TEST_CASE("param layout roles, decay and ternary flags are consistent", "[layout]") {
     using sub0::PKind;
     REQUIRE(sub0::PARAM_LAYOUT.front().kind == PKind::TokEmb);   // first tensor
     // Last tensor: n-gram's concat_proj when the feature is on (appended at the very end -- see
-    // layout.hpp's make_param_layout()); else ln_f when tied (no separate head slot -- see
-    // op_tied_head), else lm_bias.
-    const PKind expected_last = sub0::NGRAM_EMBED ? PKind::NgramProj
-                              : (USE_TIED_EMBEDDINGS ? PKind::LnF : PKind::LmBias);
+    // layout.hpp's make_param_layout()); else lm_bias when untied; else, tied, ln_f (no separate head
+    // slot -- see op_tied_head) -- or, when GR is on and there is no ln_f either, the model-level GR
+    // exit collapse's last tensor, GrMixUp.
+    const PKind expected_last =
+        sub0::NGRAM_EMBED       ? PKind::NgramProj
+        : !USE_TIED_EMBEDDINGS  ? PKind::LmBias
+        : sub0::USE_GATED_RESIDUAL ? PKind::GrMixUp
+                                   : PKind::LnF;
     REQUIRE(sub0::PARAM_LAYOUT.back().kind == expected_last);
 
     for (const sub0::ParamDesc& p : sub0::PARAM_LAYOUT) {
@@ -542,12 +562,14 @@ TEST_CASE("Gated Residual PARAM_FLOATS delta is zero when off and strictly posit
     //   per_instance_with_inject = 384 + 2*384*16 + 384*4 = 384 + 12288 + 1536 = 14208
     //   top_instance             = 384 + 12288 = 12672
     //   ln1+ln2 REMOVED per layer (WP4b blocker D)        = 2*96 = 192
-    //   total = 8 * (2*14208 - 192) + 12672 = 8 * 28224 + 12672 = 225792 + 12672 = 238464
-    // Was 240000 before blocker D, i.e. 8*192 = 1536 higher: a GR-on build no longer emits Ln1/Ln2 at
-    // all, because the real Qwen4ExpTextDecoderLayer has neither. Re-derived by hand here rather than
+    //   ln_f    REMOVED once, model level                 = 96
+    //   total = 8 * (2*14208 - 192) + 12672 - 96 = 225792 + 12672 - 96 = 238368
+    // Was 240000 before blocker D and 238464 before the LnF removal: a GR-on build no longer emits
+    // Ln1/Ln2 (the real Qwen4ExpTextDecoderLayer has neither) NOR LnF (the real Qwen4ExpTextModel has
+    // no final norm -- the GR exit collapse's own hc_norm is it). Re-derived by hand here rather than
     // pasted from the compiler, so the number still means something.
-    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
-    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 238464);
+    static_assert(sub0::gr_param_delta(8, 96, 4, 16) == 238368);
+    REQUIRE(sub0::gr_param_delta(8, 96, 4, 16) == 238368);
     // The removal must never outrun the addition -- PARAM_FLOATS is the ONLY thing discriminating a
     // GR-on build from a GR-off one at identical dims (no fingerprint bit), so a delta that could reach
     // zero would make two different architectures load into each other silently. Checked at the
