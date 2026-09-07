@@ -437,6 +437,18 @@ if(WIN32)
 endif()
 set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
+# --- WP4f: the hidden-state comparison tool ---------------------------------
+# The OPPOSITE of sub0llm-qwen4-forward directly above: this one links NO engine and includes NO
+# generated config, so it builds in every configuration of this repo including the default one. That is
+# deliberate -- the engine-linked harness can only be built against a real-axes configure run, and a
+# differ that could only be built there would be unusable for comparing two dumps someone hands you.
+# It is also how docs/WP4_SCOPE.md S6 WP4f point 4 ("acquire llama.cpp as a binary, not a submodule --
+# nothing in src/ should ever link it") stays true: both sides of the comparison are files.
+add_executable(sub0llm-hidden-diff tools/sub0llm-hidden-diff.cpp)
+target_include_directories(sub0llm-hidden-diff PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0llm-hidden-diff PRIVATE CLI11::CLI11)
+set_target_properties(sub0llm-hidden-diff PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+
 # --- Tests ------------------------------------------------------------------
 option(SUB0_BUILD_TESTS "Build the unit test suite" ON)
 if(SUB0_BUILD_TESTS)

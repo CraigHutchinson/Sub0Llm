@@ -1081,6 +1081,217 @@ layer index, which is the actual deliverable of this stage. **"Sub0Llm and llama
 success case; "they disagree at layer K, in mechanism M" is an equally valid and equally valuable
 outcome**, and is what this staging is designed to produce rather than a single unhelpful global mismatch.
 
+#### WP4f — the Sub0Llm SIDE, EXECUTED (branch `feature/wp4f-llamacpp-compare`). Results, recorded rather than summarised
+
+**This section is half of WP4f.** It records the side of the comparison this repo owns — the harness, the
+exchange format, the differ, the gate, and a real dump of real hidden states from the real transplanted
+weights. **It records NO divergence numbers against llama.cpp**, because the llama.cpp oracle is a
+separate track (§7 Q5) and had not produced a dump when this landed. That separation is deliberate and
+is the point of the file-based design below: neither side has to exist for the other to be finished and
+checkable.
+
+##### The canonical input, stated once so both sides can be held to it
+
+```
+tokens = [1543, 88123, 245000, 7, 99999, 156789]        6 positions, 0..5
+```
+
+Fed as **raw ids**, never through a tokenizer (§6 WP4f point 1 — this engine's tokenizer is its own and
+is not Qwen's, so any text-level input would compare two different token sequences). They are the six
+hand-chosen real-vocabulary ids `tests/fixtures/qwen4_preview/ngram_embedding_manifest.json` already
+carries as `test_tokens`, chosen against the real checkpoint's own `unigram_vocab_size = 248,320` —
+which **is** this build's `VOCAB`, confirmed by the configure run below producing exactly 248,320.
+
+**Nothing is prepended. There is no BOS here.** The llama.cpp side must have its own BOS insertion
+DISABLED, or the two sides are off by one position — which would present as a total mismatch at every
+layer and would localize nothing. The dump format carries the token array so the differ **checks** this
+rather than assuming it (see below); with two hand-transcribed id arrays and no shared tokenizer, a
+transcription slip is a live failure mode that looks exactly like a real disagreement.
+
+##### What was built
+
+| Piece | Where | What it is |
+|---|---|---|
+| `sub0::forward_capture` | `include/sub0/core.hpp`, `src/backend_cpu.cpp` | a named-tensor **sink on the real forward loop** — not a second diagnostic copy of it, for the same reason `loop_pass_stats` beside it is not (a separate copy drifts from the loop that actually runs and then measures the wrong thing convincingly). Armed for exactly one call and disarmed after; allocates nothing (per-layer names are formatted into a `thread_local` buffer, `AGENTS.md` §1) |
+| `--dump-hidden <path>` | `tools/sub0llm-qwen4-forward.cpp` | runs `forward_capture` **instead of** `forward`, not in addition to it — it returns the same logits node, so every other check in that harness still measures exactly what a plain `forward()` produced, and no second pass is needed whose agreement with the first would then be an open question |
+| `S0HD` | `include/sub0/hidden_dump.hpp` | the exchange container. Carries the **input token ids** alongside the tensors |
+| `sub0llm-hidden-diff` | `tools/sub0llm-hidden-diff.cpp` | the per-layer divergence table |
+| format tests | `tests/hidden_dump_tests.cpp` | 4 cases / 73 assertions |
+
+**`sub0llm-hidden-diff` links NO engine and includes NO generated config, so it builds in the DEFAULT
+configuration of this repo.** That is not incidental tidiness: the engine-linked harness can only be
+built against a real-axes configure run (§WP4d's own line, plus 43 GiB of weights), and a differ usable
+only there would be useless for comparing two dumps someone hands you. It is also how §6 WP4f point 4
+("acquire llama.cpp as a binary, not a submodule — nothing in `src/` should ever link it") stays true
+without needing to be enforced: **both sides of the comparison are files.**
+
+##### The S0HD format, in full, so a foreign producer can emit it
+
+Little-endian; `f32` is IEEE-754 binary32; **no padding anywhere**, no nesting, sequential records:
+
+```
+offset  0 : char  magic[4] = "S0HD"
+offset  4 : u32   version  = 1
+offset  8 : u32   n_tensors
+offset 12 : u32   n_tokens
+offset 16 : i32   tokens[n_tokens]
+then n_tensors records, back to back:
+            u32   name_len            (bytes, NOT NUL-terminated)
+            u8    name[name_len]
+            u32   rows                (token positions)
+            u32   cols                (feature width)
+            f32   data[rows * cols]   (row-major)
+```
+
+`tests/hidden_dump_tests.cpp` asserts this layout **offset by offset against a hand-written
+expectation**, not by writing and reading back with the same code — a self-consistent writer/reader pair
+proves nothing about what a *second* producer must emit, which is this format's entire purpose
+(`[[independent-reimplementation-catches-identity-swap-bugs]]`, at file-format scale). It also pins that
+`n_tensors` is genuinely back-patched at close, so **a dump whose producer died mid-pass is REJECTED
+rather than read as a valid short one** — the failure mode a multi-second real forward pass actually has.
+
+##### What one dump contains — 32 tensors for the 4-layer sub-stack
+
+Per layer `i` in 0..3: `blk.i.res_in`, `blk.i.attn_in`, `blk.i.attn_out`, `blk.i.attn_res`,
+`blk.i.ffn_in`, `blk.i.ffn_out`, `blk.i.out`; plus model-level `tok_embd`, `gr_tile`, `final_hidden`,
+`logits`.
+
+**Both widths are emitted, deliberately.** The `D_MODEL = 2560`-wide tensors (`attn_in`, `attn_out`,
+`ffn_in`, `ffn_out`, `final_hidden`) are directly comparable to llama.cpp's own per-block tensors with
+no hyper-connection reconciliation at all — these are the ones the comparison should lead with. The
+`HC_COUNT * D_MODEL = 10240`-wide ones (`res_in`, `attn_res`, `out`) are this engine's actual Gated
+Residual stream; they are comparable only if llama.cpp's `qwen4exp` implementation keeps the four
+streams in the same order and layout, which is an open question for whoever builds that side and is
+**not** something the differ should paper over.
+
+##### Where the comparison stops being valid, and why that is a bound, not a caveat
+
+§5 keeps the n-gram/PLE table out of this build. The real model injects it at **decoder layer 1**
+(`ple_layer_ids=[2]`, 0-indexed 1), where `Qwen4ExpTextPLELayer` folds the n-gram contribution into the
+hyper-connection stream (`docs/QWEN4_PREVIEW_REFERENCE.md`'s own fixture description). So:
+
+| Tensors | Status |
+|---|---|
+| `tok_embd`, `gr_tile`, all of `blk.0.*` | **strictly comparable** — the two implementations are computing the same function here |
+| `blk.1.res_in` | equals `blk.0.out` on this side; on the llama.cpp side it may already carry the PLE contribution |
+| everything from `blk.1.*` onward, incl. `final_hidden` and `logits` | **NOT the same function.** A disagreement here is expected and is not evidence of a bug |
+
+**`blk.0.out` is therefore the bounding tensor for a pass/fail claim**, and this is exactly what §5
+already anticipated ("compare only up to and including decoder layer 0's output, before the injection
+point"). Whether the fold happens at layer 1's entry or its exit is not established by any source this
+project has read, so the conservative bound — everything from `blk.1.res_in` inclusive is suspect — is
+the one to hold to.
+
+**A second, positive use of that same fact**: llama.cpp's own `blk.1.res_in`-equivalent minus its
+`blk.0.out`-equivalent **is** the PLE contribution, measurable without touching this engine at all. If
+those two agree on the llama.cpp side, its PLE is not firing and the deeper layers become comparable
+after all. That is a cheap check worth running before concluding anything about layers 1-3.
+
+##### The gate, stated before any result was seen
+
+```
+rel_l2 = ||a - b||_2 / ||b||_2   <=  1e-4       (per tensor; b is the llama.cpp side, the denominator)
+```
+
+`1e-4` is §6 WP4f point 3's own proposed value, taken as-is rather than chosen after the fact. The
+choice of *quantity* is the part that would otherwise silently decide the outcome, so it is recorded:
+**it is deliberately NOT a max elementwise relative error.** `d / |b|` is unbounded wherever `b` is near
+zero, which in a 2560-wide hidden state happens on every row — WP4d already hit exactly this, reporting
+"max relative 0.135" for what was a near-zero logit against a `+1e-6` denominator, not a disagreement. A
+gate on that quantity would fail a correct implementation. `||a-b|| / ||b||` is the relative size of the
+disagreement *as a vector*, which is what "these compute the same hidden state" means, and it is directly
+comparable to the fixture agreements this project already records (0.0 / 1.5e-11 / 1.4e-09 / 4.4e-11).
+
+`max_abs`, `max_rel_scaled` (`max|a-b| / max|b|`) and cosine similarity are reported **alongside** it,
+because one number cannot separate "uniformly slightly off" from "one coordinate catastrophically off",
+and that distinction is most of the diagnosis. Per-failure the tool also names the worst element's
+(row, col) and the worst row by its own `rel_l2`, which localizes **which token position** diverges.
+
+The tool will not reshape, re-order, re-scale or slice either side to make a pair fit. The one exception
+is `--b-transpose`, present because ggml declares dimensions fastest-varying-first — WP4c finding 7's
+exact trap ("no shape assertion can catch a missed transpose here, because the declared shape was never
+wrong"). It is a single explicit flag so that using it is a **recorded decision** rather than an
+automatic fixup that could quietly turn a real disagreement into an apparent match. Differently-named
+tensors are paired through a `--map` file, one `<a_name> <b_name>` per line: deciding that two tensors
+are the same mathematical object is a judgement, and it belongs in a reviewable file next to the
+results, not buried in the differ's source.
+
+##### The artifact produced, and the numbers
+
+Built through the REAL `sub0llm-configure` at the real axes (§WP4d's own line plus
+`--moe-quant-experts 1`), which produced a `sub0_corpus.hpp` **field-for-field identical** to
+`tests/qwen4_real_axes/sub0_config.hpp` at `N_LAYERS = 4`, including `VOCAB = 248320` exactly. Vocabulary
+learning took 142.4s off the `.words` scan cache; the engine build itself, 12s.
+
+The dump: **`D:\ModelWeights\Sub0Llm-Qwen4-sub4\wp4f_sub0llm.s0hd`**, 10,261,285 bytes, 32 tensors,
+from `qwen4_sub4_q.bin` (the quantized-resident WP4e artifact). Kept outside the repo, like every other
+model artifact. Peak working set **14.32 GiB** against 48.9 GiB free — the same figure WP4e recorded,
+i.e. the capture costs nothing measurable.
+
+**The capture path is provably inert.** The same run's `--dump-logits` output hashes
+`ffa1f725e0b0fbf4f7ea6054d8d3a3d829816e8af946370be10299f0b98be8e6` — **bit-identical to both** hashes
+WP4e recorded for this input (its all-f32 and its quantized-resident builds). So `forward_capture`
+produces exactly what `forward` produces, and this rebuilt-from-scratch toolchain reproduces the merged
+WP4e result exactly. Every other number in the run also reproduced: `forward` vs `forward_one` parity
+**0 exactly**, engine-vs-math-core replay `||h_in||` **2.84e-08** / `||delta||` **1.7e-08**, the removed
+`ln_f`'s size **0.174 against a logit rms of 0.605 (28.8% of scale)**, argmax 109782.
+
+**Two independent runs of the harness produced dumps the differ reports as `rel_l2 = 0.000e+00` on all
+32 tensors** — which is simultaneously a determinism check on the forward pass and the differ's own
+first exercise on real-sized tensors (`[6 x 248320]` included).
+
+**Gates run:**
+
+- **Neutral identity (`AGENTS.md` §4/§7)**: `sub0_tests` is **hash-identical at all three standard
+  shapes**, with assertion counts unchanged from WP4e's recorded baseline — d96 L8 H2 seq128
+  `4e00b8a7dadafff8 / 6909ae0b3afc2caa / ab31e5533547f73a`, 17,827,372 assertions; d132 L11 H4 kv2 seq96
+  `289b86042f02843e / 787ec95304201870 / 27ee1bd6fa0f35eb`, 29,771,944; d196 L11 H7 seq256
+  `9c8c0c17cd5043d9 / 50fae4b8922bac0e / 55f09cee05eea34b`, 54,070,194; 147 cases each. This matters
+  more here than in most stages: the change edits `Model::forward` itself, the single hottest and most
+  shared function in the engine.
+- **`sub0_frontend_tests`**: 117,358 → **117,431** assertions, 222 → **226** cases — exactly
+  `hidden_dump_tests.cpp`'s own 73 assertions in 4 cases, and nothing else moved.
+- **The differ, end to end against a FOREIGN producer.** Exercised on S0HD files written by a Python
+  script (a genuinely separate implementation of the format, which is the property that matters) across:
+  exact agreement, a 1e-6 perturbation that passes, a 1e-2 perturbation that fails and is correctly
+  localized as the first failing pair, a shape mismatch that reports the `--b-transpose` hint, a `--map`
+  file with its unreferenced-`b`-tensor report, and the token-mismatch hard stop (exit 3).
+
+##### What the llama.cpp side has to produce
+
+One S0HD file, from a forward pass on **exactly** `[1543, 88123, 245000, 7, 99999, 156789]` with BOS
+insertion off, containing whatever intermediate tensors that implementation exposes, under its own
+names. Then:
+
+```
+sub0llm-hidden-diff --a wp4f_sub0llm.s0hd --b <llamacpp>.s0hd --map wp4f_names.map [--b-transpose]
+```
+
+The map file is the remaining piece of judgement and cannot be written until llama.cpp's own tensor
+names for `qwen4exp` are known. Lead with `blk.0.attn_out`, `blk.0.ffn_out` and `blk.0.out` — the
+tensors inside the strictly-comparable window above.
+
+##### Deliberately still open, named here so nothing rediscovers them
+
+- **No llama.cpp side exists yet, so there is no divergence table.** Per §6's own framing that is a
+  valid stage outcome, not a failure to paper over. What is *closed* is that nothing on this side blocks
+  it: the input is fixed and published, the format is specified and independently exercised, the gate is
+  stated, and the dump is on disk.
+- **A prior llama.cpp checkout at `D:\Craig\diffusiongemma\llama.cpp` (`ef5e2dc`, 2026-06-17) does not
+  support this architecture.** Its `src/llama-arch.cpp` enumerates `qwen`, `qwen2`, `qwen2moe`,
+  `qwen2vl`, `qwen3`, `qwen3moe`, `qwen3next`, `qwen3vl`, `qwen3vlmoe`, `qwen35`, `qwen35moe`,
+  `rwkv6qwen2` — **no `qwen4exp`**. Whether a newer upstream branch has it is the other half of this
+  stage and was not investigated here.
+- **`forward_capture` is CPU-only**, like `loop_pass_stats` and `last_hidden_ptr` beside it. WP4 is a
+  CPU-only work package (§5), so this is a declaration with one definition, not a refusal that could fire.
+- **Layer 3 (QSA) is now covered by the dump** even though WP4d's engine-vs-math-core replay still stops
+  at layer 2 (`op_qsa` needs the backend's internal rope table). The dump comes from the engine path, so
+  it has no such limitation — which makes the QSA layer comparable against llama.cpp for the first time,
+  subject to the PLE bound above making that comparison advisory rather than a gate.
+- **Under LoopSplit a layer index repeats, so two tensors would share a name.** The format permits it and
+  the reader reports the duplicate count rather than silently picking one; the real Qwen4 axes have
+  LoopSplit off, so it does not arise there. Pinned by a test rather than left to be discovered.
+
 ---
 
 ## 7. Open questions — the author's own scoping assumptions, for the user to settle
@@ -1111,11 +1322,15 @@ not pick for the user.
 - **Q4 (Blocker A)**: **Full faithful fix** — `--head-dim` and its full consumer sweep (§2 Blocker A) are
   in scope for WP4b, not deferred. Real attention weights must be transplantable, not just GDN/GR/MoE.
 
-**Still open, unresolved by the above**: Q5 (llama.cpp availability — partially answered: no built binary
-found on this machine, but an unbuilt source checkout exists at `D:\Craig\diffusiongemma\llama.cpp`, so
-WP4f is "build it" not "acquire it from scratch"), Q6 (M-RoPE degeneracy, unverified), Q7 (per-layer
-mismatch gate, proposed `1e-4` not yet confirmed), Q8 (the 0.71B parameter-total discrepancy — the cheap
-131-header-request census that would settle it has not been run).
+**Still open, unresolved by the above**: Q5 (llama.cpp availability — **narrowed 2026-09-07**: the
+unbuilt checkout at `D:\Craig\diffusiongemma\llama.cpp` is `ef5e2dc`, 2026-06-17, and its
+`src/llama-arch.cpp` does **not** enumerate `qwen4exp` at all, so WP4f is neither "build it" nor
+"acquire it" but "find a branch that supports this architecture, or report that it does not exist yet"
+— see WP4f's executed section above), Q6 (M-RoPE degeneracy, unverified), Q7 (per-layer mismatch gate —
+**settled**: `1e-4` on `rel_l2 = ||a-b||/||b||` per tensor, adopted as proposed and stated in
+`tools/sub0llm-hidden-diff.cpp` before any result was seen; see WP4f's executed section for why the
+quantity is a relative L2 and not a max elementwise relative error), Q8 (the 0.71B parameter-total
+discrepancy — the cheap 131-header-request census that would settle it has not been run).
 
 **Q1 — Real weights at all, or a "real shape, fake weights" harness run first?**
 A synthetic run (real 48-layer Qwen4 `RunConfig`, randomly-initialised weights) would validate WP4b's

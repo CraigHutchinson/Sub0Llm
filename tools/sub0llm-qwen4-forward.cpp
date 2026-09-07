@@ -25,11 +25,26 @@
 //   6. Peak working set, because docs/QWEN4_MEMORY_ORCHESTRATION.md's budget is a prediction until
 //      something measures it.
 //
-// The input tokens are the six hand-chosen REAL Qwen vocabulary ids the n-gram fixture already uses
+// THE CANONICAL WP4f INPUT TOKEN ARRAY -- the one BOTH sides of the llama.cpp comparison must feed:
+//
+//     [1543, 88123, 245000, 7, 99999, 156789]      (6 tokens, positions 0..5, no BOS/BOS-equivalent)
+//
+// These are the six hand-chosen REAL Qwen vocabulary ids the n-gram fixture already uses
 // (tests/fixtures/qwen4_preview/ngram_embedding_manifest.json, "test_tokens") -- the only real-vocab
-// token ids anywhere in this repo's fixture set. Every other qwen4_preview fixture is a SLICED layer
-// (hidden_size 32 for GDN, 16 for QSA), so its inputs and reference outputs do not exist at the real
-// hidden_size at all and cannot be fed to a full-dims Model::forward -- see the report for WP4d.
+// token ids anywhere in this repo's fixture set, and they were chosen against the real checkpoint's own
+// unigram_vocab_size of 248,320, which IS this build's VOCAB. Every one is < 248,320 by construction.
+//
+// They are fed as raw ids, NOT tokenized: docs/WP4_SCOPE.md S6 WP4f point 1 requires bypassing
+// tokenization on both sides, because this engine's tokenizer is its own and is emphatically not
+// Qwen's, so any text-level input would compare two different token sequences. Nothing is prepended:
+// there is no implicit BOS here, so the llama.cpp side must be run with its own BOS insertion DISABLED
+// or the two sides are off by one position, which would show up as a total mismatch at every layer and
+// would localize nothing. --dump-hidden writes this array into the S0HD file so sub0llm-hidden-diff can
+// CHECK the premise rather than assume it.
+//
+// Every other qwen4_preview fixture is a SLICED layer (hidden_size 32 for GDN, 16 for QSA), so its
+// inputs and reference outputs do not exist at the real hidden_size at all and cannot be fed to a
+// full-dims Model::forward -- see the report for WP4d.
 
 #include "sub0/core.hpp"
 #include "sub0/layout.hpp"
@@ -37,6 +52,7 @@
 #include "sub0/gdn_math.hpp"
 #include "sub0/moe_math.hpp"
 #include "sub0/moe_quant.hpp"
+#include "sub0/hidden_dump.hpp"   // WP4f: the S0HD per-layer hidden-state container
 
 #include <CLI/CLI.hpp>
 
@@ -120,6 +136,16 @@ int main(int argc, char** argv) {
     std::string dump_path;
     app.add_option("--dump-logits", dump_path,
                    "write forward()'s raw [T x VOCAB] f32 logits to this path (WP4e's bitwise gate)");
+    // WP4f (docs/WP4_SCOPE.md S6): the llama.cpp comparison diffs HIDDEN STATES, not logits. S5's
+    // PLE/n-gram exclusion means this build and llama.cpp stop computing the same function at decoder
+    // layer 1 (ple_layer_ids=[2], 0-indexed), so a final-logits diff compares two different functions
+    // and localizes nothing. This writes every named intermediate of ONE forward pass, plus the exact
+    // token ids it ran on, in the S0HD container (include/sub0/hidden_dump.hpp), for
+    // sub0llm-hidden-diff to pair against llama.cpp's own dump of the same tokens.
+    std::string hidden_path;
+    app.add_option("--dump-hidden", hidden_path,
+                   "write every per-layer named hidden state of one forward pass to this path "
+                   "(S0HD container -- WP4f's llama.cpp comparison input)");
     CLI11_PARSE(app, argc, argv);
     // Unbuffered: this run is minutes long and holds 43 GiB resident, so if it dies the partial output
     // IS the finding. A buffered stdout redirected to a file loses all of it.
@@ -180,10 +206,38 @@ int main(int argc, char** argv) {
     }());
     graph_reset();          // lays out this thread's parameter nodes + allocates its Worker
     report_memory("after graph_reset");
+    // WP4f: with --dump-hidden this runs forward_capture INSTEAD of forward (not in addition to it) --
+    // it returns the same logits node, so the whole rest of this harness, including WP4e's bitwise
+    // logits gate below, is comparing exactly what a plain forward() produced. Doing a second pass to
+    // collect the intermediates would double a 5.3s forward and, worse, would leave open the question of
+    // whether the two passes agreed.
+    hidden::Writer hw;
+    bool hw_open = false;
+    if (!hidden_path.empty()) {
+        if (!hw.open(hidden_path, kTokens, T)) {
+            std::println(stderr, "FAIL: could not open '{}' for the hidden-state dump", hidden_path);
+            return 7;
+        }
+        hw_open = true;
+    }
     const auto t1 = std::chrono::steady_clock::now();
-    Node* out = forward(kTokens, T);
+    Node* out = hw_open
+        ? forward_capture(kTokens, T,
+                          [](void* ctx, const char* name, int rows, int cols, const float* data) {
+                              static_cast<hidden::Writer*>(ctx)->add(name, rows, cols, data);
+                          },
+                          &hw)
+        : forward(kTokens, T);
     const double fwd_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     if (!out) { std::println(stderr, "FAIL: forward returned null"); return 4; }
+    if (hw_open) {
+        if (!hw.close()) {
+            std::println(stderr, "FAIL: could not finish writing '{}'", hidden_path);
+            return 7;
+        }
+        std::println("wrote {} named hidden-state tensors to {} (S0HD, tokens embedded)",
+                     hw.count(), hidden_path);
+    }
     std::println("forward: [{} x {}] in {:.2f}s", out->rows, out->cols, fwd_s);
     report_memory("after forward");
     std::vector<float> batched(out->data.begin(), out->data.end());
