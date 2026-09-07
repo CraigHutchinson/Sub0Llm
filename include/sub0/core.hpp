@@ -147,6 +147,23 @@ SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T,
 // pass 2's for the SAME layers directly tests whether repeated passes are converging to a fixed point
 // (the predicted reason looping under-delivers). Either output may be null; both are [LOOP_EXEC_COUNT].
 SUB0_API void  loop_pass_stats(const int* ids, int T, float* out_delta, float* out_hnorm);
+// WP4f (docs/WP4_SCOPE.md S6): named-intermediate capture over ONE forward pass. The llama.cpp
+// comparison must diff HIDDEN STATES, not final logits -- S5's PLE/n-gram exclusion means the two
+// models stop computing the same function at the injection point, so a logits diff compares two
+// different functions and a per-layer diff is the only thing that can LOCALIZE a divergence.
+//
+// Deliberately a sink callback on the REAL forward rather than an out-parameter struct or a separate
+// diagnostic copy of the layer loop, for the same two reasons loop_pass_stats above is: (a) a second
+// copy of the loop would drift from the one that actually runs and then measure the wrong thing
+// convincingly; (b) the caller owns every buffer and every naming/format decision, so the engine adds
+// no allocation and no file-format surface (AGENTS.md S1/S8). `data` is [rows x cols] row-major and is
+// valid only for the duration of the call -- copy what you want to keep.
+//
+// Off by default and unreachable from plain forward(): the sink is armed for exactly one call and
+// disarmed after, so every existing build's forward() is byte-identical (AGENTS.md S4). CPU backend
+// only, like loop_pass_stats and last_hidden_ptr.
+using HiddenSink = void (*)(void* ctx, const char* name, int rows, int cols, const float* data);
+SUB0_API Node* forward_capture(const int* ids, int T, HiddenSink sink, void* ctx);
 // Incremental single-token inference (KV-cache): kv_reset() before a generation, then forward_one()
 // per token -> logits [VOCAB]. O(T) per token instead of forward()'s O(T^2). Dense (non-ternary),
 // positions < SEQ_LEN. See src/backend_cpu.cpp.

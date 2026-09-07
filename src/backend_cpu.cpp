@@ -2073,6 +2073,27 @@ struct Model {
     float* pass_delta = nullptr;   // [LOOP_EXEC_COUNT] ||h_out - h_in||
     float* pass_hnorm = nullptr;   // [LOOP_EXEC_COUNT] ||h_in||
 
+    // WP4f's named-intermediate capture (sub0::forward_capture -- see core.hpp for why it is a sink on
+    // the real loop rather than a second diagnostic copy of it). nullptr on every production path, so
+    // each emit() below is one predictable never-taken branch.
+    HiddenSink cap_sink = nullptr;
+    void*      cap_ctx  = nullptr;
+    // Model-level tensors keep their literal name; per-layer ones are formatted into a thread_local
+    // buffer rather than a std::string, because this runs inside forward() and AGENTS.md S1 carves out
+    // no exception for a path that only executes when a diagnostic is armed. The format string is a
+    // literal at the snprintf call (not a forwarded parameter) so -Wformat-nonliteral stays quiet; 64 is
+    // comfortably past the longest name emitted ("blk.<int>.attn_out").
+    void emit(const Node* n, const char* name) {
+        if (!cap_sink || !n) return;
+        cap_sink(cap_ctx, name, n->rows, n->cols, n->data.data());
+    }
+    void emit_layer(const Node* n, int li, const char* suffix) {
+        if (!cap_sink || !n) return;
+        static thread_local char nm[64];
+        std::snprintf(nm, sizeof nm, "blk.%d.%s", li, suffix);
+        cap_sink(cap_ctx, nm, n->rows, n->cols, n->data.data());
+    }
+
     Node* forward(const int* ids, int T) {
         // Persistent per-thread: op_embed stores this pointer and backward reads it
         // after forward returns, so it must outlive the call (a local would dangle).
@@ -2134,7 +2155,9 @@ struct Model {
         // Gated Residual's model-level ENTRY tile (docs/GATED_RESIDUAL.md S1c): seed all HC_COUNT
         // streams identically by literal duplication, right before the per-layer loop -- everything
         // above (embed, absolute pos, n-gram injection) stays D_MODEL-wide and completely untouched.
+        emit(h, "tok_embd");            // [T, D_MODEL] -- the last D_MODEL-wide state before GR widens it
         if constexpr (USE_GATED_RESIDUAL) h = op_gr_tile(h);
+        if constexpr (USE_GATED_RESIDUAL) emit(h, "gr_tile");   // [T, HC_COUNT * D_MODEL]
         // Gated Residual READ/WRITE helpers (docs/GATED_RESIDUAL.md S2): wrap one sub-block's entry/exit
         // without touching the sub-block's own code -- ln1/ln2/the mixer/the FFN below are ALL literally
         // unchanged from the GR-off form. `wide` is the residual stream BEFORE this sub-block's read
@@ -2176,6 +2199,8 @@ struct Model {
             Node* gr_inj_attn = nullptr;
             Node* a = gr_read(h, L.gr_attn_norm, L.gr_attn_down, L.gr_attn_up, L.gr_attn_inject, L.ln1,
                                &gr_inj_attn);
+            emit_layer(h, li, "res_in");   // [T, HC_WIDE] residual stream entering the layer
+            emit_layer(a, li, "attn_in");   // [T, D_MODEL] what the mixer actually reads
             // GDN_SCHEDULE.full_attn[li] decides softmax attention vs. Gated DeltaNet for THIS layer
             // (per-LAYER, not per-execution -- a layer's weight identity fixes its type, so every
             // execution of a repeated LoopSplit middle layer inherits it automatically via LAYER_EXEC_
@@ -2193,11 +2218,15 @@ struct Model {
                     // mechanism is defined in terms of softmax attention's own K/V, S1/S2 of
                     // docs/DEPTH_ATTENTION.md -- out of scope for a GDN layer, and neither doc discusses
                     // the combination, so this is a deliberate Stage-1 simplification, not an oversight).
-                    h = gr_write(h_before_attn, op_gdn(a, L), gr_inj_attn);
+                    Node* gdn_out = op_gdn(a, L);
+                    emit_layer(gdn_out, li, "attn_out");   // [T, D_MODEL] the GDN mixer's own output
+                    h = gr_write(h_before_attn, gdn_out, gr_inj_attn);
+                    emit_layer(h, li, "attn_res");         // [T, HC_WIDE] stream after the attn combine
                     Node* h_before_mlp = h;
                     Node* gr_inj_mlp = nullptr;
                     Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject,
                                        L.ln2, &gr_inj_mlp);
+                    emit_layer(f, li, "ffn_in");           // [T, D_MODEL] what MoE/the FFN reads
                     if constexpr (USE_MOE) {
                         f = op_moe(f, L, li);
                     } else if constexpr (USE_GATED_FFN) {
@@ -2207,7 +2236,9 @@ struct Model {
                     } else {
                         f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
                     }
+                    emit_layer(f, li, "ffn_out");          // [T, D_MODEL] the MoE/FFN block's output
                     h = gr_write(h_before_mlp, f, gr_inj_mlp);
+                    emit_layer(h, li, "out");              // [T, HC_WIDE] stream leaving the layer
                     if (pass_delta || pass_hnorm) {
                         const std::size_t nn = static_cast<std::size_t>(h->rows) * h->cols;
                         double d2 = 0.0, i2 = 0.0;
@@ -2262,11 +2293,14 @@ struct Model {
             Node* att = op_attn(qn, kn, vn, N_HEADS);
             mixer_out = op_linear(att, L.Wo, nullptr, q);
             }
+            emit_layer(mixer_out, li, "attn_out");   // [T, D_MODEL] QSA's (or Wo's) own output
             h = gr_write(h_before_attn, mixer_out, gr_inj_attn);
+            emit_layer(h, li, "attn_res");
             Node* h_before_mlp = h;
             Node* gr_inj_mlp = nullptr;
             Node* f = gr_read(h, L.gr_mlp_norm, L.gr_mlp_down, L.gr_mlp_up, L.gr_mlp_inject, L.ln2,
                                &gr_inj_mlp);
+            emit_layer(f, li, "ffn_in");
             if constexpr (USE_MOE) {
                 f = op_moe(f, L, li);
             } else if constexpr (USE_GATED_FFN) {
@@ -2276,7 +2310,9 @@ struct Model {
             } else {
                 f = op_linear(op_gelu(op_linear(f, L.W1, L.b1, q)), L.W2, L.b2, q);
             }
+            emit_layer(f, li, "ffn_out");
             h = gr_write(h_before_mlp, f, gr_inj_mlp);
+            emit_layer(h, li, "out");
             if (pass_delta || pass_hnorm) {
                 const std::size_t n = static_cast<std::size_t>(h->rows) * h->cols;
                 double d2 = 0.0, i2 = 0.0;
@@ -2300,8 +2336,17 @@ struct Model {
         // ~27%-of-scale shift in the real model's logits -- the LnF counterpart of blocker D's Ln1/Ln2.
         if constexpr (USE_GATED_RESIDUAL) h = op_gr_mix(h, gr_top_norm, gr_top_down, gr_top_up);
         else                              h = op_rmsnorm(h, ln_f);
-        if constexpr (USE_TIED_EMBEDDINGS) return op_tied_head(h, tok_emb);
-        else                               return op_linear(h, lm_head, lm_bias, false);  // head stays full precision
+        // [T, D_MODEL] -- what lm_head reads. Under GR this is the exit collapse's output with NO final
+        // norm after it (the LnF removal, docs/WP4_SCOPE.md "WP4d's LnF item -- CLOSED"), which is the
+        // single most useful tensor in this dump: it is the deepest point the engine reaches before the
+        // vocabulary projection, and it is D_MODEL-wide, so it is directly comparable to llama.cpp's own
+        // final hidden state without any hyper-connection-layout reconciliation.
+        emit(h, "final_hidden");
+        Node* logits;
+        if constexpr (USE_TIED_EMBEDDINGS) logits = op_tied_head(h, tok_emb);
+        else                               logits = op_linear(h, lm_head, lm_bias, false);  // head stays full precision
+        emit(logits, "logits");
+        return logits;
     }
 
     // Incremental single-token forward using the KV-cache (see KVCache above). Runs token `id` at
@@ -2875,6 +2920,19 @@ void loop_pass_stats(const int* ids, int T, float* out_delta, float* out_hnorm) 
     (void)g_model.forward(ids, T);
     g_model.pass_delta = nullptr;   // disarm: every other forward() must stay on the untouched path
     g_model.pass_hnorm = nullptr;
+}
+// WP4f's named-intermediate capture -- see core.hpp. Armed for exactly ONE forward and disarmed after,
+// the same discipline loop_pass_stats above uses, so no other forward() can ever be on this path. The
+// caller owns graph_reset() around it exactly like a plain forward(); the returned node is the ordinary
+// logits node, so a caller can use this INSTEAD of forward() rather than paying for a second pass.
+Node* forward_capture(const int* ids, int T, HiddenSink sink, void* ctx) {
+    ensure_thread_built();
+    g_model.cap_sink = sink;
+    g_model.cap_ctx  = ctx;
+    Node* out = g_model.forward(ids, T);
+    g_model.cap_sink = nullptr;
+    g_model.cap_ctx  = nullptr;
+    return out;
 }
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
 
