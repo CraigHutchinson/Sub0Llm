@@ -1011,6 +1011,48 @@ property (`desc_index` is `(layer, expert, plane)`-major and a bijection) as a r
   resolve** before the decoder overwrites them. Not an allocation (the vector is reused, so `AGENTS.md`
   §1 is satisfied) but it is a redundant pass over 6.25 MiB per expert, and it is a plausible slice of
   the 3.7x above.
+- **The sidecar stores GGML's own K-quant/IQ-quant bytes verbatim — never evaluated against a
+  Sub0Llm-native alternative, and worth reasoning through explicitly (2026-09-04, user's own catch)
+  rather than assuming the choice was optimal.** Why the raw bytes were used at all: copying them
+  verbatim (no re-encode) is what makes WP4e's bitwise-identity gate a STRUCTURAL guarantee — the same
+  bytes, the same decoder, on both sides of the comparison — rather than an empirical "close enough"
+  check. That was the right call for a first, correctness-first pass. But it means the format CHOICE was
+  never actually made by this project; it was inherited from unsloth's own calibration, which optimized
+  for a completely different consumption pattern than this engine's.
+
+  **The mismatch, stated precisely**: `llama.cpp`'s own K-quant/IQ-quant formats are co-designed with
+  FUSED quantized-matmul SIMD kernels — a dot product computed directly against packed/quantized bytes,
+  never fully materializing f32. Sub0Llm's WP4e design does the opposite: `resolve()` dequantizes one
+  expert fully to f32 (`gguf::to_f32`), then the UNCHANGED f32 `expert_ffn_row()` runs on it. In that
+  regime, `Q4_K`/`Q5_K`'s sub-block scale/min interleaving and `Q6_K`'s four-way-interleaved layout — bit
+  layouts chosen so a fused SIMD kernel can unpack them cheaply mid-dot-product — buy this engine nothing:
+  the FULL decode-loop cost (see `dequantize_q4_k`/`dequantize_q5_k`'s own `k_scale_min` unpacking) is
+  paid just to get back to f32, and then ordinary code runs. A format simpler to decode, even one "worse"
+  for a fused kernel, could plausibly decode faster for THIS specific access pattern.
+
+  **A ceiling worth naming so it isn't assumed away**: re-encoding CANNOT recover fidelity already lost.
+  Unsloth's own quantization (from the real bf16 safetensors checkpoint) is the source of truth this
+  project has locally; any Sub0Llm-native re-encode would necessarily start from the ALREADY-quantized
+  f32-decoded values, not the original bf16 ones (fetching those is the ~500GB safetensors path this
+  project explicitly avoided by choosing GGUF — `docs/WP4_SCOPE.md` §3a-bis's own Q2 decision). So the
+  only thing a new format could buy is decode SPEED and/or STORAGE SIZE, never accuracy — and those two
+  trade against each other: `Q8_0` (already implemented, the simplest format in `gguf.hpp`, single scale
+  per 32-element block, no sub-block unpacking at all) is markedly cheaper to decode than any K-quant or
+  IQ-quant, but at ~8.5 bits/element it is 2-5x more bytes than the CURRENT mixed `IQ1_S`/`IQ2_XXS`
+  (~1.5-2 bits/element) the routed experts mostly use — re-encoding everything to `Q8_0` would grow the
+  3.17 GiB sidecar to something in the 8-15 GiB range (still a large win over the 37.5 GiB f32 form, just
+  a smaller one than the current mixed-precision choice, which was tuned by unsloth for accuracy/size,
+  not for this engine's decode cost).
+
+  **Recommended next step, in order — do not skip straight to building a new format**: (1) actually
+  profile a resolve() call (VTune, per `docs/CPU_PERF_BACKLOG.md`'s own standalone-benchmark methodology)
+  to find out how much of the 3.7x is the redundant vector re-zeroing above (cheap, already identified),
+  how much is format-specific decode complexity (the K-quant/IQ-quant bit-unpacking), and how much is
+  something else (cache misses, memory bandwidth) — before spending real effort on a new format whose
+  payoff is currently a guess, not a measurement. Only once decode complexity is confirmed as a real,
+  material slice does designing + implementing + verifying a Sub0Llm-native re-encode (a project roughly
+  the size of WP4c/e's own dequant work, since it needs its own correctness gate against the f32
+  reference) become worth doing.
 - **CUDA is untouched and still refuses** (`static_assert(!USE_MOE)`), so this axis cannot reach it.
 - **Still no real-dims reference output.** WP4e proves the two RESIDENCY forms agree; it says nothing
   new about whether either agrees with the real model. That remains WP4f's job, unchanged.
