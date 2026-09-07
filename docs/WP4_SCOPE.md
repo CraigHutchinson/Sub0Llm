@@ -1,7 +1,20 @@
 # WP4 — real-scale Qwen3.8-Flash-Next run + llama.cpp comparison: scoping proposal
 
-Status: **SCOPING ONLY — no engine code, no new `RunConfig` axis, no new CLI flag lands with this
-document.** This mirrors exactly how Phase 0 (`docs/QWEN4_MEMORY_ORCHESTRATION.md`) and each of WP1-3
+Status (2026-09-07): **WP4a-e are DONE and merged — the original "scoping only" status below is
+historical, kept for the reasoning, not the current state.** A real 4-layer sub-stack (3 GDN + 1 QSA)
+with real transplanted weights runs through this engine's own `Model::forward`. WP4f (the llama.cpp
+comparison, §6) is IN PROGRESS: both halves (this engine's own hidden-state dump harness, and a real
+`llama.cpp` build that supports the target architecture) are done, and the actual cross-comparison has
+been run once — see "WP4f — the ACTUAL cross-comparison" near the end of §6 for the result (a real,
+localized divergence at layer 0, root cause under investigation as of this status line). **If you are
+picking this up cold, read the memory handover note `wp4-handover-2026-09-07` first** (or, without
+access to that memory system, read straight to that cross-comparison subsection of §6) — it names the
+one genuine loose end (an investigation that may or may not have completed) and exact repro steps.
+
+Original scoping status, unchanged below for its own reasoning: **no engine code, no new `RunConfig`
+axis, no new CLI flag lands with this document** — that constraint applied to this DOCUMENT's own first
+draft; every stage's actual implementation happened on its own branch per §6's staging, exactly as
+described. This mirrors exactly how Phase 0 (`docs/QWEN4_MEMORY_ORCHESTRATION.md`) and each of WP1-3
 (`docs/GATED_RESIDUAL.md`, `docs/MOE.md`, `docs/QSA.md`) began: a design document first, reviewed on its
 own, then implementation in independently-mergeable stages each with its own correctness gate.
 
