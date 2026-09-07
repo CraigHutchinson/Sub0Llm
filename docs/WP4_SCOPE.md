@@ -1292,6 +1292,45 @@ tensors inside the strictly-comparable window above.
   the reader reports the duplicate count rather than silently picking one; the real Qwen4 axes have
   LoopSplit off, so it does not arise there. Pinned by a test rather than left to be discovered.
 
+### WP4f — the ACTUAL cross-comparison, run for the first time (2026-09-07)
+
+With both halves merged, the orchestrating session ran the real comparison: `llama-qwen4-dump` re-run
+with the Sub0Llm side's own canonical token array (`1543,88123,245000,7,99999,156789`, no BOS, `-c 64`,
+same real GGUF file), its output converted to `S0HD` (renaming `model.input_embed`->`tok_embd`,
+`hc_init`->`gr_tile`, `l_last-N`->`blk.N.out` — ggml's `[D_MODEL,HC_COUNT,T]`/`ne[0]`-fastest layout is,
+walked in raw file order, EXACTLY row-major `[T, HC_COUNT*D_MODEL]` with the same stream-major ordering
+this project's own `wide = hc_count*hidden_size` convention already uses, so no transpose was needed —
+independently confirmed by checking `hc_init`'s own raw floats show all 4 streams holding an identical
+copy of the embedding per token, exactly what a tile op must produce), then diffed against the existing
+`wp4f_sub0llm.s0hd` with `sub0llm-hidden-diff --gate 0.0001`.
+
+**Result — a real, localized divergence, not the hoped-for "agree through layer 0" outcome**:
+
+| tensor | shape | rel_l2 | cosine | verdict |
+|---|---|---:|---:|---|
+| `tok_embd` | `[6x2560]` | 0.000e+00 | 1.000000 | PASS (exact) |
+| `gr_tile` | `[6x10240]` | 0.000e+00 | 1.000000 | PASS (exact) |
+| `blk.0.out` | `[6x10240]` | 9.960e-01 | 0.593851 | **FAIL** |
+| `blk.1.out` | `[6x10240]` | 1.115e+00 | 0.429612 | **FAIL** |
+| `blk.2.out` | `[6x10240]` | 2.875e+00 | 0.322191 | **FAIL** |
+| `blk.3.out` | `[6x10240]` | 3.521e+00 | 0.261048 | **FAIL** |
+
+The token embedding lookup and Gated-Residual entry tile — everything computed before any decoder layer
+runs — match EXACTLY, bit for bit. **The divergence starts at layer 0 itself** (a Gated DeltaNet layer),
+far beyond llama.cpp's own measured internal noise floor at this depth (~6.7e-04 relative from CPU
+repack settings alone, per the earlier finding) — this is a real disagreement, not numerical noise.
+Growing magnitude at layers 1-3 is consistent with layer 0's error propagating forward, not a new
+independent error appearing at each layer.
+
+**This IS the stage's deliverable**, per §6's own framing ("they disagree at layer K in mechanism M" is
+an equally valid, equally useful outcome as agreement) — a localized divergence, not a global unhelpful
+mismatch. Root cause NOT yet determined: dispatched as its own focused investigation (candidates, in
+prior-probability order: a bug in llama.cpp's days-old `qwen4exp` GDN implementation, since this
+architecture support merged only 2026-08-27 and is exactly where a fresh bug is plausible; a
+conversion-side issue specific to per-layer weights despite the embedding passing exactly; or a
+naming/graph-position misunderstanding of what `l_last-N` actually captures). See the next revision of
+this section for the outcome.
+
 ---
 
 ## 7. Open questions — the author's own scoping assumptions, for the user to settle
