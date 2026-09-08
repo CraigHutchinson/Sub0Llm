@@ -83,6 +83,15 @@ struct Node {
 };
 
 // --- Model lifecycle --------------------------------------------------------
+// Ownership contract: the engine exposes one process-global model and one process-global parameter
+// set. Call build_model() or a successful load_model() before forward(), forward_one(), or tokenizer
+// operations; call graph_reset() before starting the next graph execution. Do not call build_model(),
+// load_model(), save_model(), or kv_reset() concurrently with any forward/evaluation operation, and
+// do not replace a loaded model while another caller can use its returned pointers. The CLI stages
+// obey this single-owner sequencing; the API does not provide independent model contexts.
+// Compute calls may use the engine's internal OpenMP team. Callers must not assume that unrelated
+// host threads receive independent engine workers, and nested external OpenMP regions are unsupported
+// unless the caller has deliberately configured OpenMP to serialize or manage that nesting.
 SUB0_API void build_model();                       // allocate param layout + random init
 [[nodiscard]] SUB0_API bool load_model(const char* path);        // overwrite params from disk
 [[nodiscard]] SUB0_API bool save_model(const char* path);        // write params to disk; false on an I/O failure
@@ -141,7 +150,7 @@ SUB0_API std::vector<TokenEntry> vocab_entries();  // requires load_tokenizer() 
 
 // --- Forward / loss / backward ---------------------------------------------
 SUB0_API void  graph_reset();                                   // reset arena + node pool
-SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB]
+SUB0_API Node* forward(const int* ids, int T);                  // -> logits [T, VOCAB], valid until graph_reset() or the next graph execution
 // Per-execution residual-stream diagnostic: for each of LOOP_EXEC_COUNT executions, ||h_in|| and
 // ||h_out - h_in||. Under LoopSplit the same layer runs several times, so pass 1's contribution vs
 // pass 2's for the SAME layers directly tests whether repeated passes are converging to a fixed point
@@ -168,13 +177,13 @@ SUB0_API Node* forward_capture(const int* ids, int T, HiddenSink sink, void* ctx
 // per token -> logits [VOCAB]. O(T) per token instead of forward()'s O(T^2). Dense (non-ternary),
 // positions < SEQ_LEN. See src/backend_cpu.cpp.
 SUB0_API void        kv_reset();
-SUB0_API const float* forward_one(int id, int pos);
+SUB0_API const float* forward_one(int id, int pos);             // logits [VOCAB], valid until the next forward_one()/kv_reset()
 // Diagnostic-only: forward_one's residual-stream hidden state at its last call's position, right before
 // ln_f/the head projection -- D_MODEL floats, thread-local, CPU backend only (see backend_cpu.cpp's
 // Model::last_hidden). Lets a caller compare the fully-processed representation the model actually reads
 // for its next-token prediction, not just the raw input embedding -- see docs/FACTSPIKE.md's "Pack-Aware
 // Training" discussion on why raw-embedding-level fidelity (hrr_unbind) isn't the same question.
-SUB0_API const float* last_hidden_ptr();
+SUB0_API const float* last_hidden_ptr();                        // D_MODEL floats, valid until the next forward_one()/kv_reset()
 
 // --- KV-trace memoization primitives (spike, 2026-07-21) --------------------------------------------
 // See docs/SCRATCH_TOKEN_FRAMING.md's "candidate 1: post-hoc per-layer KV pooling" -- these three
