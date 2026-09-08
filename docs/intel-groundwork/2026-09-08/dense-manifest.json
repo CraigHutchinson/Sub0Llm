@@ -1,0 +1,51 @@
+{
+  "schema": "sub0.intel.groundwork.v1",
+  "purpose": "dense",
+  "utc": "2026-09-08T20:28:14.9658615Z",
+  "repo": "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork",
+  "commit": "90721bc1cd09fe12228010110bf70f8f243ded00",
+  "probe_changes": [
+    "?? benchmarks/intel/",
+    "?? scripts/intel/inventory/",
+    "?? tools/intel_probe/"
+  ],
+  "os": "Microsoft Windows 10.0.26220",
+  "compiler": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\icx-cl.exe",
+  "compiler_version": [
+    "Intel(R) oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319)",
+    "Target: x86_64-pc-windows-msvc",
+    "Thread model: posix",
+    "InstalledDir: C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\compiler"
+  ],
+  "vcvars": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat",
+  "arguments": [
+    "/DSUB0_PROBE_ELEMENTS=65536",
+    "/nologo",
+    "/std:c++20",
+    "/EHsc",
+    "-fsycl",
+    "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\benchmarks\\intel\\mechanisms\\dense.cpp",
+    "/Fe:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\dense\\20260908-202813-337\\groundwork.exe",
+    "/Fo:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\dense\\20260908-202813-337/",
+    "/O2",
+    "/fp:precise",
+    "/DSUB0_PROBE_DNNL",
+    "/IC:\\Program Files (x86)\\Intel\\oneAPI\\dnnl\\2025.3/include",
+    "C:\\Program Files (x86)\\Intel\\oneAPI\\dnnl\\2025.3\\lib\\dnnl.lib"
+  ],
+  "source_sha256": "141B114FC3E8D26991A393031648EEF365303C7823DFC16932DDD2CCB2CA6A27",
+  "runtime_header_sha256": "862246B9C6EBFBCED88247CBB8F6E6CF0F6A5AEE0F1988671830F24BDCD34C4F",
+  "runner_sha256": "39FBE998C603A8740241C1E976B0404729F84756A0D09601BBE3E4F21F5A5BD7",
+  "power_configuration": [
+    "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)"
+  ],
+  "competing_processes": [],
+  "fixture_sha256": "826917239BFCDDE49B99C51F683BCD517B1ED1E76AFCDC5D115316C4A29285EB",
+  "with_onednn": true,
+  "elements": 65536,
+  "sycl_devices": [
+    "[level_zero:gpu] Intel(R) oneAPI Unified Runtime over Level-Zero, Intel(R) Graphics 12.70.4 [1.15.39183+3]"
+  ],
+  "executable_sha256": "DF652478BE6C86E8EAA2DA419276187716CA3E08A7880A3395BE0ED0F7401143",
+  "probe_exit_code": 0
+}

@@ -158,3 +158,22 @@ Record results through I21 using the [performance contract](INTEL_IGPU_PERFORMAN
 R0/R1 update the recipe and dependencies before implementation; unsupported paths are closed with
 evidence, not hidden behind a generic native-backend label. S4/S5 test architecture-chain and full
 capacity assumptions before broader claims.
+
+## New paper and the local probe distinction
+
+The user supplied [Servat et al., 2607.26584v1](https://arxiv.org/html/2607.26584v1).
+It evaluates OpenMP system-USM on a discrete Battlemage GPU under Linux Xe with oneAPI 2026.0.
+Its discussion highlights migration, page granularity, faults and unnecessary movement of overwritten
+scratch. These observations motivate tests; they do not establish the Windows iGPU's capabilities.
+
+Our local SYCL/Level Zero probe reports `usm_shared=1`, `usm_system=0` and verifies a bounded staged
+file-mapping round trip. Ordinary mapped pointers remain unqualified for direct device dereference.
+The reported ~33.55 GiB global size and ~4 GiB maximum allocation are runtime properties, not a
+measured usable-residency envelope. See the groundwork evidence report before planning capacity.
+
+Project experiment updates (hypotheses, not paper results): compare runtime host/shared/device input
+allocations with identical accesses and completion boundaries; keep overwritten scratch device-owned
+as a baseline. Separate first touch, warmed reuse and CPU/GPU handoff. Add sparse selected-range and
+aligned/unaligned patterns in the subsequent I19 wave; record unobservable faults/migration as unknown.
+System-USM and a future Linux route require new capability checks. No OS/driver upgrade or OpenMP
+backend promotion follows automatically from this paper.

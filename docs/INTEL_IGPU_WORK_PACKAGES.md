@@ -7,6 +7,15 @@ ownership, benchmark protocol and selection criteria. The [whole-plan review](IN
 records scope gaps and their closure; the [benchmark and optimization contract](INTEL_IGPU_PERFORMANCE.md)
 is normative for all measured packages.
 
+## Groundwork branch checkpoint
+
+On `research/intel-groundwork`, [initial results](INTEL_IGPU_GROUNDWORK_RESULTS.md) establish installed
+SDK/runtime visibility, two-size mapped staging and SYCL/oneDNN interoperability, plus ten dense
+projection shapes and a bounded three-mode USM benchmark. These are partial I00/S0/S1/I05/I19/I21
+inputs. I06 is not passed. Direct Level Zero submission, real IQ formats, sparse/recurrent chains and
+sustainable capacity remain open. The report and raw manifests take precedence over earlier unknown
+hardware/tooling statements for this exact runtime tuple; main engine qualification is unchanged.
+
 ## Scope and execution rules
 
 The deliverable is a measured decision and, only if justified, a useful Intel inference path with

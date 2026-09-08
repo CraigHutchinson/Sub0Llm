@@ -1,0 +1,32 @@
+[
+  {
+    "expected_reason": "Usage:",
+    "status": "pass",
+    "case": "missing_argument",
+    "exit_code": 1
+  },
+  {
+    "expected_reason": "Cannot open",
+    "status": "pass",
+    "case": "missing_file",
+    "exit_code": 1
+  },
+  {
+    "expected_reason": "Wrong fixture extent",
+    "status": "pass",
+    "case": "truncated",
+    "exit_code": 1
+  },
+  {
+    "expected_reason": "Fixture contents invalid",
+    "status": "pass",
+    "case": "bad_values",
+    "exit_code": 1
+  },
+  {
+    "expected_reason": "Required Intel",
+    "status": "pass",
+    "case": "no_gpu_fallback",
+    "exit_code": 1
+  }
+]
