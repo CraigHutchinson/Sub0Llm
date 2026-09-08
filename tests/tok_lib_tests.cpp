@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sub0/casing.hpp"
+#include "sub0/tokmap.hpp"
 #include "sub0/tokenizer.hpp"
 #include "sub0/unigram.hpp"
 #include "sub0/window.hpp"
@@ -17,6 +18,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <random>
 #include <span>
 #include <sstream>
@@ -471,6 +475,67 @@ TEST_CASE("deserialize rejects every truncated glue table", "[tok][join]") {
         REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
         REQUIRE_FALSE(t2.loaded);
     }
+}
+
+TEST_CASE("TokMap rejects malformed counts and document tables", "[tokmap]") {
+    constexpr std::uint32_t magic_v2 = 0x32543053u;
+    constexpr std::uint32_t magic_legacy_doc = 0x44543053u;
+    const auto path = std::filesystem::temp_directory_path() / "sub0_tokmap_b04_test.tok";
+    const auto put32 = [](std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value) {
+        std::memcpy(bytes.data() + offset, &value, sizeof value);
+    };
+    const auto put64 = [](std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint64_t value) {
+        std::memcpy(bytes.data() + offset, &value, sizeof value);
+    };
+    const auto write = [&](const std::vector<std::uint8_t>& bytes) {
+        std::ofstream os(path, std::ios::binary | std::ios::trunc);
+        os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+
+    // Three token bytes make the one-entry document table begin at offset 35, proving that the
+    // parser does not reinterpret an unaligned u64 pointer.
+    std::vector<std::uint8_t> valid(43, 0);
+    put32(valid, 0, magic_v2);
+    put32(valid, 4, 256);
+    put32(valid, 8, 24);
+    put64(valid, 16, 1);
+    put64(valid, 24, 1);
+    put64(valid, 35, 0);
+    write(valid);
+    {
+        sub0::TokMap map(path.string());
+        REQUIRE(map.ok());
+        REQUIRE(map.tokens().size() == 1);
+        REQUIRE(map.doc_starts().size() == 1);
+        REQUIRE(map.doc_starts().front() == 0);
+    }
+
+    auto malformed = valid;
+    put64(malformed, 16, std::numeric_limits<std::uint64_t>::max());
+    write(malformed);
+    REQUIRE(sub0::TokMap(path.string()).error() == sub0::TokMap::Err::Truncated);
+
+    malformed = valid;
+    put32(malformed, 8, 17);
+    write(malformed);
+    REQUIRE(sub0::TokMap(path.string()).error() == sub0::TokMap::Err::BadMagic);
+
+    malformed = valid;
+    put32(malformed, 12, 1);
+    write(malformed);
+    REQUIRE(sub0::TokMap(path.string()).error() == sub0::TokMap::Err::BadMagic);
+
+    malformed = valid;
+    put64(malformed, 35, 1);
+    write(malformed);
+    REQUIRE(sub0::TokMap(path.string()).error() == sub0::TokMap::Err::BadMagic);
+
+    write(std::vector<std::uint8_t>(12, 0));
+    std::vector<std::uint8_t> legacy_header(12, 0);
+    put32(legacy_header, 0, magic_legacy_doc);
+    write(legacy_header);
+    REQUIRE(sub0::TokMap(path.string()).error() == sub0::TokMap::Err::Truncated);
+    std::filesystem::remove(path);
 }
 
 // The runtime tokenizer only ever loads kind==1 (Unigram) -- a pre-WS2 file's legacy BPE-merge

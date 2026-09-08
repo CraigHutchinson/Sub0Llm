@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <ostream>
 #include <span>
 #include <string>
@@ -172,46 +173,87 @@ private:
     Err                        err_   = Err::Missing;
 
     void parse(std::uint64_t filesize) {
-        const auto* u = reinterpret_cast<const std::uint32_t*>(base_);
-        if (filesize < 12) { err_ = Err::Truncated; return; }
-        const std::uint32_t magic = u[0];
         const auto* b8 = static_cast<const std::uint8_t*>(base_);
+        const auto read32 = [&](std::size_t offset) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, b8 + offset, sizeof value);
+            return value;
+        };
+        const auto extent_fits = [&](std::uint64_t offset, std::uint64_t count,
+                                     std::uint64_t element_size) {
+            if (count > std::numeric_limits<std::uint64_t>::max() / element_size) return false;
+            const std::uint64_t bytes = count * element_size;
+            return offset <= filesize && bytes <= filesize - offset;
+        };
+        const auto docs_valid = [&](const std::vector<std::uint64_t>& docs, std::uint64_t ntok) {
+            if (docs.empty() || docs.front() != 0) return docs.empty();
+            for (std::size_t i = 1; i < docs.size(); ++i)
+                if (docs[i] <= docs[i - 1] || docs[i] > ntok) return false;
+            return true;
+        };
+
+        if (filesize < 12) { err_ = Err::Truncated; return; }
+        const std::uint32_t magic = read32(0);
         if (magic == MAGIC_V2) {                              // ---- v2 (u64 counts, width) ----
             if (filesize < 32) { err_ = Err::Truncated; return; }
-            vocab_ = static_cast<int>(u[1]);
-            bpt_   = static_cast<int>(u[2] / 8);
-            if (bpt_ < 1 || bpt_ > 4) { err_ = Err::BadMagic; return; }
+            const std::uint32_t vocab = read32(4);
+            const std::uint32_t bits_per_token = read32(8);
+            const std::uint32_t flags = read32(12);
+            if (vocab == 0 || (bits_per_token != 16 && bits_per_token != 24 && bits_per_token != 32) || flags != 0) {
+                err_ = Err::BadMagic;
+                return;
+            }
+            vocab_ = static_cast<int>(vocab);
+            bpt_   = static_cast<int>(bits_per_token / 8);
             std::uint64_t ntok = 0, ndoc = 0;
             std::memcpy(&ntok, b8 + 16, 8);
             std::memcpy(&ndoc, b8 + 24, 8);
+            if (ntok > std::numeric_limits<std::size_t>::max() || ndoc > std::numeric_limits<std::size_t>::max() ||
+                !extent_fits(32, ntok, static_cast<std::uint64_t>(bpt_))) {
+                err_ = Err::Truncated;
+                return;
+            }
             const std::uint64_t tok_bytes = ntok * static_cast<std::uint64_t>(bpt_);
-            const std::uint64_t doc_bytes = ndoc * sizeof(std::uint64_t);
-            if (filesize < 32 + tok_bytes + doc_bytes) { err_ = Err::Truncated; return; }
+            if (!extent_fits(32 + tok_bytes, ndoc, sizeof(std::uint64_t))) { err_ = Err::Truncated; return; }
             data_  = b8 + 32;
             count_ = static_cast<std::size_t>(ntok);
             if (ndoc) {
-                const auto* d = reinterpret_cast<const std::uint64_t*>(b8 + 32 + tok_bytes);
-                docs_.assign(d, d + ndoc);
+                docs_.resize(static_cast<std::size_t>(ndoc));
+                const std::size_t offset = static_cast<std::size_t>(32 + tok_bytes);
+                for (std::size_t i = 0; i < docs_.size(); ++i)
+                    std::memcpy(&docs_[i], b8 + offset + i * sizeof(std::uint64_t), sizeof(std::uint64_t));
+                if (!docs_valid(docs_, ntok)) { err_ = Err::BadMagic; docs_.clear(); return; }
             }
             err_ = Err::Ok;
             return;
         }
         // ---- legacy S0TK / S0TD: u32 counts, int32 ids ----
         if (magic != MAGIC && magic != MAGIC_DOC) { err_ = Err::BadMagic; return; }
-        vocab_ = static_cast<int>(u[1]);
+        vocab_ = static_cast<int>(read32(4));
         bpt_   = 4;
-        const std::uint32_t ntok = u[2];
+        const std::uint32_t ntok = read32(8);
         const bool          doc  = (magic == MAGIC_DOC);
         const std::uint64_t header = doc ? 16 : 12;
-        const std::uint32_t ndoc = doc ? u[3] : 0u;
+        if (doc && filesize < header) { err_ = Err::Truncated; return; }
+        const std::uint32_t ndoc = doc ? read32(12) : 0u;
         const std::uint64_t tok_bytes = static_cast<std::uint64_t>(ntok) * sizeof(std::int32_t);
         const std::uint64_t doc_bytes = static_cast<std::uint64_t>(ndoc) * sizeof(std::uint32_t);
-        if (filesize < header + tok_bytes + doc_bytes) { err_ = Err::Truncated; return; }
+        if (!extent_fits(header, ntok, sizeof(std::int32_t)) ||
+            !extent_fits(header + tok_bytes, ndoc, sizeof(std::uint32_t))) {
+            err_ = Err::Truncated;
+            return;
+        }
         data_  = b8 + header;
         count_ = ntok;
         if (doc) {
-            const auto* d = reinterpret_cast<const std::uint32_t*>(b8 + header + tok_bytes);
-            docs_.assign(d, d + ndoc);                       // widen u32 -> u64
+            docs_.resize(ndoc);
+            const std::size_t offset = static_cast<std::size_t>(header + tok_bytes);
+            for (std::size_t i = 0; i < docs_.size(); ++i) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, b8 + offset + i * sizeof(std::uint32_t), sizeof value);
+                docs_[i] = value;
+            }
+            if (!docs_valid(docs_, ntok)) { err_ = Err::BadMagic; docs_.clear(); return; }
         }
         err_ = Err::Ok;
     }
