@@ -465,6 +465,44 @@ if(WIN32)
 endif()
 set_target_properties(sub0llm-qwen4-forward PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
+# --- WP5c: the real-axes GENERATION harness ---------------------------------
+# Same shape and the same reasoning as sub0llm-qwen4-forward directly above -- it links the engine, so
+# it is compiled against ${GEN_DIR}'s generated config and only does anything useful in a build that
+# was configured at the real Qwen4 axes. Two differences, both load-bearing:
+#
+# 1. It ALSO links sub0_frontend, because WP5a's real Qwen tokenizer (src/qwen_tokenizer.cpp) lives
+#    there -- engine-free by design, so it is not in sub0_core. SUB0_SOURCE_DIR is defined for the same
+#    reason tests/CMakeLists.txt defines it: the tool reuses the tokenizer test's own directory lookup
+#    (--tokenizer-dir, then $SUB0_QWEN_TOKENIZER_DIR, then <repo>/data/qwen_tokenizer) and the last of
+#    those needs the source root as a compile-time string.
+#
+# 2. It links with a 32 MiB stack, and that is a REAL CONSTRAINT rather than a precaution.
+#    sub0::sample_token (src/engine_core.cpp) holds `std::array<float, VOCAB>` twice and
+#    `std::array<int, VOCAB>` once as ordinary locals; at the real model's VOCAB of 248,320 that is
+#    2.84 MiB of stack in one frame, against the 1 MiB Windows default -- i.e. an unconditional
+#    overflow. It has never bitten before because no real-axes consumer had ever SAMPLED: WP4d/e/f and
+#    WP5b all stop at the logits. This target is the first to call it, so it is the first that needs
+#    the room. Deliberately fixed here at the link line and NOT in engine_core.cpp: that file is
+#    shared with every other build in the repo, and changing its sampler's storage class is a separate
+#    piece of work with its own review (recorded in docs/WP4_SCOPE.md WP5c).
+add_executable(sub0llm-qwen4-gen tools/sub0llm-qwen4-gen.cpp)
+target_include_directories(sub0llm-qwen4-gen PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
+target_link_libraries(sub0llm-qwen4-gen PRIVATE sub0_core sub0_frontend CLI11::CLI11)
+target_compile_definitions(sub0llm-qwen4-gen PRIVATE SUB0_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(WIN32)
+  # GetProcessMemoryInfo, as in the forward harness -- the peak-working-set number.
+  target_link_libraries(sub0llm-qwen4-gen PRIVATE psapi)
+  # See point 2 above. MSVC-style linkers (link.exe and lld-link, which is what clang++ drives on this
+  # target triple) take the main thread's stack reserve as /STACK; the clang driver needs -Xlinker to
+  # pass it through untouched.
+  if(MSVC)
+    target_link_options(sub0llm-qwen4-gen PRIVATE "/STACK:33554432")
+  else()
+    target_link_options(sub0llm-qwen4-gen PRIVATE "-Xlinker" "/STACK:33554432")
+  endif()
+endif()
+set_target_properties(sub0llm-qwen4-gen PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+
 # --- WP4f: the hidden-state comparison tool ---------------------------------
 # The OPPOSITE of sub0llm-qwen4-forward directly above: this one links NO engine and includes NO
 # generated config, so it builds in every configuration of this repo including the default one. That is
