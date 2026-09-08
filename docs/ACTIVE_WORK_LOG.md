@@ -34,16 +34,17 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
-**2026-09-08 Claude Code — shared-tree state flag, not fixed, for whoever next uses the SHARED working
-tree** (`D:\Craig\GitHub\Sub0Llm`, not a `.claude/worktrees/*` one). Found while merging WP5c: that tree
-had `feature/wp5c-qwen-generation` checked out (not `main`) — apparently WP5c's own resumed subagent
-session worked directly in it rather than in its own isolated worktree — with an uncommitted `AGENTS.md`
-edit present (a further refinement of the "delegate to Terra" research-delegation note, not mine, not
-touched). `main` itself was never at risk: its branch ref stayed correctly at `4468c26` throughout, and
-this merge was done in a separate throwaway worktree (`.claude/worktrees/main-merge`) specifically to
-avoid disturbing the shared tree's dirty state. **Left as found** — did not `git checkout main` there,
-did not touch the uncommitted `AGENTS.md` edit. Whoever next uses that shared tree should check
-`git status`/`git branch` before assuming it's on `main`.
+**2026-09-08 Claude Code — shared-tree state flag from earlier today, now RESOLVED.** Found while merging
+WP5c: the SHARED working tree (`D:\Craig\GitHub\Sub0Llm`, not a `.claude/worktrees/*` one) had
+`feature/wp5c-qwen-generation` checked out (not `main`) — apparently WP5c's own resumed subagent session
+worked directly in it rather than in its own isolated worktree — with an uncommitted `AGENTS.md` edit
+present (a further refinement of the "delegate to Terra" research-delegation note). `main` itself was
+never at risk: its branch ref stayed correctly at `4468c26` throughout, and the WP5c merge was done in a
+separate throwaway worktree specifically to avoid disturbing the shared tree's dirty state. The user
+confirmed the `AGENTS.md` edit was theirs (broadening delegation to Sonnet-class agents, not just Terra)
+— committed and cherry-picked onto `main` (`4eb471e`), the shared tree switched back to `main`, and the
+stale `feature/wp5c-qwen-generation` branch deleted (local + already-deleted-on-origin). Shared tree is
+clean and on `main` again as of this entry.
 
 2026-09-08 Claude Code update: **`main` did not compile** (`cb85d5a`, pushed) — three mechanical build
 breaks left by the CPU/CUDA backend split, found by actually building, not just reading the diff: (1)
