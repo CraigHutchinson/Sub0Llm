@@ -18,13 +18,13 @@ the CPU for more than a few minutes; update it when you finish.
 
 ## Research delegation
 
-Standing user preference (2026-09-08): delegate data gathering and research to a Terra agent
-(`gpt-5.6-terra`). Give it a bounded question, relevant project context, and an explicit request for
+Standing user preference: delegate data gathering and research to a Sonnet or Terra class agent respectively
+(`Sonnet 5`, `gpt-5.6-terra`). Give it a bounded question, relevant project context, and an explicit request for
 primary sources, evidence, uncertainties, and applicability to our actual hardware/software versions.
 The primary agent remains responsible for assessing the findings, integrating them into the design
 or implementation, and verifying consequential claims. Continue useful independent work in parallel.
 Research delegation does not authorize installs, shared-file edits, or contended hardware measurements;
-scope and coordinate those separately. If Terra is unavailable, state that and continue locally.
+scope and coordinate those separately. If Sonnet/Terra is unavailable, state that and continue locally.
 
 ## 1. No heap allocation in any per-step or per-call hot path
 
