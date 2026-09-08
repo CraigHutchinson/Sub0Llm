@@ -251,6 +251,24 @@ if(NOT MSVC)
   target_compile_options(sub0llm-transplant-q PRIVATE -fconstexpr-steps=1000000000)
 endif()
 
+# WP5b (docs/WP4_SCOPE.md WP5b): the SAME tool at the FULL 48 layers, quantized-resident. A third
+# target for the same reason there is a second -- N_LAYERS and MOE_QUANT_EXPERTS both change
+# make_param_layout(), so each combination is its own PARAM_LAYOUT and its own binary.
+#
+# Quantized-resident is not a choice here, it is the only expressible form: all-f32 the full model is
+# 125,711,062,400 floats == 468 GiB of blob. The tool refuses -DSUB0_QWEN4_LAYERS=48 without
+# -DSUB0_MOE_QUANT_EXPERTS=1 at compile time, so there is deliberately no f32 48-layer target to build
+# by accident.
+add_executable(sub0llm-transplant-q48 tools/sub0llm-transplant.cpp)
+target_include_directories(sub0llm-transplant-q48 PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
+  "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0llm-transplant-q48 PRIVATE SUB0_QWEN4_LAYERS=48 SUB0_MOE_QUANT_EXPERTS=1)
+target_link_libraries(sub0llm-transplant-q48 PRIVATE CLI11::CLI11)
+if(NOT MSVC)
+  target_compile_options(sub0llm-transplant-q48 PRIVATE -fconstexpr-steps=1000000000)
+endif()
+
 # --- Stage 2: code generation — run the configurator to emit the config ------
 set(GEN_DIR    "${CMAKE_BINARY_DIR}/generated")
 set(GEN_HEADER "${GEN_DIR}/sub0_config.hpp")

@@ -1,5 +1,12 @@
 # WP4 — real-scale Qwen3.8-Flash-Next run + llama.cpp comparison: scoping proposal
 
+Status (2026-09-08): **WP4a-f are all DONE and merged, and WP5b — the FULL 48-layer model — has been
+executed.** The real Qwen3.8-Flash-Next `UD-IQ1_S` weights now transplant, load and run through this
+engine's own `Model::forward` at all 48 layers, in 35.51 GiB of peak working set, at ≈8.2 s/token. See
+"WP5b" at the end of §6 for the numbers and for the honest verdict (memory: yes; disk: yes; throughput:
+not remotely interactive yet, and that is now the only binding constraint). Everything below this
+paragraph predates that and is kept for its reasoning.
+
 Status (2026-09-07): **WP4a-e are DONE and merged — the original "scoping only" status below is
 historical, kept for the reasoning, not the current state.** A real 4-layer sub-stack (3 GDN + 1 QSA)
 with real transplanted weights runs through this engine's own `Model::forward`. WP4f (the llama.cpp
@@ -1010,9 +1017,15 @@ property (`desc_index` is `(layer, expert, plane)`-major and a bijection) as a r
 
 **Deliberately still open, named here so WP4f does not rediscover them:**
 
-- **The sidecar payload is READ into memory, not `mmap`ed.** 3.17 GiB at 4 layers is fine and the file
+- ~~**The sidecar payload is READ into memory, not `mmap`ed.** 3.17 GiB at 4 layers is fine and the file
   is opened once outside any hot path. At the full 48 layers (~38 GiB encoded) an `mmap` becomes the
-  right call — and only `moeq::Store::open` changes; nothing above its `raw()` accessor can tell.
+  right call — and only `moeq::Store::open` changes; nothing above its `raw()` accessor can tell.~~
+  **CLOSED by WP5b** (see its section below). The prediction held on both counts: only
+  `moeq::Store::open` changed, and nothing above `raw()` could tell — checked rather than asserted, by
+  an independent reproduction of the eager read compared bit-for-bit through `moe::expert_ffn_row`. The
+  real encoded size at 48 layers is **37.11 GiB**, and it turned out to be not merely "the right call"
+  but the difference between a run that fits in 35.51 GiB and one that needs ≥69.45 GiB on a 63.43 GiB
+  machine.
 - **`print_host_memplan` does not know about the sidecar.** It reports `PARAM_FLOATS` (5.89 GiB) and is
   called before `load_model`, so the sidecar's 3.17 GiB shows only in `load_model`'s own line. It cannot
   be a compile-time term — the encoded size depends on which formats the source file used — so closing
@@ -1471,6 +1484,184 @@ can measure.
 - **Deliberately not attempted**: a fix to `llama.cpp`. Nothing found here is a llama.cpp bug — its
   converter and its graph are mutually consistent, and its quantized arithmetic is a deliberate
   performance choice.
+
+### WP5b — the FULL 48-layer model: `mmap`, transplant, load, run. EXECUTED. Results, recorded rather than summarised
+
+**Beyond WP4's original scope.** WP4a-f are done and the 4-layer sub-stack is validated; the goal since
+2026-09-08 is real interactive inference with the WHOLE model. WP5b is one of two prerequisites (the
+other, a real Qwen tokenizer, is WP5a and shares no files). Its deliverable is narrow and was stated
+before any of it ran: **can the real 48-layer model be produced and loaded on this machine at all — and
+if not, by how much is it short?** Not a new correctness gate; WP4c/d/f own correctness at real dims.
+
+#### The prerequisite: `moeq::Store` maps its payload instead of reading it
+
+WP4e's own "deliberately still open" list named this exactly right, including the part about nothing
+above the accessor being able to tell. The arithmetic that makes it a prerequisite rather than a tidy-up,
+with every term measured rather than estimated:
+
+| Term | 4 layers (WP4e) | 48 layers (measured this pass) |
+|---|---:|---:|
+| `PARAM_FLOATS` blob, f32 | 5.89 GiB | **18.31 GiB** (4,915,107,200 floats, 1,074 tensors) |
+| routed-expert sidecar, native GGUF bytes | 3.17 GiB | **37.11 GiB** (39,845,888,000 bytes, 73,728 planes) |
+| activation arenas, ONE Worker (`ACT_CAP` x2, `SEQ_LEN` 128) | 1.86 GiB | **14.03 GiB** |
+| **eager-read total, before any headroom** | 10.9 GiB | **69.45 GiB** — larger than this machine's 63.43 GiB of RAM |
+
+So an eager read does not merely make the run tight, it makes it **impossible**: the sidecar alone plus
+the blob is 55.42 GiB, and the first Worker's arenas push the total past total physical RAM before a
+token is embedded. Mapped, the sidecar's contribution to resident memory is whatever the run actually
+touches — `EXPERTS_PER_TOK` (10) of `NUM_EXPERTS` (512) per token per layer — and those pages are
+file-backed and evictable rather than committed private bytes.
+
+`include/sub0/file_map.hpp` is a small RAII read-only whole-file mapping (Win32 `CreateFileMapping`/
+`MapViewOfFile`, POSIX `mmap`), written as its own header rather than as a second hand-rolled call site
+beside `tokmap.hpp`'s — `AGENTS.md` §10's "remove the class, not the instance". `tokmap.hpp` is
+deliberately NOT converted in this pass: it is a hot training-path file and the conversion is unrelated
+to a work package gated on a bitwise-identity claim.
+
+**The gate, and why it is structural rather than a spot check.** `tests/moe_quant_tests.cpp` reproduces
+the OLD eager read INDEPENDENTLY (`EagerStore`, written from the S0Q1 format spec, not by calling the
+new code) and requires the mapped Store and the eager one to agree bit-for-bit at all three levels a
+consumer can observe: the raw encoded bytes `raw()` hands back, the dequantized `[in, out]` plane, and
+**`moe::expert_ffn_row`'s own output** — the only thing the engine actually does with a resolved expert.
+The third is the one that matters: identical byte spans could still be consumed differently, and the
+whole claim is that they cannot be.
+
+**One real behavioural difference, recorded rather than worked around**: on Windows a mapped file cannot
+be deleted or truncated while a view is open. Three existing test cases now scope their `Store` so the
+mapping is released before their own `remove()`. For a live model this is the property you want — the
+weights cannot change underneath a running forward pass.
+
+#### The 48-layer build path
+
+`N_LAYERS` is now 4 **or** 48 in `tools/sub0llm-transplant.cpp`, and **48 is quantized-resident only**,
+refused at compile time otherwise: all-f32 the full model is 125,711,062,400 floats = **468 GiB** of
+destination blob. That is not a tuning problem, it is the reason WP4e exists, so there is deliberately
+no f32 48-layer target to build by accident.
+
+`tests/qwen4_real_axes/full48_totals.hpp` carries the full model's totals in both residency forms as
+hand-derived literals (the same device `sub4_prefix.hpp` uses one scale down), and
+`tests/qwen4_full48_quant_shape_tests.cpp` is a **third** shape binary — one per distinct
+`PARAM_LAYOUT`, for the same ODR reason there were already two. Beyond the two totals it pins what the
+deduction removed (routed `gate`/`up`/`down` counts = 0) and what it did **not** (router, shared expert,
+GR/GDN/QSA/embeddings all still per-layer, 97 `GrHcNorm`, no `LnF`), states the deduction as an
+arithmetic identity against the f32 sibling's own independently-written census, re-checks the 4-layer
+sub-stack boundary *inside* the full layout, and walks all 48 mixer slots rather than only the first
+four.
+
+| Quantity | all-f32 | quantized-resident |
+|---|---:|---:|
+| `NUM_PARAMS` at 48 layers | 74,802 | **1,074** |
+| `PARAM_FLOATS` at 48 layers | 125,711,062,400 (468.3 GiB) | **4,915,107,200 (18.31 GiB)** |
+
+#### The real transplant, and its gate
+
+`sub0llm-transplant-q48` against the real `D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S` shards.
+**162.8 s**, single-threaded, producing two files in `D:\ModelWeights\Sub0Llm-Qwen4-full48\`:
+
+| | bytes | |
+|---|---:|---|
+| `qwen4_full48_q.bin` | 19,660,428,872 | 18.31 GiB (48-byte header + blob + three 8-byte trailers) |
+| `qwen4_full48_q.bin.moeq` | 39,848,247,352 | 37.11 GiB (56-byte header + 73,728 x 32-byte descriptors + payload) |
+| **total on disk** | **59,508,676,224** | **55.42 GiB** |
+
+Disk was never the binding constraint: `D:` had 437.6 GiB free before and 381.9 GiB after.
+
+Every gate, at the full scale, with the actual numbers:
+
+| Check | Result |
+|---|---|
+| Level 1 — reconciliation | **1,074 / 1,074** destinations, **4,915,107,200 / 4,915,107,200** floats, **1** synthesized (`LmBias`), **7** unmatched in-scope sources — the same deliberately-excluded PLE set as at 4 layers (`per_layer_token_embd` + `blk.1.ple_*`), now over all 48 layers rather than 4 |
+| Level 2 — per-tensor statistics | **1,073 tensors checked, 0 mismatches** |
+| WP4f converter conventions undone | **145** zero-centred gammas (2 per layer + the GR exit + 4 per QSA layer x 12), **36** `ssm_a` (one per GDN layer), **288** v-head reorders (8 tensors x 36 GDN layers) — every count exactly 12x the 4-layer run's, which is itself a check that nothing was applied per-file rather than per-layer |
+| Sidecar bit-for-bit sample | **1,152 expert planes** (8 experts x 3 planes x 48 layers) compared against the f32 path, **0 mismatches**, spanning all three formats |
+| Per-layer mixed quantization, printed not assumed | `IQ1_S` **34,816** planes, `IQ2_XXS` **14,336**, `IQ4_NL` **24,576** (= 48 x 512, i.e. every layer's `down`) |
+| `--verify`, bit-for-bit against what LANDED on disk | re-ran the ENTIRE pipeline and compared every destination against the written file: **0 mismatches of 1,074**, 85.5 s. Levels 1-4 validate what the tool computes; only this validates what is on the disk |
+
+The routed experts are **12.13x** smaller than the same experts as f32 (37.11 GiB vs 450.00 GiB).
+
+#### It loads, and it runs
+
+`sub0llm-qwen4-forward` needed **no change at all** — it was already written against `N_LAYERS` and
+`MIXER_SCHEDULE` rather than against 4. The engine was built through the REAL `sub0llm-configure` at the
+real axes with `--layers 48 --moe-quant-experts 1`, whose generated `sub0_corpus.hpp` is field-for-field
+identical to `tests/qwen4_real_axes/sub0_config.hpp` at those settings, `VOCAB = 248320` exactly.
+
+| Check | Result |
+|---|---|
+| `load_model()` accepts the artifact | **YES**, first try. Header, `PARAM_FLOATS` and both fingerprint trailers matched. **19.0 s** for 18.31 GiB |
+| the sidecar pairs to it | 73,728 tensors, 39,845,888,000 bytes, resolve pool 8 slots x 1,638,400 floats (150.0 MiB) |
+| peak working set **after load** | **18.32 GiB** — i.e. the 37.11 GiB mapping contributed **essentially nothing**, which is the whole point |
+| peak after `graph_reset` (one Worker's arenas) | **32.35 GiB** |
+| `Model::forward` at the real dims, 48 layers | **[6 x 248320] in 50.35 s**, **zero non-finite**; per-row logit rms 2.35-2.82, range -17.4 … +14.3 |
+| engine path vs INDEPENDENT math-core replay, layers 0-2 | worst **‖h_in‖ 1.82e-08 / ‖delta‖ 2.16e-08** — the same float32 accumulation-order band WP4d/e/f recorded at 4 layers (2.84e-08 / 1.7e-08) |
+| `forward` vs `forward_one` over all 6 positions | **0 exactly** |
+| `forward_one` walk, 6 positions | **49.43 s** |
+| independent double-precision un-normed readout vs the engine's own logits | **2.56e-05** (float32 GEMM noise over 2,560 terms; 4-layer figure was 5.89e-06 against a ~4x smaller hidden state) |
+| **peak working set, whole run** | **35.51 GiB** against 63.43 GiB total and ~46 GiB free at launch |
+
+**A number that grew, and is worth reading as confirmation rather than noise.** WP4d measured the
+removed `ln_f` as worth **0.174 against a logit rms of 0.605 — 28.8% of scale** at 4 layers. At 48
+layers the same measurement is **9.54 against a logit rms of 2.387 — 399.8% of scale**, because the
+residual stream's own RMS at the head is now 3.905 rather than ≈1. The effect of a spurious
+normalization scales with how far the stream's RMS is from 1, exactly as WP4d said it must — so the
+`LnF` removal, which was survivable-looking at 4 layers, would have been catastrophic at 48. The eps
+question that removal made moot is correspondingly tiny: `max|1e-5 - 1e-6|` = 9.69e-07.
+
+#### The verdict on interactive inference, and the number it rests on
+
+**Memory: yes, comfortably, and only because of the mapping.** 35.51 GiB peak against 63.43 GiB total.
+Eager-read it would have been ≥69.45 GiB — over total physical RAM, not merely over free RAM. There is
+roughly 10 GiB of headroom left over the machine's real background load, which is enough for a second
+Worker (+14.03 GiB) **not** to fit at `SEQ_LEN = 128`; a forward-only run is single-Worker by
+construction, so that is a bound on future parallelism, not on this.
+
+**Disk: yes.** 55.42 GiB for the pair, on a volume with 437.6 GiB free.
+
+**Throughput: NO, not at this speed, and this is now the binding constraint.** 50.35 s to prefill 6
+tokens and 49.43 s to decode 6 more is **≈8.2 s/token**. Interactive inference needs that number to come
+down by two to three orders of magnitude. Nothing about it is surprising — it is 12x the 4-layer figure,
+i.e. exactly linear in depth, and WP4e already measured and reported that dequantize-on-demand costs
+**3.7x** over f32-resident. So the honest statement is: **the full model now loads and runs, and the
+remaining gap to interactive use is entirely performance, not feasibility.**
+
+Where that performance work has to start is already scoped and is deliberately not attempted here:
+WP4e's own open list names the uninstrumented resolve-pool hit rate, `gguf::to_f32`'s redundant
+re-zeroing of 1.6M floats per resolve, and — the big one — the fact that this engine dequantizes a whole
+expert to f32 and then runs an ordinary f32 kernel, where `llama.cpp` never materializes f32 at all. At
+48 layers a 6-token forward resolves up to 2,880 experts; the measured mapped-page footprint of that is
+**~2.6 GiB** of the 37.11 GiB sidecar, so the *memory* side of on-demand residency is working exactly as
+designed and it is the *decode cost* that is expensive.
+
+#### Deliberately still open, named here so nothing rediscovers them
+
+- **`SEQ_LEN` is 128**, as it has been since WP4b's own shape header, and the activation arena scales
+  with it: 14.03 GiB per Worker at 128. A real interactive session wants a longer window, and at these
+  axes that term grows linearly — 512 would be ~56 GiB per Worker and does not fit. **The activation
+  arena, not the weights, is what bounds context length on this machine**, which is a different answer
+  from the one `docs/QWEN4_MEMORY_ORCHESTRATION.md` §3d predicted (it costed the KV cache and GDN
+  prefill scratch, both real, but the arena's own `3/2 + headroom` over-provisioning dominates here).
+- **`act_grad` is allocated in a `FORWARD_ONLY` build** — half of that 14.03 GiB is an activation
+  GRADIENT arena in a build whose four mechanisms all `abort()` in `backward_node`. WP4d removed the
+  four `PARAM_FLOATS`-sized training arenas on exactly this argument and did not extend it to the
+  per-Worker activation grad. Eliding it would halve the per-Worker cost to ~7.0 GiB, which is the
+  single cheapest available headroom win and the obvious prerequisite to a longer `SEQ_LEN`.
+- **`print_host_memplan` reports a 24-Worker plan (363 GiB) that a forward-only run never allocates.**
+  Workers are lazily allocated and this run used one. Misleading rather than wrong, and unchanged from
+  WP4d.
+- **Nothing has compared these 48-layer outputs to anything.** §5's PLE exclusion bounds a llama.cpp
+  comparison at `blk.0.out` regardless of depth, and WP4f already ran that comparison and settled it
+  (2.6e-06 against an independent float64 reference). What is genuinely unestablished is whether layers
+  4-47 are transplanted correctly: they are shape-checked, statistics-checked, converter-convention-
+  corrected and structurally identical to layers 0-3 by construction, but no *output* of them has been
+  checked against any oracle. The 4-layer artifact is a compile-time-proven prefix of this one, which is
+  the strongest carry-forward available without a new reference.
+- **The ENGINE build and the forward run were made on the pre-`backends/`-reorg tree.** `main` did not
+  compile at the time of writing for two unrelated reasons (see `docs/ACTIVE_WORK_LOG.md`); one of them
+  — empty backend source manifests, a `PARENT_SCOPE`-in-an-`include()` mistake — is fixed on this
+  branch, the other is another agent's uncommitted `muon.hpp` and was left alone rather than guessed
+  at. Everything that links no engine (all three transplant targets, all three shape targets,
+  `sub0_frontend_tests`, and the `--verify` pass above) WAS built and run on today's `main` plus that
+  fix; only `sub0llm-qwen4-forward` and `sub0_core` were built from this branch's own `4005819`.
 
 ---
 
