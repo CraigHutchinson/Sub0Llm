@@ -56,21 +56,23 @@
 //      transplant::transpose_out_in. That is what makes WP4e's gate -- bitwise-identical engine output
 //      between the all-f32-resident path and this one -- a structural property rather than a hope.
 //
-// Engine-free (gguf.hpp + transplant.hpp only, no sub0_config.hpp, no layout.hpp), like both of those,
-// so the format and the cache are unit-testable without compiling a model at the real axes.
+// Engine-free (gguf.hpp + transplant.hpp + file_map.hpp only, no sub0_config.hpp, no layout.hpp), like
+// all of those, so the format and the cache are unit-testable without compiling a model at the real
+// axes.
 
 #pragma once
 
+#include "sub0/file_map.hpp"
 #include "sub0/gguf.hpp"
 #include "sub0/transplant.hpp"
 
 #include <array>
 #include <cstdint>
-#include <fstream>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sub0::moeq {
@@ -156,47 +158,72 @@ inline bool dequantize_expert(const Desc& d, std::span<const std::uint8_t> raw, 
 
 // --- reader ------------------------------------------------------------------------------------------
 
-// Owns the sidecar's descriptor table and its whole encoded payload, resident in its native form. Read
-// once at load time, never written; every resolve is a read of a byte range already in memory.
+// Holds the sidecar's descriptor table and a read-only MAPPING of its encoded payload, in its native
+// form. Opened once at load time, never written; every resolve reads a byte range out of the mapping.
 //
-// The payload is READ, not memory-mapped, and that is a deliberate choice for this stage rather than an
-// oversight: it is ~3.2 GiB for the 4-layer sub-stack this gate runs at, the file is opened exactly once
-// outside any hot path, and a portable mmap is platform code this stage does not need to be judged on.
-// At the full 48 layers (~38 GiB) an mmap becomes the right call, and only this function changes --
-// nothing above the `raw()` accessor can tell the difference.
+// WHY MAPPED AND NOT READ (docs/WP4_SCOPE.md WP5b; WP4e's own "deliberately still open" list named this
+// as the change the full model would need). The payload used to be read into an owned buffer, which at
+// the 4-layer sub-stack is 3.17 GiB and invisible. At the real 48 layers it is ~38 GiB, and an eager
+// read of that plus the 18.3 GiB f32 backbone plus a 14 GiB activation arena exceeds this machine's
+// free RAM before a single token is embedded. A mapping changes the arithmetic rather than shaving it:
+//   * a forward pass dequantizes only the experts it ROUTES to (EXPERTS_PER_TOK of NUM_EXPERTS per
+//     token per layer), so the vast majority of those 38 GiB is never touched and never faulted in;
+//   * the pages that ARE touched are file-backed and evictable, so they count against the working set
+//     the OS can reclaim under pressure, not against committed private bytes that it cannot.
+// Nothing above `raw()` can tell: the accessor still hands back a `span<const uint8_t>` over bytes that
+// are addressable for the life of the Store, which is the only property `dequantize_expert` and the
+// resolve pool ever relied on. That claim is kept true rather than merely asserted --
+// tests/moe_quant_tests.cpp reproduces the OLD eager read independently and requires bit-identical
+// expert planes AND bit-identical moe::expert_ffn_row output from the two.
+//
+// The descriptor table is COPIED out of the mapping rather than pointed at: it is small (32 bytes per
+// routed-expert plane -- 2.25 MiB even at 48 layers), and copying it sidesteps any question about
+// reading a `Desc` through a pointer into mapped bytes whose alignment is the file's business.
 class Store {
 public:
     // Returns false and fills `err` on any problem; never throws, never partially initializes.
     bool open(const std::string& path, std::string& err) {
-        std::ifstream f(path, std::ios::binary);
-        if (!f) { err = "cannot open " + path; return false; }
-        const auto got = [&](std::streamsize want) { return f.gcount() == want; };
+        map_.close();
+        descs_.clear();
+        h_ = Header{};
+        data_ = nullptr;
 
-        f.read(reinterpret_cast<char*>(&h_), sizeof h_);
-        if (!got(sizeof h_)) { err = path + ": truncated header"; return false; }
+        FileMap m;
+        if (!m.open(path, err)) return false;
+        const std::uint8_t* p = m.data();
+        const std::uint64_t file_bytes = m.size();
+
+        if (file_bytes < sizeof(Header)) { err = path + ": truncated header"; return false; }
+        std::memcpy(&h_, p, sizeof h_);
         if (std::memcmp(h_.magic, "S0Q1", 4) != 0) { err = path + ": not an S0Q1 sidecar"; return false; }
         if (h_.version != 1) { err = path + ": unsupported S0Q1 version"; return false; }
         if (h_.n_tensors != static_cast<std::uint64_t>(h_.n_layers) * h_.num_experts * PerExpert) {
             err = path + ": tensor count does not match n_layers * num_experts * 3";
             return false;
         }
+        const std::uint64_t table_bytes = h_.n_tensors * sizeof(Desc);
+        if (file_bytes < sizeof(Header) + table_bytes) {
+            err = path + ": truncated descriptor table";
+            return false;
+        }
         descs_.resize(static_cast<std::size_t>(h_.n_tensors));
-        const auto table_bytes = static_cast<std::streamsize>(descs_.size() * sizeof(Desc));
-        f.read(reinterpret_cast<char*>(descs_.data()), table_bytes);
-        if (!got(table_bytes)) { err = path + ": truncated descriptor table"; return false; }
+        std::memcpy(descs_.data(), p + sizeof(Header), static_cast<std::size_t>(table_bytes));
 
-        data_ = std::make_unique<std::uint8_t[]>(static_cast<std::size_t>(h_.data_bytes));
-        f.clear();
-        f.seekg(static_cast<std::streamoff>(h_.data_off));
-        const auto payload_bytes = static_cast<std::streamsize>(h_.data_bytes);
-        f.read(reinterpret_cast<char*>(data_.get()), payload_bytes);
-        if (!got(payload_bytes)) { err = path + ": truncated payload"; return false; }
-        // Every descriptor must lie inside the payload. Checked once here so no resolve has to.
+        // The payload must lie wholly inside the file. This is the check the eager read got for free
+        // from a short read; with a mapping it has to be explicit, because addressing past the end of a
+        // view is an access violation rather than a `gcount()` shortfall.
+        if (h_.data_off > file_bytes || h_.data_bytes > file_bytes - h_.data_off) {
+            err = path + ": the payload runs past the end of the file";
+            return false;
+        }
+        // And every descriptor must lie inside the payload. Checked once here so no resolve has to.
         for (const Desc& d : descs_)
             if (d.off > h_.data_bytes || d.bytes > h_.data_bytes - d.off) {
                 err = path + ": a descriptor's byte range runs past the payload";
                 return false;
             }
+        map_ = std::move(m);
+        data_ = map_.data() + h_.data_off;
         return true;
     }
 
@@ -207,15 +234,20 @@ public:
         return descs_[static_cast<std::size_t>(desc_index(h_.num_experts, layer, expert, which))];
     }
     std::span<const std::uint8_t> raw(const Desc& d) const {
-        return {data_.get() + d.off, static_cast<std::size_t>(d.bytes)};
+        return {data_ + d.off, static_cast<std::size_t>(d.bytes)};
     }
 
+    // The sidecar's encoded payload size. Named for what it measures -- how many bytes of routed
+    // expert this model has -- which is unchanged by the payload now being mapped rather than read;
+    // what changed is how much of it a given run actually faults in, which only a real RSS measurement
+    // can say (docs/QWEN4_MEMORY_ORCHESTRATION.md's "a prediction is not a measurement").
     std::uint64_t resident_bytes() const { return h_.data_bytes; }
 
 private:
-    Header                          h_{};
-    std::vector<Desc>               descs_;
-    std::unique_ptr<std::uint8_t[]> data_;
+    Header                    h_{};
+    std::vector<Desc>         descs_;
+    FileMap                   map_;
+    const std::uint8_t*       data_ = nullptr;   // map_.data() + h_.data_off, or null
 };
 
 // --- the fixed-capacity resolve pool ------------------------------------------------------------------

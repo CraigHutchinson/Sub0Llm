@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <algorithm>   // std::max, used by the router's own softmax -- this header compiled only
+                        // because every existing consumer happened to include it first (WP5b)
 #include <cmath>
 #include <cstddef>
 

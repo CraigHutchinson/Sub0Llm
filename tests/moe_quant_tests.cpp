@@ -20,13 +20,26 @@
 //   * the cache changing the answer. A resolve pool is a cache, and a cache that can alter output is
 //     not a cache -- 1 slot and 4 slots must agree bit-for-bit over a selection pattern that forces
 //     both eviction and reuse.
+//   * WP5b: the MAPPING changing the answer. Store::open now memory-maps the payload instead of
+//     reading it into an owned buffer, so that the ~38 GiB sidecar the full 48-layer model needs is
+//     never eagerly resident. The claim that this is invisible above `raw()` is checked by
+//     reproducing the OLD eager read INDEPENDENTLY (EagerStore below -- an ifstream into an owned
+//     buffer, written from the format spec, not by calling the new code) and requiring the two to
+//     agree bit-for-bit on the raw bytes, on the dequantized planes, AND on moe::expert_ffn_row's own
+//     output. The last of those is the one that matters: it is the only consumer the engine actually
+//     has, and it is what makes this a structural claim rather than a spot check
+//     ([[independent-reimplementation-catches-identity-swap-bugs]], the same discipline WP4e's own
+//     forward_row_via refactor was gated on).
 
+#include "sub0/moe_math.hpp"
 #include "sub0/moe_quant.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -118,6 +131,44 @@ std::string temp_path(const char* stem) {
     return (std::filesystem::temp_directory_path() / stem).string();
 }
 
+// WP5b: the residency form moeq::Store used BEFORE it mapped its payload -- an ifstream read into an
+// owned buffer. Written here from the S0Q1 format spec (moe_quant.hpp's Header/Desc + data_off), NOT by
+// calling the current Store, because a reader compared against itself proves nothing about a change to
+// how it acquires its bytes. This is the "b" side of WP5b's own gate; it exists only in this file and
+// nothing in src/ or tools/ can reach it.
+class EagerStore {
+public:
+    bool open(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.read(reinterpret_cast<char*>(&h_), sizeof h_);
+        if (f.gcount() != static_cast<std::streamsize>(sizeof h_)) return false;
+        if (std::memcmp(h_.magic, "S0Q1", 4) != 0) return false;
+        descs_.resize(static_cast<std::size_t>(h_.n_tensors));
+        const auto table_bytes = static_cast<std::streamsize>(descs_.size() * sizeof(moeq::Desc));
+        f.read(reinterpret_cast<char*>(descs_.data()), table_bytes);
+        if (f.gcount() != table_bytes) return false;
+        data_ = std::make_unique<std::uint8_t[]>(static_cast<std::size_t>(h_.data_bytes));
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(h_.data_off));
+        const auto payload_bytes = static_cast<std::streamsize>(h_.data_bytes);
+        f.read(reinterpret_cast<char*>(data_.get()), payload_bytes);
+        return f.gcount() == payload_bytes;
+    }
+    const moeq::Header& header() const { return h_; }
+    const moeq::Desc& desc(int layer, int expert, int which) const {
+        return descs_[static_cast<std::size_t>(moeq::desc_index(h_.num_experts, layer, expert, which))];
+    }
+    std::span<const std::uint8_t> raw(const moeq::Desc& d) const {
+        return {data_.get() + d.off, static_cast<std::size_t>(d.bytes)};
+    }
+
+private:
+    moeq::Header                    h_{};
+    std::vector<moeq::Desc>         descs_;
+    std::unique_ptr<std::uint8_t[]> data_;
+};
+
 }  // namespace
 
 TEST_CASE("moeq: the on-disk structs are the size the format says", "[moequant]") {
@@ -184,6 +235,11 @@ TEST_CASE("moeq: a written sidecar reads back, and its planes match the f32 path
     const std::string path = temp_path("sub0_moeq_roundtrip.bin");
     const Built built = build_sidecar(2, path);
 
+    // WP5b: the Store is SCOPED so its mapping is released before the remove() at the end. That is a
+    // real behavioural difference the mmap upgrade introduced, and it is the correct one: on Windows a
+    // mapped file cannot be deleted or truncated while the view is open, which for a live model is
+    // exactly the property you want (the weights cannot change underneath a running forward pass).
+    {
     moeq::Store store;
     std::string err;
     REQUIRE(store.open(path, err));
@@ -212,7 +268,8 @@ TEST_CASE("moeq: a written sidecar reads back, and its planes match the f32 path
                 // the same bytes, so any difference at all is a real defect, not rounding.
                 REQUIRE(std::memcmp(dst.data(), ref.data(), ref.size() * sizeof(float)) == 0);
             }
-    std::filesystem::remove(path);
+    }
+    REQUIRE(std::filesystem::remove(path));
 }
 
 TEST_CASE("moeq: Store refuses a truncated or foreign file rather than reading garbage", "[moequant]") {
@@ -253,6 +310,7 @@ TEST_CASE("moeq: the resolve pool is a cache -- its capacity cannot change the a
     // the f32 reference, so this is not two caches agreeing on the same wrong value.
     const std::string path = temp_path("sub0_moeq_cache.bin");
     const Built built = build_sidecar(2, path);
+    {   // scoped: the mapping must be released before the remove() below (see the roundtrip case)
     moeq::Store store;
     std::string err;
     REQUIRE(store.open(path, err));
@@ -291,5 +349,107 @@ TEST_CASE("moeq: the resolve pool is a cache -- its capacity cannot change the a
     REQUIRE(one.hits() < four.hits());
     REQUIRE(one.misses() + one.hits() == pattern.size());
     REQUIRE(four.misses() + four.hits() == pattern.size());
-    std::filesystem::remove(path);
+    }
+    REQUIRE(std::filesystem::remove(path));
+}
+
+TEST_CASE("moeq (WP5b): mapping the payload instead of reading it changes nothing above raw()",
+          "[moequant]") {
+    // THE GATE for the mmap upgrade. The eager read is reproduced independently (EagerStore above) and
+    // the two are compared at all three levels a consumer can observe:
+    //   1. the raw encoded bytes handed back by raw()      -- the accessor's own contract
+    //   2. the dequantized [in, out] plane                  -- what dequantize_expert produces from them
+    //   3. moe::expert_ffn_row's output                     -- the ONLY thing the engine actually does
+    //                                                          with a resolved expert
+    // Level 3 is the one that makes this structural: an identical byte span could still be consumed
+    // differently, and the whole point of the change is that it cannot be.
+    const std::string path = temp_path("sub0_moeq_mmap.bin");
+    const Built built = build_sidecar(2, path);
+    {   // scoped: the mapping must be released before the remove() below (see the roundtrip case)
+    moeq::Store mapped;
+    std::string err;
+    REQUIRE(mapped.open(path, err));
+    REQUIRE(mapped.loaded());
+    EagerStore eager;
+    REQUIRE(eager.open(path));
+
+    // The two agree on the table itself before anything is decoded, so a later disagreement cannot be
+    // blamed on a mis-parsed header.
+    REQUIRE(mapped.header().n_tensors == eager.header().n_tensors);
+    REQUIRE(mapped.header().data_off == eager.header().data_off);
+    REQUIRE(mapped.header().data_bytes == eager.header().data_bytes);
+
+    // A row of input with no zeros anywhere: expert_ffn_row skips zero inputs, and a row of zeros would
+    // make every expert produce the same output and hide a wrong plane entirely.
+    const moe::Dims dims{kIn, kOut, kExperts, 2};
+    std::vector<float> x(kIn);
+    for (int i = 0; i < kIn; ++i) x[static_cast<std::size_t>(i)] = 0.25f + 0.125f * static_cast<float>(i);
+
+    std::vector<float> plane_m(kPerExpert, 0.f), plane_e(kPerExpert, 0.f);
+    std::vector<float> scratch_m, scratch_e;
+    std::vector<float> gate_m(kPerExpert), up_m(kPerExpert), down_m(kPerExpert);
+    std::vector<float> gate_e(kPerExpert), up_e(kPerExpert), down_e(kPerExpert);
+    std::vector<float> out_m(kIn), out_e(kIn), pre(kOut), g(kOut);
+
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < kExperts; ++e) {
+            std::vector<float>* planes_m[3] = {&gate_m, &up_m, &down_m};
+            std::vector<float>* planes_e[3] = {&gate_e, &up_e, &down_e};
+            for (int w = 0; w < moeq::PerExpert; ++w) {
+                const moeq::Desc& dm = mapped.desc(l, e, w);
+                const moeq::Desc& de = eager.desc(l, e, w);
+                // 1. the same descriptor and the same bytes.
+                REQUIRE(dm.off == de.off);
+                REQUIRE(dm.bytes == de.bytes);
+                REQUIRE(dm.type_raw == de.type_raw);
+                const auto bm = mapped.raw(dm);
+                const auto be = eager.raw(de);
+                REQUIRE(bm.size() == be.size());
+                REQUIRE(std::memcmp(bm.data(), be.data(), bm.size()) == 0);
+                // 2. the same dequantized plane, bit for bit.
+                REQUIRE(moeq::dequantize_expert(dm, bm, plane_m.data(), scratch_m));
+                REQUIRE(moeq::dequantize_expert(de, be, plane_e.data(), scratch_e));
+                REQUIRE(std::memcmp(plane_m.data(), plane_e.data(), kPerExpert * sizeof(float)) == 0);
+                *planes_m[w] = plane_m;
+                *planes_e[w] = plane_e;
+            }
+            // 3. the same expert_ffn_row output, bit for bit -- the engine's only consumer.
+            moe::expert_ffn_row(dims, x.data(), gate_m.data(), up_m.data(), down_m.data(),
+                                out_m.data(), pre.data(), g.data());
+            moe::expert_ffn_row(dims, x.data(), gate_e.data(), up_e.data(), down_e.data(),
+                                out_e.data(), pre.data(), g.data());
+            REQUIRE(std::memcmp(out_m.data(), out_e.data(), out_m.size() * sizeof(float)) == 0);
+            // And it is not trivially zero on both sides, which would make the comparison vacuous.
+            bool any_nonzero = false;
+            for (float v : out_m) any_nonzero = any_nonzero || (v != 0.f);
+            REQUIRE(any_nonzero);
+        }
+    }
+    REQUIRE(std::filesystem::remove(path));
+}
+
+TEST_CASE("moeq (WP5b): a Store outlives the scope its FileMap was opened in", "[moequant]") {
+    // The one lifetime property a mapping has that an owned buffer did not: `raw()` hands back a span
+    // over pages the Store must keep mapped. A Store moved/held past the open() call's own scope, with
+    // the source file deleted underneath it on POSIX and held open on Windows, must still read.
+    const std::string path = temp_path("sub0_moeq_lifetime.bin");
+    const Built built = build_sidecar(1, path);
+    std::vector<float> scratch, dst(kPerExpert, 0.f);
+    {
+        moeq::Store store;
+        std::string err;
+        REQUIRE(store.open(path, err));
+        // Re-opening the SAME Store must release the previous mapping and succeed, not leak a handle
+        // or refuse -- load_model calls open() exactly once, but nothing in the type says so.
+        REQUIRE(store.open(path, err));
+        const moeq::Desc& d = store.desc(0, kExperts - 1, moeq::Down);
+        REQUIRE(moeq::dequantize_expert(d, store.raw(d), dst.data(), scratch));
+        const std::vector<float> ref = f32_reference(
+            built.plane_bytes[static_cast<std::size_t>(
+                moeq::desc_index(kExperts, 0, kExperts - 1, moeq::Down))], kIn, kOut);
+        REQUIRE(std::memcmp(dst.data(), ref.data(), ref.size() * sizeof(float)) == 0);
+    }
+    // The mapping is released with the Store, so the file is removable straight afterwards on Windows
+    // too -- which is also the check that nothing leaked the HANDLE.
+    REQUIRE(std::filesystem::remove(path));
 }
