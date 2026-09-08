@@ -7,6 +7,12 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 1. **Two agents editing the same file at the same time** — not just a merge conflict, but one agent's
    in-flight investigation silently invalidated by the other's concurrent change to a shared surface
    (`backend_cpu.cpp`, `layout.hpp`, `gdn_math.hpp`, etc. are read/written by nearly every work package).
+   **2026-09-07 decision: both agents share ONE working tree today** (not separate git worktrees) —
+   deliberate, for efficient work separation without cross-worktree sync overhead. This makes the log's
+   own discipline load-bearing, not just good hygiene: `git add -A`/`-u` or any blanket-stage operation
+   is unsafe while another agent's uncommitted edits are present — always `git add <specific paths>`,
+   check `git status --short` before AND after every commit, and never `git checkout --`/`git stash`/
+   `git reset` across a file you did not personally add to the log.
 2. **CPU-contended perf/build work running alongside another agent's perf-sensitive work** — a heavy
    `cmake --build`, test suite run, or benchmark on one track can add real noise to timing measurements
    on another track (this project's own established lesson,
@@ -31,7 +37,7 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 | Started | Agent | Work package | Branch | Files/areas | Status | Notes |
 |---|---|---|---|---|---|---|
 | 2026-09-07 | Claude Code | WP4f: root-cause the layer-0 Sub0Llm-vs-llama.cpp divergence | `fix/wp4f-layer0-divergence` (tentative — not yet confirmed pushed) | `include/sub0/transplant.hpp`, likely `include/sub0/gdn_math.hpp`/`gated_residual_math.hpp`, `tools/sub0llm-transplant.cpp` | active | Dispatched to a background subagent; hit a rate limit mid-fix ("now the core fix in `transplant.hpp`"). See memory `wp4-handover-2026-09-07` for full context and resume instructions. |
-| (backlog) | Independent review agent | B14: finish Muon scratch reuse + profile matrix products | — | `include/sub0/muon.hpp`, `src/backend_cpu.cpp` (Muon step) | active | Per the user directly, in progress now. CPU-heavy/perf-sensitive — other agents should not run competing benchmarks concurrently. |
+| (backlog) | Independent review agent (Codex) | B14: finish Muon scratch reuse + profile matrix products | — | `include/sub0/muon.hpp`, `src/backend_cpu.cpp` (Muon step), `benchmarks/muon_bench.cpp`, `tests/muon_tests.cpp`, `tests/cuda_tests.cpp`, `benchmarks/CMakeLists.txt`, `docs/MUON_CPU_OPTIMIZATION.md`, `docs/CPU_PERF_BACKLOG.md` | active (uncommitted, appears to be wrapping up — `docs/MUON_CPU_OPTIMIZATION.md` already records a measured 1.9-3.5x result as of 2026-09-08, but nothing is committed yet, so treat `backend_cpu.cpp` as still hot) | Per the user directly. 2026-09-07: user confirmed one shared working tree for today; resuming WP4f (row above) in parallel now that the file overlap risk is understood — Claude's WP4f fix is scoped to `transplant.hpp`, not `backend_cpu.cpp`, so no direct collision expected, but do NOT run `git add -A` or touch these files. |
 
 ## Cleared for the independent-review agent to pick up next (after B14), per this file's own read of WP4's active scope
 
