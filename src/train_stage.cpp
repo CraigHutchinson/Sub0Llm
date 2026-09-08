@@ -39,6 +39,9 @@
 #include "sub0/corpus_collapse.hpp" // wordspike's mechanism over sampled REAL corpus docs (a "corpus_collapse" schedule source)
 #include "sub0/bench.hpp"    // adaptive_time: budget-sized measurement shared with the GPU tuner
 #include "sub0/memplan.hpp"  // train_resident_mb: predicted device footprint (guard + drift check)
+#if __has_include("sub0_provenance.hpp")
+#include "sub0_provenance.hpp"
+#endif
 
 // Code version + models root, baked in by CMake (configure-time) so a model records what
 // produced it and lands in a structured directory. Fallbacks keep the file compilable alone.

@@ -347,6 +347,15 @@ if(SUB0_BUILD_CUDA)
 endif()
 
 # --- Stage 4: backend stage libraries ---------------------------------------
+set(SUB0_PROVENANCE_HEADER "${GEN_DIR}/sub0_provenance.hpp")
+add_custom_target(sub0_provenance ALL
+  COMMAND ${CMAKE_COMMAND}
+    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DOUTPUT_FILE=${SUB0_PROVENANCE_HEADER}
+    -P ${CMAKE_SOURCE_DIR}/cmake/write_provenance.cmake
+  BYPRODUCTS "${SUB0_PROVENANCE_HEADER}"
+  VERBATIM)
+
 add_library(sub0_train SHARED src/train_stage.cpp)
 # sub0_frontend (the tokenizer) links in DIRECTLY, not just transitively via sub0_core (which links
 # it PRIVATE, so its symbols aren't re-exported): --spell-mix deserializes tokenizer.tok into a raw
@@ -354,6 +363,8 @@ add_library(sub0_train SHARED src/train_stage.cpp)
 # It's a static PIC lib, so this embeds its own copy in sub0_train.dll -- the stateless tokenizer
 # functions have no cross-DLL shared state, so a second copy is harmless.
 target_link_libraries(sub0_train PRIVATE sub0_core sub0_frontend)
+add_dependencies(sub0_train sub0_provenance)
+target_include_directories(sub0_train PRIVATE "${GEN_DIR}")
 # MSVC's CRT headers flag std::getenv deprecated (favoring _dupenv_s); the two SUB0_TRAIN_CPU /
 # SUB0_FIXED_SEQ toggles are simple read-only env lookups with no buffer to overflow, so the
 # "insecure" warning has nothing to protect against here -- suppress it rather than take on a
@@ -369,16 +380,9 @@ if(SUB0_BUILD_CUDA)
 endif()
 
 # The train/models stages tag each model with the code version that produced it and lay
-# them out under a models root. Pass both as compile definitions (configure-time) ONLY to
-# this stage, so a new commit does not force an engine-core rebuild. Reconfigure to refresh.
-execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" rev-parse --short HEAD
-                OUTPUT_VARIABLE SUB0_GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET RESULT_VARIABLE _git_rc)
-if(NOT _git_rc EQUAL 0 OR SUB0_GIT_SHA STREQUAL "")
-  set(SUB0_GIT_SHA "nogit")
-endif()
+# them out under a models root. The provenance header is refreshed at build time so a
+# normal rebuild after a commit or source edit cannot retain configure-time metadata.
 target_compile_definitions(sub0_train PRIVATE
-  SUB0_GIT_SHA="${SUB0_GIT_SHA}"
   SUB0_MODELS_ROOT="${CMAKE_SOURCE_DIR}/models")
 
 add_library(sub0_gen SHARED src/gen_stage.cpp)
