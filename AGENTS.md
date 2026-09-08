@@ -9,6 +9,13 @@ of the rule.
 If you're an agent (or a human) about to add a new op, optimizer, config knob, or file format change
 to this engine: read this first.
 
+**More than one agent may be working on this repo at the same time.** Before touching a shared file
+(`backend_cpu.cpp`, `layout.hpp`, `engine_core.cpp`, `core.hpp`, and any `*_math.hpp` are the usual
+ones) or starting a CPU-heavy build/test/benchmark run, check `docs/ACTIVE_WORK_LOG.md` for an
+overlapping active entry — a perf-sensitive workload on one track can invalidate another's
+measurements even with zero file overlap. Add a row when you start something that will hold a file or
+the CPU for more than a few minutes; update it when you finish.
+
 ## 1. No heap allocation in any per-step or per-call hot path
 
 Every model dimension is a compile-time constant, so the engine's forward/backward/training-loop
