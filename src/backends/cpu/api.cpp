@@ -10,6 +10,7 @@ void set_sentinel_bindings(const SentinelBindings* bindings) { cpu_detail::set_s
 void print_host_memplan() { cpu_detail::print_host_memplan(); }
 void print_config() { cpu_detail::print_config(); }
 bool load_moe_quant_sidecar(const char* model_path) { return cpu_detail::load_moe_quant_sidecar(model_path); }
+std::size_t trainable_floats() { return cpu_detail::trainable_floats(); }
 float* params_ptr() { return cpu_detail::params_ptr(); }
 float* grad_ptr() { return cpu_detail::grad_ptr(); }
 float* adam_m_ptr() { return cpu_detail::adam_m_ptr(); }

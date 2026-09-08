@@ -12,6 +12,7 @@ void set_sentinel_bindings(const SentinelBindings* bindings);
 void print_host_memplan();
 void print_config();
 bool load_moe_quant_sidecar(const char* model_path);
+std::size_t trainable_floats();
 float* params_ptr();
 float* grad_ptr();
 float* adam_m_ptr();

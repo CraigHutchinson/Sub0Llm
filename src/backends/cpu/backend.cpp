@@ -3018,17 +3018,20 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
             // forward+backward on this worker thread; cleared right after so nothing leaks to the next
             // window or beyond this call. All three setters write thread_local state, so per-window
             // per-worker installation is race-free by construction.
-            if (win_binds)    set_scratch_bindings(win_binds[b]);
-            if (win_sentinel) set_sentinel_bindings(win_sentinel[b]);
-            if (win_persist)  set_persistent_bindings(win_persist[b]);
+            // Qualified explicitly: these arguments' own types live in namespace sub0, so
+            // unqualified lookup here would let ADL pull in the SUB0_API sub0:: declarations
+            // (core.hpp) alongside these cpu_detail:: ones and make every call ambiguous.
+            if (win_binds)    cpu_detail::set_scratch_bindings(win_binds[b]);
+            if (win_sentinel) cpu_detail::set_sentinel_bindings(win_sentinel[b]);
+            if (win_persist)  cpu_detail::set_persistent_bindings(win_persist[b]);
             graph_reset();
             Node* logits = g_model.forward(data + starts[b], Tb);
             Node* loss   = op_cross_entropy(logits, tgt);
             total += loss->data[0];
-            backward(loss, 1.f / static_cast<float>(batch));
-            if (win_binds)    set_scratch_bindings(nullptr);
-            if (win_sentinel) set_sentinel_bindings(nullptr);
-            if (win_persist)  set_persistent_bindings(nullptr);
+            cpu_detail::backward(loss, 1.f / static_cast<float>(batch));
+            if (win_binds)    cpu_detail::set_scratch_bindings(nullptr);
+            if (win_sentinel) cpu_detail::set_sentinel_bindings(nullptr);
+            if (win_persist)  cpu_detail::set_persistent_bindings(nullptr);
         }
         // (implicit barrier above: every thread's grad slot is complete)
         const int nthreads = omp_get_num_threads();
