@@ -314,7 +314,7 @@ endif()
 # Compiled by nvcc; meets the clang world only at the extern "C" self-test boundary.
 # Grows into the real GPU backend (replacing backend_cpu.cpp under SUB0_COMPUTE=GPU).
 if(SUB0_BUILD_CUDA)
-  add_library(sub0_backend_cuda SHARED src/backends/cuda/backend.cu)
+  add_library(sub0_backend_cuda SHARED ${SUB0_CUDA_BACKEND_SOURCES})
   target_include_directories(sub0_backend_cuda PRIVATE "${CMAKE_SOURCE_DIR}/include" "${GEN_DIR}")
   set_target_properties(sub0_backend_cuda PROPERTIES
     CUDA_ARCHITECTURES "${SUB0_CUDA_ARCH}"

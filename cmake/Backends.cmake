@@ -96,7 +96,8 @@ endif()
 # The engine sub0_core compiles is ALWAYS the CPU backend (the sub0:: API + parity reference).
 # GPU mode additionally builds the CUDA device-training backend; SUB0_BUILD_CUDA is DERIVED from
 # the resolved mode (it is not an independent toggle), so SUB0_COMPUTE is the single switch.
-set(SUB0_BACKEND_SOURCES src/backends/cpu/backend.cpp)
+include("${CMAKE_SOURCE_DIR}/src/backends/cpu/CMakeLists.txt")
+include("${CMAKE_SOURCE_DIR}/src/backends/cuda/CMakeLists.txt")
 
 if(SUB0_COMPUTE_RESOLVED STREQUAL "CPU")
   set(SUB0_BUILD_CUDA OFF CACHE BOOL "Build the CUDA device-training backend (derived from SUB0_COMPUTE)" FORCE)
