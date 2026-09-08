@@ -5,8 +5,8 @@
 # switch for the pure cases, so every dead path is eliminated and every optimization
 # pathway stays open. SUB0_COMPUTE picks the target:
 #
-#   CPU    - scalar + OpenMP backend (src/backend_cpu.cpp)         [always the engine]
-#   GPU    - CPU engine + CUDA device TRAINING (src/backend_cuda.cu, nvcc)
+#   CPU    - scalar + OpenMP backend (src/backends/cpu/backend.cpp)  [always the engine]
+#   GPU    - CPU engine + CUDA device TRAINING (src/backends/cuda/backend.cu, nvcc)
 #   HYBRID - CPU + CUDA, autotuned split                           [Phase 3 -- not yet]
 #   AUTO   - resolve the best available at configure time (-> GPU if a CUDA device is
 #            present, else CPU)                                    [default]

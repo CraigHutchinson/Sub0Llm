@@ -7,7 +7,7 @@ mechanically as they are next touched (each migration shrinks the scattered lega
 
 ## What exists, and what was wrong with it for multi-backend
 
-The CPU engine (`src/backend_cpu.cpp`) is **always the engine**: the whole `sub0::` API (graph,
+The CPU engine (`src/backends/cpu/backend.cpp`) is **always the engine**: the whole `sub0::` API (graph,
 forward/backward, sampling, AdamW/Muon, the binding mechanisms) compiles for every build. A device
 backend is an **add-on accelerator** reached through an `extern "C"` seam across a DLL boundary
 (`sub0_backend_cuda.dll`), selected at **build time** (`SUB0_COMPUTE=AUTO/CPU/GPU/HYBRID`,

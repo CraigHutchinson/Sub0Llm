@@ -56,7 +56,7 @@ struct Sub0DeviceCaps {
 // `encoding` carries sub0::SlotEncoding's underlying value; only the param-free arms below have
 // device kernels -- anything else is REJECTED at install (nonzero return, nothing changes), never
 // silently mis-composed. Cross-referenced with the kBindEntryInts/kBindEnc* block in
-// src/backend_cuda.cu (a static_assert there pins the values; the two headers deliberately don't
+// src/backends/cuda/backend.cu (a static_assert there pins the values; the two headers deliberately don't
 // share code -- same convention as scratch_slots.hpp vs registry.hpp's enum-name list).
 constexpr int SUB0_DEV_BIND_ENTRY_INTS   = 3;
 constexpr int SUB0_DEV_BIND_ENC_MEANPOOL = 0;   // == (int)sub0::SlotEncoding::MeanPool
