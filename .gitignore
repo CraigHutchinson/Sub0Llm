@@ -38,6 +38,11 @@ data/cosmopedia.txt
 data/minipile.txt
 data/tutorspike_corpus.txt
 data/tutorspike_manifest.json
+# WP5a: the REAL Qwen tokenizer's own vocab.json/merges.txt/tokenizer_config.json (~10 MB), the
+# default place tests/qwen_tokenizer_tests.cpp looks for them. Fetched model data, same category as
+# the corpora above -- and large enough that an accidental commit is exactly the mistake the
+# corpus.tok note below was written about. See docs/QWEN_TOKENIZER.md sec 5 for the fetch command.
+data/qwen_tokenizer/
 runs/
 
 # Model/training artifacts, wherever they land. /models is already ignored, but a mistyped model
