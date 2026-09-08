@@ -1,6 +1,6 @@
 # Intel iGPU and backend restructuring work packages
 
-Date: 2026-09-08. **Planned work, not implementation status.**
+Date: 2026-09-08. **Reconciled with `220afaf`; research and conditional implementation plan.**
 User priority: interactive inference first, training later.
 Read [the platform research and design](INTEL_IGPU_BACKEND_DESIGN.md) for evidence, architecture,
 ownership, benchmark protocol and selection criteria.
@@ -8,13 +8,16 @@ ownership, benchmark protocol and selection criteria.
 ## Scope and execution rules
 
 The deliverable is a measured decision and, only if justified, a useful Intel inference path with
-maintainable backend boundaries. OpenVINO, SYCL and Vulkan receive support/correctness gates before
-performance comparisons. No commitment to implement all three native backends.
+maintainable backend boundaries. Sub0Llm retains execution ownership. Intel-native kernel generation
+(SYCL/ESIMD initially) and Level Zero versus SYCL submission are the primary experiments. OpenVINO
+and llama.cpp are optional bounded comparisons; Vulkan is parked. See the
+[ISA, quantization and memory study](INTEL_IGPU_ISA_MEMORY_RESEARCH.md) for I18–I20's evidence and probes.
 
 Code preparation can run in parallel; **hardware measurements on this laptop are serialized**.
 Check [ACTIVE_WORK_LOG.md](ACTIVE_WORK_LOG.md) before touching shared files or consuming the CPU/GPU.
-Claude's WP4f fidelity work owns the current oracle. Freeze a corrected revision rather than changing
-its transplant or reference harness from a second track.
+WP4f's converter correction merged in `296f2a1`; freeze its corrected fixtures and precision metadata.
+Claude owns active WP5a tokenizer and WP5b mmap/full-scale transplant work; consume their results
+without editing their tools or `moe_quant.hpp`. Copilot owns active I08/I09 extraction.
 
 Each package gets its own result/report directory and explicit file ownership. In the shared working
 tree, one integration owner edits root CMake, generated-config emitters and public headers. Other
@@ -29,30 +32,34 @@ approved project estimate.
 
 ## Package map
 
-| ID | Deliverable | Dependencies | Estimate | Can prepare while WP4f runs? |
-|---|---|---|---|---|
-| I00 | Hardware/runtime inventory and reproducible environments | None | S | Yes, read-only inventory; schedule device probes |
-| I01 | Artifact/operator census and correctness manifest | WP4f for final golden values | M | Yes, schema/fixture inventory |
-| I02 | llama.cpp SYCL comparison | I00, I01 for exact target | M | Yes, isolated source/build preparation |
-| I03 | llama.cpp Vulkan comparison | I00, I01 for exact target | M | Yes, isolated source/build preparation |
-| I04 | OpenVINO feasibility and comparison | I00, I01 for exact target | M, bounded | Yes, support/export analysis |
-| I05 | Native Intel mechanism experiment | I00, component fixtures in I01 | M | Yes, engine-free source preparation |
-| I06 | Measured platform decision | I02–I05 | S | Report/harness preparation only |
-| I07 | Canonical device ABI/build selection completion | Stable source checkpoint, I01 | M | Design/caller inventory only |
-| I08 | CPU backend extraction | WP4f stable; baseline frozen | M | Mapping only |
-| I09 | CUDA backend extraction | CUDA baseline frozen; coordinate I07 | L | Mapping only |
-| I10 | Encoded-weight preparation and memory plan | I01, I06 selects native route, I07 | L | Descriptor/census design only |
-| I11 | Native context and dense inference foundation | I06 selects native route, I07 | L | Design only |
-| I12 | GDN and gated-residual device path | I11, I01 | L | Fixture review / experiment preparation |
-| I13 | QSA device path | I11, I01 | L | Fixture review / experiment preparation |
-| I14 | Encoded MoE device path | I10, I11 | L | Quant-format analysis |
-| I15 | Integrated prefill/decode and qualification | I10–I14; I08 where needed | L | Consumer/benchmark design |
-| I16 | CPU/iGPU/NVIDIA placement experiment | I15 or working external equivalent | XL | Cost-model design only |
-| I17 | Full-model feasibility, PLE and later training | Separate gates below | XL | Inventory only; not first milestone |
+| ID | Deliverable / current status | Dependencies | Estimate |
+|---|---|---|---|
+| I00 | Runtime inventory; registry identity known, execution unverified | None | S |
+| I01 | Correctness manifest; merged WP4f correction is input | Corrected fixtures and precision census | M |
+| I02 | Optional llama.cpp SYCL reference | I00, I01 for exact target | M |
+| I03 | Vulkan comparison — parked | Evidence to reopen, then I00/I01 | Deferred |
+| I04 | Optional bounded OpenVINO comparison | I00, I01 | M |
+| I05 | Native dense/GDN/encoded-expert experiment | I00/I01, initial I18/I19 findings | M |
+| I06 | Native execution recipe decision | I05, I18–I20; optional I02/I04 evidence | S |
+| I07 | Device ABI/build axis; not delivered by source moves | I01; I07b lands with I11 | M |
+| I08 | CPU extraction — area, manifest and API facade landed; deeper split active | Frozen baseline, coordinate Copilot | M remaining |
+| I09 | CUDA extraction — area and manifest landed; deeper split active | CUDA baseline, coordinate Copilot/I07 | L remaining |
+| I10 | Encoded-weight preparation and memory accounting | I01/I06, I19, coordinate I07/I11 | L |
+| I11 | Native context and dense generation consumer | I06, I07a; land I07b together | L |
+| I12 | GDN and gated residual | I11, I01 | L |
+| I13 | QSA | I11, I01 | L |
+| I14 | Encoded MoE | I10/I11, I18 | L |
+| I15 | Integrated prefill/decode and acceptance | I10–I14; I08 only where needed | L |
+| I16 | CPU/iGPU/NVIDIA placement | I15 or equivalent working experiment; I19 | XL |
+| I17 | Full decoder and later training | WP5a/b inputs; separate gates below | XL |
+| I18 | ISA/code-generation and quantization proof | I00, I01 for real planes | M |
+| I19 | Memory access, residency and bounded staging | I00; WP5b findings as available | M |
+| I20 | Equivalent-kernel Level Zero/SYCL submission comparison | I00, executable I18 kernel; coordinate I19 | M |
 
-I07–I09 are independently useful maintenance work. **I08/I09 are not prerequisites for I02–I06**,
-and finishing every CUDA extraction is not a prerequisite for Intel inference. If OpenVINO or Vulkan
-wins, revise I10–I15 around that actual implementation before authoring native code.
+I07–I09 remain independently useful maintenance. They do not block engine-free research, and a
+complete CUDA split is not required for Intel inference. I08/I09 delivery so far is structural;
+full runtime parity/performance gates remain outstanding in the active owner's log. Do not repeat
+committed moves or infer that a source manifest implements multi-toolchain orchestration.
 
 ## Wave 1: establish evidence without engine changes
 
@@ -84,11 +91,12 @@ identity, token IDs, state formats, missing PLE/vision/MTP and each plane's actu
 GDN unequal heads, Q width != hidden width, GR exit, QSA tail/indexer, MoE selected/shared experts.
 
 **Done when:** a machine-readable manifest gives each backend a coverage row by **op, shape, dtype,
-and phase**; reference fixtures carry origin, checksum, precision and tolerances. Final prefix goldens
-depend on WP4f completion. Small real-vocabulary and exact-head-geometry cases exist. Required-fixture
+and phase**; reference fixtures carry origin, checksum, precision and tolerances. Use WP4f's corrected revision and independently checked floating-point results.
+Record llama.cpp activation quantization separately; the historical ~2.2% layer-0 gap is not a
+universal tolerance. WP5 full-scale artifacts get distinct manifests as they become available. Small real-vocabulary and exact-head-geometry cases exist. Required-fixture
 absence exits nonzero. A four-layer prefix is never scored as a full-model language-quality result.
 
-### I02 — llama.cpp SYCL
+### I02 — Optional llama.cpp SYCL reference
 
 **Owns:** `scripts/intel/sycl/`, `out/intel-review/sycl/`; a separate upstream checkout, not Claude's.
 
@@ -102,7 +110,10 @@ manifest; TTFT/decode/memory data follow the design protocol. Unexpected CPU exe
 all-iGPU gate; intentional mixed execution is a separately labeled result. No global claim that
 the SYCL compiler guarantees full model support.
 
-### I03 — llama.cpp Vulkan
+### I03 — llama.cpp Vulkan (parked)
+
+**Status:** deprioritized by user. No build or measurement required for I06. The specification below
+is retained only for a later evidence-backed reopening.
 
 **Owns:** `scripts/intel/vulkan/`, `out/intel-review/vulkan/`, separate upstream build output.
 
@@ -114,7 +125,7 @@ do not assume cooperative-matrix acceleration is available on this adapter.
 driver identified. Any revision mismatch with SYCL is explicit. Include observed CPU fallbacks and
 allocated memory; no conclusion based solely on an ordinary dense model or a shader compiling.
 
-### I04 — OpenVINO: two feasibility routes
+### I04 — Optional OpenVINO: two bounded feasibility routes
 
 **Owns:** `scripts/intel/openvino/`, `out/intel-review/openvino/` and any small export experiment there.
 
@@ -139,7 +150,7 @@ porting assignment hidden in a benchmark ticket.
 **Owns:** `benchmarks/intel/` standalone sources and `out/intel-review/native-probe/`. Separate CMake
 entry for the experiment; no production CLI flags.
 
-**Work:** compare oneDNN/oneMKL dense projection against a simple checked SYCL kernel at M=1 and
+**Work:** use I18 capability/code-generation results and I19 allocation constraints; compare oneDNN/oneMKL dense projection against a simple checked SYCL kernel at M=1 and
 prefill M=32/128; use D_MODEL=2560, Q/gate widths from layout, FF=640, real GDN head geometry. Add one
 GDN recurrent step and one selected expert triple from actual encoded weights. Compare direct encoded
 dot versus bounded f16/f32 resolve, including transfer/pack cost. A small fixed sequence of dependent
@@ -160,8 +171,10 @@ correctness, peak memory, fallback, and available energy data. Include CPU and e
 Use interleaved isolated trials. Apply the provisional 20%/5% promotion criteria from the design as an
 investment aid; show separate prompt-length outcomes rather than burying them in one score.
 
-**Done when:** choose one of: native SYCL investment, native Vulkan investment, OpenVINO integration,
-external-runtime integration, or stop Intel port work because it does not improve the use case.
+**Done when:** select a native kernel/compiler, submission and memory recipe, or stop/defer Intel port
+work because it does not improve the use case. Report direct Level Zero versus SYCL separately from
+kernel math and packing. Optional framework results inform this decision; switching to a whole-model
+external executor needs a separate design revision consistent with the user's own-engine objective.
 Document excluded candidates and why. If only a component works, approve at most the next component
 milestone, not full-backend delivery. Newer releases can reopen a failed route with new evidence.
 
@@ -197,12 +210,17 @@ No `HYBRID` flag is enabled without an actual scheduler. Coordinate export edits
 
 ### I08 — Split CPU responsibilities without changing behavior
 
+**Status:** Copilot active. Area relocation (`ba76503`), local source manifest (`fae914a`) and CPU
+API facade (`220afaf`) landed. Continue from private `api.hpp`/`api.cpp`; do not repeat those moves.
+B18's lifecycle documentation is done, but private state decomposition and runtime gates remain.
+
 **Owns:** `src/backends/cpu/backend.cpp` and new `src/backends/cpu/`; shared CMake changes queued through I07.
 
 **Work:** establish a private `WorkerState`/graph contract first without changing ownership. Then
 extract optimizer/reduction, private operators plus backward traversal, model/full-forward, and
 decode/API at natural dependency boundaries. Keep the `Model` pointers into the owning worker state;
-do not create a second layout or arena owner. Preserve decode caches as a separate reset lifetime.
+do not create a second layout or arena owner. Worker views borrow process-owned parameters;
+worker scratch/graph ownership must not duplicate that shared arena. Preserve decode caches as a separate reset lifetime.
 Preserve pointer lifetimes, initialization order, SIMD pragmas, `if constexpr`, hot inlining, and all
 model math. Keep TU-private helpers private; do not introduce a common polymorphic tensor class.
 Separate B12 memory changes from the initial source movement so regressions can be localized.
@@ -215,6 +233,9 @@ remain compatible. Do not start moves before the WP4f source checkpoint is stabl
 
 ### I09 — Split CUDA context, kernels, execution and diagnostics
 
+**Status:** Copilot active. CUDA area relocation (`605f3c5`) and local source manifest (`fae914a`)
+landed. Context/kernel/execution/diagnostic separation and runtime gates remain.
+
 **Owns:** `src/backends/cuda/backend.cu`, new `src/backends/cuda/`, private diagnostic declarations and CUDA tests.
 
 **Work:** first create the private context/state contract while retaining the current global ownership
@@ -226,7 +247,7 @@ and kernel launchers in suitable TUs. Determine whether device linking is actual
 relocatable-device-code globally by default. Keep captured graph addresses stable and error handling at
 the C boundary.
 
-The multi-source CMake target is part of this package: replace the single `backend_cuda.cu` source,
+The remaining multi-source target work extends the existing backend-local CMake source manifest;
 preserve the CUDA C++20 versus host C++26 boundary, and explicitly validate whether cross-TU device
 linking is required. The first extraction must preserve the current no-RDC behavior unless a measured,
 necessary split proves otherwise.
@@ -348,6 +369,10 @@ Merge capacity findings back into `QWEN4_MEMORY_ORCHESTRATION.md` rather than st
 
 ### I17 — Full decoder, optional sampling, and training follow-ups
 
+WP5a (real tokenizer) and WP5b (mmap sidecar/full 48-layer transplant and RSS) are active, separately
+owned inputs. Ingest their exact artifacts and measured memory when available; do not duplicate their
+implementation. Full transplant/load does not by itself establish complete PLE or useful generation.
+
 These are separate gates, not one deliverable:
 
 - **Complete useful model:** re-evaluate capacity for an actual full artifact, complete PLE/n-gram
@@ -362,42 +387,102 @@ These are separate gates, not one deliverable:
   does not supply these. Separate host optimizer settings from storage to avoid reserving unnecessary
   CPU Muon buffers for device-only work; relates to the recorded Muon memory follow-up.
 
+## Native research prerequisites (start before backend integration)
+
+### I18 — Instruction and code-generation proof for quantization
+
+**Owns:** `benchmarks/intel/isa/`, `out/intel-review/isa/`; shared inventory format by I00 owner.
+
+**Work:** identify PCI `8086:7D67` through runtime and pinned driver sources. Keep documented,
+runtime-reported and emitted/executed evidence separate. Check FP16 arithmetic/conversion, integer dot
+signedness/accumulation, subgroup operations and conditional matrix instructions. Compile SYCL and
+ESIMD microkernels; retain compiler flags, intermediate artifacts and disassembly when tooling permits.
+Do not infer XMX/DPAS from Arc branding or equate IQ encodings to uniform INT4.
+
+Compare actual IQ1_S/IQ2_XXS/IQ4_NL expert planes via fused decode/float dot, bounded tile decode, and
+integer-dot execution only with explicitly validated activation quantization and correction terms.
+Measure M=1 and prefill separately, including gather/unpack cost, register spills and memory traffic.
+Map GGML `[out,in]` to the engine's `[in,out]` explicitly with non-square real fixtures.
+
+**Done when:** a capability ledger distinguishes unsupported from unqueried/unavailable, checked
+kernels execute on the named adapter, and each promoted math path has numerical and timing evidence.
+Keep FP32 mathematical parity separate from quantized-reference parity. If assembly cannot be obtained,
+label instruction use unproven; do not promote a path based solely on its intrinsic's name.
+
+### I19 — Accessible memory, residency and movement
+
+**Owns:** `benchmarks/intel/memory/`, `out/intel-review/memory/`; proposed accounting changes remain
+private until I10 consumes them. Coordinate WP5b measurements without editing its implementation.
+
+**Work:** distinguish host physical/free/committed RAM, device addressability, maximum single
+allocation, aggregate live allocation, current OS budget, touched resident bytes and sustainable
+working set. Probe device/host/shared allocations and mapped-file access/import only where the runtime
+supports it. A large successful virtual reservation does not establish resident usable capacity.
+
+Use bounded, progressively touched working sets with explicit host/display headroom and stop thresholds.
+Compare repeated device reads, CPU copies, supported copy engines, selected-range staging and shared
+access. Count unique physical bytes, preparation peaks, page faults, eviction/stalls and synchronization;
+shared RAM is not extra capacity. Measure CPU/iGPU contention separately in reserved time.
+
+Specify reusable bounded staging slots, mapping ownership, completion-before-reuse, packing-cache
+identity, eviction and error cleanup. Compare direct shared access against resident packed tiles and
+explicit movement, including cold/warm misses. Cross-vendor zero-copy is unproven until demonstrated.
+
+**Done when:** publish a measured safe envelope for the driver/OS configuration, per-allocation and
+aggregate constraints, a movement/latency table and a concrete bounded memory recipe for I05/I10.
+Do not report all RAM or Task Manager's allowance as a universal allocatable limit. Full-model capacity
+is recomputed from WP5b's real artifact; no maximum-memory stress alongside its transplant/load.
+
+### I20 — Native submission overhead with equivalent kernels
+
+**Owns:** `benchmarks/intel/submission/`, `out/intel-review/submission/`; reuse I18 kernel artifacts.
+
+**Work:** compare ordinary SYCL, supported SYCL graph replay, and direct Level Zero reusable/immediate
+command-list execution for the same dependent kernel chain. Use identical binaries where supported;
+otherwise record differences in compilation, ABI, kernel math, allocation and synchronization as
+confounders. Include changing expert indices and kernel arguments without rebuilding every token.
+No speculative production ABI or backend-selection switch is added by this experiment.
+
+**Done when:** separately report host submission/wait time, device execution, cold compilation/setup,
+warm p50/p95 chain latency and observed allocations. Validate dependencies, reset/replay, completion
+and stable buffer lifetime before timing. Recommend direct Level Zero only from total critical-path
+results and maintenance costs, not its lower abstraction level. Feed the selected recipe into I06.
+
 ## Suggested parallel assignment
 
 ```mermaid
 flowchart TD
-    H[I00 Hardware and environments] --> S[I02 SYCL]
-    H --> V[I03 Vulkan]
-    H --> O[I04 OpenVINO]
-    H --> K[I05 Native mechanisms]
-    F[I01 Correctness manifest / WP4f] --> S
-    F --> V
-    F --> O
-    F --> K
-    S --> D[I06 Select or stop]
-    V --> D
-    O --> D
-    K --> D
-    A[I07 Device boundary] --> N[I10 / I11 Native foundation]
+    H[I00 Inventory] --> A[I18 ISA and code generation]
+    H --> M[I19 Memory and movement]
+    F[I01 Corrected fixtures] --> A
+    A --> K[I05 Native mechanisms]
+    M --> K
+    A --> S[I20 Submission]
+    K --> D[I06 Native recipe decision]
+    M --> D
+    S --> D
+    O[I02 / I04 Optional references] -.-> D
+    B[I07a Device boundary] --> N[I10 / I11 with I07b]
     D --> N
     N --> G[I12 GDN / GR]
     N --> Q[I13 QSA]
-    N --> M[I14 MoE]
-    G --> E[I15 Integrate and qualify]
-    Q --> E
-    M --> E
-    E --> X[I16 Placement]
+    N --> E[I14 MoE]
+    G --> R[I15 Integration]
+    Q --> R
+    E --> R
+    R --> X[I16 Placement]
 ```
 
-For a four-person/agent wave: one owner handles I00/I01 and measurement integration; three independent
-lanes prepare SYCL, Vulkan and OpenVINO. I05 follows the first usable Intel environment. They exchange
-manifests/results, not edits to WP4 code. Benchmarks use a shared time reservation, not simultaneous
-execution. No agents were launched during this design pass.
+For four independently owned preparation tracks: inventory/fixtures and result integration; ISA/quant
+kernels; memory/residency; submission harness (starts with a trivial checked kernel, then I18's binary).
+I05 combines their findings. Optional upstream/OpenVINO work must answer a bounded unresolved question;
+Vulkan consumes no initial slot. Hardware runs are serialized through the active log. No agents were
+launched in this design pass.
 
-After I06: one integration owner handles I07/I10/I11, with CPU and CUDA extractions independently
-scheduled after baselines stabilize. Once the native foundation contracts are fixed, GDN/GR, QSA and
-MoE can be authored concurrently in separate files. The integration owner merges the execution chain
-and conducts the serialized acceptance run.
+Copilot continues I08/I09; coordinate shared ABI/build files through one integration owner. Claude
+continues WP5a/b. These tracks need not wait for Intel research, and Intel engine-free research need not
+wait for their completion. Once I06 and native foundation contracts are ready, GDN/GR, QSA and MoE
+can be authored in separate leaf files; one integration owner handles the shared execution chain.
 
 ## Relationship to the independent backlog
 
@@ -405,15 +490,14 @@ and conducts the serialized acceptance run.
 |---|---|
 | B06 load-state validation | I10/I15 must not publish partially prepared device state; coordinate persistence fixes |
 | B08 trustworthy tests | I01/I06 require mandatory fixtures, truthful skips and failure exit status |
-| B09 provenance | I00/I07/I10 need exact binary/config/packing identity; reuse the provenance work |
+| B09 provenance | Build-time refresh landed (`3dbad05`); I00/I07/I10 extend manifests with device/compiler/artifact/packing identity |
 | B10 documentation | I07–I09 update stale backend/superbuild comments as their behavior is verified |
 | B12 CPU forward-only arenas | Separate measurable follow-up to I08; useful for CPU fallback and host headroom |
 | B13 sampling | I17 only after profiling; no automatic device-sampling redesign |
 | B14 Muon | Already implemented; later training may separate settings from host scratch ownership |
 | B15 CPU scheduling | Input to I16 contention studies, not a prerequisite for basic iGPU execution |
 | B16 prefill | I15 owns the Intel chunk-prefill consumer; coordinate CPU prefill work to avoid duplicate APIs |
-| B18 ownership | I07/I11 session contract; no premature multi-model serving framework |
+| B18 ownership | Public lifecycle documented (`32931f7`); I07/I11 still need consumed internal session ownership |
 
-First action when implementation resumes: **I00 + I01 preparation**, then the three external comparison
-lanes. No native full-backend commitment until I06. Preserve the user's tokenizer document and all
-uncommitted Muon changes throughout.
+First action when implementation resumes: **I00 + I01 preparation**, alongside I18/I19/I20 native probe preparation. Schedule device measurements after inventory.
+I02/I04 are optional references and I03 remains parked. No native full-backend commitment until I06. Preserve the active WP5 work. Muon's remaining files are committed in `8a72c67`.

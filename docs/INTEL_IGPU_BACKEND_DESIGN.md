@@ -2,25 +2,28 @@
 
 Research date: 2026-09-08. **Design only; no backend selected or implemented.**
 User priority: **interactive inference first; training later**.
-Repository inspected at `90ec9c2b5dafb5034926d78e97ab7d8533295468`, with the uncommitted CPU Muon
-changes present. WP4f remains independently owned; its active log reports unresolved layer-0 fidelity.
+Backend revision checked against `220afaf`; remaining Muon work subsequently committed in `8a72c67`. CPU/CUDA area moves, source
+manifests and the CPU API facade have landed; deeper extraction remains active. WP4f's converter fix
+merged as `296f2a1`. WP5a tokenizer and WP5b full-scale transplant remain independently owned.
 
 ## Recommendation
 
-Run a bounded comparison before committing to an Intel backend. The first contenders are
-**llama.cpp SYCL, llama.cpp Vulkan, and OpenVINO**. OpenVINO has two distinct entry routes worth
-checking: its llama.cpp backend and its native Runtime/GenAI stack. They have different model,
-quantization, and state-management coverage. A result for one does not establish the other.
+Prioritize **Sub0Llm-owned execution using Intel-native kernels and runtime access**. Study SYCL/ESIMD
+kernel generation and direct Level Zero submission alongside SYCL submission of equivalent kernels.
+Select kernel math, memory placement and submission separately: a lower-level API alone does not
+establish faster code. oneDNN/oneMKL are primitive baselines where they fit the actual operations.
 
-For a native Sub0Llm implementation, **SYCL with oneDNN and selective custom kernels is the leading
-design hypothesis**, because we need control over Qwen4's unusual state, sparse attention, and encoded
-expert weights. This is a judgment about implementation fit, **not a measured performance win**.
-Vulkan remains a serious challenger. OpenVINO should win if its graph execution is faster at acceptable
-accuracy and memory on the exact target, including any custom-operation or conversion cost.
+The first gates are instruction capabilities on the installed GPU, quantized expert execution, usable
+UMA capacity/residency, and dependent-kernel submission cost. See the new
+[ISA and memory research](INTEL_IGPU_ISA_MEMORY_RESEARCH.md), covered by packages I18–I20.
+No native route has a measured performance win yet. llama.cpp is an independent reference and optional
+baseline. OpenVINO remains a bounded comparison and source of implementation evidence; adopting its
+whole-model executor would require a separate design decision. **Vulkan is parked**, with no initial
+implementation or mandatory benchmark. Reopen it only with evidence relevant to this device.
 
 Do not make a wholesale CPU/CUDA rewrite a prerequisite for evaluating these alternatives. External
 benchmarks and small engine-free mechanism experiments can start independently. In the engine,
-extend the existing device seam and split responsibilities incrementally after WP4f stabilizes.
+extend the existing device seam and split responsibilities incrementally from a frozen baseline, coordinating the active extraction owner.
 Deliver the smallest useful inference path first; defer training, concurrent serving, and multi-device
 scheduling until there is evidence that they are needed.
 
@@ -135,13 +138,14 @@ move: pin exact commits, runtime versions and drivers before reproducing or exte
 
 | Route | Strength for this project | Principal uncertainty or cost | Proposed disposition |
 |---|---|---|---|
-| **SYCL + oneDNN/custom kernels** | Fits C++ and explicit persistent storage; detailed control over QSA/GDN/quantized experts | Kernel engineering, compiler/runtime deployment, hardware-specific tuning | Leading native design candidate; prove it with a bounded experiment |
-| **llama.cpp SYCL** | Existing GGUF execution and many relevant kernels; independent runnable comparison | Exact shapes/types, fallback and current driver's behavior must pass | First comparison lane |
+| **SYCL + oneDNN/custom kernels** | Fits C++ and explicit persistent storage; detailed control over QSA/GDN/quantized experts | Kernel engineering, compiler/runtime deployment, hardware-specific tuning | Primary kernel-authoring experiment; include ESIMD and emitted-ISA inspection |
+| **llama.cpp SYCL** | Existing GGUF execution and many relevant kernels; independent runnable comparison | Exact shapes/types, fallback and current driver's behavior must pass | Optional reference lane; Sub0Llm retains execution ownership |
 | **OpenVINO Runtime / GenAI** | Graph compilation/fusion and existing inference tooling | Exact Qwen4 export, state and IQ-format path unproven; custom work may be substantial | Model-support feasibility gate, then benchmark |
 | **llama.cpp OpenVINO** | Avoids writing an exporter for supported GGML graphs | Current IQ type coverage and stateful limitations directly affect our artifact | Separate support gate; useful control model baseline |
-| **llama.cpp Vulkan** | Existing cross-vendor execution; Windows route independent of Intel C++ compiler | Exact quant/shape coverage, shader/driver behavior | First comparison lane, equal opportunity to win |
-| **Native Vulkan** | Explicit resource/dispatch control, wider vendor reach | More resource/shader plumbing; yet another kernel implementation | Promote only if comparison justifies it |
-| **Direct OpenCL / Level Zero** | Low-level control or runtime fallback | Neither supplies a complete LLM executor; more manual scheduling and kernels | Use inside a proven bottleneck, not a separate initial engine |
+| **llama.cpp Vulkan** | Existing cross-vendor execution; Windows route independent of Intel C++ compiler | Exact quant/shape coverage, shader/driver behavior | Parked; not an initial gate |
+| **Native Vulkan** | Explicit resource/dispatch control, wider vendor reach | More resource/shader plumbing; yet another kernel implementation | Deprioritized; reopen only with concrete evidence |
+| **Direct Level Zero** | Native allocation, modules, queues, events and command lists | Kernel compilation still required; explicit lifetime/synchronization work | Primary submission experiment using equivalent kernels |
+| **Direct OpenCL** | Alternate runtime/compiler route | Different capabilities and interoperability cost | Fallback probe for a concrete capability gap |
 | **OpenMP target offload** | Potentially small experiments for isolated loops | Does not solve model residency, custom IQ kernels, or per-token launch overhead | Not the primary implementation hypothesis |
 | **Windows ML / ONNX Runtime / DirectML** | Windows inference integration | Exact graph/export/provider support still required | Secondary contender if a working target export appears |
 | **PyTorch XPU / Intel llm-scaler** | Research and later training/serving ecosystem | Different runtime/deployment model and unsupported-hardware risk on this HX iGPU | Later control; not the initial C++ dependency |
@@ -210,14 +214,19 @@ not the outcome of a performance test.
 
 ## 4. What the current backend division actually is
 
-This is a source audit, not a reading of old "skeleton" comments:
+This is a source audit, not a reading of old "skeleton" comments. Relocation is complete, not
+responsibility separation: CPU `api.cpp` now wraps private declarations in `api.hpp`, while
+`backend.cpp` retains most implementation. Backend-local CMake source manifests landed in `fae914a`.
+B18 ownership documentation landed in `32931f7`; it does not provide an RAII session implementation.
+Copilot owns the continuing I08/I09 extraction. Its log records a configure blocker (`nvcc` cannot
+find `cl.exe` in that shell); landed commits are not evidence that the full runtime gates passed.
 
 | Surface | Current responsibility and constraint |
 |---|---|
-| `src/backends/cpu/backend.cpp` — 3,139 lines | Parameter/moment ownership, per-OpenMP-slot Worker arenas, autograd, model assembly, full forward, incremental caches, MoE store, optimizer and host memory report |
-| `src/backends/cuda/backend.cu` — 6,823 lines | CUDA context/stream/BLAS ownership, kernels, launch wrappers, scratch plans, forward/backward/decode, optimizer, C exports and extensive parity/profiling hooks |
-| `include/sub0/core.hpp` — 365 lines | Public CPU engine/Node/lifecycle API; generated-layout dependency, process/global ownership assumptions |
-| `include/sub0/device_backend.hpp` — 255 lines | Existing neutral `sub0_dev_*` inline bridge to CUDA, capability struct, no-device stubs and mock evaluation route |
+| `src/backends/cpu/backend.cpp` | Parameter/moment ownership, per-OpenMP-slot Worker arenas, autograd, model assembly, full forward, incremental caches, MoE store, optimizer and host memory report |
+| `src/backends/cuda/backend.cu` | CUDA context/stream/BLAS ownership, kernels, launch wrappers, scratch plans, forward/backward/decode, optimizer, C exports and extensive parity/profiling hooks |
+| `include/sub0/core.hpp` | Public CPU engine/Node/lifecycle API; generated-layout dependency, process/global ownership assumptions |
+| `include/sub0/device_backend.hpp` | Existing neutral `sub0_dev_*` inline bridge to CUDA, capability struct, no-device stubs and mock evaluation route |
 | `include/sub0/decode.hpp` | Selects device at setup, uploads the complete f32 arena; prefill calls `forward_one` for every prompt token and retrieves vocabulary logits |
 | `include/sub0/eval.hpp`, `src/train_stage.cpp` | Other production consumers of device capabilities and lifecycle; training also handles parameter/moment synchronization |
 | `cmake/Backends.cmake` | CPU engine always built; GPU means CUDA today; AUTO detects CUDA; HYBRID rejected |
@@ -274,8 +283,8 @@ src/backends/cpu/
   api.cpp              existing sub0:: exported entry points
 src/backends/cuda/
   context.hpp/.cu      stream, BLAS, allocation and graph ownership
-   state.hpp/.cu        device allocations, cache/reset state and invalidation reasons
-   weights.hpp/.cu      dense mirrors, fused projections and encoded-weight views
+  state.hpp/.cu        device allocations, cache/reset state and invalidation reasons
+  weights.hpp/.cu      dense mirrors, fused projections and encoded-weight views
   kernels/            linear, attention, normalization, GDN, elementwise, optimizer
   forward.cu          inference launch sequences
   decode.cu           incremental execution
@@ -295,8 +304,9 @@ moves, then introduce explicit private contracts at the boundaries below.
 
 The first private contracts are deliberately small:
 
-* CPU `WorkerState` owns parameter spans, activation/gradient arenas, the node pool, thread binding,
-   and per-worker mechanism scratch. `Model` may hold pointers into that state, but no extracted file
+* CPU `WorkerState` borrows spans into process-owned parameter storage and owns its
+   activation/gradient arenas, node pool, thread binding and mechanism scratch. Shared parameter
+   ownership does not move into each worker. `Model` may hold pointers into that state, but no extracted file
    may create a second worker/layout owner. Decode caches remain separate because they reset per
    generation rather than per graph.
 * CUDA `BackendContext` owns the stream, cuBLAS handle, allocation registry, synchronization, and
@@ -406,13 +416,19 @@ Compare intermediate values, logits, top-k/router indices, masks, and every pers
 reset, second prompt, chunk boundaries, uneven tail, repeated decode, and context limit failure.
 Missing required fixtures or unexpected CPU fallback is a reported failure, not a passing skipped test.
 
+WP4f fixed three converter transforms; its residual layer-0 gap was independently traced to
+llama.cpp quantized-activation matmul noise. Keep the floating-point mathematical oracle distinct
+from the encoded-runtime comparison. The historical ~2.2% gap is not a blanket tolerance and does
+not require Sub0Llm to imitate that noise.
+
 Use the existing reference tolerances first, record absolute/relative L2 and max error with denominator
 floors, and freeze the chosen bounds before timing. Reduced precision has a separate quality gate;
 do not demand bitwise GPU equality or relax tolerances after observing an inconvenient result. Tie
 handling and actual selected-token disagreements need explicit investigation.
 
 **Gate C — interactive measurements:** same token IDs, weights, architecture, context, precision and
-sampling policy. Run CPU, SYCL, Vulkan and each eligible OpenVINO route in isolated builds. Include
+sampling policy. Run CPU and eligible native Intel variants in isolated builds. Add optional
+llama.cpp SYCL/OpenVINO comparisons where useful; Vulkan is not a gate. Include
 upstream CUDA where valid. Distinguish startup/model preparation, first request, warm TTFT, prefill
 tokens/s, and p50/p95 inter-token latency. Use prompts of 32/128/512/2048/4096 tokens where supported,
 128–256 generated tokens, batch one first; batch four is a secondary diagnostic. Exact-scale prefix
