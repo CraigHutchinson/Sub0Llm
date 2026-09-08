@@ -59,6 +59,11 @@ std::vector<float> random_matrix(int rows, int cols, std::uint32_t seed) {
     return G;
 }
 
+std::vector<float> make_scratch(int rows, int cols) {
+    const auto m = static_cast<std::size_t>(std::min(rows, cols));
+    return std::vector<float>(scratch_floats(static_cast<std::size_t>(rows) * cols, m * m));
+}
+
 }  // namespace
 
 TEST_CASE("muon: newton_schulz5 drives a random matrix's rows toward mutual orthogonality", "[muon]") {
@@ -69,7 +74,8 @@ TEST_CASE("muon: newton_schulz5 drives a random matrix's rows toward mutual orth
         auto G = random_matrix(rows, cols, 42);
         const auto before = gram_stats(G, rows, cols);
         std::vector<float> O(G.size());
-        newton_schulz5(G.data(), rows, cols, O.data(), 5);
+        auto scratch = make_scratch(rows, cols);
+        newton_schulz5(G.data(), rows, cols, O.data(), scratch, 5);
         const auto after = gram_stats(O, rows, cols);
 
         INFO("shape [" << rows << "," << cols << "]");
@@ -86,8 +92,9 @@ TEST_CASE("muon: newton_schulz5 drives a random matrix's rows toward mutual orth
 TEST_CASE("muon: newton_schulz5 is deterministic", "[muon]") {
     auto G = random_matrix(64, 64, 7);
     std::vector<float> O1(G.size()), O2(G.size());
-    newton_schulz5(G.data(), 64, 64, O1.data(), 5);
-    newton_schulz5(G.data(), 64, 64, O2.data(), 5);
+    auto scratch = make_scratch(64, 64);
+    newton_schulz5(G.data(), 64, 64, O1.data(), scratch, 5);
+    newton_schulz5(G.data(), 64, 64, O2.data(), scratch, 5);
     CHECK(O1 == O2);
 }
 
@@ -95,31 +102,33 @@ TEST_CASE("muon: newton_schulz5 is safe with out aliasing in (in-place)", "[muon
     auto G = random_matrix(32, 96, 11);
     const auto Gcopy = G;
     std::vector<float> ref(G.size());
-    newton_schulz5(Gcopy.data(), 32, 96, ref.data(), 5);
-    newton_schulz5(G.data(), 32, 96, G.data(), 5);   // in-place: out == in
+    auto scratch = make_scratch(32, 96);
+    newton_schulz5(Gcopy.data(), 32, 96, ref.data(), scratch, 5);
+    newton_schulz5(G.data(), 32, 96, G.data(), scratch, 5);   // in-place: out == in
     for (std::size_t i = 0; i < G.size(); ++i) CHECK(std::fabs(G[i] - ref[i]) < 1e-5f);
 }
 
 TEST_CASE("muon: newton_schulz5 does not produce NaN/Inf on a degenerate (all-zero) matrix", "[muon]") {
     std::vector<float> G(64 * 64, 0.0f), O(G.size());
-    newton_schulz5(G.data(), 64, 64, O.data(), 5);   // the +1e-7 norm epsilon must prevent a 0/0
+    auto scratch = make_scratch(64, 64);
+    newton_schulz5(G.data(), 64, 64, O.data(), scratch, 5);   // the +1e-7 norm epsilon must prevent a 0/0
     for (float v : O) { CHECK_FALSE(std::isnan(v)); CHECK_FALSE(std::isinf(v)); }
 }
 
 TEST_CASE("muon: newton_schulz5's reused scratch buffers never leak stale data across calls of different shapes", "[muon]") {
-    // The working buffers are `static thread_local` and only ever grow (AGENTS.md #1 -- no per-call
-    // heap allocation once warmed up). This guards specifically against the bug class that enables:
-    // every loop must be bounded by the CURRENT call's mn/mm, never by the (possibly larger, from an
-    // earlier bigger call) buffer's own .size(). Call at a LARGE shape first (grows the buffers well
-    // past what the small shape needs), then at a SMALL shape, and check the small-shape result
-    // matches a fresh (never-before-called-at-any-size) computation exactly.
+    // Reuse the same allocation across shapes: every loop must use the current extent, not capacity.
     auto Gbig = random_matrix(256, 512, 99);
     std::vector<float> Obig(Gbig.size());
-    newton_schulz5(Gbig.data(), 256, 512, Obig.data(), 5);   // warms the thread_local buffers up big
+    auto scratch = make_scratch(256, 512);
+    newton_schulz5(Gbig.data(), 256, 512, Obig.data(), scratch, 5);
 
     auto Gsmall = random_matrix(16, 24, 100);
     std::vector<float> Oafter(Gsmall.size());
-    newton_schulz5(Gsmall.data(), 16, 24, Oafter.data(), 5);
+    newton_schulz5(Gsmall.data(), 16, 24, Oafter.data(), scratch, 5);
+    auto fresh_scratch = make_scratch(16, 24);
+    std::vector<float> fresh(Gsmall.size());
+    newton_schulz5(Gsmall.data(), 16, 24, fresh.data(), fresh_scratch, 5);
+    CHECK(Oafter == fresh);
 
     const auto stats = gram_stats(Oafter, 16, 24);   // sanity: still a valid orthogonalization, not garbage
     CHECK(stats.max_offdiag < 0.3);
@@ -131,13 +140,15 @@ TEST_CASE("muon: newton_schulz5 handles a 1-row and a 1-column matrix without cr
     {
         auto G = random_matrix(1, 32, 3);
         std::vector<float> O(G.size());
-        newton_schulz5(G.data(), 1, 32, O.data(), 5);
+        auto scratch = make_scratch(1, 32);
+        newton_schulz5(G.data(), 1, 32, O.data(), scratch, 5);
         for (float v : O) CHECK_FALSE(std::isnan(v));
     }
     {
         auto G = random_matrix(32, 1, 5);
         std::vector<float> O(G.size());
-        newton_schulz5(G.data(), 32, 1, O.data(), 5);
+        auto scratch = make_scratch(32, 1);
+        newton_schulz5(G.data(), 32, 1, O.data(), scratch, 5);
         for (float v : O) CHECK_FALSE(std::isnan(v));
     }
 }

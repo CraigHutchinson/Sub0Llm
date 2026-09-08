@@ -20,30 +20,40 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
-#include <vector>
+#include <span>
 
 namespace sub0::muon {
 
-// Orthogonalizes an [rows x cols] row-major matrix `in` via `steps` (default 5) Newton-Schulz
-// quintic iterations, writing the result to `out` (`out == in` is safe -- `in` is fully consumed
-// into an internal working buffer before anything is written to `out`).
-//
-// Internally works in whichever orientation has the SMALLER dimension first (transposing if
-// rows > cols, transposing back before returning) purely to bound the per-iteration cost by
-// min(rows,cols)^2 * max(rows,cols) rather than the larger dimension squared -- the mathematical
-// result is identical either way, this is a compute-only optimization (this project's FFN weight
-// matrices are frequently non-square, e.g. D_MODEL x D_FF, so it matters here).
-//
-// ZERO heap allocation once warmed up (AGENTS.md #1): the working buffers are `static thread_local`
-// and only ever GROW (resize() is a no-op once already large enough), so after the first call at
-// each thread's largest-seen matrix size, every subsequent call -- including every optimizer step
-// for the rest of training -- allocates nothing. Every loop below is explicitly bounded by the
-// CURRENT call's mn/mm/m/n, never by the (possibly larger, stale-tailed) buffer's own .size() --
-// that distinction matters once the buffers are reused across differently-shaped calls, see
-// tests/muon_tests.cpp's "buffer reuse across shapes" case for what this specifically guards against.
-inline void newton_schulz5(const float* in, int rows, int cols, float* out, int steps = 5) {
+/** Returns the scratch capacity needed for a matrix and its smaller Gram matrix.
+ * @param[in] matrix_floats rows*cols, or the maximum over all matrices to be processed.
+ * @param[in] gram_floats min(rows,cols)^2, or the maximum over those matrices.
+ * @return Float count for two matrix buffers and two Gram buffers.
+ * @pre The resulting float count must be representable in size_t.
+ */
+[[nodiscard]] constexpr std::size_t scratch_floats(std::size_t matrix_floats,
+                                                  std::size_t gram_floats) noexcept {
+    return 2 * matrix_floats + 2 * gram_floats;
+}
+
+/** Orthogonalizes a row-major matrix using allocation-free Newton–Schulz iterations.
+ *
+ * Works with the smaller dimension first, bounding each iteration by
+ * min(rows,cols)^2 * max(rows,cols); tall matrices are transposed back on output.
+ * @param[in] in Input matrix, containing rows*cols floats.
+ * @param[in] rows Positive input row count.
+ * @param[in] cols Positive input column count.
+ * @param[out] out Output matrix, containing rows*cols floats; may equal in.
+ * @param[in,out] scratch Caller-owned storage, at least scratch_floats(rows*cols,
+ *                       min(rows,cols)^2) floats; must not overlap in or out.
+ * @param[in] steps Nonnegative iteration count; five is the reference default.
+ * @note Concurrent calls require disjoint scratch/output storage. No storage is retained.
+ */
+inline void newton_schulz5(const float* in, int rows, int cols, float* out,
+                         std::span<float> scratch, int steps = 5) {
+    assert(rows > 0 && cols > 0 && steps >= 0);
     constexpr float a = 3.4445f, b = -4.7750f, c = 2.0315f;
     const bool transposed = rows > cols;
     const int m = transposed ? cols : rows;   // working shape [m, n], always m <= n
@@ -51,18 +61,12 @@ inline void newton_schulz5(const float* in, int rows, int cols, float* out, int 
     const auto mn = static_cast<std::size_t>(m) * static_cast<std::size_t>(n);
     const auto mm = static_cast<std::size_t>(m) * static_cast<std::size_t>(m);
 
-    //TODO: Allocations inside hot loop need avoiding, violates ##1 project rule, the buffer size/limit should be determinable upfront and allocated ahead of time
-    static thread_local std::vector<float> X, A, AA, BX;
-    if (X.size() < mn) X.resize(mn);
-    if (A.size() < mm) A.resize(mm);
-    if (AA.size() < mm) AA.resize(mm);
-    if (BX.size() < mn) BX.resize(mn);
-    float* __restrict Xp = X.data();
-    float* __restrict Ap = A.data();
-    float* __restrict AAp = AA.data();
-    float* __restrict BXp = BX.data();
+    assert(scratch.size() >= scratch_floats(mn, mm));
+    float* __restrict Xp = scratch.data();
+    float* __restrict Ap = Xp + mn;
+    float* __restrict AAp = Ap + mm;
+    float* __restrict BXp = AAp + mm;
 
-    //TODO: Avoid unecessary transpose route - design for the ideal case where the input is already in the correct orientation, and avoid the transpose if possible
     if (transposed) {
         for (int i = 0; i < rows; ++i)
             for (int j = 0; j < cols; ++j)
@@ -79,30 +83,30 @@ inline void newton_schulz5(const float* in, int rows, int cols, float* out, int 
     for (std::size_t i = 0; i < mn; ++i) ss += static_cast<double>(Xp[i]) * Xp[i];
     const float norm = static_cast<float>(std::sqrt(ss)) + 1e-7f;
 
-    //TODO: division is slower than multiplication, so we should consider using multiplication with the reciprocal of norm instead of division. This may improve performance, especially for large matrices.
     #pragma omp simd
     for (std::size_t i = 0; i < mn; ++i) Xp[i] /= norm;
 
     for (int it = 0; it < steps; ++it) {
-        // A = X @ X^T  [m,m]: inner loop over `k` is contiguous in both operands (dot-product
-        // reduction), matches op_linear's backward dX pattern.
+        // A = X @ X^T is symmetric: compute each dot product once and mirror it.
         for (int i = 0; i < m; ++i) {
             const float* __restrict xi = Xp + static_cast<std::size_t>(i) * static_cast<std::size_t>(n);
-            for (int j = 0; j < m; ++j) {
+            for (int j = i; j < m; ++j) {
                 const float* __restrict xj = Xp + static_cast<std::size_t>(j) * static_cast<std::size_t>(n);
                 double s = 0.0;
                 #pragma omp simd reduction(+ : s)
                 for (int k = 0; k < n; ++k) s += static_cast<double>(xi[k]) * xj[k];
                 Ap[static_cast<std::size_t>(i) * static_cast<std::size_t>(m) + static_cast<std::size_t>(j)] = static_cast<float>(s);
+                Ap[static_cast<std::size_t>(j) * static_cast<std::size_t>(m) + static_cast<std::size_t>(i)] = static_cast<float>(s);
             }
         }
-        // AA = A @ A  [m,m]
+        // A's symmetry lets A @ A read two contiguous rows instead of striding a column.
         for (int i = 0; i < m; ++i) {
             const float* __restrict ai = Ap + static_cast<std::size_t>(i) * static_cast<std::size_t>(m);
             for (int j = 0; j < m; ++j) {
+                const float* __restrict aj = Ap + static_cast<std::size_t>(j) * static_cast<std::size_t>(m);
                 double s = 0.0;
                 #pragma omp simd reduction(+ : s)
-                for (int k = 0; k < m; ++k) s += static_cast<double>(ai[k]) * Ap[static_cast<std::size_t>(k) * static_cast<std::size_t>(m) + static_cast<std::size_t>(j)];
+                for (int k = 0; k < m; ++k) s += static_cast<double>(ai[k]) * aj[k];
                 AAp[static_cast<std::size_t>(i) * static_cast<std::size_t>(m) + static_cast<std::size_t>(j)] = static_cast<float>(s);
             }
         }
@@ -128,8 +132,6 @@ inline void newton_schulz5(const float* in, int rows, int cols, float* out, int 
         for (std::size_t i = 0; i < mn; ++i) Xp[i] = a * Xp[i] + BXp[i];
     }
 
-    // TODO: As earlier, avoid unecessary transpose route - design for the ideal case where the input is already in the correct orientation, and avoid the transpose if possible
-    // this may also avoid the temporary buffer allocation for the transpose, and avoid the copy back to the output buffer if the input is already in the correct orientation
     if (transposed) {
         for (int i = 0; i < rows; ++i)
             for (int j = 0; j < cols; ++j)

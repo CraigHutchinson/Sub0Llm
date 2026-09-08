@@ -1155,7 +1155,9 @@ TEST_CASE("CUDA Muon Newton-Schulz matches the CPU reference and the Gram proper
         for (float& v : in) v = nd(rng);
 
         std::vector<float> cpu_out(in.size());
-        sub0::muon::newton_schulz5(in.data(), rows, cols, cpu_out.data(), 5);
+        const auto gram_dim = static_cast<std::size_t>(std::min(rows, cols));
+        std::vector<float> scratch(sub0::muon::scratch_floats(in.size(), gram_dim * gram_dim));
+        sub0::muon::newton_schulz5(in.data(), rows, cols, cpu_out.data(), scratch, 5);
 
         std::vector<float> gpu_out(in.size());
         REQUIRE(sub0_cuda_muon_ns_check(in.data(), rows, cols, 0, gpu_out.data()) == 0);

@@ -1,6 +1,12 @@
 # CPU performance backlog — fixed defects, open hotspots, and how to pick up either
 
 Living document, not a one-shot report (same spirit as `docs/GATED_DELTANET.md`'s staged-status doc).
+
+**2026-09-08 Muon follow-up:** CPU optimizer scratch is now prepared before the step loop, and the
+symmetric Gram products avoid duplicate/strided work. The six-shape comparison measured 1.9–3.5x
+speedup with bit-identical results; full neutral engine assertions/hashes are unchanged. See
+[MUON_CPU_OPTIMIZATION.md](MUON_CPU_OPTIMIZATION.md) for measurements, memory cost, and validation.
+
 Two review passes have happened so far — a targeted code-reading sweep (2026-09-03, WP1-3 post-merge)
 and a VTune-guided follow-on the same day — and each found something the other missed. Read `AGENTS.md`
 first if you haven't; the standing three-pillar policy (correctness + performance + memory on every A/B)

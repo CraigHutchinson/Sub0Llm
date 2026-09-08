@@ -11,3 +11,11 @@ CPMAddPackage("gh:catchorg/Catch2@3.7.1")   # no-op if the tests already fetched
 add_executable(sub0_frontend_bench frontend_bench.cpp)
 target_include_directories(sub0_frontend_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sub0_frontend_bench PRIVATE sub0_frontend Catch2::Catch2WithMain)
+
+# Header-only numerical core; recognize its SIMD pragmas just as the CPU engine does.
+add_executable(sub0_muon_bench muon_bench.cpp)
+target_include_directories(sub0_muon_bench PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(sub0_muon_bench PRIVATE Catch2::Catch2WithMain)
+if(SUB0_HAS_OPENMP_SIMD_FLAG)
+  target_compile_options(sub0_muon_bench PRIVATE -fopenmp-simd)
+endif()
