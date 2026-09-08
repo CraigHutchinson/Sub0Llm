@@ -12,6 +12,12 @@ data-settled conclusions are collected in **§0**; the reasoning and measurement
 The lossless contract is unchanged and non-negotiable for every idea here:
 `decode(encode(x)) == normalize_text(x)`, guarded by the round-trip fuzz + dogfood net.
 
+**Status on mainline.** The ideas below are not enabled by the current mainline tokenizer. They were
+validated as a complete, code-capable schemeV4 prototype on `feature/tokenizer-v2`, pushed as
+`origin/feature/tokenizer-v2` (prototype tip `14af6d0`). That branch is the reference implementation
+for any follow-up or merge decision; this document remains the design record for the ideas and their
+measurements, not a claim that mainline already contains them.
+
 ---
 
 ## 0. Design decisions the data settles
@@ -30,97 +36,46 @@ with no identity fork** — the single biggest lever, and it *preserves unity* (
 Deviations still cost a generic modifier (`JOIN` to drop a default space; an explicit space to add
 one), but become rare.
 
-> **IMPLEMENTED (schemeV4, this branch).** A unified per-byte `(lead, trail)` glue table
-> (`glue_default(byte)` in casing.hpp): the boundary between two tokens defaults to glue iff
-> `prev.trail_glue || cur.lead_glue`, deviations lossless via `TOK_JOIN` (force glue) or a literal
-> space byte (force a space). `. , ; : ! ? %` are `lead=glue`; `$` is `trail=glue`; everything else is
-> space-both. Mechanically tiny: `encode_join`/`detokenize_join` set `dps = !trail_glue` after a
-> content byte and suppress the pending space before a `lead_glue` byte — one `glue_default()` read on
-> both sides (DRY, cannot drift). No id/marker change — only the transition rule.
-> **Measured (4 MB held-out, in-domain 4k vocab):** tinystories **1,285,466 → 1,147,084 tokens
-> (−10.8%)**, JOIN 10.80% → 0.04%; **fineweb 1,672,762 → 1,585,273 (−5.2%)**, JOIN 8.98% → 3.92% (the
-> residue is code/URL/bracket glue — D3 / point-3 territory). Lossless (round-trip fuzz + full frontend
-> suite green); encode throughput neutral (base 32.2 vs v2 32.8 ms/4 MB, within noise). Hardcoded set
-> for now; **D2** makes it corpus-derived, and the `glue_default()` accessor is the single point a
-> per-piece default (point-3 learned symbol tokens) would extend.
-
-**Point 3 — gluing corpus-specific (learned) tokens, not just inbuilt bytes. IMPLEMENTED (schemeV4).**
-The Unigram learner now also mints *symbol* pieces: `Scan::add_words` collects a maximal plain-symbol
-run (`is_symbol_piece_byte` — non-word, non-ws, excluding quotes/brackets which keep their own markers)
-as a learnable unit, so `://` `->` `==` `!=` `&&` `::` `//` `--` become single pieces where they recur.
-`encode_join` emits a symbol piece when the WHOLE maximal run matches one learned piece (a partial run
-stays byte-by-byte — still lossless). Each piece carries **per-piece glue** (`piece_lead_glue`/
-`piece_trail_glue` inherit the lead-glue of the first byte and trail-glue of the last), so decode (keyed
-by piece id) agrees with encode (keyed by boundary bytes) — a no-op for word pieces. Corpus-adaptive:
-prose (fineweb) learns few (`://` `--` `...` `||`), code (minipile) learns many (`==` `//` `**` `</` `++`
-`::` `->`). Measured code win: `x == y` 5→3 tokens, `i != 0 && j <= n` 14→10, `a::b::c` 9→7. Lossless.
-
-**Point 4 — compound & numeric expressions (measured on fineweb, real learned vocab).**
-- **Hyphenated ALPHA compounds are already optimal — no action.** `well-known` (4 tok), `state-of-the-art`
-  (9), `non-commercial` (4) each encode as a **single word unit with 0 JOIN**: `is_interior_connector`
-  (`'` `_` `-`) already binds them when flanked by word bytes on both sides, so BPE merges across the
-  separator instead of paying a JOIN per gap. This is settled; the cost is elsewhere.
-- **The real cost is NUMBERS / DATES / ALPHANUMERICS.** `is_word_byte` excludes digits, so a digit run
-  never forms a unit and glues byte-by-byte with **one JOIN per gap**: `2026` → `[2][J][0][J][2][J][6]`
-  (7 tok), `2026-07-29` → 19 tok / **9 JOIN**, `covid-19`/`H2O`/`mp3` split at the digit boundary,
-  `1,000,000` → 15 tok / 6 JOIN. On a 4 MB fineweb held-out this is most of the residual JOIN budget.
-- **Prototype (digits as word bytes → digit runs become units):** held-out `1,585,273 → 1,547,205 tok
-  (−2.4%)`, **JOIN 3.92% → 1.47%** (≈⅔ of the residual eliminated), all round-trips lossless.
-  `2026-07-29` → 8 tok / 0 JOIN, `the year 2026` → 6 tok / 0 JOIN.
-- **BUT digit tokenization is LOAD-BEARING for the arithmetic op-curriculum.** `op_curriculum` +
-  `node_frame`'s compute callback **parse numbers out of the token stream digit-by-digit** and assert
-  every result token is a single digit byte (`t >= '0' && t <= '9'`). Merging digits into pieces broke
-  both the dataset assertions AND the operand parser (a recomputed operand came back `"1"` instead of
-  `"89"`). So digits-as-bytes is a **deliberate choice for digit-level arithmetic supervision**, not an
-  oversight (AGENTS.md §10: enumerate consumers before changing a shared semantic).
-- **Refinement that keeps both wins:** make digit runs *units* (kills inter-digit JOINs) but bar the
-  Unigram from minting **all-digit pieces** (single digit bytes stay mandatory → digits always
-  Viterbi-segment to individual bytes → arithmetic intact). Measured: **same JOIN win (3.92% → 1.45%)**,
-  token −0.66% (forgoes digit-piece compression, correctly). Round-trip lossless.
-- **Spacing modality (measured, per the D1/D2 method): a number is its own TYPED unit.** A digit run's
-  boundary with a non-digit is space/punct-bounded in **90.06%** of fineweb occurrences; only **9.94%**
-  are letter-fused (`mp3`, `covid19`, `3rd`, `Foo123`). So the dominant modality is *implicit space*, with
-  letter-fusion the ~10% deviation. `word_unit_end` therefore **splits at a direct digit↔letter
-  transition** so a number stays a clean, self-contained span: `123 + 456` → 0 JOIN (spaced by default),
-  `Foo123`/`3rd` → 1 JOIN (fusion is the deviation), while a connector still binds across the class
-  boundary so `covid-19`/`2026-07-29` stay whole. This complements the digit-piece bar (a number is
-  always a pure, consistent digit span) and is what the model *should* see for numeric generalisation.
-- **IMPLEMENTED (v2 schemeV4):** `is_word_byte` += digits, `word_unit_end` class-transition split,
-  Unigram bars all-digit pieces. Held-out **1,585,273 → 1,575,871 tok (−0.59%)**, **JOIN 3.92% → 1.58%**
-  (the +0.13% vs the merge-everything variant is exactly the letter-fusion cost — trivial, buys clean
-  numbers). Round-trip fuzz + full frontend suite green EXCEPT the 2 `op_curriculum` assertions.
-- **Deferred (spike):** `op_curriculum` + `node_frame` parse operands out of the stream and depend on the
-  old digit spacing/JOIN framing. Per the owner, that curriculum is a spike/POC, so the tokenizer-level
-  improvement lands now and the arithmetic-frame number parser is reworked to the typed-unit framing as a
-  later, separate increment (AGENTS.md §10: consumer enumerated, comment in `op_curriculum.hpp` updated).
-- **Still deferred:** alpha compounds need nothing; `/` compounds (`and/or`) and thousands separators
-  (`1,000,000`'s commas) are smaller and locale/domain-dependent → Point 3 (corpus-derived symbol
-  pieces), not a hard-coded rule.
-
-**D2 — The per-byte default table is CORPUS-DERIVED, not a scheme constant. IMPLEMENTED (schemeV4).**
-`.`/`:`/`?` are unimodal closers
+**D2 — The default table is CORPUS-DERIVED, not a scheme constant.** `.`/`:`/`?` are unimodal closers
 in clean prose but **bimodal in web/code** (decimals, URLs, `a.b`). A single baked default is wrong for
 one domain. The configurator measures each codepoint's dominant modality and bakes a per-target default
 table into `tokenizer.tok` — the mechanism already exists: `sub0llm-tokenizer calibrate` /
 `sub0::modality` (mergeable ledger + contradiction flagging), so a disagreeing corpus is surfaced, not
-averaged away. **As built:** `sub0::modality` rides the `Scan` (accumulated in `add_words`, folded in
-`merge_words`, cached with the scan — `WCACHE_VERSION` 2); `learn()` derives a `std::array<GlueDefault,
-256>` where the hardcoded `casing::glue_default` is the FLOOR and a byte with decisive, unimodal evidence
-(≥500 samples, second combo <25%) overrides to its dominant `(lead, trail)`. `Tokenizer::glue_lead/
-glue_trail` is the single lookup both encode and decode consult; the table is a gracefully-degrading
-trailing section of `tokenizer.tok`. Verified end-to-end: a code corpus bakes `= / > : -` glue-both
-(prose leaves them spaced), byte-identical across a scan-cache hit.
+averaged away.
 
-**D3 — Keep a dual open/close token ONLY for a measured-BIMODAL character. RESOLVED for a code-capable
-scheme.** The prose-only plan below (drop `{}`, gate `()[]`) was premised on a prose target. Since v2 is
-**code-capable** (owner's call), `{}`/`()`/`[]` all fire on code and STAY — no marker-enum/format change.
-`"` stays a dual regardless. The keep/drop criterion, for the record:
+**Validated prototype findings (not yet mainline).** The schemeV4 prototype combined the following
+measured changes without violating the lossless contract:
+- **Per-byte glue defaults:** the hardcoded `(lead, trail)` table removed most prose JOINs; the prototype
+  then made the table corpus-derived, with the hardcoded values as a floor and decisive unimodal corpus
+  evidence overriding them. The baked table was stored as a trailing, gracefully-degrading tokenizer
+  section and included in the scan cache so cache hits remained deterministic.
+- **Numbers as typed units:** digit runs glue internally, split at direct digit↔letter transitions, and
+  bar all-digit Unigram pieces so numeric generalisation remains single-digit. Measured fineweb boundary
+  modality was 90.06% space/punctuation-bounded versus 9.94% letter-fused; `123 + 456` used no JOIN,
+  while `Foo123` paid the fusion deviation. The SPELL-transparent `node_frame` scan fix was required
+  because multi-digit numbers become SPELL-wrapped units.
+- **Learned symbol pieces:** recurring maximal plain-symbol runs (`://`, `->`, `==`, `!=`, `&&`, `::`,
+  `//`, `--`) became corpus-specific pieces; quotes and brackets stayed on their dedicated marker paths.
+  Per-piece glue inherited the first/last byte defaults so encode and decode remained symmetric. Code
+  measurements included `x == y` at 5→3 tokens and `i != 0 && j <= n` at 14→10.
+- **Marker decision for code-capable follow-up:** keep the quote and bracket markers (`"`, `()`, `[]`,
+  `{}`) rather than applying the prose-only reduction. The prototype measured closing-paren marker use
+  on fineweb, contradicting the earlier assumption that `()` had zero prose fires.
+
+The prototype was tested at 166 frontend cases / 113425 assertions and 125 fast engine cases / about
+9.86M assertions. These results are evidence for a future merge, not a replacement for revalidation
+against the current mainline.
+
+**D3 — Keep a dual open/close token ONLY for a measured-BIMODAL character.** The keep/drop criterion is
+spacing modality, per char, from the ledger. The following is the original prose-target proposal; the
+validated code-capable prototype kept the bracket markers because they fire on code and `)` also fired
+substantially in the measured prose sample:
 - **`"` → KEEP the dual** (`ODQUOTE`/`CDQUOTE`): universally bimodal (~50/50 open/close in every
   corpus). The one clear survivor of the glue-marker family.
-- **`{}` → KEPT** (code-capable; the prose-only plan would have dropped them, ~0.19% even on code).
-- **`()` `[]` → KEPT** (code-capable). Measured firing on fineweb prose is NOT zero (CPAREN ~5.6k/4 MB),
-  so the design's "0 fires on prose, gate for code" was corrected by measurement — they earn keep on
-  prose too.
+- **`{}` → DROP** the glue markers: unimodal (mostly spaced) — a default captures them; the markers
+  fork two ids for ~0.19% even on code.
+- **`()` `[]` → CODE-TARGET OPT-IN**, not always-on: **0 fires on prose**, ~4.4% on code, bimodal
+  there. Mint them only when the calibration ledger says the corpus is code-bearing.
 
 **D4 — The tokenizer NEVER matches pairs.** Local glue only; the model learns closure from the true
 distribution (asymmetric `[5,6)`, nested, isolated included). No balance checking, ever (§2a). "Pair"
@@ -130,17 +85,16 @@ stays a naming/table convenience (`partner()`/`is_open()` as data), not a semant
 `feature/tokenizer-throughput-2`) so the reduced marker set is described once, not mirrored in two
 switches (§3).
 
-**Net effect on a prose model:** the glue/quote marker family shrinks from 8 ids to **1 dual (`"`)**;
-punctuation glue moves from ~10% of the stream (JOIN tokens) into free per-char defaults; sequences are
-~10% shorter; `(`/`"` regain single embeddings. A code target additionally opts `()`/`[]` back in.
-**Still open** (need a call before v2): whether v2 targets code at all (gates `()[]`, `<>`, backtick,
-single-quote); the exact "add a space the default lacks" modifier; the per-char-default × truecase/
-word-piece round-trip design; and the contiguous pair/enum reorg (§5). None of these blocks D1–D3,
-which are the decisive wins.
+**Net effect of the original prose-only proposal:** the glue/quote marker family shrinks from 8 ids to
+**1 dual (`"`)**; punctuation glue moves from ~10% of the stream (JOIN tokens) into free per-char
+defaults; sequences are ~10% shorter; `(`/`"` regain single embeddings. For a code-capable follow-up,
+the validated prototype instead keeps `"`/`()`/`[]`/`{}` and focuses on corpus-derived glue plus learned
+symbol pieces. Remaining open questions are the exact "add a space the default lacks" modifier, the
+per-char-default × truecase/word-piece round-trip design, and the contiguous pair/enum reorg (§5).
 
 ---
 
-## 1. Current setup (as of mainline `6893624`)
+## 1. Current setup (as of mainline `5387165`)
 
 **Id space.** `0..255` = raw bytes (id == byte value, no offset); `256..287` = 32 markers
 (`TOK_EOS .. TOK_MARKER_COUNT-1`, auto-incrementing `enum TokenId` in `include/sub0/casing.hpp`);
