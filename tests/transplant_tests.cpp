@@ -197,3 +197,189 @@ TEST_CASE("transplant: stats_of and stats_consistent detect a wrong permutation"
     std::vector<float> reversed(src.rbegin(), src.rend());
     CHECK(stats_consistent(a, stats_of(reversed)));
 }
+
+// --- WP4f: the converter's own value/order conventions ---------------------------------------------
+// These cases pin the corrections whose ABSENCE made the first real cross-comparison against llama.cpp
+// diverge at decoder layer 0 (transplant.hpp's "A GGUF IS NOT A COPY OF THE CHECKPOINT"). They live
+// here, and not only in the fixture replay, because the fixture is num_k_heads == 1 -- where the
+// V-head reorder is the identity and therefore cannot be tested at all.
+
+TEST_CASE("transplant: fold_for names exactly the tensors llama.cpp's converter rewrites",
+          "[transplant]") {
+    // Every Qwen4ExpTextRMSNorm gain in the file is (1 + w) EXCEPT GDN's ssm_norm, which the
+    // converter's own `not name.endswith("linear_attn.norm.weight")` excludes -- and gdn_math.hpp
+    // correspondingly uses the gain directly while gr/qsa add the 1 themselves. Getting this list
+    // wrong in EITHER direction is a silent, model-changing error, so it is pinned name by name.
+    for (Dest d : {Dest::GrAttnNorm, Dest::GrFfnNorm, Dest::GrExitNorm, Dest::QsaQNorm, Dest::QsaKNorm,
+                   Dest::QsaIdxQNorm, Dest::QsaIdxKNorm}) {
+        INFO("dest " << static_cast<int>(d));
+        CHECK(fold_for(d) == Fold::ZeroCentredGamma);
+    }
+    CHECK(fold_for(Dest::GdnNorm) == Fold::None);       // the one real exception
+    CHECK(fold_for(Dest::GdnALog) == Fold::NegExpALog);
+    CHECK(fold_for(Dest::GdnDtBias) == Fold::None);     // same shape as ssm_a, a DIFFERENT convention
+    for (Dest d : {Dest::TokEmb, Dest::LmHead, Dest::GdnInProjQkv, Dest::MoeRouter, Dest::MoeDown,
+                   Dest::GrAttnDown, Dest::QsaQProj}) {
+        INFO("dest " << static_cast<int>(d));
+        CHECK(fold_for(d) == Fold::None);
+    }
+}
+
+TEST_CASE("transplant: apply_fold inverts the converter, exactly", "[transplant]") {
+    // ZeroCentredGamma: the file holds 1 + w, the destination must hold w.
+    std::vector<float> gamma{1.f, 0.5f, 2.25f, -0.75f};
+    REQUIRE(apply_fold(Fold::ZeroCentredGamma, gamma.data(), gamma.size()));
+    CHECK(gamma[0] == 0.f);
+    CHECK(gamma[1] == -0.5f);
+    CHECK(gamma[2] == 1.25f);
+    CHECK(gamma[3] == -1.75f);
+
+    // NegExpALog: the file holds -exp(A_log), the destination must hold A_log, so that gdn_math's own
+    // `-exp(a_log)` reproduces the file's value. Checked as a ROUND TRIP through that consumer's
+    // formula, not against a literal -- what has to hold is that the gate is unchanged.
+    const std::vector<float> a_log{-2.f, -0.25f, 0.f, 1.5f, 5.0625f};
+    std::vector<float> stored(a_log.size());
+    for (std::size_t i = 0; i < a_log.size(); ++i) stored[i] = -std::exp(a_log[i]);
+    REQUIRE(apply_fold(Fold::NegExpALog, stored.data(), stored.size()));
+    for (std::size_t i = 0; i < a_log.size(); ++i) {
+        INFO("i " << i);
+        CHECK(stored[i] == Catch::Approx(a_log[i]).margin(1e-5));
+        CHECK(-std::exp(stored[i]) == Catch::Approx(-std::exp(a_log[i])).epsilon(1e-6));
+    }
+
+    // A non-negative entry means the source is NOT `-exp(...)`, so the inverse must REFUSE rather than
+    // write a NaN weight, which would look like a plausible number everywhere downstream.
+    std::vector<float> bad{-1.f, 0.f, -2.f};
+    CHECK_FALSE(apply_fold(Fold::NegExpALog, bad.data(), bad.size()));
+
+    // None leaves the buffer alone.
+    std::vector<float> untouched = ramp(5, 1.f);
+    const std::vector<float> copy = untouched;
+    REQUIRE(apply_fold(Fold::None, untouched.data(), untouched.size()));
+    CHECK(untouched == copy);
+}
+
+TEST_CASE("transplant: ungroup_v_heads undoes the converter's grouped->tiled V-head reorder",
+          "[transplant]") {
+    // A GENUINE multi-key-head shape: 2 key heads, 6 value heads, rep 3.
+    constexpr int n_k = 2, n_v = 6, rep = n_v / n_k, hk = 2, hv = 2;
+
+    SECTION("columns, the whole axis, head_dim wide (in_proj_z)") {
+        constexpr int rows = 3, cols = n_v * hv;
+        const std::vector<float> src = ramp(rows * cols);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), rows, cols, VPerm{VAxis::Cols, false, true}, n_k, n_v, hk, hv,
+                        dst.data());
+        for (int row = 0; row < rows; ++row)
+            for (int k = 0; k < n_k; ++k)
+                for (int r = 0; r < rep; ++r)
+                    for (int g = 0; g < hv; ++g) {
+                        INFO("row " << row << " k " << k << " r " << r << " g " << g);
+                        CHECK(dst[static_cast<std::size_t>(row) * cols + (k * rep + r) * hv + g] ==
+                              src[static_cast<std::size_t>(row) * cols + (r * n_k + k) * hv + g]);
+                    }
+        // It is a genuine permutation -- every statistic survives it, which is the point: level 2 of
+        // the WP4c gate is provably blind to this whole class of defect.
+        CHECK(stats_consistent(stats_of(src), stats_of(dst)));
+        CHECK(dst != src);   // ...and it really did move, so the check above is not vacuous
+    }
+
+    SECTION("columns, per-head scalars, no head_dim (ssm_alpha / ssm_a / dt_bias)") {
+        constexpr int rows = 2, cols = n_v;
+        const std::vector<float> src = ramp(rows * cols);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), rows, cols, VPerm{VAxis::Cols, false, false}, n_k, n_v, hk, hv,
+                        dst.data());
+        // HF v-heads 0..5 are (k,r) = (0,0)(0,1)(0,2)(1,0)(1,1)(1,2), which sit in tiled slots
+        // r*n_k + k = 0, 2, 4, 1, 3, 5.
+        const int expect[n_v] = {0, 2, 4, 1, 3, 5};
+        for (int row = 0; row < rows; ++row)
+            for (int h = 0; h < n_v; ++h) {
+                INFO("row " << row << " h " << h);
+                CHECK(dst[static_cast<std::size_t>(row) * cols + h] ==
+                      src[static_cast<std::size_t>(row) * cols + expect[h]]);
+            }
+    }
+
+    SECTION("columns after the two key blocks (in_proj_qkv)") {
+        constexpr int key = n_k * hk, base = 2 * key, cols = base + n_v * hv, rows = 2;
+        const std::vector<float> src = ramp(rows * cols);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), rows, cols, VPerm{VAxis::Cols, true, true}, n_k, n_v, hk, hv,
+                        dst.data());
+        // The Q and K blocks are NOT reordered -- only the V third is. Shuffling the key heads too
+        // would leave every shape and every statistic right and compute a different model.
+        for (int row = 0; row < rows; ++row)
+            for (int c = 0; c < base; ++c) {
+                INFO("row " << row << " c " << c);
+                CHECK(dst[static_cast<std::size_t>(row) * cols + c] ==
+                      src[static_cast<std::size_t>(row) * cols + c]);
+            }
+        for (int row = 0; row < rows; ++row)
+            for (int h = 0; h < n_v; ++h)
+                for (int g = 0; g < hv; ++g) {
+                    const int k = h / rep, r = h % rep;
+                    INFO("row " << row << " h " << h << " g " << g);
+                    CHECK(dst[static_cast<std::size_t>(row) * cols + base + h * hv + g] ==
+                          src[static_cast<std::size_t>(row) * cols + base + (r * n_k + k) * hv + g]);
+                }
+    }
+
+    SECTION("rows (out_proj's input axis, and the conv's channels)") {
+        constexpr int rows = n_v * hv, cols = 3;
+        const std::vector<float> src = ramp(rows * cols);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), rows, cols, VPerm{VAxis::Rows, false, true}, n_k, n_v, hk, hv,
+                        dst.data());
+        for (int h = 0; h < n_v; ++h) {
+            const int k = h / rep, r = h % rep;
+            for (int g = 0; g < hv; ++g)
+                for (int c = 0; c < cols; ++c) {
+                    INFO("h " << h << " g " << g << " c " << c);
+                    CHECK(dst[static_cast<std::size_t>(h * hv + g) * cols + c] ==
+                          src[static_cast<std::size_t>((r * n_k + k) * hv + g) * cols + c]);
+                }
+        }
+    }
+
+    SECTION("it is the IDENTITY at one key head -- which is why the fixture replay cannot see it") {
+        constexpr int rows = 2, cols = 3 * hv;
+        const std::vector<float> src = ramp(rows * cols);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), rows, cols, VPerm{VAxis::Cols, false, true}, /*num_k_heads=*/1,
+                        /*num_v_heads=*/3, hk, hv, dst.data());
+        CHECK(dst == src);
+    }
+
+    SECTION("VAxis::None copies through untouched") {
+        const std::vector<float> src = ramp(12);
+        std::vector<float> dst(src.size(), -1.f);
+        ungroup_v_heads(src.data(), 3, 4, VPerm{}, n_k, n_v, hk, hv, dst.data());
+        CHECK(dst == src);
+    }
+}
+
+TEST_CASE("transplant: vperm_for names every v-head-indexed GDN tensor and nothing else",
+          "[transplant]") {
+    CHECK(vperm_for(Dest::GdnInProjQkv).axis == VAxis::Cols);
+    CHECK(vperm_for(Dest::GdnInProjQkv).after_keys);          // Q|K first, then V
+    CHECK(vperm_for(Dest::GdnInProjQkv).wide);
+    CHECK(vperm_for(Dest::GdnInProjZ).axis == VAxis::Cols);
+    CHECK_FALSE(vperm_for(Dest::GdnInProjZ).after_keys);
+    CHECK(vperm_for(Dest::GdnConv).axis == VAxis::Rows);
+    CHECK(vperm_for(Dest::GdnConv).after_keys);
+    CHECK(vperm_for(Dest::GdnOutProj).axis == VAxis::Rows);   // out_proj's INPUT axis is the v-head one
+    CHECK_FALSE(vperm_for(Dest::GdnOutProj).after_keys);
+    for (Dest d : {Dest::GdnInProjA, Dest::GdnInProjB, Dest::GdnALog, Dest::GdnDtBias}) {
+        INFO("dest " << static_cast<int>(d));
+        CHECK(vperm_for(d).axis == VAxis::Cols);
+        CHECK_FALSE(vperm_for(d).wide);                       // one slot per head, not head_v_dim
+    }
+    // ssm_norm is [1, head_v_dim], SHARED across heads -- it has no v-head axis at all, and permuting
+    // it would corrupt a tensor the converter never touched.
+    CHECK(vperm_for(Dest::GdnNorm).axis == VAxis::None);
+    for (Dest d : {Dest::TokEmb, Dest::LmHead, Dest::MoeGate, Dest::QsaQProj, Dest::GrAttnNorm}) {
+        INFO("dest " << static_cast<int>(d));
+        CHECK(vperm_for(d).axis == VAxis::None);
+    }
+}

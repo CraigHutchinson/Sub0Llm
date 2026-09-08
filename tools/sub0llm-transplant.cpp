@@ -241,6 +241,10 @@ std::uint64_t ne_out(const gguf::TensorInfo& t) { return t.dims.size() < 2 ? 1 :
 struct Totals {
     std::uint64_t dest_tensors = 0, dest_floats = 0, src_bytes_read = 0;
     int synthesized = 0, stats_checked = 0, stats_failed = 0;
+    // WP4f: how many destinations needed one of the converter's own conventions undone. Reported, not
+    // silent -- these are the corrections whose ABSENCE made the first cross-comparison against
+    // llama.cpp diverge at layer 0 (transplant.hpp's "A GGUF IS NOT A COPY OF THE CHECKPOINT").
+    int folded_gamma = 0, folded_alog = 0, vheads_ungrouped = 0;
 };
 
 // --- WP4e: the quantized-resident routed-expert sidecar --------------------------------------------
@@ -468,7 +472,7 @@ int main(int argc, char** argv) {
 
     Totals tot;
     std::vector<std::uint8_t> raw;
-    std::vector<float> src, src_b, dst;
+    std::vector<float> src, src_b, dst, perm;
     const auto t0 = std::chrono::steady_clock::now();
     int last_pct = -1;
 
@@ -558,6 +562,30 @@ int main(int argc, char** argv) {
                              "dst n={} mean={:.6g} std={:.6g} min={:.6g} max={:.6g}",
                              static_cast<int>(s.dest), name, before.n, before.mean, before.stddev,
                              before.min, before.max, after.n, after.mean, after.stddev, after.min, after.max);
+            }
+
+            // WP4f: undo the converter's own rewrites, AFTER the level-2 comparison above -- both are
+            // per-element/permutation maps that commute with the placement op, so running them here
+            // keeps level 2 a check on the PLACEMENT alone rather than diluting it into a check of two
+            // different things at once. See transplant.hpp for what each one is and why it exists.
+            if (const VPerm vp = vperm_for(s.dest); vp.axis != VAxis::None) {
+                perm.assign(n, 0.f);
+                ungroup_v_heads(dst.data(), s.rows, s.cols, vp, GDN_K_HEADS, GDN_V_HEADS,
+                                GDN_K_HEAD_DIM, GDN_V_HEAD_DIM, perm.data());
+                dst.swap(perm);
+                ++tot.vheads_ungrouped;
+            }
+            if (const Fold f = fold_for(s.dest); f != Fold::None) {
+                if (!apply_fold(f, dst.data(), n)) {
+                    std::println(stderr,
+                                 "error: destination {} <- {}: the converter-fold inverse rejected this "
+                                 "tensor's values (an ssm_a entry was not negative). The source does not "
+                                 "carry the convention this transplant assumes -- stopping rather than "
+                                 "writing NaN weights.",
+                                 static_cast<int>(s.dest), name);
+                    return 14;
+                }
+                (f == Fold::NegExpALog ? tot.folded_alog : tot.folded_gamma) += 1;
             }
         }
 
@@ -703,6 +731,10 @@ int main(int argc, char** argv) {
     std::println("--- level 2: per-tensor statistics ---------------------------------------");
     std::println("tensors checked          : {}", tot.stats_checked);
     std::println("mismatches               : {}", tot.stats_failed);
+    std::println("--- WP4f: converter conventions undone -----------------------------------");
+    std::println("zero-centred gammas (-1) : {}", tot.folded_gamma);
+    std::println("ssm_a -> A_log (log(-v)) : {}", tot.folded_alog);
+    std::println("v-heads tiled -> grouped : {}", tot.vheads_ungrouped);
     std::println("elapsed                  : {:.1f}s", secs);
     if (vs.is_open())
         std::println("--- artifact verification ------------------------------------------------\n"

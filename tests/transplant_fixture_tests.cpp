@@ -24,6 +24,16 @@
 // per-head interleave that the transplant then split down the middle would fail here and pass every
 // shape assertion. That is the whole point.
 //
+// WP4f WIDENED STEP 2, and this is the correction that matters most in this file. It originally
+// re-encoded each fixture's HF values VERBATIM, treating GGUF as the checkpoint with its axes declared
+// backwards. It is not: llama.cpp's converter rewrites values and head order too (transplant.hpp's
+// "A GGUF IS NOT A COPY OF THE CHECKPOINT" section). Encoding verbatim therefore made this gate pass
+// against a transplant that also did nothing -- two omissions cancelling -- while the real file
+// diverged from llama.cpp at layer 0 by rel_l2 0.996. `converter_*` below now emulates the three real
+// rewrites, so the transplant has to undo them to still match the reference. What a gate CANNOT do is
+// invent a convention it has never been told about; the lesson recorded here is that the encoder must
+// be written from the converter's source, not from the checkpoint's.
+//
 // The tolerance is the same one the existing fixture tests use, and for the same reason: this path
 // computes in float32 while the reference ran in PyTorch. Any mapping error is orders of magnitude
 // larger than that, so the tolerance is not what makes this pass.
@@ -131,13 +141,53 @@ private:
     std::uint64_t tensor_count_ = 0, kv_count_ = 0;
 };
 
+// --- what llama.cpp's converter does on the way IN, emulated so the transplant has to undo it ------
+// Sourced from conversion/qwen.py's Qwen3NextModel.modify_tensors and
+// _LinearAttentionVReorderBase.modify_tensors, which conversion/qwen4exp.py inherits. Deliberately
+// written as its own small, independent implementation rather than by calling transplant.hpp's
+// inverses backwards: a test that reuses the code under test proves only self-consistency
+// ([[independent-reimplementation-catches-identity-swap-bugs]]).
+
+// `elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"): + 1`
+std::vector<float> converter_gamma(std::vector<float> w) {
+    for (float& x : w) x += 1.f;
+    return w;
+}
+
+// `if name.endswith(".A_log"): data_torch = -torch.exp(data_torch)`
+std::vector<float> converter_a_log(std::vector<float> w) {
+    for (float& x : w) x = -std::exp(x);
+    return w;
+}
+
+// `_reorder_v_heads`: grouped [G0_v0..v{rep-1}, G1_v0..] -> tiled [G0_v0, G1_v0, .., G0_v1, ..].
+// Operates on the flat GGUF byte order, i.e. rows of a [out, in] weight (or elements of a 1-D vector,
+// with `in_f == 1`), the v-head axis starting at `base` output rows and `group` rows per head.
+std::vector<float> converter_reorder_v(const std::vector<float>& w, int in_f, int base, int group,
+                                       int n_k, int n_v) {
+    std::vector<float> out = w;
+    const int rep = n_v / n_k;
+    for (int k = 0; k < n_k; ++k)
+        for (int r = 0; r < rep; ++r)
+            for (int g = 0; g < group; ++g) {
+                const std::size_t hf   = static_cast<std::size_t>(base + (k * rep + r) * group + g);
+                const std::size_t tile = static_cast<std::size_t>(base + (r * n_k + k) * group + g);
+                for (int i = 0; i < in_f; ++i)
+                    out[tile * in_f + i] = w[hf * in_f + i];
+            }
+    return out;
+}
+
 // Runs one destination's recipe against a parsed GGUF, exactly as the offline tool does -- same
-// recipe_for(), same ops, same name substitution. The tool adds file/shard plumbing and PARAM_LAYOUT
-// placement around this; the mapping decisions themselves are all here.
+// recipe_for(), same ops, same name substitution, same converter-convention inversions in the same
+// order. The tool adds file/shard plumbing and PARAM_LAYOUT placement around this; the mapping
+// decisions themselves are all here.
 struct Applied { std::vector<float> data; Stats src_stats, dst_stats; };
 
+struct GdnHeads { int n_k = 0, n_v = 0, hk = 0, hv = 0; };
+
 Applied apply(const sub0::gguf::Reader& r, Dest d, int layer, int rows, int cols,
-              int n_heads = 0, int head_dim = 0) {
+              int n_heads = 0, int head_dim = 0, GdnHeads gdn = {}) {
     const Recipe rec = recipe_for(d);
     Applied a;
     a.data.assign(static_cast<std::size_t>(rows) * cols, 0.f);
@@ -188,7 +238,18 @@ Applied apply(const sub0::gguf::Reader& r, Dest d, int layer, int rows, int cols
         default:
             FAIL("op not exercised by this fixture");
     }
+    // Level 2 is measured on the PLACEMENT only, before the value rewrites below -- the same ordering
+    // the offline tool uses, and the reason a fold does not weaken the permutation check.
     a.dst_stats = stats_of(a.data);
+
+    if (const VPerm vp = vperm_for(d); vp.axis != VAxis::None) {
+        REQUIRE(gdn.n_k > 0);
+        std::vector<float> permuted(a.data.size(), 0.f);
+        ungroup_v_heads(a.data.data(), rows, cols, vp, gdn.n_k, gdn.n_v, gdn.hk, gdn.hv,
+                        permuted.data());
+        a.data.swap(permuted);
+    }
+    REQUIRE(apply_fold(fold_for(d), a.data.data(), a.data.size()));
     return a;
 }
 
@@ -221,39 +282,77 @@ TEST_CASE("WP4c level 3: the GDN mapping replays layer 0's real fixture through 
     // convention), which is exactly GGUF's byte order -- so the ne arrays below are {in, out}, the
     // inversion described in transplant.hpp's header. The names are the REAL model's, read out of the
     // real file's tensor table, not invented for this test.
+    // The converter's V-head reorder (transplant.hpp finding C) with n_k == 1 is the IDENTITY:
+    // `gguf[r*n_k + k]` and `hf[k*rep + r]` coincide when there is only one key head. It is applied
+    // here anyway so the encoder is a faithful emulation rather than a special case, and the
+    // permutation itself is covered by a genuine multi-k-head case in tests/transplant_tests.cpp --
+    // stated explicitly because "this fixture exercises the reorder" would be false. The encoder still
+    // APPLIES it, so this file stays a faithful emulation rather than a special case.
+    const int v_base = 2 * k_heads * hk;
+    auto reorder = [&](const std::vector<float>& x, int in_f, int base, int group) {
+        return converter_reorder_v(x, in_f, base, group, k_heads, v_heads);
+    };
+
     GgufWriter w;
     w.add("blk.0.attn_qkv.weight",   {hidden, static_cast<std::uint64_t>(conv_dim)},
-          read_f32(dir / "gdn_layer0_small_weight_in_proj_qkv.bin", static_cast<std::size_t>(conv_dim) * hidden));
+          reorder(read_f32(dir / "gdn_layer0_small_weight_in_proj_qkv.bin",
+                           static_cast<std::size_t>(conv_dim) * hidden), hidden, v_base, hv));
     w.add("blk.0.attn_gate.weight",  {hidden, static_cast<std::uint64_t>(value_dim)},
-          read_f32(dir / "gdn_layer0_small_weight_in_proj_z.bin", static_cast<std::size_t>(value_dim) * hidden));
+          reorder(read_f32(dir / "gdn_layer0_small_weight_in_proj_z.bin",
+                           static_cast<std::size_t>(value_dim) * hidden), hidden, 0, hv));
     w.add("blk.0.ssm_beta.weight",   {hidden, v_heads},
-          read_f32(dir / "gdn_layer0_small_weight_in_proj_b.bin", static_cast<std::size_t>(v_heads) * hidden));
+          reorder(read_f32(dir / "gdn_layer0_small_weight_in_proj_b.bin",
+                           static_cast<std::size_t>(v_heads) * hidden), hidden, 0, 1));
     w.add("blk.0.ssm_alpha.weight",  {hidden, v_heads},
-          read_f32(dir / "gdn_layer0_small_weight_in_proj_a.bin", static_cast<std::size_t>(v_heads) * hidden));
+          reorder(read_f32(dir / "gdn_layer0_small_weight_in_proj_a.bin",
+                           static_cast<std::size_t>(v_heads) * hidden), hidden, 0, 1));
     // Depthwise conv: PyTorch [C, 1, K] row-major == ne {K, C}. NOT a transpose, unlike every
-    // projection above -- the one 2-D-shaped GDN tensor that stays put.
+    // projection above -- the one 2-D-shaped GDN tensor that stays put. Its channels ARE the v-head
+    // axis for the V third, so the reorder applies with in_f = kernel.
     w.add("blk.0.ssm_conv1d.weight", {kernel, static_cast<std::uint64_t>(conv_dim)},
-          read_f32(dir / "gdn_layer0_small_weight_conv1d.bin", static_cast<std::size_t>(conv_dim) * kernel));
-    w.add("blk.0.ssm_dt.bias",       {v_heads}, read_f32(dir / "gdn_layer0_small_weight_dt_bias.bin", v_heads));
-    w.add("blk.0.ssm_a",             {v_heads}, read_f32(dir / "gdn_layer0_small_weight_A_log.bin", v_heads));
+          reorder(read_f32(dir / "gdn_layer0_small_weight_conv1d.bin",
+                           static_cast<std::size_t>(conv_dim) * kernel), kernel, v_base, hv));
+    w.add("blk.0.ssm_dt.bias",       {v_heads},
+          reorder(read_f32(dir / "gdn_layer0_small_weight_dt_bias.bin", v_heads), 1, 0, 1));
+    // `ssm_a` is `-exp(A_log)`, NOT `A_log` -- the converter finishes the exponential, and gdn_math
+    // would otherwise exponentiate a second time. This one line is the difference between loading the
+    // real model's decay gate and loading `exp(-exp(-exp(A_log)) * softplus(...))`.
+    w.add("blk.0.ssm_a",             {v_heads},
+          reorder(converter_a_log(read_f32(dir / "gdn_layer0_small_weight_A_log.bin", v_heads)), 1, 0, 1));
+    // NOT gamma-folded: the converter's rule excludes `linear_attn.norm.weight` explicitly, and
+    // gdn_math.hpp's RMSNormGated correspondingly uses the gain directly. The asymmetry with every
+    // other norm in this model is real.
     w.add("blk.0.ssm_norm.weight",   {hv},      read_f32(dir / "gdn_layer0_small_weight_norm.bin", hv));
-    w.add("blk.0.ssm_out.weight",    {static_cast<std::uint64_t>(value_dim), hidden},
-          read_f32(dir / "gdn_layer0_small_weight_out_proj.bin", static_cast<std::size_t>(hidden) * value_dim));
+    // out_proj's INPUT axis is the v-head axis, and GGUF stores it as [out=hidden, in=value_dim] rows,
+    // so the reorder runs on the columns -- done here by reordering the transposed view.
+    {
+        const auto raw_out = read_f32(dir / "gdn_layer0_small_weight_out_proj.bin",
+                                      static_cast<std::size_t>(hidden) * value_dim);
+        std::vector<float> tiled(raw_out.size());
+        for (int o = 0; o < hidden; ++o) {
+            std::vector<float> row(raw_out.begin() + static_cast<std::ptrdiff_t>(o) * value_dim,
+                                    raw_out.begin() + static_cast<std::ptrdiff_t>(o + 1) * value_dim);
+            const std::vector<float> rr = reorder(row, 1, 0, hv);
+            std::copy(rr.begin(), rr.end(), tiled.begin() + static_cast<std::ptrdiff_t>(o) * value_dim);
+        }
+        w.add("blk.0.ssm_out.weight", {static_cast<std::uint64_t>(value_dim), hidden}, tiled);
+    }
     const std::vector<std::uint8_t> gguf_buf = w.finish();
 
     sub0::gguf::Reader r(gguf_buf);
     REQUIRE(r.ok());
 
     // Now the transplant proper: every buffer below comes out of recipe_for(), by name.
-    const Applied w_qkv = apply(r, Dest::GdnInProjQkv, 0, hidden, conv_dim);
-    const Applied w_z   = apply(r, Dest::GdnInProjZ,   0, hidden, value_dim);
-    const Applied w_b   = apply(r, Dest::GdnInProjB,   0, hidden, v_heads);
-    const Applied w_a   = apply(r, Dest::GdnInProjA,   0, hidden, v_heads);
-    const Applied conv  = apply(r, Dest::GdnConv,      0, conv_dim, kernel);
-    const Applied dt    = apply(r, Dest::GdnDtBias,    0, 1, v_heads);
-    const Applied alog  = apply(r, Dest::GdnALog,      0, 1, v_heads);
+    const GdnHeads heads{k_heads, v_heads, hk, hv};
+    const Applied w_qkv = apply(r, Dest::GdnInProjQkv, 0, hidden, conv_dim, 0, 0, heads);
+    const Applied w_z   = apply(r, Dest::GdnInProjZ,   0, hidden, value_dim, 0, 0, heads);
+    const Applied w_b   = apply(r, Dest::GdnInProjB,   0, hidden, v_heads, 0, 0, heads);
+    const Applied w_a   = apply(r, Dest::GdnInProjA,   0, hidden, v_heads, 0, 0, heads);
+    const Applied conv  = apply(r, Dest::GdnConv,      0, conv_dim, kernel, 0, 0, heads);
+    const Applied dt    = apply(r, Dest::GdnDtBias,    0, 1, v_heads, 0, 0, heads);
+    const Applied alog  = apply(r, Dest::GdnALog,      0, 1, v_heads, 0, 0, heads);
     const Applied nrm   = apply(r, Dest::GdnNorm,      0, 1, hv);
-    const Applied w_out = apply(r, Dest::GdnOutProj,   0, value_dim, hidden);
+    const Applied w_out = apply(r, Dest::GdnOutProj,   0, value_dim, hidden, 0, 0, heads);
 
     // Level 2 in situ: every op above is a permutation, so the statistics must survive it exactly.
     for (const auto* a : {&w_qkv, &w_z, &w_b, &w_a, &conv, &dt, &alog, &nrm, &w_out})
@@ -305,6 +404,32 @@ TEST_CASE("WP4c level 3: the GDN mapping replays layer 0's real fixture through 
     // fixture test and a gradient check both (docs/GATED_DELTANET.md S6).
     CHECK(swap_diff > 100.0 * max_abs);
     CHECK(swap_diff > 1e-9);
+
+    // MUTATION CHECK (WP4f): read `ssm_a` VERBATIM, i.e. skip the NegExpALog inverse. That is exactly
+    // what this transplant did before WP4f's diagnosis, and it is one of the three defects that made
+    // the real blk.0 diverge from llama.cpp at rel_l2 0.996. Unlike the alpha/beta swap above this is
+    // not a subtle signal -- the decay gate becomes exp(-exp(-exp(A_log))*softplus) instead of
+    // exp(-exp(A_log)*softplus) -- so the bar is a plain, large multiple of the reference agreement.
+    {
+        std::vector<float> raw_a;
+        const sub0::gguf::TensorInfo* t = r.find_tensor("blk.0.ssm_a");
+        REQUIRE(t != nullptr);
+        REQUIRE(sub0::gguf::to_f32(*t, r.tensor_bytes(*t), raw_a));
+        // ...and the file really does hold the finished multiplier, not the log: every entry negative.
+        for (float x : raw_a) CHECK(x < 0.f);
+        std::vector<float> unfolded(out.size(), 0.f);
+        std::fill(state.begin(), state.end(), 0.f);
+        std::fill(conv_hist.begin(), conv_hist.end(), 0.f);
+        sub0::gdn::forward(dims, T, input.data(), w_qkv.data.data(), w_z.data.data(), w_b.data.data(),
+                           w_a.data.data(), conv.data.data(), dt.data.data(), raw_a.data(),
+                           nrm.data.data(), w_out.data.data(), state.data(), conv_hist.data(),
+                           unfolded.data(), scratch.data());
+        double d = 0.0;
+        for (std::size_t i = 0; i < out.size(); ++i)
+            d = std::max(d, std::fabs(static_cast<double>(unfolded[i]) - out[i]));
+        INFO("reading ssm_a verbatim moves the output by " << d);
+        CHECK(d > 1000.0 * max_abs);
+    }
 }
 
 // --- LEVEL 4: layer 3, the first QSA layer ---------------------------------------------------------
@@ -364,12 +489,20 @@ TEST_CASE("WP4c level 4: the QSA mapping replays layer 3's real fixture through 
           read_f32(dir / "qsa_layer3_small_weight_v_proj.bin", static_cast<std::size_t>(NKV * HD) * H));
     w.add("blk.3.attn_output.weight", {static_cast<std::uint64_t>(NH * HD), H},
           read_f32(dir / "qsa_layer3_small_weight_o_proj.bin", static_cast<std::size_t>(H) * NH * HD));
-    w.add("blk.3.attn_q_norm.weight", {HD}, read_f32(dir / "qsa_layer3_small_weight_q_norm.bin", HD));
-    w.add("blk.3.attn_k_norm.weight", {HD}, read_f32(dir / "qsa_layer3_small_weight_k_norm.bin", HD));
+    // All FOUR of this layer's norms are zero-centred gammas the converter pre-folds to (1 + w) --
+    // `self_attn.q_norm.weight`/`k_norm.weight` by the inherited `endswith("norm.weight")` rule, and
+    // the two indexer layernorms by conversion/qwen4exp.py's own explicit `data_torch + 1`. qsa_math's
+    // rms_norm_row applies the `(1 + w)` itself, so a verbatim read squares the gain's offset.
+    w.add("blk.3.attn_q_norm.weight", {HD},
+          converter_gamma(read_f32(dir / "qsa_layer3_small_weight_q_norm.bin", HD)));
+    w.add("blk.3.attn_k_norm.weight", {HD},
+          converter_gamma(read_f32(dir / "qsa_layer3_small_weight_k_norm.bin", HD)));
     w.add("blk.3.indexer.q_proj.weight", {H, q_rows}, idx_q);
     w.add("blk.3.indexer.k_proj.weight", {H, k_rows}, idx_k);
-    w.add("blk.3.indexer.q_norm.weight", {IHD}, read_f32(dir / "qsa_layer3_small_weight_idx_q_norm.bin", IHD));
-    w.add("blk.3.indexer.k_norm.weight", {IHD}, read_f32(dir / "qsa_layer3_small_weight_idx_k_norm.bin", IHD));
+    w.add("blk.3.indexer.q_norm.weight", {IHD},
+          converter_gamma(read_f32(dir / "qsa_layer3_small_weight_idx_q_norm.bin", IHD)));
+    w.add("blk.3.indexer.k_norm.weight", {IHD},
+          converter_gamma(read_f32(dir / "qsa_layer3_small_weight_idx_k_norm.bin", IHD)));
     const std::vector<std::uint8_t> gguf_buf = w.finish();
 
     sub0::gguf::Reader r(gguf_buf);
@@ -448,6 +581,36 @@ TEST_CASE("WP4c level 4: the QSA mapping replays layer 3's real fixture through 
             d = std::max(d, std::fabs(static_cast<double>(out2[i]) - out[i]));
         INFO("a swapped indexer concat order moves the output by " << d);
         CHECK(d > 1e-6);
+    }
+
+    // MUTATION CHECK (WP4f): read the four zero-centred gammas VERBATIM, i.e. skip the
+    // ZeroCentredGamma inverse, applying a gain of (2 + w) where the real model applies (1 + w).
+    // Statistically the tensors are barely distinguishable (a uniform +1 shift on a 8-wide vector) and
+    // every shape is right, which is precisely why nothing before WP4f caught it.
+    {
+        auto verbatim = [&](const char* name, std::size_t n) {
+            std::vector<float> v;
+            const sub0::gguf::TensorInfo* t = r.find_tensor(name);
+            REQUIRE(t != nullptr);
+            REQUIRE(sub0::gguf::to_f32(*t, r.tensor_bytes(*t), v));
+            REQUIRE(v.size() == n);
+            return v;
+        };
+        const std::vector<float> qn_raw = verbatim("blk.3.attn_q_norm.weight", HD);
+        const std::vector<float> kn_raw = verbatim("blk.3.attn_k_norm.weight", HD);
+        const std::vector<float> iq_raw = verbatim("blk.3.indexer.q_norm.weight", IHD);
+        const std::vector<float> ik_raw = verbatim("blk.3.indexer.k_norm.weight", IHD);
+        std::vector<float> out2(static_cast<std::size_t>(T) * H, 0.f);
+        std::vector<float> scratch(sub0::qsa::scratch_floats(dims, T), 0.f);
+        sub0::qsa::forward(dims, T, input.data(), idx.data.data(), iq_raw.data(), ik_raw.data(),
+                           q.data.data(), gate.data.data(), k.data.data(), v.data.data(), qn_raw.data(),
+                           kn_raw.data(), o.data.data(), cos.data(), sin.data(), sub0::qsa::RMS_EPS,
+                           out2.data(), scratch.data());
+        double d = 0.0;
+        for (std::size_t i = 0; i < out.size(); ++i)
+            d = std::max(d, std::fabs(static_cast<double>(out2[i]) - out[i]));
+        INFO("reading the zero-centred gammas verbatim moves the output by " << d);
+        CHECK(d > 100.0 * max_abs);
     }
 }
 
