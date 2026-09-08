@@ -21,8 +21,8 @@ token id to the real model is meaningless — the embedding row it selects is ar
 real model requires the real model's own tokenizer.
 
 So WP5a adds a **second, separate** tokenizer. Nothing in `tokenizer.hpp`/`casing.hpp` is touched, and
-the default build's test suite is byte-for-byte unchanged (AGENTS.md §4 — verified: 233 test cases /
-118,192 assertions with and without this change).
+the default build's test suite is byte-for-byte unchanged (AGENTS.md §4 — verified: 235 test cases /
+118,416 assertions with and without this change).
 
 | file | what |
 |---|---|
