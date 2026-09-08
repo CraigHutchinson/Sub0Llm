@@ -1,5 +1,11 @@
 # WP4 — real-scale Qwen3.8-Flash-Next run + llama.cpp comparison: scoping proposal
 
+Status (2026-09-08, later): **WP5c is EXECUTED — the whole pipeline composes, and the real 48-layer
+model produced real English.** Real Qwen tokenizer → real transplanted weights → real sampling → real
+detokenization, in one process: `"The capital of France is"` → `" Paris. How many countries have
+capitals with"`. See "WP5c" at the end of §6. The generation loop is no longer a missing piece; the
+gap to interactive use is now *entirely* the ≈10 s/token, exactly as WP5b predicted.
+
 Status (2026-09-08): **WP4a-f are all DONE and merged, and WP5b — the FULL 48-layer model — has been
 executed.** The real Qwen3.8-Flash-Next `UD-IQ1_S` weights now transplant, load and run through this
 engine's own `Model::forward` at all 48 layers, in 35.51 GiB of peak working set, at ≈8.2 s/token. See
@@ -1662,6 +1668,204 @@ designed and it is the *decode cost* that is expensive.
   at. Everything that links no engine (all three transplant targets, all three shape targets,
   `sub0_frontend_tests`, and the `--verify` pass above) WAS built and run on today's `main` plus that
   fix; only `sub0llm-qwen4-forward` and `sub0_core` were built from this branch's own `4005819`.
+
+---
+
+### WP5c — the generation loop: real tokenizer + real weights + real sampling, end to end. EXECUTED. Results, recorded rather than summarised
+
+**Beyond WP4's original scope, and the third of three prerequisites for real interactive inference.**
+WP5a proved the tokenizer against the real reference; WP5b proved the full 48-layer model loads and
+runs. Neither had ever been connected to the other, and nothing in this repo had ever *sampled* at the
+real axes. WP5c is that wiring, and nothing more: `tools/sub0llm-qwen4-gen.cpp` plus one
+`add_executable` block. **No new math, and deliberately no new numerical gate** — every component
+already has one, and re-gating them here would test nothing.
+
+#### The gates are composition gates, because that is the only kind available
+
+Stated up front rather than discovered later: **there is no end-to-end oracle.** Sampling is
+stochastic, and no independent Qwen inference engine exists on this machine, so "is this the right
+continuation?" is not a question this work package can answer, at any depth. What it *can* answer, and
+does, is whether the pieces are wired together correctly. Five checks, each run for real:
+
+| Gate | Result |
+|---|---|
+| **Round trip**, ASCII prompt (WP5a's contract is `decode(encode(x)) == NFC(x)`, and NFC is the identity on ASCII, so this is a hard gate) | **EXACT**, byte for byte, on every run |
+| **Round trip with special tokens in the prompt** — `"Hello<\|im_end\|>"` | ids `[9419, 248046]`, round trip **EXACT**. This is what verifies the *identity* half of the stop condition: 248046 is both what `encode` emits for that literal text and what `tk.eos_id()` returns |
+| **Determinism at fixed seed**, 4-layer sub-stack | two runs, same prompt/seed/temp/topk: **identical ids**, `[43751, 99014, 115301, 126138, 31346, 56912, 47894, 3966, 149822, 163763, 51754, 46627]`. A third run at `--seed 99` gives a **different** list, so the seed is genuinely wired rather than ignored |
+| **Determinism at fixed seed, FULL 48 layers** | first three ids `[11751, 13, 2500]`, **identical** to the 8-token run's first three. Worth doing separately from the 4-layer check: the 48-layer path runs WP4e's dequantize-on-demand resolve pool, whose residency state differs between runs, and this is what shows that state does not leak into the answer |
+| **`eos_id()` actually stops generation** | **YES, for real, on the real model** — see below |
+| **id range** — every prompt id inside `[0, VOCAB)`, and `tokenizer.vocab_size() <= VOCAB` | 248,077 named tokens against VOCAB 248,320; the **243** unnamed padding rows are printed as a number so a future axis change that inverts the inequality is loud |
+| **decode prefix invariant**, checked every token rather than assumed | never violated in any run |
+
+#### The eos stop condition — exercised, not argued around
+
+Natural sampling will not reach it: at `--topk 40` out of 248,320, `<|im_end|>` has to enter the top 40
+*and* be drawn, which is not going to happen inside a budget of tens of tokens. Rather than leave the
+branch untested by construction, or add a debug flag to force it (`AGENTS.md` §8), the case was
+*constructed out of the tokenizer's existing behaviour*: added tokens match literally, so a chat-shaped
+prompt can be typed directly with no templating layer at all.
+
+```
+--prompt "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi!"  --temp 0.1 --topk 1
+  prompt ids (13): [248045, 846, 198, 44240, 15131, 13, 248046, 198, 248045, 74455, 198, 12675, 0]
+  [stop] sampled eos_id 248046 as generated token 0 -- stopping
+```
+
+The real 48-layer model's **argmax immediately after a completed assistant turn is `<|im_end|>`**. So
+this is two results, not one: the stop branch executed (0 tokens generated, `[stopped on eos]`), and —
+unplanned — the transplanted weights end a turn the way the real instruct model does. That is a
+behavioural signal about the transplant that no shape check or statistics check could have produced.
+
+#### The headline run — the real 48-layer model, on a real prompt, from real text to real text
+
+`qwen4_full48_q.bin` + sidecar, the artifact WP5b built. Nothing about it was regenerated.
+
+```
+--prompt "The capital of France is" --n 8 --temp 0.8 --topk 40 --seed 1234
+  prompt ids (5): [760, 6511, 314, 9338, 369]
+  continuation:  Paris. How many countries have capitals with
+```
+
+| | |
+|---|---|
+| `load_model` | **20.3 s** for 18.31 GiB; sidecar 73,728 tensors / 37.11 GiB mapped |
+| peak after load / after `graph_reset` | **18.36 GiB** / **32.40 GiB** — WP5b's 18.32 / 32.35 reproduced |
+| prefill, 5 positions | **51.97 s** (**10.39 s/token**) |
+| generation, 8 tokens | **77.18 s** (**9.65 s/token**) |
+| **total wall clock, process start to exit** | **156.8 s** |
+| peak working set, whole run | **37.11 GiB** against 63.43 GiB total |
+| non-finite values, decode failures, prefix violations | **none** |
+
+**The output is real English and it is factually right.** That is worth stating plainly because
+nothing before it could have shown this: WP4c/d/e checked shapes, statistics and bitwise identity;
+WP4f checked one layer's hidden state against llama.cpp; WP5b checked that 48 layers produce finite
+logits. None of them could distinguish "the weights landed in the right places" from "the model
+actually works". A correct, fluent completion does. It is not a *quantitative* gate and is not
+presented as one — but it is the first evidence in this whole work stream that the transplant produces
+a functioning language model rather than a well-formed pile of tensors.
+
+**On the ≈10 s/token vs WP5b's ≈8.2.** Same order, and the difference was not chased — WP5c does no
+performance work by scope. The plausible contributors are that these are later window positions (QSA's
+own attention cost grows with `pos`) and ordinary run-to-run variation on a machine that is not
+otherwise quiesced. Recorded as measured, not reconciled.
+
+#### The 4-layer smoke test, and what it is and is not evidence of
+
+`qwen4_sub4_q_wp4f.bin`, same prompt, `--n 12`:
+
+```
+continuation: ocracy婴内部的着装_fit Yourself-fit віancenabbo Chin
+```
+
+Load 6.7 s, prefill 5 positions in 5.18 s (1.04 s/token), 12 tokens in 12.30 s (1.02 s/token), peak
+8.58 GiB. **This is gibberish and is supposed to be**: it is 4 of 48 layers, read straight into the
+un-normed lm_head. It proves the pipeline runs, not that anything is right — and it is ~10x faster,
+which is exactly what makes it the right place to iterate and to run the determinism gate.
+
+#### `SEQ_LEN` — measured, and the verdict is "leave it alone", with the reason
+
+`SEQ_LEN` is **128**, from WP4b's own shape header and unchanged since. `forward_one` requires
+`pos < SEQ_LEN`, so prompt length plus `--n` must fit; the tool prints the budget and clamps `--n`
+rather than walking off the end. In practice: a 5-token prompt leaves **123**, the 13-token chat-shaped
+prompt leaves **115**.
+
+**Should it be raised? No, and not because 128 is generous — because it is not the binding constraint.**
+Two independent reasons, both measured rather than assumed:
+
+1. **Throughput binds first, by a wide margin.** At 9.65-10.39 s/token, filling the *existing* 128-token
+   window would take **~20 minutes**. A larger window would buy context nobody can afford to generate
+   into. The constraint that actually stops interactive use is the same one WP5b named, and WP5c changes
+   nothing about it.
+2. **The arena cost is already known and already prohibitive.** WP5b measured the per-Worker activation
+   arena at 14.03 GiB at `SEQ_LEN = 128`, scaling linearly — 512 would be ~56 GiB per Worker and would
+   not fit. WP5b also named the cheapest available win (`act_grad` is allocated in a `FORWARD_ONLY`
+   build, roughly half of that 14.03 GiB, doing nothing). **That elision is the prerequisite to a longer
+   window, and it is still open.** Raising `--seq` before it lands would just move the failure from
+   "slow" to "does not allocate".
+
+So: no reconfigure. The finding is that `SEQ_LEN` is a *real* ceiling on a real interactive session and
+a *non-issue* for anything achievable at today's throughput, and the ordering between the two is what
+matters.
+
+#### A real defect found on the way, in engine code this work package did not touch
+
+**`sub0::sample_token` cannot be called at the real model's `VOCAB` on a default Windows stack.**
+`src/engine_core.cpp`'s sampler declares `std::array<float, VOCAB>` twice and `std::array<int, VOCAB>`
+once as ordinary locals. At `VOCAB = 248,320` that is **2.84 MiB in a single frame**, against the 1 MiB
+default. Measured rather than argued: relinked without the stack option (PE stack reserve back to
+`0x100000`), the tool dies at the **first** `sample_token` call — after the prefill lines print, before
+the first continuation byte — with exit status **`0xC00000FD`, `STATUS_STACK_OVERFLOW`**. With
+`/STACK:33554432` it completes.
+
+Nothing had hit this because **no real-axes consumer had ever sampled**: WP4d, WP4e, WP4f and WP5b all
+stop at the logits. WP5c is the first caller, so it is the first to need the room, and it takes it at
+its own link line. **The engine-side fix is NOT made here** — `engine_core.cpp` is shared with every
+other build in this repo, and moving the sampler's storage to a reused `thread_local` scratch buffer
+(which `AGENTS.md` §1 would want anyway: this runs once per generated token) is its own change with its
+own review. Recorded here so it is not rediscovered.
+
+A second, smaller one found while fixing the first: the CMake guard was originally `if(MSVC)`, which is
+about the **target ABI** and is FALSE for this repo's `clang++` presets even though the ABI *is*
+MSVC's. The correct predicate is `CMAKE_CXX_COMPILER_FRONTEND_VARIANT` — the linker is MSVC-style
+either way, it is the driver that differs. Worth recording because the failure mode is silent: the
+untaken branch simply leaves the 1 MiB default in place, and the only symptom is a crash much later.
+
+#### The design decisions, and why each went the way it did
+
+- **Priming is `forward_one` per prompt token, not one batched `forward()`.** A correctness decision,
+  and one this project had already settled — `decode.hpp`'s `kv_decode_generate` primes exactly that
+  way. `forward()` is the Node-graph path and writes **nothing** to the decode-path state: the KV cache
+  `g_kv`, the GDN recurrent accumulator `g_gdn` and QSA's own key cache `g_qsa_cache` are `thread_local`
+  state only `forward_one` touches. A batched prefill would leave all three empty and the next
+  `forward_one` would decode against an all-zero history. There is also nothing to gain: WP5b measured
+  the two at 50.35 s and 49.43 s for the same six tokens, because per-layer GDN/QSA/MoE compute
+  dominates and attention re-scanning does not.
+- **Streaming decode holds back a trailing U+FFFD.** `decode` ends in `decode_lossy`, so a prefix cut
+  mid-character yields U+FFFD where the full sequence yields a real character. The loop decodes the
+  whole accumulated id list each step, strips trailing U+FFFD (it may still resolve), prints only what
+  is new, and flushes the remainder at the end so a *genuine* replacement character is never swallowed.
+  Streaming rather than buffering because one token costs ~10 s and a run that printed only at the end
+  would be indistinguishable from a hang.
+- **No chat template.** The prompt goes through `encode()` verbatim. `AGENTS.md` §8 — land the stage
+  that is wired up. The eos experiment above shows the special tokens can simply be typed when a
+  chat-shaped prompt is wanted, which is why a templating layer earns nothing yet.
+
+#### Regression: the default build is untouched, and the counts prove it
+
+`AGENTS.md` §4 asks for identical assertion counts, not merely "no new failures". Reproduced on a
+**clean reconfigure** from an empty build directory, at a configuration confirmed field-for-field
+identical to the recorded baseline's generated `sub0_corpus.hpp`:
+
+| | before (recorded) | this branch |
+|---|---|---|
+| `sub0_tests` | 28,755,032 / 147 | **28,755,032 / 147** |
+| `sub0_frontend_tests`, no real tokenizer files | 120,889 / 244 | **120,889 / 244** |
+| `sub0_frontend_tests`, `SUB0_QWEN_TOKENIZER_DIR` set | 121,457 / 244 | **121,457 / 244** |
+
+Full build **305/305 targets** green, including the new one. Expected, since no existing file's
+*content* changed — the diff is one new `tools/` file and one additive `CMakeLists.txt` block — but
+`AGENTS.md` §4 exists precisely because "expected" is not evidence.
+
+#### Deliberately still open, named here so nothing rediscovers them
+
+- **Throughput, unchanged and now the only thing left.** ≈10 s/token. WP5b's own list of where to start
+  (uninstrumented resolve-pool hit rate, `gguf::to_f32`'s redundant re-zeroing, and the big one — this
+  engine materializes a whole expert as f32 where llama.cpp never does) is still the right list.
+- **`sample_token`'s stack footprint**, above. Also a per-token `std::partial_sort` over 248,320
+  elements plus three VOCAB-sized array copies, which is `AGENTS.md` §1's exact target once anyone
+  cares about the millisecond scale.
+- **Non-ASCII prompts cannot be passed on the command line on this host.** Windows hands `argv` in the
+  active code page, which is **1252** here, so `"日本"` arrives as `"??"`. This is a property of the
+  CLI, not of the tokenizer — WP5a's own 1936-row fixture suite is where non-ASCII coverage lives — but
+  it does mean the tool's round-trip gate only ever exercises the ASCII (byte-identical) branch in
+  practice. A `--prompt-file` reading UTF-8 bytes would fix it; not added, because nothing needs it yet.
+- **No chat template**, above. The model is an instruct model and raw-prompt continuation is not the
+  distribution it was tuned for, so the 48-layer completion above is a *lower* bound on what it can do.
+- **The CUDA-enabled configure cannot link the `psapi` targets in this shell, and that is pre-existing.**
+  `nvcc` needs the full `vcvars64` environment; with it, CMake resolves an MSVC-style linker and emits a
+  bare `psapi.lib`, which `clang++`'s GNU-style driver then reports as a missing input file. It breaks
+  the **untouched** `sub0llm-qwen4-forward` identically, so it is not a WP5c regression. The recorded
+  baseline build is `SUB0_COMPUTE=CPU`, which needs no `nvcc` and therefore no `vcvars`, and is green.
 
 ---
 

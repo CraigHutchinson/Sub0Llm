@@ -16,6 +16,16 @@ overlapping active entry — a perf-sensitive workload on one track can invalida
 measurements even with zero file overlap. Add a row when you start something that will hold a file or
 the CPU for more than a few minutes; update it when you finish.
 
+## Research delegation
+
+Standing user preference (2026-09-08): delegate data gathering and research to a Terra agent
+(`gpt-5.6-terra`). Give it a bounded question, relevant project context, and an explicit request for
+primary sources, evidence, uncertainties, and applicability to our actual hardware/software versions.
+The primary agent remains responsible for assessing the findings, integrating them into the design
+or implementation, and verifying consequential claims. Continue useful independent work in parallel.
+Research delegation does not authorize installs, shared-file edits, or contended hardware measurements;
+scope and coordinate those separately. If Terra is unavailable, state that and continue locally.
+
 ## 1. No heap allocation in any per-step or per-call hot path
 
 Every model dimension is a compile-time constant, so the engine's forward/backward/training-loop
