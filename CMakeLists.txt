@@ -175,7 +175,13 @@ endif()
 # registry (model identity/compat), casing. Factored out so BOTH the configurator and the runtime engine
 # share ONE definition, and so the engine-free tests cover it without building the engine. Depends only
 # on the standard library (no generated config), so the configurator links it without the engine.
-add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp src/run_config.cpp)
+# qwen_tokenizer.cpp (WP5a) belongs here for the same reason run_config.cpp does: it is engine-free
+# (std + simdjson + sub0/qwen_unicode.hpp, no generated config) and the engine-free tests must be able
+# to cover it without building a model. It is a SEPARATE tokenizer from src/tokenizer.cpp -- the real
+# Qwen3.8-Flash-Next byte-level BPE, needed because the transplanted Qwen weights have no relationship
+# to this project's own token ids. See docs/QWEN_TOKENIZER.md.
+add_library(sub0_frontend STATIC src/tokenizer.cpp src/unigram.cpp src/tok_interchange.cpp src/run_config.cpp
+                                 src/qwen_tokenizer.cpp)
 target_include_directories(sub0_frontend PUBLIC "${CMAKE_SOURCE_DIR}/include")
 # run_config.cpp is registry.hpp's out-of-line half (read_config_json / read_state, both simdjson).
 # It belongs HERE, not in sub0_core: it includes only registry.hpp + simdjson -- no engine, no

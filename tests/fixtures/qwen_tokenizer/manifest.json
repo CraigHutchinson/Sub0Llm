@@ -1,0 +1,30 @@
+{
+  "description": "Real-reference fixture for sub0::qwen_tok, this engine's reimplementation of the Qwen3.8-Flash-Next byte-level BPE tokenizer. Every expected value was produced by the real tokenizer, not hand-derived.",
+  "source": {
+    "repo": "Qwen/Qwen3.8-Flash-Next",
+    "snapshot": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "files_read": [
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ],
+    "oracle": "tokenizers.Tokenizer.from_file(tokenizer.json) -- the model's own artifact",
+    "cross_check": "transformers.models.qwen3_5.Qwen3_5Tokenizer (transformers' own model_type map sends qwen4_exp here); every case agreed",
+    "NOT_the_oracle": "transformers.AutoTokenizer.from_pretrained(...), which honours the stale tokenizer_class='Qwen2Tokenizer' field and rebuilds the pipeline with an OLDER pre-tokenization regex that lacks \\p{M} -- see docs/QWEN_TOKENIZER.md sec 2.1",
+    "tokenizers_version": "0.23.1",
+    "transformers_version": "5.16.1",
+    "pretokenize_regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+  },
+  "files": {
+    "encode_cases.tsv": "label / hex(input) / token ids / hex(reference decode(ids))",
+    "pretokenize_cases.tsv": "label / hex(NFC(input)) / hex of each pre-token chunk",
+    "nfc_cases.tsv": "label / hex(input) / hex(NFC(input))",
+    "decode_cases.tsv": "label / token ids / hex(reference decode(ids)) -- id sequences encode() never produces: truncated multi-byte characters and the model's padding rows"
+  },
+  "decode_convention": "skip_special_tokens=False (transformers' own default). `tokenizers`' raw Tokenizer.decode defaults to True and would drop the 20 tokens flagged `special`; that is a display policy, not a decode, and it breaks the decode(encode(x)) == NFC(x) round trip.",
+  "counts": {
+    "encode_cases": 269,
+    "pretokenize_cases": 269,
+    "nfc_cases": 1389,
+    "decode_cases": 9
+  }
+}
