@@ -31,7 +31,7 @@
 //    and the reason is visible in the backend: `forward()` is the Node-graph path and writes NOTHING
 //    to the decode-path state. The KV cache (`g_kv`), the GDN recurrent accumulator (`g_gdn`) and the
 //    QSA indexer's own key cache (`g_qsa_cache`) are thread_local state that ONLY `forward_one` reads
-//    and writes (src/backends/cpu/backend.cpp). A batched `forward()` over the prompt would leave all
+//    and writes (src/backends/cpu/decode.cpp). A batched `forward()` over the prompt would leave all
 //    three empty, and the next `forward_one` would decode position P against an all-zero history.
 //    There is no cheaper prefill available at this seam -- and at these axes there is nothing to gain
 //    from one anyway: WP5b measured `forward` over 6 tokens at 50.35 s against `forward_one` over the

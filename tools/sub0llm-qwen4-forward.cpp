@@ -434,7 +434,7 @@ int main(int argc, char** argv) {
 
     std::println("\n--- 5. the readout is un-normed, and what the removed LnF was costing ----");
     // hidden_last is the GR EXIT-COLLAPSED representation at the final position -- and, since the LnF
-    // removal, it is EXACTLY what lm_head reads (backend_cpu.cpp's forward_one no longer calls
+    // removal, it is EXACTLY what lm_head reads (decode.cpp's forward_one no longer calls
     // rmsnorm_row under USE_GATED_RESIDUAL). Two claims are checked here with numbers:
     //   (a) the engine really is un-normed now: recomputing lm_head(hidden_last) + bias in double
     //       reproduces forward_one's own logits row to float-rounding, which it cannot do if any

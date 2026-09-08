@@ -475,7 +475,7 @@ thread_local GdnLinkCache g_gdn_link;   // only ever populated/consulted when US
 // which would badly inflate the activation arena for a buffer that is, by construction, never live more
 // than once at a time. Sized once, lazily, to gdn::bwd_scratch_floats(GDN_DIMS, SEQ_LEN) -- the worst
 // case over every T <= SEQ_LEN a real forward() call could have produced -- the same lazy-lifetime
-// pattern already established by KVCache/GdnCache below (a std::vector, not a raw thread_local array:
+// pattern already established by decode.cpp's KVCache/GdnCache (a std::vector, not a raw thread_local array:
 // Worker's own comment on why multi-MB thread_local statics are unsafe on Windows applies here too, and
 // this buffer is comparably large at production dims).
 struct GdnBwdScratch {
@@ -593,9 +593,10 @@ static Node* op_attn(Node* q, Node* k, Node* v, int H) {
     return out;
 }
 
-// op_gdn (Gated DeltaNet, Stage 1) is defined further below, right after the `Layer` struct it needs --
-// see that definition for the full comment. It cannot live here: it takes a `Layer&`, and `Layer` is
-// not declared until the "Model (internal)" section, unlike op_attn/op_depth_attn's plain Node* args.
+// op_gdn (Gated DeltaNet, Stage 1) is defined further below, in the whole-sublayer op section -- see
+// that definition for the full comment. It sits apart from the ops here because it takes a `Layer&`
+// (internal.hpp) rather than op_attn/op_depth_attn's plain Node* args, which is the same reason
+// op_moe/op_qsa/op_gr_* are down there with it.
 
 // Count of ACTIVE (non-ignored) target positions -- the normalizer both the forward loss and the
 // CrossEnt backward divide by, so they must agree. A target < 0 (LOSS_IGNORE_INDEX) is masked out.
@@ -1892,7 +1893,7 @@ void sync_params_to_device() {}
 // serialization (save_model / load_model) are backend-agnostic and live in
 // engine_core.cpp.
 
-// ensure_thread_built() matches forward()/forward_one() below: a caller running on a thread that has
+// ensure_thread_built() matches forward() below and decode.cpp's forward_one(): a caller running on a thread that has
 // never touched the engine before (e.g. a freshly-spawned OpenMP worker) must not dereference a null
 // thread_local W. Idempotent -- cheap to call even when W is already built.
 void graph_reset() { ensure_thread_built(); W->pool_used = 0; W->act_used = 0; }

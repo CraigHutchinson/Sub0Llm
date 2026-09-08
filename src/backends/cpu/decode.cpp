@@ -21,6 +21,17 @@
 #include <cstddef>
 #include <vector>
 
+// OpenMP gate, the same one backend.cpp carries and for the same reason -- see its copy for the full
+// argument. This code USED to live in that file and was covered by that guard, so repeating it here is
+// keeping the guard, not adding one. It matters more here than there, in fact: tied_head_row's
+// `#pragma omp simd reduction(+ : s)` is what PERMITS the compiler to reassociate that float sum, so a
+// build that silently lost OpenMP for this translation unit would not merely decode more slowly, it
+// would decode to different last bits than the batched forward() that still had it -- breaking the
+// forward/forward_one parity check with no compile-time signal at all.
+#if !defined(_OPENMP) && defined(SUB0_REQUIRE_OPENMP)
+#error "OpenMP required but _OPENMP is undefined: this translation unit was compiled without OpenMP, so decode's `#pragma omp simd` reductions would change accumulation order relative to the batched forward path. Reconfigure with OpenMP available, or pass -DSUB0_REQUIRE_OPENMP=OFF to build single-threaded on purpose."
+#endif
+
 namespace sub0 {
 namespace {
 // --- Incremental single-token inference (KV-cache) --------------------------
@@ -307,7 +318,7 @@ const float* Model::forward_one(int id, int pos) {
             do_reinject = true;
         }
     } else if (is_persistent_slot(id, VOCAB)) {
-        // Same unconditional guard as op_embed's forward branch (backend_cpu.cpp) -- see its
+        // Same unconditional guard as op_embed's forward branch (backend.cpp) -- see its
         // comment. Decode never runs backward, so this path only needs the forward compose (enc_w,
         // never enc_w_grad).
         const SlotEncoding enc = g_persistent_binds ? g_persistent_binds->encoding : SlotEncoding::MeanPool;
@@ -435,7 +446,7 @@ const float* Model::forward_one(int id, int pos) {
         [[maybe_unused]] auto do_qsa_mixer = [&] {
             float* raw_k_base = g_qsa_cache.base(e);
             // Row stride is ROTARY_DIM (the cos/sin tables are [SEQ_LEN][ROTARY_DIM]) -- see
-            // QsaRopeTables above; it was D_HEAD before --rotary-dim became an axis.
+            // QsaRopeTables (internal.hpp); it was D_HEAD before --rotary-dim became an axis.
             const float* cos_pos = g_qsa_rope.cos.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             const float* sin_pos = g_qsa_rope.sin.data() + static_cast<size_t>(pos) * ROTARY_DIM;
             qsa::indexer_project_row(QSA_DIMS, a, L.qsa_idx_qk->data.data(),
@@ -480,7 +491,7 @@ const float* Model::forward_one(int id, int pos) {
                 // so it goes straight into the residual the same way `proj` does above -- no
                 // separate Wo, no RoPE, no QK-norm, no depth-attention (see Model::forward()'s
                 // matching comment for why those are out of scope for a GDN layer).
-                // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward above (this
+                // Same dt_bias/a_log ARGUMENT-ORDER fix as op_gdn's batched forward (backend.cpp) (this
                 // decode path had the identical swap, independently) -- see that call site's comment.
                 float gdn_scratch[GDN_SCRATCH1];
                 gdn::forward(GDN_DIMS, 1, a,

@@ -56,7 +56,7 @@ consteval size_t calc_act_cap() {
     // N-gram embeddings run ONCE per forward (input-embedding injection only, not per execution):
     // NGRAM_NUM_EMBEDDERS op_embed nodes ([T, NGRAM_EMB_DIM] each, summing to [T, D_MODEL]) + that many
     // op_linear nodes ([T, D_MODEL] each) + that many op_add nodes (the accumulator chain plus the
-    // final residual add) -- see forward()'s ngram block in backend_cpu.cpp.
+    // final residual add) -- see Model::forward()'s ngram block in backend.cpp.
     // Gated Residual (Stage 1): the model-level entry tile ([T, HC_WIDE], once) and exit collapse
     // (op_gr_mix only -- [T,D_MODEL] output + its [T,HC_WIDE]+[T,HC_LOWRANK] scratch, once). The two
     // PER-SUB-BLOCK-WRAP instances (attn-wrapping, mlp-wrapping, once per EXECUTION) are costed in
@@ -196,7 +196,7 @@ void ensure_shared_params();
 // moe::expert_ffn_row consumes them.
 //
 // WHY A POOL AND NOT A PER-CALL BUFFER (AGENTS.md S1). This runs per selected expert per token, so it
-// is as hot as anything in this file. One expert is 3 * D_MODEL * D_FF floats -- 18.75 MiB at the real
+// is as hot as anything in this backend. One expert is 3 * D_MODEL * D_FF floats -- 18.75 MiB at the real
 // axes -- which is neither a stack array nor something that may live in the DLL's static image (see
 // g_param_data's own comment on SizeOfImage), so it is a lazily heap-allocated pool sized by a
 // COMPILE-TIME slot count, allocated once and reused for the life of the process.
