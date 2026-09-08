@@ -3,7 +3,9 @@
 Date: 2026-09-08. **Reconciled with `220afaf`; research and conditional implementation plan.**
 User priority: interactive inference first, training later.
 Read [the platform research and design](INTEL_IGPU_BACKEND_DESIGN.md) for evidence, architecture,
-ownership, benchmark protocol and selection criteria.
+ownership, benchmark protocol and selection criteria. The [whole-plan review](INTEL_IGPU_PLAN_REVIEW.md)
+records scope gaps and their closure; the [benchmark and optimization contract](INTEL_IGPU_PERFORMANCE.md)
+is normative for all measured packages.
 
 ## Scope and execution rules
 
@@ -40,7 +42,7 @@ approved project estimate.
 | I03 | Vulkan comparison — parked | Evidence to reopen, then I00/I01 | Deferred |
 | I04 | Optional bounded OpenVINO comparison | I00, I01 | M |
 | I05 | Native dense/GDN/encoded-expert experiment | I00/I01, initial I18/I19 findings | M |
-| I06 | Native execution recipe decision | I05, I18–I20; optional I02/I04 evidence | S |
+| I06 | Component-based investment decision; not final interactive acceptance | I05, I18–I21; optional I02/I04 evidence | S |
 | I07 | Device ABI/build axis; not delivered by source moves | I01; I07b lands with I11 | M |
 | I08 | CPU extraction — area, manifest and API facade landed; deeper split active | Frozen baseline, coordinate Copilot | M remaining |
 | I09 | CUDA extraction — area and manifest landed; deeper split active | CUDA baseline, coordinate Copilot/I07 | L remaining |
@@ -49,23 +51,73 @@ approved project estimate.
 | I12 | GDN and gated residual | I11, I01 | L |
 | I13 | QSA | I11, I01 | L |
 | I14 | Encoded MoE | I10/I11, I18 | L |
-| I15 | Integrated prefill/decode and acceptance | I10–I14; I08 only where needed | L |
+| I15 | Integrated prefix correctness and baseline performance | I10–I14, I21; I08 only where needed | L |
 | I16 | CPU/iGPU/NVIDIA placement | I15 or equivalent working experiment; I19 | XL |
-| I17 | Full decoder and later training | WP5a/b inputs; separate gates below | XL |
+| I17 | I17a full-model capacity, I17b useful decoder; I17c–e deferred features | I17a: I01/I19 + WP5b; I17b: I15/I17a + WP5a | XL, split below |
 | I18 | ISA/code-generation and quantization proof | I00, I01 for real planes | M |
 | I19 | Memory access, residency and bounded staging | I00; WP5b findings as available | M |
 | I20 | Equivalent-kernel Level Zero/SYCL submission comparison | I00, executable I18 kernel; coordinate I19 | M |
+| I21 | Persistent benchmark harness and regression records | I00/I01 schemas; grow with runnable consumers | M |
+| I22 | Measured native optimization campaign | I21 + correct component; integrated acceptance after I15 | L, bounded per hypothesis |
+| I23 | Runtime/deployment qualification and release decision | I07b/I11 smoke; prefix after I15/I22; full after I17b | M |
 
 I07–I09 remain independently useful maintenance. They do not block engine-free research, and a
 complete CUDA split is not required for Intel inference. I08/I09 delivery so far is structural;
 full runtime parity/performance gates remain outstanding in the active owner's log. Do not repeat
 committed moves or infer that a source manifest implements multi-toolchain orchestration.
 
+## Preliminary spikes and plan evolution
+
+These are bounded sub-deliverables of existing packages, not another backend or a second experiment
+framework. Estimates below exclude environment setup; I00 reports that cost separately. Reserve the
+laptop before execution. Failed/unsupported outcomes are useful results, provided the reason is
+reproducible. Preparation can proceed in parallel in the named leaf directories.
+
+| Spike / owner package | Question and smallest useful experiment | Initial bound | Decision / next consumer |
+|---|---|---|---|
+| S0 / I00, I20 | Can a checked compiler-produced kernel execute through the proposed native route, and can one selected library primitive share its allocations and synchronization? Test one buffer handoff both directions; compare an explicit-copy fallback | 1–2 days | I06/I11 choose a compatible compiler/runtime/context recipe; direct Level Zero may remain conditional if library interop is costly or unsupported |
+| S1 / I19 | Can the actual mapped-file allocation type be legally accessed/imported, or must selected encoded ranges be staged? Touch bounded representative ranges and verify CPU-write/GPU-read synchronization | 1 day | I10 chooses mapping lifetime, staging and unique-byte accounting; no giant capacity sweep until this works |
+| S2 / I18 | Which real IQ decode-dot route suits this GPU? One non-square gate/up/down triple with actual codebook/scales and M=1 plus prefill | 2 days | I05/I14 choose float fusion, bounded tile decode or a separately quality-gated integer-dot route; disprove unsupported matrix assumptions early |
+| S3 / I20 | Can repeated dependent work update expert indices/arguments without costly recapture or unsafe buffer reuse? Replay two deliberately different routing patterns and a reset | 1 day | I11/I15 choose command/graph reuse and invalidation; ordinary submissions remain a valid baseline |
+| S4 / I05 | Do omitted QSA/GR/host boundaries dominate the promising GEMV/GDN results? Use real component fixtures in a representative dependency chain, including index selection, state updates and final-logit transfer | 2 days | I06 ranks missing kernels and transfer bottlenecks before authorizing full integration; label partial chain coverage, never synthetic TTFT |
+| S5 / I17a | Does a measured bounded working set plus the real artifact census leave a credible full-model memory path? Ingest WP5b facts; test one bounded selected-expert cache, without repeating the full transplant | 1 day after inputs exist | Continue full-model design, require explicit tiering work, or record infeasibility; prefix research can continue with a narrower claim |
+
+S0/S1 come before large native implementation commitments. S2/S3 supply I05; S4 is required before
+I06 claims coverage of the architecture's main bottlenecks. S5 starts as soon as its inputs exist and
+runs independently of prefix integration. A spike may close from already-recorded equivalent evidence;
+link that evidence instead of rebuilding scaffolding. A time bound ending without an answer produces
+an inconclusive report and a costed follow-up, not automatic promotion.
+
+Each spike leaves a compact evidence card: hypothesis, exact input/toolchain identity, commands,
+correctness result, raw measurements/limitations, alternatives ruled out, recommended plan diff,
+consumer package and remaining uncertainty. I21 stores the common schema. Keep benchmark utilities
+only when they have ongoing measurement consumers; gate retired duplicate spike scaffolding under the
+existing opt-in build options, consistent with AGENTS §11. Do not land unconsumed production knobs.
+
+Review checkpoints are explicit work within I06/I21/I23, not a new permanent review subsystem:
+
+1. **R0 after I00/S0/S1:** revise hardware facts, toolchain feasibility, allocation assumptions and
+   outstanding risks. Resolve shared file ownership and harness interfaces before parallel code work.
+2. **R1 after S2–S4, with S5 status:** I06 records proceed / narrow / defer / stop for each lane;
+   revise dependencies, estimates, math/memory/submission recipe and the full-model capacity outlook.
+3. **R2 before I11/I10 public wiring:** review the concrete consumed ABI, ownership, state machine,
+   layouts and build boundary using cpp-review. I07b/I11 land together; I10's encoded interface remains
+   private until I15 consumes it. Stop interface work on unresolved ownership or dependency cycles.
+4. **R3 after I15's correct baseline:** reprioritize I22 from the measured critical path, freeze the
+   optimization budget and re-evaluate whether the projected full-model path remains useful.
+5. **R4 after I22/I17b evidence:** I23 records the exact qualification level and outstanding limits;
+   update the main design, package map, performance baseline and active log together.
+
+A changed artifact, driver/compiler, supported instruction, memory envelope or quality assumption
+reopens only affected gates; record the prior decision, new evidence and impacted packages. Keep stable
+IDs, mark superseded recipes explicitly, and distinguish planned / active / implemented-unqualified /
+qualified / deferred status. Do not mark a package done merely because its source was committed.
+
 ## Wave 1: establish evidence without engine changes
 
 ### I00 — Hardware and environment facts
 
-**Owns:** a new `tools/intel_probe/` standalone probe if needed, `scripts/intel/` environment manifests,
+**Owns:** a new `tools/intel_probe/` standalone probe if needed, `scripts/intel/inventory/` environment manifests,
 and `out/intel-review/inventory/`. No production CMake/configuration mutation.
 
 **Work:** verify adapter identity from runtime enumeration (registry found `8086:7D67`, driver
@@ -82,7 +134,7 @@ gets a new manifest. No driver update is required merely because a newer one exi
 
 ### I01 — One artifact census and correctness manifest
 
-**Owns:** `tests/fixtures/intel/` manifests and `scripts/intel/` comparison specifications; existing
+**Owns:** `tests/fixtures/intel/` manifests and `scripts/intel/fixtures/` comparison specifications; existing
 fixtures and WP4 tools are read-only inputs.
 
 **Work:** enumerate every tensor and op for the corrected four-layer prefix, its dense/sidecar files,
@@ -147,7 +199,7 @@ porting assignment hidden in a benchmark ticket.
 
 ### I05 — Small native Intel mechanism experiment
 
-**Owns:** `benchmarks/intel/` standalone sources and `out/intel-review/native-probe/`. Separate CMake
+**Owns:** `benchmarks/intel/mechanisms/` standalone sources and `out/intel-review/native-probe/`. Separate CMake
 entry for the experiment; no production CLI flags.
 
 **Work:** use I18 capability/code-generation results and I19 allocation constraints; compare oneDNN/oneMKL dense projection against a simple checked SYCL kernel at M=1 and
@@ -166,10 +218,11 @@ the chosen backend, per AGENTS §11.
 
 **Owns:** a result appendix to the design doc and raw-result manifest index.
 
-**Work:** compare feasible routes at batch one, warm TTFT and p50/p95 decode latency, preparation time,
-correctness, peak memory, fallback, and available energy data. Include CPU and eligible NVIDIA results.
-Use interleaved isolated trials. Apply the provisional 20%/5% promotion criteria from the design as an
-investment aid; show separate prompt-length outcomes rather than burying them in one score.
+**Work:** compare the checked component chains available from I05/I18–I20, with I21 records.
+Estimate their contribution to the complete critical path and memory budget, labeling projections.
+Native TTFT is not required before native generation exists. External interactive measurements are
+optional contextual evidence, not a substitute for the missing native chain. Include CPU and eligible NVIDIA results.
+Use interleaved isolated trials. Reserve the design's 20%/5% interactive promotion criteria for I22/I23; show separate prompt-length outcomes rather than burying them in one score.
 
 **Done when:** select a native kernel/compiler, submission and memory recipe, or stop/defer Intel port
 work because it does not improve the use case. Report direct Level Zero versus SYCL separately from
@@ -283,10 +336,15 @@ and optimizer checkpoint byte layouts remain valid; no full model-sized staging 
 
 ### I11 — Context, dense kernels and an actual inference consumer
 
-**Owns:** selected backend `context.*`, `kernels/linear.*`, normalization/elementwise helpers and `api.*`.
+**Owns:** selected backend `context.*`, `kernels/linear.*`, `kernels/attention.*`, embedding,
+FFN, normalization/elementwise helpers and `api.*`; shared consumer edits through the integration owner.
 
 **Work:** implement the internal single-session lifecycle from the design, queue/event ownership,
-scratch reservation, dense projection/norm/RoPE paths and failures. Keep FP32 correctness mode and
+scratch reservation and a complete minimal dense forward/decode chain: token embeddings,
+normalization, projections, causal attention/softmax, KV append/read, positional encoding, residuals,
+the selected FFN activation/gating, final normalization and vocabulary head. Freeze one real supported
+dense artifact/config in I01; do not silently assume Qwen3.5 is an ordinary-attention control.
+Support exactly that config, reject other feature combinations, and cover setup/failure paths. Keep FP32 correctness mode and
 separately gated reduced precision. Wire a small supported dense model into the existing generation
 consumer with explicit artifact validation; do not advertise Qwen4 while I12–I14 are missing.
 
@@ -347,8 +405,8 @@ device fault; CPU recovery requires an explicit reset/replay, not stale cache co
 
 **Done when:** I01 prefix fidelity, full enabled suites, default suite count comparison, prompt/decode
 equivalence, second-session reset and context-limit checks pass. No project-owned hot allocation;
-record observed runtime allocations. I06 metrics improve on the chosen comparator at exact scale,
-including preparation/peak memory. The report states excluded PLE/vision/MTP and does not label the
+record observed runtime allocations. I21 captures the first correct native prefix baseline, including preparation/peak memory.
+A correct but slow baseline can complete integration; I22/I23 separately gate performance promotion. The report states excluded PLE/vision/MTP and does not label the
 prefix a useful full model. Runtime/toolchain redistributables and clean-shell startup are verified.
 
 ## Later, separately gated work
@@ -367,25 +425,26 @@ build/setup plan. Do not export duplicate neutral symbols from two accelerator D
 plugin registry, or enable the existing unimplemented HYBRID flag as a cosmetic milestone.
 Merge capacity findings back into `QWEN4_MEMORY_ORCHESTRATION.md` rather than starting a second tier planner.
 
-### I17 — Full decoder, optional sampling, and training follow-ups
+### I17 — Full-model delivery and separately deferred follow-ups
 
 WP5a (real tokenizer) and WP5b (mmap sidecar/full 48-layer transplant and RSS) are active, separately
 owned inputs. Ingest their exact artifacts and measured memory when available; do not duplicate their
 implementation. Full transplant/load does not by itself establish complete PLE or useful generation.
 
-These are separate gates, not one deliverable:
+I17a/b belong to the useful-Qwen objective, not the training backlog. Prefix completion alone never
+closes them. Each subpackage has its own owner, artifact manifest, estimate and status when activated.
 
-- **Complete useful model:** re-evaluate capacity for an actual full artifact, complete PLE/n-gram
-  integration through existing Sub0Firn work, and validate tokenizer/chat-template and outputs.
-  Reducing layers or dropping PLE is not completion. New smaller Qwen4 releases require a new census.
-- **Device sampling:** only if vocab-logit copy/CPU sampling is measured to matter. Preserve callback,
-  RNG/distribution and diagnostic contracts or expose an explicitly different mode. Relates to B13.
-- **Vision/MTP/NPU:** each needs its own real operator and memory study; useful later, not implied by
-  text-prefix success. Speculative decode needs state rollback/snapshots beyond ordinary reset.
-- **Training/fine-tuning:** user explicitly put it later. Requires backward coverage, mutable weights,
-  optimizer ownership/checkpoint parity and realistic memory feasibility. OpenVINO inference support
-  does not supply these. Separate host optimizer settings from storage to avoid reserving unnecessary
-  CPU Muon buffers for device-only work; relates to the recorded Muon memory follow-up.
+| Subpackage | Owns / consumes | Entry and work | Completion gate |
+|---|---|---|---|
+| I17a full-model capacity | Capacity report in existing orchestration docs; WP5b artifacts read-only | Start before I06 with I01/I19 facts; size dense weights, encoded pool, PLE, state, runtime, OS headroom and preparation peaks | Actual mapped/touched and sustainable-memory evidence, or an explicit infeasible result with remaining options; no extrapolated resident-fit claim |
+| I17b useful full text decoder | Intel full-model wiring and acceptance fixtures; WP5a tokenizer/chat and Sub0Firn PLE interfaces consumed through their owners | After I15/I17a and upstream prerequisites; integrate all layers, tokenization/chat/EOS, PLE/history and streaming through the real generation caller | Independent full-model correctness/quality checks, repeated real prompts and I21 user-visible timings; I23 qualifies release. Missing PLE or capacity keeps this milestone open |
+| I17c device sampling | Sampling consumer/backend changes, relates B13 | Only when logit copy/sampling dominates measured latency; preserve callback/RNG/diagnostic semantics or specify a distinct mode | Distribution/reference and seeded behavior gates plus inclusive latency improvement |
+| I17d vision/MTP/NPU | Separate future designs, no current shared-file reservation | New operator/memory census; speculative decode requires state rollback/snapshots | New bounded plan before implementation; text-prefix success grants no coverage |
+| I17e training/fine-tuning | Separate future training plan | Backward coverage, mutable-weight ownership, optimizer/checkpoint parity, realistic memory; separate host settings from Muon scratch | New bounded plan and real training consumer; no training support advertised by inference backend |
+
+I17c–e are deliberately deferred, not implementation-ready commitments. If I17a finds the target
+infeasible, retain the measured finding and evaluate tiering or a real smaller artifact in a separately
+scoped decision; do not silently reduce the model and mark I17b complete.
 
 ## Native research prerequisites (start before backend integration)
 
@@ -448,6 +507,64 @@ warm p50/p95 chain latency and observed allocations. Validate dependencies, rese
 and stable buffer lifetime before timing. Recommend direct Level Zero only from total critical-path
 results and maintenance costs, not its lower abstraction level. Feed the selected recipe into I06.
 
+## Measurement, optimization and delivery ownership
+
+### I21 — Persistent benchmark harness and regression records
+
+**Owns:** `scripts/intel/bench/`, `benchmarks/intel/common/`, result schema and manifest index;
+root benchmark registration via the integration owner. I00 owns environment capture, I01 fixtures.
+
+**Work:** implement the [performance contract](INTEL_IGPU_PERFORMANCE.md) with the first real probe
+consumer. Reuse existing benchmark/build-provenance facilities; do not create a second general test
+framework. Keep runner/schema maintenance here and algorithm benchmarks in their package directories.
+Add component, chain, prefix and full-model modes only as those consumers exist. Record failure,
+unsupported and missing-required-fixture outcomes explicitly; no GPU-required job may pass on a skip.
+
+**Done when:** a clean invocation reproduces a checked probe comparison and machine-readable raw
+samples, then extends without schema ambiguity to I15/I17b. Timing overhead is measured, async work is
+included, variants differ by recorded derived quantities, and regression comparison distinguishes noise
+from an established loss. Source/manifest summaries are versioned; large raw artifacts have checksums,
+retained paths and retrieval instructions. Instrumentation reserves memory outside timed loops.
+
+### I22 — Profile, tune and promote native execution
+
+**Owns:** optimization ledger/results under `out/intel-review/optimization/`; kernel modifications
+remain owned by I11–I14 authors, execution/memory changes by I10/I15. One owner integrates each trial.
+
+**Work:** rank hotspots by their measured contribution, apply the performance contract's bounded tuning
+sequence, and test one hypothesis at a time. Initial component tuning can run before I15, but final
+promotion requires the integrated chain. Include prefill chunk/tiles, M=1 GEMV, quantized gather/unpack,
+fusion, graph reuse, memory placement and CPU sampler/callback overhead. Record rejected variants.
+
+**Done when:** every retained optimization has an ablation against the correct baseline, quality/state
+and memory gates, two-scale evidence, unprofiled timing and a reproducible recipe. I15 then receives
+an integrated rerun; I17b receives a separate full-model run when feasible. Pass the 20%/5% promotion
+rule or document a justified memory/energy mode; otherwise mark correct-but-not-promoted. No claim
+of global optimality or automatic acceptance from a faster microkernel. Stop a hypothesis after a
+predeclared variant/time budget and report unresolved causes rather than endlessly tuning.
+
+### I23 — Runtime, deployment and release qualification
+
+**Owns:** `scripts/intel/qualification/`, native installation/troubleshooting notes and release evidence;
+shared packaging/build wiring via I07 owner. No installer framework is added without a real consumer.
+
+**Work:** qualify the selected host/device compiler boundary, ABI/config identity, redistributables and
+licenses on the existing Windows target, from a clean shell without developer-only PATH assumptions.
+CPU-only configure/build must not require Intel tooling. Check missing DLL/driver/device, incompatible
+artifact/cache, allocation failure, failed preparation cleanup and repeat init/shutdown. Report supported
+OS/driver/compiler/device tuple; other Intel GPUs and Linux are unqualified until tested.
+
+Exercise bounded chunk execution, cancellation between completed chunks/tokens, callbacks/EOS/context
+limits and device-loss handling. Never free in-flight memory or continue with stale state after failure;
+define drain versus process teardown for unrecoverable runtime faults. Long-session/repeated-request
+runs check retained memory, cache bounds and latency drift. GPU correctness is required on a scheduled
+hardware runner; CPU CI checks default builds/contracts without pretending to qualify kernels.
+
+**Done when:** reproducible installation and lifecycle evidence, I21/I22 performance report, supported
+artifact/operator matrix and explicit limitations are published. Label dense, prefix and full-model
+qualification separately; only I17b completion permits a useful full-Qwen claim. Document cache
+invalidation/rebuild and rollback to the prior build. Hardware absence leaves qualification pending.
+
 ## Suggested parallel assignment
 
 ```mermaid
@@ -458,7 +575,9 @@ flowchart TD
     A --> K[I05 Native mechanisms]
     M --> K
     A --> S[I20 Submission]
-    K --> D[I06 Native recipe decision]
+    P[I21 Benchmark contract] --> K
+    P --> D[I06 Component investment decision]
+    K --> D
     M --> D
     S --> D
     O[I02 / I04 Optional references] -.-> D
@@ -470,6 +589,11 @@ flowchart TD
     G --> R[I15 Integration]
     Q --> R
     E --> R
+    R --> T[I22 Integrated optimization]
+    T --> U[I23 Prefix qualification]
+    R --> W[I17b Full decoder]
+    C[I17a Capacity and WP5 inputs] --> W
+    W --> Z[I22 / I23 Full-model qualification]
     R --> X[I16 Placement]
 ```
 

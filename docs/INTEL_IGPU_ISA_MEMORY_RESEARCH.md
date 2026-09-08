@@ -150,3 +150,11 @@ before claiming ESIMD output can be dispatched directly.
 Select native language, code generation, library use, allocation strategy and submission API
 independently. A thinner submission API cannot fix a poor quantization kernel; conversely a good kernel
 can lose behind avoidable per-token waits. This decomposition is the basis for the revised parallel plan.
+
+## Evidence handoff
+
+Use work-package spikes S0–S3 for initial native interop, mapped-memory, IQ math and replay proofs.
+Record results through I21 using the [performance contract](INTEL_IGPU_PERFORMANCE.md). Checkpoints
+R0/R1 update the recipe and dependencies before implementation; unsupported paths are closed with
+evidence, not hidden behind a generic native-backend label. S4/S5 test architecture-chain and full
+capacity assumptions before broader claims.

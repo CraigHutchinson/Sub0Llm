@@ -4,10 +4,12 @@ Review date: 2026-09-07. Source snapshot: `7a188e88e5694716839664281f5aea2b8f278
 
 Follow-up 2026-09-08: Intel planning now prioritizes native Sub0Llm execution and interactive inference.
 See [backend design](INTEL_IGPU_BACKEND_DESIGN.md), [ISA/quantization and memory research](INTEL_IGPU_ISA_MEMORY_RESEARCH.md)
-and [21 packages, I00–I20](INTEL_IGPU_WORK_PACKAGES.md). Vulkan is parked; instruction proof, usable
+and [24 packages, I00–I23](INTEL_IGPU_WORK_PACKAGES.md). Vulkan is parked; instruction proof, usable
 UMA memory and native submission measurements lead the research. CPU/CUDA source-area moves,
 backend manifests and CPU API facade have landed through `220afaf`; deeper extraction and runtime
 qualification remain open. No Intel backend has been implemented or measured by this research pass.
+Whole-plan review adds [benchmark/optimization requirements](INTEL_IGPU_PERFORMANCE.md), six bounded
+spikes and five evidence-driven review checkpoints; [findings and closures](INTEL_IGPU_PLAN_REVIEW.md).
 
 Follow-up 2026-09-08: the user requested B14 immediately. CPU Muon scratch reuse and Gram-product
 optimization are implemented and validated; see [results and limits](MUON_CPU_OPTIMIZATION.md).

@@ -28,6 +28,9 @@ Deliver the smallest useful inference path first; defer training, concurrent ser
 scheduling until there is evidence that they are needed.
 
 Execution tickets and dependency gates are in [Intel work packages](INTEL_IGPU_WORK_PACKAGES.md).
+The [performance contract](INTEL_IGPU_PERFORMANCE.md) specifies benchmark boundaries, optimization
+order and regression gates. The [whole-plan review](INTEL_IGPU_PLAN_REVIEW.md) records the scope audit.
+Six bounded preliminary spikes feed five review checkpoints; evidence can narrow or stop later work.
 This document adds an Intel execution option to [BACKENDS.md](BACKENDS.md) and
 [Qwen memory orchestration](QWEN4_MEMORY_ORCHESTRATION.md); it does not replace the latter's
 cross-tier storage design or [Sub0Firn](SUB0FIRN_SPEC.md).
@@ -407,8 +410,9 @@ AUTO/HETERO schedules Sub0Llm's CUDA kernels.
 
 ## 7. Evidence required to choose a winner
 
-**Gate A — platform:** real GPU enumerates, tiny operation and small model run correctly, supported
-precisions/allocation limits recorded. A registry entry alone does not pass this gate.
+**Gate A — platform:** real GPU enumerates and a checked native operation executes with recorded
+precision/allocation facts. A small model is a later I11 execution gate or optional external control,
+not a prerequisite for engine-free research. A registry entry alone does not pass this gate.
 
 **Gate B — correctness:** component fixtures at realistic small and exact head geometry; real encoded
 expert planes of each used type; complete four-layer prefix compared to WP4f's corrected oracle.
@@ -447,6 +451,36 @@ to the best comparable current route. These are proposed investment thresholds, 
 If winners differ by prompt length, publish the tradeoff rather than an arbitrary composite score.
 If iGPU loses, retain the useful refactor and evidence, and stop the native port. A quality-preserving
 memory/energy advantage can justify a separate mode, but must be explicitly demonstrated.
+
+### Delivery and lifecycle closure
+
+I11's dense milestone includes embeddings, causal attention/softmax and KV updates, selected FFN,
+residuals, final normalization and vocabulary head, in addition to linear/norm/RoPE. I01 names its
+real control artifact/config; unsupported features reject setup. I12–I15 add the Qwen-specific path.
+I17a evaluates full capacity early and I17b integrates the complete useful decoder; training stays
+separately deferred. I06 is an investment gate based on components, I15 a correct prefix baseline,
+I22 measured optimization, and I23 runtime/release qualification. They are not interchangeable claims.
+
+The session lifecycle is uninitialized → initialized → prepared → active → prepared/reset → destroyed.
+Failed preparation never publishes usable state. Execution failure enters a failed state; continuation
+requires a supported explicit reprepare/reset or process restart. Cancellation stops new submissions
+at a completed chunk/token boundary and drains outstanding work before releasing referenced storage.
+The backend owns all queue/event/graph/primitive resources; retained library objects must use compatible
+contexts and allocation lifetimes proved by S0, or explicit copies whose costs enter the benchmark.
+A host callback never observes incomplete logits. Reject reentrant model replacement/session use.
+Do not add public cancellation/session APIs until the generation caller consumes them.
+
+I10 accounts for host parameter mirrors, CPU fallback arenas, sidecar mappings, encoded and packed
+copies, library workspaces, state, staging and preparation peaks. An always-built CPU backend does not
+make its allocations free on UMA. If existing host ownership prevents a feasible Intel path, promote a
+bounded B12/loader prerequisite from measured evidence; do not silently subtract the CPU arena or
+require a general CPU rewrite. Failed device preparation leaves CPU fallback usable only if its own
+artifact state remains valid. I23 exercises partial failures and missing runtime/device cases.
+
+Specialization and precision choices known upfront follow the generated-config/`if constexpr` design.
+Runtime hardware checks validate that selected recipe at setup; changing token routing is runtime data.
+No new persistent autotuner or per-token configuration dispatch is implied. Profiling/record buffers
+are reserved before measurement, and diagnostic exports remain private consumers of backend contracts.
 
 ## 8. Design review and outstanding decisions
 
