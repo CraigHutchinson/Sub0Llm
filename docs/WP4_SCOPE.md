@@ -1286,15 +1286,12 @@ tensors inside the strictly-comparable window above.
 
 ##### Deliberately still open, named here so nothing rediscovers them
 
-- **No llama.cpp side exists yet, so there is no divergence table.** Per §6's own framing that is a
-  valid stage outcome, not a failure to paper over. What is *closed* is that nothing on this side blocks
-  it: the input is fixed and published, the format is specified and independently exercised, the gate is
-  stated, and the dump is on disk.
-- **A prior llama.cpp checkout at `D:\Craig\diffusiongemma\llama.cpp` (`ef5e2dc`, 2026-06-17) does not
-  support this architecture.** Its `src/llama-arch.cpp` enumerates `qwen`, `qwen2`, `qwen2moe`,
-  `qwen2vl`, `qwen3`, `qwen3moe`, `qwen3next`, `qwen3vl`, `qwen3vlmoe`, `qwen35`, `qwen35moe`,
-  `rwkv6qwen2` — **no `qwen4exp`**. Whether a newer upstream branch has it is the other half of this
-  stage and was not investigated here.
+- ~~**No llama.cpp side exists yet, so there is no divergence table.**~~ **CLOSED** — the oracle was
+  acquired and the comparison run; see "WP4f — the CROSS-COMPARISON, EXECUTED" below.
+- ~~**A prior llama.cpp checkout at `D:\Craig\diffusiongemma\llama.cpp` (`ef5e2dc`, 2026-06-17) does not
+  support this architecture.**~~ Still true of that checkout, and **superseded**: upstream `ccc3646`
+  does support `qwen4exp` (PR #27742, merged 2026-08-27) and is checked out separately at
+  `D:\Craig\llama.cpp-qwen4exp`. The `diffusiongemma` checkout is untouched.
 - **`forward_capture` is CPU-only**, like `loop_pass_stats` and `last_hidden_ptr` beside it. WP4 is a
   CPU-only work package (§5), so this is a declaration with one definition, not a refusal that could fire.
 - **Layer 3 (QSA) is now covered by the dump** even though WP4d's engine-vs-math-core replay still stops
@@ -1305,44 +1302,175 @@ tensors inside the strictly-comparable window above.
   the reader reports the duplicate count rather than silently picking one; the real Qwen4 axes have
   LoopSplit off, so it does not arise there. Pinned by a test rather than left to be discovered.
 
-### WP4f — the ACTUAL cross-comparison, run for the first time (2026-09-07)
+#### WP4f — the CROSS-COMPARISON, EXECUTED. The layer-0 divergence, its root cause, and the fix
 
-With both halves merged, the orchestrating session ran the real comparison: `llama-qwen4-dump` re-run
-with the Sub0Llm side's own canonical token array (`1543,88123,245000,7,99999,156789`, no BOS, `-c 64`,
-same real GGUF file), its output converted to `S0HD` (renaming `model.input_embed`->`tok_embd`,
-`hc_init`->`gr_tile`, `l_last-N`->`blk.N.out` — ggml's `[D_MODEL,HC_COUNT,T]`/`ne[0]`-fastest layout is,
-walked in raw file order, EXACTLY row-major `[T, HC_COUNT*D_MODEL]` with the same stream-major ordering
-this project's own `wide = hc_count*hidden_size` convention already uses, so no transpose was needed —
-independently confirmed by checking `hc_init`'s own raw floats show all 4 streams holding an identical
-copy of the embedding per token, exactly what a tile op must produce), then diffed against the existing
-`wp4f_sub0llm.s0hd` with `sub0llm-hidden-diff --gate 0.0001`.
+The llama.cpp side was acquired (upstream `ggml-org/llama.cpp` at `ccc3646`, which merged `qwen4exp`
+support via PR #27742 on 2026-08-27, checked out to `D:\Craig\llama.cpp-qwen4exp` with a local
+`examples/qwen4-dump` tool) and the comparison was run for the first time on 2026-09-07. It failed, and
+localizing that failure is what this section records.
 
-**Result — a real, localized divergence, not the hoped-for "agree through layer 0" outcome**:
+##### The first result: a real, localized divergence at layer 0
 
-| tensor | shape | rel_l2 | cosine | verdict |
-|---|---|---:|---:|---|
-| `tok_embd` | `[6x2560]` | 0.000e+00 | 1.000000 | PASS (exact) |
-| `gr_tile` | `[6x10240]` | 0.000e+00 | 1.000000 | PASS (exact) |
-| `blk.0.out` | `[6x10240]` | 9.960e-01 | 0.593851 | **FAIL** |
-| `blk.1.out` | `[6x10240]` | 1.115e+00 | 0.429612 | **FAIL** |
-| `blk.2.out` | `[6x10240]` | 2.875e+00 | 0.322191 | **FAIL** |
-| `blk.3.out` | `[6x10240]` | 3.521e+00 | 0.261048 | **FAIL** |
+| Tensor | `rel_l2` | cosine |
+|---|---:|---:|
+| `tok_embd`, `gr_tile` | **0.0** | 1.0 |
+| `blk.0.out` | **0.996** | 0.594 |
+| `blk.1.out` / `blk.2.out` / `blk.3.out` | 1.11 / 2.87 / 3.52 | — |
 
-The token embedding lookup and Gated-Residual entry tile — everything computed before any decoder layer
-runs — match EXACTLY, bit for bit. **The divergence starts at layer 0 itself** (a Gated DeltaNet layer),
-far beyond llama.cpp's own measured internal noise floor at this depth (~6.7e-04 relative from CPU
-repack settings alone, per the earlier finding) — this is a real disagreement, not numerical noise.
-Growing magnitude at layers 1-3 is consistent with layer 0's error propagating forward, not a new
-independent error appearing at each layer.
+Far beyond llama.cpp's own repack-vs-no-repack spread (~6.7e-04 at this depth), and growing with depth
+in a way consistent with layer 0's own error propagating rather than a new error per layer.
 
-**This IS the stage's deliverable**, per §6's own framing ("they disagree at layer K in mechanism M" is
-an equally valid, equally useful outcome as agreement) — a localized divergence, not a global unhelpful
-mismatch. Root cause NOT yet determined: dispatched as its own focused investigation (candidates, in
-prior-probability order: a bug in llama.cpp's days-old `qwen4exp` GDN implementation, since this
-architecture support merged only 2026-08-27 and is exactly where a fresh bug is plausible; a
-conversion-side issue specific to per-layer weights despite the embedding passing exactly; or a
-naming/graph-position misunderstanding of what `l_last-N` actually captures). See the next revision of
-this section for the outcome.
+##### The bisection that localized it — llama.cpp's own intermediates, not just `l_last`
+
+`llama-qwen4-dump` was re-run on the SAME canonical input with a `--filter` naming every `cb()` site
+inside layer 0's loop body, giving 29 tensors instead of 6 (`D:\Craig\wp4f-llamacpp-dump\run_l0bisect`).
+Paired against this side's own per-layer intermediates, which the S0HD dump already carried:
+
+| Sub0Llm | llama.cpp | `rel_l2` | note |
+|---|---|---:|---|
+| `blk.0.res_in` | `hc_init` | **0.0** | identical entering the layer |
+| `blk.0.attn_in` | `hc_mixed-0` | **1.006** | **first disagreement — the Gated Residual READ, before GDN runs at all** |
+| `blk.0.attn_out` | `linear_attn_out-0` | 1.867 | |
+| `blk.0.out` | `l_last-0` | 0.996 | |
+
+`‖a‖ 201.4` against `‖b‖ 103.8` with cosine 0.967 — nearly parallel and roughly twice the length, which
+is the signature of a norm GAIN being wrong by a near-constant, not of a wrong mechanism.
+
+##### Root cause: a GGUF is not a copy of the checkpoint
+
+**The defect is on the Sub0Llm side, in `include/sub0/transplant.hpp`, and it is one wrong assumption
+with three instances.** That header treated a GGUF tensor as the HF tensor with its axes declared
+backwards. It is not. `llama.cpp`'s converter — `conversion/qwen.py`'s `Qwen3NextModel.modify_tensors`
+and `_LinearAttentionVReorderBase.modify_tensors`, both of which `conversion/qwen4exp.py`'s
+`Qwen4ExpTextModel` inherits — **rewrites values and head order on the way in**, so that llama.cpp's own
+graph can be simpler. A transplant that reads the file verbatim therefore loads a DIFFERENT MODEL, with
+every shape, every count and every per-tensor statistic correct.
+
+Each rewrite was confirmed against the real `UD-IQ1_S` bytes, not inferred from the converter source
+alone, by an **independent NumPy (float64) reimplementation** of layer 0 built from the dequantized
+GGUF tensors and checked against llama.cpp's own dumped intermediates:
+
+| # | The converter's rewrite | Evidence from the real file |
+|---|---|---|
+| A | `elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"): data_torch = data_torch + 1` — every `Qwen4ExpTextRMSNorm` gain is stored **pre-folded to `1 + w`**. `gr::hc_norm` and `qsa::rms_norm_row` add the `1` themselves, so a verbatim read applies `2 + w`. | llama.cpp's `hc_norm-0` is reproduced to **`4.2e-08`** with gain `v` and to **`0.89`** relative with gain `1 + v` |
+| B | `if name.endswith(".A_log"): data_torch = -torch.exp(data_torch)` — `ssm_a` holds the **finished multiplier**, not the log. `gdn_math.hpp` computes `-exp(a_log) * softplus(...)`, exponentiating a second time. | `gate-0 == a_softplus * ssm_a` to **`2.0e-07`**; `a_softplus * -exp(ssm_a)` (this project's reading) is **`1.0004`** relative, i.e. unrelated. Every entry of the real `blk.0.ssm_a` is negative (min −157.985), which alone rules out its being a log |
+| C | `_reorder_v_heads` rewrites every v-head-indexed axis **grouped → tiled**, so ggml's tiled broadcast (v-head `j` pairs with k-head `j % n_k`) reproduces HF's `repeat_interleave`. Concretely `gguf_vhead[r*n_k + k] == hf_vhead[k*rep + r]`. `gdn_math.hpp` implements the HF association `hv = hk*rep + r`. | `attn_output-0` is reproduced to **`2.0e-03`** (dequantization noise) with the tiled association and to **`0.71`** relative with the grouped one |
+
+**Why every existing gate missed all three, stated plainly because it is the transferable lesson:**
+
+- Level 2 (per-tensor statistics) is a permutation check. C **is** a permutation, so level 2 is provably
+  blind to it — the same blind spot `[[independent-reimplementation-catches-identity-swap-bugs]]` names.
+  A and B do change the statistics, but level 2 compares the destination to *its own source*, not to the
+  checkpoint, so a rewrite present in the source passes through untouched and unnoticed.
+- Levels 3/4 (the fixture replay) re-encoded each fixture's **HF values verbatim** into its synthetic
+  GGUF. Two omissions therefore cancelled exactly: the encoder did not apply the converter's rewrites
+  and the transplant did not undo them. The gate was measuring a round trip through a convention neither
+  side had.
+- And the level-3 GDN fixture is `num_k_heads == 1`, where C's permutation is the **identity**. Even a
+  faithful encoder could not have exercised it there.
+
+##### The fix (branch `fix/wp4f-layer0-divergence`, commit `ee78c73`)
+
+The three inverses live in `transplant.hpp` beside the name/axis table, as `fold_for`/`apply_fold` and
+`vperm_for`/`ungroup_v_heads` — the transplant is the boundary that converts a foreign file's
+conventions into this project's own, so nothing downstream (`gdn_math.hpp`, the GR math, the engine)
+changes. They run **after** the level-2 comparison, so that check stays a test of the placement alone.
+The tool reports what it undid rather than doing it silently; on the real 4-layer sub-stack:
+**13 zero-centred gammas** (2 per layer + the GR exit + layer 3's four QSA/indexer norms), **3 `ssm_a`**
+(one per GDN layer), **24 v-head reorders** (8 tensors × 3 GDN layers).
+
+Both gaps in the gate are closed: `transplant_fixture_tests.cpp`'s encoder now emulates the converter
+(written from the converter's source, as an independent implementation rather than by calling the
+inverses backwards), and `transplant_tests.cpp` carries a genuine `n_k=2, n_v=6` case for C.
+
+##### Verification, with the numbers
+
+| Check | Result |
+|---|---|
+| Level 3 — GDN layer-0 fixture replay through the transplant | max \|transplanted − real reference\| **5.09e-11** (unchanged) |
+| Level 4 — QSA layer-3 fixture replay | **1.40e-09** (was 1.86e-09) |
+| New mutation: read `ssm_a` verbatim | moves layer 0 by **9.5e-05**, ~1.9e6× the reference agreement |
+| New mutation: read the gammas verbatim | moves layer 3 by **5.7e-03** |
+| Neutral identity (`AGENTS.md` §4) | d96 L8 H2 seq128 `sub0_tests` **hash-identical** before/after: `4631786f4f7988a4 / 2385e62dd02c8295 / d415a605f2ce3671`, 12,784,031 assertions, 147 cases |
+| `sub0_frontend_tests` | 117,431 → **117,664** assertions, 226 → **230** cases — exactly the four new cases, nothing else moved |
+| Real forward pass at the real axes, on the regenerated artifact | loads and runs; `forward` vs `forward_one` parity **0 exactly**; engine-vs-math-core replay worst **2.2e-08** (WP4d's own band) |
+
+##### The cross-comparison, re-run
+
+```
+sub0llm-hidden-diff --a wp4f_sub0llm_fixed.s0hd --b wp4f_llamacpp_canonical.s0hd --gate 0.0001
+```
+
+| Tensor | before the fix | after the fix |
+|---|---:|---:|
+| `tok_embd`, `gr_tile` | 0.0 | 0.0 |
+| **`blk.0.out`** | **0.996** (cos 0.594) | **0.0221** (cos **0.999810**) |
+| `blk.1.out` | 1.11 | 0.584 |
+| `blk.2.out` | 2.87 | 0.554 |
+| `blk.3.out` | 3.52 | 0.565 |
+
+**`blk.0.out` still does not pass the `1e-4` gate, and that is now understood and is not a Sub0Llm
+defect.** The independent NumPy (float64) reference — the same one that diagnosed the root cause,
+computing the ENTIRE layer 0 (GR read, GDN, GR write, GR read, MoE + shared expert, GR write) from the
+exactly-dequantized GGUF weights — agrees with the two sides as follows:
+
+| Layer-0 intermediate | reference vs **Sub0Llm** | reference vs **llama.cpp** |
+|---|---:|---:|
+| `attn_in` | **1.11e-06** | 1.19e-02 |
+| `attn_out` | **2.32e-06** | 2.90e-02 |
+| `attn_res` | **3.63e-06** | 3.09e-02 |
+| `ffn_in` | **2.79e-06** | 3.20e-02 |
+| `ffn_out` | **1.70e-06** | 1.65e-02 |
+| `blk.0.out` | **2.59e-06** | **2.21e-02** |
+
+Sub0Llm now computes the layer-0 function to float32 rounding (cosine 1.00000000 at every one of the
+six), and the reference reproduces the differ's own `blk.0.out` number against llama.cpp to three
+figures (2.2105e-02 vs the differ's 2.211e-02, max_abs 7.817e-03 vs 7.818e-03). **The residual is
+llama.cpp's own arithmetic, not this engine's.**
+
+The mechanism is direct and was checked rather than asserted. llama.cpp does *quantized* matmuls: the
+weights stay in their `IQ1_S`/`IQ2_XXS`/`Q4_K`/`Q5_K`/`Q6_K`/`Q8_0` blocks and the **activations are
+quantized to int8** per row-block. Sub0Llm (and this reference) dequantize the same blocks and do exact
+f32/f64 arithmetic. Taking llama.cpp's OWN `hc_norm-0` as the input and projecting it two ways:
+
+| Projection out of the same input | weight type | reference vs llama.cpp |
+|---|---|---:|
+| `hc_inject-0` (`hc_attn_inject.weight`) | **F32** | **2.0e-07** |
+| `hc_gate-0` (`hc_attn_down`/`up.weight`) | **Q8_0** | **3.5e-03** |
+
+The same correlation holds across the whole layer: every tensor produced by an F32-weight matmul agrees
+to ~1e-7 (`alpha-0` 1.4e-07, `a_softplus-0` 1.3e-07, `beta_sigmoid-0` 5.2e-08, `hc_norm-0` 4.2e-08),
+and every tensor produced by a quantized-weight matmul disagrees at 1e-3…1e-2
+(`linear_attn_qkv_mixed-0` 4.1e-03, `z-0` 3.4e-03, `conv_output_silu-0` 1.5e-03). **Perfect correlation
+with weight quantization, zero correlation with mechanism.**
+
+**So the `1e-4` gate is not achievable against a quantized llama.cpp run at all**, for reasons that have
+nothing to do with this engine. §6 WP4f point 3 set that value before it was known that the oracle would
+be a 1–2 bit quantized model whose matmuls also quantize activations. And the repack-vs-no-repack noise
+floor (6.7e-04) does **not** bound this: both of those runs share the same activation-quantization
+scheme, so that number measures summation order only, not the distance from exact arithmetic. The gate
+is left stated as it was, unmoved after the fact; what changed is the recorded understanding of what it
+can measure.
+
+##### What is now established, and what is not
+
+- **Established**: with the converter's conventions undone, Sub0Llm's `Model::forward` computes decoder
+  layer 0 of the real Qwen3.8-Flash-Next `UD-IQ1_S` weights to **2.6e-06** relative against an
+  independent float64 implementation, at every intermediate, with cosine 1.00000000. That is the
+  strongest correctness statement WP4 has produced, and it is stronger than the llama.cpp comparison
+  could ever have been at this quantization tier.
+- **Not established**: agreement with the *unquantized* model. Both sides here evaluate `UD-IQ1_S`.
+- **Not established, and still bounded by §5's PLE exclusion**: layers 1-3. They still fail, and are
+  EXPECTED to. This was **measured, not assumed**: a third dump (`run_ple1`) named llama.cpp's own
+  `ple_gated_value-1` and `ple_conv_out-1`, whose sum IS the PLE contribution injected at decoder layer
+  1. Its norm is **3.329 against `‖l_last-0‖` 4.895 — 68.0% of the residual stream** (almost all of it
+  the depthwise-conv term, 3.240, with the gated-value term only 0.192). That is the same order as
+  `blk.1.out`'s own 0.584 residual, so §6's cheap "is its PLE actually firing?" check is answered:
+  **it is**, decisively, and layers 1-3 are comparing two different functions exactly as §5 said they
+  would. Not a mapping bug and not something a Sub0Llm-side change could close.
+- **Deliberately not attempted**: a fix to `llama.cpp`. Nothing found here is a llama.cpp bug — its
+  converter and its graph are mutually consistent, and its quantized arithmetic is a deliberate
+  performance choice.
 
 ---
 
@@ -1374,15 +1502,26 @@ not pick for the user.
 - **Q4 (Blocker A)**: **Full faithful fix** — `--head-dim` and its full consumer sweep (§2 Blocker A) are
   in scope for WP4b, not deferred. Real attention weights must be transplantable, not just GDN/GR/MoE.
 
-**Still open, unresolved by the above**: Q5 (llama.cpp availability — **narrowed 2026-09-07**: the
-unbuilt checkout at `D:\Craig\diffusiongemma\llama.cpp` is `ef5e2dc`, 2026-06-17, and its
-`src/llama-arch.cpp` does **not** enumerate `qwen4exp` at all, so WP4f is neither "build it" nor
-"acquire it" but "find a branch that supports this architecture, or report that it does not exist yet"
-— see WP4f's executed section above), Q6 (M-RoPE degeneracy, unverified), Q7 (per-layer mismatch gate —
-**settled**: `1e-4` on `rel_l2 = ||a-b||/||b||` per tensor, adopted as proposed and stated in
-`tools/sub0llm-hidden-diff.cpp` before any result was seen; see WP4f's executed section for why the
-quantity is a relative L2 and not a max elementwise relative error), Q8 (the 0.71B parameter-total
-discrepancy — the cheap 131-header-request census that would settle it has not been run).
+**Still open, unresolved by the above**: Q6 (M-RoPE degeneracy, unverified), Q8 (the 0.71B
+parameter-total discrepancy — the cheap 131-header-request census that would settle it has not been run).
+
+**Q5 (llama.cpp availability) — CLOSED 2026-09-07/08.** Upstream `ggml-org/llama.cpp` `ccc3646` merged
+`qwen4exp` via PR #27742 on 2026-08-27; it is checked out and built at `D:\Craig\llama.cpp-qwen4exp`
+with a local `examples/qwen4-dump` tool, and the cross-comparison has been run. (The older
+`D:\Craig\diffusiongemma\llama.cpp` at `ef5e2dc` genuinely does not carry the architecture, as recorded
+— it is simply not the checkout that was used.)
+
+**Q7 (per-layer mismatch gate) — settled as proposed, then found NOT ACHIEVABLE against a quantized
+oracle, for a reason external to this engine.** `1e-4` on `rel_l2 = ||a-b||/||b||` per tensor was
+adopted as-is and stated in `tools/sub0llm-hidden-diff.cpp` before any result was seen (see WP4f's
+executed section for why the quantity is a relative L2 and not a max elementwise relative error). It
+still stands unmoved. What the cross-comparison then established is that llama.cpp evaluates `UD-IQ1_S`
+with **quantized matmuls that also quantize the activations**, which puts a floor of ~1e-2 on any
+comparison against exact arithmetic on the same weights — measured, and shown to correlate perfectly
+with weight quantization and not at all with mechanism. The gate is therefore the right gate for a
+comparison against an *unquantized* oracle and cannot be met against this one. The replacement standard
+actually used, and the stronger one, is agreement with an independent float64 reimplementation built
+from the same dequantized weights: **2.6e-06 at `blk.0.out`**.
 
 **Q1 — Real weights at all, or a "real shape, fake weights" harness run first?**
 A synthetic run (real 48-layer Qwen4 `RunConfig`, randomly-initialised weights) would validate WP4b's

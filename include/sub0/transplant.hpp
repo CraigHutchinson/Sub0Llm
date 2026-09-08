@@ -47,6 +47,51 @@
 //     granularity. THIS engine already stores MoeGate and MoeUp as separate PARAM_LAYOUT tensors, so
 //     GGUF's granularity and the destination's coincide exactly and each is a plain per-expert slice.
 //     What IS needed is the 3-D EXPERT SLICE: one GGUF tensor supplies NUM_EXPERTS destinations.
+//
+// --- A GGUF IS NOT A COPY OF THE CHECKPOINT: THE CONVERTER'S OWN VALUE/ORDER CONVENTIONS -----------
+//
+// WP4f found this the hard way, and it is the single most important thing in this header. Everything
+// above treats a GGUF tensor as the HF tensor with its axes declared backwards. **It is not.**
+// `llama.cpp`'s converter (`conversion/qwen.py`'s `Qwen3NextModel.modify_tensors` and
+// `_LinearAttentionVReorderBase.modify_tensors`, which `conversion/qwen4exp.py`'s
+// `Qwen4ExpTextModel` inherits) REWRITES the values and the head order on the way in, so that
+// llama.cpp's own graph can be simpler. A transplant that reads the file verbatim therefore loads a
+// DIFFERENT MODEL, silently, with every shape and every statistic correct.
+//
+// Three such rewrites exist in this file, all three confirmed against the real
+// `UD-IQ1_S` bytes by an independent NumPy reimplementation of layer 0 checked against llama.cpp's own
+// dumped intermediates (see docs/WP4_SCOPE.md WP4f's diagnosis section for the measured numbers):
+//
+//  A. ZERO-CENTRED GAMMAS ARE PRE-FOLDED. `elif name.endswith("norm.weight") and not
+//     name.endswith("linear_attn.norm.weight"): data_torch = data_torch + 1`. Every
+//     Qwen4ExpTextRMSNorm gain in the file is already `1 + w`, and this project's math cores
+//     (gr::hc_norm, qsa::rms_norm_row) add the 1 THEMSELVES -- so reading the file verbatim applies a
+//     gain of `2 + w`. Measured on the real file: llama.cpp's own `hc_norm-0` is reproduced to
+//     `4.2e-08` with gain `v` and to `0.89` relative with gain `1 + v`.
+//     The ONE exception is GDN's `ssm_norm`, which the converter deliberately excludes -- and
+//     gdn_math.hpp's RMSNormGated correspondingly uses `norm_w` directly. Both sides agree, so
+//     GdnNorm carries no fold; that asymmetry is real, not an oversight.
+//  B. `ssm_a` IS NOT `A_log`. `if name.endswith(".A_log"): data_torch = -torch.exp(data_torch)`. The
+//     file stores the finished multiplier `-exp(A_log)` (every value in the real file is negative,
+//     min -157.985), while gdn_math.hpp computes `-exp(a_log) * softplus(...)` and so exponentiates
+//     again. Measured: llama.cpp's `gate-0` == `a_softplus * ssm_a` to `2.0e-07`, and
+//     `a_softplus * -exp(ssm_a)` -- this project's reading -- is `1.0004` relative, i.e. unrelated.
+//  C. GDN'S VALUE HEADS ARE REORDERED, GROUPED -> TILED. `_reorder_v_heads` rewrites every
+//     v-head-indexed axis so that ggml's TILED broadcast (v-head `j` pairs with k-head `j % n_k`)
+//     reproduces HF's `repeat_interleave` (v-head `k*rep + r` pairs with k-head `k`). Concretely
+//     `gguf_vhead[r*n_k + k] == hf_vhead[k*rep + r]`. gdn_math.hpp implements the HF association
+//     (`hv = hk*rep + r`), so the file's order must be undone. Measured: llama.cpp's `attn_output-0`
+//     is reproduced to `2.0e-03` (dequantization noise) with the tiled association and to `0.71`
+//     relative with the grouped one.
+//     **This is a PERMUTATION**, so S4c's level-2 statistics provably cannot see it -- exactly the
+//     blind spot `[[independent-reimplementation-catches-identity-swap-bugs]]` names -- and the
+//     level-3 fixture is `num_k_heads == 1`, where the permutation is the identity, so it could not
+//     see it either. tests/transplant_tests.cpp carries the multi-k-head case for that reason.
+//
+// The general rule this establishes, and the reason these live HERE rather than in the tool: the
+// transplant is the boundary that converts a foreign file's conventions into this project's own, so
+// every such inversion belongs beside the name/axis table it is part of, where the fixture replay can
+// exercise it. Nothing downstream -- gdn_math.hpp, gr math, the engine -- changes.
 
 #pragma once
 
@@ -100,6 +145,119 @@ struct Recipe {
     int         half = 0;         // PerHeadHalf: 0 = query, 1 = gate
     float       fill = 0.f;       // Synthetic: the value to write
 };
+
+// --- the converter's own value rewrites, and their inverses ---------------------------------------
+// See this header's "A GGUF IS NOT A COPY OF THE CHECKPOINT" section for where each comes from and the
+// measured evidence. Applied to the DESTINATION, after the placement op above, because every one of
+// them is a per-element map that commutes with a permutation -- which is what keeps docs/WP4_SCOPE.md
+// S4c's level-2 statistics a check on the PLACEMENT, undiluted (the tool runs them before this step).
+enum class Fold {
+    None,
+    ZeroCentredGamma,   // file holds (1 + w); this project's norms add the 1 -> subtract it back out
+    NegExpALog,         // file holds -exp(A_log); gdn_math exponentiates -> store log(-v) == A_log
+};
+
+constexpr Fold fold_for(Dest d) {
+    switch (d) {
+        // Every Qwen4ExpTextRMSNorm gain in the file EXCEPT GDN's ssm_norm, which the converter's own
+        // `not name.endswith("linear_attn.norm.weight")` deliberately excludes.
+        case Dest::GrAttnNorm:
+        case Dest::GrFfnNorm:
+        case Dest::GrExitNorm:
+        case Dest::QsaQNorm:
+        case Dest::QsaKNorm:
+        case Dest::QsaIdxQNorm:
+        case Dest::QsaIdxKNorm:  return Fold::ZeroCentredGamma;
+        case Dest::GdnALog:      return Fold::NegExpALog;
+        default:                 return Fold::None;
+    }
+}
+
+// `n` elements in place. NegExpALog reports failure rather than producing a NaN: every value in a real
+// `ssm_a` is strictly negative (it is minus an exponential), so a non-negative one means the source is
+// not what this inverse assumes and the run must stop, not continue with a silent NaN weight.
+inline bool apply_fold(Fold f, float* v, std::size_t n) {
+    switch (f) {
+        case Fold::None: return true;
+        case Fold::ZeroCentredGamma:
+            for (std::size_t i = 0; i < n; ++i) v[i] -= 1.f;
+            return true;
+        case Fold::NegExpALog:
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!(v[i] < 0.f)) return false;
+                v[i] = std::log(-v[i]);
+            }
+            return true;
+    }
+    return false;
+}
+
+// --- the converter's grouped -> tiled V-head reorder, and its inverse ------------------------------
+// Which axis of the DESTINATION tensor carries GDN's value-head index. `after_keys` marks the tensors
+// whose axis begins with the two key blocks (the fused QKV projection and the depthwise conv), so the
+// V block starts at `2 * num_k_heads * head_k_dim`. `wide` marks the tensors where a v-head occupies
+// `head_v_dim` consecutive slots rather than exactly one (alpha/beta/A_log/dt_bias are per-head
+// scalars).
+enum class VAxis : std::uint8_t { None, Rows, Cols };
+
+struct VPerm {
+    VAxis axis       = VAxis::None;
+    bool  after_keys = false;
+    bool  wide       = false;
+};
+
+constexpr VPerm vperm_for(Dest d) {
+    switch (d) {
+        // [D_MODEL, conv_dim]: columns, V block after Q|K, head_v_dim wide.
+        case Dest::GdnInProjQkv: return {VAxis::Cols, true,  true};
+        // [D_MODEL, value_dim] and [conv_dim, kernel]: the whole axis / after Q|K, head_v_dim wide.
+        case Dest::GdnInProjZ:   return {VAxis::Cols, false, true};
+        case Dest::GdnConv:      return {VAxis::Rows, true,  true};
+        // [value_dim, D_MODEL]: out_proj's INPUT axis is the v-head axis.
+        case Dest::GdnOutProj:   return {VAxis::Rows, false, true};
+        // per-head scalars: [D_MODEL, num_v_heads] and [1, num_v_heads].
+        case Dest::GdnInProjA:
+        case Dest::GdnInProjB:
+        case Dest::GdnALog:
+        case Dest::GdnDtBias:    return {VAxis::Cols, false, false};
+        // GdnNorm is [1, head_v_dim] -- shared across heads, so it has no v-head axis at all.
+        default:                 return {};
+    }
+}
+
+// Undo `_reorder_v_heads`: destination (HF/grouped) v-head `k*rep + r` takes the source (GGUF/tiled)
+// v-head `r*n_k + k`. Out-of-place -- `dst` must not alias `src` -- because a head permutation has no
+// useful in-place form and this runs once per tensor in an offline tool, never in a hot path.
+// Everything outside the V block is copied through unchanged.
+inline void ungroup_v_heads(const float* src, int rows, int cols, VPerm vp, int num_k_heads,
+                            int num_v_heads, int head_k_dim, int head_v_dim, float* dst) {
+    const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    for (std::size_t i = 0; i < n; ++i) dst[i] = src[i];
+    if (vp.axis == VAxis::None || num_k_heads <= 0 || num_v_heads % num_k_heads != 0) return;
+
+    const int rep   = num_v_heads / num_k_heads;
+    const int group = vp.wide ? head_v_dim : 1;
+    const int base  = vp.after_keys ? 2 * num_k_heads * head_k_dim : 0;
+
+    for (int k = 0; k < num_k_heads; ++k)
+        for (int r = 0; r < rep; ++r) {
+            const int dst_head = k * rep + r;        // HF / repeat_interleave order
+            const int src_head = r * num_k_heads + k; // GGUF / ggml tiled-broadcast order
+            for (int g = 0; g < group; ++g) {
+                const int d_idx = base + dst_head * group + g;
+                const int s_idx = base + src_head * group + g;
+                if (vp.axis == VAxis::Cols) {
+                    for (int row = 0; row < rows; ++row)
+                        dst[static_cast<std::size_t>(row) * cols + d_idx] =
+                            src[static_cast<std::size_t>(row) * cols + s_idx];
+                } else {
+                    for (int c = 0; c < cols; ++c)
+                        dst[static_cast<std::size_t>(d_idx) * cols + c] =
+                            src[static_cast<std::size_t>(s_idx) * cols + c];
+                }
+            }
+        }
+}
 
 // The name/axis table. Every entry was checked against the real
 // D:\ModelWeights\Qwen3.8-Flash-Next-GGUF\UD-IQ1_S file's own tensor table -- name, declared dims and
