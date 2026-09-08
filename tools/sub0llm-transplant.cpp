@@ -20,9 +20,15 @@
 // HOW IT IS COMPILED, which is the one genuinely unusual thing about this target. layout.hpp is closed
 // over a sub0_config.hpp, so this tool is compiled against tests/qwen4_real_axes/sub0_config.hpp --
 // the REAL model's axes -- with -DSUB0_QWEN4_LAYERS=4 for the 4-layer sub-stack (docs/WP4_SCOPE.md S7
-// Q3: 3 GDN layers + 1 QSA layer, the real stack's own repeating unit). It therefore links NO engine
-// library: sub0_core is compiled against the BUILD's generated config, and two definitions of
-// sub0::PARAM_LAYOUT in one binary is an ODR violation. Same reasoning as sub0_qwen4_shape_tests.
+// Q3: 3 GDN layers + 1 QSA layer, the real stack's own repeating unit), or -DSUB0_QWEN4_LAYERS=48 for
+// the FULL model (WP5b). It therefore links NO engine library: sub0_core is compiled against the
+// BUILD's generated config, and two definitions of sub0::PARAM_LAYOUT in one binary is an ODR
+// violation. Same reasoning as sub0_qwen4_shape_tests.
+//
+// WP5b -- WHY 48 LAYERS IS QUANTIZED-RESIDENT ONLY, and why that is a refusal rather than a warning.
+// All-f32 the full model is 125,711,062,400 floats: 468 GiB of destination blob, 24x this machine's
+// RAM and a file larger than anything on the disk. That is not a tuning problem, it is the reason WP4e
+// exists. The 48-layer target therefore requires SUB0_MOE_QUANT_EXPERTS=1 and says so at compile time.
 //
 // SCOPE, deliberately (docs/WP4_SCOPE.md S5): the n-gram/PLE table and its six per-layer tensors at
 // layer 1, and the MTP and vision blocks, are NOT transplanted. They are reported by name in the
@@ -33,6 +39,7 @@
 #include "sub0/model_file.hpp"
 #include "sub0/moe_quant.hpp"
 #include "sub0/transplant.hpp"
+#include "full48_totals.hpp"
 #include "sub4_prefix.hpp"
 
 #include <CLI/CLI.hpp>
@@ -56,17 +63,40 @@ using namespace sub0::transplant;
 
 namespace {
 
-// --- the compile-time claim that this really is the real model's first four layers ----------------
-// Asserted here as well as in tests/qwen4_real_shape_tests.cpp, against the SAME two literals, because
-// the two layouts cannot be compared directly in one translation unit (sub4_prefix.hpp's own comment).
-// The shape test owns the 48-layer half; this is the 4-layer half.
-static_assert(N_LAYERS == 4, "this tool targets the 4-layer real sub-stack -- see the header comment");
+// --- the compile-time claim that this really is the real model (or its first four layers) ---------
+// Asserted here as well as in the shape-test targets, against the SAME literals, because two layouts
+// cannot be compared directly in one translation unit (sub4_prefix.hpp's own comment). Each shape test
+// owns one half of a claim; this file owns the other.
+//
+// WP5b: N_LAYERS is now 4 OR 48 -- the real repeating sub-stack, or the whole model. Both are real
+// configurations of this tool and each has its own pair of literals; anything else is a build mistake,
+// not a supported target, so it is refused here rather than silently producing an artifact no test has
+// ever seen the shape of.
+static_assert(N_LAYERS == 4 || N_LAYERS == 48,
+              "this tool targets either the 4-layer real sub-stack (SUB0_QWEN4_LAYERS=4) or the full "
+              "real model (SUB0_QWEN4_LAYERS=48) -- see the header comment");
+static_assert(N_LAYERS != 48 || USE_MOE_QUANT,
+              "the full 48-layer model is only expressible quantized-resident: all-f32 it is "
+              "125,711,062,400 floats == 468 GiB, which is neither writable nor loadable here "
+              "(docs/WP4_SCOPE.md WP4e). Build the 48-layer target with SUB0_MOE_QUANT_EXPERTS=1.");
+
 // WP4e: the same claim in both residency forms. The quantized-resident totals are NOT a weakening of
-// the "this is layers 0-3 of the real model" argument -- they are the same hand-derived prefix minus
-// exactly the routed-expert tensors that moved to the sidecar, which sub4_prefix.hpp states explicitly.
-static_assert(NUM_PARAMS == (USE_MOE_QUANT ? qwen4_sub4::QUANT_NUM_PARAMS : qwen4_sub4::NUM_PARAMS));
-static_assert(PARAM_FLOATS == (USE_MOE_QUANT ? qwen4_sub4::QUANT_PARAM_FLOATS
-                                              : qwen4_sub4::PARAM_FLOATS));
+// the "this is the real model's own layout" argument -- they are the same hand-derived figures minus
+// exactly the routed-expert tensors that moved to the sidecar, which sub4_prefix.hpp (4 layers) and
+// full48_totals.hpp (48 layers) each state explicitly.
+constexpr int         kExpectNumParams =
+    N_LAYERS == 48 ? qwen4_full48::QUANT_NUM_PARAMS
+                    : (USE_MOE_QUANT ? qwen4_sub4::QUANT_NUM_PARAMS : qwen4_sub4::NUM_PARAMS);
+constexpr std::size_t kExpectParamFloats =
+    N_LAYERS == 48 ? qwen4_full48::QUANT_PARAM_FLOATS
+                    : (USE_MOE_QUANT ? qwen4_sub4::QUANT_PARAM_FLOATS : qwen4_sub4::PARAM_FLOATS);
+static_assert(NUM_PARAMS == kExpectNumParams);
+static_assert(PARAM_FLOATS == kExpectParamFloats);
+
+// The sub-stack boundary. At N_LAYERS = 4 this says "these four layers occupy the span the 48-layer
+// shape test also asserts"; at N_LAYERS = 48 it says the SAME thing about this build's own first four
+// layers, which is what makes the full artifact and the 4-layer one truncations of one model rather
+// than two independently-plausible files.
 static_assert(PARAM_LAYOUT[USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_TENSORS
                                           : qwen4_sub4::PREFIX_TENSORS].off ==
                   (USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_FLOATS : qwen4_sub4::PREFIX_FLOATS),
@@ -74,6 +104,8 @@ static_assert(PARAM_LAYOUT[USE_MOE_QUANT ? qwen4_sub4::QUANT_PREFIX_TENSORS
               "asserts -- otherwise this artifact is not a sub-stack of the real model");
 static_assert(MIXER_SCHEDULE[0] == LayerMixer::Gdn && MIXER_SCHEDULE[3] == LayerMixer::Qsa,
               "the 3-GDN-then-1-QSA repeating unit");
+static_assert(N_LAYERS != 48 || MIXER_SCHEDULE[47] == LayerMixer::Qsa,
+              "...and the last layer of the full stack closes the 12th repeat");
 static_assert(sizeof(ModelHeader) == 48);
 
 // --- one GGUF shard, header parsed and kept ------------------------------------------------------

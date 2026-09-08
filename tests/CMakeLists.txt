@@ -156,6 +156,29 @@ if(NOT MSVC)
 endif()
 catch_discover_tests(sub0_qwen4_shape_tests)
 
+# WP5b (docs/WP4_SCOPE.md WP5b): the SAME real 48-layer axes with the routed experts kept
+# quantized-resident (-DSUB0_MOE_QUANT_EXPERTS=1). A third target for exactly the reason there are
+# already two: MOE_QUANT_EXPERTS changes make_param_layout()'s output, so this is a different definition
+# of sub0::PARAM_LAYOUT and cannot share a binary with the f32 one any more than the 48-layer layout can
+# share one with the 4-layer layout. tests/qwen4_real_axes/full48_totals.hpp carries the literals this
+# target, its f32 sibling and tools/sub0llm-transplant.cpp's own 48-layer target are all held to.
+#
+# Note this one is CHEAP where its sibling is expensive: removing 48 x 1,536 routed-expert tensors takes
+# PARAM_LAYOUT from ~74.8k entries to 1,074, so the constexpr-steps budget below is generosity, not
+# necessity -- but it is set anyway, because the sibling needs it and a build that differs only in a
+# resource limit is a build whose failure mode is confusing.
+add_executable(sub0_qwen4_full48_quant_shape_tests qwen4_full48_quant_shape_tests.cpp)
+target_include_directories(sub0_qwen4_full48_quant_shape_tests PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests/qwen4_real_axes"
+  "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(sub0_qwen4_full48_quant_shape_tests PRIVATE
+  SUB0_QWEN4_LAYERS=48 SUB0_MOE_QUANT_EXPERTS=1)
+target_link_libraries(sub0_qwen4_full48_quant_shape_tests PRIVATE Catch2::Catch2WithMain)
+if(NOT MSVC)
+  target_compile_options(sub0_qwen4_full48_quant_shape_tests PRIVATE -fconstexpr-steps=1000000000)
+endif()
+catch_discover_tests(sub0_qwen4_full48_quant_shape_tests)
+
 # Eval-seam integration tests: the held-out NELBO evaluation driven end-to-end through a MOCK device
 # backend, so the device dispatch (window batching, ids/targets pairing, group recombination) is
 # covered on EVERY machine rather than only where a GPU happens to be present.
