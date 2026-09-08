@@ -495,6 +495,52 @@ can be configured without `--corpus` and without running `unigram::learn`, produ
 identical to today's corpus-driven path at the same axes; the real measured configure time drops from
 ~100 s to a fraction of that; every existing non-Qwen configure invocation is unchanged.
 
+### B20 — MoE resolve's own transpose dominates decode, and decode never uses more than one core
+
+**Real, measured, not inferred.** VTune hotspots against a live `sub0llm-qwen4-gen` decode run (real
+48-layer weights, `-collect hotspots -target-pid <pid> -duration 60`, 2026-09-08) found two independent
+findings in the same result, both concrete enough to act on directly:
+
+1. **`sub0::transplant::transpose_out_in` (`include/sub0/transplant.hpp:370`) is 52.5% of ALL sampled
+   CPU time — 28.9s of 55.0s — more than the three format-specific dequantizers it calls
+   (`dequantize_iq2_xxs`/`dequantize_iq1_s`/`dequantize_iq4_nl`, 22.7% combined) put together.** The
+   call chain, from VTune's own top-down report: `moe_resolve` → `ExpertCache::resolve` →
+   `moeq::dequantize_expert` (`include/sub0/moe_quant.hpp:154`) → `transpose_out_in`, which then calls
+   the per-format decoders as its own children. `transpose_out_in`'s body is a plain nested loop —
+   `dst[i*out_f+o] = src[o*in_f+i]` — contiguous read, but every write strides by `out_f` floats; at
+   `out_f`/`in_f` on the order of 640/2560 the destination plane is 6.55 MiB, far past any per-core
+   cache, so the write side thrashes on every element. Its own header comment ("called once per
+   destination tensor from a loop") describes the offline transplant tool's original one-shot use —
+   `moe_quant.hpp` reuses the exact same function, unmodified, once per expert per layer per token
+   (480 calls/token at these axes), the hottest path this engine has.
+2. **`Total Thread Count: 1` for the entire 60s window** (`Elapsed Time: 60.017s` ≈ `CPU Time: 55.025s`)
+   on a 24-core host. Confirmed architecturally, not just observed: `src/backends/cpu/backend.cpp` has
+   exactly two `#pragma omp parallel` sites in the whole file (`train_batch`'s window loop and
+   `AdamW::step`'s per-matrix loop) — nothing parallelizes `forward_one`/decode at all. This was a
+   reasonable design at this project's original from-scratch-model scale (multi-threading the BATCH
+   dimension, not a single token's own work); it was never revisited for a single real-scale decode
+   step, where the 10 experts a layer resolves are independent work that a single core processes
+   serially.
+
+Both findings sit inside `include/sub0/moe_quant.hpp`'s `ExpertCache::resolve`/`dequantize_expert` path
+and `include/sub0/transplant.hpp`, both shared code also used by the offline transplant tool and by
+WP4e/WP4f's own correctness gates — any change here must keep those bit-for-bit, not just the live tool.
+
+**Work:** (a) give `transpose_out_in` (and its siblings in `transplant.hpp`, e.g. `per_head_half_transpose`)
+a cache-blocked/tiled implementation instead of the naive nested loop — a pure locality fix, no
+algorithmic or numerical change, so the existing bit-for-bit gates (`tests/transplant_tests.cpp`,
+WP4e's `--verify`) should need no new tolerance; (b) parallelize the per-expert resolve work across the
+`EXPERTS_PER_TOK` selected experts within one layer's decode step (they are independent by construction
+— no shared mutable state beyond `ExpertCache`'s own resolve pool, which would need a read path safe
+under concurrent resolves, or a per-thread pool). Re-profile after each change independently rather than
+landing both at once, so the report can say which one bought what.
+
+**Done when:** a repeat of this same VTune session shows `transpose_out_in` no longer dominant and
+`Total Thread Count` above 1 during decode; the measured seconds/token for the real 48-layer model
+(currently ~9.65–10.4s, `docs/WP4_SCOPE.md` §6 WP5c) is reported before and after each change; every
+existing transplant/MoE-quant correctness test still passes bit-for-bit. Coordinate through
+`docs/ACTIVE_WORK_LOG.md` before touching `moe_quant.hpp`/`transplant.hpp` — both are hot, shared files.
+
 ## Suggested execution order
 
 1. **With WP5a/b active:** prepare B07/B08 harness design and Intel I00/I01/I18–I20 research in
