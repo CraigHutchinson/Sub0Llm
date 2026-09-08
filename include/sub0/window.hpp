@@ -76,7 +76,9 @@ inline Window sample_window(std::mt19937& rng, int T, std::size_t train_tok,
                             double fraction = 1.0, std::uint64_t subset_seed = 0) {
     const std::size_t Tsz  = static_cast<std::size_t>(T);
     const std::size_t full = Tsz + 1;   // a full window needs T inputs + the last shifted target
+    if (T <= 0 || train_tok < 2) return {};
     if (docs.empty()) {
+        if (train_tok < full) return {};
         std::uniform_int_distribution<std::size_t> uni(0, train_tok - full);
         return { uni(rng), T };
     }
@@ -124,8 +126,9 @@ inline Window sample_window(std::mt19937& rng, int T, std::size_t train_tok,
             const std::size_t cap = de - ds - 1;
             return { ds, static_cast<int>(cap >= Tsz ? Tsz : cap) };
         }
-        return { 0, 1 };   // no selected document is trainable: caller's fraction is unusable
+        return {};         // no selected document is trainable: caller must skip this source
     }
+    if (train_tok < full) return {};
     std::uniform_int_distribution<std::size_t> uni2(0, train_tok - full);
     return { uni2(rng), T };                                // pathological: fall back to a flat window
 }

@@ -339,6 +339,25 @@ TEST_CASE("training pipeline: EOS is a reachable, in-window target (not cut off)
     REQUIRE(saw_eos_target);                    // the model DOES get trained on "last token -> EOS"
 }
 
+TEST_CASE("window sampler never falls outside short or selected documents", "[window]") {
+    std::mt19937 rng(17);
+    const std::vector<std::uint64_t> singleton_docs{0, 1, 2, 3};
+    REQUIRE(sub0::sample_window(rng, 8, 4, singleton_docs, 1.0).len == 0);
+    REQUIRE(sub0::sample_window(rng, 8, 1, {}, 1.0).len == 0);
+    REQUIRE(sub0::sample_window(rng, 8, 8, {}, 1.0).len == 0);
+
+    // A train/validation split can leave the final document with no trainable pair. The sampler
+    // must return an unusable result rather than underflowing its document length.
+    const std::vector<std::uint64_t> split_docs{0, 5};
+    const sub0::Window split = sub0::sample_window(rng, 8, 5, split_docs, 1.0);
+    REQUIRE(split.len == 4);
+    REQUIRE(split.start == 0);
+
+    // A fraction with no selected trainable document must not fall back to {0, 1}.
+    const sub0::Window none = sub0::sample_window(rng, 8, 4, singleton_docs, 0.001, 3);
+    REQUIRE(none.len == 0);
+}
+
 // TOK_TURN_END must stay a document-boundary NON-event: scan_doc_boundaries only recognizes
 // TOK_EOS (or a >=2 newline run) as a boundary, so a document containing chat turns doesn't get
 // spuriously chopped at every assistant-turn end -- that would break sample_window's within-one-
