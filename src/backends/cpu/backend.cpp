@@ -3046,7 +3046,19 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
 
 // --- AdamW (optionally hybrid with Muon) -------------------------------------
 
-AdamW::AdamW(float lr, bool use_muon) : lr_(lr), use_muon_(use_muon) {}
+// Sized from this binary's immutable layout, like the shared parameter arenas. Keep one buffer per
+// optimizer-team slot, not per OS thread: a later OpenMP team can reuse it without lazy allocation.
+static constexpr std::size_t MUON_SCRATCH_FLOATS =
+    MUON_MAX_MN + muon::scratch_floats(MUON_MAX_MN, MUON_MAX_MM);
+static std::array<std::unique_ptr<float[]>, DEFAULT_THREADS> g_muon_scratch{};
+
+AdamW::AdamW(float lr, bool use_muon) : lr_(lr), use_muon_(use_muon) {
+    if constexpr (!FORWARD_ONLY) {
+        if (use_muon_)
+            for (auto& scratch : g_muon_scratch)
+                if (!scratch) scratch = std::make_unique<float[]>(MUON_SCRATCH_FLOATS);
+    }
+}
 
 void AdamW::zero_grad() { ensure_thread_built(); std::ranges::fill(W->grad, 0.f); }
 
@@ -3058,14 +3070,15 @@ void AdamW::zero_grad() { ensure_thread_built(); std::ranges::fill(W->grad, 0.f)
 // applied here too so clipping stays uniform across the whole model regardless of routing.
 static void muon_step_one(std::size_t off, int rows, int cols, float lr, float beta, float wd, float gs) {
     const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
-    std::vector<float> upd(n);
+    float* const upd = g_muon_scratch[static_cast<std::size_t>(omp_get_thread_num())].get();
     for (std::size_t i = 0; i < n; ++i) {
         const float g = g_param_grad[off + i] * gs;
         float& m = g_param_m[off + i];
         m = beta * m + (1.f - beta) * g;             // momentum EMA (muon_update's momentum.lerp_)
         upd[i] = (1.f - beta) * g + beta * m;         // Nesterov lookahead (grad.lerp_(momentum, beta))
     }
-    sub0::muon::newton_schulz5(upd.data(), rows, cols, upd.data(), 5);
+    sub0::muon::newton_schulz5(upd, rows, cols, upd,
+        std::span<float>(upd + MUON_MAX_MN, MUON_SCRATCH_FLOATS - MUON_MAX_MN), 5);
     const float scale = sub0::muon::scale_factor(rows, cols);
     for (std::size_t i = 0; i < n; ++i) {
         float& p = g_param_data[off + i];
@@ -3095,8 +3108,8 @@ void AdamW::step() {
     // cycle on EVERY step, not just the periodic eval). Each PARAM_LAYOUT entry owns a DISJOINT
     // [off, off+n) slice of every param/grad/moment array (that IS what "layout" means), so different
     // entries never touch the same memory -- safe to run concurrently with no synchronization.
-    // muon_step_one's `upd` scratch buffer is a local std::vector per call, so concurrent calls for
-    // different matrices don't share it either. newton_schulz5 (muon.hpp) only uses `#pragma omp simd`
+    // muon_step_one's scratch is private to each team slot and prepared by the constructor, so
+    // dynamically assigned matrices never share scratch. newton_schulz5 only uses `#pragma omp simd`
     // internally, never `#pragma omp parallel` -- no nested-parallelism thread-explosion risk here.
     // schedule(dynamic): Muon-eligible entries (newton_schulz5, several matrix multiplies) cost far
     // more than plain-AdamW entries, so a static chunking would load-balance badly.
