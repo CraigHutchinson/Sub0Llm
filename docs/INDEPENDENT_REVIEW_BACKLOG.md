@@ -357,6 +357,16 @@ the change. Wait for Claude's stable comparison baseline before modifying this s
 
 ### B13 — Bound sampler stack usage; benchmark vocabulary scaling
 
+**Update 2026-09-08: the overflow this item declined to claim has since been directly observed.**
+WP5c's generation harness (`tools/sub0llm-qwen4-gen.cpp`) is the first real-VOCAB consumer to actually
+call `sample_token`, at the real model's `VOCAB=248,320` — measured stack usage there is 2.84 MiB in
+one frame (two `std::array<float, VOCAB>` plus one `std::array<int, VOCAB>`), and relinking without a
+workaround reproduces `STATUS_STACK_OVERFLOW` (`0xC00000FD`) on the very first sampling call, against
+Windows' 1 MiB default. Currently worked around at that one tool's own link line (`/STACK:33554432`)
+rather than in `engine_core.cpp` itself — see `docs/WP4_SCOPE.md` §6 WP5c. This item's own proposed fix
+(reused, bounded `thread_local` scratch) is the correct one; it just wasn't done yet when this was
+written.
+
 `src/engine_core.cpp:343` places full-vocabulary float logits, int indices, and float keep arrays on
 the stack in the top-k path: approximately `12*VOCAB` bytes at source level, before other call frames.
 That is about 3 MB at a 250k vocabulary. Actual stack reservation/failure depends on the generated
@@ -456,6 +466,34 @@ Introduce contexts or session ownership only when an actual production consumer 
 
 **Done when:** a reader can determine whether concurrent generation, model replacement, and nested
 OpenMP calls are supported without inspecting backend internals. No generic serving framework is added.
+
+### B19 — Configuring a real-Qwen4-axes build should not require learning a vocabulary from a corpus
+
+`tools/configurator.cpp` treats `--corpus <path>` as required and always runs the full unigram BPE
+learner (`unigram::learn`, this project's own from-scratch scheme) over it before it will emit
+`sub0_config.hpp` — including for a Qwen4-axes build, where the learned result is never actually used.
+The runtime tokenizer for those builds is WP5a's own `sub0::qwen_tok::Tokenizer`
+(`include/sub0/qwen_tokenizer.hpp`), which loads the real model's `vocab.json`/`merges.txt` directly;
+the configurator's own learned `tokenizer.tok` is written to `${GEN_DIR}` and then never consulted by
+`sub0llm-qwen4-gen`/`sub0llm-qwen4-forward`. Its only real job in a Qwen4 build is landing the
+compile-time `VOCAB` constant on 248,320 — and even that is indirect: `docs/WP4_SCOPE.md` §6 WP4d's own
+`--vocab 248202` line is a hand-derived correction (`248320 - 288 + S`, where `S` is this specific
+corpus's own distinct-single-byte count) chosen to make the *learned* count land on the *real* target,
+which is fragile (tied to whichever corpus is passed) and slow: **102.7–106.2 s per run**, measured
+repeatedly this session (WP5c's own independent verification build, and a fresh VTune profiling build),
+each time just to reconfirm the same already-known `VOCAB=248,320`.
+
+**Work:** give the configurator a path that does not require a corpus or the unigram learner at all
+for an externally-defined vocabulary — e.g. a `--vocab-exact N` mode (or reading the axes from a file,
+mirroring how `tests/qwen4_real_axes/sub0_config.hpp` already hand-writes these constants for the
+engine-free transplant/shape-test tools, extended to the CONFIGURE step so linked-engine tools get the
+same shortcut). Existing from-scratch-corpus builds, which genuinely need the learned tokenizer, must be
+unaffected — this is additive, not a replacement for the learner.
+
+**Done when:** a Qwen4-axes engine build (`sub0_core`-linking targets, not just the engine-free ones)
+can be configured without `--corpus` and without running `unigram::learn`, producing a `sub0_config.hpp`
+identical to today's corpus-driven path at the same axes; the real measured configure time drops from
+~100 s to a fraction of that; every existing non-Qwen configure invocation is unchanged.
 
 ## Suggested execution order
 
