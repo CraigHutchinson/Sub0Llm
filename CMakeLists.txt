@@ -492,10 +492,12 @@ target_compile_definitions(sub0llm-qwen4-gen PRIVATE SUB0_SOURCE_DIR="${CMAKE_SO
 if(WIN32)
   # GetProcessMemoryInfo, as in the forward harness -- the peak-working-set number.
   target_link_libraries(sub0llm-qwen4-gen PRIVATE psapi)
-  # See point 2 above. MSVC-style linkers (link.exe and lld-link, which is what clang++ drives on this
-  # target triple) take the main thread's stack reserve as /STACK; the clang driver needs -Xlinker to
-  # pass it through untouched.
-  if(MSVC)
+  # See point 2 above. The linker on this platform is MSVC-style (link.exe or lld-link) and takes the
+  # main thread's stack reserve as /STACK either way; what differs is the DRIVER. The predicate is
+  # therefore CMAKE_CXX_COMPILER_FRONTEND_VARIANT (how the compiler is invoked), NOT `MSVC` (which is
+  # about the target ABI and is FALSE for this repo's clang++ presets even though the ABI is MSVC's) --
+  # getting that wrong is silent, since the untaken branch simply leaves the default 1 MiB in place.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_link_options(sub0llm-qwen4-gen PRIVATE "/STACK:33554432")
   else()
     target_link_options(sub0llm-qwen4-gen PRIVATE "-Xlinker" "/STACK:33554432")

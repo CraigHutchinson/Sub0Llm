@@ -63,9 +63,11 @@
 //    the CMakeLists.txt comment on this target: `sub0::sample_token` (src/engine_core.cpp) declares
 //    `std::array<float, VOCAB>` twice and `std::array<int, VOCAB>` once as ORDINARY LOCALS. At this
 //    build's VOCAB of 248,320 that is 2.84 MiB of stack in a single frame, against Windows' 1 MiB
-//    default -- an unconditional stack overflow the first time it is called, which is why nothing had
-//    hit it before: WP4d/e/f and WP5b all stop at the logits and never sample. Reported, not fixed;
-//    the engine-side fix belongs with whoever owns that path.
+//    default. MEASURED, not argued: relinked without the /STACK option (PE stack reserve back to
+//    0x100000) this tool dies at the FIRST sample_token call -- after the prefill lines print, before
+//    the first continuation byte -- with exit status 0xC00000FD, STATUS_STACK_OVERFLOW. Nothing had
+//    hit it before because no real-axes consumer had ever SAMPLED: WP4d/e/f and WP5b all stop at the
+//    logits. Reported, not fixed; the engine-side fix belongs with whoever owns that path.
 //
 // ------------------------------------------------------------------------------------------------
 // WHAT IT CHECKS, each printed with its actual value rather than a bare pass/fail
