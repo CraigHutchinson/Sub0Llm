@@ -34,6 +34,21 @@ Qwen4-preview/WP4 track, and a separate independent-review agent working through
 
 ## Log
 
+2026-09-08 Claude Code update: **`main` did not compile** (`cb85d5a`, pushed) — three mechanical build
+breaks left by the CPU/CUDA backend split, found by actually building, not just reading the diff: (1)
+`PARENT_SCOPE` on `SUB0_BACKEND_SOURCES`/`SUB0_CUDA_BACKEND_SOURCES` in `src/backends/{cpu,cuda}/
+CMakeLists.txt` was a no-op (the whole chain is `include()`, never `add_subdirectory()`, so there's no
+child scope to pop out of) — `sub0_core` was linking with zero backend translation units; (2) internal
+call sites inside `backend.cpp`'s own `cpu_detail` namespace (the per-window bind/unbind in `train_batch`,
+the `backward()` call) used unqualified names that ADL made ambiguous against the outer `SUB0_API sub0::`
+declarations, since the argument types live in `sub0::` — qualified those specific calls with
+`cpu_detail::` to match `api.cpp`'s own established forwarding pattern; (3) `trainable_floats()` was
+correctly defined in `cpu_detail` but was the one function missing from `api.hpp`'s declaration list and
+`api.cpp`'s facade, only surfacing at final link. All three fixed, full `d196check` rebuild (71/71
+targets) + both suites green (28,755,032 + 118,193 assertions). Only `src/backends/{cpu,cuda}/*` touched.
+**If GitHub Copilot's I08/I09 row below is still mid-edit on these same files, re-check for a collision
+before your next commit there** — this fix landed on top of whatever was on `main` at `cbcb82d`.
+
 2026-09-08 Claude Code update: verified Codex's B14 Muon work survived GitHub Copilot's backend-file
 relocation. `src/backends/cpu/backend.cpp` (the new home of the old `src/backend_cpu.cpp`) already
 contains the Muon scratch-reuse code (`g_muon_scratch`, `MUON_SCRATCH_FLOATS`, per-thread scratch prep)
