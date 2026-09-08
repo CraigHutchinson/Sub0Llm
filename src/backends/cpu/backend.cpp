@@ -2739,8 +2739,10 @@ static void ensure_thread_built() {
 }  // anonymous namespace
 
 // ============================================================================
-//  Exposed API
+//  Backend-private API implementation
 // ============================================================================
+
+namespace cpu_detail {
 
 void build_model() {
     ensure_thread_built();      // this (main) thread's node layout
@@ -3043,6 +3045,8 @@ float train_batch(const int* data, const std::size_t* starts, int batch, int T,
     }
     return static_cast<float>(total / batch);
 }
+
+}  // namespace cpu_detail
 
 // --- AdamW (optionally hybrid with Muon) -------------------------------------
 
