@@ -1,0 +1,14 @@
+# GENERATED from the REAL Qwen/Qwen3.8-Flash-Next tokenizer -- do not edit by hand.
+# See tests/fixtures/qwen_tokenizer/manifest.json for provenance and
+# docs/QWEN_TOKENIZER.md for how it is used. Every text column is HEX-ENCODED UTF-8, so
+# control characters, tabs and newlines survive the file format unambiguously.
+# label <TAB> ids (space separated) <TAB> decode_hex
+partial_utf8_1	160	efbfbd
+partial_utf8_2	160 121	efbfbd
+partial_then_text	160 121 64	efbfbd61
+lone_continuation	121	efbfbd
+byte_run	160 121 221	efbfbd7f
+pad_row_low	248077	
+pad_row_high	248319	
+pad_between_text	64 248200 65	6162
+empty		
