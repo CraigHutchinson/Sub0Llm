@@ -867,3 +867,31 @@ operations this project already chose for attention itself.
   lifted guard's old location) and a per-token GDN state cache inside the captured decode graph
   (TODO(gdn-gpu-decode)); a bf16/tensor-core forward pass and shared-memory tiling for the per-chunk GEMMs
   (this stage's own deliberate correctness-first simplification, not yet revisited).
+
+---
+
+## 7. `gdn_math.hpp`'s conventions are the HF ones — a GGUF's are NOT (WP4f, 2026-09-08)
+
+`gdn_math.hpp` is correct and unchanged, and this section exists so nobody "fixes" it. It implements the
+REAL `transformers` reference exactly, and two of its conventions differ from what a `llama.cpp`-produced
+GGUF file holds for the same tensors. Anyone feeding it weights from such a file must invert both first —
+`include/sub0/transplant.hpp` now does, and `docs/WP4_SCOPE.md`'s WP4f cross-comparison section records
+how the omission was found (a `rel_l2` 0.996 divergence at decoder layer 0) and the measured evidence.
+
+1. **`a_log` here is `A_log`. GGUF's `blk.N.ssm_a` is `-exp(A_log)`.** The converter
+   (`conversion/qwen.py`: `if name.endswith(".A_log"): data_torch = -torch.exp(data_torch)`) finishes the
+   exponential, so `forward()`'s own `-std::exp(a_log[hh]) * softplus(...)` would exponentiate a second
+   time. Every entry of a real `ssm_a` is negative, which is the cheap tell.
+2. **`hv = hk*rep + r` here is HF's `repeat_interleave` (grouped). GGUF stores value heads TILED.**
+   `_reorder_v_heads` rewrites every v-head-indexed axis so ggml's tiled broadcast (v-head `j` with
+   k-head `j % n_k`) reproduces the same pairing: `gguf_vhead[r*n_k + k] == hf_vhead[k*rep + r]`. It
+   touches `in_proj_qkv` (V rows only), `in_proj_z`, `in_proj_a`, `in_proj_b`, `A_log`, `dt_bias`,
+   `conv1d` (V channels only) and `out_proj` (columns). It is a **permutation**, so no statistical check
+   can see it, and it is the **identity when `num_k_heads == 1`** — which is why the layer-0 fixture,
+   whose sliced config has one key head, could not exercise it. `tests/transplant_tests.cpp` carries a
+   genuine `n_k=2, n_v=6` case.
+
+**`norm_w` is the one that does NOT need inverting**, and the asymmetry is real rather than an oversight:
+the converter's zero-centred-gamma fold explicitly excludes `linear_attn.norm.weight`, and RMSNormGated
+here correspondingly uses the gain directly instead of `(1 + w)` the way `gr::hc_norm` and
+`qsa::rms_norm_row` do.
