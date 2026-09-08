@@ -882,9 +882,8 @@ void serialize(const Tokenizer& t, std::ostream& os) {
         wu16(static_cast<std::uint16_t>(w.size()));
         os.write(w.data(), static_cast<std::streamsize>(w.size()));
     }
-    // v2 (schemeV4, D2): the corpus-derived per-byte glue table, appended last. A gracefully-
-    // degrading trailing section (AGENTS.md §3.2): an older file without it loads with the hardcoded
-    // floor, so the magic need not bump. 1 byte/entry: bit1 = lead-glue, bit0 = trail-glue.
+    // v2 (schemeV4, D2): the corpus-derived per-byte glue table, appended last. 1 byte/entry:
+    // bit1 = lead-glue, bit0 = trail-glue. The current scheme requires the complete table.
     for (int b = 0; b < 256; ++b)
         os.put(static_cast<char>((t.glue[static_cast<std::size_t>(b)].lead ? 2 : 0) |
                                  (t.glue[static_cast<std::size_t>(b)].trail ? 1 : 0)));
@@ -973,16 +972,13 @@ bool deserialize(Tokenizer& out, std::istream& is) {
     if (!is) return false;
     // v2 (schemeV4, D2): trailing per-byte glue table (see serialize). serialize() always writes it, and
     // the version gate above now rejects any file from a scheme that did not, so a short/absent table
-    // here means a TRUNCATED file rather than an older one. The floor fallback is kept as defensive
-    // tolerance for that case -- it is no longer a cross-version compatibility path.
-    t.glue = default_glue_table();
+    // here means a TRUNCATED file rather than an older one.
     char gt[256];
-    if (is.read(gt, 256).gcount() == 256)
-        for (int b = 0; b < 256; ++b) {
-            const unsigned v = static_cast<unsigned char>(gt[b]);
-            t.glue[static_cast<std::size_t>(b)] = { (v & 2) != 0, (v & 1) != 0 };
-        }
-    is.clear();   // a short/absent table leaves EOF/fail bits set on `is` -- expected, not an error
+    if (!is.read(gt, 256)) return false;
+    for (int b = 0; b < 256; ++b) {
+        const unsigned v = static_cast<unsigned char>(gt[b]);
+        t.glue[static_cast<std::size_t>(b)] = { (v & 2) != 0, (v & 1) != 0 };
+    }
     t.loaded = true;
     out = std::move(t);
     return true;

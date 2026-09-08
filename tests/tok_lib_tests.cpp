@@ -458,6 +458,21 @@ TEST_CASE("JOIN scheme: serialize/deserialize preserves the scheme + round-trip"
     REQUIRE(round_trips(t2, "The cat, the dog.\nLine two here."));
 }
 
+TEST_CASE("deserialize rejects every truncated glue table", "[tok][join]") {
+    const Tokenizer t = sub0::tok::learn(kCorpus);
+    std::ostringstream os(std::ios::binary);
+    sub0::tok::serialize(t, os);
+    const std::string blob = os.str();
+    REQUIRE(blob.size() >= 256);
+
+    for (std::size_t missing = 1; missing <= 256; ++missing) {
+        std::istringstream is(blob.substr(0, blob.size() - missing), std::ios::binary);
+        Tokenizer t2;
+        REQUIRE_FALSE(sub0::tok::deserialize(t2, is));
+        REQUIRE_FALSE(t2.loaded);
+    }
+}
+
 // The runtime tokenizer only ever loads kind==1 (Unigram) -- a pre-WS2 file's legacy BPE-merge
 // encoding (kind 0) must be rejected outright, not decoded (there is no BPE word encoder left to
 // use it with). Corrupt a real, otherwise-valid blob at the exact `kind` field offset (magic +
