@@ -106,6 +106,8 @@ and extend I21 controls before promoting any performance result.
 
 ## Plan feedback / next bounded work
 
+The [Windows USM review](INTEL_IGPU_WINDOWS_USM.md) adds official-source and installed-header findings plus ordered S1/I19 probes. It adds no measurements or capability claims to this report.
+
 R0: installed toolchain and conservative library interop are usable; runtime-managed shared memory and
 explicit staging deserve comparison. System-pointer access and matrix execution are unqualified.
 The user's [USM paper](INTEL_IGPU_ISA_MEMORY_RESEARCH.md#new-paper-and-the-local-probe-distinction)

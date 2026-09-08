@@ -479,6 +479,8 @@ label instruction use unproven; do not promote a path based solely on its intrin
 
 ### I19 — Accessible memory, residency and movement
 
+**Windows refinement (2026-09-08):** execute the ordered [USM follow-up probes](INTEL_IGPU_WINDOWS_USM.md#bounded-i19--s1-follow-ups): capability checks, prepared-copy staging, conditional mapped import, scratch/hints and representative access traces. These remain S1/I19 scope; R0/R1 review determines promotion. Header availability is not runtime qualification.
+
 **Owns:** `benchmarks/intel/memory/`, `out/intel-review/memory/`; proposed accounting changes remain
 private until I10 consumes them. Coordinate WP5b measurements without editing its implementation.
 
