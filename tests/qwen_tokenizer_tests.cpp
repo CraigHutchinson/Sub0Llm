@@ -43,7 +43,19 @@ fs::path fixture_dir() { return fs::path(SUB0_SOURCE_DIR) / "tests" / "fixtures"
 
 // The real vocabulary's three files, if this machine has them.
 fs::path model_files_dir() {
-    if (const char* env = std::getenv("SUB0_QWEN_TOKENIZER_DIR")) {
+    // std::getenv is the portable spelling and this project already uses it (src/train_stage.cpp);
+    // the deprecation is MSVC's UCRT headers pushing _dupenv_s, which is not portable. Silenced
+    // locally rather than with a global _CRT_SECURE_NO_WARNINGS, so the build stays warning-clean
+    // without disarming the diagnostic everywhere.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const char* env = std::getenv("SUB0_QWEN_TOKENIZER_DIR");
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    if (env) {
         const fs::path p(env);
         if (fs::exists(p / "vocab.json")) return p;
     }
