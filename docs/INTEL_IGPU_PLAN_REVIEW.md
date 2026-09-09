@@ -7,9 +7,9 @@ plan authoring followed its findings. Broader performance/delivery findings are 
 not C++ style rules. Existing repository `.hpp`/`.cu` conventions take precedence over generic
 skill examples. No speculative public C++ declarations were authored.
 
-The branch was subsequently rebased onto `e5af1ad`; archived measurements preserve their original
-`90721bc` provenance. The rebase and diff review are mechanical PR preparation, not evidence that the
-backend is ready to implement.
+The branch was subsequently rebased onto `e5af1ad` and integrated current `main` through `6189121`;
+archived measurements preserve their original `90721bc` provenance. Integration and diff review are
+mechanical PR preparation, not evidence that the backend is ready to implement.
 
 ## Proposed artifact and consumer audit
 

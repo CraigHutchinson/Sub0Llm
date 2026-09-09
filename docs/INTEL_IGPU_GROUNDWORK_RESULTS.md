@@ -125,9 +125,9 @@ is integrated into I19's follow-ups, without extrapolating its Linux/discrete re
    Keep quantization/packing crossed with allocation/submission variants rather than attributing all
    differences to the API. Existing f32 numbers are controls, not encoded-path forecasts.
 4. S3/S4: dynamic command replay and representative GDN/GR/QSA/MoE chains. I06 remains pending.
-5. WP5a/b/c are now merged on `main`; freeze their tokenizer, artifact census, generation inputs and
-   measured CPU baseline in I01 after rebasing. B20 currently owns decode optimization surfaces, so
-   keep mechanism probes isolated until that row closes.
+5. WP5a/b/c and B20's decode/memory work are merged on `main`; freeze their tokenizer, artifact census,
+   generation inputs, measured CPU baseline and updated memory findings in I01. Recheck the active log
+   for successor ownership before shared CPU edits; mechanism probes remain isolated regardless.
 
 The scoped C++ review checked the private shared selector/USM deleter, queue/resource lifetimes,
 benchmark consumers, failure paths and fixed allocations. No remaining MUST finding was identified.

@@ -41,7 +41,34 @@
 #include <utility>
 #include <vector>
 
+// x86 SSE/AVX control register access, used to flush subnormal floats to zero (FTZ/DAZ) in the hot
+// loops, where a subnormal operand triggers a slow assist. Here rather than in backend.cpp because
+// BOTH translation units now start compute threads that must set these bits (see
+// set_flush_denormals below).
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define SUB0_X86 1
+#endif
+
 namespace sub0 {
+
+// Flush-to-zero (FTZ) + denormals-are-zero (DAZ). A subnormal float operand traps into a slow
+// microcode assist on x86 (often ~100x a normal op); the fast-math approximations and decaying
+// gradients can produce them in the hot loops. The model tolerates flushing these near-zero values --
+// they are underflow noise here.
+//
+// MXCSR IS PER-THREAD, WHICH MAKES THIS A CORRECTNESS OBLIGATION AND NOT ONLY A SPEED ONE. Two threads
+// running the same arithmetic with different FTZ/DAZ settings do not merely run at different speeds --
+// they produce different floats the moment an intermediate goes subnormal. So EVERY thread this backend
+// computes on must set it: train_batch's team does, via ensure_thread_built, and decode's own
+// per-expert team (B20 part 2) must too, or a bit-for-bit claim about decode would hold only for
+// whichever thread happened to be thread 0.
+inline void set_flush_denormals() {
+#if defined(SUB0_X86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
 
 // ============================================================================
 //  Derived compile-time sizes
@@ -179,6 +206,29 @@ constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA;
 // Worker's array can be conditionally sized like this; the shared three are heap handles that simply
 // stay null, and every accessor that would hand one out refuses loudly instead (see grad_ptr below).
 constexpr size_t WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS;
+// The SECOND per-Worker array the same argument applies to, and the one WP4d missed. WORKER_GRAD_FLOATS
+// above elides the per-PARAMETER gradient accumulator; `act_grad` is the per-ACTIVATION one -- a
+// completely different array, sized ACT_CAP rather than PARAM_FLOATS, and until now sized that way
+// unconditionally. It is DEAD in a FORWARD_ONLY build by exactly the same proof, not a weaker one: the
+// only code that ever names it is arena_alloc (which hands out the grad half of each node's span) and
+// backward_node (which is the only thing that ever reads or writes one), and backward_node abort()s for
+// Gated Residual / MoE / QSA -- the same three USE_* constants FORWARD_ONLY is derived from. So in a
+// build where FORWARD_ONLY is true, every byte of it is allocated, zero-initialized, and then never
+// read or written by anything that can execute.
+//
+// It is not a rounding error at real-model scale: ACT_CAP is sized by SEQ_LEN x the widest per-execution
+// activation, and at the real Qwen4-preview axes it is 1,885,094,312 floats -- 7.02 GiB, exactly half of
+// a 14.05 GiB Worker, MEASURED as such (docs/WP4_SCOPE.md WP5b/WP6a: the gen tool's peak working set is
+// 40.98 GiB and 7.02 of those GiB are this array). Reclaiming it does not merely shrink the process; it
+// hands those pages straight back to the OS file cache the 37.11 GiB MoE sidecar is competing for, which
+// is what actually binds a decode run (INDEPENDENT_REVIEW_BACKLOG B20's disk-bound finding).
+//
+// Sized 1 rather than 0 for WORKER_GRAD_FLOATS's own reason (a zero-length std::array has no data()),
+// and arena_alloc hands out an EMPTY grad span in that build rather than a span into this placeholder --
+// exactly as mk_param already does for a parameter leaf's grad. Gated DeltaNet is excluded from
+// FORWARD_ONLY (its Stage 2 backward is real and gradient-checked), so a GDN-only build keeps a
+// full-size act_grad and is bit-identical under this change, like every other existing build here.
+constexpr size_t ACT_GRAD_FLOATS = FORWARD_ONLY ? 1 : ACT_CAP;
 // The four arenas themselves (g_param_data/grad/m/vel) and ensure_shared_params() are NOT declared
 // here: only backend.cpp touches them, through mk_param and the params_ptr()/AdamW accessors, so they
 // stay `static` there. decode.cpp reaches the weights the way every consumer does -- through the
@@ -210,6 +260,29 @@ inline constexpr int    MOE_RESOLVE_SLOTS      = USE_MOE_QUANT ? 8 : 1;
 // slot width serves all three planes.
 inline constexpr size_t MOE_EXPERT_SLOT_FLOATS = static_cast<size_t>(D_MODEL) * D_FF;
 using MoeExpertCache = moeq::ExpertCache<MOE_RESOLVE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
+
+// --- decode's own per-thread resolve pool (B20 part 2) --------------------------------------------
+//
+// Decode resolves a layer's EXPERTS_PER_TOK selected experts in parallel, so several resolves are live
+// at once and a single shared pool would be racing. Each participating thread therefore brings its own,
+// and it is a DIFFERENT pool type from the batched path's -- ONE slot, not eight -- because a decode
+// row's hit rate against that cache is provably zero, not merely small:
+//   * within one (token, layer), the selected experts are a TOP-K, so their indices are distinct by
+//     construction -- no two of the ten resolves can be the same key;
+//   * the key is (layer, expert), so nothing carries across layers either;
+//   * across tokens, a full token issues N_LAYERS * EXPERTS_PER_TOK = 480 resolves at the real axes,
+//     which round-robins any pool of 8 clean several times over before the next token asks again.
+// The 8 slots exist for op_moe's BATCHED path, where T rows of one window really do re-select experts
+// (see MOE_RESOLVE_SLOTS above) -- that path keeps them, unchanged. Sizing decode's own at 8 would have
+// cost 150 MiB per thread to cache nothing.
+inline constexpr int MOE_DECODE_SLOTS = 1;
+using MoeDecodeExpertCache = moeq::ExpertCache<MOE_DECODE_SLOTS, MOE_EXPERT_SLOT_FLOATS>;
+// How wide decode fans out. Capped at EXPERTS_PER_TOK because that is how many independent items exist
+// -- a thread past the tenth would have nothing to take -- and each participating thread costs a pool
+// (18.75 MiB) plus its raw-decode scratch (6.25 MiB) at the real axes, so an unused one is not free.
+// Never below 1: EXPERTS_PER_TOK is 0 in a MoE-off build, where nothing ever enters this path anyway.
+inline constexpr int MOE_DECODE_THREADS =
+    EXPERTS_PER_TOK > 1 ? std::min(DEFAULT_THREADS, EXPERTS_PER_TOK) : 1;
 // The sidecar itself: read once by load_model, immutable thereafter (this is a forward-only build by
 // construction -- FORWARD_ONLY below -- so nothing can write a routed expert), hence shared across
 // threads without synchronization. The CACHE is per-Worker, because it is mutable scratch.
@@ -231,7 +304,8 @@ struct Worker {
     std::array<float, WORKER_GRAD_FLOATS> grad{};  // gradient accumulator (this slot); 1 float when
                                                     // FORWARD_ONLY -- see that constant's comment
     std::array<float, ACT_CAP>      act_data{};    // activation arena: values
-    std::array<float, ACT_CAP>      act_grad{};    // activation arena: grads
+    std::array<float, ACT_GRAD_FLOATS> act_grad{}; // activation arena: grads; 1 float when
+                                                    // FORWARD_ONLY -- see that constant's comment
     std::array<Node, NUM_PARAMS>    param_nodes{}; // parameter leaves (data->shared, grad->this)
     std::array<Node, MAX_NODES>     pool{};        // forward-graph node pool
     std::array<ParamView, NUM_PARAMS> views{};     // optimizer parameter spans
@@ -425,9 +499,18 @@ struct Layer {
 // unsupported GGML type or a corrupt payload, and continuing would compute with whatever the slot last
 // held -- a plausible answer from the wrong weights, which is the failure mode this whole work package
 // exists to avoid.
-inline moe::ExpertWeights moe_resolve(Layer& L, int layer_index, int e) {
+//
+// THE POOL IS A PARAMETER (B20 part 2), not `W->moe_cache` read implicitly. op_moe still passes exactly
+// that -- the batched path is unchanged, including its 8 slots and their real cross-row hit rate. What
+// needed the parameter is decode: it now resolves a layer's selected experts on several threads at once,
+// and those threads have no `W` of their own (a Worker is ~14 GiB at the real axes -- see decode.cpp's
+// own note), so each brings its OWN small pool. Templated on the pool type rather than taking a base
+// class because the two pools differ only in their compile-time slot count, and a virtual call per
+// resolved expert would be a runtime dispatch on something decided once at configure time (AGENTS.md S2).
+template <class Cache>
+inline moe::ExpertWeights moe_resolve(Layer& L, int layer_index, int e, [[maybe_unused]] Cache& cache) {
     if constexpr (USE_MOE_QUANT) {
-        const auto r = W->moe_cache.resolve(g_moe_quant, layer_index, e);
+        const auto r = cache.resolve(g_moe_quant, layer_index, e);
         if (r.gate == nullptr) {
             std::println(stderr,
                          "fatal: could not dequantize routed expert {} of layer {} from the S0Q1 "

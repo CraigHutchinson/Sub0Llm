@@ -7,9 +7,9 @@ training is deferred. This is the handoff entry point for the next session.
 
 `research/intel-groundwork` contains planning, standalone probes and archived measurements. It does
 not add an Intel production target, alter default engine selection, or qualify a Qwen4 backend.
-The branch was created from `90721bc` and rebased onto `main` at `e5af1ad`. Archived 2026-09-08
-measurements retain their original base. Rebase again only if the actual PR base advances, then repeat
-status reconciliation and compile gates.
+The branch was created from `90721bc`, rebased onto `e5af1ad`, then integrated `main` through
+`6189121`. Archived 2026-09-08 measurements and the 2026-09-09 compile manifest retain their exact
+original bases. Reconcile again only if `main` advances before merge, then repeat affected gates.
 
 Measured on the named local tuple:
 
@@ -58,8 +58,9 @@ work-package gates control what may be claimed complete.
    file or running a compiler/device/CPU-heavy workload for more than a few minutes.
 3. Record current `main`, branch HEAD, merge base and dirty paths. Rebase only when concurrent owners
    no longer need the old base. Preserve main's active-log history when resolving that file.
-4. Verify B20 or its successor does not own `moe_quant.hpp`, `transplant.hpp`, or
-   `src/backends/cpu/decode.cpp` before editing them. The first research phases need no such edits.
+4. B20 and its follow-up memory audit are merged. Recheck the active log for a successor before editing
+   `moe_quant.hpp`, `transplant.hpp`, or `src/backends/cpu/decode.cpp`; the first research phases need
+   no such edits.
 5. Delegate each implementation spike to a Sol-class agent with bounded leaf ownership. Delegate
    external research/data gathering to Sonnet/Terra. The integration owner reviews and merges results.
 6. Do not install or upgrade drivers, SDKs, runtimes or dependencies without separately authorized,

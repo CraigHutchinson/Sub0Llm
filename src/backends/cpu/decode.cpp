@@ -28,8 +28,18 @@
 // build that silently lost OpenMP for this translation unit would not merely decode more slowly, it
 // would decode to different last bits than the batched forward() that still had it -- breaking the
 // forward/forward_one parity check with no compile-time signal at all.
-#if !defined(_OPENMP) && defined(SUB0_REQUIRE_OPENMP)
+#if defined(_OPENMP)
+#include <omp.h>
+#elif defined(SUB0_REQUIRE_OPENMP)
 #error "OpenMP required but _OPENMP is undefined: this translation unit was compiled without OpenMP, so decode's `#pragma omp simd` reductions would change accumulation order relative to the batched forward path. Reconfigure with OpenMP available, or pass -DSUB0_REQUIRE_OPENMP=OFF to build single-threaded on purpose."
+#else
+// Intentional single-threaded fallback (configured with -DSUB0_REQUIRE_OPENMP=OFF), mirroring
+// backend.cpp's own. The per-expert parallel region below then compiles to a plain loop on thread 0,
+// which is exactly the pre-B20 behaviour -- and still bit-for-bit identical, since the answer never
+// depended on how the selected experts were distributed (see moe_math.hpp's forward_row_via_run).
+static inline int omp_get_thread_num()  { return 0; }
+static inline int omp_get_num_threads() { return 1; }
+static inline int omp_get_max_threads() { return 1; }
 #endif
 
 namespace sub0 {
@@ -115,6 +125,77 @@ struct QsaCache {
     int*   n_cached_of(int e) { return n_cached.data() + e; }
 };
 thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_QSA
+
+// --- decode's per-expert parallelism (B20 part 2) --------------------------------------------------
+//
+// THE PROBLEM, MEASURED. VTune on a live 48-layer decode run reported `Total Thread Count: 1` for a
+// whole 60s window on a 24-core host (docs/INDEPENDENT_REVIEW_BACKLOG.md B20). Every `#pragma omp
+// parallel` this backend had was in TRAINING code, parallelising the BATCH dimension -- which is the
+// right axis when there is a batch, and there is no batch at all in a single decoded token. Meanwhile a
+// layer's EXPERTS_PER_TOK (10) selected experts are wholly independent work being done one at a time.
+//
+// WHERE THE PER-THREAD STATE LIVES, AND WHY IT IS NOT A `Worker`. The obvious move -- let several
+// Workers join in, exactly as train_batch does -- is not available here, and the reason is a real
+// number rather than a preference: a Worker owns an ACT_CAP activation arena, which at the real Qwen4
+// axes measures 7.02 GiB (the gen tool's own [mem] line moves 18.36 -> 25.39 GiB the first time one is
+// touched; before internal.hpp's ACT_GRAD_FLOATS elided the dead activation-GRADIENT arena beside it,
+// that step was 18.36 -> 32.41). Ten of those is more memory than this machine has, to hold an arena
+// that decode never uses at all -- forward_one runs one row through stack buffers and allocates no
+// arena slot and no node (see internal.hpp's note on why arena_alloc/mk_node stayed private to
+// backend.cpp).
+//
+// So a decode thread brings the small part instead: its own single-slot resolve pool (18.75 MiB) and
+// its own pair of expert_ffn_row accumulators. That is ~25 MiB per thread against a Worker's 7 GiB,
+// for state whose only requirement is "not shared while several resolves are live".
+//
+// The alternative considered and rejected: making the SHARED 8-slot pool safe under concurrent resolve.
+// It would need per-slot reservation AND pinning of a returned plane against a later round-robin
+// overwrite -- refcounting on the hottest path in the engine -- to buy a hit rate that is provably zero
+// in decode (see MOE_DECODE_SLOTS in internal.hpp for why). The batched path, which does have a real
+// hit rate, keeps that pool untouched.
+struct MoeDecodeThread {
+    MoeDecodeExpertCache cache{};
+    // expert_ffn_row's two d_ff-wide accumulators. Never zero-length (D_FF >= 1 always), so this stays
+    // a valid array bound in a MoE-off build where nothing ever reads it.
+    std::array<float, 2 * static_cast<std::size_t>(D_FF)> ffn{};
+};
+// Lazily heap-allocated per participating thread, once, and reused for the process lifetime (AGENTS.md
+// S1): only the threads a run actually uses allocate, and none of it sits in the DLL's static image
+// (g_param_data's own SizeOfImage argument). NOT thread_local -- a multi-MB thread_local in a DLL
+// overruns Windows' static-TLS block, the same hazard that made g_workers a pool rather than TLS.
+std::array<std::unique_ptr<MoeDecodeThread>, MOE_DECODE_THREADS> g_moe_decode{};
+
+// Runs one decode row's selected experts across MOE_DECODE_THREADS threads. Passed to
+// moe::forward_row_via_run, which computes each expert into its OWN output buffer and does the weighted
+// sum afterwards in the original selection order -- so this runner cannot change the answer, only who
+// computes what. See that function's comment for the float-associativity argument in full.
+//
+// `ffn`/`g` (the caller's single shared scratch pair) are deliberately IGNORED here: they would be a
+// data race across the team. Each thread uses its own pair out of g_moe_decode instead.
+struct ParallelExperts {
+    template <class Body>
+    void operator()(int n, float* /*ffn*/, float* /*g*/, Body&& body) const {
+        #pragma omp parallel num_threads(MOE_DECODE_THREADS)
+        {
+            const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
+            if (!g_moe_decode[static_cast<std::size_t>(t)]) {
+                g_moe_decode[static_cast<std::size_t>(t)] = std::make_unique<MoeDecodeThread>();
+                if constexpr (USE_MOE_QUANT) g_moe_decode[static_cast<std::size_t>(t)]->cache.allocate();
+            }
+            // FTZ/DAZ is per-thread MXCSR state, and a thread that skipped it would compute DIFFERENT
+            // floats from thread 0 the moment an intermediate went subnormal -- not merely slower ones.
+            // Setting it every entry is a two-instruction write, far cheaper than tracking whether this
+            // OpenMP worker has been seen before.
+            set_flush_denormals();
+            MoeDecodeThread& S = *g_moe_decode[static_cast<std::size_t>(t)];
+            // `static` schedule with n == EXPERTS_PER_TOK == MOE_DECODE_THREADS gives each thread
+            // exactly one expert, which is the whole point; it degrades correctly if a build's
+            // EXPERTS_PER_TOK exceeds DEFAULT_THREADS.
+            #pragma omp for schedule(static)
+            for (int k = 0; k < n; ++k) body(k, S.ffn.data(), S.ffn.data() + D_FF);
+        }
+    }
+};
 
 // y[out] = x[in] . W[in,out]  (+ bias); dense, same order as op_linear's non-ternary path.
 static inline void linear_row(const float* __restrict x, const Node* W, const Node* bias,
@@ -512,12 +593,23 @@ const float* Model::forward_one(int id, int pos) {
             // resolve experts identically -- which is what keeps forward/forward_one parity (the
             // check docs/WP4_SCOPE.md S6 records as having caught a real bug in every one of WP1-3)
             // a check of the MODEL rather than of two different residency strategies.
-            if constexpr (USE_MOE_QUANT) W->moe_cache.allocate();
-            moe::forward_row_via(MOE_DIMS, a, L.moe_router->data.data(),
-                                  [&](int e) { return moe_resolve(L, l, e); },
-                                  L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
-                                  L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
-                                  proj, moe_scratch);
+            //
+            // B20 part 2: ...and the same moe_math.hpp body, too. The only difference from the batched
+            // path is WHICH runner walks the selected experts (ParallelExperts here, the serial default
+            // there) and therefore which pool each resolve writes into -- the arithmetic, and the order
+            // the ten contributions are summed in, are identical by construction. `resolve` reads
+            // omp_get_thread_num() rather than closing over one pool, because it is called from inside
+            // the runner's own parallel region, once per thread.
+            moe::forward_row_via_run(
+                MOE_DIMS, a, L.moe_router->data.data(),
+                [&](int e) {
+                    const int t = omp_get_thread_num() % MOE_DECODE_THREADS;
+                    return moe_resolve(L, l, e, g_moe_decode[static_cast<std::size_t>(t)]->cache);
+                },
+                ParallelExperts{},
+                L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
+                L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
+                proj, moe_scratch);
         } else if constexpr (USE_GATED_FFN) {
             linear_row(a, L.Wg, nullptr, g1, C, D_FF);
             linear_row(a, L.W1, nullptr, f1, C, D_FF);

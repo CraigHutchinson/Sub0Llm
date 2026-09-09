@@ -1,7 +1,7 @@
 # Intel iGPU and backend restructuring work packages
 
-Date: 2026-09-09. **Research branch rebased onto `main` at `e5af1ad`; archived 2026-09-08
-measurements retain their original `90721bc` base.**
+Date: 2026-09-09. **Research branch includes `main` through `6189121`; archived 2026-09-08
+measurements retain their original `90721bc` base and compile evidence retains `e5af1ad`.**
 User priority: interactive inference first, training later.
 Read [the platform research and design](INTEL_IGPU_BACKEND_DESIGN.md) for evidence, architecture,
 ownership, benchmark protocol and selection criteria. The [whole-plan review](INTEL_IGPU_PLAN_REVIEW.md)
@@ -34,10 +34,10 @@ and llama.cpp are optional bounded comparisons; Vulkan is parked. See the
 Code preparation can run in parallel; **hardware measurements on this laptop are serialized**.
 Check [ACTIVE_WORK_LOG.md](ACTIVE_WORK_LOG.md) before touching shared files or consuming the CPU/GPU.
 WP4f's converter correction merged in `296f2a1`; freeze its corrected fixtures and precision metadata.
-WP5a, WP5b and WP5c are merged on current `main`: the real tokenizer, mmap/full-scale transplant and
-generation caller are available inputs. I08's decode/API slice is also merged in `cb9e2b1`; B20 now
-owns active CPU decode optimization on `main`, including `moe_quant.hpp`, `transplant.hpp` and
-`src/backends/cpu/decode.cpp`. Consume those surfaces read-only until that active row closes.
+WP5a, WP5b and WP5c are merged: the real tokenizer, mmap/full-scale transplant and generation caller
+are available inputs. I08's decode/API slice is merged in `cb9e2b1`; B20's CPU decode optimization and
+follow-up memory audit are merged through `6189121`. Consume their measurements and recheck the active
+log for successor ownership before editing `moe_quant.hpp`, `transplant.hpp` or CPU decode.
 
 Each package gets its own result/report directory and explicit file ownership. In the shared working
 tree, one integration owner edits root CMake, generated-config emitters and public headers. Other
@@ -62,7 +62,7 @@ approved project estimate.
 | I05 | Native dense/GDN/encoded-expert experiment | I00/I01, initial I18/I19 findings | M |
 | I06 | Component-based investment decision; not final interactive acceptance | I05, I18–I21; optional I02/I04 evidence | S |
 | I07 | Device ABI/build axis; not delivered by source moves | I01; I07b lands with I11 | M |
-| I08 | CPU extraction — area/facade and decode slice landed; optimizer/backward/state work remains | Frozen baseline; coordinate active B20 | M remaining |
+| I08 | CPU extraction — area/facade and decode slice landed; optimizer/backward/state work remains | Frozen baseline; consume merged B20 findings | M remaining |
 | I09 | CUDA extraction — area and manifest landed; deeper split paused | CUDA baseline, coordinate I07 | L remaining |
 | I10 | Encoded-weight preparation and memory accounting | I01/I06, I19, coordinate I07/I11 | L |
 | I11 | Native context and dense generation consumer | I06, I07a; land I07b together | L |
@@ -350,9 +350,9 @@ No `HYBRID` flag is enabled without an actual scheduler. Coordinate export edits
 ### I08 — Split CPU responsibilities without changing behavior
 
 **Status:** area/facade and the decode/API slice are merged through `cb9e2b1` and independently
-reverified in `db3594b`. Optimizer, backward and private-state decomposition remain. B20 currently owns
-decode performance work in `moe_quant.hpp`, `transplant.hpp` and `src/backends/cpu/decode.cpp`; consume
-those surfaces read-only until its active-log row closes.
+reverified in `db3594b`. B20's decode optimization and memory audit are merged through `6189121`.
+Optimizer, backward and private-state decomposition remain. Recheck the active log for successor
+ownership before shared edits.
 
 **Owns:** `src/backends/cpu/backend.cpp` and new `src/backends/cpu/`; shared CMake changes queued through I07.
 
@@ -740,5 +740,5 @@ can be authored in separate leaf files; one integration owner handles the shared
 Resume from the ordered [follow-up runbook](INTEL_IGPU_FOLLOWUP_RUNBOOK.md). In brief: reconcile/rebase,
 complete the already-authored I00/S1 capability and prepared-copy gates, freeze I01 from merged WP5
 artifacts, then prepare I18/I20/S0a before serialized device measurements. I02/I04 are optional and I03
-remains parked. No native full-backend commitment until I06. Preserve active B20 ownership. Muon's
-remaining files are committed in `8a72c67`.
+remains parked. No native full-backend commitment until I06. Consume the merged B20 performance and
+memory findings. Muon's remaining files are committed in `8a72c67`.

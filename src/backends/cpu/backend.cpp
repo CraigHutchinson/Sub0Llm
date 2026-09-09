@@ -77,12 +77,9 @@ static inline int omp_get_num_threads() { return 1; }
 static inline int omp_get_max_threads() { return 1; }
 #endif
 
-// x86 SSE/AVX control register access, used to flush subnormal floats to zero
-// (FTZ/DAZ) in the hot loops, where a subnormal operand triggers a slow assist.
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <immintrin.h>
-#define SUB0_X86 1
-#endif
+// (The x86 FTZ/DAZ control-register helper this file used to define locally now lives in internal.hpp:
+// decode.cpp's own compute threads must set the same MXCSR bits, and a thread that missed them would
+// decode to different last bits than one that did not -- see set_flush_denormals' comment there.)
 
 namespace sub0 {
 
@@ -124,14 +121,18 @@ static void ensure_shared_params() {
 // letting a null pointer reach memcpy is this project's "put the refusal at the lowest callable seam"
 // rule (memory: caps-bit-nothing-reads-is-not-a-guard): the backward pass already aborts, so reaching
 // this is a bug in a caller that skipped it, and a null deref would name the wrong thing.
-[[noreturn]] static void refuse_training_arena(const char* what) {
+// `floats` is what the named arena WOULD have cost, so the message quotes the right number for each:
+// the three shared parameter-side arenas and the per-Worker accumulator are PARAM_FLOATS long, while the
+// per-Worker ACTIVATION-gradient arena is ACT_CAP long (internal.hpp's ACT_GRAD_FLOATS). Defaulted,
+// because the parameter-side callers are the majority and were here first.
+[[noreturn]] static void refuse_training_arena(const char* what, size_t floats = PARAM_FLOATS) {
     std::println(stderr,
                  "fatal: {} does not exist in this build -- Gated Residual / MoE / QSA are CPU-forward-"
-                 "only (backward_node aborts), so the gradient and AdamW-moment arenas are not "
-                 "allocated at all ({} floats each would be {:.1f} GiB apiece here). Nothing but a "
+                 "only (backward_node aborts), so the gradient, AdamW-moment and activation-gradient "
+                 "arenas are not allocated at all ({} floats would be {:.1f} GiB here). Nothing but a "
                  "training path can want this pointer.",
-                 what, PARAM_FLOATS,
-                 static_cast<double>(PARAM_FLOATS) * 4.0 / (1024.0 * 1024.0 * 1024.0));
+                 what, floats,
+                 static_cast<double>(floats) * 4.0 / (1024.0 * 1024.0 * 1024.0));
     std::abort();
 }
 
@@ -160,8 +161,15 @@ static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
     size_t off = W->act_used;
     W->act_used += n;
     std::span<float> d(W->act_data.data() + off, n);
-    std::span<float> gr(W->act_grad.data() + off, n);
     std::fill(d.begin(), d.end(), 0.f);
+    // FORWARD_ONLY: the activation-gradient arena does not exist in this build (internal.hpp's
+    // ACT_GRAD_FLOATS), so a node carries an EMPTY grad span rather than one into a 1-float placeholder
+    // -- exactly what mk_param already does for a parameter leaf, and for the same reason: nothing in
+    // the forward path reads a grad span, and backward_node abort()s before it could. Skipping the
+    // second std::fill is not an optimization sneaked in alongside a memory change; there is simply no
+    // longer any buffer to fill, and the forward pass's own values are unaffected either way.
+    if constexpr (FORWARD_ONLY) return {d, std::span<float>{}};
+    std::span<float> gr(W->act_grad.data() + off, n);
     std::fill(gr.begin(), gr.end(), 0.f);
     return {d, gr};
 }
@@ -1244,8 +1252,11 @@ static Node* op_moe(Node* x, Layer& L, int layer_index) {
     out->a = x;
     if constexpr (USE_MOE_QUANT) W->moe_cache.allocate();
     auto [scratch, scratch_g] = arena_alloc(moe::scratch_floats(MOE_DIMS));
+    // The batched path stays SERIAL and stays on this Worker's own 8-slot pool: it is already inside
+    // train_batch's parallel team when training, and its cache has a real cross-row hit rate that
+    // decode's does not (see MOE_DECODE_SLOTS in internal.hpp). B20 part 2 changed decode, not this.
     moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
-                     [&](int e) { return moe_resolve(L, layer_index, e); },
+                     [&](int e) { return moe_resolve(L, layer_index, e, W->moe_cache); },
                      L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
                      L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
                      out->data.data(), scratch.data());
@@ -1764,18 +1775,6 @@ Node* Model::forward(const int* ids, int T) {
 
 thread_local Model g_model;
 
-// Flush-to-zero (FTZ) + denormals-are-zero (DAZ). A subnormal float operand traps
-// into a slow microcode assist on x86 (often ~100x a normal op); the fast-math
-// approximations and decaying gradients can produce them in the hot loops. MXCSR is
-// per-thread, so every compute thread sets this once (via ensure_thread_built). The
-// model tolerates flushing these near-zero values -- they are underflow noise here.
-static inline void set_flush_denormals() {
-#if defined(SUB0_X86)
-    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-#endif
-}
-
 // Declared in internal.hpp, where its contract comment lives.
 void ensure_thread_built() {
     if (W) return;
@@ -1843,7 +1842,10 @@ void print_host_memplan() {
     constexpr double shared_mb = shared_copies * PARAM_FLOATS * sizeof(float) / kMiB;
     constexpr double worker_mb = sizeof(Worker) / kMiB;
     constexpr double wgrad_mb  = WORKER_GRAD_FLOATS * sizeof(float) / kMiB; // the per-worker gradient
-    constexpr double arena_mb  = 2 * ACT_CAP * sizeof(float) / kMiB;        // act_data + act_grad
+    // act_data + act_grad, and NOT `2 * ACT_CAP`: the gradient arena is 1 float in a FORWARD_ONLY build
+    // (internal.hpp's ACT_GRAD_FLOATS), so the doubled form over-stated a real Qwen4-axes worker by
+    // 7.02 GiB -- the same class of over-report WP4d removed from `shared_copies` two lines up.
+    constexpr double arena_mb  = (ACT_CAP + ACT_GRAD_FLOATS) * sizeof(float) / kMiB;
     constexpr int    workers   = COMPUTE_MODE == ComputeBackend::Gpu ? 1 : DEFAULT_THREADS;
     std::println("host (CPU) plan: shared {:.0f} MiB + {} x worker {:.0f} MiB = {:.0f} MiB",
                  shared_mb, workers, worker_mb, shared_mb + workers * worker_mb);
@@ -1992,6 +1994,13 @@ Node* forward_capture(const int* ids, int T, HiddenSink sink, void* ctx) {
 Node* cross_entropy(Node* logits, const int* targets) { return op_cross_entropy(logits, targets); }
 
 void backward(Node* loss, float seed) {
+    // FORWARD_ONLY: the activation-gradient arena does not exist (internal.hpp's ACT_GRAD_FLOATS), so
+    // every node's grad span is empty and the seed write below has nowhere to go. backward_node already
+    // abort()s on the first GR/MoE/QSA node it reaches, but that is one statement too late: this refusal
+    // belongs at the lowest callable seam, the same placement grad_ptr/adam_*_ptr/reduce_gradients use
+    // (memory: caps-bit-nothing-reads-is-not-a-guard). Reaching here at all is a caller that skipped a
+    // build it cannot train.
+    if constexpr (FORWARD_ONLY) refuse_training_arena("the activation-gradient arena", ACT_CAP);
     loss->grad[0] = seed;
     for (Node& n : W->pool | std::views::take(W->pool_used) | std::views::reverse) backward_node(n);
 }

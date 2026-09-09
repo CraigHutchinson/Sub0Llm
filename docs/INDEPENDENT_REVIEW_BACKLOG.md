@@ -167,7 +167,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B17 | Done | Keep document-window fallback inside its declared sampling contract | Validated by focused probe and test compile | M | Completed on user request, 2026-09-08 |
 | B18 | Done | State the engine's process/thread ownership contract | Validated by public-header review | S initially | Completed on user request, 2026-09-08 |
 | B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
-| B20 | P2 | Reduce MoE decode transpose cost and use available CPU parallelism | Confirmed by VTune and live decode measurement | L | After WP5 model baseline; coordinate hot shared files |
+| B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
 
 ## Findings and acceptance criteria
 
@@ -564,6 +564,25 @@ landing both at once, so the report can say which one bought what.
 (currently ~9.65–10.4s, `docs/WP4_SCOPE.md` §6 WP5c) is reported before and after each change; every
 existing transplant/MoE-quant correctness test still passes bit-for-bit. Coordinate through
 `docs/ACTIVE_WORK_LOG.md` before touching `moe_quant.hpp`/`transplant.hpp` — both are hot, shared files.
+
+**Status: Done; merged `d2bbea4` (2026-09-09), independently reverified before merging.** Both parts
+landed, each re-profiled with VTune independently as required above. Part (a): `transpose_out_in` and
+its siblings share one measured (tile=16, both loop orders swept, not guessed) cache-blocked core —
+52.9% → 21.5% of sampled CPU time, 9.14 → 5.68 s/token (1.61x). Part (b): resolve now runs a layer's
+selected experts across threads (`Total Thread Count` 1 → 10), via a two-phase compute-then-combine
+restructuring of `moe_math.hpp`'s `forward_row_via` that keeps the weighted-sum accumulation order
+identical for both the serial and parallel paths — but bought only ~2% net, because it exposed that
+decode is now DISK-bound: ~13,610 hard page faults/sec, ~56 MB/s matching physical disk reads, no
+warm-up trend over 30 tokens, because the 37.11 GiB S0Q1 mapping doesn't stay resident alongside the
+18.31 GiB f32 backbone in 63.4 GiB of RAM. **That demand-paging behavior is the real next item**, not
+a CPU optimization — reported, not fixed, here. `include/sub0/moe_quant.hpp` was not touched by
+either fix. Bit-for-bit verified independently (not on trust) after merging: `--verify` against the
+real 48-layer artifact 0 mismatches of 1074, `forward`/`forward_one` parity 0 exactly, the WP5c
+determinism fixture byte-for-byte, and the neutral suites plus the transplant/moequant-tagged tests
+specifically all green. One real defect found and fixed along the way: decode's new worker threads
+never called `set_flush_denormals` (FTZ/DAZ is per-thread MXCSR state) — a silently false bit-exactness
+claim waiting to happen the first time an intermediate went subnormal on a thread that missed it. Full
+writeup: `docs/ACTIVE_WORK_LOG.md`'s B20 row.
 
 ## Suggested execution order
 
