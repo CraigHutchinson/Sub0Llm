@@ -168,6 +168,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B18 | Done | State the engine's process/thread ownership contract | Validated by public-header review | S initially | Completed on user request, 2026-09-08 |
 | B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
 | B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
+| B21 | P1 | Find why `ParallelExperts`' 10 decode threads show 1-thread disk-queue depth in production | Confirmed by direct `\PhysicalDisk\Avg. Disk Queue Length` measurement, root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed |
 
 ## Findings and acceptance criteria
 
@@ -583,6 +584,59 @@ specifically all green. One real defect found and fixed along the way: decode's 
 never called `set_flush_denormals` (FTZ/DAZ is per-thread MXCSR state) — a silently false bit-exactness
 claim waiting to happen the first time an intermediate went subnormal on a thread that missed it. Full
 writeup: `docs/ACTIVE_WORK_LOG.md`'s B20 row.
+
+### B21 — `ParallelExperts`' 10 decode threads are not concurrently in flight on the disk in production
+
+Follow-up to B20, filed 2026-09-09 during Sub0MemPage research. B20's own row above already flagged decode
+as disk-bound; this item is the next layer down — **whether B20's own fix (fanning MoE resolve across
+`MOE_DECODE_THREADS` = 10 OpenMP threads) is actually buying real concurrent disk I/O in the live engine.**
+
+**Measured, not inferred.** Two independent lines of evidence, both from this session:
+
+1. An isolated harness running the engine's own real resolve code path (`moeq::ExpertCache::resolve` →
+   `gguf::to_f32` → `transplant::transpose_out_in` → `moe::expert_ffn_row`), one thread per cold expert,
+   one private `ExpertCache<1,...>` per thread — a byte-for-byte structural match to `decode.cpp`'s
+   `ParallelExperts` — scales 4.2–5.2x from 1 to 10 threads (11.05 ms/expert → 2.13 ms/expert), and its
+   **1-thread** projection (5.31–5.67 s/token) matches the live engine's actual measured throughput
+   (5.53–5.85 s/token) almost exactly, while its **10-thread** projection (1.02–1.27 s/token) does not.
+2. Directly measuring `\PhysicalDisk(1 D:)\Avg. Disk Queue Length` during a real `sub0llm-qwen4-gen`
+   decode run (current `main`, includes B20): **0.04–0.09 throughout steady-state decode** — the
+   harness's own single-thread figure (0.12–0.20), nowhere near its ten-thread figure (0.98–1.21).
+
+Both point the same way: **the live engine's ten `ParallelExperts` threads are not concurrently issuing
+disk reads**, even though B20's `--verify`/parity/determinism-fixture gates (correctly) show the fix is
+bit-for-bit correct — this is a performance defect, not a correctness one.
+
+**What was ruled out by code review**: no lock, no shared mutable state, and no structural serialization
+in the actual call site (`decode.cpp`'s `ParallelExperts`, `moe_quant.hpp`'s `Store`/`ExpertCache`). Each
+of the (confirmed, from the real generated config) 10 `MOE_DECODE_THREADS` gets its own heap-allocated
+`MoeDecodeThread` (private single-slot `ExpertCache` + FFN accumulators), reads through one shared
+read-only `FileMap`, and nothing between a thread's `resolve()` and `dequantize_expert()`'s raw byte
+access can block on another thread — the `#pragma omp parallel num_threads(...)` / `#pragma omp for
+schedule(static)` structure is architecturally identical to the harness shape that DID scale.
+
+**What was ruled out by direct measurement** (same research session): mmap section-object serialization on
+this file (10-thread mmap-only fault throughput scales 5.1–5.6x in isolation); NVMe saturation (device
+sustains 6.34 GB/s vs. the engine's measured 55–108 MB/s); the 48-region fork/join barrier tail cost
+(measured 1.2–1.3x, not 4–5x); page-cache pressure under a 25 GiB resident-ballast simulation of the
+engine's own real private footprint (measured 1.3x, not 4–5x).
+
+**Still open, not yet tested**: P-core/E-core thread-affinity placement of the real OpenMP team vs. the
+harness's `std::thread` pool on this 8P+16E part; whether per-region OpenMP wake-up cost differs
+materially once the team is reused across 48 short regions inside a much larger, much busier process
+already holding 25+ GiB resident (TLB/cache contention the isolated harness's smaller footprint would not
+reproduce); whether something upstream of the resolve call itself (the router's own work, or the two-phase
+compute-then-combine restructuring) serializes the ten resolves in practice despite no lock being visible.
+
+**Acceptance criteria**: instrument or re-measure to identify the actual serialization point (VTune's
+thread-concurrency histogram over the resolve region, not its hotspot list, is the next instrument named
+by this research); fix it; re-verify decode throughput moves toward the harness's own 10-thread projection
+(~1.0–1.3 s/token) while `--verify`/parity/the determinism fixture stay exactly unchanged (this is once
+again a pure scheduling question — the two-phase compute-then-sum structure means answer correctness
+cannot depend on which thread computes which expert or how quickly).
+
+Full research trail: session scratchpad `sub0mempage-research-empirical-concurrency.md` (not part of this
+repo) — every number above is reproducible from the commands logged in that file's appendix.
 
 ## Suggested execution order
 
