@@ -39,7 +39,29 @@ both, and don't declare a "reviewed X for performance" pass complete on code-rea
 
 ## 2. Open items — checked, real, NOT yet fixed (start here)
 
-### 2a. `arena_alloc`'s unconditional grad-scratch zero-fill (backend_cpu.cpp)
+### 2a. `arena_alloc`'s unconditional grad-scratch zero-fill (backend_cpu.cpp) — **DONE (2026-09-09)**
+
+**Closed by a stronger fix than the one proposed below, and by a different route.** The memory audit that
+accounted for the real 48-layer decode run's ~41 GiB peak found that the buffer this item wanted to stop
+zero-filling should not exist at all in these builds: `Worker::act_grad` was sized `ACT_CAP`
+unconditionally, while `Worker::grad` (the per-PARAMETER accumulator, a different array) had had exactly
+this treatment since WP4d. `src/backends/cpu/internal.hpp` now derives `ACT_GRAD_FLOATS = FORWARD_ONLY ?
+1 : ACT_CAP` from the same three `USE_*` constants `backward_node`'s own refusals are written against, and
+`arena_alloc` hands out an EMPTY grad span in that build — mirroring what `mk_param` already did for a
+parameter leaf. So the `memset`-equivalent pass this item names is gone, and so is the 7.02 GiB (at the
+real Qwen4 axes) of arena it was writing into. No parameter threading was needed: the decision is a
+compile-time property of the build, not of the call site, which is why the "bool parameter or a separate
+`arena_alloc_fwd_only()`" plan below was not the shape the fix took.
+
+Measured, on the real 48-layer artifact: peak working set 40.98 → 33.96 GiB (−7.02, −17.1%), the WP5c
+determinism fixture reproducing all 30 ids and the full continuation byte-for-byte, and the neutral d196
+suites unchanged at 28,875,042/147 and 120,889/244 (baseline re-taken on the same tree by stashing the
+diff, not cited from an earlier session). The throughput effect is within noise (5.61 → 5.53 s/token), as
+B20's own disk-bound finding predicts — the value is that those 7 GiB are now available to the OS file
+cache the 37.11 GiB S0Q1 sidecar competes for: at a comparable point in the same run, the sidecar's
+resident share rose 4.81 → 7.63 GiB.
+
+The original entry follows, unedited, because its reasoning is still the record of how the cost was found.
 
 Found during the QSA performance review (2026-09-03), flagged but not fixed — cross-cutting, not specific
 to QSA. `arena_alloc` (the bump allocator over `Worker::act_data`/`act_grad`) always zero-fills BOTH the
@@ -92,6 +114,39 @@ undertaking than any fix in §1 (those were all same-file, same-pattern, zero-ri
 new code with its own correctness surface). **Do not attempt this opportunistically** — scope it
 deliberately (own design doc, own fixture-gated correctness pass) if and when the forward-pass throughput
 at real Qwen4 scale (WP4) makes it the priority, rather than folding it into an unrelated task.
+
+### 2d. `gguf::dequantize_iq2_xxs` decodes ~6x slower per element than its two neighbours
+
+Found 2026-09-09 by `benchmarks/moe_expert_bench.cpp` (see `docs/WP4_SCOPE.md` §6 "WP6b" for the full
+table and method). Isolated on real encoded planes from the real 48-layer sidecar, per expert's worth of
+elements (3 x 1,638,400):
+
+| decoder | ms / expert | Melem/s |
+|---|---:|---:|
+| `dequantize_iq1_s` | 2.21 | ~2,200 |
+| `dequantize_iq4_nl` | 2.39 | ~2,000 |
+| **`dequantize_iq2_xxs`** | **13.73** | **~360** |
+
+This is not a corner case: **14,336 of this file's 73,728 routed-expert planes are IQ2_XXS**, and an
+IQ2_XXS-heavy expert costs more to *unpack* than every other stage of its resolve put together (page-in +
+transpose + FFN ≈ 5.8 ms). It had never been visible before because every previous measurement reported
+the three decoders as one combined figure (B20's own VTune report: "22.7% combined").
+
+**Not investigated further here, deliberately** — this pass was measurement plus one specific memory fix,
+and a decoder rewrite is new numerical code with its own correctness surface (the same reasoning 2c
+applies to `qsa::linear_row`). But the obvious first hypothesis, "IQ2_XXS is just a more complicated
+format", does **not** survive reading the two functions side by side, and whoever picks this up should
+start from that rather than re-deriving it: `dequantize_iq1_s` and `dequantize_iq2_xxs`
+(`include/sub0/gguf.hpp`) have the *same* shape — a 64-bit grid word looked up per 8-element group, then
+eight `(grid >> 8j) & 0xFF` extractions. The only structural difference in the inner loop is that
+IQ2_XXS additionally reads `KMASK_IQ2XS[j]` **per element** and selects a sign from it, where IQ1_S
+folds its whole per-group correction into two loop-invariant scalars (`dl`, `delta`). `KMASK_IQ2XS[j]` is
+a function of the loop index alone, so it is loop-invariant in the only sense that matters — and the
+`for (int j = 0; j < 8 && w < n; ++j, ++w)` guard shared by both decoders is what stops the compiler
+unrolling that away. A cheap first experiment is therefore to hoist the tail bound out of the inner
+condition (the block is whole except possibly the last) and let `j` become a fixed-count unrollable loop,
+before contemplating intrinsics. Gate any change on `tests/gguf_tests.cpp` plus the existing bit-for-bit
+`--verify` against the real 48-layer artifact, which is what makes a rewrite checkable at all.
 
 ## 3. Methodology — how to reproduce or extend this profiling
 

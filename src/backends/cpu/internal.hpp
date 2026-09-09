@@ -206,6 +206,29 @@ constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA;
 // Worker's array can be conditionally sized like this; the shared three are heap handles that simply
 // stay null, and every accessor that would hand one out refuses loudly instead (see grad_ptr below).
 constexpr size_t WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS;
+// The SECOND per-Worker array the same argument applies to, and the one WP4d missed. WORKER_GRAD_FLOATS
+// above elides the per-PARAMETER gradient accumulator; `act_grad` is the per-ACTIVATION one -- a
+// completely different array, sized ACT_CAP rather than PARAM_FLOATS, and until now sized that way
+// unconditionally. It is DEAD in a FORWARD_ONLY build by exactly the same proof, not a weaker one: the
+// only code that ever names it is arena_alloc (which hands out the grad half of each node's span) and
+// backward_node (which is the only thing that ever reads or writes one), and backward_node abort()s for
+// Gated Residual / MoE / QSA -- the same three USE_* constants FORWARD_ONLY is derived from. So in a
+// build where FORWARD_ONLY is true, every byte of it is allocated, zero-initialized, and then never
+// read or written by anything that can execute.
+//
+// It is not a rounding error at real-model scale: ACT_CAP is sized by SEQ_LEN x the widest per-execution
+// activation, and at the real Qwen4-preview axes it is 1,885,094,312 floats -- 7.02 GiB, exactly half of
+// a 14.05 GiB Worker, MEASURED as such (docs/WP4_SCOPE.md WP5b/WP6a: the gen tool's peak working set is
+// 40.98 GiB and 7.02 of those GiB are this array). Reclaiming it does not merely shrink the process; it
+// hands those pages straight back to the OS file cache the 37.11 GiB MoE sidecar is competing for, which
+// is what actually binds a decode run (INDEPENDENT_REVIEW_BACKLOG B20's disk-bound finding).
+//
+// Sized 1 rather than 0 for WORKER_GRAD_FLOATS's own reason (a zero-length std::array has no data()),
+// and arena_alloc hands out an EMPTY grad span in that build rather than a span into this placeholder --
+// exactly as mk_param already does for a parameter leaf's grad. Gated DeltaNet is excluded from
+// FORWARD_ONLY (its Stage 2 backward is real and gradient-checked), so a GDN-only build keeps a
+// full-size act_grad and is bit-identical under this change, like every other existing build here.
+constexpr size_t ACT_GRAD_FLOATS = FORWARD_ONLY ? 1 : ACT_CAP;
 // The four arenas themselves (g_param_data/grad/m/vel) and ensure_shared_params() are NOT declared
 // here: only backend.cpp touches them, through mk_param and the params_ptr()/AdamW accessors, so they
 // stay `static` there. decode.cpp reaches the weights the way every consumer does -- through the
@@ -281,7 +304,8 @@ struct Worker {
     std::array<float, WORKER_GRAD_FLOATS> grad{};  // gradient accumulator (this slot); 1 float when
                                                     // FORWARD_ONLY -- see that constant's comment
     std::array<float, ACT_CAP>      act_data{};    // activation arena: values
-    std::array<float, ACT_CAP>      act_grad{};    // activation arena: grads
+    std::array<float, ACT_GRAD_FLOATS> act_grad{}; // activation arena: grads; 1 float when
+                                                    // FORWARD_ONLY -- see that constant's comment
     std::array<Node, NUM_PARAMS>    param_nodes{}; // parameter leaves (data->shared, grad->this)
     std::array<Node, MAX_NODES>     pool{};        // forward-graph node pool
     std::array<ParamView, NUM_PARAMS> views{};     // optimizer parameter spans

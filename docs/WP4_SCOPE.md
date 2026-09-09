@@ -1651,6 +1651,8 @@ designed and it is the *decode cost* that is expensive.
   four `PARAM_FLOATS`-sized training arenas on exactly this argument and did not extend it to the
   per-Worker activation grad. Eliding it would halve the per-Worker cost to ~7.0 GiB, which is the
   single cheapest available headroom win and the obvious prerequisite to a longer `SEQ_LEN`.
+  **DONE 2026-09-09 — see §6 "WP6a" below**: `ACT_GRAD_FLOATS`, measured at −7.02 GiB of peak working
+  set with the determinism fixture bit-for-bit. The per-Worker figure is now 7.02 GiB, not 14.05.
 - **`print_host_memplan` reports a 24-Worker plan (363 GiB) that a forward-only run never allocates.**
   Workers are lazily allocated and this run used one. Misleading rather than wrong, and unchanged from
   WP4d.
@@ -1781,7 +1783,9 @@ Two independent reasons, both measured rather than assumed:
    not fit. WP5b also named the cheapest available win (`act_grad` is allocated in a `FORWARD_ONLY`
    build, roughly half of that 14.03 GiB, doing nothing). **That elision is the prerequisite to a longer
    window, and it is still open.** Raising `--seq` before it lands would just move the failure from
-   "slow" to "does not allocate".
+   "slow" to "does not allocate". **(It landed 2026-09-09 — §6 "WP6a". The arena is now 7.02 GiB at
+   `SEQ_LEN = 128`, so 256 would be ~14 GiB and does fit; reason 1 above, throughput, is unaffected and
+   is still what actually binds, so the verdict on raising `--seq` does not change.)**
 
 So: no reconfigure. The finding is that `SEQ_LEN` is a *real* ceiling on a real interactive session and
 a *non-issue* for anything achievable at today's throughput, and the ordering between the two is what
@@ -1866,6 +1870,169 @@ Full build **305/305 targets** green, including the new one. Expected, since no 
   bare `psapi.lib`, which `clang++`'s GNU-style driver then reports as a missing input file. It breaks
   the **untouched** `sub0llm-qwen4-forward` identically, so it is not a WP5c regression. The recorded
   baseline build is `SUB0_COMPUTE=CPU`, which needs no `nvcc` and therefore no `vcvars`, and is green.
+
+---
+
+### WP6a — where the 48-layer decode run's ~41 GiB actually goes. EXECUTED. Every line item measured
+
+**The question, and why "approximately" was not good enough.** Every prior pass reported the gen run's
+peak working set as a single number (40.87-40.98 GiB) beside a fact that does not fit next to it: keeping
+everything resident would need 55.42 GiB (18.31 blob + 37.11 sidecar) plus a Worker, and a live sample
+during a run showed `\Memory\Available MBytes` collapsing from 47.29 GiB idle to 6.8 GiB while the
+process's own peak stayed at ~41. Either the process was much smaller than the pressure it created, or
+some of that 41 GiB was not doing anything. Both turned out to be true.
+
+**Method.** `GetProcessMemoryInfo` gives a total and nothing else, so the breakdown came from a
+`VirtualQueryEx` walk of the live process's whole address space with `QueryWorkingSetEx` over every
+committed page — a minimal VMMap stand-in, since VMMap is not installed on this host — classifying each
+region as private / mapped-file / image and naming each mapping's backing file. Cross-checked against a
+second, independent source: a probe TU compiled against the same `internal.hpp` at the same generated
+config, printing `sizeof(Worker)` and every arena's `constexpr` byte count. The two agree to the byte.
+
+**The breakdown, sampled mid-decode (token ~8 of 30), on the real 48-layer artifact:**
+
+| Line item | Bytes | What says so |
+|---|---:|---|
+| `g_param_data` (the f32 S0L5 blob) | **18.310 GiB** | one private region, resident 100%; `PARAM_FLOATS * 4` is 18.3102 GiB exactly |
+| `g_param_grad` / `g_param_m` / `g_param_vel` | **0** | `ensure_shared_params()` skips all three under `FORWARD_ONLY`; the walk finds no such region, and 4x would have been 73.24 GiB |
+| one `Worker` — `act_data` | **7.022 GiB** | `ACT_CAP` = 1,885,094,312 floats |
+| one `Worker` — `act_grad` | **7.022 GiB** | same size, and **provably dead** — see below |
+| one `Worker` — `grad` / `param_nodes` / `pool` / `views` | 0.31 MiB | `WORKER_GRAD_FLOATS` is 1; 1,074 + 1,410 `Node`s at 120 B, 1,074 `ParamView`s at 24 B |
+| one `Worker` — `moe_cache` (the 8-slot batched pool, 150 MiB) | **never allocated** | `op_moe` is its only `allocate()` caller and a `forward_one`-only run never enters it |
+| decode's per-thread pools, 10 threads | 250.0 MiB | 18.75 MiB slot + 6.25 MiB raw scratch + 5 KiB accumulators, per thread |
+| decode-persistent caches (KV 24.0, GDN 149.6, QSA raw 3.0 + block 0.75 MiB) | 177.4 MiB | `thread_local`, one copy (decode's fan-out threads share them read/write-free) |
+| everything else private (tokenizer tables, CRT heap, stacks) | ~53 MiB | the residual of the walk's private total |
+| **private total, measured** | **32.835 GiB** | matches 18.310 + 14.045 + 0.480 |
+| MoE sidecar mapping, `.moeq` | 37.113 GiB committed, **4.809 GiB resident** | one `MEM_MAPPED` region, named by `GetMappedFileNameW` |
+| images (the exe, `sub0_core.dll`, system DLLs) | 0.014 GiB | 79 `MEM_IMAGE` regions |
+
+So the answer to "what is in the 41 GiB" is: **18.31 GiB of weights that must be there, 14.05 GiB of
+Worker of which exactly half was dead, ~0.5 GiB of real decode scratch, and whatever slice of the 37.11
+GiB sidecar the OS could still hold — which was only 4.8 GiB, and shrinking, because the dead half of the
+Worker was competing with it for the same physical pages.**
+
+**The fix, and the precedent it follows.** `Worker::act_grad` is the per-ACTIVATION gradient arena;
+`Worker::grad` is the per-PARAMETER one. WP4d elided the second (`WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 :
+PARAM_FLOATS`) and did not extend the argument to the first, which is a different array a hundred lines
+away. The proof is the same one, not a weaker one: the only two things that ever name `act_grad` are
+`arena_alloc` (which hands out the grad half of a node's span) and `backward_node` (the only reader or
+writer), and `backward_node` `abort()`s for Gated Residual, MoE and QSA — the same three `USE_*` constants
+`FORWARD_ONLY` is derived from. `internal.hpp` now carries `ACT_GRAD_FLOATS = FORWARD_ONLY ? 1 : ACT_CAP`,
+`arena_alloc` returns an EMPTY grad span in that build (mirroring `mk_param`'s existing treatment of a
+parameter leaf), and `backward()` refuses at the lowest callable seam instead of writing `loss->grad[0]`
+into nothing. **Gated DeltaNet stays deliberately excluded from `FORWARD_ONLY`** — its Stage 2 backward is
+real and gradient-checked — so a GDN-only training build keeps a full-size `act_grad`, which is checked
+below rather than asserted.
+
+**Results, measured:**
+
+| | before | after |
+|---|---:|---:|
+| `sizeof(Worker)` | 15,081,078,520 B (14.045 GiB) | 7,540,701,272 B (**7.023 GiB**) |
+| gen `[mem] after graph_reset` | 32.41 GiB | **25.39 GiB** |
+| gen peak working set | **40.98 GiB** | **33.96 GiB** (−7.02, −17.1%) |
+| private resident, mid-decode | 32.835 GiB | 25.812 GiB |
+| **sidecar resident at a comparable point in the same run** | 4.809 GiB | **7.634 GiB** |
+| generation | 5.61 s/token | 5.53 s/token |
+
+The last two rows are the point. Throughput barely moves, exactly as B20's disk-bound finding predicts —
+but the reclaimed 7 GiB did not evaporate, it went to the file cache the sidecar is contending for, and
+the sidecar's resident share rose by 2.83 GiB at the same point in the same run. This does not solve the
+residency problem (37.11 GiB still does not fit beside 18.31 in 63.4 GiB); it buys back a seventh of the
+gap for free.
+
+**Verification, at both configurations the shared `Worker` layout has to serve:**
+
+- **Real 48 layers (`FORWARD_ONLY` true, `act_grad` shrinks).** The WP5c determinism fixture reproduces
+  **all 30 ids** and the full continuation text byte-for-byte:
+  `[11751, 13, 2500, 1599, 5656, 599, 89798, 440, 4283, 4874, 30, 271, 27775, 383, 279, 38870, 3766, 303,
+  678, 3296, 11, 279, 6511, 314, 9338, 369, 10503, 430, 2972, 57590]`.
+- **Neutral d196 L11 H7 (`FORWARD_ONLY` false, `act_grad` stays `ACT_CAP`).** `sub0_tests`
+  **28,875,042 assertions / 147 cases** and `sub0_frontend_tests` **120,889 / 244** — identical before and
+  after, with the *before* re-taken on this same tree by stashing the diff and rebuilding, not cited from
+  an earlier session.
+- **GDN-only, training-capable (`--gdn-full-attn-stride 2`, no GR/MoE/QSA, so `FORWARD_ONLY` is false and
+  the full-size `act_grad` must survive).** `[grad]` 13 assertions / 3 cases pass, `[engine]` 24,030,273
+  assertions — **byte-identical counts before and after**. (Three `[engine]` cases fail identically in
+  both arms because a `--vocab-exact` build emits no `tokenizer.tok` and `default_tokenizer()` is empty;
+  pre-existing, unrelated, reported below.)
+
+### WP6b — one expert, decomposed: `benchmarks/moe_expert_bench.cpp`. EXECUTED
+
+**Why a new binary rather than another whole-run measurement.** Every performance figure this document
+records for the 48-layer decode path is end-to-end — a 30-token run, or a 60 s VTune window — and each
+conflates four costs that respond to completely different fixes: faulting an expert's encoded bytes in,
+unpacking them, transposing the result, and the FFN itself. WP4e's own addendum left a question open
+("is a Sub0Llm-native re-encode of the sidecar worth it?") that is *entirely* about the ratio between the
+first two and the last, and no end-to-end number can supply that ratio. `sub0_moe_expert_bench` is a
+standalone target under `SUB0_BUILD_BENCHMARKS` linked against nothing at all (`gguf.hpp`,
+`transplant.hpp`, `moe_quant.hpp`, `moe_math.hpp` are header-only; every dimension comes from the real
+sidecar's own `S0Q1` header at runtime, so no generated `sub0_config.hpp` is involved). It is a plain
+`main()`, not Catch2 like its two neighbours in `benchmarks/`, for one specific reason: Catch2's benchmark
+support warms up before sampling, which destroys the only thing arm 1 exists to measure.
+
+**Method notes that bound what the numbers mean.** The cold arms run first, over `(layer, expert)` pairs
+from a fixed-seed shuffle kept disjoint from every warm arm's pairs; the resolve pool is one slot, exactly
+decode's own (`MOE_DECODE_SLOTS`), and the report prints its hit count so "0 pool hits" is checkable
+rather than assumed. What the binary cannot do without administrative rights is evict the OS standby list,
+so a page an earlier run left cached faults soft rather than hard — hence every arm reports achieved
+throughput, which is the discriminator.
+
+**Results — mean per expert (all three planes), four runs at seeds 1234/7001/7002/7003, `--reps 5`,
+24 experts per arm per run.** The three cold columns are four *independent* cold samples (a fresh seed
+draws experts the previous run never touched), not four reads of the same pages.
+
+| arm | mean ms / expert | spread across the 4 runs | throughput |
+|---|---:|---|---|
+| 1 cold read — encoded bytes only | **2.98** | 2.63 – 3.35 | 460–610 MB/s over 1.52–1.56 MiB/expert |
+| 2 dequant **IQ1_S** (x3 planes) | **2.21** | 2.12 – 2.36 | ~2.2 Gelem/s |
+| 2 dequant **IQ4_NL** (x3 planes) | **2.39** | 2.29 – 2.55 | ~2.0 Gelem/s |
+| 2 dequant **IQ2_XXS** (x3 planes) | **13.73** | 13.14 – 14.54 | **~0.36 Gelem/s** |
+| 3 transpose 640x2560 (x3 planes) | **1.53** | 1.48 – 1.60 | ~12.9 GB/s of f32 |
+| 3 transpose 2560x640 (x3 planes) | **1.59** | 1.52 – 1.75 | ~12.4 GB/s of f32 |
+| 4 `moe::expert_ffn_row` | **0.50** | 0.46 – 0.55 | 11.9–14.1 GFLOP/s |
+| 5a full pipeline, **COLD** | **10.58** | 9.55 – 12.34 | resolve + FFN, one pass |
+| 5b full pipeline, **WARM** | **6.80** | 5.90 – 7.49 | 120 timings/run, 0 pool hits |
+
+**The split, as shares of a cold single-expert resolve** (means of the four runs; the dequant row is
+weighted by the format mix of the experts each run happened to draw, which is why 5b moves with it):
+
+| | ms | share |
+|---|---:|---:|
+| page-in (cold − warm) | 3.78 | **35.7%** |
+| dequantize, 3 planes | 4.25 | **40.2%** |
+| transpose, 3 planes | 1.56 | 14.7% |
+| `expert_ffn_row` | 0.50 | **4.7%** |
+| cold pipeline, measured | 10.58 | 100% |
+
+**Three findings, in order of how much they should change a decision:**
+
+1. **The arithmetic the model actually wants is 4.7% of the work.** Everything else is getting the
+   weights into a form this engine can multiply by. That is the answer to WP4e's open question: a
+   Sub0Llm-native re-encode is not a micro-optimization here, it is aimed at 40% of the cost directly and
+   another 15% (the transpose exists only because the source layout is GGUF's).
+2. **`IQ2_XXS` decodes ~6x slower per element than `IQ1_S` or `IQ4_NL`** — 13.7 ms per expert against
+   2.2/2.4, i.e. one IQ2_XXS-heavy expert costs more to *unpack* than the entire rest of the pipeline
+   for an IQ1_S one. 14,336 of this file's 73,728 planes are IQ2_XXS, so this is not a corner case. It is
+   also the first per-format decoder number this project has ever had; every previous figure lumped all
+   three together.
+3. **The single-expert number explains the whole-run number, and in doing so sharpens B20's finding.**
+   480 resolves/token x 10.58 ms = **5.08 s/token** against a measured **5.53 s/token** — i.e. the real
+   48-layer decode behaves almost exactly as if its ten threads were one. Even the pure-CPU *warm* arms
+   (6.80 ms) come to 3.26 s/token if run serially, which is already most of the measured wall clock. So
+   the ~2% that B20's parallelization bought is not a mystery to be re-investigated as a scheduling bug:
+   at 10 threads each streaming ~13 GB/s through a transpose while the disk supplies 460–610 MB/s of
+   fresh pages, the per-expert work does not scale, and the isolated numbers say so directly.
+
+**Reproducing it:**
+
+```
+cmake --build <build> --target sub0_moe_expert_bench
+<build>/benchmarks/sub0_moe_expert_bench --sidecar D:/ModelWeights/.../qwen4_full48_q.bin.moeq --seed 7001
+```
+
+Use a **fresh seed** for any run whose cold arms are meant to be cold; the warm arms are seed-independent
+in expectation and reproduce to within the spread above on any of them.
 
 ---
 
