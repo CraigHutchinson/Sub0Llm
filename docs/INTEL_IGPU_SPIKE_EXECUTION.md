@@ -64,3 +64,10 @@ measured or credible workload bottleneck. Retain a viable baseline until the exa
 qualified. Version pinning, packaging/licensing, maintenance burden and migration cost belong in the
 later adoption decision alongside request latency and memory use. No SDK/driver upgrade is implied by
 adding an option to the watchlist.
+## Explicit assignment: tandem-backend batch
+
+The user assigned S0a/S0b/S0c spike work to Terra on 2026-09-09. This batch overrides the usual Sol
+implementation default. See the bounded sub-spikes in `INTEL_IGPU_WORK_PACKAGES.md`; Terra owns the
+new tandem leaf artifacts and findings, while the integration owner maintains the shared plan/log.
+This assignment does not expand the first pass into installs, contended hardware execution or new
+production interfaces. The same correctness, evidence and later integrated A/B gates apply.

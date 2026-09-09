@@ -95,6 +95,30 @@ reproducible. Preparation can proceed in parallel in the named leaf directories.
 | S4 / I05 | Do omitted QSA/GR/host boundaries dominate the promising GEMV/GDN results? Use real component fixtures in a representative dependency chain, including index selection, state updates and final-logit transfer | 2 days | I06 ranks missing kernels and transfer bottlenecks before authorizing full integration; label partial chain coverage, never synthetic TTFT |
 | S5 / I17a | Does a measured bounded working set plus the real artifact census leave a credible full-model memory path? Ingest WP5b facts; test one bounded selected-expert cache, without repeating the full transplant | 1 day after inputs exist | Continue full-model design, require explicit tiering work, or record infeasibility; prefix research can continue with a narrower claim |
 
+### S0 tandem-backend sub-spikes (2026-09-09)
+
+These refine S0/I05, keeping the six top-level spike IDs. **Terra owns this batch by explicit user
+request**, overriding the default Sol implementation assignment. Preparation is parallel-safe in
+`benchmarks/intel/tandem/`, `scripts/intel/tandem/` and
+`docs/INTEL_IGPU_TANDEM_SPIKE_FINDINGS.md`; the integration owner edits this plan. No engine/build-axis
+changes. Consult [backend/provider terminology](BACKEND_PROVIDER_DESIGN.md).
+
+| Sub-spike | Question / minimum comparison | Bound and prerequisites | Exit evidence / consumer |
+|---|---|---|---|
+| S0a native/library composition | Existing SYCL custom -> oneDNN -> custom versus direct Level Zero oneDNN interop; explicit-copy handoff control | 1 day preparation; up to 1 reserved day execution after compatible headers/library/build tuple exists | Exact pointer/context/queue/event/scratch ownership; two-size numerical check, error cleanup and setup/handoff costs. Unsupported dependency or interop is a recorded result. I06 chooses viable composition; I07/I11 consume it |
+| S0b portable-provider coverage | Portable SYCL custom kernels plus oneDNN versus Intel-only dependencies; identify a real second target and required vendor stack | 1 day audit; execution separately estimated after second hardware/OS tuple is identified | Per-operation/dtype/layout/IQ coverage, missing custom kernels, build/runtime restrictions and minimal second-target correctness recipe. Documentation/compile success alone does not qualify portability. I06 decides whether to fund a portable executor |
+| S0c provider A/B and integration cost | Same projection/short chain with custom-only, compatible library-only and mixed providers; compare sharing against explicit copies | 1 day harness preparation, then 1 reserved day initial trials after S0a correctness; reuse I05/I21 measurements | M=1 and M=32/128 plus tiny correctness; separate primitive/JIT/reorder/packing, scratch, submission, transfer and warm time. Report unsupported formats separately. I06/R3 decide whether mixed providers merit integration or separate executors need investigation |
+
+Prepared findings do not close execution gates. Preserve source encodings and numerical tolerances
+across comparisons; IQ-to-INT4 changes are a separately quality-gated S2 arm. Reuse existing probes,
+not a new backend registry. Freeze the same kernel/data where comparing runtimes and the same runtime
+where comparing providers, then cross interacting winners at integration. Hardware runs are serialized
+under I21; experimental dependency upgrades need an isolated reproducible environment.
+
+R0 consumes S0a feasibility and S0b coverage; R1 consumes S0c costs. R2 resolves names and consumed
+interfaces only after those findings; R3 repeats relevant A/B choices in complete inference. A new
+portable backend remains conditional on a concrete consumer and complete required-operation coverage.
+
 S0/S1 come before large native implementation commitments. S2/S3 supply I05; S4 is required before
 I06 claims coverage of the architecture's main bottlenecks. S5 starts as soon as its inputs exist and
 runs independently of prefix integration. A spike may close from already-recorded equivalent evidence;

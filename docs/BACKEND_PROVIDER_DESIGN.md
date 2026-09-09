@@ -83,6 +83,8 @@ features outside the initial one-device-session scope.
 
 ## Work-package decisions
 
+Concrete [S0a/S0b/S0c sub-spikes](INTEL_IGPU_WORK_PACKAGES.md#s0-tandem-backend-sub-spikes-2026-09-09) now cover composition, portable coverage and provider A/B costs. Terra owns the initial batch; source preparation and documented support remain distinct from execution qualification.
+
 S0 compares custom-kernel -> primitive -> custom-kernel handoffs with SYCL interop and experimental
 oneDNN Level Zero interop. Record pointer provenance, context ownership, event dependencies, scratch
 ownership, hidden allocations and packaging. Explicit-copy handoff is the control when sharing fails.
