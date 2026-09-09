@@ -1,8 +1,9 @@
 # Intel iGPU USM capability spike
 
-Date prepared: 2026-09-08; compile gate executed 2026-09-09. This is a runtime-unexecuted, standalone
-I19/S1 diagnostic. The ordinary and `SUB0_PROBE_PREPARED_COPY_API` variants both compiled and linked
-with DPC++ 2025.3.3. No probe binary or GPU/CPU measurement ran.
+Date prepared: 2026-09-08; compile and runtime gates executed 2026-09-09. The ordinary and
+`SUB0_PROBE_PREPARED_COPY_API` variants both compiled, linked and passed on Intel `0x7d67` through
+Level Zero with DPC++ 2025.3.3. See [the R0 checkpoint](INTEL_IGPU_R0_CHECKPOINT.md). Direct-ZE
+extension inventory remains unbuilt because development files were not supplied.
 
 ## Questions and evidence boundaries
 
@@ -59,5 +60,5 @@ Do not install or infer a header/library version merely to make the arm pass: mi
 files are a recorded unavailable build dependency.
 
 No timings, concurrency tests, memory-pressure tests, imported mappings, or production engine changes
-belong to this spike. Runtime results must be copied into a dated evidence record before any capability
-is promoted in the Intel plan.
+belong to this spike. The dated runtime evidence is archived under
+`docs/intel-groundwork/2026-09-09/runtime/`; broader memory capability remains gated.

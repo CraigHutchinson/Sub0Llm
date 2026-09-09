@@ -1,0 +1,16 @@
+device=Intel(R) Graphics
+backend=level_zero
+device_id=0x7d67
+driver=1.15.39183+3
+level_zero_inventory_built=0
+usm_host=1
+usm_shared=1
+usm_device=1
+usm_system=0
+usm_atomic_host=0
+usm_atomic_shared=0
+level_zero_extension_inventory=not_built_development_files_not_supplied
+prepared_copy_api_runtime=not_built
+prepared_copy_api_header=declared
+status=pass
+

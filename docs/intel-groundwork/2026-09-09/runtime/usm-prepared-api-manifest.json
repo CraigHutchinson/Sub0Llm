@@ -1,0 +1,50 @@
+{
+  "schema": "sub0.intel.usm-capabilities.v1",
+  "utc": "2026-09-09T22:28:26.7923944Z",
+  "repo": "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork",
+  "commit": "6cefe894e7c74b9bf8a894e7cbc60f72857d9dce",
+  "probe_changes": [],
+  "os": "Microsoft Windows 10.0.26220",
+  "compiler": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\icx-cl.exe",
+  "compiler_version": [
+    "Intel(R) oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319)",
+    "Target: x86_64-pc-windows-msvc",
+    "Thread model: posix",
+    "InstalledDir: C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\compiler"
+  ],
+  "vcvars": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat",
+  "arguments": [
+    "/nologo",
+    "/std:c++20",
+    "/EHsc",
+    "-fsycl",
+    "/Od",
+    "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\tools\\intel_probe\\usm_capabilities.cpp",
+    "/Fe:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\usm-capabilities\\20260909-222825-428\\usm-capabilities.exe",
+    "/Fo:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\usm-capabilities\\20260909-222825-428/",
+    "/DSUB0_PROBE_PREPARED_COPY_API"
+  ],
+  "source_sha256": "2593B98B178CA40CE7D175DE42070AFCFCDFB90B55EDF0ABB88A98D7D983D999",
+  "runtime_header_sha256": "742DFB29B82DD5DCF0F5BB4D68A098ECC3D155D680E687861A8E2F6F76A74BA9",
+  "runner_sha256": "57F9FBF654B9F249C92D5E4A5FF06EB3782F42EF8630A60DD6542AD91FD6D2BB",
+  "prepared_copy_api": true,
+  "level_zero_include": "",
+  "level_zero_library": "",
+  "level_zero_header": null,
+  "level_zero_header_sha256": null,
+  "level_zero_loader_import_library": null,
+  "level_zero_loader_import_library_sha256": null,
+  "level_zero_loader_runtime_identity": {
+    "status": "not_requested",
+    "path": null,
+    "file_version": null,
+    "capture": null,
+    "source": null,
+    "reason": null
+  },
+  "execution_requested": true,
+  "build_exit_code": 0,
+  "executable_sha256": "2B2225B75AE59943DEFB4AE22CCA31FBB9F6A797DE99B0368CB57CF210A1AF4E",
+  "probe_exit_code": 0
+}
+

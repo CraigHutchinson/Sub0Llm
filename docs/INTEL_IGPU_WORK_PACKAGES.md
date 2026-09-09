@@ -104,6 +104,10 @@ reproducible. Preparation can proceed in parallel in the named leaf directories.
 
 [Initial findings](INTEL_IGPU_TANDEM_SPIKE_FINDINGS.md): existing SYCL interop is measured; native ZE release-specific API/dependencies, second-target coverage and matched-chain timing remain open. Terra drafted the report; Codex reviewed it after Terra reached its usage limit. No new execution qualification.
 
+[R0 runtime update](INTEL_IGPU_R0_CHECKPOINT.md): USM capability, prepared-copy API and three-mode
+copy correctness now pass on the named Intel tuple. Direct ZE is classified unavailable on the current
+development tuple; prepared-copy performance remains inconclusive pending I21 controls.
+
 These refine S0/I05, keeping the six top-level spike IDs. **Terra owns this batch by explicit user
 request**, overriding the default Sol implementation assignment. Preparation is parallel-safe in
 `benchmarks/intel/tandem/`, `scripts/intel/tandem/` and

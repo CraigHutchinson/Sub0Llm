@@ -68,6 +68,12 @@ work-package gates control what may be claimed complete.
 
 ## Ordered execution
 
+Runtime status as of 2026-09-09: Phase 2 and the listed Phase 3 SYCL/USM controls passed and are
+archived in [the R0 checkpoint](INTEL_IGPU_R0_CHECKPOINT.md). The conditional direct-ZE inventory did
+not run because its development tuple is unavailable. Resume at the remaining Phase 1 records and
+R0-authorized I21/S1.5/S2 preparation; do not repeat runtime controls without a changed tuple or a
+specific reproducibility need.
+
 ### Phase 0 — make this groundwork PR reviewable
 
 - Rebase onto the intended target branch and resolve the expected `AGENTS.md` and

@@ -1,0 +1,68 @@
+{
+  "schema": "sub0.intel.prepared-copy-run.v1",
+  "purpose": "prepared-copy",
+  "utc": "2026-09-09T22:28:42.6028011Z",
+  "repo": "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork",
+  "commit": "6cefe894e7c74b9bf8a894e7cbc60f72857d9dce",
+  "probe_changes": [],
+  "os": "Microsoft Windows 10.0.26220",
+  "compiler": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\icx-cl.exe",
+  "compiler_version": [
+    "Intel(R) oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319)",
+    "Target: x86_64-pc-windows-msvc",
+    "Thread model: posix",
+    "InstalledDir: C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\compiler"
+  ],
+  "vcvars": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat",
+  "arguments": [
+    "/nologo",
+    "/std:c++20",
+    "/EHsc",
+    "-fsycl",
+    "/O2",
+    "/fp:precise",
+    "D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\benchmarks\\intel\\mechanisms\\prepared_copy.cpp",
+    "/Fe:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\prepared-copy\\20260909-222841-206\\prepared_copy.exe",
+    "/Fo:D:\\Craig\\GitHub\\Sub0Llm\\out\\worktrees\\intel-groundwork\\out\\intel-review\\prepared-copy\\20260909-222841-206/"
+  ],
+  "elements": [
+    257,
+    1048576
+  ],
+  "compile_only": false,
+  "source_sha256": "90A52D25218BB52FBCABBBC78DC8D08CF98261D493B1779DF0B99D2C09AD9F3D",
+  "runtime_header_sha256": "742DFB29B82DD5DCF0F5BB4D68A098ECC3D155D680E687861A8E2F6F76A74BA9",
+  "runner_sha256": "086701080E7CDF6A63A506C2F77DED8B6282BA2BAAB1E01F67EA1DEA1A3F1B15",
+  "power_configuration": [
+    "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)"
+  ],
+  "competing_processes": [],
+  "sycl_devices": [
+    "[level_zero:gpu] Intel(R) oneAPI Unified Runtime over Level-Zero, Intel(R) Graphics 12.70.4 [1.15.39183+3]"
+  ],
+  "build_exit_code": 0,
+  "executable_sha256": "0D749C8073C05757377BCA6872D149ECEC4D912681D96014040457004DCE8C3C",
+  "runs": [
+    {
+      "elements": 257,
+      "bytes": 1028,
+      "fixture_a_sha256": "16661CAED42FAF83AC1BBEC1E2722D6B00F60DB8EFA435A0BF1083F4BC4B9A3C",
+      "fixture_b_sha256": "D5F3B3194978E9E0C755A24B6ECC6B8F43B53DBFDC75D51426524684054C8DD6",
+      "exit_code": 0,
+      "prepared_status": "supported",
+      "sample_shape_valid": true,
+      "log": "prepared-copy-257.log"
+    },
+    {
+      "elements": 1048576,
+      "bytes": 4194304,
+      "fixture_a_sha256": "BB993863C069CDFAE09D410E00D99781073EB53CC765D9FAC45503C09E799820",
+      "fixture_b_sha256": "0092D9C6F880C77F84549859B84A4946146BAD310044035FAD80E1EC43D36DD7",
+      "exit_code": 0,
+      "prepared_status": "supported",
+      "sample_shape_valid": true,
+      "log": "prepared-copy-1048576.log"
+    }
+  ]
+}
+

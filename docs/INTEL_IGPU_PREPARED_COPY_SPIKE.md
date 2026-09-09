@@ -1,8 +1,8 @@
 # Prepared explicit-copy staging spike
 
-Date: 2026-09-08; compile gate executed 2026-09-09. This is a bounded benchmark design, not a measured
-result. The source compiles with DPC++ 2025.3.3; it has not executed. It does not select a production
-memory path or make a performance claim.
+Date: 2026-09-08; compile and bounded runtime gate executed 2026-09-09. All three modes passed
+element-wise correctness at both sizes. The fixed-order single-process samples are exploratory and do
+not select a production memory path. See [the R0 checkpoint](INTEL_IGPU_R0_CHECKPOINT.md).
 
 ## Question and sources
 
@@ -45,7 +45,7 @@ not independent process trials. These samples establish correctness and expose g
 they do not support a winner claim. Any comparative result must use the reserved-run process
 alternation and independent-trial controls referenced below.
 
-## Compile evidence and deferred runtime verification
+## Compile and runtime evidence
 
 The new compile-only runner path exited zero on 2026-09-09 without device enumeration, fixture
 generation or GPU execution. Source SHA-256 was
@@ -58,7 +58,8 @@ branch/base, toolchain, command and runner hashes are in the
 pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1 -CompileOnly
 ```
 
-In a reserved measurement window, run from this worktree:
+The reserved runtime command completed successfully and its raw manifests/logs are archived under
+`docs/intel-groundwork/2026-09-09/runtime/`:
 
 ```powershell
 pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1
@@ -66,6 +67,6 @@ pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1
 
 The runner captures the commit and dirty paths, compiler/device inventory, source/header/runner hashes,
 fixture hashes, compile arguments, power plan, competing process snapshot, raw logs, and exit codes.
-Review raw samples before any aggregate. Treat a supported/correct result as mechanism evidence only;
-apply the process alternation and independent-trial controls in
-[the performance contract](INTEL_IGPU_PERFORMANCE.md) before comparing or promoting a mode.
+The R0 report publishes exploratory medians and explicitly avoids promotion. Apply process alternation
+and independent-trial controls in [the performance contract](INTEL_IGPU_PERFORMANCE.md) before
+comparing or promoting a mode.
