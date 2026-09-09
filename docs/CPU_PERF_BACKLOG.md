@@ -39,7 +39,29 @@ both, and don't declare a "reviewed X for performance" pass complete on code-rea
 
 ## 2. Open items — checked, real, NOT yet fixed (start here)
 
-### 2a. `arena_alloc`'s unconditional grad-scratch zero-fill (backend_cpu.cpp)
+### 2a. `arena_alloc`'s unconditional grad-scratch zero-fill (backend_cpu.cpp) — **DONE (2026-09-09)**
+
+**Closed by a stronger fix than the one proposed below, and by a different route.** The memory audit that
+accounted for the real 48-layer decode run's ~41 GiB peak found that the buffer this item wanted to stop
+zero-filling should not exist at all in these builds: `Worker::act_grad` was sized `ACT_CAP`
+unconditionally, while `Worker::grad` (the per-PARAMETER accumulator, a different array) had had exactly
+this treatment since WP4d. `src/backends/cpu/internal.hpp` now derives `ACT_GRAD_FLOATS = FORWARD_ONLY ?
+1 : ACT_CAP` from the same three `USE_*` constants `backward_node`'s own refusals are written against, and
+`arena_alloc` hands out an EMPTY grad span in that build — mirroring what `mk_param` already did for a
+parameter leaf. So the `memset`-equivalent pass this item names is gone, and so is the 7.02 GiB (at the
+real Qwen4 axes) of arena it was writing into. No parameter threading was needed: the decision is a
+compile-time property of the build, not of the call site, which is why the "bool parameter or a separate
+`arena_alloc_fwd_only()`" plan below was not the shape the fix took.
+
+Measured, on the real 48-layer artifact: peak working set 40.98 → 33.96 GiB (−7.02, −17.1%), the WP5c
+determinism fixture reproducing all 30 ids and the full continuation byte-for-byte, and the neutral d196
+suites unchanged at 28,875,042/147 and 120,889/244 (baseline re-taken on the same tree by stashing the
+diff, not cited from an earlier session). The throughput effect is within noise (5.61 → 5.53 s/token), as
+B20's own disk-bound finding predicts — the value is that those 7 GiB are now available to the OS file
+cache the 37.11 GiB S0Q1 sidecar competes for: at a comparable point in the same run, the sidecar's
+resident share rose 4.81 → 7.63 GiB.
+
+The original entry follows, unedited, because its reasoning is still the record of how the cost was found.
 
 Found during the QSA performance review (2026-09-03), flagged but not fixed — cross-cutting, not specific
 to QSA. `arena_alloc` (the bump allocator over `Worker::act_data`/`act_grad`) always zero-fills BOTH the

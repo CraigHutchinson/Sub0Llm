@@ -136,14 +136,16 @@ thread_local QsaCache g_qsa_cache;   // only ever populated/consulted when USE_Q
 //
 // WHERE THE PER-THREAD STATE LIVES, AND WHY IT IS NOT A `Worker`. The obvious move -- let several
 // Workers join in, exactly as train_batch does -- is not available here, and the reason is a real
-// number rather than a preference: a Worker owns two ACT_CAP activation arenas, which at the real Qwen4
-// axes measure ~14 GiB (the gen tool's own [mem] line moves 18.36 -> 32.40 GiB the first time one is
-// touched). Ten of those is more memory than this machine has, to hold arenas that decode never uses at
-// all -- forward_one runs one row through stack buffers and allocates no arena slot and no node
-// (see internal.hpp's note on why arena_alloc/mk_node stayed private to backend.cpp).
+// number rather than a preference: a Worker owns an ACT_CAP activation arena, which at the real Qwen4
+// axes measures 7.02 GiB (the gen tool's own [mem] line moves 18.36 -> 25.39 GiB the first time one is
+// touched; before internal.hpp's ACT_GRAD_FLOATS elided the dead activation-GRADIENT arena beside it,
+// that step was 18.36 -> 32.41). Ten of those is more memory than this machine has, to hold an arena
+// that decode never uses at all -- forward_one runs one row through stack buffers and allocates no
+// arena slot and no node (see internal.hpp's note on why arena_alloc/mk_node stayed private to
+// backend.cpp).
 //
 // So a decode thread brings the small part instead: its own single-slot resolve pool (18.75 MiB) and
-// its own pair of expert_ffn_row accumulators. That is ~25 MiB per thread against a Worker's 14 GiB,
+// its own pair of expert_ffn_row accumulators. That is ~25 MiB per thread against a Worker's 7 GiB,
 // for state whose only requirement is "not shared while several resolves are live".
 //
 // The alternative considered and rejected: making the SHARED 8-slot pool safe under concurrent resolve.
