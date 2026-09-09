@@ -9,6 +9,8 @@ is normative for all measured packages.
 
 ## Groundwork branch checkpoint
 
+The [release watchlist](INTEL_IGPU_RELEASE_WATCHLIST.md) feeds I00/S0, S2/I18, S3/I20 and I19. Recheck stable/preview/experimental status at R0/R2/R4; future stabilization is not an assumption.
+
 On `research/intel-groundwork`, [initial results](INTEL_IGPU_GROUNDWORK_RESULTS.md) establish installed
 SDK/runtime visibility, two-size mapped staging and SYCL/oneDNN interoperability, plus ten dense
 projection shapes and a bounded three-mode USM benchmark. These are partial I00/S0/S1/I05/I19/I21
@@ -17,6 +19,8 @@ sustainable capacity remain open. The report and raw manifests take precedence o
 hardware/tooling statements for this exact runtime tuple; main engine qualification is unchanged.
 
 ## Scope and execution rules
+
+Follow the [spike execution and evidence policy](INTEL_IGPU_SPIKE_EXECUTION.md): Sol owns each implementation spike, Terra gathers research, and measured facts remain separate from hypotheses and integration choices.
 
 The deliverable is a measured decision and, only if justified, a useful Intel inference path with
 maintainable backend boundaries. Sub0Llm retains execution ownership. Intel-native kernel generation

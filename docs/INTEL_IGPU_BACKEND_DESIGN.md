@@ -8,6 +8,8 @@ merged as `296f2a1`. WP5a tokenizer and WP5b full-scale transplant remain indepe
 
 ## Recommendation
 
+The [2026-09-09 release watchlist](INTEL_IGPU_RELEASE_WATCHLIST.md) adds newer compiler/runtime and experimental-feature candidates. These require isolated qualification; earlier measured results retain their original tuple.
+
 Prioritize **Sub0Llm-owned execution using Intel-native kernels and runtime access**. Study SYCL/ESIMD
 kernel generation and direct Level Zero submission alongside SYCL submission of equivalent kernels.
 Select kernel math, memory placement and submission separately: a lower-level API alone does not
