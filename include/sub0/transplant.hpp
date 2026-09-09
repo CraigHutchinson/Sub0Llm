@@ -95,6 +95,7 @@
 
 #pragma once
 
+#include <algorithm>   // std::min -- the cache-blocked transposes' own partial-tile bound
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -363,14 +364,83 @@ inline std::string gguf_name(const char* pattern, int layer) {
 // --- the array operations -------------------------------------------------------------------------
 // Every one writes EXACTLY rows*cols floats into `dst` and reads only within the declared source
 // extent. They take raw pointers plus explicit extents rather than spans of computed size because
-// each is called once per destination tensor from a loop that already knows both -- and because the
-// fixture replay calls them directly with the fixture's own dims.
+// the fixture replay calls them directly with the fixture's own dims.
+//
+// THESE ARE NO LONGER "CALLED ONCE PER DESTINATION TENSOR" (the claim this comment used to make, true
+// only of the offline transplant tool). include/sub0/moe_quant.hpp's dequantize_expert calls
+// transpose_out_in once per SELECTED EXPERT per layer per token -- 480 calls per token at the real
+// Qwen4 axes -- so this is the engine's hottest decode path, not a one-shot import step. VTune measured
+// the naive form at 52.5% of all sampled CPU time in a live 48-layer decode run (docs/
+// INDEPENDENT_REVIEW_BACKLOG.md B20), more than the three format-specific dequantizers it calls put
+// together. Hence the blocking below.
+//
+// --- WHY BLOCKING, AND WHY IT CANNOT CHANGE A SINGLE BIT -------------------------------------------
+//
+// A transpose is a PERMUTATION: every destination element is a straight copy of exactly one source
+// element, with no arithmetic at all. So the visit order of the (o, i) pairs is free -- there is no
+// summation whose order could change, no rounding, nothing to reassociate. Blocking is therefore
+// bit-for-bit identical to the naive nested loop BY CONSTRUCTION, not "within tolerance": any test
+// here that needs a new tolerance after this change is reporting a real bug, not a cost of the change.
+//
+// What blocking buys: the naive form reads contiguously but writes with a stride of `out_f` floats
+// across a destination plane that is 6.25 MiB at the real axes (2560 x 640) -- far past any per-core
+// cache -- so nearly every write misses, and each miss drags in a 64-byte line to store 4 bytes of it.
+// Iterating a TILE at a time keeps both the source rows and the destination rows a tile touches inside
+// L1 for the whole tile, so each destination line is filled completely before it is evicted.
+//
+// LOOP ORDER AND TILE SIZE ARE MEASURED, NOT GUESSED. A standalone single-threaded benchmark over the
+// two REAL expert-plane shapes (640x2560 for gate/up, 2560x640 for down), three interleaved trials,
+// swept 8/16/32/64/128 in both tile orders -- contiguous-load/strided-store and strided-load/
+// contiguous-store. Two findings, both of which a single guessed number would have missed:
+//
+//   * CONTIGUOUS STORES WIN. Store-side misses cost a read-for-ownership as well as the eviction, so
+//     confining the STRIDED side to loads is worth more than confining it to stores.
+//   * THE TILE MUST STAY AT 16, and bigger is not "merely less good" -- it falls off a cliff, and only
+//     for one of the two shapes, which is exactly the kind of asymmetry a one-shape sweep would have
+//     read as noise. The cause is L1 set conflict, not capacity: this host (Arrow Lake-HX Core Ultra 9
+//     275HX -- 48 KiB 12-way L1d per P-core, 32 KiB 8-way per E-core, 64 sets either way) maps rows
+//     that are 2560 floats apart (10,240 B = 160 lines = 32 sets, and 2*32 == 64 sets) onto just TWO
+//     set positions, so every other row of the strided side collides. At B=16 each collision group is
+//     8 rows and fits the 12/8-way associativity; at B=32 it is 16 and does not. Measured on the
+//     `down` shape: 4.4-7.0x at B=16, but only 1.3-1.8x at B=32 -- WORSE than the wrong loop order.
+//
+// Measured speedup over the naive loop at B=16, three trials, both shapes: 4.1-4.8x (gate/up) and
+// 5.2-7.0x (down). Every one of the ~60 benchmark configurations produced a BIT-IDENTICAL result
+// plane, which is the permutation argument above confirmed empirically rather than merely asserted.
+inline constexpr int TRANSPOSE_TILE = 16;
+
+// The one blocked transpose every operation below is expressed in terms of, so the blocking is written
+// (and therefore got right, and tuned) exactly once. Writes `src[o*in_f + i]` to
+// `dst[i*dst_stride + dst_col0 + o]` for every o in [0, out_f) and i in [0, in_f).
+//
+// `dst_stride`/`dst_col0` exist because two of the three callers below write a SLICE of a wider
+// destination row (a per-head column block, or one half of a concatenation) rather than the whole row.
+// Passing the destination geometry in is what lets them share this body instead of each re-deriving a
+// blocked loop nest -- three copies of which is exactly how a locality fix acquires an indexing bug.
+//
+// The tile loops are ordered so the INNERMOST loop walks `dst` contiguously (see TRANSPOSE_TILE's own
+// comment for why that beats the other order by measurement). Partial tiles at the far edge are handled
+// by the std::min bounds, not by a separate remainder path -- the small shapes the unit tests use
+// (3x4, 2 heads x 3) are ENTIRELY one partial tile, so that path is the one the tests exercise most.
+inline void transpose_block(const float* src, int out_f, int in_f, float* dst, int dst_stride,
+                            int dst_col0) {
+    constexpr int B = TRANSPOSE_TILE;
+    for (int ii = 0; ii < in_f; ii += B) {
+        const int i_end = std::min(ii + B, in_f);
+        for (int oo = 0; oo < out_f; oo += B) {
+            const int o_end = std::min(oo + B, out_f);
+            for (int i = ii; i < i_end; ++i) {
+                float* d = dst + static_cast<std::size_t>(i) * dst_stride + dst_col0;
+                for (int o = oo; o < o_end; ++o)
+                    d[o] = src[static_cast<std::size_t>(o) * in_f + i];
+            }
+        }
+    }
+}
 
 // [out_f, in_f] row-major -> [in_f, out_f] row-major.
 inline void transpose_out_in(const float* src, int out_f, int in_f, float* dst) {
-    for (int o = 0; o < out_f; ++o)
-        for (int i = 0; i < in_f; ++i)
-            dst[static_cast<std::size_t>(i) * out_f + o] = src[static_cast<std::size_t>(o) * in_f + i];
+    transpose_block(src, out_f, in_f, dst, /*dst_stride=*/out_f, /*dst_col0=*/0);
 }
 
 // QSA q_proj. `src` is [n_heads * 2 * head_dim, in_f] row-major. Head h's output rows are
@@ -381,17 +451,19 @@ inline void transpose_out_in(const float* src, int out_f, int in_f, float* dst) 
 // The failure this exists to prevent: taking rows [0, n_heads*hd) as the query. That is correct for
 // head 0 and wrong for every other head, and produces output of exactly the right shape and a
 // plausible magnitude (docs/QSA.md S2b.4).
+//
+// Head h's `half` occupies head_dim CONSECUTIVE source rows starting at h*2*head_dim + half*head_dim,
+// and head_dim CONSECUTIVE destination columns starting at h*head_dim -- so each head is exactly one
+// transpose_block over a sub-plane of the source, and the per-head loop is the only thing left here.
 inline void per_head_half_transpose(const float* src, int n_heads, int head_dim, int in_f, int half,
                                      float* dst) {
     const int out_f = n_heads * head_dim;
-    for (int h = 0; h < n_heads; ++h)
-        for (int d = 0; d < head_dim; ++d) {
-            const std::size_t src_row =
-                static_cast<std::size_t>(h) * 2 * head_dim + static_cast<std::size_t>(half) * head_dim + d;
-            const int out_col = h * head_dim + d;
-            for (int i = 0; i < in_f; ++i)
-                dst[static_cast<std::size_t>(i) * out_f + out_col] = src[src_row * in_f + i];
-        }
+    for (int h = 0; h < n_heads; ++h) {
+        const std::size_t src_row0 =
+            static_cast<std::size_t>(h) * 2 * head_dim + static_cast<std::size_t>(half) * head_dim;
+        transpose_block(src + src_row0 * in_f, head_dim, in_f, dst, /*dst_stride=*/out_f,
+                        /*dst_col0=*/h * head_dim);
+    }
 }
 
 // Two [out, in] sources joined along the OUTPUT axis in the order (a, then b), transposed into
@@ -399,12 +471,8 @@ inline void per_head_half_transpose(const float* src, int n_heads, int head_dim,
 inline void concat_out_transpose(const float* a, int out_a, const float* b, int out_b, int in_f,
                                   float* dst) {
     const int out_f = out_a + out_b;
-    for (int o = 0; o < out_a; ++o)
-        for (int i = 0; i < in_f; ++i)
-            dst[static_cast<std::size_t>(i) * out_f + o] = a[static_cast<std::size_t>(o) * in_f + i];
-    for (int o = 0; o < out_b; ++o)
-        for (int i = 0; i < in_f; ++i)
-            dst[static_cast<std::size_t>(i) * out_f + out_a + o] = b[static_cast<std::size_t>(o) * in_f + i];
+    transpose_block(a, out_a, in_f, dst, /*dst_stride=*/out_f, /*dst_col0=*/0);
+    transpose_block(b, out_b, in_f, dst, /*dst_stride=*/out_f, /*dst_col0=*/out_a);
 }
 
 // --- per-tensor statistics (docs/WP4_SCOPE.md S4c level 2) ----------------------------------------
