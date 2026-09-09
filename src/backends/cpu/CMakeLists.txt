@@ -10,6 +10,12 @@
 # and this line are a pair, and moving one means moving the other. (Found and fixed independently,
 # the same way, in two concurrent sessions -- WP5b's own 48-layer build and a separate build-break
 # investigation; this comment is the survivor.)
+#
+# backend.cpp and decode.cpp are ONE backend split across two translation units, sharing the
+# process/thread state declared in the backend-private internal.hpp (arenas, the Worker pool,
+# `Model`). Both must be in this list: dropping decode.cpp does not disable decode, it fails to
+# link every kv_*/forward_one entry point in core.hpp.
 set(SUB0_BACKEND_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/backend.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/decode.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/api.cpp")
