@@ -115,6 +115,39 @@ new code with its own correctness surface). **Do not attempt this opportunistica
 deliberately (own design doc, own fixture-gated correctness pass) if and when the forward-pass throughput
 at real Qwen4 scale (WP4) makes it the priority, rather than folding it into an unrelated task.
 
+### 2d. `gguf::dequantize_iq2_xxs` decodes ~6x slower per element than its two neighbours
+
+Found 2026-09-09 by `benchmarks/moe_expert_bench.cpp` (see `docs/WP4_SCOPE.md` §6 "WP6b" for the full
+table and method). Isolated on real encoded planes from the real 48-layer sidecar, per expert's worth of
+elements (3 x 1,638,400):
+
+| decoder | ms / expert | Melem/s |
+|---|---:|---:|
+| `dequantize_iq1_s` | 2.21 | ~2,200 |
+| `dequantize_iq4_nl` | 2.39 | ~2,000 |
+| **`dequantize_iq2_xxs`** | **13.73** | **~360** |
+
+This is not a corner case: **14,336 of this file's 73,728 routed-expert planes are IQ2_XXS**, and an
+IQ2_XXS-heavy expert costs more to *unpack* than every other stage of its resolve put together (page-in +
+transpose + FFN ≈ 5.8 ms). It had never been visible before because every previous measurement reported
+the three decoders as one combined figure (B20's own VTune report: "22.7% combined").
+
+**Not investigated further here, deliberately** — this pass was measurement plus one specific memory fix,
+and a decoder rewrite is new numerical code with its own correctness surface (the same reasoning 2c
+applies to `qsa::linear_row`). But the obvious first hypothesis, "IQ2_XXS is just a more complicated
+format", does **not** survive reading the two functions side by side, and whoever picks this up should
+start from that rather than re-deriving it: `dequantize_iq1_s` and `dequantize_iq2_xxs`
+(`include/sub0/gguf.hpp`) have the *same* shape — a 64-bit grid word looked up per 8-element group, then
+eight `(grid >> 8j) & 0xFF` extractions. The only structural difference in the inner loop is that
+IQ2_XXS additionally reads `KMASK_IQ2XS[j]` **per element** and selects a sign from it, where IQ1_S
+folds its whole per-group correction into two loop-invariant scalars (`dl`, `delta`). `KMASK_IQ2XS[j]` is
+a function of the loop index alone, so it is loop-invariant in the only sense that matters — and the
+`for (int j = 0; j < 8 && w < n; ++j, ++w)` guard shared by both decoders is what stops the compiler
+unrolling that away. A cheap first experiment is therefore to hoist the tail bound out of the inner
+condition (the block is whole except possibly the last) and let `j` become a fixed-count unrollable loop,
+before contemplating intrinsics. Gate any change on `tests/gguf_tests.cpp` plus the existing bit-for-bit
+`--verify` against the real 48-layer artifact, which is what makes a rewrite checkable at all.
+
 ## 3. Methodology — how to reproduce or extend this profiling
 
 Two complementary techniques, use both, not either:

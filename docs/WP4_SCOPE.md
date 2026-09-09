@@ -1957,6 +1957,83 @@ gap for free.
   both arms because a `--vocab-exact` build emits no `tokenizer.tok` and `default_tokenizer()` is empty;
   pre-existing, unrelated, reported below.)
 
+### WP6b — one expert, decomposed: `benchmarks/moe_expert_bench.cpp`. EXECUTED
+
+**Why a new binary rather than another whole-run measurement.** Every performance figure this document
+records for the 48-layer decode path is end-to-end — a 30-token run, or a 60 s VTune window — and each
+conflates four costs that respond to completely different fixes: faulting an expert's encoded bytes in,
+unpacking them, transposing the result, and the FFN itself. WP4e's own addendum left a question open
+("is a Sub0Llm-native re-encode of the sidecar worth it?") that is *entirely* about the ratio between the
+first two and the last, and no end-to-end number can supply that ratio. `sub0_moe_expert_bench` is a
+standalone target under `SUB0_BUILD_BENCHMARKS` linked against nothing at all (`gguf.hpp`,
+`transplant.hpp`, `moe_quant.hpp`, `moe_math.hpp` are header-only; every dimension comes from the real
+sidecar's own `S0Q1` header at runtime, so no generated `sub0_config.hpp` is involved). It is a plain
+`main()`, not Catch2 like its two neighbours in `benchmarks/`, for one specific reason: Catch2's benchmark
+support warms up before sampling, which destroys the only thing arm 1 exists to measure.
+
+**Method notes that bound what the numbers mean.** The cold arms run first, over `(layer, expert)` pairs
+from a fixed-seed shuffle kept disjoint from every warm arm's pairs; the resolve pool is one slot, exactly
+decode's own (`MOE_DECODE_SLOTS`), and the report prints its hit count so "0 pool hits" is checkable
+rather than assumed. What the binary cannot do without administrative rights is evict the OS standby list,
+so a page an earlier run left cached faults soft rather than hard — hence every arm reports achieved
+throughput, which is the discriminator.
+
+**Results — mean per expert (all three planes), four runs at seeds 1234/7001/7002/7003, `--reps 5`,
+24 experts per arm per run.** The three cold columns are four *independent* cold samples (a fresh seed
+draws experts the previous run never touched), not four reads of the same pages.
+
+| arm | mean ms / expert | spread across the 4 runs | throughput |
+|---|---:|---|---|
+| 1 cold read — encoded bytes only | **2.98** | 2.63 – 3.35 | 460–610 MB/s over 1.52–1.56 MiB/expert |
+| 2 dequant **IQ1_S** (x3 planes) | **2.21** | 2.12 – 2.36 | ~2.2 Gelem/s |
+| 2 dequant **IQ4_NL** (x3 planes) | **2.39** | 2.29 – 2.55 | ~2.0 Gelem/s |
+| 2 dequant **IQ2_XXS** (x3 planes) | **13.73** | 13.14 – 14.54 | **~0.36 Gelem/s** |
+| 3 transpose 640x2560 (x3 planes) | **1.53** | 1.48 – 1.60 | ~12.9 GB/s of f32 |
+| 3 transpose 2560x640 (x3 planes) | **1.59** | 1.52 – 1.75 | ~12.4 GB/s of f32 |
+| 4 `moe::expert_ffn_row` | **0.50** | 0.46 – 0.55 | 11.9–14.1 GFLOP/s |
+| 5a full pipeline, **COLD** | **10.58** | 9.55 – 12.34 | resolve + FFN, one pass |
+| 5b full pipeline, **WARM** | **6.80** | 5.90 – 7.49 | 120 timings/run, 0 pool hits |
+
+**The split, as shares of a cold single-expert resolve** (means of the four runs; the dequant row is
+weighted by the format mix of the experts each run happened to draw, which is why 5b moves with it):
+
+| | ms | share |
+|---|---:|---:|
+| page-in (cold − warm) | 3.78 | **35.7%** |
+| dequantize, 3 planes | 4.25 | **40.2%** |
+| transpose, 3 planes | 1.56 | 14.7% |
+| `expert_ffn_row` | 0.50 | **4.7%** |
+| cold pipeline, measured | 10.58 | 100% |
+
+**Three findings, in order of how much they should change a decision:**
+
+1. **The arithmetic the model actually wants is 4.7% of the work.** Everything else is getting the
+   weights into a form this engine can multiply by. That is the answer to WP4e's open question: a
+   Sub0Llm-native re-encode is not a micro-optimization here, it is aimed at 40% of the cost directly and
+   another 15% (the transpose exists only because the source layout is GGUF's).
+2. **`IQ2_XXS` decodes ~6x slower per element than `IQ1_S` or `IQ4_NL`** — 13.7 ms per expert against
+   2.2/2.4, i.e. one IQ2_XXS-heavy expert costs more to *unpack* than the entire rest of the pipeline
+   for an IQ1_S one. 14,336 of this file's 73,728 planes are IQ2_XXS, so this is not a corner case. It is
+   also the first per-format decoder number this project has ever had; every previous figure lumped all
+   three together.
+3. **The single-expert number explains the whole-run number, and in doing so sharpens B20's finding.**
+   480 resolves/token x 10.58 ms = **5.08 s/token** against a measured **5.53 s/token** — i.e. the real
+   48-layer decode behaves almost exactly as if its ten threads were one. Even the pure-CPU *warm* arms
+   (6.80 ms) come to 3.26 s/token if run serially, which is already most of the measured wall clock. So
+   the ~2% that B20's parallelization bought is not a mystery to be re-investigated as a scheduling bug:
+   at 10 threads each streaming ~13 GB/s through a transpose while the disk supplies 460–610 MB/s of
+   fresh pages, the per-expert work does not scale, and the isolated numbers say so directly.
+
+**Reproducing it:**
+
+```
+cmake --build <build> --target sub0_moe_expert_bench
+<build>/benchmarks/sub0_moe_expert_bench --sidecar D:/ModelWeights/.../qwen4_full48_q.bin.moeq --seed 7001
+```
+
+Use a **fresh seed** for any run whose cold arms are meant to be cold; the warm arms are seed-independent
+in expectation and reproduce to within the spread above on any of them.
+
 ---
 
 ## 7. Open questions — the author's own scoping assumptions, for the user to settle
