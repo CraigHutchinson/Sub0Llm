@@ -179,14 +179,10 @@ constexpr bool FORWARD_ONLY = USE_GATED_RESIDUAL || USE_MOE || USE_QSA;
 // Worker's array can be conditionally sized like this; the shared three are heap handles that simply
 // stay null, and every accessor that would hand one out refuses loudly instead (see grad_ptr below).
 constexpr size_t WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS;
-// Defined in backend.cpp -- ONE set of arenas for the whole process, shared by both CPU-backend
-// translation units. That single ownership is the reason these are declared here rather than
-// duplicated: a second definition would be a second arena, not a second view of the same one.
-extern std::unique_ptr<float[]> g_param_data;
-extern std::unique_ptr<float[]> g_param_grad;
-extern std::unique_ptr<float[]> g_param_m;
-extern std::unique_ptr<float[]> g_param_vel;
-void ensure_shared_params();
+// The four arenas themselves (g_param_data/grad/m/vel) and ensure_shared_params() are NOT declared
+// here: only backend.cpp touches them, through mk_param and the params_ptr()/AdamW accessors, so they
+// stay `static` there. decode.cpp reaches the weights the way every consumer does -- through the
+// parameter Nodes `Model::build_layout` already laid out -- and never names an arena.
 
 // --- WP4e: the quantized-resident routed experts, and the pool they are resolved through ----------
 //
@@ -252,55 +248,13 @@ extern std::array<std::unique_ptr<Worker>, MAX_WORKERS> g_workers;
 // so each thread builds its g_model exactly once even if OpenMP reuses slots).
 extern thread_local Worker* W;
 
-inline std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
-    if (W->act_used + n > ACT_CAP) {
-        std::println(stderr, "fatal: activation arena overflow (need {}, cap {})",
-                     W->act_used + n, ACT_CAP);
-        std::abort();
-    }
-    size_t off = W->act_used;
-    W->act_used += n;
-    std::span<float> d(W->act_data.data() + off, n);
-    std::span<float> gr(W->act_grad.data() + off, n);
-    std::fill(d.begin(), d.end(), 0.f);
-    std::fill(gr.begin(), gr.end(), 0.f);
-    return {d, gr};
-}
-
-inline Node* mk_param(int r, int c, bool decay) {
-    size_t n = (size_t)r * c, off = W->pused;
-    W->pused += n;
-    Node& nd = W->param_nodes[W->pcount];
-    nd = Node{};
-    nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
-    nd.data = std::span<float>(g_param_data.get() + off, n);    // shared weights
-    // FORWARD_ONLY: no per-thread gradient accumulator exists, so a parameter leaf carries an EMPTY
-    // grad span rather than a span into a buffer that was never allocated. Nothing in the forward path
-    // reads a parameter's grad, and the backward path aborts before it could.
-    if constexpr (FORWARD_ONLY) nd.grad = std::span<float>{};
-    else nd.grad = std::span<float>(W->grad.data() + off, n);   // this thread's grad accumulator
-    W->views[W->pcount] = {off, n, decay};
-    ++W->pcount;
-    return &nd;
-}
-
-inline Node* mk_node(Op op, int r, int c) {
-    if (W->pool_used >= MAX_NODES) { std::println(stderr, "fatal: node pool overflow"); std::abort(); }
-    Node& nd = W->pool[W->pool_used++];
-    nd = Node{};
-    nd.op = op; nd.rows = r; nd.cols = c;
-    auto [d, gr] = arena_alloc((size_t)r * c);
-    nd.data = d; nd.grad = gr;
-    return &nd;
-}
-
-// 2D row-major view over a Node's flat [rows x cols] span (data or grad). Replaces
-// hand-rolled i*cols+j indexing in the scalar/scatter paths; the hot vectorized
-// kernels keep their __restrict row pointers.
-using Mat = std::mdspan<float, std::dextents<std::size_t, 2>>;
-inline Mat mat(std::span<float> s, int rows, int cols) {
-    return Mat(s.data(), static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
-}
+// The arena/graph-construction helpers that WRITE a Worker -- arena_alloc, mk_param, mk_node and the
+// `Mat`/`mat` view over a Node -- are NOT here. They belong to the Node-graph path alone (the ops,
+// backward, and Model::build_layout, all in backend.cpp), and decode.cpp allocates nothing: forward_one
+// runs one row through stack buffers and never touches the activation arena or the node pool. So they
+// stay `static` in backend.cpp, where the only thing that can grow a Worker is also the only thing that
+// can see how. What DOES cross the file boundary is the Worker itself, above -- because both TUs
+// dereference `W`, decode.cpp for its per-thread expert-resolve pool.
 
 // ============================================================================
 //  Fast transcendental math (vectorizable), selected at compile time

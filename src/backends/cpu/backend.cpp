@@ -87,18 +87,29 @@ static inline int omp_get_max_threads() { return 1; }
 namespace sub0 {
 
 // ============================================================================
-//  Static storage -- the definitions behind internal.hpp's declarations
+//  Static storage
 // ============================================================================
-// Every object below is declared in internal.hpp and defined HERE, once, so both CPU-backend
-// translation units address the same instance. See that header for the reasoning attached to
-// each one; only the definitions live here.
+// Two kinds of thing live here. The `extern`-declared ones (g_moe_quant, g_workers, W, the three
+// binding tables, g_qsa_rope, g_model) are declared in internal.hpp and defined HERE, once, so both
+// CPU-backend translation units address the same instance -- see that header for the reasoning
+// attached to each. Everything else on this page is `static` because only this TU needs it: the
+// parameter arenas and the helpers that write a Worker (arena_alloc/mk_param/mk_node, and the `Mat`
+// view) belong to the Node-graph path alone. decode.cpp allocates nothing.
 
-std::unique_ptr<float[]> g_param_data;
-std::unique_ptr<float[]> g_param_grad;
-std::unique_ptr<float[]> g_param_m;
-std::unique_ptr<float[]> g_param_vel;
-static std::once_flag    g_shared_params_once;   // the guard is private to this TU; the arenas are not
-void ensure_shared_params() {
+// Shared across all worker threads: the weights (read-only during fwd/bwd), the optimizer moments
+// (touched only by AdamW::step on the main thread), and the REDUCED gradient that AdamW::step consumes.
+// HEAP-allocated (not static std::array): at a large config these are 4*PARAM_FLOATS floats -- e.g.
+// d768 ~= 2.6 GB -- and as zero-init BSS they push the DLL's SizeOfImage past what the Windows loader
+// will map, so the image fails to load with STATUS_INVALID_IMAGE_FORMAT (0xC000007B). This is the same
+// reason internal.hpp's per-thread Worker arrays are heap-allocated. ensure_shared_params() allocates
+// them once (zeroed) before any parameter node references them; unique_ptr<float[]> keeps [] and .get().
+// See internal.hpp's FORWARD_ONLY for why a build that cannot train allocates only the first of them.
+static std::unique_ptr<float[]> g_param_data;
+static std::unique_ptr<float[]> g_param_grad;
+static std::unique_ptr<float[]> g_param_m;
+static std::unique_ptr<float[]> g_param_vel;
+static std::once_flag           g_shared_params_once;
+static void ensure_shared_params() {
     std::call_once(g_shared_params_once, [] {
         g_param_data = std::make_unique<float[]>(PARAM_FLOATS);   // value-initialized -> zeroed
         if constexpr (!FORWARD_ONLY) {
@@ -134,6 +145,61 @@ thread_local const PersistentBindings* g_persistent_binds = nullptr;
 thread_local const SentinelBindings* g_sentinel_binds = nullptr;
 thread_local int   g_scratch_reinject_stride = 0;
 thread_local float g_scratch_reinject_scale  = 1.0f;
+
+// The Worker-writing helpers. `static`, and deliberately so: the activation arena and the node pool
+// are the Node-graph path's own storage, and the Node-graph path is entirely in this file. forward_one
+// (decode.cpp) runs one row through stack buffers and allocates nothing, so it has no business naming
+// any of these -- keeping them private is what makes "decode allocates nothing" checkable by grep
+// rather than by reading it.
+static std::pair<std::span<float>, std::span<float>> arena_alloc(size_t n) {
+    if (W->act_used + n > ACT_CAP) {
+        std::println(stderr, "fatal: activation arena overflow (need {}, cap {})",
+                     W->act_used + n, ACT_CAP);
+        std::abort();
+    }
+    size_t off = W->act_used;
+    W->act_used += n;
+    std::span<float> d(W->act_data.data() + off, n);
+    std::span<float> gr(W->act_grad.data() + off, n);
+    std::fill(d.begin(), d.end(), 0.f);
+    std::fill(gr.begin(), gr.end(), 0.f);
+    return {d, gr};
+}
+
+static Node* mk_param(int r, int c, bool decay) {
+    size_t n = (size_t)r * c, off = W->pused;
+    W->pused += n;
+    Node& nd = W->param_nodes[W->pcount];
+    nd = Node{};
+    nd.op = Op::Leaf; nd.rows = r; nd.cols = c;
+    nd.data = std::span<float>(g_param_data.get() + off, n);    // shared weights
+    // FORWARD_ONLY: no per-thread gradient accumulator exists, so a parameter leaf carries an EMPTY
+    // grad span rather than a span into a buffer that was never allocated. Nothing in the forward path
+    // reads a parameter's grad, and the backward path aborts before it could.
+    if constexpr (FORWARD_ONLY) nd.grad = std::span<float>{};
+    else nd.grad = std::span<float>(W->grad.data() + off, n);   // this thread's grad accumulator
+    W->views[W->pcount] = {off, n, decay};
+    ++W->pcount;
+    return &nd;
+}
+
+static Node* mk_node(Op op, int r, int c) {
+    if (W->pool_used >= MAX_NODES) { std::println(stderr, "fatal: node pool overflow"); std::abort(); }
+    Node& nd = W->pool[W->pool_used++];
+    nd = Node{};
+    nd.op = op; nd.rows = r; nd.cols = c;
+    auto [d, gr] = arena_alloc((size_t)r * c);
+    nd.data = d; nd.grad = gr;
+    return &nd;
+}
+
+// 2D row-major view over a Node's flat [rows x cols] span (data or grad). Replaces
+// hand-rolled i*cols+j indexing in the scalar/scatter paths; the hot vectorized
+// kernels keep their __restrict row pointers.
+using Mat = std::mdspan<float, std::dextents<std::size_t, 2>>;
+static inline Mat mat(std::span<float> s, int rows, int cols) {
+    return Mat(s.data(), static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
+}
 
 // When a model was loaded with weights already in their final (ternary) form,
 // the linear op must not re-quantize them (absmean re-quantization is not
