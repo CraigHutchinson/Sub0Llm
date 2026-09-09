@@ -18,6 +18,8 @@
 //   sub0-configure --corpus <path> -o <generated_config.hpp>
 //                  [--dmodel N --layers N --heads N --seq N --ternary 0|1]
 //                  [--vocab N --min-merge N]
+//   sub0-configure --vocab-exact N --dmodel N --layers N --heads N --seq N
+//                  -o <generated_config.hpp>
 
 #include <algorithm>
 #include <array>
@@ -588,6 +590,7 @@ int main(int argc, char** argv) {
 
     std::string corpus;
     std::string out = sub0::build_facts::GEN_HEADER;   // default: the build's generated umbrella header
+    int vocab_exact  = 0;       // externally defined vocabulary; skips corpus scan/learn/tokenize
     int d_model      = 0;       // 0 = auto-size from corpus scale (autosize_dims); any nonzero pins it
     int n_layers     = 0;
     int n_heads      = 0;
@@ -688,8 +691,8 @@ int main(int argc, char** argv) {
     int cuda_tf32   = 0;   // bake TF32 tensor-core GEMM math on the GPU backend (tuned knob)
     std::string dump_vocab; // prefix for the readable vocabulary-analysis dumps (empty = off)
 
-    app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation)")
-       ->required()->check(CLI::ExistingFile);
+    app.add_option("--corpus", corpus,  "Training corpus path (drives vocabulary derivation; required unless --vocab-exact is used)")
+       ->check(CLI::ExistingFile);
     app.add_option("-o",       out,     "Output generated umbrella header path (default: the build's generated dir)")
        ->capture_default_str();
     app.add_option("--dmodel", d_model, "Embedding / residual width (0 = auto-size from corpus)")->capture_default_str();
@@ -849,6 +852,10 @@ int main(int argc, char** argv) {
                    "Write readable vocabulary-analysis dumps to <prefix>.{corpus_vocab,token_vocab,ngrams}.txt and exit");
     app.add_option("--vocab",  vocab_target, "Target vocabulary size (base + markers + word pieces; 0 = auto from corpus)")
        ->capture_default_str();
+    app.add_option("--vocab-exact", vocab_exact,
+                   "Use an externally defined vocabulary of exactly N tokens; skips corpus learning and "
+                   "requires explicit core dimensions")
+       ->check(CLI::Range(1, 1'000'000));
     app.add_option("--size-scale", size_scale,
                    "Multiplier on the auto-sizer's target-parameter budget: <1 = a smaller/faster/safer "
                    "starting point, >1 = more generous. Only affects auto-sized dims (--dmodel etc. or a "
@@ -882,6 +889,31 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    const bool exact_vocab = vocab_exact > 0;
+    if (corpus.empty() != exact_vocab) {
+        std::println(stderr, "configure error: provide --corpus for corpus-derived vocabulary, or provide "
+                             "--vocab-exact N without --corpus");
+        return 2;
+    }
+    if (exact_vocab) {
+        if (d_model <= 0 || n_layers <= 0 || n_heads <= 0 || seq_len <= 0) {
+            std::println(stderr, "configure error: --vocab-exact requires explicit --dmodel, --layers, "
+                                 "--heads, and --seq dimensions");
+            return 2;
+        }
+        if (vocab_target != 0 && vocab_target != vocab_exact) {
+            std::println(stderr, "configure error: --vocab ({}) conflicts with --vocab-exact ({})",
+                         vocab_target, vocab_exact);
+            return 2;
+        }
+        vocab_target = vocab_exact;
+        emit_tok = 0;
+        if (!dump_vocab.empty()) {
+            std::println(stderr, "configure error: --dump-vocab requires --corpus and cannot be used with --vocab-exact");
+            return 2;
+        }
+    }
+
     // The configurator DECIDES whether to USE CUDA: default the compute backend to GPU when the CUDA
     // device backend was built (has_cuda, from CMake's existence check), else CPU. An explicit
     // --compute overrides (e.g. CPU on a GPU build). CMake checks existence; the configurator picks.
@@ -906,8 +938,8 @@ int main(int argc, char** argv) {
     // pinned size PERSISTS across re-runs (a build-time auto-regen keeps it). Seed the sidecar if
     // absent so it is there to edit. The corpus file exists (required + ExistingFile).
     std::error_code corpus_size_ec;
-    const std::uintmax_t corpus_bytes = std::filesystem::file_size(corpus, corpus_size_ec);
-    {
+    const std::uintmax_t corpus_bytes = exact_vocab ? 0 : std::filesystem::file_size(corpus, corpus_size_ec);
+    if (!exact_vocab) {
         const std::string sidecar = corpus + ".model";
         sub0::config::ModelDims dims{d_model, n_layers, n_heads, seq_len, vocab_target};   // CLI (0 = auto)
         bool have_sidecar = false;
@@ -930,12 +962,15 @@ int main(int argc, char** argv) {
         std::println(stderr, "model dims: corpus {:.0f} MB -> d={} L={} H={} seq={} vocab={} ({}; CLI pins)",
                      (corpus_size_ec ? 0.0 : static_cast<double>(corpus_bytes) / 1e6), d_model, n_layers, n_heads, seq_len, vocab_target,
                      have_sidecar ? "from " + std::filesystem::path(sidecar).filename().string() : "auto-sized + seeded sidecar");
+    } else {
+        std::println(stderr, "model dims: exact external vocabulary {} -> d={} L={} H={} seq={} (explicit axes)",
+                     vocab_exact, d_model, n_layers, n_heads, seq_len);
     }
 
     // --corpus-pretok AUTO (2): resolve by corpus size vs half of physical RAM, mirroring the old
     // CMake-level heuristic (now removed -- the corpus path used to have to be a CMake cache variable
     // for this decision to see it; the tool has --corpus directly, so the decision belongs here).
-    if (emit_tok == 2) {
+    if (!exact_vocab && emit_tok == 2) {
         const std::uintmax_t ram_bytes = total_physical_ram_bytes();
         const bool pretok = sub0::config::should_pretokenize(corpus_size_ec ? 0 : corpus_bytes, ram_bytes);
         std::println(stderr, "corpus.tok: --corpus-pretok=AUTO -> {} (corpus {:.0f} MB est-tok {:.0f} MB vs {:.0f} MB half-RAM)",
@@ -1157,7 +1192,7 @@ int main(int argc, char** argv) {
     // does not pass the flag emits the identical D_FF it always did.
     const int d_ff = d_ff_pin > 0 ? d_ff_pin : sub0::config::d_ff_for(d_model, gated_ffn != 0);
 
-    const std::string abspath = std::filesystem::absolute(corpus).string();
+    const std::string abspath = exact_vocab ? std::string{} : std::filesystem::absolute(corpus).string();
 
     const std::filesystem::path gen_dir        = std::filesystem::path(out).parent_path();
     const std::filesystem::path tok_path       = gen_dir / "corpus.tok";
@@ -1174,7 +1209,19 @@ int main(int argc, char** argv) {
     // regardless of what is already on disk.
     // ----------------------------------------------------------------------
     tok::Tokenizer tkz;
-    bool reused = false;
+    bool reused = exact_vocab;
+    if (exact_vocab) {
+        // The external tokenizer owns the real vocabulary. Keep only the fixed base-count metadata
+        // needed by the generated layout/report; no tokenizer.tok or corpus.tok is emitted here.
+        tkz.loaded = true;
+        tkz.n_base = sub0::casing::TOK_MARKER_COUNT;
+        if (vocab_exact < tkz.n_base) {
+            std::println(stderr, "configure error: --vocab-exact ({}) is smaller than the fixed base vocabulary ({})",
+                         vocab_exact, tkz.n_base);
+            return 2;
+        }
+        tkz.vocab = vocab_exact;
+    }
     if (dump_vocab.empty() &&
         tok_stamp_matches(tok_stamp_path.string(), corpus, vocab_target, min_merge, emit_tok)) {
         std::ifstream tzin(tkz_path, std::ios::binary);
@@ -1213,9 +1260,12 @@ int main(int argc, char** argv) {
             token_count = tm.tokens().size();
             doc_count   = tm.doc_starts().size();
         }
-        std::println(stderr, "reuse: tokenizer.tok{} unchanged since the last configure (corpus + vocab {} + "
-                     "min-merge {} match) -- scan/learn/tokenize skipped",
-                     emit_tok ? " + corpus.tok" : "", vocab_target, min_merge);
+        if (exact_vocab)
+            std::println(stderr, "exact vocabulary: {} tokens; corpus scan/learn/tokenize skipped", vocab_exact);
+        else
+            std::println(stderr, "reuse: tokenizer.tok{} unchanged since the last configure (corpus + vocab {} + "
+                         "min-merge {} match) -- scan/learn/tokenize skipped",
+                         emit_tok ? " + corpus.tok" : "", vocab_target, min_merge);
     } else {
 
     // The expensive corpus scan (passes 1-2) produces a bounded ScanState. Cache it next to
@@ -1691,9 +1741,9 @@ int main(int argc, char** argv) {
     cos << "constexpr PosEncoding POS_ENCODING = PosEncoding::" << (pos_encoding == 0 ? "Absolute" : "Rope") << ";\n";
     cos << "// ROPE_THETA: RoPE frequency base; angle(pos, pair m) = pos * THETA^(-2m/D_HEAD).\n";
     cos << "constexpr float       ROPE_THETA   = " << std::format("{:.1f}", rope_theta) << "f;\n\n";
-    emit_path(cos, "DEFAULT_CORPUS",     abspath);
-    emit_path(cos, "DEFAULT_CORPUS_TOK", std::filesystem::absolute(tok_path).string());
-    emit_path(cos, "DEFAULT_TOKENIZER",  std::filesystem::absolute(tkz_path).string());
+    emit_path(cos, "DEFAULT_CORPUS",     exact_vocab ? std::string{} : abspath);
+    emit_path(cos, "DEFAULT_CORPUS_TOK", exact_vocab ? std::string{} : std::filesystem::absolute(tok_path).string());
+    emit_path(cos, "DEFAULT_TOKENIZER",  exact_vocab ? std::string{} : std::filesystem::absolute(tkz_path).string());
 
     // --- system header: precision + cached hardware facts + tuned runtime defaults, per machine ---
     sos << "// AUTO-GENERATED by sub0-configure (system-specific). Do not edit.\n";
@@ -1738,7 +1788,13 @@ int main(int argc, char** argv) {
 
     // 11. Report the real numbers (the full scan/learn diagnostics only apply when this run
     //     actually derived them; a reused tokenizer gets a short confirmation instead).
-    if (!reused) {
+    if (exact_vocab) {
+        std::println(stderr, "--- external vocabulary configuration ---");
+        std::println(stderr, "vocabulary:                       {} tokens (fixed base {} + external pieces)",
+                     vocab, n_base);
+        std::println(stderr, "corpus.tok / tokenizer.tok:      not emitted (external tokenizer owns vocabulary)");
+        std::println(stderr, "-----------------------------------------------");
+    } else if (!reused) {
         const auto& word_syms   = S.word_syms;
         const sub0::casing::TokStats& st = S.st;
         const std::size_t raw_bytes = S.raw_bytes, norm_bytes = S.norm_bytes;
@@ -1874,7 +1930,7 @@ int main(int argc, char** argv) {
     shown.gated_ffn   = gated_ffn;    shown.tied_embeddings = tie_embeddings;
     shown.qk_norm     = qk_norm;
     std::println("sub0-configure: vocab={} (base {} + {} {}) | {} -> {}",
-                 vocab, n_base, vocab - n_base, tkz.max_piece > 0 ? "unigram pieces" : "BPE merges",
+                 vocab, n_base, vocab - n_base, exact_vocab ? "external vocabulary" : (tkz.max_piece > 0 ? "unigram pieces" : "BPE merges"),
                  sub0::registry::describe_config(shown), out);
     return 0;
 }

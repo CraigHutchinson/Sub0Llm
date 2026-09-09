@@ -78,6 +78,28 @@ The review below describes the original snapshot; B14's historical evidence is r
 - **Validation:** Public-header diff review and whitespace validation completed. A full compile was not
    available because the active native build lacks generated `sub0_config.hpp`.
 
+### 2026-09-08 — B19 exact external vocabulary configuration
+
+- **Status:** Done; committed and independently verified 2026-09-09.
+- **Change:** `tools/configurator.cpp` now accepts `--vocab-exact N` without `--corpus`, requires
+   explicit core dimensions, skips corpus scanning/Unigram learning/tokenization, and emits an engine
+   config with empty corpus/tokenizer artifact paths for an externally owned vocabulary.
+- **Compatibility:** Existing `--corpus` invocations and learned-tokenizer behavior remain unchanged;
+   `--vocab` conflicts are rejected in exact mode.
+- **Validation, independently reproduced (not on trust):** built `sub0llm-configure`, exercised every
+   error path (`--vocab-exact` with missing dims, `--corpus`+`--vocab-exact` together, neither given —
+   all correctly rejected). Ran the real Qwen4 48-layer axes both ways into separate output
+   directories: `--vocab-exact 248320` took **0.033 s** against the corpus-driven path's **~120 s**
+   (matching this item's own "a fraction of that" target); `diff`ing the two runs' real generated
+   `sub0_corpus.hpp`/`sub0_system.hpp` (not the small umbrella header) showed **zero differences except
+   the three intentionally-empty `DEFAULT_CORPUS`/`DEFAULT_CORPUS_TOK`/`DEFAULT_TOKENIZER` paths** —
+   `VOCAB=248320` and every model axis byte-identical to the corpus-driven path, confirmed by direct
+   `diff`, not just a printed summary line. Fixed two small indentation inconsistencies in the new CLI
+   option registrations before committing. Rebuilt `sub0_tests`/`sub0_frontend_tests` from the neutral
+   small config afterward: both pass with 0 failures (`sub0_frontend_tests` exactly 120,889/244,
+   matching every prior count this session — confirms the change doesn't touch the engine-independent
+   path at all).
+
 This is a repository review, not a review of Claude's current changes. The pre-existing edit to
 `TOKENIZER_V2_IDEAS.md` was read for context and left untouched. No engine, test, configuration,
 model, corpus, or build-tree files were changed. Findings below come from source inspection and
@@ -144,6 +166,8 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B16 | P2 | Make generation performance transitions and prefill measurable | Confirmed algorithm choice | L | After correctness work; benchmark first |
 | B17 | Done | Keep document-window fallback inside its declared sampling contract | Validated by focused probe and test compile | M | Completed on user request, 2026-09-08 |
 | B18 | Done | State the engine's process/thread ownership contract | Validated by public-header review | S initially | Completed on user request, 2026-09-08 |
+| B19 | Done | Configure externally defined Qwen4 vocabularies without corpus learning | Confirmed; measured ~100 s avoidable learner cost | M | After WP5 tokenizer/configuration path is stable |
+| B20 | P2 | Reduce MoE decode transpose cost and use available CPU parallelism | Confirmed by VTune and live decode measurement | L | After WP5 model baseline; coordinate hot shared files |
 
 ## Findings and acceptance criteria
 
