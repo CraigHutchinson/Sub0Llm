@@ -8,6 +8,8 @@ merged as `296f2a1`. WP5a tokenizer and WP5b full-scale transplant remain indepe
 
 ## Recommendation
 
+The [backend/provider naming review](BACKEND_PROVIDER_DESIGN.md) distinguishes an Intel-specialized executor, a conditional portable SYCL executor and reusable oneDNN primitives. Compare composition before duplicating executors; these remain design options, not new build targets.
+
 The [2026-09-09 release watchlist](INTEL_IGPU_RELEASE_WATCHLIST.md) adds newer compiler/runtime and experimental-feature candidates. These require isolated qualification; earlier measured results retain their original tuple.
 
 Prioritize **Sub0Llm-owned execution using Intel-native kernels and runtime access**. Study SYCL/ESIMD

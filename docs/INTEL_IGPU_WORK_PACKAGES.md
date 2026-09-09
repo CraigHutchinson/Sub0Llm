@@ -248,6 +248,8 @@ milestone, not full-backend delivery. Newer releases can reopen a failed route w
 
 ### I07 — Finish the existing device boundary and build axis
 
+Resolve names using the [backend/provider design](BACKEND_PROVIDER_DESIGN.md): backend identity, device, primitive provider and submission runtime are distinct. S0/I05/I06 test mixed native/library execution; a portable SYCL executor needs its own qualified consumer and complete operation coverage before I07b adds a target.
+
 Split delivery into I07a (CUDA symbol/consumer cleanup and contract checks) and I07b (second toolchain
 and device selection, landing with I11's real target). I11 depends on I07a; I07b and I11 are one
 integration change. This avoids a dependency cycle and speculative build options.
