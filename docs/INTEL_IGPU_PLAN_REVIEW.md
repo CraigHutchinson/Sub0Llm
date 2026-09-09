@@ -1,15 +1,15 @@
 # Intel backend whole-plan review
 
-Initial pass 2026-09-08; PR-readiness pass 2026-09-09 against branch `47c3cf2` and `main` at
+Initial pass 2026-09-08; PR-readiness pass 2026-09-09 starting from branch `47c3cf2` and `main` at
 `e5af1ad`. Reviewed committed plan `0e82ec3`, then revised documentation only. No Intel
 implementation, benchmark or runtime qualification was performed. The C++ skill pass was read-only;
 plan authoring followed its findings. Broader performance/delivery findings are project review,
 not C++ style rules. Existing repository `.hpp`/`.cu` conventions take precedence over generic
 skill examples. No speculative public C++ declarations were authored.
 
-The branch remains based on `90721bc`; the later pass used current main read-only to reconcile package
-status and consumers. A rebase and diff review against the actual PR base remain mechanical PR gates,
-not evidence that the backend is ready to implement.
+The branch was subsequently rebased onto `e5af1ad`; archived measurements preserve their original
+`90721bc` provenance. The rebase and diff review are mechanical PR preparation, not evidence that the
+backend is ready to implement.
 
 ## Proposed artifact and consumer audit
 

@@ -34,10 +34,12 @@ range/context, not useful pinning, transfer speed, overlap, or physical zero-cop
 
 ## Compile evidence and deferred runtime commands
 
-Both compile-only commands below exited zero on 2026-09-09. The ordinary executable SHA-256 was
-`AB291201B9E3D9D5B3F6645DD19C9B55828FD1EBDAD620AE439C6DDE1AD7F028`; the prepared-copy-API
-variant was `B282DB36948AA96E58A227EC6A78D08D8C2697529D2000D7A7CAE5DF1203D743`. Source SHA-256 was
-`7ADC9B2ABF247C57C84D8C94CAFA6BDB31D12CA71E96702015C29808E7AEAF4A`. The builds omitted direct
+Both compile-only commands below exited zero after the branch rebase on 2026-09-09. The ordinary
+executable SHA-256 was `BE3AB37C4923574BB66EE7434544E06F8FDF7E502E1B397426D6020A29F62342`;
+the prepared-copy-API variant was `4D41BFFC4E72B1A82431333A972CA173111E19B337D4D06267ABDD727DBAFF77`.
+Source SHA-256 was `2593B98B178CA40CE7D175DE42070AFCFCDFB90B55EDF0ABB88A98D7D983D999`.
+The [compile manifest](intel-groundwork/2026-09-09/compile-gates.json) records the exact branch/base,
+toolchain, commands and runner hashes. The builds omitted direct
 Level Zero inventory because matching development headers/import library remain unidentified.
 
 From the isolated `intel-groundwork` worktree:

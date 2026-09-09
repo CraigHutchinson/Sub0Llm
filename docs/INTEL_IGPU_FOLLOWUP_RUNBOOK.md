@@ -7,8 +7,9 @@ training is deferred. This is the handoff entry point for the next session.
 
 `research/intel-groundwork` contains planning, standalone probes and archived measurements. It does
 not add an Intel production target, alter default engine selection, or qualify a Qwen4 backend.
-The branch was created from `90721bc`; this handoff was reconciled read-only with `main` at `e5af1ad`.
-Rebase onto the actual PR base before review and repeat the status reconciliation if `main` advances.
+The branch was created from `90721bc` and rebased onto `main` at `e5af1ad`. Archived 2026-09-08
+measurements retain their original base. Rebase again only if the actual PR base advances, then repeat
+status reconciliation and compile gates.
 
 Measured on the named local tuple:
 

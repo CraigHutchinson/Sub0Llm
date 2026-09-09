@@ -1,0 +1,52 @@
+{
+  "schema": "sub0.intel.compile-gates.v1",
+  "utc_date": "2026-09-09",
+  "branch_commit": "fc74d98a7f6f188ebe3329dbe40d6097f7261da5",
+  "base_commit": "e5af1adcd2c19f6260efe9a58778875a072fe3a5",
+  "os": "Microsoft Windows 10.0.26220",
+  "compiler": {
+    "path": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\bin\\icx-cl.exe",
+    "version": "Intel(R) oneAPI DPC++/C++ Compiler 2025.3.3 (2025.3.3.20260319)",
+    "target": "x86_64-pc-windows-msvc",
+    "vcvars": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat"
+  },
+  "runtime_executed": false,
+  "records": [
+    {
+      "name": "usm-capabilities",
+      "command": "pwsh -NoProfile -File scripts/intel/inventory/run-usm-capabilities.ps1",
+      "build_exit_code": 0,
+      "source_sha256": "2593B98B178CA40CE7D175DE42070AFCFCDFB90B55EDF0ABB88A98D7D983D999",
+      "runtime_header_sha256": "742DFB29B82DD5DCF0F5BB4D68A098ECC3D155D680E687861A8E2F6F76A74BA9",
+      "runner_sha256": "57F9FBF654B9F249C92D5E4A5FF06EB3782F42EF8630A60DD6542AD91FD6D2BB",
+      "executable_sha256": "BE3AB37C4923574BB66EE7434544E06F8FDF7E502E1B397426D6020A29F62342",
+      "level_zero_development_files_supplied": false
+    },
+    {
+      "name": "usm-capabilities-prepared-copy-api",
+      "command": "pwsh -NoProfile -File scripts/intel/inventory/run-usm-capabilities.ps1 -PreparedCopyApi",
+      "build_exit_code": 0,
+      "source_sha256": "2593B98B178CA40CE7D175DE42070AFCFCDFB90B55EDF0ABB88A98D7D983D999",
+      "runtime_header_sha256": "742DFB29B82DD5DCF0F5BB4D68A098ECC3D155D680E687861A8E2F6F76A74BA9",
+      "runner_sha256": "57F9FBF654B9F249C92D5E4A5FF06EB3782F42EF8630A60DD6542AD91FD6D2BB",
+      "executable_sha256": "4D41BFFC4E72B1A82431333A972CA173111E19B337D4D06267ABDD727DBAFF77",
+      "level_zero_development_files_supplied": false
+    },
+    {
+      "name": "prepared-copy-benchmark",
+      "command": "pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1 -CompileOnly",
+      "build_exit_code": 0,
+      "source_sha256": "90A52D25218BB52FBCABBBC78DC8D08CF98261D493B1779DF0B99D2C09AD9F3D",
+      "runtime_header_sha256": "742DFB29B82DD5DCF0F5BB4D68A098ECC3D155D680E687861A8E2F6F76A74BA9",
+      "runner_sha256": "086701080E7CDF6A63A506C2F77DED8B6282BA2BAAB1E01F67EA1DEA1A3F1B15",
+      "executable_sha256": "DB2F22A8A48A20954DA0D191EB39CB7D8286388D8641CA814807CA4CC6EB414A",
+      "elements_configured": [257, 1048576],
+      "fixtures_generated": false
+    }
+  ],
+  "limits": [
+    "No executable ran; this records compiler/header/link availability only.",
+    "No Level Zero development headers or import library were supplied, so direct-ZE inventory did not compile.",
+    "The current direct-ZE probe does not report the loaded ze_loader.dll path or file version."
+  ]
+}

@@ -1,7 +1,7 @@
 # Intel iGPU and backend restructuring work packages
 
-Date: 2026-09-09. **Research branch based on `90721bc`; execution inputs reconciled read-only with
-`main` at `e5af1ad`. Rebase is a separate PR-preparation step.**
+Date: 2026-09-09. **Research branch rebased onto `main` at `e5af1ad`; archived 2026-09-08
+measurements retain their original `90721bc` base.**
 User priority: interactive inference first, training later.
 Read [the platform research and design](INTEL_IGPU_BACKEND_DESIGN.md) for evidence, architecture,
 ownership, benchmark protocol and selection criteria. The [whole-plan review](INTEL_IGPU_PLAN_REVIEW.md)

@@ -49,8 +49,10 @@ alternation and independent-trial controls referenced below.
 
 The new compile-only runner path exited zero on 2026-09-09 without device enumeration, fixture
 generation or GPU execution. Source SHA-256 was
-`8DCAC0DC1C3C7064571C1B1684E9C2F6A04D227EE66608371AA80975C1BB603C`; executable SHA-256 was
-`59F03D89617EC194A41C7FBCE588802EA7DF4589896172336FEA7DC544ACE3B6`. Reproduce compilation with:
+`90A52D25218BB52FBCABBBC78DC8D08CF98261D493B1779DF0B99D2C09AD9F3D`; executable SHA-256 was
+`DB2F22A8A48A20954DA0D191EB39CB7D8286388D8641CA814807CA4CC6EB414A`. The exact rebased
+branch/base, toolchain, command and runner hashes are in the
+[compile manifest](intel-groundwork/2026-09-09/compile-gates.json). Reproduce compilation with:
 
 ```powershell
 pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1 -CompileOnly

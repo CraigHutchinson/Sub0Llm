@@ -2,8 +2,8 @@
 
 Research date: 2026-09-09. **Design plus isolated mechanism probes; no backend selected or implemented.**
 User priority: **interactive inference first; training later**.
-The research branch is based on `90721bc`; its execution inputs were reconciled read-only against
-`main` at `e5af1ad`. Muon work is complete. CPU/CUDA area moves, source manifests, the CPU API facade
+The research branch is rebased onto `main` at `e5af1ad`; archived 2026-09-08 measurements retain their
+original `90721bc` base. Muon work is complete. CPU/CUDA area moves, source manifests, the CPU API facade
 and I08's decode slice have landed; B20 currently owns the CPU decode optimization surfaces. WP4f's
 converter fix and WP5a/b/c tokenizer, full-scale transplant and generation work are merged.
 
