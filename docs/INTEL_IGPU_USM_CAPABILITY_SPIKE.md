@@ -1,7 +1,8 @@
 # Intel iGPU USM capability spike
 
-Date prepared: 2026-09-08. This is an unexecuted, standalone I19/S1 diagnostic. No compilation or
-GPU/CPU measurement was run while hardware and compilation were unreserved.
+Date prepared: 2026-09-08; compile gate executed 2026-09-09. This is a runtime-unexecuted, standalone
+I19/S1 diagnostic. The ordinary and `SUB0_PROBE_PREPARED_COPY_API` variants both compiled and linked
+with DPC++ 2025.3.3. No probe binary or GPU/CPU measurement ran.
 
 ## Questions and evidence boundaries
 
@@ -31,9 +32,15 @@ normal capability inventory from being mistaken for experimental API qualificati
 compile establishes API availability; a successful execution establishes only acceptance for that
 range/context, not useful pinning, transfer speed, overlap, or physical zero-copy.
 
-## Deferred commands
+## Compile evidence and deferred runtime commands
 
-From the isolated `intel-groundwork` worktree, in a reserved compilation window:
+Both compile-only commands below exited zero on 2026-09-09. The ordinary executable SHA-256 was
+`AB291201B9E3D9D5B3F6645DD19C9B55828FD1EBDAD620AE439C6DDE1AD7F028`; the prepared-copy-API
+variant was `B282DB36948AA96E58A227EC6A78D08D8C2697529D2000D7A7CAE5DF1203D743`. Source SHA-256 was
+`7ADC9B2ABF247C57C84D8C94CAFA6BDB31D12CA71E96702015C29808E7AEAF4A`. The builds omitted direct
+Level Zero inventory because matching development headers/import library remain unidentified.
+
+From the isolated `intel-groundwork` worktree:
 
 ```powershell
 pwsh -NoProfile -File scripts/intel/inventory/run-usm-capabilities.ps1

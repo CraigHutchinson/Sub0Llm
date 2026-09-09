@@ -1,10 +1,11 @@
 # Intel iGPU inference: platform selection and backend design
 
-Research date: 2026-09-08. **Design only; no backend selected or implemented.**
+Research date: 2026-09-09. **Design plus isolated mechanism probes; no backend selected or implemented.**
 User priority: **interactive inference first; training later**.
-Backend revision checked against `220afaf`; remaining Muon work subsequently committed in `8a72c67`. CPU/CUDA area moves, source
-manifests and the CPU API facade have landed; deeper extraction remains active. WP4f's converter fix
-merged as `296f2a1`. WP5a tokenizer and WP5b full-scale transplant remain independently owned.
+The research branch is based on `90721bc`; its execution inputs were reconciled read-only against
+`main` at `e5af1ad`. Muon work is complete. CPU/CUDA area moves, source manifests, the CPU API facade
+and I08's decode slice have landed; B20 currently owns the CPU decode optimization surfaces. WP4f's
+converter fix and WP5a/b/c tokenizer, full-scale transplant and generation work are merged.
 
 ## Recommendation
 
@@ -85,6 +86,11 @@ WP4e's four-layer artifact is 5.89 GiB f32 plus a 3.17 GiB encoded expert sideca
 peak is 14.32 GiB. These are historical results from [WP4](WP4_SCOPE.md), not an Intel memory plan.
 The iGPU cannot turn a model larger than available host memory into a resident one. Excluding PLE or
 using four layers must remain explicit in every comparison and must never be labeled full Qwen4 support.
+
+WP5b/c later demonstrated host-side full-artifact transplant/load/execution and measured RSS on
+current main. That is a pinned CPU/reference and capacity input, not simultaneous iGPU residency or
+an Intel execution path. I01/I17a preserve its artifact identity and recompute sustainable shared
+memory, driver budget and preparation peaks against the selected Intel runtime tuple.
 
 ## 2. Architecture-specific requirements
 
@@ -275,6 +281,21 @@ Runtime checks establish whether that compiled implementation can execute the lo
 do not introduce a registry or a per-operation virtual dispatch. Do not add a `SUB0_DEVICE` choice
 until its implementation and configurator/build consumers land together.
 
+The current selection/build surface is CUDA-specific: `GPU` means CUDA, `AUTO` discovers CUDA,
+`HAS_CUDA`, `SUB0_BUILD_CUDA` and the partly generic `SUB0_BUILD_DEVICE` gate consumers, while the
+neutral `sub0_dev_*` calls are inline CUDA forwards. Before Intel production source lands, I07b.0
+inventories every consumer and introduces a
+separate compile-time Intel selection plus a generic device-backend-linked fact, reusing
+`SUB0_BUILD_DEVICE` if its audited semantics fit. `HAS_CUDA` remains a
+CUDA fact; Intel must never satisfy it. The first Intel target is inference-only, advertises training
+and evaluation false unless their exact paths exist, and rejects unsupported artifacts at setup.
+
+Windows toolchain isolation is also an evidence gate, not an architectural assumption. Pin the host
+and DPC++ compiler/STL/CRT pair, generator, oneDNN and Level Zero inputs, generated-header dialect,
+exports and DLL search path. A POD smoke DLL must load through the real generation stage, contain
+exceptions and allocators inside its boundary, and drain queued work before unload. The current
+host-only superbuild and standalone probes do not establish this contract.
+
 ### Decompose by ownership and execution responsibility
 
 Proposed destinations, created only when existing code moves into them:
@@ -385,6 +406,15 @@ Sampling initially stays on CPU for parity. Later, measure device top-k as a sep
 callbacks and diagnostic consumers currently expect full logits, so a token-only return cannot silently
 replace that API. An OpenVINO GenAI full pipeline similarly belongs behind a whole-generation adapter
 if it owns sampling/tokenization; do not disguise it as the same low-level `forward_one` contract.
+The first Intel consumer therefore owns one pre-sized full-vocabulary logits buffer for its session.
+Its oracle covers the complete head, and request timing records vocabulary-head compute plus completed
+device-to-host bytes/time before the CPU sampler or callback observes the buffer.
+The integration consumer is production `sub0_gen` in `src/gen_stage.cpp`, exercised by
+`sub0llm-gen`. The WP5 `tools/sub0llm-qwen4-gen.cpp` path calls the CPU engine directly and remains an
+oracle until I17b deliberately connects the full artifact to the production stage. WP5c also measured
+that `sample_token` needs about 2.84 MiB of stack at `VOCAB=248320`; its Qwen4 executable uses a 32 MiB
+target-stack workaround. I17b/I23 must either verify that requirement on every sampling target or,
+preferably, replace it with pre-sized reused scratch before claiming production full-model generation.
 
 ## 6. Performance hypotheses to test
 
@@ -506,8 +536,18 @@ The plan-review pass identified these risks and incorporated the resolutions abo
    backend math/schedules separate; measure any shared-template extraction. Basis: AGENTS §2/§6.
 5. **A generic "supports Qwen" claim hides missing behavior:** test the exact artifact and all recurrent
    states; qualify the reduced prefix. Basis: AGENTS §5/§7/§9.
+6. **CUDA-only build facts cannot select an Intel consumer:** I07b.0 maps the existing guards and links,
+   preserves CUDA-specific policy, defines inference-only Intel capabilities and proves the POD DLL in
+   the real generation stage before I11. Basis: AGENTS §4/§8/§10.
+7. **Moving direct-ZE documentation is not a Windows dependency contract:** S0a first pins a tagged
+   oneDNN source, matching Level Zero development files and runtime tuple, or records native ZE
+   unavailable while retaining the SYCL control. Basis: AGENTS §5/§9.
+8. **A provider result on one Intel device cannot decide portability:** I06 records an Intel recipe
+   separately; a portable SYCL executor requires second-target execution and full required-operation
+   coverage. Basis: evidence scope and consumer-driven surface area.
 
-No remaining design-policy blocker requires a user decision before the research work packages begin.
-Hardware timing, concurrency behavior and final architecture fit still need review using the resulting
-evidence; this document does not certify them. No drivers/SDKs were installed, large artifacts downloaded,
-or device benchmarks run in this pass.
+No user decision blocks the bounded research work. I07b.0, S0a and I01 are explicit evidence blockers
+for production integration rather than facts already established. Hardware timing, concurrency behavior
+and final architecture fit still need review using the resulting evidence; this document does not
+certify them. No drivers/SDKs were installed, large artifacts downloaded, or device benchmarks run in
+this pass.

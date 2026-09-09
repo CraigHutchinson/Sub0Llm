@@ -1,7 +1,8 @@
 param(
     [string]$OneApiRoot = 'C:\Program Files (x86)\Intel\oneAPI',
     [string]$CompilerVersion = '2025.3',
-    [ValidateSet(257, 1048576)][int[]]$Elements = @(257, 1048576)
+    [ValidateSet(257, 1048576)][int[]]$Elements = @(257, 1048576),
+    [switch]$CompileOnly
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
@@ -27,13 +28,15 @@ $manifest = [ordered]@{
     probe_changes = @(& git -C $repo status --short -- benchmarks/intel/mechanisms/prepared_copy.cpp scripts/intel/inventory/run-prepared-copy.ps1 docs/INTEL_IGPU_PREPARED_COPY_SPIKE.md)
     os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
     compiler = $compiler; compiler_version = @(& $compiler --version); vcvars = $vcvars.FullName
-    arguments = $compileArgs; elements = $Elements
+    arguments = $compileArgs; elements = $Elements; compile_only = [bool]$CompileOnly
     source_sha256 = (Get-FileHash -LiteralPath $source).Hash
     runtime_header_sha256 = (Get-FileHash -LiteralPath (Join-Path $repo 'tools/intel_probe/runtime.hpp')).Hash
     runner_sha256 = (Get-FileHash -LiteralPath $PSCommandPath).Hash
     power_configuration = @(& powercfg /getactivescheme)
     competing_processes = @(Get-Process -Name '*qwen*','*llama*','*train*','*transplant*','icx*','clang*','nvcc*' -ErrorAction SilentlyContinue | Select-Object ProcessName,Id,CPU)
-    sycl_devices = @(& (Join-Path $compilerRoot 'bin/sycl-ls.exe'))
+}
+if (-not $CompileOnly) {
+    $manifest.sycl_devices = @(& (Join-Path $compilerRoot 'bin/sycl-ls.exe'))
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'manifest.json')
 & $compiler @compileArgs 2>&1 | Tee-Object -FilePath (Join-Path $output 'build.log')
@@ -43,6 +46,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Probe build failed; evidence: $output"
 }
 $manifest.executable_sha256 = (Get-FileHash -LiteralPath $exe).Hash
+if ($CompileOnly) {
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'manifest.json')
+    Write-Output "Evidence: $output"
+    return
+}
 $runs = @()
 foreach ($count in $Elements) {
     $firstPath = Join-Path $output "fixture-$count-a.f32"

@@ -106,7 +106,10 @@ and extend I21 controls before promoting any performance result.
 
 ## Plan feedback / next bounded work
 
-The [Windows USM review](INTEL_IGPU_WINDOWS_USM.md) adds official-source and installed-header findings plus ordered S1/I19 probes. It adds no measurements or capability claims to this report.
+The [Windows USM review](INTEL_IGPU_WINDOWS_USM.md) adds official-source and installed-header findings
+plus ordered S1/I19 probes. On 2026-09-09, the ordinary USM capability probe, its separately gated
+prepared-copy API variant and the prepared-copy benchmark all compiled and linked with DPC++ 2025.3.3.
+No new binary executed, so these are build-availability facts rather than runtime capability or speed.
 
 R0: installed toolchain and conservative library interop are usable; runtime-managed shared memory and
 explicit staging deserve comparison. System-pointer access and matrix execution are unqualified.
@@ -122,9 +125,9 @@ is integrated into I19's follow-ups, without extrapolating its Linux/discrete re
    Keep quantization/packing crossed with allocation/submission variants rather than attributing all
    differences to the API. Existing f32 numbers are controls, not encoded-path forecasts.
 4. S3/S4: dynamic command replay and representative GDN/GR/QSA/MoE chains. I06 remains pending.
-5. Reconcile WP5 inputs at the next checkpoint: main has advanced to WP5c according to its active log.
-   This branch intentionally retains its starting engine revision; consume new artifacts read-only
-   after pinning their identity, rather than mixing concurrent engine edits into these probes.
+5. WP5a/b/c are now merged on `main`; freeze their tokenizer, artifact census, generation inputs and
+   measured CPU baseline in I01 after rebasing. B20 currently owns decode optimization surfaces, so
+   keep mechanism probes isolated until that row closes.
 
 The scoped C++ review checked the private shared selector/USM deleter, queue/resource lifetimes,
 benchmark consumers, failure paths and fixed allocations. No remaining MUST finding was identified.

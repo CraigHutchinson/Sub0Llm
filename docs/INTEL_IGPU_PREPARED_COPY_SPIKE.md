@@ -1,7 +1,8 @@
 # Prepared explicit-copy staging spike
 
-Date: 2026-09-08. This is a bounded benchmark design, not a measured result. It does not select a
-production memory path or make a performance claim.
+Date: 2026-09-08; compile gate executed 2026-09-09. This is a bounded benchmark design, not a measured
+result. The source compiles with DPC++ 2025.3.3; it has not executed. It does not select a production
+memory path or make a performance claim.
 
 ## Question and sources
 
@@ -44,10 +45,18 @@ not independent process trials. These samples establish correctness and expose g
 they do not support a winner claim. Any comparative result must use the reserved-run process
 alternation and independent-trial controls referenced below.
 
-## Deferred verification
+## Compile evidence and deferred runtime verification
 
-No compilation or hardware execution was performed while the Qwen workload owned the machine. In a
-reserved measurement window, run from this worktree:
+The new compile-only runner path exited zero on 2026-09-09 without device enumeration, fixture
+generation or GPU execution. Source SHA-256 was
+`8DCAC0DC1C3C7064571C1B1684E9C2F6A04D227EE66608371AA80975C1BB603C`; executable SHA-256 was
+`59F03D89617EC194A41C7FBCE588802EA7DF4589896172336FEA7DC544ACE3B6`. Reproduce compilation with:
+
+```powershell
+pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1 -CompileOnly
+```
+
+In a reserved measurement window, run from this worktree:
 
 ```powershell
 pwsh -NoProfile -File scripts/intel/inventory/run-prepared-copy.ps1

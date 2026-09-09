@@ -30,13 +30,44 @@ if ($PreparedCopyApi) { $compileArgs += '/DSUB0_PROBE_PREPARED_COPY_API' }
 if ([bool]$LevelZeroInclude -ne [bool]$LevelZeroLibrary) {
     throw '-LevelZeroInclude and -LevelZeroLibrary must be supplied together'
 }
+$levelZeroHeader = $null
+$levelZeroHeaderSha256 = $null
+$levelZeroImportLibrary = $null
+$levelZeroImportLibrarySha256 = $null
+$levelZeroLoaderRuntimeIdentity = [ordered]@{
+    status = 'not_requested'
+    path = $null
+    file_version = $null
+    capture = $null
+    source = $null
+    reason = $null
+}
 if ($LevelZeroInclude) {
     $header = Join-Path $LevelZeroInclude 'level_zero/ze_api.h'
-    if (-not (Test-Path -LiteralPath $header)) { throw "Level Zero header missing below: $LevelZeroInclude" }
+    if (-not (Test-Path -LiteralPath $header -PathType Leaf)) {
+        throw "Level Zero header missing below: $LevelZeroInclude"
+    }
     if (-not (Test-Path -LiteralPath $LevelZeroLibrary -PathType Leaf)) {
         throw "Level Zero loader import library missing: $LevelZeroLibrary"
     }
-    $compileArgs += @('/DSUB0_ENABLE_LEVEL_ZERO_INVENTORY', "/I$LevelZeroInclude", $LevelZeroLibrary)
+    $levelZeroHeader = (Resolve-Path -LiteralPath $header).Path
+    $levelZeroHeaderSha256 = (Get-FileHash -LiteralPath $levelZeroHeader -Algorithm SHA256).Hash
+    $levelZeroImportLibrary = (Resolve-Path -LiteralPath $LevelZeroLibrary).Path
+    $levelZeroImportLibrarySha256 =
+        (Get-FileHash -LiteralPath $levelZeroImportLibrary -Algorithm SHA256).Hash
+    $levelZeroLoaderRuntimeIdentity.status = if ($Run) {
+        'not_implemented_requires_probe_change'
+    } else {
+        'not_loaded_compile_only'
+    }
+    $levelZeroLoaderRuntimeIdentity.capture = 'not_implemented'
+    $levelZeroLoaderRuntimeIdentity.reason =
+        'Windows resolves ze_loader.dll when the probe starts; the probe does not yet report its loaded path or file version, and compile inputs are not used to guess them.'
+    $compileArgs += @(
+        '/DSUB0_ENABLE_LEVEL_ZERO_INVENTORY',
+        "/I$((Resolve-Path -LiteralPath $LevelZeroInclude).Path)",
+        $levelZeroImportLibrary
+    )
 }
 $manifest = [ordered]@{
     schema = 'sub0.intel.usm-capabilities.v1'; utc = [DateTime]::UtcNow.ToString('o')
@@ -49,6 +80,10 @@ $manifest = [ordered]@{
     runner_sha256 = (Get-FileHash -LiteralPath $PSCommandPath).Hash
     prepared_copy_api = [bool]$PreparedCopyApi
     level_zero_include = $LevelZeroInclude; level_zero_library = $LevelZeroLibrary
+    level_zero_header = $levelZeroHeader; level_zero_header_sha256 = $levelZeroHeaderSha256
+    level_zero_loader_import_library = $levelZeroImportLibrary
+    level_zero_loader_import_library_sha256 = $levelZeroImportLibrarySha256
+    level_zero_loader_runtime_identity = $levelZeroLoaderRuntimeIdentity
     execution_requested = [bool]$Run
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'manifest.json')
