@@ -77,12 +77,9 @@ static inline int omp_get_num_threads() { return 1; }
 static inline int omp_get_max_threads() { return 1; }
 #endif
 
-// x86 SSE/AVX control register access, used to flush subnormal floats to zero
-// (FTZ/DAZ) in the hot loops, where a subnormal operand triggers a slow assist.
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <immintrin.h>
-#define SUB0_X86 1
-#endif
+// (The x86 FTZ/DAZ control-register helper this file used to define locally now lives in internal.hpp:
+// decode.cpp's own compute threads must set the same MXCSR bits, and a thread that missed them would
+// decode to different last bits than one that did not -- see set_flush_denormals' comment there.)
 
 namespace sub0 {
 
@@ -1244,8 +1241,11 @@ static Node* op_moe(Node* x, Layer& L, int layer_index) {
     out->a = x;
     if constexpr (USE_MOE_QUANT) W->moe_cache.allocate();
     auto [scratch, scratch_g] = arena_alloc(moe::scratch_floats(MOE_DIMS));
+    // The batched path stays SERIAL and stays on this Worker's own 8-slot pool: it is already inside
+    // train_batch's parallel team when training, and its cache has a real cross-row hit rate that
+    // decode's does not (see MOE_DECODE_SLOTS in internal.hpp). B20 part 2 changed decode, not this.
     moe::forward_via(MOE_DIMS, T, x->data.data(), L.moe_router->data.data(),
-                     [&](int e) { return moe_resolve(L, layer_index, e); },
+                     [&](int e) { return moe_resolve(L, layer_index, e, W->moe_cache); },
                      L.moe_shared_gate->data.data(), L.moe_shared_up->data.data(),
                      L.moe_shared_down->data.data(), L.moe_shared_gate_proj->data.data(),
                      out->data.data(), scratch.data());
@@ -1763,18 +1763,6 @@ Node* Model::forward(const int* ids, int T) {
 }
 
 thread_local Model g_model;
-
-// Flush-to-zero (FTZ) + denormals-are-zero (DAZ). A subnormal float operand traps
-// into a slow microcode assist on x86 (often ~100x a normal op); the fast-math
-// approximations and decaying gradients can produce them in the hot loops. MXCSR is
-// per-thread, so every compute thread sets this once (via ensure_thread_built). The
-// model tolerates flushing these near-zero values -- they are underflow noise here.
-static inline void set_flush_denormals() {
-#if defined(SUB0_X86)
-    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-#endif
-}
 
 // Declared in internal.hpp, where its contract comment lives.
 void ensure_thread_built() {

@@ -55,13 +55,20 @@ inline constexpr int TOPK_MAX = 16;
 // scratch_floats(): num_experts (router logits/probs, reused as scratch, S4b) + d_ff (one expert's SwiGLU
 // pre-activation, "up" half then overwritten with silu(gate)*up) + d_ff again (the "gate" accumulator
 // expert_ffn_row needs alongside it, kept separate for a cache-friendly summation order -- see that
-// function's own comment) + hidden_size (one expert's FFN output before its top-k/shared weighting is
-// applied). Deliberately NOT scaled by T (see this file's own header comment) -- one call's worth, reused
-// across forward()'s own T-row loop below.
+// function's own comment) + hidden_size (the SHARED expert's FFN output) + experts_per_tok * hidden_size
+// (one output buffer per SELECTED routed expert). Deliberately NOT scaled by T (see this file's own
+// header comment) -- one call's worth, reused across forward()'s own T-row loop below.
+//
+// THE LAST TERM IS WHY THIS GREW (B20 part 2). The routed experts used to share ONE hidden_size buffer,
+// because each was consumed -- weighted and added into `out` -- before the next was computed. Giving
+// each selected expert its own buffer is what makes the k-loop's ORDER irrelevant to the answer, so it
+// can be run on several threads without the weighted sum's float accumulation order changing. See
+// forward_row_via_run below; the sum itself is still done afterwards, sequentially, in k order.
 inline constexpr std::size_t scratch_floats(const Dims& d) {
     return static_cast<std::size_t>(d.num_experts)
          + 2u * static_cast<std::size_t>(d.d_ff)
-         + static_cast<std::size_t>(d.hidden_size);
+         + static_cast<std::size_t>(d.hidden_size)
+         + static_cast<std::size_t>(d.experts_per_tok) * static_cast<std::size_t>(d.hidden_size);
 }
 
 namespace detail {
@@ -174,27 +181,65 @@ struct ExpertWeights { const float* gate; const float* up; const float* down; };
 // order. That is not a tidiness point: it is why WP4e's gate -- bitwise-identical output between the two
 // -- is a structural property of having one code path rather than an empirical hope about two.
 //
-// `resolve` must not allocate and must leave the returned planes valid until the next call (a caller
-// with a one-slot pool is fine: the planes are consumed by expert_ffn_row before resolve is called
-// again). AGENTS.md S1 -- this is a per-token, per-selected-expert path.
-template <class Resolve>
-inline void forward_row_via(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
-                             const float* shared_gate_w, const float* shared_up_w,
-                             const float* shared_down_w, const float* shared_gate_proj_w,
-                             float* out, float* scratch, bool norm_topk_prob = true) {
+// `resolve` must not allocate and must leave the returned planes valid until this row's whole selected
+// set has been computed (a caller running the k-loop serially through a one-slot pool is fine: the
+// planes are consumed by expert_ffn_row before resolve is called again; a caller running it in parallel
+// needs one pool PER THREAD, since several resolves are then live at once). AGENTS.md S1 -- this is a
+// per-token, per-selected-expert path.
+//
+// --- RUNNING THE SELECTED EXPERTS ON MORE THAN ONE THREAD (B20 part 2) ---------------------------
+//
+// The `experts_per_tok` selected experts are independent by construction: each reads the same `x` and
+// its own three weight planes, and writes its own output. The only thing that was NOT order-independent
+// was the WEIGHTED SUM that consumed each expert's output the moment it was produced -- float addition
+// is not associative, so a thread-completion order would have changed the last bits of `out` even
+// though nothing was wrong.
+//
+// So the loop is in two phases, and it is in two phases for the SERIAL path too, not just the parallel
+// one: phase 1 computes every selected expert into ITS OWN buffer (order-independent -- no two writes
+// touch the same float), phase 2 does the weighted sum afterwards, single-threaded, in the original k
+// order. That is exactly the same sequence of float additions per output element as the old interleaved
+// form (out[j] starts at 0 and takes w0*e0[j], then w1*e1[j], ...), so this restructuring is itself
+// bit-for-bit -- which is what lets one code path serve both, rather than a parallel variant whose
+// agreement with the serial one would be an empirical hope.
+//
+// `run_experts(n, ffn_scratch, g_scratch, body)` invokes `body(k, ffn, g)` for every k in [0, n). The
+// default runner below is the plain serial loop, reusing the one scratch pair; a parallel runner hands
+// each thread its own pair. Nothing about WHICH threads, or how many, reaches this file: this header is
+// engine-free (docs/MOE.md), and OpenMP lives at the call site.
+struct SerialExperts {
+    template <class Body>
+    void operator()(int n, float* ffn, float* g, Body&& body) const {
+        for (int k = 0; k < n; ++k) body(k, ffn, g);
+    }
+};
+
+template <class Resolve, class RunExperts>
+inline void forward_row_via_run(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
+                                 RunExperts&& run_experts,
+                                 const float* shared_gate_w, const float* shared_up_w,
+                                 const float* shared_down_w, const float* shared_gate_proj_w,
+                                 float* out, float* scratch, bool norm_topk_prob = true) {
     float* probs      = scratch;                    // [num_experts]
     float* ffn_scratch = probs + d.num_experts;      // [d_ff]
     float* g_scratch  = ffn_scratch + d.d_ff;        // [d_ff]
-    float* expert_out = g_scratch + d.d_ff;          // [hidden_size]
+    float* expert_out = g_scratch + d.d_ff;          // [hidden_size]   -- the SHARED expert's
+    float* routed_out = expert_out + d.hidden_size;  // [experts_per_tok][hidden_size]
     float topk_w[TOPK_MAX];
     int   topk_idx[TOPK_MAX];
     router_topk_row(d, x, router_w, probs, topk_w, topk_idx, norm_topk_prob);
 
+    // Phase 1: every selected expert into its own buffer. Order-independent by construction.
+    run_experts(d.experts_per_tok, ffn_scratch, g_scratch, [&](int k, float* ffn, float* g) {
+        const ExpertWeights w = resolve(topk_idx[k]);
+        expert_ffn_row(d, x, w.gate, w.up, w.down,
+                       routed_out + static_cast<std::size_t>(k) * d.hidden_size, ffn, g);
+    });
+    // Phase 2: the weighted sum, in the original selection order, on one thread.
     for (int j = 0; j < d.hidden_size; ++j) out[j] = 0.f;
     for (int k = 0; k < d.experts_per_tok; ++k) {
-        const ExpertWeights w = resolve(topk_idx[k]);
-        expert_ffn_row(d, x, w.gate, w.up, w.down, expert_out, ffn_scratch, g_scratch);
-        for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * expert_out[j];
+        const float* ek = routed_out + static_cast<std::size_t>(k) * d.hidden_size;
+        for (int j = 0; j < d.hidden_size; ++j) out[j] += topk_w[k] * ek[j];
     }
 
     // Shared expert: an ordinary (non-routed) SwiGLU FFN with its OWN weights, gated by
@@ -207,6 +252,19 @@ inline void forward_row_via(const Dims& d, const float* x, const float* router_w
     for (int i = 0; i < d.hidden_size; ++i) gate_logit += x[i] * shared_gate_proj_w[i];  // [hidden_size,1]
     const float sg = detail::sigmoid(gate_logit);
     for (int j = 0; j < d.hidden_size; ++j) out[j] += sg * expert_out[j];
+}
+
+// The single-threaded form, and the one every caller that has no reason to fan out uses: the selected
+// experts run one after another on this thread, reusing the one scratch pair. Kept as its own name (and
+// its own unchanged signature) because that is what op_moe's batched T-row path, the f32-resident
+// wrappers below, and every test call -- none of which are the decode hot path B20 measured -- want.
+template <class Resolve>
+inline void forward_row_via(const Dims& d, const float* x, const float* router_w, Resolve&& resolve,
+                             const float* shared_gate_w, const float* shared_up_w,
+                             const float* shared_down_w, const float* shared_gate_proj_w,
+                             float* out, float* scratch, bool norm_topk_prob = true) {
+    forward_row_via_run(d, x, router_w, resolve, SerialExperts{}, shared_gate_w, shared_up_w,
+                        shared_down_w, shared_gate_proj_w, out, scratch, norm_topk_prob);
 }
 
 // The f32-resident form: `expert_gate_w`/`expert_up_w`/`expert_down_w` are arrays of `num_experts`
