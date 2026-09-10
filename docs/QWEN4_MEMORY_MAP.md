@@ -450,3 +450,11 @@ Nothing in this pass found a missing multi-GiB allocation, a leak, or a double-c
 This document's contribution is completeness (every allocation named, not just the large ones), lifecycle
 framing (when, not just how much), and now the dtype question (what precision, and where the real leverage
 for reducing it actually is) — all three explicitly requested, none fully covered before.
+
+**Follow-up, same day**: §7's recommendations became a real staged plan — `docs/BACKBONE_PRECISION.md`
+(BF16 backbone storage first, model-native quantized backbone as the named next priority), including a
+bandwidth argument beyond §0's residency-ceiling framing (decode's T=1 GEMVs are memory-bandwidth-bound,
+so backbone bytes-per-weight is a direct per-token latency lever, not just a footprint one) and a checked,
+not assumed, confirmation that this gen tool's own "prefill" is currently just sequential `forward_one`
+calls — exactly as bandwidth-bound as decode today, not the compute-bound batched pass a future prefill
+path might become.
