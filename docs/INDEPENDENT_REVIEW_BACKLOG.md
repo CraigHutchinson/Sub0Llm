@@ -170,6 +170,7 @@ remain Claude's work. This review draws no conclusion about which implementation
 | B20 | Done | Reduce MoE decode transpose cost and use available CPU parallelism | Merged `d2bbea4`, 1.61x + exposed decode is now disk-bound | L | Completed 2026-09-09; both parts independently reverified, bit-for-bit |
 | B21 | P1 | Find why decode's per-expert resolve concurrency plateaus at ~2-3x with inflated per-expert cost, independent of requested thread count | Confirmed via wall-clock instrumentation at both 10 and 6 requested threads; core parking + thread-count ruled out; root cause open | M | Blocks trusting any further decode-throughput number as I/O-bound-and-therefore-fixed; also affects `MOE_DECODE_THREADS` sizing |
 | B22 | P3 (backlog) | Migrate `moeq::Store`/`ExpertCache`'s hand-rolled residency+slot-pool bookkeeping onto Sub0MemPage once it has a real implementation | Sub0MemPage's spec (github.com/CraigHutchinson/Sub0MemPage) is explicitly designed against this exact code as its first real consumer | M | Blocked on Sub0MemPage reaching a working implementation (currently design-only); not urgent, but should not be forgotten once it lands |
+| B23 | Done (spike) | Naive full-warm-up of the sidecar was tested as a cheap alternative to async residency management — it does not work, and the reason is arithmetic, not a tuning problem | Confirmed: sidecar cannot fit (headroom after model load ~17.3 GiB vs. sidecar 37.11 GiB, ~46.7% max); no pagefile swap involved (Pages Output/sec = 0 throughout) | S | Directly informs Sub0MemPage's design — feeds `docs/design.md` there |
 
 ## Findings and acceptance criteria
 
@@ -781,6 +782,77 @@ whether or not it resolves B21's own still-open root cause (it is not expected t
 note — a proactive design sidesteps depending on N reactive threads cooperating correctly, but B21's
 specific unexplained ~2-3x concurrency ceiling and cost inflation could plausibly persist under an
 explicit-fill backend too, and that would itself be a finding worth reporting, not a silent non-result).
+
+### B23 — Naive full-warm-up of the sidecar does not work, and the reason is arithmetic, not a tuning problem
+
+Filed 2026-09-10, a cheap spike run directly against the user's own question: before building the full
+Sub0MemPage async-scheduling engine, is there a much simpler fix — just touch the whole sidecar once at
+startup and let the OS page cache hold it? **Tested directly, and the answer is a clean, arithmetic no.**
+
+**Method**: a standalone scratch probe (`warm_sidecar.cpp`, not part of this repo, uses the existing
+`sub0::FileMap` unmodified) opened the real 37.11 GiB `.moeq` sidecar and sequentially touched every 4 KiB
+page once — a full, unconditional warm sweep, not a sampled one. This completed in **27.3 seconds at an
+effective 1459 MB/s** (far faster than decode's own fragmented ~55-108 MB/s, confirming sequential
+single-threaded readahead is dramatically more effective than the small-random-plane access pattern decode
+uses — itself a useful, separate data point). Immediately after the probe exited, a real decode run was
+launched against the identically-warmed file, with `\PhysicalDisk\Avg. Disk Queue Length`, `\Memory\Pages
+Input/sec`, `\Memory\Pages Output/sec`, `\Paging File(_Total)\% Usage`, and `\Memory\Available MBytes`
+sampled throughout.
+
+**Result 1 — no real pagefile swap.** `\Memory\Pages Output/sec` measured **exactly 0.00 across every
+sample** of the whole run, and `\Paging File(_Total)\% Usage` stayed flat at 6.73% (matching the
+pre-experiment baseline of 6.43% — background noise, not growth). This directly answers the question that
+motivated the spike: the machine is **not** swapping anonymous/private memory to the pagefile. Whatever is
+happening is a different mechanism.
+
+**Result 2 — the warm-up did not help.** Despite the entire file having been touched 100% 27 seconds
+earlier, decode's steady-state disk activity was **not reduced** — `\PhysicalDisk\Avg. Disk Queue Length`
+measured 0.10-0.17 and `Disk Read Bytes/sec` 55-87 MB/s during decode, matching or exceeding the
+pre-warm-up cold baseline (0.04-0.09, 55.7 MB/s) recorded for B21. Final throughput was **5.60 s/token**
+(12 tokens in 67.22s) — statistically indistinguishable from the 5.53-5.85 s/token band measured without
+any warm-up. **A naive full warm sweep buys nothing measurable.**
+
+**Result 3 — `\Memory\Available MBytes` fell continuously and did not plateau** during the sampled window
+(14,889 → 14,421 MB over ~9 seconds, ~52 MB/s net drain) — closely tracking the concurrent disk read rate.
+This is the mechanism: pages the warm-up brought into the systemwide standby list are being evicted again,
+under real memory pressure, before decode gets to reuse them — not classic pagefile swap (Result 1), but
+functionally the same practical symptom (continued real disk reads) via a different OS mechanism (standby-
+list churn on the cheapest-to-evict, read-only, file-backed mapping — exactly the mechanism
+`sub0mempage-research-os-io.md`'s own H3 named as a real but, it estimated, only "contributory ~9-12%"
+effect; this result shows it dominates at this scale, not merely contributes).
+
+**Result 4 — the actual reason, and it's simple arithmetic, not a caching-cleverness problem.** Measured
+directly, not estimated: available memory **before** model load was 42.71 GiB (of 63.43 GiB total RAM —
+i.e. **~20.72 GiB is already committed to the OS and other processes on this real, shared development
+machine at baseline**, not a hypothetical margin). The backbone + worker arena together commit **25.39
+GiB** (the `[mem] after graph_reset` figure, unchanged from every prior measurement this session). That
+leaves only **17.32 GiB of headroom for a 37.11 GiB sidecar — at most 46.7% of it can be simultaneously
+resident, no matter how it is cached, warmed, or scheduled.** The other ~53% must be re-fetched from disk
+on essentially every access pattern that touches it, by construction, regardless of implementation
+cleverness on the caching side.
+
+**Why this matters beyond just closing out the "is a simple warm-up enough" question**: it reframes what
+Sub0MemPage should be understood to target. The project's own headline finding (`design.md` §5/§6 —
+"prefetch, not faster faults, is the top lever") is not weakened by this result, but its framing sharpens:
+the goal is not, and structurally cannot be, "eliminate the sidecar's disk I/O via better caching" — on
+this machine, at this model's scale, **some real disk I/O per token is unavoidable, full stop.** The
+achievable goal is efficiently *overlapping* that unavoidable I/O with useful compute (the router knows
+layer L's experts before layer L's FFN runs — the "declared signal known ahead of use" property the whole
+design already leans on), not removing the I/O. This is a sharper, more honest statement of the target
+than "make the file stay resident," and it should inform how any future Sub0MemPage implementation reports
+its own success — "reduced disk queue idle time" and "increased overlap of I/O with compute," not "reduced
+total bytes read from disk," which this result shows has a hard floor around 53% of the sidecar per full
+routing sweep on this machine's real available memory.
+
+**Caveats, stated honestly**: this is one machine's one real-world memory budget (a shared development
+box with ~20.7 GiB already committed to other things at baseline), not a clean benchmark environment — the
+"46.7%" figure is specific to this session's exact conditions and will differ on a dedicated inference
+box with less competing load, or a machine with more RAM. The qualitative conclusion (working set exceeds
+available headroom, so full residency is structurally impossible without more RAM) is robust to that
+caveat; the specific percentage is not a portable constant.
+
+Scratch probe (`warm_sidecar.cpp`) lives only in the session scratchpad, not this repo — a clean, minimal,
+reusable tool if this experiment needs re-running under different memory conditions.
 
 ## Suggested execution order
 
