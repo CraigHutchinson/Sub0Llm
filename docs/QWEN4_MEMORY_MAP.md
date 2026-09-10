@@ -2,9 +2,12 @@
 
 **Purpose.** A complete, ground-truth inventory of what the gen tool (`sub0llm-qwen4-gen`) actually
 allocates at the real 48-layer Qwen4 axes — what each thing is, why it exists, WHEN it is created in the
-process's lifetime, and WHERE it lives (private committed heap vs. reserved-then-faulted mapped file,
-thread-local vs. process-shared, one-time vs. per-thread). Requested directly: "make sure every allocation
-is mapped out and documented for the need - timing - positioning." Every number below is either taken
+process's lifetime, WHERE it lives (private committed heap vs. reserved-then-faulted mapped file,
+thread-local vs. process-shared, one-time vs. per-thread), and WHAT DTYPE it holds (§7 — every area's
+actual numeric type, checked against source rather than assumed, and whether a smaller one would help).
+Requested directly: "make sure every allocation is mapped out and documented for the need - timing -
+positioning" and, in a follow-up pass, "check the types used for the different areas... should we use more
+quantized or smaller types." Every number below is either taken
 verbatim from `docs/WP4_SCOPE.md`'s own WP6a audit (independently cross-checked there via two separate
 measurement methods agreeing to the byte) or newly derived in this pass and marked **NEW**. Nothing here
 is re-estimated from memory of an old summary — every figure was re-read from the current source or
@@ -25,13 +28,13 @@ NUM_EXPERTS=512, EXPERTS_PER_TOK=10, MOE_QUANT_EXPERTS=true, DEFAULT_THREADS=24,
 
 ## 0. The picture at a glance
 
-| Bucket | Size | Backing | Resident when |
-|---|---:|---|---|
-| **Backbone** (`g_param_data`) | 18.310 GiB | private heap, fully committed | 100% resident, always, from `load_model` onward |
-| **Worker** (one instance) | 7.023 GiB | private heap, fully committed | 100% resident, always, from first `ensure_thread_built()` onward |
-| **Sidecar** (`.moeq` mapping) | 37.113 GiB committed-as-reserved, but only **4.8–7.6 GiB actually resident** (measured, varies) | mapped file, reserve-then-fault | partially and continuously resident; never all of it at once, by construction (§6) |
-| Decode per-thread pools + persistent caches | ~0.43 GiB | private heap | resident once decode's first token runs |
-| Everything else (tokenizer, CRT heap, stacks, DLL images) | ~0.07 GiB | private heap + mapped image | resident from early startup |
+| Bucket | Size | Dtype in memory | On disk | Backing | Resident when |
+|---|---:|---|---|---|---|
+| **Backbone** (`g_param_data`) | 18.310 GiB | **F32** (`MASTER_DTYPE`) | F32 (the `.bin` checkpoint's own S0L5 format) | private heap, fully committed | 100% resident, always, from `load_model` onward |
+| **Worker** (one instance) | 7.023 GiB | **F32** activations (no reduced-precision CPU path exists — §8) | n/a (never persisted) | private heap, fully committed | 100% resident, always, from first `ensure_thread_built()` onward |
+| **Sidecar** (`.moeq` mapping) | 37.113 GiB committed-as-reserved, but only **4.8–7.6 GiB actually resident** (measured, varies) | **F32 once resolved into a pool slot** (§3b) — the ONLY area in this whole process with real at-rest compression | **mixed GGUF quant: IQ1_S/IQ2_XXS/IQ4_NL, ~2.64 bits/weight blended average** (§8) | mapped file, reserve-then-fault | partially and continuously resident; never all of it at once, by construction (§6) |
+| Decode per-thread pools + persistent caches | ~0.43 GiB | **F32** throughout | n/a | private heap | resident once decode's first token runs |
+| Everything else (tokenizer, CRT heap, stacks, DLL images) | ~0.07 GiB | mixed (tokenizer tables are UTF-8 text + `int32`; images are machine code) | n/a | private heap + mapped image | resident from early startup |
 
 **The arithmetic that governs all of it** (B23, `docs/INDEPENDENT_REVIEW_BACKLOG.md`): this machine has
 63.43 GiB total RAM, and this is a real, shared development machine, not a dedicated inference box — the
@@ -105,15 +108,15 @@ but `Model::build_layout()` still needs one Worker's `param_nodes` to give every
 **Need, field by field, at these axes** (byte-exact, from WP6a — this document does not re-derive these,
 only re-states them with the timing/positioning framing this review adds):
 
-| Field | Size | Why it exists | Why this size |
-|---|---:|---|---|
-| `act_data` (`std::array<float, ACT_CAP>`) | **7.022 GiB** | the batched forward's activation arena — every intermediate tensor a `forward()` call (not `forward_one`) produces | `ACT_CAP` = a `consteval` worst-case sum over every op this config could execute (`calc_act_cap()`, `internal.hpp:81`), `* 3/2 + 8192` headroom |
-| `act_grad` (`std::array<float, ACT_GRAD_FLOATS>`) | **1 float** (was 7.022 GiB) | the matching backward-pass gradient arena | `ACT_GRAD_FLOATS = FORWARD_ONLY ? 1 : ACT_CAP` — **provably dead** in this build: `backward_node` `abort()`s for Gated Residual/MoE/QSA before ever writing here (the WP6a fix, merged) |
-| `grad` (`std::array<float, WORKER_GRAD_FLOATS>`) | 1 float | this thread's per-parameter gradient accumulator | `WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS` — same dead-in-this-build proof as `act_grad` |
-| `param_nodes` (`std::array<Node, NUM_PARAMS>`) | ~129 KiB | one `Node` per backbone parameter tensor, `data`/`grad` spans into `g_param_data`/`grad` | 1074 × 120 B (measured `sizeof(Node)`) |
-| `pool` (`std::array<Node, MAX_NODES>`) | ~169 KiB | scratch for every intermediate node a `forward()` call constructs | 1410 × 120 B (`MAX_NODES` derived the same way `ACT_CAP` is) |
-| `views` (`std::array<ParamView, NUM_PARAMS>`) | ~26 KiB | optimizer (AdamW) per-parameter offset/decay-flag table | 1074 × 24 B |
-| `moe_cache` (`MoeExpertCache`, 8 slots) | **0 B allocated**, ~0.13 KiB struct overhead | the BATCHED path's (`op_moe`) dequantize-on-demand pool, real cross-row hit rate across a window's T rows | lazily heap-allocated on first `.allocate()` call — `op_moe` is the ONLY caller, and a `forward_one`-only decode/gen run **never calls `op_moe` at all**, so this 150 MiB pool costs exactly zero bytes in the gen tool. It only materializes in a `--verify`/training/eval run that exercises the batched forward path. |
+| Field | Dtype | Size | Why it exists | Why this size |
+|---|---|---:|---|---|
+| `act_data` (`std::array<float, ACT_CAP>`) | **F32** — CPU backend has no other option (§8) | **7.022 GiB** | the batched forward's activation arena — every intermediate tensor a `forward()` call (not `forward_one`) produces | `ACT_CAP` = a `consteval` worst-case sum over every op this config could execute (`calc_act_cap()`, `internal.hpp:81`), `* 3/2 + 8192` headroom |
+| `act_grad` (`std::array<float, ACT_GRAD_FLOATS>`) | F32 (moot — dead) | **1 float** (was 7.022 GiB) | the matching backward-pass gradient arena | `ACT_GRAD_FLOATS = FORWARD_ONLY ? 1 : ACT_CAP` — **provably dead** in this build: `backward_node` `abort()`s for Gated Residual/MoE/QSA before ever writing here (the WP6a fix, merged) |
+| `grad` (`std::array<float, WORKER_GRAD_FLOATS>`) | F32 (moot — dead) | 1 float | this thread's per-parameter gradient accumulator | `WORKER_GRAD_FLOATS = FORWARD_ONLY ? 1 : PARAM_FLOATS` — same dead-in-this-build proof as `act_grad` |
+| `param_nodes` (`std::array<Node, NUM_PARAMS>`) | struct (spans + metadata, not tensor data itself) | ~129 KiB | one `Node` per backbone parameter tensor, `data`/`grad` spans into `g_param_data`/`grad` | 1074 × 120 B (measured `sizeof(Node)`) |
+| `pool` (`std::array<Node, MAX_NODES>`) | struct | ~169 KiB | scratch for every intermediate node a `forward()` call constructs | 1410 × 120 B (`MAX_NODES` derived the same way `ACT_CAP` is) |
+| `views` (`std::array<ParamView, NUM_PARAMS>`) | `{size_t off, n; bool decay}` | ~26 KiB | optimizer (AdamW) per-parameter offset/decay-flag table | 1074 × 24 B |
+| `moe_cache` (`MoeExpertCache`, 8 slots) | **F32** (dequantized output — the source planes are quantized, §3b/§8) | **0 B allocated**, ~0.13 KiB struct overhead | the BATCHED path's (`op_moe`) dequantize-on-demand pool, real cross-row hit rate across a window's T rows | lazily heap-allocated on first `.allocate()` call — `op_moe` is the ONLY caller, and a `forward_one`-only decode/gen run **never calls `op_moe` at all**, so this 150 MiB pool costs exactly zero bytes in the gen tool. It only materializes in a `--verify`/training/eval run that exercises the batched forward path. |
 
 **Sum**: 7.022 GiB (`act_data`) + ~0.31 MiB (everything else) ≈ **7.023 GiB**, matching `sizeof(Worker)`
 measured directly (7,540,701,272 bytes).
@@ -168,10 +171,10 @@ file even if something did ask.
 Two genuinely different pools exist, deliberately not unified (`internal.hpp:237-285` has the full
 reasoning — summarized here with timing/positioning added):
 
-| Pool | Slots | Size | Used by | Timing | Real hit rate |
-|---|---:|---:|---|---|---|
-| `MoeExpertCache` (`Worker::moe_cache`) | 8 | 150.0 MiB | `op_moe`, the BATCHED forward path only | lazily allocated on first `.allocate()` — **never** in a pure gen/decode run (§2) | real: many rows of one window's T rows re-select the same expert |
-| `MoeDecodeExpertCache` (one per decode thread, `MoeDecodeThread::cache`) | 1 | 18.75 MiB pool + 6.25 MiB `raw_scratch_` = 25.0 MiB **per thread** | `forward_one`'s decode path (`ParallelExperts`, B20 part 2) | lazily allocated the first time each of the `MOE_DECODE_THREADS` (10, at these axes) OpenMP threads enters the resolve region — i.e., during the FIRST token's FIRST layer, not at startup | provably zero by construction: a token's top-10 experts are distinct indices, the key includes the layer, and 480 resolves/token round-robin any 1-slot pool clean well before the next token asks |
+| Pool | Slots | Dtype | Size | Used by | Timing | Real hit rate |
+|---|---:|---|---:|---|---|---|
+| `MoeExpertCache` (`Worker::moe_cache`) | 8 | **F32** — always, regardless of the source plane's on-disk format (§3c step 4 dequantizes unconditionally) | 150.0 MiB | `op_moe`, the BATCHED forward path only | lazily allocated on first `.allocate()` — **never** in a pure gen/decode run (§2) | real: many rows of one window's T rows re-select the same expert |
+| `MoeDecodeExpertCache` (one per decode thread, `MoeDecodeThread::cache`) | 1 | **F32** (pool) + **F32** (`raw_scratch_` — source-order intermediate before the transpose, also full-width, not the on-disk quant format) | 18.75 MiB pool + 6.25 MiB `raw_scratch_` = 25.0 MiB **per thread** | `forward_one`'s decode path (`ParallelExperts`, B20 part 2) | lazily allocated the first time each of the `MOE_DECODE_THREADS` (10, at these axes) OpenMP threads enters the resolve region — i.e., during the FIRST token's FIRST layer, not at startup | provably zero by construction: a token's top-10 experts are distinct indices, the key includes the layer, and 480 resolves/token round-robin any 1-slot pool clean well before the next token asks |
 
 Decode's ten threads together: **250.0 MiB**, all private heap, all allocated within the first token's
 first layer (not at process startup — worth being precise about, since every `[mem]` log line this session
@@ -204,11 +207,11 @@ advances). All three are **lazily sized on first `reset()`**, called from `kv_re
 (`decode.cpp:673`) once at the start of each generation, and held for the generation's whole lifetime —
 never resized mid-generation, never freed until the thread exits or a new generation calls `reset()` again.
 
-| Cache | Size (measured) | What it holds | Growth pattern |
-|---|---:|---|---|
-| `KVCache` | 24.0 MiB | every execution's K/V history, `[LOOP_EXEC_COUNT][SEQ_LEN][D_KV]` for k and v separately (`LOOP_EXEC_COUNT = N_LAYERS = 48` here, no LoopSplit) | fixed-size on `reset()`, written in-place per position, no further allocation |
-| `GdnCache` | 149.6 MiB | Gated DeltaNet's recurrent state + conv history — an ACCUMULATOR, not a per-position row store, so it does not grow with position at all | fixed-size on `reset()`, **unconditionally re-zeroed every reset** (unlike KVCache's assign-on-size-change) since a stale accumulator would leak a previous generation's state |
-| `QsaCache` | 3.75 MiB (3.0 raw keys + 0.75 pooled block-key cache) | the QSA indexer's raw, unnormed keys (grows with position, real per-position store) plus a pooled block-key cache (O(T/ratio), not O(T²) — the whole reason the pooled cache exists) | fixed-size on `reset()`; `n_cached` counts unconditionally reset (a stale nonzero count would wrongly trust a previous generation's pooled blocks) |
+| Cache | Dtype | Size (measured) | What it holds | Growth pattern |
+|---|---|---:|---|---|
+| `KVCache` | `std::vector<float>` — **F32** | 24.0 MiB | every execution's K/V history, `[LOOP_EXEC_COUNT][SEQ_LEN][D_KV]` for k and v separately (`LOOP_EXEC_COUNT = N_LAYERS = 48` here, no LoopSplit) | fixed-size on `reset()`, written in-place per position, no further allocation |
+| `GdnCache` | **F32** | 149.6 MiB | Gated DeltaNet's recurrent state + conv history — an ACCUMULATOR, not a per-position row store, so it does not grow with position at all | fixed-size on `reset()`, **unconditionally re-zeroed every reset** (unlike KVCache's assign-on-size-change) since a stale accumulator would leak a previous generation's state |
+| `QsaCache` | **F32** (`raw_k`/`block_k`); `n_cached` is `std::vector<int>` (32-bit, negligible) | 3.75 MiB (3.0 raw keys + 0.75 pooled block-key cache) | the QSA indexer's raw, unnormed keys (grows with position, real per-position store) plus a pooled block-key cache (O(T/ratio), not O(T²) — the whole reason the pooled cache exists) | fixed-size on `reset()`; `n_cached` counts unconditionally reset (a stale nonzero count would wrongly trust a previous generation's pooled blocks) |
 
 Sum: **177.4 MiB**, matching WP6a exactly.
 
@@ -266,7 +269,99 @@ remaining unexplained bucket in the whole inventory.
 
 ---
 
-## 7. Summary — findings from this review pass specifically
+## 7. Types used per area, and whether smaller ones would help
+
+Checked directly against the source rather than assumed, because the answer turned out to be more
+lopsided than "everything could use a bit of quantization" — **exactly one area in this entire process has
+any real at-rest compression today, and it is not the one carrying the most bytes.**
+
+### 7a. The dtype landscape, area by area
+
+| Area | Dtype today | Reduced-precision path exists? | Where |
+|---|---|---|---|
+| Backbone (`g_param_data`) | **F32** | **No.** `MASTER_DTYPE`/`HEAD_DTYPE` are hardcoded `Dtype::F32` by the configurator (`tools/configurator.cpp:1759-1760`) — not even a build-time choice, unlike `GEMM_DTYPE`/`ACT_DTYPE` below. | never quantized, never has been |
+| Worker `act_data`/activations | **F32** | **Only on the CUDA backend.** `GEMM_DTYPE`/`ACT_DTYPE` can bake `Dtype::BF16` (`sub0_config.hpp`, configurator-selected), and `backend.cu` genuinely uses it (`act_t = std::conditional_t<ACT_DTYPE == Dtype::BF16, __nv_bfloat16, float>`, `backend.cu:183`). **The CPU backend never reads `GEMM_DTYPE`/`ACT_DTYPE` at all** — confirmed by grep: those two symbols appear nowhere in `src/backends/cpu/*.cpp` except a comment explaining that the BF16 selection is GPU-only (`backend.cpp:19`). | CUDA only; the CPU path this whole document is about has no reduced-precision activation storage, period |
+| MoE experts, **on disk / in the mapping** | **Mixed GGUF quant: IQ1_S, IQ2_XXS, IQ4_NL** (§7b) | **Yes — this is the one place it already happened**, and it's why the sidecar is 37.11 GiB instead of the 450 GiB the same experts would be at F32 | `moe_quant.hpp`/`gguf.hpp`, WP4e |
+| MoE experts, **once resolved into a pool slot** | **F32**, unconditionally | No — `dequantize_expert` always produces F32 output regardless of the source format, because `expert_ffn_row` is an F32 compute kernel | `moe_quant.hpp::dequantize_expert`, `moe_math.hpp::expert_ffn_row` |
+| KV / GDN / QSA decode caches | **F32** | No — plain `std::vector<float>` throughout | `decode.cpp` |
+| Backbone weights under `USE_TERNARY` | **Still F32** | **This is the counter-intuitive finding of this pass.** `USE_TERNARY` sounds like a storage format but is not one: `ternarize_into(std::span<const float> w, std::span<float> q)` (`backend.cpp:276`) takes F32 in and produces F32 out — it restricts VALUES to a ternary domain (BitNet-style straight-through estimator, for training) and re-derives them on every `op_linear` call from a still-fully-F32-sized `g_param_data`; it does not shrink the array. `USE_TERNARY` is also `false` in this build. | `backend.cpp:213` itself documents the re-quantization hazard ("absmean re-quantization is not idempotent") that this scheme is built around, which is itself evidence it's a compute-path restriction, not a storage format |
+| Node graph metadata (`Node`, `ParamView`) | structs, not tensor dtype | n/a | these are bookkeeping, not weights |
+
+### 7b. The sidecar's real, measured compression — the one genuine data point in this area
+
+Computed directly from `gguf.hpp`'s own `block_spec()` table (bytes per block, elements per block) and the
+real plane-format census already taken this session (`IQ1_S` 34,816 planes, `IQ2_XXS` 14,336 planes,
+`IQ4_NL` 24,576 planes, out of 73,728 total — every plane is `D_MODEL × D_FF` = 1,638,400 elements):
+
+| Format | Block shape | Bits/element | Planes | Share of sidecar bytes |
+|---|---|---:|---:|---:|
+| `IQ1_S` | 50 B / 256 elements | **1.5625** | 34,816 | ~27.9% |
+| `IQ2_XXS` | 66 B / 256 elements | **2.0625** | 14,336 | ~15.2% |
+| `IQ4_NL` | 18 B / 32 elements | **4.5** | 24,576 | ~56.9% |
+| **Blended average** | — | **~2.64** | 73,728 | — |
+
+That blended 2.64 bits/element against F32's 32 bits/element is exactly the **12.1×** compression that
+makes 37.11 GiB out of what would otherwise be ~450 GiB — already the single biggest memory decision in
+this whole system, made once, at WP4e, and it is the reason a sidecar exists as a mapping at all rather
+than the question being moot.
+
+### 7c. So — should other areas use smaller types too? Ranked by real leverage
+
+**Yes, and the backbone is the obvious next target, by a wide margin** — it is F32, it is the
+second-largest resident item (18.31 GiB, only 7.02 GiB behind the whole reason this document's §0
+arithmetic is tight), and unlike the sidecar it currently has **zero** reduced-precision path of any kind,
+not even the GPU-only one `act_data` at least has. Ranked by expected memory win against implementation
+risk/cost, most to least attractive:
+
+1. **Backbone → BF16 storage (not GGUF-style variable quant).** Halves 18.31 GiB → ~9.15 GiB. This is the
+   single highest-leverage, lowest-risk lever available: BF16 shares F32's exponent range (so weight
+   magnitudes that already trained fine in F32 don't need re-calibration the way an INT format would), the
+   byte-level conversion primitive already exists and is already exercised for real GGUF ingestion
+   (`gguf.hpp::bf16_to_f32`, used because the real Qwen4 file's own tensors include native BF16 — only the
+   reverse direction, `f32_to_bf16`, needs writing), and — critically, unlike the sidecar's per-token sparse
+   access pattern — the backbone is touched **densely, every layer, every token**, so a real GGUF-style
+   variable-bit-rate format (needing per-block dequant work on every read) would add real, unavoidable CPU
+   cost to the hottest, most-frequently-touched weights in the whole system. BF16 sidesteps that: on
+   hardware without native BF16 ALU support, a BF16→F32 promote is a single shift, cheap enough to not be a
+   real tax on a dense, every-token path the way format-specific block dequant would be.
+   **Directly reopens B23's own arithmetic**: freeing ~9.15 GiB of backbone headroom would move this
+   machine's sidecar-residency ceiling from ~47–59% (§0) toward roughly 68–83% of the sidecar simultaneously
+   resident — the single biggest lever available anywhere in this document, bigger than anything Sub0MemPage
+   itself can buy through scheduling alone, because it changes the ceiling, not just how efficiently the
+   existing ceiling is used.
+2. **Worker `act_data` → BF16, following the CUDA backend's own already-validated precedent.** Halves 7.02
+   GiB → ~3.5 GiB. Lower priority than the backbone only because it's a smaller absolute number, but it is
+   genuinely the SAME change the CUDA backend already made and presumably already validated — porting an
+   existing, proven pattern to the CPU backend, not inventing a new one. Also frees real headroom for the
+   sidecar (§0), same mechanism as point 1.
+3. **KV/GDN/QSA caches → FP16 or BF16.** Halves 177.4 MiB → ~89 MiB. Small in absolute terms (this is the
+   smallest of the three levers) but it is the most standard, most battle-tested technique of the three —
+   FP16 KV-cache is close to the default assumption in most modern LLM-serving engines — and the lowest
+   correctness risk, since these values pass through comparatively few subsequent operations before being
+   consumed.
+4. **MoE resolve pools → store the dequantized slot in BF16 instead of F32.** Modest (~75–125 MiB across
+   the batched + decode pools combined) — lowest priority of the four, both because the absolute bytes are
+   small and because it sits directly in the hottest per-token compute path (`expert_ffn_row`), so any
+   promote/demote cost here is paid far more often, per byte saved, than points 1–3.
+
+**What this review deliberately does NOT recommend**: extending the sidecar's own GGUF-style variable-bit
+quantization to the backbone. The sidecar's format was the right choice *because* only ~10 of 512 experts
+per layer are touched per token — the per-block dequant cost is paid rarely, amortized over a huge unused
+majority. The backbone has no such sparsity to hide behind; every weight is read every token, so a format
+needing real per-read dequant work (rather than BF16's near-free promote) would trade a memory win for a
+recurring, dense CPU cost this document has no measurement to justify yet. If this direction is pursued,
+say so as an explicit follow-up experiment, not assumed free — the same "measure before spending it"
+discipline `docs/MEMORY_AUDIT.md`'s own §4 lever table already applies to a different backend's bf16
+gradient-accumulator question.
+
+**Correctness discipline, stated because it applies here exactly as everywhere else in this project**: any
+of the above is a real numerical change (BF16 has ~8 fewer significant bits than F32), not a free
+`sizeof()` relabeling — the same "verify correctness against reference before performance" standard this
+whole session's B19/B20/B21 work has followed (parity vs. a reference, the WP5c determinism fixture,
+`--verify` against the real artifact) would apply in full before any of this ships, exactly as it did for
+every other memory-shape change WP4e/WP6a already made.
+
+## 8. Summary — findings from this review pass specifically
 
 Consolidating what's genuinely **NEW** in this document versus what it faithfully carries forward from
 WP6a:
@@ -287,8 +382,20 @@ WP6a:
 6. **The full lifecycle ordering** (§6) — WP6a measured a snapshot mid-decode; this document adds the
    step-by-step "what allocates when" a snapshot alone can't show, which is what the user's "timing"
    request specifically asked for.
+7. **The dtype landscape (§7) — one real finding, one counter-intuitive one.** Real: the backbone (18.31
+   GiB, the second-largest resident item in the whole process) has literally zero reduced-precision path
+   today, not even the GPU-only one activations at least have — `MASTER_DTYPE`/`HEAD_DTYPE` are hardcoded
+   F32 by the configurator, not even a build-time choice. Counter-intuitive: `USE_TERNARY`, the one
+   quantization-sounding knob this codebase already has, does not shrink `g_param_data` at all — it
+   restricts weight VALUES to a ternary domain for training purposes and re-derives them from a still-fully-
+   F32 array on every `op_linear` call, never touching storage size. BF16 backbone storage is named as the
+   single highest-leverage lever in this whole document — bigger than anything scheduling alone (Sub0MemPage
+   included) can buy, because it moves B23's own residency ceiling rather than just using the existing one
+   more efficiently — but is explicitly NOT yet implemented, measured, or validated; it's a ranked
+   recommendation, not a finding of something already done.
 
 Nothing in this pass found a missing multi-GiB allocation, a leak, or a double-count — WP6a's own
 `32.835 GiB` private-total figure and the two independent measurement methods that produced it still stand.
-This document's contribution is completeness (every allocation named, not just the large ones) and
-lifecycle framing (when, not just how much) — both explicitly requested, neither fully covered before.
+This document's contribution is completeness (every allocation named, not just the large ones), lifecycle
+framing (when, not just how much), and now the dtype question (what precision, and where the real leverage
+for reducing it actually is) — all three explicitly requested, none fully covered before.
