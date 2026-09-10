@@ -68,11 +68,16 @@ work-package gates control what may be claimed complete.
 
 ## Ordered execution
 
-Runtime status as of 2026-09-09: Phase 2 and the listed Phase 3 SYCL/USM controls passed and are
+Runtime status as of 2026-09-10: Phase 2 and the listed Phase 3 SYCL/USM controls passed and are
 archived in [the R0 checkpoint](INTEL_IGPU_R0_CHECKPOINT.md). The conditional direct-ZE inventory did
-not run because its development tuple is unavailable. Resume at the remaining Phase 1 records and
-R0-authorized I21/S1.5/S2 preparation; do not repeat runtime controls without a changed tuple or a
-specific reproducibility need.
+not run because its development tuple is unavailable. I07b.0 is frozen in the
+[toolchain/consumer map](INTEL_IGPU_I07B0_TOOLCHAIN_CONSUMER_MAP.md); I01's
+[admission card](../tests/fixtures/intel/i01-artifact-admission-v1.json) records exact blockers rather
+than treating unpinned large artifacts as admitted. The I21 schema/parser/synthetic validation exists,
+but the current prepared-copy executable still runs every mode in fixed order, so its orchestrator
+sets `comparison_eligible=false`. Resume by adding a benchmark-only selected-arm mode, then run I21 in
+a reserved window; S1.5 and S2 preparation may proceed independently. Do not repeat earlier runtime
+controls without a changed tuple or a specific reproducibility need.
 
 ### Phase 0 — make this groundwork PR reviewable
 
@@ -190,9 +195,9 @@ Resolve these questions explicitly:
 After R0, delegate one Sol agent per bounded spike and keep leaf ownership separate. Follow the
 dependency order below; parallelism applies only to siblings whose named inputs already exist.
 
-1. **Activate I21's harness/schema** with the first runnable control. Independent-process alternation,
-   exact environment/artifact identity, asynchronous completion and raw result retention apply to all
-   subsequent comparisons.
+1. **Finish I21's first runnable comparison.** The v1 schema, parser, alternating process schedule,
+   raw retention and synthetic validator are present. Add a benchmark-only mode that executes exactly
+   one selected memory arm per process; until then records remain explicitly comparison-ineligible.
 2. **Complete I19/S1 steps 3-5:** conditionally test documented mapped import and writable scratch,
    then shared/device write-only scratch and prefetch/advice controls. Unsupported import closes only
    those conditional arms.

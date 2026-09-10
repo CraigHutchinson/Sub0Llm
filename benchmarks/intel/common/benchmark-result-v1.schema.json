@@ -1,0 +1,293 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://sub0.local/schemas/intel/benchmark-result-v1.schema.json",
+  "title": "Sub0 Intel benchmark result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "created_utc",
+    "purpose",
+    "evidence_level",
+    "synthetic",
+    "outcome",
+    "outcome_reason",
+    "source_identity",
+    "artifacts",
+    "environment",
+    "comparison",
+    "timing_provenance",
+    "processes",
+    "limits"
+  ],
+  "properties": {
+    "schema": { "const": "sub0.intel.benchmark-result.v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "created_utc": { "type": "string", "format": "date-time" },
+    "purpose": { "type": "string", "minLength": 1 },
+    "evidence_level": {
+      "enum": ["instruction", "component", "chain", "prefix", "full"]
+    },
+    "synthetic": { "type": "boolean" },
+    "outcome": { "enum": ["pass", "fail", "unsupported"] },
+    "outcome_reason": { "type": ["string", "null"] },
+    "source_identity": { "$ref": "#/definitions/sourceIdentity" },
+    "artifacts": { "$ref": "#/definitions/artifacts" },
+    "environment": { "$ref": "#/definitions/environment" },
+    "comparison": { "$ref": "#/definitions/comparison" },
+    "timing_provenance": { "$ref": "#/definitions/timingProvenance" },
+    "processes": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/process" }
+    },
+    "limits": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{64}$"
+    },
+    "pathHash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sourceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit",
+        "b09_label",
+        "worktree_state",
+        "dirty_paths",
+        "runner_sha256",
+        "module_sha256",
+        "schema_sha256"
+      ],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "b09_label": { "type": "string", "minLength": 1 },
+        "worktree_state": { "enum": ["clean", "dirty", "unknown"] },
+        "dirty_paths": { "type": "array", "items": { "type": "string" } },
+        "runner_sha256": { "$ref": "#/definitions/sha256" },
+        "module_sha256": { "$ref": "#/definitions/sha256" },
+        "schema_sha256": { "$ref": "#/definitions/sha256" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable", "fixture_a", "fixture_b", "environment_manifest"],
+      "properties": {
+        "executable": { "$ref": "#/definitions/pathHash" },
+        "fixture_a": { "$ref": "#/definitions/pathHash" },
+        "fixture_b": { "$ref": "#/definitions/pathHash" },
+        "environment_manifest": { "$ref": "#/definitions/pathHash" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "captured_manifest",
+        "machine_name",
+        "os_description",
+        "os_architecture",
+        "process_architecture",
+        "powershell_version",
+        "oneapi_device_selector",
+        "power_configuration",
+        "competing_processes"
+      ],
+      "properties": {
+        "captured_manifest": { "type": ["object", "array"] },
+        "machine_name": { "type": "string" },
+        "os_description": { "type": "string" },
+        "os_architecture": { "type": "string" },
+        "process_architecture": { "type": "string" },
+        "powershell_version": { "type": "string" },
+        "oneapi_device_selector": { "type": ["string", "null"] },
+        "power_configuration": { "type": "array", "items": { "type": "string" } },
+        "competing_processes": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "design",
+        "arms",
+        "arm_definitions",
+        "pair_count",
+        "planned_process_count",
+        "schedule",
+        "process_isolation",
+        "raw_sample_retention",
+        "consumer_process_protocol",
+        "comparison_eligible"
+      ],
+      "properties": {
+        "design": { "const": "alternating-paired-independent-process" },
+        "arms": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["ordinary", "prepared", "host_usm_staging"] }
+        },
+        "arm_definitions": { "type": "object", "minProperties": 2 },
+        "pair_count": { "type": "integer", "minimum": 1 },
+        "planned_process_count": { "type": "integer", "minimum": 2 },
+        "schedule": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/scheduleEntry" }
+        },
+        "process_isolation": { "type": "boolean" },
+        "raw_sample_retention": { "type": "boolean" },
+        "consumer_process_protocol": { "type": "string", "minLength": 1 },
+        "comparison_eligible": { "type": "boolean" }
+      }
+    },
+    "scheduleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "pair_index", "position_in_pair", "arm"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "pair_index": { "type": "integer", "minimum": 0 },
+        "position_in_pair": { "enum": [0, 1] },
+        "arm": { "enum": ["ordinary", "prepared", "host_usm_staging"] }
+      }
+    },
+    "timingProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_clock",
+        "async_completion",
+        "component_boundaries",
+        "process_elapsed_boundary",
+        "empty_harness_overhead"
+      ],
+      "properties": {
+        "host_clock": { "const": "std::chrono::steady_clock" },
+        "async_completion": { "type": "string", "minLength": 1 },
+        "component_boundaries": { "type": "object", "minProperties": 1 },
+        "process_elapsed_boundary": { "type": "string", "minLength": 1 },
+        "empty_harness_overhead": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "milliseconds", "reason"],
+          "properties": {
+            "status": { "enum": ["measured", "unavailable", "not_applicable"] },
+            "milliseconds": { "type": ["number", "null"], "minimum": 0 },
+            "reason": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "rawOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "pair_index",
+        "position_in_pair",
+        "target_arm",
+        "started_utc",
+        "elapsed_ms",
+        "command",
+        "exit_code",
+        "outcome",
+        "outcome_reason",
+        "raw_output",
+        "metadata",
+        "samples"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "pair_index": { "type": "integer", "minimum": 0 },
+        "position_in_pair": { "enum": [0, 1] },
+        "target_arm": { "enum": ["ordinary", "prepared", "host_usm_staging"] },
+        "started_utc": { "type": "string", "format": "date-time" },
+        "elapsed_ms": { "type": "number", "minimum": 0 },
+        "command": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "exit_code": { "type": "integer" },
+        "outcome": { "enum": ["pass", "fail", "unsupported"] },
+        "outcome_reason": { "type": ["string", "null"] },
+        "raw_output": { "$ref": "#/definitions/rawOutput" },
+        "metadata": { "type": "object" },
+        "samples": { "type": "array", "items": { "$ref": "#/definitions/sample" } }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "process_sequence",
+        "pair_index",
+        "target_arm",
+        "selected_for_comparison",
+        "phase",
+        "mode",
+        "bytes",
+        "trial",
+        "setup_first_ms",
+        "setup_changed_ms",
+        "staging_ms",
+        "transfer_ms",
+        "kernel_ms",
+        "readback_ms",
+        "validation_ms",
+        "validation_inclusive_ms",
+        "release_first_ms",
+        "release_changed_ms"
+      ],
+      "properties": {
+        "process_sequence": { "type": "integer", "minimum": 0 },
+        "pair_index": { "type": "integer", "minimum": 0 },
+        "target_arm": { "enum": ["ordinary", "prepared", "host_usm_staging"] },
+        "selected_for_comparison": { "type": "boolean" },
+        "phase": { "enum": ["cold", "warm", "release"] },
+        "mode": { "enum": ["ordinary", "prepared", "host_usm_staging"] },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "trial": { "type": ["integer", "null"], "minimum": 0 },
+        "setup_first_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "setup_changed_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "staging_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "transfer_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "kernel_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "readback_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "validation_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "validation_inclusive_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "release_first_ms": { "$ref": "#/definitions/nullableNonnegative" },
+        "release_changed_ms": { "$ref": "#/definitions/nullableNonnegative" }
+      }
+    },
+    "nullableNonnegative": {
+      "type": ["number", "null"],
+      "minimum": 0
+    }
+  }
+}

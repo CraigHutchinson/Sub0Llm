@@ -92,13 +92,16 @@ or a full-model capacity conclusion.
 
 ## Next bounded actions
 
-1. Complete I01's immutable dense/prefix/full-artifact admission record and I07b.0's consumer/toolchain
-   map; these are parallel documentation gates.
-2. Extend the prepared-copy runner/harness so provider/memory arms alternate across independent
-   processes with a machine-readable I21 schema. Repeat 4 MiB and one representative selected-range
-   size before selecting prepared copy.
-3. Delegate S1.5 and S2/I18 as separate Sol spikes. S1.5 may run on this tuple; S2 first consumes real
+1. Close I01's explicit blockers: immutable source-GGUF revision and shard hashes, model/sidecar hashes,
+   the real dense control, and the full PLE identity/format. The checked small-fixture inventory is
+   complete in [the admission card](../tests/fixtures/intel/i01-artifact-admission-v1.json).
+2. I07b.0 is complete in the [toolchain/consumer map](INTEL_IGPU_I07B0_TOOLCHAIN_CONSUMER_MAP.md).
+   Resume its code only as I07b.1 alongside I11; retain friendly DLL loading/deployment as I07b.2/I23.
+3. Extend the prepared-copy executable with a benchmark-only selected-arm mode. The I21 v1
+   schema/parser/orchestrator and synthetic validation are ready, but correctly mark current records
+   `comparison_eligible=false` because the consumer still executes all modes in fixed order. Then repeat
+   4 MiB and one representative selected-range size across independent processes before selection.
+4. Delegate S1.5 and S2/I18 as separate Sol spikes. S1.5 may run on this tuple; S2 first consumes real
    IQ fixture planes and proves emitted code/math before timing.
-4. Keep direct ZE parked until a pinned v3.13-or-later oneDNN and matching Level Zero development tuple
+5. Keep direct ZE parked until a pinned v3.13-or-later oneDNN and matching Level Zero development tuple
    can be audited without contaminating the qualified SYCL control.
-

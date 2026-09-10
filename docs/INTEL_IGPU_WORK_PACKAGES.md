@@ -55,13 +55,13 @@ approved project estimate.
 | ID | Deliverable / current status | Dependencies | Estimate |
 |---|---|---|---|
 | I00 | Partial: exact iGPU execution and initial runtime facts measured; native extension/API inventory pending | None | S remaining |
-| I01 | Correctness manifest pending; WP4f and merged WP5a/b/c artifacts are inputs | Corrected fixtures and precision census | M |
+| I01 | Census recorded; tracked fixtures hashed, dense/prefix/full admission blocked on named external identities/capabilities | Corrected fixtures and precision census | S remaining |
 | I02 | Optional llama.cpp SYCL reference | I00, I01 for exact target | M |
 | I03 | Vulkan comparison — parked | Evidence to reopen, then I00/I01 | Deferred |
 | I04 | Optional bounded OpenVINO comparison | I00, I01 | M |
 | I05 | Native dense/GDN/encoded-expert experiment | I00/I01, initial I18/I19 findings | M |
 | I06 | Component-based investment decision; not final interactive acceptance | I05, I18–I21; optional I02/I04 evidence | S |
-| I07 | Device ABI/build axis; not delivered by source moves | I01; I07b lands with I11 | M |
+| I07 | I07b.0 consumer/toolchain boundary pinned; ABI/build implementation not delivered by source moves | I01; I07b.1 lands with I11, load/deployment closure in I07b.2/I23 | M |
 | I08 | CPU extraction — area/facade and decode slice landed; optimizer/backward/state work remains | Frozen baseline; consume merged B20 findings | M remaining |
 | I09 | CUDA extraction — area and manifest landed; deeper split paused | CUDA baseline, coordinate I07 | L remaining |
 | I10 | Encoded-weight preparation and memory accounting | I01/I06, I19, coordinate I07/I11 | L |
@@ -75,7 +75,7 @@ approved project estimate.
 | I18 | ISA/code-generation and quantization proof | I00, I01 for real planes | M |
 | I19 | Memory access, residency and bounded staging | I00; WP5b findings as available | M |
 | I20 | Equivalent-kernel Level Zero/SYCL submission comparison | I00, executable I18 kernel; coordinate I19 | M |
-| I21 | Persistent benchmark harness and regression records | I00/I01 schemas; grow with runnable consumers | M |
+| I21 | v1 schema/parser/orchestrator groundwork validated; comparison remains ineligible until a consumer selects one arm per process | I00/I01 schemas; grow with runnable consumers | M remaining |
 | I22 | Measured native optimization campaign | I21 + correct component; integrated acceptance after I15 | L, bounded per hypothesis |
 | I23 | Runtime/deployment qualification and release decision | I07b/I11 smoke; prefix after I15/I22; full after I17b | M |
 
@@ -107,6 +107,14 @@ reproducible. Preparation can proceed in parallel in the named leaf directories.
 [R0 runtime update](INTEL_IGPU_R0_CHECKPOINT.md): USM capability, prepared-copy API and three-mode
 copy correctness now pass on the named Intel tuple. Direct ZE is classified unavailable on the current
 development tuple; prepared-copy performance remains inconclusive pending I21 controls.
+
+[Phase-1 records](INTEL_IGPU_I07B0_TOOLCHAIN_CONSUMER_MAP.md) now pin the production consumer/toolchain
+boundary. I01's machine-readable [artifact admission card](../tests/fixtures/intel/i01-artifact-admission-v1.json)
+and [tracked-fixture checksums](../tests/fixtures/intel/qwen-reference-fixtures.sha256) admit the checked
+small fixtures while explicitly blocking the dense, four-layer and useful full-artifact gates on their
+remaining identities/capabilities. I21's v1 schema and synthetic validator are present under its owned
+directories; they produce no performance conclusion until the prepared-copy consumer supports one
+selected arm per process.
 
 These refine S0/I05, keeping the six top-level spike IDs. **Terra owns this batch by explicit user
 request**, overriding the default Sol implementation assignment. Preparation is parallel-safe in
