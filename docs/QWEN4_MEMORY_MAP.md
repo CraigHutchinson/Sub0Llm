@@ -57,7 +57,10 @@ embeddings, every layer's attention/GDN/Gated-Residual weights, the QSA indexer 
 `lm_head` (when not tied), and the model-level Gated-Residual exit collapse. **It does NOT hold the 512
 routed experts per layer** — those are `MOE_QUANT_EXPERTS`-gated out of `PARAM_LAYOUT` entirely and live in
 the sidecar instead (§3). `PARAM_FLOATS = 4,915,107,200` at these axes = exactly **18.3102 GiB**, and
-`NUM_PARAMS = 1074` (the tensor/`Node` count this array is sliced into).
+`NUM_PARAMS = 1074` (the tensor/`Node` count this array is sliced into). **This F32 array is this
+project's own checkpoint format, not a description of the original source model** — the real downloaded
+Qwen3.8-Flash-Next file is genuinely quantized for these same tensors (`Q5_K`/`Q6_K`/`Q8_0`, mixed per
+tensor role); §7d has the full trace of where that precision goes and when.
 
 **Need.** These weights are read on every single forward step, dense — there is no sparsity to exploit
 here, unlike the MoE experts. Full residency is not a choice; it's the only sane placement for something
@@ -279,7 +282,7 @@ any real at-rest compression today, and it is not the one carrying the most byte
 
 | Area | Dtype today | Reduced-precision path exists? | Where |
 |---|---|---|---|
-| Backbone (`g_param_data`) | **F32** | **No.** `MASTER_DTYPE`/`HEAD_DTYPE` are hardcoded `Dtype::F32` by the configurator (`tools/configurator.cpp:1759-1760`) — not even a build-time choice, unlike `GEMM_DTYPE`/`ACT_DTYPE` below. | never quantized, never has been |
+| Backbone (`g_param_data`) | **F32** | **No — corrected below, §7d.** `MASTER_DTYPE`/`HEAD_DTYPE` are hardcoded `Dtype::F32` by the configurator (`tools/configurator.cpp:1759-1760`) — not even a build-time choice, unlike `GEMM_DTYPE`/`ACT_DTYPE` below. **The SOURCE model is not F32 for these tensors at all** (mixed `Q5_K`/`Q6_K`/`Q8_0`/`F32` — §7d); this project's own offline transplant tool fully dequantizes every backbone tensor to F32, once, before the gen tool ever runs. | ON DISK, in `qwen4_full48_q.bin`: never quantized — but that file is itself the OUTPUT of a one-time dequantization, not the original model (§7d) |
 | Worker `act_data`/activations | **F32** | **Only on the CUDA backend.** `GEMM_DTYPE`/`ACT_DTYPE` can bake `Dtype::BF16` (`sub0_config.hpp`, configurator-selected), and `backend.cu` genuinely uses it (`act_t = std::conditional_t<ACT_DTYPE == Dtype::BF16, __nv_bfloat16, float>`, `backend.cu:183`). **The CPU backend never reads `GEMM_DTYPE`/`ACT_DTYPE` at all** — confirmed by grep: those two symbols appear nowhere in `src/backends/cpu/*.cpp` except a comment explaining that the BF16 selection is GPU-only (`backend.cpp:19`). | CUDA only; the CPU path this whole document is about has no reduced-precision activation storage, period |
 | MoE experts, **on disk / in the mapping** | **Mixed GGUF quant: IQ1_S, IQ2_XXS, IQ4_NL** (§7b) | **Yes — this is the one place it already happened**, and it's why the sidecar is 37.11 GiB instead of the 450 GiB the same experts would be at F32 | `moe_quant.hpp`/`gguf.hpp`, WP4e |
 | MoE experts, **once resolved into a pool slot** | **F32**, unconditionally | No — `dequantize_expert` always produces F32 output regardless of the source format, because `expert_ffn_row` is an F32 compute kernel | `moe_quant.hpp::dequantize_expert`, `moe_math.hpp::expert_ffn_row` |
@@ -315,15 +318,16 @@ risk/cost, most to least attractive:
 
 1. **Backbone → BF16 storage (not GGUF-style variable quant).** Halves 18.31 GiB → ~9.15 GiB. This is the
    single highest-leverage, lowest-risk lever available: BF16 shares F32's exponent range (so weight
-   magnitudes that already trained fine in F32 don't need re-calibration the way an INT format would), the
-   byte-level conversion primitive already exists and is already exercised for real GGUF ingestion
-   (`gguf.hpp::bf16_to_f32`, used because the real Qwen4 file's own tensors include native BF16 — only the
-   reverse direction, `f32_to_bf16`, needs writing), and — critically, unlike the sidecar's per-token sparse
-   access pattern — the backbone is touched **densely, every layer, every token**, so a real GGUF-style
-   variable-bit-rate format (needing per-block dequant work on every read) would add real, unavoidable CPU
-   cost to the hottest, most-frequently-touched weights in the whole system. BF16 sidesteps that: on
-   hardware without native BF16 ALU support, a BF16→F32 promote is a single shift, cheap enough to not be a
-   real tax on a dense, every-token path the way format-specific block dequant would be.
+   magnitudes that already trained fine in F32 don't need re-calibration the way an INT format would), and
+   — per §7d — **the hard part is already built and already exercised**: `sub0llm-transplant` already
+   dequantizes every backbone tensor's real source format (`Q5_K`/`Q6_K`/`Q8_0`/native `BF16`/F32, mixed
+   per tensor role) via `gguf::to_f32`; adding a BF16 OUTPUT path would only need a round/pack step added
+   at the point that tool already writes bytes, not a new decoder for anything. Critically, unlike the
+   sidecar's per-token sparse access pattern, the backbone is touched **densely, every layer, every
+   token**, so a real GGUF-style variable-bit-rate format (needing per-block dequant work on every read)
+   would add real, unavoidable CPU cost to the hottest, most-frequently-touched weights in the whole
+   system — BF16 sidesteps that: a BF16→F32 promote is a single shift, cheap enough to not be a real tax
+   on a dense, every-token path the way format-specific block dequant would be.
    **Directly reopens B23's own arithmetic**: freeing ~9.15 GiB of backbone headroom would move this
    machine's sidecar-residency ceiling from ~47–59% (§0) toward roughly 68–83% of the sidecar simultaneously
    resident — the single biggest lever available anywhere in this document, bigger than anything Sub0MemPage
@@ -353,6 +357,44 @@ recurring, dense CPU cost this document has no measurement to justify yet. If th
 say so as an explicit follow-up experiment, not assumed free — the same "measure before spending it"
 discipline `docs/MEMORY_AUDIT.md`'s own §4 lever table already applies to a different backend's bf16
 gradient-accumulator question.
+
+### 7d. Correction — the backbone is not "never quantized," it is "already dequantized, once, offline"
+
+**Directly asked, worth stating precisely rather than leaving §7a's table row to be misread.** The
+backbone being F32 in `g_param_data`/on disk in `qwen4_full48_q.bin` does NOT mean the real source model
+is F32 for these tensors, and it does NOT mean `load_model` does any dequantizing at runtime — both would
+be wrong readings of §7a as originally stated. What actually happens:
+
+1. **The real, downloaded Qwen3.8-Flash-Next GGUF file is quantized for backbone tensors too, not only the
+   routed experts.** Per `docs/WP4_SCOPE.md`'s own real per-tensor dump (a full read of `blk.0.*`/`blk.23.*`,
+   a GDN and a QSA layer, `type_raw` read directly from the file, never assumed from a tensor's name/role):
+   GDN's `in_proj_qkv` is `Q5_K`, GDN's `out_proj` is `Q6_K`, QSA's `q_proj`/`k_proj`/`v_proj` are `Q5_K`,
+   Gated Residual's `down`/`up` are `Q8_0` — only small vectors (norms, `q_norm`/`k_norm`, GR's own
+   `norm`/`inject`) are natively `F32`. This is a real, deliberate, non-uniform mix — "unsloth's own
+   `Dynamic` (`UD`) per-layer importance-based mixed quantization," per that document's own words.
+2. **`sub0llm-transplant` (`tools/sub0llm-transplant.cpp`, WP4c) is a separate, OFFLINE tool** — real GGUF
+   file in, this project's own `S0L5` checkpoint out — run once, ahead of time, to PRODUCE
+   `qwen4_full48_q.bin`. For every backbone tensor, whatever its native format, it reads that tensor's own
+   `type_raw` and calls `gguf::to_f32(slice, raw, out)` (line 264 of that file) — the exact same generic
+   dequantize dispatcher the sidecar's own `dequantize_expert` uses — and writes the F32 result into the
+   checkpoint.
+3. **The 512 routed experts per layer are the one deliberate, documented exception** (WP4e,
+   `SUB0_MOE_QUANT_EXPERTS`): transplant does NOT dequantize those into the main blob at all — it copies
+   them still in their native GGUF-quantized bytes into the separate `.moeq` sidecar, unchanged. That is
+   the ONLY place the source model's own compactness survives into what the gen tool actually loads.
+4. **`load_model`'s runtime read (§1) is therefore loading an already-fully-dequantized file.** No
+   dequantization of any kind happens when the gen tool starts — it happened once, offline, whenever
+   `sub0llm-transplant` was last run to produce this checkpoint, entirely decoupled from every `[mem]`
+   number and every timing figure elsewhere in this document.
+
+**Why this strengthens, not just corrects, §7c's own recommendation 1**: a BF16-backbone lever is not
+proposing something the pipeline has never done before — it is proposing that the ALREADY-EXISTING,
+ALREADY-TESTED `sub0llm-transplant` tool stop fully discarding the source model's own reduced precision at
+the exact point it already has every backbone tensor's real value in hand (as the intermediate F32 result
+of `gguf::to_f32`, before it's written to disk). The real engineering work this implies is narrower than
+"add BF16 support to the engine" — it is "teach one existing offline tool to round its already-computed F32
+values down to BF16 before writing them," which is a materially smaller, more contained change than §7c's
+original framing implied, and worth stating as such rather than leaving it looking like new infrastructure.
 
 **Correctness discipline, stated because it applies here exactly as everywhere else in this project**: any
 of the above is a real numerical change (BF16 has ~8 fewer significant bits than F32), not a free
@@ -393,6 +435,15 @@ WP6a:
    included) can buy, because it moves B23's own residency ceiling rather than just using the existing one
    more efficiently — but is explicitly NOT yet implemented, measured, or validated; it's a ranked
    recommendation, not a finding of something already done.
+8. **A direct correction, prompted by a user question rather than found unprompted (§7d).** §7a's original
+   framing ("backbone: never quantized, never has been") was accurate about `g_param_data`/the on-disk
+   checkpoint but misleading about the SOURCE model: the real Qwen3.8-Flash-Next GGUF file genuinely
+   quantizes these same tensors (`Q5_K`/`Q6_K`/`Q8_0`, mixed per tensor role, verified against
+   `docs/WP4_SCOPE.md`'s own real per-tensor dump), and `sub0llm-transplant` (a separate offline tool)
+   already dequantizes every one of them via `gguf::to_f32` before ever writing the checkpoint —
+   `load_model` itself does zero dequantization at runtime. This sharpens, not weakens, recommendation 1
+   above: a BF16-backbone lever would extend an already-built, already-tested tool's existing dequant step
+   by one rounding operation, not build new infrastructure.
 
 Nothing in this pass found a missing multi-GiB allocation, a leak, or a double-count — WP6a's own
 `32.835 GiB` private-total figure and the two independent measurement methods that produced it still stand.
